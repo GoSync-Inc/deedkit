@@ -656,16 +656,23 @@ Phases, each a pause or a wait before any production write:
    takes at most `rehearsal_limit_ms`. Else the run pauses "not additive: <first difference>" or "too slow
    for an unattended lock". The copy's release removes and confirms every resource; a killed run leaves
    them to the next run's reconciliation.
-5. Final gate: admission and the producer check again, and the live catalog still the copy's (else "the
-   database changed shape since its copy").
-6. Apply: `<sha>/migration.json` (fsynced) records `planned`; `docker run --rm --name
+5. Final gate: admission and the producer check again, the live catalog still the copy's (else "the
+   database changed shape since its copy"), and the owner DSN file reaches that same database: the
+   candidate image reads `[system identifier, database name, OID]` through it, and `docker exec` reads the
+   same on the copied container (else "the owner DSN file does not reach the copied database").
+6. Apply: `<sha>/migration-catalog.json` (the live catalog at the copy and the rehearsal's change, schema
+   only) and then `<sha>/migration.json` `planned` are fsynced; `docker run --rm --name
    deedkit-migrate-<sha12> --log-driver none --read-only --user 10001:10001 --cap-drop ALL --security-opt
-   no-new-privileges --pids-limit 64 --memory 512m` on the database network runs `migrate-expand` once
-   (30 s); then `--status` must show the target, the live ledger the candidate's checksums and the live
-   catalog change equal the rehearsal's: `migrated`, and plan A and plan B follow at once. Otherwise
-   `not-applied` ("did not apply"), `diverged` or `uncertain`, each a pause. A run that finds
-   `migration.json` reads it: `migrated` continues with plan A; `planned` reads `--status` and the ledger
-   and records `migrated` (continue), `not-applied` or `uncertain` (pause); any other status pauses.
+   no-new-privileges --pids-limit 64 --memory 512m -e PGAPPNAME=deedkit-migrate-<sha12>` on the database
+   network runs `migrate-expand` once (30 s; past it the container is killed). The outcome is read only once
+   that container is gone and no live session carries its name (else `uncertain`): `--status` shows the
+   target, the live ledger the candidate's checksums and the live catalog changed exactly as in the
+   rehearsal: `migrated`, and plan A and plan B follow at once. Ledger and catalog unchanged: `not-applied`
+   ("did not apply"); ledger moved, catalog different: `diverged`; anything else `uncertain`; each a pause.
+   A role-only range (no new version) is told apart by the catalog alone. A run that finds a `planned`
+   receipt, or a `migrated` one without a plan A attempt, finishes that release first, even when a newer
+   commit is attested: `migrated` continues with plan A; `planned` reads the same evidence and records
+   `migrated` (continue), `not-applied`, `diverged` or `uncertain` (pause); any other status pauses.
 
 Rollback (M5): a plan A health failure after the migration runs the usual rollback: the base images on the
 target schema (expand migrations keep the base working; delivery heartbeats are read only while delivery

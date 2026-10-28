@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 from uuid import uuid4
 
@@ -13,7 +14,9 @@ import pytest
 
 from messaging_service import __version__
 from messaging_service.archive import Archive
-from messaging_service.store import RUNTIME_SCHEMA
+from messaging_service.event_delivery import dispatch_hints
+from messaging_service.subscriptions import match_subscriptions
+from messaging_service.store import RUNTIME_SCHEMA, Store
 from scripts import production as p
 from tests.test_production import BASE, NEWEST, NEWER, ROLLOUT, Deployer, no_host_state  # noqa: F401
 
@@ -64,6 +67,9 @@ class MigrationHost(Deployer):
                               f"{REVISION}:{p.BACKUP_SOURCE}": b"SCHEMAS=range(2,52)\n"})
         for name, data in roles.items():
             self.contents[f"{NEWEST}:{PACKAGE}{name}"] = ROLE + data
+        # NEWER has the range's content too, so either commit can be the candidate.
+        self.trees.update({(NEWER, path): names for (sha_, path), names in list(self.trees.items()) if sha_ == NEWEST})
+        self.contents.update({NEWER + key[40:]: data for key, data in list(self.contents.items()) if key[:40] == NEWEST})
         (tmp_path / "owner.dsn").write_text(f"postgresql://probe_owner:{DSN_MARKER}@anymsg-db-1/messaging_probe\n")
         (tmp_path / "runner.json").write_text(json.dumps({"image": "sha256:" + "5" * 64}))
         if configured:
@@ -74,12 +80,16 @@ class MigrationHost(Deployer):
                 "receiver_schema_max": 51}
         self.version, self.applied = 50, {str(n): sha(f"-- synthetic {n}\n".encode()) for n in range(2, 51)}
         self.events, self.calls, self.die, self.answer, self.copy_failure = [], [], None, "applied", None
+        self.settled, self.identity, self.reached = True, ["7000000000000000001", "messaging_probe", "16384"], None
         self.shape, self.rehearsal = list(SHAPE_BEFORE), {"took_ms": 12, "difference": p.catalog_difference(
             p.catalog_map(SHAPE_BEFORE), p.catalog_map(SHAPE_AFTER))}
         self.pending = {f"{int(name[:3])}": sha(data) for name, data in files.items()}
+        self.target = 50 + len(files)
         for name, fake in (("wait_for_calls", self.wait_for_calls), ("live_lines", self.live_lines),
                            ("database_copy", self.database_copy), ("rehearse", self.rehearse),
-                           ("expand_run", self.expand_run), ("build_image", self.build_image)):
+                           ("expand_run", self.expand_run), ("build_image", self.build_image),
+                           ("migration_settled", lambda source, name: self.settled),
+                           ("database_identity", lambda name, image, network, dsn_file: self.reached or self.identity)):
             monkeypatch.setattr(p, name, fake)
 
     def run(self, argv, **kwargs):
@@ -106,6 +116,8 @@ class MigrationHost(Deployer):
         self.events.append("live " + step)
         if step == "ledger":
             return [json.dumps({"schema_version": str(self.version), "applied": self.applied})]
+        if step == "identity":
+            return [json.dumps(self.identity)]
         return list(self.shape)
 
     @contextmanager
@@ -130,18 +142,18 @@ class MigrationHost(Deployer):
         self.events.append("status" if status else "migrate")
         if status:
             return {"schema_version": self.version}
-        assert name == "deedkit-migrate-" + NEWEST[:12] and json.loads(Path(plan_file).read_text())["target"] == 51
+        assert name.startswith("deedkit-migrate-") and json.loads(Path(plan_file).read_text())["target"] == self.target
         if self.die == "before":
             raise Died()
         if self.answer in ("applied", "lost"):
-            self.version, self.applied, self.shape = 51, {**self.applied, **self.pending}, list(SHAPE_AFTER)
+            self.version, self.applied, self.shape = self.target, {**self.applied, **self.pending}, list(SHAPE_AFTER)
         if self.die == "after":
             raise Died()
-        return {"schema_version": 51} if self.answer == "applied" else None if self.answer in ("lost", "silent") \
+        return {"schema_version": self.target} if self.answer == "applied" else None if self.answer in ("lost", "silent") \
             else {"error": "lock_timeout"}
 
-    def migration(self):
-        path = self.state / NEWEST / "migration.json"
+    def migration(self, release=NEWEST):
+        path = self.state / release / "migration.json"
         return p.read(path) if path.exists() else None
 
     def plan(self):
@@ -159,7 +171,7 @@ def test_a_qualifying_range_runs_every_phase_in_order_and_records_the_migration(
     outcome = host.deploy()
     assert outcome["status"] == "deployed" and host.paused() is None
     assert phases(host) == ["live ledger", "producer", "copy", "rehearse", "live ledger", "producer", "live shape",
-                            "migrate", "status", "live ledger", "live effect", "prepare", "apply", "seamless prepare",
+                            "live identity", "migrate", "status", "live ledger", "live effect", "prepare", "apply", "seamless prepare",
                             "seamless promote"]
     receipt = host.migration()
     assert receipt["status"] == "migrated" and (receipt["base"], receipt["target"]) == (50, 51)
@@ -455,6 +467,7 @@ CREATE TABLE archive_migrations (version integer PRIMARY KEY, sha256 text NOT NU
 CREATE TABLE messages (id serial PRIMARY KEY, body text NOT NULL, mood mood DEFAULT 'calm');
 INSERT INTO messages (body) SELECT 'synthetic ' || n FROM generate_series(1, 5) n;
 CREATE TABLE empty_one (id bigint);
+CREATE TYPE synthetic_pair AS (a integer);
 CREATE VIEW calm AS SELECT id FROM messages WHERE mood = 'calm';
 DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'synthetic_reader') THEN CREATE ROLE synthetic_reader; END IF; END $$;
 GRANT SELECT ON messages TO synthetic_reader;
@@ -500,6 +513,30 @@ def test_a_complete_new_table_and_nullable_or_constant_default_columns_are_addit
     assert p.not_additive(after, after) is None
 
 
+# spec: ANYM-449
+def test_literal_defaults_with_the_casts_postgresql_adds_are_constant(source_db):
+    before = shape(source_db)
+    psql(source_db, "ALTER TABLE messages ADD COLUMN s_big bigint NOT NULL DEFAULT 0, ADD COLUMN s_small smallint DEFAULT 1,"
+                    " ADD COLUMN s_num numeric(10,2) NOT NULL DEFAULT 0, ADD COLUMN s_neg integer DEFAULT -1,"
+                    " ADD COLUMN s_text varchar(20) NOT NULL DEFAULT 'pending', ADD COLUMN s_json jsonb DEFAULT '{}',"
+                    " ADD COLUMN s_flag boolean NOT NULL DEFAULT false, ADD COLUMN s_mood mood DEFAULT 'busy';")
+    after = shape(source_db)
+    assert p.not_additive(before, after) is None
+    assert len([key for key, _ in p.catalog_difference(before, after)["added"] if key[0] == "column"]) == 8
+
+
+# spec: ANYM-449
+def test_the_identity_the_dsn_reaches_is_the_identity_docker_exec_reads(source_db, tmp_path):
+    live()
+    dsn = Path(os.environ["PROBE_TEST_DSN_FILE"]).read_text().strip().rsplit("/", 1)[0] + "/" + source_db
+    (tmp_path / "dsn").write_text(dsn + "\n")
+    reached = subprocess.run([sys.executable, "-c", p.IDENTITY], env={**os.environ, "DATABASE_URL_FILE": str(tmp_path / "dsn")},
+                             capture_output=True, text=True, check=True).stdout
+    found = json.loads(p.live_lines({"container": CONTAINER, "owner": OWNER, "database": source_db}, "identity",
+                                    p.IDENTITY_SQL + ";")[0])
+    assert json.loads(reached) == found and found[1] == source_db and len(found) == 3
+
+
 FORBIDDEN = {
     "drop-column": ("ALTER TABLE messages DROP COLUMN body;", "removed column public.messages body"),
     "rename-column": ("ALTER TABLE messages RENAME COLUMN body TO text_body;", "removed column public.messages body"),
@@ -526,6 +563,7 @@ FORBIDDEN = {
     "restrictive-policy": ("CREATE TABLE synthetic_new (id int); CREATE POLICY synthetic_only ON synthetic_new AS "
                            "RESTRICTIVE USING (true);", "added policy public.synthetic_new synthetic_only"),
     "new-role": ("CREATE ROLE synthetic_extra_{suffix};", "added role synthetic_extra_"),
+    "composite-attribute": ("ALTER TYPE synthetic_pair ADD ATTRIBUTE b text;", "added column public.synthetic_pair b"),
 }
 
 
@@ -664,7 +702,6 @@ def test_a_rehearsal_killed_midway_leaves_resources_the_next_run_removes(copy_se
     assert (Path(copy["directory"]) / "released.json").exists()
 
 
-
 def event(**changes):
     value={'account':'synthetic-449','platform':'telegram','chat':'449','chat_title':'Synthetic 449 room',
            'provider_id':'1','sender':'42','body':'before the migration','sent_at':'2026-10-01T12:00:00+00:00',
@@ -676,54 +713,152 @@ def event(**changes):
 # spec: ANYM-449
 def test_the_base_runtime_reads_writes_and_delivers_on_a_schema_one_additive_migration_ahead(seeded,tmp_path,monkeypatch):
     s,_,_=seeded
+    dsn=Path(os.environ['PROBE_TEST_DSN_FILE']).read_text().strip()
     ar=Archive(s)
     ar.register('synthetic-449','telegram','Synthetic 449',include_chats=['449'])
     key=s.issue_key('synthetic-449-reader',['synthetic-449'])
     permissions=['read','subscription-write','subscription-ack','delivery-write']
-    token=s.issue_key('synthetic-449-agent',['synthetic-449'],permissions=permissions,key_permissions=permissions)
+    token=s.issue_key('synthetic-449-agent',['telegram-demo'],permissions=permissions,key_permissions=permissions)
+    secret='whsec_c3ludGhldGljLTQ0OS1zZWNyZXQtMDEyMzQ1Njc4OQ=='
+    public=lambda *a,**k:['93.184.216.34']  # noqa: E731
     policy=tmp_path/'delivery-policy.json'
     policy.write_text(json.dumps({'allow_hosts':['example.test']}))
     policy.chmod(0o600)
     monkeypatch.setenv('DELIVERY_POLICY_FILE',str(policy))
+    ahead=RUNTIME_SCHEMA+1
     with s.pool.connection() as c:
         row=c.execute("SELECT value FROM probe_metadata WHERE name='delivery_features'").fetchone()
+        recorded=c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']
     previous=row and row['value']
+    restarted=None
     try:
-        # Before: the SELECT * read-for-update (create, then edit) and a search run on the pooled connections.
+        # Before: SELECT * read-for-update (create, then edit), a search, and delivery enabled with a bound subscription.
         assert ar.ingest(event())['outcome']=='created'
         assert ar.ingest(event(body='edited before',updated_at='2026-10-01T12:01:00+00:00'))['outcome']=='edited'
         assert [x['body'] for x in s.search(key)['items']]==['edited before']
-        # One synthetic additive migration: a new column on tables the runtime reads with SELECT *, and a new table.
+        with s.pool.connection() as c:
+            for name in ('api','matcher','dispatcher'):
+                c.execute('''INSERT INTO component_heartbeats(component,version,schema_version,beat_at)
+                    VALUES(%s,%s,%s,clock_timestamp()) ON CONFLICT(component) DO UPDATE SET version=EXCLUDED.version,
+                    schema_version=EXCLUDED.schema_version,beat_at=EXCLUDED.beat_at''',(name,__version__,RUNTIME_SCHEMA))
+        assert s.set_delivery_features(True,verify_components=True)=={'delivery_features':'enabled','cancelled':0}
+        endpoint=s.register_delivery_endpoint(token,'synthetic-449-request','https://hooks.example.test/synthetic',secret,resolver=public)
+        sid=s.create_subscription(token,['telegram-demo-chat'],delivery={'endpoint_id':endpoint['endpoint_id']})['subscription_id']
+        # The migration the new release applies: additive DDL, its ledger row and the advanced schema_version.
         with s.pool.connection() as c:
             c.execute('ALTER TABLE messages ADD COLUMN synthetic_449 text')
             c.execute('ALTER TABLE delivery_endpoints ADD COLUMN synthetic_449 text')
             c.execute('CREATE TABLE synthetic_449_items (id bigserial PRIMARY KEY, note text)')
             c.execute("INSERT INTO synthetic_449_items(note) VALUES('synthetic')")
-        # After: the same read, a write that reads the old row with SELECT * (edit), and a new message.
-        assert [x['body'] for x in s.search(key)['items']]==['edited before']
-        assert ar.ingest(event(body='edited after',updated_at='2026-10-01T12:02:00+00:00'))['outcome']=='edited'
-        assert ar.ingest(event(provider_id='2',body='created after'))['outcome']=='created'
-        assert sorted(x['body'] for x in s.search(key)['items'])==['created after','edited after']
-        with s.pool.connection() as c:
+            c.execute('INSERT INTO archive_migrations(version,sha256) VALUES(%s,%s)',(ahead,hashlib.sha256(b'synthetic-449').hexdigest()))
+            c.execute("UPDATE probe_metadata SET value=%s WHERE name='schema_version'",(str(ahead),))
+        # The base runtime restarts on the advanced ledger: a new Store, and serve never runs migrate().
+        restarted=Store(dsn,tmp_path/'restarted-originals','http://testserver')
+        ar2=Archive(restarted)
+        assert [x['body'] for x in restarted.search(key)['items']]==['edited before']
+        assert ar2.ingest(event(body='edited after',updated_at='2026-10-01T12:02:00+00:00'))['outcome']=='edited'
+        assert ar2.ingest(event(provider_id='2',body='created after'))['outcome']=='created'
+        assert sorted(x['body'] for x in restarted.search(key)['items'])==['created after','edited after']
+        with restarted.pool.connection() as c:
             assert c.execute("SELECT count(*) AS n FROM messages WHERE synthetic_449 IS NULL AND body IN ('edited after','created after')").fetchone()['n']==2
             assert c.execute('SELECT note FROM synthetic_449_items').fetchall()==[{'note':'synthetic'}]
-            for name in ('api','matcher','dispatcher'):
-                c.execute('''INSERT INTO component_heartbeats(component,version,schema_version,beat_at)
-                    VALUES(%s,%s,%s,clock_timestamp()) ON CONFLICT(component) DO UPDATE SET version=EXCLUDED.version,
-                    schema_version=EXCLUDED.schema_version,beat_at=EXCLUDED.beat_at''',(name,__version__,RUNTIME_SCHEMA))
-        # An enabled delivery: the heartbeat-gated enable, an endpoint registered and listed, then disabled again.
-        assert s.set_delivery_features(True,verify_components=True)=={'delivery_features':'enabled','cancelled':0}
-        created=s.register_delivery_endpoint(token,'synthetic-449-request','https://hooks.example.test/synthetic',
-            'whsec_c3ludGhldGljLTQ0OS1zZWNyZXQtMDEyMzQ1Njc4OQ==',resolver=lambda *a,**k:['93.184.216.34'])
-        assert [x['endpoint_id'] for x in s.list_delivery_endpoints(token)['items']]==[created['endpoint_id']]
-        assert s.set_delivery_features(False)['delivery_features']=='disabled'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='delivery_features'").fetchone()['value']=='enabled'
+        # Delivery stayed enabled: one synthetic event is matched, staged and sent to the fake receiver by the restarted runtime.
+        assert [x['endpoint_id'] for x in restarted.list_delivery_endpoints(token)['items']]==[endpoint['endpoint_id']]
+        with restarted.pool.connection() as c:
+            restarted.append_event(c,'telegram-demo','demo-tg-1',origin='live')
+        match_subscriptions(restarted)
+        received=[]
+        assert dispatch_hints(restarted,transport=lambda url,body,headers,**k:received.append((url,headers,body)) or 204,
+            resolver=public)['delivered']==1
+        # The registration's queued endpoint test goes out in the same pass; the hint is the one naming the subscription.
+        assert {url for url,_,_ in received}=={'https://hooks.example.test/synthetic'}
+        assert [json.loads(body).get('subscription_id') for _,_,body in received].count(sid)==1
+        assert restarted.set_delivery_features(False)['delivery_features']=='disabled'
     finally:
+        if restarted is not None:
+            restarted.close()
         with s.pool.connection() as c:
             c.execute('DROP TABLE IF EXISTS synthetic_449_items')
             c.execute('ALTER TABLE messages DROP COLUMN IF EXISTS synthetic_449')
             c.execute('ALTER TABLE delivery_endpoints DROP COLUMN IF EXISTS synthetic_449')
+            c.execute('DELETE FROM archive_migrations WHERE version=%s',(ahead,))
+            c.execute("UPDATE probe_metadata SET value=%s WHERE name='schema_version'",(recorded,))
             c.execute("DELETE FROM component_heartbeats WHERE component IN ('api','matcher','dispatcher')")
             if previous is None:
                 c.execute("DELETE FROM probe_metadata WHERE name='delivery_features'")
             else:
                 c.execute("UPDATE probe_metadata SET value=%s WHERE name='delivery_features'",(previous,))
+
+
+ROLE_ONLY = {"gateway_role.sql": b"GRANT INSERT ON messages TO messaging_gateway;\n"}
+
+
+# spec: ANYM-449
+@pytest.mark.parametrize("point", ["before", "after"])
+def test_a_role_only_release_killed_around_its_container_is_settled_by_the_catalog_effect(tmp_path, monkeypatch, point):
+    host = MigrationHost(tmp_path, monkeypatch, {}, roles=ROLE_ONLY)
+    host.die = point
+    with pytest.raises(Died):
+        host.deploy()
+    assert host.migration()["status"] == "planned" and (host.migration()["base"], host.migration()["target"]) == (50, 50)
+    host.die = None
+    outcome = host.deploy()
+    # The ledger is the base's either way; only the catalog says whether the grants were applied (Astra r1 F2).
+    if point == "before":
+        assert outcome["status"] == "halted" and outcome["reason"] == f"migration of {NEWEST} did not apply"
+    else:
+        assert outcome["status"] == "deployed" and host.migration()["status"] == "migrated"
+    assert host.events.count("migrate") == 1
+
+
+# spec: ANYM-449
+def test_a_lost_answer_while_its_session_may_still_run_stays_uncertain(tmp_path, monkeypatch):
+    host = MigrationHost(tmp_path, monkeypatch, {"051_synthetic_note.sql": NOTE})
+    host.answer, host.settled = "silent", False
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and outcome["reason"] == (
+        f"the migration of {NEWEST} is uncertain; inspect the ledger before any recovery")
+    # Never `not-applied` while the container or its session may still commit (Astra r1 F1).
+    assert host.migration()["status"] == "uncertain" and "status" not in host.events
+
+
+# spec: ANYM-449
+def test_a_dsn_that_reaches_another_database_pauses_before_the_migration(tmp_path, monkeypatch):
+    host = MigrationHost(tmp_path, monkeypatch, {"051_synthetic_note.sql": NOTE})
+    host.reached = ["7000000000000000001", "messaging_other", "16999"]  # the same ledger, another database
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and outcome["reason"] == "the owner DSN file does not reach the copied database"
+    assert "migrate" not in host.events and host.migration()["status"] == "refused" and host.version == 50
+
+
+# spec: ANYM-449
+@pytest.mark.parametrize("point", ["after", "migrated"])
+def test_an_unsettled_migration_is_finished_before_a_newer_candidate(tmp_path, monkeypatch, point):
+    host = MigrationHost(tmp_path, monkeypatch, {"051_synthetic_note.sql": NOTE})
+    host.green = {NEWER}
+    if point == "after":
+        host.die = "after"
+    else:
+        monkeypatch.setattr(p, "apply", lambda settings, sha_: (_ for _ in ()).throw(Died()))
+    with pytest.raises(Died):
+        host.deploy()
+    assert host.migration(NEWER)["status"] == ("planned" if point == "after" else "migrated")
+    host.die, host.green = None, {NEWER, NEWEST}
+    monkeypatch.setattr(p, "apply", host.step(False, "apply"))
+    outcome = host.deploy()
+    # NEWEST is attested meanwhile, yet the run finishes NEWER, whose migration may have changed the database.
+    assert outcome["status"] == "deployed" and outcome["sha"] == NEWER and host.migration(NEWER)["status"] == "migrated"
+    assert ("apply", NEWER) in host.steps and host.events.count("migrate") == 1
+
+
+# spec: ANYM-449
+def test_a_network_that_appears_after_its_copy_was_released_is_removed(copy_settings):
+    with p.database_copy(copy_settings, "messaging", NEWEST) as copied:
+        copy_id = copied["id"]
+    # A network create a killed rehearsal left in flight completes after the release (Astra r1 F7).
+    subprocess.run(["docker", "network", "create", "--internal", "--label", "deedkit-copy=" + copy_id,
+                    "deedkit-copy-" + copy_id], capture_output=True, check=True)
+    assert labelled(copy_id, "network")
+    p.tend_copies(copy_settings, locked=False)
+    assert labelled(copy_id, "network") == []

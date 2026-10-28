@@ -2169,8 +2169,11 @@ def reconcile_copies(state):
     if not done and not released:
         return released, stuck
     try:
+        # A container or (ANYM-449's rehearsal) network a crash left in flight may appear after the release.
         late = set(run(["docker", "ps", "-a", "--filter", "label=deedkit-copy", "--format",
-                        '{{.Label "deedkit-copy"}}'], timeout=60).split())
+                        '{{.Label "deedkit-copy"}}'], timeout=60).split()) | set(run(
+            ["docker", "network", "ls", "--filter", "label=deedkit-copy", "--format", '{{.Label "deedkit-copy"}}'],
+            timeout=60).split())
         unconfirmed = sorted(late & (done | set(released)))
     except Exception:
         # Docker cannot list: no released copy is confirmed free of late containers.
@@ -2692,6 +2695,12 @@ def catalog_difference(before, after):
             "added": sorted(([list(key), after[key]] for key in after.keys() - before.keys()), key=order)}
 
 
+# A literal default as pg_get_expr prints it, with the casts PostgreSQL adds ('x'::text, 0, (-1), '{}'::jsonb): no
+# function runs, so ADD COLUMN stores it once and rewrites nothing.
+LITERAL_DEFAULT = re.compile(r"(?:'(?:[^']|'')*'|-?[0-9]+(?:\.[0-9]+)?|\(-[0-9]+(?:\.[0-9]+)?\)|true|false)"
+                             r"(?:::[a-z][a-z0-9_ ]*(?:\([0-9]+(?:,[0-9]+)?\))?(?:\[\])?)*")
+
+
 def described(key):
     return " ".join(str(part) for part in key)
 
@@ -2714,8 +2723,10 @@ def not_additive(before, after):
         if kind == "relation":
             allowed = value[0] in ("r", "p", "S", "i")
         elif kind == "column":
-            allowed = key[1] in tables or (not value[3] and not value[4]
-                                           and (value[6] is True if value[2] is not None else not value[1]))
+            allowed = key[1] in tables or ((before.get(("relation", key[1])) or [None])[0] in ("r", "p")
+                                           and not value[3] and not value[4]
+                                           and (value[6] is True or bool(LITERAL_DEFAULT.fullmatch(value[2]))
+                                                if value[2] is not None else not value[1]))
         elif kind == "constraint":
             allowed = key[1] in tables or (value[0] == "n" and bool(value[3])
                                            and all((key[1], column) in columns for column in value[3]))
@@ -2763,27 +2774,63 @@ def expand_run(name, image, network, dsn_file, plan_file, *, label=None, status=
     """One `migrate-expand` (or `--status`) container: the candidate's API image with MIGRATE_FLAGS, the DSN file
     and the plan mounted read-only, at most MIGRATE_TIMEOUT seconds; its one JSON line, or None when the answer is
     lost (a deadline kills the container). Its output holds a version or a fixed code, never PostgreSQL's message."""
+    mounts = [] if status else ["--mount", f"type=bind,src={plan_file},dst=/run/deedkit/plan.json,readonly"]
+    found = container_json(name, image, network, dsn_file, ["python", "-m", "messaging_service", "migrate-expand",
+                                                            *(["--status"] if status else ["--plan", "/run/deedkit/plan.json"])],
+                           label=label, mounts=mounts)
+    if isinstance(found, dict) and set(found) == {"schema_version"} and type(found["schema_version"]) is int:
+        return found
+    if isinstance(found, dict) and set(found) == {"error"}:
+        return {"error": found["error"] if found["error"] in EXPAND_CODES else "failed"}
+    return None
+
+
+def container_json(name, image, network, dsn_file, command, *, label=None, mounts=()):
+    """The last stdout line, as JSON, of one candidate API container with MIGRATE_FLAGS, the DSN file mounted read-only
+    and PGAPPNAME=<name> (its database session carries the name), at most MIGRATE_TIMEOUT seconds; None when the
+    answer is lost (a deadline kills the container; `migration_settled` then confirms it gone)."""
     argv = ["docker", "run", "--rm", "--name", name, *(["--label", label] if label else []), "--network", network,
-            *MIGRATE_FLAGS, "-e", "DATABASE_URL_FILE=/run/secrets/database_url",
-            "--mount", f"type=bind,src={dsn_file},dst=/run/secrets/database_url,readonly"]
-    if not status:
-        argv += ["--mount", f"type=bind,src={plan_file},dst=/run/deedkit/plan.json,readonly"]
-    argv += [image, "python", "-m", "messaging_service", "migrate-expand",
-             *(["--status"] if status else ["--plan", "/run/deedkit/plan.json"])]
+            *MIGRATE_FLAGS, "-e", "DATABASE_URL_FILE=/run/secrets/database_url", "-e", "PGAPPNAME=" + name,
+            "--mount", f"type=bind,src={dsn_file},dst=/run/secrets/database_url,readonly", *mounts, image, *command]
     code, output = bounded(argv, timeout=MIGRATE_TIMEOUT)
     if code is None:
         with suppress(Exception):
             run(["docker", "kill", name], timeout=30)
         return None
     try:
-        found = json.loads((output.strip().splitlines() or ["null"])[-1])
+        return json.loads((output.strip().splitlines() or ["null"])[-1])
     except ValueError:
         return None
-    if isinstance(found, dict) and set(found) == {"schema_version"} and type(found["schema_version"]) is int:
-        return found
-    if isinstance(found, dict) and set(found) == {"error"}:
-        return {"error": found["error"] if found["error"] in EXPAND_CODES else "failed"}
-    return None
+
+
+IDENTITY_SQL = ("SELECT json_build_array((SELECT system_identifier::text FROM pg_control_system()), current_database()::text,"
+                " (SELECT oid::text FROM pg_database WHERE datname = current_database()))::text")
+# The database the owner DSN file reaches, read through that DSN in the candidate image (psycopg; no psql there).
+IDENTITY = ("import json, os, psycopg\n"
+            "with psycopg.connect(open(os.environ['DATABASE_URL_FILE']).read().strip(), connect_timeout=5) as c:\n"
+            f"    print(c.execute({IDENTITY_SQL!r}).fetchone()[0])\n")
+
+
+def database_identity(name, image, network, dsn_file):
+    """[system identifier, database name, database OID] of the database the DSN file reaches, or None."""
+    found = container_json(name, image, network, dsn_file, ["python", "-c", IDENTITY])
+    return found if isinstance(found, list) and len(found) == 3 and all(isinstance(item, str) for item in found) else None
+
+
+def migration_settled(source, name):
+    """True once the container `name` is gone and no live session carries its application name (read back for up to
+    a minute), so a ledger read afterwards is final."""
+    deadline = copy_clock() + 60
+    while True:
+        try:
+            if not run(["docker", "ps", "-a", "-q", "--filter", f"name=^/{name}$"], timeout=30).split() and live_lines(
+                    source, "settled", f"SELECT count(*) FROM pg_stat_activity WHERE application_name = '{name}';") == ["0"]:
+                return True
+        except Exception:
+            pass
+        if copy_clock() >= deadline:
+            return False
+        time.sleep(1)
 
 
 def stable_data(copy, copied):
@@ -2896,22 +2943,32 @@ def migration_image(release, candidate):
     return build_image(release / "source", candidate, PROOF_TARGET)
 
 
-def migration_outcome(settings, plan, candidate, image):
-    """`migrated` when --status shows the target and the live ledger the candidate's checksums, `not-applied` when
-    both are still the base's, else `uncertain`."""
+NO_CHANGE = {"removed": [], "changed": [], "added": []}
+
+
+def migration_outcome(settings, plan, candidate, image, expected):
+    """Once the migration container and its session are confirmed gone: `migrated` when --status shows the target, the
+    live ledger the candidate's checksums and the live catalog changed exactly as the rehearsal did; `not-applied`
+    when ledger and catalog are still the copy's; `diverged` when the ledger moved but the catalog differs; else
+    `uncertain`. `expected` is migration-catalog.json: the live catalog lines at the copy and the rehearsal's change."""
     unattended, source = unattended_settings(settings), copy_source(settings, AUTO_DATABASE)[0]
+    if not migration_settled(source, "deedkit-migrate-" + candidate[:12]):
+        return "uncertain"
     answer = expand_run("deedkit-status-" + candidate[:12], image, unattended["network"], unattended["dsn_file"], None,
                         status=True)
     try:
         version, applied = live_ledger(source)
-    except MigrationRefused:
+        effect = catalog_difference(catalog_map(expected["before"]), catalog_map(live_lines(source, "effect", CATALOG)))
+    except (Refused, ValueError, KeyError, TypeError):
         return "uncertain"
-    if answer == {"schema_version": plan["target"]} == {"schema_version": version} \
-            and applied == {**plan["ledger"], **plan["pending"]}:
+    at_target = (answer == {"schema_version": plan["target"]} == {"schema_version": version}
+                 and applied == {**plan["ledger"], **plan["pending"]})
+    if at_target and effect == expected["difference"]:
         return "migrated"
-    if answer == {"schema_version": plan["base"]} == {"schema_version": version} and applied == plan["ledger"]:
+    if (answer == {"schema_version": plan["base"]} == {"schema_version": version} and applied == plan["ledger"]
+            and effect == NO_CHANGE and (plan["pending"] or expected["difference"] != NO_CHANGE)):
         return "not-applied"
-    return "uncertain"
+    return "diverged" if at_target else "uncertain"
 
 
 def resumed_migration(settings, plan, candidate, release):
@@ -2925,12 +2982,36 @@ def resumed_migration(settings, plan, candidate, release):
     if status != "planned" or plan is None:
         raise MigrationRefused(f"the unattended migration of {candidate} ended {status}; inspect "
                                f"{release / 'migration.json'} and migrate by hand (production.md)")
-    outcome = migration_outcome(settings, plan, candidate, migration_image(release, candidate))
+    try:
+        expected = read(release / "migration-catalog.json")
+    except (OSError, ValueError):
+        expected = None
+    outcome = migration_outcome(settings, plan, candidate, migration_image(release, candidate), expected) \
+        if isinstance(expected, dict) else "uncertain"
     migration_receipt(release, plan, outcome, resumed=True)
     if outcome != "migrated":
-        raise MigrationRefused(f"migration of {candidate} did not apply" if outcome == "not-applied" else
-                               f"the migration of {candidate} is uncertain; inspect the ledger before any recovery")
+        raise MigrationRefused(outcome_text(candidate, outcome))
     return True
+
+
+def outcome_text(candidate, outcome, code=None):
+    if outcome == "not-applied":
+        return f"migration of {candidate} did not apply" + (f": {code}" if code else "")
+    if outcome == "diverged":
+        return (f"the migration of {candidate} changed {AUTO_DATABASE} differently from its rehearsal; inspect it "
+                "before any recovery")
+    return f"the migration of {candidate} is uncertain; inspect the ledger before any recovery"
+
+
+def unsettled_migrations(state):
+    """Releases whose unattended migration may have changed the database before plan A ran: `planned`, or
+    `migrated` with no plan A attempt. The next run finishes that release, never a newer one (Astra r1 F4)."""
+    found = []
+    for path in sorted(Path(state).glob("*/migration.json")):
+        status = read(path).get("status")
+        if status == "planned" or (status == "migrated" and not (path.parent / "attempted.json").exists()):
+            found.append(path.parent.name)
+    return found
 
 
 def migrate(settings, http, plan, mirror, base, serving, candidate, release):
@@ -2953,36 +3034,35 @@ def migrate(settings, http, plan, mirror, base, serving, candidate, release):
     except Exception as exc:
         raise refused(f"the pre-migration copy or rehearsal of {AUTO_DATABASE} stopped: "
                       + (str(exc) if isinstance(exc, Refused) else type(exc).__name__), "copy") from exc
-    live = catalog_map(copied["catalog"])
     # The final gate: everything admission read, again, and the live catalog still the copy's.
     migration_gate(settings, http, plan, mirror, base, serving)
     producer_reads(settings, mirror, plan["target"])
     source = copy_source(settings, AUTO_DATABASE)[0]
     if hashlib.sha256("\n".join(live_lines(source, "shape", CATALOG)).encode()).hexdigest() != copied["catalog_sha256"]:
         raise refused("the database changed shape since its copy", "final gate")
+    # The DSN the migration uses must reach the database that was copied and gated, not another one (Astra r1 F3).
+    identity = json.loads(live_lines(source, "identity", IDENTITY_SQL + ";")[0])
+    if database_identity("deedkit-identity-" + candidate[:12], image, unattended["network"],
+                         unattended["dsn_file"]) != identity:
+        raise refused("the owner DSN file does not reach the copied database", "final gate")
     plan_file = release / "migrate-plan.json"
     plan_file.write_text(json.dumps(expand_plan(plan)) + "\n")
     plan_file.chmod(0o644)
+    # The recovery evidence first: the live catalog the gate read and the change the rehearsal made (schema only).
+    expected = {"before": copied["catalog"], "difference": rehearsal["difference"]}
+    write_record(release / "migration-catalog.json", expected)
     migration_receipt(release, plan, "planned", copy=copied["id"], rehearsal_ms=rehearsal["took_ms"])
     try:
         answer = expand_run("deedkit-migrate-" + candidate[:12], image, unattended["network"], unattended["dsn_file"],
                             plan_file)
-        outcome = migration_outcome(settings, plan, candidate, image)
-        if outcome == "migrated":
-            effect = catalog_difference(live, catalog_map(live_lines(source, "effect", CATALOG)))
-            outcome = "migrated" if effect == rehearsal["difference"] else "diverged"
+        outcome = migration_outcome(settings, plan, candidate, image, expected)
     except Exception:  # whatever happened, migration.json stays `planned`: the next run reads --status
-        raise MigrationRefused(f"the migration of {candidate} is uncertain; inspect the ledger before any recovery")
+        raise MigrationRefused(outcome_text(candidate, "uncertain"))
     code = (answer or {}).get("error")
     migration_receipt(release, plan, outcome, copy=copied["id"], rehearsal_ms=rehearsal["took_ms"],
                       **({"code": code} if code else {}))
-    if outcome == "not-applied":
-        raise MigrationRefused(f"migration of {candidate} did not apply" + (f": {code}" if code else ""))
-    if outcome == "diverged":
-        raise MigrationRefused(f"the migration of {candidate} changed {AUTO_DATABASE} differently from its rehearsal; "
-                               "inspect it before any recovery")
     if outcome != "migrated":
-        raise MigrationRefused(f"the migration of {candidate} is uncertain; inspect the ledger before any recovery")
+        raise MigrationRefused(outcome_text(candidate, outcome, code))
 
 
 # Deploy tool updates (ANYM-443, production.md "Deploy tool updates"). Each installed tool pair has its own directory
@@ -3538,7 +3618,13 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
         return halt(drift + "; apply the next release by hand")
     installed = {"scripts/production.py": RUNNING, "scripts/seamless_release.py": s.__file__,
                  **{path: SYSTEMD_DIRECTORY / Path(path).name for path in UNITS}}
-    if serving["sha"] != base:
+    if unsettled := unsettled_migrations(state):
+        # An unattended migration may have changed the database before its plan A ran: that release is finished
+        # first, whatever main took since (ANYM-449 M4).
+        if len(unsettled) != 1 or serving["sha"] != base or unsettled[0] == base or not on_main(mirror, base, unsettled[0]):
+            return halt("an unattended migration is unsettled: " + ", ".join(unsettled) + "; inspect its migration.json")
+        candidate, since = unsettled[0], base
+    elif serving["sha"] != base:
         # Plan A is ahead of the HTTP pair: a deploy whose HTTP release stopped before any change, or plan A applied
         # by hand.
         candidate, since = base, serving["sha"]
