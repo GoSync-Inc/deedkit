@@ -635,14 +635,22 @@ def test_cancelled_extraction_obeys_its_configured_attempt_limit(archive,limit,a
 
 
 # spec: ANYM-230
-def test_blank_extracted_text_of_any_whitespace_never_starves_a_ready_document(seeded):
+@pytest.mark.parametrize('kind',['document','audio'])
+def test_blank_extracted_text_of_any_whitespace_never_starves_a_ready_document(seeded,kind):
     s,_,_=seeded;space=''.join(c for c in map(chr,range(0x110000)) if c.isspace())  # what str.strip() removes
-    # 64 blank documents sort ahead of the ready one and would fill the whole claim window (LIMIT 64).
+    table={'document':'attachment_text','audio':'attachment_enrichment'}[kind]
+    # 64 blank sources sort ahead of the ready one and would fill the whole claim window (LIMIT 64).
     blanks=['a-blank-%02d'%n for n in range(64)]
     for n,name in enumerate(blanks):
-        add_source(s,'document',name)
+        add_source(s,kind,name)
         with s.pool.connection() as c:
-            c.execute('UPDATE attachment_text SET text_content=%s WHERE attachment=%s',(space[n%len(space)]*3+'\n\t',name))
-    add_source(s,'document','z-ready-document');w=make_worker(s,kind='document')
+            c.execute('UPDATE '+table+' SET text_content=%s WHERE attachment=%s',(space[n%len(space)]*3+'\n\t',name))
+    add_source(s,kind,'z-ready-source');w=make_worker(s,kind=kind)
     claimed=w.claim()
-    assert claimed is not None and claimed[0]['attachment']=='z-ready-document'
+    assert claimed is not None and claimed[0]['attachment']=='z-ready-source'
+    # Each whitespace character alone is blank to the SQL trim too, not only the ones the window above needs.
+    u=module()
+    with s.pool.connection() as c:
+        for ch in space:
+            assert c.execute('SELECT length(btrim(%s,'+u.BLANK+')) n',(ch*2,)).fetchone()['n']==0,hex(ord(ch))
+        assert c.execute('SELECT btrim(%s,'+u.BLANK+') t',(space+'x'+space,)).fetchone()['t']=='x'
