@@ -53,10 +53,13 @@ _CGNAT = ipaddress.ip_network('100.64.0.0/10')
 VENDORS = frozenset(('grok-bot-routine',))
 _BEARER = re.compile(r'Bearer [\x21-\x7e]+')
 try:
-    from .egress import EgressNotSent
+    from .egress import EgressNotSent, answer
 except ImportError:  # Before the egress transport (ANYM-534): no failure is known to be unsent.
     class EgressNotSent(OSError):
         pass
+
+    def answer(value):
+        return value, None
 
 
 def _error(code, status, **extra):
@@ -810,7 +813,7 @@ def dispatch_tests(store, *, limit=8, transport, resolver, served=None):
                 headers = signed_headers((row['signing_secret'], row['pending_secret']), test['id'], body, caller_headers(row))
                 started = time.monotonic()
                 try:
-                    status = transport(row['url'], body, headers, resolved=target[1], timeout=5)
+                    status = answer(transport(row['url'], body, headers, resolved=target[1], timeout=5))[0]
                     state, error = ('delivered', None) if type(status) is int and 200 <= status < 300 else (
                         'failed', 'redirect_rejected' if type(status) is int and 300 <= status < 400 else 'receiver_status')
                     if row['vendor']:

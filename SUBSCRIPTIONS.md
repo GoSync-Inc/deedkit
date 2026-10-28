@@ -268,7 +268,9 @@ boundary, kind and the unverified-host flag. A separate dispatcher uses leased
 at-least-once delivery, retries transient failures with bounded backoff, and moves
 exhausted hints to `dead_letter` after eight durably reserved attempts or seven
 days. The reservation commits before external I/O, so a crash after POST cannot
-reset the attempt budget. It checks
+reset the attempt budget. When a self-service endpoint answers 429 or 503 with a
+valid `Retry-After` (seconds or an HTTP date), its next attempt waits at least that
+long, capped at one hour; operator receivers keep the own backoff. It checks
 credential, scope, lifecycle and exact receiver binding before each attempt. A
 successful hint never ACKs events. Receivers deduplicate `X-DeedKit-Hint-ID` and
 verify `X-DeedKit-Signature` as `sha256=HMAC(secret, timestamp + '.' + exact body)`;

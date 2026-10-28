@@ -6,8 +6,10 @@ sent and retries. After the request starts, OSError, TimeoutError and ValueError
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import ipaddress
 import json
+import math
 import re
 import socket
 import ssl
@@ -35,8 +37,10 @@ def deadline_after(timeout):
     return remaining
 
 
-def post(connection, host, path, body, headers, remaining):
-    """One HTTP/1.1 POST on an open TLS connection; the status code. Raises OSError/ValueError once sending began."""
+def post(connection, host, path, body, headers, remaining, *, retry_after=False):
+    """One HTTP/1.1 POST on an open TLS connection; the status code. Raises OSError/ValueError once sending began.
+
+    With retry_after, (status, seconds): a 429 or 503's Retry-After delay (ANYM-604), else None."""
     request = ('POST ' + path + ' HTTP/1.1\r\nHost: ' + ('[' + host + ']' if ':' in host else host) + '\r\nConnection: close\r\n' +
         'Content-Length: ' + str(len(body)) + '\r\n' +
         ''.join(key + ': ' + value + '\r\n' for key, value in headers.items()) + '\r\n').encode('ascii')
@@ -61,11 +65,76 @@ def post(connection, host, path, body, headers, remaining):
         match = re.fullmatch(rb'HTTP/1\.[01] ([0-9]{3})(?: [\x20-\x7e]*)?', data.split(b'\r\n', 1)[0])
         if match is None:
             raise ValueError('invalid_receiver_response')
-        if not 100 <= int(match[1]) < 200 or int(match[1]) == 101:
-            return int(match[1])
+        status = int(match[1])
+        if not 100 <= status < 200 or status == 101:
+            if not retry_after:
+                return status
+            seconds = None
+            if status in (429, 503):
+                try:
+                    receive(b'\r\n\r\n')
+                    seconds = retry_after_seconds(data.split(b'\r\n\r\n', 1)[0])
+                except (OSError, ValueError):
+                    # A head cut short, too long or past the deadline: the dispatcher keeps its own backoff.
+                    pass
+            return status, seconds
         # An interim response (100 Continue, 103 Early Hints): skip its head; the final status follows it.
         receive(b'\r\n\r\n')
         data = data.split(b'\r\n\r\n', 1)[1]
+
+
+_MONTHS = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
+_CLOCK = '([0-9]{2}):([0-9]{2}):([0-9]{2})'
+# RFC 9110 section 5.6.7: IMF-fixdate, then the obsolete rfc850-date and asctime-date forms.
+_IMF_DATE = re.compile('(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), ([0-9]{2}) ([A-Za-z]{3}) ([0-9]{4}) ' + _CLOCK + ' GMT')
+_RFC850_DATE = re.compile('(?:Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day, ([0-9]{2})-([A-Za-z]{3})-([0-9]{2}) ' + _CLOCK + ' GMT')
+_ASCTIME_DATE = re.compile('(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) ([A-Za-z]{3}) ([ 0-9][0-9]) ' + _CLOCK + ' ([0-9]{4})')
+
+
+def _http_date(value, now):
+    """An HTTP-date as an aware UTC datetime, or None; the whole value must be exactly one date."""
+    if match := _IMF_DATE.fullmatch(value):
+        day, month, year, clock = match[1], match[2], int(match[3]), match.groups()[3:6]
+    elif match := _RFC850_DATE.fullmatch(value):
+        day, month, clock = match[1], match[2], match.groups()[3:6]
+        # A two-digit year more than 50 years ahead is the most recent past year with those digits.
+        year = now.year // 100 * 100 + int(match[3])
+        if year > now.year + 50:
+            year -= 100
+    elif match := _ASCTIME_DATE.fullmatch(value):
+        month, day, clock, year = match[1], match[2], match.groups()[2:5], int(match[6])
+    else:
+        return None
+    if month not in _MONTHS:
+        return None
+    try:
+        return datetime(year, _MONTHS.index(month) + 1, int(day), *map(int, clock), tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def retry_after_seconds(head, now=None):
+    """The delay of a response head's one Retry-After in whole seconds (RFC 9110 section 10.2.3: delta-seconds or an
+    HTTP-date), or None when it is missing, repeated, unparsable or not in the future."""
+    values = [line.split(b':', 1)[1].strip() for line in head.split(b'\r\n')[1:]
+        if b':' in line and line.split(b':', 1)[0].strip().lower() == b'retry-after']
+    if len(values) != 1 or not values[0].isascii():
+        return None
+    value, now = values[0].decode('ascii'), now or datetime.now(timezone.utc)
+    if re.fullmatch('[0-9]+', value):
+        # Any delay past the dispatcher's cap is the cap; a long digit run never reaches int().
+        digits = value.lstrip('0') or '0'
+        return int(digits) if len(digits) <= 9 else 10**9
+    when = _http_date(value, now)
+    if when is None:
+        return None
+    seconds = math.ceil((when - now).total_seconds())
+    return seconds if seconds > 0 else None
+
+
+def answer(value):
+    """A transport's result as (status, Retry-After seconds or None); a bare status (test transports) has none."""
+    return value if type(value) is tuple and len(value) == 2 else (value, None)
 
 
 def _proxy_address(proxy, lane, remaining):
@@ -200,5 +269,5 @@ def proxy_transport(proxy, *, lane=None):
                 # TLS handshake or certificate: nothing was sent (ssl errors are OSError; cert ones also ValueError).
                 raise EgressNotSent('receiver_tls_failed') from error
             with connection:
-                return post(connection, host, path, body, headers, remaining)
+                return post(connection, host, path, body, headers, remaining, retry_after=True)
     return transport
