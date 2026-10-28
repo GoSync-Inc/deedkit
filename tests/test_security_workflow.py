@@ -43,7 +43,7 @@ def test_osv_scanner_fails_the_security_run_except_for_listed_advisories():
 # spec: ANYM-500
 def test_security_runs_cancel_only_an_older_run_of_the_same_pull_request():
     concurrency = _workflow("security.yml")["concurrency"]
-    assert concurrency["group"] == "security-${{ github.event.pull_request.number || github.sha }}"
+    assert concurrency["group"] == "security-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}"
     assert concurrency["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
 
 
@@ -112,3 +112,18 @@ def test_verify_lints_the_calendar_with_the_pinned_ruff():
     assert lint in [line.strip() for line in run]
     assert [line.strip() for line in run if line.strip() and not line.strip().startswith("#")][-1] == lint
     assert '"ruff==0.15.7"' in (ROOT / "tools/dev/pyproject.toml").read_text()
+
+
+# spec: ANYM-137
+def test_security_runs_daily_on_main_so_a_new_advisory_fails_a_run_before_a_merge():
+    workflow = _workflow("security.yml")
+    triggers = workflow[True]  # YAML 1.1 reads the bare key `on` as true
+    # A schedule runs on the default branch (main) with the same steps and osv-scanner.toml as a main push run.
+    assert set(triggers) == {"pull_request", "push", "schedule"}
+    assert triggers["push"] == {"branches": ["main"]}
+    [entry] = triggers["schedule"]
+    minute, hour, *rest = entry["cron"].split()
+    assert minute.isdigit() and hour.isdigit() and rest == ["*", "*", "*"], entry
+    assert workflow["permissions"] == {"contents": "read"}
+    # A scheduled run of the main head never shares, and so never replaces, the pending slot of its push run.
+    assert workflow["concurrency"]["group"].startswith("security-${{ github.event_name }}-")
