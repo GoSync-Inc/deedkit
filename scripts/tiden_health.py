@@ -317,7 +317,7 @@ class Actions:
             raise Unknown("the sync lookup repository is not owner/name")
         endpoint = f"repos/{self.repository}/actions/workflows/{workflow}/runs"
         command = [self.gh, "api", "--method", "GET", endpoint, "-f", "branch=main",
-                   *(part for value in filters for part in ("-f", value)), "-f", f"created=>={created}",
+                   *(part for value in filters for part in ("-f", value)), "-f", f"created={created}",
                    "-F", f"per_page={SYNC_PAGE_SIZE}", "-F", f"page={number}"]
         try:
             # All pages of one lookup share one TIMEOUT budget, so a slow API cannot outlast the report's deadlines.
@@ -348,7 +348,7 @@ class Actions:
         the newest run first, so a run created or deleted while they are read shifts the later ones (run 40669350189):
         a row repeated from an earlier page or a changed `total_count` reads every page again, SYNC_READS reads in
         all within the same END."""
-        created = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        created = ">=" + since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         for _ in range(SYNC_READS):
             rows = self.read(created, end, workflow, filters)
             if rows is not None:
