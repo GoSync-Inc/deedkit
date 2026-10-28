@@ -73,6 +73,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -604,6 +605,32 @@ def gate(state, name, running=('unknown', 'started')):
     return None if intent['status'] in running else f"intent {intent['status']}"
 
 
+RUNNER_ACTIONS = ('finish', 'decline', 'large')  # what a build worker in the container runner may ask the host
+
+
+def runner_request(runner, action, name, reason=None):
+    """Inside the container runner (ANYM-574) there is no state: `gate` reads the gate file the launcher rewrites
+    from the host state, and `finish`, `decline` and `large` go to the outbox, which the launcher applies on the host
+    after the container ends. Another intent or action is refused."""
+    if name != os.environ.get('AUTOLOOP_INTENT'):
+        print("REFUSED not this runner's intent", file=sys.stderr)
+        return 1
+    if action == 'gate':
+        try:
+            why = (runner / 'control' / 'gate').read_text()[:200].strip()
+        except OSError:
+            why = 'no gate file'
+        print('go' if why == 'go' else f'STOP {why}', file=sys.stdout if why == 'go' else sys.stderr)
+        return 0 if why == 'go' else 1
+    if action not in RUNNER_ACTIONS:
+        print(f'REFUSED {action} does not run inside the runner', file=sys.stderr)
+        return 1
+    with open(runner / 'outbox' / 'requests.jsonl', 'a') as outbox:
+        outbox.write(json.dumps({'action': action, 'intent': name, 'reason': reason}) + '\n')
+    print(f'{action}: {name}; the launcher applies it when the container ends')
+    return 0
+
+
 def hold(state, card, by, now, release=False):
     if not CARD.fullmatch(card):
         raise Refused('a card is ANYM-n or new:<slug>')
@@ -942,12 +969,13 @@ def card_projection(state, triage_state, intent):
     return path
 
 
-def create(superset, intent, prompt):
-    """One worker's workspace (worker preset, branch = intent name); a reply without a workspace ID leaves the
-    intent `unknown` for `reconcile`."""
+def create(superset, intent, prompt=None, command=None):
+    """One worker's workspace (branch = intent name): the worker preset with its prompt, or a shell command (the
+    container runner's launcher); a reply without a workspace ID leaves the intent `unknown` for `reconcile`."""
+    start = ['--command', command] if command else ['--agent', PRESET, '--model', MODEL, '--effort', EFFORT,
+                                                    '--prompt', prompt]
     reply = superset(['workspaces', 'create', '--local', '--project', PROJECT_ID, '--name', intent['name'],
-                      '--branch', intent['name'], '--skip-branch-prefix', '--base-branch', 'main',
-                      '--agent', PRESET, '--model', MODEL, '--effort', EFFORT, '--prompt', prompt])
+                      '--branch', intent['name'], '--skip-branch-prefix', '--base-branch', 'main', *start])
     found = reply.get('workspace', reply) if isinstance(reply, dict) else None
     workspace = found.get('id') if isinstance(found, dict) else None
     if not isinstance(workspace, str) or not WORKSPACE_ID.fullmatch(workspace):
@@ -1026,6 +1054,7 @@ def card_end(state, triage_state, name, result, now):
 # --- the build launcher and the controller merge (ANYM-572) -----------------------------------------------------
 BUILD_BRIEF = BRIEFS / 'autoloop-build.md'
 ROOT = Path(__file__).resolve().parents[1]
+LAUNCHER = ROOT / 'deploy' / 'autoloop-runner' / 'launch.py'  # the container runner (ANYM-574)
 # docs/operations/review-protocol.md, used as written (one list; a test compares these with the document): the
 # change-path signal grep (file names, then changed lines) and the autoloop protected paths with their test-directory
 # rules.
@@ -1229,9 +1258,10 @@ def build_cards(state, triage_state, principals):
 
 
 def build_start(superset):
-    """The start of one build worker; its prompt holds the intent and the card ID only."""
-    return lambda intent: create(superset, intent, (
-        f"Read and follow {BRIEFS / 'common.md'} and {BUILD_BRIEF}. Intent: {intent['name']}. Card: {intent['card']}."))
+    """The start of one build worker: the workspace's terminal runs the container runner's launcher (ANYM-574) from
+    this checkout with the intent and the card ID only; the launcher writes the worker's prompt."""
+    return lambda intent: create(superset, intent, command=' '.join(shlex.quote(str(part)) for part in (
+        sys.executable, LAUNCHER, 'build', intent['name'], intent['card'])))
 
 
 def launch_builds(state, triage_state, cfg, snap, now, superset, gh):
@@ -2019,6 +2049,8 @@ def main(argv_=None):
         parser.error('--card goes with bind only, and bind needs it')
     if (args.head is None) == (args.action == 'review-run') or (args.attempt is None) == (args.action == 'review-run'):
         parser.error('--head and --attempt go with review-run only, and review-run needs both')
+    if os.environ.get('AUTOLOOP_RUNNER'):  # inside the container runner (ANYM-574)
+        return runner_request(Path(os.environ['AUTOLOOP_RUNNER']), args.action, args.name, args.reason)
     now = datetime.now(timezone.utc)
     try:
         if args.action == 'tick':

@@ -167,8 +167,9 @@ does. The reservation ends with the intent: PR merged or closed, card declined, 
 or the worker gone (a lost or interrupted one with no PR is parked "worker gone with no PR").
 Unpushed local work of other workers is invisible here.
 
-**The worker.** A Superset workspace `autoloop-build-anym-<n>` with the worker preset; its prompt
-names `~/deedkit-orchestrator/briefs/autoloop-build.md` (outside Git), common.md, the intent and the
+**The worker.** A Superset workspace `autoloop-build-anym-<n>` whose terminal runs the container
+runner's launcher with the intent and the card ID (below); the worker's prompt names copies of
+`~/deedkit-orchestrator/briefs/autoloop-build.md` (outside Git) and common.md, the intent and the
 card ID, nothing else (no brief template, no start). It builds as the harness says, with its own
 review rounds. The PR carries `Autoloop: <intent>`, `Spec: ANYM-n` and `Change path: AUTO…` lines.
 It runs `gate` before every push and never merges, arms or enqueues. It hands in no verdict. It
@@ -221,6 +222,37 @@ It becomes an owner item with the revert command; `status` exits 1 while that PA
 LIVE rule; its ancestry check may `git fetch origin main` in the deedkit checkout) and marks each
 merged build live. A paused autodeploy is recorded for the report and never touched.
 
+## Container runner (ANYM-574)
+
+`deploy/autoloop-runner/launch.py build <intent> <card>` runs on the owner's Mac in the build
+workspace's terminal. It builds the pinned image (`Dockerfile`: the agent CLI, git, gh, uv with
+Python 3.13, node and the Tiden CLI, each pinned by version and digest or checksum; tagged by the
+hash of the directory) and starts one container with a fresh clone of `main` on the intent's
+branch. Nothing of the owner's is mounted (no `~/.ssh`, SSH agent socket, `~/.deedkit`, the
+orchestrator directory, Docker socket or login directory); the two mounts are a read-only control
+directory (the two brief copies and the gate file) and an outbox.
+
+- **Logins.** Existing ones only, as environment values that never appear on a command line: the
+  gh token, the Claude subscription's current access token (the refresh token stays in the
+  Keychain; the launcher refuses a token that expires within the 4-hour build limit) and the Tiden
+  token. No new key.
+- **Egress.** The container sits on the internal Docker network `deedkit_autoloop` with no route
+  out. Its only way out is `proxy.py` (`deedkit_autoloop_proxy`, the one container on both that
+  network and the default bridge): `CONNECT` on port 443 to GitHub, the Anthropic API, Tiden, PyPI,
+  npm and the Go module proxy, and nothing else. No IP literal, and no name that resolves to a
+  private, loopback, link-local or tailnet address.
+- **Check.** `selfcheck.py` runs before the clone; any SSH key, socket, variable outside its list,
+  forbidden mount, or route to the production host (directly or through the proxy) stops the
+  container. `launch.py check` runs the check and one model call: the subscription login works in
+  a container.
+- **Gate and ends.** Inside the container `autoloop.py gate|finish|decline|large` work through the
+  mounts: `gate` reads the gate file, which the launcher rewrites from the host state every 30 s;
+  a stop there (`PAUSE`, a held card, a dropped item) stops the container, and so does a closed
+  terminal (fence, hold). `finish`, `decline` and `large` for this intent go to the outbox, and the
+  launcher applies them on the host after the container ends. Other commands are refused inside.
+- **Undo.** `docker stop <intent>`; `docker stop deedkit_autoloop_proxy`; to start builds with the
+  worker preset again, revert ANYM-574's `build_start`.
+
 ## The live switch
 
 `~/.deedkit/autoloop/config.json` (directory 0700, files 0600, refused inside a Git checkout) is
@@ -272,10 +304,12 @@ is one line.
 
 ## Known residual (owner-accepted 10-26)
 
-Until ANYM-574 (container runner) workers use the owner's gh, Tiden, Superset and SSH logins, so
-a steered worker can do what those logins allow. Brief rules, the gate and the post-merge audit
-(a merged loop PR whose head the controller did not approve pauses the loop) detect this; they do
-not prevent it.
+Card workers, and build workers until ANYM-574 (container runner), use the owner's gh, Tiden,
+Superset and SSH logins, so a steered worker can do what those logins allow. Since ANYM-574 a
+build worker runs in the container runner: no SSH, no route to the production host, no Superset
+login. It still holds the owner's gh and Tiden tokens, so it can do what those allow (a merge
+outside the controller included). Brief rules, the gate and the post-merge audit (a merged loop PR
+whose head the controller did not approve pauses the loop) detect this; they do not prevent it.
 
 Closed by ANYM-578: a test module the PR adds ran in the same pytest process as the existing
 tests, so it could change process-wide state and turn failing verifiers green (Astra recheck at
