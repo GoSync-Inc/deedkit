@@ -252,25 +252,32 @@ def collect(name, popen=subprocess.Popen, timeout=CALL):
     limit = MAX_OUTBOX + 16384  # the tar headers and padding around one small file
     got = []
     try:
-        with popen(['docker', 'cp', f'{name}:{OUTBOX}', '-'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                   stdin=subprocess.DEVNULL) as copy:
-            reader = threading.Thread(target=lambda: got.append(copy.stdout.read(limit) if copy.stdout else b''),
-                                      daemon=True)
-            reader.start()
-            reader.join(timeout)
-            if not got:
-                copy.kill()
-                return None  # no answer in time
-            if len(got[0]) >= limit:
-                copy.kill()
-                return ''  # more than an outbox may hold: rejected
-            try:
-                code = copy.wait(timeout)
-            except subprocess.TimeoutExpired:
-                copy.kill()  # killed inside the `with`, so its exit wait cannot block
-                return None
+        copy = popen(['docker', 'cp', f'{name}:{OUTBOX}', '-'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                     stdin=subprocess.DEVNULL)
     except OSError:
         return None
+    try:  # no `with`: its exit waits on the child without a bound; every wait here has one
+        reader = threading.Thread(target=lambda: got.append(copy.stdout.read(limit) if copy.stdout else b''),
+                                  daemon=True)
+        reader.start()
+        reader.join(timeout)
+        if not got:
+            return None  # no answer in time
+        if len(got[0]) >= limit:
+            return ''  # more than an outbox may hold: rejected
+        try:
+            code = copy.wait(timeout)
+        except subprocess.TimeoutExpired:
+            return None
+    finally:
+        if copy.poll() is None:
+            copy.kill()
+            try:
+                copy.wait(timeout)
+            except subprocess.TimeoutExpired:
+                pass  # a child that outlives SIGKILL is left to the OS; the copy reads as failed
+        if copy.stdout:
+            copy.stdout.close()
     return outbox_text(got[0]) if code == 0 else None
 
 

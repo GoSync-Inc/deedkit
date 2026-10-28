@@ -2234,6 +2234,9 @@ class FakeCopy:
     def kill(self):
         self.killed = True
 
+    def poll(self):
+        return None if self.hang and not self.killed else self.code
+
     def wait(self, timeout=None):
         return self.code
 
@@ -2289,3 +2292,19 @@ def test_a_copy_that_ends_its_output_but_never_exits_is_killed_and_read_as_faile
     begin = time.monotonic()
     assert launcher.collect(BUILD, hung, timeout=0.5) is None
     assert time.monotonic() - begin < 10 and started[0].poll() is not None  # killed, not waited on for a minute
+
+
+# spec: ANYM-574
+def test_a_killed_copy_is_reaped_only_with_a_bounded_wait():
+    waits = []
+
+    class Copy(subprocess.Popen):  # a real hung process whose every wait is recorded
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            return super().wait(timeout)
+
+    def hung(*args, **kwargs):
+        return Copy([sys.executable, '-c', 'import os, time; os.close(1); time.sleep(60)'],
+                    stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
+    assert launcher.collect(BUILD, hung, timeout=0.5) is None
+    assert waits and None not in waits  # no unbounded wait, also not from a context manager's exit
