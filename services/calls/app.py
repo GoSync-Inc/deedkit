@@ -145,6 +145,7 @@ def create_app(data_dir=None, archive=None, control_token=None, reviewer=None, a
 
     def credential_status():
         return {name:bool(keys.get(name)) for name in ('gemini','xai')}
+    service.engine_credentials=credential_status
     control_token=control_token or control_key(directory)
     lock = asyncio.Lock()
     learner=LearningWorker(service,lambda:keys.get('gemini'),reviewer=reviewer)

@@ -1,5 +1,6 @@
 """Separate authenticated control MCP for rehearsals and explicitly authorized calls."""
 import functools
+import json
 import secrets
 import os
 import stat
@@ -17,6 +18,15 @@ import destination_policy as policy
 from core import AgentBrief, ServiceError
 from outbound import AgentExternalBrief
 from learning import SemanticReview
+
+
+ENGINE_REFUSALS={'voice_engine_unavailable','no_voice_engine_available'}
+
+
+def refusal(error):
+    """ToolError text: an engine refusal keeps its engine, reason and skipped engines (ANYM-584); others keep today's text."""
+    if error.code in ENGINE_REFUSALS:return json.dumps({'error':error.code,**error.detail},sort_keys=True)
+    return error.detail.get('message',error.code)
 
 
 def control_key(directory):
@@ -73,9 +83,12 @@ def create_control(service,prepare,start,stop,capabilities,outbound=None,browser
 
     @tool(structured_output=True,annotations=write)
     async def prepare_call(brief:AgentBrief)->dict[str,Any]:
-        """Save a browser task with explicitly selected message IDs, in the owner's call voice. No audio or external call starts."""
+        """Save a browser task with explicitly selected message IDs, in the owner's call voice. No audio or external call starts. voice_engine: auto, gemini_live or grok_live; an unavailable engine is refused with its reason."""
         try:
             return await prepare(service.with_call_voice(brief))
+        except ServiceError as exc:
+            if exc.code in ENGINE_REFUSALS:raise ToolError(refusal(exc)) from None
+            raise ToolError('Cannot prepare the selected task or archive context.') from None
         except Exception:
             raise ToolError('Cannot prepare the selected task or archive context.') from None
 
@@ -158,11 +171,11 @@ def create_control(service,prepare,start,stop,capabilities,outbound=None,browser
     if outbound is not None:
         @tool(structured_output=True,annotations=write)
         async def prepare_external_call(brief:AgentExternalBrief)->dict[str,Any]:
-            """Freeze an outbound Telegram, WhatsApp, phone or SIP task with exact account/destination and selected AnyMsg facts, in the owner's call voice. No dialing occurs."""
+            """Freeze an outbound Telegram, WhatsApp, phone or SIP task with exact account/destination and selected AnyMsg facts, in the owner's call voice. No dialing occurs. voice_engine: auto, gemini_live or grok_live; an unavailable engine is refused with its reason."""
             try:
                 policy.dial_units(brief.channel,brief.destination)
                 return await prepare(service.with_call_voice(brief))
-            except ServiceError as exc:raise ToolError(exc.detail.get('message',exc.code)) from None
+            except ServiceError as exc:raise ToolError(refusal(exc)) from None
             except Exception:raise ToolError('Cannot prepare selected external task.') from None
 
         @tool(structured_output=True,annotations=read)

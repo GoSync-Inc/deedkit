@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Annotated,Literal,get_args
 from zoneinfo import ZoneInfo,ZoneInfoNotFoundError,available_timezones
 
-from pydantic import AfterValidator,BaseModel,ConfigDict,Field,field_validator,model_validator
+from pydantic import AfterValidator,BaseModel,ConfigDict,Field,PrivateAttr,field_validator,model_validator
 
 PROMPT_VERSION="2026-10-14.task-v7"
 MODEL="gemini-3.8-live"
@@ -61,6 +61,8 @@ def mark_summary_missing(v):
 GeminiVoice=Literal["Kore","Puck","Charon","Fenrir","Aoede","Leda","Orus","Zephyr"]
 GrokVoice=Literal['eve','ara','rex','sal','leo']
 VOICES,GROK_VOICES=list(get_args(GeminiVoice)),list(get_args(GrokVoice))
+# An agent's per-call engine (ANYM-584); its table and selector are voice_engines.py.
+VoiceEngine=Literal['auto','gemini_live','grok_live']
 CustomVoiceId=Annotated[str|None,Field(pattern=r'^voice_[A-Za-z0-9_]{4,100}$')]
 
 
@@ -95,10 +97,13 @@ class AgentBrief(BaseModel):
     self_reference:Literal["feminine","masculine","neutral"]="masculine"
     max_duration_secs:int=Field(default=600,ge=30,le=600)
     timezone:TimeZone=None
+    voice_engine:VoiceEngine|None=None
 
 
 # Owner rehearsals choose their own engine and voice.
 class BriefInput(AgentBrief):
+    voice_engine:None=None
+    _voice_engine:dict|None=PrivateAttr(default=None)
     voice:GeminiVoice="Puck"
     custom_voice_id:CustomVoiceId=None
     voice_style:VoiceStyle='neutral'
@@ -371,6 +376,8 @@ class VoiceService:
     def __init__(self,directory):
         directory=Path(directory)
         self.directory=directory
+        # Model key presence by name; app.py sets it (ANYM-584 voice_engine choice).
+        self.engine_credentials=lambda:{}
         directory.mkdir(parents=True,exist_ok=True,mode=0o700)
         os.chmod(directory,0o700)
         self.lock=threading.RLock()
@@ -423,6 +430,9 @@ class VoiceService:
 
     def prepare(self,selected,messages,*,followup=None,inherited_facts=None,owner_principal=None,use_learning=True):
         b=selected.model_dump()
+        b.pop('voice_engine',None)
+        if selected._voice_engine is not None:
+            b['voice_engine']=selected._voice_engine
         if owner_principal is not None:
             b["owner_principal"]=owner_principal
         fields=b["success_fields"]
@@ -500,12 +510,25 @@ class VoiceService:
         return value
 
     def with_call_voice(self,selected):
-        """Freeze the owner's current call_voice into an agent brief (ANYM-359)."""
-        fields={**selected.model_dump(),**self.call_voice().brief_fields()}
+        """Freeze the owner's current call_voice into an agent brief (ANYM-359), in the engine the agent named (ANYM-584)."""
+        from voice_engines import brief_fields,choose
+        voice=self.call_voice()
+        choice=choose(selected.voice_engine,selected.language,voice.provider,{} if selected.voice_engine is None else self.engine_key_status(selected.voice_engine))
+        fields={**selected.model_dump(),**brief_fields(voice,choice),'voice_engine':None}
         if hasattr(selected,'channel'):
             from outbound import ExternalBrief
-            return ExternalBrief(**fields)
-        return BriefInput(**fields)
+            brief=ExternalBrief(**fields)
+        else:
+            brief=BriefInput(**fields)
+        brief._voice_engine=choice
+        return brief
+
+    def engine_key_status(self,requested):
+        """Key presence for an explicit engine request; omitted requests never read it. Unreadable = a bounded refusal."""
+        try:
+            return dict(self.engine_credentials())
+        except Exception:
+            raise ServiceError('voice_engine_unavailable',503,{'voice_engine':requested,'reason':'key_status_unreadable'}) from None
 
     def get_brief(self,identity):
         with self.lock:
@@ -1344,6 +1367,8 @@ class VoiceService:
             link={'parent_call_id':identity,'decision_id':d['id'],'round':d['round'],'question':d['question'],
                   'conditions':d['conditions'],'conditions_sha256':d['conditions_sha256'],
                   'owner_answer':d['answer'],'answered_at':d['answered_at'],'external_action_authorized':False}
+            # A followup keeps the parent's engine and its recorded choice.
+            selected._voice_engine=parent.get('voice_engine')
             b=self.prepare(selected,[],followup=link,inherited_facts=parent['facts'],
                            owner_principal=parent.get('owner_principal'),use_learning=not parent.get('owner_principal'))
             d['followup_brief_id']=b['id']
