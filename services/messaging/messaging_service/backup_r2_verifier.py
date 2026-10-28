@@ -5,7 +5,7 @@ proofs remain on the receiver; the isolated helper sees only stdin, key and its
 own plaintext work. A successful upload is never considered restore evidence.
 """
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack,contextmanager
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -34,6 +34,16 @@ HELPER_TMPFS = {'/tmp':'rw,noexec,nosuid,size=64m',
                 PG_DATA_PATH:'ro,noexec,nosuid,nodev,size=1m,mode=0700'}
 # Backup schema versions this verifier accepts from its helper (`capabilities` reports them).
 SCHEMAS = range(2,54)
+# Host admission (ANYM-609): every instance on the receiver shares this root-private directory.
+# It holds the one heavy-restore lock, the holder's admission record and the pin step's journal.
+HOST_DIRECTORY = '/var/lib/deedkit-backup-verify'
+HOST_LOCK = 'host.lock'
+ADMISSION = 'admission.json'
+PINS_SWITCH = 'pins-switch.json'
+PINS_PREVIOUS = 'pins-previous.json'
+VERIFY_WAIT_SECONDS = 3600
+# Every verifier config on this receiver, for the pin step: {"v": 1, "verifier_configs": [paths]}.
+INSTANCES_FILE = Path('/etc/deedkit-backup-r2/instances.json')
 
 
 def now():return datetime.now(timezone.utc).isoformat()
@@ -58,7 +68,9 @@ def load_config(path):
     defaults={'max_plaintext_bytes':40*GIB,'postgres_headroom_bytes':8*GIB,'reserve_bytes':2*GIB,'timeout_seconds':21600}
     # Optional `profile` (ANYM-606): absent is messaging, exactly as before; `calendar` selects the calendar
     # helper checks and proof. It comes only from this root config and must equal its receiver config's.
-    if (not isinstance(value,dict) or not required<=set(value) or set(value)-required-set(defaults)-{'profile'} or
+    # Optional `host_directory` and `verify_wait_seconds` (ANYM-609) are read through host_settings.
+    if (not isinstance(value,dict) or not required<=set(value) or
+            set(value)-required-set(defaults)-{'profile','host_directory','verify_wait_seconds'} or
             type(value['v']) is not int or value['v']!=1 or
             ('profile' in value and (not isinstance(value['profile'],str) or value['profile'] not in r2.PROFILES))):
         raise ValueError('invalid_verifier_config')
@@ -71,9 +83,13 @@ def load_config(path):
             not 2*GIB<=value['postgres_headroom_bytes']<=64*GIB or
             not GIB<=value['reserve_bytes']<=32*GIB or not 300<=value['timeout_seconds']<=21600):
         raise ValueError('invalid_verifier_limits')
+    host,wait=host_settings(value)
+    if type(wait) is not int or not 0<=wait<=21600:raise ValueError('invalid_verifier_limits')
     for key in ('receiver_config_file','directory','identity_file','protected_file'):
         if not isinstance(value[key],str) or not Path(value[key]).is_absolute() or '..' in Path(value[key]).parts:
             raise ValueError('invalid_verifier_path')
+    if not isinstance(host,str) or not Path(host).is_absolute() or '..' in Path(host).parts:
+        raise ValueError('invalid_verifier_path')
     with local.trusted_directory(value['directory']) as directory:
         if os.fstat(directory).st_mode&0o077:raise ValueError('private_verifier_directory_required')
     receiver=r2.load_config(value['receiver_config_file'])
@@ -91,6 +107,9 @@ def load_config(path):
         if path.is_relative_to(directory):raise ValueError('separate_verifier_inputs_required')
     if len({Path(value[k]) for k in ('identity_file','protected_file','receiver_config_file')})!=3:
         raise ValueError('separate_verifier_inputs_required')
+    host=Path(host)
+    if any(host.is_relative_to(path) or path.is_relative_to(host) for path in (directory,state)):
+        raise ValueError('separate_operator_evidence_required')
     private_file(value['identity_file'])
     with local.trusted_directory(Path(value['protected_file']).parent):pass
     return value
@@ -112,6 +131,96 @@ def verifier_lock(directory):
         finally:os.close(lock)
 
 
+def host_settings(config):
+    return config.get('host_directory',HOST_DIRECTORY),config.get('verify_wait_seconds',VERIFY_WAIT_SECONDS)
+
+
+@contextmanager
+def host_directory(config):
+    """The shared root-private host directory, created on first use under a trusted parent."""
+    path=Path(host_settings(config)[0])
+    with local.trusted_directory(path.parent) as parent:
+        try:os.mkdir(path.name,0o700,dir_fd=parent);local.fsync_dir(parent)
+        except FileExistsError:pass
+    with local.trusted_directory(path) as fd:
+        if os.fstat(fd).st_mode&0o077:raise ValueError('private_verifier_directory_required')
+        yield fd
+
+
+@contextmanager
+def host_lock(config,wait=None):
+    """One heavy restore at a time on this host: waits at most `verify_wait_seconds`, then
+    `verifier_host_busy`. The kernel releases it when its holder dies, even by SIGKILL."""
+    wait=host_settings(config)[1] if wait is None else wait
+    with host_directory(config) as fd:
+        lock=os.open(HOST_LOCK,os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600,dir_fd=fd)
+        try:
+            info=os.fstat(lock)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid!=0 or info.st_nlink!=1 or info.st_mode&0o077:
+                raise ValueError('invalid_verifier_lock')
+            ends=time.monotonic()+wait
+            while True:
+                try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB);break
+                except BlockingIOError:
+                    left=ends-time.monotonic()
+                    if left<=0:raise RuntimeError('verifier_host_busy') from None
+                    time.sleep(min(5,left))
+            yield fd
+        finally:os.close(lock)
+
+
+def valid_admission(value):
+    if (not isinstance(value,dict) or set(value)!={'v','profile','run','resources','admitted_at'} or
+            type(value['v']) is not int or value['v']!=1 or value['profile'] not in r2.PROFILES or
+            not isinstance(value['resources'],list) or len(value['resources'])>32 or
+            any(not isinstance(item,list) or len(item)!=3 or item[0] not in ('helper','postgres','volume','network') or
+                not isinstance(item[1],str) or not re.fullmatch('deedkit-verify-[a-z0-9-]{32,120}',item[1]) or
+                not isinstance(item[2],str) or not re.fullmatch('[a-f0-9]{32}',item[2]) for item in value['resources'])):
+        raise ValueError('verifier_cleanup_unconfirmed')
+    names(value['run'])
+    return value
+
+
+def clear_admission(engine,fd):
+    """Remove a previous holder's recorded resources by exact name and owner label and confirm them
+    gone; a holder that died (SIGKILL) released the lock, but its containers may still run."""
+    _,record=r2.read_root(fd,ADMISSION,missing=True)
+    if record is None:return
+    try:
+        for kind,name,owner in valid_admission(record)['resources']:
+            if engine.inspect_owned(kind,name,owner) is not None:engine.remove(kind,name)
+            if engine.inspect_owned(kind,name,owner) is not None:raise RuntimeError('verifier_cleanup_unconfirmed')
+    except Exception:
+        if r2.CANCELLED:raise
+        raise RuntimeError('verifier_cleanup_unconfirmed') from None
+    os.unlink(ADMISSION,dir_fd=fd);local.fsync_dir(fd)
+
+
+def admit(engine,fd,profile,run,resources):
+    """Under the host lock: clear the previous holder, then record every resource before any exists."""
+    clear_admission(engine,fd)
+    local.write_maintenance_json(ADMISSION,{'v':1,'profile':profile,'run':run,'admitted_at':now(),
+                                            'resources':[list(item) for item in resources]},dir_fd=fd)
+
+
+def release_admission(fd):
+    """After the holder confirmed its own resources removed."""
+    try:os.unlink(ADMISSION,dir_fd=fd)
+    except FileNotFoundError:return
+    local.fsync_dir(fd)
+
+
+def run_resources(run,profile='messaging'):
+    return [(kind,name,run) for kind,name in names(run,profile).items()]
+
+
+def no_pin_switch(config):
+    # A pin step that died between two config writes leaves its journal: no instance runs on a
+    # mixed pair until the next pin step or follow run puts every config back on one pair.
+    with host_directory(config) as fd:
+        if r2.read_root(fd,PINS_SWITCH,missing=True)[1] is not None:raise RuntimeError('verifier_pins_unfinished')
+
+
 @contextmanager
 def deadline(seconds):
     previous=signal.getsignal(signal.SIGALRM);previous_term=signal.getsignal(signal.SIGTERM)
@@ -125,8 +234,16 @@ def deadline(seconds):
         r2.CANCELLED.clear()
 
 
-def names(run):
+def names(run,profile='messaging'):
+    """Scratch resource names carry the profile (ANYM-609), so two instances never share one."""
     if not isinstance(run,str) or not re.fullmatch('[a-f0-9]{32}',run):raise ValueError('invalid_verifier_journal')
+    if profile not in r2.PROFILES:raise ValueError('invalid_verifier_config')
+    base='deedkit-verify-'+profile+'-'+run
+    return {'helper':base+'-helper','postgres':base+'-postgres','volume':base+'-data','network':base+'-net'}
+
+
+def legacy_names(run):
+    """Names of a messaging run journaled before ANYM-609: its retry still removes them."""
     base='deedkit-verify-'+run
     return {'helper':base+'-helper','postgres':base+'-postgres','volume':base+'-data','network':base+'-net'}
 
@@ -152,7 +269,7 @@ def validate_helper_layout(config,run,payload,secret_dir,container):
                 (item.get('Source'),item.get('RW'))!=expected[item['Destination']] for item in mounts) or
             host.get('Tmpfs')!=HELPER_TMPFS or host.get('ReadonlyRootfs') is not True or
             host.get('PortBindings') or host.get('Privileged') is True or
-            host.get('NetworkMode')!=names(run)['network']):
+            host.get('NetworkMode')!=names(run,r2.profile(config))['network']):
         raise ValueError('unexpected_restore_helper_layout')
 
 
@@ -211,7 +328,7 @@ class Docker:
         if category=='container':self.command('container','stop','--time=10',name)
         self.command(category,'rm',*(['--volumes'] if category=='container' else []),name)
     def setup(self,config,run,payload,secret_dir):
-        resource=names(run);labels=['--label',LABEL+'='+run,'--label',LABEL+'.owned=1']
+        resource=names(run,r2.profile(config));labels=['--label',LABEL+'='+run,'--label',LABEL+'.owned=1']
         # Persisted names+ownership precede every create. A dropped response can
         # be reconciled by exact label, never by a generic prune.
         self.command('network','create','--internal',*labels,resource['network'])
@@ -239,12 +356,12 @@ class Docker:
                      '-i','--entrypoint','python',config['helper_image'],'-m','messaging_service.backup_restore_worker',
                      '--config','/run/restore/config.json')
     def restore(self,config,receiver,client,receipt,run,payload,secret_dir):
-        self.setup(config,run,payload,secret_dir)
-        helper=self.inspect_owned('helper',names(run)['helper'],run)
+        self.setup(config,run,payload,secret_dir);resource=names(run,r2.profile(config))
+        helper=self.inspect_owned('helper',resource['helper'],run)
         validate_helper_layout(config,run,payload,secret_dir,helper)
-        if self.inspect_owned('network',names(run)['network'],run) is None:
+        if self.inspect_owned('network',resource['network'],run) is None:
             raise ValueError('unexpected_restore_helper_layout')
-        process=subprocess.Popen(['docker','container','start','-ai',names(run)['helper']],stdin=subprocess.PIPE,
+        process=subprocess.Popen(['docker','container','start','-ai',resource['helper']],stdin=subprocess.PIPE,
                                  stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         try:
             engine=self
@@ -313,10 +430,10 @@ def helper_detail(value):
     return None
 
 
-def cleanup_resources(engine,run):
-    resource=names(run)
-    for kind in ('helper','postgres','volume','network'):
-        if engine.inspect_owned(kind,resource[kind],run) is not None:engine.remove(kind,resource[kind])
+def cleanup_resources(engine,run,profile='messaging'):
+    for resource in (names(run,profile),*([legacy_names(run)] if profile=='messaging' else [])):
+        for kind in ('helper','postgres','volume','network'):
+            if engine.inspect_owned(kind,resource[kind],run) is not None:engine.remove(kind,resource[kind])
 
 
 def preflight_disk(config,receipt,docker_root):
@@ -423,7 +540,7 @@ def write_secret(path,data):
 
 def verify_run(config,receiver,client,engine,journal,fd):
     run=journal['run'];directory=Path(config['directory']);payload=directory/('payload-'+run);secret_dir=directory/('secrets-'+run)
-    cleanup_resources(engine,run);remove_payload(directory,run)
+    cleanup_resources(engine,run,r2.profile(config));remove_payload(directory,run)
     docker_root=engine.preflight(config);preflight_disk(config,journal['receipt'],docker_root)
     if isinstance(engine,Docker):engine.disk_roots=[config['directory'],docker_root];engine.reserve_bytes=config['reserve_bytes']
     private_file(config['identity_file'])
@@ -448,8 +565,8 @@ def run(config,*,client=None,engine=None,path=None):
     receiver=r2.load_config(config['receiver_config_file'])
     client=client if client is not None else r2.make_client(receiver)
     engine=engine if engine is not None else Docker(config['timeout_seconds'])
-    with verifier_lock(config['directory']) as fd:
-        journal=None
+    with verifier_lock(config['directory']) as fd,ExitStack() as host:
+        journal=None;admitted=None
         if path is not None:
             # The receiver update follow (ANYM-597) rewrites the pins under this lock: a
             # config loaded before the lock must never start a journal on the old pair.
@@ -460,6 +577,7 @@ def run(config,*,client=None,engine=None,path=None):
         try:
             with deadline(config['timeout_seconds']):
                 if r2.profile(receiver)!=profile:raise ValueError('verifier_profile_mismatch')
+                no_pin_switch(config)
                 _,journal=r2.read_root(fd,'active.json',missing=True)
                 if journal is not None:
                     validate_journal(receiver,journal)
@@ -470,13 +588,26 @@ def run(config,*,client=None,engine=None,path=None):
                 with local.trusted_directory(receiver['state_directory'],archive=True) as state_fd,r2.shared_lock(state_fd):
                     prior,marker=read_marker(receiver,config['protected_file'])
                     candidate=select_candidate(receiver,client,state_fd,marker)
+                    pending=journal
                     if journal is None:
                         if candidate is None:
                             status={'v':1,'status':'idle','checked_at':now()};local.write_maintenance_json('status.json',status,dir_fd=fd);return status
-                        journal={'v':1,'run':secrets.token_hex(16),'destination':r2.destination(receiver),'receipt':candidate,
+                        pending={'v':1,'run':secrets.token_hex(16),'destination':r2.destination(receiver),'receipt':candidate,
                                  'prior_sha256':prior,'protected_file':config['protected_file'],'phase':'restoring','helper_image':config['helper_image'],'helper_revision':config['helper_revision']}
-                        if profile=='calendar':journal['profile']=profile
-                        local.write_maintenance_json('active.json',journal,dir_fd=fd)
+                        if profile=='calendar':pending['profile']=profile
+                    if pending['phase']=='restoring':
+                        # One heavy restore per host (ANYM-609): wait, clear a dead holder's resources and
+                        # record ours, all before a new run's journal or any scratch resource exists.
+                        started=time.monotonic();lock=host.enter_context(host_lock(config))
+                        # The wait has its own bound: the deadline moves by exactly the time waited, so the
+                        # restore keeps its whole budget and a run ends within timeout plus the wait.
+                        waited=time.monotonic()-started
+                        signal.setitimer(signal.ITIMER_REAL,signal.getitimer(signal.ITIMER_REAL)[0]+waited)
+                        if isinstance(engine,Docker):engine.ends+=waited
+                        # A refused admission keeps the record it could not clear for the next holder.
+                        admit(engine,lock,profile,pending['run'],run_resources(pending['run'],profile));admitted=lock
+                    if journal is None:
+                        journal=pending;local.write_maintenance_json('active.json',journal,dir_fd=fd)
                     # Even after a marker switch, exact committed candidate remains
                     # available by ID. Never silently adopt another new capture.
                     actual=r2.get_receipt(receiver,client,journal['receipt']['wire']['id'])
@@ -485,7 +616,8 @@ def run(config,*,client=None,engine=None,path=None):
                     else:
                         _,proof=r2.read_root(fd,'proof-'+journal['run']+'.json')
                         r2.validate_proof(proof,journal['receipt'],profile)
-                    cleanup_resources(engine,journal['run']);remove_payload(config['directory'],journal['run'])
+                    cleanup_resources(engine,journal['run'],profile);remove_payload(config['directory'],journal['run'])
+                    if admitted is not None:release_admission(admitted);host.close();admitted=None
                 # Existing maintenance takes the same upload lock and independently
                 # rechecks full ciphertext, immutable receipts and root marker CAS.
                 proof_path=Path(config['directory'])/('proof-'+journal['run']+'.json')
@@ -505,8 +637,12 @@ def run(config,*,client=None,engine=None,path=None):
             # durable status. Keep journal/proof and the old protected recovery point.
             cleanup_ok=True
             if isinstance(engine,Docker):engine=Docker(120)
-            if journal is not None:
-                try:cleanup_resources(engine,journal['run']);remove_payload(config['directory'],journal['run'])
+            # A refused admission created nothing and leaves its retry's resources to the next holder.
+            if journal is not None and str(error) not in ('verifier_host_busy','verifier_cleanup_unconfirmed'):
+                try:cleanup_resources(engine,journal['run'],profile);remove_payload(config['directory'],journal['run'])
+                except Exception:cleanup_ok=False
+            if admitted is not None and cleanup_ok:
+                try:release_admission(admitted)
                 except Exception:cleanup_ok=False
             failure={'v':1,'status':'failed','error':failure_code(error),'failed_at':now(),
                      'cleanup_complete':cleanup_ok,'diagnostic':describe(error)}
@@ -528,7 +664,8 @@ def failure_code(error):
           'unreviewed_restore_image','unreviewed_postgres_image','unowned_restore_resource','invalid_helper_result',
           'uploader_lock_initialization_required','uncommitted_cloud_object','receiver_quota','protected_backup_missing',
           'invalid_verifier_journal','private_root_file_required','restore_docker_failed','restore_postgres_unavailable',
-          'isolated_restore_failed','stored_backup_corrupt','storage_unavailable','unexpected_restore_image_volume','unexpected_restore_helper_layout',
+          'isolated_restore_failed','stored_backup_corrupt','verifier_host_busy','verifier_cleanup_unconfirmed',
+          'verifier_pins_unfinished','invalid_verifier_lock','verification_pending','instances_invalid','pins_switch_unresolved','storage_unavailable','unexpected_restore_image_volume','unexpected_restore_helper_layout',
           *CALENDAR_FAILURES}
     return str(error) if str(error) in safe else 'independent_restore_failed'
 
@@ -555,8 +692,20 @@ def describe(error):
 
 
 def main(argv=None):
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--config',required=True)
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--config')
+    # The pin step (ANYM-609): one helper pair for every instance in the instances file, or none.
+    parser.add_argument('--update-pins',action='store_true');parser.add_argument('--instances',default=str(INSTANCES_FILE))
+    parser.add_argument('--helper-image');parser.add_argument('--helper-revision')
     args=parser.parse_args(argv)
+    if args.update_pins:
+        if args.config or not args.helper_image or not args.helper_revision:
+            parser.error('--update-pins takes --helper-image and --helper-revision, not --config')
+        from . import backup_r2_follow as follow
+        try:result=follow.update_pins(args.instances,args.helper_image,args.helper_revision)
+        except Exception as error:
+            print(json.dumps({'error':follow.failure_code(error),'diagnostic':describe(error)},separators=(',',':')),file=sys.stderr);return 1
+        print(json.dumps(result,separators=(',',':')));return 0
+    if not args.config:parser.error('--config is required')
     try:run(load_config(args.config),path=args.config)
     except Exception as error:
         print(json.dumps({'error':failure_code(error),'diagnostic':describe(error)},separators=(',',':')),file=sys.stderr);return 1

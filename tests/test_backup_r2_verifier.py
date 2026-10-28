@@ -96,7 +96,9 @@ def operator(tmp_path,monkeypatch):
     config={'v':1,'receiver_config_file':str(receiver_path),'directory':str(work),'identity_file':str(identity),
             'protected_file':str(control/'protected.json'),'helper_image':'sha256:'+'a'*64,'helper_revision':'b'*40,
             'postgres_image':v.POSTGRES_IMAGE,'max_plaintext_bytes':v.GIB,'postgres_headroom_bytes':2*v.GIB,
-            'reserve_bytes':v.GIB,'timeout_seconds':900}
+            'reserve_bytes':v.GIB,'timeout_seconds':900,'host_directory':str(tmp_path/'host')}
+    # The receiver's instances file (ANYM-609): absent unless a test writes it.
+    monkeypatch.setattr(v,'INSTANCES_FILE',control/'instances.json')
     cloud=Cloud();receive(receiver,cloud)
     class Engine:
         def __init__(self):self.runs=[];self.failure=None;self.resources={};self.deleted=[]
@@ -105,7 +107,7 @@ def operator(tmp_path,monkeypatch):
         def remove(self,kind,name):self.deleted.append((kind,name));self.resources.pop((kind,name))
         def restore(self,config,receiver,client,receipt,run,payload,secret_dir):
             self.runs.append(run)
-            for kind,name in v.names(run).items():self.resources[(kind,name)]={'Labels':{v.LABEL:run}}
+            for kind,name in v.names(run,r2.profile(config)).items():self.resources[(kind,name)]={'Labels':{v.LABEL:run}}
             r2.verify_object(receiver,client,receipt,io.BytesIO())
             if self.failure:raise self.failure
             return {'v':1,'status':'verified','schema_version':34,'manifest_sha256':receipt['wire']['snapshot_sha256'],
@@ -694,8 +696,12 @@ def follower(operator,tmp_path,monkeypatch):
         return proofs[sha]
     state=SimpleNamespace(f=f,v=v,path=path,config=config,receiver=receiver,docker=Docker(),main=Main(),
                           images=images,served=served,proofs=proofs,tested=[],results={},write_json=write_json,
-                          directory=Path(config['directory']),cloud=cloud)
-    def self_test(engine,tested):
+                          directory=Path(config['directory']),cloud=cloud,profiles=[],calendar_failure=None)
+    def self_test(engine,tested,run=None):
+        state.profiles.append(r2.profile(tested))
+        if r2.profile(tested)!='messaging':
+            if state.calendar_failure:raise state.calendar_failure
+            return [2,50],4
         state.tested.append(tested['helper_revision'])
         result=state.results.get(tested['helper_revision'],50)
         if isinstance(result,BaseException):raise result
@@ -1301,3 +1307,292 @@ def test_calendar_units_run_the_same_module_with_their_own_config_and_messaging_
     assert all(example[k].startswith(('/etc/deedkit-calendar-backup-r2/','/var/lib/deedkit-calendar-backup-r2/')) for k in paths)
     assert not any(Path(example[a]).is_relative_to(Path(messaging_example[b]).parent) or example[a]==messaging_example[b]
                    for a in paths for b in paths)
+
+
+class HostEngine:
+    """Synthetic Docker shared by two verifier instances: exact named resources, one log of creates and removes."""
+    def __init__(self,v,root,host):
+        self.v=v;self.root=root;self.host=host;self.resources={};self.log=[];self.during=None;self.failure=None
+        self.fail_remove=set();self.admissions=[]
+    def preflight(self,config):return str(self.root)
+    def inspect_owned(self,kind,name,run):
+        owner=self.resources.get((kind,name))
+        if owner is not None and owner!=run:raise ValueError('unowned_restore_resource')
+        return None if owner is None else {'Labels':{self.v.LABEL:owner}}
+    def remove(self,kind,name):
+        if name in self.fail_remove:raise RuntimeError('restore_docker_failed')
+        self.log.append(('remove',name));self.resources.pop((kind,name))
+    def restore(self,config,receiver,client,receipt,run,payload,secret_dir):
+        # The holder's record names every resource before the first one exists.
+        self.admissions.append(json.loads((self.host/'admission.json').read_text()))
+        for kind,name in self.v.names(run,r2.profile(config)).items():
+            self.resources[(kind,name)]=run;self.log.append(('create',name))
+        r2.verify_object(receiver,client,receipt,io.BytesIO())
+        if self.during:
+            hook,self.during=self.during,None;hook()
+        if self.failure:raise self.failure
+        if r2.profile(config)=='calendar':return calendar_facts(receipt)
+        return {'v':1,'status':'verified','schema_version':34,'manifest_sha256':receipt['wire']['snapshot_sha256'],
+                'checks':{k:True for k in r2.CHECKS}}
+
+
+@pytest.fixture
+def instances(operator,tmp_path):
+    # Two verifier instances on one receiver (ANYM-609): operator's messaging one and a calendar one with
+    # its own receiver config, state, key, marker, directory and bucket prefix; one shared host directory.
+    from test_backup_r2 import Cloud,receive
+    v,config,receiver,cloud,_,write_json=operator
+    for name in ('cal-state','cal-control','cal-verifier'):(tmp_path/name).mkdir(mode=0o700)
+    control=tmp_path/'cal-control'
+    credentials=control/'credentials.json';write_json(credentials,{'access_key_id':'c'*32,'secret_access_key':'d'*64})
+    calendar_receiver={**receiver,'state_directory':str(tmp_path/'cal-state'),'credentials_file':str(credentials),'prefix':'calendar'}
+    calendar_cloud=Cloud();receive(calendar_receiver,calendar_cloud)
+    calendar_receiver={**calendar_receiver,'profile':'calendar'};write_json(control/'receiver.json',calendar_receiver)
+    identity=control/'identity';identity.write_text('SYNTHETIC_NOT_A_KEY');identity.chmod(0o600)
+    calendar={**config,'profile':'calendar','receiver_config_file':str(control/'receiver.json'),
+              'directory':str(tmp_path/'cal-verifier'),'identity_file':str(identity),'protected_file':str(control/'protected.json')}
+    messaging_path=Path(config['receiver_config_file']).parent/'verifier.json';write_json(messaging_path,config)
+    calendar_path=control/'verifier.json';write_json(calendar_path,calendar)
+    def listed():write_json(v.INSTANCES_FILE,{'v':1,'verifier_configs':[str(messaging_path),str(calendar_path)]})
+    host=tmp_path/'host'
+    return SimpleNamespace(v=v,messaging=config,calendar=calendar,cloud=cloud,calendar_cloud=calendar_cloud,
+                           engine=HostEngine(v,tmp_path,host),host=host,paths=[messaging_path,calendar_path],listed=listed,
+                           write_json=write_json,status=lambda c:json.loads((Path(c['directory'])/'status.json').read_text()))
+
+
+def created(engine,profile):
+    return [name for action,name in engine.log if action=='create' and name.startswith('deedkit-verify-'+profile+'-')]
+
+
+# spec: ANYM-609
+def test_two_verifier_instances_started_together_take_turns_on_the_host_lock_and_both_finish(instances,monkeypatch):
+    import contextlib
+    import threading
+    import time
+    s=instances;v=s.v;waiting=threading.Event();real_sleep=time.sleep;results={}
+    # The second instance runs in a thread: no signal deadline there, and no timer left armed.
+    monkeypatch.setattr(v,'deadline',lambda seconds:contextlib.nullcontext())
+    monkeypatch.setattr(v.signal,'setitimer',lambda *args:None)
+    def sleep(seconds):waiting.set();real_sleep(0.01)
+    monkeypatch.setattr(v.time,'sleep',sleep)
+    def calendar():
+        try:results['calendar']=v.run(s.calendar,client=s.calendar_cloud,engine=s.engine)
+        except BaseException as error:results['calendar']=error
+    thread=threading.Thread(target=calendar)
+    def during():
+        # Messaging is mid-restore holding the host lock: the calendar instance waits and creates nothing.
+        thread.start();assert waiting.wait(10)
+        assert created(s.engine,'calendar')==[] and not (Path(s.calendar['directory'])/'active.json').exists()
+    s.engine.during=during
+    assert v.run(s.messaging,client=s.cloud,engine=s.engine)['status']=='verified'
+    thread.join(30);assert not thread.is_alive()
+    assert results['calendar']['status']=='verified',results
+    first_calendar=s.engine.log.index(('create',created(s.engine,'calendar')[0]))
+    assert all(s.engine.log.index(('remove',name))<first_calendar for name in created(s.engine,'messaging'))
+    assert not s.engine.resources and not (s.host/'admission.json').exists()
+
+
+# spec: ANYM-609
+def test_a_host_lock_wait_past_its_bound_ends_busy_with_nothing_created_and_the_journal_unchanged(instances,monkeypatch):
+    import time
+    s=instances;v=s.v;calendar={**s.calendar,'verify_wait_seconds':1};real_sleep=time.sleep;slept=[]
+    monkeypatch.setattr(v.time,'sleep',lambda seconds:(slept.append(seconds),real_sleep(min(seconds,0.05))))
+    active=Path(calendar['directory'])/'active.json'
+    with v.host_lock(s.messaging):
+        with pytest.raises(RuntimeError,match='verifier_host_busy'):v.run(calendar,client=s.calendar_cloud,engine=s.engine)
+    assert slept and not s.engine.log and not active.exists() and s.status(calendar)['error']=='verifier_host_busy'
+    # A pending retry stays exactly as it was.
+    s.engine.failure=RuntimeError('restore_docker_failed')
+    with pytest.raises(RuntimeError,match='restore_docker_failed'):v.run(calendar,client=s.calendar_cloud,engine=s.engine)
+    journal=active.read_bytes();log=list(s.engine.log);s.engine.failure=None
+    with v.host_lock(s.messaging):
+        with pytest.raises(RuntimeError,match='verifier_host_busy'):v.run(calendar,client=s.calendar_cloud,engine=s.engine)
+    assert active.read_bytes()==journal and s.engine.log==log
+    assert v.run(calendar,client=s.calendar_cloud,engine=s.engine)['status']=='verified'
+
+
+# spec: ANYM-609
+def test_low_free_disk_after_the_host_wait_refuses_before_creating_anything(instances,monkeypatch):
+    import contextlib
+    s=instances;v=s.v;holder=contextlib.ExitStack();holder.enter_context(v.host_lock(s.messaging))
+    def sleep(seconds):
+        # The other instance finishes, leaving too little free disk behind.
+        holder.close();monkeypatch.setattr(v.shutil,'disk_usage',lambda path:SimpleNamespace(free=v.GIB))
+    monkeypatch.setattr(v.time,'sleep',sleep)
+    with pytest.raises(ValueError,match='restore_disk_capacity'):v.run(s.calendar,client=s.calendar_cloud,engine=s.engine)
+    assert not s.engine.log and not s.engine.resources and not (s.host/'admission.json').exists()
+    assert s.status(s.calendar)['error']=='restore_disk_capacity'
+
+
+# spec: ANYM-609
+def test_scratch_resources_and_their_admission_record_are_removed_on_success_and_failure(instances):
+    s=instances;v=s.v
+    assert v.run(s.messaging,client=s.cloud,engine=s.engine)['status']=='verified'
+    record=s.engine.admissions[-1];run=json.loads((Path(s.messaging['directory'])/'last-success.json').read_text())['verification_id']
+    assert record['profile']=='messaging' and record['run']==run
+    assert record['resources']==[[kind,name,run] for kind,name in v.names(run,'messaging').items()]
+    assert not s.engine.resources and not (s.host/'admission.json').exists()
+    s.engine.failure=RuntimeError('restore_docker_failed')
+    with pytest.raises(RuntimeError):v.run(s.calendar,client=s.calendar_cloud,engine=s.engine)
+    assert s.engine.admissions[-1]['profile']=='calendar' and created(s.engine,'calendar')
+    assert not s.engine.resources and not (s.host/'admission.json').exists()
+    assert s.status(s.calendar)['cleanup_complete'] is True
+
+
+# spec: ANYM-609
+def test_scratch_names_carry_the_profile_and_a_messaging_retry_from_before_still_removes_its_old_names():
+    v=module();run='a'*32
+    messaging,calendar=v.names(run,'messaging'),v.names(run,'calendar')
+    assert all('-messaging-'+run in name for name in messaging.values()) and all('-calendar-'+run in name for name in calendar.values())
+    assert not set(messaging.values())&set(calendar.values()) and v.names(run)==messaging
+    removed=[]
+    class Engine:
+        def inspect_owned(self,kind,name,owner):return {} if name in v.legacy_names(run).values() else None
+        def remove(self,kind,name):removed.append(name)
+    v.cleanup_resources(Engine(),run);assert removed==list(v.legacy_names(run).values())
+    removed.clear();v.cleanup_resources(Engine(),run,'calendar');assert removed==[]
+
+
+def kill_holder(s,profile='messaging'):
+    """A coordinator SIGKILLed mid-restore: the kernel released its lock, its record and containers remain."""
+    run='f'*32
+    with s.v.host_lock(s.messaging) as fd:
+        s.v.admit(s.engine,fd,profile,run,s.v.run_resources(run,profile))
+        for kind,name,owner in s.v.run_resources(run,profile):s.engine.resources[(kind,name)]=owner
+    return run
+
+
+# spec: ANYM-609
+def test_a_sigkilled_holders_resources_are_removed_before_the_other_profile_starts(instances):
+    s=instances;v=s.v;run=kill_holder(s)
+    assert v.run(s.calendar,client=s.calendar_cloud,engine=s.engine)['status']=='verified'
+    survivors=list(v.names(run,'messaging').values())
+    assert [name for action,name in s.engine.log][:4]==survivors and [a for a,_ in s.engine.log][:4]==['remove']*4
+    assert not s.engine.resources and not (s.host/'admission.json').exists()
+
+
+# spec: ANYM-609
+def test_a_failed_removal_of_a_dead_holders_resources_makes_the_other_profile_refuse(instances):
+    s=instances;v=s.v;run=kill_holder(s);s.engine.fail_remove={v.names(run,'messaging')['postgres']}
+    record=(s.host/'admission.json').read_bytes()
+    with pytest.raises(RuntimeError,match='verifier_cleanup_unconfirmed'):
+        v.run(s.calendar,client=s.calendar_cloud,engine=s.engine)
+    assert created(s.engine,'calendar')==[] and not (Path(s.calendar['directory'])/'active.json').exists()
+    assert (s.host/'admission.json').read_bytes()==record and s.status(s.calendar)['error']=='verifier_cleanup_unconfirmed'
+    s.engine.fail_remove=set()
+    assert v.run(s.calendar,client=s.calendar_cloud,engine=s.engine)['status']=='verified' and not s.engine.resources
+
+
+class PinEngine(HostEngine):
+    """The pin step's Docker: an image preflight that knows only the reviewed pairs."""
+    def __init__(self,*args):super().__init__(*args);self.preflights=[]
+    def preflight(self,config):
+        self.preflights.append((r2.profile(config),config['helper_image'],config['helper_revision']));return str(self.root)
+
+
+@pytest.fixture
+def pins(instances,monkeypatch):
+    from messaging_service import backup_r2_follow as f
+    s=instances;s.listed();s.f=f;s.tested=[];s.failures={}
+    s.engine=PinEngine(s.v,s.engine.root,s.host)
+    def test(engine,tested,run=None):
+        s.tested.append((r2.profile(tested),tested['helper_revision']))
+        if r2.profile(tested) in s.failures:raise s.failures[r2.profile(tested)]
+        return ([2,50],50) if r2.profile(tested)=='messaging' else ([2,50],4)
+    s.update=lambda:f.update_pins(s.v.INSTANCES_FILE,NEW_IMAGE,HEAD,engine=s.engine,test=test)
+    s.pairs=lambda:[(c['helper_image'],c['helper_revision']) for c in map(s.v.load_config,s.paths)]
+    s.old=(s.messaging['helper_image'],s.messaging['helper_revision'])
+    monkeypatch.setattr(f,'Docker',lambda timeout:s.engine);monkeypatch.setattr(f,'self_test',test)
+    return s
+
+
+# spec: ANYM-609
+def test_the_pin_step_moves_every_instance_to_one_self_tested_pair_and_keeps_the_previous_pins(pins,capsys):
+    s=pins
+    assert s.v.main(['--update-pins','--helper-image',NEW_IMAGE,'--helper-revision',HEAD])==0
+    assert json.loads(capsys.readouterr().out)['verifier_configs']==[str(p) for p in s.paths]
+    assert s.pairs()==[(NEW_IMAGE,HEAD)]*2 and s.tested==[('messaging',HEAD),('calendar',HEAD)]
+    assert {p for p,_,_ in s.engine.preflights}=={'messaging','calendar'}
+    previous=json.loads((s.host/'pins-previous.json').read_text())
+    assert previous=={'v':1,'pins':{str(p):list(s.old) for p in s.paths}}
+    assert not (s.host/'pins-switch.json').exists() and not (s.host/'admission.json').exists()
+    # Every other key of both configs is unchanged.
+    for path,config in zip(s.paths,(s.messaging,s.calendar)):
+        assert {**s.v.load_config(path),'helper_image':config['helper_image'],'helper_revision':config['helper_revision']}==config
+
+
+# spec: ANYM-609
+def test_a_pending_calendar_retry_journal_blocks_the_pin_step(pins):
+    s=pins;before=[p.read_bytes() for p in s.paths]
+    s.write_json(Path(s.calendar['directory'])/'active.json',{'v':1,'phase':'restoring'})
+    with pytest.raises(RuntimeError,match='verification_pending'):s.update()
+    assert [p.read_bytes() for p in s.paths]==before and not s.tested
+    with s.v.verifier_lock(s.calendar['directory']):
+        with pytest.raises(RuntimeError,match='verifier_busy'):s.update()
+
+
+# spec: ANYM-609
+def test_a_failing_calendar_self_test_keeps_both_configs_on_the_old_pins(pins):
+    s=pins;before=[p.read_bytes() for p in s.paths];s.failures['calendar']=RuntimeError('helper_self_test_failed')
+    with pytest.raises(RuntimeError,match='helper_self_test_failed'):s.update()
+    assert [p.read_bytes() for p in s.paths]==before and s.tested==[('messaging',HEAD),('calendar',HEAD)]
+    assert not (s.host/'pins-previous.json').exists() and not (s.host/'pins-switch.json').exists()
+
+
+# spec: ANYM-609
+@pytest.mark.parametrize('crash',['failure_first','failure_second','stop_second'])
+def test_a_pin_step_crash_mid_write_leaves_all_old_or_all_new(pins,monkeypatch,crash):
+    s=pins;original=os.replace;writes=[]
+    def replace(src,dst,**kw):
+        if dst=='verifier.json':
+            writes.append(dst)
+            if len(writes)==(1 if crash=='failure_first' else 2):
+                if crash=='stop_second':r2.cancel(InterruptedError('restore_stopped'))  # the service stop's handler
+                raise OSError('synthetic crash')
+        return original(src,dst,**kw)
+    monkeypatch.setattr(os,'replace',replace)
+    with pytest.raises((OSError,InterruptedError)):s.update()
+    monkeypatch.setattr(os,'replace',original)
+    if crash=='stop_second':
+        # Stopped between two writes: no instance runs on the mixed pair until a pin step puts it back.
+        assert s.pairs()==[(NEW_IMAGE,HEAD),s.old] and (s.host/'pins-switch.json').exists()
+        for config,cloud in ((s.messaging,s.cloud),(s.calendar,s.calendar_cloud)):
+            with pytest.raises(RuntimeError,match='verifier_pins_unfinished'):
+                s.v.run(config,client=cloud,engine=s.engine)
+        with s.v.host_directory(s.messaging) as host:s.f.recover_pins(host,s.paths)
+    assert s.pairs()==[s.old]*2 and not (s.host/'pins-switch.json').exists()
+    assert s.update()['status']=='pinned' and s.pairs()==[(NEW_IMAGE,HEAD)]*2
+
+
+# spec: ANYM-609
+def test_follow_moves_the_calendar_pins_with_messagings_after_self_testing_both_profiles(follower,instances):
+    s=follower;instances.listed();calendar=instances.paths[1]
+    old=(s.config['helper_image'],s.config['helper_revision'])
+    assert s.run()['status']=='switched'
+    assert [(c['helper_image'],c['helper_revision']) for c in map(s.v.load_config,(s.path,calendar))]==[(NEW_IMAGE,HEAD)]*2
+    assert s.profiles==['messaging','messaging','calendar']
+    assert s.revert()['status']=='reverted'
+    assert [(c['helper_image'],c['helper_revision']) for c in map(s.v.load_config,(s.path,calendar))]==[old]*2
+
+
+# spec: ANYM-609
+def test_follow_keeps_both_instances_on_the_old_pins_when_the_calendar_self_test_fails(follower,instances):
+    s=follower;instances.listed();before=[p.read_bytes() for p in instances.paths]
+    s.calendar_failure=RuntimeError('helper_self_test_failed')
+    with pytest.raises(RuntimeError,match='helper_self_test_failed'):s.run()
+    assert [p.read_bytes() for p in instances.paths]==before and NEW_IMAGE in s.docker.removed
+    assert follow_status(s)['error']=='helper_self_test_failed'
+    write=instances.write_json;write(Path(instances.calendar['directory'])/'active.json',{'v':1})
+    with pytest.raises(RuntimeError,match='verification_pending'):s.run()
+
+
+# spec: ANYM-609
+def test_verifier_units_allow_the_host_wait_on_top_of_the_restore_deadline_and_the_instances_example_loads(monkeypatch):
+    from messaging_service import backup_r2_follow as f
+    v=module();root=Path(__file__).resolve().parents[1]/'deploy'
+    for name in ('deedkit-backup-r2-verifier.service','deedkit-calendar-backup-r2-verifier.service'):
+        limit=[line.split('=',1)[1] for line in (root/name).read_text().splitlines() if line.startswith('TimeoutStartSec=')]
+        assert limit==['25500s'] and 25500>=21600+v.VERIFY_WAIT_SECONDS+180
+    example=root/'backup-r2-instances.example.json'
+    monkeypatch.setattr(v,'private_file',lambda path,limit:Path(path).read_bytes())
+    assert f.read_instances(example)==[Path(p) for p in r2.unique_json(example.read_bytes())['verifier_configs']]

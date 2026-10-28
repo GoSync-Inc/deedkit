@@ -11,9 +11,14 @@ receiver's `capabilities` mode. Anything unproven keeps the current pair and is
 reported. It holds the verifier lock throughout, so it never runs while a
 verification runs, and it never switches while a retry journal waits.
 
+With an instances file (ANYM-609) the pins of every verifier instance move
+together: the follow holds every instance's lock, self-tests each profile and
+switches all configs or none. `update_pins` is the same step by hand.
+
 The verifier code itself (the venv) is not followed: it is installed by hand.
 """
 import argparse
+from contextlib import ExitStack, contextmanager
 import hashlib
 import json
 import os
@@ -55,13 +60,15 @@ SELF_TEST = 'selftest-'
 PULL_BYTES = 4 * verifier.GIB
 TEMPORARY = re.compile(r'\.capabilities\.json-[0-9a-f]{32}')
 # Answers that only mean "not now": the service exits cleanly and the next tick retries.
-WAITING = {'verifier_busy', 'verification_pending', 'helper_unattested', 'attestation_unreachable', 'main_unreachable'}
+WAITING = {'verifier_busy', 'verifier_host_busy', 'verification_pending', 'helper_unattested', 'attestation_unreachable', 'main_unreachable'}
 SAFE = WAITING | {'follow_config_mismatch', 'follow_not_forward', 'helper_attestation_refused',
                   'attest_verifier_unavailable', 'helper_pull_failed', 'helper_schemas_unavailable',
                   'helper_self_test_mismatch', 'helper_self_test_failed', 'publication_directory_foreign',
                   'publication_foreign', 'publication_mount_point', 'untrusted_operator_ancestor',
                   'no_previous_pair', 'invalid_follow_record', 'follow_switch_unresolved', 'follow_disk_capacity',
-                  'publication_directory_private', 'invalid_verifier_config', 'follow_candidate_unresolved'}
+                  'publication_directory_private', 'invalid_verifier_config', 'follow_candidate_unresolved',
+                  'verifier_cleanup_unconfirmed', 'verifier_pins_unfinished', 'instances_invalid', 'pins_switch_unresolved',
+                  'immutable_reviewed_images_required', 'root_verifier_required'}
 SCHEMA_PROBE = ('import json;from messaging_service.backup import SCHEMAS as s;'
                 'print(json.dumps([s.start,s.stop-1] if s.step==1 else None))')
 # The native drill's synthetic fixture (tests/test_backup_r2_verifier_native.py), run by the image under test.
@@ -93,6 +100,43 @@ try:
     encrypt_snapshot(root/'snapshot',root/'ciphertext',recipient)
     (root/'manifest-sha256').write_text(hashlib.sha256((root/'snapshot/manifest.json').read_bytes()).hexdigest())
 finally:store.close()
+'''
+# The calendar profile's synthetic bundle (ANYM-609), as the native drill makes it: fcs tables, one enabled
+# connection with its vault token, one disabled one without; made and encrypted by the image under test.
+CALENDAR_FIXTURE_SCRIPT = r'''
+import hashlib,os
+from pathlib import Path
+from cryptography.fernet import Fernet
+import psycopg
+from psycopg.conninfo import make_conninfo
+from messaging_service.backup_calendar import create_calendar_snapshot
+from messaging_service.backup_crypto import encrypt_snapshot
+root=Path('/fixture')
+recipient=os.environ['DEEDKIT_SYNTHETIC_RECIPIENT']
+password=os.environ['POSTGRES_PASSWORD']
+base=dict(host='restore-postgres',user='restore_owner',password=password,port='5432')
+with psycopg.connect(make_conninfo(**base,dbname='deedkit_verify_restore_test'),autocommit=True) as c:
+    c.execute('CREATE DATABASE deedkit_calendar_fixture')
+dsn=make_conninfo(**base,dbname='deedkit_calendar_fixture')
+with psycopg.connect(dsn,autocommit=True) as c:
+    c.execute("""CREATE SCHEMA fcs;
+        CREATE TABLE fcs.migrations(version int PRIMARY KEY, checksum text NOT NULL);
+        INSERT INTO fcs.migrations SELECT v,'synthetic-'||v FROM generate_series(1,4) v;
+        CREATE TABLE fcs.connections(id text PRIMARY KEY, provider text NOT NULL, enabled boolean NOT NULL DEFAULT true);
+        INSERT INTO fcs.connections VALUES ('home','google',true),('old','icloud',false);
+        CREATE TABLE fcs.events(id int PRIMARY KEY, title text, at timestamptz);
+        INSERT INTO fcs.events SELECT g,'synthetic '||g,'2026-10-28 12:00+00'::timestamptz+g*interval '1 hour' FROM generate_series(1,50) g""")
+vault=root/'vault';profile=root/'profile';vault.mkdir(mode=0o700);profile.mkdir(mode=0o700)
+key=Fernet.generate_key();(vault/'key').write_bytes(key)
+(vault/'home.enc').write_bytes(Fernet(key).encrypt(b'{"refresh_token":"SYNTHETIC_NOT_A_TOKEN"}'))
+for name,data in (('postgres.env',b'POSTGRES_PASSWORD=synthetic\n'),('runtime.json',b'{}\n'),('gateway.json',b'{}\n'),
+                  ('worker.json',b'{}\n')):
+    (profile/name).write_bytes(data)
+os.environ['PGPASSWORD']=password
+public=make_conninfo(host='restore-postgres',user='restore_owner',port='5432',dbname='deedkit_calendar_fixture')
+create_calendar_snapshot(dsn,root/'snapshot',['pg_dump','--dbname='+public],vault_directory=vault,profile_directory=profile)
+encrypt_snapshot(root/'snapshot',root/'ciphertext',recipient)
+(root/'manifest-sha256').write_text(hashlib.sha256((root/'snapshot/manifest.json').read_bytes()).hexdigest())
 '''
 
 
@@ -194,17 +238,26 @@ def fixture_run(run):
     return hashlib.sha256(run.encode()).hexdigest()[:32]
 
 
-def self_test_containers(run):
+def self_test_containers(run, profile='messaging', names=None):
     """The exact names and owner run of a self-test's own containers."""
-    source = fixture_run(run)
-    return [(verifier.names(run)['helper'] + '-probe', run), (verifier.names(source)['helper'] + '-fixture', source)]
+    source = fixture_run(run); names = names or (lambda owner: verifier.names(owner, profile))
+    return [(names(run)['helper'] + '-probe', run), (names(source)['helper'] + '-fixture', source)]
+
+
+def self_test_resources(run, profile):
+    """Every resource one self-test may create, by exact name and owner: its host admission record."""
+    return ([('helper', name, owner) for name, owner in self_test_containers(run, profile)] +
+            verifier.run_resources(fixture_run(run), profile) + verifier.run_resources(run, profile))
 
 
 def clear_self_test(engine, directory, run):
-    """Remove one self-test's exact labelled resources and its workspace (also after a crash)."""
-    for name, owner in self_test_containers(run):
+    """Remove one self-test's exact labelled resources and its workspace (also after a crash).
+    Its workspace does not name its profile: every profile's names, and those from before ANYM-609."""
+    containers = [item for profile in r2.PROFILES for item in self_test_containers(run, profile)]
+    for name, owner in containers + self_test_containers(run, names=verifier.legacy_names):
         if engine.inspect_owned('helper', name, owner) is not None:engine.remove('helper', name)
-    verifier.cleanup_resources(engine, fixture_run(run)); verifier.cleanup_resources(engine, run)
+    for profile in r2.PROFILES:
+        verifier.cleanup_resources(engine, fixture_run(run), profile); verifier.cleanup_resources(engine, run, profile)
     path = Path(directory) / (SELF_TEST + run)
     try:info = path.lstat()
     except FileNotFoundError:return
@@ -220,19 +273,19 @@ def sweep_self_tests(engine, directory):
             clear_self_test(engine, directory, name[len(SELF_TEST):])
 
 
-def self_test(engine, config):
+def self_test(engine, config, run=None):
     """Read the image's `backup.SCHEMAS` in a networkless container, then restore a synthetic
-    PG18 bundle, made and age-encrypted by the image under test, with that image as the helper,
-    through the verifier's own isolated restore. Returns (schemas, proven schema version).
+    bundle of the config's profile, made and age-encrypted by the image under test, with that image
+    as the helper, through the verifier's own isolated restore. Returns (schemas, proven schema version).
     A throwaway identity; the receiver's key is never mounted. Every container is named and
     labelled before it exists, so a crash or a hung one is removed by exact name later."""
-    directory = Path(config['directory'])
+    directory = Path(config['directory']); profile = r2.profile(config)
     sweep_self_tests(engine, directory)
-    run = secrets.token_hex(16); source = fixture_run(run); root = directory / (SELF_TEST + run)
+    run = run or secrets.token_hex(16); source = fixture_run(run); root = directory / (SELF_TEST + run)
     root.mkdir(mode=0o700); local.fsync_dir(directory)
     fixture = root / 'fixture'; fixture.mkdir(mode=0o700)
     tested = {**config, 'identity_file': str(fixture / 'identity')}
-    (probe, _), (name, _) = self_test_containers(run)
+    (probe, _), (name, _) = self_test_containers(run, profile)
     pg_tmpfs = verifier.PG_DATA_PATH + ':' + verifier.HELPER_TMPFS[verifier.PG_DATA_PATH]
     try:
         engine.command('container', 'create', '--name', probe, '--label', verifier.LABEL + '=' + run,
@@ -263,16 +316,17 @@ def self_test(engine, config):
         verifier.write_secret(source_secrets / 'worker.json', b'{}\n')
         engine.setup(tested, source, source_payload, source_secrets)
         engine.command('container', 'create', '--name', name, '--label', verifier.LABEL + '=' + source,
-                       '--label', verifier.LABEL + '.owned=1', '--network', verifier.names(source)['network'],
+                       '--label', verifier.LABEL + '.owned=1', '--network', verifier.names(source, profile)['network'],
                        '--memory=512m', '--memory-swap=512m', '--cpus=1', '--pids-limit=256', '--log-driver=none',
                        '--tmpfs', pg_tmpfs,
                        '--env-file', str(source_secrets / 'postgres.env'), '--env', 'DEEDKIT_SYNTHETIC_RECIPIENT=' + recipient,
                        '--mount', 'type=bind,src=' + str(fixture) + ',dst=/fixture',
-                       '--entrypoint', 'python', config['helper_image'], '-c', FIXTURE_SCRIPT)
+                       '--entrypoint', 'python', config['helper_image'], '-c',
+                       CALENDAR_FIXTURE_SCRIPT if profile == 'calendar' else FIXTURE_SCRIPT)
         engine.command('container', 'start', '-a', name)
         state = r2.unique_json(engine.command('container', 'inspect', name))[0]['State']
         if state.get('ExitCode') != 0:raise RuntimeError('helper_self_test_failed')
-        engine.remove('helper', name); verifier.cleanup_resources(engine, source)
+        engine.remove('helper', name); verifier.cleanup_resources(engine, source, profile)
         cipher = fixture / 'ciphertext'; snapshot = (fixture / 'manifest-sha256').read_text()
         with cipher.open('rb') as data:digest = hashlib.file_digest(data, 'sha256').hexdigest()
         receipt = {'wire': {'id': '20261028T000000Z-0000000000000597', 'bytes': cipher.stat().st_size,
@@ -280,20 +334,35 @@ def self_test(engine, config):
         class Fixture:
             def get_object(self, **_):return {'ContentLength': cipher.stat().st_size, 'Body': cipher.open('rb')}
         verifier.write_secret(target_secrets / 'postgres.env', env)
-        verifier.write_secret(target_secrets / 'worker.json', r2.encoded({
-            'v': 1, 'identity_file': '/run/restore/identity', 'work_directory': '/work', 'database_host': 'restore-postgres',
-            'database_password': password, 'snapshot_sha256': snapshot, 'max_plaintext_bytes': receipt['wire']['bytes']}))
+        worker = {'v': 1, 'identity_file': '/run/restore/identity', 'work_directory': '/work', 'database_host': 'restore-postgres',
+                  'database_password': password, 'snapshot_sha256': snapshot, 'max_plaintext_bytes': receipt['wire']['bytes']}
+        if profile == 'calendar':worker['profile'] = profile
+        verifier.write_secret(target_secrets / 'worker.json', r2.encoded(worker))
         facts = engine.restore(tested, {'bucket': 'synthetic'}, Fixture(), receipt, run, target_payload, target_secrets)
-        return schemas, verifier.make_proof(receipt, facts, run)['verification']['schema_version']
+        return schemas, verifier.make_proof(receipt, facts, run, profile)['verification']['schema_version']
     finally:
         clear_self_test(Docker(120) if isinstance(engine, verifier.Docker) else engine, directory, run)
+
+
+def admitted_test(engine, config, test):
+    """One self-test as the host's one heavy restore (ANYM-609): its exact resources are recorded
+    before any exists. Its caller holds every instance's lock, so it never waits for a verification;
+    a holder it finds is one outside the instances file and is a wait, not a refusal."""
+    profile = r2.profile(config); run = secrets.token_hex(16)
+    with verifier.host_lock(config, wait=0) as fd:
+        verifier.admit(engine, fd, profile, run, self_test_resources(run, profile))
+        result = test(engine, config, run)
+        # Kept after a failure: the next holder confirms its resources gone first.
+        verifier.release_admission(fd)
+    return result
 
 
 def prove(engine, config, test):
     """Preflight, schema probe and self-test of one pinned pair: its follow record."""
     engine.preflight(config)
-    schemas, version = test(engine, config)
-    if version != schemas[1]:raise ValueError('helper_self_test_mismatch')
+    schemas, version = admitted_test(engine, config, test)
+    # The calendar's schema is fcs.migrations', not the image's backup.SCHEMAS.
+    if r2.profile(config) == 'messaging' and version != schemas[1]:raise ValueError('helper_self_test_mismatch')
     return {'v': 1, 'helper_image': config['helper_image'], 'helper_revision': config['helper_revision'],
             'helper_schemas': schemas, 'tested_at': verifier.now()}
 
@@ -349,12 +418,106 @@ def finish_switch(fd, engine, journal):
     unlink(fd, SWITCH)
 
 
-def switch(path, fd, engine, journal):
-    """Journal, then one atomic config replace, then the records: `from` survives every crash."""
+def switch(path, fd, engine, journal, paths):
+    """Journal, then every instance's config to `to` (move_pins), then the records: `from` survives every crash."""
     local.write_maintenance_json(SWITCH, journal, dir_fd=fd)
-    config = write_pins(path, journal['to']['helper_image'], journal['to']['helper_revision'])
+    with verifier.host_directory(verifier.load_config(path)) as host:
+        move_pins(host, paths, journal['to']['helper_image'], journal['to']['helper_revision'])
     finish_switch(fd, engine, journal)
-    return config
+    return verifier.load_config(path)
+
+
+def pair(config):
+    return [config['helper_image'], config['helper_revision']]
+
+
+def valid_pair(value):
+    return (isinstance(value, list) and len(value) == 2 and isinstance(value[0], str) and DIGEST.fullmatch(value[0]) is not None and
+            isinstance(value[1], str) and re.fullmatch('[0-9a-f]{40}', value[1]) is not None)
+
+
+def move_pins(host, paths, image, revision):
+    """Every instance's config to one pair, or none (ANYM-609, C2). The journal holds each config's
+    old pair first; each config is one atomic replace; a failure puts the written ones back, and a
+    crash is put back by the next run's recover_pins. Each verifier refuses to start meanwhile."""
+    journal = {'v': 1, 'to': [image, revision], 'from': {str(p): pair(verifier.load_config(p)) for p in paths}}
+    local.write_maintenance_json(verifier.PINS_SWITCH, journal, dir_fd=host)
+    try:
+        for p in paths:write_pins(p, image, revision)
+    except BaseException:
+        if not r2.CANCELLED:
+            try:undo_pins(host, journal)
+            except Exception:pass  # the journal stays: recover_pins finishes it
+        raise
+    # The previous pairs, for the documented undo (an update_pins run back to them).
+    local.write_maintenance_json(verifier.PINS_PREVIOUS, {'v': 1, 'pins': journal['from']}, dir_fd=host)
+    unlink(host, verifier.PINS_SWITCH)
+
+
+def undo_pins(host, journal):
+    for p, old in journal['from'].items():
+        if pair(verifier.load_config(p)) != old:write_pins(Path(p), *old)
+    unlink(host, verifier.PINS_SWITCH)
+
+
+def recover_pins(host, paths):
+    """A pin step that died between two config writes: every config back on its old pair."""
+    _, journal = r2.read_root(host, verifier.PINS_SWITCH, missing=True)
+    if journal is None:return
+    if (not isinstance(journal, dict) or set(journal) != {'v', 'to', 'from'} or type(journal['v']) is not int or
+            journal['v'] != 1 or not valid_pair(journal['to']) or not isinstance(journal['from'], dict) or
+            set(journal['from']) != {str(p) for p in paths} or not all(valid_pair(v) for v in journal['from'].values())):
+        raise ValueError('pins_switch_unresolved')
+    if any(pair(verifier.load_config(p)) not in (old, journal['to']) for p, old in journal['from'].items()):
+        raise ValueError('pins_switch_unresolved')
+    undo_pins(host, journal)
+
+
+def read_instances(file, default=None):
+    """The instances file's verifier configs: {"v": 1, "verifier_configs": [absolute paths]}.
+    Without the file, `default` (the follow's own config alone), else `instances_invalid`."""
+    try:value = r2.unique_json(verifier.private_file(file, 16384))
+    except FileNotFoundError:
+        if default is None:raise ValueError('instances_invalid') from None
+        return default
+    configs = value.get('verifier_configs') if isinstance(value, dict) else None
+    if (not isinstance(value, dict) or set(value) != {'v', 'verifier_configs'} or type(value['v']) is not int or
+            value['v'] != 1 or not isinstance(configs, list) or not 1 <= len(configs) <= 8 or
+            any(not isinstance(p, str) or not Path(p).is_absolute() or '..' in Path(p).parts for p in configs) or
+            len(set(configs)) != len(configs)):
+        raise ValueError('instances_invalid')
+    return [Path(p) for p in configs]
+
+
+def load_instances(paths):
+    """Every instance's config: separate directories, one shared host directory."""
+    configs = [verifier.load_config(p) for p in paths]
+    if (len({c['directory'] for c in configs}) != len(configs) or
+            len({verifier.host_settings(c)[0] for c in configs}) != 1):
+        raise ValueError('instances_invalid')
+    return configs
+
+
+@contextmanager
+def locked(configs):
+    """Every instance's verifier lock, in the instances file's order; none waits (`verifier_busy`)."""
+    with ExitStack() as stack:
+        yield [stack.enter_context(verifier.verifier_lock(c['directory'])) for c in configs]
+
+
+def instances(path, config):
+    """The follow's instances: its own config first, then the others the instances file lists."""
+    paths = read_instances(verifier.INSTANCES_FILE, default=[path])
+    if path not in paths:raise ValueError('follow_config_mismatch')
+    paths = [path, *[p for p in paths if p != path]]
+    return paths, [config, *load_instances(paths)[1:]]
+
+
+def reload_instances(paths, configs):
+    """The configs as they are under every lock, in the same directories."""
+    fresh = load_instances(paths)
+    if [c['directory'] for c in fresh] != [c['directory'] for c in configs]:raise ValueError('instances_invalid')
+    return fresh
 
 
 def recover(fd, engine, config):
@@ -477,7 +640,7 @@ def no_retry_pending(fd):
     if r2.read_root(fd, 'active.json', missing=True)[1] is not None:raise RuntimeError('verification_pending')
 
 
-def candidate(fd, engine, config, head, attest, test):
+def candidate(fd, engine, config, head, attest, test, profiles=()):
     """Pull, check and self-test main's head image: its record. A refused pull is removed."""
     # An unresolved earlier candidate keeps its record: never overwritten by a new one.
     if r2.read_root(fd, CANDIDATE, missing=True)[1] is not None:raise ValueError('follow_candidate_unresolved')
@@ -490,25 +653,33 @@ def candidate(fd, engine, config, head, attest, test):
         local.write_maintenance_json(CANDIDATE, {'v': 1, 'helper_image': image}, dir_fd=fd)
     try:
         engine.pull(proof['reference'])
-        return prove(engine, {**config, 'helper_image': image, 'helper_revision': head}, test)
+        tested = {**config, 'helper_image': image, 'helper_revision': head}
+        record = prove(engine, tested, test)
+        # Every other instance's profile on its own synthetic bundle: the pins move only together.
+        for profile in profiles:admitted_test(engine, {**tested, 'profile': profile}, test)
+        return record
     except Exception:
         if owned and not r2.CANCELLED:drop_candidate(fd, engine, config, image)
         raise
 
 
 def follow(path, *, engine=None, main=None, attest=None, test=None):
-    path, config = load(path)
+    path, config = load(path); paths, configs = instances(path, config)
     engine = engine if engine is not None else Docker(3600)
     main = main if main is not None else Main(config['directory'])
     attest = attest or attested; test = test or self_test
-    with verifier.verifier_lock(config['directory']) as fd, verifier.deadline(3600):
+    with locked(configs) as fds, verifier.deadline(3600):
+        fd = fds[0]
         status = {'v': 1, 'status': 'current', 'revision': config['helper_revision'], 'checked_at': verifier.now()}
         try:
-            config = reload(path, config); status['revision'] = config['helper_revision']
+            config = reload(path, config); configs = reload_instances(paths, configs)
+            status['revision'] = config['helper_revision']
             # Leftover self-test containers go first, also while a verification retry waits for its resources.
             sweep_self_tests(engine, config['directory'])
-            no_retry_pending(fd)
+            for held in fds:no_retry_pending(held)
+            with verifier.host_directory(config) as host:recover_pins(host, paths)
             recover(fd, engine, config); config = reload(path, config)
+            profiles = list(dict.fromkeys(r2.profile(c) for c in configs if r2.profile(c) != r2.profile(config)))
             current = read_record(fd, CURRENT)
             if not pinned(current, config):current = None
             head = main.head(); refusal = untested = None
@@ -524,7 +695,7 @@ def follow(path, *, engine=None, main=None, attest=None, test=None):
                 status['candidate'] = head
                 try:
                     if not main.forward(config['helper_revision'], head):raise ValueError('follow_not_forward')
-                    record = candidate(fd, engine, config, head, attest, test)
+                    record = candidate(fd, engine, config, head, attest, test, profiles)
                 except Exception as error:
                     if r2.CANCELLED:raise
                     refusal = error
@@ -532,7 +703,8 @@ def follow(path, *, engine=None, main=None, attest=None, test=None):
                     kept = read_record(fd, PREVIOUS)
                     drop = kept['helper_image'] if kept and kept['helper_image'] not in (
                         config['helper_image'], record['helper_image']) else None
-                    config = switch(path, fd, engine, {'v': 1, 'from': current or unproven(config), 'to': record, 'drop': drop})
+                    config = switch(path, fd, engine, {'v': 1, 'from': current or unproven(config), 'to': record, 'drop': drop},
+                                    paths)
                     unlink(fd, CANDIDATE); current = record
                     status.update(status='switched', revision=head)
             if current is None:raise refusal or untested or RuntimeError('follow_failed')
@@ -551,24 +723,50 @@ def follow(path, *, engine=None, main=None, attest=None, test=None):
 
 def revert(path, *, engine=None):
     """Switch back to the kept pair; the replaced pair becomes the kept one."""
-    path, config = load(path)
+    path, config = load(path); paths, configs = instances(path, config)
     engine = engine if engine is not None else Docker(600)
-    with verifier.verifier_lock(config['directory']) as fd:
-        config = reload(path, config)
+    with locked(configs) as fds:
+        fd = fds[0]
+        config = reload(path, config); configs = reload_instances(paths, configs)
         sweep_self_tests(engine, config['directory'])
-        no_retry_pending(fd)
+        for held in fds:no_retry_pending(held)
+        with verifier.host_directory(config) as host:recover_pins(host, paths)
         recover(fd, engine, config); config = reload(path, config)
         previous = read_record(fd, PREVIOUS)
         if previous is None:raise ValueError('no_previous_pair')
         engine.preflight({**config, 'helper_image': previous['helper_image'], 'helper_revision': previous['helper_revision']})
         current = read_record(fd, CURRENT)
+        # Every instance moves back with it: the pins move only together.
         switch(path, fd, engine, {'v': 1, 'from': current if pinned(current, config) else unproven(config),
-                                  'to': previous, 'drop': None})
+                                  'to': previous, 'drop': None}, paths)
         # A pair never proven here is not published until a follow run proves it.
         if previous['helper_schemas'] is not None:publish(path, previous)
         status = {'v': 1, 'status': 'reverted', 'revision': previous['helper_revision'], 'checked_at': verifier.now()}
         local.write_maintenance_json(STATUS, status, dir_fd=fd)
         return status
+
+
+def update_pins(instances_file, image, revision, *, engine=None, test=None):
+    """The pin step (ANYM-609, C2): every config the instances file lists to one helper pair in one
+    run, or none. It holds every instance's lock, refuses while any has a retry journal, preflights
+    the pair for each, self-tests it on each profile's synthetic bundle, then moves all pins."""
+    if os.geteuid() != 0:raise ValueError('root_verifier_required')
+    if (not isinstance(image, str) or not DIGEST.fullmatch(image) or
+            not isinstance(revision, str) or not re.fullmatch('[0-9a-f]{40}', revision)):
+        raise ValueError('immutable_reviewed_images_required')
+    paths = read_instances(Path(instances_file)); configs = load_instances(paths)
+    engine = engine if engine is not None else Docker(3600); test = test or self_test
+    with locked(configs) as fds, verifier.deadline(3600):
+        configs = reload_instances(paths, configs); base = configs[0]
+        sweep_self_tests(engine, base['directory'])
+        with verifier.host_directory(base) as host:recover_pins(host, paths)
+        for held in fds:no_retry_pending(held)
+        for config in configs:engine.preflight({**config, 'helper_image': image, 'helper_revision': revision})
+        tested = {**base, 'helper_image': image, 'helper_revision': revision}
+        for profile in dict.fromkeys(r2.profile(c) for c in configs):prove(engine, {**tested, 'profile': profile}, test)
+        with verifier.host_directory(base) as host:move_pins(host, paths, image, revision)
+    return {'v': 1, 'status': 'pinned', 'helper_image': image, 'helper_revision': revision,
+            'verifier_configs': [str(p) for p in paths]}
 
 
 def failure_code(error):
