@@ -481,6 +481,7 @@ def test_the_collector_offers_the_adapter_only_its_archived_local_lid(tmp_path, 
 
 # spec: ANYM-430
 def test_a_slow_archive_check_is_a_retryable_timeout_and_the_next_send_still_works(tmp_path, monkeypatch):
+    import threading
     import time
     from messaging_service import whatsapp_collector
     monkeypatch.setattr(whatsapp_collector, 'PHONE_RESOLUTION_SECONDS', 0.3, raising=False)
@@ -499,10 +500,15 @@ def test_a_slow_archive_check_is_a_retryable_timeout_and_the_next_send_still_wor
                'known_chats': [], 'lookup_allowed': True}
         worker.claim = lambda: job
         worker.preflight = lambda *args, **kwargs: None
-        worker.archived = lambda chat: time.sleep(1) or True  # a queued executor or a slow store read
+        # A queued executor or a slow store read: held until the deadline has fired, so it can never win (ANYM-591).
+        release = threading.Event()
+        worker.archived = lambda chat: release.wait(30) or True
         finished = []
         worker.finish = lambda *args: finished.append(args[1:])
-        assert await worker.once()
+        try:
+            assert await worker.once()
+        finally:
+            release.set()
         assert finished == [('failed', {'data': {'code': 'provider_timeout', 'retry': True}}, 'provider_timeout')]
         assert len(provider.send_writer.lines) == 1 and not disconnected  # no second call, pipe synchronized
         async with provider.send_lock:

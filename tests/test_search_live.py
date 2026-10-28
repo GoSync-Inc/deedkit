@@ -163,10 +163,22 @@ def test_the_same_request_id_queues_no_new_provider_request(live):
 
 
 # spec: ANYM-478
-def test_partial_completion_reports_done_and_pending(live):
+def test_partial_completion_reports_done_and_pending(live, monkeypatch):
     s, archive, _, state, _ = live
     key = s.issue_key('live-agent-2', [ACCOUNT, SECOND], permissions=['read', 'read-live'])
-    result = run(s, key, {'query': 'needle'}, [CommandWorker(state, found(archive))], live='on', wait_s=1)
+    original = live_search.wait
+
+    async def after_the_first(store, token, ids, wait_s):
+        # The caller's wait starts once one account's search has finished, so that search never races its deadline
+        # (ANYM-591); the other account has no collector and stays pending past it.
+        for _ in range(600):  # bounded: a search that never finishes fails the assertions below instead of hanging
+            receipts, _ = await original(store, token, ids, 1)
+            if any(r.get('status') not in ('queued', 'dispatching') for r in receipts.values()):
+                break
+            await asyncio.sleep(0.05)
+        return await original(store, token, ids, wait_s)
+    monkeypatch.setattr(live_search, 'wait', after_the_first)
+    result = run(s, key, {'query': 'needle'}, [CommandWorker(state, found(archive))], live='on', wait_s=5)
     entries = {e['account']: e for e in result['result_evidence']['live']}
     assert entries[ACCOUNT]['state'] == 'done'
     assert entries[SECOND]['state'] == 'pending' and entries[SECOND]['operation_id'].startswith('op_')
