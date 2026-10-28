@@ -5,6 +5,7 @@ export type ToolName =
   | 'calendar_assignments'
   | 'calendar_calendars'
   | 'calendar_capabilities'
+  | 'calendar_find_time'
   | 'calendar_members'
   | 'calendar_operation'
   | 'calendar_plan'

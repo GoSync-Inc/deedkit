@@ -5,6 +5,7 @@
   {"name": "calendar_assignments", "read_only": true},
   {"name": "calendar_calendars", "read_only": true},
   {"name": "calendar_capabilities", "read_only": true},
+  {"name": "calendar_find_time", "read_only": true},
   {"name": "calendar_members", "read_only": true},
   {"name": "calendar_operation", "read_only": true},
   {"name": "calendar_plan", "read_only": false},

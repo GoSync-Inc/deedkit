@@ -138,9 +138,13 @@ def exposed(value, key=None):
 def resolver_query(name, values):
     """platform_resolve_target's `to` (ANYM-545) is the name to look up: its candidates' labels and their read-only
     listing repeat it by design. Only that request's `to` stops being payload; phones and file names in the relayed
-    error are still dropped (`sensitive`), and a `to` in any relayed `next` is still checked."""
+    error are still dropped (`sensitive`), and a `to` in any relayed `next` is still checked. calendar_find_time's
+    `people` (ANYM-553) are such names, and its candidates' read-only retry repeats them and the `window`; its
+    `title` stays payload."""
     if name == "platform_resolve_target" and isinstance(values, dict):
         return {key: value for key, value in values.items() if key != "to"}
+    if name == "calendar_find_time" and isinstance(values, dict):
+        return {key: value for key, value in values.items() if key not in ("people", "window")}
     return values
 
 

@@ -18,6 +18,42 @@ def window(start, end):
     return a, b
 
 
+def clock():
+    return datetime.now(timezone.utc)
+
+
+NAMED_WINDOWS = ("today", "tomorrow", "this_week", "next_week")
+QUARTER = 900
+
+
+def find_window(value, zone, now):
+    """calendar_find_time's window (ANYM-553) as (from, to, step): a named window in the family timezone (weeks run
+    Monday to Monday; today and this_week start at the next quarter hour), or ISO {from, to} whose offset-free times
+    are wall time in that zone. step is the window's length in whole days: the widening of an empty answer."""
+    if isinstance(value, str):
+        local = now.astimezone(zone)
+        day = datetime(local.year, local.month, local.day, tzinfo=zone)
+        monday = day - timedelta(days=local.weekday())
+        a, b, step = {
+            "today": (day, day + timedelta(days=1), 1),
+            "tomorrow": (day + timedelta(days=1), day + timedelta(days=2), 1),
+            "this_week": (monday, monday + timedelta(days=7), 7),
+            "next_week": (monday + timedelta(days=7), monday + timedelta(days=14), 7),
+        }[value]
+        soon = datetime.fromtimestamp(-(-now.timestamp() // QUARTER) * QUARTER, timezone.utc)
+        return max(a, soon.astimezone(zone)), b, step
+    a, b = (local if isinstance(local := wall_time(value[k], zone), datetime) else instant(local)
+            for k in ("from", "to"))
+    window(a, b)
+    return a.astimezone(zone), b.astimezone(zone), max(1, -(-(b - a) // timedelta(days=1)))
+
+
+def widened(a, b, step):
+    """One step wider: `to` later by step days, inside the 31-day limit; a window at the limit moves on instead."""
+    end = min(b + timedelta(days=step), a + timedelta(days=31))
+    return (a, end) if end > b else (b, min(b + timedelta(days=step), b + timedelta(days=31)))
+
+
 TIME_FORMAT = (
     "ISO 8601 date-time with offset or Z, e.g. 2026-10-20T10:00:00+08:00; plan event "
     "start/end may omit the offset (YYYY-MM-DDTHH:MM[:SS]) and are then wall time in "
@@ -570,6 +606,48 @@ class FamilyService:
         # a claim that the member is free in every calendar.
         result["configured_bindings_availability"] = "verified"
         return result
+
+    def find_members(self, key, request):
+        """calendar_find_time's people (ANYM-553) as enabled members: a member ID, or a member name the calendar
+        knows (case and spacing ignored). One exact name resolves; several exact ones, or only names containing it,
+        are a selection whose candidates retry the request with that member; none is not_found. The caller comes
+        first unless exclude_me. Returns (principal, [{member_id, label, role}])."""
+        p = self.principal(key)
+        if "availability:read" not in p["scopes"]:
+            raise CalendarError("not_found_or_forbidden")
+        members = self.store.query(
+            "SELECT m.person_id AS member_id,p.label,m.role FROM memberships m JOIN people p ON p.id=m.person_id "
+            "WHERE m.group_id=%s AND m.enabled ORDER BY p.label,m.person_id",
+            (p["group_id"],),
+        )
+
+        def norm(text):
+            return " ".join(text.split()).casefold()
+
+        found = [] if request.get("exclude_me") else [m for m in members if m["member_id"] == p["person_id"]]
+        people = request["people"]
+        for i, name in enumerate(people):
+            wanted = norm(name)
+            exact = [m for m in members if m["member_id"] == name] or [m for m in members if norm(m["label"]) == wanted]
+            if len(exact) == 1:
+                found.extend(exact)
+                continue
+            matches = exact or [m for m in members if wanted and wanted in norm(m["label"])]
+            if not matches:
+                raise CalendarError("not_found", details={"next": {"tool": "calendar_members", "arguments": {}}})
+            # The retry names every member by ID; the title stays out, since a relayed next must not repeat it.
+            done = [m["member_id"] for m in found if m["member_id"] != p["person_id"] or request.get("exclude_me")]
+            retry = {k: v for k, v in request.items() if k not in ("title", "refresh")}
+            raise CalendarError("selection_required", details={"candidates": [
+                {"id": m["member_id"], "kind": "member", "label": m["label"][:200],
+                 "next": {"tool": "calendar_find_time",
+                          "arguments": {**retry, "people": [*done, m["member_id"], *people[i + 1:]]}}}
+                for m in matches[:10]
+            ]})
+        found = list({m["member_id"]: m for m in found}.values())
+        if not found:
+            raise CalendarError("invalid_arguments", [{"field": "people", "reason": "required"}])
+        return p, found
 
     def plan(self, key, actions, carry_projections=False, invitations=False):
         p = self.principal(key)
