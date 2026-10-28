@@ -83,7 +83,7 @@ its first test step, prints them and keeps the inventory as `exclusions.json` in
 its fragment; `checks / evidence` refuses fragments whose inventories differ.
 The `checks / added` job, on its own runner and with no cache it saves, runs only
 the added tests, one pytest per Python project, one `go test` per Go package
-(each added test, fuzz seed and example with output must report that it ran) and
+(each added test, fuzz seed and example that `go test -list` names must report that it ran) and
 one `node --test` per package, and uploads `ci-evidence-added` (`added.json`
 with result `passed`, `failed` or `none`, and empty module checks); with no added
 test it passes and says so. Assembly refuses an `added` fragment without a valid

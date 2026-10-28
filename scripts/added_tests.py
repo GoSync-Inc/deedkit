@@ -43,10 +43,11 @@ REPORT = "added.json"
 # Python projects with their own environment; any other Python test runs in the root project.
 PYTHON_PROJECTS = ("services/gateway", "services/calendar", "services/calls")
 NODE_TESTS = re.compile(r"\.test\.(js|mjs|cjs|ts)$")
-# Go runs a `Test`, `Fuzz` (its seed corpus) or `Example` function whose name goes on with no lower-case letter;
-# an example runs only with an output comment. `TestMain` is the package's harness, not a test.
-GO_TEST = re.compile(r"^func ((?:Test|Fuzz|Example)(?![a-z])\w*)\(", re.M)
-GO_OUTPUT = re.compile(r"^\s*// (?:Unordered output|Output):", re.M | re.I)
+# The candidates are the file's `Test`, `Fuzz` (its seed corpus) and `Example` functions whose name goes on with no
+# lower-case letter; `TestMain` is the package's harness, not a test. Which of them run (an example only with an output
+# comment, in any comment form) is `go test -list`'s answer, not this pattern's.
+GO_COMMENT = r"/\*(?:[^*]|\*+[^*/])*\*+/"
+GO_TEST = re.compile(rf"^[ \t]*func\s+((?:Test|Fuzz|Example)(?![a-z])\w*)\s*(?:{GO_COMMENT}\s*)*\(", re.M)
 QUEUE = """query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { mergeQueue(branch: "main") {
   entries(first: 100) { nodes { headCommit { oid } baseCommit { oid } pullRequest {
     number headRefName headRefOid headRepository { nameWithOwner } } } } } } }"""
@@ -223,26 +224,24 @@ def plan(document: dict, root: Path) -> list[dict]:
         elif language == "go":
             tests = sorted({test for name in names for test in go_tests((root / name).read_text(errors="replace"))})
             directory = PurePosixPath(package).relative_to(project) if project != "." else PurePosixPath(package)
-            argv = ["go", "test", "-count=1", "-v", "-run", f"^({'|'.join(tests)})$" if tests else "^$", f"./{directory}"]
-            expected = tests  # each must report `=== RUN`, so a selection that misses one fails
+            selection = f"^({'|'.join(tests)})$" if tests else "^$"
+            argv = ["go", "test", "-count=1", "-v", "-run", selection, f"./{directory}"]
+            # Go lists the candidates it runs; each of them must report `=== RUN`, so a selection that misses one fails.
+            listing = ["go", "test", "-list", selection, f"./{directory}"]
+            expected = tests
         else:
             argv = ["node", "--test", *relative]
         # `uv run --frozen` installs a Python project's locked environment itself; a Node package installs its own.
         prepare = [["npm", "ci", "--ignore-scripts", "--no-audit"]] \
             if language == "node" and (root / project / "package-lock.json").is_file() else []
         runs.append({"language": language, "project": project, "files": names, "prepare": prepare, "argv": argv,
-                     "expected": expected})
+                     "expected": expected, **({"list": listing} if language == "go" else {})})
     return runs
 
 
 def go_tests(source: str) -> list[str]:
-    """The functions `go test` runs from one test file: tests, fuzz seeds and examples with an output comment."""
-    # A function's text runs to the next top-level declaration.
-    starts = [match.start() for match in re.finditer(r"^(?:func|type|var|const) ", source, re.M)] + [len(source)]
-    bodies = {match.group(1): source[match.start():next(end for end in starts if end > match.start())]
-              for match in GO_TEST.finditer(source)}
-    return [name for name in GO_TEST.findall(source)
-            if name != "TestMain" and (not name.startswith("Example") or GO_OUTPUT.search(bodies.get(name, "")))]
+    """The candidate functions of one test file: tests, fuzz targets and examples, without `TestMain`."""
+    return [name for name in dict.fromkeys(GO_TEST.findall(source)) if name != "TestMain"]
 
 
 def run(document: dict, root: Path, evidence: Path) -> int:
@@ -255,6 +254,13 @@ def run(document: dict, root: Path, evidence: Path) -> int:
         for argv in item["prepare"]:
             if item["returncode"] == 0:
                 item["returncode"] = subprocess.run(argv, cwd=root / item["project"], check=False).returncode
+        if item["returncode"] == 0 and item.get("list"):
+            listed_tests = subprocess.run(item["list"], cwd=root / item["project"], check=False, capture_output=True, text=True)
+            if listed_tests.returncode:
+                print(listed_tests.stdout + listed_tests.stderr, end="", flush=True)
+            item["returncode"] = listed_tests.returncode
+            registered = set(listed_tests.stdout.split())
+            item["expected"] = [name for name in item["expected"] if name in registered]
         if item["returncode"] == 0:
             done = subprocess.run(item["argv"], cwd=root / item["project"], check=False, capture_output=True, text=True)
             print(done.stdout + done.stderr, end="", flush=True)

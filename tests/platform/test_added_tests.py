@@ -335,8 +335,11 @@ func ExampleShown() {
 func ExampleSilent() {
 \tfmt.Println("x")
 }
+  func  TestSpaced /* c */ (t *testing.T) {}
+func (s suite) TestMethod(t *testing.T) {}
 """
-    assert added_tests.go_tests(source) == ["TestAdded", "Test", "FuzzParse", "ExampleShown"]
+    # Candidates only: `go test -list` decides which examples run (test_an_added_go_example_*).
+    assert added_tests.go_tests(source) == ["TestAdded", "Test", "FuzzParse", "ExampleShown", "ExampleSilent", "TestSpaced"]
 
 
 # spec: ANYM-578
@@ -347,11 +350,30 @@ def test_an_added_go_test_that_never_runs_fails_the_added_job(tmp_path, monkeypa
     import subprocess
     (tmp_path / "go.mod").write_text("module example.com/x\n")
     (tmp_path / "x_test.go").write_text("func TestAdded(t *testing.T) {}\n")
-    monkeypatch.setattr(added_tests.subprocess, "run",
-                        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr=""))
+    monkeypatch.setattr(added_tests.subprocess, "run", lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, stdout="TestAdded\nok  \texample.com/x\t0.01s\n" if "-list" in argv else stdout, stderr=""))
     returncode = added_tests.run({"files": ["x_test.go"], "provenance": []}, tmp_path, tmp_path / "evidence")
     assert json.loads((tmp_path / "evidence" / "added.json").read_text())["result"] == expected
     assert returncode == (0 if expected == "passed" else 1)
+
+
+# spec: ANYM-578
+@pytest.mark.parametrize("comment, expected", [("/* Output: expected */", "failed"), ("/*\n\tOutput: actual\n\t*/", "passed"),
+                                               ("// Unordered output: expected", "failed"), ("", "passed")],
+                         ids=["block-failing", "block-passing", "unordered-failing", "no-output"])
+def test_an_added_go_example_runs_in_every_output_comment_form(tmp_path, comment, expected):
+    import os
+    import shutil
+    if shutil.which("go") is None:
+        if os.environ.get("CI"):
+            pytest.fail("CI runs the Go example: no `go` on this runner")
+        pytest.skip("no `go` outside CI")
+    (tmp_path / "go.mod").write_text("module example.com/x\n\ngo 1.22\n")
+    (tmp_path / "x_test.go").write_text(f'package x\n\nimport "fmt"\n\nfunc Example() {{\n\tfmt.Println("actual")\n\t{comment}\n}}\n')
+    returncode = added_tests.run({"files": ["x_test.go"], "provenance": []}, tmp_path, tmp_path / "evidence")
+    report = json.loads((tmp_path / "evidence" / "added.json").read_text())
+    assert report["result"] == expected and returncode == (0 if expected == "passed" else 1)
+    assert report["runs"][0]["expected"] == ([] if not comment else ["Example"])
 
 
 # spec: ANYM-578
