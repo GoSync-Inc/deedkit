@@ -390,8 +390,8 @@ def comment(c, state):
     table = c.name()
     if not (table in state['created'] or existing(state, table)): raise Manual("a comment outside the schema's tables")
     if kind == 'column':
-        if not c.take('punct', '.'): raise Manual('not a column')
-        c.name()
+        # One identifier: `name()` would read `t.public.c` as column c of table public in schema t (Astra r1).
+        if not c.take('punct', '.') or c.next()[0] not in ('word', 'ident'): raise Manual('not a column')
     c.expect('is')
     if c.next()[0] not in ('string', 'estring'): raise Manual('not a literal comment')
     c.end()

@@ -49,13 +49,16 @@ statement is one of: `SET LOCAL lock_timeout|statement_timeout` to `'<n>ms'`/`'<
 (above 0, at most 5 s and 180 s), or `lock_timeout` to `DEFAULT`; `CREATE TABLE` of a new table
 (defaults: a literal, `now()`, `gen_random_uuid()`; column constraints, references and
 `CHECK`/`PRIMARY KEY`/`UNIQUE`/`FOREIGN KEY` table constraints; a reference names, unqualified or
-`public.`, a table that exists or that the file or an earlier file of the range creates); `CREATE [UNIQUE] INDEX [name] ON
+`public.` (any other schema is `manual`), a table that exists or that the file or an earlier file of the
+range creates); `CREATE [UNIQUE] INDEX [name] ON
 <table the file creates> [USING btree] (<column> [ASC|DESC], ...)`; `ALTER TABLE ... ADD COLUMN <name> <type>
 [NULL] [DEFAULT <literal>]` (`NOT NULL` only with a literal default, no constraint, generated
 or identity column); a `DROP CONSTRAINT c` directly followed by `ADD CONSTRAINT c CHECK (<col>
 IN (<literals>)) NOT VALID` or `CHECK (<col> <@ ARRAY[<literals>]::text[]) NOT VALID`; 036's
 `DO` precondition template; `COMMENT ON TABLE <t>` or `COMMENT ON COLUMN <t>.<c> IS '<literal>'` of such
-a table (ANYM-619: a comment on a schema, role, function or any other object is `manual`). Anything else (transaction control,
+a table (ANYM-619: a comment on a schema, role, function or any other object is `manual`). Deploy's
+admission classifies without the table list and accepts any unqualified table there; `migrate-expand` passes
+the database's tables and refuses an unknown one with `not_unattended`, nothing applied. Anything else (transaction control,
 DML, functions, triggers, other `DO` blocks, grants, drops, renames, type/default/nullability
 changes), and any text not lexed exactly as PostgreSQL does (U&, B, X or N strings, a string
 continued after a newline, an unclosed quote or comment), is `manual`.

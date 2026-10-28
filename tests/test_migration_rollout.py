@@ -813,6 +813,10 @@ COMMENT_OUTSIDE = {
     'unknown-column': "COMMENT ON COLUMN synthetic_absent.body IS 'synthetic';",
     'index': "COMMENT ON INDEX messages_pkey IS 'synthetic';",
     'constraint': "COMMENT ON CONSTRAINT synthetic_existing_kind_check ON synthetic_existing IS 'synthetic';",
+    # Astra r1: column id of table public in schema messages, and the quoted form of the same.
+    'schema-named-like-a-table': "COMMENT ON COLUMN messages.public.id IS 'synthetic';",
+    'quoted-schema-named-like-a-table': 'COMMENT ON COLUMN "messages"."public"."id" IS \'synthetic\';',
+    'public-qualified-three-parts': "COMMENT ON COLUMN public.messages.public.id IS 'synthetic';",
 }
 
 
@@ -836,6 +840,11 @@ def test_comment_on_a_known_or_created_table_and_its_column_is_expand():
     later = "COMMENT ON TABLE synthetic_notes IS 'synthetic';\n" + created
     assert rollout.classify(EXPAND + later, EXISTING) == 'manual'
     assert rollout.classify(EXPAND + "COMMENT ON COLUMN messages IS 'x';\n", EXISTING) == 'manual'
+    # A table the range creates under a foreign schema's name is no way into that schema (Astra r1).
+    fcs = "CREATE TABLE fcs (id text);\nCOMMENT ON COLUMN fcs.public.id IS 'synthetic';\n"
+    assert rollout.classify(EXPAND + fcs, EXISTING) == rollout.classify(EXPAND + fcs) == 'manual'
+    assert rollout.classify(EXPAND + 'CREATE TABLE fcs (id text);\nCOMMENT ON COLUMN "fcs"."id" IS \'x\';\n',
+                            EXISTING) == 'expand'
 
 
 # spec: ANYM-619
