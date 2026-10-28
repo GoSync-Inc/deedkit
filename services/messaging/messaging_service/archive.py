@@ -141,11 +141,12 @@ class Archive:
                       (cid,aid,e['chat_title'],e['chat'],chat_type,e['chat'],e['chat']))
             old=c.execute('SELECT * FROM messages WHERE id=%s FOR UPDATE',(mid,)).fetchone()
             content=fingerprint(e); updated=datetime.fromisoformat(e['updated_at']); outcome='created'
-            old_format=None;retained=None
+            old_format=None;retained=None;retained_snapshot=None
             if old:
                 retained=c.execute('SELECT snapshot FROM message_revisions WHERE message=%s AND revision=%s',
                     (mid,old['revision'])).fetchone()
-                old_format=retained['snapshot'].get('formatting') if retained else None
+                retained_snapshot=retained['snapshot'] if retained else None
+                old_format=retained_snapshot.get('formatting') if retained_snapshot else None
             candidate_format=e.get('formatting')
             known_candidate=known_formatting(candidate_format);known_retained=known_formatting(old_format)
             formatting_changed=known_candidate and known_retained and candidate_format!=old_format
@@ -165,10 +166,20 @@ class Archive:
                 and whatsapp_user(old['sender'])==whatsapp_user(e['sender'])
                 and fingerprint({**e,'sender':old['sender']})==old['content_hash']
                 and (candidate_format==old_format or not (known_candidate or known_retained)))
+            # An observation WhatsApp could not read (kind `unknown`, no text, no attachment) at the
+            # retained provider version carries nothing: the retained revision, its metadata and
+            # sender profiles stay, and it resolves no conflict.
+            unreadable=bool(old and retained_snapshot and e['platform']=='whatsapp'
+                and e.get('metadata',{}).get('message_kind')=='unknown'
+                and not e['body'] and not e['media'] and not e['deleted'] and not old['deleted']
+                and old['provider_updated_at']==updated and content!=old['content_hash']
+                and fingerprint({**e,'body':retained_snapshot.get('body',''),
+                    'media':retained_snapshot.get('media',[])})==old['content_hash'])
             if old:
                 if old['deleted'] and not e['deleted']: outcome='tombstoned'
                 elif sender_completed:outcome='edited'
                 elif sender_device_only:outcome='unchanged'
+                elif unreadable:outcome='unchanged'
                 elif (old['sent_at']!=datetime.fromisoformat(e['sent_at']) or old['direction']!=e['direction']
                       or old['sender']!=e['sender']): outcome='conflict'
                 elif old['content_hash']==content and not (formatting_changed or formatting_completed): outcome='unchanged'
@@ -208,7 +219,7 @@ class Archive:
                     AND active IS DISTINCT FROM (id=ANY(%s))''',(media_ids,mid,media_ids))
             elif outcome=='unchanged':
                 c.execute('UPDATE messages SET provider_updated_at=greatest(provider_updated_at,%s) WHERE id=%s',(updated,mid))
-            if outcome in ('created','edited','unchanged') and not e['deleted'] and e['sender'] and not sender_device_only:
+            if outcome in ('created','edited','unchanged') and not e['deleted'] and e['sender'] and not sender_device_only and not unreadable:
                 # Identity hints come only from this message's provider payload,
                 # never a cross-chat contact book. Unknown metadata stays unknown.
                 profile=e.get('sender_profile',{})
@@ -222,7 +233,7 @@ class Archive:
                         WHERE excluded.source_sent_at>=sender_profiles.source_sent_at''',
                         (stable_id('person',aid,cid,e['sender']),aid,cid,e['sender'],
                          profile.get('display_name',''),profile.get('username',''),mid,e['sent_at']))
-            if outcome in ('created','edited','unchanged') and not e['deleted'] and e.get('metadata'):
+            if outcome in ('created','edited','unchanged') and not e['deleted'] and e.get('metadata') and not unreadable:
                 # Observations do not rewrite immutable revisions or create content conflicts.
                 c.execute('''INSERT INTO message_metadata(message,revision,metadata) SELECT id,revision,%s
                     FROM messages WHERE id=%s AND (provider_updated_at IS NULL OR provider_updated_at<=%s)
@@ -265,7 +276,7 @@ class Archive:
                 else:c.execute('''INSERT INTO message_conflicts(receipt_digest,message,observed_revision,
                     candidate_updated_at,observed_at) VALUES(%s,%s,%s,%s,clock_timestamp())''',
                     (receipt,mid,old['revision'],updated))
-            elif outcome in ('edited','deleted','unchanged') and not sender_device_only:
+            elif outcome in ('edited','deleted','unchanged') and not sender_device_only and not unreadable:
                 # A repeated copy of the retained revision does not resolve an
                 # equal/newer conflicting observation. Only later evidence does.
                 c.execute('''UPDATE message_conflicts mc SET resolved_at=clock_timestamp(),
