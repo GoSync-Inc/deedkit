@@ -109,6 +109,15 @@ def valid_member(name):
     return name in ('manifest.json','database.dump') or bool(re.fullmatch(r'(files|recovery)/[a-f0-9]{64}',name))
 
 
+def snapshot_profile(directory):
+    """None for messaging (its manifests carry no profile), 'calendar' for ANYM-605 bundles."""
+    from .recovery_state import read_manifest
+    manifest=read_manifest(directory)
+    profile=manifest.get('profile') if isinstance(manifest,dict) else None
+    if profile not in (None,'calendar'):raise ValueError('unsupported_backup')
+    return profile
+
+
 def encrypt_snapshot(directory,output,recipient,age='age',*,consume_staged_blobs=False):
     """Encrypt a verified bundle, optionally releasing exclusively owned staging.
 
@@ -119,7 +128,13 @@ def encrypt_snapshot(directory,output,recipient,age='age',*,consume_staged_blobs
     from .backup import verify_bundle
     directory=Path(directory); output=Path(output)
     if type(consume_staged_blobs) is not bool: raise ValueError('invalid_staging_consumption')
-    verify_bundle(directory)
+    calendar=snapshot_profile(directory)=='calendar'
+    if calendar:
+        # A calendar bundle stages nothing it may consume; state/ members only under its profile.
+        from .backup_calendar import valid_calendar_member,verify_calendar_bundle
+        if consume_staged_blobs: raise ValueError('invalid_staging_consumption')
+        manifest=verify_calendar_bundle(directory)
+    else:verify_bundle(directory)
     if output.exists(): raise ValueError('encrypted_backup_exists')
     if consume_staged_blobs and any(p.stat().st_nlink!=1 for p in (directory/'files').iterdir()):
         raise ValueError('exclusive_staged_blobs_required')
@@ -131,12 +146,16 @@ def encrypt_snapshot(directory,output,recipient,age='age',*,consume_staged_blobs
             process=subprocess.Popen([age,'-r',recipient],stdin=subprocess.PIPE,stdout=encrypted,stderr=errors)
             try:
                 with tarfile.open(fileobj=process.stdin,mode='w|') as archive:
-                    paths=[directory/'manifest.json',directory/'database.dump',*sorted((directory/'files').iterdir())]
-                    if (directory/'recovery').exists():paths+=sorted((directory/'recovery').iterdir())
+                    if calendar:
+                        paths=[directory/'manifest.json',directory/'database.dump',
+                               *(directory/'state'/name for name in sorted(manifest['state_files']))]
+                    else:
+                        paths=[directory/'manifest.json',directory/'database.dump',*sorted((directory/'files').iterdir())]
+                        if (directory/'recovery').exists():paths+=sorted((directory/'recovery').iterdir())
                     for path in paths:
                         if path.is_symlink() or not path.is_file(): raise ValueError('invalid_backup_file')
                         relative=path.relative_to(directory).as_posix()
-                        if not valid_member(relative):
+                        if not (valid_calendar_member(relative) if calendar else valid_member(relative)):
                             raise ValueError('invalid_backup_file')
                         with regular_source(path) as source:
                             member=tarfile.TarInfo(relative)
@@ -190,21 +209,27 @@ def _decrypt_snapshot(command,destination,max_bytes,*,source=None):
                         try:process.stdin.close()
                         except BrokenPipeError:pass
                 thread=threading.Thread(target=feed,name='backup-decrypt-input',daemon=True);thread.start()
-            total=0; seen=set()
+            total=0; seen=set(); profile=None
+            from .backup_calendar import valid_calendar_member
             with tarfile.open(fileobj=process.stdout,mode='r|') as archive:
                 for member in archive:
                     name=member.name
+                    # A calendar manifest, read from the first member, admits only calendar members.
                     if (not member.isfile() or name in seen or len(seen)>=1000000 or
-                        not valid_member(name)):
+                        not (valid_calendar_member(name) if profile=='calendar' else valid_member(name))):
                         raise ValueError('invalid_backup_member')
                     total+=member.size
                     if total>max_bytes or shutil.disk_usage(temporary).free-member.size<1024**3:
                         raise ValueError('restore_size_limit')
-                    seen.add(name); target=temporary/name; target.parent.mkdir(mode=0o700,exist_ok=True)
+                    seen.add(name); target=temporary/name
+                    for parent in reversed(Path(name).parents[:-1]):(temporary/parent).mkdir(mode=0o700,exist_ok=True)
                     member_source=archive.extractfile(member)
                     fd=os.open(target,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
                     with member_source,os.fdopen(fd,'wb') as out:
                         shutil.copyfileobj(member_source,out,1024**2); out.flush(); os.fsync(out.fileno())
+                    if name=='manifest.json' and len(seen)==1:
+                        try:profile=snapshot_profile(temporary)
+                        except ValueError:raise ValueError('invalid_backup_member') from None
             # Drain authenticated trailing bytes before accepting the decryption result.
             while trailing:=process.stdout.read(1024**2):
                 total+=len(trailing)
@@ -218,6 +243,13 @@ def _decrypt_snapshot(command,destination,max_bytes,*,source=None):
             if not {'manifest.json','database.dump'}<=seen: raise ValueError('incomplete_backup')
         from .recovery_state import read_manifest
         from .backup import verify_bundle
+        if profile=='calendar':
+            from .backup_calendar import verify_calendar_bundle
+            verify_calendar_bundle(temporary)
+            for folder in ('state/vault','state/profile','state'):
+                if (temporary/folder).exists():fsync_dir(temporary/folder)
+            fsync_dir(temporary); os.rename(temporary,destination); fsync_dir(destination.parent)
+            return destination
         manifest=read_manifest(temporary)
         if manifest.get('format')==2:(temporary/'recovery').mkdir(mode=0o700,exist_ok=True)
         (temporary/'files').mkdir(mode=0o700,exist_ok=True)
