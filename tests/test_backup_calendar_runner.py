@@ -30,6 +30,7 @@ class CalendarDocker:
     or ``fail`` (the worker exits 1)."""
     def __init__(self, root):
         self.root, self.calls, self.mode = root, [], 'encrypt'
+        self.broken = False  # every inspection fails (a Docker daemon error) while set
         self.containers = {'calendar-app': {'Id': 'calendar-app', 'Config': {'Labels': {
             'com.docker.compose.project': 'deedkit-calendar', 'com.docker.compose.service': 'calendar'}},
             'State': {'Running': True, 'Status': 'running', 'ExitCode': 0}}}
@@ -38,6 +39,8 @@ class CalendarDocker:
         return [{'id': 'calendar-app', 'service': 'calendar'}]
     def inspect(self, cid):
         self.calls.append(('inspect', cid))
+        if self.broken:
+            raise RuntimeError('docker_inspection_failed')
         return copy.deepcopy(self.containers.get(cid))
     def call(self, *args):
         self.calls.append(args)
@@ -102,6 +105,7 @@ def calendar_cfg(tmp_path, **overrides):
 
 def calendar_runner(tmp_path, send=None):
     cfg = calendar_cfg(tmp_path)
+    Path(cfg['host_lock']).parent.mkdir(mode=0o700)  # the run holds it (hold_locks) before any capture
     docker = CalendarDocker(Path(cfg['directory']))
     sent = []
     async def stored(path, result, transfer, timeout):
@@ -148,9 +152,11 @@ def held(path):
 def run_main(monkeypatch, *argv):
     monkeypatch.setattr(sys, 'argv', ['backup_runner', *argv])
     monkeypatch.setattr(backup_runner.signal, 'signal', lambda *_: None)
-    with pytest.raises(SystemExit) as stopped:
+    try:
         backup_runner.main()
-    return stopped.value.code
+    except SystemExit as stopped:
+        return stopped.code
+    return 0
 
 
 def fake_clock(monkeypatch):
@@ -470,3 +476,66 @@ def test_check_reports_an_unfinished_journal_without_docker_or_locks(tmp_path, m
     assert json.loads(capsys.readouterr().out) == {'status': 'unfinished', 'profile': profile, 'id': journal['id'],
                                                    'phase': 'capturing', 'stopped': 1}
     assert read_json(Path(cfg['directory']) / 'journal.json') == journal
+
+
+def unsettled(cfg):
+    return Path(cfg['host_lock'] + '.unsettled')
+
+
+# spec: ANYM-608
+def test_the_unsettled_marker_exists_from_before_the_worker_until_it_is_verified_stopped(tmp_path):
+    runner, docker, _ = calendar_runner(tmp_path)
+    Path(runner.cfg['host_lock']).parent.mkdir(mode=0o700, exist_ok=True)
+    seen = []
+    create = docker.call
+    def call(*args):
+        if args[0] == 'create':
+            seen.append(read_json(unsettled(runner.cfg)))
+        return create(*args)
+    docker.call = call
+    runner.run()
+    job = read_json(runner.status_path)['last_success_id']
+    assert seen == [{'profile': 'calendar', 'id': job, 'container': OWNED + job.lower()}]
+    assert not unsettled(runner.cfg).exists()
+
+
+# spec: ANYM-608
+def test_a_failed_recovery_leaves_the_unsettled_marker_and_the_next_recovery_removes_it(tmp_path, monkeypatch):
+    cfg = calendar_cfg(tmp_path)
+    Path(cfg['host_lock']).parent.mkdir(mode=0o700)
+    path = private_file(tmp_path / 'calendar.json', cfg)
+    docker = CalendarDocker(Path(cfg['directory']))
+    docker.mode = 'hold'
+    start = docker.call
+    def call(*args):
+        result = start(*args)
+        if args[0] == 'start':
+            docker.broken = True  # the daemon fails while the worker captures: inspection and recovery both fail
+        return result
+    docker.call = call
+    monkeypatch.setattr(backup_runner, 'Docker', lambda: docker)
+    assert run_main(monkeypatch, '--config', str(path)) == 1
+    job = read_json(Path(cfg['directory']) / 'journal.json')
+    assert docker.containers[job['container']]['State']['Running']  # the worker outlives the run
+    assert read_json(unsettled(cfg))['container'] == job['container']
+    assert not held(cfg['host_lock']) and not held(Path(cfg['directory']) / '.runner.lock')
+    docker.broken = False
+    assert run_main(monkeypatch, '--config', str(path), '--recover-stop') == 0
+    assert not unsettled(cfg).exists() and job['container'] not in docker.containers
+
+
+# spec: ANYM-608
+def test_a_marker_without_a_journal_is_removed_only_when_its_worker_is_not_running(tmp_path):
+    runner, docker, _ = calendar_runner(tmp_path)
+    Path(runner.cfg['host_lock']).parent.mkdir(mode=0o700, exist_ok=True)
+    container = OWNED + '20261028t180000z-0123456789abcdef'
+    write_json(unsettled(runner.cfg), {'profile': 'calendar', 'id': '20261028T180000Z-0123456789abcdef',
+                                       'container': container})
+    docker.containers[container] = {'Id': container, 'Config': {'Labels': {}},
+                                    'State': {'Running': True, 'Status': 'running', 'ExitCode': 0}}
+    with pytest.raises(RuntimeError, match='backup_shutdown_unverified'):
+        runner.recover_stop()
+    assert unsettled(runner.cfg).exists()
+    docker.containers.pop(container)
+    runner.recover_stop()
+    assert not unsettled(runner.cfg).exists()

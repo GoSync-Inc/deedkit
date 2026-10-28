@@ -344,7 +344,12 @@ The worker deletes the plaintext staging right after encryption.
 Exclusion: a calendar run, a `--recover-stop` and a `Persistent=` catch-up first take the
 profile's own `<directory>/.runner.lock` (held: `backup_job_already_running`), then wait up to
 5400 s for `host_lock`, polling every 5 s; at the bound the run ends `host_lock_busy` (the
-status file says so) with no journal and nothing started. It holds both until it ends. While
+status file says so) with no journal and nothing started. It holds both until it ends.
+Before it creates its worker it writes `<host_lock>.unsettled`, and removes it only once that
+worker is verified absent or stopped (the run's end, `--recover-stop` or the next run): while
+it exists, `production.py deploy` (with or without `--auto`) returns `busy`
+(`backup_running`), so a worker left running by a failed recovery or a killed runner never
+overlaps a deploy. While
 it holds `host_lock`, autodeploy skips (exit 75), messaging's runner refuses
 `backup_job_already_running` and systemd retries it, and a manual `production.py deploy`
 returns `busy` (`backup_running`) before any change. `backup_runner.py --config <file>

@@ -286,7 +286,17 @@ class Runner:
         self.journal_path=self.root/'journal.json';self.status_path=self.root/'status.json'
         self.docker=docker or Docker();self.clock=clock;self.sleep=sleep;self.send=send;self.stream_send=stream_send;self.journal=None
         self.calendar=cfg.get('profile')=='calendar'
+        # Exists from before the calendar worker is created until it is verified stopped: a deploy refuses while it
+        # exists (production.py), also after this process died or failed its recovery and released the locks.
+        self.unsettled_path=Path(cfg['host_lock']+'.unsettled') if self.calendar else None
     def save(self):write_json(self.journal_path,self.journal)
+    def settle(self,container):
+        """Remove the unsettled marker once `container` (this profile's own worker) is absent or stopped."""
+        if not self.calendar or not os.path.lexists(self.unsettled_path):return
+        if not container.startswith(CALENDAR_WORKER):raise RuntimeError('backup_container_mismatch')
+        info=self.docker.inspect(container)
+        if info is not None and info['State']['Running']:raise RuntimeError('backup_shutdown_unverified')
+        self.unsettled_path.unlink()
     def load(self):
         self.journal=read_json(self.journal_path)
         if not ID.fullmatch(self.journal['id']):raise ValueError('invalid_backup_journal')
@@ -346,6 +356,7 @@ class Runner:
         self.save();self.status('capturing')
     def create_calendar_worker(self,work):
         """The calendar profile's worker: its database, vault and profile files read-only, no files volume."""
+        write_json(self.unsettled_path,{'profile':'calendar','id':self.journal['id'],'container':self.journal['container']})
         write_json(work/'worker.json',{'profile':'calendar','id':self.journal['id'],'dsn_file':'/run/secrets/database_url',
             'vault_directory':'/sources/vault','profile_directory':'/sources/profile',
             'recipient_file':'/run/secrets/recipient','work_directory':'/work'})
@@ -638,6 +649,7 @@ class Runner:
         write_json(self.status_path,status)
         info=self.check_worker(self.docker.inspect(self.journal['container']))
         if info:self.docker.call('rm',self.journal['container'])
+        self.settle(self.journal['container'])
         self.journal_path.unlink();self.journal=None
         completed=sorted((p for p in self.root.iterdir() if p.is_dir() and ID.fullmatch(p.name) and (p/'delivery.json').is_file()),
                          key=lambda p:p.name,reverse=True)
@@ -666,7 +678,9 @@ class Runner:
             raise
     def recover_stop(self):
         """systemd ExecStopPost: settle the owned container, then resume its collectors."""
-        if not self.journal_path.exists():return
+        if not self.journal_path.exists():
+            if self.calendar and os.path.lexists(self.unsettled_path):self.settle(read_json(self.unsettled_path)['container'])
+            return
         self.load()
         if not self.calendar:
             for kind in ('release','abandon'):self.settle_fence_action(kind)
@@ -688,6 +702,7 @@ class Runner:
         # Preserve the actionable error from the initiating process.
         if not self.status_path.exists() or read_json(self.status_path).get('state')!='error':
             self.status('error','backup_job_failed')
+        self.settle(self.journal['container'])
 
 
 @contextmanager

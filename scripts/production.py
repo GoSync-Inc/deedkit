@@ -967,16 +967,29 @@ BACKUP_RUNNER_SOURCE = "services/messaging/messaging_service/backup_runner.py"
 BACKUP_LOCK = Path("/opt/personal-os-probe/backups/.runner.lock")
 
 
+def backup_lock_path():
+    return Path(os.environ.get("DEEDKIT_BACKUP_LOCK") or BACKUP_LOCK)
+
+
+def unsettled_backup():
+    """The calendar runner's `<host_lock>.unsettled` marker: its worker may still run although no process holds the
+    lock (a failed recovery, a killed runner). Its `--recover-stop` or next run removes it."""
+    path = Path(f"{backup_lock_path()}.unsettled")
+    if os.path.lexists(path):
+        return f"backup_running: a calendar backup worker is not verified stopped ({path}); its runner settles it"
+    return None
+
+
 @contextmanager
 def backup_lock():
-    """Hold the backup runner's lock, or refuse `Busy` while a backup holds it. A host without its directory runs no
-    backup."""
-    path = Path(os.environ.get("DEEDKIT_BACKUP_LOCK") or BACKUP_LOCK)
+    """Hold the backup runner's lock, or refuse `Busy` while a backup holds it. Only a host without the runner and
+    without the lock's directory skips it; a missing directory named by DEEDKIT_BACKUP_LOCK refuses."""
+    path = backup_lock_path()
     try:
         fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     except FileNotFoundError:
-        if path.parent.exists():
-            raise
+        if path.parent.exists() or os.environ.get("DEEDKIT_BACKUP_LOCK") or os.path.lexists(BACKUP_RUNNER):
+            raise Refused(f"the backup runner's lock {path} cannot be opened: its directory is missing") from None
         yield
         return
     try:
@@ -3877,6 +3890,8 @@ def deploy(settings, http, *, auto=False, dry_run=False, attested=None, configs=
         # tool-rollback or another run may have paused or switched the tool while this run waited for the locks.
         if PAUSE.exists():
             return {"status": "paused", "reason": PAUSE.read_text()[:1000].strip()}
+        if unsettled := unsettled_backup():
+            return {"status": "busy", "reason": unsettled}
         if stale := stale_tool(s):
             return {"status": "error", "reason": stale + "; nothing changed, the next run uses it"}
         if not dry_run:

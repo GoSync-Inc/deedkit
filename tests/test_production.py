@@ -5001,6 +5001,37 @@ def test_an_auto_deploy_under_the_units_held_wrapper_lock_is_not_blocked_by_it(t
 
 # spec: ANYM-608
 def test_a_host_without_the_backup_directory_deploys_without_the_backup_lock(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)  # no runner installed, no DEEDKIT_BACKUP_LOCK, no lock directory
+    assert host.deploy()["status"] == "deployed" and not p.BACKUP_LOCK.parent.exists()
+
+
+# spec: ANYM-608
+@pytest.mark.parametrize("cause", ["override", "runner"])
+def test_a_missing_lock_directory_never_skips_the_lock_when_named_or_when_a_runner_is_installed(tmp_path, monkeypatch,
+                                                                                                cause):
     host = Deployer(tmp_path, monkeypatch)
-    monkeypatch.setenv("DEEDKIT_BACKUP_LOCK", str(tmp_path / "absent" / ".runner.lock"))
-    assert host.deploy()["status"] == "deployed" and not (tmp_path / "absent").exists()
+    if cause == "override":
+        monkeypatch.setenv("DEEDKIT_BACKUP_LOCK", str(tmp_path / "mistyped" / ".runner.lock"))
+    else:
+        monkeypatch.setattr(p, "BACKUP_LOCK", tmp_path / "no-backups" / ".runner.lock")
+        p.BACKUP_RUNNER.parent.mkdir(parents=True)
+        p.BACKUP_RUNNER.write_bytes(b"installed runner\n")
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and "cannot be opened" in outcome["reason"]
+    assert host.steps == [] and host.git == []
+
+
+# spec: ANYM-608
+@pytest.mark.parametrize("auto", [False, True])
+def test_a_deploy_returns_busy_while_a_calendar_backup_worker_is_not_verified_stopped(tmp_path, monkeypatch, auto):
+    host = Deployer(tmp_path, monkeypatch)
+    lock = tmp_path / "backups" / ".runner.lock"
+    lock.parent.mkdir(mode=0o700)
+    monkeypatch.setenv("DEEDKIT_BACKUP_LOCK", str(lock))
+    marker = tmp_path / "backups" / ".runner.lock.unsettled"
+    marker.write_text('{"profile":"calendar"}\n')  # a calendar run failed its recovery and released the locks
+    outcome = host.deploy(auto=auto)
+    assert outcome["status"] == "busy" and outcome["reason"].startswith("backup_running") and str(marker) in outcome["reason"]
+    assert host.steps == [] and host.git == [] and host.paused() is None
+    marker.unlink()
+    assert host.deploy(auto=auto)["status"] == "deployed"
