@@ -82,9 +82,14 @@ def _peer(row):
 
 
 def _title(c, p, row):
-    from .chat_titles import labels
+    """The chat label from names this key reads: the peer's name in this chat or in another readable chat.
+
+    The PN/LID partner name (and the phone number it would replace) is left out: that link fences on observations
+    across the whole account (sender_names._links), so a hidden conflict would change the label.
+    """
+    from .chat_titles import IN_CHAT, labels
     found = labels(c, p, [(row['account'], row['id'])]).get((row['account'], row['id']))
-    return found[0] if found and found[1] else row['title']
+    return found[0] if found and found[1] in (IN_CHAT, 'seen_elsewhere') else row['title']
 
 
 def _chat_target(c, p, row, how, purpose):

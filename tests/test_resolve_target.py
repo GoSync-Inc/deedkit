@@ -322,6 +322,26 @@ def test_a_hidden_conflicting_observation_does_not_change_a_visible_alias(world)
 
 
 # spec: ANYM-545
+@pytest.mark.parametrize('hide', ['deleted', 'unreadable'])
+def test_a_hidden_conflicting_observation_does_not_change_an_alias_chats_label(world, hide):
+    s, _, _, say, _ = world
+    say(NATIVE, PHONE + '@c.us', 'G1', 'hello', chat='555000444@g.us', name='Synthetic Alice', title='Synthetic group',
+        metadata={'chat_type': 'group'})
+    seen = say(NATIVE, '555000111@lid', 'L1', 'lid chat', chat='555000111@lid', title='555000111@lid', metadata=PRIVATE)
+    observe(s, NATIVE, seen, PHONE + '@c.us', '555000111@lid')
+    lid, group = chat_of(s, NATIVE, '555000111@lid'), chat_of(s, NATIVE, '555000444@g.us')
+    key = s.issue_key('rt-label', [NATIVE], **({'chats': [lid, group]} if hide == 'unreadable' else {}))
+    before = target(s, key, '+' + PHONE)
+    hidden = say(NATIVE, '555000222@lid', 'L2', 'gone', chat='555000333@g.us', title='Synthetic other group',
+                 metadata={'chat_type': 'group'})
+    observe(s, NATIVE, hidden, PHONE + '@c.us', '555000222@lid')
+    if hide == 'deleted':
+        with s.pool.connection() as c:
+            c.execute('UPDATE messages SET deleted=true WHERE id=%s', (hidden,))
+    assert before['chat_id'] == lid and target(s, key, '+' + PHONE) == before
+
+
+# spec: ANYM-545
 def test_one_accounts_several_alias_chats_are_candidates_beside_another_accounts_phone_chat(world):
     s, _, _, say, _ = world
     key = s.issue_key('rt-two', [WA, NATIVE])
