@@ -101,7 +101,10 @@ def test_backup_worker_container_has_only_readonly_sources_public_recipient_and_
     assert any('dst=/run/secrets/recipient,readonly' in mount for mount in mounts)
     assert not any('docker.sock' in mount or 'identity' in mount or 'known-host' in mount for mount in mounts)
     config = runner_module.read_json(tmp_path / run.journal['id'] / 'worker.json')
-    assert set(config) == {'id', 'dsn_file', 'files_directory', 'recovery_config_file', 'recipient_file', 'work_directory'}
+    # Changed assertion (name kept as the Tiden identity): ANYM-627 adds the dump timeout.
+    assert set(config) == {'id', 'dsn_file', 'files_directory', 'recovery_config_file', 'recipient_file', 'work_directory',
+                           'dump_timeout_seconds'}
+    assert config['dump_timeout_seconds'] == 60
     assert config['recipient_file'] == '/run/secrets/recipient'
 
 

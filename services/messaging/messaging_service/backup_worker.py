@@ -167,8 +167,11 @@ def run(config):
             return release_delivered_fence(store,work,config['id'])
         finally:store.close()
     required={'id','dsn_file','files_directory','recovery_config_file','recipient_file','work_directory'}
-    if set(config)-{'mode'}!=required or config.get('mode','staged_v1') not in ('staged_v1','stream_v2'):
+    if set(config)-{'mode','dump_timeout_seconds'}!=required or config.get('mode','staged_v1') not in ('staged_v1','stream_v2'):
         raise ValueError('invalid_backup_worker_config')
+    # An older runner writes no dump timeout: pg_dump keeps its former 600 s.
+    timeout=config.get('dump_timeout_seconds',600)
+    if type(timeout) is not int or not 60<=timeout<=7200:raise ValueError('invalid_backup_worker_config')
     from .backup_receiver import BACKUP_ID
     if not BACKUP_ID.fullmatch(config['id']):raise ValueError('invalid_backup_id')
     work=Path(config['work_directory'])
@@ -192,7 +195,8 @@ def run(config):
                 previous=os.environ.get('PGPASSFILE');os.environ['PGPASSFILE']=str(password_file)
                 try:
                     snapshot=create_snapshot(store,work/'snapshot',command,recovery,captured_callback=captured,
-                                             reference_blobs=streaming,backup_fence=config['id'])
+                                             reference_blobs=streaming,backup_fence=config['id'],
+                                             **({'dump_timeout':timeout} if 'dump_timeout_seconds' in config else {}))
                 finally:
                     if previous is None:os.environ.pop('PGPASSFILE',None)
                     else:os.environ['PGPASSFILE']=previous

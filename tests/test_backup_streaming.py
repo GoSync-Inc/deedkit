@@ -367,3 +367,97 @@ def test_bounded_retention_counts_verified_anchor_in_maximum_three(tmp_path,monk
     result=prune(tmp_path,marker,max_copies=3)
     assert result['kept']==3 and result['removed']==3
     assert {path.name for path in tmp_path.glob('*.tar.age')}=={anchor.name,files[-1].name,files[-2].name}
+
+
+def dump_timeout_config(tmp_path,**values):
+    from test_coverage_backup import _runner_config
+    from messaging_service import backup_runner as runner_module
+    cfg={**_runner_config(tmp_path),**values}
+    path=tmp_path/'runner.json';write_json(path,cfg)
+    return runner_module.config(path)
+
+
+# spec: ANYM-627
+@pytest.mark.parametrize('capture,expected',[(60,60),(1799,1799),(1800,1800),(7200,1800)])
+def test_dump_timeout_absent_from_todays_runner_json_defaults_to_1800_or_the_capture_timeout(tmp_path,capture,expected):
+    from messaging_service.backup_runner import dump_timeout
+    cfg=dump_timeout_config(tmp_path,timeout_seconds=capture)
+    assert 'dump_timeout_seconds' not in cfg and dump_timeout(cfg)==expected
+
+
+# spec: ANYM-627
+@pytest.mark.parametrize('value',[299,7201,'1800',True,1801,None,1800.0])
+def test_dump_timeout_outside_300_7200_or_above_the_capture_timeout_is_refused(tmp_path,value):
+    with pytest.raises(ValueError,match='invalid_backup_timeout'):
+        dump_timeout_config(tmp_path,timeout_seconds=1800,dump_timeout_seconds=value)
+
+
+# spec: ANYM-627
+def test_configured_dump_timeout_reaches_worker_json_and_the_undo_restores_the_default(tmp_path):
+    from messaging_service.backup_runner import dump_timeout
+    cfg=dump_timeout_config(tmp_path,timeout_seconds=7200,dump_timeout_seconds=300)
+    assert dump_timeout(cfg)==300
+    assert dump_timeout(dump_timeout_config(tmp_path,timeout_seconds=7200,dump_timeout_seconds=7200))==7200
+    baseline,_=runner_fixture(tmp_path)
+    runner=Runner({**baseline.cfg,'timeout_seconds':3600,'dump_timeout_seconds':2400},docker=FakeDocker(tmp_path),sleep=lambda _:None)
+    runner.prepare();runner.create_worker(tmp_path/runner.journal['id'])
+    assert read_json(tmp_path/runner.journal['id']/'worker.json')['dump_timeout_seconds']==2400
+    # Undo, first step: the key removed from runner.json again is valid and gives the default.
+    cfg=dump_timeout_config(tmp_path,timeout_seconds=3600)
+    assert 'dump_timeout_seconds' not in cfg and dump_timeout(cfg)==1800
+
+
+# spec: ANYM-627
+@pytest.mark.parametrize('form',['older_runner','newer_runner','refused_bool','refused_text','refused_low','refused_high'])
+def test_worker_accepts_worker_json_with_or_without_the_dump_timeout(tmp_path,monkeypatch,form):
+    from messaging_service import backup_worker as worker
+    work=tmp_path/'work';work.mkdir(mode=0o700)
+    dsn=tmp_path/'dsn';dsn.write_text('host=db port=5432 user=owner password=synthetic dbname=synthetic')
+    recovery=tmp_path/'recovery.json';worker.write_json(recovery,{'accounts':[],'sources':[]})
+    cfg={'id':ID,'dsn_file':str(dsn),'files_directory':str(tmp_path/'files'),'recovery_config_file':str(recovery),
+         'recipient_file':str(tmp_path/'recipient'),'work_directory':str(work),'mode':'stream_v2'}
+    value={'older_runner':None,'newer_runner':2400,'refused_bool':True,'refused_text':'2400',
+           'refused_low':59,'refused_high':7201}[form]
+    if form!='older_runner':cfg['dump_timeout_seconds']=value
+    class SyntheticStore:
+        def __init__(self,*_):pass
+        def close(self):pass
+    calls=[]
+    class Captured(Exception):pass
+    def capture(*args,**kwargs):calls.append(kwargs);raise Captured
+    monkeypatch.setattr(worker,'Store',SyntheticStore);monkeypatch.setattr(worker,'create_snapshot',capture)
+    if form.startswith('refused'):
+        with pytest.raises(ValueError,match='invalid_backup_worker_config'):worker.run(cfg)
+        assert calls==[]
+        return
+    with pytest.raises(Captured):worker.run(cfg)
+    assert calls[0].get('dump_timeout',600)==(600 if value is None else value)
+
+
+# spec: ANYM-627
+def test_snapshot_dumps_with_zstd_1_and_passes_the_dump_timeout_to_pg_dump(seeded,tmp_path,monkeypatch):
+    import subprocess
+    from messaging_service import backup
+    store,*_=seeded
+    timeouts=[];run=subprocess.run
+    def recorded(*args,**kwargs):timeouts.append(kwargs.get('timeout'));return run(*args,**kwargs)
+    monkeypatch.setattr(backup.subprocess,'run',recorded)
+    argv=[sys.executable,'-c','import json,sys;print(json.dumps(sys.argv[1:]))']
+    create_snapshot(store,tmp_path/'configured',argv,dump_timeout=2400)
+    create_snapshot(store,tmp_path/'default',argv)
+    assert timeouts==[2400,600]
+    arguments=json.loads((tmp_path/'configured/database.dump').read_text())
+    assert arguments[:4]==['--format=custom','--compress=zstd:1','--no-owner','--no-acl']
+    assert arguments[4].startswith('--snapshot=') and len(arguments)==5
+
+
+# spec: ANYM-627
+def test_dump_past_its_timeout_fails_the_capture_and_releases_the_fence(seeded,tmp_path):
+    import subprocess
+    store,*_=seeded
+    slow=[sys.executable,'-c','import time;time.sleep(30)']
+    with pytest.raises(subprocess.TimeoutExpired):
+        create_snapshot(store,tmp_path/'capture',slow,backup_fence=ID,dump_timeout=1)
+    assert not (tmp_path/'capture').exists()
+    with store.pool.connection() as c:
+        assert c.execute('SELECT ended_at FROM attachment_backup_fences WHERE id=%s',(ID,)).fetchone()['ended_at'] is not None
