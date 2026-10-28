@@ -153,10 +153,12 @@ upload to R2 at once while `receive` keeps reading the stream (ANYM-628). At 1
 each part uploads inline before the next is read, as in earlier receivers. Above
 1 at most that many parts upload, one more waits, and the reader blocks only at
 that bound, so part memory stays within (`upload_concurrency` + 2) ×
-`part_bytes`: 320 MiB at 3 with 64 MiB parts. Completion still lists every part
-in order after all uploads finished; a failed part, stream error, deadline or
-stop joins every running upload before the abort, and the attempt journal keeps
-its rules. The example sets 3. Undo: set 1 for serial uploads. Remove the key
+`part_bytes` plus one 1 MiB frame: 320 MiB at 3 with 64 MiB parts. Completion
+still lists every part in order after all uploads finished; a failed part,
+stream error, deadline or stop joins every running upload before the abort, and
+the attempt journal keeps its rules. After the deadline no part starts another
+attempt; a part request still running 300 seconds after the stop ends the
+receiver process, and its `uploading` journal is reconciled by the same ID. The example sets 3. Undo: set 1 for serial uploads. Remove the key
 before installing an older receiver: an older parser refuses unknown keys.
 
 ## SSH boundary and producer enrollment
