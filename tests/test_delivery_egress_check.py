@@ -111,3 +111,41 @@ def test_rules_drop_private_tailnet_metadata_and_host_and_allow_only_dns_and_443
     assert code == 0 and 'iptables -A DEEDKIT-DELIVERY -d 100.100.100.100 -p udp --dport 53 -j RETURN' in out
     code, _ = run('rules', '--resolver', 'not-an-address')
     assert code != 0
+
+
+# spec: ANYM-581
+def test_rules_also_drop_host_bound_packets_from_the_proxy_bridge():
+    code, out = run('rules', '--resolver', '1.1.1.1')
+    lines = out.splitlines()
+    assert code == 0
+    assert 'iptables -I INPUT -i dk-deliverypx0 -j DROP' in lines and 'ip6tables -I INPUT -i dk-deliverypx0 -j DROP' in lines
+    code, out = run('rules', '--undo')
+    undo = out.splitlines()
+    assert code == 0
+    assert 'iptables -D INPUT -i dk-deliverypx0 -j DROP' in undo and 'ip6tables -D INPUT -i dk-deliverypx0 -j DROP' in undo
+
+
+# spec: ANYM-581
+def test_proxied_probes_need_a_tunnel_or_the_proxys_refusal():
+    import threading
+    from messaging_service import egress_proxy
+    upstream = socket.create_server(('127.0.0.1', 0))
+    proxy = egress_proxy.Proxy(resolver=lambda host, port, slots=None: ['1.1.1.1'],
+        connector=lambda address: socket.create_connection(upstream.getsockname(), timeout=2),
+        policy=lambda: {'allow': ['hooks.example'], 'deny': [], 'allow_any_public': False}, log=lambda record: None)
+    server = socket.create_server(('127.0.0.1', 0))
+    threading.Thread(target=proxy.serve, args=(server,), daemon=True).start()
+    address = '127.0.0.1:%d' % server.getsockname()[1]
+    try:
+        code, out = run('check', '--proxy', address, '--open-proxied', 'hooks.example', '--refused-proxied', 'other.example')
+        assert code == 0, out
+        assert [item['outcome'] for item in json.loads(out)['results']] == ['tunnel', 'refused']
+        # Reversed expectations fail, and so does a proxied target with no proxy at all.
+        code, out = run('check', '--proxy', address, '--open-proxied', 'other.example', '--refused-proxied', 'hooks.example')
+        assert code == 1 and not any(item['passed'] for item in json.loads(out)['results'])
+        code, out = run('check', '--open-proxied', 'hooks.example')
+        assert code == 1 and json.loads(out)['results'][0]['outcome'] == 'no_proxy'
+    finally:
+        proxy.stop.set()
+        server.close()
+        upstream.close()

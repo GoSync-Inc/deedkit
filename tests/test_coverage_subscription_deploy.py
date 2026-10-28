@@ -88,7 +88,7 @@ def test_delivery_overlay_isolates_the_dispatcher_database_path_and_egress(tmp_p
     root = Path(__file__).resolve().parents[1]
     env = {**os.environ, 'PROBE_PUBLIC_URL': 'https://example.invalid', 'PROBE_ALLOWED_HOSTS': 'example.invalid'}
     raw = yaml.safe_load((root / 'deploy/compose.delivery.yaml').read_text())
-    for name in ('delivery', 'api'):
+    for name in ('delivery', 'delivery-egress', 'api'):
         # Raw Compose defaults host-path creation to true: require explicit false on every bind.
         assert all(volume['bind']['create_host_path'] is False for volume in raw['services'][name]['volumes']), name
     base = yaml.safe_load((root / 'deploy/compose.yaml').read_text())
@@ -107,21 +107,26 @@ def test_delivery_overlay_isolates_the_dispatcher_database_path_and_egress(tmp_p
     service = services['delivery']
     assert service['command'] == ['python', '-m', 'messaging_service.delivery_worker']
     assert service['build']['target'] == 'runtime' and service['init'] is True and service['restart'] == 'unless-stopped'
-    # A database-only internal network plus its own egress bridge; never the backend network of the API and matcher.
-    assert set(service['networks']) == {'delivery_db', 'delivery_egress'}
+    # ANYM-581: only internal networks, the database one and the proxy one; never backend, never an egress bridge.
+    assert set(service['networks']) == {'delivery_db', 'delivery_proxy'}
     assert {name for name, item in services.items() if 'delivery_db' in item['networks']} == {'db', 'delivery'}
-    assert {name for name, item in services.items() if 'delivery_egress' in item['networks']} == {'delivery'}
+    assert {name for name, item in services.items() if 'delivery_proxy' in item['networks']} == {'delivery', 'delivery-egress'}
+    assert {name for name, item in services.items() if 'delivery_egress' in item['networks']} == {'delivery-egress'}
+    assert networks['delivery_proxy']['internal'] is True and networks['delivery_proxy'].get('enable_ipv6') is False
+    assert networks['delivery_proxy']['driver_opts'] == {'com.docker.network.bridge.name': 'dk-deliverypx0'}
     assert set(services['db']['networks']) == {'backend', 'delivery_db'}
     assert set(services['subscriptions']['networks']) == {'backend'}
     assert networks['delivery_db']['internal'] is True and networks['delivery_db'].get('enable_ipv6') is False
     assert networks['delivery_db']['driver_opts'] == {'com.docker.network.bridge.name': 'dk-deliverydb0'}
-    # Explicit dns: Docker queries it from the container namespace, where the host rules apply.
-    assert service['dns'] == ['1.1.1.1']
+    # No resolver of its own: names outside its networks never resolve; the proxy resolves.
+    assert 'dns' not in service
     assert not networks['delivery_egress'].get('internal') and networks['delivery_egress'].get('enable_ipv6') is False
     assert networks['delivery_egress']['driver_opts'] == {'com.docker.network.bridge.name': 'dk-delivery0'}
     assert not service.get('ports')
     assert service['environment'] == {'DATABASE_URL_FILE': '/run/secrets/database_url',
-                                      'DELIVERY_POLICY_FILE': '/run/secrets/delivery-policy.json'}
+                                      'DELIVERY_POLICY_FILE': '/run/secrets/delivery-policy.json',
+                                      'DELIVERY_EGRESS_PROXY': 'delivery-egress:3128'}
+    assert service['depends_on']['delivery-egress']['condition'] == 'service_started'
     mounts = {volume['target']: volume for volume in service['volumes']}
     assert set(mounts) == {'/run/secrets/database_url', '/run/secrets/delivery-policy.json', '/run/secrets/receivers'}
     assert all(volume['type'] == 'bind' and volume['read_only'] is True for volume in mounts.values())
@@ -133,6 +138,17 @@ def test_delivery_overlay_isolates_the_dispatcher_database_path_and_egress(tmp_p
     assert service['tmpfs'] == ['/tmp:size=16m,noexec,nosuid']
     assert int(service['mem_limit']) == 256 * 1024**2 and service['cpu_shares'] == 512 and service['pids_limit'] == 64
     assert service['logging'] == {'driver': 'json-file', 'options': {'max-size': '5m', 'max-file': '2'}}
+    # The proxy: no database and no secret, the policy file only; the egress bridge with an explicit resolver.
+    proxy = services['delivery-egress']
+    assert proxy['command'] == ['python', '-m', 'messaging_service.egress_proxy'] and proxy['image'] == service['image']
+    assert set(proxy['networks']) == {'delivery_proxy', 'delivery_egress'} and proxy['dns'] == ['1.1.1.1']
+    assert proxy['environment'] == {'DELIVERY_POLICY_FILE': '/run/secrets/delivery-policy.json'}
+    assert [(v['target'], v['read_only']) for v in proxy['volumes']] == [('/run/secrets/delivery-policy.json', True)]
+    assert Path(proxy['volumes'][0]['source']) == root / 'deploy/private/delivery-policy.json'
+    assert proxy['read_only'] is True and proxy['user'] == '10001:10001' and proxy['cap_drop'] == ['ALL']
+    assert 'no-new-privileges:true' in proxy['security_opt'] and proxy['init'] is True and not proxy.get('ports')
+    assert proxy['tmpfs'] == ['/tmp:size=16m,noexec,nosuid'] and int(proxy['mem_limit']) == 128 * 1024**2
+    assert proxy['pids_limit'] == 128 and proxy['logging'] == service['logging']
     # The API reads the same host policy for registration; nothing else of the API changes.
     api = services['api']
     assert api['environment']['DELIVERY_POLICY_FILE'] == '/run/secrets/delivery-policy.json'

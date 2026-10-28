@@ -7,6 +7,7 @@ import signal
 import threading
 import time
 from . import heartbeats
+from .egress import proxy_lookup, proxy_transport
 from .event_delivery import (OPERATOR_DNS_SLOTS, _addresses, _transport, beat, dispatch_hints, disable_receiver,
     endpoint_tests, register_receiver)
 from .store import Store
@@ -43,10 +44,17 @@ def _lane(store, stop, name, progress, interval, step):
             stop.wait(interval)
 
 
-def run(store, stop, *, transport=_transport, resolver=None, interval=2):
-    """Operator receivers and self-service endpoints in separate lanes until stop is set (ANYM-534)."""
-    operator_resolver = resolver or (lambda host, port: _addresses(host, port, slots=OPERATOR_DNS_SLOTS))
-    resolver = resolver or _addresses
+def run(store, stop, *, transport=_transport, resolver=None, interval=2, proxy=None):
+    """Operator receivers and self-service endpoints in separate lanes until stop is set (ANYM-534). With `proxy`
+    (DELIVERY_EGRESS_PROXY) every lookup and connection goes through the egress proxy, the operator lane on its own
+    proxy slots (ANYM-581)."""
+    operator_transport = transport
+    if proxy:
+        transport, operator_transport = proxy_transport(proxy), proxy_transport(proxy, lane='operator')
+        resolver, operator_resolver = proxy_lookup(proxy), proxy_lookup(proxy, lane='operator')
+    else:
+        operator_resolver = resolver or (lambda host, port: _addresses(host, port, slots=OPERATOR_DNS_SLOTS))
+        resolver = resolver or _addresses
     served = {}
     def endpoint_step(first):
         def step():
@@ -59,7 +67,8 @@ def run(store, stop, *, transport=_transport, resolver=None, interval=2):
                     result['endpoint_tests'] = tests
             return result
         return step
-    steps = {'operator': lambda: dispatch_hints(store, lane='operator', transport=transport, resolver=operator_resolver)}
+    steps = {'operator': lambda: dispatch_hints(store, lane='operator', transport=operator_transport,
+        resolver=operator_resolver)}
     steps.update({f'endpoint-{n}': endpoint_step(n == 0) for n in range(ENDPOINT_LANES)})
     started = time.monotonic()
     progress = dict.fromkeys(steps, started)
@@ -95,6 +104,7 @@ def main():
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
     store = Store(Path(dsn_file).read_text().strip(), Path('/nonexistent-originals'), 'http://unused')
+    proxy = os.environ.get('DELIVERY_EGRESS_PROXY') or None
     try:
         if args.register_receiver:
             info = args.register_receiver.stat()
@@ -103,15 +113,18 @@ def main():
             config = json.loads(args.register_receiver.read_text())
             if not isinstance(config, dict) or set(config) != {'receiver_id','principal','key_id','endpoint','secret_file'}:
                 raise SystemExit('Invalid receiver configuration')
-            print(json.dumps(register_receiver(store, **config)))
+            # The dispatcher container resolves only through the proxy (ANYM-581).
+            lookup = {'resolver': proxy_lookup(proxy, lane='operator')} if proxy else {}
+            print(json.dumps(register_receiver(store, **config, **lookup)))
             return
         if args.disable_receiver:
             print(json.dumps(disable_receiver(store, args.disable_receiver)))
             return
         if args.once:
-            print(json.dumps(dispatch_hints(store)), flush=True)
+            once = {'transport': proxy_transport(proxy), 'resolver': proxy_lookup(proxy)} if proxy else {}
+            print(json.dumps(dispatch_hints(store, **once)), flush=True)
             return
-        run(store, stop)
+        run(store, stop, proxy=proxy)
     finally:
         store.close()
 

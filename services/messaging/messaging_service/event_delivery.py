@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 
 from psycopg.types.json import Jsonb
 
+from .egress import EgressNotSent, deadline_after, post
 from .subscriptions import _owned, _state, _view, _worker_identity
 
 
@@ -304,34 +305,22 @@ def test_subscription(store, c, p, subscription_id, request_id):
 
 
 def _transport(endpoint, body, headers, *, resolved, timeout=5):
-    """Pinned TLS socket; no proxies, redirects, URL credentials or second DNS lookup."""
+    """Pinned TLS socket; no proxies, redirects, URL credentials or second DNS lookup. Failures before the first
+    request byte are EgressNotSent (ANYM-581); the dispatcher in Compose uses egress.proxy_transport instead."""
     host, addresses, path = resolved
-    deadline = time.monotonic() + timeout
-    def remaining():
-        value = deadline - time.monotonic()
-        if value <= 0:
-            raise TimeoutError
-        return value
-    with socket.create_connection((addresses[0], 443), timeout=remaining()) as raw:
-        raw.settimeout(remaining())
-        with ssl.create_default_context().wrap_socket(raw, server_hostname=host) as connection:
-            connection.settimeout(remaining())
-            request = ('POST ' + path + ' HTTP/1.1\r\nHost: ' + ('[' + host + ']' if ':' in host else host) + '\r\nConnection: close\r\n' +
-                'Content-Length: ' + str(len(body)) + '\r\n' +
-                ''.join(key + ': ' + value + '\r\n' for key, value in headers.items()) + '\r\n').encode('ascii')
-            connection.sendall(request + body)
-            status = b''
-            while b'\r\n' not in status:
-                connection.settimeout(remaining())
-                part = connection.recv(256)
-                if not part or len(status) + len(part) > 1024:
-                    raise ValueError('invalid_receiver_response')
-                status += part
-            line = status.split(b'\r\n', 1)[0]
-            match = re.fullmatch(rb'HTTP/1\.[01] ([0-9]{3})(?: [\x20-\x7e]*)?', line)
-            if match is None:
-                raise ValueError('invalid_receiver_response')
-            return int(match[1])
+    remaining = deadline_after(timeout)
+    try:
+        raw = socket.create_connection((addresses[0], 443), timeout=remaining())
+    except OSError as error:
+        raise EgressNotSent('receiver_connect_failed') from error
+    with raw:
+        try:
+            raw.settimeout(remaining())
+            connection = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+        except OSError as error:
+            raise EgressNotSent('receiver_tls_failed') from error
+        with connection:
+            return post(connection, host, path, body, headers, remaining)
 
 
 # ANYM-518: webhook delivery counts as working while the dispatcher's last pass is this recent.
