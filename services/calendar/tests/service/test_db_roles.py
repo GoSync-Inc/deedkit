@@ -38,9 +38,10 @@ MATRIX = (
     | {("wk", "audit", "INSERT"), ("wk", "projection_links", "INSERT"), ("wk", "projection_links", "UPDATE")}
     | {("wk", t, "UPDATE") for t in ("operations", "operation_steps", "sync_jobs")}
     | {(role, "audit_id_seq", "USAGE") for role in ("gw", "wk")}
+    | {("gw", "member_people", "SELECT")}
 )
-# Schema 4, before migration 5 adds invitation_opt_ins.
-MATRIX_4 = {e for e in MATRIX if e[1] != "invitation_opt_ins"}
+# Schema 4, before migration 5 adds invitation_opt_ins (and 6 member_people).
+MATRIX_4 = {e for e in MATRIX if e[1] not in ("invitation_opt_ins", "member_people")}
 
 
 def names_of(s):
@@ -95,7 +96,7 @@ def check(s):
 def test_roles_sql_grants_exactly_the_written_matrix(schema_one, roles):  # noqa: F811 (fixtures)
     apply_roles, _ = roles
     s = schema_one
-    for version in (1, 2, 3, 4, 5):  # each version's grants equal roles_expected.json at that version
+    for version in (1, 2, 3, 4, 5, 6):  # each version's grants equal roles_expected.json at that version
         s.migrate(through=version)
         apply_roles()
         assert check(s) == (version, [])
@@ -213,7 +214,7 @@ def test_db_roles_check_is_clean_after_db_roles_and_writes_nothing(fcs_home):
     run(["migrate"], home)
     run(["db-roles"], home)
     before = snapshot(home, dsn)
-    assert run(["db-roles", "--check"], home) == {"db_roles_check": "ok", "schema_version": 5}
+    assert run(["db-roles", "--check"], home) == {"db_roles_check": "ok", "schema_version": 6}
     assert snapshot(home, dsn) == before
 
 
@@ -229,7 +230,7 @@ def test_db_roles_check_names_each_drift_and_writes_nothing(fcs_home, change, li
     with pytest.raises(CalendarError) as caught:
         run(["db-roles", "--check"], home)
     assert caught.value.code == "db_roles_drift"
-    assert caught.value.details == {"schema_version": 5, "drift": lines}
+    assert caught.value.details == {"schema_version": 6, "drift": lines}
     assert snapshot(home, dsn) == before
 
 
