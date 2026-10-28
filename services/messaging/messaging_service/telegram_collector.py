@@ -1106,6 +1106,10 @@ class TelegramCollector:
             if await asyncio.wait_for(finished(state.catalog,chat,'chat' if peer is types.PeerChat else 'channel',
                     title if isinstance(title,str) and title else chat,chat_type,self.history_since),budget):
                 data['chat_id']=stable_id('chat',self.account,chat)
+        except asyncio.CancelledError:
+            # A shutdown during the catalog write: the worker settles the confirmed receipt first, then stops.
+            job['_cancel_after_settle']=True
+            log.warning('new_chat_catalog_failed operation=%s error=CancelledError',job.get('operation'))
         except Exception as exc:
             log.warning('new_chat_catalog_failed operation=%s error=%s',job.get('operation'),type(exc).__name__)
 

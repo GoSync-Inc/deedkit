@@ -444,12 +444,22 @@ class CollectorState:
 
     def catalog(self,provider_chat,peer_kind,title,chat_type,history_since):
         """ANYM-476: a chat first seen in a live search hit enters the catalog as a dialog would; a known one is left as is.
-        True when the chat is in the catalog afterwards, False when the collection policy leaves it out."""
+        True only when the current collection policy allows the chat and its archive row exists afterwards."""
         with self.archive.store.pool.connection() as c:
             self.archive.fence(c,self.account,self.lease)
-            if c.execute('SELECT 1 FROM collector_chats WHERE account=%s AND provider_chat=%s',
-                         (self.account,provider_chat)).fetchone(): return True
-        return provider_chat in self.inventory([(provider_chat,peer_kind,title,chat_type or 'unknown')],history_since)
+            known=c.execute('SELECT 1 FROM collector_chats WHERE account=%s AND provider_chat=%s',
+                            (self.account,provider_chat)).fetchone()
+            if known: return self.catalogued(c,provider_chat)
+        self.inventory([(provider_chat,peer_kind,title,chat_type or 'unknown')],history_since)
+        with self.archive.store.pool.connection() as c:
+            self.archive.fence(c,self.account,self.lease)
+            return self.catalogued(c,provider_chat)
+
+    def catalogued(self,c,provider_chat):
+        # A collector checkpoint alone is no archive chat: live capture writes it before the chats row.
+        policy=c.execute('SELECT * FROM account_policies WHERE account=%s AND enabled',(self.account,)).fetchone()
+        return bool(policy and self.allows(policy,provider_chat) and c.execute('SELECT 1 FROM chats WHERE id=%s',
+                    (stable_id('chat',self.account,provider_chat),)).fetchone())
 
     def attempted(self,chat):
         with self.archive.store.pool.connection() as c:

@@ -890,7 +890,7 @@ def collector_worker(state,client):
     return CommandWorker(state,collector.execute_operation)
 
 
-def created_by_worker(s,key,state):
+def created_by_worker(s,key,state,run=asyncio.run):
     from datetime import datetime,timezone
     from telethon.tl import functions,types
     from test_telegram_operations import Client
@@ -904,7 +904,7 @@ def created_by_worker(s,key,state):
     created=types.Chat(int(CREATED_CHAT[1:]),'Synthetic new group',types.ChatPhotoEmpty(),2,datetime.now(timezone.utc),1)
     client.responses[functions.messages.CreateChatRequest]=types.messages.InvitedUsers(
         types.Updates([],[],[created],datetime.now(timezone.utc),0),[])
-    assert asyncio.run(collector_worker(state,client).once())
+    assert run(collector_worker(state,client).once())
     return s.get_messenger_operation(key,queued['operation_id'])
 
 
@@ -971,3 +971,44 @@ def test_a_slow_catalog_write_is_cut_off_and_keeps_the_created_group_confirmed(o
                        (receipt['operation_id'],)).fetchone()['s']
     # The receipt is written once the budget and the thread grace are spent, not after the slow write.
     assert took<telegram_collector.STORE_GRACE+1.5
+
+
+# spec: ANYM-171
+def test_a_shutdown_during_the_catalog_write_settles_the_created_group_before_it_stops(operator,monkeypatch):
+    # The provider already created the group; a collector shutdown at that point used to leave the receipt
+    # dispatching, and recovery then read the confirmed change as unknown.
+    import threading
+    import time
+    s,_,key,state=operator
+    started=threading.Event()
+    def slow(*args):started.set();time.sleep(.5);return True
+    monkeypatch.setattr(CollectorState,'catalog',slow)
+    async def cancel_during_catalog(once):
+        task=asyncio.ensure_future(once)
+        await asyncio.to_thread(started.wait,10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):await task
+        return True
+    receipt=created_by_worker(s,key,state,lambda once:asyncio.run(cancel_during_catalog(once)))
+    assert receipt['status']=='succeeded' and receipt['result']['data']['provider_chat_id']==CREATED_CHAT
+
+
+# spec: ANYM-171
+def test_a_collector_checkpoint_without_an_archive_chat_gives_no_chat_id(operator):
+    # Live capture writes the checkpoint before the chats row; the receipt names only a chat the archive holds.
+    s,_,key,state=operator
+    with s.pool.connection() as c:
+        c.execute('INSERT INTO collector_chats(account,provider_chat,peer_kind) VALUES(%s,%s,%s)',
+                  ('command-fixture',CREATED_CHAT,'chat'))
+    receipt=created_by_worker(s,key,state)
+    assert receipt['status']=='succeeded' and 'chat_id' not in receipt['result']['data']
+
+
+# spec: ANYM-171
+def test_a_tracked_chat_the_policy_now_leaves_out_gives_no_chat_id(operator):
+    s,_,key,state=operator
+    state.inventory([(CREATED_CHAT,'chat','Synthetic old title','group')],None)
+    with s.pool.connection() as c:
+        c.execute('UPDATE account_policies SET exclude_chats=%s WHERE account=%s',([CREATED_CHAT],'command-fixture'))
+    receipt=created_by_worker(s,key,state)
+    assert receipt['status']=='succeeded' and 'chat_id' not in receipt['result']['data']
