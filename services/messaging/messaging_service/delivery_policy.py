@@ -137,6 +137,7 @@ def host_admission_slot(c, endpoint, now):
     if host is None:
         return None
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))', ('delivery-host:' + host['host'],))
+    # subscription_hint_host_admission (052) starts the read at the hour's first admission, never the history.
     charged = c.execute('''SELECT o.admitted_at AS t FROM subscription_outbox o JOIN delivery_endpoints e
         ON e.id=o.endpoint WHERE e.host=%s AND o.admitted_at>%s-interval '1 hour'
         ORDER BY o.admitted_at DESC OFFSET %s LIMIT 1''', (host['host'], now, limit - 1)).fetchone()
