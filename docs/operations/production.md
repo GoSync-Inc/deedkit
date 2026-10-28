@@ -838,7 +838,10 @@ before any stop while that file exists and its git blob is not the release's
 `services/messaging/messaging_service/backup_runner.py`; the refusal names both
 blob ids, and under `deploy --auto` it pauses the deployer like any refusal
 before a change. A host without the file runs no backup and is not checked.
-With the timer and the backup service idle, from the prepared release:
+With the timer and the backup service idle, from the prepared release: when
+the backup worker changed in the same range, first set the backup image pin in
+`runner.json` to the release's backup image and read it back, then install the
+runner:
 
 ```sh
 sha=<same-sha>; src=/var/lib/deedkit-production/$sha/source
@@ -848,14 +851,16 @@ sudo install -o root -g root -m 0600 "$src/services/messaging/messaging_service/
 sudo git hash-object /opt/personal-os-probe/ops/backup_runner.py   # = git -C "$src" rev-parse $sha:<that path>
 ```
 
-When the backup worker changed in the same range, update the backup image pin
-in `runner.json` too. Install the new runner before you add any new
-`runner.json` key: the runner refuses keys it does not know. Then remove
-`/etc/deedkit/autodeploy.pause`. Undo, in this order: remove from
-`runner.json` every key the `.before-<sha>` runner does not know (for example
-`busy_wait_seconds`) and put back the image pin it ran with, then install the
-`.before-<sha>` copy the same way. An older runner refuses a newer key, so
-the backup would fail on every run.
+Install the new runner before you add any new `runner.json` key: the runner
+refuses keys it does not know. Then remove
+`/etc/deedkit/autodeploy.pause`. Undo, with the timer and the backup service
+idle, in this order: remove from `runner.json` every key the `.before-<sha>`
+runner does not know (for example `busy_wait_seconds`), install the
+`.before-<sha>` copy the same way, and only then put back the image pin it ran
+with. An older runner refuses a newer `runner.json` key, and an older worker
+refuses a newer `worker.json` key the runner writes (`dump_timeout_seconds`,
+ANYM-627), so the backup would fail on every run; the older runner with the
+newer image passes (the worker keeps its 600 s default).
 
 ## Roll back the current release
 

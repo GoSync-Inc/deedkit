@@ -24,7 +24,7 @@ process and state.
 uv sync --group dev                                   # CI: --frozen
 PROBE_TEST_DSN_FILE=<file> uv run pytest tests        # DSN must end in /messaging_probe_test
 (cd services/gateway && uv sync --locked --group dev && uv run pytest -q)
-(cd services/calls && uv sync --locked --group dev && uv run pytest -q)
+(cd services/gateway && uv sync --locked --group dev) && (cd services/calls && uv sync --locked --group dev && uv run pytest -q)
 (cd services/calendar && uv sync --locked --group dev && FCS_TEST_DSN=<dsn> uv run pytest -m 'not live')
 (cd services/calls/frontend && npm ci --ignore-scripts && npm test && npm run build)
 node --test whatsapp/tests/*.test.mjs
