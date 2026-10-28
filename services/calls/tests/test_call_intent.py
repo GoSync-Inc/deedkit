@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 import threading
+import time
 
 import httpx
 import pytest
@@ -16,6 +17,7 @@ from platform_contracts import agent  # noqa: E402
 from platform_contracts.agent_conformance import CASES, Crash, run_matrix  # noqa: E402
 
 from agent_api import SCOPES, AgentAPI, AgentRegistry  # noqa: E402
+from anymsg import AnyMsg  # noqa: E402
 import call_intent  # noqa: E402
 from core import ServiceError, VoiceService  # noqa: E402
 from outbound import CallingSettings, Outbound  # noqa: E402
@@ -411,7 +413,8 @@ def test_channels_and_messaging_account_names_map_or_name_the_allowed_values(wor
                                            "channel": "telegram", "owner_instruction": ARCHIVE_WORDS}),
                      "invalid_arguments")
     assert mismatch["field_errors"][0]["allowed"] == ["whatsapp", "phone"]
-    w.target = {"account": "tg1", "chat_id": CHAT, "network": "telegram", "label": "Alpha", "how_resolved": "chat_id"}
+    w.target = {"account": "tg1", "chat_id": CHAT, "network": "telegram", "label": "Alpha", "how_resolved": "chat_id",
+                "telegram_user_id": "123456789"}
     telegram = preview(w)["preview"]["destination"]
     assert (telegram["channel"], telegram["destination"]) == ("telegram", "123456789")
 
@@ -556,3 +559,99 @@ def test_the_published_call_example_previews_without_dialing(world):
     result = w.tool("p1", "call", example)
     assert agent.validate_result(result)["state"] == "previewed", result
     assert w.effects == 0
+
+
+class Messaging:
+    """A stub messaging backend behind the real AnyMsg client: each principal's own key sees only its own people."""
+
+    def __init__(self):
+        self.requests = []
+        self.targets = {"key-p1": {"account": "whatsapp-owner-1", "phone": PHONE, "network": "whatsapp",
+                                   "label": "Alpha Supplier", "how_resolved": "person"}}
+
+    def handler(self, request):
+        body = json.loads(request.content)
+        self.requests.append((request.url.path, request.headers["authorization"], body))
+        target = self.targets.get(request.headers["authorization"].removeprefix("Bearer "))
+        if body["to"] == PERSON and target:
+            return httpx.Response(200, json={"state": "succeeded", "target": target, "next": None})
+        return httpx.Response(404, json={"error": "not_found", "next": {"tool": "messages_search_people",
+                                                                        "arguments": {}}})
+
+
+def person_call(w, principal, **extra):
+    return w.tool(principal, "call", {"to": PERSON, "goal": "Ask when the order arrives", "dry_run": True,
+                                      "owner_instruction": ARCHIVE_WORDS, **extra})
+
+
+# spec: ANYM-548
+def test_a_person_resolves_with_the_callers_own_key_and_sends_only_the_person_and_purpose(world):
+    w, backend = world(), Messaging()
+    http = httpx.AsyncClient(transport=httpx.MockTransport(backend.handler))
+    w.api.intents.archive_factory = lambda principal: AnyMsg("https://messaging.example.test",
+                                                             "key-" + principal.id, http=http)
+    shown = person_call(w, "p1", channel="phone")
+    assert agent.validate_result(shown)["state"] == "previewed", shown
+    destination = shown["preview"]["destination"]
+    # A WhatsApp-only person: the E.164 number of its JID, dialled on the phone (twilio) channel.
+    assert (destination["channel"], destination["destination"], destination["how_resolved"]) == ("phone", PHONE, "person")
+    hidden = error(person_call(w, "p2"), "not_found")
+    assert hidden["retryable"] is False and w.effects == 0
+    # An asked messaging account is checked against the answer, never sent.
+    assert person_call(w, "p1", channel="whatsapp-owner-1")["preview"]["destination"]["destination"] == PHONE
+    other = error(person_call(w, "p1", channel="whatsapp-owner-2"), "invalid_arguments")
+    assert other["field_errors"] == [{"field": "channel", "reason": "enum", "allowed": ["whatsapp-owner-1"]}]
+    # Egress calls -> messaging: the person UUID, the purpose and the caller's own key; nothing else.
+    asked = {"to": PERSON, "purpose": "call"}
+    assert backend.requests == [("/v1/resolve_target", "Bearer key-" + who, asked) for who in ("p1", "p2", "p1", "p1")]
+    w.run(http.aclose())
+
+
+# spec: ANYM-548
+def test_a_slow_messaging_fails_only_the_person_call_within_three_seconds(world):
+    w = world()
+    held = []
+
+    async def hold(reader, writer):
+        held.append(writer)  # Accept and never answer, not even the TLS handshake.
+
+    server = w.run(asyncio.start_server(hold, "127.0.0.1", 0))
+    port = server.sockets[0].getsockname()[1]
+    w.api.intents.archive_factory = lambda principal: AnyMsg(f"https://127.0.0.1:{port}", "key-" + principal.id)
+    started = time.monotonic()
+    slow = asyncio.run_coroutine_threadsafe(w.api.call("p1", "call", {
+        "to": PERSON, "goal": "Ask when the order arrives", "dry_run": True, "owner_instruction": ARCHIVE_WORDS}), w.loop)
+    # Another calls path answers while the lookup waits: an owner-typed number needs no messaging.
+    typed = w.tool("p2", "call", {"to": TYPED, "goal": "Ask when the order arrives", "dry_run": True,
+                                  "owner_instruction": TYPED_WORDS})
+    assert agent.validate_result(typed)["state"] == "previewed" and not slow.done()
+    with pytest.raises(ServiceError) as failed:
+        slow.result(10)
+    assert time.monotonic() - started < 3.5
+    assert (failed.value.code, failed.value.status, failed.value.detail) == ("dependency_unavailable", 503,
+                                                                            {"retryable": True})
+    assert w.effects == 0 and w.service.list_calls() == []
+    server.close()
+    for writer in held:
+        writer.close()
+
+
+# spec: ANYM-548
+def test_a_messaging_answer_trickling_in_still_fails_the_call_within_three_seconds(world):
+    w = world()
+
+    async def trickle():
+        for _ in range(6):
+            await asyncio.sleep(0.8)  # Each chunk is well inside httpx's per-read timeout.
+            yield b" "
+
+    async def handler(request):
+        return httpx.Response(200, headers={"content-type": "application/json"}, content=trickle())
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    w.api.intents.archive_factory = lambda principal: AnyMsg("https://messaging.example.test", "key-" + principal.id,
+                                                             http=http)
+    started = time.monotonic()
+    failed = error(person_call(w, "p1"), "dependency_unavailable")
+    assert time.monotonic() - started < 3.5 and failed["retryable"] is True and w.effects == 0
+    w.run(http.aclose())

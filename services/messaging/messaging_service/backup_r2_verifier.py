@@ -33,7 +33,7 @@ PG_DATA_PATH = '/var/lib/postgresql'
 HELPER_TMPFS = {'/tmp':'rw,noexec,nosuid,size=64m',
                 PG_DATA_PATH:'ro,noexec,nosuid,nodev,size=1m,mode=0700'}
 # Backup schema versions this verifier accepts from its helper (`capabilities` reports them).
-SCHEMAS = range(2,53)
+SCHEMAS = range(2,54)
 
 
 def now():return datetime.now(timezone.utc).isoformat()

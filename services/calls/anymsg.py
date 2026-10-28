@@ -1,9 +1,13 @@
 """Read-only, bounded REST adapter. Messenger credentials never reach the model."""
+import asyncio
 import json
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
+
+# The person lookup behind calls_call (ANYM-548): messaging down or slow fails the call within this bound.
+RESOLVE_TIMEOUT_S=3
 
 
 class ArchiveArgumentsRejected(ValueError):
@@ -11,7 +15,7 @@ class ArchiveArgumentsRejected(ValueError):
 
 
 class AnyMsg:
-    allowed = {"capabilities", "search", "get_context", "resolve_target", "get_messages"}
+    allowed = {"capabilities", "search", "get_context", "resolve_target"}
 
     def __init__(self, base_url, token, http=None):
         u=urlsplit(base_url)
@@ -60,21 +64,18 @@ class AnyMsg:
         return row
 
     async def resolve_target(self,to,purpose,account=""):
-        """(status, body) of ANYM-545's resolver: its refusals (selection_required, not_found) are answers, not failures."""
-        r=await self.http.post(self.base+"/v1/resolve_target",json={"to":to,"purpose":purpose,"account":account},
-                               headers={"Authorization":"Bearer "+self._token})
+        """(status, body) of ANYM-545's resolver: its refusals (selection_required, not_found) are answers, not failures.
+        Sends only `to`, `purpose`, an asked account and the caller's key; a slow messaging fails in 3 s (ANYM-548)."""
+        # One deadline for the whole exchange: httpx's own timeout restarts with every phase and chunk.
+        async with asyncio.timeout(RESOLVE_TIMEOUT_S):
+            r=await self.http.post(self.base+"/v1/resolve_target",json={"to":to,"purpose":purpose,**({"account":account} if account else {})},
+                                   headers={"Authorization":"Bearer "+self._token},timeout=RESOLVE_TIMEOUT_S)
         if r.status_code not in (200,400,404,409) or len(r.content)>1024*1024:
             raise ValueError("archive_read_failed")
         v=r.json()
         if not isinstance(v,dict):
             raise ValueError("archive_read_failed")
         return r.status_code,v
-
-    async def provider_chat(self,chat_id):
-        """The provider's ID of one chat; for a private Telegram chat it is the user ID a call dials."""
-        v=await self.call("get_messages",{"chat_id":chat_id,"limit":1,"order":"desc","detail":"full"})
-        rows=v.get("messages")
-        return rows[0].get("provider_chat_id") if isinstance(rows,list) and rows and isinstance(rows[0],dict) else None
 
     async def close(self):
         if self.owned:
