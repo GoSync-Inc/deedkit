@@ -59,6 +59,16 @@ def github(*, conclusion="success", event="push", branch="main", sha=SHA, jobs=N
     return get, run, required
 
 
+# spec: ANYM-626
+def test_the_merge_queue_builds_six_entries_and_merges_one_all_green_squash_at_a_time():
+    ruleset = json.loads((ROOT / "deploy/main-ruleset.json").read_text())
+    queue = [rule["parameters"] for rule in ruleset["rules"] if rule["type"] == "merge_queue"]
+    assert queue == [{"merge_method": "SQUASH", "grouping_strategy": "ALLGREEN", "max_entries_to_build": 6,
+                      "min_entries_to_merge": 1, "max_entries_to_merge": 1, "min_entries_to_merge_wait_minutes": 0,
+                      "check_response_timeout_minutes": 60}]
+    assert "build concurrency 6, one merge at a time" in (ROOT / "docs/operations/parallel-development.md").read_text()
+
+
 def test_exact_successful_main_push_and_all_required_jobs_allow_promotion():
     get, _, _ = github()
     assert p.verify(SHA, get)["run_attempt"] == 2

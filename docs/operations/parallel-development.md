@@ -27,7 +27,7 @@ per provider, and migration numbers are sequential with immutable checksums. `ci
 ## Merging
 
 - `main` is protected by the ruleset `deploy/main-ruleset.json` (live as ruleset 25274451):
-  squash only, `ALLGREEN`, build concurrency 3, one merge at a time, `CI gate` and
+  squash only, `ALLGREEN`, build concurrency 6, one merge at a time, `CI gate` and
   `checks / verify` required, no bypass. A pull request need not be up to date with `main`: the
   queue tests it against the latest `main` plus the pull requests ahead of it, on `merge_group`.
 - When the group commit has exactly the tree a passing full pull request run tested, the queue
