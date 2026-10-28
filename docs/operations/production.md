@@ -845,28 +845,36 @@ to the prepared release's backup image in the same step, before the runner: a ne
 can write a `worker.json` key an older worker refuses (BACKUP.md).
 
 ```sh
-sha=<prepared-sha>; src=/var/lib/deedkit-production/$sha/source
-image=$(sudo docker image inspect -f '{{.Id}}' deedkit-production-backup:$sha)
-sudo docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image"   # = $sha
+sha=<prepared-sha>; src=/var/lib/deedkit-production/$sha/source; pin=yes   # pin=no: the worker did not change
 sudo flock --nonblock /opt/personal-os-probe/backups/.runner.lock sh -euc '
-  sha=$1 src=$2 image=$3 ops=/opt/personal-os-probe/ops cfg=/opt/personal-os-probe/backup-config/runner.json
+  sha=$1 src=$2 pin=$3 ops=/opt/personal-os-probe/ops cfg=/opt/personal-os-probe/backup-config/runner.json
   new=$src/services/messaging/messaging_service/backup_runner.py
   for u in personal-os-backup.service deedkit-autodeploy.service; do
     case $(systemctl show -P ActiveState $u) in inactive|failed) ;; *) echo "$u not idle"; exit 1;; esac
   done
   python3 -I "$new" --config "$cfg" --check
+  if [ "$pin" = yes ]; then
+    image=$(docker image inspect -f "{{.Id}}" "deedkit-production-backup:$sha")
+    case $image in sha256:*) ;; *) echo "no backup image for $sha"; exit 1;; esac
+    rev=$(docker image inspect -f "{{index .Config.Labels \"org.opencontainers.image.revision\"}}" "$image")
+    test "$rev" = "$sha"
+    rm -f "$cfg.new"
+    python3 -I -c "import json,os,sys;p,i=sys.argv[1:];c=json.load(open(p));c[\"image\"]=i
+fd=os.open(p+\".new\",os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600);os.write(fd,(json.dumps(c,indent=2)+\"\n\").encode())
+os.fsync(fd);os.close(fd)" "$cfg" "$image"
+    python3 -I "$new" --config "$cfg.new" --check
+  fi
   cp -p "$ops/backup_runner.py" "$ops/backup_runner.py.before-$sha"; cp -p "$cfg" "$cfg.before-$sha"
-  python3 -I -c "import json,os,sys;p,i=sys.argv[1:];c=json.load(open(p));c[\"image\"]=i;t=p+\".new\"
-fd=os.open(t,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600);os.write(fd,(json.dumps(c,indent=2)+\"\n\").encode())
-os.fsync(fd);os.close(fd);os.replace(t,p)" "$cfg" "$image"
-  python3 -I "$new" --config "$cfg" --check
+  if [ "$pin" = yes ]; then mv "$cfg.new" "$cfg"; fi
   install -o root -g root -m 0600 "$new" "$ops/backup_runner.py"
   test "$(git hash-object "$ops/backup_runner.py")" = "$(git hash-object "$new")"
-  echo "installed $(git hash-object "$ops/backup_runner.py"), image $image"
-' sh "$sha" "$src" "$image"
+  echo "installed $(git hash-object "$ops/backup_runner.py"), image $(python3 -I -c "import json,sys;print(json.load(open(sys.argv[1]))[\"image\"])" "$cfg")"
+' sh "$sha" "$src" "$pin"
 ```
 
-Skip the two pin lines when the worker did not change. Install the new runner before you add
+Every check runs before the first write: the image is resolved and its revision compared
+inside the lock, and the new `runner.json` is written beside the live one and checked before
+it replaces it. Install the new runner before you add
 any new `runner.json` key: the runner refuses keys it does not know. Then remove
 `/etc/deedkit/autodeploy.pause` only when its reason is this runner's refusal (`the backup
 runner ... is blob`); a pause for another reason stays. The step is done when the next
