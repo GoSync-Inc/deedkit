@@ -337,3 +337,16 @@ def test_policy_reload_reports_the_vendor_map_it_loaded(gate, policy):
     assert store.reload_delivery_policy()['vendors'] == {'grok-bot-routine': ['routine.vendor.test']}
     policy(allow_hosts=['vendor.test'])
     assert store.reload_delivery_policy()['vendors'] == {}
+
+
+# spec: ANYM-604
+def test_vendor_rate_limit_retry_waits_for_its_retry_after(gate, policy):
+    store = gate
+    token = identity(store)
+    bound(store, token)
+    dispatch_hints(store, transport=lambda *a, **k: (429, 900), resolver=PUBLIC)
+    assert hint(store) == {'state': 'pending', 'error_code': 'receiver_status', 'attempts': 1}
+    with store.pool.connection() as c:
+        seconds = c.execute("""SELECT extract(epoch FROM next_attempt_at-clock_timestamp())::float AS s
+            FROM subscription_outbox WHERE kind='events'""").fetchone()['s']
+    assert 870 < seconds <= 900
