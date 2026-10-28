@@ -194,6 +194,8 @@ the gateway additionally limits actions to the chosen tools and grants.
 
 Read capabilities/agenda, create a `family_plan` of 1–8 actions, check the preview within the user's instruction, call apply with a saved `request_id`, read the operation. A plan lives ten minutes. Permissions are re-checked before admission and sending. Update/delete use the `event_ref` from the agenda and the saved ETag; the worker checks the version with a fresh GET.
 
+Dated tasks from a chat summary are planned only when the owner asks, after the summary: [CONVERSATION.md, "Summarize a chat and list its tasks"](../../../CONVERSATION.md#summarize-a-chat-and-list-its-tasks) (title and time only, agenda match, conflicts shown, apply after the owner's yes).
+
 ```json
 {"actions":[{"action":"create","calendar_ref":"CAL_REF","event":{"title":"Lesson","start":"2026-10-19T16:00:00+08:00","end":"2026-10-19T17:00:00+08:00","timezone":"Asia/Makassar"}}]}
 ```
