@@ -1292,6 +1292,32 @@ def test_a_run_killed_around_the_calendar_container_is_settled_from_status_and_t
 
 
 # spec: ANYM-586
+@pytest.mark.parametrize("call", ["active", "unknown"])
+def test_a_resumed_db_roles_waits_for_an_active_or_unknown_call(tmp_path, monkeypatch, call):
+    host = CalendarHost(tmp_path, monkeypatch, {"schema_v6.sql": CALENDAR_TABLE}, files={"051_synthetic_note.sql": NOTE})
+    host.crash_at = 3  # the calendar migrate-expand commits, the run dies before its --status
+    with pytest.raises(Died):
+        host.deploy()
+    host.crash_at = None
+    real = host.wait_for_calls
+    def calls(settings, deadline):
+        if call == "unknown":
+            raise p.CallsUnknown("the calls service could not be read")
+        host.calls = ["synthetic-call"]
+        return real(settings, deadline)
+    monkeypatch.setattr(p, "wait_for_calls", calls)
+    steps = list(host.steps)
+    outcome = host.deploy()
+    assert outcome["status"] == "waiting" and outcome["call_waits"]["count"] == 1 and host.paused() is None
+    assert "calendar roles" not in host.events and "migrate" not in host.events and host.steps == steps
+    assert host.migration()["status"] == "planned" and host.migration()["phases"]["calendar"]["status"] == "planned"
+    host.calls = []
+    monkeypatch.setattr(p, "wait_for_calls", real)
+    assert host.deploy()["reason"] == "calendar migrated to 6; messaging not applied: interrupted"
+    assert host.containers.count("calendar roles") == 1 and host.containers.count("calendar migrate") == 1
+
+
+# spec: ANYM-586
 def test_a_run_killed_during_db_roles_pauses_and_never_reruns_it(tmp_path, monkeypatch):
     host = CalendarHost(tmp_path, monkeypatch, {"schema_v6.sql": CALENDAR_TABLE})
     host.crash_at = 4  # calendar identity, migrate, status, then db-roles

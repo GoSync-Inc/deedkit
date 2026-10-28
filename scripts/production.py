@@ -3338,6 +3338,9 @@ def resumed_migration(settings, plans, candidate, release):
             if outcome != "migrated":
                 raise progress.refused(name, outcome, outcome_text(candidate, outcome, name=name))
             if name == CALENDAR:
+                # Recovery runs before admission: db-roles is a production write, so it waits for calls like any
+                # (Astra r1 F1). A wait records nothing; the next run decides the same evidence again.
+                wait_for_calls(settings, time.monotonic() + CALL_POLL)
                 progress.roles(settings, plan, candidate, migration_image(release, candidate, name))
         elif phase.get("status") != "migrated":
             progress.update(name, status="not-applied", code="interrupted")
