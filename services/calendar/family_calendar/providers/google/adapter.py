@@ -90,12 +90,15 @@ class GoogleAdapter:
             "GET", "calendars/" + quote(calendar, safe="") + "/events/" + quote(event, safe=""), missing=True
         )
 
-    async def create(self, calendar, event):
+    async def create(self, calendar, event, send_updates="none"):
+        # "all" emails each attendee the invitation (ANYM-555); every other write notifies nobody.
+        if send_updates not in ("none", "all"):
+            raise CalendarError("invalid_action")
         return await self.request(
             "POST",
             "calendars/" + quote(calendar, safe="") + "/events",
             body=event,
-            params={"sendUpdates": "none"},
+            params={"sendUpdates": send_updates},
             mutation=True,
         )
 

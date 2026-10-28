@@ -286,6 +286,15 @@ def same_time(actual, desired):
     return True
 
 
+def same_guests(actual, desired):
+    """Google's attendees are the guests sent: response fields added, addresses in any case, and only the
+    calendar's own account (organizer or self) besides them."""
+    wanted = {g["email"].casefold() for g in desired}
+    found = {a.get("email", "").casefold() for a in actual if isinstance(a, dict)}
+    extra = [a for a in actual if isinstance(a, dict) and a.get("email", "").casefold() not in wanted]
+    return wanted <= found and all(a.get("organizer") or a.get("self") for a in extra)
+
+
 class Providers:
     """Only the worker has this object and access to provider secrets."""
 
@@ -434,6 +443,10 @@ class Providers:
     async def prepare(self, cal, step):
         if step.get("projection") and cal["provider"] != "google":
             raise CalendarError("provider_not_supported")
+        invite = step.get("invite")
+        if invite and (step["action"] != "create" or cal["provider"] != "google"):
+            # Guests only on a Google create (ANYM-555); nothing was read or sent yet.
+            raise CalendarError("capability_unsupported")
         target = step["target_id"]
         event = step.get("event", {})
         occurrence = step.get("occurrence")
@@ -481,6 +494,9 @@ class Providers:
             )
             if step["action"] == "create":
                 desired["id"] = target
+            if invite:
+                desired["attendees"] = [{"email": guest} for guest in invite["guests"]]
+                intent["send_updates"] = invite["notify"]
             projection = step.get("projection")
             if projection:
                 # The one marker: an opaque random link ID, nothing derived from the child or the lesson.
@@ -551,7 +567,7 @@ class Providers:
                     create=intent["action"] == "create",
                 )
         elif intent["action"] == "create":
-            await adapter.create(cal["target"], intent["desired"])
+            await adapter.create(cal["target"], intent["desired"], send_updates=intent.get("send_updates", "none"))
         elif intent["action"] == "update":
             await adapter.patch(cal["target"], intent["target"], intent["desired"], intent["expected_etag"])
         else:
@@ -574,6 +590,8 @@ class Providers:
             def equal(k, v):
                 if k in ("start", "end"):
                     return same_time(value.get(k) or {}, v)
+                if k == "attendees":
+                    return same_guests(value.get(k) or [], v)
                 return value.get(k) == v
 
             match = all(equal(k, v) for k, v in intent["desired"].items())
