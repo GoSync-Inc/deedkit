@@ -36,6 +36,8 @@ password=os.environ['POSTGRES_PASSWORD']
 base=dict(host='restore-postgres',user='restore_owner',password=password,port='5432')
 with psycopg.connect(make_conninfo(**base,dbname='deedkit_verify_restore_test'),autocommit=True) as c:
     c.execute('CREATE DATABASE deedkit_fixture')
+    # As in production, so migration 050 creates its row-level security policies (the restore cluster has none).
+    for role in ('messaging_gateway','messaging_subscriptions','messaging_event_delivery'):c.execute('CREATE ROLE '+role+' NOLOGIN')
 dsn=make_conninfo(**base,dbname='deedkit_fixture')
 store=Store(dsn,root/'originals','http://synthetic.invalid')
 try:

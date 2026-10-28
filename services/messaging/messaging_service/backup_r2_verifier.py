@@ -258,14 +258,17 @@ class Docker:
                 except subprocess.TimeoutExpired:continue
             self.check_reserve()
             if process.wait(timeout=self.remaining()) or broken:
-                failure='isolated_restore_failed'
+                failure='isolated_restore_failed';detail=None
                 try:
                     fact=r2.unique_json(private_file(payload/'failure.json',4096))
                     safe={'restore_decryption_failed','restore_database_failed','restore_snapshot_failed','restore_quarantine_failed'}
                     if (isinstance(fact,dict) and set(fact)=={'v','status','error'} and
                             type(fact['v']) is int and fact['v']==1 and fact['status']=='failed' and type(fact['error']) is str and fact['error'] in safe):failure=fact['error']
                 except (OSError,ValueError):pass
-                raise RuntimeError(failure)
+                if failure=='restore_database_failed':
+                    try:detail=helper_detail(r2.unique_json(private_file(payload/'failure-detail.json',4096)))
+                    except (OSError,ValueError):pass
+                raise HelperFailure(failure,detail)
         finally:
             if process.stdin and not process.stdin.closed:process.stdin.close()
             if process.poll() is None:
@@ -275,6 +278,24 @@ class Docker:
         # Only facts from the helper payload are read here. Root proof is written
         # to a different path after full ciphertext hashing and successful exit.
         return r2.unique_json(private_file(payload/'result.json',16384))
+
+
+class HelperFailure(RuntimeError):
+    def __init__(self,code,detail=None):super().__init__(code);self.detail=detail
+
+
+# The only phrases backup_restore_worker.restore_detail writes: fixed words, never a name or message text.
+DETAIL_SHAPE=re.compile(r'(?:role|relation|schema|extension|type|table|column|constraint|index|policy|trigger|sequence|view|database) '
+                        r'(?:does not exist|already exists)|extension is not available|COPY failed|permission denied|out of memory|'
+                        r'could not extend file|could not write to file|deadlock detected|'
+                        r'canceling statement due to (?:statement timeout|user request)|unclassified pg_restore error')
+
+
+def helper_detail(value):
+    """The helper's pg_restore detail, only in a shape DETAIL_SHAPE admits; anything else is dropped."""
+    if (isinstance(value,dict) and set(value)=={'v','detail'} and type(value['v']) is int and value['v']==1 and
+            isinstance(value['detail'],str) and DETAIL_SHAPE.fullmatch(value['detail'])):return value['detail']
+    return None
 
 
 def cleanup_resources(engine,run):
@@ -455,6 +476,7 @@ def run(config,*,client=None,engine=None):
                 except Exception:cleanup_ok=False
             failure={'v':1,'status':'failed','error':failure_code(error),'failed_at':now(),
                      'cleanup_complete':cleanup_ok,'diagnostic':describe(error)}
+            if isinstance(error,HelperFailure) and error.detail:failure['detail']=error.detail
             local.write_maintenance_json('status.json',failure,dir_fd=fd)
             # A later busy/idle/verified run overwrites status.json; keep the last failure's cause.
             try:local.write_maintenance_json('last-failure.json',failure,dir_fd=fd)
