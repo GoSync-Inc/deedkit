@@ -141,7 +141,7 @@ def test_real_helper_image_reports_the_schema_range_its_backup_code_reads():
     engine=verifier.Docker(300);config={'helper_image':IMAGE,'helper_revision':REVISION,'postgres_image':verifier.POSTGRES_IMAGE}
     engine.preflight(config)
     before=engine.command('container','ls','-a','--format','{{.ID}}').split()
-    assert engine.helper_schemas(config)==[backup.SCHEMAS[0],backup.SCHEMAS[-1]]
+    assert engine.helper_schemas(config,secrets.token_hex(16))==[backup.SCHEMAS[0],backup.SCHEMAS[-1]]
     assert engine.command('container','ls','-a','--format','{{.ID}}').split()==before
 
 

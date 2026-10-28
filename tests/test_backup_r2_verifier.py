@@ -626,7 +626,8 @@ def test_server_verifier_publishes_the_pinned_helper_schema_range(operator,tmp_p
     for flag in ('--rm','--network=none','--read-only','--cap-drop=ALL','--security-opt=no-new-privileges','--log-driver=none'):
         assert flag in probe
     assert '--mount' not in probe and '-v' not in probe and '--volume' not in probe and '-i' not in probe
-    assert probe[probe.index('--label')+1]==v.LABEL+'.capabilities=1' and probe[probe.index('--name')+1].startswith('deedkit-verify-capabilities-')
+    assert probe[probe.index('--label')+1].startswith(v.LABEL+'.capabilities=')
+    assert probe[probe.index('--name')+1].startswith('deedkit-verify-capabilities-')
     assert probe[probe.index('--entrypoint')+1]=='python' and probe[-2:]==('-c',v.SCHEMA_PROBE)
 
 
@@ -700,7 +701,7 @@ def test_publication_from_a_staged_verifier_config_is_refused(operator,tmp_path,
 
 # spec: ANYM-589
 @pytest.mark.parametrize('alias',['identity','protected','receiver_config','credentials','verifier_config','workspace',
-                                  'beside_identity'])
+                                  'beside_identity','double_slash','private_double_slash'])
 def test_publication_never_touches_a_private_verifier_input(operator,tmp_path,monkeypatch,alias):
     v,config,engine,state=published_operator(operator,tmp_path,monkeypatch)
     receiver=json.loads(Path(config['receiver_config_file']).read_text())
@@ -708,14 +709,22 @@ def test_publication_never_touches_a_private_verifier_input(operator,tmp_path,mo
     targets={'identity':config['identity_file'],'protected':config['protected_file'],
              'receiver_config':config['receiver_config_file'],'credentials':receiver['credentials_file'],
              'verifier_config':str(state.config_path),'workspace':str(Path(config['directory'])/'status.json'),
-             'beside_identity':str(Path(config['identity_file']).with_name('capabilities.json'))}
+             'beside_identity':str(Path(config['identity_file']).with_name('capabilities.json')),
+             # `//x` walks to the same file as `/x` but compares unequal as a path.
+             'double_slash':'/'+config['identity_file'],'private_double_slash':config['identity_file']}
+    if alias=='private_double_slash':
+        # The key alone in its directory, named `//...` by the verifier config: only spelling or identity can match it.
+        keys=tmp_path/'keys';keys.mkdir(mode=0o700);key=keys/'identity';key.write_bytes(Path(config['identity_file']).read_bytes())
+        key.chmod(0o600);config={**config,'identity_file':'/'+str(key)};targets[alias]=str(key)
+        state.write_json(state.config_path,config)
     target=Path(targets[alias]);target.parent.mkdir(exist_ok=True)
     if not target.exists():target.write_bytes(b'synthetic sentinel\n')
     files=[Path(p) for p in (config['identity_file'],config['protected_file'],config['receiver_config_file'],
                              receiver['credentials_file'],state.config_path,target)]
     state.write_json(Path(config['receiver_config_file']),{**receiver,'capabilities_file':str(target)})
     files=[p for p in files if p.exists()];kept={p:p.read_bytes() for p in files}
-    with pytest.raises(ValueError,match='separate_capabilities_file_required'):v.publish_capabilities(state.config_path,engine=engine)
+    refusal='invalid_config_path' if alias=='double_slash' else 'separate_capabilities_file_required'
+    with pytest.raises(ValueError,match=refusal):v.publish_capabilities(state.config_path,engine=engine)
     assert {p:p.read_bytes() for p in files}==kept and 'preflight' not in state.calls
 
 
@@ -744,10 +753,24 @@ def test_a_probe_interrupted_mid_run_is_stopped_and_a_leftover_one_is_reconciled
     # A publisher killed outright leaves its labelled probe; the next one removes exactly those first.
     state.calls.clear();state.run=None;state.leftover=b'deedkit-verify-capabilities-0123456789abcdef\n'
     v.publish_capabilities(state.config_path,engine=engine)
-    ls=state.calls.index(('container','ls','-a','--filter','label='+v.LABEL+'.capabilities=1','--format','{{.Names}}'))
+    # Only this verifier instance's probes: another config's instance has another label value.
+    instance=hashlib.sha256(str(state.config_path).encode()).hexdigest()[:32]
+    assert instance!=hashlib.sha256(str(state.config_path.with_name('other.json')).encode()).hexdigest()[:32]
+    assert probe_of(state)[probe_of(state).index('--label')+1]==v.LABEL+'.capabilities='+instance
+    ls=state.calls.index(('container','ls','-a','--filter','label='+v.LABEL+'.capabilities='+instance,'--format','{{.Names}}'))
     assert state.calls[ls+1:ls+3]==[('container','stop','--time=1','deedkit-verify-capabilities-0123456789abcdef'),
                                      ('container','rm','deedkit-verify-capabilities-0123456789abcdef')]
     assert state.calls.index(probe_of(state))>ls+2 and state.path.exists()
+
+
+# spec: ANYM-589
+def test_server_verifier_proof_range_is_the_published_verifier_schemas():
+    v=module();receipt={'wire':{'id':'20261016T091703Z-fedcba9876543210','bytes':100,'sha256':'a'*64,'snapshot_sha256':'b'*64}}
+    for version,accepted in ((v.SCHEMAS[0],True),(v.SCHEMAS[-1],True),(v.SCHEMAS[0]-1,False),(v.SCHEMAS[-1]+1,False)):
+        facts={'v':1,'status':'verified','schema_version':version,'manifest_sha256':'b'*64,'checks':{k:True for k in r2.CHECKS}}
+        if accepted:assert v.make_proof(receipt,facts,'c'*32)['verification']['schema_version']==version
+        else:
+            with pytest.raises(ValueError,match='invalid_helper_result'):v.make_proof(receipt,facts,'c'*32)
 
 
 # spec: ANYM-589

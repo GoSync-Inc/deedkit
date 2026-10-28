@@ -816,7 +816,8 @@ def test_capabilities_file_stays_outside_upload_state_and_leaves_receive_unchang
     path=tmp_path/'config.json';value=json.loads(path.read_text())
     good={'capabilities_file':str(tmp_path/'published/capabilities.json'),'verifier_config_file':str(tmp_path/'verifier.json')}
     for key in good:
-        for bad in ('relative/capabilities.json',str(Path(config['state_directory'])/'capabilities.json'),'/etc/../tmp/c.json',7):
+        for bad in ('relative/capabilities.json',str(Path(config['state_directory'])/'capabilities.json'),'/etc/../tmp/c.json',7,
+                    '/'+str(tmp_path/'published/capabilities.json')):
             write_json(path,{**value,**good,key:bad})
             with pytest.raises(ValueError,match='invalid_config_path'):r2.load_config(path)
         # One without the other is no configuration.

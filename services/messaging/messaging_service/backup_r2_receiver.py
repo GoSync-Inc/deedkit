@@ -137,7 +137,8 @@ def load_config(path):
             raise ValueError('invalid_config_path')
     state = Path(value['state_directory'])
     # The upload UID owns its state; a publication it could write is no root answer.
-    if any(key in value and Path(value[key]).is_relative_to(state) for key in published):
+    # `//x` is another spelling of `/x` that path comparisons would miss.
+    if any(key in value and (value[key].startswith('//') or Path(value[key]).is_relative_to(state)) for key in published):
         raise ValueError('invalid_config_path')
     if any(p.is_symlink() for p in (state, *state.parents)) or not state.is_dir() or state.stat().st_mode & 0o077:
         raise ValueError('private_receiver_directory_required')

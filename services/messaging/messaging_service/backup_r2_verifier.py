@@ -195,15 +195,17 @@ class Docker:
         for args in (('container','stop','--time=1',name),('container','rm',name)):
             try:self.command(*args)
             except Exception:pass
-    def helper_schemas(self,config):
-        # A probe left running by a killed publisher (its CLI timed out or was stopped).
+    def helper_schemas(self,config,instance):
+        # A probe this verifier instance left running when a publisher was killed; another
+        # instance's probes carry another value and are never touched.
+        if not re.fullmatch('[a-f0-9]{32}',instance):raise ValueError('invalid_verifier_instance')
         owner=LABEL+'.capabilities'
-        for name in self.command('container','ls','-a','--filter','label='+owner+'=1','--format','{{.Names}}').decode().split():
+        for name in self.command('container','ls','-a','--filter','label='+owner+'='+instance,'--format','{{.Names}}').decode().split():
             self.discard(name)
         # Run only after preflight checked the image ID, labels and volumes. No input,
         # network, mount, capability or log; inherited volumes are bounded tmpfs.
         name='deedkit-verify-capabilities-'+secrets.token_hex(8)
-        try:raw=self.command('run','--rm','--name',name,'--label',owner+'=1','--network=none','--read-only','--cap-drop=ALL','--security-opt=no-new-privileges',
+        try:raw=self.command('run','--rm','--name',name,'--label',owner+'='+instance,'--network=none','--read-only','--cap-drop=ALL','--security-opt=no-new-privileges',
                          '--log-driver=none','--restart=no','--cpus=1','--memory=256m','--memory-swap=256m','--pids-limit=64',
                          '--tmpfs','/tmp:'+HELPER_TMPFS['/tmp'],'--tmpfs',PG_DATA_PATH+':'+HELPER_TMPFS[PG_DATA_PATH],
                          '--entrypoint','python',config['helper_image'],'-c',SCHEMA_PROBE)
@@ -485,6 +487,17 @@ def run(config,*,client=None,engine=None):
             raise error
 
 
+def spelled(path):
+    """One spelling per path: `//etc/x` and `/etc/./x` name `/etc/x`."""
+    return Path('/'+str(path).lstrip('/'))
+
+
+def identity_of(path):
+    try:info=os.stat(path)
+    except FileNotFoundError:return None
+    return (info.st_dev,info.st_ino)
+
+
 def publish_capabilities(config_path,*,engine=None):
     """Publish the pinned helper's schema range for the receiver's `capabilities` key.
 
@@ -500,12 +513,15 @@ def publish_capabilities(config_path,*,engine=None):
     if Path(receiver['verifier_config_file'])!=config_path:raise ValueError('verifier_config_not_canonical')
     path=Path(receiver['capabilities_file'])
     # It unlinks and writes this one path: never a private input, nor in their directories
-    # or the verifier's workspace. Checked before any change.
-    private=[config_path,*(Path(p) for p in (config['receiver_config_file'],receiver['credentials_file'],
-                                              config['identity_file'],config['protected_file']))]
-    if (any(path==item or path.parent==item.parent for item in private) or
-            path.is_relative_to(config['directory'])):
+    # or the verifier's workspace. Checked before any change, by spelling and by identity.
+    private=[spelled(p) for p in (config_path,config['receiver_config_file'],receiver['credentials_file'],
+                                  config['identity_file'],config['protected_file'])]
+    directories={identity_of(item.parent) for item in private}-{None}
+    if (any(spelled(path)==item or spelled(path).parent==item.parent for item in private) or
+            spelled(path).is_relative_to(spelled(config['directory'])) or identity_of(path.parent) in directories or
+            (identity_of(path) or 0) in {identity_of(item) for item in private}):
         raise ValueError('separate_capabilities_file_required')
+    instance=hashlib.sha256(str(config_path).encode()).hexdigest()[:32]
     # The verifier lock serializes publishers and keeps a publication out of a running verification.
     with verifier_lock(config['directory']),local.trusted_directory(path.parent) as fd:
         try:os.unlink(path.name,dir_fd=fd);local.fsync_dir(fd)
@@ -513,7 +529,7 @@ def publish_capabilities(config_path,*,engine=None):
         engine=engine if engine is not None else Docker(min(600,config['timeout_seconds']))
         engine.preflight(config)
         value={'v':1,'verifier_config':identity,'helper_revision':config['helper_revision'],
-               'helper_schemas':engine.helper_schemas(config)}
+               'helper_schemas':engine.helper_schemas(config,instance)}
         name='.'+path.name+'-'+secrets.token_hex(16)
         out=os.open(name,os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600,dir_fd=fd)
         try:
