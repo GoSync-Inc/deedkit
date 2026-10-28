@@ -707,7 +707,10 @@ first).
    bridges, `dk-delivery0` (egress), `dk-deliverydb0` and `dk-deliverypx0` (internal networks in gateway
    mode `isolated` have no host address; the rules are the second layer), and, from `dk-delivery0`, the tailnet (100.64.0.0/10), RFC 1918,
    link-local and metadata (169.254.0.0/16), loopback and every IPv6 packet; they allow DNS to `<ip>`
-   and TCP 443 to public addresses. Undo: `rules --undo`.
+   and TCP 443 to public addresses. Undo: `rules --undo`. Writing `DELIVERY_RESOLVER` or a new
+   overlay changes the project's Compose configuration, so the next autodeploy halts and writes the
+   pause file ("apply the next release by hand"): a plan that changes the host's Compose files or env
+   file lists step 5.5's hand apply of the next green `main` SHA S2.
 5. First enrollment (owner-authorized, once; `production.py` cannot do it: a selected service must
    already run, `snapshot`, and databases are never restarted). The host is on a release with this
    code, applied by `production.py`; `I=deedkit-production-runtime:<that sha>` is its verified image
@@ -759,35 +762,48 @@ first).
    subscriptions python -I - listen --port 18080 --seconds 300 < scripts/delivery_egress_check.py &`.
    `<alt>` is a public resolver other than `DELIVERY_RESOLVER` (8.8.8.8, or 9.9.9.9 if that is the
    configured one). First the positive control from the `api` container: every listener answers.
+   The host listeners are the edge proxy's published 443 and 80. Port 22 is no control on a host
+   whose firewall denies incoming traffic by default (ufw `deny (incoming)`, sshd allowed only from
+   the admin address on the tailnet): no container reaches it, with or without the delivery rules.
    ```sh
    docker compose $F exec -T api python -I - check --open <matcher ip>:18080 --open <gateway ip>:13240 \
-     --open <host public ip>:22 --open <tailnet ip>:22 --open-dns <alt> < scripts/delivery_egress_check.py
+     --open <host public ip>:443 --open <host public ip>:80 --open <docker0 gateway ip>:443 \
+     --open-dns <alt> < scripts/delivery_egress_check.py
    ```
    Then from the dispatcher; it exits 0 only when every open target connects or answers, every
    blocked one times out or has no route, the proxy opens a tunnel to `<allowed host>` (the first
-   `allow_hosts` entry, such as the owner's receiver host) and refuses `example.com` (outside the
-   policy):
+   `allow_hosts` entry, such as the owner's receiver host; leave `--open-proxied` out while
+   `allow_hosts` is empty) and refuses `example.com` (outside the policy). `<edge ip>` is the
+   address Docker's `nat` chain `DOCKER` forwards host ports 443 and 80 to:
    ```sh
    docker compose $F exec -T delivery python -I - check --open db:5432 --proxy delivery-egress:3128 \
      --open-proxied <allowed host> --refused-proxied example.com --blocked 1.1.1.1:443 \
-     --blocked-dns $DELIVERY_RESOLVER --blocked <api ip>:8080 --blocked <gateway ip>:13240 \
-     --blocked <matcher ip>:18080 --blocked <host public ip>:22 --blocked <tailnet ip>:22 \
-     --unreached <dk-deliverydb0 subnet .1>:22 --unreached <dk-deliverypx0 subnet .1>:22 \
-     --blocked <docker0 gateway ip>:22 --blocked 169.254.169.254:80 --blocked [2606:4700:4700::1111]:443 < scripts/delivery_egress_check.py
+     --blocked 1.1.1.1:80 --blocked-dns $DELIVERY_RESOLVER --blocked <api ip>:8080 \
+     --blocked <gateway ip>:13240 --blocked <matcher ip>:18080 --blocked <host public ip>:443 \
+     --blocked <host public ip>:80 --blocked <docker0 gateway ip>:443 \
+     --blocked <dk-delivery0 gateway ip>:443 --blocked <edge ip>:443 --blocked 169.254.169.254:80 \
+     --blocked [2606:4700:4700::1111]:443 < scripts/delivery_egress_check.py
    ```
-   The subnet `.1` and `docker0` targets pass with or without the host rules: both internal networks
-   use gateway mode `isolated`, so their bridges hold no host address. `--unreached` accepts the local
-   refusal an isolated subnet `.1` gives, never a connection; port 22 is the positive control, so first
-   check that sshd listens on every host address (`ss -Hltn "sport = :22"` shows `0.0.0.0:22`). Then the second layer from the proxy, which has the egress bridge:
+   Both internal networks use gateway mode `isolated`: they have no gateway, so their subnet `.1` is
+   the first container that joined (the database on `delivery_db`, the proxy on `delivery_proxy`),
+   and a `<subnet .1>` target reaches that container, not the host. The proof that their bridges hold
+   no host address is `ip -4 -o addr show dk-deliverydb0` and `ip -4 -o addr show dk-deliverypx0`,
+   both empty, run with every check. Then the second layer from the proxy, which has the egress
+   bridge (while `allow_hosts` is empty, `--open 1.1.1.1:443` stands for `<allowed host>:443`):
    ```sh
    docker compose $F exec -T delivery-egress python -I - check --open <allowed host>:443 \
-     --open-dns $DELIVERY_RESOLVER --blocked <host public ip>:22 --blocked <tailnet ip>:22 \
-     --blocked <dk-delivery0 gateway ip>:22 --unreached <dk-deliverypx0 subnet .1>:22 \
-     --blocked <matcher ip>:18080 --blocked 169.254.169.254:80 --blocked <alt>:53 \
-     --blocked-dns <alt> --blocked [2606:4700:4700::1111]:443 < scripts/delivery_egress_check.py
+     --open-dns $DELIVERY_RESOLVER --blocked <host public ip>:443 --blocked <docker0 gateway ip>:443 \
+     --blocked <dk-delivery0 gateway ip>:443 --blocked <edge ip>:443 --blocked <matcher ip>:18080 \
+     --blocked 169.254.169.254:80 --blocked <alt>:53 --blocked-dns <alt> \
+     --blocked [2606:4700:4700::1111]:443 < scripts/delivery_egress_check.py
    ```
-   `--open-dns` and `--blocked-dns` query a resolver directly over UDP, `<alt>:53` over TCP. Stop the
-   listener after.
+   `--open-dns` and `--blocked-dns` query a resolver directly over UDP, `<alt>:53` over TCP. A host
+   address's 443 or 80 is forwarded to `<edge ip>` and filtered in `FORWARD` (`DOCKER-USER`) with that
+   destination, so these targets prove the forwarding layer (the proxy's RFC 1918 drop, the
+   dispatcher's missing route), not the rules' `INPUT` drops. Those drops have no positive control on
+   such a host: the default-deny incoming policy already keeps host services out of reach, and the
+   drops stay as defence in depth. Host :22 targets may run as diagnostics, never as evidence for
+   the rules. Stop the listener after.
 8. `python -m messaging_service set-delivery-features --enable` (operator DSN) switches
    self-service delivery on. It refuses (exit 1, `component_heartbeat_absent|stale`,
    `component_version_mismatch`, `component_schema_mismatch` with the component) until the API,
