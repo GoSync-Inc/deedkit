@@ -8,6 +8,7 @@ from datetime import datetime,timedelta,timezone
 import errno
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -35,6 +36,9 @@ log=logging.getLogger(__name__)
 STORE_MARGIN=0.5
 # Seconds a cancelled live read waits for its write thread; the server has ended the transaction by then.
 STORE_GRACE=1.0
+# Operations whose confirmed receipt names a group new to the account, and the seconds its catalog write may take.
+NEW_CHAT_OPERATIONS=('create_group','join_chat')
+CATALOG_SECONDS=5.0
 
 
 class DeadlinePool:
@@ -1065,6 +1069,10 @@ class TelegramCollector:
         try:
             job['_policy']=await asyncio.to_thread((live or self.state).policy)
             if job.get('operation')=='request_chat_history': return await self.chat_history(job)
+            if job.get('operation') in NEW_CHAT_OPERATIONS:
+                answer=await self.provider.execute_operation(job)
+                await self.catalog_new_chat(job,answer)
+                return answer
             if job.get('operation')!='search_messages_live': return await self.provider.execute_operation(job)
             job['_live_hits']=found=[]
             answer=await self.provider.execute_operation(job)
@@ -1074,6 +1082,32 @@ class TelegramCollector:
             return answer
         finally:
             if bound is not None:LIVE_STATE.reset(bound)
+
+    async def catalog_new_chat(self,job,answer):
+        """A group this account just created or joined enters the archive catalog now, not at the next dialog
+        discovery (15 minutes or more later; a new basic group's only message is a service message, which live
+        capture skips), and its receipt names the archive chat_id. The provider change has already happened:
+        a failure or an exhausted time budget here leaves the chat to that discovery and never changes the
+        operation's outcome."""
+        from telethon import types,utils
+        try:
+            data=answer.get('data') if isinstance(answer,dict) and answer.get('outcome')=='confirmed' else None
+            chat=data.get('provider_chat_id') if isinstance(data,dict) else None
+            if not isinstance(chat,str) or job['operation']=='join_chat' and data.get('archive')!='collected':return
+            _,peer=utils.resolve_id(int(chat))
+            if peer not in (types.PeerChat,types.PeerChannel):return
+            expected=job.get('expected_chat') if isinstance(job.get('expected_chat'),dict) else {}
+            title=(job.get('parameters') or {}).get('title') if job['operation']=='create_group' else expected.get('title')
+            chat_type='group' if job['operation']=='create_group' or expected.get('kind')=='group' else 'channel'
+            # Inside the command's own timeout, so a slow archive never turns a confirmed change into unknown.
+            budget=min(CATALOG_SECONDS,job.get('_ends_at',math.inf)-time.monotonic()-STORE_GRACE-1)
+            if budget<=0:return
+            state=bounded_state(self.state,time.monotonic()+budget)
+            if await asyncio.wait_for(finished(state.catalog,chat,'chat' if peer is types.PeerChat else 'channel',
+                    title if isinstance(title,str) and title else chat,chat_type,self.history_since),budget):
+                data['chat_id']=stable_id('chat',self.account,chat)
+        except Exception as exc:
+            log.warning('new_chat_catalog_failed operation=%s error=%s',job.get('operation'),type(exc).__name__)
 
     async def chat_history(self,job):
         """ANYM-477: one agent-requested history page, archived as live search hits are; stored_new counts new rows."""

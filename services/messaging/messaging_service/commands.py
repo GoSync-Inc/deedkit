@@ -844,6 +844,7 @@ class CommandWorker:
             timeout=180 if job['operation']=='send_file' else 30
             # The collector stops starting archive writes for a live read before this deadline.
             if live:timeout=left();job['_deadline']=deadline
+            job['_ends_at']=loop.time()+timeout  # Work after the provider change stays inside this timeout.
             try:answer=safe_result(await asyncio.wait_for(self.execute(job),timeout))
             except (TimeoutError,psycopg.OperationalError,psycopg.errors.TransactionTimeout,
                     psycopg.errors.IdleInTransactionSessionTimeout):

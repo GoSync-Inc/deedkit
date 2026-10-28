@@ -443,12 +443,13 @@ class CollectorState:
                 WHERE account=%s ORDER BY last_attempt_at NULLS FIRST,provider_chat''',(self.account,))]
 
     def catalog(self,provider_chat,peer_kind,title,chat_type,history_since):
-        """ANYM-476: a chat first seen in a live search hit enters the catalog as a dialog would; a known one is left as is."""
+        """ANYM-476: a chat first seen in a live search hit enters the catalog as a dialog would; a known one is left as is.
+        True when the chat is in the catalog afterwards, False when the collection policy leaves it out."""
         with self.archive.store.pool.connection() as c:
             self.archive.fence(c,self.account,self.lease)
             if c.execute('SELECT 1 FROM collector_chats WHERE account=%s AND provider_chat=%s',
-                         (self.account,provider_chat)).fetchone(): return
-        self.inventory([(provider_chat,peer_kind,title,chat_type or 'unknown')],history_since)
+                         (self.account,provider_chat)).fetchone(): return True
+        return provider_chat in self.inventory([(provider_chat,peer_kind,title,chat_type or 'unknown')],history_since)
 
     def attempted(self,chat):
         with self.archive.store.pool.connection() as c:

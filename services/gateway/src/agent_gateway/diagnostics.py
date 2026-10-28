@@ -210,19 +210,24 @@ def tool_fields(tool):
 def stale_arguments_hint(tool, detail):
     """An `invalid_arguments` body plus the tool's current fields when it names a missing or unknown top-level field.
 
-    An unknown field also says the tool list is likely stale. Any failure while building the hint returns `detail`.
+    An unknown field also says the tool list is likely stale, unless every unknown field is the singular or plural
+    of a field the tool has (`account` for `accounts`): then `use_instead` names that field and the list is current.
+    Any failure while building the hint returns `detail`.
     """
     try:
         properties = tool["inputSchema"].get("properties", {})
         entries = detail["field_errors"]
-        unknown = any(e["reason"] == "unknown_field"
-                      and (e["field"] == "$" or "/" not in e["field"] and e["field"] not in properties)
-                      for e in entries)
+        unknown = [e["field"] for e in entries if e["reason"] == "unknown_field"
+                   and (e["field"] == "$" or "/" not in e["field"] and e["field"] not in properties)]
         missing = any(e["reason"] == "required" and "/" not in e["field"] for e in entries)
         if not (unknown or missing):
             return detail
         hinted = {**detail, "tool_fields": tool_fields(tool)}
-        if unknown:
+        renamed = {name: other for name in unknown for other in (name + "s", name[:-1] if name.endswith("s") else "")
+                   if other and other in properties}
+        if renamed and len(renamed) == len(unknown):
+            hinted["use_instead"] = renamed
+        elif unknown:
             hinted.update(tool_list_stale="likely", owner_hint=STALE_OWNER_HINT)
         return hinted
     except Exception:  # noqa: BLE001 - a hint must never replace the original error
