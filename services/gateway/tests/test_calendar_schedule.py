@@ -77,3 +77,24 @@ def test_selection_candidates_keep_their_preview_next_and_never_the_title(tmp_pa
     assert relayed["error"] == "selection_required" and "next" not in relayed
     # The candidate whose label echoes the caller's title is dropped; the other keeps its runnable preview.
     assert relayed["candidates"] == [candidate("evt-1f3a")]
+
+
+# spec: ANYM-552
+def test_enum_words_and_timestamps_stay_payload_outside_their_own_field():
+    schema = {"type": "object", "properties": {
+        "action": {"anyOf": [{"type": "string", "enum": ["create", "cancel"]}, {"type": "null"}]},
+        "start": {"type": "string"}, "query": {"type": "string"}, "text": {"type": "string"}}}
+    arguments = {"action": "cancel", "start": "2026-10-21T15:00", "query": "2026-10-21T15:00", "text": "cancel"}
+    assert caller_payload(arguments, schema) == {"2026-10-21T15:00", "cancel"}
+
+
+# spec: ANYM-552
+def test_a_calendar_candidate_keeps_its_next_when_the_caller_named_part_of_its_label(tmp_path):
+    lessons = {"id": "cal-child", "label": "Lessons", "kind": "calendar",
+               "next": {"tool": "calendar_schedule",
+                        "arguments": {"selection_token": "s" * 32, "calendar": "cal-child", "dry_run": True}}}
+    answer = {"error": "selection_required", "candidates": [lessons]}
+    create = {"action": "create", "title": "Swimming", "start": "2026-11-02T10:00", "calendar": "Less"}
+    with pytest.raises(Denied) as caught:
+        asyncio.run(gateway(tmp_path, answer).call("gateway-a", "calendar_schedule", create))
+    assert caught.value.detail["candidates"] == [lessons]

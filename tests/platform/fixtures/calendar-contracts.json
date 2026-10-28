@@ -706,6 +706,19 @@
             "default": null,
             "title": "Confirm Token"
           },
+          "selection_token": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Selection Token"
+          },
           "request_id": {
             "anyOf": [
               {

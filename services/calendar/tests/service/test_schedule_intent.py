@@ -366,7 +366,7 @@ def test_random_sequences_keep_one_plan_one_operation(store, seed):
 
 
 # spec: ANYM-552
-def test_runtime_gateway_role_schedules_after_db_roles(schema_one, roles):
+def test_runtime_gateway_role_schedules_after_db_roles(schema_one, roles):  # noqa: F811 (fixtures)
     apply_roles, connect = roles
     schema_one.migrate()
     key = setup(schema_one, second=True)
@@ -418,6 +418,7 @@ def test_distinct_concurrent_schedules_never_drain_the_pool(store, monkeypatch):
 # spec: ANYM-552
 def test_calendar_candidates_preview_the_stored_request_without_the_title(store):
     key, fake = setup(store, second=True), Provider()
+    store.family_settings("family", "Asia/Makassar")
     choose = rulebook.validate_error(call(store, key, {**CREATE, "duration": 45, "request_id": "req-sel-1"}, fake))
     assert choose["error"] == "selection_required" and "Swimming" not in json.dumps(choose)
     nexts = {c["id"]: c["next"]["arguments"] for c in choose["candidates"]}
@@ -488,6 +489,7 @@ def test_renamed_or_revoked_calendar_is_stale(store):
 # spec: ANYM-552
 def test_errors_state_timezone_and_now(store):
     key = setup(store, second=True)
+    store.family_settings("family", "Asia/Makassar")
     gateway = Gateway(store)
     with pytest.raises(CalendarError) as caught:
         asyncio.run(gateway.call(key, "schedule", {**CREATE, "request_id": "req-ctx-1"}))
