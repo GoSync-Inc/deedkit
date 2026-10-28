@@ -49,9 +49,10 @@ CALENDAR_CONSTRAINTS = {
 
 
 # A request key that names something the caller already chose (an ID, an account, a mode); any other string the
-# caller sent is payload: message text, file names, phone numbers, queries.
+# caller sent is payload: message text, file names, phone numbers, queries. `to` (platform_resolve_target, ANYM-545)
+# names the target, so its candidates' labels and their read-only listing may repeat it.
 REFERENCE_KEY = re.compile(r"(?:^|_)(?:ids?|digest|ref|token)$|^(?:account|chat|person|sender|receipt|operation|"
-                           r"consumer|reply_to|network|kind|view|detail|direction|order|format|status|live|modules|tool)$")
+                           r"consumer|reply_to|network|kind|view|detail|direction|order|format|status|live|modules|tool|to)$")
 PHONE = re.compile(r"\+?\d(?:[\s().-]?\d){6,}")
 # A name, a dot and an extension of 1-10 letters or digits with at least one letter (.c, .7z, .sqlite3).
 FILE_NAME = re.compile(r"[\w-]+\.(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{1,10}\b")

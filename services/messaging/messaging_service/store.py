@@ -365,7 +365,7 @@ class Store:
                 permitted[account['id']]=[row['operation'] for row in listed['items'] if row['key_permitted']]
                 supported_by_account[account['id']]={'provider':listed['provider'],'count':len(supported),
                     'operations':supported,'available_operations':[row['operation'] for row in listed['items'] if row['available']]}
-            features={'read':['search','history','context','updates','reviews','search_people','search_files','get_file_text','get_file_occurrences','get_sync_status','get_file_segments','resolve_reference','preview_message'], 'download':['attachment','request_file_download'], 'cursor-write':['ack'], 'send':['send_message','get_send_status']}
+            features={'read':['search','history','context','updates','reviews','search_people','search_files','get_file_text','get_file_occurrences','get_sync_status','get_file_segments','resolve_reference','resolve_target','preview_message'], 'download':['attachment','request_file_download'], 'cursor-write':['ack'], 'send':['send_message','get_send_status']}
             if 'read' in p['permissions']:
                 features['review-write']=['record_review']
                 features['cursor-write'].append('dismiss_reply')
@@ -737,6 +737,12 @@ class Store:
                 if not row:raise APIError('not_found',404)
                 message=self.message(c,p,row['id']);enrich(c,[message],p);result['message']=message
             return serial(result)
+
+    def resolve_target(self,token,to,purpose='message',account='',sender=False):
+        from .resolve_target import resolve_target
+        # Audited as resolve_reference (no migration for the audit_log CHECK); same read permission.
+        with self.authorized(token,'resolve_reference') as (c,p):
+            return serial(resolve_target(self,c,p,to,purpose,account,sender))
 
     def search(self, token, query='', account='', chat='', sender='', from_time='',
                to_time='', after='', limit=20, *, accounts=None, chats=None, senders=None, collapse_forwards=True,

@@ -29,7 +29,7 @@ OPERATION_PERMISSIONS = {
     'get_reviews': 'read', 'record_review': 'review-write',
     'search_people': 'read', 'search_files': 'read', 'get_file_text': 'read',
     'get_file_occurrences':'read', 'get_file_segments':'read', 'get_sync_status':'read',
-    'resolve_reference':'read',
+    'resolve_reference':'read', 'resolve_target':'read',
     'preview_message':'read','send_message':'send','get_send_status':'send',
     'list_messenger_operations':None, 'preview_messenger_operation':None,
     'execute_messenger_operation':None, 'get_messenger_operation':None,
@@ -44,7 +44,8 @@ OPERATION_PERMISSIONS = {
     'update_delivery_endpoint':'delivery-write','delete_delivery_endpoint':'delivery-write',
     'test_delivery_endpoint':'delivery-write',
 }
-AUDIT_OPERATIONS = frozenset(OPERATION_PERMISSIONS) | {
+# resolve_target is audited as resolve_reference (ANYM-545): the audit_log CHECK lists operations by migration.
+AUDIT_OPERATIONS = frozenset(OPERATION_PERMISSIONS) - {'resolve_target'} | {
     'issue_key', 'revoke_key', 'set_access', 'http_boundary', 'send_dispatch', 'set_sending',
     'set_key_permissions', 'set_operations', 'messenger_dispatch', 'extend_key', 'set_feedback_status',
 }

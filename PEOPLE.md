@@ -70,6 +70,37 @@ of the visible members during pagination returns `cursor_changed`. A key that se
 member still sees that member's `person` id; this reveals only that a link exists, not
 the other members. `person` is archive only (see `live` in SEARCH.md).
 
+## One target for any identifier (ANYM-545)
+
+`platform_resolve_target(to, purpose='message'|'call', account?, sender?)` (MCP and REST
+`resolve_target`, `read` permission) turns an identifier into one exact target or a list
+to choose from. It is read-only: no provider call, no write. The audit log records it as
+`resolve_reference`.
+
+- Exact forms: a `chat_` ID; a `msg_` ID (its chat; with `sender=true` the sender's
+  private chat; a shared contact card resolves to the card's phone or Telegram user); a
+  person UUID; a WhatsApp JID; a phone in any format (`+7 911 …`, `00…`); `@username`.
+  The answer is `{state: succeeded, target: {account, chat_id, network, label,
+  how_resolved, person?, phone?}}`; `how_resolved` names the rule (`chat_id`,
+  `message_chat`, `message_sender`, `person`, `jid`, `phone`, `username`,
+  `contact_card_phone`, `contact_card_telegram_user`).
+- A phone with no chat on exactly one native WhatsApp account that has the
+  `open_chat_by_phone` opt-in and a key with `send` (SENDING.md) gives `chat_id: null,
+  opens_chat: true`; send with `phone`. Two such accounts give `selection_required` with
+  one candidate per account and no `next`: repeat the call with `account`.
+- A name or fragment never resolves by itself, even with one match: `selection_required`
+  with candidates (chats), each with its own `next` (this tool with the exact ID). The
+  same holds for a person with several private chats and a username shared by several
+  identities. At most 10 candidates, newest `last_activity` first; with more, `more: true`
+  and `next` is `messages_search_people`. A candidate label that looks like a phone number
+  becomes `<network> <kind>`.
+- `purpose='call'` refuses group and channel chats (`unsupported_target`).
+- Scope: every read is the key's own projection (accounts, chats, visible members), as in
+  the section above. A hidden chat, identity or person is the same `not_found` as a
+  missing one; `not_found` carries a read-only `next` (`messages_search_people`). A
+  contact card with neither a usable phone nor a Telegram user ID is `not_found` with
+  `hint: contact_card_fields_missing`.
+
 ## Sender names
 
 Messages (`search`, `get_messages`, `get_context`, `get_updates`), the conversation
