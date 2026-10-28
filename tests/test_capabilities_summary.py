@@ -15,7 +15,7 @@ from test_client_contract import rpc
 ROOT=Path(__file__).resolve().parents[1]
 SNAPSHOT=ROOT/'tests/fixtures/capabilities-full-snapshot.json'
 # Values that follow the clock, the issued key or the release, not the payload's shape.
-VOLATILE={'credential_id','expires_at','scope_version','key_permission_version','last_ingest_at',
+VOLATILE={'credential_id','expires_at','scope_version','key_permission_version','last_ingest_at','started_at',
           'updated_at','observed_at','checked_at','captured_at','created_at'}
 
 

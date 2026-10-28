@@ -512,7 +512,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
     @mcp.tool(structured_output=True, annotations=read)
     def capabilities(ctx: Context,detail: Literal['summary','full']='summary',
                      sections: Annotated[list[StrictStr],Field(min_length=1,max_length=16)] | None=None) -> dict[str, Any]:
-        """Identity, permitted accounts, source coverage and unavailable features. detail=summary (default) is a short index naming the sections; sections=[names] returns only those blocks; detail=full returns everything. An unknown section name returns invalid_filter."""
+        """Identity, permitted accounts, source coverage and unavailable features. detail=summary (default) is a short index naming the sections; sections=[names] returns only those blocks; detail=full returns everything. An unknown section name returns invalid_filter. version is the package version and does not change per release; build.source_sha is the commit this messaging server was built from and build.started_at when it started (the gateway, calls and calendar services deploy separately and are not reported here). A null build.source_sha means the image was built without its commit: on production, report it as a deploy defect. A restart without a deploy also moves started_at, so compare SHAs when the expected one is known."""
         return call(ctx,'capabilities',detail=detail,**({} if sections is None else {'sections':sections}))
 
     # ANYM-532: a phone preview contacts the provider (one lookup).
