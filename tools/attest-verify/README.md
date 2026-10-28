@@ -97,7 +97,7 @@ The host builds nothing; it runs the binary whose SHA-256 is recorded in
 `attest-verify.linux-amd64.sha256`. Build with:
 
 ```sh
-GOTOOLCHAIN=go1.26.9 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags=-buildid= -o <out> .
+GOTOOLCHAIN=go1.26.10 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags=-buildid= -o <out> .
 ```
 
 `-buildvcs=false` keeps VCS stamping (which changes with every commit) out of the

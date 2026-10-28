@@ -328,7 +328,7 @@ host never builds it, and agents do not install it.
 
 1. On a development machine, at the `main` commit to deploy, build it with the
    pinned toolchain exactly as `tools/attest-verify/README.md` states
-   (`GOTOOLCHAIN=go1.26.9 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath
+   (`GOTOOLCHAIN=go1.26.10 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath
    -buildvcs=false -ldflags=-buildid= -o attest-verify .`). The build is
    reproducible: its SHA-256 must equal `tools/attest-verify/attest-verify.linux-amd64.sha256`,
    which a CI test rebuilds and compares.
@@ -336,7 +336,12 @@ host never builds it, and agents do not install it.
    root, mode `0755`, not a symlink. `production.py` refuses to run any other
    file: before every call it checks that the file is regular, owned by root or
    the operator running `production.py`, not writable by group or others, and
-   that its SHA-256 equals its own pinned `VERIFIER_SHA256`.
+   that its SHA-256 equals its own pinned `VERIFIER_SHA256`. A new build is
+   checked before it replaces the installed one: install it under a temporary
+   name in the same directory and run the self-test of the tool from the same
+   commit with `--verifier <temporary name>` (the same file checks, read and
+   never run; only `self-test` accepts `--verifier`), then rename it into place
+   together with that tool's switch ("Deploy tool updates").
 3. Install `production.py` from the same `main` commit as the release you
    prepare. The pulled image's `io.deedkit.production.build` label is the recipe
    CI computed for that commit, and the host compares it with the recipe its own

@@ -4623,7 +4623,40 @@ def test_the_self_test_runs_only_as_the_first_argument_under_its_guard(tmp_path,
     assert result.returncode == 1 and "self-test must be the first argument" in result.stderr
 
 
-BOUNDARIES = ["staged", "renamed", "activating", "switched", "before active"]
+# spec: ANYM-618
+def test_a_staged_tool_self_test_accepts_only_the_staged_verifier_its_pin_names(tmp_path, monkeypatch, capsys):
+    host = ToolHost(tmp_path, monkeypatch)
+    # The installed verifier is the previous build; the staged tool pins the staged build, held under a temporary name.
+    staged = tmp_path / "attest-verify.staged"
+    staged.write_bytes(b"#!/bin/sh\n# synthetic next build\n")
+    staged.chmod(0o755)
+    install_release(host.tool, NEWEST, candidate_tool(host.verifier, pin=hashlib.sha256(staged.read_bytes()).hexdigest()))
+    script = host.tool / "releases" / NEWEST / "production.py"
+    def self_test(*verifier):
+        return subprocess.run([sys.executable, "-B", "-E", "-s", str(script), "self-test", "--config",
+                               str(host.configs[0]), "--http-config", str(host.configs[1]), *verifier],
+                              capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"}, cwd="/", timeout=60)
+    result = self_test("--verifier", str(staged))
+    assert result.returncode == 0 and json.loads(result.stdout) == {"self_test": "ok", "sha": NEWEST}
+    # A mismatched pair is refused either way: the staged tool against the installed binary, or against another build.
+    result = self_test()
+    assert result.returncode == 1 and f"the attestation verifier {host.verifier} is missing" in result.stderr
+    assert "install the verifier first" in result.stderr
+    other = tmp_path / "attest-verify.other"
+    other.write_bytes(b"#!/bin/sh\n# synthetic other build\n")
+    other.chmod(0o755)
+    result = self_test("--verifier", str(other))
+    assert result.returncode == 1 and f"the attestation verifier {other} is missing" in result.stderr
+    staged.chmod(0o775)
+    result = self_test("--verifier", str(staged))
+    assert result.returncode == 1 and f"the attestation verifier {staged} is missing" in result.stderr
+    # Only the self-test reads another verifier path: every command that runs the verifier uses the installed one.
+    with pytest.raises(SystemExit):
+        p.main(["deploy", "--verifier", str(staged)])
+    assert "--verifier is only for self-test" in capsys.readouterr().err
+
+
+BOUNDARIES =["staged", "renamed", "activating", "switched", "before active"]
 
 
 # spec: ANYM-443
