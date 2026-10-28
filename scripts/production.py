@@ -2709,7 +2709,8 @@ def catalog_difference(before, after):
 # A literal default as pg_get_expr prints it, with the casts PostgreSQL adds ('x'::text, 0, (-1), '{}'::jsonb). The
 # printed text hides implicit casts, so the column's last CATALOG value must also say that its expression tree holds
 # only constants, relabels and built-in immutable functions (a user's assignment cast prints as `0` too, Astra r2 F5):
-# ADD COLUMN then stores it once and rewrites nothing.
+# ADD COLUMN then stores it once and rewrites nothing. Both must hold. A quoted type name (`'x'::"char"`, a quoted
+# enum) is no match and pauses: such a release goes the manual path (known pause, Astra r3 F11).
 LITERAL_DEFAULT = re.compile(r"(?:'(?:[^']|'')*'|-?[0-9]+(?:\.[0-9]+)?|\(-[0-9]+(?:\.[0-9]+)?\)|true|false)"
                              r"(?:::[a-z][a-z0-9_ ]*(?:\([0-9]+(?:,[0-9]+)?\))?(?:\[\])?)*")
 

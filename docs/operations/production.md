@@ -651,7 +651,9 @@ Phases, each a pause or a wait before any production write:
    foreign servers, extended statistics and text search) before and after must differ only by new tables
    with their columns, indexes, constraints, sequences, policies and ACL items, nullable or constant-default
    columns on existing tables (a literal whose stored expression holds only constants, relabels and
-   built-in immutable casts; a user's cast prints as a literal too and does not count) and added ACL items; `probe_metadata` only by `schema_version`;
+   built-in immutable casts; a user's cast prints as a literal too and does not count; a default whose
+   printed type name is quoted, such as `'x'::"char"` or a quoted enum, is a known pause: migrate that
+   release by hand) and added ACL items; `probe_metadata` only by `schema_version`;
    `archive_migrations` only by the pending versions; and no other existing table may show a write in
    `pg_stat_user_tables`. Its transaction (from `applied_at` to the first read after the container ended)
    takes at most `rehearsal_limit_ms`. Else the run pauses "not additive: <first difference>" or "too slow

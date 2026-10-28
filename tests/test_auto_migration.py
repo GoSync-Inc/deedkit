@@ -555,6 +555,19 @@ def test_a_default_behind_a_users_assignment_cast_is_not_constant(source_db):
     assert p.not_additive(before, after) == "added column public.messages s_wrap"
 
 
+# spec: ANYM-449
+def test_a_constant_default_of_a_quoted_type_name_pauses_as_a_known_case(source_db):
+    # Astra r3 F11, narrowed: the printed text must match LITERAL_DEFAULT as well as the vetted tree, so a quoted
+    # type name pauses and the release goes the manual path.
+    before = shape(source_db)
+    psql(source_db, 'ALTER TABLE messages ADD COLUMN s_char "char" DEFAULT \'x\';')
+    after = shape(source_db)
+    added = dict((tuple(key), value) for key, value in p.catalog_difference(before, after)["added"])
+    assert added[("column", "public.messages", "s_char")][2] == "'x'::\"char\""
+    assert added[("column", "public.messages", "s_char")][6] is True
+    assert p.not_additive(before, after) == "added column public.messages s_char"
+
+
 FORBIDDEN = {
     "drop-column": ("ALTER TABLE messages DROP COLUMN body;", "removed column public.messages body"),
     "rename-column": ("ALTER TABLE messages RENAME COLUMN body TO text_body;", "removed column public.messages body"),
