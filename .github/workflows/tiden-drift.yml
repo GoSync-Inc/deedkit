@@ -1,11 +1,17 @@
 name: Tiden drift
 on:
-  # Every merge to main; a dispatch reconciles main again after anchors were added (TIDEN-CI.md).
-  push:
-    branches: [main]
+  # After every Tiden sync run (ANYM-593): sync B anchors a merge's new files, so drift checks main only once every
+  # merge after the watermark has a successful sync, and the run after the last sync covers them. Any completion
+  # triggers a run (a skipped sync too): a run only reads main, so none is filtered out of the concurrency queue.
+  # A dispatch reconciles main again after anchors were added (TIDEN-CI.md).
+  workflow_run:  # zizmor: ignore[dangerous-triggers] only runs of this repository pass the guards; it checks out main, not the upstream head
+    workflows: [Tiden sync]
+    types: [completed]
   workflow_dispatch:
 permissions:
   contents: read
+  # The listing of the Tiden sync runs of main; read only, reaches the checker step as GH_TOKEN.
+  actions: read
 concurrency:
   # Runs never overlap. GitHub may replace a pending run with a newer one; each run checks the head of main when it
   # starts, not its event commit, so whichever run executes last covers every merge.
@@ -15,7 +21,9 @@ jobs:
   anchors:
     name: Anchors and watermark
     # Only the reviewed workflow and tools on main may use the Tiden credential.
-    if: github.ref == 'refs/heads/main'
+    if: >-
+      github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'workflow_run')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -40,12 +48,31 @@ jobs:
             test -n "$TIDEN_WORKSPACE_ID"
             echo 'enabled=true' >> "$GITHUB_OUTPUT"
           fi
+      # Expression comparisons ignore case; these do not, and run before any repository code. The upstream sync run
+      # is this repository's own (its title is never read), so main's checker and pinned CLI run on main's checkout.
+      - name: Require a Tiden sync run of this repository or a dispatch
+        if: steps.config.outputs.enabled == 'true'
+        env:
+          EVENT: ${{ github.event_name }}
+          UPSTREAM_EVENT: ${{ github.event.workflow_run.event }}
+          UPSTREAM_REPOSITORY: ${{ github.event.workflow_run.repository.full_name }}
+          UPSTREAM_HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          if [ "$EVENT" = workflow_run ]; then
+            test "$UPSTREAM_REPOSITORY" = "$REPOSITORY"
+            test "$UPSTREAM_HEAD_REPOSITORY" = "$REPOSITORY"
+            case "$UPSTREAM_EVENT" in workflow_run | workflow_dispatch) ;; *) exit 1 ;; esac
+          else
+            test "$EVENT" = workflow_dispatch
+          fi
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         if: steps.config.outputs.enabled == 'true'
         with:
           persist-credentials: false
           ref: main
           fetch-depth: 0
+      # The checker calls the CLI by its path; a workflow_run job writes nothing to GITHUB_PATH or GITHUB_ENV.
       - name: Install pinned Tiden CLI with integrity check
         if: steps.config.outputs.enabled == 'true'
         run: |
@@ -58,7 +85,6 @@ jobs:
           echo "$sum  $RUNNER_TEMP/tiden.tar.gz" | sha256sum --check --strict
           mkdir "$RUNNER_TEMP/tiden-bin"
           tar -xzf "$RUNNER_TEMP/tiden.tar.gz" -C "$RUNNER_TEMP/tiden-bin"
-          echo "$RUNNER_TEMP/tiden-bin" >> "$GITHUB_PATH"
       - name: Require an anchor for every changed code file, then advance the watermark
         if: steps.config.outputs.enabled == 'true'
         env:
@@ -66,4 +92,5 @@ jobs:
           TIDEN_PRODUCT_ID: ${{ vars.TIDEN_PRODUCT_ID }}
           TIDEN_WORKSPACE_ID: ${{ vars.TIDEN_WORKSPACE_ID }}
           TIDEN_BASE_URL: https://app.tiden.ai
-        run: python3 scripts/tiden_drift.py
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/tiden_drift.py --cli "$RUNNER_TEMP/tiden-bin/tiden" --sync-repository "$GITHUB_REPOSITORY"

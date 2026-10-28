@@ -538,35 +538,54 @@ that its run displaced (`sync_backlog` names one).
 
 `.github/workflows/tiden-drift.yml` keeps the drift watermark current after every
 merge (ANYM-355). It is a workflow of its own, so a red run never touches the
-`CI` push run that production promotion requires. Each run checks out `main` as
-it is when the run starts, not its event commit, and runs
-`scripts/tiden_drift.py`:
+`CI` push run that production promotion requires. It runs when a `Tiden sync`
+run completes, whatever its conclusion (ANYM-593), and on dispatch from `main`;
+it has no `push` trigger, because the sync anchors a merge's new files minutes
+after the push. Before any repository code, a shell guard requires a dispatch or
+an upstream sync run of this repository (its `repository` and `head_repository`)
+whose own event is `workflow_run` or `workflow_dispatch`; the upstream run's
+title and commit are never read. Its permissions are `contents: read` and
+`actions: read` (the run listing below); the job's `GITHUB_TOKEN` reaches the
+checker step alone, as `GH_TOKEN`, and the pinned CLI is called by its path.
+Each run checks out `main` as it is when the run starts, not its event commit,
+and runs `scripts/tiden_drift.py`:
 
-1. It reads the watermark W (`tiden drift status`) and lists the files changed
-   from W to that checkout, leaving out deletions and the categories in the
+1. It reads the watermark W (`tiden drift status`) and lists the first-parent
+   commits after W up to that checkout. Each needs a `Tiden sync <sha>` run (the
+   title Tiden health reads, ANYM-438) that completed with success; a skipped run
+   and a ready merge's run count for no commit. If one lacks it (no run yet,
+   queued, in progress, failed, cancelled, or dropped and not dispatched again),
+   the run checks nothing, advances nothing, passes, and its summary names every
+   commit in the range with its sync state; the sync that finishes later starts
+   a new run. A run listing that fails or is incomplete fails the run with
+   nothing sent.
+2. It lists the files changed from W to that checkout, leaving out deletions and the categories in the
    checker's `EXCLUDED` list (Markdown and `docs/`, `.claude/`, tests and their
    fixtures, lockfiles and dependency pins, licence texts: `LICENSE`,
    `*/LICENSE`, `*-LICENSE`, ANYM-504). Tests trace to specs through test
    links, not anchors.
-2. Every remaining path needs a `repo_file` anchor on some spec on Tiden main.
+3. Every remaining path needs a `repo_file` anchor on some spec on Tiden main.
    If one lacks it, the run fails, lists the paths in its summary and leaves the
-   watermark. Drift can finish before the sync of the same push: wait for that
-   sync run (dispatch it by SHA if it failed or was dropped), then rerun the
-   failed run. A path no sync anchors (a commit without a pull request, or a
+   watermark. Every sync of the range has finished by then, so a path no sync
+   anchors (a commit without a pull request, or a
    sync that failed at step anchors) is added as a `repo_file` source of the spec
    it implements with `tiden spec update --id <spec> --sources-file <file>` only
    in a maintenance window, with the sync workflow disabled and no run in
    progress (main sync). The command replaces the whole list, so resend every
    existing source with its fields, then rerun the failed run.
-3. Otherwise it runs `tiden drift advance --from W --to <checkout> --reason
+4. Otherwise it runs `tiden drift advance --from W --to <checkout> --reason
    empty_sync` once, requires `"advanced": true` and reads the watermark back.
    The server compares `--from` with the current watermark and answers a stale
    one with `"advanced": false` (verified 2026-10-18). Manual audited advances
    merge a drift-sync branch instead (docs/operations/tiden-product-workflow.md).
 
 Runs never overlap (one concurrency group, no cancelling). GitHub may replace a
-waiting run with a newer one; the run that executes covers the newest merge. A
-run whose checkout the watermark already reached passes without an advance.
+waiting run with a newer one; the run that executes covers the newest merge, and
+the run after the last sync to finish sees every sync of the range done, so a
+dropped run loses no merge. A failed sync stays named in every run, and the
+watermark stays, until a sync of the same SHA succeeds (dispatch it by SHA, Main
+sync), which starts a run again; Tiden health's sync backlog (ANYM-503) reports
+the failure. A run whose checkout the watermark already reached passes without an advance.
 Diverged history, an unreadable or incomplete spec listing, or any CLI failure
 before the advance fails the run with nothing sent. A failure after the advance
 was sent leaves its result unknown: the run is not retried in place, and a rerun
@@ -574,9 +593,11 @@ reads the server watermark again before it acts. Without `TIDEN_API_TOKEN` the
 workflow records that reporting is not configured and passes. Widening `EXCLUDED`
 is a reviewed code change to the checker and its test, never a data edit.
 
-The agent that merged a pull request checks that the `Tiden drift` run on its
-squash commit, or a later one, is green before it reports the merge as checked
-(harness process.md section 4); a red run names the files to anchor.
+The agent that merged a pull request checks that a `Tiden drift` run that started
+after its squash's `Tiden sync` run finished is green and moved the watermark to
+the squash or a later merge before it reports the merge as checked (harness
+process.md section 4); a red run names the files to anchor, and a green run that
+names a waiting commit is followed by the run its sync starts.
 
 ## Tiden health
 
@@ -607,7 +628,7 @@ start makes the metrics that need it unknown, and the others are still measured.
 
 | Metric | Fails when | Unknown when |
 | --- | --- | --- |
-| Drift | the watermark W is still behind TARGET 15 minutes after the start | W is not on `main`'s history or diverges from TARGET, or `drift status` fails |
+| Drift | the watermark W is still behind TARGET 15 minutes after the start (unchanged by ANYM-593: drift now runs after each `Tiden sync` and moves W only once every merge up to its checkout has a successful sync, one sync plus one drift run after the CI run; the verdict when that pair is slower is ANYM-600) | W is not on `main`'s history or diverges from TARGET, or `drift status` fails |
 | Unlinked tests | the unlinked share of active cases is 5% or more in a suite or overall; a suite has case rows but none active ("not reporting"); an active case has an unassigned path; an active unlinked case is not in `config/tiden-unlinked-tests.json`; that list is missing or has an invalid entry | no usable test evidence for TARGET (below), or a listing is incomplete |
 | Stale anchors | a `repo_file` source of this repository (or the former `anymsg` name, or none) names a path not tracked at TARGET, unless it is historical (below) | the spec listing is incomplete, or a source has a missing or repeated ID or no type |
 | Done with open checks | a `Done` spec carries `[open: live]` or `[open: measured]` outside inline code and fenced code (text that documents the marker is not one) | the initial Done audit date in the script is not set yet, or a `Done` spec's text was not readable |

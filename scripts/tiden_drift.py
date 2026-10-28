@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Require a Tiden source anchor for every code file changed since the drift watermark, then advance it.
 
-Runs after every merge to main (.github/workflows/tiden-drift.yml, TIDEN-CI.md). The target is the head of main when
-the run starts, so a run replaced in the concurrency queue, a delayed run and a rerun all reconcile the newest merge.
-When every changed path is anchored or excluded, the watermark advances with `empty_sync`, a compare-and-set on
-`--from`; manual audited advances merge a drift-sync branch instead. Anything unknown fails without an advance, and
-after an advance was sent nothing is retried: a fresh run reads the server watermark again.
+Runs after every `Tiden sync` run completes (.github/workflows/tiden-drift.yml, TIDEN-CI.md). The target is the head
+of main when the run starts, so a run replaced in the concurrency queue, a delayed run and a rerun all reconcile the
+newest merge. It checks only once every first-parent commit after the watermark has a successful `Tiden sync <sha>`
+run (ANYM-593), since the sync anchors a merge's new files; until then it names the commits still waiting, checks and
+advances nothing and passes, and the run after the last sync covers them. When every changed path is anchored or
+excluded, the watermark advances with `empty_sync`, a compare-and-set on `--from`; manual audited advances merge a
+drift-sync branch instead. Anything unknown fails without an advance, and after an advance was sent nothing is
+retried: a fresh run reads the server watermark again.
 """
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from fnmatch import fnmatchcase
 import json
 import os
@@ -18,6 +22,11 @@ import re
 import subprocess
 import sys
 import time
+from typing import Callable
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+# The sync lookup of Tiden health (ANYM-438, ANYM-503): the same run titles, listing and checks.
+from tiden_health import SYNC_SLACK, Actions, Unknown, decisive, moment, sync_runs  # noqa: E402
 
 REPOSITORY = "github.com/GoSync-Inc/deedkit"
 # Anchors recorded before the rename carry the former repository name, or none.
@@ -185,7 +194,43 @@ def present(root: Path, sha: str) -> bool:
                               capture_output=True, timeout=TIMEOUT).returncode
 
 
-def check(root: Path, cli: str, product: str, report) -> int:
+def synced(root: Path, base: str, target: str, syncs: Callable[[datetime], list[dict]], report) -> bool:
+    """Whether every first-parent commit after BASE up to TARGET has a successful `Tiden sync <sha>` run; otherwise
+    each commit is named with its sync state. SYNCS lists the sync runs of main created at or after a moment; a failed
+    or incomplete listing is never read as synced."""
+    commits = []
+    for line in git(root, "log", "--first-parent", "--format=%H %cI", f"{base}..{target}").splitlines():
+        sha, _, stamp = line.partition(" ")
+        if not SHA.fullmatch(sha) or moment(stamp) is None:
+            raise Refused("git log returned a malformed commit line")
+        commits.append((sha, moment(stamp)))
+    if not commits:
+        raise Refused("no main commit lies between the watermark and the target")
+    try:
+        runs = syncs(min(stamp for _, stamp in commits) - SYNC_SLACK)
+    except Unknown as error:
+        raise Refused(f"the Tiden sync runs could not be read ({error})") from None
+    states = []
+    for sha, _ in reversed(commits):  # oldest first
+        kept = sync_runs(runs, sha)
+        if any(run["conclusion"] == "success" for run in kept):
+            states.append((sha, "synced", None))
+        elif kept:
+            last = decisive(kept)
+            states.append((sha, last["conclusion"] or last["status"], last["html_url"]))
+        else:
+            states.append((sha, "no sync run", None))
+    waiting = [state for state in states if state[1] != "synced"]
+    if not waiting:
+        report(f"All {len(states)} main commit(s) after the watermark have a successful Tiden sync.")
+        return True
+    report(f"{len(waiting)} of {len(states)} main commit(s) after the watermark have no successful Tiden sync yet; "
+           "nothing is checked or advanced. The run after their sync checks them:")
+    report("\n".join(f"- {sha}: {state}" + (f" ({shown(url)})" if url else "") for sha, state, url in states))
+    return False
+
+
+def check(root: Path, cli: str, product: str, report, syncs: Callable[[datetime], list[dict]]) -> int:
     target = commit(root, "HEAD")  # the workflow checks out main as it is when the run starts
     base = watermark(cli, product)
     report(f"Target: main at {target}; watermark {base}.")
@@ -201,6 +246,8 @@ def check(root: Path, cli: str, product: str, report) -> int:
             report("Another writer advanced the watermark past this target on main; nothing to advance.")
             return 0
         raise Refused("the watermark and main have diverged; reconcile by hand, the job never resets it")
+    if not synced(root, base, target, syncs, report):
+        return 0
     paths = [path for path in changed(root, base, target) if not excluded(path)]
     known = anchors(cli, product)
     missing = [path for path in paths if path not in known]
@@ -233,6 +280,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Require anchors for changed code, then advance the drift watermark.")
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--cli", default="tiden")
+    parser.add_argument("--sync-repository", required=True,
+                        help="owner/name whose `Tiden sync` runs are listed through `gh api` (token: GH_TOKEN)")
     args = parser.parse_args()
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
 
@@ -243,7 +292,8 @@ def main() -> int:
                 stream.write(line + "\n")
 
     try:
-        return check(args.root.resolve(), args.cli, os.environ["TIDEN_PRODUCT_ID"], report)
+        return check(args.root.resolve(), args.cli, os.environ["TIDEN_PRODUCT_ID"], report,
+                     Actions(args.sync_repository).runs)
     except Refused as error:
         report(f"Refused: {error}")
         return 1
