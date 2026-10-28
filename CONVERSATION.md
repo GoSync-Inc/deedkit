@@ -92,6 +92,9 @@ two fields would carry the same fact, compact keeps the first and omits the othe
 - compact omits `owner_attention.suggested_action` when it equals
   `conversation.suggested_action`;
 - compact omits `owner_attention.next_step` when it equals `conversation.next_step`;
+- a `conversation.known_conflicts` entry names its message by `on` (`last_message`,
+  `awaiting_reply`, `latest_message_id`, `owner_attention.target_message_id` or
+  `candidate_message_ids[n]`) when the row already states that id, else by `message_id`;
   `next_step` itself stays when `basis` is omitted (see "Why a row is unclear");
 - `sender_name` in `last_message` and `awaiting_reply` is cut to 64 characters,
   as in compact messages.
@@ -331,7 +334,8 @@ A head conflict whose open conflicts are all of a known class (COLLECTOR_STATES.
 Telegram has known classes, so every WhatsApp conflict reads `message_version_conflict`) leaves
 the block stable: each shown message (`latest_known_meaningful_message(s)`,
 `owner_attention.target_message`) and its `basis.evidence[]` entry carry `conflict: {class,
-meaning}` whatever the basis, compact `known_conflicts` lists each such message once, and `meaning` says the provider may show the
+meaning}` whatever the basis, compact `known_conflicts` lists each such message once (`on` names
+the field that already states its id, else `message_id`), and `meaning` says the provider may show the
 other version now, so a quote needs a caveat. Any other class, `unclassified`, a class not
 stored (rows from before schema 54) or a mix with one of them reads `message_version_conflict`.
 

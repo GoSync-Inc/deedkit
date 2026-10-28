@@ -392,9 +392,13 @@ def test_a_known_conflict_class_keeps_the_head_stable_and_names_its_quote_caveat
     known={'class':'telegram_body_equal_version','meaning':SHOWN['telegram_body_equal_version']}
     assert result['basis']['evidence']==[{'message_id':mid,'revision':1,'conflict':known}]
     assert 'archived text is shown' in known['meaning'] and 'provider may show the other' in known['meaning']
+    from test_compact_queue_rows import assert_each_fact_once
     rows=render('list_chats',catalog(accounts=['dialogue-tg']),'compact')['items']
-    conversation=next(r['conversation'] for r in rows if r['id']==chat)
-    assert conversation['known_conflicts']==[{'message_id':mid,**known}]
+    row=next(r for r in rows if r['id']==chat)
+    shown='awaiting_reply' if 'awaiting_reply' in row else 'last_message'
+    assert row[shown]['message_id' if shown=='awaiting_reply' else 'id']==mid
+    assert row['conversation']['known_conflicts']==[{'on':shown,**known}]
+    assert_each_fact_once(row)
 
 
 # spec: ANYM-616
@@ -456,12 +460,26 @@ KNOWN_EVIDENCE={'active_conflicts':1,'conflict':{'class':'telegram_body_equal_ve
 def test_a_shown_group_head_keeps_its_known_conflict_caveat_beside_owner_attention():
     from messaging_service.conflict_classes import SHOWN
     from messaging_service.presentation import lean_conversation
-    result=state([message('head',evidence=KNOWN_EVIDENCE)],platform='telegram',chat_type='group',
-        attention=[message('mention',second=10)])
+    result=state([message('msg_head',evidence=KNOWN_EVIDENCE)],platform='telegram',chat_type='group',
+        attention=[message('msg_mention',second=10)])
     assert result['suggested_action']=='review_incoming' and result['basis']['code']=='explicit_owner_attention'
     known={'class':'telegram_body_equal_version','meaning':SHOWN['telegram_body_equal_version']}
     assert result['latest_known_meaningful_message']['conflict']==known
-    assert lean_conversation(result)['known_conflicts']==[{'message_id':'head',**known}]
+    assert lean_conversation(result)['known_conflicts']==[{'on':'latest_message_id',**known}]
+
+
+# spec: ANYM-616
+def test_a_compact_group_row_states_a_known_conflict_caveat_once():
+    from messaging_service.presentation import lean_chat
+    from test_compact_queue_rows import assert_each_fact_once
+    result=state([message('msg_head',evidence=KNOWN_EVIDENCE)],platform='telegram',chat_type='group',
+        attention=[message('msg_mention',second=10)])
+    row=lean_chat({'id':'chat_synthetic','account':'synthetic','title':'Synthetic group','type':'group',
+        'last_activity':NOW,'conversation':result,'awaiting_reply':True,'awaiting_reply_message_id':'msg_mention',
+        'awaiting_reply_sender':'synthetic-person','awaiting_reply_snippet':'Synthetic text'})
+    assert row['last_message']['id']=='msg_head' and row['awaiting_reply']['message_id']=='msg_mention'
+    assert [k['on'] for k in row['conversation']['known_conflicts']]==['last_message']
+    assert_each_fact_once(row)
 
 
 # spec: ANYM-616
@@ -471,4 +489,4 @@ def test_a_shown_meaningful_fallback_keeps_its_known_conflict_caveat():
         meaningful_fallback=message('older',second=5,evidence=KNOWN_EVIDENCE))
     assert result['basis']['code']=='unclassified_latest_message'
     assert result['latest_known_meaningful_message']['conflict']['class']=='telegram_body_equal_version'
-    assert [k['message_id'] for k in lean_conversation(result,shown=['older'])['known_conflicts']]==['older']
+    assert [k['on'] for k in lean_conversation(result,shown=['older'])['known_conflicts']]==['latest_message_id']
