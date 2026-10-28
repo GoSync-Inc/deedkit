@@ -327,3 +327,21 @@ async def test_grok_input_format_follows_frames_of_the_running_transport(tmp_pat
         assert declared_format=={'type':'audio/pcm','rate':rate}, (name,formats)
     assert {name:rate for name,(rate,_) in formats.items()}=={'browser':16000,'twilio':16000,'telegram':48000}
     service.close()
+
+
+# spec: ANYM-617
+async def test_grok_silent_start_sends_history_without_response_create_on_pipecat_1_14(tmp_path):
+    service=VoiceService(tmp_path)
+    model=create_model(grok_brief(service),'synthetic-key',silent=True)
+    context=LLMContext([{'role':'user','content':'CALL RESUMED: stay silent until you hear speech.'}])
+    wire=[]
+    async def send(event):wire.append(event.model_dump(exclude_none=True))
+    async def session_update():wire.append({'type':'session.update'})
+    model.send_client_event=send;model._send_session_update=session_update
+    model._context=context;model._api_session_ready=True
+    await model._create_response()
+    # Pipecat 1.13+ made get_llm_invocation_params async: the history items still reach xAI, no response.create.
+    assert [event['type'] for event in wire]==['conversation.item.create','session.update']
+    assert 'CALL RESUMED' in json.dumps(wire[0]['item'])
+    assert not model._llm_needs_conversation_setup and not model.silent_start
+    service.close()

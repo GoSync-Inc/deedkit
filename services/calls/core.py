@@ -8,6 +8,7 @@ import threading
 import uuid
 from datetime import datetime,timezone
 from functools import cache
+from importlib.metadata import version
 from pathlib import Path
 from typing import Annotated,Literal,get_args
 from zoneinfo import ZoneInfo,ZoneInfoNotFoundError,available_timezones
@@ -16,6 +17,8 @@ from pydantic import AfterValidator,BaseModel,ConfigDict,Field,PrivateAttr,field
 
 PROMPT_VERSION="2026-10-14.task-v7"
 MODEL="gemini-3.8-live"
+# Call records name the Pipecat release actually installed, not a literal (ANYM-617).
+ENGINE="Pipecat "+version("pipecat-ai")
 GROK_MODEL="grok-voice-3.0"
 ACTIVE={"waiting_for_browser","dialing","ringing","connecting","active"}
 
@@ -547,7 +550,7 @@ class VoiceService:
             v={"id":str(uuid.uuid4()),"brief_id":brief_id,"brief":brief,"channel":brief['channel'],
                "status":"dialing" if external else "waiting_for_browser","started_at":now(),"outcome":"unresolved",
                "answers":{},"decisions":[],"consultations":[],"events":[],"tool_results":{},"summary":"","metrics":{},"review":None,
-               "capture_mode":"provider_chunks_and_finalized_turns","engine":"Pipecat 1.12.0","transport":"external_audio" if external else "SmallWebRTC","event_storage":1}
+               "capture_mode":"provider_chunks_and_finalized_turns","engine":ENGINE,"transport":"external_audio" if external else "SmallWebRTC","event_storage":1}
             self.db.execute("INSERT INTO calls VALUES (?,?,?)",(v["id"],brief_id,json.dumps(v,ensure_ascii=False)))
             self.db.commit()
             return v

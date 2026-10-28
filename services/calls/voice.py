@@ -15,10 +15,12 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker, ProcessorUnusablePolicy
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.frameworks.rtvi import RTVIProcessor
 from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+from pipecat.utils.file_resolver import FileResolver, FileResolverError, UrlReachability
 from pipecat.workers.runner import WorkerRunner
 
 from core import KEYPAD_CHANNELS, RESUME_RULES, TOOL_MODELS, call_clock
@@ -56,6 +58,38 @@ class InboundAudioProbe(FrameProcessor):
             try:self.probe.input(frame.audio,rate=frame.sample_rate,channels=frame.num_channels)
             except Exception:self.failures+=1
         await self.push_frame(frame,direction)
+
+
+FILES_REFUSED='Files are not accepted in calls.'
+TOOL_RESULTS_REFUSED='Tool results come only from the server.'
+CLIENT_REFUSALS={'send-file':FILES_REFUSED,'llm-function-call-result':TOOL_RESULTS_REFUSED}
+
+
+class CallRTVI(RTVIProcessor):
+    """Calls take no client files or tool results (ANYM-617): RTVI send-file (Pipecat 1.13+) and
+    llm-function-call-result are refused before they become frames; the server runs every tool itself."""
+    async def _handle_message(self,message,user_id=None):
+        if message.type in CLIENT_REFUSALS:
+            return await self._send_error_response(message.id,CLIENT_REFUSALS[message.type])
+        await super()._handle_message(message,user_id)
+
+
+class NoFileResolver(FileResolver):
+    """No file URL in a call's context is fetched by this server or handed to the provider (ANYM-617)."""
+    def cached_reachability(self,url):
+        return UrlReachability.BLOCKED
+
+    async def classify(self,url):
+        return UrlReachability.BLOCKED
+
+    async def fetch(self,url):
+        raise FileResolverError('Files are not accepted in calls')
+
+
+def call_worker(processors):
+    return PipelineWorker(Pipeline(processors),
+        params=PipelineParams(enable_metrics=True,enable_usage_metrics=True),idle_timeout_secs=180,
+        processor_unusable_policy=ProcessorUnusablePolicy.END,rtvi_processor=CallRTVI())
 
 
 DESCRIPTIONS={
@@ -187,7 +221,7 @@ def tool_schemas(handler):
 
 
 class AuditedGemini(GeminiLiveLLMService):
-    """Pinned Pipecat 1.12 hooks: capture provider text before sentence/turn buffering."""
+    """Pinned Pipecat 1.14 hooks: capture provider text before sentence/turn buffering."""
     def __init__(self,*args,recorder=None,external_tts=False,live_flows=False,transcription_language=None,hint_failed=None,**kwargs):
         self.recorder=recorder
         self.hint_failed=hint_failed
@@ -199,7 +233,7 @@ class AuditedGemini(GeminiLiveLLMService):
         super().__init__(*args,**kwargs)
 
     async def _connection_task_handler(self,config):
-        # Pinned Pipecat 1.12 builds empty transcription configs. Add the
+        # Pinned Pipecat 1.14 builds empty transcription configs. Add the
         # brief's language hint at every connection, including resume.
         if self.transcription_language:
             try:
@@ -246,9 +280,9 @@ class AuditedGemini(GeminiLiveLLMService):
             self.recorder('assistant',content.output_transcription.text)
         await super()._handle_msg_output_transcription(message)
 
-    async def _tool_result(self,tool_call_id,tool_name,tool_result_message):
+    async def _tool_result(self,tool_call_id,tool_name,tool_result_message,*,is_final=True,spoken=True):
         if not self.live_flows or not self._supports_non_blocking_tools or not self._function_is_async(tool_name):
-            return await super()._tool_result(tool_call_id,tool_name,tool_result_message)
+            return await super()._tool_result(tool_call_id,tool_name,tool_result_message,is_final=is_final,spoken=spoken)
         if self._disconnecting or not self._session:
             return
         from google.genai.types import FunctionResponse
@@ -257,7 +291,9 @@ class AuditedGemini(GeminiLiveLLMService):
             scheduling='WHEN_IDLE'
         # API scheduling is outside the tool's JSON result. A result-only hint
         # leaves the wire response at WHEN_IDLE and can trigger spoken filler.
-        response=FunctionResponse(name=tool_name,id=tool_call_id,scheduling=scheduling,
+        # Scheduling stays the result's own hint, not `spoken`: Flows results keep WHEN_IDLE.
+        # will_continue=False closes the call, as upstream 1.14 does for a final result.
+        response=FunctionResponse(name=tool_name,id=tool_call_id,scheduling=scheduling,will_continue=not is_final,
             response={**tool_result_message,'scheduling':scheduling})
         try:
             await self._session.send_tool_response(function_responses=response)
@@ -279,9 +315,10 @@ def create_model(brief,key,recorder=None,input_rate=None,at=None,silent=False):
     brief={**brief,'prompt':brief['prompt']+'\n'+call_clock(brief,at or datetime.now(timezone.utc))}
     if brief.get('dialog_engine')=='grok_realtime':
         from grok_voice import AuditedGrok
-        return AuditedGrok(brief,key,recorder,input_rate=input_rate or PipelineParams().audio_in_sample_rate,silent_start=silent)
+        return AuditedGrok(brief,key,recorder,input_rate=input_rate or PipelineParams().audio_in_sample_rate,silent_start=silent,
+            file_resolver=NoFileResolver())
     return AuditedGemini(api_key=key,recorder=recorder,external_tts=bool(brief.get('custom_voice_id')),
-        inference_on_context_initialization=not silent,
+        inference_on_context_initialization=not silent,file_resolver=NoFileResolver(),
         live_flows=brief.get('dialog_engine')=='gemini_live_flows',settings=GeminiLiveLLMService.Settings(
         model=brief['model'],system_instruction=brief['prompt'],voice=brief['voice']),
         # Every Gemini engine gets the brief's language as a transcription hint; a legacy language gets none.
@@ -408,9 +445,7 @@ async def run_transport(transport,brief,key,state,browser=False):
         processors.append(ReplicatedVoiceTTS(api_key=key,voice_id=brief['custom_voice_id'],
             style=brief.get('voice_style','neutral'),metric_callback=state['tts_metrics'].append))
     processors.extend([transport.output(),AudioDeliveryProbe(runtime_health),assistant])
-    worker=PipelineWorker(Pipeline(processors),
-        params=PipelineParams(enable_metrics=True,enable_usage_metrics=True),idle_timeout_secs=180,
-        processor_unusable_policy=ProcessorUnusablePolicy.END)
+    worker=call_worker(processors)
     runner=WorkerRunner(handle_sigint=False)
     state['runner']=runner
     await runner.add_workers(worker)

@@ -1,4 +1,4 @@
-"""Pipecat 1.12 Flows executor for persistent Gemini Live sessions.
+"""Pipecat 1.14 Flows executor for persistent Gemini Live sessions.
 
 This deliberately supports APPEND, fixed tools and tool-driven transitions.
 It does not pretend a local context reset changes Gemini's remote history.
