@@ -159,9 +159,11 @@ def test_unreadable_call_voice_still_judges_explicit_engines_by_their_keys():
     ready=calling_readiness(principal,outbound,{'gemini':False,'xai':True},True,None)
     for name,channel in ready['channels'].items():
         assert channel['blockers']==['call_voice_invalid'], name
-        assert channel['voice_engines']=={'gemini_live':{'ready':False,'blockers':['key_not_configured']},
-                                          'grok_live':{'ready':True,'blockers':[]}}, name
-        assert channel['ready_engines']==['grok_live'] and channel['auto']=={'ready':True,'selects':'grok_live'}, name
+        # Prepare freezes the owner's voice into every brief, so it refuses each engine alike (ANYM-595 fix).
+        assert channel['voice_engines']=={
+            'gemini_live':{'ready':False,'blockers':['call_voice_invalid','key_not_configured']},
+            'grok_live':{'ready':False,'blockers':['call_voice_invalid']}}, name
+        assert channel['ready_engines']==[] and channel['auto']=={'ready':False,'selects':'grok_live'}, name
 
 
 # spec: ANYM-595
@@ -176,7 +178,8 @@ def test_auto_selects_what_choose_picks(provider,keys):
     try:selected=voice_engines.choose('auto','ru',provider,keys)['selected']
     except ServiceError as error:
         assert error.code=='no_voice_engine_available';selected=None
-    assert ready['channels']['browser']['auto']=={'ready':selected is not None,'selects':selected}
+    # An unreadable call_voice (provider None) still names choose's pick, but no engine can be prepared (ANYM-595 fix).
+    assert ready['channels']['browser']['auto']=={'ready':selected is not None and provider is not None,'selects':selected}
 
 
 # spec: ANYM-595

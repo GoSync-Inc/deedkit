@@ -301,3 +301,20 @@ async def test_control_mcp_refusal_names_engine_and_reason(tmp_path,monkeypatch)
         'error':'voice_engine_unavailable','voice_engine':'grok_live','reason':'key_not_configured'}
     assert external.is_error and json.loads(external.content[0].text.split(': ',1)[1])=={'error':'no_voice_engine_available',
         'skipped':{'gemini_live':'key_not_configured','grok_live':'key_not_configured'}}
+
+
+# spec: ANYM-595
+def test_an_unreadable_call_voice_leaves_no_engine_ready_and_prepare_refuses_each(tmp_path):
+    client=app_client(tmp_path)
+    try:
+        (tmp_path/'data'/'call-voice.json').write_text('{damaged')
+        ready=client.post('/v1/capabilities',json={},headers=AGENT).json()['calling_readiness']['channels']
+        for channel in ROUTES:
+            assert ready[channel]['ready_engines']==[] and ready[channel]['auto']['ready'] is False, channel
+            for engine in voice_engines.ENGINES:
+                assert 'call_voice_invalid' in ready[channel]['voice_engines'][engine]['blockers'], (channel,engine)
+                refused=prepare(client,channel,voice_engine=engine)
+                assert refused.status_code==503 and 'call_voice_invalid' in refused.text, (channel,engine,refused.text)
+        assert briefs(client)==0
+    finally:
+        client.__exit__(None,None,None)
