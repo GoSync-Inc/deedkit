@@ -111,7 +111,7 @@ affect every pull request make parallel edits collide.
 
 ## Hosts
 
-Workers can run on another machine that Superset knows as a host (CLI 1.39; owner 10-26).
+Workers can run on another machine that Paradev (formerly Superset) knows as a host (CLI 1.39; owner 10-26).
 
 - `superset hosts add <ssh-target>` installs the CLI there, signs it in with a new API key and
   keeps it running as a systemd user service or LaunchAgent; `superset hosts remove <ssh-target>`
@@ -150,7 +150,7 @@ Workers can run on another machine that Superset knows as a host (CLI 1.39; owne
   level if not in the card, limits beyond the card (production read-only, etc.), SP when Estimates is on.
 - Workspaces: no tags on any workspace; the type lives in the workspace name (`code-…`,
   `research-…`, `ops-…`, `process-…`).
-- Worker states (Superset CLI 1.39+): `bin/watch.sh` prints `AGENT <name> (terminal <id8>): <state>`
+- Worker states (CLI 1.39+): `bin/watch.sh` prints `AGENT <name> (terminal <id8>): <state>`
   when a worker agent becomes `idle` (turn ended), `blocked` (waits for input) or `exited`, or its
   terminal is `gone`; its state directory survives a restart, so a restarted watcher repeats only
   what changed meanwhile (an empty directory lists every such worker). For several workers these
@@ -172,7 +172,7 @@ Workers can run on another machine that Superset knows as a host (CLI 1.39; owne
   tail; a permission or menu prompt: add the allow entry (process.md section 2 gate) and restart the
   worker; only a prompt no entry clears is a `hands` item (never press keys in a worker's terminal).
   `STALL` (working, no agent event for `STALL_MIN`): read the tail once; an idle prompt there is an
-  interrupt typed outside Superset that left the state on working (explain only warns of it): treat
+  interrupt typed outside Paradev that left the state on working (explain only warns of it): treat
   it as idle; a tool still running (a long test, a wait) is left alone; else send "resume".
   `exited` or `gone` without a DONE: an Abandoned pull request (below) or the close step.
 - Abandoned pull request (its worker gone): hand it to another agent with the old handoff, if
@@ -192,23 +192,35 @@ Workers can run on another machine that Superset knows as a host (CLI 1.39; owne
   `exited`/`gone`, and on its own start or restart for its project's rows whose agent is not live, ends the row's
   cua session (`timeout 20 cua-driver call end_session '{"session":"<name>"}'`) and removes the row. A row of a
   project with no live orchestrator (`bin/boss-of.sh <project>`, ListAgents) may be removed by any orchestrator.
-- After a worker's DONE, or when its last PR merges (whoever merged it): check its worktree is clean and its test
+- Finished work is closed (owner 10-28: an idle worker in the sidebar reads as waiting on the owner). In the turn
+  that reads any worker's DONE (with or without a PR: research, ops and triage too), and when a worker's last PR merges
+  (whoever merged it) and its agent is not working: check its worktree is clean, nothing is unpushed (`git -C <worktree> status -sb`) and its test
   containers are gone (`docker ps -a`; `docker stop` running leftovers and `docker rm <proj>_<name>` stopped ones
   yourself, dcg allowlist in README Requirements, which checks the name shape only, not whose container it is; for a
   name dcg blocks, the `! dcg allow-once` line goes in the owner digest), run `estimate record` when Estimates is on,
-  close its terminal and archive its workspace at once, unless its task has steps after the merge (enable after
-  deploy, a measurement after N hours, a follow-up PR; from its brief, card or a `Post-merge:` line in its DONE): then
-  move them with their conditions into STATE.md NEXT, or wait for its DONE, and close after.
+  then close its terminal and archive its workspace (`superset workspaces archive --local <id>`; it removes the
+  worktree folder, the branch stays). Steps after the merge (enable after deploy, a measurement after N hours, a
+  follow-up PR; from its brief, card or a `Post-merge:` line in its DONE) move with their conditions into STATE.md
+  NEXT first. More work for it later (review fixes on a PR still open included): a new worker from its DONE handoff
+  (Abandoned pull request), not a kept-open one.
 - Workspace sweep (owner 10-22): after each merge and on every start, restart or wake-up, run
   `bin/orchestrator-check.sh` and act on each line: `STALE-WS` names a workspace with no open PR and
-  a merged or closed one (close it if it is yours and no step after the merge is left), `IDLE-FLEET`
+  a merged or closed one (close it if it is yours; steps after the merge go to STATE.md NEXT first, above), `DONE-WS`
+  a workspace with no PR from its branch whose agents are all idle or exited, or that has none (its DONE already
+  read: the close was missed, close it now; no DONE: Worker states), `FAILED-WS` a worker idle after a
+  failed turn (an API or network error ends it with no hook, so nothing else notices; owner 10-28; a
+  workspace on both lines is FAILED-WS: resume, never close): run the printed `superset terminals send ...
+  --wait --until working` line and note `resumed <HH:MM>` on its row in the STATE.md live workers table. A resume
+  that does not reach `working`, or `FAILED-WS` again for a row marked `resumed` with no new commit or DONE since,
+  is the second failure: no third resume; read its screen once, leave it idle and put the cause in the next
+  owner digest, `IDLE-FLEET`
   means no live worker while NEXT holds an item that names no wait (dispatch), `PIN-LAG n` a
   docs/harness pin n versions behind (refresh it: a worker runs `bin/pin-refresh.sh -C <its checkout>
   v<version>`; README, Pinned copy), `BRIEF-NO-SENDMESSAGE` a brief that has workers
   report in a terminal (fix the brief), `INBOX n` unread peer FYIs (Wake-ups, Inbox). A failed read prints `NOT CHECKED`, never a finding: do that
   part by hand. Then list your project's workspaces (`superset workspaces list --local --project
-  <superset project id>`) and close every one of yours with no open task: PR merged or closed with
-  no step after the merge left (above), superseded, a finished research or mockup, an old session
+  <superset project id>`) and close every one of yours with no open task: PR merged or closed (steps
+  after the merge moved to NEXT first, above), superseded, a finished research or mockup, an old session
   workspace. Look at a worktree before archiving (uncommitted work is lost). Never close another
   orchestrator's or a peer project's workspace.
 - Status sweep (owner 10-27): before each digest (at least daily) and in every Tiden maintenance
@@ -266,7 +278,7 @@ Workers can run on another machine that Superset knows as a host (CLI 1.39; owne
   are never asked (Owner asks). Every owner ask is `default: none`: it waits for the owner, and work that needs no
   answer goes on.
   - Only these get a digest line under "Decided by agents": a process.md section 2 gate step (ruleset or required
-    checks, secrets or access, destructive SQL, restore, rollback, production change, release), a process text
+    checks, secrets or access, destructive SQL or deleting data (not a service-run DELETE a ready card or data policy names), restore, rollback, production change, release), a process text
     change, a deleted card or weakened criterion, a GUI or ops step on a live service, a review finding closed
     by narrowing, a follow-up card or a revert (reviews.md, Rounds 5 and the epic review). Each line: `r<n>` (never
     reused), what, why, the gate it passed, the undo. The never-asked kinds and answered worker questions get no
@@ -308,7 +320,7 @@ Workers can run on another machine that Superset knows as a host (CLI 1.39; owne
   for sessions whose cwd lacks the repo's git remote); `doctor` must show it linked. Before creating a code worker:
   `forecast --sp <the card's Effort, or your SP for a skip> --task <its --branch> --model <your model
   id>` (you adopt the SP); the SP go into its task brief and the worker keeps that branch. Only this forecast logs a `--task`; never
-  size after the work started (a retro, not accuracy data). The Superset automation `estimate-nightly` (not yours) runs
+  size after the work started (a retro, not accuracy data). The Paradev automation `estimate-nightly` (not yours) runs
   `record --all` and `dashboard --all` (no `--repo`) for every linked project; still run `record` after merges and
   before any planning. Agent count (within Capacity) and waves: `plan --agents <n>` or `dashboard`, after `estimate
   setup` named the backlog (`backlog pull` refreshes Tiden cards first). Hours and money: only the script (tiden.md, Effort).
@@ -316,7 +328,7 @@ Workers can run on another machine that Superset knows as a host (CLI 1.39; owne
 ### Owner page
 
 Owner decision 10-26 (Superset 1.39 points 1-4: "probably do all four of these points"): the
-digest and the open owner questions reach the owner as one Superset page per project, not as long
+digest and the open owner questions reach the owner as one Paradev page per project, not as long
 terminal messages. `bin/owner-page.sh` (README, Scripts) publishes it.
 
 - Page: title `<PROJECT>: owner`, source `<orchestrator dir>/owner-page.html` (from
@@ -335,7 +347,7 @@ terminal messages. `bin/owner-page.sh` (README, Scripts) publishes it.
   previous digest); new questions join the page only with a digest, or at once for an incident, so
   the notification below sounds only at a digest or an incident; a version on an answer and on the orchestrator's start (a
   publish makes the publishing session the page's comment watcher; the output line shows
-  `watching`, and in 1.39 a creating publish once returned false). The label says what changed (`+q6 repo name; q2 answered: D10`).
+  `watching`, and in 1.39 a creating publish once returned false). The label says what changed (`+q6 repo name; q2 answered: D<n>`).
   A publish with a question new since the last notification (`owner-page.notified`) also raises a
   desktop notification with sound (owner-page.sh; a click opens the orchestrator terminal): no
   extra ping for it. Questions already notified stay silent, so a republish makes no sound. While
@@ -373,10 +385,10 @@ terminal messages. `bin/owner-page.sh` (README, Scripts) publishes it.
   another session), the terminal line and the answered list carry the confirmation. Only the
   live orchestrator handles answers and comments; a session kept by `--keep-old` does not.
 - One owner page per project, not one for all: q<n> ids, the decision log and the publisher are
-  per project; the owner's Superset page list shows them side by side. A page copied before
+  per project; the owner's Paradev page list shows them side by side. A page copied before
   answer buttons: `owner-page.sh upgrade`, then `data-options` per article and the `<main>`
   labels from the template (publish warns while the answer script is missing or old).
-- Privacy: Superset hosts the page and its stored answers; the answers also enter the
+- Privacy: Paradev hosts the page and its stored answers; the answers also enter the
   orchestrator's model context and session transcript, then DECISIONS.md. `just_me` means the publishing account, which must be the
   owner's login (never another account's `SUPERSET_API_KEY`); never widened without the owner's
   words. Still no secrets, tokens, credentials, emails, phone numbers, user data, names of people
@@ -416,7 +428,7 @@ if 30 calls or fewer are left; restart from 150k before over an hour idle):
 
 Pick the cheapest form that outlives the wait: `bin/watch.sh` for "something changed"; a session cron
 (CronCreate) or Monitor for a wait that ends inside this session; `bin/wake.sh` for a wait that must outlive
-a restart (overnight, an owner gate, a recurring check). Superset 1.39 cannot send an automation into a
+a restart (overnight, an owner gate, a recurring check). Paradev 2.0 still cannot send an automation into a
 terminal it did not start: each run starts an agent session in the target workspace or, with
 `--continue-session`, reuses the one its previous run left. So a wake is a relay: `wake.sh add <slug>
 <every|once> <minutes 5-10080> <purpose>`, run in the orchestrator's terminal, creates `<project>-wake-<slug>`
@@ -426,10 +438,16 @@ open) that sends `WAKE <name>: <purpose>` to the recorded terminal.
 - Cost: per wake, one relay turn on top of the orchestrator's own wake-up. The relay is a full Claude Code
   session (project CLAUDE.md and AGENTS.md; the SessionStart hook gives it one line, not STATE.md) whose
   context grows by one small turn per run, on the `WAKE_AGENT` preset (default `claude`; a preset with a
-  cheaper model, made in Superset settings, cuts it). Prefer one wake at the longest interval the wait allows.
+  cheaper model, made in Paradev settings, cuts it). Prefer one wake at the longest interval the wait allows.
 - Cleanup: `wake.sh rm <slug>` when the wait ends (closes its relay terminal, then deletes the automation;
   a failure keeps both for a retry); a `once` wake removes itself after it is delivered; `wake.sh rm --all`
   when the project ends. Leave relay terminals (first prompt `WAKE RELAY`) alone otherwise.
+- Heartbeat (owner 10-28): the one fixed wake, beside any wait wakes. On a dispatch and on every start or
+  restart, when a worker is live and `wake.sh list` shows no `heartbeat`, run `wake.sh add heartbeat every 30
+  "run orchestrator-check"`; when you close the last worker workspace (any turn), `wake.sh rm heartbeat`. Each
+  heartbeat runs `bin/orchestrator-check.sh` and acts on its lines (`FAILED-WS`: Workspace sweep). Its `WAKE`
+  line is also a new prompt, so it resumes an orchestrator whose own turn failed (while its terminal is live:
+  a lost wake pauses, below). With no live worker there is no heartbeat; a wait on the owner keeps its own wake.
 - A lost wake (the recorded terminal is not live) is logged to `<orchestrator dir>/wake-lost.log` and its
   automation paused. `wake.sh target`, in the orchestrator's terminal, re-records it, resumes paused wakes
   and shows the log; run it after a failed restart or an orchestrator started by hand. A run while the host
