@@ -461,3 +461,155 @@ def test_dump_past_its_timeout_fails_the_capture_and_releases_the_fence(seeded,t
     assert not (tmp_path/'capture').exists()
     with store.pool.connection() as c:
         assert c.execute('SELECT ended_at FROM attachment_backup_fences WHERE id=%s',(ID,)).fetchone()['ended_at'] is not None
+
+
+def counting_opens(monkeypatch,root):
+    """Counts opens of each file directly under root, through Path.open (io.open) and os.open."""
+    import collections
+    opened=collections.Counter();real_io=io.open;real_os=os.open;root=os.fspath(root)
+    def record(path):
+        if isinstance(path,(str,os.PathLike)) and os.path.dirname(os.fspath(path))==root:
+            opened[os.path.basename(os.fspath(path))]+=1
+    def io_open(file,*args,**kwargs):record(file);return real_io(file,*args,**kwargs)
+    def os_open(path,*args,**kwargs):record(path);return real_os(path,*args,**kwargs)
+    monkeypatch.setattr(io,'open',io_open);monkeypatch.setattr(os,'open',os_open)
+    return opened
+
+
+def copying_age(directory):
+    directory.mkdir(exist_ok=True);age=directory/'age'
+    age.write_text('#!'+sys.executable+'\nimport sys,shutil\nshutil.copyfileobj(sys.stdin.buffer,sys.stdout.buffer)\n')
+    age.chmod(0o700)
+    return str(age)
+
+
+# spec: ANYM-631
+def test_streamed_run_opens_each_original_twice_at_capture_and_in_the_stream(seeded,tmp_path,monkeypatch):
+    store,*_=seeded
+    opened=counting_opens(monkeypatch,store.files)
+    directory=tmp_path/'capture'
+    create_snapshot(store,directory,[sys.executable,'-c','print("UNIT_DUMP")'],reference_blobs=True)
+    digests=[item['digest'] for item in json.loads((directory/'manifest.json').read_text())['blobs']]
+    assert digests and dict(opened)=={digest:1 for digest in digests}
+    snapshot_stream_bound(directory,store.files)
+    assert dict(opened)=={digest:1 for digest in digests}
+    output=io.BytesIO()
+    encrypt_snapshot_stream(directory,output,'fixture',blob_root=store.files,age=copying_age(tmp_path/'bin'))
+    assert output.getvalue() and dict(opened)=={digest:2 for digest in digests}
+
+
+# spec: ANYM-631
+def test_stream_bound_from_sizes_equals_the_former_bound_and_refuses_a_changed_size(tmp_path,monkeypatch):
+    directory,source,manifest,_=reference_fixture(tmp_path)
+    # The former bound, written out: USTAR members padded to 512, the archive to 10240, then age's overhead.
+    members=[directory/'manifest.json',directory/'database.dump',*(source/item['digest'] for item in manifest['blobs'])]
+    size=1024+sum(512+((path.stat().st_size+511)//512)*512 for path in members)
+    size=((size+10239)//10240)*10240
+    opened=counting_opens(monkeypatch,source)
+    assert snapshot_stream_bound(directory,source)==size+size//100+1024**2
+    assert not opened
+    original=source/manifest['blobs'][0]['digest'];data=original.read_bytes()
+    original.write_bytes(data+b'X')
+    with pytest.raises(RuntimeError,match='backup_source_changed'):snapshot_stream_bound(directory,source)
+    original.write_bytes(data)
+    (directory/'manifest.json').write_text(json.dumps({**manifest,'blobs':[{'digest':'NOT-A-DIGEST','bytes':1}]}))
+    with pytest.raises(ValueError,match='invalid_backup_manifest'):snapshot_stream_bound(directory,source)
+    (directory/'manifest.json').write_text(json.dumps({**manifest,'format':3}))
+    with pytest.raises(ValueError,match='unsupported_backup'):snapshot_stream_bound(directory,source)
+
+
+# spec: ANYM-631
+def test_original_changed_after_capture_fails_the_stream_and_the_receiver_sees_no_footer(tmp_path,monkeypatch):
+    directory,source,manifest,age=reference_fixture(tmp_path)
+    original=source/manifest['blobs'][0]['digest'];original.write_bytes(b'Y'*original.stat().st_size)
+    seen=tmp_path/'receiver.log';ssh=tmp_path/'ssh'
+    ssh.write_text('#!'+sys.executable+'\nimport json,struct,sys\nlog=open('+repr(str(seen))+',"w")\n'+'''
+header=json.loads(sys.stdin.buffer.readline())
+print(json.dumps({'v':2,'id':header['id'],'snapshot_sha256':header['snapshot_sha256'],'status':'ready'}),flush=True)
+while True:
+    raw=sys.stdin.buffer.read(4)
+    if len(raw)!=4:log.write('aborted\\n');log.flush();sys.exit(1)
+    length=struct.unpack('!I',raw)[0]
+    if not length:log.write('footer\\n');log.flush();sys.exit(0)
+    sys.stdin.buffer.read(length);log.write('frame\\n');log.flush()
+''')
+    ssh.chmod(0o700);monkeypatch.setenv('PATH',str(tmp_path)+os.pathsep+os.environ['PATH'])
+    fifo=tmp_path/'ciphertext.fifo';os.mkfifo(fifo,0o600);outcome={}
+    def encode():
+        try:
+            with fifo.open('wb',buffering=0) as out:
+                outcome['result']=encrypt_snapshot_stream(directory,out,'fixture',blob_root=source,age=age)
+        except BaseException as exc:outcome['error']=exc
+    thread=threading.Thread(target=encode)
+    def start(encoding):
+        if encoding:thread.start()
+    async def completed():
+        await asyncio.to_thread(thread.join,30)
+        if 'error' in outcome:raise outcome['error']
+        return outcome['result']
+    # The size check passes: only the in-stream hash can see this change.
+    metadata={'v':2,'id':ID,'max_bytes':snapshot_stream_bound(directory,source),'snapshot_sha256':SNAPSHOT}
+    transfer={'host':'fixture.invalid','user':'backup','identity_file':'unused','known_hosts_file':'unused'}
+    with pytest.raises(RuntimeError,match='backup_source_changed'):
+        asyncio.run(upload_stream(fifo,metadata,transfer,30,start,completed))
+    assert not thread.is_alive() and 'frame' in seen.read_text() and 'footer' not in seen.read_text()
+
+
+# spec: ANYM-631
+@pytest.mark.parametrize('changed',['dump','manifest'])
+def test_changed_dump_or_manifest_fails_the_stream_before_its_first_byte(tmp_path,monkeypatch,changed):
+    directory,source,manifest,age=reference_fixture(tmp_path)
+    expected=hashlib.sha256((directory/'manifest.json').read_bytes()).hexdigest()
+    if changed=='dump':(directory/'database.dump').write_bytes(b'UNIT_NOT_A_DATABASX')
+    else:(directory/'manifest.json').write_text(json.dumps({**manifest,'tables':{'changed':1}}))
+    import messaging_service.backup_crypto as crypto
+    started=[];popen=crypto.subprocess.Popen
+    def recorded(*args,**kwargs):started.append(args);return popen(*args,**kwargs)
+    monkeypatch.setattr(crypto.subprocess,'Popen',recorded)
+    output=io.BytesIO()
+    with pytest.raises(RuntimeError,match='dump_corrupt' if changed=='dump' else 'backup_source_changed'):
+        encrypt_snapshot_stream(directory,output,'fixture',blob_root=source,age=age,expected_manifest_sha256=expected)
+    assert output.getvalue()==b'' and started==[]
+
+
+# spec: ANYM-631
+@pytest.mark.parametrize('kept',['intact','original_changed','dump_changed'])
+def test_retry_of_a_kept_capture_runs_the_capture_checks_and_opens_each_original_twice(tmp_path,monkeypatch,kept):
+    from messaging_service import backup_worker as worker
+    directory,source,manifest,_=reference_fixture(tmp_path)
+    work=tmp_path/'work';work.mkdir(mode=0o700);directory.rename(work/'snapshot')
+    (work/'snapshot/manifest.json').write_text(json.dumps({**manifest,'captured_at':'2026-10-14T00:00:00+00:00'}))
+    original=source/manifest['blobs'][0]['digest']
+    if kept=='original_changed':original.write_bytes(b'Y'*original.stat().st_size)
+    if kept=='dump_changed':(work/'snapshot/database.dump').write_bytes(b'UNIT_NOT_A_DATABASX')
+    copying_age(tmp_path/'bin');monkeypatch.setenv('PATH',str(tmp_path/'bin')+os.pathsep+os.environ['PATH'])
+    dsn=tmp_path/'dsn';dsn.write_text('host=db port=5432 user=owner password=synthetic dbname=synthetic')
+    recovery=tmp_path/'recovery.json';worker.write_json(recovery,{'accounts':[],'sources':[]})
+    recipient=tmp_path/'recipient';recipient.write_text('fixture')
+    cfg={'id':ID,'dsn_file':str(dsn),'files_directory':str(source),'recovery_config_file':str(recovery),
+         'recipient_file':str(recipient),'work_directory':str(work),'mode':'stream_v2'}
+    class SyntheticStore:
+        def __init__(self,dsn,files,url):self.files=files
+        def close(self):pass
+    fences=[]
+    monkeypatch.setattr(worker,'Store',SyntheticStore)
+    monkeypatch.setattr(worker,'validate_reference_fence',lambda store,manifest,token:fences.append(token))
+    monkeypatch.setattr(worker,'create_snapshot',lambda *args,**kwargs:pytest.fail('a kept capture is reused'))
+    opened=counting_opens(monkeypatch,source);outcome={}
+    def run():
+        try:outcome['result']=worker.run(cfg)
+        except BaseException as exc:outcome['error']=exc
+    thread=threading.Thread(target=run);thread.start()
+    deadline=time.monotonic()+30
+    while thread.is_alive() and not (work/'stream.json').exists() and time.monotonic()<deadline:time.sleep(.01)
+    if kept!='intact':
+        thread.join(30)
+        assert isinstance(outcome['error'],RuntimeError)
+        assert str(outcome['error'])==('blob_corrupt' if kept=='original_changed' else 'dump_corrupt')
+        assert not (work/'stream.json').exists() and fences==[ID]
+        return
+    worker.write_json(work/'stream-start.json',{'action':'start'})
+    with (work/'ciphertext.fifo').open('rb') as fifo:ciphertext=fifo.read()
+    thread.join(30)
+    assert outcome['result']['status']=='encrypted' and outcome['result']['bytes']==len(ciphertext)
+    assert fences==[ID] and dict(opened)=={original.name:2}

@@ -24,9 +24,12 @@ is empty. It is an operator workspace, **not a completed/restorable backup**.
 Normal `verify_bundle` rejects such a workspace; its explicit `blob_root` option
 is used only by the operator streaming code.
 
-Originals are read from the immutable, read-only CAS. Every referenced digest
-and size is verified, then each source is hashed again while normalized USTAR
-reads it. The manifest itself and database dump are also checked during reads.
+Originals are read from the immutable, read-only CAS. Capture verifies every
+referenced digest and size (a retry of a kept capture verifies them again); the
+wire bound and the pre-stream check use sizes only, and each source is hashed
+again while normalized USTAR reads it, so the producer reads each original twice
+(ANYM-631). A changed original fails the run before the terminal frame. The
+manifest and database dump are checked before the first byte and during reads.
 No source original is linked, copied, deleted or modified. With schema33 and
 later, capture first opens a durable database lifecycle fence. Both staged and
 reference capture retain it throughout encryption, delivery and retries. The
