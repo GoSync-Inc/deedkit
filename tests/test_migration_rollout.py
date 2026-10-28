@@ -800,3 +800,118 @@ def test_a_quoted_serial_type_is_manual_like_an_unquoted_one():
         assert rollout.classify(text) == 'manual'
         assert rollout.unattended_class(text, set()) == 'manual'
     assert rollout.classify(EXPAND + 'CREATE TABLE synthetic_owner (id "text");\n') == 'expand'
+
+
+# COMMENT ON forms outside a table of the archive or one the file creates (ANYM-619, as calendar's copy, ANYM-586).
+COMMENT_OUTSIDE = {
+    'schema': "COMMENT ON SCHEMA public IS 'synthetic';",
+    'role': "COMMENT ON ROLE messaging_gateway IS 'synthetic';",
+    'function': "COMMENT ON FUNCTION public.synthetic_one() IS 'synthetic';",
+    'other-schema-table': "COMMENT ON TABLE fcs.events IS 'synthetic';",
+    'other-schema-column': "COMMENT ON COLUMN fcs.events.title IS 'synthetic';",
+    'unknown-table': "COMMENT ON TABLE synthetic_absent IS 'synthetic';",
+    'unknown-column': "COMMENT ON COLUMN synthetic_absent.body IS 'synthetic';",
+    'index': "COMMENT ON INDEX messages_pkey IS 'synthetic';",
+    'constraint': "COMMENT ON CONSTRAINT synthetic_existing_kind_check ON synthetic_existing IS 'synthetic';",
+    # Astra r1: column id of table public in schema messages, and the quoted form of the same.
+    'schema-named-like-a-table': "COMMENT ON COLUMN messages.public.id IS 'synthetic';",
+    'quoted-schema-named-like-a-table': 'COMMENT ON COLUMN "messages"."public"."id" IS \'synthetic\';',
+    'public-qualified-three-parts': "COMMENT ON COLUMN public.messages.public.id IS 'synthetic';",
+}
+
+
+# spec: ANYM-619
+@pytest.mark.parametrize('form', COMMENT_OUTSIDE)
+def test_comment_on_anything_but_a_known_table_or_its_column_is_manual(form):
+    text = EXPAND + COMMENT_OUTSIDE[form] + '\n'
+    assert rollout.classify(text, EXISTING) == 'manual'
+    assert rollout.unattended_class(text, EXISTING) == 'manual'
+
+
+# spec: ANYM-619
+def test_comment_on_a_known_or_created_table_and_its_column_is_expand():
+    created = "CREATE TABLE synthetic_notes (id text PRIMARY KEY, note text);\n"
+    for text in ("COMMENT ON TABLE messages IS 'synthetic';\n", "COMMENT ON COLUMN public.messages.body IS 'x';\n",
+                 created + "COMMENT ON TABLE synthetic_notes IS 'synthetic';\n",
+                 created + "COMMENT ON COLUMN synthetic_notes.note IS E'synthetic';\n"):
+        assert rollout.classify(EXPAND + text, EXISTING) == rollout.classify(EXPAND + text) == 'expand'
+        assert rollout.unattended_class(EXPAND + text, EXISTING) == 'expand'
+    # A COMMENT before the CREATE TABLE names a table that does not exist yet.
+    later = "COMMENT ON TABLE synthetic_notes IS 'synthetic';\n" + created
+    assert rollout.classify(EXPAND + later, EXISTING) == 'manual'
+    assert rollout.classify(EXPAND + "COMMENT ON COLUMN messages IS 'x';\n", EXISTING) == 'manual'
+    # A table the range creates under a foreign schema's name is no way into that schema (Astra r1).
+    fcs = "CREATE TABLE fcs (id text);\nCOMMENT ON COLUMN fcs.public.id IS 'synthetic';\n"
+    assert rollout.classify(EXPAND + fcs, EXISTING) == rollout.classify(EXPAND + fcs) == 'manual'
+    assert rollout.classify(EXPAND + 'CREATE TABLE fcs (id text);\nCOMMENT ON COLUMN "fcs"."id" IS \'x\';\n',
+                            EXISTING) == 'expand'
+
+
+# spec: ANYM-619
+@pytest.mark.parametrize(('reference', 'verdict'), [
+    ('messages(id)', 'expand'), ('public.messages(id)', 'expand'), ('synthetic_parents(id)', 'expand'),
+    ('synthetic_notes(id)', 'expand'), ('fcs.events(id)', 'manual'), ('synthetic_absent(id)', 'manual'),
+    ('audit_log', 'expand'), ('synthetic_later(id)', 'manual'),
+], ids=['inventory', 'public-inventory', 'created', 'self', 'other-schema', 'unknown', 'no-columns', 'created-later'])
+def test_a_reference_is_expand_only_to_an_inventory_or_created_table(reference, verdict):
+    parents = 'CREATE TABLE synthetic_parents (id text PRIMARY KEY);\n'
+    later = 'CREATE TABLE synthetic_later (id text PRIMARY KEY);\n'
+    column = f'CREATE TABLE synthetic_notes (id text PRIMARY KEY, parent text REFERENCES {reference} ON DELETE CASCADE);\n'
+    table = (f'CREATE TABLE synthetic_notes (id text PRIMARY KEY, parent text,\n'
+             f' CONSTRAINT synthetic_notes_parent FOREIGN KEY (parent) REFERENCES {reference} DEFERRABLE);\n')
+    for text in (parents + column + later, parents + table + later):
+        assert rollout.classify(EXPAND + text, EXISTING) == verdict
+        assert rollout.unattended_class(EXPAND + text, EXISTING) == verdict
+
+
+# spec: ANYM-619
+def test_without_an_inventory_an_unqualified_target_stays_preliminary_and_other_refusals_stay():
+    # Admission (scripts/production.py CLASSIFY and UNATTENDED) passes no inventory; migrate-expand decides.
+    for text in ("CREATE TABLE synthetic_notes (id text REFERENCES synthetic_absent(id));\n",
+                 "COMMENT ON TABLE synthetic_absent IS 'synthetic';\n",
+                 "COMMENT ON COLUMN synthetic_absent.body IS 'synthetic';\n"):
+        assert rollout.rollout_class(EXPAND + text) == rollout.unattended_class(EXPAND + text) == 'expand'
+        assert rollout.unattended_class(EXPAND + text, EXISTING) == 'manual'
+    for form in ('schema', 'role', 'function', 'other-schema-table', 'other-schema-column', 'index', 'constraint'):
+        assert rollout.rollout_class(EXPAND + COMMENT_OUTSIDE[form]) == 'manual'
+    assert rollout.rollout_class(EXPAND + 'CREATE TABLE synthetic_notes (id text REFERENCES fcs.events(id));\n') == 'manual'
+
+
+# spec: ANYM-619
+def test_the_admission_classifiers_of_production_keep_the_preliminary_rule():
+    from scripts import production
+    source = Path(rollout.__file__).read_text()
+    texts = [EXPAND + 'CREATE TABLE synthetic_parents (id text PRIMARY KEY);\n',
+             EXPAND + 'CREATE TABLE synthetic_notes (id text REFERENCES synthetic_parents(id));\n'
+                      "COMMENT ON COLUMN synthetic_notes.id IS 'synthetic';\n",
+             EXPAND + "COMMENT ON SCHEMA public IS 'synthetic';\n"]
+    payload = {'source': source, 'texts': texts, 'roles': []}
+    assert production.classifier_child(production.CLASSIFY, payload) == ['expand', 'expand', 'manual']
+    found = production.classifier_child(production.UNATTENDED, payload)
+    assert found['files'] == ['expand', 'expand', 'manual']
+    assert found['tables'] == ['synthetic_notes', 'synthetic_parents']
+
+
+# The statement shapes of 054 (#390, ANYM-557) and 055 (#393, ANYM-535), both declared manual.
+SHAPE_054 = ('ALTER TABLE message_conflicts ADD COLUMN reason text;\n'
+             'ALTER TABLE message_conflicts ADD COLUMN reason_version smallint;\n')
+SHAPE_055 = ("SET LOCAL lock_timeout='2s';\nCREATE TABLE source_health_journal (\n"
+             " account text PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,\n"
+             " status text NOT NULL CHECK(status IN ('connected','disconnected','auth_required','stale')),\n"
+             " observed_at timestamptz NOT NULL DEFAULT now()\n);\n")
+
+
+# spec: ANYM-619
+def test_the_pending_054_and_055_shapes_classify_as_before():
+    inventory = {'message_conflicts', 'accounts'}
+    for shape in (SHAPE_054, SHAPE_055):
+        assert rollout.classify(EXPAND + shape, inventory) == rollout.classify(EXPAND + shape) == 'expand'
+        assert rollout.rollout_class('-- rollout: manual\n' + shape, inventory) == 'manual'
+
+
+# spec: ANYM-619
+def test_every_merged_migration_keeps_its_class_without_an_inventory():
+    # The admission class of every applied file, as before ANYM-619: none declares an expand that narrows.
+    for version, path in sorted(MIGRATIONS.items()):
+        text = source(path)
+        assert rollout.rollout_class(text) == (rollout.header(text) or 'no header'), path.name

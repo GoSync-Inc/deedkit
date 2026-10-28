@@ -356,3 +356,37 @@ def test_the_session_carries_the_deploy_name_over_one_the_dsn_names(db, tmp_path
         assert cli_module.main() == 0
     assert seen == ['deedkit-migrate-synthetic'] * 2
 
+
+
+# spec: ANYM-619
+@pytest.mark.parametrize('migration', [
+    '-- rollout: expand\nCREATE TABLE synthetic_notes (id text REFERENCES synthetic_absent(id));\n',
+    "-- rollout: expand\nCOMMENT ON SCHEMA public IS 'synthetic';\n",
+    "-- rollout: expand\nCOMMENT ON TABLE synthetic_seq IS 'synthetic';\n",
+], ids=['unknown-reference', 'comment-on-schema', 'comment-on-a-sequence'])
+def test_a_comment_or_reference_outside_the_archive_tables_applies_nothing(db, tmp_path, migration):
+    _, dsn = db
+    with psycopg.connect(dsn) as c: c.execute('CREATE SEQUENCE synthetic_seq')
+    root = package(tmp_path, migration)
+    plan = write_plan(tmp_path, plan_for(root, RUNTIME_SCHEMA, NEXT))
+    before = acls(dsn)
+    assert cli(dsn, tmp_path, '--plan', plan, root=root)[:2] == (1, {'error': 'not_unattended'})
+    assert ledger(dsn) == (RUNTIME_SCHEMA, 0, 0) and acls(dsn) == before
+    with psycopg.connect(dsn) as c:
+        assert c.execute("SELECT obj_description('public'::regnamespace, 'pg_namespace')").fetchone()[0] != 'synthetic'
+
+
+# spec: ANYM-619
+def test_a_reference_and_comment_on_a_table_an_earlier_file_of_the_range_creates_apply(db, tmp_path):
+    _, dsn = db
+    root = package(tmp_path, '-- rollout: expand\nCREATE TABLE synthetic_parents (id text PRIMARY KEY);\n')
+    root.joinpath('migrations', f'{NEXT + 1:03d}_synthetic.sql').write_text(
+        '-- rollout: expand\nCREATE TABLE synthetic_notes (id text PRIMARY KEY,\n'
+        ' parent text REFERENCES synthetic_parents(id), message text REFERENCES messages(id));\n'
+        "COMMENT ON TABLE synthetic_parents IS 'synthetic';\nCOMMENT ON COLUMN synthetic_notes.parent IS 'synthetic';\n")
+    plan = write_plan(tmp_path, plan_for(root, RUNTIME_SCHEMA, NEXT + 1))
+    assert cli(dsn, tmp_path, '--plan', plan, root=root)[:2] == (0, {'schema_version': NEXT + 1})
+    with psycopg.connect(dsn) as c:
+        assert c.execute("SELECT obj_description('synthetic_parents'::regclass, 'pg_class')").fetchone()[0] == 'synthetic'
+        assert c.execute("SELECT confrelid::regclass::text FROM pg_constraint WHERE conrelid='synthetic_notes'::regclass "
+                         "AND contype='f' ORDER BY 1").fetchall() == [('messages',), ('synthetic_parents',)]
