@@ -179,6 +179,13 @@ def encrypt_snapshot(directory,output,recipient,age='age',*,consume_staged_blobs
         temporary.unlink(missing_ok=True)
 
 
+class ExtractedBundle(type(Path())):
+    """The published bundle path plus {member: (sha256, bytes)} hashed while extracting it (ANYM-630).
+    Paths joined to it are plain paths: only the bundle root carries the digests."""
+    extracted=None
+    def with_segments(self,*segments):return Path(*segments)
+
+
 def decrypt_snapshot(encrypted,identity,destination,age='age',max_bytes=20*1024**3):
     return _decrypt_snapshot([age,'-d','-i',str(identity),str(encrypted)],destination,max_bytes)
 
@@ -209,7 +216,8 @@ def _decrypt_snapshot(command,destination,max_bytes,*,source=None):
                         try:process.stdin.close()
                         except BrokenPipeError:pass
                 thread=threading.Thread(target=feed,name='backup-decrypt-input',daemon=True);thread.start()
-            total=0; seen=set(); profile=None
+            # Digests of the bytes this process wrote, kept in memory only: the bundle can never supply them.
+            total=0; seen=set(); profile=None; extracted={}
             from .backup_calendar import valid_calendar_member
             with tarfile.open(fileobj=process.stdout,mode='r|') as archive:
                 for member in archive:
@@ -224,9 +232,11 @@ def _decrypt_snapshot(command,destination,max_bytes,*,source=None):
                     seen.add(name); target=temporary/name
                     for parent in reversed(Path(name).parents[:-1]):(temporary/parent).mkdir(mode=0o700,exist_ok=True)
                     member_source=archive.extractfile(member)
-                    fd=os.open(target,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+                    fd=os.open(target,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600); sha=hashlib.sha256(); size=0
                     with member_source,os.fdopen(fd,'wb') as out:
-                        shutil.copyfileobj(member_source,out,1024**2); out.flush(); os.fsync(out.fileno())
+                        while chunk:=member_source.read(1024**2):sha.update(chunk); out.write(chunk); size+=len(chunk)
+                        out.flush(); os.fsync(out.fileno())
+                    extracted[name]=(sha.hexdigest(),size)
                     if name=='manifest.json' and len(seen)==1:
                         try:profile=snapshot_profile(temporary)
                         except ValueError:raise ValueError('invalid_backup_member') from None
@@ -255,11 +265,12 @@ def _decrypt_snapshot(command,destination,max_bytes,*,source=None):
         manifest=read_manifest(temporary)
         if manifest.get('format')==2:(temporary/'recovery').mkdir(mode=0o700,exist_ok=True)
         (temporary/'files').mkdir(mode=0o700,exist_ok=True)
-        verify_bundle(temporary)
+        verify_bundle(temporary,extracted=extracted,read_dump=False)
         if (temporary/'recovery').exists():fsync_dir(temporary/'recovery')
         fsync_dir(temporary/'files'); fsync_dir(temporary)
         os.rename(temporary,destination); fsync_dir(destination.parent)
-        return destination
+        published=ExtractedBundle(destination); published.extracted=extracted
+        return published
     finally:
         if process is not None and process.poll() is None:
             process.terminate(); process.wait(timeout=10)

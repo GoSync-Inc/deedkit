@@ -242,7 +242,9 @@ def run(config, source=None):
                                 dsn=make_conninfo(host='restore-postgres',port='5432',user='restore_owner',dbname=DATABASE,
                                                   password=config['database_password'],connect_timeout='10'))
         return write_result(work,result)
-    manifest=stage('restore_snapshot_failed',lambda:backup.verify_bundle(restored))
+    # Originals were hashed while extracting; the dump is read back here, before pg_restore (ANYM-630).
+    extracted=getattr(restored,'extracted',None); digests={} if extracted is None else {'extracted':extracted}
+    manifest=stage('restore_snapshot_failed',lambda:backup.verify_bundle(restored,**digests))
     # The fresh isolated cluster has only restore_owner: the roles a policy names come first, from RESTORE_ROLES.
     stage('restore_database_failed',lambda:subprocess.run(['psql','-X','-q','-v','ON_ERROR_STOP=1','-c',restore_roles_sql()],
                        env=env,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True))
@@ -260,7 +262,7 @@ def run(config, source=None):
     with ConnectionPool(dsn,min_size=1,max_size=1,kwargs={'row_factory':dict_row},timeout=30) as pool:
         store=SimpleNamespace(pool=pool,files=restored/'files')
         actual_version=stage('restore_snapshot_failed',lambda:restored_schema_version(store,manifest['schema_version']))
-        stage('restore_snapshot_failed',lambda:backup.verify_snapshot(store,restored))
+        stage('restore_snapshot_failed',lambda:backup.verify_snapshot(store,restored,**digests))
         stage('restore_quarantine_failed',lambda:backup.quarantine_restore(store))
         stage('restore_quarantine_failed',lambda:assert_quarantined(store,actual_version))
     result={'v':1,'status':'verified','schema_version':actual_version,'manifest_sha256':manifest_sha,
