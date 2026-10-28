@@ -1,0 +1,15 @@
+{
+  "v": 1,
+  "profile": "calendar",
+  "receiver_config_file": "/etc/deedkit-calendar-backup-r2/operator.json",
+  "directory": "/var/lib/deedkit-calendar-backup-r2/verification",
+  "identity_file": "/etc/deedkit-calendar-backup-r2/restore/identity.agekey",
+  "protected_file": "/etc/deedkit-calendar-backup-r2/control/protected.json",
+  "helper_image": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "helper_revision": "1111111111111111111111111111111111111111",
+  "postgres_image": "postgres:18-bookworm@sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c",
+  "max_plaintext_bytes": 42949672960,
+  "postgres_headroom_bytes": 8589934592,
+  "reserve_bytes": 2147483648,
+  "timeout_seconds": 21600
+}
