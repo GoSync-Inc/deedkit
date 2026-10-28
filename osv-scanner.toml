@@ -303,6 +303,16 @@ ignoreUntil = 2026-11-11T00:00:00Z
 reason = "github.com/go-jose/go-jose/v4 4.1.4 in tools/attest-verify/go.mod: attest-verify Go dependency; govulncheck reports x/net and grpc as reachable. A rebuild changes the verifier SHA-256 pinned in scripts/production.py, backup_r2_follow.py and on the host; card: ANYM-618 attest-verify rebuild (go1.26.10, x/net, grpc, go-jose)"
 
 [[IgnoredVulns]]
+id = "GHSA-4w3g-jfj2-cw2q"
+ignoreUntil = 2026-11-11T00:00:00Z
+reason = "github.com/go-jose/go-jose/v4 4.1.4 in tools/attest-verify/go.mod (fixed in 4.1.5, published after #399; govulncheck v1.8.0 has no Go ID for it yet, the earlier go-jose advisory is not called): a rebuild changes the verifier SHA-256 pinned in scripts/production.py, backup_r2_follow.py and on the host; card: ANYM-618 attest-verify rebuild (go1.26.10, x/net, grpc, go-jose)"
+
+[[IgnoredVulns]]
+id = "GHSA-vvm8-gf78-28g4"
+ignoreUntil = 2026-11-11T00:00:00Z
+reason = "github.com/go-jose/go-jose/v4 4.1.4 in tools/attest-verify/go.mod (fixed in 4.1.5, published after #399; govulncheck v1.8.0 has no Go ID for it yet, the earlier go-jose advisory is not called): a rebuild changes the verifier SHA-256 pinned in scripts/production.py, backup_r2_follow.py and on the host; card: ANYM-618 attest-verify rebuild (go1.26.10, x/net, grpc, go-jose)"
+
+[[IgnoredVulns]]
 id = "GO-2026-5932"
 ignoreUntil = 2026-11-11T00:00:00Z
 reason = "golang.org/x/crypto 0.54.0 in tools/attest-verify/go.mod (no fixed version published): attest-verify Go dependency; govulncheck reports x/net and grpc as reachable. A rebuild changes the verifier SHA-256 pinned in scripts/production.py, backup_r2_follow.py and on the host; card: ANYM-618 attest-verify rebuild (go1.26.10, x/net, grpc, go-jose)"
