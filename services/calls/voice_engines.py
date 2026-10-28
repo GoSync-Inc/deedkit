@@ -30,10 +30,11 @@ def capabilities(credentials,provider):
 
 
 def unfit(name,language,credentials):
-    """Why an engine cannot speak this brief, or None. Every agent brief needs the task tools and success_fields."""
+    """Why an engine cannot speak this brief, or None. Every agent brief needs the task tools and success_fields.
+    language None: no brief yet (calls readiness, ANYM-595); the language is checked when the brief is prepared."""
     e=ENGINES[name]
     if not credentials.get(e['key']):return 'key_not_configured'
-    if language not in e['languages']:return 'language_unsupported'
+    if language is not None and language not in e['languages']:return 'language_unsupported'
     if not e['tool_calls']:return 'tool_calls_unsupported'
     if not e['success_fields']:return 'success_fields_unsupported'
     return None

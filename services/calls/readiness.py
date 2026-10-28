@@ -2,6 +2,7 @@
 from core import ServiceError
 from outbound import TwilioCalls
 import destination_policy as policy
+import voice_engines
 
 
 def calling_readiness(principal, outbound, credentials, browser_enabled, provider='gemini_live'):
@@ -20,7 +21,8 @@ def calling_readiness(principal, outbound, credentials, browser_enabled, provide
             elif not credentials.get(key):
                 blockers.append('model_key_required')
             channels[channel] = {'configuration_ready':not blockers, 'blockers':blockers,
-                                 'model_providers':['gemini', 'xai'], 'live_call_verified':False}
+                                 'model_providers':['gemini', 'xai'], 'live_call_verified':False,
+                                 **per_engine(blockers, credentials, provider)}
             continue
         if 'calls:dial' not in principal.scopes:
             blockers.append('calls:dial_required')
@@ -37,17 +39,33 @@ def calling_readiness(principal, outbound, credentials, browser_enabled, provide
             blockers.append('call_voice_invalid')
         elif not credentials.get(key):
             blockers.append('model_key_required')
-        provider = outbound.providers.get('telegram' if channel == 'telegram' else 'twilio')
-        if provider is None:
+        connection = outbound.providers.get('telegram' if channel == 'telegram' else 'twilio')
+        if connection is None:
             blockers.append('provider_not_configured')
-        elif isinstance(provider, TwilioCalls):
+        elif isinstance(connection, TwilioCalls):
             try:
-                provider.configuration({'channel':channel, 'destination':''})
+                connection.configuration({'channel':channel, 'destination':''})
             except ServiceError as error:
                 blockers.append(error.code)
         channels[channel] = {'configuration_ready':not blockers, 'blockers':blockers,
             'recipient_policy':policy.recipient_policy(channel), 'daily_calls_remaining':remaining,
             **({'allowed_recipient_count':len(recipients)} if channel == 'sip' else {}), 'model_providers':supported,
-            'provider_connection':'not_probed', 'preflight_required':True, 'live_call_verified':False}
+            'provider_connection':'not_probed', 'preflight_required':True, 'live_call_verified':False,
+            **per_engine(blockers, credentials, provider)}
     return {'model_credentials':dict(credentials), 'channels':channels,
             'external_action_authorized':False}
+
+
+def per_engine(blockers, credentials, provider):
+    """Readiness for an explicit voice_engine and for auto (ANYM-595): the channel's engine-independent blockers plus
+    each engine's own reason; the owner's-engine blockers above judge only an omitted voice_engine."""
+    common = [b for b in blockers if b not in ('model_key_required', 'call_voice_invalid')]
+    reasons = {name:voice_engines.unfit(name, None, credentials) for name in voice_engines.ENGINES}
+    engines = {name:{'ready':not common and reason is None, 'blockers':[*common, *([reason] if reason else [])]}
+               for name,reason in reasons.items()}
+    # auto's order from voice_engines.choose: the owner's engine first, then the first fitting one.
+    owner = voice_engines.BY_DIALOG_ENGINE.get(provider)
+    order = [owner, *(n for n in voice_engines.ENGINES if n != owner)] if owner else list(voice_engines.ENGINES)
+    selects = next((name for name in order if reasons[name] is None), None)
+    return {'voice_engines':engines, 'ready_engines':[name for name,e in engines.items() if e['ready']],
+            'auto':{'ready':bool(selects) and engines[selects]['ready'], 'selects':selects}}
