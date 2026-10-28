@@ -790,3 +790,13 @@ def test_a_policy_may_use_a_column_a_later_add_column_gives_a_new_table():
     stated = policy.replace("(component='api')", "(state='api')")
     assert rollout.role_class(GATEWAY_BASE, GATEWAY_BASE + stated, created) == 'manual'
     assert rollout.role_class(GATEWAY_BASE, GATEWAY_BASE + stated, later) == 'additive'
+
+
+# spec: ANYM-596
+def test_a_quoted_serial_type_is_manual_like_an_unquoted_one():
+    # Sol r3: PostgreSQL reads "serial" as the pseudo-type too and creates a sequence beside the table.
+    for column in ('id serial', 'id "serial"', 'id "BIGSERIAL"'.lower()):
+        text = EXPAND + f'CREATE TABLE synthetic_owner ({column});\n'
+        assert rollout.classify(text) == 'manual'
+        assert rollout.unattended_class(text, set()) == 'manual'
+    assert rollout.classify(EXPAND + 'CREATE TABLE synthetic_owner (id "text");\n') == 'expand'

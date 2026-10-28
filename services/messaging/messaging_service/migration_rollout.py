@@ -177,7 +177,8 @@ def column_type(c):
     words = []
     while c.peek()[0] in ('word', 'ident') and not (c.peek()[0] == 'word' and c.peek()[1] in COLUMN_OPTIONS):
         words.append(c.next())
-    if not words or words[0] in (('word', name) for name in SERIAL): raise Manual('no type or a serial type')
+    # A quoted "serial" is still the serial pseudo-type, which creates a sequence (Sol r3, ANYM-596).
+    if not words or words[0][1] in SERIAL: raise Manual('no type or a serial type')
     if c.peek() == ('punct', '('):
         if any(item != ('punct', ',') and item[0] != 'number' for item in c.group()): raise Manual('type modifier')
     while c.peek() == ('punct', '['):

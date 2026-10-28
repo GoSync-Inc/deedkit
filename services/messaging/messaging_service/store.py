@@ -146,6 +146,12 @@ def migrate_expand(dsn, plan, *, root=None, before_commit=None):
                 c.execute(data.decode())
                 c.execute('INSERT INTO archive_migrations(version,sha256) VALUES(%s,%s)',(version,hashlib.sha256(data).hexdigest()))
                 c.execute("UPDATE probe_metadata SET value=%s WHERE name='schema_version'",(str(version),))
+            # Each claimed new table must now be an ordinary or partitioned table of `public`: a relation the batch
+            # made under that name some other way (a sequence, an index) made IF NOT EXISTS skip it (Sol r3).
+            if created and c.execute("SELECT count(*) AS n FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                    "WHERE n.nspname='public' AND c.relkind IN ('r','p') AND c.relname=ANY(%s)",(sorted(created),)
+                    ).fetchone()['n']!=len(created):
+                raise ExpandError('not_unattended')
             for old,new in appended.values():
                 if rollout.statements(new[len(old):]): c.execute(new[len(old):])
             if before_commit: before_commit(c)

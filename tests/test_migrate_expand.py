@@ -222,7 +222,16 @@ def test_an_expand_migration_and_its_role_grant_apply_together(db, tmp_path):
     ('-- rollout: expand\nCREATE TABLE pg_authid (id text);\n',
      {'gateway_role.sql': 'GRANT SELECT ON pg_authid TO messaging_gateway;\n'}, 'not_unattended'),
     (NOTE, {'gateway_role.sql': 'GRANT SELECT ON pg_authid TO messaging_gateway;\n'}, 'role_not_additive'),
-], ids=['drop', 'declared-manual', 'revoke', 'not-a-table', 'sequence-collision', 'catalog-collision', 'catalog'])
+    # Sol r3: a relation the batch itself makes under a "new" table's name: a serial's sequence (refused by the
+    # classifier), or a primary key's index (refused after the files ran, before any role text).
+    ('-- rollout: expand\nCREATE TABLE synthetic_owner (id "serial");\n'
+     'CREATE TABLE IF NOT EXISTS synthetic_owner_id_seq (id text);\n',
+     {'gateway_role.sql': 'GRANT UPDATE ON synthetic_owner_id_seq TO messaging_gateway;\n'}, 'not_unattended'),
+    ('-- rollout: expand\nCREATE TABLE synthetic_owner (id text PRIMARY KEY);\n'
+     'CREATE TABLE IF NOT EXISTS synthetic_owner_pkey (id text);\n',
+     {'gateway_role.sql': 'GRANT SELECT ON synthetic_owner_pkey TO messaging_gateway;\n'}, 'not_unattended'),
+], ids=['drop', 'declared-manual', 'revoke', 'not-a-table', 'sequence-collision', 'catalog-collision', 'catalog',
+        'serial-sequence', 'batch-index'])
 def test_anything_outside_the_unattended_language_applies_nothing(db, tmp_path, migration, roles, code):
     _, dsn = db
     with psycopg.connect(dsn) as c: c.execute('CREATE SEQUENCE synthetic_seq')
