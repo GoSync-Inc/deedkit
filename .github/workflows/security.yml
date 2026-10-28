@@ -1,5 +1,7 @@
 name: Security report
-# Report-only: every step continues on error, so findings never block merges.
+# Report-only, except osv-scanner: every other step continues on error. osv-scanner fails the run on any
+# advisory that osv-scanner.toml does not list with a reason, a card and an expiry. The workflow is not a
+# required check, but a red main push run stops wait-merge.sh --main.
 # Tools are pinned to exact releases and verified by SHA-256 before use.
 on:
   pull_request:
@@ -8,11 +10,13 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: security-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # A pull request cancels its own older run; each main push has its own group, so no main run is cancelled
+  # (a cancelled main push run reads as failed to wait-merge.sh --main).
+  group: security-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   report:
-    name: Security report (non-blocking)
+    name: Security report
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -73,31 +77,35 @@ jobs:
         id: gitleaks
         continue-on-error: true
         run: gitleaks git --redact --no-banner --verbose .
-      - name: osv-scanner (lockfiles)
+      - name: osv-scanner (lockfiles, blocking)
         id: osv
-        continue-on-error: true
         run: |
-          osv-scanner scan source --recursive \
+          osv-scanner scan source --recursive --config osv-scanner.toml \
             --lockfile requirements.txt:services/messaging/requirements.lock \
             --lockfile requirements.txt:services/messaging/requirements-enrichment.lock \
             --lockfile requirements.txt:services/messaging/requirements-telemetry.lock \
             --lockfile requirements.txt:services/messaging/requirements-test.lock \
             .
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        # This and the scanners below run after a failed osv-scanner too, so their reports are never lost.
+        if: ${{ !cancelled() }}
         continue-on-error: true
         with:
           go-version: '1.26.9'
           cache: false
       - name: govulncheck (native WhatsApp adapter)
         id: govulncheck
+        if: ${{ !cancelled() }}
         continue-on-error: true
         working-directory: whatsapp/whatsmeow
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        if: ${{ !cancelled() }}
         continue-on-error: true
         with: {version: '0.9.26', enable-cache: false}
       - name: ruff check (pinned in tools/dev)
         id: ruff
+        if: ${{ !cancelled() }}
         continue-on-error: true
         run: |
           uv sync --project tools/dev --locked
@@ -117,7 +125,7 @@ jobs:
             ruff=${{ steps.ruff.outcome }}
         run: |
           {
-            echo '### Security report (report-only)'
+            echo '### Security report'
             echo
             echo '| Tool | Outcome |'
             echo '| --- | --- |'
@@ -125,5 +133,5 @@ jobs:
               echo "| ${pair%%=*} | ${pair#*=} |"
             done
             echo
-            echo "A failure outcome means findings or a tool error; see the step log. Nothing here blocks merging."
+            echo "A failure outcome means findings or a tool error; see the step log. Only osv-scanner fails this run."
           } >> "$GITHUB_STEP_SUMMARY"
