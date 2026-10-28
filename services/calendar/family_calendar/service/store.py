@@ -2,6 +2,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import secrets
@@ -202,13 +203,16 @@ class Store:
 
     def expand_connection(self):
         """The only connection of migrate-expand (ANYM-586 K2): its budgets and search_path set at connect and read
-        back before anything runs."""
-        expected = dict(EXPAND_SETTINGS, search_path=self.schema + ",public")
+        back before anything runs. PGAPPNAME (deploy's container name) overrides an application name the DSN names,
+        so deploy finds this session by it (ANYM-586 K3)."""
+        name = os.environ.get("PGAPPNAME") or None
+        expected = dict(EXPAND_SETTINGS, search_path=self.schema + ",public", **({"application_name": name} if name else {}))
         try:
             conn = psycopg.connect(
                 self.dsn, row_factory=dict_row, prepare_threshold=None, connect_timeout=5,
                 options="-c lock_timeout=2000 -c statement_timeout=4000 -c transaction_timeout=4000 "
                         "-c search_path=" + self.schema + ",public -c client_min_messages=error -c timezone=UTC",
+                **({"application_name": name} if name else {}),
             )
         except psycopg.Error:
             raise CalendarError("database_unavailable") from None

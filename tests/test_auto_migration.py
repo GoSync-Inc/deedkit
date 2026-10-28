@@ -908,3 +908,529 @@ def test_the_recovery_catalog_holds_digests_never_a_catalog_value(tmp_path, monk
     written = (host.state / NEWEST / "migration-catalog.json").read_text()
     # A role setting, a default or a policy expression reaches the file only as a digest (Astra r2 F10).
     assert DSN_MARKER not in written and "postgresql://" not in written and "synthetic_note" in written
+
+
+# ANYM-586 K3: calendar on the same path, and a range touching both databases.
+
+CALENDAR_PACKAGE = p.CALENDAR_PACKAGE
+CALENDAR_ROLLOUT = ROLLOUT.parents[3] / "services/calendar/family_calendar/service/migration_rollout.py"
+CALENDAR_FILES = {"schema.sql": b"CREATE TABLE people (id text PRIMARY KEY, label text);\n",
+                  **{f"schema_v{n}.sql": f"-- synthetic calendar {n}\n".encode() for n in range(2, 6)}}
+CALENDAR_ROLE = b"GRANT SELECT ON people TO fcs_gateway, fcs_worker;\n"
+CALENDAR_TABLE = b"-- rollout: expand\nCREATE TABLE synthetic_marks (id text PRIMARY KEY, label text);\n"
+CALENDAR_GRANT = b"GRANT SELECT ON synthetic_marks TO fcs_gateway;\n"
+CALENDAR_STORE = ('self.pool = ConnectionPool(\n    dsn,\n    min_size=0,\n    kwargs={"row_factory": dict_row, '
+                  '"prepare_threshold": None, "connect_timeout": 10},\n)\n')
+CALENDAR_SHAPE = [json.dumps({"k": ["relation", "fcs.people"], "v": ["r"]})]
+CALENDAR_SHAPE_AFTER = CALENDAR_SHAPE + [json.dumps({"k": ["relation", "fcs.synthetic_marks"], "v": ["r"]})]
+DRIFT_MARKER = "missing fcs_gateway SELECT fcs.marker_drift_table"
+
+
+class CalendarHost(MigrationHost):
+    """MigrationHost plus calendar: BASE has calendar schema 1-5, roles.sql and K0's Store; the range adds
+    `calendar` files (name: bytes) and appends `calendar_roles` to roles.sql, besides any messaging `files`. The
+    calendar database and its containers are fakes on `calendar_run`; `events` records each calendar phase."""
+
+    def __init__(self, tmp_path, monkeypatch, calendar, *, files=None, calendar_roles=b"", calendar_modified=(),
+                 calendar_configured=True):
+        paths = [CALENDAR_PACKAGE + name for name in calendar] + list(calendar_modified)
+        if calendar_roles:
+            paths.append(p.CALENDAR_ROLES)
+        super().__init__(tmp_path, monkeypatch, files or {}, others=paths,
+                         modified=([p.CALENDAR_ROLES] if calendar_roles else []) + list(calendar_modified))
+        after = {**CALENDAR_FILES, **calendar}
+        for sha_, names in ((BASE, CALENDAR_FILES), (NEWER, after), (NEWEST, after)):
+            self.trees[sha_, CALENDAR_PACKAGE] = set(names) | {"roles.sql", "store.py", "migration_rollout.py"}
+            for name, data in names.items():
+                self.contents[f"{sha_}:{CALENDAR_PACKAGE}{name}"] = data
+            self.contents[f"{sha_}:{p.CALENDAR_ROLES}"] = CALENDAR_ROLE + (calendar_roles if sha_ != BASE else b"")
+            self.contents[f"{sha_}:{p.CALENDAR_CLASSIFIER}"] = CALENDAR_ROLLOUT.read_bytes()
+        self.contents[f"{BASE}:{p.CALENDAR_STORE}"] = CALENDAR_STORE.encode()
+        (tmp_path / "runtime.json").write_text(json.dumps({"dsn": f"postgresql://fcs_owner:{DSN_MARKER}@db/fc"}))
+        if calendar_configured:
+            self.settings.setdefault("migration", {})
+            self.settings["migration"].setdefault("databases", {})["calendar"] = {
+                "container": "deedkit-calendar-calendar-db-1", "owner": "fcs_owner", "database": "family_calendar"}
+            self.settings["migration"]["unattended_calendar"] = {
+                "network": "deedkit-calendar_calendar-backend", "runtime_file": str(tmp_path / "runtime.json")}
+        self.cal_version = 5
+        self.cal_applied = {str(n): sha(CALENDAR_FILES["schema.sql" if n == 1 else f"schema_v{n}.sql"])
+                            for n in range(1, 6)}
+        self.cal_pending = {name[8:-4]: sha(data) for name, data in calendar.items() if name.startswith("schema_v")}
+        self.cal_target = 5 + len(self.cal_pending)
+        self.cal_identity = ["7000000000000000002", "family_calendar", "16390"]
+        self.cal_shape, self.cal_shape_after = list(CALENDAR_SHAPE), list(CALENDAR_SHAPE_AFTER)
+        self.cal_rehearsal = {"took_ms": 7, "difference": p.catalog_difference(
+            p.digested(p.catalog_map(CALENDAR_SHAPE)), p.digested(p.catalog_map(CALENDAR_SHAPE_AFTER)))}
+        self.cal_answer, self.roles_failure, self.copy_failures, self.crash_at = "applied", None, {}, None
+        self.containers = []
+        monkeypatch.setattr(p, "calendar_run", self.calendar_run)
+        monkeypatch.setattr(p, "expand_run", self.counted_expand_run)
+
+    def live_lines(self, source, step, text):
+        if not step.startswith("calendar "):
+            return super().live_lines(source, step, text)
+        assert source["container"] == "deedkit-calendar-calendar-db-1"
+        self.events.append("live " + step)
+        if step == "calendar ledger":
+            return [json.dumps({"schema_version": self.cal_version, "applied": self.cal_applied})]
+        if step == "calendar identity":
+            return [json.dumps(self.cal_identity)]
+        return list(self.cal_shape)
+
+    @contextmanager
+    def database_copy(self, settings, name, sha_, *, keep=False, catalog=None):
+        assert (keep, catalog) == (True, p.CATALOG) and name in ("messaging", "calendar")
+        self.events.append("copy" if name == "messaging" else "calendar copy")
+        if name in self.copy_failures:
+            raise p.CopyFailed("copy586", self.copy_failures[name])
+        if name == "messaging":
+            shape = self.shape
+        else:
+            shape = self.cal_shape
+        yield {"id": "copy586-" + name, "catalog": list(shape), "database": name,
+               "catalog_sha256": hashlib.sha256("\n".join(shape).encode()).hexdigest()}
+
+    def rehearse(self, copied, plan, image, limit):
+        if plan["database"] != "calendar":
+            return super().rehearse(copied, plan, image, limit)
+        assert image == "sha256:" + "6" * 64
+        self.events.append("calendar rehearse")
+        return self.cal_rehearsal
+
+    def build_image(self, source, sha_, target, **kwargs):
+        assert target in ("runtime", "calendar")
+        return "sha256:" + ("4" if target == "runtime" else "6") * 64
+
+    def crash(self, label):
+        self.containers.append(label)
+        if self.crash_at == len(self.containers):
+            raise Died()
+
+    def counted_expand_run(self, name, image, network, dsn_file, plan_file, *, label=None, status=False):
+        self.crash("status" if status else "migrate")
+        return self.expand_run(name, image, network, dsn_file, plan_file, label=label, status=status)
+
+    def calendar_run(self, name, image, network, runtime_file, arguments, *, label=None, mounts=(), entrypoint=None):
+        assert image == "sha256:" + "6" * 64 and network == "deedkit-calendar_calendar-backend"
+        assert runtime_file == self.settings["migration"]["unattended_calendar"]["runtime_file"]
+        if entrypoint:
+            self.crash("calendar identity")
+            return 0, self.cal_identity
+        if arguments == ["migrate-expand", "--status"]:
+            self.crash("calendar status")
+            self.events.append("calendar status")
+            return 0, {"schema_version": self.cal_version}
+        if arguments[:1] == ["migrate-expand"]:
+            self.crash("calendar migrate")
+            self.events.append("calendar migrate")
+            plan = json.loads(Path(mounts[1].split(",")[1][4:]).read_text())
+            assert name == "deedkit-calendar-migrate-" + NEWEST[:12] and plan["identity"] == self.cal_identity
+            assert plan["base"] == 5 and plan["target"] == self.cal_target
+            if self.cal_answer == "applied":
+                self.cal_version, self.cal_shape = self.cal_target, list(self.cal_shape_after)
+                self.cal_applied = {**self.cal_applied, **self.cal_pending}
+                return 0, {"schema_version": self.cal_target}
+            return 1, {"error": "lock_timeout"}
+        label_ = "calendar check" if arguments == ["db-roles", "--check"] else "calendar roles"
+        self.crash(label_)
+        self.events.append(label_)
+        if self.roles_failure == label_:
+            return 1, ({"error": "db_roles_drift", "schema_version": self.cal_target, "drift": [DRIFT_MARKER]}
+                       if label_ == "calendar check" else {"error": "failed"})
+        return 0, ({"db_roles_check": "ok", "schema_version": self.cal_version} if label_ == "calendar check"
+                   else {"db_roles": ["gateway", "worker"], "provider_secrets_in_gateway": False})
+
+    def plans(self):
+        return p.migration_plans(self.settings, self.state, BASE, NEWEST,
+                                 [path for path in self.changes[NEWER] if p.SQL_INVENTORY.search(path)])
+
+
+def calendar_events(host):
+    return [event for event in host.events if event != "calls"]
+
+
+# spec: ANYM-586
+def test_a_calendar_range_runs_every_phase_then_db_roles_and_its_check_and_records_its_phase(tmp_path, monkeypatch):
+    host = CalendarHost(tmp_path, monkeypatch, {"schema_v6.sql": CALENDAR_TABLE}, calendar_roles=CALENDAR_GRANT)
+    outcome = host.deploy()
+    assert outcome["status"] == "deployed" and host.paused() is None
+    assert calendar_events(host) == ["live calendar ledger", "calendar copy", "calendar rehearse", "live calendar ledger",
+                                     "live calendar shape", "live calendar identity", "calendar migrate",
+                                     "calendar status", "live calendar ledger", "live calendar effect", "calendar roles",
+                                     "calendar check"]
+    assert [name for name, _ in host.steps] == ["prepare", "apply", "seamless prepare", "seamless promote"]
+    receipt = host.migration()
+    assert receipt["status"] == "migrated" and receipt["database"] == "calendar"
+    assert (receipt["base"], receipt["target"], receipt["files"], receipt["tables"]) == (5, 6, ["schema_v6.sql"],
+                                                                                        ["synthetic_marks"])
+    assert receipt["phases"] == {"calendar": {"status": "migrated", "copy": "copy586-calendar", "rehearsal_ms": 7,
+                                              "roles": "ok"}}
+    plan = json.loads((host.state / NEWEST / "calendar-migrate-plan.json").read_text())
+    assert plan == {"base": 5, "target": 6, "roles": {"bytes": len(CALENDAR_ROLE), "sha256": sha(CALENDAR_ROLE)},
+                    "identity": host.cal_identity}
+    assert (host.state / NEWEST / "calendar-migration-catalog.json").exists()
+
+
+# spec: ANYM-586
+def test_the_calendar_plan_holds_the_bases_ledger_from_version_one_and_the_ranges_new_tables(tmp_path, monkeypatch):
+    host = CalendarHost(tmp_path, monkeypatch, {"schema_v6.sql": CALENDAR_TABLE}, calendar_roles=CALENDAR_GRANT)
+    [plan] = host.plans()
+    assert plan["ledger"] == host.cal_applied and sorted(plan["ledger"]) == ["1", "2", "3", "4", "5"]
+    assert plan["pending"] == {"6": sha(CALENDAR_TABLE)} and plan["tables"] == ["synthetic_marks"]
+    assert plan["roles_changed"] == ["roles.sql"] and (plan["database"], plan["base"], plan["target"]) == ("calendar", 5, 6)
+
+
+# spec: ANYM-586
+def test_a_range_touching_both_databases_rehearses_both_then_applies_calendar_then_messaging(tmp_path, monkeypatch):
+    host = CalendarHost(tmp_path, monkeypatch, {"schema_v6.sql": CALENDAR_TABLE}, calendar_roles=CALENDAR_GRANT,
+                        files={"051_synthetic_note.sql": NOTE})
+    assert [plan["database"] for plan in host.plans()] == ["calendar", "messaging"]
+    outcome = host.deploy()
+    assert outcome["status"] == "deployed"
+    events = calendar_events(host)
+    order = ["calendar copy", "calendar rehearse", "copy", "rehearse", "calendar migrate", "calendar roles",
+             "calendar check", "migrate"]
+    assert [events.index(name) for name in order] == sorted(events.index(name) for name in order)
+    receipt = host.migration()
+    assert receipt["status"] == "migrated" and receipt["database"] == "messaging" and receipt["copy"] == "copy586-messaging"
+    assert receipt["phases"]["calendar"]["status"] == receipt["phases"]["messaging"]["status"] == "migrated"
+    assert (host.state / NEWEST / "migrate-plan.json").exists() and (host.state / NEWEST / "calendar-migrate-plan.json").exists()
+
+
+# spec: ANYM-586
+def test_a_dry_run_names_both_migrations_in_their_order(tmp_path, monkeypatch):
+    host = CalendarHost(tmp_path, monkeypatch, {"schema_v6.sql": CALENDAR_TABLE}, files={"051_synthetic_note.sql": NOTE})
+    outcome = host.deploy(dry_run=True)
+    assert outcome["steps"][:2] == [
+        "migrate calendar schema 5 to 6 after a verified copy and its rehearsal, then db-roles and db-roles --check",
+        "migrate messaging schema 50 to 51 after a verified copy and its rehearsal"]
+    assert host.events == [] and host.migration() is None
+
+
+# spec: ANYM-586
+@pytest.mark.parametrize("failing", ["calendar", "messaging"])
+def test_a_copy_failure_of_either_database_applies_neither_and_is_not_retried(tmp_path, monkeypatch, failing):
+    host = CalendarHost(tmp_path, monkeypatch, {"schema_v6.sql": CALENDAR_TABLE}, files={"051_synthetic_note.sql": NOTE})
+    host.copy_failures[failing] = "count_mismatch"
+    outcome = host.deploy()
+    assert not {"calendar migrate", "migrate", "calendar roles"} & set(host.events)
+    assert (host.cal_version, host.version) == (5, 50) and "apply" not in [name for name, _ in host.steps]
+    reason = f"the pre-migration copy of {failing} failed: count_mismatch"
+    assert outcome["status"] == "halted" and outcome["reason"] == reason == host.paused()
+    receipt = host.migration()
+    assert receipt["status"] == "refused" and receipt["phases"][failing] == {"status": "refused", "phase": "copy"}
+    p.PAUSE.unlink()
+    again = host.deploy()
+    assert again["reason"].startswith(f"the unattended migration of {NEWEST} ended refused")
+    assert host.events.count("calendar copy") == 1
+
+
+# spec: ANYM-586
+def test_a_messaging_failure_after_calendars_commit_pauses_naming_the_calendar_schema(tmp_path, monkeypatch):
+    host = CalendarHost(tmp_path, monkeypatch, {"schema_v6.sql": CALENDAR_TABLE}, files={"051_synthetic_note.sql": NOTE})
+    host.answer = "refused"
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and outcome["reason"] == "calendar migrated to 6; messaging not applied: lock_timeout"
+    assert host.paused() == outcome["reason"] and "apply" not in [name for name, _ in host.steps]
+    receipt = host.migration()
+    assert receipt["status"] == "not-applied" and receipt["code"] == "lock_timeout"
+    assert receipt["phases"]["calendar"]["status"] == "migrated" and receipt["phases"]["calendar"]["roles"] == "ok"
+    assert receipt["phases"]["messaging"]["status"] == "not-applied"
+    assert host.cal_version == 6 and host.version == 50
+
+
+# spec: ANYM-586
+@pytest.mark.parametrize("failing", ["calendar roles", "calendar check"])
+def test_a_db_roles_or_check_failure_after_calendars_commit_pauses_before_messaging(tmp_path, monkeypatch, failing):
+    host = CalendarHost(tmp_path, monkeypatch, {"schema_v6.sql": CALENDAR_TABLE}, calendar_roles=CALENDAR_GRANT,
+                        files={"051_synthetic_note.sql": NOTE})
+    host.roles_failure = failing
+    outcome = host.deploy()
+    code = "failed" if failing == "calendar roles" else "db_roles_drift"
+    assert outcome["status"] == "halted" and outcome["reason"] == f"calendar migrated to 6; roles: {code}" == host.paused()
+    assert "migrate" not in host.events and host.version == 50 and "apply" not in [name for name, _ in host.steps]
+    assert ("calendar check" in host.events) == (failing == "calendar check")
+    receipt = host.migration()
+    assert receipt["status"] == "roles-failed" and receipt["phases"]["calendar"]["roles"] == code
+    written = "".join(path.read_text() for path in [p.PAUSE, *host.state.rglob("*.json")])
+    assert DRIFT_MARKER not in written and DSN_MARKER not in written
+    p.PAUSE.unlink()
+    assert host.deploy()["reason"].startswith(f"the unattended migration of {NEWEST} ended roles-failed")
+    assert host.events.count("calendar roles") == 1
+
+
+# spec: ANYM-586
+def test_a_run_killed_between_calendars_commit_and_messaging_pauses_and_never_applies_messaging(tmp_path, monkeypatch):
+    host = CalendarHost(tmp_path, monkeypatch, {"schema_v6.sql": CALENDAR_TABLE}, files={"051_synthetic_note.sql": NOTE})
+    real = p.migration_receipt
+    def killed(release, plan, status, **fields):
+        if fields["phases"].get("messaging", {}).get("status") == "planned":
+            raise Died()  # the process dies before messaging's planned receipt is written
+        return real(release, plan, status, **fields)
+    monkeypatch.setattr(p, "migration_receipt", killed)
+    with pytest.raises(Died):
+        host.deploy()
+    assert host.migration()["status"] == "planned" and host.migration()["phases"]["calendar"]["roles"] == "ok"
+    monkeypatch.setattr(p, "migration_receipt", real)
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and outcome["reason"] == "calendar migrated to 6; messaging not applied: interrupted"
+    assert "migrate" not in host.events and host.events.count("calendar migrate") == 1 and host.version == 50
+    assert {key: host.migration()["phases"]["messaging"][key] for key in ("status", "code")} == {
+        "status": "not-applied", "code": "interrupted"}
+
+
+CONTAINER_STEPS = ["calendar identity", "identity", "calendar migrate", "calendar status", "calendar roles",
+                   "calendar check", "migrate", "status"]
+
+
+# spec: ANYM-586
+@pytest.mark.parametrize("crash", range(1, len(CONTAINER_STEPS) + 1))
+def test_a_run_killed_at_any_container_step_never_starts_a_migration_or_db_roles_twice(tmp_path, monkeypatch, crash):
+    host = CalendarHost(tmp_path, monkeypatch, {"schema_v6.sql": CALENDAR_TABLE}, calendar_roles=CALENDAR_GRANT,
+                        files={"051_synthetic_note.sql": NOTE})
+    monkeypatch.setattr(p, "database_identity", lambda name, image, network, dsn_file: host.crash("identity") or host.identity)
+    host.crash_at = crash
+    with pytest.raises(Died):
+        host.deploy()
+    host.crash_at = None
+    outcome = host.deploy()
+    assert outcome["status"] in ("deployed", "halted")
+    for step in ("calendar migrate", "migrate", "calendar roles", "calendar check"):
+        assert host.containers.count(step) <= 1, (step, host.containers)
+    # The invariant also holds for what the next run decided: deployed means both databases reached their targets.
+    if outcome["status"] == "deployed":
+        assert (host.cal_version, host.version) == (6, 51) and host.migration()["status"] == "migrated"
+    else:
+        assert "apply" not in [name for name, _ in host.steps]
+
+
+# spec: ANYM-586
+def test_a_clean_two_database_run_reaches_each_container_step_once_in_order(tmp_path, monkeypatch):
+    host = CalendarHost(tmp_path, monkeypatch, {"schema_v6.sql": CALENDAR_TABLE}, calendar_roles=CALENDAR_GRANT,
+                        files={"051_synthetic_note.sql": NOTE})
+    monkeypatch.setattr(p, "database_identity", lambda name, image, network, dsn_file: host.crash("identity") or host.identity)
+    assert host.deploy()["status"] == "deployed" and host.containers == CONTAINER_STEPS
+
+
+# spec: ANYM-586
+@pytest.mark.parametrize("case", ["not-configured", "edited-applied-file", "gap", "no-header", "manual", "revoke",
+                                  "index-on-existing", "other-calendar-sql"])
+def test_a_calendar_range_that_does_not_qualify_pauses_with_todays_text(tmp_path, monkeypatch, case):
+    calendar, roles, modified = {"schema_v6.sql": CALENDAR_TABLE}, b"", []
+    if case == "edited-applied-file":
+        modified = [CALENDAR_PACKAGE + "schema_v4.sql"]
+    elif case == "gap":
+        calendar = {"schema_v7.sql": CALENDAR_TABLE}
+    elif case == "no-header":
+        calendar = {"schema_v6.sql": CALENDAR_TABLE.split(b"\n", 1)[1]}
+    elif case == "manual":
+        calendar = {"schema_v6.sql": b"-- rollout: manual\nUPDATE people SET label = 'marker';\n"}
+    elif case == "revoke":
+        roles = b"REVOKE SELECT ON people FROM fcs_worker;\n"
+    elif case == "index-on-existing":
+        calendar = {"schema_v6.sql": b"-- rollout: expand\nCREATE INDEX people_label ON people (label);\n"}
+    elif case == "other-calendar-sql":
+        modified = ["services/calendar/family_calendar/service/extra.sql"]
+    host = CalendarHost(tmp_path, monkeypatch, calendar, calendar_roles=roles, calendar_modified=modified,
+                        calendar_configured=case != "not-configured")
+    if case == "edited-applied-file":
+        host.contents[f"{NEWEST}:{CALENDAR_PACKAGE}schema_v4.sql"] = b"-- synthetic calendar 4, edited\n"
+    assert host.plans() is None
+    outcome = host.deploy()
+    sql = [path for path in host.changes[NEWER] if p.SQL_INVENTORY.search(path)]
+    assert outcome["status"] == "halted" and host.steps == [] and host.events == [] and host.migration() is None
+    assert outcome["reason"].startswith(f"the SQL inventory changed ({', '.join(sql)}); migrate by hand (production.md)")
+
+
+# spec: ANYM-586
+@pytest.mark.parametrize("gate", ["behind", "ahead", "store"])
+def test_a_calendar_admission_gate_pauses_with_no_copy_container_or_production_write(tmp_path, monkeypatch, gate):
+    host = CalendarHost(tmp_path, monkeypatch, {"schema_v6.sql": CALENDAR_TABLE})
+    if gate == "behind":
+        host.cal_version = 4
+        host.cal_applied.pop("5")
+    elif gate == "ahead":
+        host.cal_version, host.cal_applied["6"] = 6, sha(CALENDAR_TABLE)
+    else:
+        host.contents[f"{BASE}:{p.CALENDAR_STORE}"] = CALENDAR_STORE.replace("None", "0").encode()
+    outcome = host.deploy()
+    assert host.steps == [] and not {"calendar copy", "calendar migrate"} & set(host.events) and host.migration() is None
+    assert outcome["status"] == "halted" and outcome["reason"] == host.paused() == (
+        "the running calendar release would fail on the new columns: deploy ANYM-586 K0 first" if gate == "store"
+        else "the live calendar ledger is not the base's schema 5; migrate by hand (production.md)")
+
+
+# spec: ANYM-586
+@pytest.mark.parametrize("point", ["before", "after"])
+def test_a_run_killed_around_the_calendar_container_is_settled_from_status_and_then_runs_db_roles(tmp_path,
+                                                                                                  monkeypatch, point):
+    host = CalendarHost(tmp_path, monkeypatch, {"schema_v6.sql": CALENDAR_TABLE})
+    real = host.calendar_run
+    def dying(name, image, network, runtime_file, arguments, **kwargs):
+        if arguments[:2] == ["migrate-expand", "--plan"] and point == "before":
+            raise Died()
+        found = real(name, image, network, runtime_file, arguments, **kwargs)
+        if arguments[:2] == ["migrate-expand", "--plan"]:
+            raise Died()
+        return found
+    monkeypatch.setattr(p, "calendar_run", dying)
+    with pytest.raises(Died):
+        host.deploy()
+    assert host.migration()["phases"]["calendar"]["status"] == "planned"
+    monkeypatch.setattr(p, "calendar_run", real)
+    host.events[:] = []
+    outcome = host.deploy()
+    assert "calendar migrate" not in host.events and host.events[:2] == ["calendar status", "live calendar ledger"]
+    if point == "before":
+        assert outcome["reason"] == f"the calendar migration of {NEWEST} did not apply" and "calendar roles" not in host.events
+        assert host.migration()["status"] == "not-applied"
+    else:
+        assert outcome["status"] == "deployed" and host.events[-2:] == ["calendar roles", "calendar check"]
+        assert host.migration()["phases"]["calendar"] == {"status": "migrated", "copy": "copy586-calendar",
+                                                          "rehearsal_ms": 7, "roles": "ok"}
+
+
+# spec: ANYM-586
+def test_a_run_killed_during_db_roles_pauses_and_never_reruns_it(tmp_path, monkeypatch):
+    host = CalendarHost(tmp_path, monkeypatch, {"schema_v6.sql": CALENDAR_TABLE})
+    host.crash_at = 4  # calendar identity, migrate, status, then db-roles
+    with pytest.raises(Died):
+        host.deploy()
+    assert host.containers[-1] == "calendar roles" and host.migration()["phases"]["calendar"]["roles"] == "running"
+    host.crash_at = None
+    outcome = host.deploy()
+    assert outcome["reason"] == "calendar migrated to 6; roles: interrupted" and host.containers.count("calendar roles") == 1
+
+
+# spec: ANYM-586
+def test_a_health_failure_after_both_migrations_rolls_back_naming_both_schemas(tmp_path, monkeypatch):
+    host = CalendarHost(tmp_path, monkeypatch, {"schema_v6.sql": CALENDAR_TABLE}, files={"051_synthetic_note.sql": NOTE})
+    def unhealthy(sha_):
+        p.write(host.state / sha_ / "result.json", {"sha": sha_, "status": "unhealthy"})
+        raise p.Refused("replacement did not become healthy")
+    host.fail_apply = unhealthy
+    outcome = host.deploy()
+    assert outcome["status"] == "rolled-back" and outcome["reason"] == (
+        f"plan A of {NEWEST} failed its health wait after migrating calendar schema 5 to 6 and messaging schema 50 to "
+        f"51; rolled back to {BASE} on calendar schema 6 and messaging schema 51")
+
+
+# spec: ANYM-586
+def test_the_calendar_containers_run_the_candidate_image_with_the_bounded_flags_and_read_only_mounts(monkeypatch):
+    seen, printed = [], iter([(0, '{"schema_version": 6}\n'), (1, '{"error": "deadlock on marker-row-value"}\n'),
+                              (0, '{\n  "db_roles": ["gateway", "worker"]\n}\n'),
+                              (1, json.dumps({"error": "db_roles_drift", "schema_version": 6, "drift": [DRIFT_MARKER]},
+                                             indent=2)),
+                              (0, '["7000000000000000002", "family_calendar", "16390"]\n')])
+    monkeypatch.setattr(p, "bounded", lambda argv, **kwargs: seen.append((argv, kwargs)) or next(printed))
+    image = "sha256:" + "6" * 64
+    assert p.calendar_expand("deedkit-calendar-migrate-x", image, "cal_net", "/s/runtime.json", "/s/plan.json") == {
+        "schema_version": 6}
+    assert p.calendar_expand("deedkit-calendar-migrate-x", image, "cal_net", "/s/runtime.json", "/s/plan.json") == {
+        "error": "failed"}
+    settings = {"migration": {"unattended_calendar": {"network": "cal_net", "runtime_file": "/s/runtime.json"}}}
+    assert p.calendar_roles(settings, NEWEST, image, 6) == "db_roles_drift"
+    assert p.calendar_identity("deedkit-calendar-identity-x", image, "cal_net", "/s/runtime.json") == [
+        "7000000000000000002", "family_calendar", "16390"]
+    argv, kwargs = seen[0]
+    assert kwargs == {"timeout": 30} and argv[:5] == ["docker", "run", "--rm", "--name", "deedkit-calendar-migrate-x"]
+    joined = " ".join(argv)
+    for flag in ("--log-driver none", "--read-only", "--user 10001:10001", "--cap-drop ALL",
+                 "--security-opt no-new-privileges", "--pids-limit 64", "--memory 512m", "--network cal_net",
+                 "-e PGAPPNAME=deedkit-calendar-migrate-x",
+                 "type=bind,src=/s/runtime.json,dst=/data/service/runtime.json,readonly",
+                 "type=bind,src=/s/plan.json,dst=/run/deedkit/plan.json,readonly"):
+        assert flag in joined
+    assert argv[-4:] == [image, "migrate-expand", "--plan", "/run/deedkit/plan.json"]
+    assert [call[0][-2:] for call in seen[2:4]] == [[image, "db-roles"], ["db-roles", "--check"]]
+    assert seen[4][0][-4:] == ["python", image, "-c", p.CALENDAR_IDENTITY]
+
+
+CALENDAR_SETUP = """CREATE SCHEMA fcs;
+CREATE TABLE fcs.migrations (version int PRIMARY KEY, checksum text NOT NULL);
+INSERT INTO fcs.migrations SELECT n, repeat('c', 64) FROM generate_series(1, 5) n;
+CREATE TABLE fcs.people (id text PRIMARY KEY, label text);
+INSERT INTO fcs.people SELECT 'p' || n, 'synthetic' FROM generate_series(1, 5) n;
+"""
+CALENDAR_ADDITIVE = "CREATE TABLE fcs.synthetic_marks (id text PRIMARY KEY, label text); "
+CALENDAR_LEDGER_ROW = "INSERT INTO fcs.migrations VALUES (6, '{digest}'); "
+
+
+@pytest.fixture
+def calendar_copy_settings(tmp_path, monkeypatch, source_db):
+    psql(source_db, CALENDAR_SETUP)
+    monkeypatch.setattr(p, "filesystem", lambda path: (1 << 40, 1 << 40))
+    # The rehearsal's runtime.json belongs to the image user 10001; tests do not run as root.
+    monkeypatch.setattr(p.os, "chown", lambda path, uid, gid: None)
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    settings = {"version": 1, "state_directory": str(state), "migration": {
+        "databases": {"calendar": {"container": CONTAINER, "owner": OWNER, "database": source_db}}}}
+    yield settings
+    for directory in sorted((state / p.COPIES).iterdir()) if (state / p.COPIES).exists() else ():
+        subprocess.run(["docker", "stop", "-t", "1", "deedkit-copy-" + directory.name], capture_output=True)
+
+
+def fake_calendar_migrate(migration, *, slow=False):
+    """calendar migrate-expand as one psql session on the copy over the rehearsal network: the migration and its
+    ledger row in one transaction, the DSN read from the mounted runtime.json."""
+    calls = []
+    def calendar_expand(name, image, network, runtime_file, plan_file, *, label=None, status=False):
+        runtime = json.loads(Path(runtime_file).read_text())
+        calls.append((network, label, json.loads(Path(plan_file).read_text())["identity"],
+                      oct(Path(runtime_file).stat().st_mode & 0o777)))
+        host, database = runtime["dsn"].split("@")[1].split(":")[0], runtime["dsn"].rsplit("/", 1)[1]
+        text = "BEGIN; " + migration + CALENDAR_LEDGER_ROW.format(digest="a" * 64) + (
+            " SELECT pg_sleep(1.2);" if slow else "") + " COMMIT;"
+        subprocess.run(["docker", "run", "--rm", "--network", network, "--label", label, "-i", image, "psql", "-X", "-q",
+                        "-v", "ON_ERROR_STOP=1", "-h", host, "-U", OWNER, "-d", database], input=text,
+                       capture_output=True, text=True, check=True)
+        return {"schema_version": 6}
+    return calendar_expand, calls
+
+
+# spec: ANYM-586
+@pytest.mark.parametrize("case", ["additive", "existing-table", "slow"])
+def test_the_calendar_rehearsal_runs_on_the_copy_times_its_transaction_and_checks_its_data(calendar_copy_settings,
+                                                                                          monkeypatch, case):
+    migration = CALENDAR_ADDITIVE + ("UPDATE fcs.people SET label = label WHERE id = 'p1'; "
+                                     if case == "existing-table" else "")
+    calendar_expand, calls = fake_calendar_migrate(migration, slow=case == "slow")
+    monkeypatch.setattr(p, "calendar_expand", calendar_expand)
+    plan = {"database": "calendar", "base": 5, "target": 6, "pending": {"6": "a" * 64}, "roles": {}}
+    with p.database_copy(calendar_copy_settings, "calendar", NEWEST, keep=True, catalog=p.CATALOG) as copied:
+        copy_id = copied["id"]
+        if case == "additive":
+            record = p.rehearse(copied, plan, scratch_image(), 4000)
+        else:
+            with pytest.raises(p.MigrationRefused) as refused:
+                p.rehearse(copied, plan, scratch_image(), 1000)
+    assert calls[0][:2] == ("deedkit-copy-" + copy_id, "deedkit-copy=" + copy_id) and calls[0][3] == "0o600"
+    assert len(calls[0][2]) == 3 and calls[0][2][1] == copied["database"]
+    assert labelled(copy_id, "container") == [] and labelled(copy_id, "network") == []
+    if case == "additive":
+        assert 0 <= record["took_ms"] <= 1000
+        assert ["relation", "fcs.synthetic_marks"] in [key for key, _ in record["difference"]["added"]]
+    else:
+        assert str(refused.value).startswith({"existing-table": "not additive: rows of fcs.people were written",
+                                              "slow": "too slow for an unattended lock: the rehearsal took"}[case])
+    if case == "slow":
+        assert int(str(refused.value).split("took ")[1].split(" ")[0]) >= 1200
+    # The live database itself never changed.
+    assert psql(calendar_copy_settings["migration"]["databases"]["calendar"]["database"],
+                "SELECT max(version) FROM fcs.migrations;").strip() == "5"
+
+
+# spec: ANYM-586
+def test_the_calendar_ledger_and_identity_read_the_live_calendar_database(source_db, tmp_path):
+    psql(source_db, CALENDAR_SETUP)
+    source = {"container": CONTAINER, "owner": OWNER, "database": source_db}
+    assert p.calendar_ledger(source) == (5, {str(n): "c" * 64 for n in range(1, 6)})
+    # The image's identity script reads the DSN from runtime.json, as the calendar CLI does.
+    dsn = Path(os.environ["PROBE_TEST_DSN_FILE"]).read_text().strip().rsplit("/", 1)[0] + "/" + source_db
+    (tmp_path / "runtime.json").write_text(json.dumps({"dsn": dsn, "port": 1}))
+    script = p.CALENDAR_IDENTITY.replace(p.CALENDAR_RUNTIME, str(tmp_path / "runtime.json"))
+    reached = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True).stdout
+    found = json.loads(p.live_lines(source, "calendar identity", p.IDENTITY_SQL + ";")[0])
+    assert json.loads(reached) == found and found[1] == source_db
