@@ -411,7 +411,7 @@ def running(name, docker=call):
     try:
         return docker(['docker', 'inspect', '--format', '{{.State.Running}}', name]).strip() == 'true'
     except Refused as error:
-        if 'No such' in str(error):
+        if 'no such' in str(error).lower():  # `docker inspect` says `no such object`, the daemon `No such container`
             return None
         raise
 

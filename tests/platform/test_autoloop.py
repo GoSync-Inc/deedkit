@@ -2609,3 +2609,14 @@ def test_the_proxy_refuses_ipv6_addresses_that_carry_an_ipv4_address():
         assert egress.public([translated]) == [], translated
         assert egress.public(['140.82.121.4', translated]) == [], translated
     assert egress.public(['2606:4700:4700::1111']) == ['2606:4700:4700::1111']
+
+
+# spec: ANYM-574
+def test_a_container_docker_reports_missing_in_its_own_words_counts_as_gone():
+    for message in ('docker inspect: exit 1: Error: no such object: x',  # the docker CLI 29 on the owner Mac
+                    'docker inspect: exit 1: Error response from daemon: No such container: x'):
+        def gone(argv, timeout=None):
+            if argv[1] == 'inspect':
+                raise launcher.Refused(message)
+            raise launcher.Refused('docker stop: exit 1: Error response from daemon: No such container: x')
+        assert launcher.running(BUILD, gone) is None and launcher.stop(BUILD, gone) is True, message
