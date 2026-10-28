@@ -3,8 +3,9 @@ Description=Check for a DeedKit calendar R2 backup awaiting independent restore
 
 [Timer]
 OnBootSec=10min
-OnUnitInactiveSec=15min
-RandomizedDelaySec=1min
+OnUnitInactiveSec=2min
+RandomizedDelaySec=30s
+AccuracySec=1s
 Unit=deedkit-calendar-backup-r2-verifier.service
 
 [Install]
