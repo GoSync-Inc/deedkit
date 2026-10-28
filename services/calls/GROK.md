@@ -93,7 +93,7 @@ The Telegram route uses the xAI key for Grok briefs.
 
 ## Tools and audio
 
-The installed Pipecat 1.12 xAI realtime service carries the same six scoped task
+The installed Pipecat 1.14 xAI realtime service carries the same six scoped task
 tools as the legacy Gemini executor. No remote MCP, web search, messenger access
 or provider-native action tools are registered. Tool results, corrections,
 owner-decision requests and transcripts use the same durable task store.

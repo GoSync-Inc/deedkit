@@ -38,6 +38,28 @@ CAPABILITIES_FILE = Path('/var/lib/deedkit-backup-r2/published/capabilities.json
 CANCELLED = []
 CHECKS = {'decryption', 'bundle_integrity', 'database_restore', 'table_inventory',
           'original_hashes', 'recovery_objects', 'collectors_quarantined'}
+# A calendar receiver (ANYM-606) protects only a proof with exactly these checks; a config
+# without `profile` is messaging's. Neither profile accepts the other's proof or a union.
+CALENDAR_CHECKS = {'decryption', 'bundle_integrity', 'database_restore', 'schema_version',
+                   'table_inventory', 'vault_complete', 'vault_decrypts'}
+PROFILES = ('messaging', 'calendar')
+MAX_WARNINGS = 32
+# Encoded bytes of the copied warnings: an escaped non-ASCII name grows (an emoji is 12 bytes), and
+# the proof must stay far inside the 16 KiB `protect`/`rotate` read limit.
+WARNING_BYTES = 4096
+WARNING_KIND = re.compile('[a-z_]{1,40}')
+
+
+def profile(config):
+    return config.get('profile', 'messaging')
+
+
+def valid_warnings(value):
+    """A calendar proof's copied vault warnings: a short list of {kind, name} labels, never a value."""
+    return (isinstance(value, list) and len(value) <= MAX_WARNINGS and
+            all(isinstance(item, dict) and set(item) == {'kind', 'name'} and isinstance(item['kind'], str) and
+                WARNING_KIND.fullmatch(item['kind']) and isinstance(item['name'], str) and len(item['name']) <= 64
+                for item in value) and len(encoded(value)) <= WARNING_BYTES)
 
 
 def unique_json(raw):
@@ -116,8 +138,9 @@ def load_config(path):
     # Optional `verifier_config_file`: the installed service's verifier config, the one
     # whose publication (CAPABILITIES_FILE) `capabilities` accepts; it enables the mode.
     if (not isinstance(value, dict) or not required <= set(value) or
-            set(value) - required - set(defaults) - {'verifier_config_file'} or
-            type(value['v']) is not int or value['v'] != 1):
+            set(value) - required - set(defaults) - {'verifier_config_file', 'profile'} or
+            type(value['v']) is not int or value['v'] != 1 or
+            ('profile' in value and (not isinstance(value['profile'], str) or value['profile'] not in PROFILES))):
         raise ValueError('invalid_config')
     value = {**defaults, **value}
     if (not isinstance(value['endpoint'], str) or
@@ -683,12 +706,18 @@ def validate_marker(config, value):
     return value
 
 
-def validate_proof(proof, receipt):
+def validate_proof(proof, receipt, expected='messaging'):
     if (not isinstance(proof, dict) or set(proof) != {'v', 'type', 'status', 'backup', 'verification'} or
             type(proof['v']) is not int or proof['v'] != 1 or
             proof['type'] != 'independent_restore_verification' or proof['status'] != 'verified'):
         raise ValueError('independent_restore_proof_required')
     candidate = proof['backup']; verification = proof['verification']
+    # A messaging proof carries no profile (as before ANYM-606); a calendar proof names it.
+    if isinstance(verification, dict) and verification.get('profile', 'messaging') != expected:
+        raise ValueError('verifier_profile_mismatch')
+    keys, checks = ({'id', 'verified_at', 'schema_version', 'manifest_sha256', 'checks'}, CHECKS)
+    if expected == 'calendar':
+        keys, checks = keys | {'profile', 'vault_warnings'}, CALENDAR_CHECKS
     if not isinstance(candidate, dict) or set(candidate) != {'id', 'bytes', 'sha256', 'snapshot_sha256'}:
         raise ValueError('invalid_restore_proof')
     new = {key: candidate[key] for key in ('id', 'bytes', 'sha256')}
@@ -696,12 +725,13 @@ def validate_proof(proof, receipt):
     if not isinstance(candidate['snapshot_sha256'], str) or not local.DIGEST.fullmatch(candidate['snapshot_sha256']):
         raise ValueError('invalid_restore_proof')
     if (not isinstance(verification, dict) or
-            set(verification) != {'id', 'verified_at', 'schema_version', 'manifest_sha256', 'checks'} or
+            set(verification) != keys or
             not isinstance(verification['id'], str) or not re.fullmatch('[a-f0-9]{32}', verification['id']) or
             type(verification['schema_version']) is not int or not 1 <= verification['schema_version'] <= 100000 or
             verification['manifest_sha256'] != candidate['snapshot_sha256'] or
-            not isinstance(verification['checks'], dict) or set(verification['checks']) != CHECKS or
-            any(value is not True for value in verification['checks'].values())):
+            not isinstance(verification['checks'], dict) or set(verification['checks']) != checks or
+            any(value is not True for value in verification['checks'].values()) or
+            (expected == 'calendar' and not valid_warnings(verification['vault_warnings']))):
         raise ValueError('independent_restore_proof_required')
     if receipt is None or any(receipt['wire'].get(key) != value for key, value in candidate.items()):
         raise ValueError('candidate_receipt_mismatch')
@@ -746,7 +776,7 @@ def candidate_from_proof(config, client, proof):
         raise ValueError('independent_restore_proof_required')
     bid = proof['backup'].get('id'); valid_id(bid)
     receipt = get_receipt(config, client, bid)
-    new = validate_proof(proof, receipt)
+    new = validate_proof(proof, receipt, profile(config))
     verify_object(config, client, receipt)
     return new, receipt
 

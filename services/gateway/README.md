@@ -218,8 +218,9 @@ after a mutation is dispatched still reports `mutation_outcome_unknown` and forb
 automatic retries, even when a backend error classification is available.
 Calendar capabilities retain a reviewed `constraints` allowlist (write limitations,
 including `occurrence_write`, `all_day_write` and `provider_write`; `recurrence_write`, `future_split` and
-`invitations` are listed as false, so series-wide, this-and-following and guest writes are never advertised;
-accepted time format, freshness, bounded refresh and request limits), while upstream
+`invitations` are listed as false and describe `calendar_plan` only, so it never advertises series-wide,
+this-and-following or guest writes; `series_write` lists `calendar_schedule`'s series scopes per provider,
+as the calendar service sends them (ANYM-615); accepted time format, freshness, bounded refresh and request limits), while upstream
 feature/tool catalogs remain hidden. `gateway_tools` is the selected connection's operation ceiling;
 `gateway_actions` describes messenger actions only. Calendar `allowed_event_actions`
 also intersects local/backend scopes and requires both selected plan/apply tools.

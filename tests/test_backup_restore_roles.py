@@ -126,3 +126,15 @@ def test_verifier_keeps_a_shaped_helper_detail_beside_the_unchanged_failure_fact
         with pytest.raises(v.HelperFailure, match='restore_database_failed') as caught:
             engine.restore({}, {}, None, {}, 'a' * 32, tmp_path, tmp_path)
         assert caught.value.detail == expected
+
+
+# spec: ANYM-606
+def test_every_role_a_calendar_schema_or_role_file_names_is_a_calendar_restore_role():
+    calendar = Path(__file__).resolve().parents[1] / 'services/calendar/family_calendar/service'
+    files = sorted(calendar.glob('*.sql'))
+    assert {'roles.sql', 'schema.sql'} <= {path.name for path in files}
+    roles = set().union(*(named_roles(path.read_text()) for path in files))
+    assert {'fcs_gateway', 'fcs_worker'} <= roles
+    assert roles <= set(worker.CALENDAR_RESTORE_ROLES), sorted(roles - set(worker.CALENDAR_RESTORE_ROLES))
+    text = worker.restore_roles_sql(worker.CALENDAR_RESTORE_ROLES)
+    assert re.findall(r'CREATE ROLE (\w+) NOLOGIN;', text) == list(worker.CALENDAR_RESTORE_ROLES)

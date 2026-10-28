@@ -1,5 +1,7 @@
 """Dot regressions: scope, partial empty results, direct IDs and classified errors."""
 import asyncio
+import json
+from pathlib import Path
 from datetime import datetime,timezone
 from types import SimpleNamespace as NS
 
@@ -24,7 +26,8 @@ def test_exact_provider_reference_and_scoped_conflict_lifecycle(archive):
     resolved=s.resolve_reference(key,'archive-test','100','17')
     assert resolved['message']['id']==mid and resolved['message']['provider_id']=='17'
     assert resolved['message']['evidence']['active_conflicts']==1
-    assert resolved['sync']['conflicts']=={'active':1,'historical':0}
+    assert {k:resolved['sync']['conflicts'][k] for k in ('active','historical','attention','known')}=={
+        'active':1,'historical':0,'attention':0,'known':1}
     for args in [('archive-test','100','17'),('archive-test','missing','17')]:
         with pytest.raises(APIError,match='not_found'):s.resolve_reference(hidden,*args)
     # Even a successful re-observation of the retained version leaves equal-time ambiguity.
@@ -188,3 +191,20 @@ def test_whatsapp_empty_chat_is_resolvable_before_message_ingest(wa):
     for bounds in ({'to_time':upper},{'from_time':lower},{}):
         status=s.get_sync_status(key,chat_id=cid,**bounds)
         assert not status['history']['requested_range_traversed']
+
+
+
+# spec: ANYM-53
+def test_a_filter_that_names_no_visible_chat_points_to_list_chats(seeded):
+    s,a,b=seeded
+    # An absent and a hidden account read alike, and the next step is a real operation that needs no reference
+    # the agent lacks: list_chats shows the accounts and chats the key may search.
+    catalog=json.loads((Path(__file__).resolve().parents[1]/'services/gateway/src/agent_gateway/catalog.json').read_text())
+    for read in (lambda account:s.search(b,accounts=[account],query='missing'),
+                 lambda account:s.search_files(b,accounts=[account],query='missing'),
+                 lambda account:s.search_files(b,accounts=[account],query='missing',include_coverage=False)):
+        evidence=[read(account)['result_evidence'] for account in ('absent-account','whatsapp-demo-1')]
+        assert evidence[0]==evidence[1]
+        assert evidence[0]['empty_reason']=='not_found_or_not_permitted'
+        assert evidence[0]['next_action']=='list_chats'
+    assert any(tool.get('operation')=='list_chats' for tool in catalog)

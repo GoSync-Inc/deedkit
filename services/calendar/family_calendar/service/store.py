@@ -2,6 +2,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import secrets
@@ -11,6 +12,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import psycopg
 from psycopg import sql
+from psycopg.errors import LockNotAvailable, QueryCanceled, TransactionTimeout
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool, PoolTimeout
@@ -19,7 +21,51 @@ from family_calendar.errors import CalendarError
 
 HERE = Path(__file__).parent
 MIGRATIONS = ((1, HERE / "schema.sql"), (2, HERE / "schema_v2.sql"), (3, HERE / "schema_v3.sql"),
-              (4, HERE / "schema_v4.sql"), (5, HERE / "schema_v5.sql"))
+              (4, HERE / "schema_v4.sql"), (5, HERE / "schema_v5.sql"), (6, HERE / "schema_v6.sql"))
+ROLES = HERE / "roles.sql"
+# migrate-expand's session budgets (ANYM-586 K2, as messaging's ANYM-596), read back after connecting.
+EXPAND_SETTINGS = {"lock_timeout": "2s", "statement_timeout": "4s", "transaction_timeout": "4s"}
+# The database a connection reached: cluster system identifier, database name and OID (ANYM-449).
+EXPAND_IDENTITY = (
+    "SELECT ARRAY[(SELECT system_identifier::text FROM pg_control_system()),current_database()::text,"
+    "(SELECT oid::text FROM pg_database WHERE datname=current_database())] AS identity"
+)
+
+
+def ledger(conn, schema):
+    """(max version, {version: checksum}) of the schema's migrations table; (0, {}) without it."""
+    table = sql.Identifier(schema, "migrations")
+    if conn.execute(sql.SQL("SELECT to_regclass({}) IS NULL AS missing").format(sql.Literal(schema + ".migrations"))
+                    ).fetchone()["missing"]:
+        return 0, {}
+    applied = {r["version"]: r["checksum"] for r in conn.execute(sql.SQL("SELECT version, checksum FROM {}").format(table))}
+    return max(applied, default=0), applied
+
+
+def expand_code(run):
+    """`run()` with every failure as a fixed code, never PostgreSQL's message. The connection is closed, never rolled
+    back by psycopg's context manager; the server discards the open transaction when the session ends."""
+    try:
+        return run()
+    except CalendarError:
+        raise
+    except LockNotAvailable:
+        raise CalendarError("lock_timeout") from None
+    except TransactionTimeout:
+        raise CalendarError("transaction_timeout") from None
+    except QueryCanceled:
+        raise CalendarError("statement_timeout") from None
+    except Exception:
+        raise CalendarError("failed") from None
+
+
+# A messaging person ID (ANYM-554): a UUID in its canonical 8-4-4-4-12 form, any case.
+PERSON_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+
+def person_uuid(value):
+    """The lower-case person UUID of value, or None when value is not one."""
+    return value.lower() if isinstance(value, str) and PERSON_ID.fullmatch(value) else None
 
 
 def caller_key(value):
@@ -164,6 +210,119 @@ class Store:
                     conn.execute(body)
                     conn.execute("INSERT INTO migrations VALUES (%s,%s)", (version, checksum))
 
+    def expand_connection(self):
+        """The only connection of migrate-expand (ANYM-586 K2): its budgets and search_path set at connect and read
+        back before anything runs. PGAPPNAME (deploy's container name) overrides an application name the DSN names,
+        so deploy finds this session by it (ANYM-586 K3)."""
+        name = os.environ.get("PGAPPNAME") or None
+        expected = dict(EXPAND_SETTINGS, search_path=self.schema + ",public", **({"application_name": name} if name else {}))
+        try:
+            conn = psycopg.connect(
+                self.dsn, row_factory=dict_row, prepare_threshold=None, connect_timeout=5,
+                options="-c lock_timeout=2000 -c statement_timeout=4000 -c transaction_timeout=4000 "
+                        "-c search_path=" + self.schema + ",public -c client_min_messages=error -c timezone=UTC",
+                **({"application_name": name} if name else {}),
+            )
+        except psycopg.Error:
+            raise CalendarError("database_unavailable") from None
+        try:
+            if any(conn.execute("SHOW " + name).fetchone()[name] != value for name, value in expected.items()):
+                raise CalendarError("settings_refused")
+        except BaseException:
+            conn.close()
+            raise
+        return conn
+
+    def expand_status(self):
+        def run():
+            conn = self.expand_connection()
+            try:
+                return {"schema_version": ledger(conn, self.schema)[0]}
+            finally:
+                conn.close()
+        return expand_code(run)
+
+    def migrate_expand(self, plan, migrations=MIGRATIONS, roles=ROLES, before_commit=None):
+        """Applies only DROP-free expand migrations and appended roles.sql grants in one bounded transaction on one
+        connection, or nothing (ANYM-586 K2, the calendar copy of messaging's ANYM-596 entry point). The plan is
+        `migration_rollout.plan`'s: {base, target, roles: {bytes, sha256}} and an optional `identity` (EXPAND_IDENTITY
+        of the database deploy copied). Raises CalendarError with a fixed code; `before_commit(conn)` is a test hook."""
+        from . import migration_rollout as rollout
+
+        files = {version: Path(path).read_bytes() for version, path in migrations}
+        data = Path(roles).read_bytes()
+        try:
+            base, target, prefix, identity = plan["base"], plan["target"], plan["roles"], plan.get("identity")
+            valid = (
+                (identity is None or type(identity) is list and len(identity) == 3
+                 and all(type(i) is str for i in identity))
+                and all(type(v) is int for v in (base, target)) and 1 <= base <= target == max(files)
+                and sorted(files) == list(range(1, len(files) + 1)) and type(prefix) is dict
+                and type(prefix.get("bytes")) is int and 0 <= prefix["bytes"] <= len(data)
+                and type(prefix.get("sha256")) is str
+            )
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise CalendarError("plan_invalid") from None
+        if not valid:
+            raise CalendarError("plan_invalid")
+        if hashlib.sha256(data[:prefix["bytes"]]).hexdigest() != prefix["sha256"]:
+            raise CalendarError("prefix_mismatch")
+        try:
+            old, new = data[:prefix["bytes"]].decode(), data.decode()
+            pending = [(version, files[version].decode()) for version in range(base + 1, target + 1)]
+        except UnicodeDecodeError:
+            raise CalendarError("prefix_mismatch") from None
+
+        def run():
+            conn = self.expand_connection()
+            try:
+                if identity is not None and conn.execute(EXPAND_IDENTITY).fetchone()["identity"] != identity:
+                    raise CalendarError("identity_mismatch")
+                if not conn.execute("SELECT pg_try_advisory_xact_lock(61729128) AS locked").fetchone()["locked"]:
+                    raise CalendarError("busy")
+                version, applied = ledger(conn, self.schema)
+                if version != base or applied != {
+                        v: hashlib.sha256(body).hexdigest() for v, body in files.items() if v <= base}:
+                    raise CalendarError("ledger_mismatch")
+                # A GRANT target is an ordinary or partitioned table of the schema; a new table may not reuse the
+                # name of any relation of the schema or pg_catalog, or IF NOT EXISTS would skip it.
+                relations = conn.execute(
+                    "SELECT n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                    "WHERE n.nspname IN (%s, 'pg_catalog')", (self.schema,)
+                ).fetchall()
+                taken = {r["relname"] for r in relations}
+                inventory = {r["relname"] for r in relations if r["nspname"] == self.schema
+                             and r["relkind"] in ("r", "p")} - {
+                    r["relname"] for r in relations if r["nspname"] == "pg_catalog"}
+                created = {}
+                for _, text in pending:
+                    if rollout.unattended_class(text, inventory | set(created), self.schema) != "expand":
+                        raise CalendarError("not_unattended")
+                    following = rollout.new_tables(text, created, self.schema)
+                    if (set(following) - set(created)) & taken:
+                        raise CalendarError("not_unattended")
+                    created = following
+                if rollout.role_class(old, new, created, tables=inventory, schema=self.schema) != "additive":
+                    raise CalendarError("role_not_additive")
+                for version, text in pending:
+                    conn.execute(text)
+                    conn.execute("INSERT INTO migrations VALUES (%s,%s)", (version, hashlib.sha256(text.encode()).hexdigest()))
+                # Each claimed new table must now be an ordinary or partitioned table of the schema.
+                if created and conn.execute(
+                    "SELECT count(*) AS n FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                    "WHERE n.nspname=%s AND c.relkind IN ('r','p') AND c.relname=ANY(%s)", (self.schema, sorted(created))
+                ).fetchone()["n"] != len(created):
+                    raise CalendarError("not_unattended")
+                if rollout.statements(new[len(old):], self.schema):
+                    conn.execute(new[len(old):])
+                if before_commit:
+                    before_commit(conn)
+                conn.commit()
+            finally:
+                conn.close()
+            return {"schema_version": target}
+        return expand_code(run)
+
     def guardian_readiness(self):
         """Why guardian projections are off, or None; reads only the catalog and migrations, never the new tables."""
         row = self.one(
@@ -263,6 +422,37 @@ class Store:
                 "DO UPDATE SET enabled=excluded.enabled,changed_at=now()", (calendar_ref, enabled),
             )
             c.execute("UPDATE calendars SET version=version+1 WHERE ref=%s", (calendar_ref,))
+
+    def member_person(self, group_id, member_id, person_id):
+        """The owner's link of a calendar member to a messaging person UUID (ANYM-554); person_id None unlinks. Only
+        the UUID is kept. Returns the link with the person it replaced, so a relink or unlink can be undone."""
+        if person_id is not None:
+            person_id = person_uuid(person_id)
+            if person_id is None:
+                raise CalendarError("invalid_person_id")
+        with self.transaction() as c:
+            if not c.execute("SELECT 1 FROM memberships WHERE group_id=%s AND person_id=%s FOR UPDATE",
+                             (group_id, member_id)).fetchone():
+                raise CalendarError("not_found")
+            old = c.execute("SELECT person_uuid::text AS p FROM member_people WHERE group_id=%s AND member_id=%s",
+                            (group_id, member_id)).fetchone()
+            if person_id is None:
+                c.execute("DELETE FROM member_people WHERE group_id=%s AND member_id=%s", (group_id, member_id))
+            else:
+                if c.execute("SELECT 1 FROM member_people WHERE group_id=%s AND person_uuid=%s AND member_id<>%s",
+                             (group_id, person_id, member_id)).fetchone():
+                    raise CalendarError("person_already_linked")
+                try:
+                    c.execute("INSERT INTO member_people(group_id,member_id,person_uuid) VALUES (%s,%s,%s) "
+                              "ON CONFLICT(group_id,member_id) DO UPDATE SET person_uuid=excluded.person_uuid,"
+                              "linked_at=now()", (group_id, member_id, person_id))
+                except psycopg.errors.UniqueViolation as e:
+                    # A concurrent link of the person to another member committed after the check above.
+                    if e.diag.constraint_name == "member_people_group_id_person_uuid_key":
+                        raise CalendarError("person_already_linked") from None
+                    raise
+        return {"group_id": group_id, "member_id": member_id, "person_id": person_id,
+                "linked": person_id is not None, "previous": old["p"] if old else None}
 
     def grant(self, group_id, person_id, calendar_ref, scopes, visibility="details"):
         self.query(

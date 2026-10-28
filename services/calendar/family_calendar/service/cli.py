@@ -55,6 +55,10 @@ def parser():
         sub.add_parser(name)
     roles = sub.add_parser("db-roles")
     roles.add_argument("--check", action="store_true", help="read-only: compare the grants with roles_expected.json")
+    expand = sub.add_parser("migrate-expand", help="autodeploy's bounded additive migration (ANYM-586)")
+    mode = expand.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--plan", type=Path, help="the plan JSON migration_rollout.plan made")
+    mode.add_argument("--status", action="store_true", help="read-only: the ledger's schema version")
     init = sub.add_parser("init-family")
     init.add_argument("--group", default="family")
     init.add_argument("--owner", default="egor")
@@ -66,6 +70,13 @@ def parser():
     member.add_argument(
         "--role", required=True, choices=["group_admin", "coordinator", "adult", "dependent", "helper"]
     )
+    # The owner's link of a calendar member to a messaging person (ANYM-554); --unlink is its undo.
+    linked = sub.add_parser("member-person")
+    linked.add_argument("--group", default="family")
+    linked.add_argument("--member", required=True)
+    target = linked.add_mutually_exclusive_group(required=True)
+    target.add_argument("--person", help="the messaging person UUID")
+    target.add_argument("--unlink", action="store_true")
     imported = sub.add_parser("import-icloud")
     imported.add_argument("--connection", required=True)
     imported.add_argument("--owner", default="egor")
@@ -371,6 +382,14 @@ def dispatch(args, home, root, config, store):
         return {"migrations": store.query("SELECT version,checksum FROM migrations ORDER BY version")}
     if args.action == "db-roles":
         return db_roles_check(store) if args.check else db_roles(store, root, config)
+    if args.action == "migrate-expand":
+        if args.status:
+            return store.expand_status()
+        try:
+            plan = json.loads(args.plan.read_bytes())
+        except (OSError, ValueError):
+            raise CalendarError("plan_invalid") from None
+        return store.migrate_expand(plan)
     if args.action == "init-family":
         store.person(args.owner, args.label)
         store.group(args.group, "Семья")
@@ -389,6 +408,8 @@ def dispatch(args, home, root, config, store):
     if args.action == "bind":
         store.binding(args.group, args.member, args.calendar)
         return {"binding_saved": True}
+    if args.action == "member-person":
+        return store.member_person(args.group, args.member, None if args.unlink else args.person)
     if args.action == "family-settings":
         return store.family_settings(args.group, args.timezone, args.default_calendar)
     if args.action in ("allow-write", "disable-write"):

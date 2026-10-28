@@ -12,3 +12,15 @@ def test_supported_python_and_native_runtime_imports():
     adapter = importlib.import_module('anymsg')
     assert Path(adapter.__file__).resolve() == Path(__file__).resolve().parents[1] / 'anymsg.py'
     assert hasattr(adapter, 'UnconfiguredArchive')
+
+
+# spec: ANYM-617
+def test_call_records_name_the_installed_pipecat_version(tmp_path):
+    from importlib.metadata import version
+    from core import BriefInput, VoiceService
+    from test_tasks import BRIEF
+    assert version('pipecat-ai')=='1.14.0'
+    store=VoiceService(tmp_path)
+    call=store.start(store.prepare(BriefInput(**BRIEF),[])['id'])
+    assert call['engine']=='Pipecat 1.14.0'
+    store.close()

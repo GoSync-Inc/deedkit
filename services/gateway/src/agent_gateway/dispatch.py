@@ -38,6 +38,7 @@ CALENDAR_CONSTRAINTS = {
     "provider_write",
     "recurrence_write",
     "future_split",
+    "series_write",
     "invitations",
     "refresh",
     "window_limit_days",

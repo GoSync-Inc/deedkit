@@ -7,3 +7,5 @@ Use synthetic fixtures and mock CalDAV endpoints in normal tests. Real accounts 
 Every network mutation has a durable intent and provider-supported preconditions: CalDAV create uses If-None-Match; updates/deletes use If-Match. Google insert does not support conditional headers: use a persisted client-generated unique ID, verify by that ID, and never resend an unknown insert. Unknown results must be reconciled before retry. Preserve ICS properties and exception identity; unsupported transformations fail explicitly. Live evidence is not manufactured by mock tests. No external messages without user authorization.
 
 Stop owned temporary processes when no longer needed. Preserve other tasks' changes. Use test-first implementation and run relevant checks before committing.
+
+A new `schema_vN.sql` (N from 6) starts with `-- rollout: expand` or `-- rollout: manual`; autodeploy runs only an `expand` file in `migration_rollout.py`'s unattended language and roles.sql text appended in its GRANT forms, through `service migrate-expand`, then `db-roles` and `db-roles --check` (ANYM-586; production.md "Calendar").

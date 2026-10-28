@@ -19,7 +19,7 @@ from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from anymsg import AnyMsg, UnconfiguredArchive
-from core import ACTIVE, HANDOVER_SECS, MODEL, GROK_MODEL, GROK_VOICES, PROMPT_VERSION, VOICES, BriefInput, CallVoice, ServiceError, VoiceService, now
+from core import ACTIVE, ENGINE, HANDOVER_SECS, MODEL, GROK_MODEL, GROK_VOICES, PROMPT_VERSION, VOICES, BriefInput, CallVoice, ServiceError, VoiceService, now
 from control import control_key, create_control
 from agent_api import AgentAPI, AgentRegistry
 from learning import LearningWorker, ANALYZER_MODEL
@@ -265,7 +265,7 @@ def create_app(data_dir=None, archive=None, control_token=None, reviewer=None, a
                 'voice_providers':{'gemini':{'model':MODEL,'voices':VOICES},
                                    'xai':{'model':GROK_MODEL,'voices':GROK_VOICES,'scope':['browser','telegram','whatsapp','phone','sip']}},
                 'call_voice':app.state.agent_api.call_voice_summary(),
-                'prompt_version':learned['prompt_version'] if learned else PROMPT_VERSION,'framework':'Pipecat 1.12.0', 'transport':'SmallWebRTC',
+                'prompt_version':learned['prompt_version'] if learned else PROMPT_VERSION,'framework':ENGINE, 'transport':'SmallWebRTC',
                 'dialog_engines':['gemini_live','gemini_live_flows','grok_realtime'],
                 'live_flows':{'scope':'browser_prototype','context_strategy':'APPEND','fixed_tools':True,
                               'dynamic_tools':False,'remote_context_reset':False,'custom_tts':False},

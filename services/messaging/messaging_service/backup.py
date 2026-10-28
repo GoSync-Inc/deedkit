@@ -65,7 +65,7 @@ V50_TABLES={'component_heartbeats':'component'}
 V51_TABLES={'send_previews':'token_hash','send_intents':'id'}
 V53_TABLES={'person_preferences':'person,purpose'}
 # Every schema this runtime can capture, verify and restore (one ceiling for capture and verify_bundle).
-SCHEMAS=range(2,56)
+SCHEMAS=range(2,55)
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
 V17_TABLES={'message_conflicts':'receipt_digest'}
@@ -144,7 +144,7 @@ def validate_reference_fence(store,manifest,token):
 
 
 def create_snapshot(store,destination,dump_command,recovery_config=None,*,captured_callback=None,
-                    reference_blobs=False,backup_fence=None):
+                    reference_blobs=False,backup_fence=None,dump_timeout=600):
     """Release cold-state locks after the DB dump; immutable blob copying may continue."""
     from contextlib import nullcontext
     from .recovery_state import recovery_guard
@@ -185,8 +185,9 @@ def create_snapshot(store,destination,dump_command,recovery_config=None,*,captur
                 blobs,absent=blob_inventory(c,schema_version)
                 with (temporary/'database.dump').open('xb') as output:
                     # Command is configured by the operator, not accepted by MCP/REST. No shell.
-                    process=subprocess.run([*dump_command,'--format=custom','--no-owner','--no-acl','--snapshot='+snapshot],
-                        stdout=output,stderr=subprocess.PIPE,timeout=600)
+                    # Restoring needs pg_restore from PostgreSQL 18 built with zstd, as the image (BACKUP.md).
+                    process=subprocess.run([*dump_command,'--format=custom','--compress=zstd:1','--no-owner','--no-acl',
+                        '--snapshot='+snapshot],stdout=output,stderr=subprocess.PIPE,timeout=dump_timeout)
                     if process.returncode: raise RuntimeError('pg_dump_failed')
                     output.flush(); os.fsync(output.fileno())
         if captured_callback is not None:captured_callback()

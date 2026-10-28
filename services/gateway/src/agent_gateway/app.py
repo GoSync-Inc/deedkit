@@ -93,9 +93,13 @@ def large_call(path, body):
 def claimed_tool(prefix):
     """The tool an MCP body names in its first NORMAL_BODY_LIMIT bytes, read before any more of it: parsed
     structurally, the top-level object's own `method` is tools/call, then its `params` object's own `name` (never
-    nested metadata, a batch, a repeated key or a member that ends past the prefix). Only how much to read;
+    nested metadata, a batch, a repeated key or a member that ends past the prefix). Members after the name are read
+    to the prefix's end: a repeated key there claims nothing, as json.loads keeps the last. Only how much to read;
     `large_call` decides on the whole body."""
     text, decoder = prefix.decode("utf-8", "ignore"), json.JSONDecoder()
+
+    class Repeated(Exception):
+        pass
 
     def space(i):
         return SPACE.match(text, i).end()
@@ -107,7 +111,9 @@ def claimed_tool(prefix):
         while text[i:i + 1] == '"':
             key, i = decoder.raw_decode(text, i)
             i = space(i)
-            if key in seen or text[i:i + 1] != ":":
+            if key in seen:
+                raise Repeated
+            if text[i:i + 1] != ":":
                 raise ValueError
             seen.add(key)
             start = space(i + 1)
@@ -117,7 +123,7 @@ def claimed_tool(prefix):
                 return
             i = space(i + 1)
 
-    method = None
+    method = name = None
     try:
         for key, start in members(space(0)):
             if key == "method":
@@ -128,11 +134,13 @@ def claimed_tool(prefix):
                 for inner, at in members(start):
                     if inner == "name":
                         name = decoder.raw_decode(text, at)[0]
-                        return name if isinstance(name, str) else None
-                return None
+                        if not isinstance(name, str):
+                            return None
+    except Repeated:
+        return None
     except (ValueError, RecursionError):
         pass
-    return None
+    return name
 
 
 def create_app(policy_path, public_url, *, transports=None):

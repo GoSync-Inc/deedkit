@@ -109,32 +109,34 @@ def history(row,lower=None,upper=None):
         'older_edits_and_deletions_verified':False}
 
 
-def chat_statuses(c,p,chat_ids,lower=None,upper=None):
+def chat_statuses(c,p,chat_ids,lower=None,upper=None,*,conflict_items=False):
+    """`conflict_items` adds the bounded listing behind `inspect_chat` (get_sync_status with a chat_id only)."""
     from .sync_status import _files,empty_files
+    from .conflict_classes import grouped,listing,report
     records=rows(c,p,chat_ids);result={}
     ids=[r['chat_id'] for r in records]
     if not ids:return result
     counts={r['chat']:r for r in c.execute('''SELECT chat,count(*) AS messages,
         min(sent_at) AS oldest_message_at,max(sent_at) AS newest_message_at
         FROM messages WHERE chat=ANY(%s) AND NOT deleted GROUP BY chat''',(ids,))}
-    conflicts={r['chat']:r for r in c.execute('''SELECT m.chat,
-        count(*) FILTER(WHERE mc.resolved_at IS NULL) AS active,
-        count(*) FILTER(WHERE mc.resolved_at IS NOT NULL) AS historical
-        FROM message_conflicts mc JOIN messages m ON m.id=mc.message
-        WHERE m.chat=ANY(%s) GROUP BY m.chat''',(ids,))}
+    conflicts=grouped(c,'chat',ids)
     downloads,files=_files(c,{**p,'chat_ids':ids},group_by_chat=True)
     for row in records:
         chat=row['chat_id'];h=history(row,lower,upper)
         count=counts.get(chat,{'messages':0,'oldest_message_at':None,'newest_message_at':None})
-        conflict=conflicts.get(chat,{'active':0,'historical':0})
+        open_by_class,active,historical=conflicts.get(chat,({},0,0))
+        line=report(open_by_class)
+        # The chat's conflict line only where it says something: open conflicts, or the get_sync_status listing.
+        conflict={'active':active,'historical':historical,**(line if active or conflict_items else {})}
+        if conflict_items:conflict['items']=listing(c,chat)
         file_data=files.get(chat) or {**empty_files(),'extraction':{},'enrichment':{}}
         file_data['download']=downloads.get(chat,{})
         result[chat]={'chat_id':chat,'account':row['account'],'provider_chat_id':row['provider_chat'],
             'history':h,'messages':{k:v for k,v in count.items() if k!='chat'},'files':file_data,
-            'conflicts':{k:v for k,v in conflict.items() if k!='chat'},
+            'conflicts':conflict,
             'next_action':'check_provider_access' if h['last_error_code']=='provider_unavailable' else
                 'wait_for_provider_cooldown' if h['last_error_code']=='rate_limited' else
-                'get_context' if conflict['active'] else
+                'inspect_chat' if line['attention'] else
                 'wait_for_history' if not h['history_traversal_complete'] else 'read_archived_history'}
     return result
 
@@ -154,13 +156,16 @@ def query_evidence(c,p,normalized,items,*,paged=False,include=True):
     histories=[history(r,lower,upper) for r in records]
     missing=ids is not None and bool(set(ids)-{r['chat_id'] for r in records})
     traversed=(ids is not None or p['chat_ids'] is not None) and bool(histories) and all(h['requested_range_traversed'] for h in histories) and not missing
-    conflicts=0
+    conflicts=attention=0
     if records:
-        conflicts=c.execute('''SELECT count(*) AS n FROM message_conflicts mc JOIN messages m ON m.id=mc.message
+        from .conflict_classes import class_sql,known_classes
+        counts=c.execute('''SELECT count(*) AS n,count(*) FILTER(WHERE NOT '''+class_sql(c)+'''=ANY(%s)) AS attention
+            FROM message_conflicts mc JOIN messages m ON m.id=mc.message
             WHERE m.chat=ANY(%s) AND mc.resolved_at IS NULL
             AND (%s::timestamptz IS NULL OR m.sent_at>=%s)
             AND (%s::timestamptz IS NULL OR m.sent_at<%s)''',
-            ([r['chat_id'] for r in records],lower,lower,upper,upper)).fetchone()['n']
+            (known_classes(),[r['chat_id'] for r in records],lower,lower,upper,upper)).fetchone()
+        conflicts,attention=counts['n'],counts['attention']
     reason=None
     if not items:
         if paged:reason='end_of_archived_page'
@@ -179,8 +184,8 @@ def query_evidence(c,p,normalized,items,*,paged=False,include=True):
         'read_history_or_wait_for_collection' if reason in ('history_loading','history_not_scanned','history_has_gaps')
         else 'check_provider_access' if reason=='provider_unavailable'
         else 'wait_for_provider_cooldown' if reason=='provider_rate_limited'
-        else 'resolve_chat_or_check_scope' if reason=='not_found_or_not_permitted'
-        else 'get_context' if conflicts else 'read_context' if items else 'inspect_chat_coverage'}
+        else 'list_chats' if reason=='not_found_or_not_permitted'
+        else 'inspect_chat' if attention else 'read_context' if items else 'inspect_chat_coverage'}
     if include:
         result.update(chats_considered=len(records),chats_not_scanned=sum(h['state']=='not_scanned' for h in histories),
             chats_loading=sum(h['state']=='loading' for h in histories),chats_with_gaps=sum(bool(h['gaps']) for h in histories))
@@ -199,7 +204,8 @@ def file_query_evidence(c,p,normalized,items,paged=False,include=True):
         if not items:
             if result['empty_reason']=='no_matches_in_traversed_range':
                 result['empty_reason']='file_index_coverage_not_checked'
-            result['next_action']='get_sync_status_for_selected_chat'
+            # A filter that names no visible chat keeps list_chats: there is no selected chat to inspect.
+            if result['empty_reason']!='not_found_or_not_permitted':result['next_action']='get_sync_status_for_selected_chat'
         return result
     chat=normalized.get('chat');chats=normalized.get('chats')
     ids=[chat] if chat else chats

@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Task-based browser voice assistant with scoped AnyMsg context"
 requires-python = ">=3.13,<3.14"
 dependencies = [
-  "pipecat-ai[google,webrtc,silero]==1.12.0",
+  "pipecat-ai[google,webrtc,silero]==1.14.0",
   "fastapi==0.143.0",
   "uvicorn==0.54.0",
   "httpx==0.28.1",

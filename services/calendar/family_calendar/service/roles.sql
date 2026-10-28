@@ -44,3 +44,10 @@ DO $$ BEGIN
 END $$;
 -- Neither process can issue/revoke keys, change grants, memberships, providers or write opt-in.
 -- Provider secrets and raw encrypted source payload keys are outside PostgreSQL, worker-only.
+-- Migration 6 (member links, ANYM-554): the gateway reads the owner's links to resolve a person in
+-- calendar_find_time; only the owner CLI writes them. Skipped before migration 6.
+DO $$ BEGIN
+ IF to_regclass('fcs.member_people') IS NOT NULL THEN
+  GRANT SELECT ON fcs.member_people TO fcs_gateway;
+ END IF;
+END $$;

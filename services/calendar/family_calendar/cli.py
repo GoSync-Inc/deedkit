@@ -72,8 +72,9 @@ def parser():
     return p
 
 
-def output(value):
-    print(json.dumps(value, indent=2, ensure_ascii=False))
+def output(value, line=False):
+    # migrate-expand prints one JSON line for autodeploy (ANYM-586); everything else stays indented.
+    print(json.dumps(value, ensure_ascii=False) if line else json.dumps(value, indent=2, ensure_ascii=False))
 
 
 async def _live(args, registry):
@@ -162,13 +163,15 @@ def main(argv=None):
     # No library access logs, request bodies or exception reprs for real accounts.
     for name in ("httpx", "httpcore", "asyncio"):
         logging.getLogger(name).disabled = True
+    line = False
     try:
         args = parser().parse_args(argv)
+        line = args.command == "service" and args.arguments[:1] == ["migrate-expand"]
         registry = Registry(args.home) if args.command != "service" else None
         if args.command == "service":
             from .service.cli import run
 
-            output(run(args.arguments, args.home))
+            output(run(args.arguments, args.home), line)
         elif args.command == "connection":
             if args.action == "list":
                 output({"connections": registry.list_connections()})
@@ -190,19 +193,21 @@ def main(argv=None):
             asyncio.run(_live(args, registry))
         return 0
     except SystemExit as exc:
+        if line and exc.code:
+            output({"error": "usage"}, line)
         return int(exc.code or 0)
     except CalendarError as exc:
-        output({"error": exc.code, **exc.details})
+        output({"error": exc.code, **exc.details}, line)
         return 1
     except KeyboardInterrupt:
-        output({"error": "interrupted", "next_action": "inspect_run_status_before_retry"})
+        output({"error": "interrupted", "next_action": "inspect_run_status_before_retry"}, line)
         return 130
     except (OSError, ValueError, KeyError, TypeError):
-        output({"error": "local_configuration_error"})
+        output({"error": "local_configuration_error"}, line)
         return 1
     except Exception:
         # An unexpected error can happen after a request was sent. Never print its sensitive repr.
-        output({"error": "unexpected_error", "next_action": "inspect_run_status_before_retry"})
+        output({"error": "unexpected_error", "next_action": "inspect_run_status_before_retry"}, line)
         return 1
 
 

@@ -161,6 +161,14 @@ def decorate(c,rows,*,order_key=None):
         count(*) FILTER(WHERE resolved_at IS NOT NULL) AS historical_conflicts,
         max(observed_at) AS last_conflict_at FROM message_conflicts
         WHERE message=ANY(%s) GROUP BY message''',(ids,))}
+    # One class per message with an open conflict: one that needs attention first, then the latest (ANYM-557).
+    from .conflict_classes import class_sql,known_classes,message_conflict
+    active=[m for m,r in conflicts.items() if r['active_conflicts']]
+    name=class_sql(c) if active else ''
+    classes={r['message']:r['class'] for r in c.execute('''SELECT DISTINCT ON (mc.message) mc.message,'''+name+''' AS class
+        FROM message_conflicts mc WHERE mc.message=ANY(%s) AND mc.resolved_at IS NULL
+        ORDER BY mc.message,'''+name+'''=ANY(%s),mc.observed_at DESC,mc.receipt_digest''',
+        (active,known_classes()))} if active else {}
     send_provenance(c,rows)
     delivery_evidence(c,rows)
     formatting_evidence(c,rows)
@@ -171,10 +179,13 @@ def decorate(c,rows,*,order_key=None):
         row['attachments']=grouped.get(row['id'],[])
         conflict=conflicts.get(row['id'],{'active_conflicts':0,'historical_conflicts':0,'last_conflict_at':None})
         row['evidence']={k:v for k,v in conflict.items() if k!='message'}
+        step=None
+        if row['id'] in classes:
+            row['evidence']['conflict']=message_conflict(classes[row['id']]);step=row['evidence']['conflict']['next_step']
         changed=current.get(row['id'])!=row['revision']
         if changed:row['attachments']=[]
         row['evidence'].update(archive_revision=row['revision'],current_revision_at_evidence_read=current.get(row['id']),
             revision_changed_during_read=changed,provider_currentness_verified=False,
             next_action='reread_message' if changed else
-                'inspect_chat_coverage_and_request_reconciliation' if conflict['active_conflicts'] else 'read_context')
+                'inspect_chat' if step=='inspect_chat' else 'read_context')
     return rows
