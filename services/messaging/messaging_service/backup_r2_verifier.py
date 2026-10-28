@@ -473,13 +473,16 @@ def run(config,*,client=None,engine=None):
             raise error
 
 
-def publish_capabilities(config,*,engine=None):
+def publish_capabilities(config_path,*,engine=None):
     """Publish the pinned helper's schema range for the receiver's `capabilities` key.
 
     The file is root-owned and world-readable (it holds no secret). The old one is
     removed first: an unproven range leaves none, which the deployer reads as unknown.
+    It names this config's identity, so any later change of the config makes it stale.
     """
     if os.geteuid()!=0:raise ValueError('root_verifier_required')
+    config_path=Path(config_path).absolute();identity=r2.config_identity(config_path)
+    config=load_config(config_path)
     receiver=r2.load_config(config['receiver_config_file'])
     if 'capabilities_file' not in receiver:raise ValueError('capabilities_file_required')
     path=Path(receiver['capabilities_file'])
@@ -488,7 +491,8 @@ def publish_capabilities(config,*,engine=None):
         except FileNotFoundError:pass
         engine=engine if engine is not None else Docker(min(600,config['timeout_seconds']))
         engine.preflight(config)
-        value={'v':1,'helper_revision':config['helper_revision'],'helper_schemas':engine.helper_schemas(config)}
+        value={'v':1,'verifier_config':identity,'helper_revision':config['helper_revision'],
+               'helper_schemas':engine.helper_schemas(config)}
         name='.'+path.name+'-'+secrets.token_hex(16)
         out=os.open(name,os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600,dir_fd=fd)
         try:
@@ -498,6 +502,10 @@ def publish_capabilities(config,*,engine=None):
         finally:
             try:os.unlink(name,dir_fd=fd)
             except FileNotFoundError:pass
+        # The config changed while the image was probed: what was read may be the old pin.
+        if r2.config_identity(config_path)!=identity:
+            os.unlink(path.name,dir_fd=fd);local.fsync_dir(fd)
+            raise ValueError('verifier_config_changed')
     return value
 
 
@@ -512,7 +520,7 @@ def failure_code(error):
           'uploader_lock_initialization_required','uncommitted_cloud_object','receiver_quota','protected_backup_missing',
           'invalid_verifier_journal','private_root_file_required','restore_docker_failed','restore_postgres_unavailable',
           'isolated_restore_failed','stored_backup_corrupt','storage_unavailable','unexpected_restore_image_volume','unexpected_restore_helper_layout',
-          'capabilities_file_required','invalid_helper_schemas'}
+          'capabilities_file_required','invalid_helper_schemas','verifier_config_changed'}
     return str(error) if str(error) in safe else 'independent_restore_failed'
 
 
@@ -542,9 +550,8 @@ def main(argv=None):
     parser.add_argument('--publish-capabilities',action='store_true',help="publish the pinned helper's schema range only")
     args=parser.parse_args(argv)
     try:
-        config=load_config(args.config)
-        if args.publish_capabilities:publish_capabilities(config)
-        else:run(config)
+        if args.publish_capabilities:publish_capabilities(args.config)
+        else:run(load_config(args.config))
     except Exception as error:
         print(json.dumps({'error':failure_code(error),'diagnostic':describe(error)},separators=(',',':')),file=sys.stderr);return 1
     return 0

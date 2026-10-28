@@ -730,13 +730,16 @@ def published(config,tmp_path,monkeypatch):
     monkeypatch.setattr(os,'fstat',root_view)
     control=tmp_path/'published';control.mkdir();control.chmod(0o755)
     path=control/'capabilities.json'
+    # The root verifier config: private, but its identity is visible to the upload UID.
+    verifier_config=tmp_path/'verifier.json';write_json(verifier_config,{'synthetic':'verifier config'})
+    def good():return {'v':1,'verifier_config':r2.config_identity(verifier_config),'helper_revision':'c'*40,'helper_schemas':[2,51]}
     def publish(raw=None,*,mode=0o644,root=True):
-        path.write_bytes(r2.encoded({'v':1,'helper_revision':'c'*40,'helper_schemas':[2,51]}) if raw is None else raw)
+        path.write_bytes(r2.encoded(good()) if raw is None else raw)
         path.chmod(mode)
         if not root:upload_owned.add((path.stat().st_dev,path.stat().st_ino))
     config_path=tmp_path/'config.json'
     write_json(config_path,{**json.loads(config_path.read_text()),'capabilities_file':str(path)})
-    return SimpleNamespace(publish=publish,config=str(config_path),path=path)
+    return SimpleNamespace(publish=publish,config=str(config_path),path=path,verifier_config=verifier_config,good=good)
 
 
 # spec: ANYM-589
@@ -769,16 +772,29 @@ def test_capabilities_refuses_an_argument_or_input(published,monkeypatch,capsys)
 
 
 # spec: ANYM-589
-@pytest.mark.parametrize('case',['unconfigured','missing','upload_owned','group_writable','symlink','hardlink','malformed',
-                                 'duplicate_field','extra_field','reversed_range','boolean_bound','short_revision','oversized'])
+@pytest.mark.parametrize('case',['unconfigured','missing','unreadable','upload_owned','group_writable','symlink','hardlink',
+                                 'malformed','duplicate_field','extra_field','reversed_range','boolean_bound','short_revision',
+                                 'oversized','unbound','config_edited','config_replaced','config_removed','config_symlink',
+                                 'config_relative'])
 def test_capabilities_without_a_trusted_helper_publication_is_unavailable(published,monkeypatch,capsys,case):
-    good={'v':1,'helper_revision':'c'*40,'helper_schemas':[2,51]}
-    raws={'malformed':b'{"v":1,','duplicate_field':b'{"v":1,"v":1,"helper_revision":"'+b'c'*40+b'","helper_schemas":[2,51]}',
+    good=published.good();bound=good['verifier_config']
+    raws={'malformed':b'{"v":1,','duplicate_field':r2.encoded(good).replace(b'{"helper',b'{"v":1,"helper',1),
           'extra_field':r2.encoded({**good,'verifier_schemas':[2,99]}),'reversed_range':r2.encoded({**good,'helper_schemas':[51,2]}),
           'boolean_bound':r2.encoded({**good,'helper_schemas':[True,51]}),'short_revision':r2.encoded({**good,'helper_revision':'c'*7}),
-          'oversized':r2.encoded({**good,'pad':'x'*8192})}
-    published.publish(raws.get(case),mode=0o664 if case=='group_writable' else 0o644,root=case!='upload_owned')
-    if case=='unconfigured':
+          'oversized':r2.encoded({**good,'pad':'x'*8192}),'unbound':r2.encoded({k:v for k,v in good.items() if k!='verifier_config'}),
+          'config_relative':r2.encoded({**good,'verifier_config':{**bound,'path':'verifier.json'}})}
+    modes={'group_writable':0o664,'unreadable':0o640}
+    published.publish(raws.get(case),mode=modes.get(case,0o644),root=case!='upload_owned')
+    # A publication made from an older verifier config (a pin changed since) is stale.
+    if case=='config_edited':write_json(published.verifier_config,{'synthetic':'verifier config','helper_revision':'d'*40})
+    elif case=='config_replaced':
+        new=published.verifier_config.with_name('verifier.json.new');new.write_bytes(published.verifier_config.read_bytes())
+        new.chmod(0o600);new.replace(published.verifier_config)
+    elif case=='config_removed':published.verifier_config.unlink()
+    elif case=='config_symlink':
+        real=published.verifier_config.with_name('verifier-real.json');published.verifier_config.rename(real)
+        published.verifier_config.symlink_to(real)
+    elif case=='unconfigured':
         write_json(Path(published.config),{k:v for k,v in json.loads(Path(published.config).read_text()).items() if k!='capabilities_file'})
     elif case=='missing':published.path.unlink()
     elif case=='symlink':

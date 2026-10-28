@@ -1110,8 +1110,23 @@ def cold_serve(config, source, sink, *, client=None):
         cold_put(config, client, key, source, respond, state_fd)
 
 
+def config_identity(path):
+    """What any rewrite, replacement or removal of the root verifier config changes.
+
+    Visible to the upload UID without reading the private file (search permission only).
+    """
+    info = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError('capabilities_unavailable')
+    return {'path': str(path), 'dev': info.st_dev, 'ino': info.st_ino, 'size': info.st_size,
+            'mtime_ns': info.st_mtime_ns, 'ctime_ns': info.st_ctime_ns}
+
+
 def published_helper(config):
-    """Read the root verifier's publication: root-owned, not writable by others, one link."""
+    """Read the root verifier's publication: root-owned, world-readable, not writable by others, one link.
+
+    It names the verifier config it was made from; once that config changed, it is stale.
+    """
     if 'capabilities_file' not in config:
         raise ValueError('capabilities_unavailable')
     path = Path(config['capabilities_file'])
@@ -1121,13 +1136,18 @@ def published_helper(config):
             with os.fdopen(fd, 'rb') as source:
                 info = os.fstat(source.fileno())
                 if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1 or
-                        info.st_mode & 0o022 or info.st_size > 4096):
+                        info.st_mode & 0o022 or not info.st_mode & 0o004 or info.st_size > 4096):
                     raise ValueError('capabilities_unavailable')
                 value = unique_json(source.read(4097))
+        bound = value.get('verifier_config') if isinstance(value, dict) else None
+        if (not isinstance(bound, dict) or not isinstance(bound.get('path'), str) or
+                not Path(bound['path']).is_absolute() or '..' in Path(bound['path']).parts or
+                config_identity(bound['path']) != bound):
+            raise ValueError('capabilities_unavailable')
     except (OSError, ValueError):
         raise ValueError('capabilities_unavailable') from None
-    schemas = value.get('helper_schemas') if isinstance(value, dict) else None
-    if (not isinstance(value, dict) or set(value) != {'v', 'helper_revision', 'helper_schemas'} or
+    schemas = value.get('helper_schemas')
+    if (set(value) != {'v', 'verifier_config', 'helper_revision', 'helper_schemas'} or
             type(value['v']) is not int or value['v'] != 1 or
             not isinstance(value['helper_revision'], str) or not re.fullmatch('[a-f0-9]{40}', value['helper_revision']) or
             not isinstance(schemas, list) or len(schemas) != 2 or any(type(item) is not int for item in schemas) or

@@ -587,6 +587,8 @@ def published_operator(operator,tmp_path):
     v,config,receiver,cloud,engine,write_json=operator
     published=tmp_path/'published';published.mkdir();published.chmod(0o755)
     path=Path(config['receiver_config_file']);write_json(path,{**receiver,'capabilities_file':str(published/'capabilities.json')})
+    config_path=Path(config['receiver_config_file']).with_name('verifier.json');write_json(config_path,config)
+    engine.config_path=config_path
     calls=[]
     def command(*args):
         calls.append(args)
@@ -600,8 +602,12 @@ def published_operator(operator,tmp_path):
 # spec: ANYM-589
 def test_server_verifier_publishes_the_pinned_helper_schema_range(operator,tmp_path):
     v,config,engine,path,calls=published_operator(operator,tmp_path)
-    assert v.publish_capabilities(config,engine=engine)=={'v':1,'helper_revision':config['helper_revision'],'helper_schemas':[2,51]}
-    assert r2.unique_json(path.read_bytes())=={'v':1,'helper_revision':config['helper_revision'],'helper_schemas':[2,51]}
+    expected={'v':1,'verifier_config':r2.config_identity(engine.config_path),'helper_revision':config['helper_revision'],
+              'helper_schemas':[2,51]}
+    assert v.publish_capabilities(engine.config_path,engine=engine)==expected
+    assert r2.unique_json(path.read_bytes())==expected
+    # The receiver's own reader accepts exactly this publication.
+    assert r2.published_helper(r2.load_config(config['receiver_config_file']))==expected
     info=os.stat(path)
     assert info.st_mode&0o777==0o644 and info.st_nlink==1 and not list(path.parent.glob('.*'))
     # The probe runs the exact pinned image ID only after its labels and volumes were checked,
@@ -618,7 +624,7 @@ def test_server_verifier_publishes_the_pinned_helper_schema_range(operator,tmp_p
 @pytest.mark.parametrize('failure',['docker','labels','malformed','step','below_two','boolean','extra'])
 def test_server_verifier_unproven_helper_range_removes_the_old_publication(operator,tmp_path,failure):
     v,config,engine,path,calls=published_operator(operator,tmp_path)
-    v.publish_capabilities(config,engine=engine);assert path.exists()
+    v.publish_capabilities(engine.config_path,engine=engine);assert path.exists()
     answers={'malformed':b'[2,51]','step':b'{"start":2,"stop":52,"step":2}','below_two':b'{"start":1,"stop":52,"step":1}',
              'boolean':b'{"start":true,"stop":52,"step":1}','extra':b'{"start":2,"stop":52,"step":1,"x":1}'}
     if failure=='docker':
@@ -628,9 +634,33 @@ def test_server_verifier_unproven_helper_range_removes_the_old_publication(opera
         def preflight(config):raise ValueError('unreviewed_restore_image')
         engine.preflight=preflight
     else:engine.answer=answers[failure]
-    with pytest.raises((RuntimeError,ValueError)):v.publish_capabilities(config,engine=engine)
+    with pytest.raises((RuntimeError,ValueError)):v.publish_capabilities(engine.config_path,engine=engine)
     # Absent means unknown to the deployer (`waiting`), never the previous helper's range.
     assert not path.exists()
+
+
+# spec: ANYM-589
+def test_server_verifier_config_changed_during_publication_leaves_no_publication(operator,tmp_path):
+    v,config,engine,path,calls=published_operator(operator,tmp_path)
+    def probe(*args):
+        # The operator moves the helper pin while the old image is being probed.
+        Path(engine.config_path).write_text(json.dumps({**config,'helper_revision':'d'*40}))
+        return b'{"start":2,"stop":52,"step":1}'
+    engine.command=probe
+    with pytest.raises(ValueError,match='verifier_config_changed'):v.publish_capabilities(engine.config_path,engine=engine)
+    assert not path.exists()
+
+
+# spec: ANYM-589
+def test_publication_from_an_older_verifier_config_is_stale_to_the_receiver(operator,tmp_path):
+    v,config,engine,path,calls=published_operator(operator,tmp_path)
+    v.publish_capabilities(engine.config_path,engine=engine)
+    receiver=r2.load_config(config['receiver_config_file'])
+    assert r2.published_helper(receiver)['helper_revision']==config['helper_revision']
+    # A new pin written without a new publication (ExecStartPre failed, or no rerun yet).
+    new=Path(engine.config_path).with_name('verifier.json.new');write_json=operator[5]
+    write_json(new,{**config,'helper_revision':'d'*40});new.replace(engine.config_path)
+    with pytest.raises(ValueError,match='capabilities_unavailable'):r2.published_helper(receiver)
 
 
 # spec: ANYM-589
@@ -648,8 +678,8 @@ def test_server_verifier_cli_publishes_capabilities_without_a_restore(monkeypatc
     v=module();seen=[]
     monkeypatch.setattr(v,'load_config',lambda path:{'synthetic':path})
     monkeypatch.setattr(v,'run',lambda config,**kw:pytest.fail('publication started a restore'))
-    monkeypatch.setattr(v,'publish_capabilities',lambda config,**kw:seen.append(config) or {'v':1})
-    assert v.main(['--config','/synthetic','--publish-capabilities'])==0 and seen==[{'synthetic':'/synthetic'}]
+    monkeypatch.setattr(v,'publish_capabilities',lambda path,**kw:seen.append(path) or {'v':1})
+    assert v.main(['--config','/synthetic','--publish-capabilities'])==0 and seen==['/synthetic']
     def fail(config,**kw):raise ValueError('invalid_helper_schemas')
     monkeypatch.setattr(v,'publish_capabilities',fail)
     assert v.main(['--config','/synthetic','--publish-capabilities'])==1

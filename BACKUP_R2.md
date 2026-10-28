@@ -479,11 +479,22 @@ line:
 the pinned helper image, which only root may inspect, so the root verifier
 publishes them in a file the upload account can read: `capabilities_file` in the
 receiver configuration (an absolute path outside `state_directory`; set the same
-value in the root operator copy). The file must be root-owned, single-link and
-not group/other-writable, under root-owned ancestors that are not group/other
-writable, for example `/var/lib/deedkit-backup-r2/published/capabilities.json`
-in a root-owned `0755` directory. Anything else, a missing file or a malformed
-one answers `capabilities_unavailable`: the deployer then waits.
+value in the root operator copy). The file must be root-owned, single-link,
+world-readable and not group/other-writable, under root-owned ancestors that are
+not group/other writable, for example
+`/var/lib/deedkit-backup-r2/published/capabilities.json` in a root-owned `0755`
+directory. Anything else, a missing file or a malformed one answers
+`capabilities_unavailable`: the deployer then waits.
+
+The file also names the verifier configuration it was made from: its path,
+device, inode, size, modification and change times. `capabilities` compares
+them with the current file (a `stat`, which needs only search permission on its
+directories, never read access to the private file). Any edit, replacement,
+removal or symlink of the verifier configuration after the publication makes it
+stale and the answer is `capabilities_unavailable`, so a pin moved without a new
+publication can only make the deployer wait. Keep the verifier configuration's
+directories searchable by the upload account (as for `receive.json`), or the
+answer is always `capabilities_unavailable`.
 
 Publish it as root:
 
@@ -495,12 +506,15 @@ Publish it as root:
 It removes the previous file, checks the helper image ID, labels and volumes as
 a restore does, runs that exact image once with no input, network, mount,
 capability or log to print its own `messaging_service.backup.SCHEMAS`, and
-writes `{"v":1,"helper_revision":…,"helper_schemas":[first,last]}` atomically
-with mode `0644`. A failed check leaves no file, never the previous helper's
-range. The [verifier service](deploy/deedkit-backup-r2-verifier.service) runs it
-before each verification with its failure ignored (`ExecStartPre=-`), so a
-failed publication never stops a restore. Run it again by hand after changing
-`helper_image`/`helper_revision`; until then the file may name the old helper.
+writes `{"v":1,"verifier_config":{…},"helper_revision":…,"helper_schemas":[first,last]}`
+atomically with mode `0644`. A failed check leaves no file, never the previous
+helper's range; a configuration changed during the probe also leaves none
+(`verifier_config_changed`). The
+[verifier service](deploy/deedkit-backup-r2-verifier.service) runs it before
+each verification with its failure ignored (`ExecStartPre=-`), so a failed
+publication never stops a restore. Run it again by hand after changing
+`helper_image`/`helper_revision`; until then `capabilities` answers
+`capabilities_unavailable`.
 
 Undo: remove the capabilities key line from `authorized_keys`, then delete the
 published file and the `ExecStartPre` line; the upload and cold keys and
