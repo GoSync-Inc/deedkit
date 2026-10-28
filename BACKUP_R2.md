@@ -378,6 +378,76 @@ status need operational monitoring; these unit examples do not send alerts or
 establish a live RPO/RTO. Disable only this timer if enrollment fails; retain its
 private evidence and reconcile its exact owned resources.
 
+## Receiver update follow
+
+The verifier's pinned helper (`helper_image`, `helper_revision` in
+`verifier.json`) follows main without a hand step (ANYM-597). The
+[oneshot service](deploy/deedkit-backup-r2-follow.service) and its
+[timer](deploy/deedkit-backup-r2-follow.timer) run
+`python -m messaging_service.backup_r2_follow --config /etc/deedkit-backup-r2/verifier.json follow`
+as root, an hour after the previous run ends. Each run:
+
+1. takes the verifier's lock, so it never runs while a verification runs, and
+   stops (`verification_pending`) while a verification retry journal
+   (`active.json`) pins the current pair;
+2. reads main's head with `git ls-remote` (no API quota) and fetches its
+   history treeless into `follow-main.git` in the verifier directory; it moves
+   only to a descendant of the pinned revision, never to an older commit
+   (`follow_not_forward`);
+3. verifies the head's `ghcr.io/gosync-inc/deedkit-backup` attestation with the
+   pinned tokenless verifier `/usr/local/libexec/deedkit/attest-verify` (the one
+   `production.py` runs, empty environment), pulls that image by digest and runs
+   the verifier's own preflight: image ID equal to the attested config digest,
+   the source and revision labels, no unexpected volume;
+4. reads the image's `backup.SCHEMAS` in a networkless, read-only container and
+   self-tests it: the image makes a synthetic PG18 bundle, encrypts it with
+   `age` to a throwaway ed25519 identity, and the verifier's isolated restore
+   runs it with that image as the helper. The proven schema must equal the
+   image's last one. The receiver's identity is never mounted;
+5. writes the kept pair to `follow-previous.json`, then replaces
+   `verifier.json` atomically with only the two pins changed, records the
+   proven pair in `follow-current.json` and drops the image of the pair before
+   the kept one (best effort, never a prune);
+6. publishes `capabilities.json` for the proven installed pair. It writes only
+   its own file in `/var/lib/deedkit-backup-r2/published/` (root, mode 0755,
+   created if missing), refuses to replace a file that is not a publication or
+   to share the directory with another file, and refuses a mount point.
+
+Anything unproven keeps the current pair. The run records `follow-status.json`
+(`current`, `switched`, `waiting` or `refused`, with a safe code and the
+exception chain without messages) and prints the code to the journal. A wait
+(main or GHCR unreachable, the head's image not published yet, a verification
+running) exits 0; a refusal exits 1. A crash before the switch leaves the old
+config; a crash after it leaves a stale publication (`capabilities_unavailable`)
+until the next run proves and publishes the installed pair. A pair installed
+before `backup.SCHEMAS` existed cannot be proven: no publication until the
+follow moves to a newer one. The follow does not update the verifier code in
+the venv; a schema beyond the venv's `backup_r2_verifier.SCHEMAS` fails the
+self-test and keeps the old pair until the venv is updated by hand.
+
+Requirements: `git`, `ssh-keygen`, the pinned `attest-verify` build (SHA-256 in
+`tools/attest-verify/attest-verify.linux-amd64.sha256`) and HTTPS to github.com
+and ghcr.io. Install and enable:
+
+```sh
+systemctl daemon-reload
+systemctl enable --now deedkit-backup-r2-follow.timer
+systemctl status deedkit-backup-r2-follow.service
+```
+
+Undo: disable the timer first (`systemctl disable --now
+deedkit-backup-r2-follow.timer`; otherwise the next run moves forward again),
+then switch back to the kept pair:
+
+```sh
+/opt/deedkit-backup-r2/venv/bin/python -m messaging_service.backup_r2_follow --config /etc/deedkit-backup-r2/verifier.json revert
+```
+
+`revert` rewrites the two pins from `follow-previous.json` (the replaced pair
+becomes the kept one) and republishes it when it was proven. A corrupt
+`follow-main.git` reads as `main_unreachable`; remove that directory and the
+next run fetches it again.
+
 ## First protected point and one-point rotation
 
 Run maintenance locally as root with trusted configuration and credentials.
@@ -490,10 +560,10 @@ root-published file at a path fixed in code, never configured:
 installed service's verifier configuration, outside `state_directory` (set the
 same value in the root operator copy).
 
-The publisher of that file is not part of this release; it comes with the
-receiver's update follow (ANYM-597). Until it exists, `capabilities` answers
-`capabilities_unavailable` and the deployer waits, as it does for every answer
-it cannot prove. The reader accepts a file only when it is root-owned,
+The receiver's update follow ([below](#receiver-update-follow), ANYM-597)
+publishes that file. Until it has proven the pinned helper, `capabilities`
+answers `capabilities_unavailable` and the deployer waits, as it does for every
+answer it cannot prove. The reader accepts a file only when it is root-owned,
 single-link, world-readable and not group/other-writable, under root-owned
 ancestors that are not group/other writable, and exactly
 `{"v":1,"verifier_config":{…},"helper_revision":"<40-hex>","helper_schemas":[first,last]}`.

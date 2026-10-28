@@ -73,7 +73,7 @@ def restored_schema_version(store,manifest_version):
         row=connection.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()
     actual=row.get('value') if row else None
     if (not isinstance(actual,str) or not actual.isascii() or not actual.isdigit() or len(actual)>3 or
-            int(actual) not in range(2,53) or type(manifest_version) is not int or int(actual)!=manifest_version):
+            int(actual) not in backup.SCHEMAS or type(manifest_version) is not int or int(actual)!=manifest_version):
         raise ValueError('restored_schema_mismatch')
     return int(actual)
 

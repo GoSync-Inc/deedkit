@@ -640,3 +640,313 @@ def test_helper_exit_mid_stream_reports_its_failure_fact_not_a_generic_code(oper
     for name in ('status.json','last-failure.json'):assert json.loads((directory/name).read_text())['error']==code
     assert len(helpers)==1 and helpers[0].stdin.writes==1 and helpers[0].stdin.closed
     assert helpers[0].terminated==hangs and not Path(config['protected_file']).exists()
+
+
+HEAD='d'*40;NEW_IMAGE='sha256:'+'c'*64
+SOURCE_LABEL='https://github.com/GoSync-Inc/deedkit'
+
+
+def image_labels(revision,source=SOURCE_LABEL):
+    return {'org.opencontainers.image.revision':revision,'org.opencontainers.image.source':source}
+
+
+@pytest.fixture
+def follower(operator,tmp_path,monkeypatch):
+    # The receiver update follow (ANYM-597) with synthetic main, attestation and Docker
+    # answers; the real verifier preflight, lock, config writes and capabilities reader.
+    v,config,receiver,cloud,engine,write_json=operator
+    from messaging_service import backup_r2_follow as f
+    path=Path(config['receiver_config_file']).parent/'verifier.json';write_json(path,config)
+    write_json(Path(config['receiver_config_file']),{**receiver,'verifier_config_file':str(path)})
+    (tmp_path/'published').mkdir(mode=0o755);(tmp_path/'published').chmod(0o755)
+    monkeypatch.setattr(r2,'CAPABILITIES_FILE',tmp_path/'published'/'capabilities.json')
+    monkeypatch.setattr(f,'mount_points',lambda:set())
+    images={config['helper_image']:{'Id':config['helper_image'],'Config':{'Labels':image_labels(config['helper_revision'])}},
+            NEW_IMAGE:{'Id':NEW_IMAGE,'Config':{'Labels':image_labels(HEAD)}},
+            v.POSTGRES_IMAGE:{'RepoDigests':['postgres@'+v.POSTGRES_IMAGE.split('@')[1]]}}
+    class Docker(f.Docker):
+        def __init__(self):super().__init__(900);self.pulled=[];self.removed=[]
+        def command(self,*args):
+            if args[:2]==('image','inspect'):
+                if args[2] not in images:raise RuntimeError('restore_docker_failed')
+                return r2.encoded([images[args[2]]])
+            if args[0]=='info':return str(tmp_path).encode()
+            raise AssertionError(args)
+        def pull(self,reference):self.pulled.append(reference)
+        def helper_schemas(self,image):return [2,50]
+        def remove_image(self,image):self.removed.append(image)
+    class Main:
+        def __init__(self):self.head_value=HEAD;self.forward_value=True
+        def head(self):return self.head_value
+        def forward(self,current,head):return self.forward_value
+    proofs={HEAD:{'reference':f.IMAGE+'@sha256:'+'e'*64,'digest':'sha256:'+'e'*64,'config_digest':NEW_IMAGE}}
+    def attest(sha):
+        if sha not in proofs:raise RuntimeError('helper_unattested')
+        return proofs[sha]
+    state=SimpleNamespace(f=f,v=v,path=path,config=config,receiver=receiver,docker=Docker(),main=Main(),
+                          images=images,proofs=proofs,tested=[],results={},write_json=write_json)
+    def self_test(engine,tested):
+        state.tested.append(tested['helper_revision'])
+        result=state.results.get(tested['helper_revision'],50)
+        if isinstance(result,Exception):raise result
+        return result
+    state.run=lambda:f.follow(path,engine=state.docker,main=state.main,attest=attest,test=self_test)
+    state.revert=lambda:f.revert(path,engine=state.docker)
+    state.published=lambda:r2.published_helper(r2.load_config(config['receiver_config_file']))
+    return state
+
+
+def follow_status(state):
+    return json.loads((Path(state.config['directory'])/'follow-status.json').read_text())
+
+
+# spec: ANYM-597
+def test_follow_installs_an_attested_newer_helper_after_its_self_test_and_publishes_its_schemas(follower,monkeypatch,capsys):
+    from test_backup_r2 import silent_stdin
+    s=follower;old=(s.config['helper_image'],s.config['helper_revision'])
+    result=s.run()
+    assert result['status']=='switched' and result['revision']==HEAD
+    installed=s.v.load_config(s.path)
+    assert (installed['helper_image'],installed['helper_revision'])==(NEW_IMAGE,HEAD)
+    assert {k:installed[k] for k in installed if k not in ('helper_image','helper_revision')}=={
+        k:s.config[k] for k in s.config if k not in ('helper_image','helper_revision')}
+    assert s.docker.pulled==[s.proofs[HEAD]['reference']] and s.tested==[old[1],HEAD]
+    previous=json.loads((Path(s.config['directory'])/'follow-previous.json').read_text())
+    assert (previous['helper_image'],previous['helper_revision'],previous['helper_schemas'])==(*old,[2,50])
+    published=s.published()
+    assert published['helper_revision']==HEAD and published['helper_schemas']==[2,50]
+    silent_stdin(monkeypatch);assert r2.main(['--config',s.config['receiver_config_file'],'capabilities'])==0
+    assert json.loads(capsys.readouterr().out)['helper_revision']==HEAD
+    assert follow_status(s)['status']=='switched'
+    # Main unchanged: nothing more to install or test.
+    assert s.run()['status']=='current' and s.tested==[old[1],HEAD] and len(s.docker.pulled)==1
+
+
+# spec: ANYM-597
+@pytest.mark.parametrize('case,code',[('unattested','helper_unattested'),('other_source','unreviewed_restore_image'),
+                                      ('other_revision','unreviewed_restore_image'),
+                                      ('volume','unexpected_restore_image_volume'),('older','follow_not_forward'),
+                                      ('wrong_digest','unreviewed_restore_image')])
+def test_follow_refuses_an_unproven_or_older_helper_and_keeps_the_current_pair(follower,case,code):
+    s=follower;before=s.path.read_bytes()
+    if case=='unattested':s.proofs.clear()
+    elif case=='other_source':s.images[NEW_IMAGE]['Config']['Labels']=image_labels(HEAD,'https://github.com/attacker/deedkit')
+    elif case=='other_revision':s.images[NEW_IMAGE]['Config']['Labels']=image_labels('f'*40)
+    elif case=='volume':s.images[NEW_IMAGE]['Config']['Volumes']={'/data':{}}
+    elif case=='older':s.main.forward_value=False
+    elif case=='wrong_digest':s.images[NEW_IMAGE]['Id']='sha256:'+'9'*64
+    with pytest.raises(Exception,match=code):s.run()
+    assert s.path.read_bytes()==before and s.tested==[s.config['helper_revision']]
+    assert not (Path(s.config['directory'])/'follow-previous.json').exists()
+    status=follow_status(s);assert status['error']==code and status['revision']==s.config['helper_revision']
+    assert status['status']==('waiting' if code=='helper_unattested' else 'refused')
+    # The current, self-tested pair is still published.
+    assert s.published()['helper_revision']==s.config['helper_revision']
+
+
+# spec: ANYM-597
+@pytest.mark.parametrize('failure',['raises','other_schema'])
+def test_follow_keeps_the_old_pair_when_the_new_helper_fails_its_self_test(follower,failure):
+    s=follower;before=s.path.read_bytes()
+    s.results[HEAD]=RuntimeError('isolated_restore_failed') if failure=='raises' else 49
+    with pytest.raises(Exception,match='isolated_restore_failed' if failure=='raises' else 'helper_self_test_mismatch'):s.run()
+    assert s.path.read_bytes()==before and s.tested==[s.config['helper_revision'],HEAD]
+    assert not (Path(s.config['directory'])/'follow-previous.json').exists()
+    assert s.published()['helper_revision']==s.config['helper_revision'] and follow_status(s)['status']=='refused'
+
+
+# spec: ANYM-597
+def test_follow_switch_is_atomic_when_it_crashes_writing_the_verifier_config(follower,monkeypatch):
+    s=follower;before=s.path.read_bytes();original=os.replace
+    def crash(src,dst,**kw):
+        if dst==s.path.name:raise OSError('synthetic crash')
+        return original(src,dst,**kw)
+    monkeypatch.setattr(os,'replace',crash)
+    with pytest.raises(OSError):s.run()
+    assert s.path.read_bytes()==before and s.v.load_config(s.path)['helper_revision']==s.config['helper_revision']
+    assert [p.name for p in s.path.parent.iterdir() if p.name.startswith('.verifier.json')]==[]
+    monkeypatch.setattr(os,'replace',original)
+    assert s.run()['status']=='switched' and s.published()['helper_revision']==HEAD
+
+
+# spec: ANYM-597
+def test_follow_crash_after_the_switch_retests_and_publishes_the_installed_pair(follower,monkeypatch):
+    s=follower;original=os.replace;writes=[]
+    def crash(src,dst,**kw):
+        if dst=='follow-current.json':
+            writes.append(dst)
+            if len(writes)==2:raise OSError('synthetic crash')
+        return original(src,dst,**kw)
+    monkeypatch.setattr(os,'replace',crash)
+    with pytest.raises(OSError):s.run()
+    assert s.v.load_config(s.path)['helper_revision']==HEAD
+    with pytest.raises(ValueError,match='capabilities_unavailable'):s.published()  # the old publication is stale
+    monkeypatch.setattr(os,'replace',original)
+    assert s.run()['status']=='current' and s.tested[-1]==HEAD and s.published()['helper_revision']==HEAD
+
+
+# spec: ANYM-597
+def test_follow_never_runs_during_a_verification_or_its_pending_retry(follower):
+    s=follower;before=s.path.read_bytes()
+    with s.v.verifier_lock(s.config['directory']):
+        with pytest.raises(RuntimeError,match='verifier_busy'):s.run()
+    active=Path(s.config['directory'])/'active.json';s.write_json(active,{'v':1,'phase':'restoring'})
+    with pytest.raises(RuntimeError,match='verification_pending'):s.run()
+    assert s.path.read_bytes()==before and not s.tested and not s.docker.pulled
+    with pytest.raises(RuntimeError,match='verification_pending'):s.revert()
+
+
+# spec: ANYM-597
+def test_follow_revert_switches_back_to_the_kept_pair_and_republishes_it(follower):
+    s=follower;old=(s.config['helper_image'],s.config['helper_revision'])
+    s.run()
+    result=s.revert()
+    installed=s.v.load_config(s.path)
+    assert result['status']=='reverted' and (installed['helper_image'],installed['helper_revision'])==old
+    assert s.published()['helper_revision']==old[1]
+    kept=json.loads((Path(s.config['directory'])/'follow-previous.json').read_text())
+    assert (kept['helper_image'],kept['helper_revision'])==(NEW_IMAGE,HEAD)
+
+
+# spec: ANYM-597
+@pytest.mark.parametrize('case,code',[('foreign_file','publication_directory_foreign'),
+                                      ('foreign_publication','publication_foreign'),
+                                      ('mount_point','publication_mount_point'),
+                                      ('writable_directory','untrusted_operator_ancestor')])
+def test_follow_publishes_only_its_own_file_in_a_root_directory_that_is_no_mount(follower,monkeypatch,case,code):
+    s=follower;s.main.head_value=s.config['helper_revision'];published=r2.CAPABILITIES_FILE.parent
+    if case=='foreign_file':(published/'notes.txt').write_text('operator')
+    elif case=='foreign_publication':r2.CAPABILITIES_FILE.write_text('{"v":1}');r2.CAPABILITIES_FILE.chmod(0o644)
+    elif case=='mount_point':monkeypatch.setattr(s.f,'mount_points',lambda:{str(published)})
+    elif case=='writable_directory':published.chmod(0o777)
+    with pytest.raises(ValueError,match=code):s.run()
+    assert follow_status(s)['error']==code
+    if case=='foreign_file':assert (published/'notes.txt').read_text()=='operator'
+    if case=='foreign_publication':assert r2.CAPABILITIES_FILE.read_text()=='{"v":1}'
+
+
+# spec: ANYM-597
+def test_follow_creates_a_searchable_publication_directory_under_a_private_umask(follower):
+    s=follower;s.main.head_value=s.config['helper_revision'];published=r2.CAPABILITIES_FILE.parent
+    published.rmdir();previous=os.umask(0o077)
+    try:assert s.run()['status']=='current'
+    finally:os.umask(previous)
+    assert published.stat().st_mode&0o777==0o755 and r2.CAPABILITIES_FILE.stat().st_mode&0o777==0o644
+    assert s.published()['helper_revision']==s.config['helper_revision']
+
+
+# spec: ANYM-597
+def test_follow_reads_main_forward_only_from_a_treeless_mirror(tmp_path):
+    from messaging_service import backup_r2_follow as f
+    import subprocess
+    source=tmp_path/'source';work=tmp_path/'work';work.mkdir(mode=0o700)
+    def git(*a):
+        return subprocess.run(['git','-C',str(source),'-c','user.name=t','-c','user.email=t@invalid',*a],check=True,
+                              capture_output=True).stdout.decode().strip()
+    subprocess.run(['git','init','--quiet','-b','main',str(source)],check=True)
+    git('commit','--quiet','--allow-empty','-m','one');first=git('rev-parse','HEAD')
+    git('commit','--quiet','--allow-empty','-m','two');second=git('rev-parse','HEAD')
+    main=f.Main(work,source='file://'+str(source))
+    assert main.head()==second
+    assert main.forward(first,second) is True
+    assert main.forward(second,first) is False and main.forward('0'*40,second) is False
+    assert (work/'follow-main.git').is_dir() and main.head()==second
+
+
+# spec: ANYM-597
+@pytest.mark.parametrize('case,code',[('absent','helper_unattested'),('unreached','attestation_unreachable'),
+                                      ('refused','helper_attestation_refused'),('other_reference','helper_attestation_refused'),
+                                      ('writable_binary','attest_verifier_unavailable'),('other_binary','attest_verifier_unavailable')])
+def test_follow_attestation_runs_the_pinned_verifier_without_credentials(tmp_path,monkeypatch,case,code):
+    from messaging_service import backup_r2_follow as f
+    import hashlib as h
+    import subprocess
+    binary=tmp_path/'attest-verify';binary.write_bytes(b'synthetic verifier');binary.chmod(0o755)
+    monkeypatch.setattr(f,'ATTEST_VERIFIER',binary);monkeypatch.setattr(f,'ATTEST_SHA256',h.sha256(b'synthetic verifier').hexdigest())
+    if case=='writable_binary':binary.chmod(0o777)
+    if case=='other_binary':monkeypatch.setattr(f,'ATTEST_SHA256','0'*64)
+    digest='sha256:'+'e'*64;calls=[]
+    answers={'absent':(1,b'',b'attest-verify: refused: manifest '+HEAD.encode()+b' not found\n'),
+             'unreached':(1,b'',b'attest-verify: refused: registry request failed\n'),
+             'refused':(1,b'',b'attest-verify: refused: certificate identity mismatch\n'),
+             'other_reference':(0,json.dumps({'sha':HEAD,'digest':digest,'config_digest':NEW_IMAGE,
+                                              'reference':'ghcr.io/attacker/deedkit-backup@'+digest}).encode(),b'')}
+    def run(args,**kw):
+        calls.append((args,kw.get('env')))
+        code_,out,err=answers.get(case,answers['refused'])
+        return subprocess.CompletedProcess(args,code_,out,err)
+    monkeypatch.setattr(f.subprocess,'run',run)
+    with pytest.raises(Exception,match=code):f.attested(HEAD)
+    if case not in ('writable_binary','other_binary'):
+        assert calls==[([str(binary),'--image',f.IMAGE,'--sha',HEAD],{'PATH':'/usr/bin:/bin'})]
+    answers['ok']=(0,json.dumps({'sha':HEAD,'digest':digest,'config_digest':NEW_IMAGE,'reference':f.IMAGE+'@'+digest}).encode(),b'')
+    if case=='refused':
+        case='ok';assert f.attested(HEAD)=={'reference':f.IMAGE+'@'+digest,'digest':digest,'config_digest':NEW_IMAGE}
+
+
+# spec: ANYM-597
+def test_follow_pins_the_reviewed_attestation_verifier_build():
+    from messaging_service import backup_r2_follow as f
+    recorded=(Path(__file__).parents[1]/'tools/attest-verify/attest-verify.linux-amd64.sha256').read_text().split()
+    assert recorded==[f.ATTEST_SHA256,'attest-verify'] and str(f.ATTEST_VERIFIER)=='/usr/local/libexec/deedkit/attest-verify'
+
+
+# spec: ANYM-597
+@pytest.mark.parametrize('code,exit_code',[('helper_unattested',0),('verifier_busy',0),('main_unreachable',0),
+                                           ('unreviewed_restore_image',1),('follow_not_forward',1)])
+def test_follow_service_exit_is_clean_only_while_it_waits(monkeypatch,capsys,code,exit_code):
+    from messaging_service import backup_r2_follow as f
+    def fail(path,**kw):raise RuntimeError(code)
+    monkeypatch.setattr(f,'follow',fail)
+    assert f.main(['--config','/etc/deedkit-backup-r2/verifier.json','follow'])==exit_code
+    assert json.loads(capsys.readouterr().err)['error']==code
+
+
+# spec: ANYM-597
+def test_follow_self_test_uses_a_throwaway_identity_and_removes_its_workspace(tmp_path,monkeypatch):
+    from messaging_service import backup_r2_follow as f
+    original=Path.lstat
+    def root_owned(p):
+        values=list(original(p));values[4]=0;return os.stat_result(values)
+    monkeypatch.setattr(Path,'lstat',root_owned)
+    v=module();directory=tmp_path/'verifier';directory.mkdir(mode=0o700)
+    stale='a'*32;(directory/(f.SELF_TEST+stale)/'fixture').mkdir(parents=True)
+    config={'directory':str(directory),'helper_image':NEW_IMAGE,'helper_revision':HEAD,'postgres_image':v.POSTGRES_IMAGE,
+            'identity_file':str(tmp_path/'receiver-identity-never-mounted')}
+    class Engine:
+        def __init__(self):self.calls=[];self.resources={};self.restored=[]
+        def inspect_owned(self,kind,name,run):return self.resources.get((kind,name))
+        def remove(self,kind,name):self.calls.append(('remove',kind,name));self.resources.pop((kind,name),None)
+        def setup(self,tested,run,payload,secret_dir):
+            for kind,name in v.names(run).items():self.resources[(kind,name)]={}
+        def command(self,*args):
+            self.calls.append(args)
+            if args[:2]==('container','create'):
+                self.resources[('helper',args[3])]={}
+                fixture=Path(next(a for a in args if a.startswith('type=bind,src=')).split('src=')[1].split(',')[0])
+                (fixture/'ciphertext').write_bytes(r2.AGE_HEADER+b'synthetic')
+                (fixture/'manifest-sha256').write_text('b'*64)
+                return b''
+            if args[:2]==('container','inspect'):return r2.encoded([{'State':{'ExitCode':0}}])
+            return b''
+        def restore(self,tested,receiver,client,receipt,run,payload,secret_dir):
+            assert tested['identity_file']!=config['identity_file'] and Path(tested['identity_file']).is_file()
+            assert tested['identity_file'].startswith(str(directory/f.SELF_TEST))
+            assert receipt['wire']['bytes']==len(client.get_object()['Body'].read())
+            self.restored.append(run)
+            for kind,name in v.names(run).items():self.resources[(kind,name)]={}
+            return {'v':1,'status':'verified','schema_version':50,'manifest_sha256':'b'*64,'checks':{k:True for k in r2.CHECKS}}
+    engine=Engine()
+    assert f.self_test(engine,config)==50
+    assert list(directory.iterdir())==[] and not engine.resources and len(engine.restored)==1
+
+
+# spec: ANYM-597
+def test_follow_service_stop_during_git_is_never_read_as_main_unreachable(tmp_path,monkeypatch):
+    from messaging_service import backup_r2_follow as f
+    def stopped(*a,**kw):r2.cancel(InterruptedError('restore_stopped'))
+    monkeypatch.setattr(f.subprocess,'run',stopped)
+    try:
+        with pytest.raises(InterruptedError):f.Main(tmp_path).head()
+        assert f.failure_code(InterruptedError('restore_stopped'))=='restore_stopped'
+    finally:r2.CANCELLED.clear()
