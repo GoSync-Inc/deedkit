@@ -27,6 +27,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.request
 
 REPOSITORY = "GoSync-Inc/deedkit"
@@ -44,10 +45,60 @@ REPORT = "added.json"
 PYTHON_PROJECTS = ("services/gateway", "services/calendar", "services/calls")
 NODE_TESTS = re.compile(r"\.test\.(js|mjs|cjs|ts)$")
 # The candidates are the file's `Test`, `Fuzz` (its seed corpus) and `Example` functions whose name goes on with no
-# lower-case letter; `TestMain` is the package's harness, not a test. Which of them run (an example only with an output
-# comment, in any comment form) is `go test -list`'s answer, not this pattern's.
+# lower-case letter; `TestMain` is the package's harness, not a test. Which of them `go test` runs (an example only with
+# an output comment, in any comment form) is Go's own parser's answer (GO_RUNNABLE), read without running the package.
 GO_COMMENT = r"/\*(?:[^*]|\*+[^*/])*\*+/"
 GO_TEST = re.compile(rf"^[ \t]*func\s+((?:Test|Fuzz|Example)(?![a-z])\w*)\s*(?:{GO_COMMENT}\s*)*\(", re.M)
+# cmd/go's rules (load/test.go): a top-level `Test`/`Fuzz` function other than `TestMain` whose name goes on with no
+# lower-case letter, and a go/doc example with output.
+GO_RUNNABLE = """package main
+
+import (
+\t"fmt"
+\t"go/ast"
+\t"go/doc"
+\t"go/parser"
+\t"go/token"
+\t"os"
+\t"strings"
+\t"unicode"
+\t"unicode/utf8"
+)
+
+func named(name, prefix string) bool {
+\tif !strings.HasPrefix(name, prefix) {
+\t\treturn false
+\t}
+\tif len(name) == len(prefix) {
+\t\treturn true
+\t}
+\tr, _ := utf8.DecodeRuneInString(name[len(prefix):])
+\treturn !unicode.IsLower(r)
+}
+
+func main() {
+\tfiles := token.NewFileSet()
+\tfor _, path := range os.Args[2:] { // after "--", which ends `go run`'s file list
+\t\tfile, err := parser.ParseFile(files, path, nil, parser.ParseComments)
+\t\tif err != nil {
+\t\t\tfmt.Fprintln(os.Stderr, err)
+\t\t\tos.Exit(1)
+\t\t}
+\t\tfor _, declaration := range file.Decls {
+\t\t\tfunction, ok := declaration.(*ast.FuncDecl)
+\t\t\tif ok && function.Recv == nil && function.Name.Name != "TestMain" &&
+\t\t\t\t(named(function.Name.Name, "Test") || named(function.Name.Name, "Fuzz")) {
+\t\t\t\tfmt.Println(function.Name.Name)
+\t\t\t}
+\t\t}
+\t\tfor _, example := range doc.Examples(file) {
+\t\t\tif example.Output != "" || example.EmptyOutput {
+\t\t\t\tfmt.Println("Example" + example.Name)
+\t\t\t}
+\t\t}
+\t}
+}
+"""
 QUEUE = """query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { mergeQueue(branch: "main") {
   entries(first: 100) { nodes { headCommit { oid } baseCommit { oid } pullRequest {
     number headRefName headRefOid headRepository { nameWithOwner } } } } } } }"""
@@ -224,19 +275,28 @@ def plan(document: dict, root: Path) -> list[dict]:
         elif language == "go":
             tests = sorted({test for name in names for test in go_tests((root / name).read_text(errors="replace"))})
             directory = PurePosixPath(package).relative_to(project) if project != "." else PurePosixPath(package)
-            selection = f"^({'|'.join(tests)})$" if tests else "^$"
-            argv = ["go", "test", "-count=1", "-v", "-run", selection, f"./{directory}"]
-            # Go lists the candidates it runs; each of them must report `=== RUN`, so a selection that misses one fails.
-            listing = ["go", "test", "-list", selection, f"./{directory}"]
-            expected = tests
+            argv = ["go", "test", "-count=1", "-v", "-run", selection(tests), f"./{directory}"]
+            expected = tests  # `run` replaces them with Go's answer; each must report `=== RUN`, or the job fails
         else:
             argv = ["node", "--test", *relative]
         # `uv run --frozen` installs a Python project's locked environment itself; a Node package installs its own.
         prepare = [["npm", "ci", "--ignore-scripts", "--no-audit"]] \
             if language == "node" and (root / project / "package-lock.json").is_file() else []
         runs.append({"language": language, "project": project, "files": names, "prepare": prepare, "argv": argv,
-                     "expected": expected, **({"list": listing} if language == "go" else {})})
+                     "expected": expected})
     return runs
+
+
+def selection(tests: list[str]) -> str:
+    return f"^({'|'.join(tests)})$" if tests else "^$"
+
+
+def go_runnable(paths: list[Path]) -> subprocess.CompletedProcess:
+    """The functions `go test` runs from these files, by Go's parser: nothing of the package runs to answer."""
+    with tempfile.TemporaryDirectory() as directory:
+        (Path(directory) / "runnable.go").write_text(GO_RUNNABLE)
+        return subprocess.run(["go", "run", "runnable.go", "--", *map(str, paths)], cwd=directory, check=False,
+                              capture_output=True, text=True)
 
 
 def go_tests(source: str) -> list[str]:
@@ -254,13 +314,13 @@ def run(document: dict, root: Path, evidence: Path) -> int:
         for argv in item["prepare"]:
             if item["returncode"] == 0:
                 item["returncode"] = subprocess.run(argv, cwd=root / item["project"], check=False).returncode
-        if item["returncode"] == 0 and item.get("list"):
-            listed_tests = subprocess.run(item["list"], cwd=root / item["project"], check=False, capture_output=True, text=True)
-            if listed_tests.returncode:
-                print(listed_tests.stdout + listed_tests.stderr, end="", flush=True)
-            item["returncode"] = listed_tests.returncode
-            registered = set(listed_tests.stdout.split())
-            item["expected"] = [name for name in item["expected"] if name in registered]
+        if item["returncode"] == 0 and item["language"] == "go":
+            found = go_runnable([(root / name).resolve() for name in item["files"]])
+            if found.returncode:
+                print(found.stdout + found.stderr, end="", flush=True)
+            item["returncode"] = found.returncode
+            item["expected"] = sorted(set(found.stdout.split()))
+            item["argv"][-2] = selection(item["expected"])
         if item["returncode"] == 0:
             done = subprocess.run(item["argv"], cwd=root / item["project"], check=False, capture_output=True, text=True)
             print(done.stdout + done.stderr, end="", flush=True)

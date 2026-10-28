@@ -351,7 +351,7 @@ def test_an_added_go_test_that_never_runs_fails_the_added_job(tmp_path, monkeypa
     (tmp_path / "go.mod").write_text("module example.com/x\n")
     (tmp_path / "x_test.go").write_text("func TestAdded(t *testing.T) {}\n")
     monkeypatch.setattr(added_tests.subprocess, "run", lambda argv, **kwargs: subprocess.CompletedProcess(
-        argv, 0, stdout="TestAdded\nok  \texample.com/x\t0.01s\n" if "-list" in argv else stdout, stderr=""))
+        argv, 0, stdout="TestAdded\n" if argv[:2] == ["go", "run"] else stdout, stderr=""))
     returncode = added_tests.run({"files": ["x_test.go"], "provenance": []}, tmp_path, tmp_path / "evidence")
     assert json.loads((tmp_path / "evidence" / "added.json").read_text())["result"] == expected
     assert returncode == (0 if expected == "passed" else 1)
@@ -374,6 +374,25 @@ def test_an_added_go_example_runs_in_every_output_comment_form(tmp_path, comment
     report = json.loads((tmp_path / "evidence" / "added.json").read_text())
     assert report["result"] == expected and returncode == (0 if expected == "passed" else 1)
     assert report["runs"][0]["expected"] == ([] if not comment else ["Example"])
+
+
+# spec: ANYM-578
+def test_an_added_test_main_that_never_runs_the_tests_fails_the_added_job(tmp_path):
+    import os
+    import shutil
+    if shutil.which("go") is None:
+        if os.environ.get("CI"):
+            pytest.fail("CI runs the Go case: no `go` on this runner")
+        pytest.skip("no `go` outside CI")
+    (tmp_path / "go.mod").write_text("module example.com/x\n\ngo 1.22\n")
+    (tmp_path / "x_test.go").write_text('package x\n\nimport (\n\t"fmt"\n\t"testing"\n)\n\n'
+                                        'func TestMain(m *testing.M) {}\n\n'
+                                        'func TestAdded(t *testing.T) { t.Fatal("fails by design") }\n\n'
+                                        'func Example() {\n\tfmt.Println("actual")\n\t// Output: expected\n}\n')
+    returncode = added_tests.run({"files": ["x_test.go"], "provenance": []}, tmp_path, tmp_path / "evidence")
+    report = json.loads((tmp_path / "evidence" / "added.json").read_text())
+    assert report["result"] == "failed" and returncode == 1
+    assert report["runs"][0]["expected"] == ["Example", "TestAdded"]
 
 
 # spec: ANYM-578
