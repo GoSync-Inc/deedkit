@@ -202,7 +202,8 @@ inbox it makes no model call; it only publishes ledger entries a stopped run lef
 - Before any answer is used, the stream's `init` must match the profile pinned with the CLI
   version: `tools`, `mcp_servers`, `slash_commands` and `skills` present and empty; plugins and
   agents exactly the pinned built-in sets (plugins with `path: builtin`). Any other event than init, assistant text,
-  rate-limit events and one result (a hook event, a tool call) refuses the run; nothing is
+  rate-limit events, thinking-token counts (their six fields only) and one result (a hook event,
+  a tool call) refuses the run; nothing is
   recorded.
 - The answer is closed: `{"decisions": [...]}` with `id`, `classification` (the classes above
   plus `already-live`), `specs`, `primary`, `duplicate_of`, `new_card`, `reason_code` (an enum;
