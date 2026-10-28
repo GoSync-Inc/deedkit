@@ -109,7 +109,7 @@ def test_initialize_and_stateless_reconnect_preserve_catalog(household):
             assert result.json()["result"]["serverInfo"]["name"] == "family-calendar-service"
             assert "mcp-session-id" not in result.headers
             listed = c.post("/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-            assert len(listed.json()["result"]["tools"]) == 11
+            assert len(listed.json()["result"]["tools"]) == 12
 
 
 def test_explicit_internal_host_does_not_trust_forwarded_identity(household):
@@ -144,7 +144,7 @@ def test_tool_annotations_separate_reads_local_plans_and_provider_writes(househo
         ).json()["result"]["tools"]
     hints = {tool["name"].removeprefix("family_"): tool["annotations"] for tool in listed}
     assert hints == ANNOTATIONS
-    reads = {"capabilities", "calendars", "members", "agenda", "slots", "operation", "assignments"}
+    reads = {"capabilities", "calendars", "members", "agenda", "slots", "operation", "assignments", "find_time"}
     assert {name for name, value in hints.items() if value["readOnlyHint"]} == reads
     assert hints["plan"] == {
         "readOnlyHint": False,

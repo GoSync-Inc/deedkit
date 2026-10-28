@@ -44,6 +44,8 @@ WAIT_ADMISSION = {
     # ANYM-551: a call waits up to wait_s for its end, never on dry_run; call_result waits the same way.
     ("calls", "call"): ("waits", lambda a: (a.get("wait_s") or 0) > 0 and not a.get("dry_run")),
     ("calls", "call_result"): ("waits", lambda a: (a.get("wait_s") or 0) > 0),
+    # ANYM-553: find_time refreshes and waits up to 20 s by default (refresh omitted); refresh=false never waits.
+    ("calendar", "find_time"): ("waits", lambda a: a.get("refresh", True) is not False),
 }
 
 

@@ -4611,6 +4611,125 @@
     }
   },
   {
+    "name": "calendar_find_time",
+    "description": "Read-only. Free times for you and people in one call. people: member names as calendar_members lists them (case-insensitive, whole name) or member IDs; you are included unless exclude_me. A name several members share, or one only part of a name matches, is selection_required: each candidate's next repeats the request with that member's ID (title left out: add it again) (with a second unresolved name the gateway relays it without next: name that member by ID); an unknown name is not_found with next calendar_members. window: today, tomorrow, this_week, next_week (Monday to Monday) in the family timezone, today and this_week from now; or {from, to} ISO 8601, without an offset read in the family timezone, at most 31 days. duration in minutes (default 30). slots (at most 20) are free intervals in the members' configured bindings, each with next: calendar_schedule create at its start with dry_run=true (a preview with a confirm_token, never an apply), with title (default \"Meeting with\" the others' names) and calendar when given; a key without plan:create and plan:execute gets slots without next. availability verified with no slots: next is this tool one step wider (a day, or a week for a week window). availability unknown (refresh pending, incomplete coverage or unbound_members): no slot is claimed. Every result states timezone and now.",
+    "inputSchema": {
+      "$defs": {
+        "Window": {
+          "additionalProperties": false,
+          "properties": {
+            "from": {
+              "title": "From",
+              "type": "string"
+            },
+            "to": {
+              "title": "To",
+              "type": "string"
+            }
+          },
+          "required": [
+            "from",
+            "to"
+          ],
+          "title": "Window",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "people": {
+          "items": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "People",
+          "type": "array"
+        },
+        "window": {
+          "anyOf": [
+            {
+              "enum": [
+                "today",
+                "tomorrow",
+                "this_week",
+                "next_week"
+              ],
+              "type": "string"
+            },
+            {
+              "$ref": "#/$defs/Window"
+            }
+          ],
+          "title": "Window"
+        },
+        "duration": {
+          "default": 30,
+          "maximum": 1440,
+          "minimum": 5,
+          "title": "Duration",
+          "type": "integer"
+        },
+        "exclude_me": {
+          "default": false,
+          "title": "Exclude Me",
+          "type": "boolean"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "calendar": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Calendar"
+        },
+        "refresh": {
+          "default": true,
+          "title": "Refresh",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "people",
+        "window"
+      ],
+      "title": "FindTime",
+      "type": "object"
+    },
+    "module": "calendar",
+    "operation": "find_time",
+    "scopes": [
+      "availability:read"
+    ],
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
     "name": "calls_capabilities",
     "module": "calls",
     "operation": "capabilities",
