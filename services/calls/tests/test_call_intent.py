@@ -434,6 +434,7 @@ def test_a_channel_revoked_between_preview_and_token_never_dials(world):
     w.doc["revision"] += 1
     w.save()
     error(execute(w, token), "not_found_or_forbidden")
+    error(execute(w, token), "not_found_or_forbidden")  # the refusal is the intent's result, never in_progress
     assert w.effects == 0 and w.service.list_calls() == []
 
 
@@ -496,7 +497,8 @@ def test_records_past_seven_days_keep_only_what_stops_a_second_dial(world):
     w = world()
     used = preview(w)["confirm_token"]
     by_token = agent.validate_result(execute(w, used))
-    args = {"to": TYPED, "goal": "Ask when it arrives", "request_id": "req-keep-1", "owner_instruction": TYPED_WORDS}
+    args = {"to": TYPED, "goal": "Ask when it arrives", "questions": ["When does it arrive?"], "request_id": "req-keep-1",
+            "owner_instruction": TYPED_WORDS}
     by_key = agent.validate_result(w.tool("p1", "call", args))
     unused = preview(w)["confirm_token"]
     w.offset += call_intent.KEEP_S + 1
@@ -506,7 +508,40 @@ def test_records_past_seven_days_keep_only_what_stops_a_second_dial(world):
     assert db.execute("SELECT payload,destination FROM call_previews WHERE token_sha256=?",
                       (call_intent.sha(used),)).fetchone() == ("{}", "{}")
     kept = db.execute("SELECT payload,origin FROM call_intents").fetchall()
-    assert len(kept) == 2 and all(set(json.loads(p)) == {"sha256"} and o == "{}" for p, o in kept)
+    assert len(kept) == 2 and all(set(json.loads(p)) <= {"sha256", "questions"} and o == "{}" for p, o in kept)
     # Replays still return the first call and never dial again; another payload under the key is still a conflict.
     assert w.tool("p1", "call", args) == by_key and execute(w, used) == by_token and w.effects == 2
     error(w.tool("p1", "call", {**args, "goal": "Ask something else"}), "idempotency_conflict")
+    result = w.tool("p1", "call_result", {"call_id": by_key["call_id"]})
+    assert result["questions"] == {"answer_1": "When does it arrive?"}
+
+
+# spec: ANYM-551
+def test_concurrent_recoveries_never_hide_the_placed_call(world):
+    w = world()
+    token = preview(w)["confirm_token"]
+
+    async def die(*args, **kwargs):
+        raise Died()
+    w.outbound.dial = die
+    with pytest.raises(Crash):
+        execute(w, token)
+    plan, plans = w.api.intents.plan, []
+
+    async def drifting_plan(*args):
+        plans.append(1)
+        if len(plans) == 2:
+            w.target["phone"] = OTHER_PHONE  # the second recovery would see a drifted source
+        await asyncio.sleep(0.05)
+        return await plan(*args)
+    w.api.intents.plan = drifting_plan
+
+    async def both():
+        return await asyncio.gather(*(w.api.call("p1", "call", {"confirm_token": token,
+                                                                 "owner_instruction": ARCHIVE_WORDS})
+                                      for _ in range(2)), return_exceptions=True)
+    results = w.run(both())
+    assert [r.code for r in results if isinstance(r, ServiceError)] == ["in_progress"] and len(plans) == 1
+    done = next(r for r in results if isinstance(r, dict))
+    assert done["state"] == "succeeded" and w.effects == 1
+    assert execute(w, token) == done
