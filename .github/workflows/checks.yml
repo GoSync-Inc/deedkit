@@ -160,6 +160,17 @@ jobs:
           exit 1
       - name: Install pinned dependencies
         run: uv sync --frozen --group dev
+      - name: Every uv.lock matches its pyproject.toml
+        # `uv sync --frozen` installs a stale lock without complaint; this fails when any tracked project's lock
+        # would change on `uv lock`.
+        id: uv_locks
+        run: |
+          status=0
+          while IFS= read -r lock; do
+            project=$(dirname "$lock")
+            uv lock --check --project "$project" || { echo "::error file=$lock::$lock is stale: run uv lock in $project"; status=1; }
+          done < <(git ls-files -- 'uv.lock' '*/uv.lock')
+          exit "$status"
       - name: Build packages
         id: build
         run: |
@@ -380,6 +391,11 @@ jobs:
         working-directory: packages/npm
         # The wake relay shares this report: a new evidence file would need its own scripts/tiden_ci.py fragment entry.
         run: node --test --test-reporter=junit test/*.test.js ../wake-relay/test/*.test.mjs > "$RUNNER_TEMP/ci-evidence/npm.xml"
+      - name: DeedKit JavaScript client and CLI tests
+        # packages/deedkit (ANYM-261) has no Tiden evidence file yet: a failure fails this job like any other step.
+        id: deedkit_npm
+        if: ${{ !cancelled() }}
+        run: npm test --prefix packages/deedkit
       - name: Real synthetic MCP and HTTP with restricted gateway role
         id: smoke
         run: uv run python scripts/smoke.py --dsn-file "$RUNNER_TEMP/anymsg-test.dsn"
