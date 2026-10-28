@@ -100,6 +100,11 @@ def parser():
     )
     disable = sub.add_parser("disable-write")
     disable.add_argument("--calendar", required=True)
+    # One-call scheduling (ANYM-552): the zone offset-free times are read in and the calendar used by default.
+    settings = sub.add_parser("family-settings")
+    settings.add_argument("--group", default="family")
+    settings.add_argument("--timezone")
+    settings.add_argument("--default-calendar")
     agent = sub.add_parser("agent-key")
     agent.add_argument("--id", required=True)
     agent.add_argument("--group", default="family")
@@ -284,6 +289,8 @@ def dispatch(args, home, root, config, store):
     if args.action == "bind":
         store.binding(args.group, args.member, args.calendar)
         return {"binding_saved": True}
+    if args.action == "family-settings":
+        return store.family_settings(args.group, args.timezone, args.default_calendar)
     if args.action in ("allow-write", "disable-write"):
         store.write_opt_in(args.calendar, args.action == "allow-write")
         return {"write_enabled": args.action == "allow-write"}
