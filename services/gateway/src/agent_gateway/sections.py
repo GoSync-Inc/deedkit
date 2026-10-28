@@ -7,7 +7,7 @@ from .policy import Denied
 # Same section names as the messaging backend; each holds the keys of the gateway payload
 # that replace or keep the backend's block. A key in no section appears only in `full`.
 SECTIONS = {
-    "identity": ("service", "version", "principal", "scope_version", "credential_id", "expires_at",
+    "identity": ("service", "version", "build", "principal", "scope_version", "credential_id", "expires_at",
                  "key_permission_version", "chat_scope", "auth_mode", "gateway_principal",
                  "backend_principal", "gateway_policy_revision"),
     "accounts": ("accounts",),
@@ -106,8 +106,9 @@ def capabilities_view(result, args):
     scope = result.get("chat_scope") if isinstance(result.get("chat_scope"), dict) else {}
     chats = scope.get("chat_ids")
     accounts = result.get("accounts") if isinstance(result.get("accounts"), list) else []
-    summary = {key: result[key] for key in ("service", "version", "gateway_principal", "backend_principal",
-                                            "credential_id", "expires_at") if key in result}
+    # ANYM-592: the backend's `build` (source commit, start time) stays in the default view, unchanged.
+    summary = {key: result[key] for key in ("service", "version", "build", "gateway_principal",
+                                            "backend_principal", "credential_id", "expires_at") if key in result}
     # ANYM-470: the backend key's expiry and each owner's ID stay in the default view.
     summary.update(
         accounts=[{k: a.get(k) for k in ("id", "platform", "label")}

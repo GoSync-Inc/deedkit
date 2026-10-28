@@ -27,6 +27,16 @@ from .policy import (DEFAULT_PERMISSIONS, OPERATION_PERMISSIONS, UNSET, audit,
                      key_id, lock_principal, normalize_policy, principal_id,
                      scope_filter, targets, effective_permissions, PERMISSIONS, normalize_list,
                      LEGACY_PERMISSIONS)
+from .telemetry import source_sha
+
+
+# When this messaging server process started (ANYM-592): with the source commit, "commit X running since T".
+STARTED_AT=datetime.now(timezone.utc)
+
+
+def build():
+    """The commit this server was built from (telemetry's rule) and its start time, read anew on every call."""
+    return {'source_sha':source_sha(),'started_at':STARTED_AT.strftime('%Y-%m-%dT%H:%M:%S.%fZ')}
 
 
 class APIError(Exception):
@@ -195,7 +205,7 @@ def lock_replay_tables(c, seconds=2):
 # capabilities sections (ANYM-270): each key of the full payload sits in exactly one
 # named block, with today's shape; summary is the short index an agent reads first.
 CAPABILITY_SECTIONS={
-    'identity':('service','version','principal','scope_version','credential_id','permissions','expires_at','key_permission_ceiling',
+    'identity':('service','version','build','principal','scope_version','credential_id','permissions','expires_at','key_permission_ceiling',
                 'key_permission_version','chat_scope','auth_mode'),
     'accounts':('accounts',),'coverage':('synthetic','sources','coverage'),
     'tool_manifest':('tool_manifest','available'),'search_options':('search_options',),'sending':('sending',),
@@ -222,7 +232,7 @@ def capability_view(full, detail='full', sections=None, permitted=None):
     if detail=='full':return full
     if detail!='summary':raise APIError('invalid_filter')
     scope=full['chat_scope']
-    return {'service':full['service'],'version':full['version'],'principal':full['principal'],
+    return {'service':full['service'],'version':full['version'],'build':full['build'],'principal':full['principal'],
         'credential_id':full['credential_id'],'permissions':full['permissions'],'expires_at':full['expires_at'],
         # ANYM-470: the key's expiry and each owner's ID stay in the default view.
         'accounts':[{k:a[k] for k in ('id','platform','label','self_provider_id')} for a in full['accounts']],
@@ -518,7 +528,7 @@ class Store:
             if any(spec['permission'] in p['permissions'] for spec in OPERATIONS.values()):
                 available.extend(operation_tools)
             else:available.append('list_messenger_operations')
-            return capability_view({'service': 'anymsg', 'version': __version__, **dataset,
+            return capability_view({'service': 'anymsg', 'version': __version__, 'build': build(), **dataset,
                 'tool_manifest':{'version':__version__,'names':sorted(OPERATION_PERMISSIONS.keys()-{'download'}),
                     'discovery_action':'refresh_connection_if_tools_list_differs',
                     'rest_fallback':'POST /v1/{tool_name} with the same bearer and JSON parameters'},
