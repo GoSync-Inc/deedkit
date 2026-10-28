@@ -445,6 +445,28 @@ def test_a_container_left_created_or_started_after_its_release_is_removed(source
 
 
 # spec: ANYM-588
+def test_a_late_container_that_cannot_be_removed_keeps_its_copy_unreleased_and_pauses(tmp_path, monkeypatch):
+    docker = FakeDocker(monkeypatch, stops=False, containers=0)
+    monkeypatch.setattr(p, "COPY_STOP_READBACK", 0)
+    late = unreleased(tmp_path, stamp(47.5))
+    p.write_record(late / "released.json", {"id": late.name})
+    original = docker.__call__
+    def listing(argv, **kwargs):
+        if "--format" in argv:
+            docker.calls.append(argv)
+            docker.running = 1
+            return late.name + "\n"
+        return original(argv, **kwargs)
+    monkeypatch.setattr(p, "run", listing)
+    with pytest.raises(p.CopyStuck, match=late.name):
+        p.settle_copies(tmp_path)
+    assert not (late / "released.json").exists() and (late / "owner.json").exists()
+    # Past 48 h the dump goes, the owner record stays for the next run.
+    assert p.expire_copies(tmp_path, at=datetime.now(timezone.utc) + timedelta(hours=1)) == [late.name]
+    assert [path.name for path in late.iterdir()] == ["owner.json"]
+
+
+# spec: ANYM-588
 def test_free_space_read_while_the_restore_runs_cancels_it_below_the_reserve(source, monkeypatch):
     settings, _ = source
     reads = []

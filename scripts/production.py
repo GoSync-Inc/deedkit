@@ -2149,9 +2149,12 @@ def reconcile_copies(state):
     """C4: release every copy a crashed or killed run left without `released.json`, each on its own: (the ids released,
     the ids that could not be). A container that appeared after its copy was released (a start a crash left in
     flight) carries the label of a released copy and is removed too."""
+    root = copies_root(state)
     released, stuck, done = [], [], set()
-    for directory in copy_directories(copies_root(state)):
-        if not (directory / "owner.json").exists() or (directory / "released.json").exists():
+    for directory in copy_directories(root):
+        if not (directory / "owner.json").exists():
+            continue
+        if (directory / "released.json").exists():
             done.add(directory.name)
             continue
         try:
@@ -2159,11 +2162,23 @@ def reconcile_copies(state):
             released.append(directory.name)
         except Exception:
             stuck.append(directory.name)
-    with suppress(Exception):
-        late = run(["docker", "ps", "-a", "--filter", "label=deedkit-copy", "--format", '{{.Label "deedkit-copy"}}'],
-                   timeout=60).split()
-        for copy_id in sorted(set(late) & done):
-            stop_copy_containers({"id": copy_id})
+    if not done and not released:
+        return released, stuck
+    try:
+        late = set(run(["docker", "ps", "-a", "--filter", "label=deedkit-copy", "--format",
+                        '{{.Label "deedkit-copy"}}'], timeout=60).split())
+    except Exception:
+        late = set()  # Docker cannot list: the next run looks again, as long as the copy is kept.
+    for copy_id in sorted(late & (done | set(released))):
+        # The same confirmed release; unconfirmed, the copy counts as unreleased again, so expiry keeps its owner.json.
+        try:
+            release_copy(owned_copy(root / copy_id))
+        except Exception:
+            with suppress(FileNotFoundError):
+                (root / copy_id / "released.json").unlink()
+            stuck.append(copy_id)
+            if copy_id in released:
+                released.remove(copy_id)
     return released, stuck
 
 
