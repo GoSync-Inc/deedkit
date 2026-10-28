@@ -612,3 +612,28 @@ async def test_conversation_tools_allow_the_model_to_continue_after_saving(mode,
     assert result.get('scheduling','WHEN_IDLE')=='WHEN_IDLE', \
         'Saving during a conversation must allow the next question, not wait for the human to repeat'
     assert worker.frames==[], 'Resume through the native result, without an extra LLM run'
+
+
+# spec: ANYM-617
+@pytest.mark.parametrize('is_final,will_continue',[(True,False),(False,True)])
+async def test_flows_tool_result_takes_pipecat_1_14_keywords_and_closes_a_final_call(is_final,will_continue):
+    import json
+    from google.genai.live import AsyncSession
+    from voice import AuditedGemini
+    responses = []
+    class Socket:
+        async def send(self, message):
+            responses.append(json.loads(message))
+    class Session:
+        _api_client = SimpleNamespace(vertexai=False)
+        _ws = Socket()
+        send_tool_response = AsyncSession.send_tool_response
+    llm = AuditedGemini(api_key='fixture-not-a-key',live_flows=True)
+    llm._session = Session()
+    llm._disconnecting = False
+    llm._function_is_async = lambda name: True
+    # Pipecat 1.14 passes is_final and spoken; the result's own scheduling hint still decides.
+    await llm._tool_result('note-2','record_answer',{'ok':True},is_final=is_final,spoken=False)
+    payload = responses[0]['tool_response']['functionResponses'][0]
+    assert payload.get('will_continue',False) is will_continue
+    assert payload.get('scheduling') == 'WHEN_IDLE' and payload['id'] == 'note-2'

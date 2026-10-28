@@ -317,3 +317,35 @@ async def test_a_failing_inbound_probe_constructor_never_stops_the_call_before_t
     await _stubbed_run_transport(monkeypatch,Service(),running,probe=broken)
     # The runner started, and the empty stand-in still produced its end-of-call diagnostics event.
     assert ran==[True] and events==['provider_audio_health','inbound_audio']
+
+
+# spec: ANYM-617
+async def test_call_worker_gives_every_custom_processor_start_before_audio_and_end_last():
+    import asyncio
+    import voice
+    from live_flows import SpeechSafety
+    from pipecat.frames.frames import EndFrame, InputAudioRawFrame, OutputAudioRawFrame, StartFrame
+    seen={}
+    def watched(cls,*args):
+        class Watched(cls):
+            async def process_frame(self,frame,direction):
+                if isinstance(frame,(StartFrame,EndFrame,InputAudioRawFrame,OutputAudioRawFrame)):
+                    seen.setdefault(cls.__name__,[]).append(type(frame).__name__)
+                await super().process_frame(frame,direction)
+        return Watched(*args)
+    counted=[]
+    probe=SimpleNamespace(input=lambda audio,rate,channels:counted.append(('in',rate)))
+    health=SimpleNamespace(stop_audio=lambda:None,audio=lambda size,rate,channels:counted.append(('out',rate)))
+    async def activity(speaking):pass
+    worker=voice.call_worker([watched(voice.InboundAudioProbe,probe),watched(SpeechSafety,activity),
+        watched(voice.AudioDeliveryProbe,health)])
+    # Synthetic transport: audio frames queued before the worker starts, then the end.
+    await worker.queue_frames([InputAudioRawFrame(bytes(640),16000,1),OutputAudioRawFrame(bytes(960),24000,1),EndFrame()])
+    runner=voice.WorkerRunner(handle_sigint=False)
+    await runner.add_workers(worker)
+    await asyncio.wait_for(runner.run(),10)
+    assert set(seen)=={'InboundAudioProbe','SpeechSafety','AudioDeliveryProbe'}
+    for name,order in seen.items():
+        assert order[0]=='StartFrame' and order[-1]=='EndFrame',(name,order)
+        assert order[1:-1]==['InputAudioRawFrame','OutputAudioRawFrame'],(name,order)
+    assert ('in',16000) in counted and ('out',24000) in counted

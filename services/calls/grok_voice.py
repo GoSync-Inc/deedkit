@@ -8,7 +8,7 @@ from audio_health import ProviderAudioHealth
 
 
 class AuditedGrok(GrokRealtimeLLMService):
-    def __init__(self, brief, key, recorder=None, *, input_rate=16000, silent_start=False):
+    def __init__(self, brief, key, recorder=None, *, input_rate=16000, silent_start=False, file_resolver=None):
         self.recorder = recorder
         # A session resumed after an out-of-band key press (ANYM-451) takes its history without answering it.
         self.silent_start = silent_start
@@ -24,7 +24,7 @@ class AuditedGrok(GrokRealtimeLLMService):
                 self.hint_unavailable = True
         # xAI takes the frame bytes as they are, so the declared rate must equal the
         # transport's frames; undeclared, it assumes 24 kHz (ANYM-359).
-        super().__init__(api_key=key, settings=self.Settings(
+        super().__init__(api_key=key, file_resolver=file_resolver, settings=self.Settings(
             model=brief['model'], system_instruction=brief['prompt'],
             session_properties=events.SessionProperties(
                 voice=brief['grok_voice'],
@@ -55,9 +55,9 @@ class AuditedGrok(GrokRealtimeLLMService):
     async def _create_response(self):
         if not self.silent_start or not self._api_session_ready or not self._llm_needs_conversation_setup:
             return await super()._create_response()
-        # Pinned Pipecat 1.12 conversation setup, without response.create: wait for speech.
+        # Pinned Pipecat 1.14 conversation setup, without response.create: wait for speech.
         self.silent_start = False
-        for item in self.get_llm_adapter().get_llm_invocation_params(self._context)['messages']:
+        for item in (await self.get_llm_adapter().get_llm_invocation_params(self._context))['messages']:
             event = events.ConversationItemCreateEvent(item=item)
             self._messages_added_manually[event.item.id] = True
             await self.send_client_event(event)
