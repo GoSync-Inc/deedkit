@@ -285,7 +285,7 @@ def match(state):
         raise Refused('no snapshot: run `snapshot` first')
     specs = known(snap)
     inbox = load(state / 'inbox.json', {})
-    versions = indexed(variants(snap))
+    versions = indexed(variants(snap)) if inbox else []  # nothing to match: no version is read
     out = [{'id': i, 'category': item.get('category'), 'operation': item.get('operation'),
             'candidates': [{'ref': ref, 'title': specs[ref]['title'], 'status': specs[ref]['status'],
                             'branch': specs[ref]['branch']} for ref in candidates(item, versions)]}
