@@ -241,7 +241,7 @@ def test_check_validates_and_reports_the_schema_and_writes_nothing(granted, sche
     path = key_file(tmp_path)
     before = store.query("SELECT id,key_hash,expires_at,enabled FROM principals ORDER BY id")
     result = dispatch(store, tmp_path, command, *check_arguments(path)[command], "--check")
-    assert result == ({"check": "ok", "schema_version": 3, "required": 3} if current
+    assert result == ({"check": "ok", "schema_version": 4, "required": 3} if current
                       else {"check": "schema_not_ready", "schema_version": 2, "required": 3})
     assert store.query("SELECT id,key_hash,expires_at,enabled FROM principals ORDER BY id") == before
 
@@ -274,8 +274,8 @@ def test_migration_three_is_additive_and_repeatable(schema_two):
     schema_two.migrate()
     assert schema_two.query("SELECT to_jsonb(p) AS p FROM principals p") == before
     v3 = hashlib.sha256(store_module.MIGRATIONS[2][1].read_bytes()).hexdigest()
-    assert schema_two.query("SELECT version,checksum FROM migrations ORDER BY version")[-1] == {
-        "version": 3, "checksum": v3}
+    assert schema_two.query("SELECT version,checksum FROM migrations WHERE version=3") == [{
+        "version": 3, "checksum": v3}]
     assert schema_two.agent_info([key])[0]["principal_id"] == "planner"
     with pytest.raises(psycopg.errors.CheckViolation):
         schema_two.query("INSERT INTO principal_operations VALUES ('bad id',%s,'planner')", ("0" * 64,))
