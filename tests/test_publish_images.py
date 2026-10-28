@@ -6,6 +6,8 @@ import re
 import subprocess
 import tarfile
 
+import hypothesis
+from hypothesis import strategies as st
 import pytest
 import yaml
 
@@ -14,6 +16,8 @@ from scripts import production
 
 ROOT = Path(__file__).resolve().parents[1]
 SHA = "c" * 40
+ATTEMPT = "40667989770-1"
+STAGING = f"{SHA}-attempt-{ATTEMPT}"
 MANIFEST = "application/vnd.docker.distribution.manifest.v2+json"
 
 
@@ -51,6 +55,7 @@ class FakeRegistry(pi.Registry):
     def __init__(self, rewrite=False):
         super().__init__("ghcr.io/gosync-inc")
         self.tags, self.configs, self.pushes, self.rewrite = {}, {}, [], rewrite
+        self.reads, self.puts, self.reserialize, self.lose_put, self.lose_push = [], [], False, set(), False
 
     def store(self, reference, config):
         config_digest = "sha256:" + hashlib.sha256(config).hexdigest()
@@ -59,8 +64,24 @@ class FakeRegistry(pi.Registry):
         self.configs[config_digest] = config
 
     def manifest(self, reference):
+        self.reads.append(reference)
         raw = self.tags.get(reference)
         return None if raw is None else ("sha256:" + hashlib.sha256(raw).hexdigest(), json.loads(raw))
+
+    def fetch(self, reference):
+        """By digest: the stored bytes, or with `reserialize` a client's re-encoding of them."""
+        self.reads.append(reference)
+        name, _, digest = reference.partition("@")
+        raw = next((raw for tag, raw in self.tags.items()
+                    if tag.startswith(name + ":") and "sha256:" + hashlib.sha256(raw).hexdigest() == digest), None)
+        return json.dumps(json.loads(raw), indent=1).encode() if raw is not None and self.reserialize else raw
+
+    def put(self, reference, raw, media_type):
+        assert media_type == json.loads(raw)["mediaType"]
+        self.puts.append(reference)
+        self.tags[reference] = raw
+        if reference in self.lose_put:  # the registry stored it, the response never arrived
+            raise pi.Refused(f"cannot write {reference}: connection reset by peer")
 
     def config(self, reference, manifest):
         return json.loads(self.configs[manifest["config"]["digest"]])
@@ -70,6 +91,8 @@ class FakeRegistry(pi.Registry):
         _, config = pi.archive_config(archive)
         blob = json.dumps({**config, "rewritten": True} if self.rewrite else config, sort_keys=True).encode()
         self.store(reference, blob)
+        if self.lose_push:  # the upload landed but skopeo reported a failure
+            raise pi.Refused("skopeo copy failed (exit 1): connection reset by peer")
 
 
     def tagged(self, target, sha=SHA):
@@ -84,6 +107,12 @@ def published(registry, target, sha=SHA, salt="", **change):
                         sort_keys=True).encode()
     registry.store(f"{registry.name(target)}:{sha}", config)
     return "sha256:" + hashlib.sha256(config).hexdigest()
+
+
+def legacy(registry, target, images):
+    """The final tag a run before ANYM-602 pushed straight from this archive (the same bytes push() stores)."""
+    _, config = pi.archive_config(images / f"image-{target}" / "image.tar")
+    registry.store(f"{registry.name(target)}:{SHA}", json.dumps(config, sort_keys=True).encode())
 
 
 def never_attested(*_):
@@ -141,7 +170,8 @@ def test_build_jobs_export_the_tested_image_and_dry_run_its_publication():
     run = steps[export]["run"]
     # The export names the same commit check-image built, and the dry run never leaves the runner.
     assert 'sha="$(git rev-parse HEAD)"' in run and "export --target \"$TARGET\" --sha \"$sha\"" in run
-    assert "--local-dry-run --registry localhost:5000/dry-run" in run and "for expected in push attest" in run
+    assert "--local-dry-run --registry localhost:5000/dry-run" in run and "for expected in push reuse" in run
+    assert '--attempt "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"' in run
     assert '--directory "$RUNNER_TEMP/images/image-$TARGET"' in run
     assert steps[upload]["with"]["path"] == "${{ runner.temp }}/images/image-${{ matrix.target }}"
     # Pull requests and main pushes run it; merge queue runs and other-revision baselines do not.
@@ -161,10 +191,11 @@ def test_a_dry_run_writes_no_step_outputs(tmp_path, monkeypatch):
     outputs.write_text("")
     monkeypatch.setenv("GITHUB_OUTPUT", str(outputs))
     seen = []
-    monkeypatch.setattr(pi, "publish", lambda registry, sha, images, out, verify, targets: seen.append(out) or [])
-    pi.main(["publish", "--local-dry-run", "--registry", "localhost:5000/dry-run", "--sha", SHA,
+    monkeypatch.setattr(pi, "publish", lambda registry, sha, images, out, verify, targets, attempt: seen.append(out) or [])
+    monkeypatch.setattr(pi, "promote", lambda *_: {})
+    pi.main(["publish", "--local-dry-run", "--registry", "localhost:5000/dry-run", "--sha", SHA, "--attempt", ATTEMPT,
              "--directory", str(tmp_path), "--target", "gateway"])
-    pi.main(["publish", "--sha", SHA, "--directory", str(tmp_path), "--target", "gateway"])
+    pi.main(["publish", "--sha", SHA, "--attempt", ATTEMPT, "--directory", str(tmp_path), "--target", "gateway"])
     assert seen == [None, str(outputs)]
 
 
@@ -242,37 +273,41 @@ def test_write_once_decision_never_moves_an_unverified_tag(existing, artifact, m
 def test_first_publication_pushes_the_exact_tested_config(tmp_path):
     registry = FakeRegistry()
     tested = exported(tmp_path, "runtime")
-    result = pi.publish_one(registry, "runtime", SHA, tmp_path, never_attested)
-    assert result["action"] == "push" and result["attest"] and registry.pushes == [f"ghcr.io/gosync-inc/deedkit-runtime:{SHA}"]
-    assert registry.tagged("runtime")[1]["config"]["digest"] == tested and result["digest"] == registry.tagged("runtime")[0]
+    result = pi.publish_one(registry, "runtime", SHA, tmp_path, never_attested, ATTEMPT)
+    assert result["action"] == "push" and result["attest"] and registry.pushes == [f"ghcr.io/gosync-inc/deedkit-runtime:{STAGING}"]
+    staged = registry.tagged("runtime", STAGING)
+    assert staged[1]["config"]["digest"] == tested and result["digest"] == staged[0]
+    assert registry.manifest(f"ghcr.io/gosync-inc/deedkit-runtime:{SHA}") is None  # final only after verification
 
 
 def test_a_pushed_manifest_without_the_tested_config_is_refused(tmp_path):
     exported(tmp_path, "gateway")
     with pytest.raises(pi.Refused, match="tested image config"):
-        pi.publish_one(FakeRegistry(rewrite=True), "gateway", SHA, tmp_path, never_attested)
+        pi.publish_one(FakeRegistry(rewrite=True), "gateway", SHA, tmp_path, never_attested, ATTEMPT)
 
 
 def test_rerun_after_an_interrupted_attestation_attests_without_pushing(tmp_path):
     registry = FakeRegistry()
     exported(tmp_path, "calls")
-    first = pi.publish_one(registry, "calls", SHA, tmp_path, never_attested)
-    # The attest step never ran (job cancelled after the push); the rerun keeps the same archive.
-    second = pi.publish_one(registry, "calls", SHA, tmp_path, never_attested)
-    assert second == {**first, "action": "attest"} and len(registry.pushes) == 1
+    # A run before ANYM-602 pushed the final tag and its attest step never ran (job cancelled after the push).
+    legacy(registry, "calls", tmp_path)
+    # The rerun keeps the same archive: the legacy state is still repaired in place.
+    second = pi.publish_one(registry, "calls", SHA, tmp_path, never_attested, ATTEMPT)
+    assert second == {"target": "calls", "action": "attest", "digest": registry.tagged("calls")[0], "attest": True}
+    assert registry.pushes == []
 
 
 def test_rerun_after_artifacts_expired_refuses_an_unattested_tag_without_moving_it(tmp_path):
     registry = FakeRegistry()
     exported(tmp_path / "first", "backup")
-    pi.publish_one(registry, "backup", SHA, tmp_path / "first", never_attested)
+    legacy(registry, "backup", tmp_path / "first")  # a final tag left unattested by a run before ANYM-602
     before = dict(registry.tags)
     with pytest.raises(pi.Refused, match="without a valid attestation"):
         pi.publish_one(registry, "backup", SHA, tmp_path / "expired", never_attested)
     exported(tmp_path / "rebuilt", "backup", salt="rebuilt")
     with pytest.raises(pi.Refused, match="without a valid attestation"):
         pi.publish_one(registry, "backup", SHA, tmp_path / "rebuilt", never_attested)
-    assert registry.tags == before and len(registry.pushes) == 1
+    assert registry.tags == before and registry.pushes == []
 
 
 def test_full_rerun_reuses_the_attested_image_and_pushes_nothing(tmp_path):
@@ -314,7 +349,8 @@ def test_publication_writes_digest_and_attest_outputs_for_every_target(tmp_path)
         exported(tmp_path, target)
     published(registry, "gateway")
     outputs = tmp_path / "outputs"
-    results = pi.publish(registry, SHA, tmp_path, str(outputs), lambda name, *_: "complete" if name.endswith("deedkit-gateway") else "none")
+    results = pi.publish(registry, SHA, tmp_path, str(outputs), lambda name, *_: "complete" if name.endswith("deedkit-gateway") else "none",
+                         attempt=ATTEMPT)
     assert [result["action"] for result in results] == ["reuse" if t == "gateway" else "push" for t in pi.TARGETS]
     lines = dict(line.split("=", 1) for line in outputs.read_text().splitlines())
     assert lines["attest_gateway"] == "false" and lines["attest_enricher_local"] == "true"
@@ -585,3 +621,230 @@ def test_attestation_check_refuses_and_never_reads_none_when_the_verifier_stays_
     with pytest.raises(pi.Refused, match="could not be verified.*verifier is not available"):
         pi.attested("ghcr.io/gosync-inc/deedkit-backup", "sha256:" + "1" * 64, SHA)
     assert len(calls) == bundle + pi.ATTEMPTS and delays == [pi.BACKOFF * 2 ** n for n in range(pi.ATTEMPTS - 1)]
+
+
+def attested_set(digests):
+    """A verifier that answers "complete" only for digests an attest step covered (GitHub and the registry bundle)."""
+    def verify(name, digest, sha):
+        return "complete" if digest in digests else "none"
+    return verify
+
+
+def publish_others(registry, digests, skip):
+    for target in pi.TARGETS:
+        if target not in skip:
+            published(registry, target)
+            digests.add(registry.tagged(target)[0])
+
+
+# spec: ANYM-602
+def test_a_new_target_gets_its_final_tag_on_the_attested_digest_only_after_verification(tmp_path):
+    registry, digests, events = FakeRegistry(), set(), []
+    exported(tmp_path, "runtime")
+    result = pi.publish_one(registry, "runtime", SHA, tmp_path, never_attested, ATTEMPT)
+    final = f"{registry.name('runtime')}:{SHA}"
+    assert final not in registry.tags and registry.pushes == [f"{registry.name('runtime')}:{STAGING}"]
+    digests.add(result["digest"])  # the attest step for the staged digest
+    verify = attested_set(digests)
+    assert pi.promote_one(registry, "runtime", SHA, ATTEMPT,
+                          lambda *args: events.append(list(registry.puts)) or verify(*args)) == result["digest"]
+    assert events == [[]] and registry.puts == [final]  # verified once, before any PUT
+    assert registry.tagged("runtime")[0] == registry.tagged("runtime", STAGING)[0] == result["digest"]
+
+
+# spec: ANYM-602
+@pytest.mark.parametrize("state", ["none", "github"])
+def test_a_failed_verification_leaves_only_the_staging_tag(tmp_path, state):
+    registry = FakeRegistry()
+    exported(tmp_path, "gateway")
+    result = pi.publish_one(registry, "gateway", SHA, tmp_path, never_attested, ATTEMPT)
+    with pytest.raises(pi.Refused, match="no complete attestation; its final tag is not written"):
+        pi.promote_one(registry, "gateway", SHA, ATTEMPT, lambda *_: state)
+    assert list(registry.tags) == [f"{registry.name('gateway')}:{STAGING}"] and registry.puts == []
+    assert registry.tagged("gateway", STAGING)[0] == result["digest"]
+
+
+# spec: ANYM-602
+def test_a_full_rerun_after_a_failed_attestation_publishes_its_own_rebuilt_archive(tmp_path):
+    registry, digests = FakeRegistry(), set()
+    publish_others(registry, digests, {"calls"})
+    exported(tmp_path / "1", "calls")
+    first = pi.publish(registry, SHA, tmp_path / "1", None, attested_set(digests), ("calls",), "40667989770-1")
+    # attempt 1's attest step failed (Rekor timeout): nothing attested its digest, so promote stops before the final tag
+    with pytest.raises(pi.Refused, match="no complete attestation"):
+        pi.promote(registry, SHA, "40667989770-1", attested_set(digests))
+    stranded = f"{registry.name('calls')}:{SHA}-attempt-40667989770-1"
+    assert registry.tags.get(stranded) and f"{registry.name('calls')}:{SHA}" not in registry.tags
+    # "Re-run all jobs" rebuilds the image: another config digest, a new staging tag of attempt 2
+    exported(tmp_path / "2", "calls", salt="rebuilt")
+    registry.reads.clear()
+    second = pi.publish(registry, SHA, tmp_path / "2", None, attested_set(digests), ("calls",), "40667989770-2")
+    assert second[0]["action"] == "push" and second[0]["digest"] != first[0]["digest"]
+    digests.add(second[0]["digest"])
+    pi.promote(registry, SHA, "40667989770-2", attested_set(digests))
+    confirmed = pi.confirm(registry, SHA, attested_set(digests), "40667989770-2")
+    assert confirmed["calls"] == f"{registry.name('calls')}@{second[0]['digest']}"
+    assert stranded in registry.tags and stranded not in registry.reads  # left, never read
+
+
+# spec: ANYM-602
+def test_a_rerun_reuses_a_final_tag_whose_put_response_was_lost_and_publishes_the_rest(tmp_path):
+    registry, digests = FakeRegistry(), set()
+    publish_others(registry, digests, {"gateway", "calls"})
+    for target in ("gateway", "calls"):
+        exported(tmp_path / "1", target)
+    first = {r["target"]: r["digest"] for r in pi.publish(registry, SHA, tmp_path / "1", None, attested_set(digests),
+                                                          ("gateway", "calls"), "41-1")}
+    digests.add(first["gateway"])  # calls' attestation failed
+    registry.lose_put.add(f"{registry.name('gateway')}:{SHA}")
+    with pytest.raises(pi.Refused, match="gateway|calls"):
+        pi.promote(registry, SHA, "41-1", attested_set(digests), ("gateway", "calls"))
+    assert registry.tagged("gateway")[0] == first["gateway"] and f"{registry.name('calls')}:{SHA}" not in registry.tags
+    # attempt 2: gateway's attested final tag is reused without an archive; calls publishes its own rebuild
+    exported(tmp_path / "2", "calls", salt="rebuilt")
+    results = {r["target"]: r for r in pi.publish(registry, SHA, tmp_path / "2", None, attested_set(digests),
+                                                  ("gateway", "calls"), "41-2")}
+    assert results["gateway"]["action"] == "reuse" and not results["gateway"]["attest"]
+    assert results["calls"]["action"] == "push" and f"{registry.name('gateway')}:{SHA}-attempt-41-2" not in registry.tags
+    digests.add(results["calls"]["digest"])
+    assert pi.promote(registry, SHA, "41-2", attested_set(digests), ("gateway", "calls")) == {
+        "gateway": None, "calls": results["calls"]["digest"]}
+    confirmed = pi.confirm(registry, SHA, attested_set(digests), "41-2")
+    assert confirmed["gateway"].endswith(first["gateway"]) and confirmed["calls"].endswith(results["calls"]["digest"])
+
+
+# spec: ANYM-602
+def test_promotion_refuses_a_client_side_conversion_before_the_final_put(tmp_path):
+    registry = FakeRegistry()
+    exported(tmp_path, "indexer")
+    pi.publish_one(registry, "indexer", SHA, tmp_path, never_attested, ATTEMPT)
+    registry.reserialize = True
+    with pytest.raises(pi.Refused, match="not the verified bytes; its final tag is not written"):
+        pi.promote_one(registry, "indexer", SHA, ATTEMPT, always_attested)
+    assert registry.puts == [] and f"{registry.name('indexer')}:{SHA}" not in registry.tags
+
+
+# spec: ANYM-602
+def test_confirmation_requires_the_final_digest_to_be_the_verified_staging_digest(tmp_path):
+    registry = FakeRegistry()
+    publish_others(registry, set(), {"backup"})
+    exported(tmp_path, "backup")
+    pi.publish_one(registry, "backup", SHA, tmp_path, never_attested, ATTEMPT)
+    # The registry answers the final tag with another digest B, which also carries a valid attestation.
+    published(registry, "backup", salt="other")
+    assert registry.tagged("backup")[0] != registry.tagged("backup", STAGING)[0]
+    with pytest.raises(pi.Refused, match="backup final tag does not hold the image this attempt staged"):
+        pi.confirm(registry, SHA, always_attested, ATTEMPT)
+    with pytest.raises(pi.Refused, match="backup final tag holds another image"):
+        pi.promote_one(registry, "backup", SHA, ATTEMPT, always_attested)
+    # The backstop stays: an unattested final tag fails confirmation with or without a staging tag.
+    registry.tags[f"{registry.name('backup')}:{SHA}"] = registry.tags[f"{registry.name('backup')}:{STAGING}"]
+    with pytest.raises(pi.Refused, match="backup is not published"):
+        pi.confirm(registry, SHA, lambda name, *_: "none" if name.endswith("backup") else "complete", ATTEMPT)
+    assert set(pi.confirm(registry, SHA, always_attested, ATTEMPT)) == set(pi.TARGETS)
+
+
+# spec: ANYM-602
+def test_production_reads_a_staging_only_package_as_not_published(monkeypatch):
+    registry = FakeRegistry()
+    registry.store(f"{registry.name('runtime')}:{STAGING}", b'{"config": {}}')
+    calls = []
+
+    def verifier(argv, **kwargs):  # tools/attest-verify resolves exactly the tag --sha (main.go attest: ref := sha)
+        calls.append(argv)
+        image, sha = argv[argv.index("--image") + 1], argv[argv.index("--sha") + 1]
+        found = registry.manifest(f"{image}:{sha}")
+        if found is None:
+            raise production.Refused(f"attest-verify failed (exit 1): attest-verify: refused: manifest {image}:{sha} not found")
+        return json.dumps({"sha": sha, "digest": found[0], "config_digest": "sha256:" + "0" * 64,
+                           "reference": f"{image}@{found[0]}"})
+    monkeypatch.setattr(production, "check_verifier", lambda: None)
+    monkeypatch.setattr(production, "run", verifier)
+    with pytest.raises(production.Unattested):
+        production.published("runtime", SHA)
+    assert calls[0][1:] == ["--image", production.REGISTRY + "runtime", "--sha", SHA]
+    registry.tags[f"{registry.name('runtime')}:{SHA}"] = registry.tags[f"{registry.name('runtime')}:{STAGING}"]
+    assert production.published("runtime", SHA)["digest"] == registry.tagged("runtime")[0]
+
+
+# spec: ANYM-602
+def test_the_dry_run_verifier_answers_complete_only_for_its_own_staged_digest_and_only_under_local_dry_run(tmp_path, monkeypatch):
+    registry = FakeRegistry()
+    exported(tmp_path, "calendar")
+    staged = pi.publish_one(registry, "calendar", SHA, tmp_path, never_attested, ATTEMPT)["digest"]
+    verify = pi.dry_run_verifier(registry, ATTEMPT)
+    name = registry.name("calendar")
+    assert verify(name, staged, SHA) == "complete"
+    assert verify(name, "sha256:" + "1" * 64, SHA) == "none" and pi.dry_run_verifier(registry, "1-9")(name, staged, SHA) == "none"
+    seen = []
+    for action in ("publish", "promote", "confirm"):
+        monkeypatch.setattr(pi, action, lambda *args, **_: seen.append(args) or {})
+    for action in ("publish", "promote", "confirm"):
+        pi.main([action, "--sha", SHA, "--attempt", ATTEMPT, "--directory", str(tmp_path)])
+    assert len(seen) == 3 and all(pi.attested in args for args in seen)
+    seen.clear()
+    pi.main(["publish", "--local-dry-run", "--registry", "localhost:5000/dry-run", "--sha", SHA, "--attempt", ATTEMPT,
+             "--directory", str(tmp_path)])
+    assert all(pi.attested not in args for args in seen) and len(seen) == 2  # publish, then promote
+    with pytest.raises(SystemExit):  # never against a remote registry, and never without this attempt
+        pi.main(["publish", "--local-dry-run", "--registry", "ghcr.io/gosync-inc", "--sha", SHA, "--attempt", ATTEMPT])
+    with pytest.raises(SystemExit):
+        pi.main(["promote", "--sha", SHA])
+
+
+# spec: ANYM-602
+def test_the_publish_job_promotes_between_the_attest_steps_and_confirm():
+    steps = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())["jobs"]["publish"]["steps"]
+    runs = [step.get("run", "") for step in steps]
+    index = {action: next(i for i, run in enumerate(runs) if f"publish_images.py {action}" in run)
+             for action in ("publish", "promote", "confirm")}
+    attests = [i for i, step in enumerate(steps) if step.get("uses", "").startswith("actions/attest@")]
+    assert index["publish"] < min(attests) and max(attests) < index["promote"] == index["confirm"] - 1
+    for action in index.values():
+        assert '--attempt "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"' in runs[action]
+    assert steps[index["promote"]]["env"] == {"GH_TOKEN": "${{ github.token }}", "ACTOR": "${{ github.actor }}",
+                                              "SHA": "${{ github.sha }}"}
+    assert "if" not in steps[index["promote"]]
+
+
+FAULTS = ("push", "attest", "verify", "put-lost", "none")
+
+
+# spec: ANYM-602
+@hypothesis.settings(max_examples=60, deadline=None)
+@hypothesis.given(st.lists(st.sampled_from(FAULTS), min_size=1, max_size=5))
+def test_any_sequence_of_failed_attempts_never_moves_or_strands_the_final_tag(faults):
+    """Each full rerun rebuilds its archive. Whatever fails, the final tag only ever names an attested digest, is
+    never moved once written, and the first attempt with no failure publishes and confirms."""
+    import tempfile
+    registry, digests, final = FakeRegistry(), set(), None
+    publish_others(registry, digests, {"calls"})
+    reference = f"{registry.name('calls')}:{SHA}"
+    with tempfile.TemporaryDirectory() as directory:
+        for number, fault in enumerate(faults + ["none"], start=1):
+            attempt, images = f"7-{number}", Path(directory) / str(number)
+            exported(images, "calls", salt=str(number))
+            verify = attested_set(digests) if fault != "verify" else (lambda *_: "github")
+            registry.lose_push = fault == "push"
+            if fault == "put-lost":
+                registry.lose_put.add(reference)
+            try:
+                result = pi.publish(registry, SHA, images, None, verify, ("calls",), attempt)[0]
+                if result["attest"] and fault != "attest":
+                    digests.add(result["digest"])
+                pi.promote(registry, SHA, attempt, verify, ("calls",))
+                confirmed = pi.confirm(registry, SHA, verify, attempt)
+                # An injected fault may never fire: a rerun that reuses an attested final tag pushes nothing.
+                assert confirmed["calls"] == f"{registry.name('calls')}@{registry.tagged('calls')[0]}"
+                fault = "none"
+            except pi.Refused:
+                assert fault != "none"
+            finally:
+                registry.lose_push, registry.lose_put = False, set()
+            if reference in registry.tags:
+                digest = registry.tagged("calls")[0]
+                assert digest in digests and final in (None, digest)
+                final = digest
+            if fault == "none":
+                break
+    assert final is not None

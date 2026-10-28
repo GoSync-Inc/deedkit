@@ -116,10 +116,12 @@ jobs:
         run: |
           sha="$(git rev-parse HEAD)"
           python3 scripts/publish_images.py export --target "$TARGET" --sha "$sha" --directory "$RUNNER_TEMP/images/image-$TARGET"
-          # First publication pushes; a repeated one finds the tag and does not push again.
-          for expected in push attest; do
+          # First publication pushes a staging tag and promotes it to the final tag; a repeated one
+          # finds the final tag and reuses it without pushing again.
+          for expected in push reuse; do
             python3 scripts/publish_images.py publish --local-dry-run --registry localhost:5000/dry-run \
-              --target "$TARGET" --sha "$sha" --directory "$RUNNER_TEMP/images" > "$RUNNER_TEMP/dry-run.json"
+              --target "$TARGET" --sha "$sha" --attempt "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+              --directory "$RUNNER_TEMP/images" > "$RUNNER_TEMP/dry-run.json"
             test "$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))[0]["action"])' "$RUNNER_TEMP/dry-run.json")" = "$expected"
           done
       # Same pinned binary and checksum as security.yml (tests/test_scan_image.py keeps them equal).
