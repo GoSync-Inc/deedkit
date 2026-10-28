@@ -17,6 +17,8 @@ import time
 LOOKUP_TIMEOUT_S = 2
 HEAD_LIMIT = 4096
 _LOOKUP_SLOTS = threading.BoundedSemaphore(4)
+# Resolving the proxy's own name (Docker's embedded DNS) may stall too: bounded threads, the operator lane apart.
+_PROXY_DNS_SLOTS = {'operator': threading.BoundedSemaphore(2), 'endpoint': threading.BoundedSemaphore(4)}
 
 
 class EgressNotSent(OSError):
@@ -38,7 +40,11 @@ def post(connection, host, path, body, headers, remaining):
     request = ('POST ' + path + ' HTTP/1.1\r\nHost: ' + ('[' + host + ']' if ':' in host else host) + '\r\nConnection: close\r\n' +
         'Content-Length: ' + str(len(body)) + '\r\n' +
         ''.join(key + ': ' + value + '\r\n' for key, value in headers.items()) + '\r\n').encode('ascii')
-    connection.settimeout(remaining())
+    try:
+        connection.settimeout(remaining())
+    except TimeoutError as error:
+        # The deadline passed before the first request byte.
+        raise EgressNotSent('receiver_deadline') from error
     connection.sendall(request + body)
     status = b''
     while b'\r\n' not in status:
@@ -54,17 +60,41 @@ def post(connection, host, path, body, headers, remaining):
     return int(match[1])
 
 
-def _proxy_address(proxy):
+def _proxy_address(proxy, lane, remaining):
+    """(ip, port) of the proxy within the deadline; the lookup runs in a bounded thread like _addresses."""
     host, _, port = proxy.rpartition(':')
     if not host or not port.isdigit():
-        raise ValueError('invalid_egress_proxy')
-    return host, int(port)
+        raise OSError('invalid_egress_proxy')
+    try:
+        return str(ipaddress.ip_address(host)), int(port)
+    except ValueError:
+        pass
+    slots = _PROXY_DNS_SLOTS['operator' if lane == 'operator' else 'endpoint']
+    if not slots.acquire(blocking=False):
+        raise OSError('egress_proxy_dns_busy')
+    finished, result = threading.Event(), {}
+    def lookup():
+        try:
+            result['address'] = socket.getaddrinfo(host, int(port), type=socket.SOCK_STREAM)[0][4][:2]
+        except OSError:
+            pass
+        finally:
+            slots.release()
+            finished.set()
+    try:
+        threading.Thread(target=lookup, daemon=True, name='deedkit-egress-dns').start()
+    except BaseException:
+        slots.release()
+        raise
+    if not finished.wait(min(remaining(), LOOKUP_TIMEOUT_S)) or 'address' not in result:
+        raise OSError('egress_proxy_dns_unavailable')
+    return result['address']
 
 
-def _request(proxy, head, remaining):
+def _request(proxy, head, remaining, lane=None):
     """Open a proxy connection, send the head and read the response head (one byte at a time, so a tunnel's first
     byte is never consumed). (socket, status, reason, headers); the caller closes the socket."""
-    sock = socket.create_connection(_proxy_address(proxy), timeout=remaining())
+    sock = socket.create_connection(_proxy_address(proxy, lane, remaining), timeout=remaining())
     try:
         sock.settimeout(remaining())
         sock.sendall(head.encode('ascii'))
@@ -111,7 +141,7 @@ def proxy_lookup(proxy, *, lane=None):
             remaining = deadline_after(LOOKUP_TIMEOUT_S + 1)
             try:
                 sock, status, reason, headers = _request(proxy, f'RESOLVE {host}:{port} HTTP/1.1\r\n'
-                    f'Host: {host}:{port}\r\n{_lane_header(lane)}\r\n', remaining)
+                    f'Host: {host}:{port}\r\n{_lane_header(lane)}\r\n', remaining, lane)
             except (OSError, UnicodeError):
                 raise OSError('receiver_dns_unavailable') from None
             with sock:
@@ -149,7 +179,7 @@ def proxy_transport(proxy, *, lane=None):
         remaining = deadline_after(timeout)
         try:
             sock, status, reason, _ = _request(proxy, f'CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n'
-                f'X-DeedKit-Address: {addresses[0]}\r\n{_lane_header(lane)}\r\n', remaining)
+                f'X-DeedKit-Address: {addresses[0]}\r\n{_lane_header(lane)}\r\n', remaining, lane)
         except (OSError, UnicodeError) as error:
             raise EgressNotSent('egress_proxy_unavailable') from error
         with sock:

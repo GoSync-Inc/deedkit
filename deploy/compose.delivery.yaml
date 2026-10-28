@@ -1,8 +1,9 @@
 # Opt-in overlay (ANYM-534), after compose.subscriptions.yaml. Install delivery_role.sql as owner and
 # configure a separate LOGIN inheriting messaging_event_delivery; never use the gateway or matcher DSN.
 # ANYM-581: the dispatcher joins only internal networks, delivery_db (bridge dk-deliverydb0, PostgreSQL only) and
-# delivery_proxy (dk-deliverypx0, the proxy only), so it has no route and no DNS to anything else whatever the host
-# firewall holds. Its one way out is `delivery-egress`, which alone joins the egress bridge dk-delivery0 and
+# delivery_proxy (dk-deliverypx0, the proxy only), both with gateway mode `isolated` (no host address on the bridge,
+# Docker 28.2+), so it has no route and no DNS to anything else, the host included, whatever the host firewall
+# holds. Its one way out is `delivery-egress`, which alone joins the egress bridge dk-delivery0 and
 # resolves and connects only to public addresses of hosts in DELIVERY_POLICY_FILE. The host rules from
 # `scripts/delivery_egress_check.py rules` stay as a second layer (docs/operations/production.md). The proxy's
 # explicit `dns` makes Docker's embedded resolver query DELIVERY_RESOLVER from its namespace, where they apply.
@@ -99,11 +100,15 @@ networks:
     enable_ipv6: false
     driver_opts:
       com.docker.network.bridge.name: dk-deliverydb0
+      # No host address on the bridge: the host is unreachable even without host rules (ANYM-581).
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
   delivery_proxy:
     internal: true
     enable_ipv6: false
     driver_opts:
       com.docker.network.bridge.name: dk-deliverypx0
+      # No host address on the bridge: the host is unreachable even without host rules (ANYM-581).
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
   delivery_egress:
     driver: bridge
     enable_ipv6: false
