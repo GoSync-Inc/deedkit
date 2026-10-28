@@ -115,6 +115,99 @@ def test_sender_completion_does_not_overwrite_uncertain_content(archive,change):
     assert s.get_context(key,mid)['message']['sender']==''
 
 
+def whatsapp_event(sender,**changes):
+    return event(**{'account':'archive-wa','platform':'whatsapp','chat':'900@lid','provider_id':'true_900@lid_3EB0SYNTH',
+        'sender':sender,'direction':'outgoing',**changes})
+
+
+def wire(body='Первый текст lighthouse'):
+    return {'version':1,'state':'wire_observed','basis':'whatsapp_native_wire',
+        'wire_sha256':hashlib.sha256(body.encode()).hexdigest(),'entities':None,
+        'unsupported_entities':[],'warnings':['syntax_interpretation_unknown']}
+
+
+def sender_rows(s,mid):
+    with s.pool.connection() as c:
+        message=c.execute('SELECT sender,revision FROM messages WHERE id=%s',(mid,)).fetchone()
+        profiles=c.execute("SELECT sender FROM sender_profiles WHERE account='archive-wa' ORDER BY sender").fetchall()
+        open_conflicts=c.execute('SELECT count(*) AS n FROM message_conflicts WHERE message=%s AND resolved_at IS NULL',
+            (mid,)).fetchone()['n']
+    return message['sender'],message['revision'],[r['sender'] for r in profiles],open_conflicts
+
+
+# spec: ANYM-612
+@pytest.mark.parametrize('retained,candidate',[
+    ('900:7@lid','900@lid'),('900@lid','900:7@lid'),('900:1@lid','900:2@lid'),
+    ('555:3@c.us','555@c.us'),('555@c.us','555:3@c.us')])
+def test_whatsapp_sender_device_number_is_not_a_conflict(archive,retained,candidate):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    mid=ar.ingest(whatsapp_event(retained,formatting=wire()))['message']
+    observed=whatsapp_event(candidate,origin='reconcile',formatting=wire(),
+        sender_profile={'display_name':'Synthetic Owner'})
+    assert ar.ingest(observed)['outcome']=='unchanged'
+    # Comparison only: the stored sender, revision and receipt keep their raw values,
+    # and the candidate's form gets no sender profile.
+    assert sender_rows(s,mid)==(retained,1,[],0)
+    with s.pool.connection() as c:
+        envelope=c.execute("SELECT envelope FROM ingest_receipts WHERE outcome='unchanged'").fetchone()['envelope']
+        snapshots=c.execute('SELECT snapshot FROM message_revisions WHERE message=%s',(mid,)).fetchall()
+    assert envelope['sender']==candidate and [r['snapshot']['sender'] for r in snapshots]==[retained]
+
+
+# spec: ANYM-612
+@pytest.mark.parametrize('retained,candidate,change',[
+    ('900:7@lid','901@lid',{}),('900:7@lid','9001@lid',{}),('900@lid','900:7@c.us',{}),
+    ('900:7@g.us','900@g.us',{}),('900:7@s.whatsapp.net','900@s.whatsapp.net',{}),
+    ('900:x@lid','900@lid',{}),('900:7:1@lid','900@lid',{}),(':7@lid','@lid',{}),('900:@lid','900@lid',{}),
+    ('900:7@lid','900@lid',{'sent_at':'2026-10-01T11:59:59+00:00'}),
+    ('900:7@lid','900@lid',{'direction':'incoming'}),
+    ('900:7@lid','900@lid',{'body':'contradiction','formatting':wire('contradiction')}),
+    ('900:7@lid','900@lid',{'media':[{'provider_id':'f1','mime':'image/jpeg','bytes':10,'filename':'p.jpg'}]}),
+    ('900:7@lid','900@lid',{'formatting':{'version':1,'state':'unknown','basis':None,'wire_sha256':None,
+        'entities':None,'unsupported_entities':[],'warnings':['native_entities_not_captured']}}),
+    ('900:7@lid','900@lid',{'deleted':True,'body':'','formatting':None})])
+def test_whatsapp_sender_device_rule_keeps_other_differences_in_conflict(archive,retained,candidate,change):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    mid=ar.ingest(whatsapp_event(retained,formatting=wire()))['message']
+    observed=whatsapp_event(candidate,**{'formatting':wire(),**change})
+    if observed['formatting'] is None:del observed['formatting']
+    assert ar.ingest(observed)['outcome']=='conflict'
+    assert sender_rows(s,mid)==(retained,1,[],1)
+
+
+# spec: ANYM-612
+def test_whatsapp_sender_device_rule_needs_known_formatting_on_both_sides(archive):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    mid=ar.ingest(whatsapp_event('900:7@lid'))['message']
+    assert ar.ingest(whatsapp_event('900@lid',formatting=wire()))['outcome']=='conflict'
+    # Two observations that state no formatting do not differ in it.
+    assert ar.ingest(whatsapp_event('900@lid'))['outcome']=='unchanged'
+    assert sender_rows(s,mid)==('900:7@lid',1,[],1)
+
+
+# spec: ANYM-612
+def test_whatsapp_sender_device_reread_resolves_no_open_conflict(archive):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    mid=ar.ingest(whatsapp_event('900:7@lid'))['message']
+    assert ar.ingest(whatsapp_event('900@lid',formatting=wire()))['outcome']=='conflict'
+    assert ar.ingest(whatsapp_event('900:7@lid',body='contradiction'))['outcome']=='conflict'
+    # A later reread in the other device form states nothing about either open conflict.
+    assert ar.ingest(whatsapp_event('900@lid',updated_at='2026-10-01T12:01:00+00:00'))['outcome']=='unchanged'
+    assert sender_rows(s,mid)==('900:7@lid',1,[],2)
+
+
+# spec: ANYM-612
+def test_telegram_sender_with_a_colon_is_not_a_whatsapp_device(archive):
+    ar,s,key,_=archive
+    ar.ingest(event(sender='900:7@lid'))
+    assert ar.ingest(event(sender='900@lid'))['outcome']=='conflict'
+    assert s.search(key)['items'][0]['sender']=='900:7@lid'
+
+
 def test_delete_tombstone_does_not_resurrect_and_search_hides(archive):
     ar,s,key,_=archive
     mid=ar.ingest(event())['message']
