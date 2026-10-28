@@ -829,7 +829,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
         next_step: ambiguous_message_order, ambiguous_attention_reply_order, head_candidates_truncated -> answer_with_caveat.
         next_step: message_version_conflict -> answer_with_caveat. next_step: message_revision_changed_during_read -> reread_now.
         A head conflict of a known class (Telegram only; WhatsApp has none yet) keeps the row's action.
-        Its class and quote caveat: basis.evidence[].conflict (compact: known_conflicts).
+        Its class and quote caveat: conflict on each shown message and basis.evidence entry (compact: known_conflicts).
         next_step: rate_limited, provider_temporarily_unavailable -> wait_for_provider_cooldown.
         next_step: provider_unavailable, provider_chat_error -> check_provider_access.
         next_step: unclassified_latest_message, chat_type_unknown, any other code -> get_context.

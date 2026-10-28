@@ -447,3 +447,28 @@ def test_any_other_conflict_evidence_is_answered_with_a_caveat(conflict):
     result=state([message('out','outgoing',evidence={'active_conflicts':1,'conflict':conflict})])
     assert result['basis']['code']=='message_version_conflict' and result['next_step']=='answer_with_caveat'
     assert 'conflict' not in result['basis']['evidence'][0]
+
+
+KNOWN_EVIDENCE={'active_conflicts':1,'conflict':{'class':'telegram_body_equal_version','next_step':'none_required'}}
+
+
+# spec: ANYM-616
+def test_a_shown_group_head_keeps_its_known_conflict_caveat_beside_owner_attention():
+    from messaging_service.conflict_classes import SHOWN
+    from messaging_service.presentation import lean_conversation
+    result=state([message('head',evidence=KNOWN_EVIDENCE)],platform='telegram',chat_type='group',
+        attention=[message('mention',second=10)])
+    assert result['suggested_action']=='review_incoming' and result['basis']['code']=='explicit_owner_attention'
+    known={'class':'telegram_body_equal_version','meaning':SHOWN['telegram_body_equal_version']}
+    assert result['latest_known_meaningful_message']['conflict']==known
+    assert lean_conversation(result)['known_conflicts']==[{'message_id':'head',**known}]
+
+
+# spec: ANYM-616
+def test_a_shown_meaningful_fallback_keeps_its_known_conflict_caveat():
+    from messaging_service.presentation import lean_conversation
+    result=state([message('top',body='')],platform='telegram',
+        meaningful_fallback=message('older',second=5,evidence=KNOWN_EVIDENCE))
+    assert result['basis']['code']=='unclassified_latest_message'
+    assert result['latest_known_meaningful_message']['conflict']['class']=='telegram_body_equal_version'
+    assert [k['message_id'] for k in lean_conversation(result,shown=['older'])['known_conflicts']]==['older']

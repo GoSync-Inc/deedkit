@@ -56,6 +56,10 @@ def _snapshot(message):
     # A forwarded head keeps its attribution: the sender is the forwarder, not the author.
     if message.get('authorship'):
         snapshot.update(forwarded=True,forward_origin=message.get('forward_origin'),authorship=message['authorship'])
+    # A shown message keeps its known-conflict caveat whatever the block's basis is (ANYM-616).
+    known=known_conflict(message.get('evidence'))
+    if known:
+        snapshot['conflict']=known
     for key,limit in (('body',1000),('display_text',1200)):
         value=snapshot.get(key)
         snapshot[key+'_truncated']=isinstance(value,str) and len(value)>limit

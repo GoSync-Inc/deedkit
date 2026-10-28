@@ -329,8 +329,9 @@ it when `awaiting_reply.confidence` already states it.
 
 A head conflict whose open conflicts are all of a known class (COLLECTOR_STATES.md; only
 Telegram has known classes, so every WhatsApp conflict reads `message_version_conflict`) leaves
-the block stable: its `basis.evidence[]` entry carries `conflict: {class, meaning}`, compact
-`known_conflicts` lists the same per message, and `meaning` says the provider may show the
+the block stable: each shown message (`latest_known_meaningful_message(s)`,
+`owner_attention.target_message`) and its `basis.evidence[]` entry carry `conflict: {class,
+meaning}` whatever the basis, compact `known_conflicts` lists each such message once, and `meaning` says the provider may show the
 other version now, so a quote needs a caveat. Any other class, `unclassified`, a class not
 stored (rows from before schema 54) or a mix with one of them reads `message_version_conflict`.
 
