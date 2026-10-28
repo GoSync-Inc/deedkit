@@ -266,8 +266,12 @@ def literal(c, *, cast=True):
     return (kind, value)
 
 
-def references(c):
-    c.name()
+def references(c, state):
+    # Calendar (Astra r1, ANYM-586): an unqualified name could resolve to `public` through search_path, so the
+    # referenced table must be one of the schema's tables or one this file created.
+    table = c.name()
+    if not (table in state["created"] or existing(state, table)):
+        raise Manual("a reference outside the schema")
     if c.peek() == ("punct", "("):
         c.group()
     while True:
@@ -287,7 +291,7 @@ def references(c):
             return
 
 
-def new_column(c):
+def new_column(c, state):
     """A column of a table this file creates: literal, now() or gen_random_uuid() defaults and any constraint."""
     c.name()
     column_type(c)
@@ -322,7 +326,7 @@ def new_column(c):
         elif option == "primary":
             c.expect("key")
         elif option == "references":
-            references(c)
+            references(c, state)
         elif option == "initially":
             c.expect("deferred", "immediate")
 
@@ -347,17 +351,18 @@ def create_table(c, state):
             "foreign",
             "exclude",
         ):
-            table_constraint(e)
+            table_constraint(e, state)
         elif e.peek() == ("word", "like"):
             raise Manual("LIKE")
         else:
-            new_column(e)
+            new_column(e, state)
     state["created"].add(table)
 
 
-def table_constraint(e):
+def table_constraint(e, state):
     """`[CONSTRAINT c] CHECK (…) [NO INHERIT] | PRIMARY KEY (…) | UNIQUE (…) | FOREIGN KEY (…) REFERENCES …` of a new
-    table, which may reference any table, then only deferral words; EXCLUDE, INCLUDE, WITH and the rest are manual."""
+    table, which may reference a table of the schema, then only deferral words; EXCLUDE, INCLUDE, WITH and the rest
+    are manual."""
     if e.word("constraint"):
         e.name()
     kind = e.expect("check", "primary", "unique", "foreign")
@@ -368,7 +373,7 @@ def table_constraint(e):
         e.expect("inherit")
     if kind == "foreign":
         e.expect("references")
-        references(e)
+        references(e, state)
     while not e.done():
         if e.word("not"):
             e.expect("deferrable")
@@ -520,10 +525,18 @@ def set_local(c):
     c.end()
 
 
-def comment(c):
+def comment(c, state):
+    """`COMMENT ON TABLE <t> | COLUMN <t>.<c> IS '<literal>'` on a table of the schema or one this file created
+    (calendar, Astra r1: messaging's copy takes any object, a schema or role too)."""
     c.expect("comment"), c.expect("on")
-    while c.peek()[0] in ("word", "ident", "punct") and c.peek() != ("word", "is"):
-        c.next()
+    kind = c.expect("table", "column")
+    table = c.name()
+    if not (table in state["created"] or existing(state, table)):
+        raise Manual("a comment outside the schema's tables")
+    if kind == "column":
+        if not c.take("punct", "."):
+            raise Manual("not a column")
+        c.name()
     c.expect("is")
     if c.next()[0] not in ("string", "estring"):
         raise Manual("not a literal comment")
@@ -557,7 +570,7 @@ def classify(text, inventory=None, schema="fcs"):
             elif first == "do":
                 precondition(c)
             elif first == "comment":
-                comment(c)
+                comment(c, state)
             else:
                 return "manual"
             at += taken
@@ -674,14 +687,19 @@ def guarded(c, roles, tables, new_tables, schema):
     if items[-1:] == [("punct", ";")]:
         items = items[:-1]
     head, tail = items[: len(GUARD_OPEN)], items[len(items) - len(GUARD_CLOSE) :]
-    if len(items) <= len(GUARD_OPEN) + len(GUARD_CLOSE) or [value for _, value in tail] != GUARD_CLOSE:
+    if len(items) <= len(GUARD_OPEN) + len(GUARD_CLOSE) or tail != [
+        ("punct", value) if value == ";" else ("word", value) for value in GUARD_CLOSE
+    ]:
         raise Manual("not the template")
     for (kind, value), expected in zip(head, GUARD_OPEN):
         if not (kind == "string" if expected == "$s" else kind in ("word", "punct") and value == expected):
             raise Manual("not the template")
     if long_name(items):
         raise Manual("a name PostgreSQL would truncate")
-    if head[4][1] not in {schema + "." + table for table in new_tables}:
+    # to_regclass folds an unquoted name to lower case, so the guard names only a plain lower-case new table: a
+    # quoted or mixed-case one would read NULL and skip its grants silently (Astra r1).
+    guards = {schema + "." + table for table in new_tables if re.fullmatch(r"[a-z_][a-z0-9_]*", table)}
+    if head[4][1] not in guards:
         raise Manual("a guard on a table this release does not create")
     inner, current = [], []
     for token in items[len(GUARD_OPEN) : len(items) - len(GUARD_CLOSE)]:
@@ -773,15 +791,20 @@ def plan(base_files, candidate_files, base_roles, candidate_roles, schema="fcs")
     if any(candidate_files[v] != text for v, text in base_files.items()):
         return {"pause": "edited"}
     base, target = len(base_files), len(versions)
+    # The base's tables, as its files create them (Astra r1): an index or a "new" table on an existing name, and a
+    # GRANT on anything but a table (a sequence), pause here already; migrate-expand rechecks against the catalog.
+    inventory = {"migrations": set()}  # the ledger, which Store.migrate creates outside the files
+    for version in range(1, base + 1):
+        inventory = new_tables(base_files[version], inventory, schema)
     created = {}
     for version in range(base + 1, target + 1):
         text = candidate_files[version]
         if header_problem(version, text):
             return {"pause": "no header"}
-        if unattended_class(text, None, schema) != "expand":
+        if unattended_class(text, set(inventory) | set(created), schema) != "expand":
             return {"pause": "not_unattended"}
         created = new_tables(text, created, schema)
-    if role_class(base_roles, candidate_roles, created, schema=schema) != "additive":
+    if role_class(base_roles, candidate_roles, created, tables=set(inventory), schema=schema) != "additive":
         return {"pause": "role_not_additive"}
     if base == target and base_roles == candidate_roles:
         return {"pause": "nothing"}

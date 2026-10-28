@@ -264,7 +264,10 @@ def test_a_failing_grant_leaves_nothing(store, expand):
     (HEADER + "ALTER TABLE plans DROP COLUMN tool;\n", "", "not_unattended"),
     (HEADER + "CREATE INDEX synthetic_idx ON plans(id);\n", "", "not_unattended"),
     (NEW_TABLE, "REVOKE SELECT ON fcs.plans FROM fcs_gateway;\n", "role_not_additive"),
-], ids=["drop", "index-on-existing", "revoke"])
+    (NEW_TABLE + "COMMENT ON SCHEMA public IS 'changed';\n", "", "not_unattended"),
+    (HEADER + "CREATE TABLE synthetic_notes(id text REFERENCES outsider(id));\n", "", "not_unattended"),
+    (NEW_TABLE, "GRANT UPDATE ON fcs.audit_id_seq TO fcs_gateway;\n", "role_not_additive"),
+], ids=["drop", "index-on-existing", "revoke", "comment-outside", "reference-outside", "grant-on-sequence"])
 def test_migrate_expand_reclassifies_before_running(store, expand, migration, appended, code):
     setup, _ = expand
     plan, paths = setup(migration=migration, appended=appended)
@@ -288,3 +291,42 @@ def test_the_cli_prints_one_json_line(store, tmp_path, capsys):
     assert main(["--home", str(tmp_path / "home"), "service", "migrate-expand", "--plan", str(tmp_path / "plan.json")]) == 1
     out = capsys.readouterr().out
     assert out.count("\n") == 1 and json.loads(out) == {"error": "plan_invalid"}
+    assert main(["--home", str(tmp_path / "home"), "service", "migrate-expand"]) == 2
+    out = capsys.readouterr().out
+    assert out.count("\n") == 1 and json.loads(out) == {"error": "usage"}
+
+
+# spec: ANYM-586
+@pytest.mark.parametrize("migration,appended,reason", [
+    (NEW_TABLE + "COMMENT ON SCHEMA public IS 'changed';\n", "", "not_unattended"),
+    (NEW_TABLE + "COMMENT ON ROLE fcs_gateway IS 'changed';\n", "", "not_unattended"),
+    (HEADER + "CREATE TABLE synthetic_notes(id text REFERENCES outsider(id));\n", "", "not_unattended"),
+    (HEADER + "CREATE TABLE IF NOT EXISTS plans(id text);\nCREATE UNIQUE INDEX probe_idx ON plans(id);\n", "",
+     "not_unattended"),
+    (NEW_TABLE, "GRANT UPDATE ON fcs.audit_id_seq TO fcs_gateway;\n", "role_not_additive"),
+    (HEADER + 'CREATE TABLE fcs."MixedCase"(id int);\n',
+     "DO $$ BEGIN IF to_regclass('fcs.MixedCase') IS NOT NULL THEN GRANT SELECT ON fcs.\"MixedCase\" TO fcs_gateway;"
+     " END IF; END $$;\n", "role_not_additive"),
+    (NEW_TABLE, GUARD.replace(" END IF;\nEND $$", ' "end" "if";\n"end" $$'), "role_not_additive"),
+], ids=["comment-on-schema", "comment-on-role", "reference-outside", "existing-name", "grant-on-sequence",
+        "mixed-case-guard", "quoted-guard-close"])
+def test_plan_pauses_on_text_outside_the_schema_or_the_template(migration, appended, reason):
+    assert rollout.plan(files(), {**files(), 6: migration}, roles_text(), roles_text() + appended) == {"pause": reason}
+
+
+# spec: ANYM-586
+def test_plan_accepts_a_comment_and_a_reference_on_the_schema_s_tables():
+    migration = NEW_TABLE + ("CREATE TABLE synthetic_links(id text PRIMARY KEY, note text REFERENCES synthetic_notes(id),"
+                             " plan_id text REFERENCES plans(id));\nCOMMENT ON TABLE plans IS 'synthetic';\n"
+                             "COMMENT ON COLUMN fcs.synthetic_notes.body IS 'synthetic';\n")
+    assert rollout.plan(files(), {**files(), 6: migration}, roles_text(), roles_text())["target"] == 6
+
+
+# spec: ANYM-586
+def test_the_base_inventory_plan_reads_from_the_files_is_the_live_schema_5_tables(store):
+    inventory = {}
+    for version, text in sorted(files().items()):
+        inventory = rollout.new_tables(text, inventory)
+    assert set(inventory) | {"migrations"} == tables(store)
+    grant = "GRANT SELECT ON fcs.migrations, fcs.invitation_opt_ins TO fcs_gateway;\n"
+    assert rollout.plan(files(), {**files(), 6: NEW_TABLE}, roles_text(), roles_text() + grant)["target"] == 6

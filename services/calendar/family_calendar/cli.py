@@ -193,6 +193,8 @@ def main(argv=None):
             asyncio.run(_live(args, registry))
         return 0
     except SystemExit as exc:
+        if line and exc.code:
+            output({"error": "usage"}, line)
         return int(exc.code or 0)
     except CalendarError as exc:
         output({"error": exc.code, **exc.details}, line)
