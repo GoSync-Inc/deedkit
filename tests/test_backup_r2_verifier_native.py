@@ -135,6 +135,16 @@ def test_real_pg18_age_stream_restore_runs_all_seven_checks_in_isolated_owned_co
         assert all(engine.inspect_owned(kind,name,run) is None for kind,name in verifier.names(run).items())
 
 
+# spec: ANYM-589
+def test_real_helper_image_reports_the_schema_range_its_backup_code_reads():
+    from messaging_service import backup
+    engine=verifier.Docker(300);config={'helper_image':IMAGE,'helper_revision':REVISION,'postgres_image':verifier.POSTGRES_IMAGE}
+    engine.preflight(config)
+    before=engine.command('container','ls','-a','--format','{{.ID}}').split()
+    assert engine.helper_schemas(config)==[backup.SCHEMAS[0],backup.SCHEMAS[-1]]
+    assert engine.command('container','ls','-a','--format','{{.ID}}').split()==before
+
+
 def test_exact_owned_container_cleanup_removes_legacy_anonymous_volume_preserves_named_sentinel():
     """Actual rm --volumes semantics, including pre-fix interrupted containers."""
     run=secrets.token_hex(16);engine=verifier.Docker(120)

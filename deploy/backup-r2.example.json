@@ -5,6 +5,7 @@
   "prefix": "deployment-example/v1",
   "state_directory": "/var/lib/deedkit-backup-r2/upload-state",
   "credentials_file": "/etc/deedkit-backup-r2/receive-credentials.json",
+  "capabilities_file": "/var/lib/deedkit-backup-r2/published/capabilities.json",
   "max_bytes": 42949672960,
   "quota_bytes": 85899345920,
   "max_objects": 2,

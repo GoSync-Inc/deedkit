@@ -581,3 +581,76 @@ def test_receiver_timeout_never_leaks_into_a_later_healthy_stream(monkeypatch,ca
     data=r2.AGE_HEADER+os.urandom(r2.MIB);out=io.BytesIO()
     r2.verify_object({'bucket':'synthetic'},FlakyCloud(data,[]),stream_receipt(data),out)
     assert out.getvalue()==data
+
+
+def published_operator(operator,tmp_path):
+    v,config,receiver,cloud,engine,write_json=operator
+    published=tmp_path/'published';published.mkdir();published.chmod(0o755)
+    path=Path(config['receiver_config_file']);write_json(path,{**receiver,'capabilities_file':str(published/'capabilities.json')})
+    calls=[]
+    def command(*args):
+        calls.append(args)
+        return engine.answer
+    engine.answer=b'{"start":2,"stop":52,"step":1}\n';engine.command=command
+    engine.preflight=lambda config:calls.append('preflight') or '/var/lib/docker'
+    engine.helper_schemas=lambda config:v.Docker.helper_schemas(engine,config)
+    return v,config,engine,published/'capabilities.json',calls
+
+
+# spec: ANYM-589
+def test_server_verifier_publishes_the_pinned_helper_schema_range(operator,tmp_path):
+    v,config,engine,path,calls=published_operator(operator,tmp_path)
+    assert v.publish_capabilities(config,engine=engine)=={'v':1,'helper_revision':config['helper_revision'],'helper_schemas':[2,51]}
+    assert r2.unique_json(path.read_bytes())=={'v':1,'helper_revision':config['helper_revision'],'helper_schemas':[2,51]}
+    info=os.stat(path)
+    assert info.st_mode&0o777==0o644 and info.st_nlink==1 and not list(path.parent.glob('.*'))
+    # The probe runs the exact pinned image ID only after its labels and volumes were checked,
+    # with no input, network, mount, capability or log.
+    assert calls[0]=='preflight'
+    probe=calls[1];assert probe[0]=='run' and config['helper_image'] in probe
+    for flag in ('--rm','--network=none','--read-only','--cap-drop=ALL','--security-opt=no-new-privileges','--log-driver=none'):
+        assert flag in probe
+    assert '--mount' not in probe and '-v' not in probe and '--volume' not in probe and '-i' not in probe
+    assert probe[probe.index('--entrypoint')+1]=='python' and probe[-2:]==('-c',v.SCHEMA_PROBE)
+
+
+# spec: ANYM-589
+@pytest.mark.parametrize('failure',['docker','labels','malformed','step','below_two','boolean','extra'])
+def test_server_verifier_unproven_helper_range_removes_the_old_publication(operator,tmp_path,failure):
+    v,config,engine,path,calls=published_operator(operator,tmp_path)
+    v.publish_capabilities(config,engine=engine);assert path.exists()
+    answers={'malformed':b'[2,51]','step':b'{"start":2,"stop":52,"step":2}','below_two':b'{"start":1,"stop":52,"step":1}',
+             'boolean':b'{"start":true,"stop":52,"step":1}','extra':b'{"start":2,"stop":52,"step":1,"x":1}'}
+    if failure=='docker':
+        def command(*args):raise RuntimeError('restore_docker_failed')
+        engine.command=command
+    elif failure=='labels':
+        def preflight(config):raise ValueError('unreviewed_restore_image')
+        engine.preflight=preflight
+    else:engine.answer=answers[failure]
+    with pytest.raises((RuntimeError,ValueError)):v.publish_capabilities(config,engine=engine)
+    # Absent means unknown to the deployer (`waiting`), never the previous helper's range.
+    assert not path.exists()
+
+
+# spec: ANYM-589
+def test_server_verifier_proof_range_is_the_published_verifier_schemas():
+    v=module();receipt={'wire':{'id':'20261016T091703Z-fedcba9876543210','bytes':100,'sha256':'a'*64,'snapshot_sha256':'b'*64}}
+    for version,accepted in ((v.SCHEMAS[0],True),(v.SCHEMAS[-1],True),(v.SCHEMAS[0]-1,False),(v.SCHEMAS[-1]+1,False)):
+        facts={'v':1,'status':'verified','schema_version':version,'manifest_sha256':'b'*64,'checks':{k:True for k in r2.CHECKS}}
+        if accepted:assert v.make_proof(receipt,facts,'c'*32)['verification']['schema_version']==version
+        else:
+            with pytest.raises(ValueError,match='invalid_helper_result'):v.make_proof(receipt,facts,'c'*32)
+
+
+# spec: ANYM-589
+def test_server_verifier_cli_publishes_capabilities_without_a_restore(monkeypatch,capsys):
+    v=module();seen=[]
+    monkeypatch.setattr(v,'load_config',lambda path:{'synthetic':path})
+    monkeypatch.setattr(v,'run',lambda config,**kw:pytest.fail('publication started a restore'))
+    monkeypatch.setattr(v,'publish_capabilities',lambda config,**kw:seen.append(config) or {'v':1})
+    assert v.main(['--config','/synthetic','--publish-capabilities'])==0 and seen==[{'synthetic':'/synthetic'}]
+    def fail(config,**kw):raise ValueError('invalid_helper_schemas')
+    monkeypatch.setattr(v,'publish_capabilities',fail)
+    assert v.main(['--config','/synthetic','--publish-capabilities'])==1
+    assert json.loads(capsys.readouterr().err)['error']=='invalid_helper_schemas'

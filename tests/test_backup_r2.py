@@ -709,3 +709,94 @@ def test_sent_cold_completion_blocks_replacement_until_it_is_settled(config,age_
     cloud.objects[key]=r2.AGE_HEADER+b'the earlier completion landed'*4
     responses,_=cold(config,cloud,'put',data=data)
     assert responses==[{'v':1,'status':'exists','key':key,'bytes':len(cloud.objects[key])}] and not journal.exists()
+
+
+def silent_stdin(monkeypatch,data=b'',*,close=True):
+    read,write=os.pipe();os.write(write,data)
+    if close:os.close(write);write=None
+    monkeypatch.setattr(r2.sys,'stdin',SimpleNamespace(buffer=os.fdopen(read,'rb')))
+    return write
+
+@pytest.fixture
+def published(config,tmp_path,monkeypatch):
+    """The root verifier's helper publication: ownership virtualized; modes, links and FDs real."""
+    original=os.fstat;upload_owned=set()
+    ancestors={(p.stat().st_dev,p.stat().st_ino) for p in (tmp_path,*tmp_path.parents)}
+    def root_view(fd):
+        info=original(fd);values=list(info)
+        values[4]=1000 if (info.st_dev,info.st_ino) in upload_owned else 0
+        if (info.st_dev,info.st_ino) in ancestors:values[0]&=~0o022
+        return os.stat_result(values)
+    monkeypatch.setattr(os,'fstat',root_view)
+    control=tmp_path/'published';control.mkdir();control.chmod(0o755)
+    path=control/'capabilities.json'
+    def publish(raw=None,*,mode=0o644,root=True):
+        path.write_bytes(r2.encoded({'v':1,'helper_revision':'c'*40,'helper_schemas':[2,51]}) if raw is None else raw)
+        path.chmod(mode)
+        if not root:upload_owned.add((path.stat().st_dev,path.stat().st_ino))
+    config_path=tmp_path/'config.json'
+    write_json(config_path,{**json.loads(config_path.read_text()),'capabilities_file':str(path)})
+    return SimpleNamespace(publish=publish,config=str(config_path),path=path)
+
+
+# spec: ANYM-589
+def test_capabilities_prints_only_the_installed_verifier_and_helper_ranges(published,monkeypatch,capsys):
+    from messaging_service import backup_r2_verifier as verifier
+    published.publish();silent_stdin(monkeypatch)
+    monkeypatch.setattr(r2,'make_client',lambda conf:pytest.fail('capabilities reached the object store'))
+    monkeypatch.setattr(r2,'receive',lambda *a,**kw:pytest.fail('capabilities read an archive'))
+    assert r2.main(['--config',published.config,'capabilities'])==0
+    first,last=verifier.SCHEMAS[0],verifier.SCHEMAS[-1]
+    assert capsys.readouterr().out==('{"v":1,"verifier_schemas":[%d,%d],"helper_schemas":[2,51],"helper_revision":"%s"}\n'
+                                     %(first,last,'c'*40))
+
+
+# spec: ANYM-589
+def test_capabilities_refuses_an_argument_or_input(published,monkeypatch,capsys):
+    published.publish()
+    for extra in (['extra'],['--id',BID],['--output','/tmp/x']):
+        with pytest.raises(SystemExit) as refused:r2.main(['--config',published.config,'capabilities',*extra])
+        assert refused.value.code==2
+    capsys.readouterr()
+    silent_stdin(monkeypatch,b'{"v":2,"id":"forged"}\n')
+    assert r2.main(['--config',published.config,'capabilities'])==1
+    assert json.loads(capsys.readouterr().out)=={'v':1,'status':'error','code':'capabilities_takes_no_input'}
+    # An open, silent stdin (ssh without -n) is no input: it answers without reading it.
+    write=silent_stdin(monkeypatch,close=False)
+    try:assert r2.main(['--config',published.config,'capabilities'])==0
+    finally:os.close(write)
+    assert set(json.loads(capsys.readouterr().out))=={'v','verifier_schemas','helper_schemas','helper_revision'}
+
+
+# spec: ANYM-589
+@pytest.mark.parametrize('case',['unconfigured','missing','upload_owned','group_writable','symlink','hardlink','malformed',
+                                 'duplicate_field','extra_field','reversed_range','boolean_bound','short_revision','oversized'])
+def test_capabilities_without_a_trusted_helper_publication_is_unavailable(published,monkeypatch,capsys,case):
+    good={'v':1,'helper_revision':'c'*40,'helper_schemas':[2,51]}
+    raws={'malformed':b'{"v":1,','duplicate_field':b'{"v":1,"v":1,"helper_revision":"'+b'c'*40+b'","helper_schemas":[2,51]}',
+          'extra_field':r2.encoded({**good,'verifier_schemas':[2,99]}),'reversed_range':r2.encoded({**good,'helper_schemas':[51,2]}),
+          'boolean_bound':r2.encoded({**good,'helper_schemas':[True,51]}),'short_revision':r2.encoded({**good,'helper_revision':'c'*7}),
+          'oversized':r2.encoded({**good,'pad':'x'*8192})}
+    published.publish(raws.get(case),mode=0o664 if case=='group_writable' else 0o644,root=case!='upload_owned')
+    if case=='unconfigured':
+        write_json(Path(published.config),{k:v for k,v in json.loads(Path(published.config).read_text()).items() if k!='capabilities_file'})
+    elif case=='missing':published.path.unlink()
+    elif case=='symlink':
+        target=published.path.with_name('real.json');published.path.rename(target);published.path.symlink_to(target)
+    elif case=='hardlink':os.link(published.path,published.path.with_name('second.json'))
+    silent_stdin(monkeypatch)
+    assert r2.main(['--config',published.config,'capabilities'])==1
+    assert json.loads(capsys.readouterr().out)=={'v':1,'status':'error','code':'capabilities_unavailable'}
+
+
+# spec: ANYM-589
+def test_capabilities_file_stays_outside_upload_state_and_leaves_receive_unchanged(config,tmp_path):
+    path=tmp_path/'config.json';value=json.loads(path.read_text())
+    for bad in ('relative/capabilities.json',str(Path(config['state_directory'])/'capabilities.json'),'/etc/../tmp/c.json',7):
+        write_json(path,{**value,'capabilities_file':bad})
+        with pytest.raises(ValueError,match='invalid_config_path'):r2.load_config(path)
+    write_json(path,{**value,'capabilities_file':str(tmp_path/'published/capabilities.json')})
+    loaded=r2.load_config(path);cloud=Cloud()
+    assert receive(loaded,cloud)['status']=='stored'
+    responses,_=cold(loaded,cloud,'put',data=r2.AGE_HEADER+b'synthetic cold ciphertext'*8)
+    assert responses[-1]['status']=='stored'

@@ -454,6 +454,58 @@ Objects must be age ciphertext; the optional `cold_max_bytes` (default 5 GiB)
 bounds each one and must exceed the archiver's `max_object_bytes` plus age
 overhead. Larger objects use the configured multipart part size.
 
+## Schema capabilities key
+
+An automatic migration (ANYM-587) needs to know whether this receiver can verify
+a backup at the new schema before production moves to it. A **third** key on
+the restricted upload account answers that and nothing else:
+
+```text
+restrict,from="SOURCE_ADDRESS",command="/opt/deedkit-backup-r2/venv/bin/python -m messaging_service.backup_r2_receiver --config /etc/deedkit-backup-r2/receive.json capabilities" ssh-ed25519 REPLACE_WITH_CAPABILITIES_PUBLIC_KEY
+```
+
+The `capabilities` mode takes no argument (argparse refuses one; the forced
+command fixes the argv anyway) and no input: a byte already waiting on stdin is
+refused with `capabilities_takes_no_input`, and an open, silent stdin is never
+read. It reads no archive or receipt and never contacts the object store. It prints one
+line:
+
+```json
+{"v":1,"verifier_schemas":[2,50],"helper_schemas":[2,50],"helper_revision":"<40-hex>"}
+```
+
+`verifier_schemas` is the range the installed verifier accepts from its helper
+(`backup_r2_verifier.SCHEMAS`). `helper_schemas` and `helper_revision` come from
+the pinned helper image, which only root may inspect, so the root verifier
+publishes them in a file the upload account can read: `capabilities_file` in the
+receiver configuration (an absolute path outside `state_directory`; set the same
+value in the root operator copy). The file must be root-owned, single-link and
+not group/other-writable, under root-owned ancestors that are not group/other
+writable, for example `/var/lib/deedkit-backup-r2/published/capabilities.json`
+in a root-owned `0755` directory. Anything else, a missing file or a malformed
+one answers `capabilities_unavailable`: the deployer then waits.
+
+Publish it as root:
+
+```sh
+/opt/deedkit-backup-r2/venv/bin/python -m messaging_service.backup_r2_verifier \
+  --config /etc/deedkit-backup-r2/verifier.json --publish-capabilities
+```
+
+It removes the previous file, checks the helper image ID, labels and volumes as
+a restore does, runs that exact image once with no input, network, mount,
+capability or log to print its own `messaging_service.backup.SCHEMAS`, and
+writes `{"v":1,"helper_revision":…,"helper_schemas":[first,last]}` atomically
+with mode `0644`. A failed check leaves no file, never the previous helper's
+range. The [verifier service](deploy/deedkit-backup-r2-verifier.service) runs it
+before each verification with its failure ignored (`ExecStartPre=-`), so a
+failed publication never stops a restore. Run it again by hand after changing
+`helper_image`/`helper_revision`; until then the file may name the old helper.
+
+Undo: remove the capabilities key line from `authorized_keys`, then delete the
+published file and the `ExecStartPre` line; the upload and cold keys and
+`receive` are unchanged by this key.
+
 Backup quota inventory, verified-point rotation and the verifier only address
 `<prefix>/objects/` and `<prefix>/receipts/`: cold copies never occupy a backup
 slot and rotation never deletes them. Cleanup of incomplete multipart uploads

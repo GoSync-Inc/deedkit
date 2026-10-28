@@ -32,6 +32,11 @@ DATABASE = 'deedkit_verify_restore_test'
 PG_DATA_PATH = '/var/lib/postgresql'
 HELPER_TMPFS = {'/tmp':'rw,noexec,nosuid,size=64m',
                 PG_DATA_PATH:'ro,noexec,nosuid,nodev,size=1m,mode=0700'}
+# Backup schema versions this verifier accepts from its helper (`capabilities` reports them).
+SCHEMAS = range(2,51)
+# Asks the pinned helper image which schema versions its own backup code reads.
+SCHEMA_PROBE = ("import json;from messaging_service.backup import SCHEMAS as s;"
+                "print(json.dumps({'start':s.start,'stop':s.stop,'step':s.step}))")
 
 
 def now():return datetime.now(timezone.utc).isoformat()
@@ -186,6 +191,18 @@ class Docker:
         root=self.command('info','--format','{{.DockerRootDir}}').decode().strip()
         if not Path(root).is_absolute():raise ValueError('invalid_docker_data_root')
         return root
+    def helper_schemas(self,config):
+        # Run only after preflight checked the image ID, labels and volumes. No input,
+        # network, mount, capability or log; inherited volumes are bounded tmpfs.
+        raw=self.command('run','--rm','--network=none','--read-only','--cap-drop=ALL','--security-opt=no-new-privileges',
+                         '--log-driver=none','--restart=no','--cpus=1','--memory=256m','--memory-swap=256m','--pids-limit=64',
+                         '--tmpfs','/tmp:'+HELPER_TMPFS['/tmp'],'--tmpfs',PG_DATA_PATH+':'+HELPER_TMPFS[PG_DATA_PATH],
+                         '--entrypoint','python',config['helper_image'],'-c',SCHEMA_PROBE)
+        try:value=r2.unique_json(raw)
+        except ValueError:raise ValueError('invalid_helper_schemas') from None
+        if (not isinstance(value,dict) or set(value)!={'start','stop','step'} or any(type(item) is not int for item in value.values()) or
+                value['step']!=1 or not 2<=value['start']<value['stop']<=10000):raise ValueError('invalid_helper_schemas')
+        return [value['start'],value['stop']-1]
     def inspect_owned(self,kind,name,run):
         category='container' if kind in ('helper','postgres') else kind
         args=['ls'] if category=='container' else ['ls']
@@ -292,7 +309,7 @@ def preflight_disk(config,receipt,docker_root):
 def make_proof(receipt,facts,run):
     if (not isinstance(facts,dict) or set(facts)!={'v','status','schema_version','manifest_sha256','checks'} or
             type(facts['v']) is not int or facts['v']!=1 or facts['status']!='verified' or
-            type(facts['schema_version']) is not int or facts['schema_version'] not in range(2,51) or
+            type(facts['schema_version']) is not int or facts['schema_version'] not in SCHEMAS or
             facts['manifest_sha256']!=receipt['wire']['snapshot_sha256'] or not isinstance(facts['checks'],dict) or
             set(facts['checks'])!=r2.CHECKS or any(v is not True for v in facts['checks'].values())):
         raise ValueError('invalid_helper_result')
@@ -456,6 +473,34 @@ def run(config,*,client=None,engine=None):
             raise error
 
 
+def publish_capabilities(config,*,engine=None):
+    """Publish the pinned helper's schema range for the receiver's `capabilities` key.
+
+    The file is root-owned and world-readable (it holds no secret). The old one is
+    removed first: an unproven range leaves none, which the deployer reads as unknown.
+    """
+    if os.geteuid()!=0:raise ValueError('root_verifier_required')
+    receiver=r2.load_config(config['receiver_config_file'])
+    if 'capabilities_file' not in receiver:raise ValueError('capabilities_file_required')
+    path=Path(receiver['capabilities_file'])
+    with local.trusted_directory(path.parent) as fd:
+        try:os.unlink(path.name,dir_fd=fd);local.fsync_dir(fd)
+        except FileNotFoundError:pass
+        engine=engine if engine is not None else Docker(min(600,config['timeout_seconds']))
+        engine.preflight(config)
+        value={'v':1,'helper_revision':config['helper_revision'],'helper_schemas':engine.helper_schemas(config)}
+        name='.'+path.name+'-'+secrets.token_hex(16)
+        out=os.open(name,os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600,dir_fd=fd)
+        try:
+            with os.fdopen(out,'wb') as handle:
+                handle.write(r2.encoded(value));handle.flush();os.fchmod(handle.fileno(),0o644);os.fsync(handle.fileno())
+            os.replace(name,path.name,src_dir_fd=fd,dst_dir_fd=fd);local.fsync_dir(fd)
+        finally:
+            try:os.unlink(name,dir_fd=fd)
+            except FileNotFoundError:pass
+    return value
+
+
 def failure_code(error):
     if isinstance(error,InterruptedError):return 'restore_stopped'
     if isinstance(error,(TimeoutError,subprocess.TimeoutExpired)):return 'restore_deadline'
@@ -466,7 +511,8 @@ def failure_code(error):
           'unreviewed_restore_image','unreviewed_postgres_image','unowned_restore_resource','invalid_helper_result',
           'uploader_lock_initialization_required','uncommitted_cloud_object','receiver_quota','protected_backup_missing',
           'invalid_verifier_journal','private_root_file_required','restore_docker_failed','restore_postgres_unavailable',
-          'isolated_restore_failed','stored_backup_corrupt','storage_unavailable','unexpected_restore_image_volume','unexpected_restore_helper_layout'}
+          'isolated_restore_failed','stored_backup_corrupt','storage_unavailable','unexpected_restore_image_volume','unexpected_restore_helper_layout',
+          'capabilities_file_required','invalid_helper_schemas'}
     return str(error) if str(error) in safe else 'independent_restore_failed'
 
 
@@ -493,8 +539,12 @@ def describe(error):
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--config',required=True)
+    parser.add_argument('--publish-capabilities',action='store_true',help="publish the pinned helper's schema range only")
     args=parser.parse_args(argv)
-    try:run(load_config(args.config))
+    try:
+        config=load_config(args.config)
+        if args.publish_capabilities:publish_capabilities(config)
+        else:run(config)
     except Exception as error:
         print(json.dumps({'error':failure_code(error),'diagnostic':describe(error)},separators=(',',':')),file=sys.stderr);return 1
     return 0
