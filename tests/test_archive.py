@@ -430,14 +430,43 @@ def test_unreadable_whatsapp_observation_is_not_a_conflict(archive,media):
     ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
     key=s.issue_key('wa-reader',['archive-wa'])
     mid=ar.ingest(wa_event(media=media))['message']
-    before=archive_state(s,mid); shown=s.get_context(key,mid)['message']
+    before=archive_state(s,mid); shown=conversation_state(s,key,mid)
     assert ar.ingest(unreadable())['outcome']=='unchanged'
     # The retained revision, text, formatting, attachments and metadata stay; no revision,
     # no event, no conflict and no sender profile from the empty observation.
     assert archive_state(s,mid)==before
     assert before[2]['metadata']['message_kind']=='text' and before[5]==0 and before[6]==0
-    assert s.get_context(key,mid)['message']==shown
-    assert shown['body']=='Первый текст lighthouse' and len(before[3])==len(media)
+    assert conversation_state(s,key,mid)==shown
+    assert shown[0]['body']=='Первый текст lighthouse' and len(before[3])==len(media)
+
+
+def conversation_state(s,key,mid):
+    shown=s.get_context(key,mid,view='conversation')
+    with s.pool.connection() as c:
+        chat=c.execute('SELECT title,chat_type FROM chats c JOIN messages m ON m.chat=c.id WHERE m.id=%s',(mid,)).fetchone()
+    return shown['message'],shown['conversation_view'],chat
+
+
+# spec: ANYM-613
+def test_unreadable_whatsapp_observation_keeps_chat_and_presentation(archive):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    key=s.issue_key('wa-reader',['archive-wa'])
+    mid=ar.ingest(wa_event(chat_title='Synthetic Contact'))['message']
+    before=archive_state(s,mid); shown=conversation_state(s,key,mid)
+    candidate=unreadable(chat_title='Other synthetic title',metadata={'message_kind':'unknown','chat_type':'group'})
+    assert ar.ingest(candidate)['outcome']=='unchanged'
+    assert archive_state(s,mid)==before and conversation_state(s,key,mid)==shown
+    assert shown[2]=={'title':'Synthetic Contact','chat_type':'private'}
+
+
+# spec: ANYM-613
+def test_unreadable_whatsapp_observation_of_a_textless_message_stays_conflict(archive):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    ar.ingest(wa_event(body='',formatting=UNREADABLE_FORMAT,metadata={'message_kind':'photo','chat_type':'private'},
+        media=[{'provider_id':'f1','mime':'image/jpeg','bytes':10,'filename':'p.jpg'}]))
+    assert ar.ingest(unreadable())['outcome']=='conflict'
 
 
 # spec: ANYM-613

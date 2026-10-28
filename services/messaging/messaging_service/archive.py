@@ -131,7 +131,13 @@ class Archive:
             if previous: return {'outcome':'duplicate','message':mid}
             chat_type=e.get('metadata',{}).get('chat_type')
             if chat_type=='unknown':chat_type=None
-            c.execute('''INSERT INTO chats(id,account,title,provider_chat,chat_type) VALUES(%s,%s,%s,%s,%s)
+            # A WhatsApp observation that could not be read (kind `unknown`, no text, no attachment)
+            # may create its chat but never rewrites the chat's title or type.
+            unreadable_shape=(e['platform']=='whatsapp' and e.get('metadata',{}).get('message_kind')=='unknown'
+                and not e['body'] and not e['media'] and not e['deleted'])
+            if unreadable_shape:c.execute('''INSERT INTO chats(id,account,title,provider_chat,chat_type)
+                VALUES(%s,%s,%s,%s,%s) ON CONFLICT(id) DO NOTHING''',(cid,aid,e['chat_title'],e['chat'],chat_type))
+            else:c.execute('''INSERT INTO chats(id,account,title,provider_chat,chat_type) VALUES(%s,%s,%s,%s,%s)
                 ON CONFLICT(id) DO UPDATE SET
                 title=CASE WHEN excluded.title<>%s AND excluded.title<>'' THEN excluded.title ELSE chats.title END,
                 provider_chat=excluded.provider_chat,chat_type=coalesce(excluded.chat_type,chats.chat_type)
@@ -169,10 +175,8 @@ class Archive:
             # An observation WhatsApp could not read (kind `unknown`, no text, no attachment) at the
             # retained provider version carries nothing: the retained revision, its metadata and
             # sender profiles stay, and it resolves no conflict.
-            unreadable=bool(old and retained_snapshot and e['platform']=='whatsapp'
-                and e.get('metadata',{}).get('message_kind')=='unknown'
-                and not e['body'] and not e['media'] and not e['deleted'] and not old['deleted']
-                and old['provider_updated_at']==updated and content!=old['content_hash']
+            unreadable=bool(unreadable_shape and old and retained_snapshot and retained_snapshot.get('body')
+                and not old['deleted'] and old['provider_updated_at']==updated and content!=old['content_hash']
                 and fingerprint({**e,'body':retained_snapshot.get('body',''),
                     'media':retained_snapshot.get('media',[])})==old['content_hash'])
             if old:
