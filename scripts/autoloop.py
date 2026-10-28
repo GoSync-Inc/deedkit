@@ -53,8 +53,10 @@ switched off, in an empty temporary directory, with the inbox on stdin and every
 no `@path` in feedback can pull a local file into the request. Before any answer is used, the stream's `init` event
 must match the profile pinned with the CLI version and the stream may hold nothing but that init, assistant text,
 rate-limit events and one result. Only a closed JSON answer leaves the model: an unknown field, an ID outside the
-input, a spec outside the snapshot or a bad slug refuses the whole answer, and so does any decision
-`feedback_triage` would refuse: the batch is checked whole before anything is written. `answer` and `card_brief`
+input or twice, or a decision that is not an object refuses the whole answer before anything is written. Each other
+decision is checked alone: one with a wrong-typed field, a spec outside the snapshot, a bad slug or one
+`feedback_triage` would refuse is left out and counted in `refused.json`, its item stays in the inbox, and the
+others are recorded. `answer` and `card_brief`
 lose URL, URI, address, code fence, shell pattern and path content and stay untrusted. The checked decisions go to
 `feedback_triage.record`; card briefs go to the private state, and the card worker (ANYM-571) takes one only through
 `committed_briefs`: its item is in the triage ledger with the same new card. An empty inbox still publishes ledger
