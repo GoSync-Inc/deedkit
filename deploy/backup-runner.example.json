@@ -23,5 +23,6 @@
     "known_hosts_file": "/opt/anymsg/backup-config/known_hosts"
   },
   "timeout_seconds": 1800,
+  "dump_timeout_seconds": 1800,
   "keep_local": 1
 }

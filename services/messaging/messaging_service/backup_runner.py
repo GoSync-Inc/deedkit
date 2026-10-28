@@ -59,7 +59,7 @@ def write_json(path,data):
 
 def config(path):
     cfg=read_json(path)
-    if set(cfg)-{'delivery_mode','busy_wait_seconds'}!={'directory','project','network','image','files_volume','dsn_file','recipient_file',
+    if set(cfg)-{'delivery_mode','busy_wait_seconds','dump_timeout_seconds'}!={'directory','project','network','image','files_volume','dsn_file','recipient_file',
                   'mounts','recovery','transfer','timeout_seconds','keep_local'}:raise ValueError('invalid_backup_config')
     if cfg.get('delivery_mode','staged_v1') not in ('staged_v1','stream_v2'):raise ValueError('invalid_backup_config')
     for key in ('project','network','files_volume'):
@@ -80,10 +80,17 @@ def config(path):
         not re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}',t['user']) or
         not all(path_valid(t[k]) for k in ('identity_file','known_hosts_file'))):raise ValueError('invalid_backup_transfer')
     if type(cfg['timeout_seconds']) is not int or not 60<=cfg['timeout_seconds']<=7200:raise ValueError('invalid_backup_timeout')
+    if 'dump_timeout_seconds' in cfg and (type(cfg['dump_timeout_seconds']) is not int or
+        not 300<=cfg['dump_timeout_seconds']<=min(7200,cfg['timeout_seconds'])):raise ValueError('invalid_backup_timeout')
     if type(cfg.get('busy_wait_seconds',0)) is not int or not 0<=cfg.get('busy_wait_seconds',0)<=7200:
         raise ValueError('invalid_backup_timeout')
     if type(cfg['keep_local']) is not int or not 1<=cfg['keep_local']<=24:raise ValueError('invalid_backup_retention')
     return cfg
+
+
+def dump_timeout(cfg):
+    """pg_dump's limit inside the capture: optional in runner.json, else 1800 s or the capture timeout if lower."""
+    return cfg.get('dump_timeout_seconds',min(1800,cfg['timeout_seconds']))
 
 
 class Docker:
@@ -307,7 +314,7 @@ class Runner:
         write_json(work/'recovery.json',self.cfg['recovery'])
         write_json(work/'worker.json',{'id':self.journal['id'],'dsn_file':'/run/secrets/database_url',
             'files_directory':'/data/files','recovery_config_file':'/work/recovery.json',
-            'recipient_file':'/run/secrets/recipient','work_directory':'/work',
+            'recipient_file':'/run/secrets/recipient','work_directory':'/work','dump_timeout_seconds':dump_timeout(self.cfg),
             **({'mode':'stream_v2'} if streaming else {})})
         args=['create','--name',self.journal['container'],'--label','personal-os.backup.id='+self.journal['id'],
             '--label','personal-os.backup.project='+self.cfg['project'],'--network',self.cfg['network'],

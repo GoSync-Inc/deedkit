@@ -169,6 +169,26 @@ capability `DAC_OVERRIDE` is needed to read the collector UID's private files th
 mounts. The PG password is passed through a 0600 PGPASSFILE in tmpfs, with no password in argv.
 After successful encryption the plaintext staging is deleted before sending.
 
+The worker's `pg_dump` writes the custom format with `--compress=zstd:1`. Restoring a dump made since then
+needs `pg_restore` from PostgreSQL 16 or newer; the backup image and the receiver's verifier run PostgreSQL 18,
+but a restore by hand on the owner's own machine with older client tools fails on the archive header. Older
+dumps (gzip) restore as before. The dump has its own limit inside the capture: `dump_timeout_seconds` in
+`runner.json` (optional, a whole number 300–7200, at most the capture `timeout_seconds`; anything else is
+refused as `invalid_backup_timeout`). Without it the limit is 1800 s, or `timeout_seconds` if that is lower,
+so every `runner.json` valid before stays valid. A dump past the limit fails the capture as before (the worker
+reports `backup_worker_failed`, the fence is released, the collectors resume). Trade-off: a slow dump now keeps
+the messenger collectors paused for up to 30 minutes instead of failing the backup at the former fixed 10
+minutes. The paused collectors catch up on resume, as after the usual daily pause; a verified daily point is
+worth more than a failed run.
+
+Upgrade order: the image first, the runner second. The runner now always writes the limit into `worker.json`,
+and an older worker refuses keys it does not know, so a newer runner with an older backup image fails every
+capture; a newer worker accepts `worker.json` with or without the key (without it, `pg_dump` keeps 600 s).
+So the release's image is built (autodeploy) and the `runner.json` `image` pin names it no later than the
+runner install ([production.md, Backup runner](docs/operations/production.md#backup-runner)). Undo in
+reverse: remove `dump_timeout_seconds` from `runner.json` (an older runner refuses unknown keys), install the
+`.before-<sha>` runner, then put back the image pin it ran with.
+
 Delivery uses a separate SSH key created on the source VM. The key does not give
 shell/SFTP/forwarding/read/delete: the target VM runs only
 `backup_receiver.py` through [`restrict,from=...,command=...`](https://man.openbsd.org/sshd.8#AUTHORIZED_KEYS_FILE_FORMAT).
