@@ -196,10 +196,12 @@ def decrypt_snapshot_stream(source,identity,destination,age='age',max_bytes=20*1
     The isolated worker owns stdin. Its coordinator enforces a whole-job deadline
     and kills the owned process on stalled input. No ciphertext is staged.
     """
-    return _decrypt_snapshot([age,'-d','-i',str(identity)],destination,max_bytes,source=source)
+    return _decrypt_snapshot([age,'-d','-i',str(identity)],destination,max_bytes,source=source,cached=True)
 
 
-def _decrypt_snapshot(command,destination,max_bytes,*,source=None):
+def _decrypt_snapshot(command,destination,max_bytes,*,source=None,cached=False):
+    # cached: only the isolated helper, which reads the dump back before pg_restore and every original after it
+    # (backup_restore_worker.run); a standalone decryption reads the whole bundle back before publishing it.
     destination=Path(destination)
     if destination.exists(): raise ValueError('restore_destination_exists')
     destination.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
@@ -265,10 +267,12 @@ def _decrypt_snapshot(command,destination,max_bytes,*,source=None):
         manifest=read_manifest(temporary)
         if manifest.get('format')==2:(temporary/'recovery').mkdir(mode=0o700,exist_ok=True)
         (temporary/'files').mkdir(mode=0o700,exist_ok=True)
-        verify_bundle(temporary,extracted=extracted,read_dump=False)
+        if cached:verify_bundle(temporary,extracted=extracted,read_dump=False)
+        else:verify_bundle(temporary)
         if (temporary/'recovery').exists():fsync_dir(temporary/'recovery')
         fsync_dir(temporary/'files'); fsync_dir(temporary)
         os.rename(temporary,destination); fsync_dir(destination.parent)
+        if not cached:return destination
         published=ExtractedBundle(destination); published.extracted=extracted
         return published
     finally:

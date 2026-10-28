@@ -531,3 +531,24 @@ def test_each_original_is_read_once_and_the_dump_twice_after_extraction(tmp_path
     result=run(data,raw)
     assert result['status']=='verified' and all(result['checks'].values()) and calls==['psql','pg_restore']
     assert opened.count(digest)==1 and opened.count('database.dump')==2
+
+
+# spec: ANYM-630
+@pytest.mark.parametrize('member,error',[(2,'dump_corrupt'),(3,'blob_corrupt')],ids=['dump','original'])
+def test_standalone_decryption_still_reads_back_a_member_written_wrong_after_its_hash(tmp_path,monkeypatch,member,error):
+    import os,stat
+    data,*_=bundle_with_original();(tmp_path/'bundle.tar').write_bytes(data)
+    decoder=tmp_path/'age-file'
+    decoder.write_text('#!'+sys.executable+'\nimport sys,shutil\nshutil.copyfileobj(open(sys.argv[-1],"rb"),sys.stdout.buffer)\n')
+    decoder.chmod(0o700)
+    real_fsync=os.fsync;files=[]
+    def fsync(fd):
+        # A torn write the copy loop never saw: the member's first byte differs on disk only.
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            files.append(fd)
+            if len(files)==member:os.pwrite(fd,b'\0',0)  # members 2 and 3 start with 'U' and 'S'
+        return real_fsync(fd)
+    monkeypatch.setattr(os,'fsync',fsync)
+    with pytest.raises(RuntimeError,match=error):
+        crypto.decrypt_snapshot(tmp_path/'bundle.tar','key',tmp_path/'restore',age=str(decoder))
+    assert not (tmp_path/'restore').exists()
