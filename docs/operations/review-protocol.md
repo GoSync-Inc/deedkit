@@ -42,7 +42,9 @@ list: release, deploy and `production.py`, sends and live provider-session code.
   ```
 
   A `DELETE FROM` hit in service code (not a migration, not a script or hook that deletes production data) is a
-  `Deletes:` PR line item (harness reviews.md), not an OWNER signal.
+  `Deletes:` PR line item (harness reviews.md), not an OWNER signal. A `TRUNCATE` or `DROP` hit, in service code
+  as in a migration, is a gated change (process.md section 2), never a `Deletes:` item; only a service-run DELETE of
+  rows a card or docs/DATA-POLICY.md names is one.
 
   A host-tool change still waits for the owner to install it before autodeploy resumes
   (docs/operations/production.md).
