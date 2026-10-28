@@ -179,7 +179,7 @@ def query_evidence(c,p,normalized,items,*,paged=False,include=True):
         'read_history_or_wait_for_collection' if reason in ('history_loading','history_not_scanned','history_has_gaps')
         else 'check_provider_access' if reason=='provider_unavailable'
         else 'wait_for_provider_cooldown' if reason=='provider_rate_limited'
-        else 'resolve_chat_or_check_scope' if reason=='not_found_or_not_permitted'
+        else 'list_chats' if reason=='not_found_or_not_permitted'
         else 'get_context' if conflicts else 'read_context' if items else 'inspect_chat_coverage'}
     if include:
         result.update(chats_considered=len(records),chats_not_scanned=sum(h['state']=='not_scanned' for h in histories),
@@ -199,7 +199,8 @@ def file_query_evidence(c,p,normalized,items,paged=False,include=True):
         if not items:
             if result['empty_reason']=='no_matches_in_traversed_range':
                 result['empty_reason']='file_index_coverage_not_checked'
-            result['next_action']='get_sync_status_for_selected_chat'
+            # A filter that names no visible chat keeps list_chats: there is no selected chat to inspect.
+            if result['empty_reason']!='not_found_or_not_permitted':result['next_action']='get_sync_status_for_selected_chat'
         return result
     chat=normalized.get('chat');chats=normalized.get('chats')
     ids=[chat] if chat else chats
