@@ -37,3 +37,6 @@ DO $$ BEGIN
         CREATE POLICY messaging_subscriptions_beat ON component_heartbeats TO messaging_subscriptions USING (component='matcher') WITH CHECK (component='matcher');
     END IF;
 END $$;
+-- Schema 55 (ANYM-535): source.health rows only through the definer function, which derives each
+-- from collector_health and the lease; no direct journal, counter or collector-record write.
+GRANT EXECUTE ON FUNCTION public.journal_source_health(integer) TO messaging_subscriptions;

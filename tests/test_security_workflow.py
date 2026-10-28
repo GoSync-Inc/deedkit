@@ -102,3 +102,13 @@ def test_every_workflow_lives_where_github_runs_it_and_calendar_runs_in_verify()
     assert listed and all(path.startswith(".github/workflows/") for path in listed), listed
     calendar = next(step for step in _verify_steps() if step.get("id") == "calendar")
     assert calendar["working-directory"] == "services/calendar" and "uv run pytest" in calendar["run"]
+
+
+# spec: ANYM-324
+def test_verify_lints_the_calendar_with_the_pinned_ruff():
+    run = next(step for step in _verify_steps() if step.get("id") == "calendar")["run"].splitlines()
+    # The calendar has its own [tool.ruff]; the pinned tools/dev ruff checks it after its tests and build.
+    lint = "uv run --project ../../tools/dev --locked ruff check ."
+    assert lint in [line.strip() for line in run]
+    assert [line.strip() for line in run if line.strip() and not line.strip().startswith("#")][-1] == lint
+    assert '"ruff==0.15.7"' in (ROOT / "tools/dev/pyproject.toml").read_text()

@@ -34,7 +34,7 @@ def test_server_verifier_proof_requires_exact_helper_facts_and_cloud_identity():
 
 
 # spec: ANYM-511
-@pytest.mark.parametrize('version,accepted',[(52,True),(53,True),(54,False)],ids=['n-1','current','next'])
+@pytest.mark.parametrize('version,accepted',[(54,True),(55,True),(56,False)],ids=['n-1','current','next'])
 def test_server_verifier_proof_accepts_current_schema_and_rejects_the_next(version,accepted):
     v=module();receipt={'wire':{'id':'20261016T091703Z-fedcba9876543210','bytes':100,'sha256':'a'*64,'snapshot_sha256':'b'*64}}
     facts={'v':1,'status':'verified','schema_version':version,'manifest_sha256':'b'*64,'checks':{k:True for k in r2.CHECKS}}
@@ -565,7 +565,7 @@ def test_sdk_retry_hook_reraises_a_recorded_deadline_before_the_next_attempt(mon
     monkeypatch.setattr(r2,'credentials',lambda config:{'access_key_id':'a','secret_access_key':'s'})
     monkeypatch.setattr(r2,'CANCELLED',[])
     assert r2.make_client({'endpoint':'https://synthetic.invalid'}) is client
-    assert registered==[('needs-retry.s3',r2.cancelled)]
+    assert registered==[('needs-retry.s3',r2.cancelled),('request-created.s3',r2.cancelled)]
     assert r2.cancelled(caught_exception=OSError()) is None
     with pytest.raises(TimeoutError,match='restore_deadline'):r2.cancel(TimeoutError('restore_deadline'))
     with pytest.raises(TimeoutError,match='restore_deadline'):r2.cancelled(caught_exception=OSError())

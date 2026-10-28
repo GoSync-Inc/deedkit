@@ -80,7 +80,8 @@ REGISTRY = "ghcr.io/gosync-inc/deedkit-"
 # The tokenless attestation verifier, built reproducibly from tools/attest-verify and installed by the owner;
 # tests keep this hash equal to tools/attest-verify/attest-verify.linux-amd64.sha256.
 VERIFIER = Path("/usr/local/libexec/deedkit/attest-verify")
-VERIFIER_SHA256 = "af405433c424fe20580cc86e2d96221670b0a75d6af9068ab06d309ec49344db"
+VERIFIER_SHA256 = "de0544eda3668946aad1d4237557b3fbd747c702d1e511d0060daa5eaa62978f"
+VERIFIER_RECORD = "tools/attest-verify/attest-verify.linux-amd64.sha256"
 IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 # The pinned verifier's refusal lines (tools/attest-verify main.go, registry.go). Only a registry 404 for the image
 # tag proves it is not published yet. "No bundle attached" is also printed when the referrers API failed, and a bundle
@@ -736,15 +737,17 @@ def names_revision(image, sha, dockerfile, recipe=None):
                  or "DEEDKIT_SOURCE_SHA=" + sha in (config.get("Env") or [])))
 
 
-def check_verifier():
+def check_verifier(path=None):
+    """The installed verifier, or for `self-test --verifier` a staged build, is the pinned one (ANYM-618)."""
+    path = path or VERIFIER
     try:
-        info = VERIFIER.lstat()
-        content = VERIFIER.read_bytes() if stat.S_ISREG(info.st_mode) else b""
+        info = path.lstat()
+        content = path.read_bytes() if stat.S_ISREG(info.st_mode) else b""
     except OSError:
         info, content = None, b""
     if (info is None or not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.geteuid())
             or info.st_mode & 0o022 or hashlib.sha256(content).hexdigest() != VERIFIER_SHA256):
-        raise Refused(f"the attestation verifier {VERIFIER} is missing, writable by others or not the pinned build")
+        raise Refused(f"the attestation verifier {path} is missing, writable by others or not the pinned build")
 
 
 def published(target, sha):
@@ -2365,9 +2368,14 @@ def range_changes(mirror, base, candidate, installed):
             if path in UNITS and not os.path.lexists(installed[path]):
                 return True
             return run(["git", "-C", str(mirror), "rev-parse", f"{candidate}:{path}"]).strip() == blob(installed[path])
-        # The verifier is the candidate's when it matches the pin of the installed (the candidate's) production.py.
-        return (path.startswith("tools/attest-verify/") and current_tool("scripts/production.py") and VERIFIER.exists()
-                and hashlib.sha256(VERIFIER.read_bytes()).hexdigest() == VERIFIER_SHA256)
+        # The verifier is the candidate's when the installed binary is this tool's pinned build and the candidate
+        # records that same build (tests keep each commit's two pins equal to its recorded file): a later tool change
+        # with an unchanged verifier then installs itself instead of pausing (ANYM-618).
+        recorded = f"{VERIFIER_SHA256}  attest-verify\n".encode()
+        return (path.startswith("tools/attest-verify/") and VERIFIER.exists()
+                and hashlib.sha256(VERIFIER.read_bytes()).hexdigest() == VERIFIER_SHA256
+                and run(["git", "-C", str(mirror), "rev-parse", f"{candidate}:{VERIFIER_RECORD}"]).strip()
+                == hashlib.sha1(b"blob %d\0" % len(recorded) + recorded).hexdigest())
     return sql, [path for path in tools if not current_tool(path)]
 
 
@@ -3788,10 +3796,10 @@ def tool_rollback(settings, http, s):
         return {"status": "tool-rolled-back", "from": update["to"], "to": update["from"]}
 
 
-def self_test(config_path, http_path):
+def self_test(config_path, http_path, verifier=None):
     """This tool's check before `deploy` runs it (production.md "Deploy tool updates"): both modules from this
-    directory, its tool.json, both configurations and the current receipts read with this code, the verifier and its
-    pin. It runs under the guard at the top of this file."""
+    directory, its tool.json, both configurations and the current receipts read with this code, the verifier (or the
+    staged build `verifier` names, read and never run) and its pin. It runs under the guard at the top of this file."""
     if not GUARDED:
         raise Refused("self-test must be the first argument")
     directory = RUNNING.parent
@@ -3814,7 +3822,7 @@ def self_test(config_path, http_path):
             raise Refused(f"the receipt {path} is missing or malformed") from exc
     tool_update_receipt(state)
     try:
-        check_verifier()
+        check_verifier(verifier and Path(verifier))
     except Refused as exc:
         raise Refused(f"{exc}; install the verifier first") from exc
     return {"self_test": "ok", "sha": tool["sha"]}
@@ -4262,9 +4270,13 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true", help="deploy: print the plan or pause reason, change nothing")
     parser.add_argument("--remove", action="store_true", help="images: remove the listed candidates")
     parser.add_argument("--database", help="copy-database: a name under the configuration's migration.databases")
+    parser.add_argument("--verifier", help="self-test: check this staged verifier build against the pin instead of "
+                                           "the installed one (attest-verify install, production.md)")
     args = parser.parse_args(argv)
     os.umask(0o077)
     try:
+        if args.verifier and args.action != "self-test":
+            raise Refused("--verifier is only for self-test; every other command uses the installed verifier")
         args.config = args.config or (active_config() if args.action == "status" else CONFIG)
         if args.action == "check-image":
             if not args.target:
@@ -4275,7 +4287,7 @@ def main(argv=None):
         elif args.action == "verify":
             result = verify(args.sha or "")
         elif args.action == "self-test":
-            print(json.dumps(self_test(args.config, args.http_config)))
+            print(json.dumps(self_test(args.config, args.http_config, args.verifier)))
             return
         elif args.action == "tool-rollback":
             if os.geteuid() != 0:

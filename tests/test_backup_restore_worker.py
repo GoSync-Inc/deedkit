@@ -147,8 +147,8 @@ def test_large_stream_keeps_original_ciphertext_source_distinct_from_tar_members
     assert hashlib.sha256((tmp_path/'large-restore/files'/digest).read_bytes()).hexdigest()==digest
 
 
-# The id '36-36' is a Tiden case ID; since schema 53 the first unsupported schema is 54.
-@pytest.mark.parametrize('actual,manifest',[('34',31),('31',34),pytest.param('54',54,id='36-36'),('corrupt',34),(None,34)])
+# The id '36-36' is a Tiden case ID; since schema 55 the first unsupported schema is 56.
+@pytest.mark.parametrize('actual,manifest',[('34',31),('31',34),pytest.param('56',56,id='36-36'),('corrupt',34),(None,34)])
 def test_restored_database_schema_must_match_manifest_before_quarantine_or_proof(actual,manifest):
     from messaging_service import backup_restore_worker as worker
     class Lease:
@@ -167,7 +167,7 @@ def test_restored_database_schema_reports_actual_verified_version():
 
 
 # spec: ANYM-511
-@pytest.mark.parametrize('version',[52,53],ids=['n-1','current'])
+@pytest.mark.parametrize('version',[54,55],ids=['n-1','current'])
 def test_restored_database_schema_accepts_the_current_and_previous_schema(version):
     from messaging_service import backup_restore_worker as worker
     class Lease:
@@ -425,3 +425,130 @@ def test_a_real_bundle_missing_an_enabled_token_fails_vault_complete_and_keeps_t
     assert json.loads((Path(config['directory'])/'status.json').read_text())['error']=='restore_vault_incomplete'
     assert Path(config['protected_file']).read_bytes()==marker
     assert all(cloud.objects.get(key)==value for key,value in objects.items())
+
+
+def bundle_with_original(change=lambda entries,digest:None):
+    content=b'SYNTHETIC_ORIGINAL_BYTES\n'*64;digest=hashlib.sha256(content).hexdigest();dump=b'UNIT_DUMP_NOT_A_DATABASE'
+    manifest={'format':1,'schema_version':2,'dump_sha256':hashlib.sha256(dump).hexdigest(),'tables':{},
+              'blobs':[{'digest':digest,'bytes':len(content)}]}
+    raw=json.dumps(manifest).encode();entries={'manifest.json':raw,'database.dump':dump,'files/'+digest:content}
+    change(entries,digest);out=io.BytesIO()
+    with tarfile.open(fileobj=out,mode='w') as archive:
+        for name,data in entries.items():
+            item=tarfile.TarInfo(name);item.size=len(data);archive.addfile(item,io.BytesIO(data))
+    return out.getvalue(),manifest,raw,digest
+
+
+def offline_worker(monkeypatch,tmp_path,decoder,manifest,after=lambda restored:None):
+    """worker.run with a fake database and pg_restore; extraction, bundle checks and read-backs are real."""
+    import psycopg_pool
+    from messaging_service import backup_restore_worker as worker
+    real=crypto.decrypt_snapshot_stream;calls=[]
+    def decrypt(source,identity,destination,max_bytes):
+        restored=real(source,identity,tmp_path/'bundle',age=decoder,max_bytes=max_bytes);after(restored);return restored
+    class Lease:
+        def __enter__(self):return SimpleNamespace(execute=lambda *a:None)
+        def __exit__(self,*args):pass
+    class Pool:
+        connection=Lease
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+    monkeypatch.setattr(worker,'decrypt_snapshot_stream',decrypt)
+    monkeypatch.setattr(worker.subprocess,'run',lambda args,**kw:calls.append(args[0]))
+    monkeypatch.setattr(psycopg_pool,'ConnectionPool',lambda *a,**kw:Pool())
+    monkeypatch.setattr(worker,'restored_schema_version',lambda store,version:version)
+    monkeypatch.setattr(worker.backup,'database_manifest',lambda c:manifest['tables'])
+    monkeypatch.setattr(worker.backup,'blob_inventory',lambda c,version:(manifest['blobs'],[]))
+    monkeypatch.setattr(worker.backup,'quarantine_restore',lambda store:None)
+    monkeypatch.setattr(worker,'assert_quarantined',lambda store,version:None)
+    monkeypatch.setattr(worker,'write_result',lambda work,result:result)
+    def run(data,raw):
+        config={'v':1,'identity_file':'/run/restore/identity','work_directory':'/work','database_host':'restore-postgres',
+                'database_password':'a'*64,'snapshot_sha256':hashlib.sha256(raw).hexdigest(),'max_plaintext_bytes':len(data)}
+        return worker.run(config,io.BytesIO(data))
+    return worker,run,calls
+
+
+def flip_on_disk(path):
+    """Same size, different bytes: only a read of the file can tell."""
+    data=bytearray(path.read_bytes());data[0]^=0x01;path.write_bytes(bytes(data))
+
+
+# spec: ANYM-630
+@pytest.mark.parametrize('damage,error',[('original','blob_corrupt'),('dump','dump_corrupt'),('missing','blob_corrupt'),
+                                         ('extra','backup_blob_set_mismatch')])
+def test_extraction_refuses_a_tampered_missing_or_extra_member_of_the_stream(tmp_path,decoder,damage,error):
+    def change(entries,digest):
+        if damage=='original':entries['files/'+digest]=b'X'+entries['files/'+digest][1:]
+        elif damage=='dump':entries['database.dump']=b'X'+entries['database.dump'][1:]
+        elif damage=='missing':del entries['files/'+digest]
+        else:entries['files/'+'0'*64]=b'SYNTHETIC_EXTRA'
+    data,*_=bundle_with_original(change)
+    with pytest.raises((RuntimeError,ValueError),match=error):
+        crypto.decrypt_snapshot_stream(io.BytesIO(data),'key',tmp_path/'restore',age=decoder,max_bytes=len(data))
+    assert not (tmp_path/'restore').exists() and not list(tmp_path.glob('.decrypt-*'))
+
+
+# spec: ANYM-630
+def test_a_dump_changed_on_disk_after_extraction_is_dump_corrupt_before_pg_restore(tmp_path,monkeypatch,decoder):
+    from messaging_service import backup
+    data,manifest,raw,_=bundle_with_original();seen=[]
+    def after(restored):flip_on_disk(restored/'database.dump');seen.append(restored)
+    worker,run,calls=offline_worker(monkeypatch,tmp_path,decoder,manifest,after)
+    with pytest.raises(worker.RestoreStageError,match='restore_snapshot_failed'):run(data,raw)
+    assert calls==[]
+    with pytest.raises(RuntimeError,match='dump_corrupt'):backup.verify_bundle(seen[0],extracted=seen[0].extracted)
+
+
+# spec: ANYM-630
+def test_an_original_changed_on_disk_after_extraction_fails_the_original_hashes_read_back(tmp_path,monkeypatch,decoder):
+    data,manifest,raw,digest=bundle_with_original()
+    worker,run,calls=offline_worker(monkeypatch,tmp_path,decoder,manifest,lambda restored:flip_on_disk(restored/'files'/digest))
+    causes=[];real_stage=worker.stage
+    def stage(code,action):
+        try:return action()
+        except Exception as error:causes.append(error)
+        return real_stage(code,action)
+    monkeypatch.setattr(worker,'stage',stage)
+    with pytest.raises(worker.RestoreStageError,match='restore_snapshot_failed'):run(data,raw)
+    # The size-preserving change passes the pre-restore check; the read-back after pg_restore refuses it.
+    assert calls==['psql','pg_restore'] and [str(error) for error in causes]==['blob_corrupt']
+
+
+# spec: ANYM-630
+def test_each_original_is_read_once_and_the_dump_twice_after_extraction(tmp_path,monkeypatch,decoder):
+    import os
+    data,manifest,raw,digest=bundle_with_original()
+    worker,run,calls=offline_worker(monkeypatch,tmp_path,decoder,manifest)
+    opened=[];real_os_open=os.open;real_io_open=io.open
+    def os_open(path,flags,*args,**kw):
+        if not flags&(os.O_WRONLY|os.O_RDWR):opened.append(Path(path).name)
+        return real_os_open(path,flags,*args,**kw)
+    def io_open(file,mode='r',*args,**kw):
+        if isinstance(file,(str,os.PathLike)) and not set(mode)&set('wax+'):opened.append(Path(file).name)
+        return real_io_open(file,mode,*args,**kw)
+    monkeypatch.setattr(os,'open',os_open);monkeypatch.setattr(io,'open',io_open)
+    result=run(data,raw)
+    assert result['status']=='verified' and all(result['checks'].values()) and calls==['psql','pg_restore']
+    assert opened.count(digest)==1 and opened.count('database.dump')==2
+
+
+# spec: ANYM-630
+@pytest.mark.parametrize('member,error',[(2,'dump_corrupt'),(3,'blob_corrupt')],ids=['dump','original'])
+def test_standalone_decryption_still_reads_back_a_member_written_wrong_after_its_hash(tmp_path,monkeypatch,member,error):
+    import os,stat
+    data,*_=bundle_with_original();(tmp_path/'bundle.tar').write_bytes(data)
+    decoder=tmp_path/'age-file'
+    decoder.write_text('#!'+sys.executable+'\nimport sys,shutil\nshutil.copyfileobj(open(sys.argv[-1],"rb"),sys.stdout.buffer)\n')
+    decoder.chmod(0o700)
+    real_fsync=os.fsync;files=[]
+    def fsync(fd):
+        # A torn write the copy loop never saw: the member's first byte differs on disk only.
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            files.append(fd)
+            if len(files)==member:os.pwrite(fd,b'\0',0)  # members 2 and 3 start with 'U' and 'S'
+        return real_fsync(fd)
+    monkeypatch.setattr(os,'fsync',fsync)
+    with pytest.raises(RuntimeError,match=error):
+        crypto.decrypt_snapshot(tmp_path/'bundle.tar','key',tmp_path/'restore',age=str(decoder))
+    assert not (tmp_path/'restore').exists()

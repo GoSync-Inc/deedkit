@@ -328,7 +328,7 @@ host never builds it, and agents do not install it.
 
 1. On a development machine, at the `main` commit to deploy, build it with the
    pinned toolchain exactly as `tools/attest-verify/README.md` states
-   (`GOTOOLCHAIN=go1.26.9 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath
+   (`GOTOOLCHAIN=go1.26.10 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath
    -buildvcs=false -ldflags=-buildid= -o attest-verify .`). The build is
    reproducible: its SHA-256 must equal `tools/attest-verify/attest-verify.linux-amd64.sha256`,
    which a CI test rebuilds and compares.
@@ -336,7 +336,12 @@ host never builds it, and agents do not install it.
    root, mode `0755`, not a symlink. `production.py` refuses to run any other
    file: before every call it checks that the file is regular, owned by root or
    the operator running `production.py`, not writable by group or others, and
-   that its SHA-256 equals its own pinned `VERIFIER_SHA256`.
+   that its SHA-256 equals its own pinned `VERIFIER_SHA256`. A new build is
+   checked before it replaces the installed one: install it under a temporary
+   name in the same directory and run the self-test of the tool from the same
+   commit with `--verifier <temporary name>` (the same file checks, read and
+   never run; only `self-test` accepts `--verifier`), then rename it into place
+   together with that tool's switch ("Deploy tool updates").
 3. Install `production.py` from the same `main` commit as the release you
    prepare. The pulled image's `io.deedkit.production.build` label is the recipe
    CI computed for that commit, and the host compares it with the recipe its own
@@ -839,10 +844,11 @@ deploy can start between the check and the hash (a backup started meanwhile refu
 around 18:00 UTC. No active call. The new runner's read-only `--check` must exit 0 against
 messaging's `runner.json`: exit 3 means an unfinished journal, whose recovery stays under the
 existing rules (`--recover-stop` restarts the collectors it stopped), and the step stops. Any
-failed command stops it (`sh -e`). When the backup worker changed in the range since the
-pinned image (`org.opencontainers.image.revision` of `runner.json`'s `image`), the pin moves
-to the prepared release's backup image in the same step, before the runner: a newer runner
-can write a `worker.json` key an older worker refuses (BACKUP.md).
+failed command stops it (`sh -e`). From the prepared release: when the backup worker changed
+in the same range since the pinned image (`org.opencontainers.image.revision` of
+`runner.json`'s `image`), first set the backup image pin in `runner.json` to the release's
+backup image and check it, then install the runner, both in the script below (`pin=yes`): a
+newer runner can write a `worker.json` key an older worker refuses (BACKUP.md).
 
 ```sh
 sha=<prepared-sha>; src=/var/lib/deedkit-production/$sha/source; pin=yes   # pin=no: the worker did not change
@@ -874,17 +880,19 @@ os.fsync(fd);os.close(fd)" "$cfg" "$image"
 
 Every check runs before the first write: the image is resolved and its revision compared
 inside the lock, and the new `runner.json` is written beside the live one and checked before
-it replaces it. Install the new runner before you add
-any new `runner.json` key: the runner refuses keys it does not know. Then remove
-`/etc/deedkit/autodeploy.pause` only when its reason is this runner's refusal (`the backup
-runner ... is blob`); a pause for another reason stays. The step is done when the next
-messaging backup reaches `state: ok` with a new `last_success_id`
-(`/opt/personal-os-probe/backups/status.json`). Undo, under the same `flock`: remove from
-`runner.json` every key the `.before-<sha>` runner does not know (for example
-`busy_wait_seconds`), install the `.before-<sha>` runner the same way, then put back
-`runner.json.before-<sha>` (`cp -p`): the newer runner with the older image is the pair that
-fails, so the runner goes back first. An older runner refuses a newer key, so the backup would
-fail on every run.
+it replaces it; the script's `install` is the former separate `sudo install` step, now under
+the lock. Install the new runner before you add any new `runner.json` key: the runner refuses
+keys it does not know. Then remove `/etc/deedkit/autodeploy.pause` only when its reason is
+this runner's refusal (`the backup runner ... is blob`); a pause for another reason stays.
+The step is done when the next messaging backup reaches `state: ok` with a new
+`last_success_id` (`/opt/personal-os-probe/backups/status.json`). Undo, under the same `flock`
+and with the backup service idle, in this order: remove from `runner.json` every key the
+`.before-<sha>` runner does not know (for example `busy_wait_seconds`), install the
+`.before-<sha>` copy the same way, and only then put back the image pin it ran with
+(`runner.json.before-<sha>`, `cp -p`). An older runner refuses a newer `runner.json` key, and
+an older worker refuses a newer `worker.json` key the runner writes (`dump_timeout_seconds`,
+ANYM-627), so the backup would fail on every run; the older runner with the newer image passes
+(the worker keeps its 600 s default).
 
 ## Roll back the current release
 
@@ -1269,7 +1277,10 @@ Otherwise it:
    `services/release-router/**`, `deploy/deedkit-autodeploy.service` and
    `.timer`) that is not installed yet (the running tool file, or the unit in
    `/etc/systemd/system/`, equals the candidate's; a host without the unit
-   installs none; the verifier matches the installed pin), or
+   installs none; the verifier: the installed binary is the running tool's
+   pinned build and the candidate's `attest-verify.linux-amd64.sha256` records
+   that same build, so a later tool change with an unchanged verifier installs
+   itself; ANYM-618), or
    when the configuration changed since the current release (the plan A
    settings digest, each project's Compose document, the HTTP settings digest).
    An SQL pause also names the rollout class of each messaging migration the

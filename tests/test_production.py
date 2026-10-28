@@ -4462,6 +4462,25 @@ def test_a_tool_change_with_an_sql_router_verifier_or_unit_change_pauses_and_ins
     assert tree(host.tool) == before and host.receipt() is None and host.steps == []
 
 
+# spec: ANYM-618
+@pytest.mark.parametrize("recorded", ["the installed build", "another build"])
+def test_a_tool_change_after_a_hand_installed_verifier_updates_itself_only_when_the_candidate_records_that_build(
+        tmp_path, monkeypatch, recorded):
+    # BASE..NEWEST: NEWER rebuilt the verifier (installed by hand with its tool), NEWEST changes production.py only.
+    host = ToolHost(tmp_path, monkeypatch, changes={NEWER: ["tools/attest-verify/main.go", p.VERIFIER_RECORD],
+                                                    NEWEST: ["scripts/production.py"]})
+    pin = p.VERIFIER_SHA256 if recorded == "the installed build" else "c" * 64
+    host.blobs[f"{NEWEST}:{p.VERIFIER_RECORD}"] = git_blob(f"{pin}  attest-verify\n".encode())
+    before = tree(host.tool)
+    outcome = host.deploy()
+    if recorded == "the installed build":
+        assert outcome["status"] == "tool-updated" and host.current_tool() == f"releases/{NEWEST}"
+        assert host.receipt()["status"] == "active"
+    else:
+        assert outcome["status"] == "halted" and "tools/attest-verify/main.go" in outcome["reason"]
+        assert tree(host.tool) == before and host.receipt() is None and host.steps == []
+
+
 # spec: ANYM-443
 def test_a_changed_autodeploy_unit_pauses_until_the_installed_unit_is_the_candidates(tmp_path, monkeypatch):
     host = Deployer(tmp_path, monkeypatch, changes={NEWER: ["deploy/deedkit-autodeploy.service"]})
@@ -4625,7 +4644,40 @@ def test_the_self_test_runs_only_as_the_first_argument_under_its_guard(tmp_path,
     assert result.returncode == 1 and "self-test must be the first argument" in result.stderr
 
 
-BOUNDARIES = ["staged", "renamed", "activating", "switched", "before active"]
+# spec: ANYM-618
+def test_a_staged_tool_self_test_accepts_only_the_staged_verifier_its_pin_names(tmp_path, monkeypatch, capsys):
+    host = ToolHost(tmp_path, monkeypatch)
+    # The installed verifier is the previous build; the staged tool pins the staged build, held under a temporary name.
+    staged = tmp_path / "attest-verify.staged"
+    staged.write_bytes(b"#!/bin/sh\n# synthetic next build\n")
+    staged.chmod(0o755)
+    install_release(host.tool, NEWEST, candidate_tool(host.verifier, pin=hashlib.sha256(staged.read_bytes()).hexdigest()))
+    script = host.tool / "releases" / NEWEST / "production.py"
+    def self_test(*verifier):
+        return subprocess.run([sys.executable, "-B", "-E", "-s", str(script), "self-test", "--config",
+                               str(host.configs[0]), "--http-config", str(host.configs[1]), *verifier],
+                              capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"}, cwd="/", timeout=60)
+    result = self_test("--verifier", str(staged))
+    assert result.returncode == 0 and json.loads(result.stdout) == {"self_test": "ok", "sha": NEWEST}
+    # A mismatched pair is refused either way: the staged tool against the installed binary, or against another build.
+    result = self_test()
+    assert result.returncode == 1 and f"the attestation verifier {host.verifier} is missing" in result.stderr
+    assert "install the verifier first" in result.stderr
+    other = tmp_path / "attest-verify.other"
+    other.write_bytes(b"#!/bin/sh\n# synthetic other build\n")
+    other.chmod(0o755)
+    result = self_test("--verifier", str(other))
+    assert result.returncode == 1 and f"the attestation verifier {other} is missing" in result.stderr
+    staged.chmod(0o775)
+    result = self_test("--verifier", str(staged))
+    assert result.returncode == 1 and f"the attestation verifier {staged} is missing" in result.stderr
+    # Only the self-test reads another verifier path: every command that runs the verifier uses the installed one.
+    with pytest.raises(SystemExit):
+        p.main(["deploy", "--verifier", str(staged)])
+    assert "--verifier is only for self-test" in capsys.readouterr().err
+
+
+BOUNDARIES =["staged", "renamed", "activating", "switched", "before active"]
 
 
 # spec: ANYM-443
@@ -4956,6 +5008,19 @@ def test_deploy_pauses_before_any_step_when_a_database_copy_cannot_be_confirmed_
     outcome = host.deploy()
     assert outcome["status"] == "halted" and outcome["reason"] == "a database copy could not be stopped: " + copy_id
     assert host.paused() == outcome["reason"] and host.steps == [] and host.git == []
+
+
+# spec: ANYM-627
+def test_backup_runner_steps_never_pair_a_newer_runner_with_an_older_image():
+    # A newer runner writes dump_timeout_seconds into worker.json, which an older worker refuses: the install sets
+    # the newer image pin before the newer runner, and the undo puts the older runner back before its image pin.
+    docs = (ROOT / "docs/operations/production.md").read_text()
+    section = " ".join(docs.split("### Backup runner\n", 1)[1].split("\n## ", 1)[0].split())
+    install, undo = section.split("Undo,", 1)
+    assert install.index("first set the backup image pin") < install.index("then install the runner") \
+        < install.index("sudo install") < install.index("before you add any new `runner.json` key")
+    assert undo.index("remove from `runner.json` every key") < undo.index("install the `.before-<sha>` copy") \
+        < undo.index("put back the image pin")
 
 
 def held_backup_lock(tmp_path, monkeypatch):

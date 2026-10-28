@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from .envelope import stable_id
 from .policy import scope_filter
 from .status_details import describe,freshness
+from .conflict_classes import grouped, report
 from .operational import identity_safe, liveness, operations
 from .media_policy import ELIGIBILITY_JOIN, published_window
 
@@ -228,11 +229,7 @@ def get_sync_status(c, p):
         eligibility = _eligibility(c, [row['account'] for row in sources])
         # The archive detail code is sticky once any conflict was observed; the
         # alert follows conflicts which are still unresolved.
-        conflicts = {r['account']: r for r in c.execute('''SELECT m.account,
-            count(*) FILTER(WHERE mc.resolved_at IS NULL) AS active_conflicts,
-            count(*) FILTER(WHERE mc.resolved_at IS NOT NULL) AS historical_conflicts
-            FROM message_conflicts mc JOIN messages m ON m.id=mc.message
-            WHERE m.account=ANY(%s) GROUP BY m.account''', ([row['account'] for row in sources],))}
+        conflicts = grouped(c, 'account', [row['account'] for row in sources])
     deletion_status = {}
     if sources and not scoped:
         from .message_purge import deletions
@@ -244,17 +241,19 @@ def get_sync_status(c, p):
                    newest_message_at=data.get('newest_message_at'))
         row['history'] = _history(row['platform'], catalog_ids.get(account, set()), checkpoints.get(account, []))
         if not scoped:
-            counts=conflicts.get(account,{})
-            row['active_conflicts']=counts.get('active_conflicts',0)
-            row['historical_conflicts']=counts.get('historical_conflicts',0)
+            open_by_class,row['active_conflicts'],row['historical_conflicts']=conflicts.get(account,({},0,0))
+            row['conflicts']=report(open_by_class)
             if row.get('archive_detail_code')=='version_conflict' and not row['active_conflicts']:
                 row['archive_detail_code']='coverage_not_reconciled'
             row['deletions']=deletion_status.get(account) or {}
             row['detail']=describe(row.get('detail_code'))
             row['archive_detail']=describe(row.get('archive_detail_code'))
+            if row.get('archive_detail_code')=='version_conflict':
+                row['archive_detail']['next_action']=row['conflicts']['next_step']
             row['alerts']=[]
             if row['history'].get('gap_chats'):row['alerts'].append('provider_history_gaps')
-            if row['active_conflicts']:row['alerts'].append('archive_version_conflicts')
+            # Known classes need nothing; active_conflicts keeps the total for older readers (ANYM-557).
+            if row['conflicts']['attention']:row['alerts'].append('archive_version_conflicts')
         row['files'] = files.get(account) or empty_files()
         row['files']['download'] = {**dict.fromkeys(DOWNLOAD_STATES, 0), **downloads.get(account, {})}
         if not scoped:

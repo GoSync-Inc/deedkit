@@ -9,7 +9,7 @@ compatibility meaning too. Every service keeps its own lockfile, environment,
 process and state.
 
 ## Layout
-- `services/messaging`: AnyMsg server (Python 3.13, PostgreSQL 18, schema 53)
+- `services/messaging`: AnyMsg server (Python 3.13, PostgreSQL 18, schema 55)
 - `services/gateway`: common MCP gateway (HTTP only, imports no provider code)
 - `services/calendar`: family calendar (Google API/CalDAV), has its own AGENTS.md
 - `services/calls`: voice calls; `services/calls/frontend`: Vite UI
@@ -24,7 +24,7 @@ process and state.
 uv sync --group dev                                   # CI: --frozen
 PROBE_TEST_DSN_FILE=<file> uv run pytest tests        # DSN must end in /messaging_probe_test
 (cd services/gateway && uv sync --locked --group dev && uv run pytest -q)
-(cd services/calls && uv sync --locked --group dev && uv run pytest -q)
+(cd services/gateway && uv sync --locked --group dev) && (cd services/calls && uv sync --locked --group dev && uv run pytest -q)
 (cd services/calendar && uv sync --locked --group dev && FCS_TEST_DSN=<dsn> uv run pytest -m 'not live')
 (cd services/calls/frontend && npm ci --ignore-scripts && npm test && npm run build)
 node --test whatsapp/tests/*.test.mjs

@@ -38,9 +38,66 @@ runs about every 15 seconds only while the provider session is open; older than
 states, not only messages. It does not prove every provider callback arrived.
 The compact view carries only `liveness_state`; `detail=full` has the block.
 
-`alerts` contains `archive_version_conflicts` only while a conflict is unresolved
-(`active_conflicts`). The archive detail code itself stays recorded; without an
-unresolved conflict it is reported as `coverage_not_reconciled`.
+### Version conflicts (ANYM-557)
+
+Account-scoped readers get one conflict line per account, `conflicts`:
+
+- `attention`: open conflicts whose class is not known (including `unclassified`).
+- `known`: open conflicts of a known class: expected to stay unresolved, no action.
+- `top_classes`: at most 3 `{class, count, explanation}`, largest first.
+- `next_step`: `none_required` when every open conflict is known, otherwise
+  `inspect_chat`: call `get_sync_status` with a `chat_id` to list that chat's
+  open conflicts.
+
+`detail=compact` omits `conflicts` when both counts are 0. `active_conflicts` and
+`historical_conflicts` keep their totals for older readers. `alerts` contains
+`archive_version_conflicts` only while `attention` > 0. The archive detail code
+itself stays recorded, and while it is `version_conflict` its `next_action` is the
+line's `next_step`; without an unresolved conflict it is reported as
+`coverage_not_reconciled`. A key restricted to some chats gets no account line.
+
+`get_sync_status` with a `chat_id` returns `conflicts` with `active`,
+`historical`, the same four keys for that chat, and `items`: at most 20 open
+conflicts (attention first, newest first), each `{message_id, class,
+explanation, observed_at}` with no message text. Search, message and context
+results give a message with an open conflict `evidence.conflict{class,
+next_step}`; its `next_action` is `inspect_chat` only for a class that needs
+attention.
+
+Each conflict stores its class in `message_conflicts.reason` with
+`reason_version` (the rule version, now 1). The class compares the conflict's
+receipt (the original candidate) with the revision it contradicted, never the
+current revision. It is `<platform>_<field>_<relation>`, with platform
+`telegram` or `whatsapp`; field is the first that differs, in the order the
+archive tests them:
+
+| Field | Meaning |
+|---|---|
+| `sent_at` | the sent time differs |
+| `direction` | incoming vs outgoing differs |
+| `sender` | the sender ID differs |
+| `body` | the text differs |
+| `media` | the attachment descriptors differ |
+| `other` | another field differs (formatting or deletion) |
+
+| Relation | Meaning |
+|---|---|
+| `equal_version` | the candidate has the same provider update time |
+| `older_version` | the candidate is an older provider observation |
+| `newer_version` | the candidate is a newer provider observation |
+
+Known classes (a reviewed table in `conflict_classes.py`; the shape of a class
+never makes it known):
+
+| Class | Meaning |
+|---|---|
+| `telegram_body_equal_version` | two texts at one provider version; the archived revision stands until a later edit |
+| `telegram_direction_equal_version` | the other direction at one provider version; the archived revision stands until later evidence |
+
+`unclassified`: evidence the rule cannot read (for example a malformed legacy
+receipt), and every row without a stored class (written by older code). It
+counts as attention. Rows from before migration 054 keep no class until a
+follow-up card classifies them.
 
 Telegram history reconcile isolates a provider error of one chat (ANYM-293).
 Rate limits (`FloodWaitError`, the governor's cooldown), session-terminal

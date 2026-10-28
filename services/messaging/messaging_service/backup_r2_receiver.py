@@ -5,7 +5,7 @@ The producer still speaks stream_v2 and never receives object-store credentials.
 No boto3 import, ambient AWS credential lookup or network call occurs on import.
 """
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone, timedelta
 import hashlib
 import fcntl
@@ -19,6 +19,7 @@ import signal
 import stat
 import struct
 import sys
+import threading
 import time
 
 from . import backup_receiver as local
@@ -48,6 +49,9 @@ MAX_WARNINGS = 32
 # the proof must stay far inside the 16 KiB `protect`/`rotate` read limit.
 WARNING_BYTES = 4096
 WARNING_KIND = re.compile('[a-z_]{1,40}')
+# A part request still running this long after the uploads were stopped ends the process
+# (ANYM-628): the kernel then drops the receiver lock together with the last thread.
+STOP_SECONDS = 300
 
 
 def profile(config):
@@ -134,7 +138,7 @@ def load_config(path):
     required = {'v', 'endpoint', 'bucket', 'prefix', 'state_directory', 'credentials_file'}
     defaults = {'max_bytes': 64 * 1024 ** 3, 'quota_bytes': 128 * 1024 ** 3,
                 'max_objects': 2, 'part_bytes': 64 * MIB, 'timeout_seconds': 7200,
-                'cold_max_bytes': 5 * 1024 ** 3}
+                'cold_max_bytes': 5 * 1024 ** 3, 'upload_concurrency': 1}
     # Optional `verifier_config_file`: the installed service's verifier config, the one
     # whose publication (CAPABILITIES_FILE) `capabilities` accepts; it enables the mode.
     if (not isinstance(value, dict) or not required <= set(value) or
@@ -153,7 +157,7 @@ def load_config(path):
             not 5 * MIB <= value['part_bytes'] <= 64 * MIB or
             not 64 <= value['max_bytes'] <= min(5 * 1024 ** 4, value['part_bytes'] * 10000) or
             not value['max_bytes'] <= value['quota_bytes'] <= 10 * 1024 ** 4 or
-            not 60 <= value['timeout_seconds'] <= 21600 or
+            not 60 <= value['timeout_seconds'] <= 21600 or not 1 <= value['upload_concurrency'] <= 4 or
             not 64 <= value['cold_max_bytes'] <= min(5 * 1024 ** 4, value['part_bytes'] * 10000)):
         raise ValueError('invalid_limits')
     for key in ('state_directory', 'credentials_file', 'verifier_config_file'):
@@ -187,6 +191,8 @@ def make_client(config):
         request_checksum_calculation='when_required', response_checksum_validation='when_required',
         s3={'addressing_style': 'path'}))
     client.meta.events.register_first('needs-retry.s3', cancelled)
+    # Emitted before every attempt, also after a retry's backoff sleep.
+    client.meta.events.register_first('request-created.s3', cancelled)
     return client
 
 
@@ -559,6 +565,151 @@ def reconcile(config, client, attempt, state_fd):
     return saved
 
 
+def stop_timed_out():
+    # Never return to release the lock while a worker may still call R2. The attempt
+    # journal stays `uploading`, so the same-ID reconcile aborts this upload.
+    os._exit(1)
+
+
+class Parts:
+    """The parts of one multipart receive (ANYM-628).
+
+    With `upload_concurrency` 1 each part uploads inline, as before. With more, at most that many
+    upload at once and one more waits, so with the reader's own part memory stays within
+    (upload_concurrency + 2) x part_bytes plus one frame; the reader blocks only at that bound.
+    While workers may exist the reader holds SIGALRM (`held`): our deadline is raised only in a
+    `window`, a stream read or a wait round, never inside thread or lock bookkeeping. `finish` and
+    `stop` join every worker and then let the deadline through again, so none still calls R2 when
+    the caller aborts, completes or releases the receiver lock, the abort and the `completing`
+    journal write run as in serial mode, and a worker's first error reaches the reader.
+    """
+    def __init__(self, config, client, key, upload_id):
+        self.config, self.client, self.key, self.upload_id = config, client, key, upload_id
+        self.workers = config.get('upload_concurrency', 1); self.count = 0; self.etags = {}
+        self.waiting = []; self.running = 0; self.error = None; self.halted = False; self.threads = []
+        self.cond = threading.Condition(); self.outer = None; self.released = False
+
+    @contextmanager
+    def masked(self):
+        self.outer = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+        try:
+            yield
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, self.outer)
+
+    def held(self):
+        return self.masked() if self.workers > 1 else nullcontext()
+
+    @contextmanager
+    def opened(self):
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, self.outer)
+            yield
+        finally:
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+
+    def window(self):
+        return self.opened() if self.workers > 1 and not self.released else nullcontext()
+
+    def release(self):
+        # Every worker has ended: from here a deadline is raised where it lands, as in serial mode.
+        if self.outer is not None and not self.released:
+            self.released = True
+            signal.pthread_sigmask(signal.SIG_SETMASK, self.outer)
+
+    def send(self, number, data):
+        cancelled()
+        result = cloud_call(self.client.upload_part, Bucket=self.config['bucket'], Key=self.key,
+                            UploadId=self.upload_id, PartNumber=number, Body=data)
+        etag = result.get('ETag')
+        if not isinstance(etag, str) or not 1 <= len(etag) <= 1024:
+            raise ValueError('invalid_part_receipt')
+        return etag
+
+    def work(self):
+        while True:
+            with self.cond:
+                while not self.waiting and not self.halted:
+                    self.cond.wait()
+                if self.halted:
+                    return
+                number, data = self.waiting.pop(0); self.running += 1
+            etag = error = None
+            try:
+                etag = self.send(number, data)
+            except BaseException as exc:
+                error = exc
+            data = None
+            with self.cond:
+                self.running -= 1
+                if error is None:
+                    self.etags[number] = etag
+                elif self.error is None:
+                    self.error = error; self.halted = True
+                self.cond.notify_all()
+
+    def wait_until(self, ready):
+        while True:
+            with self.cond:
+                if self.error is not None:
+                    raise self.error
+                if ready():
+                    return
+                self.cond.wait(1)
+            with self.window():
+                pass
+
+    def add(self, data):
+        self.count += 1
+        if self.count > 10000:
+            raise ValueError('backup_size_mismatch')
+        if self.workers == 1:
+            self.etags[self.count] = self.send(self.count, data)
+            return
+        self.wait_until(lambda: len(self.waiting) + self.running <= self.workers)
+        with self.cond:
+            self.waiting.append((self.count, data)); self.cond.notify()
+            if len(self.threads) < self.workers:
+                # Started while the reader holds SIGALRM, so workers inherit the mask.
+                thread = threading.Thread(target=self.work, name=f'r2-part-{len(self.threads)}', daemon=True)
+                thread.start(); self.threads.append(thread)
+
+    def finish(self):
+        if self.workers > 1:
+            self.wait_until(lambda: not self.waiting and not self.running)
+            self.stop()
+        if sorted(self.etags) != list(range(1, self.count + 1)):
+            raise ValueError('invalid_part_receipt')
+        # Parts remain bounded in memory. The durable completion journal
+        # needs the final object identity, not 10,000 part ETags: an
+        # unknown completion is reconciled, never blindly repeated.
+        return [{'PartNumber': number, 'ETag': self.etags[number]} for number in sorted(self.etags)]
+
+    def stop(self):
+        """Drop waiting parts and join running ones; a deadline/stop meanwhile is raised after the join.
+
+        After our deadline/stop the SDK hooks refuse another attempt, so a running part ends
+        within one request's connect/read timeouts; past STOP_SECONDS the process ends. The
+        abort that follows runs with the deadline deliverable.
+        """
+        limit = time.monotonic() + STOP_SECONDS; interrupted = None
+        with self.cond:
+            self.halted = True; self.waiting.clear(); self.cond.notify_all()
+        while any(thread.is_alive() for thread in self.threads):
+            if time.monotonic() > limit:
+                stop_timed_out()
+            for thread in self.threads:
+                thread.join(1)
+            try:
+                with self.window():
+                    pass
+            except BaseException as exc:
+                interrupted = interrupted or exc
+        self.release()
+        if interrupted is not None:
+            raise interrupted
+
+
 def receive(config, source, *, client=None, respond=None):
     header = read_header(config, source); bid = header['id']
     client = client if client is not None else make_client(config)
@@ -596,64 +747,74 @@ def receive(config, source, *, client=None, respond=None):
             raise ValueError('invalid_upload_id')
         attempt['upload_id'] = upload_id; attempt['phase'] = 'uploading'
         state_write(state_fd, attempt_name(bid), attempt)
-        try:
-            if respond:
-                respond({'v': 2, 'status': 'ready', 'id': bid, 'snapshot_sha256': header['snapshot_sha256']})
-            digest = hashlib.sha256(); size = 0; prefix = b''; buffer = bytearray(); parts = []
-            def part(data):
-                number = len(parts) + 1
-                if number > 10000:
+        uploads = Parts(config, client, key, upload_id)
+        with uploads.held():
+            try:
+                if respond:
+                    respond({'v': 2, 'status': 'ready', 'id': bid, 'snapshot_sha256': header['snapshot_sha256']})
+                digest = hashlib.sha256(); size = 0; prefix = b''; part_bytes = config['part_bytes']
+                # Each part fills its own exact-size buffer, which is handed over, never copied.
+                buffer = None; filled = 0
+                while True:
+                    with uploads.window():
+                        length = struct.unpack('!I', local.exact_read(source, 4))[0]
+                    if length == 0:
+                        break
+                    if length > MIB:
+                        raise ValueError('invalid_backup_frame')
+                    if size + length > header['max_bytes']:
+                        raise ValueError('backup_size_mismatch')
+                    with uploads.window():
+                        data = local.exact_read(source, length)
+                    size += length; digest.update(data)
+                    if len(prefix) < len(AGE_HEADER):
+                        prefix += data[:len(AGE_HEADER) - len(prefix)]
+                    view = memoryview(data)
+                    while view:
+                        if buffer is None:
+                            buffer = bytearray(part_bytes); filled = 0
+                        take = min(len(view), part_bytes - filled)
+                        buffer[filled:filled + take] = view[:take]; filled += take; view = view[take:]
+                        if filled == part_bytes:
+                            full, buffer = buffer, None
+                            uploads.add(full); full = None
+                    view = data = None
+                with uploads.window():
+                    raw = source.readline(4097)
+                if len(raw) > 4096 or not raw.endswith(b'\n'):
+                    raise ValueError('truncated_backup')
+                footer = unique_json(raw)
+                if (not isinstance(footer, dict) or set(footer) != {'bytes', 'sha256'} or
+                        type(footer['bytes']) is not int or footer['bytes'] != size or size < 64):
                     raise ValueError('backup_size_mismatch')
-                result = cloud_call(client.upload_part, Bucket=config['bucket'], Key=key, UploadId=upload_id,
-                                    PartNumber=number, Body=data)
-                etag = result.get('ETag')
-                if not isinstance(etag, str) or not 1 <= len(etag) <= 1024:
-                    raise ValueError('invalid_part_receipt')
-                parts.append({'PartNumber': number, 'ETag': etag})
-                # Parts remain bounded in memory. The durable completion journal
-                # needs the final object identity, not 10,000 part ETags: an
-                # unknown completion is reconciled, never blindly repeated.
-            while True:
-                length = struct.unpack('!I', local.exact_read(source, 4))[0]
-                if length == 0:
-                    break
-                if length > MIB:
-                    raise ValueError('invalid_backup_frame')
-                if size + length > header['max_bytes']:
+                if footer['sha256'] != digest.hexdigest():
+                    raise ValueError('backup_hash_mismatch')
+                with uploads.window():
+                    tail = source.read(1)
+                if tail:
                     raise ValueError('backup_size_mismatch')
-                data = local.exact_read(source, length); size += length; digest.update(data)
-                if len(prefix) < len(AGE_HEADER):
-                    prefix += data[:len(AGE_HEADER) - len(prefix)]
-                buffer.extend(data)
-                if len(buffer) >= config['part_bytes']:
-                    part(bytes(buffer[:config['part_bytes']])); del buffer[:config['part_bytes']]
-            raw = source.readline(4097)
-            if len(raw) > 4096 or not raw.endswith(b'\n'):
-                raise ValueError('truncated_backup')
-            footer = unique_json(raw)
-            if (not isinstance(footer, dict) or set(footer) != {'bytes', 'sha256'} or
-                    type(footer['bytes']) is not int or footer['bytes'] != size or size < 64):
-                raise ValueError('backup_size_mismatch')
-            if footer['sha256'] != digest.hexdigest():
-                raise ValueError('backup_hash_mismatch')
-            if source.read(1):
-                raise ValueError('backup_size_mismatch')
-            if prefix != AGE_HEADER:
-                raise ValueError('encrypted_backup_required')
-            if buffer:
-                part(bytes(buffer))
-            wire = {'v': 2, 'status': 'stored', 'id': bid, 'bytes': size, 'sha256': digest.hexdigest(),
-                    'snapshot_sha256': header['snapshot_sha256'], 'duplicate': False,
-                    'received_at': datetime.now(timezone.utc).isoformat()}
-            attempt['receipt'] = {'v': 1, 'destination': destination(config), 'object_key': key, 'wire': wire}
-            attempt['phase'] = 'completing'
-            state_write(state_fd, attempt_name(bid), attempt)
-        except BaseException:
-            # This path is reachable only before CompleteMultipartUpload. Never
-            # abort a completion whose response may have been lost.
-            cloud_call(client.abort_multipart_upload, Bucket=config['bucket'], Key=key, UploadId=upload_id)
-            os.unlink(attempt_name(bid), dir_fd=state_fd); local.fsync_dir(state_fd)
-            raise
+                if prefix != AGE_HEADER:
+                    raise ValueError('encrypted_backup_required')
+                if buffer is not None and filled:
+                    del buffer[filled:]
+                    full, buffer = buffer, None
+                    uploads.add(full); full = None
+                # Joins every worker and lets a held deadline through before `completing`.
+                parts = uploads.finish()
+                wire = {'v': 2, 'status': 'stored', 'id': bid, 'bytes': size, 'sha256': digest.hexdigest(),
+                        'snapshot_sha256': header['snapshot_sha256'], 'duplicate': False,
+                        'received_at': datetime.now(timezone.utc).isoformat()}
+                attempt['receipt'] = {'v': 1, 'destination': destination(config), 'object_key': key, 'wire': wire}
+                attempt['phase'] = 'completing'
+                state_write(state_fd, attempt_name(bid), attempt)
+            except BaseException:
+                # This path is reachable only before CompleteMultipartUpload. Never
+                # abort a completion whose response may have been lost. No part
+                # upload may still run when the abort or the lock release happens.
+                uploads.stop()
+                cloud_call(client.abort_multipart_upload, Bucket=config['bucket'], Key=key, UploadId=upload_id)
+                os.unlink(attempt_name(bid), dir_fd=state_fd); local.fsync_dir(state_fd)
+                raise
         try:
             client.complete_multipart_upload(Bucket=config['bucket'], Key=key, UploadId=upload_id,
                                              MultipartUpload={'Parts': parts})

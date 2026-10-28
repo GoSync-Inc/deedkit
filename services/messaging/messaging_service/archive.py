@@ -134,7 +134,7 @@ class Archive:
                       (cid,aid,e['chat_title'],e['chat'],chat_type,e['chat'],e['chat']))
             old=c.execute('SELECT * FROM messages WHERE id=%s FOR UPDATE',(mid,)).fetchone()
             content=fingerprint(e); updated=datetime.fromisoformat(e['updated_at']); outcome='created'
-            old_format=None
+            old_format=None;retained=None
             if old:
                 retained=c.execute('SELECT snapshot FROM message_revisions WHERE message=%s AND revision=%s',
                     (mid,old['revision'])).fetchone()
@@ -238,7 +238,15 @@ class Archive:
             c.execute('INSERT INTO ingest_receipts(digest,account,envelope,outcome) VALUES(%s,%s,%s,%s)',
                       (receipt,aid,Jsonb(captured),outcome))
             if outcome=='conflict':
-                c.execute('''INSERT INTO message_conflicts(receipt_digest,message,observed_revision,
+                # The class compares the receipt with the contradicted revision, as the backfill does (ANYM-557).
+                from .conflict_classes import REASON_VERSION,classify,stored
+                if stored(c):
+                    c.execute('''INSERT INTO message_conflicts(receipt_digest,message,observed_revision,
+                        candidate_updated_at,observed_at,reason,reason_version) VALUES(%s,%s,%s,%s,clock_timestamp(),%s,%s)''',
+                        (receipt,mid,old['revision'],updated,
+                         classify(retained['snapshot'] if retained else None,captured,old['provider_updated_at']),
+                         REASON_VERSION))
+                else:c.execute('''INSERT INTO message_conflicts(receipt_digest,message,observed_revision,
                     candidate_updated_at,observed_at) VALUES(%s,%s,%s,%s,clock_timestamp())''',
                     (receipt,mid,old['revision'],updated))
             elif outcome in ('edited','deleted','unchanged'):

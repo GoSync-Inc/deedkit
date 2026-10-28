@@ -5,8 +5,10 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import struct
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
@@ -848,3 +850,310 @@ def test_capabilities_file_stays_outside_upload_state_and_leaves_receive_unchang
     assert receive(loaded,cloud)['status']=='stored'
     responses,_=cold(loaded,cloud,'put',data=r2.AGE_HEADER+b'synthetic cold ciphertext'*8)
     assert responses[-1]['status']=='stored'
+
+
+PART=5*1024**2
+
+class Parallel(Cloud):
+    """Cloud whose parts block until released: counts parts in flight and the thread of each call."""
+    def __init__(self,*,hold=True,fail_part=None):
+        super().__init__();self.lock=threading.Lock();self.inflight=0;self.peak=0;self.threads=set()
+        self.release={};self.hold=hold;self.fail_part=fail_part;self.completed=None;self.done=[];self.at_stop=None
+    def gate(self,number):
+        with self.lock:return self.release.setdefault(number,threading.Event())
+    def upload_part(self,**kw):
+        number=kw['PartNumber'];self.threads.add(threading.current_thread().name)
+        with self.lock:self.inflight+=1;self.peak=max(self.peak,self.inflight)
+        try:
+            if number==self.fail_part:
+                eventually(lambda:self.inflight>=3);raise CloudError(500)
+            if self.hold:assert self.gate(number).wait(10),'part never released'
+            result=super().upload_part(**kw);self.done.append(number);return result
+        finally:
+            with self.lock:self.inflight-=1
+            self.calls.append('upload_end')
+    def complete_multipart_upload(self,**kw):
+        self.completed=list(kw['MultipartUpload']['Parts'])
+        return super().complete_multipart_upload(**kw)
+    def free(self,numbers=range(1,64)):
+        for number in numbers:self.gate(number).set()
+
+class Counted(io.BytesIO):
+    """The producer's stream: how far the receiver has read; at `pause_at` it waits for `until`, then stops or ends."""
+    def __init__(self,raw,*,pause_at=None,until=None,stop=False):
+        super().__init__(raw);self.pause_at=pause_at;self.until=until;self.stop=stop
+    def read(self,*a):
+        if self.pause_at is not None and self.tell()>=self.pause_at:
+            eventually(self.until)
+            if self.stop:r2.cancel(TimeoutError('receiver_timeout'))
+            return b''
+        return super().read(*a)
+    def readline(self,*a):return self.read(*a) if self.pause_at is not None and self.tell()>=self.pause_at else super().readline(*a)
+
+def workers_alive():return [t.name for t in threading.enumerate() if t.name.startswith('r2-part')]
+
+def eventually(check,seconds=10):
+    deadline=time.monotonic()+seconds
+    while not check():
+        assert time.monotonic()<deadline,'condition never held'
+        time.sleep(0.01)
+
+def parallel(config,n=3):return {**config,'upload_concurrency':n,'max_bytes':64*1024**2,'quota_bytes':128*1024**2}
+
+@pytest.fixture
+def free_on_stop(monkeypatch):
+    """Release held parts only once the reader has begun stopping, so the join meets running uploads."""
+    def arm(cloud):
+        original=r2.Parts.stop
+        def stop(self):
+            if cloud.at_stop is None:cloud.at_stop=cloud.inflight
+            cloud.free();return original(self)
+        monkeypatch.setattr(r2.Parts,'stop',stop)
+    return arm
+
+@pytest.fixture
+def alarm():
+    """The receiver's own deadline handler (main) on SIGALRM; restored and cleared afterwards."""
+    def timed_out(*_):r2.cancel(TimeoutError('receiver_timeout'))
+    previous=signal.signal(signal.SIGALRM,timed_out)
+    yield lambda:os.kill(os.getpid(),signal.SIGALRM)
+    signal.signal(signal.SIGALRM,previous);r2.CANCELLED.clear()
+
+def joined_before_abort(cloud):
+    ends=[i for i,c in enumerate(cloud.calls) if c=='upload_end']
+    return bool(ends) and cloud.calls.index('abort_multipart_upload')>max(ends) and not workers_alive()
+
+def journal(config):return list(Path(config['state_directory']).glob('*.attempt.json'))
+
+# spec: ANYM-628
+@pytest.mark.parametrize('value',[0,5,'3',True,1.0,-1])
+def test_upload_concurrency_config_accepts_only_whole_numbers_one_to_four(config,tmp_path,value):
+    path=tmp_path/'bad.json';write_json(path,{**config,'upload_concurrency':value})
+    with pytest.raises(ValueError,match='invalid_limits'):r2.load_config(path)
+
+# spec: ANYM-628
+def test_upload_concurrency_defaults_to_serial_and_accepts_production_value(config,tmp_path):
+    assert config['upload_concurrency']==1
+    path=tmp_path/'three.json';write_json(path,{**config,'upload_concurrency':3})
+    assert r2.load_config(path)['upload_concurrency']==3
+
+# spec: ANYM-628
+def test_without_the_key_every_part_uploads_inline_on_the_reader_thread(config):
+    cloud=Parallel(hold=False);data=r2.AGE_HEADER+b'x'*(11*1024**2)
+    assert receive(config,cloud,data=data)['status']=='stored'
+    assert cloud.peak==1 and cloud.threads=={threading.current_thread().name}
+    assert cloud.completed==[{'PartNumber':n,'ETag':'part-'+str(n)} for n in (1,2,3)]
+
+# spec: ANYM-628
+def test_sdk_refuses_every_attempt_after_a_deadline_including_retries_after_backoff(config,monkeypatch):
+    hooks=[]
+    made=SimpleNamespace(meta=SimpleNamespace(events=SimpleNamespace(register_first=lambda *a:hooks.append(a))))
+    monkeypatch.setitem(sys.modules,'boto3',SimpleNamespace(session=SimpleNamespace(Session=lambda **kw:SimpleNamespace(client=lambda *a,**k:made))))
+    monkeypatch.setitem(sys.modules,'botocore.config',SimpleNamespace(Config=lambda **kw:kw))
+    r2.make_client(config)
+    assert ('request-created.s3',r2.cancelled) in hooks and ('needs-retry.s3',r2.cancelled) in hooks
+
+# spec: ANYM-628
+def test_reader_keeps_receiving_while_three_parts_upload_within_the_memory_bound(config):
+    config=parallel(config);cloud=Parallel();data=r2.AGE_HEADER+b'p'*(9*PART)
+    source=Counted(wire(data));outcome={}
+    def run():
+        try:outcome['result']=r2.receive(config,source,client=cloud)
+        except BaseException as exc:outcome['error']=exc
+    reader=threading.Thread(target=run);reader.start()
+    try:
+        eventually(lambda:cloud.inflight==3 and source.tell()>=5*PART)
+        time.sleep(0.3)
+        # Three parts upload, one waits, the reader's own part: (3 + 2) parts plus at most one frame.
+        assert cloud.inflight==3 and cloud.peak==3
+        assert 4*PART<source.tell()<=5*PART+2*1024**2
+        assert len(workers_alive())==3
+    finally:
+        cloud.free(range(10,0,-1));reader.join(20)
+    assert not reader.is_alive() and 'error' not in outcome
+    assert outcome['result']['status']=='stored' and cloud.peak==3
+    assert list(v for k,v in cloud.objects.items() if '/objects/' in k)==[data]
+
+class Lean(Parallel):
+    """Keeps only each part's digest, so traced memory is the receiver's own."""
+    def upload_part(self,**kw):
+        number=kw['PartNumber'];self.uploads[kw['UploadId']]['parts'][number]=None
+        with self.lock:self.inflight+=1;self.peak=max(self.peak,self.inflight)
+        try:
+            assert self.gate(number).wait(10);self.digests[number]=sha(kw['Body']);self.sizes[number]=len(kw['Body'])
+            return {'ETag':'part-'+str(number)}
+        finally:
+            with self.lock:self.inflight-=1
+    def complete_multipart_upload(self,**kw):
+        self.completed=list(kw['MultipartUpload']['Parts']);self.uploads.pop(kw['UploadId']);self.objects[kw['Key']]=b''
+        return {}
+
+# spec: ANYM-628
+def test_part_memory_stays_within_concurrency_plus_two_parts_and_one_frame(config,monkeypatch):
+    import tracemalloc
+    config=parallel(config);data=r2.AGE_HEADER+b'm'*(8*PART+12345);raw=wire(data)
+    cloud=Lean();cloud.digests={};cloud.sizes={}
+    monkeypatch.setattr(r2,'verify_object',lambda *a,**k:None)
+    source=Counted(raw);outcome={}
+    def run():
+        try:outcome['result']=r2.receive(config,source,client=cloud)
+        except BaseException as exc:outcome['error']=exc
+    tracemalloc.start()
+    try:
+        reader=threading.Thread(target=run);reader.start()
+        try:
+            # The worst moment: three uploading, one waiting, the reader's fifth part full.
+            eventually(lambda:cloud.inflight==3 and source.tell()>=5*PART);time.sleep(0.3)
+        finally:
+            cloud.free();reader.join(20)
+        peak=tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert 'error' not in outcome and outcome['result']['status']=='stored'
+    assert peak<=5*PART+4*1024**2,peak/1024**2
+    assert b''.join(data[(n-1)*PART:n*PART] for n in range(1,10))==data and len(cloud.sizes)==9
+    assert all(cloud.digests[n]==sha(data[(n-1)*PART:n*PART]) for n in range(1,10))
+
+# spec: ANYM-628
+def test_parts_released_out_of_order_complete_sorted_like_the_serial_run(config):
+    data=r2.AGE_HEADER+b'q'*(6*PART+123)
+    serial=Parallel(hold=False);assert r2.receive(parallel(config,1),io.BytesIO(wire(data,bid=THIRD)),client=serial)['status']=='stored'
+    # Four upload while the fifth waits; each release lets a later part in, so all seven finish out of order.
+    cloud=Parallel();order=[4,2,3,7,5,6,1]
+    def release():
+        for number in order:
+            eventually(lambda:number in cloud.release);cloud.gate(number).set()
+            eventually(lambda:number in cloud.done)
+    releaser=threading.Thread(target=release);releaser.start()
+    try:result=r2.receive(parallel(config,4),io.BytesIO(wire(data)),client=cloud)
+    finally:cloud.free();releaser.join(20)
+    assert cloud.done==order and serial.done==sorted(order)
+    assert result['status']=='stored' and cloud.completed==serial.completed
+    assert [p['PartNumber'] for p in cloud.completed]==list(range(1,8))
+    assert cloud.calls.index('complete_multipart_upload')>max(i for i,c in enumerate(cloud.calls) if c=='upload_end')
+    assert list(v for k,v in cloud.objects.items() if '/objects/' in k)==[data] and not workers_alive()
+
+# spec: ANYM-628
+def test_failed_part_two_of_five_joins_every_upload_then_aborts_with_safe_code(config,free_on_stop):
+    cloud=Parallel(fail_part=2);free_on_stop(cloud)
+    with pytest.raises(RuntimeError,match='^storage_unavailable$'):
+        r2.receive(parallel(config),io.BytesIO(wire(r2.AGE_HEADER+b'f'*(5*PART-100))),client=cloud)
+    assert 'complete_multipart_upload' not in cloud.calls and cloud.calls.count('abort_multipart_upload')==1
+    assert joined_before_abort(cloud) and cloud.at_stop>=1 and cloud.peak==3
+    assert not cloud.uploads and not cloud.objects and not journal(config)
+
+# spec: ANYM-628
+def test_failed_abort_with_uploads_in_flight_keeps_journal_for_same_id_reconcile(config,free_on_stop):
+    config=parallel(config);data=r2.AGE_HEADER+b'g'*(5*PART-100)
+    cloud=Parallel(fail_part=2);cloud.fail['abort_multipart_upload']=TimeoutError('unknown abort');free_on_stop(cloud)
+    with pytest.raises(RuntimeError,match='storage_unavailable'):r2.receive(config,io.BytesIO(wire(data)),client=cloud)
+    assert joined_before_abort(cloud) and cloud.at_stop>=1 and 'complete_multipart_upload' not in cloud.calls
+    assert journal(config)
+    cloud.fail_part=None
+    with pytest.raises(RuntimeError,match='incomplete_upload_aborted_retry'):r2.receive(config,io.BytesIO(wire(data)),client=cloud)
+    assert not cloud.uploads and r2.receive(config,io.BytesIO(wire(data)),client=cloud)['status']=='stored'
+
+# spec: ANYM-628
+def test_stream_truncated_while_parts_upload_aborts_after_joining(config,free_on_stop):
+    cloud=Parallel();free_on_stop(cloud);raw=wire(r2.AGE_HEADER+b't'*(5*PART))
+    source=Counted(raw,pause_at=len(raw)//5*4,until=lambda:cloud.inflight==3)
+    with pytest.raises(ValueError,match='truncated_backup'):r2.receive(parallel(config),source,client=cloud)
+    assert cloud.at_stop==3 and 'complete_multipart_upload' not in cloud.calls
+    assert joined_before_abort(cloud) and not cloud.uploads and not journal(config)
+
+# spec: ANYM-628
+def test_stop_during_uploads_ends_with_the_deadline_code_and_no_thread_alive(config,free_on_stop):
+    cloud=Parallel();free_on_stop(cloud);raw=wire(r2.AGE_HEADER+b's'*(6*PART))
+    source=Counted(raw,pause_at=4*PART,until=lambda:cloud.inflight==3,stop=True)
+    try:
+        with pytest.raises(TimeoutError,match='receiver_timeout'):r2.receive(parallel(config),source,client=cloud)
+        assert cloud.at_stop==3 and 'complete_multipart_upload' not in cloud.calls
+        assert not workers_alive() and cloud.inflight==0
+        # The stop also refuses the abort's answer, as before: the journal waits for the same-ID reconcile.
+        assert journal(config)
+    finally:
+        r2.CANCELLED.clear()
+
+# spec: ANYM-628
+def test_deadline_during_the_join_keeps_joining_and_leaves_the_journal_for_reconcile(config,alarm,monkeypatch):
+    config=parallel(config);data=r2.AGE_HEADER+b'd'*(5*PART);raw=wire(data);cloud=Parallel()
+    source=Counted(raw,pause_at=len(raw)//5*4,until=lambda:cloud.inflight==3)
+    original=r2.Parts.stop
+    def stop(self):
+        # The deadline lands while the reader joins three held uploads; they end only after it ran.
+        def later():eventually(lambda:bool(r2.CANCELLED));time.sleep(0.2);cloud.free()
+        helper=threading.Thread(target=later);helper.start();alarm()
+        try:return original(self)
+        finally:helper.join(20)
+    monkeypatch.setattr(r2.Parts,'stop',stop)
+    with pytest.raises(TimeoutError,match='receiver_timeout'):r2.receive(config,source,client=cloud)
+    # The receiver lock is released only here: every worker had already ended.
+    assert not workers_alive() and cloud.inflight==0 and cloud.peak==3
+    assert 'abort_multipart_upload' not in cloud.calls and 'complete_multipart_upload' not in cloud.calls
+    assert journal(config)
+    r2.CANCELLED.clear()
+    with pytest.raises(RuntimeError,match='incomplete_upload_aborted_retry'):r2.receive(config,io.BytesIO(wire(data)),client=cloud)
+    assert not cloud.uploads
+
+# spec: ANYM-628
+@pytest.mark.parametrize('moment',['thread_start','slot_wait'])
+def test_deadline_during_bookkeeping_is_held_until_a_safe_point(config,alarm,free_on_stop,monkeypatch,moment):
+    config=parallel(config);cloud=Parallel();free_on_stop(cloud);raw=wire(r2.AGE_HEADER+b'b'*(9*PART))
+    if moment=='thread_start':
+        class Started(threading.Thread):
+            def start(self):super().start();alarm()
+        monkeypatch.setattr(r2,'threading',SimpleNamespace(Thread=Started,Condition=threading.Condition))
+    else:
+        source=Counted(raw)
+        def fire():eventually(lambda:cloud.inflight==3 and source.tell()>=5*PART);time.sleep(0.2);alarm()
+        helper=threading.Thread(target=fire);helper.start()
+    with pytest.raises(TimeoutError,match='receiver_timeout'):
+        r2.receive(config,io.BytesIO(raw) if moment=='thread_start' else source,client=cloud)
+    if moment=='slot_wait':helper.join(20)
+    assert not workers_alive() and cloud.inflight==0 and 'complete_multipart_upload' not in cloud.calls
+    assert journal(config) and cloud.at_stop is not None
+
+# spec: ANYM-628
+def test_a_part_request_outliving_the_stop_limit_ends_the_process_without_releasing_the_lock(config,monkeypatch):
+    class Ended(BaseException):pass
+    seen={}
+    def ended():seen['alive']=workers_alive();raise Ended()
+    monkeypatch.setattr(r2,'STOP_SECONDS',0.3);monkeypatch.setattr(r2,'stop_timed_out',ended)
+    cloud=Parallel();raw=wire(r2.AGE_HEADER+b'h'*(5*PART))
+    source=Counted(raw,pause_at=len(raw)//5*4,until=lambda:cloud.inflight==3)
+    try:
+        with pytest.raises(Ended):r2.receive(parallel(config),source,client=cloud)
+        assert len(seen['alive'])==3 and 'abort_multipart_upload' not in cloud.calls and journal(config)
+    finally:
+        cloud.free();eventually(lambda:not workers_alive())
+
+# spec: ANYM-628
+def test_deadline_at_the_completing_write_aborts_like_serial_and_never_strands_the_journal(config,alarm,monkeypatch):
+    config=parallel(config);data=r2.AGE_HEADER+b'c'*(4*PART);cloud=Parallel(hold=False);written=r2.state_write
+    def state_write(directory,name,value):
+        if value.get('phase')=='completing':alarm()
+        return written(directory,name,value)
+    monkeypatch.setattr(r2,'state_write',state_write)
+    with pytest.raises(TimeoutError,match='receiver_timeout'):r2.receive(config,io.BytesIO(wire(data)),client=cloud)
+    assert 'complete_multipart_upload' not in cloud.calls and not workers_alive()
+    # The deadline refuses the abort's answer as in serial mode; the journal says `uploading`, so it reconciles.
+    assert [json.loads(p.read_text())['phase'] for p in journal(config)]==['uploading']
+    r2.CANCELLED.clear();monkeypatch.setattr(r2,'state_write',written)
+    with pytest.raises(RuntimeError,match='incomplete_upload_aborted_retry'):r2.receive(config,io.BytesIO(wire(data)),client=cloud)
+    assert r2.receive(config,io.BytesIO(wire(data)),client=cloud)['status']=='stored'
+
+# spec: ANYM-628
+def test_a_stalled_abort_after_the_join_still_gets_the_deadline(config,alarm,free_on_stop):
+    config=parallel(config);cloud=Parallel(fail_part=2);free_on_stop(cloud);entered=threading.Event();held=threading.Event()
+    def abort(**kw):
+        entered.set();assert held.wait(10),'abort never released'
+        return Cloud.abort_multipart_upload(cloud,**kw)
+    cloud.abort_multipart_upload=abort
+    def fire():entered.wait(10);alarm()
+    helper=threading.Thread(target=fire);helper.start();started=time.monotonic()
+    try:
+        with pytest.raises(TimeoutError,match='receiver_timeout'):
+            r2.receive(config,io.BytesIO(wire(r2.AGE_HEADER+b'a'*(5*PART-100))),client=cloud)
+        assert time.monotonic()-started<5 and not held.is_set() and not workers_alive() and journal(config)
+    finally:
+        held.set();helper.join(20)
