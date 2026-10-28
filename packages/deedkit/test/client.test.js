@@ -1,8 +1,13 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
+import {existsSync, readFileSync} from 'node:fs';
 import {inspect} from 'node:util';
 import {DeedKitClient, DeedKitError, tools} from '../lib/index.js';
 
+// The gateway catalog plus platform_capabilities, so a new gateway tool needs no edit here (catalog.test.js
+// checks the names); outside a repository checkout, the packaged list.
+const catalogUrl = new URL('../../../services/gateway/src/agent_gateway/catalog.json', import.meta.url);
+const toolCount = existsSync(catalogUrl) ? JSON.parse(readFileSync(catalogUrl, 'utf8')).length + 1 : tools.length;
 const token = 'synthetic-gateway-key';
 const options = {baseUrl: 'https://gateway.example/deedkit', token};
 const response = (body, status = 200) => Response.json(body, {status});
@@ -20,7 +25,7 @@ test('every catalog tool is a bearer POST to /v1/{tool} on the gateway prefix', 
   }});
   for (const tool of tools) assert.deepEqual(await client.call(tool, {probe: 'synthetic'}), {ok: true});
   assert.deepEqual(seen, tools.map(tool => `https://gateway.example/deedkit/v1/${tool}`));
-  assert.equal(tools.length, 67);
+  assert.equal(tools.length, toolCount);
 });
 
 test('platform_capabilities helper sends an empty object', async () => {
