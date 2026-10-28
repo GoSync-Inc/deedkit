@@ -236,6 +236,8 @@ jobs:
           uv sync --locked --group dev
           uv run pytest -m 'not live' -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/calendar.xml"
           uv build --out-dir "$RUNNER_TEMP/calendar-dist"
+          # Last, so a lint failure still leaves calendar.xml for the evidence; the calendar's own [tool.ruff] applies.
+          uv run --project ../../tools/dev --locked ruff check .
       - name: Calls Python 3.13 native transports and synthetic workflows
         id: calls
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
