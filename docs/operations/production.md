@@ -838,29 +838,61 @@ before any stop while that file exists and its git blob is not the release's
 `services/messaging/messaging_service/backup_runner.py`; the refusal names both
 blob ids, and under `deploy --auto` it pauses the deployer like any refusal
 before a change. A host without the file runs no backup and is not checked.
-With the timer and the backup service idle, from the prepared release: when
-the backup worker changed in the same range, first set the backup image pin in
-`runner.json` to the release's backup image and read it back, then install the
-runner:
+The install is one step under the runner's own lock, so no messaging or calendar backup and no
+deploy can start between the check and the hash (a backup started meanwhile refuses
+`backup_job_already_running` and systemd retries it; a deploy exits 75): avoid the minutes
+around 18:00 UTC. No active call. The new runner's read-only `--check` must exit 0 against
+messaging's `runner.json`: exit 3 means an unfinished journal, whose recovery stays under the
+existing rules (`--recover-stop` restarts the collectors it stopped), and the step stops. Any
+failed command stops it (`sh -e`). From the prepared release: when the backup worker changed
+in the same range since the pinned image (`org.opencontainers.image.revision` of
+`runner.json`'s `image`), first set the backup image pin in `runner.json` to the release's
+backup image and check it, then install the runner, both in the script below (`pin=yes`): a
+newer runner can write a `worker.json` key an older worker refuses (BACKUP.md).
 
 ```sh
-sha=<same-sha>; src=/var/lib/deedkit-production/$sha/source
-sudo cp -p /opt/personal-os-probe/ops/backup_runner.py /opt/personal-os-probe/ops/backup_runner.py.before-$sha
-sudo install -o root -g root -m 0600 "$src/services/messaging/messaging_service/backup_runner.py" \
-  /opt/personal-os-probe/ops/backup_runner.py
-sudo git hash-object /opt/personal-os-probe/ops/backup_runner.py   # = git -C "$src" rev-parse $sha:<that path>
+sha=<prepared-sha>; src=/var/lib/deedkit-production/$sha/source; pin=yes   # pin=no: the worker did not change
+sudo flock --nonblock /opt/personal-os-probe/backups/.runner.lock sh -euc '
+  sha=$1 src=$2 pin=$3 ops=/opt/personal-os-probe/ops cfg=/opt/personal-os-probe/backup-config/runner.json
+  new=$src/services/messaging/messaging_service/backup_runner.py
+  for u in personal-os-backup.service deedkit-autodeploy.service; do
+    case $(systemctl show -P ActiveState $u) in inactive|failed) ;; *) echo "$u not idle"; exit 1;; esac
+  done
+  python3 -I "$new" --config "$cfg" --check
+  if [ "$pin" = yes ]; then
+    image=$(docker image inspect -f "{{.Id}}" "deedkit-production-backup:$sha")
+    case $image in sha256:*) ;; *) echo "no backup image for $sha"; exit 1;; esac
+    rev=$(docker image inspect -f "{{index .Config.Labels \"org.opencontainers.image.revision\"}}" "$image")
+    test "$rev" = "$sha"
+    rm -f "$cfg.new"
+    python3 -I -c "import json,os,sys;p,i=sys.argv[1:];c=json.load(open(p));c[\"image\"]=i
+fd=os.open(p+\".new\",os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600);os.write(fd,(json.dumps(c,indent=2)+\"\n\").encode())
+os.fsync(fd);os.close(fd)" "$cfg" "$image"
+    python3 -I "$new" --config "$cfg.new" --check
+  fi
+  cp -p "$ops/backup_runner.py" "$ops/backup_runner.py.before-$sha"; cp -p "$cfg" "$cfg.before-$sha"
+  if [ "$pin" = yes ]; then mv "$cfg.new" "$cfg"; fi
+  install -o root -g root -m 0600 "$new" "$ops/backup_runner.py"
+  test "$(git hash-object "$ops/backup_runner.py")" = "$(git hash-object "$new")"
+  echo "installed $(git hash-object "$ops/backup_runner.py"), image $(python3 -I -c "import json,sys;print(json.load(open(sys.argv[1]))[\"image\"])" "$cfg")"
+' sh "$sha" "$src" "$pin"
 ```
 
-Install the new runner before you add any new `runner.json` key: the runner
-refuses keys it does not know. Then remove
-`/etc/deedkit/autodeploy.pause`. Undo, with the timer and the backup service
-idle, in this order: remove from `runner.json` every key the `.before-<sha>`
-runner does not know (for example `busy_wait_seconds`), install the
-`.before-<sha>` copy the same way, and only then put back the image pin it ran
-with. An older runner refuses a newer `runner.json` key, and an older worker
-refuses a newer `worker.json` key the runner writes (`dump_timeout_seconds`,
-ANYM-627), so the backup would fail on every run; the older runner with the
-newer image passes (the worker keeps its 600 s default).
+Every check runs before the first write: the image is resolved and its revision compared
+inside the lock, and the new `runner.json` is written beside the live one and checked before
+it replaces it; the script's `install` is the former separate `sudo install` step, now under
+the lock. Install the new runner before you add any new `runner.json` key: the runner refuses
+keys it does not know. Then remove `/etc/deedkit/autodeploy.pause` only when its reason is
+this runner's refusal (`the backup runner ... is blob`); a pause for another reason stays.
+The step is done when the next messaging backup reaches `state: ok` with a new
+`last_success_id` (`/opt/personal-os-probe/backups/status.json`). Undo, under the same `flock`
+and with the backup service idle, in this order: remove from `runner.json` every key the
+`.before-<sha>` runner does not know (for example `busy_wait_seconds`), install the
+`.before-<sha>` copy the same way, and only then put back the image pin it ran with
+(`runner.json.before-<sha>`, `cp -p`). An older runner refuses a newer `runner.json` key, and
+an older worker refuses a newer `worker.json` key the runner writes (`dump_timeout_seconds`,
+ANYM-627), so the backup would fail on every run; the older runner with the newer image passes
+(the worker keeps its 600 s default).
 
 ## Roll back the current release
 
@@ -1442,7 +1474,14 @@ whole run, so a backup started by hand during a deploy refuses before it stops
 anything (`backup_job_already_running`) and systemd retries it every 30 minutes,
 at most three starts in 8 hours: pause the timer and let a running deploy finish
 before starting a backup by hand. While a backup holds the lock, the deploy
-exits 75 and the run counts as a skip. A skipped run (condition or lock) prints
+exits 75 and the run counts as a skip. The calendar's backup runner holds the
+same lock as its `host_lock` (BACKUP.md, Family calendar), and a manual
+`production.py deploy` (without `--auto`) takes it too, without waiting: while a
+backup holds it the deploy returns `busy` (`backup_running`) before any change. Every
+deploy, `--auto` too, also returns `busy` while the calendar runner's
+`<lock>.unsettled` marker exists (its worker is not verified stopped; its runner's
+`--recover-stop` or next run removes it). A missing lock directory skips the lock only on a
+host without the runner and without `DEEDKIT_BACKUP_LOCK`; otherwise the deploy halts. A skipped run (condition or lock) prints
 no JSON line.
 
 The unit adds no destination: `deploy` reads `main` from GitHub over HTTPS

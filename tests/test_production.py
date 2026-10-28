@@ -1,6 +1,7 @@
 """Promotion guards use synthetic GitHub/Compose responses; no live runtime access."""
 import contextlib
 import copy
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -30,7 +31,8 @@ CHECK_SPACE, RETAIN_IMAGES, PROMOTABLE = p.check_space, p.retain_images, p.promo
 @pytest.fixture(autouse=True)
 def no_host_state(tmp_path, monkeypatch):
     """No test reads this machine's production state, /etc/deedkit, containerd, tool or systemd directory."""
-    for name in ("HOST_STATE", "CONFIG_DIRECTORY", "CONTAINERD_ROOT", "TOOL_ROOT", "SYSTEMD_DIRECTORY", "BACKUP_RUNNER"):
+    for name in ("HOST_STATE", "CONFIG_DIRECTORY", "CONTAINERD_ROOT", "TOOL_ROOT", "SYSTEMD_DIRECTORY", "BACKUP_RUNNER",
+                 "BACKUP_LOCK"):
         monkeypatch.setattr(p, name, tmp_path / "absent" / name.lower())
 
 
@@ -5019,3 +5021,82 @@ def test_backup_runner_steps_never_pair_a_newer_runner_with_an_older_image():
         < install.index("sudo install") < install.index("before you add any new `runner.json` key")
     assert undo.index("remove from `runner.json` every key") < undo.index("install the `.before-<sha>` copy") \
         < undo.index("put back the image pin")
+
+
+def held_backup_lock(tmp_path, monkeypatch):
+    """The backup runner's lock, held by a synthetic backup run (another open file description)."""
+    path = tmp_path / "backups" / ".runner.lock"
+    path.parent.mkdir(mode=0o700)
+    monkeypatch.setenv("DEEDKIT_BACKUP_LOCK", str(path))
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return path, fd
+
+
+# spec: ANYM-608
+def test_a_manual_deploy_returns_busy_before_any_change_while_a_backup_holds_its_lock(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    path, fd = held_backup_lock(tmp_path, monkeypatch)
+    try:
+        outcome = host.deploy()
+    finally:
+        os.close(fd)
+    assert outcome["status"] == "busy" and outcome["reason"].startswith("backup_running") and str(path) in outcome["reason"]
+    assert host.steps == [] and host.git == [] and host.requests == [] and host.paused() is None
+    assert not (host.state / "deploy.json").exists()
+    # Once the backup ends, the same deploy runs and releases the lock when it ends.
+    assert host.deploy()["status"] == "deployed"
+    fd = os.open(path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(fd)
+
+
+# spec: ANYM-608
+def test_an_auto_deploy_under_the_units_held_wrapper_lock_is_not_blocked_by_it(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    _, fd = held_backup_lock(tmp_path, monkeypatch)  # the unit's `flock --nonblock` wrapper holds it
+    try:
+        outcome = host.deploy(auto=True)
+    finally:
+        os.close(fd)
+    assert outcome["status"] == "deployed" and host.steps
+
+
+# spec: ANYM-608
+def test_a_host_without_the_backup_directory_deploys_without_the_backup_lock(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)  # no runner installed, no DEEDKIT_BACKUP_LOCK, no lock directory
+    assert host.deploy()["status"] == "deployed" and not p.BACKUP_LOCK.parent.exists()
+
+
+# spec: ANYM-608
+@pytest.mark.parametrize("cause", ["override", "runner"])
+def test_a_missing_lock_directory_never_skips_the_lock_when_named_or_when_a_runner_is_installed(tmp_path, monkeypatch,
+                                                                                                cause):
+    host = Deployer(tmp_path, monkeypatch)
+    if cause == "override":
+        monkeypatch.setenv("DEEDKIT_BACKUP_LOCK", str(tmp_path / "mistyped" / ".runner.lock"))
+    else:
+        monkeypatch.setattr(p, "BACKUP_LOCK", tmp_path / "no-backups" / ".runner.lock")
+        p.BACKUP_RUNNER.parent.mkdir(parents=True)
+        p.BACKUP_RUNNER.write_bytes(b"installed runner\n")
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and "cannot be opened" in outcome["reason"]
+    assert host.steps == [] and host.git == []
+
+
+# spec: ANYM-608
+@pytest.mark.parametrize("auto", [False, True])
+def test_a_deploy_returns_busy_while_a_calendar_backup_worker_is_not_verified_stopped(tmp_path, monkeypatch, auto):
+    host = Deployer(tmp_path, monkeypatch)
+    lock = tmp_path / "backups" / ".runner.lock"
+    lock.parent.mkdir(mode=0o700)
+    monkeypatch.setenv("DEEDKIT_BACKUP_LOCK", str(lock))
+    marker = tmp_path / "backups" / ".runner.lock.unsettled"
+    marker.write_text('{"profile":"calendar"}\n')  # a calendar run failed its recovery and released the locks
+    outcome = host.deploy(auto=auto)
+    assert outcome["status"] == "busy" and outcome["reason"].startswith("backup_running") and str(marker) in outcome["reason"]
+    assert host.steps == [] and host.git == [] and host.paused() is None
+    marker.unlink()
+    assert host.deploy(auto=auto)["status"] == "deployed"
