@@ -4954,3 +4954,14 @@ def test_deploy_pauses_before_any_step_when_a_database_copy_cannot_be_confirmed_
     outcome = host.deploy()
     assert outcome["status"] == "halted" and outcome["reason"] == "a database copy could not be stopped: " + copy_id
     assert host.paused() == outcome["reason"] and host.steps == [] and host.git == []
+
+
+# spec: ANYM-627
+def test_backup_runner_undo_installs_the_older_runner_before_the_older_image_pin():
+    # A newer runner writes dump_timeout_seconds into worker.json, which an older worker refuses, so the undo
+    # never pairs the newer runner with the older image: the older runner goes back first, its image pin last.
+    docs = (ROOT / "docs/operations/production.md").read_text()
+    section = docs.split("### Backup runner\n", 1)[1].split("\n## ", 1)[0]
+    undo = " ".join(section.split("Undo,", 1)[1].split())
+    assert undo.index("remove from `runner.json` every key") < undo.index("install the `.before-<sha>` copy") \
+        < undo.index("put back the image pin")
