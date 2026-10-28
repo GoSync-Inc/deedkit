@@ -566,7 +566,8 @@ and records `http_status` and `latency_ms`. Past 10 s the result says
 same `request_id`. A failed test still creates the endpoint (state `enabled`,
 health `failing`), so a retry needs no new request ID.
 
-**States.** `enabled`, `agent_paused`, `auto_paused` (set by S3) and
+**States.** `enabled`, `agent_paused`, `auto_paused` (set by S3, and by a vendor's
+401 or 403, ANYM-582) and
 `operator_disabled`. The agent may pause, and resume from `agent_paused` or
 `auto_paused`; resume and test on `operator_disabled` answer `operator_disabled`.
 Only the operator disables or enables (`deedkit admin delivery-endpoints list |
@@ -605,14 +606,22 @@ run started and every other status as "no run started", and no deduplication
 canonicalized and matched like `allow_hosts`. It never widens the policy: the host
 must also pass `allow_hosts` and `deny_hosts`, and a malformed value or an unknown
 name leaves the policy unset. Take the host from the routine's own URL; the vendor
-publishes none.
+publishes none. `reload-delivery-policy` prints the `vendors` map it loaded, so a
+host left out of `vendors` shows at the edit.
 
 The agent then calls `register_delivery_endpoint` with the URL,
-`headers: {"Authorization": "Bearer <key>"}` and a `signing_secret` of its own
-(still required; the vendor ignores the `webhook-*` headers). Without that header,
-registration and `set_headers` answer `invalid_header` with `header:
-"Authorization"`. Endpoint views show `vendor` (`grok-bot-routine` or null) under
-the current policy. The registration's signed test starts one run.
+`headers: {"Authorization": "Bearer <key>"}` (the routine's key) and a
+`signing_secret`: any valid `whsec_` of its own; it is still required, and the
+vendor never checks the `webhook-*` headers. Without that header, registration and
+`set_headers` on a vendor host answer `invalid_header` with `header:
+"Authorization"`: send the routine key as `Bearer <key>`. Endpoint views show
+`vendor` (`grok-bot-routine` or null) under the current policy. If the register
+answer shows `vendor: null` for the routine's URL, the host is not in `vendors`:
+stop and ask the operator, since that endpoint would deliver at least once. Every
+test (the registration's and `test_delivery_endpoint`) starts one run with body
+`type: "test"`; the routine should end quietly on it. Bind with a
+`delivery_policy` of `{"debounce_s": 60}` so a burst of events wakes one run, not
+one per hint (a server-side fold of pending hints is not built).
 
 A vendor host's endpoints deliver at most once after the request is written:
 
@@ -620,14 +629,17 @@ A vendor host's endpoints deliver at most once after the request is written:
 |---|---|---|
 | 2xx | `delivered` | `delivered` |
 | 3xx | dead letter `redirect_rejected` | `failed` `redirect_rejected` |
-| 401, 403 | dead letter `vendor_refused` | `failed` `vendor_refused` |
+| 401, 403 | dead letter `vendor_refused`; the endpoint turns `auto_paused` and its queued hints and tests are cancelled `endpoint_auto_paused` | `failed` `vendor_refused` |
 | other status (no run started) | bounded retry, `receiver_status` | `failed` `receiver_status` |
 | not sent (`egress.EgressNotSent`: refusal, connect, TLS, deadline before the first byte) | bounded retry, `receiver_unavailable` | `failed` `receiver_unavailable` |
-| timeout, reset or malformed response after the write | dead letter `outcome_unknown`, never re-sent | `failed` `outcome_unknown` |
-| lease ran out during an attempt (dispatcher crash) | dead letter `outcome_unknown`, no POST | `failed` `outcome_unknown`, no POST |
+| timeout, reset, a 1xx or a malformed response after the write | dead letter `outcome_unknown`, never re-sent | `failed` `outcome_unknown` |
+| lease ran out during an attempt (dispatcher crash) | dead letter `outcome_unknown`, no POST, settled before DNS, quiet hours or the budget | `failed` `outcome_unknown`, no POST |
 
 Before the dispatcher's transport raises `EgressNotSent`, no failure counts as
-unsent, so a vendor hint is still never sent twice. A lost wake loses no event: the
+unsent, so a vendor hint is still never sent twice. A rotated or revoked routine
+key shows as `auto_paused`: replace the headers with `set_headers`, then `resume`.
+A 429 is an "other status": the bounded retry spends its attempts in minutes. A lost
+wake loses no event: the
 routine also keeps a schedule trigger that fetches and ACKs. Other endpoints and
 operator receivers keep at-least-once delivery.
 
