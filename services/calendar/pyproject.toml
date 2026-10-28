@@ -42,7 +42,7 @@ packages = ["family_calendar"]
 exclude = ["**/.local/**", "**/outputs/**", "**/*.key", "**/*.sqlite*"]
 
 [tool.hatch.build.targets.sdist]
-include = ["family_calendar", "tests", "scripts", "docs", ".github", "AGENTS.md", "README.md", "CONTRACTS.md", "THIRD_PARTY.md", "LICENSE", "pyproject.toml", "uv.lock", ".gitignore", ".gitattributes"]
+include = ["family_calendar", "tests", "scripts", "docs", "AGENTS.md", "README.md", "CONTRACTS.md", "THIRD_PARTY.md", "LICENSE", "pyproject.toml", "uv.lock", ".gitignore", ".gitattributes"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
