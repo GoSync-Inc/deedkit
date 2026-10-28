@@ -65,7 +65,7 @@ V50_TABLES={'component_heartbeats':'component'}
 V51_TABLES={'send_previews':'token_hash','send_intents':'id'}
 V53_TABLES={'person_preferences':'person,purpose'}
 # Every schema this runtime can capture, verify and restore (one ceiling for capture and verify_bundle).
-SCHEMAS=range(2,55)
+SCHEMAS=range(2,56)
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
 V17_TABLES={'message_conflicts':'receipt_digest'}
