@@ -14,8 +14,9 @@ permissions:
   contents: read
 concurrency:
   # A pull request cancels its own older run; each main push has its own group, so no main run is cancelled
-  # (a cancelled main push run reads as failed to wait-merge.sh --main).
-  group: security-${{ github.event.pull_request.number || github.sha }}
+  # (a cancelled main push run reads as failed to wait-merge.sh --main). The event name keeps a scheduled run of
+  # the same commit out of the push group, so it can never replace a pending push run.
+  group: security-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   report:

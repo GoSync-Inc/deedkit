@@ -43,7 +43,7 @@ def test_osv_scanner_fails_the_security_run_except_for_listed_advisories():
 # spec: ANYM-500
 def test_security_runs_cancel_only_an_older_run_of_the_same_pull_request():
     concurrency = _workflow("security.yml")["concurrency"]
-    assert concurrency["group"] == "security-${{ github.event.pull_request.number || github.sha }}"
+    assert concurrency["group"] == "security-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}"
     assert concurrency["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
 
 
@@ -125,3 +125,5 @@ def test_security_runs_daily_on_main_so_a_new_advisory_fails_a_run_before_a_merg
     minute, hour, *rest = entry["cron"].split()
     assert minute.isdigit() and hour.isdigit() and rest == ["*", "*", "*"], entry
     assert workflow["permissions"] == {"contents": "read"}
+    # A scheduled run of the main head never shares, and so never replaces, the pending slot of its push run.
+    assert workflow["concurrency"]["group"].startswith("security-${{ github.event_name }}-")
