@@ -43,6 +43,9 @@ MAX_GUESTS = 20
 EMAIL = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
                    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+")
 INVITE_FIELDS = ("guests", "notify")
+# The closest call after a series edit refused before any write: this occurrence alone, or (a following move from
+# the series' first occurrence) the whole series.
+CLOSEST_SCOPE = {"series_exceptions": "this", "series_starts_here": "all"}
 # What a series scope of a move or cancel does (ANYM-556), as the preview states it.
 SERIES_EFFECTS = {
     ("all", "move"): "Every occurrence of the series moves by this occurrence's shift from its original start, in "
@@ -349,16 +352,15 @@ class Scheduler:
         if isinstance(target, dict):
             self.choose(request, target, calendars, zone)
         if isinstance(target, str) and target.startswith("series-"):
-            # A series handle (a partial following move's replacement) names the whole series only.
-            if scope != "all":
+            # A series handle names the replacement series of one of this principal's partial following moves:
+            # its undo is a cancel of that whole series, resolved from the durable record, never the cache.
+            if kind != "cancel" or scope != "all":
                 raise missing("series", "enum")
-            row = self.store.one(
-                "SELECT ref FROM occurrences WHERE details->>'series_ref'=%s AND calendar_ref=ANY(%s) "
-                "ORDER BY start_at,ref LIMIT 1", (target, [c["calendar_ref"] for c in calendars]),
-            )
-            if not row:
-                raise CalendarError("event_not_found")
-            target = row["ref"]
+            made = self.service.replacement_of(p, target)
+            cal = next((c for c in calendars if c["calendar_ref"] == made["calendar_ref"]), None)
+            if cal is None:
+                raise CalendarError("not_found_or_forbidden")
+            return {"action": "delete", "calendar_ref": cal["calendar_ref"], "replacement": target}, cal
         occurrence = self.store.one(
             "SELECT ref,calendar_ref,start_at,end_at,details FROM occurrences WHERE ref=%s AND calendar_ref=ANY(%s)",
             (target, [c["calendar_ref"] for c in calendars]),
@@ -414,7 +416,7 @@ class Scheduler:
                   "arguments": {"calendar_refs": refs[:32], "start": start.isoformat(), "end": end.isoformat()}}
         if not rows:
             raise CalendarError("event_not_found", details={"next": agenda})
-        moved = {k: request[k] for k in ("start", "duration") if k in request}
+        moved = {k: request[k] for k in ("start", "duration", "series") if k in request}
         raise selection([
             {"id": row["ref"], "kind": "event", "account": row["calendar_ref"],
              # The label names the time only: the title is the caller's own words.
@@ -471,7 +473,11 @@ class Scheduler:
             shown["before"] = {k: before[k] if before.get("all_day") else instant(before[k]).astimezone(zone).isoformat()
                                for k in ("start", "end")}
         scope = (step.get("series") or {}).get("scope")
-        if scope:
+        if scope and "occurrence" not in step:
+            # The undo of a partial following move: its replacement series, as created.
+            shown.update(series=scope, effect="The replacement series this principal created is deleted, only if "
+                                              "nobody changed it since.")
+        elif scope:
             original = step["occurrence"]["original_start"]
             shown.update(series=scope, effect=SERIES_EFFECTS[(scope, shown["action"])],
                          original_start=original if "T" not in original else (
@@ -520,7 +526,7 @@ class Scheduler:
             result["request_id"] = op["request_id"]
         if state == "succeeded" and series:
             # An occurrence's event_ref names its original start, which an all move changes: the series is the handle.
-            result["series_ref"] = step["occurrence"]["series_ref"]
+            result["series_ref"] = (step.get("occurrence") or series)["series_ref"]
             if replaced:
                 result["replacement"] = {"series_ref": series_ref(step["calendar_ref"], steps[0]["target_id"])}
         elif state == "succeeded" and step["action"] == "create":
@@ -541,12 +547,12 @@ class Scheduler:
             result["next_action"] = "reconcile; do not create again"
         if partial:
             result.update(self.partial(step, steps, family))
-        elif state == "failed" and op["error"] == "series_exceptions":
+        elif state == "failed" and op["error"] in CLOSEST_SCOPE:
             request = plan["request"] or {}
-            # Nothing was written; the same change for this occurrence alone is the closest call.
+            # Nothing was written; the same change for this occurrence alone (or the whole series) is the closest.
             result["next"] = {"tool": TOOL_NAME, "arguments": {
                 **{k: request[k] for k in ("action", "event", "start", "duration") if k in request},
-                "series": "this", "dry_run": True}}
+                "series": CLOSEST_SCOPE[op["error"]], "dry_run": True}}
         return result
 
     @staticmethod
@@ -559,13 +565,20 @@ class Scheduler:
         at = step["occurrence"]["original_start"]
         start = (datetime.combine(date.fromisoformat(at), datetime.min.time(), family["zone"]) if "T" not in at
                  else instant(at).astimezone(family["zone"]))
+
+        def inspect(first):
+            # Each series from where it overlaps on: the replacement can start far from the original boundary.
+            return {"tool": "calendar_agenda", "arguments": {
+                "calendar_refs": [calendar], "start": (first - timedelta(days=7)).isoformat(),
+                "end": (first + timedelta(days=21)).isoformat()}}
+
+        moved = instant(steps[0]["span"]["start"]).astimezone(family["zone"])
         return {
             "partial": True,
-            "handles": {"original": {"calendar_ref": calendar, "series_ref": original},
-                        "replacement": {"calendar_ref": calendar, "series_ref": replacement}},
-            "next": {"tool": "calendar_agenda", "arguments": {
-                "calendar_refs": [calendar], "start": (start - timedelta(days=7)).isoformat(),
-                "end": (start + timedelta(days=21)).isoformat()}},
+            "handles": {"original": {"calendar_ref": calendar, "series_ref": original, "inspect": inspect(start)},
+                        "replacement": {"calendar_ref": calendar, "series_ref": replacement,
+                                        "inspect": inspect(moved)}},
+            "next": inspect(start),
             "undo": {"tool": TOOL_NAME, "arguments": {"action": "cancel", "event": replacement, "series": "all",
                                                       "dry_run": True}},
             "next_action": "inspect both series; the original was not ended, so occurrences from here on show twice; "

@@ -19,9 +19,13 @@ from .store import instant
 
 SCOPES = ("this", "following", "all")
 # Fields a replacement series copies from the original master; guests, conferences and attachments refuse.
-COPIED = ("summary", "description", "location", "colorId", "transparency", "visibility", "reminders")
+# `status` too: a tentative series stays tentative (Google's default for a new event is confirmed).
+COPIED = ("summary", "description", "location", "colorId", "transparency", "visibility", "reminders", "status")
 UNCOPIABLE = ("attendees", "conferenceData", "attachments", "extendedProperties", "source")
-# RRULE parts a date shift would contradict (the rule names days); time parts contradict any move.
+# RRULE parts a date shift would contradict (the rule names days); time parts contradict any move. A monthly or
+# yearly rule takes its day from DTSTART when it names none, and skips dates a month lacks: a date shift
+# changes which dates exist (31 Jan monthly is not 1 Feb monthly), so it refuses too.
+DATE_FREQS = ("MONTHLY", "YEARLY")
 DAY_PARTS = ("BYDAY", "BYMONTHDAY", "BYYEARDAY", "BYWEEKNO", "BYMONTH", "BYSETPOS")
 TIME_PARTS = ("BYHOUR", "BYMINUTE", "BYSECOND")
 MAX_INSTANCES = 10_000
@@ -107,21 +111,23 @@ def original_of(event, zone):
 
 def check_exceptions(exceptions, zone, boundary, scope, cancel):
     """Refuse an edit that would leave an exception's fate to the provider: for a move every exception in the
-    range (all: the whole series), for a following cancel every live exception from the boundary on."""
-    if scope == "all" and cancel:
-        # Deleting the master deletes the whole series, its exceptions included.
-        return
-    found = 0
+    range (all: the whole series), for a following cancel every live exception from the boundary on. An exception
+    with guests of its own in the range is an edit of an event with guests (capability_unverified)."""
+    affected = []
     for e in exceptions:
         original = original_of(e, zone)
         if original is None:
             raise CalendarError("series_exceptions")
         if scope == "following" and original < boundary:
             continue
-        if cancel and e.get("status") == "cancelled":
-            continue
-        found += 1
-    if found:
+        affected.append(e)
+    # Google lets an exception carry attendees the master lacks; cancelling it is a change of an event with guests.
+    if any(e.get("attendees") for e in affected):
+        raise CalendarError("capability_unverified")
+    if scope == "all" and cancel:
+        # Deleting the master deletes the whole series, its exceptions included.
+        return
+    if any(not (cancel and e.get("status") == "cancelled") for e in affected):
         raise CalendarError("series_exceptions")
 
 
@@ -146,7 +152,8 @@ def check_shift(parts, delta, first):
     if names & set(TIME_PARTS):
         raise CalendarError("unsupported_recurrence")
     moved = first + delta
-    if names & set(DAY_PARTS) and (moved.date() if isinstance(moved, datetime) else moved) != (
+    freq = dict(parts).get("FREQ", "").upper()
+    if (names & set(DAY_PARTS) or freq in DATE_FREQS) and (moved.date() if isinstance(moved, datetime) else moved) != (
             first.date() if isinstance(first, datetime) else first):
         raise CalendarError("unsupported_recurrence")
 

@@ -78,7 +78,8 @@ class FakeGoogle:
             body = json.loads(req.content)
             if body["id"] in self.events:
                 return httpx.Response(409)
-            self.events[body["id"]] = dict(body, etag=self._etag())
+            # Google gives every new event an iCalUID of its own.
+            self.events[body["id"]] = dict(body, etag=self._etag(), iCalUID=body.get("iCalUID", body["id"] + "@google.com"))
             return httpx.Response(200, json=self.events[body["id"]])
         if current is None:
             return httpx.Response(404)

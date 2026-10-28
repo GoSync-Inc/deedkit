@@ -301,8 +301,12 @@ def test_a_refused_truncation_is_a_partial_failure_with_both_handles(store, fail
     replacement = series_ref("cal-a", steps[0]["target_id"])
     assert (result["state"], result["detail_state"], result["error"], result["partial"]) == (
         "failed", "partial", code, True)
-    assert result["handles"] == {"original": {"calendar_ref": "cal-a", "series_ref": series_ref("cal-a", "lesson")},
-                                 "replacement": {"calendar_ref": "cal-a", "series_ref": replacement}}
+    handles = result["handles"]
+    assert {k: handles[k]["series_ref"] for k in handles} == {"original": series_ref("cal-a", "lesson"),
+                                                              "replacement": replacement}
+    # Each series has its own read-only look; the replacement's starts at the replacement.
+    assert handles["replacement"]["inspect"]["tool"] == "calendar_agenda"
+    assert handles["replacement"]["inspect"]["arguments"]["start"] == "2026-10-26T17:30:00+08:00"
     assert result["next"]["tool"] == "calendar_agenda" and result["next"]["arguments"]["calendar_refs"] == ["cal-a"]
     assert result["undo"] == {"tool": "calendar_schedule", "arguments": {
         "action": "cancel", "event": replacement, "series": "all", "dry_run": True}}
@@ -312,15 +316,18 @@ def test_a_refused_truncation_is_a_partial_failure_with_both_handles(store, fail
     asyncio.run(Worker(store, providers).run_operation(result["operation"]["id"], reconcile=True))
     again = run(store, providers, key, {**MOVE, "event": refs["20261102"], "request_id": "req-partial"})
     assert writes(server) == sent and again["state"] == "failed" and again["partial"] is True
-    # The undo previews removing the replacement, once a read has published it.
-    server.events[steps[0]["target_id"] + "_20261102T093000Z"] = {
-        **instance("20261102"), "id": steps[0]["target_id"] + "_20261102T093000Z", "recurringEventId": steps[0]["target_id"],
-        "start": {"dateTime": "2026-11-02T10:30:00+01:00"}, "end": {"dateTime": "2026-11-02T11:30:00+01:00"},
-        "originalStartTime": {"dateTime": "2026-11-02T10:30:00+01:00", "timeZone": BERLIN}}
-    publish(store, server)
+    # Polling the operation gives the same definite failure and recovery, not a reconcile.
+    polled = FamilyService(store).operation(key, result["operation"]["id"])
+    assert polled["partial"] is True and polled["undo"] == result["undo"]
+    assert polled["handles"] == handles and "reconcile" not in polled["next_action"]
+    # The undo resolves the replacement from the durable record, before any read published it.
     undo = rulebook.validate_result(start(store, key, result["undo"]["arguments"])[0])
     assert undo["state"] == "previewed" and undo["preview"]["series"] == "all"
     assert undo["preview"]["action"] == "cancel" and writes(server) == sent
+    done = run(store, providers, key, {"confirm_token": undo["confirm_token"]})
+    assert done["state"] == "succeeded" and done["series_ref"] == replacement
+    assert writes(server) == [*sent, ("DELETE", steps[0]["target_id"])]
+    assert steps[0]["target_id"] not in server.events and "lesson" in server.events
 
 
 # spec: ANYM-556
@@ -421,3 +428,76 @@ async def test_all_day_following_cancel_ends_the_series_the_day_before():
                  occurrence=dict(step["occurrence"], original_start="2026-10-19"))
     await apply_step(first, GOOGLE_CAL, whole)
     assert "lesson" not in server.events
+
+
+# spec: ANYM-556
+def test_a_following_move_from_the_first_occurrence_is_refused_with_next_series_all(store):
+    """Ending the original from its first occurrence would delete it, which a move never authorized."""
+    key = setup(store)
+    providers, server = world(series_events())
+    refs = publish(store, server)
+    result = run(store, providers, key, {**MOVE, "start": "2026-10-19T10:30:00+02:00", "event": refs["20261019"],
+                                         "request_id": "req-first"})
+    assert (result["state"], result["error"], writes(server)) == ("failed", "series_starts_here", [])
+    assert result["next"]["arguments"]["series"] == "all"
+
+
+# spec: ANYM-556
+def test_a_series_cancel_is_refused_when_an_exception_has_guests_of_its_own(store):
+    key = setup(store)
+    guests = instance("20261109", attendees=[{"email": "guest@example.invalid"}])
+    providers, server = world(series_events(guests))
+    refs = publish(store, server)
+    for scope, ref in (("all", refs["20261026"]), ("following", refs["20261102"])):
+        result = run(store, providers, key, {"action": "cancel", "series": scope, "event": ref,
+                                             "request_id": "req-guests-" + scope})
+        assert (result["state"], result["error"]) == ("failed", "capability_unverified")
+    assert writes(server) == []
+
+
+# spec: ANYM-556
+@pytest.mark.asyncio
+async def test_a_monthly_series_never_moves_to_another_date():
+    """Monthly from 31 Jan takes its day from DTSTART and skips short months: a date shift changes which dates
+    exist, so it is refused; a time shift on the same date is not."""
+    monthly = master(recurrence=["RRULE:FREQ=MONTHLY;COUNT=5"], start={"dateTime": "2027-01-31T09:00:00+01:00",
+                     "timeZone": BERLIN}, end={"dateTime": "2027-01-31T10:00:00+01:00", "timeZone": BERLIN})
+    march = {**instance("20261102"), "id": "lesson_20270331T070000Z", "etag": '"m31"',
+             "originalStartTime": {"dateTime": "2027-03-31T09:00:00+02:00", "timeZone": BERLIN}}
+    providers, server = world([monthly, march])
+    providers.adapters["conn-g"] = providers.adapters["google-a"]
+    step = {"action": "update", "ordinal": 0, "target_id": march["id"], "expected_etag": '"m31"',
+            "occurrence": {"series_ref": series_ref("cal-g", "lesson"), "original_start": "2027-03-31T07:00:00+00:00"},
+            "event": {"start": "2027-04-01T09:00:00+02:00", "end": "2027-04-01T10:00:00+02:00", "timezone": BERLIN},
+            "series": {"scope": "all", "planned_at": PLANNED}}
+    with pytest.raises(CalendarError, match="unsupported_recurrence"):
+        await providers.prepare(GOOGLE_CAL, step)
+    later = dict(step, event={"start": "2027-03-31T11:00:00+02:00", "end": "2027-03-31T12:00:00+02:00",
+                              "timezone": BERLIN})
+    await apply_step(providers, GOOGLE_CAL, later)
+    assert server.events["lesson"]["start"] == {"dateTime": "2027-01-31T11:00:00+01:00", "timeZone": BERLIN}
+
+
+# spec: ANYM-556
+def test_event_selection_candidates_keep_the_series_scope(store):
+    key = setup(store)
+    providers, server = world(series_events())
+    publish(store, server)
+    query = {"action": "cancel", "series": "following", "event": {"title": "Lesson", "date": "2026-11-02"},
+             "dry_run": True}
+    chosen = start(store, key, query)[0]
+    assert chosen["error"] == "selection_required"
+    [candidate] = chosen["candidates"]
+    assert candidate["next"]["arguments"]["series"] == "following"
+    preview = start(store, key, candidate["next"]["arguments"])[0]
+    assert preview["preview"]["series"] == "following"
+
+
+# spec: ANYM-556
+def test_the_replacement_keeps_a_tentative_status(store):
+    key = setup(store)
+    providers, server = world(series_events(status="tentative"))
+    refs = publish(store, server)
+    result = run(store, providers, key, {**MOVE, "event": refs["20261102"], "request_id": "req-tentative"})
+    assert result["state"] == "succeeded"
+    assert server.events[plan_steps(store, result)[0]["target_id"]]["status"] == "tentative"

@@ -689,8 +689,9 @@ class FamilyService:
             # calendar_schedule only (ANYM-555): calendar_plan never takes guests.
             allowed.add("invite")
         if series:
-            # calendar_schedule only (ANYM-556): a series scope of a move or cancel.
-            allowed.add("series")
+            # calendar_schedule only (ANYM-556): a series scope of a move or cancel, and the undo of a partial
+            # following move (`replacement`: the series_ref of the replacement series it created).
+            allowed.update(("series", "replacement"))
         for action in actions:
             if not isinstance(action, dict) or set(action) - allowed:
                 raise CalendarError("invalid_action")
@@ -772,6 +773,13 @@ class FamilyService:
                     raise CalendarError("invalid_event")
                 step["resource_ref"] = ref("res")
                 step["target_id"] = uuid_token()
+            elif "replacement" in action:
+                if kind != "delete":
+                    raise CalendarError("invalid_action")
+                step = self._undo_step(p, cal, action["replacement"], step)
+                if (cal["ref"], step["target_id"]) in targets:
+                    raise CalendarError("duplicate_resource_action")
+                targets.add((cal["ref"], step["target_id"]))
             else:
                 row = self.store.one(
                     "SELECT o.*,r.etag,r.target FROM occurrences o JOIN resources r ON r.ref=o.resource_ref "
@@ -1298,6 +1306,34 @@ class FamilyService:
         "WHERE r.group_id=%s AND l.state<>'removed' AND "
     )
 
+    def replacement_of(self, p, handle):
+        """The verified replacement series one of p's own following moves created, by its series_ref: the plan step
+        that created it and the create's receipt. Durable, so an undo never waits for a read to publish it."""
+        from .providers import series_ref
+
+        rows = self.store.query(
+            "SELECT p.payload,s.receipt FROM operations o JOIN plans p ON p.id=o.plan_id "
+            "JOIN operation_steps s ON s.operation_id=o.id AND s.ordinal=0 "
+            "WHERE o.principal_id=%s AND s.state='verified' "
+            "AND p.payload->'steps'->0->'series'->>'role'='replacement' ORDER BY o.created_at",
+            (p["id"],),
+        )
+        for row in rows:
+            made = row["payload"]["steps"][0]
+            if series_ref(made["calendar_ref"], made["target_id"]) == handle and (row["receipt"] or {}).get("etag"):
+                return dict(made, receipt=row["receipt"])
+        raise CalendarError("not_found_or_forbidden")
+
+    def _undo_step(self, p, cal, handle, step):
+        """Delete the replacement series of a partial following move, only as its create left it (its etag)."""
+        made = self.replacement_of(p, handle)
+        if made["calendar_ref"] != cal["ref"] or cal["provider"] != "google":
+            raise CalendarError("not_found_or_forbidden")
+        return dict(step, target_id=made["target_id"], resource_ref=made["resource_ref"],
+                    expected_etag=made["receipt"]["etag"], before=dict(made["span"]),
+                    series={"scope": "all", "role": "undo", "series_ref": handle,
+                            "planned_at": datetime.now(timezone.utc).isoformat()})
+
     def _series_steps(self, key, cal, step, scope, ordinal):
         """The steps of a series edit (ANYM-556): `all` is one write to the master; `following` ends the master just
         before the occurrence, and a following move first creates the replacement series under a stable,
@@ -1528,7 +1564,7 @@ class FamilyService:
             "SELECT ordinal,state,receipt,error FROM operation_steps WHERE operation_id=%s ORDER BY ordinal",
             (operation_id,),
         )
-        return {
+        result = {
             "operation_id": operation_id,
             "state": op["state"],
             "steps": steps,
@@ -1537,6 +1573,16 @@ class FamilyService:
             if op["state"] in ("unknown", "needs_attention", "partial")
             else None,
         }
+        first = plan["payload"]["steps"][0]
+        if op["state"] == "partial" and (first.get("series") or {}).get("role") == "replacement":
+            # A following move whose truncation was definitely refused (ANYM-556): the same definite failure, both
+            # series and the undo preview calendar_schedule gives, never a reconcile.
+            from .schedule import Scheduler
+
+            scheduler = Scheduler(self)
+            steps_ = plan["payload"]["steps"]
+            result.update(scheduler.partial(scheduler.primary(steps_), steps_, scheduler.family(key, p)))
+        return result
 
     def assignments(self, key, start, end):
         p = self.principal(key)
