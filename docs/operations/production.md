@@ -501,8 +501,14 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
    pinned backup and restore runtimes updated once to it, one backup gate, one `migrate` (one
    transaction applies every pending migration in order), each migration's owner and role SQL
    steps in their order around it, then the release. A migration gets a release of its own only
-   when its procedure below says so. A `migrate` retried after `LockNotAvailable` stays under
-   the same gate; item 3's age limits hold at each attempt.
+   when its own procedure or a compatibility rule, wherever documented, says so: a contract
+   (drop, rename, narrow) still waits for a later release (`.claude/rules/migrations.md`). When
+   several procedures below are pending, follow them as one: the backup and restore runtimes of
+   the prepared release (it reads the final schema) are installed before the gate; each
+   procedure's steps before `migrate` run before the one `migrate`, its steps after `migrate`
+   after it, in migration order; a procedure's "schema-N release" is the prepared release. A
+   `migrate` retried after `LockNotAvailable` stays under the same gate and hold; item 3's age
+   limits hold at each attempt.
 2. After the release, no backup is required unless the release deletes data: before such a step
    (045 step 7, `purge-deleted --apply`) a fresh verified backup at the new schema. Otherwise the
    next scheduled daily backup follows as usual.
@@ -517,11 +523,16 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
      backup image revision, ciphertext size and SHA-256, receipt and the proof's run ID;
    - it is held. A hold on a reused daily backup starts after its scheduled verification: stop
      the producer's `personal-os-backup.timer` with no backup service running, then the
-     receiver's verifier timer with no verifier run in flight. A read-only check then confirms
-     both timers stay stopped, `last-success.json` still names that backup and run, and the
-     backup is in the protected file. That `held` line is at most 30 minutes old when `migrate`
-     starts and is read again before each retry, as for a fresh backup proven by the release
-     kit. Right after `migrate`, release the receiver's timer, then the producer's.
+     receiver's verifier timer with no verifier run in flight. Until the hold ends, no capture,
+     delivery, verifier run, `protect` or `rotate` runs by hand either. A read-only check then
+     confirms: both timers stopped and both services inactive; no `active.json` (no pending
+     attempt); `status.json` still equals `last-success.json`, which names that backup and its
+     proof run (every later verifier run, idle or failed, rewrites `status.json`); the verifier
+     service last started before that proof's `verified_at` (`systemctl show -P
+     ExecMainStartTimestamp`); the protected file names that backup. That `held` line is at most
+     30 minutes old when `migrate` starts and is read again before each retry, as for a fresh
+     backup proven by the release kit. The hold lasts across retries; once `migrate` succeeds (or
+     the release is abandoned), release the receiver's timer, then the producer's.
 
    Accepted risk (owner 10-28, quoted above): a reused backup may be 12 hours old. If `migrate`
    destroys or corrupts data, a restore returns the database to that snapshot, and everything
@@ -672,8 +683,8 @@ API, the matcher and the dispatcher (package version, schema), each role limited
 row-level security. Additive; older runtimes write nothing there. With it the matcher and the
 delivery dispatcher run in production. Nothing here runs during an active call (check read-only
 first).
-1. The backup gate (fresh or a qualifying daily backup, above), then `migrate`; the pinned backup
-   and restore runtimes move to the schema-50 release.
+1. Update the pinned backup and restore runtimes to the prepared release, then the backup gate
+   (fresh or a qualifying daily backup, above), then `migrate`.
 2. Role SQL (reviewed with the release): `gateway_role.sql`, `subscription_role.sql` and
    `delivery_role.sql`. Logins as in step 4 of 045: `messaging_subscriptions_runtime` (`LOGIN IN
    ROLE messaging_subscriptions`) and `messaging_event_delivery_runtime` (`LOGIN IN ROLE
