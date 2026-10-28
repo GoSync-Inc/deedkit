@@ -853,6 +853,40 @@ def test_the_root_build_context_leaves_out_env_files_at_every_depth_but_keeps_th
     assert rules.index("!**/.env.example") > rules.index("**/.env.*")
 
 
+# spec: ANYM-546
+def test_the_root_build_context_keeps_every_platform_contracts_module_the_runtime_image_copies():
+    import re
+    root = Path(__file__).resolve().parents[1]
+    lines = [line.strip() for line in (root / ".dockerignore").read_text().splitlines()]
+    rules = [line for line in lines if line and not line.startswith("#")]
+    wildcards = {"**/": "(?:.*/)?", "**": ".*", "*": "[^/]*", "?": "[^/]"}
+    # Docker's syntax: leading and trailing slashes dropped, Go character classes ([a], [!a] or [^a]).
+    def token(part):
+        if part.startswith("[") and part.endswith("]") and len(part) > 2:
+            return "[" + ("^" + part[2:-1] if part[1] in "!^" else part[1:-1]) + "]"
+        return wildcards.get(part, re.escape(part))
+    def regex(rule):
+        return re.compile("".join(token(part) for part in re.split(r"(\*\*/|\*\*|\*|\?|\[[^]]+\])", rule.strip("/"))))
+    # Docker's rule: the last pattern that matches the path or one of its parent directories decides.
+    def ignored(path, rules=rules):
+        parts, result = path.split("/"), False
+        for rule in rules:
+            pattern = regex(rule.removeprefix("!"))
+            if any(pattern.fullmatch("/".join(parts[:n])) for n in range(1, len(parts) + 1)):
+                result = not rule.startswith("!")
+        return result
+    package = root / "packages/platform-contracts/src/platform_contracts"
+    modules = sorted(path.relative_to(root).as_posix() for path in package.glob("*.py"))
+    agent = "packages/platform-contracts/src/platform_contracts/agent.py"
+    assert agent in modules
+    assert [module for module in modules if ignored(module)] == []
+    for exclusion in ("/" + agent, agent.replace("/agent.py", "/[a]gent.py"), agent.replace("/agent.py", "/[!b]gent.py")):
+        assert ignored(agent, rules + [exclusion]), exclusion
+    assert not ignored(agent, rules + [agent.replace("/agent.py", "/[!a]gent.py")])
+    assert ignored("packages/npm/package.json") and ignored("packages/platform-contracts/tests/test_agent.py")
+    assert ignored("deploy/private/x.json") and not ignored("services/messaging/messaging_service/app.py")
+
+
 
 TRIAGE_FIXTURE = json.loads((Path(__file__).parent / "fixtures/tiden-run-triage-041.json").read_text())
 TRIAGE_SENTINELS = ("SENTINEL-OUTPUT-542", "SENTINEL-ERROR-542")
