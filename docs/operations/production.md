@@ -558,7 +558,7 @@ Steps, all through `docker exec -i -e PGAPPNAME=deedkit-copy-<id>-<step> <contai
    and the session prefix before anything starts.
 2. A keeper `psql` session (`idle_in_transaction_session_timeout` and `statement_timeout` = the deadline)
    opens `REPEATABLE READ READ ONLY`, exports its snapshot, reads the database size and an exact
-   `count(*)` of every table outside the system schemas.
+   `count(*)` of every table (ordinary and partitioned) outside the system schemas.
 3. Free space: the copy filesystem and the live database's data filesystem (the Source of the mount that
    holds the container's `PGDATA`) each need 2 × the database size + the reserve, max(10 GiB, 10 % of that
    filesystem). While a dump or the restore runs both are read every 2 s; below the reserve the step is
@@ -576,23 +576,30 @@ Steps, all through `docker exec -i -e PGAPPNAME=deedkit-copy-<id>-<step> <contai
 
 A failure is one fixed code: `dump_failed`, `restore_failed`, `count_mismatch`, `schema_mismatch`,
 `disk_reserve` or `deadline`; no `copy.json` is written. No helper's output is kept or printed: stderr is
-discarded, receipts hold table names, counts, sizes, hashes, times and codes only.
+discarded, the stdout of a short helper (counts, versions) is read up to 16 MiB; receipts hold table
+names, counts, sizes, hashes, times and codes only.
 
 Cleanup, at the end of every call, pass or fail: `pg_terminate_backend` of every live session whose
-application name starts with `deedkit-copy-<id>-`, `docker stop -t 10` of the scratch container and of
-every container a caller claimed, `docker network rm` of its claimed networks, then a read back (no such
-session in `pg_stat_activity`, no container with the label or name, no network) for up to 30 s; only then
-the scratch directory is removed and `released.json` written. `copy.json` says nothing about resources.
+application name starts with `deedkit-copy-<id>-`; `docker stop -t 10` and `docker rm` of every container
+labelled `deedkit-copy=<id>`, in any state (one a crash left created but not started included); `docker
+network rm` of every network with that label; then a read back (no such session in `pg_stat_activity`,
+no container or network with the label) for up to 30 s; only then the scratch directory is removed and
+`released.json` written. `copy.json` says nothing about resources. Only the label makes a resource the
+copy's: a container or network a caller claims in `owner.json` must carry it, and one that merely has a
+claimed name is never touched.
 
 Crashes: every `deploy` (not `--dry-run`) and every `copy-database` starts by releasing each copy with an
-`owner.json` and no `released.json` the same way; the dump files stay. A session or container it cannot
-confirm gone pauses `deploy`: "a database copy could not be stopped: <id>". Inspect it with `docker ps -a
---filter label=deedkit-copy=<id>` and `pg_stat_activity`, stop what remains, then remove the pause.
+`owner.json` and no `released.json` the same way, each on its own; the dump files stay. A labelled
+container of an already released copy (a start a killed run left in flight) is removed too. A session or
+container it cannot confirm gone pauses `deploy`: "a database copy could not be stopped: <id>". Inspect it
+with `docker ps -a --filter label=deedkit-copy=<id>` and `pg_stat_activity`, stop what remains, then
+remove the pause.
 
 Retention (C6, docs/DATA-POLICY.md): every `deploy` run, paused or not (a paused run takes the plan A
 lock only when it is free), and every `copy-database` deletes copies older than 48 hours, whatever their
-state. Of a copy whose resources are not confirmed released only `owner.json` stays, so a later run can
-still stop them. The copies are plaintext on this host's disk and never leave it.
+state, also when another copy is stuck. Of a copy whose resources are not confirmed released only
+`owner.json` stays, so a later run can still stop them. The copies are plaintext on this host's disk and
+never leave it.
 
 Undo: none needed; a copy changes no database. To remove a copy at once: `rm -r
 /var/lib/deedkit-production/migration-copies/<id>` after its `released.json` exists.

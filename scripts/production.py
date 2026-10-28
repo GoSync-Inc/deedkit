@@ -1687,6 +1687,7 @@ COPY_RETENTION = 48 * 3600
 COPY_POLL = 2
 COPY_RESERVE = 10 << 30
 COPY_TIMEOUT = 1800
+COPY_OUTPUT = 16 << 20
 COPY_STOP_READBACK = 30
 COPY_USER = "deedkit_copy"
 COPY_DATA = "/deedkit-copy"
@@ -1700,7 +1701,7 @@ LOCALE = re.compile(r"[A-Za-z0-9_.@-]{1,64}")
 # Every table outside the system schemas, one JSON line each: the same text counts the live snapshot and the restore.
 COUNTS = r"""SELECT format('SELECT json_build_object(''table'', %L, ''rows'', count(*)) FROM %s', t, t)
   FROM (SELECT format('%I.%I', n.nspname, c.relname) AS t FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+        WHERE c.relkind IN ('r', 'p') AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           AND n.nspname !~ '^pg_(toast|temp_|toast_temp_)') AS tables ORDER BY t \gexec"""
 INSPECT_COPY = ('{{json .Image}}\n{{json .Mounts}}\n'
                 '{{range .Config.Env}}{{if eq (index (split . "=") 0) "PGDATA"}}{{json .}}{{end}}{{end}}')
@@ -1735,8 +1736,9 @@ def copy_source(settings, name):
         raise Refused("the production configuration has no migration section; no database is copied")
     source = section["databases"].get(name) if COPY_NAME.fullmatch(name or "") else None
     if (not isinstance(source, dict) or set(source) != {"container", "owner", "database"}
-            or not DOCKER_NAME.fullmatch(str(source["container"]))
-            or not all(SQL_NAME.fullmatch(str(source[key])) for key in ("owner", "database"))):
+            or not all(isinstance(value, str) for value in source.values())
+            or not DOCKER_NAME.fullmatch(source["container"])
+            or not all(SQL_NAME.fullmatch(source[key]) for key in ("owner", "database"))):
         raise Refused("migration.databases must name the database's container, owner and database")
     timeout = section.get("copy_timeout_s", COPY_TIMEOUT)
     if type(timeout) is not int or not 60 <= timeout <= 86400:
@@ -1831,15 +1833,45 @@ def watched(copy, argv, *, timeout, paths, failure, stdin=None, stdout=None):
             process.wait()
 
 
+def bounded(argv, *, timeout, text=""):
+    """(exit status, stdout) of a short helper reading `text`: stderr is discarded, stdout read up to COPY_OUTPUT
+    bytes. More output or the deadline kills it: (None, "")."""
+    process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    assert process.stdin and process.stdout
+    deadline, output = copy_clock() + timeout, b""
+    try:
+        with suppress(OSError):
+            process.stdin.write(text.encode())
+        with suppress(OSError):
+            process.stdin.close()
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while (remaining := deadline - copy_clock()) > 0:
+                if selector.select(min(remaining, 1.0)):
+                    chunk = os.read(process.stdout.fileno(), 65536)
+                    if not chunk:
+                        return process.wait(max(1, deadline - copy_clock())), output.decode(errors="replace")
+                    output += chunk
+                    if len(output) > COPY_OUTPUT:
+                        break
+        return None, ""
+    except subprocess.TimeoutExpired:
+        return None, ""
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        process.stdout.close()
+
+
 def helper_output(copy, argv, *, timeout, failure, text=""):
     """The stdout of a short helper reading `text`; it holds only names, counts and versions, never a row."""
-    try:
-        result = subprocess.run(argv, input=text.encode(), capture_output=True, timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        raise CopyFailed(copy["id"], "deadline") from exc
-    if result.returncode:
+    status, output = bounded(argv, timeout=timeout, text=text)
+    if status is None:
+        raise CopyFailed(copy["id"], "deadline")
+    if status:
         raise CopyFailed(copy["id"], failure)
-    return result.stdout.decode()
+    return output
 
 
 def counts(copy, lines, failure):
@@ -1936,8 +1968,8 @@ def restored(copy, argv, path, **watch):
 
 
 def claim(copy, kind, name):
-    """Name a container or network a caller (ANYM-449's rehearsal) creates, before it creates it; `release_copy`
-    removes it. A container should carry the label `deedkit-copy=<id>`."""
+    """Name a container or network a caller (ANYM-449's rehearsal) creates, before it creates it. It must carry the
+    label `deedkit-copy=<id>`: `release_copy` removes only what carries it."""
     if kind not in ("container", "network") or not DOCKER_NAME.fullmatch(name):
         raise Refused("a copy resource is a named container or network")
     copy["resources"].append({"kind": kind, "name": name})
@@ -2035,34 +2067,42 @@ def snapshot_copy(copy, timeout, keep):
 
 def copy_sql(source, step, prefix, text):
     """A count or termination statement about the copy's own sessions on the live database."""
-    return run(["docker", "exec", "-i", "-e", f"PGAPPNAME={prefix}-{step}", source["container"], "psql", "-X", "-q",
-                "-A", "-t", "-v", "ON_ERROR_STOP=1", "-U", source["owner"], "-d", source["database"], "-c",
-                text.format(f"starts_with(application_name, '{prefix}-') AND pid <> pg_backend_pid()")],
-               timeout=60).strip()
+    status, output = bounded(["docker", "exec", "-i", "-e", f"PGAPPNAME={prefix}-{step}", source["container"], "psql",
+                              "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-U", source["owner"], "-d",
+                              source["database"], "-c",
+                              text.format(f"starts_with(application_name, '{prefix}-') AND pid <> pg_backend_pid()")],
+                             timeout=60)
+    if status != 0:
+        raise Refused("the copy's sessions could not be read")
+    return output.strip()
+
+
+def labelled(copy_id, kind="container"):
+    """The IDs of the copy's containers (any state) or networks. Only what carries `deedkit-copy=<id>` is the copy's,
+    whatever a name says, so a name collision never reaches another container."""
+    listing = ["docker", "ps", "-a", "-q"] if kind == "container" else ["docker", "network", "ls", "-q"]
+    return run([*listing, "--filter", "label=deedkit-copy=" + copy_id], timeout=60).split()
 
 
 def stop_copy_containers(copy):
-    for name in [copy["container"], *(item["name"] for item in copy["resources"] if item["kind"] == "container")]:
-        # An error or a lost answer is decided by the read back, never by this call.
-        with suppress(Exception):
-            run(["docker", "stop", "-t", "10", name], timeout=60)
+    # An error or a lost answer is decided by the read back, never by these calls. `docker rm` after the stop also
+    # removes a container a crash left created but never started.
+    with suppress(Exception):
+        for container in labelled(copy["id"]):
+            with suppress(Exception):
+                run(["docker", "stop", "-t", "10", container], timeout=60)
+            with suppress(Exception):
+                run(["docker", "rm", container], timeout=60)
 
 
 def copy_gone(copy):
     """True when no session, container or network of the copy remains (read back, never assumed)."""
     try:
-        if copy_sql(copy["source"], "check", copy["application_name"],
-                    "SELECT count(*) FROM pg_stat_activity WHERE {}") != "0":
-            return False
-        if run(["docker", "ps", "-a", "-q", "--filter", "label=deedkit-copy=" + copy["id"]], timeout=60).strip():
-            return False
-        for item in [{"kind": "container", "name": copy["container"]}, *copy["resources"]]:
-            listing = ["docker", "ps", "-a", "-q"] if item["kind"] == "container" else ["docker", "network", "ls", "-q"]
-            if run([*listing, "--filter", f"name=^/?{re.escape(item['name'])}$"], timeout=60).strip():
-                return False
+        return (copy_sql(copy["source"], "check", copy["application_name"],
+                         "SELECT count(*) FROM pg_stat_activity WHERE {}") == "0"
+                and not labelled(copy["id"]) and not labelled(copy["id"], "network"))
     except Exception:
         return False
-    return True
 
 
 def release_copy(copy):
@@ -2073,10 +2113,10 @@ def release_copy(copy):
         copy_sql(copy["source"], "cancel", copy["application_name"],
                  "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE {}")
     stop_copy_containers(copy)
-    for item in reversed(copy["resources"]):
-        if item["kind"] == "network":
+    with suppress(Exception):
+        for network in labelled(copy["id"], "network"):
             with suppress(Exception):
-                run(["docker", "network", "rm", item["name"]], timeout=60)
+                run(["docker", "network", "rm", network], timeout=60)
     deadline = copy_clock() + COPY_STOP_READBACK
     while not copy_gone(copy):
         if copy_clock() >= deadline:
@@ -2093,22 +2133,46 @@ def owned_copy(directory):
     source = copy.get("source") or {}
     if (copy.get("id") != directory.name or copy.get("container") != "deedkit-copy-" + directory.name
             or copy.get("application_name") != copy["container"]
-            or not DOCKER_NAME.fullmatch(str(source.get("container")))
-            or not all(SQL_NAME.fullmatch(str(source.get(key))) for key in ("owner", "database"))
-            or not all(item.get("kind") in ("container", "network") and DOCKER_NAME.fullmatch(str(item.get("name")))
-                       for item in copy.get("resources", []))):
+            or not isinstance(source, dict) or set(source) != {"container", "owner", "database"}
+            or not all(isinstance(value, str) for value in source.values())
+            or not DOCKER_NAME.fullmatch(source["container"])
+            or not all(SQL_NAME.fullmatch(source[key]) for key in ("owner", "database"))
+            or not isinstance(copy.get("resources"), list)
+            or not all(isinstance(item, dict) and item.get("kind") in ("container", "network")
+                       and isinstance(item.get("name"), str) and DOCKER_NAME.fullmatch(item["name"])
+                       for item in copy["resources"])):
         raise CopyStuck(directory.name)
     return {**copy, "directory": str(directory)}
 
 
 def reconcile_copies(state):
-    """C4: release every copy a crashed or killed run left without `released.json`; the ids released."""
-    released = []
+    """C4: release every copy a crashed or killed run left without `released.json`, each on its own: (the ids released,
+    the ids that could not be). A container that appeared after its copy was released (a start a crash left in
+    flight) carries the label of a released copy and is removed too."""
+    released, stuck, done = [], [], set()
     for directory in copy_directories(copies_root(state)):
-        if (directory / "owner.json").exists() and not (directory / "released.json").exists():
+        if not (directory / "owner.json").exists() or (directory / "released.json").exists():
+            done.add(directory.name)
+            continue
+        try:
             release_copy(owned_copy(directory))
             released.append(directory.name)
-    return released
+        except Exception:
+            stuck.append(directory.name)
+    with suppress(Exception):
+        late = run(["docker", "ps", "-a", "--filter", "label=deedkit-copy", "--format", '{{.Label "deedkit-copy"}}'],
+                   timeout=60).split()
+        for copy_id in sorted(set(late) & done):
+            stop_copy_containers({"id": copy_id})
+    return released, stuck
+
+
+def settle_copies(state):
+    """Reconcile, then expire whatever happened (C6 never waits for a stuck copy); a stuck copy then refuses."""
+    _, stuck = reconcile_copies(state)
+    expire_copies(state)
+    if stuck:
+        raise CopyStuck(stuck[0])
 
 
 def expire_copies(state, *, at=None):
@@ -2140,8 +2204,7 @@ def database_copy(settings, name, sha, *, keep=False):
     state = Path(settings["state_directory"])
     root = copies_root(state, create=True)
     assert root
-    reconcile_copies(state)
-    expire_copies(state)
+    settle_copies(state)
     copy_id = f"{sha[:12]}-{name}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
     directory = root / copy_id
     directory.mkdir(mode=0o700)
@@ -2165,8 +2228,7 @@ def tend_copies(settings, *, locked):
                 held.enter_context(lock(state))
             except Busy:
                 return
-        reconcile_copies(state)
-        expire_copies(state)
+        settle_copies(state)
 
 
 # Continuous deployment (production.md "Continuous deployment"): one command that deploys the newest green main

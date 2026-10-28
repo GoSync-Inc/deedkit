@@ -76,6 +76,9 @@ def source(tmp_path, monkeypatch):
     psql(database, "CREATE TYPE mood AS ENUM ('calm', 'busy'); "
                    "CREATE TABLE items (id serial PRIMARY KEY, value text NOT NULL, mood mood DEFAULT 'calm'); "
                    "CREATE TABLE empty_one (id bigint); CREATE VIEW calm AS SELECT id FROM items WHERE mood = 'calm'; "
+                   "CREATE TABLE events (id int, at date) PARTITION BY RANGE (at); CREATE TABLE events_2026 PARTITION "
+                   "OF events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01'); "
+                   "INSERT INTO events SELECT n, '2026-10-28' FROM generate_series(1, 3) n; "
                    f"INSERT INTO items (value) SELECT 'row ' || n FROM generate_series(1, 19) n; "
                    f"INSERT INTO items (value) VALUES ('{PRIVATE}');")
     monkeypatch.setattr(p, "filesystem", lambda path: PLENTY)
@@ -118,7 +121,8 @@ def test_copy_holds_the_snapshot_counts_while_a_writer_inserts_and_restores_them
     wrap_watched(monkeypatch, before=writer)
     with p.database_copy(settings, "main", SHA) as record:
         copy_id = record["id"]
-        assert record["verified"] and record["counts"] == {"public.empty_one": 0, "public.items": 20}
+        assert record["verified"] and record["counts"] == {"public.empty_one": 0, "public.events": 3,
+                                                           "public.events_2026": 3, "public.items": 20}
     assert seen == [1] and psql(database, "SELECT count(*) FROM items") == "70"
     directory = released(settings, copy_id)
     assert copy_id.startswith(SHA[:12] + "-main-") and p.COPY_ID.fullmatch(copy_id)
@@ -300,7 +304,7 @@ def test_a_copy_killed_at_any_point_is_stopped_and_released_by_the_next_run(sour
         child.send_signal(signal.SIGKILL)
         child.wait(30)
         assert (directory / "owner.json").exists() and not (directory / "released.json").exists()
-        assert p.reconcile_copies(Path(settings["state_directory"])) == [copy_id]
+        assert p.reconcile_copies(Path(settings["state_directory"])) == ([copy_id], [])
         released(settings, copy_id)
         if point in ("scratch", "kept"):
             assert (directory / f"{database}.dump").exists()
@@ -320,19 +324,26 @@ def test_copy_database_refuses_without_the_migration_section(tmp_path):
 
 
 class FakeDocker:
-    """Answers the cleanup's `docker` commands: `stop` loses its answer, the read back tells."""
+    """Answers the cleanup's `docker` commands: `stop` and `rm` lose their answers, the read back tells. The session
+    count through `bounded` is 0."""
 
-    def __init__(self, *, stops=True):
-        self.stops, self.calls, self.running = stops, [], True
+    def __init__(self, monkeypatch, *, stops=True, containers=1):
+        self.stops, self.calls, self.running = stops, [], containers
+        monkeypatch.setattr(p, "run", self)
+        monkeypatch.setattr(p, "bounded", self.bounded)
+
+    def bounded(self, argv, **kwargs):
+        self.calls.append(argv)
+        return 0, "0\n"
 
     def __call__(self, argv, **kwargs):
         self.calls.append(argv)
-        if argv[:2] == ["docker", "stop"]:
-            self.running = self.running and not self.stops
+        if argv[:2] in (["docker", "stop"], ["docker", "rm"]):
+            self.running = 0 if self.stops else self.running
             raise p.Refused("docker failed (exit 1); production was not accepted")
-        if argv[:2] == ["docker", "ps"]:
-            return "0123456789ab\n" if self.running else ""
-        return "0"
+        if argv[:3] == ["docker", "ps", "-a"] and "-q" in argv:
+            return "".join(f"{index:012x}\n" for index in range(self.running))
+        return ""
 
 
 def unreleased(state, copy_id):
@@ -354,10 +365,9 @@ def stamp(hours):
 
 # spec: ANYM-588
 def test_a_lost_docker_stop_answer_is_read_back_before_the_run_goes_on(tmp_path, monkeypatch):
-    docker = FakeDocker()
-    monkeypatch.setattr(p, "run", docker)
+    docker = FakeDocker(monkeypatch)
     directory = unreleased(tmp_path, stamp(1))
-    assert p.reconcile_copies(tmp_path) == [directory.name]
+    assert p.reconcile_copies(tmp_path) == ([directory.name], [])
     stop = next(index for index, argv in enumerate(docker.calls) if argv[:2] == ["docker", "stop"])
     assert any(argv[:2] == ["docker", "ps"] for argv in docker.calls[stop:])
     assert (directory / "released.json").exists() and (directory / "probe.dump").exists()
@@ -365,17 +375,106 @@ def test_a_lost_docker_stop_answer_is_read_back_before_the_run_goes_on(tmp_path,
 
 # spec: ANYM-588
 def test_a_container_still_there_after_stop_pauses_with_the_copy_id(tmp_path, monkeypatch):
-    monkeypatch.setattr(p, "run", FakeDocker(stops=False))
+    FakeDocker(monkeypatch, stops=False)
     monkeypatch.setattr(p, "COPY_STOP_READBACK", 0)
     directory = unreleased(tmp_path, stamp(1))
     with pytest.raises(p.CopyStuck, match="a database copy could not be stopped: " + directory.name):
-        p.reconcile_copies(tmp_path)
+        p.settle_copies(tmp_path)
     assert not (directory / "released.json").exists()
 
 
 # spec: ANYM-588
+def test_a_stuck_copy_never_holds_back_the_expiry_of_the_others(tmp_path, monkeypatch):
+    FakeDocker(monkeypatch, stops=False)
+    monkeypatch.setattr(p, "COPY_STOP_READBACK", 0)
+    stuck, old = unreleased(tmp_path, stamp(50)), unreleased(tmp_path, stamp(49))
+    p.write_record(old / "released.json", {"id": old.name})
+    with pytest.raises(p.CopyStuck, match=stuck.name):
+        p.settle_copies(tmp_path)
+    assert not old.exists() and [path.name for path in stuck.iterdir()] == ["owner.json"]
+
+
+# spec: ANYM-588
+def test_cleanup_never_touches_a_container_or_network_that_only_shares_a_claimed_name(tmp_path, monkeypatch):
+    docker = FakeDocker(monkeypatch, containers=0)
+    directory = unreleased(tmp_path, stamp(1))
+    copy = p.owned_copy(directory)
+    p.claim(copy, "container", "anymsg-db-1")
+    p.claim(copy, "network", "anymsg_backend")
+    assert p.reconcile_copies(tmp_path) == ([directory.name], [])
+    assert not [argv for argv in docker.calls if "anymsg-db-1" in argv or "anymsg_backend" in argv]
+    assert [argv for argv in docker.calls if argv[:2] == ["docker", "stop"]] == []
+
+
+# spec: ANYM-588
+def test_a_bad_database_entry_is_refused_before_any_copy_record(tmp_path):
+    settings = settings_for(tmp_path, "probe")
+    for entry in ({"container": 123, "owner": "probe", "database": "probe"},
+                  {"container": "db", "owner": "Probe; x", "database": "probe"},
+                  {"container": "db", "owner": "probe", "database": "probe", "extra": "x"}):
+        settings["migration"]["databases"]["main"] = entry
+        with pytest.raises(p.Refused, match="must name the database's container, owner and database"):
+            with p.database_copy(settings, "main", SHA):
+                pass
+    assert not (tmp_path / "state" / p.COPIES).exists()
+
+
+def image_of(container):
+    return subprocess.run(["docker", "inspect", "--type", "container", "--format", "{{.Image}}", container],
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
+# spec: ANYM-588
+def test_a_container_left_created_or_started_after_its_release_is_removed(source, tmp_path):
+    settings, database = source
+    state = Path(settings["state_directory"])
+    created, late = unreleased(state, stamp(2)), unreleased(state, stamp(1))
+    for directory in (created, late):
+        record = p.read(directory / "owner.json")
+        p.write_record(directory / "owner.json", {**record, "source": {"container": CONTAINER, "owner": OWNER,
+                                                                         "database": database}})
+    p.write_record(late / "released.json", {"id": late.name})
+    for directory in (created, late):
+        # A crash between create and start, and a start a killed run left in flight after its release.
+        subprocess.run(["docker", "create", "--name", "deedkit-copy-" + directory.name, "--label",
+                        "deedkit-copy=" + directory.name, "--network", "none", "--log-driver", "none",
+                        image_of(CONTAINER)], capture_output=True, check=True)
+    assert labelled(created.name) and labelled(late.name)
+    assert p.reconcile_copies(state) == ([created.name], [])
+    assert not labelled(created.name) and not labelled(late.name)
+
+
+# spec: ANYM-588
+def test_free_space_read_while_the_restore_runs_cancels_it_below_the_reserve(source, monkeypatch):
+    settings, _ = source
+    reads = []
+    def space(path):
+        if reads:
+            reads.append(path)
+            return (1 << 30, 100 << 30) if len(reads) > 3 else PLENTY
+        return PLENTY
+    monkeypatch.setattr(p, "filesystem", space)
+    def slow(copy, argv):
+        # A restore that is still running at the next 2 s read.
+        if "pg_restore" in argv:
+            reads.append("start")
+            return [*argv[:6], "psql", "-X", "-q", "-h", "127.0.0.1", "-U", p.COPY_USER, "-d", "postgres", "-c",
+                    "SELECT pg_sleep(60)"]
+    wrap_watched(monkeypatch, before=slow)
+    started = time.monotonic()
+    with pytest.raises(p.CopyFailed, match="disk_reserve"):
+        with p.database_copy(settings, "main", SHA):
+            pass
+    # The first read (both filesystems) passed; the next one, 2 s later, cancelled the running restore.
+    assert len(reads) == 4 and 2 <= time.monotonic() - started < 30
+    [directory] = copies(settings)
+    assert not (directory / "copy.json").exists()
+    released(settings, directory.name)
+
+
+# spec: ANYM-588
 def test_copies_expire_after_48_hours_on_a_paused_run(tmp_path, monkeypatch):
-    monkeypatch.setattr(p, "run", FakeDocker())
+    FakeDocker(monkeypatch)
     settings = {"state_directory": str(tmp_path / "state")}
     old, kept, _ = (unreleased(tmp_path / "state", stamp(hours)) for hours in (49, 47, 50))
     for directory in (old, kept):
@@ -403,7 +502,7 @@ def test_a_planted_symlink_is_never_followed_or_removed_through(tmp_path):
     (tmp_path / "state").mkdir(mode=0o700)
     root = p.copies_root(tmp_path / "state", create=True)
     (root / stamp(60)).symlink_to(target)
-    assert p.expire_copies(tmp_path / "state") == [] and p.reconcile_copies(tmp_path / "state") == []
+    assert p.expire_copies(tmp_path / "state") == [] and p.reconcile_copies(tmp_path / "state") == ([], [])
     assert (target / "keep").exists()
     with pytest.raises(FileExistsError):
         p.new_file(root / stamp(60))
