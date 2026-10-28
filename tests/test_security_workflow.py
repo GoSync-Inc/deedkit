@@ -53,7 +53,10 @@ def _run_uv_locks(tmp_path, listed, git_status=0, stale=()):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(parents=True)
     (bin_dir / "git").write_text(f"#!/bin/sh\nprintf '%s' '{listed}'\nexit {git_status}\n")
-    (bin_dir / "uv").write_text('#!/bin/sh\necho "$4" >> "$CHECKED"\ncase " $STALE " in *" $4 "*) exit 1;; esac\n')
+    # The stub accepts exactly `uv lock --check --project <dir>`: any other invocation (e.g. without --check,
+    # which would rewrite a stale lock instead of failing) exits 99 and fails the assertions below.
+    (bin_dir / "uv").write_text('#!/bin/sh\n[ "$#" = 4 ] && [ "$1 $2 $3" = "lock --check --project" ] || exit 99\n'
+                                'echo "$4" >> "$CHECKED"\ncase " $STALE " in *" $4 "*) exit 1;; esac\n')
     for stub in bin_dir.iterdir():
         stub.chmod(0o755)
     checked = tmp_path / "checked"
