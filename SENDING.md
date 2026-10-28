@@ -139,6 +139,54 @@ Cold messages from a personal account to strangers can get it restricted or bann
 by WhatsApp, so keep them few and expected. New Telegram conversations by phone
 number or username are not implemented.
 
+### One call for text and files: `messages_send` (schema 51)
+
+`messages_send(to, text, files, reply_to, format, account, dry_run, confirm_token,
+request_id, resume, wait_s)` (REST `POST /v1/messages_send`, gateway
+`messages_send`) sends text and up to 10 files to one target and runs the steps
+above itself. It needs `send` (and `read` for its preview); files need what
+`send_file` needs (`upload` for an `upload_id`, `download` for an
+`attachment_id`, and through the gateway the `send_file` action grant).
+
+1. `to` is anything `platform_resolve_target` resolves exactly: a person, a
+   `chat_` or `msg_` ID, a phone, `@username` or JID. `reply_to` (a `msg_` ID)
+   alone sends into its chat. Files go in order; a plain caption up to 1024
+   characters rides on the first file, other text goes after the files.
+2. `dry_run: true` returns `state: previewed` with the preview (recipient,
+   visible text, warnings, links, reply target, files, caption handling) and a
+   `confirm_token` valid for 10 minutes. The server keeps a `send_previews` row
+   with only the token's hash. Show the owner the preview and obtain their exact
+   confirmation. **The token binds that preview; it is not the owner's
+   confirmation**, and the server never checks approval.
+3. Call again with `confirm_token` (and optionally a `request_id`). The server
+   resolves the target again and compares recipient, reply target, text, files
+   (by hash) and scope: any change returns `preview_stale` with `changed`, a
+   fresh preview and a new `confirm_token`; an old token gets `preview_expired`.
+   A plain-text send may skip the preview with a `request_id` only; rich
+   `format` and a phone with no chat always need it (`preview_required`).
+4. The call binds one `send_intents` record before any step runs, then each
+   step goes through the unchanged route above (outbox, `send_file` operation,
+   phone send) under its own child key (`agent-child:…`, which the caller
+   routes refuse). States: `running` (repeat with `next`), `succeeded`,
+   `failed` with `resumable: true` (repeat with `resume: true`: only failed and
+   unsent steps go, under new child keys; `account_offline` when the account was
+   not connected) and `unknown` (a step may have been delivered: check the chat
+   history, never resend). `wait_s` (0–25) waits for the receipts in the call.
+
+Repeating a call with the same `request_id` or `confirm_token` (with no other
+fields, or with the same payload) reads the record and continues; a different
+payload with that key gets `idempotency_conflict`. Text leaves both tables once
+no unsent step needs it; unbound previews are deleted 7 days after they expire.
+A phone with no chat is opened only when the gateway sets `allow_open_chat` from
+the caller's `open_chat_by_phone` grant; an agent's own value is replaced, and
+`false` refuses such a phone with `forbidden`. Likewise `allow_files` comes from the
+`send_file` grant on every call, also one with only `confirm_token`, `request_id` or
+`resume`: `false` refuses any unsent file step with `forbidden`. A confirm_token belongs
+to the key that previewed it; a `preview_stale` replacement shares its lineage, and one
+lineage sends once. Before each step the server re-checks that the chat and reply target
+still map to the previewed ones; otherwise the step fails with `identity_changed` and
+nothing goes to the new chat.
+
 ## Sender identity and provenance (0.9.12)
 
 Telegram private short-send receipts may omit the sender. The collector uses its

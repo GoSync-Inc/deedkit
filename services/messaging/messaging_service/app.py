@@ -460,6 +460,10 @@ def create_app(store: Store, allowed_hosts: list[str]):
             from . import phone_send
             phone=phone_send.recipient(arguments.get('chat_id',''),arguments.pop('phone',''))
             if phone is not None:arguments.pop('chat_id',None);arguments['phone']=phone
+        if method == 'messages_send':
+            # ANYM-546: messages_send previews, admits and advances in short transactions, waiting between them.
+            from .send_intent import send
+            return await send(store,token,arguments)
         if method == 'preview_messenger_operation':
             # ANYM-549: accepted for parity with execute, ignored for idempotency.
             arguments.pop('request_id',None)
@@ -570,6 +574,41 @@ def create_app(store: Store, allowed_hosts: list[str]):
         return await async_call(ctx,'send_message',account=account,chat_id=chat_id,phone=phone,text=text,
             request_id=request_id,reply_to=reply_to,format=format,preview_digest=preview_digest,
             link_preview=link_preview,allow_lossy=allow_lossy,wait_s=wait_s)
+
+    @mcp.tool(structured_output=True, annotations=ToolAnnotations(readOnlyHint=False,
+        destructiveHint=True,idempotentHint=True,openWorldHint=True))
+    async def messages_send(ctx: Context,to: StrictStr | None=None,account: StrictStr | None=None,
+                   reply_to: StrictStr | None=None,text: StrictStr | None=None,
+                   files: list[dict[str,StrictStr]] | None=None,format: MessageFormat | None=None,
+                   dry_run: StrictBool | None=None,confirm_token: StrictStr | None=None,
+                   request_id: StrictStr | None=None,resume: StrictBool | None=None,
+                   wait_s: WaitSeconds | None=None,allow_open_chat: StrictBool | None=None,
+                   allow_files: StrictBool | None=None) -> dict[str,Any]:
+        """Send text and files to anyone in one call: preview, confirm, send, wait, resume.
+
+        Confirm with the owner before any send: call with dry_run true, show the owner the
+        preview (recipient, visible text, warnings, links, reply target, files, caption
+        handling) and get their exact confirmation; then call again with its confirm_token.
+        The token binds that preview; it is not the owner's confirmation, and the server
+        does not verify approval. A live send needs confirm_token or request_id (8-128
+        characters, one key per approved action; repeat it after a network failure with the
+        SAME payload). Rich format always needs a preview (preview_required).
+        to: anything platform_resolve_target resolves exactly (person, chat_ or msg_ ID,
+        phone, @username, JID); reply_to (a msg_ ID) alone sends into its chat. files: up to
+        10 of {upload_id} (messages_prepare_file_upload) or {attachment_id} (forward an
+        archived file), each with optional mode; they go in order. A plain caption up to
+        1024 characters rides on the first file, other text is sent after the files.
+        States: previewed, running (repeat with next), succeeded, failed with resumable
+        true (repeat with resume true: only failed and unsent steps go; account_offline
+        when the account was not connected), unknown (a step may have been delivered:
+        check history, never resend). preview_stale returns changed, a fresh preview and
+        a new confirm_token. wait_s (0-25) waits for the receipts here. allow_open_chat is
+        set by the gateway from its open_chat_by_phone grant; false refuses a phone with no chat.
+        allow_files is set by the gateway from its send_file grant; false refuses any file step.
+        """
+        return await async_call(ctx,'messages_send',to=to,account=account,reply_to=reply_to,text=text,files=files,
+            format=format,dry_run=dry_run,confirm_token=confirm_token,request_id=request_id,resume=resume,
+            wait_s=wait_s,allow_open_chat=allow_open_chat,allow_files=allow_files)
 
     @mcp.tool(structured_output=True,annotations=read)
     def get_send_status(ctx: Context,send_id: StrictStr) -> dict[str,Any]:
@@ -1251,7 +1290,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
         operations={'capabilities','list_chats','search','get_messages','get_context',
                     'get_attachment','request_file_download','get_updates','ack_updates','dismiss_reply','record_review','get_reviews',
                     'snooze_reply','restore_reply','mute_reply_source','unmute_reply_source','list_reply_dismissals',
-                    'search_people','search_files','get_file_text','get_sync_status','get_file_occurrences','get_file_segments','resolve_reference','resolve_target','preview_message','send_message','get_send_status',
+                    'search_people','search_files','get_file_text','get_sync_status','get_file_occurrences','get_file_segments','resolve_reference','resolve_target','preview_message','send_message','messages_send','get_send_status',
                     'list_messenger_operations','preview_messenger_operation','execute_messenger_operation','get_messenger_operation',
                     'prepare_file_upload','upload_file_chunk','get_file_upload',
                     'create_subscription','list_subscriptions','get_subscription','update_subscription','get_subscription_events',

@@ -26,6 +26,8 @@ WAIT_ADMISSION = {
     # ANYM-532: a phone recipient also waits, for its open_chat_by_phone lookup.
     ("messaging", "send_message"): ("waits", lambda a: (a.get("wait_s") or 0) > 0 or bool(a.get("phone"))),
     ("messaging", "preview_message"): ("waits", lambda a: bool(a.get("phone"))),
+    # ANYM-546: a dry_run may wait for a phone lookup, a send for its receipts.
+    ("messaging", "messages_send"): ("waits", lambda a: (a.get("wait_s") or 0) > 0 or bool(a.get("dry_run"))),
     ("messaging", "wait_for_subscription_events"): ("waits", lambda a: True),
     # ANYM-478: a live search waits up to 20 s in its own pool.
     ("messaging", "search"): ("searches", lambda a: a.get("live", "off") != "off"),

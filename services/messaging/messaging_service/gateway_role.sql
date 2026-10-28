@@ -35,6 +35,9 @@ GRANT SELECT ON messenger_commands TO messaging_gateway;
 GRANT INSERT(principal,key_id,scope_version,key_permission_version,request_id,request_hash,
     account,chat,message,expected_revision,operation,permission,mutation,payload,preview_digest)
     ON messenger_commands TO messaging_gateway;
+-- ANYM-546: messages_send preview records (unbound ones age out) and composite parent records.
+GRANT SELECT,INSERT,UPDATE,DELETE ON send_previews TO messaging_gateway;
+GRANT SELECT,INSERT,UPDATE ON send_intents TO messaging_gateway;
 -- Definitions are credential-bound in the shared application authorization.
 -- Matching is a separate least-privilege worker, never a gateway write path.
 GRANT SELECT,INSERT,UPDATE ON subscriptions TO messaging_gateway;

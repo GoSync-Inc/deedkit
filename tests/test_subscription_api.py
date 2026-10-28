@@ -136,7 +136,7 @@ def test_subscription_manifest_has_strict_schemas_and_passive_event_read():
             'Accept':'application/json, text/event-stream'},json={'jsonrpc':'2.0','id':1,
             'method':'tools/list','params':{}}).json()['result']['tools']
     tools={tool['name']:tool for tool in listed}
-    assert len(tools)==52
+    assert len(tools)==53
     for method in METHODS:
         tool=tools[method]
         assert tool['inputSchema']['additionalProperties'] is False

@@ -170,14 +170,15 @@ def _sent(store, c, p, row, step):
 
 
 def send_begin(store, c, p, account, phone, text, request_id, reply_to, format, preview_digest,
-               link_preview, allow_lossy):
+               link_preview, allow_lossy, child=False):
     """The first send result of this request_id, or the chat step to wait for. Nothing reaches a provider here."""
     from .commands import enqueue
-    from .outgoing import format_options, phone_step_id, valid_text
+    from .outgoing import CHILD_KEY_PREFIX, format_options, phone_step_id, valid_text
     format_options(format, link_preview, allow_lossy, preview_digest)
     if not isinstance(text, str) or not text.strip(): raise APIError('invalid_message_text')
     if format == 'plain': valid_text(text)
-    if not isinstance(request_id, str) or not re.fullmatch(r'[a-zA-Z0-9_.:-]{8,128}', request_id):
+    if (not isinstance(request_id, str) or not re.fullmatch(r'[a-zA-Z0-9_.:-]{8,128}', request_id)
+            or request_id.startswith(CHILD_KEY_PREFIX) != child):
         raise APIError('invalid_request_id')
     if not isinstance(reply_to, str) or len(reply_to) > 256: raise APIError('not_found', 404)
     _native(c, p, account)
@@ -214,7 +215,7 @@ def send_begin(store, c, p, account, phone, text, request_id, reply_to, format, 
 
 
 def send_finish(store, c, p, account, phone, operation_id, text, request_id, reply_to, format, preview_digest,
-                link_preview, allow_lossy):
+                link_preview, allow_lossy, child=False):
     """After the chat step: the unchanged send pipeline under the caller's request_id."""
     from .commands import status
     from .outgoing import enqueue
@@ -245,7 +246,7 @@ def send_finish(store, c, p, account, phone, operation_id, text, request_id, rep
                                step['payload'].get('preview_lookup'), text, reply_to, format, link_preview, allow_lossy)
     if chat_id != data['chat_id'] or draft['preview_digest'] != preview_digest: raise APIError('preview_mismatch', 409)
     row = enqueue(c, p, account, chat_id, text, request_id, reply_to, format, preview_digest, link_preview,
-                  allow_lossy, phone_hash=expected)
+                  allow_lossy, phone_hash=expected, child=child)
     sent = c.execute('SELECT * FROM outgoing_messages WHERE id=%s', (row['send_id'],)).fetchone()
     return _sent(store, c, p, sent, step)
 
