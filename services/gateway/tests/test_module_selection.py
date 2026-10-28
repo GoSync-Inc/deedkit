@@ -401,7 +401,7 @@ def test_modules_available_summary(gateway):
     assert on_path["tools"] == PLATFORM + MODULE_TOOLS["messaging"]
 
 
-TWINS = ["calls_get_call_status", "calls_call_result"]
+TWINS = ["calls_get_call_analysis", "calls_call_result"]
 
 
 def advanced_paths():
@@ -425,12 +425,12 @@ def test_advanced_lists_only_the_profiles_tools_and_scopes_never_widen_it(gatewa
     write(change)
     with TestClient(app) as client:
         plain, _ = listed(client)
-        assert "calls_get_call_status" not in plain and "calls_call_result" in plain
+        assert "calls_get_call_analysis" not in plain and "calls_call_result" in plain
         for path, chosen in advanced_paths():
             names, found = listed(client, path)
             assert names == [n for n in profile if CATALOG[n]["module"] in chosen | {"gateway"}], path
             assert found["tool_count"] == len(names)
-            for name in ("calls_get_call_analysis", "calls_dial_call", "messages_send"):
+            for name in ("calls_get_call_status", "calls_dial_call", "messages_send"):
                 assert name not in names, (path, name)
                 assert call(client, name, path=path)["isError"], (path, name)
 

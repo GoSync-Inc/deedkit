@@ -545,3 +545,14 @@ def test_concurrent_recoveries_never_hide_the_placed_call(world):
     done = next(r for r in results if isinstance(r, dict))
     assert done["state"] == "succeeded" and w.effects == 1
     assert execute(w, token) == done
+
+
+# spec: ANYM-550
+def test_the_published_call_example_previews_without_dialing(world):
+    from agent_api import DESCRIPTIONS
+    text = DESCRIPTIONS["call"]
+    example = json.loads(text[text.index("Example: ") + len("Example: "):])
+    w = world(mode="typed")
+    result = w.tool("p1", "call", example)
+    assert agent.validate_result(result)["state"] == "previewed", result
+    assert w.effects == 0

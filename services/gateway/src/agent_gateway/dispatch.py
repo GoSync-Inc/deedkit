@@ -266,8 +266,11 @@ class Route:
         return names if self.advanced else default_list(names)
 
 
-def tool_paths(usable):
-    """Every tool the key may use, the advanced ones included, with the connection path that lists it (ANYM-550)."""
+def tool_paths(usable, selections=None):
+    """Every tool the key may use, the advanced ones included, with the connection path that lists it (ANYM-550).
+
+    `selections` are the principal's in-session selections by path; a row whose path a selection narrows past the
+    tool's module carries the `next` selection that lists it there again."""
     everyday = set(default_list(usable))
     rows = []
     for name in usable:
@@ -277,6 +280,9 @@ def tool_paths(usable):
                "path": MODULE_PATH + ",".join(sorted(names)) if names else PLAIN_PATH}
         if name not in everyday:
             row["replaced_by"] = REPLACED_BY[name]
+        chosen = (selections or {}).get(row["path"])
+        if chosen and module != "gateway" and module not in chosen:
+            row["next"] = {"tool": "platform_select_modules", "arguments": {"modules": sorted(chosen | {module})}}
         rows.append(row)
     return rows
 
@@ -554,7 +560,8 @@ class Dispatch:
                  "path": MODULE_PATH + m}
                 for m in sorted(counts)
             ],
-            "tool_paths": tool_paths(usable),
+            "tool_paths": tool_paths(usable, {path: modules for (principal, path), modules in self.selections.items()
+                                              if principal == agent["id"]}),
         }
 
     def authenticate(self, key):

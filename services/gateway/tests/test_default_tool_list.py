@@ -10,7 +10,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from agent_gateway.app import create_app
-from agent_gateway.catalog import ACTIONS, CATALOG, arguments, public
+from agent_gateway.catalog import ACTIONS, CATALOG, StrictValidator, arguments, public
 from agent_gateway.diagnostics import with_catalog
 from agent_gateway.dispatch import MODULE_PURPOSES, Route
 from agent_gateway.policy import Denied
@@ -103,7 +103,9 @@ def test_every_everyday_description_is_short_and_its_one_example_passes_the_sche
         assert description.count("Example: ") == 1, name
         example, _ = decoder.raw_decode(description, description.index("Example: ") + len("Example: "))
         assert isinstance(example, dict), name
-        # The gateway's own admission: the tool's strict schema plus its request_id rule.
+        # The published schema of a key that holds the example's operation, then the gateway's own admission.
+        published = public(CATALOG[name], [example["operation"]] if "operation" in example else None)
+        StrictValidator(published["inputSchema"]).validate(example)
         assert arguments(CATALOG[name], example) is not None, name
 
 
@@ -141,6 +143,7 @@ def test_platform_capabilities_names_every_tool_with_the_path_that_lists_it(tmp_
         for row in rows:
             assert row["tier"] == ("everyday" if row["tool"] in EVERYDAY else "advanced"), row
             assert row["tool"] in listing(client, row["path"]), row
+            assert "next" not in row, row
             assert row.get("replaced_by") == REPLACED_BY.get(row["tool"]), row
 
 
@@ -148,10 +151,10 @@ def test_platform_capabilities_names_every_tool_with_the_path_that_lists_it(tmp_
 def test_an_old_tool_stays_callable_on_the_default_path(tmp_path):
     app, calls = gateway(tmp_path, FIXTURE_TOOLS, FIXTURE_ACTIONS)
     with TestClient(app) as client:
-        assert "calls_get_call_status" not in listing(client, "/mcp")
-        result = rpc(client, "/mcp", "tools/call", {"name": "calls_get_call_status", "arguments": {"call_id": "c-1"}})
+        assert "calls_get_call_analysis" not in listing(client, "/mcp")
+        result = rpc(client, "/mcp", "tools/call", {"name": "calls_get_call_analysis", "arguments": {"call_id": "c-1"}})
     assert not result.get("isError"), result
-    assert ("calls", "/v1/get_call_status") in calls
+    assert ("calls", "/v1/get_call_analysis") in calls
 
 
 # spec: ANYM-550
@@ -170,3 +173,19 @@ def test_every_module_path_parses_with_and_without_advanced_in_any_order():
         with pytest.raises(Denied):
             Route.parse("/mcp/modules/" + bad)
     assert Route.parse("/mcp").advanced is False
+
+
+# spec: ANYM-550
+def test_a_tool_path_narrowed_by_a_selection_names_the_selection_that_lists_it_again(tmp_path):
+    app, _ = gateway(tmp_path, FIXTURE_TOOLS + ["platform_select_modules"], FIXTURE_ACTIONS)
+    with TestClient(app) as client:
+        rpc(client, "/mcp/modules/messaging", "tools/call",
+            {"name": "platform_select_modules", "arguments": {"modules": ["calls"]}})
+        rows = {r["tool"]: r for r in rpc(client, "/mcp", "tools/call", {
+            "name": "platform_capabilities", "arguments": {}})["structuredContent"]["tool_paths"]}
+        row = rows["messages_send"]
+        assert row["path"] == "/mcp/modules/messaging" and "messages_send" not in listing(client, row["path"])
+        assert row["next"] == {"tool": "platform_select_modules", "arguments": {"modules": ["calls", "messaging"]}}
+        rpc(client, row["path"], "tools/call", {"name": "platform_select_modules", "arguments": row["next"]["arguments"]})
+        assert "messages_send" in listing(client, row["path"])
+        assert "next" not in rows["calls_call"]
