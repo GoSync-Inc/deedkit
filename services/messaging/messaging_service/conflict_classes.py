@@ -32,7 +32,6 @@ EXPLANATIONS = {
 }
 LISTING_LIMIT = 20
 TOP_CLASSES = 3
-BACKFILL_BATCH = 500
 # The schema that stores classes. Before it (a rollback or an unmigrated test database) every conflict reads as
 # unclassified and ingest writes the N-1 row, so no reader or collector depends on the new columns.
 CLASS_SCHEMA = 54
@@ -58,23 +57,6 @@ def _time(value):
 
 # A revision snapshot is the validated envelope plus these archive fields; its `chat` is the archive chat ID.
 SNAPSHOT_FIELDS = ('message', 'provider_chat', 'chat', 'revision')
-
-
-def version_at_conflict(retained, unchanged):
-    """The provider version the archive held when it raised the conflict: the observed revision's own, advanced by
-    each earlier `unchanged` observation (archive.ingest bumps provider_updated_at without a revision). An
-    unreadable or missing receipt can only leave it lower, which reads as newer: attention, never known."""
-    times = []
-    for value in unchanged or []:
-        try: times.append(_time(value))
-        except (TypeError, ValueError): pass
-    at = _time(retained['updated_at'])
-    return max([at, *times])
-
-
-def _at_conflict(retained, unchanged):
-    try: return version_at_conflict(retained, unchanged)
-    except Exception: return None  # classify then reads the snapshot or names the row unclassified
 
 
 def _classify(retained, candidate, retained_at=None):
@@ -103,7 +85,7 @@ def _classify(retained, candidate, retained_at=None):
 
 def classify(retained, candidate, retained_at=None):
     """The class of one conflict: `retained` is the observed revision's snapshot, `candidate` the receipt envelope and
-    `retained_at` the provider version the archive held then (ingest: exact; backfill: version_at_conflict).
+    `retained_at` the provider version the archive held then (ingest: exact).
     Never raises: ingest calls it inside its transaction, and bad evidence is a class of its own."""
     try:
         if not isinstance(retained, dict) or not isinstance(candidate, dict): return UNCLASSIFIED
@@ -160,39 +142,3 @@ def listing(c, chat):
         (chat, known_classes(), LISTING_LIMIT)).fetchall()
     return [{'message_id': r['message_id'], 'class': r['class'], 'explanation': explanation(r['class']),
              'observed_at': r['observed_at']} for r in rows]
-
-
-# One backfill batch is its own short transaction: a lock wait or a slow batch fails it instead of holding
-# collectors behind it (Astra r1 F1). A failed batch leaves its rows NULL (read as unclassified); rerun to resume.
-BATCH_LOCK_TIMEOUT = "SET LOCAL lock_timeout='2s'"
-BATCH_STATEMENT_TIMEOUT = "SET LOCAL statement_timeout='10s'"
-
-
-def backfill(pool, batch=BACKFILL_BATCH, *, after_batch=None):
-    """Classifies rows without a stored class with the insert rule, after migrate() has committed. Bounded (one
-    keyset pass, each batch committed on its own), idempotent (only NULL classes) and non-resolving (resolved_at and
-    resolved_revision are never written). Returns the number of rows classified; `after_batch()` is a test hook."""
-    after, classified = '', 0
-    while True:
-        with pool.connection() as c:
-            if not stored(c): return classified
-            c.execute(BATCH_LOCK_TIMEOUT);c.execute(BATCH_STATEMENT_TIMEOUT)
-            # The message's earlier `unchanged` receipts, found through the indexed receipt links (045).
-            rows = c.execute('''SELECT mc.receipt_digest,r.envelope,mr.snapshot,b.unchanged FROM message_conflicts mc
-                LEFT JOIN ingest_receipts r ON r.digest=mc.receipt_digest
-                LEFT JOIN message_revisions mr ON mr.message=mc.message AND mr.revision=mc.observed_revision
-                LEFT JOIN LATERAL (SELECT array_agg(u.envelope->>'updated_at') AS unchanged
-                    FROM ingest_receipt_links l JOIN ingest_receipts u ON u.digest=l.digest
-                    WHERE l.account=r.account AND l.provider_chat=r.envelope->>'chat'
-                    AND l.provider_id=r.envelope->>'provider_id' AND u.outcome='unchanged'
-                    AND u.received_at<=mc.observed_at) b ON true
-                WHERE mc.reason IS NULL AND mc.receipt_digest>%s ORDER BY mc.receipt_digest LIMIT %s''',
-                (after, batch)).fetchall()
-            if not rows: return classified
-            with c.cursor() as cur:
-                cur.executemany('''UPDATE message_conflicts SET reason=%s,reason_version=%s
-                    WHERE receipt_digest=%s AND reason IS NULL''',
-                    [(classify(r['snapshot'], r['envelope'], _at_conflict(r['snapshot'], r['unchanged'])),
-                      REASON_VERSION, r['receipt_digest']) for r in rows])
-        classified += len(rows); after = rows[-1]['receipt_digest']
-        if after_batch: after_batch()

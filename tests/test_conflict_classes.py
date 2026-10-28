@@ -95,7 +95,7 @@ def test_mixed_classes_attention_outside_the_top_three_still_counts(archive):
 
 # spec: ANYM-557
 def test_class_is_stored_at_insert_against_the_observed_revision(archive):
-    from messaging_service.conflict_classes import REASON_VERSION,backfill
+    from messaging_service.conflict_classes import REASON_VERSION
     ar,s,key,_=archive
     mid=contradict(ar,'17',direction='outgoing')
     assert stored(s,mid)['reason']=='telegram_direction_equal_version'
@@ -104,15 +104,11 @@ def test_class_is_stored_at_insert_against_the_observed_revision(archive):
     assert ar.ingest(event(body='Вторая версия',updated_at='2026-10-01T12:01:00Z'))['outcome']=='edited'
     resolved=stored(s,mid)['resolved_at']
     assert resolved is not None
-    with s.pool.connection() as c:
-        c.execute('UPDATE message_conflicts SET reason=NULL,reason_version=NULL WHERE message=%s',(mid,))
-    assert backfill(s.pool)==1
     assert stored(s,mid)=={'reason':'telegram_direction_equal_version','reason_version':REASON_VERSION,'resolved_at':resolved}
 
 
 # spec: ANYM-557
 def test_relation_is_to_the_version_the_archive_held_after_an_unchanged_reobservation(archive):
-    from messaging_service.conflict_classes import backfill
     ar,s,key,_=archive
     later='2026-10-01T12:03:00+00:00'
     # An `unchanged` re-read advances the archive's provider version past the revision's snapshot (ANYM-561 s4).
@@ -123,65 +119,25 @@ def test_relation_is_to_the_version_the_archive_held_after_an_unchanged_reobserv
     direction,body=(stable_id('msg','archive-test','100',p) for p in ('d','b'))
     assert stored(s,direction)['reason']=='telegram_direction_equal_version'
     assert stored(s,body)['reason']=='telegram_body_equal_version'
-    with s.pool.connection() as c:
-        c.execute('UPDATE message_conflicts SET reason=NULL,reason_version=NULL')
-    assert backfill(s.pool)==2
     assert stored(s,direction)['reason']=='telegram_direction_equal_version'
     assert stored(s,body)['reason']=='telegram_body_equal_version'
     assert account(s,key)['conflicts']=={**account(s,key)['conflicts'],'attention':0,'known':2,'next_step':'none_required'}
 
 
 # spec: ANYM-557
-def test_backfill_is_bounded_idempotent_and_reads_malformed_or_n1_rows_as_unclassified(archive):
-    from messaging_service.conflict_classes import backfill
+def test_rows_without_a_stored_class_read_as_unclassified_attention(archive):
     ar,s,key,_=archive
     good=[contradict(ar,f'g{n}',body=f'Другой {n}') for n in range(3)]
-    bad=contradict(ar,'bad',body='Другой')
     legacy=contradict(ar,'legacy',body='Другой')
     with s.pool.connection() as c:
-        c.execute('UPDATE message_conflicts SET reason=NULL,reason_version=NULL')
-        # Malformed legacy evidence: a receipt without the fields the class needs.
-        c.execute('''UPDATE ingest_receipts SET envelope='{"platform":"telegram"}'::jsonb
-            WHERE digest=(SELECT receipt_digest FROM message_conflicts WHERE message=%s)''',(bad,))
-    assert backfill(s.pool,batch=2)==5
-    with s.pool.connection() as c:
-        first=c.execute('SELECT receipt_digest,reason,reason_version,resolved_at FROM message_conflicts ORDER BY 1').fetchall()
-    assert backfill(s.pool,batch=2)==0
-    with s.pool.connection() as c:
-        assert c.execute('SELECT receipt_digest,reason,reason_version,resolved_at FROM message_conflicts ORDER BY 1').fetchall()==first
-        # N-1 code inserts without a class after the backfill.
+        # N-1 code inserts without a class.
         row=c.execute('DELETE FROM message_conflicts WHERE message=%s RETURNING *',(legacy,)).fetchone()
         c.execute(OLD_INSERT,(row['receipt_digest'],row['message'],row['observed_revision'],row['candidate_updated_at']))
     assert all(stored(s,mid)['reason']=='telegram_body_equal_version' for mid in good)
-    assert stored(s,bad)['reason']=='unclassified' and stored(s,legacy)['reason'] is None
-    assert all(r['resolved_at'] is None for r in first)
+    assert stored(s,legacy)['reason'] is None
     conflicts=account(s,key)['conflicts']
-    assert conflicts['attention']==2 and conflicts['known']==3 and conflicts['next_step']=='inspect_chat'
-    assert {'class':'unclassified','count':2} in [{k:c[k] for k in ('class','count')} for c in conflicts['top_classes']]
-
-
-# spec: ANYM-557
-def test_backfill_commits_each_batch_so_ingest_and_resolution_never_wait_for_it(archive):
-    from messaging_service.conflict_classes import backfill
-    ar,s,key,_=archive
-    mids=[contradict(ar,f'c{n}',body=f'Другой {n}') for n in range(3)]
-    with s.pool.connection() as c:
-        c.execute('UPDATE message_conflicts SET reason=NULL,reason_version=NULL')
-    seen=[]
-    def between():
-        # A collector on its own connection, with a lock wait far below the batch bounds: a new conflict and a
-        # resolving edit of an already classified row both go through while the backfill is between batches.
-        with s.pool.connection() as c:
-            c.execute("SET LOCAL lock_timeout='200ms'")
-            seen.append(c.execute('SELECT count(*) AS n FROM message_conflicts WHERE reason IS NOT NULL').fetchone()['n'])
-        if len(seen)==1:
-            contradict(ar,'during',body='Другой')
-            assert ar.ingest(event(provider_id='c0',body='Новая версия',updated_at='2026-10-01T12:05:00Z'))['outcome']=='edited'
-    assert backfill(s.pool,batch=1,after_batch=between)==3
-    # Each batch was committed when the next began; the conflict ingested in between was classified at insert.
-    assert seen==[1,3,4]
-    assert stored(s,mids[0])['resolved_at'] is not None and stored(s,mids[0])['reason']=='telegram_body_equal_version'
-    assert stored(s,stable_id('msg','archive-test','100','during'))['reason']=='telegram_body_equal_version'
+    assert conflicts['attention']==1 and conflicts['known']==3 and conflicts['next_step']=='inspect_chat'
+    assert {'class':'unclassified','count':1} in [{k:c[k] for k in ('class','count')} for c in conflicts['top_classes']]
 
 
 # spec: ANYM-557

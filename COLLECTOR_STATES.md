@@ -96,8 +96,8 @@ never makes it known):
 
 `unclassified`: evidence the rule cannot read (for example a malformed legacy
 receipt), and every row without a stored class (written by older code). It
-counts as attention. Migration 054 classifies existing rows once, in batches,
-without resolving any.
+counts as attention. Rows from before migration 054 keep no class until a
+follow-up card classifies them.
 
 Telegram history reconcile isolates a provider error of one chat (ANYM-293).
 Rate limits (`FloodWaitError`, the governor's cooldown), session-terminal

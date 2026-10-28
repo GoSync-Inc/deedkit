@@ -1480,10 +1480,6 @@ class Store:
                  REVOKE ALL ON FUNCTION public.subscription_hint_references(uuid,bigint,bigint,text[],text[]) FROM PUBLIC;
                 END IF;
             END $$''')
-        # After the commit, in short batches of their own: conflicts without a class (054, or rows N-1 code wrote
-        # since) get one; a rerun of migrate resumes it (ANYM-557, Astra r1 F1).
-        from .conflict_classes import backfill as classify_conflicts
-        classify_conflicts(self.pool)
 
     def expand_status(self):
         return expand_status(self.pool.conninfo)
