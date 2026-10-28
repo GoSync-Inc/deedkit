@@ -236,7 +236,9 @@ class CallIntents:
                           if isinstance(c, dict)][:10]
             raise ServiceError("selection_required", 409, {
                 "candidates": candidates, "retryable": False,
-                "hint": "A name never picks a person by itself: ask the owner which one, then pass its id as to."})
+                "hint": "This person has several channels and no call preference: ask the owner which one, then pass "
+                        "that channel's chat_ ID as to." if person else
+                        "A name never picks a person by itself: ask the owner which one, then pass its id as to."})
         if code in ("not_found", "unsupported_target"):
             raise ServiceError(code, 404 if code == "not_found" else 422, {"retryable": False})
         raise ServiceError("scoped_archive_unavailable", 503)

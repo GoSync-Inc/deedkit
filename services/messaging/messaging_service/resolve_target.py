@@ -232,6 +232,13 @@ def _person(c, p, person, account, purpose):
     if len(chosen) == 1:
         return _person_target(_chat_target(c, p, chosen[0], 'person_preferred', purpose), person, purpose)
     rows = chosen or rows
+    if purpose == 'call':
+        # A call lookup names channels only (ANYM-548): one candidate per account, no chat reference or activity.
+        accounts = {}
+        for r in rows:
+            accounts.setdefault(r['account'], _candidate(r['account'], _title(c, p, r), 'account', r['platform'],
+                                                         r['account'], None, purpose, follow=False))
+        raise _choose(list(accounts.values()))
     # Several channels and no usable preference: the agent picks the channel.
     raise _choose([_candidate(r['id'], _title(c, p, r), 'chat', r['platform'], r['account'], r['last_at'], purpose)
                    for r in rows])

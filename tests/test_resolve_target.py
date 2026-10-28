@@ -470,3 +470,31 @@ def test_the_owner_prefers_only_a_linked_account_and_unlinking_it_clears_the_pre
     s.delete_person(person)
     with s.pool.connection() as c:
         assert c.execute('SELECT count(*) AS n FROM person_preferences').fetchone()['n'] == 0
+
+
+# spec: ANYM-548
+def test_a_call_lookup_of_a_person_without_a_usable_preference_names_channels_only(world):
+    s, _, key, say, _ = world
+    native = '79110000003@c.us'
+    say(NATIVE, native, 'N1', 'Steven native', chat=native, name='Steven Native', metadata=PRIVATE)
+    person = s.link_person(TG, '42')['person']
+    s.link_person(WA, WA_STEPAN, person=person)
+    s.link_person(NATIVE, native, person=person)
+
+    def channels(body, *accounts):
+        assert body['error'] == 'selection_required' and 'next' not in body and 'more' not in body
+        # Egress messaging -> calls, exactly: per channel its account, network and label; no chat_ ID, activity
+        # or continuation.
+        assert sorted(body['candidates'], key=lambda c: c['id']) == [
+            {'id': a, 'label': target(s, key, chat_of(s, a, peer))['label'], 'kind': 'account', 'network': network,
+             'account': a} for a, peer, network in sorted(accounts)]
+
+    everyone = ((TG, '42', 'telegram'), (WA, WA_STEPAN, 'whatsapp'), (NATIVE, native, 'whatsapp'))
+    key = s.issue_key('rt-all', [TG, WA, NATIVE])
+    channels(refused(s, key, person, purpose='call'), *everyone)
+    # A preference on an account this key cannot read is unusable: the same channels as none.
+    s.set_person_channel(person, 'call', WA)
+    narrow = s.issue_key('rt-tg-native', [TG, NATIVE])
+    channels(refused(s, narrow, person, purpose='call'), everyone[0], everyone[2])
+    # Messages keep ANYM-545's chat candidates with their own continuation.
+    assert all(c['kind'] == 'chat' and c['next'] for c in refused(s, narrow, person)['candidates'])
