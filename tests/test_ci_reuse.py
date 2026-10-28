@@ -632,8 +632,10 @@ def test_a_reusing_push_skips_only_the_test_jobs_and_still_builds_publishes_and_
     tiden = checks["jobs"]["tiden"]
     assert tiden["needs"] == ["documentation", "evidence"] and tiden["if"].startswith("${{ always() && !cancelled()")
     assert "reuse_queue_evidence" not in json.dumps(tiden)
-    for name in ("native", "images"):
-        assert "if" not in ci["jobs"][name] and "needs" not in ci["jobs"][name]
+    assert "if" not in ci["jobs"]["images"] and "needs" not in ci["jobs"]["images"]
+    # native skips only on the queue's pull request reuse, never on a main push (pr_reuse is skipped there).
+    assert ci["jobs"]["native"]["needs"] == ["pr_reuse"]
+    assert ci["jobs"]["native"]["if"] == "${{ !cancelled() && needs.pr_reuse.outputs.decision != 'reuse' }}"
     assert ci["jobs"]["publish"]["needs"] == ["gate"] and ci["jobs"]["release"]["needs"] == ["gate", "publish", "checks"]
     # The queue still gets no Tiden credential.
     assert ci["jobs"]["checks"]["secrets"]["TIDEN_API_TOKEN"] == (
@@ -996,6 +998,31 @@ def test_ci_gate_passes_a_queue_run_with_skipped_verify_only_for_its_validated_p
     completed = subprocess.run(["bash", "-e", "-c", step["run"]], env={"PATH": "/usr/bin:/bin", **environment},
                                capture_output=True)
     assert (completed.returncode == 0) == passes
+
+
+# spec: ANYM-322
+@pytest.mark.parametrize("native, decision, passes", [
+    ("success", "", True), ("success", "full", True), ("success", "reuse", True), ("skipped", "reuse", True),
+    ("skipped", "", False), ("skipped", "full", False), ("failure", "reuse", False), ("cancelled", "reuse", False),
+], ids=["ran", "ran-full-queue", "ran-on-reuse", "skipped-on-reuse", "skipped-without-decision", "skipped-on-full-queue",
+        "failed-on-reuse", "cancelled-on-reuse"])
+def test_ci_gate_accepts_a_skipped_native_job_only_with_the_queue_pull_request_reuse(native, decision, passes):
+    ci, _ = workflows()
+    job = ci["jobs"]["native"]
+    assert job["needs"] == ["pr_reuse"] and job["uses"] == "./.github/workflows/whatsmeow.yml"
+    # Any doubt about the decision (a failed or skipped pr_reuse leaves no `reuse`) runs the native suite.
+    assert job["if"] == "${{ !cancelled() && needs.pr_reuse.outputs.decision != 'reuse' }}"
+    first, second = ci["jobs"]["gate"]["steps"][:2]
+    assert first["env"]["PR_DECISION"] == second["env"]["PR_DECISION"] == "${{ needs.pr_reuse.outputs.decision }}"
+    environment = {"CHECKS_RESULT": "success", "NATIVE_RESULT": native, "IMAGES_RESULT": "success", "PR_DECISION": decision,
+                   "SOURCE_REF": "", "EXPECTED_SHA": SHA}
+    completed = subprocess.run(["bash", "-e", "-c", first["run"]], env={"PATH": "/usr/bin:/bin", **environment},
+                               capture_output=True)
+    assert (completed.returncode == 0) == passes
+    # The second step still refuses a `reuse` decision that is not a validated pull request reuse of this group commit.
+    refused = subprocess.run(["bash", "-e", "-c", second["run"]], env={"PATH": "/usr/bin:/bin", **PR_REUSED,
+                                                                        "PR_REUSE_RESULT": "failure"}, capture_output=True)
+    assert refused.returncode != 0
 
 
 def test_the_push_after_a_reusing_queue_run_verifies_in_full_and_promotion_takes_its_own_verify():

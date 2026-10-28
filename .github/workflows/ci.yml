@@ -130,6 +130,10 @@ jobs:
       # A queued group can hold a fork's unmerged code, so it never gets the credential.
       TIDEN_API_TOKEN: ${{ github.event_name != 'merge_group' && secrets.TIDEN_API_TOKEN || '' }}
   native:
+    # A merge queue group that reuses a pull request run skips this job too: that run's CI gate required it on exactly
+    # this tree. Every other run, and any doubt, runs it; the main push always does (production.py REQUIRED_JOBS).
+    needs: [pr_reuse]
+    if: ${{ !cancelled() && needs.pr_reuse.outputs.decision != 'reuse' }}
     uses: ./.github/workflows/whatsmeow.yml
     with:
       source_ref: ${{ inputs.source_ref || '' }}
@@ -149,11 +153,18 @@ jobs:
           CHECKS_RESULT: ${{ needs.checks.result }}
           NATIVE_RESULT: ${{ needs.native.result }}
           IMAGES_RESULT: ${{ needs.images.result }}
+          PR_DECISION: ${{ needs.pr_reuse.outputs.decision }}
           SOURCE_REF: ${{ inputs.source_ref || '' }}
           EXPECTED_SHA: ${{ github.sha }}
         run: |
           test "$CHECKS_RESULT" = success
-          test "$NATIVE_RESULT" = success
+          # native / synthetic is skipped only with the pull request reuse, which the next step validates. An if, not
+          # an `&&` list: `bash -e` ignores a failure on the left of `&&`.
+          if [ "$NATIVE_RESULT" = skipped ]; then
+            test "$PR_DECISION" = reuse
+          else
+            test "$NATIVE_RESULT" = success
+          fi
           test "$IMAGES_RESULT" = success
           # A manual baseline of another revision must never turn this commit green.
           test -z "$SOURCE_REF" || test "$SOURCE_REF" = "$EXPECTED_SHA"

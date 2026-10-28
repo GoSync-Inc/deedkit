@@ -8,10 +8,10 @@ Parameterized Python executions retain their parameter names and status.
 
 Test jobs run in parallel and each uploads a `ci-evidence-<job>` fragment:
 `checks / verify` the seven checks and its module reports, `checks / load` the
-gateway load gate, and each `checks / python (<n>/4)` job its shard of the root
-Python/PostgreSQL suite. The root suite runs in four file-level shards
-(`scripts/python_shards.py`): `checks / verify` runs shard 1 and the three
-`checks / python (<n>/4)` jobs (`python-2` to `python-4`) shards 2-4, each on its
+gateway load gate, and each `checks / python (<n>/6)` job its shard of the root
+Python/PostgreSQL suite. The root suite runs in six file-level shards
+(`scripts/python_shards.py`): `checks / verify` runs shard 1 and the five
+`checks / python (<n>/6)` jobs (`python-2` to `python-6`) shards 2-6, each on its
 own runner with its own PostgreSQL. Every test module belongs to exactly one shard, chosen by committed
 per-file timings (`scripts/python_shards.json`, refreshed with
 `python scripts/python_shards.py weights <python.xml>`); a module without a
@@ -20,7 +20,7 @@ the plan cannot name (outside `tests/`, through a directory symlink) is a
 collection error. Each job runs pytest through the selector of the workflow's
 own commit (`ci-tools`), so a baseline of a revision without the selector is
 sharded the same way. The `checks / evidence` job merges the fragments into
-`ci-evidence` and the four shard reports into one `python.xml`, so test
+`ci-evidence` and the six shard reports into one `python.xml`, so test
 identities do not change. `anymsg-ci::python` passes only when every shard
 passed with its own valid report of executed tests and no failed one, and every
 shard job succeeded. Each shard is a job of its own rather than one matrix, so
@@ -230,8 +230,9 @@ downloaded and validated as data by the push-reuse rules below. The tested
 merge commit must be GitHub's merge of that head, and its tree must equal the
 group commit's tree. A re-read must show the same run. Anything else, including
 any error, means full verification, never a failed run. On a reuse
-`checks / verify`, `checks / python`, `checks / load` and `checks / evidence` are skipped;
-`native / synthetic` runs. `checks / tiden` runs no Tiden
+`checks / verify`, `checks / python`, `checks / load`, `checks / evidence` and
+`native / synthetic` are skipped (the pull request run's `CI gate` required it on
+the same tree); the main push still runs it. `checks / tiden` runs no Tiden
 command: its receipt records `skipped` with the reused run attempt's URL
 (`tested_in`), the merge commit it tested and the group commit, and the job fails
 without them. `CI gate` accepts that skip only for this decision on this group
