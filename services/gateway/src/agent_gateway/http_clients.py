@@ -32,6 +32,11 @@ WAIT_ADMISSION = {
     # ANYM-519: register and test wait up to 10 s for the signed test delivery's result.
     ("messaging", "register_delivery_endpoint"): ("waits", lambda a: True),
     ("messaging", "test_delivery_endpoint"): ("waits", lambda a: True),
+    # ANYM-549: execute waits up to wait_s for its receipt. The risk-class tools reach the backend as preview or
+    # execute (dispatch), so their own entries only describe when they wait: never on dry_run.
+    ("messaging", "execute_messenger_operation"): ("waits", lambda a: (a.get("wait_s") or 0) > 0),
+    **{("messaging", tool): ("waits", lambda a: (a.get("wait_s") or 0) > 0 and not a.get("dry_run"))
+       for tool in ("change_message", "manage_chat", "change_contacts", "read_contacts")},
 }
 
 

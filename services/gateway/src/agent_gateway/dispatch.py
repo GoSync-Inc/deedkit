@@ -7,7 +7,7 @@ from platform_contracts import Capability, safe_error
 from platform_contracts.agent import MAX_CANDIDATES, PLACEHOLDER_REQUEST_ID, validate_candidate
 from .adapters.calls import receipt_reference
 
-from .catalog import arguments, CATALOG, InvalidArguments
+from .catalog import arguments, CATALOG, InvalidArguments, routed
 from .diagnostics import FAILURE_FIELDS, discovery, manifest_summary, stale_arguments_hint, unavailable, unknown_tool_denial
 from .http_clients import WAIT_POOL, WAIT_RETRY_AFTER_S
 from .policy import Denied, key_from_file
@@ -376,7 +376,7 @@ class Dispatch:
                 and self.implemented(CATALOG[n], current, principal, capabilities[CATALOG[n]["module"]])
                 and (
                     not CATALOG[n].get("action_group")
-                    or bool(actions)
+                    or bool(routed(CATALOG[n], actions))
                     or (
                         CATALOG[n]["operation"] == "get_messenger_operation"
                         and bool(self.policy.actions(current, principal, scopes.get("messaging", [])))
@@ -495,10 +495,12 @@ class Dispatch:
             # Retained receipts are independent of current provider support.
             allowed_actions = self.policy.actions(snapshot, agent, caps["permissions"])
         if tool.get("action_group"):
+            # ANYM-549: a risk-class tool carries only the granted actions it routes.
+            allowed_actions = routed(tool, allowed_actions)
             if not allowed_actions or ("operation" in args and args["operation"] not in allowed_actions):
                 raise Denied()
             if "account" in args:
-                allowed_actions = self.actions(snapshot, agent, caps, args["account"])
+                allowed_actions = routed(tool, self.actions(snapshot, agent, caps, args["account"]))
                 if "operation" in args and args["operation"] not in allowed_actions:
                     raise Denied()
         if (module == "messaging" and tool["operation"] in ("preview_message", "send_message") and args.get("phone")
@@ -507,6 +509,30 @@ class Dispatch:
             # ANYM-532: a phone recipient needs the same action grant as the separate operation.
             raise Denied()
         return allowed_actions
+
+    @staticmethod
+    def backend_call(tool, args, caps):
+        """The backend operation and arguments of one admitted call. A risk-class tool (ANYM-549) is a preview on
+        dry_run and an execute otherwise. Preview's request_id is accepted and never forwarded, and wait_s=0 is not
+        sent, so a backend from before ANYM-549 keeps taking these calls; a real wait needs the backend's bound."""
+        operation = tool["operation"]
+        if tool.get("routes_actions"):
+            operation = "preview_messenger_operation" if args.get("dry_run") else "execute_messenger_operation"
+            args = {k: v for k, v in args.items() if k != "dry_run"}
+        if operation == "preview_messenger_operation" and tool["module"] == "messaging":
+            args = {k: v for k, v in args.items() if k not in ("request_id", "preview_digest", "wait_s")}
+        if operation == "execute_messenger_operation" and tool["module"] == "messaging":
+            if not args.get("wait_s"):
+                args = {k: v for k, v in args.items() if k != "wait_s"}
+            else:
+                block = caps.get("messenger_operations")
+                bound = block.get("execute_wait_s_max") if isinstance(block, dict) else None
+                if type(bound) is not int or bound < args["wait_s"]:
+                    denied = Denied("unsupported_by_backend", 409)
+                    denied.detail = {"error": "unsupported_by_backend", "field": "wait_s",
+                                     "next_action": "repeat_without_wait_s_then_poll_get_messenger_operation"}
+                    raise denied
+        return operation, args
 
     def admit(self, key, name):
         return self.policy.authorize_agent(*self.authenticate(key), name)
@@ -595,6 +621,9 @@ class Dispatch:
                                            phase="capabilities", read_only=read_only)
             raise
         allowed_actions = self.argument_admission(tool, args, snapshot, agent, caps)
+        operation, args = self.backend_call(tool, args, caps)
+        # A preview has no effect, also when a risk-class tool asks for it.
+        read_only = read_only or operation == "preview_messenger_operation"
         rules_ceiling = "assignment:read" in set(agent["grants"].get(module, [])) & set(caps["permissions"])
         if module == "messaging" and tool["operation"] in ("preview_message", "send_message"):
             # An empty recipient field is not sent, so a backend from before ANYM-532 keeps taking chat_id calls.
@@ -627,7 +656,7 @@ class Dispatch:
             result = (
                 caps
                 if tool["operation"] == "capabilities"
-                else await self.clients.call(module, tool["operation"], credential, args)
+                else await self.clients.call(module, operation, credential, args)
             )
         except Denied as error:
             if error.code == "backend_busy" and module == "messaging" and tool["operation"] == "wait_for_subscription_events":
@@ -728,7 +757,7 @@ class Dispatch:
                 and self.implemented(CATALOG[n], snapshot, agent, caps)
                 and (
                     not CATALOG[n].get("action_group")
-                    or bool(allowed_actions)
+                    or bool(routed(CATALOG[n], allowed_actions))
                     or (
                         CATALOG[n]["operation"] == "get_messenger_operation"
                         and bool(self.policy.actions(snapshot, agent, caps["permissions"]))

@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .catalog import CATALOG, ACTIONS
+from .catalog import CATALOG, ACTIONS, routed
 
 
 class Denied(Exception):
@@ -214,7 +214,7 @@ class Policy:
             if CATALOG[name]["module"] in modules
             and (CATALOG[name]["module"] == "gateway" or CATALOG[name]["module"] in agent["credentials"])
             and set(CATALOG[name]["scopes"]) <= set(agent["grants"].get(CATALOG[name]["module"], []))
-            and (not CATALOG[name].get("action_group") or bool(Policy.actions(snapshot, agent)))
+            and (not CATALOG[name].get("action_group") or bool(routed(CATALOG[name], Policy.actions(snapshot, agent))))
             and (
                 not CATALOG[name].get("required_action")
                 or CATALOG[name]["required_action"] in Policy.actions(snapshot, agent)

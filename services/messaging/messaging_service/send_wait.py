@@ -31,7 +31,7 @@ class _Admission:
         self.closed = False
         self.reading = False
 
-    def read(self, store, token, send_id):
+    def read(self, read, token, handle):
         with self.lock:
             # A queued thread can start after the HTTP request's deadline. In
             # that case it must not acquire a database connection at all.
@@ -41,7 +41,7 @@ class _Admission:
         try:
             # Store owns the short authorization/connection context. No DB
             # connection or authorization lock survives into the poll sleep.
-            return store.get_send_status(token, send_id)
+            return read(token, handle)
         finally:
             with self.lock:
                 self.reading = False
@@ -63,6 +63,15 @@ def _consume_result(task):
 
 
 async def wait_for_send(store, token, send_id, wait_s):
+    return await _wait(store.get_send_status, token, send_id, wait_s)
+
+
+async def wait_for_operation(store, token, operation_id, wait_s):
+    """ANYM-549: the same bounded observation of an already queued messenger operation; it never dispatches."""
+    return await _wait(store.get_messenger_operation, token, operation_id, wait_s)
+
+
+async def _wait(read, token, handle, wait_s):
     """Return authorized status plus elapsed/timeout metadata, without resending.
 
     ``wait_s=0`` performs one status read. Enqueue callers can skip this helper
@@ -87,7 +96,7 @@ async def wait_for_send(store, token, send_id, wait_s):
                 if latest is None:
                     raise APIError('send_status_timeout', 503)
                 return result(True)
-            task = asyncio.create_task(asyncio.to_thread(admission.read, store, token, send_id))
+            task = asyncio.create_task(asyncio.to_thread(admission.read, read, token, handle))
             task.add_done_callback(_consume_result)
             try:
                 latest = await asyncio.wait_for(asyncio.shield(task), remaining) if wait_s else await task

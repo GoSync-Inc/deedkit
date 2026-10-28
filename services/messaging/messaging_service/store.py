@@ -494,7 +494,9 @@ class Store:
                     'archive_read_remains_passive':True,'provider_session_owner':'existing_fenced_collector',
                     'mutation_preview_digest_required':True,'preview_digest_proves_owner_approval':False,
                     'ambiguous_mutations':'unknown_no_automatic_retry','registered_file_limit_bytes':32*1024**2,
-                    'read_state_requires_explicit_permission':True},
+                    'read_state_requires_explicit_permission':True,
+                    # ANYM-549: execute takes wait_s up to this bound; preview takes and ignores request_id.
+                    'execute_wait_s_max':25,'preview_accepts_request_id':True},
                 'unavailable': ['guaranteed_full_history', 'drafts',
                                 'owner_approval', 'project_memory', 'schedules', 'oauth'],
                 'limits': {'page_size': 100, 'query_chars': 200,
