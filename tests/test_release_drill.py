@@ -109,7 +109,7 @@ def evidence_for(tmp_path, name, commit, reports):
         (fragments / "ci-evidence-verify" / MODULE_REPORTS[module][0]).write_text(node_report(*sorted(required)))
     for fragment, report in reports.items():
         (fragments / "ci-evidence-verify" / fragment).write_text(report)
-    producers = [f"{job}:success:{commit}" for job in ("verify", "load", "python-2", "python-3", "python-4", "go")]
+    producers = [f"{job}:success:{commit}" for job in ("verify", "load", "python-2", "python-3", "python-4", "python-5", "python-6", "go")]
     env = {"PATH": os.environ["PATH"], "GITHUB_REPOSITORY": "example/repo", "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "2"}
     directory = tmp_path / f"{name}-evidence"
     tool = ["scripts/tiden_ci.py"]
