@@ -264,8 +264,12 @@ def collect(name, popen=subprocess.Popen, timeout=CALL):
             if len(got[0]) >= limit:
                 copy.kill()
                 return ''  # more than an outbox may hold: rejected
-            code = copy.wait(timeout)
-    except (OSError, subprocess.TimeoutExpired):
+            try:
+                code = copy.wait(timeout)
+            except subprocess.TimeoutExpired:
+                copy.kill()  # killed inside the `with`, so its exit wait cannot block
+                return None
+    except OSError:
         return None
     return outbox_text(got[0]) if code == 0 else None
 

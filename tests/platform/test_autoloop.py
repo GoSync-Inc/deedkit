@@ -7,9 +7,11 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tarfile
 import threading
+import time
 
 import pytest
 
@@ -2374,3 +2376,16 @@ def test_a_stop_counts_only_when_docker_confirms_the_container_stopped_or_gone()
     assert launcher.stop(BUILD, gone) is True
     with pytest.raises(launcher.Refused):
         launcher.exists(BUILD, down)
+
+
+# spec: ANYM-574
+def test_a_copy_that_ends_its_output_but_never_exits_is_killed_and_read_as_failed():
+    started = []
+
+    def hung(*args, **kwargs):  # a real process: empty output at once, then it never exits by itself
+        started.append(subprocess.Popen([sys.executable, '-c', 'import os, time; os.close(1); time.sleep(60)'],
+                                        stdout=subprocess.PIPE, stdin=subprocess.DEVNULL))
+        return started[0]
+    begin = time.monotonic()
+    assert launcher.collect(BUILD, hung, timeout=0.5) is None
+    assert time.monotonic() - begin < 10 and started[0].poll() is not None  # killed, not waited on for a minute

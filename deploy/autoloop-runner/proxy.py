@@ -108,7 +108,7 @@ async def handle(reader, writer, resolver=resolve):
     host, port = (found[1].decode('ascii', 'replace').lower(), int(found[2])) if found else (None, None)
     addresses = await resolver(host) if allowed(host, port) else []
     if not addresses:
-        print(f'refused {host!r}:{port}', file=sys.stderr, flush=True)
+        print(f'refused {str(host)[:64]!r}:{port}', file=sys.stderr, flush=True)
         writer.write(b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n')
         await writer.drain()
         writer.close()
