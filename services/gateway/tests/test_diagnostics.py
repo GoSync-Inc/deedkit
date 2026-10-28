@@ -7,7 +7,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from agent_gateway.app import create_app
-from agent_gateway.catalog import CATALOG, public
+from agent_gateway.catalog import CATALOG
 from test_policy import config
 from test_transport import rpc
 
@@ -255,7 +255,10 @@ def test_tools_list_publishes_catalog_annotations_name_description_and_schemas_u
         listed = {t["name"]: t for t in rpc(client, "tools/list").json()["result"]["tools"]}
     assert set(listed) == set(tools)
     for name in tools:
-        expected, tool = public(CATALOG[name]), listed[name]
+        # Built from the raw catalog entry, not public(), so a field public() dropped would fail here.
+        fields = ("name", "title", "description", "inputSchema", "outputSchema", "annotations", "_meta")
+        expected, tool = {k: CATALOG[name][k] for k in fields if k in CATALOG[name]}, listed[name]
+        assert not CATALOG[name].get("action_group"), name
         assert tool["annotations"] == CATALOG[name]["annotations"], name
         if name == "platform_capabilities":
             # Only its description gains the catalog note; the reviewed text stays its prefix.
