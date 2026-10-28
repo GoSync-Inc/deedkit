@@ -133,12 +133,14 @@ def tokens(text):
 
 
 def scoped(items, schema):
-    """`items` with each `<schema>.` qualifier before a name removed: the calendar schema is the only one, and the
+    """`items` with each leading `<schema>.` qualifier before a name removed: the calendar schema is the only one, and the
     migration's search_path starts with it. Any other qualifier stays and fails the grammar."""
     out, at = [], 0
     while at < len(items):
+        # Only a leading qualifier: in `t.fcs.c` the schema word is a middle part of a longer path (Astra r2).
         if (
-            items[at][0] in ("word", "ident")
+            not (at and items[at - 1] == ("punct", "."))
+            and items[at][0] in ("word", "ident")
             and items[at][1] == schema
             and items[at + 1 : at + 2] == [("punct", ".")]
             and items[at + 2 : at + 3]
@@ -341,6 +343,8 @@ def create_table(c, state):
         raise Manual("not a new table")
     elements = c.group()
     c.end()
+    # Known before its elements, so a self-referencing foreign key passes `references` (Astra r2).
+    state["created"].add(table)
     for element in split(elements):
         e = Cursor(element)
         if e.peek()[0] == "word" and e.peek()[1] in (
@@ -356,7 +360,6 @@ def create_table(c, state):
             raise Manual("LIKE")
         else:
             new_column(e, state)
-    state["created"].add(table)
 
 
 def table_constraint(e, state):

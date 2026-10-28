@@ -267,7 +267,9 @@ def test_a_failing_grant_leaves_nothing(store, expand):
     (NEW_TABLE + "COMMENT ON SCHEMA public IS 'changed';\n", "", "not_unattended"),
     (HEADER + "CREATE TABLE synthetic_notes(id text REFERENCES outsider(id));\n", "", "not_unattended"),
     (NEW_TABLE, "GRANT UPDATE ON fcs.audit_id_seq TO fcs_gateway;\n", "role_not_additive"),
-], ids=["drop", "index-on-existing", "revoke", "comment-outside", "reference-outside", "grant-on-sequence"])
+    (HEADER + "COMMENT ON COLUMN plans.fcs.tool IS 'changed';\n", "", "not_unattended"),
+], ids=["drop", "index-on-existing", "revoke", "comment-outside", "reference-outside", "grant-on-sequence",
+        "comment-displaced-qualifier"])
 def test_migrate_expand_reclassifies_before_running(store, expand, migration, appended, code):
     setup, _ = expand
     plan, paths = setup(migration=migration, appended=appended)
@@ -308,8 +310,12 @@ def test_the_cli_prints_one_json_line(store, tmp_path, capsys):
      "DO $$ BEGIN IF to_regclass('fcs.MixedCase') IS NOT NULL THEN GRANT SELECT ON fcs.\"MixedCase\" TO fcs_gateway;"
      " END IF; END $$;\n", "role_not_additive"),
     (NEW_TABLE, GUARD.replace(" END IF;\nEND $$", ' "end" "if";\n"end" $$'), "role_not_additive"),
+    (HEADER + "COMMENT ON COLUMN plans.fcs.tool IS 'changed';\n", "", "not_unattended"),
+    (HEADER + "COMMENT ON COLUMN fcs.plans.fcs.tool IS 'changed';\n", "", "not_unattended"),
+    (HEADER + "COMMENT ON TABLE fcs.fcs.plans IS 'changed';\n", "", "not_unattended"),
 ], ids=["comment-on-schema", "comment-on-role", "reference-outside", "existing-name", "grant-on-sequence",
-        "mixed-case-guard", "quoted-guard-close"])
+        "mixed-case-guard", "quoted-guard-close", "comment-displaced-qualifier", "comment-two-qualifiers",
+        "comment-doubled-schema"])
 def test_plan_pauses_on_text_outside_the_schema_or_the_template(migration, appended, reason):
     assert rollout.plan(files(), {**files(), 6: migration}, roles_text(), roles_text() + appended) == {"pause": reason}
 
@@ -330,3 +336,12 @@ def test_the_base_inventory_plan_reads_from_the_files_is_the_live_schema_5_table
     assert set(inventory) | {"migrations"} == tables(store)
     grant = "GRANT SELECT ON fcs.migrations, fcs.invitation_opt_ins TO fcs_gateway;\n"
     assert rollout.plan(files(), {**files(), 6: NEW_TABLE}, roles_text(), roles_text() + grant)["target"] == 6
+
+
+# spec: ANYM-586
+def test_a_self_referencing_new_table_is_additive():
+    inline = HEADER + "CREATE TABLE synthetic_tree(id int PRIMARY KEY, parent_id int REFERENCES synthetic_tree(id));\n"
+    table = HEADER + ("CREATE TABLE synthetic_tree(id int PRIMARY KEY, parent_id int,"
+                      " FOREIGN KEY (parent_id) REFERENCES fcs.synthetic_tree(id));\n")
+    for migration in (inline, table):
+        assert rollout.plan(files(), {**files(), 6: migration}, roles_text(), roles_text())["target"] == 6
