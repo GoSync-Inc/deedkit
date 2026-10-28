@@ -883,18 +883,25 @@ messages only, so a subscription with wake rules never matches them. `direction`
 another key of the same principal sees nothing. No text leaves: neither the body nor the
 provider's error text, only the fixed `error_code`. The collector writes the row in the same
 transaction as the send status, in its own savepoint: a journal error is logged
-(`subscription_journal_failed`) and counted, and the status commits anyway.
+(`subscription_journal_failed`) and counted, and the status commits anyway; a failing log write
+cannot undo it either. A collector login bound to one account (`collector_account_roles`) may
+journal only a failed or unknown send of its own account, under that send's own principal, key and
+chat.
 
 `source.health` matches subscriptions whose key sees the whole account; a chat-restricted key
 reads no collector health (as in `get_sync_status`). Its `status` is `auth_required` (the
 connection is blocked until the owner relinks), `disconnected` (no live collector lease, a
-stopped collector or a connection that is not connected), `stale` (connected, but neither the
-connect nor the live capture, which refreshes about every 15 seconds while the provider session is
-open, has confirmed the session for longer than `SOURCE_HEALTH_STALE_MINUTES`, default 30,
-1–1440, set on the matcher) or `connected` (a recovery). A quiet chat is not stale: the capture
-refresh does not depend on new messages. The matcher derives it from `collector_health` and the lease every 30 seconds through
-the definer function `journal_source_health`; the first observation of an account is a baseline
-and journals nothing. Its failure is logged and counted and never stops matching.
+stopped collector or a connection that is not connected), `stale` (connected, but no provider
+event, meaning a committed live capture such as a message, receipt, read state or deletion, since
+the later of the connect and the last event for longer than `SOURCE_HEALTH_STALE_MINUTES`,
+default 30, 1–1440, set on the matcher) or `connected` (a recovery). An account quiet for longer
+than the threshold is therefore stale; raise the threshold for quiet accounts. The matcher derives
+the status from `collector_health` and the lease every 30 seconds through the definer function
+`journal_source_health`, which remembers the last status, connect time and lease epoch per account
+in `source_health_journal`. A disconnect and reconnect, or a collector restart, between two calls is
+journaled as `disconnected` followed by the current status. The first observation of an account
+is a baseline and journals nothing. The function locks no collector row; its transaction is
+bounded to 2 seconds. A failure is logged and counted and never stops matching.
 
 Voice transcripts need no new kind: `file.transcript.ready` already wakes a subscriber when an
 audio or voice message's transcript is ready.

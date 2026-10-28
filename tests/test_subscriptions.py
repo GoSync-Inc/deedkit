@@ -465,7 +465,7 @@ def test_send_failed_reaches_only_the_sending_key(sender, outcome, status, code)
 
 
 # spec: ANYM-535
-def test_send_failed_journal_error_never_blocks_the_send_status(sender):  # noqa: F811
+def test_send_failed_journal_error_never_blocks_the_send_status(sender, monkeypatch):  # noqa: F811
     import asyncio
     from messaging_service import outgoing, subscriptions
     from messaging_service.envelope import stable_id
@@ -482,6 +482,11 @@ def test_send_failed_journal_error_never_blocks_the_send_status(sender):  # noqa
         c.execute('''CREATE TRIGGER refuse_send_failed BEFORE INSERT ON events FOR EACH ROW
             WHEN (NEW.kind='send.failed') EXECUTE FUNCTION pg_temp.refuse_send_failed()''')
     before = subscriptions.JOURNAL_FAILURES['send.failed']
+
+    def closed_log(*args, **kwargs):
+        raise BrokenPipeError('synthetic closed log pipe')
+    # Its diagnostics fail too: neither may undo the send status.
+    monkeypatch.setattr(subscriptions, 'print', closed_log, raising=False)
     try:
         asyncio.run(outgoing.OutgoingWorker(state, failing_provider('uncertain')).once())
     finally:
@@ -520,23 +525,37 @@ def test_source_health_journals_status_changes_for_account_readers(seeded):
     epoch = archive.acquire('telegram-demo', 'synthetic-health')
     state = CollectorState(archive, 'telegram-demo', ('synthetic-health', epoch))
 
-    def age(*phases):
+    def synthetic(path, value):
         with store.pool.connection() as c:
-            for phase in phases:
-                c.execute('''UPDATE collector_health SET operations=jsonb_set(operations,%s,
-                    to_jsonb((clock_timestamp()-interval '31 minutes')::text)) WHERE account='telegram-demo' ''',
-                    ('{%s,observed_at}' % phase,))
+            c.execute("""UPDATE collector_health SET operations=jsonb_set(operations,%s,%s)
+                WHERE account='telegram-demo'""", (path, Jsonb(value)))
+    long_ago = str(datetime.now(timezone.utc).replace(year=2025))
     state.phase('connection', 'connected', 'provider_ready')
     state.capture_progress(None, 0, 0)
     assert journal_source_health(store) == 0  # The first observation is a baseline.
     state.connection_failed('provider_disconnected')
     assert journal_source_health(store) == 1 and journal_source_health(store) == 0
-    # A reconnect after a long outage is connected, not stale, before its first capture refresh.
-    age('live_capture')
     state.phase('connection', 'connected', 'provider_ready')
     assert journal_source_health(store) == 1
-    # No confirmation of the provider session for longer than the default 30 minutes.
-    age('connection', 'live_capture')
+    # A disconnect and reconnect between two calls is not lost.
+    state.connection_failed('provider_disconnected')
+    state.phase('connection', 'connected', 'provider_ready')
+    assert journal_source_health(store) == 2
+    # Nor is a collector restart (a new lease epoch) between two calls.
+    archive.release('telegram-demo', 'synthetic-health', epoch)
+    epoch = archive.acquire('telegram-demo', 'synthetic-health')
+    state = CollectorState(archive, 'telegram-demo', ('synthetic-health', epoch))
+    state.phase('connection', 'connected', 'provider_ready')
+    assert journal_source_health(store) == 2
+    # No provider event since the connect for longer than the default 30 minutes; capture refreshes
+    # without a committed event do not count.
+    synthetic('{connection,changed_at}', long_ago)
+    with store.pool.connection() as c:
+        # The same connect as last observed, only earlier: not a reconnect.
+        c.execute("UPDATE source_health_journal SET connection_changed_at=%s WHERE account='telegram-demo'", (long_ago,))
+    state.capture_progress(None, 0, 0)
+    assert journal_source_health(store) == 1
+    synthetic('{live_capture,last_commit}', {'committed_by': str(datetime.now(timezone.utc))})
     assert journal_source_health(store) == 1
     state.connection_failed('telegram_pairing_required')
     assert journal_source_health(store) == 1
@@ -545,8 +564,57 @@ def test_source_health_journals_status_changes_for_account_readers(seeded):
     match_subscriptions(store)
     items = store.get_subscription_events(reader, selected)['items']
     assert [(item['kind'], item['account'], item['status']) for item in items] == [
-        ('source.health', 'telegram-demo', status) for status in ('disconnected', 'connected', 'stale', 'auth_required')]
+        ('source.health', 'telegram-demo', status) for status in ('disconnected', 'connected', 'disconnected',
+            'connected', 'disconnected', 'connected', 'stale', 'connected', 'auth_required')]
     assert all(not {'chat', 'message', 'sender', 'send_id', 'error_code'} & set(item) for item in items)
     assert 'provider_disconnected' not in json.dumps(items, default=str)
     for token, sid in ((reader, default), (restricted, narrow), (elsewhere, other)):
         assert store.get_subscription_events(token, sid)['items'] == []
+
+
+# spec: ANYM-535
+def test_bound_collector_journals_only_its_own_failed_sends(sender):  # noqa: F811
+    import asyncio
+    from types import SimpleNamespace
+    from messaging_service import outgoing
+    from messaging_service.archive import Archive
+    from messaging_service.collector_state import CollectorState
+    from messaging_service.envelope import stable_id
+    from test_db_role_isolation import RolePool, install, refused, remove
+    s, _, _, _, state = sender
+    mine, sibling = failure_keys(s)
+    chat = stable_id('chat', 'send-fixture', '100')
+    sid = s.create_subscription(mine, [chat], kinds=['send.failed'])['subscription_id']
+    role = install(s, 'collector_role.sql', 'messaging_collector', account='send-fixture')
+
+    def submit(n):
+        return s.send_message(mine, account='send-fixture', chat_id=chat, text='Synthetic failing text',
+            request_id='synthetic-bound-%04d' % n)['send_id']
+    try:
+        bound = CollectorState(Archive(SimpleNamespace(pool=RolePool(s, role), append_event=s.append_event,
+            files=s.files)), 'send-fixture', state.lease)
+        finished = submit(1)
+        asyncio.run(outgoing.OutgoingWorker(bound, failing_provider('uncertain')).once())
+        interrupted = submit(2)
+        with s.pool.connection() as c:
+            c.execute("UPDATE outgoing_messages SET status='dispatching',lease_epoch=NULL WHERE id=%s", (interrupted,))
+        asyncio.run(outgoing.OutgoingWorker(bound, failing_provider('uncertain')).once())
+        queued = submit(3)
+        with s.pool.connection() as c:
+            sends = {row['id']: row for row in c.execute('''SELECT id,account,chat,principal,key_id::text AS key_id,
+                status,error_code FROM outgoing_messages WHERE id=ANY(%s)''', ([finished, queued],)).fetchall()}
+            other_key = c.execute("SELECT id::text AS id FROM api_keys WHERE id::text<>%s AND principal='failure-agent'",
+                (sends[finished]['key_id'],)).fetchone()['id']
+        forged = 'INSERT INTO events(id,account,message,kind,revision,origin,snapshot) VALUES(0,%s,NULL,%s,1,%s,%s)'
+        # Another key's subscription, an unfinished send, a non-send kind: refused by the guard.
+        for kind, snapshot in (('send.failed', {**sends[finished], 'send_id': finished, 'key_id': other_key}),
+                               ('send.failed', {**sends[queued], 'send_id': queued, 'status': 'failed'}),
+                               ('source.health', {'account': 'send-fixture', 'status': 'disconnected'})):
+            refused(s, role, forged, ('send-fixture', kind, 'live', Jsonb(snapshot)))
+    finally:
+        remove(s, role)
+    match_subscriptions(s)
+    items = s.get_subscription_events(mine, sid)['items']
+    assert [(item['send_id'], item['status'], item['error_code']) for item in items] == [
+        (finished, 'unknown', 'send_result_unknown'), (interrupted, 'unknown', 'sender_interrupted')]
+    assert sibling and s.get_send_status(mine, queued)['status'] == 'queued'

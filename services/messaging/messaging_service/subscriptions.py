@@ -484,10 +484,15 @@ def _failure_audience(event, selected_chat, row, p):
 
 
 def _journal_failed(kind, error):
+    """Never raises: the caller's send status or matching pass must survive its own diagnostics."""
     JOURNAL_FAILURES[kind] += 1
-    from .telemetry import capture
-    capture(error, 'subscription_journal_failed')
-    print(json.dumps({'error': 'subscription_journal_failed', 'kind': kind, 'class': type(error).__name__}), flush=True)
+    try:
+        from .telemetry import capture
+        capture(error, 'subscription_journal_failed')
+        print(json.dumps({'error': 'subscription_journal_failed', 'kind': kind, 'class': type(error).__name__}),
+            flush=True)
+    except Exception:
+        pass
 
 
 def journal_send_failures(c, rows):
@@ -511,6 +516,10 @@ def journal_send_failures(c, rows):
             _journal_failed('send.failed', error)
 
 
+# Under the pool's 5 s statement_timeout that bounds every publisher waiting on the feed counter.
+HEALTH_TRANSACTION_TIMEOUT = '2s'
+
+
 def source_health_stale_seconds():
     """The operator's source.health stale threshold; checked at worker startup."""
     return 60 * _bound_setting('SOURCE_HEALTH_STALE_MINUTES', 30, 1, 1440)
@@ -521,6 +530,10 @@ def journal_source_health(store):
     from psycopg import errors
     try:
         with store.pool.connection() as c:
+            # Set first: the server ends the transaction, a stalled client included, before it can hold
+            # the feed counter past a publisher's statement timeout.
+            c.execute("SELECT set_config('transaction_timeout',%s,true)", (HEALTH_TRANSACTION_TIMEOUT,))
+            c.execute("SET LOCAL lock_timeout='500ms'")
             return c.execute('SELECT public.journal_source_health(%s) AS n',
                 (source_health_stale_seconds(),)).fetchone()['n']
     except errors.UndefinedFunction:
