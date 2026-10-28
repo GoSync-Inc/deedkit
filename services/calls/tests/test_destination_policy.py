@@ -339,10 +339,10 @@ def test_defaults_need_no_configuration_and_no_agent_tool_changes_policy(tmp_pat
         ready = client.post('/v1/preflight_call', json={'brief_id': brief.json()['id']}, headers=auth)
         assert ready.status_code == 200 and ready.json()['daily_calls_remaining'] == policy.DAILY_UNITS
     # No agent operation changes the switch or any list; only raise_call_cap changes the cap,
-    # and only on the owner's quoted words (ANYM-353).
+    # and only on the owner's quoted words (ANYM-353). `call` (ANYM-551) prepares and dials in one step.
     writes = {name for name, (_, scope) in METHODS.items() if scope not in {'', 'calls:read'}}
     assert writes == {'prepare_call', 'prepare_external_call', 'start_call', 'dial_call', 'prepare_followup', 'stop_call',
-                      'raise_call_cap'}
+                      'raise_call_cap', 'call'}
     assert set(METHODS['raise_call_cap'][0].model_json_schema()['required']) == {'owner_instruction', 'extra_units'}
     assert not any(field in json.dumps(model.model_json_schema()) for model, _ in METHODS.values()
                    for field in ('daily_call_units', '"allowed"', '"enabled"', 'calling_settings'))

@@ -108,3 +108,18 @@ def test_calendar_plan_declares_unproject_by_lesson_or_operation():
                     {"action": "delete", "calendar_ref": "cal-a", "event_ref": "event-a", "operation_id": "op-1"}):
         with pytest.raises(InvalidArguments):
             arguments(plan, {"actions": [invalid]})
+
+
+# spec: ANYM-551
+def test_calls_call_needs_both_the_dial_and_the_prepare_grant():
+    """A gateway grant of calls:dial alone never reaches calls_call, whatever the backend credential allows."""
+    from agent_gateway.policy import Policy
+    tools = ["calls_call", "calls_dial_call", "calls_prepare_external_call"]
+    snapshot = {"profiles": {"caller": {"tools": tools}}, "deployment": {"modules": ["calls"]}}
+
+    def visible(grants):
+        agent = {"profile": "caller", "credentials": {"calls": "synthetic"}, "grants": {"calls": grants}}
+        return Policy.visible(snapshot, agent)
+    assert sorted(CATALOG["calls_call"]["scopes"]) == ["calls:dial", "calls:prepare"]
+    assert visible(["calls:dial"]) == ["calls_dial_call"]
+    assert visible(["calls:dial", "calls:prepare"]) == tools

@@ -10,6 +10,8 @@
   {"name": "calendar_plan", "read_only": false},
   {"name": "calendar_schedule", "read_only": false},
   {"name": "calendar_slots", "read_only": true},
+  {"name": "calls_call", "read_only": false},
+  {"name": "calls_call_result", "read_only": true},
   {"name": "calls_capabilities", "read_only": true},
   {"name": "calls_dial_call", "read_only": false},
   {"name": "calls_get_call_analysis", "read_only": true},

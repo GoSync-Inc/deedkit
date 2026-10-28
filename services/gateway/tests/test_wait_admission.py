@@ -35,7 +35,7 @@ def test_every_catalog_tool_with_wait_s_has_an_admission_entry_and_a_wait_pool()
 # spec: ANYM-544
 def test_a_new_wait_s_tool_is_selected_from_the_catalog_and_gets_its_modules_wait_pool(monkeypatch):
     """A later story's tool (here a synthetic calls one) waits in a calls wait pool without a name list."""
-    tool = {"name": "calls_call_result", "module": "calls", "operation": "call_result", "scopes": [],
+    tool = {"name": "calls_synthetic_wait", "module": "calls", "operation": "synthetic_wait", "scopes": [],
             "inputSchema": {"type": "object", "properties": {"call_id": {"type": "string"},
                                                              "wait_s": {"type": "number", "minimum": 0, "maximum": 25}}}}
     monkeypatch.setitem(CATALOG, tool["name"], tool)
@@ -48,12 +48,12 @@ def test_a_new_wait_s_tool_is_selected_from_the_catalog_and_gets_its_modules_wai
             return httpx.Response(200, json={"ok": True})
 
         async with Clients(DEPLOYMENT, {m: httpx.MockTransport(handler) for m in DEPLOYMENT["modules"]}) as clients:
-            assert admission(clients.wait_tools, "calls", "call_result", {"wait_s": 5}) == "waits"
+            assert admission(clients.wait_tools, "calls", "synthetic_wait", {"wait_s": 5}) == "waits"
             assert "calls" in clients.waits and "calls" in clients.wait_budgets
-            assert (await clients.call("calls", "call_result", "synthetic", {"call_id": "c", "wait_s": 5}))["ok"]
+            assert (await clients.call("calls", "synthetic_wait", "synthetic", {"call_id": "c", "wait_s": 5}))["ok"]
         return seen
 
-    assert asyncio.run(run()) == ["/v1/call_result"]
+    assert asyncio.run(run()) == ["/v1/synthetic_wait"]
     assert (tool["module"], tool["operation"]) not in WAIT_ADMISSION  # so the catalog test above fails for it
 
 
@@ -144,7 +144,7 @@ def test_the_wait_pool_has_its_own_connections():
         async with Clients(DEPLOYMENT, {m: httpx.MockTransport(lambda r: httpx.Response(200, json={}))
                                         for m in DEPLOYMENT["modules"]}) as clients:
             assert clients.waits["messaging"] is not clients.metadata["messaging"]
-            assert "calls" not in clients.waits  # no calls tool takes wait_s yet
+            assert "calls" in clients.waits  # ANYM-551: calls_call and calls_call_result take wait_s
             assert http_clients.WAIT_ADMISSION[("messaging", "search")][0] == "searches"
 
     asyncio.run(run())
