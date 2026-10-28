@@ -34,9 +34,6 @@ HELPER_TMPFS = {'/tmp':'rw,noexec,nosuid,size=64m',
                 PG_DATA_PATH:'ro,noexec,nosuid,nodev,size=1m,mode=0700'}
 # Backup schema versions this verifier accepts from its helper (`capabilities` reports them).
 SCHEMAS = range(2,51)
-# Asks the pinned helper image which schema versions its own backup code reads.
-SCHEMA_PROBE = ("import json;from messaging_service.backup import SCHEMAS as s;"
-                "print(json.dumps({'start':s.start,'stop':s.stop,'step':s.step}))")
 
 
 def now():return datetime.now(timezone.utc).isoformat()
@@ -191,32 +188,6 @@ class Docker:
         root=self.command('info','--format','{{.DockerRootDir}}').decode().strip()
         if not Path(root).is_absolute():raise ValueError('invalid_docker_data_root')
         return root
-    def discard(self,name):
-        for args in (('container','stop','--time=1',name),('container','rm',name)):
-            try:self.command(*args)
-            except Exception:pass
-    def helper_schemas(self,config,instance):
-        # A probe this verifier instance left running when a publisher was killed; another
-        # instance's probes carry another value and are never touched.
-        if not re.fullmatch('[a-f0-9]{32}',instance):raise ValueError('invalid_verifier_instance')
-        owner=LABEL+'.capabilities'
-        for name in self.command('container','ls','-a','--filter','label='+owner+'='+instance,'--format','{{.Names}}').decode().split():
-            self.discard(name)
-        # Run only after preflight checked the image ID, labels and volumes. No input,
-        # network, mount, capability or log; inherited volumes are bounded tmpfs.
-        name='deedkit-verify-capabilities-'+secrets.token_hex(8)
-        try:raw=self.command('run','--rm','--name',name,'--label',owner+'='+instance,'--network=none','--read-only','--cap-drop=ALL','--security-opt=no-new-privileges',
-                         '--log-driver=none','--restart=no','--cpus=1','--memory=256m','--memory-swap=256m','--pids-limit=64',
-                         '--tmpfs','/tmp:'+HELPER_TMPFS['/tmp'],'--tmpfs',PG_DATA_PATH+':'+HELPER_TMPFS[PG_DATA_PATH],
-                         '--entrypoint','python',config['helper_image'],'-c',SCHEMA_PROBE)
-        except BaseException:
-            # A timed-out CLI leaves the daemon's container running: stop exactly this one.
-            Docker(60).discard(name);raise
-        try:value=r2.unique_json(raw)
-        except ValueError:raise ValueError('invalid_helper_schemas') from None
-        if (not isinstance(value,dict) or set(value)!={'start','stop','step'} or any(type(item) is not int for item in value.values()) or
-                value['step']!=1 or not 2<=value['start']<value['stop']<=10000):raise ValueError('invalid_helper_schemas')
-        return [value['start'],value['stop']-1]
     def inspect_owned(self,kind,name,run):
         category='container' if kind in ('helper','postgres') else kind
         args=['ls'] if category=='container' else ['ls']
@@ -487,68 +458,6 @@ def run(config,*,client=None,engine=None):
             raise error
 
 
-def spelled(path):
-    """One spelling per path: `//etc/x` and `/etc/./x` name `/etc/x`."""
-    return Path('/'+str(path).lstrip('/'))
-
-
-def identity_of(path):
-    try:info=os.stat(path)
-    except FileNotFoundError:return None
-    return (info.st_dev,info.st_ino)
-
-
-def publish_capabilities(config_path,*,engine=None):
-    """Publish the pinned helper's schema range for the receiver's `capabilities` key.
-
-    The file is root-owned and world-readable (it holds no secret). The old one is
-    removed first: an unproven range leaves none, which the deployer reads as unknown.
-    It names this config's identity, so any later change of the config makes it stale.
-    """
-    if os.geteuid()!=0:raise ValueError('root_verifier_required')
-    config_path=Path(config_path).absolute();identity=r2.config_identity(config_path)
-    config=load_config(config_path)
-    receiver=r2.load_config(config['receiver_config_file'])
-    if 'verifier_config_file' not in receiver:raise ValueError('capabilities_file_required')
-    if Path(receiver['verifier_config_file'])!=config_path:raise ValueError('verifier_config_not_canonical')
-    path=r2.CAPABILITIES_FILE
-    # It unlinks and writes this one fixed path. Belt and braces for a host that put a private
-    # input there: never a private input, their directories or the verifier's workspace,
-    # by spelling and by identity, checked before any change.
-    private=[spelled(p) for p in (config_path,config['receiver_config_file'],receiver['credentials_file'],
-                                  config['identity_file'],config['protected_file'])]
-    directories={identity_of(item.parent) for item in private}-{None}
-    if (any(spelled(path)==item or spelled(path).parent==item.parent for item in private) or
-            spelled(path).is_relative_to(spelled(config['directory'])) or identity_of(path.parent) in directories or
-            (identity_of(path) or 0) in {identity_of(item) for item in private} or
-            # A bind-mounted alias of the workspace (or of one of its ancestors' children) has its identity.
-            identity_of(config['directory']) in {identity_of(item) for item in (path.parent,*path.parent.parents)}):
-        raise ValueError('separate_capabilities_file_required')
-    instance=hashlib.sha256(str(config_path).encode()).hexdigest()[:32]
-    # The verifier lock serializes publishers and keeps a publication out of a running verification.
-    with verifier_lock(config['directory']),local.trusted_directory(path.parent) as fd:
-        try:os.unlink(path.name,dir_fd=fd);local.fsync_dir(fd)
-        except FileNotFoundError:pass
-        engine=engine if engine is not None else Docker(min(600,config['timeout_seconds']))
-        engine.preflight(config)
-        value={'v':1,'verifier_config':identity,'helper_revision':config['helper_revision'],
-               'helper_schemas':engine.helper_schemas(config,instance)}
-        name='.'+path.name+'-'+secrets.token_hex(16)
-        out=os.open(name,os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600,dir_fd=fd)
-        try:
-            with os.fdopen(out,'wb') as handle:
-                handle.write(r2.encoded(value));handle.flush();os.fchmod(handle.fileno(),0o644);os.fsync(handle.fileno())
-            os.replace(name,path.name,src_dir_fd=fd,dst_dir_fd=fd);local.fsync_dir(fd)
-        finally:
-            try:os.unlink(name,dir_fd=fd)
-            except FileNotFoundError:pass
-        # The config changed while the image was probed: what was read may be the old pin.
-        if r2.config_identity(config_path)!=identity:
-            os.unlink(path.name,dir_fd=fd);local.fsync_dir(fd)
-            raise ValueError('verifier_config_changed')
-    return value
-
-
 def failure_code(error):
     if isinstance(error,InterruptedError):return 'restore_stopped'
     if isinstance(error,(TimeoutError,subprocess.TimeoutExpired)):return 'restore_deadline'
@@ -559,9 +468,7 @@ def failure_code(error):
           'unreviewed_restore_image','unreviewed_postgres_image','unowned_restore_resource','invalid_helper_result',
           'uploader_lock_initialization_required','uncommitted_cloud_object','receiver_quota','protected_backup_missing',
           'invalid_verifier_journal','private_root_file_required','restore_docker_failed','restore_postgres_unavailable',
-          'isolated_restore_failed','stored_backup_corrupt','storage_unavailable','unexpected_restore_image_volume','unexpected_restore_helper_layout',
-          'capabilities_file_required','invalid_helper_schemas','verifier_config_changed',
-          'verifier_config_not_canonical','separate_capabilities_file_required'}
+          'isolated_restore_failed','stored_backup_corrupt','storage_unavailable','unexpected_restore_image_volume','unexpected_restore_helper_layout'}
     return str(error) if str(error) in safe else 'independent_restore_failed'
 
 
@@ -588,11 +495,8 @@ def describe(error):
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('--config',required=True)
-    parser.add_argument('--publish-capabilities',action='store_true',help="publish the pinned helper's schema range only")
     args=parser.parse_args(argv)
-    try:
-        if args.publish_capabilities:publish_capabilities(args.config)
-        else:run(load_config(args.config))
+    try:run(load_config(args.config))
     except Exception as error:
         print(json.dumps({'error':failure_code(error),'diagnostic':describe(error)},separators=(',',':')),file=sys.stderr);return 1
     return 0

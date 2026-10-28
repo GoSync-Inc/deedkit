@@ -475,64 +475,33 @@ line:
 ```
 
 `verifier_schemas` is the range the installed verifier accepts from its helper
-(`backup_r2_verifier.SCHEMAS`). `helper_schemas` and `helper_revision` come from
-the pinned helper image, which only root may inspect, so the root verifier
-publishes them in a file the upload account can read. Its path is fixed in code,
-never configured: `/var/lib/deedkit-backup-r2/published/capabilities.json`.
-Create `/var/lib/deedkit-backup-r2/published/` as a root-owned `0755` directory
-that holds nothing else. The mode is enabled by `verifier_config_file` in the
-receiver configuration: the absolute path of the installed service's verifier
-configuration, outside `state_directory`. Set the same value in the root
-operator copy. As a second guard, the publisher refuses to touch that fixed path
-if a host put a private input there: the verifier configuration, the operator
-configuration, its credentials, the recovery key, the protected marker or the
-verifier `directory`, compared by spelling and by device and inode, including a
-bind-mounted alias (`separate_capabilities_file_required`, checked before
-anything changes). The file must be root-owned, single-link, world-readable and
-not group/other-writable, under root-owned ancestors that are not group/other
-writable. Anything else, a missing file or a malformed one answers
-`capabilities_unavailable`: the deployer then waits.
+(`backup_r2_verifier.SCHEMAS`). `helper_schemas` and `helper_revision` describe
+the pinned helper image, which only root may inspect. They are read from a
+root-published file at a path fixed in code, never configured:
+`/var/lib/deedkit-backup-r2/published/capabilities.json`. The mode is enabled by
+`verifier_config_file` in the receiver configuration: the absolute path of the
+installed service's verifier configuration, outside `state_directory` (set the
+same value in the root operator copy).
 
-The file also names the verifier configuration it was made from, which must be
-`verifier_config_file` (a staged copy's publication is refused): its path,
-device, inode, size, modification and change times. `capabilities` compares
-them with the current file (a `stat`, which needs only search permission on its
-directories, never read access to the private file). Any edit, replacement,
-removal or symlink of the verifier configuration after the publication makes it
-stale and the answer is `capabilities_unavailable`, so a pin moved without a new
-publication can only make the deployer wait. Keep the verifier configuration's
-directories searchable by the upload account (as for `receive.json`), or the
-answer is always `capabilities_unavailable`.
+The publisher of that file is not part of this release; it comes with the
+receiver's update follow (ANYM-597). Until it exists, `capabilities` answers
+`capabilities_unavailable` and the deployer waits, as it does for every answer
+it cannot prove. The reader accepts a file only when it is root-owned,
+single-link, world-readable and not group/other-writable, under root-owned
+ancestors that are not group/other writable, and exactly
+`{"v":1,"verifier_config":{…},"helper_revision":"<40-hex>","helper_schemas":[first,last]}`.
+`verifier_config` must name `verifier_config_file` and its current path, device,
+inode, size, modification and change times. `capabilities` compares them with a
+`stat` of that file, which needs only search permission on its directories,
+never read access to the private file. Any edit, replacement, removal or symlink
+of the verifier configuration after the publication makes it stale. A missing,
+unreadable, malformed or stale file answers `capabilities_unavailable`. Keep the
+verifier configuration's directories searchable by the upload account (as for
+`receive.json`), or the answer is always `capabilities_unavailable`.
 
-Publish it as root:
-
-```sh
-/opt/deedkit-backup-r2/venv/bin/python -m messaging_service.backup_r2_verifier \
-  --config /etc/deedkit-backup-r2/verifier.json --publish-capabilities
-```
-
-It refuses any `--config` other than `verifier_config_file`
-(`verifier_config_not_canonical`) and takes the verifier lock, so two publishers
-never overlap and none runs during a verification (`verifier_busy`, the file is
-left as it is). It removes the previous file, checks the helper image ID, labels and volumes as
-a restore does, runs that exact image once with no input, network, mount,
-capability or log to print its own `messaging_service.backup.SCHEMAS`, and
-writes `{"v":1,"verifier_config":{…},"helper_revision":…,"helper_schemas":[first,last]}`
-atomically with mode `0644`. A failed check leaves no file, never the previous
-helper's range; a configuration changed during the probe also leaves none
-(`verifier_config_changed`). The probe container has a unique name and the
-`org.deedkit.backup-verifier.capabilities=1` label: a timed-out or interrupted
-probe is stopped and removed by that name, and each publication first removes
-any probe a killed publisher left behind. The
-[verifier service](deploy/deedkit-backup-r2-verifier.service) runs it before
-each verification with its failure ignored (`ExecStartPre=-`), so a failed
-publication never stops a restore. Run it again by hand after changing
-`helper_image`/`helper_revision`; until then `capabilities` answers
-`capabilities_unavailable`.
-
-Undo: remove the capabilities key line from `authorized_keys`, then delete the
-published file and the `ExecStartPre` line; the upload and cold keys and
-`receive` are unchanged by this key.
+Undo: remove the capabilities key line from `authorized_keys` and
+`verifier_config_file` from the receiver configuration; the upload and cold keys
+and `receive` are unchanged by this key.
 
 Backup quota inventory, verified-point rotation and the verifier only address
 `<prefix>/objects/` and `<prefix>/receipts/`: cold copies never occupy a backup

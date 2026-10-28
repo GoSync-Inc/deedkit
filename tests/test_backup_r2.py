@@ -823,10 +823,10 @@ def test_capabilities_file_stays_outside_upload_state_and_leaves_receive_unchang
         write_json(path,{**value,'verifier_config_file':bad})
         with pytest.raises(ValueError,match='invalid_config_path'):r2.load_config(path)
     # A state directory holding the fixed publication path cannot enable the mode.
-    monkeypatch.setattr(r2,'CAPABILITIES_FILE',Path(config['state_directory'])/'published/capabilities.json')
-    write_json(path,{**value,**good})
-    with pytest.raises(ValueError,match='invalid_config_path'):r2.load_config(path)
-    monkeypatch.undo()
+    with monkeypatch.context() as scoped:
+        scoped.setattr(r2,'CAPABILITIES_FILE',Path(config['state_directory'])/'published/capabilities.json')
+        write_json(path,{**value,**good})
+        with pytest.raises(ValueError,match='invalid_config_path'):r2.load_config(path)
     write_json(path,{**value,**good})
     loaded=r2.load_config(path);cloud=Cloud()
     assert receive(loaded,cloud)['status']=='stored'

@@ -30,8 +30,8 @@ MIB = 1024 ** 2
 STREAM_RESUMES = 5
 # Codes our own SIGALRM/SIGTERM handlers raise; an SDK may wrap them.
 SIGNAL_CODES = {'receiver_timeout', 'restore_deadline', 'restore_stopped'}
-# The root verifier's helper publication for `capabilities`. A fixed path, never
-# configured, so no configuration can point the publisher at another file.
+# The root-published helper facts `capabilities` reads (written by the receiver's
+# update follow, ANYM-597). A fixed path, never configured.
 CAPABILITIES_FILE = Path('/var/lib/deedkit-backup-r2/published/capabilities.json')
 # The deadline/stop our signal handlers raised. botocore's retry loop can swallow it and
 # return a later attempt's success, so its retry hook and every cloud call re-raise it.
