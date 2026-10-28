@@ -38,11 +38,12 @@ def migrate_expand(args, parser):
     logging.getLogger('psycopg').disabled=True
     try:
         dsn=Path(os.environ['DATABASE_URL_FILE']).read_text().strip()
-        if args.status: result=store.expand_status(dsn)
+        name=os.environ.get('PGAPPNAME') or None
+        if args.status: result=store.expand_status(dsn,name)
         else:
             try: plan=json.loads(args.plan.read_text())
             except (OSError,ValueError): raise store.ExpandError('plan_invalid') from None
-            result=store.migrate_expand(dsn,plan if isinstance(plan,dict) else {})
+            result=store.migrate_expand(dsn,plan if isinstance(plan,dict) else {},application_name=name)
     except store.ExpandError as error: result=error.code
     except Exception: result='failed'
     print(json.dumps(result if isinstance(result,dict) else {'error':result}))

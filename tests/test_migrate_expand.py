@@ -80,8 +80,9 @@ def package(tmp_path, migration=NOTE, roles=None, *, slow=False):
     if slow:
         with root.joinpath('store.py').open('a') as store:
             store.write('\n_synthetic_original = migrate_expand\n\n\n'
-                        'def migrate_expand(dsn, plan, *, root=None, before_commit=None):\n'
-                        "    return _synthetic_original(dsn, plan, root=root, before_commit=lambda c: c.execute('SELECT pg_sleep(5)'))\n")
+                        'def migrate_expand(dsn, plan, *, root=None, before_commit=None, **kwargs):\n'
+                        "    return _synthetic_original(dsn, plan, root=root, before_commit=lambda c: c.execute('SELECT pg_sleep(5)'),\n"
+                        "                               **kwargs)\n")
     return root
 
 
@@ -312,3 +313,46 @@ def test_the_session_budgets_are_read_back_before_anything_runs(db, monkeypatch)
     monkeypatch.setitem(store_module.EXPAND_SETTINGS, 'transaction_timeout', '5s')
     with pytest.raises(ExpandError) as refused: store.expand_status()
     assert refused.value.code == 'settings_refused'
+
+
+def reached(dsn):
+    with psycopg.connect(dsn, row_factory=dict_row) as c:
+        return c.execute(store_module.EXPAND_IDENTITY).fetchone()['identity']
+
+
+# spec: ANYM-449
+def test_a_plan_identity_of_another_database_refuses_before_anything_runs(db, tmp_path):
+    _, dsn = db
+    root = package(tmp_path)
+    identity = reached(dsn)
+    other = [identity[0], identity[1] + '_other', identity[2]]  # the same ledger reached through another DSN
+    plan = write_plan(tmp_path, {**plan_for(root, RUNTIME_SCHEMA, NEXT), 'identity': other})
+    assert cli(dsn, tmp_path, '--plan', plan, root=root)[:2] == (1, {'error': 'identity_mismatch'})
+    assert ledger(dsn) == (RUNTIME_SCHEMA, 0, 0)
+    plan = write_plan(tmp_path, {**plan_for(root, RUNTIME_SCHEMA, NEXT), 'identity': identity})
+    assert cli(dsn, tmp_path, '--plan', plan, root=root)[:2] == (0, {'schema_version': NEXT})
+    assert ledger(dsn) == (NEXT, 1, 1)
+
+
+# spec: ANYM-449
+def test_the_session_carries_the_deploy_name_over_one_the_dsn_names(db, tmp_path, monkeypatch):
+    from messaging_service import __main__ as cli_module
+    _, dsn = db
+    named = make_conninfo(dsn, application_name='synthetic-dsn-name')
+    c = store_module.expand_connection(named, 'deedkit-migrate-synthetic')
+    try:
+        assert c.execute('SELECT application_name FROM pg_stat_activity WHERE pid=pg_backend_pid()').fetchone() == {
+            'application_name': 'deedkit-migrate-synthetic'}
+    finally: c.close()
+    # The entry point passes PGAPPNAME, which deploy sets to the container name, to both commands.
+    seen, connect = [], store_module.expand_connection
+    monkeypatch.setattr(store_module, 'expand_connection', lambda dsn, name=None: seen.append(name) or connect(dsn, name))
+    tmp_path.joinpath('dsn').write_text(named)
+    monkeypatch.setenv('DATABASE_URL_FILE', str(tmp_path / 'dsn'))
+    monkeypatch.setenv('PGAPPNAME', 'deedkit-migrate-synthetic')
+    plan = write_plan(tmp_path, plan_for(SOURCE, RUNTIME_SCHEMA, RUNTIME_SCHEMA))
+    for args in (['--status', 'ledger'], ['--plan', plan]):
+        monkeypatch.setattr(sys, 'argv', ['messaging_service', 'migrate-expand', *args])
+        assert cli_module.main() == 0
+    assert seen == ['deedkit-migrate-synthetic'] * 2
+

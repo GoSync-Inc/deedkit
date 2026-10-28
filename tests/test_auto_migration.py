@@ -81,8 +81,9 @@ class MigrationHost(Deployer):
         self.version, self.applied = 50, {str(n): sha(f"-- synthetic {n}\n".encode()) for n in range(2, 51)}
         self.events, self.calls, self.die, self.answer, self.copy_failure = [], [], None, "applied", None
         self.settled, self.identity, self.reached = True, ["7000000000000000001", "messaging_probe", "16384"], None
-        self.shape, self.rehearsal = list(SHAPE_BEFORE), {"took_ms": 12, "difference": p.catalog_difference(
-            p.catalog_map(SHAPE_BEFORE), p.catalog_map(SHAPE_AFTER))}
+        self.shape, self.shape_after = list(SHAPE_BEFORE), list(SHAPE_AFTER)
+        self.rehearsal = {"took_ms": 12, "difference": p.catalog_difference(
+            p.digested(p.catalog_map(SHAPE_BEFORE)), p.digested(p.catalog_map(SHAPE_AFTER)))}
         self.pending = {f"{int(name[:3])}": sha(data) for name, data in files.items()}
         self.target = 50 + len(files)
         for name, fake in (("wait_for_calls", self.wait_for_calls), ("live_lines", self.live_lines),
@@ -142,11 +143,13 @@ class MigrationHost(Deployer):
         self.events.append("status" if status else "migrate")
         if status:
             return {"schema_version": self.version}
-        assert name.startswith("deedkit-migrate-") and json.loads(Path(plan_file).read_text())["target"] == self.target
+        written = json.loads(Path(plan_file).read_text())
+        assert name.startswith("deedkit-migrate-") and written["target"] == self.target
+        assert written["identity"] == self.identity  # its connection checks the copied database (Astra r2 F3)
         if self.die == "before":
             raise Died()
         if self.answer in ("applied", "lost"):
-            self.version, self.applied, self.shape = self.target, {**self.applied, **self.pending}, list(SHAPE_AFTER)
+            self.version, self.applied, self.shape = self.target, {**self.applied, **self.pending}, list(self.shape_after)
         if self.die == "after":
             raise Died()
         return {"schema_version": self.target} if self.answer == "applied" else None if self.answer in ("lost", "silent") \
@@ -177,7 +180,8 @@ def test_a_qualifying_range_runs_every_phase_in_order_and_records_the_migration(
     assert receipt["status"] == "migrated" and (receipt["base"], receipt["target"]) == (50, 51)
     assert receipt["files"] == ["051_synthetic_note.sql"] and receipt["copy"] == "copy449"
     plan = json.loads((host.state / NEWEST / "migrate-plan.json").read_text())
-    assert plan == {"base": 50, "target": 51, "roles": {"gateway_role.sql": {"bytes": len(ROLE), "sha256": sha(ROLE)}}}
+    assert plan == {"base": 50, "target": 51, "roles": {"gateway_role.sql": {"bytes": len(ROLE), "sha256": sha(ROLE)}},
+                    "identity": host.identity}
 
 
 # spec: ANYM-449
@@ -537,6 +541,20 @@ def test_the_identity_the_dsn_reaches_is_the_identity_docker_exec_reads(source_d
     assert json.loads(reached) == found and found[1] == source_db and len(found) == 3
 
 
+# spec: ANYM-449
+def test_a_default_behind_a_users_assignment_cast_is_not_constant(source_db):
+    # Astra r2 F5: pg_get_expr prints an implicit cast's argument only, so this default reads `0`.
+    psql(source_db, "CREATE TYPE synthetic_wrap AS (n integer); CREATE FUNCTION synthetic_wrap_of(integer) RETURNS "
+                    "synthetic_wrap VOLATILE LANGUAGE sql AS 'SELECT ROW($1)::synthetic_wrap'; CREATE CAST (integer AS "
+                    "synthetic_wrap) WITH FUNCTION synthetic_wrap_of(integer) AS ASSIGNMENT;")
+    before = shape(source_db)
+    psql(source_db, "ALTER TABLE messages ADD COLUMN s_wrap synthetic_wrap DEFAULT 0;")
+    after = shape(source_db)
+    added = dict((tuple(key), value) for key, value in p.catalog_difference(before, after)["added"])
+    assert added[("column", "public.messages", "s_wrap")][2] == "0"
+    assert p.not_additive(before, after) == "added column public.messages s_wrap"
+
+
 FORBIDDEN = {
     "drop-column": ("ALTER TABLE messages DROP COLUMN body;", "removed column public.messages body"),
     "rename-column": ("ALTER TABLE messages RENAME COLUMN body TO text_body;", "removed column public.messages body"),
@@ -633,7 +651,7 @@ def fake_migrate(migration, *, slow=False):
     schema version, in one transaction."""
     calls = []
     def expand_run(name, image, network, dsn_file, plan_file, *, label=None, status=False):
-        calls.append((name, network, label))
+        calls.append((name, network, label, json.loads(Path(plan_file).read_text())["identity"]))
         host = Path(dsn_file).read_text().split("@")[1].split(":")[0]
         text = "BEGIN; " + migration + LEDGER_ROW.format(digest="a" * 64) + (" SELECT pg_sleep(1.2);" if slow else "") \
             + " COMMIT;"
@@ -660,19 +678,21 @@ def test_the_rehearsal_runs_on_the_copy_over_an_internal_network_and_leaves_noth
     with p.database_copy(copy_settings, "messaging", NEWEST, keep=True, catalog=p.CATALOG) as copied:
         copy_id = copied["id"]
         if case == "additive":
-            record = p.rehearse(copied, plan, scratch_image(), 1000)
+            record = p.rehearse(copied, plan, scratch_image(), 4000)  # docker teardown sits inside the window
         else:
             with pytest.raises(p.MigrationRefused) as refused:
                 p.rehearse(copied, plan, scratch_image(), 1000)
         network = subprocess.run(["docker", "network", "inspect", "--format", "{{.Internal}}", "deedkit-copy-" + copy_id],
                                  capture_output=True, text=True, check=True).stdout.strip()
         owner = json.loads((Path(copied["copy"]["directory"]) / "owner.json").read_text())
-    assert network == "true" and calls[0][1:] == ("deedkit-copy-" + copy_id, "deedkit-copy=" + copy_id)
+    assert network == "true" and calls[0][1:3] == ("deedkit-copy-" + copy_id, "deedkit-copy=" + copy_id)
+    # The plan names the scratch database it rehearses on (Astra r2 F3).
+    assert len(calls[0][3]) == 3 and calls[0][3][1] == copied["database"]
     assert {"kind": "network", "name": "deedkit-copy-" + copy_id} in owner["resources"]
     assert {"kind": "container", "name": f"deedkit-copy-{copy_id}-migrate"} in owner["resources"]
     assert labelled(copy_id, "container") == [] and labelled(copy_id, "network") == []
     if case == "additive":
-        assert 0 <= record["took_ms"] <= 1000
+        assert 0 <= record["took_ms"] <= 4000
         assert ["relation", "public.synthetic_items"] in [key for key, _ in record["difference"]["added"]]
     else:
         assert str(refused.value).startswith({"delivery-features": "not additive: probe_metadata changed beyond "
@@ -862,3 +882,16 @@ def test_a_network_that_appears_after_its_copy_was_released_is_removed(copy_sett
     assert labelled(copy_id, "network")
     p.tend_copies(copy_settings, locked=False)
     assert labelled(copy_id, "network") == []
+
+
+# spec: ANYM-449
+def test_the_recovery_catalog_holds_digests_never_a_catalog_value(tmp_path, monkeypatch):
+    host = MigrationHost(tmp_path, monkeypatch, {"051_synthetic_note.sql": NOTE})
+    setting = json.dumps({"k": ["role_setting", "", OWNER], "v": [f"app.dsn=postgresql://u:{DSN_MARKER}@h/d"]})
+    host.shape, host.shape_after = [*SHAPE_BEFORE, setting], [*SHAPE_AFTER, setting]
+    host.rehearsal["difference"] = p.catalog_difference(p.digested(p.catalog_map(host.shape)),
+                                                        p.digested(p.catalog_map(host.shape_after)))
+    assert host.deploy()["status"] == "deployed" and host.migration()["status"] == "migrated"
+    written = (host.state / NEWEST / "migration-catalog.json").read_text()
+    # A role setting, a default or a policy expression reaches the file only as a digest (Astra r2 F10).
+    assert DSN_MARKER not in written and "postgresql://" not in written and "synthetic_note" in written

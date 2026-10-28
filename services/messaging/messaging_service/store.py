@@ -50,13 +50,22 @@ class ExpandError(Exception):
         super().__init__(code)
 
 
-def expand_connection(dsn):
-    """The only connection of migrate-expand (ANYM-596): its budgets, `public` only and no notices, read back."""
+# The database a connection reached: cluster system identifier, database name and OID (ANYM-449).
+EXPAND_IDENTITY=("SELECT ARRAY[(SELECT system_identifier::text FROM pg_control_system()),current_database()::text,"
+    "(SELECT oid::text FROM pg_database WHERE datname=current_database())] AS identity")
+
+
+def expand_connection(dsn, application_name=None):
+    """The only connection of migrate-expand (ANYM-596): its budgets, `public` only and no notices, read back.
+    `application_name` overrides one the DSN names, so deploy finds this session by it (ANYM-449)."""
     c=psycopg.connect(dsn,row_factory=dict_row,prepare_threshold=None,connect_timeout=5,
         options='-c lock_timeout=2000 -c statement_timeout=4000 -c transaction_timeout=4000 -c search_path=public '
-                '-c client_min_messages=error -c timezone=UTC')
+                '-c client_min_messages=error -c timezone=UTC',
+        **({'application_name':application_name} if application_name else {}))
     try:
         if [c.execute(f'SHOW {name}').fetchone()[name] for name in EXPAND_SETTINGS]!=list(EXPAND_SETTINGS.values()):
+            raise ExpandError('settings_refused')
+        if application_name and c.execute('SHOW application_name').fetchone()['application_name']!=application_name:
             raise ExpandError('settings_refused')
     except BaseException:
         c.close(); raise
@@ -81,25 +90,27 @@ def expand_code(run):
         raise ExpandError('failed') from None
 
 
-def expand_status(dsn):
+def expand_status(dsn, application_name=None):
     def run():
-        c=expand_connection(dsn)
+        c=expand_connection(dsn,application_name)
         try: return {'schema_version':ledger_version(c)}
         finally: c.close()
     return expand_code(run)
 
 
-def migrate_expand(dsn, plan, *, root=None, before_commit=None):
+def migrate_expand(dsn, plan, *, root=None, before_commit=None, application_name=None):
     """Applies only DROP-free expand migrations and appended role grants in one bounded transaction on one
     connection, or nothing (ANYM-596). Never schema.sql, lock_replay_tables or the ACL repair of migrate().
-    Raises ExpandError with a fixed code; `before_commit(c)` is a test hook."""
+    A plan `identity` (EXPAND_IDENTITY of the database deploy copied) must be what this connection reached before
+    anything else runs (ANYM-449). Raises ExpandError with a fixed code; `before_commit(c)` is a test hook."""
     from . import migration_rollout as rollout
     root=Path(root) if root else Path(__file__).parent
     files={int(p.name[:3]):p for p in root.joinpath('migrations').glob('[0-9][0-9][0-9]_*.sql')}
     roles={p.name:p.read_bytes() for p in root.glob('*_role.sql')}
     try:
-        base,target,prefixes=plan['base'],plan['target'],plan['roles']
-        valid=(all(type(v) is int for v in (base,target)) and base<=target==max(files) and type(prefixes) is dict
+        base,target,prefixes,identity=plan['base'],plan['target'],plan['roles'],plan.get('identity')
+        valid=((identity is None or type(identity) is list and len(identity)==3 and all(type(i) is str for i in identity))
+            and all(type(v) is int for v in (base,target)) and base<=target==max(files) and type(prefixes) is dict
             and set(prefixes)==set(roles) and all(type(p) is dict and type(p.get('bytes')) is int
             and 0<=p['bytes']<=len(roles[n]) and type(p.get('sha256')) is str for n,p in prefixes.items()))
     except (KeyError,TypeError,ValueError):
@@ -116,8 +127,10 @@ def migrate_expand(dsn, plan, *, root=None, before_commit=None):
     pending=[(v,files[v].read_bytes()) for v in sorted(files) if base<v<=target]
 
     def run():
-        c=expand_connection(dsn)
+        c=expand_connection(dsn,application_name)
         try:
+            if identity is not None and c.execute(EXPAND_IDENTITY).fetchone()['identity']!=identity:
+                raise ExpandError('identity_mismatch')
             if not c.execute('SELECT pg_try_advisory_xact_lock(74509137) AS locked').fetchone()['locked']:
                 raise ExpandError('busy')
             if ledger_version(c)!=base: raise ExpandError('ledger_mismatch')

@@ -650,7 +650,8 @@ Phases, each a pause or a wait before any production write:
    row counts of extensions, publications, subscriptions, casts, operators, access methods, languages,
    foreign servers, extended statistics and text search) before and after must differ only by new tables
    with their columns, indexes, constraints, sequences, policies and ACL items, nullable or constant-default
-   columns on existing tables and added ACL items; `probe_metadata` only by `schema_version`;
+   columns on existing tables (a literal whose stored expression holds only constants, relabels and
+   built-in immutable casts; a user's cast prints as a literal too and does not count) and added ACL items; `probe_metadata` only by `schema_version`;
    `archive_migrations` only by the pending versions; and no other existing table may show a write in
    `pg_stat_user_tables`. Its transaction (from `applied_at` to the first read after the container ended)
    takes at most `rehearsal_limit_ms`. Else the run pauses "not additive: <first difference>" or "too slow
@@ -659,13 +660,16 @@ Phases, each a pause or a wait before any production write:
 5. Final gate: admission and the producer check again, the live catalog still the copy's (else "the
    database changed shape since its copy"), and the owner DSN file reaches that same database: the
    candidate image reads `[system identifier, database name, OID]` through it, and `docker exec` reads the
-   same on the copied container (else "the owner DSN file does not reach the copied database").
-6. Apply: `<sha>/migration-catalog.json` (the live catalog at the copy and the rehearsal's change, schema
-   only) and then `<sha>/migration.json` `planned` are fsynced; `docker run --rm --name
+   same on the copied container (else "the owner DSN file does not reach the copied database"). The plan
+   file carries that identity, and `migrate-expand` checks it again on its one connection before anything
+   runs (`identity_mismatch`); the rehearsal's plan carries the scratch database's.
+6. Apply: `<sha>/migration-catalog.json` (SHA-256 digests of the live catalog at the copy and the
+   rehearsal's change between digests: object names, never a definition, default or setting) and then `<sha>/migration.json` `planned` are fsynced; `docker run --rm --name
    deedkit-migrate-<sha12> --log-driver none --read-only --user 10001:10001 --cap-drop ALL --security-opt
    no-new-privileges --pids-limit 64 --memory 512m -e PGAPPNAME=deedkit-migrate-<sha12>` on the database
-   network runs `migrate-expand` once (30 s; past it the container is killed). The outcome is read only once
-   that container is gone and no live session carries its name (else `uncertain`): `--status` shows the
+   network runs `migrate-expand` once (30 s; past it the container is killed). Its connection takes that
+   application name over any the DSN names and reads it back. The outcome is read only once that container
+   is gone and no live session carries its name (else `uncertain`): `--status` shows the
    target, the live ledger the candidate's checksums and the live catalog changed exactly as in the
    rehearsal: `migrated`, and plan A and plan B follow at once. Ledger and catalog unchanged: `not-applied`
    ("did not apply"); ledger moved, catalog different: `diverged`; anything else `uncertain`; each a pause.

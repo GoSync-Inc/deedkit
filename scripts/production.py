@@ -2443,7 +2443,7 @@ MIGRATION_WAITS = 3
 MIGRATE_TIMEOUT = 30
 REHEARSAL_LIMIT_MS = 1000
 EXPAND_CODES = ("busy", "settings_refused", "plan_invalid", "ledger_mismatch", "not_unattended", "role_not_additive",
-                "prefix_mismatch", "lock_timeout", "statement_timeout", "transaction_timeout", "failed")
+                "prefix_mismatch", "identity_mismatch", "lock_timeout", "statement_timeout", "transaction_timeout", "failed")
 MIGRATE_FLAGS = ("--log-driver", "none", "--read-only", "--user", "10001:10001", "--cap-drop", "ALL", "--security-opt",
                  "no-new-privileges", "--pids-limit", "64", "--memory", "512m")
 # The candidate's classifiers in the same isolated child as CLASSIFY: each added file's `unattended_class` and each
@@ -2491,7 +2491,12 @@ SELECT line FROM (
          relforcerowsecurity, reloptions, pg_get_userbyid(relowner), relpersistence, relispartition))::text FROM rel
   UNION ALL SELECT json_build_object('k', json_build_array('column', rel.name, a.attname), 'v', json_build_array(
          format_type(a.atttypid, a.atttypmod), a.attnotnull, pg_get_expr(d.adbin, d.adrelid), a.attidentity, a.attgenerated,
-         (SELECT collname FROM pg_collation WHERE oid = a.attcollation), d.adbin::text LIKE '{CONST %'))::text
+         (SELECT collname FROM pg_collation WHERE oid = a.attcollation), d.adbin IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM regexp_matches(d.adbin::text, '\{([A-Z_]+)', 'g') node
+                          WHERE node[1] NOT IN ('CONST', 'FUNCEXPR', 'RELABELTYPE'))
+         AND NOT EXISTS (SELECT 1 FROM regexp_matches(d.adbin::text, ':funcid ([0-9]+)', 'g') called
+                          LEFT JOIN pg_proc f ON f.oid = called[1]::oid
+                          WHERE f.oid IS NULL OR f.oid >= 16384 OR f.provolatile <> 'i')))::text
     FROM pg_attribute a JOIN rel ON rel.oid = a.attrelid LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
    WHERE a.attnum > 0 AND NOT a.attisdropped AND rel.relkind IN ('r', 'p', 'v', 'm', 'f', 'c')
   UNION ALL SELECT json_build_object('k', json_build_array('constraint', coalesce(rel.name, typ.name), co.conname), 'v',
@@ -2652,9 +2657,9 @@ def unattended_plan(settings, mirror, base, candidate, sql):
                       for name, data in prefixes.items()}}
 
 
-def expand_plan(plan):
-    """The plan file migrate-expand reads (ANYM-596)."""
-    return {"base": plan["base"], "target": plan["target"], "roles": plan["roles"]}
+def expand_plan(plan, identity):
+    """The plan file migrate-expand reads (ANYM-596), with the identity of the database it must reach (ANYM-449)."""
+    return {"base": plan["base"], "target": plan["target"], "roles": plan["roles"], "identity": identity}
 
 
 def live_lines(source, step, text):
@@ -2686,6 +2691,12 @@ def catalog_map(lines):
     return rows
 
 
+def digested(rows):
+    """{key: sha256 of its value}: what migration-catalog.json keeps and what recovery compares; a catalog value
+    (a default, a policy expression, a role setting) never reaches a file (Astra r2 F10)."""
+    return {key: hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest() for key, value in rows.items()}
+
+
 def catalog_difference(before, after):
     """What changed between two catalog maps, canonically ordered: what the rehearsal and production compare."""
     order = json.dumps
@@ -2695,8 +2706,10 @@ def catalog_difference(before, after):
             "added": sorted(([list(key), after[key]] for key in after.keys() - before.keys()), key=order)}
 
 
-# A literal default as pg_get_expr prints it, with the casts PostgreSQL adds ('x'::text, 0, (-1), '{}'::jsonb): no
-# function runs, so ADD COLUMN stores it once and rewrites nothing.
+# A literal default as pg_get_expr prints it, with the casts PostgreSQL adds ('x'::text, 0, (-1), '{}'::jsonb). The
+# printed text hides implicit casts, so the column's last CATALOG value must also say that its expression tree holds
+# only constants, relabels and built-in immutable functions (a user's assignment cast prints as `0` too, Astra r2 F5):
+# ADD COLUMN then stores it once and rewrites nothing.
 LITERAL_DEFAULT = re.compile(r"(?:'(?:[^']|'')*'|-?[0-9]+(?:\.[0-9]+)?|\(-[0-9]+(?:\.[0-9]+)?\)|true|false)"
                              r"(?:::[a-z][a-z0-9_ ]*(?:\([0-9]+(?:,[0-9]+)?\))?(?:\[\])?)*")
 
@@ -2725,7 +2738,7 @@ def not_additive(before, after):
         elif kind == "column":
             allowed = key[1] in tables or ((before.get(("relation", key[1])) or [None])[0] in ("r", "p")
                                            and not value[3] and not value[4]
-                                           and (value[6] is True or bool(LITERAL_DEFAULT.fullmatch(value[2]))
+                                           and (value[6] is True and bool(LITERAL_DEFAULT.fullmatch(value[2]))
                                                 if value[2] is not None else not value[1]))
         elif kind == "constraint":
             allowed = key[1] in tables or (value[0] == "n" and bool(value[3])
@@ -2863,12 +2876,13 @@ def rehearse(copied, plan, image, limit):
     run(["docker", "network", "disconnect", "none", scratch], timeout=60)
     run(["docker", "network", "connect", network, scratch], timeout=60)
     before = catalog_map(scratch_lines(copy, copied, "before", CATALOG))
+    identity = json.loads(scratch_lines(copy, copied, "identity", IDENTITY_SQL + ";")[0])
     data = stable_data(copy, copied)
     directory = Path(copy["directory"])
     dsn, plan_file = directory / "rehearsal.dsn", directory / "rehearsal-plan.json"
     # Trust on the internal network: the DSN names no password. Image user 10001 reads both files.
     for path, text in ((dsn, f"postgresql://{copy['source']['owner']}@{scratch}:5432/{copied['database']}\n"),
-                       (plan_file, json.dumps(expand_plan(plan)) + "\n")):
+                       (plan_file, json.dumps(expand_plan(plan, identity)) + "\n")):
         path.write_text(text)
         path.chmod(0o644)
     container = network + "-migrate"
@@ -2887,7 +2901,7 @@ def rehearse(copied, plan, image, limit):
     after = catalog_map(scratch_lines(copy, copied, "after", CATALOG))
     if reason := not_additive(before, after) or data_unchanged(data, after_data, plan):
         raise MigrationRefused("not additive: " + reason)
-    return {"took_ms": took, "difference": catalog_difference(before, after)}
+    return {"took_ms": took, "difference": catalog_difference(digested(before), digested(after))}
 
 
 def producer_reads(settings, mirror, target):
@@ -2950,7 +2964,8 @@ def migration_outcome(settings, plan, candidate, image, expected):
     """Once the migration container and its session are confirmed gone: `migrated` when --status shows the target, the
     live ledger the candidate's checksums and the live catalog changed exactly as the rehearsal did; `not-applied`
     when ledger and catalog are still the copy's; `diverged` when the ledger moved but the catalog differs; else
-    `uncertain`. `expected` is migration-catalog.json: the live catalog lines at the copy and the rehearsal's change."""
+    `uncertain`. `expected` is migration-catalog.json: the digests of the live catalog at the copy and the
+    rehearsal's change between digests."""
     unattended, source = unattended_settings(settings), copy_source(settings, AUTO_DATABASE)[0]
     if not migration_settled(source, "deedkit-migrate-" + candidate[:12]):
         return "uncertain"
@@ -2958,7 +2973,8 @@ def migration_outcome(settings, plan, candidate, image, expected):
                         status=True)
     try:
         version, applied = live_ledger(source)
-        effect = catalog_difference(catalog_map(expected["before"]), catalog_map(live_lines(source, "effect", CATALOG)))
+        effect = catalog_difference({tuple(key): value for key, value in expected["before"]},
+                                    digested(catalog_map(live_lines(source, "effect", CATALOG))))
     except (Refused, ValueError, KeyError, TypeError):
         return "uncertain"
     at_target = (answer == {"schema_version": plan["target"]} == {"schema_version": version}
@@ -3040,16 +3056,18 @@ def migrate(settings, http, plan, mirror, base, serving, candidate, release):
     source = copy_source(settings, AUTO_DATABASE)[0]
     if hashlib.sha256("\n".join(live_lines(source, "shape", CATALOG)).encode()).hexdigest() != copied["catalog_sha256"]:
         raise refused("the database changed shape since its copy", "final gate")
-    # The DSN the migration uses must reach the database that was copied and gated, not another one (Astra r1 F3).
+    # The DSN the migration uses must reach the database that was copied and gated, not another one (Astra r1 F3); its
+    # one connection checks the same identity again before anything runs (Astra r2 F3).
     identity = json.loads(live_lines(source, "identity", IDENTITY_SQL + ";")[0])
     if database_identity("deedkit-identity-" + candidate[:12], image, unattended["network"],
                          unattended["dsn_file"]) != identity:
         raise refused("the owner DSN file does not reach the copied database", "final gate")
     plan_file = release / "migrate-plan.json"
-    plan_file.write_text(json.dumps(expand_plan(plan)) + "\n")
+    plan_file.write_text(json.dumps(expand_plan(plan, identity)) + "\n")
     plan_file.chmod(0o644)
-    # The recovery evidence first: the live catalog the gate read and the change the rehearsal made (schema only).
-    expected = {"before": copied["catalog"], "difference": rehearsal["difference"]}
+    # The recovery evidence first: digests of the live catalog the gate read and the change the rehearsal made.
+    expected = {"before": sorted(([list(key), value] for key, value in digested(catalog_map(copied["catalog"])).items()),
+                                 key=json.dumps), "difference": rehearsal["difference"]}
     write_record(release / "migration-catalog.json", expected)
     migration_receipt(release, plan, "planned", copy=copied["id"], rehearsal_ms=rehearsal["took_ms"])
     try:
