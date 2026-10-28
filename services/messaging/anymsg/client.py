@@ -121,10 +121,10 @@ def _upload_receipt(value, metadata, *, upload_id=None, offset=None):
 _MESSENGER_FIELDS = {
     'list_messenger_operations': ({'account'}, {'account'}),
     'preview_messenger_operation': ({'account', 'operation'},
-        {'account', 'operation', 'chat_id', 'message_id', 'expected_revision', 'parameters'}),
+        {'account', 'operation', 'chat_id', 'message_id', 'expected_revision', 'parameters', 'request_id'}),
     'execute_messenger_operation': ({'account', 'operation', 'request_id'},
         {'account', 'operation', 'chat_id', 'message_id', 'expected_revision', 'parameters',
-         'request_id', 'preview_digest'}),
+         'request_id', 'preview_digest', 'wait_s'}),
     'get_messenger_operation': ({'operation_id'}, {'operation_id'}),
 }
 _OMITTED = object()
@@ -277,6 +277,8 @@ def _messenger_parameters(operation, parameters):
         elif name == 'parameters':
             if not isinstance(value, dict) or any(type(key) is not str for key in value):
                 raise ValueError('invalid_parameters')
+        elif name == 'wait_s':
+            _wait_seconds(value)
         elif type(value) is not str:
             raise ValueError('invalid_parameters')
     return parameters
@@ -357,7 +359,7 @@ class Client:
             _subscription_parameters(operation,parameters)
         if operation in _FEEDBACK_FIELDS:
             _feedback_parameters(operation,parameters)
-        if operation=='send_message' and 'wait_s' in parameters:
+        if operation in ('send_message','execute_messenger_operation') and 'wait_s' in parameters:
             _wait_seconds(parameters['wait_s'])
             if parameters['wait_s']==0:
                 parameters={name:value for name,value in parameters.items() if name!='wait_s'}
@@ -547,24 +549,30 @@ class Client:
         return self.call('list_messenger_operations', {'account': account})
 
     def preview_messenger_operation(self, *, account, operation, chat_id='', message_id='',
-                                   expected_revision=0, parameters=_OMITTED):
-        """Passively validate intent. A preview digest is not human approval."""
+                                   expected_revision=0, parameters=_OMITTED, request_id=_OMITTED):
+        """Passively validate intent. A preview digest is not human approval.
+
+        request_id (ANYM-549) is accepted so preview and execute share arguments; it is
+        ignored and sent only when given, so older servers keep taking the call.
+        """
         return self.call('preview_messenger_operation', dict(account=account, operation=operation,
             chat_id=chat_id, message_id=message_id, expected_revision=expected_revision,
-            parameters={} if parameters is _OMITTED else parameters))
+            parameters={} if parameters is _OMITTED else parameters,
+            **({} if request_id is _OMITTED else {'request_id': request_id})))
 
     def execute_messenger_operation(self, *, account, operation, request_id, chat_id='',
                                    message_id='', expected_revision=0, parameters=_OMITTED,
-                                   preview_digest=''):
+                                   preview_digest='', wait_s=0):
         """Queue exact confirmed intent; poll the receipt and never retry ambiguous effects.
 
         Named live-read permissions are separate. For every mutation, the acting
         agent obtains exact owner confirmation; the digest only binds the payload.
+        wait_s (0-25 s, ANYM-549) waits for the receipt; 0 is not sent.
         """
         return self.call('execute_messenger_operation', dict(account=account, operation=operation,
             chat_id=chat_id, message_id=message_id, expected_revision=expected_revision,
             parameters={} if parameters is _OMITTED else parameters,
-            request_id=request_id, preview_digest=preview_digest))
+            request_id=request_id, preview_digest=preview_digest, **({'wait_s': wait_s} if wait_s else {})))
 
     def get_messenger_operation(self, *, operation_id):
         """Read this key's scoped operation receipt without invoking the provider again."""

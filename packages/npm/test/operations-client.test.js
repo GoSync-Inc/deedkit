@@ -74,3 +74,23 @@ for(const code of ['unsupported_operation','invalid_operation_parameters','opera
       error=>error instanceof AnyMsgError&&error.code===code&&!String(error).includes('synthetic-private-content'));
     assert.equal(calls,1);
   });
+
+// spec: ANYM-549
+test('preview takes request_id and execute takes a bounded wait_s, zero omitted',async()=>{
+  const captured=[];
+  const client=new AnyMsgClient({...options,fetch:async(url,request)=>{
+    captured.push([String(url),JSON.parse(request.body)]);
+    return Response.json({status:'queued'});
+  }});
+  const preview={...methods.previewMessengerOperation[1],request_id:'synthetic-action'};
+  const execute=methods.executeMessengerOperation[1];
+  await client.previewMessengerOperation(preview);
+  await client.executeMessengerOperation({...execute,wait_s:5});
+  await client.executeMessengerOperation({...execute,wait_s:0});
+  await client.call('execute_messenger_operation',{...execute,wait_s:0});
+  assert.deepEqual(captured.map(([,body])=>body),[preview,{...execute,wait_s:5},execute,execute]);
+  for (const wait_s of ['5',-1,26,Number.NaN,null])
+    assert.throws(()=>client.executeMessengerOperation({...execute,wait_s}),TypeError);
+  assert.throws(()=>client.previewMessengerOperation({...preview,wait_s:5}),TypeError);
+  assert.throws(()=>client.previewMessengerOperation({...preview,request_id:7}),TypeError);
+});

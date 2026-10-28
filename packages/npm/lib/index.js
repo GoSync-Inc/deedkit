@@ -126,9 +126,10 @@ async function hashFile(handle,size,signal) {
 const MESSENGER_FIELDS = Object.freeze({
   list_messenger_operations: [['account'],['account']],
   preview_messenger_operation: [['account','operation'],
-    ['account','operation','chat_id','message_id','expected_revision','parameters']],
+    ['account','operation','chat_id','message_id','expected_revision','parameters','request_id']],
   execute_messenger_operation: [['account','operation','request_id'],
-    ['account','operation','chat_id','message_id','expected_revision','parameters','request_id','preview_digest']],
+    ['account','operation','chat_id','message_id','expected_revision','parameters','request_id','preview_digest',
+     'wait_s']],
   get_messenger_operation: [['operation_id'],['operation_id']],
 });
 const SUBSCRIPTION_FIELDS = Object.freeze({
@@ -201,7 +202,13 @@ function messengerArguments(method,args) {
     } else if (key === 'parameters') {
       if (!plainObject(value) || !operationJson(value))
         throw new TypeError('Operation parameters must be an object with string keys');
-    } else if (typeof value !== 'string') throw new TypeError('Operation fields must be strings');
+    } else if (key === 'wait_s') waitSeconds(value);
+    else if (typeof value !== 'string') throw new TypeError('Operation fields must be strings');
+  }
+  // ANYM-549: wait_s=0 is not sent, so a server from before execute's wait keeps taking the call.
+  if (args.wait_s === 0) {
+    const {wait_s,...compatible}=args;
+    return compatible;
   }
   return args;
 }
@@ -401,7 +408,7 @@ export class AnyMsgClient {
     if (!METHODS.includes(method)) throw new TypeError('Unknown AnyMsg operation');
     if (!arguments_ || typeof arguments_ !== 'object' || Array.isArray(arguments_) || 'token' in arguments_)
       throw new TypeError('Arguments must be an object without a token field');
-    if (Object.hasOwn(MESSENGER_FIELDS,method)) messengerArguments(method,arguments_);
+    if (Object.hasOwn(MESSENGER_FIELDS,method)) arguments_=messengerArguments(method,arguments_);
     if (Object.hasOwn(SUBSCRIPTION_FIELDS,method)) subscriptionArguments(method,arguments_);
     if (Object.hasOwn(FEEDBACK_FIELDS,method)) feedbackArguments(method,arguments_);
     if (method==='send_message') arguments_=sendWaitArguments(arguments_);
