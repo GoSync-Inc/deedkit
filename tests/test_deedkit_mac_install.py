@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import secrets
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -747,6 +748,35 @@ def test_a_url_with_an_at_sign_in_its_path_or_a_terminal_dot_installs_and_uninst
     assert site.run("uninstall", "clone")[0] == 0 and site.config()["mcpServers"] == {}
     site.config_file.write_text(json.dumps({"mcpServers": {"deedkit-clone": site.entry(url="https://gateway.example.com./mcp")}}))
     assert site.run("uninstall", "clone")[0] == 0 and site.config()["mcpServers"] == {}
+
+
+# spec: ANYM-498
+def test_an_ipv6_literal_without_a_port_is_sent_to_the_scheme_port(site, monkeypatch):
+    # Sol r3: without an explicit port http.client read the last IPv6 group as a port and raised after the writes.
+    opened = []
+
+    class Refusing(mac.http.client.HTTPConnection):
+        def __init__(self, host, port=None, **kwargs):
+            super().__init__(host, port, **kwargs)
+            opened.append((self.host, self.port))
+
+        def connect(self):
+            raise ConnectionRefusedError
+
+    monkeypatch.setattr(mac.http.client, "HTTPConnection", Refusing)
+    url = "http://[::1]/team@work/mcp"
+    assert site.install(url=url) == (1, "", f"cannot reach the gateway at {url}: ConnectionRefusedError\n")
+    assert opened == [("::1", 80), ("::1", 80)] and site.calls("claude") == [] and site.lock_is_free()
+    # Orchestrator r4 scope: the connection target is built in the preflight, so a URL http.client rejects refuses
+    # before the fetch with no file on disk.
+    shutil.rmtree(site.home / ".config")
+
+    def rejecting(*args, **kwargs):
+        raise mac.http.client.InvalidURL("nonnumeric port")
+
+    monkeypatch.setattr(mac.http.client, "HTTPConnection", rejecting)
+    assert site.install(url=url) == (1, "", mac.BAD_URL + "\n")
+    assert len(site.calls("ssh")) == 1 and not (site.home / ".config").exists()
 
 
 # spec: ANYM-498

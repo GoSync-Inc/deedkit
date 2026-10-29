@@ -102,6 +102,10 @@ def valid_url(url: str) -> bool:
             return False
     if port == 0 or "@" in parts.netloc or not URL_PATH.fullmatch(parts.path):
         return False
+    try:  # the connection target the proof builds, checked before any fetch or write (no I/O here)
+        http.client.HTTPConnection(host, port or (443 if parts.scheme == "https" else 80))
+    except (ValueError, http.client.HTTPException):
+        return False
     return parts.scheme == "https" or (parts.scheme == "http" and loopback(host))
 
 
@@ -326,12 +330,16 @@ def exchange(url: str, authorization: str) -> tuple[int, bytes]:
     on the deadline its socket is shut down and the run refuses, so the lock is released (a lookup still stalled in
     DNS ends with the process)."""
     parts = urlsplit(url)
-    host, done = parts.hostname or "", {}
-    if parts.scheme == "https":
-        connection = http.client.HTTPSConnection(host, parts.port, timeout=HTTP_TIMEOUT,
-                                                 context=ssl.create_default_context())
-    else:
-        connection = http.client.HTTPConnection(host, parts.port, timeout=HTTP_TIMEOUT)
+    # An explicit port: without one http.client reads the last group of an IPv6 literal as a port (Sol r3).
+    host, port, done = parts.hostname or "", parts.port or (443 if parts.scheme == "https" else 80), {}
+    try:
+        if parts.scheme == "https":
+            connection = http.client.HTTPSConnection(host, port, timeout=HTTP_TIMEOUT,
+                                                     context=ssl.create_default_context())
+        else:
+            connection = http.client.HTTPConnection(host, port, timeout=HTTP_TIMEOUT)
+    except (ValueError, http.client.HTTPException) as exc:
+        raise Refused(f"cannot reach the gateway at {url}: {type(exc).__name__}") from None
 
     def work() -> None:
         try:
