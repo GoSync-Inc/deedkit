@@ -90,12 +90,15 @@ SET LOCAL lock_timeout=DEFAULT;
 -- its rule (ref, time, token, enumeration, integer range, changed list), the subject equal to the
 -- type's subject key, the id's module equal to the source's, data at most 1024 bytes, the
 -- urgency and expiry rules, and every time (occurrence, expiry, data) finite and between
--- 1970-01-01 and 9999-12-30 UTC, so a reader can always decode it. References only: no free text
--- fits any rule.
+-- 1970-01-01 and 9999-12-30 UTC, so a reader can always decode it. Every time arrives as text and
+-- passes the text rule of module_events._TIME before any cast (hours 00-23, minutes and seconds
+-- 00-59, offsets up to 15:59), so both validators accept the same strings. References only: no
+-- free text fits any rule.
 CREATE FUNCTION public.module_event_valid(p_id text, p_source text, p_type text, p_subject text,
-  p_time timestamptz, p_data jsonb, p_urgency text, p_expires_at timestamptz) RETURNS boolean
+  p_time text, p_data jsonb, p_urgency text, p_expires_at text) RETURNS boolean
  LANGUAGE plpgsql STABLE SET search_path=pg_catalog AS $$
-DECLARE spec jsonb; rule text; item record; v jsonb; parts text[];
+DECLARE spec jsonb; rule text; item record; v jsonb; parts text[]; t timestamptz; x timestamptz;
+ pattern constant text := '^(19[7-9][0-9]|[2-9][0-9]{3})-\d{2}-\d{2}T([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d{1,6})?(Z|[+-](0\d|1[0-5]):[0-5]\d)$';
  specs constant jsonb := '{
   "calendar.event.created": {"subject": "event_ref", "optional": [], "keys": {"calendar_ref": "ref",
    "event_ref": "ref", "start_at": "time", "version": "int:0:9007199254740991"}},
@@ -117,6 +120,13 @@ DECLARE spec jsonb; rule text; item record; v jsonb; parts text[];
   "call.owner_request": {"subject": "call_id", "optional": [], "keys": {"call_id": "ref",
    "decision_id": "ref", "state": "enum:pending"}}}';
 BEGIN
+ -- The casts only after the text is known to parse (no OR evaluation order is relied on).
+ IF p_time IS NULL OR p_time !~ pattern OR NOT pg_input_is_valid(p_time,'timestamptz') THEN RETURN false; END IF;
+ t := p_time::timestamptz;
+ IF p_expires_at IS NOT NULL THEN
+  IF p_expires_at !~ pattern OR NOT pg_input_is_valid(p_expires_at,'timestamptz') THEN RETURN false; END IF;
+  x := p_expires_at::timestamptz;
+ END IF;
  spec := specs->p_type;
  IF spec IS NULL OR p_data IS NULL OR jsonb_typeof(p_data)<>'object' OR octet_length(p_data::text)>1024
    OR p_id IS NULL OR p_id !~ '^(calendar|calls):[1-9][0-9]{0,15}$'
@@ -124,9 +134,8 @@ BEGIN
    OR length(split_part(p_id,':',2))=16 AND split_part(p_id,':',2) COLLATE "C">'9007199254740991'
    OR split_part(p_id,':',1) IS DISTINCT FROM split_part(p_source,':',2)
    OR p_urgency IS NULL OR p_urgency NOT IN ('now','batch')
-   OR p_time IS NULL OR NOT isfinite(p_time) OR p_time NOT BETWEEN '1970-01-01Z' AND '9999-12-30Z'
-   OR p_expires_at IS NOT NULL AND (NOT isfinite(p_expires_at)
-     OR p_expires_at NOT BETWEEN '1970-01-01Z' AND '9999-12-30Z')
+   OR t NOT BETWEEN '1970-01-01Z' AND '9999-12-30Z'
+   OR x NOT BETWEEN '1970-01-01Z' AND '9999-12-30Z'
    OR p_subject IS DISTINCT FROM p_data->>(spec->>'subject')
    OR jsonb_typeof(p_data->(spec->>'subject')) IS DISTINCT FROM 'string' THEN
   RETURN false;
@@ -151,7 +160,7 @@ BEGIN
   END IF;
   IF rule='time' THEN
    -- The cast only after the text is known to parse (no OR evaluation order is relied on).
-   IF v#>>'{}' !~ '^(19[7-9][0-9]|[2-9][0-9]{3})-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})$'
+   IF v#>>'{}' !~ pattern
      OR NOT pg_input_is_valid(v#>>'{}','timestamptz') THEN
     RETURN false;
    END IF;
@@ -172,13 +181,13 @@ BEGIN
   END IF;
  END LOOP;
  IF p_type='call.owner_request' AND (p_urgency<>'now' OR p_expires_at IS NULL)
-   OR p_type='calendar.event.starting' AND (p_expires_at IS NULL
-     OR p_expires_at<>(p_data->>'start_at')::timestamptz) THEN
+   OR p_type='calendar.event.starting' AND (x IS NULL
+     OR x<>(p_data->>'start_at')::timestamptz) THEN
   RETURN false;
  END IF;
  RETURN true;
 END $$;
-REVOKE ALL ON FUNCTION public.module_event_valid(text,text,text,text,timestamptz,jsonb,text,timestamptz) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.module_event_valid(text,text,text,text,text,jsonb,text,text) FROM PUBLIC;
 
 -- The only module journal write. Fixed search_path, no PUBLIC execute; it inserts one module_events
 -- row and touches no message table, link, source or subscription. A retry with the same id and the
@@ -186,7 +195,7 @@ REVOKE ALL ON FUNCTION public.module_event_valid(text,text,text,text,timestamptz
 -- locked first, so concurrent publishers serialize on it and a failed insert rolls the step back:
 -- the sequence stays gapless.
 CREATE FUNCTION public.publish_module_event(p_id text, p_source text, p_type text, p_subject text,
-  p_scope_ref text, p_time timestamptz, p_data jsonb, p_urgency text, p_expires_at timestamptz)
+  p_scope_ref text, p_time text, p_data jsonb, p_urgency text, p_expires_at text)
  RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
 DECLARE stored public.module_events; seq bigint;
 BEGIN
@@ -197,17 +206,19 @@ BEGIN
  SELECT * INTO stored FROM public.module_events WHERE event_key=p_id;
  IF FOUND THEN
   IF (stored.source,stored.type,stored.subject,stored.scope_ref,stored.occurred_at,stored.data,stored.urgency,stored.expires_at)
-    IS NOT DISTINCT FROM (p_source,p_type,p_subject,p_scope_ref,p_time,p_data,p_urgency,p_expires_at) THEN
+    IS NOT DISTINCT FROM (p_source,p_type,p_subject,p_scope_ref,p_time::timestamptz,p_data,p_urgency,
+      p_expires_at::timestamptz) THEN
    RETURN stored.seq;
   END IF;
   RAISE EXCEPTION 'module_event_conflict' USING ERRCODE='unique_violation';
  END IF;
  UPDATE public.module_event_counter SET value=value+1 WHERE id=1 RETURNING value INTO seq;
  INSERT INTO public.module_events(seq,event_key,source,type,subject,scope_ref,occurred_at,data,urgency,expires_at)
-  VALUES(seq,p_id,p_source,p_type,p_subject,p_scope_ref,p_time,p_data,p_urgency,p_expires_at);
+  VALUES(seq,p_id,p_source,p_type,p_subject,p_scope_ref,p_time::timestamptz,p_data,p_urgency,
+   p_expires_at::timestamptz);
  RETURN seq;
 END $$;
-REVOKE ALL ON FUNCTION public.publish_module_event(text,text,text,text,text,timestamptz,jsonb,text,timestamptz)
+REVOKE ALL ON FUNCTION public.publish_module_event(text,text,text,text,text,text,jsonb,text,text)
  FROM PUBLIC;
 
 -- The router's reachability report: the first failure keeps its time, a success clears it.

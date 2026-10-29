@@ -20,7 +20,7 @@ _REF = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}')
 _SCOPE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,255}')
 _TOKEN = re.compile(r'[a-z][a-z0-9_]{0,47}')
 _ID = re.compile(r'(calendar|calls):([1-9][0-9]{0,15})')
-_TIME = re.compile(r'(19[7-9][0-9]|[2-9][0-9]{3})-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})')
+_TIME = re.compile(r'(19[7-9][0-9]|[2-9][0-9]{3})-\d{2}-\d{2}T([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d{1,6})?(Z|[+-](0\d|1[0-5]):[0-5]\d)')
 # Every time is finite and inside this range (UTC), so every reader decodes it; the definer function
 # enforces the same bounds.
 _EARLIEST = datetime(1970, 1, 1, tzinfo=timezone.utc)

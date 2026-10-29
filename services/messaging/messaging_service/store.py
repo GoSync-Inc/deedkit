@@ -1487,10 +1487,10 @@ class Store:
                 END IF;
                 -- ANYM-562: the module journal's only writers and the matcher's hint gate.
                 IF pg_has_role((SELECT proowner FROM pg_proc WHERE oid=to_regprocedure(
-                    'public.publish_module_event(text,text,text,text,text,timestamptz,jsonb,text,timestamptz)')),'USAGE') THEN
-                 REVOKE ALL ON FUNCTION public.publish_module_event(text,text,text,text,text,timestamptz,jsonb,text,timestamptz),
+                    'public.publish_module_event(text,text,text,text,text,text,jsonb,text,text)')),'USAGE') THEN
+                 REVOKE ALL ON FUNCTION public.publish_module_event(text,text,text,text,text,text,jsonb,text,text),
                   public.report_module_reachability(text,boolean),
-                  public.module_event_valid(text,text,text,text,timestamptz,jsonb,text,timestamptz),
+                  public.module_event_valid(text,text,text,text,text,jsonb,text,text),
                   public.module_hints_ready(),public.subscription_module_fence() FROM PUBLIC;
                 END IF;
             END $$''')

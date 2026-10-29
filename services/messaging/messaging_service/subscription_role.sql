@@ -50,6 +50,6 @@ GRANT UPDATE(matched_through,hinted_through,retention_floor,blocked_reason,gap,m
     ON subscription_module_streams TO messaging_subscriptions;
 GRANT EXECUTE ON FUNCTION public.module_hints_ready() TO messaging_subscriptions;
 -- A restore runs without ACLs; the definer functions never stay open to PUBLIC.
-REVOKE ALL ON FUNCTION public.module_hints_ready(),public.publish_module_event(text,text,text,text,text,timestamptz,jsonb,text,timestamptz),
-    public.report_module_reachability(text,boolean),public.module_event_valid(text,text,text,text,timestamptz,jsonb,text,timestamptz),
+REVOKE ALL ON FUNCTION public.module_hints_ready(),public.publish_module_event(text,text,text,text,text,text,jsonb,text,text),
+    public.report_module_reachability(text,boolean),public.module_event_valid(text,text,text,text,text,jsonb,text,text),
     public.subscription_module_fence() FROM PUBLIC;

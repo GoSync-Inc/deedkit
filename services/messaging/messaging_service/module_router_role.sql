@@ -9,9 +9,9 @@ DO $$ BEGIN
 END $$;
 GRANT USAGE ON SCHEMA public TO messaging_module_router;
 -- A restore runs without ACLs and reopens functions to PUBLIC: only this role keeps EXECUTE.
-REVOKE ALL ON FUNCTION public.publish_module_event(text,text,text,text,text,timestamptz,jsonb,text,timestamptz),
-    public.report_module_reachability(text,boolean),public.module_event_valid(text,text,text,text,timestamptz,jsonb,text,timestamptz)
+REVOKE ALL ON FUNCTION public.publish_module_event(text,text,text,text,text,text,jsonb,text,text),
+    public.report_module_reachability(text,boolean),public.module_event_valid(text,text,text,text,text,jsonb,text,text)
     FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.publish_module_event(text,text,text,text,text,timestamptz,jsonb,text,timestamptz)
+GRANT EXECUTE ON FUNCTION public.publish_module_event(text,text,text,text,text,text,jsonb,text,text)
     TO messaging_module_router;
 GRANT EXECUTE ON FUNCTION public.report_module_reachability(text,boolean) TO messaging_module_router;

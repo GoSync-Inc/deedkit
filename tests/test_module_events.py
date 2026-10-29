@@ -476,7 +476,14 @@ def _mutations():
         'time_before_1970': {**finished, 'time': '1969-12-31T23:59:59Z'},
         'expiry_past_latest': {**finished, 'expires_at': '9999-12-31T23:59:59Z'},
         'start_before_1970': data(changed, start_at='1969-12-31T23:59:59Z'),
-        'start_infinite': data(changed, start_at='infinity')}
+        'start_infinite': data(changed, start_at='infinity'),
+        # Component limits PostgreSQL and Python parse differently: both validators refuse each one.
+        'valid_offset_15_59': {**finished, 'time': '2026-10-29T10:00:00+15:59'},
+        **{f'{field}_{label}': ({**finished, field: moment} if field != 'start' else data(changed, start_at=moment))
+            for field in ('time', 'expires_at', 'start') for label, moment in (
+                ('hour_24', '2026-10-29T24:00:00Z'), ('second_60', '2026-10-29T10:00:60Z'),
+                ('offset_minute_60', '2026-10-29T10:00:00+00:60'), ('offset_16', '2026-10-29T10:00:00+16:00'),
+                ('february_30', '2026-02-30T10:00:00Z'), ('no_offset', '2026-10-29T10:00:00'))}}
 
 
 # spec: ANYM-562
@@ -697,9 +704,9 @@ def test_restored_mixed_subscription_keeps_each_stream_and_reopens_no_function(m
         streams = c.execute('SELECT acked_through,matched_through FROM subscription_module_streams').fetchone()
     assert streams == {'acked_through': first, 'matched_through': second}
     assert [row['state'] for row in module_hints(store, sid)] == ['pending']
-    functions = ('public.publish_module_event(text,text,text,text,text,timestamptz,jsonb,text,timestamptz)',
+    functions = ('public.publish_module_event(text,text,text,text,text,text,jsonb,text,text)',
         'public.report_module_reachability(text,boolean)', 'public.module_hints_ready()',
-        'public.module_event_valid(text,text,text,text,timestamptz,jsonb,text,timestamptz)')
+        'public.module_event_valid(text,text,text,text,text,jsonb,text,text)')
     probe = 'anym562_probe_' + uuid4().hex[:10]
     with snapshot_restored(store, tmp_path) as restored:
         with restored.pool.connection() as c:
@@ -748,11 +755,14 @@ store.update_subscription(token, sid, version, action='resume')
 out['matched'] = match_subscriptions(store)
 out['dispatch'] = dispatch_hints(store, transport=lambda url, body, headers, **k: sent.append(json.loads(body)) or 204,
     resolver=lambda *x, **k: ['93.184.216.34'])
-out['updates'] = len(store.get_updates(a['old'], 'probe-previous')['items'])
+out['updates'] = [e['event_sequence'] for e in store.get_updates(a['old'], 'probe-previous')['items']]
 out['passive'] = store.get_subscription_events(token, sid)
 page = store.fetch_subscription_events(token, sid)
 out['fetch'] = page
 out['ack'] = store.ack_subscription_events(token, sid, page['receipt'], page['ack_version'])
+with store.pool.connection() as c:  # every match past the retention window, the module ones too
+    for table in ('subscription_matches', 'subscription_module_matches'):
+        c.execute(f"UPDATE {table} SET matched_at=matched_at-interval '30 days' WHERE subscription=%s", (sid,))
 out['sent'], out['pruned'] = sent, prune_subscriptions(store)
 store.close()
 print(json.dumps(out, default=str))
@@ -773,7 +783,9 @@ def _previous_source(tmp_path):
         subprocess.run(['git', 'fetch', '--quiet', '--depth=1', 'origin',
             PREVIOUS_RELEASE], cwd=root, capture_output=True, timeout=120)
     if missing():
-        pytest.skip(f'the deployed release {PREVIOUS_RELEASE} is not reachable; set ANYMSG_PREVIOUS_SOURCE')
+        # CI must carry the evidence: there an unreachable release fails; a local run may skip.
+        (pytest.fail if os.environ.get('CI') else pytest.skip)(
+            f'the deployed release {PREVIOUS_RELEASE} is not reachable; set ANYMSG_PREVIOUS_SOURCE')
     archive = subprocess.run(['git', 'archive', PREVIOUS_RELEASE, 'services/messaging'], cwd=root,
         capture_output=True, check=True).stdout
     tmp_path.mkdir()
@@ -809,9 +821,15 @@ def test_the_deployed_release_runs_beside_module_rows_after_the_documented_rollb
     newer = emit(store, 'demo-tg-2')
     files = tmp_path / 'previous-files'
     files.mkdir()
-    run = subprocess.run([sys.executable, '-c', PREVIOUS_DRIVER, str(source), json.dumps({
-        'dsn': os.environ['PROBE_TEST_DSN_FILE'], 'files': str(files), 'token': token, 'sid': sid, 'old': old,
-        'receipt': page['receipt'], 'version': page['ack_version']})], capture_output=True, text=True, timeout=120)
+    store.set_subscription_retention(True)
+    try:
+        run = subprocess.run([sys.executable, '-c', PREVIOUS_DRIVER, str(source), json.dumps({
+            'dsn': os.environ['PROBE_TEST_DSN_FILE'], 'files': str(files), 'token': token, 'sid': sid, 'old': old,
+            'receipt': page['receipt'], 'version': page['ack_version']})], capture_output=True, text=True,
+            timeout=120)
+    finally:
+        with store.pool.connection() as c:
+            c.execute("DELETE FROM probe_metadata WHERE name='subscription_retention'")
     assert run.returncode == 0, run.stderr[-2000:]
     out = json.loads(run.stdout.strip().splitlines()[-1])
     assert out['schema'] < 56
@@ -820,10 +838,18 @@ def test_the_deployed_release_runs_beside_module_rows_after_the_documented_rollb
     for read, expected in ((out['passive'], [message, newer]), (out['fetch'], [newer])):
         assert 'module' not in read and [item['event_id'] for item in read['items']] == expected
     assert out['ack']['acked_through'] == newer
+    assert {message, newer} <= set(out['updates']) and out['updates'] == [e['event_sequence']
+        for e in store.get_updates(old, 'probe-current')['items']]
+    assert out['pruned']['pruned'] == 2 and out['pruned']['retention_failed'] == 0
     assert out['sent'] and all(body['kind'] != 'module_events' for body in out['sent']), (out['dispatch'], _outbox(store))
     with store.pool.connection() as c:
         assert {name: c.execute(sql.SQL('SELECT count(*) AS n FROM {}').format(sql.Identifier(name))).fetchone()['n']
             for name in tables} == rows
+    with store.pool.connection() as c:
+        assert c.execute('SELECT retention_floor FROM subscriptions WHERE id=%s', (sid,)).fetchone()[
+            'retention_floor'] == newer
+        assert c.execute('SELECT count(*) AS n FROM subscription_matches WHERE subscription=%s',
+            (sid,)).fetchone()['n'] == 0
     view = store.get_subscription(token, sid)
     assert view['module_stream']['state'] == 'held_after_rollback' and view['module_stream']['acked_through'] == 0
     view = store.update_subscription(token, sid, view['version'], action='resume')
