@@ -16,6 +16,7 @@ from messaging_service.backup_receiver import prune
 from messaging_service.backup import create_snapshot, verify_bundle
 from messaging_service.backup_crypto import encrypt_snapshot_stream, decrypt_snapshot, snapshot_stream_bound
 from messaging_service.backup_runner import upload_stream
+from messaging_service import backup_runner
 from messaging_service.backup_runner import Runner,read_json,write_json
 from test_backup_operations import FakeDocker,runner_fixture
 
@@ -250,6 +251,44 @@ def test_stream_runner_reports_finished_or_failed_worker_to_the_stream_wait(tmp_
     else:
         with pytest.raises(RuntimeError,match='backup_capture_failed'):runner.run()
     assert observed==[False,True]
+
+
+class SlowCaptureDocker(StreamingDocker):
+    """The worker writes captured.json at 7.5 s and stream.json at 10 s of the runner's clock."""
+    def __init__(self,root,now):
+        super().__init__(root);self.now=now;self.work=None;self.polls=[];self.resumed=[]
+    def call(self,*args):
+        if args[0]=='start' and args[1].startswith('pos-backup-'):
+            info=self.containers[args[1]];info['State'].update(Running=True,Status='running')
+            self.work=self.root/info['Config']['Labels']['personal-os.backup.id']
+            (self.work/'snapshot').mkdir();(self.work/'snapshot/private').write_bytes(b'PRIVATE_CAPTURE_FIXTURE')
+            self.calls.append(args);return ''
+        if args==('start','tg-id'):self.resumed.append(self.now[0])
+        return super().call(*args)
+    def inspect(self,cid):
+        if cid.startswith('pos-backup-') and self.work and not (self.work/'stream.json').exists():self.polls.append(self.now[0])
+        return super().inspect(cid)
+    def advance(self,seconds):
+        before=self.now[0];self.now[0]+=seconds
+        if before<7.5<=self.now[0]:write_json(self.work/'captured.json',{'id':self.work.name,'status':'capture_complete'})
+        if before<10<=self.now[0]:
+            write_json(self.work/'stream.json',{'v':2,'id':self.work.name,'snapshot_sha256':SNAPSHOT,'max_bytes':4096,
+                                                'captured_at':'2026-10-14T00:00:00+00:00'})
+
+
+# spec: ANYM-635
+def test_a_ten_second_streaming_capture_inspects_the_worker_once_a_second_and_resumes_in_the_next_poll(tmp_path):
+    async def send(path,metadata,transfer,timeout,start,completed,stopped=None):
+        start(True);result=await completed()
+        return {**result,'status':'stored','duplicate':False}
+    runner,_=streaming_runner(tmp_path,send)
+    now=[0.0];docker=SlowCaptureDocker(tmp_path,now)
+    runner.docker,runner.clock,runner.sleep=docker,(lambda:now[0]),docker.advance
+    runner.run()
+    assert read_json(tmp_path/'status.json')['state']=='ok'
+    assert len(docker.polls)<=11  # 0.1-s polling made about 100
+    first_after=min(t for t in docker.polls if t>=7.5)
+    assert docker.resumed==[first_after] and first_after<=7.5+backup_runner.POLL_SECONDS
 
 
 def test_stream_runner_lost_receipt_uses_duplicate_without_reencryption(tmp_path):
