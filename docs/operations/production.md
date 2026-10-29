@@ -895,6 +895,17 @@ an older worker refuses a newer `worker.json` key the runner writes (`dump_timeo
 ANYM-627), so the backup would fail on every run; the older runner with the newer image passes
 (the worker keeps its 600 s default).
 
+The calendar's runner (ANYM-607, BACKUP.md "Family calendar") is the same installed file with its own
+config: `/opt/deedkit/calendar-backup/` (root `0700`) holds `runner.json` (from
+`deploy/backup-runner-calendar.example.json`; `image` = messaging's pin, so the step above moves it too:
+set the calendar `runner.json` `image` to the same ID in the same idle window and `--check` it),
+`owner.dsn` (the calendar database's existing owner from `<CALENDAR_STATE_DIR>/service/postgres.env`, host
+`calendar-db`), `recipient`, `delivery_ed25519` and `known_hosts`, and the job directory `backups/`. Units:
+`deploy/deedkit-calendar-backup.service` and `.timer` (daily 16:00 UTC). Its read-only `--check` is
+`python3 -I /opt/personal-os-probe/ops/backup_runner.py --config /opt/deedkit/calendar-backup/runner.json
+--check`. Undo: `systemctl disable --now deedkit-calendar-backup.timer`, then remove the units and the
+directory; messaging's files are not touched.
+
 ## Roll back the current release
 
 A release whose `up --wait` failed while every replacement it started runs the
