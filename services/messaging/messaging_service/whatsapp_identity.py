@@ -51,20 +51,27 @@ def store(c,account,mid,item):
         (account,mid,item['identity_id'],item['pn'],item['lid'],item['provenance'],item['observed_at'],item['observed_at']))
 
 
-def same_sender(c,account,mid,retained,candidate,captured=()):
+def fence(c,account,mid,captured):
+    """Store each captured observation that links a PN or LID to another identity than the account
+    already recorded, against message `mid`, so the account-wide ambiguity fence keeps it whatever the
+    message's outcome (a conflict, a duplicate receipt, an alias re-read whose message keeps the
+    retained sender). Only a contradiction is stored: it makes both pairs ambiguous, so it is never a
+    usable link; a first pair waits for `record` as before. Called under ingest's account lock."""
+    for item in captured or ():
+        row=c.execute(SAME_SENDER_SQL,{'account':account,'pn':item['pn'],'lid':item['lid'],
+            'provenances':sorted(PROVENANCES)}).fetchone()
+        if row['fenced']:store(c,account,mid,item)
+
+
+def same_sender(c,account,retained,candidate):
     """True when `retained` and `candidate` are one WhatsApp sender in its phone-number and LID forms:
-    this account recorded the pair from an approved provenance, and nothing links either side to
-    another, neither an observation anywhere in the account (deleted sources included: the fence of
-    visible_cte and resolve_alias) nor one `captured` with this observation. A captured contradiction
-    is stored against message `mid` before the answer, so the fence keeps it although the archive
-    keeps the retained sender. Called under ingest's account lock. Account-local, network-free; each
-    probe is one index range (`<`/`>` on the last key column), never a scan of a pair's repeats."""
+    this account recorded the pair from an approved provenance, and no observation anywhere in the
+    account (deleted sources included: the fence of visible_cte and resolve_alias, and what `fence`
+    stored from captures) links either side to another. Account-local, network-free; each probe is
+    one index range (`<`/`>` on the last key column), never a scan of a pair's repeats."""
     forms={personal_id(retained),personal_id(candidate)}
     pn=next((f for f in forms if f and f.endswith('@c.us')),None);lid=next((f for f in forms if f and f.endswith('@lid')),None)
     if len(forms)!=2 or not pn or not lid:return False
-    contradicting=[item for item in captured or () if (item['pn']==pn)!=(item['lid']==lid)]
-    for item in contradicting:store(c,account,mid,item)
-    if contradicting:return False
     row=c.execute(SAME_SENDER_SQL,{'account':account,'pn':pn,'lid':lid,'provenances':sorted(PROVENANCES)}).fetchone()
     return bool(row['linked'] and not row['fenced'])
 

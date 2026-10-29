@@ -1067,7 +1067,7 @@ def test_whatsapp_sender_alias_lookup_is_bounded_by_index_ranges(archive):
     for source in sources:observe(s,source)
     with s.pool.connection() as c:
         # Many repeats of one pair are linked and not fenced.
-        assert same_sender(c,'archive-wa',sources[0],PN,LID)
+        assert same_sender(c,'archive-wa',PN,LID)
         c.execute('SET LOCAL enable_seqscan=off');c.execute('SET LOCAL enable_bitmapscan=off')
         plan=c.execute('EXPLAIN (ANALYZE, FORMAT JSON) '+SAME_SENDER_SQL,{'account':'archive-wa','pn':PN,'lid':LID,
             'provenances':sorted(PROVENANCES)}).fetchone()
@@ -1079,4 +1079,57 @@ def test_whatsapp_sender_alias_lookup_is_bounded_by_index_ranges(archive):
         assert len(scans)==5 and all(n['Actual Rows']<=1 and n.get('Rows Removed by Filter',0)==0 for n in scans),json.dumps(scans)
     observe(s,sources[1],lid='310000000002@lid')
     with s.pool.connection() as c:
-        assert not same_sender(c,'archive-wa',sources[0],PN,LID)
+        assert not same_sender(c,'archive-wa',PN,LID)
+
+
+def alias_capture(sender,pn,**changes):
+    return {'kind':'message','peer_kind':'user','envelope':alias_event(sender,**changes),
+        'identity_observations':[{'identity_id':sender,'pn':pn,'lid':LID,'provenance':'whatsmeow_message_alt_v1',
+            'observed_at':'2026-10-01T11:00:00Z'}]}
+
+
+def fence_rows(s):
+    with s.pool.connection() as c:
+        return [(r['source_message'],r['identity_id'],r['pn']) for r in c.execute(
+            "SELECT source_message,identity_id,pn FROM whatsapp_identity_observations WHERE pn<>%s ORDER BY 1,2,3",(PN,))]
+
+
+# spec: ANYM-559
+def test_whatsapp_duplicate_capture_with_new_contradicting_evidence_still_fences(archive):
+    from messaging_service.whatsapp_collector import WhatsAppState
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    state=WhatsAppState(ar,'archive-wa',('fixture',ar.acquire('archive-wa','fixture')))
+    mid=state.apply(alias_capture(PN,PN))['message']
+    assert state.apply(alias_capture(LID,PN,origin='reconcile'))['outcome']=='unchanged'
+    # The same envelope again, now with evidence linking the LID to another phone number: the receipt
+    # is a duplicate, the contradiction is still kept, once, and replaying it changes nothing.
+    changed=alias_capture(LID,'79990000002@c.us',origin='reconcile')
+    assert state.apply(changed)['outcome']=='duplicate'
+    assert state.apply(changed)['outcome']=='duplicate'
+    assert fence_rows(s)==[(mid,LID,'79990000002@c.us')]
+    with s.pool.connection() as c:
+        from messaging_service.whatsapp_identity import same_sender
+        assert not same_sender(c,'archive-wa',PN,LID)
+    # A later alias edit is then a conflict, not an edit under the old mapping.
+    assert state.apply(alias_capture(LID,PN,body='Вторая версия',formatting=wire('Вторая версия'),
+        updated_at='2026-10-01T12:01:00+00:00'))['outcome']=='conflict'
+    assert sender_rows(s,mid)[:2]==(PN,1)
+
+
+# spec: ANYM-559
+def test_whatsapp_capture_evidence_without_a_recorded_pair_is_no_fence_and_no_link(archive):
+    from messaging_service.whatsapp_collector import WhatsAppState
+    from messaging_service.whatsapp_identity import same_sender
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    state=WhatsAppState(ar,'archive-wa',('fixture',ar.acquire('archive-wa','fixture')))
+    # A message with no evidence, then a re-read in the LID form carrying a pair nobody recorded yet:
+    # nothing contradicts, so ingest stores nothing, and the alias is not accepted on its own evidence.
+    mid=ar.ingest(alias_event(PN))['message']
+    assert state.apply(alias_capture(LID,'79990000002@c.us',body='Вторая версия',formatting=wire('Вторая версия'),
+        updated_at='2026-10-01T12:01:00+00:00'))['outcome']=='conflict'
+    assert fence_rows(s)==[]
+    with s.pool.connection() as c:
+        assert not same_sender(c,'archive-wa','79990000002@c.us',LID) and not same_sender(c,'archive-wa',PN,LID)
+    assert sender_rows(s,mid)[:2]==(PN,1)

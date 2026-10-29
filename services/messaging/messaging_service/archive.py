@@ -178,6 +178,11 @@ class Archive:
                    'updated_at':max(tombstone,datetime.fromisoformat(e['updated_at'])).isoformat()}
                 if 'formatting' in e:e['formatting']=unknown_formatting()
                 if 'contact' in e.get('metadata',{}):e['metadata']={k:v for k,v in e['metadata'].items() if k!='contact'}
+            if identity_observations and c.execute('SELECT 1 FROM messages WHERE id=%s',(mid,)).fetchone():
+                # A capture's identity evidence that contradicts a recorded pair is kept as a fence
+                # before anything else, also for a duplicate receipt (ANYM-559).
+                from .whatsapp_identity import fence as fence_identity
+                fence_identity(c,aid,mid,identity_observations)
             previous=c.execute('SELECT outcome FROM ingest_receipts WHERE digest=%s',(receipt,)).fetchone()
             if previous: return {'outcome':'duplicate','message':mid}
             chat_type=e.get('metadata',{}).get('chat_type')
@@ -206,7 +211,7 @@ class Archive:
                 and not old['deleted'] and old['sent_at']==datetime.fromisoformat(e['sent_at']))
             if sender_alias and e['sender']:
                 from .whatsapp_identity import same_sender
-                sender_alias=same_sender(c,aid,mid,old['sender'],e['sender'],identity_observations)
+                sender_alias=same_sender(c,aid,old['sender'],e['sender'])
             if sender_alias:e={**e,'sender':old['sender']}
             content=fingerprint(e); updated=datetime.fromisoformat(e['updated_at']); outcome='created'
             old_format=None;retained=None;retained_snapshot=None
