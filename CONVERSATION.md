@@ -311,7 +311,9 @@ message (a reaction or service event) does `waiting` add `last_message_id` and
 Rows are ordered by (`waiting.since`, chat ID). The cursor binds the list,
 `min_wait_hours`, `awaiting_reply_days` and `only_questions`; another value
 returns `invalid_cursor`. Pages read the changing archive: a reply that arrives
-between pages removes its chat from the later page. `awaiting_their_reply=true`
+between pages removes its chat from the later page, and a chat whose head
+changed while the page was read is left out of it (counted as its head now
+reads), so a page may hold fewer rows than `limit` while `next_cursor` continues. `awaiting_their_reply=true`
 needs `order="waiting_longest"` and the reverse; neither combines with
 `awaiting_reply`, `only_unread`, `exclude_senders`, `exclude_likely_broadcasts`,
 `promotional`, `from_time`/`to_time`, `my_roles` or `can_post`
