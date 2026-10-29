@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import re
+import statistics
 import sys
 import xml.etree.ElementTree as ET
 
@@ -124,6 +125,14 @@ def junit_seconds(paths: list[Path]) -> dict[str, float]:
     return seconds
 
 
+def median_seconds(paths: list[Path]) -> dict[str, float]:
+    """Per-file median over reports of several runs (a merged python.xml each, or the shard reports of each run):
+    a file counts in the reports that hold it, so one run's six shard reports give its own seconds."""
+    reports = [junit_seconds([path]) for path in paths]
+    names = {name for report in reports for name in report}
+    return {name: statistics.median(report[name] for report in reports if name in report) for name in names}
+
+
 def main() -> int:
     if sys.argv[1:2] == ["pytest"]:
         # pytest with this module as a plugin; only this file's directory joins the import path, in this process.
@@ -134,13 +143,17 @@ def main() -> int:
     actions = parser.add_subparsers(dest="action", required=True)
     show = actions.add_parser("plan", help="print each shard's modules and expected seconds")
     show.add_argument("--count", type=int, default=4)
-    update = actions.add_parser("weights", help="rewrite python_shards.json from CI python.xml reports")
+    update = actions.add_parser("weights", help="rewrite python_shards.json from CI python.xml reports (per-file median)")
     update.add_argument("reports", nargs="+", type=Path)
+    update.add_argument("--head-start", type=float, help="verify's measured time outside its pytest step, minus a "
+                                                          "python job's (job and step times of the same runs)")
     args = parser.parse_args()
     weights = json.loads(WEIGHTS.read_text())
     if args.action == "weights":
-        seconds = junit_seconds(args.reports)
+        seconds = median_seconds(args.reports)
         weights["seconds"] = {name: round(seconds[name], 1) for name in sorted(seconds)}
+        if args.head_start is not None:
+            weights["head_start"] = round(args.head_start)
         WEIGHTS.write_text(json.dumps(weights, indent=1) + "\n")
         return 0
     assigned = plan(modules(ROOT), args.count, weights)
