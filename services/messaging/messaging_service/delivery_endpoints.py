@@ -777,12 +777,11 @@ def hint_body(c, hint, row, p):
     if hint['kind'] == 'test':
         return _compact({**base, 'type': 'test', 'test_id': str(hint['id']), 'endpoint_id': str(hint['endpoint'])})
     if hint['kind'] == 'module_events':
-        # ANYM-562: the type, the subject reference and the module only; data is read through the fetch.
+        # ANYM-562/575: the kind, the subject reference and the module only; positions, urgency, expiry and
+        # data are read through the fetch.
         from .module_events import hint_references
-        from .store import serial
         rows = hint_references(c, row['id'], hint['through_position'])
-        listed = [{'module_event_id': item['seq'], 'type': item['type'], 'source': item['source'],
-            'subject': item['subject'], 'urgency': item['urgency'], 'expires_at': serial(item['expires_at'])}
+        listed = [{'type': item['type'], 'source': item['source'], 'subject': item['subject']}
             for item in rows][:MAX_REFERENCES]
         total = rows[0]['total'] if rows else 0
         while True:

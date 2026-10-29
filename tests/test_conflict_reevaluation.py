@@ -107,7 +107,8 @@ def test_migration_is_expand_and_role_files_only_append_grants():
     for name, line in [('collector_role.sql', 'GRANT SELECT,INSERT,UPDATE(cursor,watermark,done_at,last_error) ON conflict_reevaluations TO messaging_collector;'),
                        ('gateway_role.sql', 'GRANT SELECT ON conflict_reevaluations TO messaging_gateway;')]:
         current = (SOURCE/name).read_text()
-        assert current.rstrip().endswith(line)
+        assert line in current
+        current = current[:current.index(line)+len(line)]  # later schemas append after this grant
         base = current[:current.rindex(line)]
         base = base[:base.index('-- Schema 57')]  # without the comment above the grant
         assert role_class(base, current, created) == 'additive'

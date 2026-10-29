@@ -240,15 +240,30 @@ def view(c, row, module):
     # Per source and self-clearing: the router's last report decides; the matcher's blocked_reason is untouched.
     health = [{'source': source, 'state': 'module_unreachable', 'since': since} for source, since in
         sorted({(item['source'], item['unreachable_since']) for item in sources if item['unreachable_since']})]
+    # ANYM-575: a range the router could not publish keeps the source's coverage incomplete until it is
+    # re-fetched or the operator abandons it.
+    gaps = router_gaps(c)
+    health += [{'source': source, 'state': 'module_gap', 'since': gaps[source]} for source in
+        sorted({item['source'] for item in sources} & set(gaps))]
     state = ('held_after_rollback' if module['rollback_hold'] else row['state'])
     return serial({'state': state, 'start_position': module['start_position'],
         'matched_through': module['matched_through'], 'acked_through': module['acked_through'],
         'matcher_caught_up': state == 'active' and module['matched_through'] == head,
         'matched_event_count': count, 'blocked_reason': module['blocked_reason'], 'gap': module['gap'],
         'retention_floor': module['retention_floor'], 'last_matched_at': module['last_matched_at'],
-        'sources': [{'source': item['source'], 'scope_ref': item['scope_ref'], 'types': item['types']}
-            for item in sources], 'health': health,
+        'sources': [{'source': item['source'], 'scope_ref': item['scope_ref'], 'types': item['types'],
+            'coverage': 'incomplete' if item['source'] in gaps else 'complete'} for item in sources],
+        'health': health,
         'next_action': 'resume' if module['rollback_hold'] else None})
+
+
+def router_gaps(c):
+    """{source: oldest open router gap time}; empty before schema 58 or without the read grant (rolling upgrade)."""
+    if not c.execute("""SELECT CASE WHEN to_regclass('public.module_router_gaps') IS NULL THEN false
+            ELSE has_table_privilege('public.module_router_gaps','SELECT') END AS readable""").fetchone()['readable']:
+        return {}
+    return {row['source']: row['since'] for row in c.execute(
+        'SELECT source,min(opened_at) AS since FROM module_router_gaps WHERE resolved_at IS NULL GROUP BY source')}
 
 
 def match(c, row, *, batch_size, maximum, stats):

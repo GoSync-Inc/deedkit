@@ -1,0 +1,8 @@
+{
+  "modules": [
+    {"source": "deedkit:calls", "url": "http://calls:13842", "token_file": "/run/secrets/module-tokens/calls"},
+    {"source": "deedkit:calendar", "url": "http://calendar-api:13232", "token_file": "/run/secrets/module-tokens/calendar"}
+  ],
+  "timeout_s": 5,
+  "interval_s": 5
+}
