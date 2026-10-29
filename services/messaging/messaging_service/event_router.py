@@ -12,15 +12,17 @@ Logs and telemetry carry fixed codes only: never a URL, token, page or event bod
 from __future__ import annotations
 
 import argparse
+import http.client
+import io
 import json
 import os
 from pathlib import Path
 import signal
+import socket
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
-import httpx
 import psycopg
 from psycopg import errors
 from psycopg.rows import dict_row
@@ -60,7 +62,7 @@ def load_config(path):
             raise ValueError('invalid_router_config')
         url = urlsplit(module['url']) if isinstance(module['url'], str) else None
         if (module['source'] not in SOURCES or module['source'] in seen or url is None or
-                url.scheme not in ('http', 'https') or not url.hostname or url.username or url.password or
+                url.scheme != 'http' or not url.hostname or url.username or url.password or
                 url.query or url.fragment or not isinstance(module['token_file'], str) or
                 not module['token_file'].startswith('/')):
             raise ValueError('invalid_router_config')
@@ -72,16 +74,73 @@ def load_config(path):
     return {'modules': modules, 'timeout_s': float(timeout), 'interval_s': float(interval)}
 
 
+class _DeadlineSocket:
+    """A connected socket whose every read and write first takes the time left before one deadline.
+
+    The socket timeout bounds each call, the deadline bounds their sum: a module that trickles its
+    headers or body byte by byte still ends at the deadline, and the socket is closed with the request.
+    """
+
+    def __init__(self, sock, deadline):
+        self.sock, self.deadline, self._files, self._closed = sock, deadline, 0, False
+
+    def _arm(self):
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError('module_timeout')
+        self.sock.settimeout(left)
+
+    def recv_into(self, buffer, nbytes=0):
+        self._arm()
+        return self.sock.recv_into(buffer, nbytes)
+
+    def sendall(self, data):
+        self._arm()
+        return self.sock.sendall(data)
+
+    # As socket.socket: http.client closes the connection while the response still reads its file, so
+    # the socket closes when both are done.
+    def makefile(self, mode='rb', *args, **kwargs):
+        self._files += 1
+        return io.BufferedReader(socket.SocketIO(self, 'rb'))  # type: ignore[arg-type]  # duck-typed socket
+
+    def _decref_socketios(self):
+        self._files -= 1
+        if self._closed and self._files <= 0:
+            self.sock.close()
+
+    def close(self):
+        self._closed = True
+        if self._files <= 0:
+            self.sock.close()
+
+
+class _Connection(http.client.HTTPConnection):
+    def __init__(self, address, host, deadline):
+        super().__init__(host, address[1])
+        self.address, self.deadline = address, deadline
+
+    def connect(self):
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError('module_timeout')
+        self.sock = _DeadlineSocket(socket.create_connection(self.address, timeout=left), self.deadline)
+
+
 class HttpModule:
-    """One producer's read endpoint behind its router token (read per request, so a rotation needs no restart)."""
+    """One producer's read endpoint behind its router token (read per request, so a rotation needs no restart).
+
+    Plain HTTP on the internal integration network, one request per connection, no redirect, no proxy.
+    Each request has one total deadline over the name lookup, connect, headers and body; nothing of a
+    request outlives it except a name lookup still running in its thread, and a module never has more
+    than one of those.
+    """
 
     def __init__(self, source, url, token_file, timeout_s):
-        self.source, self.url, self.token_file, self.timeout = source, url.rstrip('/'), Path(token_file), timeout_s
-        # One client per module: building one loads the TLS trust store, which costs more than a page read.
-        self.client = self._client()
-
-    def _client(self):
-        return httpx.Client(timeout=httpx.Timeout(self.timeout), follow_redirects=False, trust_env=False)
+        parts = urlsplit(url)
+        self.source, self.token_file, self.timeout = source, Path(token_file), timeout_s
+        self.host, self.port, self.prefix = parts.hostname, parts.port or 80, parts.path.rstrip('/')
+        self._lookup = None
 
     def head(self):
         body = self._get('/v1/events/head', {})
@@ -94,58 +153,53 @@ class HttpModule:
     def events(self, after, limit):
         return self._get('/v1/events', {'after': after, 'limit': limit})
 
-    def _get(self, path, params):
-        """One request under a total deadline over connect, headers and body.
+    def _resolve(self, deadline):
+        if self._lookup is not None and self._lookup.is_alive():
+            raise ModuleUnavailable('module_timeout')
+        found = {}
 
-        httpx bounds each phase, not the whole: a module that trickles its headers or body could hold the
-        worker for many phases. The read runs on a thread; past the deadline the client is closed, which
-        closes its socket and ends the abandoned read, and the next request gets a new client.
-        """
+        def lookup():
+            try:
+                found['address'] = socket.getaddrinfo(self.host, self.port, type=socket.SOCK_STREAM)[0][4][:2]
+            except (OSError, IndexError):
+                found['address'] = None
+        self._lookup = threading.Thread(target=lookup, name='module-lookup', daemon=True)
+        self._lookup.start()
+        self._lookup.join(max(0, deadline - time.monotonic()))
+        if self._lookup.is_alive():
+            raise ModuleUnavailable('module_timeout')
+        if found['address'] is None:
+            raise ModuleUnavailable('module_unreachable')
+        return found['address']
+
+    def _get(self, path, params):
         try:
             token = self.token_file.read_text().strip()
         except OSError:
             raise ModuleUnavailable('token_unreadable') from None
-        outcome, client = {}, self.client
-
-        def read():
-            try:
-                outcome['body'] = self._read(client, path, params, token)
-            except BaseException as error:
-                outcome['error'] = error
-        worker = threading.Thread(target=read, name='module-read', daemon=True)
-        worker.start()
-        worker.join(self.timeout)
-        if worker.is_alive():
-            self.client = self._client()
-            try:
-                client.close()
-            except Exception:
-                pass
-            raise ModuleUnavailable('module_timeout')
-        if 'error' in outcome:
-            raise outcome['error']
-        return outcome['body']
-
-    def _read(self, client, path, params, token):
-        deadline, body = time.monotonic() + self.timeout, bytearray()
+        deadline = time.monotonic() + self.timeout
+        connection, response = _Connection(self._resolve(deadline), self.host, deadline), None
         try:
-            with client.stream('GET', self.url + path, params=params,
-                    headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/json'}) as response:
-                if response.status_code in (401, 403):
-                    raise ModuleUnavailable('module_auth_refused')
-                if response.status_code != 200:
-                    raise ModuleUnavailable('module_http_status')
-                # A total deadline and a byte cap: a module that trickles bytes cannot hold the router.
-                for chunk in response.iter_bytes():
-                    body += chunk
-                    if len(body) > MAX_PAGE_BYTES:
-                        raise ModuleUnavailable('page_over_bytes')
-                    if time.monotonic() > deadline:
-                        raise ModuleUnavailable('module_timeout')
-        except httpx.TimeoutException:
+            connection.request('GET', self.prefix + path + ('?' + urlencode(params) if params else ''),
+                headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/json', 'Connection': 'close'})
+            response = connection.getresponse()
+            if response.status in (401, 403):
+                raise ModuleUnavailable('module_auth_refused')
+            if response.status != 200:
+                raise ModuleUnavailable('module_http_status')
+            body = response.read(MAX_PAGE_BYTES + 1)
+            if len(body) > MAX_PAGE_BYTES:
+                raise ModuleUnavailable('page_over_bytes')
+        except TimeoutError:
             raise ModuleUnavailable('module_timeout') from None
-        except httpx.HTTPError:
+        except (OSError, http.client.HTTPException):
             raise ModuleUnavailable('module_unreachable') from None
+        finally:
+            # With Connection: close the connection no longer tracks its response: close both, so the socket
+            # never outlives the request.
+            if response is not None:
+                response.close()
+            connection.close()
         try:
             return json.loads(body)
         except ValueError:
@@ -431,10 +485,9 @@ def run(connect_db, modules, *, interval, stop, once=False):
                 for module in modules:
                     try:
                         poll(conn, module)
-                    except psycopg.OperationalError:
-                        raise
                     except Exception as error:
-                        # One module's unexpected failure never stops the others' pass.
+                        # One module's failure (a lock or statement timeout on its cursor included) never stops
+                        # the others' pass; only a lost connection ends it, and the next pass reconnects.
                         capture(error, 'module_router_failed')
                         _log(module.source, 'module_router_failed')
                         if conn.closed or conn.broken:

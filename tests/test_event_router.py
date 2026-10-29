@@ -70,6 +70,7 @@ class Producer:
             def log_message(self, *args):
                 pass
 
+        ThreadingHTTPServer.request_queue_size = 64
         self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         self.server.daemon_threads = True
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -462,7 +463,7 @@ def _trickling_server():
     listener = socket.socket()
     listener.bind(('127.0.0.1', 0))
     listener.listen(4)
-    stop = threading.Event()
+    stop, served = threading.Event(), []
 
     def serve():
         listener.settimeout(0.2)
@@ -481,9 +482,10 @@ def _trickling_server():
                     pass
                 finally:
                     client.close()
-            threading.Thread(target=trickle, daemon=True).start()
+            served.append(threading.Thread(target=trickle, daemon=True))
+            served[-1].start()
     threading.Thread(target=serve, daemon=True).start()
-    return listener, stop
+    return listener, stop, served
 
 
 # spec: ANYM-575
@@ -501,7 +503,7 @@ def test_wrong_json_types_are_quarantined_and_one_module_never_stops_another(rou
     assert [key for _, key, _ in journal(store)] == ['calls:4']
     assert [(g['after_seq'], g['through_seq']) for g in router_state(store)[1]] == [(0, 1), (1, 2), (2, 3)]
     # An unexpected failure inside one module's pass: the next module is still read and reported.
-    listener, stop = _trickling_server()
+    listener, stop, served = _trickling_server()
     slow = HttpModule('deedkit:calls', f'http://127.0.0.1:{listener.getsockname()[1]}', str(calls_module.token_file),
         0.3)
     calendar.rows.append(None)
@@ -510,8 +512,11 @@ def test_wrong_json_types_are_quarantined_and_one_module_never_stops_another(rou
     try:
         started = time.monotonic()
         sweep(connect, slow, calendar_module)
-        # A total deadline: headers trickled faster than any single read timeout still end the read.
+        # A total deadline: headers trickled faster than any single read timeout still end the read, and the
+        # router closed its socket with it (the server's next write fails) and left no reader running.
         assert time.monotonic() - started < 2.0
+        assert served and all(thread.join(2) is None and not thread.is_alive() for thread in served)
+        assert not [thread for thread in threading.enumerate() if thread.name == 'module-read']
     finally:
         stop.set()
         listener.close()
@@ -536,6 +541,24 @@ def test_an_unexpected_failure_of_one_module_leaves_the_next_module_polled(route
     sweep(connect, calls_module, calendar_module)
     assert router_state(store)[0]['after_seq'] == 0
     assert router_state(store, 'deedkit:calendar')[0]['after_seq'] == 1
+
+
+# spec: ANYM-575
+def test_a_lock_or_statement_timeout_on_one_cursor_never_stops_the_next_module(routed, producers, tmp_path):
+    store, connect = routed
+    calls, calendar = producers(), producers('deedkit:calendar')
+    calls_module, calendar_module = calls.module(tmp_path), calendar.module(tmp_path)
+    sweep(connect, calls_module, calendar_module)
+    calls.add()
+    calendar.rows.append(None)
+    with store.pool.connection() as holder:
+        # Another session holds the calls cursor row: the router's publish step meets its lock_timeout.
+        holder.execute("SELECT 1 FROM module_router_cursors WHERE source='deedkit:calls' FOR UPDATE")
+        sweep(connect, calls_module, calendar_module)
+    assert journal(store) == [] and router_state(store)[0]['after_seq'] == 0
+    assert router_state(store, 'deedkit:calendar')[0]['after_seq'] == 1
+    sweep(connect, calls_module, calendar_module)
+    assert [key for _, key, _ in journal(store)] == ['calls:1']
 
 
 # spec: ANYM-575
@@ -744,6 +767,7 @@ def test_router_config_refuses_unsafe_or_unknown_settings(tmp_path):
     path.write_text(json.dumps(good))
     assert event_router.load_config(path)['timeout_s'] == 5
     for bad in ({**good, 'extra': 1},
+            {'modules': [{**good['modules'][0], 'url': 'https://calls:13842'}]},
             {'modules': [{**good['modules'][0], 'url': 'http://user:pw@calls:13842'}]},
             {'modules': [{**good['modules'][0], 'url': 'file:///etc/passwd'}]},
             {'modules': [{**good['modules'][0], 'source': 'deedkit:messages'}]},

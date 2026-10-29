@@ -974,7 +974,9 @@ The shared producer contract (ANYM-575; ANYM-563 and ANYM-565 build against this
   assigned). The router reads it once, for a source with no stored cursor.
 - Every request carries `Authorization: Bearer <router read token>`; reads send `after` and
   `limit` (100). The router refuses a response over 256 KiB or over `limit` events, follows no
-  redirect and gives each request a total deadline (`timeout_s`).
+  redirect, reads plain HTTP on the internal integration network only (the config refuses another
+  scheme) and gives each request one total deadline (`timeout_s`) over the name lookup, connect,
+  headers and body.
 - A re-fetch of one quarantined seq reads `?after=<seq-1>&limit=1`.
 
 Publishing: only `publish_module_event(...)`, a definer function with a fixed search path and no
