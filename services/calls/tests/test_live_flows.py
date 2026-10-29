@@ -591,6 +591,40 @@ def test_late_final_of_an_old_answer_keeps_the_newer_closing_reply(tmp_path):
 
 
 # spec: ANYM-374
+def test_new_words_after_a_granted_goodbye_revoke_it_before_their_final(tmp_path):
+    store, identity = call(tmp_path)
+    store.audio_activity(identity,True)
+    store.transcript_chunk(identity,'user','Ну пока. Пока!')
+    store.audio_activity(identity,False)
+    store.transcript(identity,'user','Ну пока.')
+    assert end(store,identity,'Пока!')['end_requested']
+    # The transcription of newer speech can arrive after its audio already stopped.
+    store.transcript_chunk(identity,'user',' Хотя подожди, я ещё про доставку')
+    store.transcript(identity,'user','Пока!')
+    assert not store.closing_ready(identity)
+    assert end(store,identity,'Пока!')['error'] == 'closing_result_obsolete'
+    store.close()
+
+
+# spec: ANYM-374
+def test_goodbye_granted_before_late_finals_of_two_inputs_stays_granted(tmp_path):
+    store, identity = call(tmp_path)
+    store.audio_activity(identity,True)
+    store.transcript_chunk(identity,'user','Доставка с 12 до 13.')
+    store.audio_activity(identity,False)
+    store.transcript(identity,'assistant','Можем заканчивать?')
+    store.audio_activity(identity,True)
+    store.transcript_chunk(identity,'user','Спасибо, до свидания.')
+    store.audio_activity(identity,False)
+    assert end(store,identity,'Спасибо, до свидания.')['end_requested']
+    store.transcript(identity,'user','Доставка с 12 до 13.')
+    store.transcript(identity,'user','Спасибо, до свидания.')
+    assert store.closing_ready(identity)
+    assert end(store,identity,'Спасибо, до свидания.')['end_requested']
+    store.close()
+
+
+# spec: ANYM-374
 def test_every_chunk_split_keeps_exactly_the_speech_no_final_has_transcribed(tmp_path):
     store, identity = call(tmp_path)
     old, new = 'До свидания. Ну пока.', 'Хотя подожди, ещё'

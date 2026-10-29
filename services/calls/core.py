@@ -254,6 +254,11 @@ def _words_after(text,count):
     return ''
 
 
+def _newest_input(pending):
+    """Pending chunks from the latest input start: the person's latest utterance, not older unfinalized speech."""
+    return pending[max(k for k,item in enumerate(pending) if item[2]):]
+
+
 # Local hour bands per call language; outside them (night) the model greets neutrally.
 GREETINGS={'id':('Halo',[(4,11,'Selamat pagi'),(11,15,'Selamat siang'),(15,18,'Selamat sore'),(18,24,'Selamat malam')]),
            'ru':('Здравствуйте',[(5,12,'Доброе утро'),(12,18,'Добрый день'),(18,23,'Добрый вечер')]),
@@ -652,15 +657,16 @@ class VoiceService:
             v=self.get_call(identity)
             if v["status"] not in ACTIVE or generation not in (None,v.get('generation',1)):
                 return
-            if role=='user' and v['brief'].get('dialog_engine')=='gemini_live_flows':
-                if not v.get('human_pending_final'):
-                    v['human_revision']=v.get('human_revision',0)+1
-                    self._revoke_closing(v,'new_human_turn')
             self._event(v,{"kind":"transcript","role":role,"text":text,"interrupted":interrupted})
             if role=='user' and v['brief'].get('dialog_engine')=='gemini_live_flows':
+                try:_,_,pending,restated=self._turns(v['events'],'user')
+                except Exception:pending,restated=[],False
+                # A final restating recorded chunks keeps a granted permission; any other final is new speech.
+                if not v.get('human_pending_final') or (v.get('close_requested') and not restated):
+                    v['human_revision']=v.get('human_revision',0)+1
+                    self._revoke_closing(v,'new_human_turn')
                 # Newer chunks this final does not transcribe still wait for their own final.
-                try:v['human_pending_final']=bool(self._turns(v['events'],'user')[2])
-                except Exception:v['human_pending_final']=False
+                v['human_pending_final']=bool(pending)
             self._save_call(v)
 
     def transcript_chunk(self,identity,role,text,generation=None):
@@ -676,7 +682,8 @@ class VoiceService:
             v['events']=[]
             metadata_changed=False
             if role=='user' and v['brief'].get('dialog_engine')=='gemini_live_flows':
-                if not v.get('human_pending_final'):
+                # Words after a granted permission are new speech even before their final arrives.
+                if not v.get('human_pending_final') or (v.get('close_requested') and _compact_words(text)):
                     v['human_revision']=v.get('human_revision',0)+1
                     self._revoke_closing(v,'new_human_input')
                     metadata_changed=True
@@ -773,13 +780,14 @@ class VoiceService:
         return self._latest_turn(v['events'],'user')
 
     def _latest_turn(self,events,role):
-        turn,_,pending=self._turns(events,role)
-        return ''.join(text for _,text,_ in pending) if pending else turn
+        turn,_,pending,_=self._turns(events,role)
+        return ''.join(item[1] for item in _newest_input(pending)) if pending else turn
 
     def _turns(self,events,role):
-        """Latest final, the event index where its input began, and the chunks no final has transcribed yet.
-        A final can arrive after newer speech (Pipecat flushes at a bot turn), so it clears only its own input."""
-        turn='';began=None;pending=[];split=False
+        """Latest final, the event index where its input began, the chunks no final has transcribed yet, and
+        whether that final restated pending chunks. A final can arrive after newer speech (Pipecat flushes at a
+        bot turn), so it clears only its own input."""
+        turn='';began=None;pending=[];split=False;restated=False
         for index,event in enumerate(events):
             if role=='user' and event['kind']=='audio_activity' and event.get('speaking'):
                 split=True
@@ -790,11 +798,11 @@ class VoiceService:
                     # [event index, text, starts a new input after other speech or a speech start]
                     pending.append([index,event['text'],split or not pending]);split=False
                 elif role=='user':
-                    turn=event['text'];began,pending=self._transcribed(pending,turn,index)
+                    turn=event['text'];began,pending,restated=self._transcribed(pending,turn,index)
                 else:
                     # An interrupted assistant final holds only the played part: unplayed chunks are not speech.
-                    turn=event['text'];began=pending[0][0] if pending else index;pending=[]
-        return turn,began,pending
+                    turn=event['text'];began=pending[0][0] if pending else index;pending=[];restated=False
+        return turn,began,pending,restated
 
     def _transcribed(self,pending,text,index):
         """Drop the pending input a final transcribes: it starts at an input start and shares the words."""
@@ -810,9 +818,9 @@ class VoiceService:
                         cut-=size;continue
                     # Pipecat sends one sentence per final, so a chunk can be transcribed only in part.
                     rest.append([item[0],_words_after(item[1],cut) if not rest else item[1],item[2] or not rest]);cut=0
-                return pending[k][0],rest
+                return pending[k][0],rest,True
         # Unmatched words: keep the newest input pending, so an old final never clears newer speech.
-        return (pending[0][0] if starts and starts[-1] else index),(pending[starts[-1]:] if starts else [])
+        return (pending[0][0] if starts and starts[-1] else index),(pending[starts[-1]:] if starts else []),False
 
     def _closing_intent(self,v,evidence,reason):
         text=' '.join(self._latest_human_turn(v).casefold().split())
@@ -882,8 +890,8 @@ class VoiceService:
                     if e['kind']=='audio_activity' and e.get('speaking')
                     and e.get('human_revision')==revision),None)
         if start is None:
-            _,began,pending=self._turns(events,'user')
-            start=pending[0][0] if pending else began
+            _,began,pending,_=self._turns(events,'user')
+            start=_newest_input(pending)[0][0] if pending else began
             if start is None:
                 return None
         previous=next((e for e in reversed(events[:start])
