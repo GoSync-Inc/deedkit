@@ -338,6 +338,13 @@ project; a journal naming anything else is refused before any Docker call. Recov
 `result.json` is abandoned (the job directory goes, no fence action: the calendar capture
 opens none) and the next run takes a new snapshot; an encrypted bundle and a lost receipt are
 delivered again under the same ID, with messaging's journal, `receiver_busy` wait and resume.
+The calendar delivers to the [R2 receiver](BACKUP_R2.md), which speaks only the v2 wire: the runner
+sends its staged `bundle.tar.age` over `backup-put-v2` (header `max_bytes` = the file's size and
+`snapshot_sha256` = the sha256 of the bundle's `manifest.json`, which the worker writes into
+`result.json` and the verifier's proof must equal; then 1 MiB frames and the footer), and a stored
+duplicate answers the header (ANYM-607). A `result.json` without `snapshot_sha256` (a backup image
+from before this) is refused `invalid_backup_result` before any upload, so this runner needs a backup
+image with the same change; messaging's delivery is unchanged.
 The worker deletes the plaintext staging right after encryption.
 
 Exclusion: a calendar run, a `--recover-stop` and a `Persistent=` catch-up first take the

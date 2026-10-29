@@ -295,3 +295,53 @@ def test_manifest_ignores_row_order_and_identifier_quoting_but_counts_duplicates
     with psycopg.connect(backward, autocommit=True) as c:
         c.execute("DELETE FROM public.\"Mixed\" WHERE ctid=(SELECT min(ctid) FROM public.\"Mixed\" WHERE note='a')")
     assert manifest_of(backward)[0]['public."Mixed"']['sha256'] != tables['public."Mixed"']['sha256']
+
+
+# spec: ANYM-605
+def test_worker_calendar_result_names_the_staged_manifest_hash_the_verifier_checks(tmp_path, monkeypatch):
+    manifest = b'{"profile":"calendar","captured_at":"2026-10-29T16:00:00+00:00","synthetic":true}\n'
+    def snapshot(dsn, destination, command, **kwargs):
+        destination.mkdir(mode=0o700); (destination / 'manifest.json').write_bytes(manifest)
+        return {'status': 'snapshot_created', 'profile': 'calendar', 'tables': 0, 'state_files': 0}
+    def encrypt(directory, output, recipient):
+        assert (directory / 'manifest.json').read_bytes() == manifest  # the bytes the bundle carries
+        output.write_bytes(b'age-encryption.org/v1\nsynthetic ciphertext')
+    monkeypatch.setattr(backup_calendar, 'create_calendar_snapshot', snapshot)
+    monkeypatch.setattr(backup_worker, 'encrypt_snapshot', encrypt)
+    (tmp_path / 'dsn').write_text('postgresql://synthetic:synthetic@calendar-db:5432/family_calendar')
+    (tmp_path / 'recipient').write_text('age1synthetic')
+    work = tmp_path / 'work'; work.mkdir(mode=0o700)
+    result = backup_worker.run({'profile': 'calendar', 'id': '20261029T160000Z-0123456789abcdef',
+                                'dsn_file': str(tmp_path / 'dsn'), 'vault_directory': str(tmp_path / 'vault'),
+                                'profile_directory': str(tmp_path / 'profile'),
+                                'recipient_file': str(tmp_path / 'recipient'), 'work_directory': str(work)})
+    assert result['snapshot_sha256'] == hashlib.sha256(manifest).hexdigest()
+    assert json.loads((work / 'result.json').read_text())['snapshot_sha256'] == result['snapshot_sha256']
+    assert not (work / 'snapshot').exists()
+
+
+# spec: ANYM-605
+def test_worker_calendar_manifest_hash_equals_the_decrypted_bundle_manifest(calendar_db, tmp_path, monkeypatch):
+    container = pg_tools()
+    if not shutil.which('age') or not shutil.which('age-keygen'):
+        if os.environ.get('CI'): pytest.fail('CI must provide age')
+        pytest.skip('age unavailable locally')
+    dsn = calendar_db()
+    vault, profile = write_state(tmp_path / 'src', {})
+    (tmp_path / 'dsn').write_text(dsn)
+    subprocess.run(['age-keygen', '-o', str(tmp_path / 'identity')], check=True, capture_output=True)
+    (tmp_path / 'recipient').write_text(subprocess.run(['age-keygen', '-y', str(tmp_path / 'identity')],
+        check=True, capture_output=True, text=True).stdout)
+    real = backup_worker.dump_credentials
+    monkeypatch.setattr(backup_worker, 'dump_credentials',
+        lambda value, directory: (docker_tool(container, value, 'pg_dump'), real(value, directory)[1]))
+    work = tmp_path / 'work'; work.mkdir(mode=0o700)
+    result = backup_worker.run({'profile': 'calendar', 'id': '20261029T160000Z-' + uuid.uuid4().hex[:16],
+                                'dsn_file': str(tmp_path / 'dsn'), 'vault_directory': str(vault),
+                                'profile_directory': str(profile), 'recipient_file': str(tmp_path / 'recipient'),
+                                'work_directory': str(work)})
+    from messaging_service.backup_crypto import decrypt_snapshot
+    decrypt_snapshot(work / 'bundle.tar.age', tmp_path / 'identity', tmp_path / 'restored')
+    # backup_restore_worker compares this file's sha256 with the receipt's snapshot_sha256.
+    with (tmp_path / 'restored' / 'manifest.json').open('rb') as f:
+        assert hashlib.file_digest(f, 'sha256').hexdigest() == result['snapshot_sha256']

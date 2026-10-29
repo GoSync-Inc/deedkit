@@ -1,4 +1,5 @@
 """The host backup runner's calendar profile (ANYM-608): no application container, locks against deploys."""
+import asyncio
 import copy
 import fcntl
 import hashlib
@@ -8,16 +9,18 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
 
-from messaging_service import backup_runner
+from messaging_service import backup_r2_receiver as r2, backup_runner
 from messaging_service.backup_receiver import AGE_HEADER
 from messaging_service.backup_runner import ID, Runner, read_json, write_json
 
 ROOT = Path(__file__).resolve().parents[1]
 OWNED = 'deedkit-calendar-backup-'
+MANIFEST = b'{"profile":"calendar","synthetic":true}'
 TRANSFER = {'host': 'backup.example.invalid', 'user': 'calbackup', 'identity_file': '/private/delivery_ed25519',
             'known_hosts_file': '/private/known_hosts'}
 
@@ -59,6 +62,7 @@ class CalendarDocker:
             assert read_json(work / 'worker.json')['profile'] == 'calendar'
             (work / 'snapshot').mkdir()
             (work / 'snapshot' / 'key').write_bytes(b'SYNTHETIC VAULT KEY')
+            (work / 'snapshot' / 'manifest.json').write_bytes(MANIFEST)
             if self.mode == 'fail':
                 info['State'].update(Running=False, Status='exited', ExitCode=1)
                 return ''
@@ -71,6 +75,7 @@ class CalendarDocker:
             (work / 'bundle.tar.age').write_bytes(data)
             write_json(work / 'result.json', {'v': 1, 'id': work.name, 'profile': 'calendar', 'status': 'encrypted',
                                               'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest(),
+                                              'snapshot_sha256': hashlib.sha256(MANIFEST).hexdigest(),
                                               'captured_at': '2026-10-28T00:00:00+00:00'})
             if self.mode == 'encrypt':
                 info['State'].update(Running=False, Status='exited', ExitCode=0)
@@ -539,3 +544,126 @@ def test_a_marker_without_a_journal_is_removed_only_when_its_worker_is_not_runni
     docker.containers.pop(container)
     runner.recover_stop()
     assert not unsettled(runner.cfg).exists()
+
+
+class ReceiverProcess:
+    """`ssh ... backup-put-<v>` whose far end is the real R2 receiver (`backup_r2_receiver.receive` on a synthetic S3)
+    in a thread, answering as its CLI does: `respond` lines, then the result or an error line."""
+    def __init__(self, config, cloud, args):
+        self.args, self.returncode = args, None
+        loop = asyncio.get_running_loop()
+        self.lines, self.done = asyncio.Queue(), loop.create_future()
+        read, self.write_fd = os.pipe()
+        def emit(value):
+            loop.call_soon_threadsafe(self.lines.put_nowait, (json.dumps(value, separators=(',', ':')) + '\n').encode())
+        def serve():
+            with os.fdopen(read, 'rb') as source:
+                try:
+                    emit(r2.receive(config, source, client=cloud, respond=emit)); code = 0
+                except Exception as exc:
+                    emit({'v': 1, 'status': 'error', 'code': str(exc)}); code = 1
+            loop.call_soon_threadsafe(self.done.set_result, code)
+        threading.Thread(target=serve, daemon=True).start()
+        async def nothing():
+            pass
+        self.stdin = SimpleNamespace(write=self.write, drain=nothing, close=self.close, wait_closed=nothing)
+        self.stdout = SimpleNamespace(readline=self.lines.get)
+    def write(self, data):
+        view = memoryview(data)
+        while view:
+            view = view[os.write(self.write_fd, view):]
+    def close(self):
+        if self.write_fd is not None:
+            os.close(self.write_fd); self.write_fd = None
+    async def wait(self):
+        self.returncode = await self.done
+        return self.returncode
+    def terminate(self):
+        self.close()
+    kill = terminate
+
+
+@pytest.fixture
+def r2_receiver(tmp_path, monkeypatch):
+    """The calendar runner's SSH upload reaches the real R2 receiver; returns its synthetic S3 and the argv seen."""
+    from tests.test_backup_r2 import Cloud
+    from tests.test_backup_r2 import write_json as private_json
+    if os.geteuid() == 0:
+        monkeypatch.setattr(os, 'geteuid', lambda: 1000)
+    state = tmp_path / 'receiver-state'; state.mkdir(mode=0o700)
+    private_json(tmp_path / 'credentials.json', {'access_key_id': 'a' * 32, 'secret_access_key': 'b' * 64})
+    private_json(tmp_path / 'receive.json', {
+        'v': 1, 'endpoint': 'https://' + '1' * 32 + '.r2.cloudflarestorage.com', 'bucket': 'synthetic-calendar',
+        'prefix': 'calendar', 'state_directory': str(state), 'credentials_file': str(tmp_path / 'credentials.json'),
+        'max_bytes': 20 * 1024 ** 2, 'quota_bytes': 40 * 1024 ** 2, 'max_objects': 2, 'part_bytes': 5 * 1024 ** 2,
+        'timeout_seconds': 900})
+    config, cloud, argv = r2.load_config(tmp_path / 'receive.json'), Cloud(), []
+    async def ssh(*args, **kwargs):
+        argv.append(args)
+        return ReceiverProcess(config, cloud, args)
+    monkeypatch.setattr(backup_runner.asyncio, 'create_subprocess_exec', ssh)
+    return cloud, argv
+
+
+def default_calendar_runner(tmp_path):
+    """A calendar runner with its production sender (no `send` stub)."""
+    cfg = calendar_cfg(tmp_path)
+    Path(cfg['host_lock']).parent.mkdir(mode=0o700)
+    docker = CalendarDocker(Path(cfg['directory']))
+    return Runner(cfg, docker=docker, sleep=lambda _: None), docker
+
+
+# spec: ANYM-608
+def test_a_calendar_run_delivers_its_staged_bundle_to_the_r2_receiver_over_the_v2_wire(tmp_path, r2_receiver):
+    cloud, argv = r2_receiver
+    runner, _ = default_calendar_runner(tmp_path)
+    runner.run()
+    status = read_json(runner.status_path)
+    assert status['state'] == 'ok' and argv[0][-1] == 'backup-put-v2'
+    job = Path(runner.cfg['directory']) / status['last_success_id']
+    receipt = read_json(job / 'delivery.json')
+    assert receipt['v'] == 2 and receipt['status'] == 'stored' and receipt['id'] == status['last_success_id']
+    # The verifier's proof must name this hash: the bundle manifest's (backup_r2_verifier.make_proof).
+    assert receipt['snapshot_sha256'] == hashlib.sha256(MANIFEST).hexdigest()
+    [stored] = [data for key, data in cloud.objects.items() if key.startswith('calendar/objects/')]
+    assert stored == (job / 'bundle.tar.age').read_bytes()
+    assert receipt['bytes'] == len(stored) == status['ciphertext_bytes']
+    assert receipt['sha256'] == hashlib.sha256(stored).hexdigest() == status['ciphertext_sha256']
+
+
+# spec: ANYM-608
+def test_a_receipt_lost_after_the_r2_receiver_stored_the_calendar_bundle_is_its_duplicate_not_a_second_object(
+        tmp_path, r2_receiver):
+    cloud, argv = r2_receiver
+    runner, docker = default_calendar_runner(tmp_path)
+    finish = runner.finish
+    def crash(work, result, receipt):
+        raise RuntimeError('host_crash')
+    runner.finish = crash
+    with pytest.raises(RuntimeError, match='host_crash'):
+        runner.run()
+    runner.finish = finish
+    runner.run()
+    status = read_json(runner.status_path)
+    receipt = read_json(Path(runner.cfg['directory']) / status['last_success_id'] / 'delivery.json')
+    assert status['state'] == 'ok' and receipt['duplicate'] is True and len(argv) == 2
+    assert len([key for key in cloud.objects if key.startswith('calendar/objects/')]) == 1
+    assert sum(args[0] == 'create' for args in docker.calls) == 1
+
+
+# spec: ANYM-608
+def test_a_calendar_result_without_its_manifest_hash_is_refused_before_any_upload(tmp_path, r2_receiver):
+    cloud, argv = r2_receiver
+    runner, docker = default_calendar_runner(tmp_path)
+    start = docker.call
+    def older_image(*args):
+        value = start(*args)
+        if args[0] == 'start':
+            work = Path(runner.cfg['directory']) / runner.journal['id']
+            result = read_json(work / 'result.json'); result.pop('snapshot_sha256')
+            write_json(work / 'result.json', result)  # a backup image from before ANYM-607
+        return value
+    docker.call = older_image
+    with pytest.raises(RuntimeError, match='invalid_backup_result'):
+        runner.run()
+    assert argv == [] and cloud.objects == {}
