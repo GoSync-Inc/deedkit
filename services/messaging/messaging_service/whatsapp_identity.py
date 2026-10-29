@@ -88,6 +88,11 @@ def record(archive,envelope,values,lease):
         row=c.execute('SELECT m.account,m.sender,m.deleted,ch.provider_chat FROM messages m '
             'JOIN chats ch ON ch.id=m.chat WHERE m.id=%s',(mid,)).fetchone()
         if not row or row['deleted'] or row['account']!=envelope['account']:return
+        # A provider tombstone not yet applied to the row removes it too (archive.ingest's predicate).
+        if c.execute('''SELECT 1 FROM provider_tombstones t WHERE t.account=%s AND t.provider_id=%s
+                AND (t.provider_chat=%s OR (t.provider_chat='' AND EXISTS(SELECT 1 FROM collector_chats cc
+                    WHERE cc.account=t.account AND cc.provider_chat=%s AND cc.peer_kind IN ('user','chat'))))''',
+                (envelope['account'],envelope['provider_id'],envelope['chat'],envelope['chat'])).fetchone():return
         if envelope['sender'] and any(v['identity_id']==row['sender'] for v in values):
             # Verified namespace data can provide a directory entry even when the
             # provider has no display name. Do not replace a name observation.
