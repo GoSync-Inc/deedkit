@@ -678,6 +678,35 @@ def test_a_run_whose_recorded_process_does_not_stop_fails_and_keeps_its_record(m
     zombie.wait()
 
 
+# spec: ANYM-639
+def test_finish_ends_within_its_bound_when_the_watchdog_outlives_its_kill(tmp_path):
+    # The script's functions without its dispatch, and a `kill` that drops the watchdog's KILL: a watchdog stuck
+    # in the kernel. An unbounded wait on it would hold the run for the watchdog's 60 s.
+    functions = SCRIPT.read_text().rsplit('\ncase "${1:-}" in', 1)[0]
+    run_dir = tmp_path / 'runs' / '1-1'
+    run_dir.mkdir(parents=True)
+    driver = functions + f'''
+kill() {{ if [ "$1" = -KILL ] && [ "$2" = "$WATCHDOG" ]; then return 0; fi; builtin kill "$@"; }}
+set -m
+sleep 60 </dev/null >/dev/null 2>&1 & WATCHDOG=$!
+echo "$WATCHDOG" > {tmp_path}/watchdog.pid
+WORKER=w SUITE=gateway START_ISO=t START_EPOCH=$SECONDS ROOT_DIR={tmp_path} WORKER_DIR={tmp_path}
+RUN_DIR={run_dir} CHILDREN="" DATABASES="" HOLDER="" STOP_SECONDS=1
+trap finish EXIT
+exit 0
+'''
+    started = time.time()
+    result = subprocess.run(['bash', '-c', driver], capture_output=True, text=True, timeout=30)
+    watchdog = int((tmp_path / 'watchdog.pid').read_text())
+    try:
+        assert result.returncode == 0, result.stderr
+        assert time.time() - started < 15
+        assert alive(watchdog) and not run_dir.exists()
+        assert (tmp_path / 'load.log').read_text().split('\t')[-1] == '0\n'
+    finally:
+        os.kill(watchdog, signal.SIGKILL)
+
+
 # docs/operations/remote-test-mini-setup.md section 1, run as written: its blocks with the system paths moved under
 # a temporary root, and fakes of ssh/scp (the mini's shell runs here), sudo, dscl, install, chown and visudo.
 SETUP_DOC = ROOT / 'docs' / 'operations' / 'remote-test-mini-setup.md'
