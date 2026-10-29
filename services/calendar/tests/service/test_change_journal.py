@@ -263,11 +263,43 @@ def test_caldav_probes_rotate_so_a_deleted_resource_behind_a_moved_one_is_found(
     for expected in ([], [source_ref("event", source_ref("res", "cal-i", deleted["href"]), uid, "master")]):
         with s.transaction() as c:
             lost = journal.missing(c, "cal-i", *window, set())
-        keys, probed = asyncio.run(providers.gone(cal, lost))
+        keys, probed = asyncio.run(providers.gone(cal, lost, None))
         entries = icloud_read(s, [], changes={"cancelled": keys, "probed": probed})
         assert [e["event_ref"] for e in entries] == expected
     # The moved resource was read first; the next refresh read the one behind it.
     assert probe.reads == [moved["href"], deleted["href"]]
+
+
+class SlowProbe(Probe):
+    async def read(self, href):
+        self.reads.append(href)
+        await asyncio.sleep(30)
+
+
+# spec: ANYM-565
+def test_a_probe_that_times_out_still_rotates_to_the_next_resource(household):
+    s = icloud(household)
+    first, second = sorted((single("visit-1", "20261104T080000Z"), single("visit-2", "20261105T080000Z")),
+                           key=lambda r: source_ref("res", "cal-i", r["href"]))
+    icloud_read(s, [first, second])
+    providers = Providers(s, None)
+    cal = {"provider": "icloud", "connection_id": "icloud-a", "target": HOME, "ref": "cal-i"}
+    window = ("2026-11-02T00:00:00Z", "2026-11-23T00:00:00Z")
+
+    async def refresh(adapter):
+        providers.adapters["icloud-a"] = adapter
+        with s.transaction() as c:
+            lost = journal.missing(c, "cal-i", *window, set())
+        return await providers.gone(cal, lost, asyncio.get_running_loop().time() + 0.2)
+
+    # The first resource hangs: attempted, nothing claimed, and the refresh goes on within its deadline.
+    keys, probed = asyncio.run(refresh(SlowProbe(set())))
+    assert (keys, probed) == ([], [source_ref("res", "cal-i", first["href"])])
+    assert icloud_read(s, [], changes={"cancelled": keys, "probed": probed}) == []
+    # The next refresh starts with the other one, which is gone.
+    keys, probed = asyncio.run(refresh(Probe({second["href"]})))
+    assert keys[0] == ["resource", source_ref("res", "cal-i", second["href"])]
+    assert len(icloud_read(s, [], changes={"cancelled": keys, "probed": probed})) == 1
 
 
 # spec: ANYM-565
@@ -284,19 +316,28 @@ def test_origin_names_the_deedkit_principal_that_wrote_the_resource(household):
     s.query("INSERT INTO audit(principal_id,action,ref,outcome) VALUES ('agent-a','operation','op-1','verified')")
     s.query("INSERT INTO operation_steps(operation_id,ordinal,state,intent) VALUES ('op-1',0,'verified',%s)",
             (Jsonb({"resource_ref": source_ref("res", "cal-a", "lesson"), "action": "update"}),))
-    entries = read(s, [dict(LESSON, summary="Moved by agent"), dict(DENTIST, summary="Moved by hand")])
+    # Queued after the read and interrupted by a restart before its audit row: its enqueue time counts.
+    s.query("INSERT INTO plans(id,principal_id,payload,scope_hash,expires_at) VALUES "
+            "('plan-2','agent-a','{}','x',now()+interval '1 hour')")
+    s.query("INSERT INTO operations(id,principal_id,plan_id,request_id,state) VALUES "
+            "('op-2','agent-a','plan-2','r-2','running')")
+    s.query("INSERT INTO operation_steps(operation_id,ordinal,state,intent) VALUES ('op-2',0,'sending',%s)",
+            (Jsonb({"resource_ref": source_ref("res", "cal-a", "party"), "action": "update"}),))
+    party = event("party", "2026-11-05T17:00:00Z", "2026-11-05T19:00:00Z")
+    entries = read(s, [dict(LESSON, summary="Moved by agent"), dict(DENTIST, summary="Moved by hand"), party])
     assert {e["event_ref"]: e["origin"] for e in entries} == {
-        ref("lesson"): "deedkit:agent-a", ref("dentist"): "provider"}
+        ref("lesson"): "deedkit:agent-a", ref("dentist"): "provider", ref("party"): "deedkit:agent-a"}
 
 
 # spec: ANYM-565
 def test_google_incremental_sync_cancels_and_its_token_is_stored(household):
     s = household
-    read(s, [LESSON, DENTIST], changes={"sync_token": "t1"})
+    read(s, [LESSON, DENTIST], changes={"sync": {"token": "t1"}})
     assert s.one("SELECT sync_token FROM journal_calendars")["sync_token"] == "t1"
     # A read of the next week learns from the incremental sync that the dentist (stored in this week) is cancelled:
     # journaled, and its occurrence leaves the projection, while its snapshot stays.
-    changes = {"cancelled": google_cancelled("cal-a", {"id": "dentist", "status": "cancelled"}), "sync_token": "t2"}
+    changes = {"cancelled": google_cancelled("cal-a", {"id": "dentist", "status": "cancelled"}),
+               "sync": {"token": "t2"}}
     [entry] = read(s, [], window=LATER, changes=changes)
     assert (entry["type"], entry["event_ref"]) == ("cancelled", ref("dentist"))
     assert s.one("SELECT sync_token FROM journal_calendars")["sync_token"] == "t2"
@@ -305,40 +346,61 @@ def test_google_incremental_sync_cancels_and_its_token_is_stored(household):
 
 
 class SyncAdapter:
+    """Google's sync: t1 -> one cancellation and t2; an expired token is a 410; a full run takes two steps."""
+
     def __init__(self):
         self.calls = []
 
-    async def changes(self, calendar, token=None, start=None):
-        self.calls.append((token, start))
+    async def changes(self, calendar, token=None, start=None, page=None, deadline=None):
+        self.calls.append((token, start, page))
         if token == "expired":
             return None
-        if token == "too-many":
-            raise CalendarError("coverage_incomplete")
         if token:
-            return [{"id": "dentist", "status": "cancelled"}], "t2"
-        return [{"id": "party", "status": "cancelled"}], "t1"
+            return {"items": [{"id": "dentist", "status": "cancelled"}], "done": True, "sync_token": "t2", "page": None}
+        if page is None:
+            return {"items": [{"id": "party", "status": "cancelled"}], "done": False, "sync_token": None, "page": "p2"}
+        return {"items": [{"id": "picnic", "status": "cancelled"}], "done": True, "sync_token": "t1", "page": None}
+
+
+def keys(*ids):
+    return [k for id in ids for k in google_cancelled("cal-a", {"id": id, "status": "cancelled"})]
 
 
 # spec: ANYM-565
-def test_providers_use_the_sync_token_and_resync_after_410():
+def test_providers_use_the_sync_token_and_resume_a_resync_after_410():
     providers = Providers(None, None)
     providers.adapters["google-a"] = adapter = SyncAdapter()
     cal = {"provider": "google", "connection_id": "google-a", "target": "private-a", "ref": "cal-a"}
-    start = datetime(2026, 11, 2, tzinfo=timezone.utc)
-    got = asyncio.run(providers.sync_changes(cal, "t1", start))
-    assert got == {"cancelled": google_cancelled("cal-a", {"id": "dentist", "status": "cancelled"}), "sync_token": "t2"}
-    # 410 or past the item cap: a full resync from the earliest tracked event claims its cancelled items, then
-    # its token replaces the old one.
-    resync = {"cancelled": google_cancelled("cal-a", {"id": "party", "status": "cancelled"}), "sync_token": "t1"}
-    assert asyncio.run(providers.sync_changes(cal, "expired", start)) == resync
-    assert adapter.calls[-2:] == [("expired", None), (None, start.isoformat())]
-    assert asyncio.run(providers.sync_changes(cal, "too-many", start)) == resync
-    assert asyncio.run(providers.sync_changes(dict(cal, provider="icloud"), "t1", start)) == {}
+    since = datetime(2026, 11, 2, tzinfo=timezone.utc)
+    got = asyncio.run(providers.sync_changes(cal, {"token": "t1"}, since))
+    assert got == {"cancelled": keys("dentist"), "sync": {"token": "t2", "page": None, "since": None}}
+    # 410: a full resync from the earliest tracked event; each step claims the cancellations it read, and a run that
+    # does not end resumes at its page with the same start, so no cancellation it passes is skipped.
+    first = asyncio.run(providers.sync_changes(cal, {"token": "expired"}, since))
+    assert first == {"cancelled": keys("party"), "sync": {"token": None, "page": "p2", "since": since}}
+    later = datetime(2026, 11, 9, tzinfo=timezone.utc)
+    second = asyncio.run(providers.sync_changes(cal, first["sync"], later))
+    assert second == {"cancelled": keys("picnic"), "sync": {"token": "t1", "page": None, "since": None}}
+    assert adapter.calls == [("t1", None, None), ("expired", None, None), (None, since.isoformat(), None),
+                             (None, since.isoformat(), "p2")]
+    assert asyncio.run(providers.sync_changes(dict(cal, provider="icloud"), {}, since)) == {}
+
+
+# spec: ANYM-565
+def test_a_resumed_sync_state_is_stored_with_the_window(household):
+    s = household
+    since = datetime(2026, 11, 2, tzinfo=timezone.utc)
+    read(s, [LESSON], changes={"sync": {"token": None, "page": "p2", "since": since}})
+    with s.transaction() as c:
+        assert journal.sync_state(c, "cal-a") == {"token": None, "page": "p2", "since": since}
+    read(s, [LESSON], changes={"sync": {"token": "t1", "page": None, "since": None}})
+    with s.transaction() as c:
+        assert journal.sync_state(c, "cal-a") == {"token": "t1", "page": None, "since": None}
 
 
 class SlowSync:
-    async def sync_changes(self, cal, token, since):
-        await asyncio.sleep(5)
+    async def sync_changes(self, cal, state, since, deadline=None):
+        await asyncio.sleep(30)
 
 
 # spec: ANYM-565
@@ -346,7 +408,7 @@ def test_a_slow_provider_sync_keeps_the_token_and_never_holds_the_worker(househo
     from family_calendar.service import worker as worker_module
 
     s = household
-    read(s, [LESSON], changes={"sync_token": "t1"})
+    read(s, [LESSON], changes={"sync": {"token": "t1"}})
     monkeypatch.setattr(worker_module, "SUPPLEMENT_S", 0.05)
     cal = {"provider": "google", "connection_id": "google-a", "target": "private-a", "ref": "cal-a"}
     started = asyncio.run(asyncio.wait_for(worker_module.Worker(s, SlowSync())._journal_changes(
@@ -358,7 +420,8 @@ def test_a_slow_provider_sync_keeps_the_token_and_never_holds_the_worker(househo
 
 
 # spec: ANYM-565
-def test_google_adapter_sync_requests_no_time_bounds_with_a_token_and_reads_410():
+def test_google_adapter_sync_requests_no_time_bounds_with_a_token_and_reads_410(monkeypatch):
+    from family_calendar.providers.google import adapter as adapter_module
     from family_calendar.providers.google.adapter import GoogleAdapter
 
     seen = []
@@ -376,12 +439,23 @@ def test_google_adapter_sync_requests_no_time_bounds_with_a_token_and_reads_410(
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             adapter = GoogleAdapter("google-a", client, lambda: "token")
             return (await adapter.changes("private-a", token="t1"), await adapter.changes("private-a", token="expired"),
-                    await adapter.changes("private-a", start="2026-11-02T00:00:00+00:00"))
+                    await adapter.changes("private-a", start="2026-11-02T00:00:00+00:00"),
+                    await adapter.changes("private-a", start="2026-11-02T00:00:00+00:00", page="p2"))
 
-    incremental, expired, initial = asyncio.run(run())
+    incremental, expired, initial, resumed = asyncio.run(run())
     # Only cancelled items are kept, in the incremental and in the full sync.
-    assert incremental == ([{"id": "a", "status": "cancelled"}], "t2")
-    assert expired is None and initial == ([{"id": "a", "status": "cancelled"}], "t2")
+    done = {"items": [{"id": "a", "status": "cancelled"}], "done": True, "sync_token": "t2", "page": None}
+    assert incremental == done and initial == done and expired is None
+    assert resumed == {"items": [], "done": True, "sync_token": "t2", "page": None}
+    # A step that reaches its page limit (or its deadline) returns its items and the page to resume from.
+    monkeypatch.setattr(adapter_module, "SYNC_PAGES", 1)
+
+    async def step():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await GoogleAdapter("google-a", client, lambda: "token").changes("private-a", token="t1")
+
+    assert asyncio.run(step()) == {"items": [{"id": "a", "status": "cancelled"}], "done": False, "sync_token": None,
+                                   "page": "p2"}
     assert all("timeMin" not in p and "timeMax" not in p for p in seen if "syncToken" in p)
     assert seen[-1]["timeMin"] == "2026-11-02T00:00:00+00:00" and "syncToken" not in seen[-1]
     # Only the fields that name an item and its status: no title, place or description is read.
@@ -467,6 +541,14 @@ def test_a_cancelled_event_stays_readable_in_agenda_for_30_days(household):
     read(s, [LESSON, {"id": "dentist", "status": "cancelled"}])
     assert "cancelled" not in service.agenda(key, ["cal-a"], *WINDOW)
     assert s.one("SELECT count(*) AS n FROM event_states WHERE event_ref=%s", (ref("dentist"),))["n"] == 0
+    # More than 500 cancelled at one span: the response says so, and each ref stays readable by event_refs.
+    s.query("INSERT INTO event_states(event_ref,calendar_ref,resource_ref,start_at,end_at,busy,details,cancelled_at) "
+            "SELECT 'event-'||g,'cal-a','res-'||g,'2026-11-06T10:00:00Z','2026-11-06T11:00:00Z',true,"
+            "'{\"title\": \"Visit\"}',now() FROM generate_series(1,501) g")
+    crowded = service.agenda(key, ["cal-a"], *WINDOW)
+    assert len(crowded["cancelled"]) == 500 and crowded["cancelled_incomplete"] is True
+    [last] = service.agenda(key, ["cal-a"], *WINDOW, event_refs=["event-99"])["cancelled"]
+    assert last["event_ref"] == "event-99"
 
 
 # spec: ANYM-565

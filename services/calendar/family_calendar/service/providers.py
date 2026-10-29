@@ -421,40 +421,59 @@ class Providers:
             }
         return rows
 
-    async def sync_changes(self, cal, token, since):
-        """Google's incremental sync for the journal (ANYM-565 criterion 4): {"cancelled": keys, "sync_token": next}
-        since `token`. Without one, after a 410 or past the item cap: a full resync from `since` (the earliest
-        tracked event), whose cancelled items are claimed too before its token replaces the old one. Other
-        providers: {} (their window diff uses each resource's etag and data)."""
+    async def sync_changes(self, cal, state, since, deadline=None):
+        """Google's sync for the journal (ANYM-565 criterion 4), one bounded step: {"cancelled": keys, "sync": the
+        calendar's next sync state}. State {"token", "page", "since"}: incremental since the token, or a full sync
+        from `since` (the earliest tracked event) when there is none, after a 410; a run that does not end before
+        `deadline` resumes at its page next time, and its cancelled items are claimed as they are read, so a resync
+        never skips the cancellations it passes. Other providers: {}."""
         if cal["provider"] != "google":
             return {}
         adapter = await self.adapter(cal)
-        result = None
-        if token:
-            try:
-                result = await adapter.changes(cal["target"], token=token)
-            except CalendarError as error:
-                if error.code != "coverage_incomplete":
-                    raise
+        token, page = state.get("token"), state.get("page")
+        full_since = state.get("since") or since
+        try:
+            result = await adapter.changes(cal["target"], token=token, start=None if token else full_since.isoformat(),
+                                           page=page, deadline=deadline)
+        except CalendarError:
+            if not page:
+                raise
+            # A page Google no longer serves: the run starts again from its token (or its start) next time.
+            return {"cancelled": [], "sync": {"token": token, "page": None, "since": None}}
         if result is None:
-            result = await adapter.changes(cal["target"], start=since.isoformat())
-        items, following = result
-        return {"cancelled": [k for e in items for k in google_cancelled(cal["ref"], e)], "sync_token": following}
+            token, full_since = None, since
+            result = await adapter.changes(cal["target"], start=since.isoformat(), deadline=deadline)
+            if result is None:
+                raise CalendarError("provider_unavailable")
+        keys = [k for e in result["items"] for k in google_cancelled(cal["ref"], e)]
+        if result["done"]:
+            return {"cancelled": keys, "sync": {"token": result["sync_token"], "page": None, "since": None}}
+        return {"cancelled": keys, "sync": {"token": token, "page": result["page"], "since": None if token else full_since}}
 
-    async def gone(self, cal, resources):
-        """CalDAV: of the resources [(resource_ref, target)] a window read lost, the first GONE_PROBES read back:
-        (cancellation keys of those that are deleted (404), the resource_refs probed). A resource still there moved
-        out of the window: no key (ANYM-565)."""
+    async def gone(self, cal, resources, deadline=None):
+        """CalDAV: of the resources [(resource_ref, target)] a window read lost, the first GONE_PROBES read back until
+        the loop-time `deadline`: (cancellation keys of those that are deleted (404), the resource_refs attempted).
+        A resource still there moved out of the window: no key. A failed or timed-out read counts as attempted, so
+        the next refresh goes on with the others (ANYM-565)."""
         if cal["provider"] != "icloud":
             return [], []
         adapter = await self.adapter(cal)
+        loop = asyncio.get_running_loop()
         keys, probed = [], []
         for resource_ref, target in resources[:GONE_PROBES]:
+            left = None if deadline is None else deadline - loop.time()
+            if left is not None and left <= 0:
+                break
             if not within_collection(target, cal["target"]):
                 continue
-            if await adapter.read(target) is None:
-                keys.append(["resource", resource_ref])
             probed.append(resource_ref)
+            try:
+                if await asyncio.wait_for(adapter.read(target), left) is None:
+                    keys.append(["resource", resource_ref])
+            except TimeoutError:
+                break
+            except Exception:
+                continue
         return keys, probed
 
     async def read(self, cal, target):

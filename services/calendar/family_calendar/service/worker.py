@@ -392,15 +392,18 @@ class Worker:
 
     async def _journal_changes(self, cal, start):
         """What the journal learns besides the window (ANYM-565): Google's incremental sync, read before the window
-        so a change between the two is in both. Bounded by SUPPLEMENT_S and never fails the read: on an error or
-        the time limit the stored token stays, and the next refresh reads the same changes again."""
+        so a change between the two is in both. One step of at most SUPPLEMENT_S that never fails the read: a run
+        that does not end resumes at its page next refresh; on an error the stored state stays and the next refresh
+        reads the same changes again."""
         try:
             with self.store.transaction() as c:
                 if not journal.ready(c):
                     return None
-                token = journal.sync_token(c, cal["ref"])
+                state = journal.sync_state(c, cal["ref"])
                 since = journal.tracked_since(c, cal["ref"], start)
-            return await asyncio.wait_for(self.providers.sync_changes(cal, token, since), SUPPLEMENT_S)
+            deadline = asyncio.get_running_loop().time() + SUPPLEMENT_S
+            # The step stops itself at the deadline and keeps its progress; the outer bound only catches a hang.
+            return await asyncio.wait_for(self.providers.sync_changes(cal, state, since, deadline), SUPPLEMENT_S * 1.5)
         except Exception:
             return {}
 
@@ -412,7 +415,8 @@ class Worker:
         try:
             with self.store.transaction() as c:
                 lost = journal.missing(c, cal["ref"], start, end, {r["resource_ref"] for r in resources})
-            keys, probed = await asyncio.wait_for(self.providers.gone(cal, lost), SUPPLEMENT_S)
+            deadline = asyncio.get_running_loop().time() + SUPPLEMENT_S
+            keys, probed = await asyncio.wait_for(self.providers.gone(cal, lost, deadline), SUPPLEMENT_S * 1.5)
             return dict(changes, cancelled=list(changes.get("cancelled", [])) + keys, probed=probed)
         except Exception:
             # An unexplained absence journals nothing (criterion 3); the window itself is still published.

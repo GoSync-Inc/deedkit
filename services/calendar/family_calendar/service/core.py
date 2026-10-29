@@ -500,7 +500,7 @@ class FamilyService:
         reason = self.store.guardian_readiness()
         return {"available": True} if not reason else {"available": False, "reason": reason}
 
-    def agenda(self, key, calendar_refs, start, end, scope="agenda:read", projection_status=False):
+    def agenda(self, key, calendar_refs, start, end, scope="agenda:read", projection_status=False, event_refs=None):
         a, b = window(start, end)
         if not calendar_refs or len(calendar_refs) > 32 or len(set(calendar_refs)) != len(calendar_refs):
             raise CalendarError("invalid_calendar_refs")
@@ -572,7 +572,7 @@ class FamilyService:
                         }
                 events.append(event)
             if cal["visibility"] == "details":
-                cancelled.extend(self._cancelled(calendar_ref, a, b))
+                cancelled.extend(self._cancelled(calendar_ref, a, b, event_refs or None))
         if len(events) > 500:
             raise CalendarError("coverage_incomplete")
         result = {
@@ -587,15 +587,16 @@ class FamilyService:
                 result["cancelled_incomplete"] = True
         return result
 
-    def _cancelled(self, calendar_ref, a, b):
+    def _cancelled(self, calendar_ref, a, b, event_refs=None):
         """Events of the window cancelled in the last 30 days, from their last stored state (ANYM-565 criterion 5):
-        the event_ref a calendar.event.cancelled names stays readable. Nothing before migration 8 and its grants."""
+        the event_ref a calendar.event.cancelled names stays readable, by its window or by event_refs. Nothing before
+        migration 8 and its grants."""
         with self.store.transaction() as c:
             if not c.execute(
                 "SELECT coalesce(has_table_privilege(to_regclass('event_states'),'SELECT'),false) AS ok"
             ).fetchone()["ok"]:
                 return []
-            rows = journal.cancelled(c, calendar_ref, a, b)
+            rows = journal.cancelled(c, calendar_ref, a, b, event_refs)
         return [
             {"calendar_ref": calendar_ref, "event_ref": r["event_ref"], "status": "cancelled",
              "start": r["start_at"].isoformat(),

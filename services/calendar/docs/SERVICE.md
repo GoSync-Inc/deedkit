@@ -295,21 +295,23 @@ refresh of a window that holds the event.
   just left a window, or a recurrence rule that stops producing an occurrence, is moved or unknown: no event, and the
   read of another window that finds it journals `changed`. A failed, partial or interrupted read journals nothing. A
   cancellation also removes the event's live occurrence wherever it is stored.
-- Google sync and CalDAV probes run before and after the window read, each within 15 s. On an error or that limit the
-  stored token stays (the next refresh reads the same changes again) and the window is still published. A 410 or more
-  than 5000 cancelled items starts a full resync from the earliest tracked event; its cancelled items are journaled
-  before its token replaces the old one. Only the item ID, status, series and original start are requested. The
-  probes read at most 25 lost resources per refresh, least recently probed first.
+- Google sync and CalDAV probes run before and after the window read, each one step of at most 15 s; the window is
+  always published. A sync run that does not end in its step (10 pages, or the 15 s) resumes at its page on the next
+  refresh, and the cancellations each step read are journaled with it; on an error the stored state stays and the
+  next refresh reads the same changes again. A 410 starts a full resync from the earliest tracked event, whose token
+  replaces the old one only when the run ends. Only the item ID, status, series and original start are requested,
+  and only cancelled items are kept. The probes read at most 25 lost resources per refresh, least recently probed
+  first; a failed or timed-out probe counts as probed.
 - `origin` is `deedkit:<principal>` when an operation of that principal sent a step to the event's resource (or a
-  Google instance's series master) and finished (its audit row) after the state the change is measured from, else
-  `provider`.
+  Google instance's series master) and finished (its audit row; an operation a restart interrupted counts from its
+  enqueue time) after the state the change is measured from, else `provider`.
 - An event outside 1970-01-01..9999-12-30 (the ANYM-562 time range) is kept in the baseline but not journaled.
 - If the journal write fails, its savepoint rolls back: the window still answers readers from the provider, the
   baseline does not move, an audit row `change_journal`/`failed` is written, and the next read journals the same
   changes once. Before migration 8 and its `db-roles` grants nothing is journaled.
 - A cancelled event stays readable for 30 days from its last stored state: `calendar_agenda` lists the window's
   cancelled events under `cancelled` (details visibility only; the key is absent when there are none; at most 500,
-  with `cancelled_incomplete: true` when a narrower window is needed). The worker deletes the state 30 days after
+  with `cancelled_incomplete: true` when there are more; `event_refs` (up to 100) lists only those refs). The worker deletes the state 30 days after
   cancellation.
 
 `GET /v1/events?after=<seq>&limit=<1-200>` and `GET /v1/events/head` serve the journal in the ANYM-562 producer

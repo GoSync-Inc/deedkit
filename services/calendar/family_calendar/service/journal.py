@@ -95,15 +95,17 @@ def cancelled_by(state, keys):
 
 
 def origins(c, refs):
-    """{resource_ref: [(finished_at, principal_id)]} of operations that sent a step to one of these resources.
-    The time is when the worker finished the operation (its audit row), after the provider write; the enqueue time
-    would put a write queued before a read but sent after it behind that read."""
+    """{resource_ref: [(time, principal_id)]} of operations that sent a step to one of these resources. The time is
+    when the worker last finished the operation (its audit row, after the provider write), so a write queued before
+    a read but sent after it counts; an operation a restart interrupted before its audit row counts from its
+    enqueue time."""
     found = {}
     if refs:
         for row in c.execute(
-            "SELECT s.intent->>'resource_ref' AS ref,o.principal_id,max(a.at) AS at FROM operation_steps s "
-            "JOIN operations o ON o.id=s.operation_id JOIN audit a ON a.action='operation' AND a.ref=o.id "
-            "WHERE s.intent->>'resource_ref'=ANY(%s) AND s.state=ANY(%s) GROUP BY 1,2",
+            "SELECT s.intent->>'resource_ref' AS ref,o.principal_id,coalesce(max(a.at),o.created_at) AS at "
+            "FROM operation_steps s JOIN operations o ON o.id=s.operation_id "
+            "LEFT JOIN audit a ON a.action='operation' AND a.ref=o.id "
+            "WHERE s.intent->>'resource_ref'=ANY(%s) AND s.state=ANY(%s) GROUP BY 1,o.id",
             (sorted(refs), list(SENT)),
         ):
             found.setdefault(row["ref"], []).append((row["at"], row["principal_id"]))
@@ -150,8 +152,9 @@ def write(c, entries):
 def record(c, calendar_ref, start, end, resources, changes=None):
     """Journals what a complete read of [start, end) changed and stores the new baseline; returns the entries.
 
-    changes: {"cancelled": [key, ...]} the provider's explicit cancellations outside the read (Google incremental
-    sync, a CalDAV resource read back as gone), and "sync_token" when the read carries the calendar's next token.
+    changes: {"cancelled": [key, ...]} the provider's explicit cancellations outside the read (Google sync, a CalDAV
+    resource read back as gone), "sync": the calendar's next Google sync state {token, page, since}, and "probed":
+    the resource_refs the CalDAV probes read.
     The first read of a calendar seeds the baseline and journals nothing: `created` means first seen after it.
     """
     changes = changes or {}
@@ -169,9 +172,10 @@ def record(c, calendar_ref, start, end, resources, changes=None):
         (calendar_ref,),
     ).fetchone()
     now = calendar["now"]
-    if "sync_token" in changes:
-        c.execute("UPDATE journal_calendars SET sync_token=%s WHERE calendar_ref=%s",
-                  (changes["sync_token"], calendar_ref))
+    if "sync" in changes:
+        sync = changes["sync"]
+        c.execute("UPDATE journal_calendars SET sync_token=%s,sync_page=%s,sync_since=%s WHERE calendar_ref=%s",
+                  (sync.get("token"), sync.get("page"), sync.get("since"), calendar_ref))
     c.execute("UPDATE journal_calendars SET refreshed_at=%s WHERE calendar_ref=%s", (now, calendar_ref))
     if changes.get("probed"):
         # Probed resources go to the back of the next refresh's probe order (providers.GONE_PROBES).
@@ -238,10 +242,11 @@ def tracked_since(c, calendar_ref, start):
     return min(row["t"], instant(start)) if row["t"] else instant(start)
 
 
-def sync_token(c, calendar_ref):
-    """The calendar's stored Google sync token, or None (no baseline yet, or none since a 410)."""
-    row = c.execute("SELECT sync_token FROM journal_calendars WHERE calendar_ref=%s", (calendar_ref,)).fetchone()
-    return row["sync_token"] if row else None
+def sync_state(c, calendar_ref):
+    """The calendar's stored Google sync state: {"token", "page", "since"} (all None before the first sync)."""
+    row = c.execute("SELECT sync_token AS token,sync_page AS page,sync_since AS since FROM journal_calendars "
+                    "WHERE calendar_ref=%s", (calendar_ref,)).fetchone()
+    return dict(row) if row else {"token": None, "page": None, "since": None}
 
 
 def missing(c, calendar_ref, start, end, read):
@@ -311,11 +316,12 @@ def page(c, after, limit, calendars):
     return dict(shell, events=events, next_after=position, has_more=position < last)
 
 
-def cancelled(c, calendar_ref, a, b):
-    """Cancelled events of a calendar whose last stored state overlaps [a, b), cancelled under RETENTION ago."""
+def cancelled(c, calendar_ref, a, b, event_refs=None):
+    """Cancelled events of a calendar whose last stored state overlaps [a, b), cancelled under RETENTION ago; with
+    event_refs, only those."""
     return c.execute(
         "SELECT * FROM event_states WHERE calendar_ref=%s AND cancelled_at>now()-%s AND start_at<%s AND end_at>%s "
-        "ORDER BY start_at,event_ref LIMIT 501",
-        (calendar_ref, RETENTION, b, a),
+        "AND (%s::text[] IS NULL OR event_ref=ANY(%s)) ORDER BY start_at,event_ref LIMIT 501",
+        (calendar_ref, RETENTION, b, a, event_refs, event_refs),
     ).fetchall()
 

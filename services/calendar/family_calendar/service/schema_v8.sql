@@ -3,8 +3,9 @@
 -- migration takes no lock on calendars (as 3-7).
 -- A calendar the journal has a baseline for: its first complete read seeds the baseline and journals nothing.
 -- sync_token is Google's nextSyncToken of the calendar (incremental sync); null before it has one or after a 410.
+-- sync_page is the page a sync run resumes at on the next refresh, sync_since the start of a full sync run.
 CREATE TABLE journal_calendars(calendar_ref text PRIMARY KEY, seeded_at timestamptz NOT NULL DEFAULT now(),
- refreshed_at timestamptz NOT NULL DEFAULT now(), sync_token text);
+ refreshed_at timestamptz NOT NULL DEFAULT now(), sync_token text, sync_page text, sync_since timestamptz);
 -- The last stored state of each event_ref read after the baseline: the next read's comparison baseline, and a
 -- cancelled event's snapshot, readable for 30 days after cancelled_at and then deleted by the worker. master_ref is
 -- the resource_ref of a Google instance's series master, which a series write names. probed_at: when the worker last
