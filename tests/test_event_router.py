@@ -138,6 +138,8 @@ def routed(seeded):
         return conn
     yield store, connect
     with store.pool.connection() as c:
+        # Open gaps would show as module_gap in other modules' subscription views.
+        c.execute('TRUNCATE module_router_cursors,module_router_gaps')
         c.execute(sql.SQL('DROP OWNED BY {}').format(sql.Identifier(role)))
         c.execute(sql.SQL('DROP ROLE {}').format(sql.Identifier(role)))
 
