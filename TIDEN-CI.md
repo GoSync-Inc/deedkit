@@ -353,6 +353,24 @@ until its push run, which then fails and needs a fix forward. Editing a pull
 request description does not rerun CI, and a rerun reuses the captured event, so
 adding a `Tiden intent branch:` line later needs a new push.
 
+A draft pull request's push runs only the tests its change can reach (owner
+decisions D36, D38). The `checks / documentation` job plans it with
+`scripts/affected_tests.py` as it is on the base commit (`HEAD^1`, with its shard
+timings), so a pull request never chooses its own tests: the module suites under
+the changed paths, and the root test modules whose import closure holds a changed
+module or a test or tool file that names a changed path. A full-suite path
+(`.github/`, the selector, the root environment, `tools/dev/`), a selection longer
+than the parallel suite, a `Tiden intent branch:` line, a failed or missing plan
+or any other event verifies in full. On such a run `checks / affected tests` runs
+the selection on one runner; `checks / verify`, the shards, `load`, `go`, `added`
+and `evidence` are skipped, the images are not built, `checks / tiden` records a
+skipped route, and `CI gate` accepts it only for a draft whose `affected` job
+tested this merge commit. Marking the pull request ready (`ready_for_review`)
+starts a full run, which its merge needs: the queue reuses only a full pull request
+run (`production.PULL_REQUEST_JOBS`), and the merge queue and main push are
+unchanged. Keep review rounds in draft; a push to a ready pull request verifies in
+full.
+
 For an explicit baseline rerun, dispatch `CI` on the reporting-code branch with
 `source_ref` set to the exact source revision and `tiden_branch` to the matching
 existing spec branch. The checkout SHA, rather than the workflow SHA, is recorded.

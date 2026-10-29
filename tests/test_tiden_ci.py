@@ -549,7 +549,7 @@ def test_ci_reports_required_checks_for_merge_queue_runs_without_cancelling_them
     assert checks.get("on", checks.get(True))["workflow_call"]["inputs"]["reuse_queue_evidence"]["default"] is False
     # It is skipped too on a pull request run of reviewed documentation only (ANYM-323).
     assert checks["jobs"]["verify"]["needs"] == "documentation"
-    assert checks["jobs"]["verify"]["if"] == "${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}"
+    assert checks["jobs"]["verify"]["if"] == "${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' && needs.documentation.outputs.affected != 'true' }}"
     step_ids = {step.get("id") for step in checks["jobs"]["verify"]["steps"]}
     assert set(CHECKS) <= step_ids
     # A queue run gets its own group and cancels nothing; so does a main push run.
@@ -2252,7 +2252,7 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
     # queue run that reuses a full pull request run of its tree (ANYM-358) or on a docs-only pull request run
     # (ANYM-323); it needs only that decision, never verify.
     assert load["needs"] == jobs["verify"]["needs"] == "documentation"
-    assert load["if"] == jobs["verify"]["if"] == "${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}"
+    assert load["if"] == jobs["verify"]["if"] == "${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' && needs.documentation.outputs.affected != 'true' }}"
     assert load["timeout-minutes"] == 10
     gate = next(step for step in load["steps"] if step.get("id") == "load")
     assert gate["name"] == "Paired gateway load and isolation budgets" and "if" not in gate
@@ -2265,7 +2265,7 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
         assert upload["with"]["name"] == f"ci-evidence-{job}" and upload["if"] == "${{ always() }}"
         assert upload["with"]["overwrite"] is True
     evidence = jobs["evidence"]
-    assert evidence["needs"] == ["documentation", "verify", "load", *SHARD_JOBS, "go", "added"] and evidence["if"] == "${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}"
+    assert evidence["needs"] == ["documentation", "verify", "load", *SHARD_JOBS, "go", "added"] and evidence["if"] == "${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' && needs.documentation.outputs.affected != 'true' }}"
     assert jobs["tiden"]["needs"] == ["documentation", "evidence"]
     steps = {step.get("name") or step["uses"].split("@")[0]: step for step in evidence["steps"]}
     assert steps["actions/download-artifact"]["with"]["pattern"] == "ci-evidence-*"

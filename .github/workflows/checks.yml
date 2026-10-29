@@ -44,6 +44,12 @@ on:
       docs_sha:
         description: The pull request merge commit or merge queue group commit the docs-only decision classified
         value: ${{ jobs.documentation.outputs.docs_sha }}
+      affected:
+        description: Whether this draft pull request run is affected-only (scripts/affected_tests.py, D36)
+        value: ${{ jobs.documentation.outputs.affected }}
+      affected_sha:
+        description: The commit the `affected` job tested, empty when it did not run
+        value: ${{ jobs.affected.outputs.source_sha }}
       tiden_published:
         description: Whether a passed Tiden run of this run's evidence was published and verified (not a skip)
         value: ${{ jobs.tiden.outputs.published }}
@@ -63,6 +69,10 @@ jobs:
     outputs:
       docs_only: ${{ steps.decide.outcome == 'success' && steps.decide.outputs.docs_only || 'false' }}
       docs_sha: ${{ steps.decide.outcome == 'success' && steps.decide.outputs.docs_sha || '' }}
+      affected: ${{ steps.plan.outcome == 'success' && steps.plan.outputs.affected || 'false' }}
+      affected_sha: ${{ steps.plan.outcome == 'success' && steps.plan.outputs.affected_sha || '' }}
+      affected_suites: ${{ steps.plan.outcome == 'success' && steps.plan.outputs.affected_suites || '[]' }}
+      affected_python: ${{ steps.plan.outcome == 'success' && steps.plan.outputs.affected_python || '' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -78,9 +88,24 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           BASE_SHA: ${{ github.event.merge_group.base_sha }}
         run: python3 scripts/docs_only.py
+      - name: Plan the tests a draft pull request's change can reach
+        id: plan
+        # D36: a draft push runs only these (the `affected` job); its `ready_for_review` run, the merge queue and the
+        # main push verify in full. The selector and its weights are the base commit's, so a pull request never
+        # chooses its own tests; a failed or missing plan (none on the base yet) verifies in full, never fails.
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft == true
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir "$RUNNER_TEMP/selector"
+          git show HEAD^1:scripts/affected_tests.py > "$RUNNER_TEMP/selector/affected_tests.py"
+          git show HEAD^1:scripts/python_shards.json > "$RUNNER_TEMP/selector/python_shards.json"
+          python3 "$RUNNER_TEMP/selector/affected_tests.py"
   verify:
     needs: documentation
-    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' && needs.documentation.outputs.affected != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -485,7 +510,7 @@ jobs:
     # The paired gateway load gate measures its latency and isolation budgets on a runner of its own,
     # in parallel with verify, instead of after the whole suite on the verify runner.
     needs: documentation
-    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' && needs.documentation.outputs.affected != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -544,7 +569,7 @@ jobs:
     # evidence. scripts/tiden_ci.py turns each `go test -json` stream into result rows under the identities
     # the existing Tiden cases carry.
     needs: documentation
-    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' && needs.documentation.outputs.affected != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -619,7 +644,7 @@ jobs:
     # so a shard job's result is its tests' and never a baseline's deliberate mismatch.
     name: python (${{ matrix.shard }}/6)
     needs: documentation
-    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' && needs.documentation.outputs.affected != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -783,7 +808,7 @@ jobs:
   python-3:
     name: python (${{ matrix.shard }}/6)
     needs: documentation
-    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' && needs.documentation.outputs.affected != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -798,7 +823,7 @@ jobs:
   python-4:
     name: python (${{ matrix.shard }}/6)
     needs: documentation
-    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' && needs.documentation.outputs.affected != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -813,7 +838,7 @@ jobs:
   python-5:
     name: python (${{ matrix.shard }}/6)
     needs: documentation
-    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' && needs.documentation.outputs.affected != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -828,7 +853,7 @@ jobs:
   python-6:
     name: python (${{ matrix.shard }}/6)
     needs: documentation
-    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' && needs.documentation.outputs.affected != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -840,6 +865,271 @@ jobs:
       source_sha: ${{ steps.source.outputs.sha }}
     services: *python-shard-services
     steps: *python-shard-steps
+  affected:
+    # D36: a draft pull request push runs only what the documentation job's plan names (scripts/affected_tests.py):
+    # the module suites under its changed paths and the root test modules its change can reach, on one runner. The
+    # full test jobs above are skipped, nothing feeds `evidence` and Tiden publishes nothing; CI gate passes this run
+    # only for a draft, whose `ready_for_review` run verifies in full before the pull request can enter the queue.
+    # The steps repeat the verify and shard commands they select.
+    name: affected tests
+    needs: documentation
+    if: ${{ !cancelled() && needs.documentation.outputs.affected == 'true' && needs.documentation.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DEEDKIT_TEST_PYTHON_IMAGE: docker.io/library/python@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
+      # A JSON list of suite names and a space-separated list of tests/ modules; steps match `"<suite>"` and paths.
+      SUITES: ${{ needs.documentation.outputs.affected_suites }}
+      PYTHON_MODULES: ${{ needs.documentation.outputs.affected_python }}
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    services: *python-shard-services
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_ref }}
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: ci-tools
+      - name: Delete the files autoloop pull requests add to tests before anything collects or builds a test
+        env:
+          ADDED_TESTS: ${{ inputs.added_tests }}
+        run: python3 ci-tools/scripts/added_tests.py strip --root . --root ci-tools --evidence "$RUNNER_TEMP/ci-evidence"
+      - name: Require the tested source to be the planned commit receiving this check
+        id: source
+        env:
+          PLANNED_SHA: ${{ needs.documentation.outputs.affected_sha }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          sha="$(git rev-parse HEAD)"
+          test "$sha" = "$PLANNED_SHA"
+          test "$sha" = "$EXPECTED_SHA"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Start the release router image build and the Python image pull in the background
+        if: env.PYTHON_MODULES != ''
+        run: |
+          mkdir -p "$RUNNER_TEMP/background"
+          finish() { if "${@:2}" > "$RUNNER_TEMP/background/$1.log" 2>&1; then echo 0; else echo 1; fi > "$RUNNER_TEMP/background/$1.tmp"; mv "$RUNNER_TEMP/background/$1.tmp" "$RUNNER_TEMP/background/$1.exit"; }
+          revision="$(git rev-parse HEAD)"
+          finish router docker build --file services/release-router/Dockerfile --tag deedkit-release-router:ci \
+            --build-arg "VERSION_REF=$revision" --label "org.opencontainers.image.revision=$revision" \
+            --label org.opencontainers.image.source=https://github.com/GoSync-Inc/deedkit . </dev/null >/dev/null 2>&1 &
+          finish python-image docker pull "$DEEDKIT_TEST_PYTHON_IMAGE" </dev/null >/dev/null 2>&1 &
+          if [[ " $PYTHON_MODULES " == *" tests/test_audio_native.py "* ]] && grep -Eq '^FROM[[:space:]].*[[:space:]]AS[[:space:]]+enricher-test[[:space:]]*$' Dockerfile; then
+            finish enricher-test docker build --target enricher-test --tag deedkit-enricher-test:ci . </dev/null >/dev/null 2>&1 &
+          fi
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with: {python-version: '3.13'}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with: {node-version: '24'}
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with: {version: '0.9.26'}
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.26.10'
+          cache-dependency-path: |
+            whatsapp/whatsmeow/go.sum
+            services/release-router/go.sum
+      - name: Native extraction tools
+        if: env.PYTHON_MODULES != '' || contains(env.SUITES, '"calendar"') || contains(env.SUITES, '"calls"')
+        timeout-minutes: 9
+        run: |
+          apt_opts=(-o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::Retries=3)
+          for attempt in 1 2; do
+            if [ "$attempt" = 2 ] && [ -f /etc/apt/apt-mirrors.txt ]; then echo 'http://archive.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null; fi
+            if sudo timeout --kill-after=10s 90 apt-get "${apt_opts[@]}" update && sudo timeout --kill-after=10s 150 apt-get "${apt_opts[@]}" install -y poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus ffmpeg age libglib2.0-0 libsndfile1 libopus0; then exit 0; fi
+            echo "::warning::Native extraction tools attempt $attempt failed"
+          done
+          exit 1
+      - name: Root environment, distributions and the environments the root suite starts
+        id: package
+        if: env.PYTHON_MODULES != '' || contains(env.SUITES, '"release"')
+        run: |
+          uv sync --frozen --group dev
+          python - <<'PYCODE'
+          import os,tomllib
+          from pathlib import Path
+          version=tomllib.loads(Path('services/messaging/pyproject.toml').read_text())['project']['version']
+          with open(os.environ['GITHUB_OUTPUT'],'a') as output:output.write(f'version={version}\n')
+          PYCODE
+          uv build --project services/messaging --out-dir dist
+          (cd packages/npm && npm pack --pack-destination ../../dist --ignore-scripts)
+          (cd services/gateway && uv sync --locked --group dev)
+          (cd services/calendar && uv sync --locked --group dev)
+      # ANYM-441: the forked whatsmeow pin must equal upstream + fork.patch before any of its code is built.
+      - name: Check the whatsmeow fork against upstream and fork.patch
+        id: whatsmeow_fork
+        if: env.PYTHON_MODULES != '' || contains(env.SUITES, '"go"')
+        run: python3 scripts/check_whatsmeow_fork.py
+      - name: Build native WhatsApp offline normalizer and install the pinned gitleaks
+        if: env.PYTHON_MODULES != ''
+        run: |
+          (cd whatsapp/whatsmeow && go build -trimpath -o "$RUNNER_TEMP/anymsg-whatsmeow" .)
+          echo "ANYMSG_WHATSMEOW_TEST_BINARY=$RUNNER_TEMP/anymsg-whatsmeow" >> "$GITHUB_ENV"
+          curl --fail --silent --show-error --location --retry 3 -o "$RUNNER_TEMP/gitleaks.tar.gz" \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check --strict
+          mkdir "$RUNNER_TEMP/gitleaks-bin"
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP/gitleaks-bin" gitleaks
+          echo "GITLEAKS=$RUNNER_TEMP/gitleaks-bin/gitleaks" >> "$GITHUB_ENV"
+      - name: Wait for the background router image and Python image
+        if: env.PYTHON_MODULES != ''
+        env:
+          BACKGROUND_WAIT_SECONDS: 900
+        run: |
+          for name in router python-image; do
+            for _ in $(seq "$BACKGROUND_WAIT_SECONDS"); do
+              test -f "$RUNNER_TEMP/background/$name.exit" && break
+              sleep 1
+            done
+            if [ "$(cat "$RUNNER_TEMP/background/$name.exit" 2>/dev/null)" != 0 ]; then
+              cat "$RUNNER_TEMP/background/$name.log" 2>/dev/null || true
+              echo "::error::background $name preparation failed or did not finish"
+              exit 1
+            fi
+          done
+      - name: Selected Python/PostgreSQL test modules
+        id: python
+        if: env.PYTHON_MODULES != ''
+        env:
+          PROBE_TEST_DSN_FILE: ${{ runner.temp }}/anymsg-test.dsn
+          ANYMSG_TEST_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          ANYMSG_TEST_WHEEL: ${{ github.workspace }}/dist/anymsg-${{ steps.package.outputs.version }}-py3-none-any.whl
+          ANYMSG_TEST_SDIST: ${{ github.workspace }}/dist/anymsg-${{ steps.package.outputs.version }}.tar.gz
+        run: |
+          DEEDKIT_TEST_ROUTER_IMAGE="$(docker image inspect --format '{{.Id}}' deedkit-release-router:ci)"
+          export DEEDKIT_TEST_ROUTER_IMAGE
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          p=Path(os.environ['PROBE_TEST_DSN_FILE'])
+          p.write_text('postgresql://probe_owner:synthetic-ci-password@127.0.0.1:5432/messaging_probe_test')
+          p.chmod(0o600)
+          PY
+          # The modules the shards run, minus the one the backup restore step runs under sudo; the same nodes the
+          # shards deselect run in their own steps below.
+          read -r -a modules <<< "$PYTHON_MODULES"
+          selected=()
+          for module in "${modules[@]}"; do
+            # A module the strip step deleted is an added test of an autoloop pull request: never run here.
+            if [ -f "$module" ] && [ "$module" != tests/test_backup_r2_verifier_native.py ]; then selected+=("$module"); fi
+          done
+          if [ "${#selected[@]}" = 0 ]; then echo "Only the backup restore module is selected"; exit 0; fi
+          uv run pytest --tb=short --durations=25 \
+            --deselect tests/test_collectors.py::test_session_lock_rejects_directory_chowned_to_foreign_uid_as_root \
+            --deselect tests/test_audio_native.py::test_optional_cpu_package_loads_without_gpu_or_model_download \
+            --deselect tests/test_audio_native.py::test_faster_whisper_decoder_compatibility_without_model "${selected[@]}"
+      - name: Isolated server backup restore with real age and PostgreSQL
+        if: ${{ !cancelled() && contains(format(' {0} ', env.PYTHON_MODULES), ' tests/test_backup_r2_verifier_native.py ') }}
+        run: |
+          python3 scripts/production.py check-image --target backup > "$RUNNER_TEMP/backup-image.json"
+          restore_image="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image"])' "$RUNNER_TEMP/backup-image.json")"
+          restore_revision="$(git rev-parse HEAD)"
+          sudo env DEEDKIT_TEST_BACKUP_IMAGE="$restore_image" DEEDKIT_TEST_BACKUP_REVISION="$restore_revision" \
+            "$PWD/.venv/bin/python" -m pytest --tb=short -p no:cacheprovider tests/test_backup_r2_verifier_native.py
+      - name: Root-only session lock test under sudo
+        if: ${{ !cancelled() && contains(format(' {0} ', env.PYTHON_MODULES), ' tests/test_collectors.py ') }}
+        env:
+          PYTHONDONTWRITEBYTECODE: 1
+        run: |
+          sudo env PYTHONDONTWRITEBYTECODE=1 "$PWD/.venv/bin/python" -m pytest --tb=short -p no:cacheprovider \
+            tests/test_collectors.py::test_session_lock_rejects_directory_chowned_to_foreign_uid_as_root
+      - name: Native audio decoder tests in the enricher test image without network
+        if: ${{ !cancelled() && contains(format(' {0} ', env.PYTHON_MODULES), ' tests/test_audio_native.py ') }}
+        env:
+          AUDIO_IMAGE_WAIT_SECONDS: 900
+        run: |
+          if ! grep -Eq '^FROM[[:space:]].*[[:space:]]AS[[:space:]]+enricher-test[[:space:]]*$' Dockerfile; then
+            echo "::notice::The tested Dockerfile has no enricher-test target"
+            exit 0
+          fi
+          for _ in $(seq "$AUDIO_IMAGE_WAIT_SECONDS"); do
+            test -f "$RUNNER_TEMP/background/enricher-test.exit" && break
+            sleep 1
+          done
+          if [ "$(cat "$RUNNER_TEMP/background/enricher-test.exit" 2>/dev/null)" != 0 ]; then
+            cat "$RUNNER_TEMP/background/enricher-test.log" 2>/dev/null || true
+            echo "::error::background enricher-test image build failed or did not finish"
+            exit 1
+          fi
+          docker run --rm --network none --read-only --tmpfs /tmp --user "$(id -u):$(id -g)" deedkit-enricher-test:ci \
+            python -m pytest --tb=short -p no:cacheprovider \
+            tests/test_audio_native.py::test_optional_cpu_package_loads_without_gpu_or_model_download \
+            tests/test_audio_native.py::test_faster_whisper_decoder_compatibility_without_model
+      - name: Release inventory, synthetic MCP and HTTP, and installed distributions
+        if: ${{ !cancelled() && contains(env.SUITES, '"release"') && steps.package.outcome == 'success' }}
+        run: |
+          uv run python scripts/check_release.py
+          uvx --from twine twine check dist/*.whl dist/*.tar.gz
+          uv run python scripts/smoke.py --dsn-file "$RUNNER_TEMP/anymsg-test.dsn"
+          uv venv "$RUNNER_TEMP/anymsg-wheel-env" --python 3.13
+          uv pip install --python "$RUNNER_TEMP/anymsg-wheel-env/bin/python" dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/anymsg-wheel-env/bin/python" -m anymsg --version
+          mkdir anymsg-npm-install
+          cd anymsg-npm-install
+          npm install --ignore-scripts --no-audit --no-fund "$GITHUB_WORKSPACE"/dist/*.tgz
+          ./node_modules/.bin/anymsg --version
+      - name: Gateway isolated package and transport tests
+        if: ${{ !cancelled() && contains(env.SUITES, '"gateway"') }}
+        working-directory: services/gateway
+        run: |
+          uv sync --locked --group dev
+          uv run pytest -q
+      - name: Shared platform contract package tests
+        if: ${{ !cancelled() && contains(env.SUITES, '"platform_contracts"') }}
+        working-directory: packages/platform-contracts
+        run: uv run --project ../../services/gateway --locked --group dev pytest -q -p no:cacheprovider --rootdir . tests
+      - name: Calendar provider policy and database tests
+        if: ${{ !cancelled() && contains(env.SUITES, '"calendar"') }}
+        working-directory: services/calendar
+        env:
+          FCS_TEST_DSN: postgresql://probe_owner:synthetic-ci-password@127.0.0.1:5432/messaging_probe_test
+        run: |
+          uv sync --locked --group dev
+          uv run pytest -m 'not live'
+          uv run --project ../../tools/dev --locked ruff check .
+      - name: Calls Python 3.13 native transports and synthetic workflows
+        if: ${{ !cancelled() && contains(env.SUITES, '"calls"') }}
+        working-directory: services/calls
+        run: |
+          uv sync --locked --group dev
+          uv run pytest -q
+      - name: Calls frontend tests and build
+        if: ${{ !cancelled() && contains(env.SUITES, '"calls_frontend"') }}
+        working-directory: services/calls/frontend
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          node --test tests/*.test.mjs
+          npm run build
+      - name: Node collector tests
+        if: ${{ !cancelled() && contains(env.SUITES, '"collector"') }}
+        run: node --test whatsapp/tests/*.test.mjs
+      - name: Node HTTP client tests
+        if: ${{ !cancelled() && contains(env.SUITES, '"npm"') }}
+        working-directory: packages/npm
+        run: node --test test/*.test.js ../wake-relay/test/*.test.mjs
+      - name: DeedKit JavaScript client and CLI tests
+        if: ${{ !cancelled() && contains(env.SUITES, '"deedkit_npm"') }}
+        run: npm test --prefix packages/deedkit
+      - name: Native WhatsApp adapter, forked whatsmeow patch and release router tests
+        if: ${{ !cancelled() && contains(env.SUITES, '"go"') && steps.whatsmeow_fork.outcome == 'success' }}
+        run: |
+          (cd whatsapp/whatsmeow && go test -race -count=1 ./... && go test -race -count=1 -run '^TestFork' go.mau.fi/whatsmeow)
+          (cd services/release-router && go test -race -count=1 ./...)
+      - name: Paired gateway load and isolation budgets
+        if: ${{ !cancelled() && contains(env.SUITES, '"load"') }}
+        run: |
+          (cd services/gateway && uv sync --locked --group dev)
+          uv sync --project tools/dev --locked
+          uv run --project tools/dev --locked python tests/platform/benchmarks/gateway_read_load.py --config tests/platform/benchmarks/budgets.json --output "$RUNNER_TEMP/load.json" --junit "$RUNNER_TEMP/load.xml"
+      - name: govulncheck (attestation verifier, blocking)
+        if: ${{ !cancelled() && contains(env.SUITES, '"attest_verify"') }}
+        working-directory: tools/attest-verify
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
   added:
     # ANYM-578: only the tests autoloop pull requests add (scripts/added_tests.py run), on a runner of their own: one
     # pytest per Python project, one `go test` per Go package and one `node --test` per package. The suites above
@@ -847,7 +1137,7 @@ jobs:
     # only `evidence` reads its fragment. With no added test it passes and says so.
     name: added tests
     needs: documentation
-    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' && needs.documentation.outputs.affected != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
@@ -921,7 +1211,7 @@ jobs:
     # failure itself is recorded (TIDEN-CI.md). A missing, failed, cancelled or skipped test job fails
     # this job whether or not Tiden reporting is configured.
     needs: [documentation, verify, load, python-2, python-3, python-4, python-5, python-6, go, added]
-    if: ${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
+    if: ${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' && needs.documentation.outputs.affected != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -1115,8 +1405,8 @@ jobs:
     if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     # Every step has a timeout and together they stay below the job's, so a hung Tiden call ends as a step
-    # failure, which only warns, and never as a cancelled job.
-    timeout-minutes: 20
+    # failure, which only warns, and never as a cancelled job (+1 minute for the affected-only receipt step).
+    timeout-minutes: 21
     outputs:
       published: ${{ steps.publish.outcome == 'success' && steps.publish.outputs.verified == 'true' }}
     steps:
@@ -1130,6 +1420,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}
           DOCS_ONLY: ${{ needs.documentation.outputs.docs_only }}
+          AFFECTED: ${{ needs.documentation.outputs.affected }}
           PR_REUSED: ${{ inputs.reuse_pr_verification }}
         run: |
           # A merge queue run publishes nothing, so it needs no Tiden configuration or CLI.
@@ -1142,6 +1433,10 @@ jobs:
             # A docs-only pull request or merge queue run ran no tests, so it has no evidence to publish.
             echo 'enabled=false' >> "$GITHUB_OUTPUT"
             echo 'docs_only=true' >> "$GITHUB_OUTPUT"
+          elif [ "$AFFECTED" = true ]; then
+            # A draft's affected-only run assembled no evidence; its ready run publishes the full suite's.
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+            echo 'affected=true' >> "$GITHUB_OUTPUT"
           elif [ "$EVENT_NAME" = merge_group ] || [[ "$SOURCE_BRANCH" == gh-readonly-queue/* ]]; then
             echo 'enabled=false' >> "$GITHUB_OUTPUT"
             echo 'queue=true' >> "$GITHUB_OUTPUT"
@@ -1220,6 +1515,14 @@ jobs:
         run: |
           python3 -c 'import json, os, pathlib; d = pathlib.Path(os.environ["RUNNER_TEMP"], "ci-evidence"); d.mkdir(parents=True, exist_ok=True); (d / "tiden-route.json").write_text(json.dumps({"branch": None, "source": "skipped", "reason": os.environ["REASON"]}))'
           echo "::notice title=Tiden evidence not published::$REASON"
+      - name: Record that a draft's affected-only run publishes nothing
+        if: steps.config.outputs.affected == 'true'
+        timeout-minutes: 1
+        env:
+          REASON: affected-only run of a draft pull request; only the tests its change reaches ran, and its ready run verifies and publishes in full
+        run: |
+          python3 -c 'import json, os, pathlib; d = pathlib.Path(os.environ["RUNNER_TEMP"], "ci-evidence"); d.mkdir(parents=True, exist_ok=True); (d / "tiden-route.json").write_text(json.dumps({"branch": None, "source": "skipped", "reason": os.environ["REASON"]}))'
+          echo "::notice title=Tiden evidence not published::$REASON"
       - name: Record that a merge queue run reusing the pull request verification publishes nothing
         if: steps.config.outputs.pr_reused == 'true'
         timeout-minutes: 1
@@ -1246,7 +1549,7 @@ jobs:
           PY
           echo "::notice title=Tiden evidence not published::$REASON ($TESTED_IN)"
       - name: Retain Tiden association and verdict receipt
-        if: ${{ always() && ((steps.config.outputs.enabled == 'true' || steps.config.outputs.queue == 'true') || steps.config.outputs.docs_only == 'true' || steps.config.outputs.pr_reused == 'true') }}
+        if: ${{ always() && ((steps.config.outputs.enabled == 'true' || steps.config.outputs.queue == 'true') || steps.config.outputs.docs_only == 'true' || steps.config.outputs.affected == 'true' || steps.config.outputs.pr_reused == 'true') }}
         timeout-minutes: 3
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

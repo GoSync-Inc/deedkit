@@ -4,7 +4,10 @@ on:
   # would duplicate CI and publish evidence to a second, same-named Tiden branch.
   push:
     branches: [main]
+  # A draft's pushes run only the tests their change reaches (D36, checks.yml `affected`); marking it ready starts
+  # the full run that its merge needs, so `ready_for_review` joins the default types.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   # The merge queue needs the required checks on its group commit; such a run
   # publishes nothing to Tiden (TIDEN-CI.md).
   merge_group:
@@ -210,6 +213,9 @@ jobs:
           VERIFIED_SHA: ${{ needs.checks.outputs.source_sha }}
           DOCS_ONLY: ${{ needs.checks.outputs.docs_only }}
           DOCS_SHA: ${{ needs.checks.outputs.docs_sha }}
+          AFFECTED: ${{ needs.checks.outputs.affected }}
+          AFFECTED_SHA: ${{ needs.checks.outputs.affected_sha }}
+          DRAFT: ${{ github.event.pull_request.draft }}
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
           EXPECTED_SHA: ${{ github.sha }}
@@ -232,6 +238,13 @@ jobs:
             # merge queue group commit (ANYM-323); a main push never takes it.
             [ "$EVENT_NAME" = pull_request ] || [ "$EVENT_NAME" = merge_group ]
             test "$DOCS_SHA" = "$EXPECTED_SHA"
+            test -z "$VERIFIED_SHA"
+          elif [ "$AFFECTED" = true ]; then
+            # checks / verify was skipped for the affected-only run of a draft pull request (D36): only its own
+            # `affected` job's pass on this merge commit counts, and never for a ready pull request, the queue or main.
+            test "$EVENT_NAME" = pull_request
+            test "$DRAFT" = true
+            test "$AFFECTED_SHA" = "$EXPECTED_SHA"
             test -z "$VERIFIED_SHA"
           else
             # Otherwise checks / verify tested this commit; one skipped for any other reason fails the gate.

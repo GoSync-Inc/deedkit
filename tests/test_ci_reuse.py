@@ -636,10 +636,11 @@ def test_only_a_main_push_decides_and_only_the_reuse_job_reads_actions():
 def test_a_reusing_push_skips_only_the_test_jobs_and_still_builds_publishes_and_records():
     ci, checks = workflows()
     skip = ("${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification "
-            "&& needs.documentation.outputs.docs_only != 'true' }}")
+            "&& needs.documentation.outputs.docs_only != 'true' && needs.documentation.outputs.affected != 'true' }}")
     assert checks["jobs"]["verify"]["if"] == checks["jobs"]["load"]["if"] == skip
     assert checks["jobs"]["evidence"]["if"] == ("${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification "
-                                                "&& needs.documentation.outputs.docs_only != 'true' }}")
+                                                "&& needs.documentation.outputs.docs_only != 'true' "
+                                                "&& needs.documentation.outputs.affected != 'true' }}")
     tiden = checks["jobs"]["tiden"]
     assert tiden["needs"] == ["documentation", "evidence"] and tiden["if"].startswith("${{ always() && !cancelled()")
     assert "reuse_queue_evidence" not in json.dumps(tiden)
@@ -670,6 +671,8 @@ def test_a_reused_main_push_still_publishes_and_records_after_a_green_gate():
 GREEN = {"DECISION": "full", "REUSE_RESULT": "skipped", "REUSED_SHA": "", "VERIFIED_SHA": SHA, "EVENT_NAME": "pull_request",
          "REF": "refs/pull/7/merge", "EXPECTED_SHA": SHA, "DOCS_ONLY": "false", "DOCS_SHA": "", "PR_DECISION": "",
          "PR_REUSE_RESULT": "skipped", "PR_REUSED_SHA": ""}
+# The gate's affected-only branch (D36) reads these too; unset, it never applies.
+AFFECTED_ENV = {"AFFECTED", "AFFECTED_SHA", "DRAFT"}
 REUSED = {"DECISION": "reuse", "REUSE_RESULT": "success", "REUSED_SHA": SHA, "VERIFIED_SHA": "", "EVENT_NAME": "push",
           "REF": "refs/heads/main", "EXPECTED_SHA": SHA, "DOCS_ONLY": "", "DOCS_SHA": "", "PR_DECISION": "",
           "PR_REUSE_RESULT": "skipped", "PR_REUSED_SHA": ""}
@@ -694,7 +697,7 @@ def test_ci_gate_passes_a_skipped_verify_only_for_a_validated_reuse_of_this_comm
     gate = ci["jobs"]["gate"]
     assert gate["needs"] == ["added_list", "reuse", "pr_reuse", "checks", "native", "images"]
     step = gate["steps"][1]
-    assert set(step["env"]) == set(GREEN)
+    assert set(step["env"]) - AFFECTED_ENV == set(GREEN)
     completed = subprocess.run(["bash", "-e", "-c", step["run"]], env={"PATH": "/usr/bin:/bin", **environment},
                                capture_output=True)
     assert (completed.returncode == 0) == passes
@@ -1008,7 +1011,7 @@ PR_REUSED = {**GREEN, "VERIFIED_SHA": "", "EVENT_NAME": "merge_group", "REF": "r
 def test_ci_gate_passes_a_queue_run_with_skipped_verify_only_for_its_validated_pull_request_reuse(environment, passes):
     ci, _ = workflows()
     step = ci["jobs"]["gate"]["steps"][1]
-    assert set(step["env"]) == set(PR_REUSED)
+    assert set(step["env"]) - AFFECTED_ENV == set(PR_REUSED)
     completed = subprocess.run(["bash", "-e", "-c", step["run"]], env={"PATH": "/usr/bin:/bin", **environment},
                                capture_output=True)
     assert (completed.returncode == 0) == passes

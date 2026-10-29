@@ -279,7 +279,7 @@ def test_ci_gate_passes_a_skipped_verify_only_for_the_docs_only_decision_of_this
         environment, passes):
     ci, _ = workflows()
     step = ci["jobs"]["gate"]["steps"][1]
-    assert set(step["env"]) == set(DOCS)
+    assert set(step["env"]) - {"AFFECTED", "AFFECTED_SHA", "DRAFT"} == set(DOCS)
     assert step["env"]["DOCS_ONLY"] == "${{ needs.checks.outputs.docs_only }}"
     assert step["env"]["DOCS_SHA"] == "${{ needs.checks.outputs.docs_sha }}"
     completed = subprocess.run(["bash", "-e", "-c", step["run"]], env={"PATH": "/usr/bin:/bin", **environment},

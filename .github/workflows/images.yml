@@ -28,6 +28,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DRAFT: ${{ github.event.pull_request.draft }}
           # Path prefixes copied into the images.yml targets (tests/test_tiden_ci.py
           # checks them against scripts/production.py BUILDS and the Dockerfiles), plus
           # the build driver, the publication script the build jobs run and the workflows.
@@ -54,6 +55,9 @@ jobs:
           build=true reason="$EVENT_NAME runs always build"
           if [ "$EVENT_NAME" = merge_group ]; then
             build=false reason='merge queue runs never build; the main push builds every target before publication'
+          elif [ "$EVENT_NAME" = pull_request ] && [ "$DRAFT" = true ]; then
+            # D36: a draft push runs only affected tests; its ready_for_review run builds any changed input.
+            build=false reason='draft pull request; the ready run builds any changed image input'
           elif [ "$EVENT_NAME" = pull_request ]; then
             reason='the pull request merge commit could not be established'
             # Only GitHub's two-parent merge of this exact head yields the pull request's diff.
