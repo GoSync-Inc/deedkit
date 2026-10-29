@@ -140,6 +140,8 @@ def run_calendar(config):
             else:os.environ['PGPASSFILE']=previous
     write_json(work/'captured.json',{'id':config['id'],'status':'capture_complete'})
     manifest=read_manifest(work/'snapshot')
+    # The R2 receiver's v2 header and the verifier's proof name the bundle by its manifest's hash (ANYM-607).
+    with (work/'snapshot/manifest.json').open('rb') as f:snapshot_sha=hashlib.file_digest(f,'sha256').hexdigest()
     output=work/'bundle.tar.age'
     try:encrypt_snapshot(work/'snapshot',output,Path(config['recipient_file']).read_text().strip())
     finally:
@@ -147,7 +149,7 @@ def run_calendar(config):
         shutil.rmtree(work/'snapshot')
     with output.open('rb') as f:digest=hashlib.file_digest(f,'sha256').hexdigest()
     result={'v':1,'id':config['id'],'profile':'calendar','status':'encrypted','bytes':output.stat().st_size,
-            'sha256':digest,'snapshot':snapshot,'created_at':datetime.now(timezone.utc).isoformat(),
+            'sha256':digest,'snapshot_sha256':snapshot_sha,'snapshot':snapshot,'created_at':datetime.now(timezone.utc).isoformat(),
             'captured_at':manifest['captured_at']}
     write_json(work/'result.json',result)
     print(json.dumps({'status':'encrypted','id':config['id'],'profile':'calendar','bytes':result['bytes']}),flush=True)

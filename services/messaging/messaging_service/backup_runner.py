@@ -279,13 +279,72 @@ async def upload_stream(path,metadata,transfer,timeout,start,completed,stopped=N
             except asyncio.TimeoutError:process.kill();await process.wait()
 
 
+async def upload_file_v2(path,result,transfer,timeout):
+    """The calendar's staged, already encrypted bundle over `backup-put-v2` framing: the R2 receiver speaks only v2.
+
+    The header bounds the object at the file's exact size and names the manifest hash the verifier's proof must
+    equal; a stored duplicate answers the header, otherwise the file goes in 1 MiB frames and a footer.
+    """
+    args=['ssh','-F','/dev/null','-T','-o','BatchMode=yes','-o','IdentitiesOnly=yes',
+        '-o','StrictHostKeyChecking=yes','-o','PasswordAuthentication=no','-o','KbdInteractiveAuthentication=no',
+        '-o','ConnectTimeout=15','-o','ServerAliveInterval=15','-o','ServerAliveCountMax=3',
+        '-o','UserKnownHostsFile='+transfer['known_hosts_file'],'-i',transfer['identity_file'],
+        transfer['user']+'@'+transfer['host'],'backup-put-v2']
+    env={k:v for k,v in os.environ.items() if k!='SSH_AUTH_SOCK'}
+    process=await asyncio.create_subprocess_exec(*args,stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,limit=4096,env=env)
+    async def response():
+        raw=await process.stdout.readline()
+        if len(raw)>4096 or not raw.endswith(b'\n'):raise RuntimeError('invalid_backup_receipt')
+        item=json.loads(raw)
+        if not isinstance(item,dict):raise RuntimeError('invalid_backup_receipt')
+        if item.get('status')=='error':
+            raise RuntimeError(item.get('code') if item.get('code') in SAFE_ERRORS else 'backup_delivery_failed')
+        if item.get('v')!=2 or item.get('id')!=result['id'] or item.get('snapshot_sha256')!=result['snapshot_sha256']:
+            raise RuntimeError('invalid_backup_receipt')
+        return item
+    def stored(item):
+        if item.get('status')!='stored' or item.get('bytes')!=result['bytes'] or item.get('sha256')!=result['sha256']:
+            raise RuntimeError('invalid_backup_receipt')
+        return item
+    async def exchange():
+        header={'v':2,'id':result['id'],'max_bytes':result['bytes'],'snapshot_sha256':result['snapshot_sha256']}
+        process.stdin.write((json.dumps(header,separators=(',',':'))+'\n').encode());await process.stdin.drain()
+        item=await response()
+        if item.get('status')=='stored':
+            process.stdin.close();await process.stdin.wait_closed()
+            if await process.wait()!=0:raise RuntimeError('backup_delivery_failed')
+            return stored(item)
+        if item.get('status')!='ready':raise RuntimeError('invalid_backup_receipt')
+        sha=hashlib.sha256();size=0
+        with Path(path).open('rb') as src:
+            while data:=src.read(1024**2):
+                size+=len(data);sha.update(data)
+                process.stdin.write(struct.pack('!I',len(data))+data);await process.stdin.drain()
+        footer={'bytes':size,'sha256':sha.hexdigest()}
+        if size!=result['bytes'] or footer['sha256']!=result['sha256']:raise RuntimeError('local_backup_corrupt')
+        process.stdin.write(struct.pack('!I',0)+(json.dumps(footer,separators=(',',':'))+'\n').encode())
+        await process.stdin.drain();process.stdin.close();await process.stdin.wait_closed()
+        receipt=await response()
+        if await process.wait()!=0:raise RuntimeError('backup_delivery_failed')
+        return stored(receipt)
+    try:return await asyncio.wait_for(exchange(),timeout)
+    finally:
+        if process.returncode is None:
+            process.terminate()
+            try:await asyncio.wait_for(process.wait(),10)
+            except asyncio.TimeoutError:process.kill();await process.wait()
+
+
 class Runner:
-    def __init__(self,cfg,*,docker=None,clock=time.time,sleep=time.sleep,send=upload,stream_send=upload_stream):
+    def __init__(self,cfg,*,docker=None,clock=time.time,sleep=time.sleep,send=None,stream_send=upload_stream):
         self.cfg=cfg;self.root=Path(cfg['directory']);self.root.mkdir(mode=0o700,parents=True,exist_ok=True)
         if self.root.is_symlink() or self.root.stat().st_mode&0o077:raise ValueError('private_backup_directory_required')
         self.journal_path=self.root/'journal.json';self.status_path=self.root/'status.json'
         self.docker=docker or Docker();self.clock=clock;self.sleep=sleep;self.send=send;self.stream_send=stream_send;self.journal=None
         self.calendar=cfg.get('profile')=='calendar'
+        # The calendar delivers to the R2 receiver, which takes only the v2 wire (ANYM-607).
+        if send is None:self.send=upload_file_v2 if self.calendar else upload
         # Exists from before the calendar worker is created until it is verified stopped: a deploy refuses while it
         # exists (production.py), also after this process died or failed its recovery and released the locks.
         self.unsettled_path=Path(cfg['host_lock']+'.unsettled') if self.calendar else None
@@ -666,6 +725,9 @@ class Runner:
             result=read_json(work/'result.json')
             path=work/'bundle.tar.age'
             if result.get('id')!=self.journal['id'] or result.get('status')!='encrypted' or path.is_symlink():
+                raise RuntimeError('invalid_backup_result')
+            # A backup image from before ANYM-607 names no manifest hash: its bundle could never be verified.
+            if self.calendar and not re.fullmatch('[a-f0-9]{64}',str(result.get('snapshot_sha256'))):
                 raise RuntimeError('invalid_backup_result')
             with path.open('rb') as f:
                 if path.stat().st_size!=result['bytes'] or hashlib.file_digest(f,'sha256').hexdigest()!=result['sha256']:

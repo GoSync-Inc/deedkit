@@ -179,6 +179,8 @@ and file ownership before changing the existing upload route.
 
 The producer keeps its existing host/user/key/known-hosts transfer configuration
 and uses `delivery_mode: "stream_v2"`; this backend does not accept `staged_v1`.
+The calendar runner's staged bundle (ANYM-607) reaches it over the same v2 wire (BACKUP.md, Family
+calendar), not as `staged_v1`.
 No R2 key or endpoint is added to the producer. Do not switch an in-flight job
 without reconciling its journal and exact prior destination: retrying a stale
 capture is not taking a fresh pre-migration snapshot.
