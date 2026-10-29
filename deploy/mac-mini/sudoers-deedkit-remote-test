@@ -1,3 +1,4 @@
-# /etc/sudoers.d/deedkit-remote-test (root:wheel 0440) on the Mac mini: egoregerev may run the DeedKit
-# remote-test shim as _deedkitci without a password, and nothing else as that user.
-egoregerev ALL=(_deedkitci) NOPASSWD: /usr/local/libexec/deedkit-remote-test
+# /etc/sudoers.d/deedkit-remote-test (root:wheel 0440) on the Mac mini: the admin account (the setup puts its
+# name in place of the placeholder) may run the DeedKit remote-test shim as _deedkitci without a password,
+# and nothing else as that user.
+@ADMIN@ ALL=(_deedkitci) NOPASSWD: /usr/local/libexec/deedkit-remote-test

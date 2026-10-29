@@ -42,7 +42,8 @@ their own test commands; the full list CI runs is in
 Maintainer agents never run these on their laptop. GitHub CI runs the full suites on every pull
 request. Before a push, `scripts/remote-test.sh <worktree> <suite> [test args]` (suite `root`,
 `calendar`, `gateway`, `calls`, `go`, `build`, `frontend` or `node`) runs ruff and the test modules the
-worktree touched on the maintainers' Mac mini; `--full` runs the whole suite there. It copies the
+worktree touched on the maintainers' Mac mini, whose ssh address it reads from the laptop's
+`~/.config/deedkit/mini-host`; `--full` runs the whole suite there. It copies the
 worktree's tracked and new files to the mini; it never copies `.env*`, keys, sessions, tokens or
 credentials (`--list <worktree>` shows what goes). There it runs as the service user `_deedkitci`
 against its own PostgreSQL 18 on 127.0.0.1, streams the output and exits with the suite's status. Tests

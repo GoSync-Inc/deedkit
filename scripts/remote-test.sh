@@ -12,7 +12,7 @@
 # (pytest paths/options; go packages); --full runs the whole suite. build, frontend and node always run whole.
 #
 # A run copies the worktree's tracked and untracked-but-not-ignored files, never a secret-shaped one
-# (is_secret), to /Users/Shared/deedkit-ci/stage/<worker> on the mini as egoregerev, then runs the suite as
+# (is_secret), to /Users/Shared/deedkit-ci/stage/<worker> on the mini as the admin account, then runs the suite as
 # the service user _deedkitci (sudo, docs/operations/remote-test-mini-setup.md) in its own copy
 # ~_deedkitci/deedkit-ci/<worker>/src, with a disposable PostgreSQL 18 on 127.0.0.1, and streams the output
 # back. Nothing of it uses docker there, so tests that need docker skip, as in the local flow without
@@ -31,7 +31,8 @@
 set -euo pipefail
 
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-HOST="${DEEDKIT_REMOTE_HOST:-egoregerev@100.88.40.111}"
+HOST="${DEEDKIT_REMOTE_HOST:-}"   # else need_host reads HOST_FILE: the repository names no host or account
+HOST_FILE="${HOME:-}/.config/deedkit/mini-host"
 SERVICE_USER="${DEEDKIT_REMOTE_USER:-_deedkitci}"
 SHIM="${DEEDKIT_REMOTE_SHIM:-/usr/local/libexec/deedkit-remote-test}"
 SHARED="${DEEDKIT_REMOTE_SHARED:-/Users/Shared/deedkit-ci}"
@@ -137,7 +138,7 @@ read_caps() {
   [ "$POLL_SECONDS" -ge 1 ] || POLL_SECONDS=1
 }
 
-# --- On the mini (as egoregerev for the Between check, as _deedkitci for everything else) --------------
+# --- On the mini (as the admin account for the Between check, as _deedkitci for everything else) --------------
 
 ROOT_DIR=""
 WORKER=""
@@ -181,7 +182,7 @@ free_mem_gb() {
   printf '%s' "${gb:-0}"
 }
 
-# As egoregerev: Between's containers on the default VM, a host load above MAX_LOAD (Between's own VM is
+# As the admin account: Between's containers on the default VM, a host load above MAX_LOAD (Between's own VM is
 # invisible to this docker; its load shows on the host), or too little free memory.
 between_busy() {
   local load mem
@@ -195,7 +196,7 @@ between_busy() {
   return 1
 }
 
-# --here busy [deadline]: as egoregerev, before every start attempt of a run. The first call sets the run's one
+# --here busy [deadline]: as the admin account, before every start attempt of a run. The first call sets the run's one
 # queue deadline (now + WAIT_SECONDS, mini clock) and prints it; later calls, after a queued attempt, wait under
 # that same deadline and refuse once it has passed.
 wait_not_busy() {
@@ -250,7 +251,7 @@ take_slot() {
 
 # Admission as _deedkitci: the disk guard, then (a run) one try for a slot and, holding it, the load and memory
 # caps again. A run that gets no slot or finds the mini busy holds nothing, waits POLL_SECONDS and returns
-# QUEUED; the laptop then repeats the Between check (as egoregerev) before it tries again, under one deadline.
+# QUEUED; the laptop then repeats the Between check (as the admin account) before it tries again, under one deadline.
 admit() {
   local mode="$1" free reason=""
   mkdir -p "$ROOT_DIR"
@@ -649,9 +650,19 @@ runner_here() {
 
 quoted() { local arg out=""; for arg in "$@"; do out="$out $(printf '%q' "$arg")"; done; printf '%s' "$out"; }
 
-# As egoregerev on the mini, and as the service user through its shim (the only sudo it may run).
+# The mini's ssh destination (user@address or an ssh alias): DEEDKIT_REMOTE_HOST, else the first line of
+# HOST_FILE, kept on the laptop only. Without one, or with one ssh would read as an option, nothing runs: CI covers.
+need_host() {
+  [ -n "$HOST" ] || HOST="$(head -1 "$HOST_FILE" 2>/dev/null || true)"
+  case "$HOST" in
+    "") say "no mini address (DEEDKIT_REMOTE_HOST or $HOST_FILE), CI covers"; exit "$UNREACHABLE" ;;
+    -*|*[[:space:]]*) die "bad mini address in DEEDKIT_REMOTE_HOST or $HOST_FILE" ;;
+  esac
+}
+
+# As the admin account on the mini, and as the service user through its shim (the only sudo it may run).
 as_owner() { ssh "${SSH_OPTS[@]}" "$HOST" "bash -s --$(quoted "$@")" < "$SELF"; }
-# From /: egoregerev's home, the ssh session's directory, is closed to the service user.
+# From /: the admin account's home, the ssh session's directory, is closed to the service user.
 as_service() { ssh "${SSH_OPTS[@]}" "$HOST" "cd / && sudo -n -u $SERVICE_USER $SHIM$(quoted "$@")" < "$SELF"; }
 
 # Files changed against the merge base with main (committed or not) plus new untracked ones, one per line.
@@ -687,7 +698,7 @@ select_touched() {
   done < <(touched_files "$tree")
 }
 
-# The Between check as egoregerev before each start attempt. The first call gets the run's one queue deadline
+# The Between check as the admin account before each start attempt. The first call gets the run's one queue deadline
 # (mini clock, WAIT_SECONDS from caps.conf) and every later call waits under it.
 DEADLINE=""
 wait_turn() {
@@ -720,6 +731,7 @@ laptop_run() {
       exit 0
     fi
   fi
+  need_host
   wait_turn || exit $?
   status=0
   as_service --here probe "$worker" || status=$?
@@ -735,7 +747,7 @@ laptop_run() {
   mkdir -p "$stage/src"
   list_files "$tree" > "$stage/files"
   tar -C "$tree" --null -T "$stage/files" -cf - | tar -C "$stage/src" -xpf -
-  # The mini stage is read by _deedkitci, not its owner egoregerev: readable to all (rsync -a keeps modes).
+  # The mini stage is read by _deedkitci, not its owner, the admin account: readable to all (rsync -a keeps modes).
   chmod -R go+rX "$stage/src"
   if ! ssh "${SSH_OPTS[@]}" "$HOST" "mkdir -p $(printf '%q' "$SHARED/stage/$worker")" ||
      ! rsync "${RSYNC_COPY[@]}" -e "ssh ${SSH_OPTS[*]}" "$stage/src/" "$HOST:$SHARED/stage/$worker/"; then
@@ -776,10 +788,11 @@ case "${1:-}" in
   --list)
     [ $# = 2 ] || die "usage: $0 --list <worktree>"
     list_files "$2" | tr '\0' '\n' ;;
-  --load) as_service --here load ;;
+  --load) need_host; as_service --here load ;;
   --cleanup)
     [ $# = 2 ] || die "usage: $0 --cleanup <worker>"
     valid_worker "$2" || die "bad worker name"
+    need_host
     status=0
     as_service --here cleanup "$2" || status=$?
     ssh "${SSH_OPTS[@]}" "$HOST" "rm -rf $(printf '%q' "$SHARED/stage/$2")"
