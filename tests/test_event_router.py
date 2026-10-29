@@ -764,18 +764,23 @@ def test_router_role_reads_and_moves_only_its_own_rows_and_gateway_reads_tolerat
 def test_a_refused_first_address_falls_back_to_the_next_within_the_deadline(producers, tmp_path, monkeypatch):
     producer = producers()
     producer.add()
-    module = producer.module(tmp_path, timeout_s=2)
+    token = producer.module(tmp_path).token_file
     with socket.socket() as probe:
         probe.bind(('127.0.0.1', 0))
         refused = probe.getsockname()[1]
-    port = producer.server.server_address[1]
-    # A name whose first address refuses (an IPv6 listener that is not there) and whose second answers.
-    monkeypatch.setattr(socket, 'getaddrinfo', lambda *a, **k: [
-        (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', refused)),
-        (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', port))])
+    port, real = producer.server.server_address[1], socket.getaddrinfo
+    name = 'producer.synthetic.test'
+    candidates = [
+        # A family this host cannot open with this protocol: socket() itself fails (as EAFNOSUPPORT for IPv6).
+        (socket.AF_UNIX, socket.SOCK_STREAM, 6, '', '/nonexistent/module.sock'),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', refused)),  # refuses
+        (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', port))]    # answers
+    # Only the synthetic name has several addresses; every other lookup (numeric ones included) stays real.
+    monkeypatch.setattr(socket, 'getaddrinfo', lambda host, *a, **k: list(candidates) if host == name
+        else real(host, *a, **k))
+    module = HttpModule('deedkit:calls', f'http://{name}:{port}', str(token), 2)
     assert module.head() == {'journal_id': 'journal-1', 'head': 1}
-    monkeypatch.setattr(socket, 'getaddrinfo', lambda *a, **k: [
-        (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', refused))])
+    del candidates[2]
     with pytest.raises(event_router.ModuleUnavailable, match='module_unreachable'):
         module.head()
 

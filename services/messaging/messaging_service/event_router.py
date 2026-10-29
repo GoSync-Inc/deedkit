@@ -127,12 +127,15 @@ class _Connection(http.client.HTTPConnection):
             left = self.deadline - time.monotonic()
             if left <= 0:
                 raise TimeoutError('module_timeout')
-            sock = socket.socket(family, kind, proto)
+            sock = None
             try:
+                # Inside the try: a family the host cannot open (EAFNOSUPPORT for IPv6) moves to the next address.
+                sock = socket.socket(family, kind, proto)
                 sock.settimeout(left)
                 sock.connect(address)
             except OSError as error:
-                sock.close()
+                if sock is not None:
+                    sock.close()
                 if isinstance(error, TimeoutError):
                     raise
                 failure = error
