@@ -93,7 +93,7 @@ SET LOCAL lock_timeout=DEFAULT;
 CREATE FUNCTION public.module_event_valid(p_id text, p_source text, p_type text, p_subject text,
   p_data jsonb, p_urgency text, p_expires_at timestamptz) RETURNS boolean
  LANGUAGE plpgsql STABLE SET search_path=pg_catalog AS $$
-DECLARE spec jsonb; rule text; item record; value jsonb; parts text[];
+DECLARE spec jsonb; rule text; item record; v jsonb; parts text[];
  specs constant jsonb := '{
   "calendar.event.created": {"subject": "event_ref", "optional": [], "keys": {"calendar_ref": "ref",
    "event_ref": "ref", "start_at": "time", "version": "int:0:9007199254740991"}},
@@ -118,8 +118,8 @@ BEGIN
  spec := specs->p_type;
  IF spec IS NULL OR p_data IS NULL OR jsonb_typeof(p_data)<>'object' OR octet_length(p_data::text)>1024
    OR p_id IS NULL OR p_id !~ '^(calendar|calls):[1-9][0-9]{0,15}$'
-   OR CASE WHEN p_id ~ '^(calendar|calls):[1-9][0-9]{0,15}$'
-     THEN split_part(p_id,':',2)::numeric>9007199254740991 ELSE true END
+   -- At most 2^53-1: 16 digits without a leading zero compare as text like numbers (no cast, no THEN here).
+   OR length(split_part(p_id,':',2))=16 AND split_part(p_id,':',2) COLLATE "C">'9007199254740991'
    OR split_part(p_id,':',1) IS DISTINCT FROM split_part(p_source,':',2)
    OR p_urgency IS NULL OR p_urgency NOT IN ('now','batch')
    OR p_subject IS DISTINCT FROM p_data->>(spec->>'subject')
@@ -129,34 +129,34 @@ BEGIN
  FOR item IN SELECT k FROM jsonb_object_keys(p_data) k LOOP
   IF NOT spec->'keys' ? item.k THEN RETURN false; END IF;
  END LOOP;
- FOR item IN SELECT key,value AS r FROM jsonb_each_text(spec->'keys') LOOP
-  value := p_data->item.key;
-  IF value IS NULL THEN
+ FOR item IN SELECT e.key,e.value AS r FROM jsonb_each_text(spec->'keys') e LOOP
+  v := p_data->item.key;
+  IF v IS NULL THEN
    IF NOT spec->'optional' ? item.key THEN RETURN false; END IF;
    CONTINUE;
   END IF;
   rule := item.r;
   IF rule IN ('ref','time','token') OR rule LIKE 'enum:%' THEN
-   IF jsonb_typeof(value)<>'string' THEN RETURN false; END IF;
+   IF jsonb_typeof(v)<>'string' THEN RETURN false; END IF;
   END IF;
-  IF rule='ref' AND value#>>'{}' !~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
-    OR rule='token' AND value#>>'{}' !~ '^[a-z][a-z0-9_]{0,47}$'
-    OR rule='time' AND (value#>>'{}' !~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})$'
-      OR NOT pg_input_is_valid(value#>>'{}','timestamptz'))
-    OR rule LIKE 'enum:%' AND NOT (value#>>'{}')=ANY(string_to_array(substr(rule,6),'|')) THEN
+  IF rule='ref' AND v#>>'{}' !~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+    OR rule='token' AND v#>>'{}' !~ '^[a-z][a-z0-9_]{0,47}$'
+    OR rule='time' AND (v#>>'{}' !~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})$'
+      OR NOT pg_input_is_valid(v#>>'{}','timestamptz'))
+    OR rule LIKE 'enum:%' AND NOT (v#>>'{}')=ANY(string_to_array(substr(rule,6),'|')) THEN
    RETURN false;
   END IF;
   IF rule LIKE 'int:%' THEN
    parts := string_to_array(rule,':');
-   IF jsonb_typeof(value)<>'number' OR (value#>>'{}') !~ '^-?[0-9]+$'
-     OR (value#>>'{}')::numeric NOT BETWEEN parts[2]::numeric AND parts[3]::numeric THEN
+   IF jsonb_typeof(v)<>'number' OR (v#>>'{}') !~ '^-?[0-9]+$'
+     OR (v#>>'{}')::numeric NOT BETWEEN parts[2]::numeric AND parts[3]::numeric THEN
     RETURN false;
    END IF;
   END IF;
-  IF rule='changed' AND (jsonb_typeof(value)<>'array' OR jsonb_array_length(value) NOT BETWEEN 1 AND 3
-    OR EXISTS(SELECT FROM jsonb_array_elements(value) e WHERE jsonb_typeof(e)<>'string'
+  IF rule='changed' AND (jsonb_typeof(v)<>'array' OR jsonb_array_length(v) NOT BETWEEN 1 AND 3
+    OR EXISTS(SELECT FROM jsonb_array_elements(v) e WHERE jsonb_typeof(e)<>'string'
       OR e#>>'{}' NOT IN ('start','end','details'))
-    OR (SELECT count(DISTINCT e) FROM jsonb_array_elements(value) e)<>jsonb_array_length(value)) THEN
+    OR (SELECT count(DISTINCT e) FROM jsonb_array_elements(v) e)<>jsonb_array_length(v)) THEN
    RETURN false;
   END IF;
  END LOOP;

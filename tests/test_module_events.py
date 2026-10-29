@@ -335,7 +335,7 @@ def test_unacked_module_matches_stay_and_a_pruned_range_is_a_gap_of_its_stream(m
         left = [row['event'] for row in c.execute('SELECT event FROM subscription_module_matches WHERE subscription=%s',
             (sid,))]
     assert left == [seqs[2]]
-    stale = store.get_subscription_events(token, sid, after=0)
+    stale = store.get_subscription_events(token, sid, after=0, module_after=0)
     assert stale['module']['gap']['reason'] == 'retention_gap' and stale['module']['gap']['stream'] == 'modules'
     assert stale['module']['items'] == [] and stale['module']['has_more'] is True
     assert stale['subscription']['gap'] is None  # the message stream has no gap
