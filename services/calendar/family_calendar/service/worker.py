@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import psycopg
 from psycopg.types.json import Jsonb
 from family_calendar.errors import CalendarError
+from . import journal
 from .core import FamilyService
 from .providers import created_event_ref
 from .store import instant
@@ -386,6 +387,30 @@ class Worker:
             ("operation", state, operation_id),
         )
 
+    async def _journal_changes(self, cal, start):
+        """What the journal learns besides the window (ANYM-565): Google's incremental sync, read before the window
+        so a change between the two is in both. Never fails the read: an error drops the token for a resync."""
+        try:
+            with self.store.transaction() as c:
+                if not journal.ready(c):
+                    return None
+                token = journal.sync_token(c, cal["ref"])
+            return await self.providers.sync_changes(cal, token, start)
+        except Exception:
+            return {"sync_token": None}
+
+    async def _gone(self, cal, start, end, resources, changes):
+        """CalDAV resources a window read lost, read back: a 404 is a deletion; one still there moved (no event)."""
+        if changes is None or cal["provider"] != "icloud":
+            return changes
+        try:
+            with self.store.transaction() as c:
+                lost = journal.missing(c, cal["ref"], start, end, {r["resource_ref"] for r in resources})
+            return dict(changes, cancelled=list(changes.get("cancelled", [])) + await self.providers.gone(cal, lost))
+        except Exception:
+            # An unexplained absence journals nothing (criterion 3); the window itself is still published.
+            return changes
+
     async def sync_one(self):
         with self.store.transaction() as conn:
             job = conn.execute(
@@ -414,8 +439,12 @@ class Worker:
                 ).fetchone()["ok"]:
                     self.store.query("UPDATE sync_jobs SET state='prepared' WHERE id=%s", (job["id"],))
                     return True
+                changes = await self._journal_changes(cal, job["start_at"])
                 resources = await self.providers.read_window(cal, job["start_at"], job["end_at"])
-                self.store.publish_window(cal["ref"], job["start_at"], job["end_at"], resources, "complete")
+                changes = await self._gone(cal, job["start_at"], job["end_at"], resources, changes)
+                self.store.publish_window(
+                    cal["ref"], job["start_at"], job["end_at"], resources, "complete", changes=changes
+                )
             state = "verified"
         except CalendarError as e:
             self.store.query(

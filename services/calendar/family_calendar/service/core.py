@@ -6,10 +6,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import psycopg
 from psycopg.types.json import Jsonb
 from family_calendar.errors import CalendarError
+from . import journal
 from .store import digest, instant, person_uuid, ref
 
 READ = ["agenda:read", "availability:read", "event:read", "assignment:read"]
 WRITE = ["plan:create", "plan:execute", "event:create", "event:update", "event:delete", "assignment:write"]
+# The event router's read of the change journal (ANYM-565): a key with this scope alone, nothing else.
+EVENTS = "calendar:events"
 
 
 def window(start, end):
@@ -503,6 +506,7 @@ class FamilyService:
             raise CalendarError("invalid_calendar_refs")
         coverage = []
         events = []
+        cancelled = []
         # Before migration 2 and its grants no link exists: agenda never reads the new tables then.
         projection_status = projection_status and not self.store.guardian_readiness()
         for calendar_ref in calendar_refs:
@@ -567,13 +571,54 @@ class FamilyService:
                             "operation_id": link["operation_id"],
                         }
                 events.append(event)
+            if cal["visibility"] == "details":
+                cancelled.extend(self._cancelled(calendar_ref, a, b))
         if len(events) > 500:
             raise CalendarError("coverage_incomplete")
-        return {
+        result = {
             "events": sorted(events, key=lambda x: x["start"]),
             "coverage": coverage,
             "required_sources_complete": all(c["status"] == "complete" for c in coverage),
         }
+        if cancelled:
+            result["cancelled"] = sorted(cancelled, key=lambda x: (x["start"], x["event_ref"]))[:500]
+        return result
+
+    def _cancelled(self, calendar_ref, a, b):
+        """Events of the window cancelled in the last 30 days, from their last stored state (ANYM-565 criterion 5):
+        the event_ref a calendar.event.cancelled names stays readable. Nothing before migration 8 and its grants."""
+        with self.store.transaction() as c:
+            if not c.execute(
+                "SELECT coalesce(has_table_privilege(to_regclass('event_states'),'SELECT'),false) AS ok"
+            ).fetchone()["ok"]:
+                return []
+            rows = journal.cancelled(c, calendar_ref, a, b)
+        return [
+            {"calendar_ref": calendar_ref, "event_ref": r["event_ref"], "status": "cancelled",
+             "start": r["start_at"].isoformat(),
+             "end": (r["start_at"] if r["details"].get("instant") else r["end_at"]).isoformat(),
+             "busy": r["busy"], "cancelled_at": r["cancelled_at"].isoformat(), **r["details"]}
+            for r in rows
+        ]
+
+    def events_page(self, key, after, limit):
+        """The change journal for the event router (GET /v1/events, ANYM-562 cursor contract): a key whose only scope
+        is calendar:events reads the events of the calendars it is bound to."""
+        p = self.principal(key)
+        if p["scopes"] != [EVENTS]:
+            raise CalendarError("not_found_or_forbidden")
+        with self.store.transaction() as c:
+            calendars = {r["calendar_ref"] for r in c.execute(
+                "SELECT calendar_ref FROM agent_calendars WHERE principal_id=%s", (p["id"],))}
+            return journal.page(c, after, limit, calendars)
+
+    def events_head(self, key):
+        p = self.principal(key)
+        if p["scopes"] != [EVENTS]:
+            raise CalendarError("not_found_or_forbidden")
+        with self.store.transaction() as c:
+            row = journal.head(c)
+        return {"journal_id": row["journal_id"], "head": row["head"]}
 
     def slots(self, key, member_ids, start, end, duration_minutes, additional_calendar_refs=None):
         p = self.principal(key)

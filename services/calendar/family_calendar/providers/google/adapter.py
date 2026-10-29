@@ -3,6 +3,9 @@ from urllib.parse import quote
 import httpx
 from family_calendar.errors import CalendarError
 
+# Pages of one sync request: the initial sync of a large calendar walks them all.
+SYNC_PAGES = 40
+
 
 class GoogleAdapter:
     def __init__(self, connection_id, client, token):
@@ -84,6 +87,32 @@ class GoogleAdapter:
                 "maxResults": 2500,
             },
         )
+
+    async def changes(self, calendar, token=None, start=None):
+        """Google incremental sync (ANYM-565): (items changed since `token`, the next sync token), or None when
+        Google no longer knows the token (410). Without a token, the initial sync from `start`, whose items only
+        yield the first token. Only the fields that name an item and its status are read."""
+        params = {"singleEvents": "false", "showDeleted": "true", "maxResults": 2500,
+                  "fields": "items(id,status,recurringEventId,originalStartTime),nextPageToken,nextSyncToken"}
+        params.update({"syncToken": token} if token else {"timeMin": start})
+        path = "calendars/" + quote(calendar, safe="") + "/events"
+        items, seen = [], set()
+        for _ in range(SYNC_PAGES):
+            page = await self.request("GET", path, params=params, missing=bool(token))
+            if page is None:
+                return None
+            if token:
+                items.extend(page.get("items", []))
+                if len(items) > 5000:
+                    raise CalendarError("coverage_incomplete")
+            cursor = page.get("nextPageToken")
+            if not cursor:
+                return items, page.get("nextSyncToken")
+            if cursor in seen:
+                raise CalendarError("coverage_incomplete")
+            seen.add(cursor)
+            params = dict(params, pageToken=cursor)
+        raise CalendarError("coverage_incomplete")
 
     async def exceptions(self, calendar, ical_uid):
         """A recurring event unexpanded: its master and its exceptions (instances changed or cancelled on their own)."""

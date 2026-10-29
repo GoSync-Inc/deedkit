@@ -60,3 +60,14 @@ DO $$ BEGIN
   GRANT UPDATE (state, result, error, answered_at) ON fcs.series_reads TO fcs_worker;
  END IF;
 END $$;
+-- Migration 8 (change journal, ANYM-565): the worker writes the journal, its baseline and head in the window's
+-- transaction and deletes cancelled snapshots after 30 days; the gateway serves the journal (GET /v1/events) and a
+-- cancelled event's snapshot in calendar_agenda. Skipped before migration 8.
+DO $$ BEGIN
+ IF to_regclass('fcs.change_journal') IS NOT NULL THEN
+  GRANT SELECT ON fcs.change_journal, fcs.journal_head, fcs.event_states TO fcs_gateway, fcs_worker;
+  GRANT SELECT, INSERT, UPDATE ON fcs.journal_calendars, fcs.journal_head TO fcs_worker;
+  GRANT INSERT ON fcs.change_journal TO fcs_worker;
+  GRANT INSERT, UPDATE, DELETE ON fcs.event_states TO fcs_worker;
+ END IF;
+END $$;

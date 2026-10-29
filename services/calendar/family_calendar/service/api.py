@@ -2,6 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 import json
+import re
 import time
 from typing import Annotated, Literal
 
@@ -16,6 +17,7 @@ from starlette.routing import Route
 
 from family_calendar.errors import CalendarError
 from . import core
+from . import journal as journal_module
 from .core import TIME_FORMAT, FamilyService, window
 from .schedule import DEFAULT_MINUTES, DEFAULT_WAIT_S, TOOL_NAME, Scheduler
 from .store import ref
@@ -594,6 +596,29 @@ def create_app(store, port=13232, allowed_hosts=None, allowed_origins=None):
         except Exception:
             return JSONResponse({"error": "service_unavailable"}, status_code=503)
 
+    async def journal(request: Request):
+        """GET /v1/events and /v1/events/head: the change journal in the ANYM-562 cursor contract (ANYM-565)."""
+        query = request.query_params
+        names = ("after", "limit") if request.url.path == "/v1/events" else ()
+        if set(query) - set(names) or any(len(query.getlist(k)) != 1 for k in query):
+            return JSONResponse({"error": "invalid_arguments"}, status_code=422)
+        after, limit = query.get("after", "0"), query.get("limit", "100")
+        if not (re.fullmatch("[0-9]{1,16}", after) and int(after) <= journal_module.MAX_SEQ
+                and re.fullmatch("[0-9]{1,3}", limit) and 1 <= int(limit) <= journal_module.MAX_LIMIT):
+            return JSONResponse({"error": "invalid_arguments"}, status_code=422)
+        try:
+            if names:
+                result = await asyncio.to_thread(gateway.service.events_page, agent_key.get(), int(after), int(limit))
+            else:
+                result = await asyncio.to_thread(gateway.service.events_head, agent_key.get())
+            return JSONResponse(result)
+        except CalendarError as e:
+            if e.code == "not_found_or_forbidden":
+                return JSONResponse({"error": e.code}, status_code=403)
+            return JSONResponse({"error": e.code}, status_code=503)
+        except Exception:
+            return JSONResponse({"error": "service_unavailable"}, status_code=503)
+
     async def health(request):
         return JSONResponse({"status": "ok", "service": "family-calendar", "version": "0.2.0"})
 
@@ -604,6 +629,8 @@ def create_app(store, port=13232, allowed_hosts=None, allowed_origins=None):
     app = Starlette(
         routes=[
             Route("/health", health),
+            Route("/v1/events", journal, methods=["GET"]),
+            Route("/v1/events/head", journal, methods=["GET"]),
             Route("/v1/{method}", rest, methods=["POST"]),
             Route("/mcp", MCP(), methods=["GET", "POST", "DELETE"]),
         ],
@@ -625,9 +652,14 @@ def create_app(store, port=13232, allowed_hosts=None, allowed_origins=None):
                 return await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
             key = auth[7:] if auth.startswith("Bearer ") else ""
             try:
-                await asyncio.to_thread(gateway.service.principal, key)
+                principal = await asyncio.to_thread(gateway.service.principal, key)
             except CalendarError:
                 return await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
+            # The event router's key reads the change journal and nothing else (ANYM-565).
+            if (principal["scopes"] == [core.EVENTS]) != scope["path"].startswith("/v1/events"):
+                return await JSONResponse({"error": "not_found_or_forbidden"}, status_code=403)(
+                    scope, receive, send
+                )
             length = headers.get("content-length", "0")
             if not length.isdigit() or int(length) > 65536:
                 return await JSONResponse({"error": "request_too_large"}, status_code=413)(

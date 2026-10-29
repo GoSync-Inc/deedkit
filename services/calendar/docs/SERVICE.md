@@ -276,6 +276,43 @@ A zero-length event (for example, DTSTART without DTEND) is published as a momen
 
 If a worker restarted during a read, that refresh becomes `failed`, and coverage gets `sync_interrupted`. It is not run again: a read that crashed the process would otherwise block all refreshes and operations. For a new read the agent calls agenda/slots with `refresh=true` again.
 
+## Change journal (ANYM-565, schema 8)
+
+Each complete window read is compared with the last stored state of every event it holds (`event_states`), and what
+changed is written to `change_journal` in the transaction that replaces the window. A change is seen only when a read
+covers it: there is no background refresh (ANYM-576), so a change appears no sooner than the next agenda or slots
+refresh of a window that holds the event.
+
+- The first read of a calendar seeds the baseline and journals nothing. `created` means *first seen after the
+  baseline*, not the provider's creation time: an event in a window first read later is `created` then.
+- `changed` names the fields that differ (`start`, `end`, `details`: title, place, description, busy and the other
+  agenda fields); an etag change alone is no change. The occurrences of one series that changed in one read are one
+  `changed` (its first changed occurrence, `series_ref`, the occurrence count). A moved occurrence keeps its
+  `event_ref` (Google: `recurringEventId` and `originalStartTime`; CalDAV: the UID and recurrence ID).
+- `cancelled` is claimed only on the provider's word: a Google item with status `cancelled` (in the window read or in
+  Google's incremental sync since the stored `nextSyncToken`; a 410 drops the token and the next read starts a full
+  resync), a CalDAV occurrence with `STATUS:CANCELLED`, a CalDAV occurrence a complete re-read of its unmoved slot no
+  longer has and no override moved, or a CalDAV resource read back as gone (404, at most 25 per read). An event that
+  just left a window is moved or unknown: no event, and the read of another window that finds it journals `changed`.
+  A failed, partial or interrupted read journals nothing.
+- `origin` is `deedkit:<principal>` when an operation of that principal sent a step to the event's resource (or a
+  Google instance's series master) since the state the change is measured from, else `provider`.
+- If the journal write fails, its savepoint rolls back: the window still answers readers from the provider, the
+  baseline does not move, an audit row `change_journal`/`failed` is written, and the next read journals the same
+  changes once. Before migration 8 and its `db-roles` grants nothing is journaled.
+- A cancelled event stays readable for 30 days from its last stored state: `calendar_agenda` lists the window's
+  cancelled events under `cancelled` (details visibility only; the key is absent when there are none). The worker
+  deletes the state 30 days after cancellation.
+
+`GET /v1/events?after=<seq>&limit=<1-200>` and `GET /v1/events/head` serve the journal in the ANYM-562 producer
+contract (root SUBSCRIPTIONS.md, Module events) to a key whose only scope is `calendar:events` (`service agent-key
+--scopes calendar:events --calendar <ref> ...`), for the calendars it is bound to. Each event is the envelope with
+`source` `deedkit:calendar`, `id` `calendar:<seq>`, `urgency` `batch`, a top-level `scope_ref` `calendar:<calendar_ref>`,
+and only the contract's data keys: `calendar_ref`, `event_ref`, `start_at`, `version` (not on `cancelled`) and
+`changed`. `series_ref`, the occurrence count and `origin` stay in the journal until the contract accepts them.
+`seq` is gapless and commits in order (writers take the one `journal_head` row); the journal is not pruned
+(`retention_floor` 0). Before the worker's first journal write the head is `503 journal_not_ready`.
+
 ## Operations
 
 `family-calendar-local status/start/stop` manages only its own macOS launch agents; PostgreSQL remains a separate persistent container. The Docker daemon must be running. Keys/passwords are not passed in argv/env; logs are private. On other OSes, run it manually or under your own supervisor.

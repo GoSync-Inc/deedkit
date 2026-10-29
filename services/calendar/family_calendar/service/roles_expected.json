@@ -55,5 +55,22 @@
       "SELECT fcs.series_reads", "UPDATE fcs.series_reads(state)", "UPDATE fcs.series_reads(result)",
       "UPDATE fcs.series_reads(error)", "UPDATE fcs.series_reads(answered_at)"
     ]
+  },
+  "8": {
+    "fcs_gateway": ["SELECT fcs.change_journal", "SELECT fcs.journal_head", "SELECT fcs.event_states"],
+    "fcs_worker": [
+      "SELECT fcs.change_journal",
+      "SELECT fcs.journal_head",
+      "SELECT fcs.event_states",
+      "SELECT fcs.journal_calendars",
+      "INSERT fcs.journal_calendars",
+      "UPDATE fcs.journal_calendars",
+      "INSERT fcs.journal_head",
+      "UPDATE fcs.journal_head",
+      "INSERT fcs.change_journal",
+      "INSERT fcs.event_states",
+      "UPDATE fcs.event_states",
+      "DELETE fcs.event_states"
+    ]
   }
 }
