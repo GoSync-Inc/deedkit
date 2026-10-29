@@ -935,6 +935,7 @@ class CommandWorker:
             result={'data':{'code':code,'retry':True}} if code=='provider_timeout' else None
             if code=='rate_limited' and exc.retry_after:
                 result={'data':{'code':code,'retry_after':exc.retry_after}}
+                if getattr(exc,'provider_lookup',None) is False:result['data']['provider_lookup']=False
             # ANYM-643: a Telegram flood wait (retry_after) reached the provider, so it counts as a lookup.
             if code=='rate_limited' and (job['operation']=='open_chat_by_phone' or
                                          job['operation']=='open_chat_by_username' and not exc.retry_after):

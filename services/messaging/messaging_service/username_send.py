@@ -48,11 +48,13 @@ def _admit(store, c, p, account, username, create):
 
 
 def _lookup(c, p, account, username):
-    """This key's latest username preview lookup inside the digest's validity."""
+    """This key's latest username preview lookup inside the digest's validity: a finished one for 10 minutes
+    after it finished (the expiry the preview returns), an unfinished one for 10 minutes after it was queued."""
     return c.execute('''SELECT *,finished_at>clock_timestamp()-%s*interval '1 second' AS fresh
         FROM messenger_commands WHERE principal=%s AND key_id=%s AND account=%s
         AND operation='open_chat_by_username' AND payload->>'username_preview'='true'
-        AND payload->'parameters'->>'username'=%s AND created_at>clock_timestamp()-%s*interval '1 second'
+        AND payload->'parameters'->>'username'=%s
+        AND coalesce(finished_at,created_at)>clock_timestamp()-%s*interval '1 second'
         ORDER BY created_at DESC,id DESC LIMIT 1''',
         (DIGEST_VALID_SECONDS, p['id'], p['key_id'], account, username, DIGEST_VALID_SECONDS)).fetchone()
 

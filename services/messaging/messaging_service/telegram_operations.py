@@ -1413,11 +1413,18 @@ async def open_by_username(client, job, parameters, rpc, collection_policy, allo
         reject('chat_not_collected')
     if job.get('lookup_allowed') is not True:
         reject('rate_limited')
+    asked = []
+
+    def resolve():
+        asked.append(True)
+        return client(functions.contacts.ResolveUsernameRequest(username))
     try:
-        resolved = await rpc(lambda: client(functions.contacts.ResolveUsernameRequest(username)),
-                             scope='resolve_username')
+        resolved = await rpc(resolve, scope='resolve_username')
     except ProviderRateLimited as exc:
-        raise CommandRejected('rate_limited', retry_after=exc.seconds) from None
+        refusal = CommandRejected('rate_limited', retry_after=exc.seconds)
+        # A pause the governor already held refuses before Telegram is asked: no lookup is spent.
+        refusal.provider_lookup = bool(asked)
+        raise refusal from None
     except (errors.UsernameNotOccupiedError, errors.UsernameInvalidError):
         reject('username_not_found')
     peer = getattr(resolved, 'peer', None)
