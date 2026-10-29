@@ -22,22 +22,82 @@ affect every pull request make parallel edits collide.
   another task's files goes to the orchestrator.
 - Draft first (owner 10-27, paid CI minutes): workers open pull requests as drafts, run the
   project's local checks before every push and mark the pull request ready (`gh pr ready <n>`)
-  once local checks and reviews pass; nothing skips a required check or the `main` push run.
-  Whoever enqueues (the worker, or the orchestrator when it merges) enqueues only a ready pull
+  once local checks pass and either reviews pass or the push that carries the fixes of every open
+  finding is made (only the confirming recheck left): then CI runs alongside the recheck (owner
+  10-29); the recheck never waits for that run (reviews.md, Rounds 4). A recheck finding returns
+  it to draft (`gh pr ready <n> --undo`) and cancels that head's run in flight (`gh run cancel <id>`) before its fix; that costs one more CI run. Nothing skips a
+  required check or the `main` push run. Whoever enqueues (the worker, or the orchestrator when
+  the project's merge lock or the brief names it as merger) enqueues only a ready pull
   request, and only after the run that `ready_for_review` (or a later push) started for the
   head SHA has finished with no required job `skipped`: a draft's skipped checks read as
   passed, and a gate job's dependants get new check runs only once it ends. "First CI run green" (Sessions) means the first run after ready.
+- No parking, merge without the orchestrator (owner 10-29, every project): after a verdict the
+  worker starts the fix and the next round in the same turn and never idles with a pull request in
+  review; a wait on CI or another pull request is a background wait (Sessions), not silence. Once
+  the review has passed (no open blocking or major finding) and the ready run has finished with no
+  required job skipped (Draft first), the worker arms the merge itself (`gh pr merge <n> --squash
+  --auto`, or the project's merge step) without waiting for the orchestrator; the required checks
+  gate it. Exception: when the project's merge lock or a rule for paths its AGENTS.md marks shared,
+  or the brief, names the orchestrator as merger, the worker reports and the orchestrator arms.
+- Conflict guard before arming (study 10-29: conflicts cost queue re-entries): the worker runs
+  `bin/merge-guard.sh [base]` in its worktree on its pushed head before it arms, or before it
+  reports ready when the orchestrator arms (which then arms only on a clean guard). Exit 3: push
+  first; 2: a git or fetch error, fix it; neither arms. Exit 1 lists the conflicting paths: in
+  this task's files rebase, rerun the project's local checks, push, guard again, and arm once that
+  head's run has finished (Draft first); in another task's files report to the orchestrator
+  (above). Tests appended at the end of a shared test file are the common cause: add them beside
+  related tests.
+- One task while waiting (owner 10-29): a worker waiting on CI or the queue keeps its one task (no
+  other branch meanwhile, its context stays clean); the orchestrator starts more workers instead.
 - Project-side CI change for a private repository with paid minutes (the project's Boss, named
   in its AGENTS.md; not a harness script): `pull_request.types` lists
   `opened, synchronize, reopened, ready_for_review`, and jobs skip drafts with
   `if: github.event_name != 'pull_request' || !github.event.pull_request.draft` (on each job,
   or on one first gate job the others need); `push` and `merge_group` runs stay. Draft pushes
   then cost nothing; `ready_for_review` starts the real run.
+- CI once per pull request (owner 10-29, every project; its Boss changes its own CI; a ruleset
+  or required-check change, merge-queue grouping included, is process.md section 2: Astra r1, the
+  safe GET->PUT path). The full suite runs once before merge, on the head that merges: in the merge queue or a
+  batch; a project with neither runs it on `ready_for_review` and again on any later push to the
+  ready pull request (so review rounds happen in draft until the last fix push, Draft first above). Draft pushes (review rounds included) keep the draft skip above or run only
+  the tests the change affects (touched modules and their dependents). Recommended: each draft
+  review-fix push reports such a run as its own non-required status (`affected`, never the
+  required check's name), so a red shows during review and is fixed before ready; the full suite
+  stays on ready and merge as below. Keep the full suite on the
+  `main` push run: Done and tiden.md's test evidence read that run. The required status keeps
+  meaning "full suite passed on the merge head"; with the full suite only in the merge queue, the
+  `merge_group` run of the required check is the full suite, and the same check name on the pull
+  request head comes from the affected-only run (never `skipped`, never a bypass). A project
+  switches only after a replay of about 20 recent pull requests shows the affected-only selection
+  missed no failure the full suite caught.
+  - Batches: when several pull requests are ready, the full suite runs once on their combination
+    and green merges them together. Merge-queue grouping waits minutes at most for a second pull
+    request (a lone one merges alone), and on red the queue bisects; local CI: a batch runner
+    that sets the required status on a head only for the exact tree it tested, and on red tests
+    them one by one. Before the first batch, sync B and every `main` push job that acts per squash
+    (release record, tags) read the push range (`github.event.before`..`after`), not the head
+    commit only (tiden.md, One Tiden branch per pull request).
+  - Timeouts that caused reruns (job, step, per test, database start) go to about 1.5x the p99 of
+    loaded runs: a slow but healthy run passes, a real hang still fails.
+  - Test speed is standing work: a periodic pass (the project names the cadence in AGENTS.md)
+    over the slowest tests, flaky reruns and parallelism.
+  - Each change is measured before and about 3 days after: full runs per merged pull request,
+    minutes per run, merge wait, CI hours per day, timeout and flaky reruns. Both sets go to the
+    harness Boss (`bin/boss-of.sh agent-harness`).
+- Done (process.md section 3): a merge-queue group or batch pushes `main` once, so a squash may
+  have no push run of its own. Its runs are those of the first `main` push after the merge whose
+  head has the squash as an ancestor: `gh run list --branch main --event push --limit 100
+  --json databaseId,headSha,status,conclusion`, then `git merge-base --is-ancestor <squash> <headSha>`
+  on the oldest heads first; every run of that push must be green. `bin/wait-merge.sh --main`
+  does this from the push ranges (before..after) of the repository activity API. Its "no main
+  push runs" exit 0 means the push holding the squash had no runs within 300 s: before DONE,
+  check with the `gh run list` above that `main` has push runs at all; if it has, wait for them.
+  Its exit 6 "no push holding" the squash: find the push with the same list.
 - A red `main` push run: never `gh run rerun --failed` (a partial rerun can never pass a release
   record job that needs the whole run). Use one full `gh run rerun <id>`. If it is still red
   outside your code, report DONE with the run link; a later green main SHA carries your code.
-- Tiden after a GitHub merge: act on Tiden main only after the squash's `main` push run has
-  finished.
+- Tiden after a GitHub merge: act on Tiden main only after the `main` push run whose range
+  contains the squash has finished.
 
 ## Sessions
 
@@ -68,7 +128,7 @@ affect every pull request make parallel edits collide.
   failure is. Exit 1 (no record): ListAgents; only a project's own orchestrator runs `set`, and
   `orchestrator-check.sh` warns while `orch-name` or its row is missing. A new name goes only to live workers, never
   to peer orchestrators: they read the registry.
-- Restart. A worker near its brief's token limit (process.md section 6; the orchestrator near 250k), at the next natural boundary,
+- Restart. A worker near its brief's token limit (the context hook's line, default 400k; the orchestrator near 250k), at the next natural boundary,
   writes a handoff of at most 40 lines (templates/handoff.md, kept as `handoffs/TEMPLATE.md` in the orchestrator's directory)
   whose Read map lists the file:line facts already established (decisions under State), waits for its own
   background jobs (closing the terminal kills them), then restarts itself with the orchestrator's
@@ -81,11 +141,11 @@ affect every pull request make parallel edits collide.
   re-bills its whole context on resume). The script lists each brief once (COMMON_BRIEF included) and,
   when the handoff names `review-codex.sh` or `wait-merge.sh` anywhere (its `Commands:` line is the place),
   puts that script's usage and exit-code lines in the prompt, so the successor need not read its header.
-  The successor closes the old terminal as its last step, after it has read the handoff and the briefs. Background jobs
+  The successor closes the old session (its pane and terminal, `bin/session-close.sh`) as its last step, after it has read the handoff and the briefs. Background jobs
   are waited for (closing kills them); live subagents are the case for `--keep-old` (or `HARNESS_KEEP_OLD=1`), which takes
   the close step out of the prompt; a line `Keep old session: yes` in the handoff (STATE.md for the orchestrator) does the
-  same, and the script reads it. The old session then sends `RESTARTED`, does nothing else, and closes its own terminal
-  when its last subagent has reported (the workspace sweep closes a leftover). Wake-ups go only to the terminal in
+  same, and the script reads it. The old session then sends `RESTARTED`, does nothing else, and closes its own session
+  with `bin/session-close.sh` (its pane too, else the dead tab stays) when its last subagent has reported (the workspace sweep closes a leftover). Wake-ups go only to the terminal in
   `orch-terminal`, which the successor takes over (`wake.sh target`) before any close, so a kept old orchestrator
   gets none; it deletes its own session crons first (CronDelete), or two sessions would act. Both scripts refuse
   a workspace or terminal ID that is not a UUID, extra arguments, and (orchestrator) a successor template without a
@@ -203,7 +263,8 @@ Workers can run on another machine that Paradev (formerly Superset) knows as a h
   containers are gone (`docker ps -a`; `docker stop` running leftovers and `docker rm <proj>_<name>` stopped ones
   yourself, dcg allowlist in README Requirements, which checks the name shape only, not whose container it is; for a
   name dcg blocks, the `! dcg allow-once` line goes in the owner digest), run `estimate record` when Estimates is on,
-  then close its terminal and archive its workspace (`superset workspaces archive --local <id>`; it removes the
+  then close its session with `bin/session-close.sh <workspace> <terminal>` (its desktop pane and terminal;
+  `superset terminals close` alone leaves a dead tab) and archive its workspace (`superset workspaces archive --local <id>`; it removes the
   worktree folder, the branch stays). Steps after the merge (enable after deploy, a measurement after N hours, a
   follow-up PR; from its brief, card or a `Post-merge:` line in its DONE) move with their conditions into STATE.md
   NEXT first. More work for it later (review fixes on a PR still open included): a new worker from its DONE handoff
@@ -227,7 +288,10 @@ Workers can run on another machine that Paradev (formerly Superset) knows as a h
   <superset project id>`) and close every one of yours with no open task: PR merged or closed (steps
   after the merge moved to NEXT first, above), superseded, a finished research or mockup, an old session
   workspace. Look at a worktree before archiving (uncommitted work is lost). Never close another
-  orchestrator's or a peer project's workspace.
+  orchestrator's or a peer project's workspace. In the ListAgents tool, a `shell` row is a live session running a Bash
+  tool, not a dead one; dead is `exited: true`, or a pane whose agent is null with no claude process on the host
+  in its worktree (`ps -ax -o pid=,command= | grep '[b]in/claude '`, then `lsof -a -p <pid> -d cwd -Fn` for each:
+  none prints that worktree path).
 - Status sweep (owner 10-27): before each digest (at least daily) and in every Tiden maintenance
   window, read the project's `Active`, `Review` and `Done` cards (with the `Tiden health` and
   `Tiden drift` lines) and every feature and epic whose child moved since the last sweep, and fix
@@ -269,7 +333,15 @@ Workers can run on another machine that Paradev (formerly Superset) knows as a h
   commands for the owner to run; after the yes an agent runs it. The one allowed command: a dcg block outside the
   agent-cleanup allowlist (README, Requirements) that only the owner can clear goes in the report with its exact
   `! dcg allow-once CODE --yes` line (worker brief, Tool traps). The owner's own checklist holds
-  only what no agent can do (a device in hand, a payment, a password, MFA or passkey entry). Mark each item FYI
+  only what no agent can do (a device in hand, a payment, a password, MFA or passkey entry).
+  A GUI step (open a service, register, add, read or change a setting) is never by itself an owner
+  ask or checklist item: the orchestrator or worker does it through computer use (Cua Driver,
+  `bin/gui-claims.sh`; Live checks) (owner 10-29, every project). A step that is one of the five
+  kinds above (a new account or terms in the owner's name, a send, a spend) gets the owner's yes
+  first, then the agent clicks (worker brief, GUI steps, Limits). Beyond that the owner is asked
+  only for a password, MFA, passkey or payment-card entry, a physical device, a decision of the
+  five kinds, an incident or a dcg `allow-once` line; an ask after a failed GUI attempt names its
+  kind, what was tried and why an agent cannot finish it. Mark each item FYI
   or QUESTION; an incident is one plain sentence on what breaks for the owner; each question
   restates its context in full (the owner does not reread). Several decisions go in one decision
   brief (owner 10-26), one owner-page question with numbered items: each a question (Owner talk)
@@ -424,10 +496,10 @@ if 30 calls or fewer are left; restart from 150k before over an hour idle):
    (self-contained, current workers, NOW/NEXT, approvals, wake automations).
 2. Start the successor in the orchestrator's workspace (`bin/orchestrator-restart.sh [--keep-old] <old name>`): it reads
    STATE.md, records its name (`boss-of.sh set`), sends the live workers (never peer orchestrators) its name as the new address, checks the wake automations against STATE.md,
-   records itself as the wake target (`wake.sh target`) and only then closes the old orchestrator's terminal.
-3. The successor announces itself to the live workers, closes the old terminal (after `wake.sh target` printed OK), continues
+   records itself as the wake target (`wake.sh target`) and only then closes the old orchestrator's session.
+3. The successor announces itself to the live workers, closes the old session with `bin/session-close.sh` (after `wake.sh target` printed OK), continues
    NOW/NEXT, and sets `Keep old session:` back to `no` in STATE.md. With `--keep-old`, or when STATE.md says
-   `Keep old session: yes` (the old session has live subagents), the old terminal stays open (rules: Restart, Sessions).
+   `Keep old session: yes` (the old session has live subagents), the old session stays open (rules: Restart, Sessions).
 
 ### Wake-ups
 
