@@ -1,5 +1,7 @@
 """Feedback autoloop: the tool-less reader, its init check, the closed answer and its outcomes (ANYM-570)."""
 import asyncio
+import base64
+import hashlib
 import io
 import json
 import os
@@ -15,6 +17,7 @@ import threading
 import time
 import types
 
+from hypothesis import given, settings, strategies as st
 import pytest
 
 import scripts.autoloop as autoloop
@@ -438,6 +441,7 @@ class Fakes:
         # The build stage (ANYM-572): Tiden main, compare files by head, pushed branches, open PRs' files.
         self.specs, self.compares, self.branches, self.pr_files = list(SNAPSHOT['main']), {}, [], {}
         self.rest_files = {}  # {PR number: REST file rows} of PRs with a rename
+        self.contents, self.blobs = {}, {}  # {(path, commit): text}, {blob SHA: text} GitHub serves (ANYM-590)
 
     def ssh(self, host, argv):
         self.calls.append(('ssh', argv[:2]))
@@ -473,7 +477,15 @@ class Fakes:
         if argv[:2] == ['api', '--paginate'] and '/branches?' in argv[3]:
             return json.dumps([[{'name': b} for b in self.branches]])
         if argv[0] == 'api' and '/compare/main...' in argv[1]:
-            return json.dumps({'files': self.compares.get(argv[1].split('...', 1)[1], [])})
+            return json.dumps({'files': self.compares.get(argv[1].split('...', 1)[1], []),
+                               'merge_base_commit': {'sha': MERGE_BASE}})
+        if argv[0] == 'api' and '/git/blobs/' in argv[1]:
+            return json.dumps({'content': base64.b64encode(self.blobs[argv[1].rsplit('/', 1)[1]].encode()).decode(),
+                               'encoding': 'base64'})
+        if argv[0] == 'api' and '/contents/' in argv[1]:
+            path, ref = argv[1].split('/contents/', 1)[1].split('?ref=')
+            return json.dumps({'type': 'file', 'encoding': 'base64',
+                               'content': base64.b64encode(self.contents[(path, ref)].encode()).decode()})
         if argv[:2] == ['api', '--paginate']:
             rows = [{'id': r['databaseId'], 'status': r['status'], 'conclusion': r['conclusion'],
                      'updated_at': r['updatedAt'], 'display_title': r['displayTitle']} for r in self.runs]
@@ -1496,6 +1508,7 @@ CARD_TEXT = ('Title: names stay after a rename\nCategory: defect\n'
              'Lane: messaging   Expected paths: services/messaging/groups.py, tests/test_groups.py (new)\n'
              'Value: 3   Effort: 3   Score: 1.00\nReady: 2026-10-26, Fable approve; asked by agent-grok\n')
 H1, H2 = 'b' * 40, 'c' * 40
+MERGE_BASE = 'd' * 40
 BUILD = 'autoloop-build-anym-30'
 BODY = f'Autoloop: {BUILD}\nSpec: ANYM-30\nChange path: AUTO+review (code)\n'
 
@@ -1714,6 +1727,219 @@ def test_the_controller_parks_a_pr_outside_the_envelope_at_its_exact_head(tmp_pa
         assert got['parked_detail'] == ['outside reserved paths services/messaging/send.py']
     # A parked PR stays parked on the next tick.
     assert autoloop.controller(a, cfg(), snap(ready(30)), NOW, fakes.gh, fakes.prs)[0] == {BUILD: 'parked'}
+
+
+MSG_SQL, CAL_SQL = 'services/messaging/messaging_service/', 'services/calendar/family_calendar/service/'
+MIGRATION, ROLE = MSG_SQL + 'migrations/056_widget_notes.sql', MSG_SQL + 'gateway_role.sql'
+CAL_MIGRATION, CAL_ROLES = CAL_SQL + 'schema_v7.sql', CAL_SQL + 'roles.sql'
+NEW_TABLE = 'CREATE TABLE widget_notes (id bigint PRIMARY KEY, note text NOT NULL);\n'
+EXPAND = '-- rollout: expand\n' + NEW_TABLE
+NEW_COLUMN = 'ALTER TABLE messages ADD COLUMN widget_flag boolean;\n'
+
+
+def sql_change(migrations=(), roles=(), other=()):
+    """The compare rows and {(path, commit): text} of a PR that adds `migrations` ((path, text)), appends to `roles`
+    ((path, appended); the base is the repository's file) and makes the `other` rows."""
+    files, texts = list(other), {}
+    for path, body in migrations:
+        files.append(dict(changed_file(path, patch=''.join('+' + row for row in body.splitlines(True))),
+                          sha=hashlib.sha1(body.encode()).hexdigest()))
+        texts[(path, H1)] = body
+    for path, added in roles:
+        base = (ROOT / path).read_text()
+        files.append(dict(changed_file(path, 'modified', ''.join('+' + row for row in added.splitlines(True))),
+                          sha=hashlib.sha1((base + added).encode()).hexdigest()))
+        texts[(path, MERGE_BASE)], texts[(path, H1)] = base, base + added
+    return files, texts
+
+
+def sql_verdict(files, texts):
+    owner, lifted = autoloop.sql_hits(files, H1, MERGE_BASE, lambda path, ref: texts[(path, ref)])
+    return owner, lifted, autoloop.diff_hits(files, lifted)
+
+
+# spec: ANYM-590
+@pytest.mark.parametrize('case', ['messaging', 'migration only', 'column grant on a new table', 'policy on a new table',
+                                  'calendar', 'two migrations', 'column grant on columns added to an older table',
+                                  'calendar guard'])
+def test_an_additive_migration_with_grants_on_its_own_tables_is_no_owner_item(case):
+    policy = ("DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_policies WHERE tablename = 'widget_notes' AND policyname = "
+              "'widget_notes_api') THEN CREATE POLICY widget_notes_api ON widget_notes TO messaging_gateway USING "
+              "(note = 'api') WITH CHECK (note = 'api'); END IF; END $$;\n")
+    files, texts = {
+        'messaging': sql_change([(MIGRATION, EXPAND + NEW_COLUMN)],
+                                [(ROLE, 'GRANT SELECT, INSERT ON widget_notes TO messaging_gateway;\n')]),
+        'migration only': sql_change([(MIGRATION, EXPAND + NEW_COLUMN)]),
+        'column grant on a new table': sql_change(
+            [(MIGRATION, EXPAND + 'ALTER TABLE widget_notes ADD COLUMN tag text;\n')],
+            [(ROLE, 'GRANT SELECT (id, tag) ON widget_notes TO messaging_gateway;\n')]),
+        'policy on a new table': sql_change([(MIGRATION, EXPAND)], [(ROLE, policy)]),
+        'calendar': sql_change([(CAL_MIGRATION, EXPAND)],
+                               [(CAL_ROLES, 'GRANT SELECT ON fcs.widget_notes TO fcs_gateway;\n')]),
+        # The second file's table is granted: each migration's new tables feed the role check, in version order.
+        'two migrations': sql_change(
+            [(MSG_SQL + 'migrations/057_widget_tags.sql', '-- rollout: expand\nCREATE TABLE widget_tags (id bigint);\n'),
+             (MIGRATION, EXPAND)],
+            [(ROLE, 'GRANT SELECT ON widget_notes, widget_tags TO messaging_gateway;\n')]),
+        'column grant on columns added to an older table': sql_change(
+            [(MIGRATION, EXPAND + NEW_COLUMN + 'ALTER TABLE messages ADD COLUMN widget_tag text;\n')],
+            [(ROLE, 'GRANT SELECT (widget_flag, widget_tag), UPDATE (widget_tag) ON messages TO messaging_gateway;\n')]),
+        'calendar guard': sql_change(
+            [(CAL_MIGRATION, EXPAND)],
+            [(CAL_ROLES, "DO $$ BEGIN\n IF to_regclass('fcs.widget_notes') IS NOT NULL THEN\n  GRANT SELECT ON "
+                         "fcs.widget_notes TO fcs_gateway;\n END IF;\nEND $$;\n")]),
+    }[case]
+    owner, lifted, hits = sql_verdict(files, texts)
+    assert owner == [] and hits == []
+    assert lifted == {f['filename']: 'GRANT' if f['status'] == 'modified' else 'ALTER' for f in files}
+    # Without the classifier's lift the same diff is out of the envelope (the base behaviour).
+    assert autoloop.diff_hits(files)
+
+
+# spec: ANYM-590
+@pytest.mark.parametrize('case', [
+    'revoke', 'expand header on a non-expand body', 'manual header', 'no header', 'drop', 'grant to a new role',
+    'grant on an existing table', 'column grant on an old column', 'table privilege beside a new column',
+    'grant on an old table created if not exists', 'grant with grant option', 'role file rewritten',
+    'calendar grant on an existing table', 'calendar manual migration', 'edited migration', 'other sql',
+    'upper-case sql', 'renamed migration', 'grant to public', 'a name the classifier cannot parse'])
+def test_any_other_sql_or_grant_still_waits_for_the_owner(case):
+    table_grant = 'GRANT SELECT ON widget_notes TO messaging_gateway;\n'
+    files, texts = {
+        'revoke': sql_change([(MIGRATION, EXPAND)],
+                             [(ROLE, table_grant + 'REVOKE SELECT ON person_preferences FROM messaging_gateway;\n')]),
+        'expand header on a non-expand body': sql_change([(MIGRATION, '-- rollout: expand\nUPDATE messages SET '
+                                                          'body = NULL;\n')]),
+        'manual header': sql_change([(MIGRATION, '-- rollout: manual\n' + NEW_TABLE)]),
+        'no header': sql_change([(MIGRATION, NEW_TABLE)]),
+        'drop': sql_change([(MIGRATION, EXPAND + 'ALTER TABLE messages DROP COLUMN IF EXISTS widget_flag;\n')]),
+        'grant to a new role': sql_change([(MIGRATION, EXPAND)],
+                                          [(ROLE, 'GRANT SELECT ON widget_notes TO messaging_newcomer;\n')]),
+        'grant on an existing table': sql_change(
+            [(MIGRATION, EXPAND)], [(ROLE, table_grant + 'GRANT SELECT ON delivery_endpoints TO messaging_gateway;\n')]),
+        'column grant on an old column': sql_change(
+            [(MIGRATION, EXPAND + NEW_COLUMN)],
+            [(ROLE, 'GRANT SELECT (widget_flag, body) ON messages TO messaging_gateway;\n')]),
+        'table privilege beside a new column': sql_change(
+            [(MIGRATION, EXPAND + NEW_COLUMN)],
+            [(ROLE, 'GRANT SELECT (widget_flag), UPDATE ON messages TO messaging_gateway;\n')]),
+        # IF NOT EXISTS skips an existing table, so the GRANT would land on it (Astra r1 F1).
+        'grant on an old table created if not exists': sql_change(
+            [(MIGRATION, '-- rollout: expand\nCREATE TABLE IF NOT EXISTS delivery_endpoints (id bigint);\n')],
+            [(ROLE, 'GRANT SELECT ON delivery_endpoints TO messaging_gateway;\n')]),
+        'grant with grant option': sql_change(
+            [(MIGRATION, EXPAND)], [(ROLE, 'GRANT SELECT ON widget_notes TO messaging_gateway WITH GRANT OPTION;\n')]),
+        'role file rewritten': sql_change([(MIGRATION, EXPAND)]),
+        'calendar grant on an existing table': sql_change(
+            [(CAL_MIGRATION, EXPAND)], [(CAL_ROLES, 'GRANT SELECT ON fcs.people TO fcs_gateway;\n')]),
+        'calendar manual migration': sql_change([(CAL_MIGRATION, '-- rollout: manual\n' + NEW_TABLE)]),
+        'edited migration': sql_change(other=[changed_file(MSG_SQL + 'migrations/055_failure_events.sql', 'modified',
+                                                           '+-- note')]),
+        'other sql': sql_change([(MIGRATION, EXPAND)], other=[changed_file('deploy/postgres/widget.sql')]),
+        # Astra r1 F3: no other signal sees an upper-case suffix.
+        'upper-case sql': sql_change([(MIGRATION, EXPAND)], other=[changed_file(CAL_SQL + 'schema_v8.SQL')]),
+        'renamed migration': sql_change(other=[changed_file(MIGRATION, 'renamed', '', MSG_SQL + 'migrations/x.sql')]),
+        'grant to public': sql_change([(MIGRATION, EXPAND)], [(ROLE, 'GRANT SELECT ON widget_notes TO PUBLIC;\n')]),
+        # Astra r1 F4: the classifier recurses per name part; its RecursionError parks the PR, never the tick.
+        'a name the classifier cannot parse': sql_change(
+            [(MIGRATION, '-- rollout: expand\nCREATE TABLE ' + 'public.' * 5000 + 'widget_notes (id bigint);\n')]),
+    }[case]
+    if case == 'role file rewritten':  # a changed line before the appended GRANT: not an append
+        base = (ROOT / ROLE).read_text()
+        files.append(changed_file(ROLE, 'modified', '+' + table_grant))
+        texts[(ROLE, MERGE_BASE)], texts[(ROLE, H1)] = base, base.replace('GRANT', 'GRANT ', 1) + table_grant
+    owner, lifted, hits = sql_verdict(files, texts)
+    grant = case.startswith(('revoke', 'grant', 'column grant', 'role file', 'calendar grant', 'table privilege'))
+    # The offending file: the role file for a grant, the `other` row where there is one, else the migration.
+    path = next(f['filename'] for f in files if f['status'] == 'modified') if grant else files[0]['filename']
+    assert lifted == {} and (autoloop.WAITS_GRANT if grant else autoloop.WAITS_MIGRATION, path) in owner
+    assert all(why in (autoloop.WAITS_GRANT, autoloop.WAITS_MIGRATION) for why, _ in owner)
+    assert case == 'upper-case sql' or ('protected path', path) in hits  # nothing of the PR's SQL is lifted
+
+
+# spec: ANYM-590
+@settings(max_examples=60, deadline=None)
+@given(table=st.sampled_from(['widget_notes', 'delivery_endpoints', 'messages', 'person_preferences']),
+       role=st.sampled_from(['messaging_gateway', 'messaging_newcomer', 'PUBLIC']),
+       privileges=st.lists(st.sampled_from(['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'ALL']), min_size=1,
+                           max_size=3, unique=True))
+def test_a_role_grant_is_lifted_exactly_when_it_gives_an_existing_role_plain_privileges_on_a_new_table(
+        table, role, privileges):
+    files, texts = sql_change([(MIGRATION, EXPAND)], [(ROLE, f"GRANT {', '.join(privileges)} ON {table} TO {role};\n")])
+    owner, lifted, _ = sql_verdict(files, texts)
+    plain = table == 'widget_notes' and role == 'messaging_gateway' and not {'TRUNCATE', 'ALL'} & set(privileges)
+    assert (owner == [] and set(lifted) == {MIGRATION, ROLE}) if plain else \
+        (owner == [(autoloop.WAITS_GRANT, ROLE)] and lifted == {})
+
+
+# spec: ANYM-590
+def test_a_lifted_sql_file_still_hits_on_any_signal_word_but_its_own():
+    files, texts = sql_change([(MIGRATION, EXPAND + '-- keeps no secret\n')],
+                              [(ROLE, 'GRANT SELECT ON widget_notes TO messaging_gateway;\n')])
+    owner, lifted, hits = sql_verdict(files, texts)
+    assert owner == [] and hits == [('change-path signal', MIGRATION)]
+    # A comment line `++ secret` is the patch row `+++ secret`: on a lifted file it is a changed line, not a header.
+    files, texts = sql_change([(MIGRATION, EXPAND + '/*\n++ secret\n*/\n')])
+    owner, lifted, hits = sql_verdict(files, texts)
+    assert owner == [] and hits == [('change-path signal', MIGRATION)]
+    # A GRANT outside the lifted role lines still hits, as does an ALTER outside the lifted migration.
+    files.append(changed_file('services/messaging/store.py', 'modified', "+c.execute('GRANT ALL ON x TO y')"))
+    assert ('change-path signal', 'services/messaging/store.py') in autoloop.diff_hits(files, lifted)
+
+
+# spec: ANYM-590
+def test_the_classifier_reads_the_compared_blob_and_never_a_symlink_target():
+    fakes = Fakes()
+    files, texts = sql_change([(MIGRATION, EXPAND)], [(ROLE, 'GRANT SELECT ON widget_notes TO messaging_gateway;\n')])
+    fakes.blobs = {f['sha']: texts[(f['filename'], H1)] for f in files}
+    fakes.contents = {(ROLE, MERGE_BASE): texts[(ROLE, MERGE_BASE)]}
+    text = autoloop.pr_text(fakes.gh, files, H1)
+    assert autoloop.sql_hits(files, H1, MERGE_BASE, text) == ([], {MIGRATION: 'ALTER', ROLE: 'GRANT'})
+    # A symlink's blob is its target path: not a migration. A base path that is no regular file reads as nothing.
+    fakes.blobs[files[0]['sha']] = MSG_SQL + 'migrations/055_failure_events.sql'
+    assert autoloop.sql_hits(files, H1, MERGE_BASE, text)[0] == [(autoloop.WAITS_MIGRATION, MIGRATION),
+                                                                 (autoloop.WAITS_GRANT, ROLE)]
+    symlink = Fakes()
+    symlink.gh = lambda argv: json.dumps({'type': 'symlink', 'target': 'x.sql', 'encoding': 'base64', 'content': ''})
+    assert autoloop.pr_text(symlink.gh, files, H1)(ROLE, MERGE_BASE) is None
+    assert autoloop.pr_text(symlink.gh, [dict(files[0], sha=None)], H1)(MIGRATION, H1) is None
+    # A failed read is no verdict: it reaches the tick's failures and is read again, never parked (Sol r2).
+
+    def down(argv):
+        raise triage.Refused('gh api exited 1')
+    with pytest.raises(triage.Refused):
+        autoloop.sql_hits(files, H1, MERGE_BASE, autoloop.pr_text(down, files, H1))
+
+
+# spec: ANYM-590
+def test_the_controller_reviews_an_additive_migration_pr_and_parks_a_grant_on_an_existing_table(tmp_path):
+    a = tmp_path / 'autoloop'
+    a.mkdir(mode=0o700)
+    finished_build(a)
+    autoloop.put(a, dict(autoloop.intents(a)[BUILD], paths=[MIGRATION, ROLE, 'tests/test_widget_notes.py']))
+    files, texts = sql_change([(MIGRATION, EXPAND)], [(ROLE, 'GRANT SELECT ON widget_notes TO messaging_gateway;\n')])
+    fakes, started = Fakes(open_prs=[build_pr()]), []
+    fakes.compares = {H1: files + [changed_file('tests/test_widget_notes.py')]}
+    fakes.blobs = {f['sha']: texts[(f['filename'], H1)] for f in files}
+    fakes.contents = {(ROLE, MERGE_BASE): texts[(ROLE, MERGE_BASE)]}
+    done, failed = autoloop.controller(a, cfg(), snap(ready(30)), NOW, fakes.gh, fakes.prs,
+                                       lambda *args: started.append(args))
+    assert (done, failed) == ({BUILD: 'reviewing'}, []) and started == [(a, BUILD, H1)]
+    # The classifier read the compared blobs of the PR's head and the role file at the merge base, from GitHub.
+    reads = {c[1][1] for c in fakes.calls if c[0] == 'gh' and re.search('/(contents|git/blobs)/', c[1][1])}
+    assert reads == {f"repos/{autoloop.REPO}/git/blobs/{f['sha']}" for f in files} | \
+        {f'repos/{autoloop.REPO}/contents/{ROLE}?ref={MERGE_BASE}'}
+    # Pushed again with a standalone access change on an existing table: parked, waiting for the owner.
+    files, texts = sql_change([(MIGRATION, EXPAND)], [(ROLE, 'GRANT SELECT ON delivery_endpoints TO '
+                                                             'messaging_gateway;\n')])
+    fakes.prs[0]['headRefOid'] = fakes.prs[0]['commits']['nodes'][-1]['commit']['oid'] = H2
+    fakes.compares = {H2: files}
+    fakes.blobs.update({f['sha']: texts[(f['filename'], H1)] for f in files})
+    done, failed = autoloop.controller(a, cfg(), snap(ready(30)), NOW, fakes.gh, fakes.prs)
+    got = autoloop.intents(a)[BUILD]
+    assert (done, failed) == ({BUILD: 'parked'}, []) and got['parked'] == autoloop.WAITS_GRANT
+    assert autoloop.plain_park(got['parked']) == autoloop.WAITS_GRANT and f'{autoloop.WAITS_GRANT} {ROLE}' in \
+        got['parked_detail']
 
 
 # spec: ANYM-572
