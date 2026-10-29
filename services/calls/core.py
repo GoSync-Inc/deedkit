@@ -254,11 +254,6 @@ def _words_after(text,count):
     return ''
 
 
-def _newest_input(pending):
-    """Pending chunks from the latest input start: the person's latest utterance, not older unfinalized speech."""
-    return pending[max(k for k,item in enumerate(pending) if item[2]):]
-
-
 # Local hour bands per call language; outside them (night) the model greets neutrally.
 GREETINGS={'id':('Halo',[(4,11,'Selamat pagi'),(11,15,'Selamat siang'),(15,18,'Selamat sore'),(18,24,'Selamat malam')]),
            'ru':('Здравствуйте',[(5,12,'Доброе утро'),(12,18,'Добрый день'),(18,23,'Добрый вечер')]),
@@ -657,10 +652,16 @@ class VoiceService:
             v=self.get_call(identity)
             if v["status"] not in ACTIVE or generation not in (None,v.get('generation',1)):
                 return
+            live_user=role=='user' and v['brief'].get('dialog_engine')=='gemini_live_flows'
+            try:before=self._latest_human_turn(v) if live_user else ''
+            except Exception:before=''
             self._event(v,{"kind":"transcript","role":role,"text":text,"interrupted":interrupted})
-            if role=='user' and v['brief'].get('dialog_engine')=='gemini_live_flows':
+            if live_user:
                 try:_,_,pending,restated=self._turns(v['events'],'user')
                 except Exception:pending,restated=[],False
+                # An older input finalized out of the pending speech leaves different latest words to judge.
+                if restated and pending and ''.join(item[1] for item in pending)!=before:
+                    v.pop('closing_rejected_revision',None)
                 # A final restating recorded chunks keeps a granted permission; any other final is new speech.
                 if not v.get('human_pending_final') or (v.get('close_requested') and not restated):
                     v['human_revision']=v.get('human_revision',0)+1
@@ -781,7 +782,7 @@ class VoiceService:
 
     def _latest_turn(self,events,role):
         turn,_,pending,_=self._turns(events,role)
-        return ''.join(item[1] for item in _newest_input(pending)) if pending else turn
+        return ''.join(item[1] for item in pending) if pending else turn
 
     def _turns(self,events,role):
         """Latest final, the event index where its input began, the chunks no final has transcribed yet, and
@@ -891,7 +892,7 @@ class VoiceService:
                     and e.get('human_revision')==revision),None)
         if start is None:
             _,began,pending,_=self._turns(events,'user')
-            start=_newest_input(pending)[0][0] if pending else began
+            start=pending[0][0] if pending else began
             if start is None:
                 return None
         previous=next((e for e in reversed(events[:start])

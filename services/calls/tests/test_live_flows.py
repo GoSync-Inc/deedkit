@@ -607,7 +607,7 @@ def test_new_words_after_a_granted_goodbye_revoke_it_before_their_final(tmp_path
 
 
 # spec: ANYM-374
-def test_goodbye_granted_before_late_finals_of_two_inputs_stays_granted(tmp_path):
+def test_goodbye_refused_while_joined_to_an_older_input_is_granted_after_that_final(tmp_path):
     store, identity = call(tmp_path)
     store.audio_activity(identity,True)
     store.transcript_chunk(identity,'user','Доставка с 12 до 13.')
@@ -616,11 +616,31 @@ def test_goodbye_granted_before_late_finals_of_two_inputs_stays_granted(tmp_path
     store.audio_activity(identity,True)
     store.transcript_chunk(identity,'user','Спасибо, до свидания.')
     store.audio_activity(identity,False)
-    assert end(store,identity,'Спасибо, до свидания.')['end_requested']
+    # Before any final, the two inputs are judged together, which refuses.
+    assert end(store,identity,'Спасибо, до свидания.')['error'] == 'closing_confirmation_required'
     store.transcript(identity,'user','Доставка с 12 до 13.')
     store.transcript(identity,'user','Спасибо, до свидания.')
+    assert end(store,identity,'Спасибо, до свидания.','fresh')['end_requested']
     assert store.closing_ready(identity)
-    assert end(store,identity,'Спасибо, до свидания.')['end_requested']
+    store.close()
+
+
+# spec: ANYM-374
+@pytest.mark.parametrize('assistant',['final','chunk'])
+def test_assistant_speech_inside_one_human_utterance_does_not_cut_it(tmp_path,assistant):
+    store, identity = call(tmp_path)
+    store.audio_activity(identity,True)
+    store.transcript_chunk(identity,'user','I am not saying ')
+    if assistant=='final':
+        store.transcript(identity,'assistant','Okay, goodbye.',interrupted=True)
+    else:
+        store.transcript_chunk(identity,'assistant','Okay, goodbye.')
+    store.transcript_chunk(identity,'user','goodbye.')
+    store.audio_activity(identity,False)
+    assert end(store,identity,'goodbye.')['error'] == 'closing_confirmation_required'
+    store.transcript(identity,'user','I am not saying goodbye.')
+    assert 'end_requested' not in end(store,identity,'goodbye.','fresh')
+    assert not store.closing_ready(identity)
     store.close()
 
 
