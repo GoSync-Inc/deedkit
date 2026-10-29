@@ -167,8 +167,12 @@ def telegram_message(account,message,*,chat_title='',origin='live',verified_self
         if not sender_id and message.out and isinstance(getattr(message,'peer_id',None),types.PeerUser):
             sender_id=verified_self.id
             identity_basis='authenticated_self'
-        if sender_id==verified_self.id and entity is None:
-            entity=verified_self
+        # Telegram itself names the verified owner (any chat type): the basis comes from
+        # the self entity, never from a caller-supplied value (ANYM-620).
+        if sender_id==verified_self.id:
+            identity_basis='authenticated_self'
+            if entity is None:
+                entity=verified_self
     chat_entity=getattr(message,'chat',None)
     observed_type='private' if isinstance(getattr(message,'peer_id',None),types.PeerUser) else None
     observed_title=''

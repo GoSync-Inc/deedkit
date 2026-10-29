@@ -215,6 +215,18 @@ class Archive:
                 and old['provider_updated_at']==updated
                 and fingerprint({**e,'sender':''})==old['content_hash']
                 and not formatting_changed)
+            # A group sender is never inferred (it may be anonymous): it completes only when Telegram
+            # itself named the owner, which the adapter marks with the authenticated basis. A retained
+            # revision observed as private or channel never qualifies (ANYM-620).
+            group_sender_completed=bool(old and retained_snapshot and not old['sender'] and e['sender']
+                and not old['deleted'] and not e['deleted'] and e['platform']=='telegram' and e['direction']=='outgoing'
+                and e.get('metadata',{}).get('chat_type')=='group'
+                and (retained_snapshot.get('metadata') or {}).get('chat_type') in (None,'unknown','group')
+                and e.get('metadata',{}).get('sender_identity_basis')=='authenticated_self'
+                and old['provider_updated_at']==updated
+                and fingerprint({**e,'sender':''})==old['content_hash']
+                and not formatting_changed)
+            sender_completed=sender_completed or group_sender_completed
             # The same WhatsApp sender with and without a device number, everything else equal,
             # contradicts nothing: the retained sender, revision and sender profiles stay, and it
             # is no later evidence for an open conflict.

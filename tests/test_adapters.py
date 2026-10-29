@@ -51,7 +51,28 @@ def test_verified_self_can_supply_profile_for_explicit_owner_id():
         message='fixture',date=datetime(2026,10,1,tzinfo=timezone.utc))
     e=telegram_message('tg-owner',message,verified_self=owner)
     assert e['sender']=='42' and e['sender_profile']['username']=='fixture_owner'
-    assert e['metadata'].get('sender_identity_basis')!='authenticated_self'
+    # ANYM-620: Telegram itself named the verified owner, so the basis is authenticated.
+    assert e['metadata'].get('sender_identity_basis')=='authenticated_self'
+
+
+# spec: ANYM-620
+@pytest.mark.parametrize('peer,sender,verified,basis',[
+    ('chat',('user',42),'self',True),('channel',('user',42),'self',True),('user',('user',42),'self',True),
+    ('chat',('user',99),'self',False),('channel',('channel',100),'self',False),('chat',None,'self',False),
+    ('chat',('user',42),'not_self',False),('chat',('user',42),None,False)],
+    ids=['group','supergroup','private','other_user','anonymous_admin','missing_sender','unverified','no_self'])
+def test_authenticated_self_basis_only_when_telegram_names_the_owner(peer,sender,verified,basis):
+    from telethon import types
+    selves={'self':types.User(id=42,is_self=True,first_name='Synthetic'),
+        'not_self':types.User(id=42,is_self=False,first_name='Synthetic'),None:None}
+    peers={'user':types.PeerUser,'chat':types.PeerChat,'channel':types.PeerChannel}
+    message=types.Message(id=19,peer_id=peers[peer](100),out=True,message='fixture',
+        from_id=peers[sender[0]](sender[1]) if sender else None,date=datetime(2026,10,1,tzinfo=timezone.utc))
+    expected=str(message.sender_id or '')
+    e=telegram_message('tg-owner',message,verified_self=selves[verified])
+    # A missing group or channel sender stays empty: it may be anonymous.
+    assert e['sender']==expected
+    assert (e['metadata'].get('sender_identity_basis')=='authenticated_self')==basis
 
 
 def test_telegram_webpage_document_metadata_does_not_use_preview_photo():
