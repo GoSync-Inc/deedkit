@@ -73,6 +73,18 @@ Hidden/deleted sources cannot supply their phone numbers or provenance in a
 different chat. Resolving the conflict requires a later explicit reconciliation
 design, not a silent overwrite.
 
+The archive's version comparison (ANYM-559) reads the same fence. A re-read of a
+message with the same sent time whose sender is the retained sender's other form (`<pn>@c.us` against
+`<lid>@lid`, a device suffix ignored) is the same sender only when this account
+recorded that pair from an approved provenance and no observation anywhere in
+the account, deleted sources included, links either side to another; then, and
+for a re-read with an empty (unknown) sender, the retained sender stands for the
+comparison and in any later revision, the receipt keeps the raw value, the other
+form gets no sender profile, and at the retained provider version only the sender
+difference is lifted. Two LID forms are never a pair. `whatsapp_identity.record`
+takes the account's archive lock before it writes, so a new mapping commits
+before or after an ingest's check, never in between.
+
 This release does not repair history gaps, change collection checkpoints or
 claim complete WhatsApp history. Production acceptance must measure actual cache
 availability on both existing collectors, check original IDs and revisions and

@@ -197,6 +197,17 @@ class Archive:
                     OR (excluded.chat_type IS NOT NULL AND chats.chat_type IS DISTINCT FROM excluded.chat_type)''',
                       (cid,aid,e['chat_title'],e['chat'],chat_type,e['chat'],e['chat']))
             old=c.execute('SELECT * FROM messages WHERE id=%s FOR UPDATE',(mid,)).fetchone()
+            # One WhatsApp sender in its phone-number and LID forms (a fenced pair this account recorded)
+            # or an unknown (empty) candidate sender is the retained sender for every comparison below:
+            # the receipt keeps the raw value, a revision the retained one. At the retained provider
+            # version it lifts only the sender difference (ANYM-559). One rule per field: with another
+            # sent time as well (even ANYM-558's jitter) the observation stays a conflict.
+            sender_alias=bool(old and e['platform']=='whatsapp' and old['sender'] and e['sender']!=old['sender']
+                and not old['deleted'] and old['sent_at']==datetime.fromisoformat(e['sent_at']))
+            if sender_alias and e['sender']:
+                from .whatsapp_identity import same_sender
+                sender_alias=same_sender(c,aid,old['sender'],e['sender'])
+            if sender_alias:e={**e,'sender':old['sender']}
             content=fingerprint(e); updated=datetime.fromisoformat(e['updated_at']); outcome='created'
             old_format=None;retained=None;retained_snapshot=None
             if old:
@@ -270,6 +281,7 @@ class Archive:
                 elif old['content_hash']==content and formatting_completed:outcome='edited'
                 elif (old['provider_updated_at']==updated and not e['deleted']): outcome='conflict'
                 else: outcome='deleted' if e['deleted'] else 'edited'
+                if sender_alias and outcome not in ('unchanged','stale') and old['provider_updated_at']==updated:outcome='conflict'
             elif e['deleted']: outcome='deleted'
             # An incomplete observation of the same retained provider body must
             # not erase known formatting, including authenticated sender repair.
@@ -302,7 +314,8 @@ class Archive:
                     AND active IS DISTINCT FROM (id=ANY(%s))''',(media_ids,mid,media_ids))
             elif outcome=='unchanged' and not jitter_version:
                 c.execute('UPDATE messages SET provider_updated_at=greatest(provider_updated_at,%s) WHERE id=%s',(updated,mid))
-            if outcome in ('created','edited','unchanged') and not e['deleted'] and e['sender'] and not sender_device_only and not unreadable:
+            if (outcome in ('created','edited','unchanged') and not e['deleted'] and e['sender'] and not sender_device_only
+                    and not unreadable and not sender_alias):
                 # Identity hints come only from this message's provider payload,
                 # never a cross-chat contact book. Unknown metadata stays unknown.
                 profile=e.get('sender_profile',{})
@@ -360,7 +373,7 @@ class Archive:
                     candidate_updated_at,observed_at) VALUES(%s,%s,%s,%s,clock_timestamp())''',
                     (receipt,mid,old['revision'],updated))
             elif (outcome in ('edited','deleted','unchanged') and not sender_device_only and not unreadable and not jitter_version
-                    and not body_completed):
+                    and not body_completed and not (sender_alias and outcome=='unchanged')):
                 # A repeated copy of the retained revision does not resolve an
                 # equal/newer conflicting observation. Only later evidence does.
                 c.execute('''UPDATE message_conflicts mc SET resolved_at=clock_timestamp(),

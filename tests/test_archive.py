@@ -871,3 +871,156 @@ def test_group_sender_completion_never_completes_a_deleted_message(archive):
     with s.pool.connection() as c:
         row=c.execute('SELECT sender,revision,deleted FROM messages WHERE id=%s',(mid,)).fetchone()
     assert (row['sender'],row['revision'],row['deleted'])==('',2,True)
+
+
+PN='79990000001@c.us'
+LID='310000000001@lid'
+
+
+def observe(s,source,pn=PN,lid=LID,account='archive-wa',provenance='whatsmeow_lid_store_v1'):
+    with s.pool.connection() as c:
+        c.execute('''INSERT INTO whatsapp_identity_observations(account,source_message,identity_id,pn,lid,provenance,
+            first_observed_at,observed_at) VALUES(%s,%s,%s,%s,%s,%s,'2026-10-01T11:00:00Z','2026-10-01T11:00:00Z')''',
+            (account,source,lid,pn,lid,provenance))
+
+
+def alias_event(sender,**changes):
+    return whatsapp_event(sender,**{'direction':'incoming','formatting':wire(),**changes})
+
+
+# spec: ANYM-559
+@pytest.mark.parametrize('retained,candidate',[(PN,LID),(LID,PN),('79990000001:4@c.us',LID),(PN,'310000000001:2@lid')])
+def test_whatsapp_sender_in_two_address_forms_is_not_a_conflict(archive,retained,candidate):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    mid=ar.ingest(alias_event(retained))['message']
+    observe(s,mid)
+    observed=alias_event(candidate,origin='reconcile',sender_profile={'display_name':'Synthetic Sender'})
+    assert ar.ingest(observed)['outcome']=='unchanged'
+    # The retained sender and revision stay, the receipt keeps the raw form, and the other form gets no profile.
+    assert sender_rows(s,mid)==(retained,1,[],0)
+    with s.pool.connection() as c:
+        envelope=c.execute("SELECT envelope FROM ingest_receipts WHERE outcome='unchanged'").fetchone()['envelope']
+        snapshots=c.execute('SELECT snapshot FROM message_revisions WHERE message=%s',(mid,)).fetchall()
+    assert envelope['sender']==candidate and [r['snapshot']['sender'] for r in snapshots]==[retained]
+
+
+# spec: ANYM-559
+@pytest.mark.parametrize('evidence',['none','other_account','two_lids','two_pns','deleted_source_conflict','lid_only'])
+def test_whatsapp_sender_alias_needs_admissible_evidence(archive,evidence):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    ar.register('archive-wb','whatsapp','Other synthetic WhatsApp',include_chats=['900@lid'])
+    mid=ar.ingest(alias_event(PN))['message']
+    if evidence=='lid_only':
+        # Two LID forms are no phone-number/LID pair (class F, ANYM-561).
+        observe(s,mid)
+        lid_mid=ar.ingest(alias_event(LID,provider_id='true_900@lid_3EB0LIDONLY'))['message']
+        assert ar.ingest(alias_event('310000000002@lid',provider_id='true_900@lid_3EB0LIDONLY'))['outcome']=='conflict'
+        assert sender_rows(s,lid_mid)==(LID,1,[],1)
+        return
+    if evidence=='other_account':
+        observe(s,ar.ingest(alias_event(PN,account='archive-wb'))['message'],account='archive-wb')
+    elif evidence!='none':observe(s,mid)
+    if evidence=='two_lids':observe(s,mid,lid='310000000002@lid')
+    if evidence=='two_pns':observe(s,mid,pn='79990000002@c.us')
+    if evidence=='deleted_source_conflict':
+        # A conflicting mapping whose source message was deleted still fences the pair.
+        gone=ar.ingest(alias_event(PN,provider_id='true_900@lid_3EB0GONE'))['message']
+        observe(s,gone,lid='310000000002@lid')
+        deletion=alias_event(PN,provider_id='true_900@lid_3EB0GONE',deleted=True,body='',updated_at='2026-10-01T12:01:00+00:00')
+        del deletion['formatting']
+        assert ar.ingest(deletion)['outcome']=='deleted'
+    assert ar.ingest(alias_event(LID))['outcome']=='conflict'
+    assert sender_rows(s,mid)==(PN,1,[],1)
+    assert stored_conflicts(s,mid)==['whatsapp_sender_equal_version']
+
+
+# spec: ANYM-559
+def test_whatsapp_unknown_sender_is_not_a_conflict_and_never_replaces_the_sender(archive):
+    ar,s,key,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    mid=ar.ingest(alias_event(PN))['message']
+    assert ar.ingest(alias_event('',origin='backfill'))['outcome']=='unchanged'
+    assert sender_rows(s,mid)==(PN,1,[],0)
+    # A later legitimate edit without a sender keeps the known sender in its revision.
+    assert ar.ingest(alias_event('',body='Вторая версия',formatting=wire('Вторая версия'),
+        updated_at='2026-10-01T12:01:00+00:00'))['outcome']=='edited'
+    assert sender_rows(s,mid)==(PN,2,[],0)
+    with s.pool.connection() as c:
+        snapshots=c.execute('SELECT snapshot FROM message_revisions WHERE message=%s ORDER BY revision',(mid,)).fetchall()
+    assert [r['snapshot']['sender'] for r in snapshots]==[PN,PN]
+
+
+# spec: ANYM-559
+@pytest.mark.parametrize('change,outcome',[
+    ({'body':'contradiction','formatting':wire('contradiction')},'conflict'),
+    ({'media':[{'provider_id':'f1','mime':'image/jpeg','bytes':10,'filename':'p.jpg'}]},'conflict'),
+    ({'sent_at':'2026-10-01T12:00:07+00:00','updated_at':'2026-10-01T12:00:07+00:00',
+        'metadata':{'timestamp_resolution':'second'}},'conflict'),
+    ({'sent_at':'2026-10-01T12:00:01+00:00','updated_at':'2026-10-01T12:00:01+00:00',
+        'metadata':{'timestamp_resolution':'second'}},'conflict'),
+    ({'direction':'outgoing'},'conflict'),
+    ({'formatting':'retained_unknown'},'conflict'),
+    ({'deleted':True,'body':'','formatting':None},'conflict'),
+    ({'body':'older text','formatting':wire('older text'),'retained_later':True},'stale')])
+@pytest.mark.parametrize('sender',['',LID])
+def test_whatsapp_sender_rule_lifts_only_the_sender_difference(archive,change,outcome,sender):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    retained=alias_event(PN,metadata={'timestamp_resolution':'second'});change=dict(change)
+    if change.get('formatting')=='retained_unknown':
+        retained['formatting']=UNREADABLE_FORMAT;change={}
+    if change.pop('retained_later',False):retained['updated_at']='2026-10-01T12:01:00+00:00'
+    mid=ar.ingest(retained)['message']
+    observe(s,mid)
+    observed={**alias_event(sender),**change}
+    if observed.get('formatting') is None:observed.pop('formatting',None)
+    assert ar.ingest(observed)['outcome']==outcome
+    assert sender_rows(s,mid)[:2]==(PN,1)
+
+
+# spec: ANYM-559
+def test_whatsapp_sender_rule_keeps_open_conflicts_and_telegram_completion(archive):
+    ar,s,key,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    mid=ar.ingest(alias_event(PN))['message']
+    observe(s,mid)
+    assert ar.ingest(alias_event('901@lid'))['outcome']=='conflict'
+    # A re-read in the other form at a later version states nothing about the open conflict.
+    assert ar.ingest(alias_event(LID,updated_at='2026-10-01T12:01:00+00:00'))['outcome']=='unchanged'
+    assert sender_rows(s,mid)==(PN,1,[],1)
+    # Telegram's sender completion is unchanged: private outgoing, authenticated self only.
+    original=event(sender='',direction='outgoing',metadata={'chat_type':'private'})
+    tg=ar.ingest(original)['message']
+    assert ar.ingest({**original,'sender':'42','metadata':{'chat_type':'group','sender_identity_basis':'authenticated_self'}})['outcome']=='conflict'
+    assert ar.ingest({**original,'sender':'42','metadata':{'chat_type':'private','sender_identity_basis':'authenticated_self'}})['outcome']=='edited'
+    assert s.get_context(key,tg)['message']['sender']=='42'
+    # A Telegram candidate without a sender is not covered by the WhatsApp rule.
+    tg2=ar.ingest(event(provider_id='19'))['message']
+    assert ar.ingest(event(provider_id='19',sender=''))['outcome']=='conflict'
+    assert s.get_context(key,tg2)['message']['sender']=='42'
+
+
+# spec: ANYM-559
+def test_identity_record_waits_for_the_account_lock(archive):
+    import threading
+    from messaging_service.whatsapp_identity import record
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    envelope=validate(alias_event(PN))
+    mid=ar.ingest(envelope)['message']
+    values=[{'identity_id':PN,'pn':PN,'lid':LID,'provenance':'whatsmeow_lid_store_v1','observed_at':'2026-10-01T11:00:00+00:00'}]
+    done=threading.Event()
+    with s.pool.connection() as c:
+        # The lock ingest holds while it reads the account's observations.
+        c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('archive:archive-wa',))
+        writer=threading.Thread(target=lambda:(record(ar,envelope,values,None),done.set()))
+        writer.start()
+        assert not done.wait(1.5)
+        with s.pool.connection() as probe:
+            assert probe.execute('SELECT count(*) AS n FROM whatsapp_identity_observations').fetchone()['n']==0
+    writer.join(10)
+    assert done.is_set()
+    with s.pool.connection() as c:
+        assert c.execute('SELECT count(*) AS n FROM whatsapp_identity_observations WHERE source_message=%s',(mid,)).fetchone()['n']==1

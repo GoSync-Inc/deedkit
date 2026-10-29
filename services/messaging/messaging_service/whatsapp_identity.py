@@ -31,9 +31,28 @@ def observations(value,envelope):
     return result
 
 
+def same_sender(c,account,retained,candidate):
+    """True when `retained` and `candidate` are one WhatsApp sender in its phone-number and LID forms:
+    this account recorded the pair from an approved provenance, and no observation anywhere in the
+    account (deleted sources included) links either side to another (the fence of visible_cte and
+    resolve_alias). Account-local, network-free, two index probes; absence or ambiguity is False."""
+    forms={personal_id(retained),personal_id(candidate)}
+    pn=next((f for f in forms if f and f.endswith('@c.us')),None);lid=next((f for f in forms if f and f.endswith('@lid')),None)
+    if len(forms)!=2 or not pn or not lid:return False
+    row=c.execute('''SELECT EXISTS(SELECT 1 FROM whatsapp_identity_observations
+            WHERE account=%s AND pn=%s AND lid=%s AND provenance=ANY(%s)) AS linked,
+        EXISTS(SELECT 1 FROM whatsapp_identity_observations WHERE account=%s AND pn=%s AND lid<>%s) OR
+        EXISTS(SELECT 1 FROM whatsapp_identity_observations WHERE account=%s AND lid=%s AND pn<>%s) AS fenced''',
+        (account,pn,lid,sorted(PROVENANCES),account,pn,lid,account,lid,pn)).fetchone()
+    return bool(row['linked'] and not row['fenced'])
+
+
 def record(archive,envelope,values,lease):
     if not values:return
     with archive.store.pool.connection() as c:
+        # Ingest reads these observations under the account lock (archive.ingest, same_sender):
+        # a mapping commits before or after that read, never between its check and its outcome.
+        c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('archive:'+envelope['account'],))
         archive.fence(c,envelope['account'],lease)
         mid=stable_id('msg',envelope['account'],envelope['chat'],envelope['provider_id'])
         # The independently committed message may have changed since this capture.
