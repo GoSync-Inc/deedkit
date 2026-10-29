@@ -221,6 +221,7 @@ def wait_for(condition, seconds=30):
         time.sleep(0.2)
 
 
+# spec: ANYM-638
 def test_the_list_holds_tracked_and_untracked_files_but_no_secret_environment_or_deleted_file(mini, worktree):
     _, env = mini
     result = remote(env, '--list', worktree)
@@ -228,6 +229,7 @@ def test_the_list_holds_tracked_and_untracked_files_but_no_secret_environment_or
     assert set(result.stdout.split('\n')) - {''} == SENT
 
 
+# spec: ANYM-638
 def test_a_run_sends_exactly_the_listed_files_and_runs_the_suite_as_the_service_user(mini, worktree):
     home, env = mini
     result = remote(env, '--full', worktree, 'gateway')
@@ -244,6 +246,7 @@ def test_a_run_sends_exactly_the_listed_files_and_runs_the_suite_as_the_service_
     assert log_lines(home, 'uv run pytest -q | cwd=gateway')
 
 
+# spec: ANYM-638
 def test_a_second_run_removes_what_the_worktree_no_longer_has_and_keeps_the_environment(mini, worktree):
     home, env = mini
     assert remote(env, '--full', worktree, 'gateway').returncode == 0
@@ -254,6 +257,7 @@ def test_a_second_run_removes_what_the_worktree_no_longer_has_and_keeps_the_envi
     assert files_under(copy) == SENT - {'new_module.py'} | {'.venv/kept.py'}
 
 
+# spec: ANYM-638
 def test_by_default_a_run_takes_ruff_and_the_touched_test_modules_of_its_suite(mini, worktree):
     home, env = mini
     git(worktree, 'checkout', '-qb', 'feature')
@@ -270,6 +274,7 @@ def test_by_default_a_run_takes_ruff_and_the_touched_test_modules_of_its_suite(m
     assert log_lines(home, 'uv run --project tools/dev --locked ruff check services/calendar/tests/service/test_cal.py')
 
 
+# spec: ANYM-638
 def test_a_suite_with_nothing_touched_runs_nothing_and_says_ci_covers_it(mini, worktree):
     home, env = mini
     result = remote(env, worktree, 'gateway')
@@ -278,6 +283,7 @@ def test_a_suite_with_nothing_touched_runs_nothing_and_says_ci_covers_it(mini, w
     assert not log_lines(home, 'ssh')
 
 
+# spec: ANYM-638
 def test_the_root_suite_gets_a_postgres_on_localhost_and_a_private_dsn_file(mini, worktree):
     home, env = mini
     result = remote(env, worktree, 'root', 'tests/test_app.py')
@@ -297,6 +303,7 @@ def test_the_root_suite_gets_a_postgres_on_localhost_and_a_private_dsn_file(mini
     assert 'skipped: needs docker (CI covers)' in result.stderr
 
 
+# spec: ANYM-638
 def test_the_full_root_suite_runs_parallel_shards_each_with_its_own_database(mini, worktree):
     home, env = mini
     result = remote(env, '--full', worktree, 'root')
@@ -308,6 +315,7 @@ def test_the_full_root_suite_runs_parallel_shards_each_with_its_own_database(min
     assert '[1/2] FAKE SUITE OUTPUT 1/2' in result.stdout and '[2/2] FAKE SUITE OUTPUT 2/2' in result.stdout
 
 
+# spec: ANYM-638
 def test_caps_on_the_mini_drop_the_root_suite_to_one_process_without_a_code_change(mini, worktree):
     home, env = mini
     write(home / 'shared' / 'caps.conf', CAPS + 'PARALLEL=1\nMAX_RUNS=1\n', 0o644)
@@ -316,6 +324,7 @@ def test_caps_on_the_mini_drop_the_root_suite_to_one_process_without_a_code_chan
     assert len(log_lines(home, 'uv run pytest --tb=short')) == 1
 
 
+# spec: ANYM-638
 def test_the_go_frontend_and_node_suites_run_the_ci_commands(mini, worktree):
     home, env = mini
     for args in (('--full', worktree, 'go'), (worktree, 'frontend'), (worktree, 'node')):
@@ -328,6 +337,7 @@ def test_the_go_frontend_and_node_suites_run_the_ci_commands(mini, worktree):
     assert log_lines(home, 'node --test whatsapp/tests/a.test.mjs')
 
 
+# spec: ANYM-638
 def test_the_build_suite_brings_dist_back_to_the_worktree(mini, worktree):
     _, env = mini
     result = remote(env, worktree, 'build')
@@ -335,6 +345,7 @@ def test_the_build_suite_brings_dist_back_to_the_worktree(mini, worktree):
     assert (worktree / 'dist' / 'anymsg-0.0.0.whl').read_text() == 'synthetic'
 
 
+# spec: ANYM-638
 def test_the_disk_guard_refuses_under_15_gigabytes_before_anything_runs(mini, worktree):
     home, env = mini
     result = remote(env, worktree, 'root', FAKE_FREE_GB='14')
@@ -344,6 +355,7 @@ def test_the_disk_guard_refuses_under_15_gigabytes_before_anything_runs(mini, wo
     assert not (home / 'shared' / 'stage' / WORKER).exists()
 
 
+# spec: ANYM-638
 def test_a_failing_suite_stops_postgres_and_returns_the_suite_status(mini, worktree):
     home, env = mini
     result = remote(env, '--full', worktree, 'calendar', FAKE_UV_EXIT='3')
@@ -352,6 +364,7 @@ def test_a_failing_suite_stops_postgres_and_returns_the_suite_status(mini, workt
     assert 'fcs=postgresql://probe_owner:' in log_lines(home, 'uv run pytest -m not live')[0]
 
 
+# spec: ANYM-638
 def test_a_terminated_run_stops_its_children_and_postgres(mini, worktree):
     home, env = mini
     process = background(env, worktree, 'root', 'tests/test_app.py', FAKE_UV_SLEEP='60')
@@ -365,6 +378,7 @@ def test_a_terminated_run_stops_its_children_and_postgres(mini, worktree):
     assert load_rows(home)[-1][1] == 'root' and load_rows(home)[-1][-1] == '143'
 
 
+# spec: ANYM-638
 @pytest.mark.parametrize('stage', ['copy', 'initdb', 'suite'])
 def test_a_killed_runner_leaves_no_process_database_or_held_slot_behind(mini, worktree, stage):
     home, env = mini
@@ -384,6 +398,7 @@ def test_a_killed_runner_leaves_no_process_database_or_held_slot_behind(mini, wo
     assert again.returncode == 0, again.stderr
 
 
+# spec: ANYM-638
 def test_a_run_started_right_after_a_killed_one_is_not_touched_by_the_old_watchdog(mini, worktree):
     home, env = mini
     write(home / 'shared' / 'caps.conf', 'WAIT_SECONDS=10\nPOLL_SECONDS=1\n', 0o644)
@@ -397,6 +412,7 @@ def test_a_run_started_right_after_a_killed_one_is_not_touched_by_the_old_watchd
     assert load_rows(home)[-1][-1] == '0'
 
 
+# spec: ANYM-638
 def test_each_mini_run_appends_one_load_line(mini, worktree):
     home, env = mini
     assert remote(env, worktree, 'root', 'tests/test_app.py').returncode == 0
@@ -411,6 +427,7 @@ def test_each_mini_run_appends_one_load_line(mini, worktree):
     assert remote(env, '--load').stdout.count(WORKER) == 2
 
 
+# spec: ANYM-638
 def test_a_taken_slot_makes_the_run_wait_in_the_mini_queue_then_ci_covers(mini, worktree):
     home, env = mini
     locks = home / 'service' / 'deedkit-ci' / '.locks'
@@ -428,6 +445,7 @@ def test_a_taken_slot_makes_the_run_wait_in_the_mini_queue_then_ci_covers(mini, 
     assert log_lines(home, 'uv run pytest -q | cwd=gateway')
 
 
+# spec: ANYM-638
 @pytest.mark.parametrize('extra', [{'FAKE_DOCKER_PS': 'between-ci-1234-test \n'},
                                    {'FAKE_DOCKER_PS': 'app-ready-1 io.between.local-ci.run=abc\n'},
                                    {'FAKE_LOAD': '9.50'}, {'FAKE_FREE_MEM_GB': '2'}],
@@ -439,6 +457,7 @@ def test_between_activity_or_low_memory_keeps_the_run_off_the_mini(mini, worktre
     assert not log_lines(home, 'sudo')
 
 
+# spec: ANYM-638
 @pytest.mark.parametrize('extra,code', [({'FAKE_SSH_DOWN': '1'}, 91), ({'FAKE_NO_SERVICE': '1'}, 92),
                                         ({'FAKE_SSH_FAIL': 'mkdir -p'}, 91), ({'FAKE_SSH_FAIL': 'rsync --server'}, 91)],
                          ids=['unreachable', 'no-service-user', 'mkdir-fails', 'rsync-fails'])
@@ -451,6 +470,7 @@ def test_a_mini_that_cannot_start_the_suite_leaves_it_to_ci_and_runs_nothing_loc
     assert not (worker_dir(home) / 'src').exists()
 
 
+# spec: ANYM-638
 def test_an_ssh_drop_mid_run_stops_the_run_on_the_mini_and_does_not_rerun_locally(mini, worktree):
     home, env = mini
     process = background(env, worktree, 'root', 'tests/test_app.py', FAKE_UV_SLEEP='60', FAKE_SSH_DROP='1')
@@ -465,6 +485,7 @@ def test_an_ssh_drop_mid_run_stops_the_run_on_the_mini_and_does_not_rerun_locall
     assert len(log_lines(home, 'uv run pytest')) == 1
 
 
+# spec: ANYM-638
 def test_cleanup_removes_the_workers_copies_and_leftover_databases_only(mini, worktree):
     home, env = mini
     assert remote(env, '--full', worktree, 'gateway').returncode == 0
@@ -482,6 +503,7 @@ def test_cleanup_removes_the_workers_copies_and_leftover_databases_only(mini, wo
     assert (other / 'kept.py').exists()
 
 
+# spec: ANYM-638
 @pytest.mark.parametrize('name', ['../owner', 'A', '', 'a/b', '_x'])
 def test_a_worker_name_that_could_leave_its_directory_is_refused(mini, name):
     home, env = mini
