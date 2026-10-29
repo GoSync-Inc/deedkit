@@ -490,3 +490,18 @@ def test_a_shown_meaningful_fallback_keeps_its_known_conflict_caveat():
     assert result['basis']['code']=='unclassified_latest_message'
     assert result['latest_known_meaningful_message']['conflict']['class']=='telegram_body_equal_version'
     assert [k['on'] for k in lean_conversation(result,shown=['older'])['known_conflicts']]==['latest_message_id']
+
+
+# spec: ANYM-408
+@pytest.mark.parametrize('chat_type,messages,attention,kept',[
+    ('group',[message('msg_head')],[message('msg_mention',second=10)],
+        lambda c:c['owner_attention']['target_message_id']=='msg_mention'),
+    ('private',[message('Z','incoming'),message('A','outgoing')],None,
+        lambda c:sorted(c['candidate_message_ids'])==['A','Z'])])
+def test_a_compact_row_with_a_hint_without_message_id_keeps_the_ids_it_does_not_state(chat_type,messages,attention,kept):
+    from messaging_service.presentation import lean_chat
+    result=state(messages,chat_type=chat_type,**({'attention':attention} if attention else {}))
+    row=lean_chat({'id':'chat_synthetic','account':'synthetic','title':'Synthetic chat','type':chat_type,
+        'last_activity':NOW,'conversation':result,'awaiting_reply':True,'awaiting_reply_sender':'synthetic-person',
+        'awaiting_reply_snippet':'Synthetic text'})
+    assert 'message_id' not in row['awaiting_reply'] and kept(row['conversation'])
