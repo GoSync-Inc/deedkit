@@ -366,6 +366,59 @@ def test_dynamic_counts_and_visibility_survive_hint_deletion_and_the_tombstone(s
 
 
 # spec: ANYM-447
+def test_hints_at_one_position_past_the_batch_bound_go_in_bounded_batches_and_keep_counting(seeded, monkeypatch):
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    try:
+        token = dynamic_key(store, 'tombstone-tie-reader')
+        sid = store.create_subscription(token, sources=ALL_VISIBLE)['subscription_id']
+        event = emit(store)
+        match_subscriptions(store)
+        # Equal positions: subscription versions or repeated endpoint resumes; one group alone exceeds the bound.
+        for _ in range(3):
+            tie = hints(store, sid, ['delivered'], '40 days', at=event)
+            with store.pool.connection() as c:
+                c.execute("UPDATE subscription_outbox SET request_id='tie:'||id WHERE id=%s", (tie[0],))
+        monkeypatch.setattr(subscriptions, 'RETENTION_BATCH', 2)
+        first = retire_subscriptions(store)
+        assert (first['hints_deleted'], first['rows_deleted'], first['more']) == (2, 2, True)
+        # The kept hint at that position still bounds its range, so the floor stays below it and it still counts.
+        assert column(store, sid, 'hints_deleted_through') < event
+        assert store.get_subscription(token, sid)['delivery']['hint_counts'] == {'delivered': 3}
+        assert retire_subscriptions(store)['hints_deleted'] == 1 and outbox(store, sid) == []
+        assert column(store, sid, 'hints_deleted_through') == event
+        delivery = store.get_subscription(token, sid)['delivery']
+        assert delivery['hint_counts'] == {'delivered': 3} and delivery['deleted_hint_counts'] == {'delivered': 3}
+    finally:
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-447
+def test_resume_wake_after_hint_deletion_counts_from_the_ack_position(seeded):
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    try:
+        token = dynamic_key(store, 'tombstone-resume-reader')
+        sid = store.create_subscription(token, sources=ALL_VISIBLE)['subscription_id']
+        event = emit(store)
+        match_subscriptions(store)
+        hints(store, sid, ['delivered'], '40 days', at=event)
+        assert retire_subscriptions(store)['hints_deleted'] == 1
+        assert column(store, sid, 'hints_deleted_through') == event
+        # An endpoint resume wakes the receiver for the unACKed backlog at the deleted hint's position.
+        wake = hints(store, sid, ['pending'], at=event)
+        with store.pool.connection() as c:
+            c.execute("UPDATE subscription_outbox SET request_id='resume:'||id WHERE id=%s", (wake[0],))
+        with store.authorized(token) as (c, p):
+            row = c.execute('SELECT * FROM subscriptions WHERE id=%s', (sid,)).fetchone()
+            assert subscriptions.hint_visible(c, row, p, event, acked=True)
+        # The dispatcher sends it, so it counts: the view and the dispatcher read one range.
+        assert store.get_subscription(token, sid)['delivery']['hint_counts'] == {'delivered': 1, 'pending': 1}
+    finally:
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-447
 def test_access_changed_definition_keeps_its_acked_references_until_30_days_after_closure(seeded):
     store, _, _ = seeded
     token, sid, events = acked_subscription(store, name='tombstone-acl-reader')

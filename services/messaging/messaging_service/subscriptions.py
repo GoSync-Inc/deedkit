@@ -266,14 +266,16 @@ def _hint_counts(c, row, p, ids=None):
     if dynamic(row):
         if p is None:
             return {}  # ANYM-447: no key can read it now, so the worker counts none and discloses nothing.
-        # ANYM-522: only events hints that cover a reference the key can see now count, in every state.
+        # ANYM-522: only events hints that cover a reference the key can see now count, in every state; a resume's
+        # backlog wake covers it from the ACK position, as hint_visible sends it.
         where, args = visible_filter(row, p)
         counts = c.execute('''SELECT o.state,count(*) AS n FROM subscription_outbox o WHERE o.subscription=%s
             AND (%s::uuid[] IS NULL OR o.id=ANY(%s))
             AND o.error_code IS DISTINCT FROM 'scope_changed' AND (o.kind<>'events' OR EXISTS(
                 SELECT FROM subscription_matches m WHERE m.subscription=o.subscription AND m.event<=o.through_position
-                AND m.event>''' + _PREVIOUS_HINT + ''' AND ''' + where + ''')) GROUP BY o.state''',
-            (row['id'], ids, ids, hint_floor(row), *args)).fetchall()
+                AND m.event>CASE WHEN starts_with(o.request_id,'resume:') THEN ''' + _ACK_POSITION + '''
+                ELSE ''' + _PREVIOUS_HINT + ''' END AND ''' + where + ''')) GROUP BY o.state''',
+            (row['id'], ids, ids, row['start_position'], hint_floor(row), *args)).fetchall()
     else:
         counts = c.execute('''SELECT state,count(*) AS n FROM subscription_outbox WHERE subscription=%s
             AND (%s::uuid[] IS NULL OR id=ANY(%s)) GROUP BY state''', (row['id'], ids, ids)).fetchall()
@@ -1090,9 +1092,9 @@ def _delete_hints(c, row, limit, *, days=None):
     """Delete up to limit finished hints (finished more than days ago, if given); their counts the key could see
     move to deleted_hint_counts in the same transaction. Returns rows deleted.
 
-    Bounding events hints go only as a prefix by position, strictly below every one that stays, and
-    hints_deleted_through takes the highest deleted position, so each kept hint's range (hint_floor) and hint_visible
-    stay exactly as they were. With days (an open definition) test hints stay: their request IDs replay."""
+    Bounding events hints go only as a prefix by position, at or below every one that stays, and
+    hints_deleted_through takes the highest deleted position no kept hint bounds, so each kept hint's range
+    (hint_floor) and hint_visible stay exactly as they were. With days (an open definition) test hints stay: their request IDs replay."""
     finished = _FINISHED + ' AND (%s::integer IS NULL OR finished_at<clock_timestamp()-make_interval(days=>%s))'
     # No row lock first: the worker role has no UPDATE on the outbox, and finished rows no longer change.
     keep = c.execute('SELECT min(through_position) AS p FROM subscription_outbox WHERE subscription=%s AND ' +
@@ -1103,19 +1105,18 @@ def _delete_hints(c, row, limit, *, days=None):
         ORDER BY through_position,id LIMIT %s''', (row['id'], days, days, days is None, keep, keep, limit)).fetchall()
     if not rows:
         return 0
-    if len(rows) == limit and any(item['bounding'] for item in rows):
-        # A cut inside equal positions would leave a kept hint at the new floor: take that position whole.
-        top = max(item['through_position'] for item in rows if item['bounding'])
-        chosen = {item['id'] for item in rows}
-        rows += c.execute('SELECT id,through_position,true AS bounding FROM subscription_outbox WHERE subscription=%s AND ' +
-            _BOUNDING + ' AND through_position=%s AND NOT id=ANY(%s) AND ' + finished,
-            (row['id'], top, list(chosen), days, days)).fetchall()
     ids = [item['id'] for item in rows]
     # The view's own filter at deletion time, references still present, so hint_counts never drops.
     counts = _hint_counts(c, row, _worker_identity(c, row) if dynamic(row) else None, ids)
     deleted = c.execute('DELETE FROM subscription_outbox WHERE id=ANY(%s) AND ' + _FINISHED, (ids,)).rowcount
     kept = row['deleted_hint_counts']
-    through = max([item['through_position'] for item in rows if item['bounding']], default=0)
+    positions = {item['through_position'] for item in rows if item['bounding']}
+    # The limit may cut inside equal positions: the floor then stays below the position a kept hint still bounds,
+    # so its range starts where it did, and a later batch takes the rest of that position.
+    if positions and c.execute('SELECT EXISTS(SELECT FROM subscription_outbox WHERE subscription=%s AND ' + _BOUNDING +
+            ' AND through_position=%s) AS left', (row['id'], max(positions))).fetchone()['left']:
+        positions.remove(max(positions))
+    through = max(positions, default=0)
     c.execute('''UPDATE subscriptions SET deleted_hint_counts=%s,hints_deleted_at=clock_timestamp(),
         hints_deleted_through=greatest(hints_deleted_through,%s) WHERE id=%s''',
         (Jsonb({state: kept.get(state, 0) + counts.get(state, 0) for state in sorted({*kept, *counts})}), through,
