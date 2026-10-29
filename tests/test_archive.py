@@ -791,8 +791,7 @@ def test_whatsapp_body_completion_rule_is_a_pure_function_of_two_observations():
         assert not whatsapp_body_completion(broken,validate(business()))
 
 
-def group_formatting(entities=None):
-    body='Первый текст lighthouse'
+def group_formatting(entities=None,body='Первый текст lighthouse'):
     return {'version':1,'state':'observed','basis':'telegram_native_entities',
         'wire_sha256':hashlib.sha256(body.encode()).hexdigest(),
         'entities':entities if entities is not None else [{'type':'bold','offset':0,'length':6}],
@@ -811,7 +810,8 @@ def test_authenticated_group_sender_completion_resolves_its_conflict(archive,ret
     completed={**original,'sender':'42','sender_profile':{'display_name':'Synthetic Owner'},'metadata':GROUP_SELF}
     # Today's class E: the same content naming a sender without the authenticated basis.
     assert ar.ingest({**completed,'metadata':{'chat_type':'group','sender_identity_basis':None}})['outcome']=='conflict'
-    assert ar.ingest({**completed,'body':'unrelated conflicting text'})['outcome']=='conflict'
+    assert ar.ingest({**completed,'body':'unrelated conflicting text',
+        'formatting':group_formatting(body='unrelated conflicting text')})['outcome']=='conflict'
     assert ar.ingest(completed)['outcome']=='edited'
     assert ar.ingest(completed)['outcome']=='duplicate'
     message=s.get_context(key,mid)['message']
@@ -835,7 +835,7 @@ def test_authenticated_group_sender_completion_resolves_its_conflict(archive,ret
     {'sender':'77','metadata':{'chat_type':'group'}},
     {'sender':'-100300','metadata':{'chat_type':'group'}},
     {'metadata':{'chat_type':'channel','sender_identity_basis':'authenticated_self'}},
-    {'direction':'incoming'}, {'body':'changed content'},
+    {'direction':'incoming'}, {'body':'changed content','formatting':group_formatting(body='changed content')},
     {'media':[{'provider_id':'f1','mime':'image/jpeg','bytes':10,'filename':'p.jpg'}]},
     {'updated_at':'2026-10-01T12:01:00Z'}, {'deleted':True},
     {'formatting':group_formatting([{'type':'italic','offset':0,'length':6}])}],
@@ -857,3 +857,17 @@ def test_group_sender_completion_needs_an_empty_group_sender(archive,sender,chat
     mid=ar.ingest(original)['message']
     assert ar.ingest({**original,'sender':'42','metadata':GROUP_SELF})['outcome']=='conflict'
     assert s.get_context(key,mid)['message']['sender']==sender
+
+
+# spec: ANYM-620
+def test_group_sender_completion_never_completes_a_deleted_message(archive):
+    ar,s,key,_=archive
+    original=event(sender='',direction='outgoing',metadata={'chat_type':None})
+    mid=ar.ingest(original)['message']
+    assert ar.ingest({**original,'deleted':True,'body':'','updated_at':'2026-10-01T12:01:00Z'})['outcome']=='deleted'
+    # A retained deletion keeps its tombstone precedence: the candidate writes no revision and no sender.
+    candidate={**original,'sender':'42','metadata':GROUP_SELF,'updated_at':'2026-10-01T12:01:00Z'}
+    assert ar.ingest(candidate)['outcome']=='tombstoned'
+    with s.pool.connection() as c:
+        row=c.execute('SELECT sender,revision,deleted FROM messages WHERE id=%s',(mid,)).fetchone()
+    assert (row['sender'],row['revision'],row['deleted'])==('',2,True)
