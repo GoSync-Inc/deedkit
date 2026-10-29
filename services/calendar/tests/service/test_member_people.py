@@ -167,7 +167,7 @@ def test_migration_6_leaves_every_existing_table_as_version_5_code_reads_it():
     try:
         s.migrate(through=5)
         before = shape()
-        s.migrate()
+        s.migrate(through=6)
         assert shape() == before
         assert s.one("SELECT max(version) AS v FROM migrations")["v"] == 6
     finally:
@@ -182,8 +182,10 @@ def test_migration_6_and_its_grant_are_an_unattended_expand_from_schema_5():
     from family_calendar.service import migration_rollout as rollout
     from family_calendar.service.store import MIGRATIONS, ROLES
 
-    files = {v: Path(p).read_text() for v, p in MIGRATIONS}
+    # Migration 6 alone: the files and roles.sql text through it (later migrations are their own releases).
+    files = {v: Path(p).read_text() for v, p in MIGRATIONS if v <= 6}
     roles = ROLES.read_text()
+    roles = roles[:roles.index("-- Migration 7")] if "-- Migration 7" in roles else roles
     base = roles[:roles.index("-- Migration 6")]
     plan = rollout.plan({v: t for v, t in files.items() if v <= 5}, files, base, roles)
     assert plan["base"] == 5 and plan["target"] == 6 and "pause" not in plan

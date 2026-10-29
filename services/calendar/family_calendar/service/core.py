@@ -1401,7 +1401,7 @@ class FamilyService:
         if cal["provider"] != "google":
             raise CalendarError("capability_unsupported")
         planned = datetime.now(timezone.utc).isoformat()
-        carry = self._carry(cal, step, scope, read) if read is not None and step["action"] == "update" else None
+        carry = self._series_carry(cal, step, scope, read) if read is not None and step["action"] == "update" else None
         extra = {} if carry is None else {"snapshot": carry["snapshot"]}
         if scope == "all" or step["action"] == "delete":
             steps = [dict(step, ordinal=ordinal, series={"scope": scope, "planned_at": planned, **extra})]
@@ -1421,7 +1421,7 @@ class FamilyService:
         truncation["series"].update(extra)
         return self._carried_steps(key, cal, [replacement, truncation], carry, planned)
 
-    def _carry(self, cal, step, scope, read):
+    def _series_carry(self, cal, step, scope, read):
         """The exceptions a series time move carries, from the preview's read of the series (ANYM-614); None when
         the move's shape is one the carried writes do not express (the worker then refuses it before any write as
         it always did: series_exceptions, unsupported_recurrence, capability_unverified)."""
