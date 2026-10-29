@@ -713,7 +713,7 @@ def test_whatsapp_business_text_completes_an_empty_unknown_revision(archive,kind
     ({'body':'Старый текст','formatting':wire('Старый текст')},{},'conflict'),
     # Another identity, attachment set or provider time.
     ({},{'sender':'901@lid'},'conflict'),
-    ({},{'direction':'incoming'},'conflict'),
+    ({},{'direction':'outgoing'},'conflict'),
     ({},{'sent_at':'2026-10-01T11:59:59+00:00'},'conflict'),
     ({},{'media':DOCUMENT},'conflict'),
     ({'media':DOCUMENT},{},'conflict'),
@@ -752,7 +752,7 @@ def test_whatsapp_business_text_completion_keeps_unrelated_open_conflicts(archiv
     mid=ar.ingest(unreadable(origin='live',updated_at='2026-10-01T12:00:30+00:00'))['message']
     # One contradiction at the retained version and one older one, both about other fields.
     assert ar.ingest(unreadable(sender='901@lid',updated_at='2026-10-01T12:00:30+00:00'))['outcome']=='conflict'
-    assert ar.ingest(unreadable(direction='incoming'))['outcome']=='conflict'
+    assert ar.ingest(unreadable(direction='outgoing'))['outcome']=='conflict'
     before=open_conflicts(s,mid)
     assert before==['whatsapp_sender_equal_version','whatsapp_direction_older_version']
     assert ar.ingest(business(updated_at='2026-10-01T12:00:30+00:00'))['outcome']=='edited'
