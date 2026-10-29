@@ -167,18 +167,25 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         include_coverage=True,awaiting_reply_days=14,exclude_chats=None,exclude_senders=None,
         only_questions=False,only_unread=False,selected_chat=None,include_dismissed=False,
         view='archive',exclude_likely_broadcasts=False,include_muted=False,promotional='exclude',
-        my_roles=None,can_post=None):
+        my_roles=None,can_post=None,awaiting_their_reply=False,min_wait_hours=None):
     from .store import APIError,bounded,date_bound,serial
+    from . import owner_waits
     bounded(limit);valid_text(after,4096);valid_text(query,200)
     options(view)
     if order=='last_activity_desc':order='activity'
-    if order not in ('id','activity','priority') or any(type(v) is not bool for v in
+    if order not in ('id','activity','priority','waiting_longest') or any(type(v) is not bool for v in
             (exclude_channels,awaiting_reply,include_coverage,only_questions,only_unread,exclude_likely_broadcasts,include_muted)):
         raise APIError('invalid_filter')
     if type(awaiting_reply_days) is not int or not 0<=awaiting_reply_days<=365:
         raise APIError('invalid_filter')
+    # ANYM-537: the owner's unanswered runs, refused with any filter that reads the reply queue's hint or the head time.
+    min_wait_hours=owner_waits.validate(order,min_wait_hours,awaiting_their_reply=awaiting_their_reply,
+        awaiting_reply=awaiting_reply,others={'only_unread':only_unread,'exclude_senders':exclude_senders is not None,
+        'exclude_likely_broadcasts':exclude_likely_broadcasts,'from_time':from_time,'to_time':to_time,
+        'my_roles':my_roles is not None,'can_post':can_post is not None,'promotional':promotional!='exclude'})
     if awaiting_reply and order=='id':order='activity'
-    if (order=='priority' or exclude_likely_broadcasts or include_muted) and not awaiting_reply:raise APIError('invalid_filter')
+    if (order=='priority' or exclude_likely_broadcasts) and not awaiting_reply:raise APIError('invalid_filter')
+    if include_muted and not (awaiting_reply or awaiting_their_reply):raise APIError('invalid_filter')
     # ANYM-427: likely promotional rows leave the queue by default; include returns them marked, only lists just them.
     if promotional not in PROMOTIONAL or promotional!='exclude' and (exclude_likely_broadcasts or not awaiting_reply):
         raise APIError('invalid_filter')
@@ -271,12 +278,13 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         **({'include_muted':True} if include_muted else {}),
         **({'promotional':promotional} if awaiting_reply else {}),
         **({'score_formula':SCORE_FORMULA} if order=='priority' else {}),
-        **({'my_roles':my_roles} if my_roles is not None else {}),**({'can_post':can_post} if can_post is not None else {})})
+        **({'my_roles':my_roles} if my_roles is not None else {}),**({'can_post':can_post} if can_post is not None else {}),
+        **({'awaiting_their_reply':True,'min_wait_hours':min_wait_hours} if awaiting_their_reply else {})})
     if view=='conversation':
         binding=cursor_binding(p,'chats-conversation-v1',{'archive_binding':binding})
     pos=decode_cursor(after,binding) if after and order!='id' else None
     now=c.execute('SELECT CURRENT_TIMESTAMP AS t').fetchone()['t'];score_at=now
-    if pos and order=='activity' and set(pos)!={'id','at'}:raise APIError('invalid_cursor')
+    if pos and order in ('activity','waiting_longest') and set(pos)!={'id','at'}:raise APIError('invalid_cursor')
     if pos and order=='priority':
         if set(pos)!={'id','at','score','as_of'} or type(pos['score']) is not int:raise APIError('invalid_cursor')
         score_at=position_date(pos['as_of'])
@@ -359,8 +367,8 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         AND (coalesce(attention.business,false) OR {day_walk} IS NOT NULL))'''
     promotional_filter={'exclude':'NOT '+likely_promotional,'only':likely_promotional}.get(promotional) if awaiting_reply else None
     if awaiting_reply:clauses.append(pending)
-    if only_questions:clauses.append('attention.question')
-    if (awaiting_reply or only_questions) and awaiting_reply_days:
+    if only_questions and not awaiting_their_reply:clauses.append('attention.question')
+    if (awaiting_reply or only_questions and not awaiting_their_reply) and awaiting_reply_days:
         # Attention needs a recent incoming message. One indexed probe per chat
         # skips the attention, head and owner-thread lookups for quiet chats,
         # which are most of a large catalogue, before both the count and page.
@@ -490,6 +498,24 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         unknown_roles=c.execute('SELECT count(*) AS n'+base+' AND '.join([*(v for v in clauses if v not in role_clauses),
             role_sql+"='unknown' AND c.chat_type IN ('group','channel') AND a.platform='telegram'"]),
             [*base_args,*args]).fetchone()['n']
+    waits=None
+    if awaiting_their_reply:
+        # ANYM-537: one pass counts what the list shows and what each of its rules leaves out.
+        waits_mutes=c.execute('SELECT EXISTS(SELECT 1 FROM reply_mutes WHERE principal=%s) AS x',(p['id'],)).fetchone()['x']
+        rules=owner_waits.conditions(aliases=aliases,min_wait_hours=min_wait_hours,days=awaiting_reply_days,
+            principal=p['id'],mutes=waits_mutes)
+        waits_from=(' FROM chats c JOIN accounts a ON a.id=c.account CROSS JOIN (SELECT %s::jsonb AS owners,%s::jsonb AS aliases) score_clock'
+            ' LEFT JOIN chat_read_observations ro ON ro.account=c.account AND ro.chat=c.id'+owner_waits.laterals(c,aliases))
+        waits_args=[owner_senders(c,p),Jsonb(aliases)]
+        shown=f"({rules['muted']}) IS NULL" if rules['muted'] and not include_muted else 'true'
+        asked=rules['question'] if only_questions else 'true'
+        counted=c.execute(f'''SELECT count(*) FILTER(WHERE {rules['listed']} AND {shown} AND {asked}) AS listed,
+            count(*) FILTER(WHERE {rules['uncertain']} AND {shown}) AS uncertain,
+            count(*) FILTER(WHERE {rules['listed']} AND {shown} AND NOT {asked}) AS without_question,
+            count(*) FILTER(WHERE {rules['listed']} AND {asked} AND ({rules['muted'] or 'NULL'}) IS NOT NULL) AS muted
+            '''+waits_from+' WHERE '+' AND '.join([*clauses,rules['chat']]),[*waits_args,*args]).fetchone()
+        waits={'rules':rules,'from':waits_from,'args':waits_args,'totals':counted,'mutes':waits_mutes,
+            'where':[rules['chat'],rules['listed'],shown,asked]}
     if after:
         cid=valid_text(after,empty=False) if order=='id' else position_text(pos.get('id'))
         if not c.execute('SELECT 1 FROM chats c WHERE c.id=%s AND '+scope,[cid,*scope_filter(p,'c',chat_column='id')[1]]).fetchone():raise APIError('not_found',404)
@@ -498,10 +524,12 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
             at=None if pos['at'] is None and order=='activity' else position_date(pos['at'])
             if order=='activity':
                 clauses.append("(coalesce(last.sent_at,'-infinity'),c.id)<(coalesce(%s::timestamptz,'-infinity'),%s)");args.extend([at,cid])
+            elif order=='waiting_longest':
+                clauses.append('(ws.sent_at,c.id)>(%s::timestamptz,%s)');args.extend([at,cid])
             else:
                 clauses.append('(-'+score+',attention.sent_at,c.id)>(-%s,%s,%s)');args.extend([pos['score'],at,cid])
     sort={'id':'c.id','activity':"coalesce(last.sent_at,'-infinity') DESC,c.id DESC",
-        'priority':score+' DESC,attention.sent_at,c.id'}[order]
+        'priority':score+' DESC,attention.sent_at,c.id','waiting_longest':'c.wait_since,c.id'}[order]
     prefix='';where=' AND '.join(clauses);query_args=[*base_args,*args,limit+1]
     if not awaiting_reply and not only_questions and not only_unread and exclude_senders is None and (
             order=='activity' or order=='id' and lower is None and upper is None):
@@ -513,6 +541,14 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         prefix='WITH chat_page AS MATERIALIZED (SELECT c.*'+page_from+' WHERE '+where+' ORDER BY '+sort+' LIMIT %s) '
         base=base.replace(' FROM chats c JOIN accounts a',' FROM chat_page c JOIN accounts a',1)
         query_args=[*args,limit+1,*base_args,limit+1];where='true'
+    if waits:
+        # The page is chosen over the run lookups alone; the row's head, read and hint evidence is read for it only.
+        prefix=('WITH chat_page AS MATERIALIZED (SELECT c.*,ws.sent_at AS wait_since,wh.id AS wait_last_id,'
+            'wh.sent_at AS wait_last_at,wp.sent_at AS wait_peer_at,wp.numeric_id AS wait_peer_numeric,'
+            +(waits['rules']['muted'] or 'NULL::text')+' AS wait_muted'+waits['from']+' WHERE '+' AND '.join([*clauses,*waits['where']])+
+            ' ORDER BY ws.sent_at,c.id LIMIT %s) ')
+        base=base.replace(' FROM chats c JOIN accounts a',' FROM chat_page c JOIN accounts a',1)
+        query_args=[*waits['args'],*args,limit+1,*base_args,limit+1];where='true'
     rows=c.execute(prefix+'''SELECT c.id,c.account,c.title,c.provider_chat AS provider_chat_id,c.chat_type AS type,
         '''+role_sql+''' AS my_role,'''+('c.can_post,c.role_observed_at,' if roles_ready else
           'NULL::boolean AS can_post,NULL::timestamptz AS role_observed_at,')+'''
@@ -527,7 +563,7 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
             THEN attention.provider_id::bigint<=ro.read_inbox_max_id
           END END AS read_by_owner,'''+('ro.count_basis AS read_state_count_basis,ro.marked_unread AS read_state_marked_unread,'
             if read_sources else 'NULL::text AS read_state_count_basis,NULL::boolean AS read_state_marked_unread,')+'''
-        NULL::boolean AS muted,NULL::boolean AS archived,'''+pending+''' AS awaiting_reply,
+        NULL::boolean AS muted,NULL::boolean AS archived,'''+('false' if waits else pending)+''' AS awaiting_reply,
         '''+(muted_flag if include_muted and ranked else 'NULL::text')+''' AS awaiting_reply_muted,
         '''+(f'''(SELECT sz.snoozed_until FROM reply_snoozes sz WHERE sz.key_id={key} AND sz.chat=c.id
           AND sz.message=attention.id AND sz.revision=attention.revision AND sz.incoming_head=({incoming_head})
@@ -547,6 +583,8 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         a.platform AS _platform,coalesce('''+dismissed+''',false) AS awaiting_reply_dismissed,
         CASE WHEN a.platform='whatsapp' AND attention.sent_at=own_last.sent_at THEN
           'ambiguous_message_order' ELSE 'heuristic_not_obligation' END AS awaiting_reply_confidence'''+(
+        ''',c.wait_since AS _wait_since,c.wait_last_id AS _wait_last_id,c.wait_last_at AS _wait_last_at,
+        c.wait_peer_at AS _wait_peer_at,c.wait_peer_numeric AS _wait_peer_numeric,c.wait_muted AS _wait_muted''' if waits else '')+(
         ',count(*) OVER() AS _total,count(*) FILTER(WHERE '+unread+' IS NULL) OVER() AS _unknown' if inline_totals else '')+base+where+
         ' ORDER BY '+sort+' LIMIT %s',query_args).fetchall()
     if inline_totals:
@@ -556,6 +594,7 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     if len(rows)>limit:
         row=items[-1];position={'id':row['id'],'at':row['last_activity']}
         if order=='priority':position.update(at=row['awaiting_reply_sent_at'],score=row['awaiting_reply_priority'],as_of=score_at)
+        if waits:position['at']=row['_wait_since']
         cursor=row['id'] if order=='id' else encode_cursor(binding,position)
     # Titles of raw-titled private chats are resolved once per page; conversation reads reuse them.
     from .chat_titles import labels
@@ -566,8 +605,12 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
             ([row['id'] for row in private],))}
     titles=labels(c,p,[(row['account'],row['id']) for row in private if row['id'] not in selves])
     zone=owner_zone(os.environ)
+    if waits:
+        from .receipts import for_rows
+        receipts=for_rows(c,[{'id':row['_wait_last_id']} for row in items])
     # Compute run counts only for the returned page, never for every chat.
     for row in items:
+        if waits:row['_wait_count']=owner_waits.run_count(c,row,aliases)
         if row['awaiting_reply'] and row.get('awaiting_reply_snoozed_until'):
             # The agent asked to be reminded; the row is back for that reason (ANYM-281).
             row['awaiting_reply_priority_reasons']=[*row['awaiting_reply_priority_reasons'],'snooze_due']
@@ -610,6 +653,8 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
             if state['last_turn']=='unknown':row['last_message_direction']=None
             if row['awaiting_reply'] and state['suggested_action']=='unclear':
                 row['awaiting_reply_confidence']=state['basis']['code']
+        if waits:
+            owner_waits.finish(row,state if view=='conversation' else conversation_state(c,p,row['account'],row['id'],titles=titles),receipts)
     # The queue hint names its sender like a message; the raw ID stays in awaiting_reply_sender.
     from .sender_names import raw_name,resolve
     resolve(c,p,items,chat='id',sender='awaiting_reply_sender',name='awaiting_reply_sender_name',
@@ -639,7 +684,8 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         for row in items:row['sync']=statuses[row['id']]
     return serial({'items':items,'next_cursor':cursor,'order':order,'awaiting_reply_total':total,
         **({'view':view,'conversation_view_version':1} if view=='conversation' else {}),
-        'awaiting_reply_days':awaiting_reply_days if awaiting_reply else None,
+        'awaiting_reply_days':awaiting_reply_days if awaiting_reply or awaiting_their_reply else None,
+        **(owner_waits.summary(store,c,p,waits,accounts,min_wait_hours,only_questions) if waits else {}),
         **({'muted_total':muted_total} if muted_total is not None else {}),
         **({'excluded_likely_broadcasts_total':excluded} if exclude_likely_broadcasts else {}),
         # Absent means none, so a queue without likely promotional rows keeps its shape.

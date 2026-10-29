@@ -803,7 +803,8 @@ class Store:
                    order='id',exclude_channels=False,awaiting_reply=False,from_time='',to_time='',
                    include_coverage=True,awaiting_reply_days=14,exclude_chats=None,exclude_senders=None,
                    only_questions=False,only_unread=False,view='archive',exclude_likely_broadcasts=False,
-                   include_muted=False,promotional='exclude',my_roles=None,can_post=None):
+                   include_muted=False,promotional='exclude',my_roles=None,can_post=None,
+                   awaiting_their_reply=False,min_wait_hours=None):
         from .chat_queries import list_chats
         from .message_queries import hint_forward_origin
         with self.authorized(token,'list_chats') as (c,p):
@@ -813,7 +814,7 @@ class Store:
                 awaiting_reply_days=awaiting_reply_days,exclude_chats=exclude_chats,exclude_senders=exclude_senders,
                 only_questions=only_questions,only_unread=only_unread,view=view,
                 exclude_likely_broadcasts=exclude_likely_broadcasts,include_muted=include_muted,promotional=promotional,
-                my_roles=my_roles,can_post=can_post)
+                my_roles=my_roles,can_post=can_post,awaiting_their_reply=awaiting_their_reply,min_wait_hours=min_wait_hours)
             hint_forward_origin(c,result['items'])
             return result
 
