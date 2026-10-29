@@ -1,4 +1,4 @@
-"""The root Python suite runs in file-level shards (six in CI) on parallel runners; synthetic workflows and reports only."""
+"""The root Python suite runs in file-level shards (seven in CI) on parallel runners; synthetic workflows and reports only."""
 import fnmatch
 import json
 import os

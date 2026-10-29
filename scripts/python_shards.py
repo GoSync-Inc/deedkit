@@ -127,7 +127,7 @@ def junit_seconds(paths: list[Path]) -> dict[str, float]:
 
 def median_seconds(paths: list[Path]) -> dict[str, float]:
     """Per-file median over reports of several runs (a merged python.xml each, or the shard reports of each run):
-    a file counts in the reports that hold it, so one run's six shard reports give its own seconds."""
+    a file counts in the reports that hold it, so one run's seven shard reports give its own seconds."""
     reports = [junit_seconds([path]) for path in paths]
     names = {name for report in reports for name in report}
     return {name: statistics.median(report[name] for report in reports if name in report) for name in names}
