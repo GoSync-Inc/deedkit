@@ -1049,7 +1049,7 @@ WHERE kind='module_events' AND state IN ('pending','leased')`), because an older
 send them as message hints, then deploy. The module tables stay; an older matcher stages no module
 hint, and the fence holds every module stream an older runtime resumes.
 
-### Module event router (ANYM-575, schema 59)
+### Module event router (ANYM-575, schema 58)
 
 `messaging_service/event_router.py` is a worker (overlay `deploy/compose.event-router.yaml`) that
 pulls each configured module (`deploy/event-router.example.json`) and publishes into the module

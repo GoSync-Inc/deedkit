@@ -753,7 +753,7 @@ def test_router_role_reads_and_moves_only_its_own_rows_and_gateway_reads_tolerat
         c.execute(sql.SQL('CREATE ROLE {}').format(sql.Identifier(role)))
         try:
             c.execute(sql.SQL('SET LOCAL ROLE {}').format(sql.Identifier(role)))
-            # A gateway before its schema-59 grant still serves get_subscription: no module_gap, no error.
+            # A gateway before its schema-58 grant still serves get_subscription: no module_gap, no error.
             assert module_events.router_gaps(c) == {}
             c.execute('RESET ROLE')
         finally:

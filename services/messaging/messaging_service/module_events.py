@@ -258,7 +258,7 @@ def view(c, row, module):
 
 
 def router_gaps(c):
-    """{source: oldest open router gap time}; empty before schema 59 or without the read grant (rolling upgrade)."""
+    """{source: oldest open router gap time}; empty before schema 58 or without the read grant (rolling upgrade)."""
     if not c.execute("""SELECT CASE WHEN to_regclass('public.module_router_gaps') IS NULL THEN false
             ELSE has_table_privilege('public.module_router_gaps','SELECT') END AS readable""").fetchone()['readable']:
         return {}

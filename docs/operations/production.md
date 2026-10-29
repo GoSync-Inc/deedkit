@@ -934,13 +934,13 @@ failed check stops the undo. Messaging's files are not touched.
 ### Module event router (ANYM-575)
 
 The router (`deploy/compose.event-router.yaml`, SUBSCRIPTIONS.md "Module event router") is not
-enrolled by any release: nothing runs until these steps. It needs schema 59 and a producer
+enrolled by any release: nothing runs until these steps. It needs schema 58 and a producer
 endpoint (calls ANYM-563, calendar ANYM-565) deployed. Owner-kept steps: the two module read
 tokens (secrets and access) and the link grants (ANYM-564). The agent prepares each step for the owner's yes:
 1. Module read tokens: one per module, issued by the module for the router's audience, stored
    as `private/event-router-tokens/calls` and `.../calendar` (directory 0700, files 0600, uid
    10001). The repository and the config name only the paths, never a value.
-2. Role and login: install `module_router_role.sql` as owner (schema 59 grants included), create
+2. Role and login: install `module_router_role.sql` as owner (schema 58 grants included), create
    `messaging_module_router_runtime` (`LOGIN IN ROLE messaging_module_router`), DSN in
    `private/event-router.dsn` (0600). Undo: stop the service, `DROP ROLE <login>`, remove the file.
 3. Config: `private/event-router.json` from `deploy/event-router.example.json` (0600); list only
@@ -954,7 +954,7 @@ tokens (secrets and access) and the link grants (ANYM-564). The agent prepares e
    link no subscription has a module source and published events wake nobody.
 Read-back: a synthetic module event published by a test producer appears in `module-router-status`
 (cursor moved) and in `module_events`, only after the owner-kept tokens exist. Undo: `docker
-compose $F stop event-router`, remove it from `files`; cursors and gaps stay (schema 59 is
+compose $F stop event-router`, remove it from `files`; cursors and gaps stay (schema 58 is
 additive) and a later start resumes from the stored cursor.
 
 ## Roll back the current release

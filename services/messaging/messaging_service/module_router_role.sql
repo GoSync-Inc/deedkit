@@ -15,6 +15,6 @@ REVOKE ALL ON FUNCTION public.publish_module_event(text,text,text,text,text,text
 GRANT EXECUTE ON FUNCTION public.publish_module_event(text,text,text,text,text,text,jsonb,text,text)
     TO messaging_module_router;
 GRANT EXECUTE ON FUNCTION public.report_module_reachability(text,boolean) TO messaging_module_router;
--- Schema 59 (ANYM-575): its only table privileges are its own cursor and gap rows, read and advanced in
+-- Schema 58 (ANYM-575): its only table privileges are its own cursor and gap rows, read and advanced in
 -- the publish transaction; still nothing on the module journal, messages, sources or links.
 GRANT SELECT,INSERT,UPDATE ON module_router_cursors,module_router_gaps TO messaging_module_router;
