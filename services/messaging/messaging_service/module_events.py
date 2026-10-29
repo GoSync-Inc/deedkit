@@ -1,6 +1,6 @@
 """Module events (ANYM-562): calendar and calls events in a journal of their own.
 
-The module journal (schema 57) has its own gapless counter, so publishing never takes the
+The module journal (schema 56) has its own gapless counter, so publishing never takes the
 feed_counter lock of the message journal. A subscription's module part is a second stream with
 its own matched, acknowledged, hinted and retained positions. Events carry references only.
 This module holds the contract (CloudEvents attribute names, the per-type data schema and the
@@ -8,7 +8,7 @@ producers' cursor rules), the matcher pass, the stream's reads and its retention
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import re
 
@@ -20,7 +20,11 @@ _REF = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}')
 _SCOPE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,255}')
 _TOKEN = re.compile(r'[a-z][a-z0-9_]{0,47}')
 _ID = re.compile(r'(calendar|calls):([1-9][0-9]{0,15})')
-_TIME = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})')
+_TIME = re.compile(r'(19[7-9][0-9]|[2-9][0-9]{3})-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})')
+# Every time is finite and inside this range (UTC), so every reader decodes it; the definer function
+# enforces the same bounds.
+_EARLIEST = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_LATEST = datetime(9999, 12, 30, tzinfo=timezone.utc)
 MAX_SEQ = 2**53 - 1
 
 
@@ -32,10 +36,10 @@ def _time(value):
     if not isinstance(value, str) or _TIME.fullmatch(value) is None:
         return False
     try:
-        datetime.fromisoformat(value.replace('Z', '+00:00'))
+        moment = datetime.fromisoformat(value.replace('Z', '+00:00'))
     except ValueError:
         return False
-    return True
+    return _EARLIEST <= moment <= _LATEST
 
 
 def _int(low, high):
@@ -172,7 +176,7 @@ def read_page(cursor, page, *, limit, max_bytes):
 
 
 def ready(c):
-    """Schema 57 present: new code tolerates an older database during a rolling upgrade."""
+    """Schema 56 present: new code tolerates an older database during a rolling upgrade."""
     return c.execute("SELECT to_regclass('public.subscription_module_streams') IS NOT NULL AS ready").fetchone()['ready']
 
 
@@ -296,7 +300,10 @@ def match(c, row, *, batch_size, maximum, stats):
         last_matched_at=clock_timestamp() WHERE subscription=%s''',
         (position, reason, Jsonb(gap) if gap else None, row['id']))
     try:
-        _hint(c, row, module)
+        # Its own savepoint around every statement of the step: a database error (a statement timeout
+        # included) rolls back to here, so the transaction stays usable and the matches above commit.
+        with c.transaction():
+            _hint(c, row, module)
     except Exception as error:
         # The matches and frontier above stay; hinted_through stays, so a later pass offers the hint again.
         from .telemetry import capture

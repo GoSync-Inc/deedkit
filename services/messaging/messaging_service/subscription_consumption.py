@@ -154,7 +154,8 @@ def ack_subscription_events(store, c, p, subscription_id, receipt, version):
         raise APIError('stale_ack', 409)
     result = {'subscription_id': str(row['id']), 'acked_through': updated['acked_through'],
         'ack_version': updated['version'], 'provider_read_state_changed': False}
-    if issued.get('module_through_position') is not None:
+    from . import module_events
+    if issued.get('module_through_position') is not None and module_events.ready(c):
         # ANYM-562: the module stream's own position, compare-and-swap under the same receipt.
         module = c.execute('''UPDATE subscription_module_streams SET acked_through=%s WHERE subscription=%s
             AND acked_through=%s RETURNING acked_through''', (issued['module_through_position'], row['id'],

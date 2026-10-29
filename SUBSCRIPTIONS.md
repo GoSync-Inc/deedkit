@@ -912,7 +912,7 @@ Rollout: migration 55, then reapply `subscription_role.sql` (EXECUTE on
 `journal_source_health(integer)`), then restart the matcher. Before the migration the matcher
 skips health journaling. Undo: stop selecting the kinds; the rows stay in the journal.
 
-## Module events (schema 57)
+## Module events (schema 56)
 
 Calendar and calls events (ANYM-562; design: docs/plans/cross-module-subscriptions.md, option a2)
 have a journal of their own, `module_events`, with its own gapless counter
@@ -980,7 +980,7 @@ module events by `(source, scope_ref)` and type into `subscription_module_matche
 `matched_through`, match budget (`SUBSCRIPTION_MAX_MATCHES`) and gap (`stream: "modules"`), and
 stages one outbox hint of kind `module_events` whose `through_position` is a module position
 (endpoint bodies list `module_event_id`, `type`, `source`, `subject`, `urgency`, `expires_at`).
-A hint is staged only while a dispatcher whose heartbeat names schema 57 or later beats
+A hint is staged only while a dispatcher whose heartbeat names schema 56 or later beats
 (`module_hints_ready()`): an older dispatcher would read the module position as a message
 position. Until then the hint waits (the stream's `hinted_through` stays) and pull reads work. A
 failed hint step (`subscription_module_hint_failed`) keeps the module matches and is retried on
@@ -1011,21 +1011,21 @@ stream stays held (`module_stream.state: "held_after_rollback"`, `next_action: "
 the message stream runs, until the key calls `update_subscription(action="resume")` again.
 
 Backup: the manifest covers `module_event_counter`, `module_events`, `subscription_module_sources`,
-`subscription_module_streams` and `subscription_module_matches` from schema 57;
+`subscription_module_streams` and `subscription_module_matches` from schema 56;
 `module_source_health` is derived router state. A restore closes every subscription and cancels
 pending hints, module ones included. `pg_restore --no-acl` leaves new functions executable by
-PUBLIC; `migrate()` revokes PUBLIC from the five schema-57 functions again (as for the older
+PUBLIC; `migrate()` revokes PUBLIC from the five schema-56 functions again (as for the older
 definer functions), and `subscription_role.sql` and `module_router_role.sql` revoke it too.
 
 Rollout: under docs/operations/production.md "Migration releases and the backup gate". Production
 runs schema 53 (0107b218), whose backup reads schemas up to 53 only: the prepared release's backup
-and restore runtimes (schema 57) are installed first, then the gate takes and verifies the backup
-of the current database with them, then the one `migrate` (054 through 057), then reapply
+and restore runtimes (schema 56) are installed first, then the gate takes and verifies the backup
+of the current database with them, then the one `migrate` (054 through 056), then reapply
 `subscription_role.sql`, `gateway_role.sql` and `delivery_role.sql` and install
 `module_router_role.sql`; the router (ANYM-575) comes later. Those backup and restore runtimes stay
 pinned through any rollback of the service images: a backup taken after the migration needs a
-schema-57 runtime to verify or restore.
-Rollback of the service images to a runtime before schema 57: stop the matcher (the only module hint
+schema-56 runtime to verify or restore.
+Rollback of the service images to a runtime before schema 56: stop the matcher (the only module hint
 writer) first, then cancel pending module hints
 (`UPDATE subscription_outbox SET state='cancelled',error_code='module_rollback',finished_at=clock_timestamp()
 WHERE kind='module_events' AND state IN ('pending','leased')`), because an older dispatcher would

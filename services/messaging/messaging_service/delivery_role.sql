@@ -38,5 +38,5 @@ DO $$ BEGIN
         CREATE POLICY messaging_event_delivery_beat ON component_heartbeats TO messaging_event_delivery USING (component='dispatcher') WITH CHECK (component='dispatcher');
     END IF;
 END $$;
--- Schema 57 (ANYM-562): module_events hint bodies list type, subject and module of matched events.
+-- Schema 56 (ANYM-562): module_events hint bodies list type, subject and module of matched events.
 GRANT SELECT ON module_events,subscription_module_matches,subscription_module_streams TO messaging_event_delivery;

@@ -88,10 +88,12 @@ SET LOCAL lock_timeout=DEFAULT;
 -- The contract of module_events.validate_event (KINDS), enforced again inside the privileged
 -- boundary: every key of the type present (optional ones aside) and no other, each value within
 -- its rule (ref, time, token, enumeration, integer range, changed list), the subject equal to the
--- type's subject key, the id's module equal to the source's, data at most 1024 bytes, and the
--- urgency and expiry rules. References only: no free text fits any rule.
+-- type's subject key, the id's module equal to the source's, data at most 1024 bytes, the
+-- urgency and expiry rules, and every time (occurrence, expiry, data) finite and between
+-- 1970-01-01 and 9999-12-30 UTC, so a reader can always decode it. References only: no free text
+-- fits any rule.
 CREATE FUNCTION public.module_event_valid(p_id text, p_source text, p_type text, p_subject text,
-  p_data jsonb, p_urgency text, p_expires_at timestamptz) RETURNS boolean
+  p_time timestamptz, p_data jsonb, p_urgency text, p_expires_at timestamptz) RETURNS boolean
  LANGUAGE plpgsql STABLE SET search_path=pg_catalog AS $$
 DECLARE spec jsonb; rule text; item record; v jsonb; parts text[];
  specs constant jsonb := '{
@@ -122,6 +124,9 @@ BEGIN
    OR length(split_part(p_id,':',2))=16 AND split_part(p_id,':',2) COLLATE "C">'9007199254740991'
    OR split_part(p_id,':',1) IS DISTINCT FROM split_part(p_source,':',2)
    OR p_urgency IS NULL OR p_urgency NOT IN ('now','batch')
+   OR p_time IS NULL OR NOT isfinite(p_time) OR p_time NOT BETWEEN '1970-01-01Z' AND '9999-12-30Z'
+   OR p_expires_at IS NOT NULL AND (NOT isfinite(p_expires_at)
+     OR p_expires_at NOT BETWEEN '1970-01-01Z' AND '9999-12-30Z')
    OR p_subject IS DISTINCT FROM p_data->>(spec->>'subject')
    OR jsonb_typeof(p_data->(spec->>'subject')) IS DISTINCT FROM 'string' THEN
   RETURN false;
@@ -141,10 +146,16 @@ BEGIN
   END IF;
   IF rule='ref' AND v#>>'{}' !~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
     OR rule='token' AND v#>>'{}' !~ '^[a-z][a-z0-9_]{0,47}$'
-    OR rule='time' AND (v#>>'{}' !~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})$'
-      OR NOT pg_input_is_valid(v#>>'{}','timestamptz'))
     OR rule LIKE 'enum:%' AND NOT (v#>>'{}')=ANY(string_to_array(substr(rule,6),'|')) THEN
    RETURN false;
+  END IF;
+  IF rule='time' THEN
+   -- The cast only after the text is known to parse (no OR evaluation order is relied on).
+   IF v#>>'{}' !~ '^(19[7-9][0-9]|[2-9][0-9]{3})-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})$'
+     OR NOT pg_input_is_valid(v#>>'{}','timestamptz') THEN
+    RETURN false;
+   END IF;
+   IF (v#>>'{}')::timestamptz NOT BETWEEN '1970-01-01Z' AND '9999-12-30Z' THEN RETURN false; END IF;
   END IF;
   IF rule LIKE 'int:%' THEN
    parts := string_to_array(rule,':');
@@ -167,7 +178,7 @@ BEGIN
  END IF;
  RETURN true;
 END $$;
-REVOKE ALL ON FUNCTION public.module_event_valid(text,text,text,text,jsonb,text,timestamptz) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.module_event_valid(text,text,text,text,timestamptz,jsonb,text,timestamptz) FROM PUBLIC;
 
 -- The only module journal write. Fixed search_path, no PUBLIC execute; it inserts one module_events
 -- row and touches no message table, link, source or subscription. A retry with the same id and the
@@ -179,7 +190,7 @@ CREATE FUNCTION public.publish_module_event(p_id text, p_source text, p_type tex
  RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
 DECLARE stored public.module_events; seq bigint;
 BEGIN
- IF NOT public.module_event_valid(p_id,p_source,p_type,p_subject,p_data,p_urgency,p_expires_at) THEN
+ IF NOT public.module_event_valid(p_id,p_source,p_type,p_subject,p_time,p_data,p_urgency,p_expires_at) THEN
   RAISE EXCEPTION 'invalid_module_event' USING ERRCODE='check_violation';
  END IF;
  PERFORM 1 FROM public.module_event_counter WHERE id=1 FOR UPDATE;
@@ -214,7 +225,7 @@ REVOKE ALL ON FUNCTION public.report_module_reachability(text,boolean) FROM PUBL
 -- read a module position as a message position. The matcher cannot read that row (row-level security).
 CREATE FUNCTION public.module_hints_ready() RETURNS boolean
  LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
- SELECT EXISTS(SELECT FROM public.component_heartbeats WHERE component='dispatcher' AND schema_version>=57
+ SELECT EXISTS(SELECT FROM public.component_heartbeats WHERE component='dispatcher' AND schema_version>=56
   AND beat_at>clock_timestamp()-interval '120 seconds') $$;
 REVOKE ALL ON FUNCTION public.module_hints_ready() FROM PUBLIC;
 

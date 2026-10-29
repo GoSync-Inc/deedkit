@@ -40,7 +40,7 @@ END $$;
 -- Schema 55 (ANYM-535): source.health rows only through the definer function, which derives each
 -- from collector_health and the lease; no direct journal, counter or collector-record write.
 GRANT EXECUTE ON FUNCTION public.journal_source_health(integer) TO messaging_subscriptions;
--- Schema 57 (ANYM-562): the module stream. Read the module journal, insert and prune module match
+-- Schema 56 (ANYM-562): the module stream. Read the module journal, insert and prune module match
 -- references, move the module stream's matcher positions; no publish, no source or ACK write.
 GRANT SELECT ON module_events,module_event_counter,subscription_module_sources,module_source_health
     TO messaging_subscriptions;
@@ -51,5 +51,5 @@ GRANT UPDATE(matched_through,hinted_through,retention_floor,blocked_reason,gap,m
 GRANT EXECUTE ON FUNCTION public.module_hints_ready() TO messaging_subscriptions;
 -- A restore runs without ACLs; the definer functions never stay open to PUBLIC.
 REVOKE ALL ON FUNCTION public.module_hints_ready(),public.publish_module_event(text,text,text,text,text,timestamptz,jsonb,text,timestamptz),
-    public.report_module_reachability(text,boolean),public.module_event_valid(text,text,text,text,jsonb,text,timestamptz),
+    public.report_module_reachability(text,boolean),public.module_event_valid(text,text,text,text,timestamptz,jsonb,text,timestamptz),
     public.subscription_module_fence() FROM PUBLIC;

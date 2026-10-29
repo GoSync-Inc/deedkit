@@ -10,7 +10,7 @@ import psycopg
 import pytest
 
 from messaging_service import module_events
-from messaging_service.module_events import ModuleContractError, read_page, validate_event
+from messaging_service.module_events import KINDS, ModuleContractError, read_page, validate_event
 from messaging_service.subscriptions import match_subscriptions, prune_subscriptions
 
 SOURCE = Path(__file__).resolve().parents[1] / 'services/messaging/messaging_service'
@@ -461,7 +461,22 @@ def _mutations():
         'owner_batched': call_event(2, kind='call.owner_request', urgency='batch'),
         'starting_late_expiry': {**starting_event(4), 'expires_at': '2026-12-01T00:00:00Z'},
         'id_of_other_module': {**finished, 'id': 'calendar:1'}, 'id_above_2_53': {**finished, 'id': 'calls:9999999999999999'},
-        'ref_too_long': data(finished, call_id='c' * 129) | {'subject': 'c' * 129}}
+        'ref_too_long': data(finished, call_id='c' * 129) | {'subject': 'c' * 129},
+        'valid_created': {**changed, 'type': 'calendar.event.created', 'data': {k: v for k, v in changed['data'].items()
+            if k != 'changed'}},
+        'valid_cancelled': {**changed, 'type': 'calendar.event.cancelled', 'data': {k: changed['data'][k]
+            for k in ('calendar_ref', 'event_ref', 'start_at')}},
+        'valid_failed': {**finished, 'type': 'call.failed', 'data': {'call_id': 'call-1', 'status': 'failed',
+            'end_reason': 'provider_error'}},
+        'valid_not_answered': call_event(5, kind='call.not_answered'),
+        'valid_interrupted': {**finished, 'type': 'call.interrupted', 'data': {'call_id': 'call-1',
+            'end_reason': 'service_restart'}},
+        'valid_latest_expiry': {**finished, 'expires_at': '9999-12-30T00:00:00Z'},
+        'time_infinite': {**finished, 'time': 'infinity'}, 'expiry_infinite': {**finished, 'expires_at': 'infinity'},
+        'time_before_1970': {**finished, 'time': '1969-12-31T23:59:59Z'},
+        'expiry_past_latest': {**finished, 'expires_at': '9999-12-31T23:59:59Z'},
+        'start_before_1970': data(changed, start_at='1969-12-31T23:59:59Z'),
+        'start_infinite': data(changed, start_at='infinity')}
 
 
 # spec: ANYM-562
@@ -474,10 +489,11 @@ def test_definer_function_enforces_the_same_schema_as_the_contract(modules):
                 python = True
             except ModuleContractError:
                 python = False
-            database = c.execute('SELECT public.module_event_valid(%s,%s,%s,%s,%s,%s,%s) AS ok', (event['id'],
-                event['source'], event['type'], event['subject'], json.dumps(event['data']), event['urgency'],
-                event['expires_at'])).fetchone()['ok']
+            database = c.execute('SELECT public.module_event_valid(%s,%s,%s,%s,%s,%s,%s,%s) AS ok', (event['id'],
+                event['source'], event['type'], event['subject'], event['time'], json.dumps(event['data']),
+                event['urgency'], event['expires_at'])).fetchone()['ok']
             assert python == database == name.startswith('valid_'), name
+    assert {event['type'] for name, event in _mutations().items() if name.startswith('valid_')} == set(KINDS)
 
 
 # spec: ANYM-562
@@ -551,6 +567,45 @@ def test_a_failing_hint_step_keeps_the_module_matches(modules, monkeypatch):
 
 
 # spec: ANYM-562
+def test_a_database_error_in_the_hint_step_keeps_the_message_and_module_matches(modules, monkeypatch):
+    store = modules[0]
+    token = subscriber(store)
+    sid = mixed(store, token)
+    message = emit(store)
+    seq = publish(store, call_event(1))
+    monkeypatch.setattr(module_events, '_hint', lambda c, *a: c.execute('SELECT 1/0'))
+    match_subscriptions(store)
+    assert store.get_subscription(token, sid)['module_stream']['matched_through'] == seq
+    events = store.fetch_subscription_events(token, sid)
+    assert [item['module_event_id'] for item in events['module']['items']] == [seq]
+    assert [item['event_id'] for item in events['items']] == [message]
+
+
+# spec: ANYM-562
+def test_an_event_that_expires_while_a_hint_is_prepared_is_cancelled_under_the_fence(modules, tmp_path):
+    from messaging_service.event_delivery import dispatch_hints
+    store = modules[0]
+    token = subscriber(store)
+    sid = mixed(store, token)
+    bound(store, token, sid, tmp_path)
+    beat(store)
+    seq = publish(store, call_event(1, kind='call.owner_request'))
+    match_subscriptions(store)
+
+    def resolver(*a, **k):  # runs after the lease, before the fence: the deadline passes meanwhile
+        with store.pool.connection() as c:
+            c.execute("UPDATE module_events SET expires_at=clock_timestamp()-interval '1 second' WHERE seq=%s", (seq,))
+        return ['93.184.216.34']
+    stats = dispatch_hints(store, transport=lambda *a, **k: pytest.fail('an expired event was announced'),
+        resolver=resolver)
+    assert stats['cancelled'] == 1
+    with store.pool.connection() as c:
+        assert [(r['state'], r['error_code'], r['attempts']) for r in c.execute('''SELECT state,error_code,attempts
+            FROM subscription_outbox WHERE subscription=%s AND kind='module_events' ''', (sid,))] == [
+            ('cancelled', 'module_events_expired', 1)]
+
+
+# spec: ANYM-562
 def test_passive_module_pages_advance_and_never_repeat_a_retention_gap(modules):
     store = modules[0]
     token = subscriber(store)
@@ -589,7 +644,7 @@ def test_passive_module_pages_advance_and_never_repeat_a_retention_gap(modules):
 
 # spec: ANYM-562
 def test_code_without_module_streams_reads_messages_only_beside_module_rows(modules, monkeypatch):
-    # Emulates a runtime that does not know schema 57: every module path is off (module_events.ready is the
+    # Emulates a runtime that does not know schema 56: every module path is off (module_events.ready is the
     # only switch); the message matcher, get_updates, passive read, fetch, ACK and retention run unchanged.
     store, old, _ = modules
     token = subscriber(store)
@@ -644,7 +699,7 @@ def test_restored_mixed_subscription_keeps_each_stream_and_reopens_no_function(m
     assert [row['state'] for row in module_hints(store, sid)] == ['pending']
     functions = ('public.publish_module_event(text,text,text,text,text,timestamptz,jsonb,text,timestamptz)',
         'public.report_module_reachability(text,boolean)', 'public.module_hints_ready()',
-        'public.module_event_valid(text,text,text,text,jsonb,text,timestamptz)')
+        'public.module_event_valid(text,text,text,text,timestamptz,jsonb,text,timestamptz)')
     probe = 'anym562_probe_' + uuid4().hex[:10]
     with snapshot_restored(store, tmp_path) as restored:
         with restored.pool.connection() as c:
@@ -670,3 +725,111 @@ def test_restored_mixed_subscription_keeps_each_stream_and_reopens_no_function(m
                 c.execute(sql.SQL('DROP ROLE {}').format(sql.Identifier(probe)))
     assert all(after[name] == source[name] for name in tables)
     assert hints == [{'state': 'cancelled', 'error_code': 'restored_disabled'}]
+
+
+# The deployed release (production runs schema 53, SUBSCRIPTIONS.md "Rollout"). Its source is a sibling
+# checkout named by ANYMSG_PREVIOUS_SOURCE, or `git archive` of the commit.
+PREVIOUS_RELEASE = '0107b218f035fd011596a5ded901623e8dbb1849'
+PREVIOUS_DRIVER = '''
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from messaging_service import heartbeats
+from messaging_service.event_delivery import dispatch_hints
+from messaging_service.store import RUNTIME_SCHEMA, Store
+from messaging_service.subscriptions import match_subscriptions, prune_subscriptions
+a = json.loads(sys.argv[2])
+store, token, sid, sent = Store(Path(a['dsn']).read_text().strip(), Path(a['files']), 'http://testserver'), \\
+    a['token'], a['sid'], []
+out = {'schema': RUNTIME_SCHEMA, 'ack_new_receipt': store.ack_subscription_events(token, sid, a['receipt'], a['version'])}
+heartbeats.record(store, 'dispatcher')
+version = store.update_subscription(token, sid, store.get_subscription(token, sid)['version'], action='pause')['version']
+store.update_subscription(token, sid, version, action='resume')
+out['matched'] = match_subscriptions(store)
+out['dispatch'] = dispatch_hints(store, transport=lambda url, body, headers, **k: sent.append(json.loads(body)) or 204,
+    resolver=lambda *x, **k: ['93.184.216.34'])
+out['updates'] = len(store.get_updates(a['old'], 'probe-previous')['items'])
+out['passive'] = store.get_subscription_events(token, sid)
+page = store.fetch_subscription_events(token, sid)
+out['fetch'] = page
+out['ack'] = store.ack_subscription_events(token, sid, page['receipt'], page['ack_version'])
+out['sent'], out['pruned'] = sent, prune_subscriptions(store)
+store.close()
+print(json.dumps(out, default=str))
+'''
+
+
+def _previous_source(tmp_path):
+    import os
+    import subprocess
+    named = os.environ.get('ANYMSG_PREVIOUS_SOURCE')
+    if named:
+        return Path(named) / 'services/messaging'
+    root = Path(__file__).resolve().parents[1]
+    def missing():
+        return subprocess.run(['git', 'cat-file', '-e', PREVIOUS_RELEASE + '^{commit}'], cwd=root,
+            capture_output=True).returncode
+    if missing():  # CI's shallow clone: the repository is public, so one commit is fetched without credentials
+        subprocess.run(['git', 'fetch', '--quiet', '--depth=1', 'origin',
+            PREVIOUS_RELEASE], cwd=root, capture_output=True, timeout=120)
+    if missing():
+        pytest.skip(f'the deployed release {PREVIOUS_RELEASE} is not reachable; set ANYMSG_PREVIOUS_SOURCE')
+    archive = subprocess.run(['git', 'archive', PREVIOUS_RELEASE, 'services/messaging'], cwd=root,
+        capture_output=True, check=True).stdout
+    tmp_path.mkdir()
+    subprocess.run(['tar', '-x', '-C', str(tmp_path)], input=archive, check=True)
+    return tmp_path / 'services/messaging'
+
+
+# spec: ANYM-562
+def test_the_deployed_release_runs_beside_module_rows_after_the_documented_rollback(modules, tmp_path):
+    # Criterion 5 against the deployed code itself: rollback step "cancel pending module hints", then the
+    # previous runtime's ACK of a module-bearing receipt, matcher, pause/resume, get_updates, passive read,
+    # fetch, ACK, delivery and retention. Module rows stay untouched and wait for module-aware code.
+    import os
+    import subprocess
+    import sys
+    source = _previous_source(tmp_path / 'previous')
+    store, old, _ = modules
+    token = subscriber(store)
+    sid = mixed(store, token)
+    bound(store, token, sid, tmp_path)
+    beat(store)
+    message = emit(store)
+    seq = publish(store, call_event(1))
+    match_subscriptions(store)
+    page = store.fetch_subscription_events(token, sid)
+    assert [item['module_event_id'] for item in page['module']['items']] == [seq]
+    with store.pool.connection() as c:
+        c.execute('''UPDATE subscription_outbox SET state='cancelled',error_code='module_rollback',
+            finished_at=clock_timestamp() WHERE kind='module_events' AND state IN ('pending','leased')''')
+        tables = ('module_events', 'subscription_module_matches', 'subscription_module_sources')
+        rows = {name: c.execute(sql.SQL('SELECT count(*) AS n FROM {}').format(sql.Identifier(name))).fetchone()['n']
+            for name in tables}
+    newer = emit(store, 'demo-tg-2')
+    files = tmp_path / 'previous-files'
+    files.mkdir()
+    run = subprocess.run([sys.executable, '-c', PREVIOUS_DRIVER, str(source), json.dumps({
+        'dsn': os.environ['PROBE_TEST_DSN_FILE'], 'files': str(files), 'token': token, 'sid': sid, 'old': old,
+        'receipt': page['receipt'], 'version': page['ack_version']})], capture_output=True, text=True, timeout=120)
+    assert run.returncode == 0, run.stderr[-2000:]
+    out = json.loads(run.stdout.strip().splitlines()[-1])
+    assert out['schema'] < 56
+    assert out['ack_new_receipt']['acked_through'] == message
+    assert out['matched']['matched'] == 1
+    for read, expected in ((out['passive'], [message, newer]), (out['fetch'], [newer])):
+        assert 'module' not in read and [item['event_id'] for item in read['items']] == expected
+    assert out['ack']['acked_through'] == newer
+    assert out['sent'] and all(body['kind'] != 'module_events' for body in out['sent']), (out['dispatch'], _outbox(store))
+    with store.pool.connection() as c:
+        assert {name: c.execute(sql.SQL('SELECT count(*) AS n FROM {}').format(sql.Identifier(name))).fetchone()['n']
+            for name in tables} == rows
+    view = store.get_subscription(token, sid)
+    assert view['module_stream']['state'] == 'held_after_rollback' and view['module_stream']['acked_through'] == 0
+    view = store.update_subscription(token, sid, view['version'], action='resume')
+    assert [item['module_event_id'] for item in store.fetch_subscription_events(token, sid)['module']['items']] == [seq]
+
+
+def _outbox(store):
+    with store.pool.connection() as c:
+        return c.execute('SELECT kind,state,error_code,through_position,attempts FROM subscription_outbox').fetchall()
