@@ -1728,10 +1728,14 @@ valid on the host until `deedkit admin key revoke <id>`.
   <new>` then `key uninstall <old>`.
 - An interpreter upgrade that removes the pinned Python breaks the helper: run `key uninstall <id>`
   then `key install <id> ...` again to re-pin it.
-- Entries left by ANYM-496's manual lines (a `printf` helper, local scope): `key uninstall` refuses
-  them. Remove them by hand with `claude mcp remove deedkit-<id>` (add `--scope local` in the
-  folder where it was added, or `--scope user`), then run `key install`; an existing
-  `~/.config/deedkit/<id>.token` with the same token and mode 0600 is reused.
+- Entries left by ANYM-496's manual lines (a `printf` helper, added in the local scope of the
+  folder it ran in): remove each by hand in its own scope, `claude mcp remove --scope local
+  deedkit-<id>` in that folder (`key install` names such folders as `shadowed in:`), or `--scope
+  user` for a user-scope copy (`key uninstall` refuses a user-scope entry install did not write).
+  The old `mkdir -p` usually left `~/.config/deedkit` at 0755, which `key install` refuses: check
+  that it is your own directory (`ls -ld ~/.config/deedkit`) and run `chmod 700 ~/.config/deedkit`
+  (and `chmod 600` on the token file), then `key install`; an existing `<id>.token` with the same
+  token and mode 0600 is reused.
 
 ### Extend or revoke a key in every store (ANYM-497)
 

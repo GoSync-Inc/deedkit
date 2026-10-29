@@ -77,6 +77,9 @@ class Gateway:
                 if outer.reply is None:
                     outer.release.wait(10)
                     return
+                if callable(outer.reply):
+                    outer.reply(self, outer.release)
+                    return
                 status, headers, payload = outer.reply
                 self.send_response(status)
                 for header in headers + [("Content-Length", str(len(payload)))]:
@@ -230,6 +233,13 @@ def test_the_id_pattern_is_the_admin_cli_one_and_names_map_injectively():
     (["install", "clone", "--host", "h", "--url", "https://user@g.test/mcp"], mac.BAD_URL),
     (["install", "clone", "--host", "h", "--url", "https://g.test/mcp?x=1"], mac.BAD_URL),
     (["install", "clone", "--host", "h", "--url", "ftp://g.test/mcp"], mac.BAD_URL),
+    # Astra r1 F2: URLs http.client cannot send are refused before the fetch, not after the writes.
+    (["install", "clone", "--host", "h", "--url", "https://bad host/mcp"], mac.BAD_URL),
+    (["install", "clone", "--host", "h", "--url", "https://g_x.test/mcp"], mac.BAD_URL),
+    (["install", "clone", "--host", "h", "--url", "https://g.test/dé/mcp"], mac.BAD_URL),
+    (["install", "clone", "--host", "h", "--url", "https://g.test/a b/mcp"], mac.BAD_URL),
+    (["install", "clone", "--host", "h", "--url", "https://g.test:99999/mcp"], mac.BAD_URL),
+    (["install", "clone", "--host", "h", "--url", "https://g.test/x\n/mcp"], mac.BAD_URL),
     (["uninstall", "a_b"], mac.BAD_ID),
 ])
 def test_a_bad_input_is_refused_before_any_call_or_write(site, argv, line):
@@ -373,15 +383,32 @@ def unsafe_cases():
         site.token_file.chmod(0o600)
         monkeypatch.setattr(mac, "mine", lambda st: st.st_uid == os.getuid() and not stat.S_ISREG(st.st_mode))
 
+    def helper_symlink(site):
+        target = site.home / "elsewhere.py"
+        target.write_bytes(Path(mac.HELPER).read_bytes())
+        target.chmod(0o600)
+        (private_directory(site) / "headers.py").symlink_to(target)
+
+    def helper_fifo(site):
+        os.mkfifo(private_directory(site) / "headers.py", 0o600)
+
+    def helper_mode(site):
+        (private_directory(site) / "headers.py").write_bytes(Path(mac.HELPER).read_bytes())
+        (site.directory / "headers.py").chmod(0o644)
+
     directory = "{d} is not a private directory of yours (mode 0700); nothing changed"
     file = "{d}/clone.token is not a private file of yours (mode 0600); nothing changed"
+    helper = "{d}/headers.py is not a private file of yours (mode 0600); nothing changed"
     other = "{d}/clone.token holds another token; nothing changed: run key uninstall clone first"
     return [pytest.param(directory_symlink, directory, id="directory-symlink"),
             pytest.param(token_symlink, file, id="token-symlink"), pytest.param(token_fifo, file, id="token-fifo"),
             pytest.param(directory_mode, directory, id="directory-mode"), pytest.param(token_mode, file, id="token-mode"),
             pytest.param(other_token, other, id="other-token"),
             pytest.param(foreign_directory, directory, id="foreign-directory"),
-            pytest.param(foreign_token, file, id="foreign-token")]
+            pytest.param(foreign_token, file, id="foreign-token"),
+            # Astra r1 F3: an unsafe helper refuses before the token file is written.
+            pytest.param(helper_symlink, helper, id="helper-symlink"), pytest.param(helper_fifo, helper, id="helper-fifo"),
+            pytest.param(helper_mode, helper, id="helper-mode")]
 
 
 # spec: ANYM-498
@@ -547,6 +574,32 @@ def test_a_failed_proof_adds_no_entry_and_keeps_the_token_file(site, monkeypatch
 
 
 # spec: ANYM-498
+def test_a_trickled_answer_or_a_stalled_lookup_ends_at_the_deadline(site, monkeypatch):
+    # Astra r1 F1: one hard deadline across DNS, connect, headers and body, not a per-read timeout.
+    def trickle(handler, release):
+        for byte in b"HTTP/1.0 401 Unauthorized\r\nX-Slow: " + b"x" * 200:
+            if release.wait(0.2):
+                return
+            handler.wfile.write(bytes([byte]))
+            handler.wfile.flush()
+
+    monkeypatch.setattr(mac, "HTTP_TIMEOUT", 1)
+    site.gateway.reply = trickle
+    started = time.monotonic()
+    assert site.install() == (1, "", f"the gateway at {site.gateway.url} did not answer within 1 s\n")
+    assert time.monotonic() - started < 30 and site.calls("claude") == [] and site.lock_is_free()
+    lookup, stalled = mac.socket.getaddrinfo, threading.Event()
+    monkeypatch.setattr(mac.socket, "getaddrinfo", lambda *a, **k: stalled.wait(10) and lookup(*a, **k))
+    url = site.gateway.url.replace("127.0.0.1", "localhost")
+    try:
+        started = time.monotonic()
+        assert site.install(url=url) == (1, "", f"the gateway at {url} did not answer within 1 s\n")
+        assert time.monotonic() - started < 30 and site.calls("claude") == [] and site.lock_is_free()
+    finally:
+        stalled.set()
+
+
+# spec: ANYM-498
 def test_a_redirect_is_not_followed(site):
     second = Gateway("clone")
     try:
@@ -581,6 +634,14 @@ def test_a_hanging_helper_is_killed_and_the_next_run_takes_the_lock(site, monkey
 
 
 # --- criterion 6: registration --------------------------------------------------------------------------------------
+
+
+# spec: ANYM-498
+def test_a_null_entry_with_the_name_is_refused_before_any_write(site):
+    # Astra r1 F4: `"deedkit-clone": null` is another configuration, not an absent entry.
+    site.config_file.write_text(json.dumps({"mcpServers": {"deedkit-clone": None}}))
+    assert site.install() == (1, "", "deedkit-clone exists with another configuration; run key uninstall clone first\n")
+    assert site.calls("claude") == [] and not site.token_file.exists() and site.gateway.requests == []
 
 
 # spec: ANYM-498
@@ -688,6 +749,7 @@ def test_uninstall_accepts_an_entry_pinned_to_another_interpreter(site):
     {"type": "http", "url": "https://g.test/mcp",
      "headersHelper": 'printf \'{"Authorization":"Bearer %s"}\' "$(cat ~/.config/deedkit/clone.token)"'},
     {"type": "stdio", "command": "deedkit"},
+    None,  # Astra r1 F4: a null entry is an entry
 ])
 def test_uninstall_refuses_an_entry_install_did_not_write(site, foreign):
     assert site.install()[0] == 0

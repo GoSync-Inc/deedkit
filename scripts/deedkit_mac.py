@@ -24,10 +24,12 @@ import selectors
 import shlex
 import shutil
 import signal
+import socket
 import ssl
 import stat
 import subprocess
 import sys
+import threading
 import time
 from urllib.parse import urlsplit
 
@@ -35,6 +37,9 @@ NAME = re.compile(r"[a-z0-9][a-z0-9.-]{0,49}")  # deedkit_admin.NAME, the IDs `k
 TOKEN = re.compile(rb"dk_[A-Za-z0-9_-]{43}\n?")  # deedkit_admin issue(): "dk_" + secrets.token_urlsafe(32)
 TOKENS = "/root/deedkit-admin/tokens"  # deedkit_admin.TOKENS, where `key issue` leaves the gateway token
 STAGING = re.compile(r"\.(?:headers\.py|[a-z0-9][a-z0-9.-]{0,49}\.token)\.[A-Za-z0-9_-]{16}\.tmp")
+HOSTNAME = re.compile(r"(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*")
+URL_PATH = re.compile(r"(?:/(?:[A-Za-z0-9._~!$&'()*+,;=:@-]|%[0-9A-Fa-f]{2})*)*/mcp")
+MISSING = object()  # no entry of that name, unlike an entry whose value is null
 HELPER = Path(__file__).resolve().with_name("deedkit_headers.py")  # installed as headers.py
 FETCH_TIMEOUT, HELPER_TIMEOUT, HTTP_TIMEOUT, CLAUDE_TIMEOUT = 30, 10, 15, 30  # seconds
 TOKEN_LIMIT, OUTPUT_LIMIT, HELPER_LIMIT = 1024, 4096, 64 * 1024  # bytes
@@ -80,15 +85,24 @@ def loopback(host: str) -> bool:
 
 
 def valid_url(url: str) -> bool:
+    """`https://<host>[:port]/…/mcp` that http.client can send as is: a DNS name or IP literal, a plain ASCII path,
+    no user info, query or fragment; `http://` only for a loopback host."""
+    if not url.isascii() or not url.isprintable() or " " in url or "@" in url or "?" in url or "#" in url:
+        return False
     try:
         parts = urlsplit(url)
-        parts.port  # noqa: B018 - raises on a bad port
+        port = parts.port
     except ValueError:
         return False
-    if not parts.hostname or "@" in parts.netloc or parts.query or parts.fragment or "?" in url or "#" in url \
-            or not parts.path.endswith("/mcp"):
+    host = parts.hostname or ""
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if not HOSTNAME.fullmatch(host):
+            return False
+    if port == 0 or not URL_PATH.fullmatch(parts.path):
         return False
-    return parts.scheme == "https" or (parts.scheme == "http" and loopback(parts.hostname))
+    return parts.scheme == "https" or (parts.scheme == "http" and loopback(host))
 
 
 def run(argv: list[str], timeout: float, limit: int | None = None) -> tuple[int | str, bytes]:
@@ -256,14 +270,15 @@ def claude_config() -> tuple[Path, dict]:
     return path, value
 
 
-def lookup(name: str) -> tuple[object | None, list[str]]:
-    """The user-scope entry `name` and the folders whose local scope has the same name (those win in that folder)."""
+def lookup(name: str) -> tuple[object, list[str]]:
+    """The user-scope entry `name` (MISSING when absent; null is an entry) and the folders whose local scope has the
+    same name (those win in that folder)."""
     _, value = claude_config()
     projects = value.get("projects")
     shadowed = sorted(folder for folder, project in projects.items()
                       if isinstance(project, dict) and isinstance(project.get("mcpServers"), dict)
                       and name in project["mcpServers"]) if isinstance(projects, dict) else []
-    return value.get("mcpServers", {}).get(name), shadowed
+    return value.get("mcpServers", {}).get(name, MISSING), shadowed
 
 
 def ours(entry: object, key: str) -> bool:
@@ -305,6 +320,47 @@ def fetch(ssh: str, destination: str, key: str) -> bytes:
     return out.rstrip(b"\n")
 
 
+def exchange(url: str, authorization: str) -> tuple[int, bytes]:
+    """(status, body up to 1 MiB + 1 byte for a 200) of the one proof request: no proxies, no redirects, the default
+    TLS context. One hard deadline covers DNS, connect, TLS, headers and body: the request runs in a daemon thread;
+    on the deadline its socket is shut down and the run refuses, so the lock is released (a lookup still stalled in
+    DNS ends with the process)."""
+    parts = urlsplit(url)
+    host, done = parts.hostname or "", {}
+    if parts.scheme == "https":
+        connection = http.client.HTTPSConnection(host, parts.port, timeout=HTTP_TIMEOUT,
+                                                 context=ssl.create_default_context())
+    else:
+        connection = http.client.HTTPConnection(host, parts.port, timeout=HTTP_TIMEOUT)
+
+    def work() -> None:
+        try:
+            connection.request("POST", parts.path[:-len("/mcp")] + "/v1/platform_capabilities", body=b"{}",
+                               headers={"Authorization": authorization, "Content-Type": "application/json",
+                                        "Accept": "application/json"})
+            response = connection.getresponse()
+            done["result"] = response.status, response.read(RESPONSE_LIMIT + 1) if response.status == 200 else b""
+        except BaseException as exc:  # handed to the caller, which names only its class
+            done["error"] = exc
+
+    worker = threading.Thread(target=work, name="deedkit-proof", daemon=True)
+    worker.start()
+    worker.join(HTTP_TIMEOUT)
+    if worker.is_alive():
+        with suppress(OSError, AttributeError):
+            connection.sock.shutdown(socket.SHUT_RDWR)
+        raise Refused(f"the gateway at {url} did not answer within {HTTP_TIMEOUT} s")
+    connection.close()
+    error = done.get("error")
+    if isinstance(error, TimeoutError):
+        raise Refused(f"the gateway at {url} did not answer within {HTTP_TIMEOUT} s")
+    if isinstance(error, (OSError, ValueError, http.client.HTTPException)):
+        raise Refused(f"cannot reach the gateway at {url}: {type(error).__name__}")
+    if error is not None:
+        raise error
+    return done["result"]
+
+
 def prove(helper: str, url: str, key: str, token: bytes) -> None:
     """Run the stored helper as Claude Code does, then one read of the gateway with the header it printed."""
     status, out = run(["/bin/sh", "-c", helper], HELPER_TIMEOUT, TOKEN_LIMIT)
@@ -318,46 +374,14 @@ def prove(helper: str, url: str, key: str, token: bytes) -> None:
         header = None
     if header != {"Authorization": "Bearer " + token.decode()}:
         raise Refused("the headers helper printed another header; nothing was added to Claude Code")
-    parts, deadline = urlsplit(url), time.monotonic() + HTTP_TIMEOUT
-    host = parts.hostname or ""
-    if parts.scheme == "https":
-        connection = http.client.HTTPSConnection(host, parts.port, timeout=HTTP_TIMEOUT,
-                                                 context=ssl.create_default_context())
-    else:
-        connection = http.client.HTTPConnection(host, parts.port, timeout=HTTP_TIMEOUT)
-
-    def remaining() -> float:
-        left = deadline - time.monotonic()
-        if left <= 0:
-            raise TimeoutError
-        return left
-
-    body = bytearray()
-    try:
-        connection.request("POST", parts.path[:-len("/mcp")] + "/v1/platform_capabilities", body=b"{}",
-                           headers={"Authorization": "Bearer " + token.decode(), "Content-Type": "application/json", "Accept": "application/json"})
-        sock = connection.sock
-        sock.settimeout(remaining())
-        response = connection.getresponse()
-        while response.status == 200 and len(body) <= RESPONSE_LIMIT and not response.isclosed():
-            sock.settimeout(remaining())
-            chunk = response.read1(65536)
-            if not chunk:
-                break
-            body += chunk
-    except TimeoutError:
-        raise Refused(f"the gateway at {url} did not answer within {HTTP_TIMEOUT} s") from None
-    except (OSError, http.client.HTTPException) as exc:
-        raise Refused(f"cannot reach the gateway at {url}: {type(exc).__name__}") from None
-    finally:
-        connection.close()
-    if response.status == 401:
+    status, body = exchange(url, "Bearer " + token.decode())
+    if status == 401:
         raise Refused("token rejected by the gateway: check the URL, then deedkit admin key list on the host "
                       "(expired or revoked key)")
-    if 300 <= response.status < 400:
-        raise Refused(f"the gateway answered HTTP {response.status} (a redirect, not followed): check --url")
-    if response.status != 200:
-        raise Refused(f"the gateway answered HTTP {response.status}")
+    if 300 <= status < 400:
+        raise Refused(f"the gateway answered HTTP {status} (a redirect, not followed): check --url")
+    if status != 200:
+        raise Refused(f"the gateway answered HTTP {status}")
     if len(body) > RESPONSE_LIMIT:
         raise Refused("the gateway answer exceeds 1 MiB")
     try:
@@ -381,19 +405,19 @@ def install(key: str, destination: str, url: str, tools: dict[str, str]) -> list
     conflict = Refused(f"{name} exists with another configuration; run key uninstall {key} first")
     with private_directory() as fd:
         current, _ = lookup(name)
-        if current is not None and current != wanted:
+        if current is not MISSING and current != wanted:
             raise conflict
-        stored = existing(fd, path.name)
+        # Every check before the first write: a refusal leaves no new file behind.
+        stored, source, shipped = existing(fd, path.name), existing(fd, "headers.py", HELPER_LIMIT), HELPER.read_bytes()
+        if stored is not None and stored.rstrip(b"\n") != token:
+            raise Refused(f"{path} holds another token; nothing changed: run key uninstall {key} first")
         if stored is None:
             publish(fd, path.name, token + b"\n")
-        elif stored.rstrip(b"\n") != token:
-            raise Refused(f"{path} holds another token; nothing changed: run key uninstall {key} first")
-        source, shipped = existing(fd, "headers.py", HELPER_LIMIT), HELPER.read_bytes()
         if source != shipped:
             publish(fd, "headers.py", shipped, replace=source is not None)
         prove(helper, url, key, token)
         current, shadowed = lookup(name)
-        if current is None:
+        if current is MISSING:
             claude(tools["claude"], "add-json", name, json.dumps(wanted))
         elif current != wanted:
             raise conflict
@@ -407,10 +431,10 @@ def uninstall(key: str, tools: dict[str, str]) -> list[str]:
     name, path = server_name(key), private_path() / f"{key}.token"
     with private_directory() as fd:
         current, _ = lookup(name)
-        if current is not None and not ours(current, key):
+        if current is not MISSING and not ours(current, key):
             raise Refused(f"{name} was not added by key install; remove it with claude mcp remove --scope user {name}")
         stored = existing(fd, path.name)  # an unsafe file refuses before anything changes
-        if current is not None:
+        if current is not MISSING:
             claude(tools["claude"], "remove", name)
         if stored is not None:
             os.unlink(path.name, dir_fd=fd)
@@ -419,7 +443,8 @@ def uninstall(key: str, tools: dict[str, str]) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="deedkit key", description="put a key deedkit admin key issue made into Claude Code on this Mac")
+    parser = argparse.ArgumentParser(prog="deedkit key",
+                                     description="put a key deedkit admin key issue made into Claude Code on this Mac")
     actions = parser.add_subparsers(dest="action", required=True)
     add = actions.add_parser("install", help="fetch, prove and add a key to Claude Code (user scope)")
     add.add_argument("id")
