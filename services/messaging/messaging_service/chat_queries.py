@@ -500,22 +500,25 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
             [*base_args,*args]).fetchone()['n']
     waits=None
     if awaiting_their_reply:
-        # ANYM-537: one pass counts what the list shows and what each of its rules leaves out.
+        # ANYM-537: one statement reads the candidates once and takes the totals and the page from that one
+        # snapshot, so a page row left out later (owner_waits.finish) is always one the totals counted.
         waits_mutes=c.execute('SELECT EXISTS(SELECT 1 FROM reply_mutes WHERE principal=%s) AS x',(p['id'],)).fetchone()['x']
         rules=owner_waits.conditions(aliases=aliases,min_wait_hours=min_wait_hours,days=awaiting_reply_days,
             principal=p['id'],mutes=waits_mutes)
-        waits_from=(' FROM chats c JOIN accounts a ON a.id=c.account CROSS JOIN (SELECT %s::jsonb AS owners,%s::jsonb AS aliases) score_clock'
-            ' LEFT JOIN chat_read_observations ro ON ro.account=c.account AND ro.chat=c.id'+owner_waits.laterals(c,aliases))
-        waits_args=[owner_senders(c,p),Jsonb(aliases)]
-        shown=f"({rules['muted']}) IS NULL" if rules['muted'] and not include_muted else 'true'
-        asked=rules['question'] if only_questions else 'true'
-        counted=c.execute(f'''SELECT count(*) FILTER(WHERE {rules['listed']} AND {shown} AND {asked}) AS listed,
-            count(*) FILTER(WHERE {rules['uncertain']} AND {shown}) AS uncertain,
-            count(*) FILTER(WHERE {rules['listed']} AND {shown} AND NOT {asked}) AS without_question,
-            count(*) FILTER(WHERE {rules['listed']} AND {asked} AND ({rules['muted'] or 'NULL'}) IS NOT NULL) AS muted
-            '''+waits_from+' WHERE '+' AND '.join([*clauses,rules['chat']]),[*waits_args,*args]).fetchone()
-        waits={'rules':rules,'from':waits_from,'args':waits_args,'totals':counted,'mutes':waits_mutes,
-            'where':[rules['chat'],rules['listed'],shown,asked]}
+        shown='w.muted IS NULL' if rules['muted'] and not include_muted else 'true'
+        candidates=('WITH waits_all AS MATERIALIZED (SELECT c.id AS chat_id,ws.sent_at AS since,wh.id AS last_id,'
+            'wh.sent_at AS last_at,wp.sent_at AS peer_at,wp.numeric_id AS peer_numeric,'+(rules['muted'] or 'NULL::text')+
+            ' AS muted,wl.listed,'+('CASE WHEN wl.listed THEN '+rules['question']+' ELSE false END' if only_questions else 'wl.listed')+
+            ' AS asked,'+rules['uncertain']+' AS uncertain FROM chats c JOIN accounts a ON a.id=c.account'
+            ' CROSS JOIN (SELECT %s::jsonb AS owners,%s::jsonb AS aliases) score_clock'
+            ' LEFT JOIN chat_read_observations ro ON ro.account=c.account AND ro.chat=c.id'+owner_waits.laterals(c,aliases)+
+            ' CROSS JOIN LATERAL (SELECT '+rules['listed']+' AS listed) wl WHERE '+' AND '.join([*clauses,rules['chat']])+'),'
+            f''' waits_totals AS (SELECT count(*) FILTER(WHERE w.listed AND w.asked AND {shown}) AS listed,
+              count(*) FILTER(WHERE w.uncertain AND {shown}) AS uncertain,
+              count(*) FILTER(WHERE w.listed AND NOT w.asked AND {shown}) AS without_question,
+              count(*) FILTER(WHERE w.listed AND w.asked AND w.muted IS NOT NULL) AS muted FROM waits_all w)''')
+        waits={'rules':rules,'candidates':candidates,'shown':shown,'mutes':waits_mutes,'cursor':None,
+            'args':[owner_senders(c,p),Jsonb(aliases),*args]}
     if after:
         cid=valid_text(after,empty=False) if order=='id' else position_text(pos.get('id'))
         if not c.execute('SELECT 1 FROM chats c WHERE c.id=%s AND '+scope,[cid,*scope_filter(p,'c',chat_column='id')[1]]).fetchone():raise APIError('not_found',404)
@@ -524,8 +527,7 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
             at=None if pos['at'] is None and order=='activity' else position_date(pos['at'])
             if order=='activity':
                 clauses.append("(coalesce(last.sent_at,'-infinity'),c.id)<(coalesce(%s::timestamptz,'-infinity'),%s)");args.extend([at,cid])
-            elif order=='waiting_longest':
-                clauses.append('(ws.sent_at,c.id)>(%s::timestamptz,%s)');args.extend([at,cid])
+            elif order=='waiting_longest':waits['cursor']=[at,cid]
             else:
                 clauses.append('(-'+score+',attention.sent_at,c.id)>(-%s,%s,%s)');args.extend([pos['score'],at,cid])
     sort={'id':'c.id','activity':"coalesce(last.sent_at,'-infinity') DESC,c.id DESC",
@@ -543,12 +545,20 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         query_args=[*args,limit+1,*base_args,limit+1];where='true'
     if waits:
         # The page is chosen over the run lookups alone; the row's head, read and hint evidence is read for it only.
-        prefix=('WITH chat_page AS MATERIALIZED (SELECT c.*,ws.sent_at AS wait_since,wh.id AS wait_last_id,'
-            'wh.sent_at AS wait_last_at,wp.sent_at AS wait_peer_at,wp.numeric_id AS wait_peer_numeric,'
-            +(waits['rules']['muted'] or 'NULL::text')+' AS wait_muted'+waits['from']+' WHERE '+' AND '.join([*clauses,*waits['where']])+
-            ' ORDER BY ws.sent_at,c.id LIMIT %s) ')
+        # One statement picks the page and counts the totals; the row query then reads only the picked chats.
+        picked=c.execute(waits['candidates']+''', picked AS (SELECT w.chat_id,w.since,w.last_id,w.last_at,w.peer_at,
+            w.peer_numeric,w.muted FROM waits_all w WHERE w.listed AND w.asked AND '''+waits['shown']+
+            (' AND (w.since,w.chat_id)>(%s::timestamptz,%s)' if waits['cursor'] else '')+''' ORDER BY w.since,w.chat_id LIMIT %s)
+            SELECT (SELECT to_jsonb(t) FROM waits_totals t) AS totals,
+              coalesce((SELECT jsonb_agg(to_jsonb(k) ORDER BY k.since,k.chat_id) FROM picked k),'[]'::jsonb) AS page''',
+            [*waits['args'],*(waits['cursor'] or []),limit+1]).fetchone()
+        waits['totals']=dict(picked['totals'])
+        prefix='''WITH chat_page AS MATERIALIZED (SELECT c.*,w.since AS wait_since,w.last_id AS wait_last_id,
+            w.last_at AS wait_last_at,w.peer_at AS wait_peer_at,w.peer_numeric AS wait_peer_numeric,w.muted AS wait_muted
+            FROM jsonb_to_recordset(%s::jsonb) AS w(chat_id text,since timestamptz,last_id text,last_at timestamptz,
+              peer_at timestamptz,peer_numeric bigint,muted text) JOIN chats c ON c.id=w.chat_id) '''
         base=base.replace(' FROM chats c JOIN accounts a',' FROM chat_page c JOIN accounts a',1)
-        query_args=[*waits['args'],*args,limit+1,*base_args,limit+1];where='true'
+        query_args=[Jsonb(picked['page']),*base_args,limit+1];where='true'
     rows=c.execute(prefix+'''SELECT c.id,c.account,c.title,c.provider_chat AS provider_chat_id,c.chat_type AS type,
         '''+role_sql+''' AS my_role,'''+('c.can_post,c.role_observed_at,' if roles_ready else
           'NULL::boolean AS can_post,NULL::timestamptz AS role_observed_at,')+'''

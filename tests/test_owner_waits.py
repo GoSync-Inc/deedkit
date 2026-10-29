@@ -391,3 +391,30 @@ def test_a_head_that_changes_during_the_read_leaves_the_row_out(waits,monkeypatc
         page=listed(view=view)
         assert [r['provider_chat_id'] for r in page['items']]==['kept'],view
         assert page['awaiting_their_reply_total']==1 and page['uncertain_total']==uncertain
+
+
+class Arriving:
+    """Commits `arrive()` from another connection right after the first statement that reads the run lookups."""
+    def __init__(self,c,arrive):self.connection=c;self.arrive=arrive
+    def execute(self,sql,args=None):
+        result=self.connection.execute(sql,args)
+        if self.arrive and 'wh ON true' in sql:
+            self.arrive();self.arrive=None
+        return result
+    def __getattr__(self,name):return getattr(self.connection,name)
+
+
+# spec: ANYM-537
+def test_totals_and_page_come_from_one_snapshot_so_a_late_change_never_goes_below_zero(waits,monkeypatch):
+    import messaging_service.chat_queries as chat_queries
+    s,ar,key,now,add,listed,rows=waits
+    # A question backfilled while the list is read, then answered before its head state is read.
+    real=chat_queries.conversation_state
+    def answered(c,p,account,chat,**kwargs):
+        state=real(c,p,account,chat,**kwargs)
+        state.update(last_turn='peer',suggested_action='review_incoming')
+        return state
+    monkeypatch.setattr(chat_queries,'conversation_state',answered)
+    with s.authorized(key,'list_chats') as (c,p):
+        page=chat_queries.list_chats(s,Arriving(c,lambda:add('late','1',30,body=QUESTION)),p,include_coverage=False,**QUEUE)
+    assert page['awaiting_their_reply_total']>=0 and page['awaiting_their_reply_total']==len(page['items'])
