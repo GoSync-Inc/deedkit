@@ -2063,7 +2063,7 @@ def evidence_fragments(tmp_path, *, load_sha="a" * 40, load_outcomes=None, load=
     (verify / "metadata.json").write_text(json.dumps({**metadata(), "tiden_branch": "", "module_checks": modules}))
     for name in ("python-1.xml", *verify_files):
         (verify / name).write_text('<testsuite><testcase name="x" file="tests/x.py"/></testsuite>')
-    for job in shards:  # the `checks / python` matrix jobs, shards 2-6 of the root suite
+    for job in shards:  # the `checks / python` matrix jobs, shards 2-7 of the root suite
         fragment = fragments / f"ci-evidence-{job}"
         fragment.mkdir()
         (fragment / "source-sha").write_text("a" * 40 + "\n")
