@@ -118,12 +118,12 @@ Synthetic tests do not establish that live quiescence.
 If current and candidate SQL inventories differ, complete a separate reviewed
 compatibility and migration plan before enrollment. Verify that the pinned
 backup and restore runtimes support the current database schema and the planned
-target schema. Resolve receiver capacity or delivery failures such as
+target schema. An additive release needs no pre-migration backup: the daily
+backup is its restore point ([production.md](production.md#migration-releases-and-the-backup-gate)
+item 3). For a contract or destructive release, resolve receiver capacity or delivery failures such as
 `receiver_quota` through a reviewed storage/retention operation that preserves
 the protected restore anchor. Then obtain a fresh compatible pre-migration
-snapshot with confirmed durable delivery, or for an additive release the latest
-proven daily backup under the conditions of [production.md](production.md#migration-releases-and-the-backup-gate)
-item 3. Retain its ID, snapshot time, schema,
+snapshot with confirmed durable delivery. Retain its ID, snapshot time, schema,
 image revision, ciphertext size/hash and receiver receipt privately, and verify
 restore integrity in an isolated quarantine as described in
 [backup and recovery](../../BACKUP.md). Measure freshness from snapshot time,

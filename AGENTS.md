@@ -44,8 +44,9 @@ agents' under the harness section 2 gates. Item 2 asks only what docs/DATA-POLIC
 cover; item 3 is the Budget line above. The live actions act on the owner's messenger accounts
 under the owner's name (item 4) and the owner's devices and provider auth (item 5): they keep
 section 1's exact confirmation. In a task (a ready card) the agent applies its migration under
-production.md's backup gate; enabling a feature never includes send, call, pairing, session or
-allowlist changes, and none of it runs during an active call.
+production.md "Migration releases" (an additive one without a backup gate, owner 10-29); enabling
+a feature never includes send, call, pairing, session or allowlist changes, and none of it runs
+during an active call.
 
 Override: harness tiden.md Card intake step 1 (owner 10-26). A defect, improvement or feature
 idea in feedback from a principal in the autoloop config is written, readied, built, merged by the
