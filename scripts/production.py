@@ -1378,13 +1378,19 @@ def serving_generation(settings, http):
     if http is None:
         # HTTP state in this state, the host state root, its subdirectories with a receipt or any /etc/deedkit
         # configuration's state (retention_states), or a deploy that promoted plan B from this state, is a plan B.
+        def marked(path):
+            # A link counts, also a dangling one: an ambiguous marker is never taken for no plan B.
+            try:
+                return bool(os.lstat(path))
+            except (FileNotFoundError, NotADirectoryError):
+                return False
         try:
             found = [str(path) for directory in retention_states(state)
                      for path in (directory / "http", directory / "http-current.json",
                                   *(release / "http-attempted.json" for release in subdirectories(directory)))
-                     if present(path)]
+                     if marked(path)]
             deployed = state / "deploy.json"
-            if present(deployed) and "http" in read(deployed):
+            if marked(deployed) and "http" in read(deployed):
                 found.append(f"{deployed} (a deploy promoted plan B)")
         except (OSError, ValueError, TypeError, KeyError, AttributeError, Refused) as exc:
             detail = type(exc).__name__ if not isinstance(exc, Refused) else str(exc).removesuffix("; no image is removed")
