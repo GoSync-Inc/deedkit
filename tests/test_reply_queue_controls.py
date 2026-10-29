@@ -398,7 +398,7 @@ def test_reply_controls_surface_and_backup(inbox):
     with s.pool.connection() as c:
         manifest = database_manifest(c)
         assert manifest['reply_mutes']['rows'] == 1 and manifest['reply_snoozes']['rows'] == 0
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '56'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '57'
     assert s.list_reply_dismissals(key)['items'] == [] and mid
 
 
@@ -572,7 +572,7 @@ def test_reply_controls_backup_round_trip(inbox, tmp_path):
     docker = ['docker', 'exec', '-i', '-e', 'PGPASSWORD=' + values['password'], container]
     create_snapshot(s, tmp_path / 'capture', [*docker, 'pg_dump', '--format=custom', '--dbname=' + container_dsn])
     manifest = verify_bundle(tmp_path / 'capture')
-    assert manifest['schema_version'] == 56
+    assert manifest['schema_version'] == 57
     assert [manifest['tables'][t]['rows'] for t in ('reply_dismissals', 'reply_snoozes', 'reply_mutes')] == [1, 1, 1]
     name = 'anymsg_reply_' + uuid4().hex + '_restore_test'
     restored = None

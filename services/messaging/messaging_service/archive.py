@@ -110,6 +110,101 @@ def telegram_web_preview_refresh(retained,candidate,version):
         return False
 
 
+def whatsapp_unreadable_shape(e):
+    """A WhatsApp observation that could not be read: kind `unknown`, no text, no attachment."""
+    return (e['platform']=='whatsapp' and e.get('metadata',{}).get('message_kind')=='unknown'
+        and not e['body'] and not e['media'] and not e['deleted'])
+
+
+def ingest_outcome(old,e,retained_snapshot,sender_alias=False):
+    """What ingest does with the validated candidate `e` against the retained message row `old` (None: a new message)
+    and the retained revision's snapshot: (outcome, sender_completed, sender_device_only, unreadable, sent_at_jitter,
+    jitter_version, body_completed, web_preview_refresh, known_candidate, known_retained, old_format). The version a
+    rule compares with is `old['provider_updated_at']`. `sender_alias` is ingest's ANYM-559 lookup, a database read:
+    the caller makes it and has already put the retained sender into `e`. Pure, so conflict re-evaluation asks the
+    same rule whether it would still raise a stored conflict (ANYM-621); it passes no alias, which keeps a row raised
+    (open) wherever the alias would lift it."""
+    content=fingerprint(e); updated=datetime.fromisoformat(e['updated_at']); outcome='created'
+    old_format=retained_snapshot.get('formatting') if old and retained_snapshot else None
+    candidate_format=e.get('formatting')
+    known_candidate=known_formatting(candidate_format);known_retained=known_formatting(old_format)
+    formatting_changed=known_candidate and known_retained and candidate_format!=old_format
+    formatting_completed=known_candidate and not known_retained
+    sender_completed=bool(old and not old['sender'] and e['sender'] and not old['deleted']
+        and not e['deleted'] and e['platform']=='telegram' and e['direction']=='outgoing'
+        and e.get('metadata',{}).get('chat_type')=='private'
+        and e.get('metadata',{}).get('sender_identity_basis')=='authenticated_self'
+        and old['provider_updated_at']==updated
+        and fingerprint({**e,'sender':''})==old['content_hash']
+        and not formatting_changed)
+    # A group sender is never inferred (it may be anonymous): it completes only when Telegram
+    # itself named the owner, which the adapter marks with the authenticated basis. A retained
+    # revision observed as private or channel never qualifies (ANYM-620).
+    group_sender_completed=bool(old and retained_snapshot and not old['sender'] and e['sender']
+        and not old['deleted'] and not e['deleted'] and e['platform']=='telegram' and e['direction']=='outgoing'
+        and e.get('metadata',{}).get('chat_type')=='group'
+        and (retained_snapshot.get('metadata') or {}).get('chat_type') in (None,'unknown','group')
+        and e.get('metadata',{}).get('sender_identity_basis')=='authenticated_self'
+        and old['provider_updated_at']==updated
+        and fingerprint({**e,'sender':''})==old['content_hash']
+        and not formatting_changed)
+    sender_completed=sender_completed or group_sender_completed
+    # The same WhatsApp sender with and without a device number, everything else equal,
+    # contradicts nothing: the retained sender, revision and sender profiles stay, and it
+    # is no later evidence for an open conflict.
+    sender_device_only=bool(old and e['platform']=='whatsapp' and old['sender']!=e['sender']
+        and not old['deleted'] and not e['deleted'] and whatsapp_user(old['sender']) is not None
+        and whatsapp_user(old['sender'])==whatsapp_user(e['sender'])
+        and fingerprint({**e,'sender':old['sender']})==old['content_hash']
+        and (candidate_format==old_format or not (known_candidate or known_retained)))
+    # An observation WhatsApp could not read (kind `unknown`, no text, no attachment) at the
+    # retained provider version carries nothing: the retained revision, its metadata and
+    # sender profiles stay, and it resolves no conflict.
+    unreadable=bool(whatsapp_unreadable_shape(e) and old and retained_snapshot and retained_snapshot.get('body')
+        and not old['deleted'] and old['provider_updated_at']==updated and content!=old['content_hash']
+        and fingerprint({**e,'body':retained_snapshot.get('body',''),
+            'media':retained_snapshot.get('media',[])})==old['content_hash'])
+    # A WhatsApp re-read whose sent time is a few seconds off, everything else equal, is the
+    # retained revision. An unedited message's provider version is its sent time, so a version
+    # no later than the retained one plus that offset is no later evidence: the stored version
+    # stays and it resolves no conflict. A later version (an edit time) counts as for an exact re-read.
+    sent_at_jitter=bool(old and retained_snapshot and whatsapp_sent_at_jitter(retained_snapshot,e)
+        and fingerprint({**e,'sent_at':retained_snapshot['sent_at']})==old['content_hash'])
+    jitter_version=bool(sent_at_jitter and old['provider_updated_at'] is not None and updated<=old['provider_updated_at']
+        +max(datetime.fromisoformat(e['sent_at'])-old['sent_at'],timedelta(0)))
+    # A WhatsApp business message's text at the retained provider version completes a revision
+    # stored without text: a new revision, the empty one stays readable. It is no later
+    # evidence, so it resolves no open conflict.
+    body_completed=bool(old and retained_snapshot and whatsapp_body_completion(retained_snapshot,e)
+        and not old['body'] and old['provider_updated_at']==updated
+        and fingerprint({**e,'body':''})==old['content_hash'])
+    # Telegram's re-crawl of the same link preview page at the retained provider version changes
+    # only the attachment: the retained revision, its metadata, media and attachments stay, and it
+    # is no later evidence for an open conflict (ANYM-611).
+    web_preview_refresh=bool(old and retained_snapshot and not old['deleted']
+        and telegram_web_preview_refresh(retained_snapshot,e,old['provider_updated_at'])
+        and fingerprint({**e,'media':retained_snapshot['media']})==old['content_hash'])
+    if old:
+        if old['deleted'] and not e['deleted']: outcome='tombstoned'
+        elif sender_completed:outcome='edited'
+        elif sender_device_only:outcome='unchanged'
+        elif unreadable:outcome='unchanged'
+        elif sent_at_jitter:outcome='stale' if old['provider_updated_at'] and updated<old['provider_updated_at'] else 'unchanged'
+        elif body_completed:outcome='edited'
+        elif web_preview_refresh:outcome='unchanged'
+        elif (old['sent_at']!=datetime.fromisoformat(e['sent_at']) or old['direction']!=e['direction']
+              or old['sender']!=e['sender']): outcome='conflict'
+        elif old['content_hash']==content and not (formatting_changed or formatting_completed): outcome='unchanged'
+        elif old['provider_updated_at'] and updated<old['provider_updated_at']: outcome='stale'
+        elif old['content_hash']==content and formatting_completed:outcome='edited'
+        elif (old['provider_updated_at']==updated and not e['deleted']): outcome='conflict'
+        else: outcome='deleted' if e['deleted'] else 'edited'
+        if sender_alias and outcome not in ('unchanged','stale') and old['provider_updated_at']==updated:outcome='conflict'
+    elif e['deleted']: outcome='deleted'
+    return (outcome,sender_completed,sender_device_only,unreadable,sent_at_jitter,jitter_version,body_completed,
+            web_preview_refresh,known_candidate,known_retained,old_format)
+
+
 class Archive:
     def __init__(self,store):
         self.store=store; self._media_sweeps={}; self._media_sweep_lock=threading.Lock()
@@ -173,7 +268,7 @@ class Archive:
             AND expires_at>clock_timestamp() FOR UPDATE''',(account,owner,epoch)).fetchone()
         if not row: raise RuntimeError('collector_lease_lost')
 
-    def ingest(self,raw,*,lease=None,identity_observations=()):
+    def ingest(self,raw,*,lease=None,identity_observations=(),replay=False):
         e=validate(raw); captured=e; receipt=hashlib.sha256(canonical(e)).hexdigest()
         aid=e['account']; cid=stable_id('chat',aid,e['chat']); mid=stable_id('msg',aid,e['chat'],e['provider_id'])
         with self.store.pool.connection() as c:
@@ -208,13 +303,12 @@ class Archive:
                 from .whatsapp_identity import fence as fence_identity
                 fence_identity(c,aid,mid,identity_observations)
             previous=c.execute('SELECT outcome FROM ingest_receipts WHERE digest=%s',(receipt,)).fetchone()
-            if previous: return {'outcome':'duplicate','message':mid}
+            if previous and not replay: return {'outcome':'duplicate','message':mid}
             chat_type=e.get('metadata',{}).get('chat_type')
             if chat_type=='unknown':chat_type=None
             # A WhatsApp observation that could not be read (kind `unknown`, no text, no attachment)
             # may create its chat but never rewrites the chat's title or type.
-            unreadable_shape=(e['platform']=='whatsapp' and e.get('metadata',{}).get('message_kind')=='unknown'
-                and not e['body'] and not e['media'] and not e['deleted'])
+            unreadable_shape=whatsapp_unreadable_shape(e)
             if unreadable_shape:c.execute('''INSERT INTO chats(id,account,title,provider_chat,chat_type)
                 VALUES(%s,%s,%s,%s,%s) ON CONFLICT(id) DO NOTHING''',(cid,aid,e['chat_title'],e['chat'],chat_type))
             else:c.execute('''INSERT INTO chats(id,account,title,provider_chat,chat_type) VALUES(%s,%s,%s,%s,%s)
@@ -237,88 +331,15 @@ class Archive:
                 from .whatsapp_identity import same_sender
                 sender_alias=same_sender(c,aid,old['sender'],e['sender'])
             if sender_alias:e={**e,'sender':old['sender']}
-            content=fingerprint(e); updated=datetime.fromisoformat(e['updated_at']); outcome='created'
-            old_format=None;retained=None;retained_snapshot=None
+            content=fingerprint(e); updated=datetime.fromisoformat(e['updated_at'])
+            retained=None;retained_snapshot=None
             if old:
                 retained=c.execute('SELECT snapshot FROM message_revisions WHERE message=%s AND revision=%s',
                     (mid,old['revision'])).fetchone()
                 retained_snapshot=retained['snapshot'] if retained else None
-                old_format=retained_snapshot.get('formatting') if retained_snapshot else None
-            candidate_format=e.get('formatting')
-            known_candidate=known_formatting(candidate_format);known_retained=known_formatting(old_format)
-            formatting_changed=known_candidate and known_retained and candidate_format!=old_format
-            formatting_completed=known_candidate and not known_retained
-            sender_completed=bool(old and not old['sender'] and e['sender'] and not old['deleted']
-                and not e['deleted'] and e['platform']=='telegram' and e['direction']=='outgoing'
-                and e.get('metadata',{}).get('chat_type')=='private'
-                and e.get('metadata',{}).get('sender_identity_basis')=='authenticated_self'
-                and old['provider_updated_at']==updated
-                and fingerprint({**e,'sender':''})==old['content_hash']
-                and not formatting_changed)
-            # A group sender is never inferred (it may be anonymous): it completes only when Telegram
-            # itself named the owner, which the adapter marks with the authenticated basis. A retained
-            # revision observed as private or channel never qualifies (ANYM-620).
-            group_sender_completed=bool(old and retained_snapshot and not old['sender'] and e['sender']
-                and not old['deleted'] and not e['deleted'] and e['platform']=='telegram' and e['direction']=='outgoing'
-                and e.get('metadata',{}).get('chat_type')=='group'
-                and (retained_snapshot.get('metadata') or {}).get('chat_type') in (None,'unknown','group')
-                and e.get('metadata',{}).get('sender_identity_basis')=='authenticated_self'
-                and old['provider_updated_at']==updated
-                and fingerprint({**e,'sender':''})==old['content_hash']
-                and not formatting_changed)
-            sender_completed=sender_completed or group_sender_completed
-            # The same WhatsApp sender with and without a device number, everything else equal,
-            # contradicts nothing: the retained sender, revision and sender profiles stay, and it
-            # is no later evidence for an open conflict.
-            sender_device_only=bool(old and e['platform']=='whatsapp' and old['sender']!=e['sender']
-                and not old['deleted'] and not e['deleted'] and whatsapp_user(old['sender']) is not None
-                and whatsapp_user(old['sender'])==whatsapp_user(e['sender'])
-                and fingerprint({**e,'sender':old['sender']})==old['content_hash']
-                and (candidate_format==old_format or not (known_candidate or known_retained)))
-            # An observation WhatsApp could not read (kind `unknown`, no text, no attachment) at the
-            # retained provider version carries nothing: the retained revision, its metadata and
-            # sender profiles stay, and it resolves no conflict.
-            unreadable=bool(unreadable_shape and old and retained_snapshot and retained_snapshot.get('body')
-                and not old['deleted'] and old['provider_updated_at']==updated and content!=old['content_hash']
-                and fingerprint({**e,'body':retained_snapshot.get('body',''),
-                    'media':retained_snapshot.get('media',[])})==old['content_hash'])
-            # A WhatsApp re-read whose sent time is a few seconds off, everything else equal, is the
-            # retained revision. An unedited message's provider version is its sent time, so a version
-            # no later than the retained one plus that offset is no later evidence: the stored version
-            # stays and it resolves no conflict. A later version (an edit time) counts as for an exact re-read.
-            sent_at_jitter=bool(old and retained_snapshot and whatsapp_sent_at_jitter(retained_snapshot,e)
-                and fingerprint({**e,'sent_at':retained_snapshot['sent_at']})==old['content_hash'])
-            jitter_version=bool(sent_at_jitter and old['provider_updated_at'] is not None and updated<=old['provider_updated_at']
-                +max(datetime.fromisoformat(e['sent_at'])-old['sent_at'],timedelta(0)))
-            # A WhatsApp business message's text at the retained provider version completes a revision
-            # stored without text: a new revision, the empty one stays readable. It is no later
-            # evidence, so it resolves no open conflict.
-            body_completed=bool(old and retained_snapshot and whatsapp_body_completion(retained_snapshot,e)
-                and not old['body'] and old['provider_updated_at']==updated
-                and fingerprint({**e,'body':''})==old['content_hash'])
-            # Telegram's re-crawl of the same link preview page at the retained provider version changes
-            # only the attachment: the retained revision, its metadata, media and attachments stay, and it
-            # is no later evidence for an open conflict (ANYM-611).
-            web_preview_refresh=bool(old and retained_snapshot and not old['deleted']
-                and telegram_web_preview_refresh(retained_snapshot,e,old['provider_updated_at'])
-                and fingerprint({**e,'media':retained_snapshot['media']})==old['content_hash'])
-            if old:
-                if old['deleted'] and not e['deleted']: outcome='tombstoned'
-                elif sender_completed:outcome='edited'
-                elif sender_device_only:outcome='unchanged'
-                elif unreadable:outcome='unchanged'
-                elif sent_at_jitter:outcome='stale' if old['provider_updated_at'] and updated<old['provider_updated_at'] else 'unchanged'
-                elif body_completed:outcome='edited'
-                elif web_preview_refresh:outcome='unchanged'
-                elif (old['sent_at']!=datetime.fromisoformat(e['sent_at']) or old['direction']!=e['direction']
-                      or old['sender']!=e['sender']): outcome='conflict'
-                elif old['content_hash']==content and not (formatting_changed or formatting_completed): outcome='unchanged'
-                elif old['provider_updated_at'] and updated<old['provider_updated_at']: outcome='stale'
-                elif old['content_hash']==content and formatting_completed:outcome='edited'
-                elif (old['provider_updated_at']==updated and not e['deleted']): outcome='conflict'
-                else: outcome='deleted' if e['deleted'] else 'edited'
-                if sender_alias and outcome not in ('unchanged','stale') and old['provider_updated_at']==updated:outcome='conflict'
-            elif e['deleted']: outcome='deleted'
+            (outcome,sender_completed,sender_device_only,unreadable,sent_at_jitter,jitter_version,body_completed,
+             web_preview_refresh,known_candidate,known_retained,old_format)=ingest_outcome(old,e,retained_snapshot,sender_alias)
+            if replay and outcome!='edited':raise ValueError('replay_not_accepted')
             # An incomplete observation of the same retained provider body must
             # not erase known formatting, including authenticated sender repair.
             inherited_format=bool(old and known_retained and not known_candidate and not e['deleted']
@@ -395,8 +416,8 @@ class Archive:
                 reply = capture_reply(c,e,cid) if outcome=='created' else None
                 self.store.append_event(c,aid,mid,'message.'+outcome,e['origin'],receipt,
                     snapshot_metadata={'reply_evidence':reply} if reply else None)
-            c.execute('INSERT INTO ingest_receipts(digest,account,envelope,outcome) VALUES(%s,%s,%s,%s)',
-                      (receipt,aid,Jsonb(captured),outcome))
+            if not previous:c.execute('INSERT INTO ingest_receipts(digest,account,envelope,outcome) VALUES(%s,%s,%s,%s)',
+                (receipt,aid,Jsonb(captured),outcome))
             if outcome=='conflict':
                 # The class compares the receipt with the contradicted revision, as the backfill does (ANYM-557).
                 from .conflict_classes import REASON_VERSION,classify,stored
@@ -413,7 +434,9 @@ class Archive:
                     and not body_completed and not web_preview_refresh and not (sender_alias and outcome=='unchanged')):
                 # A repeated copy of the retained revision does not resolve an
                 # equal/newer conflicting observation. Only later evidence does.
-                c.execute('''UPDATE message_conflicts mc SET resolved_at=clock_timestamp(),
+                # From schema 57 each resolve names how it was resolved (ANYM-621); N-1 rows keep NULL, unknown.
+                from .conflict_reevaluation import resolution_set
+                c.execute('''UPDATE message_conflicts mc SET resolved_at=clock_timestamp(),'''+resolution_set(c,'newer_observation')+'''
                     resolved_revision=(SELECT revision FROM messages WHERE id=%s)
                     FROM ingest_receipts r WHERE r.digest=mc.receipt_digest
                     AND mc.message=%s AND mc.resolved_at IS NULL AND mc.candidate_updated_at<%s
@@ -433,7 +456,7 @@ class Archive:
                         and (not known_formatting(r['envelope'].get('formatting'))
                             or not known_formatting(e.get('formatting'))
                             or r['envelope']['formatting']==e['formatting'])]
-                    if equivalent:c.execute('''UPDATE message_conflicts SET resolved_at=clock_timestamp(),
+                    if equivalent:c.execute('''UPDATE message_conflicts SET resolved_at=clock_timestamp(),'''+resolution_set(c,'sender_completed')+'''
                         resolved_revision=%s WHERE message=%s AND receipt_digest=ANY(%s) AND resolved_at IS NULL''',
                         (revision,mid,equivalent))
             c.execute("""UPDATE source_status SET last_ingest_at=clock_timestamp(),status='receiving',

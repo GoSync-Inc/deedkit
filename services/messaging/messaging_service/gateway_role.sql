@@ -112,3 +112,5 @@ GRANT SELECT ON module_events,module_event_counter,subscription_module_sources,s
 GRANT SELECT,INSERT ON subscription_module_streams TO messaging_gateway;
 GRANT UPDATE(matched_through,acked_through,gap,blocked_reason,rollback_hold) ON subscription_module_streams
     TO messaging_gateway;
+-- Schema 57 (ANYM-621): sync status shows each account's conflict re-evaluation progress, read only.
+GRANT SELECT ON conflict_reevaluations TO messaging_gateway;

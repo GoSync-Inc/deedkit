@@ -29,9 +29,9 @@ def test_schema26_manifest_includes_definitions_sources_and_exact_match_referenc
     _, definition, event = _subscription(store, 'synthetic-manifest-subscriber')
     match_subscriptions(store)
     with store.pool.connection() as connection:
-        assert connection.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '56'
+        assert connection.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '57'
         manifest = database_manifest(connection)
-    assert len(manifest) == 87
+    assert len(manifest) == 88
     assert all(manifest[name]['rows'] == 1 for name in (
         'subscriptions', 'subscription_sources', 'subscription_matches'))
     assert all(len(manifest[name]['sha256']) == 64 for name in (
@@ -114,7 +114,7 @@ def test_native_schema26_quarantine_closes_versions_preserves_refs_and_revokes_r
             assert connection.execute('SELECT count(*) AS n FROM subscription_receipts').fetchone()['n'] == 0
             assert after['subscription_consumption'] == before['subscription_consumption']
             assert after['agent_feedback'] == before['agent_feedback']
-        assert len(after) == 87 and after['subscriptions']['rows'] == 2
+        assert len(after) == 88 and after['subscriptions']['rows'] == 2
         assert all(row['state'] == 'closed' and row['version'] == before_versions[str(row['id'])] + 1
             for row in definitions)
         assert after['subscription_sources'] == before['subscription_sources']

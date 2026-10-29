@@ -99,6 +99,28 @@ receipt), and every row without a stored class (written by older code). It
 counts as attention. Rows from before migration 054 keep no class until a
 follow-up card classifies them.
 
+### Conflict re-evaluation (ANYM-621)
+
+A rule fix changes only what ingest raises from then on. A rule card registers a
+job in `conflict_reevaluation.py`, and each collector runs its account's jobs at
+start, on its own thread and database connection: `classify` stores a class on
+open rows without one; `resolve` closes open rows of the job's classes that the
+current rule would not raise (the retained revision stands); `accept` writes the
+completed revision through ingest. Rule jobs wait for the account's classification
+(`last_error` `classify_pending`). Each resolve records `message_conflicts.resolution`:
+`newer_observation` or `sender_completed` from ingest, `rule_changed:<job>@<version>`
+from a job; NULL is unknown (rows resolved before schema 57 or by older code).
+
+Account-scoped `get_sync_status` (`detail=full`) shows `conflict_reevaluations`,
+one `{job, version, done, done_at, rows_resolved, last_error}` per job the
+account's collector has run; empty before a rule card registers a job. `last_error`
+is a fixed code: `evaluation_error`, `invalid_result`, `evaluation_timeout` (a job
+function ran over 10 s; the next start skips that row, and a classification stores
+`unclassified` for it), `lock_timeout`, `statement_timeout`, `wall_deadline`,
+`accept_rejected`, `classify_pending` or `rule_still_raises` (the job asked to resolve
+a row today's ingest rule still raises; the row stays open). A job with an error
+retries at the next collector start.
+
 Telegram history reconcile isolates a provider error of one chat (ANYM-293).
 Rate limits (`FloodWaitError`, the governor's cooldown), session-terminal
 `UnauthorizedError`s, a duplicated authorization key, transport loss
