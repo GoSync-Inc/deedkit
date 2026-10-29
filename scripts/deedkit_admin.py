@@ -1990,10 +1990,15 @@ def line(indent: str, credential: dict) -> str:
             f"  expires {credential['expires_at'] or '-'}{note}")
 
 
-def delivery_endpoints(run, args) -> dict:
-    """The messaging operator commands for self-service endpoints (ANYM-519); a UUID is checked before any run."""
+def delivery_endpoints(run, args, config: dict | None = None) -> dict:
+    """The messaging operator commands for self-service endpoints (ANYM-519); a UUID is checked before any run.
+    The list adds each owning principal's key label from the private admin file (ANYM-520)."""
     if args.verb == "list":
-        return ask(run, "messaging", ["delivery-endpoints-list"] + (["--principal", args.principal] if args.principal else []))
+        listed = ask(run, "messaging", ["delivery-endpoints-list"] + (["--principal", args.principal] if args.principal else []))
+        labels = load_labels(config or {})
+        for item in listed.get("items", []):
+            item["key_label"] = labels.get(item.get("principal"))
+        return listed
     try:
         endpoint_id = str(UUID(args.endpoint_id))
     except ValueError:
@@ -2054,7 +2059,7 @@ def main(argv: list[str] | None = None, run=None, docker=None, host=None) -> int
     try:
         config = load_json(args.config, "admin configuration")
         if args.noun == "delivery-endpoints":
-            print(json.dumps(delivery_endpoints(run or runner(config), args), ensure_ascii=False, indent=2))
+            print(json.dumps(delivery_endpoints(run or runner(config), args, config), ensure_ascii=False, indent=2))
             return 0
         if args.noun in ("undo", "profile") or args.verb in ("issue", "extend", "revoke"):
             os.umask(0o077)

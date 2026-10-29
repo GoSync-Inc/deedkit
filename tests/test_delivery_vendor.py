@@ -436,8 +436,8 @@ def catalog_validate(tool, arguments):
 # spec: ANYM-583
 @pytest.mark.parametrize(('state', 'actions'), [
     pytest.param('enabled', ['set_headers', 'test'], id='enabled'),
-    pytest.param('agent_paused', ['set_headers', 'resume', 'test'], id='agent-paused'),
-    pytest.param('auto_paused', ['set_headers', 'resume', 'test'], id='auto-paused'),
+    pytest.param('agent_paused', ['set_headers', 'resume'], id='agent-paused'),
+    pytest.param('auto_paused', ['set_headers', 'resume'], id='auto-paused'),
     pytest.param('operator_disabled', ['set_headers', 'test'], id='operator-disabled'),
 ])
 def test_refusal_next_step_names_the_cause_header_names_and_valid_calls_for_the_state(state, actions):
@@ -478,8 +478,20 @@ def test_refusal_survives_a_secret_rotation_a_pause_and_a_resume_with_the_same_t
     assert view['last_error'] == refused
     view = store.update_delivery_endpoint(token, endpoint['endpoint_id'], view['version'], 'pause')
     assert view['last_error']['next_step'] == refusal_step(endpoint['endpoint_id'], 'agent_paused', ['Authorization'])
-    view = store.update_delivery_endpoint(token, endpoint['endpoint_id'], view['version'], 'resume')
-    assert (view['last_error'], view['health']) == (refused, 'failing')
+    # ANYM-520: the resume's own signed test is refused too, so the resume is refused and the refusal stays.
+    age(store)
+    pending = store.update_delivery_endpoint(token, endpoint['endpoint_id'], view['version'], 'resume')
+    assert (pending['state'], pending['test']['test_status']) == ('agent_paused', 'pending')
+    dispatch_hints(store, transport=lambda *a, **k: 401, resolver=PUBLIC)
+    with pytest.raises(APIError, match='endpoint_test_failed') as failed:
+        store.update_delivery_endpoint(token, endpoint['endpoint_id'], view['version'], 'resume',
+            resume_test=pending['test']['request_id'])
+    assert (failed.value.test_error, failed.value.http_status, failed.value.state) == ('vendor_refused', 401,
+        'agent_paused')
+    view = store.list_delivery_endpoints(token)['items'][0]
+    assert (view['state'], view['last_error']['code'], view['health']) == ('agent_paused', 'vendor_refused', 'failing')
+    assert view['last_error']['next_step'] == refusal_step(endpoint['endpoint_id'], 'agent_paused', ['Authorization'])
+    assert view['delivery_health']['next_step'] == view['last_error']['next_step']
 
 
 def plan_nodes(plan):
@@ -679,6 +691,10 @@ def test_endpoint_view_reads_one_state_while_a_test_and_a_hint_finish(gate, poli
     class Interleaved:
         def __init__(self, c):
             self.c, self.done = c, False
+
+        def __getattr__(self, name):
+            # transaction() and the rest of the connection (ANYM-520's health read runs in its own savepoint).
+            return getattr(self.c, name)
 
         def execute(self, *args):
             cursor = self.c.execute(*args)

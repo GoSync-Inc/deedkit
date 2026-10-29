@@ -530,6 +530,28 @@ def test_endpoint_errors_relay_only_reviewed_extras(tmp_path, caplog, operation,
         assert SECRET_CANARY not in text and HEADER_CANARY not in text
 
 
+# spec: ANYM-520
+@pytest.mark.parametrize("body,relayed", [
+    ({"error": "endpoint_test_failed", "state": "auto_paused", "version": 8, "test_error": "receiver_status",
+      "http_status": 500, "next_step": "fix the receiver, then call update_delivery_endpoint with action resume again"},
+     {"state": "auto_paused", "version": 8, "test_error": "receiver_status", "http_status": 500,
+      "next_step": "fix the receiver, then call update_delivery_endpoint with action resume again"}),
+    ({"error": "endpoint_test_failed", "version": True, "test_error": "Receiver said " + SECRET_CANARY,
+      "http_status": 99}, {}),
+    ({"error": "endpoint_test_failed", "version": 0}, {}),
+])
+def test_a_refused_resume_relays_its_test_error_and_the_new_version_only(tmp_path, caplog, body, relayed):
+    caplog.set_level(logging.DEBUG)
+    app, _ = endpoint_app(tmp_path, "update_delivery_endpoint", lambda request: httpx.Response(
+        409, json={**body, "request_id": "c" * 32}))
+    with TestClient(app) as client:
+        rest, mcp = both(client, "messages_update_delivery_endpoint", ENDPOINT_TOOLS[4][1])
+    assert rest.json() == mcp["structuredContent"] == {
+        "error": "endpoint_test_failed", "backend_status": 409, "request_id": "c" * 32, **relayed}
+    for text in (rest.text, json.dumps(mcp), caplog.text):
+        assert SECRET_CANARY not in text
+
+
 # spec: ANYM-519
 def test_register_and_test_wait_in_the_wait_pool_not_the_metadata_pool():
     from agent_gateway.http_clients import admission, wait_tools

@@ -43,3 +43,7 @@ GRANT SELECT ON module_events,subscription_module_matches,subscription_module_st
 -- Schema 60 (ANYM-522): a dynamic definition's hint is rechecked against the key's current scope under the
 -- fence: each reference's account, chat, hidden mark and own-send evidence; no journal snapshot.
 GRANT SELECT(subscription,event,account,chat,hidden,own_send_reply) ON subscription_matches TO messaging_event_delivery;
+-- Schema 61 (ANYM-520): the attempt log (written per endpoint hint attempt, pruned after 7 days) and the auto-pause:
+-- an endpoint that keeps failing moves from enabled to auto_paused; nothing else of the endpoint row is writable.
+GRANT SELECT,INSERT,DELETE ON delivery_attempts TO messaging_event_delivery;
+GRANT UPDATE(state,version,updated_at) ON delivery_endpoints TO messaging_event_delivery;

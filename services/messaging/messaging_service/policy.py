@@ -42,7 +42,7 @@ OPERATION_PERMISSIONS = {
     'prepare_file_upload':'upload','upload_file_chunk':'upload','get_file_upload':'upload',
     'register_delivery_endpoint':'delivery-write','list_delivery_endpoints':'delivery-write',
     'update_delivery_endpoint':'delivery-write','delete_delivery_endpoint':'delivery-write',
-    'test_delivery_endpoint':'delivery-write',
+    'test_delivery_endpoint':'delivery-write','list_delivery_attempts':'delivery-write',
 }
 # resolve_target is audited as resolve_reference (ANYM-545) and messages_send as its preview_message and
 # send_message steps (ANYM-546): the audit_log CHECK lists operations by migration.

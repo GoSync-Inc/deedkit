@@ -276,6 +276,23 @@ def test_python_endpoint_helpers_preserve_exact_wire_arguments(operation):
     assert seen[4][1] == {'endpoint_id': ENDPOINT, 'version': 2, 'action': 'pause'}
 
 
+# spec: ANYM-520
+def test_python_attempt_listing_helper_sends_exact_wire_arguments_and_checks_them_first():
+    seen = []
+    def transport(request):
+        seen.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={'items': []})
+    with Client('https://archive.example', 'synthetic-token', transport=httpx.MockTransport(transport)) as client:
+        assert client.list_delivery_attempts(endpoint_id=ENDPOINT) == {'items': []}
+        client.list_delivery_attempts(endpoint_id=ENDPOINT, limit=5, before=ENDPOINT)
+        for arguments in ({'endpoint_id': ENDPOINT, 'limit': 51}, {'endpoint_id': ENDPOINT, 'before': 'attempt-1'},
+                {'limit': 5}):
+            with pytest.raises(ValueError):
+                client.call('list_delivery_attempts', arguments)
+    assert seen == [('/v1/list_delivery_attempts', {'endpoint_id': ENDPOINT, 'limit': 50}),
+        ('/v1/list_delivery_attempts', {'endpoint_id': ENDPOINT, 'limit': 5, 'before': ENDPOINT})]
+
+
 # spec: ANYM-519
 @pytest.mark.parametrize('operation,arguments', [
     ('register_delivery_endpoint', {'request_id': 'synthetic-endpoint', 'url': 'https://hooks.example', 'signing_secret': 'plain'}),

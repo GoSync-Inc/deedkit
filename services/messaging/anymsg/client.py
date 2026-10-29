@@ -151,6 +151,7 @@ _SUBSCRIPTION_FIELDS = {
     'update_delivery_endpoint': ({'endpoint_id','version','action'}, {'endpoint_id','version','action','new_secret','headers'}),
     'delete_delivery_endpoint': ({'endpoint_id','version'}, {'endpoint_id','version'}),
     'test_delivery_endpoint': ({'endpoint_id','request_id'}, {'endpoint_id','request_id'}),
+    'list_delivery_attempts': ({'endpoint_id'}, {'endpoint_id','limit','before'}),
 }
 _FEEDBACK_STATUSES = ('received','accepted','declined','duplicate','fixed','verify_requested','verified','reopened')
 _FEEDBACK_FIELDS = {
@@ -203,13 +204,15 @@ def _subscription_parameters(operation, parameters):
                     else isinstance(item,str) and item in (_SUBSCRIPTION_KINDS if name=='kinds'
                         else _SUBSCRIPTION_ORIGINS if name=='origins' else _WAKE_RULES) for item in value)
         elif name in ('limit','version','after'):
-            minimum,maximum={'limit':(1,100),'version':(1,9007199254740991),'after':(0,9007199254740991)}[name]
+            minimum,maximum={'limit':(1,50 if operation=='list_delivery_attempts' else 100),
+                'version':(1,9007199254740991),'after':(0,9007199254740991)}[name]
             valid=type(value) is int and minimum<=value<=maximum
         elif name=='subscription_id':valid=_subscription_reference(value)
         elif name=='receipt':valid=isinstance(value,str) and 32<=len(value)<=128
         elif name=='timeout':_wait_seconds(value)
         elif name=='request_id':valid=_request_id(value)
         elif name=='receiver_id':valid=value is None or _uuid(value)
+        elif name=='before':valid=_uuid(value)
         elif name=='endpoint_id':valid=(value is None and operation=='configure_subscription_delivery') or _uuid(value)
         elif name=='url':valid=isinstance(value,str) and 1<=len(value)<=2048
         elif name in ('signing_secret','new_secret'):valid=(value is None and name=='new_secret') or _signing_secret(value)
@@ -683,6 +686,12 @@ class Client:
     def test_delivery_endpoint(self, *, endpoint_id, request_id):
         """Send one signed test delivery; the same request_id reads the same test back."""
         return self.call('test_delivery_endpoint',dict(endpoint_id=endpoint_id,request_id=request_id))
+
+    def list_delivery_attempts(self, *, endpoint_id, limit=50, before=None):
+        """Your endpoint's delivery attempts, newest first, kept 7 days; never a body, header value or URL."""
+        arguments=dict(endpoint_id=endpoint_id,limit=limit)
+        if before is not None:arguments['before']=before
+        return self.call('list_delivery_attempts',arguments)
 
     def submit_feedback(self, *, request_id, category, description, operation=None, refs=None):
         """Record bounded private feedback locally. Never forwards or publishes it."""

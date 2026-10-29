@@ -81,7 +81,7 @@ CONSUMPTION_OPERATIONS = frozenset({
     "fetch_subscription_events", "ack_subscription_events", "wait_for_subscription_events",
     "configure_subscription_delivery", "test_subscription", "submit_feedback", "list_feedback",
     "register_delivery_endpoint", "list_delivery_endpoints", "update_delivery_endpoint", "delete_delivery_endpoint",
-    "test_delivery_endpoint",
+    "test_delivery_endpoint", "list_delivery_attempts",
 })
 CONSUMPTION_ERRORS = frozenset({
     "unauthorized", "forbidden", "not_found", "invalid_limit", "invalid_version", "invalid_receipt",
@@ -91,7 +91,7 @@ CONSUMPTION_ERRORS = frozenset({
     "delivery_not_configured", "rate_limited", "invalid_request_id",
     "delivery_disabled", "delivery_policy_unset", "unsafe_endpoint", "invalid_signing_secret", "invalid_header",
     "reserved_header", "rotation_in_progress", "endpoint_limit", "endpoint_conflict", "operator_disabled",
-    "invalid_endpoint_state", "endpoint_paused", "endpoint_auto_paused",
+    "invalid_endpoint_state", "endpoint_paused", "endpoint_auto_paused", "endpoint_test_failed", "invalid_limit",
 })
 # ANYM-519: the endpoint errors' bounded extras. Values are reviewed constants, counters or a header name
 # (never a header value or secret); anything else is dropped.
@@ -100,7 +100,10 @@ ENDPOINT_NEXT_STEPS = frozenset({
     "for a tailnet or private host ask the operator for the wake relay (ANYM-228)",
     "fix the receiver, then call test_delivery_endpoint with a new request_id",
     "ask the operator to enable the endpoint", "call update_delivery_endpoint with action resume",
+    "fix the receiver, then call update_delivery_endpoint with action resume again",
 })
+# ANYM-520: a refused resume's test error, one of the backend's bounded codes (never response text).
+TEST_ERROR = re.compile(r"[a-z_]{1,64}\Z")
 HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}\Z")
 
 
@@ -115,6 +118,12 @@ def endpoint_extras(value):
         result["header"] = value["header"]
     if isinstance(value.get("next_step"), str) and value["next_step"] in ENDPOINT_NEXT_STEPS:
         result["next_step"] = value["next_step"]
+    if isinstance(value.get("test_error"), str) and TEST_ERROR.match(value["test_error"]):
+        result["test_error"] = value["test_error"]
+    if type(value.get("http_status")) is int and 100 <= value["http_status"] <= 599:
+        result["http_status"] = value["http_status"]
+    if type(value.get("version")) is int and 1 <= value["version"] <= 2**53 - 1:
+        result["version"] = value["version"]
     return result
 
 
@@ -270,7 +279,8 @@ def consumption_failure(status, value, header_request_id=None, operation=None):
         field_errors = reviewed_field_errors(operation, value.get("field_errors"))
         if field_errors:
             result["field_errors"] = field_errors
-        if operation.endswith("_delivery_endpoint") or operation in ("list_delivery_endpoints", "configure_subscription_delivery"):
+        if operation.endswith("_delivery_endpoint") or operation in ("list_delivery_endpoints", "list_delivery_attempts",
+                                                                     "configure_subscription_delivery"):
             result.update(endpoint_extras(value))
     return result
 

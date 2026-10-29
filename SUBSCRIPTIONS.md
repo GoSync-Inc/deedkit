@@ -476,9 +476,10 @@ agent picks any public host, with no operator step per agent or per vendor.
 | --- | --- | --- |
 | `register_delivery_endpoint` | `request_id`, `url`, `signing_secret`; optional `label`, `headers` | Check the URL, store the endpoint, send one signed test and wait up to 10 s for it |
 | `list_delivery_endpoints` | none | This key's endpoints that are not deleted, newest first, with `max_endpoints` |
-| `update_delivery_endpoint` | `endpoint_id`, current `version`, `action`; `new_secret` for `rotate_secret`, `headers` for `set_headers` | Rotate the secret, replace headers (`{}` clears), `pause` or `resume` |
+| `update_delivery_endpoint` | `endpoint_id`, current `version`, `action`; `new_secret` for `rotate_secret`, `headers` for `set_headers` | Rotate the secret, replace headers (`{}` clears), `pause` or `resume` (a signed test first, below) |
 | `delete_delivery_endpoint` | `endpoint_id`, current `version` | Delete; bound subscriptions become pull-only |
 | `test_delivery_endpoint` | `endpoint_id`, `request_id` | One signed test delivery, at most one per minute per key |
+| `list_delivery_attempts` | `endpoint_id`; optional `limit` (1–50, default 50), `before` | This key's latest attempts at the endpoint, newest first (schema 61, below) |
 
 `create_subscription` accepts `delivery: {endpoint_id, delivery_policy?}` and
 `configure_subscription_delivery` accepts `endpoint_id` beside `receiver_id` (not
@@ -608,7 +609,7 @@ and records `http_status` and `latency_ms`. Past 10 s the result says
 same `request_id`. A failed test still creates the endpoint (state `enabled`,
 health `failing`), so a retry needs no new request ID.
 
-**States.** `enabled`, `agent_paused`, `auto_paused` (set by S3) and
+**States.** `enabled`, `agent_paused`, `auto_paused` (set by the dispatcher, below) and
 `operator_disabled`. The agent may pause, and resume from `agent_paused` or
 `auto_paused`; resume and test on `operator_disabled` answer `operator_disabled`.
 Only the operator disables or enables (`deedkit admin delivery-endpoints list |
@@ -709,17 +710,88 @@ newest delivered test, so only a delivery clears it (a later `outcome_unknown`, 
 receiver or budget failure does not). `http_status` appears only when the refusal was a
 test. `next_step` names the cause, the stored header names (never values) and the calls
 for the endpoint's state: replace the headers with `set_headers` (it replaces every
-header), resume a paused endpoint, then call `test_delivery_endpoint`; a delivered test
-confirms the new key and clears the signal. Only the operator re-enables an
-`operator_disabled` endpoint. The signal carries no header value, URL, response body or
-hint payload. It is per endpoint: rotate every endpoint that shares a key. Until
-ANYM-520 puts it in `get_subscription` and the wait/fetch responses, a pushed agent
-sees it only by calling `list_delivery_endpoints` on its own schedule, so a silent
-routine is the symptom.
+header), then call `test_delivery_endpoint`, or for a paused endpoint `resume`, which
+sends the signed test itself (ANYM-520); a delivered test confirms the new key and clears
+the signal. Only the operator re-enables an `operator_disabled` endpoint. The signal
+carries no header value, URL, response body or hint payload. It is per endpoint: rotate
+every endpoint that shares a key. It is also `delivery_health.last_error` in
+`get_subscription` and every wait and fetch response (below).
 A 429 is an "other status": the bounded retry spends its attempts in minutes. A lost
 wake loses no event: the
 routine also keeps a schedule trigger that fetches and ACKs. Other endpoints and
 operator receivers keep at-least-once delivery.
+
+### Delivery attempts, health and auto-pause (schema 61, ANYM-520)
+
+**Attempt log.** The dispatcher writes one `delivery_attempts` row for each attempt at an
+endpoint hint, and one for a hint it settles without a POST (an expired lease, an exhausted
+budget, an expired module event, an auto-pause). `list_delivery_attempts(endpoint_id,
+limit<=50, before?)` returns the key's own rows newest first: `attempt_id`, `at`, `hint_id`,
+`subscription_id`, `attempt` (the hint's attempt number), `outcome` (`delivered`, `retry`,
+`dead_letter`, `cancelled`, `paused`), `http_status` when the receiver answered,
+`error_code` and `latency_ms`. Error codes name the failure, never its text: `timeout`,
+`tls`, `connect`, `dns_unsafe`, `dns_unavailable`, `egress_unavailable`,
+`invalid_response`, `redirect`, or the hint's own code (`vendor_refused`,
+`outcome_unknown`, `receiver_status`, `delivery_budget_exhausted`, ...). No response body,
+header value or URL is stored or returned. `has_more` and `next_before` page to older
+rows. **Retention:** rows older than 7 days are never listed, and the dispatcher deletes
+them, at most 1000 per pass. A failed attempt-log write never fails the hint (its own
+savepoint, logged as `delivery_attempt_record_failed`).
+
+**Health in every read.** `list_delivery_endpoints` (and `register` and `update`) carry
+`delivery_health` for each endpoint, and so does `delivery` in `get_subscription` and in
+every `fetch_subscription_events` and `wait_for_subscription_events` response for a
+subscription bound to an endpoint: `{state, consecutive_failures, last_success,
+last_error, next_step}`. `state` is the endpoint's `agent_paused`, `auto_paused` or
+`operator_disabled`; an enabled endpoint is `failing` while it has a failed attempt since
+its last success, a vendor refusal (`last_error`, ANYM-583), or a test that failed after
+its last success, else `ok`. `consecutive_failures` counts the retried and dead-lettered
+attempts since `last_success`, the newest delivered hint or test. `next_step` names the
+exact call the state accepts: `test_delivery_endpoint` for a failing endpoint,
+`update_delivery_endpoint(..., action="resume")` for a paused one, the operator for an
+`operator_disabled` one, null when `ok`. It comes from the same function as
+`last_error.next_step`, so the two never disagree.
+
+**Pause rule.** After 3 dead-lettered hints since the last success, or once the first
+failed attempt since the last success is 24 hours old (hints were due for a day without a
+success), the dispatcher moves an `enabled` endpoint to `auto_paused` (version + 1) and
+cancels its queued hints (`endpoint_auto_paused`, each logged as `paused`) and tests.
+Events stay fetchable and nothing is ACKed. The rule runs after each pass with a failed
+attempt, under the endpoint's lock taken exclusive without waiting: an attempt still in
+flight skips the endpoint until the next pass, so the rule reads every finished attempt and
+never races an agent's pause, resume or delete.
+The dispatcher role gains only `UPDATE(state, version, updated_at)` on
+`delivery_endpoints` and `SELECT, INSERT, DELETE` on `delivery_attempts`
+(`delivery_role.sql`); the API role reads `delivery_attempts` (`gateway_role.sql`).
+
+**Resume path.** `update_delivery_endpoint(action="resume")` from `agent_paused` or
+`auto_paused` stages one signed test (`{type: "test"}`, the per-key test rate applies)
+while the endpoint stays paused, and waits up to 10 s for it. The endpoint version is the
+resume's identity: one test per version. Delivered: the endpoint is `enabled` again
+(version + 1), and every bound subscription of the key with events above its ACK position
+(a dynamic one: a reference there the key still sees) gets one `events` hint at once, past
+the key's queue cap (`woken_subscriptions`); quiet hours, the budget and the scope recheck
+(from the ACK position) still apply at dispatch. Failed: `endpoint_test_failed` with the
+test's `test_error`, `http_status` and the endpoint's `version` (the dispatcher moves a
+paused endpoint one version on once its resume test failed, at the latest on its next
+pass); the endpoint stays paused. Repeating that resume with the old version returns the same refusal and sends
+nothing, so a test whose answer was lost is never sent twice; a resume with the new
+version sends a new test. Still pending after 10 s: the endpoint stays paused and
+`test.next_step` names the same resume call, which reads that test back and finishes the
+resume once it is delivered. A test the dispatcher cancelled before sending it is staged
+again by the same call. A subscription another call holds refuses the resume with
+`service_busy` (retry; the endpoint stays paused). Resume never clears `operator_disabled`.
+The dispatcher sends a resume's test to a paused endpoint only from schema 61; the release
+order promotes the serving API after it, and a rollback goes plan B before plan A
+(docs/operations/production.md, Roll back the current release).
+
+**Budget and operator view.** `messages_capabilities` shows the webhook transport's
+`hint_budget`: `per_hour` (`SUBSCRIPTION_MAX_HINTS_PER_HOUR`) and `remaining_this_hour`,
+the fewer of the hints the key may still commit and still admit in the rolling hour (null
+when that optional read fails). `deedkit admin delivery-endpoints list` shows each
+endpoint's `delivery_health` and `last_error`, the owning `principal`, `key_id` and the
+principal's `key_label` from the private admin labels file, and `endpoints_by_state` counts
+the listed endpoints by health state.
 
 ## Host receivers (wake relay)
 

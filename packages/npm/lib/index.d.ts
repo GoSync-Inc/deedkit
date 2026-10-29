@@ -302,6 +302,8 @@ export declare class AnyMsgClient {
   deleteDeliveryEndpoint(args: {endpoint_id:string; version:number}, options?: {signal?:AbortSignal}): Promise<Record<string,unknown>>;
   /** One signed test delivery; the same request_id reads the same test back. */
   testDeliveryEndpoint(args: {endpoint_id:string; request_id:string}, options?: {signal?:AbortSignal}): Promise<Record<string,unknown>>;
+  /** Your endpoint's delivery attempts, newest first, kept 7 days; never a body, header value or URL. */
+  listDeliveryAttempts(args: {endpoint_id:string; limit?:number; before?:string}, options?: {signal?:AbortSignal}): Promise<Record<string,unknown>>;
   /** Store local private feedback; never forwards or publishes the description. */
   submitFeedback(args: PrivateFeedback, options?: {signal?:AbortSignal}): Promise<Record<string,unknown>>;
   /** Only the current credential's records, without former source references. */

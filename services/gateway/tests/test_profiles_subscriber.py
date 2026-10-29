@@ -17,7 +17,7 @@ SUBSCRIBER = READER + ["messages_create_subscription", "messages_update_subscrip
 # ANYM-519: the subscriber profile also registers its own webhook endpoints.
 ENDPOINT_TOOLS = ["messages_register_delivery_endpoint", "messages_list_delivery_endpoints",
                   "messages_update_delivery_endpoint", "messages_delete_delivery_endpoint",
-                  "messages_test_delivery_endpoint"]
+                  "messages_test_delivery_endpoint", "messages_list_delivery_attempts"]
 
 
 def tools(name):
@@ -41,11 +41,11 @@ def test_subscriber_profile_gains_delivery_write_tools_and_reader_stays_without_
     subscriber, reader = tools("messaging-subscriber"), tools("messaging-reader")
     assert subscriber[-len(ENDPOINT_TOOLS):] == ENDPOINT_TOOLS and len(set(subscriber)) == len(subscriber)
     assert not set(ENDPOINT_TOOLS) & set(reader)
-    # delivery-write is a new permission: only these five tools need it, and no reader tool does.
+    # delivery-write is a new permission: only these six tools need it, and no reader tool does.
     needs = {name for name, tool in CATALOG.items() if "delivery-write" in tool["scopes"]}
     assert needs == set(ENDPOINT_TOOLS)
     assert all(CATALOG[name]["scopes"] == ["read", "delivery-write"] for name in ENDPOINT_TOOLS)
     assert not any("delivery-write" in CATALOG[name]["scopes"] for name in reader)
-    # Only list is a read; the other four change state.
+    # Only the two lists are reads; the other four change state.
     assert {name for name in ENDPOINT_TOOLS if CATALOG[name]["annotations"]["readOnlyHint"]} == {
-        "messages_list_delivery_endpoints"}
+        "messages_list_delivery_endpoints", "messages_list_delivery_attempts"}

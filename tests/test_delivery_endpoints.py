@@ -319,6 +319,11 @@ def test_states_operator_disable_and_configuring_a_paused_endpoint(gate, policy)
     assert refused.value.state == 'agent_paused' and 'resume' in refused.value.next_step
     with pytest.raises(APIError, match='invalid_parameters'):
         store.configure_subscription_delivery(token, sid, 1, '00000000-0000-4000-8000-000000000000', None, eid)
+    # ANYM-520: a resume sends a signed test first and re-arms only once it is delivered.
+    age(store)
+    resuming = store.update_delivery_endpoint(token, eid, 2, 'resume')
+    assert (resuming['state'], resuming['test']['test_status']) == ('agent_paused', 'pending')
+    dispatch_hints(store, transport=lambda *a, **k: 204, resolver=PUBLIC)
     assert store.update_delivery_endpoint(token, eid, 2, 'resume')['state'] == 'enabled'
     with pytest.raises(APIError, match='invalid_endpoint_state'):
         store.update_delivery_endpoint(token, eid, 3, 'resume')
@@ -336,7 +341,7 @@ def test_states_operator_disable_and_configuring_a_paused_endpoint(gate, policy)
         store.set_delivery_endpoint_operator_state(eid, True)
     assert store.list_delivery_endpoints(token)['items'][0]['state'] == 'enabled'
     with store.pool.connection() as c:
-        assert c.execute('SELECT state,error_code FROM delivery_endpoint_tests').fetchone() == \
+        assert c.execute("SELECT state,error_code FROM delivery_endpoint_tests WHERE request_id NOT LIKE 'resume/%%'").fetchone() == \
             {'state': 'cancelled', 'error_code': 'endpoint_paused'}
 
 
@@ -709,11 +714,150 @@ def test_endpoint_silence_hint_and_recovery_from_auto_paused(gate, policy, monke
             call()
         assert refused.value.state == 'auto_paused' and 'resume' in refused.value.next_step
     version = store.list_delivery_endpoints(token)['items'][0]['version']
+    age(store)
+    assert store.update_delivery_endpoint(token, eid, version, 'resume')['state'] == 'auto_paused'
+    dispatch_hints(store, transport=lambda *a, **k: 204, resolver=PUBLIC)
     assert store.update_delivery_endpoint(token, eid, version, 'resume')['state'] == 'enabled'
     assert store.configure_subscription_delivery(token, other, 1, None, None, eid)['delivery']['target'] == 'endpoint'
     with store.pool.connection() as c:
         c.execute("UPDATE delivery_endpoints SET state='auto_paused' WHERE id=%s", (eid,))
     assert store.update_delivery_endpoint(token, eid, version + 1, 'pause')['state'] == 'agent_paused'
+
+
+def due_now(store):
+    with store.pool.connection() as c:
+        c.execute("UPDATE subscription_outbox SET next_attempt_at=clock_timestamp() WHERE state='pending'")
+
+
+# spec: ANYM-520
+def test_attempt_log_lists_each_attempt_with_its_status_or_error_code_and_nothing_else(gate, policy):
+    from messaging_service.delivery_endpoints import EgressNotSent
+    store = gate
+    token = identity(store)
+    eid = register(store, token)['endpoint_id']
+    with store.pool.connection() as c:
+        c.execute("UPDATE delivery_endpoint_tests SET state='cancelled'")
+    sid = store.create_subscription(token, ['telegram-demo-chat'], delivery={'endpoint_id': eid})['subscription_id']
+    emit(store)
+    match_subscriptions(store)
+    answers = [TimeoutError(), EgressNotSent('receiver_tls_failed'), 500, 204]
+    def receiver(url, body, headers, **kwargs):
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+    for _ in range(4):
+        due_now(store)
+        dispatch_hints(store, transport=receiver, resolver=PUBLIC)
+    page = store.list_delivery_attempts(token, eid)
+    items = page['items']
+    assert [(i['outcome'], i['attempt'], i['http_status'], i['error_code']) for i in items] == [
+        ('delivered', 4, 204, None), ('retry', 3, 500, None), ('retry', 2, None, 'tls'), ('retry', 1, None, 'timeout')]
+    assert {i['subscription_id'] for i in items} == {sid} and len({i['hint_id'] for i in items}) == 1
+    assert all(type(i['latency_ms']) is int and i['latency_ms'] >= 0 for i in items)
+    assert set(items[0]) == {'attempt_id', 'at', 'hint_id', 'subscription_id', 'attempt', 'outcome', 'http_status',
+        'error_code', 'latency_ms'}
+    assert URL not in json.dumps(page) and (page['has_more'], page['retention_days']) == (False, 7)
+    first = store.list_delivery_attempts(token, eid, limit=2)
+    assert (first['items'], first['has_more'], first['next_before']) == (items[:2], True, items[1]['attempt_id'])
+    rest = store.list_delivery_attempts(token, eid, limit=2, before=first['next_before'])
+    assert (rest['items'], rest['has_more'], rest['next_before']) == (items[2:], False, None)
+    for kwargs, code in (({'limit': 51}, 'invalid_limit'), ({'limit': 0}, 'invalid_limit'),
+            ({'before': '00000000-0000-4000-8000-000000000000'}, 'invalid_parameters'), ({'before': 'x'}, 'invalid_parameters')):
+        with pytest.raises(APIError, match=code):
+            store.list_delivery_attempts(token, eid, **kwargs)
+    with pytest.raises(APIError, match='not_found'):
+        store.list_delivery_attempts(identity(store, 'other-agent'), eid)
+    # Older than 7 days: never listed, and the dispatcher's next pass deletes them.
+    with store.pool.connection() as c:
+        c.execute("UPDATE delivery_attempts SET created_at=created_at-interval '7 days 1 minute'")
+    assert store.list_delivery_attempts(token, eid)['items'] == []
+    dispatch_hints(store, transport=receiver, resolver=PUBLIC)
+    with store.pool.connection() as c:
+        assert c.execute('SELECT count(*) AS n FROM delivery_attempts').fetchone()['n'] == 0
+
+
+# spec: ANYM-520
+def test_attempt_error_codes_name_the_failure_never_its_text():
+    import ssl
+    from messaging_service.delivery_endpoints import EgressNotSent, attempt_error
+    assert attempt_error(failure=TimeoutError('synthetic detail')) == 'timeout'
+    assert attempt_error(failure=EgressNotSent('receiver_deadline')) == 'timeout'
+    assert attempt_error(failure=ssl.SSLCertVerificationError('synthetic detail')) == 'tls'
+    assert attempt_error(failure=EgressNotSent('receiver_tls_failed')) == 'tls'
+    assert attempt_error(failure=EgressNotSent('receiver_connect_failed')) == 'connect'
+    assert attempt_error(failure=EgressNotSent('egress_proxy_unavailable')) == 'egress_unavailable'
+    assert attempt_error(failure=ValueError('unsafe_receiver')) == 'dns_unsafe'
+    assert attempt_error(failure=ValueError('invalid_receiver_response')) == 'invalid_response'
+    assert attempt_error(problem='unsafe_endpoint', error='unsafe_endpoint') == 'dns_unsafe'
+    assert attempt_error(problem='receiver_unavailable', error='receiver_unavailable') == 'dns_unavailable'
+    assert attempt_error(301, error='redirect_rejected') == 'redirect'
+    assert attempt_error(204) is None and attempt_error(500, error='receiver_unavailable') is None
+    assert attempt_error(401, error='vendor_refused') == 'vendor_refused'
+
+
+def instructions(text, version):
+    """Each `tool(arguments)` call of a next_step text, its placeholders filled in for this endpoint."""
+    import ast
+    import re
+    filled = {'<version>': str(version), '<new request id>': 'health-request-' + str(version)}
+    calls = []
+    for tool, arguments in re.findall(r'`(\w+)\((.*?)\)`', text or ''):
+        for placeholder, value in filled.items():
+            arguments = arguments.replace(placeholder, value)
+        assert '<' not in arguments, arguments
+        call = ast.parse(f'f({arguments})', mode='eval').body
+        calls.append((tool, {k.arg: ast.literal_eval(k.value) for k in call.keywords}))
+    return calls
+
+
+# spec: ANYM-520
+def test_delivery_health_is_in_every_read_and_each_next_step_is_a_call_the_state_accepts(gate, policy):
+    from messaging_service.subscription_consumption import wait_for_subscription_events
+    store = gate
+    token = identity(store)
+    eid = register(store, token)['endpoint_id']
+    dispatch_hints(store, transport=lambda *a, **k: 204, resolver=PUBLIC)
+    sid = store.create_subscription(token, ['telegram-demo-chat'], delivery={'endpoint_id': eid})['subscription_id']
+    def reads():
+        listed = store.list_delivery_endpoints(token)['items'][0]
+        views = [listed['delivery_health'], store.get_subscription(token, sid)['delivery']['delivery_health'],
+            store.fetch_subscription_events(token, sid)['subscription']['delivery']['delivery_health'],
+            asyncio.run(wait_for_subscription_events(store, token, sid, timeout=0))['subscription']['delivery'][
+                'delivery_health']]
+        assert all(view == views[0] for view in views), views
+        return listed, views[0]
+    listed, health = reads()
+    assert (health['state'], health['consecutive_failures'], health['last_error'], health['next_step']) == (
+        'ok', 0, None, None) and health['last_success'] == listed['last_test']['finished_at']
+    emit(store)
+    match_subscriptions(store)
+    dispatch_hints(store, transport=lambda *a, **k: 500, resolver=PUBLIC)
+    listed, health = reads()
+    assert (health['state'], health['consecutive_failures']) == ('failing', 1)
+    assert store.list_delivery_endpoints_admin()['endpoints_by_state'] == {'failing': 1}
+    age(store)
+    [(tool, arguments)] = instructions(health['next_step'], listed['version'])
+    assert tool == 'test_delivery_endpoint' and arguments['endpoint_id'] == eid
+    assert store.test_delivery_endpoint(token, **arguments)['test_status'] == 'pending'
+    paused = store.update_delivery_endpoint(token, eid, listed['version'], 'pause')
+    for state in ('agent_paused', 'auto_paused'):
+        with store.pool.connection() as c:
+            c.execute('UPDATE delivery_endpoints SET state=%s WHERE id=%s', (state, eid))
+        listed, health = reads()
+        assert health['state'] == state and health['consecutive_failures'] == 1
+        [(tool, arguments)] = instructions(health['next_step'], listed['version'])
+        assert (tool, arguments) == ('update_delivery_endpoint', {'endpoint_id': eid, 'version': paused['version'],
+            'action': 'resume'})
+        age(store)
+        assert store.update_delivery_endpoint(token, **arguments)['test']['test_status'] == 'pending'
+        with store.pool.connection() as c:
+            c.execute("UPDATE delivery_endpoint_tests SET state='cancelled' WHERE state='pending'")
+    store.set_delivery_endpoint_operator_state(eid, False)
+    listed, health = reads()
+    assert health['state'] == 'operator_disabled' and instructions(health['next_step'], listed['version']) == []
+    assert 'only the operator can re-enable it' in health['next_step']
+    assert store.list_delivery_endpoints_admin()['endpoints_by_state'] == {'operator_disabled': 1}
 
 
 def features_cli(store, tmp_path, monkeypatch, capsys, *args):

@@ -1034,6 +1034,12 @@ ran before it, from `<state>/<sha>/<project>.before.json`. It does not call
 `promotable()` (the previous revision is no longer current `main`), does not run or
 reverse migrations and does not restore data: when the release changed the
 schema or data, follow the module's backup and migration runbook instead.
+After an A+B promotion (`apply`, then `seamless_release.py promote` of the serving API),
+roll back plan B before plan A: this rollback does not check plan B, and a new serving API
+next to plan A's previous workers can ask them for what they lack. Messaging schema 61
+(ANYM-520): a paused endpoint's resume then refuses on every try (`endpoint_test_failed`,
+`access_or_configuration_changed`), the endpoint stays paused and nothing is lost or sent
+twice, until both plans run the same release again. The guard is ANYM-642.
 Messaging migration 050 (`manual`, ANYM-534) adds `component_heartbeats`: one row each for the
 API, the matcher and the dispatcher (package version, schema), each role limited to its own row by
 row-level security. Additive; older runtimes write nothing there. With it the matcher and the

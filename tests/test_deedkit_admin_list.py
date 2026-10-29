@@ -473,6 +473,29 @@ def test_the_deedkit_launcher_routes_admin_to_the_admin_cli(stores, capsys, monk
 
 
 
+# spec: ANYM-520
+def test_delivery_endpoints_list_shows_health_and_the_owners_key_label(tmp_path, capsys):
+    labels = tmp_path / "labels.json"
+    labels.write_text(json.dumps({"version": 1, "labels": {"endpoint-agent": "Synthetic agent"}}))
+    labels.chmod(0o600)
+    config = tmp_path / "admin.json"
+    config.write_text(json.dumps({"labels": str(labels)}))
+    config.chmod(0o600)
+    health = {"state": "failing", "consecutive_failures": 2, "last_success": None,
+              "last_error": None, "next_step": "Fix the receiver"}
+    def run(service, args, data=None):
+        return {"items": [{"endpoint_id": "synthetic-1", "principal": "endpoint-agent", "key_id": "synthetic-key",
+                           "delivery_health": health, "last_error": None},
+                          {"endpoint_id": "synthetic-2", "principal": "unlabelled-agent", "key_id": "synthetic-key-2",
+                           "delivery_health": {**health, "state": "ok", "consecutive_failures": 0}}],
+                "endpoints_by_state": {"failing": 1, "ok": 1}}
+    assert admin.main(["--config", str(config), "delivery-endpoints", "list"], run=run) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert [(item["principal"], item["key_label"]) for item in listed["items"]] == [
+        ("endpoint-agent", "Synthetic agent"), ("unlabelled-agent", None)]
+    assert listed["items"][0]["delivery_health"] == health and listed["endpoints_by_state"] == {"failing": 1, "ok": 1}
+
+
 # spec: ANYM-519
 def test_delivery_endpoints_list_disable_enable_run_the_messaging_operator_commands(tmp_path, capsys):
     config = tmp_path / "admin.json"

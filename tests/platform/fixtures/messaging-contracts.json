@@ -3900,7 +3900,7 @@
         "openWorldHint": false,
         "readOnlyHint": false
       },
-      "description": "Version-checked change of your own endpoint: rotate_secret (new_secret), set_headers (headers; {} clears), pause or resume.\n\nRequires read + explicit delivery-write. During a rotation deliveries carry both signatures for 24 hours,\nthen the new secret alone. Resume works from agent_paused or auto_paused; only the operator lifts\noperator_disabled. Write-only values are never returned.\n",
+      "description": "Version-checked change of your own endpoint: rotate_secret (new_secret), set_headers (headers; {} clears), pause or resume.\n\nRequires read + explicit delivery-write. During a rotation deliveries carry both signatures for 24 hours,\nthen the new secret alone. Resume works from agent_paused or auto_paused: it sends one signed test, waits\nup to 10 s, and re-arms the endpoint only once the test is delivered (else endpoint_test_failed, or the test\npending with the same resume call to repeat); each bound subscription with unACKed events then gets one\nhint at once. Only the operator lifts operator_disabled. Write-only values are never returned.\n",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -3967,6 +3967,55 @@
       "outputSchema": {
         "additionalProperties": true,
         "title": "update_delivery_endpointDictOutput",
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "List your own endpoint's latest delivery attempts, newest first: time, hint and subscription IDs, attempt number, outcome (delivered, retry, dead_letter, cancelled, paused), HTTP status or error code, latency_ms.\n\nRequires read + explicit delivery-write. Kept 7 days; no response body, header value or URL. Pass the\nprevious page's next_before as before for older attempts.\n",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "before": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Before"
+          },
+          "endpoint_id": {
+            "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+            "title": "Endpoint Id",
+            "type": "string"
+          },
+          "limit": {
+            "default": 50,
+            "maximum": 50,
+            "minimum": 1,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "endpoint_id"
+        ],
+        "title": "list_delivery_attemptsArguments",
+        "type": "object"
+      },
+      "name": "list_delivery_attempts",
+      "outputSchema": {
+        "additionalProperties": true,
+        "title": "list_delivery_attemptsDictOutput",
         "type": "object"
       }
     },

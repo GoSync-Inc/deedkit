@@ -229,7 +229,7 @@ def test_webhook_policy_unset_then_a_bound_self_service_endpoint(seeded,tmp_path
         hook=transports(s,token)['webhook']
         assert hook['reason']=='no_receiver_bound' and hook['registration']=='self_service'
         assert hook['self_service']['tools']==['register_delivery_endpoint','list_delivery_endpoints',
-            'update_delivery_endpoint','delete_delivery_endpoint','test_delivery_endpoint']
+            'update_delivery_endpoint','delete_delivery_endpoint','test_delivery_endpoint','list_delivery_attempts']
         endpoint=register(s,token)
         s.create_subscription(token,['telegram-demo-chat'],delivery={'endpoint_id':endpoint['endpoint_id']})
         hook=transports(s,token)['webhook']
@@ -240,6 +240,46 @@ def test_webhook_policy_unset_then_a_bound_self_service_endpoint(seeded,tmp_path
         caps=s.capabilities(token)
         assert {'register_delivery_endpoint','test_delivery_endpoint'}<=set(caps['available'])
         assert 'register_delivery_endpoint' not in s.capabilities(s.issue_key('endpoint-legacy',['telegram-demo']))['available']
+    finally:
+        s.set_delivery_features(False)
+
+
+# spec: ANYM-520
+def test_webhook_shows_the_keys_hourly_hint_budget_and_the_slots_left(seeded,tmp_path,monkeypatch):
+    from test_event_delivery import endpoint_setup
+    s,_,_=seeded
+    monkeypatch.setenv('SUBSCRIPTION_MAX_HINTS_PER_HOUR','5')
+    token,_,_,_=endpoint_setup(s,tmp_path,monkeypatch)
+    try:
+        # The matcher committed one hint for this key; another key has its whole budget.
+        assert transports(s,token)['webhook']['hint_budget']=={'per_hour':5,'remaining_this_hour':4,
+            'window':'rolling_hour'}
+        other=s.issue_key('budget-other',['telegram-demo'],permissions=['read'])
+        assert transports(s,other)['webhook']['hint_budget']['remaining_this_hour']==5
+        # An admission counts in the same rolling hour; an hour later the slot is back.
+        with s.pool.connection() as c:
+            c.execute("UPDATE subscription_outbox SET created_at=clock_timestamp()-interval '61 minutes',"
+                "admitted_at=clock_timestamp()")
+        assert transports(s,token)['webhook']['hint_budget']['remaining_this_hour']==4
+        with s.pool.connection() as c:
+            c.execute("UPDATE subscription_outbox SET admitted_at=clock_timestamp()-interval '61 minutes'")
+        assert transports(s,token)['webhook']['hint_budget']['remaining_this_hour']==5
+    finally:
+        s.set_delivery_features(False)
+
+
+# spec: ANYM-520
+def test_an_invalid_hint_budget_setting_leaves_capabilities_answering(seeded,tmp_path,monkeypatch):
+    from test_event_delivery import endpoint_setup
+    s,_,_=seeded
+    token,_,_,_=endpoint_setup(s,tmp_path,monkeypatch)
+    try:
+        # The gateway admits every messaging call through capabilities: an optional diagnostic never fails them.
+        for value in ('many','0'):
+            monkeypatch.setenv('SUBSCRIPTION_MAX_HINTS_PER_HOUR',value)
+            webhook=transports(s,token)['webhook']
+            assert webhook['hint_budget']=={'per_hour':None,'remaining_this_hour':None,'window':'rolling_hour'}
+            assert webhook['authorized'] and webhook['configured']
     finally:
         s.set_delivery_features(False)
 
