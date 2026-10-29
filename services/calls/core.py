@@ -4,9 +4,11 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import threading
+import time
 import uuid
-from datetime import datetime,timezone
+from datetime import datetime,timedelta,timezone
 from functools import cache
 from importlib.metadata import version
 from pathlib import Path
@@ -15,12 +17,15 @@ from zoneinfo import ZoneInfo,ZoneInfoNotFoundError,available_timezones
 
 from pydantic import AfterValidator,BaseModel,ConfigDict,Field,PrivateAttr,field_validator,model_validator
 
+import call_events
+
 PROMPT_VERSION="2026-10-14.task-v7"
 MODEL="gemini-3.8-live"
 # Call records name the Pipecat release actually installed, not a literal (ANYM-617).
 ENGINE="Pipecat "+version("pipecat-ai")
 GROK_MODEL="grok-voice-3.0"
 ACTIVE={"waiting_for_browser","dialing","ringing","connecting","active"}
+EXPIRY_INTERVAL_S=30
 
 
 INBOUND_KEYS=('input_active_ms','input_frames','input_pcm_ms','input_zero_frames')
@@ -405,6 +410,9 @@ class VoiceService:
         self.db.execute("CREATE TABLE IF NOT EXISTS calls (id TEXT PRIMARY KEY, brief_id TEXT UNIQUE NOT NULL, body TEXT NOT NULL)")
         self.db.execute('CREATE TABLE IF NOT EXISTS voice_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE, call_id TEXT, body TEXT NOT NULL)')
         self.db.execute('CREATE INDEX IF NOT EXISTS voice_events_call ON voice_events(call_id,seq)')
+        self.journal_id,journal_started=call_events.create(self.db)
+        self._expiry_checked=None
+        calls=[]
         for identity,body in self.db.execute("SELECT id,body FROM calls").fetchall():
             value=json.loads(body)
             if not value.get('event_storage'):
@@ -420,7 +428,11 @@ class VoiceService:
                 for consultation in value.get('consultations',[]):
                     if consultation['status']=='pending':
                         consultation.update(status='interrupted',ended_at=now())
+                call_events.record_terminal(self.db,value)
                 self.db.execute("UPDATE calls SET body=? WHERE id=?",(json.dumps(value),identity))
+            calls.append(value)
+        # A terminal save whose event write failed gets its row now (idempotent by event key).
+        call_events.repair(self.db,calls,journal_started,ACTIVE)
         self.db.commit()
         from learning import Learning
         self.learning=Learning(self)
@@ -642,6 +654,8 @@ class VoiceService:
                     v['handover_failure']=HANDOVER_FAILURE
                 if v['outcome']=='needs_summary' and any(d['status']=='answered' for d in v['decisions']):
                     v['outcome']='followup_ready'
+                # The terminal event commits with the terminal state; its failure is logged only (ANYM-563).
+                call_events.record_terminal(self.db,v)
                 self._save_call(v)
             return v
 
@@ -937,7 +951,10 @@ class VoiceService:
         conditions=self._conditions(v)
         for decision in v['decisions']:
             if decision['status']!='superseded' and decision.get('conditions')!=conditions:
+                was=decision['status']
                 decision.update(status='superseded',superseded_at=now(),superseded_reason='conditions_changed')
+                if was=='pending':
+                    call_events.record_owner_request(self.db,v,decision,'superseded',decision['superseded_at'])
                 self._event(v,{'kind':'decision_superseded','decision_id':decision['id'],
                                'reason':'conditions_changed'})
 
@@ -951,15 +968,21 @@ class VoiceService:
             raise ServiceError('decision_limit')
         for previous in v['decisions']:
             if previous['status']!='superseded':
+                was=previous['status']
                 previous.update(status='superseded',superseded_at=now(),superseded_reason='new_round')
+                if was=='pending':
+                    call_events.record_owner_request(self.db,v,previous,'superseded',previous['superseded_at'])
                 self._event(v,{'kind':'decision_superseded','decision_id':previous['id'],'reason':'new_round'})
+        created=datetime.now(timezone.utc)
         decision={'id':str(uuid.uuid4()),'question':question,'options':options,'status':'pending',
-                  'created_at':now(),'conditions':conditions,'round':len(v['decisions'])+1,'trigger':trigger,
+                  'created_at':created.isoformat(),'expires_at':(created+timedelta(seconds=call_events.DECISION_TTL_S)).isoformat(),
+                  'conditions':conditions,'round':len(v['decisions'])+1,'trigger':trigger,
                   'conditions_sha256':hashlib.sha256(json.dumps(conditions,sort_keys=True,ensure_ascii=False).encode()).hexdigest()}
         v['decisions'].append(decision)
         v['outcome']='needs_owner'
         self._event(v,{'kind':'decision_requested','decision_id':decision['id'],'round':decision['round'],
                        'trigger':trigger,'conditions':conditions})
+        call_events.record_owner_request(self.db,v,decision,'pending',decision['created_at'])
         return decision
 
     def _required_decision(self,v):
@@ -1347,6 +1370,10 @@ class VoiceService:
             d=next((x for x in v["decisions"] if x["id"]==decision_id),None)
             if not d:
                 raise ServiceError("decision_not_found",404)
+            if self._expire_due(v):
+                self._save_call(v,report=False)
+            if d['status']=='expired':
+                raise ServiceError('decision_expired')
             if d["status"] != "pending":
                 if d['status']=='superseded':
                     raise ServiceError('decision_superseded')
@@ -1357,11 +1384,69 @@ class VoiceService:
             if v['outcome'] not in {'refused','unavailable'}:
                 v['outcome']='needs_owner' if any(x['status']=='pending' for x in v['decisions']) else ('needs_summary' if v['status'] in ACTIVE else 'followup_ready')
             self._event(v,{"kind":"owner_decision","decision_id":decision_id,"answer":answer})
+            call_events.record_owner_request(self.db,v,d,'answered',d['answered_at'])
             self._save_call(v)
             return d
 
+    def _expire_due(self,v):
+        """Expire the pending decisions of an ended call whose deadline passed; True when one changed.
+
+        Never raises and never touches a live call: a failure leaves the decision pending (logged).
+        """
+        if v['status'] in ACTIVE:
+            return False
+        changed=False
+        for d in v['decisions']:
+            try:
+                if d['status']!='pending' or datetime.fromisoformat(call_events.deadline(d))>datetime.fromisoformat(now()):
+                    continue
+            except Exception as error:
+                print(json.dumps({'error':'decision_expiry_unreadable','class':type(error).__name__}),file=sys.stderr,flush=True)
+                continue
+            d.update(status='expired',expired_at=now())
+            self._event(v,{'kind':'decision_expired','decision_id':d['id']})
+            call_events.record_owner_request(self.db,v,d,'expired',d['expired_at'])
+            changed=True
+        if changed and v['outcome']=='needs_owner' and not any(d['status']=='pending' for d in v['decisions']):
+            v['outcome']='unresolved'
+        return changed
+
+    def expire_decisions(self):
+        """Lazy expiry of owner requests past their deadline (ANYM-563): ended calls with a pending decision only."""
+        with self.lock:
+            try:
+                rows=self.db.execute("""SELECT id FROM calls WHERE json_extract(body,'$.status') NOT IN (?,?,?,?,?)
+                    AND EXISTS (SELECT 1 FROM json_each(calls.body,'$.decisions') WHERE json_extract(value,'$.status')='pending')""",
+                    tuple(sorted(ACTIVE))).fetchall()
+                for identity, in rows:
+                    v=self.get_call(identity)
+                    if self._expire_due(v):
+                        self._save_call(v,report=False)
+            except Exception as error:
+                self.db.rollback()
+                print(json.dumps({'error':'decision_expiry_failed','class':type(error).__name__}),file=sys.stderr,flush=True)
+
+    def events_head(self):
+        with self.lock:
+            return {'journal_id':self.journal_id,'head':call_events.head(self.db)}
+
+    def _expire_soon(self):
+        """The inbox and the events read run expiry at most once in EXPIRY_INTERVAL_S; an answer checks its own."""
+        moment=time.monotonic()
+        if self._expiry_checked is None or moment-self._expiry_checked>=EXPIRY_INTERVAL_S:
+            self._expiry_checked=moment
+            self.expire_decisions()
+
+    def events_page(self,after,limit,include_rehearsal=False):
+        """GET /v1/events: one bounded page (call_events.page)."""
+        self._expire_soon()
+        with self.lock:
+            last,rows=call_events.scan(self.db,after)
+        return call_events.page(self.journal_id,after,limit,last,rows,include_rehearsal)
+
     def decision_inbox(self,limit=100,offset=0,*,owner_principal=None):
         """Read durable requests without requiring a live conversation or notifications."""
+        self._expire_soon()
         with self.lock:
             items=[]
             # Page decisions, not calls: old unresolved requests must remain reachable.

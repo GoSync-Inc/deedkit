@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from fastapi.responses import JSONResponse
 
 from anymsg import AnyMsg
+import call_events
 from core import AgentBrief, ServiceError
 from outbound import AgentExternalBrief
 import destination_policy as policy
@@ -99,6 +100,8 @@ METHODS = {
 # call prepares its brief too: the gateway catalog lists both scopes, and the backend checks both (ANYM-551).
 ALSO_REQUIRES = {"call": "calls:prepare"}
 SCOPES = {scope for _, scope in METHODS.values()} - {""}
+# The module router's read-only token (ANYM-563): GET /v1/events only, never a tool, and alone on its principal.
+EVENTS_SCOPE = "calls:events"
 BODY_LIMIT = 16384
 
 READ = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
@@ -376,7 +379,7 @@ class AgentRegistry:
                 p.id in ids
                 or p.key_sha256 in keys
                 or expiry.tzinfo is None
-                or set(p.scopes) - SCOPES
+                or set(p.scopes) - SCOPES - {EVENTS_SCOPE}
             ):
                 raise ValueError("invalid_principal")
             if set(p.channels) - {
@@ -526,7 +529,7 @@ class AgentAPI:
 
     async def _call(self, token, name, arguments):
         principal = self.registry.authenticate(token)
-        if name not in METHODS:
+        if name not in METHODS or EVENTS_SCOPE in principal.scopes:
             raise ServiceError("not_found_or_forbidden", 403)
         model, scope = METHODS[name]
         if scope and scope not in principal.scopes:
@@ -682,16 +685,54 @@ class AgentAPI:
             } | call_origin(call) | voice_engine(call)
         return call
 
+    @staticmethod
+    def bearer(request):
+        auth = request.headers.get("authorization", "")
+        if len(
+            request.headers.getlist("authorization")
+        ) != 1 or not auth.startswith("Bearer "):
+            raise ServiceError("unauthorized", 401)
+        token = auth[7:]
+        if not token or len(token) > 512 or any(c.isspace() for c in token):
+            raise ServiceError("unauthorized", 401)
+        return token
+
+    def events(self, request, head=False):
+        """GET /v1/events and /v1/events/head for the module router (ANYM-563, ANYM-562 cursor contract).
+
+        Only a principal whose sole scope is calls:events reads it: the journal spans every owner principal,
+        so an agent key never does. References and enumerations only; never transcript or decision text.
+        """
+        try:
+            principal = self.registry.authenticate(self.bearer(request))
+            if principal.scopes != [EVENTS_SCOPE]:
+                raise ServiceError("not_found_or_forbidden", 403)
+            if head:
+                return JSONResponse(self.service.events_head())
+            query = request.query_params
+            if set(query) - {"after", "limit", "include_rehearsal"} or any(
+                len(query.getlist(key)) > 1 for key in query
+            ):
+                raise ServiceError("invalid_arguments", 422)
+            after, limit = query.get("after", "0"), query.get("limit", "100")
+            rehearsal = query.get("include_rehearsal", "0")
+            if (
+                not after.isdigit() or not limit.isdigit() or len(after) > 16
+                or int(after) > call_events.MAX_SEQ or not 1 <= int(limit) <= call_events.MAX_LIMIT
+                or rehearsal not in {"0", "1"}
+            ):
+                raise ServiceError("invalid_arguments", 422)
+            return JSONResponse(
+                self.service.events_page(int(after), int(limit), rehearsal == "1")
+            )
+        except ServiceError as error:
+            return JSONResponse({"error": error.code}, status_code=error.status)
+        except Exception:
+            return JSONResponse({"error": "service_unavailable"}, status_code=503)
+
     async def endpoint(self, operation, request):
         try:
-            auth = request.headers.get("authorization", "")
-            if len(
-                request.headers.getlist("authorization")
-            ) != 1 or not auth.startswith("Bearer "):
-                raise ServiceError("unauthorized", 401)
-            token = auth[7:]
-            if not token or len(token) > 512 or any(c.isspace() for c in token):
-                raise ServiceError("unauthorized", 401)
+            token = self.bearer(request)
             self.registry.authenticate(token)
             data = bytearray()
             async for part in request.stream():

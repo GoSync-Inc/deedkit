@@ -537,6 +537,16 @@ def create_app(data_dir=None, archive=None, control_token=None, reviewer=None, a
         control_start,control_stop,outbound,
         readiness=lambda principal:calling_readiness(principal,outbound,credential_status(),browser_enabled,voice_provider()))
 
+    # Plain def: FastAPI runs the journal read in its thread pool, so a wait for the service lock never
+    # blocks the event loop that carries call audio (ANYM-563).
+    @app.get('/v1/events')
+    def call_events_page(request:Request):
+        return app.state.agent_api.events(request)
+
+    @app.get('/v1/events/head')
+    def call_events_head(request:Request):
+        return app.state.agent_api.events(request,head=True)
+
     @app.post('/v1/{operation}')
     async def agent_operation(operation:str,request:Request):
         return await app.state.agent_api.endpoint(operation,request)
