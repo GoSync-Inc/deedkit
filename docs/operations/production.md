@@ -1018,10 +1018,15 @@ the locks `seamless_release.py` holds for the whole rollback. It first checks
 plan B's state the way `deploy` does (`unresolved`: an unfinished apply or
 rollback, an unresolved HTTP attempt, an interrupted publication, read from the
 local source mirror `<state>/deploy-source.git`, never fetched), then that
-`http-current.json` names a serving generation whose attempt serves. Unknown,
-malformed or inconsistent HTTP state refuses. Only an absent default HTTP
-configuration with no HTTP state under `<state>` (`http/`, `http-current.json`,
-`*/http-attempted.json`) means no plan B and skips the guard. The guard then
+`http-current.json` names a serving generation whose attempt serves and whose
+records agree (its runtime image, its API container's image, the release's
+`http-result.json`, and its recorded schema with the image's inventory).
+Unknown, malformed or inconsistent HTTP state refuses. Only an absent default
+HTTP configuration with no HTTP state (`http/`, `http-current.json`,
+`*/http-attempted.json`) in `<state>`, the host state root, its subdirectories
+with a receipt or any `/etc/deedkit` configuration's state, and no `deploy.json`
+recording a plan B promotion, means no plan B and skips the guard (under the
+global lock, where the host has one); otherwise pass `--http-config`. The guard then
 reads the schema inventory (checksums of `schema.sql` and `migrations/*.sql`,
 `docker run --network none --read-only`) of the serving generation's runtime
 image and of each messaging image (runtime, indexer, enricher-local,

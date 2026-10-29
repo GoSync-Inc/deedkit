@@ -1376,9 +1376,21 @@ def serving_generation(settings, http):
     refused (ANYM-642). The caller holds the locks seamless_release.py holds."""
     state = Path(settings["state_directory"])
     if http is None:
-        found = [path for path in (state / "http", state / "http-current.json") if path.exists() or path.is_symlink()]
-        if found := found + sorted(state.glob("*/http-attempted.json")):
-            raise Refused("there is no HTTP configuration, but HTTP state exists: " + ", ".join(map(str, found))
+        # HTTP state in this state, the host state root, its subdirectories with a receipt or any /etc/deedkit
+        # configuration's state (retention_states), or a deploy that promoted plan B from this state, is a plan B.
+        try:
+            found = [str(path) for directory in retention_states(state)
+                     for path in (directory / "http", directory / "http-current.json",
+                                  *(release / "http-attempted.json" for release in subdirectories(directory)))
+                     if present(path)]
+            deployed = state / "deploy.json"
+            if present(deployed) and "http" in read(deployed):
+                found.append(f"{deployed} (a deploy promoted plan B)")
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, Refused) as exc:
+            detail = type(exc).__name__ if not isinstance(exc, Refused) else str(exc).removesuffix("; no image is removed")
+            raise Refused(f"whether there is a plan B cannot be read ({detail}); pass --http-config") from exc
+        if found:
+            raise Refused("there is no HTTP configuration, but HTTP state exists: " + ", ".join(found)
                           + "; pass --http-config")
         return None
     http_state, mirror = Path(http["state_directory"]), state / "deploy-source.git"
@@ -1394,6 +1406,14 @@ def serving_generation(settings, http):
             raise Refused(f"plan B's state is inconsistent: {current} names no serving generation")
         if read(http_state / serving["sha"] / "http-attempted.json").get("status") != "serving":
             raise Refused(f"plan B's state is inconsistent: {serving['sha']}'s HTTP attempt does not serve")
+        # Every record of the serving API's image agrees: the receipt, the container promote started, and the release's
+        # own result (the schema it recorded is compared with the image's inventory in guard_rollback).
+        result = read(http_state / serving["sha"] / "http-result.json")
+        runtime = serving["images"]["runtime"]
+        if (serving["containers"]["api"]["image"] != runtime or result.get("generation") != serving["generation"]
+                or result.get("images", {}).get("runtime") != runtime or not isinstance(serving["schema"], dict)):
+            raise Refused(f"plan B's state is inconsistent: the serving generation {serving['generation']}'s records "
+                          "name different runtime images")
         # The interrupted-publication check reads the local source mirror; nothing is fetched.
         if not mirror.is_dir():
             raise Refused(f"{mirror} is missing: plan B's publication cannot be checked")
@@ -1426,20 +1446,25 @@ def guard_rollback(serving, plan):
         return
     s, inventories = http_release_tool(), {}
     named = f"plan B serves generation {serving['generation']} of {serving['sha']}"
+    way_out = ("Roll forward instead: `production.py deploy` of a newer green main SHA (a fix or a revert that keeps "
+               "every applied migration; production.md, \"Roll back the current release\")")
     def inventory(image):
         if image not in inventories:
             try:
                 inventories[image] = s.schema_inventory(image)
             except Exception as exc:
                 detail = str(exc) if isinstance(exc, Refused) else type(exc).__name__
-                raise Refused(f"the schema inventory of {image} cannot be read ({detail}) while {named}; "
-                              "a plan A rollback is refused") from exc
+                raise Refused(f"the schema inventory of {image} cannot be read ({detail}) while {named}; a plan A "
+                              "rollback is refused. " + way_out) from exc
         return inventories[image]
     for project, _, previous in plan:
         for service, image in sorted(previous.items()):
             if project["services"][service] not in MESSAGING_TARGETS:
                 continue
             current, restored = inventory(serving["images"]["runtime"]), inventory(image)
+            if current != serving["schema"]:
+                raise Refused(f"plan B's state is inconsistent: the schema recorded for generation "
+                              f"{serving['generation']} is not its runtime image's inventory. " + way_out)
             where = f"{project['name']}/{service}'s restored image {image}"
             order = inventory_order(current, restored)
             if order in ("equal", "older"):
@@ -1451,8 +1476,7 @@ def guard_rollback(serving, plan):
                 changed = ", ".join(sorted(path for path in set(current) & set(restored) if current[path] != restored[path]))
                 detail = f"a migration inventory {where} diverges from (changed: {changed or 'none'}; missing: {missing})"
             raise Refused(f"{named} with {detail}; a plan A rollback alone would leave the serving API newer than "
-                          "its workers. Roll forward instead: `production.py deploy` of a newer green main SHA (a fix "
-                          "or a revert that keeps every applied migration; production.md, \"Roll back the current release\")")
+                          "its workers. " + way_out)
 
 
 def rollback(settings, sha, http=None):
@@ -4518,7 +4542,7 @@ def main(argv=None):
                 parser.exit(1)
             return
         else:
-            settings = config(args.config)
+            settings, http = config(args.config), None
             state = Path(settings["state_directory"])
             with ExitStack() as locks:
                 if args.action == "prepare-router":
@@ -4529,12 +4553,14 @@ def main(argv=None):
                     if state.resolve() != canonical.resolve():
                         locks.enter_context(lock(state))
                 elif args.action == "rollback":
-                    # Plan B's state is read, and the rollback runs, under the locks seamless_release.py holds; only
-                    # an absent default HTTP configuration means no plan B (ANYM-642).
+                    # Plan B's state is read, and the rollback runs, under the locks seamless_release.py holds (its
+                    # global lock also without plan B, where the host has one); only an absent default HTTP
+                    # configuration can mean no plan B (ANYM-642).
                     s = http_release_tool()
                     http = (None if args.http_config == HTTP_CONFIG and not os.path.lexists(args.http_config)
                             else s.validate_settings(config(args.http_config)))
-                    locks.enter_context(host_locks(settings, http, s) if http else lock(state))
+                    locks.enter_context(host_locks(settings, http, s) if http else s.locks(settings)
+                                        if s.GLOBAL_LOCK.is_dir() else lock(state))
                 else:
                     locks.enter_context(lock(state))
                 if args.action == "status":
