@@ -11,7 +11,7 @@
 #
 # A run copies the worktree's tracked and untracked-but-not-ignored files, never a secret-shaped one
 # (is_secret), to /Users/Shared/deedkit-ci/stage/<worker> on the mini as egoregerev, then runs the suite as
-# the service user _deedkitci (sudo, docs/operations/remote-test-owner-steps.md) in its own copy
+# the service user _deedkitci (sudo, docs/operations/remote-test-mini-setup.md) in its own copy
 # ~_deedkitci/deedkit-ci/<worker>/src, with a disposable PostgreSQL 18 on 127.0.0.1, and streams the output
 # back; nothing of it uses docker there, so tests that need docker skip, as in the local flow without
 # ANYMSG_TEST_POSTGRES_CONTAINER (CI covers them). The mini runs at most MAX_RUNS DeedKit suites at once and
@@ -148,7 +148,10 @@ runner_env() {
 }
 
 load_1m() {
-  if [ -r /proc/loadavg ]; then cut -d' ' -f1 /proc/loadavg; else sysctl -n vm.loadavg | awk '{print $2}'; fi
+  local load
+  load="$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}')"
+  if [ -z "$load" ] && [ -r /proc/loadavg ]; then load="$(cut -d' ' -f1 /proc/loadavg)"; fi
+  printf '%s' "${load:-0}"
 }
 
 # As egoregerev on the mini: Between's containers on the default VM, or a host load above MAX_LOAD (Between's

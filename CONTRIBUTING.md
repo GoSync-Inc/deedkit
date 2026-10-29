@@ -39,6 +39,16 @@ their own test commands; the full list CI runs is in
 [`checks.yml`](.github/workflows/checks.yml) and
 [`whatsmeow.yml`](.github/workflows/whatsmeow.yml).
 
+Maintainer agents run these suites on the maintainers' Mac mini instead of their laptop:
+`scripts/remote-test.sh <worktree> <suite> [test args]` with the suite `root`, `calendar`, `gateway`,
+`calls`, `go`, `build`, `frontend` or `node`. It copies the worktree's tracked and new files (never
+`.env*`, keys, sessions, tokens or credentials; `--list <worktree>` shows them) to the mini, runs the suite
+there as the service user `_deedkitci` against its own PostgreSQL 18 on 127.0.0.1, streams the output and
+exits with the suite's status. Tests that need docker skip there; CI runs them. When Between is busy, the
+DeedKit slot is taken, the disk is short or the mini is unreachable, the same suite runs locally instead.
+`scripts/remote-test.sh --cleanup <worker>` removes a worker's copies when it finishes, `--load` prints the
+mini's run log; setup and caps: [`docs/operations/remote-test-mini-setup.md`](docs/operations/remote-test-mini-setup.md).
+
 A change to an MCP tool's name, description, annotations or input or output schema
 changes the committed messaging contract snapshot, and
 `tests/platform/test_legacy_contracts.py` fails until it is refreshed. Regenerate it in the same pull request and commit the result:
