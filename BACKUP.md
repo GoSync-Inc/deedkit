@@ -206,7 +206,13 @@ The receiver has no public SSH: its provider firewall has no inbound rules, `fro
 authorized_keys line holds the producer's tailnet address, and `runner.json` `transfer.host`
 and the pinned `known_hosts` name the receiver's tailnet address. When one receiver serves
 several projects, each gets its own upload user, forced-command config, state directory,
-recovery key and R2 bucket (R2 tokens are scoped to buckets, not prefixes).
+recovery key and R2 bucket (R2 tokens are scoped to buckets, not prefixes). Exception: DeedKit's
+messaging and family calendar, both the owner's, share one bucket and its token under separate
+prefixes (ANYM-607; owner 10-29 «почему у нас не может быть один и тот же токен Р2 для всех
+бэкапов»). What that gives up: one leaked receiver token reads and deletes both prefixes; each
+prefix's objects stay age-encrypted to its own
+recovery key, and the receiver, its rotation and each verifier list and delete only inside their own
+prefix (`tests/test_backup_r2_shared_bucket.py`).
 
 On a delivery error the same encrypted package and journal are kept; a retry
 does not take a new snapshot and does not stop the collectors again. The error
@@ -417,7 +423,8 @@ backup directory (the shared lock and its `.unsettled` marker). The capture limi
 `timeout_seconds` 900 and the receiver busy wait `busy_wait_seconds` 1800.
 
 The calendar's bundle goes to its own receiver project on the shared backup server: its own upload
-user, forced-command line, state directory, recovery key and private R2 bucket (BACKUP_R2.md,
+user, forced-command line, state directory, recovery key and prefix in messaging's private R2
+bucket (BACKUP_R2.md,
 Calendar verifier instance), verified there by the calendar verifier, which takes turns with
 messaging's ([Two verifiers on one receiver](BACKUP_R2.md#two-verifiers-on-one-receiver)).
 

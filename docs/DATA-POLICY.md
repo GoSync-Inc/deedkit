@@ -56,10 +56,12 @@ the owner has decided parts (below), not this inventory as a whole.
     and iCloud credentials with the key that opens them, and its database passwords (the profile files),
     encrypted to the calendar recovery key (held by the backup server's root and, once the owner has stored
     it, the owner's offline copy), daily to the same shared backup server over the tailnet and its own
-    private R2 bucket. Each verification opens the tokens in memory on that server and never writes them.
-    One protected point plus room for one candidate: the rotation keeps no older point (owner 10-28 «Ну
-    вообще можно регулярный, ну то есть все одинаковый, короче, пока делать, да»). Agent key files are not
-    in it.
+    prefix in the same private R2 bucket, under the same token (owner 10-29 «почему у нас не может быть
+    один и тот же токен Р2 для всех бэкапов»): one leaked token exposes both prefixes' encrypted objects,
+    not their recovery keys. Each verification opens the tokens in memory on that server and never writes
+    them. One protected point plus room for one candidate: the rotation keeps no older point (owner 10-28
+    «Ну вообще можно регулярный, ну то есть все одинаковый, короче, пока делать, да»). Agent key files are
+    not in it.
   - Webhook receivers named by an agent: hint, test, endpoint, subscription, event, account, chat,
     message, sender and send IDs, the subscription version, event kinds and times, wake reasons, the
     count of omitted references, the next tool to call, the signature headers, the delivery timing, and
