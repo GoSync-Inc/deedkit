@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import sqlite3
 import sys
 import threading
 import time
@@ -180,6 +181,88 @@ def test_terminal_event_failure_is_logged_never_breaks_stop_and_startup_repairs_
 
 
 # spec: ANYM-563
+def test_a_failing_write_with_a_broken_stderr_still_stops_the_call(tmp_path, monkeypatch):
+    store = VoiceService(tmp_path)
+    identity = external(store)
+
+    class Broken:
+        def write(self, text):
+            raise BrokenPipeError
+
+        def flush(self):
+            raise BrokenPipeError
+
+    def broken(*args):
+        raise RuntimeError('disk')
+    monkeypatch.setattr(call_events, '_insert', broken)
+    monkeypatch.setattr(sys, 'stderr', Broken())
+    assert store.stop(identity, 'agent_stop')['status'] == 'finished'
+    monkeypatch.undo()
+    assert store.get_call(identity)['status'] == 'finished'
+    store.close()
+
+
+# spec: ANYM-563
+def test_a_replayed_terminal_write_takes_no_sequence_number(tmp_path):
+    store = VoiceService(tmp_path)
+    identity = external(store)
+    store.stop(identity, 'agent_stop')
+    call = store.get_call(identity)
+    for _ in range(2):
+        assert call_events.record_terminal(store.db, call)
+        store.db.commit()
+    assert store.events_head()['head'] == 1
+    first, _ = read(store, {'after': 0, 'journal_id': None})
+    after, _ = read(store, first['next'])
+    assert [e['id'] for e in first['events']] == ['calls:1'] and after['events'] == []
+    store.close()
+
+
+def seed(tmp_path, calls):
+    """Write call bodies straight into a calls database, as an older release left them."""
+    VoiceService(tmp_path).close()
+    db = sqlite3.connect(tmp_path / 'voice.sqlite3')
+    db.executemany('INSERT INTO calls VALUES (?,?,?)', [(v['id'], 'brief-' + v['id'], json.dumps(v)) for v in calls])
+    db.commit()
+    db.close()
+
+
+def archived(n, decision_at=None):
+    started = '2026-10-01T10:00:00+00:00'
+    decisions = [] if decision_at is None else [{'id': f'decision-{n}', 'question': 'SECRETQUESTION', 'options': ['a', 'b'],
+        'status': 'pending', 'created_at': decision_at, 'conditions': {'fee': 'SECRETCOST'}}]
+    return {'id': f'call-{n}', 'brief_id': f'brief-call-{n}', 'status': 'finished', 'channel': 'phone',
+            'started_at': started, 'ended_at': '2026-10-01T10:03:00+00:00', 'end_reason': 'agent_stop',
+            'outcome': 'needs_owner' if decisions else 'unresolved', 'decisions': decisions, 'answers': {},
+            'brief': {'owner_principal': 'alice', 'channel': 'phone'}, 'event_storage': 1}
+
+
+# spec: ANYM-563
+def test_an_existing_calls_database_gets_terminal_rows_and_deadlines_for_its_calls(tmp_path):
+    db = tmp_path / 'voice.sqlite3'
+    seed(tmp_path, [archived(1), archived(2, decision_at='2026-10-01T10:01:00+00:00')])
+    connection = sqlite3.connect(db)
+    connection.execute('DROP TABLE call_events')
+    connection.execute('DROP TABLE decision_deadlines')
+    connection.commit()
+    connection.close()
+    for _ in range(2):
+        store = VoiceService(tmp_path)
+        assert [(kind, data['call_id']) for kind, data in journal(store)] == [
+            ('call.finished', 'call-1'), ('call.finished', 'call-2')]
+        assert store.db.execute('SELECT decision_id,expires_at FROM decision_deadlines').fetchall() == [
+            ('decision-2', '2026-10-02T10:01:00.000000Z')]
+        store.close()
+    store = VoiceService(tmp_path)
+    store.expire_decisions()
+    call = store.get_call('call-2')
+    assert call['decisions'][0]['status'] == 'expired' and call['outcome'] == 'unresolved'
+    assert store.db.execute('SELECT count(*) FROM decision_deadlines').fetchone()[0] == 0
+    assert [data.get('state') for kind, data in journal(store)][-1] == 'expired'
+    store.close()
+
+
+# spec: ANYM-563
 def test_owner_request_follows_its_state_with_the_stored_deadline(tmp_path):
     store = VoiceService(tmp_path)
     identity = external(store, approval=True)
@@ -201,6 +284,11 @@ def test_owner_request_follows_its_state_with_the_stored_deadline(tmp_path):
     # 562 accepts state=pending only: the answered row is journaled and skipped, the cursor moves past it.
     later, _ = read(store, result['next'])
     assert later['events'] == [] and later['next']['after'] == store.events_head()['head']
+    # Corrected terms supersede the answered round: one more transition, then a new pending round.
+    answer(store, identity, 'delivery_window', '14–15', 'correct-time')
+    states = [(data['decision_id'] == request['decision_id'], data['state'])
+              for kind, data in journal(store) if kind == 'call.owner_request']
+    assert states == [(True, 'pending'), (True, 'answered'), (True, 'superseded'), (False, 'pending')]
     store.close()
 
 
@@ -224,6 +312,7 @@ def test_a_decision_past_its_deadline_is_refused_and_one_before_it_is_accepted(t
     assert store.decide(second, early, 'Разрешить')['status'] == 'answered'
     expired = store.get_call(first)
     assert expired['decisions'][0]['status'] == 'expired' and expired['outcome'] != 'needs_owner'
+    assert [row[0] for row in store.db.execute('SELECT decision_id FROM decision_deadlines')] == [early]
     store.expire_decisions()
     states = [(data['decision_id'], data['state']) for kind, data in journal(store) if kind == 'call.owner_request']
     assert states == [(late, 'pending'), (early, 'pending'), (late, 'expired'), (early, 'answered')]
@@ -364,15 +453,12 @@ async def test_events_endpoint_reads_only_with_the_router_token(tmp_path):
 
 
 # spec: ANYM-563
-def test_reading_ten_thousand_events_keeps_event_writes_of_an_active_call_within_bound(tmp_path):
+def test_reading_ten_thousand_events_keeps_event_writes_of_an_active_call_within_bound(tmp_path, monkeypatch):
+    # 10k archived calls, each with a terminal row and a due owner request: every page read also runs expiry.
+    seed(tmp_path, [archived(n, decision_at='2026-10-01T10:01:00+00:00') for n in range(10000)])
+    monkeypatch.setattr(core, 'EXPIRY_INTERVAL_S', 0)
     store = VoiceService(tmp_path)
-    at = datetime.now(timezone.utc).isoformat()
-    store.db.executemany('''INSERT INTO call_events(event_key,call_id,type,occurred_at,owner_principal,rehearsal,data,
-        urgency,expires_at) VALUES (?,?,?,?,?,?,?,?,?)''', [
-        (f'synthetic:{n}', f'call-{n}', 'call.finished', at.replace('+00:00', 'Z'), 'alice', 0,
-         json.dumps({'call_id': f'call-{n}', 'status': 'finished', 'end_reason': 'agent_stop',
-                     'outcome': 'unresolved', 'transcript': 'final'}), 'now', None) for n in range(10000)])
-    store.db.commit()
+    assert store.events_head()['head'] == 10000
     identity = external(store)
     writer, held = threading.current_thread(), []
 
@@ -417,8 +503,12 @@ def test_reading_ten_thousand_events_keeps_event_writes_of_an_active_call_within
     finally:
         done.set()
         thread.join()
-    # Stated bound (README): while 10k events are read back to back, an event write of a live call waits at most
-    # 100 ms for the service lock (one 200-row scan holds it); the whole write is never a second slower.
+    # Stated bound (README): while 10k events are read back to back and expiry runs on every page, a live call's
+    # event write waits for the service lock, at the 99th percentile, no longer than its own slowest write alone
+    # plus 100 ms, and never a second; the whole write is never a second slower. A read section holds the lock
+    # for one 200-row scan or one expiry batch of at most 20 calls with one commit.
     assert sum(pages) >= 10000 and held, sum(pages)
-    assert max(held) < 0.1 and max(waits) < max(alone) + 1.0, (max(held), max(waits), max(alone))
+    assert store.db.execute("SELECT count(*) FROM call_events WHERE data LIKE '%expired%'").fetchone()[0] > 0
+    p99 = sorted(held)[int(len(held) * 0.99)]
+    assert p99 < max(alone) + 0.1 and max(held) < 1.0 and max(waits) < max(alone) + 1.0, (p99, max(held), max(waits), max(alone))
     store.close()

@@ -41,9 +41,13 @@ def create(db):
     db.execute('''CREATE TABLE IF NOT EXISTS call_events (seq INTEGER PRIMARY KEY AUTOINCREMENT,
         event_key TEXT UNIQUE NOT NULL, call_id TEXT NOT NULL, type TEXT NOT NULL, occurred_at TEXT NOT NULL,
         owner_principal TEXT, rehearsal INTEGER NOT NULL, data TEXT NOT NULL, urgency TEXT NOT NULL, expires_at TEXT)''')
-    db.execute('CREATE TABLE IF NOT EXISTS call_event_journal (id INTEGER PRIMARY KEY CHECK (id=1), journal_id TEXT NOT NULL, started_at TEXT NOT NULL)')
-    db.execute('INSERT OR IGNORE INTO call_event_journal VALUES (1,?,?)',(uuid.uuid4().hex,datetime.now(timezone.utc).isoformat()))
-    return db.execute('SELECT journal_id,started_at FROM call_event_journal WHERE id=1').fetchone()
+    db.execute('CREATE TABLE IF NOT EXISTS call_event_journal (id INTEGER PRIMARY KEY CHECK (id=1), journal_id TEXT NOT NULL)')
+    db.execute('INSERT OR IGNORE INTO call_event_journal VALUES (1,?)',(uuid.uuid4().hex,))
+    # Pending decisions by deadline (UTC, the _time format, so text order is time order): the expiry
+    # sweep reads a few due rows by index instead of every call body.
+    db.execute('CREATE TABLE IF NOT EXISTS decision_deadlines (decision_id TEXT PRIMARY KEY, call_id TEXT NOT NULL, expires_at TEXT NOT NULL)')
+    db.execute('CREATE INDEX IF NOT EXISTS decision_deadlines_due ON decision_deadlines(expires_at)')
+    return db.execute('SELECT journal_id FROM call_event_journal WHERE id=1').fetchone()[0]
 
 
 def _time(value):
@@ -82,10 +86,19 @@ def terminal(v):
 
 
 def _insert(db,key,v,kind,data,at,urgency,expires_at):
-    db.execute('''INSERT OR IGNORE INTO call_events(event_key,call_id,type,occurred_at,owner_principal,rehearsal,data,
-        urgency,expires_at) VALUES (?,?,?,?,?,?,?,?,?)''',
+    # Not INSERT OR IGNORE: a committed ignored insert still advances sqlite_sequence, a seq no row has.
+    db.execute('''INSERT INTO call_events(event_key,call_id,type,occurred_at,owner_principal,rehearsal,data,urgency,
+        expires_at) SELECT ?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM call_events WHERE event_key=?)''',
         (key,v['id'],kind,_time(at),v['brief'].get('owner_principal'),int(v.get('channel','browser')=='browser'),
-         json.dumps(data,separators=(',',':')),urgency,expires_at and _time(expires_at)))
+         json.dumps(data,separators=(',',':')),urgency,expires_at and _time(expires_at),key))
+
+
+def log(code,error):
+    """One JSON line to stderr that can never raise (a closed or broken stderr included)."""
+    try:
+        print(json.dumps({'error':code,'class':type(error).__name__}),file=sys.stderr,flush=True)
+    except Exception:
+        pass
 
 
 def _logged(write,code):
@@ -94,7 +107,7 @@ def _logged(write,code):
         write()
         return True
     except Exception as error:
-        print(json.dumps({'error':code,'class':type(error).__name__}),file=sys.stderr,flush=True)
+        log(code,error)
         return False
 
 
@@ -103,7 +116,7 @@ def record_terminal(db,v):
     def write():
         kind,data=terminal(v)
         # The agent that placed the call waits for it: never held by batching.
-        _insert(db,'terminal:'+v['id'],v,kind,data,v['ended_at'],'now',None)
+        _insert(db,'terminal:'+v['id'],v,kind,data,v.get('ended_at') or v['started_at'],'now',None)
     return _logged(write,'call_event_terminal_failed')
 
 
@@ -116,13 +129,36 @@ def record_owner_request(db,v,decision,state,at):
     return _logged(write,'call_event_owner_request_failed')
 
 
-def repair(db,calls,started_at,active):
-    """Startup: a terminal call that ended after the journal began and has no terminal row gets one."""
+def track_deadline(db,v,decision):
+    """A pending decision's deadline row; the sweep drops it once the decision is no longer pending."""
+    def write():
+        db.execute('INSERT OR REPLACE INTO decision_deadlines VALUES (?,?,?)',(decision['id'],v['id'],_time(deadline(decision))))
+    return _logged(write,'decision_deadline_failed')
+
+
+def untrack_deadline(db,decision_id):
+    return _logged(lambda:db.execute('DELETE FROM decision_deadlines WHERE decision_id=?',(decision_id,)),'decision_deadline_failed')
+
+
+def due(db,limit,at):
+    """At most `limit` (decision_id, call_id) rows whose deadline is at or before `at`, oldest first."""
+    return db.execute('SELECT decision_id,call_id FROM decision_deadlines WHERE expires_at<=? ORDER BY expires_at LIMIT ?',
+        (_time(at),limit)).fetchall()
+
+
+def repair(db,calls,active):
+    """Startup: every terminal call without a terminal row gets one; every pending decision gets its deadline row.
+
+    Calls that ended before this journal existed get rows too; a router starts at the head, so they are history.
+    """
     def write():
         have={row[0] for row in db.execute("SELECT call_id FROM call_events WHERE event_key LIKE 'terminal:%'")}
         for v in calls:
-            if v['status'] not in active and v['id'] not in have and v.get('ended_at') and v['ended_at']>=started_at:
+            if v['status'] not in active and v['id'] not in have:
                 record_terminal(db,v)
+            for decision in v.get('decisions',[]):
+                if decision.get('status')=='pending':
+                    track_deadline(db,v,decision)
     return _logged(write,'call_event_repair_failed')
 
 
@@ -179,4 +215,7 @@ def page(journal_id,after,limit,last,rows,include_rehearsal=False):
             events.append(event)
             size=grown
         position=row[0]
+    if len(rows)<SCAN_ROWS and (not rows or position==rows[-1][0]):
+        # Every row up to the head was read: a seq no row has (none is expected) never stalls the cursor.
+        position=last
     return {'events':events,'next_after':position,'has_more':position<last,'retention_floor':0,'journal_id':journal_id}

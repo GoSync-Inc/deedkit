@@ -4,7 +4,6 @@ import json
 import os
 import re
 import sqlite3
-import sys
 import threading
 import time
 import uuid
@@ -26,6 +25,7 @@ ENGINE="Pipecat "+version("pipecat-ai")
 GROK_MODEL="grok-voice-3.0"
 ACTIVE={"waiting_for_browser","dialing","ringing","connecting","active"}
 EXPIRY_INTERVAL_S=30
+EXPIRY_BATCH=20
 
 
 INBOUND_KEYS=('input_active_ms','input_frames','input_pcm_ms','input_zero_frames')
@@ -410,7 +410,7 @@ class VoiceService:
         self.db.execute("CREATE TABLE IF NOT EXISTS calls (id TEXT PRIMARY KEY, brief_id TEXT UNIQUE NOT NULL, body TEXT NOT NULL)")
         self.db.execute('CREATE TABLE IF NOT EXISTS voice_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE, call_id TEXT, body TEXT NOT NULL)')
         self.db.execute('CREATE INDEX IF NOT EXISTS voice_events_call ON voice_events(call_id,seq)')
-        self.journal_id,journal_started=call_events.create(self.db)
+        self.journal_id=call_events.create(self.db)
         self._expiry_checked=None
         calls=[]
         for identity,body in self.db.execute("SELECT id,body FROM calls").fetchall():
@@ -432,7 +432,7 @@ class VoiceService:
                 self.db.execute("UPDATE calls SET body=? WHERE id=?",(json.dumps(value),identity))
             calls.append(value)
         # A terminal save whose event write failed gets its row now (idempotent by event key).
-        call_events.repair(self.db,calls,journal_started,ACTIVE)
+        call_events.repair(self.db,calls,ACTIVE)
         self.db.commit()
         from learning import Learning
         self.learning=Learning(self)
@@ -449,13 +449,14 @@ class VoiceService:
             value['events']=[json.loads(r[0]) for r in self.db.execute('SELECT body FROM voice_events WHERE call_id=? ORDER BY seq',(identity,))]
         return value
 
-    def _save_call(self,v,report=True):
+    def _save_call(self,v,report=True,commit=True):
         body={k:x for k,x in v.items() if k!='events'}
         body['event_storage']=1
         self.db.execute("UPDATE calls SET body=? WHERE id=?",(json.dumps(body,ensure_ascii=False),v["id"]))
         if report and hasattr(self,'learning') and v['status'] not in ACTIVE:
             self.learning.enqueue(v)
-        self.db.commit()
+        if commit:
+            self.db.commit()
 
     def prepare(self,selected,messages,*,followup=None,inherited_facts=None,owner_principal=None,use_learning=True):
         b=selected.model_dump()
@@ -951,10 +952,8 @@ class VoiceService:
         conditions=self._conditions(v)
         for decision in v['decisions']:
             if decision['status']!='superseded' and decision.get('conditions')!=conditions:
-                was=decision['status']
                 decision.update(status='superseded',superseded_at=now(),superseded_reason='conditions_changed')
-                if was=='pending':
-                    call_events.record_owner_request(self.db,v,decision,'superseded',decision['superseded_at'])
+                call_events.record_owner_request(self.db,v,decision,'superseded',decision['superseded_at'])
                 self._event(v,{'kind':'decision_superseded','decision_id':decision['id'],
                                'reason':'conditions_changed'})
 
@@ -968,10 +967,8 @@ class VoiceService:
             raise ServiceError('decision_limit')
         for previous in v['decisions']:
             if previous['status']!='superseded':
-                was=previous['status']
                 previous.update(status='superseded',superseded_at=now(),superseded_reason='new_round')
-                if was=='pending':
-                    call_events.record_owner_request(self.db,v,previous,'superseded',previous['superseded_at'])
+                call_events.record_owner_request(self.db,v,previous,'superseded',previous['superseded_at'])
                 self._event(v,{'kind':'decision_superseded','decision_id':previous['id'],'reason':'new_round'})
         created=datetime.now(timezone.utc)
         decision={'id':str(uuid.uuid4()),'question':question,'options':options,'status':'pending',
@@ -983,6 +980,7 @@ class VoiceService:
         self._event(v,{'kind':'decision_requested','decision_id':decision['id'],'round':decision['round'],
                        'trigger':trigger,'conditions':conditions})
         call_events.record_owner_request(self.db,v,decision,'pending',decision['created_at'])
+        call_events.track_deadline(self.db,v,decision)
         return decision
 
     def _required_decision(self,v):
@@ -1401,30 +1399,53 @@ class VoiceService:
                 if d['status']!='pending' or datetime.fromisoformat(call_events.deadline(d))>datetime.fromisoformat(now()):
                     continue
             except Exception as error:
-                print(json.dumps({'error':'decision_expiry_unreadable','class':type(error).__name__}),file=sys.stderr,flush=True)
+                call_events.log('decision_expiry_unreadable',error)
                 continue
             d.update(status='expired',expired_at=now())
             self._event(v,{'kind':'decision_expired','decision_id':d['id']})
             call_events.record_owner_request(self.db,v,d,'expired',d['expired_at'])
+            call_events.untrack_deadline(self.db,d['id'])
             changed=True
         if changed and v['outcome']=='needs_owner' and not any(d['status']=='pending' for d in v['decisions']):
             v['outcome']='unresolved'
         return changed
 
     def expire_decisions(self):
-        """Lazy expiry of owner requests past their deadline (ANYM-563): ended calls with a pending decision only."""
+        """Lazy expiry of owner requests past their deadline (ANYM-563), at most EXPIRY_BATCH per pass.
+
+        Due decisions come from the decision_deadlines index, never a scan of call bodies; bodies are read
+        without their events. One lock section and one commit per pass, so a live call's write waits for at
+        most one bounded batch. A live call is skipped. A failure is logged and leaves that decision pending;
+        nothing is rolled back, since other writers share the connection.
+        """
         with self.lock:
             try:
-                rows=self.db.execute("""SELECT id FROM calls WHERE json_extract(body,'$.status') NOT IN (?,?,?,?,?)
-                    AND EXISTS (SELECT 1 FROM json_each(calls.body,'$.decisions') WHERE json_extract(value,'$.status')='pending')""",
-                    tuple(sorted(ACTIVE))).fetchall()
-                for identity, in rows:
-                    v=self.get_call(identity)
-                    if self._expire_due(v):
-                        self._save_call(v,report=False)
+                due=call_events.due(self.db,EXPIRY_BATCH,now())
             except Exception as error:
-                self.db.rollback()
-                print(json.dumps({'error':'decision_expiry_failed','class':type(error).__name__}),file=sys.stderr,flush=True)
+                call_events.log('decision_expiry_failed',error)
+                return
+            changed=False
+            for decision_id,identity in due:
+                try:
+                    row=self.db.execute('SELECT body FROM calls WHERE id=?',(identity,)).fetchone()
+                    v=json.loads(row[0]) if row else None
+                    if v is not None and v['status'] in ACTIVE:
+                        continue
+                    if v is not None:
+                        v['events']=[]
+                        if self._expire_due(v):
+                            self._save_call(v,report=False,commit=False)
+                            changed=True
+                            continue
+                    if v is None or all(d['id']!=decision_id or d['status']!='pending' for d in v['decisions']):
+                        changed=call_events.untrack_deadline(self.db,decision_id) or changed
+                except Exception as error:
+                    call_events.log('decision_expiry_failed',error)
+            if changed:
+                try:
+                    self.db.commit()
+                except Exception as error:
+                    call_events.log('decision_expiry_failed',error)
 
     def events_head(self):
         with self.lock:

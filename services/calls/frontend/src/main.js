@@ -239,6 +239,8 @@ async function loadInbox() {
       const submit=node('button','Сохранить решение');submit.type='submit';form.append(input,submit);
       form.onsubmit=e=>{e.preventDefault();answerDecision(item.call_id,d.id,input.value.trim());};
       row.append(options,form);
+    } else if(d.status==='expired') {
+      row.append(node('small','Срок ответа на этот запрос истёк. Для продолжения нужно новое поручение.'));
     } else {
       row.append(node('p',d.answer));
       const finished=!['waiting_for_browser','connecting','active'].includes(item.call_status);
