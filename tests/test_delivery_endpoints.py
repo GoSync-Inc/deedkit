@@ -341,7 +341,7 @@ def test_states_operator_disable_and_configuring_a_paused_endpoint(gate, policy)
         store.set_delivery_endpoint_operator_state(eid, True)
     assert store.list_delivery_endpoints(token)['items'][0]['state'] == 'enabled'
     with store.pool.connection() as c:
-        assert c.execute("SELECT state,error_code FROM delivery_endpoint_tests WHERE purpose='test'").fetchone() == \
+        assert c.execute("SELECT state,error_code FROM delivery_endpoint_tests WHERE request_id NOT LIKE 'resume/%%'").fetchone() == \
             {'state': 'cancelled', 'error_code': 'endpoint_paused'}
 
 

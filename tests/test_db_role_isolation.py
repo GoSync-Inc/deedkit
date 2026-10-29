@@ -804,9 +804,14 @@ def test_gateway_role_writes_endpoint_secrets_and_headers_but_never_reads_them(s
         api.update_delivery_endpoint(token, eid, 1, 'set_headers', headers={'X-Auth': 'synthetic-auth-2'})
         api.update_delivery_endpoint(token, eid, 2, 'rotate_secret', new_secret='whsec_' + base64.b64encode(b'r' * 32).decode())
         api.update_delivery_endpoint(token, eid, 3, 'pause')
-        api.update_delivery_endpoint(token, eid, 4, 'resume')
         with store.pool.connection() as c:
             c.execute("UPDATE delivery_endpoint_tests SET created_at=created_at-interval '2 minutes' WHERE endpoint=%s", (eid,))
+        # ANYM-520: the resume stages its signed test; once it is delivered the API role re-arms the endpoint itself.
+        assert api.update_delivery_endpoint(token, eid, 4, 'resume')['test']['test_status'] == 'pending'
+        with store.pool.connection() as c:
+            c.execute('''UPDATE delivery_endpoint_tests SET state='delivered',finished_at=clock_timestamp(),
+                created_at=created_at-interval '2 minutes' WHERE endpoint=%s AND starts_with(request_id,'resume/')''', (eid,))
+        assert api.update_delivery_endpoint(token, eid, 4, 'resume')['state'] == 'enabled'
         assert api.test_delivery_endpoint(token, eid, 'endpoint-test-1')['test_status'] == 'pending'
         # Only the dispatcher reads them: it signs and sends the test with the caller's header.
         sent = []

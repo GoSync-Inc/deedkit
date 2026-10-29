@@ -43,6 +43,9 @@ ATTEMPT_DAYS = 7
 PAUSE_DEAD_LETTERS = 3
 PAUSE_SILENT_HOURS = 24
 RESUME_FRESH_S = 300
+# A resume's signed test: request ID `resume/<endpoint version>/<random>`. `/` is outside _REQUEST, so no agent request
+# ID can name one, and only these tests reach a paused endpoint (fenced).
+RESUME_PREFIX = 'resume/'
 PAUSED = ('agent_paused', 'auto_paused')
 BODY_LIMIT = 4096
 MAX_REFERENCES = 20
@@ -497,10 +500,21 @@ def failures(c, endpoint_id, since):
     return c.execute(FAILURES, {'endpoint': endpoint_id, 'since': since, 'hours': PAUSE_SILENT_HOURS}).fetchone()
 
 
+def _read_failures(c, endpoint_id, since):
+    """The failure count for a read, in its own savepoint: a failed read (a role without the schema-61 grant during a
+    rollout) answers None and never fails list, get, wait or fetch."""
+    import psycopg
+    try:
+        with c.transaction():
+            return failures(c, endpoint_id, since)['failures']
+    except psycopg.Error:
+        return None
+
+
 def delivery_health(c, row, found, last_error):
     """ANYM-520: {state, consecutive_failures, last_success, last_error, next_step} of an endpoint row."""
     since = max((at for at in (found['delivered_test'], found['delivered_hint']) if at), default=None)
-    failed = failures(c, row['id'], since)['failures']
+    failed = _read_failures(c, row['id'], since)
     if row['state'] in (*PAUSED, 'operator_disabled'):
         state = row['state']
     else:
@@ -723,19 +737,19 @@ TEST_SELECT = 'SELECT id,endpoint,request_id,state,http_status,latency_ms,error_
 def _resume_test(c, p, row, request_id):
     """The resume test of this endpoint version: the named one, else a pending one or one delivered within
     RESUME_FRESH_S, else a new one (the per-key test rate applies). A named test that failed refuses the resume."""
-    prefix = f"resume-{row['version']}-"
+    prefix = f"{RESUME_PREFIX}{row['version']}/"
     if request_id is not None:
         if not isinstance(request_id, str) or not request_id.startswith(prefix):
             raise _error('endpoint_conflict', 409)
-        test = c.execute(TEST_SELECT + ''' FROM delivery_endpoint_tests WHERE endpoint=%s AND request_id=%s
-            AND purpose='resume' ''', (row['id'], request_id)).fetchone()
+        test = c.execute(TEST_SELECT + ' FROM delivery_endpoint_tests WHERE endpoint=%s AND request_id=%s',
+            (row['id'], request_id)).fetchone()
         if test is None:
             raise _error('endpoint_conflict', 409)
         if test['state'] in ('failed', 'cancelled'):
             raise _error('endpoint_test_failed', 409, state=row['state'], test_error=test['error_code'],
                 http_status=test['http_status'], next_step=RESUME_FAILED_STEP)
         return test
-    test = c.execute(TEST_SELECT + ''' FROM delivery_endpoint_tests WHERE endpoint=%s AND purpose='resume'
+    test = c.execute(TEST_SELECT + ''' FROM delivery_endpoint_tests WHERE endpoint=%s
         AND starts_with(request_id,%s) AND (state IN ('pending','leased') OR state='delivered'
         AND finished_at>clock_timestamp()-make_interval(secs=>%s)) ORDER BY created_at DESC,id DESC LIMIT 1''',
         (row['id'], prefix, RESUME_FRESH_S)).fetchone()
@@ -743,9 +757,7 @@ def _resume_test(c, p, row, request_id):
         return test
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))', ('delivery-endpoints:' + str(p['key_id']),))
     _test_rate(c, p)
-    return c.execute('''INSERT INTO delivery_endpoint_tests(endpoint,request_id,purpose) VALUES(%s,%s,'resume')
-        RETURNING id,endpoint,request_id,state,http_status,latency_ms,error_code,created_at,finished_at''',
-        (row['id'], prefix + uuid4().hex[:16])).fetchone()
+    return _stage_test(c, row['id'], prefix + uuid4().hex[:16])
 
 
 def wake_backlog(c, p, row):
@@ -1156,7 +1168,7 @@ def dispatch_tests(store, *, limit=8, transport, resolver, served=None):
         with store.pool.connection() as c:
             p = _worker_identity(c, test)
             row, cancel = fenced(c, p, test['endpoint'], target[0] if target else None,
-                resume=test.get('purpose') == 'resume')
+                resume=test['request_id'].startswith(RESUME_PREFIX))
             if cancel in ('access_or_configuration_changed', 'delivery_disabled', 'endpoint_policy_refused'):
                 state, error = ('failed' if cancel == 'endpoint_policy_refused' else 'cancelled'), cancel
             live = c.execute("""SELECT 1 FROM delivery_endpoint_tests WHERE id=%s AND state='leased' AND lease_token=%s

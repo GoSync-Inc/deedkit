@@ -2,9 +2,9 @@
 -- ANYM-520: an agent sees each delivery to its webhook. delivery_attempts keeps one row per attempt of an endpoint hint:
 -- time, hint, subscription, attempt number, outcome, the HTTP status or an error code and the latency. No response
 -- body, header value or URL is stored. The dispatcher writes it and prunes rows older than 7 days; the API reads the
--- owning key's rows. delivery_endpoint_tests.purpose marks the signed test a resume sends while the endpoint is still
--- paused. The audit CHECK gains list_delivery_attempts (a DROP and ADD pair, so this file is manual); it stays NOT
--- VALID as 036 left it. No GRANT here: delivery_role.sql and gateway_role.sql, installed by the operator.
+-- owning key's rows. No foreign key and no change to an existing delivery table, so the migration takes no lock a
+-- delivery writer holds. The audit CHECK gains list_delivery_attempts (a DROP and ADD pair, so this file is manual);
+-- it stays NOT VALID as 036 left it. No GRANT here: delivery_role.sql and gateway_role.sql, installed by the operator.
 SET LOCAL lock_timeout='2s';
 ALTER TABLE audit_log DROP CONSTRAINT audit_log_operation_check;
 ALTER TABLE audit_log ADD CONSTRAINT audit_log_operation_check CHECK(operation IN (
@@ -25,8 +25,9 @@ ALTER TABLE audit_log ADD CONSTRAINT audit_log_operation_check CHECK(operation I
  'delete_delivery_endpoint','test_delivery_endpoint','list_delivery_attempts')) NOT VALID;
 CREATE TABLE delivery_attempts (
  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
- endpoint uuid NOT NULL REFERENCES delivery_endpoints(id),
- -- No foreign key: retention may delete a hint or subscription before its attempt rows age out.
+ -- No foreign keys: retention may delete a hint or subscription before its attempt rows age out, and a reference
+ -- would lock delivery_endpoints during the migration.
+ endpoint uuid NOT NULL,
  hint uuid NOT NULL,
  subscription uuid NOT NULL,
  attempt integer NOT NULL CHECK(attempt BETWEEN 0 AND 1000),
@@ -38,4 +39,3 @@ CREATE TABLE delivery_attempts (
 );
 CREATE INDEX delivery_attempt_endpoint ON delivery_attempts(endpoint,created_at DESC,id DESC);
 CREATE INDEX delivery_attempt_age ON delivery_attempts(created_at);
-ALTER TABLE delivery_endpoint_tests ADD COLUMN purpose text NOT NULL DEFAULT 'test' CHECK(purpose IN ('test','resume'));

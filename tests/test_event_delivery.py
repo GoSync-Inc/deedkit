@@ -1495,6 +1495,7 @@ def test_resume_sends_a_signed_test_inline_rearms_once_it_is_delivered_and_wakes
         version = endpoint_state(store, eid)['version']
         arguments = {'endpoint_id': eid, 'version': version, 'action': 'resume'}
         # A failed test refuses the resume with the test's error and leaves the endpoint paused.
+        tested()
         pending = store.update_delivery_endpoint(token, eid, version, 'resume')
         assert (pending['state'], pending['test']['test_status'], pending['woken_subscriptions']) == (
             'auto_paused', 'pending', [])
