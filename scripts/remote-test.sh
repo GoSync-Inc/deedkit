@@ -13,12 +13,13 @@
 # (is_secret), to /Users/Shared/deedkit-ci/stage/<worker> on the mini as egoregerev, then runs the suite as
 # the service user _deedkitci (sudo, docs/operations/remote-test-mini-setup.md) in its own copy
 # ~_deedkitci/deedkit-ci/<worker>/src, with a disposable PostgreSQL 18 on 127.0.0.1, and streams the output
-# back; nothing of it uses docker there, so tests that need docker skip, as in the local flow without
+# back. Nothing of it uses docker there, so tests that need docker skip, as in the local flow without
 # ANYMSG_TEST_POSTGRES_CONTAINER (CI covers them). The mini runs at most MAX_RUNS DeedKit suites at once and
-# gives way to Between: when a Between container runs or the host load is high, the slots are taken, the disk is short, the service user is missing or the
-# mini is unreachable, the same suite runs on this machine instead (the local flow; DEEDKIT_REMOTE_FALLBACK=0
-# exits 90 refused, 91 unreachable, 92 not set up). Each mini run appends
-# `worker suite start wall_s cpu_s pg_cpu_s exit` to ~_deedkitci/deedkit-ci/load.log.
+# gives way to Between: when a Between container runs, the host load is high, the slots are taken, the disk
+# is short, the service user is missing or the mini cannot be reached before the suite starts, the same
+# suite runs on this machine instead (the local flow; DEEDKIT_REMOTE_FALLBACK=0 exits 90 refused, 91
+# unreachable, 92 not set up). Each mini run appends `worker suite start wall_s cpu_s pg_cpu_s exit` to
+# ~_deedkitci/deedkit-ci/load.log (cpu_s: all of the run's processes, PostgreSQL included).
 #
 # Caps: /Users/Shared/deedkit-ci/caps.conf on the mini (KEY=value lines, defaults below), so they change
 # without a pull request. Worker name: DEEDKIT_REMOTE_WORKER, else the worktree's last two path components.
@@ -64,28 +65,28 @@ worker_of() {
   printf '%s' "$name"
 }
 
-# A path that may hold a secret, a session or a local environment never leaves this machine.
+# A path that may hold a secret, a session or a local environment never leaves this machine. Every path
+# component counts, in any letter case: a directory named like a secret takes all of its files with it.
+# Source and docs that only name the subject in their file name (tests/test_credential_expiry.py) stay.
 is_secret() {
-  local base="${1##*/}" part parts
+  local base="${1##*/}" part parts found=1
   IFS=/ read -ra parts <<< "$1"
+  shopt -s nocasematch
   for part in "${parts[@]}"; do
     case "$part" in
-      .git|.venv|venv|node_modules|.tiden|.ssh|.gnupg|.aws|.azure|.kube|.docker|__pycache__|.pytest_cache|.ruff_cache|.mypy_cache) return 0 ;;
+      .git|.venv|venv|node_modules|.tiden|.ssh|.gnupg|.aws|.azure|.kube|.docker|.gcloud|.config|__pycache__|.pytest_cache|.ruff_cache|.mypy_cache) found=0 ;;
+      .env|.env.*|*.env|.envrc|*.pem|*.key|*.p12|*.pfx|*.jks|*.keystore|*.gpg|*.asc|*.agekey|*.ovpn|*.kdbx|*.dsn) found=0 ;;
+      id_rsa*|id_dsa*|id_ecdsa*|id_ed25519*|auth.json|.netrc|.npmrc|.pypirc|.git-credentials|.htpasswd) found=0 ;;
+      *.session|*.session-*|*.sqlite|*.sqlite3|*.sqlite-*|*.sqlite3-*|*.db|*.db-*|*-journal|*-wal|*-shm) found=0 ;;
+      *credential*|*token*|*secret*|*passw*)
+        if [ "$part" != "$base" ]; then found=0; fi
+        case "$part" in
+          *.py|*.go|*.mjs|*.js|*.ts|*.tsx|*.jsx|*.md|*.sh) ;;
+          *) found=0 ;;
+        esac ;;
     esac
+    [ "$found" = 1 ] || break
   done
-  shopt -s nocasematch
-  local found=1
-  case "$base" in
-    .env|.env.*|*.env|.envrc|*.pem|*.key|*.p12|*.pfx|*.jks|*.keystore|*.gpg|*.agekey|*.ovpn|*.kdbx|*.dsn) found=0 ;;
-    id_rsa*|id_dsa*|id_ecdsa*|id_ed25519*|auth.json|.netrc|.npmrc|.pypirc|.git-credentials|.htpasswd) found=0 ;;
-    *.session|*.session-journal|*.sqlite|*.sqlite3|*.db) found=0 ;;
-    *credential*|*token*|*secret*|*passw*)
-      # Source and docs that only name the subject (tests/test_credential_expiry.py) stay; data files go.
-      case "$base" in
-        *.py|*.go|*.mjs|*.js|*.ts|*.tsx|*.jsx|*.md|*.sh) ;;
-        *) found=0 ;;
-      esac ;;
-  esac
   shopt -u nocasematch
   return "$found"
 }
@@ -127,9 +128,11 @@ ROOT_DIR=""
 LOCAL=0
 WORKER=""
 SUITE=""
+RUN_DIR=""
 CHILDREN=""
 DATABASES=""
 CONTAINERS=""
+WATCHDOG=""
 ADMITTED=0
 START_EPOCH=0
 START_ISO=""
@@ -168,7 +171,8 @@ between_busy() {
 
 free_gb() { df -Pk "$1" | awk 'NR==2 {print int($4 / 1048576)}'; }
 
-# Hold one of MAX_RUNS slot locks on fd 9 for the life of this process (and its children).
+# Hold one of MAX_RUNS slot locks on fd 9 for the life of this shell. Every child starts with fd 9
+# closed (9>&-), so the lock dies with the runner even when an orphan outlives it.
 take_slot() {
   local slot
   mkdir -p "$ROOT_DIR/.locks"
@@ -195,28 +199,55 @@ admit() {
   return 0
 }
 
-seconds_of() { awk '{ split($0, a, "m"); sub("s", "", a[2]); printf "%.2f", a[1] * 60 + a[2] }' <<< "$1"; }
+# CPU seconds (user + system) of this shell's finished children, from a `times` snapshot taken in the
+# owning shell (in a subshell `times` would report the subshell's own children).
+cpu_of() {
+  tail -1 "$1" | awk '{ t = 0; for (i = 1; i <= 2; i++) { split($i, a, "m"); sub("s", "", a[2]); t += a[1] * 60 + a[2] }
+    printf "%.1f", t }'
+}
 
-# User + system CPU of every finished child of this run so far (bash `times`: the rusage /usr/bin/time reads).
-children_cpu() {
-  local line
-  line="$(times | tail -1)"
-  awk -v u="$(seconds_of "${line%% *}")" -v s="$(seconds_of "${line##* }")" 'BEGIN { printf "%.1f", u + s }'
+# Every process group, PostgreSQL and container a run starts is recorded with its start time, so a later
+# stop (the watchdog, the next run, --cleanup) signals it only while that same process still holds the id.
+started() { ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' '_' || true; }
+own() { printf '%s %s %s\n' "$1" "$2" "${3:-$(started "$2")}" >> "$RUN_DIR/owned"; }
+
+reap() {
+  local dir="$1" kind id stamp
+  [ -f "$dir/owned" ] || return 0
+  while read -r kind id stamp; do
+    case "$kind" in
+      group) [ "$(started "$id")" = "$stamp" ] && kill -TERM -- "-$id" 2>/dev/null ;;
+      postgres) [ "$(started "$id")" = "$stamp" ] && kill -QUIT "$id" 2>/dev/null ;;
+      container) docker stop -t 5 "$id" >/dev/null 2>&1 ;;
+    esac || true
+  done < "$dir/owned"
+  rm -f "$dir/owned"
+}
+
+# Runs apart from the runner (fd 9 closed): when the runner dies without its trap (SIGKILL), it stops what
+# the run had started and removes its databases; `finish` kills it first on every normal exit.
+start_watchdog() {
+  local runner=$$ dir="$1"
+  ( trap '' HUP INT
+    while kill -0 "$runner" 2>/dev/null; do sleep 2; done
+    reap "$dir"
+    sleep 2
+    rm -rf "$dir"/pg[0-9]* "$dir/run.pid" ) 9>&- </dev/null >/dev/null 2>&1 &
+  WATCHDOG=$!
 }
 
 # Run a command as a background job (its own process group under set -m, so a stop reaches all of it) and
 # wait for it; a trapped signal interrupts the wait at once.
 run() {
-  "$@" &
+  "$@" 9>&- &
   local pid=$!
   CHILDREN="$CHILDREN $pid"
+  own group "$pid"
   wait "$pid"
   CHILDREN="${CHILDREN% $pid}"
 }
 
 in_dir() { cd "$1" && shift && exec "$@"; }
-
-stop_group() { kill "-$1" -- "-$2" 2>/dev/null || kill "-$1" "$2" 2>/dev/null || true; }
 
 PG_DSN=""
 PG_BIN="${DEEDKIT_PG_BIN:-/opt/homebrew/opt/postgresql@18/bin}"
@@ -224,20 +255,22 @@ PG_BIN="${DEEDKIT_PG_BIN:-/opt/homebrew/opt/postgresql@18/bin}"
 # The mini: PostgreSQL 18 from Homebrew as a child of this run, its cluster in the worker's directory,
 # listening on 127.0.0.1 only. A child, so its CPU (and its backends') counts in `times` once it is reaped.
 pg_start_native() {
-  local name="$1" data password port i
-  data="$ROOT_DIR/$WORKER/$name"
+  local name="$1" data password port i pid
+  data="$RUN_DIR/$name"
   password="$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
   rm -rf "$data"
   mkdir -p "$data"
   chmod 700 "$data"
-  (umask 077 && printf '%s\n' "$password" > "$data.pw")
-  "$PG_BIN/initdb" -D "$data/cluster" -U probe_owner --pwfile="$data.pw" --auth=scram-sha-256 -E UTF8 \
-    --locale=en_US.UTF-8 >/dev/null
-  rm -f "$data.pw"
+  (umask 077 && printf '%s\n' "$password" > "$data/pw")
+  "$PG_BIN/initdb" -D "$data/cluster" -U probe_owner --pwfile="$data/pw" --auth=scram-sha-256 -E UTF8 \
+    --locale=en_US.UTF-8 >/dev/null 9>&-
+  rm -f "$data/pw"
   port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
   "$PG_BIN/postgres" -D "$data/cluster" -c listen_addresses=127.0.0.1 -p "$port" -k "$data" \
-    -c shared_buffers=128MB -c fsync=off -c synchronous_commit=off -c full_page_writes=off > "$data/log" 2>&1 &
-  DATABASES="$DATABASES $!"
+    -c shared_buffers=128MB -c fsync=off -c synchronous_commit=off -c full_page_writes=off > "$data/log" 2>&1 9>&- &
+  pid=$!
+  DATABASES="$DATABASES $pid"
+  own postgres "$pid"
   for i in $(seq 1 60); do
     if "$PG_BIN/pg_isready" -q -h 127.0.0.1 -p "$port"; then break; fi
     if [ "$i" = 60 ]; then say "postgres $name did not become ready"; cat "$data/log" >&2; return 1; fi
@@ -247,61 +280,68 @@ pg_start_native() {
   PG_DSN="postgresql://probe_owner:$password@127.0.0.1:$port/messaging_probe_test"
 }
 
-# This machine: the local flow's `docker run --rm` postgres:18 on 127.0.0.1.
+# This machine: the local flow's `docker run --rm` postgres:18 on 127.0.0.1, named and labelled by worker;
+# only a container this run created (its id) is ever stopped.
 pg_start_docker() {
-  local name="$1" password port i
+  local name="deedkit_${WORKER}_$1" password port i id
   password="$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
-  CONTAINERS="$CONTAINERS $name"
-  docker run --rm -d --name "$name" --label "$LABEL=$WORKER" -e POSTGRES_USER=probe_owner \
-    -e "POSTGRES_PASSWORD=$password" -e POSTGRES_DB=messaging_probe_test -p 127.0.0.1::5432 "$PG_IMAGE" >/dev/null
+  id="$(docker run --rm -d --name "$name" --label "$LABEL=$WORKER" -e POSTGRES_USER=probe_owner \
+    -e "POSTGRES_PASSWORD=$password" -e POSTGRES_DB=messaging_probe_test -p 127.0.0.1::5432 "$PG_IMAGE")"
+  CONTAINERS="$CONTAINERS $id"
+  own container "$id" -
   # TCP readiness: the image's init server listens on the socket only, so this waits for the real one.
   for i in $(seq 1 90); do
-    if docker exec "$name" pg_isready -q -h 127.0.0.1 -U probe_owner -d messaging_probe_test 2>/dev/null; then break; fi
+    if docker exec "$id" pg_isready -q -h 127.0.0.1 -U probe_owner -d messaging_probe_test 2>/dev/null; then break; fi
     if [ "$i" = 90 ]; then say "postgres $name did not become ready"; return 1; fi
     sleep 1
   done
-  port="$(docker port "$name" 5432/tcp | head -1)"
+  port="$(docker port "$id" 5432/tcp | head -1)"
   PG_DSN="postgresql://probe_owner:$password@127.0.0.1:${port##*:}/messaging_probe_test"
 }
 
 pg_start() { if [ "$LOCAL" = 1 ]; then pg_start_docker "$@"; else pg_start_native "$@"; fi; }
 
-# Leftovers of an earlier run of this worker that was killed before its trap ran.
+# What an earlier run of this worker left behind when neither its trap nor its watchdog ran.
 stop_leftovers() {
-  local pidfile pid id
-  for pidfile in "$ROOT_DIR/$1"/pg*/cluster/postmaster.pid; do
+  local dir="$ROOT_DIR/$1" pidfile pid id
+  reap "$dir"
+  for pidfile in "$dir"/pg[0-9]*/cluster/postmaster.pid; do
     [ -f "$pidfile" ] || continue
     pid="$(head -1 "$pidfile")"
-    if [[ "$pid" =~ ^[0-9]+$ ]]; then kill -QUIT "$pid" 2>/dev/null || true; fi
+    if [[ "$pid" =~ ^[0-9]+$ ]] && ps -o command= -p "$pid" 2>/dev/null | grep -q "$dir/pg"; then
+      kill -QUIT "$pid" 2>/dev/null || true
+    fi
   done
-  rm -rf "$ROOT_DIR/$1"/pg*
+  rm -rf "$dir"/pg[0-9]*
   if [ "$LOCAL" = 1 ]; then
-    for id in $(docker ps -aq --filter "label=$LABEL=$1" 2>/dev/null); do docker stop -t 5 "$id" >/dev/null 2>&1 || true; done
+    for id in $(docker ps -q --filter "label=$LABEL=$1" 2>/dev/null); do docker stop -t 5 "$id" >/dev/null 2>&1 || true; done
   fi
 }
 
 finish() {
-  local status=$? pid name before pg=0
+  local status=$? pid name pg=0
   trap - EXIT INT TERM HUP
-  for pid in $CHILDREN; do stop_group TERM "$pid"; done
+  if [ -n "$WATCHDOG" ]; then kill -KILL "$WATCHDOG" 2>/dev/null || true; wait "$WATCHDOG" 2>/dev/null || true; fi
+  for pid in $CHILDREN; do kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true; done
   for pid in $CHILDREN; do wait "$pid" 2>/dev/null || true; done
-  before="$(children_cpu)"
+  times > "$RUN_DIR/.times-before"
   for pid in $DATABASES; do kill -QUIT "$pid" 2>/dev/null || true; done  # immediate shutdown
   for pid in $DATABASES; do wait "$pid" 2>/dev/null || true; done
+  times > "$RUN_DIR/.times"
   if [ -n "$DATABASES" ]; then
-    pg="$(awk -v a="$(children_cpu)" -v b="$before" 'BEGIN { printf "%.1f", a - b }')"
-    rm -rf "$ROOT_DIR/$WORKER"/pg*
+    pg="$(awk -v a="$(cpu_of "$RUN_DIR/.times")" -v b="$(cpu_of "$RUN_DIR/.times-before")" 'BEGIN { printf "%.1f", a - b }')"
   fi
   for name in $CONTAINERS; do docker stop -t 5 "$name" >/dev/null 2>&1 || true; done
+  rm -rf "$RUN_DIR"/pg[0-9]* "$RUN_DIR/owned"
   if [ "$SUITE" = root ] && [ "$LOCAL" = 0 ]; then
     say "skipped: needs docker (CI covers): the modules that use ANYMSG_TEST_POSTGRES_CONTAINER or the docker CLI;" \
       "this is not the full suite"
   fi
   if [ "$ADMITTED" = 1 ]; then
-    rm -f "$ROOT_DIR/$WORKER/run.pid"
+    rm -f "$RUN_DIR/run.pid"
     if [ "$LOCAL" = 0 ]; then
       printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$WORKER" "$SUITE" "$START_ISO" "$((SECONDS - START_EPOCH))" \
-        "$(children_cpu)" "$pg" "$status" >> "$ROOT_DIR/load.log"
+        "$(cpu_of "$RUN_DIR/.times")" "$pg" "$status" >> "$ROOT_DIR/load.log"
     fi
   fi
   exit "$status"
@@ -314,8 +354,7 @@ sync_env() { cd "$1" && exec uv sync --frozen --group dev -q; }
 prefix() { awk -v p="$1" '{ print p $0; fflush() }'; }
 
 suite_root() {
-  local dir="$1"; shift
-  local shard pids="" status=0 pid rc
+  local shard pid pids="" status=0 rc
   local ignores=(--ignore=tests/test_backup_r2_verifier_native.py
     --deselect tests/test_collectors.py::test_session_lock_rejects_directory_chowned_to_foreign_uid_as_root
     --deselect tests/test_audio_native.py::test_optional_cpu_package_loads_without_gpu_or_model_download
@@ -326,20 +365,22 @@ suite_root() {
   export OMP_THREAD_LIMIT=1
   if [ $# -gt 0 ] || [ "$PARALLEL" = 1 ]; then
     pg_start pg1
-    write_dsn "$dir/test-1.dsn"
+    write_dsn "$RUN_DIR/test-1.dsn"
     [ $# -gt 0 ] || set -- --tb=short "${ignores[@]}" tests
-    run env PROBE_TEST_DSN_FILE="$dir/test-1.dsn" uv run pytest "$@"
+    run env PROBE_TEST_DSN_FILE="$RUN_DIR/test-1.dsn" uv run pytest "$@"
     return
   fi
   # The full suite: PARALLEL file-level shards (scripts/python_shards.py, as CI), each with its own database.
   for shard in $(seq 1 "$PARALLEL"); do
     pg_start "pg$shard"
-    write_dsn "$dir/test-$shard.dsn"
+    write_dsn "$RUN_DIR/test-$shard.dsn"
   done
   for shard in $(seq 1 "$PARALLEL"); do
-    (env DEEDKIT_TEST_SHARD="$shard/$PARALLEL" PROBE_TEST_DSN_FILE="$dir/test-$shard.dsn" uv run python \
-      scripts/python_shards.py pytest --tb=short "${ignores[@]}" tests 2>&1 | prefix "[$shard/$PARALLEL] ") &
-    pids="$pids $!"
+    (env DEEDKIT_TEST_SHARD="$shard/$PARALLEL" PROBE_TEST_DSN_FILE="$RUN_DIR/test-$shard.dsn" uv run python \
+      scripts/python_shards.py pytest --tb=short "${ignores[@]}" tests 2>&1 | prefix "[$shard/$PARALLEL] ") 9>&- &
+    pid=$!
+    pids="$pids $pid"
+    own group "$pid"
   done
   CHILDREN="$CHILDREN $pids"
   for pid in $pids; do
@@ -350,9 +391,8 @@ suite_root() {
 }
 
 run_suite() {
-  local dir="$1"; shift
   case "$SUITE" in
-    root) suite_root "$dir" "$@" ;;
+    root) suite_root "$@" ;;
     calendar)
       run sync_env services/gateway
       run sync_env services/calendar
@@ -387,7 +427,7 @@ run_suite() {
 
 # --run <worker> <suite> [args] (the mini, as _deedkitci) or --run-local <worker> <suite> <worktree> [args].
 runner_run() {
-  local dir src=""
+  local src=""
   WORKER="$1" SUITE="$2"
   shift 2
   if [ "$LOCAL" = 1 ]; then src="$1"; shift; fi
@@ -395,23 +435,24 @@ runner_run() {
   # The script itself may have arrived on stdin; nothing the suite starts reads the rest of it.
   exec 0</dev/null
   runner_env
-  dir="$ROOT_DIR/$WORKER"
+  RUN_DIR="$ROOT_DIR/$WORKER"
   if [ "$LOCAL" = 0 ]; then admit run || exit $?; fi
-  mkdir -p "$dir"
-  if [ -f "$dir/run.pid" ] && kill -0 "$(cat "$dir/run.pid")" 2>/dev/null; then
+  mkdir -p "$RUN_DIR"
+  if [ -f "$RUN_DIR/run.pid" ] && kill -0 "$(cat "$RUN_DIR/run.pid")" 2>/dev/null; then
     say "a run of $WORKER is still active"; exit "$REFUSED"
   fi
+  stop_leftovers "$WORKER"
   set -m
   trap finish EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
   trap 'exit 129' HUP
   ADMITTED=1 START_EPOCH=$SECONDS START_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  echo $$ > "$dir/run.pid"
-  stop_leftovers "$WORKER"
+  echo $$ > "$RUN_DIR/run.pid"
+  start_watchdog "$RUN_DIR"
   if [ "$LOCAL" = 0 ]; then
     renice -n "$NICE" -p $$ >/dev/null 2>&1 || true
-    src="$dir/src"
+    src="$RUN_DIR/src"
     mkdir -p "$src"
     rsync "${RSYNC_COPY[@]}" "$SHARED/stage/$WORKER/" "$src/"
     cd "$src"
@@ -424,7 +465,7 @@ runner_run() {
     cd "$src"
   fi
   say "running $SUITE for $WORKER on $(hostname -s)"
-  run_suite "$dir" "$@"
+  run_suite "$@"
 }
 
 here_stop() {
@@ -500,13 +541,17 @@ laptop_run() {
     255) say "mini unreachable"; fallback "$UNREACHABLE" "$tree" "$suite" "$worker" "$@" ;;
     *) say "the mini's service user $SERVICE_USER is not set up (exit $status)"; fallback "$NOT_SET_UP" "$tree" "$suite" "$worker" "$@" ;;
   esac
+  # The local stage (kept until the next run of this worker) mirrors exactly the files that may leave.
   stage="${DEEDKIT_REMOTE_STAGE:-${TMPDIR:-/tmp}/deedkit-remote-test/$worker}"
   rm -rf "$stage/src"
   mkdir -p "$stage/src"
   list_files "$tree" > "$stage/files"
   tar -C "$tree" --null -T "$stage/files" -cf - | tar -C "$stage/src" -xpf -
-  ssh "${SSH_OPTS[@]}" "$HOST" "mkdir -p $(printf '%q' "$SHARED/stage/$worker")"
-  rsync "${RSYNC_COPY[@]}" -e "ssh ${SSH_OPTS[*]}" "$stage/src/" "$HOST:$SHARED/stage/$worker/"
+  if ! ssh "${SSH_OPTS[@]}" "$HOST" "mkdir -p $(printf '%q' "$SHARED/stage/$worker")" ||
+     ! rsync "${RSYNC_COPY[@]}" -e "ssh ${SSH_OPTS[*]}" "$stage/src/" "$HOST:$SHARED/stage/$worker/"; then
+    say "copying to the mini failed before the suite started"
+    fallback "$UNREACHABLE" "$tree" "$suite" "$worker" "$@"
+  fi
   trap 'as_service --here stop "$worker" || true; exit 130' INT TERM HUP
   status=0
   as_service --run "$worker" "$suite" ${@+"$@"} || status=$?
