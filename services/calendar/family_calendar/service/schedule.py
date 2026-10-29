@@ -86,8 +86,6 @@ EXCEPTION_EFFECTS = {
     "cancelled": "Stays cancelled: the occurrence at its original start plus the shift is cancelled again.",
     "moves": "Moves with the series and keeps its own title, place, description and other own fields.",
     "kept": "Keeps its own start and end (and its own fields); follow_up moves it back into the series.",
-    "named": "The occurrence this move names: it goes to the requested time, also if it was moved on its own "
-             "before, and keeps its own title, place, description and other own fields.",
 }
 
 

@@ -360,20 +360,21 @@ def test_guests_added_to_an_instance_after_the_series_write_stop_only_that_write
 
 # spec: ANYM-614
 @pytest.mark.parametrize("scope", ["all", "following"])
-def test_the_occurrence_the_move_names_goes_to_the_requested_time_even_if_moved_before(store, scope):
-    """The named occurrence was moved on its own (09:00 to 12:00); the move asks for 10:30: the preview says so
-    (`named`) and it lands at 10:30 with its own title, not back at 12:00."""
+def test_the_occurrence_the_move_names_keeps_its_own_time_when_moved_before(store, scope):
+    """The named occurrence was moved on its own (09:00 to 12:00); the series moves to 10:30 by its original start,
+    and the occurrence keeps 12:00 and its own title (criterion 1), with a follow_up into the series."""
     key = setup(store)
     providers, server = world([master(), exception(2, start=week(2, 12), end=week(2, 13), summary="Moved lesson")])
     refs = publish(store, server)
     move = {**ALL, "series": scope, "event": refs["20261102"]}
-    view = preview(store, providers, key, move)["preview"]
-    assert [(e["fate"], e["effect"]) for e in view["exceptions"]] == [("named", sched.EXCEPTION_EFFECTS["named"])]
-    result = run(store, providers, key, {"confirm_token": preview(store, providers, key, move)["confirm_token"]})
+    shown = preview(store, providers, key, move)
+    [named] = shown["preview"]["exceptions"]
+    assert named["fate"] == "kept" and named["follow_up"]["arguments"]["start"] == "2026-11-02T17:30:00+08:00"
+    result = run(store, providers, key, {"confirm_token": shown["confirm_token"]})
     assert result["state"] == "succeeded"
     base = "lesson" if scope == "all" else plan_steps(store, result)[0]["target_id"]
     landed = server.events[iid(base, 2, 10, 30)]
-    assert landed["start"]["dateTime"] == week(2, 10, 30).isoformat() and landed["summary"] == "Moved lesson"
+    assert landed["start"]["dateTime"] == week(2, 12).isoformat() and landed["summary"] == "Moved lesson"
 
 
 # spec: ANYM-614
