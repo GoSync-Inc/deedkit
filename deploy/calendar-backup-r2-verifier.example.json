@@ -12,5 +12,6 @@
   "postgres_headroom_bytes": 8589934592,
   "reserve_bytes": 2147483648,
   "timeout_seconds": 21600,
-  "busy_wait_seconds": 300
+  "busy_wait_seconds": 300,
+  "postgres_data_directory": "/var/lib/deedkit-backup-verify-postgres"
 }

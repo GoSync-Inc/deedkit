@@ -1874,3 +1874,311 @@ def test_both_verifier_timers_start_two_minutes_after_the_last_run():
         lines=(root/name).read_text().splitlines()
         assert 'OnUnitInactiveSec=2min' in lines and 'RandomizedDelaySec=30s' in lines and 'OnBootSec=10min' in lines
         assert 'AccuracySec=1s' in lines
+
+
+@pytest.fixture
+def datadir(instances,tmp_path,monkeypatch):
+    # ANYM-634: both instances keep their scratch PostgreSQL in one local-disk root 0700; chown is recorded.
+    s=instances;root=tmp_path/'pg-local';root.mkdir(mode=0o700);s.chowned=[];s.made=[]
+    for config in (s.messaging,s.calendar):config['postgres_data_directory']=str(root)
+    # The image's postgres user is uid 999; here the test's own uid stands in for it (removal checks the owner).
+    assert s.v.POSTGRES_UID==999;monkeypatch.setattr(s.v,'POSTGRES_UID',os.getuid())
+    monkeypatch.setattr(os,'chown',lambda path,uid,gid,**kw:s.chowned.append((path,uid,gid)))
+    real_make=s.v.make_data_directory
+    def make(path):
+        # Its exact path is in the holder's record before the directory exists.
+        record=json.loads((s.host/'admission.json').read_text())
+        entry=['directory',str(path),record['run'],s.v.root_identity(Path(path).parent)]
+        assert entry in record['resources'] and not Path(path).exists()
+        s.made.append(Path(path));real_make(path);(Path(path)/'18').mkdir();(Path(path)/'18'/'PG_VERSION').write_text('18')
+    monkeypatch.setattr(s.v,'make_data_directory',make)
+    real_restore=s.engine.restore
+    def restore(config,receiver,client,receipt,run,payload,secret_dir):
+        # A bind mount needs its source: the run's directory exists, 0700, while the restore runs.
+        data=s.v.data_directory(config,run);assert data is None or (data.is_dir() and data.stat().st_mode&0o777==0o700)
+        return real_restore(config,receiver,client,receipt,run,payload,secret_dir)
+    s.engine.restore=restore;s.root=root
+    s.config=lambda profile:s.messaging if profile=='messaging' else s.calendar
+    s.cloud_of=lambda profile:s.cloud if profile=='messaging' else s.calendar_cloud
+    return s
+
+
+# spec: ANYM-634
+@pytest.mark.parametrize('outcome',['success','failure'])
+@pytest.mark.parametrize('profile',['messaging','calendar'])
+def test_a_runs_data_directory_is_recorded_before_it_exists_and_removed_on_success_and_failure(datadir,profile,outcome):
+    s=datadir;v=s.v;config=s.config(profile)
+    if outcome=='failure':
+        s.engine.failure=RuntimeError('restore_docker_failed')
+        with pytest.raises(RuntimeError,match='restore_docker_failed'):v.run(config,client=s.cloud_of(profile),engine=s.engine)
+        run=json.loads((Path(config['directory'])/'active.json').read_text())['run']
+        assert s.status(config)['cleanup_complete'] is True
+    else:
+        assert v.run(config,client=s.cloud_of(profile),engine=s.engine)['status']=='verified'
+        run=json.loads((Path(config['directory'])/'last-success.json').read_text())['verification_id']
+    assert s.made==[s.root/v.names(run,profile)['volume']] and s.chowned==[(s.made[0].name,os.getuid(),os.getuid())]
+    assert s.engine.admissions[-1]['resources'][-1]==['directory',str(s.made[0]),run,v.root_identity(s.root)]
+    # The bind replaces the volume: the record still names it, for a retry from before ANYM-634.
+    assert ['volume',v.names(run,profile)['volume'],run] in s.engine.admissions[-1]['resources']
+    assert list(s.root.iterdir())==[] and not s.engine.resources and not (s.host/'admission.json').exists()
+
+
+def kill_holder_with_data(s,profile,run='f'*32,data=None):
+    """A coordinator SIGKILLed mid-restore with its data directory on the local disk (ANYM-634)."""
+    data=data or s.root/s.v.names(run,profile)['volume']
+    with s.v.host_lock(s.messaging) as fd:
+        s.v.admit(s.engine,fd,profile,run,s.v.run_resources(run,profile,data))
+    for kind,name,owner in s.v.run_resources(run,profile):s.engine.resources[(kind,name)]=owner
+    return data
+
+
+# spec: ANYM-634
+@pytest.mark.parametrize('profile',['messaging','calendar'])
+def test_a_sigkilled_holders_data_directory_is_removed_by_the_next_holder(datadir,profile):
+    s=datadir;v=s.v;data=kill_holder_with_data(s,profile)
+    (data/'18'/'docker').mkdir(parents=True);(data/'18'/'docker'/'PG_VERSION').write_text('18')
+    other='calendar' if profile=='messaging' else 'messaging'
+    assert v.run(s.config(other),client=s.cloud_of(other),engine=s.engine)['status']=='verified'
+    assert not data.exists() and list(s.root.iterdir())==[] and not s.engine.resources
+    assert not (s.host/'admission.json').exists()
+
+
+# spec: ANYM-634
+@pytest.mark.parametrize('case',['unremovable','symlink','foreign_name','unrelated_parent','public_parent','other_run',
+                                  'record_run','other_owner'])
+def test_a_recorded_data_directory_that_cannot_be_removed_refuses_with_nothing_created(datadir,monkeypatch,tmp_path,case):
+    s=datadir;v=s.v;outside=tmp_path/'outside';outside.mkdir();(outside/'keep').write_text('kept')
+    if case in ('foreign_name','other_run','record_run','unrelated_parent'):
+        # A record naming a path that is not its run's directory under its admitted root is never acted on.
+        data=kill_holder_with_data(s,'messaging')
+        record=json.loads((s.host/'admission.json').read_text());entry=record['resources'][-1]
+        if case=='foreign_name':entry[1]=str(outside)
+        elif case=='unrelated_parent':
+            # The run's exact name under another root-private directory: not the root it was admitted under.
+            outside.chmod(0o700);data=outside/data.name;data.mkdir();(data/'keep').write_text('kept');entry[1]=str(data)
+        else:
+            # The name of another run, also as that run's own entry inside this run's record.
+            data=outside/v.names('e'*32,'messaging')['volume'];data.mkdir();(data/'keep').write_text('kept')
+            entry[1]=str(data);entry[3]=v.root_identity(outside)
+            if case=='record_run':entry[2]='e'*32
+        s.write_json(s.host/'admission.json',record)
+    elif case=='public_parent':
+        # The run's exact name under a parent that is not root-private: not a data root, never removed.
+        outside.chmod(0o755);data=kill_holder_with_data(s,'messaging',data=outside/v.names('f'*32,'messaging')['volume'])
+        data.mkdir();(data/'keep').write_text('kept')
+    elif case=='other_owner':
+        # The recorded directory was replaced by one of another user.
+        data=kill_holder_with_data(s,'messaging');data.mkdir();(data/'keep').write_text('kept');real_stat=os.stat
+        def stat_(path,*a,**kw):
+            info=real_stat(path,*a,**kw)
+            if str(path)==data.name and kw.get('dir_fd') is not None:values=list(info);values[4]=1234;return os.stat_result(values)
+            return info
+        monkeypatch.setattr(os,'stat',stat_)
+    else:
+        data=kill_holder_with_data(s,'messaging')
+        if case=='symlink':data.symlink_to(outside,target_is_directory=True)
+        else:
+            data.mkdir()
+            real=v.shutil.rmtree
+            def rmtree(path,*a,**kw):
+                if str(path)==data.name:raise PermissionError('busy')
+                return real(path,*a,**kw)
+            monkeypatch.setattr(v.shutil,'rmtree',rmtree)
+    record=(s.host/'admission.json').read_bytes()
+    with pytest.raises(RuntimeError,match='verifier_cleanup_unconfirmed'):
+        v.run(s.calendar,client=s.calendar_cloud,engine=s.engine)
+    assert created(s.engine,'calendar')==[] and s.made==[] and (s.host/'admission.json').read_bytes()==record
+    assert (outside/'keep').read_text()=='kept' and s.status(s.calendar)['error']=='verifier_cleanup_unconfirmed'
+    if case in ('unrelated_parent','public_parent','other_owner','other_run','record_run'):assert (data/'keep').read_text()=='kept'
+
+
+def separate_filesystem(monkeypatch,root):
+    """The data directory's root reads as another filesystem than the working directory's."""
+    real=os.stat
+    def fake(path,*a,**kw):
+        info=real(path,*a,**kw)
+        if not kw.get('dir_fd') and not a and Path(path)==root:values=list(info);values[2]+=1;return os.stat_result(values)
+        return info
+    monkeypatch.setattr(os,'stat',fake)
+
+
+# spec: ANYM-634
+@pytest.mark.parametrize('low',['work','data','shared'])
+def test_low_space_on_either_filesystem_refuses_before_anything_is_created(datadir,monkeypatch,low):
+    s=datadir;v=s.v;config=s.messaging
+    database=config['postgres_headroom_bytes']+config['reserve_bytes']
+    if low!='shared':separate_filesystem(monkeypatch,s.root)
+    def free(path):
+        if low=='data' and Path(path)==s.root:return SimpleNamespace(free=database-1)
+        if low=='work' and Path(path)==Path(config['directory']):return SimpleNamespace(free=config['reserve_bytes'])
+        # One filesystem holds both shares: room for the database share alone is not enough.
+        if low=='shared':return SimpleNamespace(free=database)
+        return SimpleNamespace(free=100*v.GIB)
+    monkeypatch.setattr(v.shutil,'disk_usage',free)
+    with pytest.raises(ValueError,match='restore_disk_capacity'):v.run(config,client=s.cloud,engine=s.engine)
+    assert not s.engine.log and s.made==[] and list(s.root.iterdir())==[] and not (s.host/'admission.json').exists()
+
+
+# spec: ANYM-634
+def test_the_reserve_monitor_watches_the_data_directorys_filesystem(tmp_path,monkeypatch):
+    v=module();config={'directory':str(tmp_path/'work'),'postgres_data_directory':str(tmp_path/'pg')}
+    roots=v.reserve_roots(config,'/docker');assert roots==[str(tmp_path/'work'),'/docker',str(tmp_path/'pg')]
+    assert v.reserve_roots({'directory':'/work'},'/docker')==['/work','/docker']
+    engine=v.Docker();engine.disk_roots=roots;engine.reserve_bytes=100
+    monkeypatch.setattr(v.shutil,'disk_usage',lambda path:SimpleNamespace(free=99 if path==str(tmp_path/'pg') else 1000))
+    with pytest.raises(ValueError,match='restore_disk_capacity'):engine.check_reserve()
+
+
+# spec: ANYM-634
+@pytest.mark.parametrize('attack',['symlink','group_writable','non_root','not_private','relative','mount_option',
+                                   'in_work','holds_work','in_state','in_host','null','alias_work','alias_host'])
+def test_an_unsafe_postgres_data_directory_is_refused(operator,monkeypatch,tmp_path,attack):
+    v,config,receiver,cloud,engine,write_json=operator
+    data=tmp_path/'pg-local';data.mkdir(mode=0o700);value=str(data)
+    if attack=='symlink':
+        real=tmp_path/'pg-real';real.mkdir(mode=0o700);data.rmdir();data.symlink_to(real,target_is_directory=True)
+    elif attack=='group_writable':data.chmod(0o770)
+    elif attack=='not_private':data.chmod(0o750)
+    elif attack=='non_root':
+        inode=data.stat().st_ino;patched=os.fstat
+        def fstat(fd):
+            info=patched(fd)
+            if info.st_ino!=inode:return info
+            values=list(info);values[4]=1000;return os.stat_result(values)
+        monkeypatch.setattr(os,'fstat',fstat)
+    elif attack=='relative':value='pg-local'
+    elif attack=='mount_option':value=str(data)+',readonly'
+    elif attack=='in_work':value=str(Path(config['directory'])/'pg')
+    elif attack=='holds_work':value=str(tmp_path)
+    elif attack=='in_state':value=str(Path(receiver['state_directory'])/'pg')
+    elif attack=='in_host':value=config['host_directory']+'/pg'
+    elif attack=='null':value=None
+    elif attack=='alias_work':value='/'+config['directory']  # `//x` is `/x` on Linux
+    elif attack=='alias_host':config={**config,'host_directory':'/'+str(data)};value=str(data/'pg')
+    path=Path(config['receiver_config_file']).parent/'verifier-config.json'
+    write_json(path,{**config,'postgres_data_directory':value})
+    codes={'group_writable':'untrusted_operator_ancestor','non_root':'untrusted_operator_ancestor',
+           'not_private':'private_verifier_directory_required','relative':'invalid_verifier_path','alias_work':'invalid_verifier_path',
+           'mount_option':'invalid_verifier_path','null':'invalid_verifier_path'}
+    if attack=='symlink':
+        with pytest.raises(OSError):v.load_config(path)  # O_NOFOLLOW: never followed
+    else:
+        with pytest.raises(ValueError,match=codes.get(attack,'separate_operator_evidence_required')):v.load_config(path)
+    write_json(path,{**config,'postgres_data_directory':str(tmp_path/'pg-ok')});(tmp_path/'pg-ok').mkdir(mode=0o700)
+    if attack!='non_root':assert v.load_config(path)['postgres_data_directory']==str(tmp_path/'pg-ok')
+
+
+# spec: ANYM-634
+@pytest.mark.parametrize('profile',['messaging','calendar'])
+def test_an_older_verifiers_journal_and_admission_record_are_retried_and_cleaned(datadir,profile):
+    s=datadir;v=s.v;config=s.config(profile);old={k:val for k,val in config.items() if k!='postgres_data_directory'}
+    # The older verifier: a Docker volume, a journal and a record without any data directory.
+    s.engine.failure=RuntimeError('restore_docker_failed')
+    with pytest.raises(RuntimeError):v.run(old,client=s.cloud_of(profile),engine=s.engine)
+    run=json.loads((Path(config['directory'])/'active.json').read_text())['run']
+    with v.host_lock(old) as fd:v.admit(s.engine,fd,profile,run,v.run_resources(run,profile))
+    for kind,name,owner in v.run_resources(run,profile):s.engine.resources[(kind,name)]=owner
+    assert all(item[0]!='directory' for item in json.loads((s.host/'admission.json').read_text())['resources'])
+    s.engine.failure=None;log=len(s.engine.log)
+    assert v.run(config,client=s.cloud_of(profile),engine=s.engine)['status']=='verified'
+    assert ('remove',v.names(run,profile)['volume']) in s.engine.log[log:]
+    assert s.made==[s.root/v.names(run,profile)['volume']] and list(s.root.iterdir())==[]
+    assert not s.engine.resources and not (s.host/'admission.json').exists()
+    assert not (Path(config['directory'])/'active.json').exists()
+
+
+# spec: ANYM-634
+@pytest.mark.parametrize('local_disk',[True,False],ids=['data_directory','volume'])
+def test_the_scratch_postgres_gets_restore_memory_and_its_storage(tmp_path,monkeypatch,local_disk):
+    v=module();engine=v.Docker();calls=[];run='a'*32
+    monkeypatch.setattr(engine,'command',lambda *args:calls.append(args) or b'')
+    config={'postgres_image':v.POSTGRES_IMAGE,'helper_image':'sha256:'+'a'*64,'identity_file':'/private/key',
+            **({'postgres_data_directory':'/srv/pg-local'} if local_disk else {})}
+    engine.setup(config,run,tmp_path,tmp_path)
+    postgres=next(call for call in calls if call[:2]==('container','create') and v.POSTGRES_IMAGE in call)
+    settings=postgres[postgres.index(v.POSTGRES_IMAGE)+1:]
+    assert {settings[i+1] for i,value in enumerate(settings[:-1]) if value=='-c'}>={
+        'shared_buffers=256MB','maintenance_work_mem=256MB','max_parallel_workers=0'}
+    assert '--cpus=1' in postgres and '--memory=1g' in postgres and '--memory-swap=1g' in postgres
+    mount=postgres[postgres.index('--mount')+1];volume=v.names(run)['volume']
+    if local_disk:
+        assert mount=='type=bind,src=/srv/pg-local/'+volume+',dst=/var/lib/postgresql'
+        assert not any(call[:2]==('volume','create') for call in calls)
+    else:
+        assert mount=='type=volume,src='+volume+',dst=/var/lib/postgresql' and ('volume','create') in [c[:2] for c in calls]
+
+
+# spec: ANYM-634
+def test_follow_self_test_keeps_a_docker_volume_with_a_data_directory_configured(self_test_setup):
+    v,f,directory,config=self_test_setup;seen=[]
+    class Engine(SelfTestEngine):
+        def setup(self,tested,run,payload,secret_dir):seen.append(tested);super().setup(tested,run,payload,secret_dir)
+        def restore(self,tested,*args):seen.append(tested);return super().restore(tested,*args)
+    engine=Engine(v,f,{**config,'postgres_data_directory':'/srv/pg-local'})
+    assert f.self_test(engine,{**config,'postgres_data_directory':'/srv/pg-local'})==([2,50],50)
+    assert len(seen)==2 and all('postgres_data_directory' not in tested for tested in seen)
+
+
+class Killed(BaseException):
+    """A SIGKILL: no except clause of the run handles it."""
+
+
+# spec: ANYM-634
+@pytest.mark.parametrize('change',['removed','moved'])
+@pytest.mark.parametrize('profile',['messaging','calendar'])
+def test_a_retry_after_its_proof_removes_the_recorded_data_directory_after_the_key_changed(datadir,monkeypatch,tmp_path,profile,change):
+    s=datadir;v=s.v;config=s.config(profile);real=v.cleanup_resources;calls=[]
+    def killed_after_proof(*args,**kw):
+        calls.append(args)
+        if len(calls)>=2:raise Killed()  # also the failure path's cleanup: the process is gone
+        return real(*args,**kw)
+    monkeypatch.setattr(v,'cleanup_resources',killed_after_proof)
+    with pytest.raises(Killed):v.run(config,client=s.cloud_of(profile),engine=s.engine)
+    journal=json.loads((Path(config['directory'])/'active.json').read_text())
+    data=s.root/v.names(journal['run'],profile)['volume']
+    assert journal['phase']=='proof_ready' and data.is_dir() and (s.host/'admission.json').exists()
+    monkeypatch.setattr(v,'cleanup_resources',real)
+    if change=='removed':del config['postgres_data_directory']
+    else:other=tmp_path/'pg-other';other.mkdir(mode=0o700);config['postgres_data_directory']=str(other)
+    assert v.run(config,client=s.cloud_of(profile),engine=s.engine)['status']=='verified'
+    assert not data.exists() and list(s.root.iterdir())==[] and not (s.host/'admission.json').exists()
+    assert not s.engine.resources and len(s.made)==1
+
+
+# spec: ANYM-634
+@pytest.mark.parametrize('phase',['proof_ready','promoted'])
+def test_a_retry_after_its_proof_with_no_record_left_never_waits_for_the_host_lock(datadir,monkeypatch,phase):
+    s=datadir;v=s.v;config={**s.messaging,'verify_wait_seconds':1};original=r2.protect
+    def lost_response(*args,**kwargs):original(*args,**kwargs);raise TimeoutError('lost promotion result')
+    monkeypatch.setattr(r2,'protect',lost_response)
+    with pytest.raises(TimeoutError):v.run(config,client=s.cloud,engine=s.engine)
+    monkeypatch.setattr(r2,'protect',original)
+    active=Path(config['directory'])/'active.json';journal=json.loads(active.read_text())
+    assert journal['phase']=='proof_ready' and not (s.host/'admission.json').exists()
+    if phase=='promoted':s.write_json(active,{**journal,'phase':'promoted'})
+    # The calendar instance restores meanwhile: this retry promotes without waiting for it.
+    monkeypatch.setattr(v.time,'sleep',lambda seconds:pytest.fail('the retry waited for the host lock'))
+    with v.host_lock(s.calendar):
+        assert v.run(config,client=s.cloud,engine=s.engine)['status']=='verified'
+    assert not active.exists() and list(s.root.iterdir())==[]
+
+
+# spec: ANYM-634
+@pytest.mark.parametrize('phase',['proof_ready','promoted'])
+def test_a_retry_after_its_proof_meeting_an_invalid_record_keeps_it_and_the_directory(datadir,monkeypatch,phase):
+    s=datadir;v=s.v;config=s.messaging;real=v.cleanup_resources;calls=[]
+    def killed_after_proof(*args,**kw):
+        calls.append(args)
+        if len(calls)>=2:raise Killed()
+        return real(*args,**kw)
+    monkeypatch.setattr(v,'cleanup_resources',killed_after_proof)
+    with pytest.raises(Killed):v.run(config,client=s.cloud,engine=s.engine)
+    monkeypatch.setattr(v,'cleanup_resources',real)
+    active=Path(config['directory'])/'active.json';journal=json.loads(active.read_text())
+    data=s.root/v.names(journal['run'],'messaging')['volume']
+    if phase=='promoted':s.write_json(active,{**journal,'phase':'promoted'})
+    # The record names another run on top while its entries still name this run's resources: invalid.
+    record=json.loads((s.host/'admission.json').read_text());s.write_json(s.host/'admission.json',{**record,'run':'e'*32})
+    kept=(s.host/'admission.json').read_bytes();del config['postgres_data_directory']
+    with pytest.raises(RuntimeError,match='verifier_cleanup_unconfirmed'):v.run(config,client=s.cloud,engine=s.engine)
+    assert data.is_dir() and (s.host/'admission.json').read_bytes()==kept and active.exists()

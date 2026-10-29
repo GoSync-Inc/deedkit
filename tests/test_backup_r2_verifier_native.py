@@ -115,7 +115,11 @@ def test_real_pg18_age_stream_restore_runs_all_seven_checks_in_isolated_owned_co
         verifier.write_secret(target_secrets/'worker.json',r2.encoded({'v':1,'identity_file':'/run/restore/identity',
             'work_directory':'/work','database_host':'restore-postgres','database_password':password,
             'snapshot_sha256':snapshot,'max_plaintext_bytes':receipt['wire']['bytes']}))
-        facts=engine.restore(config,{'bucket':'synthetic'},Cloud(),receipt,restore_run,target_payload,target_secrets)
+        # The restore's scratch PostgreSQL keeps its data in a run directory on a root 0700 local root (ANYM-634).
+        data_root=root/'pg-local';data_root.mkdir(mode=0o700)
+        restore_config={**config,'postgres_data_directory':str(data_root)}
+        data=verifier.data_directory(restore_config,restore_run);verifier.make_data_directory(data)
+        facts=engine.restore(restore_config,{'bucket':'synthetic'},Cloud(),receipt,restore_run,target_payload,target_secrets)
         proof=verifier.make_proof(receipt,facts,restore_run)
         assert proof['verification']['schema_version']==55
         assert proof['verification']['checks']=={name:True for name in r2.CHECKS}
@@ -129,11 +133,17 @@ def test_real_pg18_age_stream_restore_runs_all_seven_checks_in_isolated_owned_co
         mounts={m['Destination'] for m in helper['Mounts']}
         assert mounts=={'/work','/run/restore/identity','/run/restore/config.json'}
         assert helper['HostConfig']['Memory']==512*1024**2 and pg['HostConfig']['Memory']==1024**3
+        assert [(m['Type'],m['Source'],m['Destination']) for m in pg['Mounts']]==[('bind',str(data),verifier.PG_DATA_PATH)]
+        assert 'shared_buffers=256MB' in pg['Args'] and 'maintenance_work_mem=256MB' in pg['Args']
+        assert next(data.rglob('PG_VERSION'),None) is not None,'the cluster is not in the run data directory'
     finally:
         # Exact journal-derived resource names and labels; no prune or unrelated IDs.
         if engine.inspect_owned('helper',fixture_name,source_run) is not None:engine.remove('helper',fixture_name)
-        verifier.cleanup_resources(engine,source_run);verifier.cleanup_resources(engine,restore_run)
+        verifier.cleanup_resources(engine,source_run)
+        verifier.cleanup_resources(engine,restore_run,data=verifier.data_directory({'postgres_data_directory':str(root/'pg-local')},restore_run))
+        removed=not (root/'pg-local').exists() or not any((root/'pg-local').iterdir())
         shutil.rmtree(root)
+    assert removed,'the run data directory outlived its cleanup'
     # Every labelled explicit PG volume was removed. Inherited helper/fixture
     # paths were bounded tmpfs, so no anonymous data volume can outlive them.
     for run in (source_run,restore_run):

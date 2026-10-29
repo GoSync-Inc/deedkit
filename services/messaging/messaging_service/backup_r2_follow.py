@@ -285,7 +285,8 @@ def self_test(engine, config, run=None):
     run = run or secrets.token_hex(16); source = fixture_run(run); root = directory / (SELF_TEST + run)
     root.mkdir(mode=0o700); local.fsync_dir(directory)
     fixture = root / 'fixture'; fixture.mkdir(mode=0o700)
-    tested = {**config, 'identity_file': str(fixture / 'identity')}
+    # The synthetic fixture keeps a Docker volume: only a verification run records and creates a data directory (ANYM-634).
+    tested = {**{k: v for k, v in config.items() if k != 'postgres_data_directory'}, 'identity_file': str(fixture / 'identity')}
     (probe, _), (name, _) = self_test_containers(run, profile)
     pg_tmpfs = verifier.PG_DATA_PATH + ':' + verifier.HELPER_TMPFS[verifier.PG_DATA_PATH]
     try:

@@ -295,8 +295,10 @@ The helper receives the recovery key read-only and plaintext workspace access,
 with no R2 credentials, producer DSN, delivery key, shared application volumes or
 Docker socket. PostgreSQL and helper containers use an exact owned internal
 network with no egress and no published host ports. Their images and resource
-limits are explicit: the helper has 512 MiB and PostgreSQL 1 GiB, with one restore
-job. These container bounds still require host headroom; this is not application
+limits are explicit: the helper has 512 MiB and PostgreSQL 1 GiB (`shared_buffers`
+and `maintenance_work_mem` 256 MB each), both capped at one CPU. The messaging
+helper restores with two jobs (`pg_restore --jobs=2`); the calendar helper streams
+its dump to `pg_restore` and keeps one. These container bounds still require host headroom; this is not application
 startup or permission to disturb existing services on a 4 GiB receiver.
 
 Successful verification requires authenticated age EOF and exact full cloud
@@ -314,6 +316,48 @@ up to the example's 40 GiB bound, 8 GiB headroom and 2 GiB reserve, plan for up 
 **50 GiB free**. Separate filesystems must each pass their respective work or
 database requirement with reserve. These are planning bounds, not a filesystem
 quota or a guarantee about future database growth.
+
+**Scratch database on the local disk (ANYM-634).** By default the scratch
+PostgreSQL keeps its data in an owned Docker volume, on Docker's data root. With
+`postgres_data_directory` (verifier config, optional) it keeps it in a run
+directory under that path instead: put it on the receiver's local disk, not on
+network block storage. The path is absolute, a root-owned `0700` directory the
+operator creates (`install -d -m 0700 -o root -g root <path>`), walked from `/`
+through root-owned, non-writable ancestors (a symlink is refused), outside the
+verifier `directory`, the upload state directory and `host_directory`. Both
+verifier configs may name the same path: run directories carry the profile. Each
+run records `<path>/deedkit-verify-<profile>-<run>-data` in `admission.json`
+before it creates it (`0700`, owned by the image's `postgres` user, uid 999,
+inside the root-only parent), bind-mounts it at `/var/lib/postgresql`, and
+removes exactly that path on success and failure; after a SIGKILL the next
+holder removes it from the record. The record holds the path, the run and the
+data root's device and inode. A retry after its proof whose own record a crash
+left (or an invalid record) clears it under the host lock, so a run directory
+recorded before the key was removed or changed is still removed; with no record
+or another run's valid record it does not wait for the host lock. Removal from a record refuses a path that is not the
+record run's name directly in the data root it was admitted under (same device
+and inode, root-private), or whose leaf is not a directory of root or uid 999 (a
+symlink is never followed); such a path, like one it cannot remove, ends
+`verifier_cleanup_unconfirmed` with nothing new created and the record kept. The disk preflight
+checks the database share (headroom plus reserve) on that directory's
+filesystem and the payload share on the working directory's (one shared
+filesystem: their sum), and the reserve monitor watches both during the run. The
+plaintext restored database then sits on the local disk instead of the Docker
+volume: same host, root-only, removed after each run. The follow's self-test keeps
+a Docker volume for its small synthetic fixture.
+
+Install order: the verifier wheel that knows the key (installed by hand,
+[Receiver installation](#receiver-installation-and-private-configuration); the
+follow does not update it) and the helper with
+`--jobs=2` (the pin step, [Two verifiers on one receiver](#two-verifiers-on-one-receiver)),
+then the key in each verifier config, each with no upload or proof running. A run
+journaled by an older verifier (Docker volume, no data-directory record) is
+retried and cleaned by the new one. Undo, in this order: remove
+`postgres_data_directory` from every verifier config, wait until no verifier
+`active.json` exists and `host_directory/admission.json` is gone (a recorded
+directory would be left for a holder that cannot read it), then install the
+older wheel or helper. An older verifier refuses the key in its config and a
+`directory` resource in `admission.json`.
 Measure available disk and RAM alongside the host's other projects. On a small
 receiver, leave memory for the host and existing applications; do not increase
 helper/PostgreSQL limits or delete shared data to make admission pass.
@@ -509,8 +553,9 @@ after the wait. Under the lock the holder:
    them gone, the new holder fails `verifier_cleanup_unconfirmed`, creates
    nothing and keeps the record;
 2. writes its own record (profile, run, the exact name of every resource it
-   will create, for a messaging retry also its names from before ANYM-609)
-   before creating any;
+   will create, for a messaging retry also its names from before ANYM-609, and
+   with `postgres_data_directory` its run directory's exact path) before
+   creating any;
 3. removes its resources after success or failure and then its record.
 
 Scratch names carry the profile: `deedkit-verify-<profile>-<run>-helper`,
