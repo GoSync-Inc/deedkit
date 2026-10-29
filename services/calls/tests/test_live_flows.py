@@ -540,6 +540,74 @@ def test_finalizing_same_input_chunks_is_not_new_human_speech(tmp_path):
     store.close()
 
 
+# spec: ANYM-374
+def test_late_final_of_an_old_goodbye_cannot_close_a_newer_unfinished_story(tmp_path):
+    store, identity = call(tmp_path)
+    store.audio_activity(identity,True)
+    store.transcript_chunk(identity,'user','Спасибо, до свидания.')
+    store.audio_activity(identity,False)
+    store.audio_activity(identity,True)
+    store.transcript_chunk(identity,'user','Хотя подожди, я ещё про доставку')
+    store.audio_activity(identity,False)
+    # Pipecat finalizes the old goodbye only now, after the newer story began.
+    store.transcript(identity,'user','Спасибо, до свидания.')
+    assert end(store,identity,'Спасибо, до свидания.')['error'] == 'closing_confirmation_required'
+    assert not store.closing_ready(identity)
+    store.transcript(identity,'user','Хотя подожди, я ещё про доставку не сказал.')
+    store.audio_activity(identity,True)
+    store.transcript_chunk(identity,'user','Всё, до свидания.')
+    store.audio_activity(identity,False)
+    store.transcript(identity,'user','Всё, до свидания.')
+    assert end(store,identity,'Всё, до свидания.','fresh')['end_requested']
+    assert store.closing_ready(identity)
+    store.close()
+
+
+# spec: ANYM-374
+def test_goodbye_sentence_final_keeps_the_rest_of_its_chunk_pending(tmp_path):
+    store, identity = call(tmp_path)
+    store.audio_activity(identity,True)
+    store.transcript_chunk(identity,'user','До свидания. Хотя нет, подожди')
+    store.audio_activity(identity,False)
+    # Pipecat sends one sentence per final; the rest of the chunk is still unfinalized speech.
+    store.transcript(identity,'user','До свидания.')
+    assert end(store,identity,'До свидания.')['error'] == 'closing_confirmation_required'
+    assert not store.closing_ready(identity)
+    store.close()
+
+
+# spec: ANYM-374
+def test_late_final_of_an_old_answer_keeps_the_newer_closing_reply(tmp_path):
+    store, identity = call(tmp_path)
+    store.transcript_chunk(identity,'user','Доставка с 12 до 13.')
+    store.transcript(identity,'assistant','Записала. Можем заканчивать?')
+    store.transcript_chunk(identity,'user','Да, можем заканчивать.')
+    store.transcript(identity,'user','Доставка с 12 до 13.')
+    assert end(store,identity,'Да, можем заканчивать.')['end_requested']
+    # The reply's own final is the same input, not new human speech.
+    store.transcript(identity,'user','Да, можем заканчивать.')
+    assert store.closing_ready(identity)
+    store.close()
+
+
+# spec: ANYM-374
+def test_every_chunk_split_keeps_exactly_the_speech_no_final_has_transcribed(tmp_path):
+    store, identity = call(tmp_path)
+    old, new = 'До свидания. Ну пока.', 'Хотя подожди, ещё'
+    speech = old + ' ' + new
+    for first in range(1, len(speech)):
+        for second in range(first, len(speech)):
+            pieces = [p for p in (speech[:first], speech[first:second], speech[second:]) if p]
+            events = [{'kind':'transcript_chunk','role':'user','text':p} for p in pieces]
+            # Pipecat finalizes the old speech sentence by sentence, after all chunks arrived.
+            for sentence in ('До свидания.', 'Ну пока.'):
+                events.append({'kind':'transcript','role':'user','text':sentence})
+            assert ' '.join(store._latest_turn(events,'user').split()) == new, pieces
+            events.append({'kind':'transcript','role':'user','text':new})
+            assert store._turns(events,'user')[2] == [], pieces
+    store.close()
+
+
 def test_simple_yes_requires_offer_and_new_human_turn(tmp_path):
     store, identity = call(tmp_path)
     store.transcript(identity,'user','Да.')
