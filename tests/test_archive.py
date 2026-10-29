@@ -789,3 +789,71 @@ def test_whatsapp_body_completion_rule_is_a_pure_function_of_two_observations():
     assert not whatsapp_body_completion({**retained,'formatting':wire('report.pdf')},validate(business()))
     for broken in (None,{},{**retained,'metadata':'unknown'},{**retained,'updated_at':'not a time'}):
         assert not whatsapp_body_completion(broken,validate(business()))
+
+
+def group_formatting(entities=None):
+    body='Первый текст lighthouse'
+    return {'version':1,'state':'observed','basis':'telegram_native_entities',
+        'wire_sha256':hashlib.sha256(body.encode()).hexdigest(),
+        'entities':entities if entities is not None else [{'type':'bold','offset':0,'length':6}],
+        'unsupported_entities':[],'warnings':[]}
+
+
+GROUP_SELF={'chat_type':'group','sender_identity_basis':'authenticated_self'}
+
+
+# spec: ANYM-620
+@pytest.mark.parametrize('retained_type',[None,'group'])
+def test_authenticated_group_sender_completion_resolves_its_conflict(archive,retained_type):
+    ar,s,key,_=archive
+    original=event(sender='',direction='outgoing',metadata={'chat_type':retained_type},formatting=group_formatting())
+    mid=ar.ingest(original)['message']
+    completed={**original,'sender':'42','sender_profile':{'display_name':'Synthetic Owner'},'metadata':GROUP_SELF}
+    # Today's class E: the same content naming a sender without the authenticated basis.
+    assert ar.ingest({**completed,'metadata':{'chat_type':'group','sender_identity_basis':None}})['outcome']=='conflict'
+    assert ar.ingest({**completed,'body':'unrelated conflicting text'})['outcome']=='conflict'
+    assert ar.ingest(completed)['outcome']=='edited'
+    assert ar.ingest(completed)['outcome']=='duplicate'
+    message=s.get_context(key,mid)['message']
+    assert message['sender']=='42' and message['revision']==2
+    assert message['sender_identity_basis']=='authenticated_self'
+    assert message['formatting']['entities']==group_formatting()['entities']
+    assert message['evidence']['active_conflicts']==1
+    with s.pool.connection() as c:
+        snapshots=c.execute('SELECT snapshot FROM message_revisions WHERE message=%s ORDER BY revision',(mid,)).fetchall()
+        conflicts=c.execute('''SELECT r.envelope->>'body' AS body,mc.resolved_revision FROM message_conflicts mc
+            JOIN ingest_receipts r ON r.digest=mc.receipt_digest WHERE mc.message=%s ORDER BY mc.observed_at''',(mid,)).fetchall()
+    assert [r['snapshot']['sender'] for r in snapshots]==['','42']
+    assert [(r['body'],r['resolved_revision']) for r in conflicts]==[
+        ('Первый текст lighthouse',2),('unrelated conflicting text',None)]
+    assert [r['revision'] for r in s.get_updates(key,'history')['items']]==[1,2]
+
+
+# spec: ANYM-620
+@pytest.mark.parametrize('change',[
+    {'metadata':{'chat_type':'group'}},
+    {'sender':'77','metadata':{'chat_type':'group'}},
+    {'sender':'-100300','metadata':{'chat_type':'group'}},
+    {'metadata':{'chat_type':'channel','sender_identity_basis':'authenticated_self'}},
+    {'direction':'incoming'}, {'body':'changed content'},
+    {'media':[{'provider_id':'f1','mime':'image/jpeg','bytes':10,'filename':'p.jpg'}]},
+    {'updated_at':'2026-10-01T12:01:00Z'}, {'deleted':True},
+    {'formatting':group_formatting([{'type':'italic','offset':0,'length':6}])}],
+    ids=['no_basis','other_user','anonymous_admin','channel','incoming','body','media','version','deleted','formatting'])
+def test_group_sender_completion_keeps_other_differences_in_conflict(archive,change):
+    ar,s,key,_=archive
+    original=event(sender='',direction='outgoing',metadata={'chat_type':None},formatting=group_formatting())
+    mid=ar.ingest(original)['message']
+    assert ar.ingest({**original,'sender':'42','metadata':GROUP_SELF,**change})['outcome']=='conflict'
+    message=s.get_context(key,mid)['message']
+    assert message['sender']=='' and message['revision']==1
+
+
+# spec: ANYM-620
+@pytest.mark.parametrize('sender,chat_type',[('77','group'),('','private'),('','channel')])
+def test_group_sender_completion_needs_an_empty_group_sender(archive,sender,chat_type):
+    ar,s,key,_=archive
+    original=event(sender=sender,direction='outgoing',metadata={'chat_type':chat_type})
+    mid=ar.ingest(original)['message']
+    assert ar.ingest({**original,'sender':'42','metadata':GROUP_SELF})['outcome']=='conflict'
+    assert s.get_context(key,mid)['message']['sender']==sender
