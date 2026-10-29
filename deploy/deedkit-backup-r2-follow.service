@@ -1,5 +1,5 @@
 [Unit]
-Description=Follow main: install the attested DeedKit backup helper of a newer commit after its self-test
+Description=Follow main: install the attested DeedKit backup helper and receiver code of a newer commit after their self-test
 Wants=network-online.target
 Requires=docker.service
 After=network-online.target docker.service

@@ -692,8 +692,9 @@ running) exits 0; a refusal exits 1. A crash before the switch leaves the old
 config; a crash after it leaves a stale publication (`capabilities_unavailable`)
 until the next run proves and publishes the installed pair. A pair installed
 before `backup.SCHEMAS` existed cannot be proven: no publication until the
-follow moves to a newer one. The follow does not update the verifier code in
-the venv; a schema beyond the venv's `backup_r2_verifier.SCHEMAS` fails the
+follow moves to a newer one. The receiver's code moves with the pins once its
+venv is a release link ([below](#the-receivers-code)); a hand-installed venv
+keeps its code, and a schema beyond its `backup_r2_verifier.SCHEMAS` fails the
 self-test and keeps the old pair until the venv is updated by hand.
 
 Requirements: `git`, `ssh-keygen`, the pinned `attest-verify` build (SHA-256 in
@@ -715,9 +716,96 @@ then switch back to the kept pair:
 ```
 
 `revert` rewrites the two pins from `follow-previous.json` (the replaced pair
-becomes the kept one) and republishes it when it was proven. A corrupt
-`follow-main.git` reads as `main_unreachable`; remove that directory and the
-next run fetches it again.
+becomes the kept one), points `venv` back to the kept pair's release when it
+names one (the other profiles' self-tests then run by that release's code), and
+republishes it when it was proven. A kept pair from before the release link
+leaves the code where it is. A corrupt `follow-main.git` reads as
+`main_unreachable`; remove that directory and the next run fetches it again.
+
+### The receiver's code
+
+The receiver's code (receive, `capabilities`, both verifiers and the follow
+itself) moves with the pins once `/opt/deedkit-backup-r2/venv` is a symlink to
+a release, `releases/<revision>` (a venv), in the same directory. While `venv`
+is a directory (a hand install) only the pins follow. With the link, the
+follow takes a candidate when the pins or the linked release lag main's head
+(a pin step can move the pins alone), and a candidate (step 3 above) also:
+
+- moves only forward from the linked release (`follow_not_forward`);
+- stages `releases/<head>` in `releases/.stage-<run>` (1 GiB free on
+  `/opt/deedkit-backup-r2` first, `follow_disk_capacity`): a copy of the linked
+  release without the wheel's `messaging_service`, `anymsg` and their record,
+  plus the attested image's `/app/messaging_service`, copied out of a created,
+  never started, networkless container (named and labelled before it exists,
+  removed by exact name). The package, its root included, may hold only
+  directories and regular files without set-ID bits (`verifier_code_invalid`);
+  they become 0755/0644. The copy keeps the linked release's dependencies:
+  every pin of the image's `/app/requirements-backup-r2.lock` (the commit's
+  receiver lock, read as a regular file of at most 1 MiB, never through a link)
+  must be installed at that version, else `verifier_dependencies_changed`. The
+  lock may hold only `name==version` pins, their `--hash=sha256:` lines and
+  comments, each name once; a distribution installed twice or without a
+  readable record is refused too. A changed dependency needs a hand-installed
+  release (below). The stage binds the release (its `.lease` and
+  `deedkit-release.pth`, below) and fsyncs it file by file before it is
+  renamed into place;
+- runs every self-test (each listed profile's) by the staged code itself:
+  `releases/<head>/bin/python -I -B -m messaging_service.backup_r2_follow self-test`
+  with one JSON request on stdin, under the follow's locks and host admission,
+  with its own deadline ending before the follow's. The child gets SIGKILL when
+  the follow dies (`PR_SET_PDEATHSIG`), so it never outlives the locks; the next
+  holder confirms its recorded resources gone. The child first loads receive's
+  own imports (`boto3`, `botocore.config`, `backup_r2_receiver`). A failed or
+  malformed answer is `staged_self_test_failed`; the child's own line goes to
+  the journal.
+
+A bound release's `deedkit-release.pth` runs at every start of its
+interpreter, before any DeedKit import, for every verb (receive, cold copies
+and downloads, `capabilities`, both verifiers, the follow): the process imports
+from the release `venv` resolved to at that moment and holds a shared `flock`
+on that release's `.lease` until it exits. A later switch therefore never
+changes what a running process imports, and a release goes only when its lease
+can be taken exclusively; a held one stays for a later run. The follow uses
+only bound releases (`verifier_code_unbound`).
+
+The switch records name each pair's release (`code`). Before the pins move the
+follow writes `code-switch.json` in the shared host directory, naming its own
+verifier directory (the one holding its switch journal). While the marker
+exists no verifier instance starts a run (`verifier_code_unfinished`, no retry
+journal written), since the pins and the code may differ. The link moves right
+after the pins, in one rename, and the marker goes after it. A crash or stop in
+between moves the link (or confirms the old one) and removes the marker first
+thing in the next run or `revert` with the same `--config`; a follow run with
+another instance's config refuses (`code_switch_foreign`) and leaves both. After
+a switch only the linked and the kept release stay; a refused or interrupted
+release is removed by the run that refused it or by the next one.
+
+Enable it once, as root, with the follow stopped and no upload in flight, where
+`REVIEWED_SOURCE` is the revision the hand venv was built from (40 hex digits,
+a commit of main):
+
+```sh
+systemctl stop deedkit-backup-r2-follow.timer deedkit-backup-r2-follow.service
+systemctl is-active deedkit-backup-r2-follow.service   # must print inactive
+pgrep -f messaging_service.backup_r2_receiver          # must print nothing
+install -d -m 0755 -o root -g root /opt/deedkit-backup-r2/releases
+cp -a /opt/deedkit-backup-r2/venv "/opt/deedkit-backup-r2/releases/$REVIEWED_SOURCE"
+"/opt/deedkit-backup-r2/releases/$REVIEWED_SOURCE/bin/python" -m messaging_service.backup_r2_follow bind --release "$REVIEWED_SOURCE"
+ln -s "releases/$REVIEWED_SOURCE" /opt/deedkit-backup-r2/venv.link
+mv /opt/deedkit-backup-r2/venv /opt/deedkit-backup-r2/venv.hand
+mv -T /opt/deedkit-backup-r2/venv.link /opt/deedkit-backup-r2/venv
+systemctl start deedkit-backup-r2-follow.timer
+```
+
+A release with a changed dependency is installed by hand as above into
+`releases/<revision>` (after the same three checks) and bound the same way,
+then `venv` is moved to it with `ln -s` on a new name and `mv -T` over `venv`. Undo of the layout: the same
+three checks, remove the link (`unlink /opt/deedkit-backup-r2/venv`; a
+directory cannot replace it in one rename), then `mv
+/opt/deedkit-backup-r2/venv.hand /opt/deedkit-backup-r2/venv` (or copy one
+release there as a directory); the follow then moves only the pins. A
+`code-switch.json` left in the host directory while the follow is disabled
+keeps verifications waiting: run `revert` (or one follow run) to finish it.
 
 ## First protected point and one-point rotation
 
