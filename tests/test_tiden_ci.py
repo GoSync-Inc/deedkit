@@ -2276,6 +2276,10 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
     for name in FRAGMENTS["services"][0]:
         assert service_steps[name]["if"] == "${{ !cancelled() && steps.source.outcome == 'success' }}"
         assert MODULE_REPORTS[name][0] in service_steps[name]["run"]
+    # Verify's calendar suite still runs the gateway's locked environment, which the gateway step no longer creates there.
+    calendar = [line.strip() for line in next(step for step in jobs["verify"]["steps"] if step.get("id") == "calendar")["run"].splitlines()]
+    assert calendar.index("(cd ../gateway && uv sync --locked --group dev)") < next(
+        index for index, line in enumerate(calendar) if line.startswith("uv run pytest"))
     recorded = next(step for step in services["steps"] if step.get("name") == "Record the service outcomes")
     assert recorded["if"] == "${{ always() }}" and dict(re.findall(r'"(\w+)":"\$\{\{ steps\.(\w+)\.outcome \}\}"',
                                                                    recorded["env"]["MODULE_OUTCOMES"])) == {name: name for name in FRAGMENTS["services"][0]}
