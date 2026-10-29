@@ -903,8 +903,12 @@ set the calendar `runner.json` `image` to the same ID in the same idle window an
 `calendar-db`), `recipient`, `delivery_ed25519` and `known_hosts`, and the job directory `backups/`. Units:
 `deploy/deedkit-calendar-backup.service` and `.timer` (daily 16:00 UTC). Its read-only `--check` is
 `python3 -I /opt/personal-os-probe/ops/backup_runner.py --config /opt/deedkit/calendar-backup/runner.json
---check`. Undo: `systemctl disable --now deedkit-calendar-backup.timer`, then remove the units and the
-directory; messaging's files are not touched.
+--check`. Undo, in this order: `systemctl disable --now deedkit-calendar-backup.timer`; let a running
+`deedkit-calendar-backup.service` end or `systemctl stop` it (its `ExecStopPost` recovers); go on only when the
+service is inactive, no `deedkit-calendar-backup-*` container exists, `/opt/personal-os-probe/backups/.runner.lock.unsettled`
+is absent and `--check` prints `idle`; then remove the units (`daemon-reload`) and move the directory aside
+(`/opt/deedkit/calendar-backup.removed-<date>`, root `0700`) rather than deleting its journal and evidence. A
+failed check stops the undo. Messaging's files are not touched.
 
 ## Roll back the current release
 

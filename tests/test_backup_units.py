@@ -35,9 +35,16 @@ def example(tmp_path):
     return backup_runner.config(path)
 
 
+def stop_post():
+    """ExecStopPost's /bin/sh script as the shell runs it."""
+    shell = shlex.split(unit('deedkit-calendar-backup.service')['Service']['ExecStopPost'])
+    assert shell[:2] == ['/bin/sh', '-c'] and len(shell) == 3
+    return shell[2].replace('$$', '$')
+
+
 def service_config():
     service = unit('deedkit-calendar-backup.service')['Service']
-    start, stop = shlex.split(service['ExecStart']), shlex.split(service['ExecStopPost'])
+    start, stop = shlex.split(service['ExecStart']), shlex.split(stop_post().split('|| exec ', 1)[1])
     assert start[:3] == ['/usr/bin/python3', '-I', RUNNER] and start[3] == '--config' and len(start) == 5
     assert stop == start + ['--recover-stop']
     return Path(start[4])
@@ -80,13 +87,23 @@ def test_the_calendar_timer_fires_daily_at_16_utc_persistent_inside_autodeploys_
 # spec: ANYM-607
 def test_a_calendar_run_and_its_recovery_end_before_messagings_run_and_retry_none():
     timer, service = unit('deedkit-calendar-backup.timer')['Timer'], unit('deedkit-calendar-backup.service')
-    start = 16 * 3600 + seconds(timer['RandomizedDelaySec'])
+    start = latest_timer_start(timer)
     # The runner's own lock wait ends first; systemd's start bound then ends the run before 18:00.
     assert start + backup_runner.HOST_LOCK_WAIT_SECONDS < MESSAGING_RUN
     budget = seconds(service['Service']['TimeoutStartSec'])
     assert budget > backup_runner.HOST_LOCK_WAIT_SECONDS
-    assert start + budget + seconds(service['Service']['TimeoutStopSec']) < MESSAGING_RUN
+    assert start + whole_budget(service['Service']) < MESSAGING_RUN
     assert service['Service'].get('Restart', 'no') == 'no'
+
+
+def latest_timer_start(timer):
+    """16:00 plus the timer's random delay and its accuracy (systemd's default accuracy is 1 min)."""
+    return 16 * 3600 + seconds(timer['RandomizedDelaySec']) + seconds(timer.get('AccuracySec', '1min'))
+
+
+def whole_budget(service):
+    """TimeoutStartSec, then the main process's stop and ExecStopPost, each with its own TimeoutStopSec."""
+    return seconds(service['TimeoutStartSec']) + 2 * seconds(service['TimeoutStopSec'])
 
 
 def admission():
@@ -101,10 +118,11 @@ def admission():
 def test_a_late_start_is_not_admitted_so_no_calendar_run_reaches_messagings_run():
     service, timer = unit('deedkit-calendar-backup.service')['Service'], unit('deedkit-calendar-backup.timer')['Timer']
     _, last = admission()
-    # The timer's own start (16:00 plus its random delay) is admitted; a Persistent= catch-up or a manual start
-    # after the bound is skipped, and every admitted start, its whole budget and its recovery end before 18:00.
-    assert 16 * 3600 + seconds(timer['RandomizedDelaySec']) <= last
-    assert last + seconds(service['TimeoutStartSec']) + seconds(service['TimeoutStopSec']) < MESSAGING_RUN
+    # The timer's own start (16:00 plus its random delay and accuracy) is admitted; a Persistent= catch-up or a
+    # manual start after the bound is skipped, and every admitted start, its whole budget and its recovery end
+    # before 18:00.
+    assert latest_timer_start(timer) <= last
+    assert last + whole_budget(service) < MESSAGING_RUN
 
 
 # spec: ANYM-607
@@ -115,5 +133,19 @@ def test_the_admission_condition_admits_only_minutes_up_to_its_bound_and_fails_c
         fake.write_text('#!/bin/sh\n' + ('echo ' + clock if clock else 'exit 1') + '\n')
         fake.chmod(0o700)
         return subprocess.run(['/bin/sh', '-c', script], env={'PATH': f'{tmp_path}:/usr/bin:/bin'}).returncode == 0
-    assert all(admitted(clock) for clock in ('0000', '0930', '1600', '1605'))
-    assert not any(admitted(clock) for clock in ('1606', '1700', '1759', '1800', '2359', 'x', ''))
+    assert all(admitted(clock) for clock in ('0000', '0930', '1600', '1602'))
+    assert not any(admitted(clock) for clock in ('1603', '1605', '1700', '1759', '1800', '2359', 'x', ''))
+
+
+# spec: ANYM-607
+def test_a_start_the_condition_skipped_recovers_nothing_and_every_other_end_recovers(tmp_path):
+    script = stop_post()
+    assert script.count('/usr/bin/python3') == 1
+    fake, calls = tmp_path / 'python3', tmp_path / 'calls'
+    fake.write_text(f'#!/bin/sh\necho "$@" >> {calls}\n')
+    fake.chmod(0o700)
+    local = script.replace('/usr/bin/python3', str(fake))
+    for result in ('exec-condition', 'success', 'timeout', 'exit-code', 'signal', ''):
+        subprocess.run(['/bin/sh', '-c', local], env={'PATH': '/usr/bin:/bin', 'SERVICE_RESULT': result}, check=True)
+    lines = calls.read_text().splitlines()
+    assert len(lines) == 5 and all(line.endswith('runner.json --recover-stop') for line in lines)

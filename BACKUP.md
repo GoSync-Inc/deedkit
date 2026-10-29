@@ -416,11 +416,14 @@ On the production host `deploy/deedkit-calendar-backup.service` runs the install
 `--recover-stop`. `deploy/deedkit-calendar-backup.timer` fires daily at 16:00 UTC with
 `Persistent=true`: inside autodeploy's no-start hours (13:00-18:59), and the runner's 5400 s wait for
 messaging's lock ends before messaging's 18:00 run. The hour only schedules; the lock excludes (above).
-Its `ExecCondition` admits a start only up to 16:05 UTC (a `Persistent=` catch-up after a reboot or a
-late manual start is skipped; an unreadable clock skips too), `TimeoutStartSec=6600s` ends every
-admitted run, its lock wait and recovery included, before 18:00, and the unit has no `Restart=`, so
-the calendar never holds messaging's lock into messaging's run; a skipped or failed day stays in
-`status.json` until the next day's run. The unit may write only its job directory and messaging's
+Its `ExecCondition` admits a start only up to 16:02 UTC (a `Persistent=` catch-up after a reboot or a
+late manual start is skipped; an unreadable clock skips too; the timer fires within 16:00:31,
+`AccuracySec=1s`). `TimeoutStartSec=6300s` plus the main process's stop and `ExecStopPost`, each with
+its own `TimeoutStopSec=180s`, ends every admitted run, its lock wait and recovery included, before
+18:00; a skipped start runs no recovery (`SERVICE_RESULT=exec-condition`), and the unit has no
+`Restart=`, so the calendar never holds messaging's lock into messaging's run. A skipped or failed day
+stays in `status.json` until the next day's run; a journal an earlier recovery left waits for the next
+admitted run, and its `.unsettled` marker keeps deploys out meanwhile. The unit may write only its job directory and messaging's
 backup directory (the shared lock and its `.unsettled` marker). The capture limit is
 `timeout_seconds` 900 and the receiver busy wait `busy_wait_seconds` 1800.
 
