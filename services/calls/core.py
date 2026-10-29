@@ -1412,19 +1412,20 @@ class VoiceService:
         return expired
 
     def _save_expired(self,v,expired):
-        """The body first: a failed save writes nothing else, so the deadline row stays and a later pass retries.
+        """Body, voice event, journal row, then the dropped deadline, in this order; the first failure raises.
 
-        Then the event rows and the dropped deadlines, logged only: a missing expired row is written again by
-        the sweep when it finds the decision expired and its deadline row still there.
+        Nothing is written after a failure: SQLite may have rolled the whole transaction back (SQLITE_FULL), and
+        a later write would then commit alone. Whatever the failure kept, the deadline row is the last write, so
+        it stays and a later pass retries: a decision found expired with its deadline still there gets its
+        journal row written again (idempotent by key).
         """
         self._save_call(v,report=False,commit=False)
         for d in expired:
-            try:
-                self._event(v,{'kind':'decision_expired','decision_id':d['id']})
-            except Exception as error:
-                call_events.log('decision_expiry_event_failed',error)
-            if call_events.record_owner_request(self.db,v,d,'expired',d['expired_at']):
-                call_events.untrack_deadline(self.db,d['id'])
+            self._event(v,{'kind':'decision_expired','decision_id':d['id']})
+            if not call_events.record_owner_request(self.db,v,d,'expired',d['expired_at']):
+                raise RuntimeError('decision_expired_row_failed')
+            if not call_events.untrack_deadline(self.db,d['id']):
+                raise RuntimeError('decision_deadline_failed')
 
     def expire_decisions(self):
         """Lazy expiry of owner requests past their deadline (ANYM-563), at most EXPIRY_BATCH per pass.
@@ -1459,11 +1460,15 @@ class VoiceService:
                         # Expired earlier with its event row missing: write it (idempotent by key) before dropping.
                         if decision is not None and decision['status']=='expired' and not call_events.record_owner_request(
                                 self.db,v,decision,'expired',decision.get('expired_at') or now()):
-                            continue
-                        changed=call_events.untrack_deadline(self.db,decision_id) or changed
+                            raise RuntimeError('decision_expired_row_failed')
+                        if not call_events.untrack_deadline(self.db,decision_id):
+                            raise RuntimeError('decision_deadline_failed')
+                        changed=True
                 except Exception as error:
+                    # Stop the pass: the transaction may be rolled back, and no later write may commit alone.
                     call_events.log('decision_expiry_failed',error)
-            if changed:
+                    break
+            if changed and self.db.in_transaction:
                 try:
                     self.db.commit()
                 except Exception as error:

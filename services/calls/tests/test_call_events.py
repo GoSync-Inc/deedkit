@@ -251,17 +251,18 @@ def test_a_failed_expiry_save_writes_nothing_and_a_later_pass_expires_it_once(tm
     monkeypatch.setattr(VoiceService, '_save_call', failing)
     store.expire_decisions()
     monkeypatch.undo()
-    assert store.get_call('call-1')['decisions'][0]['status'] == 'pending'
-    assert store.get_call('call-2')['decisions'][0]['status'] == 'expired'
+    # The failure stops the pass (Sol r3): nothing after it is written, both decisions stay pending and tracked.
+    assert [store.get_call(f'call-{n}')['decisions'][0]['status'] for n in (1, 2)] == ['pending', 'pending']
 
     def states():
         return [(data['call_id'], data['state']) for kind, data in journal(store) if kind == 'call.owner_request']
-    assert states() == [('call-2', 'expired')]
-    assert [row[0] for row in store.db.execute('SELECT decision_id FROM decision_deadlines')] == ['decision-1']
+    assert states() == []
+    assert sorted(row[0] for row in store.db.execute('SELECT decision_id FROM decision_deadlines')) == [
+        'decision-1', 'decision-2']
     store.expire_decisions()
     store.expire_decisions()
-    assert store.get_call('call-1')['decisions'][0]['status'] == 'expired'
-    assert states() == [('call-2', 'expired'), ('call-1', 'expired')]
+    assert [store.get_call(f'call-{n}')['decisions'][0]['status'] for n in (1, 2)] == ['expired', 'expired']
+    assert states() == [('call-1', 'expired'), ('call-2', 'expired')]
     assert store.db.execute('SELECT count(*) FROM decision_deadlines').fetchone()[0] == 0
     store.close()
 
@@ -284,6 +285,68 @@ def test_an_expired_decision_whose_event_write_failed_gets_its_row_from_the_next
     store.expire_decisions()
     assert [data['state'] for kind, data in journal(store) if kind == 'call.owner_request'] == ['expired']
     assert store.db.execute('SELECT count(*) FROM decision_deadlines').fetchone()[0] == 0
+    store.close()
+
+
+# spec: ANYM-563
+def test_a_full_disk_during_expiry_never_drops_a_deadline_the_body_does_not_show(tmp_path, capsys):
+    # SQLITE_FULL may roll the whole transaction back: nothing may be written after it (Sol r3).
+    seed(tmp_path, [archived(n, decision_at='2026-10-01T10:01:00+00:00') for n in range(1, 4)])
+    store = VoiceService(tmp_path)
+    store.db.execute('VACUUM')
+    pages = store.db.execute('PRAGMA page_count').fetchone()[0]
+    store.db.execute(f'PRAGMA max_page_count={pages}')
+    # Fill the free space of both journals with rows smaller than any real one, so the next real insert needs
+    # a page the database may not have.
+    fillers = {'voice_events': 'INSERT INTO voice_events(id,call_id,body) VALUES (?,?,?)',
+               'call_events': '''INSERT INTO call_events(event_key,call_id,type,occurred_at,owner_principal,rehearsal,
+                   data,urgency,expires_at) VALUES (?,'f','f','f',NULL,0,'{}','f',NULL)'''}
+    for table, sql in fillers.items():
+        for n in range(100000):
+            try:
+                store.db.execute(sql, (f'f{n}', 'f', '{}') if table == 'voice_events' else (f'f{n}',))
+                store.db.commit()
+            except sqlite3.OperationalError:
+                store.db.rollback()
+                break
+        else:
+            raise AssertionError('the database never filled')
+    store.expire_decisions()
+    assert 'decision_expiry_failed' in capsys.readouterr().err
+    store.db.rollback()
+    deadlines = {row[0] for row in store.db.execute('SELECT decision_id FROM decision_deadlines')}
+    rows = {data['decision_id'] for kind, data in journal(store) if kind == 'call.owner_request'}
+    for n in range(1, 4):
+        status = store.get_call(f'call-{n}')['decisions'][0]['status']
+        # A deadline is dropped only together with an expired body and its journal row.
+        assert f'decision-{n}' in deadlines or (status == 'expired' and f'decision-{n}' in rows), (n, status)
+    store.db.execute('PRAGMA max_page_count=1073741823')
+    store.expire_decisions()
+    assert [store.get_call(f'call-{n}')['decisions'][0]['status'] for n in range(1, 4)] == ['expired'] * 3
+    assert sorted(data['decision_id'] for kind, data in journal(store) if kind == 'call.owner_request') == [
+        'decision-1', 'decision-2', 'decision-3']
+    assert store.db.execute('SELECT count(*) FROM decision_deadlines').fetchone()[0] == 0
+    store.close()
+
+
+# spec: ANYM-563
+def test_a_terminal_event_committed_while_a_page_is_read_waits_for_the_next_page(tmp_path, monkeypatch):
+    store = VoiceService(tmp_path)
+    store.stop(external(store), 'agent_stop')
+    later = external(store)
+    original = call_events.head
+
+    def head_then_commit(db):
+        value = original(db)
+        if db is not store.db:
+            monkeypatch.setattr(call_events, 'head', original)
+            store.stop(later, 'agent_stop')
+        return value
+    monkeypatch.setattr(call_events, 'head', head_then_commit)
+    first, _ = read(store, {'after': 0, 'journal_id': None})
+    assert [e['id'] for e in first['events']] == ['calls:1'] and first['next']['after'] == 1
+    second, _ = read(store, first['next'])
+    assert [e['id'] for e in second['events']] == ['calls:2']
     store.close()
 
 

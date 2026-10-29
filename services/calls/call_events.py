@@ -187,9 +187,14 @@ def _served(row,include_rehearsal):
 
 
 def scan(db,after):
-    """The only step under the service lock: the head and one bounded range of rows by primary key."""
+    """The head and one bounded range of rows by primary key, never past that head.
+
+    The read-only connection reads them in two statements; a row committed in between has a seq above the
+    head and waits for the next page. Every seq up to a committed head is committed: one connection writes.
+    """
     last=head(db)
-    rows=db.execute('SELECT * FROM call_events WHERE seq>? ORDER BY seq LIMIT ?',(after,SCAN_ROWS)).fetchall() if after<last else []
+    rows=db.execute('SELECT * FROM call_events WHERE seq>? AND seq<=? ORDER BY seq LIMIT ?',
+                    (after,last,SCAN_ROWS)).fetchall() if after<last else []
     return last,rows
 
 
