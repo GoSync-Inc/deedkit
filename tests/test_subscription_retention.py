@@ -76,6 +76,11 @@ def refs(store, sid):
             'SELECT event FROM subscription_matches WHERE subscription=%s ORDER BY event', (sid,)).fetchall()]
 
 
+def legacy_matches(c):
+    """Match references in the columns a schema-38 database has; schema 60 (ANYM-522) adds reference columns."""
+    return c.execute('SELECT subscription,event,matched_at FROM subscription_matches ORDER BY 1,2').fetchall()
+
+
 def floor(store, sid):
     with store.pool.connection() as c:
         return c.execute('SELECT retention_floor FROM subscriptions WHERE id=%s', (sid,)).fetchone()['retention_floor']
@@ -396,16 +401,16 @@ def test_schema38_database_migrates_with_floor_zero_and_quarantine_sets_the_hold
         token, sid, events = acked_subscription(restored, name='retention-legacy-reader')
         ack(restored, token, sid)
         with restored.pool.connection() as c:
-            legacy = database_manifest(c)
+            legacy, references = database_manifest(c), legacy_matches(c)
         assert legacy['subscription_matches']['rows'] == 3
         with pytest.raises(RuntimeError, match='subscription_retention_needs_schema_40'):
             restored.set_subscription_retention(True)
         restored.migrate()
         with restored.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '59'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '60'
             row = c.execute('SELECT retention_floor,retention_hold FROM subscriptions WHERE id=%s', (sid,)).fetchone()
             assert row == {'retention_floor': 0, 'retention_hold': False}
-            assert database_manifest(c)['subscription_matches'] == legacy['subscription_matches']
+            assert legacy_matches(c) == references and len(references) == 3
         page = restored.get_subscription_events(token, sid)
         assert [i['event_id'] for i in page['items']] == events and page['subscription']['gap'] is None
         quarantine_restore(restored)
@@ -624,7 +629,7 @@ def test_legacy_snapshot_quarantined_before_migration_is_never_pruned(database, 
         with snapshot_restored(source, tmp_path) as restored:
             quarantine_restore(restored)
             with restored.pool.connection() as c:
-                quarantined = database_manifest(c)
+                quarantined, references = database_manifest(c), legacy_matches(c)
             restored.migrate()
             restored.set_subscription_retention(True)
             with restored.pool.connection() as c:
@@ -638,8 +643,8 @@ def test_legacy_snapshot_quarantined_before_migration_is_never_pruned(database, 
             assert restored.release_retention_hold(None) == {'released': 0}
             assert prune_subscriptions(restored)['pruned'] == 0
             with restored.pool.connection() as c:
-                after = database_manifest(c)
-            assert after['subscription_matches'] == quarantined['subscription_matches']
+                after, kept = database_manifest(c), legacy_matches(c)
+            assert kept == references and len(references) == len(events)
             assert after['subscription_consumption'] == quarantined['subscription_consumption']
 
 

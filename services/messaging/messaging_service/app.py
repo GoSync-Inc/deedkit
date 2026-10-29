@@ -75,7 +75,7 @@ def claimed_tool(prefix):
 
 WaitSeconds = Annotated[float, Field(strict=True,ge=0,le=25,allow_inf_nan=False)]
 LiveWaitSeconds = Annotated[float, Field(strict=True,ge=0,le=20,allow_inf_nan=False)]
-WakeRule = Literal['incoming_message','owner_mention','reply_to_owner','reply_to_confirmed_send']
+WakeRule = Literal['incoming_message','owner_mention','reply_to_owner','reply_to_confirmed_send','reply_to_own_send']
 WakeRules = Annotated[list[WakeRule], Field(min_length=1,max_length=4)]
 SendReference = Annotated[StrictStr, Field(min_length=1,max_length=128)]
 SubscriptionReceipt = Annotated[StrictStr, Field(min_length=32,max_length=128)]
@@ -134,12 +134,19 @@ EndpointUrl = Annotated[StrictStr, Field(min_length=1,max_length=2048)]
 SigningSecret = Annotated[StrictStr, Field(pattern=r'^whsec_[A-Za-z0-9+/=]{32,96}$')]
 EndpointHeaders = Annotated[dict[StrictStr,StrictStr], Field(max_length=4)]
 EndpointLabel = Annotated[StrictStr, Field(max_length=128,pattern=r'^[^\x00-\x1f\x7f]*$')]
+class SubscriptionSources(TypedDict, total=False):
+    # ANYM-522: every chat the key can see now, optionally per account; channels and bots only when asked for.
+    __pydantic_config__ = ConfigDict(extra='forbid')
+    all_visible_chats: Required[Literal[True]]
+    account_ids: SubscriptionReferences
+    include_channels: StrictBool
+    include_bots: StrictBool
 class SubscriptionEndpoint(TypedDict, total=False):
     __pydantic_config__ = ConfigDict(extra='forbid')
     endpoint_id: Required[EndpointReference]
     delivery_policy: DeliveryPolicy
 # Optional arguments dropped when None, so payloads and audit records of callers that omit them stay unchanged.
-OMITTED_WHEN_NONE = {'create_subscription':('wake_rules','reply_to_send','delivery'),
+OMITTED_WHEN_NONE = {'create_subscription':('chat_ids','sources','wake_rules','reply_to_send','delivery'),
     'configure_subscription_delivery':('delivery_policy','endpoint_id'),
     'register_delivery_endpoint':('headers',),'update_delivery_endpoint':('new_secret','headers')}
 def drop_omitted(method, arguments):
@@ -185,6 +192,8 @@ def validate_arguments(models, method, arguments):
         invalid=[]
         if method=='create_subscription' and 'reply_to_confirmed_send' in (values.get('wake_rules') or []) and not values.get('reply_to_send'):
             invalid=[('reply_to_send','required','set when wake_rules has reply_to_confirmed_send')]
+        if method=='create_subscription' and (values.get('chat_ids') is None)==(values.get('sources') is None):
+            invalid.append(('chat_ids','required'))  # exactly one of chat_ids or sources (no shared hint text)
         if method=='submit_feedback':
             if not values['description'].strip():invalid.append(('description','blank','text with a non-space character'))
             if len(json.dumps(values.get('refs') or {}).encode())>8192:invalid.append(('refs','size','at most 8 KiB'))
@@ -1200,7 +1209,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
 
     @mcp.tool(structured_output=True,annotations=ToolAnnotations(readOnlyHint=False,
         destructiveHint=False,idempotentHint=False,openWorldHint=False))
-    def create_subscription(ctx: Context,chat_ids: SubscriptionReferences,
+    def create_subscription(ctx: Context,chat_ids: SubscriptionReferences | None=None,
+                            sources: SubscriptionSources | None=None,
                             sender_ids: SubscriptionReferences | None=None,
                             kinds: SubscriptionKinds | None=None,
                             direction: Literal['','incoming','outgoing']='incoming',
@@ -1210,12 +1220,18 @@ def create_app(store: Store, allowed_hosts: list[str]):
                             expires_at: SubscriptionExpiry | None=None,
         wake_rules: WakeRules | None=None, reply_to_send: SendReference | None=None,
         delivery: SubscriptionEndpoint | None=None) -> dict[str,Any]:
-        """Persist selection of explicit authorized archive chats; no send or provider request.
+        """Persist selection of authorized archive chats; no send or provider request.
 
         Requires read + explicit subscription-write. The subscription belongs to the
         originating credential; another key for the same principal cannot adopt it.
-        chat_ids are 1–64 archive IDs resolved through list_chats/resolve_reference.
-        Optional sender_ids are exact account-scoped IDs from search_people, not names.
+        Exactly one of chat_ids (1–64 archive IDs from list_chats/resolve_reference, frozen)
+        or sources={all_visible_chats: true, account_ids?, include_channels?, include_bots?}:
+        every chat the key can see at the moment of each read, count and hint, so a scope
+        change neither invalidates it nor needs a new one; channels and bot senders stay out
+        unless included. Dynamic sources need the operator's switch (dynamic_sources_disabled).
+        Recommended wake_rules for them: [reply_to_owner, owner_mention, reply_to_own_send];
+        reply_to_own_send (dynamic only) catches an exact native reply to any confirmed send of
+        this key. Optional sender_ids (explicit chats only) are exact account-scoped IDs from search_people.
         Starts at the committed event boundary; default message.created/incoming/live.
         Historical events require explicit backfill/reconcile origins. File readiness
         is independent of message arrival. Optional expiry is a future zoned ISO time
@@ -1225,7 +1241,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
         it needs delivery-write and the operator's delivery switch.
         A timeout can leave creation uncertain: inspect list_subscriptions before retrying.
         """
-        return call(ctx,'create_subscription',chat_ids=chat_ids,sender_ids=sender_ids,
+        return call(ctx,'create_subscription',chat_ids=chat_ids,sources=sources,sender_ids=sender_ids,
             kinds=kinds,direction=direction,origins=origins,label=label,expires_at=expires_at,wake_rules=wake_rules,reply_to_send=reply_to_send,
             delivery=delivery)
 

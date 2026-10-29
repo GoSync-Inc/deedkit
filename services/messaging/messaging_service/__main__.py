@@ -59,7 +59,7 @@ def main():
         'set-subscription-retention','link-person','unlink-person','delete-person','list-people','set-person-channel','key-info',
         'principal-info','delivery-endpoints-list','disable-delivery-endpoint','enable-delivery-endpoint',
         'reload-delivery-policy','set-delivery-features','migrate-expand','set-module-cursor','abandon-module-gap',
-        'module-router-status'])
+        'module-router-status','set-dynamic-subscriptions'])
     parser.add_argument('--principal')
     parser.add_argument('--accounts',nargs='+')
     parser.add_argument('--key-file',type=Path)
@@ -307,6 +307,14 @@ def main():
             if not (args.enable or args.disable):
                 parser.error('set-delivery-features requires --enable or --disable')
             result=store.set_delivery_features(args.enable,verify_components=True)
+            print(json.dumps(result))
+            if 'error' in result:raise SystemExit(1)
+        elif args.command=='set-dynamic-subscriptions':
+            # ANYM-522: --enable refuses unless the API, matcher and dispatcher heartbeats agree on this version;
+            # --disable is the rollback: dynamic definitions become access_changed, their queued hints are cancelled.
+            if not (args.enable or args.disable):
+                parser.error('set-dynamic-subscriptions requires --enable or --disable')
+            result=store.set_dynamic_subscriptions(args.enable,verify_components=True)
             print(json.dumps(result))
             if 'error' in result:raise SystemExit(1)
         elif args.command=='reload-delivery-policy':

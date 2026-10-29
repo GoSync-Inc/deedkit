@@ -40,3 +40,6 @@ DO $$ BEGIN
 END $$;
 -- Schema 56 (ANYM-562): module_events hint bodies list type, subject and module of matched events.
 GRANT SELECT ON module_events,subscription_module_matches,subscription_module_streams TO messaging_event_delivery;
+-- Schema 60 (ANYM-522): a dynamic definition's hint is rechecked against the key's current scope under the
+-- fence: each reference's account, chat, hidden mark and own-send evidence; no journal snapshot.
+GRANT SELECT(subscription,event,account,chat,hidden,own_send_reply) ON subscription_matches TO messaging_event_delivery;

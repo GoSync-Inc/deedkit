@@ -867,15 +867,28 @@ def hint_body(c, hint, row, p):
         (row['id'],)).fetchone()
     after = consumption['acked_through'] if consumption else row['start_position']
     # 049's definer function: IDs, timing and wake evidence only, never message text; scope-filtered here.
+    from .subscriptions import dynamic, scope
+    accounts, chats = scope(row, p)
     matches = c.execute('SELECT * FROM public.subscription_hint_references(%s,%s,%s,%s,%s)',
-        (row['id'], after, hint['through_position'], p['accounts'], p['chat_ids'])).fetchall()
+        (row['id'], after, hint['through_position'], accounts, chats)).fetchall()
+    total = matches[0]['total'] if matches else 0
+    flags = {}
+    if dynamic(row):
+        # ANYM-522: references the operator hid stay out of the list and the count; own-send evidence is the matcher's.
+        flags = {item['event']: item for item in c.execute('''SELECT event,hidden,own_send_reply,
+            coalesce(account=ANY(%s) AND (%s::text[] IS NULL OR chat=ANY(%s)),false) AS in_scope
+            FROM subscription_matches WHERE subscription=%s AND event>%s AND event<=%s AND (hidden OR own_send_reply)''',
+            (accounts, chats, chats, row['id'], after, hint['through_position'])).fetchall()}
+        total -= sum(1 for item in flags.values() if item['hidden'] and item['in_scope'])
+        matches = [item for item in matches if not flags.get(item['event'], {}).get('hidden')]
     from .subscription_consumption import wake_reason
     from .store import serial
     references = []
     for item in matches:
         evidence = item['evidence']
         reasons = wake_reason({**evidence, 'account': item['account'], 'kind': item['kind'],
-            'historical': item['origin'] in ('backfill', 'reconcile')}, row['selector'])
+            'historical': item['origin'] in ('backfill', 'reconcile'),
+            'reply_to_own_send': flags.get(item['event'], {}).get('own_send_reply') is True}, row['selector'])
         reference = {'event_id': item['event'], 'kind': item['kind'], 'occurred_at': serial(item['created_at']),
             'wake_reason': reasons, 'account_id': item['account'], 'chat_id': evidence.get('chat'),
             'message_id': evidence.get('message'), 'sender_id': evidence.get('sender')}
@@ -887,7 +900,6 @@ def hint_body(c, hint, row, p):
         if 'reply_to_confirmed_send' in reasons:
             reference['reply_to_send_id'] = (row['selector'].get('reply_anchor') or {}).get('send_id')
         references.append(reference)
-    total = matches[0]['total'] if matches else 0
     listed = references[:MAX_REFERENCES]
     while True:
         body = _compact({**base, 'type': 'events', 'references': listed, 'references_omitted': total - len(listed),

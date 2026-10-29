@@ -53,3 +53,11 @@ GRANT EXECUTE ON FUNCTION public.module_hints_ready() TO messaging_subscriptions
 REVOKE ALL ON FUNCTION public.module_hints_ready(),public.publish_module_event(text,text,text,text,text,text,jsonb,text,text),
     public.report_module_reachability(text,boolean),public.module_event_valid(text,text,text,text,text,jsonb,text,text),
     public.subscription_module_fence() FROM PUBLIC;
+-- Schema 60 (ANYM-522): a dynamic definition's per-batch scope snapshot (chat IDs and types, no titles) and
+-- the reply_to_own_send lookup: the key's confirmed sends and, for the WhatsApp stanza projection, the exact
+-- outgoing archive row and the account's platform. IDs and status only, never message text.
+GRANT SELECT(id,account,chat_type) ON chats TO messaging_subscriptions;
+GRANT SELECT(principal,key_id,status,account,chat,provider_chat,provider_message_id)
+    ON outgoing_messages TO messaging_subscriptions;
+GRANT SELECT(account,chat,provider_id,sender,direction,deleted) ON messages TO messaging_subscriptions;
+GRANT SELECT(id,platform) ON accounts TO messaging_subscriptions;

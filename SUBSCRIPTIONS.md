@@ -18,7 +18,7 @@ Python/npm client methods:
 
 | Operation | Arguments | Behavior |
 | --- | --- | --- |
-| `create_subscription` | `chat_ids`; optional `sender_ids`, `kinds`, `direction`, `origins`, `label`, `expires_at` | Freeze an authorized source set at the committed journal head |
+| `create_subscription` | `chat_ids` or `sources`; optional `sender_ids`, `kinds`, `direction`, `origins`, `label`, `expires_at` | Freeze an authorized source set, or follow every chat the key can see ([dynamic sources](#dynamic-sources-all-visible-chats-schema-58)), from the committed journal head |
 | `list_subscriptions` | Optional `limit` (1–100) | List this exact credential's definitions; `has_more` is explicit |
 | `get_subscription` | `subscription_id` | Inspect lifecycle, match frontier and gap evidence |
 | `update_subscription` | `subscription_id`, current `version`, `action`; optional `resume_policy` | Pause, resume or close with optimistic concurrency |
@@ -44,9 +44,10 @@ days ahead. No messages before the creation frontier are replayed.
 
 Lifecycle is `active`, `paused`, `closed`, `expired` or `access_changed`.
 Resume defaults to `catch_up`; explicit `skip` records the intentionally skipped
-journal range. Re-read the version after a `subscription_conflict`. Any principal
-scope or credential-permission version change invalidates the original grant,
-even if rights are later restored. Inaccessible definitions expose only a masked
+journal range. Re-read the version after a `subscription_conflict`. For an explicit
+`chat_ids` definition, any principal scope or credential-permission version change
+invalidates the original grant, even if rights are later restored. A dynamic
+definition is not invalidated by scope changes (see below). Inaccessible definitions expose only a masked
 ID/state/version, and must be recreated after checking the current scope.
 
 Pages contain event/message/account/chat/sender/provider references, exact
@@ -195,7 +196,8 @@ policy is set, otherwise `"operator_only"`; its `self_service` block names the f
 endpoint tools and `max_endpoints` ([Self-service webhook endpoints](#self-service-webhook-endpoints-schema-49)).
 
 Creation accepts optional `wake_rules`, an OR selection of `incoming_message`,
-`owner_mention`, `reply_to_owner` and `reply_to_confirmed_send`. Reasons come from
+`owner_mention`, `reply_to_owner`, `reply_to_confirmed_send` and (dynamic sources only)
+`reply_to_own_send`. Reasons come from
 immutable event snapshots of validated native metadata on incoming
 `message.created` events. Edits, receipts/status changes and processing readiness
 never count as a new human reply. `reply_to_send` freezes
@@ -411,7 +413,7 @@ passive reads return. `capabilities.subscriptions.delivery_policy` lists the fie
 | `batch_window_s` | 0–86400 | one hint this long after the first unhinted match |
 | `batch_count` | 1–1000 | one hint at this many matches (also flushes at `max_wait_s`) |
 | `quiet_hours` | IANA `timezone`, 1–4 `windows` | `{days: [mon..sun], start: "HH:MM", end: "HH:MM"}`; `days` names the day a window starts, `end` ≤ `start` crosses midnight, adjacent windows chain |
-| `quiet_bypass` | ⊆ `incoming_message`, `owner_mention`, `reply_to_owner`, `reply_to_confirmed_send`, `silence` | reasons that skip quiet hours (default none) |
+| `quiet_bypass` | ⊆ `incoming_message`, `owner_mention`, `reply_to_owner`, `reply_to_confirmed_send`, `silence` | reasons that skip quiet hours (default none); a dynamic-sources subscription refuses it (`invalid_delivery_policy`) |
 | `expect_reply_within_s` | 60 s–14 d | silence timer; only for a `reply_to_send` subscription |
 
 Debounce and batch are alternatives (both set: `invalid_delivery_policy`). Gate order: the window
@@ -1115,6 +1117,72 @@ Delivery honours the contract (ANYM-562 paths): an event whose `expires_at` pass
 matched, and a hint whose events all expired is cancelled at every attempt; a hint holding an
 `urgency=now` event bypasses quiet hours and is never batched, and still takes a slot of the
 key's budget; `batch` events are hinted after each matcher pass and wait for quiet hours.
+
+## Dynamic sources: all visible chats (schema 60)
+
+ANYM-522. Instead of `chat_ids`, `create_subscription` accepts
+`sources={all_visible_chats: true, account_ids?, include_channels?, include_bots?}`: every chat
+the key can see, optionally limited to some of its accounts (1–64 account IDs inside the key's
+scope, else `not_found`). Exactly one of `chat_ids` and `sources` is required. The definition
+stores no chat list (`get_subscription` shows `sources` instead of `chat_ids`), so a principal
+scope or credential-permission version change neither invalidates it nor needs a new one. Losing
+`read` or `subscription-write` (on the principal or the key), a disabled principal, a revoked or
+expired key still moves it to `access_changed` (fail closed); the operator's change does so at once,
+so restoring the right later does not revive it. `sender_ids` and `reply_to_send` belong to explicit chats and are
+refused with dynamic sources.
+
+Channels (Telegram broadcast channels have `chat_type` `channel`) and messages from bot senders
+(`sender_is_bot` native metadata) are left out unless `include_channels` or `include_bots` is
+`true`. WhatsApp status and broadcast lists are not collected at all. Kinds, direction, origins
+and the existing wake rules apply unchanged; `reply_to_confirmed_send` still needs its explicit
+anchor.
+
+**Authorization at every disclosure point.** The matcher reads one scope snapshot per event batch
+(one `chats` query, under the shared principal lock it holds for the batch) and never matches an
+event in a chat outside the key's scope at that moment. Each reference records its account and
+chat. Every read applies the key's scope at that moment: passive `get_subscription_events` pages,
+`fetch_subscription_events` and `wait_for_subscription_events`, `get_subscription` and
+`list_subscriptions` (`matched_event_count`), hint staging (reasons, counts and match times of a
+held range) and hint dispatch. When the operator narrows a scope (`set-access`), the principal's
+dynamic references to chats or accounts that left it are marked hidden in the same transaction,
+which waits for every read, matcher batch and hint POST in flight; a chat added again shows only
+events matched after the re-add. The same transaction rebuilds a held hint range from the visible
+references (count, reasons and match times) and cancels a pending hint that covers no visible
+reference (`scope_changed`, left out of `hint_counts`); any other queued hint keeps its range and
+position. The dispatcher rechecks visibility under its fence before each POST. Quiet hours hold a
+dynamic subscription's hints with no bypass: its delivery policy refuses `quiet_bypass`, so a
+reason in a chat hidden later never skips them. A self-service endpoint body lists only visible
+references. A page whose remaining
+references are all hidden still moves `next_after` past them, and `fetch_subscription_events`
+issues a receipt for it, so the ACK cursor passes filtered positions; a receipt issued before a
+scope change is still `stale_ack`.
+
+**Waking on replies without a per-send subscription.** The wake rule `reply_to_own_send` matches an
+incoming live `message.created` that natively replies, in the same account and chat, to any
+confirmed send of this key, by the anchor rules of `reply_to_confirmed_send`: its native reply
+reference equals the send's exact provider message ID; or, on WhatsApp, the native stanza projected
+from the exact outgoing archive row (known chat prefix, and in a group the exact participant suffix),
+unless the provider marks it as no reply to the owner; or its exact reply evidence (frozen at
+ingestion) names that archived outgoing message. Another
+key's send, an unknown or failed send and the same ID in another chat never match. No anchor is
+needed at creation. Recommended for a dynamic subscription, so it does not spend the hourly hint
+budget on every message: `wake_rules=[reply_to_owner, owner_mention, reply_to_own_send]`. Interim
+await-reply recipe: one `all_visible_chats` subscription with `wake_rules=[reply_to_own_send]`
+catches every reply to the key's confirmed sends; only a silence timer (`expect_reply_within_s`)
+still needs a per-send `reply_to_send` subscription.
+
+**Activation.** Dynamic sources return `dynamic_sources_disabled` (409) until the operator runs
+`python -m messaging_service set-dynamic-subscriptions --enable`, which refuses (and changes
+nothing) unless the API, matcher and dispatcher heartbeats report this version on the current
+schema: an older matcher would scan a dynamic definition, match nothing and still advance its
+checkpoint. Rollout: migration 60 (expand: four columns on `subscription_matches`), reapply
+`subscription_role.sql` (SELECT on chat IDs and types, on the key's sends' IDs and status, and on
+the outgoing archive rows' IDs and the account platform for the stanza projection)
+and `delivery_role.sql` (SELECT on the reference columns), deploy, then enable. Rollback, before
+any older code is deployed: `--disable` moves every dynamic definition to `access_changed`, which
+older code already masks in get, list and passive reads and refuses to resume or fetch, cancels
+its queued hints (`dynamic_sources_disabled`) under the fence and prints the definition and hint
+IDs. Agents recreate their definitions after a new `--enable`.
 
 ## Remaining extensions and verification boundaries
 
