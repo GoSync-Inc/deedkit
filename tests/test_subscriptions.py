@@ -188,6 +188,327 @@ def test_key_permission_change_revocation_and_expiry_stop_matcher(seeded):
     assert store.get_subscription(expiring, expiring_id)['state'] == 'expired'
 
 
+ALL_VISIBLE = {'all_visible_chats': True}
+
+
+def dynamic_key(store, principal='dynamic-reader', accounts=('telegram-demo', 'whatsapp-demo-1')):
+    permissions = ['read', 'subscription-write', 'subscription-ack']
+    return store.issue_key(principal, list(accounts), permissions=permissions, key_permissions=permissions)
+
+
+def chat_message(store, chat, message, *, chat_type=None, metadata=None, account='telegram-demo'):
+    """A synthetic chat (created once) and an incoming message in it."""
+    with store.pool.connection() as c:
+        c.execute('INSERT INTO chats(id,account,title,chat_type) VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING',
+            (chat, account, 'Synthetic chat', chat_type))
+        c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at)
+            VALUES(%s,%s,%s,%s,'demo-person-9','Synthetic text',clock_timestamp())''', (message, account, chat, message))
+        if metadata:
+            c.execute('INSERT INTO message_metadata(message,revision,metadata) VALUES(%s,1,%s)', (message, Jsonb(metadata)))
+    return message
+
+
+def event_ids(store, token, sid):
+    return [item['event_id'] for item in store.get_subscription_events(token, sid)['items']]
+
+
+# spec: ANYM-522
+def test_dynamic_sources_show_chats_visible_now_and_a_readded_chat_only_new_matches(seeded):
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    try:
+        token = dynamic_key(store)
+        chat_message(store, 'telegram-demo-chat-2', 'demo-tg-x')
+        created = store.create_subscription(token, sources=ALL_VISIBLE)
+        sid = created['subscription_id']
+        assert created['sources'] == {'all_visible_chats': True, 'account_ids': None, 'include_channels': False,
+            'include_bots': False}
+        assert 'chat_ids' not in created and created['state'] == 'active'
+        with store.pool.connection() as c:
+            assert c.execute('SELECT count(*) AS n FROM subscription_sources WHERE subscription=%s',
+                (sid,)).fetchone()['n'] == 0
+        first, removed, other = emit(store), emit(store, 'demo-tg-x'), emit(store, 'demo-wa-1')
+        match_subscriptions(store)
+        assert event_ids(store, token, sid) == [first, removed, other]
+        store.set_access('dynamic-reader', chats=['telegram-demo-chat', 'whatsapp-demo-1-chat'])
+        view = store.get_subscription(token, sid)
+        assert view['state'] == 'active' and view['matched_event_count'] == 2
+        assert event_ids(store, token, sid) == [first, other]
+        outside, inside = emit(store, 'demo-tg-x'), emit(store)
+        match_subscriptions(store)
+        assert event_ids(store, token, sid) == [first, other, inside]
+        store.set_access('dynamic-reader', chats=None)
+        readded = emit(store, 'demo-tg-x')
+        match_subscriptions(store)
+        # The chat is back: only what matched after the re-add shows, never the earlier or the outside match.
+        assert event_ids(store, token, sid) == [first, other, inside, readded]
+        assert outside not in event_ids(store, token, sid)
+        store.set_access('dynamic-reader', accounts=['telegram-demo'])
+        assert event_ids(store, token, sid) == [first, inside, readded]
+        assert store.get_subscription(token, sid)['matched_event_count'] == 3
+    finally:
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-522
+def test_dynamic_definition_survives_version_changes_and_fails_closed_on_lost_access(seeded):
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    try:
+        token = dynamic_key(store)
+        sid = store.create_subscription(token, sources=ALL_VISIBLE)['subscription_id']
+        explicit = create(store, token)['subscription_id']
+        store.set_access('dynamic-reader', chats=['telegram-demo-chat'])
+        credential = store.capabilities(token)['credential_id']
+        store.set_key_permissions(credential, ['read', 'subscription-write'])
+        event = emit(store)
+        match_subscriptions(store)
+        assert store.get_subscription(token, sid)['state'] == 'active'
+        assert event_ids(store, token, sid) == [event]
+        # Explicit chat_ids definitions keep today's behaviour.
+        assert store.get_subscription(token, explicit)['state'] == 'access_changed'
+        assert store.update_subscription(token, sid, 1, action='pause')['state'] == 'paused'
+        assert store.update_subscription(token, sid, 2, action='resume')['state'] == 'active'
+        store.set_key_permissions(credential, ['read'])
+        masked = store.get_subscription(token, sid)
+        assert masked['state'] == 'access_changed' and masked['scope_masked']
+        assert store.get_subscription_events(token, sid)['items'] == []
+    finally:
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-522
+def test_dynamic_sources_wait_for_the_operator_switch_and_validate_their_form(seeded):
+    from messaging_service import __version__
+    from messaging_service.store import RUNTIME_SCHEMA
+    store, _, _ = seeded
+    token = dynamic_key(store)
+    with pytest.raises(APIError, match='dynamic_sources_disabled'):
+        store.create_subscription(token, sources=ALL_VISIBLE)
+    with store.pool.connection() as c:
+        saved = c.execute('SELECT * FROM component_heartbeats').fetchall()
+    def beat(matcher_version):
+        with store.pool.connection() as c:
+            for component, version in (('api', __version__), ('matcher', matcher_version), ('dispatcher', __version__)):
+                c.execute('''INSERT INTO component_heartbeats(component,version,schema_version,beat_at)
+                    VALUES(%s,%s,%s,clock_timestamp()) ON CONFLICT(component) DO UPDATE SET version=EXCLUDED.version,
+                    schema_version=EXCLUDED.schema_version,beat_at=EXCLUDED.beat_at''', (component, version, RUNTIME_SCHEMA))
+    try:
+        # Mixed versions: an older matcher would scan a dynamic definition, match nothing and advance.
+        beat('0.0.1')
+        assert store.set_dynamic_subscriptions(True, verify_components=True) == {'error': 'component_version_mismatch',
+            'component': 'matcher', 'version': '0.0.1', 'expected': __version__}
+        with pytest.raises(APIError, match='dynamic_sources_disabled'):
+            store.create_subscription(token, sources=ALL_VISIBLE)
+        beat(__version__)
+        assert store.set_dynamic_subscriptions(True, verify_components=True) == {'dynamic_subscriptions': 'enabled'}
+        for arguments, code in [
+                ({'chat_ids': ['telegram-demo-chat'], 'sources': ALL_VISIBLE}, 'invalid_filter'),
+                ({}, 'invalid_filter'),
+                ({'sources': {'all_visible_chats': False}}, 'invalid_filter'),
+                ({'sources': {**ALL_VISIBLE, 'chat_types': ['group']}}, 'invalid_filter'),
+                ({'sources': {**ALL_VISIBLE, 'include_bots': 'yes'}}, 'invalid_filter'),
+                ({'sources': {**ALL_VISIBLE, 'account_ids': ['whatsapp-demo-2']}}, 'not_found'),
+                ({'sources': ALL_VISIBLE, 'sender_ids': ['demo-person-1']}, 'invalid_filter'),
+                ({'sources': ALL_VISIBLE, 'reply_to_send': 'send_synthetic'}, 'invalid_subscription'),
+                ({'chat_ids': ['telegram-demo-chat'], 'wake_rules': ['reply_to_own_send']}, 'invalid_subscription')]:
+            with pytest.raises(APIError, match=code):
+                store.create_subscription(token, **arguments)
+        sid = store.create_subscription(token, sources={**ALL_VISIBLE, 'account_ids': ['whatsapp-demo-1']})['subscription_id']
+        emit(store)
+        selected = emit(store, 'demo-wa-1')
+        match_subscriptions(store)
+        assert event_ids(store, token, sid) == [selected]
+    finally:
+        store.set_dynamic_subscriptions(False)
+        with store.pool.connection() as c:
+            c.execute('DELETE FROM component_heartbeats')
+            for row in saved:
+                c.execute('INSERT INTO component_heartbeats(component,version,schema_version,beat_at) VALUES(%s,%s,%s,%s)',
+                    (row['component'], row['version'], row['schema_version'], row['beat_at']))
+
+
+# spec: ANYM-522
+def test_dynamic_sources_leave_out_channels_and_bots_unless_included(seeded):
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    try:
+        token = dynamic_key(store)
+        chat_message(store, 'telegram-demo-channel', 'demo-tg-channel', chat_type='channel')
+        chat_message(store, 'telegram-demo-chat', 'demo-tg-bot', metadata={'sender_is_bot': True})
+        default = store.create_subscription(token, sources=ALL_VISIBLE)['subscription_id']
+        everything = store.create_subscription(token, sources={**ALL_VISIBLE, 'include_channels': True,
+            'include_bots': True})['subscription_id']
+        person, channel, bot = emit(store), emit(store, 'demo-tg-channel'), emit(store, 'demo-tg-bot')
+        match_subscriptions(store)
+        assert event_ids(store, token, default) == [person]
+        assert event_ids(store, token, everything) == [person, channel, bot]
+    finally:
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-522
+def test_reply_to_own_send_wakes_on_a_reply_to_any_confirmed_send_of_the_key_only(seeded):
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    try:
+        token, other = dynamic_key(store), dynamic_key(store, 'other-reader')
+        def send(owner_token, send_id, provider_id, status='sent'):
+            with store.authorized(owner_token) as (_, p):
+                owner = p
+            with store.pool.connection() as c:
+                c.execute('''INSERT INTO outgoing_messages(id,principal,key_id,scope_version,key_permission_version,
+                    request_id,request_hash,account,chat,provider_chat,body,status,provider_message_id)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,'telegram-demo','telegram-demo-chat','provider-chat','Synthetic',%s,%s)''',
+                    (send_id, owner['id'], owner['key_id'], owner['scope_version'], owner['key_permission_version'],
+                     'request-' + send_id, 'a' * 64, status, provider_id))
+        send(token, 'send_own', 'native-own')
+        send(token, 'send_unconfirmed', 'native-unconfirmed', 'unknown')
+        send(other, 'send_other', 'native-other')
+        send(token, 'send_archived', 'native-archived')
+        sid = store.create_subscription(token, sources=ALL_VISIBLE, wake_rules=['reply_to_own_send'])['subscription_id']
+        replies = [chat_message(store, 'telegram-demo-chat', 'demo-reply-' + reference,
+            metadata={'reply_to_provider_id': reference})
+            for reference in ('native-own', 'native-unconfirmed', 'native-other', 'unrelated')]
+        events = [emit(store, message) for message in replies]
+        # The same provider ID in another chat is not a reply to that send.
+        elsewhere = emit(store, chat_message(store, 'telegram-demo-chat-2', 'demo-reply-elsewhere',
+            metadata={'reply_to_provider_id': 'native-own'}))
+        chat_message(store, 'telegram-demo-chat', 'demo-reply-archived')
+        with store.pool.connection() as c:
+            archived = store.append_event(c, 'telegram-demo', 'demo-reply-archived', origin='live', snapshot_metadata={
+                'reply_evidence': {'basis': 'exact_native_reply_to_archived_outgoing', 'target_message': 'demo-out-1',
+                    'target_revision': 1, 'target_provider_id': 'native-archived'}})
+        match_subscriptions(store)
+        page = store.get_subscription_events(token, sid)
+        assert [item['event_id'] for item in page['items']] == [events[0], archived]
+        assert elsewhere not in [item['event_id'] for item in page['items']]
+        assert all('reply_to_own_send' in item['wake_reason'] for item in page['items'])
+    finally:
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-522
+def test_dynamic_matching_costs_one_scope_query_per_event_batch(seeded, monkeypatch):
+    import psycopg
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    try:
+        token = dynamic_key(store)
+        for _ in range(2):
+            store.create_subscription(token, sources=ALL_VISIBLE)
+        for _ in range(3):
+            emit(store)
+        emit(store, 'demo-wa-1')
+        statements = []
+        execute = psycopg.Connection.execute
+        def counted(self, query, *args, **kwargs):
+            statements.append(str(query))
+            return execute(self, query, *args, **kwargs)
+        monkeypatch.setattr(psycopg.Connection, 'execute', counted)
+        # The worker's defaults (subscription_worker.py: 16 subscriptions, 200 events per pass).
+        stats = match_subscriptions(store, batch_size=200, max_subscriptions=16)
+        assert stats['matched'] == 8
+        assert sum('FROM chats' in statement for statement in statements) == 2
+        statements.clear()
+        assert match_subscriptions(store, batch_size=200, max_subscriptions=16)['matched'] == 0
+        assert sum('FROM chats' in statement for statement in statements) == 0
+    finally:
+        monkeypatch.undo()
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-522
+def test_a_failing_dynamic_scope_query_never_stops_other_definitions(seeded, monkeypatch):
+    from messaging_service import subscriptions
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    try:
+        token = dynamic_key(store)
+        sid = store.create_subscription(token, sources=ALL_VISIBLE)['subscription_id']
+        explicit = create(store, token)['subscription_id']
+        def failing(*args, **kwargs):
+            raise RuntimeError('synthetic scope failure')
+        monkeypatch.setattr(subscriptions, '_batch_scope', failing)
+        event = emit(store)
+        for _ in range(2):
+            assert match_subscriptions(store, max_subscriptions=1)['scope_failed'] <= 1
+        assert event_ids(store, token, explicit) == [event]
+        assert event_ids(store, token, sid) == []
+        monkeypatch.undo()
+        match_subscriptions(store)
+        assert event_ids(store, token, sid) == [event]
+    finally:
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-522
+@pytest.mark.parametrize('level', ['key', 'principal'])
+def test_a_lost_subscription_write_ends_a_dynamic_definition_even_when_restored_unobserved(seeded, level):
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    try:
+        token = dynamic_key(store)
+        sid = store.create_subscription(token, sources=ALL_VISIBLE)['subscription_id']
+        assert store.update_subscription(token, sid, 1, action='pause')['state'] == 'paused'
+        credential = store.capabilities(token)['credential_id']
+        if level == 'key':
+            store.set_key_permissions(credential, ['read', 'subscription-ack'])
+            store.set_key_permissions(credential, ['read', 'subscription-write', 'subscription-ack'])
+        else:
+            store.set_access('dynamic-reader', permissions=['read', 'subscription-ack'])
+            store.set_access('dynamic-reader', permissions=['read', 'subscription-write', 'subscription-ack'])
+        view = store.get_subscription(token, sid)
+        assert view['state'] == 'access_changed' and view['recreate_required']
+        with pytest.raises(APIError, match='subscription_access_changed'):
+            store.update_subscription(token, sid, view['version'], action='resume')
+    finally:
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-522
+def test_reply_to_own_send_follows_the_whatsapp_native_stanza_rules(seeded):
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    try:
+        token = dynamic_key(store, accounts=('whatsapp-demo-1',))
+        with store.authorized(token) as (_, p):
+            owner = p
+        with store.pool.connection() as c:
+            c.execute("UPDATE chats SET provider_chat='111111@c.us' WHERE id='whatsapp-demo-1-chat'")
+            c.execute('''INSERT INTO chats(id,account,title,chat_type,provider_chat) VALUES('whatsapp-demo-1-group',
+                'whatsapp-demo-1','Synthetic group','group','120363000000000001@g.us')''')
+            for chat, provider_chat, archived, sender in (
+                    ('whatsapp-demo-1-chat', '111111@c.us', 'true_111111@c.us_STANZAPRIVATE', 'owner'),
+                    ('whatsapp-demo-1-group', '120363000000000001@g.us',
+                     'true_120363000000000001@g.us_STANZAGROUP_222222@c.us', '222222@c.us')):
+                c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
+                    VALUES(%s,'whatsapp-demo-1',%s,%s,%s,'Synthetic sent text',clock_timestamp(),'outgoing')''',
+                    ('out-' + chat, chat, archived, sender))
+                c.execute('''INSERT INTO outgoing_messages(id,principal,key_id,scope_version,key_permission_version,
+                    request_id,request_hash,account,chat,provider_chat,body,status,provider_message_id)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,'whatsapp-demo-1',%s,%s,'Synthetic','sent',%s)''',
+                    ('send-' + chat, owner['id'], owner['key_id'], owner['scope_version'],
+                     owner['key_permission_version'], 'request-' + chat, 'a' * 64, chat, provider_chat, archived))
+        sid = store.create_subscription(token, sources=ALL_VISIBLE, wake_rules=['reply_to_own_send'])['subscription_id']
+        private = chat_message(store, 'whatsapp-demo-1-chat', 'wa-reply-private', account='whatsapp-demo-1',
+            metadata={'reply_to_provider_id': 'STANZAPRIVATE'})
+        group = chat_message(store, 'whatsapp-demo-1-group', 'wa-reply-group', account='whatsapp-demo-1',
+            metadata={'reply_to_provider_id': 'STANZAGROUP'})
+        # The provider says this quotes no owner message: never projected onto the stanza.
+        denied = chat_message(store, 'whatsapp-demo-1-chat', 'wa-reply-denied', account='whatsapp-demo-1',
+            metadata={'reply_to_provider_id': 'STANZAPRIVATE', 'reply_to_owner': False})
+        with store.pool.connection() as c:
+            selected = [store.append_event(c, 'whatsapp-demo-1', message, origin='live') for message in (private, group)]
+            refused = store.append_event(c, 'whatsapp-demo-1', denied, origin='live')
+        match_subscriptions(store)
+        page = store.get_subscription_events(token, sid)
+        assert [item['event_id'] for item in page['items']] == selected and refused not in selected
+        assert all('reply_to_own_send' in item['wake_reason'] for item in page['items'])
+    finally:
+        store.set_dynamic_subscriptions(False)
+
+
 def test_bounded_matching_pagination_restart_and_concurrent_workers(seeded):
     store, _, _ = seeded
     token = key(store)

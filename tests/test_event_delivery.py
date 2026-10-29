@@ -177,6 +177,261 @@ def test_receiver_validation_and_revocation_fail_closed(seeded, tmp_path):
         resolver=lambda *a, **k: ['93.184.216.34'])['cancelled'] == 1
 
 
+def second_chat(store, account='telegram-demo'):
+    """A second synthetic chat with one incoming message (demo-tg-x)."""
+    with store.pool.connection() as c:
+        c.execute("INSERT INTO chats(id,account,title) VALUES('telegram-demo-chat-2',%s,'Synthetic chat')", (account,))
+        c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at) VALUES('demo-tg-x',%s,
+            'telegram-demo-chat-2','demo-tg-x','demo-person-9','Synthetic text',clock_timestamp())''', (account,))
+
+
+def emit_in(store, message):
+    with store.pool.connection() as c:
+        return store.append_event(c, 'telegram-demo', message, origin='live')
+
+
+def pending_hints(store, sid):
+    with store.pool.connection() as c:
+        return c.execute("""SELECT count(*) AS n FROM subscription_outbox WHERE subscription=%s
+            AND state='pending'""", (sid,)).fetchone()['n']
+
+
+# spec: ANYM-522
+def test_dynamic_hint_staged_before_a_scope_removal_or_revocation_is_never_posted(seeded, tmp_path):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    try:
+        token = identity(store)
+        second_chat(store)
+        sid = store.create_subscription(token, sources={'all_visible_chats': True})['subscription_id']
+        rid, _ = receiver(store, token, tmp_path)
+        call(store, token, 'configure_subscription_delivery', sid, 1, rid)
+        emit_in(store, 'demo-tg-x')
+        match_subscriptions(store)
+        assert pending_hints(store, sid) == 1
+        store.set_access('event-reader', chats=['telegram-demo-chat'])
+        posts = []
+        def transport(endpoint, body, headers, **kwargs):
+            posts.append(body)
+            return 204
+        resolver = lambda *a, **k: ['93.184.216.34']  # noqa: E731
+        # The scope change cancels the queued hint under the exclusive principal lock; nothing is posted.
+        assert pending_hints(store, sid) == 0
+        assert dispatch_hints(store, transport=transport, resolver=resolver)['delivered'] == 0 and posts == []
+        visible = emit(store)
+        match_subscriptions(store)
+        assert dispatch_hints(store, transport=transport, resolver=resolver)['delivered'] == 1
+        assert json.loads(posts[0])['through'] == visible
+        emit(store)
+        match_subscriptions(store)
+        assert pending_hints(store, sid) == 1
+        store.revoke(token)
+        assert dispatch_hints(store, transport=transport, resolver=resolver)['delivered'] == 0 and len(posts) == 1
+    finally:
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-522
+def test_a_held_hint_range_is_rebuilt_from_references_visible_after_a_scope_removal(seeded, tmp_path):
+    from psycopg.types.json import Jsonb
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    try:
+        token = identity(store)
+        second_chat(store)
+        with store.pool.connection() as c:
+            c.execute("INSERT INTO message_metadata(message,revision,metadata) VALUES('demo-tg-x',1,%s)",
+                (Jsonb({'mentions_owner': True}),))
+        sid = store.create_subscription(token, sources={'all_visible_chats': True})['subscription_id']
+        rid, _ = receiver(store, token, tmp_path)
+        call(store, token, 'configure_subscription_delivery', sid, 1, rid, {'batch_count': 2})
+        emit_in(store, 'demo-tg-x')
+        match_subscriptions(store)
+        assert pending_hints(store, sid) == 0
+        store.set_access('event-reader', chats=['telegram-demo-chat'])
+        emit(store)
+        match_subscriptions(store)
+        # One visible match: the hidden owner mention gives the range no count, reason or match time.
+        assert pending_hints(store, sid) == 0
+        assert store.get_subscription(token, sid)['delivery']['held_reason'] == 'batch'
+        with store.pool.connection() as c:
+            window = c.execute('SELECT match_count,reasons FROM subscription_hint_windows WHERE subscription=%s',
+                (sid,)).fetchone()
+        assert window['match_count'] == 1 and 'owner_mention' not in window['reasons']
+        emit(store)
+        match_subscriptions(store)
+        assert pending_hints(store, sid) == 1
+    finally:
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-522
+def test_a_queued_hint_of_hidden_references_is_cancelled_and_not_counted(seeded, tmp_path):
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    try:
+        token = identity(store)
+        second_chat(store)
+        sid = store.create_subscription(token, sources={'all_visible_chats': True})['subscription_id']
+        rid, _ = receiver(store, token, tmp_path)
+        call(store, token, 'configure_subscription_delivery', sid, 1, rid)
+        emit_in(store, 'demo-tg-x')
+        match_subscriptions(store)
+        assert store.get_subscription(token, sid)['delivery']['hint_counts'] == {'pending': 1}
+        store.set_access('event-reader', chats=['telegram-demo-chat'])
+        assert pending_hints(store, sid) == 0
+        assert store.get_subscription(token, sid)['delivery']['hint_counts'] == {}
+    finally:
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-522
+def test_a_queued_mixed_hint_keeps_its_position_and_is_delivered_after_a_scope_removal(seeded, tmp_path):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    try:
+        token = identity(store)
+        second_chat(store)
+        sid = store.create_subscription(token, sources={'all_visible_chats': True})['subscription_id']
+        rid, _ = receiver(store, token, tmp_path)
+        call(store, token, 'configure_subscription_delivery', sid, 1, rid)
+        emit(store)
+        through = emit_in(store, 'demo-tg-x')
+        match_subscriptions(store)
+        store.set_access('event-reader', chats=['telegram-demo-chat'])
+        # The hint over a visible and a now hidden reference stays queued: same id, same position, no re-emission.
+        with store.pool.connection() as c:
+            assert [hint['through_position'] for hint in c.execute("""SELECT through_position FROM subscription_outbox
+                WHERE subscription=%s AND state='pending'""", (sid,)).fetchall()] == [through]
+        assert store.get_subscription(token, sid)['delivery']['hint_counts'] == {'pending': 1}
+        match_subscriptions(store)
+        posts = []
+        def transport(endpoint, body, headers, **kwargs):
+            posts.append(body)
+            return 204
+        assert dispatch_hints(store, transport=transport, resolver=lambda *a, **k: ['93.184.216.34'])['delivered'] == 1
+        assert [json.loads(body)['through'] for body in posts] == [through]
+    finally:
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-522
+def test_a_dynamic_definition_refuses_a_quiet_hours_bypass(seeded, tmp_path):
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    try:
+        token = identity(store)
+        sid = store.create_subscription(token, sources={'all_visible_chats': True})['subscription_id']
+        rid, _ = receiver(store, token, tmp_path)
+        quiet = {'timezone': 'UTC', 'windows': [{'days': ['mon'], 'start': '22:00', 'end': '07:00'}]}
+        with pytest.raises(APIError, match='invalid_delivery_policy'):
+            call(store, token, 'configure_subscription_delivery', sid, 1, rid,
+                {'quiet_hours': quiet, 'quiet_bypass': ['owner_mention']})
+        # Quiet hours alone hold its hints as for any definition.
+        call(store, token, 'configure_subscription_delivery', sid, 1, rid, {'quiet_hours': quiet})
+    finally:
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-522
+def test_hint_counts_of_a_dynamic_definition_leave_out_finished_hints_of_hidden_references(seeded, tmp_path):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    try:
+        token = identity(store)
+        second_chat(store)
+        sid = store.create_subscription(token, sources={'all_visible_chats': True})['subscription_id']
+        rid, _ = receiver(store, token, tmp_path)
+        call(store, token, 'configure_subscription_delivery', sid, 1, rid)
+        resolver = lambda *a, **k: ['93.184.216.34']  # noqa: E731
+        emit_in(store, 'demo-tg-x')
+        match_subscriptions(store)
+        assert dispatch_hints(store, transport=lambda *a, **k: 204, resolver=resolver)['delivered'] == 1
+        emit(store)
+        match_subscriptions(store)
+        assert dispatch_hints(store, transport=lambda *a, **k: 204, resolver=resolver)['delivered'] == 1
+        assert store.get_subscription(token, sid)['delivery']['hint_counts'] == {'delivered': 2}
+        store.set_access('event-reader', chats=['telegram-demo-chat'])
+        assert store.get_subscription(token, sid)['delivery']['hint_counts'] == {'delivered': 1}
+    finally:
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-522
+def test_scope_removal_waits_for_an_inflight_fetch_and_the_cursor_passes_hidden_references(seeded):
+    import threading
+    from messaging_service.subscription_consumption import fetch_subscription_events
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    try:
+        token = identity(store)
+        second_chat(store)
+        sid = store.create_subscription(token, sources={'all_visible_chats': True})['subscription_id']
+        kept, gone = emit(store), emit_in(store, 'demo-tg-x')
+        match_subscriptions(store)
+        with store.authorized(token, 'fetch_subscription_events') as (c, p):
+            page = fetch_subscription_events(store, c, p, sid)
+            change = threading.Thread(target=store.set_access, args=('event-reader',),
+                kwargs={'chats': ['telegram-demo-chat']})
+            change.start()
+            change.join(0.5)
+            # The removal waits for the read in flight, which saw the old scope.
+            assert change.is_alive()
+        change.join(10)
+        assert not change.is_alive()
+        assert [item['event_id'] for item in page['items']] == [kept, gone]
+        with pytest.raises(APIError, match='stale_ack'):
+            call(store, token, 'ack_subscription_events', sid, page['receipt'], page['ack_version'])
+        after = call(store, token, 'fetch_subscription_events', sid)
+        assert [item['event_id'] for item in after['items']] == [kept] and after['next_after'] == gone
+        assert call(store, token, 'ack_subscription_events', sid, after['receipt'], after['ack_version'])['acked_through'] == gone
+        following = call(store, token, 'fetch_subscription_events', sid)
+        assert following['items'] == [] and following['receipt'] is None
+    finally:
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-522
+def test_disabling_dynamic_sources_masks_them_for_todays_readers_and_cancels_their_hints(seeded, tmp_path):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    try:
+        token = identity(store)
+        sid = store.create_subscription(token, sources={'all_visible_chats': True}, label='Synthetic dynamic')['subscription_id']
+        explicit = subscription(store, token)
+        rid, _ = receiver(store, token, tmp_path)
+        call(store, token, 'configure_subscription_delivery', sid, 1, rid)
+        emit(store)
+        match_subscriptions(store)
+        assert pending_hints(store, sid) == 1
+    finally:
+        result = store.set_dynamic_subscriptions(False)
+    assert result['dynamic_subscriptions'] == 'disabled' and result['access_changed'] == [sid]
+    assert len(result['cancelled_hints']) == 1 and pending_hints(store, sid) == 0
+    view = store.get_subscription(token, sid)
+    assert set(view) == {'subscription_id', 'state', 'version', 'recreate_required', 'scope_masked'}
+    assert view['state'] == 'access_changed' and 'Synthetic dynamic' not in str(store.list_subscriptions(token))
+    assert [item['state'] for item in store.list_subscriptions(token)['items'] if item['subscription_id'] == sid] == [
+        'access_changed']
+    page = store.get_subscription_events(token, sid)
+    assert page['items'] == [] and page['scope_masked']
+    with pytest.raises(APIError, match='subscription_access_changed'):
+        store.update_subscription(token, sid, view['version'], action='resume')
+    with pytest.raises(APIError, match='subscription_access_changed'):
+        call(store, token, 'fetch_subscription_events', sid)
+    with pytest.raises(APIError, match='dynamic_sources_disabled'):
+        store.create_subscription(token, sources={'all_visible_chats': True})
+    # Explicit definitions are untouched.
+    assert store.get_subscription(token, explicit)['state'] == 'active'
+    posts = []
+    dispatch_hints(store, transport=lambda *a, **k: posts.append(a) or 204, resolver=lambda *a, **k: ['93.184.216.34'])
+    assert posts == []
+
+
 def test_synthetic_subscription_probe_is_idempotent_and_rate_bounded(seeded, tmp_path):
     store, _, _ = seeded
     token = identity(store)
@@ -832,6 +1087,33 @@ def test_endpoint_hint_body_pins_the_reference_fields_and_the_cap(seeded, tmp_pa
     assert payload['next_call'] == {'tool': 'messages_fetch_subscription_events', 'subscription_id': sid}
     assert set(headers) == {'Content-Type', 'webhook-id', 'webhook-timestamp', 'webhook-signature'}
     assert not any(name.lower().startswith('x-deedkit') for name in headers) and b'host_turn_verified' not in body
+
+
+# spec: ANYM-522
+def test_endpoint_hint_of_a_dynamic_definition_lists_only_references_visible_now(seeded, tmp_path, monkeypatch):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    try:
+        token, endpoint, _, _ = endpoint_setup(store, tmp_path, monkeypatch, events=0)
+        second_chat(store)
+        sid = store.create_subscription(token, sources={'all_visible_chats': True},
+            delivery={'endpoint_id': endpoint['endpoint_id']})['subscription_id']
+        kept, hidden = emit(store), emit_in(store, 'demo-tg-x')
+        match_subscriptions(store)
+        # Removed and added again: the earlier match stays hidden although its chat is visible.
+        store.set_access('endpoint-reader', chats=['telegram-demo-chat'])
+        store.set_access('endpoint-reader', chats=None)
+        sent = []
+        assert dispatch_hints(store, transport=lambda url, body, headers, **k: sent.append(body) or 204,
+            resolver=lambda *a, **k: ['93.184.216.34'])['delivered'] == 1
+    finally:
+        store.set_delivery_features(False)
+        store.set_dynamic_subscriptions(False)
+    payload = json.loads(sent[0])
+    assert payload['subscription_id'] == sid
+    assert [ref['event_id'] for ref in payload['references']] == [kept] and payload['references_omitted'] == 0
+    assert hidden not in [ref['event_id'] for ref in payload['references']]
 
 
 # spec: ANYM-535

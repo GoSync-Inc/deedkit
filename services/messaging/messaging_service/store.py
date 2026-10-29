@@ -261,7 +261,7 @@ def digest(value: str) -> str:
 
 
 KEY_OPERATION_SCHEMA=44  # api_key_operations (ANYM-495)
-RUNTIME_SCHEMA=59  # the newest schema this runtime knows; migrate() refuses a newer database
+RUNTIME_SCHEMA=60  # the newest schema this runtime knows; migrate() refuses a newer database
 
 
 def revocable_token(value):
@@ -1222,12 +1222,12 @@ class Store:
                 exclude_channels=exclude_channels,order=order,reset_filters=reset_filters,
                 expected_ack_version=expected_ack_version,start_from=start_from,view=view)
 
-    def create_subscription(self, token, chat_ids, *, sender_ids=None, kinds=None,
+    def create_subscription(self, token, chat_ids=None, *, sources=None, sender_ids=None, kinds=None,
                             direction='incoming', origins=None, label='', expires_at=None, wake_rules=None, reply_to_send=None,
                             delivery=None):
         from .subscriptions import create_subscription
         with self.authorized(token, 'create_subscription') as (c, p):
-            return create_subscription(self, c, p, chat_ids, sender_ids=sender_ids, kinds=kinds,
+            return create_subscription(self, c, p, chat_ids, sources=sources, sender_ids=sender_ids, kinds=kinds,
                 direction=direction, origins=origins, label=label, expires_at=expires_at, wake_rules=wake_rules, reply_to_send=reply_to_send,
                 delivery=delivery)
 
@@ -1322,6 +1322,11 @@ class Store:
         from .delivery_endpoints import endpoint_signal
         with self.authorized(token) as (c, p):
             return endpoint_signal(c, p, endpoint_id)
+
+    def set_dynamic_subscriptions(self, enabled, *, verify_components=False):
+        # Operator only (`set-dynamic-subscriptions`, ANYM-522); disabling is the rollback before older code runs.
+        from .subscriptions import set_dynamic_subscriptions
+        return set_dynamic_subscriptions(self, enabled, verify_components=verify_components)
 
     def set_delivery_features(self, enabled, *, verify_components=False):
         # Operator only (`set-delivery-features`, ANYM-534); disabling cancels queued endpoint hints and tests.
@@ -1460,7 +1465,7 @@ class Store:
             c.execute(Path(__file__).with_name('schema.sql').read_text())
             version=int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
             if version>RUNTIME_SCHEMA: raise RuntimeError('database_newer_than_runtime')
-            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql'),(43,'043_person_links.sql'),(44,'044_key_operation_id.sql'),(45,'045_message_purge.sql'),(46,'046_chat_roles.sql'),(47,'047_contact_search.sql'),(48,'048_dispatcher_heartbeat.sql'),(49,'049_delivery_endpoints.sql'),(50,'050_component_heartbeats.sql'),(51,'051_send_intents.sql'),(52,'052_host_admission_index.sql'),(53,'053_person_preferences.sql'),(54,'054_conflict_classes.sql'),(55,'055_failure_events.sql'),(56,'056_module_events.sql'),(57,'057_conflict_reevaluation.sql'),(58,'058_module_router.sql'),(59,'059_endpoint_refusal_indexes.sql')]:
+            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql'),(43,'043_person_links.sql'),(44,'044_key_operation_id.sql'),(45,'045_message_purge.sql'),(46,'046_chat_roles.sql'),(47,'047_contact_search.sql'),(48,'048_dispatcher_heartbeat.sql'),(49,'049_delivery_endpoints.sql'),(50,'050_component_heartbeats.sql'),(51,'051_send_intents.sql'),(52,'052_host_admission_index.sql'),(53,'053_person_preferences.sql'),(54,'054_conflict_classes.sql'),(55,'055_failure_events.sql'),(56,'056_module_events.sql'),(57,'057_conflict_reevaluation.sql'),(58,'058_module_router.sql'),(59,'059_endpoint_refusal_indexes.sql'),(60,'060_dynamic_subscription_sources.sql')]:
                 migration=Path(__file__).with_name('migrations')/name
                 sha=hashlib.sha256(migration.read_bytes()).hexdigest()
                 if version<target:
@@ -1601,6 +1606,10 @@ class Store:
                 permission_version=permission_version+1 WHERE id=%s
                 RETURNING id,principal,permissions,permission_version''',
                 (permissions,credential_id)).fetchone()
+            if not {'read','subscription-write'}<=set(permissions):
+                # ANYM-522: restoring the permission later does not revive this key's dynamic definitions.
+                from .subscriptions import invalidate_dynamic
+                invalidate_dynamic(c,known['principal'],credential_id)
             audit(c,{'id':known['principal'],'key_id':credential_id},'set_key_permissions','ok')
             return serial(row)
 
@@ -1612,6 +1621,11 @@ class Store:
             if changed:
                 c.execute('''UPDATE principals SET accounts=%s,chat_ids=%s,permissions=%s,enabled=%s,
                     scope_version=scope_version+1 WHERE id=%s''',(accounts,chats,permissions,enabled,principal))
+                # ANYM-522: references to chats leaving the scope stay hidden, also after a re-add; a lost
+                # read or subscription-write ends the dynamic definitions for good.
+                from .subscriptions import hide_out_of_scope,invalidate_dynamic
+                hide_out_of_scope(c,principal,accounts,chats)
+                if not enabled or not {'read','subscription-write'}<=set(permissions):invalidate_dynamic(c,principal)
         else:
             c.execute('INSERT INTO principals(id,accounts,chat_ids,permissions,enabled) VALUES(%s,%s,%s,%s,%s)',
                       (principal,accounts,chats,permissions,enabled))

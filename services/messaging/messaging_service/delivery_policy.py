@@ -12,7 +12,7 @@ import re
 
 from psycopg.types.json import Jsonb
 
-from .subscriptions import _bound_setting, _state, _worker_identity
+from .subscriptions import _bound_setting, _state, _worker_identity, reference_columns
 
 WEEKDAYS = ('mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun')
 BYPASS = ('incoming_message', 'owner_mention', 'reply_to_owner', 'reply_to_confirmed_send', 'silence')
@@ -77,6 +77,10 @@ def normalize_policy(c, policy, selector):
         if ('quiet_hours' not in result or not isinstance(bypass, list) or not 1 <= len(bypass) <= len(BYPASS) or
                 any(not isinstance(reason, str) or reason not in BYPASS for reason in bypass) or
                 len(set(bypass)) != len(bypass)):
+            raise invalid
+        if 'sources' in (selector or {}):
+            # ANYM-522: a dynamic definition's hints wake only on references the key can see at dispatch; the
+            # dispatcher cannot re-derive their reasons, so no reason skips its quiet hours.
             raise invalid
         result['quiet_bypass'] = sorted(bypass, key=BYPASS.index)
     if 'expect_reply_within_s' in result and not (selector or {}).get('reply_anchor'):
@@ -263,7 +267,7 @@ def _settle(c, row, binding, window, now, through):
     return emitted
 
 
-def _absorb(c, row, binding, window, *, limit=1000, pages=16):
+def _absorb(c, row, binding, window, p=None, *, limit=1000, pages=16):
     """Fold every committed match above the held range into it; False if pages ran out first.
 
     The matcher and the recovery tick share this path, so a failed hint step loses no reason,
@@ -271,48 +275,62 @@ def _absorb(c, row, binding, window, *, limit=1000, pages=16):
     caller settles nothing on False: the progress is saved and the next tick continues.
     """
     for _ in range(pages):
-        if _absorb_page(c, row, binding, window, limit) < limit:
+        if _absorb_page(c, row, binding, window, limit, p) < limit:
             return True
     # A last full page may have taken the final match: only a match still above the range defers
     # settling, and that match keeps the subscription a recovery candidate for the next tick.
+    through = window['through_position'] if window['through_position'] is not None else window['hinted_through']
     return c.execute('SELECT 1 FROM subscription_matches WHERE subscription=%s AND event>%s LIMIT 1',
-        (row['id'], window['through_position'])).fetchone() is None
+        (row['id'], through)).fetchone() is None
 
 
-def _absorb_page(c, row, binding, window, limit):
+def _absorb_page(c, row, binding, window, limit, p=None):
     start = window['through_position']
     if start is None:
         start = window['hinted_through'] if window['hinted_through'] is not None else row['start_position']
-    matches = c.execute('''SELECT m.event,m.matched_at,e.account,e.kind,e.origin,
+    # ANYM-522: references a dynamic definition cannot show now give no reason, count or match time.
+    columns, args = reference_columns(row, p)
+    matches = c.execute('''SELECT m.event,m.matched_at,e.account,e.kind,e.origin,''' + columns + ''',
         jsonb_strip_nulls(jsonb_build_object('chat',e.snapshot->'chat',
             'sender',e.snapshot->'sender','direction',e.snapshot->'direction',
             'metadata',e.snapshot->'metadata','reply_evidence',e.snapshot->'reply_evidence')) AS snapshot
         FROM subscription_matches m JOIN events e ON e.id=m.event
         WHERE m.subscription=%s AND m.event>%s ORDER BY m.event LIMIT %s''',
-        (row['id'], start, limit)).fetchall()
+        (*args, row['id'], start, limit)).fetchall()
     if not matches:
         return 0
+    shown = [item for item in matches if item['visible']]
+    if not shown:
+        # Passed for good: a held range ends after them, else they count as handled.
+        if window['first_match_at'] is not None:
+            window['through_position'] = matches[-1]['event']
+        else:
+            window['hinted_through'] = max(window['hinted_through'] or 0, matches[-1]['event'])
+        return len(matches)
     from .subscription_consumption import wake_reason
     reasons = set(window['reasons'])
-    for item in matches:
+    for item in shown:
         found = wake_reason({**item['snapshot'], 'account': item['account'], 'kind': item['kind'],
-            'historical': item['origin'] in ('backfill', 'reconcile')}, row['selector'])
+            'historical': item['origin'] in ('backfill', 'reconcile'), 'reply_to_own_send': item['own_send_reply']},
+            row['selector'])
         reasons.update(found)
         if (binding is not None and _armed(row, binding) and window['silence_state'] is None and
                 'reply_to_confirmed_send' in found and
                 binding['configured_at'] <= item['matched_at'] < binding['silence_deadline']):
             window['silence_state'] = 'replied'
     if window['first_match_at'] is None:
-        window['first_match_at'] = matches[0]['matched_at']
-    window['last_match_at'] = max(window['last_match_at'] or matches[-1]['matched_at'], matches[-1]['matched_at'])
-    window['match_count'] = min(1000000, window['match_count'] + len(matches))
+        window['first_match_at'] = shown[0]['matched_at']
+    window['last_match_at'] = max(window['last_match_at'] or shown[-1]['matched_at'], shown[-1]['matched_at'])
+    window['match_count'] = min(1000000, window['match_count'] + len(shown))
     window['through_position'] = matches[-1]['event']
     window['reasons'] = sorted(reasons)[:16]
     return len(matches)
 
 
-def after_match(c, row, through):
-    """Matcher transaction, after new matches: hold or commit the hint. Returns hints committed."""
+def after_match(c, row, through, p=None):
+    """Matcher transaction, after new matches: hold or commit the hint. Returns hints committed.
+
+    p: the key's identity the matcher locked (a dynamic definition hints only references it can see)."""
     binding = _binding(c, row)
     window = _window(c, row)
     if binding is None:
@@ -320,7 +338,7 @@ def after_match(c, row, through):
         window['hinted_through'] = max(window['hinted_through'] or 0, through)
         _save(c, window)
         return 0
-    emitted = _settle(c, row, binding, window, _now(c), through) if _absorb(c, row, binding, window) else 0
+    emitted = _settle(c, row, binding, window, _now(c), through) if _absorb(c, row, binding, window, p) else 0
     _save(c, window)
     return emitted
 
@@ -369,7 +387,7 @@ def flush_hints(store, *, limit=32):
                 continue
             # A failed hint step left committed matches outside the held range: replay all of them
             # before any range or silence timer is settled.
-            if _absorb(c, row, binding, window):
+            if _absorb(c, row, binding, window, p):
                 stats['emitted'] += _settle(c, row, binding, window, _now(c), row['matched_through'])
             stats['held'] += window['due_at'] is not None or window['silence_due_at'] is not None
             _save(c, window)

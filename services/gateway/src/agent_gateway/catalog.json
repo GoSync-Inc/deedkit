@@ -4002,20 +4002,39 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Persist selection of explicit authorized archive chats; no send or provider request.\n\nRequires read + explicit subscription-write. The subscription belongs to the\noriginating credential; another key for the same principal cannot adopt it.\nchat_ids are 1–64 archive IDs resolved through list_chats/resolve_reference.\nOptional sender_ids are exact account-scoped IDs from search_people, not names.\nStarts at the committed event boundary; default message.created/incoming/live.\nHistorical events require explicit backfill/reconcile origins. File readiness\nis independent of message arrival. Optional expiry is a future zoned ISO time\nwithin 366 days. Label is only a correlation hint, not authority to wake a task.\nDelivery uses separate fetch/ACK and configured signed hints; no provider read-state mutation.\nOptional delivery={endpoint_id, delivery_policy?} binds your own endpoint from register_delivery_endpoint;\nit needs delivery-write and the operator's delivery switch.\nA timeout can leave creation uncertain: inspect list_subscriptions before retrying.\n",
+    "description": "Persist selection of authorized archive chats; no send or provider request.\n\nRequires read + explicit subscription-write. The subscription belongs to the\noriginating credential; another key for the same principal cannot adopt it.\nExactly one of chat_ids (1–64 archive IDs from list_chats/resolve_reference, frozen)\nor sources={all_visible_chats: true, account_ids?, include_channels?, include_bots?}:\nevery chat the key can see at the moment of each read, count and hint, so a scope\nchange neither invalidates it nor needs a new one; channels and bot senders stay out\nunless included. Dynamic sources need the operator's switch (dynamic_sources_disabled).\nRecommended wake_rules for them: [reply_to_owner, owner_mention, reply_to_own_send];\nreply_to_own_send (dynamic only) catches an exact native reply to any confirmed send of\nthis key. Optional sender_ids (explicit chats only) are exact account-scoped IDs from search_people.\nStarts at the committed event boundary; default message.created/incoming/live.\nHistorical events require explicit backfill/reconcile origins. File readiness\nis independent of message arrival. Optional expiry is a future zoned ISO time\nwithin 366 days. Label is only a correlation hint, not authority to wake a task.\nDelivery uses separate fetch/ACK and configured signed hints; no provider read-state mutation.\nOptional delivery={endpoint_id, delivery_policy?} binds your own endpoint from register_delivery_endpoint;\nit needs delivery-write and the operator's delivery switch.\nA timeout can leave creation uncertain: inspect list_subscriptions before retrying.\n",
     "inputSchema": {
       "properties": {
         "chat_ids": {
-          "items": {
-            "maxLength": 256,
-            "minLength": 1,
-            "pattern": "^[^\\x00-\\x20\\x7f]+$",
-            "type": "string"
-          },
-          "maxItems": 64,
-          "minItems": 1,
           "title": "Chat Ids",
-          "type": "array"
+          "anyOf": [
+            {
+              "items": {
+                "maxLength": 256,
+                "minLength": 1,
+                "pattern": "^[^\\x00-\\x20\\x7f]+$",
+                "type": "string"
+              },
+              "maxItems": 64,
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "sources": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SubscriptionSources"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "sender_ids": {
           "anyOf": [
@@ -4130,7 +4149,8 @@
                   "incoming_message",
                   "owner_mention",
                   "reply_to_owner",
-                  "reply_to_confirmed_send"
+                  "reply_to_confirmed_send",
+                  "reply_to_own_send"
                 ],
                 "type": "string"
               },
@@ -4171,9 +4191,6 @@
           "default": null
         }
       },
-      "required": [
-        "chat_ids"
-      ],
       "type": "object",
       "title": "create_subscriptionArguments",
       "additionalProperties": false,
@@ -4316,6 +4333,41 @@
             "endpoint_id"
           ],
           "title": "SubscriptionEndpoint",
+          "type": "object"
+        },
+        "SubscriptionSources": {
+          "additionalProperties": false,
+          "properties": {
+            "account_ids": {
+              "items": {
+                "maxLength": 256,
+                "minLength": 1,
+                "pattern": "^[^\\x00-\\x20\\x7f]+$",
+                "type": "string"
+              },
+              "maxItems": 64,
+              "minItems": 1,
+              "title": "Account Ids",
+              "type": "array"
+            },
+            "all_visible_chats": {
+              "const": true,
+              "title": "All Visible Chats",
+              "type": "boolean"
+            },
+            "include_bots": {
+              "title": "Include Bots",
+              "type": "boolean"
+            },
+            "include_channels": {
+              "title": "Include Channels",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "all_visible_chats"
+          ],
+          "title": "SubscriptionSources",
           "type": "object"
         }
       }

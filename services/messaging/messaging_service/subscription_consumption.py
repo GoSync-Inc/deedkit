@@ -6,7 +6,7 @@ import secrets
 import time
 import threading
 from psycopg.types.json import Jsonb
-from .subscriptions import _owned, get_subscription_events
+from .subscriptions import _owned, dynamic, get_subscription_events
 
 _WAIT_SLOTS = threading.BoundedSemaphore(32)
 _IMMEDIATE_READ_TIMEOUT_S = 5
@@ -71,6 +71,9 @@ def wake_reason(item, selector=None):
                 metadata.get('reply_to_owner') is not False and
                 metadata.get('reply_to_provider_id') == anchor['native_reply_id'])):
         reasons.append('reply_to_confirmed_send')
+    # ANYM-522: the matcher's evidence that this arrival replies to any confirmed send of the key.
+    if arrival and item.get('reply_to_own_send') is True:
+        reasons.append('reply_to_own_send')
     if item.get('kind', '').startswith(('attachment.', 'file.')):
         reasons.append('processing_state_changed')
     return reasons or ['selected_event']
@@ -102,7 +105,9 @@ def fetch_subscription_events(store, c, p, subscription_id, *, limit=50):
     page.update(consumption='explicit_subscription_ack', ack_version=consumption['version'], receipt=None,
         acked_through=consumption['acked_through'], receipt_expires_at=None,
         ack_available='subscription-ack' in p['permissions'])
-    moved = module is not None and page['module']['next_after'] != module['acked_through']
+    # ANYM-522: a page of a dynamic definition can pass hidden references with no item to return.
+    moved = (module is not None and page['module']['next_after'] != module['acked_through'] or
+        dynamic(row) and page['next_after'] != consumption['acked_through'])
     if not page['items'] and not moved or 'subscription-ack' not in p['permissions']:
         return page
     c.execute('DELETE FROM subscription_receipts WHERE subscription=%s AND expires_at<=clock_timestamp()',

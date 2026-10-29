@@ -72,7 +72,7 @@ V57_TABLES={'conflict_reevaluations':'job,job_version,account'}
 # Every schema this runtime can capture, verify and restore (one ceiling for capture and verify_bundle).
 # ANYM-575: the router's cursors and open or resolved gaps, consistent with module_events in one snapshot.
 V58_TABLES={'module_router_cursors':'source','module_router_gaps':'id'}
-SCHEMAS=range(2,60)
+SCHEMAS=range(2,61)
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
 V17_TABLES={'message_conflicts':'receipt_digest'}

@@ -18,7 +18,7 @@ from uuid import UUID, uuid4
 from psycopg.types.json import Jsonb
 
 from .egress import EgressNotSent, answer, deadline_after, post
-from .subscriptions import _owned, _state, _view, _worker_identity
+from .subscriptions import _owned, _state, _view, _worker_identity, dynamic, hint_visible
 
 
 _DNS_SLOTS = threading.BoundedSemaphore(4)
@@ -224,7 +224,7 @@ def configure_subscription_delivery(store, c, p, subscription_id, version, recei
     if previous is not None and (receiver_id or endpoint_id) is not None and (
             str(previous['receiver']), str(previous.get('endpoint'))) == (str(receiver_id), str(endpoint_id)):
         carry_window(c, row, version)
-    result = _view(c, row)
+    result = _view(c, row, p)
     result['delivery'] = {'passive_read': True, 'ack': True, 'push': receiver_id is not None or endpoint_id is not None,
         'receiver_id': receiver_id, 'host_wakeup': 'unverified', 'host_turn_verified': False}
     if endpoint_id is not None:
@@ -360,7 +360,8 @@ def delivery_transports(c, p):
                 (f'{DIAGNOSTIC_STATEMENT_MS}ms', f'{DIAGNOSTIC_LOCK_MS}ms'))
             beat_row = c.execute('''SELECT clock_timestamp()-beat_at<=make_interval(secs=>%s) AS fresh
                 FROM subscription_dispatcher_heartbeat WHERE id=1''', (HEARTBEAT_MAX_AGE_S,)).fetchone()
-            # Only bindings of subscriptions still valid for this key: not expired, same scope and permissions.
+            # Only bindings of subscriptions still valid for this key: not expired, same scope and permissions
+            # (ANYM-522: a dynamic definition follows the key's current scope).
             # ANYM-519: a bound enabled self-service endpoint counts as configured too (schema 49).
             from .delivery_endpoints import gate_on, schema_ready
             endpoints = schema_ready(c)
@@ -371,7 +372,7 @@ def delivery_transports(c, p):
                 if endpoints else '') + '''
                 WHERE s.principal=%s AND s.key_id=%s AND s.state IN ('active','paused')
                 AND (s.expires_at IS NULL OR s.expires_at>clock_timestamp())
-                AND s.scope_version=%s AND s.key_permission_version=%s''',
+                AND (s.selector ? 'sources' OR s.scope_version=%s AND s.key_permission_version=%s)''',
                 (p['id'], p['key_id'], p['scope_version'], p['key_permission_version'])).fetchone()
             gate = gate_on(c, fence=False)
             c.execute("SELECT set_config('statement_timeout',%s,true),set_config('lock_timeout',%s,true)",
@@ -637,6 +638,10 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                 receiver['principal'] == p['id'] and receiver['key_id'] == p['key_id'] and
                 (registered is None or (receiver['endpoint'], receiver['secret_file']) ==
                  (registered['endpoint'], registered['secret_file'])))
+            if eligible and hint['kind'] == 'events' and dynamic(row):
+                # ANYM-522: under the fence, a hint whose references all left the key's scope is not sent.
+                eligible = hint_visible(c, row, p, hint['through_position'])
+                refused = refused or (None if eligible else 'scope_changed')
             live = c.execute("""SELECT 1 FROM subscription_outbox WHERE id=%s AND state='leased'
                 AND lease_token=%s AND lease_until>clock_timestamp() FOR UPDATE""", (hint['id'], lease)).fetchone()
             if live:

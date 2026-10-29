@@ -24,6 +24,13 @@ FAILURE_KINDS = frozenset(('send.failed', 'source.health'))
 # A journal write the send or collector path survived, per kind, since process start.
 JOURNAL_FAILURES = Counter()
 ORIGINS = frozenset(('live', 'fixture', 'backfill', 'reconcile'))
+WAKE_RULES = frozenset(('incoming_message', 'owner_mention', 'reply_to_owner', 'reply_to_confirmed_send',
+    'reply_to_own_send'))
+# ANYM-522: the operator's switch for dynamic sources (set-dynamic-subscriptions); creation reads it under
+# the shared lock, so --disable waits for every creation that read it enabled.
+DYNAMIC_GATE = 'dynamic_subscriptions'
+DYNAMIC_LOCK = 'dynamic-subscriptions'
+SOURCE_OPTIONS = frozenset(('all_visible_chats', 'account_ids', 'include_channels', 'include_bots'))
 
 
 def _bound_setting(name, default, minimum, maximum):
@@ -55,12 +62,112 @@ def _subscription_id(value):
         raise APIError('not_found', 404) from None
 
 
+def dynamic(row):
+    """ANYM-522: the definition follows the key's current scope instead of frozen sources."""
+    return 'sources' in row['selector']
+
+
+def dynamic_gate_on(c, *, fence=True):
+    if fence:
+        c.execute('SELECT pg_advisory_xact_lock_shared(hashtextextended(%s,0))', (DYNAMIC_LOCK,))
+    return c.execute("""SELECT EXISTS(SELECT FROM probe_metadata WHERE name=%s AND value='enabled')
+        AS enabled""", (DYNAMIC_GATE,)).fetchone()['enabled']
+
+
+def scope(row, p):
+    """(accounts, chats) a definition may disclose now: a dynamic one the key's current scope narrowed by
+    its account_ids; chats None means every chat of those accounts."""
+    if not dynamic(row):
+        return p['accounts'], p['chat_ids']
+    selected = row['selector']['sources'].get('account_ids')
+    return [account for account in p['accounts'] if selected is None or account in selected], p['chat_ids']
+
+
+def visible_filter(row, p, alias='m'):
+    """(SQL, args) over subscription_matches (ANYM-522). A dynamic definition shows a reference only while its
+    chat is in the key's scope and the operator did not hide it (hide_out_of_scope); an explicit definition
+    is masked as a whole instead (access_changed), so all of its references show."""
+    if alias not in ('m', 'sm'):
+        raise ValueError('invalid_reference_alias')
+    if not dynamic(row):
+        return 'true', []
+    accounts, chats = scope(row, p)
+    return ('coalesce(NOT ' + alias + '.hidden AND ' + alias + '.account=ANY(%s) AND (%s::text[] IS NULL OR ' +
+        alias + '.chat=ANY(%s)),false)', [accounts, chats, chats])
+
+
+def reference_columns(row, p, alias='m'):
+    """(SQL, args) of the `visible` and `own_send_reply` columns of each match reference."""
+    where, args = visible_filter(row, p, alias)
+    # Explicit definitions name no schema-60 column, so they keep working before the migration.
+    return where + ' AS visible,' + (alias + '.own_send_reply' if dynamic(row) else 'false AS own_send_reply'), args
+
+
+def hide_out_of_scope(c, principal, accounts, chats):
+    """ANYM-522, in the operator's scope change under the exclusive principal lock, which waits for every
+    read, matcher batch and hint POST of the principal in flight: references of its dynamic definitions to a
+    chat or account now outside the scope stay hidden for good, so a chat removed and added again shows only
+    events matched after it came back. A held hint range is rebuilt from the visible references (its count,
+    reasons and match times), a pending hint that covers no visible reference is cancelled, and every other
+    queued hint keeps its range."""
+    if not c.execute("SELECT EXISTS(SELECT FROM subscriptions WHERE principal=%s AND selector ? 'sources') AS e",
+            (principal,)).fetchone()['e']:
+        return
+    touched = sorted({row['subscription'] for row in c.execute('''UPDATE subscription_matches m SET hidden=true
+        FROM subscriptions s WHERE s.principal=%s AND s.selector ? 'sources' AND m.subscription=s.id AND NOT m.hidden
+        AND NOT coalesce(m.account=ANY(%s) AND (%s::text[] IS NULL OR m.chat=ANY(%s)),false)
+        RETURNING m.subscription''', (principal, accounts, chats, chats)).fetchall()})
+    for row in c.execute('SELECT * FROM subscriptions WHERE id=ANY(%s) ORDER BY id FOR UPDATE', (touched,)).fetchall():
+        # The next matcher or recovery tick re-absorbs the range above hinted_through, visible references only.
+        c.execute('''UPDATE subscription_hint_windows SET first_match_at=NULL,last_match_at=NULL,match_count=0,
+            through_position=NULL,reasons='{}',due_at=NULL,held_reason=NULL,updated_at=clock_timestamp()
+            WHERE subscription=%s AND through_position IS NOT NULL''', (row['id'],))
+        p = {'accounts': accounts, 'chat_ids': chats}
+        # A mixed hint keeps its id and position (never re-emitted: the outbox key would drop it), as does a
+        # lapsed lease, which may have reached its receiver; the dispatcher rechecks visibility under its fence.
+        # A dynamic definition has no quiet-hours bypass (delivery_policy.normalize_policy).
+        for hint in c.execute('''SELECT id,through_position FROM subscription_outbox WHERE subscription=%s
+                AND kind='events' AND state='pending' ORDER BY through_position,id''', (row['id'],)).fetchall():
+            if not hint_visible(c, row, p, hint['through_position']):
+                c.execute('''UPDATE subscription_outbox SET state='cancelled',finished_at=clock_timestamp(),
+                    error_code='scope_changed',lease_token=NULL,lease_until=NULL WHERE id=%s''', (hint['id'],))
+
+
+def invalidate_dynamic(c, principal, key_id=None):
+    """ANYM-522, in the operator's change under the exclusive principal lock: losing read or subscription-write
+    (or a disabled principal) ends the dynamic definitions at once, so restoring the right cannot revive them."""
+    c.execute("""UPDATE subscriptions SET state='access_changed',version=version+1,updated_at=clock_timestamp()
+        WHERE principal=%s AND (%s::uuid IS NULL OR key_id=%s) AND selector ? 'sources'
+        AND state<>'access_changed'""", (principal, key_id, key_id))
+
+
+# The range an events hint o covers starts above the previous one's position, or the start (one argument);
+# a hint the scope change re-planned (scope_changed) no longer bounds a range.
+_PREVIOUS_HINT = '''coalesce((SELECT max(p.through_position) FROM subscription_outbox p WHERE p.subscription=o.subscription
+    AND p.kind='events' AND p.through_position<o.through_position AND p.error_code IS DISTINCT FROM 'scope_changed'),%s)'''
+
+
+def hint_visible(c, row, p, through):
+    """ANYM-522: an events hint of a dynamic definition goes out only while a reference it covers is visible
+    now: above the previous events hint's position (or the start) and at or below its own."""
+    where, args = visible_filter(row, p)
+    return c.execute('''SELECT EXISTS(SELECT FROM (SELECT %s::uuid AS subscription,%s::bigint AS through_position) o
+        JOIN subscription_matches m ON m.subscription=o.subscription AND m.event<=o.through_position
+        AND m.event>''' + _PREVIOUS_HINT + ' AND ' + where + ') AS shown',
+        (row['id'], through, row['start_position'], *args)).fetchone()['shown']
+
+
 def _state(c, row, p):
     """ACL changes never revive a previous definition, even after restoration."""
-    changed = (row['scope_version'] != p['scope_version'] or
-        row['key_permission_version'] != p['key_permission_version'] or
-        not {'read', 'subscription-write'} <= set(p['permissions']))
-    if not changed:
+    if dynamic(row):
+        # ANYM-522: scope and permission versions move without invalidating it; losing read or
+        # subscription-write still does (fail closed). Each disclosure point applies the current scope.
+        changed = not {'read', 'subscription-write'} <= set(p['permissions'])
+    else:
+        changed = (row['scope_version'] != p['scope_version'] or
+            row['key_permission_version'] != p['key_permission_version'] or
+            not {'read', 'subscription-write'} <= set(p['permissions']))
+    if not changed and not dynamic(row):
         sources = c.execute('SELECT account,chat FROM subscription_sources WHERE subscription=%s',
             (row['id'],)).fetchall()
         changed = any(source['account'] not in p['accounts'] or
@@ -86,14 +193,18 @@ def _owned(c, p, subscription_id):
     return _state(c, row, p)
 
 
-def _view(c, row):
+def _view(c, row, p=None):
     from .store import serial
     if row['state'] == 'access_changed':
         return {'subscription_id': str(row['id']), 'state': 'access_changed',
             'version': row['version'], 'recreate_required': True, 'scope_masked': True}
     head = c.execute('SELECT value FROM feed_counter WHERE id=1').fetchone()['value']
-    count = c.execute('SELECT count(*) AS n FROM subscription_matches WHERE subscription=%s',
-        (row['id'],)).fetchone()['n']
+    if dynamic(row) and p is None:
+        raise ValueError('dynamic_view_needs_scope')
+    # ANYM-522: a dynamic definition counts only the references the key can see now.
+    where, args = visible_filter(row, p)
+    count = c.execute('SELECT count(*) AS n FROM subscription_matches m WHERE m.subscription=%s AND ' + where,
+        (row['id'], *args)).fetchone()['n']
     # ANYM-518: the consumer's ACK position; before its first fetch, the start.
     consumption = c.execute('SELECT acked_through FROM subscription_consumption WHERE subscription=%s',
         (row['id'],)).fetchone()
@@ -109,7 +220,7 @@ def _view(c, row):
         'missing_revision_evidence_events': row['missing_evidence'],
         'last_matched_at': row['last_matched_at'], 'scope_masked': False,
         'freshness_basis': 'committed_archive_journal_not_provider_freshness',
-        'delivery': _delivery_view(c, row), **_module_view(c, row)})
+        'delivery': _delivery_view(c, row, p), **_module_view(c, row)})
 
 
 def _module_view(c, row):
@@ -120,11 +231,20 @@ def _module_view(c, row):
 
 
 
-def _delivery_view(c, row):
+def _delivery_view(c, row, p=None):
     # Every column: before schema 49 the binding has no endpoint column (rolling upgrade).
     binding = c.execute('SELECT * FROM subscription_delivery WHERE subscription=%s', (row['id'],)).fetchone()
-    counts = c.execute('''SELECT state,count(*) AS n FROM subscription_outbox WHERE subscription=%s
-        GROUP BY state''', (row['id'],)).fetchall()
+    if dynamic(row):
+        # ANYM-522: only events hints that cover a reference the key can see now count, in every state.
+        where, args = visible_filter(row, p)
+        counts = c.execute('''SELECT o.state,count(*) AS n FROM subscription_outbox o WHERE o.subscription=%s
+            AND o.error_code IS DISTINCT FROM 'scope_changed' AND (o.kind<>'events' OR EXISTS(
+                SELECT FROM subscription_matches m WHERE m.subscription=o.subscription AND m.event<=o.through_position
+                AND m.event>''' + _PREVIOUS_HINT + ''' AND ''' + where + ''')) GROUP BY o.state''',
+            (row['id'], row['start_position'], *args)).fetchall()
+    else:
+        counts = c.execute('''SELECT state,count(*) AS n FROM subscription_outbox WHERE subscription=%s
+            GROUP BY state''', (row['id'],)).fetchall()
     # An unbound subscription reads no policy state, so its view needs no schema-38 column.
     from .delivery_policy import UNBOUND, delivery_state
     view = {'passive_read': True, 'ack': True, 'push': binding is not None,
@@ -142,12 +262,33 @@ def _delivery_view(c, row):
     return view
 
 
-def create_subscription(store, c, p, chat_ids, *, sender_ids=None, kinds=None,
+def _sources(p, sources, sender_ids, reply_to_send):
+    """ANYM-522: all chats the key can see, optionally per account; channels (Telegram broadcasts
+    included) and bot senders only when asked for."""
+    from .store import APIError
+    if (not isinstance(sources, dict) or set(sources) - SOURCE_OPTIONS or sources.get('all_visible_chats') is not True or
+            any(type(sources.get(name, False)) is not bool for name in ('include_channels', 'include_bots'))):
+        raise APIError('invalid_filter')
+    # Sender IDs are account-scoped and a send anchor names one chat: both belong to explicit sources.
+    if sender_ids is not None:
+        raise APIError('invalid_filter')
+    if reply_to_send is not None:
+        raise APIError('invalid_subscription')
+    accounts = _ids(sources.get('account_ids'))
+    if accounts is not None and set(accounts) - set(p['accounts']):
+        raise APIError('not_found', 404)
+    return {'all_visible_chats': True, 'account_ids': accounts,
+        'include_channels': sources.get('include_channels', False), 'include_bots': sources.get('include_bots', False)}
+
+
+def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=None, kinds=None,
         direction='incoming', origins=None, label='', expires_at=None, wake_rules=None, reply_to_send=None,
         delivery=None):
     from .store import APIError, date_bound
     if 'read' not in p['permissions']:
         raise APIError('forbidden', 403)
+    if (chat_ids is None) == (sources is None):
+        raise APIError('invalid_filter')
     if delivery is not None:
         # ANYM-519: bind a self-service endpoint in the same transaction (configure_subscription_delivery's checks).
         if not isinstance(delivery, dict) or 'endpoint_id' not in delivery or set(delivery) - {'endpoint_id', 'delivery_policy'}:
@@ -157,7 +298,8 @@ def create_subscription(store, c, p, chat_ids, *, sender_ids=None, kinds=None,
             raise APIError('forbidden', 403)
         if not gate_on(c):
             raise APIError('delivery_disabled', 409)
-    chats = _ids(chat_ids, required=True)
+    dynamic_sources = None if sources is None else _sources(p, sources, sender_ids, reply_to_send)
+    chats = [] if dynamic_sources else _ids(chat_ids, required=True)
     senders = _ids(sender_ids)
     kinds = _ids(['message.created'] if kinds is None else kinds, required=True)
     origins = _ids(['live'] if origins is None else origins, required=True)
@@ -170,6 +312,9 @@ def create_subscription(store, c, p, chat_ids, *, sender_ids=None, kinds=None,
     now = c.execute('SELECT clock_timestamp() AS t').fetchone()['t']
     if expires_at is not None and (expiry is None or not now < expiry <= now + timedelta(days=366)):
         raise APIError('invalid_utc_date')
+    if dynamic_sources and not dynamic_gate_on(c):
+        # Until the operator enables them after the API, matcher and dispatcher run this version.
+        raise APIError('dynamic_sources_disabled', 409)
     sources = c.execute('SELECT id,account FROM chats WHERE id=ANY(%s) AND account=ANY(%s)',
         (chats, p['accounts'])).fetchall()
     if (len(sources) != len(chats) or
@@ -200,12 +345,14 @@ def create_subscription(store, c, p, chat_ids, *, sender_ids=None, kinds=None,
     # The counter is serialized by event publishers. An MVCC read sees only a
     # committed frontier and cannot skip an uncommitted event transaction.
     head = c.execute('SELECT value FROM feed_counter WHERE id=1').fetchone()['value']
-    selector = dict(chat_ids=chats, sender_ids=senders, kinds=kinds, origins=origins, direction=direction)
+    selector = (dict(sources=dynamic_sources, sender_ids=None, kinds=kinds, origins=origins, direction=direction)
+        if dynamic_sources else dict(chat_ids=chats, sender_ids=senders, kinds=kinds, origins=origins, direction=direction))
     if wake_rules is not None:
         if not isinstance(wake_rules, (list, tuple)) or not 1 <= len(wake_rules) <= 4:
             raise APIError('invalid_subscription')
         rules = _ids(wake_rules, required=True)
-        if set(rules) - {'incoming_message', 'owner_mention', 'reply_to_owner', 'reply_to_confirmed_send'}:
+        # reply_to_own_send needs the matcher of this version: dynamic sources only, behind their switch.
+        if set(rules) - WAKE_RULES or 'reply_to_own_send' in rules and not dynamic_sources:
             raise APIError('invalid_subscription')
         selector['wake_rules'] = rules
     if reply_to_send is not None:
@@ -242,7 +389,7 @@ def create_subscription(store, c, p, chat_ids, *, sender_ids=None, kinds=None,
             delivery.get('delivery_policy'), delivery['endpoint_id'])
         targets(p, [str(row['id'])])
         return result
-    return _view(c, row)
+    return _view(c, row, p)
 
 
 def list_subscriptions(store, c, p, *, limit=50):
@@ -250,13 +397,13 @@ def list_subscriptions(store, c, p, *, limit=50):
     bounded(limit)
     rows = c.execute('''SELECT * FROM subscriptions WHERE principal=%s AND key_id=%s
         ORDER BY created_at DESC,id DESC LIMIT %s FOR UPDATE''', (p['id'], p['key_id'], limit + 1)).fetchall()
-    result = [_view(c, _state(c, row, p)) for row in rows[:limit]]
+    result = [_view(c, _state(c, row, p), p) for row in rows[:limit]]
     targets(p, [str(row['id']) for row in rows[:limit]])
     return {'items': result, 'has_more': len(rows) > limit}
 
 
 def get_subscription(store, c, p, subscription_id):
-    return _view(c, _owned(c, p, subscription_id))
+    return _view(c, _owned(c, p, subscription_id), p)
 
 
 def update_subscription(store, c, p, subscription_id, version, *, action, resume_policy='catch_up'):
@@ -284,7 +431,7 @@ def update_subscription(store, c, p, subscription_id, version, *, action, resume
         module_events.resume(c, row, resume_policy)
         row = c.execute('''UPDATE subscriptions SET version=version+1,updated_at=clock_timestamp()
             WHERE id=%s RETURNING *''', (row['id'],)).fetchone()
-        return _view(c, row)
+        return _view(c, row, p)
     if action == 'pause' and row['state'] != 'active' or action == 'resume' and row['state'] != 'paused':
         raise APIError('invalid_subscription_state', 409)
     if action == 'resume' and module is not None:
@@ -301,7 +448,7 @@ def update_subscription(store, c, p, subscription_id, version, *, action, resume
     row = c.execute('''UPDATE subscriptions SET state=%s,version=version+1,
         matched_through=%s,gap=%s,blocked_reason=NULL,updated_at=clock_timestamp()
         WHERE id=%s RETURNING *''', (state, position, Jsonb(gap) if gap else None, row['id'])).fetchone()
-    return _view(c, row)
+    return _view(c, row, p)
 
 
 def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, module_after=None):
@@ -310,7 +457,7 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
     if type(after) is not int or not 0 <= after <= 2**53 - 1:
         raise APIError('invalid_version')
     row = _owned(c, p, subscription_id)
-    state = _view(c, row)
+    state = _view(c, row, p)
     if row['state'] == 'access_changed':
         return {'subscription': state, 'items': [], 'has_more': False, 'scope_masked': True}
     # Pruned references never become an empty complete page: the gap names the floor to resume from.
@@ -329,7 +476,10 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
             'recoverable': False, 'floor': floor}
         return serial({'subscription': state, 'items': [], 'has_more': True, 'next_after': floor,
             'consumption': 'passive_read_no_ack', 'scope_masked': False, **modules})
-    events = c.execute('''SELECT e.id,e.kind,e.origin,e.revision,e.created_at,
+    # ANYM-522: a dynamic definition returns only references the key can see now.
+    where, args = visible_filter(row, p, 'sm')
+    events = c.execute('''SELECT e.id,e.kind,e.origin,e.revision,e.created_at,''' +
+        ('sm.own_send_reply' if dynamic(row) else 'false AS own_send_reply') + ''',
         jsonb_strip_nulls(jsonb_build_object(
             'message',e.snapshot->'message','account',e.snapshot->'account','chat',e.snapshot->'chat',
             'sender',e.snapshot->'sender','provider_id',e.snapshot->'provider_id',
@@ -342,8 +492,8 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
             'error_code',CASE WHEN e.kind='send.failed' THEN e.snapshot->'error_code' END,
             'status',CASE WHEN e.kind IN ('send.failed','source.health') THEN e.snapshot->'status' END)) AS snapshot
         FROM subscription_matches sm JOIN events e ON e.id=sm.event
-        WHERE sm.subscription=%s AND sm.event>%s ORDER BY sm.event LIMIT %s''',
-        (row['id'], after, limit + 1)).fetchall()
+        WHERE sm.subscription=%s AND sm.event>%s AND ''' + where + ''' ORDER BY sm.event LIMIT %s''',
+        (row['id'], after, *args, limit + 1)).fetchall()
     fields = ('message', 'account', 'chat', 'sender', 'provider_id', 'revision', 'sent_at',
         'direction', 'deleted', 'processing', 'metadata', 'reply_evidence', 'send_id', 'error_code', 'status')
     items = [{**{key: event['snapshot'][key] for key in fields if key in event['snapshot']},
@@ -352,10 +502,16 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
         'historical': event['origin'] in ('backfill', 'reconcile'),
         'matching_basis': 'exact_event_revision'} for event in events[:limit]]
     from .subscription_consumption import wake_reason
-    for item in items:
-        item['wake_reason'] = wake_reason(item, row['selector'])
+    for item, event in zip(items, events):
+        item['wake_reason'] = wake_reason({**item, 'reply_to_own_send': event['own_send_reply']}, row['selector'])
+    position = items[-1]['event_id'] if items else after
+    if dynamic(row) and len(events) <= limit:
+        # The page holds every visible reference: the cursor passes the hidden ones above it, so a fetch's
+        # receipt moves past them. The read holds the definition's row, so the matcher adds none meanwhile.
+        position = max(position, c.execute('SELECT max(event) AS e FROM subscription_matches WHERE subscription=%s',
+            (row['id'],)).fetchone()['e'] or 0)
     return serial({'subscription': state, 'items': items, 'has_more': len(events) > limit,
-        'next_after': items[-1]['event_id'] if items else after,
+        'next_after': position,
         'consumption': 'passive_read_no_ack', 'scope_masked': False, **modules})
 
 
@@ -377,7 +533,7 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
     bounded(max_subscriptions, 128)
     maximum = _bound_setting('SUBSCRIPTION_MAX_MATCHES', 10000, 1, 1000000)
     stats = {'checked': 0, 'scanned': 0, 'matched': 0, 'access_changed': 0,
-        'expired': 0, 'blocked': 0, 'missing_evidence': 0, 'module_matched': 0, 'module_blocked': 0}
+        'expired': 0, 'blocked': 0, 'missing_evidence': 0, 'module_matched': 0, 'module_blocked': 0, 'scope_failed': 0}
     with store.pool.connection() as c:
         from . import module_events
         modules = module_events.ready(c)
@@ -402,8 +558,8 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
             if row['state'] != 'active':
                 stats[row['state']] += 1
                 continue
-            sources = c.execute('SELECT account,chat,sender_ids FROM subscription_sources WHERE subscription=%s',
-                (row['id'],)).fetchall()
+            sources = [] if dynamic(row) else c.execute('''SELECT account,chat,sender_ids FROM subscription_sources
+                WHERE subscription=%s''', (row['id'],)).fetchall()
             # Version equality is the fence, with a full source-scope check as a
             # defensive boundary if records are restored or repaired externally.
             if any(source['account'] not in p['accounts'] or
@@ -424,6 +580,22 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                 (row['id'],)).fetchone()['n']
             lookup = {(source['account'], source['chat']): source['sender_ids'] for source in sources}
             selector = row['selector']
+            # ANYM-522: one locked scope snapshot per batch; the shared principal lock holds it until commit.
+            visible, own = None, set()
+            if dynamic(row):
+                try:
+                    with c.transaction():
+                        visible = _batch_scope(c, row, p, events)
+                        if visible and 'reply_to_own_send' in selector.get('wake_rules', ()):
+                            own = _own_send_replies(c, row, events, visible)
+                except Exception as error:
+                    # Only this definition waits: it goes to the back of the queue, the pass goes on.
+                    from .telemetry import capture
+                    capture(error, 'subscription_scope_failed')
+                    print(json.dumps({'error': 'subscription_scope_failed', 'class': type(error).__name__}), flush=True)
+                    c.execute('UPDATE subscriptions SET last_matched_at=clock_timestamp() WHERE id=%s', (row['id'],))
+                    stats['scope_failed'] += 1
+                    continue
             position = row['matched_through']
             newly_matched = False
             missing = 0
@@ -437,20 +609,23 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                     break
                 snapshot = event['snapshot']
                 source = (event['account'], snapshot.get('chat'))
+                selected = source in lookup if visible is None else source in visible
                 if event['kind'] in FAILURE_KINDS:
                     # Direction and senders describe messages; these kinds have their own audience.
                     matches = (event['kind'] in selector['kinds'] and event['origin'] in selector['origins'] and
-                        _failure_audience(event, source in lookup, row, p))
+                        _failure_audience(event, selected, row, p))
                 else:
-                    matches = (source in lookup and event['kind'] in selector['kinds'] and
+                    matches = (selected and event['kind'] in selector['kinds'] and
                         event['origin'] in selector['origins'])
+                    if matches and visible is not None:
+                        matches = _dynamic_match(selector['sources'], visible[source], snapshot)
                     if matches and selector['direction']:
                         if 'direction' not in snapshot:
                             missing += 1
                             matches = False
                         else:
                             matches = snapshot['direction'] == selector['direction']
-                    if matches and lookup[source] is not None:
+                    if matches and lookup.get(source) is not None:
                         if 'sender' not in snapshot:
                             missing += 1
                             matches = False
@@ -459,7 +634,7 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                 if matches and selector.get('wake_rules'):
                     from .subscription_consumption import wake_reason
                     evidence = {**snapshot, 'account': event['account'], 'kind': event['kind'],
-                        'historical': event['origin'] in ('backfill', 'reconcile')}
+                        'historical': event['origin'] in ('backfill', 'reconcile'), 'reply_to_own_send': event['id'] in own}
                     matches = bool(set(selector['wake_rules']) & set(wake_reason(evidence, selector)))
                 if matches:
                     if count >= maximum:
@@ -467,8 +642,13 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                         gap = {'reason': reason, 'after': position, 'through': head,
                             'recoverable': True, 'requires_operator': True}
                         break
-                    inserted = c.execute('''INSERT INTO subscription_matches(subscription,event)
-                        VALUES(%s,%s) ON CONFLICT DO NOTHING RETURNING event''', (row['id'], event['id'])).fetchone()
+                    if visible is None:
+                        inserted = c.execute('''INSERT INTO subscription_matches(subscription,event)
+                            VALUES(%s,%s) ON CONFLICT DO NOTHING RETURNING event''', (row['id'], event['id'])).fetchone()
+                    else:
+                        inserted = c.execute('''INSERT INTO subscription_matches(subscription,event,account,chat,
+                            own_send_reply) VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING event''',
+                            (row['id'], event['id'], event['account'], snapshot.get('chat'), event['id'] in own)).fetchone()
                     if inserted:
                         count += 1
                         stats['matched'] += 1
@@ -493,7 +673,7 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                     # The hint step cannot undo or block the matches and frontier above:
                     # a failure rolls back only the savepoint and a later tick reopens the range.
                     with c.transaction():
-                        after_match(c, row, position)
+                        after_match(c, row, position, p)
                 except Exception as error:
                     from .telemetry import capture
                     capture(error, 'subscription_hint_failed')
@@ -523,7 +703,65 @@ def _failure_audience(event, selected_chat, row, p):
         snapshot = event['snapshot']
         return (selected_chat and snapshot.get('principal') == row['principal'] and
             snapshot.get('key_id') == str(row['key_id']))
-    return event['account'] in p['accounts'] and p['chat_ids'] is None
+    return event['account'] in scope(row, p)[0] and p['chat_ids'] is None
+
+
+def _batch_scope(c, row, p, events):
+    """ANYM-522: {(account, chat): chat_type} of this batch's chats the key can see now; one query."""
+    accounts, chats = scope(row, p)
+    wanted = sorted({event['snapshot']['chat'] for event in events if isinstance(event['snapshot'].get('chat'), str)})
+    if not wanted or not accounts:
+        return {}
+    rows = c.execute('''SELECT id,account,chat_type FROM chats WHERE id=ANY(%s) AND account=ANY(%s)
+        AND (%s::text[] IS NULL OR id=ANY(%s))''', (wanted, accounts, chats, chats)).fetchall()
+    return {(item['account'], item['id']): item['chat_type'] for item in rows}
+
+
+def _dynamic_match(sources, chat_type, snapshot):
+    """Channels (Telegram broadcast channels have chat_type channel) and bot senders stay out unless asked for."""
+    if chat_type == 'channel' and not sources['include_channels']:
+        return False
+    return sources['include_bots'] or (snapshot.get('metadata') or {}).get('sender_is_bot') is not True
+
+
+def _own_send_replies(c, row, events, visible):
+    """ANYM-522 reply_to_own_send: IDs of arrivals that natively reply, in the same account and chat, to a
+    confirmed send of this key, by the anchor rules of reply_to_confirmed_send: the reply names the send's
+    exact provider message ID; or, on WhatsApp, its native stanza, projected from the exact outgoing archive
+    row as reply_evidence.confirmed_native_reference does (the known chat prefix, and in a group the exact
+    participant suffix); or the exact reply evidence frozen at ingestion names that archived message. One
+    query per batch."""
+    wanted = []
+    for event in events:
+        snapshot = event['snapshot']
+        source = (event['account'], snapshot.get('chat'))
+        if (event['kind'] != 'message.created' or snapshot.get('direction') != 'incoming' or
+                event['origin'] in ('backfill', 'reconcile') or source not in visible):
+            continue
+        metadata = snapshot.get('metadata') or {}
+        proof = snapshot.get('reply_evidence') or {}
+        reference = metadata.get('reply_to_provider_id')
+        if isinstance(reference, str) and reference:
+            # The native projection, as for an anchor, unless the provider says it is no reply to the owner.
+            wanted.append((event['id'], *source, reference, metadata.get('reply_to_owner') is not False))
+        target = proof.get('target_provider_id') if proof.get('basis') == 'exact_native_reply_to_archived_outgoing' else None
+        if isinstance(target, str) and target:
+            wanted.append((event['id'], *source, target, False))
+    if not wanted:
+        return set()
+    ids, accounts, chats, references, native = (list(column) for column in zip(*wanted))
+    return {item['event'] for item in c.execute(r'''SELECT DISTINCT r.event
+        FROM unnest(%s::bigint[],%s::text[],%s::text[],%s::text[],%s::boolean[]) AS r(event,account,chat,reference,native)
+        JOIN outgoing_messages o ON o.account=r.account AND o.chat=r.chat
+        WHERE o.principal=%s AND o.key_id=%s AND o.status='sent' AND o.provider_message_id<>''
+        AND (o.provider_message_id=r.reference OR r.native AND length(r.reference)<=256 AND r.reference ~ '^[a-zA-Z0-9_.:-]+$'
+            AND EXISTS(SELECT FROM accounts a WHERE a.id=o.account AND a.platform='whatsapp')
+            AND EXISTS(SELECT FROM messages m WHERE m.account=o.account AND m.chat=o.chat
+                AND m.provider_id=o.provider_message_id AND m.direction='outgoing' AND NOT m.deleted
+                AND (m.provider_id='true_'||o.provider_chat||'_'||r.reference OR right(o.provider_chat,5)='@g.us'
+                    AND m.sender ~ '^[a-zA-Z0-9_.:-]{1,140}@(c\.us|lid)$'
+                    AND m.provider_id='true_'||o.provider_chat||'_'||r.reference||'_'||m.sender)))''',
+        (ids, accounts, chats, references, native, row['principal'], row['key_id'])).fetchall()}
 
 
 def _journal_failed(kind, error):
@@ -724,3 +962,32 @@ def _prune_batch(c, candidate, days):
         (row['id'], row['retention_floor'], through)).rowcount
     c.execute('UPDATE subscriptions SET retention_floor=%s WHERE id=%s', (through, row['id']))
     return deleted
+
+
+def set_dynamic_subscriptions(store, enabled, *, verify_components=False):
+    """Operator only (ANYM-522). With verify_components (the CLI), enabling refuses unless the API, matcher
+    and dispatcher heartbeats report this version, because an older matcher would scan a dynamic definition,
+    match nothing and still advance its checkpoint. Disabling is the rollback before older code is deployed:
+    it moves every dynamic definition to access_changed, which older code masks and refuses to resume, and
+    cancels its queued hints; agents recreate them after a new enable."""
+    with store.pool.connection() as c:
+        # Waits for every creation that read the switch enabled.
+        c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))', (DYNAMIC_LOCK,))
+        if enabled and verify_components:
+            from .heartbeats import mismatch
+            problem = mismatch(c)
+            if problem is not None:
+                return problem
+        c.execute('''INSERT INTO probe_metadata(name,value) VALUES(%s,%s)
+            ON CONFLICT(name) DO UPDATE SET value=EXCLUDED.value''', (DYNAMIC_GATE, 'enabled' if enabled else 'disabled'))
+        if enabled:
+            return {'dynamic_subscriptions': 'enabled'}
+        # The row lock waits for a hint in flight under the dispatcher's fence; the version bump cancels held ones.
+        moved = [str(row['id']) for row in c.execute("""UPDATE subscriptions SET state='access_changed',
+            version=version+1,updated_at=clock_timestamp() WHERE selector ? 'sources' AND state<>'access_changed'
+            RETURNING id""").fetchall()]
+        cancelled = [str(row['id']) for row in c.execute("""UPDATE subscription_outbox SET state='cancelled',
+            finished_at=clock_timestamp(),error_code='dynamic_sources_disabled',lease_token=NULL,lease_until=NULL
+            WHERE subscription IN (SELECT id FROM subscriptions WHERE selector ? 'sources')
+            AND state IN ('pending','leased') RETURNING id""").fetchall()]
+    return {'dynamic_subscriptions': 'disabled', 'access_changed': sorted(moved), 'cancelled_hints': sorted(cancelled)}

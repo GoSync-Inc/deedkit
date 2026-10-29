@@ -121,7 +121,7 @@ def test_real_pg18_age_stream_restore_runs_all_seven_checks_in_isolated_owned_co
         data=verifier.data_directory(restore_config,restore_run);verifier.make_data_directory(data)
         facts=engine.restore(restore_config,{'bucket':'synthetic'},Cloud(),receipt,restore_run,target_payload,target_secrets)
         proof=verifier.make_proof(receipt,facts,restore_run)
-        assert proof['verification']['schema_version']==59
+        assert proof['verification']['schema_version']==60
         assert proof['verification']['checks']=={name:True for name in r2.CHECKS}
         helper=engine.inspect_owned('helper',verifier.names(restore_run)['helper'],restore_run)
         network=engine.inspect_owned('network',verifier.names(restore_run)['network'],restore_run)
