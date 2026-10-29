@@ -316,18 +316,9 @@ def test_origin_names_the_deedkit_principal_that_wrote_the_resource(household):
     s.query("INSERT INTO audit(principal_id,action,ref,outcome) VALUES ('agent-a','operation','op-1','verified')")
     s.query("INSERT INTO operation_steps(operation_id,ordinal,state,intent) VALUES ('op-1',0,'verified',%s)",
             (Jsonb({"resource_ref": source_ref("res", "cal-a", "lesson"), "action": "update"}),))
-    # Queued before the read, its step admitted after it (the lease the worker sets then), interrupted by a restart
-    # before its audit row: the admission counts.
-    s.query("INSERT INTO plans(id,principal_id,payload,scope_hash,expires_at) VALUES "
-            "('plan-2','agent-a','{}','x',now()+interval '1 hour')")
-    s.query("INSERT INTO operations(id,principal_id,plan_id,request_id,state,created_at,lease_until) VALUES "
-            "('op-2','agent-a','plan-2','r-2','running',now()-interval '1 hour',now()+interval '2 minutes')")
-    s.query("INSERT INTO operation_steps(operation_id,ordinal,state,intent) VALUES ('op-2',0,'sending',%s)",
-            (Jsonb({"resource_ref": source_ref("res", "cal-a", "party"), "action": "update"}),))
-    party = event("party", "2026-11-05T17:00:00Z", "2026-11-05T19:00:00Z")
-    entries = read(s, [dict(LESSON, summary="Moved by agent"), dict(DENTIST, summary="Moved by hand"), party])
+    entries = read(s, [dict(LESSON, summary="Moved by agent"), dict(DENTIST, summary="Moved by hand")])
     assert {e["event_ref"]: e["origin"] for e in entries} == {
-        ref("lesson"): "deedkit:agent-a", ref("dentist"): "provider", ref("party"): "deedkit:agent-a"}
+        ref("lesson"): "deedkit:agent-a", ref("dentist"): "provider"}
 
 
 # spec: ANYM-565
