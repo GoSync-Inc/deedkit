@@ -211,15 +211,28 @@ SENT = {'app.py', 'tests/test_app.py', 'services/gateway/tests/test_credential_e
 # sessions once the test ends: passed, failed, timed out, or pytest itself killed (the reaper's stdin then
 # closes). Orphans keep their session, so a run whose test failed mid-run cannot outlive it (10-29: such runs
 # kept their runner, fake PostgreSQL loops and slot holders on the laptop for hours). Zombies are left to their
-# parent.
+# parent. Each session's keeper (enter_session) holds its id while the reaper sweeps, so the id is never another
+# session's then; the keepers go last, and a session whose keeper is already gone is not touched.
 REAPER = r'''import os, signal, subprocess, sys, time
-sessions = {int(line) for line in sys.stdin}
+keepers = dict(map(int, line.split()) for line in sys.stdin)
+
+
+def held(session):
+    try:
+        return os.getsid(keepers[session]) == session
+    except OSError:
+        return False
+
+
 for attempt in range(25):
+    live = {session for session in keepers if held(session)}
     left = []
     for row in subprocess.run(['ps', '-A', '-o', 'pid=,uid=,stat='], capture_output=True, text=True).stdout.splitlines():
         pid, uid, stat = row.split()[:3]
+        if int(uid) != os.getuid() or stat.startswith('Z') or int(pid) in keepers.values():
+            continue
         try:
-            if int(uid) == os.getuid() and not stat.startswith('Z') and os.getsid(int(pid)) in sessions:
+            if os.getsid(int(pid)) in live:
                 left.append(int(pid))
         except OSError:
             pass
@@ -231,6 +244,9 @@ for attempt in range(25):
         except OSError:
             pass
     time.sleep(0.2)
+for session, keeper in keepers.items():
+    if held(session):
+        os.kill(keeper, signal.SIGKILL)
 '''
 STARTED = []
 REAPERS = []
@@ -252,23 +268,24 @@ def reap_sessions():
 
 
 def enter_session(reaper):
-    """In the child, before it runs anything: its own session, registered with the reaper first (a pytest killed
-    this very moment still leaves the reaper's pipe open until the child has written), and a keeper, a member
-    no signal but the reaper's KILL ends, so the session id stays taken (never reused by another session) until
-    the reaper has looked at it."""
+    """In the child, before it runs anything: its own session with a keeper, a detached member no signal but the
+    reaper's KILL ends, so the session id stays taken (never another session's) until the reaper is done; both
+    registered with the reaper before the command runs (a pytest killed this very moment still leaves the
+    reaper's pipe open until they are)."""
     os.setsid()
-    os.write(reaper, f'{os.getpid()}\n'.encode())
-    os.close(reaper)
     middle = os.fork()
     if middle == 0:
-        if os.fork() == 0:
+        keeper = os.fork()
+        if keeper == 0:
             os.closerange(0, 65536)
             for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGQUIT):
                 signal.signal(number, signal.SIG_IGN)
             while True:
                 signal.pause()
+        os.write(reaper, f'{os.getsid(0)} {keeper}\n'.encode())
         os._exit(0)
     os.waitpid(middle, 0)
+    os.close(reaper)
 
 
 def start(command, **options):
@@ -734,6 +751,28 @@ def test_a_run_whose_laptop_is_gone_ends_at_its_lease(mini, worktree):
     wait_for(lambda: load_rows(home) and load_rows(home)[-1][-1] == '143')
 
 
+# spec: ANYM-639
+def test_a_stop_that_stalls_after_the_lease_still_ends_the_run(mini, worktree):
+    home, env = mini
+    write(home / 'shared' / 'caps.conf', CAPS + 'RUN_SECONDS=30\n', 0o644)
+    hold = home / 'ps-hold'
+    process = background(env, worktree, 'root', 'tests/test_app.py', FAKE_UV_SLEEP='300', FAKE_PS_HOLD=str(hold))
+    wait_for(lambda: log_lines(home, 'uv run pytest'), 60)
+    suite = pid_of(log_lines(home, 'uv run pytest')[0])
+    wait_for(lambda: recorded(home, suite))
+    runner = runner_pid(home)
+    # From here every start-time lookup hangs, so the stop the lease's TERM starts stalls in its record check.
+    hold.touch()
+    wait_for(lambda: log_lines(home, 'ps-hold'), 60)
+    # STOP_SECONDS=3: the lease's KILL comes 10 x 3 s after its TERM.
+    wait_for(lambda: not alive(runner), 60)
+    hold.unlink()
+    process.communicate(timeout=60)
+    wait_for(lambda: not list((worker_dir(home) / 'runs').iterdir()), 30)
+    assert log_lines(home, 'postgres stopped by QUIT') and not alive(suite)
+    assert load_rows(home)[-1][-1] == 'killed'
+
+
 INNER_TEST = '''from pathlib import Path
 from test_remote_test import background, log_lines, wait_for
 
@@ -759,7 +798,7 @@ def test_a_test_that_fails_mid_run_leaves_no_process_of_its_run_behind(tmp_path)
     basetemp = tmp_path / 'base'
     env = {k: v for k, v in os.environ.items() if not k.startswith('PYTEST_')}
     env['PYTHONPATH'] = os.pathsep.join(filter(None, [str(ROOT / 'tests'), env.get('PYTHONPATH')]))
-    bystander = subprocess.Popen(['sleep', '120'], start_new_session=True)
+    bystander = start(['sleep', '120'])  # this test's own session: the nested session's reaper never sees it
     try:
         result = run_tracked([sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', '--basetemp',
                               str(basetemp), 'test_inner.py'], 300, cwd=inner, env=env)
