@@ -516,7 +516,8 @@ actions, or perform provider readback. A schema change needs the module's explic
 migration procedure and the backup gate below first. Confirm that the pinned
 backup/restore runtimes support both the current database schema and the planned
 target. Resolve delivery failures, including receiver quota/capacity failures,
-before taking the pre-migration snapshot; use a reviewed retention/storage change
+before taking the pre-migration snapshot (a fresh one, or for an additive release the latest
+daily backup, item 3 below); use a reviewed retention/storage change
 that preserves the protected restore anchor. Confirm durable receiver delivery,
 retain the snapshot ID/time/schema, image revision, ciphertext size/hash and
 receipt privately, and verify an isolated quarantine restore using the module's
@@ -552,10 +553,20 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
 2. After the release, no backup is required unless the release deletes data: before such a step
    (045 step 7, `purge-deleted --apply`) a fresh verified backup at the new schema. Otherwise the
    next scheduled daily backup follows as usual.
-3. The pre-migration gate is met by a fresh backup, or by the latest scheduled daily backup when,
-   at `migrate` (each attempt), all of these hold; otherwise take a fresh one:
+3. Owner 10-29, «1+2 сейчас, 3 позже», answering item 1: additive (expand, DROP-free)
+   migrations gate on the latest proven daily backup not older than 24 hours; a fresh backup and
+   restore proof only for destructive or contract migrations. A release is additive when every
+   pending migration file is `expand` by the candidate's `unattended_class` (no DROP of any kind),
+   every changed role file is `additive` by `role_class` (the classes of M1, "Unattended
+   migrations" below; the release kit records each file's class) and it has no data-deleting step (item 2). Any other release (a contract:
+   drop, rename, narrow, the CHECK widening pair, a revoke, or a file of another class) needs a
+   fresh backup and its restore proof, never a reused daily backup. An additive release's
+   pre-migration gate is met by a fresh backup, or by the latest scheduled daily backup when, at
+   `migrate` (each attempt), all of these hold; otherwise take a fresh one:
    - it is the producer's `last_success_id` and its snapshot time (`last_snapshot_at`, never the
-     delivery time) is at most 12 hours old: the 18:00 UTC backup serves until about 06:00 UTC;
+     delivery time) is at most 24 hours old: the 18:00 UTC backup serves from its proof (about
+     20:00 UTC) until 18:00 UTC the next day; in the gap until the next proof, wait for it or take
+     a fresh one;
    - its schema is the database's current schema (no migration since);
    - the receiver's independent verifier restored it: `last-success.json` names it, its proof is
      `verified` with all seven checks true at that schema, and it is the protected point;
@@ -574,9 +585,9 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
      backup proven by the release kit. The hold lasts across retries; once `migrate` succeeds (or
      the release is abandoned), release the receiver's timer, then the producer's.
 
-   Accepted risk (owner 10-28, quoted above): a reused backup may be 12 hours old. If `migrate`
-   destroys or corrupts data, a restore returns the database to that snapshot, and everything
-   written after it (messages, receipts, keys, operator changes) is lost.
+   Accepted risk (owner 10-28 and 10-29, quoted above): a reused backup may be 24 hours old. If
+   `migrate` destroys or corrupts data, a restore returns the database to that snapshot, and
+   everything written after it (messages, receipts, keys, operator changes) is lost.
 
 ### Database copies
 
