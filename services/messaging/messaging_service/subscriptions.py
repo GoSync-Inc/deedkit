@@ -126,9 +126,10 @@ def hide_out_of_scope(c, principal, accounts, chats):
         # A mixed hint keeps its id and position (never re-emitted: the outbox key would drop it), as does a
         # lapsed lease, which may have reached its receiver; the dispatcher rechecks visibility under its fence.
         # A dynamic definition has no quiet-hours bypass (delivery_policy.normalize_policy).
-        for hint in c.execute('''SELECT id,through_position FROM subscription_outbox WHERE subscription=%s
+        for hint in c.execute('''SELECT id,through_position,request_id FROM subscription_outbox WHERE subscription=%s
                 AND kind='events' AND state='pending' ORDER BY through_position,id''', (row['id'],)).fetchall():
-            if not hint_visible(c, row, p, hint['through_position']):
+            if not hint_visible(c, row, p, hint['through_position'],
+                    acked=(hint['request_id'] or '').startswith('resume:')):
                 c.execute('''UPDATE subscription_outbox SET state='cancelled',finished_at=clock_timestamp(),
                     error_code='scope_changed',lease_token=NULL,lease_until=NULL WHERE id=%s''', (hint['id'],))
 
@@ -145,15 +146,18 @@ def invalidate_dynamic(c, principal, key_id=None):
 # a hint the scope change re-planned (scope_changed) no longer bounds a range.
 _PREVIOUS_HINT = '''coalesce((SELECT max(p.through_position) FROM subscription_outbox p WHERE p.subscription=o.subscription
     AND p.kind='events' AND p.through_position<o.through_position AND p.error_code IS DISTINCT FROM 'scope_changed'),%s)'''
+_ACK_POSITION = '''coalesce((SELECT k.acked_through FROM subscription_consumption k WHERE k.subscription=o.subscription),%s)'''
 
 
-def hint_visible(c, row, p, through):
+def hint_visible(c, row, p, through, *, acked=False):
     """ANYM-522: an events hint of a dynamic definition goes out only while a reference it covers is visible
-    now: above the previous events hint's position (or the start) and at or below its own."""
+    now: above the previous events hint's position (or the start) and at or below its own. acked (ANYM-520, a
+    resume's backlog wake): above the ACK position instead, since a paused endpoint's cancelled hints woke no one."""
     where, args = visible_filter(row, p)
+    lower = _ACK_POSITION if acked else _PREVIOUS_HINT
     return c.execute('''SELECT EXISTS(SELECT FROM (SELECT %s::uuid AS subscription,%s::bigint AS through_position) o
         JOIN subscription_matches m ON m.subscription=o.subscription AND m.event<=o.through_position
-        AND m.event>''' + _PREVIOUS_HINT + ' AND ' + where + ') AS shown',
+        AND m.event>''' + lower + ' AND ' + where + ') AS shown',
         (row['id'], through, row['start_position'], *args)).fetchone()['shown']
 
 

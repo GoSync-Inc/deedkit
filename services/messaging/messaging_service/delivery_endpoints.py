@@ -38,13 +38,14 @@ RESERVED = frozenset(('host', 'content-type', 'content-length', 'transfer-encodi
 RESERVED_PREFIXES = ('webhook-', 'x-deedkit-', 'mcp-')
 STATE_ERRORS = {'agent_paused': 'endpoint_paused', 'auto_paused': 'endpoint_auto_paused',
     'operator_disabled': 'operator_disabled'}
-# ANYM-520: the attempt log's retention, the auto-pause rule and how long a delivered resume test re-arms.
+# ANYM-520: the attempt log's retention and the auto-pause rule.
 ATTEMPT_DAYS = 7
 PAUSE_DEAD_LETTERS = 3
 PAUSE_SILENT_HOURS = 24
-RESUME_FRESH_S = 300
 # A resume's signed test: request ID `resume/<endpoint version>/<random>`. `/` is outside _REQUEST, so no agent request
-# ID can name one, and only these tests reach a paused endpoint (fenced).
+# ID can name one, and only these tests reach a paused endpoint (fenced). The endpoint version is the resume's
+# identity: one test per version. A test the dispatcher settles undelivered advances the version (settle_resume), so
+# repeating that resume replays its refusal and only a resume with the new version sends another test.
 RESUME_PREFIX = 'resume/'
 PAUSED = ('agent_paused', 'auto_paused')
 BODY_LIMIT = 4096
@@ -382,6 +383,14 @@ def max_endpoints():
     return _bound_setting('DELIVERY_MAX_ENDPOINTS_PER_KEY', 4, 1, 32)
 
 
+def resume_version(request_id):
+    """The endpoint version a resume's test belongs to, or None for any other test."""
+    if not isinstance(request_id, str) or not request_id.startswith(RESUME_PREFIX):
+        return None
+    version = request_id[len(RESUME_PREFIX):].partition('/')[0]
+    return int(version) if version.isdecimal() else None
+
+
 def _test_view(row):
     if row is None:
         return None
@@ -389,11 +398,16 @@ def _test_view(row):
     view = {'test_id': str(row['id']), 'endpoint_id': str(row['endpoint']), 'request_id': row['request_id'],
         'test_status': status, 'http_status': row['http_status'], 'latency_ms': row['latency_ms'],
         'error_code': row['error_code'], 'created_at': row['created_at'], 'finished_at': row['finished_at']}
-    if status == 'pending':
+    version = resume_version(row['request_id'])
+    if status == 'pending' and version is not None:
+        # A resume's test is read back by repeating that resume; its request ID is not one an agent may send.
+        view['next_step'] = {'tool': 'update_delivery_endpoint', 'endpoint_id': str(row['endpoint']),
+            'version': version, 'action': 'resume'}
+    elif status == 'pending':
         view['next_step'] = {'tool': 'test_delivery_endpoint', 'endpoint_id': str(row['endpoint']),
             'request_id': row['request_id']}
     elif status == 'failed':
-        view['next_step'] = FAILED_STEP
+        view['next_step'] = FAILED_STEP if version is None else RESUME_FAILED_STEP
     from .store import serial
     return serial(view)
 
@@ -680,7 +694,7 @@ def update_delivery_endpoint(store, c, p, endpoint_id, version, action, new_secr
         resume_test=None):
     """A resume (ANYM-520) first stages a signed test while the endpoint stays paused and returns it pending; the
     call that finds that test delivered (the inline wait's second call, `resume_test` its request ID, or the agent's
-    repeat within RESUME_FRESH_S) re-arms the endpoint and wakes its backlog. A failed test refuses the resume."""
+    repeat) re-arms the endpoint and wakes its backlog. A failed test refuses the resume, also on a repeat."""
     _allowed(c, p)
     version = _version(version)
     if action not in ('rotate_secret', 'set_headers', 'pause', 'resume'):
@@ -691,6 +705,8 @@ def update_delivery_endpoint(store, c, p, endpoint_id, version, action, new_secr
         raise _error('invalid_parameters', 400)
     row = _owned(c, p, endpoint_id, lock=True)
     if row['version'] != version:
+        if action == 'resume':
+            _replay_refusal(c, row, version)
         raise _error('endpoint_conflict', 409)
     changes, values = 'version=version+1,updated_at=clock_timestamp()', []
     if action == 'rotate_secret':
@@ -734,9 +750,30 @@ def update_delivery_endpoint(store, c, p, endpoint_id, version, action, new_secr
 TEST_SELECT = 'SELECT id,endpoint,request_id,state,http_status,latency_ms,error_code,created_at,finished_at'
 
 
+def _resume_refused(row, test):
+    return _error('endpoint_test_failed', 409, state=row['state'], version=row['version'], test_error=test['error_code'],
+        http_status=test['http_status'], next_step=RESUME_FAILED_STEP)
+
+
+def _latest_resume_test(c, endpoint_id, version):
+    return c.execute(TEST_SELECT + ''' FROM delivery_endpoint_tests WHERE endpoint=%s AND starts_with(request_id,%s)
+        ORDER BY created_at DESC,id DESC LIMIT 1''', (endpoint_id, f'{RESUME_PREFIX}{version}/')).fetchone()
+
+
+def _replay_refusal(c, row, version):
+    """A repeated resume of a version whose test the dispatcher settled undelivered (settle_resume moved the paused
+    endpoint one version on): the same refusal, carrying the new version, and no second test."""
+    if type(version) is not int or row['state'] not in PAUSED or row['version'] != version + 1:
+        return
+    test = _latest_resume_test(c, row['id'], version)
+    if test is not None and test['state'] in ('failed', 'cancelled'):
+        raise _resume_refused(row, test)
+
+
 def _resume_test(c, p, row, request_id):
-    """The resume test of this endpoint version: the named one, else a pending one or one delivered within
-    RESUME_FRESH_S, else a new one (the per-key test rate applies). A named test that failed refuses the resume."""
+    """The resume test of this endpoint version: the named one, else its latest one, else a new one (the per-key test
+    rate applies). A failed one refuses the resume; only a test that was never sent (cancelled before the dispatcher
+    reached it, or expired unsent) is staged again for the same version."""
     prefix = f"{RESUME_PREFIX}{row['version']}/"
     if request_id is not None:
         if not isinstance(request_id, str) or not request_id.startswith(prefix):
@@ -746,30 +783,54 @@ def _resume_test(c, p, row, request_id):
         if test is None:
             raise _error('endpoint_conflict', 409)
         if test['state'] in ('failed', 'cancelled'):
-            raise _error('endpoint_test_failed', 409, state=row['state'], test_error=test['error_code'],
-                http_status=test['http_status'], next_step=RESUME_FAILED_STEP)
+            raise _resume_refused(row, test)
         return test
-    test = c.execute(TEST_SELECT + ''' FROM delivery_endpoint_tests WHERE endpoint=%s
-        AND starts_with(request_id,%s) AND (state IN ('pending','leased') OR state='delivered'
-        AND finished_at>clock_timestamp()-make_interval(secs=>%s)) ORDER BY created_at DESC,id DESC LIMIT 1''',
-        (row['id'], prefix, RESUME_FRESH_S)).fetchone()
-    if test is not None:
+    test = _latest_resume_test(c, row['id'], row['version'])
+    if test is not None and test['state'] == 'failed' and test['error_code'] != 'test_expired':
+        raise _resume_refused(row, test)
+    if test is not None and test['state'] != 'cancelled' and test['error_code'] != 'test_expired':
         return test
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))', ('delivery-endpoints:' + str(p['key_id']),))
     _test_rate(c, p)
     return _stage_test(c, row['id'], prefix + uuid4().hex[:16])
 
 
+def settle_resume(c, test, state):
+    """The dispatcher's side of a resume's identity: a resume test it settles undelivered moves the still-paused
+    endpoint one version on, in its own savepoint, so a repeat of that resume replays the refusal instead of sending
+    a second test. A failed write (the schema-61 grant missing during a rollout) is logged; the repeat then refuses
+    from the failed test itself."""
+    import psycopg
+    version = resume_version(test['request_id'])
+    if version is None or state == 'delivered':
+        return False
+    try:
+        with c.transaction():
+            return c.execute('''UPDATE delivery_endpoints SET version=version+1,updated_at=clock_timestamp()
+                WHERE id=%s AND version=%s AND state IN ('agent_paused','auto_paused')''',
+                (test['endpoint'], version)).rowcount == 1
+    except psycopg.Error as caught:
+        print(json.dumps({'error': 'resume_settle_failed', 'class': type(caught).__name__}), flush=True)
+        return False
+
+
 def wake_backlog(c, p, row):
-    """ANYM-520: one `events` hint at once for each subscription bound to the re-armed endpoint whose events are not
-    all ACKed; the dispatcher still applies quiet hours, the budget and the scope recheck. A full key queue stops it."""
+    """ANYM-520: one `events` hint at once for each subscription bound to the re-armed endpoint with events above its
+    ACK position (a dynamic one: a reference there the key still sees); the dispatcher still applies quiet hours, the
+    budget and the scope recheck (from the ACK position). The wake hints pass the key's queue cap, bounded by its
+    SUBSCRIPTION_MAX_DEFINITIONS, so none is dropped. The subscription rows are locked first and NOWAIT:
+    configure_subscription_delivery holds its row before it waits for the endpoint lock this resume holds, so a
+    busy row refuses the resume (service_busy, retryable; the endpoint stays paused) instead of deadlocking."""
+    import psycopg
     from .event_delivery import enqueue_hint
-    from .subscriptions import _state
-    from .store import APIError
-    rows = c.execute('''SELECT s.* FROM subscriptions s JOIN subscription_delivery d ON d.subscription=s.id
-        LEFT JOIN subscription_consumption k ON k.subscription=s.id WHERE d.endpoint=%s AND s.principal=%s
-        AND s.key_id=%s AND s.state='active' AND s.matched_through>coalesce(k.acked_through,s.start_position)
-        ORDER BY s.id''', (row['id'], p['id'], p['key_id'])).fetchall()
+    from .subscriptions import _state, dynamic, hint_visible
+    try:
+        rows = c.execute('''SELECT s.* FROM subscriptions s JOIN subscription_delivery d ON d.subscription=s.id
+            LEFT JOIN subscription_consumption k ON k.subscription=s.id WHERE d.endpoint=%s AND s.principal=%s
+            AND s.key_id=%s AND s.state='active' AND s.matched_through>coalesce(k.acked_through,s.start_position)
+            ORDER BY s.id FOR KEY SHARE OF s NOWAIT''', (row['id'], p['id'], p['key_id'])).fetchall()
+    except psycopg.errors.LockNotAvailable:
+        raise _error('service_busy', 503) from None
     # The key's hint lock, as every writer of its endpoint queue holds it (endpoint_queue_full).
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))', ('subscription-hints:' + str(p['key_id']),))
     woken = []
@@ -777,11 +838,10 @@ def wake_backlog(c, p, row):
         subscription = _state(c, subscription, p)
         if subscription['state'] != 'active':
             continue
-        try:
-            hint = enqueue_hint(c, subscription, subscription['matched_through'],
-                request_id=f"resume:{row['id']}:{row['version']}")
-        except APIError:
-            break
+        if dynamic(subscription) and not hint_visible(c, subscription, p, subscription['matched_through'], acked=True):
+            continue
+        hint = enqueue_hint(c, subscription, subscription['matched_through'],
+            request_id=f"resume:{row['id']}:{row['version']}", capped=False)
         if hint is not None:
             woken.append(str(subscription['id']))
     return woken
@@ -1154,11 +1214,13 @@ def dispatch_tests(store, *, limit=8, transport, resolver, served=None):
                 # age check and DNS, so neither turns "may have arrived" into test_expired or receiver_unavailable.
                 c.execute("""UPDATE delivery_endpoint_tests SET state='failed',error_code='outcome_unknown',
                     finished_at=clock_timestamp(),lease_token=NULL,lease_until=NULL WHERE id=%s""", (test['id'],))
+                settle_resume(c, test, 'failed')
                 stats['failed'] += 1
                 continue
             if c.execute("SELECT %s<clock_timestamp()-interval '5 minutes' AS old", (test['created_at'],)).fetchone()['old']:
                 c.execute("""UPDATE delivery_endpoint_tests SET state='failed',error_code='test_expired',
                     finished_at=clock_timestamp(),lease_token=NULL,lease_until=NULL WHERE id=%s""", (test['id'],))
+                settle_resume(c, test, 'failed')
                 stats['failed'] += 1
                 continue
             c.execute("""UPDATE delivery_endpoint_tests SET state='leased',lease_token=%s,
@@ -1198,6 +1260,7 @@ def dispatch_tests(store, *, limit=8, transport, resolver, served=None):
             c.execute('''UPDATE delivery_endpoint_tests SET state=%s,error_code=%s,http_status=%s,latency_ms=%s,
                 finished_at=clock_timestamp(),lease_token=NULL,lease_until=NULL WHERE id=%s AND lease_token=%s''',
                 (state, error, status, latency, test['id'], lease))
+            settle_resume(c, test, state)
         stats[state] += 1
     return stats
 
@@ -1254,11 +1317,15 @@ def record_attempt(c, hint, outcome, attempt, *, status=None, error=None, latenc
 def auto_pause(store, endpoint_id):
     """ANYM-520: after PAUSE_DEAD_LETTERS dead-lettered hints, or PAUSE_SILENT_HOURS of failures, since the last
     delivered hint or test, an enabled endpoint becomes auto_paused: its queued hints and tests are cancelled (events
-    stay fetchable, nothing is ACKed). Its own transaction under the endpoint lock (shared, like an attempt; API
-    changes take it exclusive), so it never races a pause, resume or delete. Returns True when it paused."""
+    stay fetchable, nothing is ACKed). Its own transaction under the endpoint lock taken exclusive and without
+    waiting: an attempt holds it shared until its outcome commits, so the decision reads every finished attempt and
+    never races a pause, resume or delete; a held lock skips the endpoint until the next pass. Returns True when it
+    paused."""
     with store.pool.connection() as c:
         gate_on(c)
-        lock_endpoint(c, endpoint_id, shared=True)
+        if not c.execute('SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS got',
+                ('delivery-endpoint:' + str(endpoint_id),)).fetchone()['got']:
+            return False
         row = c.execute('SELECT id,state FROM delivery_endpoints WHERE id=%s FOR UPDATE', (endpoint_id,)).fetchone()
         if row is None or row['state'] != 'enabled':
             return False

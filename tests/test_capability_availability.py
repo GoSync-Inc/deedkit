@@ -268,6 +268,22 @@ def test_webhook_shows_the_keys_hourly_hint_budget_and_the_slots_left(seeded,tmp
         s.set_delivery_features(False)
 
 
+# spec: ANYM-520
+def test_an_invalid_hint_budget_setting_leaves_capabilities_answering(seeded,tmp_path,monkeypatch):
+    from test_event_delivery import endpoint_setup
+    s,_,_=seeded
+    token,_,_,_=endpoint_setup(s,tmp_path,monkeypatch)
+    try:
+        # The gateway admits every messaging call through capabilities: an optional diagnostic never fails them.
+        for value in ('many','0'):
+            monkeypatch.setenv('SUBSCRIPTION_MAX_HINTS_PER_HOUR',value)
+            webhook=transports(s,token)['webhook']
+            assert webhook['hint_budget']=={'per_hour':None,'remaining_this_hour':None,'window':'rolling_hour'}
+            assert webhook['authorized'] and webhook['configured']
+    finally:
+        s.set_delivery_features(False)
+
+
 # spec: ANYM-534
 def test_a_lane_worker_pulse_keeps_webhook_operational_for_120_seconds(seeded,tmp_path):
     import time

@@ -122,6 +122,8 @@ def endpoint_extras(value):
         result["test_error"] = value["test_error"]
     if type(value.get("http_status")) is int and 100 <= value["http_status"] <= 599:
         result["http_status"] = value["http_status"]
+    if type(value.get("version")) is int and 1 <= value["version"] <= 2**53 - 1:
+        result["version"] = value["version"]
     return result
 
 

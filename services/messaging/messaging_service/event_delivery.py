@@ -256,12 +256,13 @@ def endpoint_queue_full(c, row):
         (ENDPOINT_QUEUE_PER_KEY, row['principal'], row['key_id'])).fetchone()['full']
 
 
-def enqueue_hint(c, row, through, *, kind='events', request_id=''):
+def enqueue_hint(c, row, through, *, kind='events', request_id='', capped=True):
+    """capped=False: a resume's backlog wake (ANYM-520), bounded by the key's definitions instead of its queue."""
     binding = _hint_target(c, row)
     if binding is None:
         return None
     target = 'receiver' if binding['receiver'] is not None else 'endpoint'
-    if target == 'endpoint' and endpoint_queue_full(c, row):
+    if target == 'endpoint' and capped and endpoint_queue_full(c, row):
         from .store import APIError
         raise APIError('rate_limited', 429)
     return c.execute('''INSERT INTO subscription_outbox(subscription,subscription_version,''' + target + ''',
@@ -453,10 +454,14 @@ def _auto_pause(store, endpoints, stats):
 def hint_budget(c, p):
     """ANYM-520: the key's hourly hint budget and the slots left in the rolling hour: the fewer of what the matcher
     may still commit (created_at) and the dispatcher may still admit (admitted_at), as budget_slot and admission_slot
-    count. An optional read in its own savepoint with DIAGNOSTIC_STATEMENT_MS; on failure remaining is None."""
+    count. An optional read in its own savepoint with DIAGNOSTIC_STATEMENT_MS; on failure remaining is None, and an
+    invalid SUBSCRIPTION_MAX_HINTS_PER_HOUR shows per_hour None too, never failing messages_capabilities."""
     import psycopg
     from .subscriptions import _bound_setting
-    limit = _bound_setting('SUBSCRIPTION_MAX_HINTS_PER_HOUR', 20, 1, 1000)
+    try:
+        limit = _bound_setting('SUBSCRIPTION_MAX_HINTS_PER_HOUR', 20, 1, 1000)
+    except ValueError:
+        return {'per_hour': None, 'remaining_this_hour': None, 'window': 'rolling_hour'}
     remaining = None
     limits = c.execute("SELECT current_setting('statement_timeout') AS s,current_setting('lock_timeout') AS l").fetchone()
     try:
@@ -697,7 +702,9 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                  (registered['endpoint'], registered['secret_file'])))
             if eligible and hint['kind'] == 'events' and dynamic(row):
                 # ANYM-522: under the fence, a hint whose references all left the key's scope is not sent.
-                eligible = hint_visible(c, row, p, hint['through_position'])
+                # A resume's backlog wake covers every unACKed event, so its range starts at the ACK position.
+                eligible = hint_visible(c, row, p, hint['through_position'],
+                    acked=(hint['request_id'] or '').startswith('resume:'))
                 refused = refused or (None if eligible else 'scope_changed')
             live = c.execute("""SELECT 1 FROM subscription_outbox WHERE id=%s AND state='leased'
                 AND lease_token=%s AND lease_until>clock_timestamp() FOR UPDATE""", (hint['id'], lease)).fetchone()

@@ -757,21 +757,30 @@ failed attempt since the last success is 24 hours old (hints were due for a day 
 success), the dispatcher moves an `enabled` endpoint to `auto_paused` (version + 1) and
 cancels its queued hints (`endpoint_auto_paused`, each logged as `paused`) and tests.
 Events stay fetchable and nothing is ACKed. The rule runs after each pass with a failed
-attempt, under the endpoint's lock, so it never races an agent's pause, resume or delete.
+attempt, under the endpoint's lock taken exclusive without waiting: an attempt still in
+flight skips the endpoint until the next pass, so the rule reads every finished attempt and
+never races an agent's pause, resume or delete.
 The dispatcher role gains only `UPDATE(state, version, updated_at)` on
 `delivery_endpoints` and `SELECT, INSERT, DELETE` on `delivery_attempts`
 (`delivery_role.sql`); the API role reads `delivery_attempts` (`gateway_role.sql`).
 
 **Resume path.** `update_delivery_endpoint(action="resume")` from `agent_paused` or
 `auto_paused` stages one signed test (`{type: "test"}`, the per-key test rate applies)
-while the endpoint stays paused, and waits up to 10 s for it. Delivered: the endpoint is
-`enabled` again (version + 1), and every bound subscription of the key with events above
-its ACK position gets one `events` hint at once (`woken_subscriptions`); quiet hours, the
-budget and the scope recheck still apply at dispatch. Failed: `endpoint_test_failed` with
-the test's `test_error` and `http_status`, and the endpoint stays paused. Still pending
-after 10 s: the endpoint stays paused and `test.next_step` names the same resume call,
-which reads that test back and finishes the resume once it is delivered (within 5
-minutes). Resume never clears `operator_disabled`.
+while the endpoint stays paused, and waits up to 10 s for it. The endpoint version is the
+resume's identity: one test per version. Delivered: the endpoint is `enabled` again
+(version + 1), and every bound subscription of the key with events above its ACK position
+(a dynamic one: a reference there the key still sees) gets one `events` hint at once, past
+the key's queue cap (`woken_subscriptions`); quiet hours, the budget and the scope recheck
+(from the ACK position) still apply at dispatch. Failed: `endpoint_test_failed` with the
+test's `test_error`, `http_status` and the endpoint's new `version` (the dispatcher moves a
+paused endpoint one version on when it settles its resume test undelivered); the endpoint
+stays paused. Repeating that resume with the old version returns the same refusal and sends
+nothing, so a test whose answer was lost is never sent twice; a resume with the new
+version sends a new test. Still pending after 10 s: the endpoint stays paused and
+`test.next_step` names the same resume call, which reads that test back and finishes the
+resume once it is delivered. A test the dispatcher cancelled before sending it is staged
+again by the same call. A subscription another call holds refuses the resume with
+`service_busy` (retry; the endpoint stays paused). Resume never clears `operator_disabled`.
 
 **Budget and operator view.** `messages_capabilities` shows the webhook transport's
 `hint_budget`: `per_hour` (`SUBSCRIPTION_MAX_HINTS_PER_HOUR`) and `remaining_this_hour`,
