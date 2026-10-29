@@ -959,10 +959,15 @@ def free_on_stop(monkeypatch):
 
 @pytest.fixture
 def alarm():
-    """The receiver's own deadline handler (main) on SIGALRM; restored and cleared afterwards."""
+    """The receiver's own deadline handler (main) on SIGALRM; restored and cleared afterwards.
+
+    The alarm goes to the main thread, the receiver's: in the receiver process every thread holds
+    SIGALRM while workers exist, but a test process may keep another thread that does not, and a
+    process-wide signal the kernel hands to that thread runs the handler outside the receiver's window.
+    """
     def timed_out(*_):r2.cancel(TimeoutError('receiver_timeout'))
-    previous=signal.signal(signal.SIGALRM,timed_out)
-    yield lambda:os.kill(os.getpid(),signal.SIGALRM)
+    previous=signal.signal(signal.SIGALRM,timed_out);main=threading.get_ident()
+    yield lambda:signal.pthread_kill(main,signal.SIGALRM)
     signal.signal(signal.SIGALRM,previous);r2.CANCELLED.clear()
 
 def joined_before_abort(cloud):
@@ -1140,6 +1145,19 @@ def test_deadline_during_the_join_keeps_joining_and_leaves_the_journal_for_recon
     r2.CANCELLED.clear()
     with pytest.raises(RuntimeError,match='incomplete_upload_aborted_retry'):r2.receive(config,io.BytesIO(wire(data)),client=cloud)
     assert not cloud.uploads
+
+# spec: ANYM-628
+def test_the_alarm_fixture_reaches_the_receiver_thread_while_another_thread_leaves_sigalrm_open(alarm):
+    # Regression (CI 40804619118): a thread with SIGALRM open, such as another module's server thread or
+    # an in-test helper, fires the deadline; it stays pending on the receiver's thread for its window.
+    outer=signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGALRM});fired=threading.Event()
+    try:
+        def fire():signal.pthread_sigmask(signal.SIG_UNBLOCK,{signal.SIGALRM});alarm();fired.set()
+        bystander=threading.Thread(target=fire,name='bystander');bystander.start()
+        assert fired.wait(10);bystander.join(10)
+        assert signal.SIGALRM in signal.sigpending() and not r2.CANCELLED
+    finally:
+        with pytest.raises(TimeoutError,match='receiver_timeout'):signal.pthread_sigmask(signal.SIG_SETMASK,outer)
 
 # spec: ANYM-628
 @pytest.mark.parametrize('moment',['thread_start','slot_wait'])
