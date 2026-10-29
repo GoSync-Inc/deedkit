@@ -16,7 +16,10 @@ FIELDS = {'sent_at': 'sent time differs', 'direction': 'direction differs', 'sen
           'body': 'text differs', 'media': 'attachments differ',
           'other': 'another field differs (formatting or deletion)'}
 RELATIONS = {'equal_version': 'at the same provider version', 'older_version': 'in an older provider observation',
-             'newer_version': 'in a newer provider observation'}
+             'newer_version': 'in a newer provider observation',
+             'unordered': 'with its order against later re-reads unknown'}
+# Fields ingest compares at any provider version; only these can be stored without a provable order (ANYM-622).
+IDENTITY = ('sent_at', 'direction', 'sender')
 # Reviewed disposition (ANYM-530 research, owner Ready 10-26): a real contradiction at one provider version keeps the
 # retained revision until later evidence arrives (archive.py, the resolve UPDATE), and no agent or owner step helps.
 KNOWN = {
@@ -26,7 +29,7 @@ KNOWN = {
 EXPLANATIONS = {
     **{f'{platform}_{field}_{relation}': f'{label} {text} {when}; inspect the chat.'
        for platform, label in PLATFORMS.items() for field, text in FIELDS.items()
-       for relation, when in RELATIONS.items()},
+       for relation, when in RELATIONS.items() if relation != 'unordered' or field in IDENTITY},
     **KNOWN,
     UNCLASSIFIED: 'The stored evidence of this conflict could not be classified; inspect the chat.',
 }
@@ -90,6 +93,32 @@ def classify(retained, candidate, retained_at=None):
     try:
         if not isinstance(retained, dict) or not isinstance(candidate, dict): return UNCLASSIFIED
         return _classify(retained, candidate, retained_at)
+    except Exception:
+        return UNCLASSIFIED
+
+
+def reclassify(row):
+    """ANYM-622: the class of an open conflict stored without one, from the runner's evidence of one row (`envelope`,
+    `observed`, `archive_version`: the message's provider version now, `tombstoned`). Content conflicts are raised
+    only at the archive's version (archive.ingest_outcome), so their relation is `equal_version`. An identity conflict
+    is raised at any version: its relation is exact only when the version now equals the observed revision's, since the
+    stored version never goes back (a revision is never stale; an unchanged re-read takes greatest) and so it was that
+    one at the conflict too, and no provider tombstone rewrote the candidate; otherwise `unordered`. A row migration 017
+    reconstructed (its observed_at is the receipt's received_at, chat_evidence.backfill) names its revision by
+    transaction start times, which need not follow the account lock: on a message with more than one revision that
+    revision may not be the contradicted one, so it is `unclassified` (Astra r1 on #454). Never raises."""
+    try:
+        envelope, observed = row['envelope'], row['observed']
+        if not isinstance(envelope, dict) or not isinstance(observed, dict): return UNCLASSIFIED
+        if row['reconstructed'] is not False: return UNCLASSIFIED
+        name = classify(observed, envelope, _time(envelope['updated_at']))
+        if name == UNCLASSIFIED: return name
+        platform, field = name[:-len('_equal_version')].split('_', 1)
+        if field not in IDENTITY: return name
+        version = row['archive_version']
+        if (row['tombstoned'] is not False or not isinstance(version, datetime)
+                or version != _time(observed['updated_at'])): return f'{platform}_{field}_unordered'
+        return classify(observed, envelope)
     except Exception:
         return UNCLASSIFIED
 

@@ -1,7 +1,9 @@
 """ANYM-557: one honest conflict line per account, a stored class per conflict, no step that cannot act."""
+from datetime import datetime,timedelta,timezone
 import re
 from pathlib import Path
 
+from hypothesis import given,settings,strategies as st
 import pytest
 
 from messaging_service.envelope import stable_id
@@ -138,6 +140,145 @@ def test_rows_without_a_stored_class_read_as_unclassified_attention(archive):
     conflicts=account(s,key)['conflicts']
     assert conflicts['attention']==1 and conflicts['known']==3 and conflicts['next_step']=='inspect_chat'
     assert {'class':'unclassified','count':1} in [{k:c[k] for k in ('class','count')} for c in conflicts['top_classes']]
+
+
+LATER='2026-10-01T12:03:00+00:00'
+
+
+def reread(ar,provider_id,updated_at=LATER):
+    assert ar.ingest(event(provider_id=provider_id,updated_at=updated_at,origin='reconcile'))['outcome']=='unchanged'
+
+
+def legacy(s,*mids):
+    """Rows as written before schema 54 or by N-1 code: no class."""
+    with s.pool.connection() as c:
+        c.execute('UPDATE message_conflicts SET reason=NULL,reason_version=NULL WHERE message=ANY(%s)',(list(mids),))
+
+
+def classify_existing(ar,s):
+    from messaging_service import conflict_reevaluation as cr
+    from test_conflict_reevaluation import run
+    assert run(ar,s,[cr.JOBS['classify']])=='done'
+
+
+def rows(s):
+    with s.pool.connection() as c:
+        return {r['message']:r for r in c.execute('SELECT mc.*,mc.xmin::text AS xmin FROM message_conflicts mc')}
+
+
+# spec: ANYM-622
+def test_existing_content_rows_are_equal_version_even_after_an_advancing_reread(archive):
+    ar,s,key,_=archive
+    ar.ingest(event(provider_id='b'))
+    reread(ar,'b')  # the snapshot now shows an older version than the archive held at the conflict
+    mid=contradict(ar,'b',body='Другой текст',updated_at=LATER)
+    legacy(s,mid)
+    classify_existing(ar,s)
+    assert stored(s,mid)=={'reason':'telegram_body_equal_version','reason_version':1,'resolved_at':None}
+
+
+# spec: ANYM-622
+def test_existing_identity_rows_are_exact_only_when_the_version_provably_held(archive):
+    ar,s,key,_=archive
+    newer=contradict(ar,'n',direction='outgoing',updated_at='2026-10-01T12:01:00+00:00')
+    ar.ingest(event(provider_id='same'))
+    reread(ar,'same',updated_at='2026-10-01T12:00:00+00:00')  # a re-read at the same version advances nothing
+    same=contradict(ar,'same',sender='43')
+    ar.ingest(event(provider_id='adv'))
+    reread(ar,'adv')
+    advanced=contradict(ar,'adv',direction='outgoing',updated_at=LATER)
+    after=contradict(ar,'after',direction='outgoing',updated_at='2026-10-01T12:05:00+00:00')
+    reread(ar,'after')  # advances the version after the conflict, below its candidate (stays open): still unprovable
+    tombstoned=contradict(ar,'t',sent_at='2026-10-01T11:59:00+00:00')
+    with s.pool.connection() as c:
+        c.execute("INSERT INTO provider_tombstones(account,provider_chat,provider_id,observed_at) VALUES('archive-test','100','t',%s)",
+                  ('2026-10-01T12:05:00+00:00',))
+        # Receipt and conflict times interleave within one second; no comparison of them decides a class.
+        conflict_at=c.execute('SELECT observed_at FROM message_conflicts WHERE message=%s',(advanced,)).fetchone()['observed_at']
+        c.execute('''UPDATE ingest_receipts SET received_at=%s::timestamptz+interval '400 milliseconds'
+            WHERE outcome='unchanged' AND envelope->>'provider_id'='adv' ''',(conflict_at,))
+    legacy(s,newer,same,advanced,after,tombstoned)
+    classify_existing(ar,s)
+    assert {mid:stored(s,mid)['reason'] for mid in (newer,same,advanced,after,tombstoned)}=={
+        newer:'telegram_direction_newer_version',same:'telegram_sender_equal_version',
+        advanced:'telegram_direction_unordered',after:'telegram_direction_unordered',tombstoned:'telegram_sent_at_unordered'}
+    conflicts=account(s,key)['conflicts']
+    assert conflicts['attention']==5 and conflicts['next_step']=='inspect_chat'
+
+
+# spec: ANYM-622
+def test_rows_migration_17_reconstructed_on_a_message_with_later_revisions_stay_unclassified(archive):
+    ar,s,key,_=archive
+    # Migration 017 named each older row's revision by transaction start times (chat_evidence.backfill) and stored the
+    # receipt's received_at as observed_at; on a message with more than one revision that revision may be the wrong one.
+    edited=contradict(ar,'e',direction='outgoing',updated_at='2026-10-01T12:05:00+00:00')
+    assert ar.ingest(event(provider_id='e',body='Вторая версия',updated_at='2026-10-01T12:01:00+00:00'))['outcome']=='edited'
+    single=contradict(ar,'s',direction='outgoing',updated_at='2026-10-01T12:05:00+00:00')
+    with s.pool.connection() as c:
+        c.execute('''UPDATE message_conflicts mc SET observed_at=r.received_at FROM ingest_receipts r
+            WHERE r.digest=mc.receipt_digest AND mc.message=ANY(%s)''',([edited,single],))
+    legacy(s,edited,single)
+    classify_existing(ar,s)
+    assert stored(s,edited)['reason']=='unclassified' and stored(s,edited)['resolved_at'] is None
+    assert stored(s,single)['reason']=='telegram_direction_newer_version'  # one revision: no other it could mean
+    assert account(s,key)['conflicts']['attention']==2
+
+
+# spec: ANYM-622
+def test_classify_existing_touches_only_open_rows_without_a_class_and_reruns_write_nothing(archive):
+    ar,s,key,_=archive
+    resolved=contradict(ar,'r',direction='outgoing',updated_at='2026-10-01T12:01:00+00:00')
+    assert ar.ingest(event(provider_id='r',body='Вторая версия',updated_at='2026-10-01T12:02:00+00:00'))['outcome']=='edited'
+    kept=contradict(ar,'k',body='Другой текст')
+    unreadable=contradict(ar,'u',body='Другой текст')
+    legacy(s,resolved,unreadable)
+    with s.pool.connection() as c:
+        c.execute("UPDATE message_conflicts SET reason='telegram_body_newer_version' WHERE message=%s",(kept,))
+        c.execute("UPDATE message_revisions SET snapshot=snapshot-'sent_at' WHERE message=%s",(unreadable,))
+        content=c.execute('SELECT id,body,revision,provider_updated_at FROM messages ORDER BY id').fetchall()
+    before=rows(s)
+    assert before[resolved]['resolved_at'] is not None
+    classify_existing(ar,s)
+    after=rows(s)
+    assert after[resolved]==before[resolved] and after[kept]==before[kept]
+    assert (after[unreadable]['reason'],after[unreadable]['reason_version'])==('unclassified',1)
+    assert all(r['resolved_at']==before[m]['resolved_at'] for m,r in after.items())
+    classify_existing(ar,s)
+    assert rows(s)==after  # same xmin: no row was written again
+    late=contradict(ar,'late',body='Ещё текст')  # an N-1 writer after the job finished: the catch-up scan
+    legacy(s,late)
+    classify_existing(ar,s)
+    assert stored(s,late)['reason']=='telegram_body_equal_version'
+    with s.pool.connection() as c:
+        assert c.execute('SELECT id,body,revision,provider_updated_at FROM messages WHERE id<>%s ORDER BY id',
+                         (late,)).fetchall()==content
+
+
+def at(minutes):
+    return datetime(2026,10,1,12,0,tzinfo=timezone.utc)+timedelta(minutes=minutes)
+
+
+SNAPSHOT={**event(),'message':'m','provider_chat':'100','chat':'chat-id','revision':1}
+CHANGES={'sent_at':'2026-10-01T11:59:00+00:00','direction':'outgoing','sender':'43','body':'Другой текст',
+         'media':[{'provider_id':'p1','filename':'a.jpg','mime':'image/jpeg','bytes':10}],'other':None}  # other: the text with its formatting known
+
+
+# spec: ANYM-622
+@settings(deadline=None)
+@given(st.sampled_from(sorted(CHANGES)),st.integers(0,3),st.integers(-3,3),st.sampled_from([False,True,None]))
+def test_reclassify_is_equal_version_for_content_and_exact_or_unordered_for_identity(field,candidate,archived,tombstoned):
+    from messaging_service.conflict_classes import IDENTITY,classify,reclassify
+    from messaging_service.incoming_formatting import telegram
+    change={'formatting':telegram(SNAPSHOT['body'],[])} if field=='other' else {field:CHANGES[field]}
+    envelope=event(**change,updated_at=at(candidate).isoformat())
+    archive_version=at(archived) if archived>=0 else None
+    row={'envelope':envelope,'observed':SNAPSHOT,'archive_version':archive_version,'tombstoned':tombstoned,'reconstructed':False}
+    name=reclassify(row)
+    if field not in IDENTITY: assert name==f'telegram_{field}_equal_version'
+    elif archived==0 and tombstoned is False: assert name==classify(SNAPSHOT,envelope)!='unclassified'
+    else: assert name==f'telegram_{field}_unordered'
+    assert reclassify({**row,'reconstructed':True})==reclassify({**row,'reconstructed':None})=='unclassified'
+    assert reclassify({**row,'envelope':None})=='unclassified'
 
 
 # spec: ANYM-557
