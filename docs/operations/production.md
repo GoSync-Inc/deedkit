@@ -564,9 +564,10 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
    pre-migration gate is met by a fresh backup, or by the latest scheduled daily backup when, at
    `migrate` (each attempt), all of these hold; otherwise take a fresh one:
    - it is the producer's `last_success_id` and its snapshot time (`last_snapshot_at`, never the
-     delivery time) is at most 24 hours old: the 18:00 UTC backup serves from its proof (about
-     20:00 UTC) until 18:00 UTC the next day; in the gap until the next proof, wait for it or take
-     a fresh one;
+     delivery time) is at most 24 hours old: the 18:00 UTC backup, held from its proof (about
+     20:00 UTC; the next verifier run, 2 minutes later, rewrites `status.json`, below), serves
+     until 18:00 UTC the next day; between the next capture and its proof, wait for that proof
+     or take a fresh one;
    - its schema is the database's current schema (no migration since);
    - the receiver's independent verifier restored it: `last-success.json` names it, its proof is
      `verified` with all seven checks true at that schema, and it is the protected point;
@@ -583,7 +584,13 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
      ExecMainStartTimestamp`); the protected file names that backup. That `held` line is at most
      30 minutes old when `migrate` starts and is read again before each retry, as for a fresh
      backup proven by the release kit. The hold lasts across retries; once `migrate` succeeds (or
-     the release is abandoned), release the receiver's timer, then the producer's.
+     the release is abandoned), release the receiver's timer, then the producer's. A held backup
+     whose 24 hours end before a retry (or before `migrate` starts) ends the hold at once, in the
+     same order, before any wait or fresh capture: the producer's timer is `Persistent=true`
+     (18:00 UTC), so restarting it after a missed 18:00 starts that day's capture at once; confirm
+     it ran (`systemctl show -P LastTriggerUSec personal-os-backup.timer`, a new
+     `last_success_id`). The gate is then met again only by that capture's proof under a new hold,
+     or by a fresh backup.
 
    Accepted risk (owner 10-28 and 10-29, quoted above): a reused backup may be 24 hours old. If
    `migrate` destroys or corrupts data, a restore returns the database to that snapshot, and
