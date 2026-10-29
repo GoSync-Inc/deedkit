@@ -957,26 +957,38 @@ is idle; a read of deleted data says when it was deleted instead of `not_found`.
   adds them to the rows kept, so it never decreases; `delivery.hints_deleted_at` is the
   last deletion. A dynamic definition counts what its key could see at the deletion (the
   view's own filter); a definition no key can read counts none. Pending and leased hints
-  are never deleted.
+  are never deleted, and test hints stay while the definition is open, so a repeated
+  `test_subscription` request ID still returns its first probe. Events hints go only as a
+  prefix by position, below every one that stays; `hints_deleted_through` keeps the highest
+  deleted position, so the range of each kept hint, which the dynamic counts and the
+  dispatcher's visibility check read, stays exactly as it was.
 - **Closed definitions:** 30 days after `closed_at`, a closed, expired or
-  `access_changed` definition loses all its match references (ACKed or not, module ones
-  included), finished hints, receipts and consumption. References go from the bottom and
-  the floor follows each batch, so a reader between batches gets `retention_gap`. Once
-  nothing else is left (an unfinished hint waits for the dispatcher), the floor becomes
-  `matched_through` and `tombstoned_at` is set. The definition's row stays as a masked
+  `access_changed` definition loses its finished hints first (counted while their
+  references exist), then, once no hint is left (an unfinished one waits for the
+  dispatcher), all its match references (ACKed or not, module ones included), receipts and
+  consumption. References go from the bottom and the floor follows each batch, so a
+  reader between batches gets `retention_gap`. The last batch sets the floor to
+  `matched_through` and `tombstoned_at`. Acknowledged-event retention treats
+  `access_changed` as terminal too, so such a definition keeps its references until then. The definition's row stays as a masked
   tombstone: `get_subscription` and `list_subscriptions` return only `subscription_id`,
   `state`, `version`, `closed_at`, `data_deleted: true`, `deleted_at`, `deletion_reason:
   closed_over_30_days`, `retention_floor` and `hint_counts` (an `access_changed` one keeps
   `recreate_required` and `scope_masked` instead of the floor and counts).
-  `get_subscription_events` below the floor returns `retention_gap` up to it; fetch, ACK
-  and wait keep answering `subscription_closed`. A tombstone more than 30 days old no
+  `get_subscription_events` below the floor returns `retention_gap` up to it (an
+  `access_changed` tombstone keeps its scope-masked empty page); fetch, ACK and wait keep
+  answering `subscription_closed`. A tombstone more than 30 days old no
   longer counts toward `SUBSCRIPTION_MAX_DEFINITIONS`.
 - **Held definitions:** a quarantine-restored definition (`retention_hold`) is skipped by
   both paths until the operator's release; its 30 days count from the release.
 - **Mechanics:** the subscription worker runs one pass a minute (at once again while a
   batch was full), at most 16 definitions per path and one transaction of at most 500
-  rows per definition, under the same activation (`set-subscription-retention`), lock and
-  timeouts as acknowledged-event retention. A failed batch rolls back alone as
+  rows per definition (receipts, at most 128, and the consumption row included; equal
+  positions of events hints are taken whole), under the same lock and timeouts as
+  acknowledged-event retention and two activations: `subscription_retention` and
+  `subscription_tombstones`. `set-subscription-retention --enable` sets both, the second
+  only while the API, matcher and dispatcher heartbeats report this version on schema 62
+  (else it refuses with the lagging component), so no older reader serves hint counts
+  without the deleted ones; `--disable` clears both. A failed batch rolls back alone as
   `subscription_retention_failed` (error class only); matching and hints continue. Data
   deleted: the rows above, by the service (ready card ANYM-447).
 - **Roles:** the worker role gains `UPDATE(tombstoned_at, deleted_hint_counts,
@@ -985,11 +997,13 @@ is idle; a read of deleted data says when it was deleted instead of `not_found`.
   `subscription_receipts` (no receipt hash). Migration 62 grants them to an existing
   `messaging_subscriptions`; reapply `subscription_role.sql` for a new install.
 - **Rollout:** a verified backup, then migration 62 (manual: its backfill writes an
-  existing table; docs/operations/production.md backup gate), then the release. Retention
-  is already enabled on production, and the backfill keeps the first deletion 30 days
-  away. Rollback: `set-subscription-retention --disable` stops both paths; a runtime of
-  schema 61 serves a tombstone as a closed definition with no references, and its reader
-  returns `retention_gap` below the floor.
+  existing table; docs/operations/production.md backup gate), then the release, then
+  `set-subscription-retention --enable` once every component reports schema 62. Nothing
+  is deleted before that step; finished hints already older than 30 days go at the first
+  pass after it, closed definitions 30 days after the migration at the earliest.
+  Rollback: `set-subscription-retention --disable` first stops both paths; a runtime of
+  schema 61 then serves a tombstone as a closed definition with no references, its reader
+  returns `retention_gap` below the floor, and its hint counts lack the deleted hints.
 
 ## Deleted messages (schema 45)
 

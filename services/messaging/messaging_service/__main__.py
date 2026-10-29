@@ -263,7 +263,7 @@ def main():
         elif args.command=='set-subscription-retention':
             if not (args.enable or args.disable):
                 parser.error('set-subscription-retention requires --enable or --disable')
-            print(json.dumps(store.set_subscription_retention(args.enable)))
+            print(json.dumps(store.set_subscription_retention(args.enable, verify_components=True)))
         elif args.command=='set-access':
             if not args.principal:parser.error('set-access requires --principal')
             result=store.set_access(args.principal,accounts=args.accounts if args.accounts is not None else UNSET,

@@ -421,7 +421,7 @@ def feed_state(store):
         assert row.pop('retention_floor', 0) == 0 and row.pop('retention_hold', False) is False
         # Schema 62 (ANYM-447): an open definition has no closure time, tombstone or deleted hints.
         assert (row.pop('closed_at', None), row.pop('tombstoned_at', None), row.pop('deleted_hint_counts', {}),
-            row.pop('hints_deleted_at', None)) == (None, None, {}, None)
+            row.pop('hints_deleted_at', None), row.pop('hints_deleted_through', 0)) == (None, None, {}, None, 0)
     # Schema 60 (ANYM-522) adds reference columns that explicit definitions leave at their defaults.
     for row in state['subscription_matches']:
         assert (row.pop('account', None), row.pop('chat', None), row.pop('hidden', False),

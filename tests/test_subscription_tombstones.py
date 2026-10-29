@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 from copy import copy
 import hashlib
+from itertools import count
 import json
 from uuid import uuid4
 
@@ -14,8 +15,9 @@ from messaging_service import subscriptions
 from messaging_service.backup import database_manifest, quarantine_restore
 from messaging_service.store import APIError, Store
 from messaging_service.subscriptions import match_subscriptions, prune_subscriptions, retire_subscriptions
-from test_subscription_retention import (SOURCE, ack, acked_subscription, call, floor, identity, refs,
+from test_subscription_retention import (SOURCE, ack, acked_subscription, call, emit, floor, identity, refs,
     restore_database, set_retention)
+from test_subscriptions import ALL_VISIBLE, dynamic_key
 
 FINISHED = ('delivered', 'cancelled', 'dead_letter')
 KEPT = ('subscriptions', 'subscription_matches', 'subscription_outbox', 'subscription_consumption',
@@ -31,19 +33,23 @@ def seeded(seeded):
     set_retention(store, None)
 
 
-def hints(store, sid, states, finished_ago=None):
-    """Synthetic test hints of one subscription through an operator receiver; returns their IDs."""
+POSITIONS = count(1)
+
+
+def hints(store, sid, states, finished_ago=None, *, kind='events', at=None):
+    """Synthetic hints of one subscription through an operator receiver, each events hint at a higher position
+    than the previous one unless `at` names it; returns their IDs."""
     with store.pool.connection() as c:
-        owner = c.execute('SELECT principal,key_id,version,matched_through FROM subscriptions WHERE id=%s',
-            (sid,)).fetchone()
+        owner = c.execute('SELECT principal,key_id,version FROM subscriptions WHERE id=%s', (sid,)).fetchone()
         receiver = c.execute('''INSERT INTO subscription_receivers(id,principal,key_id,endpoint,secret_file)
             VALUES(gen_random_uuid(),%s,%s,'https://hooks.example.test/wake','/synthetic/receiver.key')
             RETURNING id''', (owner['principal'], owner['key_id'])).fetchone()['id']
         return [str(c.execute('''INSERT INTO subscription_outbox(subscription,subscription_version,receiver,
-            through_position,kind,request_id,state,finished_at) VALUES(%s,%s,%s,%s,'test',%s,%s,
+            through_position,kind,request_id,state,finished_at) VALUES(%s,%s,%s,%s,%s,%s,%s,
             CASE WHEN %s THEN clock_timestamp()-%s::interval END) RETURNING id''',
-            (sid, owner['version'], receiver, owner['matched_through'], 'synthetic-' + uuid4().hex, state,
-             state in FINISHED, finished_ago)).fetchone()['id']) for state in states]
+            (sid, owner['version'], receiver, next(POSITIONS) if at is None else at, kind,
+             'synthetic-' + uuid4().hex if kind == 'test' else '', state, state in FINISHED,
+             finished_ago)).fetchone()['id']) for state in states]
 
 
 def outbox(store, sid):
@@ -126,11 +132,13 @@ def test_finished_hints_are_deleted_after_30_days_and_the_counts_do_not_decrease
     hints(store, sid, FINISHED, '30 days 1 minute')
     young = hints(store, sid, ['delivered'], '29 days 23 hours 59 minutes')
     queued = hints(store, sid, ['pending'])
+    # A test hint keeps its request ID's replay while the definition is open.
+    probe = hints(store, sid, ['delivered'], '60 days', kind='test')
     before = store.get_subscription(token, sid)['delivery']['hint_counts']
-    assert before == {'cancelled': 1, 'dead_letter': 1, 'delivered': 2, 'pending': 1}
+    assert before == {'cancelled': 1, 'dead_letter': 1, 'delivered': 3, 'pending': 1}
     stats = retire_subscriptions(store)
     assert stats['hints_deleted'] == 3 and stats['tombstoned'] == 0 and stats['retire_failed'] == 0
-    assert outbox(store, sid) == sorted(young + queued)
+    assert outbox(store, sid) == sorted(young + queued + probe)
     view = store.get_subscription(token, sid)
     assert view['delivery']['hint_counts'] == before
     assert view['delivery']['deleted_hint_counts'] == {'cancelled': 1, 'dead_letter': 1, 'delivered': 1}
@@ -278,15 +286,19 @@ def test_injected_failure_mid_batch_rolls_back_and_bounded_batches_resume(seeded
             c.execute('DROP TRIGGER IF EXISTS test_tombstone_fault ON subscriptions')
             c.execute('DROP FUNCTION IF EXISTS public.test_tombstone_fault()')
     monkeypatch.setattr(subscriptions, 'RETENTION_BATCH', 2)
+    # Hints first, counted while their references exist; then references from the bottom.
     first = retire_subscriptions(store)
-    assert (first['rows_deleted'], first['more']) == (2, True) and floor(store, sid) == events[1]
+    assert (first['hints_deleted'], first['rows_deleted'], first['more']) == (2, 2, True) and refs(store, sid) == events
+    second = retire_subscriptions(store)
+    assert (second['rows_deleted'], second['more']) == (2, True) and floor(store, sid) == events[1]
     # A reader between batches gets the gap up to the moved floor, never a hole.
     assert store.get_subscription_events(token, sid)['subscription']['gap']['through'] == events[1]
     assert retire_subscriptions(store)['rows_deleted'] == 2 and floor(store, sid) == events[3]
-    third = retire_subscriptions(store)
-    assert (third['rows_deleted'], third['hints_deleted'], third['tombstoned']) == (2, 1, 0)
+    # The receipt and the consumption row count toward the bound: they wait for a fresh batch.
+    fourth = retire_subscriptions(store)
+    assert (fourth['rows_deleted'], fourth['tombstoned'], fourth['more']) == (1, 0, True)
     last = retire_subscriptions(store)
-    assert (last['hints_deleted'], last['tombstoned'], last['more']) == (1, 1, False)
+    assert (last['rows_deleted'], last['tombstoned'], last['more']) == (2, 1, False)
     assert counts(store, sid) == dict.fromkeys(KEPT[1:], 0) and floor(store, sid) == events[-1]
     assert store.get_subscription(token, sid)['hint_counts'] == {'cancelled': 1, 'delivered': 1}
 
@@ -302,13 +314,102 @@ def test_unfinished_hint_or_disabled_retention_keeps_the_closed_definition(seede
     assert retire_subscriptions(store)['rows_deleted'] == 0 and refs(store, sid) == events
     store.set_subscription_retention(True)
     stats = retire_subscriptions(store)
-    # The dispatcher settles it first: references go, the hint, consumption and the tombstone wait.
-    assert stats['rows_deleted'] == 3 and stats['tombstoned'] == 0 and outbox(store, sid) == queued
-    assert column(store, sid, 'tombstoned_at') is None
+    # The dispatcher settles it first: references, consumption and the tombstone wait for it.
+    assert stats['rows_deleted'] == 0 and stats['tombstoned'] == 0 and outbox(store, sid) == queued
+    assert column(store, sid, 'tombstoned_at') is None and refs(store, sid) == events
     with store.pool.connection() as c:
         c.execute("UPDATE subscription_outbox SET state='cancelled',finished_at=clock_timestamp() WHERE subscription=%s",
             (sid,))
     assert retire_subscriptions(store)['tombstoned'] == 1
+
+
+# spec: ANYM-447
+def test_dynamic_counts_and_visibility_survive_hint_deletion_and_the_tombstone(seeded):
+    store, _, _ = seeded
+    store.set_dynamic_subscriptions(True)
+    try:
+        token = dynamic_key(store, 'tombstone-dynamic-reader')
+        sid = store.create_subscription(token, sources=ALL_VISIBLE)['subscription_id']
+        shown, hidden, again = emit(store), emit(store), emit(store)
+        match_subscriptions(store)
+        assert refs(store, sid) == [shown, hidden, again]
+        with store.pool.connection() as c:
+            c.execute('UPDATE subscription_matches SET hidden=true WHERE subscription=%s AND event=%s', (sid, hidden))
+        # A and C cover a visible event; B covers only the hidden one, so it is neither counted nor sent.
+        hints(store, sid, ['delivered'], '40 days', at=shown)
+        pending = hints(store, sid, ['pending'], at=hidden)
+        recent_hint = hints(store, sid, ['delivered'], '1 day', at=again)
+
+        def sent():
+            with store.authorized(token) as (c, p):
+                row = c.execute('SELECT * FROM subscriptions WHERE id=%s', (sid,)).fetchone()
+                return subscriptions.hint_visible(c, row, p, hidden)
+
+        before = store.get_subscription(token, sid)['delivery']['hint_counts']
+        assert before == {'delivered': 2} and not sent()
+        assert retire_subscriptions(store)['hints_deleted'] == 1
+        assert outbox(store, sid) == sorted(pending + recent_hint) and column(store, sid, 'hints_deleted_through') == shown
+        delivery = store.get_subscription(token, sid)['delivery']
+        assert delivery['hint_counts'] == before and delivery['deleted_hint_counts'] == {'delivered': 1}
+        # B's range still starts above A's position: deleting A widens nothing.
+        assert not sent()
+        with store.pool.connection() as c:
+            c.execute("UPDATE subscription_outbox SET state='delivered',finished_at=clock_timestamp() WHERE id=%s",
+                (pending[0],))
+        close(store, token, sid)
+        backdate(store, sid, 'closed_at', '31 days')
+        # Hints go before their references, so C still counts.
+        assert retire_subscriptions(store)['tombstoned'] == 1
+        assert store.get_subscription(token, sid)['hint_counts'] == {'delivered': 2}
+    finally:
+        store.set_dynamic_subscriptions(False)
+
+
+# spec: ANYM-447
+def test_access_changed_definition_keeps_its_acked_references_until_30_days_after_closure(seeded):
+    store, _, _ = seeded
+    token, sid, events = acked_subscription(store, name='tombstone-acl-reader')
+    ack(store, token, sid)
+    with store.pool.connection() as c:
+        c.execute("UPDATE subscriptions SET state='access_changed',version=version+1 WHERE id=%s", (sid,))
+        c.execute("UPDATE subscription_matches SET matched_at=clock_timestamp()-interval '30 days' WHERE subscription=%s",
+            (sid,))
+    assert prune_subscriptions(store)['pruned'] == 0 and refs(store, sid) == events and floor(store, sid) == 0
+    assert retire_subscriptions(store)['rows_deleted'] == 0
+
+
+# spec: ANYM-447
+def test_deletion_waits_until_every_component_runs_schema_62(seeded):
+    from messaging_service import __version__
+    from messaging_service.store import RUNTIME_SCHEMA
+    store, _, _ = seeded
+    _, sid, _ = acked_subscription(store, name='tombstone-gate-reader')
+    old = hints(store, sid, ['delivered'], '40 days')
+    store.set_subscription_retention(False)
+    with store.pool.connection() as c:
+        saved = c.execute('SELECT * FROM component_heartbeats').fetchall()
+
+    def beat(api_schema):
+        with store.pool.connection() as c:
+            for component, schema in (('api', api_schema), ('matcher', RUNTIME_SCHEMA), ('dispatcher', RUNTIME_SCHEMA)):
+                c.execute('''INSERT INTO component_heartbeats(component,version,schema_version,beat_at)
+                    VALUES(%s,%s,%s,clock_timestamp()) ON CONFLICT(component) DO UPDATE SET version=EXCLUDED.version,
+                    schema_version=EXCLUDED.schema_version,beat_at=EXCLUDED.beat_at''', (component, __version__, schema))
+    try:
+        # A schema-61 API would serve hint counts without the deleted ones.
+        beat(61)
+        assert store.set_subscription_retention(True, verify_components=True) == {
+            'error': 'component_schema_mismatch', 'component': 'api', 'schema_version': 61}
+        assert retire_subscriptions(store)['hints_deleted'] == 0 and outbox(store, sid) == old
+        beat(RUNTIME_SCHEMA)
+        assert store.set_subscription_retention(True, verify_components=True) == {'subscription_retention': 'enabled'}
+        assert retire_subscriptions(store)['hints_deleted'] == 1 and outbox(store, sid) == []
+    finally:
+        with store.pool.connection() as c:
+            c.execute('DELETE FROM component_heartbeats')
+            for row in saved:
+                c.execute('INSERT INTO component_heartbeats(component,version,schema_version,beat_at) VALUES(%s,%s,%s,%s)',
+                    (row['component'], row['version'], row['schema_version'], row['beat_at']))
 
 
 # spec: ANYM-447

@@ -1484,18 +1484,28 @@ class Store:
                 (ids, ids)).fetchall()
         return {'released': len(released)}
 
-    def set_subscription_retention(self, enabled):
-        # Operator CLI only (ANYM-446): enable after every serving reader reports retention_gap.
-        from .subscriptions import lock_retention
+    def set_subscription_retention(self, enabled, *, verify_components=False):
+        # Operator CLI only (ANYM-446): enable after every serving reader reports retention_gap. From schema 62 it
+        # also switches ANYM-447's deletion of finished hints and closed definitions; with verify_components (the
+        # CLI) enabling refuses unless the API, matcher and dispatcher report this version on schema 62, so no
+        # older reader serves hint counts without the deleted ones.
+        from .subscriptions import TOMBSTONE_GATE, lock_retention
+        value = 'enabled' if enabled else 'disabled'
         with self.pool.connection() as c:
             # Waits for in-flight pruning batches; every later batch reads this value.
             lock_retention(c, shared=False)
             version = int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
             if version < 40:
                 raise RuntimeError('subscription_retention_needs_schema_40')
-            c.execute('''INSERT INTO probe_metadata(name,value) VALUES('subscription_retention',%s)
-                ON CONFLICT(name) DO UPDATE SET value=EXCLUDED.value''', ('enabled' if enabled else 'disabled',))
-        return {'subscription_retention': 'enabled' if enabled else 'disabled'}
+            if enabled and verify_components and version >= 62:
+                from .heartbeats import mismatch
+                problem = mismatch(c)
+                if problem is not None:
+                    return problem
+            for name in ('subscription_retention', *((TOMBSTONE_GATE,) if version >= 62 else ())):
+                c.execute('''INSERT INTO probe_metadata(name,value) VALUES(%s,%s)
+                    ON CONFLICT(name) DO UPDATE SET value=EXCLUDED.value''', (name, value))
+        return {'subscription_retention': value}
 
     def migrate(self):
         with self.pool.connection() as c:
