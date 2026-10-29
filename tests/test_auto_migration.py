@@ -286,6 +286,165 @@ def test_an_incompatible_producer_pin_waits_after_preparation_and_a_compatible_o
     assert [name for name, _ in host.steps].count("prepare") == 1
 
 
+BACKUP_IMAGE, PINNED = "sha256:" + "6" * 64, "sha256:" + "5" * 64
+
+
+class PinHost(MigrationHost):
+    """ANYM-589 B1: the pinned producer (REVISION) reads schemas 2-50 only; the candidate's attested backup image
+    (pulled through `build_image`, as preparation never resolves the backup target) reads 2-51; runner.json holds
+    other keys and mode 0640."""
+
+    def __init__(self, tmp_path, monkeypatch, files=None, **options):
+        super().__init__(tmp_path, monkeypatch, files or {"051_synthetic_note.sql": NOTE}, **options)
+        self.contents[f"{REVISION}:{p.BACKUP_SOURCE}"] = b"SCHEMAS=range(2,51)\n"
+        for commit in (NEWER, NEWEST):
+            self.contents[f"{commit}:{p.BACKUP_SOURCE}"] = b"SCHEMAS=range(2,52)\n"
+        self.runner = tmp_path / "runner.json"
+        self.runner.write_text('{\n  "image": "%s",\n  "directory": "/synthetic/backups",\n  "busy_wait_seconds": 5\n}\n'
+                               % PINNED)
+        self.runner.chmod(0o640)
+        self.old = self.runner.read_bytes()
+        self.unit, self.pulled = "inactive", None
+
+    def build_image(self, source, sha_, target, **kwargs):
+        if target != "backup":
+            return super().build_image(source, sha_, target, **kwargs)
+        assert sha_ == NEWEST and not kwargs
+        self.events.append("backup pull")
+        if self.pulled:
+            raise self.pulled
+        return BACKUP_IMAGE
+
+    def run(self, argv, **kwargs):
+        if argv[:3] == ["docker", "image", "inspect"] and "{{.Id}}" in argv[4]:
+            self.events.append("backup image")
+            return f"{argv[-1]} {NEWEST}\n" if argv[-1] == BACKUP_IMAGE else ""
+        if argv[:3] == ["docker", "image", "inspect"] and argv[-1] == BACKUP_IMAGE:
+            self.events.append("producer")
+            return NEWEST + "\n"
+        if argv[0] == "systemctl":
+            self.events.append("unit")
+            if self.unit is None:
+                raise p.Refused("systemctl failed (exit 1); production was not accepted")
+            return self.unit + "\n"
+        return super().run(argv, **kwargs)
+
+    def undo(self):
+        return self.runner.with_name(f"runner.json.before-{NEWEST}")
+
+
+# spec: ANYM-589
+def test_an_incompatible_producer_pin_moves_to_the_candidates_backup_image_and_the_migration_follows(tmp_path,
+                                                                                                    monkeypatch):
+    host = PinHost(tmp_path, monkeypatch)
+    outcome = host.deploy()
+    assert outcome["status"] == "deployed" and host.migration()["status"] == "migrated"
+    assert phases(host)[:8] == ["live ledger", "producer", "backup pull", "backup image", "unit", "unit", "producer",
+                                "copy"]
+    # The final gate reads the new pin.
+    assert phases(host)[phases(host).index("rehearse"):][:3] == ["rehearse", "live ledger", "producer"]
+    moved = json.loads(host.runner.read_text())
+    assert moved == {**json.loads(host.old), "image": BACKUP_IMAGE} and list(moved) == list(json.loads(host.old))
+    assert host.undo().read_bytes() == host.old and oct(host.undo().stat().st_mode & 0o777) == "0o640"
+    assert oct(host.runner.stat().st_mode & 0o777) == "0o640" and host.runner.stat().st_uid == os.getuid()
+    receipt = p.read(host.state / NEWEST / "producer-pin.json")
+    assert (receipt["before"], receipt["after"], receipt["status"]) == (PINNED, BACKUP_IMAGE, "moved")
+    assert sorted(path.name for path in tmp_path.iterdir() if path.name.startswith((".runner", "runner"))) == [
+        "runner.json", f"runner.json.before-{NEWEST}"]
+
+
+# spec: ANYM-589
+def test_a_rollback_after_a_moved_pin_keeps_the_new_pin(tmp_path, monkeypatch):
+    host = PinHost(tmp_path, monkeypatch)
+    def unhealthy(sha_):
+        p.write(host.state / sha_ / "result.json", {"sha": sha_, "status": "unhealthy"})
+        raise p.Refused("replacement did not become healthy")
+    host.fail_apply = unhealthy
+    assert host.deploy()["status"] == "rolled-back" and ("rollback", NEWEST) in host.steps
+    assert json.loads(host.runner.read_text())["image"] == BACKUP_IMAGE
+
+
+# spec: ANYM-589
+@pytest.mark.parametrize("case", ["not-qualifying", "compatible", "no-backup-image", "candidate-too-old", "unit-active",
+                                  "runner-not-installed", "unit-unreadable"])
+def test_the_producer_pin_does_not_move_outside_a_qualifying_range_or_a_safe_moment(tmp_path, monkeypatch, case):
+    files = {"051_synthetic_widen.sql": b"-- rollout: manual\nUPDATE messages SET body = 'marker-1';\n"} \
+        if case == "not-qualifying" else None
+    host = PinHost(tmp_path, monkeypatch, files)
+    if case == "compatible":
+        host.contents[f"{REVISION}:{p.BACKUP_SOURCE}"] = b"SCHEMAS=range(2,52)\n"
+    elif case == "no-backup-image":
+        host.pulled = p.Unreachable("synthetic registry timeout")
+    elif case == "candidate-too-old":
+        host.contents[f"{NEWEST}:{p.BACKUP_SOURCE}"] = b"SCHEMAS=range(2,51)\n"
+    elif case == "unit-active":
+        host.unit = "activating"
+    elif case == "unit-unreadable":
+        host.unit = None
+    elif case == "runner-not-installed":
+        # The installed runner is not the candidate's (ANYM-488): refused before any write.
+        monkeypatch.setattr(p, "BACKUP_RUNNER", tmp_path / "backup_runner.py")
+        monkeypatch.setenv("DEEDKIT_BACKUP_LOCK", str(tmp_path / ".runner.lock"))
+        p.BACKUP_RUNNER.write_text("# synthetic older runner\n")
+    outcome = host.deploy()
+    assert host.runner.read_bytes() == host.old and not host.undo().exists()
+    assert not (host.state / NEWEST / "producer-pin.json").exists()
+    if case == "compatible":
+        assert outcome["status"] == "deployed" and "backup image" not in host.events
+    elif case == "not-qualifying":
+        assert outcome["status"] == "halted" and host.events == [] and host.steps == []
+    elif case == "runner-not-installed":
+        assert outcome["status"] == "halted" and f"the backup runner {p.BACKUP_RUNNER} is blob" in outcome["reason"] and "copy" not in host.events
+    else:
+        assert outcome["status"] == "waiting" and outcome["migration_waits"]["count"] == 1 and "copy" not in host.events
+        assert outcome["reason"].startswith({"unit-active": "personal-os-backup.service is activating",
+                                             "unit-unreadable": "the state of personal-os-backup.service could not be read"
+                                             }.get(case, "the backup producer does not read schema 51 yet"))
+
+
+# spec: ANYM-589
+@pytest.mark.parametrize("change", ["edited", "replaced", "chmod"])
+def test_a_runner_json_changed_while_the_pin_moves_pauses_and_keeps_the_change(tmp_path, monkeypatch, change):
+    host = PinHost(tmp_path, monkeypatch)
+    edit = '{"image": "sha256:%s"}\n' % ("7" * 64)
+    write = p.leaf_write
+    def changed(directory, name, data, like):
+        write(directory, name, data, like)
+        if name.startswith(".runner.json."):  # the new file is written; the operator acts before the rename
+            if change == "edited":
+                host.runner.write_text(edit)
+            elif change == "chmod":
+                host.runner.chmod(0o600)
+            else:
+                host.runner.with_name("other.json").write_bytes(host.old)
+                host.runner.with_name("other.json").replace(host.runner)
+    monkeypatch.setattr(p, "leaf_write", changed)
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and host.paused() == outcome["reason"]
+    assert "changed while deploy moved the backup producer pin" in outcome["reason"] and "copy" not in host.events
+    assert host.runner.read_text() == (edit if change == "edited" else host.old.decode())
+    assert host.undo().read_bytes() == host.old and not list(tmp_path.glob(".runner.json.*"))
+    assert not (host.state / NEWEST / "producer-pin.json").exists()
+
+
+# spec: ANYM-589
+def test_a_run_killed_after_the_pin_moved_is_recorded_and_continued_by_the_next_run(tmp_path, monkeypatch):
+    host = PinHost(tmp_path, monkeypatch)
+    record = p.write_record
+    def killed(path, value):
+        if value.get("status") == "moved":
+            raise Died()
+        record(path, value)
+    monkeypatch.setattr(p, "write_record", killed)
+    with pytest.raises(Died):
+        host.deploy()
+    receipt = host.state / NEWEST / "producer-pin.json"
+    assert json.loads(host.runner.read_text())["image"] == BACKUP_IMAGE and p.read(receipt)["status"] == "moving"
+    monkeypatch.setattr(p, "write_record", record)
+    assert host.deploy()["status"] == "deployed" and host.migration()["status"] == "migrated"
+    assert p.read(receipt)["status"] == "moved" and host.undo().read_bytes() == host.old
+
+
 # spec: ANYM-449
 @pytest.mark.parametrize("failure", ["copy", "rehearsal", "shape", "final-call"])
 def test_a_failed_copy_rehearsal_or_final_gate_pauses_before_the_migration_and_is_not_retried(tmp_path, monkeypatch,

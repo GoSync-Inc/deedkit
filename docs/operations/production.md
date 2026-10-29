@@ -692,9 +692,27 @@ Phases, each a pause or a wait before any production write:
    target (else `waiting`); the live ledger is exactly the base's (`schema_version` and every
    `archive_migrations` checksum; else a pause).
 2. Preparation: plan A `prepare` as always, then the producer check: the image `runner.json` pins has an
-   `org.opencontainers.image.revision` whose `backup.py` `SCHEMAS` holds the target (else `waiting`;
-   move the pin by hand until ANYM-589). Waits on the receiver or the producer count in `deploy.json`
-   (`migration_waits`); the third in a row pauses.
+   `org.opencontainers.image.revision` whose `backup.py` `SCHEMAS` holds the target. When it does not, the
+   pin follows (ANYM-589 B1, under the runner lock the deploy holds): the candidate's `backup` image,
+   pulled by its attested digest as `deedkit-production-backup:<sha>` (no Compose service selects it, so
+   `prepare` does not; its ID and revision label are read back), must have a `backup.py` whose `SCHEMAS`
+   holds the base and the target; the installed runner must be the candidate's (ANYM-488, "Backup
+   runner"; else a pause before any write); `personal-os-backup.service` and
+   `deedkit-calendar-backup.service` must read `inactive` or `failed`. Then, every path opened below one
+   descriptor of `runner.json`'s directory, `runner.json.before-<sha>` is written (the old file's bytes,
+   owner and mode), a new file with only `image` changed is written beside it, `runner.json` is read again
+   (bytes, inode, size, times, owner, mode), `<sha>/producer-pin.json` records `moving` with the old and
+   new image, one rename replaces `runner.json`, and the receipt records `moved` (a run that stopped
+   before that records it when it finds the new pin). The check then runs again. Any condition unmet or
+   unreadable: `waiting`, nothing written. A `runner.json` changed while it moves pauses (the change stays);
+   a `.before-<sha>` file with other bytes pauses. Edit `runner.json` by hand only under the runner lock
+   ("Backup runner"). A rollback keeps the new pin (the candidate's backup code reads the base and the
+   target). Undo, only while the old image still reads the live schema, that is before the migration
+   applied (`<sha>/migration.json` absent, `rehearsed`, `refused` or `not-applied`): under the runner
+   lock with the backup services idle, `cp -p runner.json.before-<sha> runner.json`. After the migration
+   the old pin would fail every capture (`unsupported_backup_schema`): keep the new one. The calendar
+   `runner.json` keeps its own pin; move it by hand as in "Backup runner". Waits on the receiver or the
+   producer count in `deploy.json` (`migration_waits`); the third in a row pauses.
 3. Copy: ANYM-588 for `messaging`, keeping the scratch server; the copy's keeper also records the live
    catalog in its snapshot (`catalog_sha256`). A failed copy pauses "the pre-migration copy of messaging
    failed: <code>".
@@ -888,7 +906,9 @@ failed command stops it (`sh -e`). From the prepared release: when the backup wo
 in the same range since the pinned image (`org.opencontainers.image.revision` of
 `runner.json`'s `image`), first set the backup image pin in `runner.json` to the release's
 backup image and check it, then install the runner, both in the script below (`pin=yes`): a
-newer runner can write a `worker.json` key an older worker refuses (BACKUP.md).
+newer runner can write a `worker.json` key an older worker refuses (BACKUP.md). An unattended migration
+moves messaging's pin itself when the pinned image cannot read the target ("Unattended migrations",
+phase 2); a pin it already moved reads as the release's, so the script below then runs with `pin=no`.
 
 ```sh
 sha=<prepared-sha>; src=<state_directory>/$sha/source; pin=yes   # state_directory: /etc/deedkit/production.json; pin=no: the worker did not change
