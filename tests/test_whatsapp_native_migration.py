@@ -97,7 +97,7 @@ def test_schema29_upgrade_preserves_webjs_and_replays_both_native_provenances(sc
     assert manifest['schema_version'] == 62
     assert manifest['tables']['whatsapp_identity_observations']['rows'] == 3
     assert len(manifest['tables']) == 91
-    future = {**manifest, 'schema_version': 62}
+    future = {**manifest, 'schema_version': 63}
     bundle.joinpath('manifest.json').write_text(json.dumps(future))
     with pytest.raises(ValueError, match='unsupported_backup'):
         verify_bundle(bundle)

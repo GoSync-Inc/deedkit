@@ -56,7 +56,7 @@ def test_schema46_backup_carries_role_columns_and_verifies(seeded,tmp_path):
             role_observed_at=clock_timestamp() WHERE id=%s''',(chat,))
     create_snapshot(store,tmp_path/'capture',DUMP)
     manifest=verify_bundle(tmp_path/'capture')
-    assert manifest['schema_version']==61 and len(manifest['tables'])==91
+    assert manifest['schema_version']==62 and len(manifest['tables'])==91
     assert verify_snapshot(store,tmp_path/'capture')['status']=='verified'
     # The chats digest covers the role columns: a changed role no longer matches the snapshot.
     with store.pool.connection() as c:c.execute("UPDATE chats SET my_role='admin' WHERE id=%s",(chat,))

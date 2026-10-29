@@ -223,7 +223,7 @@ CHECKS = {
 
 # spec: ANYM-495
 @pytest.mark.parametrize('command', list(CHECKS))
-@pytest.mark.parametrize('version,answer', [(61, 'ok'), (43, 'schema_not_ready')], ids=['current', 'n-1'])
+@pytest.mark.parametrize('version,answer', [(62, 'ok'), (43, 'schema_not_ready')], ids=['current', 'n-1'])
 def test_check_validates_and_reports_the_schema_and_writes_nothing(seeded, run, tmp_path, command, version, answer):
     store = seeded[0]
     with store.pool.connection() as c:
