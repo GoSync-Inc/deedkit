@@ -2129,6 +2129,36 @@ def test_the_protected_paths_and_signals_are_the_review_protocol_lists_as_writte
     assert sorted(autoloop.REQUIRED) == sorted(required)
 
 
+# spec: ANYM-590
+@pytest.mark.parametrize('name, reason', [
+    ('services/messaging/messaging_service/migrations/057_widget.SQL', 'change-path signal'),
+    ('services/messaging/messaging_service/Migrations/057_widget.py', 'change-path signal'),
+    ('services/messaging/messaging_service/ROLES.SQL', 'protected path'),
+    ('services/calls/dockerfile', 'protected path'),
+    ('services/calls/prod.Dockerfile', 'protected path'),
+    ('services/calls/DOCKERFILE.prod', 'protected path'),
+    ('services/calls/Dockerfile.prod', 'protected path'),
+    ('services/calls/Compose.yaml', 'change-path signal'),
+    ('AGENTS.MD', 'change-path signal'),
+    ('services/calendar/Claude.md', 'protected path'),
+    ('.GitHub/workflows/checks.yml', 'protected path'),
+    ('services/calls/PyProject.toml', 'protected path'),
+    ('services/messaging/tests/widget_helper.PY', 'test helper'),
+    ('services/messaging/Tests/widget_helper.py', 'test helper'),
+    ('services/messaging/tests/Test_widget.py', 'test helper')])
+def test_the_path_lists_match_a_name_in_any_case(name, reason):
+    assert reason in [r for r, _ in autoloop.diff_hits([changed_file(name)])]
+
+
+# spec: ANYM-590
+def test_the_review_protocol_path_greps_are_case_insensitive_except_the_test_name_exemption():
+    doc = (ROOT / 'docs/operations/review-protocol.md').read_text()
+    for compiled in (autoloop.SIGNAL_PATHS, autoloop.SIGNAL_TEXT, autoloop.PROTECTED, autoloop.TEST_DIR,
+                     autoloop.CODE_FILE):
+        assert compiled.flags & re.I and f"grep -E -i '{compiled.pattern}'" in doc, compiled.pattern
+    assert not autoloop.TEST_FILE.flags & re.I and f"grep -v -E '{autoloop.TEST_FILE.pattern}'" in doc
+
+
 # spec: ANYM-572
 def test_the_controller_reviews_the_exact_head_itself_in_a_clean_worktree_and_takes_no_verdict_from_the_worker(
         tmp_path, capsys):

@@ -1125,9 +1125,10 @@ ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = ROOT / 'deploy' / 'autoloop-runner' / 'launch.py'  # the container runner (ANYM-574)
 # docs/operations/review-protocol.md, used as written (one list; a test compares these with the document): the
 # change-path signal grep (file names, then changed lines) and the autoloop protected paths with their test-directory
-# rules.
+# rules. Every path list matches in any case (`migrations/X.SQL`, `prod.dockerfile`, `AGENTS.MD` on a case-insensitive
+# checkout); only TEST_FILE, an exemption, stays exact, so an odd-case test name is a helper.
 SIGNAL_PATHS = re.compile(r'^\.github/workflows/|main-ruleset\.json|\.sql$|migrations/|gitleaks|compose|'
-                          r'\.claude/settings\.json|^AGENTS\.md$|^docs/operations/feedback-autoloop\.md$')
+                          r'\.claude/settings\.json|^AGENTS\.md$|^docs/operations/feedback-autoloop\.md$', re.I)
 SIGNAL_TEXT = re.compile(r'^[-+].*(secret|permissions|: *write|write-all|\b(GRANT|REVOKE|DROP|TRUNCATE|DELETE FROM|'
                          r'RENAME)\b|ALTER )', re.I)
 PROTECTED = re.compile(
@@ -1135,11 +1136,11 @@ PROTECTED = re.compile(
     r'packages/platform-contracts/|tests/platform/benchmarks/)|^[^/]+\.py$|^[^/]+/__init__\.py$|'
     r'(^|/)(sitecustomize|usercustomize)\.py$|\.pth$|(^|/)(pytest\.ini|setup\.cfg|tox\.ini)$|'
     r'(^|/)(AGENTS|CLAUDE)(\.override)?\.md$|^(SUBSCRIPTIONS|SECURITY|TIDEN-CI)\.md$|(^|/)\.(claude|codex)/|'
-    r'\.mcp\.json$|migrations/|\.sql$|(^|/)(Dockerfile[^/]*|pyproject\.toml|package\.json|go\.mod|hatch_build\.py|'
-    r'conftest\.py|migration_rollout\.py|\.dockerignore|\.gitattributes|uv\.lock|package-lock\.json|go\.sum|'
-    r'requirements[^/]*\.(lock|in|txt))$|\.(pyc|so|pyd|dylib)$|(^|/)__pycache__/')
-TEST_DIR = re.compile(r'(^|/)tests?/')
-CODE_FILE = re.compile(r'\.(py|pyi|js|mjs|cjs|ts|tsx|go|sh)$')
+    r'\.mcp\.json$|migrations/|\.sql$|(^|/)(([^/]*[.-])?Dockerfile[^/]*|pyproject\.toml|package\.json|go\.mod|'
+    r'hatch_build\.py|conftest\.py|migration_rollout\.py|\.dockerignore|\.gitattributes|uv\.lock|package-lock\.json|'
+    r'go\.sum|requirements[^/]*\.(lock|in|txt))$|\.(pyc|so|pyd|dylib)$|(^|/)__pycache__/', re.I)
+TEST_DIR = re.compile(r'(^|/)tests?/', re.I)
+CODE_FILE = re.compile(r'\.(py|pyi|js|mjs|cjs|ts|tsx|go|sh)$', re.I)
 TEST_FILE = re.compile(r'(^|/)test_[^/]*\.py$|\.test\.[^/]+$|_test\.go$')
 ENVELOPE = ('defect', 'improvement', 'feature')
 MAX_SP = 8
