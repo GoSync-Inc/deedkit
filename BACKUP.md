@@ -193,11 +193,12 @@ with the timer and the backup service idle and no capture started until it ends:
 image pin it ran with (the new runner with the old image is the pair that fails).
 
 Schema follow (ANYM-589 B1): an unattended migration whose target the pinned image's `backup.py` does not
-read moves the messaging `runner.json` `image` pin itself, before the copy, to the release's prepared backup
+read moves the messaging `runner.json` `image` pin itself, before the copy, to the release's attested backup
 image, under the runner lock with both backup services idle, keeping `runner.json.before-<sha>` byte for
 byte ([production.md, Unattended migrations](docs/operations/production.md#unattended-migrations), phase 2).
 It moves only the image, never the runner: it needs the installed runner to be the release's already.
-Undo: under the same lock and idle services, `cp -p runner.json.before-<sha> runner.json`.
+Undo only before the migration applied (the old image refuses the newer schema, so afterwards it would fail
+every capture): under the same lock and idle services, `cp -p runner.json.before-<sha> runner.json`.
 
 Delivery uses a separate SSH key created on the source VM. The key does not give
 shell/SFTP/forwarding/read/delete: the target VM runs only
