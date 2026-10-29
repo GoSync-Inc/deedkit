@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 
@@ -206,14 +207,73 @@ SENT = {'app.py', 'tests/test_app.py', 'services/gateway/tests/test_credential_e
         'scripts/python_shards.py', 'scripts/build.py', '.gitignore', 'new_module.py', 'private_notes.txt'}
 
 
+# Every process a test starts leads a session of its own, and a reaper outside them, fed each session id, kills
+# what is left of them once the test ends: passed, failed, timed out, or pytest itself gone (the reaper's stdin
+# then closes). Orphans keep their session, so a run whose test failed mid-run cannot outlive it (10-29: such runs
+# kept their runner, fake PostgreSQL loops and slot holders on the laptop for hours). Zombies are left to their
+# parent.
+REAPER = r'''import os, signal, subprocess, sys, time
+sessions = {int(line) for line in sys.stdin}
+for attempt in range(25):
+    left = []
+    for row in subprocess.run(['ps', '-A', '-o', 'pid=,uid=,stat='], capture_output=True, text=True).stdout.splitlines():
+        pid, uid, stat = row.split()[:3]
+        try:
+            if int(uid) == os.getuid() and not stat.startswith('Z') and os.getsid(int(pid)) in sessions:
+                left.append(int(pid))
+        except OSError:
+            pass
+    if not left:
+        break
+    for pid in left:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    time.sleep(0.2)
+'''
+STARTED = []
+REAPER_INPUT = []
+
+
+@pytest.fixture(autouse=True)
+def reap_sessions():
+    reaper = subprocess.Popen([sys.executable, '-c', REAPER], stdin=subprocess.PIPE, text=True,
+                              start_new_session=True)
+    REAPER_INPUT[:] = [reaper.stdin]
+    yield
+    REAPER_INPUT.pop().close()
+    reaper.wait(timeout=60)
+    while STARTED:
+        process = STARTED.pop()
+        process.wait(timeout=30)
+        for stream in (process.stdout, process.stderr):
+            if stream:
+                stream.close()
+
+
+def start(command, **options):
+    process = subprocess.Popen(command, start_new_session=True, **options)
+    STARTED.append(process)
+    if REAPER_INPUT:
+        REAPER_INPUT[0].write(f'{process.pid}\n')
+        REAPER_INPUT[0].flush()
+    return process
+
+
 def remote(env, *args, **extra):
-    return subprocess.run(['bash', str(SCRIPT), *map(str, args)], env=dict(env, **extra), capture_output=True,
-                          text=True, timeout=120)
+    process = background(env, *args, **extra)
+    try:
+        stdout, stderr = process.communicate(timeout=120)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        raise
+    return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
 
 
 def background(env, *args, **extra):
-    return subprocess.Popen(['bash', str(SCRIPT), *map(str, args)], env=dict(env, **extra), stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True)
+    return start(['bash', str(SCRIPT), *map(str, args)], env=dict(env, **extra), stdout=subprocess.PIPE,
+                 stderr=subprocess.PIPE, text=True)
 
 
 def files_under(root):
@@ -636,6 +696,45 @@ def test_an_ssh_drop_mid_run_stops_the_run_on_the_mini_and_does_not_rerun_locall
     assert len(log_lines(home, 'uv run pytest')) == 1
 
 
+INNER_TEST = '''from test_remote_test import background, log_lines, wait_for
+
+
+def test_fails_mid_run(mini, worktree):
+    home, env = mini
+    background(env, worktree, 'root', 'tests/test_app.py', FAKE_UV_SLEEP='120', FAKE_SSH_DROP='1')
+    wait_for(lambda: log_lines(home, 'uv run pytest') and log_lines(home, 'ssh-session'), 60)
+    assert False, 'the test fails while its run goes on'
+'''
+
+
+# spec: ANYM-639
+def test_a_test_that_fails_mid_run_leaves_no_process_of_its_run_behind(tmp_path):
+    # A pytest session of its own, with this module's fixtures, runs a test that fails while its run (ssh session,
+    # runner, suite, PostgreSQL, slot holder) is alive; once that session has ended, none of them may be.
+    inner = tmp_path / 'inner'
+    write(inner / 'conftest.py', "pytest_plugins = ['test_remote_test']\n", 0o644)
+    write(inner / 'pytest.ini', '[pytest]\n', 0o644)
+    write(inner / 'test_inner.py', INNER_TEST, 0o644)
+    basetemp = tmp_path / 'base'
+    env = {k: v for k, v in os.environ.items() if not k.startswith('PYTEST_')}
+    env['PYTHONPATH'] = os.pathsep.join(filter(None, [str(ROOT / 'tests'), env.get('PYTHONPATH')]))
+    result = subprocess.run([sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', '--basetemp',
+                             str(basetemp), 'test_inner.py'], cwd=inner, env=env, capture_output=True, text=True,
+                            timeout=300)
+    assert result.returncode == 1 and '1 failed' in result.stdout, result.stdout + result.stderr
+    home = basetemp / 'test_fails_mid_run0'
+    pids = [pid_of(line) for prefix in ('uv run pytest', 'ssh-session', 'postgres -D') for line in log_lines(home, prefix)]
+    pids.append(runner_pid(home))
+    assert len(pids) == 4
+
+    def gone():
+        listing = subprocess.run(['ps', '-A', '-o', 'pid=,stat=,command='], capture_output=True, text=True).stdout
+        live = [row for row in (line.split(None, 2) for line in listing.splitlines())
+                if len(row) == 3 and not row[1].startswith('Z')]
+        return not any(int(row[0]) in pids or str(basetemp) in row[2] for row in live)
+    wait_for(gone, 15)
+
+
 # spec: ANYM-638
 def test_cleanup_removes_the_workers_copies_and_leftover_databases_only(mini, worktree):
     home, env = mini
@@ -644,7 +743,7 @@ def test_cleanup_removes_the_workers_copies_and_leftover_databases_only(mini, wo
     write(other / 'kept.py', '', 0o644)
     cluster = worker_dir(home) / 'runs' / '1-1' / 'pg1' / 'cluster'
     cluster.mkdir(parents=True)
-    leftover = subprocess.Popen([str(home / 'pgbin' / 'postgres'), '-D', str(cluster)], env=env)
+    leftover = start([str(home / 'pgbin' / 'postgres'), '-D', str(cluster)], env=env)
     wait_for(lambda: (cluster / 'postmaster.pid').exists())
     result = remote(env, '--cleanup', WORKER)
     assert result.returncode == 0, result.stderr
