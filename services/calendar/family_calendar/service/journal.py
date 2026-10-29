@@ -97,12 +97,13 @@ def cancelled_by(state, keys):
 def origins(c, refs):
     """{resource_ref: [(time, principal_id)]} of operations that sent a step to one of these resources. The time is
     when the worker last finished the operation (its audit row, after the provider write), so a write queued before
-    a read but sent after it counts; an operation a restart interrupted before its audit row counts from its
-    enqueue time."""
+    a read but sent after it counts. An operation a restart interrupted before its audit row counts from its last
+    step admission: the worker sets lease_until to now()+2 minutes when it admits a step to send (worker.py), and
+    from its enqueue time without one."""
     found = {}
     if refs:
         for row in c.execute(
-            "SELECT s.intent->>'resource_ref' AS ref,o.principal_id,coalesce(max(a.at),o.created_at) AS at "
+            "SELECT s.intent->>'resource_ref' AS ref,o.principal_id,coalesce(max(a.at),o.lease_until-interval '2 minutes',o.created_at) AS at "
             "FROM operation_steps s JOIN operations o ON o.id=s.operation_id "
             "LEFT JOIN audit a ON a.action='operation' AND a.ref=o.id "
             "WHERE s.intent->>'resource_ref'=ANY(%s) AND s.state=ANY(%s) GROUP BY 1,o.id",

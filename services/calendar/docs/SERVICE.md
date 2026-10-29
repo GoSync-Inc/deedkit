@@ -304,7 +304,7 @@ refresh of a window that holds the event.
   first; a failed or timed-out probe counts as probed.
 - `origin` is `deedkit:<principal>` when an operation of that principal sent a step to the event's resource (or a
   Google instance's series master) and finished (its audit row; an operation a restart interrupted counts from its
-  enqueue time) after the state the change is measured from, else `provider`.
+  last step admission, the lease the worker sets then) after the state the change is measured from, else `provider`.
 - An event outside 1970-01-01..9999-12-30 (the ANYM-562 time range) is kept in the baseline but not journaled.
 - If the journal write fails, its savepoint rolls back: the window still answers readers from the provider, the
   baseline does not move, an audit row `change_journal`/`failed` is written, and the next read journals the same

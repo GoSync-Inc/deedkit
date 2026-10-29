@@ -316,11 +316,12 @@ def test_origin_names_the_deedkit_principal_that_wrote_the_resource(household):
     s.query("INSERT INTO audit(principal_id,action,ref,outcome) VALUES ('agent-a','operation','op-1','verified')")
     s.query("INSERT INTO operation_steps(operation_id,ordinal,state,intent) VALUES ('op-1',0,'verified',%s)",
             (Jsonb({"resource_ref": source_ref("res", "cal-a", "lesson"), "action": "update"}),))
-    # Queued after the read and interrupted by a restart before its audit row: its enqueue time counts.
+    # Queued before the read, its step admitted after it (the lease the worker sets then), interrupted by a restart
+    # before its audit row: the admission counts.
     s.query("INSERT INTO plans(id,principal_id,payload,scope_hash,expires_at) VALUES "
             "('plan-2','agent-a','{}','x',now()+interval '1 hour')")
-    s.query("INSERT INTO operations(id,principal_id,plan_id,request_id,state) VALUES "
-            "('op-2','agent-a','plan-2','r-2','running')")
+    s.query("INSERT INTO operations(id,principal_id,plan_id,request_id,state,created_at,lease_until) VALUES "
+            "('op-2','agent-a','plan-2','r-2','running',now()-interval '1 hour',now()+interval '2 minutes')")
     s.query("INSERT INTO operation_steps(operation_id,ordinal,state,intent) VALUES ('op-2',0,'sending',%s)",
             (Jsonb({"resource_ref": source_ref("res", "cal-a", "party"), "action": "update"}),))
     party = event("party", "2026-11-05T17:00:00Z", "2026-11-05T19:00:00Z")
@@ -367,7 +368,7 @@ def keys(*ids):
 
 
 # spec: ANYM-565
-def test_providers_use_the_sync_token_and_resume_a_resync_after_410():
+def test_providers_use_the_sync_token_and_resync_after_410():
     providers = Providers(None, None)
     providers.adapters["google-a"] = adapter = SyncAdapter()
     cal = {"provider": "google", "connection_id": "google-a", "target": "private-a", "ref": "cal-a"}
@@ -447,6 +448,9 @@ def test_google_adapter_sync_requests_no_time_bounds_with_a_token_and_reads_410(
     done = {"items": [{"id": "a", "status": "cancelled"}], "done": True, "sync_token": "t2", "page": None}
     assert incremental == done and initial == done and expired is None
     assert resumed == {"items": [], "done": True, "sync_token": "t2", "page": None}
+    assert all("timeMin" not in p and "timeMax" not in p for p in seen if "syncToken" in p)
+    assert seen[-1]["timeMin"] == "2026-11-02T00:00:00+00:00" and seen[-1]["pageToken"] == "p2"
+    assert "syncToken" not in seen[-1]
     # A step that reaches its page limit (or its deadline) returns its items and the page to resume from.
     monkeypatch.setattr(adapter_module, "SYNC_PAGES", 1)
 
@@ -456,8 +460,6 @@ def test_google_adapter_sync_requests_no_time_bounds_with_a_token_and_reads_410(
 
     assert asyncio.run(step()) == {"items": [{"id": "a", "status": "cancelled"}], "done": False, "sync_token": None,
                                    "page": "p2"}
-    assert all("timeMin" not in p and "timeMax" not in p for p in seen if "syncToken" in p)
-    assert seen[-1]["timeMin"] == "2026-11-02T00:00:00+00:00" and "syncToken" not in seen[-1]
     # Only the fields that name an item and its status: no title, place or description is read.
     assert all(p["fields"] == "items(id,status,recurringEventId,originalStartTime),nextPageToken,nextSyncToken"
                and p["showDeleted"] == "true" for p in seen)
