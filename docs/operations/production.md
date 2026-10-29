@@ -851,7 +851,7 @@ backup image and check it, then install the runner, both in the script below (`p
 newer runner can write a `worker.json` key an older worker refuses (BACKUP.md).
 
 ```sh
-sha=<prepared-sha>; src=/var/lib/deedkit-production/$sha/source; pin=yes   # pin=no: the worker did not change
+sha=<prepared-sha>; src=<state_directory>/$sha/source; pin=yes   # state_directory: /etc/deedkit/production.json; pin=no: the worker did not change
 sudo flock --nonblock /opt/personal-os-probe/backups/.runner.lock sh -euc '
   sha=$1 src=$2 pin=$3 ops=/opt/personal-os-probe/ops cfg=/opt/personal-os-probe/backup-config/runner.json
   new=$src/services/messaging/messaging_service/backup_runner.py
