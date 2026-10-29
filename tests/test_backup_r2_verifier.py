@@ -1059,7 +1059,8 @@ def fake_release(root,name,package=b'OLD_SYNTHETIC_CODE\n'):
     for directory in ('messaging_service','anymsg','anymsg-0.0.0.dist-info','boto3-1.43.114.dist-info','six-1.17.0.dist-info'):
         (packages/directory).mkdir(parents=True)
     (packages/'messaging_service'/'__init__.py').write_bytes(package)
-    for directory,(name_,version) in (('boto3-1.43.114.dist-info',('boto3','1.43.114')),('six-1.17.0.dist-info',('six','1.17.0'))):
+    for directory,(name_,version) in (('boto3-1.43.114.dist-info',('boto3','1.43.114')),('six-1.17.0.dist-info',('six','1.17.0')),
+                                      ('anymsg-0.0.0.dist-info',('anymsg','0.0.0'))):
         (packages/directory/'METADATA').write_text('Metadata-Version: 2.1\nName: '+name_+'\nVersion: '+version+'\n\nbody\n')
     (release/'pyvenv.cfg').write_text('home = /usr/bin\n');(release/'bin').mkdir();(release/'bin'/'python').write_text('')
     release.chmod(0o755)  # trusted only when not group-writable, whatever the runner's umask
@@ -1183,7 +1184,7 @@ def test_receiver_lock_reading_refuses_anything_but_hashed_pins(text):
 def test_release_dependencies_installed_twice_or_unreadable_refuse_the_release(tmp_path):
     from messaging_service import backup_r2_follow as f
     packages=fake_release(tmp_path,'r')/'lib'/'python3.13'/'site-packages'
-    assert f.installed(packages)=={'boto3':'1.43.114','six':'1.17.0'}
+    assert f.installed(packages)=={'anymsg':'0.0.0','boto3':'1.43.114','six':'1.17.0'}
     (packages/'Boto3-1.0.dist-info').mkdir();(packages/'Boto3-1.0.dist-info'/'METADATA').write_text('Name: Boto3\nVersion: 1.0\n')
     with pytest.raises(ValueError,match='verifier_dependencies_changed'):f.installed(packages)
     (packages/'Boto3-1.0.dist-info'/'METADATA').unlink()
