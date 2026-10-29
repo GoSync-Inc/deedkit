@@ -491,6 +491,8 @@ class Docker:
     """Small, argument-only Docker adapter. It never prints secret diagnostics."""
     def __init__(self,timeout=21600):
         self.ends=time.monotonic()+timeout;self.disk_roots=[];self.reserve_bytes=0
+        # The ranged GETs the last full stream needed (r2.verify_object); None until one completes.
+        self.stream_resumes=None
     def check_reserve(self):
         if any(shutil.disk_usage(path).free<self.reserve_bytes for path in self.disk_roots):
             raise ValueError('restore_disk_capacity')
@@ -574,6 +576,7 @@ class Docker:
                      '-i','--entrypoint','python',config['helper_image'],'-m','messaging_service.backup_restore_worker',
                      '--config','/run/restore/config.json')
     def restore(self,config,receiver,client,receipt,run,payload,secret_dir):
+        self.stream_resumes=None
         self.setup(config,run,payload,secret_dir);resource=names(run,r2.profile(config))
         helper=self.inspect_owned('helper',resource['helper'],run)
         validate_helper_layout(config,run,payload,secret_dir,helper)
@@ -588,7 +591,7 @@ class Docker:
                     engine.check_reserve();return process.stdin.write(data)
             # A helper that exits mid-stream breaks the pipe: stop streaming (never
             # retried), wait for it within the deadline and report its own failure.
-            try:r2.verify_object(receiver,client,receipt,Sink());broken=False
+            try:self.stream_resumes=r2.verify_object(receiver,client,receipt,Sink());broken=False
             except BrokenPipeError:broken=True
             try:process.stdin.close()
             except BrokenPipeError:broken=True
@@ -646,6 +649,24 @@ def helper_detail(value):
     if (isinstance(value,dict) and set(value)=={'v','detail'} and type(value['v']) is int and value['v']==1 and
             isinstance(value['detail'],str) and DETAIL_SHAPE.fullmatch(value['detail'])):return value['detail']
     return None
+
+
+# Docker's container states; anything else is recorded as `unknown`.
+HELPER_STATES={'created','running','paused','restarting','removing','exited','dead'}
+
+
+def helper_state(engine,journal,profile='messaging'):
+    """The journaled run's own helper container as Docker records it, read before cleanup stops it (ANYM-633):
+    its status, exit code and OOM kill, not the attach client's return code. None without a helper, an answer
+    or a valid journal."""
+    try:
+        run=journal['run'];value=engine.inspect_owned('helper',names(run,profile)['helper'],run)
+        state=value.get('State') if isinstance(value,dict) else None
+        if not isinstance(state,dict):return None
+        return {'status':state['Status'] if state.get('Status') in HELPER_STATES else 'unknown',
+                'exit_code':state['ExitCode'] if type(state.get('ExitCode')) is int else None,
+                'oom_killed':state.get('OOMKilled') is True}
+    except Exception:return None
 
 
 def cleanup_resources(engine,run,profile='messaging',data=None):
@@ -788,7 +809,12 @@ def verify_run(config,receiver,client,engine,journal,fd):
     return journal
 
 
+# This invocation's failure record, for main's journal line (ANYM-633); run() clears it first.
+FAILED=[]
+
+
 def run(config,*,client=None,engine=None,path=None):
+    FAILED.clear()
     if os.geteuid()!=0:raise ValueError('root_verifier_required')
     receiver=r2.load_config(config['receiver_config_file'])
     client=client if client is not None else r2.make_client(receiver)
@@ -866,6 +892,7 @@ def run(config,*,client=None,engine=None,path=None):
                                      expected_protected_sha256=journal['prior_sha256'],client=client)
                 journal={**journal,'phase':'promoted'};local.write_maintenance_json('active.json',journal,dir_fd=fd)
                 status={'v':1,'status':'verified','backup_id':journal['receipt']['wire']['id'],'verification_id':journal['run'],'verified_at':now()}
+                if type(resumes:=getattr(engine,'stream_resumes',None)) is int:status['stream_resumes']=resumes
                 local.write_maintenance_json('last-success.json',status,dir_fd=fd)
                 local.write_maintenance_json('status.json',status,dir_fd=fd)
                 os.unlink('active.json',dir_fd=fd);local.fsync_dir(fd)
@@ -878,7 +905,9 @@ def run(config,*,client=None,engine=None,path=None):
                 local.write_maintenance_json('status.json',status,dir_fd=fd);return status
             # Generic safe codes only; SDK errors, DSNs and stderr never enter
             # durable status. Keep journal/proof and the old protected recovery point.
-            cleanup_ok=True
+            cleanup_ok=True;resumes=getattr(engine,'stream_resumes',None)
+            # Its own short bound, so a slow answer never spends the cleanup's.
+            state=None if journal is None else helper_state(Docker(10) if isinstance(engine,Docker) else engine,journal,profile)
             if isinstance(engine,Docker):engine=Docker(120)
             # A refused admission created nothing and leaves its retry's resources to the next holder.
             if journal is not None and str(error) not in ('verifier_host_busy','verifier_cleanup_unconfirmed'):
@@ -892,6 +921,11 @@ def run(config,*,client=None,engine=None,path=None):
             failure={'v':1,'status':'failed','error':failure_code(error),'failed_at':now(),
                      'cleanup_complete':cleanup_ok,'diagnostic':describe(error)}
             if isinstance(error,HelperFailure) and error.detail:failure['detail']=error.detail
+            # Counts and Docker's fixed state words only (ANYM-633): the stream's ranged GETs and the helper's end.
+            if type(resumes) is int:failure['stream_resumes']=resumes
+            if state is not None:failure['helper_state']=state
+            # The journal line (main) carries them too: a later failure overwrites last-failure.json.
+            FAILED[:]=[failure]
             local.write_maintenance_json('status.json',failure,dir_fd=fd)
             # A later busy/idle/verified run overwrites status.json; keep the last failure's cause.
             try:local.write_maintenance_json('last-failure.json',failure,dir_fd=fd)
@@ -952,13 +986,19 @@ def main(argv=None):
         # Only the outcome: config paths and the image ID stay in the root-private records.
         print(json.dumps({k:result[k] for k in ('v','status','helper_revision')},separators=(',',':')));return 0
     if not args.config:parser.error('--config is required')
+    FAILED.clear()
     try:status=run(load_config(args.config),path=args.config)
     except Exception as error:
         if failure_code(error)=='verifier_busy':
             # Another invocation of this profile runs: it owns status.json, so this one writes nothing.
             print(json.dumps({'v':1,'status':'busy','code':'verifier_busy'},separators=(',',':')));return 0
-        print(json.dumps({'error':failure_code(error),'diagnostic':describe(error)},separators=(',',':')),file=sys.stderr);return 1
+        line={'error':failure_code(error),'diagnostic':describe(error)}
+        if FAILED:line.update({k:FAILED[0][k] for k in ('stream_resumes','helper_state') if k in FAILED[0]})
+        print(json.dumps(line,separators=(',',':')),file=sys.stderr);return 1
     if status['status']=='busy':print(json.dumps(status,separators=(',',':')))
+    # A verified run's resumes reach the journal too (ANYM-633): last-success.json keeps only the latest.
+    elif status['status']=='verified' and 'stream_resumes' in status:
+        print(json.dumps({k:status[k] for k in ('status','verification_id','stream_resumes')},separators=(',',':')))
     return 0
 
 

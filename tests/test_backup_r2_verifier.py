@@ -492,6 +492,14 @@ def test_stream_resume_refuses_a_range_of_the_wrong_length(monkeypatch):
         r2.verify_object({'bucket':'synthetic'},cloud,stream_receipt(data),io.BytesIO())
 
 
+# spec: ANYM-633
+@pytest.mark.parametrize('failures',[[],[7],[7,r2.MIB+3,2*r2.MIB]],ids=['clean','one-reset','three-resets'])
+def test_stream_reports_how_many_resumes_it_used(monkeypatch,failures):
+    data=r2.AGE_HEADER+os.urandom(3*r2.MIB)
+    monkeypatch.setattr(r2,'stream_pause',lambda attempt:None)
+    assert r2.verify_object({'bucket':'synthetic'},FlakyCloud(data,failures),stream_receipt(data),io.BytesIO())==len(failures)
+
+
 # spec: ANYM-285
 def test_first_run_survives_a_transient_cloud_reset_mid_stream(operator,monkeypatch):
     v,config,receiver,cloud,engine,_=operator
@@ -508,6 +516,50 @@ def test_first_run_survives_a_transient_cloud_reset_mid_stream(operator,monkeypa
     cloud.get_object=get_object
     result=v.run(config,client=cloud,engine=engine)
     assert broken and result['status']=='verified' and Path(config['protected_file']).exists()
+
+
+class FinishedHelper:
+    """Synthetic helper that reads the whole stream, leaves its result and exits 0."""
+    def __init__(self,payload,facts):
+        self.stdin=io.BytesIO()
+        path=payload/'result.json';path.write_bytes(r2.encoded(facts));path.chmod(0o600)
+    def poll(self):return 0
+    def wait(self,timeout):return 0
+
+
+# spec: ANYM-633
+def test_verified_status_records_how_many_stream_resumes_the_proof_needed(operator,monkeypatch,capsys):
+    v,config,receiver,cloud,_,_=operator
+    monkeypatch.setattr(r2,'stream_pause',lambda attempt:None)
+    directory=Path(config['directory']);docker=v.Docker(60)
+    monkeypatch.setattr(docker,'preflight',lambda config:str(directory))
+    monkeypatch.setattr(docker,'setup',lambda *a:None)
+    monkeypatch.setattr(docker,'inspect_owned',lambda *a:{})
+    monkeypatch.setattr(docker,'remove',lambda *a:None)
+    monkeypatch.setattr(v,'validate_helper_layout',lambda *a:None)
+    def popen(*args,**kwargs):
+        receipt=json.loads((directory/'active.json').read_text())['receipt']
+        return FinishedHelper(next(directory.glob('payload-*')),
+                              {'v':1,'status':'verified','schema_version':v.SCHEMAS[-1],'manifest_sha256':receipt['wire']['snapshot_sha256'],
+                               'checks':{k:True for k in r2.CHECKS}})
+    monkeypatch.setattr(v.subprocess,'Popen',popen)
+    original=cloud.get_object;broken=[]
+    def get_object(**kw):
+        response=original(**kw)
+        if '/objects/' not in kw['Key']:return response
+        start=int(kw['Range'].removeprefix('bytes=').split('-')[0]) if 'Range' in kw else 0
+        rest=response['Body'].read()[start:]
+        response={**response,'ContentLength':len(rest),'Body':io.BytesIO(rest)}
+        if len(broken)<2:broken.append(start);response['Body']=FlakyBody(rest,64)
+        return response
+    cloud.get_object=get_object
+    busy_main(v,config,cloud,docker,monkeypatch)
+    assert v.main(['--config','/synthetic'])==0 and broken==[0,64]
+    status=json.loads((directory/'status.json').read_text())
+    assert status['status']=='verified' and status['stream_resumes']==2
+    assert json.loads((directory/'last-success.json').read_text())==status
+    line=json.loads(capsys.readouterr().out)
+    assert line=={'status':'verified','verification_id':status['verification_id'],'stream_resumes':2}
 
 
 # spec: ANYM-285
@@ -658,6 +710,63 @@ def test_helper_exit_mid_stream_reports_its_failure_fact_not_a_generic_code(oper
     for name in ('status.json','last-failure.json'):assert json.loads((directory/name).read_text())['error']==code
     assert len(helpers)==1 and helpers[0].stdin.writes==1 and helpers[0].stdin.closed
     assert helpers[0].terminated==hangs and not Path(config['protected_file']).exists()
+
+
+# spec: ANYM-633
+@pytest.mark.parametrize('failure,state,expected',[
+    (RuntimeError('isolated_restore_failed'),{'Status':'exited','ExitCode':1,'OOMKilled':False},
+     {'status':'exited','exit_code':1,'oom_killed':False}),
+    (RuntimeError('isolated_restore_failed'),{'Status':'exited','ExitCode':137,'OOMKilled':True},
+     {'status':'exited','exit_code':137,'oom_killed':True}),
+    (RuntimeError('storage_unavailable'),{'Status':'running','ExitCode':0,'OOMKilled':False,'Error':'SECRET'},
+     {'status':'running','exit_code':0,'oom_killed':False}),
+    (RuntimeError('storage_unavailable'),{'Status':'SECRET','ExitCode':'1'},{'status':'unknown','exit_code':None,'oom_killed':False}),
+    (RuntimeError('storage_unavailable'),None,None)],ids=['helper-error','helper-oom','verifier-side','odd-answer','no-helper'])
+def test_failure_status_records_the_helper_containers_own_state_before_cleanup(operator,monkeypatch,capsys,failure,state,expected):
+    v,config,receiver,cloud,engine,_=operator
+    engine.failure=failure;original=engine.inspect_owned;seen=[]
+    def inspect_owned(kind,name,run):
+        value=original(kind,name,run)
+        if kind=='helper' and value is not None and state is not None:seen.append(run);return {**value,'State':state}
+        return value
+    engine.inspect_owned=inspect_owned
+    busy_main(v,config,cloud,engine,monkeypatch)
+    assert v.main(['--config','/synthetic'])==1 and not engine.resources
+    directory=Path(config['directory']);err=capsys.readouterr().err;line=json.loads(err)
+    for name in ('status.json','last-failure.json'):
+        status=json.loads((directory/name).read_text())
+        assert status['error']==str(failure) and status.get('helper_state')==expected
+    assert line.get('helper_state')==expected and line['error']==str(failure) and 'SECRET' not in err
+    assert 'SECRET' not in (directory/'status.json').read_text() and bool(seen)==(state is not None)
+
+
+# spec: ANYM-633
+def test_a_malformed_journal_still_records_its_failure_with_no_helper_state(operator):
+    v,config,receiver,cloud,engine,write_json=operator
+    directory=Path(config['directory']);write_json(directory/'active.json',{'v':1,'phase':'restoring'})
+    with pytest.raises(ValueError,match='invalid_verifier_journal'):v.run(config,client=cloud,engine=engine)
+    for name in ('status.json','last-failure.json'):
+        status=json.loads((directory/name).read_text())
+        assert status['error']=='invalid_verifier_journal' and 'helper_state' not in status
+
+
+# spec: ANYM-633
+def test_the_journal_line_keeps_the_helper_state_of_an_exception_that_refuses_attributes(operator,monkeypatch,capsys):
+    v,config,receiver,cloud,engine,_=operator
+    class Sealed(RuntimeError):
+        # Python's own links (__context__, __traceback__) still set; any other attribute is refused.
+        def __setattr__(self,name,value):
+            if not name.startswith('__'):raise AttributeError(name)
+            super().__setattr__(name,value)
+    engine.failure=Sealed('storage_unavailable');original=engine.inspect_owned
+    def inspect_owned(kind,name,run):
+        value=original(kind,name,run)
+        return {**value,'State':{'Status':'running','ExitCode':0,'OOMKilled':False}} if kind=='helper' and value is not None else value
+    engine.inspect_owned=inspect_owned
+    busy_main(v,config,cloud,engine,monkeypatch)
+    assert v.main(['--config','/synthetic'])==1
+    line=json.loads(capsys.readouterr().err)
+    assert line['error']=='storage_unavailable' and line['helper_state']=={'status':'running','exit_code':0,'oom_killed':False}
 
 
 HEAD='d'*40;NEW_IMAGE='sha256:'+'c'*64
