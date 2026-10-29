@@ -654,7 +654,12 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
             if row['awaiting_reply'] and state['suggested_action']=='unclear':
                 row['awaiting_reply_confidence']=state['basis']['code']
         if waits:
-            owner_waits.finish(row,state if view=='conversation' else conversation_state(c,p,row['account'],row['id'],titles=titles),receipts)
+            outcome=owner_waits.finish(row,state if view=='conversation' else conversation_state(c,p,row['account'],row['id'],titles=titles),receipts)
+            if outcome:
+                # Changed since the page query: left out, counted as the head now reads (ANYM-537).
+                waits['totals']['listed']-=1;waits['totals']['uncertain']+=outcome=='uncertain';row['_wait_dropped']=True
+    if waits:
+        items=[row for row in items if not row.get('_wait_dropped')];private=[row for row in items if row['type']=='private']
     # The queue hint names its sender like a message; the raw ID stays in awaiting_reply_sender.
     from .sender_names import raw_name,resolve
     resolve(c,p,items,chat='id',sender='awaiting_reply_sender',name='awaiting_reply_sender_name',

@@ -353,3 +353,41 @@ def test_the_gateway_catalog_declares_the_queue_without_defaults():
     snapshot=next(t for t in contracts['tools'] if t['name']=='list_chats')
     assert snapshot['description']==tool['description']
     assert {'awaiting_their_reply','min_wait_hours'}<=set(snapshot['inputSchema']['properties'])
+
+
+# spec: ANYM-537
+def test_a_pair_head_tie_or_unclassified_head_in_either_chat_is_uncertain(waits):
+    s,ar,key,now,add,listed,rows=waits
+    for n in (30,31,32):
+        pair(s,'wait-wa',f'9{n}0@lid',f'7{n}0@c.us',add(f'9{n}0@lid','L1',100,'incoming','Hello',account='wait-wa'))
+    # Two outgoing messages in one second, one in each chat of the pair.
+    add('7300@c.us','true_7300@c.us_A',30,body=QUESTION,account='wait-wa')
+    add('9300@lid','true_9300@lid_B',30,body='And the keys?',account='wait-wa')
+    # The owner's message on the phone side and the peer's on the LID side in one second.
+    add('7310@c.us','true_7310@c.us_A',30,body=QUESTION,account='wait-wa')
+    add('9310@lid','L2',30,'incoming','Sure',account='wait-wa')
+    # A newer message of unknown kind and no text on the LID side.
+    add('7320@c.us','true_7320@c.us_A',30,body=QUESTION,account='wait-wa')
+    add('9320@lid','L2',20,'incoming','',account='wait-wa',message_kind='unknown')
+    page=listed()
+    assert page['items']==[] and page['uncertain_total']==3,page
+
+
+# spec: ANYM-537
+@pytest.mark.parametrize('change,uncertain',[('message_revision_changed_during_read',1),('peer_wrote',0)])
+def test_a_head_that_changes_during_the_read_leaves_the_row_out(waits,monkeypatch,change,uncertain):
+    import messaging_service.chat_queries as chat_queries
+    s,ar,key,now,add,listed,rows=waits
+    add('changed','1',30,body=QUESTION);add('kept','1',29,body=QUESTION)
+    real=chat_queries.conversation_state
+    def raced(c,p,account,chat,**kwargs):
+        state=real(c,p,account,chat,**kwargs)
+        if c.execute('SELECT provider_chat FROM chats WHERE id=%s',(chat,)).fetchone()['provider_chat']=='changed':
+            if change=='peer_wrote':state.update(last_turn='peer',suggested_action='review_incoming')
+            else:state.update(last_turn='unknown',suggested_action='unclear',basis={**state['basis'],'code':change})
+        return state
+    monkeypatch.setattr(chat_queries,'conversation_state',raced)
+    for view in ('archive','conversation'):
+        page=listed(view=view)
+        assert [r['provider_chat_id'] for r in page['items']]==['kept'],view
+        assert page['awaiting_their_reply_total']==1 and page['uncertain_total']==uncertain

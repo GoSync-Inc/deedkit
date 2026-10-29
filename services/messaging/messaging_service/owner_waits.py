@@ -51,8 +51,20 @@ def paired(sql, aliases, order):
     return f'SELECT * FROM (({sql}) UNION ALL ({other})) pair ORDER BY {order} LIMIT 1'
 
 
+def chats(aliases, alias='m'):
+    """Both chats of a WhatsApp phone/LID conversation (ANYM-278), else the listed chat."""
+    return f"{alias}.chat IN (c.id,score_clock.aliases->>c.id)" if aliases else f'{alias}.chat=c.id'
+
+
+def floor(alias='m'):
+    # An index bound for the run lookups; after_peer keeps the exact same-second rule.
+    return f"{alias}.sent_at>=coalesce(wp.sent_at,'-infinity'::timestamptz)"
+
+
 def laterals(c, aliases):
-    """Joins over chats c, accounts a and score_clock(owners, aliases): head wh, its tie wt, peer wp, run start ws."""
+    """Joins over chats c, accounts a and score_clock(owners, aliases): head wh, its tie wt, peer wp, run start ws.
+
+    A pair's head, tie, peer and run read both chats: the newest message of the pair decides."""
     from .chat_queries import latest_sql
     from .conflict_classes import class_sql,known_classes
     meaningful=meaningful_sql()
@@ -64,19 +76,20 @@ def laterals(c, aliases):
     tie=f'''SELECT count(*) AS n,bool_and(t.meaningful) AS all_meaningful,bool_and(t.provider_id ~ '^[0-9]{{1,18}}$') AS numeric_ids
         FROM (SELECT m.provider_id,({meaningful}) AS meaningful FROM messages m
           LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision
-          WHERE m.account=c.account AND m.chat=c.id AND NOT m.deleted AND {visible_sql()} AND m.sent_at=wh.sent_at LIMIT 65) t'''
+          WHERE m.account=c.account AND {chats(aliases)} AND NOT m.deleted AND {visible_sql()} AND m.sent_at=wh.sent_at LIMIT 65) t'''
     peer=f'''SELECT m.sent_at,m.id,m.sender,{number('m')} AS numeric_id,
         coalesce(md.metadata->'sender_is_bot'='true'::jsonb,false) AS bot FROM messages m
         LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision
         WHERE m.account=c.account AND m.chat=c.id AND m.direction='incoming' AND {meaningful} AND wh.direction='outgoing' '''
     start=f'''SELECT m.sent_at,{number('m')} AS numeric_id,m.id FROM messages m
         LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision
-        WHERE m.account=c.account AND m.chat=c.id AND m.direction='outgoing' AND {meaningful} AND {after_peer()}
+        WHERE m.account=c.account AND m.chat=c.id AND m.direction='outgoing' AND {meaningful} AND {floor()} AND {after_peer()}
           AND wh.direction='outgoing' ORDER BY m.sent_at,{number('m')},m.id LIMIT 1'''
     known=','.join("'"+name+"'" for name in known_classes())
-    return f''' LEFT JOIN LATERAL ({latest_sql(observed,both_directions=True)}) wh ON true
+    newest='sent_at DESC,numeric_id DESC,id DESC'
+    return f''' LEFT JOIN LATERAL ({paired(latest_sql(observed,both_directions=True),aliases,newest)}) wh ON true
       LEFT JOIN LATERAL ({tie}) wt ON true
-      LEFT JOIN LATERAL ({paired(latest_sql(peer),aliases,'sent_at DESC,numeric_id DESC,id DESC')}) wp ON true
+      LEFT JOIN LATERAL ({paired(latest_sql(peer),aliases,newest)}) wp ON true
       LEFT JOIN LATERAL ({paired(start,aliases,'sent_at,numeric_id,id')}) ws ON true
       CROSS JOIN LATERAL (SELECT CASE WHEN wh.id IS NULL THEN NULL
           WHEN wt.n>64 THEN 'head_candidates_truncated'
@@ -95,9 +108,9 @@ def after_peer(alias='m'):
 
 def run_has(condition, aliases):
     """Any message of the run meets `condition` (meaningful outgoing after the peer, in either chat of a pair)."""
-    chats="m.chat IN (c.id,score_clock.aliases->>c.id)" if aliases else 'm.chat=c.id'
     return f'''EXISTS(SELECT 1 FROM messages m LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision
-        WHERE m.account=c.account AND {chats} AND m.direction='outgoing' AND {meaningful_sql()} AND {after_peer()}
+        WHERE m.account=c.account AND {chats(aliases)} AND m.direction='outgoing' AND {meaningful_sql()} AND {floor()}
+          AND {after_peer()}
           AND {condition})'''
 
 
@@ -110,7 +123,7 @@ def conditions(*, aliases, min_wait_hours, days, principal, mutes):
         AND NOT coalesce(wh.is_self_chat,false) AND NOT {self_chat_sql()} AND NOT coalesce(wp.bot,false)
         AND NOT coalesce((score_clock.owners->(a.platform||'|'||{peer_id}))-c.account<>'[]'::jsonb,false)"""+(
         # One indexed probe skips chats without a recent owner message before the run lookups.
-        f''' AND EXISTS(SELECT 1 FROM messages recent WHERE recent.account=c.account AND recent.chat=c.id
+        f''' AND EXISTS(SELECT 1 FROM messages recent WHERE recent.account=c.account AND {chats(aliases,'recent')}
           AND recent.direction='outgoing' AND NOT recent.deleted
           AND recent.sent_at>=CURRENT_TIMESTAMP-interval '{days} days' OFFSET 0)''' if days else ''))
     courtesy=(f"length(btrim(m.body)) BETWEEN 1 AND 40 AND position('?' in m.body)=0 AND position('？' in m.body)=0"
@@ -134,21 +147,28 @@ def run_count(c, row, aliases):
     return c.execute(f'''SELECT count(*) AS n FROM messages m
         LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision
         WHERE m.account=%s AND m.chat=ANY(%s) AND m.direction='outgoing' AND {meaningful_sql()}
-          AND (%s::timestamptz IS NULL OR m.sent_at>%s::timestamptz OR
+          AND m.sent_at>=coalesce(%s::timestamptz,'-infinity'::timestamptz) AND (%s::timestamptz IS NULL OR m.sent_at>%s::timestamptz OR
             (%s='telegram' AND m.sent_at=%s::timestamptz AND {number('m')}>%s::bigint))''',
         (row['account'],[row['id'],*([aliases[row['id']]] if row['id'] in aliases else [])],row['_wait_peer_at'],
-         row['_wait_peer_at'],row['_platform'],row['_wait_peer_at'],row['_wait_peer_numeric'])).fetchone()['n']
+         row['_wait_peer_at'],row['_wait_peer_at'],row['_platform'],row['_wait_peer_at'],row['_wait_peer_numeric'])).fetchone()['n']
 
 
 def finish(row, state, receipts):
-    """The row's `waiting` from the run facts the page query carried; the head's state gives an unverified head's code."""
+    """The row's `waiting` from the run facts the page query carried; the head's state gives an unverified head's code.
+
+    The state is read after the page: a chat whose head changed meanwhile (the peer wrote, a revision changed during
+    the read) is no longer the owner's turn. Returns None for a kept row, else 'uncertain' or 'answered' (the caller
+    drops it and corrects the totals)."""
     from .presentation import waiting_summary
+    if state['last_turn']!='owner':
+        return 'uncertain' if state['basis']['code'] in UNCERTAIN else 'answered'
     last=row.pop('_wait_last_id')
     facts={'since':row.pop('_wait_since'),'count':row.pop('_wait_count'),'receipt':(receipts.get(last) or {}).get('state'),
         'last_message_id':last,'last_at':row.pop('_wait_last_at'),'muted':row.pop('_wait_muted')}
     if state['suggested_action']=='unclear':facts['confidence']=state['basis']['code']
     for key in ('_wait_peer_at','_wait_peer_numeric'):row.pop(key)
     row['waiting']=waiting_summary(facts,row.get('last_message_id'))
+    return None
 
 
 def summary(store, c, p, waits, accounts, min_wait_hours, only_questions):
