@@ -561,7 +561,9 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
    migration file is `expand` by the candidate's `unattended_class` (no DROP of any kind), every
    changed role file is `additive` by `role_class` (the classes of M1, "Unattended migrations"
    below; the release kit records each file's class) and it has no data-deleting step (item 2).
-   This holds for messaging and calendar, by hand or unattended. Any other release (a contract:
+   This holds for messaging and calendar, by hand or unattended. A database with no scheduled
+   daily backup running (calendar while its timer is off, ANYM-607) keeps a restore point anyway:
+   unattended, its pre-migration copy (Database copies); by hand, `copy-database` first. Any other release (a contract:
    drop, rename, narrow, the CHECK widening pair, a revoke, a data-deleting step or a file of
    another class) needs the backup gate above: a fresh backup and its restore proof, never a
    reused daily backup.
