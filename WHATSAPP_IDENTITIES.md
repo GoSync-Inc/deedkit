@@ -81,7 +81,10 @@ the account, deleted sources included, links either side to another; then, and
 for a re-read with an empty (unknown) sender, the retained sender stands for the
 comparison and in any later revision, the receipt keeps the raw value, the other
 form gets no sender profile, and at the retained provider version only the sender
-difference is lifted. Two LID forms are never a pair. `whatsapp_identity.record`
+difference is lifted. The re-read's own identity observations count too: one that
+links either side to another identity keeps the conflict and is stored against the
+message as a fence (not as a visible link, since the message keeps the retained
+sender). Two LID forms are never a pair. `whatsapp_identity.record`
 takes the account's archive lock before it writes, so a new mapping commits
 before or after an ingest's check, never in between.
 

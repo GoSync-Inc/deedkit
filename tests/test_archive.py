@@ -878,10 +878,14 @@ LID='310000000001@lid'
 
 
 def observe(s,source,pn=PN,lid=LID,account='archive-wa',provenance='whatsmeow_lid_store_v1'):
+    # As whatsapp_identity.record stores it: the observed identity is the source message's sender.
+    from messaging_service.whatsapp_identity import personal_id
     with s.pool.connection() as c:
+        sender=c.execute('SELECT sender FROM messages WHERE id=%s',(source,)).fetchone()['sender']
+        assert personal_id(sender) in (pn,lid)
         c.execute('''INSERT INTO whatsapp_identity_observations(account,source_message,identity_id,pn,lid,provenance,
             first_observed_at,observed_at) VALUES(%s,%s,%s,%s,%s,%s,'2026-10-01T11:00:00Z','2026-10-01T11:00:00Z')''',
-            (account,source,lid,pn,lid,provenance))
+            (account,source,sender,pn,lid,provenance))
 
 
 def alias_event(sender,**changes):
@@ -914,16 +918,17 @@ def test_whatsapp_sender_alias_needs_admissible_evidence(archive,evidence):
     mid=ar.ingest(alias_event(PN))['message']
     if evidence=='lid_only':
         # Two LID forms are no phone-number/LID pair (class F, ANYM-561).
-        observe(s,mid)
-        lid_mid=ar.ingest(alias_event(LID,provider_id='true_900@lid_3EB0LIDONLY'))['message']
-        assert ar.ingest(alias_event('310000000002@lid',provider_id='true_900@lid_3EB0LIDONLY'))['outcome']=='conflict'
+        lid_mid=ar.ingest(alias_event(LID,provider_id='true_900@lid_3EB0LIDONLY',direction='outgoing'))['message']
+        observe(s,lid_mid)
+        assert ar.ingest(alias_event('310000000002@lid',provider_id='true_900@lid_3EB0LIDONLY',direction='outgoing'))['outcome']=='conflict'
         assert sender_rows(s,lid_mid)==(LID,1,[],1)
         return
     if evidence=='other_account':
         observe(s,ar.ingest(alias_event(PN,account='archive-wb'))['message'],account='archive-wb')
     elif evidence!='none':observe(s,mid)
     if evidence=='two_lids':observe(s,mid,lid='310000000002@lid')
-    if evidence=='two_pns':observe(s,mid,pn='79990000002@c.us')
+    if evidence=='two_pns':
+        observe(s,ar.ingest(alias_event(LID,provider_id='true_900@lid_3EB0TWOPN'))['message'],pn='79990000002@c.us')
     if evidence=='deleted_source_conflict':
         # A conflicting mapping whose source message was deleted still fences the pair.
         gone=ar.ingest(alias_event(PN,provider_id='true_900@lid_3EB0GONE'))['message']
@@ -1024,3 +1029,54 @@ def test_identity_record_waits_for_the_account_lock(archive):
     assert done.is_set()
     with s.pool.connection() as c:
         assert c.execute('SELECT count(*) AS n FROM whatsapp_identity_observations WHERE source_message=%s',(mid,)).fetchone()['n']==1
+
+
+# spec: ANYM-559
+def test_whatsapp_alias_capture_with_a_contradicting_observation_stays_a_conflict_and_fences(archive):
+    from messaging_service.whatsapp_collector import WhatsAppState
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    state=WhatsAppState(ar,'archive-wa',('fixture',ar.acquire('archive-wa','fixture')))
+    def message(sender,pn,**changes):
+        return {'kind':'message','peer_kind':'user','envelope':alias_event(sender,**changes),
+            'identity_observations':[{'identity_id':sender,'pn':pn,'lid':LID,'provenance':'whatsmeow_message_alt_v1',
+                'observed_at':'2026-10-01T11:00:00Z'}]}
+    mid=state.apply(message(PN,PN))['message']
+    assert state.apply(message(LID,PN,origin='reconcile'))['outcome']=='unchanged'
+    # An edit in the LID form whose own observation links the LID to another phone number: the
+    # capture's evidence decides with the recorded one, and its contradiction is kept as a fence.
+    edit=message(LID,'79990000002@c.us',body='Вторая версия',formatting=wire('Вторая версия'),
+        updated_at='2026-10-01T12:01:00+00:00')
+    assert state.apply(edit)['outcome']=='conflict'
+    assert state.apply(edit)['outcome']=='duplicate'
+    with s.pool.connection() as c:
+        fence=c.execute("SELECT source_message,identity_id FROM whatsapp_identity_observations WHERE pn='79990000002@c.us'").fetchall()
+    assert [(r['source_message'],r['identity_id']) for r in fence]==[(mid,LID)]
+    assert sender_rows(s,mid)[:2]==(PN,1)
+    # Every later re-read in the other form now stays a conflict, also with consistent evidence.
+    assert state.apply(message(LID,PN,origin='backfill'))['outcome']=='conflict'
+
+
+# spec: ANYM-559
+def test_whatsapp_sender_alias_lookup_is_bounded_by_index_ranges(archive):
+    import json
+    from messaging_service.whatsapp_identity import SAME_SENDER_SQL,PROVENANCES,same_sender
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    sources=[ar.ingest(alias_event(PN,provider_id=f'true_900@lid_3EB0{n:04d}'))['message'] for n in range(120)]
+    for source in sources:observe(s,source)
+    with s.pool.connection() as c:
+        # Many repeats of one pair are linked and not fenced.
+        assert same_sender(c,'archive-wa',sources[0],PN,LID)
+        c.execute('SET LOCAL enable_seqscan=off');c.execute('SET LOCAL enable_bitmapscan=off')
+        plan=c.execute('EXPLAIN (ANALYZE, FORMAT JSON) '+SAME_SENDER_SQL,{'account':'archive-wa','pn':PN,'lid':LID,
+            'provenances':sorted(PROVENANCES)}).fetchone()
+        nodes=[];pending=[(plan.get('QUERY PLAN') or next(iter(plan.values())))[0]['Plan']]
+        while pending:
+            node=pending.pop();nodes.append(node);pending.extend(node.get('Plans',[]))
+        scans=[n for n in nodes if n.get('Relation Name')=='whatsapp_identity_observations']
+        # Each probe reads at most its first row; none filters through the pair's repeats.
+        assert len(scans)==5 and all(n['Actual Rows']<=1 and n.get('Rows Removed by Filter',0)==0 for n in scans),json.dumps(scans)
+    observe(s,sources[1],lid='310000000002@lid')
+    with s.pool.connection() as c:
+        assert not same_sender(c,'archive-wa',sources[0],PN,LID)

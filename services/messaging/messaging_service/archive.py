@@ -151,7 +151,7 @@ class Archive:
             AND expires_at>clock_timestamp() FOR UPDATE''',(account,owner,epoch)).fetchone()
         if not row: raise RuntimeError('collector_lease_lost')
 
-    def ingest(self,raw,*,lease=None):
+    def ingest(self,raw,*,lease=None,identity_observations=()):
         e=validate(raw); captured=e; receipt=hashlib.sha256(canonical(e)).hexdigest()
         aid=e['account']; cid=stable_id('chat',aid,e['chat']); mid=stable_id('msg',aid,e['chat'],e['provider_id'])
         with self.store.pool.connection() as c:
@@ -206,7 +206,7 @@ class Archive:
                 and not old['deleted'] and old['sent_at']==datetime.fromisoformat(e['sent_at']))
             if sender_alias and e['sender']:
                 from .whatsapp_identity import same_sender
-                sender_alias=same_sender(c,aid,old['sender'],e['sender'])
+                sender_alias=same_sender(c,aid,mid,old['sender'],e['sender'],identity_observations)
             if sender_alias:e={**e,'sender':old['sender']}
             content=fingerprint(e); updated=datetime.fromisoformat(e['updated_at']); outcome='created'
             old_format=None;retained=None;retained_snapshot=None
