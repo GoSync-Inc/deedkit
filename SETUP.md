@@ -210,6 +210,19 @@ default. Only a stated flag is captured. Set it on the Telegram and WhatsApp
 collector services once the release a rollback would return to accepts the field:
 an older server rejects the capture and the collector skips that message.
 
+### Telegram link preview page ID
+
+The Telegram collector records a link preview's Telegram page ID
+(`metadata.web_preview_id`, the unsigned decimal form) only when its environment
+sets `ANYMSG_CAPTURE_WEB_PREVIEW_ID=1`; it is off by default. Telegram re-crawls a
+preview without an edit, so the same message can arrive again with another preview
+photo or document at the same provider time. With the same page ID on both sides
+and nothing else changed, the archive keeps the stored revision and records no
+version conflict; without the ID on both sides it records a conflict, as before.
+Set it on the Telegram collector service once the release a rollback would return
+to accepts the field: an older server rejects the capture and the collector skips
+that message.
+
 ### Reply queue upgrade (0.9.17)
 
 Apply migration 027 as owner and reapply `gateway_role.sql` and

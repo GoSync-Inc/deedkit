@@ -80,6 +80,20 @@ def provider_flags_capture():
     return os.environ.get('ANYMSG_CAPTURE_PROVIDER_FLAGS')=='1'
 
 
+def web_preview_capture():
+    # Off until the release a rollback would return to accepts web_preview_id (ANYM-611).
+    return os.environ.get('ANYMSG_CAPTURE_WEB_PREVIEW_ID')=='1'
+
+
+def telegram_web_preview_id(media):
+    """A link preview's Telegram page ID: Telegram re-crawls a preview under it (updateWebPage)."""
+    from telethon import types
+    page=getattr(media,'webpage',None) if isinstance(media,types.MessageMediaWebPage) else None
+    if not isinstance(page,(types.WebPage,types.WebPagePending,types.WebPageEmpty)) or type(page.id) is not int:return None
+    # A signed 64-bit ID in its unsigned decimal form: at most 20 digits, one string per ID.
+    return str(page.id%2**64)
+
+
 def contact_card_capture():
     # On unless ANYMSG_CAPTURE_CONTACT_CARDS=0, the kill switch (ANYM-529).
     return os.environ.get('ANYMSG_CAPTURE_CONTACT_CARDS')!='0'
@@ -204,6 +218,7 @@ def telegram_message(account,message,*,chat_title='',origin='live',verified_self
     forward=telegram_forward_origin(message) if forwarded and forward_origin_capture() else None
     shared=getattr(message,'media',None)
     contact=telegram_contact(shared) if isinstance(shared,types.MessageMediaContact) and contact_card_capture() else None
+    preview_id=telegram_web_preview_id(shared) if web_preview_capture() else None
     return validate({'account':account,'platform':'telegram','chat':str(message.chat_id),
         'chat_title':(chat_title if chat_title and chat_title!=str(message.chat_id) else observed_title) or str(message.chat_id),
         'provider_id':str(message.id),
@@ -227,6 +242,7 @@ def telegram_message(account,message,*,chat_title='',origin='live',verified_self
             'forwarded':forwarded,
             **({'forward_origin':forward} if forward else {}),
             **({'contact':contact} if contact else {}),
+            **({'web_preview_id':preview_id} if preview_id else {}),
             # Only a stated flag is captured; an absent one is unknown, never "not verified".
             **({'sender_is_business_or_verified':True} if provider_flags_capture() and isinstance(entity,types.User)
                 and (getattr(entity,'verified',None) is True or getattr(entity,'support',None) is True) else {}),

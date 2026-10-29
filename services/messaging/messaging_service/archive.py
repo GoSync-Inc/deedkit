@@ -88,6 +88,26 @@ def whatsapp_body_completion(retained,candidate):
         return False
 
 
+def telegram_web_preview_refresh(retained,candidate):
+    """True when a Telegram link preview differs from the retained revision only by its attachments, both
+    sides naming the same preview page ID: Telegram re-crawled the page (updateWebPage, no edit). Same
+    identity, text, formatting and provider time, neither deleted. `retained` is the revision snapshot,
+    `candidate` a validated envelope. Pure, so the conflict re-evaluation can call it; evidence it cannot
+    read is no refresh, never an exception inside ingest."""
+    try:
+        if candidate['platform']!='telegram' or retained['platform']!='telegram' or retained['deleted'] or candidate['deleted']:
+            return False
+        pages=[side.get('metadata',{}) for side in (retained,candidate)]
+        if any(page.get('provider_message_type')!='webpage' for page in pages):return False
+        if pages[0].get('web_preview_id') is None or pages[0].get('web_preview_id')!=pages[1].get('web_preview_id'):return False
+        if datetime.fromisoformat(candidate['updated_at'])!=datetime.fromisoformat(retained['updated_at']):return False
+        if candidate.get('formatting')!=retained.get('formatting') or candidate['media']==retained['media']:return False
+        envelope={**{k:v for k,v in retained.items() if k not in REVISION_FIELDS},'chat':retained['provider_chat']}
+        return fingerprint({**candidate,'media':retained['media']})==fingerprint(envelope)
+    except (KeyError,TypeError,ValueError,AttributeError):
+        return False
+
+
 class Archive:
     def __init__(self,store):
         self.store=store; self._media_sweeps={}; self._media_sweep_lock=threading.Lock()
@@ -274,6 +294,12 @@ class Archive:
             body_completed=bool(old and retained_snapshot and whatsapp_body_completion(retained_snapshot,e)
                 and not old['body'] and old['provider_updated_at']==updated
                 and fingerprint({**e,'body':''})==old['content_hash'])
+            # Telegram's re-crawl of the same link preview page at the retained provider version changes
+            # only the attachment: the retained revision, its metadata, media and attachments stay, and it
+            # is no later evidence for an open conflict (ANYM-611).
+            web_preview_refresh=bool(old and retained_snapshot and telegram_web_preview_refresh(retained_snapshot,e)
+                and not old['deleted'] and old['provider_updated_at']==updated
+                and fingerprint({**e,'media':retained_snapshot['media']})==old['content_hash'])
             if old:
                 if old['deleted'] and not e['deleted']: outcome='tombstoned'
                 elif sender_completed:outcome='edited'
@@ -281,6 +307,7 @@ class Archive:
                 elif unreadable:outcome='unchanged'
                 elif sent_at_jitter:outcome='stale' if old['provider_updated_at'] and updated<old['provider_updated_at'] else 'unchanged'
                 elif body_completed:outcome='edited'
+                elif web_preview_refresh:outcome='unchanged'
                 elif (old['sent_at']!=datetime.fromisoformat(e['sent_at']) or old['direction']!=e['direction']
                       or old['sender']!=e['sender']): outcome='conflict'
                 elif old['content_hash']==content and not (formatting_changed or formatting_completed): outcome='unchanged'
@@ -336,7 +363,8 @@ class Archive:
                         WHERE excluded.source_sent_at>=sender_profiles.source_sent_at''',
                         (stable_id('person',aid,cid,e['sender']),aid,cid,e['sender'],
                          profile.get('display_name',''),profile.get('username',''),mid,e['sent_at']))
-            if outcome in ('created','edited','unchanged') and not e['deleted'] and e.get('metadata') and not unreadable:
+            if (outcome in ('created','edited','unchanged') and not e['deleted'] and e.get('metadata') and not unreadable
+                    and not web_preview_refresh):
                 # Observations do not rewrite immutable revisions or create content conflicts.
                 c.execute('''INSERT INTO message_metadata(message,revision,metadata) SELECT id,revision,%s
                     FROM messages WHERE id=%s AND (provider_updated_at IS NULL OR provider_updated_at<=%s)
@@ -380,7 +408,7 @@ class Archive:
                     candidate_updated_at,observed_at) VALUES(%s,%s,%s,%s,clock_timestamp())''',
                     (receipt,mid,old['revision'],updated))
             elif (outcome in ('edited','deleted','unchanged') and not sender_device_only and not unreadable and not jitter_version
-                    and not body_completed and not (sender_alias and outcome=='unchanged')):
+                    and not body_completed and not web_preview_refresh and not (sender_alias and outcome=='unchanged')):
                 # A repeated copy of the retained revision does not resolve an
                 # equal/newer conflicting observation. Only later evidence does.
                 c.execute('''UPDATE message_conflicts mc SET resolved_at=clock_timestamp(),

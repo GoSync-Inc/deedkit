@@ -798,6 +798,82 @@ def group_formatting(entities=None,body='Первый текст lighthouse'):
         'unsupported_entities':[],'warnings':[]}
 
 
+PREVIEW_PHOTO=[{'provider_id':'300','mime':'image/jpeg','bytes':4,'filename':'17.jpg'}]
+PREVIEW_DOCUMENT=[{'provider_id':'200','mime':'application/pdf','bytes':1234,'filename':'document.pdf'}]
+
+
+def preview(page='20',kind='webpage',**changes):
+    """A Telegram message with a link preview, its photo or document stored as the message's media."""
+    metadata={'message_kind':'photo','provider_message_type':kind,'chat_type':'private',
+        **({'web_preview_id':page} if page is not None else {})}
+    return event(**{'media':PREVIEW_PHOTO,'formatting':group_formatting([]),'metadata':metadata,**changes})
+
+
+# spec: ANYM-611
+@pytest.mark.parametrize('retained_media,candidate_media',[(PREVIEW_PHOTO,PREVIEW_DOCUMENT),([],PREVIEW_PHOTO),(PREVIEW_PHOTO,[])],
+    ids=['another_attachment','attachment_added','attachment_dropped'])
+def test_refreshed_telegram_link_preview_of_the_same_page_is_unchanged(archive,retained_media,candidate_media):
+    ar,s,_,_=archive
+    mid=ar.ingest(preview(media=retained_media))['message']
+    before=archive_state(s,mid)
+    candidate=preview(media=candidate_media,origin='reconcile',
+        metadata={'message_kind':'document','provider_message_type':'webpage','chat_type':'private','web_preview_id':'20'})
+    assert ar.ingest(candidate)['outcome']=='unchanged'
+    # The retained revision, its metadata, media and attachments stay; no revision, no event, no conflict.
+    assert archive_state(s,mid)==before and before[1][0]['media']==retained_media
+    assert message_events(s,mid)==[('message.created',1)] and open_conflicts(s,mid)==[]
+    assert ar.ingest(candidate)['outcome']=='duplicate'
+
+
+# spec: ANYM-611
+@pytest.mark.parametrize('retained,candidate,outcome',[
+    ({},{'page':'21'},'conflict'),
+    ({},{'page':None},'conflict'),
+    ({'page':None},{},'conflict'),
+    ({},{'kind':'photo'},'conflict'),
+    ({'kind':'photo'},{},'conflict'),
+    ({},{'sent_at':'2026-10-01T11:59:59+00:00'},'conflict'),
+    ({},{'direction':'outgoing'},'conflict'),
+    ({},{'sender':'43'},'conflict'),
+    ({},{'body':'Другой текст','formatting':group_formatting([],'Другой текст')},'conflict'),
+    ({},{'formatting':group_formatting()},'conflict'),
+    ({},{'updated_at':'2026-10-01T12:01:00+00:00'},'edited'),
+    ({'updated_at':'2026-10-01T12:01:00+00:00'},{},'stale'),
+    ({},{'deleted':True,'body':'','media':[],'formatting':group_formatting([],'')},'deleted')],
+    ids=['another_page','candidate_without_page','retained_without_page','candidate_not_webpage','retained_not_webpage',
+        'sent_at','direction','sender','body','formatting','newer_version','older_version','deleted'])
+def test_link_preview_refresh_needs_the_same_page_and_nothing_else_changed(archive,retained,candidate,outcome):
+    ar,s,_,_=archive
+    mid=ar.ingest(preview(**retained))['message']
+    before=archive_state(s,mid)[1]
+    assert ar.ingest(preview(**{'media':PREVIEW_DOCUMENT,'origin':'reconcile',**candidate}))['outcome']==outcome
+    if outcome=='conflict':
+        assert archive_state(s,mid)[1]==before and message_events(s,mid)==[('message.created',1)]
+        assert len(open_conflicts(s,mid))==1
+
+
+# spec: ANYM-611
+def test_link_preview_refresh_keeps_deletion_precedence_and_open_conflicts(archive):
+    ar,s,_,_=archive
+    # A deleted retained message stays deleted: a refresh does not resurrect it.
+    gone=ar.ingest(preview(provider_id='18'))['message']
+    assert ar.ingest(preview(provider_id='18',deleted=True,body='',media=[],formatting=group_formatting([],''),
+        updated_at='2026-10-01T12:01:00+00:00'))['outcome']=='deleted'
+    assert ar.ingest(preview(provider_id='18',media=PREVIEW_DOCUMENT,updated_at='2026-10-01T12:01:00+00:00'))['outcome']=='tombstoned'
+    # A provider tombstone turns the refresh into a deletion, as before.
+    mid=ar.ingest(preview())['message']
+    with s.pool.connection() as c:
+        c.execute('''INSERT INTO provider_tombstones(account,provider_chat,provider_id,observed_at)
+            VALUES('archive-test','100','17','2026-10-01T12:00:00+00:00')''')
+    assert ar.ingest(preview(media=PREVIEW_DOCUMENT))['outcome']=='deleted'
+    assert archive_state(s,mid)[0]['deleted'] and archive_state(s,gone)[0]['deleted']
+    # A refresh is no later evidence: an open older contradiction stays open.
+    other=ar.ingest(preview(provider_id='19',updated_at='2026-10-01T12:00:30+00:00'))['message']
+    assert ar.ingest(preview(provider_id='19',sender='43'))['outcome']=='conflict'
+    assert ar.ingest(preview(provider_id='19',media=PREVIEW_DOCUMENT,updated_at='2026-10-01T12:00:30+00:00'))['outcome']=='unchanged'
+    assert len(open_conflicts(s,other))==1
+
+
 GROUP_SELF={'chat_type':'group','sender_identity_basis':'authenticated_self'}
 
 
