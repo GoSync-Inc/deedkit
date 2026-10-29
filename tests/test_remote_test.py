@@ -48,10 +48,17 @@ echo "sudo $*" >> "$FAKE_LOG"
 while [ $# -gt 0 ]; do case "$1" in -n) shift ;; -u) shift 2 ;; *) break ;; esac; done
 exec "$@"
 ''',
-    'docker': '#!/usr/bin/env bash\necho "docker $*" >> "$FAKE_LOG"\n[ "$1" = ps ] && printf "%s" "${FAKE_DOCKER_PS:-}"\nexit 0\n',
+    # FAKE_DOCKER_PS_FILE: containers that can start or stop while a run waits.
+    'docker': '''#!/usr/bin/env bash
+echo "docker $*" >> "$FAKE_LOG"
+[ "$1" = ps ] && printf "%s" "${FAKE_DOCKER_PS:-}" && cat "${FAKE_DOCKER_PS_FILE:-/nonexistent}" 2>/dev/null
+exit 0
+''',
     'uv': f'''#!/usr/bin/env bash
-dsn=""; [ -n "${{PROBE_TEST_DSN_FILE:-}}" ] && dsn="$(cat "$PROBE_TEST_DSN_FILE")"
-echo "uv $* | cwd=${{PWD##*/}} dsn=$dsn shard=${{DEEDKIT_TEST_SHARD:-}} fcs=${{FCS_TEST_DSN:-}} pid=$$" >> "$FAKE_LOG"
+[ "${{FAKE_UV_IGNORE_TERM:-0}}" = 0 ] || trap '' TERM
+dsn=""; mode=""
+if [ -n "${{PROBE_TEST_DSN_FILE:-}}" ]; then dsn="$(cat "$PROBE_TEST_DSN_FILE")"; mode="$(ls -l "$PROBE_TEST_DSN_FILE" | cut -c1-10)"; fi
+echo "uv $* | cwd=${{PWD##*/}} dsn=$dsn dsnmode=$mode shard=${{DEEDKIT_TEST_SHARD:-}} fcs=${{FCS_TEST_DSN:-}} pid=$$" >> "$FAKE_LOG"
 [ "$1" = run ] || exit 0
 echo "FAKE SUITE OUTPUT ${{DEEDKIT_TEST_SHARD:-}}"
 {BURN}
@@ -84,8 +91,11 @@ echo "initdb $* pid=$$" >> "$FAKE_LOG"
 [ "${FAKE_INITDB_SLEEP:-0}" = 0 ] || sleep "$FAKE_INITDB_SLEEP"
 while [ $# -gt 0 ]; do [ "$1" = -D ] && mkdir -p "$2"; shift; done
 ''',
+    # A Unix socket path past macOS's 104 bytes (`<dir>/.s.PGSQL.<port>`) fails startup, as it does there.
     'postgres': f'''#!/usr/bin/env bash
 echo "postgres $* pid=$$" >> "$FAKE_LOG"
+case " $* " in *" -k "*) k="${{*##* -k }}"; k="${{k%% *}}"
+  [ "${{#k}}" -le 88 ] || {{ echo "postgres: socket path too long" >> "$FAKE_LOG"; exit 1; }} ;; esac
 echo $$ > "$2/postmaster.pid"
 trap '{BURN}; echo "postgres stopped by QUIT pid=$$" >> "$FAKE_LOG"; exit 0' QUIT
 while :; do sleep 0.1; done
@@ -93,7 +103,7 @@ while :; do sleep 0.1; done
     'pg_isready': '#!/usr/bin/env bash\nexit 0\n',
     'createdb': '#!/usr/bin/env bash\necho "createdb $*" >> "$FAKE_LOG"\n',
 }
-CAPS = 'WAIT_SECONDS=0\nPOLL_SECONDS=1\n'
+CAPS = 'WAIT_SECONDS=0\nPOLL_SECONDS=1\nSTOP_SECONDS=3\n'
 
 
 def write(path, text, mode=0o755):
@@ -160,16 +170,19 @@ def worktree(tmp_path):
                  'credentials/google.json': '{}\n', '.AWS/sso/cache/entry.json': '{}\n',
                  'whatsapp/session.sqlite-wal': 'k\n', 'data/store.db-journal': 'k\n', 'Secrets/notes.txt': 'k\n',
                  'TOKENS/github': 'k\n', 'state/.ENV': 'K=1\n', 'safe\nname/session.sqlite': 'k\n',
-                 'credential.py/credential.py': 'k\n'}
+                 'credential.py/credential.py': 'k\n', 'client.p8': 'k\n', 'tls.der': 'k\n', '.envbackup': 'K=1\n',
+                 'certs/ca.crt': 'k\n'}
     for name, text in untracked.items():
         write(tree / name, text, 0o644)
+    # An ordinary file only its owner may read: _deedkitci, another user, must still read its staged copy.
+    write(tree / 'private_notes.txt', 'synthetic\n', 0o600)
     return tree
 
 
 SENT = {'app.py', 'tests/test_app.py', 'services/gateway/tests/test_credential_expiry.py',
         'services/calendar/pyproject.toml', 'services/calls/pyproject.toml', 'services/calls/frontend/package.json',
         'whatsapp/tests/a.test.mjs', 'whatsapp/whatsmeow/go.mod', 'packages/npm/package.json',
-        'scripts/python_shards.py', 'scripts/build.py', '.gitignore', 'new_module.py'}
+        'scripts/python_shards.py', 'scripts/build.py', '.gitignore', 'new_module.py', 'private_notes.txt'}
 
 
 def remote(env, *args, **extra):
@@ -237,6 +250,9 @@ def test_a_run_sends_exactly_the_listed_files_and_runs_the_suite_as_the_service_
     assert 'FAKE SUITE OUTPUT' in result.stdout
     assert files_under(home / 'stage' / 'src') == SENT
     assert files_under(home / 'shared' / 'stage' / WORKER) == SENT
+    # The mini stage belongs to egoregerev and is read by _deedkitci: every staged file is readable by others.
+    assert (home / 'shared' / 'stage' / WORKER / 'private_notes.txt').stat().st_mode & 0o044 == 0o044
+    assert (worktree / 'private_notes.txt').stat().st_mode & 0o777 == 0o600
     copy = worker_dir(home) / 'src'
     assert files_under(copy) == SENT
     # The copy is a one-commit repository of itself, for the tests that read `git ls-files`.
@@ -290,8 +306,10 @@ def test_the_root_suite_gets_a_postgres_on_localhost_and_a_private_dsn_file(mini
     assert result.returncode == 0, result.stderr
     [postgres] = log_lines(home, 'postgres -D')
     assert '-c listen_addresses=127.0.0.1' in postgres
+    assert '-c unix_socket_directories= ' in postgres and ' -k ' not in postgres
     port = postgres.split(' -p ')[1].split()[0]
     [pytest_line] = log_lines(home, 'uv run pytest tests/test_app.py')
+    assert 'dsnmode=-rw------- ' in pytest_line
     dsn_text = pytest_line.split('dsn=')[1].split()[0]
     assert dsn_text.startswith('postgresql://probe_owner:')
     assert dsn_text.endswith(f'@127.0.0.1:{port}/messaging_probe_test')
@@ -301,6 +319,15 @@ def test_the_root_suite_gets_a_postgres_on_localhost_and_a_private_dsn_file(mini
     assert log_lines(home, 'postgres stopped by QUIT')
     assert not list((worker_dir(home) / 'runs').iterdir())
     assert 'skipped: needs docker (CI covers)' in result.stderr
+
+
+# spec: ANYM-638
+def test_a_long_worker_name_still_gets_its_database(mini, worktree):
+    home, env = mini
+    result = remote(env, worktree, 'root', 'tests/test_app.py', DEEDKIT_REMOTE_WORKER='w' * 63)
+    assert result.returncode == 0, result.stderr
+    assert not log_lines(home, 'postgres: socket path too long')
+    assert log_lines(home, 'uv run pytest tests/test_app.py')
 
 
 # spec: ANYM-638
@@ -379,6 +406,22 @@ def test_a_terminated_run_stops_its_children_and_postgres(mini, worktree):
 
 
 # spec: ANYM-638
+@pytest.mark.parametrize('signal_name', ['TERM', 'KILL'])
+def test_a_suite_that_ignores_term_is_killed_once_the_stop_bound_passes(mini, worktree, signal_name):
+    home, env = mini
+    process = background(env, worktree, 'root', 'tests/test_app.py', FAKE_UV_SLEEP='120', FAKE_UV_IGNORE_TERM='1')
+    wait_for(lambda: log_lines(home, 'uv run pytest'), 60)
+    suite = pid_of(log_lines(home, 'uv run pytest')[0])
+    os.kill(runner_pid(home), getattr(signal, f'SIG{signal_name}'))
+    process.communicate(timeout=60)
+    # STOP_SECONDS=3: TERM, then KILL; then PostgreSQL, the run directory and the load line.
+    wait_for(lambda: not alive(suite), 30)
+    wait_for(lambda: not list((worker_dir(home) / 'runs').iterdir()), 30)
+    assert log_lines(home, 'postgres stopped by QUIT')
+    assert load_rows(home)[-1][-1] == {'TERM': '143', 'KILL': 'killed'}[signal_name]
+
+
+# spec: ANYM-638
 @pytest.mark.parametrize('stage', ['copy', 'initdb', 'suite'])
 def test_a_killed_runner_leaves_no_process_database_or_held_slot_behind(mini, worktree, stage):
     home, env = mini
@@ -393,6 +436,8 @@ def test_a_killed_runner_leaves_no_process_database_or_held_slot_behind(mini, wo
     wait_for(lambda: not list((worker_dir(home) / 'runs').iterdir()))
     for line in log_lines(home, 'postgres -D'):
         assert not alive(pid_of(line))
+    # The watchdog accounts for the killed run; its CPU is unknown.
+    assert load_rows(home)[-1][:2] == [WORKER, 'root'] and load_rows(home)[-1][4:] == ['-', '-', 'killed']
     write(home / 'shared' / 'caps.conf', 'WAIT_SECONDS=10\nPOLL_SECONDS=1\n', 0o644)
     again = remote(env, '--full', worktree, 'gateway')
     assert again.returncode == 0, again.stderr
@@ -409,7 +454,8 @@ def test_a_run_started_right_after_a_killed_one_is_not_touched_by_the_old_watchd
     # At once: the old watchdog wakes while this run's suite and database are up, and must leave them be.
     again = remote(env, worktree, 'root', 'tests/test_app.py', FAKE_UV_SLEEP='4')
     assert again.returncode == 0, again.stderr
-    assert load_rows(home)[-1][-1] == '0'
+    # This run's line and the killed run's (from its watchdog), in either order.
+    wait_for(lambda: sorted(row[-1] for row in load_rows(home)) == ['0', 'killed'])
 
 
 # spec: ANYM-638
@@ -435,13 +481,37 @@ def test_a_taken_slot_makes_the_run_wait_in_the_mini_queue_then_ci_covers(mini, 
     with open(locks / 'slot1', 'a') as slot:
         fcntl.flock(slot, fcntl.LOCK_EX | fcntl.LOCK_NB)
         refused = remote(env, '--full', worktree, 'gateway')
-        assert refused.returncode == 90 and 'all 1 DeedKit slot(s) taken), CI covers' in refused.stderr
-        assert not log_lines(home, 'uv run pytest') and not (home / 'shared' / 'stage' / WORKER).exists()
+        assert refused.returncode == 90, refused.stderr
+        assert 'all 1 DeedKit slot(s) taken' in refused.stderr and 'CI covers' in refused.stderr
+        assert not log_lines(home, 'uv run pytest')
         write(home / 'shared' / 'caps.conf', 'WAIT_SECONDS=30\nPOLL_SECONDS=1\n', 0o644)
         threading.Timer(2, lambda: fcntl.flock(slot, fcntl.LOCK_UN)).start()
         waited = remote(env, '--full', worktree, 'gateway')
     assert waited.returncode == 0, waited.stderr
     assert 'waiting in the mini queue' in waited.stderr
+    assert log_lines(home, 'uv run pytest -q | cwd=gateway')
+
+
+# spec: ANYM-638
+def test_a_run_that_waited_for_a_slot_checks_for_between_again_before_it_starts(mini, worktree):
+    home, env = mini
+    write(home / 'shared' / 'caps.conf', 'WAIT_SECONDS=60\nPOLL_SECONDS=1\n', 0o644)
+    between = home / 'between-containers'
+    locks = home / 'service' / 'deedkit-ci' / '.locks'
+    locks.mkdir(parents=True)
+    with open(locks / 'slot1', 'a') as slot:
+        fcntl.flock(slot, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        process = background(env, '--full', worktree, 'gateway', FAKE_DOCKER_PS_FILE=str(between))
+        wait_for(lambda: any(' --run ' in line for line in log_lines(home, 'sudo')), 60)
+        # Between starts while the run waits for the slot; then the slot frees.
+        between.write_text('between-ci-77-test \n')
+        fcntl.flock(slot, fcntl.LOCK_UN)
+        time.sleep(4)
+        assert not log_lines(home, 'uv run pytest')
+        between.unlink()
+        _, stderr = process.communicate(timeout=60)
+    assert process.returncode == 0, stderr
+    assert 'a Between container is running' in stderr
     assert log_lines(home, 'uv run pytest -q | cwd=gateway')
 
 
@@ -501,6 +571,131 @@ def test_cleanup_removes_the_workers_copies_and_leftover_databases_only(mini, wo
     assert not worker_dir(home).exists()
     assert not (home / 'shared' / 'stage' / WORKER).exists()
     assert (other / 'kept.py').exists()
+
+
+# docs/operations/remote-test-mini-setup.md section 1, run as written: its blocks with the system paths moved under
+# a temporary root, and fakes of ssh/scp (the mini's shell runs here), sudo, dscl, install, chown and visudo.
+SETUP_DOC = ROOT / 'docs' / 'operations' / 'remote-test-mini-setup.md'
+SETUP_SHELLS = ['bash'] + (['zsh'] if shutil.which('zsh') else [])  # zsh: the mini's login shell
+SETUP_FAKES = {
+    'ssh': '''#!/usr/bin/env bash
+while [ $# -gt 0 ]; do case "$1" in -o) shift 2 ;; -*) shift ;; *) break ;; esac; done
+shift
+cd "$FAKE_OWNER_HOME" || exit 255
+HOME="$FAKE_OWNER_HOME" exec "$FAKE_SHELL" -c "$*"
+''',
+    'scp': '''#!/usr/bin/env bash
+dest="${@: -1}"; dest="${dest#*:}"
+case "$dest" in /*) ;; *) dest="$FAKE_OWNER_HOME/$dest" ;; esac
+cp "${@:1:$#-1}" "$dest"
+''',
+    # FAKE_FAIL: the sudo command line that fails, as a denied or broken step would.
+    'sudo': '''#!/usr/bin/env bash
+while [ $# -gt 0 ]; do case "$1" in -n) shift ;; -u) shift 2 ;; *) break ;; esac; done
+if [ -n "${FAKE_FAIL:-}" ]; then case "$*" in *"$FAKE_FAIL"*) echo "sudo: synthetic failure: $*" >&2; exit 1 ;; esac; fi
+exec "$@"
+''',
+    'dscl': '''#!/usr/bin/env bash
+op="$2" rec="${3#"$FAKE_ROOT"}"; shift 3
+f="$FAKE_DS$rec"
+case "$op" in
+  -read) [ -f "$f" ] && cat "$f" ;;
+  -create) mkdir -p "${f%/*}"; touch "$f"; if [ $# -gt 0 ]; then echo "$1: ${2:-}" >> "$f"; fi ;;
+  -delete) rm -f "$f" ;;
+  -list) for g in "$f"/*; do [ -f "$g" ] || continue; v="$(sed -n "s/^$1: //p" "$g")"; [ -z "$v" ] || echo "${g##*/} $v"; done ;;
+esac
+''',
+    'install': '''#!/usr/bin/env bash
+mode=644
+while [ $# -gt 2 ]; do case "$1" in -m) mode="$2"; shift 2 ;; -o|-g) shift 2 ;; *) break ;; esac; done
+cp "$1" "$2" && chmod "$mode" "$2"
+''',
+    'chown': '#!/usr/bin/env bash\nexit 0\n',
+    'visudo': '#!/usr/bin/env bash\nexit 0\n',
+}
+
+
+@pytest.fixture
+def mini_setup(tmp_path):
+    root = tmp_path / 'mini'
+    for name in ('owner', 'ds', 'Users', 'tmp', 'sudoers.d'):
+        (root / name).mkdir(parents=True)
+    for name, text in SETUP_FAKES.items():
+        write(tmp_path / 'setupbin' / name, text)
+    section = SETUP_DOC.read_text().split('\n## 1.')[1].split('\n## ')[0]
+    blocks = [part.split('\n', 1)[1].split('```')[0] for part in section.split('```bash')[1:]]
+    for system, moved in (('/tmp/deedkit-setup', f'{root}/tmp/deedkit-setup'), ('/Users/$U', f'{root}/Users/$U'),
+                          ('/usr/local/libexec', f'{root}/libexec'), ('/etc/sudoers.d', f'{root}/sudoers.d')):
+        blocks = [block.replace(system, moved) for block in blocks]
+    # preflight, steps 1-4, read-back (not run here), undo
+    assert len(blocks) == 7 and 'preflight-ok' in blocks[0] and 'undo-ok' in blocks[6]
+    env = dict(os.environ, PATH=f"{tmp_path / 'setupbin'}:{os.environ['PATH']}", FAKE_OWNER_HOME=str(root / 'owner'),
+               FAKE_DS=str(root / 'ds'), FAKE_ROOT=str(root))
+    return root, env, blocks
+
+
+def setup_block(env, block, shell, **extra):
+    return subprocess.run(['bash', '-c', block], cwd=ROOT, env=dict(env, FAKE_SHELL=shell, **extra),
+                          capture_output=True, text=True, timeout=60)
+
+
+def setup_leftovers(root):
+    paths = [root / 'Users' / '_deedkitci', root / 'libexec' / 'deedkit-remote-test',
+             root / 'sudoers.d' / 'deedkit-remote-test', root / 'ds' / 'Users' / '_deedkitci',
+             root / 'ds' / 'Groups' / '_deedkitci', root / 'owner' / 'deedkit-ci-setup.created',
+             root / 'owner' / 'deedkit-ci-setup.left']
+    return [path for path in paths if path.exists()] + list((root / 'tmp').iterdir())
+
+
+# spec: ANYM-638
+@pytest.mark.parametrize('shell', SETUP_SHELLS)
+def test_the_setup_creates_and_its_undo_removes_exactly_the_ledgered_resources(mini_setup, shell):
+    root, env, blocks = mini_setup
+    write(root / 'owner' / 'deedkit-remote-test', 'an owner file\n', 0o600)
+    for block in blocks[:5]:
+        result = setup_block(env, block, shell)
+        assert result.returncode == 0, result.stdout + result.stderr
+    ledger = (root / 'owner' / 'deedkit-ci-setup.created').read_text().splitlines()
+    assert ledger[:3] == ['group', 'user', 'home'] and ledger[4:] == ['shim', 'sudoers']
+    assert ledger[3].startswith(f'stage {root}/tmp/deedkit-setup.')
+    assert 'UniqueID: 452' in (root / 'ds' / 'Users' / '_deedkitci').read_text()
+    assert (root / 'libexec' / 'deedkit-remote-test').read_text() == SHIM.read_text()
+    # The files travelled through a private directory, now gone; the owner's own file is untouched.
+    assert (root / 'owner' / 'deedkit-remote-test').read_text() == 'an owner file\n'
+    assert not list((root / 'tmp').iterdir())
+    undo = setup_block(env, blocks[6], shell)
+    assert undo.returncode == 0 and 'undo-ok' in undo.stdout, undo.stdout + undo.stderr
+    assert setup_leftovers(root) == []
+
+
+# spec: ANYM-638
+@pytest.mark.parametrize('fail', ['PrimaryGroupID 452', 'UniqueID 452', 'chown', 'sudoers.d'],
+                         ids=['group', 'user', 'home', 'sudoers'])
+def test_a_setup_that_fails_midway_is_undone_completely(mini_setup, fail):
+    root, env, blocks = mini_setup
+    for block in blocks[:5]:
+        if setup_block(env, block, SETUP_SHELLS[-1], FAKE_FAIL=fail).returncode:
+            break
+    else:
+        pytest.fail(f'no step failed on {fail}')
+    undo = setup_block(env, blocks[6], SETUP_SHELLS[-1])
+    assert undo.returncode == 0 and 'undo-ok' in undo.stdout, undo.stdout + undo.stderr
+    assert setup_leftovers(root) == []
+
+
+# spec: ANYM-638
+def test_an_undo_that_cannot_remove_a_resource_keeps_it_in_the_ledger_and_fails(mini_setup):
+    root, env, blocks = mini_setup
+    shell = SETUP_SHELLS[-1]
+    for block in blocks[:5]:
+        assert setup_block(env, block, shell).returncode == 0
+    failed = setup_block(env, blocks[6], shell, FAKE_FAIL=f'-delete {root}/Users')
+    assert failed.returncode == 1 and 'still present' in failed.stdout, failed.stdout + failed.stderr
+    assert (root / 'owner' / 'deedkit-ci-setup.created').read_text() == 'user\n'
+    assert (root / 'ds' / 'Users' / '_deedkitci').exists() and not (root / 'ds' / 'Groups' / '_deedkitci').exists()
+    again = setup_block(env, blocks[6], shell)
+    assert again.returncode == 0 and 'undo-ok' in again.stdout, again.stdout + again.stderr
+    assert setup_leftovers(root) == []
 
 
 # spec: ANYM-638

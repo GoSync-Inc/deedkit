@@ -40,6 +40,8 @@ FULL=0
 BUSY=90
 UNREACHABLE=91
 NOT_SET_UP=92
+QUEUED=93   # between the laptop and the mini only: a run that did not start yet and asks for another try
+QUIET_QUEUE=0
 
 # Defaults of the caps; caps.conf overrides them (owner D42: Between has priority, one DeedKit run).
 MAX_RUNS=1          # DeedKit runs at once on the mini
@@ -51,6 +53,7 @@ POLL_SECONDS=15     # how often a waiting run looks again
 BUSY_CHECK=1        # 1: wait while a Between container runs or the load or memory is past its cap
 MAX_LOAD=8          # 1-minute load average of the mini's 12 cores
 NICE=10             # the mini run's scheduling priority, below Between's
+STOP_SECONDS=30     # how long a stop waits for TERM (PostgreSQL: QUIT) before it sends KILL
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 
@@ -69,7 +72,7 @@ worker_of() {
   printf '%s' "$name"
 }
 
-# A path that may hold a secret, a session or a local environment never leaves this machine. Every path
+# A path that may hold a secret, a session, a local environment or build output never leaves this machine. Every path
 # component counts, in any letter case: a directory named like a secret takes all of its files with it.
 # Source and docs that only name the subject in their own file name (tests/test_credential_expiry.py) stay;
 # a path with a control character (a newline would split it for a line-based reader) never leaves.
@@ -81,8 +84,9 @@ is_secret() {
     part="${rest%%/*}"
     if [ "$part" = "$rest" ]; then last=1; else last=0; fi
     case "$part" in
-      .git|.venv|venv|node_modules|.tiden|.ssh|.gnupg|.aws|.azure|.kube|.docker|.gcloud|.config|__pycache__|.pytest_cache|.ruff_cache|.mypy_cache) found=0 ;;
-      .env|.env.*|*.env|.envrc|*.pem|*.key|*.p12|*.pfx|*.jks|*.keystore|*.gpg|*.asc|*.agekey|*.ovpn|*.kdbx|*.dsn) found=0 ;;
+      .git|.venv|venv|node_modules|.tiden|.ssh|.gnupg|.aws|.azure|.kube|.docker|.gcloud|.config|__pycache__|.pytest_cache|.ruff_cache|.mypy_cache|dist) found=0 ;;
+      .env*|*.env|*.pem|*.key|*.p8|*.der|*.crt|*.cer|*.p7b|*.p7c|*.csr|*.p12|*.pfx|*.jks|*.keystore|*.keytab) found=0 ;;
+      *.ppk|*.jwk|*.gpg|*.asc|*.age|*.agekey|*.ovpn|*.kdbx|*.kdb|*.dsn) found=0 ;;
       id_rsa*|id_dsa*|id_ecdsa*|id_ed25519*|auth.json|.netrc|.npmrc|.pypirc|.git-credentials|.htpasswd) found=0 ;;
       *.session|*.session-*|*.sqlite|*.sqlite3|*.sqlite-*|*.sqlite3-*|*.db|*.db-*|*-journal|*-wal|*-shm) found=0 ;;
       *credential*|*token*|*secret*|*passw*)
@@ -109,7 +113,8 @@ list_files() {
 }
 
 # rsync options shared by both copies: --delete keeps the copy equal to its source, and these receiver
-# paths (environments, caches, build output) survive it; the secret shapes are a second net after is_secret.
+# paths (environments, caches, build output) survive it; the secret shapes are a second net after is_secret
+# (every pattern here is one is_secret drops too, so `--list` stays exactly what arrives).
 RSYNC_COPY=(-a --delete --exclude=.git/ --exclude=.venv/ --exclude=node_modules/ --exclude=__pycache__/
   --exclude=.pytest_cache/ --exclude=.ruff_cache/ --exclude=dist/ --exclude='.env*' --exclude='*.pem'
   --exclude='*.key' --exclude=auth.json --exclude=.tiden/)
@@ -120,7 +125,7 @@ read_caps() {
   while IFS='=' read -r key value; do
     value="${value%%#*}"; value="${value//[[:space:]]/}"
     case "$key" in
-      MAX_RUNS|PARALLEL|MIN_FREE_GB|MIN_FREE_MEM_GB|WAIT_SECONDS|POLL_SECONDS|BUSY_CHECK|MAX_LOAD|NICE)
+      MAX_RUNS|PARALLEL|MIN_FREE_GB|MIN_FREE_MEM_GB|WAIT_SECONDS|POLL_SECONDS|BUSY_CHECK|MAX_LOAD|NICE|STOP_SECONDS)
         [[ "$value" =~ ^[0-9]+$ ]] || continue ;;
       *) continue ;;
     esac
@@ -128,6 +133,7 @@ read_caps() {
   done < "$file"
   [ "$MAX_RUNS" -ge 1 ] || MAX_RUNS=1
   [ "$PARALLEL" -ge 1 ] || PARALLEL=1
+  [ "$STOP_SECONDS" -ge 1 ] || STOP_SECONDS=1
   [ "$POLL_SECONDS" -ge 1 ] || POLL_SECONDS=1
 }
 
@@ -189,11 +195,21 @@ between_busy() {
   return 1
 }
 
+# --here busy [deadline]: as egoregerev, before every start attempt of a run. The first call sets the run's one
+# queue deadline (now + WAIT_SECONDS, mini clock) and prints it; later calls, after a queued attempt, wait under
+# that same deadline and refuse once it has passed.
 wait_not_busy() {
-  local reason deadline=$((SECONDS + WAIT_SECONDS)) told=0
-  [ "$BUSY_CHECK" = 1 ] || return 0
-  while reason="$(between_busy)"; do
-    if [ "$SECONDS" -ge "$deadline" ]; then say "mini busy ($reason), CI covers"; return "$BUSY"; fi
+  local deadline="$1" reason told=0 again=1
+  if [ -z "$deadline" ]; then deadline=$(($(date +%s) + WAIT_SECONDS)); again=0; fi
+  printf 'deadline=%s\n' "$deadline"
+  while :; do
+    reason=""
+    if [ "$BUSY_CHECK" = 1 ]; then reason="$(between_busy)" || reason=""; fi
+    if [ -z "$reason" ]; then
+      if [ "$again" = 0 ] || [ "$(date +%s)" -lt "$deadline" ]; then return 0; fi
+      reason="the DeedKit slot(s) stayed taken"
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then say "mini busy ($reason), CI covers"; return "$BUSY"; fi
     if [ "$told" = 0 ]; then say "waiting in the mini queue: $reason"; told=1; fi
     sleep "$POLL_SECONDS"
   done
@@ -216,13 +232,9 @@ while parent and os.getppid() == parent:
     time.sleep(0.5)'
 
 take_slot() {
-  local mode="$1" slot note
+  local slot note
   mkdir -p "$ROOT_DIR/.locks"
   for slot in $(seq 1 "$MAX_RUNS"); do
-    if [ "$mode" = probe ]; then
-      python3 -c "$LOCK_HOLDER" "$ROOT_DIR/.locks/slot$slot" 0 >/dev/null 2>&1 </dev/null && return 0
-      continue
-    fi
     note="$ROOT_DIR/.locks/holder.$$"
     rm -f "$note"
     python3 -c "$LOCK_HOLDER" "$ROOT_DIR/.locks/slot$slot" $$ > "$note" 2>/dev/null </dev/null &
@@ -236,17 +248,27 @@ take_slot() {
   return 1
 }
 
-# Admission as _deedkitci: disk, then a slot, waiting in the queue up to WAIT_SECONDS. `probe` holds nothing.
+# Admission as _deedkitci: the disk guard, then (a run) one try for a slot and, holding it, the load and memory
+# caps again. A run that gets no slot or finds the mini busy holds nothing, waits POLL_SECONDS and returns
+# QUEUED; the laptop then repeats the Between check (as egoregerev) before it tries again, under one deadline.
 admit() {
-  local mode="$1" deadline=$((SECONDS + WAIT_SECONDS)) free told=0
+  local mode="$1" free reason=""
   mkdir -p "$ROOT_DIR"
   free="$(free_gb "$ROOT_DIR")"
   if [ "$free" -lt "$MIN_FREE_GB" ]; then say "mini disk guard: ${free} G free, need ${MIN_FREE_GB} G; CI covers"; return "$BUSY"; fi
-  until take_slot "$mode"; do
-    if [ "$SECONDS" -ge "$deadline" ]; then say "mini busy (all $MAX_RUNS DeedKit slot(s) taken), CI covers"; return "$BUSY"; fi
-    if [ "$told" = 0 ]; then say "waiting in the mini queue: all $MAX_RUNS DeedKit slot(s) taken"; told=1; fi
-    sleep "$POLL_SECONDS"
-  done
+  [ "$mode" = run ] || return 0
+  if ! take_slot run; then
+    reason="all $MAX_RUNS DeedKit slot(s) taken"
+  elif [ "$BUSY_CHECK" = 1 ] && reason="$(between_busy)"; then
+    kill "$HOLDER" 2>/dev/null || true
+    wait "$HOLDER" 2>/dev/null || true
+    HOLDER=""
+  else
+    return 0
+  fi
+  if [ "$QUIET_QUEUE" = 0 ]; then say "waiting in the mini queue: $reason"; fi
+  sleep "$POLL_SECONDS"
+  return "$QUEUED"
 }
 
 # CPU seconds (user + system) of this shell's finished children, from a `times` snapshot taken in the
@@ -261,43 +283,83 @@ cpu_of() {
 started() { ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' '_' || true; }
 own() { printf '%s %s %s\n' "$1" "$2" "$(started "$2")" >> "$RUN_DIR/owned"; }
 
-reap() {
-  local dir="$1" kind id stamp
+# Every recorded id leads its own process group (set -m). It is still this run's while its leader is the
+# recorded process or, the leader gone, while members of its group remain: the system never hands out a pid
+# that is still a process group id.
+ours() {
+  local now
+  now="$(started "$1")"
+  if [ -n "$now" ]; then [ "$now" = "$2" ]; return; fi
+  kill -0 -- "-$1" 2>/dev/null
+}
+
+# signal_recorded <run dir> stop|kill: stop sends TERM to each group and QUIT (immediate shutdown) to
+# PostgreSQL; kill sends KILL to every group. Only to what is still this run's.
+signal_recorded() {
+  local dir="$1" how="$2" kind id stamp
   [ -f "$dir/owned" ] || return 0
   while read -r kind id stamp; do
-    [ -n "$stamp" ] && [ "$(started "$id")" = "$stamp" ] || continue
-    case "$kind" in
-      group) kill -TERM -- "-$id" 2>/dev/null || true ;;
-      postgres) kill -QUIT "$id" 2>/dev/null || true ;;  # immediate shutdown
+    [ -n "$stamp" ] && ours "$id" "$stamp" || continue
+    case "$how:$kind" in
+      stop:group) kill -TERM -- "-$id" 2>/dev/null || true ;;
+      stop:postgres) kill -QUIT "$id" 2>/dev/null || true ;;
+      kill:*) kill -KILL -- "-$id" 2>/dev/null || kill -KILL "$id" 2>/dev/null || true ;;
     esac
   done < "$dir/owned"
 }
 
+recorded_alive() {
+  local dir="$1" kind id stamp
+  [ -f "$dir/owned" ] || return 1
+  while read -r kind id stamp; do
+    [ -n "$stamp" ] && ours "$id" "$stamp" && return 0
+  done < "$dir/owned"
+  return 1
+}
+
+# Stop what a run recorded: TERM/QUIT, up to STOP_SECONDS, then KILL, up to 5 s more. Fails while any of it
+# still runs, so the caller keeps the run directory (the record) for the next run or --cleanup to try again.
+stop_recorded() {
+  local dir="$1" i
+  signal_recorded "$dir" stop
+  for i in $(seq 1 "$STOP_SECONDS"); do recorded_alive "$dir" || return 0; sleep 1; done
+  signal_recorded "$dir" kill
+  for i in $(seq 1 5); do recorded_alive "$dir" || return 0; sleep 1; done
+  return 1
+}
+
 # Runs apart from the runner: when the runner dies without its trap (SIGKILL), it stops what this run
-# recorded and removes this run's directory, and nothing of another run; `finish` kills it first otherwise.
+# recorded, appends the run's load line (exit `killed`, CPU unknown: `-`) and removes this run's directory
+# once all of it is gone, and touches nothing of another run; `finish` kills it first otherwise.
 start_watchdog() {
-  local runner=$$ dir="$1"
+  local runner=$$ dir="$1" start
+  start="$(date +%s)"
   ( trap '' HUP INT
     while kill -0 "$runner" 2>/dev/null; do sleep 1; done
-    reap "$dir"
-    sleep 2
-    rm -rf "$dir" ) </dev/null >/dev/null 2>&1 &
+    stopped=0
+    stop_recorded "$dir" && stopped=1
+    printf '%s\t%s\t%s\t%s\t-\t-\tkilled\n' "$WORKER" "$SUITE" "$START_ISO" "$(($(date +%s) - start))" \
+      >> "$ROOT_DIR/load.log"
+    if [ "$stopped" = 1 ]; then rm -rf "$dir"; fi ) </dev/null >/dev/null 2>&1 &
   WATCHDOG=$!
 }
 
-# What earlier runs of this worker left when neither their trap nor their watchdog ran: their own run
-# directories only, never the current one.
+# What earlier runs of this worker left when neither their trap nor their watchdog finished: their own run
+# directories only, never the current one. A directory whose processes do not stop stays for the next try.
 stop_leftovers() {
-  local dir pidfile pid
+  local dir pidfile pid i
   for dir in "$WORKER_DIR"/runs/*; do
     [ -d "$dir" ] && [ "$dir" != "$RUN_DIR" ] || continue
-    reap "$dir"
+    stop_recorded "$dir" || { say "a process of $dir does not stop; it stays recorded"; continue; }
+    # A PostgreSQL started just before its run died, so never recorded: known by its data directory.
     for pidfile in "$dir"/pg[0-9]*/cluster/postmaster.pid; do
       [ -f "$pidfile" ] || continue
       pid="$(head -1 "$pidfile")"
-      if [[ "$pid" =~ ^[0-9]+$ ]] && ps -o command= -p "$pid" 2>/dev/null | grep -qF "$dir/pg"; then
-        kill -QUIT "$pid" 2>/dev/null || true
-      fi
+      [[ "$pid" =~ ^[0-9]+$ ]] || continue
+      kill -0 "$pid" 2>/dev/null && ps -o command= -p "$pid" 2>/dev/null | grep -qF "$dir/pg" || continue
+      kill -QUIT "$pid" 2>/dev/null || true
+      for i in $(seq 1 "$STOP_SECONDS"); do ps -o command= -p "$pid" 2>/dev/null | grep -qF "$dir/pg" || continue 2; sleep 1; done
+      ps -o command= -p "$pid" 2>/dev/null | grep -qF "$dir/pg" && kill -KILL "$pid" 2>/dev/null || true
     done
     rm -rf "$dir"
   done
@@ -332,7 +394,8 @@ pg_start() {
     --locale=en_US.UTF-8 >/dev/null
   rm -f "$data/pw"
   port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
-  "$PG_BIN/postgres" -D "$data/cluster" -c listen_addresses=127.0.0.1 -p "$port" -k "$data" \
+  # TCP only: a Unix socket under the run directory can pass macOS's 104-byte socket path limit.
+  "$PG_BIN/postgres" -D "$data/cluster" -c listen_addresses=127.0.0.1 -p "$port" -c unix_socket_directories= \
     -c shared_buffers=128MB -c fsync=off -c synchronous_commit=off -c full_page_writes=off > "$data/log" 2>&1 &
   pid=$!
   DATABASES="$DATABASES $pid"
@@ -346,17 +409,27 @@ pg_start() {
   PG_DSN="postgresql://probe_owner:$password@127.0.0.1:$port/messaging_probe_test"
 }
 
+# Whether any process of these groups (this shell's own jobs) still runs.
+groups_alive() {
+  local pid
+  for pid in "$@"; do kill -0 -- "-$pid" 2>/dev/null && return 0; done
+  return 1
+}
+
 finish() {
   local status=$? pid pg=0 i
   trap - EXIT INT TERM HUP
   if [ -n "$WATCHDOG" ]; then kill -KILL "$WATCHDOG" 2>/dev/null || true; wait "$WATCHDOG" 2>/dev/null || true; fi
   for pid in $CHILDREN; do kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true; done
+  # Up to STOP_SECONDS for the groups to end, then KILL: a child that ignores TERM never holds the run open.
+  for i in $(seq 1 "$STOP_SECONDS"); do groups_alive $CHILDREN || break; sleep 1; done
+  for pid in $CHILDREN; do kill -KILL -- "-$pid" 2>/dev/null || true; done
   for pid in $CHILDREN; do wait "$pid" 2>/dev/null || true; done
   times > "$RUN_DIR/.times-before"
   for pid in $DATABASES; do kill -QUIT "$pid" 2>/dev/null || true; done  # immediate shutdown
   for pid in $DATABASES; do
-    for i in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
-    kill -KILL "$pid" 2>/dev/null || true
+    for i in $(seq 1 "$STOP_SECONDS"); do groups_alive "$pid" || break; sleep 1; done
+    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
   times > "$RUN_DIR/.times"
@@ -468,7 +541,7 @@ runner_run() {
   WORKER="$1" SUITE="$2" MODE="$3"
   shift 3
   while [ $# -gt 0 ] && [ "$1" != -- ]; do
-    case "$1" in --ruff) RUFF+=("$2"); shift 2 ;; *) die "unknown runner option $1" ;; esac
+    case "$1" in --ruff) RUFF+=("$2"); shift 2 ;; --again) QUIET_QUEUE=1; shift ;; *) die "unknown runner option $1" ;; esac
   done
   [ "${1:-}" != -- ] || shift
   valid_worker "$WORKER" || die "bad worker name"
@@ -518,7 +591,7 @@ runner_here() {
   case "$action" in busy|load) ;; *) valid_worker "$worker" || die "bad worker name" ;; esac
   runner_env
   case "$action" in
-    busy) wait_not_busy ;;
+    busy) [[ "$worker" =~ ^[0-9]*$ ]] || die "bad deadline"; wait_not_busy "$worker" ;;
     probe) admit probe ;;
     stop) here_stop "$worker" ;;
     dist) tar -C "$ROOT_DIR/$worker/src/dist" -cf - . ;;
@@ -574,6 +647,21 @@ select_touched() {
   done < <(touched_files "$tree")
 }
 
+# The Between check as egoregerev before each start attempt. The first call gets the run's one queue deadline
+# (mini clock, WAIT_SECONDS from caps.conf) and every later call waits under it.
+DEADLINE=""
+wait_turn() {
+  local out status=0
+  out="$(as_owner --here busy ${DEADLINE:+"$DEADLINE"})" || status=$?
+  case "$status" in
+    0) ;;
+    "$BUSY") return "$BUSY" ;;
+    *) say "mini unreachable (ssh exit $status), CI covers"; return "$UNREACHABLE" ;;
+  esac
+  DEADLINE="$(printf '%s\n' "$out" | sed -n 's/^deadline=\([0-9][0-9]*\)$/\1/p' | tail -1)"
+  [ -n "$DEADLINE" ] || { say "the mini sent no queue deadline, CI covers"; return "$UNREACHABLE"; }
+}
+
 laptop_run() {
   local tree suite="$2" worker stage status mode=modules
   tree="$(cd "$1" && pwd)" || die "no worktree $1"
@@ -592,13 +680,7 @@ laptop_run() {
       exit 0
     fi
   fi
-  status=0
-  as_owner --here busy || status=$?
-  case "$status" in
-    0) ;;
-    "$BUSY") exit "$BUSY" ;;
-    *) say "mini unreachable (ssh exit $status), CI covers"; exit "$UNREACHABLE" ;;
-  esac
+  wait_turn || exit $?
   status=0
   as_service --here probe "$worker" || status=$?
   case "$status" in
@@ -613,12 +695,14 @@ laptop_run() {
   mkdir -p "$stage/src"
   list_files "$tree" > "$stage/files"
   tar -C "$tree" --null -T "$stage/files" -cf - | tar -C "$stage/src" -xpf -
+  # The mini stage is read by _deedkitci, not its owner egoregerev: readable to all (rsync -a keeps modes).
+  chmod -R go+rX "$stage/src"
   if ! ssh "${SSH_OPTS[@]}" "$HOST" "mkdir -p $(printf '%q' "$SHARED/stage/$worker")" ||
      ! rsync "${RSYNC_COPY[@]}" -e "ssh ${SSH_OPTS[*]}" "$stage/src/" "$HOST:$SHARED/stage/$worker/"; then
     say "copying to the mini failed before the suite started, CI covers"
     exit "$UNREACHABLE"
   fi
-  local runner_args=("$worker" "$suite" "$mode") path
+  local runner_args=() path again=""
   if [ "${#RUFF[@]}" -gt 0 ]; then for path in "${RUFF[@]}"; do runner_args+=(--ruff "$path"); done; fi
   runner_args+=(--)
   if [ "$mode" = full ]; then
@@ -627,8 +711,13 @@ laptop_run() {
     runner_args+=("${SELECTED[@]}")
   fi
   trap 'as_service --here stop "$worker" || true; exit 130' INT TERM HUP
-  status=0
-  as_service --run "${runner_args[@]}" || status=$?
+  while :; do
+    status=0
+    as_service --run "$worker" "$suite" "$mode" ${again:+--again} "${runner_args[@]}" || status=$?
+    [ "$status" = "$QUEUED" ] || break
+    again=1
+    wait_turn || { status=$?; break; }
+  done
   trap - INT TERM HUP
   if [ "$status" = 255 ]; then
     say "ssh to the mini failed mid-run; stopping it there"

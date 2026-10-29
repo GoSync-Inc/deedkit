@@ -78,9 +78,15 @@ sudo -n chmod 700 /Users/$U'
 Step 4: the shim (`deploy/mac-mini/deedkit-remote-test`), which is the only command the sudoers line lets
 egoregerev run as `_deedkitci`, and that line (`deploy/mac-mini/sudoers-deedkit-remote-test`):
 
+The two files travel through a new private directory (`mktemp -d`, mode 700, recorded in the ledger as
+`stage <path>` right after it exists), so no file of egoregerev's is overwritten; a failed copy stops the
+block before anything is installed.
+
 ```bash
-scp deploy/mac-mini/deedkit-remote-test deploy/mac-mini/sudoers-deedkit-remote-test egoregerev@100.88.40.111:
-ssh egoregerev@100.88.40.111 'set -e
+D="$(ssh egoregerev@100.88.40.111 'D=$(mktemp -d /tmp/deedkit-setup.XXXXXX) && echo "stage $D" >> ~/deedkit-ci-setup.created && echo $D')" &&
+[ -n "$D" ] &&
+scp deploy/mac-mini/deedkit-remote-test deploy/mac-mini/sudoers-deedkit-remote-test "egoregerev@100.88.40.111:$D/" &&
+ssh egoregerev@100.88.40.111 "D=$D"'; set -e; cd "$D"
 sudo -n visudo -cf sudoers-deedkit-remote-test
 if [ -e /usr/local/libexec/deedkit-remote-test ]; then echo "shim exists"; exit 1; fi
 if [ -e /etc/sudoers.d/deedkit-remote-test ]; then echo "sudoers file exists"; exit 1; fi
@@ -90,13 +96,14 @@ sudo -n install -o root -g wheel -m 0755 deedkit-remote-test /usr/local/libexec/
 echo sudoers >> ~/deedkit-ci-setup.created
 sudo -n install -o root -g wheel -m 0440 sudoers-deedkit-remote-test /etc/sudoers.d/deedkit-remote-test
 sudo -n visudo -c
-rm deedkit-remote-test sudoers-deedkit-remote-test'
+cd; rm -r "$D"'
 ```
 
 Read-back (every line goes in the pull request that ran it):
 
 ```bash
 ssh egoregerev@100.88.40.111 'U=_deedkitci; id $U; cat ~/deedkit-ci-setup.created
+P=/Users/Shared/deedkit-ci/stage/.readback; (umask 077; printf x > $P); chmod go+r $P
 dscl . -read /Users/$U UniqueID PrimaryGroupID UserShell NFSHomeDirectory IsHidden
 dscl . -read /Users/$U Password; dscl . -read /Groups/$U PrimaryGroupID
 dseditgroup -o checkmember -m $U admin; dseditgroup -o checkmember -m $U staff
@@ -104,19 +111,23 @@ ls -ld /Users/$U /Users/$U/deedkit-ci /usr/local/libexec/deedkit-remote-test /et
 sudo -n visudo -cf /etc/sudoers.d/deedkit-remote-test; sudo -n -l | grep -n $U
 echo "id -un; cd /Users/egoregerev 2>/dev/null && echo HOME-ENTERABLE || echo home-closed
 ls /Users/egoregerev/telegram-session >/dev/null 2>&1 && echo SESSIONS-READABLE || echo sessions-closed
-ls /Users/Shared/deedkit-ci/stage >/dev/null && echo stage-readable" | sudo -n -u $U /usr/local/libexec/deedkit-remote-test'
+cat /Users/Shared/deedkit-ci/stage/.readback >/dev/null && echo stage-file-readable" | sudo -n -u $U /usr/local/libexec/deedkit-remote-test
+rm -f $P'
 ```
 
 Expected:
 
-- `uid=452(_deedkitci) gid=452(_deedkitci)` and the ledger `group user home shim sudoers`.
+- `uid=452(_deedkitci) gid=452(_deedkitci)` and the ledger `group user home stage /tmp/deedkit-setup.<x> shim
+  sudoers` (the stage directory itself is gone).
 - `UniqueID: 452`, `PrimaryGroupID: 452`, `UserShell: /usr/bin/false`, `NFSHomeDirectory: /Users/_deedkitci`,
   `IsHidden: 1`, `Password: *` (or `********`), and the group's `PrimaryGroupID: 452`.
 - NOT a member of `admin`, and NOT a member of `staff`.
 - `drwx------ _deedkitci _deedkitci` for the home, `drwxr-xr-x _deedkitci _deedkitci` for `deedkit-ci`,
   `-rwxr-xr-x root wheel` for the shim, and `-r--r----- root wheel` for the sudoers file.
 - `parsed OK`, and exactly one `(_deedkitci) NOPASSWD: /usr/local/libexec/deedkit-remote-test` line.
-- Then `_deedkitci`, `home-closed`, `sessions-closed` and `stage-readable`.
+- Then `_deedkitci`, `home-closed`, `sessions-closed` and `stage-file-readable` (a file egoregerev made
+  0600 and opened to group and others, as `scripts/remote-test.sh` does with every staged file; the first
+  measured run then reads real staged files as `_deedkitci`).
 
 Anything else: undo and report. The ledger stays as the record of what the setup created.
 
@@ -126,17 +137,31 @@ that broad rule is narrowed. The shim runs whatever script arrives on stdin as `
 the suites run arbitrary repository code anyway, and the user's isolation is what protects egoregerev's
 files and sessions.
 
-Undo. It removes, newest first, only what the ledger names, whether whole or half-made, then the ledger:
+Undo. It removes, newest first, only what the ledger names, whether whole or half-made, and checks that each
+is gone. The ledger is removed only when everything is gone and `visudo -c` passes; otherwise it is rewritten
+to the resources still present, the undo prints them and exits 1, and a rerun tries again:
 
 ```bash
-ssh egoregerev@100.88.40.111 'U=_deedkitci; L=~/deedkit-ci-setup.created
+ssh egoregerev@100.88.40.111 'U=_deedkitci; L=~/deedkit-ci-setup.created; R=~/deedkit-ci-setup.left
 [ -f $L ] || { echo "no ledger: nothing of this setup to undo"; exit 0; }
-grep -qx sudoers $L && sudo -n rm -f /etc/sudoers.d/deedkit-remote-test
-grep -qx shim $L && sudo -n rm -f /usr/local/libexec/deedkit-remote-test
-grep -qx home $L && sudo -n rm -rf /Users/$U
-grep -qx user $L && { dscl . -read /Users/$U >/dev/null 2>&1 && sudo -n dscl . -delete /Users/$U; }
-grep -qx group $L && { dscl . -read /Groups/$U >/dev/null 2>&1 && sudo -n dscl . -delete /Groups/$U; }
-sudo -n visudo -c && rm $L'
+: > $R
+if grep -qx sudoers $L; then sudo -n rm -f /etc/sudoers.d/deedkit-remote-test
+  if [ -e /etc/sudoers.d/deedkit-remote-test ]; then echo sudoers >> $R; fi; fi
+if grep -qx shim $L; then sudo -n rm -f /usr/local/libexec/deedkit-remote-test
+  if [ -e /usr/local/libexec/deedkit-remote-test ]; then echo shim >> $R; fi; fi
+for D in $(sed -n "s/^stage //p" $L); do
+  case $D in /tmp/deedkit-setup.*) rm -rf "$D"; if [ -e "$D" ]; then echo "stage $D" >> $R; fi ;; esac; done
+if grep -qx home $L; then sudo -n rm -rf /Users/$U
+  if [ -e /Users/$U ]; then echo home >> $R; fi; fi
+if grep -qx user $L; then
+  if dscl . -read /Users/$U >/dev/null 2>&1; then sudo -n dscl . -delete /Users/$U; fi
+  if dscl . -read /Users/$U >/dev/null 2>&1; then echo user >> $R; fi; fi
+if grep -qx group $L; then
+  if dscl . -read /Groups/$U >/dev/null 2>&1; then sudo -n dscl . -delete /Groups/$U; fi
+  if dscl . -read /Groups/$U >/dev/null 2>&1; then echo group >> $R; fi; fi
+if ! sudo -n visudo -c >/dev/null; then rm -f $R; echo "visudo -c fails: ledger kept"; exit 1; fi
+if [ -s $R ]; then mv $R $L; echo "undo incomplete, still present:"; cat $L; exit 1; fi
+rm -f $R $L; echo undo-ok'
 ```
 
 ## Agent-side state (no sudo)
@@ -144,7 +169,8 @@ sudo -n visudo -c && rm $L'
 - Homebrew as egoregerev: `python@3.13 go poppler tesseract tesseract-lang age node@24 postgresql@18`
   (ffmpeg was there already). No `brew services`: each run starts its own PostgreSQL and stops it.
 - `/Users/Shared/deedkit-ci` (egoregerev, 755): the `stage/<worker>` copies and `caps.conf`, the run caps
-  (`MAX_RUNS PARALLEL MIN_FREE_GB MIN_FREE_MEM_GB WAIT_SECONDS POLL_SECONDS BUSY_CHECK MAX_LOAD NICE`,
+  (`MAX_RUNS PARALLEL MIN_FREE_GB MIN_FREE_MEM_GB WAIT_SECONDS POLL_SECONDS BUSY_CHECK MAX_LOAD NICE
+  STOP_SECONDS`,
   defaults in the script).
 - `~_deedkitci/deedkit-ci`: the workers' run copies, `load.log` (`scripts/remote-test.sh --load`) and the
   slot locks.
