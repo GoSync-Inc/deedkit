@@ -1,0 +1,14 @@
+#!/bin/bash
+# /usr/local/libexec/deedkit-remote-test (root:wheel 0755) on the Mac mini: the only command egoregerev may
+# run as _deedkitci (deploy/mac-mini/sudoers-deedkit-remote-test). scripts/remote-test.sh arrives on stdin,
+# so this file never changes when the script does; it fixes the user, home, PATH and working directory.
+set -eu
+if [ "$(/usr/bin/id -un)" != _deedkitci ]; then
+  echo "deedkit-remote-test: run as _deedkitci (sudo -n -u _deedkitci $0)" >&2
+  exit 2
+fi
+export HOME=/Users/_deedkitci USER=_deedkitci LOGNAME=_deedkitci SHELL=/bin/bash
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+umask 022
+cd "$HOME"
+exec /bin/bash -s -- "$@"
