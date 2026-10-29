@@ -249,7 +249,7 @@ def run(config, source=None):
     stage('restore_database_failed',lambda:subprocess.run(['psql','-X','-q','-v','ON_ERROR_STOP=1','-c',restore_roles_sql()],
                        env=env,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True))
     with tempfile.TemporaryFile() as errors:
-        try:stage('restore_database_failed',lambda:subprocess.run(['pg_restore','--exit-on-error','--no-owner','--no-acl','--jobs=1',
+        try:stage('restore_database_failed',lambda:subprocess.run(['pg_restore','--exit-on-error','--no-owner','--no-acl','--jobs=2',
                         '--dbname='+DATABASE,str(restored/'database.dump')],env=env,
                        stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=errors,check=True))
         except RestoreStageError as error:

@@ -552,3 +552,13 @@ def test_standalone_decryption_still_reads_back_a_member_written_wrong_after_its
     with pytest.raises(RuntimeError,match=error):
         crypto.decrypt_snapshot(tmp_path/'bundle.tar','key',tmp_path/'restore',age=str(decoder))
     assert not (tmp_path/'restore').exists()
+
+
+# spec: ANYM-634
+def test_the_helper_restores_the_dump_with_two_jobs(tmp_path,monkeypatch,decoder):
+    data,manifest,raw,_=bundle_with_original()
+    worker,run,calls=offline_worker(monkeypatch,tmp_path,decoder,manifest);restores=[]
+    monkeypatch.setattr(worker.subprocess,'run',lambda args,**kw:(calls.append(args[0]),restores.append(args) if args[0]=='pg_restore' else None))
+    assert run(data,raw)['status']=='verified' and calls==['psql','pg_restore']
+    assert '--jobs=2' in restores[0] and not any(arg.startswith('--jobs=') and arg!='--jobs=2' for arg in restores[0])
+    assert restores[0][-1].endswith('database.dump')

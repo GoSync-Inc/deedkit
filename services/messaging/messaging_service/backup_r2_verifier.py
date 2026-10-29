@@ -30,6 +30,9 @@ POSTGRES_IMAGE = 'postgres:18-bookworm@sha256:afc7e2d441324c0388fa80c3d24f733b41
 LABEL = 'org.deedkit.backup-verifier'
 DATABASE = 'deedkit_verify_restore_test'
 PG_DATA_PATH = '/var/lib/postgresql'
+# The pinned image's postgres user and group (Debian image, uid/gid 999). A run's data directory on
+# `postgres_data_directory` (ANYM-634) is 0700 and theirs; the root 0700 parent shields it on the host.
+POSTGRES_UID = 999
 HELPER_TMPFS = {'/tmp':'rw,noexec,nosuid,size=64m',
                 PG_DATA_PATH:'ro,noexec,nosuid,nodev,size=1m,mode=0700'}
 # Backup schema versions this verifier accepts from its helper (`capabilities` reports them).
@@ -74,9 +77,10 @@ def load_config(path):
     # Optional `profile` (ANYM-606): absent is messaging, exactly as before; `calendar` selects the calendar
     # helper checks and proof. It comes only from this root config and must equal its receiver config's.
     # Optional `host_directory` and `verify_wait_seconds` (ANYM-609) are read through host_settings;
-    # optional `busy_wait_seconds` (ANYM-632) through busy_wait.
+    # optional `busy_wait_seconds` (ANYM-632) through busy_wait; optional `postgres_data_directory` (ANYM-634).
     if (not isinstance(value,dict) or not required<=set(value) or
-            set(value)-required-set(defaults)-{'profile','host_directory','verify_wait_seconds','busy_wait_seconds'} or
+            set(value)-required-set(defaults)-{'profile','host_directory','verify_wait_seconds','busy_wait_seconds',
+                                               'postgres_data_directory'} or
             type(value['v']) is not int or value['v']!=1 or
             ('profile' in value and (not isinstance(value['profile'],str) or value['profile'] not in r2.PROFILES))):
         raise ValueError('invalid_verifier_config')
@@ -117,6 +121,16 @@ def load_config(path):
     host=Path(host)
     if any(host.is_relative_to(path) or path.is_relative_to(host) for path in (directory,state)):
         raise ValueError('separate_operator_evidence_required')
+    if 'postgres_data_directory' in value:
+        # Absent: the scratch PostgreSQL keeps a Docker volume, as before. The path enters a --mount argument.
+        data=value['postgres_data_directory']
+        if not isinstance(data,str) or not re.fullmatch('/[A-Za-z0-9._/-]{1,512}',data) or '..' in Path(data).parts:
+            raise ValueError('invalid_verifier_path')
+        data=Path(data)
+        if any(data.is_relative_to(path) or path.is_relative_to(data) for path in (directory,state,host)):
+            raise ValueError('separate_operator_evidence_required')
+        with local.trusted_directory(data) as fd:
+            if os.fstat(fd).st_mode&0o077:raise ValueError('private_verifier_directory_required')
     private_file(value['identity_file'])
     with local.trusted_directory(Path(value['protected_file']).parent):pass
     return value
@@ -212,13 +226,21 @@ def host_lock(config,wait=None):
         finally:os.close(lock)
 
 
+def valid_resource(item,profile):
+    if (not isinstance(item,list) or len(item)!=3 or not isinstance(item[1],str) or
+            not isinstance(item[2],str) or not re.fullmatch('[a-f0-9]{32}',item[2])):return False
+    if item[0]=='directory':
+        # A run's PostgreSQL data directory (ANYM-634): its exact path, named for its run and profile.
+        path=Path(item[1])
+        return path.is_absolute() and '..' not in path.parts and len(item[1])<=1024 and path.name==names(item[2],profile)['volume']
+    return item[0] in ('helper','postgres','volume','network') and re.fullmatch('deedkit-verify-[a-z0-9-]{32,120}',item[1]) is not None
+
+
 def valid_admission(value):
     if (not isinstance(value,dict) or set(value)!={'v','profile','run','resources','admitted_at'} or
             type(value['v']) is not int or value['v']!=1 or value['profile'] not in r2.PROFILES or
             not isinstance(value['resources'],list) or len(value['resources'])>32 or
-            any(not isinstance(item,list) or len(item)!=3 or item[0] not in ('helper','postgres','volume','network') or
-                not isinstance(item[1],str) or not re.fullmatch('deedkit-verify-[a-z0-9-]{32,120}',item[1]) or
-                not isinstance(item[2],str) or not re.fullmatch('[a-f0-9]{32}',item[2]) for item in value['resources'])):
+            any(not valid_resource(item,value['profile']) for item in value['resources'])):
         raise ValueError('verifier_cleanup_unconfirmed')
     names(value['run'])
     return value
@@ -231,6 +253,7 @@ def clear_admission(engine,fd):
     if record is None:return
     try:
         for kind,name,owner in valid_admission(record)['resources']:
+            if kind=='directory':remove_data_directory(name);continue
             if engine.inspect_owned(kind,name,owner) is not None:engine.remove(kind,name)
             if engine.inspect_owned(kind,name,owner) is not None:raise RuntimeError('verifier_cleanup_unconfirmed')
     except Exception:
@@ -253,10 +276,12 @@ def release_admission(fd):
     local.fsync_dir(fd)
 
 
-def run_resources(run,profile='messaging'):
-    """A run's resources by exact name and owner; a messaging retry may still own its names from before ANYM-609."""
+def run_resources(run,profile='messaging',data=None):
+    """A run's resources by exact name and owner; a messaging retry may still own its names from before ANYM-609.
+    Its data directory (ANYM-634) comes last: removed after the PostgreSQL container that uses it."""
     resources=[names(run,profile),*([legacy_names(run)] if profile=='messaging' else [])]
-    return [(kind,name,run) for resource in resources for kind,name in resource.items()]
+    return [(kind,name,run) for resource in resources for kind,name in resource.items()]+(
+        [('directory',str(data),run)] if data is not None else [])
 
 
 def pair(config):return [config['helper_image'],config['helper_revision']]
@@ -373,6 +398,35 @@ def legacy_names(run):
     return {'helper':base+'-helper','postgres':base+'-postgres','volume':base+'-data','network':base+'-net'}
 
 
+def data_directory(config,run):
+    """The run's PostgreSQL data directory on `postgres_data_directory` (ANYM-634); None: a Docker volume."""
+    root=config.get('postgres_data_directory')
+    return None if root is None else Path(root)/names(run,r2.profile(config))['volume']
+
+
+def make_data_directory(path):
+    """Create a run's data directory, 0700 and the image's postgres user's, under the trusted root 0700
+    parent. Its exact path is in admission.json before this runs."""
+    path=Path(path)
+    with local.trusted_directory(path.parent) as parent:
+        if os.fstat(parent).st_mode&0o077:raise ValueError('private_verifier_directory_required')
+        os.mkdir(path.name,0o700,dir_fd=parent)
+        try:os.chown(path.name,POSTGRES_UID,POSTGRES_UID,dir_fd=parent,follow_symlinks=False)
+        finally:local.fsync_dir(parent)
+
+
+def remove_data_directory(path):
+    """Remove exactly a recorded data directory; a symlink or file there is refused, never followed."""
+    path=Path(path)
+    try:
+        with local.trusted_directory(path.parent) as parent:
+            try:info=os.stat(path.name,dir_fd=parent,follow_symlinks=False)
+            except FileNotFoundError:return
+            if not stat.S_ISDIR(info.st_mode):raise ValueError('verifier_cleanup_unconfirmed')
+            shutil.rmtree(path.name,dir_fd=parent);local.fsync_dir(parent)
+    except FileNotFoundError:return  # no parent: nothing of the run is left there
+
+
 def validate_image_volumes(image):
     # The backup target inherits this one PG18 VOLUME. Override it explicitly;
     # unknown declarations must never silently allocate writable host storage.
@@ -457,13 +511,17 @@ class Docker:
         # Persisted names+ownership precede every create. A dropped response can
         # be reconciled by exact label, never by a generic prune.
         self.command('network','create','--internal',*labels,resource['network'])
-        self.command('volume','create',*labels,resource['volume'])
+        # On `postgres_data_directory` (ANYM-634) the run's directory, created by verify_run, else a volume.
+        data=data_directory(config,run)
+        if data is None:self.command('volume','create',*labels,resource['volume'])
+        storage='type=bind,src='+str(data) if data is not None else 'type=volume,src='+resource['volume']
         common=['--network',resource['network'],'--restart=no','--log-driver=none','--cpus=1','--pids-limit=256',*labels]
+        # Bulk-restore memory inside the 1 GiB limit: 256 MB buffers plus two 256 MB index builds (pg_restore --jobs=2).
         self.command('container','create','--name',resource['postgres'],*common,'--memory=1g','--memory-swap=1g',
                      '--env-file',str(secret_dir/'postgres.env'),'--network-alias','restore-postgres',
-                     '--mount','type=volume,src='+resource['volume']+',dst=/var/lib/postgresql',
-                     config['postgres_image'],'postgres','-c','shared_buffers=64MB','-c','work_mem=8MB',
-                     '-c','maintenance_work_mem=64MB','-c','max_connections=10','-c','max_parallel_workers=0')
+                     '--mount',storage+',dst='+PG_DATA_PATH,
+                     config['postgres_image'],'postgres','-c','shared_buffers=256MB','-c','work_mem=8MB',
+                     '-c','maintenance_work_mem=256MB','-c','max_connections=10','-c','max_parallel_workers=0')
         self.command('container','start',resource['postgres'])
         ready=False
         for _ in range(90):
@@ -555,22 +613,30 @@ def helper_detail(value):
     return None
 
 
-def cleanup_resources(engine,run,profile='messaging'):
+def cleanup_resources(engine,run,profile='messaging',data=None):
     for resource in (names(run,profile),*([legacy_names(run)] if profile=='messaging' else [])):
         for kind in ('helper','postgres','volume','network'):
             if engine.inspect_owned(kind,resource[kind],run) is not None:engine.remove(kind,resource[kind])
+    if data is not None:remove_data_directory(data)
 
 
 def preflight_disk(config,receipt,docker_root):
+    """The payload share on the working directory's filesystem, the database share on the data directory's
+    (`postgres_data_directory`, else Docker's root); on one shared filesystem their sum."""
     wire=receipt['wire']['bytes']
     if wire>config['max_plaintext_bytes']:raise ValueError('restore_plaintext_bound')
-    work=Path(config['directory']);docker_root=Path(docker_root)
+    work=Path(config['directory']);database=Path(config.get('postgres_data_directory',docker_root))
     required=wire+config['postgres_headroom_bytes']+config['reserve_bytes']
-    if os.stat(work).st_dev==os.stat(docker_root).st_dev:
+    if os.stat(work).st_dev==os.stat(database).st_dev:
         if shutil.disk_usage(work).free<required:raise ValueError('restore_disk_capacity')
     elif (shutil.disk_usage(work).free<wire+config['reserve_bytes'] or
-          shutil.disk_usage(docker_root).free<config['postgres_headroom_bytes']+config['reserve_bytes']):
+          shutil.disk_usage(database).free<config['postgres_headroom_bytes']+config['reserve_bytes']):
         raise ValueError('restore_disk_capacity')
+
+
+def reserve_roots(config,docker_root):
+    """The filesystems the reserve monitor watches during a run."""
+    return [config['directory'],docker_root,*([config['postgres_data_directory']] if 'postgres_data_directory' in config else [])]
 
 
 def make_proof(receipt,facts,run,profile='messaging'):
@@ -665,10 +731,12 @@ def write_secret(path,data):
 
 def verify_run(config,receiver,client,engine,journal,fd):
     run=journal['run'];directory=Path(config['directory']);payload=directory/('payload-'+run);secret_dir=directory/('secrets-'+run)
-    cleanup_resources(engine,run,r2.profile(config));remove_payload(directory,run)
+    data=data_directory(config,run)
+    cleanup_resources(engine,run,r2.profile(config),data);remove_payload(directory,run)
     docker_root=engine.preflight(config);preflight_disk(config,journal['receipt'],docker_root)
-    if isinstance(engine,Docker):engine.disk_roots=[config['directory'],docker_root];engine.reserve_bytes=config['reserve_bytes']
+    if isinstance(engine,Docker):engine.disk_roots=reserve_roots(config,docker_root);engine.reserve_bytes=config['reserve_bytes']
     private_file(config['identity_file'])
+    if data is not None:make_data_directory(data)
     payload.mkdir(mode=0o700);secret_dir.mkdir(mode=0o700)
     password=secrets.token_hex(32)
     write_secret(secret_dir/'postgres.env',('POSTGRES_USER=restore_owner\nPOSTGRES_DB='+DATABASE+'\nPOSTGRES_PASSWORD='+password+'\n').encode())
@@ -733,7 +801,8 @@ def run(config,*,client=None,engine=None,path=None):
                         # it waits, so the restore keeps its whole budget; SIGTERM still stops the wait.
                         lock=untimed(engine,host,host_lock(config))
                         # A refused admission keeps the record it could not clear for the next holder.
-                        admit(engine,lock,profile,pending['run'],run_resources(pending['run'],profile));admitted=lock
+                        admit(engine,lock,profile,pending['run'],
+                              run_resources(pending['run'],profile,data_directory(config,pending['run'])));admitted=lock
                     if journal is None:
                         journal=pending;local.write_maintenance_json('active.json',journal,dir_fd=fd)
                     # Even after a marker switch, exact committed candidate remains
@@ -744,7 +813,8 @@ def run(config,*,client=None,engine=None,path=None):
                     else:
                         _,proof=r2.read_root(fd,'proof-'+journal['run']+'.json')
                         r2.validate_proof(proof,journal['receipt'],profile)
-                    cleanup_resources(engine,journal['run'],profile);remove_payload(config['directory'],journal['run'])
+                    cleanup_resources(engine,journal['run'],profile,data_directory(config,journal['run']))
+                    remove_payload(config['directory'],journal['run'])
                     if admitted is not None:release_admission(admitted);host.close();admitted=None
                 # Existing maintenance takes the same upload lock and independently
                 # rechecks full ciphertext, immutable receipts and root marker CAS.
@@ -772,7 +842,9 @@ def run(config,*,client=None,engine=None,path=None):
             if isinstance(engine,Docker):engine=Docker(120)
             # A refused admission created nothing and leaves its retry's resources to the next holder.
             if journal is not None and str(error) not in ('verifier_host_busy','verifier_cleanup_unconfirmed'):
-                try:cleanup_resources(engine,journal['run'],profile);remove_payload(config['directory'],journal['run'])
+                try:
+                    cleanup_resources(engine,journal['run'],profile,data_directory(config,journal['run']))
+                    remove_payload(config['directory'],journal['run'])
                 except Exception:cleanup_ok=False
             if admitted is not None and cleanup_ok:
                 try:release_admission(admitted)
