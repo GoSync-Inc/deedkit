@@ -31,9 +31,57 @@ def observations(value,envelope):
     return result
 
 
+# The pair, then four range probes for another LID of the PN or another PN of the LID (index
+# whatsapp_identity_pn/_lid): each stops at its first row, however often the pair itself repeats.
+SAME_SENDER_SQL='''SELECT EXISTS(SELECT 1 FROM whatsapp_identity_observations
+            WHERE account=%(account)s AND pn=%(pn)s AND lid=%(lid)s AND provenance=ANY(%(provenances)s)) AS linked,
+        EXISTS(SELECT 1 FROM whatsapp_identity_observations WHERE account=%(account)s AND pn=%(pn)s AND lid<%(lid)s)
+        OR EXISTS(SELECT 1 FROM whatsapp_identity_observations WHERE account=%(account)s AND pn=%(pn)s AND lid>%(lid)s)
+        OR EXISTS(SELECT 1 FROM whatsapp_identity_observations WHERE account=%(account)s AND lid=%(lid)s AND pn<%(pn)s)
+        OR EXISTS(SELECT 1 FROM whatsapp_identity_observations WHERE account=%(account)s AND lid=%(lid)s AND pn>%(pn)s)
+        AS fenced'''
+
+
+def store(c,account,mid,item):
+    c.execute('''INSERT INTO whatsapp_identity_observations(account,source_message,identity_id,
+        pn,lid,provenance,first_observed_at,observed_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT(account,source_message,identity_id,pn,lid,provenance) DO UPDATE
+        SET first_observed_at=least(whatsapp_identity_observations.first_observed_at,excluded.first_observed_at),
+            observed_at=greatest(whatsapp_identity_observations.observed_at,excluded.observed_at)''',
+        (account,mid,item['identity_id'],item['pn'],item['lid'],item['provenance'],item['observed_at'],item['observed_at']))
+
+
+def fence(c,account,mid,captured):
+    """Store each captured observation that links a PN or LID to another identity than the account
+    already recorded, against message `mid`, so the account-wide ambiguity fence keeps it whatever the
+    message's outcome (a conflict, a duplicate receipt, an alias re-read whose message keeps the
+    retained sender). Only a contradiction is stored: it makes both pairs ambiguous, so it is never a
+    usable link; a first pair waits for `record` as before. Called under ingest's account lock."""
+    for item in captured or ():
+        row=c.execute(SAME_SENDER_SQL,{'account':account,'pn':item['pn'],'lid':item['lid'],
+            'provenances':sorted(PROVENANCES)}).fetchone()
+        if row['fenced']:store(c,account,mid,item)
+
+
+def same_sender(c,account,retained,candidate):
+    """True when `retained` and `candidate` are one WhatsApp sender in its phone-number and LID forms:
+    this account recorded the pair from an approved provenance, and no observation anywhere in the
+    account (deleted sources included: the fence of visible_cte and resolve_alias, and what `fence`
+    stored from captures) links either side to another. Account-local, network-free; each probe is
+    one index range (`<`/`>` on the last key column), never a scan of a pair's repeats."""
+    forms={personal_id(retained),personal_id(candidate)}
+    pn=next((f for f in forms if f and f.endswith('@c.us')),None);lid=next((f for f in forms if f and f.endswith('@lid')),None)
+    if len(forms)!=2 or not pn or not lid:return False
+    row=c.execute(SAME_SENDER_SQL,{'account':account,'pn':pn,'lid':lid,'provenances':sorted(PROVENANCES)}).fetchone()
+    return bool(row['linked'] and not row['fenced'])
+
+
 def record(archive,envelope,values,lease):
     if not values:return
     with archive.store.pool.connection() as c:
+        # Ingest reads these observations under the account lock (archive.ingest, same_sender):
+        # a mapping commits before or after that read, never between its check and its outcome.
+        c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('archive:'+envelope['account'],))
         archive.fence(c,envelope['account'],lease)
         mid=stable_id('msg',envelope['account'],envelope['chat'],envelope['provider_id'])
         # The independently committed message may have changed since this capture.
@@ -48,14 +96,7 @@ def record(archive,envelope,values,lease):
                 ON CONFLICT(account,chat,sender) DO NOTHING''',
                 (stable_id('person',envelope['account'],stable_id('chat',envelope['account'],envelope['chat']),row['sender']),mid))
         for item in values:
-            if item['identity_id'] not in (row['sender'],row['provider_chat']):continue
-            c.execute('''INSERT INTO whatsapp_identity_observations(account,source_message,identity_id,
-                pn,lid,provenance,first_observed_at,observed_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT(account,source_message,identity_id,pn,lid,provenance) DO UPDATE
-                SET first_observed_at=least(whatsapp_identity_observations.first_observed_at,excluded.first_observed_at),
-                    observed_at=greatest(whatsapp_identity_observations.observed_at,excluded.observed_at)''',
-                (envelope['account'],mid,item['identity_id'],item['pn'],item['lid'],item['provenance'],
-                 item['observed_at'],item['observed_at']))
+            if item['identity_id'] in (row['sender'],row['provider_chat']):store(c,envelope['account'],mid,item)
 
 
 def visible_cte(p):

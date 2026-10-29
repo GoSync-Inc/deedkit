@@ -561,7 +561,7 @@ class CollectorState:
             if e['account']!=self.account: raise ValueError('foreign_capture')
             if not self.allows(self.policy(),e['chat']): return {'outcome':'excluded'}
             self.chat(e['chat'],capture['peer_kind'])
-            result=self.archive.ingest(e,lease=self.lease)
+            result=self.archive.ingest(e,lease=self.lease,identity_observations=capture.get('identity_observations',[]))
             if result['outcome'] not in ('excluded','conflict','stale','tombstoned','deleted'):
                 from .whatsapp_identity import record
                 record(self.archive,e,capture.get('identity_observations',[]),self.lease)
