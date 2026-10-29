@@ -116,15 +116,30 @@ class _DeadlineSocket:
 
 
 class _Connection(http.client.HTTPConnection):
-    def __init__(self, address, host, deadline):
-        super().__init__(host, address[1])
-        self.address, self.deadline = address, deadline
+    def __init__(self, candidates, host, port, deadline):
+        super().__init__(host, port)
+        self.candidates, self.deadline = candidates, deadline
 
     def connect(self):
-        left = self.deadline - time.monotonic()
-        if left <= 0:
-            raise TimeoutError('module_timeout')
-        self.sock = _DeadlineSocket(socket.create_connection(self.address, timeout=left), self.deadline)
+        """Each resolved address in order (as socket.create_connection), all within the one deadline."""
+        failure = OSError('module_unreachable')
+        for family, kind, proto, _, address in self.candidates:
+            left = self.deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError('module_timeout')
+            sock = socket.socket(family, kind, proto)
+            try:
+                sock.settimeout(left)
+                sock.connect(address)
+            except OSError as error:
+                sock.close()
+                if isinstance(error, TimeoutError):
+                    raise
+                failure = error
+                continue
+            self.sock = _DeadlineSocket(sock, self.deadline)
+            return
+        raise failure
 
 
 class HttpModule:
@@ -160,8 +175,8 @@ class HttpModule:
 
         def lookup():
             try:
-                found['address'] = socket.getaddrinfo(self.host, self.port, type=socket.SOCK_STREAM)[0][4][:2]
-            except (OSError, IndexError):
+                found['address'] = socket.getaddrinfo(self.host, self.port, type=socket.SOCK_STREAM) or None
+            except OSError:
                 found['address'] = None
         self._lookup = threading.Thread(target=lookup, name='module-lookup', daemon=True)
         self._lookup.start()
@@ -178,7 +193,7 @@ class HttpModule:
         except OSError:
             raise ModuleUnavailable('token_unreadable') from None
         deadline = time.monotonic() + self.timeout
-        connection, response = _Connection(self._resolve(deadline), self.host, deadline), None
+        connection, response = _Connection(self._resolve(deadline), self.host, self.port, deadline), None
         try:
             connection.request('GET', self.prefix + path + ('?' + urlencode(params) if params else ''),
                 headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/json', 'Connection': 'close'})

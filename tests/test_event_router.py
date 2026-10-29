@@ -761,6 +761,26 @@ def test_router_role_reads_and_moves_only_its_own_rows_and_gateway_reads_tolerat
 
 
 # spec: ANYM-575
+def test_a_refused_first_address_falls_back_to_the_next_within_the_deadline(producers, tmp_path, monkeypatch):
+    producer = producers()
+    producer.add()
+    module = producer.module(tmp_path, timeout_s=2)
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', 0))
+        refused = probe.getsockname()[1]
+    port = producer.server.server_address[1]
+    # A name whose first address refuses (an IPv6 listener that is not there) and whose second answers.
+    monkeypatch.setattr(socket, 'getaddrinfo', lambda *a, **k: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', refused)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', port))])
+    assert module.head() == {'journal_id': 'journal-1', 'head': 1}
+    monkeypatch.setattr(socket, 'getaddrinfo', lambda *a, **k: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', refused))])
+    with pytest.raises(event_router.ModuleUnavailable, match='module_unreachable'):
+        module.head()
+
+
+# spec: ANYM-575
 def test_router_config_refuses_unsafe_or_unknown_settings(tmp_path):
     good = {'modules': [{'source': 'deedkit:calls', 'url': 'http://calls:13842', 'token_file': '/run/secrets/t'}]}
     path = tmp_path / 'router.json'
