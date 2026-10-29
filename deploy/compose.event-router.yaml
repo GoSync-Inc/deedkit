@@ -1,0 +1,51 @@
+# Opt-in overlay (ANYM-575): the module event router. Install module_router_role.sql as owner and
+# configure a separate LOGIN inheriting messaging_module_router; never use the gateway DSN.
+# Private files (owner steps, docs/operations/production.md "Module event router"): the DSN, the
+# router config (event-router.example.json) and one read token per module, each mode 0600.
+services:
+  event-router:
+    image: anymsg-event-router:${MESSAGING_VERSION:-0.9.19}
+    build:
+      context: ..
+      target: runtime
+    command: [python, -m, messaging_service.event_router, --config, /run/secrets/event_router.json]
+    init: true
+    restart: unless-stopped
+    depends_on:
+      db: {condition: service_healthy}
+    environment:
+      DATABASE_URL_FILE: /run/secrets/database_url
+    volumes:
+      - type: bind
+        source: ./private/event-router.dsn
+        target: /run/secrets/database_url
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ./private/event-router.json
+        target: /run/secrets/event_router.json
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ./private/event-router-tokens
+        target: /run/secrets/module-tokens
+        read_only: true
+        bind: {create_host_path: false}
+    # backend reaches the database; integration reaches the modules' read endpoints (calls, calendar-api).
+    networks: [backend, integration]
+    read_only: true
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:size=16m,noexec,nosuid"]
+    mem_limit: 128m
+    cpu_shares: 256
+    pids_limit: 16
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options: {max-size: 5m, max-file: "2"}
+networks:
+  integration:
+    external: true
+    name: ${DEEDKIT_NETWORK:-deedkit-integration}

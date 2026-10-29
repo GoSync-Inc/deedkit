@@ -58,7 +58,8 @@ def main():
         'set-messenger-operations','extend-key','set-feedback-status','export-feedback','release-retention-hold',
         'set-subscription-retention','link-person','unlink-person','delete-person','list-people','set-person-channel','key-info',
         'principal-info','delivery-endpoints-list','disable-delivery-endpoint','enable-delivery-endpoint',
-        'reload-delivery-policy','set-delivery-features','migrate-expand'])
+        'reload-delivery-policy','set-delivery-features','migrate-expand','set-module-cursor','abandon-module-gap',
+        'module-router-status'])
     parser.add_argument('--principal')
     parser.add_argument('--accounts',nargs='+')
     parser.add_argument('--key-file',type=Path)
@@ -118,6 +119,9 @@ def main():
     parser.add_argument('--person',help='link-person: add to this person UUID (default: a new person); delete-person, list-people')
     parser.add_argument('--purpose',choices=['message','call'],help='set-person-channel: the purpose of the preference')
     parser.add_argument('--clear',action='store_true',help='set-person-channel: clear the preference instead of --account')
+    parser.add_argument('--source',help='set-module-cursor, abandon-module-gap: deedkit:calls or deedkit:calendar')
+    parser.add_argument('--after',type=int,help='set-module-cursor: the exclusive module seq to read after; abandon-module-gap: the gap\'s after_seq')
+    parser.add_argument('--gap-kind',choices=['quarantine','retention_gap'],help='abandon-module-gap: the open gap\'s kind')
     args=parser.parse_args()
     if args.command=='migrate-expand': return migrate_expand(args,parser)
     if args.command == 'serve':
@@ -312,6 +316,17 @@ def main():
             if not args.feedback_ids or len(args.feedback_ids)!=1:parser.error(args.command+' requires one --id')
             print(json.dumps(store.set_delivery_endpoint_operator_state(args.feedback_ids[0],
                 args.command=='enable-delivery-endpoint')))
+        elif args.command in ('set-module-cursor','abandon-module-gap','module-router-status'):
+            # ANYM-575: owner steps for the module router; recorded in its cursor and gap rows.
+            from . import event_router
+            if args.command!='module-router-status' and (not args.source or args.after is None):
+                parser.error(args.command+' requires --source and --after')
+            if args.command=='abandon-module-gap' and not args.gap_kind:parser.error('abandon-module-gap requires --gap-kind')
+            with store.pool.connection() as c:
+                if args.command=='set-module-cursor':result=event_router.set_cursor(c,args.source,args.after)
+                elif args.command=='abandon-module-gap':result=event_router.abandon_gap(c,args.source,args.gap_kind,args.after)
+                else:result=event_router.status(c)
+            print(json.dumps(result))
         elif args.command=='audit-tail':
             print(json.dumps(store.audit_tail(args.principal or '',args.limit)))
         else:

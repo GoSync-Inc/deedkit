@@ -962,6 +962,21 @@ from `after` to the floor (the ANYM-446 shape), never an empty complete page. A 
 other than the cursor's, or a `next_after` below the cursor, is a source reset: it is reported and
 never read as new events.
 
+The shared producer contract (ANYM-575; ANYM-563 and ANYM-565 build against this paragraph, and
+`tests/test_event_router.py` runs a reference producer of it over HTTP):
+- Each event in `events` is the envelope above plus one top-level `scope_ref`
+  (`[A-Za-z0-9][A-Za-z0-9._:-]{0,255}`), the module-side owner of the event (calls: the call's
+  `owner_principal`, ANYM-564). The router removes it before `validate_event` and publishes it as
+  the event's scope; messaging never takes a scope from router configuration. No other top-level
+  key and no key outside the type's `data` keys (a rehearsal flag or owner scope included): such an
+  event is quarantined.
+- `GET /v1/events/head` returns `{"journal_id": str, "head": int}` (the highest seq ever
+  assigned). The router reads it once, for a source with no stored cursor.
+- Every request carries `Authorization: Bearer <router read token>`; reads send `after` and
+  `limit` (100). The router refuses a response over 256 KiB or over `limit` events, follows no
+  redirect and gives each request a total deadline (`timeout_s`).
+- A re-fetch of one quarantined seq reads `?after=<seq-1>&limit=1`.
+
 Publishing: only `publish_module_event(...)`, a definer function with a fixed search path and no
 PUBLIC execute; it applies the whole contract again through `module_event_valid` (every key, rule,
 bound, the subject, the id's module, the urgency and expiry rules and the data size), so a caller
@@ -1031,6 +1046,62 @@ writer) first, then cancel pending module hints
 WHERE kind='module_events' AND state IN ('pending','leased')`), because an older dispatcher would
 send them as message hints, then deploy. The module tables stay; an older matcher stages no module
 hint, and the fence holds every module stream an older runtime resumes.
+
+### Module event router (ANYM-575, schema 59)
+
+`messaging_service/event_router.py` is a worker (overlay `deploy/compose.event-router.yaml`) that
+pulls each configured module (`deploy/event-router.example.json`) and publishes into the module
+journal. Per page: the HTTP read, the page checks and each event's contract check run with no
+database transaction open; then one database-only transaction, bounded on the server
+(`lock_timeout` 1 s, `statement_timeout` 2 s, `transaction_timeout` 5 s,
+`idle_in_transaction_session_timeout` 5 s), publishes the events through `publish_module_event`
+and advances the stored cursor (`module_router_cursors`: `source`, `after_seq`, `journal_id`)
+in the same commit, compare-and-set against the cursor read before the network step. A crash
+before the commit publishes nothing; a crash after it reads from the stored cursor; a replay
+returns the stored seq for each `event_key`, so no event is journaled twice.
+
+- First contact: the cursor is the module's head, unless the operator set one before
+  (`python -m messaging_service set-module-cursor --source <s> --after <n>`); an earlier `after`
+  replays idempotently.
+- A malformed event (contract refused, wrong source, missing `scope_ref`, or a definer-side
+  refusal or `module_event_conflict`) is quarantined in `module_router_gaps` with its seq and the
+  rule's code, never its content; the page continues past it. A refused event that names no
+  usable seq is held as the range up to the next valid event. A pruned range (`retention_floor`
+  above the cursor) is a `retention_gap` row; a new `journal_id` or a cursor going back is a
+  `source_reset` row and the router stops reading that source until the operator sets its
+  cursor again. Ordering breaks (`seq_not_increasing`, `next_after_behind_events`) refuse the page.
+- While a source has an open gap, `module_stream.sources[].coverage` is `incomplete` and
+  `module_stream.health` lists `{source, state: "module_gap", since}` (the oldest open gap). Each
+  pass re-fetches up to four quarantined ranges; one whose events all pass is published and
+  resolved `refetched`. The owner abandons one explicitly with `python -m messaging_service
+  abandon-module-gap --source <s> --gap-kind quarantine|retention_gap --after <after_seq>`
+  (recorded as `abandoned` with its time); `module-router-status` lists cursors and open gaps.
+- A module that does not answer, answers slowly (past `timeout_s`), with a non-200 status or with a
+  broken page is reported through `report_module_reachability` (`module_unreachable`) and
+  cleared by the next good answer. The router never writes a message row or takes the
+  `feed_counter` lock, so message writes and hints never wait for it.
+- Role: `messaging_module_router` executes the two definer functions and reads and writes only
+  its own cursor and gap rows (`module_router_role.sql`). The gateway reads open gaps
+  (`gateway_role.sql`); before that grant, `get_subscription` shows no `module_gap`.
+
+What leaves the process. To a module: the bearer token, `after` and `limit`. Into the database:
+the envelope and its `scope_ref` (references only, `validate_event`). Logs: one JSON line per
+failure, `{event: "module_router", source, code}` with a fixed code (`module_timeout`,
+`module_http_status`, `module_auth_refused`, `module_unreachable`, a contract rule, ...); never
+a URL, token, response body or event field. Telemetry (opt-in): `module_router_failed` with
+the exception type and frames only. A delivered module hint carries no event body:
+
+- a self-service endpoint body is `{type: "module_events", hint_id, subscription_id, version,
+  label, references, references_omitted, next_call}`, and each reference is `{module_event_id,
+  type, source, subject, urgency, expires_at}`: the kind, the subject reference and the module,
+  plus the stream position and the delivery attributes; `data` is read only through the fetch;
+- an operator receiver body is `{hint_id, subscription_id, subscription_version, through, kind:
+  "module_events", host_turn_verified}`, with no reference at all.
+
+Delivery honours the contract (ANYM-562 paths): an event whose `expires_at` passed is never
+matched, and a hint whose events all expired is cancelled at every attempt; a hint holding an
+`urgency=now` event bypasses quiet hours and is never batched, and still takes a slot of the
+key's budget; `batch` events are hinted after each matcher pass and wait for quiet hours.
 
 ## Remaining extensions and verification boundaries
 
