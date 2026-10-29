@@ -388,24 +388,79 @@ def _test_view(row):
     return serial(view)
 
 
-def _tests(c, endpoint_id):
-    return c.execute('''SELECT id,endpoint,request_id,state,http_status,latency_ms,error_code,created_at,finished_at
-        FROM delivery_endpoint_tests WHERE endpoint=%s ORDER BY created_at DESC,id DESC LIMIT 1''', (endpoint_id,)).fetchone()
+TEST_COLUMNS = ('id', 'endpoint', 'request_id', 'state', 'http_status', 'latency_ms', 'error_code', 'created_at',
+    'finished_at')
+# ANYM-583: every input of health and of the vendor refusal in one statement, so a test or hint finishing meanwhile
+# never yields a mix of before and after; each read is bounded by its partial index (059).
+SIGNAL = '''SELECT l.id,l.endpoint,l.request_id,l.state,l.http_status,l.latency_ms,l.error_code,l.created_at,
+    l.finished_at,f.state AS finished_state,dt.finished_at AS delivered_test,dh.finished_at AS delivered_hint,
+    rt.finished_at AS refused_test,rt.http_status AS refused_status,rh.finished_at AS refused_hint FROM (SELECT) one
+    LEFT JOIN LATERAL (SELECT id,endpoint,request_id,state,http_status,latency_ms,error_code,created_at,finished_at
+        FROM delivery_endpoint_tests WHERE endpoint=%(endpoint)s ORDER BY created_at DESC,id DESC LIMIT 1) l ON true
+    LEFT JOIN LATERAL (SELECT state FROM delivery_endpoint_tests WHERE endpoint=%(endpoint)s
+        AND state IN ('delivered','failed') ORDER BY finished_at DESC,id DESC LIMIT 1) f ON true
+    LEFT JOIN LATERAL (SELECT finished_at FROM delivery_endpoint_tests WHERE endpoint=%(endpoint)s AND state='delivered'
+        ORDER BY finished_at DESC,id DESC LIMIT 1) dt ON true
+    LEFT JOIN LATERAL (SELECT finished_at,http_status FROM delivery_endpoint_tests WHERE endpoint=%(endpoint)s
+        AND state='failed' AND error_code='vendor_refused' ORDER BY finished_at DESC,id DESC LIMIT 1) rt ON true
+    LEFT JOIN LATERAL (SELECT finished_at FROM subscription_outbox WHERE endpoint=%(endpoint)s AND endpoint IS NOT NULL
+        AND state='delivered' ORDER BY finished_at DESC,id DESC LIMIT 1) dh ON true
+    LEFT JOIN LATERAL (SELECT finished_at FROM subscription_outbox WHERE endpoint=%(endpoint)s AND endpoint IS NOT NULL
+        AND state='dead_letter' AND error_code='vendor_refused' ORDER BY finished_at DESC,id DESC LIMIT 1) rh ON true'''
+REFUSAL_CAUSE = ('the vendor refused the key with HTTP 401 or 403: the key was rotated or revoked, or the routine was '
+    'deleted or lost permission')
+
+
+def refusal_step(endpoint_id, state, header_names):
+    """The fixed next step of a vendor refusal (ANYM-583; ANYM-520 reuses it): the cause, the stored header names (never
+    values) and call templates valid for the endpoint's state. set_headers replaces every header, so it names each."""
+    names = list(header_names) or ['Authorization']
+    target = 'endpoint_id=' + json.dumps(str(endpoint_id))
+    headers = ', '.join(json.dumps(name) + ': ' + json.dumps('Bearer <new key>' if name.lower() == 'authorization'
+        else '<value>') for name in names)
+    replace = f'`update_delivery_endpoint({target}, version=<version>, action="set_headers", headers={{{headers}}})`'
+    test = f'`test_delivery_endpoint({target}, request_id="<new request id>")`'
+    text = f'{REFUSAL_CAUSE}. Stored header names: {", ".join(names)}. '
+    if state in ('agent_paused', 'auto_paused'):
+        return text + (f'The endpoint is {state} and a paused endpoint refuses a test: call {replace}, then '
+            f'`update_delivery_endpoint({target}, version=<new version>, action="resume")` with the version it '
+            f'returned, then {test}.')
+    if state == 'operator_disabled':
+        return text + ('The endpoint is operator_disabled: only the operator can re-enable it, so ask the operator; '
+            f'call {replace}, then, once it is enabled, {test}.')
+    return text + f'Call {replace}, then {test}.'
+
+
+def _signal(c, row):
+    """(the latest-created test, health, last_error) of an endpoint row from one snapshot (ANYM-583). The refusal is
+    the newest vendor_refused hint or test by finished_at, shown while it finished after the newest delivered hint and
+    test; only a delivery clears it."""
+    found = c.execute(SIGNAL, {'endpoint': row['id']}).fetchone()
+    last = {name: found[name] for name in TEST_COLUMNS} if found['id'] is not None else None
+    health = {'delivered': 'ok', 'failed': 'failing'}.get(found['finished_state'], 'unknown')
+    # On a tie the test wins: it carries the HTTP status.
+    refusals = [(at, test) for at, test in ((found['refused_test'], True), (found['refused_hint'], False)) if at]
+    at, test = max(refusals) if refusals else (None, False)
+    if at is None or any(delivered is not None and delivered >= at
+            for delivered in (found['delivered_test'], found['delivered_hint'])):
+        return last, health, None
+    error = {'code': 'vendor_refused', 'at': at}
+    if test:
+        error['http_status'] = found['refused_status']
+    error['next_step'] = refusal_step(row['id'], row['state'], row['header_names'])
+    return last, 'failing', error
 
 
 def _view(c, row):
     from .store import serial
-    last, policy = _tests(c, row['id']), load_policy()
-    finished = c.execute('''SELECT state FROM delivery_endpoint_tests WHERE endpoint=%s AND state IN ('delivered','failed')
-        ORDER BY finished_at DESC,id DESC LIMIT 1''', (row['id'],)).fetchone()
+    (last, health, last_error), policy = _signal(c, row), load_policy()
     rotation = None if row['rotation_started_at'] is None else {'pending_fingerprint': row['pending_fingerprint'],
         'started_at': row['rotation_started_at'], 'promotes_at': row['rotation_started_at'] + _day()}
     return serial({'endpoint_id': row['id'], 'version': row['version'], 'state': row['state'], 'url': row['url'],
         'host': row['host'], 'label': row['label'], 'header_names': list(row['header_names']),
         'headers_fingerprint': row['headers_fingerprint'], 'secret_fingerprint': row['secret_fingerprint'],
         'rotation': rotation, 'created_at': row['created_at'], 'updated_at': row['updated_at'],
-        'health': {'delivered': 'ok', 'failed': 'failing'}[finished['state']] if finished else 'unknown',
-        'last_test': _test_view(last), 'signature_scheme': SCHEME,
+        'health': health, 'last_error': last_error, 'last_test': _test_view(last), 'signature_scheme': SCHEME,
         'vendor': vendor_of(policy, row['host'], row['url']), 'at_most_once': at_most_once(policy, row['host'], row['url'])})
 
 
@@ -621,6 +676,19 @@ def endpoint_test(c, p, endpoint_id, request_id):
     return _test_view(row)
 
 
+def endpoint_signal(c, p, endpoint_id):
+    """Read-only health and last_error of an owned endpoint once its inline test finished; None if absent."""
+    if not {'read', 'delivery-write'} <= set(p['permissions']):
+        raise _error('forbidden', 403)
+    row = c.execute('''SELECT id,state,header_names FROM delivery_endpoints WHERE id=%s AND principal=%s AND key_id=%s
+        AND state<>'deleted' ''', (_endpoint_id(endpoint_id), p['id'], p['key_id'])).fetchone()
+    if row is None:
+        return None
+    from .store import serial
+    _, health, last_error = _signal(c, row)
+    return serial({'health': health, 'last_error': last_error})
+
+
 async def finish_inline_test(store, token, result, *, wait_s=10.0):
     """Wait up to wait_s for the dispatcher to finish the staged test; past it the test stays pending."""
     block = result.get('test') if 'test' in result else result
@@ -639,6 +707,10 @@ async def finish_inline_test(store, token, result, *, wait_s=10.0):
     result = {**result, 'test': current, 'last_test': current}
     if current['test_status'] in ('delivered', 'failed'):
         result['health'] = 'ok' if current['test_status'] == 'delivered' else 'failing'
+        # ANYM-583: the refusal belongs to the endpoint, so it is read again together with the finished test.
+        signal = await asyncio.to_thread(store.delivery_endpoint_signal, token, block['endpoint_id'])
+        if signal is not None:
+            result.update(signal)
     if current.get('next_step'):
         result['next_step'] = current['next_step']
     return result

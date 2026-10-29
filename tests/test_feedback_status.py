@@ -89,7 +89,7 @@ def test_feedback_status_migration(schema38_store):
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '58'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '59'
         assert c.execute('SELECT * FROM archive_migrations WHERE version<=38 ORDER BY version').fetchall() == migrations
         assert c.execute('SELECT sha256 FROM archive_migrations WHERE version=39').fetchone()['sha256'] == \
             hashlib.sha256(SOURCE.joinpath('migrations/039_feedback_status.sql').read_bytes()).hexdigest()
@@ -144,7 +144,7 @@ def test_feedback_status_backup_round_trip(seeded, tmp_path):
     docker = ['docker', 'exec', '-i', '-e', 'PGPASSWORD=' + values['password'], container]
     create_snapshot(source, tmp_path / 'capture', [*docker, 'pg_dump', '--format=custom', '--dbname=' + container_dsn])
     manifest = verify_bundle(tmp_path / 'capture')
-    assert manifest['schema_version'] == 58 and manifest['tables']['agent_feedback']['rows'] == 3
+    assert manifest['schema_version'] == 59 and manifest['tables']['agent_feedback']['rows'] == 3
     name = 'anymsg_feedback_' + uuid4().hex + '_restore_test'
     restored = None
     created = False
