@@ -1,6 +1,6 @@
 """Durable ingestion and worker leases. Used only by operator/collector DB roles."""
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime,timedelta
 import hashlib
 import os
 import stat
@@ -35,6 +35,31 @@ WHATSAPP_USER=re.compile(r'([0-9]+)(?::[0-9]+)?@(lid|c\.us)')
 
 def whatsapp_user(sender):
     match=WHATSAPP_USER.fullmatch(sender); return match.groups() if match else None
+
+
+# WhatsApp states message times in whole seconds (metadata `timestamp_resolution`), and its live,
+# history and reconcile paths can read one message's time a few seconds apart (ANYM-530 class A).
+WHATSAPP_SENT_AT_TOLERANCE=timedelta(seconds=6)
+REVISION_FIELDS=('message','provider_chat','chat','revision')
+
+
+def whatsapp_sent_at_jitter(retained,candidate):
+    """True when a WhatsApp observation differs from the retained revision only by a sent time at
+    most WHATSAPP_SENT_AT_TOLERANCE apart, both sides stating second resolution. `retained` is the
+    revision snapshot, `candidate` a validated envelope. Pure, so the conflict re-evaluation can call
+    it; evidence it cannot read is no tolerance, never an exception inside ingest."""
+    try:
+        if candidate['platform']!='whatsapp' or retained['platform']!='whatsapp' or retained['deleted'] or candidate['deleted']:
+            return False
+        if any(side.get('metadata',{}).get('timestamp_resolution')!='second' for side in (retained,candidate)):return False
+        gap=abs(datetime.fromisoformat(candidate['sent_at'])-datetime.fromisoformat(retained['sent_at']))
+        if not timedelta(0)<gap<=WHATSAPP_SENT_AT_TOLERANCE:return False
+        # Formatting the candidate does not know is inherited, as for an exact re-read; known formatting must agree.
+        if known_formatting(candidate.get('formatting')) and candidate.get('formatting')!=retained.get('formatting'):return False
+        envelope={**{k:v for k,v in retained.items() if k not in REVISION_FIELDS},'chat':retained['provider_chat']}
+        return fingerprint({**candidate,'sent_at':retained['sent_at']})==fingerprint(envelope)
+    except (KeyError,TypeError,ValueError,AttributeError):
+        return False
 
 
 class Archive:
@@ -179,11 +204,20 @@ class Archive:
                 and not old['deleted'] and old['provider_updated_at']==updated and content!=old['content_hash']
                 and fingerprint({**e,'body':retained_snapshot.get('body',''),
                     'media':retained_snapshot.get('media',[])})==old['content_hash'])
+            # A WhatsApp re-read whose sent time is a few seconds off, everything else equal, is the
+            # retained revision. An unedited message's provider version is its sent time, so a version
+            # no later than the retained one plus that offset is no later evidence: the stored version
+            # stays and it resolves no conflict. A later version (an edit time) counts as for an exact re-read.
+            sent_at_jitter=bool(old and retained_snapshot and whatsapp_sent_at_jitter(retained_snapshot,e)
+                and fingerprint({**e,'sent_at':retained_snapshot['sent_at']})==old['content_hash'])
+            jitter_version=bool(sent_at_jitter and old['provider_updated_at'] is not None and updated<=old['provider_updated_at']
+                +max(datetime.fromisoformat(e['sent_at'])-old['sent_at'],timedelta(0)))
             if old:
                 if old['deleted'] and not e['deleted']: outcome='tombstoned'
                 elif sender_completed:outcome='edited'
                 elif sender_device_only:outcome='unchanged'
                 elif unreadable:outcome='unchanged'
+                elif sent_at_jitter:outcome='stale' if old['provider_updated_at'] and updated<old['provider_updated_at'] else 'unchanged'
                 elif (old['sent_at']!=datetime.fromisoformat(e['sent_at']) or old['direction']!=e['direction']
                       or old['sender']!=e['sender']): outcome='conflict'
                 elif old['content_hash']==content and not (formatting_changed or formatting_completed): outcome='unchanged'
@@ -195,7 +229,7 @@ class Archive:
             # An incomplete observation of the same retained provider body must
             # not erase known formatting, including authenticated sender repair.
             inherited_format=bool(old and known_retained and not known_candidate and not e['deleted']
-                and (old['content_hash']==content or sender_completed))
+                and (old['content_hash']==content or sender_completed or sent_at_jitter))
             if inherited_format:e={**e,'formatting':old_format}
             if outcome in ('created','edited','deleted'):
                 revision=old['revision']+1 if old else 1
@@ -221,7 +255,7 @@ class Archive:
                 # no-op active updates which otherwise enqueue extraction again.
                 c.execute('''UPDATE attachments SET active=(id=ANY(%s)) WHERE message=%s
                     AND active IS DISTINCT FROM (id=ANY(%s))''',(media_ids,mid,media_ids))
-            elif outcome=='unchanged':
+            elif outcome=='unchanged' and not jitter_version:
                 c.execute('UPDATE messages SET provider_updated_at=greatest(provider_updated_at,%s) WHERE id=%s',(updated,mid))
             if outcome in ('created','edited','unchanged') and not e['deleted'] and e['sender'] and not sender_device_only and not unreadable:
                 # Identity hints come only from this message's provider payload,
@@ -280,7 +314,7 @@ class Archive:
                 else:c.execute('''INSERT INTO message_conflicts(receipt_digest,message,observed_revision,
                     candidate_updated_at,observed_at) VALUES(%s,%s,%s,%s,clock_timestamp())''',
                     (receipt,mid,old['revision'],updated))
-            elif outcome in ('edited','deleted','unchanged') and not sender_device_only and not unreadable:
+            elif outcome in ('edited','deleted','unchanged') and not sender_device_only and not unreadable and not jitter_version:
                 # A repeated copy of the retained revision does not resolve an
                 # equal/newer conflicting observation. Only later evidence does.
                 c.execute('''UPDATE message_conflicts mc SET resolved_at=clock_timestamp(),

@@ -208,6 +208,148 @@ def test_telegram_sender_with_a_colon_is_not_a_whatsapp_device(archive):
     assert s.search(key)['items'][0]['sender']=='900:7@lid'
 
 
+def jitter_event(**changes):
+    # A WhatsApp message nobody edited carries its sent time as its provider version.
+    if 'sent_at' in changes:changes.setdefault('updated_at',changes['sent_at'])
+    value=whatsapp_event(changes.pop('sender','900@lid'),**{'formatting':wire(),'metadata':{'timestamp_resolution':'second'},
+        **changes})
+    if not value['metadata']:del value['metadata']
+    if value['formatting'] is None:del value['formatting']
+    return value
+
+
+def shifted(seconds):
+    return (datetime(2026,10,1,12,tzinfo=timezone.utc)+timedelta(seconds=seconds)).isoformat()
+
+
+def stored_conflicts(s,mid):
+    with s.pool.connection() as c:
+        return [r['reason'] for r in c.execute('SELECT reason FROM message_conflicts WHERE message=%s',(mid,))]
+
+
+def retained_row(s,mid):
+    with s.pool.connection() as c:
+        message=c.execute('SELECT sent_at,provider_updated_at FROM messages WHERE id=%s',(mid,)).fetchone()
+        snapshots=c.execute('SELECT snapshot FROM message_revisions WHERE message=%s',(mid,)).fetchall()
+        metadata=c.execute('SELECT metadata FROM message_metadata WHERE message=%s',(mid,)).fetchone()
+    return message['sent_at'],message['provider_updated_at'],[r['snapshot']['sent_at'] for r in snapshots],metadata['metadata']
+
+
+# spec: ANYM-558
+@pytest.mark.parametrize('seconds,updated',[(1,1),(6,6),(-1,0),(-6,0)])
+def test_whatsapp_sent_at_jitter_is_not_a_conflict(archive,seconds,updated):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    mid=ar.ingest(jitter_event())['message']
+    before=retained_row(s,mid)
+    observed=jitter_event(sent_at=shifted(seconds),updated_at=shifted(updated),origin='backfill',
+        sender_profile={'display_name':'Synthetic Owner'},metadata={'timestamp_resolution':'second','message_kind':'text'})
+    assert ar.ingest(observed)['outcome']=='unchanged'
+    # The retained revision, its sent time and version stay; nothing is recorded as a conflict. What the
+    # re-read newly states about the same revision (metadata, the sender's profile) is kept, as for any re-read.
+    assert sender_rows(s,mid)==('900@lid',1,['900@lid'],0) and stored_conflicts(s,mid)==[]
+    after=retained_row(s,mid)
+    assert after[:3]==before[:3]==(datetime(2026,10,1,12,tzinfo=timezone.utc),datetime(2026,10,1,12,tzinfo=timezone.utc),
+        ['2026-10-01T12:00:00+00:00'])
+    assert before[3]=={'timestamp_resolution':'second'} and after[3]=={'timestamp_resolution':'second','message_kind':'text'}
+
+
+# spec: ANYM-558
+@pytest.mark.parametrize('seconds',[-1,-6])
+def test_whatsapp_sent_at_jitter_in_an_older_observation_is_stale(archive,seconds):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    mid=ar.ingest(jitter_event())['message']
+    before=retained_row(s,mid)
+    assert ar.ingest(jitter_event(sent_at=shifted(seconds),origin='backfill'))['outcome']=='stale'
+    assert sender_rows(s,mid)==('900@lid',1,[],0) and stored_conflicts(s,mid)==[] and retained_row(s,mid)==before
+
+
+# spec: ANYM-558
+def test_whatsapp_sent_at_jitter_is_no_later_evidence(archive):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    mid=ar.ingest(jitter_event())['message']
+    assert ar.ingest(jitter_event(body='contradiction',formatting=wire('contradiction')))['outcome']=='conflict'
+    # Its version is the jittered sent time, not a later provider state: the open conflict stays,
+    # and a contradiction at the retained version is still a conflict, not stale.
+    assert ar.ingest(jitter_event(sent_at=shifted(1)))['outcome']=='unchanged'
+    assert sender_rows(s,mid)==('900@lid',1,[],1)
+    assert ar.ingest(jitter_event(body='another contradiction',formatting=wire('another contradiction')))['outcome']=='conflict'
+    # A real later edit still applies and resolves both.
+    assert ar.ingest(jitter_event(body='Вторая версия',formatting=wire('Вторая версия'),
+        updated_at='2026-10-01T12:01:00+00:00'))['outcome']=='edited'
+    assert sender_rows(s,mid)==('900@lid',2,[],0)
+
+
+# spec: ANYM-558
+def test_whatsapp_sent_at_jitter_with_a_later_edit_time_is_later_evidence(archive):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    mid=ar.ingest(jitter_event())['message']
+    assert ar.ingest(jitter_event(body='contradiction',formatting=wire('contradiction')))['outcome']=='conflict'
+    # The same text with an edit time beyond the offset: the stored version moves on, as for an exact
+    # re-read, and the older contradiction is resolved.
+    assert ar.ingest(jitter_event(sent_at=shifted(1),updated_at=shifted(60)))['outcome']=='unchanged'
+    assert retained_row(s,mid)[:3]==(datetime(2026,10,1,12,tzinfo=timezone.utc),datetime(2026,10,1,12,1,tzinfo=timezone.utc),
+        ['2026-10-01T12:00:00+00:00'])
+    assert sender_rows(s,mid)==('900@lid',1,[],0)
+    # Another text at an earlier version is then stale, not an edit.
+    assert ar.ingest(jitter_event(body='Вторая версия',formatting=wire('Вторая версия'),
+        updated_at=shifted(30)))['outcome']=='stale'
+    assert sender_rows(s,mid)==('900@lid',1,[],0)
+
+
+# spec: ANYM-558
+@pytest.mark.parametrize('retained,candidate',[
+    ({},{'sent_at':shifted(7)}),({},{'sent_at':shifted(-7)}),({},{'sent_at':shifted(60)}),
+    ({'metadata':{}},{'sent_at':shifted(1)}),
+    ({'metadata':{'timestamp_resolution':'unknown'}},{'sent_at':shifted(1)}),
+    ({},{'sent_at':shifted(1),'metadata':{'timestamp_resolution':'unknown'}}),
+    ({},{'sent_at':shifted(1),'metadata':{}}),
+    ({},{'sent_at':shifted(1),'direction':'incoming'}),
+    ({},{'sent_at':shifted(1),'sender':'901@lid'}),
+    ({},{'sent_at':shifted(1),'sender':'900:7@lid'}),
+    ({},{'sent_at':shifted(1),'sender':''}),
+    ({},{'sent_at':shifted(1),'body':'contradiction','formatting':wire('contradiction')}),
+    ({},{'sent_at':shifted(1),'media':[{'provider_id':'f1','mime':'image/jpeg','bytes':10,'filename':'p.jpg'}]}),
+    ({'formatting':{'version':1,'state':'unknown','basis':None,'wire_sha256':None,'entities':None,
+        'unsupported_entities':[],'warnings':['native_entities_not_captured']}},{'sent_at':shifted(1)}),
+    ({'formatting':None},{'sent_at':shifted(1)}),
+    ({},{'sent_at':shifted(1),'deleted':True,'body':'','formatting':None}),
+    ({},{'sent_at':shifted(1),'updated_at':shifted(60),'body':'contradiction','formatting':wire('contradiction')})])
+def test_whatsapp_sent_at_jitter_rule_keeps_other_differences_in_conflict(archive,retained,candidate):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    mid=ar.ingest(jitter_event(**retained))['message']
+    assert ar.ingest(jitter_event(**candidate))['outcome']=='conflict'
+    # The class names the sent time, the first field ingest compares (ANYM-557).
+    assert sender_rows(s,mid)==('900@lid',1,[],1)
+    relation='older' if candidate['sent_at']<shifted(0) else 'newer'
+    assert stored_conflicts(s,mid)==[f'whatsapp_sent_at_{relation}_version']
+
+
+# spec: ANYM-558
+def test_whatsapp_sent_at_jitter_rule_is_whatsapp_only(archive):
+    ar,s,key,_=archive
+    mid=ar.ingest(event(metadata={'timestamp_resolution':'second'}))['message']
+    assert ar.ingest(event(sent_at=shifted(1),updated_at=shifted(1),
+        metadata={'timestamp_resolution':'second'}))['outcome']=='conflict'
+    assert stored_conflicts(s,mid)==['telegram_sent_at_newer_version']
+
+
+# spec: ANYM-558
+def test_whatsapp_sent_at_jitter_rule_is_a_pure_function_of_two_observations():
+    from messaging_service.archive import whatsapp_sent_at_jitter
+    retained={**validate(jitter_event()),'message':'m','provider_chat':'900@lid','chat':'c','revision':1}
+    assert whatsapp_sent_at_jitter(retained,validate(jitter_event(sent_at=shifted(2))))
+    assert not whatsapp_sent_at_jitter(retained,validate(jitter_event(sent_at=shifted(7))))
+    assert not whatsapp_sent_at_jitter(retained,validate(jitter_event()))
+    # Evidence it cannot read is no tolerance, never an exception inside ingest.
+    for broken in (None,{},{**retained,'sent_at':'not a time'},{**retained,'metadata':'second'}):
+        assert not whatsapp_sent_at_jitter(broken,validate(jitter_event(sent_at=shifted(1))))
+
+
 def test_delete_tombstone_does_not_resurrect_and_search_hides(archive):
     ar,s,key,_=archive
     mid=ar.ingest(event())['message']
