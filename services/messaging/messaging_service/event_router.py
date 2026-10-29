@@ -121,28 +121,17 @@ class _Connection(http.client.HTTPConnection):
         self.candidates, self.deadline = candidates, deadline
 
     def connect(self):
-        """Each resolved address in order (as socket.create_connection), all within the one deadline."""
-        failure = OSError('module_unreachable')
-        for family, kind, proto, _, address in self.candidates:
-            left = self.deadline - time.monotonic()
-            if left <= 0:
-                raise TimeoutError('module_timeout')
-            sock = None
-            try:
-                # Inside the try: a family the host cannot open (EAFNOSUPPORT for IPv6) moves to the next address.
-                sock = socket.socket(family, kind, proto)
-                sock.settimeout(left)
-                sock.connect(address)
-            except OSError as error:
-                if sock is not None:
-                    sock.close()
-                if isinstance(error, TimeoutError):
-                    raise
-                failure = error
-                continue
-            self.sock = _DeadlineSocket(sock, self.deadline)
-            return
-        raise failure
+        """socket.create_connection's fallback over every resolved address, each attempt bounded by the time
+        left divided by the number of addresses the bounded lookup found, so N attempts fit the deadline.
+
+        create_connection resolves the name again; the bounded lookup has just answered, so that is the
+        resolver's cache, not a new unbounded wait in practice (follow-up card: one total connect deadline).
+        """
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError('module_timeout')
+        sock = socket.create_connection((self.host, self.port), timeout=left / max(1, len(self.candidates)))
+        self.sock = _DeadlineSocket(sock, self.deadline)
 
 
 class HttpModule:
