@@ -157,7 +157,12 @@ LIST_CHATS_OUTPUT_PROPERTIES={
         'awaiting_reply':{'description':'Conversation compact hint; carries likely_promotional (true) and '
             'promotional_basis ('+PROMOTIONAL_BASIS+')'},
         'awaiting_reply_likely_promotional':{'description':'Store, view=archive and detail=full rows: true when likely promotional; absent otherwise.'},
-        'awaiting_reply_promotional_basis':{'description':'Store, view=archive and detail=full rows: '+PROMOTIONAL_BASIS}}}}}
+        'awaiting_reply_promotional_basis':{'description':'Store, view=archive and detail=full rows: '+PROMOTIONAL_BASIS},
+        'waiting':{'type':'object','description':'awaiting_their_reply=true rows: the owner\'s unanswered run (ANYM-537).'}}}},
+    'uncertain_total':{'type':'integer','minimum':0,'description':
+        'awaiting_their_reply=true: chats left out because their head order or kind is unknown.'},
+    'excluded_without_question_total':{'type':'integer','minimum':0,'description':
+        'awaiting_their_reply=true with only_questions=true: runs left out because no message asks a question.'}}
 def subscription_expiry(value):
     """Validate a zoned ISO timestamp without coercing or echoing input values."""
     try:
@@ -787,7 +792,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
 
     @mcp.tool(structured_output=True, annotations=read)
     def list_chats(ctx: Context, after: str='', limit: int=25, accounts: list[StrictStr] | None=None,
-                   query: str='', chat_types: list[Literal['private','group','channel','unknown']] | None=None, order: Literal['id','activity','last_activity_desc','priority']='activity',
+                   query: str='', chat_types: list[Literal['private','group','channel','unknown']] | None=None,
+                   order: Literal['id','activity','last_activity_desc','priority','waiting_longest']='activity',
                    exclude_channels: bool=False, awaiting_reply: bool=False,
                    from_time: str='', to_time: str='', include_coverage: bool | None=None, detail: Detail='compact',
                    awaiting_reply_days: StrictInt=14,exclude_chats: list[StrictStr] | None=None,
@@ -795,7 +801,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
                    view: ConversationView='conversation',exclude_likely_broadcasts: bool=False,
                    include_muted: bool=False,promotional: Literal['exclude','include','only']='exclude',
                    my_roles: list[Literal['creator','admin','member','left','unknown']] | None=None,
-                   can_post: StrictBool | None=None) -> dict[str, Any]:
+                   can_post: StrictBool | None=None,awaiting_their_reply: StrictBool=False,
+                   min_wait_hours: StrictInt | None=None) -> dict[str, Any]:
         """List permitted chats. order: activity (default) or last_activity_desc = recent first;
         id = stable catalogue traversal. awaiting_reply: private incoming, excluding known bots,
         or explicit group owner mention/reply; heuristic, not obligation. Attention expires after
@@ -816,6 +823,17 @@ def create_app(store: Store, allowed_hosts: list[str]):
         While this agent has a mute the queue reports muted_total (rows mutes remove); include_muted=true
         (queue only) returns them with awaiting_reply.muted chat or sender. A due snooze returns with
         snoozed_until and snooze_due.
+        awaiting_their_reply=true with order=waiting_longest (only together; not with awaiting_reply): private chats where
+        the owner wrote last and the peer has not written back, longest wait first. A row means no written reply in this
+        archived chat (the peer may have answered by phone or elsewhere). The run is the owner's messages after the
+        peer's last one; a reaction or service event is no answer. Listed when its first message is min_wait_hours
+        (default 24, 0-720) old and within awaiting_reply_days; never for a run of courtesies only (thanks, ok).
+        only_questions=true (recommended here) keeps runs that ask a question and reports excluded_without_question_total.
+        Groups, channels, self chats, own accounts and observed bots are left out. A chat whose head order or kind is
+        unknown is left out and counted in uncertain_total. Row waiting: since (first message), count, receipt (absent
+        when unknown), confidence (an unverified head's code), suggested_action check_delivery (receipt error, pending
+        or server; absent means await_peer), last_message_id and last_at only when the row's head is another message.
+        accounts gives each account's source status and last ingest. Mutes apply as in the queue.
         Compact rows omit values the row fixes; an absent field means the value below.
         last_turn: not_applicable on groups, and on channel and self_chat rows without suggested_action;
         else the shown head's direction (owner/peer; a head hint: peer).
@@ -849,7 +867,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
                     awaiting_reply_days=awaiting_reply_days,exclude_chats=exclude_chats,exclude_senders=exclude_senders,
                     only_questions=only_questions,only_unread=only_unread,view=view,
                     exclude_likely_broadcasts=exclude_likely_broadcasts,include_muted=include_muted,
-                    promotional=promotional,my_roles=my_roles,can_post=can_post)
+                    promotional=promotional,my_roles=my_roles,can_post=can_post,
+                    awaiting_their_reply=awaiting_their_reply,min_wait_hours=min_wait_hours)
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(readOnlyHint=False,
         destructiveHint=False, idempotentHint=True, openWorldHint=False))

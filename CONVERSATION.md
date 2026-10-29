@@ -255,6 +255,71 @@ long queue, not as the default view.
 `own_account` evidence is read only from chats the key may read, and the same
 score is returned whether or not `awaiting_reply` filters the listing.
 
+### Whom the owner waits for
+
+The reply queue answers "who waits for the owner". The reverse list answers
+"whom does the owner wait for" (ANYM-537):
+
+```json
+{"awaiting_their_reply": true, "order": "waiting_longest", "only_questions": true}
+```
+
+A row means **no written reply in this archived chat**: the peer may have
+answered by phone, in another chat or in person. Read it as a nudge list, not
+as a debt.
+
+- The unit is the owner's run: the meaningful outgoing messages after the
+  peer's last meaningful incoming message (the head rules of the conversation
+  state). A reaction, a service event or a deleted message neither answers nor
+  starts a wait. Outgoing messages count whether or not an agent sent them.
+- A chat is listed when its run's first message is at least `min_wait_hours`
+  old (integer 0-720, default 24) and within `awaiting_reply_days` (default 14,
+  0 = no limit). A nudge does not restart the wait: `waiting.since` stays the
+  first message.
+- A run made only of closing courtesies ("thanks", "ok", an emoji; the queue's
+  word list) is never listed. `only_questions=true` (recommended here; its
+  default stays false) keeps runs where any message asks a question and reports
+  `excluded_without_question_total`.
+- Private chats only: groups, channels, self chats, the owner's own accounts and
+  observed bots are left out. A WhatsApp phone/LID pair is one row (the chat
+  with the newest message; `alias_chats` names the other).
+- A chat whose head order or kind is unknown (`ambiguous_message_order`,
+  including two outgoing WhatsApp messages in one second,
+  `unclassified_latest_message`, `head_candidates_truncated`,
+  `message_version_conflict`) is left out and counted in `uncertain_total`.
+  A WhatsApp outgoing message in the same second as the peer's last message is
+  not part of the run. A known run whose head is not verified
+  (`provider_head_stale`, `provider_head_not_verified`, `history_has_gaps`) is
+  listed with `waiting.confidence` set to that code.
+- Mutes apply as in the queue: `muted_total` while the principal has a mute,
+  `include_muted=true` returns the rows with `waiting.muted` (`chat` or
+  `sender`).
+- `accounts` gives each scoped account's source `status` and `last_ingest_at`,
+  so an empty list after a stopped collector reads as "nothing archived", not
+  "nobody owes a reply".
+
+Each row carries `waiting`: `since`, `count`, `receipt` (the run's last
+message's delivery state, absent when unknown), `confidence` when set and
+`suggested_action: "check_delivery"` when that receipt is `error`, `pending` or
+`server` (absent means `await_peer`; Telegram's `unknown` before a read boundary
+is normal). The run's last message is the row's head (`last_message.id` and
+`last_activity` in compact conversation rows, the flat `last_message_id` and
+`last_activity` in full and archive rows); only when the archive head is another
+message (a reaction or service event) does `waiting` add `last_message_id` and
+`last_at`.
+
+Rows are ordered by (`waiting.since`, chat ID). The cursor binds the list,
+`min_wait_hours`, `awaiting_reply_days` and `only_questions`; another value
+returns `invalid_cursor`. Pages read the changing archive: a reply that arrives
+between pages removes its chat from the later page, and a chat whose head
+changed while the page was read is left out of it (counted as its head now
+reads), so a page may hold fewer rows than `limit` while `next_cursor` continues. `awaiting_their_reply=true`
+needs `order="waiting_longest"` and the reverse; neither combines with
+`awaiting_reply`, `only_unread`, `exclude_senders`, `exclude_likely_broadcasts`,
+`promotional`, `from_time`/`to_time`, `my_roles` or `can_post`
+(`invalid_filter` with a `hint` naming the order). Through the gateway pass
+`order` explicitly: it fills `order="activity"` otherwise.
+
 ## Ordering and windows
 
 `position` is local to the returned page/window, never a permanent chat sequence.
