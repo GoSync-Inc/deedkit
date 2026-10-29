@@ -570,6 +570,16 @@ def test_applied_migrations_need_no_header_and_every_later_one_declares_its_clas
     assert rollout.header_problem(SYNTHETIC, '-- rollout: manual\n' + body) is None
 
 
+# migrate() applies a file only while the database is below its number, so a gap left for a later file strands it.
+# spec: ANYM-449
+def test_migrations_and_the_migrate_list_run_without_a_gap_up_to_the_runtime_schema():
+    import re
+    listed = [(int(number), name) for number, name in
+        re.findall(r"\((\d+),'(\d{3}_\w+\.sql)'\)", SOURCE.joinpath('store.py').read_text())]
+    assert sorted(MIGRATIONS) == list(range(2, store_module.RUNTIME_SCHEMA + 1))
+    assert listed == [(version, MIGRATIONS[version].name) for version in sorted(MIGRATIONS)]
+
+
 # spec: ANYM-444
 def test_every_migration_from_041_passes_the_header_rule_and_a_declared_expand_both_checks(catalog):
     for version in sorted(v for v in MIGRATIONS if v >= rollout.HEADER_FROM):

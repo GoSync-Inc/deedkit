@@ -698,11 +698,22 @@ A vendor host's endpoints deliver at most once after the request is written:
 Before the dispatcher's transport raises `EgressNotSent`, no failure counts as
 unsent, so a vendor hint is still never sent twice. After a rotated or revoked routine
 key every hint dead-letters `vendor_refused` and starts no run; the endpoint stays
-`enabled` with the health of its last test. Today the refusal shows only as a
-growing `hint_counts.dead_letter` in `get_subscription`, without the error code;
-the endpoint view does not show it yet (follow-up card ANYM-583). To rotate,
-replace the headers with `set_headers`, then call `test_delivery_endpoint`: a
-delivered test confirms the new key.
+`enabled`. Every endpoint view (`register_delivery_endpoint`, `list_delivery_endpoints`,
+`update_delivery_endpoint`) shows it as `last_error` (ANYM-583): null, or
+`{code: "vendor_refused", at, http_status, next_step}`, and `health` reads `failing`
+while it is set. The refusal is the endpoint's newest `vendor_refused` hint or test by
+`finished_at`; it shows while it finished after the endpoint's newest delivered hint and
+newest delivered test, so only a delivery clears it (a later `outcome_unknown`, redirect,
+receiver or budget failure does not). `http_status` appears only when the refusal was a
+test. `next_step` names the cause, the stored header names (never values) and the calls
+for the endpoint's state: replace the headers with `set_headers` (it replaces every
+header), resume a paused endpoint, then call `test_delivery_endpoint`; a delivered test
+confirms the new key and clears the signal. Only the operator re-enables an
+`operator_disabled` endpoint. The signal carries no header value, URL, response body or
+hint payload. It is per endpoint: rotate every endpoint that shares a key. Until
+ANYM-520 puts it in `get_subscription` and the wait/fetch responses, a pushed agent
+sees it only by calling `list_delivery_endpoints` on its own schedule, so a silent
+routine is the symptom.
 A 429 is an "other status": the bounded retry spends its attempts in minutes. A lost
 wake loses no event: the
 routine also keeps a schedule trigger that fetches and ACKs. Other endpoints and

@@ -480,6 +480,32 @@ def test_failed_inline_test_still_creates_the_endpoint_and_a_slow_one_stays_pend
     assert store.list_delivery_endpoints(token)['items'][0]['health'] == 'ok'
 
 
+# spec: ANYM-583
+def test_registration_whose_inline_test_the_vendor_refuses_shows_the_refusal(gate, policy):
+    from messaging_service.delivery_endpoints import FAILED_STEP, refusal_step
+    store = gate
+    token = identity(store)
+    policy(allow_hosts=['example.test', 'vendor.test'], vendors={'grok-bot-routine': ['routine.vendor.test']})
+    url, headers = 'https://routine.vendor.test/automations/webhook/synthetic', {'Authorization': 'Bearer synthetic-1'}
+    fresh = register(store, token, url=url, headers=headers)
+    assert (fresh['last_error'], fresh['test']['test_status']) == (None, 'pending')
+    dispatch_hints(store, transport=lambda *a, **k: 403, resolver=PUBLIC)
+    refused = asyncio.run(finish_inline_test(store, token, fresh, wait_s=0.5))
+    error = refused['last_error']
+    assert (error['code'], error['http_status'], error['at']) == ('vendor_refused', 403, refused['test']['finished_at'])
+    assert error['next_step'] == refusal_step(refused['endpoint_id'], 'enabled', ['Authorization'])
+    assert (refused['health'], refused['next_step'], refused['last_test']) == ('failing', FAILED_STEP, refused['test'])
+    replay = asyncio.run(finish_inline_test(store, token, register(store, token, url=url, headers=headers), wait_s=0.5))
+    assert (replay['last_error'], replay['health'], replay['test']) == (error, 'failing', refused['test'])
+    assert replay['test']['next_step'] == FAILED_STEP and 'next_step' not in replay
+    age(store)
+    delivered = register(store, token, request_id='endpoint-request-2')
+    dispatch_hints(store, transport=lambda *a, **k: 204, resolver=PUBLIC)
+    delivered = asyncio.run(finish_inline_test(store, token, delivered, wait_s=0.5))
+    assert (delivered['last_error'], delivered['health']) == (None, 'ok')
+    assert store.list_delivery_endpoints(token)['items'][0]['last_error'] is None
+
+
 # spec: ANYM-519
 def test_a_policy_change_cancels_queued_hints_and_fails_tests_without_a_post(gate, policy):
     store = gate

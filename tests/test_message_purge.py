@@ -732,7 +732,7 @@ def test_migration_refuses_an_unusable_events_message_index(database,tmp_path,in
             c.execute('DROP INDEX events_message');c.execute('CREATE INDEX events_message ON events(message)')
         store.migrate()
         with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='58'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='59'
             # A small database also gets the visibility probe's index in place (production: release step 2).
             assert c.execute("SELECT to_regclass('messages_unpurged') IS NOT NULL AS ok").fetchone()['ok']
 
@@ -781,7 +781,7 @@ def test_migration_045_never_holds_a_table_while_it_waits_for_another(database,t
         assert errors==[] and migrate_errors==[] and outcome==['migrated']
         assert max(waits)<0.5,waits
         with store.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='58'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value']=='59'
 
 
 # spec: ANYM-511
