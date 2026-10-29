@@ -19,6 +19,14 @@ def test_the_cross_module_note_compares_the_three_options_on_isolation_egress_sc
     assert [title[:3] for title in options] == ['(a)', '(b)', '(c)']
     assert 'router pulls' in options[0] and 'own subscriptions and dispatcher' in options[1]
     assert 'publish directly into the messaging journal through a narrow write role' in options[2]
+    assert ('Criteria: failure isolation (a calendar or calls outage or stall must not stall message hints, and the '
+            'reverse: the subscription path must not stall calendar sync or a live call), data egress, schema and role '
+            'changes, compatibility with what is deployed (N-1 schema, installed gateway), effort.') in note['3. Options compared']
+    chosen = note[options[0]]
+    for part in ('**Failure isolation:**', '**Data egress:**', '**Schema/roles:**', '**Compatibility:**', '**Effort:**'):
+        assert f'- {part}' in chosen
+    assert 'Failure isolation: best' in note[options[1]] and 'Egress: each dispatcher' in note[options[1]]
+    assert '- Failure isolation fails both ways' in note[options[2]] and '- Compatibility: same `events`' in note[options[2]]
     table = note['Decision table']
     for row in ('A module outage stalls message hints', 'New secrets', 'Schema changes', 'Effort (story points'):
         assert f'| {row}' in table
@@ -55,16 +63,23 @@ def test_the_dequeue_note_counts_removals_by_reason_and_keeps_reproduced_conflic
     assert {'merged', 'failed_checks', 'merge_conflict', 'manual'} <= set(counts)
     conflicts = next(text for title, text in note.items() if title.startswith(f"The {counts['merge_conflict']} conflict removals"))
     # One table row per conflict removal, each with the path `git merge-tree` showed; hypotheses stated apart.
-    assert len(re.findall(r'\| #\d+ \| 10-\d\d \d\d:\d\d \|', conflicts)) == int(counts['merge_conflict'])
+    rows = re.findall(r'\| #\d+ \| 10-\d\d \d\d:\d\d \| ([^|]*) \|', conflicts)
+    assert len(rows) == int(counts['merge_conflict']) and all(re.search(r'`[^`]+\.\w+`', path) for path in rows)
     assert 'No shared-file hypotheses are left' in conflicts
 
 
 # spec: ANYM-625
 def test_the_dequeue_note_gives_each_cause_one_fix_with_its_owner_and_writes_its_unknowns():
-    note = sections('docs/quality/merge-queue-dequeues-2026-10-29.md')
-    causes = re.findall(r'^\| ([A-D])\. .*?\| (\d+)', (ROOT / 'docs/quality/merge-queue-dequeues-2026-10-29.md')
-                        .read_text(encoding='utf-8'), re.M)
-    assert [cause for cause, _ in causes] == ['A', 'B', 'C', 'D']
+    path = 'docs/quality/merge-queue-dequeues-2026-10-29.md'
+    note = sections(path)
+    counts = dict(re.findall(r'\| `([a-z_]+)` \| (\d+) \|', note['Counts by reason (removals in the window)']))
+    text = (ROOT / path).read_text(encoding='utf-8')
+    table = text[text.index('## Causes and proposed fixes'):text.index('## Unknowns')]
+    # One row per cause: | X. cause | removals | fix | owner |, each fix and owner cell filled.
+    causes = re.findall(r'^\| ([A-D])\. [^|]+\| (\d+)[^|]*\| ([^|]+)\| ([^|]+)\|$', table, re.M)
+    assert [cause for cause, *_ in causes] == ['A', 'B', 'C', 'D']
+    assert sum(int(removals) for _, removals, _, _ in causes) == int(counts['merge_conflict'])
+    assert all(fix.strip() and owner.strip().startswith(('Orchestrator', 'Repository')) for _, _, fix, owner in causes)
     fixes = note['Causes and proposed fixes']
     assert '| Cause | Removals | Fix | Owner |' in fixes
     assert 'Repository: proposal card ANYM-636' in fixes and 'Orchestrator' in fixes
