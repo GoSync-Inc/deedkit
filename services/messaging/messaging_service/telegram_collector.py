@@ -988,6 +988,9 @@ class TelegramCollector:
         epoch=await asyncio.to_thread(self.archive.acquire,self.account,self.owner,self.lease_ttl)
         self._lease_valid_until=started+self.lease_ttl-min(10,self.lease_ttl/4)
         self.state=self.state_class(self.archive,self.account,(self.owner,epoch))
+        # Conflict re-evaluation (ANYM-621): its own thread and connection, fenced by this lease; never blocks capture.
+        from .conflict_reevaluation import start as start_reevaluation
+        reevaluation=start_reevaluation(self.archive,self.account,(self.owner,epoch))
         tasks=[];failure=None
         try:
             self.policy=await asyncio.to_thread(self.state.policy)
@@ -1031,6 +1034,7 @@ class TelegramCollector:
             raise
         finally:
             self.stopping.set()
+            if reevaluation is not None: reevaluation.stop()
             for task in tasks: task.cancel()
             await asyncio.gather(*tasks,return_exceptions=True)
             with suppress(Exception): await asyncio.wait_for(self.provider.disconnect(),15)

@@ -224,12 +224,15 @@ def get_sync_status(c, p):
         checkpoints = _checkpoints(c, p, {row['id'] for row in catalog})
         downloads, files = _files(c, p)
     conflicts = {}
+    reevaluations = {}
     eligibility = {}
     if sources and not scoped:
         eligibility = _eligibility(c, [row['account'] for row in sources])
         # The archive detail code is sticky once any conflict was observed; the
         # alert follows conflicts which are still unresolved.
         conflicts = grouped(c, 'account', [row['account'] for row in sources])
+        from .conflict_reevaluation import status as reevaluation_status
+        reevaluations = reevaluation_status(c, [row['account'] for row in sources])
     deletion_status = {}
     if sources and not scoped:
         from .message_purge import deletions
@@ -243,6 +246,8 @@ def get_sync_status(c, p):
         if not scoped:
             open_by_class,row['active_conflicts'],row['historical_conflicts']=conflicts.get(account,({},0,0))
             row['conflicts']=report(open_by_class)
+            # Per job: version, done, rows resolved, last error (ANYM-621); full detail only.
+            row['conflict_reevaluations']=reevaluations.get(account,[])
             if row.get('archive_detail_code')=='version_conflict' and not row['active_conflicts']:
                 row['archive_detail_code']='coverage_not_reconciled'
             row['deletions']=deletion_status.get(account) or {}

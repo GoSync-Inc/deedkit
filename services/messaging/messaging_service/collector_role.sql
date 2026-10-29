@@ -53,3 +53,6 @@ DO $$ BEGIN
 END $$;
 -- Schema 42: WhatsApp owner read receipts (ANYM-275).
 GRANT SELECT,INSERT,UPDATE ON owner_message_reads TO messaging_collector;
+-- Schema 57 (ANYM-621): each collector keeps its own account's conflict re-evaluation progress; the key columns
+-- are not updatable, so a bound collector cannot move another account's row to its own (the CHECK sees NEW only).
+GRANT SELECT,INSERT,UPDATE(cursor,watermark,done_at,last_error) ON conflict_reevaluations TO messaging_collector;
