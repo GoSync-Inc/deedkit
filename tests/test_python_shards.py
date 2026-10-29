@@ -58,6 +58,39 @@ def test_the_plan_is_deterministic_balanced_and_gives_shard_one_less_work():
     assert max(seconds) - min(seconds) < 60, seconds
 
 
+# spec: ANYM-624
+def test_the_committed_plan_balances_the_measured_suite_and_job_overheads():
+    # Ten full CI runs of 2026-10-29: each module's median seconds and each job's median time outside its pytest
+    # step (verify builds and runs the other checks). The committed weights and head start must split that measured
+    # work so that no shard job ends more than 10 % after the mean one.
+    measured = json.loads((ROOT / "tests/fixtures/python-shards-measured-2026-10-29.json").read_text())
+    plan = python_shards.plan(sorted(measured["seconds"]), tiden_ci.PYTHON_SHARDS, WEIGHTS)
+    ends = [measured["overhead"]["verify" if index == 1 else "python"]
+            + sum(seconds for name, seconds in measured["seconds"].items() if plan[name] == index)
+            for index in range(1, tiden_ci.PYTHON_SHARDS + 1)]
+    assert max(ends) <= 1.10 * sum(ends) / len(ends), ends
+
+
+# spec: ANYM-624
+def test_weights_take_each_modules_median_over_the_runs_and_the_measured_head_start(tmp_path, monkeypatch):
+    def report(path, **seconds):
+        cases = "".join(f'<testcase classname="c" name="t{index}" file="tests/{name}.py" time="{value}"/>'
+                        for index, (name, value) in enumerate(seconds.items()))
+        path.write_text(f'<testsuites><testsuite name="pytest" tests="{len(seconds)}">{cases}</testsuite></testsuites>')
+        return path
+    # Three runs; test_b ran in two of them only, and one run's report is split by shard.
+    runs = [report(tmp_path / "1.xml", test_a=10, test_b=2), report(tmp_path / "2a.xml", test_a=30),
+            report(tmp_path / "2b.xml", test_b=4), report(tmp_path / "3.xml", test_a=20)]
+    assert python_shards.median_seconds(runs) == {"tests/test_a.py": 20, "tests/test_b.py": 3}
+    weights = tmp_path / "python_shards.json"
+    weights.write_text(json.dumps({"default": 3, "head_start": 220, "seconds": {"tests/test_old.py": 1}}))
+    monkeypatch.setattr(python_shards, "WEIGHTS", weights)
+    monkeypatch.setattr(sys, "argv", ["python_shards.py", "weights", *map(str, runs), "--head-start", "292.6"])
+    assert python_shards.main() == 0
+    assert json.loads(weights.read_text()) == {"default": 3, "head_start": 293,
+                                               "seconds": {"tests/test_a.py": 20, "tests/test_b.py": 3}}
+
+
 def test_a_module_without_a_timing_still_runs_in_exactly_one_shard(tmp_path):
     (tmp_path / "tests" / "nested").mkdir(parents=True)
     names = ["tests/test_new.py", "tests/nested/test_deep.py", *(f"tests/test_{index}.py" for index in range(6))]
