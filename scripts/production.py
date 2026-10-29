@@ -3192,6 +3192,92 @@ def producer_reads(settings, mirror, target):
         raise waiting
 
 
+# ANYM-589 B1: the units that run a backup with the producer pin (messaging's and the calendar's runner).
+BACKUP_UNITS = ("personal-os-backup.service", "deedkit-calendar-backup.service")
+
+
+def follow_producer(settings, mirror, plan, candidate, release):
+    """Preparation phase, under the backup runner's lock (deploy holds it): when the pinned producer image does not
+    read the target, runner.json `image` moves to the candidate's prepared backup image, whose backup.py reads the
+    base and the target. `runner.json.before-<candidate>` is written first and the new file replaces the old in one
+    rename with the same owner and mode; no other key changes. A rollback keeps the new pin."""
+    try:
+        return producer_reads(settings, mirror, plan["target"])
+    except MigrationWait as exc:
+        waiting = exc
+    path = Path(unattended_settings(settings)["runner_config"])
+    try:
+        image = read(release / "prepared.json").get("images", {}).get("backup")
+        if not isinstance(image, str) or not IMAGE_DIGEST.fullmatch(image):
+            raise waiting
+        found = run(["docker", "image", "inspect", "--format",
+                     '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}}', image], timeout=60).split()
+        schemas = BACKUP_SCHEMAS.search(run(["git", "-C", str(mirror), "cat-file", "blob", f"{candidate}:{BACKUP_SOURCE}"]))
+    except MigrationWait:
+        raise
+    except Exception as exc:
+        raise waiting from exc
+    if found != [image, candidate] or not schemas or not all(
+            int(schemas[1]) <= version < int(schemas[2]) for version in (plan["base"], plan["target"])):
+        raise waiting
+    # The installed runner is the candidate's (ANYM-488), so it knows every key the new worker reads.
+    check_backup_runner(release / "source", candidate)
+    for unit in BACKUP_UNITS:
+        if run(["systemctl", "show", "-P", "ActiveState", unit], timeout=60).strip() not in ("inactive", "failed"):
+            raise MigrationWait(f"{unit} is active; the backup producer pin moves when it is idle")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            old = handle.read()
+        pinned = json.loads(old)
+    except (OSError, ValueError) as exc:
+        raise waiting from exc
+    if not stat.S_ISREG(before.st_mode) or not isinstance(pinned, dict) or not isinstance(pinned.get("image"), str):
+        raise waiting
+    undo, temporary = path.with_name(f"{path.name}.before-{candidate}"), path.with_name(f".{path.name}.{candidate}.tmp")
+    def unchanged():
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, "rb") as handle:
+                now_ = os.fstat(handle.fileno())
+                return handle.read() == old and (now_.st_dev, now_.st_ino) == (before.st_dev, before.st_ino)
+        except OSError:
+            return False
+    def written(target, data):
+        fd = new_file(target)
+        with os.fdopen(fd, "wb") as handle:
+            os.fchown(handle.fileno(), before.st_uid, before.st_gid)
+            os.fchmod(handle.fileno(), stat.S_IMODE(before.st_mode))
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    if os.path.lexists(undo):
+        # An earlier run wrote it and stopped before the rename: only the same bytes may stay the undo.
+        try:
+            fd = os.open(undo, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, "rb") as handle:
+                kept = handle.read()
+        except OSError:
+            kept = None
+        if kept != old:
+            raise MigrationRefused(f"{undo} exists and is not {path}; inspect both before the pin moves")
+    else:
+        written(undo, old)
+        fsync_directory(path.parent)
+    with suppress(FileNotFoundError):
+        temporary.unlink()
+    written(temporary, (json.dumps({**pinned, "image": image}, indent=2) + "\n").encode())
+    if not unchanged():
+        temporary.unlink()
+        raise MigrationRefused(f"{path} changed while deploy moved the backup producer pin; inspect it")
+    temporary.replace(path)
+    fsync_directory(path.parent)
+    write_record(release / "producer-pin.json", {"runner_config": str(path), "before": pinned["image"], "after": image,
+                                                 "undo": str(undo), "at": now()})
+    producer_reads(settings, mirror, plan["target"])
+
+
 def migration_gate(settings, http, plan, mirror, base, serving):
     """M2's read-only gates, at admission and again as the final gate: no active or unknown call, nothing
     unfinished, the base release's Store without server-side prepared statements (#352), a receiver that reads the
@@ -3418,8 +3504,8 @@ def migrate(settings, http, plans, mirror, base, serving, candidate, release):
     messaging = [plan for plan in plans if plan["database"] == AUTO_DATABASE]
     limit = rehearsal_limit(settings)
     if messaging:
-        producer_reads(settings, mirror, messaging[0]["target"])
-    images = {plan["database"]: migration_image(release, candidate, plan["database"]) for plan in plans}
+        follow_producer(settings, mirror, messaging[0], candidate, release)
+    images ={plan["database"]: migration_image(release, candidate, plan["database"]) for plan in plans}
     progress = Progress(release, plans)
     def refused(name, reason, phase):
         progress.update(name, status="refused", phase=phase)

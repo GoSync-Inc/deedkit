@@ -192,6 +192,13 @@ with the timer and the backup service idle and no capture started until it ends:
 `runner.json` (an older runner refuses unknown keys), install the `.before-<sha>` runner, then put back the
 image pin it ran with (the new runner with the old image is the pair that fails).
 
+Schema follow (ANYM-589 B1): an unattended migration whose target the pinned image's `backup.py` does not
+read moves the messaging `runner.json` `image` pin itself, before the copy, to the release's prepared backup
+image, under the runner lock with both backup services idle, keeping `runner.json.before-<sha>` byte for
+byte ([production.md, Unattended migrations](docs/operations/production.md#unattended-migrations), phase 2).
+It moves only the image, never the runner: it needs the installed runner to be the release's already.
+Undo: under the same lock and idle services, `cp -p runner.json.before-<sha> runner.json`.
+
 Delivery uses a separate SSH key created on the source VM. The key does not give
 shell/SFTP/forwarding/read/delete: the target VM runs only
 `backup_receiver.py` through [`restrict,from=...,command=...`](https://man.openbsd.org/sshd.8#AUTHORIZED_KEYS_FILE_FORMAT).
