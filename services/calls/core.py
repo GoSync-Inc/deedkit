@@ -411,7 +411,7 @@ class VoiceService:
         self.db.execute('CREATE TABLE IF NOT EXISTS voice_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE, call_id TEXT, body TEXT NOT NULL)')
         self.db.execute('CREATE INDEX IF NOT EXISTS voice_events_call ON voice_events(call_id,seq)')
         self.journal_id=call_events.create(self.db)
-        self._expiry_checked=None
+        self._expiry_checked,self._reader,self._read_lock=None,None,threading.Lock()
         calls=[]
         for identity,body in self.db.execute("SELECT id,body FROM calls").fetchall():
             value=json.loads(body)
@@ -438,6 +438,8 @@ class VoiceService:
         self.learning=Learning(self)
 
     def close(self):
+        if self._reader is not None:
+            self._reader.close()
         self.db.close()
 
     def _get(self,table,identity):
@@ -1368,8 +1370,10 @@ class VoiceService:
             d=next((x for x in v["decisions"] if x["id"]==decision_id),None)
             if not d:
                 raise ServiceError("decision_not_found",404)
-            if self._expire_due(v):
-                self._save_call(v,report=False)
+            expired=self._expire_due(v)
+            if expired:
+                self._save_expired(v,expired)
+                self.db.commit()
             if d['status']=='expired':
                 raise ServiceError('decision_expired')
             if d["status"] != "pending":
@@ -1387,13 +1391,13 @@ class VoiceService:
             return d
 
     def _expire_due(self,v):
-        """Expire the pending decisions of an ended call whose deadline passed; True when one changed.
+        """In memory only: mark the pending decisions of an ended call whose deadline passed; returns them.
 
-        Never raises and never touches a live call: a failure leaves the decision pending (logged).
+        Never raises and never touches a live call: an unreadable deadline leaves the decision pending (logged).
         """
         if v['status'] in ACTIVE:
-            return False
-        changed=False
+            return []
+        expired=[]
         for d in v['decisions']:
             try:
                 if d['status']!='pending' or datetime.fromisoformat(call_events.deadline(d))>datetime.fromisoformat(now()):
@@ -1402,13 +1406,25 @@ class VoiceService:
                 call_events.log('decision_expiry_unreadable',error)
                 continue
             d.update(status='expired',expired_at=now())
-            self._event(v,{'kind':'decision_expired','decision_id':d['id']})
-            call_events.record_owner_request(self.db,v,d,'expired',d['expired_at'])
-            call_events.untrack_deadline(self.db,d['id'])
-            changed=True
-        if changed and v['outcome']=='needs_owner' and not any(d['status']=='pending' for d in v['decisions']):
+            expired.append(d)
+        if expired and v['outcome']=='needs_owner' and not any(d['status']=='pending' for d in v['decisions']):
             v['outcome']='unresolved'
-        return changed
+        return expired
+
+    def _save_expired(self,v,expired):
+        """The body first: a failed save writes nothing else, so the deadline row stays and a later pass retries.
+
+        Then the event rows and the dropped deadlines, logged only: a missing expired row is written again by
+        the sweep when it finds the decision expired and its deadline row still there.
+        """
+        self._save_call(v,report=False,commit=False)
+        for d in expired:
+            try:
+                self._event(v,{'kind':'decision_expired','decision_id':d['id']})
+            except Exception as error:
+                call_events.log('decision_expiry_event_failed',error)
+            if call_events.record_owner_request(self.db,v,d,'expired',d['expired_at']):
+                call_events.untrack_deadline(self.db,d['id'])
 
     def expire_decisions(self):
         """Lazy expiry of owner requests past their deadline (ANYM-563), at most EXPIRY_BATCH per pass.
@@ -1433,11 +1449,17 @@ class VoiceService:
                         continue
                     if v is not None:
                         v['events']=[]
-                        if self._expire_due(v):
-                            self._save_call(v,report=False,commit=False)
+                        expired=self._expire_due(v)
+                        if expired:
+                            self._save_expired(v,expired)
                             changed=True
                             continue
-                    if v is None or all(d['id']!=decision_id or d['status']!='pending' for d in v['decisions']):
+                    decision=next((d for d in v['decisions'] if d['id']==decision_id),None) if v else None
+                    if decision is None or decision['status']!='pending':
+                        # Expired earlier with its event row missing: write it (idempotent by key) before dropping.
+                        if decision is not None and decision['status']=='expired' and not call_events.record_owner_request(
+                                self.db,v,decision,'expired',decision.get('expired_at') or now()):
+                            continue
                         changed=call_events.untrack_deadline(self.db,decision_id) or changed
                 except Exception as error:
                     call_events.log('decision_expiry_failed',error)
@@ -1447,9 +1469,17 @@ class VoiceService:
                 except Exception as error:
                     call_events.log('decision_expiry_failed',error)
 
+    def _journal(self):
+        """The journal's own read-only connection: a read never takes the service lock a live call writes
+        under, and it sees committed rows only (the one writing connection commits them in seq order)."""
+        if self._reader is None:
+            path=(self.directory/'voice.sqlite3').resolve().as_uri()+'?mode=ro'
+            self._reader=sqlite3.connect(path,uri=True,check_same_thread=False)
+        return self._reader
+
     def events_head(self):
-        with self.lock:
-            return {'journal_id':self.journal_id,'head':call_events.head(self.db)}
+        with self._read_lock:
+            return {'journal_id':self.journal_id,'head':call_events.head(self._journal())}
 
     def _expire_soon(self):
         """The inbox and the events read run expiry at most once in EXPIRY_INTERVAL_S; an answer checks its own."""
@@ -1459,10 +1489,10 @@ class VoiceService:
             self.expire_decisions()
 
     def events_page(self,after,limit,include_rehearsal=False):
-        """GET /v1/events: one bounded page (call_events.page)."""
+        """GET /v1/events: one bounded page (call_events.page) from the journal's read-only connection."""
         self._expire_soon()
-        with self.lock:
-            last,rows=call_events.scan(self.db,after)
+        with self._read_lock:
+            last,rows=call_events.scan(self._journal(),after)
         return call_events.page(self.journal_id,after,limit,last,rows,include_rehearsal)
 
     def decision_inbox(self,limit=100,offset=0,*,owner_principal=None):

@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import threading
 import time
+import traceback
 import types
 
 import httpx
@@ -238,6 +239,55 @@ def archived(n, decision_at=None):
 
 
 # spec: ANYM-563
+def test_a_failed_expiry_save_writes_nothing_and_a_later_pass_expires_it_once(tmp_path, monkeypatch):
+    seed(tmp_path, [archived(1, decision_at='2026-10-01T10:01:00+00:00'), archived(2, decision_at='2026-10-01T10:02:00+00:00')])
+    store = VoiceService(tmp_path)
+    original = VoiceService._save_call
+
+    def failing(self, v, report=True, commit=True):
+        if v['id'] == 'call-1':
+            raise sqlite3.OperationalError('disk I/O error')
+        return original(self, v, report, commit)
+    monkeypatch.setattr(VoiceService, '_save_call', failing)
+    store.expire_decisions()
+    monkeypatch.undo()
+    assert store.get_call('call-1')['decisions'][0]['status'] == 'pending'
+    assert store.get_call('call-2')['decisions'][0]['status'] == 'expired'
+
+    def states():
+        return [(data['call_id'], data['state']) for kind, data in journal(store) if kind == 'call.owner_request']
+    assert states() == [('call-2', 'expired')]
+    assert [row[0] for row in store.db.execute('SELECT decision_id FROM decision_deadlines')] == ['decision-1']
+    store.expire_decisions()
+    store.expire_decisions()
+    assert store.get_call('call-1')['decisions'][0]['status'] == 'expired'
+    assert states() == [('call-2', 'expired'), ('call-1', 'expired')]
+    assert store.db.execute('SELECT count(*) FROM decision_deadlines').fetchone()[0] == 0
+    store.close()
+
+
+# spec: ANYM-563
+def test_an_expired_decision_whose_event_write_failed_gets_its_row_from_the_next_pass(tmp_path, monkeypatch):
+    seed(tmp_path, [archived(1, decision_at='2026-10-01T10:01:00+00:00')])
+    store = VoiceService(tmp_path)
+    original = call_events._insert
+
+    def broken(db, key, *args):
+        if key.startswith('owner_request:'):
+            raise RuntimeError('disk')
+        return original(db, key, *args)
+    monkeypatch.setattr(call_events, '_insert', broken)
+    store.expire_decisions()
+    monkeypatch.undo()
+    assert store.get_call('call-1')['decisions'][0]['status'] == 'expired'
+    assert store.db.execute('SELECT count(*) FROM decision_deadlines').fetchone()[0] == 1
+    store.expire_decisions()
+    assert [data['state'] for kind, data in journal(store) if kind == 'call.owner_request'] == ['expired']
+    assert store.db.execute('SELECT count(*) FROM decision_deadlines').fetchone()[0] == 0
+    store.close()
+
+
+# spec: ANYM-563
 def test_an_existing_calls_database_gets_terminal_rows_and_deadlines_for_its_calls(tmp_path):
     db = tmp_path / 'voice.sqlite3'
     seed(tmp_path, [archived(1), archived(2, decision_at='2026-10-01T10:01:00+00:00')])
@@ -453,27 +503,33 @@ async def test_events_endpoint_reads_only_with_the_router_token(tmp_path):
 
 
 # spec: ANYM-563
-def test_reading_ten_thousand_events_keeps_event_writes_of_an_active_call_within_bound(tmp_path, monkeypatch):
-    # 10k archived calls, each with a terminal row and a due owner request: every page read also runs expiry.
+def test_reading_ten_thousand_events_keeps_event_writes_of_an_active_call_within_bound(tmp_path):
+    # 10k archived calls, each with a terminal row and a due owner request, so reads also trigger expiry.
     seed(tmp_path, [archived(n, decision_at='2026-10-01T10:01:00+00:00') for n in range(10000)])
-    monkeypatch.setattr(core, 'EXPIRY_INTERVAL_S', 0)
     store = VoiceService(tmp_path)
     assert store.events_head()['head'] == 10000
     identity = external(store)
-    writer, held = threading.current_thread(), []
+    writer, held, taken = threading.current_thread(), [], []
 
     class Timed:
-        """The service RLock (core.py VoiceService.lock), timing how long the call's writer waits for it."""
+        """The service RLock (core.py VoiceService.lock), timing the writer's outermost acquisitions only."""
         def __init__(self, inner):
-            self.inner = inner
+            self.inner, self.depth = inner, 0
 
         def __enter__(self):
             started = time.perf_counter()
             self.inner.acquire()
             if threading.current_thread() is writer:
-                held.append(time.perf_counter() - started)
+                # A recursive acquisition (get_call inside runtime_event) never waits; it is no sample.
+                if self.depth == 0:
+                    held.append(time.perf_counter() - started)
+                self.depth += 1
+            else:
+                taken.append(traceback.extract_stack(limit=2)[0].name)
 
         def __exit__(self, *args):
+            if threading.current_thread() is writer:
+                self.depth -= 1
             self.inner.release()
     store.lock = Timed(threading.RLock())
 
@@ -503,12 +559,15 @@ def test_reading_ten_thousand_events_keeps_event_writes_of_an_active_call_within
     finally:
         done.set()
         thread.join()
-    # Stated bound (README): while 10k events are read back to back and expiry runs on every page, a live call's
-    # event write waits for the service lock, at the 99th percentile, no longer than its own slowest write alone
-    # plus 100 ms, and never a second; the whole write is never a second slower. A read section holds the lock
-    # for one 200-row scan or one expiry batch of at most 20 calls with one commit.
+    # Stated bound (README): a journal read never takes the service lock (its own read-only connection); only
+    # the expiry pass, at most once per interval and at most 20 due calls with one commit, does. While 10k
+    # events are read back to back, a live call's event write waits for the lock, at the 99th percentile, no
+    # longer than its own slowest write alone plus 100 ms, never a second; the whole write is never a second slower.
     assert sum(pages) >= 10000 and held, sum(pages)
-    assert store.db.execute("SELECT count(*) FROM call_events WHERE data LIKE '%expired%'").fetchone()[0] > 0
+    assert taken and set(taken) == {'expire_decisions'}, set(taken)
+    # One expiry pass in the interval, bounded to one batch: the only reader-side holder of the lock.
+    expired = store.db.execute("SELECT count(*) FROM call_events WHERE data LIKE '%expired%'").fetchone()[0]
+    assert expired == core.EXPIRY_BATCH, expired
     p99 = sorted(held)[int(len(held) * 0.99)]
     assert p99 < max(alone) + 0.1 and max(held) < 1.0 and max(waits) < max(alone) + 1.0, (p99, max(held), max(waits), max(alone))
     store.close()
