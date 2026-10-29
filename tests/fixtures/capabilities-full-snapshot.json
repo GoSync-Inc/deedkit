@@ -61,6 +61,7 @@
   "update_delivery_endpoint",
   "delete_delivery_endpoint",
   "test_delivery_endpoint",
+  "list_delivery_attempts",
   "prepare_file_upload",
   "upload_file_chunk",
   "get_file_upload",
@@ -669,6 +670,11 @@
     "authorized": true,
     "configured": false,
     "heartbeat_max_age_s": 120,
+    "hint_budget": {
+     "per_hour": 20,
+     "remaining_this_hour": 20,
+     "window": "rolling_hour"
+    },
     "name": "webhook",
     "next_step": "ask the operator to register a receiver",
     "operational": false,
@@ -685,7 +691,8 @@
       "list_delivery_endpoints",
       "update_delivery_endpoint",
       "delete_delivery_endpoint",
-      "test_delivery_endpoint"
+      "test_delivery_endpoint",
+      "list_delivery_attempts"
      ]
     },
     "tools": [
@@ -724,6 +731,7 @@
    "get_sync_status",
    "get_updates",
    "list_chats",
+   "list_delivery_attempts",
    "list_delivery_endpoints",
    "list_feedback",
    "list_messenger_operations",

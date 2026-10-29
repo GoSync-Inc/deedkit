@@ -54,6 +54,7 @@ export type ToolName =
   | 'messages_get_sync_status'
   | 'messages_get_updates'
   | 'messages_list_chats'
+  | 'messages_list_delivery_attempts'
   | 'messages_list_delivery_endpoints'
   | 'messages_list_feedback'
   | 'messages_list_messenger_operations'

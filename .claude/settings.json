@@ -32,6 +32,7 @@
       "mcp__claude_ai_Deedkit__messages_get_subscription_events",
       "mcp__claude_ai_Deedkit__messages_get_sync_status",
       "mcp__claude_ai_Deedkit__messages_list_chats",
+      "mcp__claude_ai_Deedkit__messages_list_delivery_attempts",
       "mcp__claude_ai_Deedkit__messages_list_delivery_endpoints",
       "mcp__claude_ai_Deedkit__messages_list_feedback",
       "mcp__claude_ai_Deedkit__messages_list_messenger_operations",

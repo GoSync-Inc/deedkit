@@ -259,6 +259,10 @@ def _delivery_view(c, row, p=None):
             reason=None if state == 'enabled' else 'endpoint_deleted' if state == 'deleted' else state)
         if state == 'deleted':
             view.update(target='none', endpoint_id=None)
+        else:
+            # ANYM-520: the bound endpoint's health in every subscription read (get, wait and fetch).
+            from .delivery_endpoints import endpoint_health
+            view['delivery_health'] = endpoint_health(c, binding['endpoint'])
     return view
 
 

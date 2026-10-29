@@ -54,6 +54,7 @@
   {"name": "messages_get_sync_status", "read_only": true},
   {"name": "messages_get_updates", "read_only": false},
   {"name": "messages_list_chats", "read_only": true},
+  {"name": "messages_list_delivery_attempts", "read_only": true},
   {"name": "messages_list_delivery_endpoints", "read_only": true},
   {"name": "messages_list_feedback", "read_only": true},
   {"name": "messages_list_messenger_operations", "read_only": true},

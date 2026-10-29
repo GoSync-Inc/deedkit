@@ -362,6 +362,7 @@ class EndpointStore(RecordingStore):
     def update_delivery_endpoint(self,token,**params):return self._endpoint('update_delivery_endpoint',token,params)
     def delete_delivery_endpoint(self,token,**params):return self._endpoint('delete_delivery_endpoint',token,params)
     def test_delivery_endpoint(self,token,**params):return self._endpoint('test_delivery_endpoint',token,params)
+    def list_delivery_attempts(self,token,**params):return self._endpoint('list_delivery_attempts',token,params)
     def configure_subscription_delivery(self,token,**params):return self._endpoint('configure_subscription_delivery',token,params)
 
 
@@ -425,3 +426,59 @@ def test_endpoint_calls_drop_omitted_options_and_wait_for_the_inline_test(transp
     assert waited==['synthetic-token']*2
     assert [r['test']['test_status'] for r in results]==['delivered','pending','delivered','pending','pending']
     assert all(secret not in json.dumps(r) for r in results)
+
+
+# spec: ANYM-520
+def test_attempt_listing_matches_the_gateway_catalog_and_the_client_lists():
+    root=Path(__file__).resolve().parents[1]
+    catalog={row['name']:row for row in json.loads(
+        (root/'services/gateway/src/agent_gateway/catalog.json').read_text())}
+    client={row['name']:row['read_only'] for row in json.loads((root/'packages/deedkit/lib/tools.json').read_text())}
+    with TestClient(create_app(RecordingStore(),['testserver'])) as http:
+        listed=http.post('/mcp',headers={'Authorization':'Bearer synthetic-token',
+            'Accept':'application/json, text/event-stream'},json={'jsonrpc':'2.0','id':1,
+            'method':'tools/list','params':{}}).json()['result']['tools']
+    backend={tool['name']:tool for tool in listed}
+    for name in ('list_delivery_attempts','update_delivery_endpoint'):
+        for field in ('description','inputSchema','annotations'):
+            assert catalog['messages_'+name][field]==backend[name][field],(name,field)
+    assert backend['list_delivery_attempts']['annotations']['readOnlyHint'] is True
+    assert client['messages_list_delivery_attempts'] is True
+    assert catalog['messages_list_delivery_attempts']['scopes']==['read','delivery-write']
+    schema=backend['list_delivery_attempts']['inputSchema']
+    assert schema['required']==['endpoint_id'] and schema['properties']['limit']['maximum']==50
+    assert 'signed test' in backend['update_delivery_endpoint']['description']
+
+
+# spec: ANYM-520
+@pytest.mark.parametrize('transport',['rest','mcp'])
+def test_attempt_listing_reaches_the_store_and_a_resume_waits_for_its_signed_test(transport,monkeypatch):
+    from messaging_service import delivery_endpoints
+    waited=[]
+    async def finish(store,token,arguments,result,*,wait_s=10.0):
+        waited.append(arguments);return {**result,'state':'enabled'}
+    monkeypatch.setattr(delivery_endpoints,'finish_resume',finish)
+    store=EndpointStore()
+    endpoint='11111111-1111-4111-8111-111111111111'
+    calls=[('list_delivery_attempts',{'endpoint_id':endpoint,'limit':5,'before':endpoint}),
+        ('list_delivery_attempts',{'endpoint_id':endpoint}),
+        ('update_delivery_endpoint',{'endpoint_id':endpoint,'version':3,'action':'resume'}),
+        ('update_delivery_endpoint',{'endpoint_id':endpoint,'version':4,'action':'pause'})]
+    results=[]
+    with TestClient(create_app(store,['testserver'])) as http:
+        for name,values in calls:
+            if transport=='rest':
+                response=http.post('/v1/'+name,headers={'Authorization':'Bearer synthetic-token'},json=values)
+                assert response.status_code==200,response.text;results.append(response.json())
+            else:
+                body=http.post('/mcp',headers={'Authorization':'Bearer synthetic-token',
+                    'Accept':'application/json, text/event-stream'},json={'jsonrpc':'2.0','id':1,
+                    'method':'tools/call','params':{'name':name,'arguments':values}}).json()['result']
+                assert not body.get('isError'),body;results.append(body['structuredContent'])
+    assert store.calls==[('list_delivery_attempts',{'endpoint_id':endpoint,'limit':5,'before':endpoint}),
+        ('list_delivery_attempts',{'endpoint_id':endpoint,'limit':50}),
+        ('update_delivery_endpoint',{'endpoint_id':endpoint,'version':3,'action':'resume'}),
+        ('update_delivery_endpoint',{'endpoint_id':endpoint,'version':4,'action':'pause'})]
+    # Only the resume waits, with its exact arguments for the finishing call.
+    assert waited==[{'endpoint_id':endpoint,'version':3,'action':'resume'}]
+    assert [r.get('state') for r in results]==[None,None,'enabled',None]

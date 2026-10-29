@@ -45,6 +45,7 @@ const actions={
   updateDeliveryEndpoint:{endpoint_id:'11111111-1111-4111-8111-111111111111',version:2,action:'pause'},
   deleteDeliveryEndpoint:{endpoint_id:'11111111-1111-4111-8111-111111111111',version:2},
   testDeliveryEndpoint:{endpoint_id:'11111111-1111-4111-8111-111111111111',request_id:'synthetic-probe'},
+  listDeliveryAttempts:{endpoint_id:'11111111-1111-4111-8111-111111111111',limit:4},
   submitFeedback:{request_id:'synthetic-feedback',category:'quality',description:'Synthetic issue'},
   listFeedback:{limit:4},
 };

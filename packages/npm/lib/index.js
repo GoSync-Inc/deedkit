@@ -21,6 +21,7 @@ const METHODS = Object.freeze([
   'fetch_subscription_events','ack_subscription_events','wait_for_subscription_events',
   'configure_subscription_delivery','test_subscription','submit_feedback','list_feedback',
   'register_delivery_endpoint','list_delivery_endpoints','update_delivery_endpoint','delete_delivery_endpoint','test_delivery_endpoint',
+  'list_delivery_attempts',
   'prepare_file_upload','upload_file_chunk','get_file_upload',
 ]);
 export const tools = METHODS;
@@ -154,6 +155,7 @@ const SUBSCRIPTION_FIELDS = Object.freeze({
   update_delivery_endpoint: [['endpoint_id','version','action'],['endpoint_id','version','action','new_secret','headers']],
   delete_delivery_endpoint: [['endpoint_id','version'],['endpoint_id','version']],
   test_delivery_endpoint: [['endpoint_id','request_id'],['endpoint_id','request_id']],
+  list_delivery_attempts: [['endpoint_id'],['endpoint_id','limit','before']],
 });
 const FEEDBACK_STATUSES = Object.freeze(['received','accepted','declined','duplicate','fixed','verify_requested','verified','reopened']);
 const FEEDBACK_FIELDS = Object.freeze({
@@ -271,13 +273,15 @@ function subscriptionArguments(method,args) {
           typeof item==='string' && (key==='kinds'?SUBSCRIPTION_KINDS:
             key==='origins'?SUBSCRIPTION_ORIGINS:WAKE_RULES).has(item));
     } else if (['limit','version','after'].includes(key)) {
-      const [minimum,maximum]={limit:[1,100],version:[1,Number.MAX_SAFE_INTEGER],after:[0,Number.MAX_SAFE_INTEGER]}[key];
+      const [minimum,maximum]={limit:[1,method==='list_delivery_attempts'?50:100],version:[1,Number.MAX_SAFE_INTEGER],
+        after:[0,Number.MAX_SAFE_INTEGER]}[key];
       valid=Number.isSafeInteger(value) && value>=minimum && value<=maximum;
     } else if (key==='subscription_id') valid=subscriptionReference(value);
     else if (key==='receipt') valid=typeof value==='string' && [...value].length>=32 && [...value].length<=128;
     else if (key==='timeout') waitSeconds(value);
     else if (key==='request_id') valid=requestId(value);
     else if (key==='receiver_id') valid=value===null || uuid(value);
+    else if (key==='before') valid=uuid(value);
     else if (key==='endpoint_id') valid=value===null && method==='configure_subscription_delivery' || uuid(value);
     else if (key==='url') valid=typeof value==='string' && value.length>=1 && value.length<=2048;
     else if (key==='signing_secret' || key==='new_secret') valid=value===null && key==='new_secret' || signingSecret(value);
@@ -592,6 +596,9 @@ export class AnyMsgClient {
   }
   testDeliveryEndpoint(args,options) {
     return this.call('test_delivery_endpoint',subscriptionArguments('test_delivery_endpoint',args),options);
+  }
+  listDeliveryAttempts(args,options) {
+    return this.call('list_delivery_attempts',subscriptionArguments('list_delivery_attempts',args),options);
   }
   submitFeedback(args,options) {
     return this.call('submit_feedback',feedbackArguments('submit_feedback',args),options);

@@ -134,6 +134,8 @@ EndpointUrl = Annotated[StrictStr, Field(min_length=1,max_length=2048)]
 SigningSecret = Annotated[StrictStr, Field(pattern=r'^whsec_[A-Za-z0-9+/=]{32,96}$')]
 EndpointHeaders = Annotated[dict[StrictStr,StrictStr], Field(max_length=4)]
 EndpointLabel = Annotated[StrictStr, Field(max_length=128,pattern=r'^[^\x00-\x1f\x7f]*$')]
+# ANYM-520: one page of an endpoint's attempt log.
+AttemptLimit = Annotated[StrictInt, Field(ge=1,le=50)]
 class SubscriptionSources(TypedDict, total=False):
     # ANYM-522: every chat the key can see now, optionally per account; channels and bots only when asked for.
     __pydantic_config__ = ConfigDict(extra='forbid')
@@ -148,7 +150,8 @@ class SubscriptionEndpoint(TypedDict, total=False):
 # Optional arguments dropped when None, so payloads and audit records of callers that omit them stay unchanged.
 OMITTED_WHEN_NONE = {'create_subscription':('chat_ids','sources','wake_rules','reply_to_send','delivery'),
     'configure_subscription_delivery':('delivery_policy','endpoint_id'),
-    'register_delivery_endpoint':('headers',),'update_delivery_endpoint':('new_secret','headers')}
+    'register_delivery_endpoint':('headers',),'update_delivery_endpoint':('new_secret','headers'),
+    'list_delivery_attempts':('before',)}
 def drop_omitted(method, arguments):
     for name in OMITTED_WHEN_NONE.get(method,()):
         if arguments.get(name) is None:arguments.pop(name,None)
@@ -510,6 +513,11 @@ def create_app(store: Store, allowed_hosts: list[str]):
             from .delivery_endpoints import finish_inline_test
             result=await run_in_threadpool(getattr(store,method),token,**arguments)
             return await finish_inline_test(store,token,result)
+        if method == 'update_delivery_endpoint' and arguments.get('action') == 'resume':
+            # ANYM-520: the resume's signed test commits first; wait up to 10 s, then finish the resume with it.
+            from .delivery_endpoints import finish_resume
+            result=await run_in_threadpool(store.update_delivery_endpoint,token,**arguments)
+            return await finish_resume(store,token,arguments,result)
         if method == 'wait_for_subscription_events':
             from .subscription_consumption import wait_for_subscription_events
             return await wait_for_subscription_events(store, token, **arguments)
@@ -1342,16 +1350,27 @@ def create_app(store: Store, allowed_hosts: list[str]):
         return call(ctx,'list_delivery_endpoints')
 
     @mcp.tool(structured_output=True,annotations=upload_write)
-    def update_delivery_endpoint(ctx: Context,endpoint_id: EndpointReference,version: SubscriptionVersion,
+    async def update_delivery_endpoint(ctx: Context,endpoint_id: EndpointReference,version: SubscriptionVersion,
                                  action: Literal['rotate_secret','set_headers','pause','resume'],
                                  new_secret: SigningSecret | None=None,headers: EndpointHeaders | None=None) -> dict[str,Any]:
         """Version-checked change of your own endpoint: rotate_secret (new_secret), set_headers (headers; {} clears), pause or resume.
 
         Requires read + explicit delivery-write. During a rotation deliveries carry both signatures for 24 hours,
-        then the new secret alone. Resume works from agent_paused or auto_paused; only the operator lifts
-        operator_disabled. Write-only values are never returned.
+        then the new secret alone. Resume works from agent_paused or auto_paused: it sends one signed test, waits
+        up to 10 s, and re-arms the endpoint only once the test is delivered (else endpoint_test_failed, or the test
+        pending with the same resume call to repeat); each bound subscription with unACKed events then gets one
+        hint at once. Only the operator lifts operator_disabled. Write-only values are never returned.
         """
-        return call(ctx,'update_delivery_endpoint',endpoint_id=endpoint_id,version=version,action=action,new_secret=new_secret,headers=headers)
+        return await async_call(ctx,'update_delivery_endpoint',endpoint_id=endpoint_id,version=version,action=action,new_secret=new_secret,headers=headers)
+
+    @mcp.tool(structured_output=True,annotations=read)
+    def list_delivery_attempts(ctx: Context,endpoint_id: EndpointReference,limit: AttemptLimit=50,before: ReceiverReference | None=None) -> dict[str,Any]:
+        """List your own endpoint's latest delivery attempts, newest first: time, hint and subscription IDs, attempt number, outcome (delivered, retry, dead_letter, cancelled, paused), HTTP status or error code, latency_ms.
+
+        Requires read + explicit delivery-write. Kept 7 days; no response body, header value or URL. Pass the
+        previous page's next_before as before for older attempts.
+        """
+        return call(ctx,'list_delivery_attempts',endpoint_id=endpoint_id,limit=limit,before=before)
 
     @mcp.tool(structured_output=True,annotations=upload_write)
     def delete_delivery_endpoint(ctx: Context,endpoint_id: EndpointReference,version: SubscriptionVersion) -> dict[str,Any]:
@@ -1386,7 +1405,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
                     'prepare_file_upload','upload_file_chunk','get_file_upload',
                     'create_subscription','list_subscriptions','get_subscription','update_subscription','get_subscription_events',
                     'fetch_subscription_events','ack_subscription_events','wait_for_subscription_events','configure_subscription_delivery','test_subscription','submit_feedback','list_feedback',
-                    'register_delivery_endpoint','list_delivery_endpoints','update_delivery_endpoint','delete_delivery_endpoint','test_delivery_endpoint'}
+                    'register_delivery_endpoint','list_delivery_endpoints','update_delivery_endpoint','delete_delivery_endpoint','test_delivery_endpoint',
+                    'list_delivery_attempts'}
         method=request.path_params['operation']
         if method not in operations: raise APIError('not_found',404)
         try:

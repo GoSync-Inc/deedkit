@@ -325,7 +325,7 @@ def _transport(endpoint, body, headers, *, resolved, timeout=5):
 
 # ANYM-518: webhook delivery counts as working while the dispatcher's last pass is this recent.
 HEARTBEAT_MAX_AGE_S = 120
-# Budget of each optional delivery-status read in capabilities (two reads, so at most 0.4 s).
+# Budget of each optional delivery-status read in capabilities (three reads, so at most 0.6 s).
 DIAGNOSTIC_STATEMENT_MS = 200
 DIAGNOSTIC_LOCK_MS = 100
 TRANSPORT_TOOLS = {'pull': ['fetch_subscription_events', 'ack_subscription_events'],
@@ -380,6 +380,7 @@ def delivery_transports(c, p):
     except psycopg.Error:
         # The savepoint's rollback also restores the caller's limits.
         beat_row = bound = gate = None
+    budget = hint_budget(c, p)
     from .delivery_endpoints import TOOLS, load_policy, max_endpoints
     policy_set = load_policy() is not None
     try:
@@ -423,9 +424,56 @@ def delivery_transports(c, p):
                 heartbeat_max_age_s=HEARTBEAT_MAX_AGE_S,
                 self_service={'enabled': bool(gate), 'policy_set': policy_set, 'tools': list(TOOLS),
                     'max_endpoints': limit, 'signature_scheme': 'standard_webhooks_v1',
-                    'reissued_key_carries_endpoints': False})
+                    'reissued_key_carries_endpoints': False}, hint_budget=budget)
         rows.append(row)
     return rows
+
+
+def _prune(store):
+    """ANYM-520: the attempt log's 7-day retention; a failure here never stops tests or hints."""
+    try:
+        from .delivery_endpoints import prune_attempts
+        with store.pool.connection() as c:
+            prune_attempts(c)
+    except Exception as error:
+        print(json.dumps({'error': 'delivery_attempt_prune_failed', 'class': type(error).__name__}), flush=True)
+
+
+def _auto_pause(store, endpoints, stats):
+    """ANYM-520: the pause rule for each endpoint that failed in this pass; a failure here never stops hints."""
+    from .delivery_endpoints import auto_pause
+    for endpoint in sorted(endpoints, key=str):
+        try:
+            if auto_pause(store, endpoint):
+                stats['auto_paused'] = stats.get('auto_paused', 0) + 1
+        except Exception as error:
+            print(json.dumps({'error': 'delivery_auto_pause_failed', 'class': type(error).__name__}), flush=True)
+
+
+def hint_budget(c, p):
+    """ANYM-520: the key's hourly hint budget and the slots left in the rolling hour: the fewer of what the matcher
+    may still commit (created_at) and the dispatcher may still admit (admitted_at), as budget_slot and admission_slot
+    count. An optional read in its own savepoint with DIAGNOSTIC_STATEMENT_MS; on failure remaining is None."""
+    import psycopg
+    from .subscriptions import _bound_setting
+    limit = _bound_setting('SUBSCRIPTION_MAX_HINTS_PER_HOUR', 20, 1, 1000)
+    remaining = None
+    limits = c.execute("SELECT current_setting('statement_timeout') AS s,current_setting('lock_timeout') AS l").fetchone()
+    try:
+        with c.transaction():
+            c.execute("SELECT set_config('statement_timeout',%s,true),set_config('lock_timeout',%s,true)",
+                (f'{DIAGNOSTIC_STATEMENT_MS}ms', f'{DIAGNOSTIC_LOCK_MS}ms'))
+            used = c.execute('''SELECT count(*) FILTER (WHERE o.created_at>clock_timestamp()-interval '1 hour') AS created,
+                count(*) FILTER (WHERE o.admitted_at>clock_timestamp()-interval '1 hour') AS admitted
+                FROM subscription_outbox o JOIN subscriptions s ON s.id=o.subscription WHERE s.principal=%s AND s.key_id=%s
+                AND (o.created_at>clock_timestamp()-interval '1 hour' OR o.admitted_at>clock_timestamp()-interval '1 hour')''',
+                (p['id'], p['key_id'])).fetchone()
+            remaining = max(0, limit - max(used['created'], used['admitted']))
+            c.execute("SELECT set_config('statement_timeout',%s,true),set_config('lock_timeout',%s,true)",
+                (limits['s'], limits['l']))
+    except psycopg.Error:
+        remaining = None
+    return {'per_hour': limit, 'remaining_this_hour': remaining, 'window': 'rolling_hour'}
 
 
 def endpoint_tests(store, *, transport=_transport, resolver=_addresses, limit=8, served=None):
@@ -435,6 +483,7 @@ def endpoint_tests(store, *, transport=_transport, resolver=_addresses, limit=8,
         with store.pool.connection() as c:
             ready = schema_ready(c) and promote_rotations(c) is not None
         if ready:
+            _prune(store)
             return dispatch_tests(store, transport=transport, resolver=resolver, limit=limit, served=served)
     except Exception as error:
         from .telemetry import capture
@@ -502,6 +551,9 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
             stats['endpoint_tests'] = tests
     served = {} if served is None else served
     holds = []
+    # ANYM-520: endpoints with a retry or dead letter in this pass; the pause rule runs once the pass ends.
+    suspects = set()
+    from .delivery_endpoints import record_attempt
     for _ in range(limit):
         lease = uuid4()
         with store.pool.connection() as c:
@@ -517,6 +569,8 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                 c.execute("""UPDATE subscription_outbox SET state='dead_letter',
                     finished_at=clock_timestamp(),error_code='delivery_budget_exhausted',
                     lease_token=NULL,lease_until=NULL WHERE id=%s""", (hint['id'],))
+                if record_attempt(c, hint, 'dead_letter', hint['attempts'], error='delivery_budget_exhausted'):
+                    suspects.add(hint['endpoint'])
                 stats['dead_letter'] += 1
                 continue
             if hint['kind'] == 'module_events':
@@ -526,6 +580,7 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                     c.execute("""UPDATE subscription_outbox SET state='cancelled',finished_at=clock_timestamp(),
                         error_code='module_events_expired',lease_token=NULL,lease_until=NULL WHERE id=%s""",
                         (hint['id'],))
+                    record_attempt(c, hint, 'cancelled', hint['attempts'], error='module_events_expired')
                     stats['cancelled'] += 1
                     continue
             if hint['state'] == 'leased' and hint.get('endpoint') is not None:
@@ -535,6 +590,8 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                 if at_most_once_endpoint(c, hint['endpoint']):
                     c.execute("""UPDATE subscription_outbox SET state='dead_letter',finished_at=clock_timestamp(),
                         error_code='outcome_unknown',lease_token=NULL,lease_until=NULL WHERE id=%s""", (hint['id'],))
+                    if record_attempt(c, hint, 'dead_letter', hint['attempts'], error='outcome_unknown'):
+                        suspects.add(hint['endpoint'])
                     stats['dead_letter'] += 1
                     continue
             now = c.execute('SELECT clock_timestamp() AS t').fetchone()['t']
@@ -576,7 +633,7 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
         # are immutable; the fence rechecks the exact binding. The body carries the hint's
         # version, which the fence requires to equal the locked subscription's.
         state, error, prepared, unsafe = 'pending', 'receiver_unavailable', None, False
-        target = refused = None
+        target = refused = problem = status = failure = latency = None
         if hint.get('endpoint') is not None:
             # ANYM-519: a self-service endpoint; DNS and the host policy here, secrets and body inside the fence.
             from .delivery_endpoints import prepare
@@ -664,6 +721,7 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                     headers = signed_headers((endpoint['signing_secret'], endpoint['pending_secret']), hint['id'], body,
                         caller_headers(endpoint))
                     status = failure = retry_after = None
+                    started = time.monotonic()
                     try:
                         status, retry_after = answer(transport(endpoint['url'], body, headers, resolved=target[1], timeout=5))
                         if type(status) is int and 200 <= status < 300:
@@ -674,6 +732,7 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                         failure = caught
                     except ValueError as caught:
                         failure, state, error = caught, 'dead_letter', 'unsafe_endpoint'
+                    latency = round((time.monotonic() - started) * 1000)
                     if endpoint['at_most_once']:
                         # A vendor endpoint retries only its documented "no run started" statuses and an unsent
                         # request; a generic self-registered one only an unsent request.
@@ -706,8 +765,15 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                     finished_at=CASE WHEN %s='pending' THEN NULL ELSE clock_timestamp() END
                     WHERE id=%s AND state='leased' AND lease_token=%s''',
                     (state, error, delay, state, hint['id'], lease))
+                # ANYM-520: the attempt log; the HTTP status or the error code, never a body, header value or URL.
+                from .delivery_endpoints import attempt_error
+                if record_attempt(c, hint, state, hint['attempts'] + 1, status=status, latency=latency,
+                        error=attempt_error(status, failure, None if state == 'cancelled' else problem, error)) and \
+                        state in ('pending', 'dead_letter'):
+                    suspects.add(hint['endpoint'])
         # Each attempt's fence hold, so a latency regression shows up in a measurement.
         holds.append(round((time.monotonic() - fenced) * 1000))
         if live:
             stats['retried' if state == 'pending' else state] += 1
+    _auto_pause(store, suspects, stats)
     return dict(stats, fence_hold_ms=holds)

@@ -33,6 +33,9 @@ def payload(error,operation='',request_id=None):
     # ANYM-519: reviewed counters, states, steps and a header NAME, never a header value or secret.
     for name in ('retry_after_s','next_step','state','header'):
         if hasattr(error,name):info[name]=getattr(error,name)
+    # ANYM-520: a refused resume's test: its error code and HTTP status, never a response body.
+    for name in ('test_error','http_status'):
+        if hasattr(error,name):info[name]=getattr(error,name)
     # ANYM-545: rulebook v1 (AGENT_API.md) next, candidates and more; archive IDs and labels the key may read.
     for name in ('next','candidates','more'):
         if hasattr(error,name):info[name]=getattr(error,name)

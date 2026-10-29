@@ -97,6 +97,8 @@ GRANT UPDATE(header_names,headers_fingerprint,header_values,pending_secret,pendi
     signing_secret,state,version,updated_at) ON delivery_endpoints TO messaging_gateway;
 GRANT SELECT,INSERT ON delivery_endpoint_tests TO messaging_gateway;
 GRANT UPDATE(state,finished_at,error_code) ON delivery_endpoint_tests TO messaging_gateway;
+-- Schema 61 (ANYM-520): list_delivery_attempts and delivery_health read the owning key's attempt log.
+GRANT SELECT ON delivery_attempts TO messaging_gateway;
 -- Schema 50 (ANYM-534): only this component's heartbeat row (row-level security).
 GRANT SELECT,INSERT,UPDATE ON component_heartbeats TO messaging_gateway;
 DO $$ BEGIN

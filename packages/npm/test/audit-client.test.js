@@ -179,6 +179,22 @@ const endpointMethods={
   testDeliveryEndpoint:['test_delivery_endpoint',{endpoint_id:ENDPOINT,request_id:'synthetic-probe'}],
 };
 
+// spec: ANYM-520
+test('the attempt listing helper sends its wire arguments and checks them before transport',async()=>{
+  const seen=[];
+  const client=new AnyMsgClient({...options,fetch:async(url,request)=>{
+    seen.push([String(url),JSON.parse(request.body)]);return Response.json({items:[]});
+  }});
+  assert.ok(tools.includes('list_delivery_attempts'));
+  await client.listDeliveryAttempts({endpoint_id:ENDPOINT});
+  await client.listDeliveryAttempts({endpoint_id:ENDPOINT,limit:5,before:ENDPOINT});
+  for(const args of [{endpoint_id:ENDPOINT,limit:51},{endpoint_id:ENDPOINT,before:'attempt-1'},{limit:5}])
+    await assert.rejects(async()=>client.listDeliveryAttempts(args),TypeError);
+  assert.deepEqual(seen,[['https://archive.example/prefix/v1/list_delivery_attempts',{endpoint_id:ENDPOINT}],
+    ['https://archive.example/prefix/v1/list_delivery_attempts',{endpoint_id:ENDPOINT,limit:5,before:ENDPOINT}]]);
+});
+
+
 // spec: ANYM-519
 test('the five endpoint helpers send their wire arguments to the REST operations',async()=>{
   const seen=[];

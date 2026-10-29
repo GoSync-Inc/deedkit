@@ -1383,6 +1383,163 @@ def test_a_key_endpoint_queue_is_bounded_and_events_stay_fetchable(seeded, tmp_p
         store.set_delivery_features(False)
 
 
+def delivery_role_worker(store):
+    """(a copy of store whose connections run as a fresh role made from delivery_role.sql, a cleanup)."""
+    from contextlib import contextmanager
+    from copy import copy
+    from psycopg import sql
+    role = 'synthetic_dispatcher_' + uuid4().hex
+    ddl = Path('services/messaging/messaging_service/delivery_role.sql').read_text().replace('messaging_event_delivery', role)
+    class RestrictedPool:
+        @contextmanager
+        def connection(self):
+            with store.pool.connection() as c:
+                c.execute(sql.SQL('SET LOCAL ROLE {}').format(sql.Identifier(role)))
+                yield c
+    with store.pool.connection() as c:
+        c.execute(ddl)
+    worker = copy(store)
+    worker.pool = RestrictedPool()
+    def cleanup():
+        with store.pool.connection() as c:
+            c.execute(sql.SQL('DROP OWNED BY {}').format(sql.Identifier(role)))
+            c.execute(sql.SQL('DROP ROLE {}').format(sql.Identifier(role)))
+    return worker, cleanup
+
+
+def endpoint_state(store, endpoint_id):
+    with store.pool.connection() as c:
+        return c.execute('SELECT state,version FROM delivery_endpoints WHERE id=%s', (endpoint_id,)).fetchone()
+
+
+# spec: ANYM-520
+def test_three_dead_letters_auto_pause_the_endpoint_as_the_deployed_dispatcher_role(seeded, tmp_path, monkeypatch):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    [(token, eid, sids)] = endpoint_keys(store, tmp_path, monkeypatch, [4])
+    worker, cleanup = delivery_role_worker(store)
+    try:
+        before = endpoint_state(store, eid)
+        # A redirect is final at once: three hints dead-letter in one pass, the fourth is still queued.
+        stats = dispatch_hints(worker, limit=3, transport=lambda *a, **k: 301, resolver=PUBLIC)
+        assert (stats['dead_letter'], stats['auto_paused']) == (3, 1)
+        assert endpoint_state(store, eid) == {'state': 'auto_paused', 'version': before['version'] + 1}
+        with store.pool.connection() as c:
+            hints = c.execute("SELECT state,error_code FROM subscription_outbox ORDER BY finished_at").fetchall()
+            acked = c.execute('SELECT count(*) AS n FROM subscription_consumption').fetchone()['n']
+        assert hints[-1] == {'state': 'cancelled', 'error_code': 'endpoint_auto_paused'} and acked == 0
+        attempts = store.list_delivery_attempts(token, eid)['items']
+        assert [(a['outcome'], a['http_status'], a['error_code']) for a in attempts] == [
+            ('paused', None, 'endpoint_auto_paused'), *[('dead_letter', 301, 'redirect')] * 3]
+        health = store.get_subscription(token, sids[3])['delivery']['delivery_health']
+        assert (health['state'], health['consecutive_failures']) == ('auto_paused', 3)
+        assert 'action="resume"' in health['next_step']
+        # Events stay fetchable and nothing more is sent.
+        assert len(call(store, token, 'fetch_subscription_events', sids[3])['items']) == 1
+        assert dispatch_hints(worker, transport=lambda *a, **k: pytest.fail('sent while auto_paused'),
+            resolver=PUBLIC)['delivered'] == 0
+    finally:
+        cleanup()
+        store.set_delivery_features(False)
+
+
+# spec: ANYM-520
+def test_a_day_of_failures_without_a_success_auto_pauses_the_endpoint_as_the_deployed_role(seeded, tmp_path, monkeypatch):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    token, endpoint, sid, _ = endpoint_setup(store, tmp_path, monkeypatch)
+    eid = endpoint['endpoint_id']
+    worker, cleanup = delivery_role_worker(store)
+    def failing_pass():
+        with store.pool.connection() as c:
+            c.execute("UPDATE subscription_outbox SET next_attempt_at=clock_timestamp() WHERE state='pending'")
+        return dispatch_hints(worker, transport=lambda *a, **k: 500, resolver=PUBLIC)
+    try:
+        assert failing_pass()['retried'] == 1 and endpoint_state(store, eid)['state'] == 'enabled'
+        # One failure under 24 h never pauses; once the first failure since the last success is a day old, it does.
+        with store.pool.connection() as c:
+            c.execute("UPDATE delivery_attempts SET created_at=created_at-interval '23 hours'")
+        assert failing_pass().get('auto_paused') is None and endpoint_state(store, eid)['state'] == 'enabled'
+        with store.pool.connection() as c:
+            c.execute("UPDATE delivery_attempts SET created_at=created_at-interval '1 hour 1 minute'")
+        assert failing_pass()['auto_paused'] == 1 and endpoint_state(store, eid)['state'] == 'auto_paused'
+        with store.pool.connection() as c:
+            assert c.execute("SELECT state,error_code FROM subscription_outbox").fetchone() == {
+                'state': 'cancelled', 'error_code': 'endpoint_auto_paused'}
+        assert len(call(store, token, 'fetch_subscription_events', sid)['items']) == 1
+    finally:
+        cleanup()
+        store.set_delivery_features(False)
+
+
+# spec: ANYM-520
+def test_resume_sends_a_signed_test_inline_rearms_once_it_is_delivered_and_wakes_the_backlog(seeded, tmp_path,
+        monkeypatch):
+    from messaging_service.delivery_endpoints import finish_resume
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    [(token, eid, sids)] = endpoint_keys(store, tmp_path, monkeypatch, [2])
+    received = []
+    def receiver(status):
+        def send(url, body, headers, **kwargs):
+            received.append(json.loads(body))
+            return status
+        return send
+    def tested():
+        with store.pool.connection() as c:
+            c.execute("UPDATE delivery_endpoint_tests SET created_at=created_at-interval '2 minutes'")
+    try:
+        with store.pool.connection() as c:
+            c.execute("UPDATE delivery_endpoints SET state='auto_paused' WHERE id=%s", (eid,))
+            c.execute("UPDATE subscription_outbox SET state='cancelled',error_code='endpoint_auto_paused'")
+        version = endpoint_state(store, eid)['version']
+        arguments = {'endpoint_id': eid, 'version': version, 'action': 'resume'}
+        # A failed test refuses the resume with the test's error and leaves the endpoint paused.
+        pending = store.update_delivery_endpoint(token, eid, version, 'resume')
+        assert (pending['state'], pending['test']['test_status'], pending['woken_subscriptions']) == (
+            'auto_paused', 'pending', [])
+        assert pending['test']['next_step'] == {'tool': 'update_delivery_endpoint', **arguments}
+        dispatch_hints(store, transport=receiver(500), resolver=PUBLIC)
+        assert received == [{'type': 'test', 'test_id': pending['test']['test_id'], 'endpoint_id': eid}]
+        with pytest.raises(APIError, match='endpoint_test_failed') as refused:
+            asyncio.run(finish_resume(store, token, arguments, pending, wait_s=1))
+        assert (refused.value.test_error, refused.value.http_status, refused.value.state) == (
+            'receiver_status', 500, 'auto_paused')
+        assert endpoint_state(store, eid) == {'state': 'auto_paused', 'version': version}
+        # A delivered test re-arms it and stages one events hint per subscription with unACKed events, at once.
+        tested()
+        pending = store.update_delivery_endpoint(token, eid, version, 'resume')
+        dispatch_hints(store, transport=receiver(204), resolver=PUBLIC)
+        resumed = asyncio.run(finish_resume(store, token, arguments, pending, wait_s=1))
+        assert (resumed['state'], resumed['version'], resumed['test']['test_status']) == ('enabled', version + 1,
+            'delivered')
+        assert sorted(resumed['woken_subscriptions']) == sorted(sids)
+        assert resumed['delivery_health']['state'] == 'ok'
+        with store.pool.connection() as c:
+            woken = c.execute("""SELECT subscription,request_id,next_attempt_at<=clock_timestamp() AS due
+                FROM subscription_outbox WHERE state='pending'""").fetchall()
+        assert sorted(str(row['subscription']) for row in woken) == sorted(sids)
+        assert all(row['request_id'] == f'resume:{eid}:{version + 1}' and row['due'] for row in woken)
+        received.clear()
+        assert dispatch_hints(store, transport=receiver(204), resolver=PUBLIC)['delivered'] == 2
+        assert {body['type'] for body in received} == {'events'}
+        # Only a subscription whose events are not all ACKed is woken again.
+        page = call(store, token, 'fetch_subscription_events', sids[0])
+        call(store, token, 'ack_subscription_events', sids[0], page['receipt'], page['ack_version'])
+        paused = store.update_delivery_endpoint(token, eid, version + 1, 'pause')
+        tested()
+        pending = store.update_delivery_endpoint(token, eid, paused['version'], 'resume')
+        dispatch_hints(store, transport=receiver(204), resolver=PUBLIC)
+        resumed = asyncio.run(finish_resume(store, token, {**arguments, 'version': paused['version']}, pending, wait_s=1))
+        assert resumed['woken_subscriptions'] == [sids[1]]
+        # Resume never clears operator_disabled.
+        store.set_delivery_endpoint_operator_state(eid, False)
+        with pytest.raises(APIError, match='operator_disabled'):
+            store.update_delivery_endpoint(token, eid, endpoint_state(store, eid)['version'], 'resume')
+    finally:
+        store.set_delivery_features(False)
+
+
 # spec: ANYM-534
 def test_a_key_never_has_an_endpoint_test_and_a_hint_in_flight_together(seeded, tmp_path, monkeypatch):
     import base64
