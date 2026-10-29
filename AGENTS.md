@@ -59,9 +59,9 @@ live action from it wait for the owner, and so does that document's boundary.
 Override: harness process.md section 2, keys and roles in existing accounts (owner 10-29, D47(a):
 «надо изменить эти правила точно … проверять выдачу ключа … и прав … овер инженеринг»). Granting
 or widening permissions, scopes, profiles or keys inside documented permissions for the owner's
-own agents needs no Astra round: a backup of the setting, an undo and a read-back. Send, call,
-pairing, session and allowlist grants and the live actions keep section 1. Remove at the harness
-0.64.0 pin refresh.
+own agents needs no Astra round: a backup of the setting, an undo and a read-back. Not covered:
+send, call, pairing, session and allowlist grants keep their Astra r1, and the live actions keep
+section 1. Remove at the harness 0.64.0 pin refresh.
 
 ## 3. Change paths
 
