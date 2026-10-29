@@ -202,7 +202,8 @@ class VoiceBoundary:
             # Routing strips a mount prefix the boundary would not see; the supported entry point has none.
             return await reject(404, 'Unsupported root path')
         # Only an exact /v1/<operation> is the agent route: a dot segment would reach the panel's static files.
-        agent = re.fullmatch(r'/v1/[A-Za-z0-9_]+', path) is not None
+        # The router's journal head (ANYM-563) is the one exact two-segment agent route.
+        agent = re.fullmatch(r'/v1/[A-Za-z0-9_]+', path) is not None or path == '/v1/events/head'
         if not agent and not self.local_peer(scope):
             return await reject(403, 'Local peer required')
         authorization = request.headers.getlist('authorization')

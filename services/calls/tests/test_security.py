@@ -323,6 +323,14 @@ async def test_agent_routes_and_provider_callbacks_from_a_neighbour_keep_their_o
     assert await invoke(application) == 200
 
 
+# spec: ANYM-563
+async def test_the_router_reaches_call_events_from_a_neighbour_with_its_own_authentication_only(application):
+    for path in ('/v1/events', '/v1/events/head'):
+        assert await from_peer(application, '172.23.0.5', 'GET', path) == (401, b'{"error":"unauthorized"}'), path
+    for path in ('/v1/events/head/', '/v1/events/../api/health', '/v1/events/other'):
+        assert (await from_peer(application, '172.23.0.5', 'GET', path))[0] == 403, path
+
+
 # spec: ANYM-304
 async def test_the_entry_point_admits_the_transport_peer_whatever_forwarded_headers_say(tmp_path, monkeypatch):
     monkeypatch.setenv('VOICE_BIND', '127.0.0.1')

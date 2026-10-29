@@ -184,7 +184,7 @@ function renderRecord(record, force=false) {
     let box=document.getElementById(`decision-${d.id}`);
     if(box && box.dataset.status===d.status && box.dataset.callStatus===record.status)continue;
     const replacement=node('div',undefined,'decision'); replacement.id=`decision-${d.id}`; replacement.dataset.status=d.status; replacement.dataset.callStatus=record.status;
-    replacement.append(node('h3',`${d.status==='superseded' ? 'Прежний раунд' : d.status==='pending' ? 'Решение владельца' : 'Ответ владельца'}${d.round ? ` · ${d.round}` : ''}`),node('p',d.question));
+    replacement.append(node('h3',`${d.status==='superseded' ? 'Прежний раунд' : d.status==='pending' ? 'Решение владельца' : d.status==='expired' ? 'Срок решения истёк' : 'Ответ владельца'}${d.round ? ` · ${d.round}` : ''}`),node('p',d.question));
     for(const [field,value] of Object.entries(d.conditions || {}))replacement.append(node('p',`${fieldLabels[field] || field}: ${value}`));
     if(d.trigger==='required_fields')replacement.append(node('small','Запрос создан сервисом по обязательным полям поручения.'));
     if(d.status==='superseded')replacement.append(node('small','Этот раунд заменён. Его ответ не действует для текущего согласования.'));
@@ -230,7 +230,7 @@ async function loadInbox() {
     const itemSignature=JSON.stringify(item);
     if(existing?.dataset.signature===itemSignature)continue;
     const row=node('article',undefined,'decision');row.id=id;row.dataset.signature=itemSignature;
-    row.append(node('h3',`${item.counterparty} · ${d.status==='pending'?'Ждёт решения':'Решение сохранено'}`),node('p',d.question));
+    row.append(node('h3',`${item.counterparty} · ${d.status==='pending'?'Ждёт решения':d.status==='expired'?'Срок решения истёк':'Решение сохранено'}`),node('p',d.question));
     for(const [field,value] of Object.entries(d.conditions || {}))row.append(node('p',`${fieldLabels[field] || field}: ${value}`));
     if(d.status==='pending') {
       const options=node('div',undefined,'options');
@@ -239,6 +239,8 @@ async function loadInbox() {
       const submit=node('button','Сохранить решение');submit.type='submit';form.append(input,submit);
       form.onsubmit=e=>{e.preventDefault();answerDecision(item.call_id,d.id,input.value.trim());};
       row.append(options,form);
+    } else if(d.status==='expired') {
+      row.append(node('small','Срок ответа на этот запрос истёк. Для продолжения нужно новое поручение.'));
     } else {
       row.append(node('p',d.answer));
       const finished=!['waiting_for_browser','connecting','active'].includes(item.call_status);
