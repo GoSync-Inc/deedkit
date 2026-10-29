@@ -50,6 +50,15 @@ _FREQ_SECONDS = {
 _DAYS_PER_PERIOD = {"WEEKLY": 7, "MONTHLY": 31, "YEARLY": 366}
 
 
+# A series read for a preview (ANYM-614): what it keeps of the master and of each exception, and how many exceptions
+# it answers at most (the preview carries at most recurrence.MAX_CARRIED of them in range).
+MASTER_FIELDS = ("id", "etag", "iCalUID", "updated", "status", "eventType", "start", "end", "recurrence",
+                 *recurrence.COPIED)
+EXCEPTION_FIELDS = ("id", "etag", "status", "eventType", "recurringEventId", "originalStartTime", "start", "end",
+                    *recurrence.CARRIED)
+SERIES_READ_LIMIT = 1000
+
+
 def source_ref(prefix, *parts):
     return prefix + "-" + digest(parts)[:32]
 
@@ -555,6 +564,8 @@ class Providers:
             raise CalendarError("capability_unsupported")
         if series.get("role") == "undo":
             return await self._prepare_undo(cal, step)
+        if series.get("role") == "exception":
+            return await self._prepare_exception(cal, step)
         if not occurrence or series.get("scope") not in ("all", "following"):
             raise CalendarError("capability_unverified")
         replacing = step["action"] == "create"
@@ -568,12 +579,22 @@ class Providers:
         # The master as the plan saw it: changed since the preview, or since the replacement was made from it.
         if series.get("master_etag") and master["etag"] != series["master_etag"]:
             raise CalendarError("version_conflict")
-        if master.get("updated") and instant(master["updated"]) > instant(series["planned_at"]):
+        snapshot = series.get("snapshot")
+        if snapshot is None and master.get("updated") and instant(master["updated"]) > instant(series["planned_at"]):
             raise CalendarError("version_conflict")
         zone = recurrence.zone_of(master)
         boundary = recurrence.boundary_of(occurrence, zone)
         cancel = step["action"] == "delete"
-        recurrence.check_exceptions(await self._exceptions(cal, master), zone, boundary, series["scope"], cancel)
+        exceptions = await self._exceptions(cal, master)
+        if snapshot is not None:
+            # A move previewed with its exceptions (ANYM-614): the series and every exception in range exactly as
+            # the preview listed them, or nothing is written and the preview is run again.
+            found = {e.get("id"): e.get("etag")
+                     for _, e in recurrence.in_range(exceptions, zone, boundary, series["scope"])}
+            if master["etag"] != snapshot["master_etag"] or found != snapshot["exceptions"]:
+                raise CalendarError("preview_stale")
+        else:
+            recurrence.check_exceptions(exceptions, zone, boundary, series["scope"], cancel)
         moving = not cancel and series["scope"] == "following"
         if moving and boundary <= recurrence.master_start(master, zone):
             # From the first occurrence on, a following move is the whole series: ending the original would be a
@@ -611,6 +632,63 @@ class Providers:
             raise CalendarError("version_conflict")
         return {"action": "delete", "target": master["id"], "expected_etag": master["etag"], "desired": None,
                 "resource_ref": source_ref("res", cal["ref"], master["id"]), "scope": "series"}
+
+    async def _prepare_exception(self, cal, step):
+        """One exception carried through a verified time move (ANYM-614): its instance in the moved series, named by
+        its original start plus the shift, is patched to the exception's own fields (and times) or cancelled, with
+        that instance's etag. An instance that is missing, of another series or cancelled where it should not be,
+        or the exception still live at its old identity (the provider kept it: a write would show it twice), is a
+        definite mismatch before this write."""
+        series = step["series"]
+        live = await self.read(cal, step["target_id"])
+        if not live or live.get("recurringEventId") != series["series_id"] or not live.get("etag"):
+            raise CalendarError("series_exception_mismatch")
+        if live.get("attendees") or live.get("eventType", "default") != "default" or any(
+                live.get(k) for k in recurrence.UNCOPIABLE):
+            # Guests (or a special type) added there since the preview: a write would change an event with guests.
+            raise CalendarError("capability_unverified")
+        # The instance the moved series has at the exception's original start plus the shift, by its identity.
+        wanted, found = series["exception"]["start"], live.get("originalStartTime") or {}
+        if not isinstance(found, dict) or not (
+                instant(found["dateTime"]) == instant(wanted) if "T" in wanted and "dateTime" in found
+                else found.get("date") == wanted):
+            raise CalendarError("series_exception_mismatch")
+        old = series["exception"]["id"]
+        if old != step["target_id"]:
+            kept = await self.read(cal, old)
+            if kept and kept.get("status") != "cancelled":
+                raise CalendarError("series_exception_mismatch")
+        intent = {"action": step["action"], "target": step["target_id"], "expected_etag": live["etag"],
+                  "resource_ref": source_ref("res", cal["ref"], step["target_id"]), "scope": "occurrence"}
+        if step["action"] == "delete":
+            if live.get("status") == "cancelled":
+                # Already cancelled there (a resumed step whose delete landed): nothing to send.
+                return {**intent, "absent": True}
+            return {**intent, "desired": None}
+        if live.get("status") == "cancelled":
+            raise CalendarError("series_exception_mismatch")
+        return {**intent, "desired": series["desired"]}
+
+    async def read_series(self, cal, target):
+        """A read of the series an instance belongs to for a preview (ANYM-614): the instance's identity, its master
+        and the master's exceptions, with only the fields a carried move needs (no guests, conference or
+        attachment content: their presence only)."""
+        if cal["provider"] != "google":
+            raise CalendarError("capability_unsupported")
+        instance = await self.read(cal, target)
+        if not instance or instance.get("recurrence") or not instance.get("recurringEventId"):
+            raise CalendarError("version_conflict")
+        master = self._series_master(await self.read(cal, instance["recurringEventId"]))
+        exceptions = await self._exceptions(cal, master)
+        if len(exceptions) > SERIES_READ_LIMIT:
+            raise CalendarError("series_exceptions_too_many")
+
+        def kept(event, fields):
+            return {**{k: event[k] for k in fields if k in event},
+                    **{k: True for k in recurrence.UNCOPIABLE if event.get(k)}}
+
+        return {"instance": {"id": instance["id"], "etag": instance.get("etag")},
+                "master": kept(master, MASTER_FIELDS), "exceptions": [kept(e, EXCEPTION_FIELDS) for e in exceptions]}
 
     @staticmethod
     def _series_master(master):

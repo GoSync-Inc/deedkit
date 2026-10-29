@@ -241,7 +241,7 @@ def test_check_validates_and_reports_the_schema_and_writes_nothing(granted, sche
     path = key_file(tmp_path)
     before = store.query("SELECT id,key_hash,expires_at,enabled FROM principals ORDER BY id")
     result = dispatch(store, tmp_path, command, *check_arguments(path)[command], "--check")
-    assert result == ({"check": "ok", "schema_version": 6, "required": 3} if current
+    assert result == ({"check": "ok", "schema_version": 7, "required": 3} if current
                       else {"check": "schema_not_ready", "schema_version": 2, "required": 3})
     assert store.query("SELECT id,key_hash,expires_at,enabled FROM principals ORDER BY id") == before
 

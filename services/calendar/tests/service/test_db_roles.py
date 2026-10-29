@@ -26,7 +26,8 @@ SCHEMA_ONE_TABLES = (
     "migrations people groups memberships guardians connections calendars calendar_grants bindings principals "
     "agent_calendars resources occurrences coverage sync_jobs plans operations operation_steps assignments audit"
 ).split()
-READ = SCHEMA_ONE_TABLES + ["guardian_rules", "projection_links", "schedule_selections", "invitation_opt_ins"]
+READ = SCHEMA_ONE_TABLES + ["guardian_rules", "projection_links", "schedule_selections", "invitation_opt_ins",
+                            "series_reads"]
 # The privilege matrix of the latest schema, written out: (role, object, privilege); a column privilege as table(col).
 MATRIX = (
     {(role, t, "SELECT") for role in ("gw", "wk") for t in READ}
@@ -39,9 +40,10 @@ MATRIX = (
     | {("wk", t, "UPDATE") for t in ("operations", "operation_steps", "sync_jobs")}
     | {(role, "audit_id_seq", "USAGE") for role in ("gw", "wk")}
     | {("gw", "member_people", "SELECT")}
+    | {("gw", "series_reads", "INSERT")} | {("wk", "series_reads(%s)" % c, "UPDATE") for c in ("state", "result", "error", "answered_at")}
 )
-# Schema 4, before migration 5 adds invitation_opt_ins (and 6 member_people).
-MATRIX_4 = {e for e in MATRIX if e[1] not in ("invitation_opt_ins", "member_people")}
+# Schema 4, before migration 5 adds invitation_opt_ins (6 member_people, 7 series_reads).
+MATRIX_4 = {e for e in MATRIX if e[1].partition("(")[0] not in ("invitation_opt_ins", "member_people", "series_reads")}
 
 
 def names_of(s):
@@ -96,7 +98,7 @@ def check(s):
 def test_roles_sql_grants_exactly_the_written_matrix(schema_one, roles):  # noqa: F811 (fixtures)
     apply_roles, _ = roles
     s = schema_one
-    for version in (1, 2, 3, 4, 5, 6):  # each version's grants equal roles_expected.json at that version
+    for version in (1, 2, 3, 4, 5, 6, 7):  # each version's grants equal roles_expected.json at that version
         s.migrate(through=version)
         apply_roles()
         assert check(s) == (version, [])
@@ -108,6 +110,25 @@ def test_roles_sql_grants_exactly_the_written_matrix(schema_one, roles):  # noqa
     apply_roles()
     assert matrix(s) == MATRIX
     assert not any(obj == "synthetic" or obj == "principal_operations" for _, obj, _ in matrix(s))
+
+
+# spec: ANYM-614
+def test_the_real_roles_ask_for_and_answer_a_series_read(schema_one, roles):  # noqa: F811 (fixtures)
+    """Under roles.sql's narrow grants (worker: UPDATE of the answer's columns only) the gateway asks for a read and
+    the worker takes it and writes its answer."""
+    import asyncio
+    from family_calendar.service.worker import Worker
+
+    apply_roles, connect = roles
+    s = schema_one
+    s.migrate()
+    apply_roles()
+    gateway, worker = connect("gateway"), connect("worker")
+    gateway.query("INSERT INTO series_reads(id,principal_id,calendar_ref,target) VALUES ('read-1','p','cal','t')")
+    assert asyncio.run(Worker(worker, None).read_series_one()) is True
+    # No such principal: the read is refused, and the refusal is the worker's own written answer.
+    assert gateway.one("SELECT state,error FROM series_reads WHERE id='read-1'") == {
+        "state": "failed", "error": "not_found_or_forbidden"}
 
 
 # spec: ANYM-601
@@ -214,7 +235,7 @@ def test_db_roles_check_is_clean_after_db_roles_and_writes_nothing(fcs_home):
     run(["migrate"], home)
     run(["db-roles"], home)
     before = snapshot(home, dsn)
-    assert run(["db-roles", "--check"], home) == {"db_roles_check": "ok", "schema_version": 6}
+    assert run(["db-roles", "--check"], home) == {"db_roles_check": "ok", "schema_version": 7}
     assert snapshot(home, dsn) == before
 
 
@@ -230,7 +251,7 @@ def test_db_roles_check_names_each_drift_and_writes_nothing(fcs_home, change, li
     with pytest.raises(CalendarError) as caught:
         run(["db-roles", "--check"], home)
     assert caught.value.code == "db_roles_drift"
-    assert caught.value.details == {"schema_version": 6, "drift": lines}
+    assert caught.value.details == {"schema_version": 7, "drift": lines}
     assert snapshot(home, dsn) == before
 
 

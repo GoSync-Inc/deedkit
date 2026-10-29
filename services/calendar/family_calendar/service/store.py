@@ -21,7 +21,8 @@ from family_calendar.errors import CalendarError
 
 HERE = Path(__file__).parent
 MIGRATIONS = ((1, HERE / "schema.sql"), (2, HERE / "schema_v2.sql"), (3, HERE / "schema_v3.sql"),
-              (4, HERE / "schema_v4.sql"), (5, HERE / "schema_v5.sql"), (6, HERE / "schema_v6.sql"))
+              (4, HERE / "schema_v4.sql"), (5, HERE / "schema_v5.sql"), (6, HERE / "schema_v6.sql"),
+              (7, HERE / "schema_v7.sql"))
 ROLES = HERE / "roles.sql"
 # migrate-expand's session budgets (ANYM-586 K2, as messaging's ANYM-596), read back after connecting.
 EXPAND_SETTINGS = {"lock_timeout": "2s", "statement_timeout": "4s", "transaction_timeout": "4s"}
