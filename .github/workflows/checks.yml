@@ -204,6 +204,9 @@ jobs:
         env:
           FCS_TEST_DSN: postgresql://probe_owner:synthetic-ci-password@127.0.0.1:5432/messaging_probe_test
         run: |
+          # The calendar's gateway tests run the gateway's own locked environment (services/gateway/.venv), which
+          # verify no longer gets from the gateway step: that runs in `services`.
+          (cd ../gateway && uv sync --locked --group dev)
           uv sync --locked --group dev
           uv run pytest -m 'not live' -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/calendar.xml"
           uv build --out-dir "$RUNNER_TEMP/calendar-dist"
