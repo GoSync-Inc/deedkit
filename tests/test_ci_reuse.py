@@ -44,8 +44,8 @@ def queue_evidence(tmp_path, attempt="2", sha=SHA, git_branch=QUEUE_BRANCH, even
     """The `ci-evidence` directory a passing merge queue run uploads, built by the real assemble and prepare.
     Every fragment keeps the run's exclusion inventory (ANYM-578), none by default."""
     fragments = tmp_path / "fragments"
-    verify, load = fragments / "ci-evidence-verify", fragments / "ci-evidence-load"
-    for fragment in (verify, load):
+    verify, load, services = (fragments / f"ci-evidence-{job}" for job in ("verify", "load", "services"))
+    for fragment in (verify, load, services):
         fragment.mkdir(parents=True)
         (fragment / "source-sha").write_text(sha + "\n")
         (fragment / "attempt").write_text(attempt + "\n")
@@ -60,6 +60,9 @@ def queue_evidence(tmp_path, attempt="2", sha=SHA, git_branch=QUEUE_BRANCH, even
     (load / "load.xml").write_text(CASE.format(name="load"))
     (load / "load.json").write_text(json.dumps({"version": 1, "status": "passed", "sha": sha}))
     (load / "outcomes.json").write_text(json.dumps({"module_checks": {"load": "success"}}))
+    for name in tiden_ci.FRAGMENTS["services"][1][1:-1]:  # the reports between outcomes.json and exclusions.json
+        (services / name).write_text(CASE.format(name=name.split(".")[0].replace("-", "_")))
+    (services / "outcomes.json").write_text(json.dumps({"module_checks": dict.fromkeys(tiden_ci.FRAGMENTS["services"][0], "success")}))
     for job in tiden_ci.SHARD_JOBS:  # the shard jobs of the root Python suite; a None outcome uploads nothing
         outcome = (shard_outcomes or {}).get(job, "success")
         if outcome is None:
@@ -637,7 +640,7 @@ def test_a_reusing_push_skips_only_the_test_jobs_and_still_builds_publishes_and_
     ci, checks = workflows()
     skip = ("${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification "
             "&& needs.documentation.outputs.docs_only != 'true' }}")
-    assert checks["jobs"]["verify"]["if"] == checks["jobs"]["load"]["if"] == skip
+    assert checks["jobs"]["verify"]["if"] == checks["jobs"]["load"]["if"] == checks["jobs"]["services"]["if"] == skip
     assert checks["jobs"]["evidence"]["if"] == ("${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification "
                                                 "&& needs.documentation.outputs.docs_only != 'true' }}")
     tiden = checks["jobs"]["tiden"]

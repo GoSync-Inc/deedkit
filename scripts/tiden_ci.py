@@ -47,10 +47,12 @@ REQUIRED_EXECUTIONS = {
                                  "tests/test_audio_native.py::test_faster_whisper_decoder_compatibility_without_model[ogg]"}),
 }
 GO_MODULES = tuple(name for name, (_, framework, _) in MODULE_REPORTS.items() if framework == "go")
-_VERIFY_MODULES = tuple(name for name in MODULE_REPORTS if name != "load" and name not in GO_MODULES)
+# The gateway, its contract package and the calls service run on a runner of their own, in parallel with verify.
+SERVICE_MODULES = ("gateway", "platform_contracts", "calls", "calls_frontend")
+_VERIFY_MODULES = tuple(name for name in MODULE_REPORTS if name != "load" and name not in GO_MODULES and name not in SERVICE_MODULES)
 # The root Python suite runs in file-level shards (scripts/python_shards.py): verify runs shard 1, each
 # `checks / python` matrix job one of the others, and assembly merges their reports into python.xml.
-PYTHON_SHARDS = 7
+PYTHON_SHARDS = 9
 SHARD_REPORTS = tuple(f"python-{index}.xml" for index in range(1, PYTHON_SHARDS + 1))
 SHARD_JOBS = tuple(f"python-{index}" for index in range(2, PYTHON_SHARDS + 1))
 # Each test job deletes the files autoloop pull requests add to test directories from its checkout and keeps that
@@ -64,6 +66,7 @@ FRAGMENTS = {
     "verify": (_VERIFY_MODULES, ("metadata.json", SHARD_REPORTS[0], *(name for check, name in REPORTS.items() if check != "python"),
                                  *(MODULE_REPORTS[name][0] for name in _VERIFY_MODULES), EXCLUSIONS)),
     "load": (("load",), ("outcomes.json", MODULE_REPORTS["load"][0], "load.json", EXCLUSIONS)),
+    "services": (SERVICE_MODULES, ("outcomes.json", *(MODULE_REPORTS[name][0] for name in SERVICE_MODULES), EXCLUSIONS)),
     **{job: ((), ("outcomes.json", report, EXCLUSIONS)) for job, report in zip(SHARD_JOBS, SHARD_REPORTS[1:])},
     "go": (GO_MODULES, ("outcomes.json", *(MODULE_REPORTS[name][0] for name in GO_MODULES), EXCLUSIONS)),
     "added": ((), ("outcomes.json", ADDED_REPORT, EXCLUSIONS)),

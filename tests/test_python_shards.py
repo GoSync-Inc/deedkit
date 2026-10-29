@@ -1,4 +1,4 @@
-"""The root Python suite runs in file-level shards (seven in CI) on parallel runners; synthetic workflows and reports only."""
+"""The root Python suite runs in file-level shards (nine in CI) on parallel runners; synthetic workflows and reports only."""
 import fnmatch
 import json
 import os
@@ -351,6 +351,7 @@ def test_the_python_producer_names_every_shard_job_of_the_matrix(tmp_path):
     env = {"PATH": os.environ["PATH"], "GITHUB_REPOSITORY": "example/repo", "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "2"}
     base = [sys.executable, str(ROOT / "scripts/tiden_ci.py"), "assemble", "--fragments", str(tmp_path / "fragments"),
             "--producer", "verify:success:" + "a" * 40, "--producer", "load:success:" + "a" * 40,
+            "--producer", "services:success:" + "a" * 40,
             "--producer", "go:success:" + "a" * 40, "--producer", "added:success:" + "a" * 40]
     shards = [argument for job in tiden_ci.SHARD_JOBS for argument in ("--producer", f"{job}:success:" + "a" * 40)]
     passed = subprocess.run([*base, "--directory", str(tmp_path / "ok"), *shards], env=env, capture_output=True, text=True)
@@ -405,6 +406,7 @@ def test_a_shard_job_that_fails_after_uploading_a_passing_fragment_never_reads_a
     merge = next(step for step in jobs()["evidence"]["steps"]
                  if step.get("name") == "Merge the fragments of the tested commit and record every check outcome")
     needs = {"verify": {"result": "success", "sha": "a" * 40}, "load": {"result": "success", "sha": "a" * 40},
+             "services": {"result": "success", "sha": "a" * 40},
              "go": {"result": "success", "sha": "a" * 40}, "added": {"result": "success", "sha": "a" * 40},
              **{job: {"result": "success", "sha": "a" * 40} for job in tiden_ci.SHARD_JOBS}}
     needs["python-3"]["result"] = late
