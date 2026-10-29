@@ -182,6 +182,14 @@ CLI), and a larger database clock skew stops it with the gateway unchanged. `key
 NULL legacy ceiling too; `unknown_key` if there is none, `key_permissions_conflict` together with
 `--key-permissions`). It reads the source with `principal-info --principal ID`, whose keys carry
 `effective_permissions` (the principal's permissions narrowed by the key's ceiling).
+On the Mac, `python3 scripts/deedkit.py key install ID --host <ssh-destination> --url <gateway MCP
+URL>` (the line `key issue` prints) fetches the gateway token over SSH into
+`~/.config/deedkit/ID.token` (0600 in a 0700 directory), checks that the gateway answers
+`platform_capabilities` as `ID`, and adds the user-scope Claude Code server `deedkit-ID` whose
+headers helper (`~/.config/deedkit/headers.py`, pinned to the installing interpreter) reads that
+file on each connection; `key uninstall ID` removes the entry and the file. Rotation: `key extend`
+needs nothing on the Mac; a new key is `key install NEW` then `key uninstall OLD`. Details, upgrades
+and entries left by the older manual lines: docs/operations/production.md, Admin CLI.
 
 A token is 32–256 printable ASCII characters without spaces (for example
 `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'`). `/dev/stdin` may be a pipe or a

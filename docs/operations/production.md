@@ -1686,12 +1686,56 @@ read back, so the gateway never outlives a backend. No container restarts: the g
 re-read their mounted directory on the next request. A token file is either absent or complete; a
 rerun removes the staging files an interrupted write left and continues from the journal.
 
-The output lists public IDs, expiries, the token file, the undo command and the next step for the
-Mac (copy the token file to `~/.config/deedkit/<new-id>.token`, then a `claude mcp add-json`
-command whose headers helper reads it). `undo` disables the gateway and calls entries and revokes
+The output lists public IDs, expiries, the token file, the undo command and, as `next`, the single
+step for the Mac: `python3 scripts/deedkit.py key install <new-id> --host <ssh-destination> --url
+<gateway MCP URL>` (below; the destination stays a placeholder, since only the Mac's ssh config
+names this host). `undo` disables the gateway and calls entries and revokes
 the backend credentials; revoked records stay for audit, so `<new-id>` stays taken and a fresh
 attempt uses another ID. Its output lists `revoked` (store and public ID), `disabled` (entries),
-`deleted_files` and `next` (the `claude mcp remove` command for the Mac).
+`deleted_files` and `next` (`python3 scripts/deedkit.py key uninstall <new-id>` for the Mac).
+
+### Install an issued key in Claude Code on the Mac (ANYM-498)
+
+Run from the repository checkout on the Mac (Python 3.11+, standard library only); it needs `ssh`
+and `claude` on PATH and touches only the user's own files:
+
+```sh
+python3 scripts/deedkit.py key install <id> --host <ssh-destination> --url https://<host>/.../mcp
+python3 scripts/deedkit.py key uninstall <id>
+```
+
+`key install` runs `ssh -T -o BatchMode=yes -- <dest> cat -- /root/deedkit-admin/tokens/<id>.token`
+(30 s, at most 1 KiB, stderr never shown) and accepts exactly one gateway token. It stores it as
+`~/.config/deedkit/<id>.token` (0600; the directory 0700, refused when it is a symlink, another
+user's or group/other-accessible) by a synced staging file and a hard link that never replaces a
+file, and copies the shipped helper `scripts/deedkit_headers.py` there as `headers.py` (0600; an
+older copy is replaced by a rename). It then runs the helper exactly as Claude Code will (10 s) and
+sends one `POST <url without /mcp>/v1/platform_capabilities` with its header (no proxies, no
+redirects, verified TLS, 15 s): only HTTP 200 with `service: deedkit` and `principal: <id>` passes.
+Only then it adds the user-scope server `deedkit-<id>` (a dot in the ID becomes `_`) with
+`claude mcp add-json --scope user`, whose `headersHelper` is `<real path of the interpreter that
+ran install> -I -S <path of headers.py> <id>`: the token is never in `~/.claude.json`, argv or
+output. Claude Code's config (`$CLAUDE_CONFIG_DIR/.claude.json`, else `~/.claude.json`) is only
+read. A rerun with the same token and entry changes nothing; a different token file or another
+entry of that name refuses (`key uninstall <id>` first). A failed check adds nothing and leaves
+the token file for a rerun. Install and uninstall share the lock `~/.config/deedkit/.lock`.
+
+`key uninstall <id>` removes the user-scope entry only when it has the shape install writes (any
+pinned interpreter), then the token file; each part already absent counts as done. The key stays
+valid on the host until `deedkit admin key revoke <id>`.
+
+- Rotation: `key extend` keeps the token, so the Mac needs nothing. A new key is `key install
+  <new>` then `key uninstall <old>`.
+- An interpreter upgrade that removes the pinned Python breaks the helper: run `key uninstall <id>`
+  then `key install <id> ...` again to re-pin it.
+- Entries left by ANYM-496's manual lines (a `printf` helper, added in the local scope of the
+  folder it ran in): remove each by hand in its own scope, `claude mcp remove --scope local
+  deedkit-<id>` in that folder (`key install` names such folders as `shadowed in:`), or `--scope
+  user` for a user-scope copy (`key uninstall` refuses a user-scope entry install did not write).
+  The old `mkdir -p` usually left `~/.config/deedkit` at 0755, which `key install` refuses: check
+  that it is your own directory (`ls -ld ~/.config/deedkit`) and run `chmod 700 ~/.config/deedkit`
+  (and `chmod 600` on the token file), then `key install`; an existing `<id>.token` with the same
+  token and mode 0600 is reused.
 
 ### Extend or revoke a key in every store (ANYM-497)
 

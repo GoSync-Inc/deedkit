@@ -4,7 +4,6 @@ import json
 import os
 from pathlib import Path
 import shlex
-import subprocess
 import tempfile
 import time
 import uuid
@@ -148,17 +147,10 @@ def test_issue_like_prints_public_ids_the_undo_and_the_mac_step(site, capsys, tm
                    "calendar": "clone", "calls": "clone"}
     assert result["undo"] == f"deedkit admin undo {result['operation']}"
     assert result["token_file"] == str(site.root / "admin-tokens/clone.token")
-    words = shlex.split(result["next"][1])
-    assert words[:4] == ["claude", "mcp", "add-json", "deedkit-clone"] and len(words) == 5
-    server = json.loads(words[4])
-    assert server["type"] == "http" and server["url"] == "https://deedkit.test/deedkit/mcp"
-    home = tmp_path / "mac"
-    (home / ".config/deedkit").mkdir(parents=True)
-    token = Path(result["token_file"]).read_text().strip()
-    (home / ".config/deedkit/clone.token").write_text(token + "\n")
-    printed = subprocess.run(["sh", "-c", server["headersHelper"]], env={"HOME": str(home), "PATH": os.environ["PATH"]},
-                             capture_output=True, text=True, check=True).stdout
-    assert json.loads(printed) == {"Authorization": f"Bearer {token}"}
+    # ANYM-498: the single Mac step is `deedkit key install` (tests/test_deedkit_mac_install.py covers it).
+    assert [shlex.split(line) for line in result["next"]] == [
+        ["python3", "scripts/deedkit.py", "key", "install", "clone", "--host", "<ssh-destination>",
+         "--url", "https://deedkit.test/deedkit/mcp"]]
 
 
 # spec: ANYM-496
@@ -420,7 +412,7 @@ def test_undo_reports_what_it_revoked_disabled_and_deleted(site, capsys):
     undone = json.loads(capsys.readouterr().out)
     assert sorted(r["store"] for r in undone["revoked"]) == ["calendar", "messaging", "messaging-archive"]
     assert undone["disabled"] == ["gateway policy", "calls registry"]
-    assert result["token_file"] in undone["deleted_files"] and undone["next"] == "on the Mac: claude mcp remove deedkit-clone"
+    assert result["token_file"] in undone["deleted_files"] and undone["next"] == "on the Mac: python3 scripts/deedkit.py key uninstall clone"
 
 
 # spec: ANYM-496

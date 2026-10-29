@@ -1142,17 +1142,14 @@ def run_issue(config, run, docker, host, journal: Journal, scope, files, tokens,
     if data["command"]["label"]:
         set_label(config, new, data["command"]["label"])
     token, url = files["gateway"]["host"], host.http["http_release"]["gateway_public_url"].rstrip("/") + "/mcp"
-    helper = f'printf \'{{"Authorization":"Bearer %s"}}\' "$(cat ~/.config/deedkit/{new}.token)"'
-    server = json.dumps({"type": "http", "url": url, "headersHelper": helper})
     data["result"] = {
         "operation": data["operation"], "principal": new, "like": data["command"]["like"], "expires_at": expires_at,
         "credentials": [{"store": step, "public_id": data["steps"][step]["public_id"],
                          "expires_at": data["steps"][step]["expires_at"]} for step, *_ in steps]
         + ([{"store": "calls", "public_id": new, "expires_at": expires_at}] if calls else []),
         "token_file": token, "undo": f"deedkit admin undo {data['operation']}",
-        "next": [f"mkdir -p ~/.config/deedkit && scp <host>:{shlex.quote(token)} ~/.config/deedkit/{new}.token "
-                 f"&& chmod 600 ~/.config/deedkit/{new}.token",
-                 f"claude mcp add-json deedkit-{new} {shlex.quote(server)}"]}
+        # ANYM-498: one command on the Mac; only the Mac's ssh config names this host, so the destination is a placeholder.
+        "next": [f"python3 scripts/deedkit.py key install {new} --host <ssh-destination> --url {shlex.quote(url)}"]}
     data["state"] = "done"
     journal.save()
     return data["result"]
@@ -1316,7 +1313,7 @@ def undo(config: dict, run, docker, host_factory, operation: str) -> dict:
         data["undo"] = {"revoked": [{"store": step, "public_id": revoke[-1]} for step, _, revoke in records],
                         "disabled": disabled, "deleted_files": deleted}
         journal.save()
-    return {**result, **data["undo"], "next": f"on the Mac: claude mcp remove deedkit-{new}"}
+    return {**result, **data["undo"], "next": f"on the Mac: python3 scripts/deedkit.py key uninstall {new}"}
 
 
 # --- `key extend` and `key revoke` (ANYM-497) under the same shared rules -----------------------------------------

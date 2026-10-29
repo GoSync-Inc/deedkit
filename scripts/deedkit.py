@@ -145,6 +145,11 @@ def main(argv=None):
         from deedkit_admin import main as admin
 
         sys.exit(admin(argv[1:]))
+    if argv[:1] == ["key"]:
+        # `deedkit key install|uninstall` (ANYM-498): on the Mac, put an issued key into Claude Code.
+        from deedkit_mac import main as key
+
+        sys.exit(key(argv[1:]))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["resolve", "up", "status", "stop"])
     parser.add_argument("--profile", required=True, type=Path)
