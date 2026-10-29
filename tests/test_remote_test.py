@@ -34,7 +34,7 @@ FAKES = {
 echo "ssh $*" >> "$FAKE_LOG"
 [ "${FAKE_SSH_DOWN:-0}" = 1 ] && exit 255
 case "$*" in *"${FAKE_SSH_FAIL:-no such command}"*) exit 255 ;; esac
-while [ $# -gt 0 ]; do case "$1" in -o) shift 2 ;; -[ntq]) shift ;; *) break ;; esac; done
+while [ $# -gt 0 ]; do case "$1" in -[ol]) shift 2 ;; -[ntq]) shift ;; *) break ;; esac; done  # GNU rsync: -l user
 shift
 cd "$FAKE_OWNER_HOME" || exit 255
 export HOME="$FAKE_OWNER_HOME"
@@ -732,14 +732,18 @@ exit 0
 SETUP_DOC = ROOT / 'docs' / 'operations' / 'remote-test-mini-setup.md'
 SETUP_SHELLS = ['bash'] + (['zsh'] if shutil.which('zsh') else [])  # zsh: the mini's login shell
 SETUP_FAKES = {
+    # Both reach only the address in the laptop's config (FAKE_MINI), and log every call.
     'ssh': '''#!/usr/bin/env bash
+echo "ssh $*" >> "$FAKE_ROOT/remote.log"
 while [ $# -gt 0 ]; do case "$1" in -o) shift 2 ;; -*) shift ;; *) break ;; esac; done
+[ "$1" = "$FAKE_MINI" ] || exit 255
 shift
 cd "$FAKE_OWNER_HOME" || exit 255
 HOME="$FAKE_OWNER_HOME" exec "$FAKE_SHELL" -c "$*"
 ''',
     'scp': '''#!/usr/bin/env bash
-dest="${@: -1}"; dest="${dest#*:}"
+echo "scp $*" >> "$FAKE_ROOT/remote.log"
+dest="${@: -1}"; [ "${dest%%:*}" = "$FAKE_MINI" ] || exit 1; dest="${dest#*:}"
 case "$dest" in /*) ;; *) dest="$FAKE_OWNER_HOME/$dest" ;; esac
 cp "${@:1:$#-1}" "$dest"
 ''',
@@ -794,8 +798,11 @@ def mini_setup(tmp_path):
         blocks = [block.replace(system, moved) for block in blocks]
     # preflight, steps 1-4, read-back (not run here), undo
     assert len(blocks) == 7 and 'preflight-ok' in blocks[0] and 'undo-ok' in blocks[6]
+    # The laptop: its own home, whose config holds a synthetic mini address.
+    write(tmp_path / 'laptop' / '.config' / 'deedkit' / 'mini-host', 'admin@mini.invalid\n', 0o600)
     env = dict(os.environ, PATH=f"{tmp_path / 'setupbin'}:{os.environ['PATH']}", FAKE_OWNER_HOME=str(root / 'owner'),
-               FAKE_DS=str(root / 'ds'), FAKE_ROOT=str(root))
+               FAKE_DS=str(root / 'ds'), FAKE_ROOT=str(root), HOME=str(tmp_path / 'laptop'),
+               FAKE_MINI='admin@mini.invalid')
     return root, env, blocks
 
 
@@ -836,6 +843,18 @@ def test_the_setup_creates_and_its_undo_removes_exactly_the_ledgered_resources(m
     undo = setup_block(env, blocks[6], shell)
     assert undo.returncode == 0 and 'undo-ok' in undo.stdout, undo.stdout + undo.stderr
     assert setup_leftovers(root) == []
+
+
+# spec: ANYM-638
+@pytest.mark.parametrize('address', ['', '-V', 'admin@mini.invalid -oProxyCommand=sh'],
+                         ids=['empty', 'option', 'two-words'])
+def test_no_setup_block_connects_with_a_missing_or_option_shaped_mini_address(mini_setup, tmp_path, address):
+    root, env, blocks = mini_setup
+    write(tmp_path / 'laptop' / '.config' / 'deedkit' / 'mini-host', f'{address}\n', 0o600)
+    for block in blocks:
+        result = setup_block(env, block, SETUP_SHELLS[-1])
+        assert result.returncode != 0 and 'bad mini address' in result.stdout, result.stdout + result.stderr
+    assert not (root / 'remote.log').exists()
 
 
 # spec: ANYM-638

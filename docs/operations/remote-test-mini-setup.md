@@ -27,7 +27,7 @@ Preflight (read-only). Every resource must be absent and the ledger must not exi
 `preflight-ok`:
 
 ```bash
-MINI="$(head -1 ~/.config/deedkit/mini-host)"
+MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
 ssh "$MINI" 'U=_deedkitci; ID=453; fail=0
 [ ! -e ~/deedkit-ci-setup.created ] || { echo "ledger exists: undo or inspect first"; fail=1; }
 dscl . -read /Users/$U >/dev/null 2>&1 && { echo "user $U exists"; fail=1; }
@@ -45,7 +45,7 @@ under bash and zsh alike), then records it, then creates it.
 Step 1, the group:
 
 ```bash
-MINI="$(head -1 ~/.config/deedkit/mini-host)"
+MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
 ssh "$MINI" 'set -e; U=_deedkitci; ID=453
 if dscl . -read /Groups/$U >/dev/null 2>&1; then echo "group exists"; exit 1; fi
 echo group >> ~/deedkit-ci-setup.created
@@ -58,7 +58,7 @@ sudo -n dscl . -create /Groups/$U Password "*"'
 Step 2, the user:
 
 ```bash
-MINI="$(head -1 ~/.config/deedkit/mini-host)"
+MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
 ssh "$MINI" 'set -e; U=_deedkitci; ID=453
 if dscl . -read /Users/$U >/dev/null 2>&1; then echo "user exists"; exit 1; fi
 echo user >> ~/deedkit-ci-setup.created
@@ -75,7 +75,7 @@ sudo -n dscl . -create /Users/$U IsHidden 1'
 Step 3, the home:
 
 ```bash
-MINI="$(head -1 ~/.config/deedkit/mini-host)"
+MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
 ssh "$MINI" 'set -e; U=_deedkitci
 if [ -e /Users/$U ]; then echo "home exists"; exit 1; fi
 echo home >> ~/deedkit-ci-setup.created
@@ -99,7 +99,7 @@ plain `visudo -c`; sudo still reads them, and they are not this setup's to chang
 failed `visudo -c` without such a warning (killed, say), or a failed filter.
 
 ```bash
-MINI="$(head -1 ~/.config/deedkit/mini-host)"
+MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
 D="$(ssh "$MINI" 'D=$(mktemp -d /tmp/deedkit-setup.XXXXXX) && echo "stage $D" >> ~/deedkit-ci-setup.created && echo $D')" &&
 [ -n "$D" ] &&
 scp deploy/mac-mini/deedkit-remote-test deploy/mac-mini/sudoers-deedkit-remote-test "$MINI:$D/" &&
@@ -127,7 +127,7 @@ cd; rm -r "$D"'
 Read-back (every line goes in the pull request that ran it):
 
 ```bash
-MINI="$(head -1 ~/.config/deedkit/mini-host)"
+MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
 ssh "$MINI" 'U=_deedkitci; H=$HOME; id $U; cat ~/deedkit-ci-setup.created
 P=/Users/Shared/deedkit-ci/stage/.readback; (umask 077; printf x > $P); chmod go+r $P
 dscl . -read /Users/$U UniqueID PrimaryGroupID UserShell NFSHomeDirectory IsHidden
@@ -170,7 +170,7 @@ and the owner's permission warnings (step 4); otherwise it is rewritten
 to the resources still present, the undo prints them and exits 1, and a rerun tries again:
 
 ```bash
-MINI="$(head -1 ~/.config/deedkit/mini-host)"
+MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
 ssh "$MINI" 'U=_deedkitci; L=~/deedkit-ci-setup.created; R=~/deedkit-ci-setup.left
 [ -f $L ] || { echo "no ledger: nothing of this setup to undo"; exit 0; }
 : > $R
