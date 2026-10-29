@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import psycopg
 from psycopg.types.json import Jsonb
 from family_calendar.errors import CalendarError
+from . import journal
 from .core import FamilyService
 from .providers import created_event_ref
 from .store import instant
@@ -10,6 +11,9 @@ from .store import instant
 # Step states whose intent was durably admitted to send: only their own failure may undo a link change.
 ADMITTED = ("sending", "unknown", "needs_attention")
 AMBIGUOUS = {"unknown_result", "write_unknown", "provider_unavailable"}
+# The journal's reads besides the window (Google sync, CalDAV probes) take at most this long each per refresh, so a
+# slow provider never holds the singleton worker away from queued operations (ANYM-565).
+SUPPLEMENT_S = 15
 
 
 class Worker:
@@ -386,6 +390,38 @@ class Worker:
             ("operation", state, operation_id),
         )
 
+    async def _journal_changes(self, cal, start):
+        """What the journal learns besides the window (ANYM-565): Google's incremental sync, read before the window
+        so a change between the two is in both. One step of at most SUPPLEMENT_S that never fails the read: a run
+        that does not end resumes at its page next refresh; on an error the stored state stays and the next refresh
+        reads the same changes again."""
+        try:
+            with self.store.transaction() as c:
+                if not journal.ready(c):
+                    return None
+                state = journal.sync_state(c, cal["ref"])
+                since = journal.tracked_since(c, cal["ref"], start)
+            deadline = asyncio.get_running_loop().time() + SUPPLEMENT_S
+            # The step stops itself at the deadline and keeps its progress; the outer bound only catches a hang.
+            return await asyncio.wait_for(self.providers.sync_changes(cal, state, since, deadline), SUPPLEMENT_S * 1.5)
+        except Exception:
+            return {}
+
+    async def _gone(self, cal, start, end, resources, changes):
+        """CalDAV resources a window read lost, read back within SUPPLEMENT_S: a 404 is a deletion; one still there
+        moved (no event). Probed resources go to the back of the next refresh's order."""
+        if changes is None or cal["provider"] != "icloud":
+            return changes
+        try:
+            with self.store.transaction() as c:
+                lost = journal.missing(c, cal["ref"], start, end, {r["resource_ref"] for r in resources})
+            deadline = asyncio.get_running_loop().time() + SUPPLEMENT_S
+            keys, probed = await asyncio.wait_for(self.providers.gone(cal, lost, deadline), SUPPLEMENT_S * 1.5)
+            return dict(changes, cancelled=list(changes.get("cancelled", [])) + keys, probed=probed)
+        except Exception:
+            # An unexplained absence journals nothing (criterion 3); the window itself is still published.
+            return changes
+
     async def sync_one(self):
         with self.store.transaction() as conn:
             job = conn.execute(
@@ -414,8 +450,12 @@ class Worker:
                 ).fetchone()["ok"]:
                     self.store.query("UPDATE sync_jobs SET state='prepared' WHERE id=%s", (job["id"],))
                     return True
+                changes = await self._journal_changes(cal, job["start_at"])
                 resources = await self.providers.read_window(cal, job["start_at"], job["end_at"])
-                self.store.publish_window(cal["ref"], job["start_at"], job["end_at"], resources, "complete")
+                changes = await self._gone(cal, job["start_at"], job["end_at"], resources, changes)
+                self.store.publish_window(
+                    cal["ref"], job["start_at"], job["end_at"], resources, "complete", changes=changes
+                )
             state = "verified"
         except CalendarError as e:
             self.store.query(

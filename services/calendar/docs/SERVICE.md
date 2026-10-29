@@ -276,6 +276,53 @@ A zero-length event (for example, DTSTART without DTEND) is published as a momen
 
 If a worker restarted during a read, that refresh becomes `failed`, and coverage gets `sync_interrupted`. It is not run again: a read that crashed the process would otherwise block all refreshes and operations. For a new read the agent calls agenda/slots with `refresh=true` again.
 
+## Change journal (ANYM-565, schema 8)
+
+Each complete window read is compared with the last stored state of every event it holds (`event_states`), and what
+changed is written to `change_journal` in the transaction that replaces the window. A change is seen only when a read
+covers it: there is no background refresh (ANYM-576), so a change appears no sooner than the next agenda or slots
+refresh of a window that holds the event.
+
+- The first read of a calendar seeds the baseline and journals nothing. `created` means *first seen after the
+  baseline*, not the provider's creation time: an event in a window first read later is `created` then.
+- `changed` names the fields that differ (`start`, `end`, `details`: title, place, description, busy and the other
+  agenda fields); an etag change alone is no change. The occurrences of one series that changed in one read are one
+  `changed` (its first changed occurrence, `series_ref`, the occurrence count). A moved occurrence keeps its
+  `event_ref` (Google: `recurringEventId` and `originalStartTime`; CalDAV: the UID and recurrence ID).
+- `cancelled` is claimed only on the provider's word: a Google item with status `cancelled` (in the window read, or in
+  Google's incremental sync since the stored `nextSyncToken`), a CalDAV occurrence with `STATUS:CANCELLED` or named
+  by the series' `EXDATE`, or a CalDAV resource a window read lost and a GET reads back as gone (404). An event that
+  just left a window, or a recurrence rule that stops producing an occurrence, is moved or unknown: no event, and the
+  read of another window that finds it journals `changed`. A failed, partial or interrupted read journals nothing. A
+  cancellation also removes the event's live occurrence wherever it is stored.
+- Google sync and CalDAV probes run before and after the window read, each one step of at most 15 s; the window is
+  always published. A sync run that does not end in its step (10 pages, or the 15 s) resumes at its page on the next
+  refresh, and the cancellations each step read are journaled with it; on an error the stored state stays and the
+  next refresh reads the same changes again. A 410 starts a full resync from the earliest tracked event, whose token
+  replaces the old one only when the run ends. Only the item ID, status, series and original start are requested,
+  and only cancelled items are kept. The probes read at most 25 lost resources per refresh, least recently probed
+  first; a failed or timed-out probe counts as probed.
+- `origin` is `deedkit:<principal>` when an operation of that principal sent a step to the event's resource (or a
+  Google instance's series master) and finished (its audit row) after the state the change is measured from, else `provider`.
+- Known limit: a DeedKit write whose operation a restart interrupted before its audit row reads `provider`.
+- An event outside 1970-01-01..9999-12-30 (the ANYM-562 time range) is kept in the baseline but not journaled.
+- If the journal write fails, its savepoint rolls back: the window still answers readers from the provider, the
+  baseline does not move, an audit row `change_journal`/`failed` is written, and the next read journals the same
+  changes once. Before migration 8 and its `db-roles` grants nothing is journaled.
+- A cancelled event stays readable for 30 days from its last stored state: `calendar_agenda` lists the window's
+  cancelled events under `cancelled` (details visibility only; the key is absent when there are none; at most 500,
+  with `cancelled_incomplete: true` when there are more; `event_refs` (up to 100) lists only those refs). The worker deletes the state 30 days after
+  cancellation.
+
+`GET /v1/events?after=<seq>&limit=<1-200>` and `GET /v1/events/head` serve the journal in the ANYM-562 producer
+contract (root SUBSCRIPTIONS.md, Module events) to a key whose only scope is `calendar:events` (`service agent-key
+--scopes calendar:events --calendar <ref> ...`), for the calendars it is bound to. Each event is the envelope with
+`source` `deedkit:calendar`, `id` `calendar:<seq>`, `urgency` `batch`, a top-level `scope_ref` `calendar:<calendar_ref>`,
+and only the contract's data keys: `calendar_ref`, `event_ref`, `start_at`, `version` (not on `cancelled`) and
+`changed`. `series_ref`, the occurrence count and `origin` stay in the journal until the contract accepts them.
+`seq` is gapless and commits in order (writers take the one `journal_head` row); the journal is not pruned
+(`retention_floor` 0). Before the worker's first journal write the head is `503 journal_not_ready`.
+
 ## Operations
 
 `family-calendar-local status/start/stop` manages only its own macOS launch agents; PostgreSQL remains a separate persistent container. The Docker daemon must be running. Keys/passwords are not passed in argv/env; logs are private. On other OSes, run it manually or under your own supervisor.

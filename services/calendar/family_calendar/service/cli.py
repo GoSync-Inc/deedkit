@@ -16,7 +16,7 @@ from family_calendar.config import Registry
 from family_calendar.errors import CalendarError
 from family_calendar.private_files import read_private, write_private, private_dir
 from family_calendar.providers.google.auth import connect
-from .core import READ, WRITE
+from .core import EVENTS, READ, WRITE
 from .providers import Providers, source_ref
 from .store import Store, caller_key, operation_name
 from .vault import Vault
@@ -420,7 +420,8 @@ def dispatch(args, home, root, config, store):
         return {"invitations_enabled": args.action == "allow-invitations"}
     if args.action == "agent-key":
         scopes = args.scopes.split(",")
-        if set(scopes) - set(READ + WRITE):
+        # The event router's key holds calendar:events alone (ANYM-565).
+        if set(scopes) - set(READ + WRITE) and scopes != [EVENTS]:
             raise CalendarError("unsupported_scope")
         if (args.output is None) == (args.token_file is None):
             raise CalendarError("output_or_token_file_required")

@@ -22,7 +22,8 @@ from family_calendar.errors import CalendarError
 HERE = Path(__file__).parent
 MIGRATIONS = ((1, HERE / "schema.sql"), (2, HERE / "schema_v2.sql"), (3, HERE / "schema_v3.sql"),
               (4, HERE / "schema_v4.sql"), (5, HERE / "schema_v5.sql"), (6, HERE / "schema_v6.sql"),
-              (7, HERE / "schema_v7.sql"))
+              (7, HERE / "schema_v7.sql"),
+              (8, HERE / "schema_v8.sql"))
 ROLES = HERE / "roles.sql"
 # migrate-expand's session budgets (ANYM-586 K2, as messaging's ANYM-596), read back after connecting.
 EXPAND_SETTINGS = {"lock_timeout": "2s", "statement_timeout": "4s", "transaction_timeout": "4s"}
@@ -742,16 +743,31 @@ class Store:
             "ORDER BY group_id,dependent_id,activity,duty"
         )
 
-    def publish_window(self, calendar_ref, start, end, resources, status, error=None):
+    def publish_window(self, calendar_ref, start, end, resources, status, error=None, changes=None):
+        """Replaces the window's occurrences; a complete read also journals its changes (ANYM-565). Returns the
+        journal entries, or None when the journal was not written."""
         try:
-            self._publish_window(calendar_ref, start, end, resources, status, error)
+            return self._publish_window(calendar_ref, start, end, resources, status, error, changes)
         except (psycopg.DataError, psycopg.IntegrityError):
             # Provider data the projection cannot hold is not an unavailable provider.
             raise CalendarError("invalid_provider_data") from None
 
-    def _publish_window(self, calendar_ref, start, end, resources, status, error):
+    def _publish_window(self, calendar_ref, start, end, resources, status, error, changes):
+        from . import journal
+
+        entries = None
         # Replace only this bounded projection, not durable assignments, plans or operation history.
         with self.transaction() as c:
+            if status == "complete" and journal.ready(c):
+                # The journal and its baseline commit with this window or not at all: a failure rolls back to the
+                # savepoint, the window below still answers readers from the provider, and the next read compares
+                # against the unchanged baseline, so it journals the same changes once (criterion 1).
+                try:
+                    with c.transaction():
+                        entries = journal.record(c, calendar_ref, start, end, resources, changes)
+                except Exception:
+                    c.execute("INSERT INTO audit(action,ref,outcome) VALUES ('change_journal',%s,'failed')",
+                              (calendar_ref,))
             c.execute(
                 "DELETE FROM occurrences WHERE calendar_ref=%s AND start_at<%s AND end_at>%s",
                 (calendar_ref, instant(end), instant(start)),
@@ -792,3 +808,4 @@ class Store:
                 "status=excluded.status,checked_at=now(),error=excluded.error",
                 (calendar_ref, instant(start), instant(end), status, error),
             )
+        return entries

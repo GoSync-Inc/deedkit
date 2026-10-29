@@ -131,6 +131,40 @@ def test_the_real_roles_ask_for_and_answer_a_series_read(schema_one, roles):  # 
         "state": "failed", "error": "not_found_or_forbidden"}
 
 
+# spec: ANYM-565
+def test_change_journal_grants_let_the_worker_write_and_the_gateway_read_it(schema_one, roles):  # noqa: F811 (fixtures)
+    from family_calendar.service.core import EVENTS, FamilyService
+    from family_calendar.service.providers import normalize_google
+
+    apply_roles, connect = roles
+    s = schema_one
+    s.migrate()
+    apply_roles()
+    assert check(s) == (store_module.MIGRATIONS[-1][0], [])
+    tables = ("change_journal", "journal_head", "event_states", "journal_calendars")
+    assert {e for e in matrix(s) if e[1] in tables} == (
+        {("gw", t, "SELECT") for t in tables[:3]} | {("wk", t, "SELECT") for t in tables}
+        | {("wk", t, p) for t in ("journal_calendars", "journal_head") for p in ("INSERT", "UPDATE")}
+        | {("wk", "change_journal", "INSERT")} | {("wk", "event_states", p) for p in ("INSERT", "UPDATE", "DELETE")}
+    )
+    s.person("adult-a", "Adult A")
+    s.group("family", "Family")
+    s.member("family", "adult-a", "group_admin")
+    s.connection("google-a", "adult-a", "google")
+    s.calendar("cal-a", "google-a", "private-a", "Private", "UTC", "write")
+    window = ("2026-11-02T00:00:00Z", "2026-11-09T00:00:00Z")
+    lesson = {"id": "lesson", "status": "confirmed", "summary": "Lesson",
+              "start": {"dateTime": "2026-11-03T08:00:00Z"}, "end": {"dateTime": "2026-11-03T09:00:00Z"}}
+    worker, gateway = connect("worker"), connect("gateway")
+    assert worker.publish_window("cal-a", *window, [normalize_google("cal-a", lesson, "UTC")], "complete") == []
+    [entry] = worker.publish_window(
+        "cal-a", *window, [normalize_google("cal-a", dict(lesson, summary="Swim"), "UTC")], "complete")
+    assert entry["changed"] == ["details"]
+    key = s.agent("router", "family", "adult-a", [EVENTS], ["cal-a"])
+    page = FamilyService(gateway).events_page(key, 0, 100)
+    assert [e["type"] for e in page["events"]] == ["calendar.event.changed"]
+
+
 # spec: ANYM-601
 def test_roles_sql_revokes_the_old_all_tables_grant(schema_one, roles):  # noqa: F811 (fixtures)
     apply_roles, _ = roles
@@ -235,7 +269,7 @@ def test_db_roles_check_is_clean_after_db_roles_and_writes_nothing(fcs_home):
     run(["migrate"], home)
     run(["db-roles"], home)
     before = snapshot(home, dsn)
-    assert run(["db-roles", "--check"], home) == {"db_roles_check": "ok", "schema_version": 7}
+    assert run(["db-roles", "--check"], home) == {"db_roles_check": "ok", "schema_version": 8}
     assert snapshot(home, dsn) == before
 
 
@@ -251,7 +285,7 @@ def test_db_roles_check_names_each_drift_and_writes_nothing(fcs_home, change, li
     with pytest.raises(CalendarError) as caught:
         run(["db-roles", "--check"], home)
     assert caught.value.code == "db_roles_drift"
-    assert caught.value.details == {"schema_version": 7, "drift": lines}
+    assert caught.value.details == {"schema_version": 8, "drift": lines}
     assert snapshot(home, dsn) == before
 
 

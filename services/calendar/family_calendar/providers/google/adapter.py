@@ -1,7 +1,11 @@
+import asyncio
 import inspect
 from urllib.parse import quote
 import httpx
 from family_calendar.errors import CalendarError
+
+# Pages of one sync step; a longer run resumes at its page on the next refresh (ANYM-565).
+SYNC_PAGES = 10
 
 
 class GoogleAdapter:
@@ -84,6 +88,39 @@ class GoogleAdapter:
                 "maxResults": 2500,
             },
         )
+
+    async def changes(self, calendar, token=None, start=None, page=None, deadline=None):
+        """One step of Google's sync (ANYM-565): incremental since `token`, or a full sync from `start`, resumed at
+        `page`. Reads pages until the run ends, SYNC_PAGES pages or the loop-time `deadline`, and returns
+        {"items": the cancelled items read, "done": whether the run ended, "sync_token": its next token when it did,
+        "page": the page to resume from when it did not}, or None when Google no longer knows the token (410). Only
+        the fields that name an item and its status are requested; other items are not kept."""
+        params = {"singleEvents": "false", "showDeleted": "true", "maxResults": 2500,
+                  "fields": "items(id,status,recurringEventId,originalStartTime),nextPageToken,nextSyncToken"}
+        params.update({"syncToken": token} if token else {"timeMin": start})
+        if page:
+            params["pageToken"] = page
+        path = "calendars/" + quote(calendar, safe="") + "/events"
+        loop = asyncio.get_running_loop()
+        items = []
+        for _ in range(SYNC_PAGES):
+            left = None if deadline is None else deadline - loop.time()
+            if left is not None and left <= 0:
+                break
+            try:
+                answer = await asyncio.wait_for(self.request("GET", path, params=params, missing=bool(token)), left)
+            except TimeoutError:
+                break
+            if answer is None:
+                return None
+            items.extend(e for e in answer.get("items", []) if isinstance(e, dict) and e.get("status") == "cancelled")
+            cursor = answer.get("nextPageToken")
+            if not cursor:
+                return {"items": items, "done": True, "sync_token": answer.get("nextSyncToken"), "page": None}
+            if cursor == params.get("pageToken"):
+                raise CalendarError("coverage_incomplete")
+            params = dict(params, pageToken=cursor)
+        return {"items": items, "done": False, "sync_token": None, "page": params.get("pageToken")}
 
     async def exceptions(self, calendar, ical_uid):
         """A recurring event unexpanded: its master and its exceptions (instances changed or cancelled on their own)."""

@@ -31,6 +31,8 @@ from .store import digest, instant
 
 # Occurrences published for one calendar window; the same limit as agenda/slots responses.
 EVENT_LIMIT = 500
+# CalDAV resources missing from a window read that one refresh reads back to tell deleted from moved (ANYM-565).
+GONE_PROBES = 25
 # Private extended property of a projected Google event; its value is the random link ID only.
 LINK_PROPERTY = "deedkitLink"
 # dateutil (behind recurring_ical_events) walks and caches every rule instance from
@@ -164,8 +166,16 @@ def normalize_icloud(calendar_ref, resource, start, end, zone, budget=None):
         budget["rule_instances"] -= instances
         if instances > RULE_INSTANCE_LIMIT or budget["rule_instances"] < 0:
             raise CalendarError("coverage_incomplete")
+        cancelled = []
         for e in expand(cal, start, end):
             if str(e.get("STATUS", "")).upper() == "CANCELLED":
+                # The provider's explicit cancellation of this occurrence (ANYM-565), or of the whole event.
+                marked = e.get("RECURRENCE-ID") or e["DTSTART"]
+                cancelled.append(
+                    ["instance", series_ref(calendar_ref, resource["href"]), marked.dt.isoformat()]
+                    if recurring
+                    else ["resource", resource_ref]
+                )
                 continue
             a = ical_time(e.decoded("DTSTART"), zone)
             finish = (
@@ -207,12 +217,23 @@ def normalize_icloud(calendar_ref, resource, start, end, zone, budget=None):
             if len(occurrences) > budget["occurrences"]:
                 raise CalendarError("coverage_incomplete")
         budget["occurrences"] -= len(occurrences)
+        if recurring:
+            # An EXDATE is the provider's own removal of one occurrence (ANYM-565); a rule that just stops producing
+            # an occurrence, or a range override that moves it, is no evidence.
+            for e in cal.walk("VEVENT"):
+                excluded = e.get("EXDATE", [])
+                for group in excluded if isinstance(excluded, list) else [excluded]:
+                    cancelled.extend(
+                        ["instance", series_ref(calendar_ref, resource["href"]), value.dt.isoformat()]
+                        for value in group.dts
+                    )
         return {
             "resource_ref": resource_ref,
             "target": resource["href"],
             "etag": resource["etag"],
             "payload": {"ical": base64.b64encode(resource["data"]).decode()},
             "occurrences": occurrences,
+            "cancelled": cancelled,
         }
     except CalendarError:
         raise
@@ -263,23 +284,38 @@ def normalize_google(calendar_ref, e, zone):
         if e.get("recurringEventId") and original and not e.get("recurrence"):
             # An instance (singleEvents=true) names its series and its original start; a master has neither.
             details.update(series_ref=series_ref(calendar_ref, e["recurringEventId"]), original_start=original)
-        rows.append(
-            {
-                "ref": source_ref("event", resource_ref, identity),
-                "start": a,
-                "end": b,
-                # A zero-length event is a non-blocking instant.
-                "busy": b > a and e.get("transparency") != "transparent",
-                "details": details,
-            }
-        )
+        row = {
+            "ref": source_ref("event", resource_ref, identity),
+            "start": a,
+            "end": b,
+            # A zero-length event is a non-blocking instant.
+            "busy": b > a and e.get("transparency") != "transparent",
+            "details": details,
+        }
+        if e.get("recurringEventId"):
+            # A series write names the master's resource: the journal's origin of an instance's change (ANYM-565).
+            row["master_ref"] = source_ref("res", calendar_ref, e["recurringEventId"])
+        rows.append(row)
     return {
         "resource_ref": resource_ref,
         "target": e["id"],
         "etag": e.get("etag"),
         "payload": e,
         "occurrences": rows,
+        "cancelled": google_cancelled(calendar_ref, e),
     }
+
+
+def google_cancelled(calendar_ref, e):
+    """What a Google item with status cancelled cancels (ANYM-565): one instance by its series and original start,
+    else the event, or the whole series when the item is its master."""
+    if e.get("status") != "cancelled" or not isinstance(e.get("id"), str):
+        return []
+    identity = e.get("originalStartTime")
+    original = identity.get("dateTime") or identity.get("date") if isinstance(identity, dict) else None
+    if e.get("recurringEventId"):
+        return [["instance", series_ref(calendar_ref, e["recurringEventId"]), original]] if valid_original(original) else []
+    return [["resource", source_ref("res", calendar_ref, e["id"])], ["series", series_ref(calendar_ref, e["id"])]]
 
 
 def same_time(actual, desired):
@@ -384,6 +420,61 @@ class Providers:
                 "encrypted_v1": self.vault._cipher().encrypt(json.dumps(r["payload"]).encode()).decode()
             }
         return rows
+
+    async def sync_changes(self, cal, state, since, deadline=None):
+        """Google's sync for the journal (ANYM-565 criterion 4), one bounded step: {"cancelled": keys, "sync": the
+        calendar's next sync state}. State {"token", "page", "since"}: incremental since the token, or a full sync
+        from `since` (the earliest tracked event) when there is none, after a 410; a run that does not end before
+        `deadline` resumes at its page next time, and its cancelled items are claimed as they are read, so a resync
+        never skips the cancellations it passes. Other providers: {}."""
+        if cal["provider"] != "google":
+            return {}
+        adapter = await self.adapter(cal)
+        token, page = state.get("token"), state.get("page")
+        full_since = state.get("since") or since
+        try:
+            result = await adapter.changes(cal["target"], token=token, start=None if token else full_since.isoformat(),
+                                           page=page, deadline=deadline)
+        except CalendarError:
+            if not page:
+                raise
+            # A page Google no longer serves: the run starts again from its token (or its start) next time.
+            return {"cancelled": [], "sync": {"token": token, "page": None, "since": None}}
+        if result is None:
+            token, full_since = None, since
+            result = await adapter.changes(cal["target"], start=since.isoformat(), deadline=deadline)
+            if result is None:
+                raise CalendarError("provider_unavailable")
+        keys = [k for e in result["items"] for k in google_cancelled(cal["ref"], e)]
+        if result["done"]:
+            return {"cancelled": keys, "sync": {"token": result["sync_token"], "page": None, "since": None}}
+        return {"cancelled": keys, "sync": {"token": token, "page": result["page"], "since": None if token else full_since}}
+
+    async def gone(self, cal, resources, deadline=None):
+        """CalDAV: of the resources [(resource_ref, target)] a window read lost, the first GONE_PROBES read back until
+        the loop-time `deadline`: (cancellation keys of those that are deleted (404), the resource_refs attempted).
+        A resource still there moved out of the window: no key. A failed or timed-out read counts as attempted, so
+        the next refresh goes on with the others (ANYM-565)."""
+        if cal["provider"] != "icloud":
+            return [], []
+        adapter = await self.adapter(cal)
+        loop = asyncio.get_running_loop()
+        keys, probed = [], []
+        for resource_ref, target in resources[:GONE_PROBES]:
+            left = None if deadline is None else deadline - loop.time()
+            if left is not None and left <= 0:
+                break
+            if not within_collection(target, cal["target"]):
+                continue
+            probed.append(resource_ref)
+            try:
+                if await asyncio.wait_for(adapter.read(target), left) is None:
+                    keys.append(["resource", resource_ref])
+            except TimeoutError:
+                break
+            except Exception:
+                continue
+        return keys, probed
 
     async def read(self, cal, target):
         adapter = await self.adapter(cal)
