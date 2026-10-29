@@ -949,7 +949,8 @@ attribute names, not the CloudEvents HTTP binding:
 
 References are `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`; `end_reason` and `outcome` are lowercase
 tokens of at most 48 characters. No titles, places, descriptions, guest names, destinations,
-transcripts or owner answers. An event is at most 2 KiB.
+transcripts or owner answers. `data` is at most 1 KiB (as PostgreSQL prints jsonb); the module
+seq in `id` is at most 2^53-1.
 
 Producers' read endpoint (`GET /v1/events?after=<seq>&limit=<n>`, ANYM-563 and ANYM-565; the router,
 ANYM-575, applies `read_page`). A page is `{events, next_after, has_more, retention_floor,
@@ -962,8 +963,9 @@ other than the cursor's, or a `next_after` below the cursor, is a source reset: 
 never read as new events.
 
 Publishing: only `publish_module_event(...)`, a definer function with a fixed search path and no
-PUBLIC execute; it checks the type's data keys and the urgency and expiry rules again and inserts
-one row. A retry with the same `id` and fields returns the stored seq; the same `id` with other
+PUBLIC execute; it applies the whole contract again through `module_event_valid` (every key, rule,
+bound, the subject, the id's module, the urgency and expiry rules and the data size), so a caller
+that skips `validate_event` still cannot store free text, and inserts one row. A retry with the same `id` and fields returns the stored seq; the same `id` with other
 fields fails with `module_event_conflict`. The router's role (`module_router_role.sql`,
 `messaging_module_router`) can execute it and `report_module_reachability` and nothing else: no
 table privilege, so it can write no message event, change no subscription source or link and read
@@ -978,11 +980,20 @@ module events by `(source, scope_ref)` and type into `subscription_module_matche
 `matched_through`, match budget (`SUBSCRIPTION_MAX_MATCHES`) and gap (`stream: "modules"`), and
 stages one outbox hint of kind `module_events` whose `through_position` is a module position
 (endpoint bodies list `module_event_id`, `type`, `source`, `subject`, `urgency`, `expires_at`).
+A hint is staged only while a dispatcher whose heartbeat names schema 57 or later beats
+(`module_hints_ready()`): an older dispatcher would read the module position as a message
+position. Until then the hint waits (the stream's `hinted_through` stays) and pull reads work. A
+failed hint step (`subscription_module_hint_failed`) keeps the module matches and is retried on
+the next pass. The dispatcher rechecks expiry before every attempt: a hint whose events have all
+expired (or were ACKed) is cancelled with `module_events_expired` and never sent.
 
 Reads: `get_subscription` adds `module_stream` (state, positions, sources, health) only for a
 subscription that has one; message-only responses are unchanged. `get_subscription_events`,
 `fetch_subscription_events` and `wait_for_subscription_events` add `module: {items, has_more,
-next_after, gap}`; each item is the envelope above plus `module_event_id`. One fetch receipt
+next_after, gap}`; each item is the envelope above plus `module_event_id` and `expired`. The
+passive `get_subscription_events` reads the module stream from the consumer's ACK position, so a
+pruned range is never served again; `Store.get_subscription_events(module_after=)` pages it
+explicitly (the MCP and gateway parameter comes with the module catalog, ANYM-566). One fetch receipt
 carries both streams' positions (`module_after_position`, `module_through_position`); the ACK
 moves each position by compare-and-swap and returns `module_acked_through`. Retention prunes
 ACKed module references after the same window and with the same switch as message references,
@@ -1002,17 +1013,24 @@ the message stream runs, until the key calls `update_subscription(action="resume
 Backup: the manifest covers `module_event_counter`, `module_events`, `subscription_module_sources`,
 `subscription_module_streams` and `subscription_module_matches` from schema 57;
 `module_source_health` is derived router state. A restore closes every subscription and cancels
-pending hints, module ones included.
+pending hints, module ones included. `pg_restore --no-acl` leaves new functions executable by
+PUBLIC; `migrate()` revokes PUBLIC from the five schema-57 functions again (as for the older
+definer functions), and `subscription_role.sql` and `module_router_role.sql` revoke it too.
 
-Rollout: a verified backup by the deployed image's backup (schema 55/56), migration 57 (manual),
-then reapply `subscription_role.sql`, `gateway_role.sql` and `delivery_role.sql` and install
-`module_router_role.sql` before the router (ANYM-575) exists; the new image's backup reads schema 57.
-Rollback to a runtime before schema 57: first cancel pending module hints
+Rollout: under docs/operations/production.md "Migration releases and the backup gate". Production
+runs schema 53 (0107b218), whose backup reads schemas up to 53 only: the prepared release's backup
+and restore runtimes (schema 57) are installed first, then the gate takes and verifies the backup
+of the current database with them, then the one `migrate` (054 through 057), then reapply
+`subscription_role.sql`, `gateway_role.sql` and `delivery_role.sql` and install
+`module_router_role.sql`; the router (ANYM-575) comes later. Those backup and restore runtimes stay
+pinned through any rollback of the service images: a backup taken after the migration needs a
+schema-57 runtime to verify or restore.
+Rollback of the service images to a runtime before schema 57: stop the matcher (the only module hint
+writer) first, then cancel pending module hints
 (`UPDATE subscription_outbox SET state='cancelled',error_code='module_rollback',finished_at=clock_timestamp()
 WHERE kind='module_events' AND state IN ('pending','leased')`), because an older dispatcher would
-send them as message hints; the module tables stay and the fence holds every module stream an
-older runtime resumes. Backups taken after the migration need the schema-57 backup executable to
-verify or restore.
+send them as message hints, then deploy. The module tables stay; an older matcher stages no module
+hint, and the fence holds every module stream an older runtime resumes.
 
 ## Remaining extensions and verification boundaries
 

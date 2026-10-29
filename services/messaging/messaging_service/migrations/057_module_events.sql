@@ -85,6 +85,90 @@ ALTER TABLE subscription_outbox ADD CONSTRAINT subscription_outbox_kind_check
  CHECK(kind IN ('events','test','silence','module_events')) NOT VALID;
 SET LOCAL lock_timeout=DEFAULT;
 
+-- The contract of module_events.validate_event (KINDS), enforced again inside the privileged
+-- boundary: every key of the type present (optional ones aside) and no other, each value within
+-- its rule (ref, time, token, enumeration, integer range, changed list), the subject equal to the
+-- type's subject key, the id's module equal to the source's, data at most 1024 bytes, and the
+-- urgency and expiry rules. References only: no free text fits any rule.
+CREATE FUNCTION public.module_event_valid(p_id text, p_source text, p_type text, p_subject text,
+  p_data jsonb, p_urgency text, p_expires_at timestamptz) RETURNS boolean
+ LANGUAGE plpgsql STABLE SET search_path=pg_catalog AS $$
+DECLARE spec jsonb; rule text; item record; value jsonb; parts text[];
+ specs constant jsonb := '{
+  "calendar.event.created": {"subject": "event_ref", "optional": [], "keys": {"calendar_ref": "ref",
+   "event_ref": "ref", "start_at": "time", "version": "int:0:9007199254740991"}},
+  "calendar.event.changed": {"subject": "event_ref", "optional": [], "keys": {"calendar_ref": "ref",
+   "event_ref": "ref", "start_at": "time", "version": "int:0:9007199254740991", "changed": "changed"}},
+  "calendar.event.cancelled": {"subject": "event_ref", "optional": [], "keys": {"calendar_ref": "ref",
+   "event_ref": "ref", "start_at": "time"}},
+  "calendar.event.starting": {"subject": "event_ref", "optional": [], "keys": {"calendar_ref": "ref",
+   "event_ref": "ref", "start_at": "time", "lead_minutes": "int:1:1440"}},
+  "call.finished": {"subject": "call_id", "optional": ["duration_s", "outcome"], "keys": {"call_id": "ref",
+   "status": "enum:finished", "end_reason": "token", "duration_s": "int:0:86400", "outcome": "token",
+   "transcript": "enum:final"}},
+  "call.failed": {"subject": "call_id", "optional": [], "keys": {"call_id": "ref",
+   "status": "enum:failed|finished", "end_reason": "token"}},
+  "call.not_answered": {"subject": "call_id", "optional": [], "keys": {"call_id": "ref",
+   "end_reason": "enum:no_answer|busy|canceled"}},
+  "call.interrupted": {"subject": "call_id", "optional": [], "keys": {"call_id": "ref",
+   "end_reason": "enum:service_restart"}},
+  "call.owner_request": {"subject": "call_id", "optional": [], "keys": {"call_id": "ref",
+   "decision_id": "ref", "state": "enum:pending"}}}';
+BEGIN
+ spec := specs->p_type;
+ IF spec IS NULL OR p_data IS NULL OR jsonb_typeof(p_data)<>'object' OR octet_length(p_data::text)>1024
+   OR p_id IS NULL OR p_id !~ '^(calendar|calls):[1-9][0-9]{0,15}$'
+   OR CASE WHEN p_id ~ '^(calendar|calls):[1-9][0-9]{0,15}$'
+     THEN split_part(p_id,':',2)::numeric>9007199254740991 ELSE true END
+   OR split_part(p_id,':',1) IS DISTINCT FROM split_part(p_source,':',2)
+   OR p_urgency IS NULL OR p_urgency NOT IN ('now','batch')
+   OR p_subject IS DISTINCT FROM p_data->>(spec->>'subject')
+   OR jsonb_typeof(p_data->(spec->>'subject')) IS DISTINCT FROM 'string' THEN
+  RETURN false;
+ END IF;
+ FOR item IN SELECT k FROM jsonb_object_keys(p_data) k LOOP
+  IF NOT spec->'keys' ? item.k THEN RETURN false; END IF;
+ END LOOP;
+ FOR item IN SELECT key,value AS r FROM jsonb_each_text(spec->'keys') LOOP
+  value := p_data->item.key;
+  IF value IS NULL THEN
+   IF NOT spec->'optional' ? item.key THEN RETURN false; END IF;
+   CONTINUE;
+  END IF;
+  rule := item.r;
+  IF rule IN ('ref','time','token') OR rule LIKE 'enum:%' THEN
+   IF jsonb_typeof(value)<>'string' THEN RETURN false; END IF;
+  END IF;
+  IF rule='ref' AND value#>>'{}' !~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+    OR rule='token' AND value#>>'{}' !~ '^[a-z][a-z0-9_]{0,47}$'
+    OR rule='time' AND (value#>>'{}' !~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})$'
+      OR NOT pg_input_is_valid(value#>>'{}','timestamptz'))
+    OR rule LIKE 'enum:%' AND NOT (value#>>'{}')=ANY(string_to_array(substr(rule,6),'|')) THEN
+   RETURN false;
+  END IF;
+  IF rule LIKE 'int:%' THEN
+   parts := string_to_array(rule,':');
+   IF jsonb_typeof(value)<>'number' OR (value#>>'{}') !~ '^-?[0-9]+$'
+     OR (value#>>'{}')::numeric NOT BETWEEN parts[2]::numeric AND parts[3]::numeric THEN
+    RETURN false;
+   END IF;
+  END IF;
+  IF rule='changed' AND (jsonb_typeof(value)<>'array' OR jsonb_array_length(value) NOT BETWEEN 1 AND 3
+    OR EXISTS(SELECT FROM jsonb_array_elements(value) e WHERE jsonb_typeof(e)<>'string'
+      OR e#>>'{}' NOT IN ('start','end','details'))
+    OR (SELECT count(DISTINCT e) FROM jsonb_array_elements(value) e)<>jsonb_array_length(value)) THEN
+   RETURN false;
+  END IF;
+ END LOOP;
+ IF p_type='call.owner_request' AND (p_urgency<>'now' OR p_expires_at IS NULL)
+   OR p_type='calendar.event.starting' AND (p_expires_at IS NULL
+     OR p_expires_at<>(p_data->>'start_at')::timestamptz) THEN
+  RETURN false;
+ END IF;
+ RETURN true;
+END $$;
+REVOKE ALL ON FUNCTION public.module_event_valid(text,text,text,text,jsonb,text,timestamptz) FROM PUBLIC;
+
 -- The only module journal write. Fixed search_path, no PUBLIC execute; it inserts one module_events
 -- row and touches no message table, link, source or subscription. A retry with the same id and the
 -- same fields returns the stored seq; the same id with other fields is refused. The counter row is
@@ -93,26 +177,9 @@ SET LOCAL lock_timeout=DEFAULT;
 CREATE FUNCTION public.publish_module_event(p_id text, p_source text, p_type text, p_subject text,
   p_scope_ref text, p_time timestamptz, p_data jsonb, p_urgency text, p_expires_at timestamptz)
  RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
-DECLARE allowed text[]; stored public.module_events; seq bigint;
+DECLARE stored public.module_events; seq bigint;
 BEGIN
- allowed := CASE p_type
-  WHEN 'calendar.event.created' THEN ARRAY['calendar_ref','event_ref','start_at','version']
-  WHEN 'calendar.event.changed' THEN ARRAY['calendar_ref','event_ref','start_at','version','changed']
-  WHEN 'calendar.event.cancelled' THEN ARRAY['calendar_ref','event_ref','start_at']
-  WHEN 'calendar.event.starting' THEN ARRAY['calendar_ref','event_ref','start_at','lead_minutes']
-  WHEN 'call.finished' THEN ARRAY['call_id','status','end_reason','duration_s','outcome','transcript']
-  WHEN 'call.failed' THEN ARRAY['call_id','status','end_reason']
-  WHEN 'call.not_answered' THEN ARRAY['call_id','end_reason']
-  WHEN 'call.interrupted' THEN ARRAY['call_id','end_reason']
-  WHEN 'call.owner_request' THEN ARRAY['call_id','decision_id','state'] END;
- IF allowed IS NULL OR p_data IS NULL OR jsonb_typeof(p_data)<>'object'
-   OR EXISTS(SELECT FROM jsonb_object_keys(p_data) k WHERE k<>ALL(allowed))
-   OR EXISTS(SELECT FROM jsonb_each(p_data) e WHERE jsonb_typeof(e.value) NOT IN ('string','number','array')
-     OR jsonb_typeof(e.value)='string' AND length(e.value#>>'{}')>128)
-   OR p_type='call.owner_request' AND (p_urgency IS DISTINCT FROM 'now' OR p_expires_at IS NULL)
-   OR p_type='calendar.event.starting' AND (p_expires_at IS NULL
-     OR NOT pg_input_is_valid(coalesce(p_data->>'start_at',''),'timestamptz')
-     OR p_expires_at<>(p_data->>'start_at')::timestamptz) THEN
+ IF NOT public.module_event_valid(p_id,p_source,p_type,p_subject,p_data,p_urgency,p_expires_at) THEN
   RAISE EXCEPTION 'invalid_module_event' USING ERRCODE='check_violation';
  END IF;
  PERFORM 1 FROM public.module_event_counter WHERE id=1 FOR UPDATE;
@@ -134,13 +201,22 @@ REVOKE ALL ON FUNCTION public.publish_module_event(text,text,text,text,text,time
 
 -- The router's reachability report: the first failure keeps its time, a success clears it.
 CREATE FUNCTION public.report_module_reachability(p_source text, p_reachable boolean) RETURNS void
- LANGUAGE sql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
+ LANGUAGE sql STRICT SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
  INSERT INTO public.module_source_health(source,unreachable_since)
   VALUES(p_source,CASE WHEN p_reachable THEN NULL ELSE clock_timestamp() END)
  ON CONFLICT(source) DO UPDATE SET observed_at=clock_timestamp(),
   unreachable_since=CASE WHEN p_reachable THEN NULL
    ELSE coalesce(public.module_source_health.unreachable_since,clock_timestamp()) END $$;
 REVOKE ALL ON FUNCTION public.report_module_reachability(text,boolean) FROM PUBLIC;
+
+-- The matcher stages module_events hints only while a dispatcher that knows the kind beats: its
+-- heartbeat names its runtime schema (component_heartbeats, schema 50), and an older dispatcher would
+-- read a module position as a message position. The matcher cannot read that row (row-level security).
+CREATE FUNCTION public.module_hints_ready() RETURNS boolean
+ LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
+ SELECT EXISTS(SELECT FROM public.component_heartbeats WHERE component='dispatcher' AND schema_version>=57
+  AND beat_at>clock_timestamp()-interval '120 seconds') $$;
+REVOKE ALL ON FUNCTION public.module_hints_ready() FROM PUBLIC;
 
 -- Rollback fence: code that knows module streams sets messaging.module_aware for the transaction
 -- that makes a subscription active. Any other transition to active (an older runtime's resume)
@@ -167,6 +243,7 @@ DO $$ BEGIN
   GRANT SELECT ON subscription_module_streams TO messaging_subscriptions;
   GRANT UPDATE(matched_through,hinted_through,retention_floor,blocked_reason,gap,missing_evidence,last_matched_at)
    ON subscription_module_streams TO messaging_subscriptions;
+  GRANT EXECUTE ON FUNCTION public.module_hints_ready() TO messaging_subscriptions;
  END IF;
  IF EXISTS(SELECT FROM pg_roles WHERE rolname='messaging_gateway') THEN
   GRANT SELECT ON module_events,module_event_counter,subscription_module_sources,subscription_module_matches,

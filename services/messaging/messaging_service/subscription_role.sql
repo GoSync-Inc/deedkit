@@ -48,3 +48,8 @@ GRANT SELECT,INSERT,DELETE ON subscription_module_matches TO messaging_subscript
 GRANT SELECT ON subscription_module_streams TO messaging_subscriptions;
 GRANT UPDATE(matched_through,hinted_through,retention_floor,blocked_reason,gap,missing_evidence,last_matched_at)
     ON subscription_module_streams TO messaging_subscriptions;
+GRANT EXECUTE ON FUNCTION public.module_hints_ready() TO messaging_subscriptions;
+-- A restore runs without ACLs; the definer functions never stay open to PUBLIC.
+REVOKE ALL ON FUNCTION public.module_hints_ready(),public.publish_module_event(text,text,text,text,text,timestamptz,jsonb,text,timestamptz),
+    public.report_module_reachability(text,boolean),public.module_event_valid(text,text,text,text,jsonb,text,timestamptz),
+    public.subscription_module_fence() FROM PUBLIC;

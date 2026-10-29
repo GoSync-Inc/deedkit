@@ -140,7 +140,39 @@ def modules(seeded):
     with store.pool.connection() as c:
         c.execute('TRUNCATE module_events,module_source_health CASCADE')
         c.execute('UPDATE module_event_counter SET value=0 WHERE id=1')
+        c.execute("DELETE FROM component_heartbeats WHERE component='dispatcher'")
     return seeded
+
+
+def beat(store, schema=None):
+    """The dispatcher's heartbeat: this runtime's schema, or an older dispatcher's."""
+    from messaging_service.heartbeats import record
+    if schema is None:
+        assert record(store, 'dispatcher')
+        return
+    with store.pool.connection() as c:
+        c.execute('''INSERT INTO component_heartbeats(component,version,schema_version,beat_at)
+            VALUES('dispatcher','0.9.18',%s,clock_timestamp()) ON CONFLICT(component) DO UPDATE
+            SET schema_version=EXCLUDED.schema_version,beat_at=EXCLUDED.beat_at''', (schema,))
+
+
+def bound(store, token, sid, tmp_path):
+    from messaging_service.event_delivery import register_receiver
+    secret = tmp_path / 'receiver.key'
+    secret.write_bytes(b'synthetic receiver secret bytes 0123456789')
+    secret.chmod(0o600)
+    with store.authorized(token) as (_, p):
+        key_id = str(p['key_id'])
+    rid = str(uuid4())
+    register_receiver(store, rid, 'module-reader', key_id, 'https://hooks.example.test/wake', str(secret),
+        resolver=lambda *a, **k: ['93.184.216.34'])
+    store.configure_subscription_delivery(token, sid, store.get_subscription(token, sid)['version'], rid)
+
+
+def module_hints(store, sid):
+    with store.pool.connection() as c:
+        return c.execute('''SELECT through_position,state,error_code FROM subscription_outbox
+            WHERE subscription=%s AND kind='module_events' ORDER BY created_at''', (sid,)).fetchall()
 
 
 def subscriber(store):
@@ -232,6 +264,7 @@ def test_mixed_subscription_fetches_and_acks_each_stream_and_a_module_wake_reach
     register_receiver(store, rid, 'module-reader', key_id, 'https://hooks.example.test/wake', str(secret),
         resolver=lambda *a, **k: ['93.184.216.34'])
     store.configure_subscription_delivery(token, sid, 1, rid)
+    beat(store)
     ignored = publish(store, call_event(1, 'call-9'), scope='someone-else')
     wake = publish(store, call_event(2, kind='call.owner_request'))
     message = emit(store)
@@ -404,3 +437,236 @@ def test_concurrent_publishers_keep_the_module_sequence_gapless(modules):
     with ThreadPoolExecutor(8) as pool:
         seqs = list(pool.map(lambda n: publish(store, call_event(n, f'call-{n}')), range(1, 41)))
     assert sorted(seqs) == list(range(1, 41))
+
+
+def _mutations():
+    finished = call_event(1)
+    changed = {'specversion': '1.0', 'id': 'calendar:3', 'source': 'deedkit:calendar',
+        'type': 'calendar.event.changed', 'subject': 'event-1', 'time': '2026-10-29T10:00:00Z',
+        'data': {'calendar_ref': 'family', 'event_ref': 'event-1', 'start_at': '2026-10-29T10:15:00Z',
+            'version': 2, 'changed': ['start']}, 'urgency': 'batch', 'expires_at': None}
+    def data(event, **values):
+        return {**event, 'data': {**event['data'], **values}}
+    without = {key: value for key, value in finished['data'].items() if key != 'end_reason'}
+    return {'valid_finished': finished, 'valid_changed': changed, 'valid_owner': call_event(2, kind='call.owner_request'),
+        'valid_starting': starting_event(4), 'free_text_transcript': data(finished, transcript='private words'),
+        'missing_key': {**finished, 'data': without}, 'status_outside_enum': data(finished, status='done'),
+        'duration_too_long': data(finished, duration_s=86401), 'duration_negative': data(finished, duration_s=-1),
+        'duration_fraction': data(finished, duration_s=1.5), 'duration_text': data(finished, duration_s='42'),
+        'duration_bool': data(finished, duration_s=True), 'token_with_space': data(finished, end_reason='has space'),
+        'extra_key': data(finished, destination='+10000000000'), 'subject_mismatch': {**finished, 'subject': 'other'},
+        'changed_repeat': data(changed, changed=['start', 'start']), 'changed_number': data(changed, changed=['start', 1]),
+        'changed_unknown': data(changed, changed=['title']), 'changed_empty': data(changed, changed=[]),
+        'start_not_time': data(changed, start_at='tomorrow'), 'version_negative': data(changed, version=-1),
+        'owner_batched': call_event(2, kind='call.owner_request', urgency='batch'),
+        'starting_late_expiry': {**starting_event(4), 'expires_at': '2026-12-01T00:00:00Z'},
+        'id_of_other_module': {**finished, 'id': 'calendar:1'}, 'id_above_2_53': {**finished, 'id': 'calls:9999999999999999'},
+        'ref_too_long': data(finished, call_id='c' * 129) | {'subject': 'c' * 129}}
+
+
+# spec: ANYM-562
+def test_definer_function_enforces_the_same_schema_as_the_contract(modules):
+    store = modules[0]
+    with store.pool.connection() as c:
+        for name, event in _mutations().items():
+            try:
+                validate_event(event)
+                python = True
+            except ModuleContractError:
+                python = False
+            database = c.execute('SELECT public.module_event_valid(%s,%s,%s,%s,%s,%s,%s) AS ok', (event['id'],
+                event['source'], event['type'], event['subject'], json.dumps(event['data']), event['urgency'],
+                event['expires_at'])).fetchone()['ok']
+            assert python == database == name.startswith('valid_'), name
+
+
+# spec: ANYM-562
+def test_router_role_cannot_publish_free_text_by_calling_sql_directly(modules):
+    store = modules[0]
+    role = 'anym562_router_' + uuid4().hex[:10]
+    with store.pool.connection() as c:
+        c.execute(SOURCE.joinpath('module_router_role.sql').read_text().replace('messaging_module_router', role))
+    try:
+        with pytest.raises(errors.CheckViolation, match='invalid_module_event'), store.pool.connection() as c:
+            c.execute(sql.SQL('SET LOCAL ROLE {}').format(sql.Identifier(role)))
+            c.execute('SELECT public.publish_module_event(%s,%s,%s,%s,%s,%s,%s,%s,%s)', ('calls:1', 'deedkit:calls',
+                'call.finished', 'call-1', 'owner-calls', '2026-10-29T10:00:00Z', json.dumps({'call_id': 'call-1',
+                'status': 'finished', 'end_reason': 'completed', 'transcript': 'private words'}), 'batch', None))
+        with store.pool.connection() as c:
+            assert c.execute('SELECT count(*) AS n FROM module_events').fetchone()['n'] == 0
+    finally:
+        with store.pool.connection() as c:
+            c.execute(sql.SQL('DROP OWNED BY {}').format(sql.Identifier(role)))
+            c.execute(sql.SQL('DROP ROLE {}').format(sql.Identifier(role)))
+
+
+# spec: ANYM-562
+def test_no_module_hint_is_staged_until_a_dispatcher_that_knows_the_kind_beats(modules, tmp_path):
+    store = modules[0]
+    token = subscriber(store)
+    sid = mixed(store, token)
+    bound(store, token, sid, tmp_path)
+    beat(store, 55)  # an older dispatcher would read a module position as a message position
+    seq = publish(store, call_event(1))
+    match_subscriptions(store)
+    assert module_hints(store, sid) == []
+    assert store.get_subscription(token, sid)['module_stream']['matched_event_count'] == 1
+    beat(store)
+    match_subscriptions(store)  # no new match: the waiting hint is staged now
+    assert [row['through_position'] for row in module_hints(store, sid)] == [seq]
+
+
+# spec: ANYM-562
+def test_an_event_that_expires_after_matching_is_never_announced(modules, tmp_path):
+    from messaging_service.event_delivery import dispatch_hints
+    store = modules[0]
+    token = subscriber(store)
+    sid = mixed(store, token)
+    bound(store, token, sid, tmp_path)
+    beat(store)
+    seq = publish(store, call_event(1, kind='call.owner_request'))
+    match_subscriptions(store)
+    assert [row['state'] for row in module_hints(store, sid)] == ['pending']
+    with store.pool.connection() as c:
+        c.execute("UPDATE module_events SET expires_at=clock_timestamp()-interval '1 minute' WHERE seq=%s", (seq,))
+    stats = dispatch_hints(store, transport=lambda *a, **k: pytest.fail('an expired event was announced'),
+        resolver=lambda *a, **k: ['93.184.216.34'])
+    assert stats['cancelled'] == 1
+    assert [(row['state'], row['error_code']) for row in module_hints(store, sid)] == [
+        ('cancelled', 'module_events_expired')]
+    assert store.get_subscription_events(token, sid)['module']['items'][0]['expired'] is True
+
+
+# spec: ANYM-562
+def test_a_failing_hint_step_keeps_the_module_matches(modules, monkeypatch):
+    store = modules[0]
+    token = subscriber(store)
+    sid = mixed(store, token)
+    seq = publish(store, call_event(1))
+    monkeypatch.setattr(module_events, '_hint', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('hint down')))
+    stats = match_subscriptions(store)
+    view = store.get_subscription(token, sid)['module_stream']
+    assert stats['module_matched'] == 1 and view['matched_through'] == seq and view['matched_event_count'] == 1
+    assert [item['module_event_id'] for item in store.fetch_subscription_events(token, sid)['module']['items']] == [seq]
+
+
+# spec: ANYM-562
+def test_passive_module_pages_advance_and_never_repeat_a_retention_gap(modules):
+    store = modules[0]
+    token = subscriber(store)
+    sid = mixed(store, token)
+    seqs = [publish(store, call_event(n, f'call-{n}')) for n in range(1, 6)]
+    match_subscriptions(store)
+    seen, after = [], None
+    for _ in range(5):
+        page = store.get_subscription_events(token, sid, limit=2, module_after=after)['module']
+        seen += [item['module_event_id'] for item in page['items']]
+        after = page['next_after']
+        if not page['has_more']:
+            break
+    assert seen == seqs
+    page = store.fetch_subscription_events(token, sid, limit=3)
+    store.ack_subscription_events(token, sid, page['receipt'], page['ack_version'])
+    with store.pool.connection() as c:
+        c.execute("UPDATE subscription_module_matches SET matched_at=matched_at-interval '30 days' WHERE subscription=%s",
+            (sid,))
+        c.execute("INSERT INTO probe_metadata(name,value) VALUES('subscription_retention','enabled') "
+            "ON CONFLICT(name) DO UPDATE SET value='enabled'")
+    try:
+        prune_subscriptions(store)
+    finally:
+        with store.pool.connection() as c:
+            c.execute("DELETE FROM probe_metadata WHERE name='subscription_retention'")
+    # The default passive cursor is the ACK position, so the pruned range is never read again.
+    default = store.get_subscription_events(token, sid)['module']
+    assert default['gap'] is None and [item['module_event_id'] for item in default['items']] == seqs[3:]
+    # An explicit cursor below the floor gets the gap once; its next_after reads on.
+    stale = store.get_subscription_events(token, sid, module_after=0)['module']
+    assert stale['gap']['reason'] == 'retention_gap' and stale['next_after'] == seqs[2]
+    resumed = store.get_subscription_events(token, sid, module_after=stale['next_after'])['module']
+    assert [item['module_event_id'] for item in resumed['items']] == seqs[3:]
+
+
+# spec: ANYM-562
+def test_code_without_module_streams_reads_messages_only_beside_module_rows(modules, monkeypatch):
+    # Emulates a runtime that does not know schema 57: every module path is off (module_events.ready is the
+    # only switch); the message matcher, get_updates, passive read, fetch, ACK and retention run unchanged.
+    store, old, _ = modules
+    token = subscriber(store)
+    sid = mixed(store, token)
+    publish(store, call_event(1))
+    match_subscriptions(store)
+    with store.pool.connection() as c:
+        module_rows = {name: c.execute(sql.SQL('SELECT count(*) AS n FROM {}').format(sql.Identifier(name))).fetchone()['n']
+            for name in ('module_events', 'subscription_module_matches', 'subscription_module_streams')}
+    monkeypatch.setattr(module_events, 'ready', lambda c: False)
+    before = len(store.get_updates(old, 'probe-old')['items'])
+    message = emit(store)
+    publish(store, call_event(2, 'call-2'))
+    stats = match_subscriptions(store)
+    assert stats['matched'] == 1 and stats['module_matched'] == 0
+    view = store.get_subscription(token, sid)
+    assert 'module_stream' not in view and view['matched_through'] == message
+    page = store.fetch_subscription_events(token, sid)
+    assert 'module' not in page and [item['event_id'] for item in page['items']] == [message]
+    acked = store.ack_subscription_events(token, sid, page['receipt'], page['ack_version'])
+    assert acked['acked_through'] == message and 'module_acked_through' not in acked
+    assert 'module' not in store.get_subscription_events(token, sid)
+    prune_subscriptions(store)
+    assert len(store.get_updates(old, 'probe-old')['items']) == before + 1
+    with store.pool.connection() as c:
+        assert c.execute('SELECT count(*) AS n FROM subscription_module_matches').fetchone()['n'] == \
+            module_rows['subscription_module_matches']
+        assert c.execute('SELECT count(*) AS n FROM module_events').fetchone()['n'] == module_rows['module_events'] + 1
+
+
+# spec: ANYM-562
+def test_restored_mixed_subscription_keeps_each_stream_and_reopens_no_function(modules, tmp_path):
+    from messaging_service.backup import database_manifest, quarantine_restore
+    from test_subscription_retention import snapshot_restored
+    store = modules[0]
+    token = subscriber(store)
+    sid = mixed(store, token)
+    bound(store, token, sid, tmp_path)
+    beat(store)
+    first, second = publish(store, call_event(1)), publish(store, call_event(2, 'call-2'))
+    messages = [emit(store), emit(store, 'demo-tg-2')]
+    match_subscriptions(store)
+    page = store.fetch_subscription_events(token, sid, limit=1)
+    store.ack_subscription_events(token, sid, page['receipt'], page['ack_version'])
+    store.fetch_subscription_events(token, sid)  # an outstanding receipt
+    tables = ('module_event_counter', 'module_events', 'subscription_module_sources', 'subscription_module_streams',
+        'subscription_module_matches', 'subscription_consumption')
+    with store.pool.connection() as c:
+        source = database_manifest(c)
+        streams = c.execute('SELECT acked_through,matched_through FROM subscription_module_streams').fetchone()
+    assert streams == {'acked_through': first, 'matched_through': second}
+    assert [row['state'] for row in module_hints(store, sid)] == ['pending']
+    functions = ('public.publish_module_event(text,text,text,text,text,timestamptz,jsonb,text,timestamptz)',
+        'public.report_module_reachability(text,boolean)', 'public.module_hints_ready()',
+        'public.module_event_valid(text,text,text,text,jsonb,text,timestamptz)')
+    probe = 'anym562_probe_' + uuid4().hex[:10]
+    with snapshot_restored(store, tmp_path) as restored:
+        with restored.pool.connection() as c:
+            c.execute(sql.SQL('CREATE ROLE {} NOLOGIN').format(sql.Identifier(probe)))
+        try:
+            with restored.pool.connection() as c:
+                # pg_restore --no-acl leaves new functions executable by PUBLIC.
+                assert all(c.execute('SELECT has_function_privilege(%s,%s,%s) AS x', (probe, name, 'EXECUTE'))
+                    .fetchone()['x'] for name in functions)
+            quarantine_restore(restored)
+            restored.migrate()
+            with restored.pool.connection() as c:
+                assert not any(c.execute('SELECT has_function_privilege(%s,%s,%s) AS x', (probe, name, 'EXECUTE'))
+                    .fetchone()['x'] for name in functions)
+                after = database_manifest(c)
+                hints = c.execute("SELECT state,error_code FROM subscription_outbox WHERE kind='module_events'").fetchall()
+                assert c.execute('SELECT count(*) AS n FROM subscription_receipts').fetchone()['n'] == 0
+                assert c.execute('SELECT state FROM subscriptions WHERE id=%s', (sid,)).fetchone()['state'] == 'closed'
+                assert c.execute('SELECT acked_through FROM subscription_consumption').fetchone()['acked_through'] == \
+                    messages[0]
+        finally:
+            with restored.pool.connection() as c:
+                c.execute(sql.SQL('DROP ROLE {}').format(sql.Identifier(probe)))
+    assert all(after[name] == source[name] for name in tables)
+    assert hints == [{'state': 'cancelled', 'error_code': 'restored_disabled'}]

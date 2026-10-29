@@ -518,6 +518,15 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                     lease_token=NULL,lease_until=NULL WHERE id=%s""", (hint['id'],))
                 stats['dead_letter'] += 1
                 continue
+            if hint['kind'] == 'module_events':
+                # ANYM-562: expiry is rechecked before each attempt; a hint with no live reference is not sent.
+                from .module_events import hint_references
+                if not hint_references(c, hint['subscription'], hint['through_position']):
+                    c.execute("""UPDATE subscription_outbox SET state='cancelled',finished_at=clock_timestamp(),
+                        error_code='module_events_expired',lease_token=NULL,lease_until=NULL WHERE id=%s""",
+                        (hint['id'],))
+                    stats['cancelled'] += 1
+                    continue
             if hint['state'] == 'leased' and hint.get('endpoint') is not None:
                 # ANYM-582/585: a lease that ran out mid-attempt may have reached an at-most-once receiver. Settle it
                 # before DNS, quiet hours or the budget can turn it back into a pending hint that is sent again.

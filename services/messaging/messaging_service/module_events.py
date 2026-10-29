@@ -19,7 +19,7 @@ URGENCIES = frozenset(('now', 'batch'))
 _REF = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}')
 _SCOPE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,255}')
 _TOKEN = re.compile(r'[a-z][a-z0-9_]{0,47}')
-_ID = re.compile(r'(calendar|calls):([1-9][0-9]{0,17})')
+_ID = re.compile(r'(calendar|calls):([1-9][0-9]{0,15})')
 _TIME = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})')
 MAX_SEQ = 2**53 - 1
 
@@ -73,7 +73,8 @@ KINDS = {
         'call_id'),
 }
 ENVELOPE = frozenset(('specversion', 'id', 'source', 'type', 'subject', 'time', 'data', 'urgency', 'expires_at'))
-EVENT_LIMIT_BYTES = 2048
+# Measured as PostgreSQL prints jsonb (', ' and ': '), so the definer function's bound is the same number.
+DATA_LIMIT_BYTES = 1024
 
 
 class ModuleContractError(ValueError):
@@ -114,8 +115,8 @@ def validate_event(event):
     if event['type'] == 'calendar.event.starting' and (event['expires_at'] is None or
             _at(event['expires_at']) != _at(data['start_at'])):
         _fail('starting_expires_at_start')
-    if len(json.dumps(event, separators=(',', ':')).encode()) > EVENT_LIMIT_BYTES:
-        _fail('event_too_large')
+    if len(json.dumps(data, separators=(', ', ': ')).encode()) > DATA_LIMIT_BYTES:
+        _fail('data_too_large')
     return int(match.group(2))
 
 
@@ -294,7 +295,13 @@ def match(c, row, *, batch_size, maximum, stats):
     c.execute('''UPDATE subscription_module_streams SET matched_through=%s,blocked_reason=%s,gap=%s,
         last_matched_at=clock_timestamp() WHERE subscription=%s''',
         (position, reason, Jsonb(gap) if gap else None, row['id']))
-    _hint(c, row, module)
+    try:
+        _hint(c, row, module)
+    except Exception as error:
+        # The matches and frontier above stay; hinted_through stays, so a later pass offers the hint again.
+        from .telemetry import capture
+        capture(error, 'subscription_module_hint_failed')
+        print(json.dumps({'error': 'subscription_module_hint_failed', 'class': type(error).__name__}), flush=True)
 
 
 def _hint(c, row, module):
@@ -312,7 +319,14 @@ def _hint(c, row, module):
     with c.transaction():
         binding = _hint_target(c, row)
         if binding is not None:
+            if not c.execute('SELECT public.module_hints_ready() AS ready').fetchone()['ready']:
+                # No dispatcher that knows the kind beats: an older one would read a module position as a
+                # message position. Nothing is staged; hinted_through stays, so the hint waits for one.
+                return
             target = 'receiver' if binding['receiver'] is not None else 'endpoint'
+            # The key's hint lock (delivery_policy._slot) makes the queue count and the insert one step.
+            c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',
+                ('subscription-hints:' + str(row['key_id']),))
             if target == 'endpoint' and endpoint_queue_full(c, row):
                 return
             # urgency=now passes quiet hours like a quiet_bypass reason; the dispatcher's key budget still applies.
@@ -326,7 +340,8 @@ def _hint(c, row, module):
 def _item(event):
     return {'module_event_id': event['seq'], 'specversion': '1.0', 'id': event['event_key'],
         'source': event['source'], 'type': event['type'], 'subject': event['subject'], 'time': event['occurred_at'],
-        'data': event['data'], 'urgency': event['urgency'], 'expires_at': event['expires_at']}
+        'data': event['data'], 'urgency': event['urgency'], 'expires_at': event['expires_at'],
+        'expired': event['expired']}
 
 
 def page(c, row, module, after, limit):
@@ -336,23 +351,28 @@ def page(c, row, module, after, limit):
         return {'items': [], 'has_more': True, 'next_after': floor,
             'gap': {'reason': 'retention_gap', 'stream': 'modules', 'after': after, 'through': floor,
                 'recoverable': False, 'floor': floor}}
-    events = c.execute('''SELECT e.* FROM subscription_module_matches m JOIN module_events e ON e.seq=m.event
+    events = c.execute('''SELECT e.*,e.expires_at IS NOT NULL AND e.expires_at<=clock_timestamp() AS expired
+        FROM subscription_module_matches m JOIN module_events e ON e.seq=m.event
         WHERE m.subscription=%s AND m.event>%s ORDER BY m.event LIMIT %s''', (row['id'], after, limit + 1)).fetchall()
     items = [_item(event) for event in events[:limit]]
     return {'items': items, 'has_more': len(events) > limit,
         'next_after': items[-1]['module_event_id'] if items else after, 'gap': module['gap']}
 
 
-def hint_references(c, row, through):
-    """Endpoint hint body references: the kind, the subject reference and the module, nothing else."""
+def hint_references(c, subscription_id, through):
+    """Unexpired references of a module_events hint: the type, the subject reference and the module only.
+
+    Expiry is rechecked at every delivery attempt, so a reminder after its start or an owner request
+    past its deadline is never announced, even after budget waits or retries.
+    """
     module = c.execute('SELECT acked_through FROM subscription_module_streams WHERE subscription=%s',
-        (row['id'],)).fetchone()
+        (subscription_id,)).fetchone()
     after = module['acked_through'] if module else through
-    rows = c.execute('''SELECT e.seq,e.source,e.type,e.subject,e.urgency,e.expires_at,count(*) OVER () AS total
+    return c.execute('''SELECT e.seq,e.source,e.type,e.subject,e.urgency,e.expires_at,count(*) OVER () AS total
         FROM subscription_module_matches m JOIN module_events e ON e.seq=m.event
-        WHERE m.subscription=%s AND m.event>%s AND m.event<=%s ORDER BY m.event LIMIT 20''',
-        (row['id'], after, through)).fetchall()
-    return rows
+        WHERE m.subscription=%s AND m.event>%s AND m.event<=%s
+        AND (e.expires_at IS NULL OR e.expires_at>clock_timestamp()) ORDER BY m.event LIMIT 20''',
+        (subscription_id, after, through)).fetchall()
 
 
 def resume(c, row, policy):

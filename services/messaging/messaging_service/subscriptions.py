@@ -318,7 +318,8 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
     from . import module_events
     module = module_events.stream(c, row['id'])
     if module is not None and module_after is None:
-        module_after = module['start_position']
+        # Passive reads start at the consumer's ACK position: never below the retention floor.
+        module_after = module['acked_through']
     if module_after is not None and (type(module_after) is not int or not 0 <= module_after <= 2**53 - 1):
         raise APIError('invalid_version')
     # Each stream pages, gaps and advances on its own positions (ANYM-562).

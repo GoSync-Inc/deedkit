@@ -1246,10 +1246,11 @@ class Store:
             return update_subscription(self, c, p, subscription_id, version,
                 action=action, resume_policy=resume_policy)
 
-    def get_subscription_events(self, token, subscription_id, *, after=0, limit=50):
+    def get_subscription_events(self, token, subscription_id, *, after=0, limit=50, module_after=None):
         from .subscriptions import get_subscription_events
         with self.authorized(token, 'get_subscription_events') as (c, p):
-            return get_subscription_events(self, c, p, subscription_id, after=after, limit=limit)
+            return get_subscription_events(self, c, p, subscription_id, after=after, limit=limit,
+                module_after=module_after)
 
     def fetch_subscription_events(self, token, subscription_id, *, limit=50):
         from .subscription_consumption import fetch_subscription_events
@@ -1483,6 +1484,14 @@ class Store:
                     'public.journal_source_health(integer)')),'USAGE') THEN
                  REVOKE ALL ON FUNCTION public.journal_source_health(integer),
                   public.source_health_status(jsonb,text,timestamptz,integer) FROM PUBLIC;
+                END IF;
+                -- ANYM-562: the module journal's only writers and the matcher's hint gate.
+                IF pg_has_role((SELECT proowner FROM pg_proc WHERE oid=to_regprocedure(
+                    'public.publish_module_event(text,text,text,text,text,timestamptz,jsonb,text,timestamptz)')),'USAGE') THEN
+                 REVOKE ALL ON FUNCTION public.publish_module_event(text,text,text,text,text,timestamptz,jsonb,text,timestamptz),
+                  public.report_module_reachability(text,boolean),
+                  public.module_event_valid(text,text,text,text,jsonb,text,timestamptz),
+                  public.module_hints_ready(),public.subscription_module_fence() FROM PUBLIC;
                 END IF;
             END $$''')
 
