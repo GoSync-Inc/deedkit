@@ -168,7 +168,7 @@
   "independent_key_permissions": true,
   "mutation_preview_digest_required": true,
   "new_permissions_inherited_by_existing_keys": false,
-  "operation_count": 60,
+  "operation_count": 61,
   "platform_counts_basis": "legacy_defaults_use_account_manifest_for_actual_support",
   "preview_accepts_request_id": true,
   "preview_digest_proves_owner_approval": false,
@@ -178,7 +178,7 @@
   "supported_by_account": {
    "telegram-demo": {
     "available_operations": [],
-    "count": 51,
+    "count": 52,
     "operations": [
      "add_contact",
      "add_participant",
@@ -208,6 +208,7 @@
      "mark_read",
      "mark_unread",
      "mute_chat",
+     "open_chat_by_username",
      "pin_message",
      "promote_participant",
      "reject_join_requests",
@@ -288,7 +289,7 @@
    }
   },
   "supported_count_by_platform": {
-   "telegram": 51,
+   "telegram": 52,
    "whatsapp": 45
   },
   "tools": [
@@ -518,6 +519,22 @@
      "open_chat_by_phone",
      "gateway_action_grant"
     ],
+    "send_requires_preview_digest": true
+   },
+   "username": {
+    "digest_binds_identity": true,
+    "lookup_quota": "shared_with_open_chat_by_username",
+    "platforms": [
+     "telegram"
+    ],
+    "preview_contacts_provider": true,
+    "requires": [
+     "send",
+     "full_account",
+     "open_chat_by_username",
+     "gateway_action_grant"
+    ],
+    "send_rechecks_identity": true,
     "send_requires_preview_digest": true
    }
   },

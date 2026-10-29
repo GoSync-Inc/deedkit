@@ -45,9 +45,7 @@ export interface MessageContent {
 }
 /** Exactly one recipient: an archive chat_id, a phone number on a native WhatsApp account (ANYM-532), or a
  * Telegram @username of a person (ANYM-643). */
-export type MessageRecipient = {chat_id: string; phone?: never; username?: never}
-  | {phone: string; chat_id?: never; username?: never}
-  | {username: string; chat_id?: never; phone?: never};
+export type MessageRecipient = {chat_id: string; phone?: never; username?: never} | {phone: string; chat_id?: never; username?: never} | {username: string; chat_id?: never; phone?: never};
 export type MessageDraft = MessageContent & MessageRecipient;
 export type MessageAction = MessageDraft & MessageActionFields;
 export interface MessageActionFields {

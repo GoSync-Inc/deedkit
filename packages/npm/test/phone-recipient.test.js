@@ -8,7 +8,8 @@ const declared=readFileSync(new URL('../lib/index.d.ts',import.meta.url),'utf8')
 // spec: ANYM-532
 test('a message draft takes exactly one recipient, chat_id or phone',()=>{
   const union=/export type MessageRecipient = ([^;\n]+(?:;[^;\n]+)*);\n/.exec(declared)?.[1];
-  assert.equal(union,'{chat_id: string; phone?: never} | {phone: string; chat_id?: never}');
+  // ANYM-643: a Telegram username is the third exclusive recipient.
+  assert.equal(union,'{chat_id: string; phone?: never; username?: never} | {phone: string; chat_id?: never; username?: never} | {username: string; chat_id?: never; phone?: never}');
   assert.match(declared,/export type MessageDraft = MessageContent & MessageRecipient;/);
   assert.match(declared,/export type MessageAction = MessageDraft & MessageActionFields;/);
   const content=/interface MessageContent \{([\s\S]*?)\n\}/.exec(declared)[1];
