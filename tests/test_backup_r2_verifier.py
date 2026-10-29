@@ -839,7 +839,7 @@ def follower(operator,tmp_path,monkeypatch):
         if isinstance(result,BaseException):raise result
         return [2,50],result
     # No `venv` under the synthetic code root: the code is installed by hand, only the pins follow.
-    state.code=f.Code(tmp_path/'code');state.self_test=self_test
+    state.code=f.Code(tmp_path/'code');state.self_test=self_test;state.attest=attest
     state.run=lambda:f.follow(path,engine=state.docker,main=state.main,attest=attest,test=self_test,code=state.code)
     state.revert=lambda:f.revert(path,engine=state.docker,test=self_test,code=state.code)
     state.published=lambda:r2.published_helper(r2.load_config(config['receiver_config_file']))
@@ -1064,6 +1064,8 @@ def fake_release(root,name,package=b'OLD_SYNTHETIC_CODE\n'):
         (packages/directory/'METADATA').write_text('Metadata-Version: 2.1\nName: '+name_+'\nVersion: '+version+'\n\nbody\n')
     (release/'pyvenv.cfg').write_text('home = /usr/bin\n');(release/'bin').mkdir();(release/'bin'/'python').write_text('')
     release.chmod(0o755)  # trusted only when not group-writable, whatever the runner's umask
+    from messaging_service import backup_r2_follow as f
+    f.Code.write_binding(release)
     return release
 
 
@@ -1115,7 +1117,7 @@ def test_follow_stages_the_heads_verifier_code_from_its_attested_image_and_moves
     assert sorted(p.name for p in packages.iterdir())==['boto3-1.43.114.dist-info','deedkit-release.pth','messaging_service',
                                                         'six-1.17.0.dist-info']
     assert (packages/'deedkit-release.pth').read_text().startswith('import os, sys; sys.path[:] = [os.path.realpath(p)')
-    assert not (Path(s.config['host_directory'])/s.v.CODE_SWITCH).exists()
+    assert not (Path(s.config['host_directory'])/s.v.CODE_SWITCH).exists() and (s.root/'releases'/HEAD/'.lease').is_file()
     assert s.extracted==[NEW_IMAGE] and s.releases()==sorted([OLD_CODE,HEAD])
     # The installed pair proven by the running code, the head's pair by its own staged code.
     assert s.tested==[OLD_CODE,HEAD] and s.code_tested==[(HEAD,'messaging')]
@@ -1157,15 +1159,66 @@ def test_follow_moves_the_code_when_only_the_code_lags_main_after_a_pin_step(rel
 
 
 # spec: ANYM-597
-def test_follow_moves_the_code_link_only_while_no_receive_session_runs(released):
-    s=released
-    with r2.state_lock(s.receiver):
-        with pytest.raises(RuntimeError,match='receiver_busy'):s.run()
-    # The pins moved, the link waits with its journal and the verifiers' marker.
-    assert s.v.load_config(s.path)['helper_revision']==HEAD and s.link()=='releases/'+OLD_CODE
-    assert follow_status(s)['status']=='waiting' and (Path(s.config['host_directory'])/s.v.CODE_SWITCH).exists()
-    assert s.run()['status']=='current' and s.link()=='releases/'+HEAD
-    assert not (Path(s.config['host_directory'])/s.v.CODE_SWITCH).exists()
+def test_a_release_interpreter_imports_from_the_release_it_started_on_and_holds_its_lease_until_it_exits(released):
+    import subprocess,sys
+    s=released;name='a'*40;release=s.root/'releases'/name
+    subprocess.run([sys.executable,'-m','venv','--without-pip',str(release)],check=True,timeout=300)
+    release.chmod(0o755);assert s.code.bind(name)['status']=='bound'
+    os.unlink(s.root/'venv');(s.root/'venv').symlink_to('releases/'+name)
+    probe='import json,sys;print(json.dumps([sys.deedkit_release,sys.path]),flush=True);sys.stdin.read()'
+    child=subprocess.Popen([str(s.root/'venv'/'bin'/'python'),'-c',probe],stdin=subprocess.PIPE,stdout=subprocess.PIPE)
+    try:
+        bound,path=json.loads(child.stdout.readline())
+        resolved=os.path.realpath(release)
+        assert bound==resolved and any(p.startswith(resolved+os.sep) for p in path)
+        assert not any(p.startswith(str(s.root/'venv')) for p in path)
+        # A switch away and a prune leave the running process its release.
+        s.code.point(OLD_CODE);s.code.prune(s.docker,set())
+        assert release.is_dir() and s.link()=='releases/'+OLD_CODE
+    finally:
+        child.stdin.close();child.wait(timeout=60)
+    s.code.prune(s.docker,set())
+    assert not release.exists() and s.releases()==[OLD_CODE]
+
+
+# spec: ANYM-597
+def test_a_follow_under_another_instances_config_never_clears_the_code_switch_marker(released,instances,monkeypatch):
+    s=released;instances.listed();calendar=instances.paths[1];receiver=Path(instances.calendar['receiver_config_file'])
+    s.write_json(receiver,{**json.loads(receiver.read_text()),'verifier_config_file':str(calendar)})
+    original=s.code.point;calls=[]
+    def crash(name):
+        calls.append(name)
+        if len(calls)==1:raise OSError('synthetic crash')
+        return original(name)
+    monkeypatch.setattr(s.code,'point',crash)
+    with pytest.raises(OSError):s.run()
+    marker=Path(s.config['host_directory'])/s.v.CODE_SWITCH
+    assert json.loads(marker.read_text())['directory']==s.config['directory'] and s.link()=='releases/'+OLD_CODE
+    with pytest.raises(ValueError,match='code_switch_foreign'):
+        s.f.follow(calendar,engine=s.docker,main=s.main,attest=s.attest,test=s.self_test,code=s.code)
+    assert marker.exists() and (s.directory/'follow-switch.json').exists()
+    with pytest.raises(RuntimeError,match='verifier_code_unfinished'):
+        s.v.run(s.v.load_config(calendar),client=instances.calendar_cloud,engine=instances.engine)
+    assert s.run()['status']=='current' and s.link()=='releases/'+HEAD and not marker.exists()
+
+
+# spec: ANYM-597
+@pytest.mark.skipif(not os.path.isdir('/proc/self'),reason='PR_SET_PDEATHSIG is Linux; CI runs it')
+def test_a_staged_self_test_child_dies_with_a_killed_follow():
+    import signal,subprocess,sys,time
+    sleeper="import time;time.sleep(120)"
+    script=('import os,signal,subprocess,sys\nfrom messaging_service import backup_r2_follow as f\n'
+            'child=subprocess.Popen([sys.executable,"-c",%r],preexec_fn=f.die_with(os.getpid()))\n'
+            'print(child.pid,flush=True);os.kill(os.getpid(),signal.SIGKILL)\n')%sleeper
+    parent=subprocess.run([sys.executable,'-c',script],stdout=subprocess.PIPE,timeout=60)
+    assert parent.returncode==-signal.SIGKILL
+    pid=int(parent.stdout);ends=time.monotonic()+10
+    while time.monotonic()<ends:
+        try:state=Path('/proc/%d/stat'%pid).read_text().rsplit(')',1)[1].split()[0]
+        except FileNotFoundError:break
+        if state in ('Z','X'):break
+        time.sleep(0.05)
+    else:pytest.fail('the child outlived its killed parent')
 
 
 # spec: ANYM-597
@@ -1203,10 +1256,10 @@ def test_follow_never_moves_the_code_to_a_commit_older_than_the_linked_release(r
 # spec: ANYM-597
 def test_follow_crash_between_the_pins_and_the_code_link_moves_the_code_on_recovery(released,monkeypatch):
     s=released;original=s.code.point;calls=[]
-    def crash(name,configs):
+    def crash(name):
         calls.append(name)
         if len(calls)==1:raise OSError('synthetic crash')
-        return original(name,configs)
+        return original(name)
     monkeypatch.setattr(s.code,'point',crash)
     with pytest.raises(OSError):s.run()
     assert s.v.load_config(s.path)['helper_revision']==HEAD and s.link()=='releases/'+OLD_CODE
@@ -1256,11 +1309,14 @@ def test_code_prune_keeps_the_linked_and_kept_releases_and_removes_stages_by_the
     for name in (HEAD,stale):fake_release(s.root,name)
     (s.root/'releases'/(f.STAGE+run)).mkdir();(s.root/'releases'/'unrelated').mkdir()
     s.docker.resources[('helper',f.code_container(run))]={'run':run}
-    # A running upload session defers it: nothing is removed under a reader.
-    with r2.state_lock(s.receiver):s.code.prune(s.docker,{HEAD,None},[s.config])
-    assert s.releases()==sorted([OLD_CODE,HEAD,stale,f.STAGE+run,'unrelated']) and s.docker.resources
-    s.code.prune(s.docker,{HEAD,None},[s.config])
-    assert s.releases()==sorted([OLD_CODE,HEAD,'unrelated']) and not s.docker.resources
+    # A process running from the stale release holds its lease: that release stays, the stage goes.
+    import fcntl
+    lease=os.open(s.root/'releases'/stale/'.lease',os.O_RDONLY);fcntl.flock(lease,fcntl.LOCK_SH)
+    try:s.code.prune(s.docker,{HEAD,None})
+    finally:os.close(lease)
+    assert s.releases()==sorted([OLD_CODE,HEAD,stale,'unrelated']) and not s.docker.resources
+    s.code.prune(s.docker,{HEAD,None})
+    assert s.releases()==sorted([OLD_CODE,HEAD,'unrelated'])
 
 
 # spec: ANYM-597
@@ -1270,7 +1326,13 @@ def test_code_switch_refuses_an_untrusted_or_unknown_release(released):
         os.unlink(s.root/'venv');(s.root/'venv').symlink_to(target)
         with pytest.raises(ValueError,match='verifier_code_invalid'):s.code.active()
     os.unlink(s.root/'venv');(s.root/'venv').symlink_to('releases/'+OLD_CODE)
-    with pytest.raises(ValueError,match='verifier_code_invalid'):s.code.point('f'*40,[s.config])
+    with pytest.raises(ValueError,match='verifier_code_invalid'):s.code.point('f'*40)
+    packages=s.root/'releases'/OLD_CODE/'lib'/'python3.13'/'site-packages'
+    (packages/'deedkit-release.pth').write_text('import os\n')
+    with pytest.raises(ValueError,match='verifier_code_unbound'):s.code.active()
+    assert s.code.bind(OLD_CODE)['status']=='bound' and s.code.active()==OLD_CODE
+    (s.root/'releases'/OLD_CODE/'.lease').unlink()
+    with pytest.raises(ValueError,match='verifier_code_unbound'):s.code.active()
     (s.root/'releases'/OLD_CODE/'pyvenv.cfg').unlink()
     with pytest.raises(ValueError,match='verifier_code_invalid'):s.code.active()
 
