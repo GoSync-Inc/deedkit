@@ -740,6 +740,32 @@ def test_failure_status_records_the_helper_containers_own_state_before_cleanup(o
     assert 'SECRET' not in (directory/'status.json').read_text() and bool(seen)==(state is not None)
 
 
+# spec: ANYM-633
+def test_a_malformed_journal_still_records_its_failure_with_no_helper_state(operator):
+    v,config,receiver,cloud,engine,write_json=operator
+    directory=Path(config['directory']);write_json(directory/'active.json',{'v':1,'phase':'restoring'})
+    with pytest.raises(ValueError,match='invalid_verifier_journal'):v.run(config,client=cloud,engine=engine)
+    for name in ('status.json','last-failure.json'):
+        status=json.loads((directory/name).read_text())
+        assert status['error']=='invalid_verifier_journal' and 'helper_state' not in status
+
+
+# spec: ANYM-633
+def test_the_journal_line_keeps_the_helper_state_of_an_exception_that_refuses_attributes(operator,monkeypatch,capsys):
+    v,config,receiver,cloud,engine,_=operator
+    class Sealed(RuntimeError):
+        def __setattr__(self,name,value):raise AttributeError(name)
+    engine.failure=Sealed('storage_unavailable');original=engine.inspect_owned
+    def inspect_owned(kind,name,run):
+        value=original(kind,name,run)
+        return {**value,'State':{'Status':'running','ExitCode':0,'OOMKilled':False}} if kind=='helper' and value is not None else value
+    engine.inspect_owned=inspect_owned
+    busy_main(v,config,cloud,engine,monkeypatch)
+    assert v.main(['--config','/synthetic'])==1
+    line=json.loads(capsys.readouterr().err)
+    assert line['error']=='storage_unavailable' and line['helper_state']=={'status':'running','exit_code':0,'oom_killed':False}
+
+
 HEAD='d'*40;NEW_IMAGE='sha256:'+'c'*64
 SOURCE_LABEL='https://github.com/GoSync-Inc/deedkit'
 

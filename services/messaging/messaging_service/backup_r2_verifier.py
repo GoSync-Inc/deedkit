@@ -655,11 +655,12 @@ def helper_detail(value):
 HELPER_STATES={'created','running','paused','restarting','removing','exited','dead'}
 
 
-def helper_state(engine,run,profile='messaging'):
-    """The run's own helper container as Docker records it, read before cleanup stops it (ANYM-633): its
-    status, exit code and OOM kill, not the attach client's return code. None without a helper or an answer."""
+def helper_state(engine,journal,profile='messaging'):
+    """The journaled run's own helper container as Docker records it, read before cleanup stops it (ANYM-633):
+    its status, exit code and OOM kill, not the attach client's return code. None without a helper, an answer
+    or a valid journal."""
     try:
-        value=engine.inspect_owned('helper',names(run,profile)['helper'],run)
+        run=journal['run'];value=engine.inspect_owned('helper',names(run,profile)['helper'],run)
         state=value.get('State') if isinstance(value,dict) else None
         if not isinstance(state,dict):return None
         return {'status':state['Status'] if state.get('Status') in HELPER_STATES else 'unknown',
@@ -808,7 +809,12 @@ def verify_run(config,receiver,client,engine,journal,fd):
     return journal
 
 
+# This invocation's failure record, for main's journal line (ANYM-633); run() clears it first.
+FAILED=[]
+
+
 def run(config,*,client=None,engine=None,path=None):
+    FAILED.clear()
     if os.geteuid()!=0:raise ValueError('root_verifier_required')
     receiver=r2.load_config(config['receiver_config_file'])
     client=client if client is not None else r2.make_client(receiver)
@@ -901,7 +907,7 @@ def run(config,*,client=None,engine=None,path=None):
             # durable status. Keep journal/proof and the old protected recovery point.
             cleanup_ok=True;resumes=getattr(engine,'stream_resumes',None)
             # Its own short bound, so a slow answer never spends the cleanup's.
-            state=None if journal is None else helper_state(Docker(10) if isinstance(engine,Docker) else engine,journal['run'],profile)
+            state=None if journal is None else helper_state(Docker(10) if isinstance(engine,Docker) else engine,journal,profile)
             if isinstance(engine,Docker):engine=Docker(120)
             # A refused admission created nothing and leaves its retry's resources to the next holder.
             if journal is not None and str(error) not in ('verifier_host_busy','verifier_cleanup_unconfirmed'):
@@ -919,8 +925,7 @@ def run(config,*,client=None,engine=None,path=None):
             if type(resumes) is int:failure['stream_resumes']=resumes
             if state is not None:failure['helper_state']=state
             # The journal line (main) carries them too: a later failure overwrites last-failure.json.
-            try:error.verifier_status=failure
-            except Exception:pass
+            FAILED[:]=[failure]
             local.write_maintenance_json('status.json',failure,dir_fd=fd)
             # A later busy/idle/verified run overwrites status.json; keep the last failure's cause.
             try:local.write_maintenance_json('last-failure.json',failure,dir_fd=fd)
@@ -981,14 +986,14 @@ def main(argv=None):
         # Only the outcome: config paths and the image ID stay in the root-private records.
         print(json.dumps({k:result[k] for k in ('v','status','helper_revision')},separators=(',',':')));return 0
     if not args.config:parser.error('--config is required')
+    FAILED.clear()
     try:status=run(load_config(args.config),path=args.config)
     except Exception as error:
         if failure_code(error)=='verifier_busy':
             # Another invocation of this profile runs: it owns status.json, so this one writes nothing.
             print(json.dumps({'v':1,'status':'busy','code':'verifier_busy'},separators=(',',':')));return 0
         line={'error':failure_code(error),'diagnostic':describe(error)}
-        recorded=getattr(error,'verifier_status',None)
-        if isinstance(recorded,dict):line.update({k:recorded[k] for k in ('stream_resumes','helper_state') if k in recorded})
+        if FAILED:line.update({k:FAILED[0][k] for k in ('stream_resumes','helper_state') if k in FAILED[0]})
         print(json.dumps(line,separators=(',',':')),file=sys.stderr);return 1
     if status['status']=='busy':print(json.dumps(status,separators=(',',':')))
     # A verified run's resumes reach the journal too (ANYM-633): last-success.json keeps only the latest.
