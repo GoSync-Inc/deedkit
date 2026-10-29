@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import re
 import shlex
+import subprocess
 
 from messaging_service import backup_runner
 
@@ -16,7 +17,7 @@ MESSAGING_RUN = 18 * 3600  # personal-os-backup.timer, 18:00 UTC (docs/operation
 
 def unit(name):
     parser = configparser.ConfigParser(interpolation=None, strict=True, delimiters=('=',))
-    parser.optionxform = lambda option: option  # keep systemd key case
+    parser.optionxform = lambda optionstr: optionstr  # keep systemd key case
     parser.read_string((DEPLOY / name).read_text())
     return parser
 
@@ -86,3 +87,33 @@ def test_a_calendar_run_and_its_recovery_end_before_messagings_run_and_retry_non
     assert budget > backup_runner.HOST_LOCK_WAIT_SECONDS
     assert start + budget + seconds(service['Service']['TimeoutStopSec']) < MESSAGING_RUN
     assert service['Service'].get('Restart', 'no') == 'no'
+
+
+def admission():
+    """The calendar service's ExecCondition as /bin/sh runs it, and the last UTC second it admits a start."""
+    condition = unit('deedkit-calendar-backup.service')['Service']['ExecCondition']
+    script = shlex.split(condition)[2].replace('$$', '$').replace('%%', '%')
+    bound = re.search(r'\[ "\$m" -le (\d{4}) \]', script)[1]
+    return script, int(bound[:2]) * 3600 + int(bound[2:]) * 60 + 59
+
+
+# spec: ANYM-607
+def test_a_late_start_is_not_admitted_so_no_calendar_run_reaches_messagings_run():
+    service, timer = unit('deedkit-calendar-backup.service')['Service'], unit('deedkit-calendar-backup.timer')['Timer']
+    _, last = admission()
+    # The timer's own start (16:00 plus its random delay) is admitted; a Persistent= catch-up or a manual start
+    # after the bound is skipped, and every admitted start, its whole budget and its recovery end before 18:00.
+    assert 16 * 3600 + seconds(timer['RandomizedDelaySec']) <= last
+    assert last + seconds(service['TimeoutStartSec']) + seconds(service['TimeoutStopSec']) < MESSAGING_RUN
+
+
+# spec: ANYM-607
+def test_the_admission_condition_admits_only_minutes_up_to_its_bound_and_fails_closed(tmp_path):
+    script, _ = admission()
+    fake = tmp_path / 'date'
+    def admitted(clock):
+        fake.write_text('#!/bin/sh\n' + ('echo ' + clock if clock else 'exit 1') + '\n')
+        fake.chmod(0o700)
+        return subprocess.run(['/bin/sh', '-c', script], env={'PATH': f'{tmp_path}:/usr/bin:/bin'}).returncode == 0
+    assert all(admitted(clock) for clock in ('0000', '0930', '1600', '1605'))
+    assert not any(admitted(clock) for clock in ('1606', '1700', '1759', '1800', '2359', 'x', ''))

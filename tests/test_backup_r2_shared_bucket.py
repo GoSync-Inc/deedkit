@@ -130,3 +130,38 @@ def test_admission_inventory_and_the_verifiers_candidate_scan_see_only_their_own
     finally:
         os.close(state_fd)
     assert json.dumps(selected).count(FIRST) >= 1 and M_FIRST not in json.dumps(selected)
+
+
+def own(cloud, prefix):
+    """A project's own keys: its `<prefix>/objects/` and `<prefix>/receipts/`, whatever other prefix contains it."""
+    return {key: data for key, data in cloud.objects.items()
+            if key.startswith(prefix + '/objects/') or key.startswith(prefix + '/receipts/')}
+
+
+# The calendar prefix is shorter here: a parent path of messaging's, or a string-prefix of it.
+# spec: ANYM-607
+@pytest.mark.parametrize('calendar_prefix', ['deedkit', MESSAGING[:-1]])
+def test_a_calendar_prefix_that_contains_messagings_rotates_and_scans_only_its_own_keys(root, calendar_prefix):
+    cloud = Cloud()
+    messaging, m_marker, m_proof = project(root, 'messaging', MESSAGING)
+    calendar, c_marker, c_proof = project(root, 'calendar', calendar_prefix, 'calendar')
+    age = r2.AGE_HEADER
+    protect_first(messaging, cloud, m_marker, m_proof, M_FIRST, age + b'messaging point' * 8, None)
+    deliver(messaging, cloud, M_SECOND, age + b'messaging candidate' * 8)
+    protect_first(calendar, cloud, c_marker, c_proof, FIRST, age + b'calendar point' * 8, 'calendar')
+    assert set(r2.inventory(calendar, cloud)) == {k for k in own(cloud, calendar_prefix) if '/objects/' in k}
+    messaging_bytes, deleted = own(cloud, MESSAGING), []
+    original = cloud.delete_object
+    def delete_object(**kw):
+        deleted.append(kw['Key'])
+        return original(**kw)
+    cloud.delete_object = delete_object
+    assert rotate_to(calendar, cloud, c_marker, c_proof, SECOND, age + b'calendar next' * 8, 'calendar')['status'] == 'rotated'
+    assert deleted and all(key.startswith((calendar_prefix + '/objects/', calendar_prefix + '/receipts/')) for key in deleted)
+    assert own(cloud, MESSAGING) == messaging_bytes
+    state_fd = os.open(calendar['state_directory'], os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        selected = json.dumps(verifier.select_candidate(calendar, cloud, state_fd, json.loads(c_marker.read_bytes())))
+    finally:
+        os.close(state_fd)
+    assert M_FIRST not in selected and M_SECOND not in selected

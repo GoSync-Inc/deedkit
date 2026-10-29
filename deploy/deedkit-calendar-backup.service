@@ -6,12 +6,16 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# Admission: no start after 16:05 UTC (a Persistent= catch-up after a reboot, a late manual start): from then on
+# TimeoutStartSec could reach messaging's 18:00 run. A skipped start waits for the next day's timer; a failed
+# read skips too (fail closed).
+ExecCondition=/bin/sh -c 'm=$$(date -u +%%H%%M) || exit 1; case "$$m" in [0-2][0-9][0-5][0-9]) ;; *) exit 1;; esac; [ "$$m" -le 1605 ]'
 ExecStart=/usr/bin/python3 -I /opt/personal-os-probe/ops/backup_runner.py --config /opt/deedkit/calendar-backup/runner.json
 ExecStopPost=/usr/bin/python3 -I /opt/personal-os-probe/ops/backup_runner.py --config /opt/deedkit/calendar-backup/runner.json --recover-stop
 # Exclusion is the runner's: it waits at most 5400 s for messaging's runner lock (its host_lock), which a deploy and
-# messaging's 18:00 run hold. This bound ends a 16:00 run, lock wait included, and its recovery before 18:00, so
-# the calendar never holds that lock into messaging's run. No Restart=: a retry could; a failed day stays in
-# status.json until the next day's timer.
+# messaging's 18:00 run hold. This bound ends a run admitted by 16:05, lock wait included, and its recovery before
+# 18:00, so the calendar never holds that lock into messaging's run. No Restart=: a retry could; a failed day stays
+# in status.json until the next day's timer.
 TimeoutStartSec=6600s
 TimeoutStopSec=180s
 User=root

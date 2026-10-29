@@ -416,8 +416,10 @@ On the production host `deploy/deedkit-calendar-backup.service` runs the install
 `--recover-stop`. `deploy/deedkit-calendar-backup.timer` fires daily at 16:00 UTC with
 `Persistent=true`: inside autodeploy's no-start hours (13:00-18:59), and the runner's 5400 s wait for
 messaging's lock ends before messaging's 18:00 run. The hour only schedules; the lock excludes (above).
-`TimeoutStartSec=6600s` ends a 16:00 run, its lock wait included, before 18:00, and the unit has no
-`Restart=`, so the calendar never holds messaging's lock into messaging's run; a failed day stays in
+Its `ExecCondition` admits a start only up to 16:05 UTC (a `Persistent=` catch-up after a reboot or a
+late manual start is skipped; an unreadable clock skips too), `TimeoutStartSec=6600s` ends every
+admitted run, its lock wait and recovery included, before 18:00, and the unit has no `Restart=`, so
+the calendar never holds messaging's lock into messaging's run; a skipped or failed day stays in
 `status.json` until the next day's run. The unit may write only its job directory and messaging's
 backup directory (the shared lock and its `.unsettled` marker). The capture limit is
 `timeout_seconds` 900 and the receiver busy wait `busy_wait_seconds` 1800.
