@@ -39,6 +39,15 @@ their own test commands; the full list CI runs is in
 [`checks.yml`](.github/workflows/checks.yml) and
 [`whatsmeow.yml`](.github/workflows/whatsmeow.yml).
 
+A change to an MCP tool's name, description, annotations or input or output schema
+changes the committed messaging contract snapshot, and
+`tests/platform/test_legacy_contracts.py` fails until it is refreshed. Regenerate it in the same pull request and commit the result:
+
+```sh
+.venv/bin/python scripts/capture_legacy_contract.py --module messaging --source . \
+  --output tests/platform/fixtures/messaging-contracts.json --canonical
+```
+
 Keep applied SQL migrations unchanged. Add a new migration for schema changes,
 update backup table inventory/restore ceilings and check roles/ACL and repeat migration.
 Every messaging migration numbered 041 or later starts with `-- rollout: expand` or

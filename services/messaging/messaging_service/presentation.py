@@ -345,13 +345,13 @@ def lean_queue_conversation(state, last, hint, *, kind=None, self_chat=False):
     attention=result.get('owner_attention')
     if attention:
         # The target is the hint's message, or the shown head in a row without a hint.
-        target=hint['message_id'] if hint else last and last['id']
+        target=hint.get('message_id') if hint else last and last['id']
         if target and attention.get('target_message_id')==target:attention.pop('target_message_id')
         if attention['suggested_action']==result['suggested_action']:attention.pop('suggested_action')
         if attention.get('next_step')==result.get('next_step'):attention.pop('next_step',None)
     if 'candidate_message_ids' in result:
         # Tied candidates list only the IDs not already stated by the hint or the attention target.
-        stated={hint and hint['message_id'],(attention or {}).get('target_message_id')}
+        stated={hint and hint.get('message_id'),(attention or {}).get('target_message_id')}
         result['candidate_message_ids']=[m for m in result['candidate_message_ids'] if m not in stated]
         if not result['candidate_message_ids']:result.pop('candidate_message_ids')
     if hint and result['basis'] in (hint.get('confidence'),hint.get('basis')):result.pop('basis')
