@@ -178,9 +178,11 @@ class Archive:
                    'updated_at':max(tombstone,datetime.fromisoformat(e['updated_at'])).isoformat()}
                 if 'formatting' in e:e['formatting']=unknown_formatting()
                 if 'contact' in e.get('metadata',{}):e['metadata']={k:v for k,v in e['metadata'].items() if k!='contact'}
-            if identity_observations and c.execute('SELECT 1 FROM messages WHERE id=%s',(mid,)).fetchone():
+            if (identity_observations and not e['deleted']
+                    and c.execute('SELECT 1 FROM messages WHERE id=%s AND NOT deleted',(mid,)).fetchone()):
                 # A capture's identity evidence that contradicts a recorded pair is kept as a fence
-                # before anything else, also for a duplicate receipt (ANYM-559).
+                # before anything else, also for a duplicate receipt (ANYM-559). As for `record`, a
+                # deleted or tombstoned message supplies no new evidence.
                 from .whatsapp_identity import fence as fence_identity
                 fence_identity(c,aid,mid,identity_observations)
             previous=c.execute('SELECT outcome FROM ingest_receipts WHERE digest=%s',(receipt,)).fetchone()

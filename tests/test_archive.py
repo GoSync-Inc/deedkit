@@ -1133,3 +1133,32 @@ def test_whatsapp_capture_evidence_without_a_recorded_pair_is_no_fence_and_no_li
     with s.pool.connection() as c:
         assert not same_sender(c,'archive-wa','79990000002@c.us',LID) and not same_sender(c,'archive-wa',PN,LID)
     assert sender_rows(s,mid)[:2]==(PN,1)
+
+
+# spec: ANYM-559
+@pytest.mark.parametrize('removal',['deleted','provider_tombstone'])
+def test_whatsapp_deleted_message_supplies_no_new_identity_fence(archive,removal):
+    from messaging_service.whatsapp_collector import WhatsAppState
+    from messaging_service.whatsapp_identity import same_sender
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    state=WhatsAppState(ar,'archive-wa',('fixture',ar.acquire('archive-wa','fixture')))
+    mid=state.apply(alias_capture(PN,PN))['message']
+    other=state.apply(alias_capture(PN,PN,provider_id='true_900@lid_3EB0OTHER'))['message']
+    assert state.apply(alias_capture(LID,PN,provider_id='true_900@lid_3EB0OTHER',origin='reconcile'))['outcome']=='unchanged'
+    if removal=='deleted':
+        deletion=alias_event(PN,provider_id='true_900@lid_3EB0OTHER',deleted=True,body='',updated_at='2026-10-01T12:01:00+00:00')
+        del deletion['formatting']
+        assert ar.ingest(deletion)['outcome']=='deleted'
+    else:
+        with s.pool.connection() as c:
+            c.execute('''INSERT INTO provider_tombstones(account,provider_chat,provider_id,observed_at)
+                VALUES('archive-wa','900@lid','true_900@lid_3EB0OTHER','2026-10-01T12:01:00+00:00')''')
+    # Replays of that message with new contradicting evidence store nothing, so the valid pair stays.
+    assert state.apply(alias_capture(LID,'79990000002@c.us',provider_id='true_900@lid_3EB0OTHER',
+        origin='reconcile'))['outcome']=='duplicate'
+    assert state.apply(alias_capture(LID,'79990000002@c.us',provider_id='true_900@lid_3EB0OTHER',
+        origin='backfill'))['outcome']==('tombstoned' if removal=='deleted' else 'deleted')
+    assert fence_rows(s)==[] and other!=mid
+    with s.pool.connection() as c:
+        assert same_sender(c,'archive-wa',PN,LID)
