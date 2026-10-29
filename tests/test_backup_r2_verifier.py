@@ -1215,7 +1215,7 @@ def test_a_staged_self_test_child_dies_with_a_killed_follow():
     pid=int(parent.stdout);ends=time.monotonic()+10
     while time.monotonic()<ends:
         try:state=Path('/proc/%d/stat'%pid).read_text().rsplit(')',1)[1].split()[0]
-        except FileNotFoundError:break
+        except (FileNotFoundError,ProcessLookupError):break  # the child vanishing mid-read is ESRCH
         if state in ('Z','X'):break
         time.sleep(0.05)
     else:pytest.fail('the child outlived its killed parent')
