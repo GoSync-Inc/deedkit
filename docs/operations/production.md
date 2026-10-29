@@ -47,17 +47,38 @@ auto-merge is ever disabled, `gh pr merge` cannot queue a pull request: it calls
 
 `main` is protected by the ruleset `deploy/main-ruleset.json` (live as ruleset
 25274451, with the merge queue); classic branch protection has been removed
-([parallel development](parallel-development.md#merging)). An administrator
-updates the ruleset with
-`gh api --method PUT repos/GoSync-Inc/deedkit/rulesets/<id> --input deploy/main-ruleset.json`
-(it was created with
-`gh api --method POST repos/GoSync-Inc/deedkit/rulesets --input deploy/main-ruleset.json`)
-and verifies the effective rules with
-`gh api repos/GoSync-Inc/deedkit/rules/branches/main`. Keep classic protection
+([parallel development](parallel-development.md#merging)). It was created with
+`gh api --method POST repos/GoSync-Inc/deedkit/rulesets --input deploy/main-ruleset.json`.
+Never update it by a PUT of the file: the live ruleset holds fields GitHub added
+that the file lacks (for example `require_extra_approval_for_unattributed_changes`,
+`dismissal_restriction`, `required_reviewers`), and such a PUT may reset them.
+A change merges into `deploy/main-ruleset.json` first (Astra r1, process.md
+section 2); an administrator then applies the same one value to the live state:
+GET, change that value, PUT, read back. The example sets the merge queue's
+`max_entries_to_build` (ANYM-626, PR #420); edit the `jq` filter for another value:
+
+```sh
+R=repos/GoSync-Inc/deedkit/rulesets/25274451
+gh api $R > before.json                          # kept: the undo payload source
+jq --argjson v 6 '{name,target,enforcement,conditions,bypass_actors,rules:[.rules[]|if .type=="merge_queue" then .parameters.max_entries_to_build=$v else . end]}' before.json > put.json
+diff <(jq -S '{name,target,enforcement,conditions,bypass_actors,rules}' before.json) <(jq -S . put.json)   # only the changed value
+gh api --method PUT $R --input put.json
+gh api $R > after.json
+diff <(jq -S . put.json) <(jq -S '{name,target,enforcement,conditions,bypass_actors,rules}' after.json)     # empty
+gh api repos/GoSync-Inc/deedkit/rules/branches/main   # the effective rules
+```
+
+Stop before the PUT if the first `diff` shows more than the changed value. A
+rejected PUT leaves the ruleset unchanged; `main` stays protected throughout,
+because the ruleset is updated in place, never deleted. Undo: PUT
+`jq '{name,target,enforcement,conditions,bypass_actors,rules}' before.json`
+as the payload and read back the same way. Keep classic protection
 absent: GitHub enforces it together with the ruleset, and
 a pull request enters the queue only after it passes the branch protection
 checks, so a strict up-to-date rule would again require updating each branch
-first. `deploy/main-protection.json` remains the rollback state. To roll back,
+first. `deploy/main-protection.json` remains the rollback state. To roll back
+from the ruleset to classic protection (this drops the merge queue; the undo of
+one update is above),
 empty the queue (`mergeQueue(branch:"main"){entries{totalCount}}` is 0, or use
 `dequeuePullRequest`), restore classic protection with
 `gh api --method PUT repos/GoSync-Inc/deedkit/branches/main/protection --input deploy/main-protection.json`,
