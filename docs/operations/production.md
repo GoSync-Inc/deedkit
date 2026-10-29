@@ -513,11 +513,12 @@ Before applying, follow [backup/migration and rollback](platform-cutover.md).
 This tool runs no migration by hand (`deploy` runs the qualifying messaging ones itself, "Unattended
 migrations" below), does not prove data compatibility, authorize external
 actions, or perform provider readback. A schema change needs the module's explicit
-migration procedure and the backup gate below first. Confirm that the pinned
+migration procedure first; a contract or destructive one also the backup gate below (an additive
+release has none, item 3 below). Confirm that the pinned
 backup/restore runtimes support both the current database schema and the planned
-target. Resolve delivery failures, including receiver quota/capacity failures,
-before taking the pre-migration snapshot (a fresh one, or for an additive release the latest
-daily backup, item 3 below); use a reviewed retention/storage change
+target, so the daily backup keeps running after the migration. For the backup gate: resolve delivery
+failures, including receiver quota/capacity failures,
+before taking the fresh pre-migration snapshot; use a reviewed retention/storage change
 that preserves the protected restore anchor. Confirm durable receiver delivery,
 retain the snapshot ID/time/schema, image revision, ciphertext size/hash and
 receipt privately, and verify an isolated quarantine restore using the module's
@@ -539,7 +540,7 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
 менять».
 
 1. One release. Every migration pending on `main` ships in one release: one prepared SHA, the
-   pinned backup and restore runtimes updated once to it, one backup gate, one `migrate` (one
+   pinned backup and restore runtimes updated once to it, one backup gate if item 3 needs one, one `migrate` (one
    transaction applies every pending migration in order), each migration's owner and role SQL
    steps in their order around it, then the release. A migration gets a release of its own only
    when its own procedure or a compatibility rule, wherever documented, says so: a contract
@@ -548,53 +549,29 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
    the prepared release (it reads the final schema) are installed before the gate; each
    procedure's steps before `migrate` run before the one `migrate`, its steps after `migrate`
    after it, in migration order; a procedure's "schema-N release" is the prepared release. A
-   `migrate` retried after `LockNotAvailable` stays under the same gate and hold; item 3's age
-   limits hold at each attempt.
+   `migrate` retried after `LockNotAvailable` stays under the same gate.
 2. After the release, no backup is required unless the release deletes data: before such a step
    (045 step 7, `purge-deleted --apply`) a fresh verified backup at the new schema. Otherwise the
    next scheduled daily backup follows as usual.
-3. Owner 10-29, «1+2 сейчас, 3 позже», answering item 1: additive (expand, DROP-free)
-   migrations gate on the latest proven daily backup not older than 24 hours; a fresh backup and
-   restore proof only for destructive or contract migrations. A release is additive when every
-   pending migration file is `expand` by the candidate's `unattended_class` (no DROP of any kind),
-   every changed role file is `additive` by `role_class` (the classes of M1, "Unattended
-   migrations" below; the release kit records each file's class) and it has no data-deleting step (item 2). Any other release (a contract:
-   drop, rename, narrow, the CHECK widening pair, a revoke, or a file of another class) needs a
-   fresh backup and its restore proof, never a reused daily backup. An additive release's
-   pre-migration gate is met by a fresh backup, or by the latest scheduled daily backup when, at
-   `migrate` (each attempt), all of these hold; otherwise take a fresh one:
-   - it is the producer's `last_success_id` and its snapshot time (`last_snapshot_at`, never the
-     delivery time) is at most 24 hours old: the 18:00 UTC backup, held from its proof (about
-     20:00 UTC; the next verifier run, about 2 minutes later, rewrites `status.json`, below), serves
-     until 18:00 UTC the next day; between the next capture and its proof, wait for that proof
-     or take a fresh one;
-   - its schema is the database's current schema (no migration since);
-   - the receiver's independent verifier restored it: `last-success.json` names it, its proof is
-     `verified` with all seven checks true at that schema, and it is the protected point;
-   - the evidence above is kept privately as for a fresh backup: snapshot ID, time and schema,
-     backup image revision, ciphertext size and SHA-256, receipt and the proof's run ID;
-   - it is held. A hold on a reused daily backup starts after its scheduled verification: stop
-     the producer's `personal-os-backup.timer` with no backup service running, then the
-     receiver's verifier timer with no verifier run in flight. Until the hold ends, no capture,
-     delivery, verifier run, `protect` or `rotate` runs by hand either. A read-only check then
-     confirms: both timers stopped and both services inactive; no `active.json` (no pending
-     attempt); `status.json` still equals `last-success.json`, which names that backup and its
-     proof run (every later verifier run, idle or failed, rewrites `status.json`); the verifier
-     service last started before that proof's `verified_at` (`systemctl show -P
-     ExecMainStartTimestamp`); the protected file names that backup. That `held` line is at most
-     30 minutes old when `migrate` starts and is read again before each retry, as for a fresh
-     backup proven by the release kit. The hold lasts across retries; once `migrate` succeeds (or
-     the release is abandoned), release the receiver's timer, then the producer's. A held backup
-     whose 24 hours end before a retry (or before `migrate` starts) ends the hold at once, in the
-     same order, before any wait or fresh capture: the producer's timer is `Persistent=true`
-     (18:00 UTC), so restarting it after a missed 18:00 triggers a catch-up of that day's capture
-     after its configured delay (`RandomizedDelaySec=30s`); wait for the new trigger (`systemctl
-     show -P LastTriggerUSec personal-os-backup.timer`) and a new `last_success_id`. The gate is then met again only by that capture's proof under a new hold,
-     or by a fresh backup.
+3. Owner 10-29: «я бы максимально облегчил этот. сценарий и снял бы запрет на этот просто катил бы
+   вот эти все штуки сейчас не дожидаясь и делал такую процедуру сложную очень-очень редко»; «Я готов
+   принять риск максимально. облегчить этот процесс.» An additive release has no backup gate: no
+   fresh backup, no restore proof, no wait for a proof, no hold and no backup-age check; the
+   scheduled daily backup is its restore point. A release is additive when every pending
+   migration file is `expand` by the candidate's `unattended_class` (no DROP of any kind), every
+   changed role file is `additive` by `role_class` (the classes of M1, "Unattended migrations"
+   below; the release kit records each file's class) and it has no data-deleting step (item 2).
+   This holds for messaging and calendar, by hand or unattended. A database with no scheduled
+   daily backup running (calendar while its timer is off, ANYM-607) keeps a restore point anyway:
+   unattended, its pre-migration copy (Database copies); by hand, `copy-database` first. Any other release (a contract:
+   drop, rename, narrow, the CHECK widening pair, a revoke, a data-deleting step or a file of
+   another class) needs the backup gate above: a fresh backup and its restore proof, never a
+   reused daily backup.
 
-   Accepted risk (owner 10-28 and 10-29, quoted above): a reused backup may be 24 hours old. If
-   `migrate` destroys or corrupts data, a restore returns the database to that snapshot, and
-   everything written after it (messages, receipts, keys, operator changes) is lost.
+   Accepted risk (owner 10-29, quoted above): if an additive `migrate` destroys or corrupts data, a
+   restore returns the database to the latest daily backup (about 24 hours old at most while the
+   daily backup succeeds), and everything written after it (messages, receipts, keys, operator
+   changes) is lost.
 
 ### Database copies
 
@@ -1063,7 +1040,7 @@ row-level security. Additive; older runtimes write nothing there. With it the ma
 delivery dispatcher run in production. Nothing here runs during an active call (check read-only
 first).
 1. Update the pinned backup and restore runtimes to the prepared release, then the backup gate
-   (fresh or a qualifying daily backup, above), then `migrate`.
+   if item 3 above needs one, then `migrate`.
 2. Role SQL (reviewed with the release): `gateway_role.sql`, `subscription_role.sql` and
    `delivery_role.sql`. Logins as in step 4 of 045: `messaging_subscriptions_runtime` (`LOGIN IN
    ROLE messaging_subscriptions`) and `messaging_event_delivery_runtime` (`LOGIN IN ROLE
@@ -1208,7 +1185,7 @@ order, outside an active call:
    without one it builds in place only on a table of at most 10k events and 8 MB, so a production
    build never runs inside the migration transaction.
 1. Update the pinned backup and restore runtimes to the schema-45 release.
-2. The backup gate (fresh or a qualifying daily backup, above), then `migrate`. 045 takes all its
+2. The backup gate if item 3 above needs one, then `migrate`. 045 takes all its
    table locks in one attempt that never queues, retried for 2 s; `LockNotAvailable` (busy tables)
    rolls everything back: run `migrate` again. Then, as the owner, `CREATE INDEX CONCURRENTLY IF NOT EXISTS
    messages_unpurged ON messages(account,chat) WHERE NOT purged;` (needs the new column; no lock on
