@@ -637,8 +637,11 @@ as root, an hour after the previous run ends. Each run:
 3. verifies the head's `ghcr.io/gosync-inc/deedkit-backup` attestation with the
    pinned tokenless verifier `/usr/local/libexec/deedkit/attest-verify` (the one
    `production.py` runs, empty environment), pulls that image by digest and runs
-   the verifier's own preflight: image ID equal to the attested config digest,
-   the source and revision labels, no unexpected volume;
+   the verifier's own preflight: image ID equal to the attested digest the
+   daemon uses as ID (the config digest; the manifest digest with the containerd
+   image store, `docker info` driver-type `io.containerd.snapshotter.v1`; a pull
+   the daemon does not list under it is `helper_pull_failed`), the source and
+   revision labels, no unexpected volume;
    A pull needs the verifier's `reserve_bytes` plus 4 GiB free on the Docker
    data root (`follow_disk_capacity`); an image the follow pulled is recorded in
    `follow-candidate.json` first and removed by exact ID when it is refused or
