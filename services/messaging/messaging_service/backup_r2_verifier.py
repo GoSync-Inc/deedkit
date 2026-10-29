@@ -124,16 +124,21 @@ def load_config(path):
     if 'postgres_data_directory' in value:
         # Absent: the scratch PostgreSQL keeps a Docker volume, as before. The path enters a --mount argument.
         data=value['postgres_data_directory']
-        if not isinstance(data,str) or not re.fullmatch('/[A-Za-z0-9._/-]{1,512}',data) or '..' in Path(data).parts:
+        if not isinstance(data,str) or not re.fullmatch('/[A-Za-z0-9._-][A-Za-z0-9._/-]{0,511}',data) or '..' in Path(data).parts:
             raise ValueError('invalid_verifier_path')
         data=Path(data)
-        if any(data.is_relative_to(path) or path.is_relative_to(data) for path in (directory,state,host)):
+        if any(data.is_relative_to(path) or path.is_relative_to(data) for path in map(lexical,(directory,state,host))):
             raise ValueError('separate_operator_evidence_required')
         with local.trusted_directory(data) as fd:
             if os.fstat(fd).st_mode&0o077:raise ValueError('private_verifier_directory_required')
     private_file(value['identity_file'])
     with local.trusted_directory(Path(value['protected_file']).parent):pass
     return value
+
+
+def lexical(path):
+    """A path without POSIX's leading `//`, which Linux resolves as `/`: for comparisons only."""
+    return Path('/'+str(path).lstrip('/'))
 
 
 @contextmanager
@@ -416,13 +421,16 @@ def make_data_directory(path):
 
 
 def remove_data_directory(path):
-    """Remove exactly a recorded data directory; a symlink or file there is refused, never followed."""
+    """Remove exactly a recorded data directory. Its parent must be root-private and the leaf a directory
+    of root (created, not yet handed over) or of the image's postgres user, never a symlink, so a stale
+    or wrong record cannot reach another directory: it is refused and kept."""
     path=Path(path)
     try:
         with local.trusted_directory(path.parent) as parent:
+            if os.fstat(parent).st_mode&0o077:raise ValueError('verifier_cleanup_unconfirmed')
             try:info=os.stat(path.name,dir_fd=parent,follow_symlinks=False)
             except FileNotFoundError:return
-            if not stat.S_ISDIR(info.st_mode):raise ValueError('verifier_cleanup_unconfirmed')
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0,POSTGRES_UID):raise ValueError('verifier_cleanup_unconfirmed')
             shutil.rmtree(path.name,dir_fd=parent);local.fsync_dir(parent)
     except FileNotFoundError:return  # no parent: nothing of the run is left there
 
@@ -803,6 +811,10 @@ def run(config,*,client=None,engine=None,path=None):
                         # A refused admission keeps the record it could not clear for the next holder.
                         admit(engine,lock,profile,pending['run'],
                               run_resources(pending['run'],profile,data_directory(config,pending['run'])));admitted=lock
+                    else:
+                        # A retry after its proof: a crash before cleanup left its record, which names the run's
+                        # data directory as it was then (ANYM-634), whatever the config says now.
+                        clear_admission(engine,untimed(engine,host,host_lock(config)))
                     if journal is None:
                         journal=pending;local.write_maintenance_json('active.json',journal,dir_fd=fd)
                     # Even after a marker switch, exact committed candidate remains
@@ -815,7 +827,8 @@ def run(config,*,client=None,engine=None,path=None):
                         r2.validate_proof(proof,journal['receipt'],profile)
                     cleanup_resources(engine,journal['run'],profile,data_directory(config,journal['run']))
                     remove_payload(config['directory'],journal['run'])
-                    if admitted is not None:release_admission(admitted);host.close();admitted=None
+                    if admitted is not None:release_admission(admitted);admitted=None
+                    host.close()
                 # Existing maintenance takes the same upload lock and independently
                 # rechecks full ciphertext, immutable receipts and root marker CAS.
                 proof_path=Path(config['directory'])/('proof-'+journal['run']+'.json')

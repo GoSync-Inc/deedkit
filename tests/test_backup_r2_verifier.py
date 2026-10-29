@@ -1881,6 +1881,8 @@ def datadir(instances,tmp_path,monkeypatch):
     # ANYM-634: both instances keep their scratch PostgreSQL in one local-disk root 0700; chown is recorded.
     s=instances;root=tmp_path/'pg-local';root.mkdir(mode=0o700);s.chowned=[];s.made=[]
     for config in (s.messaging,s.calendar):config['postgres_data_directory']=str(root)
+    # The image's postgres user is uid 999; here the test's own uid stands in for it (removal checks the owner).
+    assert s.v.POSTGRES_UID==999;monkeypatch.setattr(s.v,'POSTGRES_UID',os.getuid())
     monkeypatch.setattr(os,'chown',lambda path,uid,gid,**kw:s.chowned.append((path,uid,gid)))
     real_make=s.v.make_data_directory
     def make(path):
@@ -1913,7 +1915,7 @@ def test_a_runs_data_directory_is_recorded_before_it_exists_and_removed_on_succe
     else:
         assert v.run(config,client=s.cloud_of(profile),engine=s.engine)['status']=='verified'
         run=json.loads((Path(config['directory'])/'last-success.json').read_text())['verification_id']
-    assert s.made==[s.root/v.names(run,profile)['volume']] and s.chowned==[(s.made[0].name,999,999)]
+    assert s.made==[s.root/v.names(run,profile)['volume']] and s.chowned==[(s.made[0].name,os.getuid(),os.getuid())]
     assert s.engine.admissions[-1]['resources'][-1]==['directory',str(s.made[0]),run]
     # The bind replaces the volume: the record still names it, for a retry from before ANYM-634.
     assert ['volume',v.names(run,profile)['volume'],run] in s.engine.admissions[-1]['resources']
@@ -1941,14 +1943,30 @@ def test_a_sigkilled_holders_data_directory_is_removed_by_the_next_holder(datadi
 
 
 # spec: ANYM-634
-@pytest.mark.parametrize('case',['unremovable','symlink','foreign_name'])
+@pytest.mark.parametrize('case',['unremovable','symlink','foreign_name','unrelated_parent','other_run','other_owner'])
 def test_a_recorded_data_directory_that_cannot_be_removed_refuses_with_nothing_created(datadir,monkeypatch,tmp_path,case):
     s=datadir;v=s.v;outside=tmp_path/'outside';outside.mkdir();(outside/'keep').write_text('kept')
-    if case=='foreign_name':
-        # A record naming a path that is not this run's directory is never acted on.
+    if case in ('foreign_name','other_run'):
+        # A record naming a path that is not its run's directory is never acted on.
         data=kill_holder_with_data(s,'messaging')
-        record=json.loads((s.host/'admission.json').read_text());record['resources'][-1][1]=str(outside)
+        record=json.loads((s.host/'admission.json').read_text())
+        if case=='foreign_name':record['resources'][-1][1]=str(outside)
+        else:
+            record['resources'][-1][1]=str(outside/v.names('e'*32,'messaging')['volume'])
+            (outside/v.names('e'*32,'messaging')['volume']).mkdir();(outside/v.names('e'*32,'messaging')['volume']/'keep').write_text('kept')
         s.write_json(s.host/'admission.json',record)
+    elif case=='unrelated_parent':
+        # The run's exact name under a parent that is not root-private: not a data root, never removed.
+        outside.chmod(0o755);data=kill_holder_with_data(s,'messaging',data=outside/v.names('f'*32,'messaging')['volume'])
+        data.mkdir();(data/'keep').write_text('kept')
+    elif case=='other_owner':
+        # The recorded directory was replaced by one of another user.
+        data=kill_holder_with_data(s,'messaging');data.mkdir();(data/'keep').write_text('kept');real_stat=os.stat
+        def stat_(path,*a,**kw):
+            info=real_stat(path,*a,**kw)
+            if str(path)==data.name and kw.get('dir_fd') is not None:values=list(info);values[4]=1234;return os.stat_result(values)
+            return info
+        monkeypatch.setattr(os,'stat',stat_)
     else:
         data=kill_holder_with_data(s,'messaging')
         if case=='symlink':data.symlink_to(outside,target_is_directory=True)
@@ -1964,6 +1982,8 @@ def test_a_recorded_data_directory_that_cannot_be_removed_refuses_with_nothing_c
         v.run(s.calendar,client=s.calendar_cloud,engine=s.engine)
     assert created(s.engine,'calendar')==[] and s.made==[] and (s.host/'admission.json').read_bytes()==record
     assert (outside/'keep').read_text()=='kept' and s.status(s.calendar)['error']=='verifier_cleanup_unconfirmed'
+    if case in ('unrelated_parent','other_owner'):assert (data/'keep').read_text()=='kept'
+    if case=='other_run':assert (outside/v.names('e'*32,'messaging')['volume']/'keep').read_text()=='kept'
 
 
 def separate_filesystem(monkeypatch,root):
@@ -2005,7 +2025,7 @@ def test_the_reserve_monitor_watches_the_data_directorys_filesystem(tmp_path,mon
 
 # spec: ANYM-634
 @pytest.mark.parametrize('attack',['symlink','group_writable','non_root','not_private','relative','mount_option',
-                                   'in_work','holds_work','in_state','in_host','null'])
+                                   'in_work','holds_work','in_state','in_host','null','alias_work','alias_host'])
 def test_an_unsafe_postgres_data_directory_is_refused(operator,monkeypatch,tmp_path,attack):
     v,config,receiver,cloud,engine,write_json=operator
     data=tmp_path/'pg-local';data.mkdir(mode=0o700);value=str(data)
@@ -2027,10 +2047,12 @@ def test_an_unsafe_postgres_data_directory_is_refused(operator,monkeypatch,tmp_p
     elif attack=='in_state':value=str(Path(receiver['state_directory'])/'pg')
     elif attack=='in_host':value=config['host_directory']+'/pg'
     elif attack=='null':value=None
+    elif attack=='alias_work':value='/'+config['directory']  # `//x` is `/x` on Linux
+    elif attack=='alias_host':config={**config,'host_directory':'/'+str(data)};value=str(data/'pg')
     path=Path(config['receiver_config_file']).parent/'verifier-config.json'
     write_json(path,{**config,'postgres_data_directory':value})
     codes={'group_writable':'untrusted_operator_ancestor','non_root':'untrusted_operator_ancestor',
-           'not_private':'private_verifier_directory_required','relative':'invalid_verifier_path',
+           'not_private':'private_verifier_directory_required','relative':'invalid_verifier_path','alias_work':'invalid_verifier_path',
            'mount_option':'invalid_verifier_path','null':'invalid_verifier_path'}
     if attack=='symlink':
         with pytest.raises(OSError):v.load_config(path)  # O_NOFOLLOW: never followed
@@ -2089,3 +2111,29 @@ def test_follow_self_test_keeps_a_docker_volume_with_a_data_directory_configured
     engine=Engine(v,f,{**config,'postgres_data_directory':'/srv/pg-local'})
     assert f.self_test(engine,{**config,'postgres_data_directory':'/srv/pg-local'})==([2,50],50)
     assert len(seen)==2 and all('postgres_data_directory' not in tested for tested in seen)
+
+
+class Killed(BaseException):
+    """A SIGKILL: no except clause of the run handles it."""
+
+
+# spec: ANYM-634
+@pytest.mark.parametrize('change',['removed','moved'])
+@pytest.mark.parametrize('profile',['messaging','calendar'])
+def test_a_retry_after_its_proof_removes_the_recorded_data_directory_after_the_key_changed(datadir,monkeypatch,tmp_path,profile,change):
+    s=datadir;v=s.v;config=s.config(profile);real=v.cleanup_resources;calls=[]
+    def killed_after_proof(*args,**kw):
+        calls.append(args)
+        if len(calls)>=2:raise Killed()  # also the failure path's cleanup: the process is gone
+        return real(*args,**kw)
+    monkeypatch.setattr(v,'cleanup_resources',killed_after_proof)
+    with pytest.raises(Killed):v.run(config,client=s.cloud_of(profile),engine=s.engine)
+    journal=json.loads((Path(config['directory'])/'active.json').read_text())
+    data=s.root/v.names(journal['run'],profile)['volume']
+    assert journal['phase']=='proof_ready' and data.is_dir() and (s.host/'admission.json').exists()
+    monkeypatch.setattr(v,'cleanup_resources',real)
+    if change=='removed':del config['postgres_data_directory']
+    else:other=tmp_path/'pg-other';other.mkdir(mode=0o700);config['postgres_data_directory']=str(other)
+    assert v.run(config,client=s.cloud_of(profile),engine=s.engine)['status']=='verified'
+    assert not data.exists() and list(s.root.iterdir())==[] and not (s.host/'admission.json').exists()
+    assert not s.engine.resources and len(s.made)==1
