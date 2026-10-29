@@ -221,7 +221,10 @@ and nothing else changed, the archive keeps the stored revision and records no
 version conflict; without the ID on both sides it records a conflict, as before.
 Set it on the Telegram collector service once the release a rollback would return
 to accepts the field: an older server rejects the capture and the collector skips
-that message.
+that message. Turning it off stops new captures only: envelopes already in the
+collector's capture spool keep the field, and a collector or drainer older than
+this release rejects and quarantines them, so once the flag has been on, rollback
+targets stay at or after this release.
 
 ### Reply queue upgrade (0.9.17)
 
