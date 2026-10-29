@@ -321,6 +321,7 @@ def verify_object(config, client, receipt, output=None):
     A body read that fails mid-stream resumes at the next byte with a ranged GET
     of the same ETag (STREAM_RESUMES, bounded backoff); the full SHA256 still
     covers every delivered byte. A failed write to `output` is never retried.
+    Returns the ranged GETs it used, so a run a resume saved stays visible (ANYM-633).
     """
     wire = receipt['wire']
     response = cloud_call(client.get_object, Bucket=config['bucket'], Key=receipt['object_key'])
@@ -369,6 +370,7 @@ def verify_object(config, client, receipt, output=None):
         body.close()
     if size != wire['bytes'] or digest.hexdigest() != wire['sha256'] or prefix != AGE_HEADER:
         raise ValueError('stored_backup_corrupt')
+    return resumes
 
 
 def state_read(directory, name):

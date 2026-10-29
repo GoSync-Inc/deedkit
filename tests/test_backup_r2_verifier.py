@@ -492,6 +492,14 @@ def test_stream_resume_refuses_a_range_of_the_wrong_length(monkeypatch):
         r2.verify_object({'bucket':'synthetic'},cloud,stream_receipt(data),io.BytesIO())
 
 
+# spec: ANYM-633
+@pytest.mark.parametrize('failures',[[],[7],[7,r2.MIB+3,2*r2.MIB]],ids=['clean','one-reset','three-resets'])
+def test_stream_reports_how_many_resumes_it_used(monkeypatch,failures):
+    data=r2.AGE_HEADER+os.urandom(3*r2.MIB)
+    monkeypatch.setattr(r2,'stream_pause',lambda attempt:None)
+    assert r2.verify_object({'bucket':'synthetic'},FlakyCloud(data,failures),stream_receipt(data),io.BytesIO())==len(failures)
+
+
 # spec: ANYM-285
 def test_first_run_survives_a_transient_cloud_reset_mid_stream(operator,monkeypatch):
     v,config,receiver,cloud,engine,_=operator
@@ -508,6 +516,46 @@ def test_first_run_survives_a_transient_cloud_reset_mid_stream(operator,monkeypa
     cloud.get_object=get_object
     result=v.run(config,client=cloud,engine=engine)
     assert broken and result['status']=='verified' and Path(config['protected_file']).exists()
+
+
+class FinishedHelper:
+    """Synthetic helper that reads the whole stream, leaves its result and exits 0."""
+    def __init__(self,payload,facts):
+        self.stdin=io.BytesIO()
+        path=payload/'result.json';path.write_bytes(r2.encoded(facts));path.chmod(0o600)
+    def poll(self):return 0
+    def wait(self,timeout):return 0
+
+
+# spec: ANYM-633
+def test_verified_status_records_how_many_stream_resumes_the_proof_needed(operator,monkeypatch):
+    v,config,receiver,cloud,_,_=operator
+    monkeypatch.setattr(r2,'stream_pause',lambda attempt:None)
+    directory=Path(config['directory']);docker=v.Docker(60)
+    monkeypatch.setattr(docker,'preflight',lambda config:str(directory))
+    monkeypatch.setattr(docker,'setup',lambda *a:None)
+    monkeypatch.setattr(docker,'inspect_owned',lambda *a:{})
+    monkeypatch.setattr(docker,'remove',lambda *a:None)
+    monkeypatch.setattr(v,'validate_helper_layout',lambda *a:None)
+    def popen(*args,**kwargs):
+        receipt=json.loads((directory/'active.json').read_text())['receipt']
+        return FinishedHelper(next(directory.glob('payload-*')),
+                              {'v':1,'status':'verified','schema_version':v.SCHEMAS[-1],'manifest_sha256':receipt['wire']['snapshot_sha256'],
+                               'checks':{k:True for k in r2.CHECKS}})
+    monkeypatch.setattr(v.subprocess,'Popen',popen)
+    original=cloud.get_object;broken=[]
+    def get_object(**kw):
+        response=original(**kw)
+        if '/objects/' not in kw['Key']:return response
+        start=int(kw['Range'].removeprefix('bytes=').split('-')[0]) if 'Range' in kw else 0
+        rest=response['Body'].read()[start:]
+        response={**response,'ContentLength':len(rest),'Body':io.BytesIO(rest)}
+        if len(broken)<2:broken.append(start);response['Body']=FlakyBody(rest,64)
+        return response
+    cloud.get_object=get_object
+    result=v.run(config,client=cloud,engine=docker)
+    assert broken==[0,64] and result['status']=='verified' and result['stream_resumes']==2
+    for name in ('status.json','last-success.json'):assert json.loads((directory/name).read_text())['stream_resumes']==2
 
 
 # spec: ANYM-285
@@ -658,6 +706,29 @@ def test_helper_exit_mid_stream_reports_its_failure_fact_not_a_generic_code(oper
     for name in ('status.json','last-failure.json'):assert json.loads((directory/name).read_text())['error']==code
     assert len(helpers)==1 and helpers[0].stdin.writes==1 and helpers[0].stdin.closed
     assert helpers[0].terminated==hangs and not Path(config['protected_file']).exists()
+
+
+# spec: ANYM-633
+@pytest.mark.parametrize('exit_code',[1,130,137],ids=['error','sigint-stop','oom-kill'])
+def test_helper_failure_status_records_the_helper_exit_code(operator,monkeypatch,exit_code):
+    v,config,receiver,cloud,engine,_=operator
+    docker=v.Docker(60);helpers=[]
+    monkeypatch.setattr(docker,'setup',lambda *a:None)
+    monkeypatch.setattr(docker,'inspect_owned',lambda *a:{})
+    monkeypatch.setattr(v,'validate_helper_layout',lambda *a:None)
+    monkeypatch.setattr(r2,'verify_object',lambda receiver,client,receipt,out:out.write(b'synthetic-ciphertext'))
+    class Exited(ExitedHelper):
+        def poll(self):return exit_code
+        def wait(self,timeout):return exit_code
+    def popen(*args,**kwargs):
+        helpers.append(Exited(next(Path(config['directory']).glob('payload-*')),None,False));return helpers[-1]
+    monkeypatch.setattr(v.subprocess,'Popen',popen)
+    engine.restore=docker.restore
+    with pytest.raises(RuntimeError,match='isolated_restore_failed'):v.run(config,client=cloud,engine=engine)
+    directory=Path(config['directory'])
+    for name in ('status.json','last-failure.json'):
+        status=json.loads((directory/name).read_text())
+        assert status['error']=='isolated_restore_failed' and status['helper_exit']==exit_code
 
 
 HEAD='d'*40;NEW_IMAGE='sha256:'+'c'*64

@@ -491,6 +491,8 @@ class Docker:
     """Small, argument-only Docker adapter. It never prints secret diagnostics."""
     def __init__(self,timeout=21600):
         self.ends=time.monotonic()+timeout;self.disk_roots=[];self.reserve_bytes=0
+        # The ranged GETs the last full stream needed (r2.verify_object); None until one completes.
+        self.stream_resumes=None
     def check_reserve(self):
         if any(shutil.disk_usage(path).free<self.reserve_bytes for path in self.disk_roots):
             raise ValueError('restore_disk_capacity')
@@ -588,7 +590,7 @@ class Docker:
                     engine.check_reserve();return process.stdin.write(data)
             # A helper that exits mid-stream breaks the pipe: stop streaming (never
             # retried), wait for it within the deadline and report its own failure.
-            try:r2.verify_object(receiver,client,receipt,Sink());broken=False
+            try:self.stream_resumes=r2.verify_object(receiver,client,receipt,Sink());broken=False
             except BrokenPipeError:broken=True
             try:process.stdin.close()
             except BrokenPipeError:broken=True
@@ -597,7 +599,8 @@ class Docker:
                 try:process.wait(timeout=min(1,self.remaining()))
                 except subprocess.TimeoutExpired:continue
             self.check_reserve()
-            if process.wait(timeout=self.remaining()) or broken:raise helper_failure(payload)
+            code=process.wait(timeout=self.remaining())
+            if code or broken:raise helper_failure(payload,code)
         finally:
             if process.stdin and not process.stdin.closed:process.stdin.close()
             if process.poll() is None:
@@ -615,11 +618,12 @@ CALENDAR_FAILURES={'restore_bundle_failed','restore_schema_failed','restore_inve
 
 
 class HelperFailure(RuntimeError):
-    def __init__(self,code,detail=None):super().__init__(code);self.detail=detail
+    def __init__(self,code,detail=None,exit=None):super().__init__(code);self.detail=detail;self.exit=exit
 
 
-def helper_failure(payload):
-    """The failed helper's own fact (backup_restore_worker.write_failure) when it is a known safe code."""
+def helper_failure(payload,exit=None):
+    """The failed helper's own fact (backup_restore_worker.write_failure) when it is a known safe code, and
+    its exit status (`docker start -a` passes the container's: 130 a stop, 137 a kill or OOM; ANYM-633)."""
     failure='isolated_restore_failed';detail=None
     try:
         fact=r2.unique_json(private_file(payload/'failure.json',4096))
@@ -631,7 +635,7 @@ def helper_failure(payload):
     if failure=='restore_database_failed':
         try:detail=helper_detail(r2.unique_json(private_file(payload/'failure-detail.json',4096)))
         except (OSError,ValueError):pass
-    return HelperFailure(failure,detail)
+    return HelperFailure(failure,detail,exit)
 
 
 # The only phrases backup_restore_worker.restore_detail writes: fixed words, never a name or message text.
@@ -866,6 +870,7 @@ def run(config,*,client=None,engine=None,path=None):
                                      expected_protected_sha256=journal['prior_sha256'],client=client)
                 journal={**journal,'phase':'promoted'};local.write_maintenance_json('active.json',journal,dir_fd=fd)
                 status={'v':1,'status':'verified','backup_id':journal['receipt']['wire']['id'],'verification_id':journal['run'],'verified_at':now()}
+                if type(resumes:=getattr(engine,'stream_resumes',None)) is int:status['stream_resumes']=resumes
                 local.write_maintenance_json('last-success.json',status,dir_fd=fd)
                 local.write_maintenance_json('status.json',status,dir_fd=fd)
                 os.unlink('active.json',dir_fd=fd);local.fsync_dir(fd)
@@ -878,7 +883,7 @@ def run(config,*,client=None,engine=None,path=None):
                 local.write_maintenance_json('status.json',status,dir_fd=fd);return status
             # Generic safe codes only; SDK errors, DSNs and stderr never enter
             # durable status. Keep journal/proof and the old protected recovery point.
-            cleanup_ok=True
+            cleanup_ok=True;resumes=getattr(engine,'stream_resumes',None)
             if isinstance(engine,Docker):engine=Docker(120)
             # A refused admission created nothing and leaves its retry's resources to the next holder.
             if journal is not None and str(error) not in ('verifier_host_busy','verifier_cleanup_unconfirmed'):
@@ -892,6 +897,9 @@ def run(config,*,client=None,engine=None,path=None):
             failure={'v':1,'status':'failed','error':failure_code(error),'failed_at':now(),
                      'cleanup_complete':cleanup_ok,'diagnostic':describe(error)}
             if isinstance(error,HelperFailure) and error.detail:failure['detail']=error.detail
+            # Counts only (ANYM-633): a stream a resume saved, and how the helper exited.
+            if type(resumes) is int:failure['stream_resumes']=resumes
+            if isinstance(error,HelperFailure) and type(error.exit) is int:failure['helper_exit']=error.exit
             local.write_maintenance_json('status.json',failure,dir_fd=fd)
             # A later busy/idle/verified run overwrites status.json; keep the last failure's cause.
             try:local.write_maintenance_json('last-failure.json',failure,dir_fd=fd)

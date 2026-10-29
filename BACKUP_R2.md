@@ -368,7 +368,13 @@ and proof evidence outside the helper's writable payload. A failed run's
 keep) adds `diagnostic`: the exception class chain (cause/context, at most four)
 with code frames as `[file, line, function]`, never messages, arguments or
 locals. The service prints the same code and diagnostic as one JSON line to
-stderr (the journal). A failed `pg_restore` also adds `detail`: its first
+stderr (the journal). Two counts make a run's stream and helper visible (ANYM-633):
+`stream_resumes`, the ranged GETs the full cloud stream needed (in a verified
+`status.json` and `last-success.json`, and in a failure after the stream completed;
+absent when no stream completed, for example `storage_unavailable` after the last
+resume), and on a helper failure `helper_exit`, the helper's exit status as `docker
+start -a` passes it (130: stopped by its SIGINT stop signal, which the run's own
+cleanup sends after another failure; 137: killed, OOM included). A failed `pg_restore` also adds `detail`: its first
 `pg_restore: error:` line as one fixed phrase (the kind of a missing or existing schema
 object, a COPY failure, a resource category) or `unclassified pg_restore error`,
 never a name, message text or row value. The helper writes
