@@ -13,10 +13,11 @@ from . import heartbeats
 from .store import Store
 from .delivery_policy import flush_hints
 from .subscriptions import (acked_retention_days, journal_source_health, match_subscriptions,
-    prune_subscriptions, source_health_stale_seconds)
+    prune_subscriptions, retire_subscriptions, source_health_stale_seconds)
 from .telemetry import configure, capture
 
 HEALTH_INTERVAL_S = 30
+RETIRE_INTERVAL_S = 60
 
 
 def main():
@@ -42,13 +43,18 @@ def main():
     dsn = Path(os.environ['DATABASE_URL_FILE']).read_text().strip()
     store = Store(dsn, Path(os.environ.get('PROBE_FILES', '/tmp/unused-files')),
                   'http://localhost')
-    last_beat = last_health = None
+    last_beat = last_health = last_retire = None
+    more = False
     try:
         while not stop.is_set():
             if not args.once:
                 # Retention first frees match budget; its failures never stop matching or hints.
                 try:
                     prune_subscriptions(store, max_subscriptions=args.max_subscriptions)
+                    # ANYM-447: 30-day housekeeping runs once a minute, at once again while a batch was full.
+                    if last_retire is None or more or time.monotonic() - last_retire >= RETIRE_INTERVAL_S:
+                        last_retire = time.monotonic()
+                        more = retire_subscriptions(store, max_subscriptions=args.max_subscriptions)['more']
                 except Exception as error:
                     capture(error, 'subscription_retention_failed')
                     print(json.dumps({'error': 'subscription_retention_failed'}), flush=True)

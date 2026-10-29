@@ -21,6 +21,11 @@ GRANT SELECT ON probe_metadata TO messaging_subscriptions;
 GRANT SELECT ON subscription_consumption TO messaging_subscriptions;
 GRANT UPDATE(retention_floor) ON subscriptions TO messaging_subscriptions;
 GRANT DELETE ON subscription_matches TO messaging_subscriptions;
+-- Schema 62 (ANYM-447): delete finished hints (keeping their counts) and, 30 days after closure, a closed
+-- definition's receipts, outbox rows and consumption, then mark its tombstone. No receipt hash read.
+GRANT UPDATE(tombstoned_at,deleted_hint_counts,hints_deleted_at,hints_deleted_through) ON subscriptions TO messaging_subscriptions;
+GRANT DELETE ON subscription_outbox,subscription_consumption TO messaging_subscriptions;
+GRANT SELECT(subscription),DELETE ON subscription_receipts TO messaging_subscriptions;
 
 -- Atomically enqueue opaque references only; no endpoint/secret access or egress.
 GRANT SELECT ON subscription_delivery TO messaging_subscriptions;

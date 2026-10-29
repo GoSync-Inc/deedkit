@@ -419,6 +419,9 @@ def feed_state(store):
     # Schema 40 adds retention columns at their pre-retention values (floor 0, no hold).
     for row in state['subscriptions']:
         assert row.pop('retention_floor', 0) == 0 and row.pop('retention_hold', False) is False
+        # Schema 62 (ANYM-447): an open definition has no closure time, tombstone or deleted hints.
+        assert (row.pop('closed_at', None), row.pop('tombstoned_at', None), row.pop('deleted_hint_counts', {}),
+            row.pop('hints_deleted_at', None), row.pop('hints_deleted_through', 0)) == (None, None, {}, None, 0)
     # Schema 60 (ANYM-522) adds reference columns that explicit definitions leave at their defaults.
     for row in state['subscription_matches']:
         assert (row.pop('account', None), row.pop('chat', None), row.pop('hidden', False),
@@ -455,7 +458,7 @@ def test_upgrade_and_rollback_keep_feed_order_and_cursors(schema36_store, monkey
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '61'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '62'
         assert c.execute('SELECT * FROM archive_migrations WHERE version<=36 ORDER BY version').fetchall() == migrations
     assert feed_state(store) == before
     try:

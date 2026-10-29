@@ -94,7 +94,7 @@ operator diagnostics. This worker needs no public port. The optional overlay
 limits memory to 256 MiB and has a read-only filesystem and internal DB network.
 
 Operator bounds are `SUBSCRIPTION_MAX_DEFINITIONS` (default 64 per key, including
-closed definitions; 1–1000) and `SUBSCRIPTION_MAX_MATCHES` (default 10,000 references
+closed definitions and tombstones younger than 30 days; 1–1000) and `SUBSCRIPTION_MAX_MATCHES` (default 10,000 references
 per subscription; 1–1,000,000). Set the match bound on the worker and the definition
 bound on the API. Raising a match budget resumes retained events without provider
 polling. Old ACKed references are pruned (see [Event retention](#event-retention));
@@ -874,9 +874,9 @@ host-turn evidence the live acceptance of ANYM-228 records.
 
 Status: acknowledged-event retention is implemented since **schema 40** (ANYM-446, the
 first half of the ANYM-257 contract decided 2026-10-17 by the orchestrator under the
-owner's delegation). Terminal outbox rows and closed definitions are still never
-deleted, and closed definitions still count toward `SUBSCRIPTION_MAX_DEFINITIONS`
-(sibling story, not built). Retention may lose events only with an explicit gap.
+owner's delegation); finished hints and closed definitions age out since **schema 62**
+(ANYM-447, the second half; "Closed definitions and finished hints" below). Retention may
+lose events only with an explicit gap.
 
 - **Explicit-ACK subscriptions** that are not closed or expired: match references at or below `acked_through` whose
   `matched_at` is older than `SUBSCRIPTION_ACKED_RETENTION_DAYS` (default 7, 1–366; set
@@ -903,8 +903,8 @@ deleted, and closed definitions still count toward `SUBSCRIPTION_MAX_DEFINITIONS
   `subscription_retention_failed` with its error class only; matching and hints
   continue (also in opt-in telemetry, code only). `--once` diagnostics never prune.
 - **Closed and expired definitions** keep their references: they match nothing new, so
-  their budget does not matter, and every quarantine closes all definitions. Deleting
-  them is the sibling story's. A definition whose `expires_at` has passed, or is less than
+  their budget does not matter, and every quarantine closes all definitions. They go 30
+  days after closure (schema 62, below). A definition whose `expires_at` has passed, or is less than
   a minute away, counts as expired before the matcher stores the state: selection and
   the batch (under the row lock) both skip it.
 - **Quarantine hold:** quarantine restore sets `retention_hold` on every definition it
@@ -913,11 +913,9 @@ deleted, and closed definitions still count toward `SUBSCRIPTION_MAX_DEFINITIONS
   restored until the operator releases the hold:
   `python -m messaging_service release-retention-hold --subscription-ids <uuid>...`
   (or `--all-subscriptions`). A schema-38 or 39 restore is quarantined without a hold
-  column and migrates to `retention_hold=false`; its definitions are closed, so this
-  story never prunes them. The sibling story must not delete such closed definitions
-  without the operator's release either: a closed definition left by a quarantine is
-  indistinguishable from an ordinary one after migration 40, so before it ships the
-  operator reruns `quarantine-restore` on any legacy restore kept beyond the migration.
+  column; migration 62 holds every closed definition of a `*_restore_test` database (the
+  only name `quarantine-restore` accepts), so such a restore keeps its evidence until the
+  release too. From schema 62 the release also sets `closed_at` to the release time.
 - **Activation:** nothing is pruned until the operator enables retention, after every
   serving messaging API runs a floor-aware reader (one that returns `retention_gap`):
   `python -m messaging_service set-subscription-retention --enable` (or `--disable`;
@@ -940,6 +938,72 @@ deleted, and closed definitions still count toward `SUBSCRIPTION_MAX_DEFINITIONS
   `set-subscription-retention --disable`; the pre-retention reader still does not report
   gaps for subscriptions already pruned, so roll back only with that known loss of the
   gap signal or restore the pre-migration backup instead.
+
+### Closed definitions and finished hints (schema 62, ANYM-447)
+
+The owner's conditions (2026-10-29, «Да, с условиями Грока»): only closed definitions
+and finished hints are deleted, never an active or paused definition however long it
+is idle; a read of deleted data says when it was deleted instead of `not_found`.
+
+- **Closure time:** `get_subscription` shows `closed_at`. A trigger sets it on every
+  transition to `closed`, `expired` or `access_changed` (also from an older runtime's
+  statement); a later terminal change keeps the first time. Migration 62 sets it to the
+  migration time on definitions already terminal, so nothing is deleted earlier than 30
+  days after the migration. Quarantine restore sets it to the restore time, and the
+  operator's hold release to the release time.
+- **Finished hints:** outbox rows in `delivered`, `cancelled` or `dead_letter` whose
+  `finished_at` is more than 30 days old are deleted from active and paused definitions.
+  Their per-state counts move to `delivery.deleted_hint_counts`, and `delivery.hint_counts`
+  adds them to the rows kept, so it never decreases; `delivery.hints_deleted_at` is the
+  last deletion. A dynamic definition counts what its key could see at the deletion (the
+  view's own filter); a definition no key can read counts none. Pending and leased hints
+  are never deleted, and test hints stay while the definition is open, so a repeated
+  `test_subscription` request ID still returns its first probe. Events hints go only as a
+  prefix by position, below every one that stays; `hints_deleted_through` keeps the highest
+  deleted position, so the range of each kept hint, which the dynamic counts and the
+  dispatcher's visibility check read, stays exactly as it was.
+- **Closed definitions:** 30 days after `closed_at`, a closed, expired or
+  `access_changed` definition loses its finished hints first (counted while their
+  references exist), then, once no hint is left (an unfinished one waits for the
+  dispatcher), all its match references (ACKed or not, module ones included), receipts and
+  consumption. References go from the bottom and the floor follows each batch, so a
+  reader between batches gets `retention_gap`. The last batch sets the floor to
+  `matched_through` and `tombstoned_at`. Acknowledged-event retention treats
+  `access_changed` as terminal too, so such a definition keeps its references until then. The definition's row stays as a masked
+  tombstone: `get_subscription` and `list_subscriptions` return only `subscription_id`,
+  `state`, `version`, `closed_at`, `data_deleted: true`, `deleted_at`, `deletion_reason:
+  closed_over_30_days`, `retention_floor` and `hint_counts` (an `access_changed` one keeps
+  `recreate_required` and `scope_masked` instead of the floor and counts).
+  `get_subscription_events` below the floor returns `retention_gap` up to it (an
+  `access_changed` tombstone keeps its scope-masked empty page); fetch, ACK and wait keep
+  answering `subscription_closed`. A tombstone more than 30 days old no
+  longer counts toward `SUBSCRIPTION_MAX_DEFINITIONS`.
+- **Held definitions:** a quarantine-restored definition (`retention_hold`) is skipped by
+  both paths until the operator's release; its 30 days count from the release.
+- **Mechanics:** the subscription worker runs one pass a minute (at once again while a
+  batch was full), at most 16 definitions per path and one transaction of at most 500
+  rows per definition (receipts, at most 128, and the consumption row included; equal
+  positions of events hints are taken whole), under the same lock and timeouts as
+  acknowledged-event retention and two activations: `subscription_retention` and
+  `subscription_tombstones`. `set-subscription-retention --enable` sets both, the second
+  only while the API, matcher and dispatcher heartbeats report this version on schema 62
+  (else it refuses with the lagging component), so no older reader serves hint counts
+  without the deleted ones; `--disable` clears both. A failed batch rolls back alone as
+  `subscription_retention_failed` (error class only); matching and hints continue. Data
+  deleted: the rows above, by the service (ready card ANYM-447).
+- **Roles:** the worker role gains `UPDATE(tombstoned_at, deleted_hint_counts,
+  hints_deleted_at)` on `subscriptions`, `DELETE` on `subscription_outbox` and
+  `subscription_consumption`, and `SELECT(subscription)` and `DELETE` on
+  `subscription_receipts` (no receipt hash). Migration 62 grants them to an existing
+  `messaging_subscriptions`; reapply `subscription_role.sql` for a new install.
+- **Rollout:** a verified backup, then migration 62 (manual: its backfill writes an
+  existing table; docs/operations/production.md backup gate), then the release, then
+  `set-subscription-retention --enable` once every component reports schema 62. Nothing
+  is deleted before that step; finished hints already older than 30 days go at the first
+  pass after it, closed definitions 30 days after the migration at the earliest.
+  Rollback: `set-subscription-retention --disable` first stops both paths; a runtime of
+  schema 61 then serves a tombstone as a closed definition with no references, its reader
+  returns `retention_gap` below the floor, and its hint counts lack the deleted hints.
 
 ## Deleted messages (schema 45)
 
