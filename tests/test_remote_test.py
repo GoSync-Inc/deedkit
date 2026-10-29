@@ -432,7 +432,7 @@ def test_a_suite_that_ignores_term_is_killed_once_the_stop_bound_passes(mini, wo
     assert load_rows(home)[-1][-1] == {'TERM': '143', 'KILL': 'killed'}[signal_name]
 
 
-# spec: ANYM-638
+# spec: ANYM-639
 def test_a_runner_killed_the_moment_a_step_starts_leaves_no_step_behind(mini, worktree):
     home, env = mini
     process = background(env, worktree, 'root', 'tests/test_app.py', FAKE_UV_SLEEP='120', FAKE_UV_IGNORE_TERM='1')
@@ -444,7 +444,7 @@ def test_a_runner_killed_the_moment_a_step_starts_leaves_no_step_behind(mini, wo
     wait_for(lambda: not list((worker_dir(home) / 'runs').iterdir()), 30)
 
 
-# spec: ANYM-638
+# spec: ANYM-639
 def test_a_descendant_left_by_a_finished_step_is_stopped_before_the_run_ends(mini, worktree):
     home, env = mini
     result = remote(env, '--full', worktree, 'gateway', FAKE_UV_ORPHAN='1')
@@ -610,7 +610,7 @@ def test_cleanup_removes_the_workers_copies_and_leftover_databases_only(mini, wo
     assert (other / 'kept.py').exists()
 
 
-# spec: ANYM-638
+# spec: ANYM-639
 def test_cleanup_keeps_the_record_of_a_run_whose_process_does_not_stop(mini, worktree):
     home, env = mini
     assert remote(env, '--full', worktree, 'gateway').returncode == 0
@@ -747,7 +747,7 @@ def test_a_setup_that_fails_midway_is_undone_completely(mini_setup, fail):
     assert setup_leftovers(root) == []
 
 
-# spec: ANYM-638
+# spec: ANYM-639
 @pytest.mark.parametrize('report,ok', [('/private/etc/sudoers.d/ego: bad permissions, should be mode 0440', True),
                                        ('>>> /etc/sudoers.d/other: syntax error near line 2 <<<', False)],
                          ids=['permission-warning', 'syntax-error'])
