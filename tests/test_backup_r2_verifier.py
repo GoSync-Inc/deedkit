@@ -1888,7 +1888,8 @@ def datadir(instances,tmp_path,monkeypatch):
     def make(path):
         # Its exact path is in the holder's record before the directory exists.
         record=json.loads((s.host/'admission.json').read_text())
-        assert ['directory',str(path),record['run']] in record['resources'] and not Path(path).exists()
+        entry=['directory',str(path),record['run'],s.v.root_identity(Path(path).parent)]
+        assert entry in record['resources'] and not Path(path).exists()
         s.made.append(Path(path));real_make(path);(Path(path)/'18').mkdir();(Path(path)/'18'/'PG_VERSION').write_text('18')
     monkeypatch.setattr(s.v,'make_data_directory',make)
     real_restore=s.engine.restore
@@ -1916,7 +1917,7 @@ def test_a_runs_data_directory_is_recorded_before_it_exists_and_removed_on_succe
         assert v.run(config,client=s.cloud_of(profile),engine=s.engine)['status']=='verified'
         run=json.loads((Path(config['directory'])/'last-success.json').read_text())['verification_id']
     assert s.made==[s.root/v.names(run,profile)['volume']] and s.chowned==[(s.made[0].name,os.getuid(),os.getuid())]
-    assert s.engine.admissions[-1]['resources'][-1]==['directory',str(s.made[0]),run]
+    assert s.engine.admissions[-1]['resources'][-1]==['directory',str(s.made[0]),run,v.root_identity(s.root)]
     # The bind replaces the volume: the record still names it, for a retry from before ANYM-634.
     assert ['volume',v.names(run,profile)['volume'],run] in s.engine.admissions[-1]['resources']
     assert list(s.root.iterdir())==[] and not s.engine.resources and not (s.host/'admission.json').exists()
@@ -1943,19 +1944,25 @@ def test_a_sigkilled_holders_data_directory_is_removed_by_the_next_holder(datadi
 
 
 # spec: ANYM-634
-@pytest.mark.parametrize('case',['unremovable','symlink','foreign_name','unrelated_parent','other_run','other_owner'])
+@pytest.mark.parametrize('case',['unremovable','symlink','foreign_name','unrelated_parent','public_parent','other_run',
+                                  'record_run','other_owner'])
 def test_a_recorded_data_directory_that_cannot_be_removed_refuses_with_nothing_created(datadir,monkeypatch,tmp_path,case):
     s=datadir;v=s.v;outside=tmp_path/'outside';outside.mkdir();(outside/'keep').write_text('kept')
-    if case in ('foreign_name','other_run'):
-        # A record naming a path that is not its run's directory is never acted on.
+    if case in ('foreign_name','other_run','record_run','unrelated_parent'):
+        # A record naming a path that is not its run's directory under its admitted root is never acted on.
         data=kill_holder_with_data(s,'messaging')
-        record=json.loads((s.host/'admission.json').read_text())
-        if case=='foreign_name':record['resources'][-1][1]=str(outside)
+        record=json.loads((s.host/'admission.json').read_text());entry=record['resources'][-1]
+        if case=='foreign_name':entry[1]=str(outside)
+        elif case=='unrelated_parent':
+            # The run's exact name under another root-private directory: not the root it was admitted under.
+            outside.chmod(0o700);data=outside/data.name;data.mkdir();(data/'keep').write_text('kept');entry[1]=str(data)
         else:
-            record['resources'][-1][1]=str(outside/v.names('e'*32,'messaging')['volume'])
-            (outside/v.names('e'*32,'messaging')['volume']).mkdir();(outside/v.names('e'*32,'messaging')['volume']/'keep').write_text('kept')
+            # The name of another run, also as that run's own entry inside this run's record.
+            data=outside/v.names('e'*32,'messaging')['volume'];data.mkdir();(data/'keep').write_text('kept')
+            entry[1]=str(data);entry[3]=v.root_identity(outside)
+            if case=='record_run':entry[2]='e'*32
         s.write_json(s.host/'admission.json',record)
-    elif case=='unrelated_parent':
+    elif case=='public_parent':
         # The run's exact name under a parent that is not root-private: not a data root, never removed.
         outside.chmod(0o755);data=kill_holder_with_data(s,'messaging',data=outside/v.names('f'*32,'messaging')['volume'])
         data.mkdir();(data/'keep').write_text('kept')
@@ -1982,8 +1989,7 @@ def test_a_recorded_data_directory_that_cannot_be_removed_refuses_with_nothing_c
         v.run(s.calendar,client=s.calendar_cloud,engine=s.engine)
     assert created(s.engine,'calendar')==[] and s.made==[] and (s.host/'admission.json').read_bytes()==record
     assert (outside/'keep').read_text()=='kept' and s.status(s.calendar)['error']=='verifier_cleanup_unconfirmed'
-    if case in ('unrelated_parent','other_owner'):assert (data/'keep').read_text()=='kept'
-    if case=='other_run':assert (outside/v.names('e'*32,'messaging')['volume']/'keep').read_text()=='kept'
+    if case in ('unrelated_parent','public_parent','other_owner','other_run','record_run'):assert (data/'keep').read_text()=='kept'
 
 
 def separate_filesystem(monkeypatch,root):
@@ -2137,3 +2143,21 @@ def test_a_retry_after_its_proof_removes_the_recorded_data_directory_after_the_k
     assert v.run(config,client=s.cloud_of(profile),engine=s.engine)['status']=='verified'
     assert not data.exists() and list(s.root.iterdir())==[] and not (s.host/'admission.json').exists()
     assert not s.engine.resources and len(s.made)==1
+
+
+# spec: ANYM-634
+@pytest.mark.parametrize('phase',['proof_ready','promoted'])
+def test_a_retry_after_its_proof_with_no_record_left_never_waits_for_the_host_lock(datadir,monkeypatch,phase):
+    s=datadir;v=s.v;config={**s.messaging,'verify_wait_seconds':1};original=r2.protect
+    def lost_response(*args,**kwargs):original(*args,**kwargs);raise TimeoutError('lost promotion result')
+    monkeypatch.setattr(r2,'protect',lost_response)
+    with pytest.raises(TimeoutError):v.run(config,client=s.cloud,engine=s.engine)
+    monkeypatch.setattr(r2,'protect',original)
+    active=Path(config['directory'])/'active.json';journal=json.loads(active.read_text())
+    assert journal['phase']=='proof_ready' and not (s.host/'admission.json').exists()
+    if phase=='promoted':s.write_json(active,{**journal,'phase':'promoted'})
+    # The calendar instance restores meanwhile: this retry promotes without waiting for it.
+    monkeypatch.setattr(v.time,'sleep',lambda seconds:pytest.fail('the retry waited for the host lock'))
+    with v.host_lock(s.calendar):
+        assert v.run(config,client=s.cloud,engine=s.engine)['status']=='verified'
+    assert not active.exists() and list(s.root.iterdir())==[]

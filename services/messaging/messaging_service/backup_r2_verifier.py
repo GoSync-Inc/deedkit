@@ -231,13 +231,16 @@ def host_lock(config,wait=None):
         finally:os.close(lock)
 
 
-def valid_resource(item,profile):
-    if (not isinstance(item,list) or len(item)!=3 or not isinstance(item[1],str) or
+def valid_resource(item,profile,run):
+    if (not isinstance(item,list) or len(item)!=(4 if item[:1]==['directory'] else 3) or not isinstance(item[1],str) or
             not isinstance(item[2],str) or not re.fullmatch('[a-f0-9]{32}',item[2])):return False
     if item[0]=='directory':
-        # A run's PostgreSQL data directory (ANYM-634): its exact path, named for its run and profile.
+        # A run's PostgreSQL data directory (ANYM-634): its exact path, named for the record's own run and
+        # profile, and the device:inode of the data root it was admitted under.
         path=Path(item[1])
-        return path.is_absolute() and '..' not in path.parts and len(item[1])<=1024 and path.name==names(item[2],profile)['volume']
+        return (item[2]==run and path.is_absolute() and '..' not in path.parts and len(item[1])<=1024 and
+                path.name==names(run,profile)['volume'] and isinstance(item[3],str) and
+                re.fullmatch('[0-9]{1,20}:[0-9]{1,20}',item[3]) is not None)
     return item[0] in ('helper','postgres','volume','network') and re.fullmatch('deedkit-verify-[a-z0-9-]{32,120}',item[1]) is not None
 
 
@@ -245,7 +248,8 @@ def valid_admission(value):
     if (not isinstance(value,dict) or set(value)!={'v','profile','run','resources','admitted_at'} or
             type(value['v']) is not int or value['v']!=1 or value['profile'] not in r2.PROFILES or
             not isinstance(value['resources'],list) or len(value['resources'])>32 or
-            any(not valid_resource(item,value['profile']) for item in value['resources'])):
+            not isinstance(value['run'],str) or not re.fullmatch('[a-f0-9]{32}',value['run']) or
+            any(not valid_resource(item,value['profile'],value['run']) for item in value['resources'])):
         raise ValueError('verifier_cleanup_unconfirmed')
     names(value['run'])
     return value
@@ -257,8 +261,8 @@ def clear_admission(engine,fd):
     _,record=r2.read_root(fd,ADMISSION,missing=True)
     if record is None:return
     try:
-        for kind,name,owner in valid_admission(record)['resources']:
-            if kind=='directory':remove_data_directory(name);continue
+        for kind,name,owner,*root in valid_admission(record)['resources']:
+            if kind=='directory':remove_data_directory(name,root[0]);continue
             if engine.inspect_owned(kind,name,owner) is not None:engine.remove(kind,name)
             if engine.inspect_owned(kind,name,owner) is not None:raise RuntimeError('verifier_cleanup_unconfirmed')
     except Exception:
@@ -274,6 +278,17 @@ def admit(engine,fd,profile,run,resources):
                                             'resources':[list(item) for item in resources]},dir_fd=fd)
 
 
+def own_record(config,run):
+    """Whether the host's admission record is still this run's, read without the lock: another holder
+    replaces it only after removing what it names. An unreadable record counts as this run's."""
+    with host_directory(config) as fd:
+        try:_,record=r2.read_root(fd,ADMISSION,missing=True)
+        except Exception:
+            if r2.CANCELLED:raise
+            return True
+    return record is not None and (not isinstance(record,dict) or record.get('run')==run)
+
+
 def release_admission(fd):
     """After the holder confirmed its own resources removed."""
     try:os.unlink(ADMISSION,dir_fd=fd)
@@ -286,7 +301,13 @@ def run_resources(run,profile='messaging',data=None):
     Its data directory (ANYM-634) comes last: removed after the PostgreSQL container that uses it."""
     resources=[names(run,profile),*([legacy_names(run)] if profile=='messaging' else [])]
     return [(kind,name,run) for resource in resources for kind,name in resource.items()]+(
-        [('directory',str(data),run)] if data is not None else [])
+        [('directory',str(data),run,root_identity(data.parent))] if data is not None else [])
+
+
+def root_identity(path):
+    """The data root's device:inode, recorded with a run's directory: removal from a record acts only there."""
+    with local.trusted_directory(path) as fd:
+        info=os.fstat(fd);return str(info.st_dev)+':'+str(info.st_ino)
 
 
 def pair(config):return [config['helper_image'],config['helper_revision']]
@@ -420,14 +441,17 @@ def make_data_directory(path):
         finally:local.fsync_dir(parent)
 
 
-def remove_data_directory(path):
-    """Remove exactly a recorded data directory. Its parent must be root-private and the leaf a directory
-    of root (created, not yet handed over) or of the image's postgres user, never a symlink, so a stale
-    or wrong record cannot reach another directory: it is refused and kept."""
+def remove_data_directory(path,root=None):
+    """Remove exactly a run's data directory. Its parent must be root-private (from a record: the very data
+    root it was admitted under, `root` device:inode) and the leaf a directory of root (created, not yet
+    handed over) or of the image's postgres user, never a symlink, so a stale or wrong record cannot reach
+    another directory: it is refused and kept."""
     path=Path(path)
     try:
         with local.trusted_directory(path.parent) as parent:
-            if os.fstat(parent).st_mode&0o077:raise ValueError('verifier_cleanup_unconfirmed')
+            info=os.fstat(parent)
+            if info.st_mode&0o077 or (root is not None and str(info.st_dev)+':'+str(info.st_ino)!=root):
+                raise ValueError('verifier_cleanup_unconfirmed')
             try:info=os.stat(path.name,dir_fd=parent,follow_symlinks=False)
             except FileNotFoundError:return
             if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0,POSTGRES_UID):raise ValueError('verifier_cleanup_unconfirmed')
@@ -811,9 +835,9 @@ def run(config,*,client=None,engine=None,path=None):
                         # A refused admission keeps the record it could not clear for the next holder.
                         admit(engine,lock,profile,pending['run'],
                               run_resources(pending['run'],profile,data_directory(config,pending['run'])));admitted=lock
-                    else:
-                        # A retry after its proof: a crash before cleanup left its record, which names the run's
-                        # data directory as it was then (ANYM-634), whatever the config says now.
+                    elif own_record(config,pending['run']):
+                        # A retry after its proof whose own record a crash left: it names the run's data directory
+                        # as it was then (ANYM-634), whatever the config says now. Only then does it wait.
                         clear_admission(engine,untimed(engine,host,host_lock(config)))
                     if journal is None:
                         journal=pending;local.write_maintenance_json('active.json',journal,dir_fd=fd)

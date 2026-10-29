@@ -328,13 +328,15 @@ run records `<path>/deedkit-verify-<profile>-<run>-data` in `admission.json`
 before it creates it (`0700`, owned by the image's `postgres` user, uid 999,
 inside the root-only parent), bind-mounts it at `/var/lib/postgresql`, and
 removes exactly that path on success and failure; after a SIGKILL the next
-holder removes it from the record. A retry after its proof (a crash before
-cleanup) also clears the record under the host lock, so a run directory recorded
-before the key was removed or changed is still removed. Removal refuses a
-recorded path whose parent is not root-private, or whose leaf is not a directory
-of root or uid 999 (a symlink is never followed); such a path, like one it
-cannot remove, ends `verifier_cleanup_unconfirmed` with nothing new created and
-the record kept. The disk preflight
+holder removes it from the record. The record holds the path, the run and the
+data root's device and inode. A retry after its proof whose own record a crash
+left clears it under the host lock, so a run directory recorded before the key
+was removed or changed is still removed; with no own record left it does not
+wait for the host lock. Removal from a record refuses a path that is not the
+record run's name directly in the data root it was admitted under (same device
+and inode, root-private), or whose leaf is not a directory of root or uid 999 (a
+symlink is never followed); such a path, like one it cannot remove, ends
+`verifier_cleanup_unconfirmed` with nothing new created and the record kept. The disk preflight
 checks the database share (headroom plus reserve) on that directory's
 filesystem and the payload share on the working directory's (one shared
 filesystem: their sum), and the reserve monitor watches both during the run. The
