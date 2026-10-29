@@ -754,7 +754,10 @@ def test_a_malformed_journal_still_records_its_failure_with_no_helper_state(oper
 def test_the_journal_line_keeps_the_helper_state_of_an_exception_that_refuses_attributes(operator,monkeypatch,capsys):
     v,config,receiver,cloud,engine,_=operator
     class Sealed(RuntimeError):
-        def __setattr__(self,name,value):raise AttributeError(name)
+        # Python's own links (__context__, __traceback__) still set; any other attribute is refused.
+        def __setattr__(self,name,value):
+            if not name.startswith('__'):raise AttributeError(name)
+            super().__setattr__(name,value)
     engine.failure=Sealed('storage_unavailable');original=engine.inspect_owned
     def inspect_owned(kind,name,run):
         value=original(kind,name,run)
