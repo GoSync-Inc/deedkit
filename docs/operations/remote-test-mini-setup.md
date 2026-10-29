@@ -85,7 +85,8 @@ block before anything is installed.
 The closing sudoers check accepts only `parsed OK` lines and `bad permissions, should be mode 0440` warnings.
 Three of the owner's own sudoers.d files (`ego`, `egoregerev`, `ksyusha`, root-owned 0644 since April and
 May 2026) draw that warning from plain `visudo -c`; sudo still reads them, and they are not this setup's to
-change. Any other line (a syntax error) stops the block.
+change. Any other line (a syntax error) stops the block, and so does output with no `parsed OK` line or a
+failed `visudo -c` without such a warning (killed, say), or a failed filter.
 
 ```bash
 D="$(ssh egoregerev@100.88.40.111 'D=$(mktemp -d /tmp/deedkit-setup.XXXXXX) && echo "stage $D" >> ~/deedkit-ci-setup.created && echo $D')" &&
@@ -101,7 +102,10 @@ sudo -n install -o root -g wheel -m 0755 deedkit-remote-test /usr/local/libexec/
 echo sudoers >> ~/deedkit-ci-setup.created
 sudo -n install -o root -g wheel -m 0440 sudoers-deedkit-remote-test /etc/sudoers.d/deedkit-remote-test
 sudo -n visudo -cf /etc/sudoers.d/deedkit-remote-test
-if sudo -n visudo -c 2>&1 | grep -v -e ": parsed OK$" -e ": bad permissions, should be mode 0440$"; then exit 1; fi
+out="$(sudo -n visudo -c 2>&1)" && rc=0 || rc=$?; W=": bad permissions, should be mode 0440$"
+printf "%s\n" "$out" | grep -v -e ": parsed OK$" -e "$W" && g=0 || g=$?
+if [ "$g" != 1 ] || ! printf "%s\n" "$out" | grep -q ": parsed OK$" ||
+  { [ "$rc" != 0 ] && ! printf "%s\n" "$out" | grep -q "$W"; }; then echo "visudo -c failed (exit $rc)"; exit 1; fi
 cd; rm -r "$D"'
 ```
 
@@ -167,8 +171,11 @@ if grep -qx user $L; then
 if grep -qx group $L; then
   if dscl . -read /Groups/$U >/dev/null 2>&1; then sudo -n dscl . -delete /Groups/$U; fi
   if dscl . -read /Groups/$U >/dev/null 2>&1; then echo group >> $R; fi; fi
-if sudo -n visudo -c 2>&1 | grep -v -e ": parsed OK$" -e ": bad permissions, should be mode 0440$"; then
-  rm -f $R; echo "visudo -c reports an error: ledger kept"; exit 1; fi
+out="$(sudo -n visudo -c 2>&1)" && rc=0 || rc=$?; W=": bad permissions, should be mode 0440$"
+printf "%s\n" "$out" | grep -v -e ": parsed OK$" -e "$W" && g=0 || g=$?
+if [ "$g" != 1 ] || ! printf "%s\n" "$out" | grep -q ": parsed OK$" ||
+  { [ "$rc" != 0 ] && ! printf "%s\n" "$out" | grep -q "$W"; }; then
+  rm -f $R; echo "visudo -c failed (exit $rc): ledger kept"; exit 1; fi
 if [ -s $R ]; then mv $R $L; echo "undo incomplete, still present:"; cat $L; exit 1; fi
 rm -f $R $L; echo undo-ok'
 ```

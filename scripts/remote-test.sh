@@ -431,18 +431,19 @@ groups_alive() {
 }
 
 # Reap these jobs after KILL, waiting at most 5 s for each: a process stuck in the kernel never holds the run.
+# Quiet: bash 3.2 would report each killed job ("Killed: 9") on the run's output.
 reap_jobs() {
   local pid i
   for pid in "$@"; do
     for i in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
     kill -0 "$pid" 2>/dev/null || wait "$pid" 2>/dev/null || true
   done
-}
+} 2>/dev/null
 
 finish() {
-  local status=$? pid pg=0 i
+  local status=$? pid pg=0 i stopped=1
   trap - EXIT INT TERM HUP
-  if [ -n "$WATCHDOG" ]; then kill -KILL "$WATCHDOG" 2>/dev/null || true; wait "$WATCHDOG" 2>/dev/null || true; fi
+  if [ -n "$WATCHDOG" ]; then kill -KILL "$WATCHDOG" 2>/dev/null || true; reap_jobs "$WATCHDOG"; fi
   for pid in $CHILDREN; do kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true; done
   # Up to STOP_SECONDS for the groups to end, then KILL: a child that ignores TERM never holds the run open.
   for i in $(seq 1 "$STOP_SECONDS"); do groups_alive $CHILDREN || break; sleep 1; done
@@ -456,6 +457,14 @@ finish() {
     reap_jobs "$pid"
   done
   times > "$RUN_DIR/.times"
+  # Whatever recorded still runs (a group whose leader already ended, say) gets the same bounded stop. When
+  # something does not stop, the run fails (an otherwise green run exits 1, and its load line says so) and its
+  # directory, the record, stays for the next run or --cleanup.
+  if ! stop_recorded "$RUN_DIR"; then
+    stopped=0
+    say "a process of this run does not stop; $RUN_DIR stays recorded"
+    [ "$status" != 0 ] || status=1
+  fi
   if [ -n "$DATABASES" ]; then
     pg="$(awk -v a="$(cpu_of "$RUN_DIR/.times")" -v b="$(cpu_of "$RUN_DIR/.times-before")" 'BEGIN { printf "%.1f", a - b }')"
   fi
@@ -466,9 +475,7 @@ finish() {
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$WORKER" "$SUITE" "$START_ISO" "$((SECONDS - START_EPOCH))" \
     "$(cpu_of "$RUN_DIR/.times")" "$pg" "$status" >> "$ROOT_DIR/load.log"
   if [ "$(cat "$WORKER_DIR/run.pid" 2>/dev/null)" = "$$ $(started $$)" ]; then rm -f "$WORKER_DIR/run.pid"; fi
-  # Whatever recorded still runs (a group whose leader already ended, say) gets the same bounded stop; the run
-  # directory, its record, stays when something does not stop, for the next run or --cleanup.
-  if stop_recorded "$RUN_DIR"; then rm -rf "$RUN_DIR"; else say "a process of this run does not stop; $RUN_DIR stays recorded"; fi
+  if [ "$stopped" = 1 ]; then rm -rf "$RUN_DIR"; fi
   if [ -n "$HOLDER" ]; then kill "$HOLDER" 2>/dev/null || true; fi
   exit "$status"
 }
@@ -581,7 +588,9 @@ runner_run() {
   RUN_DIR="$WORKER_DIR/runs/$(date +%s)-$$"
   mkdir -p "$RUN_DIR"
   echo "$$ $(started $$)" > "$WORKER_DIR/run.pid"
-  stop_leftovers || true  # what does not stop stays recorded for the next try
+  # A leftover that does not stop stays recorded (stop_leftovers says so) and this run goes on: the next run and
+  # --cleanup try again, and --cleanup exits 1 while it stays.
+  stop_leftovers || true
   set -m
   trap finish EXIT
   trap 'exit 130' INT
