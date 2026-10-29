@@ -75,11 +75,13 @@ def load_config(path):
 class HttpModule:
     """One producer's read endpoint behind its router token (read per request, so a rotation needs no restart)."""
 
-    def __init__(self, source, url, token_file, timeout_s, transport=None):
+    def __init__(self, source, url, token_file, timeout_s):
         self.source, self.url, self.token_file, self.timeout = source, url.rstrip('/'), Path(token_file), timeout_s
         # One client per module: building one loads the TLS trust store, which costs more than a page read.
-        self.client = httpx.Client(timeout=httpx.Timeout(timeout_s), follow_redirects=False, trust_env=False,
-            transport=transport)
+        self.client = self._client()
+
+    def _client(self):
+        return httpx.Client(timeout=httpx.Timeout(self.timeout), follow_redirects=False, trust_env=False)
 
     def head(self):
         body = self._get('/v1/events/head', {})
@@ -93,13 +95,41 @@ class HttpModule:
         return self._get('/v1/events', {'after': after, 'limit': limit})
 
     def _get(self, path, params):
+        """One request under a total deadline over connect, headers and body.
+
+        httpx bounds each phase, not the whole: a module that trickles its headers or body could hold the
+        worker for many phases. The read runs on a thread; past the deadline the client is closed, which
+        closes its socket and ends the abandoned read, and the next request gets a new client.
+        """
         try:
             token = self.token_file.read_text().strip()
         except OSError:
             raise ModuleUnavailable('token_unreadable') from None
+        outcome, client = {}, self.client
+
+        def read():
+            try:
+                outcome['body'] = self._read(client, path, params, token)
+            except BaseException as error:
+                outcome['error'] = error
+        worker = threading.Thread(target=read, name='module-read', daemon=True)
+        worker.start()
+        worker.join(self.timeout)
+        if worker.is_alive():
+            self.client = self._client()
+            try:
+                client.close()
+            except Exception:
+                pass
+            raise ModuleUnavailable('module_timeout')
+        if 'error' in outcome:
+            raise outcome['error']
+        return outcome['body']
+
+    def _read(self, client, path, params, token):
         deadline, body = time.monotonic() + self.timeout, bytearray()
         try:
-            with self.client.stream('GET', self.url + path, params=params,
+            with client.stream('GET', self.url + path, params=params,
                     headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/json'}) as response:
                 if response.status_code in (401, 403):
                     raise ModuleUnavailable('module_auth_refused')
@@ -142,7 +172,13 @@ def producer_event(raw, source):
     if not isinstance(raw, dict) or 'scope_ref' not in raw:
         raise ModuleContractError('invalid_scope_ref')
     envelope = {key: value for key, value in raw.items() if key != 'scope_ref'}
-    seq = validate_event(envelope)
+    try:
+        seq = validate_event(envelope)
+    except ModuleContractError:
+        raise
+    except (TypeError, ValueError, KeyError, AttributeError):
+        # A value of the wrong JSON type (a list as source, an object as urgency) is a refused event too.
+        raise ModuleContractError('invalid_envelope') from None
     if envelope['source'] != source:
         raise ModuleContractError('source_mismatch')
     if not isinstance(raw['scope_ref'], str) or _SCOPE.fullmatch(raw['scope_ref']) is None:
@@ -221,9 +257,17 @@ def cursor(conn, source):
         (source,)).fetchone()
 
 
-def _open_gap(conn, source, kind, after, through, code):
-    conn.execute('''INSERT INTO module_router_gaps(source,kind,after_seq,through_seq,code)
-        VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING''', (source, kind, after, through, code))
+def _open_gap(conn, source, kind, journal_id, after, through, code):
+    """Open a gap unless the same one is open; the caller holds the source's cursor row lock."""
+    conn.execute('''INSERT INTO module_router_gaps(source,kind,journal_id,after_seq,through_seq,code)
+        SELECT %s,%s,%s,%s,%s,%s WHERE NOT EXISTS(SELECT FROM module_router_gaps WHERE source=%s AND kind=%s
+        AND after_seq=%s AND resolved_at IS NULL)''', (source, kind, journal_id, after, through, code, source, kind,
+        after))
+
+
+def _locked_cursor(conn, source):
+    return conn.execute('SELECT after_seq,journal_id FROM module_router_cursors WHERE source=%s FOR UPDATE',
+        (source,)).fetchone()
 
 
 def _publish(conn, seq, envelope, scope, quarantined):
@@ -244,15 +288,14 @@ def commit_page(conn, source, expected, journal_id, next_after, published, quara
     """
     with conn.transaction():
         _bounded(conn)
-        row = conn.execute('SELECT after_seq,journal_id FROM module_router_cursors WHERE source=%s FOR UPDATE',
-            (source,)).fetchone()
+        row = _locked_cursor(conn, source)
         if row is None or (row['after_seq'], row['journal_id']) != (expected['after_seq'], expected['journal_id']):
             return False
         quarantined = list(quarantined)
         for seq, envelope, scope in published:
             _publish(conn, seq, envelope, scope, quarantined)
         for after, through, code in quarantined:
-            _open_gap(conn, source, kind, after, through, code)
+            _open_gap(conn, source, kind, journal_id, after, through, code)
         conn.execute('''UPDATE module_router_cursors SET after_seq=%s,journal_id=%s,origin='router',
             updated_at=clock_timestamp() WHERE source=%s''', (next_after, journal_id, source))
     return True
@@ -285,7 +328,8 @@ def read_page(conn, module, row):
         # A source reset is reported and never read as new events; the operator sets the cursor again.
         with conn.transaction():
             _bounded(conn)
-            _open_gap(conn, module.source, 'source_reset', after, None, 'source_reset')
+            _locked_cursor(conn, module.source)
+            _open_gap(conn, module.source, 'source_reset', page['journal_id'], after, None, 'source_reset')
         return 'reset'
     if page['retention_floor'] > after:
         # Pruned before this cursor read it: name the range, read none of it.
@@ -299,11 +343,19 @@ def read_page(conn, module, row):
 
 
 def refetch(conn, module, journal_id):
-    """Re-read a few quarantined ranges; a range whose every event now passes is published and resolved."""
-    rows = conn.execute('''SELECT after_seq,through_seq FROM module_router_gaps WHERE source=%s AND kind='quarantine'
-        AND resolved_at IS NULL ORDER BY after_seq LIMIT %s''', (module.source, REFETCH_PER_PASS)).fetchall()
+    """Re-read a few quarantined ranges, least recently tried first, so a range that stays broken never
+    starves a repaired one. A range resolves only when the module serves at least one event inside it, every
+    event inside it passes and is published, and the page covers it; a range the producer now filters
+    stays open until the operator abandons it.
+    """
+    rows = conn.execute('''SELECT id,after_seq,through_seq FROM module_router_gaps WHERE source=%s
+        AND kind='quarantine' AND resolved_at IS NULL ORDER BY attempted_at NULLS FIRST,after_seq LIMIT %s''',
+        (module.source, REFETCH_PER_PASS)).fetchall()
     for row in rows:
         after, through = row['after_seq'], row['through_seq']
+        with conn.transaction():
+            _bounded(conn)
+            conn.execute('UPDATE module_router_gaps SET attempted_at=clock_timestamp() WHERE id=%s', (row['id'],))
         page = module.events(after, min(LIMIT, through - after))
         check_page(page, after, LIMIT)
         if page['journal_id'] != journal_id or page['retention_floor'] > after:
@@ -312,19 +364,21 @@ def refetch(conn, module, journal_id):
             published, quarantined, next_after = split_page(module.source, after, page)
         except ModuleContractError:
             continue
-        if quarantined and quarantined[0][0] < through or next_after < through:
+        inside = [item for item in published if item[0] <= through]
+        if not inside or any(low < through for low, _, _ in quarantined) or next_after < through:
             continue
-        with conn.transaction():
-            _bounded(conn)
-            failed = []
-            for seq, envelope, scope in published:
-                if seq <= through:
+        try:
+            with conn.transaction():
+                _bounded(conn)
+                failed = []
+                for seq, envelope, scope in inside:
                     _publish(conn, seq, envelope, scope, failed)
-            if failed:
-                raise _Rollback()
-            conn.execute('''UPDATE module_router_gaps SET resolved_at=clock_timestamp(),resolution='refetched'
-                WHERE source=%s AND kind='quarantine' AND after_seq=%s AND resolved_at IS NULL''',
-                (module.source, after))
+                if failed:
+                    raise _Rollback()
+                conn.execute('''UPDATE module_router_gaps SET resolved_at=clock_timestamp(),resolution='refetched'
+                    WHERE id=%s AND resolved_at IS NULL''', (row['id'],))
+        except _Rollback:
+            continue
 
 
 class _Rollback(Exception):
@@ -348,10 +402,7 @@ def poll(conn, module):
         if outcome in ('reset', 'moved'):
             _log(source, outcome)
             return
-        try:
-            refetch(conn, module, cursor(conn, source)['journal_id'])
-        except _Rollback:
-            pass
+        refetch(conn, module, cursor(conn, source)['journal_id'])
     except (ModuleUnavailable, ModuleContractError) as error:
         _log(source, getattr(error, 'code', None) or str(error))
         report(conn, source, False)
@@ -378,7 +429,16 @@ def run(connect_db, modules, *, interval, stop, once=False):
                 _log(None, 'schema_not_ready')
             else:
                 for module in modules:
-                    poll(conn, module)
+                    try:
+                        poll(conn, module)
+                    except psycopg.OperationalError:
+                        raise
+                    except Exception as error:
+                        # One module's unexpected failure never stops the others' pass.
+                        capture(error, 'module_router_failed')
+                        _log(module.source, 'module_router_failed')
+                        if conn.closed or conn.broken:
+                            raise
         except Exception as error:
             capture(error, 'module_router_failed')
             _log(None, 'module_router_failed')

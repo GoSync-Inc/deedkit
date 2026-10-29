@@ -398,16 +398,18 @@ def test_a_pruned_range_and_a_source_reset_are_named_and_never_read_as_new_event
 # spec: ANYM-575
 def test_dead_slow_or_restarting_modules_leave_message_hints_flowing_within_a_latency_bound(routed, producers,
         tmp_path):
+    from messaging_service.event_delivery import dispatch_hints
     store, connect = routed
     token = subscriber(store)
     sid = mixed(store, token)
+    _receiver(store, token, sid, tmp_path)
     calls = producers()
     calls_module = calls.module(tmp_path, timeout_s=0.5)
     sweep(connect, calls_module)
     with socket.socket() as probe:
         probe.bind(('127.0.0.1', 0))
         dead_port = probe.getsockname()[1]
-    dead = HttpModule('deedkit:calendar', f'http://127.0.0.1:{dead_port}', str(tmp_path / 'none.token'), 0.5)
+    dead = HttpModule('deedkit:calendar', f'http://127.0.0.1:{dead_port}', str(calls_module.token_file), 0.5)
     calls.stall = 3  # slow: every read runs past the router's deadline
     stop = threading.Event()
     worker = threading.Thread(target=event_router.run, args=(connect, [calls_module, dead]),
@@ -425,10 +427,19 @@ def test_dead_slow_or_restarting_modules_leave_message_hints_flowing_within_a_la
         # stalled read alone lasts 3 s (the bound leaves room for a loaded CI host).
         assert max(latencies) < 2.0, latencies
         assert store.get_subscription(token, sid)['matched_through'] == last
+        sent = []
+        dispatch_hints(store, transport=lambda url, body, headers, **k: sent.append(json.loads(body)) or 204,
+            resolver=PUBLIC, limit=32)
+        # Message hints reach the receiver while both modules fail, up to the newest message.
+        throughs = [hint['through'] for hint in sent if hint['kind'] == 'events']
+        assert throughs and throughs == sorted(throughs) and throughs[-1] == last
         with store.pool.connection() as c:
             unreachable = {row['source'] for row in c.execute(
                 'SELECT source FROM module_source_health WHERE unreachable_since IS NOT NULL')}
         assert unreachable == {'deedkit:calls', 'deedkit:calendar'}
+        with store.pool.connection() as c:
+            # The dead module fails on the connection (a readable token was sent nowhere), not before it.
+            assert c.execute("SELECT 1 FROM module_router_cursors WHERE source='deedkit:calendar'").fetchone() is None
         view = store.get_subscription(token, sid)
         assert view['module_stream']['health'][0]['state'] == 'module_unreachable' and view['blocked_reason'] is None
         # Restarting: 503 keeps it unreachable; the answer after the restart clears it.
@@ -444,6 +455,133 @@ def test_dead_slow_or_restarting_modules_leave_message_hints_flowing_within_a_la
         worker.join(10)
     assert [key for _, key, _ in journal(store)] == ['calls:1']
     assert store.get_subscription(token, sid)['module_stream']['health'] == []
+
+
+def _trickling_server():
+    """Accepts, sends a status line, then one header byte every 0.1 s: each read is fast, the whole is not."""
+    listener = socket.socket()
+    listener.bind(('127.0.0.1', 0))
+    listener.listen(4)
+    stop = threading.Event()
+
+    def serve():
+        listener.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                client, _ = listener.accept()
+            except OSError:
+                continue
+            def trickle(client=client):
+                try:
+                    client.sendall(b'HTTP/1.1 200 OK\r\n')
+                    while not stop.is_set():
+                        client.sendall(b'X')
+                        time.sleep(0.1)
+                except OSError:
+                    pass
+                finally:
+                    client.close()
+            threading.Thread(target=trickle, daemon=True).start()
+    threading.Thread(target=serve, daemon=True).start()
+    return listener, stop
+
+
+# spec: ANYM-575
+def test_wrong_json_types_are_quarantined_and_one_module_never_stops_another(routed, producers, tmp_path, capsys):
+    store, connect = routed
+    calls = producers()
+    calendar = producers('deedkit:calendar')
+    calls_module, calendar_module = calls.module(tmp_path), calendar.module(tmp_path)
+    sweep(connect, calls_module, calendar_module)
+    calls.add({**call_event(1), 'source': []})
+    calls.add({**call_event(2), 'urgency': {'now': True}})
+    calls.add({**call_event(3), 'data': [1, 2]})
+    calls.add()
+    sweep(connect, calls_module, calendar_module)
+    assert [key for _, key, _ in journal(store)] == ['calls:4']
+    assert [(g['after_seq'], g['through_seq']) for g in router_state(store)[1]] == [(0, 1), (1, 2), (2, 3)]
+    # An unexpected failure inside one module's pass: the next module is still read and reported.
+    listener, stop = _trickling_server()
+    slow = HttpModule('deedkit:calls', f'http://127.0.0.1:{listener.getsockname()[1]}', str(calls_module.token_file),
+        0.3)
+    calendar.rows.append(None)
+    with store.pool.connection() as c:
+        c.execute("UPDATE module_source_health SET unreachable_since=clock_timestamp() WHERE source='deedkit:calendar'")
+    try:
+        started = time.monotonic()
+        sweep(connect, slow, calendar_module)
+        # A total deadline: headers trickled faster than any single read timeout still end the read.
+        assert time.monotonic() - started < 2.0
+    finally:
+        stop.set()
+        listener.close()
+    assert router_state(store, 'deedkit:calendar')[0]['after_seq'] == 1
+    with store.pool.connection() as c:
+        health = {row['source']: row['unreachable_since'] for row in c.execute('SELECT * FROM module_source_health')}
+    assert health['deedkit:calendar'] is None and health['deedkit:calls'] is not None
+    assert '"code": "module_timeout"' in capsys.readouterr().out
+
+
+# spec: ANYM-575
+def test_an_unexpected_failure_of_one_module_leaves_the_next_module_polled(routed, producers, tmp_path, monkeypatch):
+    store, connect = routed
+    calls, calendar = producers(), producers('deedkit:calendar')
+    calls_module, calendar_module = calls.module(tmp_path), calendar.module(tmp_path)
+    sweep(connect, calls_module, calendar_module)
+    calls.add()
+    calendar.rows.append(None)
+    real = event_router.split_page
+    monkeypatch.setattr(event_router, 'split_page', lambda source, *a: (_ for _ in ()).throw(RuntimeError('bug'))
+        if source == 'deedkit:calls' else real(source, *a))
+    sweep(connect, calls_module, calendar_module)
+    assert router_state(store)[0]['after_seq'] == 0
+    assert router_state(store, 'deedkit:calendar')[0]['after_seq'] == 1
+
+
+# spec: ANYM-575
+def test_a_refetch_resolves_only_a_published_event_and_no_broken_range_starves_a_repaired_one(routed, producers,
+        tmp_path):
+    store, connect = routed
+    producer = producers()
+    module = producer.module(tmp_path)
+    sweep(connect, module)
+    broken = [producer.add(call_event(n, f'call-{n}', data={'call_id': f'call-{n}', 'title': MARKER}))
+        for n in range(1, 7)]
+    sweep(connect, module)
+    assert len([g for g in router_state(store)[1] if g['resolution'] is None]) == 6
+    # The producer now filters seq 1: an empty re-fetch publishes nothing, so the range stays open.
+    producer.rows[0] = None
+    # Only the last broken event is repaired: the rotation reaches it although four earlier ones stay broken.
+    producer.rows[5] = call_event(6, 'call-6')
+    for _ in range(3):
+        sweep(connect, module)
+    gaps = {g['after_seq'] + 1: g['resolution'] for g in router_state(store)[1]}
+    assert gaps == {seq: ('refetched' if seq == broken[-1] else None) for seq in broken}
+    assert [key for _, key, _ in journal(store)] == ['calls:6']
+
+
+# spec: ANYM-575
+def test_a_second_reset_at_the_same_cursor_opens_a_new_gap_and_holds_the_source(routed, producers, tmp_path):
+    store, connect = routed
+    producer = producers()
+    module = producer.module(tmp_path)
+    sweep(connect, module)
+    producer.add()
+    sweep(connect, module)
+    producer.journal_id, producer.rows = 'journal-2', []
+    sweep(connect, module)
+    with store.pool.connection() as c:
+        event_router.set_cursor(c, 'deedkit:calls', 1)
+    sweep(connect, module)  # adopts journal-2 at the operator's cursor
+    assert router_state(store)[0] == {'after_seq': 1, 'journal_id': 'journal-2', 'origin': 'router'}
+    producer.journal_id = 'journal-3'
+    sweep(connect, module)  # a reset again, at the same cursor
+    resets = [g for g in router_state(store)[1] if g['kind'] == 'source_reset']
+    assert [(g['after_seq'], g['resolution']) for g in resets] == [(1, 'abandoned'), (1, None)]
+    producer.add()
+    producer.add()
+    sweep(connect, module)
+    assert [key for _, key, _ in journal(store)] == ['calls:1'] and router_state(store)[0]['after_seq'] == 1
 
 
 def _receiver(store, token, sid, tmp_path, policy=None, name='module-reader'):
@@ -560,15 +698,16 @@ def test_a_receiver_gets_kind_subject_and_module_only_and_logs_carry_no_body_url
     endpoint_body = bodies['https://hooks.example.test/hook']
     references = endpoint_body['references']
     assert [ref['subject'] for ref in references] == ['call-1', 'call-2']
-    assert {key for ref in references for key in ref} == {'module_event_id', 'type', 'source', 'subject', 'urgency',
-        'expires_at'}
+    # Criterion 4: the kind, the subject reference and the module name, nothing else of the event.
+    assert all(set(ref) == {'type', 'source', 'subject'} for ref in references)
+    assert references[0] == {'type': 'call.owner_request', 'source': 'deedkit:calls', 'subject': 'call-1'}
     assert set(endpoint_body) == {'type', 'hint_id', 'subscription_id', 'version', 'label', 'references',
         'references_omitted', 'next_call'}
     # The operator receiver gets positions and the hint kind only.
     assert set(bodies['https://hooks.example.test/wake']) == {'hint_id', 'subscription_id', 'subscription_version',
         'through', 'kind', 'host_turn_verified'}
     text = json.dumps(sent)
-    for value in ('decision-1', 'task_completed', 'completed', 'owner-calls', MARKER):
+    for value in ('decision-1', 'task_completed', 'completed', 'owner-calls', '2099-10-29', MARKER):
         assert value not in text
     logs = capsys.readouterr()
     for secret in (MARKER, TOKEN, producer.url, '127.0.0.1'):

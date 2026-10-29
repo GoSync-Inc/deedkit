@@ -994,7 +994,7 @@ matcher pass, after the message pass and in a savepoint of its own (a failure is
 module events by `(source, scope_ref)` and type into `subscription_module_matches` with its own
 `matched_through`, match budget (`SUBSCRIPTION_MAX_MATCHES`) and gap (`stream: "modules"`), and
 stages one outbox hint of kind `module_events` whose `through_position` is a module position
-(endpoint bodies list `module_event_id`, `type`, `source`, `subject`, `urgency`, `expires_at`).
+(endpoint bodies list `type`, `source` and `subject` per event, ANYM-575).
 A hint is staged only while a dispatcher whose heartbeat names schema 56 or later beats
 (`module_hints_ready()`): an older dispatcher would read the module position as a message
 position. Until then the hint waits (the stream's `hinted_through` stays) and pull reads work. A
@@ -1092,9 +1092,9 @@ a URL, token, response body or event field. Telemetry (opt-in): `module_router_f
 the exception type and frames only. A delivered module hint carries no event body:
 
 - a self-service endpoint body is `{type: "module_events", hint_id, subscription_id, version,
-  label, references, references_omitted, next_call}`, and each reference is `{module_event_id,
-  type, source, subject, urgency, expires_at}`: the kind, the subject reference and the module,
-  plus the stream position and the delivery attributes; `data` is read only through the fetch;
+  label, references, references_omitted, next_call}`, and each reference is `{type, source,
+  subject}`: the kind, the subject reference and the module name; positions, urgency, expiry and
+  `data` are read only through the fetch (`next_call`);
 - an operator receiver body is `{hint_id, subscription_id, subscription_version, through, kind:
   "module_events", host_turn_verified}`, with no reference at all.
 

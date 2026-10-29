@@ -13,17 +13,23 @@ CREATE TABLE IF NOT EXISTS module_router_cursors (
 );
 -- kind quarantine: (after_seq, through_seq] held events the contract refused; retention_gap: the producer
 -- pruned it before the router read it; source_reset: a new journal_id or a cursor going back (through_seq
--- NULL), the router reads the source again only after the operator sets its cursor.
+-- NULL), the router reads the source again only after the operator sets its cursor. A resolved row stays
+-- as history and the same range can open again (a new id); the router opens one only when no open row of
+-- the same (source, kind, after_seq) exists, under its cursor row lock. journal_id names the producer
+-- journal incarnation; attempted_at orders the re-fetches so no range starves another.
 CREATE TABLE IF NOT EXISTS module_router_gaps (
+ id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
  source text NOT NULL CHECK(source IN ('deedkit:calendar','deedkit:calls')),
  kind text NOT NULL CHECK(kind IN ('quarantine','retention_gap','source_reset')),
+ journal_id text CHECK(journal_id IS NULL OR length(journal_id) BETWEEN 1 AND 64),
  after_seq bigint NOT NULL CHECK(after_seq BETWEEN 0 AND 9007199254740991),
  through_seq bigint CHECK(through_seq IS NULL OR through_seq>after_seq AND through_seq<=9007199254740991),
  code text NOT NULL CHECK(code ~ '^[a-z_]{1,64}$'),
  opened_at timestamptz NOT NULL DEFAULT now(),
+ attempted_at timestamptz,
  resolved_at timestamptz,
  resolution text CHECK(resolution IN ('refetched','abandoned')),
  CHECK((resolved_at IS NULL)=(resolution IS NULL)),
- CHECK((through_seq IS NULL)=(kind='source_reset')),
- PRIMARY KEY(source,kind,after_seq)
+ CHECK((through_seq IS NULL)=(kind='source_reset'))
 );
+CREATE INDEX IF NOT EXISTS module_router_gaps_source ON module_router_gaps(source,resolved_at,after_seq);

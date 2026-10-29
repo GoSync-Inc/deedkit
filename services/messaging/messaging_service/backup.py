@@ -70,7 +70,7 @@ V56_TABLES={'module_event_counter':'id','module_events':'seq','subscription_modu
     'subscription_module_streams':'subscription','subscription_module_matches':'subscription,event'}
 # Every schema this runtime can capture, verify and restore (one ceiling for capture and verify_bundle).
 # ANYM-575: the router's cursors and open or resolved gaps, consistent with module_events in one snapshot.
-V59_TABLES={'module_router_cursors':'source','module_router_gaps':'source,kind,after_seq'}
+V59_TABLES={'module_router_cursors':'source','module_router_gaps':'id'}
 SCHEMAS=range(2,60)
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
