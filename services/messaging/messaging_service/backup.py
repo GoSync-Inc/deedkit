@@ -74,7 +74,7 @@ V57_TABLES={'conflict_reevaluations':'job,job_version,account'}
 V58_TABLES={'module_router_cursors':'source','module_router_gaps':'id'}
 # ANYM-520: each endpoint hint attempt, kept 7 days (no body, header value or URL).
 V61_TABLES={'delivery_attempts':'id'}
-SCHEMAS=range(2,62)
+SCHEMAS=range(2,63)
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
 V17_TABLES={'message_conflicts':'receipt_digest'}
@@ -344,7 +344,10 @@ def quarantine_restore(store):
             c.execute("UPDATE account_policies SET operations_enabled='{}'")
             c.execute("""UPDATE messenger_commands SET status=CASE WHEN status='queued' THEN 'cancelled' ELSE 'unknown' END,
                 error_code='restored_disabled',finished_at=clock_timestamp() WHERE status IN ('queued','dispatching')""")
-        if version>=40:
+        if version>=62:
+            # ANYM-447: the 30 days after closure count from this restore, and only after the release.
+            c.execute("UPDATE subscriptions SET state='closed',version=version+1,retention_hold=true,closed_at=clock_timestamp()")
+        elif version>=40:
             # The hold keeps restored matches and consumption out of every pruning path
             # until an explicit operator release (ANYM-446).
             c.execute("UPDATE subscriptions SET state='closed',version=version+1,retention_hold=true")

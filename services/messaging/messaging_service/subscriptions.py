@@ -197,8 +197,28 @@ def _owned(c, p, subscription_id):
     return _state(c, row, p)
 
 
+def tombstones_ready(c):
+    """Schema 62 present: new code tolerates an older database during a rolling upgrade."""
+    return c.execute('''SELECT EXISTS(SELECT FROM pg_attribute WHERE attrelid='public.subscriptions'::regclass
+        AND attname='tombstoned_at' AND NOT attisdropped) AS ready''').fetchone()['ready']
+
+
+def _tombstone(row):
+    """ANYM-447: a definition whose data was deleted 30 days after closure; the date says when, never not_found."""
+    from .store import serial
+    view = {'subscription_id': row['id'], 'state': row['state'], 'version': row['version'],
+        'closed_at': row['closed_at'], 'data_deleted': True, 'deleted_at': row['tombstoned_at'],
+        'deletion_reason': 'closed_over_30_days'}
+    if row['state'] == 'access_changed':
+        return serial({**view, 'recreate_required': True, 'scope_masked': True})
+    return serial({**view, 'retention_floor': row['retention_floor'],
+        'hint_counts': row['deleted_hint_counts'], 'scope_masked': False})
+
+
 def _view(c, row, p=None):
     from .store import serial
+    if row.get('tombstoned_at') is not None:
+        return _tombstone(row)
     if row['state'] == 'access_changed':
         return {'subscription_id': str(row['id']), 'state': 'access_changed',
             'version': row['version'], 'recreate_required': True, 'scope_masked': True}
@@ -214,7 +234,7 @@ def _view(c, row, p=None):
         (row['id'],)).fetchone()
     return serial({'subscription_id': row['id'], 'state': row['state'], 'version': row['version'],
         'label': row['label'], **row['selector'], 'created_at': row['created_at'],
-        'updated_at': row['updated_at'], 'expires_at': row['expires_at'],
+        'updated_at': row['updated_at'], 'expires_at': row['expires_at'], 'closed_at': row.get('closed_at'),
         'start_position': row['start_position'], 'matched_through': row['matched_through'],
         'matcher_caught_up': row['state'] == 'active' and row['matched_through'] == head,
         'matched_event_count': count,
@@ -235,25 +255,37 @@ def _module_view(c, row):
 
 
 
-def _delivery_view(c, row, p=None):
-    # Every column: before schema 49 the binding has no endpoint column (rolling upgrade).
-    binding = c.execute('SELECT * FROM subscription_delivery WHERE subscription=%s', (row['id'],)).fetchone()
+def _hint_counts(c, row, p, ids=None):
+    """{state: n} of the definition's hints the key can see now; ids narrows it to those outbox rows."""
     if dynamic(row):
+        if p is None:
+            return {}  # ANYM-447: no key can read it now, so the worker counts none and discloses nothing.
         # ANYM-522: only events hints that cover a reference the key can see now count, in every state.
         where, args = visible_filter(row, p)
         counts = c.execute('''SELECT o.state,count(*) AS n FROM subscription_outbox o WHERE o.subscription=%s
+            AND (%s::uuid[] IS NULL OR o.id=ANY(%s))
             AND o.error_code IS DISTINCT FROM 'scope_changed' AND (o.kind<>'events' OR EXISTS(
                 SELECT FROM subscription_matches m WHERE m.subscription=o.subscription AND m.event<=o.through_position
                 AND m.event>''' + _PREVIOUS_HINT + ''' AND ''' + where + ''')) GROUP BY o.state''',
-            (row['id'], row['start_position'], *args)).fetchall()
+            (row['id'], ids, ids, row['start_position'], *args)).fetchall()
     else:
         counts = c.execute('''SELECT state,count(*) AS n FROM subscription_outbox WHERE subscription=%s
-            GROUP BY state''', (row['id'],)).fetchall()
+            AND (%s::uuid[] IS NULL OR id=ANY(%s)) GROUP BY state''', (row['id'], ids, ids)).fetchall()
+    return {item['state']: item['n'] for item in counts}
+
+
+def _delivery_view(c, row, p=None):
+    # Every column: before schema 49 the binding has no endpoint column (rolling upgrade).
+    binding = c.execute('SELECT * FROM subscription_delivery WHERE subscription=%s', (row['id'],)).fetchone()
+    # ANYM-447: counters that never decrease: the hints the worker deleted plus the rows still kept.
+    live, deleted = _hint_counts(c, row, p), row.get('deleted_hint_counts') or {}
     # An unbound subscription reads no policy state, so its view needs no schema-38 column.
     from .delivery_policy import UNBOUND, delivery_state
     view = {'passive_read': True, 'ack': True, 'push': binding is not None,
         'receiver_id': str(binding['receiver']) if binding and binding['receiver'] else None, 'host_wakeup': 'unverified',
-        'host_turn_verified': False, 'hint_counts': {item['state']: item['n'] for item in counts},
+        'host_turn_verified': False,
+        'hint_counts': {state: live.get(state, 0) + deleted.get(state, 0) for state in sorted({*live, *deleted})},
+        'deleted_hint_counts': deleted, 'hints_deleted_at': row.get('hints_deleted_at'),
         **(delivery_state(c, row) if binding else UNBOUND)}
     if binding and binding.get('endpoint'):
         # ANYM-519: a deleted endpoint leaves the subscription pull-only; a paused one names its state.
@@ -346,8 +378,11 @@ def create_subscription(store, c, p, chat_ids=None, *, sources=None, sender_ids=
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',
         ('subscriptions:' + str(p['key_id']),))
     maximum = _bound_setting('SUBSCRIPTION_MAX_DEFINITIONS', 64, 1, 1000)
-    count = c.execute('SELECT count(*) AS n FROM subscriptions WHERE principal=%s AND key_id=%s',
-        (p['id'], p['key_id'])).fetchone()['n']
+    # ANYM-447: a tombstone older than 30 days no longer counts (schema 62; an older database has none).
+    aged = tombstones_ready(c)
+    count = c.execute('SELECT count(*) AS n FROM subscriptions WHERE principal=%s AND key_id=%s' + (
+        ' AND (tombstoned_at IS NULL OR tombstoned_at>=clock_timestamp()-make_interval(days=>%s))' if aged else ''),
+        (p['id'], p['key_id'], *((CLOSED_RETENTION_DAYS,) if aged else ()))).fetchone()['n']
     if count >= maximum:
         raise APIError('subscription_limit', 429)
     # The counter is serialized by event publishers. An MVCC read sees only a
@@ -841,6 +876,9 @@ RETENTION_EXPIRY_MARGIN = '1 minute'
 RETENTION_TRANSACTION_TIMEOUT = '4s'
 # Shared by each batch, exclusive by the operator's switch: a disable waits for in-flight batches.
 RETENTION_LOCK = 'subscription-retention'
+# ANYM-447: finished hints, a closed definition's data after its closure and a tombstone each age out after it.
+CLOSED_RETENTION_DAYS = 30
+TERMINAL_STATES = ('closed', 'expired', 'access_changed')
 
 
 def lock_retention(c, *, shared):
@@ -925,17 +963,22 @@ def prune_subscriptions(store, *, max_subscriptions=16):
     return stats
 
 
-def _prune_batch(c, candidate, days):
-    """One transaction. Returns rows deleted, or None when retention is off or the subscription
-    is busy, held or past its deadline."""
+def _retention_batch(c):
+    """The bounds and the operator activation of one retention transaction; False when retention is off."""
     # Set first, so it bounds the expiry read through COMMIT: a stalled batch is rolled back.
     c.execute("SELECT set_config('transaction_timeout',%s,true)", (RETENTION_TRANSACTION_TIMEOUT,))
     # Bounds well under one matcher pass; a contended subscription waits for the next pass.
     c.execute("SET LOCAL lock_timeout='100ms'")
     c.execute("SET LOCAL statement_timeout='1s'")
     # The activation is reread under the shared lock: once --disable returns, no batch deletes.
-    if not lock_retention(c, shared=True) or not c.execute('''SELECT EXISTS(SELECT FROM probe_metadata
-            WHERE name='subscription_retention' AND value='enabled') AS enabled''').fetchone()['enabled']:
+    return lock_retention(c, shared=True) and c.execute('''SELECT EXISTS(SELECT FROM probe_metadata
+        WHERE name='subscription_retention' AND value='enabled') AS enabled''').fetchone()['enabled']
+
+
+def _prune_batch(c, candidate, days):
+    """One transaction. Returns rows deleted, or None when retention is off or the subscription
+    is busy, held or past its deadline."""
+    if not _retention_batch(c):
         return None
     # The matcher's order: the shared principal lock, then the subscription row.
     lock_principal(c, candidate['principal'], shared=True)
@@ -970,6 +1013,142 @@ def _prune_batch(c, candidate, days):
         (row['id'], row['retention_floor'], through)).rowcount
     c.execute('UPDATE subscriptions SET retention_floor=%s WHERE id=%s', (through, row['id']))
     return deleted
+
+
+def retire_subscriptions(store, *, max_subscriptions=16):
+    """ANYM-447: one bounded pass deleting finished hints older than 30 days and, 30 days after closure, a closed,
+    expired or access_changed definition's matches, receipts, outbox rows and consumption; never raises for a
+    single batch.
+
+    Active and paused definitions lose only finished hints, whose per-state counts move to deleted_hint_counts.
+    A closed definition ends as a tombstone whose floor is its matched_through. Held (quarantine-restored)
+    definitions are skipped until the operator's release. Same activation, lock and bounds as
+    prune_subscriptions; `more` says a batch reached its bound, so the worker runs the next pass at once.
+    """
+    from psycopg import errors
+    from .store import bounded
+    bounded(max_subscriptions, 128)
+    stats = {'hints_deleted': 0, 'rows_deleted': 0, 'tombstoned': 0, 'retire_skipped': 0, 'retire_failed': 0,
+        'more': False}
+    try:
+        with store.pool.connection() as c:
+            candidates = c.execute('''SELECT id,principal,true AS closed FROM subscriptions
+                WHERE state IN ('closed','expired','access_changed') AND NOT retention_hold AND tombstoned_at IS NULL
+                    AND closed_at<clock_timestamp()-make_interval(days=>%s)
+                    AND EXISTS(SELECT FROM probe_metadata WHERE name='subscription_retention' AND value='enabled')
+                ORDER BY closed_at,id LIMIT %s''', (CLOSED_RETENTION_DAYS, max_subscriptions)).fetchall()
+            # One probe per definition on the outbox's (subscription,...) unique key.
+            candidates += c.execute('''SELECT s.id,s.principal,false AS closed FROM subscriptions s
+                WHERE s.state IN ('active','paused') AND NOT s.retention_hold
+                    AND EXISTS(SELECT FROM subscription_outbox o WHERE o.subscription=s.id
+                        AND o.state IN ('delivered','cancelled','dead_letter')
+                        AND o.finished_at<clock_timestamp()-make_interval(days=>%s))
+                    AND EXISTS(SELECT FROM probe_metadata WHERE name='subscription_retention' AND value='enabled')
+                ORDER BY s.id LIMIT %s''', (CLOSED_RETENTION_DAYS, max_subscriptions)).fetchall()
+    except errors.UndefinedColumn:
+        return stats  # Schema before 62: the migration precedes this worker, so nothing is deleted meanwhile.
+    for candidate in candidates:
+        try:
+            with store.pool.connection() as c:
+                result = (_retire_definition if candidate['closed'] else _retire_hints)(c, candidate)
+        except Exception as error:
+            # The batch rolled back alone (deletions, floors and counters together); matching continues.
+            from .telemetry import capture
+            capture(error, 'subscription_retention_failed')
+            print(json.dumps({'error': 'subscription_retention_failed', 'class': type(error).__name__}), flush=True)
+            stats['retire_failed'] += 1
+            continue
+        if result is None:
+            stats['retire_skipped'] += 1
+            continue
+        stats['hints_deleted'] += result['hints']
+        stats['rows_deleted'] += result['rows']
+        stats['tombstoned'] += result['tombstoned']
+        stats['more'] = stats['more'] or result['more']
+    return stats
+
+
+def _delete_hints(c, row, limit, *, days=None):
+    """Delete up to limit finished hints (finished more than days ago, if given); their counts the key could see
+    move to deleted_hint_counts in the same transaction. Returns rows deleted."""
+    # No row lock first: the worker role has no UPDATE on the outbox, and finished rows no longer change.
+    ids = [item['id'] for item in c.execute('''SELECT id FROM subscription_outbox WHERE subscription=%s
+        AND state IN ('delivered','cancelled','dead_letter')
+        AND (%s::integer IS NULL OR finished_at<clock_timestamp()-make_interval(days=>%s))
+        ORDER BY finished_at,id LIMIT %s''', (row['id'], days, days, limit)).fetchall()]
+    if not ids:
+        return 0
+    # The view's own filter at deletion time, so hint_counts never drops.
+    counts = _hint_counts(c, row, _worker_identity(c, row) if dynamic(row) else None, ids)
+    deleted = c.execute('''DELETE FROM subscription_outbox WHERE id=ANY(%s)
+        AND state IN ('delivered','cancelled','dead_letter')''', (ids,)).rowcount
+    kept = row['deleted_hint_counts']
+    c.execute('UPDATE subscriptions SET deleted_hint_counts=%s,hints_deleted_at=clock_timestamp() WHERE id=%s',
+        (Jsonb({state: kept.get(state, 0) + counts.get(state, 0) for state in sorted({*kept, *counts})}), row['id']))
+    return deleted
+
+
+def _retire_hints(c, candidate):
+    """One transaction: finished hints older than 30 days of an active or paused definition."""
+    if not _retention_batch(c):
+        return None
+    # The matcher's order: the shared principal lock, then the subscription row.
+    lock_principal(c, candidate['principal'], shared=True)
+    row = c.execute('SELECT * FROM subscriptions WHERE id=%s FOR UPDATE SKIP LOCKED', (candidate['id'],)).fetchone()
+    # Rechecked under the row lock: a hold or a closure since selection wins.
+    if row is None or row['retention_hold'] or row['state'] not in ('active', 'paused'):
+        return None
+    hints = _delete_hints(c, row, RETENTION_BATCH, days=CLOSED_RETENTION_DAYS)
+    return {'hints': hints, 'rows': hints, 'tombstoned': 0, 'more': hints >= RETENTION_BATCH}
+
+
+def _retire_definition(c, candidate):
+    """One transaction of at most RETENTION_BATCH rows of a definition closed more than 30 days ago: matches from
+    the bottom (the floor follows, so a reader in between gets retention_gap), module matches, finished hints;
+    once nothing else is left its receipts and consumption, and the floor becomes matched_through (the tombstone)."""
+    if not _retention_batch(c):
+        return None
+    lock_principal(c, candidate['principal'], shared=True)
+    row = c.execute('''SELECT *,closed_at<clock_timestamp()-make_interval(days=>%s) AS due FROM subscriptions
+        WHERE id=%s FOR UPDATE SKIP LOCKED''', (CLOSED_RETENTION_DAYS, candidate['id'])).fetchone()
+    if (row is None or row['retention_hold'] or not row['due'] or row['tombstoned_at'] is not None or
+            row['state'] not in TERMINAL_STATES):
+        return None
+    budget = RETENTION_BATCH
+    events = [item['event'] for item in c.execute('''DELETE FROM subscription_matches WHERE subscription=%s
+        AND event IN (SELECT event FROM subscription_matches WHERE subscription=%s ORDER BY event LIMIT %s)
+        RETURNING event''', (row['id'], row['id'], budget)).fetchall()]
+    if events:
+        c.execute('UPDATE subscriptions SET retention_floor=greatest(retention_floor,%s) WHERE id=%s',
+            (max(events), row['id']))
+    budget -= len(events)
+    from . import module_events
+    module = module_events.ready(c) and module_events.stream(c, row['id'])
+    if module and budget > 0:
+        # ANYM-562: the module stream's references, with its own floor.
+        seqs = [item['event'] for item in c.execute('''DELETE FROM subscription_module_matches WHERE subscription=%s
+            AND event IN (SELECT event FROM subscription_module_matches WHERE subscription=%s ORDER BY event LIMIT %s)
+            RETURNING event''', (row['id'], row['id'], budget)).fetchall()]
+        if seqs:
+            c.execute('''UPDATE subscription_module_streams SET retention_floor=greatest(retention_floor,%s)
+                WHERE subscription=%s''', (max(seqs), row['id']))
+        budget -= len(seqs)
+    hints = _delete_hints(c, row, budget) if budget > 0 else 0
+    budget -= hints
+    result = {'hints': hints, 'rows': RETENTION_BATCH - budget, 'tombstoned': 0, 'more': budget <= 0}
+    # An unfinished hint waits for the dispatcher, which settles a closed definition's hints first.
+    if budget <= 0 or c.execute('SELECT EXISTS(SELECT FROM subscription_outbox WHERE subscription=%s) AS left',
+            (row['id'],)).fetchone()['left']:
+        return result
+    result['rows'] += c.execute('DELETE FROM subscription_receipts WHERE subscription=%s', (row['id'],)).rowcount
+    result['rows'] += c.execute('DELETE FROM subscription_consumption WHERE subscription=%s', (row['id'],)).rowcount
+    if module:
+        c.execute('''UPDATE subscription_module_streams SET retention_floor=greatest(retention_floor,matched_through)
+            WHERE subscription=%s''', (row['id'],))
+    c.execute('''UPDATE subscriptions SET retention_floor=greatest(retention_floor,matched_through),
+        tombstoned_at=clock_timestamp() WHERE id=%s''', (row['id'],))
+    result['tombstoned'] = 1
+    return result
 
 
 def set_dynamic_subscriptions(store, enabled, *, verify_components=False):

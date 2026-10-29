@@ -235,7 +235,7 @@ def test_concurrent_schema_upgrade_cannot_create_unfenced_lifecycle_capture(back
             self.calls+=1
             if self.calls==1:
                 with store.pool.connection() as c:
-                    c.execute("UPDATE probe_metadata SET value='61' WHERE name='schema_version'")
+                    c.execute("UPDATE probe_metadata SET value='62' WHERE name='schema_version'")
     with pytest.raises(RuntimeError,match='backup_capture_unfenced'):
         create_snapshot(SimpleNamespace(pool=UpgradePool(),files=store.files),tmp_path/'capture',
                         [sys.executable,'-c','print("synthetic dump")'])

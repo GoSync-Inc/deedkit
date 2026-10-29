@@ -147,8 +147,8 @@ def test_large_stream_keeps_original_ciphertext_source_distinct_from_tar_members
     assert hashlib.sha256((tmp_path/'large-restore/files'/digest).read_bytes()).hexdigest()==digest
 
 
-# The id '36-36' is a Tiden case ID; since schema 61 the first unsupported schema is 62.
-@pytest.mark.parametrize('actual,manifest',[('34',31),('31',34),pytest.param('62',62,id='36-36'),('corrupt',34),(None,34)])
+# The id '36-36' is a Tiden case ID; since schema 62 the first unsupported schema is 63.
+@pytest.mark.parametrize('actual,manifest',[('34',31),('31',34),pytest.param('63',63,id='36-36'),('corrupt',34),(None,34)])
 def test_restored_database_schema_must_match_manifest_before_quarantine_or_proof(actual,manifest):
     from messaging_service import backup_restore_worker as worker
     class Lease:

@@ -104,6 +104,7 @@ def assert_quarantined(store, version):
         predicates['messenger_commands'] = "status IN ('queued','dispatching')"
     if version >= 26:predicates['subscriptions'] = "state <> 'closed'"
     if version >= 40:predicates['subscriptions'] += ' OR NOT retention_hold'
+    if version >= 62:predicates['subscriptions'] += ' OR closed_at IS NULL'
     if version >= 29:predicates['file_uploads'] = "state <> 'expired'"
     if version >= 32:
         predicates['subscription_receivers'] = 'enabled'

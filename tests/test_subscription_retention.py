@@ -312,8 +312,10 @@ def test_pruning_runs_as_the_real_worker_role_with_only_the_named_grants(seeded)
         assert stats['pruned'] == 2 and stats['retention_failed'] == 0
         assert refs(store, sid) == events[2:] and floor(store, sid) == events[1]
         forbidden = ('UPDATE subscriptions SET retention_hold=false', 'DELETE FROM subscriptions',
-            'UPDATE subscription_consumption SET acked_through=acked_through', 'DELETE FROM subscription_consumption',
-            'DELETE FROM subscription_receipts', 'DELETE FROM subscription_outbox', 'DELETE FROM events',
+            # Schema 62 (ANYM-447) adds DELETE on consumption, receipts and the outbox for closed definitions.
+            'UPDATE subscription_consumption SET acked_through=acked_through',
+            'SELECT receipt_hash FROM subscription_receipts', 'UPDATE subscription_outbox SET state=state',
+            'DELETE FROM events',
             "UPDATE probe_metadata SET value='enabled' WHERE name='subscription_retention'",
             "DELETE FROM probe_metadata WHERE name='subscription_retention'")
         for statement in forbidden:
@@ -407,7 +409,7 @@ def test_schema38_database_migrates_with_floor_zero_and_quarantine_sets_the_hold
             restored.set_subscription_retention(True)
         restored.migrate()
         with restored.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '61'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '62'
             row = c.execute('SELECT retention_floor,retention_hold FROM subscriptions WHERE id=%s', (sid,)).fetchone()
             assert row == {'retention_floor': 0, 'retention_hold': False}
             assert legacy_matches(c) == references and len(references) == 3
@@ -635,12 +637,13 @@ def test_legacy_snapshot_quarantined_before_migration_is_never_pruned(database, 
             with restored.pool.connection() as c:
                 row = c.execute('SELECT state,retention_floor,retention_hold FROM subscriptions WHERE id=%s',
                     (sid,)).fetchone()
-                assert row == {'state': 'closed', 'retention_floor': 0, 'retention_hold': False}
+                # Schema 62 (ANYM-447) holds the closed definitions of a restore database it migrates.
+                assert row == {'state': 'closed', 'retention_floor': 0, 'retention_hold': True}
                 acked = c.execute('SELECT acked_through FROM subscription_consumption WHERE subscription=%s',
                     (sid,)).fetchone()['acked_through']
             assert acked == events[-1]
             assert prune_subscriptions(restored)['pruned'] == 0
-            assert restored.release_retention_hold(None) == {'released': 0}
+            assert restored.release_retention_hold(None) == {'released': 1}
             assert prune_subscriptions(restored)['pruned'] == 0
             with restored.pool.connection() as c:
                 after, kept = database_manifest(c), legacy_matches(c)

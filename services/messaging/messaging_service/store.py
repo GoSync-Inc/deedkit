@@ -261,7 +261,7 @@ def digest(value: str) -> str:
 
 
 KEY_OPERATION_SCHEMA=44  # api_key_operations (ANYM-495)
-RUNTIME_SCHEMA=61  # the newest schema this runtime knows; migrate() refuses a newer database
+RUNTIME_SCHEMA=62  # the newest schema this runtime knows; migrate() refuses a newer database
 
 
 def revocable_token(value):
@@ -1477,7 +1477,9 @@ class Store:
         if ids is not None and not 1 <= len(ids) <= 1000:
             raise ValueError('invalid_subscription_ids')
         with self.pool.connection() as c:
-            released = c.execute('''UPDATE subscriptions SET retention_hold=false
+            # ANYM-447: from schema 62 a closed definition's 30 days count from its release.
+            closure = ',closed_at=clock_timestamp()' if schema_version(c) >= 62 else ''
+            released = c.execute('''UPDATE subscriptions SET retention_hold=false''' + closure + '''
                 WHERE retention_hold AND (%s::uuid[] IS NULL OR id=ANY(%s::uuid[])) RETURNING id''',
                 (ids, ids)).fetchall()
         return {'released': len(released)}
@@ -1507,7 +1509,7 @@ class Store:
             c.execute(Path(__file__).with_name('schema.sql').read_text())
             version=int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
             if version>RUNTIME_SCHEMA: raise RuntimeError('database_newer_than_runtime')
-            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql'),(43,'043_person_links.sql'),(44,'044_key_operation_id.sql'),(45,'045_message_purge.sql'),(46,'046_chat_roles.sql'),(47,'047_contact_search.sql'),(48,'048_dispatcher_heartbeat.sql'),(49,'049_delivery_endpoints.sql'),(50,'050_component_heartbeats.sql'),(51,'051_send_intents.sql'),(52,'052_host_admission_index.sql'),(53,'053_person_preferences.sql'),(54,'054_conflict_classes.sql'),(55,'055_failure_events.sql'),(56,'056_module_events.sql'),(57,'057_conflict_reevaluation.sql'),(58,'058_module_router.sql'),(59,'059_endpoint_refusal_indexes.sql'),(60,'060_dynamic_subscription_sources.sql'),(61,'061_delivery_attempts.sql')]:
+            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql'),(43,'043_person_links.sql'),(44,'044_key_operation_id.sql'),(45,'045_message_purge.sql'),(46,'046_chat_roles.sql'),(47,'047_contact_search.sql'),(48,'048_dispatcher_heartbeat.sql'),(49,'049_delivery_endpoints.sql'),(50,'050_component_heartbeats.sql'),(51,'051_send_intents.sql'),(52,'052_host_admission_index.sql'),(53,'053_person_preferences.sql'),(54,'054_conflict_classes.sql'),(55,'055_failure_events.sql'),(56,'056_module_events.sql'),(57,'057_conflict_reevaluation.sql'),(58,'058_module_router.sql'),(59,'059_endpoint_refusal_indexes.sql'),(60,'060_dynamic_subscription_sources.sql'),(61,'061_delivery_attempts.sql'),(62,'062_subscription_tombstones.sql')]:
                 migration=Path(__file__).with_name('migrations')/name
                 sha=hashlib.sha256(migration.read_bytes()).hexdigest()
                 if version<target:
