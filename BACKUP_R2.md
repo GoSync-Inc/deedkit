@@ -177,10 +177,10 @@ maintenance from `SSH_ORIGINAL_COMMAND`; stdin cannot choose a control/proof pat
 Only the configured module invocation is run. Inspect the actual key restrictions
 and file ownership before changing the existing upload route.
 
-The producer keeps its existing host/user/key/known-hosts transfer configuration
-and uses `delivery_mode: "stream_v2"`; this backend does not accept `staged_v1`.
-The calendar runner's staged bundle (ANYM-607) reaches it over the same v2 wire (BACKUP.md, Family
-calendar), not as `staged_v1`.
+The producer keeps its existing host/user/key/known-hosts transfer configuration.
+Messaging uses `delivery_mode: "stream_v2"`; this backend does not accept the `staged_v1` wire.
+The calendar runner keeps `delivery_mode: "staged_v1"` in its `runner.json` (its only mode) and sends
+its staged bundle over the same v2 wire (ANYM-607; BACKUP.md, Family calendar).
 No R2 key or endpoint is added to the producer. Do not switch an in-flight job
 without reconciling its journal and exact prior destination: retrying a stale
 capture is not taking a fresh pre-migration snapshot.
