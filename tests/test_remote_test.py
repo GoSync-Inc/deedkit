@@ -217,8 +217,8 @@ def runner_pid(home):
 
 
 def recorded(home, pid):
-    """Whether a run has recorded this step yet. The runner records a step just after starting it, so a SIGKILL
-    in between leaves it unrecorded: that window is a follow-up of ANYM-638, and the SIGKILL tests wait it out."""
+    """Whether a run has recorded this step. A step records itself before it runs anything, so this holds once
+    the step has logged; test_a_runner_killed_the_moment_a_step_starts_leaves_no_step_behind kills without it."""
     runs = worker_dir(home) / 'runs'
     return runs.exists() and any(f'group {pid} ' in (run / 'owned').read_text()
                                  for run in runs.iterdir() if (run / 'owned').exists())
@@ -429,6 +429,18 @@ def test_a_suite_that_ignores_term_is_killed_once_the_stop_bound_passes(mini, wo
     wait_for(lambda: not list((worker_dir(home) / 'runs').iterdir()), 30)
     assert log_lines(home, 'postgres stopped by QUIT')
     assert load_rows(home)[-1][-1] == {'TERM': '143', 'KILL': 'killed'}[signal_name]
+
+
+# spec: ANYM-638
+def test_a_runner_killed_the_moment_a_step_starts_leaves_no_step_behind(mini, worktree):
+    home, env = mini
+    process = background(env, worktree, 'root', 'tests/test_app.py', FAKE_UV_SLEEP='120', FAKE_UV_IGNORE_TERM='1')
+    wait_for(lambda: log_lines(home, 'uv run pytest'), 60)
+    # No wait for the record: the step wrote it before it started.
+    os.kill(runner_pid(home), signal.SIGKILL)
+    process.communicate(timeout=60)
+    wait_for(lambda: not alive(pid_of(log_lines(home, 'uv run pytest')[0])), 30)
+    wait_for(lambda: not list((worker_dir(home) / 'runs').iterdir()), 30)
 
 
 # spec: ANYM-638

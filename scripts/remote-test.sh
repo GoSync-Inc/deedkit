@@ -367,13 +367,23 @@ stop_leftovers() {
   return "$kept"
 }
 
+# First thing in a step's own subshell: the step records itself (kind: group or postgres), then goes on only
+# while the runner ($$) lives. A runner SIGKILLed the moment after starting a step so never leaves the step
+# unrecorded: the record is written before the check, and the watchdog reads it only once the runner is gone.
+own_self() {
+  local pid
+  pid="$(exec sh -c 'echo $PPID')"
+  own "$1" "$pid"
+  kill -0 $$ 2>/dev/null || exit 143
+}
+
 # Run a command as a background job (its own process group under set -m, so a stop reaches all of it) and
 # wait for it; a trapped signal interrupts the wait at once.
 run() {
-  "$@" &
+  ( own_self group
+    if [ "$(type -t "$1")" = function ]; then "$@"; else exec "$@"; fi ) &
   local pid=$!
   CHILDREN="$CHILDREN $pid"
-  own group "$pid"
   wait "$pid"
   CHILDREN="${CHILDREN% $pid}"
 }
@@ -397,11 +407,11 @@ pg_start() {
   rm -f "$data/pw"
   port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
   # TCP only: a Unix socket under the run directory can pass macOS's 104-byte socket path limit.
-  "$PG_BIN/postgres" -D "$data/cluster" -c listen_addresses=127.0.0.1 -p "$port" -c unix_socket_directories= \
-    -c shared_buffers=128MB -c fsync=off -c synchronous_commit=off -c full_page_writes=off > "$data/log" 2>&1 &
+  ( own_self postgres
+    exec "$PG_BIN/postgres" -D "$data/cluster" -c listen_addresses=127.0.0.1 -p "$port" -c unix_socket_directories= \
+      -c shared_buffers=128MB -c fsync=off -c synchronous_commit=off -c full_page_writes=off ) > "$data/log" 2>&1 &
   pid=$!
   DATABASES="$DATABASES $pid"
-  own postgres "$pid"
   for i in $(seq 1 60); do
     if "$PG_BIN/pg_isready" -q -h 127.0.0.1 -p "$port"; then break; fi
     if [ "$i" = 60 ]; then say "postgres $name did not become ready"; cat "$data/log" >&2; return 1; fi
@@ -490,11 +500,11 @@ suite_root() {
     write_dsn "$RUN_DIR/test-$shard.dsn"
   done
   for shard in $(seq 1 "$PARALLEL"); do
-    (env DEEDKIT_TEST_SHARD="$shard/$PARALLEL" PROBE_TEST_DSN_FILE="$RUN_DIR/test-$shard.dsn" uv run python \
+    (own_self group
+      env DEEDKIT_TEST_SHARD="$shard/$PARALLEL" PROBE_TEST_DSN_FILE="$RUN_DIR/test-$shard.dsn" uv run python \
       scripts/python_shards.py pytest --tb=short "${ignores[@]}" tests 2>&1 | prefix "[$shard/$PARALLEL] ") &
     pid=$!
     pids="$pids $pid"
-    own group "$pid"
   done
   CHILDREN="$CHILDREN $pids"
   for pid in $pids; do
