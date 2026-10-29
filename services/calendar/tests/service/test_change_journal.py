@@ -27,7 +27,8 @@ DATA = {
     "calendar.event.changed": {"calendar_ref", "event_ref", "start_at", "version", "changed"},
     "calendar.event.cancelled": {"calendar_ref", "event_ref", "start_at"},
 }
-ICAL_HREF = "https://caldav.example.test/calendars/home/weekly.ics"
+HOME = "https://p01-caldav.icloud.com/1/calendars/home/"
+ICAL_HREF = HOME + "weekly.ics"
 
 
 def event(id, start, end, **extra):
@@ -96,6 +97,16 @@ def test_details_change_is_semantic_not_etag(household):
     assert read(s, [dict(LESSON, etag='"2"')]) == []
     [entry] = read(s, [dict(LESSON, etag='"3"', location="Pool 2")])
     assert entry["changed"] == ["details"]
+
+
+# spec: ANYM-565
+def test_a_change_outside_the_contract_time_range_is_stored_but_not_journaled(household):
+    s = household
+    old = ("1969-12-01T00:00:00Z", "1969-12-08T00:00:00Z")
+    read(s, [], window=old)
+    assert read(s, [event("archive", "1969-12-02T08:00:00Z", "1969-12-02T09:00:00Z")], window=old) == []
+    assert s.one("SELECT count(*) AS n FROM event_states WHERE event_ref=%s", (ref("archive"),))["n"] == 1
+    assert rows(s) == []
 
 
 # spec: ANYM-565
@@ -175,9 +186,9 @@ def test_overlapping_and_shrinking_windows_and_failed_reads_never_cancel(househo
     assert s.one("SELECT count(*) AS n FROM event_states WHERE cancelled_at IS NULL")["n"] == 2
 
 
-def ical(*extra):
+def ical(*extra, rule="FREQ=WEEKLY;COUNT=3"):
     lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "BEGIN:VEVENT", "UID:weekly", "DTSTART:20261103T080000Z",
-             "DTEND:20261103T090000Z", "RRULE:FREQ=WEEKLY;COUNT=3", "SUMMARY:Lesson", *extra[:1], "END:VEVENT",
+             "DTEND:20261103T090000Z", "RRULE:" + rule, "SUMMARY:Lesson", *extra[:1], "END:VEVENT",
              *extra[1:], "END:VCALENDAR"]
     return {"href": ICAL_HREF, "etag": '"1"', "data": ("\r\n".join(line for line in lines if line) + "\r\n").encode()}
 
@@ -190,7 +201,7 @@ def icloud_read(s, resources, window=("2026-11-02T00:00:00Z", "2026-11-23T00:00:
 
 def icloud(s):
     s.connection("icloud-a", "adult-a", "icloud")
-    s.calendar("cal-i", "icloud-a", "home", "Home", "UTC", "write")
+    s.calendar("cal-i", "icloud-a", HOME, "Home", "UTC", "write")
     return s
 
 
@@ -200,6 +211,9 @@ def test_caldav_instance_gone_from_a_complete_reread_is_cancelled_and_an_overrid
     icloud_read(s, [ical()])
     states = {r["original_start"]: r["event_ref"] for r in s.query("SELECT * FROM event_states")}
     assert len(states) == 3
+    # A rule that stops early (or a range override that moves the rest) is no evidence of a cancellation.
+    assert icloud_read(s, [ical(rule="FREQ=WEEKLY;COUNT=1")]) == []
+    assert icloud_read(s, [ical()]) == []
     # EXDATE drops the second week; an override moves the third out of the window: one cancellation only.
     override = "\r\n".join(["BEGIN:VEVENT", "UID:weekly", "RECURRENCE-ID:20261117T080000Z",
                             "DTSTART:20261201T080000Z", "DTEND:20261201T090000Z", "SUMMARY:Lesson", "END:VEVENT"])
@@ -214,6 +228,48 @@ def test_caldav_instance_gone_from_a_complete_reread_is_cancelled_and_an_overrid
         states[t] for t in ("2026-11-03T08:00:00+00:00", "2026-11-17T08:00:00+00:00"))
 
 
+def single(uid, start):
+    data = "\r\n".join(["BEGIN:VCALENDAR", "VERSION:2.0", "BEGIN:VEVENT", "UID:" + uid, "DTSTART:" + start,
+                         "DURATION:PT1H", "SUMMARY:Visit", "END:VEVENT", "END:VCALENDAR", ""])
+    return {"href": HOME + uid + ".ics", "etag": '"1"', "data": data.encode()}
+
+
+class Probe:
+    """CalDAV GET of a lost resource: 404 (None) for the deleted ones, the resource for the moved ones."""
+
+    def __init__(self, deleted):
+        self.deleted, self.reads = deleted, []
+
+    async def read(self, href):
+        self.reads.append(href)
+        return None if href in self.deleted else {"href": href, "data": b"", "etag": '"2"'}
+
+
+# spec: ANYM-565
+def test_caldav_probes_rotate_so_a_deleted_resource_behind_a_moved_one_is_found(household, monkeypatch):
+    from family_calendar.service import providers as providers_module
+
+    s = icloud(household)
+    # Never probed yet, the resources are read in resource_ref order: the moved one first.
+    moved, deleted = sorted((single("visit-1", "20261104T080000Z"), single("visit-2", "20261105T080000Z")),
+                            key=lambda r: source_ref("res", "cal-i", r["href"]))
+    icloud_read(s, [moved, deleted])
+    monkeypatch.setattr(providers_module, "GONE_PROBES", 1)
+    providers = Providers(s, None)
+    providers.adapters["icloud-a"] = probe = Probe({deleted["href"]})
+    cal = {"provider": "icloud", "connection_id": "icloud-a", "target": HOME, "ref": "cal-i"}
+    window = ("2026-11-02T00:00:00Z", "2026-11-23T00:00:00Z")
+    uid = deleted["href"].rsplit("/", 1)[1].removesuffix(".ics")
+    for expected in ([], [source_ref("event", source_ref("res", "cal-i", deleted["href"]), uid, "master")]):
+        with s.transaction() as c:
+            lost = journal.missing(c, "cal-i", *window, set())
+        keys, probed = asyncio.run(providers.gone(cal, lost))
+        entries = icloud_read(s, [], changes={"cancelled": keys, "probed": probed})
+        assert [e["event_ref"] for e in entries] == expected
+    # The moved resource was read first; the next refresh read the one behind it.
+    assert probe.reads == [moved["href"], deleted["href"]]
+
+
 # spec: ANYM-565
 def test_origin_names_the_deedkit_principal_that_wrote_the_resource(household):
     s = household
@@ -222,8 +278,10 @@ def test_origin_names_the_deedkit_principal_that_wrote_the_resource(household):
     read(s, [LESSON, DENTIST])
     s.query("INSERT INTO plans(id,principal_id,payload,scope_hash,expires_at) VALUES "
             "('plan-1','agent-a','{}','x',now()+interval '1 hour')")
-    s.query("INSERT INTO operations(id,principal_id,plan_id,request_id,state) VALUES "
-            "('op-1','agent-a','plan-1','r-1','verified')")
+    # Queued before the read that saw the old state, finished (audit) after it: the write is DeedKit's.
+    s.query("INSERT INTO operations(id,principal_id,plan_id,request_id,state,created_at) VALUES "
+            "('op-1','agent-a','plan-1','r-1','verified',now()-interval '1 hour')")
+    s.query("INSERT INTO audit(principal_id,action,ref,outcome) VALUES ('agent-a','operation','op-1','verified')")
     s.query("INSERT INTO operation_steps(operation_id,ordinal,state,intent) VALUES ('op-1',0,'verified',%s)",
             (Jsonb({"resource_ref": source_ref("res", "cal-a", "lesson"), "action": "update"}),))
     entries = read(s, [dict(LESSON, summary="Moved by agent"), dict(DENTIST, summary="Moved by hand")])
@@ -236,11 +294,14 @@ def test_google_incremental_sync_cancels_and_its_token_is_stored(household):
     s = household
     read(s, [LESSON, DENTIST], changes={"sync_token": "t1"})
     assert s.one("SELECT sync_token FROM journal_calendars")["sync_token"] == "t1"
-    # The dentist moved out of the window (absent) and the incremental sync reports it cancelled.
+    # A read of the next week learns from the incremental sync that the dentist (stored in this week) is cancelled:
+    # journaled, and its occurrence leaves the projection, while its snapshot stays.
     changes = {"cancelled": google_cancelled("cal-a", {"id": "dentist", "status": "cancelled"}), "sync_token": "t2"}
-    [entry] = read(s, [LESSON], changes=changes)
+    [entry] = read(s, [], window=LATER, changes=changes)
     assert (entry["type"], entry["event_ref"]) == ("cancelled", ref("dentist"))
     assert s.one("SELECT sync_token FROM journal_calendars")["sync_token"] == "t2"
+    assert s.one("SELECT count(*) AS n FROM occurrences WHERE ref=%s", (ref("dentist"),))["n"] == 0
+    assert s.one("SELECT cancelled_at FROM event_states WHERE event_ref=%s", (ref("dentist"),))["cancelled_at"]
 
 
 class SyncAdapter:
@@ -251,9 +312,11 @@ class SyncAdapter:
         self.calls.append((token, start))
         if token == "expired":
             return None
+        if token == "too-many":
+            raise CalendarError("coverage_incomplete")
         if token:
-            return [{"id": "dentist", "status": "cancelled"}, {"id": "lesson", "status": "confirmed"}], "t2"
-        return [], "t1"
+            return [{"id": "dentist", "status": "cancelled"}], "t2"
+        return [{"id": "party", "status": "cancelled"}], "t1"
 
 
 # spec: ANYM-565
@@ -264,10 +327,34 @@ def test_providers_use_the_sync_token_and_resync_after_410():
     start = datetime(2026, 11, 2, tzinfo=timezone.utc)
     got = asyncio.run(providers.sync_changes(cal, "t1", start))
     assert got == {"cancelled": google_cancelled("cal-a", {"id": "dentist", "status": "cancelled"}), "sync_token": "t2"}
-    # 410: the token is gone; a full resync takes a new token and claims nothing.
-    assert asyncio.run(providers.sync_changes(cal, "expired", start)) == {"cancelled": [], "sync_token": "t1"}
+    # 410 or past the item cap: a full resync from the earliest tracked event claims its cancelled items, then
+    # its token replaces the old one.
+    resync = {"cancelled": google_cancelled("cal-a", {"id": "party", "status": "cancelled"}), "sync_token": "t1"}
+    assert asyncio.run(providers.sync_changes(cal, "expired", start)) == resync
     assert adapter.calls[-2:] == [("expired", None), (None, start.isoformat())]
+    assert asyncio.run(providers.sync_changes(cal, "too-many", start)) == resync
     assert asyncio.run(providers.sync_changes(dict(cal, provider="icloud"), "t1", start)) == {}
+
+
+class SlowSync:
+    async def sync_changes(self, cal, token, since):
+        await asyncio.sleep(5)
+
+
+# spec: ANYM-565
+def test_a_slow_provider_sync_keeps_the_token_and_never_holds_the_worker(household, monkeypatch):
+    from family_calendar.service import worker as worker_module
+
+    s = household
+    read(s, [LESSON], changes={"sync_token": "t1"})
+    monkeypatch.setattr(worker_module, "SUPPLEMENT_S", 0.05)
+    cal = {"provider": "google", "connection_id": "google-a", "target": "private-a", "ref": "cal-a"}
+    started = asyncio.run(asyncio.wait_for(worker_module.Worker(s, SlowSync())._journal_changes(
+        cal, datetime(2026, 11, 2, tzinfo=timezone.utc)), 2))
+    # No changes and no token change: the window is still published, and the next refresh reads from t1 again.
+    assert started == {}
+    read(s, [LESSON], changes=started)
+    assert s.one("SELECT sync_token FROM journal_calendars")["sync_token"] == "t1"
 
 
 # spec: ANYM-565
@@ -292,8 +379,9 @@ def test_google_adapter_sync_requests_no_time_bounds_with_a_token_and_reads_410(
                     await adapter.changes("private-a", start="2026-11-02T00:00:00+00:00"))
 
     incremental, expired, initial = asyncio.run(run())
-    assert incremental == ([{"id": "a", "status": "cancelled"}, {"id": "b", "status": "confirmed"}], "t2")
-    assert expired is None and initial == ([], "t2")
+    # Only cancelled items are kept, in the incremental and in the full sync.
+    assert incremental == ([{"id": "a", "status": "cancelled"}], "t2")
+    assert expired is None and initial == ([{"id": "a", "status": "cancelled"}], "t2")
     assert all("timeMin" not in p and "timeMax" not in p for p in seen if "syncToken" in p)
     assert seen[-1]["timeMin"] == "2026-11-02T00:00:00+00:00" and "syncToken" not in seen[-1]
     # Only the fields that name an item and its status: no title, place or description is read.

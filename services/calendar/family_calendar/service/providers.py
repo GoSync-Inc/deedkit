@@ -217,7 +217,17 @@ def normalize_icloud(calendar_ref, resource, start, end, zone, budget=None):
             if len(occurrences) > budget["occurrences"]:
                 raise CalendarError("coverage_incomplete")
         budget["occurrences"] -= len(occurrences)
-        normalized = {
+        if recurring:
+            # An EXDATE is the provider's own removal of one occurrence (ANYM-565); a rule that just stops producing
+            # an occurrence, or a range override that moves it, is no evidence.
+            for e in cal.walk("VEVENT"):
+                excluded = e.get("EXDATE", [])
+                for group in excluded if isinstance(excluded, list) else [excluded]:
+                    cancelled.extend(
+                        ["instance", series_ref(calendar_ref, resource["href"]), value.dt.isoformat()]
+                        for value in group.dts
+                    )
+        return {
             "resource_ref": resource_ref,
             "target": resource["href"],
             "etag": resource["etag"],
@@ -225,12 +235,6 @@ def normalize_icloud(calendar_ref, resource, start, end, zone, budget=None):
             "occurrences": occurrences,
             "cancelled": cancelled,
         }
-        if recurring:
-            # The whole resource was read: an occurrence it no longer has, and no override moved, is gone (ANYM-565).
-            normalized["overrides"] = [
-                e["RECURRENCE-ID"].dt.isoformat() for e in cal.walk("VEVENT") if "RECURRENCE-ID" in e
-            ]
-        return normalized
     except CalendarError:
         raise
     except Exception:
@@ -417,33 +421,41 @@ class Providers:
             }
         return rows
 
-    async def sync_changes(self, cal, token, start):
+    async def sync_changes(self, cal, token, since):
         """Google's incremental sync for the journal (ANYM-565 criterion 4): {"cancelled": keys, "sync_token": next}
-        since `token`; without one, or after a 410, the initial sync's token and no keys (a full resync: the window
-        read is the full state). Other providers: {} (their window diff uses each resource's etag and data)."""
+        since `token`. Without one, after a 410 or past the item cap: a full resync from `since` (the earliest
+        tracked event), whose cancelled items are claimed too before its token replaces the old one. Other
+        providers: {} (their window diff uses each resource's etag and data)."""
         if cal["provider"] != "google":
             return {}
         adapter = await self.adapter(cal)
+        result = None
         if token:
-            result = await adapter.changes(cal["target"], token=token)
-            if result is not None:
-                items, following = result
-                return {"cancelled": [k for e in items for k in google_cancelled(cal["ref"], e)],
-                        "sync_token": following}
-        _, following = await adapter.changes(cal["target"], start=start.isoformat())
-        return {"cancelled": [], "sync_token": following}
+            try:
+                result = await adapter.changes(cal["target"], token=token)
+            except CalendarError as error:
+                if error.code != "coverage_incomplete":
+                    raise
+        if result is None:
+            result = await adapter.changes(cal["target"], start=since.isoformat())
+        items, following = result
+        return {"cancelled": [k for e in items for k in google_cancelled(cal["ref"], e)], "sync_token": following}
 
     async def gone(self, cal, resources):
-        """CalDAV: the resources [(resource_ref, target)] a GET reads back as deleted (404), as cancellation keys;
-        at most GONE_PROBES per read. A resource still there moved out of the window: no key (ANYM-565)."""
+        """CalDAV: of the resources [(resource_ref, target)] a window read lost, the first GONE_PROBES read back:
+        (cancellation keys of those that are deleted (404), the resource_refs probed). A resource still there moved
+        out of the window: no key (ANYM-565)."""
         if cal["provider"] != "icloud":
-            return []
+            return [], []
         adapter = await self.adapter(cal)
-        keys = []
+        keys, probed = [], []
         for resource_ref, target in resources[:GONE_PROBES]:
-            if within_collection(target, cal["target"]) and await adapter.read(target) is None:
+            if not within_collection(target, cal["target"]):
+                continue
+            if await adapter.read(target) is None:
                 keys.append(["resource", resource_ref])
-        return keys
+            probed.append(resource_ref)
+        return keys, probed
 
     async def read(self, cal, target):
         adapter = await self.adapter(cal)

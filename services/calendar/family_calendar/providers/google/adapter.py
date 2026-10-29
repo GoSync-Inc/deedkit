@@ -89,9 +89,9 @@ class GoogleAdapter:
         )
 
     async def changes(self, calendar, token=None, start=None):
-        """Google incremental sync (ANYM-565): (items changed since `token`, the next sync token), or None when
-        Google no longer knows the token (410). Without a token, the initial sync from `start`, whose items only
-        yield the first token. Only the fields that name an item and its status are read."""
+        """Google incremental sync (ANYM-565): (the cancelled items since `token`, the next sync token), or None when
+        Google no longer knows the token (410). Without a token, the full sync from `start` (its cancelled items and
+        the first token). Only the fields that name an item and its status are read; other items are not kept."""
         params = {"singleEvents": "false", "showDeleted": "true", "maxResults": 2500,
                   "fields": "items(id,status,recurringEventId,originalStartTime),nextPageToken,nextSyncToken"}
         params.update({"syncToken": token} if token else {"timeMin": start})
@@ -101,10 +101,9 @@ class GoogleAdapter:
             page = await self.request("GET", path, params=params, missing=bool(token))
             if page is None:
                 return None
-            if token:
-                items.extend(page.get("items", []))
-                if len(items) > 5000:
-                    raise CalendarError("coverage_incomplete")
+            items.extend(e for e in page.get("items", []) if isinstance(e, dict) and e.get("status") == "cancelled")
+            if len(items) > 5000:
+                raise CalendarError("coverage_incomplete")
             cursor = page.get("nextPageToken")
             if not cursor:
                 return items, page.get("nextSyncToken")

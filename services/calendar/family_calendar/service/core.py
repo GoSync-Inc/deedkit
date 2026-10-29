@@ -582,6 +582,9 @@ class FamilyService:
         }
         if cancelled:
             result["cancelled"] = sorted(cancelled, key=lambda x: (x["start"], x["event_ref"]))[:500]
+            if len(cancelled) > 500:
+                # More than the response holds: a narrower window lists the rest.
+                result["cancelled_incomplete"] = True
         return result
 
     def _cancelled(self, calendar_ref, a, b):

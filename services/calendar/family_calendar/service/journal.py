@@ -6,7 +6,7 @@ A key names what a provider marked cancelled: ("resource", resource_ref) a whole
 ("series", series_ref) every occurrence of a series, ("instance", series_ref, original_start) one occurrence.
 """
 
-from datetime import date, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 
 from psycopg.types.json import Jsonb
@@ -22,6 +22,8 @@ FIELDS = ("start", "end", "details")
 SENT = ("sending", "verified", "unknown", "needs_attention")
 SOURCE = "deedkit:calendar"
 MAX_SEQ = 2**53 - 1
+EARLIEST = datetime(1970, 1, 1, tzinfo=timezone.utc)
+LATEST = datetime(9999, 12, 30, tzinfo=timezone.utc)
 MAX_LIMIT = 200
 SCAN_ROWS = 200
 PAGE_BYTES = 240 * 1024
@@ -81,35 +83,30 @@ def key(k):
     return (k[0], k[1], original_key(k[2])) if k[0] == "instance" else tuple(k)
 
 
+def deliverable(value):
+    """A start_at the ANYM-562 contract accepts (1970-01-01 to 9999-12-30, module_events.py); a change of an event
+    outside it is stored in the baseline but not journaled."""
+    return EARLIEST <= value <= LATEST
+
+
 def cancelled_by(state, keys):
     return (("resource", state["resource_ref"]) in keys or ("series", state["series_ref"]) in keys
             or ("instance", state["series_ref"], state["original_start"]) in keys)
 
 
-def vanished(state, read, a, b):
-    """A recurring resource re-read in full no longer has this occurrence, unmoved inside the window, nor an
-    override (RECURRENCE-ID) for it anywhere: the occurrence is gone, not moved (criterion 3). CalDAV only: a
-    Google resource is one event or one instance, so its absence says nothing."""
-    resource = read.get(state["resource_ref"])
-    if resource is None or "overrides" not in resource or not state["series_ref"] or not state["original_start"]:
-        return False
-    if state["original_start"] in {original_key(o) for o in resource["overrides"]}:
-        return False
-    if "T" in state["original_start"] and instant(state["original_start"]) != state["start_at"]:
-        return False
-    return a <= state["start_at"] and state["end_at"] <= b
-
-
 def origins(c, refs):
-    """{resource_ref: [(created_at, principal_id)]} of operations that sent a step to one of these resources."""
+    """{resource_ref: [(finished_at, principal_id)]} of operations that sent a step to one of these resources.
+    The time is when the worker finished the operation (its audit row), after the provider write; the enqueue time
+    would put a write queued before a read but sent after it behind that read."""
     found = {}
     if refs:
         for row in c.execute(
-            "SELECT s.intent->>'resource_ref' AS ref,o.principal_id,o.created_at FROM operation_steps s "
-            "JOIN operations o ON o.id=s.operation_id WHERE s.intent->>'resource_ref'=ANY(%s) AND s.state=ANY(%s)",
+            "SELECT s.intent->>'resource_ref' AS ref,o.principal_id,max(a.at) AS at FROM operation_steps s "
+            "JOIN operations o ON o.id=s.operation_id JOIN audit a ON a.action='operation' AND a.ref=o.id "
+            "WHERE s.intent->>'resource_ref'=ANY(%s) AND s.state=ANY(%s) GROUP BY 1,2",
             (sorted(refs), list(SENT)),
         ):
-            found.setdefault(row["ref"], []).append((row["created_at"], row["principal_id"]))
+            found.setdefault(row["ref"], []).append((row["at"], row["principal_id"]))
     return found
 
 
@@ -160,7 +157,6 @@ def record(c, calendar_ref, start, end, resources, changes=None):
     changes = changes or {}
     a, b = instant(start), instant(end)
     new = observed(resources)
-    read = {r["resource_ref"]: r for r in resources}
     keys = {key(k) for r in resources for k in r.get("cancelled", ())} | {key(k) for k in changes.get("cancelled", ())}
     # Locks in one order everywhere: the calendar's row, then the journal head (in write()).
     c.execute("INSERT INTO journal_head(id) VALUES (1) ON CONFLICT(id) DO NOTHING")
@@ -177,6 +173,10 @@ def record(c, calendar_ref, start, end, resources, changes=None):
         c.execute("UPDATE journal_calendars SET sync_token=%s WHERE calendar_ref=%s",
                   (changes["sync_token"], calendar_ref))
     c.execute("UPDATE journal_calendars SET refreshed_at=%s WHERE calendar_ref=%s", (now, calendar_ref))
+    if changes.get("probed"):
+        # Probed resources go to the back of the next refresh's probe order (providers.GONE_PROBES).
+        c.execute("UPDATE event_states SET probed_at=%s WHERE calendar_ref=%s AND resource_ref=ANY(%s)",
+                  (now, calendar_ref, sorted(changes["probed"])))
     series = sorted({k[1] for k in keys if k[0] in ("series", "instance") and k[1]})
     gone = sorted({k[1] for k in keys if k[0] == "resource"})
     old = {
@@ -199,15 +199,16 @@ def record(c, calendar_ref, start, end, resources, changes=None):
             changed = differences(before, state)
             version, kind = before["version"] + bool(changed), "changed" if changed else None
         save(c, state, now, version)
-        if kind and not seeding:
+        if kind and not seeding and deliverable(state["start_at"]):
             found.append((kind, state, version, changed, before["seen_at"] if before else calendar["seeded_at"]))
     for ref, before in old.items():
-        if ref in new or before["cancelled_at"] is not None:
+        if ref in new or before["cancelled_at"] is not None or not cancelled_by(before, keys):
             continue
-        if cancelled_by(before, keys) or vanished(before, read, a, b):
-            save(c, dict(before), now, before["version"], cancelled=True)
-            if not seeding:
-                found.append(("cancelled", before, before["version"], [], before["seen_at"]))
+        save(c, dict(before), now, before["version"], cancelled=True)
+        # A cancellation proven outside this window leaves no live occurrence anywhere (the snapshot stays).
+        c.execute("DELETE FROM occurrences WHERE calendar_ref=%s AND ref=%s", (calendar_ref, ref))
+        if not seeding and deliverable(before["start_at"]):
+            found.append(("cancelled", before, before["version"], [], before["seen_at"]))
     c.execute("DELETE FROM event_states WHERE calendar_ref=%s AND cancelled_at<%s", (calendar_ref, now - RETENTION))
     writes = origins(c, {s.get(k) for _, s, *_ in found for k in ("resource_ref", "master_ref")} - {None})
     entries, series_entries = [], {}
@@ -230,6 +231,13 @@ def record(c, calendar_ref, start, end, resources, changes=None):
     return entries
 
 
+def tracked_since(c, calendar_ref, start):
+    """Where a full Google resync starts: the earliest live tracked event of the calendar, or `start`."""
+    row = c.execute("SELECT min(start_at) AS t FROM event_states WHERE calendar_ref=%s AND cancelled_at IS NULL",
+                    (calendar_ref,)).fetchone()
+    return min(row["t"], instant(start)) if row["t"] else instant(start)
+
+
 def sync_token(c, calendar_ref):
     """The calendar's stored Google sync token, or None (no baseline yet, or none since a 410)."""
     row = c.execute("SELECT sync_token FROM journal_calendars WHERE calendar_ref=%s", (calendar_ref,)).fetchone()
@@ -238,11 +246,12 @@ def sync_token(c, calendar_ref):
 
 def missing(c, calendar_ref, start, end, read):
     """[(resource_ref, target)] of live stored events overlapping [start, end) whose resource a complete read of
-    that window did not return: deleted, or moved out of the window."""
+    that window did not return (deleted, or moved out of the window), least recently probed first."""
     return [(r["resource_ref"], r["target"]) for r in c.execute(
-        "SELECT DISTINCT s.resource_ref,r.target FROM event_states s JOIN resources r ON r.ref=s.resource_ref "
+        "SELECT s.resource_ref,r.target FROM event_states s JOIN resources r ON r.ref=s.resource_ref "
         "WHERE s.calendar_ref=%s AND s.cancelled_at IS NULL AND s.start_at<%s AND s.end_at>%s "
-        "AND NOT s.resource_ref=ANY(%s) ORDER BY s.resource_ref",
+        "AND NOT s.resource_ref=ANY(%s) GROUP BY s.resource_ref,r.target "
+        "ORDER BY max(s.probed_at) NULLS FIRST,s.resource_ref",
         (calendar_ref, instant(end), instant(start), sorted(read)),
     )]
 

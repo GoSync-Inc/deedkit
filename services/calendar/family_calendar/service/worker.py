@@ -11,6 +11,9 @@ from .store import instant
 # Step states whose intent was durably admitted to send: only their own failure may undo a link change.
 ADMITTED = ("sending", "unknown", "needs_attention")
 AMBIGUOUS = {"unknown_result", "write_unknown", "provider_unavailable"}
+# The journal's reads besides the window (Google sync, CalDAV probes) take at most this long each per refresh, so a
+# slow provider never holds the singleton worker away from queued operations (ANYM-565).
+SUPPLEMENT_S = 15
 
 
 class Worker:
@@ -389,24 +392,28 @@ class Worker:
 
     async def _journal_changes(self, cal, start):
         """What the journal learns besides the window (ANYM-565): Google's incremental sync, read before the window
-        so a change between the two is in both. Never fails the read: an error drops the token for a resync."""
+        so a change between the two is in both. Bounded by SUPPLEMENT_S and never fails the read: on an error or
+        the time limit the stored token stays, and the next refresh reads the same changes again."""
         try:
             with self.store.transaction() as c:
                 if not journal.ready(c):
                     return None
                 token = journal.sync_token(c, cal["ref"])
-            return await self.providers.sync_changes(cal, token, start)
+                since = journal.tracked_since(c, cal["ref"], start)
+            return await asyncio.wait_for(self.providers.sync_changes(cal, token, since), SUPPLEMENT_S)
         except Exception:
-            return {"sync_token": None}
+            return {}
 
     async def _gone(self, cal, start, end, resources, changes):
-        """CalDAV resources a window read lost, read back: a 404 is a deletion; one still there moved (no event)."""
+        """CalDAV resources a window read lost, read back within SUPPLEMENT_S: a 404 is a deletion; one still there
+        moved (no event). Probed resources go to the back of the next refresh's order."""
         if changes is None or cal["provider"] != "icloud":
             return changes
         try:
             with self.store.transaction() as c:
                 lost = journal.missing(c, cal["ref"], start, end, {r["resource_ref"] for r in resources})
-            return dict(changes, cancelled=list(changes.get("cancelled", [])) + await self.providers.gone(cal, lost))
+            keys, probed = await asyncio.wait_for(self.providers.gone(cal, lost), SUPPLEMENT_S)
+            return dict(changes, cancelled=list(changes.get("cancelled", [])) + keys, probed=probed)
         except Exception:
             # An unexplained absence journals nothing (criterion 3); the window itself is still published.
             return changes
