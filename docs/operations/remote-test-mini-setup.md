@@ -211,7 +211,7 @@ rm -f $R $L; echo undo-ok'
   A new extension in a migration needs its files linked the same way.
 - `/Users/Shared/deedkit-ci` (the admin account, 755): the `stage/<worker>` copies and `caps.conf`, the run caps
   (`MAX_RUNS PARALLEL MIN_FREE_GB MIN_FREE_MEM_GB WAIT_SECONDS POLL_SECONDS BUSY_CHECK MAX_LOAD NICE
-  STOP_SECONDS`,
+  STOP_SECONDS RUN_SECONDS`,
   defaults in the script).
 - `~_deedkitci/deedkit-ci`: the workers' run copies, `load.log` (`scripts/remote-test.sh --load`) and the
   slot locks.
