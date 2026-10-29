@@ -112,32 +112,34 @@ def test_roles_sql_grants_exactly_the_written_matrix(schema_one, roles):  # noqa
     assert not any(obj == "synthetic" or obj == "principal_operations" for _, obj, _ in matrix(s))
 
 
-<<<<<<< HEAD
 # spec: ANYM-614
 def test_the_real_roles_ask_for_and_answer_a_series_read(schema_one, roles):  # noqa: F811 (fixtures)
     """Under roles.sql's narrow grants (worker: UPDATE of the answer's columns only) the gateway asks for a read and
     the worker takes it and writes its answer."""
     import asyncio
     from family_calendar.service.worker import Worker
-=======
-# spec: ANYM-565
-def test_change_journal_grants_let_the_worker_write_and_the_gateway_read_it(schema_one, roles):  # noqa: F811 (fixtures)
-    from family_calendar.service.core import EVENTS, FamilyService
-    from family_calendar.service.providers import normalize_google
->>>>>>> 19daf502 (feat(calendar): change journal of created, changed and cancelled events with GET /v1/events (ANYM-565, calendar schema 8))
 
     apply_roles, connect = roles
     s = schema_one
     s.migrate()
     apply_roles()
-<<<<<<< HEAD
     gateway, worker = connect("gateway"), connect("worker")
     gateway.query("INSERT INTO series_reads(id,principal_id,calendar_ref,target) VALUES ('read-1','p','cal','t')")
     assert asyncio.run(Worker(worker, None).read_series_one()) is True
     # No such principal: the read is refused, and the refusal is the worker's own written answer.
     assert gateway.one("SELECT state,error FROM series_reads WHERE id='read-1'") == {
         "state": "failed", "error": "not_found_or_forbidden"}
-=======
+
+
+# spec: ANYM-565
+def test_change_journal_grants_let_the_worker_write_and_the_gateway_read_it(schema_one, roles):  # noqa: F811 (fixtures)
+    from family_calendar.service.core import EVENTS, FamilyService
+    from family_calendar.service.providers import normalize_google
+
+    apply_roles, connect = roles
+    s = schema_one
+    s.migrate()
+    apply_roles()
     assert check(s) == (store_module.MIGRATIONS[-1][0], [])
     tables = ("change_journal", "journal_head", "event_states", "journal_calendars")
     assert {e for e in matrix(s) if e[1] in tables} == (
@@ -161,7 +163,6 @@ def test_change_journal_grants_let_the_worker_write_and_the_gateway_read_it(sche
     key = s.agent("router", "family", "adult-a", [EVENTS], ["cal-a"])
     page = FamilyService(gateway).events_page(key, 0, 100)
     assert [e["type"] for e in page["events"]] == ["calendar.event.changed"]
->>>>>>> 19daf502 (feat(calendar): change journal of created, changed and cancelled events with GET /v1/events (ANYM-565, calendar schema 8))
 
 
 # spec: ANYM-601
@@ -268,7 +269,7 @@ def test_db_roles_check_is_clean_after_db_roles_and_writes_nothing(fcs_home):
     run(["migrate"], home)
     run(["db-roles"], home)
     before = snapshot(home, dsn)
-    assert run(["db-roles", "--check"], home) == {"db_roles_check": "ok", "schema_version": 7}
+    assert run(["db-roles", "--check"], home) == {"db_roles_check": "ok", "schema_version": 8}
     assert snapshot(home, dsn) == before
 
 
@@ -284,7 +285,7 @@ def test_db_roles_check_names_each_drift_and_writes_nothing(fcs_home, change, li
     with pytest.raises(CalendarError) as caught:
         run(["db-roles", "--check"], home)
     assert caught.value.code == "db_roles_drift"
-    assert caught.value.details == {"schema_version": 7, "drift": lines}
+    assert caught.value.details == {"schema_version": 8, "drift": lines}
     assert snapshot(home, dsn) == before
 
 
