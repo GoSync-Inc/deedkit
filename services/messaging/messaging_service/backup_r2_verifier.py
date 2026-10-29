@@ -44,6 +44,9 @@ HOST_LOCK = 'host.lock'
 ADMISSION = 'admission.json'
 PINS_SWITCH = 'pins-switch.json'
 PINS_PREVIOUS = 'pins-previous.json'
+# The receiver update follow (ANYM-597) moves the shared code with the pins: from before the pins move
+# until the code link follows them, no instance verifies (the pins and the code may differ).
+CODE_SWITCH = 'code-switch.json'
 VERIFY_WAIT_SECONDS = 3600
 # A new run that meets an upload's receiver lock retries it (ANYM-632): every BUSY_POLL_SECONDS
 # for at most `busy_wait_seconds` (verifier config, 0..BUSY_WAIT_MAX), then ends `busy`.
@@ -377,6 +380,14 @@ def recover_pins(host,paths=None):
         raise ValueError('pins_switch_unresolved')
     undo_pins(host,journal)
     return [Path(p) for p in olds]
+
+
+def code_switch_pending(config):
+    """Whether a follow's code switch is unfinished: its next run (or revert) finishes it first."""
+    with host_directory(config) as host:
+        try:os.stat(CODE_SWITCH,dir_fd=host,follow_symlinks=False)
+        except FileNotFoundError:return False
+    return True
 
 
 def finish_pin_switch(config):
@@ -824,6 +835,7 @@ def run(config,*,client=None,engine=None,path=None):
         # A pin step stopped between two config writes (ANYM-609): every config back on its old pair first.
         try:recovered=finish_pin_switch(config);pins_error=None
         except Exception as error:recovered=None;pins_error=error
+        if pins_error is None and code_switch_pending(config):pins_error=RuntimeError('verifier_code_unfinished')
         path=path if path is not None else recovered
         if path is not None:
             # The receiver update follow (ANYM-597) rewrites the pins under this lock: a
@@ -944,7 +956,7 @@ def failure_code(error):
           'uploader_lock_initialization_required','uncommitted_cloud_object','receiver_quota','protected_backup_missing',
           'invalid_verifier_journal','private_root_file_required','restore_docker_failed','restore_postgres_unavailable',
           'isolated_restore_failed','stored_backup_corrupt','protected_backup_corrupt','verifier_host_busy','verifier_cleanup_unconfirmed',
-          'verifier_pins_unfinished','invalid_verifier_lock','verification_pending','instances_invalid','pins_switch_unresolved','storage_unavailable','unexpected_restore_image_volume','unexpected_restore_helper_layout',
+          'verifier_pins_unfinished','verifier_code_unfinished','invalid_verifier_lock','verification_pending','instances_invalid','pins_switch_unresolved','storage_unavailable','unexpected_restore_image_volume','unexpected_restore_helper_layout',
           *CALENDAR_FAILURES}
     return str(error) if str(error) in safe else 'independent_restore_failed'
 

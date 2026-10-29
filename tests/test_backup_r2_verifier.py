@@ -1074,12 +1074,19 @@ def released(follower,tmp_path):
     root.chmod(0o755);(root/'releases').chmod(0o755)
     fake_release(root,OLD_CODE);(root/'venv').symlink_to('releases/'+OLD_CODE)
     s.root=root;s.extracted=[];s.code_tested=[];s.image_lock=RECEIVER_LOCK;s.image_link=False;s.staged_failure=None
+    s.receiver_state=Path(s.receiver['state_directory'])
+    host_code=tmp_path/'host-code';host_code.mkdir();(host_code/'__init__.py').write_bytes(b'HOST\n')
+    (host_code/'__init__.py').chmod(0o600)
+    host_lock=tmp_path/'host-lock';host_lock.write_text(RECEIVER_LOCK)
     def extract(image,run,paths):
+        # As `docker cp` copies a link: the link itself, never its target.
         s.extracted.append(image);assert set(paths)=={f.IMAGE_PACKAGE,f.IMAGE_LOCK}
-        package=paths[f.IMAGE_PACKAGE];package.mkdir();(package/'__init__.py').write_bytes(b'HEAD_SYNTHETIC_CODE\n')
-        (package/'__init__.py').chmod(0o666)
-        if s.image_link:os.symlink('/etc/passwd',package/'linked.py')
-        if s.image_lock is not None:paths[f.IMAGE_LOCK].write_text(s.image_lock)
+        package=paths[f.IMAGE_PACKAGE]
+        if s.image_link=='linked_package':os.symlink(host_code,package)
+        else:package.mkdir();(package/'__init__.py').write_bytes(b'HEAD_SYNTHETIC_CODE\n');(package/'__init__.py').chmod(0o666)
+        if s.image_link is True:os.symlink('/etc/passwd',package/'linked.py')
+        if s.image_link=='linked_lock':os.symlink(host_lock,paths[f.IMAGE_LOCK])
+        elif s.image_lock is not None:paths[f.IMAGE_LOCK].write_text(s.image_lock)
     s.docker.extract=extract
     class Code(f.Code):
         def tester(self,name):
@@ -1104,7 +1111,10 @@ def test_follow_stages_the_heads_verifier_code_from_its_attested_image_and_moves
     # The image's package on the linked release's dependencies; the wheel's own packages and record are gone.
     assert (packages/'messaging_service'/'__init__.py').read_bytes()==b'HEAD_SYNTHETIC_CODE\n'
     assert (packages/'messaging_service'/'__init__.py').stat().st_mode&0o777==0o644
-    assert sorted(p.name for p in packages.iterdir())==['boto3-1.43.114.dist-info','messaging_service','six-1.17.0.dist-info']
+    assert sorted(p.name for p in packages.iterdir())==['boto3-1.43.114.dist-info','deedkit-release.pth','messaging_service',
+                                                        'six-1.17.0.dist-info']
+    assert (packages/'deedkit-release.pth').read_text().startswith('import os, sys; sys.path[:] = [os.path.realpath(p)')
+    assert not (Path(s.config['host_directory'])/s.v.CODE_SWITCH).exists()
     assert s.extracted==[NEW_IMAGE] and s.releases()==sorted([OLD_CODE,HEAD])
     # The installed pair proven by the running code, the head's pair by its own staged code.
     assert s.tested==[OLD_CODE,HEAD] and s.code_tested==[(HEAD,'messaging')]
@@ -1115,18 +1125,69 @@ def test_follow_stages_the_heads_verifier_code_from_its_attested_image_and_moves
 
 # spec: ANYM-597
 @pytest.mark.parametrize('case,code',[('other_dependency','verifier_dependencies_changed'),('no_lock','verifier_dependencies_changed'),
-                                      ('linked_file','verifier_code_invalid'),('self_test','staged_self_test_failed')])
+                                      ('linked_file','verifier_code_invalid'),('linked_package','verifier_code_invalid'),
+                                      ('linked_lock','verifier_dependencies_changed'),('marker_pin','verifier_dependencies_changed'),
+                                      ('self_test','staged_self_test_failed')])
 def test_follow_keeps_the_code_and_the_pins_when_the_heads_release_is_unproven(released,case,code):
     s=released;before=s.path.read_bytes()
     if case=='other_dependency':s.image_lock=RECEIVER_LOCK.replace('boto3==1.43.114','boto3==1.44.0')
     elif case=='no_lock':s.image_lock=None
     elif case=='linked_file':s.image_link=True
+    elif case in ('linked_package','linked_lock'):s.image_link=case
+    elif case=='marker_pin':s.image_lock=RECEIVER_LOCK+'urllib3==2.8.0 ; python_version >= "3.9"\n'
     else:s.staged_failure=RuntimeError('staged_self_test_failed')
     with pytest.raises(Exception,match=code):s.run()
     assert s.path.read_bytes()==before and s.link()=='releases/'+OLD_CODE and s.releases()==[OLD_CODE]
+    # A linked package never reaches host code: no chmod or import through it.
+    host=s.root.parent/'host-code'/'__init__.py';assert host.read_bytes()==b'HOST\n' and host.stat().st_mode&0o777==0o600
     assert s.docker.removed==[NEW_IMAGE] and not (s.directory/'follow-previous.json').exists()
     assert follow_status(s)['error']==code and follow_status(s)['status']=='refused'
     assert s.published()['helper_revision']==OLD_CODE and s.record('follow-current.json')['code']==OLD_CODE
+
+
+# spec: ANYM-597
+def test_follow_moves_the_code_when_only_the_code_lags_main_after_a_pin_step(released):
+    s=released;s.images[NEW_IMAGE]=s.served
+    s.write_json(s.path,{**s.config,'helper_image':NEW_IMAGE,'helper_revision':HEAD})
+    result=s.run()
+    assert result['status']=='switched' and s.link()=='releases/'+HEAD and s.extracted==[NEW_IMAGE]
+    assert (s.v.load_config(s.path)['helper_image'],s.v.load_config(s.path)['helper_revision'])==(NEW_IMAGE,HEAD)
+    assert s.code_tested==[(HEAD,'messaging')] and s.record('follow-current.json')['code']==HEAD
+
+
+# spec: ANYM-597
+def test_follow_moves_the_code_link_only_while_no_receive_session_runs(released):
+    s=released
+    with r2.state_lock(s.receiver):
+        with pytest.raises(RuntimeError,match='receiver_busy'):s.run()
+    # The pins moved, the link waits with its journal and the verifiers' marker.
+    assert s.v.load_config(s.path)['helper_revision']==HEAD and s.link()=='releases/'+OLD_CODE
+    assert follow_status(s)['status']=='waiting' and (Path(s.config['host_directory'])/s.v.CODE_SWITCH).exists()
+    assert s.run()['status']=='current' and s.link()=='releases/'+HEAD
+    assert not (Path(s.config['host_directory'])/s.v.CODE_SWITCH).exists()
+
+
+# spec: ANYM-597
+@pytest.mark.parametrize('text',['boto3==1.43.114\nboto3==1.44.0\n','boto3 @ https://example.invalid/boto3.whl\n',
+                                 '-e git+https://example.invalid/x\n','--index-url https://example.invalid\nsix==1.17.0\n',
+                                 '# only a comment\n'],ids=['twice','url','editable','option','empty'])
+def test_receiver_lock_reading_refuses_anything_but_hashed_pins(text):
+    from messaging_service import backup_r2_follow as f
+    with pytest.raises(ValueError,match='verifier_dependencies_changed'):f.lock_pins(text)
+    root=Path(__file__).resolve().parents[1]
+    assert set(f.lock_pins((root/'services/messaging/requirements-backup-r2.lock').read_text()))=={
+        'boto3','botocore','jmespath','python-dateutil','s3transfer','six','urllib3'}
+
+
+# spec: ANYM-597
+def test_release_dependencies_installed_twice_or_unreadable_refuse_the_release(tmp_path):
+    from messaging_service import backup_r2_follow as f
+    packages=fake_release(tmp_path,'r')/'lib'/'python3.13'/'site-packages'
+    assert f.installed(packages)=={'boto3':'1.43.114','six':'1.17.0'}
+    (packages/'Boto3-1.0.dist-info').mkdir();(packages/'Boto3-1.0.dist-info'/'METADATA').write_text('Name: Boto3\nVersion: 1.0\n')
+    with pytest.raises(ValueError,match='verifier_dependencies_changed'):f.installed(packages)
+    (packages/'Boto3-1.0.dist-info'/'METADATA').unlink()
+    with pytest.raises(ValueError,match='verifier_dependencies_changed'):f.installed(packages)
 
 
 # spec: ANYM-597
@@ -1141,17 +1202,20 @@ def test_follow_never_moves_the_code_to_a_commit_older_than_the_linked_release(r
 # spec: ANYM-597
 def test_follow_crash_between_the_pins_and_the_code_link_moves_the_code_on_recovery(released,monkeypatch):
     s=released;original=s.code.point;calls=[]
-    def crash(name):
+    def crash(name,configs):
         calls.append(name)
         if len(calls)==1:raise OSError('synthetic crash')
-        return original(name)
+        return original(name,configs)
     monkeypatch.setattr(s.code,'point',crash)
     with pytest.raises(OSError):s.run()
     assert s.v.load_config(s.path)['helper_revision']==HEAD and s.link()=='releases/'+OLD_CODE
     assert s.record('follow-switch.json')['to']['code']==HEAD
+    # Old code on the new helper: no verifier starts a run (nor a retry journal) until the follow finishes it.
+    with pytest.raises(RuntimeError,match='verifier_code_unfinished'):s.v.run(s.v.load_config(s.path),client=s.cloud,engine=s.docker)
+    assert not (s.directory/'active.json').exists() and (Path(s.config['host_directory'])/s.v.CODE_SWITCH).exists()
     assert s.run()['status']=='current' and s.link()=='releases/'+HEAD
     assert not (s.directory/'follow-switch.json').exists() and s.record('follow-previous.json')['code']==OLD_CODE
-    assert s.releases()==sorted([OLD_CODE,HEAD])
+    assert s.releases()==sorted([OLD_CODE,HEAD]) and not (Path(s.config['host_directory'])/s.v.CODE_SWITCH).exists()
 
 
 # spec: ANYM-597
@@ -1191,7 +1255,10 @@ def test_code_prune_keeps_the_linked_and_kept_releases_and_removes_stages_by_the
     for name in (HEAD,stale):fake_release(s.root,name)
     (s.root/'releases'/(f.STAGE+run)).mkdir();(s.root/'releases'/'unrelated').mkdir()
     s.docker.resources[('helper',f.code_container(run))]={'run':run}
-    s.code.prune(s.docker,{HEAD,None})
+    # A running upload session defers it: nothing is removed under a reader.
+    with r2.state_lock(s.receiver):s.code.prune(s.docker,{HEAD,None},[s.config])
+    assert s.releases()==sorted([OLD_CODE,HEAD,stale,f.STAGE+run,'unrelated']) and s.docker.resources
+    s.code.prune(s.docker,{HEAD,None},[s.config])
     assert s.releases()==sorted([OLD_CODE,HEAD,'unrelated']) and not s.docker.resources
 
 
@@ -1202,7 +1269,7 @@ def test_code_switch_refuses_an_untrusted_or_unknown_release(released):
         os.unlink(s.root/'venv');(s.root/'venv').symlink_to(target)
         with pytest.raises(ValueError,match='verifier_code_invalid'):s.code.active()
     os.unlink(s.root/'venv');(s.root/'venv').symlink_to('releases/'+OLD_CODE)
-    with pytest.raises(ValueError,match='verifier_code_invalid'):s.code.point('f'*40)
+    with pytest.raises(ValueError,match='verifier_code_invalid'):s.code.point('f'*40,[s.config])
     (s.root/'releases'/OLD_CODE/'pyvenv.cfg').unlink()
     with pytest.raises(ValueError,match='verifier_code_invalid'):s.code.active()
 
@@ -1235,6 +1302,8 @@ def test_staged_code_self_test_runs_isolated_in_its_release_and_returns_only_its
     test=f.Code.tester(s.code,OLD_CODE);config={**s.config,'helper_revision':HEAD}
     assert test(s.docker,config,'5'*32)==([2,50],50)
     argv,kw=seen[0]
+    # The child dies with the follow (PR_SET_PDEATHSIG), so it never outlives the locks and host admission.
+    assert kw['preexec_fn'].__qualname__.startswith('die_with')
     assert argv==[str(s.root/'releases'/OLD_CODE/'bin'/'python'),'-I','-B','-m','messaging_service.backup_r2_follow','self-test']
     request=json.loads(kw['input'])
     assert request['config']==config and request['run']=='5'*32 and 60<=request['seconds']<kw['timeout'] and kw['cwd']=='/'

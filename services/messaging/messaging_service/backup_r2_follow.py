@@ -25,6 +25,8 @@ code by hand: only the pins follow.
 """
 import argparse
 from contextlib import ExitStack, contextmanager
+import ctypes
+import fcntl
 import hashlib
 import importlib
 import json
@@ -33,6 +35,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -77,10 +80,14 @@ IMAGE_PACKAGE = '/app/messaging_service'
 IMAGE_LOCK = '/app/requirements-backup-r2.lock'
 # Free space a staged release needs on the code root: a copy of the venv and the image's package.
 CODE_BYTES = verifier.GIB
+# Run by `site` at every start of a release's interpreter, before any DeedKit import: the process imports
+# from the release `venv` resolved to then, never from one a later switch links (ANYM-597).
+RELEASE_PTH = ('deedkit-release.pth', 'import os, sys; sys.path[:] = [os.path.realpath(p) for p in sys.path]\n')
+LOCK_BYTES = 1024 ** 2
 # What receive and `capabilities` load in a staged release beyond the self-test (the SDK lazily).
 RECEIVER_IMPORTS = ('boto3', 'botocore.config', 'messaging_service.backup_r2_receiver')
 # Answers that only mean "not now": the service exits cleanly and the next tick retries.
-WAITING = {'verifier_busy', 'verifier_host_busy', 'verification_pending', 'helper_unattested', 'attestation_unreachable', 'main_unreachable'}
+WAITING = {'verifier_busy', 'verifier_host_busy', 'verification_pending', 'receiver_busy', 'helper_unattested', 'attestation_unreachable', 'main_unreachable'}
 SAFE = WAITING | {'follow_config_mismatch', 'follow_not_forward', 'helper_attestation_refused',
                   'attest_verifier_unavailable', 'helper_pull_failed', 'helper_schemas_unavailable',
                   'helper_self_test_mismatch', 'helper_self_test_failed', 'publication_directory_foreign',
@@ -278,8 +285,9 @@ def code_container(run):
 
 
 def plain_tree(root):
-    """The image's package as plain code: directories and regular files only (no link, device or
-    set-ID bit), each made root-readable and writable by its owner only."""
+    """The image's package as plain code: the root and everything below it directories and regular
+    files only (no link, device or set-ID bit), made root-readable and writable by their owner only."""
+    if not stat.S_ISDIR(Path(root).lstat().st_mode):raise ValueError('verifier_code_invalid')
     for directory, dirs, files in os.walk(root):
         for name in dirs + files:
             path = Path(directory) / name; info = path.lstat()
@@ -289,25 +297,90 @@ def plain_tree(root):
     Path(root).chmod(0o755)
 
 
+def read_plain(path, limit):
+    """A regular file's bytes, never through a link, at most `limit` bytes."""
+    try:fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:raise ValueError('verifier_dependencies_changed') from None
+    with os.fdopen(fd, 'rb') as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):raise ValueError('verifier_dependencies_changed')
+        data = source.read(limit + 1)
+    if len(data) > limit:raise ValueError('verifier_dependencies_changed')
+    return data
+
+
+def sync_tree(root):
+    """fsync every file and directory below `root`, deepest first, then `root`: a release is durable
+    before anything links to it."""
+    for directory, dirs, files in os.walk(root, topdown=False):
+        for name in files:
+            path = Path(directory) / name
+            if stat.S_ISREG(path.lstat().st_mode):
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                try:os.fsync(fd)
+                finally:os.close(fd)
+        local.fsync_dir(directory)
+
+
+def normalized(name):
+    return re.sub(r'[-_.]+', '-', name).lower()
+
+
 def lock_pins(text):
-    """{normalized name: version} of a hashed pip lock (`name==version \\`)."""
+    """{normalized name: version} of a hashed pip lock. Only `name==version \`, its `--hash=sha256:`
+    lines and comments are read: any other line (a marker, URL, option or editable) or a name
+    pinned twice refuses the lock."""
     pins = {}
     for line in text.splitlines():
-        match = re.match(r'([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;\\]+)', line)
-        if match:pins[re.sub(r'[-_.]+', '-', match[1]).lower()] = match[2]
+        line = line.strip()
+        if not line or line.startswith('#') or re.fullmatch(r'--hash=sha256:[0-9a-f]{64}( \\)?', line):continue
+        match = re.fullmatch(r'([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9][A-Za-z0-9.+!_-]*)( \\)?', line)
+        if not match or normalized(match[1]) in pins:raise ValueError('verifier_dependencies_changed')
+        pins[normalized(match[1])] = match[2]
     if not pins:raise ValueError('verifier_dependencies_changed')
     return pins
 
 
 def installed(packages):
-    """{normalized name: version} of the distributions in a site-packages directory."""
+    """{normalized name: version} of the distributions in a site-packages directory; an unreadable
+    record or a distribution installed twice refuses the release."""
     found = {}
     for entry in Path(packages).glob('*.dist-info'):
         try:headers = (entry / 'METADATA').read_text(errors='replace').split('\n\n', 1)[0].splitlines()
-        except OSError:continue
+        except OSError:raise ValueError('verifier_dependencies_changed') from None
         fields = dict(line.split(': ', 1) for line in headers if ': ' in line)
-        if 'Name' in fields and 'Version' in fields:found[re.sub(r'[-_.]+', '-', fields['Name']).lower()] = fields['Version']
+        if 'Name' not in fields or 'Version' not in fields or normalized(fields['Name']) in found:
+            raise ValueError('verifier_dependencies_changed')
+        found[normalized(fields['Name'])] = fields['Version']
     return found
+
+
+def die_with(parent):
+    """A child's preexec: SIGKILL when the follow dies (Linux PR_SET_PDEATHSIG), so no self-test
+    outlives the locks and host admission its parent holds; a parent already gone ends it at once."""
+    def prepare():
+        if ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL) != 0 or os.getppid() != parent:os._exit(127)
+    return prepare
+
+
+@contextmanager
+def sessions_quiet(configs):
+    """Every listed receiver's upload and cold-copy locks, never waiting (`receiver_busy`): no session
+    runs while the code link moves or a release is removed. Root never creates either lock."""
+    with ExitStack() as stack:
+        for config in configs:
+            state = r2.load_config(config['receiver_config_file'])['state_directory']
+            state_fd = stack.enter_context(local.trusted_directory(state, archive=True))
+            stack.enter_context(r2.shared_lock(state_fd))
+            try:
+                cold = os.open('cold', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=state_fd)
+                stack.callback(os.close, cold)
+                fd = os.open('.cold.lock', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=cold)
+            except FileNotFoundError:continue  # no cold copy ever ran here
+            stack.callback(os.close, fd)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):raise ValueError('invalid_receiver_lock')
+            try:fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:raise RuntimeError('receiver_busy') from None
+        yield
 
 
 class Code:
@@ -361,31 +434,43 @@ class Code:
         engine.extract(image, run, {IMAGE_PACKAGE: packages / 'messaging_service', IMAGE_LOCK: work / 'lock'})
         plain_tree(packages / 'messaging_service')
         have = installed(packages)
-        try:pins = lock_pins((work / 'lock').read_text())
-        except (OSError, UnicodeDecodeError):raise ValueError('verifier_dependencies_changed') from None
+        try:pins = lock_pins(read_plain(work / 'lock', LOCK_BYTES).decode())
+        except UnicodeDecodeError:raise ValueError('verifier_dependencies_changed') from None
         if any(have.get(name) != version for name, version in pins.items()):raise ValueError('verifier_dependencies_changed')
-        # A leftover release of this revision (refused or interrupted earlier) is never the active or a kept one.
+        (packages / RELEASE_PTH[0]).write_text(RELEASE_PTH[1]); (packages / RELEASE_PTH[0]).chmod(0o644)
+        sync_tree(release)
+        # A leftover release of this revision (refused or interrupted earlier) is never linked: no process reads it.
         if target.exists():shutil.rmtree(target)
         os.rename(release, target); shutil.rmtree(work); local.fsync_dir(self.releases)
         return self.trusted(revision)
 
-    def point(self, name):
-        """`venv` to `releases/<name>` in one rename; a hand-installed `venv` directory is never replaced."""
+    def point(self, name, configs):
+        """`venv` to `releases/<name>` in one rename while no receive or cold session of the listed
+        receivers runs (`receiver_busy`: the switch journal stays for the next run); a hand-installed
+        `venv` directory is never replaced."""
         self.trusted(name)
         info = self.link.lstat()
         if not stat.S_ISLNK(info.st_mode):raise ValueError('verifier_code_invalid')
         if os.readlink(self.link) == RELEASES + '/' + name:return
-        temporary = self.root / ('.venv-' + secrets.token_hex(16))
-        os.symlink(RELEASES + '/' + name, temporary)
-        try:os.replace(temporary, self.link)
-        except BaseException:
-            temporary.unlink(missing_ok=True); raise
-        local.fsync_dir(self.root)
+        with sessions_quiet(configs):
+            temporary = self.root / ('.venv-' + secrets.token_hex(16))
+            os.symlink(RELEASES + '/' + name, temporary)
+            try:os.replace(temporary, self.link)
+            except BaseException:
+                temporary.unlink(missing_ok=True); raise
+            local.fsync_dir(self.root)
 
-    def prune(self, engine, keep):
-        """Remove interrupted stages (their exact container first) and every release but the active and kept ones."""
+    def prune(self, engine, keep, configs):
+        """Remove interrupted stages (their exact container first) and every release but the active and
+        kept ones, while no session of the listed receivers runs; a busy receiver defers it to a later run."""
         if not self.releases.is_dir():return
         keep = {name for name in keep if name} | {self.active()}
+        try:
+            with sessions_quiet(configs):self.remove_unkept(engine, keep)
+        except RuntimeError as error:
+            if str(error) != 'receiver_busy':raise
+
+    def remove_unkept(self, engine, keep):
         for name in os.listdir(self.releases):
             path = self.releases / name
             if name.startswith(STAGE) and re.fullmatch('[0-9a-f]{32}', name[len(STAGE):]):
@@ -408,7 +493,8 @@ class Code:
                 # Isolated (-I: no PYTHON* variable, user site or working directory on its path), no bytecode
                 # written into the release; its own failure line goes to the journal (stderr).
                 result = subprocess.run([str(python), '-I', '-B', '-m', 'messaging_service.backup_r2_follow', 'self-test'],
-                                        input=request, stdout=subprocess.PIPE, cwd='/', timeout=remaining)
+                                        input=request, stdout=subprocess.PIPE, cwd='/', timeout=remaining,
+                                        preexec_fn=die_with(os.getpid()))
             except subprocess.TimeoutExpired:raise TimeoutError('restore_deadline') from None
             except OSError:
                 if r2.CANCELLED:raise
@@ -596,30 +682,40 @@ def unlink(fd, name):
     local.fsync_dir(fd)
 
 
-def point_code(code, record):
+def point_code(code, record, configs):
     """The `venv` link to the record's release; a record without one leaves the code as it is."""
-    if 'code' in record:code.point(record['code'])
+    if 'code' in record:code.point(record['code'], configs)
 
 
-def finish_switch(fd, engine, journal, code):
+def code_switch(configs, value=None):
+    """Write (`value`) or clear the host marker that keeps every verifier waiting while the pins and
+    the code link may differ (backup_r2_verifier.CODE_SWITCH)."""
+    with verifier.host_directory(configs[0]) as host:
+        if value is not None:local.write_maintenance_json(verifier.CODE_SWITCH, value, dir_fd=host)
+        else:verifier.unlink_entry(host, verifier.CODE_SWITCH)
+
+
+def finish_switch(fd, engine, journal, code, configs):
     """After the config holds `to`: its code, the kept pair, the installed record, the dropped image and release."""
-    point_code(code, journal['to'])
+    point_code(code, journal['to'], configs); code_switch(configs)
     local.write_maintenance_json(PREVIOUS, journal['from'], dir_fd=fd)
     if journal['to']['helper_schemas'] is None:unlink(fd, CURRENT)
     else:local.write_maintenance_json(CURRENT, journal['to'], dir_fd=fd)
     # The pair before the kept one is no undo any more.
     if journal['drop'] is not None:engine.remove_image(journal['drop'])
     unlink(fd, SWITCH)
-    if 'code' in journal['to']:code.prune(engine, {journal['to']['code'], journal['from'].get('code')})
+    if 'code' in journal['to']:code.prune(engine, {journal['to']['code'], journal['from'].get('code')}, configs)
 
 
-def switch(path, fd, engine, journal, paths, code):
+def switch(path, fd, engine, journal, paths, code, configs):
     """Journal, then every instance's config to `to` (move_pins), then its code and the records:
-    `from` survives every crash, and the code follows the pins on recovery."""
+    `from` survives every crash, and the code follows the pins on recovery. While the code may lag
+    the pins, the host marker keeps every verifier from starting a run."""
     local.write_maintenance_json(SWITCH, journal, dir_fd=fd)
+    if 'code' in journal['to']:code_switch(configs, {'v': 1, 'code': journal['to']['code']})
     with verifier.host_directory(verifier.load_config(path)) as host:
         move_pins(host, paths, journal['to']['helper_image'], journal['to']['helper_revision'])
-    finish_switch(fd, engine, journal, code)
+    finish_switch(fd, engine, journal, code, configs)
     return verifier.load_config(path)
 
 
@@ -670,7 +766,7 @@ def reload_instances(paths, configs):
     return fresh
 
 
-def recover(fd, engine, config, code):
+def recover(fd, engine, config, code, configs):
     """Finish or drop an interrupted switch (its code with its pins), then remove an interrupted candidate's image."""
     _, journal = r2.read_root(fd, SWITCH, missing=True)
     if journal is not None:
@@ -678,9 +774,10 @@ def recover(fd, engine, config, code):
                 not (journal['drop'] is None or (isinstance(journal['drop'], str) and DIGEST.fullmatch(journal['drop'])))):
             raise ValueError('invalid_follow_record')
         valid_record(journal['from']); valid_record(journal['to'])
-        if pinned(journal['to'], config):finish_switch(fd, engine, journal, code)
-        elif pinned(journal['from'], config):point_code(code, journal['from']); unlink(fd, SWITCH)
+        if pinned(journal['to'], config):finish_switch(fd, engine, journal, code, configs)
+        elif pinned(journal['from'], config):point_code(code, journal['from'], configs); code_switch(configs); unlink(fd, SWITCH)
         else:raise ValueError('follow_switch_unresolved')
+    else:code_switch(configs)  # never without a journal: a leftover of a crash in between
     _, candidate = r2.read_root(fd, CANDIDATE, missing=True)
     if candidate is not None:
         if not isinstance(candidate, dict) or set(candidate) != {'v', 'helper_image'} or not DIGEST.fullmatch(str(candidate['helper_image'])):
@@ -833,7 +930,7 @@ def follow(path, *, engine=None, main=None, attest=None, test=None, code=None):
             for held in fds:no_retry_pending(held)
             # A stopped pin step first, then the follow's own switch against the configs as they are now.
             with verifier.host_directory(config) as host:recover_pins(host, paths)
-            config = reload(path, config); recover(fd, engine, config, code)
+            config = reload(path, config); recover(fd, engine, config, code, configs)
             config = reload(path, config); configs = reload_instances(paths, configs)
             profiles = list(dict.fromkeys(r2.profile(c) for c in configs if r2.profile(c) != r2.profile(config)))
             current = read_record(fd, CURRENT); kept = read_record(fd, PREVIOUS)
@@ -841,7 +938,7 @@ def follow(path, *, engine=None, main=None, attest=None, test=None, code=None):
             active = code.active()
             if active is not None:
                 status['code'] = active
-                code.prune(engine, {current and current.get('code'), kept and kept.get('code')})
+                code.prune(engine, {current and current.get('code'), kept and kept.get('code')}, configs)
             if not pinned(current, config) or current.get('code') != active:current = None
             head = main.head(); refusal = untested = unaligned = None
             if any(pair(c) != pair(config) for c in configs):
@@ -862,7 +959,8 @@ def follow(path, *, engine=None, main=None, attest=None, test=None, code=None):
                     if r2.CANCELLED:raise
                     untested = error
                 else:local.write_maintenance_json(CURRENT, current, dir_fd=fd)
-            if head != config['helper_revision']:
+            # A candidate when the pins or the linked code lag main's head (a pin step can move the pins alone).
+            if head != config['helper_revision'] or active not in (None, head):
                 status['candidate'] = head; stage = None
                 keep = {active, kept and kept.get('code')}
                 try:
@@ -879,13 +977,13 @@ def follow(path, *, engine=None, main=None, attest=None, test=None, code=None):
                     refusal = error
                     if stage is not None:
                         # A refused release goes now; one that cannot be removed goes at the next run's start.
-                        try:code.prune(engine, keep)
+                        try:code.prune(engine, keep, configs)
                         except Exception:pass
                 else:
                     drop = kept['helper_image'] if kept and kept['helper_image'] not in (
                         config['helper_image'], record['helper_image']) else None
                     config = switch(path, fd, engine, {'v': 1, 'from': current or unproven(config, active), 'to': record,
-                                                       'drop': drop}, paths, code)
+                                                       'drop': drop}, paths, code, configs)
                     unlink(fd, CANDIDATE); current = record
                     status.update(status='switched', revision=head)
                     if 'code' in record:status['code'] = record['code']
@@ -916,7 +1014,7 @@ def revert(path, *, engine=None, test=None, code=None):
         sweep_self_tests(engine, config['directory'])
         for held in fds:no_retry_pending(held)
         with verifier.host_directory(config) as host:recover_pins(host, paths)
-        config = reload(path, config); recover(fd, engine, config, code); config = reload(path, config)
+        config = reload(path, config); recover(fd, engine, config, code, configs); config = reload(path, config)
         previous = read_record(fd, PREVIOUS)
         if previous is None:raise ValueError('no_previous_pair')
         kept = {**config, 'helper_image': previous['helper_image'], 'helper_revision': previous['helper_revision']}
@@ -928,7 +1026,7 @@ def revert(path, *, engine=None, test=None, code=None):
         current = read_record(fd, CURRENT)
         # Every instance moves back with it: the pins move only together.
         switch(path, fd, engine, {'v': 1, 'from': current if pinned(current, config) and current.get('code') == active
-                                  else unproven(config, active), 'to': previous, 'drop': None}, paths, code)
+                                  else unproven(config, active), 'to': previous, 'drop': None}, paths, code, configs)
         # A pair never proven here is not published until a follow run proves it.
         if previous['helper_schemas'] is not None:publish(path, previous)
         status = {'v': 1, 'status': 'reverted', 'revision': previous['helper_revision'], 'checked_at': verifier.now()}
