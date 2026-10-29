@@ -217,6 +217,9 @@ async def test_rehearsal_call_flows_from_measured_audio_through_guarded_goodbye_
                 assert service.get_call(identity)['status'] == 'active' and llm.end_frame_at is None
 
                 # A fresh goodbye grants permission, but the hangup waits for the farewell to be played.
+                # The answer turn commits at a bot-turn flush (deferred after response start, or at response end
+                # after playback); this fixture keeps its two human turns separate by speaking only after that.
+                await until(lambda: [e for e in events('transcript') if e['role'] == 'user'])
                 track.speak(.5)
                 await until(lambda: len([e for e in events('audio_activity') if e['speaking']]) >= 2)
                 llm.hear(GOODBYE)
