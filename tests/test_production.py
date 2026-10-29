@@ -2364,6 +2364,303 @@ def test_an_unhealthy_release_is_not_rolled_back_after_another_release_became_cu
     rolled_back_refusal(host, "another release was applied or rolled back")
 
 
+def inventory(*versions, changed=()):
+    """A synthetic image schema inventory: schema.sql and the migrations of these numbers, `changed` ones with another
+    checksum."""
+    value = {"schema.sql": hashlib.sha256(b"schema").hexdigest()}
+    for version in versions:
+        name = f"migrations/{version:03d}_synthetic.sql"
+        value[name] = hashlib.sha256((name + ("changed" if version in changed else "")).encode()).hexdigest()
+    return value
+
+
+APPLIED = inventory(*range(1, 61))
+
+
+class PlanB:
+    """Plan B beside a synthetic plan A `Host`: an HTTP configuration file, its state serving one generation, the local
+    source mirror (main is RELEASES in order) and the image inventories local inspection reads. No Docker or git."""
+    GENERATION = "abcdef123456"
+
+    def __init__(self, host, monkeypatch, sha, image, inventories):
+        from scripts import seamless_release as s
+        self.host, self.s, self.inventories, self.reads = host, s, dict(inventories), []
+        self.state, self.file = host.root / "http-state", host.root / "http.json"
+        self.state.mkdir(mode=0o700)
+        (host.root / "global").mkdir(mode=0o700)
+        (host.state / "deploy-source.git").mkdir()
+        self.http = {"version": 1, "state_directory": str(self.state), "projects": host.settings["projects"]}
+        self.file.write_text(json.dumps(self.http))
+        monkeypatch.setattr(s, "GLOBAL_LOCK", host.root / "global")
+        monkeypatch.setattr(s, "validate_settings", lambda value: value)
+        monkeypatch.setattr(p, "config", lambda path: self.http if str(path) == str(self.file) else host.settings)
+        monkeypatch.setattr(p, "HTTP_CONFIG", str(self.file))
+        monkeypatch.setattr(p, "run", self.run)
+        self.serve(sha, image)
+
+    def serve(self, sha, image):
+        """Promote's receipts for `sha` serving `image`: the attempt, the release's result and http-current.json."""
+        (self.state / sha).mkdir(exist_ok=True)
+        receipt = {"sha": sha, "generation": self.GENERATION, "status": "serving",
+                   "images": {"runtime": image, "gateway": IMAGE}, "schema": self.inventories.get(image, {}),
+                   "containers": {"api": {"container": "api0", "image": image},
+                                  "gateway": {"container": "gateway0", "image": IMAGE}}}
+        p.write(self.state / sha / "http-attempted.json", {"status": "serving", "sha": sha})
+        p.write(self.state / sha / "http-result.json", receipt)
+        p.write(self.state / "http-current.json", receipt)
+
+    def run(self, argv, **kwargs):
+        if argv[:2] == ["docker", "run"] and self.s.SCHEMA_READER in argv:
+            self.reads.append(argv)
+            image = argv[argv.index("--entrypoint") + 2]
+            if image not in self.inventories:
+                raise p.Refused("docker failed (exit 125)")
+            return json.dumps(self.inventories[image])
+        if argv[0] == "git" and "merge-base" in argv:
+            ancestor, sha = argv[-2:]
+            if ancestor in RELEASES and sha in RELEASES and RELEASES.index(ancestor) <= RELEASES.index(sha):
+                return ""
+            raise p.Refused("git failed (exit 1)")
+        return self.host.run(argv, **kwargs)
+
+    def refused(self, match, sha=RELEASES[1], http=True):
+        """A rollback of `sha` refused before any journal, stop or `up`."""
+        self.host.calls.clear()
+        with pytest.raises(p.Refused, match=match) as refusal:
+            p.rollback(self.host.settings, sha, self.http if http else None)
+        assert self.host.mutations() == [] and not (self.host.state / sha / "rollback-attempted.json").exists()
+        return str(refusal.value)
+
+
+def promoted(tmp_path, monkeypatch, serving, restored=APPLIED):
+    """RELEASES[0] and then RELEASES[1] applied by plan A, and plan B serving RELEASES[1]'s runtime image with the
+    inventory `serving`; RELEASES[0]'s image, the one a rollback restores, has `restored`."""
+    host = Host(tmp_path, monkeypatch)
+    for sha in RELEASES[:2]:
+        host.release(sha)
+    plan = PlanB(host, monkeypatch, RELEASES[1], host.image(RELEASES[1]),
+                 {host.image(RELEASES[1]): serving, host.image(RELEASES[0]): restored})
+    return host, plan
+
+
+# spec: ANYM-642
+@pytest.mark.parametrize("case", ["malformed", "missing", "not serving", "attempt not serving", "unresolved attempt",
+                                  "unpublished attempt", "no mirror", "state without configuration",
+                                  "container image", "result image", "no result", "recorded schema",
+                                  "configured state without configuration", "deploy record without configuration",
+                                  "dangling link without configuration", "dangling sibling without configuration"])
+def test_rollback_refuses_unresolved_or_malformed_http_state(tmp_path, monkeypatch, case):
+    host, plan = promoted(tmp_path, monkeypatch, APPLIED)
+    current = plan.state / "http-current.json"
+    match = {"malformed": "cannot be read: JSONDecodeError", "missing": "plan B's state is unknown",
+             "not serving": "inconsistent: .* names no serving generation", "attempt not serving": "does not serve",
+             "unresolved attempt": "an HTTP release attempt is unresolved: " + RELEASES[2],
+             "unpublished attempt": "an HTTP release attempt serves, but http-current.json does not name it: "
+                                    + RELEASES[2], "no mirror": "publication cannot be checked",
+             "state without configuration": "there is no HTTP configuration, but HTTP state exists",
+             "container image": "records name different runtime images",
+             "result image": "records name different runtime images", "no result": "cannot be read: FileNotFoundError",
+             "recorded schema": "the schema recorded for generation " + PlanB.GENERATION + " is not its runtime",
+             "configured state without configuration": "HTTP state exists: " + str(tmp_path / "sibling"),
+             "deploy record without configuration": "a deploy promoted plan B",
+             "dangling link without configuration": "HTTP state exists: " + str(host.state / "http-current.json"),
+             "dangling sibling without configuration": "HTTP state exists: " + str(p.HOST_STATE / "plan-b")}[case]
+    result = plan.state / RELEASES[1] / "http-result.json"
+    if case == "malformed":
+        current.write_text("not json")
+    elif case == "missing":
+        current.unlink()
+    elif case == "not serving":
+        p.write(current, {**p.read(current), "status": "recovery-required"})
+    elif case == "attempt not serving":
+        p.write(plan.state / RELEASES[1] / "http-attempted.json", {"status": "switching", "sha": RELEASES[1]})
+    elif case in ("unresolved attempt", "unpublished attempt"):
+        (plan.state / RELEASES[2]).mkdir()
+        p.write(plan.state / RELEASES[2] / "http-attempted.json",
+                {"status": "switching" if case == "unresolved attempt" else "serving", "sha": RELEASES[2]})
+    elif case == "no mirror":
+        (host.state / "deploy-source.git").rmdir()
+    elif case == "state without configuration":
+        (host.state / "http").mkdir()
+    elif case == "container image":
+        # The receipt's runtime image names the previous release, its own container record the newer one.
+        p.write(current, {**p.read(current), "images": {"runtime": host.image(RELEASES[0]), "gateway": IMAGE},
+                          "schema": APPLIED})
+    elif case == "result image":
+        p.write(result, {**p.read(result), "images": {"runtime": host.image(RELEASES[0]), "gateway": IMAGE}})
+    elif case == "no result":
+        result.unlink()
+    elif case == "recorded schema":
+        p.write(current, {**p.read(current), "schema": inventory(*range(1, 62))})
+    elif case == "configured state without configuration":
+        # A custom HTTP configuration elsewhere: its state, a sibling of plan A's, is named by an /etc/deedkit config.
+        (tmp_path / "sibling").mkdir()
+        p.write(tmp_path / "sibling" / "http-current.json", p.read(current))
+        p.CONFIG_DIRECTORY.mkdir(parents=True)
+        p.write(p.CONFIG_DIRECTORY / "http-custom.json", {"state_directory": str(tmp_path / "sibling")})
+    elif case == "deploy record without configuration":
+        p.write(host.state / "deploy.json", {"sha": RELEASES[1], "status": "deployed", "http": "serving"})
+    elif case == "dangling link without configuration":
+        # A link whose target is gone is still a marker, never taken for no plan B.
+        (host.state / "http-current.json").symlink_to(tmp_path / "gone" / "http-current.json")
+    else:
+        # So is one in a sibling state under the host state root that holds nothing else.
+        (p.HOST_STATE / "plan-b").mkdir(parents=True)
+        (p.HOST_STATE / "plan-b" / "http-current.json").symlink_to(tmp_path / "gone" / "http-current.json")
+    # The cases without configuration pass none; plan B's own state directory is not under plan A's.
+    plan.refused(match, http="without configuration" not in case)
+    # Refused before any image inventory was read (http-current.json is not trusted), but for the recorded schema,
+    # which only the serving image's inventory contradicts.
+    assert plan.reads == [] or case == "recorded schema"
+
+
+# spec: ANYM-642
+def test_rollback_without_http_configuration_passes(tmp_path, monkeypatch, capsys):
+    host = Host(tmp_path, monkeypatch)
+    for sha in RELEASES[:2]:
+        host.release(sha)
+    monkeypatch.setattr(p, "config", lambda path: host.settings)
+    monkeypatch.setattr(p, "HTTP_CONFIG", str(tmp_path / "absent" / "http-production.json"))
+    host.calls.clear()
+    p.main(["rollback", "--sha", RELEASES[1]])
+    assert json.loads(capsys.readouterr().out)["previous_images"] == {"synthetic": {"api": host.image(RELEASES[0])}}
+    assert host.container["Image"] == host.image(RELEASES[0])
+    from scripts import seamless_release as s
+    assert not any(s.SCHEMA_READER in call for call in host.calls)
+
+
+# spec: ANYM-642
+def test_rollback_holds_http_locks(tmp_path, monkeypatch, capsys):
+    host, plan = promoted(tmp_path, monkeypatch, APPLIED)
+    held = []
+    def run(argv, **kwargs):
+        if argv[:2] == ["docker", "compose"] and "stop" in argv:
+            for directory in (plan.s.GLOBAL_LOCK, plan.state, host.state):
+                with pytest.raises(p.Busy), contextlib.ExitStack() as stack:
+                    stack.enter_context(p.lock(directory))
+                held.append(directory)
+        return plan.run(argv, **kwargs)
+    monkeypatch.setattr(p, "run", run)
+    p.main(["rollback", "--sha", RELEASES[1]])
+    assert json.loads(capsys.readouterr().out)["status"] == "rolled-back"
+    assert held == [plan.s.GLOBAL_LOCK, plan.state, host.state] and plan.reads
+
+
+# spec: ANYM-642
+@pytest.mark.parametrize("outcome", ["equal", "older-serving prefix", "newer-serving", "divergent", "not a prefix",
+                                     "unreadable", "no messaging image"])
+def test_rollback_guard_outcomes(tmp_path, monkeypatch, outcome):
+    serving = {"equal": APPLIED, "older-serving prefix": inventory(*range(1, 60)),
+               "newer-serving": inventory(*range(1, 62)), "divergent": inventory(*range(1, 61), changed={60}),
+               "not a prefix": inventory(*range(1, 60), 61), "unreadable": APPLIED,
+               "no messaging image": inventory(*range(1, 62))}[outcome]
+    host, plan = promoted(tmp_path, monkeypatch, serving)
+    restored = host.image(RELEASES[0])
+    if outcome in ("unreadable", "no messaging image"):
+        del plan.inventories[restored]
+    if outcome == "no messaging image":
+        # A rollback that restores no messaging image (a calls-only plan) never inspects one, even with plan B newer
+        # and its inventory unreadable.
+        plan.inventories.clear()
+        serving = p.serving_generation(host.settings, plan.http)
+        assert p.guard_rollback(serving, [({"name": "voice", "services": {"calls": "calls"}}, None,
+                                           {"calls": restored})]) is None and plan.reads == []
+        return
+    if outcome in ("equal", "older-serving prefix"):
+        result = p.rollback(host.settings, RELEASES[1], plan.http)
+        assert result["previous_images"] == {"synthetic": {"api": restored}} and host.container["Image"] == restored
+    else:
+        message = plan.refused("plan B serves generation " + PlanB.GENERATION + " of " + RELEASES[1])
+        if outcome == "unreadable":
+            assert f"the schema inventory of {restored} cannot be read (docker failed (exit 125))" in message
+            assert "Roll forward instead: `production.py deploy` of a newer green main SHA" in message
+        else:
+            where = f"synthetic/api's restored image {restored}"
+            assert {"newer-serving": f"with migrations {where} lacks: migrations/061_synthetic.sql;",
+                    "divergent": f"inventory {where} diverges from (changed: migrations/060_synthetic.sql; missing: none)",
+                    "not a prefix": f"inventory {where} diverges from (changed: none; missing: migrations/061_synthetic"
+                                    ".sql)"}[outcome] in message
+            assert ("a plan A rollback alone would leave the serving API newer than its workers. Roll forward instead: "
+                    "`production.py deploy` of a newer green main SHA") in message
+        assert host.container["Image"] == host.image(RELEASES[1]) and host.container["State"]["Running"]
+    # Local image inspection of exactly the serving and the restored image: no network, read-only.
+    assert {argv[argv.index("--entrypoint") + 2] for argv in plan.reads} == {host.image(RELEASES[1]), restored}
+    assert all(argv[3:5] == ["--network", "none"] and "--read-only" in argv for argv in plan.reads)
+
+
+# spec: ANYM-642
+def test_rollback_guard_refuses_newer_serving(tmp_path, monkeypatch, capsys):
+    host, plan = promoted(tmp_path, monkeypatch, inventory(*range(1, 62)))
+    host.calls.clear()
+    with pytest.raises(SystemExit):
+        p.main(["rollback", "--sha", RELEASES[1]])
+    error = capsys.readouterr().err
+    assert "promotion refused: plan B serves generation " + PlanB.GENERATION in error
+    assert "migrations/061_synthetic.sql" in error and "production.py deploy" in error
+    assert host.mutations() == [] and not (host.state / RELEASES[1] / "rollback-attempted.json").exists()
+    assert host.container["Image"] == host.image(RELEASES[1])
+
+
+# spec: ANYM-642
+@pytest.mark.parametrize("serving", ["equal", "older"])
+def test_unhealthy_apply_rollback_passes_guard(tmp_path, monkeypatch, serving):
+    host = Host(tmp_path, monkeypatch)
+    unhealthy_apply(host, monkeypatch)
+    # Plan B still serves the base release, or an older generation whose inventory is a prefix of the base's.
+    image = host.image(RELEASES[0]) if serving == "equal" else OLD_IMAGE
+    plan = PlanB(host, monkeypatch, RELEASES[0], image,
+                 {host.image(RELEASES[0]): APPLIED, OLD_IMAGE: inventory(*range(1, 60))})
+    assert p.rollback(host.settings, RELEASES[1], plan.http)["status"] == "rolled-back"
+    assert host.container["Image"] == host.image(RELEASES[0]) and plan.reads
+    # deploy's automatic rollback hands it the HTTP configuration, so the same guard runs there.
+    (tmp_path / "deploy").mkdir()
+    deployer, seen = Deployer(tmp_path / "deploy", monkeypatch), []
+    def failed(sha):
+        p.write(deployer.state / sha / "result.json", {"sha": sha, "status": "unhealthy"})
+        raise p.Refused("a replacement failed its health wait")
+    deployer.fail_apply = failed
+    monkeypatch.setattr(p, "rollback", lambda settings, sha, http=None: seen.append((sha, http)) or {"sha": sha})
+    assert deployer.deploy()["status"] == "rolled-back" and seen == [(NEWEST, deployer.http)]
+
+
+# spec: ANYM-642
+def test_retry_after_guard_refusal(tmp_path, monkeypatch):
+    host, plan = promoted(tmp_path, monkeypatch, inventory(*range(1, 62)))
+    plan.refused("migrations/061_synthetic.sql")
+    # The refusal changed nothing: once plan B serves a generation the restored workers fit, the same rollback runs.
+    plan.inventories[IMAGE] = APPLIED
+    plan.serve(RELEASES[2], IMAGE)
+    assert p.rollback(host.settings, RELEASES[1], plan.http)["status"] == "rolled-back"
+    assert host.container["Image"] == host.image(RELEASES[0])
+
+
+# spec: ANYM-642
+def test_partially_executed_rollback_keeps_refusing(tmp_path, monkeypatch):
+    host, plan = promoted(tmp_path, monkeypatch, inventory(*range(1, 62)))
+    p.write(host.state / RELEASES[1] / "rollback-attempted.json", {"sha": RELEASES[1], "status": "rolling-back"})
+    host.calls.clear()
+    with pytest.raises(p.Refused, match="already rolled back or attempted"):
+        p.rollback(host.settings, RELEASES[1], plan.http)
+    assert host.mutations() == []
+    # A journal removed by hand never bypasses the guard: it runs again on every invocation before any change.
+    (host.state / RELEASES[1] / "rollback-attempted.json").unlink()
+    plan.refused("plan B serves generation .* lacks: migrations/061_synthetic.sql")
+
+
+# spec: ANYM-642
+def test_roll_forward_after_guard_refusal(tmp_path, monkeypatch):
+    host, plan = promoted(tmp_path, monkeypatch, inventory(*range(1, 62)))
+    plan.refused("Roll forward instead")
+    assert (host.state / RELEASES[1] / "attempted.json").exists()
+    # A newer synthetic SHA (a fix or a revert keeping every migration): its own attempt marker, the same schema, and
+    # plan A applies it without the guard.
+    plan.reads.clear()
+    host.release(RELEASES[2])
+    current = p.read(host.state / "current.json")
+    assert current["sha"] == RELEASES[2] and current["status"] == "applied"
+    assert host.container["Image"] == host.image(RELEASES[2]) and plan.reads == []
+
+
 BASE, NEWER, NEWEST = "0" * 40, "1" * 40, "2" * 40
 
 
@@ -2415,7 +2712,7 @@ class Deployer:
 
     def step(self, http, name):
         label = ("seamless " if http else "") + name
-        def call(settings, sha):
+        def call(settings, sha, *rest):
             self.steps.append((label, sha))
             failure = getattr(self, "fail_" + label.replace(" ", "_"), None)
             if label == "prepare":
