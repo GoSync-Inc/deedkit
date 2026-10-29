@@ -316,6 +316,7 @@ def test_the_root_suite_gets_a_postgres_on_localhost_and_a_private_dsn_file(mini
     [postgres] = log_lines(home, 'postgres -D')
     assert '-c listen_addresses=127.0.0.1' in postgres
     assert '-c unix_socket_directories= ' in postgres and ' -k ' not in postgres
+    assert '-c timezone=UTC ' in postgres  # as CI's postgres:18 container, whatever the mini's own zone
     port = postgres.split(' -p ')[1].split()[0]
     [pytest_line] = log_lines(home, 'uv run pytest tests/test_app.py')
     assert 'dsnmode=-rw------- ' in pytest_line

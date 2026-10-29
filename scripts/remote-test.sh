@@ -406,9 +406,11 @@ pg_start() {
     --locale=en_US.UTF-8 >/dev/null
   rm -f "$data/pw"
   port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
-  # TCP only: a Unix socket under the run directory can pass macOS's 104-byte socket path limit.
+  # TCP only: a Unix socket under the run directory can pass macOS's 104-byte socket path limit. UTC, as CI's
+  # postgres:18 container: initdb would take the mini's own zone, and timestamps would render in it.
   ( own_self postgres
     exec "$PG_BIN/postgres" -D "$data/cluster" -c listen_addresses=127.0.0.1 -p "$port" -c unix_socket_directories= \
+      -c timezone=UTC -c log_timezone=UTC \
       -c shared_buffers=128MB -c fsync=off -c synchronous_commit=off -c full_page_writes=off ) > "$data/log" 2>&1 &
   pid=$!
   DATABASES="$DATABASES $pid"
