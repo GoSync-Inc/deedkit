@@ -135,7 +135,8 @@ def validate(data):
     if 'metadata' in data:
         metadata=data['metadata']
         if not isinstance(metadata,dict) or set(metadata)-{'reply_to_provider_id','forwarded','media_kind','mentions_owner','reply_to_owner','sender_is_bot','chat_type','sender_identity_basis','is_service','is_self_chat','sender_is_contact','sender_is_business_or_verified',
-                'message_kind','provider_message_type','timestamp_resolution','media_duration_seconds','forward_origin','contact'}:
+                'message_kind','provider_message_type','timestamp_resolution','media_duration_seconds','forward_origin','contact',
+                'web_preview_id'}:
             raise ValueError('invalid_metadata')
         result['metadata']={}
         for key,value in metadata.items():
@@ -152,6 +153,10 @@ def validate(data):
                 if metadata.get('message_kind')!='contact':raise ValueError('invalid_metadata')
                 value=contact_block(value)
                 if value['status']=='unavailable':continue
+            elif key=='web_preview_id':
+                # Telegram's link preview page ID in its unsigned 64-bit decimal form (ANYM-611).
+                if value is not None and (type(value) is not str or not re.fullmatch(r'[0-9]{1,20}',value)):
+                    raise ValueError('invalid_metadata')
             elif key=='media_duration_seconds':
                 if value is not None and (type(value) not in (int,float) or not 0<=value<=86400 or not math.isfinite(value)):
                     raise ValueError('invalid_metadata')

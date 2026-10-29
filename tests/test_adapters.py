@@ -93,6 +93,60 @@ def test_telegram_webpage_document_metadata_does_not_use_preview_photo():
     assert utils._get_file_info(message.document or message.photo).size==descriptor['bytes']
 
 
+def preview_message(media):
+    from telethon import types
+    return types.Message(id=10,peer_id=types.PeerUser(42),from_id=types.PeerUser(42),
+        date=datetime(2026,10,13,tzinfo=timezone.utc),message='preview',media=media)
+
+
+# spec: ANYM-611
+@pytest.mark.parametrize('page_id,expected',[(20,'20'),(-1,'18446744073709551615'),(2**63-1,'9223372036854775807')],
+    ids=['positive','negative','largest'])
+def test_telegram_web_preview_id_is_captured_only_with_the_flag(monkeypatch,page_id,expected):
+    from telethon import types
+    now=datetime(2026,10,13,tzinfo=timezone.utc)
+    pages=[types.WebPage(id=page_id,url='https://example.invalid',display_url='example.invalid',hash=0),
+        types.WebPagePending(id=page_id,date=now),types.WebPageEmpty(id=page_id)]
+    for page in pages:
+        message=preview_message(types.MessageMediaWebPage(webpage=page))
+        monkeypatch.delenv('ANYMSG_CAPTURE_WEB_PREVIEW_ID',raising=False)
+        assert 'web_preview_id' not in telegram_message('tg-owner',message)['metadata']
+        monkeypatch.setenv('ANYMSG_CAPTURE_WEB_PREVIEW_ID','1')
+        # A signed 64-bit page ID is kept in its unsigned decimal form: one ID, one string.
+        metadata=telegram_message('tg-owner',message)['metadata']
+        assert metadata['web_preview_id']==expected and metadata['provider_message_type']=='webpage'
+
+
+# spec: ANYM-611
+def test_telegram_web_preview_id_is_omitted_without_a_page(monkeypatch):
+    from telethon import types
+    monkeypatch.setenv('ANYMSG_CAPTURE_WEB_PREVIEW_ID','1')
+    photo=types.Photo(id=300,access_hash=0,file_reference=b'ref',date=datetime(2026,10,13,tzinfo=timezone.utc),
+        sizes=[types.PhotoSize(type='x',w=2,h=2,size=4)],dc_id=1)
+    for media in (types.MessageMediaWebPage(webpage=types.WebPageNotModified()),types.MessageMediaPhoto(photo=photo),None):
+        assert 'web_preview_id' not in telegram_message('tg-owner',preview_message(media))['metadata']
+
+
+# spec: ANYM-611
+@pytest.mark.parametrize('value',['0','20','18446744073709551615','0'*20,None])
+def test_envelope_accepts_a_decimal_web_preview_id(value):
+    from messaging_service.envelope import validate
+    e=validate({'account':'tg-owner','platform':'telegram','chat':'42','chat_title':'Fixture','provider_id':'10',
+        'sender':'42','body':'preview','sent_at':'2026-10-13T00:00:00Z','updated_at':'2026-10-13T00:00:00Z',
+        'deleted':False,'direction':'incoming','origin':'fixture','metadata':{'web_preview_id':value}})
+    assert e['metadata']['web_preview_id']==value
+
+
+# spec: ANYM-611
+@pytest.mark.parametrize('value',['','-1','1'*21,'１２','12a',' 12','12\n',12,1.5,True,['12'],{'id':'12'}])
+def test_envelope_rejects_any_other_web_preview_id(value):
+    from messaging_service.envelope import validate
+    with pytest.raises(ValueError,match='^invalid_metadata$'):
+        validate({'account':'tg-owner','platform':'telegram','chat':'42','chat_title':'Fixture','provider_id':'10',
+            'sender':'42','body':'preview','sent_at':'2026-10-13T00:00:00Z','updated_at':'2026-10-13T00:00:00Z',
+            'deleted':False,'direction':'incoming','origin':'fixture','metadata':{'web_preview_id':value}})
+
+
 def test_whatsapp_accounts_mapping_and_delete_time():
     event={'messageId':'true_group_ABC','chatId':'123@g.us','senderId':'456@c.us',
            'body':'caption','fromMe':True,'timestamp':1791000000,'hasMedia':True,
