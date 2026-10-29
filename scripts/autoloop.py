@@ -71,6 +71,7 @@ import fcntl
 import fnmatch
 import getpass
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -1134,7 +1135,7 @@ PROTECTED = re.compile(
     r'(^|/)(sitecustomize|usercustomize)\.py$|\.pth$|(^|/)(pytest\.ini|setup\.cfg|tox\.ini)$|'
     r'(^|/)(AGENTS|CLAUDE)(\.override)?\.md$|^(SUBSCRIPTIONS|SECURITY|TIDEN-CI)\.md$|(^|/)\.(claude|codex)/|'
     r'\.mcp\.json$|migrations/|\.sql$|(^|/)(Dockerfile[^/]*|pyproject\.toml|package\.json|go\.mod|hatch_build\.py|'
-    r'conftest\.py|\.dockerignore|\.gitattributes|uv\.lock|package-lock\.json|go\.sum|'
+    r'conftest\.py|migration_rollout\.py|\.dockerignore|\.gitattributes|uv\.lock|package-lock\.json|go\.sum|'
     r'requirements[^/]*\.(lock|in|txt))$|\.(pyc|so|pyd|dylib)$|(^|/)__pycache__/')
 TEST_DIR = re.compile(r'(^|/)tests?/')
 CODE_FILE = re.compile(r'\.(py|pyi|js|mjs|cjs|ts|tsx|go|sh)$')
@@ -1273,12 +1274,19 @@ def open_files(gh):
 def compare(gh, head):
     """The files of `main...head` (GitHub compare, three dots: what the branch changes), each with its status,
     previous name and patch."""
+    return compare_base(gh, head)[0]
+
+
+def compare_base(gh, head):
+    """`compare`'s files and the merge base's SHA (None when the reply names none)."""
     reply = triage.parse(gh(['api', f'repos/{REPO}/compare/main...{urllib.parse.quote(head, safe="")}']),
                          'gh api compare')
     if not isinstance(reply, dict) or not isinstance(reply.get('files'), list) \
             or any(not isinstance(f, dict) or not isinstance(f.get('filename'), str) for f in reply['files']):
         raise Refused('gh api compare: unexpected reply')
-    return reply['files']
+    found = reply.get('merge_base_commit')
+    base = found.get('sha') if isinstance(found, dict) else None
+    return reply['files'], base if SHA40.fullmatch(str(base)) else None
 
 
 def branch_files(superset, gh):
@@ -1523,10 +1531,88 @@ def reserve_hits(state, name, intent, number, files, others):
     return hits
 
 
-def diff_hits(files):
+# ANYM-590 L1: the SQL a loop PR may carry without the owner. An added migration this checkout's classifier (main's,
+# never the PR's) names `expand` by `unattended_class`, and appended role-file lines `role_class` names `additive`
+# with every GRANT target a table those same migrations create; any other SQL waits for the owner. Each kind:
+# (path, change status, database, the signal word its changed lines may carry: ALTER in a migration, GRANT in roles).
+SQL = re.compile(r'\.sql$|migrations/')
+SQL_KINDS = ((re.compile(r'services/messaging/messaging_service/migrations/[0-9]{3}_[A-Za-z0-9_]+\.sql'), 'added',
+              'messaging', 'ALTER'),
+             (re.compile(r'services/messaging/messaging_service/[A-Za-z0-9_]+_role\.sql'), 'modified', 'messaging',
+              'GRANT'),
+             (re.compile(r'services/calendar/family_calendar/service/schema_v[1-9][0-9]*\.sql'), 'added', 'calendar',
+              'ALTER'),
+             (re.compile(r'services/calendar/family_calendar/service/roles\.sql'), 'modified', 'calendar', 'GRANT'))
+CLASSIFIERS = {'messaging': 'services/messaging/messaging_service/migration_rollout.py',
+               'calendar': 'services/calendar/family_calendar/service/migration_rollout.py'}
+MAX_SQL_BYTES = 1 << 20
+WAITS_MIGRATION, WAITS_GRANT = 'waits for the owner: migration', 'waits for the owner: grant'
+
+
+def classifier(database):
+    """The database's `migration_rollout` module from this checkout (standard library only, no I/O)."""
+    spec = importlib.util.spec_from_file_location(f'autoloop_rollout_{database}', ROOT / CLASSIFIERS[database])
+    if spec is None or spec.loader is None:
+        raise Refused(f'no {database} classifier')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def blob(gh, path, ref):
+    """A file's text at commit `ref`, from GitHub."""
+    return gh(['api', '-H', 'Accept: application/vnd.github.raw',
+               f'repos/{REPO}/contents/{urllib.parse.quote(path)}?ref={ref}'])
+
+
+def sql_hits(files, head, base, text):
+    """(owner hits, {path: its lifted signal word}) for a PR's SQL (ANYM-590 L1). SQL that is only added `expand`
+    migrations and appended role grants on the tables they create is lifted whole; otherwise nothing is lifted and
+    each offending path waits for the owner. `text(path, ref)` reads a file at a commit; `base` is the merge base."""
+    sql = [f for f in files if any(SQL.search(n) for n in (f['filename'], f.get('previous_filename') or ''))]
+    kinds, owner = {}, []
+    for f in sql:
+        kind = next((k for k in SQL_KINDS if k[0].fullmatch(f['filename']) and f.get('status') == k[1]
+                     and not f.get('previous_filename')), None)
+        if kind is None:
+            owner.append((WAITS_MIGRATION, f['filename']))
+        kinds[f['filename']] = kind
+    if owner or not sql:
+        return owner, {}
+
+    def read(path, ref):
+        found = text(path, ref)
+        if not isinstance(found, str) or len(found.encode()) > MAX_SQL_BYTES:
+            owner.append((WAITS_MIGRATION, path))
+            return None
+        return found
+    for database in CLASSIFIERS:
+        mine = [n for n, k in kinds.items() if k[2] == database]
+        if not mine:
+            continue
+        rollout, created = classifier(database), {}
+        # Migrations in version order first (each file's new tables feed the next), then the role files.
+        for name in sorted((n for n in mine if kinds[n][1] == 'added'),
+                           key=lambda n: int(re.findall(r'[0-9]+', n.rsplit('/', 1)[1])[0])):
+            body = read(name, head)
+            if body is not None and rollout.unattended_class(body) != 'expand':
+                owner.append((WAITS_MIGRATION, name))
+            created = rollout.new_tables(body or '', created)
+        for name in sorted(n for n in mine if kinds[n][1] == 'modified'):
+            if not base:
+                raise Refused('gh api compare: no merge base')
+            old, new = read(name, base), read(name, head)
+            # tables=set(): a GRANT target must be a table this change creates, never one that existed before it.
+            if None not in (old, new) and rollout.role_class(old, new, created, tables=set()) != 'additive':
+                owner.append((WAITS_GRANT, name))
+    return (owner, {}) if owner else ([], {n: k[3] for n, k in kinds.items()})
+
+
+def diff_hits(files, lifted=None):
     """(reason, path) for each way a PR's real diff leaves the envelope (review-protocol.md lists; renames and deletions
-    included)."""
-    hits = []
+    included). `lifted` ({path: signal word}, from `sql_hits`) names the SQL files ANYM-590 L1 admits: no path hit for
+    them, and their changed lines hit the text signal only for something besides that word."""
+    lifted, hits = lifted or {}, []
     if len(files) >= MAX_FILES:
         return [('diff too large', None)]
     for f in files:
@@ -1534,8 +1620,9 @@ def diff_hits(files):
         names = [name] + ([old] if isinstance(old, str) else [])
         if status in ('removed', 'renamed'):
             hits.append(('deleted file', old or name))  # `--no-renames`: a rename deletes its old name
-        hits += [('change-path signal', n) for n in names if SIGNAL_PATHS.search(n)]
-        hits += [('protected path', n) for n in names if PROTECTED.search(n)]
+        word = None if isinstance(old, str) else lifted.get(name)
+        hits += [('change-path signal', n) for n in names if SIGNAL_PATHS.search(n) and not word]
+        hits += [('protected path', n) for n in names if PROTECTED.search(n) and not word]
         if status in ('modified', 'changed') and TEST_DIR.search(name):
             hits.append(('changed test file', name))
         if status in ('added', 'copied', 'renamed') and TEST_DIR.search(name) and CODE_FILE.search(name) \
@@ -1545,7 +1632,8 @@ def diff_hits(files):
         if not isinstance(patch, str):
             if f.get('changes', 1) or status in ('added', 'removed'):
                 hits.append(('no patch', name))
-        elif any(SIGNAL_TEXT.search(row) for row in patch.splitlines() if not row.startswith(('+++', '---'))):
+        elif any(SIGNAL_TEXT.search(re.sub(rf'\b{word}\b', '', row, flags=re.I) if word else row)
+                 for row in patch.splitlines() if not row.startswith(('+++', '---'))):
             hits.append(('change-path signal', name))
     return hits
 
@@ -1694,9 +1782,10 @@ def controller(state, cfg, snap, now, gh, prs, review=None):
         try:
             hits = [(why, None) for why in pr_hits(i, pr, snap)]
             if not hits:
-                files = compare(gh, head)
+                files, base = compare_base(gh, head)
                 others = open_files(gh) if others is None else others
-                hits = diff_hits(files) or reserve_hits(state, name, i, pr['number'], files, others)
+                owner, lifted = sql_hits(files, head, base, lambda path, ref: blob(gh, path, ref))
+                hits = owner + diff_hits(files, lifted) or reserve_hits(state, name, i, pr['number'], files, others)
         except (Refused, triage.Refused) as error:
             failed.append(f'{name}: {error}')
             continue
@@ -1805,7 +1894,7 @@ def plain_park(reason):
              'Spec line', 'change path', 'criterion edit', 'diff too large', 'deleted file', 'change-path signal',
              'protected path', 'changed test file', 'test helper', 'no patch', 'no head', 'armed without approval',
              'outside reserved paths', 'path reserved by another', 'review lost', 'review failed',
-             'review round cap', 'review: changes required')
+             'review round cap', 'review: changes required', WAITS_MIGRATION, WAITS_GRANT)
     return reason if reason in fixed or re.fullmatch(r'envelope: [a-zA-Z0-9 ]+', reason) else 'другая причина'
 
 

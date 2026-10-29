@@ -51,8 +51,10 @@ Override: harness tiden.md Card intake step 1 (owner 10-26). A defect, improveme
 idea in feedback from a principal in the autoloop config is written, readied, built, merged by the
 controller and released by autodeploy without the owner's line, inside
 docs/operations/feedback-autoloop.md (≤8 SP, no epic). Feedback is never the owner's words: an
-OWNER-path PR, any item of this section, an opt-in, grant, allowlist or key change, a migration
-and every live action from it wait for the owner, and so does that document's boundary.
+OWNER-path PR, any item of this section, an opt-in, grant, allowlist or key change, a non-additive
+migration (not: a DROP-free expand migration with grants only on the tables and columns that same
+change creates or adds, ANYM-590 L1; "grant" as that document's Owner items define it) and every
+live action from it wait for the owner, and so does that document's boundary.
 
 ## 3. Change paths
 

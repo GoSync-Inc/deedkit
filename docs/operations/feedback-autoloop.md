@@ -45,8 +45,9 @@ Anything else stays in the orchestrator queue; the item's note or the daily repo
 
 Never from feedback; the loop stops at them and the item says "waits for the owner: <what>":
 an OWNER change path; any item of harness process.md section 2 or AGENTS.md section 2; an opt-in,
-grant, allowlist or key change; a migration; a live action (send, call, ACK, pairing, provider
-session); secrets or new credentials; destructive or irreversible data changes; required checks
+grant, allowlist or key change; a non-additive migration (not: a DROP-free expand migration with
+grants only on the tables and columns that same change creates or adds, ANYM-590 L1); a live action
+(send, call, ACK, pairing, provider session); secrets or new credentials; destructive or irreversible data changes; required checks
 or the ruleset; weakening a criterion; accepting a risk; an epic; a change to this document. The
 override covers only choosing, writing and readying a card inside the envelope; every other
 product direction and card move stays the owner's. The loop enables nothing after deploy: a
@@ -55,6 +56,21 @@ that meets any other owner item ends with `large` ("queued: large card"), and th
 raises it with the owner. The
 other notes the agent sees are "queued: large card", "over daily cap", "withdrawn by the
 reporter", "paused" and "answered, no change needed" (ANYM-573).
+
+Additive migrations (owner 2026-10-28, «Да, добавление миграции автоматически с копией.»; the
+copy is autodeploy's pre-migration copy and rehearsal, docs/operations/production.md). The
+controller lets a PR's SQL through only when it is all of: added messaging
+`migrations/NNN_*.sql` or calendar `schema_vN.sql` files that `unattended_class` (this checkout's
+`migration_rollout.py`, never the PR's) names `expand`, and modified messaging `*_role.sql` or
+calendar `roles.sql` files whose appended text `role_class` names `additive` with every GRANT
+target a table those same migrations create (a column-level GRANT counts as a GRANT on its table).
+Any other SQL, a `manual` or headerless migration, a DROP, a REVOKE or other non-additive role
+change, a GRANT to a role the file does not already grant to and any GRANT on a table that existed
+before the change park the PR as "waits for the owner: migration" or "waits for the owner: grant".
+Here "grant" is a principal's grant (gateway profile tools, API key permissions, messenger
+opt-ins) and any SQL GRANT on a table or column that existed before the change; it excludes only a
+SQL GRANT to an existing service role on a table or column the same change's migrations create or
+add. Autodeploy classifies the release again before it migrates.
 
 ## Stop, withdraw, hold
 
