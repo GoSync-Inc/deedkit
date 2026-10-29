@@ -231,6 +231,20 @@ def chat_role(row):
     return {'my_role':row['my_role'],**({'can_post':row['can_post']} if row.get('can_post') is not None else {})}
 
 
+def waiting_summary(facts, head_id):
+    """ANYM-537: the owner's unanswered run on every rendering. Its last message is the row's head, named by the row's
+    own head fields; only another head (an archive row's reaction or service event) adds last_message_id and last_at."""
+    from .owner_waits import CHECK_DELIVERY
+    result={'since':facts['since'],'count':facts['count']}
+    if facts.get('receipt') not in (None,'unknown'):result['receipt']=facts['receipt']
+    # The run's last message may not have reached the peer; absent means await_peer.
+    if facts.get('receipt') in CHECK_DELIVERY:result['suggested_action']='check_delivery'
+    for key in ('confidence','muted'):
+        if facts.get(key):result[key]=facts[key]
+    if facts['last_message_id']!=head_id:result.update(last_message_id=facts['last_message_id'],last_at=facts['last_at'])
+    return result
+
+
 def lean_chat(row):
     result={k:row[k] for k in ('id','account','title','title_basis','type','last_activity') if row.get(k) is not None}
     result['title']=result['title'][:64]
@@ -296,6 +310,11 @@ def lean_chat(row):
             'authorship':row.get('awaiting_reply_authorship')},brief=True))
         if hint['sent_at']==result.get('last_activity'):hint.pop('sent_at')
         result['awaiting_reply']={k:v for k,v in hint.items() if v is not None}
+    if row.get('waiting'):
+        # The store row names the run's last message only beside another archive head (waiting_summary).
+        waiting=row['waiting']
+        result['waiting']=waiting_summary({**waiting,'last_message_id':waiting.get('last_message_id',row.get('last_message_id')),
+            'last_at':waiting.get('last_at',row.get('last_activity'))},(last or {}).get('id'))
     for key in ('last_message','awaiting_reply'):
         if result.get(key,{}).get('sender_name'):result[key]['sender_name']=result[key]['sender_name'][:64]
     hint=result.get('awaiting_reply')

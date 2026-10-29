@@ -32,8 +32,9 @@ import urllib.request
 
 REPOSITORY = "GoSync-Inc/deedkit"
 AUTOLOOP_PREFIX = "autoloop-"
-# The autoloop's test-directory and test-file rules (scripts/autoloop.py TEST_DIR and TEST_FILE).
-TEST_DIR = re.compile(r'(^|/)tests?/')
+# The autoloop's test-directory and test-file rules (scripts/autoloop.py TEST_DIR and TEST_FILE), flags included: a
+# test directory in any case.
+TEST_DIR = re.compile(r'(^|/)tests?/', re.I)
 TEST_FILE = re.compile(r'(^|/)test_[^/]*\.py$|\.test\.[^/]+$|_test\.go$')
 ADDED = frozenset({"added", "renamed", "copied"})
 MAX_FILES = 300  # GitHub's compare lists at most 300 files: a longer comparison cannot be listed whole

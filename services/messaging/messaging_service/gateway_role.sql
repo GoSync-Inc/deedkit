@@ -112,5 +112,7 @@ GRANT SELECT ON module_events,module_event_counter,subscription_module_sources,s
 GRANT SELECT,INSERT ON subscription_module_streams TO messaging_gateway;
 GRANT UPDATE(matched_through,acked_through,gap,blocked_reason,rollback_hold) ON subscription_module_streams
     TO messaging_gateway;
+-- Schema 57 (ANYM-621): sync status shows each account's conflict re-evaluation progress, read only.
+GRANT SELECT ON conflict_reevaluations TO messaging_gateway;
 -- Schema 59 (ANYM-575): the module router's open gaps mark a source's coverage incomplete in get_subscription.
 GRANT SELECT ON module_router_gaps TO messaging_gateway;

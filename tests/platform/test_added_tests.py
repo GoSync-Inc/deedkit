@@ -229,6 +229,14 @@ def test_the_listed_test_directories_and_file_names_are_the_autoloop_envelopes()
     assert added_tests.MAX_FILES == autoloop.MAX_FILES
 
 
+# spec: ANYM-590
+@pytest.mark.parametrize("name", ["services/calls/Tests/fixtures/example.json", "TESTS/conftest_notes.txt",
+                                  "services/gateway/Test/helper.py"], ids=["fixture", "upper-case", "singular"])
+def test_an_added_file_of_a_test_directory_in_any_case_is_listed_with_the_autoloop_flags(name):
+    assert listed((name, "added"))["files"] == [name]
+    assert (added_tests.TEST_DIR.flags, added_tests.TEST_FILE.flags) == (autoloop.TEST_DIR.flags, autoloop.TEST_FILE.flags)
+
+
 # spec: ANYM-578
 @pytest.mark.parametrize("name", ["tests/__init__.pyc", "services/gateway/tests/fixtures/helper.cpython-313.pyc",
                                   "tests/__pycache__/checker.cpython-313.pyc", "whatsapp/__pycache__/notes.txt",
