@@ -37,7 +37,7 @@ list: release, deploy and `production.py`, sends and live provider-session code.
 - `Change path:` signal grep:
 
   ```sh
-  git diff --no-renames --name-only origin/main... | grep -E '^\.github/workflows/|main-ruleset\.json|\.sql$|migrations/|gitleaks|compose|\.claude/settings\.json|^AGENTS\.md$|^docs/operations/feedback-autoloop\.md$'
+  git diff --no-renames --name-only origin/main... | grep -E -i '^\.github/workflows/|main-ruleset\.json|\.sql$|migrations/|gitleaks|compose|\.claude/settings\.json|^AGENTS\.md$|^docs/operations/feedback-autoloop\.md$'
   git diff -U5 origin/main... | grep -E -i '^[-+].*(secret|permissions|: *write|write-all|\b(GRANT|REVOKE|DROP|TRUNCATE|DELETE FROM|RENAME)\b|ALTER )'
   ```
 
@@ -64,11 +64,13 @@ list: release, deploy and `production.py`, sends and live provider-session code.
   changed lines the text signal does not count `ALTER` (migrations) or `GRANT` (role files); any
   other word still hits. Otherwise each SQL path is a "waits for the owner: migration" or "grant"
   hit. The classifier (`migration_rollout.py`) is itself a protected path.
+  Both path lists match in any case (`-i`: `migrations/X.SQL`, `prod.dockerfile`, `AGENTS.MD` on a
+  case-insensitive checkout); only the test-name exemption (`grep -v -E`) stays exact.
 
   ```sh
-  git diff --no-renames --name-only origin/main... | grep -E '^(\.github/|scripts/|deploy/|tools/|config/|docs/(operations|harness)/|services/release-router/|packages/platform-contracts/|tests/platform/benchmarks/)|^[^/]+\.py$|^[^/]+/__init__\.py$|(^|/)(sitecustomize|usercustomize)\.py$|\.pth$|(^|/)(pytest\.ini|setup\.cfg|tox\.ini)$|(^|/)(AGENTS|CLAUDE)(\.override)?\.md$|^(SUBSCRIPTIONS|SECURITY|TIDEN-CI)\.md$|(^|/)\.(claude|codex)/|\.mcp\.json$|migrations/|\.sql$|(^|/)(Dockerfile[^/]*|pyproject\.toml|package\.json|go\.mod|hatch_build\.py|conftest\.py|migration_rollout\.py|\.dockerignore|\.gitattributes|uv\.lock|package-lock\.json|go\.sum|requirements[^/]*\.(lock|in|txt))$|\.(pyc|so|pyd|dylib)$|(^|/)__pycache__/'
+  git diff --no-renames --name-only origin/main... | grep -E -i '^(\.github/|scripts/|deploy/|tools/|config/|docs/(operations|harness)/|services/release-router/|packages/platform-contracts/|tests/platform/benchmarks/)|^[^/]+\.py$|^[^/]+/__init__\.py$|(^|/)(sitecustomize|usercustomize)\.py$|\.pth$|(^|/)(pytest\.ini|setup\.cfg|tox\.ini)$|(^|/)(AGENTS|CLAUDE)(\.override)?\.md$|^(SUBSCRIPTIONS|SECURITY|TIDEN-CI)\.md$|(^|/)\.(claude|codex)/|\.mcp\.json$|migrations/|\.sql$|(^|/)(([^/]*[.-])?Dockerfile[^/]*|pyproject\.toml|package\.json|go\.mod|hatch_build\.py|conftest\.py|migration_rollout\.py|\.dockerignore|\.gitattributes|uv\.lock|package-lock\.json|go\.sum|requirements[^/]*\.(lock|in|txt))$|\.(pyc|so|pyd|dylib)$|(^|/)__pycache__/'
   git diff --no-renames --diff-filter=D --name-only origin/main...   # any deleted file
-  git diff --no-renames --diff-filter=M --name-only origin/main... | grep -E '(^|/)tests?/'   # a changed test-directory file
-  git diff --no-renames --diff-filter=A --name-only origin/main... | grep -E '(^|/)tests?/' \
-    | grep -E '\.(py|pyi|js|mjs|cjs|ts|tsx|go|sh)$' | grep -v -E '(^|/)test_[^/]*\.py$|\.test\.[^/]+$|_test\.go$'   # an added helper
+  git diff --no-renames --diff-filter=M --name-only origin/main... | grep -E -i '(^|/)tests?/'   # a changed test-directory file
+  git diff --no-renames --diff-filter=A --name-only origin/main... | grep -E -i '(^|/)tests?/' \
+    | grep -E -i '\.(py|pyi|js|mjs|cjs|ts|tsx|go|sh)$' | grep -v -E '(^|/)test_[^/]*\.py$|\.test\.[^/]+$|_test\.go$'   # an added helper
   ```
