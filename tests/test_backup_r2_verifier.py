@@ -2161,3 +2161,24 @@ def test_a_retry_after_its_proof_with_no_record_left_never_waits_for_the_host_lo
     with v.host_lock(s.calendar):
         assert v.run(config,client=s.cloud,engine=s.engine)['status']=='verified'
     assert not active.exists() and list(s.root.iterdir())==[]
+
+
+# spec: ANYM-634
+@pytest.mark.parametrize('phase',['proof_ready','promoted'])
+def test_a_retry_after_its_proof_meeting_an_invalid_record_keeps_it_and_the_directory(datadir,monkeypatch,phase):
+    s=datadir;v=s.v;config=s.messaging;real=v.cleanup_resources;calls=[]
+    def killed_after_proof(*args,**kw):
+        calls.append(args)
+        if len(calls)>=2:raise Killed()
+        return real(*args,**kw)
+    monkeypatch.setattr(v,'cleanup_resources',killed_after_proof)
+    with pytest.raises(Killed):v.run(config,client=s.cloud,engine=s.engine)
+    monkeypatch.setattr(v,'cleanup_resources',real)
+    active=Path(config['directory'])/'active.json';journal=json.loads(active.read_text())
+    data=s.root/v.names(journal['run'],'messaging')['volume']
+    if phase=='promoted':s.write_json(active,{**journal,'phase':'promoted'})
+    # The record names another run on top while its entries still name this run's resources: invalid.
+    record=json.loads((s.host/'admission.json').read_text());s.write_json(s.host/'admission.json',{**record,'run':'e'*32})
+    kept=(s.host/'admission.json').read_bytes();del config['postgres_data_directory']
+    with pytest.raises(RuntimeError,match='verifier_cleanup_unconfirmed'):v.run(config,client=s.cloud,engine=s.engine)
+    assert data.is_dir() and (s.host/'admission.json').read_bytes()==kept and active.exists()

@@ -330,9 +330,9 @@ inside the root-only parent), bind-mounts it at `/var/lib/postgresql`, and
 removes exactly that path on success and failure; after a SIGKILL the next
 holder removes it from the record. The record holds the path, the run and the
 data root's device and inode. A retry after its proof whose own record a crash
-left clears it under the host lock, so a run directory recorded before the key
-was removed or changed is still removed; with no own record left it does not
-wait for the host lock. Removal from a record refuses a path that is not the
+left (or an invalid record) clears it under the host lock, so a run directory
+recorded before the key was removed or changed is still removed; with no record
+or another run's valid record it does not wait for the host lock. Removal from a record refuses a path that is not the
 record run's name directly in the data root it was admitted under (same device
 and inode, root-private), or whose leaf is not a directory of root or uid 999 (a
 symlink is never followed); such a path, like one it cannot remove, ends

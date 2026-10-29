@@ -280,13 +280,16 @@ def admit(engine,fd,profile,run,resources):
 
 def own_record(config,run):
     """Whether the host's admission record is still this run's, read without the lock: another holder
-    replaces it only after removing what it names. An unreadable record counts as this run's."""
+    replaces it only after removing what it names. An unreadable or invalid record counts as this run's:
+    the locked cleanup refuses it and keeps it."""
     with host_directory(config) as fd:
-        try:_,record=r2.read_root(fd,ADMISSION,missing=True)
+        try:
+            _,record=r2.read_root(fd,ADMISSION,missing=True)
+            if record is None:return False
+            return valid_admission(record)['run']==run
         except Exception:
             if r2.CANCELLED:raise
             return True
-    return record is not None and (not isinstance(record,dict) or record.get('run')==run)
 
 
 def release_admission(fd):
