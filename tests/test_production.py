@@ -5037,8 +5037,8 @@ def test_backup_runner_steps_never_pair_a_newer_runner_with_an_older_image():
 def test_backup_runner_install_reads_the_prepared_source_under_the_configured_state_directory():
     # prepare() checks the candidate out at <state_directory>/<sha>/source; a fixed host path installs nothing real.
     docs = (ROOT / "docs/operations/production.md").read_text()
-    section = docs.split("### Backup runner\n", 1)[1].split("\n## ", 1)[0]
-    assert "src=<state_directory>/$sha/source;" in section and "/var/lib/deedkit-production" not in section
+    script = docs.split("### Backup runner\n", 1)[1].split("\n## ", 1)[0].split("```sh\n", 1)[1]
+    assert re.match(r"""sha=\S+; src=["']?([^"';\s]+)""", script)[1] == "<state_directory>/$sha/source"
 
 
 def held_backup_lock(tmp_path, monkeypatch):
