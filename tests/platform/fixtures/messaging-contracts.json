@@ -57,7 +57,7 @@
         "openWorldHint": true,
         "readOnlyHint": true
       },
-      "description": "Render an authorized draft without sending or queuing.\n\nPass exactly one recipient: chat_id (archive ID) or phone (native WhatsApp: E.164\nwith or without +, or a @c.us/@s.whatsapp.net JID). A chat_id preview contacts no\nprovider and requires read permission for the account/chat and any reply target,\nwith no sending-policy or connected-collector requirement. A phone preview\ncontacts the provider: it does one open_chat_by_phone lookup (send key, full\naccount, the operation enabled; shared hourly quota), writes no chat and returns\non_whatsapp, verified_name, chat_existed, chats_on_other_accounts and a digest\nbound to the number and its WhatsApp identity, valid 10 minutes. Returns visible/wire text,\nstructured entities, warnings, link destinations, UTF-16 lengths, renderer\nversion and a preview_digest bound to this principal, scope and exact payload.\nThe digest is not owner approval. Explicitly review lossy conversions before\nallowing them. To send rich content, use these SAME source/format/policy/target\nvalues and digest after obtaining exact owner confirmation. No automatic splitting.\n",
+      "description": "Render an authorized draft without sending or queuing.\n\nPass exactly one recipient: chat_id (archive ID), phone (native WhatsApp: E.164\nwith or without +, or a @c.us/@s.whatsapp.net JID) or username (Telegram: @name of a\nperson, not a bot, channel or group). A chat_id preview contacts no\nprovider and requires read permission for the account/chat and any reply target,\nwith no sending-policy or connected-collector requirement. A phone preview\ncontacts the provider: it does one open_chat_by_phone lookup (send key, full\naccount, the operation enabled; shared hourly quota), writes no chat and returns\non_whatsapp, verified_name, chat_existed, chats_on_other_accounts and a digest\nbound to the number and its WhatsApp identity, valid 10 minutes. A username preview\nlikewise does one open_chat_by_username lookup at Telegram (own hourly quota) and returns\nusername, user_id, name, chat_existed and a digest bound to the resolved user ID, valid\n10 minutes. Returns visible/wire text,\nstructured entities, warnings, link destinations, UTF-16 lengths, renderer\nversion and a preview_digest bound to this principal, scope and exact payload.\nThe digest is not owner approval. Explicitly review lossy conversions before\nallowing them. To send rich content, use these SAME source/format/policy/target\nvalues and digest after obtaining exact owner confirmation. No automatic splitting.\n",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -103,6 +103,11 @@
           "text": {
             "title": "Text",
             "type": "string"
+          },
+          "username": {
+            "default": "",
+            "title": "Username",
+            "type": "string"
           }
         },
         "required": [
@@ -126,7 +131,7 @@
         "openWorldHint": true,
         "readOnlyHint": false
       },
-      "description": "Send exact confirmed content using this account's existing collector.\n\nFor rich formatting or nondefault policies, call preview_message first and\npass its matching preview_digest. Show account, recipient, visible text,\nformatting, warnings, link destinations and reply target to the owner and\nobtain explicit confirmation. Digest is not approval. Requires send permission\nand operator opt-in. plain remains the default and native WhatsApp delimiters\ncan still be interpreted by WhatsApp.\nchat_id/reply_to are archive IDs; account must be explicit. request_id is a\nunique 8\u2013128 character key for this approved action; reuse it after network\nfailure with the SAME payload. queued is not sent. Poll get_send_status.\nsent means provider accepted, not recipient read/delivered. unknown must be\nchecked against history before any newly approved send. Text only, provider\npayload at most 4000 UTF-16 units; source at most 16000 units subject to the\n16384-byte HTTP JSON envelope. No splitting or server human-approval gate.\nPass exactly one recipient, chat_id or phone. A new WhatsApp number: preview_message\nwith phone, then send_message with the same phone and that preview_digest; it opens\nor reuses the chat with no second lookup and returns chat_id, chat_existed and\nverified_name. status opening_chat: repeat with the same request_id. A changed\nidentity or expired digest asks for a new preview. Opening the chat without a message\nstays execute_messenger_operation operation open_chat_by_phone.\n",
+      "description": "Send exact confirmed content using this account's existing collector.\n\nFor rich formatting or nondefault policies, call preview_message first and\npass its matching preview_digest. Show account, recipient, visible text,\nformatting, warnings, link destinations and reply target to the owner and\nobtain explicit confirmation. Digest is not approval. Requires send permission\nand operator opt-in. plain remains the default and native WhatsApp delimiters\ncan still be interpreted by WhatsApp.\nchat_id/reply_to are archive IDs; account must be explicit. request_id is a\nunique 8\u2013128 character key for this approved action; reuse it after network\nfailure with the SAME payload. queued is not sent. Poll get_send_status.\nsent means provider accepted, not recipient read/delivered. unknown must be\nchecked against history before any newly approved send. Text only, provider\npayload at most 4000 UTF-16 units; source at most 16000 units subject to the\n16384-byte HTTP JSON envelope. No splitting or server human-approval gate.\nPass exactly one recipient, chat_id, phone or username. A new WhatsApp number: preview_message\nwith phone, then send_message with the same phone and that preview_digest; it opens\nor reuses the chat with no second lookup and returns chat_id, chat_existed and\nverified_name. status opening_chat: repeat with the same request_id. A changed\nidentity or expired digest asks for a new preview. Opening the chat without a message\nstays execute_messenger_operation operation open_chat_by_phone. A Telegram @username\nwith no chat: preview_message with username, then send_message with the same username\nand that preview_digest; the send resolves the username again and refuses a different\nperson (identity_changed), then returns chat_id, chat_existed, user_id and name.\n",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -182,6 +187,11 @@
             "title": "Text",
             "type": "string"
           },
+          "username": {
+            "default": "",
+            "title": "Username",
+            "type": "string"
+          },
           "wait_s": {
             "default": 0,
             "maximum": 25,
@@ -212,7 +222,7 @@
         "openWorldHint": true,
         "readOnlyHint": false
       },
-      "description": "Send text and files to anyone in one call: preview, confirm, send, wait, resume.\n\nConfirm with the owner before any send: call with dry_run true, show the owner the\npreview (recipient, visible text, warnings, links, reply target, files, caption\nhandling) and get their exact confirmation; then call again with its confirm_token.\nThe token binds that preview; it is not the owner's confirmation, and the server\ndoes not verify approval. A live send needs confirm_token or request_id (8-128\ncharacters, one key per approved action; repeat it after a network failure with the\nSAME payload). Rich format always needs a preview (preview_required).\nto: anything platform_resolve_target resolves exactly (person, chat_ or msg_ ID,\nphone, @username, JID); reply_to (a msg_ ID) alone sends into its chat. files: up to\n10 of {upload_id} (messages_prepare_file_upload), {attachment_id} (forward an\narchived file) or a small file inline as {name, mime, base64} (at most 262144 bytes\ndecoded per call, counted against the key's 4 active uploads; over that, field_errors\nand a next to messages_prepare_file_upload), each with optional mode; they go in order. A plain caption up to\n1024 characters rides on the first file, other text is sent after the files.\nStates: previewed, running (repeat with next), succeeded, failed with resumable\ntrue (repeat with resume true: only failed and unsent steps go; account_offline\nwhen the account was not connected), unknown (a step may have been delivered:\ncheck history, never resend). preview_stale returns changed, a fresh preview and\na new confirm_token. wait_s (0-25) waits for the receipts here. allow_open_chat is\nset by the gateway from its open_chat_by_phone grant; false refuses a phone with no chat.\nallow_files is set by the gateway from its send_file grant; false refuses any file step.\n",
+      "description": "Send text and files to anyone in one call: preview, confirm, send, wait, resume.\n\nConfirm with the owner before any send: call with dry_run true, show the owner the\npreview (recipient, visible text, warnings, links, reply target, files, caption\nhandling) and get their exact confirmation; then call again with its confirm_token.\nThe token binds that preview; it is not the owner's confirmation, and the server\ndoes not verify approval. A live send needs confirm_token or request_id (8-128\ncharacters, one key per approved action; repeat it after a network failure with the\nSAME payload). Rich format always needs a preview (preview_required).\nto: anything platform_resolve_target resolves exactly (person, chat_ or msg_ ID,\nphone, @username, JID); reply_to (a msg_ ID) alone sends into its chat. files: up to\n10 of {upload_id} (messages_prepare_file_upload), {attachment_id} (forward an\narchived file) or a small file inline as {name, mime, base64} (at most 262144 bytes\ndecoded per call, counted against the key's 4 active uploads; over that, field_errors\nand a next to messages_prepare_file_upload), each with optional mode; they go in order. A plain caption up to\n1024 characters rides on the first file, other text is sent after the files.\nStates: previewed, running (repeat with next), succeeded, failed with resumable\ntrue (repeat with resume true: only failed and unsent steps go; account_offline\nwhen the account was not connected), unknown (a step may have been delivered:\ncheck history, never resend). preview_stale returns changed, a fresh preview and\na new confirm_token. wait_s (0-25) waits for the receipts here. allow_open_chat is\nset by the gateway from its open_chat_by_phone grant; false refuses a phone with no chat.\nallow_open_username likewise comes from its open_chat_by_username grant for a Telegram\n@username with no chat (ANYM-643); a gateway that sets allow_open_chat but not it gets none.\nallow_files is set by the gateway from its send_file grant; false refuses any file step.\n",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -251,6 +261,18 @@
             ],
             "default": null,
             "title": "Allow Open Chat"
+          },
+          "allow_open_username": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Allow Open Username"
           },
           "confirm_token": {
             "anyOf": [

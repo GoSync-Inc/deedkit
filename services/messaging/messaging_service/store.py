@@ -634,7 +634,12 @@ class Store:
                         'phone':{'platforms':['whatsapp_native'],'preview_contacts_provider':True,
                             'requires':['send','full_account','open_chat_by_phone','gateway_action_grant'],
                             'send_requires_preview_digest':True,'digest_binds_identity':True,
-                            'lookup_quota':'shared_with_open_chat_by_phone'}},
+                            'lookup_quota':'shared_with_open_chat_by_phone'},
+                        # ANYM-643: a username preview resolves it at Telegram; the send rechecks the user ID.
+                        'username':{'platforms':['telegram'],'preview_contacts_provider':True,
+                            'requires':['send','full_account','open_chat_by_username','gateway_action_grant'],
+                            'send_requires_preview_digest':True,'digest_binds_identity':True,
+                            'send_rechecks_identity':True,'lookup_quota':'shared_with_open_chat_by_username'}},
                     'ambiguous_result_policy':'unknown_no_automatic_retry',
                     'delivery_observations':{'telegram':'private_outbox_read_boundary',
                         'whatsapp':'message_ack_private_or_group_aggregate',
@@ -705,34 +710,63 @@ class Store:
             return send_finish(self,c,p,account,phone,operation_id,text,request_id,reply_to,format,
                 preview_digest,link_preview,allow_lossy)
 
+    # ANYM-643: a Telegram username recipient; username_send.preview and username_send.send wait between these.
+    def username_preview_lookup(self,token,account,username,text,reply_to='',format='plain',
+                                link_preview=False,allow_lossy=False):
+        from .username_send import preview_lookup
+        with self.authorized(token,'preview_message') as (c,p):
+            return preview_lookup(self,c,p,account,username,text,reply_to,format,link_preview,allow_lossy)
+
+    def username_preview_result(self,token,account,username,operation_id,text,reply_to='',format='plain',
+                                link_preview=False,allow_lossy=False):
+        from .username_send import preview_result
+        with self.authorized(token,'preview_message') as (c,p):
+            return preview_result(self,c,p,account,username,operation_id,text,reply_to,format,link_preview,allow_lossy)
+
+    def username_send_begin(self,token,account,username,text,request_id,reply_to='',format='plain',
+                            preview_digest='',link_preview=False,allow_lossy=False):
+        from .username_send import send_begin
+        with self.authorized(token,'send_message') as (c,p):
+            return send_begin(self,c,p,account,username,text,request_id,reply_to,format,preview_digest,
+                link_preview,allow_lossy)
+
+    def username_send_finish(self,token,account,username,operation_id,text,request_id,reply_to='',format='plain',
+                             preview_digest='',link_preview=False,allow_lossy=False):
+        from .username_send import send_finish
+        with self.authorized(token,'send_message') as (c,p):
+            return send_finish(self,c,p,account,username,operation_id,text,request_id,reply_to,format,
+                preview_digest,link_preview,allow_lossy)
+
     # ANYM-546: messages_send; send_intent.send waits between these short transactions.
     def messages_send_preview(self,token,arguments,draft=None):
-        from .send_intent import _text, payload, resolve, save_preview
+        from .send_intent import _text, open_grants, payload, resolve, save_preview
         from .resolve_target import resolve_target
         with self.authorized(token,'preview_message') as (c,p):
             value=payload(arguments)
-            resolution=resolve(self,c,p,value,phone_text=_text(draft) if draft else None,
-                               open_chat=arguments.get('allow_open_chat') is not False,
+            # ANYM-643: a username draft also names the person it resolved to.
+            text=draft and {**_text(draft),**{k:draft[k] for k in ('name','user_id') if 'username' in draft}}
+            resolution=resolve(self,c,p,value,phone_text=text or None,open_chat=open_grants(arguments),
                                files=arguments.get('allow_files') is not False)
             if resolution is not None:return save_preview(c,p,value,resolution)
             target=resolve_target(self,c,p,value['to'],'message',value['account'])['target']
-            return {'phone':{'account':target['account'],'phone':target['phone'][1:],'text':value['text'],
-                             'reply_to':'','format':value['format']}}
+            kind='username' if 'username' in target else 'phone'
+            return {kind:{'account':target['account'],kind:target[kind][1:],'text':value['text'],
+                          'reply_to':'','format':value['format']}}
 
     def messages_send_execute(self,token,arguments):
-        from .send_intent import admit, advance
+        from .send_intent import admit, advance, open_grants
         with self.authorized(token,'send_message') as (c,p):
             intent=admit(self,c,p,arguments)
             # preview_stale: its fresh preview commits with this transaction, then the caller raises.
             if isinstance(intent,APIError):return {'raise':intent}
             return advance(self,c,p,intent,resume=arguments.get('resume',False),first=True,
-                           open_chat=arguments.get('allow_open_chat') is not False,
+                           open_chat=open_grants(arguments),
                            files=arguments.get('allow_files') is not False)
 
     def messages_send_advance(self,token,intent_id,arguments):
-        from .send_intent import advance
+        from .send_intent import advance, open_grants
         with self.authorized(token,'send_message') as (c,p):
-            return advance(self,c,p,intent_id,open_chat=arguments.get('allow_open_chat') is not False,
+            return advance(self,c,p,intent_id,open_chat=open_grants(arguments),
                            files=arguments.get('allow_files') is not False)
 
     def get_send_status(self,token,send_id):

@@ -23,9 +23,10 @@ def takes_wait(tool):
 # never the metadata pool. An entry names the pool and when the arguments make the call wait; wait_s=0 stays a plain
 # call. A catalog tool with wait_s but no entry still waits in "waits" and fails test_wait_admission.
 WAIT_ADMISSION = {
-    # ANYM-532: a phone recipient also waits, for its open_chat_by_phone lookup.
-    ("messaging", "send_message"): ("waits", lambda a: (a.get("wait_s") or 0) > 0 or bool(a.get("phone"))),
-    ("messaging", "preview_message"): ("waits", lambda a: bool(a.get("phone"))),
+    # ANYM-532, ANYM-643: a phone or username recipient also waits, for its open_chat_by_* lookup.
+    ("messaging", "send_message"): ("waits", lambda a: (a.get("wait_s") or 0) > 0 or bool(a.get("phone"))
+                                    or bool(a.get("username"))),
+    ("messaging", "preview_message"): ("waits", lambda a: bool(a.get("phone")) or bool(a.get("username"))),
     # ANYM-546: a dry_run may wait for a phone lookup, a send for its receipts.
     ("messaging", "messages_send"): ("waits", lambda a: (a.get("wait_s") or 0) > 0 or bool(a.get("dry_run"))),
     ("messaging", "wait_for_subscription_events"): ("waits", lambda a: True),

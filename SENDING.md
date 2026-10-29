@@ -157,7 +157,46 @@ none. `capabilities.sending.recipients` lists `chat_id` and `phone`; see
 [MESSENGER_OPERATIONS.md](MESSENGER_OPERATIONS.md#opening-a-whatsapp-chat-by-phone-number).
 Cold messages from a personal account to strangers can get it restricted or banned
 by WhatsApp, so keep them few and expected. New Telegram conversations by phone
-number or username are not implemented.
+number are not implemented; by username, see below.
+
+### New Telegram conversations by username
+
+On Telegram accounts an agent can write to a person by `@username` when the archive
+has no chat with them (ANYM-643), with `username` instead of `chat_id`:
+
+1. `preview_message(account, username, text)`: `username` is `@name`, `name` or
+   `https://t.me/name` of a person, not a bot, channel or group. Exactly one of
+   `chat_id`, `phone` and `username` is given, else `invalid_arguments`. The preview
+   runs one `open_chat_by_username` lookup at Telegram (`create=false`, up to 20
+   seconds) and returns the usual draft plus `username`, `user_id`, `name`,
+   `chat_existed` (with `chat_id` only then), `preview_contacts_provider: true` and
+   `preview_digest_expires_at`. The digest binds the account, the username, that
+   one lookup, the resolved user ID and the rendered draft, for 10 minutes. A lookup
+   still running gets `username_lookup_pending` with `operation_id` and
+   `next_action: repeat_preview_message`.
+2. Show the owner the account, `@username`, name and exact text; obtain
+   confirmation, as for any send.
+3. `send_message(account, username, text, request_id, preview_digest=…)`. The digest
+   is required (`preview_required`); `preview_expired` and `preview_mismatch` ask for
+   a new preview. The server queues one chat step under the caller's `request_id`,
+   which resolves the username at Telegram again: a different user ID gets
+   `identity_changed` and nothing is sent. Otherwise the private chat is opened or
+   reused, every guard and the digest are rechecked, and the unchanged send pipeline
+   runs. While the step runs the result is `status: opening_chat` with
+   `next_action: repeat_send_message_with_same_request_id`. The result adds
+   `chat_id`, `chat_existed`, `user_id` and `name`.
+
+Username recipients need what `open_chat_by_username` needs (the `send` permission, a
+full-account key, the account opt-in, `discover_chats` and, through the gateway, the
+action grant; a preview also `read`). Each account allows 20 username resolves per
+rolling hour, previews and send rechecks alike, so a cold send costs two; `rate_limited`
+carries `resets_in_seconds`, or `retry_after_s` after a Telegram flood wait.
+`messages_send(to="@name")` with no archived private chat previews and sends through
+the same steps when exactly one Telegram account of the key may open it; through the
+gateway that needs its `open_chat_by_username` grant (`allow_open_username`).
+`capabilities.sending.recipients` lists `username`. Telegram restricts accounts that
+message many strangers, so keep cold messages few and expected; see
+[MESSENGER_OPERATIONS.md](MESSENGER_OPERATIONS.md#opening-a-telegram-chat-by-username).
 
 ### One call for text and files: `messages_send` (schema 51)
 

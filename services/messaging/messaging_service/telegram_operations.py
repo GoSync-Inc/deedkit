@@ -61,6 +61,7 @@ PARAMETERS = {
     'set_slow_mode': {'seconds'}, 'list_join_requests': {'limit'},
     'approve_join_requests': {'user_ids'}, 'reject_join_requests': {'user_ids'},
     'check_chat_link': {'link'}, 'join_chat': {'link'},
+    'open_chat_by_username': {'username', 'create'},
     LIVE_SEARCH: {'query', 'chat_types', 'filter', 'from_time', 'to_time', 'limit', 'cursor'},
     HISTORY: {'count', 'before_message', 'around_message', 'from_time', 'to_time'},
 }
@@ -94,6 +95,8 @@ JOIN_CHAT_REFUSALS = ((errors.InviteHashExpiredError, 'invite_expired'), (errors
     (errors.ChannelsTooMuchError, 'join_not_allowed'), (errors.ChannelPrivateError, 'join_not_allowed'),
     (errors.UserAlreadyParticipantError, 'already_member'))
 JOIN_NEXT_STEP = "the operator adds this chat to the account's collection policy"
+# ANYM-643: the normalized username (messenger_operations.telegram_username).
+USERNAME = re.compile(r'[a-z][a-z0-9_]{3,31}', re.ASCII)
 
 
 def link_chat(chat, membership, basis):
@@ -484,6 +487,8 @@ async def _execute(client, job, *, verified_self=None, governor=None):
                 not CHAT_LINK.fullmatch(parameters['link'])):
             reject('invalid_parameters')
 
+        if operation == 'open_chat_by_username':
+            return await open_by_username(client, job, parameters, rpc, collection_policy, allowed_provider_id)
         if operation == LIVE_SEARCH:
             return await live_search(client, job, parameters, governor, rpc, allowed_provider_id,
                                      referenced_peers, check_policy)
@@ -1392,6 +1397,52 @@ async def chat_history(client, job, parameters, governor, rpc, referenced_peers,
     counts['fetched'] = len(kept)
     finish('done')
     return result
+
+
+async def open_by_username(client, job, parameters, rpc, collection_policy, allowed_provider_id):
+    """ANYM-643: one contacts.ResolveUsername, a person only (never a bot, channel or group). The resolve is a read
+    in its own governor scope, so its flood wait pauses no send; the chat row is the worker's, after it rechecks
+    authority (commands.finish_open_username). Telethon keeps the user's access hash in its session."""
+    from .commands import CommandRejected
+    from .telegram_governor import ProviderRateLimited
+    username = parameters.get('username')
+    if (not isinstance(username, str) or not USERNAME.fullmatch(username) or
+            type(parameters.get('create', False)) is not bool):
+        reject('invalid_parameters')
+    if not collection_policy()['discover_chats']:
+        reject('chat_not_collected')
+    if job.get('lookup_allowed') is not True:
+        reject('rate_limited')
+    asked = []
+
+    def resolve():
+        asked.append(True)
+        return client(functions.contacts.ResolveUsernameRequest(username))
+    try:
+        resolved = await rpc(resolve, scope='resolve_username')
+    except ProviderRateLimited as exc:
+        refusal = CommandRejected('rate_limited', retry_after=exc.seconds)
+        # A pause the governor already held refuses before Telegram is asked: no lookup is spent.
+        refusal.provider_lookup = bool(asked)
+        raise refusal from None
+    except (errors.UsernameNotOccupiedError, errors.UsernameInvalidError):
+        reject('username_not_found')
+    peer = getattr(resolved, 'peer', None)
+    if not isinstance(peer, types.PeerUser):
+        reject('recipient_not_user')
+    user = next((u for u in (getattr(resolved, 'users', None) or [])[:100]
+                 if isinstance(u, types.User) and u.id == peer.user_id), None)
+    if user is None or type(user.id) is not int or user.id <= 0:
+        return {'outcome': 'unknown', 'error': 'provider_result_unverified'}
+    if user.deleted:
+        reject('username_not_found')
+    if user.bot:
+        reject('recipient_not_user')
+    if not allowed_provider_id(user.id):
+        reject('chat_not_collected')
+    name = safe_text(' '.join(n for n in (user.first_name, user.last_name) if isinstance(n, str) and n.strip()), 255)
+    return {'outcome': 'confirmed', 'found': True, 'user_id': str(user.id), 'username': username,
+            'name': name if name and name.strip() else None, 'provider_lookup': True}
 
 
 async def execute(client, job, *, verified_self=None, governor=None):

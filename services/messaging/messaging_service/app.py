@@ -522,10 +522,16 @@ def create_app(store: Store, allowed_hosts: list[str]):
             from .live_search import validate
             validate('off',live.get('wait_s'),live.get('request_id',''))
         if method in ('preview_message','send_message'):
-            # ANYM-532: exactly one recipient; a phone goes through the lookup and its digest.
-            from . import phone_send
-            phone=phone_send.recipient(arguments.get('chat_id',''),arguments.pop('phone',''))
-            if phone is not None:arguments.pop('chat_id',None);arguments['phone']=phone
+            # ANYM-532, ANYM-643: exactly one recipient; a phone or a username goes through its lookup and digest.
+            from . import phone_send, username_send
+            phone=None
+            username=username_send.recipient(arguments.get('chat_id',''),arguments.get('phone',''),
+                                             arguments.pop('username',''))
+            if username is not None:
+                arguments.pop('chat_id',None);arguments.pop('phone',None);arguments['username']=username
+            else:
+                phone=phone_send.recipient(arguments.get('chat_id',''),arguments.pop('phone',''))
+                if phone is not None:arguments.pop('chat_id',None);arguments['phone']=phone
         if method == 'messages_send':
             # ANYM-546: messages_send previews, admits and advances in short transactions, waiting between them.
             from .send_intent import send
@@ -548,16 +554,19 @@ def create_app(store: Store, allowed_hosts: list[str]):
             return result
         if method == 'preview_message' and phone is not None:
             return await phone_send.preview(store,token,arguments)
+        if method == 'preview_message' and username is not None:
+            return await username_send.preview(store,token,arguments)
         if method == 'send_message':
             from .send_wait import validate_wait_s, wait_for_send
             wait_s=validate_wait_s(arguments.pop('wait_s', 0))
             if phone is not None:result=await phone_send.send(store,token,arguments)
+            elif username is not None:result=await username_send.send(store,token,arguments)
             else:result=await run_in_threadpool(store.send_message,token,**arguments)
             if wait_s and result.get('send_id'):
                 try:
                     waited=await wait_for_send(store,token,result['send_id'],wait_s)
-                    # A phone send keeps chat_id, chat_existed and verified_name beside the waited status.
-                    return waited if phone is None else {**result,**waited}
+                    # A phone or username send keeps chat_id, chat_existed and the resolved names beside it.
+                    return waited if phone is None and username is None else {**result,**waited}
                 except APIError as error:
                     # The send is already committed; a failed observation must not hide its send_id.
                     if error.code not in ('send_wait_busy','send_status_timeout'):raise
@@ -585,35 +594,40 @@ def create_app(store: Store, allowed_hosts: list[str]):
         """Identity, permitted accounts, source coverage and unavailable features. detail=summary (default) is a short index naming the sections; sections=[names] returns only those blocks; detail=full returns everything. An unknown section name returns invalid_filter. version is the package version and does not change per release; build.source_sha is the commit this messaging server was built from and build.started_at when it started (the gateway, calls and calendar services deploy separately and are not reported here). A null build.source_sha means the image was built without its commit: on production, report it as a deploy defect. A restart without a deploy also moves started_at, so compare SHAs when the expected one is known."""
         return call(ctx,'capabilities',detail=detail,**({} if sections is None else {'sections':sections}))
 
-    # ANYM-532: a phone preview contacts the provider (one lookup).
+    # ANYM-532, ANYM-643: a phone or username preview contacts the provider (one lookup).
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(readOnlyHint=True,destructiveHint=False,openWorldHint=True))
     async def preview_message(ctx: Context,account: StrictStr,text: StrictStr,chat_id: StrictStr='',
-                        phone: StrictStr='',reply_to: StrictStr='',format: MessageFormat='plain',
+                        phone: StrictStr='',username: StrictStr='',reply_to: StrictStr='',format: MessageFormat='plain',
                         link_preview: StrictBool=False,allow_lossy: StrictBool=False) -> dict[str,Any]:
         """Render an authorized draft without sending or queuing.
 
-        Pass exactly one recipient: chat_id (archive ID) or phone (native WhatsApp: E.164
-        with or without +, or a @c.us/@s.whatsapp.net JID). A chat_id preview contacts no
+        Pass exactly one recipient: chat_id (archive ID), phone (native WhatsApp: E.164
+        with or without +, or a @c.us/@s.whatsapp.net JID) or username (Telegram: @name of a
+        person, not a bot, channel or group). A chat_id preview contacts no
         provider and requires read permission for the account/chat and any reply target,
         with no sending-policy or connected-collector requirement. A phone preview
         contacts the provider: it does one open_chat_by_phone lookup (send key, full
         account, the operation enabled; shared hourly quota), writes no chat and returns
         on_whatsapp, verified_name, chat_existed, chats_on_other_accounts and a digest
-        bound to the number and its WhatsApp identity, valid 10 minutes. Returns visible/wire text,
+        bound to the number and its WhatsApp identity, valid 10 minutes. A username preview
+        likewise does one open_chat_by_username lookup at Telegram (own hourly quota) and returns
+        username, user_id, name, chat_existed and a digest bound to the resolved user ID, valid
+        10 minutes. Returns visible/wire text,
         structured entities, warnings, link destinations, UTF-16 lengths, renderer
         version and a preview_digest bound to this principal, scope and exact payload.
         The digest is not owner approval. Explicitly review lossy conversions before
         allowing them. To send rich content, use these SAME source/format/policy/target
         values and digest after obtaining exact owner confirmation. No automatic splitting.
         """
-        return await async_call(ctx,'preview_message',account=account,chat_id=chat_id,phone=phone,text=text,
+        return await async_call(ctx,'preview_message',account=account,chat_id=chat_id,phone=phone,username=username,
+            text=text,
             reply_to=reply_to,format=format,link_preview=link_preview,allow_lossy=allow_lossy)
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(readOnlyHint=False,
         destructiveHint=True,idempotentHint=True,openWorldHint=True))
     async def send_message(ctx: Context,account: StrictStr,text: StrictStr,request_id: StrictStr,
-                     chat_id: StrictStr='',phone: StrictStr='',reply_to: StrictStr='',format: MessageFormat='plain',
-                     preview_digest: StrictStr='',link_preview: StrictBool=False,
+                     chat_id: StrictStr='',phone: StrictStr='',username: StrictStr='',reply_to: StrictStr='',
+                     format: MessageFormat='plain',preview_digest: StrictStr='',link_preview: StrictBool=False,
                      allow_lossy: StrictBool=False, wait_s: WaitSeconds=0) -> dict[str,Any]:
         """Send exact confirmed content using this account's existing collector.
 
@@ -630,14 +644,18 @@ def create_app(store: Store, allowed_hosts: list[str]):
         checked against history before any newly approved send. Text only, provider
         payload at most 4000 UTF-16 units; source at most 16000 units subject to the
         16384-byte HTTP JSON envelope. No splitting or server human-approval gate.
-        Pass exactly one recipient, chat_id or phone. A new WhatsApp number: preview_message
+        Pass exactly one recipient, chat_id, phone or username. A new WhatsApp number: preview_message
         with phone, then send_message with the same phone and that preview_digest; it opens
         or reuses the chat with no second lookup and returns chat_id, chat_existed and
         verified_name. status opening_chat: repeat with the same request_id. A changed
         identity or expired digest asks for a new preview. Opening the chat without a message
-        stays execute_messenger_operation operation open_chat_by_phone.
+        stays execute_messenger_operation operation open_chat_by_phone. A Telegram @username
+        with no chat: preview_message with username, then send_message with the same username
+        and that preview_digest; the send resolves the username again and refuses a different
+        person (identity_changed), then returns chat_id, chat_existed, user_id and name.
         """
-        return await async_call(ctx,'send_message',account=account,chat_id=chat_id,phone=phone,text=text,
+        return await async_call(ctx,'send_message',account=account,chat_id=chat_id,phone=phone,username=username,
+            text=text,
             request_id=request_id,reply_to=reply_to,format=format,preview_digest=preview_digest,
             link_preview=link_preview,allow_lossy=allow_lossy,wait_s=wait_s)
 
@@ -649,7 +667,7 @@ def create_app(store: Store, allowed_hosts: list[str]):
                    dry_run: StrictBool | None=None,confirm_token: StrictStr | None=None,
                    request_id: StrictStr | None=None,resume: StrictBool | None=None,
                    wait_s: WaitSeconds | None=None,allow_open_chat: StrictBool | None=None,
-                   allow_files: StrictBool | None=None) -> dict[str,Any]:
+                   allow_files: StrictBool | None=None,allow_open_username: StrictBool | None=None) -> dict[str,Any]:
         """Send text and files to anyone in one call: preview, confirm, send, wait, resume.
 
         Confirm with the owner before any send: call with dry_run true, show the owner the
@@ -672,11 +690,14 @@ def create_app(store: Store, allowed_hosts: list[str]):
         check history, never resend). preview_stale returns changed, a fresh preview and
         a new confirm_token. wait_s (0-25) waits for the receipts here. allow_open_chat is
         set by the gateway from its open_chat_by_phone grant; false refuses a phone with no chat.
+        allow_open_username likewise comes from its open_chat_by_username grant for a Telegram
+        @username with no chat (ANYM-643); a gateway that sets allow_open_chat but not it gets none.
         allow_files is set by the gateway from its send_file grant; false refuses any file step.
         """
         return await async_call(ctx,'messages_send',to=to,account=account,reply_to=reply_to,text=text,files=files,
             format=format,dry_run=dry_run,confirm_token=confirm_token,request_id=request_id,resume=resume,
-            wait_s=wait_s,allow_open_chat=allow_open_chat,allow_files=allow_files)
+            wait_s=wait_s,allow_open_chat=allow_open_chat,allow_files=allow_files,
+            allow_open_username=allow_open_username)
 
     @mcp.tool(structured_output=True,annotations=read)
     def get_send_status(ctx: Context,send_id: StrictStr) -> dict[str,Any]:

@@ -138,7 +138,7 @@ same preview and execute, with the same permissions, account opt-ins and receipt
 | Tool | Operations | MCP annotations |
 | --- | --- | --- |
 | `messages_change_message` | edit, delete, react, vote, pin/unpin, star/unstar one message | external effect |
-| `messages_manage_chat` | archive, mute, pin, read state, labels, groups, members, invite links, join, `open_chat_by_phone` | external effect |
+| `messages_manage_chat` | archive, mute, pin, read state, labels, groups, members, invite links, join, `open_chat_by_phone`, `open_chat_by_username` | external effect |
 | `messages_change_contacts` | add, delete, block, unblock a contact | external effect |
 | `messages_read_contacts` | contacts, blocked list, labels | read only |
 
@@ -306,6 +306,43 @@ carries this step as its `hint`. The list replaces the current one:
 
 ```sh
 python -m messaging_service set-messenger-operations --account account-demo --operations send_file open_chat_by_phone
+```
+
+## Opening a Telegram chat by username
+
+`open_chat_by_username` (ANYM-643) gives a Telegram person who has never been in a
+chat with the owner an archive `chat_id`. It runs on Telegram accounts only (WhatsApp
+gets `unsupported_operation` with `hint: telegram_accounts_only`) and needs what
+`open_chat_by_phone` needs: `send`, a full-account key, the account opt-in,
+`discover_chats` on, and through the gateway the `open_chat_by_username` action grant.
+
+1. Check: `parameters={"username": "@name"}` (`create` defaults to false). `@name`,
+   `name` and `https://t.me/name` are accepted (4-32 letters, digits or `_`, starting
+   with a letter) and bound lower-case; anything else gets `invalid_username`. The
+   collector makes one `contacts.ResolveUsername` request; the result is `found`,
+   `user_id`, `username`, `name`, `provider_lookup` and `chat_id` with `existing: true`
+   only when the person's private chat is already archived. Nothing is written.
+2. Show the owner the account, `@username`, name and exact text; obtain confirmation.
+3. Create: the same call with `"create": true` resolves again and returns `chat_id`
+   and `existing`; the private chat row is created only after the key, the opt-in and
+   the collection policy are rechecked against the resolved user ID.
+4. Send with `send_message(account, chat_id, text, request_id)` as usual.
+
+Only people: a channel, group or bot gets `recipient_not_user`; a name nobody holds,
+an invalid one or a deleted account gets `username_not_found`; a resolved user ID in
+`exclude_chats` gets `chat_not_collected`. These refusals have spent a lookup but
+write no chat. Each account allows at most 20 resolves per rolling hour, counted like
+the phone lookups above (previews and send rechecks alike); over it, `rate_limited`
+with `result.data.resets_in_seconds` and no request. The resolve has its own governor
+scope, so a Telegram flood wait of up to an hour pauses only username lookups, never
+sends (`rate_limited` with `retry_after`). The username, user ID and name go to
+and come from Telegram, are kept in the operation row, Telethon's session file and
+the chat title, and are not logged. `preview_message`, `send_message` and
+`messages_send` with a username run these steps for the caller
+([SENDING.md](SENDING.md#new-telegram-conversations-by-username)).
+
+```sh
+python -m messaging_service set-messenger-operations --account telegram-demo --operations send_file open_chat_by_username
 ```
 
 ## Group restrictions and join requests
