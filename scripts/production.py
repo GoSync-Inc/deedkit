@@ -1435,12 +1435,12 @@ def guard_rollback(serving, plan):
                 raise Refused(f"the schema inventory of {image} cannot be read ({detail}) while {named}; "
                               "a plan A rollback is refused") from exc
         return inventories[image]
-    current = inventory(serving["images"]["runtime"])
     for project, _, previous in plan:
         for service, image in sorted(previous.items()):
             if project["services"][service] not in MESSAGING_TARGETS:
                 continue
-            restored, where = inventory(image), f"{project['name']}/{service}'s restored image {image}"
+            current, restored = inventory(serving["images"]["runtime"]), inventory(image)
+            where = f"{project['name']}/{service}'s restored image {image}"
             order = inventory_order(current, restored)
             if order in ("equal", "older"):
                 continue

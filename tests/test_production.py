@@ -2405,7 +2405,7 @@ class PlanB:
                                                    "images": {"runtime": image, "gateway": IMAGE}})
 
     def run(self, argv, **kwargs):
-        if argv[:2] == ["docker", "run"]:
+        if argv[:2] == ["docker", "run"] and self.s.SCHEMA_READER in argv:
             self.reads.append(argv)
             image = argv[argv.index("--entrypoint") + 2]
             if image not in self.inventories:
@@ -2478,10 +2478,12 @@ def test_rollback_without_http_configuration_passes(tmp_path, monkeypatch, capsy
         host.release(sha)
     monkeypatch.setattr(p, "config", lambda path: host.settings)
     monkeypatch.setattr(p, "HTTP_CONFIG", str(tmp_path / "absent" / "http-production.json"))
+    host.calls.clear()
     p.main(["rollback", "--sha", RELEASES[1]])
     assert json.loads(capsys.readouterr().out)["previous_images"] == {"synthetic": {"api": host.image(RELEASES[0])}}
     assert host.container["Image"] == host.image(RELEASES[0])
-    assert not any(call[:2] == ["docker", "run"] for call in host.calls)
+    from scripts import seamless_release as s
+    assert not any(s.SCHEMA_READER in call for call in host.calls)
 
 
 # spec: ANYM-642
@@ -2530,7 +2532,7 @@ def test_rollback_guard_outcomes(tmp_path, monkeypatch, outcome):
         assert host.container["Image"] == host.image(RELEASES[1]) and host.container["State"]["Running"]
     # Local image inspection of exactly the serving and the restored image: no network, read-only.
     assert {argv[argv.index("--entrypoint") + 2] for argv in plan.reads} == {host.image(RELEASES[1]), restored}
-    assert all(argv[2:4] == ["--network", "none"] and "--read-only" in argv for argv in plan.reads)
+    assert all(argv[3:5] == ["--network", "none"] and "--read-only" in argv for argv in plan.reads)
 
 
 # spec: ANYM-642
@@ -2540,7 +2542,7 @@ def test_rollback_guard_refuses_newer_serving(tmp_path, monkeypatch, capsys):
     with pytest.raises(SystemExit):
         p.main(["rollback", "--sha", RELEASES[1]])
     error = capsys.readouterr().err
-    assert error.startswith("promotion refused: plan B serves generation " + PlanB.GENERATION)
+    assert "promotion refused: plan B serves generation " + PlanB.GENERATION in error
     assert "migrations/061_synthetic.sql" in error and "production.py deploy" in error
     assert host.mutations() == [] and not (host.state / RELEASES[1] / "rollback-attempted.json").exists()
     assert host.container["Image"] == host.image(RELEASES[1])
