@@ -1116,7 +1116,7 @@ def test_follow_stages_the_heads_verifier_code_from_its_attested_image_and_moves
     assert (packages/'messaging_service'/'__init__.py').stat().st_mode&0o777==0o644
     assert sorted(p.name for p in packages.iterdir())==['boto3-1.43.114.dist-info','deedkit-release.pth','messaging_service',
                                                         'six-1.17.0.dist-info']
-    assert (packages/'deedkit-release.pth').read_text().startswith('import os, sys; sys.path[:] = [os.path.realpath(p)')
+    assert (packages/'deedkit-release.pth').read_text()==s.f.RELEASE_PTH[1]
     assert not (Path(s.config['host_directory'])/s.v.CODE_SWITCH).exists() and (s.root/'releases'/HEAD/'.lease').is_file()
     assert s.extracted==[NEW_IMAGE] and s.releases()==sorted([OLD_CODE,HEAD])
     # The installed pair proven by the running code, the head's pair by its own staged code.
