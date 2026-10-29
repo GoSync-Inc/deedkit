@@ -364,3 +364,129 @@ def test_exact_chat_state_obeys_restricted_and_revoked_acl(dialogue_archive):
     with s.authorized(scoped,'list_chats') as (c,p):
         with pytest.raises(APIError,match='not_found'):
             conversation_state(c,p,'dialogue-wa',allowed)
+
+
+def contradicted_head(s, add, *changes):
+    """A Telegram private head with one open conflict per change, each at the head's own provider version."""
+    from messaging_service.archive import Archive
+    from test_archive import event
+    chat=add('head','incoming',account='dialogue-tg',chat='616')
+    with s.pool.connection() as c:
+        row=c.execute('SELECT id,sent_at FROM messages WHERE chat=%s',(chat,)).fetchone()
+    at=row['sent_at'].isoformat(); ar=Archive(s)
+    for change in changes:
+        assert ar.ingest(event(**{'account':'dialogue-tg','chat':'616','provider_id':'head','sent_at':at,'updated_at':at,
+            'body':'Synthetic text','metadata':{'chat_type':'private'},**change}))['outcome']=='conflict'
+    return chat,row['id']
+
+
+# spec: ANYM-616
+def test_a_known_conflict_class_keeps_the_head_stable_and_names_its_quote_caveat(dialogue_archive):
+    from messaging_service.conflict_classes import SHOWN
+    from messaging_service.presentation import render
+    s,key,add,query,catalog=dialogue_archive
+    chat,mid=contradicted_head(s,add,{'body':'Another synthetic text'})
+    result=query('dialogue-tg',chat)
+    assert result['suggested_action']=='review_incoming' and result['last_turn']=='peer'
+    assert result['basis']['code']=='last_archived_message_incoming' and 'next_step' not in result
+    known={'class':'telegram_body_equal_version','meaning':SHOWN['telegram_body_equal_version']}
+    assert result['basis']['evidence']==[{'message_id':mid,'revision':1,'conflict':known}]
+    assert 'archived text is shown' in known['meaning'] and 'provider may show the other' in known['meaning']
+    from test_compact_queue_rows import assert_each_fact_once
+    rows=render('list_chats',catalog(accounts=['dialogue-tg']),'compact')['items']
+    row=next(r for r in rows if r['id']==chat)
+    shown='awaiting_reply' if 'awaiting_reply' in row else 'last_message'
+    assert row[shown]['message_id' if shown=='awaiting_reply' else 'id']==mid
+    assert row['conversation']['known_conflicts']==[{'on':shown,**known}]
+    assert_each_fact_once(row)
+
+
+# spec: ANYM-616
+def test_a_known_conflict_beside_an_attention_conflict_is_answered_with_a_caveat(dialogue_archive):
+    s,key,add,query,catalog=dialogue_archive
+    chat,_=contradicted_head(s,add,{'body':'Another synthetic text'},{'sender':'43'})
+    result=query('dialogue-tg',chat)
+    assert result['basis']['code']=='message_version_conflict' and result['suggested_action']=='unclear'
+    assert result['next_step']=='answer_with_caveat'
+    assert not [e for e in result['basis']['evidence'] if 'conflict' in e]
+
+
+# spec: ANYM-616
+def test_a_conflict_without_a_stored_class_is_answered_with_a_caveat(dialogue_archive):
+    s,key,add,query,catalog=dialogue_archive
+    chat,mid=contradicted_head(s,add,{'body':'Another synthetic text'})
+    with s.pool.connection() as c:
+        # N-1 code inserts without a class.
+        c.execute('UPDATE message_conflicts SET reason=NULL,reason_version=NULL WHERE message=%s',(mid,))
+    result=query('dialogue-tg',chat)
+    assert result['basis']['code']=='message_version_conflict' and result['next_step']=='answer_with_caveat'
+
+
+# spec: ANYM-616
+def test_a_conflict_on_a_schema_before_stored_classes_is_answered_with_a_caveat(dialogue_archive,monkeypatch):
+    from messaging_service import store
+    from messaging_service.conflict_classes import CLASS_SCHEMA
+    s,key,add,query,catalog=dialogue_archive
+    chat,_=contradicted_head(s,add,{'body':'Another synthetic text'})
+    monkeypatch.setattr(store,'schema_version',lambda c:CLASS_SCHEMA-1)
+    result=query('dialogue-tg',chat)
+    assert result['basis']['code']=='message_version_conflict' and result['next_step']=='answer_with_caveat'
+
+
+# spec: ANYM-616
+def test_only_a_revision_changed_during_read_is_reread_now():
+    from messaging_service.conversation_state import NEXT_STEP
+    assert [code for code,step in NEXT_STEP.items() if step=='reread_now']==['message_revision_changed_during_read']
+    known={'active_conflicts':1,'conflict':{'class':'telegram_body_equal_version','next_step':'none_required'}}
+    result=state([message('out','outgoing',evidence={**known,'revision_changed_during_read':True})],platform='telegram')
+    assert result['basis']['code']=='message_revision_changed_during_read' and result['next_step']=='reread_now'
+
+
+# spec: ANYM-616
+@pytest.mark.parametrize('conflict',[None,'telegram_body_equal_version',{'class':None},{'class':['x']},
+    {'class':'unclassified'},{'class':'whatsapp_body_equal_version'}])
+def test_any_other_conflict_evidence_is_answered_with_a_caveat(conflict):
+    from messaging_service.conflict_classes import KNOWN
+    assert not [name for name in KNOWN if not name.startswith('telegram_')]
+    result=state([message('out','outgoing',evidence={'active_conflicts':1,'conflict':conflict})])
+    assert result['basis']['code']=='message_version_conflict' and result['next_step']=='answer_with_caveat'
+    assert 'conflict' not in result['basis']['evidence'][0]
+
+
+KNOWN_EVIDENCE={'active_conflicts':1,'conflict':{'class':'telegram_body_equal_version','next_step':'none_required'}}
+
+
+# spec: ANYM-616
+def test_a_shown_group_head_keeps_its_known_conflict_caveat_beside_owner_attention():
+    from messaging_service.conflict_classes import SHOWN
+    from messaging_service.presentation import lean_conversation
+    result=state([message('msg_head',evidence=KNOWN_EVIDENCE)],platform='telegram',chat_type='group',
+        attention=[message('msg_mention',second=10)])
+    assert result['suggested_action']=='review_incoming' and result['basis']['code']=='explicit_owner_attention'
+    known={'class':'telegram_body_equal_version','meaning':SHOWN['telegram_body_equal_version']}
+    assert result['latest_known_meaningful_message']['conflict']==known
+    assert lean_conversation(result)['known_conflicts']==[{'on':'latest_message_id',**known}]
+
+
+# spec: ANYM-616
+def test_a_compact_group_row_states_a_known_conflict_caveat_once():
+    from messaging_service.presentation import lean_chat
+    from test_compact_queue_rows import assert_each_fact_once
+    result=state([message('msg_head',evidence=KNOWN_EVIDENCE)],platform='telegram',chat_type='group',
+        attention=[message('msg_mention',second=10)])
+    row=lean_chat({'id':'chat_synthetic','account':'synthetic','title':'Synthetic group','type':'group',
+        'last_activity':NOW,'conversation':result,'awaiting_reply':True,'awaiting_reply_message_id':'msg_mention',
+        'awaiting_reply_sender':'synthetic-person','awaiting_reply_snippet':'Synthetic text'})
+    assert row['last_message']['id']=='msg_head' and row['awaiting_reply']['message_id']=='msg_mention'
+    assert [k['on'] for k in row['conversation']['known_conflicts']]==['last_message']
+    assert_each_fact_once(row)
+
+
+# spec: ANYM-616
+def test_a_shown_meaningful_fallback_keeps_its_known_conflict_caveat():
+    from messaging_service.presentation import lean_conversation
+    result=state([message('top',body='')],platform='telegram',
+        meaningful_fallback=message('older',second=5,evidence=KNOWN_EVIDENCE))
+    assert result['basis']['code']=='unclassified_latest_message'
+    assert result['latest_known_meaningful_message']['conflict']['class']=='telegram_body_equal_version'
+    assert [k['on'] for k in lean_conversation(result,shown=['older'])['known_conflicts']]==['latest_message_id']

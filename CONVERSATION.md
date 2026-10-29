@@ -92,6 +92,9 @@ two fields would carry the same fact, compact keeps the first and omits the othe
 - compact omits `owner_attention.suggested_action` when it equals
   `conversation.suggested_action`;
 - compact omits `owner_attention.next_step` when it equals `conversation.next_step`;
+- a `conversation.known_conflicts` entry names its message by `on` (`last_message`,
+  `awaiting_reply`, `latest_message_id`, `owner_attention.target_message_id` or
+  `candidate_message_ids[n]`) when the row already states that id, else by `message_id`;
   `next_step` itself stays when `basis` is omitted (see "Why a row is unclear");
 - `sender_name` in `last_message` and `awaiting_reply` is cut to 64 characters,
   as in compact messages.
@@ -318,7 +321,7 @@ it when `awaiting_reply.confidence` already states it.
 | `ambiguous_attention_reply_order` | a group attention message and the owner's reply share a time | `answer_with_caveat` |
 | `head_candidates_truncated` | more messages share the latest time than one read returns | `answer_with_caveat` |
 | `message_revision_changed_during_read` | the chat changed while being read | `reread_now` |
-| `message_version_conflict` | two versions of a head message conflict | `reread_now` |
+| `message_version_conflict` | two versions of a head message conflict; the archive shows its retained revision, a reread does not change it | `answer_with_caveat` |
 | `rate_limited` | the provider asked us to wait | `wait_for_provider_cooldown` |
 | `provider_temporarily_unavailable` | the provider failed briefly | `wait_for_provider_cooldown` |
 | `provider_unavailable` | the account or peer cannot be read | `check_provider_access` |
@@ -326,6 +329,15 @@ it when `awaiting_reply.confidence` already states it.
 | `unclassified_latest_message` | the latest item is not a normal message | `get_context` |
 | `chat_type_unknown` | the chat type is not known yet | `get_context` |
 | `no_archived_messages` | nothing archived yet | `wait_for_history` |
+
+A head conflict whose open conflicts are all of a known class (COLLECTOR_STATES.md; only
+Telegram has known classes, so every WhatsApp conflict reads `message_version_conflict`) leaves
+the block stable: each shown message (`latest_known_meaningful_message(s)`,
+`owner_attention.target_message`) and its `basis.evidence[]` entry carry `conflict: {class,
+meaning}` whatever the basis, compact `known_conflicts` lists each such message once (`on` names
+the field that already states its id, else `message_id`), and `meaning` says the provider may show the
+other version now, so a quote needs a caveat. Any other class, `unclassified`, a class not
+stored (rows from before schema 54) or a mix with one of them reads `message_version_conflict`.
 
 `retry_after_s` sits beside `next_step: wait_for_provider_cooldown` for `rate_limited`
 when the account's collector recorded its backoff: whole seconds until it ends.

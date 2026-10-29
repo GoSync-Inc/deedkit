@@ -161,7 +161,7 @@ def lean_view(view):
     return result
 
 
-def lean_conversation(state, *, shown=()):
+def lean_conversation(state, *, shown=(), place=True):
     """Heuristic chat-head state without repeating message bodies already shown."""
     if not state:return state
     result={'last_turn':state['last_turn'],'suggested_action':state['suggested_action'],
@@ -172,6 +172,13 @@ def lean_conversation(state, *, shown=()):
     if state.get('order_status')=='ambiguous':
         result['order_status']='ambiguous'
         result['candidate_message_ids']=[m['message_id'] for m in state['basis'].get('evidence',[])]
+    # A known version conflict leaves the block stable; its meaning is the agent's quote caveat for every message
+    # the block names or shows, whatever its basis (ANYM-616).
+    known={}
+    for m in [*state['basis'].get('evidence',[]),state.get('latest_known_meaningful_message'),
+            *(state.get('latest_known_meaningful_messages') or []),(state.get('owner_attention') or {}).get('target_message')]:
+        if m and m.get('conflict'):known.setdefault(m.get('message_id') or m.get('id'),m['conflict'])
+    if known:result['known_conflicts']=[{'message_id':k,**v} for k,v in known.items()]
     latest=state.get('latest_known_meaningful_message')
     if latest:
         result['latest_message_id']=latest['id']
@@ -192,6 +199,21 @@ def lean_conversation(state, *, shown=()):
     problems={k:coverage[k] for k in ('gaps','last_error_code') if coverage.get(k)}
     if problems:result['coverage']=problems
     if state.get('catchup'):result['catchup']=state['catchup']
+    return place_conflicts(result,{}) if place else result
+
+
+def place_conflicts(result, stated):
+    """A known-conflict caveat names its message once in a compact row (ANYM-269, ANYM-616): `on` is the field that
+    already states the message's id, else the entry keeps message_id. `stated` maps row-level ids to their field."""
+    known=result.get('known_conflicts')
+    if not known:return result
+    stated=dict(stated)
+    if result.get('latest_message_id'):stated.setdefault(result['latest_message_id'],'latest_message_id')
+    target=(result.get('owner_attention') or {}).get('target_message_id')
+    if target:stated.setdefault(target,'owner_attention.target_message_id')
+    for n,m in enumerate(result.get('candidate_message_ids') or ()):stated.setdefault(m,f'candidate_message_ids[{n}]')
+    result['known_conflicts']=[{'on':stated[e['message_id']],**{k:v for k,v in e.items() if k!='message_id'}}
+        if e['message_id'] in stated else e for e in known]
     return result
 
 
@@ -318,7 +340,7 @@ def omit_fixed(result, last, hint, kind, self_chat):
 def lean_queue_conversation(state, last, hint, *, kind=None, self_chat=False):
     """Compact omits a conversation field when it equals a shown message or hint field, or the row fixes it."""
     shown=[m for m in (last and last['id'],hint and hint.get('message_id')) if m]
-    result=lean_conversation(state,shown=shown)
+    result=lean_conversation(state,shown=shown,place=False)
     if result.get('latest_message_id') in shown:result.pop('latest_message_id')
     attention=result.get('owner_attention')
     if attention:
@@ -333,6 +355,9 @@ def lean_queue_conversation(state, last, hint, *, kind=None, self_chat=False):
         result['candidate_message_ids']=[m for m in result['candidate_message_ids'] if m not in stated]
         if not result['candidate_message_ids']:result.pop('candidate_message_ids')
     if hint and result['basis'] in (hint.get('confidence'),hint.get('basis')):result.pop('basis')
+    # The hint is the head when both name one message: last_message is then omitted from the row.
+    shown_fields={(last or {}).get('id'):'last_message',(hint or {}).get('message_id'):'awaiting_reply'}
+    place_conflicts(result,{k:v for k,v in shown_fields.items() if k})
     return omit_fixed(result,last,hint,kind,self_chat)
 
 

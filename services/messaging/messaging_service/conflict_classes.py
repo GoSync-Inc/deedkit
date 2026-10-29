@@ -142,3 +142,21 @@ def listing(c, chat):
         (chat, known_classes(), LISTING_LIMIT)).fetchall()
     return [{'message_id': r['message_id'], 'class': r['class'], 'explanation': explanation(r['class']),
              'observed_at': r['observed_at']} for r in rows]
+
+
+# ANYM-616: what a known class means for a quote of the archived message a conversation block shows.
+SHOWN = {
+    'telegram_body_equal_version': 'Two texts at one provider version; the archived text is shown and the provider may show the other now, so caveat a quote.',
+    'telegram_direction_equal_version': 'Two directions at one provider version; the archived direction is shown and the provider may show the other (and its text) now, so caveat a quote.',
+}
+
+
+def known_conflict(evidence):
+    """{class, meaning} when a message's open conflicts are all of a KNOWN class, else None.
+
+    result_evidence names one class per message, a class that needs attention first, so a known class there means
+    every open conflict of the message is known."""
+    if not isinstance(evidence, dict) or not evidence.get('active_conflicts'): return None
+    conflict = evidence.get('conflict')
+    name = conflict.get('class') if isinstance(conflict, dict) else None
+    return {'class': name, 'meaning': SHOWN[name]} if isinstance(name, str) and name in KNOWN and name in SHOWN else None

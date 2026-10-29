@@ -100,7 +100,9 @@ TABLE_CASES = [
     ([message('a', 'incoming', body='', kind='unknown')], {}, 'unclassified_latest_message', 'get_context'),
     ([message('x', 'outgoing', evidence={'revision_changed_during_read': True})], {},
         'message_revision_changed_during_read', 'reread_now'),
-    ([message('x', 'outgoing', evidence={'active_conflicts': 1})], {}, 'message_version_conflict', 'reread_now'),
+    # ANYM-616 moved this pair to answer_with_caveat; the case keeps its Tiden ID.
+    pytest.param([message('x', 'outgoing', evidence={'active_conflicts': 1})], {}, 'message_version_conflict',
+        'answer_with_caveat', id='messages4-changes4-message_version_conflict-reread_now'),
     ([message('x', 'outgoing')], {'history': {'last_head_scan_at': None}}, 'provider_head_not_verified',
         'answer_with_caveat'),
     ([message('x', 'outgoing')], {'history': {'last_head_scan_at': NOW - timedelta(minutes=6)}},
