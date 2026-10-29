@@ -67,7 +67,8 @@ def resolution_set(c, value):
 class Job:
     """`function(row)` gets a read-only mapping of one row's stored evidence (`envelope`: the receipt envelope,
     `observed`: the observed revision's snapshot, `observed_revision`, `candidate_updated_at`, `reason`,
-    `archive_version`: the message's provider version now, `tombstoned`: a provider tombstone names it) and returns
+    `archive_version`: the message's provider version now, `tombstoned`: a provider tombstone names it,
+    `reconstructed`: migration 017 chose `observed_revision` by transaction times on a message with more revisions) and returns
     a class name (`classify`), 'keep' or 'resolve' (`resolve`), or None or a candidate envelope the current rule
     accepts as a new revision (`accept`). `classes` are fnmatch patterns over ANYM-557's classes."""
     name: str
@@ -139,7 +140,7 @@ def still_raised(row):
 
 def _decide(job, row):
     evidence = MappingProxyType({key: deepcopy(row[key]) for key in
-        ('envelope', 'observed', 'observed_revision', 'candidate_updated_at', 'reason', 'archive_version', 'tombstoned')})
+        ('envelope', 'observed', 'observed_revision', 'candidate_updated_at', 'reason', 'archive_version', 'tombstoned', 'reconstructed')})
     try: result = job.function(evidence)
     except Exception: raise Failed('evaluation_error') from None
     if job.kind == 'classify' and isinstance(result, str) and result in EXPLANATIONS: return result
@@ -156,6 +157,7 @@ SCOPE = '''FROM message_conflicts mc JOIN messages m ON m.id=mc.message
     AND (%(at)s::timestamptz IS NULL OR (mc.observed_at,mc.receipt_digest)>(%(at)s::timestamptz,%(digest)s::text))'''
 CANDIDATES = '''SELECT mc.receipt_digest AS digest,mc.message,mc.observed_at,mc.observed_revision,mc.reason,
     mc.candidate_updated_at,r.envelope,v.snapshot AS observed,m.provider_updated_at AS archive_version,
+    (r.digest IS NULL OR mc.observed_at<=r.received_at) AND m.revision<>1 AS reconstructed,
     EXISTS(SELECT 1 FROM provider_tombstones t WHERE t.account=m.account AND t.provider_id=m.provider_id
         AND t.provider_chat IN ((SELECT provider_chat FROM chats WHERE id=m.chat),'')) AS tombstoned
     FROM message_conflicts mc JOIN messages m ON m.id=mc.message

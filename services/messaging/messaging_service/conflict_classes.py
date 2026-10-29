@@ -103,10 +103,14 @@ def reclassify(row):
     only at the archive's version (archive.ingest_outcome), so their relation is `equal_version`. An identity conflict
     is raised at any version: its relation is exact only when the version now equals the observed revision's, since the
     stored version never goes back (a revision is never stale; an unchanged re-read takes greatest) and so it was that
-    one at the conflict too, and no provider tombstone rewrote the candidate; otherwise `unordered`. Never raises."""
+    one at the conflict too, and no provider tombstone rewrote the candidate; otherwise `unordered`. A row migration 017
+    reconstructed (its observed_at is the receipt's received_at, chat_evidence.backfill) names its revision by
+    transaction start times, which need not follow the account lock: on a message with more than one revision that
+    revision may not be the contradicted one, so it is `unclassified` (Astra r1 on #454). Never raises."""
     try:
         envelope, observed = row['envelope'], row['observed']
         if not isinstance(envelope, dict) or not isinstance(observed, dict): return UNCLASSIFIED
+        if row['reconstructed'] is not False: return UNCLASSIFIED
         name = classify(observed, envelope, _time(envelope['updated_at']))
         if name == UNCLASSIFIED: return name
         platform, field = name[:-len('_equal_version')].split('_', 1)

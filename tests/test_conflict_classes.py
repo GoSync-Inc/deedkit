@@ -207,6 +207,24 @@ def test_existing_identity_rows_are_exact_only_when_the_version_provably_held(ar
 
 
 # spec: ANYM-622
+def test_rows_migration_17_reconstructed_on_a_message_with_later_revisions_stay_unclassified(archive):
+    ar,s,key,_=archive
+    # Migration 017 named each older row's revision by transaction start times (chat_evidence.backfill) and stored the
+    # receipt's received_at as observed_at; on a message with more than one revision that revision may be the wrong one.
+    edited=contradict(ar,'e',direction='outgoing',updated_at='2026-10-01T12:05:00+00:00')
+    assert ar.ingest(event(provider_id='e',body='Вторая версия',updated_at='2026-10-01T12:01:00+00:00'))['outcome']=='edited'
+    single=contradict(ar,'s',direction='outgoing',updated_at='2026-10-01T12:05:00+00:00')
+    with s.pool.connection() as c:
+        c.execute('''UPDATE message_conflicts mc SET observed_at=r.received_at FROM ingest_receipts r
+            WHERE r.digest=mc.receipt_digest AND mc.message=ANY(%s)''',([edited,single],))
+    legacy(s,edited,single)
+    classify_existing(ar,s)
+    assert stored(s,edited)['reason']=='unclassified' and stored(s,edited)['resolved_at'] is None
+    assert stored(s,single)['reason']=='telegram_direction_newer_version'  # one revision: no other it could mean
+    assert account(s,key)['conflicts']['attention']==2
+
+
+# spec: ANYM-622
 def test_classify_existing_touches_only_open_rows_without_a_class_and_reruns_write_nothing(archive):
     ar,s,key,_=archive
     resolved=contradict(ar,'r',direction='outgoing',updated_at='2026-10-01T12:01:00+00:00')
@@ -254,11 +272,13 @@ def test_reclassify_is_equal_version_for_content_and_exact_or_unordered_for_iden
     change={'formatting':telegram(SNAPSHOT['body'],[])} if field=='other' else {field:CHANGES[field]}
     envelope=event(**change,updated_at=at(candidate).isoformat())
     archive_version=at(archived) if archived>=0 else None
-    name=reclassify({'envelope':envelope,'observed':SNAPSHOT,'archive_version':archive_version,'tombstoned':tombstoned})
+    row={'envelope':envelope,'observed':SNAPSHOT,'archive_version':archive_version,'tombstoned':tombstoned,'reconstructed':False}
+    name=reclassify(row)
     if field not in IDENTITY: assert name==f'telegram_{field}_equal_version'
     elif archived==0 and tombstoned is False: assert name==classify(SNAPSHOT,envelope)!='unclassified'
     else: assert name==f'telegram_{field}_unordered'
-    assert reclassify({'envelope':None,'observed':SNAPSHOT,'archive_version':None,'tombstoned':False})=='unclassified'
+    assert reclassify({**row,'reconstructed':True})==reclassify({**row,'reconstructed':None})=='unclassified'
+    assert reclassify({**row,'envelope':None})=='unclassified'
 
 
 # spec: ANYM-557

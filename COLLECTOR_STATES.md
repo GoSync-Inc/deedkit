@@ -101,7 +101,9 @@ counts as attention. Rows stored without a class (before migration 054, or by
 older code later) get one from the `classify` job below (ANYM-622): content
 fields `equal_version`; identity fields the exact relation only when the
 message's provider version still equals the observed revision's and no provider
-tombstone names it, else `unordered`. Resolved rows keep no class.
+tombstone names it, else `unordered`. A row migration 017 reconstructed (its
+contradicted revision chosen by transaction times) on a message with more than
+one revision stays `unclassified`. Resolved rows keep no class.
 
 ### Conflict re-evaluation (ANYM-621)
 
