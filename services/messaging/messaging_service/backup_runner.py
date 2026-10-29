@@ -563,12 +563,17 @@ class Runner:
         self.journal['phase']='stream_upload';self.save();self.status('uploading')
         def start(encode):write_json(work/'stream-start.json',{'action':'start' if encode else 'skip'})
         async def completed():
+            # Runs inside the upload deadline: the local result.json stat stays at 0.1 s, the docker
+            # inspect runs once per POLL_SECONDS.
+            loop=asyncio.get_running_loop();inspected=None
             while not (work/'result.json').exists():
-                info=self.check_worker(self.docker.inspect(self.journal['container']))
-                if info is None or not info['State']['Running']:
-                    if (work/'result.json').exists():break
-                    raise RuntimeError('backup_capture_failed')
-                await asyncio.sleep(POLL_SECONDS)
+                if inspected is None or loop.time()-inspected>=POLL_SECONDS:
+                    inspected=loop.time()
+                    info=self.check_worker(self.docker.inspect(self.journal['container']))
+                    if info is None or not info['State']['Running']:
+                        if (work/'result.json').exists():break
+                        raise RuntimeError('backup_capture_failed')
+                await asyncio.sleep(.1)
             result=read_json(work/'result.json')
             if (result.get('v')!=2 or result.get('id')!=metadata['id'] or result.get('status')!='encrypted' or
                 result.get('snapshot_sha256')!=metadata['snapshot_sha256']):raise RuntimeError('invalid_backup_result')

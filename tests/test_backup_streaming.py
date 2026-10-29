@@ -254,9 +254,10 @@ def test_stream_runner_reports_finished_or_failed_worker_to_the_stream_wait(tmp_
 
 
 class SlowCaptureDocker(StreamingDocker):
-    """The worker writes captured.json at 7.5 s and stream.json at 10 s of the runner's clock."""
-    def __init__(self,root,now):
-        super().__init__(root);self.now=now;self.work=None;self.polls=[];self.resumed=[]
+    """The worker writes captured.json at 7.5 s and stream.json at ``stream_at`` (10 s; None: never) of the runner's
+    clock."""
+    def __init__(self,root,now,stream_at=10):
+        super().__init__(root);self.now=now;self.work=None;self.polls=[];self.resumed=[];self.stream_at=stream_at
     def call(self,*args):
         if args[0]=='start' and args[1].startswith('pos-backup-'):
             info=self.containers[args[1]];info['State'].update(Running=True,Status='running')
@@ -271,7 +272,7 @@ class SlowCaptureDocker(StreamingDocker):
     def advance(self,seconds):
         before=self.now[0];self.now[0]+=seconds
         if before<7.5<=self.now[0]:write_json(self.work/'captured.json',{'id':self.work.name,'status':'capture_complete'})
-        if before<10<=self.now[0]:
+        if self.stream_at is not None and before<self.stream_at<=self.now[0]:
             write_json(self.work/'stream.json',{'v':2,'id':self.work.name,'snapshot_sha256':SNAPSHOT,'max_bytes':4096,
                                                 'captured_at':'2026-10-14T00:00:00+00:00'})
 
@@ -289,6 +290,56 @@ def test_a_ten_second_streaming_capture_inspects_the_worker_once_a_second_and_re
     assert len(docker.polls)<=11  # 0.1-s polling made about 100
     first_after=min(t for t in docker.polls if t>=7.5)
     assert docker.resumed==[first_after] and first_after<=7.5+backup_runner.POLL_SECONDS
+
+
+# spec: ANYM-635
+def test_the_capture_and_fence_helper_deadlines_fire_within_one_poll_of_expiry(tmp_path):
+    async def send(*_args,**_kwargs):raise AssertionError('no delivery without stream.json')
+    runner,_=streaming_runner(tmp_path/'capture',send)
+    now=[0.0];docker=SlowCaptureDocker(tmp_path/'capture',now,stream_at=None)
+    runner.docker,runner.clock,runner.sleep=docker,(lambda:now[0]),docker.advance
+    with pytest.raises(RuntimeError,match='backup_capture_timeout'):runner.run()
+    assert runner.cfg['timeout_seconds']<now[0]<=runner.cfg['timeout_seconds']+backup_runner.POLL_SECONDS
+    assert len(docker.polls)<=runner.cfg['timeout_seconds']+2
+    runner,docker=runner_fixture(tmp_path/'helper')
+    runner.journal={'id':ID};work=tmp_path/'helper'/ID;work.mkdir();docker.hold_worker=True
+    now=[0.0];inspected=[];inspect=docker.inspect
+    def counted(cid):
+        if cid.startswith('pos-backup-release-'):inspected.append(now[0])
+        return inspect(cid)
+    def advance(seconds):now[0]+=seconds
+    docker.inspect,runner.clock,runner.sleep=counted,(lambda:now[0]),advance
+    with pytest.raises(RuntimeError,match='backup_fence_release_failed'):
+        runner.fence_action(work,'release',[{'id':ID,'status':'fence_released'}],'backup_fence_release_failed')
+    assert 60<now[0]<=60+backup_runner.POLL_SECONDS and len([t for t in inspected if t>0])<=61  # 0.1 s: about 600
+
+
+# spec: ANYM-635
+def test_the_stream_result_is_seen_within_a_tenth_of_a_second_while_the_worker_is_inspected_once_a_second(tmp_path):
+    holding,timing,seen=[False],[],[]
+    async def send(path,metadata,transfer,timeout,start,completed,stopped=None):
+        start(True);holding[0]=True
+        async def worker():
+            await asyncio.sleep(.25)
+            write_json(path.parent/'result.json',{'v':2,'id':metadata['id'],'snapshot_sha256':metadata['snapshot_sha256'],
+                                                  'status':'encrypted','bytes':64,'sha256':'c'*64})
+            holding[0]=False
+        task=asyncio.create_task(worker());loop=asyncio.get_running_loop();began,before=loop.time(),len(seen)
+        result=await asyncio.wait_for(completed(),.6)  # 1-s sleeps between result.json checks miss this bound
+        timing.append((loop.time()-began,len(seen)-before));await task
+        return {**result,'status':'stored','duplicate':False}
+    runner,docker=streaming_runner(tmp_path,send);inspect=docker.inspect
+    def counted(cid):
+        if not cid.startswith('pos-backup-'):return inspect(cid)
+        seen.append(cid)
+        if not holding[0]:return inspect(cid)
+        docker.hold_worker=True
+        try:return FakeDocker.inspect(docker,cid)  # running, no result yet
+        finally:docker.hold_worker=False
+    docker.inspect=counted
+    runner.run()
+    assert read_json(tmp_path/'status.json')['state']=='ok'
+    assert timing[0][0]<.5 and timing[0][1]==1
 
 
 def test_stream_runner_lost_receipt_uses_duplicate_without_reencryption(tmp_path):
