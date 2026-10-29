@@ -1730,12 +1730,78 @@ def test_auto_pause_skips_an_endpoint_while_an_attempt_holds_it_and_reads_that_a
             lock_endpoint(attempt, eid, shared=True)
             attempt.execute("""UPDATE subscription_outbox SET state='delivered',finished_at=clock_timestamp()
                 WHERE id=%s""", (hint['id'],))
-            assert auto_pause(store, eid) is False and endpoint_state(store, eid)['state'] == 'enabled'
+            assert auto_pause(store, eid) is None and endpoint_state(store, eid)['state'] == 'enabled'
         assert auto_pause(store, eid) is False and endpoint_state(store, eid)['state'] == 'enabled'
         # Three dead letters after that success pause it.
         with store.pool.connection() as c:
             dead_letters(c, hint)
         assert auto_pause(store, eid) is True and endpoint_state(store, eid)['state'] == 'auto_paused'
+    finally:
+        store.set_delivery_features(False)
+
+
+# spec: ANYM-520
+def test_a_pause_check_a_held_lock_deferred_runs_on_a_later_idle_pass(seeded, tmp_path, monkeypatch):
+    from messaging_service.delivery_endpoints import lock_endpoint
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    [(token, eid, sids)] = endpoint_keys(store, tmp_path, monkeypatch, [1])
+    try:
+        version = endpoint_state(store, eid)['version']
+        with store.pool.connection() as c:
+            hint = c.execute('SELECT id,subscription FROM subscription_outbox WHERE endpoint=%s', (eid,)).fetchone()
+            for _ in range(2):
+                c.execute('''INSERT INTO delivery_attempts(endpoint,hint,subscription,attempt,outcome,http_status,
+                    error_code) VALUES(%s,%s,%s,1,'dead_letter',301,'redirect')''', (eid, hint['id'], hint['subscription']))
+        with store.pool.connection() as other:
+            # Another lane's attempt holds the lock while the third redirect dead-letters the last queued hint.
+            lock_endpoint(other, eid, shared=True)
+            stats = dispatch_hints(store, transport=lambda *a, **k: 301, resolver=PUBLIC)
+            assert stats['dead_letter'] == 1 and 'auto_paused' not in stats
+            assert endpoint_state(store, eid) == {'state': 'enabled', 'version': version}
+        # The next pass has nothing to send and no new failure, yet it runs the deferred check.
+        assert dispatch_hints(store, transport=lambda *a, **k: pytest.fail('nothing is due'),
+            resolver=PUBLIC)['auto_paused'] == 1
+        assert endpoint_state(store, eid) == {'state': 'auto_paused', 'version': version + 1}
+        health = store.get_subscription(token, sids[0])['delivery']['delivery_health']
+        assert (health['state'], health['consecutive_failures']) == ('auto_paused', 3)
+    finally:
+        store.set_delivery_features(False)
+
+
+# spec: ANYM-520
+def test_an_expiring_resume_test_never_waits_for_an_endpoint_a_change_holds_and_settles_on_a_later_pass(seeded,
+        tmp_path, monkeypatch):
+    import threading
+    from messaging_service.event_delivery import endpoint_tests
+    store, _, _ = seeded
+    [(token, eid, _)] = endpoint_keys(store, tmp_path, monkeypatch, [1])
+    try:
+        version = paused_endpoint(store, eid)
+        pending = store.update_delivery_endpoint(token, eid, version, 'resume')
+        with store.pool.connection() as c:
+            c.execute("UPDATE delivery_endpoint_tests SET created_at=created_at-interval '6 minutes' WHERE id=%s",
+                (pending['test']['test_id'],))
+        done = threading.Event()
+        def expire():
+            endpoint_tests(store, transport=lambda *a, **k: pytest.fail('an expired test is never sent'), resolver=PUBLIC)
+            done.set()
+        with store.pool.connection() as change:
+            # A delete or update holds the endpoint lock and row, then cancels the endpoint's queued tests.
+            change.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))', ('delivery-endpoint:' + eid,))
+            change.execute('SELECT id FROM delivery_endpoints WHERE id=%s FOR UPDATE', (eid,))
+            worker = threading.Thread(target=expire, daemon=True)
+            worker.start()
+            assert done.wait(20), 'the dispatcher waited for the endpoint row while holding the test'
+            change.execute("""UPDATE delivery_endpoint_tests SET finished_at=finished_at WHERE endpoint=%s
+                AND state IN ('pending','leased','failed')""", (eid,))
+        assert endpoint_state(store, eid) == {'state': 'auto_paused', 'version': version}
+        # Once the lock is free, the next pass moves the paused endpoint one version on; the repeat replays.
+        endpoint_tests(store, transport=lambda *a, **k: pytest.fail('nothing is due'), resolver=PUBLIC)
+        assert endpoint_state(store, eid) == {'state': 'auto_paused', 'version': version + 1}
+        with pytest.raises(APIError, match='endpoint_test_failed') as refused:
+            store.update_delivery_endpoint(token, eid, version, 'resume')
+        assert (refused.value.test_error, refused.value.version) == ('test_expired', version + 1)
     finally:
         store.set_delivery_features(False)
 

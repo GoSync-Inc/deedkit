@@ -44,7 +44,7 @@ PAUSE_DEAD_LETTERS = 3
 PAUSE_SILENT_HOURS = 24
 # A resume's signed test: request ID `resume/<endpoint version>/<random>`. `/` is outside _REQUEST, so no agent request
 # ID can name one, and only these tests reach a paused endpoint (fenced). The endpoint version is the resume's
-# identity: one test per version. A test the dispatcher settles undelivered advances the version (settle_resume), so
+# identity: one test per version. A resume test that failed advances the version (settle_resume, settle_resumes), so
 # repeating that resume replays its refusal and only a resume with the new version sends another test.
 RESUME_PREFIX = 'resume/'
 PAUSED = ('agent_paused', 'auto_paused')
@@ -761,8 +761,8 @@ def _latest_resume_test(c, endpoint_id, version):
 
 
 def _replay_refusal(c, row, version):
-    """A repeated resume of a version whose test the dispatcher settled undelivered (settle_resume moved the paused
-    endpoint one version on): the same refusal, carrying the new version, and no second test."""
+    """A repeated resume of a version whose test failed (settle_resume moved the paused endpoint one version on):
+    the same refusal, carrying the new version, and no second test."""
     if type(version) is not int or row['state'] not in PAUSED or row['version'] != version + 1:
         return
     test = _latest_resume_test(c, row['id'], version)
@@ -795,23 +795,51 @@ def _resume_test(c, p, row, request_id):
     return _stage_test(c, row['id'], prefix + uuid4().hex[:16])
 
 
+# The latest resume test of the endpoint's current version failed: the endpoint moves one version on.
+_SETTLE_DUE = '''e.state IN ('agent_paused','auto_paused') AND (SELECT t.state FROM delivery_endpoint_tests t
+    WHERE t.endpoint=e.id AND starts_with(t.request_id,'resume/'||e.version||'/')
+    ORDER BY t.created_at DESC,t.id DESC LIMIT 1)='failed\''''
+_SETTLE = 'UPDATE delivery_endpoints e SET version=version+1,updated_at=clock_timestamp() WHERE e.id=%s AND e.version=%s AND '
+
+
 def settle_resume(c, test, state):
-    """The dispatcher's side of a resume's identity: a resume test it settles undelivered moves the still-paused
-    endpoint one version on, in its own savepoint, so a repeat of that resume replays the refusal instead of sending
-    a second test. A failed write (the schema-61 grant missing during a rollout) is logged; the repeat then refuses
-    from the failed test itself."""
+    """The dispatcher's side of a resume's identity: a resume test that failed moves the still-paused endpoint one
+    version on, so a repeat of that resume replays the refusal instead of sending a second test (a cancelled one was
+    never sent and is staged again). Called where the attempt holds the endpoint lock shared, in its own savepoint; a
+    failed write (the schema-61 grant missing during a rollout) is logged and settle_resumes retries it."""
     import psycopg
     version = resume_version(test['request_id'])
-    if version is None or state == 'delivered':
+    if version is None or state != 'failed':
         return False
     try:
         with c.transaction():
-            return c.execute('''UPDATE delivery_endpoints SET version=version+1,updated_at=clock_timestamp()
-                WHERE id=%s AND version=%s AND state IN ('agent_paused','auto_paused')''',
-                (test['endpoint'], version)).rowcount == 1
+            return c.execute(_SETTLE + _SETTLE_DUE, (test['endpoint'], version)).rowcount == 1
     except psycopg.Error as caught:
         print(json.dumps({'error': 'resume_settle_failed', 'class': type(caught).__name__}), flush=True)
         return False
+
+
+def settle_resumes(store, *, limit=32):
+    """Each dispatcher pass: a paused endpoint whose current version's resume test failed and was not settled where
+    it finished (an expired or unknown-outcome test settled before the endpoint lock, or the grant missing then) moves
+    one version on. Each in its own transaction under the endpoint lock, taken shared and without waiting, while no
+    test row is held, so it never waits in a cycle with an API change; a held lock leaves it to the next pass."""
+    import psycopg
+    try:
+        with store.pool.connection() as c:
+            due = c.execute('SELECT e.id,e.version FROM delivery_endpoints e WHERE ' + _SETTLE_DUE +
+                ' ORDER BY e.updated_at,e.id LIMIT %s', (limit,)).fetchall()
+        settled = 0
+        for row in due:
+            with store.pool.connection() as c:
+                if not c.execute('SELECT pg_try_advisory_xact_lock_shared(hashtextextended(%s,0)) AS got',
+                        ('delivery-endpoint:' + str(row['id']),)).fetchone()['got']:
+                    continue
+                settled += c.execute(_SETTLE + _SETTLE_DUE, (row['id'], row['version'])).rowcount
+        return settled
+    except psycopg.Error as caught:
+        print(json.dumps({'error': 'resume_settle_failed', 'class': type(caught).__name__}), flush=True)
+        return None
 
 
 def wake_backlog(c, p, row):
@@ -1214,13 +1242,11 @@ def dispatch_tests(store, *, limit=8, transport, resolver, served=None):
                 # age check and DNS, so neither turns "may have arrived" into test_expired or receiver_unavailable.
                 c.execute("""UPDATE delivery_endpoint_tests SET state='failed',error_code='outcome_unknown',
                     finished_at=clock_timestamp(),lease_token=NULL,lease_until=NULL WHERE id=%s""", (test['id'],))
-                settle_resume(c, test, 'failed')
                 stats['failed'] += 1
                 continue
             if c.execute("SELECT %s<clock_timestamp()-interval '5 minutes' AS old", (test['created_at'],)).fetchone()['old']:
                 c.execute("""UPDATE delivery_endpoint_tests SET state='failed',error_code='test_expired',
                     finished_at=clock_timestamp(),lease_token=NULL,lease_until=NULL WHERE id=%s""", (test['id'],))
-                settle_resume(c, test, 'failed')
                 stats['failed'] += 1
                 continue
             c.execute("""UPDATE delivery_endpoint_tests SET state='leased',lease_token=%s,
@@ -1319,13 +1345,13 @@ def auto_pause(store, endpoint_id):
     delivered hint or test, an enabled endpoint becomes auto_paused: its queued hints and tests are cancelled (events
     stay fetchable, nothing is ACKed). Its own transaction under the endpoint lock taken exclusive and without
     waiting: an attempt holds it shared until its outcome commits, so the decision reads every finished attempt and
-    never races a pause, resume or delete; a held lock skips the endpoint until the next pass. Returns True when it
-    paused."""
+    never races a pause, resume or delete. Returns True when it paused, None when the lock was held (the dispatcher
+    checks the endpoint again on its next pass)."""
     with store.pool.connection() as c:
         gate_on(c)
         if not c.execute('SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS got',
                 ('delivery-endpoint:' + str(endpoint_id),)).fetchone()['got']:
-            return False
+            return None
         row = c.execute('SELECT id,state FROM delivery_endpoints WHERE id=%s FOR UPDATE', (endpoint_id,)).fetchone()
         if row is None or row['state'] != 'enabled':
             return False

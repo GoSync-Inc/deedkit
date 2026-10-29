@@ -440,15 +440,30 @@ def _prune(store):
         print(json.dumps({'error': 'delivery_attempt_prune_failed', 'class': type(error).__name__}), flush=True)
 
 
+# ANYM-520: endpoints whose pause check found the endpoint lock held, rechecked on every later pass until it runs.
+# In-process: after a restart the next failed attempt names the endpoint again.
+_DEFERRED_PAUSES = set()
+_DEFERRED_LOCK = threading.Lock()
+
+
 def _auto_pause(store, endpoints, stats):
-    """ANYM-520: the pause rule for each endpoint that failed in this pass; a failure here never stops hints."""
+    """ANYM-520: the pause rule for each endpoint that failed in this pass, and for each one a held lock deferred
+    earlier; a failure here never stops hints."""
     from .delivery_endpoints import auto_pause
-    for endpoint in sorted(endpoints, key=str):
+    with _DEFERRED_LOCK:
+        candidates = set(endpoints) | _DEFERRED_PAUSES
+        _DEFERRED_PAUSES.difference_update(candidates)
+    for endpoint in sorted(candidates, key=str):
         try:
-            if auto_pause(store, endpoint):
-                stats['auto_paused'] = stats.get('auto_paused', 0) + 1
+            paused = auto_pause(store, endpoint)
         except Exception as error:
             print(json.dumps({'error': 'delivery_auto_pause_failed', 'class': type(error).__name__}), flush=True)
+            continue
+        if paused is None:
+            with _DEFERRED_LOCK:
+                _DEFERRED_PAUSES.add(endpoint)
+        elif paused:
+            stats['auto_paused'] = stats.get('auto_paused', 0) + 1
 
 
 def hint_budget(c, p):
@@ -488,8 +503,11 @@ def endpoint_tests(store, *, transport=_transport, resolver=_addresses, limit=8,
         with store.pool.connection() as c:
             ready = schema_ready(c) and promote_rotations(c) is not None
         if ready:
+            from .delivery_endpoints import settle_resumes
             _prune(store)
-            return dispatch_tests(store, transport=transport, resolver=resolver, limit=limit, served=served)
+            stats = dispatch_tests(store, transport=transport, resolver=resolver, limit=limit, served=served)
+            settle_resumes(store)
+            return stats
     except Exception as error:
         from .telemetry import capture
         capture(error, 'endpoint_tests_failed')

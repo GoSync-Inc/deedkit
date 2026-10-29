@@ -772,9 +772,9 @@ resume's identity: one test per version. Delivered: the endpoint is `enabled` ag
 (a dynamic one: a reference there the key still sees) gets one `events` hint at once, past
 the key's queue cap (`woken_subscriptions`); quiet hours, the budget and the scope recheck
 (from the ACK position) still apply at dispatch. Failed: `endpoint_test_failed` with the
-test's `test_error`, `http_status` and the endpoint's new `version` (the dispatcher moves a
-paused endpoint one version on when it settles its resume test undelivered); the endpoint
-stays paused. Repeating that resume with the old version returns the same refusal and sends
+test's `test_error`, `http_status` and the endpoint's `version` (the dispatcher moves a
+paused endpoint one version on once its resume test failed, at the latest on its next
+pass); the endpoint stays paused. Repeating that resume with the old version returns the same refusal and sends
 nothing, so a test whose answer was lost is never sent twice; a resume with the new
 version sends a new test. Still pending after 10 s: the endpoint stays paused and
 `test.next_step` names the same resume call, which reads that test back and finishes the
