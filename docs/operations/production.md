@@ -736,8 +736,9 @@ runs on the new calendar schema (expand only). A run that finds `planned`: a dat
 may have run is decided from its evidence as above, and calendar's roles then run once if they had not
 started; roles that were `running` pause "roles: interrupted"; a database that never started after an
 earlier one committed pauses "<database> not applied: interrupted" (migrate it by hand). The calendar copy
-is calendar's only pre-migration copy (there is no scheduled calendar backup before it), kept 48 hours
-(ANYM-588 C6); restore from it with the gated restore procedure.
+is calendar's pre-migration copy, kept 48 hours (ANYM-588 C6); restore from it with the gated restore
+procedure. It is no longer calendar's only copy: the daily calendar backup (ANYM-607, BACKUP.md "Family
+calendar") keeps its last verified point on the backup server (ANYM-586 K4).
 
 ## Apply and verify
 
@@ -893,6 +894,21 @@ and with the backup service idle, in this order: remove from `runner.json` every
 an older worker refuses a newer `worker.json` key the runner writes (`dump_timeout_seconds`,
 ANYM-627), so the backup would fail on every run; the older runner with the newer image passes
 (the worker keeps its 600 s default).
+
+The calendar's runner (ANYM-607, BACKUP.md "Family calendar") is the same installed file with its own
+config: `/opt/deedkit/calendar-backup/` (root `0700`) holds `runner.json` (from
+`deploy/backup-runner-calendar.example.json`; `image` = messaging's pin, so the step above moves it too:
+set the calendar `runner.json` `image` to the same ID in the same idle window and `--check` it),
+`owner.dsn` (the calendar database's existing owner from `<CALENDAR_STATE_DIR>/service/postgres.env`, host
+`calendar-db`), `recipient`, `delivery_ed25519` and `known_hosts`, and the job directory `backups/`. Units:
+`deploy/deedkit-calendar-backup.service` and `.timer` (daily 16:00 UTC). Its read-only `--check` is
+`python3 -I /opt/personal-os-probe/ops/backup_runner.py --config /opt/deedkit/calendar-backup/runner.json
+--check`. Undo, in this order: `systemctl disable --now deedkit-calendar-backup.timer`; let a running
+`deedkit-calendar-backup.service` end or `systemctl stop` it (its `ExecStopPost` recovers); go on only when the
+service is inactive, no `deedkit-calendar-backup-*` container exists, `/opt/personal-os-probe/backups/.runner.lock.unsettled`
+is absent and `--check` prints `idle`; then remove the units (`daemon-reload`) and move the directory aside
+(`/opt/deedkit/calendar-backup.removed-<date>`, root `0700`) rather than deleting its journal and evidence. A
+failed check stops the undo. Messaging's files are not touched.
 
 ## Roll back the current release
 

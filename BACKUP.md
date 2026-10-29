@@ -206,7 +206,13 @@ The receiver has no public SSH: its provider firewall has no inbound rules, `fro
 authorized_keys line holds the producer's tailnet address, and `runner.json` `transfer.host`
 and the pinned `known_hosts` name the receiver's tailnet address. When one receiver serves
 several projects, each gets its own upload user, forced-command config, state directory,
-recovery key and R2 bucket (R2 tokens are scoped to buckets, not prefixes).
+recovery key and R2 bucket (R2 tokens are scoped to buckets, not prefixes). Exception: DeedKit's
+messaging and family calendar, both the owner's, share one bucket and its token under separate
+prefixes (ANYM-607; owner 10-29 «почему у нас не может быть один и тот же токен Р2 для всех
+бэкапов»). What that gives up: one leaked receiver token reads and deletes both prefixes; each
+prefix's objects stay age-encrypted to its own
+recovery key, and the receiver, its rotation and each verifier list and delete only inside their own
+prefix (`tests/test_backup_r2_shared_bucket.py`).
 
 On a delivery error the same encrypted package and journal are kept; a retry
 does not take a new snapshot and does not stop the collectors again. The error
@@ -316,11 +322,13 @@ messaging_service.backup_worker` with `"profile": "calendar"` and the keys `id`,
 `vault_directory`, `profile_directory`, `recipient_file`, `work_directory` (read-only
 mounts of `${CALENDAR_STATE_DIR}/service/vault` and `${CALENDAR_STATE_DIR}/service`). It
 writes `bundle.tar.age`, `result.json` and `captured.json` like a staged messaging run;
-without `profile` the worker behaves as before. Receiver verification, scheduling, the
-data-policy line and the restore procedure are ANYM-606, -607 and -610.
+without `profile` the worker behaves as before. Receiver verification is ANYM-606, the
+daily schedule and the data-policy line ANYM-607 (below and docs/DATA-POLICY.md), the restore
+procedure ANYM-610.
 
 The host runner takes it with its own `runner.json` (ANYM-608; example:
-`deploy/backup-runner-calendar.example.json`, placeholder paths only) and its own `directory`,
+`deploy/backup-runner-calendar.example.json`: the production paths, with the receiver host and
+the image as placeholders) and its own `directory`,
 journal and lock. Keys: `profile: "calendar"`, `directory`, `project`, `network`, `image`,
 `dsn_file`, `recipient_file`, `state_mounts` (`vault` and `profile`: the host paths of
 `${CALENDAR_STATE_DIR}/service/vault` and `${CALENDAR_STATE_DIR}/service`, mounted read-only at
@@ -406,3 +414,60 @@ member rules are unchanged.
 Retention: the calendar keeps one protected point plus room for one candidate
 (`max_objects` = 2, and rotation keeps `protected: 1`, backup_r2_receiver.py:870), so
 calendar data edited later is recoverable only as of the last protected point.
+
+### Daily run and freshness (ANYM-607)
+
+On the production host `deploy/deedkit-calendar-backup.service` runs the installed host runner
+(`/opt/personal-os-probe/ops/backup_runner.py`, the same file as messaging's) with
+`/opt/deedkit/calendar-backup/runner.json`, and `ExecStopPost` runs the same config's
+`--recover-stop`. `deploy/deedkit-calendar-backup.timer` fires daily at 16:00 UTC with
+`Persistent=true`: inside autodeploy's no-start hours (13:00-18:59), and the runner's 5400 s wait for
+messaging's lock ends before messaging's 18:00 run. The hour only schedules; the lock excludes (above).
+Its `ExecCondition` admits a start only up to 16:02 UTC (a `Persistent=` catch-up after a reboot or a
+late manual start is skipped; an unreadable clock skips too; the timer fires within 16:00:31,
+`AccuracySec=1s`). `TimeoutStartSec=6300s` plus the main process's stop and `ExecStopPost`, each with
+its own `TimeoutStopSec=180s`, ends every admitted run, its lock wait and recovery included, before
+18:00; a skipped start runs no recovery (`SERVICE_RESULT=exec-condition`), and the unit has no
+`Restart=`, so the calendar never holds messaging's lock into messaging's run. A skipped or failed day
+stays in `status.json` until the next day's run; a journal an earlier recovery left waits for the next
+admitted run, and its `.unsettled` marker keeps deploys out meanwhile. The unit may write only its job directory and messaging's
+backup directory (the shared lock and its `.unsettled` marker). The capture limit is
+`timeout_seconds` 900 and the receiver busy wait `busy_wait_seconds` 1800.
+
+The calendar's bundle goes to its own receiver project on the shared backup server: its own upload
+user, forced-command line, state directory, recovery key and prefix in messaging's private R2
+bucket (BACKUP_R2.md,
+Calendar verifier instance), verified there by the calendar verifier, which takes turns with
+messaging's ([Two verifiers on one receiver](BACKUP_R2.md#two-verifiers-on-one-receiver)).
+
+Freshness at a glance, read-only, one command per host. Production host: the state, error code,
+time and age of the last successful capture (`status.json` `last_snapshot_at`) of each side:
+
+```sh
+sudo python3 -I -c '
+import json
+from datetime import datetime,timezone
+for name,path in (("messaging","/opt/personal-os-probe/backups/status.json"),("calendar","/opt/deedkit/calendar-backup/backups/status.json")):
+    try:s=json.load(open(path))
+    except OSError:print(name,"no status");continue
+    at=s.get("last_snapshot_at");age=str(datetime.now(timezone.utc)-datetime.fromisoformat(at)).split(".")[0] if at else "-"
+    print(name,s.get("state"),s.get("error_code") or "-","last capture",at or "never","age",age)'
+```
+
+Backup server (root): the verifier status and the time and age of the last protected proof
+(`last-success.json` `verified_at`) of each side:
+
+```sh
+python3 -I -c '
+import json
+from datetime import datetime,timezone
+for name,directory in (("messaging","/srv/backups/deedkit/verifier"),("calendar","/var/lib/deedkit-calendar-backup-r2/verification")):
+    def read(file):
+        try:return json.load(open(directory+"/"+file))
+        except OSError:return {}
+    s,p=read("status.json"),read("last-success.json");at=p.get("verified_at")
+    age=str(datetime.now(timezone.utc)-datetime.fromisoformat(at)).split(".")[0] if at else "-"
+    print(name,s.get("status","no status"),s.get("error") or "-","last proof",at or "never","age",age)'
+```
+
+Nothing alerts on a stale age yet (alerting is a separate card).

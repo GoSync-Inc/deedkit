@@ -477,7 +477,8 @@ private evidence and reconcile its exact owned resources.
 The family calendar's encrypted bundle (ANYM-605) goes through the same verifier
 code as a second instance with `profile: calendar` (ANYM-606). Like every project
 on a shared receiver it has its own upload user, receiver config, state directory,
-recovery key, R2 bucket and protected marker (BACKUP.md, "Automatic run without a Mac"):
+recovery key, R2 prefix (DeedKit: in messaging's bucket, with its token; BACKUP.md, "Automatic run
+without a Mac") and protected marker:
 add `"profile": "calendar"` to its receiver config and copy
 [the calendar verifier configuration](deploy/calendar-backup-r2-verifier.example.json)
 to `/etc/deedkit-calendar-backup-r2/verifier.json` (root-owned `0600`). A config
@@ -516,12 +517,20 @@ calendar timer runs, list both configs in the instances file
 ([Two verifiers on one receiver](#two-verifiers-on-one-receiver)), so their
 restores take turns and their helper pins move together.
 
-Age of the last proof (root on the receiver):
+DeedKit's calendar project on the shared receiver (ANYM-607): upload user `deedkit-calendar-backup`
+with its own `Match User` block and `AuthorizedKeysFile /etc/ssh/authorized_keys.d/deedkit-calendar-backup`
+(root `0644`), whose one line is
+`restrict,from="<producer tailnet address>",command="/opt/deedkit-backup-r2/venv/bin/python -I -m messaging_service.backup_r2_receiver --config /etc/deedkit-calendar-backup-r2/receive.json receive"`;
+upload state `/srv/backups/deedkit-calendar/state/receive`; under `/etc/deedkit-calendar-backup-r2/` the
+upload-owned `receive.json` and its credentials, the root `operator.json` and its credentials (both configs
+`"profile": "calendar"`, messaging's bucket and endpoint, the prefix `deedkit-calendar/egor-20261029`;
+the two credential files copy messaging's token), `control/`, `restore/identity.agekey` (its
+own age recovery key) and `verifier.json`; proofs in `/var/lib/deedkit-calendar-backup-r2/verification`.
+It shares messaging's venv, bucket and token, but no user, SSH or recovery key, config, state directory
+or prefix.
 
-```sh
-jq -r .verified_at /var/lib/deedkit-calendar-backup-r2/verification/last-success.json
-jq -r '.status, .error // empty' /var/lib/deedkit-calendar-backup-r2/verification/status.json
-```
+Age of the last proof, messaging and calendar side by side: BACKUP.md, Family calendar, "Freshness at a
+glance" (the receiver has no `jq`).
 
 Undo: `systemctl disable --now deedkit-calendar-backup-r2-verifier.timer`. Its
 evidence, the protected calendar point and the messaging instance stay as they are.
