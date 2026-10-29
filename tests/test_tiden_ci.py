@@ -2021,7 +2021,8 @@ def test_the_overall_deadline_ends_a_hang_outside_tiden_calls_and_fails_the_ci_r
 
 ATTEMPT_URL ="https://github.com/example/repo/actions/runs/1/attempts/2"
 LOAD_REPORT = '<testsuite><testcase name="budgets" file="tests/platform/benchmarks/gateway_read_load.py"/></testsuite>'
-PASSED = {"verify": ("success", "a" * 40), "load": ("success", "a" * 40), **dict.fromkeys(SHARD_JOBS, ("success", "a" * 40)),
+PASSED = {"verify": ("success", "a" * 40), "load": ("success", "a" * 40), "services": ("success", "a" * 40),
+          **dict.fromkeys(SHARD_JOBS, ("success", "a" * 40)),
           "go": ("success", "a" * 40), "added": ("success", "a" * 40)}
 # Synthetic Go modules at the module directories of the two Go checks; `go_results` reads only go.mod and *_test.go.
 GO_MODULE_PATHS = {"whatsmeow": "example.com/whatsmeow", "release_router": "example.com/release/router"}
@@ -2053,7 +2054,8 @@ def shard_report(job):
 
 
 def evidence_fragments(tmp_path, *, load_sha="a" * 40, load_outcomes=None, load=True, load_attempt="2",
-                       verify_modules=None, verify_files=(), load_files=(), shards=SHARD_JOBS, go=True, go_streams=None):
+                       verify_modules=None, verify_files=(), load_files=(), shards=SHARD_JOBS, go=True, go_streams=None,
+                       services=True):
     fragments = tmp_path / "fragments"
     verify = fragments / "ci-evidence-verify"
     verify.mkdir(parents=True)
@@ -2063,7 +2065,7 @@ def evidence_fragments(tmp_path, *, load_sha="a" * 40, load_outcomes=None, load=
     (verify / "metadata.json").write_text(json.dumps({**metadata(), "tiden_branch": "", "module_checks": modules}))
     for name in ("python-1.xml", *verify_files):
         (verify / name).write_text('<testsuite><testcase name="x" file="tests/x.py"/></testsuite>')
-    for job in shards:  # the `checks / python` matrix jobs, shards 2-7 of the root suite
+    for job in shards:  # the `checks / python` matrix jobs, shards 2-9 of the root suite
         fragment = fragments / f"ci-evidence-{job}"
         fragment.mkdir()
         (fragment / "source-sha").write_text("a" * 40 + "\n")
@@ -2079,6 +2081,12 @@ def evidence_fragments(tmp_path, *, load_sha="a" * 40, load_outcomes=None, load=
             (fragment / name).write_text(LOAD_REPORT)
         (fragment / "load.json").write_text('{"status": "passed"}')
         (fragment / "outcomes.json").write_text(json.dumps(load_outcomes or {"module_checks": {"load": "success"}}))
+    if services:  # the `services` job: the gateway, its contract package and the calls service, without reports here
+        fragment = fragments / "ci-evidence-services"
+        fragment.mkdir()
+        (fragment / "source-sha").write_text("a" * 40 + "\n")
+        (fragment / "attempt").write_text("2\n")
+        (fragment / "outcomes.json").write_text(json.dumps({"module_checks": dict.fromkeys(FRAGMENTS["services"][0], "success")}))
     if go:  # the `go` job: one `go test -json` stream per Go module, of modules under the prepare root
         fragment = fragments / "ci-evidence-go"
         fragment.mkdir()
@@ -2109,7 +2117,7 @@ def test_parallel_load_fragment_is_assembled_with_verify_evidence_of_the_same_co
     out = tmp_path / "ci-evidence"
     merged = assemble(out, evidence_fragments(tmp_path), ATTEMPT_URL, PASSED)
     # The assembling attempt names the evidence, so a rerun of one test job publishes under new row identities.
-    assert merged["ci_url"] == ATTEMPT_URL and merged["fragments"] == ["verify", "load", *SHARD_JOBS, "go", "added"] and merged["missing"] == []
+    assert merged["ci_url"] == ATTEMPT_URL and merged["fragments"] == ["verify", "load", "services", *SHARD_JOBS, "go", "added"] and merged["missing"] == []
     assert merged["module_checks"]["load"] == "success" and set(merged["module_checks"]) == set(MODULE_REPORTS)
     assert {path.name for path in out.iterdir()} == {"metadata.json", "source-sha", "python.xml", "load.xml", "load.json",
                                                      "whatsmeow.json", "release-router.json", "exclusions.json", "added.json"}
@@ -2119,10 +2127,10 @@ def test_parallel_load_fragment_is_assembled_with_verify_evidence_of_the_same_co
     assert rows["deedkit-ci::load"] == rows["anymsg-ci::python"] == rows["deedkit-ci::whatsmeow"] == "passed"
     # A job that succeeded and was not rerun keeps its earlier attempt's fragment, and the evidence says so.
     earlier = assemble(tmp_path / "earlier", evidence_fragments(tmp_path / "e", load_attempt="1"), ATTEMPT_URL, PASSED)
-    assert earlier["fragments"] == ["verify", "load", *SHARD_JOBS, "go", "added"]
+    assert earlier["fragments"] == ["verify", "load", "services", *SHARD_JOBS, "go", "added"]
     assert earlier["producers"] == {"verify": {"result": "success", "sha": "a" * 40, "attempt": "2"},
                                     "load": {"result": "success", "sha": "a" * 40, "attempt": "1"},
-                                    **{job: {"result": "success", "sha": "a" * 40, "attempt": "2"} for job in (*SHARD_JOBS, "go", "added")}}
+                                    **{job: {"result": "success", "sha": "a" * 40, "attempt": "2"} for job in ("services", *SHARD_JOBS, "go", "added")}}
     # Assembling again into a used directory could keep a report the new fragments no longer supply.
     with pytest.raises(ValueError, match="new or empty"):
         assemble(out, evidence_fragments(tmp_path / "again", load=False), ATTEMPT_URL, PASSED)
@@ -2173,7 +2181,7 @@ def test_assembly_refuses_a_fragment_of_another_commit_or_of_foreign_checks(tmp_
 def test_missing_load_fragment_is_recorded_as_an_unrun_check(tmp_path):
     from scripts.tiden_ci import assemble
     merged = assemble(tmp_path / "ci-evidence", evidence_fragments(tmp_path, load=False), ATTEMPT_URL, PASSED)
-    assert merged["fragments"] == ["verify", *SHARD_JOBS, "go", "added"] and merged["missing"] == ["load"] and merged["module_checks"]["load"] == "skipped"
+    assert merged["fragments"] == ["verify", "services", *SHARD_JOBS, "go", "added"] and merged["missing"] == ["load"] and merged["module_checks"]["load"] == "skipped"
     assert assembled_rows(tmp_path, merged)["deedkit-ci::load"] == "blocked"
 
 
@@ -2212,6 +2220,7 @@ def test_evidence_step_records_and_then_fails_a_run_without_every_fragment(tmp_p
     step = next(s for s in evidence["steps"] if s.get("name") == "Merge the fragments of the tested commit and record every check outcome")
     assert step["env"] == {"VERIFY": "verify:${{ needs.verify.result }}:${{ needs.verify.outputs.source_sha }}",
                            "LOAD": "load:${{ needs.load.result }}:${{ needs.load.outputs.source_sha }}",
+                           "SERVICES": "services:${{ needs.services.result }}:${{ needs.services.outputs.source_sha }}",
                            **{f"PYTHON_{index}": f"python-{index}:${{{{ needs.python-{index}.result }}}}:${{{{ needs.python-{index}.outputs.source_sha }}}}"
                               for index in range(2, PYTHON_SHARDS + 1)},
                            "GO": "go:${{ needs.go.result }}:${{ needs.go.outputs.source_sha }}",
@@ -2224,7 +2233,7 @@ def test_evidence_step_records_and_then_fails_a_run_without_every_fragment(tmp_p
     evidence_fragments(temp, load=False)  # both jobs report success, the load artifact is gone, Tiden is unconfigured
     env = {"PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin", "RUNNER_TEMP": str(temp), "GITHUB_REPOSITORY": "example/repo",
            "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "2", "VERIFY": "verify:success:" + "a" * 40,
-           "LOAD": "load:success:" + "a" * 40, **{f"PYTHON_{index}": f"python-{index}:success:" + "a" * 40 for index in range(2, PYTHON_SHARDS + 1)},
+           "LOAD": "load:success:" + "a" * 40, "SERVICES": "services:success:" + "a" * 40, **{f"PYTHON_{index}": f"python-{index}:success:" + "a" * 40 for index in range(2, PYTHON_SHARDS + 1)},
            "GO": "go:success:" + "a" * 40, "ADDED": "added:success:" + "a" * 40}
     result = subprocess.run(["bash", "-e", "-c", step["run"]], cwd=work, capture_output=True, text=True, env=env)
     assert result.returncode != 0, result.stderr
@@ -2242,6 +2251,7 @@ def test_evidence_step_records_and_then_fails_a_run_without_every_fragment(tmp_p
 
 
 def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evidence():
+    import re
     import subprocess
     import yaml
     root = Path(__file__).resolve().parents[1]
@@ -2258,14 +2268,25 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
     assert gate["name"] == "Paired gateway load and isolation budgets" and "if" not in gate
     assert "gateway_read_load.py --config tests/platform/benchmarks/budgets.json" in gate["run"]
     assert all(step.get("id") != "load" for step in jobs["verify"]["steps"])
+    services = jobs["services"]
+    assert services["needs"] == "documentation" and services["if"] == jobs["verify"]["if"]
+    service_steps = {step.get("id"): step for step in services["steps"] if step.get("id")}
+    assert set(service_steps) == {"source", *FRAGMENTS["services"][0]}
+    assert not set(FRAGMENTS["services"][0]) & {step.get("id") for step in jobs["verify"]["steps"]}
+    for name in FRAGMENTS["services"][0]:
+        assert service_steps[name]["if"] == "${{ !cancelled() && steps.source.outcome == 'success' }}"
+        assert MODULE_REPORTS[name][0] in service_steps[name]["run"]
+    recorded = next(step for step in services["steps"] if step.get("name") == "Record the service outcomes")
+    assert recorded["if"] == "${{ always() }}" and dict(re.findall(r'"(\w+)":"\$\{\{ steps\.(\w+)\.outcome \}\}"',
+                                                                   recorded["env"]["MODULE_OUTCOMES"])) == {name: name for name in FRAGMENTS["services"][0]}
     assert set(CHECKS) <= {step.get("id") for step in jobs["verify"]["steps"]}
     uploads = {job: next(step for step in jobs[job]["steps"] if step.get("uses", "").startswith("actions/upload-artifact")
-                         and step["with"]["name"].startswith("ci-evidence")) for job in ("verify", "load")}
+                         and step["with"]["name"].startswith("ci-evidence")) for job in ("verify", "load", "services")}
     for job, upload in uploads.items():
         assert upload["with"]["name"] == f"ci-evidence-{job}" and upload["if"] == "${{ always() }}"
         assert upload["with"]["overwrite"] is True
     evidence = jobs["evidence"]
-    assert evidence["needs"] == ["documentation", "verify", "load", *SHARD_JOBS, "go", "added"] and evidence["if"] == "${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}"
+    assert evidence["needs"] == ["documentation", "verify", "load", "services", *SHARD_JOBS, "go", "added"] and evidence["if"] == "${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}"
     assert jobs["tiden"]["needs"] == ["documentation", "evidence"]
     steps = {step.get("name") or step["uses"].split("@")[0]: step for step in evidence["steps"]}
     assert steps["actions/download-artifact"]["with"]["pattern"] == "ci-evidence-*"
@@ -2275,6 +2296,7 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
     require = steps["Require every test job to have succeeded"]
     assert require["if"] == "${{ always() }}"
     assert require["env"] == {"VERIFY_RESULT": "${{ needs.verify.result }}", "LOAD_RESULT": "${{ needs.load.result }}",
+                              "SERVICES_RESULT": "${{ needs.services.result }}",
                               **{f"PYTHON_{index}_RESULT": f"${{{{ needs.python-{index}.result }}}}" for index in range(2, PYTHON_SHARDS + 1)},
                               "GO_RESULT": "${{ needs.go.result }}", "ADDED_RESULT": "${{ needs.added.result }}"}
     for verify, load_result, shards, go in [("success", "success", "success", "success"), ("success", "failure", "success", "success"),
@@ -2285,7 +2307,7 @@ def test_load_gate_runs_in_its_own_parallel_job_and_every_test_job_gates_the_evi
         result = subprocess.run(["bash", "-e", "-c", require["run"]], capture_output=True,
                                 env={"VERIFY_RESULT": verify, "LOAD_RESULT": load_result, "GO_RESULT": go,
                                      **{f"PYTHON_{index}_RESULT": "success" for index in range(2, PYTHON_SHARDS + 1)},
-                                     "PYTHON_3_RESULT": shards, "ADDED_RESULT": "success"})
+                                     "PYTHON_3_RESULT": shards, "ADDED_RESULT": "success", "SERVICES_RESULT": "success"})
         assert (result.returncode == 0) == (verify == load_result == shards == go == "success"), (verify, load_result, shards, go)
 
 
@@ -2299,7 +2321,7 @@ def test_python_suite_reports_its_slowest_tests_and_waits_for_its_background_ima
     wait = names.index("Wait for the background router image and Python image")
     python = next(i for i, step in enumerate(steps) if step.get("id") == "python")
     # The image preparation starts before the module test steps and is awaited right before the suite.
-    assert start < names.index("Gateway isolated package and transport tests") and wait == python - 1
+    assert start < names.index("Calendar provider policy and database tests") and wait == python - 1
     assert "docker build --file services/release-router/Dockerfile" in steps[start]["run"]
     assert "docker build" not in steps[python]["run"] and "docker pull" not in steps[python]["run"]
     assert "--durations=25" in steps[python]["run"]
@@ -2797,9 +2819,9 @@ def test_the_shared_contract_package_publishes_its_own_module_report_under_its_r
     # Its tests ran inside the gateway step without a report, so Tiden had no case to link them to (sync B `links`).
     import yaml
     assert MODULE_REPORTS["platform_contracts"] == ("platform-contracts.xml", "python", "packages/platform-contracts")
-    assert "platform_contracts" in FRAGMENTS["verify"][0] and "platform-contracts.xml" in FRAGMENTS["verify"][1]
+    assert "platform_contracts" in FRAGMENTS["services"][0] and "platform-contracts.xml" in FRAGMENTS["services"][1]
     root = Path(__file__).resolve().parents[1]
-    steps = yaml.safe_load((root / ".github/workflows/checks.yml").read_text())["jobs"]["verify"]["steps"]
+    steps = yaml.safe_load((root / ".github/workflows/checks.yml").read_text())["jobs"]["services"]["steps"]
     step = next(step for step in steps if step.get("id") == "platform_contracts")
     assert step["working-directory"] == "packages/platform-contracts"
     assert '--junitxml="$RUNNER_TEMP/ci-evidence/platform-contracts.xml"' in step["run"]
@@ -2944,7 +2966,7 @@ def test_the_native_audio_step_waits_only_for_its_own_build_and_keeps_its_test_s
     assert ids.index("enricher_audio") > ids.index("python") and ids.index("root_session_lock") > ids.index("python")
     assert audio["if"] == "${{ !cancelled() && steps.build.outcome == 'success' }}" and "AUDIO_IMAGE_WAIT_SECONDS" in audio["env"]
     names = [step.get("name") for step in steps]
-    assert names.index(START_AUDIO) < names.index("Gateway isolated package and transport tests")
+    assert names.index(START_AUDIO) < names.index("Calendar provider policy and database tests")
     tools, python = stub_tools(tmp_path)
     source = fixture_source(tmp_path, python)
     temp = tmp_path / "runner"

@@ -212,7 +212,7 @@ def test_pull_request_and_merge_queue_runs_decide_and_a_failed_decision_verifies
     assert outputs["docs_only"]["value"] == "${{ jobs.documentation.outputs.docs_only }}"
     assert outputs["docs_sha"]["value"] == "${{ jobs.documentation.outputs.docs_sha }}"
     skip = "needs.documentation.outputs.docs_only != 'true'"
-    for name in ("verify", "load", "python-2", "python-3", "python-4", "evidence"):
+    for name in ("verify", "load", "services", "python-2", "python-3", "python-4", "evidence"):
         assert skip in checks["jobs"][name]["if"] and "documentation" in checks["jobs"][name]["needs"]
     assert not (ROOT / ".github/docs-only-paths.txt").exists()
 

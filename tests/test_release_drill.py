@@ -15,7 +15,7 @@ import zipfile
 
 import yaml
 
-from scripts.tiden_ci import MODULE_REPORTS, REQUIRED_EXECUTIONS
+from scripts.tiden_ci import MODULE_REPORTS, REQUIRED_EXECUTIONS, SHARD_JOBS
 from tests.test_tiden_ci import (ATTEMPT_URL, RUN_URL, evidence_fragments, main_push_manifest, main_run, node_report, release_cli,
                                  run_release)
 from tests.test_ci_reuse import go_stream
@@ -23,8 +23,8 @@ from tests.test_ci_reuse import go_stream
 ROOT = Path(__file__).resolve().parents[1]
 SYNTHETIC_GIT = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "Synthetic", "GIT_AUTHOR_EMAIL": "synthetic@example.invalid",
                  "GIT_COMMITTER_NAME": "Synthetic", "GIT_COMMITTER_EMAIL": "synthetic@example.invalid"}
-VERIFY_REPORTS = ("collector.xml", "npm.xml", "gateway.xml", "platform-contracts.xml", "calendar.xml", "calls.xml",
-                  "calls-frontend.xml", "backup-restore.xml")
+VERIFY_REPORTS = ("collector.xml", "npm.xml", "calendar.xml", "backup-restore.xml")
+SERVICE_REPORTS = ("gateway.xml", "platform-contracts.xml", "calls.xml", "calls-frontend.xml")  # the `services` job's
 PASSING_CASE = '<testsuite><testcase name="x" file="tests/x.py"/></testsuite>'
 FAILING_CASE = '<testsuite><testcase name="x" file="tests/x.py"><failure/></testcase></testsuite>'
 
@@ -107,9 +107,11 @@ def evidence_for(tmp_path, name, commit, reports):
             path.write_text(path.read_text().replace("a" * 40, commit))
     for module, required in REQUIRED_EXECUTIONS.items():  # each holds exactly its required executions
         (fragments / "ci-evidence-verify" / MODULE_REPORTS[module][0]).write_text(node_report(*sorted(required)))
+    for report in SERVICE_REPORTS:
+        (fragments / "ci-evidence-services" / report).write_text(PASSING_CASE)
     for fragment, report in reports.items():
         (fragments / "ci-evidence-verify" / fragment).write_text(report)
-    producers = [f"{job}:success:{commit}" for job in ("verify", "load", "python-2", "python-3", "python-4", "python-5", "python-6", "python-7", "go", "added")]
+    producers = [f"{job}:success:{commit}" for job in ("verify", "load", "services", *SHARD_JOBS, "go", "added")]
     env = {"PATH": os.environ["PATH"], "GITHUB_REPOSITORY": "example/repo", "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "2"}
     directory = tmp_path / f"{name}-evidence"
     tool = ["scripts/tiden_ci.py"]

@@ -8,10 +8,11 @@ Parameterized Python executions retain their parameter names and status.
 
 Test jobs run in parallel and each uploads a `ci-evidence-<job>` fragment:
 `checks / verify` the seven checks and its module reports, `checks / load` the
-gateway load gate, and each `checks / python (<n>/7)` job its shard of the root
-Python/PostgreSQL suite. The root suite runs in seven file-level shards
-(`scripts/python_shards.py`): `checks / verify` runs shard 1 and the six
-`checks / python (<n>/7)` jobs (`python-2` to `python-7`) shards 2-7, each on its
+gateway load gate, `checks / services` the gateway, platform-contracts, calls and
+calls-frontend module reports, and each `checks / python (<n>/9)` job its shard of the root
+Python/PostgreSQL suite. The root suite runs in nine file-level shards
+(`scripts/python_shards.py`): `checks / verify` runs shard 1 and the eight
+`checks / python (<n>/9)` jobs (`python-2` to `python-9`) shards 2-9, each on its
 own runner with its own PostgreSQL. Every test module belongs to exactly one shard, chosen by committed
 per-file timings (`scripts/python_shards.json`, refreshed with
 `python scripts/python_shards.py weights <python.xml>`); a module without a
@@ -20,7 +21,7 @@ the plan cannot name (outside `tests/`, through a directory symlink) is a
 collection error. Each job runs pytest through the selector of the workflow's
 own commit (`ci-tools`), so a baseline of a revision without the selector is
 sharded the same way. The `checks / evidence` job merges the fragments into
-`ci-evidence` and the seven shard reports into one `python.xml`, so test
+`ci-evidence` and the nine shard reports into one `python.xml`, so test
 identities do not change. `anymsg-ci::python` passes only when every shard
 passed with its own valid report of executed tests and no failed one, and every
 shard job succeeded. Each shard is a job of its own rather than one matrix, so
@@ -77,7 +78,7 @@ copies included) under a `test/` or `tests/` directory and every added
 against its own merge base (a merge queue group reads its pull requests from the
 queue; other events exclude nothing). An unreadable pull request, base or queue
 fails `added_list` and so `CI gate`. Every job that collects, compiles or builds
-tests (`checks / verify`, the shards, `checks / load`, `checks / go` and
+tests (`checks / verify`, the shards, `checks / load`, `checks / services`, `checks / go` and
 whatsmeow.yml's `synthetic`) deletes the listed files from its checkouts before
 its first test step, prints them and keeps the inventory as `exclusions.json` in
 its fragment; `checks / evidence` refuses fragments whose inventories differ.
@@ -964,7 +965,8 @@ merge, verify both main's gate and the GitHub App processing/drift state.
 The integrated CI includes gateway, platform-contracts, calendar, calls and
 calls-frontend reports, plus the measured gateway load gate, which runs on a
 runner of its own in
-parallel with the suite. Existing messaging check/test identities
+parallel with the suite; the gateway, platform-contracts, calls and calls-frontend
+suites run together in `checks / services`, also on a runner of their own. Existing messaging check/test identities
 and links remain intact. Module assertions support reviewed contracts in the
 same product; a successful messaging run alone cannot verify another module.
 

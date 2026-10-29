@@ -197,35 +197,6 @@ jobs:
             uv run python scripts/check_release.py
           fi
           uvx --from twine twine check dist/*.whl dist/*.tar.gz
-      - name: Gateway isolated package and transport tests
-        id: gateway
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: services/gateway
-        run: |
-          uv sync --locked --group dev
-          uv run pytest -q -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/gateway.xml"
-          uv build --project ../../packages/platform-contracts --out-dir "$RUNNER_TEMP/gateway-dist"
-          uv build --out-dir "$RUNNER_TEMP/gateway-dist"
-          uv venv "$RUNNER_TEMP/gateway-installed" --python 3.13
-          uv pip install --python "$RUNNER_TEMP/gateway-installed/bin/python" "$RUNNER_TEMP"/gateway-dist/*.whl
-          cd "$RUNNER_TEMP"
-          "$RUNNER_TEMP/gateway-installed/bin/python" - <<'PY'
-          import importlib.util
-          from agent_gateway.catalog import CATALOG
-          assert CATALOG
-          for module in ('family_calendar', 'messaging_service', 'pipecat', 'telethon', 'psycopg'):
-              assert importlib.util.find_spec(module) is None, module
-          PY
-          "$RUNNER_TEMP/gateway-installed/bin/deedkit-gateway" --help
-      - name: Shared platform contract package tests
-        id: platform_contracts
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        # Its own report, rooted in the package directory: gateway.xml cannot hold paths outside services/gateway.
-        # The gateway's locked environment installs this package, so the tests run there.
-        working-directory: packages/platform-contracts
-        run: |
-          uv run --project ../../services/gateway --locked --group dev pytest -q -p no:cacheprovider --rootdir . \
-            -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/platform-contracts.xml" tests
       - name: Calendar provider policy and database tests
         id: calendar
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
@@ -238,21 +209,6 @@ jobs:
           uv build --out-dir "$RUNNER_TEMP/calendar-dist"
           # Last, so a lint failure still leaves calendar.xml for the evidence; the calendar's own [tool.ruff] applies.
           uv run --project ../../tools/dev --locked ruff check .
-      - name: Calls Python 3.13 native transports and synthetic workflows
-        id: calls
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: services/calls
-        run: |
-          uv sync --locked --group dev
-          uv run pytest -q -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/calls.xml"
-      - name: Calls frontend tests and build
-        id: calls_frontend
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        working-directory: services/calls/frontend
-        run: |
-          npm ci --ignore-scripts --no-audit --no-fund
-          node --test --test-reporter=junit tests/*.test.mjs > "$RUNNER_TEMP/ci-evidence/calls-frontend.xml"
-          npm run build
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: '1.26.10'
@@ -298,7 +254,7 @@ jobs:
           ANYMSG_TEST_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
           ANYMSG_TEST_WHEEL: ${{ github.workspace }}/dist/anymsg-${{ steps.build.outputs.version }}-py3-none-any.whl
           ANYMSG_TEST_SDIST: ${{ github.workspace }}/dist/anymsg-${{ steps.build.outputs.version }}.tar.gz
-          DEEDKIT_TEST_SHARD: 1/7
+          DEEDKIT_TEST_SHARD: 1/9
         run: |
           DEEDKIT_TEST_ROUTER_IMAGE="$(docker image inspect --format '{{.Id}}' deedkit-release-router:ci)"
           export DEEDKIT_TEST_ROUTER_IMAGE
@@ -431,7 +387,7 @@ jobs:
           CHECK_OUTCOMES: >-
             {"build":"${{ steps.build.outcome }}","release":"${{ steps.release.outcome }}","python":"${{ steps.python.outcome }}","collector":"${{ steps.collector.outcome }}","npm":"${{ steps.npm.outcome }}","smoke":"${{ steps.smoke.outcome }}","distributions":"${{ steps.distributions.outcome }}"}
           MODULE_OUTCOMES: >-
-            {"gateway":"${{ steps.gateway.outcome }}","platform_contracts":"${{ steps.platform_contracts.outcome }}","calendar":"${{ steps.calendar.outcome }}","calls":"${{ steps.calls.outcome }}","calls_frontend":"${{ steps.calls_frontend.outcome }}","backup_restore":"${{ steps.backup_restore.outcome }}","root_session_lock":"${{ steps.root_session_lock.outcome }}","enricher_audio":"${{ steps.enricher_audio.outcome }}"}
+            {"calendar":"${{ steps.calendar.outcome }}","backup_restore":"${{ steps.backup_restore.outcome }}","root_session_lock":"${{ steps.root_session_lock.outcome }}","enricher_audio":"${{ steps.enricher_audio.outcome }}"}
           SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}
           TIDEN_BRANCH_OVERRIDE: ${{ inputs.tiden_branch }}
         run: |
@@ -538,6 +494,104 @@ jobs:
           if-no-files-found: error
           retention-days: 1
           overwrite: true
+  services:
+    # The gateway, its shared contract package and the calls service (Python and frontend) run on a runner of their
+    # own, in parallel with verify, so verify's own steps no longer set the run's wall time (CI latency 10-29).
+    # Their reports and module checks reach the evidence job as this job's fragment, as the load gate's do.
+    needs: documentation
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_ref }}
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: ci-tools
+      - name: Delete the files autoloop pull requests add to tests before anything collects or builds a test
+        # ANYM-578: an added file never runs inside this job's suites; the added-test job runs them on its own.
+        env:
+          ADDED_TESTS: ${{ inputs.added_tests }}
+        run: python3 ci-tools/scripts/added_tests.py strip --root . --root ci-tools --evidence "$RUNNER_TEMP/ci-evidence"
+      - name: Start evidence record
+        id: source
+        run: |
+          mkdir -p "$RUNNER_TEMP/ci-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/ci-evidence/source-sha"
+          echo "$GITHUB_RUN_ATTEMPT" > "$RUNNER_TEMP/ci-evidence/attempt"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with: {python-version: '3.13'}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with: {node-version: '24'}
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with: {version: '0.9.26'}
+      - name: Gateway isolated package and transport tests
+        id: gateway
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
+        working-directory: services/gateway
+        run: |
+          uv sync --locked --group dev
+          uv run pytest -q -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/gateway.xml"
+          uv build --project ../../packages/platform-contracts --out-dir "$RUNNER_TEMP/gateway-dist"
+          uv build --out-dir "$RUNNER_TEMP/gateway-dist"
+          uv venv "$RUNNER_TEMP/gateway-installed" --python 3.13
+          uv pip install --python "$RUNNER_TEMP/gateway-installed/bin/python" "$RUNNER_TEMP"/gateway-dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/gateway-installed/bin/python" - <<'PY'
+          import importlib.util
+          from agent_gateway.catalog import CATALOG
+          assert CATALOG
+          for module in ('family_calendar', 'messaging_service', 'pipecat', 'telethon', 'psycopg'):
+              assert importlib.util.find_spec(module) is None, module
+          PY
+          "$RUNNER_TEMP/gateway-installed/bin/deedkit-gateway" --help
+      - name: Shared platform contract package tests
+        id: platform_contracts
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
+        # Its own report, rooted in the package directory: gateway.xml cannot hold paths outside services/gateway.
+        # The gateway's locked environment installs this package, so the tests run there.
+        working-directory: packages/platform-contracts
+        run: |
+          uv run --project ../../services/gateway --locked --group dev pytest -q -p no:cacheprovider --rootdir . \
+            -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/platform-contracts.xml" tests
+      - name: Calls Python 3.13 native transports and synthetic workflows
+        id: calls
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
+        working-directory: services/calls
+        run: |
+          uv sync --locked --group dev
+          uv run pytest -q -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/ci-evidence/calls.xml"
+      - name: Calls frontend tests and build
+        id: calls_frontend
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
+        working-directory: services/calls/frontend
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          node --test --test-reporter=junit tests/*.test.mjs > "$RUNNER_TEMP/ci-evidence/calls-frontend.xml"
+          npm run build
+      - name: Record the service outcomes
+        if: ${{ always() }}
+        env:
+          MODULE_OUTCOMES: >-
+            {"gateway":"${{ steps.gateway.outcome }}","platform_contracts":"${{ steps.platform_contracts.outcome }}","calls":"${{ steps.calls.outcome }}","calls_frontend":"${{ steps.calls_frontend.outcome }}"}
+        run: |
+          python3 -c 'import json, os, pathlib; pathlib.Path(os.environ["RUNNER_TEMP"], "ci-evidence", "outcomes.json").write_text(json.dumps({"module_checks": json.loads(os.environ["MODULE_OUTCOMES"])}))'
+      - name: Retain service evidence even when a test fails
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-evidence-services
+          path: ${{ runner.temp }}/ci-evidence
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
   go:
     # The native Go suites (the whatsmeow adapter and the release router) as Tiden evidence: the same tests
     # ci.yml's `native` job requires, run again here because a job of another workflow cannot feed this
@@ -610,14 +664,14 @@ jobs:
           retention-days: 1
           overwrite: true
   python-2:
-    # Shards 2-7 of the root Python/PostgreSQL suite, in parallel with verify, which runs shard 1. Each shard has
+    # Shards 2-9 of the root Python/PostgreSQL suite, in parallel with verify, which runs shard 1. Each shard has
     # its own runner and PostgreSQL and the same tools, images and environments as verify's suite step; every
     # test module belongs to exactly one shard (scripts/python_shards.py), and evidence merges their reports.
     # Each shard is a job of its own, not one matrix, so evidence receives each shard job's completed result and
-    # captured SHA; python-3 to python-7 repeat this job's steps through the anchor. A shard job does not check
+    # captured SHA; python-3 to python-9 repeat this job's steps through the anchor. A shard job does not check
     # the commit receiving the checks: evidence requires its captured SHA to be verify's, and verify checks it,
     # so a shard job's result is its tests' and never a baseline's deliberate mismatch.
-    name: python (${{ matrix.shard }}/7)
+    name: python (${{ matrix.shard }}/9)
     needs: documentation
     if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
@@ -746,7 +800,7 @@ jobs:
           ANYMSG_TEST_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
           ANYMSG_TEST_WHEEL: ${{ github.workspace }}/dist/anymsg-${{ steps.package.outputs.version }}-py3-none-any.whl
           ANYMSG_TEST_SDIST: ${{ github.workspace }}/dist/anymsg-${{ steps.package.outputs.version }}.tar.gz
-          DEEDKIT_TEST_SHARD: ${{ matrix.shard }}/7
+          DEEDKIT_TEST_SHARD: ${{ matrix.shard }}/9
         run: |
           DEEDKIT_TEST_ROUTER_IMAGE="$(docker image inspect --format '{{.Id}}' deedkit-release-router:ci)"
           export DEEDKIT_TEST_ROUTER_IMAGE
@@ -781,7 +835,7 @@ jobs:
           retention-days: 1
           overwrite: true
   python-3:
-    name: python (${{ matrix.shard }}/7)
+    name: python (${{ matrix.shard }}/9)
     needs: documentation
     if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
@@ -796,7 +850,7 @@ jobs:
     services: *python-shard-services
     steps: *python-shard-steps
   python-4:
-    name: python (${{ matrix.shard }}/7)
+    name: python (${{ matrix.shard }}/9)
     needs: documentation
     if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
@@ -811,7 +865,7 @@ jobs:
     services: *python-shard-services
     steps: *python-shard-steps
   python-5:
-    name: python (${{ matrix.shard }}/7)
+    name: python (${{ matrix.shard }}/9)
     needs: documentation
     if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
@@ -826,7 +880,7 @@ jobs:
     services: *python-shard-services
     steps: *python-shard-steps
   python-6:
-    name: python (${{ matrix.shard }}/7)
+    name: python (${{ matrix.shard }}/9)
     needs: documentation
     if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
@@ -841,7 +895,7 @@ jobs:
     services: *python-shard-services
     steps: *python-shard-steps
   python-7:
-    name: python (${{ matrix.shard }}/7)
+    name: python (${{ matrix.shard }}/9)
     needs: documentation
     if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
@@ -849,6 +903,36 @@ jobs:
     strategy:
       matrix:
         shard: [7]
+    env:
+      DEEDKIT_TEST_PYTHON_IMAGE: docker.io/library/python@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    services: *python-shard-services
+    steps: *python-shard-steps
+  python-8:
+    name: python (${{ matrix.shard }}/9)
+    needs: documentation
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        shard: [8]
+    env:
+      DEEDKIT_TEST_PYTHON_IMAGE: docker.io/library/python@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    services: *python-shard-services
+    steps: *python-shard-steps
+  python-9:
+    name: python (${{ matrix.shard }}/9)
+    needs: documentation
+    if: ${{ !cancelled() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        shard: [9]
     env:
       DEEDKIT_TEST_PYTHON_IMAGE: docker.io/library/python@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
     outputs:
@@ -935,7 +1019,7 @@ jobs:
     # One `ci-evidence` artifact from every test job's fragment, attempted even after a failure so the
     # failure itself is recorded (TIDEN-CI.md). A missing, failed, cancelled or skipped test job fails
     # this job whether or not Tiden reporting is configured.
-    needs: [documentation, verify, load, python-2, python-3, python-4, python-5, python-6, python-7, go, added]
+    needs: [documentation, verify, load, services, python-2, python-3, python-4, python-5, python-6, python-7, python-8, python-9, go, added]
     if: ${{ always() && !inputs.reuse_queue_evidence && !inputs.reuse_pr_verification && needs.documentation.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -959,19 +1043,23 @@ jobs:
         env:
           VERIFY: verify:${{ needs.verify.result }}:${{ needs.verify.outputs.source_sha }}
           LOAD: load:${{ needs.load.result }}:${{ needs.load.outputs.source_sha }}
+          SERVICES: services:${{ needs.services.result }}:${{ needs.services.outputs.source_sha }}
           PYTHON_2: python-2:${{ needs.python-2.result }}:${{ needs.python-2.outputs.source_sha }}
           PYTHON_3: python-3:${{ needs.python-3.result }}:${{ needs.python-3.outputs.source_sha }}
           PYTHON_4: python-4:${{ needs.python-4.result }}:${{ needs.python-4.outputs.source_sha }}
           PYTHON_5: python-5:${{ needs.python-5.result }}:${{ needs.python-5.outputs.source_sha }}
           PYTHON_6: python-6:${{ needs.python-6.result }}:${{ needs.python-6.outputs.source_sha }}
           PYTHON_7: python-7:${{ needs.python-7.result }}:${{ needs.python-7.outputs.source_sha }}
+          PYTHON_8: python-8:${{ needs.python-8.result }}:${{ needs.python-8.outputs.source_sha }}
+          PYTHON_9: python-9:${{ needs.python-9.result }}:${{ needs.python-9.outputs.source_sha }}
           GO: go:${{ needs.go.result }}:${{ needs.go.outputs.source_sha }}
           ADDED: added:${{ needs.added.result }}:${{ needs.added.outputs.source_sha }}
         run: |
           assembled=0
           python ci-tools/scripts/tiden_ci.py assemble --directory "$RUNNER_TEMP/ci-evidence" --fragments "$RUNNER_TEMP/fragments" \
-            --producer "$VERIFY" --producer "$LOAD" --producer "$PYTHON_2" --producer "$PYTHON_3" --producer "$PYTHON_4" \
-            --producer "$PYTHON_5" --producer "$PYTHON_6" --producer "$PYTHON_7" --producer "$GO" --producer "$ADDED" || assembled=$?
+            --producer "$VERIFY" --producer "$LOAD" --producer "$SERVICES" --producer "$PYTHON_2" --producer "$PYTHON_3" --producer "$PYTHON_4" \
+            --producer "$PYTHON_5" --producer "$PYTHON_6" --producer "$PYTHON_7" --producer "$PYTHON_8" \
+            --producer "$PYTHON_9" --producer "$GO" --producer "$ADDED" || assembled=$?
           python ci-tools/scripts/tiden_ci.py prepare --directory "$RUNNER_TEMP/ci-evidence"
           exit "$assembled"
       - name: Retain test evidence even when a check fails
@@ -994,23 +1082,29 @@ jobs:
         env:
           VERIFY_RESULT: ${{ needs.verify.result }}
           LOAD_RESULT: ${{ needs.load.result }}
+          SERVICES_RESULT: ${{ needs.services.result }}
           PYTHON_2_RESULT: ${{ needs.python-2.result }}
           PYTHON_3_RESULT: ${{ needs.python-3.result }}
           PYTHON_4_RESULT: ${{ needs.python-4.result }}
           PYTHON_5_RESULT: ${{ needs.python-5.result }}
           PYTHON_6_RESULT: ${{ needs.python-6.result }}
           PYTHON_7_RESULT: ${{ needs.python-7.result }}
+          PYTHON_8_RESULT: ${{ needs.python-8.result }}
+          PYTHON_9_RESULT: ${{ needs.python-9.result }}
           GO_RESULT: ${{ needs.go.result }}
           ADDED_RESULT: ${{ needs.added.result }}
         run: |
           test "$VERIFY_RESULT" = success
           test "$LOAD_RESULT" = success
+          test "$SERVICES_RESULT" = success
           test "$PYTHON_2_RESULT" = success
           test "$PYTHON_3_RESULT" = success
           test "$PYTHON_4_RESULT" = success
           test "$PYTHON_5_RESULT" = success
           test "$PYTHON_6_RESULT" = success
           test "$PYTHON_7_RESULT" = success
+          test "$PYTHON_8_RESULT" = success
+          test "$PYTHON_9_RESULT" = success
           test "$GO_RESULT" = success
           test "$ADDED_RESULT" = success
   tiden_pr:
