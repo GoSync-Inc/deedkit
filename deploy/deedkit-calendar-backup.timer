@@ -1,0 +1,11 @@
+[Unit]
+Description=DeedKit family calendar backup cadence (daily, inside autodeploy's no-start hours)
+
+[Timer]
+OnCalendar=*-*-* 16:00:00 UTC
+Persistent=true
+RandomizedDelaySec=30s
+Unit=deedkit-calendar-backup.service
+
+[Install]
+WantedBy=timers.target

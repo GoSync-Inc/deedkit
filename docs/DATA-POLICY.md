@@ -52,6 +52,14 @@ the owner has decided parts (below), not this inventory as a whole.
   - Backups, encrypted, to the shared backup server over the tailnet and its object storage; originals,
     encrypted, to the private R2 bucket (owner 10-17 cold archive «yes»; owner 10-22 «надо на всех проектах
     так сделать»).
+  - The family calendar backup (ANYM-607, BACKUP.md "Family calendar"): the calendar database, its Google
+    and iCloud credentials with the key that opens them, and its database passwords (the profile files),
+    encrypted to the calendar recovery key (held by the backup server's root and, once the owner has stored
+    it, the owner's offline copy), daily to the same shared backup server over the tailnet and its own
+    private R2 bucket. Each verification opens the tokens in memory on that server and never writes them.
+    One protected point plus room for one candidate: the rotation keeps no older point (owner 10-28 «Ну
+    вообще можно регулярный, ну то есть все одинаковый, короче, пока делать, да»). Agent key files are not
+    in it.
   - Webhook receivers named by an agent: hint, test, endpoint, subscription, event, account, chat,
     message, sender and send IDs, the subscription version, event kinds and times, wake reasons, the
     count of omitted references, the next tool to call, the signature headers, the delivery timing, and

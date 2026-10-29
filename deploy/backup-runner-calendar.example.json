@@ -1,23 +1,24 @@
 {
   "profile": "calendar",
-  "directory": "/opt/deedkit-calendar/backups",
+  "directory": "/opt/deedkit/calendar-backup/backups",
   "project": "deedkit-calendar",
-  "network": "deedkit-calendar_backend",
-  "image": "anymsg-backup:0.9.9",
+  "network": "deedkit-calendar_calendar-backend",
+  "image": "sha256:REPLACE_WITH_THE_BACKUP_IMAGE_ID_MESSAGING_PINS",
   "delivery_mode": "staged_v1",
-  "dsn_file": "/opt/deedkit-calendar/backup-config/backup.dsn",
-  "recipient_file": "/opt/deedkit-calendar/backup-config/recipient",
+  "dsn_file": "/opt/deedkit/calendar-backup/owner.dsn",
+  "recipient_file": "/opt/deedkit/calendar-backup/recipient",
   "state_mounts": {
-    "vault": "/opt/deedkit-calendar/state/service/vault",
-    "profile": "/opt/deedkit-calendar/state/service"
+    "vault": "/opt/deedkit/calendar-state/service/vault",
+    "profile": "/opt/deedkit/calendar-state/service"
   },
   "transfer": {
     "host": "backup.example.invalid",
-    "user": "calbackup",
-    "identity_file": "/opt/deedkit-calendar/backup-config/delivery_ed25519",
-    "known_hosts_file": "/opt/deedkit-calendar/backup-config/known_hosts"
+    "user": "deedkit-calendar-backup",
+    "identity_file": "/opt/deedkit/calendar-backup/delivery_ed25519",
+    "known_hosts_file": "/opt/deedkit/calendar-backup/known_hosts"
   },
-  "timeout_seconds": 1800,
+  "timeout_seconds": 900,
+  "busy_wait_seconds": 1800,
   "keep_local": 1,
   "host_lock": "/opt/personal-os-probe/backups/.runner.lock"
 }

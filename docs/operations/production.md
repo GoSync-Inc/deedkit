@@ -736,8 +736,9 @@ runs on the new calendar schema (expand only). A run that finds `planned`: a dat
 may have run is decided from its evidence as above, and calendar's roles then run once if they had not
 started; roles that were `running` pause "roles: interrupted"; a database that never started after an
 earlier one committed pauses "<database> not applied: interrupted" (migrate it by hand). The calendar copy
-is calendar's only pre-migration copy (there is no scheduled calendar backup before it), kept 48 hours
-(ANYM-588 C6); restore from it with the gated restore procedure.
+is calendar's pre-migration copy, kept 48 hours (ANYM-588 C6); restore from it with the gated restore
+procedure. It is no longer calendar's only copy: the daily calendar backup (ANYM-607, BACKUP.md "Family
+calendar") keeps its last verified point on the backup server (ANYM-586 K4).
 
 ## Apply and verify
 

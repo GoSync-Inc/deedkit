@@ -1,0 +1,28 @@
+[Unit]
+Description=DeedKit family calendar encrypted backup and delivery (ANYM-607)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /opt/personal-os-probe/ops/backup_runner.py --config /opt/deedkit/calendar-backup/runner.json
+ExecStopPost=/usr/bin/python3 -I /opt/personal-os-probe/ops/backup_runner.py --config /opt/deedkit/calendar-backup/runner.json --recover-stop
+# Exclusion is the runner's: it waits at most 5400 s for messaging's runner lock (its host_lock), which a deploy and
+# messaging's 18:00 run hold. This bound ends a 16:00 run, lock wait included, and its recovery before 18:00, so
+# the calendar never holds that lock into messaging's run. No Restart=: a retry could; a failed day stays in
+# status.json until the next day's timer.
+TimeoutStartSec=6600s
+TimeoutStopSec=180s
+User=root
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+MemoryMax=192M
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+# Its own job directory; messaging's backup directory only for the shared lock and its .unsettled marker.
+ReadWritePaths=/opt/deedkit/calendar-backup/backups /opt/personal-os-probe/backups
