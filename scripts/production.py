@@ -1385,10 +1385,13 @@ def serving_generation(settings, http):
             except (FileNotFoundError, NotADirectoryError):
                 return False
         try:
-            found = [str(path) for directory in retention_states(state)
-                     for path in (directory / "http", directory / "http-current.json",
-                                  *(release / "http-attempted.json" for release in subdirectories(directory)))
-                     if marked(path)]
+            # Every subdirectory of the host state root, not only those whose receipt is readable (retention_states):
+            # a sibling state holding only a dangling receipt link is a marker too.
+            found = list(dict.fromkeys(str(path) for directory in [*retention_states(state), *subdirectories(HOST_STATE)]
+                                       for path in (directory / "http", directory / "http-current.json",
+                                                    *(release / "http-attempted.json"
+                                                      for release in subdirectories(directory)))
+                                       if marked(path)))
             deployed = state / "deploy.json"
             if marked(deployed) and "http" in read(deployed):
                 found.append(f"{deployed} (a deploy promoted plan B)")

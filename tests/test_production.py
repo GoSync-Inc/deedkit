@@ -2448,7 +2448,7 @@ def promoted(tmp_path, monkeypatch, serving, restored=APPLIED):
                                   "unpublished attempt", "no mirror", "state without configuration",
                                   "container image", "result image", "no result", "recorded schema",
                                   "configured state without configuration", "deploy record without configuration",
-                                  "dangling link without configuration"])
+                                  "dangling link without configuration", "dangling sibling without configuration"])
 def test_rollback_refuses_unresolved_or_malformed_http_state(tmp_path, monkeypatch, case):
     host, plan = promoted(tmp_path, monkeypatch, APPLIED)
     current = plan.state / "http-current.json"
@@ -2463,7 +2463,8 @@ def test_rollback_refuses_unresolved_or_malformed_http_state(tmp_path, monkeypat
              "recorded schema": "the schema recorded for generation " + PlanB.GENERATION + " is not its runtime",
              "configured state without configuration": "HTTP state exists: " + str(tmp_path / "sibling"),
              "deploy record without configuration": "a deploy promoted plan B",
-             "dangling link without configuration": "HTTP state exists: " + str(host.state / "http-current.json")}[case]
+             "dangling link without configuration": "HTTP state exists: " + str(host.state / "http-current.json"),
+             "dangling sibling without configuration": "HTTP state exists: " + str(p.HOST_STATE / "plan-b")}[case]
     result = plan.state / RELEASES[1] / "http-result.json"
     if case == "malformed":
         current.write_text("not json")
@@ -2499,9 +2500,13 @@ def test_rollback_refuses_unresolved_or_malformed_http_state(tmp_path, monkeypat
         p.write(p.CONFIG_DIRECTORY / "http-custom.json", {"state_directory": str(tmp_path / "sibling")})
     elif case == "deploy record without configuration":
         p.write(host.state / "deploy.json", {"sha": RELEASES[1], "status": "deployed", "http": "serving"})
-    else:
+    elif case == "dangling link without configuration":
         # A link whose target is gone is still a marker, never taken for no plan B.
         (host.state / "http-current.json").symlink_to(tmp_path / "gone" / "http-current.json")
+    else:
+        # So is one in a sibling state under the host state root that holds nothing else.
+        (p.HOST_STATE / "plan-b").mkdir(parents=True)
+        (p.HOST_STATE / "plan-b" / "http-current.json").symlink_to(tmp_path / "gone" / "http-current.json")
     # The cases without configuration pass none; plan B's own state directory is not under plan A's.
     plan.refused(match, http="without configuration" not in case)
     # Refused before any image inventory was read (http-current.json is not trusted), but for the recorded schema,
