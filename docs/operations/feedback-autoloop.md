@@ -62,11 +62,13 @@ copy is autodeploy's pre-migration copy and rehearsal, docs/operations/productio
 controller lets a PR's SQL through only when it is all of: added messaging
 `migrations/NNN_*.sql` or calendar `schema_vN.sql` files that `unattended_class` (this checkout's
 `migration_rollout.py`, never the PR's) names `expand`, and modified messaging `*_role.sql` or
-calendar `roles.sql` files whose appended text `role_class` names `additive` with every GRANT
-target a table those same migrations create (a column-level GRANT counts as a GRANT on its table).
-Any other SQL, a `manual` or headerless migration, a DROP, a REVOKE or other non-additive role
-change, a GRANT to a role the file does not already grant to and any GRANT on a table that existed
-before the change park the PR as "waits for the owner: migration" or "waits for the owner: grant".
+calendar `roles.sql` files whose appended text `role_class` names `additive` (GRANTs to roles the
+file already grants to, the 050 policy or calendar guard on a new table) with every GRANT on a table
+those same migrations create by a plain `CREATE TABLE`, or naming, for each privilege, only columns
+they add to an older table. Any other SQL, a `manual` or headerless migration, a DROP, a REVOKE or
+other non-additive role change, a GRANT to a role the file does not already grant to, any
+table-level GRANT on an older table or one created `IF NOT EXISTS`, and a GRANT on an older column
+park the PR as "waits for the owner: migration" or "waits for the owner: grant".
 Here "grant" is a principal's grant (gateway profile tools, API key permissions, messenger
 opt-ins) and any SQL GRANT on a table or column that existed before the change; it excludes only a
 SQL GRANT to an existing service role on a table or column the same change's migrations create or

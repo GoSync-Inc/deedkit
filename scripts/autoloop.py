@@ -65,6 +65,7 @@ entries a stopped run left unreported. Nothing here prints feedback text. Exit 0
 from __future__ import annotations
 
 import argparse
+import base64
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 import fcntl
@@ -1533,9 +1534,10 @@ def reserve_hits(state, name, intent, number, files, others):
 
 # ANYM-590 L1: the SQL a loop PR may carry without the owner. An added migration this checkout's classifier (main's,
 # never the PR's) names `expand` by `unattended_class`, and appended role-file lines `role_class` names `additive`
-# with every GRANT target a table those same migrations create; any other SQL waits for the owner. Each kind:
-# (path, change status, database, the signal word its changed lines may carry: ALTER in a migration, GRANT in roles).
-SQL = re.compile(r'\.sql$|migrations/')
+# with every GRANT on a table those same migrations create, or only on columns they add; any other SQL waits for the
+# owner. Each kind: (path, change status, database, the signal word its changed lines may carry: ALTER in a
+# migration, GRANT in a role file). Any case of `.sql` or `migrations/` is SQL (only the exact paths qualify).
+SQL = re.compile(r'\.sql$|migrations/', re.I)
 SQL_KINDS = ((re.compile(r'services/messaging/messaging_service/migrations/[0-9]{3}_[A-Za-z0-9_]+\.sql'), 'added',
               'messaging', 'ALTER'),
              (re.compile(r'services/messaging/messaging_service/[A-Za-z0-9_]+_role\.sql'), 'modified', 'messaging',
@@ -1559,16 +1561,83 @@ def classifier(database):
     return module
 
 
-def blob(gh, path, ref):
-    """A file's text at commit `ref`, from GitHub."""
-    return gh(['api', '-H', 'Accept: application/vnd.github.raw',
-               f'repos/{REPO}/contents/{urllib.parse.quote(path)}?ref={ref}'])
+def pr_text(gh, files, head):
+    """`sql_hits`' reader: at `head` the exact blob the compare names (a symlink reads as its target path, never as
+    the target's text), elsewhere a regular file of that commit; None for anything else."""
+    shas = {f['filename']: f.get('sha') for f in files}
+
+    def text(path, ref):
+        if ref == head:
+            sha = shas.get(path)
+            if not isinstance(sha, str) or not SHA40.fullmatch(sha):
+                return None
+            reply = triage.parse(gh(['api', f'repos/{REPO}/git/blobs/{sha}']), 'gh api blobs')
+        else:
+            reply = triage.parse(gh(['api', f'repos/{REPO}/contents/{urllib.parse.quote(path)}?ref={ref}']),
+                                 'gh api contents')
+            if not isinstance(reply, dict) or reply.get('type') != 'file':
+                return None
+        if not isinstance(reply, dict) or reply.get('encoding') != 'base64' or not isinstance(reply.get('content'), str):
+            return None
+        try:
+            return base64.b64decode(reply['content']).decode()
+        except ValueError:  # binascii.Error and UnicodeDecodeError both are
+            return None
+    return text
+
+
+def if_absent(rollout, text):
+    """The tables `text` creates with IF NOT EXISTS: one may have existed before, so it is never a new table here."""
+    found = set()
+    for statement in rollout.statements(text):
+        c = rollout.Cursor(statement)
+        if c.word('create') and c.word('table') and c.word('if'):
+            c.expect('not')
+            c.expect('exists')
+            found.add(c.name())
+    return found
+
+
+def grant_targets(rollout, appended):
+    """[(table, [each privilege's column set or None])] of every GRANT in a role file's appended text, inside the
+    calendar guard too (`role_class` named the text `additive` already, so each GRANT has `grant`'s form)."""
+    grants = []
+    for statement in rollout.statements(appended):
+        if statement[:1] == [('word', 'do')]:
+            items = rollout.tokens(statement[1][1])
+            items = rollout.scoped(items, 'fcs') if hasattr(rollout, 'scoped') else items
+            inner = [[]]
+            for token in items:
+                if token == ('punct', ';'):
+                    inner.append([])
+                else:
+                    inner[-1].append(token)
+            grants += [part[part.index(('word', 'grant')):] for part in inner if ('word', 'grant') in part]
+        elif statement[:1] == [('word', 'grant')]:
+            grants.append(statement)
+    found = []
+    for items in grants:
+        c, columns = rollout.Cursor(items), []
+        c.expect('grant')
+        while True:
+            c.expect(*rollout.ROLE_PRIVILEGES)
+            columns.append({part[0][1] for part in rollout.split(c.group())} if c.peek() == ('punct', '(') else None)
+            if not c.take('punct', ','):
+                break
+        c.expect('on')
+        c.word('table')
+        while True:
+            found.append((c.name(), columns))
+            if not c.take('punct', ','):
+                break
+    return found
 
 
 def sql_hits(files, head, base, text):
     """(owner hits, {path: its lifted signal word}) for a PR's SQL (ANYM-590 L1). SQL that is only added `expand`
-    migrations and appended role grants on the tables they create is lifted whole; otherwise nothing is lifted and
-    each offending path waits for the owner. `text(path, ref)` reads a file at a commit; `base` is the merge base."""
+    migrations and appended role grants on what they create or add is lifted whole; otherwise nothing is lifted and
+    each offending path waits for the owner. `text(path, ref)` reads a file at a commit or gives None; `base` is the
+    merge base."""
     sql = [f for f in files if any(SQL.search(n) for n in (f['filename'], f.get('previous_filename') or ''))]
     kinds, owner = {}, []
     for f in sql:
@@ -1580,31 +1649,46 @@ def sql_hits(files, head, base, text):
     if owner or not sql:
         return owner, {}
 
+    if any(k[1] == 'modified' for k in kinds.values()) and not base:
+        raise Refused('gh api compare: no merge base')
+
     def read(path, ref):
         found = text(path, ref)
-        if not isinstance(found, str) or len(found.encode()) > MAX_SQL_BYTES:
-            owner.append((WAITS_MIGRATION, path))
-            return None
-        return found
+        return found if isinstance(found, str) and len(found.encode()) <= MAX_SQL_BYTES else None
     for database in CLASSIFIERS:
         mine = [n for n, k in kinds.items() if k[2] == database]
         if not mine:
             continue
-        rollout, created = classifier(database), {}
-        # Migrations in version order first (each file's new tables feed the next), then the role files.
-        for name in sorted((n for n in mine if kinds[n][1] == 'added'),
-                           key=lambda n: int(re.findall(r'[0-9]+', n.rsplit('/', 1)[1])[0])):
-            body = read(name, head)
-            if body is not None and rollout.unattended_class(body) != 'expand':
-                owner.append((WAITS_MIGRATION, name))
-            created = rollout.new_tables(body or '', created)
-        for name in sorted(n for n in mine if kinds[n][1] == 'modified'):
-            if not base:
-                raise Refused('gh api compare: no merge base')
-            old, new = read(name, base), read(name, head)
-            # tables=set(): a GRANT target must be a table this change creates, never one that existed before it.
-            if None not in (old, new) and rollout.role_class(old, new, created, tables=set()) != 'additive':
-                owner.append((WAITS_GRANT, name))
+        rollout, bodies, created, maybe = classifier(database), [], {}, set()
+        try:
+            # Migrations in version order first (each file's new tables feed the next), then the role files.
+            for name in sorted((n for n in mine if kinds[n][1] == 'added'),
+                               key=lambda n: int(re.findall(r'[0-9]+', n.rsplit('/', 1)[1])[0])):
+                body = read(name, head)
+                if body is None or rollout.unattended_class(body) != 'expand':
+                    owner.append((WAITS_MIGRATION, name))
+                    continue
+                bodies.append(body)
+                created, maybe = rollout.new_tables(body, created), maybe | if_absent(rollout, body)
+            # A table created only IF NOT EXISTS may be an old one. A plain CREATE TABLE or ADD COLUMN of an old name
+            # fails, and the migrations and the role lines run in one transaction (migrate-expand).
+            new = {table: columns for table, columns in created.items() if table not in maybe}
+            for name in sorted(n for n in mine if kinds[n][1] == 'modified'):
+                old, now = read(name, base), read(name, head)
+                if old is None or now is None or rollout.role_class(old, now, new) != 'additive':
+                    owner.append((WAITS_GRANT, name))
+                    continue
+                # A GRANT on an older table counts only when every privilege names columns this change adds to it.
+                targets = grant_targets(rollout, now[len(old):])
+                added = {table: set() for table, _ in targets if table not in new}
+                for body in bodies:
+                    added = rollout.new_tables(body, added)
+                if any(table not in new and (table in maybe or any(
+                        columns is None or not columns <= added[table] for columns in privileges))
+                       for table, privileges in targets):
+                    owner.append((WAITS_GRANT, name))
+        except Exception:  # noqa: BLE001 - the classifier parses PR text: any failure (RecursionError too) parks it
+            owner.append((WAITS_MIGRATION, mine[0]))
     return (owner, {}) if owner else ([], {n: k[3] for n, k in kinds.items()})
 
 
@@ -1633,7 +1717,7 @@ def diff_hits(files, lifted=None):
             if f.get('changes', 1) or status in ('added', 'removed'):
                 hits.append(('no patch', name))
         elif any(SIGNAL_TEXT.search(re.sub(rf'\b{word}\b', '', row, flags=re.I) if word else row)
-                 for row in patch.splitlines() if not row.startswith(('+++', '---'))):
+                 for row in patch.splitlines() if word or not row.startswith(('+++', '---'))):
             hits.append(('change-path signal', name))
     return hits
 
@@ -1784,7 +1868,7 @@ def controller(state, cfg, snap, now, gh, prs, review=None):
             if not hits:
                 files, base = compare_base(gh, head)
                 others = open_files(gh) if others is None else others
-                owner, lifted = sql_hits(files, head, base, lambda path, ref: blob(gh, path, ref))
+                owner, lifted = sql_hits(files, head, base, pr_text(gh, files, head))
                 hits = owner + diff_hits(files, lifted) or reserve_hits(state, name, i, pr['number'], files, others)
         except (Refused, triage.Refused) as error:
             failed.append(f'{name}: {error}')

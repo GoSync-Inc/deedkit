@@ -60,7 +60,7 @@ list: release, deploy and `production.py`, sends and live provider-session code.
   runs them alone inside `CI gate` (ANYM-578, TIDEN-CI.md).
   One exception, for the controller only (ANYM-590 L1, docs/operations/feedback-autoloop.md
   "Additive migrations"): when all of a loop PR's SQL is added `expand` migrations and appended
-  `additive` role grants on the tables they create, those files are no path hit, and on their
+  `additive` role grants on the tables and columns they create or add, those files are no path hit, and on their
   changed lines the text signal does not count `ALTER` (migrations) or `GRANT` (role files); any
   other word still hits. Otherwise each SQL path is a "waits for the owner: migration" or "grant"
   hit. The classifier (`migration_rollout.py`) is itself a protected path.
