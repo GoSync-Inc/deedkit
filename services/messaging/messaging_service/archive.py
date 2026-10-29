@@ -88,20 +88,22 @@ def whatsapp_body_completion(retained,candidate):
         return False
 
 
-def telegram_web_preview_refresh(retained,candidate):
+def telegram_web_preview_refresh(retained,candidate,version):
     """True when a Telegram link preview differs from the retained revision only by its attachments, both
     sides naming the same preview page ID: Telegram re-crawled the page (updateWebPage, no edit). Same
-    identity, text, formatting and provider time, neither deleted. `retained` is the revision snapshot,
-    `candidate` a validated envelope. Pure, so the conflict re-evaluation can call it; evidence it cannot
-    read is no refresh, never an exception inside ingest."""
+    identity, text and formatting, neither deleted, the candidate at the retained provider `version`.
+    `retained` is the revision snapshot, `candidate` a validated envelope, `version` the message's stored
+    provider time (an identical re-read can advance it past the snapshot's). Pure, so the conflict
+    re-evaluation can call it; evidence it cannot read is no refresh, never an exception inside ingest."""
     try:
         if candidate['platform']!='telegram' or retained['platform']!='telegram' or retained['deleted'] or candidate['deleted']:
             return False
         pages=[side.get('metadata',{}) for side in (retained,candidate)]
         if any(page.get('provider_message_type')!='webpage' for page in pages):return False
         if pages[0].get('web_preview_id') is None or pages[0].get('web_preview_id')!=pages[1].get('web_preview_id'):return False
-        if datetime.fromisoformat(candidate['updated_at'])!=datetime.fromisoformat(retained['updated_at']):return False
-        if candidate.get('formatting')!=retained.get('formatting') or candidate['media']==retained['media']:return False
+        if version is None or datetime.fromisoformat(candidate['updated_at'])!=version:return False
+        if candidate.get('formatting')!=retained.get('formatting') or not isinstance(retained['media'],list):return False
+        if candidate['media']==retained['media']:return False
         envelope={**{k:v for k,v in retained.items() if k not in REVISION_FIELDS},'chat':retained['provider_chat']}
         return fingerprint({**candidate,'media':retained['media']})==fingerprint(envelope)
     except (KeyError,TypeError,ValueError,AttributeError):
@@ -297,8 +299,8 @@ class Archive:
             # Telegram's re-crawl of the same link preview page at the retained provider version changes
             # only the attachment: the retained revision, its metadata, media and attachments stay, and it
             # is no later evidence for an open conflict (ANYM-611).
-            web_preview_refresh=bool(old and retained_snapshot and telegram_web_preview_refresh(retained_snapshot,e)
-                and not old['deleted'] and old['provider_updated_at']==updated
+            web_preview_refresh=bool(old and retained_snapshot and not old['deleted']
+                and telegram_web_preview_refresh(retained_snapshot,e,old['provider_updated_at'])
                 and fingerprint({**e,'media':retained_snapshot['media']})==old['content_hash'])
             if old:
                 if old['deleted'] and not e['deleted']: outcome='tombstoned'

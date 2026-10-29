@@ -826,6 +826,50 @@ def test_refreshed_telegram_link_preview_of_the_same_page_is_unchanged(archive,r
 
 
 # spec: ANYM-611
+def test_link_preview_refresh_keeps_the_downloaded_attachment(archive):
+    ar,s,key,_=archive
+    mid=ar.ingest(preview())['message']
+    job=ar.claim_media('worker'); writer=BlobWriter(s.files,reserve_bytes=0)
+    ar.finish_media(job,writer.write([b'jpeg'],expected_bytes=4),writer)
+    def attachments():
+        with s.pool.connection() as c:
+            return [dict(r) for r in c.execute('SELECT id,digest,filename,mime,bytes,active FROM attachments WHERE message=%s',(mid,))]
+    before=attachments(); state=archive_state(s,mid)
+    assert len(before)==1 and before[0]['active'] and s.get_attachment(key,job['id'])['status']=='ready'
+    assert ar.ingest(preview(media=PREVIEW_DOCUMENT,origin='reconcile'))['outcome']=='unchanged'
+    # The retained attachment stays active and downloadable; no job for the refreshed preview is queued.
+    assert attachments()==before and archive_state(s,mid)==state and ar.claim_media('worker') is None
+    assert s.get_attachment(key,job['id'])['status']=='ready'
+
+
+# spec: ANYM-611
+def test_link_preview_refresh_compares_the_stored_provider_version(archive):
+    ar,s,_,_=archive
+    # An identical re-read at a later edit time advances the stored provider version past the snapshot's.
+    mid=ar.ingest(preview())['message']
+    assert ar.ingest(preview(updated_at='2026-10-01T12:00:30+00:00',origin='backfill'))['outcome']=='unchanged'
+    before=archive_state(s,mid)
+    assert ar.ingest(preview(media=PREVIEW_DOCUMENT,updated_at='2026-10-01T12:00:30+00:00'))['outcome']=='unchanged'
+    assert archive_state(s,mid)==before and open_conflicts(s,mid)==[]
+    # The snapshot's own time is now older than the stored version: stale, as before.
+    assert ar.ingest(preview(media=PREVIEW_DOCUMENT,origin='reconcile'))['outcome']=='stale'
+
+
+# spec: ANYM-611
+def test_link_preview_refresh_rule_is_a_pure_function_of_two_observations():
+    from messaging_service.archive import telegram_web_preview_refresh
+    def snapshot(value):
+        return {**validate(value),'message':'m','provider_chat':'100','chat':'c','revision':1}
+    retained=snapshot(preview()); version=datetime(2026,10,1,12,tzinfo=timezone.utc)
+    assert telegram_web_preview_refresh(retained,validate(preview(media=PREVIEW_DOCUMENT)),version)
+    assert not telegram_web_preview_refresh(retained,validate(preview()),version)
+    assert not telegram_web_preview_refresh(retained,validate(preview(media=PREVIEW_DOCUMENT)),None)
+    assert not telegram_web_preview_refresh(retained,validate(preview(media=PREVIEW_DOCUMENT)),version+timedelta(seconds=1))
+    for broken in (None,{},{**retained,'metadata':'webpage'},{**retained,'media':None},{**retained,'deleted':True}):
+        assert not telegram_web_preview_refresh(broken,validate(preview(media=PREVIEW_DOCUMENT)),version)
+
+
+# spec: ANYM-611
 @pytest.mark.parametrize('retained,candidate,outcome',[
     ({},{'page':'21'},'conflict'),
     ({},{'page':None},'conflict'),
