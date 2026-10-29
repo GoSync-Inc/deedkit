@@ -37,7 +37,7 @@ NAME = re.compile(r"[a-z0-9][a-z0-9.-]{0,49}")  # deedkit_admin.NAME, the IDs `k
 TOKEN = re.compile(rb"dk_[A-Za-z0-9_-]{43}\n?")  # deedkit_admin issue(): "dk_" + secrets.token_urlsafe(32)
 TOKENS = "/root/deedkit-admin/tokens"  # deedkit_admin.TOKENS, where `key issue` leaves the gateway token
 STAGING = re.compile(r"\.(?:headers\.py|[a-z0-9][a-z0-9.-]{0,49}\.token)\.[A-Za-z0-9_-]{16}\.tmp")
-HOSTNAME = re.compile(r"(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*")
+HOSTNAME = re.compile(r"(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\.?")
 URL_PATH = re.compile(r"(?:/(?:[A-Za-z0-9._~!$&'()*+,;=:@-]|%[0-9A-Fa-f]{2})*)*/mcp")
 MISSING = object()  # no entry of that name, unlike an entry whose value is null
 HELPER = Path(__file__).resolve().with_name("deedkit_headers.py")  # installed as headers.py
@@ -87,7 +87,7 @@ def loopback(host: str) -> bool:
 def valid_url(url: str) -> bool:
     """`https://<host>[:port]/…/mcp` that http.client can send as is: a DNS name or IP literal, a plain ASCII path,
     no user info, query or fragment; `http://` only for a loopback host."""
-    if not url.isascii() or not url.isprintable() or " " in url or "@" in url or "?" in url or "#" in url:
+    if not url.isascii() or not url.isprintable() or " " in url or "?" in url or "#" in url:
         return False
     try:
         parts = urlsplit(url)
@@ -100,7 +100,7 @@ def valid_url(url: str) -> bool:
     except ValueError:
         if not HOSTNAME.fullmatch(host):
             return False
-    if port == 0 or not URL_PATH.fullmatch(parts.path):
+    if port == 0 or "@" in parts.netloc or not URL_PATH.fullmatch(parts.path):
         return False
     return parts.scheme == "https" or (parts.scheme == "http" and loopback(host))
 

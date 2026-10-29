@@ -736,6 +736,20 @@ def test_uninstall_removes_the_entry_and_the_token_and_a_second_run_is_done(site
 
 
 # spec: ANYM-498
+def test_a_url_with_an_at_sign_in_its_path_or_a_terminal_dot_installs_and_uninstalls(site):
+    # Sol r2: only user info is refused; `@` is a valid path character and `host.` a valid DNS name.
+    assert mac.valid_url("https://gateway.example.com/team@work/mcp") and mac.valid_url("https://gateway.example.com./mcp")
+    assert not mac.valid_url("https://user@gateway.example.com/mcp")
+    url = site.gateway.url.replace("/deedkit/mcp", "/team@work/mcp")
+    code, out, err = site.install(url=url)
+    assert code == 0, err
+    assert site.gateway.requests[-1]["path"] == "/team@work/v1/platform_capabilities"
+    assert site.run("uninstall", "clone")[0] == 0 and site.config()["mcpServers"] == {}
+    site.config_file.write_text(json.dumps({"mcpServers": {"deedkit-clone": site.entry(url="https://gateway.example.com./mcp")}}))
+    assert site.run("uninstall", "clone")[0] == 0 and site.config()["mcpServers"] == {}
+
+
+# spec: ANYM-498
 def test_uninstall_accepts_an_entry_pinned_to_another_interpreter(site):
     assert site.install()[0] == 0
     value = site.config()
