@@ -57,6 +57,6 @@ DO $$ BEGIN
  IF to_regclass('fcs.series_reads') IS NOT NULL THEN
   GRANT SELECT ON fcs.series_reads TO fcs_gateway, fcs_worker;
   GRANT INSERT ON fcs.series_reads TO fcs_gateway;
-  GRANT UPDATE (state, result, error) ON fcs.series_reads TO fcs_worker;
+  GRANT UPDATE (state, result, error, answered_at) ON fcs.series_reads TO fcs_worker;
  END IF;
 END $$;

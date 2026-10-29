@@ -53,7 +53,7 @@
     "fcs_gateway": ["SELECT fcs.series_reads", "INSERT fcs.series_reads"],
     "fcs_worker": [
       "SELECT fcs.series_reads", "UPDATE fcs.series_reads(state)", "UPDATE fcs.series_reads(result)",
-      "UPDATE fcs.series_reads(error)"
+      "UPDATE fcs.series_reads(error)", "UPDATE fcs.series_reads(answered_at)"
     ]
   }
 }

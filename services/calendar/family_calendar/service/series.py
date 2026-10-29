@@ -317,8 +317,9 @@ def carried(master, exceptions, occurrence, event, scope, zone):
     """The exceptions a time move of `scope` carries (ANYM-614), in original-start order, each with its fate and the
     one write that keeps it in the moved series (its instance there is named by its original start plus the shift):
     a cancelled one stays cancelled (a delete); one edited without a time change moves with the series and keeps its
-    own fields (a patch of the fields that differ from the master, or no write); one whose start or length was
-    changed keeps its own start and end too. The occurrence the move names follows the requested time. Refuses
+    own fields (a patch of the series' new times and the fields that differ from the master); one whose start or
+    length was changed keeps its own start and end too. The occurrence the move names goes to the requested time
+    and keeps its own other fields (`named`), even when it was moved on its own before. Refuses
     what check_exceptions refuses: guests of its own (or a special type, or an uncopiable field) and an unreadable
     original start."""
     delta, length = shift(occurrence, event, zone)
@@ -340,7 +341,12 @@ def carried(master, exceptions, occurrence, event, scope, zone):
             raise CalendarError("capability_unverified")
         desired = {k: e.get(k) for k in CARRIED if e.get(k) != master.get(k)}
         if original == boundary or own == (original, series[1]):
-            out.append(dict(item, fate="moves", desired=desired))
+            # The series' new start and length are written too, so a changed duration reaches it and the read-back
+            # checks the whole promised result. The occurrence the move names goes where the move asks, whatever
+            # its own time was (`named`).
+            start, end = times(original + delta, length, zone)
+            out.append(dict(item, fate="named" if original == boundary else "moves",
+                            desired={**desired, "start": start, "end": end}))
         else:
             form = "date" if zone is None else "dateTime"
             out.append(dict(item, fate="kept", desired={**desired, "start": e["start"], "end": e["end"]},

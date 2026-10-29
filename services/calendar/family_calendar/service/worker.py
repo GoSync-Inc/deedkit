@@ -436,9 +436,13 @@ class Worker:
         return True
 
     def _series_reads_ready(self):
+        # roles.sql grants the worker UPDATE on the answer's columns only, never the whole row.
         return self.store.one(
             "SELECT coalesce(has_table_privilege(to_regclass('series_reads'),'SELECT') "
-            "AND has_table_privilege(to_regclass('series_reads'),'UPDATE'),false) AS ok"
+            "AND has_column_privilege(to_regclass('series_reads'),'state','UPDATE') "
+            "AND has_column_privilege(to_regclass('series_reads'),'result','UPDATE') "
+            "AND has_column_privilege(to_regclass('series_reads'),'error','UPDATE') "
+            "AND has_column_privilege(to_regclass('series_reads'),'answered_at','UPDATE'),false) AS ok"
         )["ok"]
 
     async def read_series_one(self):
@@ -462,7 +466,7 @@ class Worker:
         except Exception:
             error = "provider_unavailable"
         self.store.query(
-            "UPDATE series_reads SET state=%s,result=%s,error=%s WHERE id=%s",
+            "UPDATE series_reads SET state=%s,result=%s,error=%s,answered_at=now() WHERE id=%s",
             ("failed" if error else "verified", Jsonb(result) if result is not None else None, error, job["id"]),
         )
         return True
@@ -504,8 +508,8 @@ class Worker:
                 )
                 if self._series_reads_ready():
                     # A series read left 'sending' failed with the process; its preview asks again.
-                    self.store.query("UPDATE series_reads SET state='failed',error='read_interrupted' "
-                                     "WHERE state='sending'")
+                    self.store.query("UPDATE series_reads SET state='failed',error='read_interrupted',"
+                                     "answered_at=now() WHERE state='sending'")
                 while True:
                     # Loss of the dedicated lease connection stops the process.
                     lease.execute("SELECT 1")

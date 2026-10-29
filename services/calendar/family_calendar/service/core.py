@@ -1467,13 +1467,12 @@ class FamilyService:
         series_id = steps[0]["target_id"] if steps[0]["action"] == "create" else carry["master_id"]
         shown, out = [], list(steps)
         for item in carry["items"]:
+            # Every exception gets its own write and read-back, also one whose fields equal the master's: its
+            # instance in the moved series is checked to be the one occurrence there, as previewed.
             target = recurrence.instance_id(series_id, item["start"], zone)
-            write = item["fate"] == "cancelled" or bool(item["desired"])
             shown.append({"fate": item["fate"], "original_start": shown_time(item["original"], zone),
-                          "start": shown_time(item["start"], zone), "write": write,
+                          "start": shown_time(item["start"], zone),
                           **({"own": item["own"]} if item["fate"] == "kept" else {})})
-            if not write:
-                continue
             action = "delete" if item["fate"] == "cancelled" else "update"
             self.authorize(key, cal["ref"], "event:" + action)
             out.append({"action": action, "calendar_ref": cal["ref"], "provider": cal["provider"],
@@ -1482,7 +1481,8 @@ class FamilyService:
                         "series": {"scope": primary["series"]["scope"], "role": "exception", "planned_at": planned,
                                    "series_id": series_id, "desired": item["desired"],
                                    "exception": {"id": item["id"], "fate": item["fate"],
-                                                 "original_start": shown[-1]["original_start"]}}})
+                                                 "original_start": shown[-1]["original_start"],
+                                                 "start": shown[-1]["start"]}}})
         primary["series"]["carried"] = shown
         return out
 

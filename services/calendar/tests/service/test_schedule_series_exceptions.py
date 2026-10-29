@@ -145,10 +145,10 @@ def test_an_all_move_lists_and_carries_a_cancelled_an_edited_and_a_moved_excepti
     view = shown["preview"]
     assert view["writes"] == 4 and view["steps"] == ["move_series", *["carry_exception"] * 3]
     assert "preview_stale" in view["effect"]
-    assert [(e["original_start"], e["fate"], e["series_start"], e["write"]) for e in view["exceptions"]] == [
-        ("2026-10-26T16:00:00+08:00", "cancelled", "2026-10-26T17:30:00+08:00", True),
-        ("2026-11-09T16:00:00+08:00", "moves", "2026-11-09T17:30:00+08:00", True),
-        ("2026-11-16T16:00:00+08:00", "kept", "2026-11-16T17:30:00+08:00", True)]
+    assert [(e["original_start"], e["fate"], e["series_start"]) for e in view["exceptions"]] == [
+        ("2026-10-26T16:00:00+08:00", "cancelled", "2026-10-26T17:30:00+08:00"),
+        ("2026-11-09T16:00:00+08:00", "moves", "2026-11-09T17:30:00+08:00"),
+        ("2026-11-16T16:00:00+08:00", "kept", "2026-11-16T17:30:00+08:00")]
     assert all(e["effect"] == sched.EXCEPTION_EFFECTS[e["fate"]] for e in view["exceptions"])
     kept = view["exceptions"][2]
     assert kept["own"] == {"start": "2026-11-17T18:00:00+08:00", "end": "2026-11-17T19:00:00+08:00"}
@@ -316,9 +316,10 @@ def test_carried_exceptions_keep_their_wall_time_across_the_dst_change(store):
 # spec: ANYM-614
 def test_an_exception_the_provider_kept_is_named_with_a_next_to_inspect_it(store):
     """Read-back: Google kept the moved exception at its old identity, so a write would show it twice. That
-    occurrence is reported exactly; the series and the other exception stay written."""
+    occurrence is reported exactly, as is one edited and reverted (its fields equal the master's, so it needs no
+    field of its own, but it is read back too); the series and the cancelled exception stay written."""
     key = setup(store)
-    providers, server = world([master(), exception(1, status="cancelled"),
+    providers, server = world([master(), exception(1, status="cancelled"), exception(3),
                                exception(4, start=week(4) + timedelta(hours=3), end=week(4) + timedelta(hours=4))],
                               keep=True)
     refs = publish(store, server)
@@ -326,11 +327,69 @@ def test_an_exception_the_provider_kept_is_named_with_a_next_to_inspect_it(store
     result = rulebook.validate_result(run(store, providers, key, {"confirm_token": shown["confirm_token"]}))
     assert (result["state"], result["detail_state"], result["error"], result["partial"]) == (
         "failed", "partial", "series_exception_mismatch", True)
-    assert [(m["original_start"], m["fate"]) for m in result["mismatches"]] == [("2026-11-16T16:00:00+08:00", "kept")]
+    assert [(m["original_start"], m["fate"]) for m in result["mismatches"]] == [
+        ("2026-11-09T16:00:00+08:00", "moves"), ("2026-11-16T16:00:00+08:00", "kept")]
     assert result["next"] == result["mismatches"][0]["inspect"] and result["next"]["tool"] == "calendar_agenda"
     assert writes(server) == [("PATCH", "lesson"), ("DELETE", iid("lesson", 1, 10, 30))]
     polled = FamilyService(store).operation(key, result["operation"]["id"])
     assert (polled["state"], polled["mismatches"]) == ("failed", result["mismatches"])
+
+
+# spec: ANYM-614
+def test_guests_added_to_an_instance_after_the_series_write_stop_only_that_write(store):
+    """The exception's instance is read fresh before its write: guests added there since the preview make that
+    write a refusal (an edit of an event with guests), reported exactly; the other exception is still written."""
+    key = setup(store)
+    providers, server = world([master(), exception(1, status="cancelled"), exception(3, summary="Edited")])
+    refs = publish(store, server)
+    shown = preview(store, providers, key, {**ALL, "event": refs["20261102"]})
+    prepare = providers.prepare
+
+    async def guests_meanwhile(cal, step):
+        if (step.get("series") or {}).get("role") == "exception" and step["target_id"] == iid("lesson", 1, 10, 30):
+            server.events[step["target_id"]]["attendees"] = [{"email": "guest@example.invalid"}]
+        return await prepare(cal, step)
+
+    providers.prepare = guests_meanwhile
+    result = rulebook.validate_result(run(store, providers, key, {"confirm_token": shown["confirm_token"]}))
+    assert (result["state"], result["error"]) == ("failed", "series_exception_mismatch")
+    assert [(m["fate"], m["error"]) for m in result["mismatches"]] == [("cancelled", "capability_unverified")]
+    assert writes(server) == [("PATCH", "lesson"), ("PATCH", iid("lesson", 3, 10, 30))]
+    assert server.events[iid("lesson", 1, 10, 30)].get("status") != "cancelled"
+
+
+# spec: ANYM-614
+@pytest.mark.parametrize("scope", ["all", "following"])
+def test_the_occurrence_the_move_names_goes_to_the_requested_time_even_if_moved_before(store, scope):
+    """The named occurrence was moved on its own (09:00 to 12:00); the move asks for 10:30: the preview says so
+    (`named`) and it lands at 10:30 with its own title, not back at 12:00."""
+    key = setup(store)
+    providers, server = world([master(), exception(2, start=week(2, 12), end=week(2, 13), summary="Moved lesson")])
+    refs = publish(store, server)
+    move = {**ALL, "series": scope, "event": refs["20261102"]}
+    view = preview(store, providers, key, move)["preview"]
+    assert [(e["fate"], e["effect"]) for e in view["exceptions"]] == [("named", sched.EXCEPTION_EFFECTS["named"])]
+    result = run(store, providers, key, {"confirm_token": preview(store, providers, key, move)["confirm_token"]})
+    assert result["state"] == "succeeded"
+    base = "lesson" if scope == "all" else plan_steps(store, result)[0]["target_id"]
+    landed = server.events[iid(base, 2, 10, 30)]
+    assert landed["start"]["dateTime"] == week(2, 10, 30).isoformat() and landed["summary"] == "Moved lesson"
+
+
+# spec: ANYM-614
+def test_a_longer_series_also_lengthens_an_edited_exception_at_the_same_start(store):
+    """Same start, two hours instead of one: an exception edited without a time change gets the new length too;
+    the read-back checks its times, not only its title."""
+    key = setup(store)
+    providers, server = world([master(), exception(3, summary="Edited")])
+    refs = publish(store, server)
+    move = {"action": "move", "start": "2026-11-02T09:00:00+01:00", "duration": 120, "series": "all",
+            "event": refs["20261102"]}
+    shown = preview(store, providers, key, move)
+    assert [e["fate"] for e in shown["preview"]["exceptions"]] == ["moves"]
+    assert run(store, providers, key, {"confirm_token": shown["confirm_token"]})["state"] == "succeeded"
+    edited = server.events[iid("lesson", 3)]
+    assert edited["end"]["dateTime"] == (week(3) + timedelta(hours=2)).isoformat() and edited["summary"] == "Edited"
 
 
 # spec: ANYM-614
@@ -382,5 +441,5 @@ def test_a_failing_series_read_never_stops_the_workers_other_jobs(store):
     assert store.one("SELECT state,error FROM series_reads") == {"state": "failed", "error": "provider_unavailable"}
     assert store.one("SELECT state FROM operations WHERE id=%s", (operation_id,))["state"] == "verified"
     # The repeat within the reuse window (made "now" here: the host may be slow) answers the read's failure.
-    store.query("UPDATE series_reads SET created_at=now() WHERE state='failed'")
+    store.query("UPDATE series_reads SET answered_at=now() WHERE state='failed'")
     assert start(store, key, pending["next"]["arguments"])[0]["error"] == "provider_unavailable"

@@ -53,7 +53,7 @@ CLOSEST_SCOPE = {"series_exceptions": "this", "series_starts_here": "all"}
 SERIES_READ_WAIT_S = 4
 SERIES_READ_PENDING_S = 60
 PENDING = object()
-SERIES_READ_REUSE_S = 15
+SERIES_READ_REUSE_S = 30
 # What a series scope of a move or cancel does (ANYM-556), as the preview states it.
 SERIES_EFFECTS = {
     ("all", "move"): "Every occurrence of the series moves by this occurrence's shift from its original start, in "
@@ -86,6 +86,8 @@ EXCEPTION_EFFECTS = {
     "cancelled": "Stays cancelled: the occurrence at its original start plus the shift is cancelled again.",
     "moves": "Moves with the series and keeps its own title, place, description and other own fields.",
     "kept": "Keeps its own start and end (and its own fields); follow_up moves it back into the series.",
+    "named": "The occurrence this move names: it goes to the requested time, also if it was moved on its own "
+             "before, and keeps its own title, place, description and other own fields.",
 }
 
 
@@ -476,7 +478,7 @@ class Scheduler:
         row = self.store.one(
             "SELECT id FROM series_reads WHERE principal_id=%s AND calendar_ref=%s AND target=%s AND ("
             "(state IN ('prepared','sending') AND created_at>now()-make_interval(secs=>%s)) OR "
-            "(state IN ('verified','failed') AND created_at>now()-make_interval(secs=>%s))) "
+            "(state IN ('verified','failed') AND answered_at>now()-make_interval(secs=>%s))) "
             "ORDER BY created_at DESC LIMIT 1",
             (p["id"], cal["calendar_ref"], found["target"], SERIES_READ_PENDING_S, SERIES_READ_REUSE_S))
         read_id = row["id"] if row else ref("read")
@@ -604,7 +606,7 @@ class Scheduler:
 
         fate = carried["fate"]
         shown = {"original_start": local(carried["original_start"]), "fate": fate, "effect": EXCEPTION_EFFECTS[fate],
-                 "series_start": local(carried["start"]), "write": carried["write"]}
+                 "series_start": local(carried["start"])}
         if fate == "kept":
             own = {k: local(v) for k, v in carried["own"].items()}
             arguments = {"action": "move", "event": {"date": own["start"][:10]}, "start": shown["series_start"]}

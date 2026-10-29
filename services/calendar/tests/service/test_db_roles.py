@@ -40,7 +40,7 @@ MATRIX = (
     | {("wk", t, "UPDATE") for t in ("operations", "operation_steps", "sync_jobs")}
     | {(role, "audit_id_seq", "USAGE") for role in ("gw", "wk")}
     | {("gw", "member_people", "SELECT")}
-    | {("gw", "series_reads", "INSERT")} | {("wk", "series_reads(%s)" % c, "UPDATE") for c in ("state", "result", "error")}
+    | {("gw", "series_reads", "INSERT")} | {("wk", "series_reads(%s)" % c, "UPDATE") for c in ("state", "result", "error", "answered_at")}
 )
 # Schema 4, before migration 5 adds invitation_opt_ins (6 member_people, 7 series_reads).
 MATRIX_4 = {e for e in MATRIX if e[1].partition("(")[0] not in ("invitation_opt_ins", "member_people", "series_reads")}
@@ -110,6 +110,25 @@ def test_roles_sql_grants_exactly_the_written_matrix(schema_one, roles):  # noqa
     apply_roles()
     assert matrix(s) == MATRIX
     assert not any(obj == "synthetic" or obj == "principal_operations" for _, obj, _ in matrix(s))
+
+
+# spec: ANYM-614
+def test_the_real_roles_ask_for_and_answer_a_series_read(schema_one, roles):  # noqa: F811 (fixtures)
+    """Under roles.sql's narrow grants (worker: UPDATE of the answer's columns only) the gateway asks for a read and
+    the worker takes it and writes its answer."""
+    import asyncio
+    from family_calendar.service.worker import Worker
+
+    apply_roles, connect = roles
+    s = schema_one
+    s.migrate()
+    apply_roles()
+    gateway, worker = connect("gateway"), connect("worker")
+    gateway.query("INSERT INTO series_reads(id,principal_id,calendar_ref,target) VALUES ('read-1','p','cal','t')")
+    assert asyncio.run(Worker(worker, None).read_series_one()) is True
+    # No such principal: the read is refused, and the refusal is the worker's own written answer.
+    assert gateway.one("SELECT state,error FROM series_reads WHERE id='read-1'") == {
+        "state": "failed", "error": "not_found_or_forbidden"}
 
 
 # spec: ANYM-601

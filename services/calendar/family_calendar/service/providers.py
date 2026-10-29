@@ -643,6 +643,16 @@ class Providers:
         live = await self.read(cal, step["target_id"])
         if not live or live.get("recurringEventId") != series["series_id"] or not live.get("etag"):
             raise CalendarError("series_exception_mismatch")
+        if live.get("attendees") or live.get("eventType", "default") != "default" or any(
+                live.get(k) for k in recurrence.UNCOPIABLE):
+            # Guests (or a special type) added there since the preview: a write would change an event with guests.
+            raise CalendarError("capability_unverified")
+        # The instance the moved series has at the exception's original start plus the shift, by its identity.
+        wanted, found = series["exception"]["start"], live.get("originalStartTime") or {}
+        if not isinstance(found, dict) or not (
+                instant(found["dateTime"]) == instant(wanted) if "T" in wanted and "dateTime" in found
+                else found.get("date") == wanted):
+            raise CalendarError("series_exception_mismatch")
         old = series["exception"]["id"]
         if old != step["target_id"]:
             kept = await self.read(cal, old)
