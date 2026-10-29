@@ -19,6 +19,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'scripts' / 'remote-test.sh'
 SHIM = ROOT / 'deploy' / 'mac-mini' / 'deedkit-remote-test'
+SUDOERS = ROOT / 'deploy' / 'mac-mini' / 'sudoers-deedkit-remote-test'
 WORKER = 'infra_remote_test'
 RSYNC = shutil.which('rsync')
 
@@ -278,7 +279,7 @@ def test_a_run_sends_exactly_the_listed_files_and_runs_the_suite_as_the_service_
     assert 'FAKE SUITE OUTPUT' in result.stdout
     assert files_under(home / 'stage' / 'src') == SENT
     assert files_under(home / 'shared' / 'stage' / WORKER) == SENT
-    # The mini stage belongs to egoregerev and is read by _deedkitci: every staged file is readable by others.
+    # The mini stage belongs to the admin account and is read by _deedkitci: every staged file is readable by others.
     assert (home / 'shared' / 'stage' / WORKER / 'private_notes.txt').stat().st_mode & 0o044 == 0o044
     assert (worktree / 'private_notes.txt').stat().st_mode & 0o777 == 0o600
     copy = worker_dir(home) / 'src'
@@ -602,6 +603,25 @@ def test_a_mini_that_cannot_start_the_suite_leaves_it_to_ci_and_runs_nothing_loc
 
 
 # spec: ANYM-638
+def test_the_mini_address_comes_from_the_laptops_config_and_never_reaches_ssh_as_an_option(mini, worktree):
+    home, env = mini
+    env = dict({k: v for k, v in env.items() if k != 'DEEDKIT_REMOTE_HOST'}, HOME=str(home / 'laptop'))
+    missing = remote(env, '--full', worktree, 'gateway')
+    assert missing.returncode == 91 and 'no mini address' in missing.stderr, missing.stderr
+    config = home / 'laptop' / '.config' / 'deedkit' / 'mini-host'
+    write(config, '-oProxyCommand=sh\n', 0o600)
+    bad = remote(env, '--full', worktree, 'gateway')
+    assert bad.returncode != 0 and 'bad mini address' in bad.stderr, bad.stderr
+    assert not log_lines(home, 'ssh')
+    write(config, 'admin@mini.invalid\n', 0o600)
+    result = remote(env, '--full', worktree, 'gateway')
+    assert result.returncode == 0, result.stderr
+    # rsync hands ssh the account as `-l admin`; every connection goes to the configured host.
+    assert any('admin@mini.invalid' in line.split() for line in log_lines(home, 'ssh'))
+    assert all('mini.invalid' in line for line in log_lines(home, 'ssh'))
+
+
+# spec: ANYM-638
 def test_an_ssh_drop_mid_run_stops_the_run_on_the_mini_and_does_not_rerun_locally(mini, worktree):
     home, env = mini
     process = background(env, worktree, 'root', 'tests/test_app.py', FAKE_UV_SLEEP='60', FAKE_SSH_DROP='1')
@@ -805,6 +825,11 @@ def test_the_setup_creates_and_its_undo_removes_exactly_the_ledgered_resources(m
     assert ledger[3].startswith(f'stage {root}/tmp/deedkit-setup.')
     assert 'UniqueID: 453' in (root / 'ds' / 'Users' / '_deedkitci').read_text()
     assert (root / 'libexec' / 'deedkit-remote-test').read_text() == SHIM.read_text()
+    # The repository's sudoers line names no account; the installed one names the account that ran the setup.
+    admin = subprocess.run(['id', '-un'], capture_output=True, text=True, check=True).stdout.strip()
+    rule = 'ALL=(_deedkitci) NOPASSWD: /usr/local/libexec/deedkit-remote-test'
+    assert SUDOERS.read_text().splitlines()[-1] == f'@ADMIN@ {rule}'
+    assert (root / 'sudoers.d' / 'deedkit-remote-test').read_text().splitlines()[-1] == f'{admin} {rule}'
     # The files travelled through a private directory, now gone; the owner's own file is untouched.
     assert (root / 'owner' / 'deedkit-remote-test').read_text() == 'an owner file\n'
     assert not list((root / 'tmp').iterdir())

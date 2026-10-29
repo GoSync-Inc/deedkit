@@ -1,5 +1,5 @@
 #!/bin/bash
-# /usr/local/libexec/deedkit-remote-test (root:wheel 0755) on the Mac mini: the only command egoregerev may
+# /usr/local/libexec/deedkit-remote-test (root:wheel 0755) on the Mac mini: the only command the admin account may
 # run as _deedkitci (deploy/mac-mini/sudoers-deedkit-remote-test). scripts/remote-test.sh arrives on stdin,
 # so this file never changes when the script does; it fixes the user, home, PATH and working directory.
 set -eu
