@@ -31,8 +31,11 @@ pins after that. Wheels by kit on the server: release-045 (10-27 02:32Z) and rel
 (10-28 01:02Z) have no stream resume (`STREAM_RESUMES`) and no `describe`. `recvupd` (10-28
 15:07Z) is the first kit with both. The release workers' one-off diagnostic passes then verified
 the same capture on retry: 045 at 10-27 09:49 (`ca36d92d…`), 046 at 10-28 02:58 (`93ea9813…`).
-So the failure was transient, not in the data or the images. The journal printed only `independent_restore_failed`, because `main()` at those
-revisions printed that string for every exception. `last-failure.json` now holds a later
+So the failure was transient, not in the data or the images.
+
+The journal printed only `independent_restore_failed`, because `main()` at those revisions printed
+that string for every exception, safe-coded or not (`ad46e79`, `main`). The line says nothing about
+the failure's code. `last-failure.json` now holds a later
 `receiver_busy` (10-28 18:57Z), not one of these four. Helper failure files are removed with the
 payload. The journal records no R2 resume counts.
 
@@ -43,59 +46,73 @@ which writes `busy` status for an upload's lock.
 
 ## What the evidence shows
 
-1. **Exit 130 is the verifier's own cleanup, not the helper's failure.** The helper image is
-   built `FROM` the official postgres image and keeps its `STOPSIGNAL SIGINT` (read back:
-   `stop=SIGINT`). Python dies of an uncaught SIGINT with status 130. The verifier's `except`
-   path runs `cleanup_resources`, which runs `docker container stop --time=10`
-   (`backup_r2_verifier.py`, `Docker.remove`). Both helper deaths fall in the same minute as the
-   verifier's failure line. So in those two runs the verifier had already raised, and the helper
-   was still streaming. A helper that failed on its own exits 1. A kill exits 137. A forwarded
-   SIGTERM from `process.terminate()` exits 143.
-2. **No OOM, no daemon fault.** `journalctl -k` covers the whole window (since the 10-22 boot,
-   234 lines from 10-27 to 10-28 03:00) and has no OOM or killed-process line.
-   `docker.service`/`containerd.service` log no error or warning between 10-27 07:50 and 10-28
-   02:15. `docker events` no longer holds those days.
-3. **In the 045/046 wheels only two exceptions mid-stream gave the generic code.** That code
-   means `failure_code` found no safe code (verifier at `ad46e79`, `failure_code`). During the
-   stream, `restore()` called `r2.verify_object(receiver,client,receipt,Sink())`. That
-   `verify_object` had no resume: a `body.read(MIB)` error from botocore/urllib3
-   (`ResponseStreamingError`, `ReadTimeoutError`) propagated raw. The deadline
-   (`TimeoutError`/`restore_deadline`), stop (`InterruptedError`), disk reserve
-   (`restore_disk_capacity`), `stored_backup_corrupt` and a helper exit
-   (`isolated_restore_failed`) were all safe codes. The two candidates left are:
-   - (i) a broken R2 body read: an SDK read error;
-   - (ii) a `BrokenPipeError` on the helper's stdin while the helper itself lived. This happens
-     when the `docker container start -ai` client ended. The helper-death case is ruled out for
-     the two exit-130 runs by point 1.
-4. **No mid-run failure since the resume shipped.** The resume (bounded ranged GET, `STREAM_RESUMES`
-   = 5, #332, merged 10-28 04:37Z) reached the receiver with the `recvupd` kit (10-28 15:07Z).
-   Restore runs since then: 10-28 15:09 → 16:19 verified, 19:13 → 20:12 verified, 10-29 09:27 →
-   10:15 verified (`last-success.json` `a7aac368…`). The only failures in that time are three
-   pre-stream `receiver_busy` (10-28 18:27-18:57). This fits (i), but three runs prove little,
-   and a run that a resume saved looks exactly like a clean one.
+Observations (read on the server, 10-29):
 
-The card's other candidates: the resume limit could not fire, because no resume existed then.
-The job deadline is 21,600 s, and a deadline or stop maps to its own code. Helper memory is ruled
-out by point 2 and by the exit codes.
+1. **The helper ended with 130 in two runs, in the minute the verifier failed.** The helper image
+   is built `FROM` the official postgres image and keeps its `STOPSIGNAL SIGINT` (read back:
+   `stop=SIGINT`). The helper runs as the container's PID 1 (`--entrypoint python`, no `--init`).
+   PID 1 does not get SIGTERM's default action, and CPython exits 130 on SIGINT. The verifier's
+   `except` path runs `cleanup_resources` → `docker container stop --time=10` (`Docker.remove`),
+   which sends that SIGINT. Its `finally` sends SIGTERM to the attach client
+   (`process.terminate()`); with sig-proxy that reaches the helper, which ignores it as PID 1. So
+   130 fits a helper still running when the verifier failed and the cleanup stopped it. A stop by
+   someone else, at that minute, is not ruled out. The minute match does not prove which side
+   failed first.
+2. **No OOM, no daemon fault, no service stop.** `journalctl -k` covers the whole window (since
+   the 10-22 boot, 234 lines from 10-27 to 10-28 03:00) and has no OOM or killed-process line.
+   `docker.service`/`containerd.service` log no error or warning between 10-27 07:50 and 10-28
+   02:15. The verifier unit logs no stop, signal or timeout in that range, so systemd sent no
+   SIGTERM. `docker events` no longer holds those days.
+3. **No mid-run failure since the resume shipped.** The resume (bounded ranged GET,
+   `STREAM_RESUMES` = 5, #332, merged 10-28 04:37Z) reached the receiver with the `recvupd` kit
+   (10-28 15:07Z). Restore runs since then: 10-28 15:09 → 16:19 verified, 19:13 → 20:12 verified,
+   10-29 09:27 → 10:15 verified (`last-success.json` `a7aac368…`). The only failures in that time
+   are three pre-stream `receiver_busy` (10-28 18:27-18:57). Three runs prove little, and a run
+   that a resume saved looked exactly like a clean one.
+
+Hypotheses the evidence leaves open (the release-045/046 code, `ad46e79`):
+
+- (i) A broken R2 body read. That `verify_object` had no resume: a `body.read(MIB)` error from
+  botocore/urllib3 (`ResponseStreamingError`, `ReadTimeoutError`) propagated raw. Fits
+  observations 1 and 3 and #332's analysis.
+- (ii) A `BrokenPipeError` on the helper's stdin after the `docker container start -ai` client
+  ended while the helper lived.
+- (iii) A safe-coded verifier failure mid-stream, hidden by the generic journal line:
+  `restore_disk_capacity` from the reserve check (disk free at that time is not recorded), or
+  `stored_backup_corrupt`.
+- (iv) Another uncoded error in the stream loop, for example an `OSError` from
+  `shutil.disk_usage` in the reserve check.
+- For the two 10-27 morning runs, with no exit recorded: a helper failure of its own as well
+  (`isolated_restore_failed` or a stage code), though OOM is ruled out by observation 2.
+
+Ruled out: a systemd stop (observation 2), the job deadline (21,600 s against 7-28 min), and
+kernel OOM. The card's resume-limit candidate could not fire, because no resume existed then.
 
 ## Outcome: (c) cause not determinable from the evidence; this PR adds what was missing
 
-Most likely cause: (i), a mid-stream R2 body read error that the verifier did not resume, at the
-revisions installed then. #332 (ANYM-285) fixes it. The evidence cannot separate (i) from (ii),
-because these runs predate the class diagnostics, and it cannot show whether R2 still breaks
-under the resume. Missing evidence and where it now comes from:
+Most likely is (i), which #332 (ANYM-285) fixes, but nothing recorded then separates (i)-(iv).
+Missing evidence and where it now comes from:
 
 | Missing | Now recorded by |
 |---|---|
-| The exception class and frames of a failed run | `diagnostic` (ANYM-285 #332, installed) |
+| The failure's own code (not the generic journal line) | `error` in the journal line and `status.json` (ANYM-285 #332, installed) |
+| The exception class and frames | `diagnostic` (ANYM-285 #332, installed) |
 | The helper's failure code after a broken pipe | `failure.json` → `error` (ANYM-603 #369, installed) |
-| How many ranged GETs a stream needed: whether R2 still breaks, and the headroom to `STREAM_RESUMES` | `stream_resumes` in a verified `status.json`/`last-success.json`, and in a failure after the full stream (this PR) |
-| How the helper ended: a stop (130), a kill/OOM (137), its own error (1), or a client end | `helper_exit` on a helper failure (this PR) |
+| Whether R2 still breaks under the resume, and the headroom to `STREAM_RESUMES` | `stream_resumes`: the ranged-GET attempts of the full stream, in a verified run's status and stdout line, and in a failure after the stream (this PR) |
+| Whether the helper was still running, exited on its own (code), or was OOM-killed when the verifier failed | `helper_state` from Docker's own container state, read before cleanup, on any failure (this PR; not the attach client's return code) |
 
-Case (ii) will now show as `isolated_restore_failed` with `helper_exit` other than 1. Case (i)
-under the resume shows as a growing `stream_resumes` on verified runs, or as `storage_unavailable`
-with its SDK class in `diagnostic`.
+Each failure's fields also go to the journal line, so a later failure overwriting
+`last-failure.json` loses nothing. A verified run's stdout line keeps its `stream_resumes`. How the
+cases will show: (i) as `storage_unavailable` with an SDK class in `diagnostic`, or as non-zero
+`stream_resumes` on verified runs; (ii) as `isolated_restore_failed` with `helper_state.status`
+`running`; (iii) as its own code; (iv) as its class in `diagnostic`; a helper failure as `exited`
+with its `exit_code` and `oom_killed`.
 
-Record for the window (criterion 2c): mid-run failures in the 14 days are read from
-`last-failure.json`, `status.json` and the journal at the window's end. Any failure there carries
-the fields above.
+## Record for the window (criterion 2c)
+
+Due 2026-11-12 11:40Z, from the verifier journal for 10-29 11:40Z to 11-12 11:40Z (journald keeps
+227 MB since the 10-22 boot) and `last-failure.json`: every mid-run failure with its code,
+`diagnostic` classes and frames, `stream_resumes` and `helper_state`, and the `stream_resumes` of
+each verified run. The new fields exist from the receiver wheel install that carries this change;
+until then, failures carry `error` and `diagnostic` only. The record is appended here in one
+docs pull request. A cause found in it gets its fix or follow-up card as outcome (a) or (b).

@@ -528,7 +528,7 @@ class FinishedHelper:
 
 
 # spec: ANYM-633
-def test_verified_status_records_how_many_stream_resumes_the_proof_needed(operator,monkeypatch):
+def test_verified_status_records_how_many_stream_resumes_the_proof_needed(operator,monkeypatch,capsys):
     v,config,receiver,cloud,_,_=operator
     monkeypatch.setattr(r2,'stream_pause',lambda attempt:None)
     directory=Path(config['directory']);docker=v.Docker(60)
@@ -553,9 +553,13 @@ def test_verified_status_records_how_many_stream_resumes_the_proof_needed(operat
         if len(broken)<2:broken.append(start);response['Body']=FlakyBody(rest,64)
         return response
     cloud.get_object=get_object
-    result=v.run(config,client=cloud,engine=docker)
-    assert broken==[0,64] and result['status']=='verified' and result['stream_resumes']==2
-    for name in ('status.json','last-success.json'):assert json.loads((directory/name).read_text())['stream_resumes']==2
+    busy_main(v,config,cloud,docker,monkeypatch)
+    assert v.main(['--config','/synthetic'])==0 and broken==[0,64]
+    status=json.loads((directory/'status.json').read_text())
+    assert status['status']=='verified' and status['stream_resumes']==2
+    assert json.loads((directory/'last-success.json').read_text())==status
+    line=json.loads(capsys.readouterr().out)
+    assert line=={'status':'verified','verification_id':status['verification_id'],'stream_resumes':2}
 
 
 # spec: ANYM-285
@@ -709,26 +713,31 @@ def test_helper_exit_mid_stream_reports_its_failure_fact_not_a_generic_code(oper
 
 
 # spec: ANYM-633
-@pytest.mark.parametrize('exit_code',[1,130,137],ids=['error','sigint-stop','oom-kill'])
-def test_helper_failure_status_records_the_helper_exit_code(operator,monkeypatch,exit_code):
+@pytest.mark.parametrize('failure,state,expected',[
+    (RuntimeError('isolated_restore_failed'),{'Status':'exited','ExitCode':1,'OOMKilled':False},
+     {'status':'exited','exit_code':1,'oom_killed':False}),
+    (RuntimeError('isolated_restore_failed'),{'Status':'exited','ExitCode':137,'OOMKilled':True},
+     {'status':'exited','exit_code':137,'oom_killed':True}),
+    (RuntimeError('storage_unavailable'),{'Status':'running','ExitCode':0,'OOMKilled':False,'Error':'SECRET'},
+     {'status':'running','exit_code':0,'oom_killed':False}),
+    (RuntimeError('storage_unavailable'),{'Status':'SECRET','ExitCode':'1'},{'status':'unknown','exit_code':None,'oom_killed':False}),
+    (RuntimeError('storage_unavailable'),None,None)],ids=['helper-error','helper-oom','verifier-side','odd-answer','no-helper'])
+def test_failure_status_records_the_helper_containers_own_state_before_cleanup(operator,monkeypatch,capsys,failure,state,expected):
     v,config,receiver,cloud,engine,_=operator
-    docker=v.Docker(60);helpers=[]
-    monkeypatch.setattr(docker,'setup',lambda *a:None)
-    monkeypatch.setattr(docker,'inspect_owned',lambda *a:{})
-    monkeypatch.setattr(v,'validate_helper_layout',lambda *a:None)
-    monkeypatch.setattr(r2,'verify_object',lambda receiver,client,receipt,out:out.write(b'synthetic-ciphertext'))
-    class Exited(ExitedHelper):
-        def poll(self):return exit_code
-        def wait(self,timeout):return exit_code
-    def popen(*args,**kwargs):
-        helpers.append(Exited(next(Path(config['directory']).glob('payload-*')),None,False));return helpers[-1]
-    monkeypatch.setattr(v.subprocess,'Popen',popen)
-    engine.restore=docker.restore
-    with pytest.raises(RuntimeError,match='isolated_restore_failed'):v.run(config,client=cloud,engine=engine)
-    directory=Path(config['directory'])
+    engine.failure=failure;original=engine.inspect_owned;seen=[]
+    def inspect_owned(kind,name,run):
+        value=original(kind,name,run)
+        if kind=='helper' and value is not None and state is not None:seen.append(run);return {**value,'State':state}
+        return value
+    engine.inspect_owned=inspect_owned
+    busy_main(v,config,cloud,engine,monkeypatch)
+    assert v.main(['--config','/synthetic'])==1 and not engine.resources
+    directory=Path(config['directory']);err=capsys.readouterr().err;line=json.loads(err)
     for name in ('status.json','last-failure.json'):
         status=json.loads((directory/name).read_text())
-        assert status['error']=='isolated_restore_failed' and status['helper_exit']==exit_code
+        assert status['error']==str(failure) and status.get('helper_state')==expected
+    assert line.get('helper_state')==expected and line['error']==str(failure) and 'SECRET' not in err
+    assert 'SECRET' not in (directory/'status.json').read_text() and bool(seen)==(state is not None)
 
 
 HEAD='d'*40;NEW_IMAGE='sha256:'+'c'*64
