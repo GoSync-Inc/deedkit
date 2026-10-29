@@ -659,8 +659,9 @@ class VoiceService:
             if live_user:
                 try:_,_,pending,restated=self._turns(v['events'],'user')
                 except Exception:pending,restated=[],False
-                # An older input finalized out of the pending speech leaves different latest words to judge.
-                if restated and pending and ''.join(item[1] for item in pending)!=before:
+                # A distinct older input finalized out of the pending speech leaves new latest words to judge;
+                # a sentence of the same input does not (its rejected evidence stays rejected).
+                if restated and pending and pending[0][2]=='speech' and ''.join(item[1] for item in pending)!=before:
                     v.pop('closing_rejected_revision',None)
                 # A final restating recorded chunks keeps a granted permission; any other final is new speech.
                 if not v.get('human_pending_final') or (v.get('close_requested') and not restated):
@@ -791,13 +792,14 @@ class VoiceService:
         turn='';began=None;pending=[];split=False;restated=False
         for index,event in enumerate(events):
             if role=='user' and event['kind']=='audio_activity' and event.get('speaking'):
-                split=True
+                split='speech'
             elif event['kind'] in {'transcript','transcript_chunk'}:
                 if event.get('role')!=role:
-                    split=True
+                    split=split or 'other'
                 elif event['kind']=='transcript_chunk':
-                    # [event index, text, starts a new input after other speech or a speech start]
-                    pending.append([index,event['text'],split or not pending]);split=False
+                    # [event index, text, input start: 'speech' (a speech start), 'other' (after other speech),
+                    # 'first' or 'part' (the rest of a partly transcribed input), else False]
+                    pending.append([index,event['text'],split or (not pending and 'first')]);split=False
                 elif role=='user':
                     turn=event['text'];began,pending,restated=self._transcribed(pending,turn,index)
                 else:
@@ -817,8 +819,14 @@ class VoiceService:
                     size=len(_compact_words(item[1]))
                     if not rest and size<=cut:
                         cut-=size;continue
-                    # Pipecat sends one sentence per final, so a chunk can be transcribed only in part.
-                    rest.append([item[0],_words_after(item[1],cut) if not rest else item[1],item[2] or not rest]);cut=0
+                    if rest:
+                        rest.append(item)
+                    elif cut or not item[2]:
+                        # Pipecat sends one sentence per final: the rest of this input is not a new input.
+                        rest.append([item[0],_words_after(item[1],cut),'part'])
+                    else:
+                        rest.append(item)
+                    cut=0
                 return pending[k][0],rest,True
         # Unmatched words: keep the newest input pending, so an old final never clears newer speech.
         return (pending[0][0] if starts and starts[-1] else index),(pending[starts[-1]:] if starts else []),False

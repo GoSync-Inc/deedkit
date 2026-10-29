@@ -645,6 +645,19 @@ def test_assistant_speech_inside_one_human_utterance_does_not_cut_it(tmp_path,as
 
 
 # spec: ANYM-374
+def test_a_sentence_final_of_a_refused_input_keeps_its_retry_refused(tmp_path):
+    store, identity = call(tmp_path)
+    store.audio_activity(identity,True)
+    store.transcript_chunk(identity,'user','I am quoting this, not ending our call. Goodbye.')
+    store.audio_activity(identity,False)
+    assert end(store,identity,'Goodbye.')['error'] == 'closing_confirmation_required'
+    store.transcript(identity,'user','I am quoting this, not ending our call.')
+    assert end(store,identity,'Goodbye.','fresh')['error'] == 'closing_retry_requires_new_human_speech'
+    assert not store.closing_ready(identity)
+    store.close()
+
+
+# spec: ANYM-374
 def test_every_chunk_split_keeps_exactly_the_speech_no_final_has_transcribed(tmp_path):
     store, identity = call(tmp_path)
     old, new = 'До свидания. Ну пока.', 'Хотя подожди, ещё'
