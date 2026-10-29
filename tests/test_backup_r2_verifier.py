@@ -686,7 +686,7 @@ def follower(operator,tmp_path,monkeypatch):
     class Docker(f.Docker):
         def __init__(self):
             super().__init__(900);self.pulled=[];self.removed=[];self.in_use=set();self.daemon_down=False
-            self.resources={}
+            self.resources={};self.containerd=False
         def command(self,*args):
             if self.daemon_down:raise RuntimeError('restore_docker_failed')
             if args[:2]==('image','inspect'):
@@ -697,11 +697,18 @@ def follower(operator,tmp_path,monkeypatch):
                 self.removed.append(args[2])
                 if args[2] in self.in_use:raise RuntimeError('restore_docker_failed')
                 images.pop(args[2],None);return b''
+            if args==('info','--format','{{json .DriverStatus}}'):
+                store=[['driver-type','io.containerd.snapshotter.v1']] if self.containerd else [['Backing Filesystem','extfs']]
+                return json.dumps(store).encode()
             if args[0]=='info':return str(tmp_path).encode()
             raise AssertionError(args)
         def inspect_owned(self,kind,name,run):return self.resources.get((kind,name))
         def remove(self,kind,name):self.resources.pop((kind,name))
-        def pull(self,reference):self.pulled.append(reference);images[NEW_IMAGE]=served
+        def pull(self,reference):
+            # The classic store keys the pull by its config digest, the containerd store by its manifest digest.
+            self.pulled.append(reference);key=NEW_IMAGE
+            if self.containerd:key=reference.split('@')[1];served['Id']=key
+            images[key]=served
     class Main:
         def __init__(self):self.head_value=HEAD;self.forward_value=True
         def head(self):return self.head_value
@@ -754,6 +761,37 @@ def test_follow_installs_an_attested_newer_helper_after_its_self_test_and_publis
     assert follow_status(s)['status']=='switched'
     # Main unchanged: nothing more to install or test.
     assert s.run()['status']=='current' and s.tested==[old[1],HEAD] and len(s.docker.pulled)==1
+
+
+# spec: ANYM-597
+def test_follow_on_a_containerd_image_store_pins_the_attested_manifest_digest(follower):
+    # The containerd image store's image ID is the manifest digest (the receiver, 10-29): the record, the preflight's
+    # `Id` and the pin are that digest, never the config digest the classic store uses.
+    s=follower;s.docker.containerd=True;digest=s.proofs[HEAD]['digest']
+    result=s.run()
+    assert result['status']=='switched' and result['revision']==HEAD
+    installed=s.v.load_config(s.path)
+    assert (installed['helper_image'],installed['helper_revision'])==(digest,HEAD)
+    assert digest in s.images and NEW_IMAGE not in s.images and not (s.directory/'follow-candidate.json').exists()
+    assert s.run()['status']=='current' and len(s.docker.pulled)==1
+
+
+# spec: ANYM-597
+def test_follow_on_a_containerd_image_store_removes_a_refused_pull_by_its_manifest_digest(follower):
+    s=follower;s.docker.containerd=True;digest=s.proofs[HEAD]['digest'];before=s.path.read_bytes()
+    s.results[HEAD]=49
+    with pytest.raises(Exception,match='helper_self_test_mismatch'):s.run()
+    assert s.path.read_bytes()==before and s.docker.removed==[digest] and digest not in s.images
+    assert not (s.directory/'follow-candidate.json').exists()
+
+
+# spec: ANYM-597
+def test_follow_refuses_a_pull_the_daemon_does_not_list_under_the_recorded_image_id(follower):
+    s=follower;before=s.path.read_bytes()
+    s.docker.pull=lambda reference:s.docker.pulled.append(reference)
+    with pytest.raises(Exception,match='helper_pull_failed'):s.run()
+    assert s.path.read_bytes()==before and s.tested==[s.config['helper_revision']]
+    assert follow_status(s)['error']=='helper_pull_failed' and not (s.directory/'follow-candidate.json').exists()
 
 
 # spec: ANYM-597

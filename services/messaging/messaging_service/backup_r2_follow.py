@@ -224,6 +224,14 @@ class Docker(verifier.Docker):
         if not Path(root).is_absolute():raise ValueError('invalid_docker_data_root')
         return root
 
+    def image_id(self, proof):
+        """The ID this daemon gives the attested image: the manifest digest with the containerd image store
+        (`driver-type io.containerd.snapshotter.v1`), else the config digest, the classic store's image ID."""
+        try:status = json.loads(self.command('info', '--format', '{{json .DriverStatus}}'))
+        except ValueError:raise RuntimeError('restore_docker_failed') from None
+        containerd = isinstance(status, list) and ['driver-type', 'io.containerd.snapshotter.v1'] in status
+        return proof['digest'] if containerd else proof['config_digest']
+
     def has_image(self, image):
         """Whether the daemon holds this exact image ID. A daemon failure raises: never read as absence."""
         return image in self.command('image', 'ls', '--all', '--quiet', '--no-trunc').decode().split()
@@ -590,7 +598,8 @@ def candidate(fd, engine, config, head, attest, test, profiles=()):
     """Pull, check and self-test main's head image: its record. A refused pull is removed."""
     # An unresolved earlier candidate keeps its record: never overwritten by a new one.
     if r2.read_root(fd, CANDIDATE, missing=True)[1] is not None:raise ValueError('follow_candidate_unresolved')
-    proof = attest(head); image = proof['config_digest']
+    # The pin is the daemon's own image ID (the verifier's preflight compares `Id`): the record names it before the pull.
+    proof = attest(head); image = engine.image_id(proof)
     owned = not engine.has_image(image)
     if owned:
         if shutil.disk_usage(engine.docker_root()).free < config['reserve_bytes'] + PULL_BYTES:
@@ -599,6 +608,7 @@ def candidate(fd, engine, config, head, attest, test, profiles=()):
         local.write_maintenance_json(CANDIDATE, {'v': 1, 'helper_image': image}, dir_fd=fd)
     try:
         engine.pull(proof['reference'])
+        if not engine.has_image(image):raise RuntimeError('helper_pull_failed')
         tested = {**config, 'helper_image': image, 'helper_revision': head}
         record = prove(engine, tested, test)
         # Every other instance's profile on its own synthetic bundle: the pins move only together.
