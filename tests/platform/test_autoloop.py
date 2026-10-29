@@ -1903,6 +1903,12 @@ def test_the_classifier_reads_the_compared_blob_and_never_a_symlink_target():
     symlink.gh = lambda argv: json.dumps({'type': 'symlink', 'target': 'x.sql', 'encoding': 'base64', 'content': ''})
     assert autoloop.pr_text(symlink.gh, files, H1)(ROLE, MERGE_BASE) is None
     assert autoloop.pr_text(symlink.gh, [dict(files[0], sha=None)], H1)(MIGRATION, H1) is None
+    # A failed read is no verdict: it reaches the tick's failures and is read again, never parked (Sol r2).
+
+    def down(argv):
+        raise triage.Refused('gh api exited 1')
+    with pytest.raises(triage.Refused):
+        autoloop.sql_hits(files, H1, MERGE_BASE, autoloop.pr_text(down, files, H1))
 
 
 # spec: ANYM-590

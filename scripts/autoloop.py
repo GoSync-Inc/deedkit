@@ -1687,6 +1687,8 @@ def sql_hits(files, head, base, text):
                         columns is None or not columns <= added[table] for columns in privileges))
                        for table, privileges in targets):
                     owner.append((WAITS_GRANT, name))
+        except (Refused, triage.Refused):
+            raise  # a failed GitHub read: the tick reports it and the next one reads again (Sol r2)
         except Exception:  # noqa: BLE001 - the classifier parses PR text: any failure (RecursionError too) parks it
             owner.append((WAITS_MIGRATION, mine[0]))
     return (owner, {}) if owner else ([], {n: k[3] for n, k in kinds.items()})
