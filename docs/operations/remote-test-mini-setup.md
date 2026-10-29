@@ -82,6 +82,11 @@ The two files travel through a new private directory (`mktemp -d`, mode 700, rec
 `stage <path>` right after it exists), so no file of egoregerev's is overwritten; a failed copy stops the
 block before anything is installed.
 
+The closing sudoers check accepts only `parsed OK` lines and `bad permissions, should be mode 0440` warnings.
+Three of the owner's own sudoers.d files (`ego`, `egoregerev`, `ksyusha`, root-owned 0644 since April and
+May 2026) draw that warning from plain `visudo -c`; sudo still reads them, and they are not this setup's to
+change. Any other line (a syntax error) stops the block.
+
 ```bash
 D="$(ssh egoregerev@100.88.40.111 'D=$(mktemp -d /tmp/deedkit-setup.XXXXXX) && echo "stage $D" >> ~/deedkit-ci-setup.created && echo $D')" &&
 [ -n "$D" ] &&
@@ -95,7 +100,8 @@ echo shim >> ~/deedkit-ci-setup.created
 sudo -n install -o root -g wheel -m 0755 deedkit-remote-test /usr/local/libexec/deedkit-remote-test
 echo sudoers >> ~/deedkit-ci-setup.created
 sudo -n install -o root -g wheel -m 0440 sudoers-deedkit-remote-test /etc/sudoers.d/deedkit-remote-test
-sudo -n visudo -c
+sudo -n visudo -cf /etc/sudoers.d/deedkit-remote-test
+if sudo -n visudo -c 2>&1 | grep -v -e ": parsed OK$" -e ": bad permissions, should be mode 0440$"; then exit 1; fi
 cd; rm -r "$D"'
 ```
 
@@ -107,9 +113,9 @@ P=/Users/Shared/deedkit-ci/stage/.readback; (umask 077; printf x > $P); chmod go
 dscl . -read /Users/$U UniqueID PrimaryGroupID UserShell NFSHomeDirectory IsHidden
 dscl . -read /Users/$U Password; dscl . -read /Groups/$U PrimaryGroupID
 dseditgroup -o checkmember -m $U admin; dseditgroup -o checkmember -m $U staff
-ls -ld /Users/$U /Users/$U/deedkit-ci /usr/local/libexec/deedkit-remote-test /etc/sudoers.d/deedkit-remote-test
+ls -ld /Users/$U /usr/local/libexec/deedkit-remote-test /etc/sudoers.d/deedkit-remote-test
 sudo -n visudo -cf /etc/sudoers.d/deedkit-remote-test; sudo -n -l | grep -n $U
-echo "id -un; cd /Users/egoregerev 2>/dev/null && echo HOME-ENTERABLE || echo home-closed
+cd /; echo "id -un; ls -ld deedkit-ci; cd /Users/egoregerev 2>/dev/null && echo HOME-ENTERABLE || echo home-closed
 ls /Users/egoregerev/telegram-session >/dev/null 2>&1 && echo SESSIONS-READABLE || echo sessions-closed
 cat /Users/Shared/deedkit-ci/stage/.readback >/dev/null && echo stage-file-readable" | sudo -n -u $U /usr/local/libexec/deedkit-remote-test
 rm -f $P'
@@ -122,10 +128,11 @@ Expected:
 - `UniqueID: 453`, `PrimaryGroupID: 453`, `UserShell: /usr/bin/false`, `NFSHomeDirectory: /Users/_deedkitci`,
   `IsHidden: 1`, `Password: *` (or `********`), and the group's `PrimaryGroupID: 453`.
 - NOT a member of `admin`, and NOT a member of `staff`.
-- `drwx------ _deedkitci _deedkitci` for the home, `drwxr-xr-x _deedkitci _deedkitci` for `deedkit-ci`,
-  `-rwxr-xr-x root wheel` for the shim, and `-r--r----- root wheel` for the sudoers file.
+- `drwx------ _deedkitci _deedkitci` for the home, `-rwxr-xr-x root wheel` for the shim, and
+  `-r--r----- root wheel` for the sudoers file.
 - `parsed OK`, and exactly one `(_deedkitci) NOPASSWD: /usr/local/libexec/deedkit-remote-test` line.
-- Then `_deedkitci`, `home-closed`, `sessions-closed` and `stage-file-readable` (a file egoregerev made
+- Then, as `_deedkitci` (from `/`, since egoregerev's home is closed to it): `_deedkitci`,
+  `drwxr-xr-x _deedkitci _deedkitci` for `deedkit-ci`, `home-closed`, `sessions-closed` and `stage-file-readable` (a file egoregerev made
   0600 and opened to group and others, as `scripts/remote-test.sh` does with every staged file; the first
   measured run then reads real staged files as `_deedkitci`).
 
@@ -138,7 +145,8 @@ the suites run arbitrary repository code anyway, and the user's isolation is wha
 files and sessions.
 
 Undo. It removes, newest first, only what the ledger names, whether whole or half-made, and checks that each
-is gone. The ledger is removed only when everything is gone and `visudo -c` passes; otherwise it is rewritten
+is gone. The ledger is removed only when everything is gone and `visudo -c` reports nothing but parsed files
+and the owner's permission warnings (step 4); otherwise it is rewritten
 to the resources still present, the undo prints them and exits 1, and a rerun tries again:
 
 ```bash
@@ -159,7 +167,8 @@ if grep -qx user $L; then
 if grep -qx group $L; then
   if dscl . -read /Groups/$U >/dev/null 2>&1; then sudo -n dscl . -delete /Groups/$U; fi
   if dscl . -read /Groups/$U >/dev/null 2>&1; then echo group >> $R; fi; fi
-if ! sudo -n visudo -c >/dev/null; then rm -f $R; echo "visudo -c fails: ledger kept"; exit 1; fi
+if sudo -n visudo -c 2>&1 | grep -v -e ": parsed OK$" -e ": bad permissions, should be mode 0440$"; then
+  rm -f $R; echo "visudo -c reports an error: ledger kept"; exit 1; fi
 if [ -s $R ]; then mv $R $L; echo "undo incomplete, still present:"; cat $L; exit 1; fi
 rm -f $R $L; echo undo-ok'
 ```
@@ -168,6 +177,14 @@ rm -f $R $L; echo undo-ok'
 
 - Homebrew as egoregerev: `python@3.13 go poppler tesseract tesseract-lang age node@24 postgresql@18`
   (ffmpeg was there already). No `brew services`: each run starts its own PostgreSQL and stops it.
+- `postgresql@18` is keg-only there (`postgresql@17` is the linked one), yet its binaries read their share
+  files from `/opt/homebrew/share/postgresql@18`, which held only pgvector's `extension/` links; `initdb`
+  failed with "postgres.bki does not exist". On 2026-10-29 the agent linked the keg's 16 top-level share
+  entries and the `plpgsql`, `citext` and `pg_trgm` extension files (20) there, through the version-stable
+  `/opt/homebrew/opt/postgresql@18/share/postgresql/...` path, never over an existing file. The relative paths
+  are in `/Users/Shared/deedkit-ci/pg18-links.created`; undo:
+  `cd /opt/homebrew/share/postgresql@18 && while read -r p; do [ -L "$p" ] && rm "$p"; done < /Users/Shared/deedkit-ci/pg18-links.created`.
+  A new extension in a migration needs its files linked the same way.
 - `/Users/Shared/deedkit-ci` (egoregerev, 755): the `stage/<worker>` copies and `caps.conf`, the run caps
   (`MAX_RUNS PARALLEL MIN_FREE_GB MIN_FREE_MEM_GB WAIT_SECONDS POLL_SECONDS BUSY_CHECK MAX_LOAD NICE
   STOP_SECONDS`,

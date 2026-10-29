@@ -345,12 +345,13 @@ start_watchdog() {
 }
 
 # What earlier runs of this worker left when neither their trap nor their watchdog finished: their own run
-# directories only, never the current one. A directory whose processes do not stop stays for the next try.
+# directories only, never the current one. A directory whose processes do not stop stays for the next try,
+# and the function then fails.
 stop_leftovers() {
-  local dir pidfile pid i
+  local dir pidfile pid i kept=0
   for dir in "$WORKER_DIR"/runs/*; do
     [ -d "$dir" ] && [ "$dir" != "$RUN_DIR" ] || continue
-    stop_recorded "$dir" || { say "a process of $dir does not stop; it stays recorded"; continue; }
+    stop_recorded "$dir" || { say "a process of $dir does not stop; it stays recorded"; kept=1; continue; }
     # A PostgreSQL started just before its run died, so never recorded: known by its data directory.
     for pidfile in "$dir"/pg[0-9]*/cluster/postmaster.pid; do
       [ -f "$pidfile" ] || continue
@@ -363,6 +364,7 @@ stop_leftovers() {
     done
     rm -rf "$dir"
   done
+  return "$kept"
 }
 
 # Run a command as a background job (its own process group under set -m, so a stop reaches all of it) and
@@ -416,6 +418,15 @@ groups_alive() {
   return 1
 }
 
+# Reap these jobs after KILL, waiting at most 5 s for each: a process stuck in the kernel never holds the run.
+reap_jobs() {
+  local pid i
+  for pid in "$@"; do
+    for i in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+    kill -0 "$pid" 2>/dev/null || wait "$pid" 2>/dev/null || true
+  done
+}
+
 finish() {
   local status=$? pid pg=0 i
   trap - EXIT INT TERM HUP
@@ -424,13 +435,13 @@ finish() {
   # Up to STOP_SECONDS for the groups to end, then KILL: a child that ignores TERM never holds the run open.
   for i in $(seq 1 "$STOP_SECONDS"); do groups_alive $CHILDREN || break; sleep 1; done
   for pid in $CHILDREN; do kill -KILL -- "-$pid" 2>/dev/null || true; done
-  for pid in $CHILDREN; do wait "$pid" 2>/dev/null || true; done
+  reap_jobs $CHILDREN
   times > "$RUN_DIR/.times-before"
   for pid in $DATABASES; do kill -QUIT "$pid" 2>/dev/null || true; done  # immediate shutdown
   for pid in $DATABASES; do
     for i in $(seq 1 "$STOP_SECONDS"); do groups_alive "$pid" || break; sleep 1; done
     kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    reap_jobs "$pid"
   done
   times > "$RUN_DIR/.times"
   if [ -n "$DATABASES" ]; then
@@ -443,7 +454,9 @@ finish() {
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$WORKER" "$SUITE" "$START_ISO" "$((SECONDS - START_EPOCH))" \
     "$(cpu_of "$RUN_DIR/.times")" "$pg" "$status" >> "$ROOT_DIR/load.log"
   if [ "$(cat "$WORKER_DIR/run.pid" 2>/dev/null)" = "$$ $(started $$)" ]; then rm -f "$WORKER_DIR/run.pid"; fi
-  rm -rf "$RUN_DIR"
+  # Whatever recorded still runs (a group whose leader already ended, say) gets the same bounded stop; the run
+  # directory, its record, stays when something does not stop, for the next run or --cleanup.
+  if stop_recorded "$RUN_DIR"; then rm -rf "$RUN_DIR"; else say "a process of this run does not stop; $RUN_DIR stays recorded"; fi
   if [ -n "$HOLDER" ]; then kill "$HOLDER" 2>/dev/null || true; fi
   exit "$status"
 }
@@ -556,7 +569,7 @@ runner_run() {
   RUN_DIR="$WORKER_DIR/runs/$(date +%s)-$$"
   mkdir -p "$RUN_DIR"
   echo "$$ $(started $$)" > "$WORKER_DIR/run.pid"
-  stop_leftovers
+  stop_leftovers || true  # what does not stop stays recorded for the next try
   set -m
   trap finish EXIT
   trap 'exit 130' INT
@@ -599,7 +612,12 @@ runner_here() {
     cleanup)
       here_stop "$worker"
       WORKER_DIR="$ROOT_DIR/$worker" RUN_DIR=""
-      stop_leftovers
+      if ! stop_leftovers; then
+        # The run records stay, so a later --cleanup (or the worker's next run) can stop what is left.
+        rm -rf "${ROOT_DIR:?}/$worker/src"
+        say "kept $ROOT_DIR/$worker/runs: a recorded process does not stop; run --cleanup again later"
+        exit 1
+      fi
       rm -rf "${ROOT_DIR:?}/$worker"
       say "removed $ROOT_DIR/$worker" ;;
     *) die "unknown --here action" ;;
@@ -612,7 +630,8 @@ quoted() { local arg out=""; for arg in "$@"; do out="$out $(printf '%q' "$arg")
 
 # As egoregerev on the mini, and as the service user through its shim (the only sudo it may run).
 as_owner() { ssh "${SSH_OPTS[@]}" "$HOST" "bash -s --$(quoted "$@")" < "$SELF"; }
-as_service() { ssh "${SSH_OPTS[@]}" "$HOST" "sudo -n -u $SERVICE_USER $SHIM$(quoted "$@")" < "$SELF"; }
+# From /: egoregerev's home, the ssh session's directory, is closed to the service user.
+as_service() { ssh "${SSH_OPTS[@]}" "$HOST" "cd / && sudo -n -u $SERVICE_USER $SHIM$(quoted "$@")" < "$SELF"; }
 
 # Files changed against the merge base with main (committed or not) plus new untracked ones, one per line.
 touched_files() {

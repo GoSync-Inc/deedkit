@@ -60,6 +60,7 @@ dsn=""; mode=""
 if [ -n "${{PROBE_TEST_DSN_FILE:-}}" ]; then dsn="$(cat "$PROBE_TEST_DSN_FILE")"; mode="$(ls -l "$PROBE_TEST_DSN_FILE" | cut -c1-10)"; fi
 echo "uv $* | cwd=${{PWD##*/}} dsn=$dsn dsnmode=$mode shard=${{DEEDKIT_TEST_SHARD:-}} fcs=${{FCS_TEST_DSN:-}} pid=$$" >> "$FAKE_LOG"
 [ "$1" = run ] || exit 0
+if [ "${{FAKE_UV_ORPHAN:-0}}" = 1 ]; then sleep 300 >/dev/null 2>&1 & echo "orphan pid=$!" >> "$FAKE_LOG"; fi
 echo "FAKE SUITE OUTPUT ${{DEEDKIT_TEST_SHARD:-}}"
 {BURN}
 [ "${{FAKE_UV_SLEEP:-0}}" = 0 ] || sleep "$FAKE_UV_SLEEP"
@@ -431,6 +432,18 @@ def test_a_suite_that_ignores_term_is_killed_once_the_stop_bound_passes(mini, wo
 
 
 # spec: ANYM-638
+def test_a_descendant_left_by_a_finished_step_is_stopped_before_the_run_ends(mini, worktree):
+    home, env = mini
+    result = remote(env, '--full', worktree, 'gateway', FAKE_UV_ORPHAN='1')
+    assert result.returncode == 0, result.stderr
+    # The step's leader exited; its background child still held the step's process group.
+    orphans = [pid_of(line) for line in log_lines(home, 'orphan')]
+    assert orphans
+    wait_for(lambda: not any(alive(pid) for pid in orphans), 10)
+    assert not list((worker_dir(home) / 'runs').iterdir())
+
+
+# spec: ANYM-638
 @pytest.mark.parametrize('stage', ['copy', 'initdb', 'suite'])
 def test_a_killed_runner_leaves_no_process_database_or_held_slot_behind(mini, worktree, stage):
     home, env = mini
@@ -584,6 +597,28 @@ def test_cleanup_removes_the_workers_copies_and_leftover_databases_only(mini, wo
     assert (other / 'kept.py').exists()
 
 
+# spec: ANYM-638
+def test_cleanup_keeps_the_record_of_a_run_whose_process_does_not_stop(mini, worktree):
+    home, env = mini
+    assert remote(env, '--full', worktree, 'gateway').returncode == 0
+    # No signal ends a zombie: it stays until its parent, this test, reaps it.
+    zombie = subprocess.Popen(['true'], start_new_session=True)
+    wait_for(lambda: subprocess.run(['ps', '-o', 'stat=', '-p', str(zombie.pid)], capture_output=True,
+                                    text=True).stdout.strip().startswith('Z'))
+    stamp = subprocess.run(['bash', '-c', f'ps -o lstart= -p {zombie.pid} | tr -s " " "_"'], capture_output=True,
+                           text=True, check=True).stdout.strip('\n')
+    run_dir = worker_dir(home) / 'runs' / '1-1'
+    run_dir.mkdir(parents=True)
+    (run_dir / 'owned').write_text(f'group {zombie.pid} {stamp}\n')
+    kept = remote(env, '--cleanup', WORKER)
+    assert kept.returncode == 1 and 'does not stop' in kept.stderr, kept.stderr
+    assert (run_dir / 'owned').exists() and not (worker_dir(home) / 'src').exists()
+    zombie.wait()
+    again = remote(env, '--cleanup', WORKER)
+    assert again.returncode == 0, again.stderr
+    assert not worker_dir(home).exists()
+
+
 # docs/operations/remote-test-mini-setup.md section 1, run as written: its blocks with the system paths moved under
 # a temporary root, and fakes of ssh/scp (the mini's shell runs here), sudo, dscl, install, chown and visudo.
 SETUP_DOC = ROOT / 'docs' / 'operations' / 'remote-test-mini-setup.md'
@@ -622,7 +657,12 @@ while [ $# -gt 2 ]; do case "$1" in -m) mode="$2"; shift 2 ;; -o|-g) shift 2 ;; 
 cp "$1" "$2" && chmod "$mode" "$2"
 ''',
     'chown': '#!/usr/bin/env bash\nexit 0\n',
-    'visudo': '#!/usr/bin/env bash\nexit 0\n',
+    # FAKE_VISUDO_OUT: what a full `visudo -c` also reports about other sudoers files (it then exits 1).
+    'visudo': '''#!/usr/bin/env bash
+echo "${@: -1}: parsed OK"
+if [ "$*" = -c ] && [ -n "${FAKE_VISUDO_OUT:-}" ]; then printf '%s\\n' "$FAKE_VISUDO_OUT" >&2; exit 1; fi
+exit 0
+''',
 }
 
 
@@ -692,6 +732,25 @@ def test_a_setup_that_fails_midway_is_undone_completely(mini_setup, fail):
     undo = setup_block(env, blocks[6], SETUP_SHELLS[-1])
     assert undo.returncode == 0 and 'undo-ok' in undo.stdout, undo.stdout + undo.stderr
     assert setup_leftovers(root) == []
+
+
+# spec: ANYM-638
+@pytest.mark.parametrize('report,ok', [('/private/etc/sudoers.d/ego: bad permissions, should be mode 0440', True),
+                                       ('>>> /etc/sudoers.d/other: syntax error near line 2 <<<', False)],
+                         ids=['permission-warning', 'syntax-error'])
+def test_the_setup_accepts_the_owners_sudoers_permission_warnings_but_stops_on_a_syntax_error(mini_setup, report, ok):
+    root, env, blocks = mini_setup
+    shell = SETUP_SHELLS[-1]
+    results = [setup_block(env, block, shell, FAKE_VISUDO_OUT=report) for block in blocks[:5]]
+    assert [result.returncode for result in results[:4]] == [0, 0, 0, 0]
+    assert (results[4].returncode == 0) == ok, results[4].stdout + results[4].stderr
+    undo = setup_block(env, blocks[6], shell, FAKE_VISUDO_OUT=report)
+    if ok:
+        assert undo.returncode == 0 and 'undo-ok' in undo.stdout, undo.stdout + undo.stderr
+        assert setup_leftovers(root) == []
+    else:
+        assert undo.returncode == 1 and 'ledger kept' in undo.stdout, undo.stdout + undo.stderr
+        assert (root / 'owner' / 'deedkit-ci-setup.created').exists()
 
 
 # spec: ANYM-638
