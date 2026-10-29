@@ -781,6 +781,9 @@ version sends a new test. Still pending after 10 s: the endpoint stays paused an
 resume once it is delivered. A test the dispatcher cancelled before sending it is staged
 again by the same call. A subscription another call holds refuses the resume with
 `service_busy` (retry; the endpoint stays paused). Resume never clears `operator_disabled`.
+The dispatcher sends a resume's test to a paused endpoint only from schema 61; the release
+order promotes the serving API after it, and a rollback goes plan B before plan A
+(docs/operations/production.md, Roll back the current release).
 
 **Budget and operator view.** `messages_capabilities` shows the webhook transport's
 `hint_budget`: `per_hour` (`SUBSCRIPTION_MAX_HINTS_PER_HOUR`) and `remaining_this_hour`,
