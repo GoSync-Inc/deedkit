@@ -658,7 +658,7 @@ def test_the_setup_creates_and_its_undo_removes_exactly_the_ledgered_resources(m
     ledger = (root / 'owner' / 'deedkit-ci-setup.created').read_text().splitlines()
     assert ledger[:3] == ['group', 'user', 'home'] and ledger[4:] == ['shim', 'sudoers']
     assert ledger[3].startswith(f'stage {root}/tmp/deedkit-setup.')
-    assert 'UniqueID: 452' in (root / 'ds' / 'Users' / '_deedkitci').read_text()
+    assert 'UniqueID: 453' in (root / 'ds' / 'Users' / '_deedkitci').read_text()
     assert (root / 'libexec' / 'deedkit-remote-test').read_text() == SHIM.read_text()
     # The files travelled through a private directory, now gone; the owner's own file is untouched.
     assert (root / 'owner' / 'deedkit-remote-test').read_text() == 'an owner file\n'
@@ -669,7 +669,7 @@ def test_the_setup_creates_and_its_undo_removes_exactly_the_ledgered_resources(m
 
 
 # spec: ANYM-638
-@pytest.mark.parametrize('fail', ['PrimaryGroupID 452', 'UniqueID 452', 'chown', 'sudoers.d'],
+@pytest.mark.parametrize('fail', ['PrimaryGroupID 453', 'UniqueID 453', 'chown', 'sudoers.d'],
                          ids=['group', 'user', 'home', 'sudoers'])
 def test_a_setup_that_fails_midway_is_undone_completely(mini_setup, fail):
     root, env, blocks = mini_setup

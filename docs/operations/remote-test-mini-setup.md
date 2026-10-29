@@ -11,7 +11,7 @@ failing block, run the undo, and report. No token or key is involved.
 
 The user is hidden, not an admin, with no login shell and no password login. It has its own primary
 group (not `staff`: staff members can read egoregerev's home, mode 750 group staff) and the home
-`/Users/_deedkitci` (mode 700). UID and GID 452 were free on 2026-10-29.
+`/Users/_deedkitci` (mode 700). UID and GID 453 were free on 2026-10-29 (452 went to `_harnessci` that day).
 
 The ledger `~/deedkit-ci-setup.created` (egoregerev's home) records each resource *before* the command
 that creates it, so the undo removes exactly what this setup made, including a half-made resource, and
@@ -21,7 +21,7 @@ Preflight (read-only). Every resource must be absent and the ledger must not exi
 `preflight-ok`:
 
 ```bash
-ssh egoregerev@100.88.40.111 'U=_deedkitci; ID=452; fail=0
+ssh egoregerev@100.88.40.111 'U=_deedkitci; ID=453; fail=0
 [ ! -e ~/deedkit-ci-setup.created ] || { echo "ledger exists: undo or inspect first"; fail=1; }
 dscl . -read /Users/$U >/dev/null 2>&1 && { echo "user $U exists"; fail=1; }
 dscl . -read /Groups/$U >/dev/null 2>&1 && { echo "group $U exists"; fail=1; }
@@ -38,7 +38,7 @@ under bash and zsh alike), then records it, then creates it.
 Step 1, the group:
 
 ```bash
-ssh egoregerev@100.88.40.111 'set -e; U=_deedkitci; ID=452
+ssh egoregerev@100.88.40.111 'set -e; U=_deedkitci; ID=453
 if dscl . -read /Groups/$U >/dev/null 2>&1; then echo "group exists"; exit 1; fi
 echo group >> ~/deedkit-ci-setup.created
 sudo -n dscl . -create /Groups/$U
@@ -50,7 +50,7 @@ sudo -n dscl . -create /Groups/$U Password "*"'
 Step 2, the user:
 
 ```bash
-ssh egoregerev@100.88.40.111 'set -e; U=_deedkitci; ID=452
+ssh egoregerev@100.88.40.111 'set -e; U=_deedkitci; ID=453
 if dscl . -read /Users/$U >/dev/null 2>&1; then echo "user exists"; exit 1; fi
 echo user >> ~/deedkit-ci-setup.created
 sudo -n dscl . -create /Users/$U
@@ -117,10 +117,10 @@ rm -f $P'
 
 Expected:
 
-- `uid=452(_deedkitci) gid=452(_deedkitci)` and the ledger `group user home stage /tmp/deedkit-setup.<x> shim
+- `uid=453(_deedkitci) gid=453(_deedkitci)` and the ledger `group user home stage /tmp/deedkit-setup.<x> shim
   sudoers` (the stage directory itself is gone).
-- `UniqueID: 452`, `PrimaryGroupID: 452`, `UserShell: /usr/bin/false`, `NFSHomeDirectory: /Users/_deedkitci`,
-  `IsHidden: 1`, `Password: *` (or `********`), and the group's `PrimaryGroupID: 452`.
+- `UniqueID: 453`, `PrimaryGroupID: 453`, `UserShell: /usr/bin/false`, `NFSHomeDirectory: /Users/_deedkitci`,
+  `IsHidden: 1`, `Password: *` (or `********`), and the group's `PrimaryGroupID: 453`.
 - NOT a member of `admin`, and NOT a member of `staff`.
 - `drwx------ _deedkitci _deedkitci` for the home, `drwxr-xr-x _deedkitci _deedkitci` for `deedkit-ci`,
   `-rwxr-xr-x root wheel` for the shim, and `-r--r----- root wheel` for the sudoers file.
