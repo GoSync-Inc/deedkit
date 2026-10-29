@@ -305,7 +305,7 @@ def test_migration_036_adds_extend_key_audit_and_keeps_schema35_rows(schema35_st
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '55'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '56'
         assert c.execute('SELECT * FROM archive_migrations WHERE version<=35 ORDER BY version').fetchall() == migrations
         assert c.execute('SELECT * FROM audit_log ORDER BY id').fetchall() == audit_before
         assert {row['operation'] for row in audit_before} <= {'issue_key', 'revoke_key', 'capabilities'}
@@ -341,7 +341,7 @@ def test_migration_036_gives_up_on_a_busy_audit_log_without_stalling_requests(sc
         holder.close()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '55'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '56'
         with pytest.raises(psycopg.errors.CheckViolation), c.transaction():
             c.execute("INSERT INTO audit_log(principal,operation,outcome) VALUES('agent-busy','not_an_operation','ok')")
 
@@ -416,7 +416,7 @@ def test_migrate_gives_up_on_a_busy_messages_table_without_stalling_writers(seed
         replay_attempt, lambda c: c.execute('LOCK TABLE messages IN ROW EXCLUSIVE MODE'))
     assert outcome == ['lock_not_available']
     assert writer_seconds < 5 and migrate_seconds < 10
-    assert schema_state(store) == ('55', 55, True)
+    assert schema_state(store) == ('56', 56, True)
     store.migrate()
 
 
@@ -434,7 +434,7 @@ def test_migrate_lock_timeout_rolls_back_migrations_it_already_applied(database,
         # Nothing of 017-021 stays: same version, no new migration rows, no new table.
         assert schema_state(store) == ('16', 16, False)
         store.migrate()
-        assert schema_state(store) == ('55', 55, True)
+        assert schema_state(store) == ('56', 56, True)
 
 
 # spec: ANYM-422
@@ -447,9 +447,9 @@ def test_migrate_never_holds_one_replay_lock_while_waiting_for_another(seeded, r
         replay_attempt, lambda c: c.execute('LOCK TABLE messages IN ROW EXCLUSIVE MODE'))
     assert outcome == ['lock_not_available']
     assert writer_seconds < 1 and migrate_seconds < 10
-    assert schema_state(store) == ('55', 55, True)
+    assert schema_state(store) == ('56', 56, True)
     store.migrate()
-    assert schema_state(store) == ('55', 55, True)
+    assert schema_state(store) == ('56', 56, True)
 
 
 # spec: ANYM-422
@@ -458,7 +458,7 @@ def test_migrate_replays_replay_tables_missing_from_a_partial_restore(database, 
     partial = base[:base.index('CREATE TABLE IF NOT EXISTS deliveries')]
     with old_schema_store(database, tmp_path, 1, base=partial) as store:
         store.migrate()
-        assert schema_state(store) == ('55', 55, True)
+        assert schema_state(store) == ('56', 56, True)
         with store.pool.connection() as c:
             assert c.execute("""SELECT to_regclass('deliveries') IS NOT NULL
                 AND to_regclass('download_grants') IS NOT NULL AS present""").fetchone()['present']

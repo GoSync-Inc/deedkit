@@ -611,7 +611,7 @@ def test_actual_postgres_age_receiver_restore_drill_preserves_source_and_quarant
             input=(tmp_path / 'restored/database.dump').read_bytes(), check=True, capture_output=True)
         restored = Store(make_conninfo(source.pool.conninfo, dbname=restored_name),
             tmp_path / 'restored/files', 'http://testserver')
-        assert verify_snapshot(restored, tmp_path / 'restored')['tables'] == 82
+        assert verify_snapshot(restored, tmp_path / 'restored')['tables'] == 87
         quarantine_restore(restored)
         with restored.pool.connection() as connection:
             keys = connection.execute('SELECT revoked FROM api_keys').fetchall()
@@ -619,7 +619,7 @@ def test_actual_postgres_age_receiver_restore_drill_preserves_source_and_quarant
         assert keys and all(row['revoked'] for row in keys)
         assert policies and all(not row['enabled'] for row in policies)
         # The original live database, CAS and fake cold session are unchanged.
-        assert verify_snapshot(source, tmp_path / 'restored')['tables'] == 82
+        assert verify_snapshot(source, tmp_path / 'restored')['tables'] == 87
         assert all(hashlib.sha256((source.files / digest).read_bytes()).hexdigest() == value
                    for digest, value in source_hashes.items())
         assert (tmp_path / 'session/example.session').read_bytes() == b'FAKE_SESSION_BYTES'

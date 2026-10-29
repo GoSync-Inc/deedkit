@@ -9,7 +9,7 @@ compatibility meaning too. Every service keeps its own lockfile, environment,
 process and state.
 
 ## Layout
-- `services/messaging`: AnyMsg server (Python 3.13, PostgreSQL 18, schema 55)
+- `services/messaging`: AnyMsg server (Python 3.13, PostgreSQL 18, schema 56)
 - `services/gateway`: common MCP gateway (HTTP only, imports no provider code)
 - `services/calendar`: family calendar (Google API/CalDAV), has its own AGENTS.md
 - `services/calls`: voice calls; `services/calls/frontend`: Vite UI

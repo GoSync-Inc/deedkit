@@ -109,7 +109,14 @@ def _view(c, row):
         'missing_revision_evidence_events': row['missing_evidence'],
         'last_matched_at': row['last_matched_at'], 'scope_masked': False,
         'freshness_basis': 'committed_archive_journal_not_provider_freshness',
-        'delivery': _delivery_view(c, row)})
+        'delivery': _delivery_view(c, row), **_module_view(c, row)})
+
+
+def _module_view(c, row):
+    # ANYM-562: only a subscription with a module stream shows one; message-only views keep their shape.
+    from . import module_events
+    module = module_events.stream(c, row['id'])
+    return {'module_stream': module_events.view(c, row, module)} if module else {}
 
 
 
@@ -270,8 +277,18 @@ def update_subscription(store, c, p, subscription_id, version, *, action, resume
         raise APIError('subscription_conflict', 409)
     if row['state'] in ('closed', 'expired'):
         raise APIError('subscription_closed', 409)
+    from . import module_events
+    module = module_events.stream(c, row['id'], lock=True)
+    if action == 'resume' and row['state'] == 'active' and module and module['rollback_hold']:
+        # ANYM-562: an older runtime resumed it; the owner of the key re-arms the held module stream.
+        module_events.resume(c, row, resume_policy)
+        row = c.execute('''UPDATE subscriptions SET version=version+1,updated_at=clock_timestamp()
+            WHERE id=%s RETURNING *''', (row['id'],)).fetchone()
+        return _view(c, row)
     if action == 'pause' and row['state'] != 'active' or action == 'resume' and row['state'] != 'paused':
         raise APIError('invalid_subscription_state', 409)
+    if action == 'resume' and module is not None:
+        module_events.resume(c, row, resume_policy)
     state = {'pause': 'paused', 'resume': 'active', 'close': 'closed'}[action]
     position = row['matched_through']
     gap = row['gap']
@@ -287,7 +304,7 @@ def update_subscription(store, c, p, subscription_id, version, *, action, resume
     return _view(c, row)
 
 
-def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50):
+def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, module_after=None):
     from .store import APIError, bounded, serial
     bounded(limit)
     if type(after) is not int or not 0 <= after <= 2**53 - 1:
@@ -298,11 +315,20 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50):
         return {'subscription': state, 'items': [], 'has_more': False, 'scope_masked': True}
     # Pruned references never become an empty complete page: the gap names the floor to resume from.
     floor = row.get('retention_floor', 0)
+    from . import module_events
+    module = module_events.stream(c, row['id'])
+    if module is not None and module_after is None:
+        # Passive reads start at the consumer's ACK position: never below the retention floor.
+        module_after = module['acked_through']
+    if module_after is not None and (type(module_after) is not int or not 0 <= module_after <= 2**53 - 1):
+        raise APIError('invalid_version')
+    # Each stream pages, gaps and advances on its own positions (ANYM-562).
+    modules = {} if module is None else {'module': module_events.page(c, row, module, module_after, limit)}
     if after < floor:
         state['gap'] = {'reason': 'retention_gap', 'after': after, 'through': floor,
             'recoverable': False, 'floor': floor}
-        return {'subscription': state, 'items': [], 'has_more': True, 'next_after': floor,
-            'consumption': 'passive_read_no_ack', 'scope_masked': False}
+        return serial({'subscription': state, 'items': [], 'has_more': True, 'next_after': floor,
+            'consumption': 'passive_read_no_ack', 'scope_masked': False, **modules})
     events = c.execute('''SELECT e.id,e.kind,e.origin,e.revision,e.created_at,
         jsonb_strip_nulls(jsonb_build_object(
             'message',e.snapshot->'message','account',e.snapshot->'account','chat',e.snapshot->'chat',
@@ -330,7 +356,7 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50):
         item['wake_reason'] = wake_reason(item, row['selector'])
     return serial({'subscription': state, 'items': items, 'has_more': len(events) > limit,
         'next_after': items[-1]['event_id'] if items else after,
-        'consumption': 'passive_read_no_ack', 'scope_masked': False})
+        'consumption': 'passive_read_no_ack', 'scope_masked': False, **modules})
 
 
 def _worker_identity(c, row):
@@ -351,8 +377,10 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
     bounded(max_subscriptions, 128)
     maximum = _bound_setting('SUBSCRIPTION_MAX_MATCHES', 10000, 1, 1000000)
     stats = {'checked': 0, 'scanned': 0, 'matched': 0, 'access_changed': 0,
-        'expired': 0, 'blocked': 0, 'missing_evidence': 0}
+        'expired': 0, 'blocked': 0, 'missing_evidence': 0, 'module_matched': 0, 'module_blocked': 0}
     with store.pool.connection() as c:
+        from . import module_events
+        modules = module_events.ready(c)
         candidates = c.execute('''SELECT id,principal,key_id FROM subscriptions WHERE state='active'
             ORDER BY last_matched_at NULLS FIRST,created_at,id LIMIT %s''', (max_subscriptions,)).fetchall()
     for candidate in candidates:
@@ -470,7 +498,22 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                     from .telemetry import capture
                     capture(error, 'subscription_hint_failed')
                     print(json.dumps({'error': 'subscription_hint_failed'}), flush=True)
+            if modules:
+                _match_modules(c, row, batch_size, maximum, stats)
     return stats
+
+
+def _match_modules(c, row, batch_size, maximum, stats):
+    """ANYM-562: the module stream after the message pass, in a savepoint of its own: a failure is
+    logged and rolls back only the module step; the message matches above still commit."""
+    from . import module_events
+    try:
+        with c.transaction():
+            module_events.match(c, row, batch_size=batch_size, maximum=maximum, stats=stats)
+    except Exception as error:
+        from .telemetry import capture
+        capture(error, 'subscription_module_match_failed')
+        print(json.dumps({'error': 'subscription_module_match_failed', 'class': type(error).__name__}), flush=True)
 
 
 def _failure_audience(event, selected_chat, row, p):
@@ -599,7 +642,25 @@ def prune_subscriptions(store, *, max_subscriptions=16):
     except errors.UndefinedColumn:
         # Schema before 40: the migration precedes this worker, so nothing is pruned meanwhile.
         return stats
-    for candidate in candidates:
+    try:
+        with store.pool.connection() as c:
+            from . import module_events
+            # ANYM-562: the module stream keeps its own ACK position and floor; same window and rules.
+            modules = c.execute('''SELECT s.id,s.principal,true AS modules FROM subscriptions s
+                JOIN subscription_module_streams ms ON ms.subscription=s.id
+                CROSS JOIN LATERAL (SELECT m.matched_at FROM subscription_module_matches m WHERE m.subscription=s.id
+                    AND m.event>ms.retention_floor AND m.event<=ms.acked_through ORDER BY m.event LIMIT 1) oldest
+                WHERE NOT s.retention_hold AND s.state NOT IN ('closed','expired')
+                    AND (s.expires_at IS NULL OR s.expires_at>clock_timestamp()+%s::interval)
+                    AND oldest.matched_at<clock_timestamp()-make_interval(days=>%s)
+                    AND EXISTS(SELECT FROM probe_metadata WHERE name='subscription_retention' AND value='enabled')
+                ORDER BY oldest.matched_at,s.id LIMIT %s''',
+                (RETENTION_EXPIRY_MARGIN, days, max_subscriptions)).fetchall() if module_events.ready(c) else []
+    except Exception as error:
+        from .telemetry import capture
+        capture(error, 'subscription_retention_failed')
+        modules = []
+    for candidate in [*candidates, *modules]:
         try:
             with store.pool.connection() as c:
                 deleted = _prune_batch(c, candidate, days)
@@ -640,6 +701,9 @@ def _prune_batch(c, candidate, days):
     # A passed deadline is terminal before the matcher stores 'expired'.
     if row is None or row['retention_hold'] or row['lapsed'] or row['state'] in ('closed', 'expired'):
         return None
+    if candidate.get('modules'):
+        from .module_events import prune
+        return prune(c, row['id'], days, RETENTION_BATCH)
     # ACK and fetch hold the subscription row, so acked_through cannot move under this batch.
     consumption = c.execute('SELECT acked_through FROM subscription_consumption WHERE subscription=%s',
         (row['id'],)).fetchone()

@@ -93,12 +93,17 @@ def fetch_subscription_events(store, c, p, subscription_id, *, limit=50):
         VALUES(%s,%s) ON CONFLICT DO NOTHING''', (row['id'], row['start_position']))
     consumption = c.execute('SELECT * FROM subscription_consumption WHERE subscription=%s FOR UPDATE',
         (row['id'],)).fetchone()
-    page = get_subscription_events(store, c, p, subscription_id,
-        after=consumption['acked_through'], limit=limit)
+    from . import module_events
+    module = module_events.stream(c, row['id'], lock=True)
+    page = get_subscription_events(store, c, p, subscription_id, after=consumption['acked_through'], limit=limit,
+        module_after=module['acked_through'] if module else None)
+    if module is not None:
+        page['module'].update(acked_through=module['acked_through'])
     page.update(consumption='explicit_subscription_ack', ack_version=consumption['version'], receipt=None,
         acked_through=consumption['acked_through'], receipt_expires_at=None,
         ack_available='subscription-ack' in p['permissions'])
-    if not page['items'] or 'subscription-ack' not in p['permissions']:
+    moved = module is not None and page['module']['next_after'] != module['acked_through']
+    if not page['items'] and not moved or 'subscription-ack' not in p['permissions']:
         return page
     c.execute('DELETE FROM subscription_receipts WHERE subscription=%s AND expires_at<=clock_timestamp()',
         (row['id'],))
@@ -110,10 +115,12 @@ def fetch_subscription_events(store, c, p, subscription_id, *, limit=50):
     receipt = secrets.token_urlsafe(32)
     issued = c.execute('''INSERT INTO subscription_receipts(receipt_hash,subscription,principal,key_id,
         scope_version,key_permission_version,subscription_version,consumption_version,
-        after_position,through_position) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING expires_at''',
+        after_position,through_position''' + (',module_after_position,module_through_position' if module else '') +
+        ''') VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s''' + (',%s,%s' if module else '') + ') RETURNING expires_at',
         (hashlib.sha256(receipt.encode()).hexdigest(), row['id'], p['id'], p['key_id'],
          p['scope_version'], p['key_permission_version'], row['version'], consumption['version'],
-         consumption['acked_through'], page['next_after'])).fetchone()
+         consumption['acked_through'], page['next_after'],
+         *((module['acked_through'], page['module']['next_after']) if module else ()))).fetchone()
     page.update(receipt=receipt, receipt_expires_at=issued['expires_at'].isoformat())
     return page
 
@@ -147,6 +154,15 @@ def ack_subscription_events(store, c, p, subscription_id, receipt, version):
         raise APIError('stale_ack', 409)
     result = {'subscription_id': str(row['id']), 'acked_through': updated['acked_through'],
         'ack_version': updated['version'], 'provider_read_state_changed': False}
+    from . import module_events
+    if issued.get('module_through_position') is not None and module_events.ready(c):
+        # ANYM-562: the module stream's own position, compare-and-swap under the same receipt.
+        module = c.execute('''UPDATE subscription_module_streams SET acked_through=%s WHERE subscription=%s
+            AND acked_through=%s RETURNING acked_through''', (issued['module_through_position'], row['id'],
+            issued['module_after_position'])).fetchone()
+        if module is None:
+            raise APIError('stale_ack', 409)
+        result['module_acked_through'] = module['acked_through']
     c.execute('UPDATE subscription_receipts SET ack_result=%s WHERE receipt_hash=%s',
         (Jsonb(result), issued['receipt_hash']))
     return result
@@ -176,7 +192,7 @@ async def wait_for_subscription_events(store, token, subscription_id, *, timeout
                 if latest is None:
                     raise APIError('subscription_wait_timeout', 503) from None
                 return {**latest, 'wait_status': 'timeout'}
-            if latest['items']:
+            if latest['items'] or (latest.get('module') or {}).get('items'):
                 return {**latest, 'wait_status': 'events_available'}
             if latest.get('subscription', {}).get('state') != 'active':
                 return {**latest, 'wait_status': 'subscription_inactive'}

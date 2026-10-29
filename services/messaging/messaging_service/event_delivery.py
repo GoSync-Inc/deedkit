@@ -518,6 +518,15 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                     lease_token=NULL,lease_until=NULL WHERE id=%s""", (hint['id'],))
                 stats['dead_letter'] += 1
                 continue
+            if hint['kind'] == 'module_events':
+                # ANYM-562: expiry is rechecked before each attempt; a hint with no live reference is not sent.
+                from .module_events import hint_references
+                if not hint_references(c, hint['subscription'], hint['through_position']):
+                    c.execute("""UPDATE subscription_outbox SET state='cancelled',finished_at=clock_timestamp(),
+                        error_code='module_events_expired',lease_token=NULL,lease_until=NULL WHERE id=%s""",
+                        (hint['id'],))
+                    stats['cancelled'] += 1
+                    continue
             if hint['state'] == 'leased' and hint.get('endpoint') is not None:
                 # ANYM-582/585: a lease that ran out mid-attempt may have reached an at-most-once receiver. Settle it
                 # before DNS, quiet hours or the budget can turn it back into a pending hint that is sent again.
@@ -618,7 +627,12 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
                 receiver = endpoint if bound else None
                 if receiver is not None:
                     receiver = {'principal': p['id'], 'key_id': p['key_id']}
-            eligible = (p is not None and row is not None and row['state'] == 'active' and
+            expired = False
+            if hint['kind'] == 'module_events':
+                # ANYM-562: rechecked under the fence too, so an event that expires during preparation is never sent.
+                from .module_events import hint_references
+                expired = not hint_references(c, hint['subscription'], hint['through_position'])
+            eligible = (not expired and p is not None and row is not None and row['state'] == 'active' and
                 row['version'] == hint['subscription_version'] and receiver is not None and
                 receiver['principal'] == p['id'] and receiver['key_id'] == p['key_id'] and
                 (registered is None or (receiver['endpoint'], receiver['secret_file']) ==
@@ -628,7 +642,8 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
             if live:
                 delay = min(3600, 2**(hint['attempts'] + 1))
                 if not eligible:
-                    state, error = 'cancelled', refused or 'access_or_configuration_changed'
+                    state, error = 'cancelled', refused or ('module_events_expired' if expired else
+                        'access_or_configuration_changed')
                 # The retry age starts at admission: waiting for a budget slot or quiet hours never expires a hint.
                 elif hint['attempts'] >= 8 or c.execute("SELECT %s<clock_timestamp()-interval '7 days' AS expired",
                         (hint['admitted_at'] or now,)).fetchone()['expired']:
