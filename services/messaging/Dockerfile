@@ -152,6 +152,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 RUN python -c "import hashlib,io,tarfile,urllib.request; b=urllib.request.urlopen('https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz').read(); assert hashlib.sha256(b).hexdigest()=='cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10'; t=tarfile.open(fileobj=io.BytesIO(b)); m=t.getmember('age/age'); assert m.isfile(); f=open('/usr/local/bin/age','xb'); f.write(t.extractfile(m).read()); f.close()" \
     && chmod 0755 /usr/local/bin/age && age --version && pg_dump --version
 COPY services/messaging/messaging_service ./messaging_service
+# The receiver lock its update follow checks a staged release against (BACKUP_R2.md, ANYM-597).
+COPY services/messaging/requirements-backup-r2.lock ./requirements-backup-r2.lock
 COPY licenses/age-LICENSE /usr/share/doc/age/LICENSE
 ENTRYPOINT []
 CMD ["python", "-m", "messaging_service.backup_worker", "--config", "/run/secrets/backup_config"]

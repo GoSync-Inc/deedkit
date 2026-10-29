@@ -838,8 +838,10 @@ def follower(operator,tmp_path,monkeypatch):
         result=state.results.get(tested['helper_revision'],50)
         if isinstance(result,BaseException):raise result
         return [2,50],result
-    state.run=lambda:f.follow(path,engine=state.docker,main=state.main,attest=attest,test=self_test)
-    state.revert=lambda:f.revert(path,engine=state.docker,test=self_test)
+    # No `venv` under the synthetic code root: the code is installed by hand, only the pins follow.
+    state.code=f.Code(tmp_path/'code');state.self_test=self_test
+    state.run=lambda:f.follow(path,engine=state.docker,main=state.main,attest=attest,test=self_test,code=state.code)
+    state.revert=lambda:f.revert(path,engine=state.docker,test=self_test,code=state.code)
     state.published=lambda:r2.published_helper(r2.load_config(config['receiver_config_file']))
     state.record=lambda name:json.loads((state.directory/name).read_text())
     return state
@@ -1045,6 +1047,241 @@ def test_follow_revert_switches_back_to_the_kept_pair_and_republishes_it(followe
     assert s.published()['helper_revision']==old[1]
     kept=s.record('follow-previous.json')
     assert (kept['helper_image'],kept['helper_revision'])==(NEW_IMAGE,HEAD)
+
+
+OLD_CODE='b'*40
+RECEIVER_LOCK='boto3==1.43.114 \\\n    --hash=sha256:'+'1'*64+'\nsix==1.17.0 \\\n    --hash=sha256:'+'2'*64+'\n'
+
+
+def fake_release(root,name,package=b'OLD_SYNTHETIC_CODE\n'):
+    """A synthetic receiver venv: the wheel's packages and record, and the receiver lock's distributions."""
+    release=root/'releases'/name;packages=release/'lib'/'python3.13'/'site-packages'
+    for directory in ('messaging_service','anymsg','anymsg-0.0.0.dist-info','boto3-1.43.114.dist-info','six-1.17.0.dist-info'):
+        (packages/directory).mkdir(parents=True)
+    (packages/'messaging_service'/'__init__.py').write_bytes(package)
+    for directory,(name_,version) in (('boto3-1.43.114.dist-info',('boto3','1.43.114')),('six-1.17.0.dist-info',('six','1.17.0'))):
+        (packages/directory/'METADATA').write_text('Metadata-Version: 2.1\nName: '+name_+'\nVersion: '+version+'\n\nbody\n')
+    (release/'pyvenv.cfg').write_text('home = /usr/bin\n');(release/'bin').mkdir();(release/'bin'/'python').write_text('')
+    release.chmod(0o755)  # trusted only when not group-writable, whatever the runner's umask
+    return release
+
+
+@pytest.fixture
+def released(follower,tmp_path):
+    """The follower with `venv` linked to a release of the pinned revision; the image's code and lock and the
+    staged code's self-test are synthetic (Code.tester's child protocol is tested on its own)."""
+    s=follower;f=s.f;root=tmp_path/'code';root.mkdir(mode=0o755);(root/'releases').mkdir(mode=0o755)
+    root.chmod(0o755);(root/'releases').chmod(0o755)
+    fake_release(root,OLD_CODE);(root/'venv').symlink_to('releases/'+OLD_CODE)
+    s.root=root;s.extracted=[];s.code_tested=[];s.image_lock=RECEIVER_LOCK;s.image_link=False;s.staged_failure=None
+    def extract(image,run,paths):
+        s.extracted.append(image);assert set(paths)=={f.IMAGE_PACKAGE,f.IMAGE_LOCK}
+        package=paths[f.IMAGE_PACKAGE];package.mkdir();(package/'__init__.py').write_bytes(b'HEAD_SYNTHETIC_CODE\n')
+        (package/'__init__.py').chmod(0o666)
+        if s.image_link:os.symlink('/etc/passwd',package/'linked.py')
+        if s.image_lock is not None:paths[f.IMAGE_LOCK].write_text(s.image_lock)
+    s.docker.extract=extract
+    class Code(f.Code):
+        def tester(self,name):
+            def test(engine,config,run=None):
+                s.code_tested.append((name,r2.profile(config)))
+                if s.staged_failure:raise s.staged_failure
+                return s.self_test(engine,config,run)
+            return test
+    s.code=Code(root)
+    s.link=lambda:os.readlink(root/'venv')
+    s.releases=lambda:sorted(p.name for p in (root/'releases').iterdir())
+    return s
+
+
+# spec: ANYM-597
+def test_follow_stages_the_heads_verifier_code_from_its_attested_image_and_moves_it_with_the_pins(released):
+    s=released
+    result=s.run()
+    assert result['status']=='switched' and result['code']==HEAD and s.link()=='releases/'+HEAD
+    assert (s.v.load_config(s.path)['helper_image'],s.v.load_config(s.path)['helper_revision'])==(NEW_IMAGE,HEAD)
+    packages=s.root/'releases'/HEAD/'lib'/'python3.13'/'site-packages'
+    # The image's package on the linked release's dependencies; the wheel's own packages and record are gone.
+    assert (packages/'messaging_service'/'__init__.py').read_bytes()==b'HEAD_SYNTHETIC_CODE\n'
+    assert (packages/'messaging_service'/'__init__.py').stat().st_mode&0o777==0o644
+    assert sorted(p.name for p in packages.iterdir())==['boto3-1.43.114.dist-info','messaging_service','six-1.17.0.dist-info']
+    assert s.extracted==[NEW_IMAGE] and s.releases()==sorted([OLD_CODE,HEAD])
+    # The installed pair proven by the running code, the head's pair by its own staged code.
+    assert s.tested==[OLD_CODE,HEAD] and s.code_tested==[(HEAD,'messaging')]
+    assert s.record('follow-previous.json')['code']==OLD_CODE and s.record('follow-current.json')['code']==HEAD
+    assert follow_status(s)['code']==HEAD and s.published()['helper_revision']==HEAD
+    assert s.run()['status']=='current' and s.extracted==[NEW_IMAGE] and s.code_tested==[(HEAD,'messaging')]
+
+
+# spec: ANYM-597
+@pytest.mark.parametrize('case,code',[('other_dependency','verifier_dependencies_changed'),('no_lock','verifier_dependencies_changed'),
+                                      ('linked_file','verifier_code_invalid'),('self_test','staged_self_test_failed')])
+def test_follow_keeps_the_code_and_the_pins_when_the_heads_release_is_unproven(released,case,code):
+    s=released;before=s.path.read_bytes()
+    if case=='other_dependency':s.image_lock=RECEIVER_LOCK.replace('boto3==1.43.114','boto3==1.44.0')
+    elif case=='no_lock':s.image_lock=None
+    elif case=='linked_file':s.image_link=True
+    else:s.staged_failure=RuntimeError('staged_self_test_failed')
+    with pytest.raises(Exception,match=code):s.run()
+    assert s.path.read_bytes()==before and s.link()=='releases/'+OLD_CODE and s.releases()==[OLD_CODE]
+    assert s.docker.removed==[NEW_IMAGE] and not (s.directory/'follow-previous.json').exists()
+    assert follow_status(s)['error']==code and follow_status(s)['status']=='refused'
+    assert s.published()['helper_revision']==OLD_CODE and s.record('follow-current.json')['code']==OLD_CODE
+
+
+# spec: ANYM-597
+def test_follow_never_moves_the_code_to_a_commit_older_than_the_linked_release(released):
+    s=released;ahead='a'*40;fake_release(s.root,ahead);os.unlink(s.root/'venv');(s.root/'venv').symlink_to('releases/'+ahead)
+    s.main.forward=lambda current,head:current!=ahead
+    before=s.path.read_bytes()
+    with pytest.raises(ValueError,match='follow_not_forward'):s.run()
+    assert s.path.read_bytes()==before and s.link()=='releases/'+ahead and not s.extracted and not s.docker.pulled
+
+
+# spec: ANYM-597
+def test_follow_crash_between_the_pins_and_the_code_link_moves_the_code_on_recovery(released,monkeypatch):
+    s=released;original=s.code.point;calls=[]
+    def crash(name):
+        calls.append(name)
+        if len(calls)==1:raise OSError('synthetic crash')
+        return original(name)
+    monkeypatch.setattr(s.code,'point',crash)
+    with pytest.raises(OSError):s.run()
+    assert s.v.load_config(s.path)['helper_revision']==HEAD and s.link()=='releases/'+OLD_CODE
+    assert s.record('follow-switch.json')['to']['code']==HEAD
+    assert s.run()['status']=='current' and s.link()=='releases/'+HEAD
+    assert not (s.directory/'follow-switch.json').exists() and s.record('follow-previous.json')['code']==OLD_CODE
+    assert s.releases()==sorted([OLD_CODE,HEAD])
+
+
+# spec: ANYM-597
+def test_follow_crash_before_the_pins_keeps_the_code_on_the_old_release(released,monkeypatch):
+    s=released;before=s.path.read_bytes();original=os.replace
+    def crash(src,dst,**kw):
+        if dst==s.path.name:raise OSError('synthetic crash')
+        return original(src,dst,**kw)
+    monkeypatch.setattr(os,'replace',crash)
+    with pytest.raises(OSError):s.run()
+    assert s.path.read_bytes()==before and s.link()=='releases/'+OLD_CODE
+    monkeypatch.setattr(os,'replace',original)
+    assert s.run()['status']=='switched' and s.link()=='releases/'+HEAD
+
+
+# spec: ANYM-597
+def test_follow_revert_moves_the_code_back_to_the_kept_release(released):
+    s=released;s.run()
+    assert s.revert()['status']=='reverted' and s.link()=='releases/'+OLD_CODE
+    assert s.v.load_config(s.path)['helper_revision']==OLD_CODE
+    assert s.record('follow-previous.json')['code']==HEAD and s.record('follow-current.json')['code']==OLD_CODE
+    assert s.releases()==sorted([OLD_CODE,HEAD])
+
+
+# spec: ANYM-597
+def test_follow_with_a_hand_installed_venv_moves_only_the_pins(released):
+    s=released;os.unlink(s.root/'venv');fake_release(s.root,'venv-hand');(s.root/'releases'/'venv-hand').rename(s.root/'venv')
+    result=s.run()
+    assert result['status']=='switched' and 'code' not in result and (s.root/'venv').is_dir()
+    assert not s.extracted and not s.code_tested and 'code' not in s.record('follow-current.json')
+    assert s.releases()==[OLD_CODE]
+
+
+# spec: ANYM-597
+def test_code_prune_keeps_the_linked_and_kept_releases_and_removes_stages_by_their_exact_container(released):
+    s=released;f=s.f;run='9'*32;stale='e'*40
+    for name in (HEAD,stale):fake_release(s.root,name)
+    (s.root/'releases'/(f.STAGE+run)).mkdir();(s.root/'releases'/'unrelated').mkdir()
+    s.docker.resources[('helper',f.code_container(run))]={'run':run}
+    s.code.prune(s.docker,{HEAD,None})
+    assert s.releases()==sorted([OLD_CODE,HEAD,'unrelated']) and not s.docker.resources
+
+
+# spec: ANYM-597
+def test_code_switch_refuses_an_untrusted_or_unknown_release(released):
+    s=released
+    for target in ('releases/'+'f'*40,'../elsewhere','releases/'+OLD_CODE+'/..'):
+        os.unlink(s.root/'venv');(s.root/'venv').symlink_to(target)
+        with pytest.raises(ValueError,match='verifier_code_invalid'):s.code.active()
+    os.unlink(s.root/'venv');(s.root/'venv').symlink_to('releases/'+OLD_CODE)
+    with pytest.raises(ValueError,match='verifier_code_invalid'):s.code.point('f'*40)
+    (s.root/'releases'/OLD_CODE/'pyvenv.cfg').unlink()
+    with pytest.raises(ValueError,match='verifier_code_invalid'):s.code.active()
+
+
+# spec: ANYM-597
+def test_code_extract_copies_from_a_networkless_container_it_names_before_creating_and_always_removes(tmp_path):
+    from messaging_service import backup_r2_follow as f
+    class Engine(f.Docker):
+        def __init__(self):super().__init__(60);self.calls=[]
+        def command(self,*args):
+            self.calls.append(args)
+            if args[:2]==('container','cp'):raise RuntimeError('restore_docker_failed')
+            return b''
+    engine=Engine();run='7'*32;name=f.code_container(run)
+    with pytest.raises(RuntimeError,match='restore_docker_failed'):
+        engine.extract(NEW_IMAGE,run,{f.IMAGE_PACKAGE:tmp_path/'messaging_service'})
+    create=engine.calls[0]
+    assert create[:4]==('container','create','--name',name) and ('--network','none') in zip(create,create[1:])
+    assert ('--label','org.deedkit.backup-verifier='+run) in zip(create,create[1:]) and NEW_IMAGE in create
+    assert engine.calls[1]==('container','cp',name+':'+f.IMAGE_PACKAGE,str(tmp_path/'messaging_service'))
+    assert engine.calls[2:]==[('container','stop','--time=10',name),('container','rm','--volumes',name)]
+
+
+# spec: ANYM-597
+def test_staged_code_self_test_runs_isolated_in_its_release_and_returns_only_its_proof(released,monkeypatch):
+    s=released;f=s.f;seen=[]
+    def run(argv,**kw):
+        seen.append((argv,kw));return SimpleNamespace(returncode=0,stdout=r2.encoded({'v':1,'helper_schemas':[2,50],'schema_version':50}))
+    monkeypatch.setattr(f.subprocess,'run',run)
+    test=f.Code.tester(s.code,OLD_CODE);config={**s.config,'helper_revision':HEAD}
+    assert test(s.docker,config,'5'*32)==([2,50],50)
+    argv,kw=seen[0]
+    assert argv==[str(s.root/'releases'/OLD_CODE/'bin'/'python'),'-I','-B','-m','messaging_service.backup_r2_follow','self-test']
+    request=json.loads(kw['input'])
+    assert request['config']==config and request['run']=='5'*32 and 60<=request['seconds']<kw['timeout'] and kw['cwd']=='/'
+    for stdout in (b'',b'{"v":1,"helper_schemas":[2,50]}',r2.encoded({'v':1,'helper_schemas':'2-50','schema_version':50})):
+        monkeypatch.setattr(f.subprocess,'run',lambda argv,**kw:SimpleNamespace(returncode=0,stdout=stdout))
+        with pytest.raises(RuntimeError,match='staged_self_test_failed'):test(s.docker,config,'5'*32)
+    monkeypatch.setattr(f.subprocess,'run',lambda argv,**kw:SimpleNamespace(returncode=1,stdout=b''))
+    with pytest.raises(RuntimeError,match='staged_self_test_failed'):test(s.docker,config,'5'*32)
+
+
+# spec: ANYM-597
+def test_follow_self_test_mode_answers_one_request_with_this_codes_self_test(monkeypatch,capsys):
+    import sys
+    from messaging_service import backup_r2_follow as f
+    calls=[];imported=[];monkeypatch.setattr(os,'geteuid',lambda:0)
+    def self_test(engine,config,run):calls.append((type(engine),config,run));return [2,50],50
+    # The receive path's own imports load first (the SDK is not in the test environment).
+    monkeypatch.setattr(f,'RECEIVER_IMPORTS',('json','messaging_service.backup_r2_receiver'))
+    original=f.importlib.import_module
+    monkeypatch.setattr(f.importlib,'import_module',lambda name:imported.append(name) or original(name))
+    monkeypatch.setattr(f,'self_test',self_test)
+    def ask(request):
+        monkeypatch.setattr(sys,'stdin',SimpleNamespace(buffer=io.BytesIO(r2.encoded(request))))
+        return f.main(['self-test'])
+    assert ask({'v':1,'config':{'directory':'/synthetic'},'run':'5'*32,'seconds':600})==0
+    assert json.loads(capsys.readouterr().out)=={'v':1,'helper_schemas':[2,50],'schema_version':50}
+    assert calls==[(f.Docker,{'directory':'/synthetic'},'5'*32)] and imported==['json','messaging_service.backup_r2_receiver']
+    monkeypatch.setattr(f,'RECEIVER_IMPORTS',('deedkit_synthetic_missing_sdk',))
+    assert ask({'v':1,'config':{},'run':'5'*32,'seconds':600})==1 and len(calls)==1
+    assert json.loads(capsys.readouterr().err)['error']=='verifier_dependencies_changed'
+    monkeypatch.setattr(f,'RECEIVER_IMPORTS',('json',))
+    for bad in ({'v':1,'config':{},'run':'../x','seconds':600},{'v':1,'config':{},'run':'5'*32,'seconds':86400},{'v':1}):
+        assert ask(bad)==1 and json.loads(capsys.readouterr().err)['error']=='invalid_self_test_request'
+    with pytest.raises(SystemExit):f.main(['--config','/synthetic','self-test'])
+    monkeypatch.setattr(os,'geteuid',lambda:1000)
+    assert ask({'v':1,'config':{},'run':'5'*32,'seconds':600})==1 and len(calls)==1
+
+
+# spec: ANYM-597
+def test_backup_image_carries_the_receiver_code_and_lock_where_the_follow_reads_them():
+    from messaging_service import backup_r2_follow as f
+    root=Path(__file__).resolve().parents[1]
+    stage=(root/'services/messaging/Dockerfile').read_text().split('AS backup',1)[1].split('\nFROM ',1)[0]
+    assert 'WORKDIR /app' in stage and f.IMAGE_PACKAGE=='/app/messaging_service' and f.IMAGE_LOCK=='/app/requirements-backup-r2.lock'
+    assert 'COPY services/messaging/messaging_service ./messaging_service' in stage
+    assert 'COPY services/messaging/requirements-backup-r2.lock ./requirements-backup-r2.lock' in stage
+    assert f.lock_pins((root/'services/messaging/requirements-backup-r2.lock').read_text())['boto3']
 
 
 # spec: ANYM-597
