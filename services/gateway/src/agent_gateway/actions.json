@@ -93,6 +93,9 @@
   "open_chat_by_phone": [
     "send"
   ],
+  "open_chat_by_username": [
+    "send"
+  ],
   "pin_chat": [
     "chat-manage"
   ],

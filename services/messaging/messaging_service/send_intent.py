@@ -29,9 +29,26 @@ from .outgoing import CHILD_KEY_PREFIX
 from .store import APIError, serial
 
 TOOL = 'messages_send'
-# allow_open_chat and allow_files are set by the gateway from its open_chat_by_phone (ANYM-532) and send_file grants
-# on every call, token-only ones included; omitted means a direct caller.
-CONTROL = ('dry_run', 'confirm_token', 'request_id', 'resume', 'wait_s', 'allow_open_chat', 'allow_files')
+# allow_open_chat, allow_open_username and allow_files are set by the gateway from its open_chat_by_phone (ANYM-532),
+# open_chat_by_username (ANYM-643) and send_file grants on every call, token-only ones included; omitted means a
+# direct caller.
+CONTROL = ('dry_run', 'confirm_token', 'request_id', 'resume', 'wait_s', 'allow_open_chat', 'allow_open_username',
+           'allow_files')
+# The steps that open a chat first: a phone (phone_send) or a Telegram username (username_send).
+OPENING = ('phone', 'username')
+OPEN_ALL = {'phone': True, 'username': True}
+
+
+def open_grants(arguments):
+    """Which chat openings this call may start, by recipient kind. A call with allow_open_chat but no
+    allow_open_username comes from a gateway that never checked the open_chat_by_username grant: no username opens."""
+    phone, username = arguments.get('allow_open_chat'), arguments.get('allow_open_username')
+    return {'phone': phone is not False, 'username': username is not False if username is not None else phone is None}
+
+
+def _module(target):
+    from . import phone_send, username_send
+    return (username_send, target['username'][1:]) if 'username' in target else (phone_send, target['phone'][1:])
 FIELDS = frozenset(('to', 'account', 'reply_to', 'text', 'files', 'format', *CONTROL))
 FILE_FIELDS = frozenset(('upload_id', 'attachment_id', 'mode'))
 INLINE_FIELDS = frozenset(('name', 'mime', 'base64', 'mode'))
@@ -132,7 +149,7 @@ def payload(arguments):
     if value['reply_to'] and not value['reply_to'].startswith('msg_'): raise _invalid('reply_to', 'pattern')
     if value['format'] not in ('plain', 'markdown', 'html'): raise _invalid('format', 'enum')
     if not value['to'] and not value['reply_to']: raise _invalid('to', 'required')
-    for name in ('dry_run', 'resume', 'allow_open_chat', 'allow_files'):
+    for name in ('dry_run', 'resume', 'allow_open_chat', 'allow_open_username', 'allow_files'):
         if name in arguments and type(arguments[name]) is not bool: raise _invalid(name, 'type')
     files = value['files']
     if not isinstance(files, list): raise _invalid('files', 'type')
@@ -201,9 +218,10 @@ def _text(draft):
             'links': list(draft.get('links') or []), 'digest': draft['preview_digest']}
 
 
-def resolve(store, c, p, value, phone_text=None, open_chat=True, files=True):
+def resolve(store, c, p, value, phone_text=None, open_chat=OPEN_ALL, files=True):
     """Everything the owner should see, from the caller's current scope. Refusals are the low-level codes.
-    A phone target that opens a chat needs its lookup draft (`phone_text`); without one it returns None."""
+    A phone or username target that opens a chat needs its lookup draft (`phone_text`); without one it returns None.
+    open_chat: open_grants of the call."""
     from .outgoing import reviewed, target, valid_text
     from .resolve_target import resolve_target
     if value['files'] and not files: raise APIError('forbidden', 403)
@@ -218,12 +236,16 @@ def resolve(store, c, p, value, phone_text=None, open_chat=True, files=True):
     text = value['text'] if value['text'].strip() else ''
     if text and value['format'] == 'plain': valid_text(text)
     if to.get('opens_chat'):
-        if not open_chat: raise APIError('forbidden', 403)
+        kind = 'username' if 'username' in to else 'phone'
+        if not open_chat[kind]: raise APIError('forbidden', 403)
         if value['files']:
             raise _invalid('files', 'max_items', 'a phone without a chat takes text only: send it, then the files')
         if phone_text is None: return None
-        return {'target': {**recipient, 'chat_id': None, 'opens_chat': True, 'phone': to['phone']}, 'reply_to': None,
-                'text': phone_text, 'files': [], 'caption': None, 'scope': scope}
+        # ANYM-643: the owner sees the person the username resolved to; the digest binds that user ID.
+        person = {k: phone_text[k] for k in ('name', 'user_id') if k in phone_text}
+        return {'target': {**recipient, 'chat_id': None, 'opens_chat': True, kind: to[kind], **person},
+                'reply_to': None, 'text': {k: v for k, v in phone_text.items() if k not in person}, 'files': [],
+                'caption': None, 'scope': scope}
     chat, reply_id = target(c, p, account, to['chat_id'], value['reply_to'])
     recipient.update(chat_id=to['chat_id'], provider_chat=chat['provider_chat'])
     # A plain caption that fits rides on the first file; anything else (rich text, a reply) is its own last step.
@@ -247,7 +269,9 @@ def _comparable(resolution):
 
 
 def _steps(resolution):
-    if resolution['target'].get('opens_chat'): steps = [{'name': 'phone', 'kind': 'phone'}]
+    if resolution['target'].get('opens_chat'):
+        kind = 'username' if 'username' in resolution['target'] else 'phone'
+        steps = [{'name': kind, 'kind': kind}]
     else:
         steps = [{'name': f'file{index + 1}', 'kind': 'file'} for index in range(len(resolution['files']))]
         if resolution['text'] is not None: steps.append({'name': 'text', 'kind': 'text'})
@@ -313,7 +337,7 @@ def _preview_required(value):
 def admit(store, c, p, arguments):
     """The intent this call acts on, bound before any effect; or an error to commit first (`preview_stale`)."""
     request_id, token = arguments.get('request_id'), arguments.get('confirm_token')
-    open_chat, files = arguments.get('allow_open_chat') is not False, arguments.get('allow_files') is not False
+    open_chat, files = open_grants(arguments), arguments.get('allow_files') is not False
     # Control fields alone replay (or resume) the intent of that key; a payload sent with them must equal it.
     value = None if _bare(arguments) and (token is not None or request_id is not None) else payload(arguments)
     if request_id is not None and not is_request_id(request_id): raise _invalid('request_id', 'pattern')
@@ -345,7 +369,10 @@ def admit(store, c, p, arguments):
         if record['expired']:
             raise _error('preview_expired', 409, next=next_call(TOOL, {**_callable(record['arguments']), 'dry_run': True}))
         value, old = record['arguments'], record['resolution']
-        fresh = resolve(store, c, p, value, old['text'] if old['target'].get('opens_chat') else None, open_chat, files)
+        # An opening target's lookup draft, with the person a username resolved to (resolve moves it to target).
+        draft = old['target'].get('opens_chat') and {**old['text'], **{k: old['target'][k] for k in ('name', 'user_id')
+                                                                       if k in old['target']}}
+        fresh = resolve(store, c, p, value, draft or None, open_chat, files)
         before, after = _comparable(old), _comparable(fresh)
         changed = [name for name in COMPARED if before[name] != after[name]]
         if changed:
@@ -388,7 +415,7 @@ def _start(store, c, p, row, step):
     not a read before it, also holds when a remap commits between two statements (READ COMMITTED)."""
     with c.transaction():
         handle = _enqueue(store, c, p, row, step)
-        if step['kind'] == 'phone': return handle
+        if step['kind'] in OPENING: return handle
         resolution = row['plan']['resolution']
         if 'send_id' in handle:
             written = c.execute('SELECT provider_chat,reply_provider_id FROM outgoing_messages WHERE id=%s',
@@ -424,9 +451,9 @@ def _enqueue(store, c, p, row, step):
         return {'operation_id': operation(store, c, p, target['account'], 'send_file', target['chat_id'],
                                           parameters=parameters, request_id=key, preview_digest=digest,
                                           child=True)['operation_id']}
-    from .phone_send import send_begin
-    begun = send_begin(store, c, p, target['account'], target['phone'][1:], value['text'], key, '', value['format'],
-                       resolution['text']['digest'], False, False, child=True)
+    module, recipient = _module(target)
+    begun = module.send_begin(store, c, p, target['account'], recipient, value['text'], key, '', value['format'],
+                              resolution['text']['digest'], False, False, child=True)
     return {'send_id': begun['sent']['send_id']} if 'sent' in begun else {'operation_id': begun['operation_id']}
 
 
@@ -444,14 +471,14 @@ def _observe(store, c, p, row, step):
         receipt = operation(store, c, p, handle['operation_id'])
         status = receipt['status']
         done = {'operation_id': receipt['operation_id']}
-        if step['kind'] == 'phone' and status == 'succeeded':
-            from .phone_send import send_finish
+        if step['kind'] in OPENING and status == 'succeeded':
             value, resolution = row['plan']['value'], row['plan']['resolution']
             target = resolution['target']
+            module, recipient = _module(target)
             try:
-                sent = send_finish(store, c, p, target['account'], target['phone'][1:], handle['operation_id'],
-                                   value['text'], _key(p, row, step), '', value['format'], resolution['text']['digest'],
-                                   False, False, child=True)
+                sent = module.send_finish(store, c, p, target['account'], recipient, handle['operation_id'],
+                                          value['text'], _key(p, row, step), '', value['format'],
+                                          resolution['text']['digest'], False, False, child=True)
             except APIError as error:
                 return 'failed', error.code
             if 'send_id' not in sent or not sent['send_id']: return 'pending', None
@@ -498,7 +525,7 @@ def _finish(c, row, steps, state, reason=None):
     return {'result': serial(result), **({'release': staged} if state == 'succeeded' and staged else {})}
 
 
-def advance(store, c, p, intent_id, *, resume=False, first=False, open_chat=True, files=True):
+def advance(store, c, p, intent_id, *, resume=False, first=False, open_chat=OPEN_ALL, files=True):
     """Move one intent as far as it goes without waiting: {'result'} when final, else {'wait', 'result'}."""
     try:
         row = c.execute('SELECT * FROM send_intents WHERE id=%s AND principal=%s FOR UPDATE NOWAIT',
@@ -514,7 +541,7 @@ def advance(store, c, p, intent_id, *, resume=False, first=False, open_chat=True
         if step['state'] == 'succeeded': continue
         if step['handle'] is None:
             # The gateway's grants of this call bound every unsent step, also of an intent bound earlier.
-            if step['kind'] == 'phone' and not open_chat or step['kind'] == 'file' and not files:
+            if step['kind'] in OPENING and not open_chat[step['kind']] or step['kind'] == 'file' and not files:
                 raise APIError('forbidden', 403)
             try:
                 step['handle'] = _start(store, c, p, row, step)
@@ -524,6 +551,9 @@ def advance(store, c, p, intent_id, *, resume=False, first=False, open_chat=True
                 if first and row['attempt'] == 1 and all(s['handle'] is None for s in steps): raise
                 step.update(state='failed', error=error.code)
                 return _finish(c, row, steps, 'failed', 'step_failed')
+        elif step['kind'] == 'username' and 'send_id' not in step['handle'] and not open_chat['username']:
+            # ANYM-643: this call's grant also bounds the message a username step's opened chat would queue.
+            raise APIError('forbidden', 403)
         state, detail = _observe(store, c, p, row, step)
         if state == 'pending':
             step['state'] = 'running'
@@ -670,9 +700,10 @@ async def send(store, token, arguments):
             if error.code != 'attachment_unavailable' or arguments is given: raise
             arguments = await run(stage, store, token, given)
             staged = await run(store.messages_send_preview, token, arguments)
-        if 'phone' not in staged: return staged
-        from . import phone_send
-        draft = await phone_send.preview(store, token, staged['phone'])
+        kind = next((k for k in OPENING if k in staged), None)
+        if kind is None: return staged
+        from . import phone_send, username_send
+        draft = await (username_send if kind == 'username' else phone_send).preview(store, token, staged[kind])
         return await run(store.messages_send_preview, token, arguments, draft)
     answer = await run(store.messages_send_execute, token, arguments)
     if 'raise' in answer: raise answer['raise']

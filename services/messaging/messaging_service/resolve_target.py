@@ -144,6 +144,26 @@ def _opted_in(store, c, p, account, digits):
     return bool(row and row['discover_chats'])
 
 
+def _username_opens(store, c, p, name, account):
+    """ANYM-643: the Telegram accounts on which this key may open a private chat by username: the
+    open_chat_by_username guards as reads (opt-in, policy, permissions); the lookup itself is the preview's."""
+    from .store import APIError
+    from .username_send import _admit, _telegram
+    rows = c.execute("SELECT id FROM accounts WHERE platform='telegram' AND id=ANY(%s) ORDER BY id",
+                     (p['accounts'],)).fetchall()
+    opened = []
+    for row in rows:
+        if account and row['id'] != account: continue
+        try:
+            with c.transaction():
+                _telegram(c, p, row['id'])
+                _admit(store, c, p, row['id'], name, True)
+            opened.append(row['id'])
+        except APIError:
+            pass
+    return opened
+
+
 def _alias_chats(c, p, account, jid):
     """The chats of the number's PN/LID pair, read from observations this key can see only.
 
@@ -364,6 +384,16 @@ def resolve_target(store, c, p, to, purpose='message', account='', sender=False)
     elif kind == 'username':
         identities = _identities(c, p, 'lower(sp.username)=%s', [value.lower()], account)
         rows = _private_chats(c, p, identities)
+        from .messenger_operations import telegram_username
+        name = telegram_username(value) if not rows and purpose == 'message' else None
+        opened = _username_opens(store, c, p, name, account) if name else []
+        if len(opened) == 1:
+            # ANYM-643: no archived chat; the send's preview resolves the username at Telegram.
+            return {'state': 'succeeded', 'target': {
+                'account': opened[0], 'chat_id': None, 'username': '@' + name, 'network': 'telegram',
+                'label': 'Telegram @' + name, 'how_resolved': 'username_opens_chat', 'opens_chat': True}, 'next': None}
+        if opened:
+            raise _choose([_candidate(a, a, 'account', 'telegram', a, None, purpose, follow=False) for a in opened])
         if not rows:
             raise _not_found('no_private_chat' if identities else None, query=value)
         # Exact only when the username names one visible identity; else the agent picks.

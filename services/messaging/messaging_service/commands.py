@@ -31,10 +31,17 @@ LIVE_FOREGROUND_RESERVE = 1.0
 # Preflight, governor waits and the request end this long after the claim; the rest is the receipt's.
 LIVE_EXECUTION_TIMEOUT = 8
 PHONE_LOOKUPS_PER_HOUR = 10
-# ANYM-532: server-set fields of a phone preview lookup or a phone send's chat step, never caller parameters.
-PHONE_INTERNAL = ('phone_preview','expected_lid','send_request_hash','preview_lookup','verified_name')
+# ANYM-643: Telegram username lookups, preview and send recheck alike.
+USERNAME_LOOKUPS_PER_HOUR = 20
+LOOKUP_BUDGETS = {'open_chat_by_phone':PHONE_LOOKUPS_PER_HOUR,'open_chat_by_username':USERNAME_LOOKUPS_PER_HOUR}
+# ANYM-532, ANYM-643: server-set fields of a phone or username preview lookup or a send's chat step, never
+# caller parameters.
+PHONE_INTERNAL = ('phone_preview','expected_lid','send_request_hash','preview_lookup','verified_name',
+                  'username_preview','expected_user_id','preview_name')
 OPEN_CHAT_ENABLE_STEP = ('owner enables: anymsg set-messenger-operations --account <account> '
     '--operations <current operations> open_chat_by_phone')
+OPEN_USERNAME_ENABLE_STEP = ('owner enables: anymsg set-messenger-operations --account <account> '
+    '--operations <current operations> open_chat_by_username')
 log = logging.getLogger('anymsg.live_search')
 BLOCKED_RESULT_KEYS = frozenset(('token','access_token','refresh_token','session','session_data',
     'password','secret','stack','traceback','diagnostic','diagnostics','credentials'))
@@ -129,6 +136,7 @@ def _policy(c,account,operation,provider_chats=(),*,ready=False,live=False):
     if not row or not row['enabled'] or operation not in row['operations_enabled']:
         failure=APIError('operation_disabled',409)
         if operation=='open_chat_by_phone':failure.hint=OPEN_CHAT_ENABLE_STEP
+        if operation=='open_chat_by_username':failure.hint=OPEN_USERNAME_ENABLE_STEP
         raise failure
     if any(not CollectorState.allows(row,chat) for chat in provider_chats):
         raise APIError('not_found',404)
@@ -214,12 +222,15 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
     if validate_parameters:
         try:parameters=validate_operation(account_row['platform'],operation,parameters,provider=provider)
         except (ValueError,TypeError,UnicodeError) as exc:
-            code=str(exc) if str(exc) in ('unsupported_operation','invalid_operation_parameters','invalid_phone') else 'invalid_operation_parameters'
+            code=str(exc) if str(exc) in ('unsupported_operation','invalid_operation_parameters','invalid_phone',
+                                          'invalid_username') else 'invalid_operation_parameters'
             failure=APIError(code)
             if isinstance(exc,ParameterError):failure.field_errors=exc.field_errors
             if getattr(exc,'hint',None):failure.hint=exc.hint
             if code=='unsupported_operation' and operation=='open_chat_by_phone':
                 failure.hint='native_whatsapp_accounts_only'
+            if code=='unsupported_operation' and operation=='open_chat_by_username':
+                failure.hint='telegram_accounts_only'
             raise failure from None
     else:
         # Persisted normalized parameters are immutable. Do not apply a newer
@@ -292,6 +303,9 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
     if operation=='open_chat_by_phone':
         _phone_policy(c,account,parameters['phone'])
         if saved is not None:payload.update({k:saved[k] for k in PHONE_INTERNAL if k in saved})
+    if operation=='open_chat_by_username':
+        _username_policy(c,account)
+        if saved is not None:payload.update({k:saved[k] for k in PHONE_INTERNAL if k in saved})
     if operation=='join_chat':
         # Saved intent keeps the chat the owner confirmed; a new preview binds the key's latest check.
         payload['expected_chat']=saved.get('expected_chat') if saved is not None else _link_check(c,p,account,parameters['link'])
@@ -338,19 +352,26 @@ def _phone_policy(c,account,phone):
         raise APIError('chat_not_collected',409)
 
 
-def _lookup_budget(c,account,command):
-    """Whether this dispatch may query WhatsApp, and when the oldest counted query
+def _username_policy(c,account):
+    """ANYM-643: the user ID is unknown before the lookup, so it can only be collected under discovery; the
+    collector and the chat step refuse a resolved ID the exclusions name."""
+    row=c.execute('SELECT discover_chats FROM account_policies WHERE account=%s',(account,)).fetchone()
+    if not row or not row['discover_chats']:raise APIError('chat_not_collected',409)
+
+
+def _lookup_budget(c,account,command,operation='open_chat_by_phone'):
+    """Whether this dispatch may query the provider (WhatsApp by phone, Telegram by username), and when the oldest counted query
     leaves the window. A dispatched row counts until an hour after it finished
     (a query runs between claim and finish; an unfinished row counts now), so
     neither a queue delay, a slow store read nor a restart resets the bound.
     Dispatch is serial per account (one fenced worker), so two principals cannot
     both take the last slot. Local answers and bound refusals do not count."""
     rows=c.execute('''SELECT coalesce(finished_at,clock_timestamp()) AS at FROM messenger_commands
-        WHERE account=%s AND operation='open_chat_by_phone' AND id<>%s AND started_at IS NOT NULL
+        WHERE account=%s AND operation=%s AND id<>%s AND started_at IS NOT NULL
         AND coalesce(finished_at,clock_timestamp())>clock_timestamp()-interval '1 hour'
         AND coalesce(result->'data'->>'provider_lookup','true')<>'false'
-        ORDER BY 1 DESC LIMIT %s''',(account,command,PHONE_LOOKUPS_PER_HOUR)).fetchall()
-    if len(rows)<PHONE_LOOKUPS_PER_HOUR:return True,None
+        ORDER BY 1 DESC LIMIT %s''',(account,operation,command,LOOKUP_BUDGETS[operation])).fetchall()
+    if len(rows)<LOOKUP_BUDGETS[operation]:return True,None
     return False,c.execute('''SELECT greatest(1,ceil(extract(epoch FROM
         %s::timestamptz+interval '1 hour'-clock_timestamp())))::int AS s''',(rows[-1]['at'],)).fetchone()['s']
 
@@ -698,6 +719,9 @@ class CommandWorker:
                 if payload['operation']=='open_chat_by_phone':
                     payload['known_chats']=[]
                     payload['lookup_allowed'],job['_lookup_resets_in']=_lookup_budget(c,st.account,job['id'])
+                if payload['operation']=='open_chat_by_username':
+                    payload['lookup_allowed'],job['_lookup_resets_in']=_lookup_budget(
+                        c,st.account,job['id'],'open_chat_by_username')
                 if payload['operation']=='send_file':
                     # Only collectors get a filesystem path; previews/status never do.
                     root=store.files
@@ -804,6 +828,46 @@ class CommandWorker:
             c.execute('''UPDATE messenger_commands SET status=%s,result=%s,error_code=%s,finished_at=clock_timestamp()
                 WHERE id=%s''',(status,Jsonb(result) if result is not None else None,code,row['id']))
 
+    def finish_open_username(self,job,answer):
+        """ANYM-643: recheck authority and policy against the resolved Telegram user, then create or reuse its
+        private chat and record the receipt in one fenced transaction."""
+        from .collector_state import CollectorState
+        st=self.state;store=st.archive.store
+        with store.pool.connection() as c:
+            st.archive.fence(c,st.account,st.lease)
+            row=c.execute('''SELECT * FROM messenger_commands WHERE id=%s AND account=%s AND status='dispatching'
+                AND lease_epoch=%s FOR UPDATE''',(job['id'],st.account,st.lease[1])).fetchone()
+            if not row:return
+            data=answer.get('data') if isinstance(answer.get('data'),dict) else {}
+            user,username,name=data.get('user_id'),data.get('username'),data.get('name')
+            try:
+                if (not isinstance(user,str) or not re.fullmatch(r'[1-9][0-9]{0,18}',user) or
+                    not isinstance(username,str) or not re.fullmatch(r'[a-z][a-z0-9_]{3,31}',username) or
+                    name is not None and (not isinstance(name,str) or not name.strip() or len(name)>512)):
+                    raise APIError('operation_result_unknown')
+                _check_saved(store,c,self._identity(c,row),row,ready=False,verify_file=False)
+                policy=c.execute('SELECT * FROM account_policies WHERE account=%s',(st.account,)).fetchone()
+                if not policy or not policy['discover_chats'] or not CollectorState.allows(policy,user):
+                    raise APIError('chat_not_collected')
+                if 'expected_user_id' in row['payload']:
+                    # A username send's chat step opens only the previewed person, under the sending opt-in.
+                    if user!=row['payload']['expected_user_id']:raise APIError('identity_changed')
+                    if not policy['enabled'] or not policy['send_enabled']:raise APIError('sending_disabled')
+                public={'found':True,'user_id':user,'username':username,'name':name,'provider_lookup':True}
+                chat_id=stable_id('chat',st.account,user)
+                existing=c.execute('SELECT 1 FROM chats WHERE id=%s',(chat_id,)).fetchone() is not None
+                if not existing and row['payload']['parameters'].get('create') is True:
+                    existing=c.execute('''INSERT INTO chats(id,account,title,chat_type,provider_chat)
+                        VALUES(%s,%s,%s,'private',%s) ON CONFLICT DO NOTHING RETURNING id''',
+                        (chat_id,st.account,name or '@'+username,user)).fetchone() is None
+                    public.update(chat_id=chat_id,existing=existing)
+                elif existing:public.update(chat_id=chat_id,existing=True)
+                else:public['existing']=False
+                status,result,code='succeeded',{'outcome':'confirmed','data':public},None
+            except APIError as exc:status,result,code='failed',None,exc.code
+            c.execute('''UPDATE messenger_commands SET status=%s,result=%s,error_code=%s,finished_at=clock_timestamp()
+                WHERE id=%s''',(status,Jsonb(result) if result is not None else None,code,row['id']))
+
     async def once(self):
         if self.unsettled is not None:raise self.unsettled
         if await asyncio.to_thread(self.state.cooldown_remaining)>0:return False
@@ -865,12 +929,15 @@ class CommandWorker:
                 'operation_target_changed','sender_not_ready','attachment_unavailable','unsupported_operation',
                 'forbidden','not_found','operation_rejected','identity_unresolved','chat_not_collected',
                 'rate_limited','provider_timeout','invalid_phone','identity_changed','sending_disabled','invite_invalid','invite_expired','chat_full',
-                'join_not_allowed','already_member','invalid_cursor','invalid_anchor') else 'operation_rejected'
+                'join_not_allowed','already_member','invalid_cursor','invalid_anchor','username_not_found',
+                'recipient_not_user') else 'operation_rejected'
             # Nothing was sent, so a lookup that ran out of time is a retryable read.
             result={'data':{'code':code,'retry':True}} if code=='provider_timeout' else None
             if code=='rate_limited' and exc.retry_after:
                 result={'data':{'code':code,'retry_after':exc.retry_after}}
-            if code=='rate_limited' and job['operation']=='open_chat_by_phone':
+            # ANYM-643: a Telegram flood wait (retry_after) reached the provider, so it counts as a lookup.
+            if code=='rate_limited' and (job['operation']=='open_chat_by_phone' or
+                                         job['operation']=='open_chat_by_username' and not exc.retry_after):
                 result={'data':{'code':code,'resets_in_seconds':job.get('_lookup_resets_in') or 1,'provider_lookup':False}}
             await settle(job,'expired' if code=='operation_expired' else 'failed',result,code)
         except Exception:
@@ -882,6 +949,9 @@ class CommandWorker:
         else:
             if job['operation']=='open_chat_by_phone' and answer['outcome']=='confirmed':
                 await finish_durably(self.finish_open_chat,job,answer)
+                return True
+            if job['operation']=='open_chat_by_username' and answer['outcome']=='confirmed':
+                await finish_durably(self.finish_open_username,job,answer)
                 return True
             if (job['operation']==HISTORY and job.get('platform')=='whatsapp' and isinstance(answer.get('data'),dict)
                     and 'code' not in answer['data']):

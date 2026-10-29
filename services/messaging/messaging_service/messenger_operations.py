@@ -16,6 +16,10 @@ CATALOG_VERSION = 1
 PHONE_LIMITATION = ('Native WhatsApp (whatsmeow) accounts only. One number per call: create=false checks it and '
     'writes nothing; create=true after the owner confirms returns the chat_id for send_message. At most 10 provider '
     'lookups per account per rolling hour; requires discover_chats. Sends still need exact owner confirmation.')
+USERNAME_LIMITATION = ('Telegram only. One @username per call, a person only (no bot, channel or group): '
+    'create=false resolves it at Telegram and writes nothing; create=true after the owner confirms returns the '
+    'chat_id. At most 20 provider lookups per account per rolling hour; requires discover_chats. Sends still need '
+    'exact owner confirmation.')
 # A phone-shaped chat reference: the not_found hint names open_chat_by_phone from the
 # input's shape alone, never from what the archive holds.
 PHONE_SHAPED = re.compile(r'\+?[0-9]{5,20}|[0-9]{5,20}@(?:c\.us|s\.whatsapp\.net)')
@@ -176,14 +180,18 @@ OPERATIONS = {
         'phone': _field('phone_number', required=True),
         'create': _field('boolean', default=False)},
         limitation=PHONE_LIMITATION),
+    'open_chat_by_username': _spec('send', 'account', full_account=True, platforms=('telegram',), fields={
+        'username': _field('telegram_username', required=True),
+        'create': _field('boolean', default=False)},
+        limitation=USERNAME_LIMITATION),
 }
 # ANYM-549: the gateway's risk-class tools (catalog.json `messages_<tool>`, `routes_actions`). One MCP annotation
-# set holds per tool, so a tool never mixes a read with an external effect; open_chat_by_phone is a local write
-# (a lookup and an archived chat), the only non-mutation of an effect tool.
+# set holds per tool, so a tool never mixes a read with an external effect; open_chat_by_phone and
+# open_chat_by_username are local writes (a lookup and an archived chat), the only non-mutations of an effect tool.
 OPERATION_TOOLS = {
     'change_message': ('edit_message', 'delete_message', 'send_reaction', 'vote_poll', 'pin_message',
                        'unpin_message', 'star_message', 'unstar_message'),
-    'manage_chat': ('open_chat_by_phone', 'archive_chat', 'unarchive_chat', 'mute_chat', 'unmute_chat',
+    'manage_chat': ('open_chat_by_phone', 'open_chat_by_username', 'archive_chat', 'unarchive_chat', 'mute_chat', 'unmute_chat',
                     'pin_chat', 'unpin_chat', 'mark_read', 'mark_unread', 'set_chat_labels', 'create_group',
                     'rename_group', 'set_group_description', 'add_participant', 'remove_participant',
                     'promote_participant', 'demote_participant', 'leave_group', 'get_invite_link',
@@ -192,7 +200,7 @@ OPERATION_TOOLS = {
     'change_contacts': ('add_contact', 'delete_contact', 'block_contact', 'unblock_contact'),
     'read_contacts': ('list_contacts', 'get_contact', 'list_blocked', 'get_labels'),
 }
-LOCAL_WRITE_OPERATIONS = frozenset(('open_chat_by_phone',))
+LOCAL_WRITE_OPERATIONS = frozenset(('open_chat_by_phone', 'open_chat_by_username'))
 _SEND = 'a send: the send layer (send_message, ANYM-546) owns sends'
 _LIVE_READ = 'a live chat read; no risk-class tool of this story reads chats (ANYM-550 picks the default layer)'
 # Reached only through execute_messenger_operation, each with its reason.
@@ -285,6 +293,8 @@ def operation_manifest(platform, *, provider=None):
             row['limitation']='Unsupported here: native WhatsApp (whatsmeow) accounts only.'
         elif name == 'open_chat_by_phone' and not row['supported']:
             row['limitation'] = 'Unsupported here: native WhatsApp (whatsmeow) accounts only.'
+        elif name == 'open_chat_by_username' and not row['supported']:
+            row['limitation'] = 'Unsupported here: Telegram accounts only.'
         elif platform == 'whatsapp' and name == 'delete_message':
             row['limitation'] = 'Unsupported: upstream global revoke can silently fallback to local deletion.'
         elif platform not in spec['platforms']:
@@ -328,6 +338,14 @@ def chat_link_key(platform, value):
     return code.group(1) if code else None
 
 
+def telegram_username(value):
+    """The lowercase Telegram username of @name, name or https://t.me/name (4-32 letters, digits or _, starting
+    with a letter), or None. No URL is fetched."""
+    if not isinstance(value, str) or len(value) > 64: return None
+    name = re.fullmatch(r'(?:https://t\.me/|@)?([A-Za-z][A-Za-z0-9_]{3,31})', value, re.ASCII)
+    return name.group(1).lower() if name else None
+
+
 def _modes(platform):
     return ['document', 'photo', 'video', 'audio', 'voice'] + (['video_note'] if platform == 'telegram' else ['sticker'])
 
@@ -348,6 +366,8 @@ def parameter_format(platform, kind):
         'phone': 'international number of 5-20 digits, the first 1-9, with an optional leading +, no spaces or punctuation',
         'phone_number': 'international number with its country code, such as +49 151 1234-5678 or 0049 (151) 12345678; '
             'spaces, dashes, dots and parentheses are ignored; 7-15 digits, no national trunk 0',
+        'telegram_username': ('Telegram username of a person: @NAME, NAME or https://t.me/NAME (NAME 4-32 letters, '
+            'digits or _, starting with a letter); not a bot, channel or group'),
         'file_mode': 'one of ' + ', '.join(_modes(platform)),
         'chat_link': ('https://t.me/+CODE, https://t.me/joinchat/CODE (CODE 8-64 letters, digits, _ or -), '
             'https://t.me/NAME or @NAME (NAME 5-32 letters, digits or _, starting with a letter); '
@@ -393,6 +413,9 @@ def _problem(platform, descriptor, value, field):
     if kind == 'phone_number':
         if not isinstance(value, str): return fail('type', 'string')
         return None if phone_digits(value)[0] else fail('format', parameter_format(platform, kind))
+    if kind == 'telegram_username':
+        if not isinstance(value, str): return fail('type', 'string')
+        return None if telegram_username(value) else fail('format', parameter_format(platform, kind))
     if kind == 'chat_link':
         if not isinstance(value, str): return fail('type', 'string')
         if chat_link_key(platform, value): return None
@@ -481,6 +504,7 @@ def validate_operation(platform, operation, parameters, *, provider=None):
             if problem: errors.extend(problem)
             else: output[name] = (phone_digits(value)[0] if descriptor['type'] == 'phone_number' else
                 chat_link_key(platform, value) if descriptor['type'] == 'chat_link' else
+                telegram_username(value) if descriptor['type'] == 'telegram_username' else
                 timestamp(value) if descriptor['type'] == 'timestamp' else value)
         # Only a bounded identifier name is returned; the submitted value never is.
         allowed = 'only ' + ', '.join(fields) if fields else 'no parameters'
@@ -491,6 +515,8 @@ def validate_operation(platform, operation, parameters, *, provider=None):
         raise ParameterError(field_error('parameters', 'type', 'JSON object of documented parameters')) from None
     if errors and operation == 'open_chat_by_phone' and any(e['field'] == 'phone' for e in errors):
         raise ParameterError(*errors, code='invalid_phone', hint=phone_digits(parameters.get('phone'))[1])
+    if errors and operation == 'open_chat_by_username' and any(e['field'] == 'username' for e in errors):
+        raise ParameterError(*errors, code='invalid_username')
     if errors: raise ParameterError(*errors)
     if operation == 'update_profile' and not output:
         raise ParameterError(field_error('parameters', 'required', 'at least one of ' + ', '.join(fields)))
