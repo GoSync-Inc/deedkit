@@ -654,3 +654,138 @@ def test_unreadable_observation_rule_is_whatsapp_only(archive):
     ar,s,key,_=archive
     ar.ingest(event(metadata={'message_kind':'text'}))
     assert ar.ingest(event(body='',metadata={'message_kind':'unknown'}))['outcome']=='conflict'
+
+
+BUSINESS_TEXT='Ваш заказ 4821 готов lighthouse'
+DOCUMENT=[{'provider_id':'f9','mime':'application/pdf','bytes':2048,'filename':'report.pdf'}]
+
+
+def business(kind='template',**changes):
+    body=changes.get('body',BUSINESS_TEXT)
+    return wa_event(**{'body':body,'formatting':wire(body),'origin':'reconcile',
+        'metadata':{'message_kind':'text','provider_message_type':kind,'chat_type':'private'},**changes})
+
+
+def message_events(s,mid):
+    with s.pool.connection() as c:
+        return [(r['kind'],r['revision']) for r in c.execute('SELECT kind,revision FROM events WHERE message=%s ORDER BY id',(mid,))]
+
+
+def open_conflicts(s,mid):
+    with s.pool.connection() as c:
+        return [r['reason'] for r in c.execute('''SELECT reason FROM message_conflicts WHERE message=%s
+            AND resolved_at IS NULL ORDER BY observed_at''',(mid,))]
+
+
+# spec: ANYM-560
+@pytest.mark.parametrize('kind',['template','interactive','buttons','list','product','group_invite'])
+@pytest.mark.parametrize('retained_kind',[{'message_kind':'unknown','chat_type':'private'},{'chat_type':'private'}])
+def test_whatsapp_business_text_completes_an_empty_unknown_revision(archive,kind,retained_kind):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    key=s.issue_key('wa-reader',['archive-wa'])
+    mid=ar.ingest(unreadable(origin='live',metadata=retained_kind))['message']
+    assert ar.ingest(business(kind))['outcome']=='edited'
+    # A completion revision: the empty one stays readable, the text one is current and searchable.
+    message,snapshots,metadata,_,_,_,conflicts=archive_state(s,mid)
+    assert message['body']==BUSINESS_TEXT and message['revision']==2 and conflicts==0
+    assert [r['body'] for r in snapshots]==['',BUSINESS_TEXT]
+    assert snapshots[0]['updated_at']==snapshots[1]['updated_at'] and snapshots[1]['formatting']==wire(BUSINESS_TEXT)
+    assert metadata['revision']==2 and metadata['metadata']['provider_message_type']==kind
+    assert message_events(s,mid)==[('message.created',1),('message.edited',2)]
+    assert [i['id'] for i in s.search(key,'заказ')['items']]==[mid]
+    # A replay is idempotent: the same receipt is a duplicate, another copy of the text is unchanged.
+    assert ar.ingest(business(kind))['outcome']=='duplicate'
+    assert ar.ingest(business(kind,origin='backfill'))['outcome']=='unchanged'
+    assert archive_state(s,mid)[1]==snapshots and message_events(s,mid)==[('message.created',1),('message.edited',2)]
+
+
+# spec: ANYM-560
+@pytest.mark.parametrize('retained,candidate,outcome',[
+    # Kinds outside the explicit list, including a plain chat message and a document (criterion 6).
+    ({},{'metadata':{'message_kind':'text','provider_message_type':'chat','chat_type':'private'}},'conflict'),
+    ({},{'metadata':{'message_kind':'document','provider_message_type':'document','chat_type':'private'}},'conflict'),
+    ({},{'metadata':{'message_kind':'text','chat_type':'private'}},'conflict'),
+    ({},{'metadata':{}},'conflict'),
+    # The retained revision is typed, or already has text: never replaced.
+    ({'metadata':{'message_kind':'text','chat_type':'private'}},{},'conflict'),
+    ({'metadata':{'message_kind':'document','chat_type':'private'}},{},'conflict'),
+    ({'body':'Старый текст','formatting':wire('Старый текст')},{},'conflict'),
+    # Another identity, attachment set or provider time.
+    ({},{'sender':'901@lid'},'conflict'),
+    ({},{'direction':'outgoing'},'conflict'),
+    ({},{'sent_at':'2026-10-01T11:59:59+00:00'},'conflict'),
+    ({},{'media':DOCUMENT},'conflict'),
+    ({'media':DOCUMENT},{},'conflict'),
+    ({'updated_at':'2026-10-01T12:01:00+00:00'},{},'stale'),
+    ({},{'updated_at':'2026-10-01T12:01:00+00:00'},'edited'),
+    ({},{'deleted':True,'body':'','formatting':UNREADABLE_FORMAT},'deleted')])
+def test_whatsapp_business_text_completion_keeps_other_shapes(archive,retained,candidate,outcome):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    mid=ar.ingest(unreadable(**{'origin':'live',**retained}))['message']
+    before=archive_state(s,mid)[1]
+    assert ar.ingest(business(**candidate))['outcome']==outcome
+    if outcome in ('conflict','stale'):
+        assert archive_state(s,mid)[1]==before and message_events(s,mid)==[('message.created',1)]
+    if outcome=='conflict':assert len(open_conflicts(s,mid))==1
+
+
+# spec: ANYM-560
+def test_whatsapp_business_text_completion_needs_text_and_a_whatsapp_source(archive):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    # A candidate without text and a retained text are a conflict, the unreadable rule aside (ANYM-613).
+    mid=ar.ingest(wa_event(metadata={'message_kind':'text','provider_message_type':'template','chat_type':'private'}))['message']
+    assert ar.ingest(business(body='',formatting=UNREADABLE_FORMAT,media=DOCUMENT))['outcome']=='conflict'
+    assert archive_state(s,mid)[0]['body']=='Первый текст lighthouse'
+    # Telegram is not in scope.
+    tg=ar.ingest(event(body='',metadata={'message_kind':'unknown'}))['message']
+    assert ar.ingest(event(body=BUSINESS_TEXT,metadata={'message_kind':'text','provider_message_type':'template'}))['outcome']=='conflict'
+    assert archive_state(s,tg)[0]['body']==''
+
+
+# spec: ANYM-560
+def test_whatsapp_business_text_completion_keeps_unrelated_open_conflicts(archive):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    mid=ar.ingest(unreadable(origin='live',updated_at='2026-10-01T12:00:30+00:00'))['message']
+    # One contradiction at the retained version and one older one, both about other fields.
+    assert ar.ingest(unreadable(sender='901@lid',updated_at='2026-10-01T12:00:30+00:00'))['outcome']=='conflict'
+    assert ar.ingest(unreadable(direction='outgoing'))['outcome']=='conflict'
+    before=open_conflicts(s,mid)
+    assert before==['whatsapp_sender_equal_version','whatsapp_direction_older_version']
+    assert ar.ingest(business(updated_at='2026-10-01T12:00:30+00:00'))['outcome']=='edited'
+    # The completion is no later provider evidence: neither conflict is resolved.
+    assert open_conflicts(s,mid)==before and archive_state(s,mid)[0]['revision']==2
+
+
+# spec: ANYM-560
+@pytest.mark.parametrize('order',['whatsmeow_first','older_adapter_first'])
+def test_whatsapp_document_file_name_is_never_stored_as_completed_text(archive,order):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    # whatsmeow: an empty-caption document; the older adapter: its file name as the body (class C-62a).
+    caption=wa_event(body='',formatting=UNREADABLE_FORMAT,media=DOCUMENT,
+        metadata={'message_kind':'document','provider_message_type':'document','chat_type':'private'})
+    named=wa_event(body='report.pdf',formatting=UNREADABLE_FORMAT,media=DOCUMENT,origin='backfill',metadata={'chat_type':'private'})
+    first,second=(caption,named) if order=='whatsmeow_first' else (named,caption)
+    mid=ar.ingest(first)['message']
+    assert ar.ingest(second)['outcome']=='conflict'
+    assert archive_state(s,mid)[0]['body']==first['body'] and message_events(s,mid)==[('message.created',1)]
+    assert open_conflicts(s,mid)==['whatsapp_body_equal_version']
+
+
+# spec: ANYM-560
+def test_whatsapp_body_completion_rule_is_a_pure_function_of_two_observations():
+    from messaging_service.archive import whatsapp_body_completion
+    def snapshot(value):
+        return {**validate(value),'message':'m','provider_chat':'900@lid','chat':'c','revision':1}
+    retained=snapshot(unreadable(origin='live'))
+    assert whatsapp_body_completion(retained,validate(business()))
+    assert not whatsapp_body_completion(retained,validate(business('chat')))
+    assert not whatsapp_body_completion(snapshot(business()),validate(business()))
+    # A retained formatting that states text the revision does not have contradicts the completion.
+    assert not whatsapp_body_completion({**retained,'formatting':wire('report.pdf')},validate(business()))
+    for broken in (None,{},{**retained,'metadata':'unknown'},{**retained,'updated_at':'not a time'}):
+        assert not whatsapp_body_completion(broken,validate(business()))

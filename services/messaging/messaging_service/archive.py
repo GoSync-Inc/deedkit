@@ -13,7 +13,7 @@ from psycopg.types.json import Jsonb
 
 from .envelope import canonical, fingerprint, stable_id, validate
 from .store import serial
-from .incoming_formatting import known as known_formatting, unknown as unknown_formatting
+from .incoming_formatting import known as known_formatting, unknown as unknown_formatting, wire_digest
 
 # The retry-exhausted sweep has no selective index: one Archive (a collector)
 # runs it on its first media claim for an account, then at most once per this.
@@ -58,6 +58,32 @@ def whatsapp_sent_at_jitter(retained,candidate):
         if known_formatting(candidate.get('formatting')) and candidate.get('formatting')!=retained.get('formatting'):return False
         envelope={**{k:v for k,v in retained.items() if k not in REVISION_FIELDS},'chat':retained['provider_chat']}
         return fingerprint({**candidate,'sent_at':retained['sent_at']})==fingerprint(envelope)
+    except (KeyError,TypeError,ValueError,AttributeError):
+        return False
+
+
+# WhatsApp business messages whose visible text the adapters now return (adapters.py whatsapp_message,
+# whatsmeow capture.go). A revision captured before that has an unknown kind and no text (ANYM-530 class C).
+# Never `document`: an empty caption is not missing text (ANYM-560 criterion 6).
+WHATSAPP_TEXT_TYPES=('template','interactive','buttons','list','product','group_invite')
+
+
+def whatsapp_body_completion(retained,candidate):
+    """True when a WhatsApp business message's text completes a retained revision of unknown or no kind
+    with an empty body: same identity, media and provider time, neither deleted. `retained` is the revision
+    snapshot, `candidate` a validated envelope. Pure, so the conflict re-evaluation can call it; evidence it
+    cannot read is no completion, never an exception inside ingest."""
+    try:
+        if candidate['platform']!='whatsapp' or retained['platform']!='whatsapp' or retained['deleted'] or candidate['deleted']:
+            return False
+        if candidate.get('metadata',{}).get('provider_message_type') not in WHATSAPP_TEXT_TYPES:return False
+        if retained.get('metadata',{}).get('message_kind') not in (None,'unknown') or retained['body'] or not candidate['body']:
+            return False
+        if datetime.fromisoformat(candidate['updated_at'])!=datetime.fromisoformat(retained['updated_at']):return False
+        # WhatsApp's known formatting is the digest of its own body: a retained one must state no text.
+        if known_formatting(retained.get('formatting')) and retained['formatting'].get('wire_sha256')!=wire_digest(''):return False
+        envelope={**{k:v for k,v in retained.items() if k not in REVISION_FIELDS},'chat':retained['provider_chat']}
+        return fingerprint({**candidate,'body':''})==fingerprint(envelope)
     except (KeyError,TypeError,ValueError,AttributeError):
         return False
 
@@ -212,12 +238,19 @@ class Archive:
                 and fingerprint({**e,'sent_at':retained_snapshot['sent_at']})==old['content_hash'])
             jitter_version=bool(sent_at_jitter and old['provider_updated_at'] is not None and updated<=old['provider_updated_at']
                 +max(datetime.fromisoformat(e['sent_at'])-old['sent_at'],timedelta(0)))
+            # A WhatsApp business message's text at the retained provider version completes a revision
+            # stored without text: a new revision, the empty one stays readable. It is no later
+            # evidence, so it resolves no open conflict.
+            body_completed=bool(old and retained_snapshot and whatsapp_body_completion(retained_snapshot,e)
+                and not old['body'] and old['provider_updated_at']==updated
+                and fingerprint({**e,'body':''})==old['content_hash'])
             if old:
                 if old['deleted'] and not e['deleted']: outcome='tombstoned'
                 elif sender_completed:outcome='edited'
                 elif sender_device_only:outcome='unchanged'
                 elif unreadable:outcome='unchanged'
                 elif sent_at_jitter:outcome='stale' if old['provider_updated_at'] and updated<old['provider_updated_at'] else 'unchanged'
+                elif body_completed:outcome='edited'
                 elif (old['sent_at']!=datetime.fromisoformat(e['sent_at']) or old['direction']!=e['direction']
                       or old['sender']!=e['sender']): outcome='conflict'
                 elif old['content_hash']==content and not (formatting_changed or formatting_completed): outcome='unchanged'
@@ -314,7 +347,8 @@ class Archive:
                 else:c.execute('''INSERT INTO message_conflicts(receipt_digest,message,observed_revision,
                     candidate_updated_at,observed_at) VALUES(%s,%s,%s,%s,clock_timestamp())''',
                     (receipt,mid,old['revision'],updated))
-            elif outcome in ('edited','deleted','unchanged') and not sender_device_only and not unreadable and not jitter_version:
+            elif (outcome in ('edited','deleted','unchanged') and not sender_device_only and not unreadable and not jitter_version
+                    and not body_completed):
                 # A repeated copy of the retained revision does not resolve an
                 # equal/newer conflicting observation. Only later evidence does.
                 c.execute('''UPDATE message_conflicts mc SET resolved_at=clock_timestamp(),
