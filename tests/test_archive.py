@@ -1162,3 +1162,25 @@ def test_whatsapp_deleted_message_supplies_no_new_identity_fence(archive,removal
     assert fence_rows(s)==[] and other!=mid
     with s.pool.connection() as c:
         assert same_sender(c,'archive-wa',PN,LID)
+
+
+# spec: ANYM-559
+def test_whatsapp_tombstoned_message_replay_supplies_no_new_identity_fence(archive):
+    from messaging_service.whatsapp_collector import WhatsAppState
+    from messaging_service.whatsapp_identity import same_sender
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    state=WhatsAppState(ar,'archive-wa',('fixture',ar.acquire('archive-wa','fixture')))
+    capture=alias_capture(PN,PN)
+    mid=state.apply(capture)['message']
+    # The provider removed the message; the local row is not deleted yet.
+    with s.pool.connection() as c:
+        c.execute('''INSERT INTO provider_tombstones(account,provider_chat,provider_id,observed_at)
+            VALUES('archive-wa','900@lid',%s,'2026-10-01T12:01:00+00:00')''',(capture['envelope']['provider_id'],))
+    # The identical envelope again, with evidence linking its sender to another LID, stores nothing.
+    replay={**capture,'identity_observations':[{**capture['identity_observations'][0],'lid':'310000000002@lid'}]}
+    assert state.apply(replay)['outcome']=='duplicate'
+    with s.pool.connection() as c:
+        assert c.execute("SELECT count(*) AS n FROM whatsapp_identity_observations WHERE lid<>%s",(LID,)).fetchone()['n']==0
+        assert same_sender(c,'archive-wa',PN,LID)
+    assert sender_rows(s,mid)[:2]==(PN,1)
