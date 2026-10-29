@@ -25,7 +25,7 @@ test('all seven consumption and feedback helpers preserve wire arguments',async(
     assert.deepEqual(await client[method](args),{future_field:{verified:false}});
     assert.ok(tools.includes(operation),operation);
   }
-  assert.equal(tools.length,52);
+  assert.equal(tools.length,53);
   assert.deepEqual(seen,Object.values(methods).map(([operation,args])=>[
     `https://archive.example/prefix/v1/${operation}`,args]));
 });

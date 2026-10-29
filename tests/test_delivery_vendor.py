@@ -692,6 +692,10 @@ def test_endpoint_view_reads_one_state_while_a_test_and_a_hint_finish(gate, poli
         def __init__(self, c):
             self.c, self.done = c, False
 
+        def __getattr__(self, name):
+            # transaction() and the rest of the connection (ANYM-520's health read runs in its own savepoint).
+            return getattr(self.c, name)
+
         def execute(self, *args):
             cursor = self.c.execute(*args)
             if not self.done:
