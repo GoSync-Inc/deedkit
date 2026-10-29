@@ -240,6 +240,20 @@ def _spoken_words(text):
     return ' '.join(re.findall(r'\w+',text.casefold()))
 
 
+def _compact_words(text):
+    """Word characters only: the aggregator can add or drop spaces between provider chunks."""
+    return ''.join(re.findall(r'\w+',text.casefold()))
+
+
+def _words_after(text,count):
+    """The text after its first `count` compact word characters, without the punctuation that closed them."""
+    for index,char in enumerate(text):
+        if count<=0:
+            return re.sub(r'^\W+','',text[index:])
+        count-=len(_compact_words(char))
+    return ''
+
+
 # Local hour bands per call language; outside them (night) the model greets neutrally.
 GREETINGS={'id':('Halo',[(4,11,'Selamat pagi'),(11,15,'Selamat siang'),(15,18,'Selamat sore'),(18,24,'Selamat malam')]),
            'ru':('Здравствуйте',[(5,12,'Доброе утро'),(12,18,'Добрый день'),(18,23,'Добрый вечер')]),
@@ -638,12 +652,23 @@ class VoiceService:
             v=self.get_call(identity)
             if v["status"] not in ACTIVE or generation not in (None,v.get('generation',1)):
                 return
-            if role=='user' and v['brief'].get('dialog_engine')=='gemini_live_flows':
-                if not v.get('human_pending_final'):
+            live_user=role=='user' and v['brief'].get('dialog_engine')=='gemini_live_flows'
+            try:before=self._latest_human_turn(v) if live_user else ''
+            except Exception:before=''
+            self._event(v,{"kind":"transcript","role":role,"text":text,"interrupted":interrupted})
+            if live_user:
+                try:_,_,pending,restated=self._turns(v['events'],'user')
+                except Exception:pending,restated=[],False
+                # A distinct older input finalized out of the pending speech leaves new latest words to judge;
+                # a sentence of the same input does not (its rejected evidence stays rejected).
+                if restated and pending and pending[0][2]=='speech' and ''.join(item[1] for item in pending)!=before:
+                    v.pop('closing_rejected_revision',None)
+                # A final restating recorded chunks keeps a granted permission; any other final is new speech.
+                if not v.get('human_pending_final') or (v.get('close_requested') and not restated):
                     v['human_revision']=v.get('human_revision',0)+1
                     self._revoke_closing(v,'new_human_turn')
-                v['human_pending_final']=False
-            self._event(v,{"kind":"transcript","role":role,"text":text,"interrupted":interrupted})
+                # Newer chunks this final does not transcribe still wait for their own final.
+                v['human_pending_final']=bool(pending)
             self._save_call(v)
 
     def transcript_chunk(self,identity,role,text,generation=None):
@@ -659,7 +684,8 @@ class VoiceService:
             v['events']=[]
             metadata_changed=False
             if role=='user' and v['brief'].get('dialog_engine')=='gemini_live_flows':
-                if not v.get('human_pending_final'):
+                # Words after a granted permission are new speech even before their final arrives.
+                if not v.get('human_pending_final') or (v.get('close_requested') and _compact_words(text)):
                     v['human_revision']=v.get('human_revision',0)+1
                     self._revoke_closing(v,'new_human_input')
                     metadata_changed=True
@@ -756,15 +782,54 @@ class VoiceService:
         return self._latest_turn(v['events'],'user')
 
     def _latest_turn(self,events,role):
-        turn='';chunks=[]
-        for event in events:
-            if event.get('role')!=role:
-                continue
-            if event['kind']=='transcript':
-                turn=event['text'];chunks=[]
-            elif event['kind']=='transcript_chunk':
-                chunks.append(event['text'])
-        return ''.join(chunks) if chunks else turn
+        turn,_,pending,_=self._turns(events,role)
+        return ''.join(item[1] for item in pending) if pending else turn
+
+    def _turns(self,events,role):
+        """Latest final, the event index where its input began, the chunks no final has transcribed yet, and
+        whether that final restated pending chunks. A final can arrive after newer speech (Pipecat flushes at a
+        bot turn), so it clears only its own input."""
+        turn='';began=None;pending=[];split=False;restated=False
+        for index,event in enumerate(events):
+            if role=='user' and event['kind']=='audio_activity' and event.get('speaking'):
+                split='speech'
+            elif event['kind'] in {'transcript','transcript_chunk'}:
+                if event.get('role')!=role:
+                    split=split or 'other'
+                elif event['kind']=='transcript_chunk':
+                    # [event index, text, input start: 'speech' (a speech start), 'other' (after other speech),
+                    # 'first' or 'part' (the rest of a partly transcribed input), else False]
+                    pending.append([index,event['text'],split or (not pending and 'first')]);split=False
+                elif role=='user':
+                    turn=event['text'];began,pending,restated=self._transcribed(pending,turn,index)
+                else:
+                    # An interrupted assistant final holds only the played part: unplayed chunks are not speech.
+                    turn=event['text'];began=pending[0][0] if pending else index;pending=[];restated=False
+        return turn,began,pending,restated
+
+    def _transcribed(self,pending,text,index):
+        """Drop the pending input a final transcribes: it starts at an input start and shares the words."""
+        final=_compact_words(text)
+        starts=[k for k,item in enumerate(pending) if item[2]]
+        for k in starts:
+            heard=''.join(_compact_words(item[1]) for item in pending[k:])
+            if heard.startswith(final) or final.startswith(heard):
+                cut=len(final);rest=[]
+                for item in pending[k:]:
+                    size=len(_compact_words(item[1]))
+                    if not rest and size<=cut:
+                        cut-=size;continue
+                    if rest:
+                        rest.append(item)
+                    elif cut or not item[2]:
+                        # Pipecat sends one sentence per final: the rest of this input is not a new input.
+                        rest.append([item[0],_words_after(item[1],cut),'part'])
+                    else:
+                        rest.append(item)
+                    cut=0
+                return pending[k][0],rest,True
+        # Unmatched words: keep the newest input pending, so an old final never clears newer speech.
+        return (pending[0][0] if starts and starts[-1] else index),(pending[starts[-1]:] if starts else []),False
 
     def _closing_intent(self,v,evidence,reason):
         text=' '.join(self._latest_human_turn(v).casefold().split())
@@ -834,16 +899,9 @@ class VoiceService:
                     if e['kind']=='audio_activity' and e.get('speaking')
                     and e.get('human_revision')==revision),None)
         if start is None:
-            finals=[i for i,e in enumerate(events) if e['kind']=='transcript' and e.get('role')=='user']
-            last=finals[-1] if finals else -1
-            pending=[i for i,e in enumerate(events) if i>last and e['kind']=='transcript_chunk' and e.get('role')=='user']
-            if pending:
-                start=pending[0]
-            elif last>=0:
-                previous=finals[-2] if len(finals)>1 else -1
-                chunks=[i for i,e in enumerate(events) if previous<i<last and e['kind']=='transcript_chunk' and e.get('role')=='user']
-                start=chunks[0] if chunks else last
-            else:
+            _,began,pending,_=self._turns(events,'user')
+            start=pending[0][0] if pending else began
+            if start is None:
                 return None
         previous=next((e for e in reversed(events[:start])
                        if e['kind'] in {'transcript','transcript_chunk'} and e.get('role') in {'user','assistant'}),None)
