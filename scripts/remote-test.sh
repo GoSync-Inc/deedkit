@@ -55,6 +55,8 @@ BUSY_CHECK=1        # 1: wait while a Between container runs or the load or memo
 MAX_LOAD=8          # 1-minute load average of the mini's 12 cores
 NICE=10             # the mini run's scheduling priority, below Between's
 STOP_SECONDS=30     # how long a stop waits for TERM (PostgreSQL: QUIT) before it sends KILL
+RUN_SECONDS=7200    # a run's lease: its watchdog sends the runner TERM past it, so a run whose laptop is gone
+                    # (ssh dropped and the stop never arrived) still ends
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 
@@ -126,7 +128,7 @@ read_caps() {
   while IFS='=' read -r key value; do
     value="${value%%#*}"; value="${value//[[:space:]]/}"
     case "$key" in
-      MAX_RUNS|PARALLEL|MIN_FREE_GB|MIN_FREE_MEM_GB|WAIT_SECONDS|POLL_SECONDS|BUSY_CHECK|MAX_LOAD|NICE|STOP_SECONDS)
+      MAX_RUNS|PARALLEL|MIN_FREE_GB|MIN_FREE_MEM_GB|WAIT_SECONDS|POLL_SECONDS|BUSY_CHECK|MAX_LOAD|NICE|STOP_SECONDS|RUN_SECONDS)
         [[ "$value" =~ ^[0-9]+$ ]] || continue ;;
       *) continue ;;
     esac
@@ -331,12 +333,20 @@ stop_recorded() {
 
 # Runs apart from the runner: when the runner dies without its trap (SIGKILL), it stops what this run
 # recorded, appends the run's load line (exit `killed`, CPU unknown: `-`) and removes this run's directory
-# once all of it is gone, and touches nothing of another run; `finish` kills it first otherwise.
+# once all of it is gone, and touches nothing of another run; `finish` kills it last otherwise.
+# It also holds the run's lease: past RUN_SECONDS it sends the runner TERM once (its trap stops the run), and
+# KILL 10 x STOP_SECONDS later (a stop that stalls), so a run the laptop lost (ssh down, no stop) ends.
 start_watchdog() {
   local runner=$$ dir="$1" start
   start="$(date +%s)"
   ( trap '' HUP INT
-    while kill -0 "$runner" 2>/dev/null; do sleep 1; done
+    while kill -0 "$runner" 2>/dev/null; do
+      age=$(($(date +%s) - start))
+      if [ "$age" -ge $((RUN_SECONDS + 10 * STOP_SECONDS)) ]; then kill -KILL "$runner" 2>/dev/null || true
+      elif [ "$age" -ge "$RUN_SECONDS" ] && [ -z "${leased:-}" ]; then leased=1; kill -TERM "$runner" 2>/dev/null || true
+      fi
+      sleep 1
+    done
     stopped=0
     stop_recorded "$dir" && stopped=1
     printf '%s\t%s\t%s\t%s\t-\t-\tkilled\n' "$WORKER" "$SUITE" "$START_ISO" "$(($(date +%s) - start))" \
@@ -444,7 +454,7 @@ reap_jobs() {
 finish() {
   local status=$? pid pg=0 i stopped=1
   trap - EXIT INT TERM HUP
-  if [ -n "$WATCHDOG" ]; then kill -KILL "$WATCHDOG" 2>/dev/null || true; reap_jobs "$WATCHDOG"; fi
+  # The watchdog stays until the end: a stop that stalls (a lookup that hangs, say) still meets the lease's KILL.
   for pid in $CHILDREN; do kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true; done
   # Up to STOP_SECONDS for the groups to end, then KILL: a child that ignores TERM never holds the run open.
   for i in $(seq 1 "$STOP_SECONDS"); do groups_alive $CHILDREN || break; sleep 1; done
@@ -478,6 +488,7 @@ finish() {
   if [ "$(cat "$WORKER_DIR/run.pid" 2>/dev/null)" = "$$ $(started $$)" ]; then rm -f "$WORKER_DIR/run.pid"; fi
   if [ "$stopped" = 1 ]; then rm -rf "$RUN_DIR"; fi
   if [ -n "$HOLDER" ]; then kill "$HOLDER" 2>/dev/null || true; fi
+  if [ -n "$WATCHDOG" ]; then kill -KILL "$WATCHDOG" 2>/dev/null || true; reap_jobs "$WATCHDOG"; fi
   exit "$status"
 }
 

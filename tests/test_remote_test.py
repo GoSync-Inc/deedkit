@@ -11,6 +11,7 @@ from pathlib import Path
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 
@@ -206,14 +207,111 @@ SENT = {'app.py', 'tests/test_app.py', 'services/gateway/tests/test_credential_e
         'scripts/python_shards.py', 'scripts/build.py', '.gitignore', 'new_module.py', 'private_notes.txt'}
 
 
+# Every process a test starts leads a session of its own, and a reaper outside them kills what is left of those
+# sessions once the test ends: passed, failed, timed out, or pytest itself killed (the reaper's stdin then
+# closes). Orphans keep their session, so a run whose test failed mid-run cannot outlive it (10-29: such runs
+# kept their runner, fake PostgreSQL loops and slot holders on the laptop for hours). Zombies are left to their
+# parent. Each session's keeper (enter_session) holds its id while the reaper sweeps, so the id is never another
+# session's then; the keepers go last, and a session whose keeper is already gone is not touched.
+REAPER = r'''import os, signal, subprocess, sys, time
+keepers = dict(map(int, line.split()) for line in sys.stdin)
+
+
+def held(session):
+    try:
+        return os.getsid(keepers[session]) == session
+    except OSError:
+        return False
+
+
+for attempt in range(25):
+    live = {session for session in keepers if held(session)}
+    left = []
+    for row in subprocess.run(['ps', '-A', '-o', 'pid=,uid=,stat='], capture_output=True, text=True).stdout.splitlines():
+        pid, uid, stat = row.split()[:3]
+        if int(uid) != os.getuid() or stat.startswith('Z') or int(pid) in keepers.values():
+            continue
+        try:
+            if os.getsid(int(pid)) in live:
+                left.append(int(pid))
+        except OSError:
+            pass
+    if not left:
+        break
+    for pid in left:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    time.sleep(0.2)
+for session, keeper in keepers.items():
+    if held(session):
+        os.kill(keeper, signal.SIGKILL)
+'''
+STARTED = []
+REAPERS = []
+
+
+@pytest.fixture(autouse=True)
+def reap_sessions():
+    reaper = subprocess.Popen([sys.executable, '-c', REAPER], stdin=subprocess.PIPE, start_new_session=True)
+    REAPERS[:] = [reaper]
+    yield
+    REAPERS.clear()
+    reaper.communicate(timeout=60)
+    while STARTED:
+        process = STARTED.pop()
+        process.wait(timeout=30)
+        for stream in (process.stdout, process.stderr):
+            if stream:
+                stream.close()
+
+
+def enter_session(reaper):
+    """In the child, before it runs anything: its own session with a keeper, a detached member no signal but the
+    reaper's KILL ends, so the session id stays taken (never another session's) until the reaper is done; both
+    registered with the reaper before the command runs (a pytest killed this very moment still leaves the
+    reaper's pipe open until they are)."""
+    os.setsid()
+    middle = os.fork()
+    if middle == 0:
+        keeper = os.fork()
+        if keeper == 0:
+            os.closerange(0, 65536)
+            for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGQUIT):
+                signal.signal(number, signal.SIG_IGN)
+            while True:
+                signal.pause()
+        os.write(reaper, f'{os.getsid(0)} {keeper}\n'.encode())
+        os._exit(0)
+    os.waitpid(middle, 0)
+    os.close(reaper)
+
+
+def start(command, **options):
+    reaper = REAPERS[0].stdin.fileno()
+    process = subprocess.Popen(command, pass_fds=(reaper,), preexec_fn=lambda: enter_session(reaper), **options)
+    STARTED.append(process)
+    return process
+
+
+def run_tracked(command, timeout, **options):
+    process = start(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **options)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        raise
+    return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+
+
 def remote(env, *args, **extra):
-    return subprocess.run(['bash', str(SCRIPT), *map(str, args)], env=dict(env, **extra), capture_output=True,
-                          text=True, timeout=120)
+    return run_tracked(['bash', str(SCRIPT), *map(str, args)], 120, env=dict(env, **extra))
 
 
 def background(env, *args, **extra):
-    return subprocess.Popen(['bash', str(SCRIPT), *map(str, args)], env=dict(env, **extra), stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True)
+    return start(['bash', str(SCRIPT), *map(str, args)], env=dict(env, **extra), stdout=subprocess.PIPE,
+                 stderr=subprocess.PIPE, text=True)
 
 
 def files_under(root):
@@ -636,6 +734,100 @@ def test_an_ssh_drop_mid_run_stops_the_run_on_the_mini_and_does_not_rerun_locall
     assert len(log_lines(home, 'uv run pytest')) == 1
 
 
+# spec: ANYM-639
+def test_a_run_whose_laptop_is_gone_ends_at_its_lease(mini, worktree):
+    home, env = mini
+    write(home / 'shared' / 'caps.conf', CAPS + 'RUN_SECONDS=30\n', 0o644)
+    # The ssh session drops and the stop that follows cannot reach the mini either: only the lease ends the run.
+    process = background(env, worktree, 'root', 'tests/test_app.py', FAKE_UV_SLEEP='300', FAKE_SSH_DROP='1',
+                         FAKE_SSH_FAIL='--here stop')
+    wait_for(lambda: log_lines(home, 'uv run pytest') and log_lines(home, 'ssh-session'), 60)
+    os.kill(pid_of(log_lines(home, 'ssh-session')[0]), signal.SIGTERM)
+    _, stderr = process.communicate(timeout=120)
+    assert process.returncode == 255 and 'failed mid-run' in stderr, stderr
+    assert any(f'--here stop {WORKER}' in line for line in log_lines(home, 'ssh'))
+    wait_for(lambda: log_lines(home, 'postgres stopped by QUIT'))
+    assert not alive(pid_of(log_lines(home, 'uv run pytest')[0]))
+    wait_for(lambda: load_rows(home) and load_rows(home)[-1][-1] == '143')
+
+
+# spec: ANYM-639
+def test_a_stop_that_stalls_after_the_lease_still_ends_the_run(mini, worktree):
+    home, env = mini
+    write(home / 'shared' / 'caps.conf', CAPS + 'RUN_SECONDS=30\n', 0o644)
+    hold = home / 'ps-hold'
+    process = background(env, worktree, 'root', 'tests/test_app.py', FAKE_UV_SLEEP='300', FAKE_PS_HOLD=str(hold))
+    wait_for(lambda: log_lines(home, 'uv run pytest'), 60)
+    suite = pid_of(log_lines(home, 'uv run pytest')[0])
+    wait_for(lambda: recorded(home, suite))
+    runner = runner_pid(home)
+    # From here every start-time lookup hangs, so the stop the lease's TERM starts stalls in its record check.
+    hold.touch()
+    wait_for(lambda: log_lines(home, 'ps-hold'), 60)
+    # STOP_SECONDS=3: the lease's KILL comes 10 x 3 s after its TERM.
+    wait_for(lambda: not alive(runner), 60)
+    hold.unlink()
+    process.communicate(timeout=60)
+    wait_for(lambda: not list((worker_dir(home) / 'runs').iterdir()), 30)
+    assert log_lines(home, 'postgres stopped by QUIT') and not alive(suite)
+    assert load_rows(home)[-1][-1] == 'killed'
+
+
+INNER_TEST = '''from pathlib import Path
+from test_remote_test import background, log_lines, wait_for
+
+
+def test_fails_mid_run(mini, worktree):
+    home, env = mini
+    process = background(env, worktree, 'root', 'tests/test_app.py', FAKE_UV_SLEEP='120', FAKE_SSH_DROP='1')
+    Path(home, 'session').write_text(str(process.pid))
+    wait_for(lambda: log_lines(home, 'uv run pytest') and log_lines(home, 'ssh-session'), 60)
+    assert False, 'the test fails while its run goes on'
+'''
+
+
+# spec: ANYM-639
+def test_a_test_that_fails_mid_run_leaves_no_process_of_its_run_behind(tmp_path):
+    # A pytest session of its own, with this module's fixtures, runs a test that fails while its run (ssh session,
+    # runner, watchdog, suite, PostgreSQL, slot holder) is alive; once that session has ended, none of them may be,
+    # and a process of no test's run is untouched.
+    inner = tmp_path / 'inner'
+    write(inner / 'conftest.py', "pytest_plugins = ['test_remote_test']\n", 0o644)
+    write(inner / 'pytest.ini', '[pytest]\n', 0o644)
+    write(inner / 'test_inner.py', INNER_TEST, 0o644)
+    basetemp = tmp_path / 'base'
+    env = {k: v for k, v in os.environ.items() if not k.startswith('PYTEST_')}
+    env['PYTHONPATH'] = os.pathsep.join(filter(None, [str(ROOT / 'tests'), env.get('PYTHONPATH')]))
+    bystander = start(['sleep', '120'])  # this test's own session: the nested session's reaper never sees it
+    try:
+        result = run_tracked([sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', '--basetemp',
+                              str(basetemp), 'test_inner.py'], 300, cwd=inner, env=env)
+        assert result.returncode == 1 and '1 failed' in result.stdout, result.stdout + result.stderr
+        home = basetemp / 'test_fails_mid_run0'
+        session = int((home / 'session').read_text())
+        pids = [pid_of(line) for prefix in ('uv run pytest', 'ssh-session', 'postgres -D')
+                for line in log_lines(home, prefix)]
+        pids.append(runner_pid(home))
+        assert len(pids) == 4
+
+        def member(pid):
+            try:
+                return os.getsid(pid) == session
+            except OSError:
+                return False
+
+        def gone():
+            listing = subprocess.run(['ps', '-A', '-o', 'pid=,stat=,command='], capture_output=True, text=True).stdout
+            live = [row for row in (line.split(None, 2) for line in listing.splitlines())
+                    if len(row) == 3 and not row[1].startswith('Z')]
+            return not any(int(row[0]) in pids or member(int(row[0])) or str(basetemp) in row[2] for row in live)
+        wait_for(gone, 15)
+        assert bystander.poll() is None
+    finally:
+        bystander.kill()
+        bystander.wait()
+
+
 # spec: ANYM-638
 def test_cleanup_removes_the_workers_copies_and_leftover_databases_only(mini, worktree):
     home, env = mini
@@ -644,7 +836,7 @@ def test_cleanup_removes_the_workers_copies_and_leftover_databases_only(mini, wo
     write(other / 'kept.py', '', 0o644)
     cluster = worker_dir(home) / 'runs' / '1-1' / 'pg1' / 'cluster'
     cluster.mkdir(parents=True)
-    leftover = subprocess.Popen([str(home / 'pgbin' / 'postgres'), '-D', str(cluster)], env=env)
+    leftover = start([str(home / 'pgbin' / 'postgres'), '-D', str(cluster)], env=env)
     wait_for(lambda: (cluster / 'postmaster.pid').exists())
     result = remote(env, '--cleanup', WORKER)
     assert result.returncode == 0, result.stderr
@@ -716,7 +908,7 @@ trap finish EXIT
 exit 0
 '''
     started = time.time()
-    result = subprocess.run(['bash', '-c', driver], capture_output=True, text=True, timeout=30)
+    result = run_tracked(['bash', '-c', driver], 30)
     watchdog = int((tmp_path / 'watchdog.pid').read_text())
     try:
         assert result.returncode == 0, result.stderr
