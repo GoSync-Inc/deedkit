@@ -31,3 +31,21 @@ The checks include recurrence identities/occurrence sets, COUNT/UNTIL/infinite s
 The Gate A decision test with a mock transport and an explicitly chosen test environment label checks only the logic; it is not live evidence. The CI workflow is prepared but was not run on GitHub in this pass. No package/remote repository publication or deployment was done.
 
 Next step: connect an account locally, run discovery, choose an empty test calendar and run the matrix by the [instructions](ICLOUD_PILOT.md). Google/MCP/production backend and real family events are outside this stage.
+
+## Series time move with exceptions: owner live check (ANYM-614)
+
+Not run yet. The synthetic tests (`tests/service/test_schedule_series_exceptions.py`) assume that Google drops an
+exception whose original start the moved rule no longer yields, as its own "All events" edit does; this check is
+what confirms or refutes it. Steps, on the owner's empty test calendar only (Google, write opt-in on, no guests):
+
+1. In Google Calendar, create a weekly series (for example Mondays 17:00-18:00, 8 occurrences, no guests).
+2. By hand in Google Calendar: cancel the second occurrence ("This event" only), and move the fourth to the next day
+   at 19:00 ("This event" only). Optionally retitle the fifth.
+3. Ask the agent for `calendar_schedule` move of the third occurrence to 18:00 with `series: all` and
+   `dry_run: true`. The preview must list the cancelled, moved (and retitled) occurrence under `exceptions` with
+   fates `cancelled`, `kept` (`moves`), and `writes` = 1 + the listed writes.
+4. Confirm that preview (`confirm_token`). The result must be `succeeded`.
+5. Read back in Google Calendar: every plain occurrence at 18:00; the second still cancelled (not shown); the
+   fourth still on the next day at 19:00 and shown once; the fifth at 18:00 with its own title.
+6. Record the owner's words and the date on the card ANYM-614 (criterion 5); a `failed` result with `mismatches`
+   names the occurrence to inspect, and the card stays in Review until the owner's check passes.

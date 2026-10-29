@@ -10,6 +10,7 @@ from datetime import date, datetime, timedelta, timezone
 import hashlib
 import re
 import secrets
+import time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from psycopg.types.json import Jsonb
@@ -46,6 +47,13 @@ INVITE_FIELDS = ("guests", "notify")
 # The closest call after a series edit refused before any write: this occurrence alone, or (a following move from
 # the series' first occurrence) the whole series.
 CLOSEST_SCOPE = {"series_exceptions": "this", "series_starts_here": "all"}
+# A preview of a series time move asks the worker for one read of the series (ANYM-614) and waits this long for it,
+# only while a worker runs; a read not answered by then gives the plan without carried exceptions (the worker
+# refuses one before any write, as before) and `exceptions_read: pending` with the same preview as `next`.
+SERIES_READ_WAIT_S = 4
+SERIES_READ_PENDING_S = 60
+PENDING = object()
+SERIES_READ_REUSE_S = 15
 # What a series scope of a move or cancel does (ANYM-556), as the preview states it.
 SERIES_EFFECTS = {
     ("all", "move"): "Every occurrence of the series moves by this occurrence's shift from its original start, in "
@@ -60,6 +68,24 @@ SERIES_EFFECTS = {
     ("following", "cancel"): "The series ends just before this occurrence's original start; earlier occurrences, "
                              "also those changed on their own, stay as they are. If an occurrence from here on was "
                              "changed on its own, nothing is written: series_exceptions.",
+    # A time move previewed with its exceptions (ANYM-614): `exceptions` lists each one in range and its fate.
+    ("all", "move", "exceptions"): "Every occurrence of the series moves by this occurrence's shift from its "
+                                   "original start, in the wall-clock time of the series' own timezone. Each "
+                                   "occurrence changed or cancelled on its own (listed in exceptions) is then "
+                                   "written once more so it keeps its change; if the series or any of them changed "
+                                   "since this preview, nothing is written: preview_stale.",
+    ("following", "move", "exceptions"): "First a new series from this occurrence on is created at the new time, "
+                                         "then the original series ends just before this occurrence's original "
+                                         "start; earlier occurrences stay as they are. Each occurrence from here on "
+                                         "changed or cancelled on its own (listed in exceptions) is then written in "
+                                         "the new series so it keeps its change; if the series or any of them "
+                                         "changed since this preview, nothing is written: preview_stale.",
+}
+# What happens to one exception of a time move (ANYM-614), as the preview's exceptions list states it.
+EXCEPTION_EFFECTS = {
+    "cancelled": "Stays cancelled: the occurrence at its original start plus the shift is cancelled again.",
+    "moves": "Moves with the series and keeps its own title, place, description and other own fields.",
+    "kept": "Keeps its own start and end (and its own fields); follow_up moves it back into the series.",
 }
 
 
@@ -429,15 +455,85 @@ class Scheduler:
 
     # --- previews ----------------------------------------------------------------------------------------
 
-    def preview(self, key, p, request, family):
-        """Resolve `request` into a fresh plan with a token. Returns the plan row and the token."""
+    def series_read(self, p, action, cal, request):
+        """The worker's read of the series a time move of `all` or `following` edits on Google (ANYM-614), asked for
+        and waited on here, outside every transaction: the read, PENDING when no worker answered it in time, or None
+        for any other request and before schema 7 and its grants (the plan then carries no exceptions, and the
+        worker refuses one before any write)."""
+        if action.get("series") not in ("all", "following") or action["action"] != "update" or (
+                cal["provider"] != "google"):
+            return None
+        if not self.store.one(
+            "SELECT coalesce(has_table_privilege(to_regclass('series_reads'),'SELECT') "
+            "AND has_table_privilege(to_regclass('series_reads'),'INSERT'),false) AS ok"
+        )["ok"]:
+            return None
+        found = self.store.one(
+            "SELECT r.target FROM occurrences o JOIN resources r ON r.ref=o.resource_ref "
+            "WHERE o.ref=%s AND o.calendar_ref=%s", (action["event_ref"], cal["calendar_ref"]))
+        if not found:
+            return None
+        row = self.store.one(
+            "SELECT id FROM series_reads WHERE principal_id=%s AND calendar_ref=%s AND target=%s AND ("
+            "(state IN ('prepared','sending') AND created_at>now()-make_interval(secs=>%s)) OR "
+            "(state IN ('verified','failed') AND created_at>now()-make_interval(secs=>%s))) "
+            "ORDER BY created_at DESC LIMIT 1",
+            (p["id"], cal["calendar_ref"], found["target"], SERIES_READ_PENDING_S, SERIES_READ_REUSE_S))
+        read_id = row["id"] if row else ref("read")
+        if not row:
+            self.store.query("INSERT INTO series_reads(id,principal_id,calendar_ref,target) VALUES (%s,%s,%s,%s)",
+                             (read_id, p["id"], cal["calendar_ref"], found["target"]))
+        # The worker's session lock (worker.py run): without a running worker nobody answers, so nothing waits.
+        running = self.store.one(
+            "SELECT EXISTS(SELECT 1 FROM pg_locks l, (SELECT hashtextextended(%s,0) AS k) h "
+            "WHERE l.locktype='advisory' AND l.granted AND l.objsubid=1 "
+            "AND l.classid=((h.k>>32)&4294967295)::oid AND l.objid=(h.k&4294967295)::oid) AS ok",
+            (self.store.lock_key("worker", "singleton"),))["ok"]
+        deadline = time.monotonic() + (SERIES_READ_WAIT_S if running else 0)
+        while True:
+            row = self.store.one("SELECT state,result,error FROM series_reads WHERE id=%s", (read_id,))
+            if row["state"] == "verified":
+                return row["result"]
+            if row["state"] == "failed":
+                raise CalendarError(row["error"] or "provider_unavailable")
+            if time.monotonic() >= deadline:
+                return PENDING
+            time.sleep(0.25)
+
+    def preview(self, key, p, request, family, read=None, ask=False):
+        """Resolve `request` into a fresh plan with a token. Returns the plan row and the token. A dry run (`ask`)
+        of a series time move reads the series first; a confirm re-previews with the plan's own read."""
         action, cal = self.action(key, p, request, family)
-        plan = self.service.plan(key, [action], invitations=True, series=True)
+        pending = False
+        if ask and read is None:
+            read = self.series_read(p, action, cal, request)
+            pending, read = read is PENDING, (None if read is PENDING else read)
+        try:
+            plan = self.service.plan(key, [action], invitations=True, series=True, read=read)
+        except CalendarError as e:
+            if e.code != "series_exceptions_too_many":
+                raise
+            # A following move from a later occurrence carries no more than the limit.
+            later = e.details.get("later")
+            e.details = {k: v for k, v in e.details.items() if k in ("count", "limit")}
+            if later:
+                zone, at = family["zone"], later["original_start"]
+                day = at if "T" not in at else instant(at).astimezone(zone).date().isoformat()
+                e.details["next"] = {"tool": TOOL_NAME, "arguments": {
+                    "action": "move", "event": {"date": day},
+                    "start": later["start"] if "T" not in later["start"] else (
+                        instant(later["start"]).astimezone(zone).isoformat()),
+                    **{k: request[k] for k in ("duration",) if k in request}, "series": "following",
+                    "dry_run": True}}
+            raise
         token = secrets.token_urlsafe(24)
         row = self.store.one(
             "UPDATE plans SET token_hash=%s,tool=%s,request=%s WHERE id=%s AND principal_id=%s RETURNING *",
             (token_hash(token), TOOL, Jsonb(request), plan["plan_id"], p["id"]),
         )
+        if pending:
+            plan["exceptions_read"] = {"state": "pending", "next": {
+                "tool": TOOL_NAME, "arguments": {**request, "dry_run": True}}}
         return row, token, dict(plan, calendar=cal)
 
     @staticmethod
@@ -479,18 +575,47 @@ class Scheduler:
                                               "nobody changed it since.")
         elif scope:
             original = step["occurrence"]["original_start"]
+            carried = step["series"].get("carried")
             shown.update(series=scope, effect=SERIES_EFFECTS[(scope, shown["action"])],
                          original_start=original if "T" not in original else (
                              instant(original).astimezone(zone).isoformat()),
                          overlap_scope="this occurrence only")
-            if len(steps) > 1:
-                shown["steps"] = ["create_replacement", "end_original"]
+            names = ["create_replacement", "end_original"] if steps[0]["action"] == "create" else []
+            if carried is not None:
+                shown.update(effect=SERIES_EFFECTS[(scope, "move", "exceptions")], writes=len(steps),
+                             exceptions=[Scheduler.exception(c, event, zone) for c in carried])
+                names = (names or ["move_series"]) + ["carry_exception"] * (len(steps) - max(1, len(names)))
+            if names:
+                shown["steps"] = names
+        if plan.get("exceptions_read"):
+            # The read of the series was not answered in time: this plan carries no exception (an exception in
+            # range refuses it before any write); the repeat previews with the read.
+            shown["exceptions_read"] = plan["exceptions_read"]
         shown["overlap_check"] = plan["overlap_check"]
         shown["expires_at"] = plan["expires_at"]
         return shown
 
-    def previewed(self, key, p, request, family):
-        row, token, plan = self.preview(key, p, request, family)
+    @staticmethod
+    def exception(carried, event, zone):
+        """One exception of a time move as its preview lists it (ANYM-614): where the series had it, what happens
+        to it, and for one that keeps its own time the follow-up that would move it back into the series."""
+        def local(value):
+            return value if "T" not in value else instant(value).astimezone(zone).isoformat()
+
+        fate = carried["fate"]
+        shown = {"original_start": local(carried["original_start"]), "fate": fate, "effect": EXCEPTION_EFFECTS[fate],
+                 "series_start": local(carried["start"]), "write": carried["write"]}
+        if fate == "kept":
+            own = {k: local(v) for k, v in carried["own"].items()}
+            arguments = {"action": "move", "event": {"date": own["start"][:10]}, "start": shown["series_start"]}
+            if not event.get("all_day"):
+                arguments["duration"] = int((instant(event["end"]) - instant(event["start"])).total_seconds() // 60)
+            shown.update(own=own, follow_up={"tool": TOOL_NAME, "arguments": {
+                **arguments, "series": "this", "dry_run": True}})
+        return shown
+
+    def previewed(self, key, p, request, family, read=None, ask=False):
+        row, token, plan = self.preview(key, p, request, family, read, ask)
         plan["event_ref"] = request.get("event")
         return row, token, {
             "state": "previewed", "preview": self.view(plan, family), "confirm_token": token,
@@ -516,15 +641,18 @@ class Scheduler:
         steps = plan["payload"]["steps"]
         step = self.primary(steps)
         series = step.get("series")
-        replaced = bool(series) and len(steps) > 1
+        replaced = bool(series) and (steps[0].get("series") or {}).get("role") == "replacement"
+        # Carried exceptions that did not end as previewed (ANYM-614): the series and the other exceptions were
+        # written; a definite failure naming each such occurrence.
+        mismatch = op["state"] == "partial" and op["error"] == "series_exception_mismatch"
         # A following move whose replacement exists and whose truncation was definitely refused (ANYM-556): a
         # definite failure with both series named, never an operation to reconcile.
-        partial = replaced and op["state"] == "partial"
-        state = "failed" if partial else STATES[op["state"]]
+        partial = replaced and op["state"] == "partial" and not mismatch
+        state = "failed" if partial or mismatch else STATES[op["state"]]
         result = {"state": state, "detail_state": op["state"], "operation": {"module": "calendar", "id": op["id"]}}
         if not op["request_id"].startswith(TOKEN_KEY):
             result["request_id"] = op["request_id"]
-        if state == "succeeded" and series:
+        if (state == "succeeded" or mismatch) and series:
             # An occurrence's event_ref names its original start, which an all move changes: the series is the handle.
             result["series_ref"] = (step.get("occurrence") or series)["series_ref"]
             if replaced:
@@ -547,6 +675,14 @@ class Scheduler:
             result["next_action"] = "reconcile; do not create again"
         if partial:
             result.update(self.partial(step, steps, family))
+        elif mismatch:
+            result.update(self.mismatches(op["id"], steps, family))
+        elif state == "failed" and op["error"] == "preview_stale":
+            request = plan["request"] or {}
+            # Nothing was written: the series or one of its exceptions changed since the preview.
+            result["next"] = {"tool": TOOL_NAME, "arguments": {
+                **{k: request[k] for k in ("action", "event", "start", "duration", "series") if k in request},
+                "dry_run": True}}
         elif state == "failed" and op["error"] in CLOSEST_SCOPE:
             request = plan["request"] or {}
             # Nothing was written; the same change for this occurrence alone (or the whole series) is the closest.
@@ -584,6 +720,28 @@ class Scheduler:
             "next_action": "inspect both series; the original was not ended, so occurrences from here on show twice; "
                            "undo previews removing the replacement",
         }
+
+    def mismatches(self, operation_id, steps, family):
+        """The carried exceptions whose write did not end as previewed (ANYM-614), each with a read-only look at its
+        day; nothing is retried or undone on its own."""
+        rows = {r["ordinal"]: r for r in self.store.query(
+            "SELECT ordinal,state,error FROM operation_steps WHERE operation_id=%s", (operation_id,))}
+        zone, calendar, found = family["zone"], steps[0]["calendar_ref"], []
+        for s in steps:
+            series = s.get("series") or {}
+            if series.get("role") != "exception" or rows[s["ordinal"]]["state"] not in ("conflict", "failed"):
+                continue
+            at = series["exception"]["original_start"]
+            start = (datetime.combine(date.fromisoformat(at), datetime.min.time(), zone) if "T" not in at
+                     else instant(at).astimezone(zone))
+            found.append({"original_start": start.isoformat() if "T" in at else at,
+                          "fate": series["exception"]["fate"], "error": rows[s["ordinal"]]["error"],
+                          "inspect": {"tool": "calendar_agenda", "arguments": {
+                              "calendar_refs": [calendar], "start": (start - timedelta(days=1)).isoformat(),
+                              "end": (start + timedelta(days=2)).isoformat()}}})
+        return {"partial": True, "mismatches": found, "next": found[0]["inspect"] if found else None,
+                "next_action": "inspect each listed occurrence; the series and the other exceptions were written "
+                               "as previewed"}
 
     def replay(self, operation_id, family):
         op = self.store.one("SELECT * FROM operations WHERE id=%s", (operation_id,))
@@ -653,7 +811,7 @@ class Scheduler:
         if arguments.get("dry_run"):
             if "confirm_token" in arguments:
                 raise missing("confirm_token", "unknown_field")
-            return self.previewed(key, p, request, family)[2], None
+            return self.previewed(key, p, request, family, ask=True)[2], None
         token = arguments.get("confirm_token")
         if token is not None:
             return self.consume(key, p, token, request, request_id, family, tool)
@@ -712,7 +870,7 @@ class Scheduler:
                 again = dict(plan["request"], calendar=step["calendar_ref"]) if "calendar" in plan["request"] else (
                     plan["request"])
                 try:
-                    fresh, _, view = self.previewed(key, p, again, family)
+                    fresh, _, view = self.previewed(key, p, again, family, read=plan["payload"].get("series_read"))
                     changed = {k for k, v in self.fingerprint(fresh).items() if v != self.fingerprint(plan)[k]}
                     # A calendar named by its label that now has another label is a changed calendar too.
                     named = plan["request"].get("calendar")

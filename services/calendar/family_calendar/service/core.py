@@ -123,8 +123,30 @@ INVITE_SCOPE = "invitations-v1"
 # refuses the plan (scope_changed) instead of writing only the one occurrence.
 SERIES_SCOPES = ("this", "following", "all")
 SERIES_SCOPE = "series-v1"
+# A series time move that carries its exceptions (ANYM-614): a worker that predates the per-exception steps refuses
+# the plan (scope_changed) instead of moving the series without them.
+CARRIED_SCOPE = "series-exceptions-v1"
 LIMITS = [("title", 256), ("location", 512), ("description", 4000)]
 DATE_VALUE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def carries(step):
+    """A series step that checks the preview's read of the series, or one write of a carried exception (ANYM-614)."""
+    series = step.get("series") or {}
+    return "snapshot" in series or series.get("role") == "exception"
+
+
+def carried_step(step):
+    return (step.get("series") or {}).get("role") == "exception"
+
+
+def shown_time(value, zone):
+    """A series wall time as an aware ISO time in the series zone; a date stays a date."""
+    from . import series as recurrence
+
+    if zone is None:
+        return value.isoformat()
+    return recurrence.placed(value, zone).isoformat()
 
 
 def invalid(path, *problems):
@@ -251,7 +273,7 @@ class FamilyService:
                 raise CalendarError("write_not_enabled")
         return p, c
 
-    def _scope_hash(self, p, calendars, invitations=False, series=False):
+    def _scope_hash(self, p, calendars, invitations=False, series=False, carried=False):
         return digest(
             [
                 p["id"],
@@ -266,6 +288,7 @@ class FamilyService:
             ]
             + ([INVITE_SCOPE] if invitations else [])
             + ([SERIES_SCOPE] if series else [])
+            + ([CARRIED_SCOPE] if carried else [])
         )
 
     def invitations_enabled(self, calendar_ref):
@@ -703,7 +726,7 @@ class FamilyService:
             raise CalendarError("invalid_arguments", [{"field": "people", "reason": "required"}])
         return found
 
-    def plan(self, key, actions, carry_projections=False, invitations=False, series=False):
+    def plan(self, key, actions, carry_projections=False, invitations=False, series=False, read=None):
         p = self.principal(key)
         if not isinstance(actions, list) or not 1 <= len(actions) <= 8:
             raise CalendarError("invalid_actions")
@@ -860,7 +883,7 @@ class FamilyService:
                 if scope not in SERIES_SCOPES or (scope != "this" and "occurrence" not in step):
                     raise CalendarError("invalid_action")
                 if scope != "this":
-                    steps = self._series_steps(key, cal, step, scope, len(prepared))
+                    steps = self._series_steps(key, cal, step, scope, len(prepared), read)
                     # One calendar entry per step, as validate_plan recomputes the scope hash.
                     calendars.extend([cal] * (len(steps) - 1))
                     prepared.extend(steps)
@@ -906,17 +929,21 @@ class FamilyService:
             )
         if unprojected and not prepared:
             raise CalendarError("nothing_to_unproject", details={"projections_skipped": skipped})
-        if len(prepared) > 16:
+        # The writes of exceptions a series move carries (at most 50, ANYM-614) come on top of the plan's 16 steps.
+        if len(prepared) - sum(carried_step(s) for s in prepared) > 16:
             raise CalendarError("too_many_steps")
         overlap_check = self._overlap_check(key, p, prepared, selected)
         plan_id = ref("plan")
         expires = datetime.now(timezone.utc) + timedelta(minutes=10)
         payload = {"steps": prepared, **({"sources": sources} if sources else {})}
+        if read is not None and any(carries(s) for s in prepared):
+            # The series read the preview listed the exceptions from: a re-preview at confirm reuses it.
+            payload["series_read"] = read
         self.store.query(
             "INSERT INTO plans(id,principal_id,payload,scope_hash,expires_at) VALUES (%s,%s,%s,%s,%s)",
             (plan_id, p["id"], Jsonb(payload),
              self._scope_hash(p, calendars + source_calendars, any("invite" in s for s in prepared),
-                              any("series" in s for s in prepared)), expires),
+                              any("series" in s for s in prepared), any(carries(s) for s in prepared)), expires),
         )
         return {
             "plan_id": plan_id,
@@ -1364,15 +1391,21 @@ class FamilyService:
                     series={"scope": "all", "role": "undo", "series_ref": handle,
                             "planned_at": datetime.now(timezone.utc).isoformat()})
 
-    def _series_steps(self, key, cal, step, scope, ordinal):
+    def _series_steps(self, key, cal, step, scope, ordinal, read=None):
         """The steps of a series edit (ANYM-556): `all` is one write to the master; `following` ends the master just
         before the occurrence, and a following move first creates the replacement series under a stable,
-        client-generated ID (step 0), then truncates (step 1), so a failed truncation never loses an occurrence."""
+        client-generated ID (step 0), then truncates (step 1), so a failed truncation never loses an occurrence.
+        A time move previewed with a read of the series (ANYM-614) carries its exceptions: after those steps, one
+        write per exception to its instance in the moved series, and every series step first checks that the
+        series and its exceptions in range are still as read."""
         if cal["provider"] != "google":
             raise CalendarError("capability_unsupported")
         planned = datetime.now(timezone.utc).isoformat()
+        carry = self._carry(cal, step, scope, read) if read is not None and step["action"] == "update" else None
+        extra = {} if carry is None else {"snapshot": carry["snapshot"]}
         if scope == "all" or step["action"] == "delete":
-            return [dict(step, ordinal=ordinal, series={"scope": scope, "planned_at": planned})]
+            steps = [dict(step, ordinal=ordinal, series={"scope": scope, "planned_at": planned, **extra})]
+            return self._carried_steps(key, cal, steps, carry, planned)
         self.authorize(key, cal["ref"], "event:create")
         replacement = {
             "action": "create", "calendar_ref": step["calendar_ref"], "provider": step["provider"],
@@ -1384,7 +1417,74 @@ class FamilyService:
         truncation = {k: v for k, v in step.items() if k not in ("event", "span")}
         truncation.update(ordinal=ordinal + 1, series={"scope": "following", "role": "truncation",
                                                        "replacement_step": ordinal, "planned_at": planned})
-        return [replacement, truncation]
+        replacement["series"].update(extra)
+        truncation["series"].update(extra)
+        return self._carried_steps(key, cal, [replacement, truncation], carry, planned)
+
+    def _carry(self, cal, step, scope, read):
+        """The exceptions a series time move carries, from the preview's read of the series (ANYM-614); None when
+        the move's shape is one the carried writes do not express (the worker then refuses it before any write as
+        it always did: series_exceptions, unsupported_recurrence, capability_unverified)."""
+        from . import series as recurrence
+
+        if (read.get("instance") or {}).get("id") != step["target_id"]:
+            return None
+        if read["instance"].get("etag") != step["expected_etag"]:
+            # The cache and the read disagree on the occurrence: a refresh before the preview settles which is right.
+            raise CalendarError("version_conflict")
+        master, occurrence, event = read["master"], step["occurrence"], step["event"]
+        try:
+            zone = recurrence.zone_of(master)
+            if scope == "all":
+                recurrence.edit_all(master, occurrence, event, zone)
+            else:
+                recurrence.replacement(master, occurrence, event, zone, "preview")
+            items = recurrence.carried(master, read["exceptions"], occurrence, event, scope, zone)
+        except CalendarError:
+            return None
+        if len(items) > recurrence.MAX_CARRIED:
+            parts, _ = recurrence.rule_of(master)
+            delta, _ = recurrence.shift(occurrence, event, zone)
+            later = recurrence.later_start(parts, recurrence.master_start(master, zone),
+                                           [i["original"] for i in items], recurrence.MAX_CARRIED)
+            raise CalendarError("series_exceptions_too_many", details={
+                "count": len(items), "limit": recurrence.MAX_CARRIED,
+                **({"later": {"original_start": shown_time(later, zone), "start": shown_time(later + delta, zone)}}
+                   if later is not None else {})})
+        snapshot = {"master_etag": master["etag"], "exceptions": {i["id"]: i["etag"] for i in items}}
+        return {"zone": zone, "items": items, "master_id": master["id"], "snapshot": snapshot}
+
+    def _carried_steps(self, key, cal, steps, carry, planned):
+        """The series steps followed by one write per carried exception that needs one; the primary step (the
+        master's write, or a following move's truncation) keeps the list the preview shows."""
+        from . import series as recurrence
+        from .providers import source_ref
+
+        if carry is None:
+            return steps
+        zone, primary = carry["zone"], steps[-1]
+        # The moved series: the replacement a following move creates, or the master an all move patches.
+        series_id = steps[0]["target_id"] if steps[0]["action"] == "create" else carry["master_id"]
+        shown, out = [], list(steps)
+        for item in carry["items"]:
+            target = recurrence.instance_id(series_id, item["start"], zone)
+            write = item["fate"] == "cancelled" or bool(item["desired"])
+            shown.append({"fate": item["fate"], "original_start": shown_time(item["original"], zone),
+                          "start": shown_time(item["start"], zone), "write": write,
+                          **({"own": item["own"]} if item["fate"] == "kept" else {})})
+            if not write:
+                continue
+            action = "delete" if item["fate"] == "cancelled" else "update"
+            self.authorize(key, cal["ref"], "event:" + action)
+            out.append({"action": action, "calendar_ref": cal["ref"], "provider": cal["provider"],
+                        "ordinal": steps[0]["ordinal"] + len(out), "target_id": target,
+                        "resource_ref": source_ref("res", cal["ref"], target),
+                        "series": {"scope": primary["series"]["scope"], "role": "exception", "planned_at": planned,
+                                   "series_id": series_id, "desired": item["desired"],
+                                   "exception": {"id": item["id"], "fate": item["fate"],
+                                                 "original_start": shown[-1]["original_start"]}}})
+        primary["series"]["carried"] = shown
+        return out
 
     def _overlap_check(self, key, principal, prepared, selected):
         """Advisory cached evidence within current read grants, never permission
@@ -1513,8 +1613,9 @@ class FamilyService:
         shown = {k: v for k, v in step.items()
                  if k not in ("target_id", "resource_ref", "expected_etag", "span", "projection", "series")}
         if "series" in step:
-            # The scope and role only: the instance's provider ID and etag stay internal.
-            shown["series"] = {k: step["series"][k] for k in ("scope", "role") if k in step["series"]}
+            # The scope and role only, and the exceptions a time move carries as its preview lists them: the
+            # instance's provider ID and etag stay internal.
+            shown["series"] = {k: step["series"][k] for k in ("scope", "role", "carried") if k in step["series"]}
         return {**shown, "diff": diff}
 
     def validate_plan(self, plan, principal_id):
@@ -1539,8 +1640,9 @@ class FamilyService:
                 raise CalendarError("scope_changed")
             calendars.append(cal)
         invites = [s for s in plan["payload"]["steps"] if "invite" in s]
-        if self._scope_hash(p, calendars, bool(invites),
-                            any("series" in s for s in plan["payload"]["steps"])) != plan["scope_hash"]:
+        steps = plan["payload"]["steps"]
+        if self._scope_hash(p, calendars, bool(invites), any("series" in s for s in steps),
+                            any(carries(s) for s in steps)) != plan["scope_hash"]:
             raise CalendarError("scope_changed")
         if any(not self.invitations_enabled(s["calendar_ref"]) for s in invites):
             raise CalendarError("invitations_not_enabled")
@@ -1604,7 +1706,14 @@ class FamilyService:
             else None,
         }
         first = plan["payload"]["steps"][0]
-        if op["state"] == "partial" and (first.get("series") or {}).get("role") == "replacement":
+        if op["state"] == "partial" and op["error"] == "series_exception_mismatch":
+            # Carried exceptions that did not end as previewed (ANYM-614): a definite failure naming each one.
+            from .schedule import Scheduler
+
+            scheduler = Scheduler(self)
+            result.update(scheduler.mismatches(operation_id, plan["payload"]["steps"], scheduler.family(key, p)),
+                          state="failed", detail_state="partial")
+        elif op["state"] == "partial" and (first.get("series") or {}).get("role") == "replacement":
             # A following move whose truncation was definitely refused (ANYM-556): the same definite failure, both
             # series and the undo preview calendar_schedule gives, never a reconcile.
             from .schedule import Scheduler

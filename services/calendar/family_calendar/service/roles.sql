@@ -51,3 +51,12 @@ DO $$ BEGIN
   GRANT SELECT ON fcs.member_people TO fcs_gateway;
  END IF;
 END $$;
+-- Migration 7 (series reads, ANYM-614): the gateway asks for a read of a series and reads the answer; the worker
+-- takes the request and writes the answer. Skipped before migration 7.
+DO $$ BEGIN
+ IF to_regclass('fcs.series_reads') IS NOT NULL THEN
+  GRANT SELECT ON fcs.series_reads TO fcs_gateway, fcs_worker;
+  GRANT INSERT ON fcs.series_reads TO fcs_gateway;
+  GRANT UPDATE (state, result, error) ON fcs.series_reads TO fcs_worker;
+ END IF;
+END $$;

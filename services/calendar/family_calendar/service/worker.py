@@ -43,9 +43,13 @@ class Worker:
                 (operation_id,),
             )
             completed = 0
+            # Carried exceptions of a series move (ANYM-614) that did not end as previewed: each is reported, and the
+            # other exceptions are still written, so the move never ends as a silent partial.
+            mismatched = False
             for step in plan["payload"]["steps"]:
                 ordinal = step["ordinal"]
                 args = (operation_id, ordinal)
+                carried = (step.get("series") or {}).get("role") == "exception"
                 # A linked create reserves its link; a linked delete (unproject) closes an existing one.
                 claim = step.get("link") and step["action"] == "create"
                 # A re-create of a drive gone outside DeedKit takes over its existing link (ANYM-436).
@@ -55,6 +59,9 @@ class Worker:
                 )
                 if row["state"] == "verified":
                     completed += 1
+                    continue
+                if carried and row["state"] in ("conflict", "failed"):
+                    mismatched = True
                     continue
                 try:
                     self.service.validate_plan(plan, op["principal_id"])
@@ -237,6 +244,9 @@ class Worker:
                                 "WHERE target_calendar_ref=%s AND target_id=%s AND state='repairing'",
                                 (step["calendar_ref"], step["target_id"]),
                             )
+                    if carried and not ambiguous:
+                        mismatched = True
+                        continue
                     self._finish(operation_id, state if ambiguous or not completed else "partial", e.code)
                     return
                 except Exception:
@@ -258,6 +268,9 @@ class Worker:
                     )
                     self._finish(operation_id, "unknown", "unknown_result")
                     return
+            if mismatched:
+                self._finish(operation_id, "partial", "series_exception_mismatch")
+                return
             self._finish(operation_id, "verified", None)
 
     @staticmethod
@@ -422,8 +435,45 @@ class Worker:
         self.store.query("UPDATE sync_jobs SET state=%s WHERE id=%s", (state, job["id"]))
         return True
 
+    def _series_reads_ready(self):
+        return self.store.one(
+            "SELECT coalesce(has_table_privilege(to_regclass('series_reads'),'SELECT') "
+            "AND has_table_privilege(to_regclass('series_reads'),'UPDATE'),false) AS ok"
+        )["ok"]
+
+    async def read_series_one(self):
+        """Answer one preview's request for a read of a series (ANYM-614): read-only, and only what the asking
+        principal may edit in that calendar. False when there is none (or before schema 7 and its grants)."""
+        if not self._series_reads_ready():
+            return False
+        with self.store.transaction() as conn:
+            job = conn.execute(
+                "SELECT * FROM series_reads WHERE state='prepared' ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1"
+            ).fetchone()
+            if not job:
+                return False
+            conn.execute("UPDATE series_reads SET state='sending' WHERE id=%s", (job["id"],))
+        result, error = None, None
+        try:
+            _, cal = self.service.authorize(None, job["calendar_ref"], "event:update", principal_id=job["principal_id"])
+            result = await self.providers.read_series(cal, job["target"])
+        except CalendarError as e:
+            error = e.code
+        except Exception:
+            error = "provider_unavailable"
+        self.store.query(
+            "UPDATE series_reads SET state=%s,result=%s,error=%s WHERE id=%s",
+            ("failed" if error else "verified", Jsonb(result) if result is not None else None, error, job["id"]),
+        )
+        return True
+
     async def tick(self):
         await self.sync_one()
+        try:
+            await self.read_series_one()
+        except Exception:
+            # A series read is a preview's convenience: its failure never stops syncs or operations.
+            pass
         op = self.store.one(
             "SELECT id FROM operations WHERE state='queued' OR (state='running' AND lease_until<now()) ORDER BY created_at LIMIT 1"
         )
@@ -452,6 +502,10 @@ class Worker:
                     "SELECT DISTINCT ON (calendar_ref) calendar_ref,start_at,end_at,'blocked','sync_interrupted' "
                     "FROM interrupted ON CONFLICT(calendar_ref) DO UPDATE SET status='blocked',error=excluded.error"
                 )
+                if self._series_reads_ready():
+                    # A series read left 'sending' failed with the process; its preview asks again.
+                    self.store.query("UPDATE series_reads SET state='failed',error='read_interrupted' "
+                                     "WHERE state='sending'")
                 while True:
                     # Loss of the dedicated lease connection stops the process.
                     lease.execute("SELECT 1")

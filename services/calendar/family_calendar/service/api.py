@@ -299,7 +299,7 @@ HINTS = {
 # Errors whose fixed-shape details the agent needs to choose its next action.
 PUBLIC_DETAILS = {"nothing_to_project", "nothing_to_unproject", "selection_required", "preview_stale",
                   "invalid_arguments", "event_not_found", "capability_unsupported", "invitations_not_enabled",
-                  "not_found"}
+                  "not_found", "series_exceptions_too_many"}
 
 
 def failure(code, field_errors=None, details=None):
