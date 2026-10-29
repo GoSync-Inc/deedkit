@@ -565,7 +565,7 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
    `migrate` (each attempt), all of these hold; otherwise take a fresh one:
    - it is the producer's `last_success_id` and its snapshot time (`last_snapshot_at`, never the
      delivery time) is at most 24 hours old: the 18:00 UTC backup, held from its proof (about
-     20:00 UTC; the next verifier run, 2 minutes later, rewrites `status.json`, below), serves
+     20:00 UTC; the next verifier run, about 2 minutes later, rewrites `status.json`, below), serves
      until 18:00 UTC the next day; between the next capture and its proof, wait for that proof
      or take a fresh one;
    - its schema is the database's current schema (no migration since);
@@ -587,9 +587,9 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
      the release is abandoned), release the receiver's timer, then the producer's. A held backup
      whose 24 hours end before a retry (or before `migrate` starts) ends the hold at once, in the
      same order, before any wait or fresh capture: the producer's timer is `Persistent=true`
-     (18:00 UTC), so restarting it after a missed 18:00 starts that day's capture at once; confirm
-     it ran (`systemctl show -P LastTriggerUSec personal-os-backup.timer`, a new
-     `last_success_id`). The gate is then met again only by that capture's proof under a new hold,
+     (18:00 UTC), so restarting it after a missed 18:00 triggers a catch-up of that day's capture
+     after its configured delay (`RandomizedDelaySec=30s`); wait for the new trigger (`systemctl
+     show -P LastTriggerUSec personal-os-backup.timer`) and a new `last_success_id`. The gate is then met again only by that capture's proof under a new hold,
      or by a fresh backup.
 
    Accepted risk (owner 10-28 and 10-29, quoted above): a reused backup may be 24 hours old. If
