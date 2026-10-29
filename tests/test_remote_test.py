@@ -215,6 +215,14 @@ def runner_pid(home):
     return int((worker_dir(home) / 'run.pid').read_text().split()[0])
 
 
+def recorded(home, pid):
+    """Whether a run has recorded this step yet. The runner records a step just after starting it, so a SIGKILL
+    in between leaves it unrecorded: that window is a follow-up of ANYM-638, and the SIGKILL tests wait it out."""
+    runs = worker_dir(home) / 'runs'
+    return runs.exists() and any(f'group {pid} ' in (run / 'owned').read_text()
+                                 for run in runs.iterdir() if (run / 'owned').exists())
+
+
 def load_rows(home):
     return [line.split('\t') for line in (home / 'service' / 'deedkit-ci' / 'load.log').read_text().splitlines()]
 
@@ -412,6 +420,7 @@ def test_a_suite_that_ignores_term_is_killed_once_the_stop_bound_passes(mini, wo
     process = background(env, worktree, 'root', 'tests/test_app.py', FAKE_UV_SLEEP='120', FAKE_UV_IGNORE_TERM='1')
     wait_for(lambda: log_lines(home, 'uv run pytest'), 60)
     suite = pid_of(log_lines(home, 'uv run pytest')[0])
+    wait_for(lambda: recorded(home, suite))
     os.kill(runner_pid(home), getattr(signal, f'SIG{signal_name}'))
     process.communicate(timeout=60)
     # STOP_SECONDS=3: TERM, then KILL; then PostgreSQL, the run directory and the load line.
@@ -429,6 +438,7 @@ def test_a_killed_runner_leaves_no_process_database_or_held_slot_behind(mini, wo
                     'suite': ('FAKE_UV_SLEEP', 'uv run pytest')}[stage]
     process = background(env, worktree, 'root', 'tests/test_app.py', **{slow: '60'})
     wait_for(lambda: log_lines(home, marker), 60)
+    wait_for(lambda: recorded(home, pid_of(log_lines(home, marker)[0])))
     os.kill(runner_pid(home), signal.SIGKILL)
     process.communicate(timeout=30)
     # The watchdog stops the orphan and any PostgreSQL; the slot died with the runner.
@@ -449,6 +459,7 @@ def test_a_run_started_right_after_a_killed_one_is_not_touched_by_the_old_watchd
     write(home / 'shared' / 'caps.conf', 'WAIT_SECONDS=10\nPOLL_SECONDS=1\n', 0o644)
     process = background(env, worktree, 'root', 'tests/test_app.py', FAKE_UV_SLEEP='60')
     wait_for(lambda: log_lines(home, 'uv run pytest'), 60)
+    wait_for(lambda: recorded(home, pid_of(log_lines(home, 'uv run pytest')[0])))
     os.kill(runner_pid(home), signal.SIGKILL)
     process.communicate(timeout=30)
     # At once: the old watchdog wakes while this run's suite and database are up, and must leave them be.
