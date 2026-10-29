@@ -85,6 +85,7 @@ archive tests them:
 | `equal_version` | the candidate has the same provider update time |
 | `older_version` | the candidate is an older provider observation |
 | `newer_version` | the candidate is a newer provider observation |
+| `unordered` | identity fields only: the archive's version at the conflict is not provable (a later re-read advanced it, or a tombstone) |
 
 Known classes (a reviewed table in `conflict_classes.py`; the shape of a class
 never makes it known):
@@ -96,8 +97,11 @@ never makes it known):
 
 `unclassified`: evidence the rule cannot read (for example a malformed legacy
 receipt), and every row without a stored class (written by older code). It
-counts as attention. Rows from before migration 054 keep no class until a
-follow-up card classifies them.
+counts as attention. Rows stored without a class (before migration 054, or by
+older code later) get one from the `classify` job below (ANYM-622): content
+fields `equal_version`; identity fields the exact relation only when the
+message's provider version still equals the observed revision's and no provider
+tombstone names it, else `unordered`. Resolved rows keep no class.
 
 ### Conflict re-evaluation (ANYM-621)
 
