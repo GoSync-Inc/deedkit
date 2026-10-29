@@ -1010,6 +1010,41 @@ exited or keeps restarting, not only a running one (`docker ps --all`).
 python3 /usr/local/lib/deedkit/production.py rollback --sha <current-applied-sha>
 ```
 
+After an A+B promotion (plan B, `seamless_release.py`, serves its own runtime
+generation) a plan A rollback is guarded (ANYM-642), standalone and as
+`deploy`'s automatic one. It resolves the HTTP configuration (`--http-config`,
+default `/etc/deedkit/http-production.json`; `deploy` passes its own) and holds
+the locks `seamless_release.py` holds for the whole rollback. It first checks
+plan B's state the way `deploy` does (`unresolved`: an unfinished apply or
+rollback, an unresolved HTTP attempt, an interrupted publication, read from the
+local source mirror `<state>/deploy-source.git`, never fetched), then that
+`http-current.json` names a serving generation whose attempt serves. Unknown,
+malformed or inconsistent HTTP state refuses. Only an absent default HTTP
+configuration with no HTTP state under `<state>` (`http/`, `http-current.json`,
+`*/http-attempted.json`) means no plan B and skips the guard. The guard then
+reads the schema inventory (checksums of `schema.sql` and `migrations/*.sql`,
+`docker run --network none --read-only`) of the serving generation's runtime
+image and of each messaging image (runtime, indexer, enricher-local,
+whatsapp-native, backup) the rollback would restore. Equal inventories, or a
+serving inventory that is a strict prefix of the restored one (plan B older),
+pass. Migrations plan B serves that a restored image lacks, divergent
+inventories (a changed checksum, or neither a prefix) and an unreadable
+inventory refuse before `rollback-attempted.json`, any stop or `up`:
+
+```text
+promotion refused: plan B serves generation <generation> of <sha> with migrations <project>/<service>'s restored image <image> lacks: migrations/061_<name>.sql; a plan A rollback alone would leave the serving API newer than its workers. Roll forward instead: `production.py deploy` of a newer green main SHA (a fix or a revert that keeps every applied migration; production.md, "Roll back the current release")
+```
+
+There is no override. The way out is roll-forward: `production.py deploy` of a
+newer green `main` SHA (a fix or a revert pull request that keeps every applied
+migration) applies plan A and then promotes plan B in order (`check_schema`).
+Attempt markers are per SHA (`<state>/<sha>/attempted.json`), so the serving
+release's marker does not block the newer one, and the migrated database stays
+as it is. Rolling plan A back alone while plan B is newer is never a recovery:
+it recreates the incompatible pair. The guard covers migration-dependent
+compatibility only: a code-only protocol change between the serving API and
+the workers with equal inventories passes it.
+
 Rollback is a production change: the owner confirms it like `apply` (except
 the one automatic rollback of `deploy`, below). It returns
 the current release's selected services to the images and configuration that

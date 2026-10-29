@@ -1366,12 +1366,102 @@ def wait_for_calls(settings, deadline):
     raise CallActive("a call is active: " + ", ".join(calls or []))
 
 
-def rollback(settings, sha):
+# The images that carry the messaging migration inventory: plan B's serving API depends on what their workers run.
+MESSAGING_TARGETS = frozenset(target for target, build in BUILDS.items() if build[1] == "services/messaging/Dockerfile")
+
+
+def serving_generation(settings, http):
+    """Plan B's serving release (http-current.json) for a plan A rollback, or None when there is positively no plan B:
+    no HTTP configuration (`http` None) and no HTTP state. Unknown, malformed, inconsistent or unresolved HTTP state is
+    refused (ANYM-642). The caller holds the locks seamless_release.py holds."""
+    state = Path(settings["state_directory"])
+    if http is None:
+        found = [path for path in (state / "http", state / "http-current.json") if path.exists() or path.is_symlink()]
+        if found := found + sorted(state.glob("*/http-attempted.json")):
+            raise Refused("there is no HTTP configuration, but HTTP state exists: " + ", ".join(map(str, found))
+                          + "; pass --http-config")
+        return None
+    http_state, mirror = Path(http["state_directory"]), state / "deploy-source.git"
+    current = http_state / "http-current.json"
+    try:
+        if not current.is_file():
+            raise Refused(f"plan B's state is unknown: {current} is missing")
+        serving = read(current)
+        if (not isinstance(serving, dict) or serving.get("status") not in ("serving", "serving-retirement-pending")
+                or not RELEASE_DIRECTORY.fullmatch(str(serving.get("sha")))
+                or not re.fullmatch(r"[0-9a-f]{12}", str(serving.get("generation")))
+                or not IMAGE_DIGEST.fullmatch(str(serving.get("images", {}).get("runtime")))):
+            raise Refused(f"plan B's state is inconsistent: {current} names no serving generation")
+        if read(http_state / serving["sha"] / "http-attempted.json").get("status") != "serving":
+            raise Refused(f"plan B's state is inconsistent: {serving['sha']}'s HTTP attempt does not serve")
+        # The interrupted-publication check reads the local source mirror; nothing is fetched.
+        if not mirror.is_dir():
+            raise Refused(f"{mirror} is missing: plan B's publication cannot be checked")
+        if reason := unresolved(state, http_state, lambda: mirror, serving["sha"]):
+            raise Refused(reason)
+    except Refused:
+        raise
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise Refused(f"plan B's state in {http_state} cannot be read: {type(exc).__name__}") from exc
+    return serving
+
+
+def inventory_order(serving, restored):
+    """`equal`, `older` (the serving inventory is a strict prefix of the restored one), `newer` (the restored one is a
+    strict prefix of the serving one) or `divergent`: schema.sql first, then the migrations in file order."""
+    def ordered(inventory):
+        return [("schema.sql", inventory["schema.sql"]), *sorted(item for item in inventory.items() if item[0] != "schema.sql")]
+    old, new = ordered(serving), ordered(restored)
+    if old == new:
+        return "equal"
+    if len(old) < len(new) and new[:len(old)] == old:
+        return "older"
+    return "newer" if len(new) < len(old) and old[:len(new)] == new else "divergent"
+
+
+def guard_rollback(serving, plan):
+    """Refuse a plan A rollback that would restore a messaging image without migrations the serving plan B generation
+    runs, or with a divergent inventory (ANYM-642). Local image inspection, network disabled; there is no override."""
+    if serving is None:
+        return
+    s, inventories = http_release_tool(), {}
+    named = f"plan B serves generation {serving['generation']} of {serving['sha']}"
+    def inventory(image):
+        if image not in inventories:
+            try:
+                inventories[image] = s.schema_inventory(image)
+            except Exception as exc:
+                detail = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+                raise Refused(f"the schema inventory of {image} cannot be read ({detail}) while {named}; "
+                              "a plan A rollback is refused") from exc
+        return inventories[image]
+    current = inventory(serving["images"]["runtime"])
+    for project, _, previous in plan:
+        for service, image in sorted(previous.items()):
+            if project["services"][service] not in MESSAGING_TARGETS:
+                continue
+            restored, where = inventory(image), f"{project['name']}/{service}'s restored image {image}"
+            order = inventory_order(current, restored)
+            if order in ("equal", "older"):
+                continue
+            missing = ", ".join(sorted(set(current) - set(restored))) or "none"
+            if order == "newer":
+                detail = f"migrations {where} lacks: {missing}"
+            else:
+                changed = ", ".join(sorted(path for path in set(current) & set(restored) if current[path] != restored[path]))
+                detail = f"a migration inventory {where} diverges from (changed: {changed or 'none'}; missing: {missing})"
+            raise Refused(f"{named} with {detail}; a plan A rollback alone would leave the serving API newer than "
+                          "its workers. Roll forward instead: `production.py deploy` of a newer green main SHA (a fix "
+                          "or a revert that keeps every applied migration; production.md, \"Roll back the current release\")")
+
+
+def rollback(settings, sha, http=None):
     """Return the current release's selected services to the images and configuration that ran before it, or
     those of a release whose apply failed its health wait (`unhealthy`), which never became current.
 
     Owner-confirmed like apply, except as `deploy`'s one automatic rollback. It never calls promotable(): the previous
-    revision is no longer current main. The caller holds the host lock, as main() does for every state-changing action.
+    revision is no longer current main. The caller holds the host lock, as main() does for every state-changing action,
+    and with plan B (`http`, its validated configuration; None when there is none) the locks of seamless_release.py.
     """
     state = Path(settings["state_directory"])
     release = state / sha
@@ -1384,6 +1474,8 @@ def rollback(settings, sha):
         raise Refused("this release was already rolled back or attempted; inspect it before any recovery")
     if blocked := unfinished(state):
         raise Refused("an apply or rollback is unfinished: " + ", ".join(blocked) + "; inspect it first")
+    # Plan B's state first, before http-current.json names the generation the guard compares (ANYM-642).
+    serving = serving_generation(settings, http)
     data = result.get("rollback")
     if not isinstance(data, dict) or data.get("version") != 1 or result.get("sha") != sha:
         raise Refused("this release has no rollback data; follow the manual rollback procedure (production.md)")
@@ -1423,6 +1515,7 @@ def rollback(settings, sha):
             if not present:
                 raise Refused("a previous image is no longer present on this host")
         plan.append((project, before, previous))
+    guard_rollback(serving, plan)
     wait_for_calls(settings, time.monotonic() + CALL_WAIT)
     write(release / "rollback-attempted.json", {"sha": sha, "status": "rolling-back", "started_at": now()})
     for index, (project, before, previous) in enumerate(plan):
@@ -4291,7 +4384,7 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
             # The previous release still fits: a range either leaves the SQL inventory alone (pause_reasons) or only
             # expands the schema (ANYM-449 M5), and the base runs on the target schema; a migration is never reversed.
             try:
-                rollback(settings, candidate)
+                rollback(settings, candidate, http)
             except Exception as again:
                 detail = str(again) if isinstance(again, Refused) else type(again).__name__
                 return finish(**halt(f"plan A of {candidate} failed its health wait and its rollback failed: {detail}; "
@@ -4385,7 +4478,7 @@ def main(argv=None):
     parser.add_argument("--sha")
     parser.add_argument("--target", choices=sorted(BUILDS))
     parser.add_argument("--config", help="default " + CONFIG + "; status: the autodeploy unit's (active_config)")
-    parser.add_argument("--http-config", default=HTTP_CONFIG, help="deploy: seamless_release.py's")
+    parser.add_argument("--http-config", default=HTTP_CONFIG, help="deploy, rollback: seamless_release.py's")
     parser.add_argument("--auto", action="store_true", help="deploy: at most one deploy start per 20 minutes (timer)")
     parser.add_argument("--dry-run", action="store_true", help="deploy: print the plan or pause reason, change nothing")
     parser.add_argument("--remove", action="store_true", help="images: remove the listed candidates")
@@ -4435,6 +4528,13 @@ def main(argv=None):
                     locks.enter_context(lock(canonical))
                     if state.resolve() != canonical.resolve():
                         locks.enter_context(lock(state))
+                elif args.action == "rollback":
+                    # Plan B's state is read, and the rollback runs, under the locks seamless_release.py holds; only
+                    # an absent default HTTP configuration means no plan B (ANYM-642).
+                    s = http_release_tool()
+                    http = (None if args.http_config == HTTP_CONFIG and not os.path.lexists(args.http_config)
+                            else s.validate_settings(config(args.http_config)))
+                    locks.enter_context(host_locks(settings, http, s) if http else lock(state))
                 else:
                     locks.enter_context(lock(state))
                 if args.action == "status":
@@ -4452,8 +4552,9 @@ def main(argv=None):
                 else:
                     if not re.fullmatch(r"[0-9a-f]{40}", args.sha or ""):
                         raise Refused("an exact lowercase 40-character commit SHA is required")
-                    result = {"prepare": prepare, "prepare-router": prepare_router, "apply": apply,
-                              "rollback": rollback}[args.action](settings, args.sha)
+                    result = (rollback(settings, args.sha, http) if args.action == "rollback" else
+                              {"prepare": prepare, "prepare-router": prepare_router, "apply": apply}[args.action](
+                                  settings, args.sha))
                     if args.action == "apply":
                         # Printed only: result.json and current.json stay the release receipts.
                         result = {**result, "image_removal": retain_images(settings)}
