@@ -60,6 +60,7 @@ dsn=""; mode=""
 if [ -n "${{PROBE_TEST_DSN_FILE:-}}" ]; then dsn="$(cat "$PROBE_TEST_DSN_FILE")"; mode="$(ls -l "$PROBE_TEST_DSN_FILE" | cut -c1-10)"; fi
 echo "uv $* | cwd=${{PWD##*/}} dsn=$dsn dsnmode=$mode shard=${{DEEDKIT_TEST_SHARD:-}} fcs=${{FCS_TEST_DSN:-}} pid=$$" >> "$FAKE_LOG"
 [ "$1" = run ] || exit 0
+if [ "${{FAKE_UV_ORPHAN:-0}}" = 1 ]; then sleep 300 >/dev/null 2>&1 & echo "orphan pid=$!" >> "$FAKE_LOG"; fi
 echo "FAKE SUITE OUTPUT ${{DEEDKIT_TEST_SHARD:-}}"
 {BURN}
 [ "${{FAKE_UV_SLEEP:-0}}" = 0 ] || sleep "$FAKE_UV_SLEEP"
@@ -84,6 +85,16 @@ echo "Pages speculative:                             0."
 RUNNER_FAKES = {
     'rsync': f'#!/usr/bin/env bash\necho "runner-rsync pid=$$" >> "$FAKE_LOG"\n'
              f'[ "${{FAKE_RSYNC_SLEEP:-0}}" = 0 ] || sleep "$FAKE_RSYNC_SLEEP"\nexec {RSYNC} "$@"\n',
+    # A start-time lookup (how the runner records a step) waits while the file FAKE_PS_HOLD exists.
+    'ps': '''#!/usr/bin/env bash
+case "$*" in *lstart=*)
+  if [ -n "${FAKE_PS_HOLD:-}" ] && [ -e "$FAKE_PS_HOLD" ]; then
+    echo "ps-hold pid=$$" >> "$FAKE_LOG"
+    while [ -e "$FAKE_PS_HOLD" ]; do sleep 0.05; done
+  fi ;;
+esac
+exec /bin/ps "$@"
+''',
 }
 PG_FAKES = {
     'initdb': '''#!/usr/bin/env bash
@@ -98,10 +109,19 @@ case " $* " in *" -k "*) k="${{*##* -k }}"; k="${{k%% *}}"
   [ "${{#k}}" -le 88 ] || {{ echo "postgres: socket path too long" >> "$FAKE_LOG"; exit 1; }} ;; esac
 echo $$ > "$2/postmaster.pid"
 trap '{BURN}; echo "postgres stopped by QUIT pid=$$" >> "$FAKE_LOG"; exit 0' QUIT
+touch "$FAKE_LOG.ready.$(printf '%s\\n' "$*" | sed -n 's/.* -p \\([0-9][0-9]*\\) .*/\\1/p')"
 while :; do sleep 0.1; done
 ''',
-    'pg_isready': '#!/usr/bin/env bash\nexit 0\n',
-    'createdb': '#!/usr/bin/env bash\necho "createdb $*" >> "$FAKE_LOG"\n',
+    # Ready once that server has started (and so recorded itself), as the real one.
+    'pg_isready': '''#!/usr/bin/env bash
+while [ $# -gt 0 ]; do [ "$1" = -p ] && port="$2"; shift; done
+[ -e "$FAKE_LOG.ready.${port:-}" ]
+''',
+    # FAKE_ARM_PS_HOLD: the next start-time lookup after the database exists (the suite step's record) waits.
+    'createdb': '''#!/usr/bin/env bash
+echo "createdb $*" >> "$FAKE_LOG"
+[ "${FAKE_ARM_PS_HOLD:-0}" = 0 ] || touch "$FAKE_PS_HOLD"
+''',
 }
 CAPS = 'WAIT_SECONDS=0\nPOLL_SECONDS=1\nSTOP_SECONDS=3\n'
 
@@ -216,8 +236,8 @@ def runner_pid(home):
 
 
 def recorded(home, pid):
-    """Whether a run has recorded this step yet. The runner records a step just after starting it, so a SIGKILL
-    in between leaves it unrecorded: that window is a follow-up of ANYM-638, and the SIGKILL tests wait it out."""
+    """Whether a run has recorded this step. A step records itself before it runs anything, so this holds once
+    the step has logged; test_a_runner_killed_the_moment_a_step_starts_leaves_no_step_behind kills without it."""
     runs = worker_dir(home) / 'runs'
     return runs.exists() and any(f'group {pid} ' in (run / 'owned').read_text()
                                  for run in runs.iterdir() if (run / 'owned').exists())
@@ -315,6 +335,7 @@ def test_the_root_suite_gets_a_postgres_on_localhost_and_a_private_dsn_file(mini
     [postgres] = log_lines(home, 'postgres -D')
     assert '-c listen_addresses=127.0.0.1' in postgres
     assert '-c unix_socket_directories= ' in postgres and ' -k ' not in postgres
+    assert '-c timezone=UTC ' in postgres  # as CI's postgres:18 container, whatever the mini's own zone
     port = postgres.split(' -p ')[1].split()[0]
     [pytest_line] = log_lines(home, 'uv run pytest tests/test_app.py')
     assert 'dsnmode=-rw------- ' in pytest_line
@@ -428,6 +449,35 @@ def test_a_suite_that_ignores_term_is_killed_once_the_stop_bound_passes(mini, wo
     wait_for(lambda: not list((worker_dir(home) / 'runs').iterdir()), 30)
     assert log_lines(home, 'postgres stopped by QUIT')
     assert load_rows(home)[-1][-1] == {'TERM': '143', 'KILL': 'killed'}[signal_name]
+
+
+# spec: ANYM-639
+def test_a_runner_killed_the_moment_a_step_starts_leaves_no_step_behind(mini, worktree):
+    home, env = mini
+    hold = home / 'ps-hold'
+    # The suite step's record waits on the hold; the runner dies inside that window, then the record goes on.
+    process = background(env, worktree, 'root', 'tests/test_app.py', FAKE_PS_HOLD=str(hold), FAKE_ARM_PS_HOLD='1',
+                         FAKE_UV_SLEEP='120', FAKE_UV_IGNORE_TERM='1')
+    wait_for(lambda: log_lines(home, 'ps-hold'), 60)
+    os.kill(runner_pid(home), signal.SIGKILL)
+    hold.unlink()
+    process.communicate(timeout=60)
+    wait_for(lambda: not list((worker_dir(home) / 'runs').iterdir()), 30)
+    # Recorded, the step found its runner gone: no suite started, so none runs.
+    assert not any(alive(pid_of(line)) for line in log_lines(home, 'uv run pytest'))
+    assert not log_lines(home, 'uv run pytest')
+
+
+# spec: ANYM-639
+def test_a_descendant_left_by_a_finished_step_is_stopped_before_the_run_ends(mini, worktree):
+    home, env = mini
+    result = remote(env, '--full', worktree, 'gateway', FAKE_UV_ORPHAN='1')
+    assert result.returncode == 0, result.stderr
+    # The step's leader exited; its background child still held the step's process group.
+    orphans = [pid_of(line) for line in log_lines(home, 'orphan')]
+    assert orphans
+    wait_for(lambda: not any(alive(pid) for pid in orphans), 10)
+    assert not list((worker_dir(home) / 'runs').iterdir())
 
 
 # spec: ANYM-638
@@ -584,6 +634,79 @@ def test_cleanup_removes_the_workers_copies_and_leftover_databases_only(mini, wo
     assert (other / 'kept.py').exists()
 
 
+def make_zombie():
+    """A process no signal ends (it stays until its parent, this test, reaps it) and its record line."""
+    zombie = subprocess.Popen(['true'], start_new_session=True)
+    wait_for(lambda: subprocess.run(['ps', '-o', 'stat=', '-p', str(zombie.pid)], capture_output=True,
+                                    text=True).stdout.strip().startswith('Z'))
+    stamp = subprocess.run(['bash', '-c', f'ps -o lstart= -p {zombie.pid} | tr -s " " "_"'], capture_output=True,
+                           text=True, check=True).stdout.strip('\n')
+    return zombie, f'group {zombie.pid} {stamp}\n'
+
+
+# spec: ANYM-639
+def test_cleanup_keeps_the_record_of_a_run_whose_process_does_not_stop(mini, worktree):
+    home, env = mini
+    assert remote(env, '--full', worktree, 'gateway').returncode == 0
+    zombie, record = make_zombie()
+    run_dir = worker_dir(home) / 'runs' / '1-1'
+    run_dir.mkdir(parents=True)
+    (run_dir / 'owned').write_text(record)
+    kept = remote(env, '--cleanup', WORKER)
+    assert kept.returncode == 1 and 'does not stop' in kept.stderr, kept.stderr
+    assert (run_dir / 'owned').exists() and not (worker_dir(home) / 'src').exists()
+    zombie.wait()
+    again = remote(env, '--cleanup', WORKER)
+    assert again.returncode == 0, again.stderr
+    assert not worker_dir(home).exists()
+
+
+# spec: ANYM-639
+def test_a_run_whose_recorded_process_does_not_stop_fails_and_keeps_its_record(mini, worktree):
+    home, env = mini
+    process = background(env, '--full', worktree, 'gateway', FAKE_UV_SLEEP='3')
+    wait_for(lambda: log_lines(home, 'uv run pytest'), 60)
+    zombie, record = make_zombie()
+    (run_dir,) = (worker_dir(home) / 'runs').iterdir()
+    with (run_dir / 'owned').open('a') as owned:
+        owned.write(record)
+    _, stderr = process.communicate(timeout=60)
+    # The suite passed but its stop did not finish: the run fails, its load line says so and the record stays.
+    assert process.returncode == 1 and 'does not stop' in stderr, stderr
+    assert load_rows(home)[-1][1] == 'gateway' and load_rows(home)[-1][-1] == '1'
+    assert (run_dir / 'owned').exists()
+    zombie.wait()
+
+
+# spec: ANYM-639
+def test_finish_ends_within_its_bound_when_the_watchdog_outlives_its_kill(tmp_path):
+    # The script's functions without its dispatch, and a `kill` that drops the watchdog's KILL: a watchdog stuck
+    # in the kernel. An unbounded wait on it would hold the run for the watchdog's 60 s.
+    functions = SCRIPT.read_text().rsplit('\ncase "${1:-}" in', 1)[0]
+    run_dir = tmp_path / 'runs' / '1-1'
+    run_dir.mkdir(parents=True)
+    driver = functions + f'''
+kill() {{ if [ "$1" = -KILL ] && [ "$2" = "$WATCHDOG" ]; then return 0; fi; builtin kill "$@"; }}
+set -m
+sleep 60 </dev/null >/dev/null 2>&1 & WATCHDOG=$!
+echo "$WATCHDOG" > {tmp_path}/watchdog.pid
+WORKER=w SUITE=gateway START_ISO=t START_EPOCH=$SECONDS ROOT_DIR={tmp_path} WORKER_DIR={tmp_path}
+RUN_DIR={run_dir} CHILDREN="" DATABASES="" HOLDER="" STOP_SECONDS=1
+trap finish EXIT
+exit 0
+'''
+    started = time.time()
+    result = subprocess.run(['bash', '-c', driver], capture_output=True, text=True, timeout=30)
+    watchdog = int((tmp_path / 'watchdog.pid').read_text())
+    try:
+        assert result.returncode == 0, result.stderr
+        assert time.time() - started < 15
+        assert alive(watchdog) and not run_dir.exists()
+        assert (tmp_path / 'load.log').read_text().split('\t')[-1] == '0\n'
+    finally:
+        os.kill(watchdog, signal.SIGKILL)
+
+
 # docs/operations/remote-test-mini-setup.md section 1, run as written: its blocks with the system paths moved under
 # a temporary root, and fakes of ssh/scp (the mini's shell runs here), sudo, dscl, install, chown and visudo.
 SETUP_DOC = ROOT / 'docs' / 'operations' / 'remote-test-mini-setup.md'
@@ -622,7 +745,18 @@ while [ $# -gt 2 ]; do case "$1" in -m) mode="$2"; shift 2 ;; -o|-g) shift 2 ;; 
 cp "$1" "$2" && chmod "$mode" "$2"
 ''',
     'chown': '#!/usr/bin/env bash\nexit 0\n',
-    'visudo': '#!/usr/bin/env bash\nexit 0\n',
+    # FAKE_VISUDO_OUT: what a full `visudo -c` also reports about other sudoers files (it then exits 1).
+    # FAKE_VISUDO_SILENT: a full `visudo -c` fails without a word; FAKE_VISUDO_EXIT: it fails after the first
+    # file parsed (killed, say).
+    'visudo': '''#!/usr/bin/env bash
+if [ "$*" = -c ]; then
+  [ "${FAKE_VISUDO_SILENT:-0}" = 0 ] || exit 1
+  echo "/private/etc/sudoers: parsed OK"
+  if [ -n "${FAKE_VISUDO_OUT:-}" ]; then printf '%s\\n' "$FAKE_VISUDO_OUT" >&2; exit 1; fi
+  exit "${FAKE_VISUDO_EXIT:-0}"
+fi
+echo "${@: -1}: parsed OK"
+''',
 }
 
 
@@ -692,6 +826,27 @@ def test_a_setup_that_fails_midway_is_undone_completely(mini_setup, fail):
     undo = setup_block(env, blocks[6], SETUP_SHELLS[-1])
     assert undo.returncode == 0 and 'undo-ok' in undo.stdout, undo.stdout + undo.stderr
     assert setup_leftovers(root) == []
+
+
+# spec: ANYM-639
+@pytest.mark.parametrize('shell', SETUP_SHELLS)
+@pytest.mark.parametrize('visudo,ok', [
+    ({'FAKE_VISUDO_OUT': '/private/etc/sudoers.d/ego: bad permissions, should be mode 0440'}, True),
+    ({'FAKE_VISUDO_OUT': '>>> /etc/sudoers.d/other: syntax error near line 2 <<<'}, False),
+    ({'FAKE_VISUDO_SILENT': '1'}, False), ({'FAKE_VISUDO_EXIT': '137'}, False)],
+    ids=['permission-warning', 'syntax-error', 'silent-failure', 'killed'])
+def test_the_setup_accepts_the_owners_sudoers_permission_warnings_and_no_other_failure(mini_setup, visudo, ok, shell):
+    root, env, blocks = mini_setup
+    results = [setup_block(env, block, shell, **visudo) for block in blocks[:5]]
+    assert [result.returncode for result in results[:4]] == [0, 0, 0, 0]
+    assert (results[4].returncode == 0) == ok, results[4].stdout + results[4].stderr
+    undo = setup_block(env, blocks[6], shell, **visudo)
+    if ok:
+        assert undo.returncode == 0 and 'undo-ok' in undo.stdout, undo.stdout + undo.stderr
+        assert setup_leftovers(root) == []
+    else:
+        assert undo.returncode == 1 and 'ledger kept' in undo.stdout, undo.stdout + undo.stderr
+        assert (root / 'owner' / 'deedkit-ci-setup.created').exists()
 
 
 # spec: ANYM-638

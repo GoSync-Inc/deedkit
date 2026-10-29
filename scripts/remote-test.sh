@@ -345,12 +345,13 @@ start_watchdog() {
 }
 
 # What earlier runs of this worker left when neither their trap nor their watchdog finished: their own run
-# directories only, never the current one. A directory whose processes do not stop stays for the next try.
+# directories only, never the current one. A directory whose processes do not stop stays for the next try,
+# and the function then fails.
 stop_leftovers() {
-  local dir pidfile pid i
+  local dir pidfile pid i kept=0
   for dir in "$WORKER_DIR"/runs/*; do
     [ -d "$dir" ] && [ "$dir" != "$RUN_DIR" ] || continue
-    stop_recorded "$dir" || { say "a process of $dir does not stop; it stays recorded"; continue; }
+    stop_recorded "$dir" || { say "a process of $dir does not stop; it stays recorded"; kept=1; continue; }
     # A PostgreSQL started just before its run died, so never recorded: known by its data directory.
     for pidfile in "$dir"/pg[0-9]*/cluster/postmaster.pid; do
       [ -f "$pidfile" ] || continue
@@ -363,15 +364,26 @@ stop_leftovers() {
     done
     rm -rf "$dir"
   done
+  return "$kept"
+}
+
+# First thing in a step's own subshell: the step records itself (kind: group or postgres), then goes on only
+# while the runner ($$) lives. A runner SIGKILLed the moment after starting a step so never leaves the step
+# unrecorded: the record is written before the check, and the watchdog reads it only once the runner is gone.
+own_self() {
+  local pid
+  pid="$(exec sh -c 'echo $PPID')"
+  own "$1" "$pid"
+  kill -0 $$ 2>/dev/null || exit 143
 }
 
 # Run a command as a background job (its own process group under set -m, so a stop reaches all of it) and
 # wait for it; a trapped signal interrupts the wait at once.
 run() {
-  "$@" &
+  ( own_self group
+    if [ "$(type -t "$1")" = function ]; then "$@"; else exec "$@"; fi ) &
   local pid=$!
   CHILDREN="$CHILDREN $pid"
-  own group "$pid"
   wait "$pid"
   CHILDREN="${CHILDREN% $pid}"
 }
@@ -394,12 +406,14 @@ pg_start() {
     --locale=en_US.UTF-8 >/dev/null
   rm -f "$data/pw"
   port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
-  # TCP only: a Unix socket under the run directory can pass macOS's 104-byte socket path limit.
-  "$PG_BIN/postgres" -D "$data/cluster" -c listen_addresses=127.0.0.1 -p "$port" -c unix_socket_directories= \
-    -c shared_buffers=128MB -c fsync=off -c synchronous_commit=off -c full_page_writes=off > "$data/log" 2>&1 &
+  # TCP only: a Unix socket under the run directory can pass macOS's 104-byte socket path limit. UTC, as CI's
+  # postgres:18 container: initdb would take the mini's own zone, and timestamps would render in it.
+  ( own_self postgres
+    exec "$PG_BIN/postgres" -D "$data/cluster" -c listen_addresses=127.0.0.1 -p "$port" -c unix_socket_directories= \
+      -c timezone=UTC -c log_timezone=UTC \
+      -c shared_buffers=128MB -c fsync=off -c synchronous_commit=off -c full_page_writes=off ) > "$data/log" 2>&1 &
   pid=$!
   DATABASES="$DATABASES $pid"
-  own postgres "$pid"
   for i in $(seq 1 60); do
     if "$PG_BIN/pg_isready" -q -h 127.0.0.1 -p "$port"; then break; fi
     if [ "$i" = 60 ]; then say "postgres $name did not become ready"; cat "$data/log" >&2; return 1; fi
@@ -416,23 +430,41 @@ groups_alive() {
   return 1
 }
 
+# Reap these jobs after KILL, waiting at most 5 s for each: a process stuck in the kernel never holds the run.
+# Quiet: bash 3.2 would report each killed job ("Killed: 9") on the run's output.
+reap_jobs() {
+  local pid i
+  for pid in "$@"; do
+    for i in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+    kill -0 "$pid" 2>/dev/null || wait "$pid" 2>/dev/null || true
+  done
+} 2>/dev/null
+
 finish() {
-  local status=$? pid pg=0 i
+  local status=$? pid pg=0 i stopped=1
   trap - EXIT INT TERM HUP
-  if [ -n "$WATCHDOG" ]; then kill -KILL "$WATCHDOG" 2>/dev/null || true; wait "$WATCHDOG" 2>/dev/null || true; fi
+  if [ -n "$WATCHDOG" ]; then kill -KILL "$WATCHDOG" 2>/dev/null || true; reap_jobs "$WATCHDOG"; fi
   for pid in $CHILDREN; do kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true; done
   # Up to STOP_SECONDS for the groups to end, then KILL: a child that ignores TERM never holds the run open.
   for i in $(seq 1 "$STOP_SECONDS"); do groups_alive $CHILDREN || break; sleep 1; done
   for pid in $CHILDREN; do kill -KILL -- "-$pid" 2>/dev/null || true; done
-  for pid in $CHILDREN; do wait "$pid" 2>/dev/null || true; done
+  reap_jobs $CHILDREN
   times > "$RUN_DIR/.times-before"
   for pid in $DATABASES; do kill -QUIT "$pid" 2>/dev/null || true; done  # immediate shutdown
   for pid in $DATABASES; do
     for i in $(seq 1 "$STOP_SECONDS"); do groups_alive "$pid" || break; sleep 1; done
     kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    reap_jobs "$pid"
   done
   times > "$RUN_DIR/.times"
+  # Whatever recorded still runs (a group whose leader already ended, say) gets the same bounded stop. When
+  # something does not stop, the run fails (an otherwise green run exits 1, and its load line says so) and its
+  # directory, the record, stays for the next run or --cleanup.
+  if ! stop_recorded "$RUN_DIR"; then
+    stopped=0
+    say "a process of this run does not stop; $RUN_DIR stays recorded"
+    [ "$status" != 0 ] || status=1
+  fi
   if [ -n "$DATABASES" ]; then
     pg="$(awk -v a="$(cpu_of "$RUN_DIR/.times")" -v b="$(cpu_of "$RUN_DIR/.times-before")" 'BEGIN { printf "%.1f", a - b }')"
   fi
@@ -443,7 +475,7 @@ finish() {
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$WORKER" "$SUITE" "$START_ISO" "$((SECONDS - START_EPOCH))" \
     "$(cpu_of "$RUN_DIR/.times")" "$pg" "$status" >> "$ROOT_DIR/load.log"
   if [ "$(cat "$WORKER_DIR/run.pid" 2>/dev/null)" = "$$ $(started $$)" ]; then rm -f "$WORKER_DIR/run.pid"; fi
-  rm -rf "$RUN_DIR"
+  if [ "$stopped" = 1 ]; then rm -rf "$RUN_DIR"; fi
   if [ -n "$HOLDER" ]; then kill "$HOLDER" 2>/dev/null || true; fi
   exit "$status"
 }
@@ -477,11 +509,11 @@ suite_root() {
     write_dsn "$RUN_DIR/test-$shard.dsn"
   done
   for shard in $(seq 1 "$PARALLEL"); do
-    (env DEEDKIT_TEST_SHARD="$shard/$PARALLEL" PROBE_TEST_DSN_FILE="$RUN_DIR/test-$shard.dsn" uv run python \
+    (own_self group
+      env DEEDKIT_TEST_SHARD="$shard/$PARALLEL" PROBE_TEST_DSN_FILE="$RUN_DIR/test-$shard.dsn" uv run python \
       scripts/python_shards.py pytest --tb=short "${ignores[@]}" tests 2>&1 | prefix "[$shard/$PARALLEL] ") &
     pid=$!
     pids="$pids $pid"
-    own group "$pid"
   done
   CHILDREN="$CHILDREN $pids"
   for pid in $pids; do
@@ -556,7 +588,9 @@ runner_run() {
   RUN_DIR="$WORKER_DIR/runs/$(date +%s)-$$"
   mkdir -p "$RUN_DIR"
   echo "$$ $(started $$)" > "$WORKER_DIR/run.pid"
-  stop_leftovers
+  # A leftover that does not stop stays recorded (stop_leftovers says so) and this run goes on: the next run and
+  # --cleanup try again, and --cleanup exits 1 while it stays.
+  stop_leftovers || true
   set -m
   trap finish EXIT
   trap 'exit 130' INT
@@ -599,7 +633,12 @@ runner_here() {
     cleanup)
       here_stop "$worker"
       WORKER_DIR="$ROOT_DIR/$worker" RUN_DIR=""
-      stop_leftovers
+      if ! stop_leftovers; then
+        # The run records stay, so a later --cleanup (or the worker's next run) can stop what is left.
+        rm -rf "${ROOT_DIR:?}/$worker/src"
+        say "kept $ROOT_DIR/$worker/runs: a recorded process does not stop; run --cleanup again later"
+        exit 1
+      fi
       rm -rf "${ROOT_DIR:?}/$worker"
       say "removed $ROOT_DIR/$worker" ;;
     *) die "unknown --here action" ;;
@@ -612,7 +651,8 @@ quoted() { local arg out=""; for arg in "$@"; do out="$out $(printf '%q' "$arg")
 
 # As egoregerev on the mini, and as the service user through its shim (the only sudo it may run).
 as_owner() { ssh "${SSH_OPTS[@]}" "$HOST" "bash -s --$(quoted "$@")" < "$SELF"; }
-as_service() { ssh "${SSH_OPTS[@]}" "$HOST" "sudo -n -u $SERVICE_USER $SHIM$(quoted "$@")" < "$SELF"; }
+# From /: egoregerev's home, the ssh session's directory, is closed to the service user.
+as_service() { ssh "${SSH_OPTS[@]}" "$HOST" "cd / && sudo -n -u $SERVICE_USER $SHIM$(quoted "$@")" < "$SELF"; }
 
 # Files changed against the merge base with main (committed or not) plus new untracked ones, one per line.
 touched_files() {
