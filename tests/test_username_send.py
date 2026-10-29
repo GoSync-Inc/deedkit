@@ -263,6 +263,11 @@ def rows(s, sql, args=()):
     with s.pool.connection() as c: return c.execute(sql, args).fetchall()
 
 
+def policy(s, assignment):
+    with s.pool.connection() as c:
+        c.execute('UPDATE account_policies SET ' + assignment + ' WHERE account=%s', (ACCOUNT,))
+
+
 def shift(s, operation_id, created, finished):
     """Move a lookup back in time by seconds (synthetic clock)."""
     with s.pool.connection() as c:
@@ -346,7 +351,7 @@ def test_a_preview_stays_valid_until_the_expiry_it_returned(telegram):
 
 
 # spec: ANYM-643
-@pytest.mark.parametrize('revoke', ['operation', 'sending'])
+@pytest.mark.parametrize('revoke', ['operation', 'sending', 'discover', 'collector', 'expired'])
 def test_a_guard_revoked_after_the_chat_step_queues_no_message(telegram, revoke):
     s, archive, state, key = telegram
     jobs = []
@@ -354,10 +359,14 @@ def test_a_guard_revoked_after_the_chat_step_queues_no_message(telegram, revoke)
     arguments = {**draft(), 'request_id': 'username-revoke-1', 'preview_digest': digest}
     step = s.username_send_begin(key, **arguments)
     dispatch(state, jobs, answer())
+    codes = {'operation': 'operation_disabled', 'sending': 'sending_disabled', 'discover': 'chat_not_collected',
+             'collector': 'sender_not_ready', 'expired': 'preview_expired'}
     if revoke == 'operation': s.set_messenger_operations(ACCOUNT, [])
-    else: archive.set_sending(ACCOUNT, False)
-    refused(lambda: s.username_send_finish(key, operation_id=step['operation_id'], **arguments),
-            'operation_disabled' if revoke == 'operation' else 'sending_disabled')
+    elif revoke == 'sending': archive.set_sending(ACCOUNT, False)
+    elif revoke == 'discover': policy(s, 'discover_chats=false')
+    elif revoke == 'collector': state.phase('connection', 'stopped', 'collector_shutdown')
+    else: shift(s, jobs[0]['id'], 700, 601)  # The preview's lookup expired after the chat step.
+    refused(lambda: s.username_send_finish(key, operation_id=step['operation_id'], **arguments), codes[revoke])
     assert count(s, 'outgoing_messages') == 0
 
 
@@ -374,12 +383,18 @@ def test_one_request_id_is_one_chat_step_also_concurrently_and_conflicts_with_a_
     threads = [threading.Thread(target=begin) for _ in range(2)]
     for t in threads: t.start()
     for t in threads: t.join()
-    assert len(set(steps)) == 1 and count(s, 'messenger_commands', "payload ? 'expected_user_id'") == 1
+    assert len(steps) == 2 and len(set(steps)) == 1
+    assert count(s, 'messenger_commands', "payload ? 'expected_user_id'") == 1
     dispatch(state, jobs, answer())
     assert s.username_send_begin(key, **arguments) == {'operation_id': steps[0]}  # A repeat after the chat step.
     refused(lambda: s.send_message(key, ACCOUNT, CHAT, TEXT, 'username-once-0001'), 'idempotency_conflict')
-    sent = s.username_send_finish(key, operation_id=steps[0], **arguments)
-    assert s.username_send_finish(key, operation_id=steps[0], **arguments)['send_id'] == sent['send_id']
+    sent, barrier = [], threading.Barrier(2)
+    def finish():
+        barrier.wait(); sent.append(s.username_send_finish(key, operation_id=steps[0], **arguments)['send_id'])
+    threads = [threading.Thread(target=finish) for _ in range(2)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    assert len(sent) == 2 and len(set(sent)) == 1
     assert count(s, 'outgoing_messages') == 1 and len(jobs) == 2
 
 
@@ -507,4 +522,161 @@ def test_messages_send_opens_a_username_under_the_gateway_grant_and_keeps_the_de
     plan = rows(s, 'SELECT plan FROM send_intents')[0]['plan']
     assert {k: plan['resolution']['target'][k] for k in ('username', 'user_id', 'name')} == {
         'username': '@' + USERNAME, 'user_id': USER, 'name': 'Synthetic Person'}
-    assert TEXT not in str(plan) and USERNAME not in caplog.text
+    assert TEXT not in str(plan) and USERNAME not in caplog.text and USER not in caplog.text
+    previews = rows(s, 'SELECT arguments,resolution FROM send_previews')
+    assert previews and all(p['resolution']['target']['user_id'] == USER and p['arguments']['to'] == '@' + USERNAME
+                            for p in previews)
+
+
+ACCOUNT2 = 'tg-username-send-2'
+
+
+@pytest.fixture
+def two(telegram):
+    s, archive, state, key = telegram
+    archive.register(ACCOUNT2, 'telegram', 'Synthetic Telegram 2', discover=True)
+    state2 = CollectorState(archive, ACCOUNT2, ('send-test-2', archive.acquire(ACCOUNT2, 'send-test-2')))
+    state2.phase('connection', 'connected', 'provider_ready')
+    s.set_messenger_operations(ACCOUNT2, ['open_chat_by_username'])
+    archive.set_sending(ACCOUNT2, True)
+    both = s.issue_key('username-two-accounts', [ACCOUNT, ACCOUNT2], permissions=['read', 'send'])
+    yield s, archive, state, state2, both
+    archive.release(ACCOUNT2, 'send-test-2', state2.lease[1])
+
+
+# spec: ANYM-643
+def test_the_digest_binds_the_account_the_username_and_the_resolved_user(two):
+    s, archive, state, state2, key = two
+    jobs = []
+    first = preview(s, key, state, jobs)['preview_digest']
+    preview(s, key, state2, jobs, account=ACCOUNT2)
+    refused(lambda: send(s, key, state2, jobs, first, account=ACCOUNT2), 'preview_mismatch')
+    preview(s, key, state, jobs, username='synthetic_other')  # Resolves to the same user.
+    refused(lambda: send(s, key, state, jobs, first, username='synthetic_other'), 'preview_mismatch')
+    with s.pool.connection() as c:
+        c.execute("""UPDATE messenger_commands SET result=jsonb_set(result,'{data,user_id}',to_jsonb(%s::text))
+            WHERE id=%s""", (OTHER_USER, jobs[0]['id']))
+    refused(lambda: send(s, key, state, jobs, first), 'preview_mismatch')
+    assert count(s, 'outgoing_messages') == 0
+    with pytest.raises(APIError) as choice: s.resolve_target(key, '@synthetic_nobody')
+    assert {c['account'] for c in error_candidates(choice.value)} == {ACCOUNT, ACCOUNT2}
+
+
+def error_candidates(error):
+    from messaging_service.error_details import payload as error_payload
+    return error_payload(error)['candidates']
+
+
+# spec: ANYM-643
+def test_an_unsent_step_shows_opening_chat_and_every_guard_holds_for_send_too(telegram):
+    s, archive, state, key = telegram
+    jobs = []
+    digest = preview(s, key, state, jobs)['preview_digest']
+    arguments = {**draft(), 'request_id': 'username-open-0001', 'preview_digest': digest}
+    step = s.username_send_begin(key, **arguments)
+    opening = s.username_send_finish(key, operation_id=step['operation_id'], **arguments)
+    assert opening['status'] == 'opening_chat'
+    assert opening['next_action'] == 'repeat_send_message_with_same_request_id'
+    reader = s.issue_key('username-send-reader', [ACCOUNT], permissions=['read'])
+    later = {**arguments, 'request_id': 'username-guard-001'}
+    refused(lambda: s.username_send_begin(reader, **later), 'forbidden')
+    policy(s, 'discover_chats=false')
+    refused(lambda: s.username_send_begin(key, **later), 'chat_not_collected')
+    policy(s, 'discover_chats=true')
+    s.set_messenger_operations(ACCOUNT, [])
+    refused(lambda: s.username_send_begin(key, **later), 'operation_disabled')
+    assert count(s, 'messenger_commands') == 2 and len(jobs) == 1
+
+
+# spec: ANYM-643
+@pytest.mark.parametrize('change', [{'format': 'markdown'}, {'link_preview': True}, {'preview_digest': 'e' * 64},
+                                    {'reply_to': 'msg_' + 'a' * 32}])
+def test_a_request_id_with_any_field_changed_conflicts(telegram, change):
+    s, archive, state, key = telegram
+    jobs = []
+    digest = preview(s, key, state, jobs)['preview_digest']
+    arguments = {**draft(), 'request_id': 'username-field-001', 'preview_digest': digest}
+    s.username_send_begin(key, **arguments)
+    refused(lambda: s.username_send_begin(key, **{**arguments, **change}), 'idempotency_conflict')
+
+
+# spec: ANYM-643
+def test_the_request_id_namespace_is_shared_with_plain_and_phone_sends(telegram, seeded):
+    from test_phone_send import ACCOUNT as WA, connect
+    s, archive, state, key = telegram
+    wa_state = connect(s, archive, WA)
+    both = s.issue_key('username-and-phone', [ACCOUNT, WA], permissions=['read', 'send'])
+    jobs = []
+    other = stable_id('chat', ACCOUNT, OTHER_USER)
+    with s.pool.connection() as c:
+        c.execute("INSERT INTO chats(id,account,title,chat_type,provider_chat) VALUES(%s,%s,'Synthetic','private',%s)",
+                  (other, ACCOUNT, OTHER_USER))
+    s.send_message(both, ACCOUNT, other, TEXT, 'shared-plain-0001')
+    digest = preview(s, both, state, jobs)['preview_digest']
+    refused(lambda: s.username_send_begin(both, **draft(), request_id='shared-plain-0001', preview_digest=digest),
+            'idempotency_conflict')
+    s.username_send_begin(both, **draft(), request_id='shared-step-00001', preview_digest=digest)
+    refused(lambda: s.phone_send_begin(both, account=WA, phone='12025550161', text=TEXT, request_id='shared-step-00001',
+                                       preview_digest='d' * 64), 'idempotency_conflict')
+    archive.release(WA, 'send-test', wa_state.lease[1])
+
+
+class Hanging(Telegram):
+    async def __call__(self, request):
+        self.calls.append(request)
+        await asyncio.Event().wait()
+
+
+# spec: ANYM-643
+def test_a_hanging_lookup_is_cut_at_the_operation_timeout_and_frees_the_lane(telegram, monkeypatch):
+    from messaging_service import commands
+    from messaging_service.outgoing import OutgoingWorker
+    s, archive, state, key = telegram
+    wait_for = asyncio.wait_for
+    monkeypatch.setattr(commands.asyncio, 'wait_for', lambda aw, timeout: wait_for(aw, min(timeout, 0.3)))
+    governor = RequestGovernor(state, interval=0)
+    s.username_preview_lookup(key, **draft(username='synthetic_hang'))
+    collector(state, Hanging(), governor)
+    assert rows(s, 'SELECT status FROM messenger_commands')[0]['status'] == 'failed'
+    assert not governor.lock.locked()
+    client = Telegram()
+    s.username_preview_lookup(key, **draft())
+    collector(state, client, governor)
+    assert len(client.calls) == 1
+    other = stable_id('chat', ACCOUNT, OTHER_USER)
+    with s.pool.connection() as c:
+        c.execute("INSERT INTO chats(id,account,title,chat_type,provider_chat) VALUES(%s,%s,'Synthetic','private',%s)",
+                  (other, ACCOUNT, OTHER_USER))
+    sent = []
+    async def provider(job):
+        sent.append(job); return {'provider_message_id': '1'}
+    s.send_message(key, ACCOUNT, other, TEXT, 'plain-after-hang')
+    asyncio.run(OutgoingWorker(state, provider).once())
+    assert len(sent) == 1
+
+
+# spec: ANYM-643
+def test_the_last_slot_unfinished_rows_and_real_flood_waits_all_count(telegram):
+    s, archive, state, key = telegram
+    client = Telegram()
+    for index in range(18):
+        s.username_preview_lookup(key, **draft(username=f'synthetic_{index:02d}'))
+        collector(state, client)
+    flood = RequestGovernor(state, interval=0)
+    s.username_preview_lookup(key, **draft(username='synthetic_flood'))
+    collector(state, Telegram(errors.FloodWaitError(None, capture=60)), flood)  # Asked Telegram: counts.
+    for name in ('synthetic_slot_a', 'synthetic_slot_b'):  # Two queued for the last slot, dispatched serially.
+        s.username_preview_lookup(key, **draft(username=name))
+    collector(state, client)
+    collector(state, client)
+    assert len(client.calls) == 19
+    by_name = {r['name']: r for r in rows(s, "SELECT payload->'parameters'->>'username' AS name,status,error_code "
+                                             'FROM messenger_commands')}
+    assert by_name['synthetic_slot_a']['status'] == 'succeeded' and by_name['synthetic_slot_b']['error_code'] == 'rate_limited'
+    # A row still dispatching counts now, also when it started more than an hour ago.
+    with s.pool.connection() as c:
+        c.execute("""UPDATE messenger_commands SET status='dispatching',finished_at=NULL,
+            started_at=clock_timestamp()-interval '2 hours' WHERE payload->'parameters'->>'username'='synthetic_00'""")
+    s.username_preview_lookup(key, **draft(username='synthetic_late'))
+    collector(state, client)
+    assert len(client.calls) == 19

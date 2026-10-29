@@ -19,7 +19,11 @@ def backend(request, seen, permissions, recipients):
         return httpx.Response(200, json={"permissions": list(permissions),
             "sending": {"recipients": {name: {} for name in recipients}}, "messenger_operations": {
                 "supported_by_account": {"synthetic": {"operations": ["open_chat_by_username"]}}}})
-    seen.append((request.url.path.removeprefix("/v1/"), json.loads(request.content)))
+    args = json.loads(request.content)
+    seen.append((request.url.path.removeprefix("/v1/"), args))
+    if "allow_open_username" in args and "username" not in recipients:
+        # A backend at bc228151 rejects an argument it does not declare.
+        return httpx.Response(400, json={"error": "invalid_parameters", "request_id": "c" * 32, "retryable": False})
     return httpx.Response(200, json={"status": "queued", "send_id": "send_" + "a" * 32, "preview_digest": "d" * 64})
 
 
@@ -46,8 +50,10 @@ def setup(tmp_path, actions=("open_chat_by_username",), permissions=("read", "se
 
 
 # spec: ANYM-643
-def test_a_username_recipient_needs_the_open_chat_by_username_grant(tmp_path):
-    app, seen = setup(tmp_path, actions=("open_chat_by_phone",))
+@pytest.mark.parametrize("actions,permissions", [(("open_chat_by_phone",), ("read", "send")),
+                                                 (("open_chat_by_username",), ("read",))])
+def test_a_username_recipient_needs_the_open_chat_by_username_grant(tmp_path, actions, permissions):
+    app, seen = setup(tmp_path, actions=actions, permissions=permissions)
     with TestClient(app) as client:
         for tool, extra in (("preview_message", {}), ("send_message", {"request_id": "synthetic-username-1"})):
             response = client.post("/v1/messages_" + tool, json={**DRAFT, **extra}, headers=HEADERS)
