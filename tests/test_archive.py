@@ -245,11 +245,13 @@ def test_whatsapp_sent_at_jitter_is_not_a_conflict(archive,seconds,updated):
     observed=jitter_event(sent_at=shifted(seconds),updated_at=shifted(updated),origin='backfill',
         sender_profile={'display_name':'Synthetic Owner'},metadata={'timestamp_resolution':'second','message_kind':'text'})
     assert ar.ingest(observed)['outcome']=='unchanged'
-    # The retained revision, its sent time, version and metadata stay; nothing is recorded as a conflict.
-    assert sender_rows(s,mid)==('900@lid',1,[],0) and stored_conflicts(s,mid)==[]
-    assert retained_row(s,mid)==before
-    assert before[:3]==(datetime(2026,10,1,12,tzinfo=timezone.utc),datetime(2026,10,1,12,tzinfo=timezone.utc),
+    # The retained revision, its sent time and version stay; nothing is recorded as a conflict. What the
+    # re-read newly states about the same revision (metadata, the sender's profile) is kept, as for any re-read.
+    assert sender_rows(s,mid)==('900@lid',1,['900@lid'],0) and stored_conflicts(s,mid)==[]
+    after=retained_row(s,mid)
+    assert after[:3]==before[:3]==(datetime(2026,10,1,12,tzinfo=timezone.utc),datetime(2026,10,1,12,tzinfo=timezone.utc),
         ['2026-10-01T12:00:00+00:00'])
+    assert before[3]=={'timestamp_resolution':'second'} and after[3]=={'timestamp_resolution':'second','message_kind':'text'}
 
 
 # spec: ANYM-558
@@ -278,6 +280,24 @@ def test_whatsapp_sent_at_jitter_is_no_later_evidence(archive):
     assert ar.ingest(jitter_event(body='Вторая версия',formatting=wire('Вторая версия'),
         updated_at='2026-10-01T12:01:00+00:00'))['outcome']=='edited'
     assert sender_rows(s,mid)==('900@lid',2,[],0)
+
+
+# spec: ANYM-558
+def test_whatsapp_sent_at_jitter_with_a_later_edit_time_is_later_evidence(archive):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    mid=ar.ingest(jitter_event())['message']
+    assert ar.ingest(jitter_event(body='contradiction',formatting=wire('contradiction')))['outcome']=='conflict'
+    # The same text with an edit time beyond the offset: the stored version moves on, as for an exact
+    # re-read, and the older contradiction is resolved.
+    assert ar.ingest(jitter_event(sent_at=shifted(1),updated_at=shifted(60)))['outcome']=='unchanged'
+    assert retained_row(s,mid)[:3]==(datetime(2026,10,1,12,tzinfo=timezone.utc),datetime(2026,10,1,12,1,tzinfo=timezone.utc),
+        ['2026-10-01T12:00:00+00:00'])
+    assert sender_rows(s,mid)==('900@lid',1,[],0)
+    # Another text at an earlier version is then stale, not an edit.
+    assert ar.ingest(jitter_event(body='Вторая версия',formatting=wire('Вторая версия'),
+        updated_at=shifted(30)))['outcome']=='stale'
+    assert sender_rows(s,mid)==('900@lid',1,[],0)
 
 
 # spec: ANYM-558
