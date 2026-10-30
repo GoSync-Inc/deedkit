@@ -256,6 +256,7 @@ def test_next_send_opportunity_follows_a_hung_search_within_the_deadline(monkeyp
     marks, finished, jobs = {}, [], [{'id': 'synthetic-job', 'mutation': False, 'operation': 'search_messages_live'}]
     class Sends:
         def __init__(self, *args):pass
+        def expire_queued(self):return 0
         async def once(self):
             if 'claimed' in marks and 'send' not in marks:marks['send'] = time.monotonic()
             return False
@@ -270,6 +271,7 @@ def test_next_send_opportunity_follows_a_hung_search_within_the_deadline(monkeyp
     monkeypatch.setattr(outgoing, 'OutgoingWorker', Sends); monkeypatch.setattr(commands, 'CommandWorker', Worker)
     collector = TelegramCollector.__new__(TelegramCollector)
     collector.state, collector.provider = State(), SimpleNamespace()
+    collector.database_retry = .01
     async def hangs(job):await asyncio.sleep(60)
     collector.execute_operation = hangs
     async def scenario():
@@ -292,6 +294,7 @@ def test_a_slow_receipt_commit_does_not_hold_up_the_send_loop(monkeypatch):
     marks, finished, jobs = {}, [], [{'id': 'synthetic-job', 'mutation': False, 'operation': 'search_messages_live'}]
     class Sends:
         def __init__(self, *args):pass
+        def expire_queued(self):return 0
         async def once(self):
             if 'claimed' in marks and 'send' not in marks:marks['send'] = time.monotonic()
             return False
@@ -306,6 +309,7 @@ def test_a_slow_receipt_commit_does_not_hold_up_the_send_loop(monkeypatch):
     monkeypatch.setattr(outgoing, 'OutgoingWorker', Sends); monkeypatch.setattr(commands, 'CommandWorker', Worker)
     collector = TelegramCollector.__new__(TelegramCollector)
     collector.state, collector.provider = State(), SimpleNamespace()
+    collector.database_retry = .01
     async def found(job):return {'outcome': 'confirmed', 'data': {'hits': []}}
     collector.execute_operation = found
     async def scenario():
