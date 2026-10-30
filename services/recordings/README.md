@@ -3,7 +3,8 @@
 An optional, independent HTTP backend for the DeedKit gateway. Version 0.1 reads
 Omi conversation metadata, transcripts and structured overviews on demand. It
 has its own Python 3.13 environment/lock, no database, collector or durable
-content cache. PLAUD is a separate requested follow-up; it is not implemented here.
+content cache. The PLAUD adapter reads its official remote MCP; its distinct
+authorization, data route and limitations are described below.
 
 ## Install and authorize
 
@@ -54,7 +55,7 @@ The CLI disables HTTP client URL logging and Uvicorn access logs. Each process
 admits four provider calls; run one process for the documented account budget.
 The 12-second deadline includes body reading and cancellation releases admission.
 There are no provider retries or background calls. Unauthenticated requests and
-capabilities do not contact Omi.
+capabilities do not contact either provider.
 
 ## Gateway opt-in
 
@@ -78,7 +79,7 @@ already admitted provider requests can finish. Rotate cursor secret to invalidat
 continuations. Atomically replace configuration in its private directory; mount
 that directory read-only, not a single file whose inode would stay stale.
 
-## Read contract
+## Omi read contract
 
 The private backend uses authenticated `POST /v1/capabilities`,
 `POST /v1/list_recordings` and `POST /v1/read_recording`; the gateway tools provide
@@ -113,7 +114,7 @@ a newer one. Provider responses over 2 MiB fail `response_too_large` without
 partial content. Request bodies are capped at 16 KiB. Errors contain fixed codes,
 never provider response bodies or credentials.
 
-Only documented HTTPS GET routes at `api.omi.me` are used. Credentials,
+The Omi adapter uses only documented HTTPS GET routes at `api.omi.me`. Credentials,
 recording IDs, bounds, limits and provider cursor go to Omi; metadata, requested
 content and continuation tokens go to the authenticated gateway/caller. Redirects,
 environment proxies and encoded provider responses are refused. No arbitrary URL,
@@ -123,3 +124,58 @@ An agent consuming the returned text may put it in its own model context.
 Official contract: [Omi conversations API](https://docs.omi.me/doc/developer/api/conversations).
 Synthetic tests verify the implementation, not live account authorization,
 provider coverage, raw audio availability or a production deployment.
+
+## PLAUD (ANYM-649)
+
+Use `provider: "plaud"` and a private `token_file` containing a bearer access token
+issued specifically for the official remote MCP audience. Obtain this through the
+vendor's supported remote-server OAuth connection with the owner's hands. This
+package does not implement login, refresh, token extraction or device pairing;
+CLI/device tokens are not assumed interchangeable. A missing/expired token returns
+`provider_auth_required`; replace the private file after owner authorization.
+Source acceptance uses synthetic fixtures only: remote OAuth issuance, actual
+server version and live response shape still require separate activation evidence.
+
+DeedKit sends OAuth authorization, protocol metadata, fixed tool names and the
+requested recording/page identifiers only to `https://mcp.plaud.ai/mcp`. The vendor
+[documents US-hosted HTTP transit](https://docs.plaud.ai/plaud-mcp-cli/mcp), governed
+by its privacy policy. Its remote MCP can resolve linked transcript/note bodies
+and has its own logging/telemetry policy; this adapter cannot disable or verify
+vendor internals. DeedKit itself makes no linked-body/audio fetches, model calls,
+content writes or request/content logs. No Node subprocess/package is installed.
+
+The adapter supports MCP protocol `2025-06-18`, JSON and bounded SSE responses,
+structured tool objects or the exact JSON wrapper published in `@plaud-ai/mcp`
+0.3.14. Unexpected shapes fail closed; a vendor change may require an update.
+Each operation creates and initializes a short-lived remote protocol session;
+cleanup shares the overall deadline and gets at most 200 ms. Failed cleanup does
+not replace the result. No retry, reconnection, background reader or session state
+is retained. Omi and PLAUD share the four-active-read budget in this process.
+
+- `list_recordings`: PLAUD limits 10–50; no date filters in this slice. Metadata is
+  restricted to id/name/created_at/start_at/duration (vendor duration is ms).
+  Request one explicit page per signed cursor. The unfiltered API has no pinned
+  completion schema, so `complete`/`has_more` stay null, even on an empty page.
+  A nonempty page offers another explicit page; it never scans a full archive.
+- `read_recording`: transcript calls `get_transcript` once with the transaction
+  block and a 500-segment limit. A provider continuation returns
+  `transcript_window_exceeded`, with no partial text. Summary calls `get_note` and
+  projects all bounded resolved note bodies, dropping link metadata. Linked-body
+  failures are `unavailable`; unknown text shapes are errors. A missing transcript
+  block is unavailable. Local character pages reuse Omi's digest check; source
+  changes require restarting. Concatenate pages only when digests match.
+- `audio` / gateway `recordings_audio`: requires **both** `recordings:read` and
+  **`recordings:audio`** in the backend principal and gateway grant, with the tool
+  in the gateway profile and the account in the backend principal. Returns only
+  the validated HTTPS `get_file.presigned_url` plus its vendor-reported 24-hour
+  lifetime. Missing links are unavailable; Omi audio stays unsupported.
+  **This is a bearer download link. DeedKit revocation does not revoke an already
+  returned link before vendor expiry.** The authorized caller handles download and
+  storage; no audio bytes flow through this service. Metadata/content operations
+  do not return the audio inventory or signed link.
+
+No existing profile gets this new audio scope/tool. Remove the gateway tool/grant
+and backend account access to stop new link issuance; an issued link's lifetime
+is controlled by PLAUD. For rollback, remove PLAUD accounts/audio configuration
+before downgrading the recordings package, and remove the audio tool from gateway
+profiles before downgrading its catalog. Keep Omi configuration unchanged.
