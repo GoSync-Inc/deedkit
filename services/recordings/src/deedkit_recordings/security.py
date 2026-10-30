@@ -25,7 +25,7 @@ class Strict(BaseModel):
 
 class Account(Strict):
     id: str = Field(pattern=r'^[A-Za-z0-9_-]{1,64}$')
-    provider: Literal['omi']
+    provider: Literal['omi', 'plaud']
     label: str = Field(min_length=1, max_length=128)
     token_file: str
 
@@ -35,7 +35,7 @@ class Principal(Strict):
     key_sha256: str = Field(pattern=r'^[0-9a-f]{64}$')
     expires_at: str
     accounts: list[str]
-    permissions: list[Literal['recordings:read', 'recordings:content']]
+    permissions: list[Literal['recordings:read', 'recordings:content', 'recordings:audio']]
 
 
 class Document(Strict):
@@ -109,8 +109,9 @@ def configuration(path, key):
 
 def provider_token(account):
     try:
-        value = private(account.token_file, 1024).decode().strip()
-        if not 8 <= len(value) <= 512 or any(c.isspace() for c in value) or not value.isascii():
+        maximum = 8192 if account.provider == 'plaud' else 512
+        value = private(account.token_file, maximum + 2).decode().strip()
+        if not 8 <= len(value) <= maximum or any(c.isspace() for c in value) or not value.isascii():
             raise ValueError('invalid token')
         return value
     except (OSError, ValueError, UnicodeError):

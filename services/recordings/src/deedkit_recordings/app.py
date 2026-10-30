@@ -12,9 +12,10 @@ from starlette.routing import Route
 from pydantic import Field, ValidationError
 
 from .omi import Provider, metadata, pagination, content
+from . import plaud
 from .security import Strict, Failure, configuration, provider_token, cursor, continuation, canonical, loads
 
-READ, CONTENT = 'recordings:read', 'recordings:content'
+READ, CONTENT, AUDIO = 'recordings:read', 'recordings:content', 'recordings:audio'
 
 
 class Empty(Strict):
@@ -35,6 +36,11 @@ class Reading(Strict):
     kind: Literal['transcript', 'summary'] = 'transcript'
     page_chars: int = Field(default=4000, ge=100, le=10000)
     cursor: str | None = Field(default=None, min_length=1, max_length=8192)
+
+
+class Audio(Strict):
+    account: str = Field(pattern=r'^[A-Za-z0-9_-]{1,64}$')
+    recording_id: str = Field(pattern=r'^[A-Za-z0-9_-]{1,256}$')
 
 
 def dates(args):
@@ -60,6 +66,8 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
     app = Starlette()
     provider = Provider(transport, provider_timeout, provider_bytes)
     app.state.provider = provider
+    remote = plaud.Provider(provider, transport, provider_timeout, provider_bytes)
+    app.state.plaud = remote
     path = Path(config_path).absolute()
 
     async def failure(request, error):
@@ -73,11 +81,11 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
         if not authorization.startswith('Bearer ') or not 1 <= len(authorization[7:]) <= 512:
             raise Failure('unauthorized', 401)
         actor, accounts, secret = configuration(path, authorization[7:])
-        models = {'capabilities': Empty, 'list_recordings': Listing, 'read_recording': Reading}
+        models = {'capabilities': Empty, 'list_recordings': Listing, 'read_recording': Reading, 'audio': Audio}
         model = models.get(operation)
         if model is None:
             raise Failure('not_found_or_forbidden', 404)
-        required = {READ, CONTENT} if operation == 'read_recording' else {READ}
+        required = {READ, CONTENT} if operation == 'read_recording' else ({READ, AUDIO} if operation == 'audio' else {READ})
         if not required <= set(actor.permissions):
             raise Failure('not_found_or_forbidden', 403)
         raw = bytearray()
@@ -96,10 +104,10 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
         if operation == 'capabilities':
             return {'service': 'deedkit-recordings', 'version': '0.1.0', 'principal': actor.id,
                     'permissions': actor.permissions, 'tool_manifest': {'names': [n for n in models
-                        if n != 'read_recording' or CONTENT in actor.permissions]},
+                        if (n != 'read_recording' or CONTENT in actor.permissions) and (n != 'audio' or AUDIO in actor.permissions)]},
                     'accounts': [{'id': a.id, 'provider': a.provider, 'label': a.label}
                                  for a in accounts.values() if a.id in actor.accounts],
-                    'audio': 'unsupported', 'coverage': 'on_demand_provider_reads_not_archive',
+                    'audio': 'plaud_link_requires_audio_scope' if any(a.provider == 'plaud' and a.id in actor.accounts for a in accounts.values()) else 'unsupported', 'coverage': 'on_demand_provider_reads_not_archive',
                     'limits': {'provider_timeout_seconds': 12, 'provider_response_bytes': 2 * 1024 * 1024,
                                'active_calls_per_process': 4, 'cursor_ttl_seconds': 900}}
         if args.account not in actor.accounts:
@@ -107,11 +115,27 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
         account = accounts[args.account]
         token = provider_token(account)
         params = dates(args) if operation == 'list_recordings' else {}
-        binding = {'provider': 'omi', 'account': account.id, 'principal': actor.key_sha256,
+        binding = {'provider': account.provider, 'account': account.id, 'principal': actor.key_sha256,
                    'provider_identity': hashlib.sha256(token.encode()).hexdigest(), 'operation': operation,
                    'arguments': {**args.model_dump(exclude={'cursor'}), **params}}
-        previous = cursor(args.cursor, binding, secret) if args.cursor else None
+        previous = cursor(args.cursor, binding, secret) if getattr(args, 'cursor', None) else None
+        if operation == 'audio':
+            if account.provider != 'plaud':
+                raise Failure('audio_unsupported', 422)
+            value = await remote.call(token, 'get_file', {'file_id': args.recording_id})
+            return {'account': account.id, 'provider': 'plaud', 'recording_id': args.recording_id,
+                    **plaud.audio(value, args.recording_id)}
         if operation == 'list_recordings':
+            if account.provider == 'plaud':
+                if params or args.limit < 10:
+                    raise Failure('unsupported_plaud_filters_or_limit', 422)
+                page = previous['position'] if previous else 1
+                if type(page) is not int or not 1 <= page <= 100000:
+                    raise Failure('invalid_cursor', 400)
+                value = await remote.call(token, 'list_files', {'page': page, 'page_size': args.limit})
+                items, evidence, next_page = plaud.listing(value, args.limit, page)
+                return {'account': account.id, 'provider': 'plaud', 'items': items, 'pagination': evidence,
+                        'next_cursor': continuation(binding, next_page, secret) if next_page else None}
             params.update(limit=args.limit, offset=0, include_transcript='false')
             if previous:
                 if not isinstance(previous.get('position'), str):
@@ -124,11 +148,20 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
             return {'account': account.id, 'provider': 'omi', 'items': [metadata(v) for v in values],
                     'pagination': evidence,
                     'next_cursor': continuation(binding, next_page, secret) if next_page else None}
-        value, _ = await provider.get(token, args.recording_id, {'include_transcript': 'true'})
-        record = metadata(value)
-        if record['id'] != args.recording_id:
-            raise Failure('invalid_provider_response')
-        state, text = content(value, args.kind)
+        if account.provider == 'plaud':
+            tool = 'get_transcript' if args.kind == 'transcript' else 'get_note'
+            parameters = {'file_id': args.recording_id}
+            if args.kind == 'transcript':
+                parameters.update(block='transaction', limit=500)
+            value = await remote.call(token, tool, parameters)
+            state, text = plaud.content(value, args.kind, args.recording_id)
+            record = {'id': args.recording_id}
+        else:
+            value, _ = await provider.get(token, args.recording_id, {'include_transcript': 'true'})
+            record = metadata(value)
+            if record['id'] != args.recording_id:
+                raise Failure('invalid_provider_response')
+            state, text = content(value, args.kind)
         digest = hashlib.sha256(canonical({'state': state, 'text': text})).hexdigest()
         offset = 0
         if previous:
@@ -138,13 +171,18 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
             if type(offset) is not int or not 0 < offset < len(text):
                 raise Failure('invalid_cursor', 400)
         end = min(len(text), offset + args.page_chars)
-        return {'account': account.id, 'provider': 'omi', 'recording': record, 'kind': args.kind,
+        return {'account': account.id, 'provider': account.provider, 'recording': record, 'kind': args.kind,
                 'content_state': state, 'text': text[offset:end], 'offset': offset,
                 'source_digest': digest, 'complete': end == len(text),
                 'next_cursor': continuation(binding, end, secret, digest) if end < len(text) else None}
 
     async def endpoint(request):
-        return JSONResponse(await invoke(request))
+        try:
+            return JSONResponse(await invoke(request))
+        except (ValueError, TypeError, OverflowError, UnicodeError, RecursionError):
+            # Provider projection and JSON encoding can fail after the HTTP client boundary.
+            # Never expose their values through an unhandled exception or server traceback.
+            raise Failure('invalid_provider_response') from None
 
     app.router.routes.append(Route('/v1/{operation}', endpoint, methods=['POST']))
     return app

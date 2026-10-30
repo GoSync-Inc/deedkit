@@ -1,4 +1,5 @@
 export type ToolName =
+  | 'recordings_audio'
   | 'recordings_capabilities'
   | 'recordings_list'
   | 'recordings_read'
