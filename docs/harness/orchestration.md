@@ -18,7 +18,10 @@ affect every pull request make parallel edits collide.
 
 - Enqueue with `gh pr merge <n> --squash --auto`. The merge is asynchronous: confirm it landed,
   not that the command returned. A failed group check drops the pull request; fix it and enqueue
-  again. Update a branch only for a real conflict, never just to stay current. A conflict in
+  again. The first flake on `main` or in the merge queue (a failing test outside the pull request's
+  changes) is fixed at once by whoever sees it, as its own tests-only AUTO pull request, never a
+  card candidate (owner 10-30); `bin/wait-merge.sh` prints the failing test ids and
+  re-enqueues the dropped pull request once. Update a branch only for a real conflict, never just to stay current. A conflict in
   another task's files goes to the orchestrator.
 - Draft first (owner 10-27, paid CI minutes): workers open pull requests as drafts, run the
   project's local checks before every push and mark the pull request ready (`gh pr ready <n>`)
@@ -115,8 +118,13 @@ affect every pull request make parallel edits collide.
   Sonnet PRs in the band, a read-only Sonnet subagent writes the read and the orchestrator reports
   it to the owner; the band goes back to Opus at that read on twice Opus's r1 blocking and major,
   more than 1 in 5 PRs with later-round findings or a first-green drop of 20 points or more, and at
-  once on a post-merge defect of blocking severity (reviews.md). Search and exploration
-  in subagents run on Sonnet; reviews (r1 and rechecks) keep the model reviews.md names (Routing; Rounds 4, 5; owner 10-19, 10-21, 10-23).
+  once on a post-merge defect of blocking severity (reviews.md). Worker and orchestrator
+  subagents default to Sonnet for search, exploration, kit or script adaptation and scoped
+  rechecks of their own work (re-running a check, confirming a fix landed); Opus only for a reason
+  named in the subagent's prompt. Reviews (r1 and rechecks) keep the model reviews.md names (Routing;
+  Rounds 4, 5; owner 10-19, 10-21, 10-23). The worker's DONE has one line per Sonnet subagent
+  task: task, model, `ok` or `redo` (redone by Opus or by hand), the orchestrator's digest the
+  same for its own, so the trial's quality is watched (owner 10-30: give Sonnet more, continue the experiment).
 - Orchestrator address: `bin/boss-of.sh <project>` prints a project's orchestrator session name from one
   registry (`<orchestrator dir>/orch-name` and the shared `~/.config/agent-harness/bosses.tsv`, one row per
   project). `orchestrator-restart.sh` records the old name, the successor its own (`boss-of.sh set <name>`), and an
@@ -313,6 +321,9 @@ Workers can run on another machine that Paradev (formerly Superset) knows as a h
 - Cost (process-diet 10-18): no "ok/noted" replies to workers; each wake-up re-reads the whole
   context, so wake less: rely on worker standing approvals and answer worker questions in one
   message. Orchestrator effort medium (owner 10-19).
+- An over-cap ask (an r4) is checked against the packet class first (owner 10-30): a card or
+  production operation plan keeps its one recheck (reviews.md, Rounds 6, 7), so the answer is no
+  and the open finding is the worker's BLOCKED; `bin/review-codex.sh` refuses r3 and r4 there.
 - Capacity (owner 10-18): run at least 7 workers in parallel (owner wants 10–15 later). A
   worker's context limit is a restart signal at a natural boundary; never stop a worker just for
   the number.
