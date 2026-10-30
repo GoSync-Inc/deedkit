@@ -83,7 +83,7 @@ class Provider:
             if identity is not None and mime not in ('application/json', 'text/event-stream'):
                 raise Failure('invalid_provider_response')
             body, total = bytearray(), 0
-            async for chunk in response.aiter_bytes(16384):
+            async for chunk in response.aiter_bytes():
                 total += len(chunk)
                 if total > self.maximum:
                     raise Failure('response_too_large')
@@ -125,10 +125,10 @@ class Provider:
         headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/json, text/event-stream',
                    'Accept-Encoding': 'identity', 'MCP-Protocol-Version': VERSION}
         try:
-            async with asyncio.timeout(self.timeout):
-                async with httpx.AsyncClient(transport=self.transport, trust_env=False, follow_redirects=False,
-                                             timeout=self.timeout) as client:
-                    try:
+            async with httpx.AsyncClient(transport=self.transport, trust_env=False, follow_redirects=False,
+                                         timeout=self.timeout) as client:
+                try:
+                    async with asyncio.timeout_at(deadline):
                         initialized, session = await self._request(client, headers, {
                             'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {
                                 'protocolVersion': VERSION, 'capabilities': {},
@@ -142,15 +142,17 @@ class Provider:
                             'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
                             'params': {'name': name, 'arguments': arguments}}, 2)
                         return tool_payload(result)
-                    finally:
-                        remaining = min(0.2, deadline - asyncio.get_running_loop().time())
-                        if session and remaining > 0:
-                            try:
-                                async with asyncio.timeout(remaining):
-                                    async with client.stream('DELETE', ENDPOINT, headers=headers):
-                                        pass
-                            except (httpx.HTTPError, TimeoutError):
-                                pass  # Cleanup never replaces the primary outcome.
+                finally:
+                    # The operation timer has exited. Cleanup gets only the remaining budget;
+                    # its own expiry cannot cancel a completed result or a specific failure.
+                    remaining = min(0.2, deadline - asyncio.get_running_loop().time())
+                    if session and remaining > 0 and not asyncio.current_task().cancelling():
+                        try:
+                            async with asyncio.timeout(remaining):
+                                async with client.stream('DELETE', ENDPOINT, headers=headers):
+                                    pass
+                        except (httpx.HTTPError, TimeoutError):
+                            pass  # Caller cancellation still propagates.
         except (TimeoutError, httpx.TimeoutException):
             raise Failure('provider_timeout') from None
         except httpx.HTTPError:
@@ -194,12 +196,17 @@ def content(value, kind, recording_id):
     if kind == 'summary':
         if not isinstance(value, list) or not all(isinstance(row, dict) for row in value):
             raise Failure('invalid_provider_response')
+        for row in value:
+            if not ({'data_content', 'data_content_error', 'data_link'} & row.keys()):
+                raise Failure('invalid_provider_response')
+            if 'data_content' in row and not isinstance(row['data_content'], str):
+                raise Failure('invalid_provider_response')
+            if 'data_content' not in row and not ('data_content_error' in row or row.get('data_link')):
+                raise Failure('invalid_provider_response')
         if any('data_content_error' in row or (row.get('data_link') and not row.get('data_content')) for row in value):
             return 'unavailable', ''
         rows = []
         for row in value:
-            if not isinstance(row.get('data_content', ''), str):
-                raise Failure('invalid_provider_response')
             if row.get('data_content'):
                 rows.append(canonical({'type': row.get('data_type') if isinstance(row.get('data_type'), str) else 'unknown',
                                        'text': row['data_content']}).decode())

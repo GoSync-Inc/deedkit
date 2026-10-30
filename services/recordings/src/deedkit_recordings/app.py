@@ -177,7 +177,12 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
                 'next_cursor': continuation(binding, end, secret, digest) if end < len(text) else None}
 
     async def endpoint(request):
-        return JSONResponse(await invoke(request))
+        try:
+            return JSONResponse(await invoke(request))
+        except (ValueError, TypeError, OverflowError, UnicodeError, RecursionError):
+            # Provider projection and JSON encoding can fail after the HTTP client boundary.
+            # Never expose their values through an unhandled exception or server traceback.
+            raise Failure('invalid_provider_response') from None
 
     app.router.routes.append(Route('/v1/{operation}', endpoint, methods=['POST']))
     return app

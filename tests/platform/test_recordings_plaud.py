@@ -319,3 +319,114 @@ def test_plaud_cleanup_timeout_keeps_success_and_releases_shared_budget(tmp_path
             assert response.json()['content_state']=='available'
             assert app.state.plaud.active==app.state.provider.active==0
     asyncio.run(run())
+
+
+# spec: ANYM-649
+@pytest.mark.parametrize('operation,value', [
+    ('audio', {'id': 'file-a', 'presigned_url': 'https://audio.invalid:private-recording-id/file'}),
+    ('audio', {'id': 'file-a', 'presigned_url': 'https://[private-recording-id/file'}),
+    ('list_recordings', {'data': [{'id': 'file-a', 'duration': 10 ** 400}]}),
+    ('list_recordings', {'data': [{'id': 'file-a', 'created_at': 10 ** 400}]}),
+    ('read_recording', transcript(segments=[{'text': 'private-recording-id', 'start': float('inf')}])),
+    ('read_recording', transcript(segments=[{'text': '\ud800private-recording-id'}])),
+])
+def test_plaud_projection_errors_have_sanitized_responses_and_no_exception_logs(tmp_path, caplog, operation, value):
+    path, _ = configuration(tmp_path)
+    async def run():
+        async with client(application(path, Remote(value))) as c:
+            args = {'account': 'plaud-a'}
+            args.update({'limit': 10} if operation == 'list_recordings' else {'recording_id': 'file-a'})
+            response = await c.post('/v1/' + operation, json=args)
+            assert response.status_code == 503
+            assert response.json() == {'error': 'invalid_provider_response'}
+            assert 'private-recording-id' not in response.text
+        assert not any(record.exc_info for record in caplog.records)
+        assert 'private-recording-id' not in caplog.text
+    asyncio.run(run())
+
+
+# spec: ANYM-649
+def test_plaud_complete_sse_events_finish_before_stream_eof(tmp_path):
+    path, _ = configuration(tmp_path)
+    base = Remote(transcript('Synthetic'), sse=True)
+    class OpenStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield self.body
+            await asyncio.Event().wait()
+        def __init__(self, body):
+            self.body = body
+    def remote(request):
+        response = base(request)
+        if response.headers.get('content-type') == 'text/event-stream':
+            return httpx.Response(200, stream=OpenStream(response.content), headers=response.headers)
+        return response
+    async def run():
+        app = application(path, remote, provider_timeout=0.1)
+        async with client(app) as c:
+            response = await c.post('/v1/read_recording', json={'account': 'plaud-a', 'recording_id': 'file-a'})
+            assert response.json()['content_state'] == 'available'
+            assert app.state.plaud.active == 0
+    asyncio.run(run())
+
+
+# spec: ANYM-649
+@pytest.mark.parametrize('failure', [False, True])
+def test_plaud_cleanup_near_deadline_preserves_primary_outcome(tmp_path, failure):
+    path, _ = configuration(tmp_path)
+    base = Remote(transcript('Synthetic'))
+    async def remote(request):
+        if request.method == 'DELETE':
+            await asyncio.Event().wait()
+        if request.method == 'POST' and json.loads(request.content)['method'] == 'tools/call':
+            await asyncio.sleep(0.04)
+            if failure:
+                return httpx.Response(401, text='private-recording-id')
+        return base(request)
+    async def run():
+        app = application(path, remote, provider_timeout=0.06)
+        async with client(app) as c:
+            async with asyncio.timeout(0.2):
+                response = await c.post('/v1/read_recording', json={'account': 'plaud-a', 'recording_id': 'file-a'})
+            if failure:
+                assert response.json() == {'error': 'provider_auth_required'}
+            else:
+                assert response.json()['content_state'] == 'available'
+            assert app.state.plaud.active == 0
+    asyncio.run(run())
+
+
+# spec: ANYM-649
+def test_plaud_caller_cancellation_during_cleanup_propagates(tmp_path):
+    path, _ = configuration(tmp_path)
+    base = Remote(transcript('Synthetic'))
+    async def run():
+        cleaning = asyncio.Event()
+        async def remote(request):
+            if request.method == 'DELETE':
+                cleaning.set()
+                await asyncio.Event().wait()
+            return base(request)
+        app = application(path, remote)
+        async with client(app) as c:
+            task = asyncio.create_task(c.post('/v1/read_recording', json={'account': 'plaud-a', 'recording_id': 'file-a'}))
+            await asyncio.wait_for(cleaning.wait(), timeout=0.2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert app.state.plaud.active == 0
+    asyncio.run(run())
+
+
+# spec: ANYM-649
+@pytest.mark.parametrize('notes,state', [([{'unexpected': 'private-recording-id'}], None),
+    ([], 'empty'), ([{'data_content': '', 'data_type': 'summary'}], 'empty')])
+def test_plaud_unknown_note_rows_are_errors_and_known_empty_notes_remain_empty(tmp_path, notes, state):
+    path, _ = configuration(tmp_path)
+    async def run():
+        async with client(application(path, Remote(notes))) as c:
+            response = await c.post('/v1/read_recording', json={'account': 'plaud-a', 'recording_id': 'file-a', 'kind': 'summary'})
+            if state is None:
+                assert response.json() == {'error': 'invalid_provider_response'}
+            else:
+                assert response.json()['content_state'] == state
+    asyncio.run(run())
