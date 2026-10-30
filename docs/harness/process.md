@@ -1,8 +1,8 @@
 # Agent process (harness)
 
-Rules for every project. A project's AGENTS.md adds rules and fills the `<placeholders>`
+Rules for every project. A project's AGENTS.md adds rules, fills the `<placeholders>`
 (`Harness values:`). It may tighten a rule here; it loosens one only with an `Override:` line listed
-in differences.md. Details: reviews.md, tiden.md, orchestration.md, skills.md.
+in differences.md.
 
 ## 1. Always
 
@@ -31,24 +31,28 @@ input box. A project adds an owner item only on the owner's words (differences.m
    request, package, announcement, letter, send); a new account or terms in the owner's name.
 5. The owner's hands: password, MFA, passkey, payment card, device.
 
-Everything else: agents decide and report the undo, gated:
+Everything else: agents decide, report the undo, gated:
 
 - Ruleset and required checks (`<ruleset file>`, `<required checks>`); secrets and access (secret
   references, `permissions:` widening, gitleaks config, role SQL, keys and roles in existing
-  accounts, `.claude/settings.json` allow entries): Astra r1.
+  accounts, `.claude/settings.json` allow entries): Astra r1. Owner 10-29: keys, roles, scopes,
+  subscriptions and message-delivery grants for the owner's own agents within permissions already named in a
+  ready card, AGENTS.md or the security document need a backup, read-back and undo (not CI
+  `permissions:` or `.claude/` entries); still risk paths: internet exposure,
+  secrets leaving the owner's accounts, data deletion, money.
 - Destructive SQL (DROP, TRUNCATE, DELETE, RENAME, narrowing ALTER), an edited migration, a
   restore, rollback or production change other than `<deploy command>`, deleting data, any step
-  without an undo: an Astra-reviewed plan, a fresh verified backup, any undo. User data neither a
+  without an undo: a fresh verified backup, any undo, an Astra-reviewed plan (exempt:
+  new additive migrations, small tested deviations; reviews.md, Rounds 7). User data neither a
   card nor the data policy names: item 2. Exempt: service-run DELETEs of rows a ready card or data policy
   names (PR-listed).
 - Card moves, deletions and evidence-based criterion weakening: a digest line (tiden.md); other
   weakening: item 1.
-- Releases: the project's promotion tool.
 
 Never accept a known risk (an open blocking or major finding): narrow the scope, file a
-follow-up card or revert. A ready card's owner-asked feature ships enabled: after
-merge and deploy, set its flag or opt-in and grant only what its criteria name, never a
-live-action change the project lists. No production step during a live activity the project
+follow-up card or revert. A ready card's owner-asked feature ships enabled
+after merge and deploy (its flag, opt-in and the grants its criteria name), never a live-action
+change the project lists. No production step during a live activity the project
 names; check read-only first.
 
 ## 3. Change paths
@@ -56,20 +60,20 @@ names; check read-only first.
 Path: from the changed files and section 2 (reviews.md, Pull request lines); PR line
 `Change path: <path> (<rule>)`. Never lower it; in doubt, AUTO+review with Astra.
 
-- AUTO (tests, non-process docs; reviews.md, Rounds 8): merge on green required checks.
+- AUTO (tests, non-process docs, a `bin/pin-refresh.sh` pinned-copy refresh; reviews.md, Rounds 8):
+  merge on green required checks.
 - AUTO+review (any other file): plus one review round (reviews.md, Routing); VISION.md:
   the B5 review (tiden.md).
 - OWNER (a change, here or in a project's AGENTS.md, that lets agents decide part of section 2's
-  five, drops or weakens a section 2 gate, or loosens section 3; a clean-reviewed pinned-copy
-  refresh needs no new yes): plus the owner's words; a quoted request naming the change counts (checked against the diff).
+  five, drops or weakens a section 2 gate, or loosens section 3): plus the owner's words; a quoted request naming the change counts (checked against the diff).
 
-Merge with `gh pr merge <n> --squash --auto`, never bypassing checks.
-Done: the squash's `main` push run is green.
+Merge and CI: orchestration.md, Merging. Done: every `main` push run containing the squash is
+green.
 
 ## 4. Product context and Tiden
 
-- First step of any task touching product code, specs or tests: `tiden intent skip`, the card
-  and `product-context`, then code.
+- First step of any task touching product code, specs or tests: `tiden intent skip`, the card,
+  `product-context`, then code.
 - Spec, tests, code: the ready card is the spec; failing tests come first. Each new test has
   `# spec: <PREFIX>-n` (Python) or `// spec: <PREFIX>-n` (JS, TS, Go) directly above it and its
   decorators, naming a story-level spec, or sits in the project's unlinked-tests list. Defects, infra and refactors
@@ -77,15 +81,13 @@ Done: the squash's `main` push run is green.
 - PR lines: `Spec: <PREFIX>-n[, …]` (implements or keeps), `Delivers: <PREFIX>-n` (completes), at most one
   `Tiden branch: proposal/<name>` or `review/<name>`, the only place to edit criteria. The first
   ID is primary; new files are anchored to it.
-- Wait for sync B (main push) on your squash and read back; rerun or dispatch a failed B, `Tiden
-  drift` or `Tiden health`. Hand writes to Tiden need a maintenance window (the project's Tiden CI
+- Wait for sync B covering your squash, read back; rerun or dispatch a failed B, `Tiden
+  drift` or `Tiden health`. Hand writes to Tiden: a maintenance window (the project's Tiden CI
   document).
 
 ## 5. Reviews
 
-- Astra: `codex exec --disable hooks -m gpt-6-astra -c service_tier="default" "<task with packet
-  paths>" </dev/null`.
-  Fable: `fable` subagent, product manager, never on code.
+- Astra: `bin/review-codex.sh astra`. Fable: product manager, never on code.
 - Packet, rounds, routing, verdict line: reviews.md. Every Astra task starts with:
   1. Failure isolation: can an exception, timeout or bad input in the new code break or silence an
      existing path (`<critical paths>`)? Name the line.
@@ -100,9 +102,7 @@ Done: the squash's `main` push run is green.
 
 - The card or brief is the plan. Decide in scope; ask only before leaving it (another task's
   files, section 2, the card's criteria, a fork without an obvious answer).
-- Test only touched and new code.
 - Message on events only (question, BLOCKED, DONE), ending with a `SUPERSET_WORKER_*` block.
-- At the brief's token limit (default 400k), restart via handoff (orchestration.md, Sessions).
 - Word cap: this file 1,000 words, a project AGENTS.md its own (`wc -w`).
   A rule change replaces or deletes words and names its incident and enforcer; an incident gets a
   test or hook first.

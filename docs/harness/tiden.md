@@ -52,7 +52,8 @@ fenced block is ignored, so a spec may document the marker).
 
 A card moves to `Done` only when every acceptance criterion is proven by one of:
 - a test linked to it (`# spec:` or `// spec:`) that asserts the criterion and ran and passed, not
-  skipped, on the green `main` push run of the squash whose PR `Delivers:` it;
+  skipped, on the green `main` push runs whose range contains the squash of the PR that `Delivers:` it
+  (orchestration.md, Merging);
 - for a criterion no test can assert (a deploy, an image, a registry or config state, a release;
   the evidence line says why), checkable evidence that it holds, taken after that squash on `main`
   or the deployed version: a CI log line, registry or image data, a command's output, or a git
@@ -68,7 +69,7 @@ owner ask, and is not stale while it waits. One without
 such proof keeps it in `Review` as well; an `[open: live]` criterion whose check is CI, registry
 or command data closes like the evidence above. Every move is a hand write in the maintenance window the orchestrator opens (its own
 dispatch move in the next one; a project without sync B: by hand); a `Done` move happens after sync B's
-read-back and records in the same edit on the evidence line the `main` run id and, per
+read-back and records in the same edit on the evidence line the id of that push's test run and, per
 criterion, the test ids or the evidence (removing the criterion's open marker, as above). A
 worker lists its moves made or due, each with its evidence, in its DONE message, the orchestrator
 its sweep's moves in the digest.
@@ -120,9 +121,11 @@ audits. A worker that finds work outside its task reports it to the orchestrator
    description: no estimate for an undescribed task, no list of estimates for approval first.
 3. **Review** by kind (process.md section 5): product cards (feature, improvement, epic) one Fable
    round with the product-manager prompt, which also checks `How others solve it` (adopt | adapt |
-   build, sized to the task) and whether the card should be split; cards that set a contract in
-   code, CI, data or security, and operation plans, Astra r1 and at most one scoped recheck; small cards the author's
-   self-check. A card that is both a product card and a contract card gets Fable + Astra r1; no
+   build, sized to the task) and whether the card should be split; cards that set a contract on
+   access, data, migrations or release Astra r1 and at most one scoped recheck, other contract cards
+   Fable or the author's self-check (reviews.md, Rounds 6); production operation plans Astra r1 by
+   risk tier, a Sol recheck only after a blocking or major finding (Rounds 7); small cards the author's
+   self-check. A product card that is also such a contract card gets Fable + Astra r1; no
    separate Sol correctness round. Reviewers first
    judge whether the card should exist and may shrink or reject it.
 4. **Ready.** Clean step-3 reviews make a card ready; no acceptance follows (owner 10-26: the
@@ -250,7 +253,8 @@ the planner the rest.
   defect cards on the same paths go into the epic's `History:` for the refactor slot of the wave
   before the story that shares them (or as its Depends on).
 - **P4 Reviews.** Step 3: one Fable round on the epic with its stories (split check; VISION.md
-  where it exists), one Astra r1 on its contract stories together, self-check on small ones.
+  where it exists), one Astra r1 on its contract stories touching access, data, migrations or release
+  together, self-check on the others.
 - **P5 Ready and waves.** The ready merge (below). Then the orchestrator's waves: the backlog table
   (`backlog pull` where Estimates is on, orchestration.md; else one it writes in the same shape,
   plan-check.sh header) gets lane and paths columns from each story's `Lane:` and `Expected paths:`
@@ -265,8 +269,8 @@ the planner the rest.
   the owner will notice, the waves, total SP, hours and money where Estimates is on, the
   assumptions made. No owner wait before dispatch.
 - **P7 Close.** After its last story merges, leftovers become cards and the PLAN block's remaining
-  lines go to the archive. After 4 or more PRs or a wave of parallel stories, the orchestrator
-  starts the epic review (reviews.md, Rounds 9); it does not hold the close. Then the vision
+  lines go to the archive. After 6 or more PRs the orchestrator may start the epic review
+  (reviews.md, Rounds 9; optional); it does not hold the close. Then the vision
   refresh (Brainstorm and vision, B7) where VISION.md exists.
 
 ### Ready merge
@@ -326,7 +330,9 @@ opens no `intent/` branch. Tiden changes in step with each PR: the PR's proposal
 branch carries the spec text it changes (a card it writes, every criterion edit or flag made while
 coding, the settle text); the PR names it as `Tiden branch:`, the reviewers read it with the diff, check A reads its specs and compares
 its merge preview with the `Spec:`/`Delivers:` lines, and sync B merges it right after the squash, so the
-spec text is current at merge. This holds for every PR that changes behaviour; a PR that delivers no new card and changes no spec text names no branch.
+spec text is current at merge. One `main` push can carry several squashes (a merge-queue group or a
+batch): a project that groups or batches makes B merge the Tiden branch of every squash in the push's
+range, not only the last one's (its Boss, with the CI change; orchestration.md, Merging). This holds for every PR that changes behaviour; a PR that delivers no new card and changes no spec text names no branch.
 Each deliverable has its own branch, because B merges only the specs a PR names. A project without
 check A and sync B in CI does those steps by hand (differences.md).
 
