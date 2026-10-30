@@ -87,5 +87,8 @@
   {"name": "messages_wait_for_subscription_events", "read_only": true},
   {"name": "platform_capabilities", "read_only": true},
   {"name": "platform_resolve_target", "read_only": true},
-  {"name": "platform_select_modules", "read_only": false}
+  {"name": "platform_select_modules", "read_only": false},
+  {"name": "recordings_capabilities", "read_only": true},
+  {"name": "recordings_list", "read_only": true},
+  {"name": "recordings_read", "read_only": true}
 ]
