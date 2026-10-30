@@ -154,7 +154,8 @@ class RequestGovernor:
                     await before()
                     if await self.account_remaining()>0:continue
                 await asyncio.to_thread(self.state.status,'receiving',phase)
-                if before is not None and await self.account_remaining()>0:continue
+                if refusal:await refusal()
+                elif await self.account_remaining()>0:continue
                 self.next_call=self.clock()+self.interval
                 return
 

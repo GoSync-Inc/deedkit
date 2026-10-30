@@ -27,6 +27,9 @@ class DispatchNotStarted(Exception):
 PROVIDER_PHASES=frozenset({'waiting','started','refused'})
 # ANYM-546: request IDs of composite steps (messages_send child keys); a caller route refuses them.
 CHILD_KEY_PREFIX='agent-child:'
+# One absolute budget covers expiry pool acquisition and its server transaction.
+EXPIRY_SECONDS=2.0
+EXPIRY_GRACE=0.5
 
 
 async def dispatch(job,call,timeout,*,passthrough=()):
@@ -440,14 +443,16 @@ class OutgoingWorker:
     def __init__(self,state,send,gate=None):
         self.state,self.send,self.gate=state,send,gate
 
-    def expire_queued(self):
+    def expire_queued(self,*,deadline=None):
         """ANYM-655: bounded housekeeping, independent of the provider and cooldown.
 
         Row locks exclude a concurrent claim; never touch dispatching/unknown
         attempts. A terminal event uses the same savepoint isolation as finish.
         """
+        from .telegram_collector import DeadlinePool
         st=self.state
-        with st.archive.store.pool.connection() as c:
+        pool=DeadlinePool(st.archive.store.pool,deadline if deadline is not None else time.monotonic()+EXPIRY_SECONDS)
+        with pool.connection() as c:
             c.execute("SET LOCAL lock_timeout='100ms'")
             c.execute("SET LOCAL statement_timeout='2s'")
             st.archive.fence(c,st.account,st.lease)

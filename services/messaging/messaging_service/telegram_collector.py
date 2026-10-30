@@ -1065,19 +1065,22 @@ class TelegramCollector:
             await asyncio.gather(*tasks,return_exceptions=True)
 
     async def outgoing_expiry_loop(self):
-        from .outgoing import OutgoingWorker
+        from psycopg import Error
+        from .outgoing import OutgoingWorker,EXPIRY_SECONDS,EXPIRY_GRACE
         worker=OutgoingWorker(self.state,None)
         delay=self.database_retry
         while True:
-            pending=asyncio.create_task(asyncio.to_thread(worker.expire_queued))
+            deadline=time.monotonic()+EXPIRY_SECONDS
+            pending=asyncio.create_task(asyncio.to_thread(worker.expire_queued,deadline=deadline))
             try:await asyncio.shield(pending)
             except asyncio.CancelledError:
-                # The SQL is bounded; do not release this collector's fence
-                # while our housekeeping thread still owns its transaction.
-                try:await pending
-                except Exception:pass
+                # The server ends the transaction and frees the fence at the
+                # absolute deadline, even if the client thread remains stalled.
+                await asyncio.wait({pending},timeout=max(0,deadline+EXPIRY_GRACE-time.monotonic()))
+                pending.add_done_callback(lambda t:t.cancelled() or t.exception())
                 raise
-            except database_errors():
+            except (Error,TimeoutError,*database_errors()) as exc:
+                log.warning('outgoing_expiry_failed exception_type=%s',type(exc).__name__)
                 await asyncio.sleep(delay);delay=min(60,delay*2);continue
             delay=self.database_retry
             await asyncio.sleep(1)

@@ -256,7 +256,7 @@ def test_next_send_opportunity_follows_a_hung_search_within_the_deadline(monkeyp
     marks, finished, jobs = {}, [], [{'id': 'synthetic-job', 'mutation': False, 'operation': 'search_messages_live'}]
     class Sends:
         def __init__(self, *args):pass
-        def expire_queued(self):return 0
+        def expire_queued(self,**kwargs):return 0
         async def once(self):
             if 'claimed' in marks and 'send' not in marks:marks['send'] = time.monotonic()
             return False
@@ -294,7 +294,7 @@ def test_a_slow_receipt_commit_does_not_hold_up_the_send_loop(monkeypatch):
     marks, finished, jobs = {}, [], [{'id': 'synthetic-job', 'mutation': False, 'operation': 'search_messages_live'}]
     class Sends:
         def __init__(self, *args):pass
-        def expire_queued(self):return 0
+        def expire_queued(self,**kwargs):return 0
         async def once(self):
             if 'claimed' in marks and 'send' not in marks:marks['send'] = time.monotonic()
             return False

@@ -110,7 +110,10 @@ From schema 63, `send.failed` also covers `expired` and `cancelled`, carrying on
 the send reference and status/error codes. An independent fenced sweep settles at
 most 16 expired queued requests per one-second tick, including during a stalled
 send or account cooldown. It never invokes a provider, replays a request or changes
-an uncertain attempt. Journal failures cannot undo terminal status; polling remains
+an uncertain attempt. Each pass has one two-second deadline for pool acquisition
+and its database transaction, including an idle client. Shutdown waits at most
+that remaining deadline plus half a second; the server releases the lease fence
+even if the client remains stalled. Journal failures cannot undo terminal status; polling remains
 available. On schema 62 the old collector guard rejects these additional events
 without undoing the status. Migrate to 63 for their notification support; migration
 63 replaces a guard function and follows the manual production migration gates.

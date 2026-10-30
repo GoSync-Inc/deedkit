@@ -246,7 +246,9 @@ def test_bound_collector_terminal_events_and_schema62_guard_isolation(sender, ol
     from messaging_service.archive import Archive
     from messaging_service.collector_state import CollectorState
     from messaging_service import store as store_module
-    from test_db_role_isolation import RolePool, install, refused, remove
+    from contextlib import contextmanager
+    from psycopg import sql
+    from test_db_role_isolation import install, refused, remove
     from psycopg.types.json import Jsonb
     s, _, _, _, state = sender; mine, _ = failure_keys(s)
     chat = stable_id('chat', 'send-fixture', '100')
@@ -259,10 +261,15 @@ def test_bound_collector_terminal_events_and_schema62_guard_isolation(sender, ol
         end = previous.index('\nEND $$;', start)+len('\nEND $$;')
         with s.pool.connection() as c: c.execute(previous[start:end])
     role = install(s, 'collector_role.sql', 'messaging_collector', account='send-fixture')
+    @contextmanager
+    def connection(*, timeout=None):
+        with s.pool.connection(timeout=timeout) as c:
+            c.execute(sql.SQL('SET LOCAL ROLE {}').format(sql.Identifier(role)))
+            yield c
     try:
         with s.pool.connection() as c:
             c.execute("UPDATE outgoing_messages SET expires_at=clock_timestamp()-interval '1 second' WHERE id=%s",(queued,))
-        bound = CollectorState(Archive(NS(pool=RolePool(s, role), append_event=s.append_event, files=s.files)),
+        bound = CollectorState(Archive(NS(pool=NS(connection=connection), append_event=s.append_event, files=s.files)),
             'send-fixture', state.lease)
         before = subscriptions.JOURNAL_FAILURES['send.failed']
         assert outgoing.OutgoingWorker(bound, None).expire_queued() == 1
@@ -287,7 +294,7 @@ def test_bound_collector_terminal_events_and_schema62_guard_isolation(sender, ol
 # spec: ANYM-655
 def test_expiry_shutdown_waits_for_owned_sql_thread(monkeypatch):
     entered = Event(); release = Event()
-    def stalled(self): entered.set(); assert release.wait(2)
+    def stalled(self,**kwargs): entered.set(); assert release.wait(2)
     monkeypatch.setattr(outgoing.OutgoingWorker, 'expire_queued', stalled)
     worker = TelegramCollector.__new__(TelegramCollector); worker.state = None; worker.database_retry = .01
     async def scenario():
@@ -363,3 +370,79 @@ def test_schema63_upgrade_preserves_grants_and_backups_and_is_repeatable(sender,
     backup.create_snapshot(s,destination,[sys.executable,'-c','print("synthetic dump stub")'])
     assert backup.verify_snapshot(s,destination)['status'] == 'verified'
     assert backup.verify_bundle(destination)['schema_version'] == 63
+
+
+# spec: ANYM-655
+@pytest.mark.parametrize('scoped', [False, True])
+def test_send_flood_during_background_status_write_blocks_background_admission(scoped):
+    async def scenario():
+        clock = Clock(); state = State(clock); gate = RequestGovernor(state,clock=clock,sleep=clock.sleep)
+        sending = asyncio.Event(); flood = asyncio.Event(); entered = Event(); release = Event(); calls = []
+        phase = 'live_search' if scoped else 'telegram_history'
+        def status(kind, current):
+            if current == phase: entered.set(); assert release.wait(2)
+        state.status = status
+        async def send(): sending.set(); await flood.wait(); raise ProviderRateLimited(60)
+        async def background(): calls.append(clock())
+        tasks = [asyncio.create_task(gate.call(send,'provider_send'))]
+        try:
+            await asyncio.wait_for(sending.wait(),1)
+            tasks.append(asyncio.create_task(gate.scoped_call(background,phase,'search') if scoped
+                else gate.call(background,phase)))
+            assert await asyncio.to_thread(entered.wait,1)
+            flood.set()
+            with pytest.raises(ProviderRateLimited): await tasks[0]
+            release.set()
+            if scoped:
+                with pytest.raises(ProviderRateLimited): await tasks[1]
+                assert calls == []
+            else:
+                await tasks[1]
+                assert calls == [61]
+        finally:
+            release.set()
+            for task in tasks: task.cancel()
+            await asyncio.gather(*tasks,return_exceptions=True)
+    asyncio.run(scenario())
+
+
+# spec: ANYM-655
+def test_expiry_pool_acquisition_obeys_one_absolute_deadline(sender, monkeypatch):  # noqa: F811
+    import copy
+    from psycopg_pool import ConnectionPool, PoolTimeout
+    s, _, _, _, state = sender
+    monkeypatch.setattr(outgoing,'EXPIRY_SECONDS',.2,raising=False)
+    with ConnectionPool(s.pool.conninfo,min_size=1,max_size=1) as pool:
+        archive = copy.copy(state.archive); archive.store = copy.copy(archive.store); archive.store.pool = pool
+        worker = outgoing.OutgoingWorker(NS(archive=archive,account=state.account,lease=state.lease),None)
+        with pool.connection():
+            began = time.monotonic()
+            with pytest.raises(PoolTimeout): worker.expire_queued()
+            assert time.monotonic()-began < .6
+
+
+# spec: ANYM-655
+def test_stalled_expiry_transaction_releases_fence_and_cancellation_is_bounded(sender, monkeypatch):  # noqa: F811
+    from messaging_service.archive import Archive
+    s, _, _, _, state = sender; entered = Event(); release = Event(); original = Archive.fence
+    monkeypatch.setattr(outgoing,'EXPIRY_SECONDS',.2,raising=False)
+    monkeypatch.setattr(outgoing,'EXPIRY_GRACE',.1,raising=False)
+    def stalled(c, account, lease):
+        original(c,account,lease); entered.set(); assert release.wait(2)
+    monkeypatch.setattr(Archive,'fence',staticmethod(stalled))
+    worker = TelegramCollector.__new__(TelegramCollector); worker.state = state; worker.database_retry = .01
+    async def scenario():
+        task = asyncio.create_task(worker.outgoing_expiry_loop())
+        try:
+            assert await asyncio.to_thread(entered.wait,1)
+            began = time.monotonic(); task.cancel()
+            with pytest.raises(asyncio.CancelledError): await task
+            assert time.monotonic()-began < .5 and not release.is_set()
+            # The SQL client is still stalled: only the server deadline can free this row.
+            with s.pool.connection() as c:
+                c.execute("SET LOCAL lock_timeout='100ms'")
+                assert c.execute('SELECT 1 FROM collector_leases WHERE account=%s FOR UPDATE',
+                    (state.account,)).fetchone()
+        finally:
+            release.set(); task.cancel(); await asyncio.gather(task,return_exceptions=True)
+    asyncio.run(scenario())
