@@ -5,6 +5,7 @@ from pathlib import Path
 import time
 
 from .archive_store import Store, MAX_TEXT, namespace
+from . import plaud, archive_plaud
 from .omi import metadata, pagination, content
 from .security import Failure, provider_token, read_document
 
@@ -100,20 +101,29 @@ class ArchiveRuntime:
         for position in ([None, checkpoint] if checkpoint is not None else [None]):
             token = self.current(account)
             fingerprint = hashlib.sha256(token.encode()).hexdigest()
-            params = {'limit':25, 'offset':0, 'include_transcript':'false'}
-            if position is not None:
-                params['cursor'] = position
-            values, headers = await self.provider.get(token, params=params)
-            if not isinstance(values, list) or len(values) > 25:
-                raise Failure('invalid_provider_response')
-            items = [metadata(value) for value in values]
-            _, next_page = pagination(headers, len(items), 25)
+            if account.provider == 'plaud':
+                page = position if position is not None else 1
+                if type(page) is not int or not 1 <= page <= 100000:
+                    raise Failure('archive_unavailable')
+                value = await self.remote.call(token,'list_files',{'page':page,'page_size':25})
+                items, _, next_page = plaud.listing(value,25,page)
+            else:
+                params = {'limit':25, 'offset':0, 'include_transcript':'false'}
+                if position is not None:
+                    params['cursor'] = position
+                values, headers = await self.provider.get(token, params=params)
+                if not isinstance(values, list) or len(values) > 25:
+                    raise Failure('invalid_provider_response')
+                items = [metadata(value) for value in values]
+                _, next_page = pagination(headers, len(items), 25)
             # Refreshing the head must not replace an unfinished history cursor.
             next_checkpoint = checkpoint if position is None and checkpoint is not None else next_page
             await self.db('discover', account, items, next_checkpoint, now,
                           lambda: self.current(account, fingerprint))
 
     async def observe(self, account, recording_id, now):
+        if account.provider == 'plaud':
+            return await self.observe_plaud(account, recording_id, now)
         old = await self.db('record', account, recording_id)
         projected, observations = old['metadata'], {}
         token = self.current(account)
@@ -170,6 +180,46 @@ class ArchiveRuntime:
         except Failure as error:
             return {**result,'error':error.code}
 
+    async def observe_plaud(self, account, recording_id, now):
+        token = self.current(account)
+        fingerprint = hashlib.sha256(token.encode()).hexdigest()
+        def guard():
+            self.current(account, fingerprint)
+        async def call(name, args):
+            return await self.remote.call(self.current(account,fingerprint), name, args)
+        # Commit each part after its own completed attempt, without waiting for
+        # the other part's readiness. Notes get their own bounded request even
+        # if a transcript window later fails or the collector is cancelled.
+        async with asyncio.timeout(60):
+            for kind in ('summary','transcript'):
+                old = await self.db('record',account,recording_id)
+                try:
+                    async with asyncio.timeout(12 if kind == 'summary' else 40):
+                        if kind == 'summary':
+                            value = await call('get_note',{'file_id':recording_id})
+                            state,text = plaud.content(value,'summary',recording_id)
+                        else:
+                            state,text = await archive_plaud.transcript(call,recording_id)
+                        if len(text.encode())>MAX_TEXT:
+                            raise Failure('archive_content_limit')
+                    observation = state,text,None
+                except (Failure,TimeoutError,ValueError,TypeError,UnicodeError,RecursionError) as error:
+                    code = error.code if isinstance(error,Failure) else (
+                        'provider_timeout' if isinstance(error,TimeoutError) else 'invalid_provider_response')
+                    observation = 'error','',code
+                consistency = {'transcript':'observed_equal_reads_not_atomic_snapshot'} if kind == 'transcript' else {}
+                try:
+                    observations = {kind:observation}
+                    if kind == 'summary' and 'transcript' not in old['parts']:
+                        observations['transcript'] = 'pending','',None
+                    await self.db('observe',account,recording_id,old['metadata'],observations,now,guard,consistency)
+                except Failure as error:
+                    if error.code != 'archive_content_limit':
+                        raise
+                    await self.db('observe',account,recording_id,old['metadata'],
+                                  {kind:('error','','archive_content_limit')},now,guard)
+
+
     async def run_once(self, *, now=None):
         if self.collecting.locked():
             return
@@ -190,13 +240,11 @@ class ArchiveRuntime:
                 now = time.time() if now is None else now
                 indexes = [(self.turn + i) % len(accounts) for i in range(min(4, len(accounts)))]
                 self.error = None
-                async with asyncio.timeout(60):
+                async with asyncio.timeout(300 if any(a.provider == 'plaud' for a in accounts) else 60):
                     for index in indexes:
                         self.turn = (index + 1) % len(accounts)
                         account = accounts[index]
                         try:
-                            if account.provider != 'omi':
-                                raise Failure('archive_provider_unsupported')
                             await self.db('capacity')
                             discovery_error = None
                             try:

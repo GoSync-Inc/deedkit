@@ -232,7 +232,7 @@ class Store:
                              (namespace(account), provider_id)).fetchone()
             return self.decoded(row) if row else None
 
-    def observe(self, account, provider_id, metadata, observations, now, guard=lambda: None):
+    def observe(self, account, provider_id, metadata, observations, now, guard=lambda: None, consistency=None):
         ns = namespace(account)
         def change(db):
             row = db.execute('SELECT * FROM records WHERE namespace=? AND provider_id=?', (ns, provider_id)).fetchone()
@@ -247,9 +247,11 @@ class Store:
                     digest = hashlib.sha256(text.encode()).hexdigest()
                     usable_change |= part['digest'] != digest
                     part.update(state='available', text=text, digest=digest, last_success=now)
+                    if consistency and kind in consistency:
+                        part['consistency'] = consistency[kind]
                 part.update(attempt_state=state, attempt_error=error, attempted_at=now)
                 parts[kind] = part
-                failed |= state in ('pending', 'unavailable', 'error')
+            failed = any(part.get('attempt_state') in ('pending','unavailable','error') for part in parts.values())
             if sum(len(p['text'].encode()) for p in parts.values()) > MAX_TEXT:
                 raise Failure('archive_content_limit')
             body = canonical(metadata).decode()

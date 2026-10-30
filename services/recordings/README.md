@@ -4,7 +4,7 @@ An optional, independent HTTP backend for the DeedKit gateway. Version 0.1 reads
 Omi conversation metadata, transcripts and structured overviews on demand. It
 has its own Python 3.13 environment/lock. By default it has no database,
 collector or durable content cache. The optional text archive below adds private
-SQLite state and Omi polling only for explicitly configured archive accounts. The PLAUD adapter reads its official remote MCP; its distinct
+SQLite state and Omi/PLAUD polling only for explicitly configured archive accounts. The PLAUD adapter reads its official remote MCP; its distinct
 authorization, data route and limitations are described below.
 
 ## Install and authorize
@@ -206,8 +206,8 @@ Keep it across token rotation. **When reusing a local account ID for another
 provider identity, generate a new namespace.** The service cannot infer whether
 a replacement token belongs to the same person. Provider, account ID and this
 namespace jointly isolate stored history. An account without this field has no
-background collection. PLAUD remains available on demand; this initial archive
-slice reports `archive_provider_unsupported` for its background ingestion.
+background collection. PLAUD uses the same opt-in collector and stable-namespace isolation. No new
+account gains archive collection automatically.
 
 Use a canonical absolute directory path with no symlink components. Its existing
 parent must be private operator-controlled storage outside the checkout. The
@@ -242,7 +242,8 @@ produce reference-only journal events. Replays do not duplicate records/events.
 Latest accepted text is retained indefinitely; provider deletions do not purge it.
 No content or journal retention deletion is automated.
 
-Limits: 60 seconds per record/pass, 2 MiB combined accepted text per record,
+Limits: 60 seconds per record, 60 seconds per Omi-only pass (300 seconds when
+PLAUD is configured), 2 MiB combined accepted text per record,
 10,000 not-yet-attempted queued records per namespace, 100 ms SQLite busy wait and
 a 2-second SQL progress deadline. Poll interval is at least 60 seconds. Archive
 byte ceiling defaults to 1 GiB (minimum 128 MiB); filesystem free-space reserve
@@ -283,3 +284,28 @@ and synthetic text/event readback. Production restore/backup enrollment is a
 separate operation under the existing backup policy. Rollback of this feature:
 remove top-level `archive` and every account's `archive_namespace` from
 configuration, then stop only this owned service before package downgrade; keep the private state intact for re-enable or recovery.
+
+### Automatic PLAUD text ingestion (ANYM-654)
+
+The collector uses only `list_files`, `get_note` and `get_transcript` at the fixed
+official remote MCP origin. It never calls `get_file`, follows a linked body URL
+itself or obtains audio links. The vendor's US transit and internal linked-body
+resolution disclosure above still applies. Discovery polls unfiltered pages,
+revisits the head and resets traversal after an empty page; empty pages still
+leave coverage `unknown`. Pending/error work receives bounded retries.
+
+PLAUD transcript ingestion follows contiguous 500-segment windows, checks file,
+block, offsets, totals, cursor progress and final coverage, and accepts at most
+10,000 segments / 2 MiB combined accepted text. It reads the entire transcript
+twice and requires identical canonical segment content and total. Accepted text
+is labelled `observed_equal_reads_not_atomic_snapshot`: equal observations detect
+many mutations but cannot prove an atomic vendor snapshot. A changed, looping,
+incomplete or oversized observation never replaces previously accepted text.
+The existing on-demand one-window 500-segment refusal stays unchanged.
+
+Each part commits immediately after its own complete attempt. Vendor notes are
+attempted separately first, so a failed/long transcript cannot discard ready
+notes; a transcript does not wait for notes to become ready. Note requests have
+a 12-second budget, full transcript verification 40 seconds, within a 60-second
+record budget including commits. This service creates neither transcript nor
+summary; it reads the vendor's existing text and makes no paid processing call.
