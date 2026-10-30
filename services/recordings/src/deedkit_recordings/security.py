@@ -28,6 +28,7 @@ class Account(Strict):
     provider: Literal['omi', 'plaud']
     label: str = Field(min_length=1, max_length=128)
     token_file: str
+    archive_namespace: str | None = Field(default=None, pattern=r'^[0-9a-f]{32}$')
 
 
 class Principal(Strict):
@@ -38,11 +39,19 @@ class Principal(Strict):
     permissions: list[Literal['recordings:read', 'recordings:content', 'recordings:audio']]
 
 
+class ArchiveSettings(Strict):
+    directory: str
+    poll_seconds: int = Field(default=300, ge=60, le=86400)
+    max_bytes: int = Field(default=1024 ** 3, ge=128 * 1024 ** 2)
+    free_reserve_bytes: int = Field(default=1024 ** 3, ge=256 * 1024 ** 2)
+
+
 class Document(Strict):
     version: Literal[1]
     cursor_secret_file: str
     accounts: list[Account] = Field(max_length=64)
     principals: list[Principal] = Field(max_length=256)
+    archive: ArchiveSettings | None = None
 
 
 def unique(pairs):
@@ -76,9 +85,17 @@ def private(path, maximum):
         os.close(fd)
 
 
-def configuration(path, key):
+def read_document(path, *, include_archive=True):
     try:
-        doc = Document.model_validate(loads(private(str(path), 262144)))
+        value = loads(private(str(path), 262144))
+        if not include_archive and isinstance(value, dict):
+            # Archive-only errors cannot disable existing provider reads. Keep
+            # every auth/grant field and every other unknown-field check strict.
+            value = {k:v for k,v in value.items() if k != 'archive'}
+            if isinstance(value.get('accounts'), list):
+                value['accounts'] = [{k:v for k,v in row.items() if k != 'archive_namespace'}
+                    if isinstance(row,dict) else row for row in value['accounts']]
+        doc = Document.model_validate(value)
         accounts = {a.id: a for a in doc.accounts}
         if len(accounts) != len(doc.accounts):
             raise ValueError('duplicate account')
@@ -98,6 +115,12 @@ def configuration(path, key):
             raise ValueError('short cursor secret')
     except (OSError, ValueError, TypeError):
         raise Failure('configuration_unavailable') from None
+    return doc, secret
+
+
+def configuration(path, key):
+    doc, secret = read_document(path, include_archive=False)
+    accounts = {a.id: a for a in doc.accounts}
     hashed = hashlib.sha256(key.encode()).hexdigest()
     for actor in doc.principals:
         if hmac.compare_digest(actor.key_sha256, hashed):

@@ -2,8 +2,9 @@
 
 An optional, independent HTTP backend for the DeedKit gateway. Version 0.1 reads
 Omi conversation metadata, transcripts and structured overviews on demand. It
-has its own Python 3.13 environment/lock, no database, collector or durable
-content cache. The PLAUD adapter reads its official remote MCP; its distinct
+has its own Python 3.13 environment/lock. By default it has no database,
+collector or durable content cache. The optional text archive below adds private
+SQLite state and Omi polling only for explicitly configured archive accounts. The PLAUD adapter reads its official remote MCP; its distinct
 authorization, data route and limitations are described below.
 
 ## Install and authorize
@@ -54,7 +55,8 @@ Do not expose the backend publicly or log request headers/bodies/URLs at an ingr
 The CLI disables HTTP client URL logging and Uvicorn access logs. Each process
 admits four provider calls; run one process for the documented account budget.
 The 12-second deadline includes body reading and cancellation releases admission.
-There are no provider retries or background calls. Unauthenticated requests and
+On-demand reads have no provider retries. Without archive configuration there
+are no background provider calls. Unauthenticated requests and
 capabilities do not contact either provider.
 
 ## Gateway opt-in
@@ -118,7 +120,8 @@ The Omi adapter uses only documented HTTPS GET routes at `api.omi.me`. Credentia
 recording IDs, bounds, limits and provider cursor go to Omi; metadata, requested
 content and continuation tokens go to the authenticated gateway/caller. Redirects,
 environment proxies and encoded provider responses are refused. No arbitrary URL,
-upload, OAuth/login, deletion, model call, telemetry or content persistence exists.
+upload, OAuth/login, deletion, model call or telemetry exists. On-demand requests
+do not persist content; only the separately enabled archive collector does.
 An agent consuming the returned text may put it in its own model context.
 
 Official contract: [Omi conversations API](https://docs.omi.me/doc/developer/api/conversations).
@@ -141,8 +144,8 @@ requested recording/page identifiers only to `https://mcp.plaud.ai/mcp`. The ven
 [documents US-hosted HTTP transit](https://docs.plaud.ai/plaud-mcp-cli/mcp), governed
 by its privacy policy. Its remote MCP can resolve linked transcript/note bodies
 and has its own logging/telemetry policy; this adapter cannot disable or verify
-vendor internals. DeedKit itself makes no linked-body/audio fetches, model calls,
-content writes or request/content logs. No Node subprocess/package is installed.
+vendor internals. DeedKit itself makes no linked-body/audio fetches, model calls or request/content
+logs. On-demand PLAUD reads do not write content. No Node subprocess/package is installed.
 
 The adapter supports MCP protocol `2025-06-18`, JSON and bounded SSE responses,
 structured tool objects or the exact JSON wrapper published in `@plaud-ai/mcp`
@@ -179,3 +182,104 @@ and backend account access to stop new link issuance; an issued link's lifetime
 is controlled by PLAUD. For rollback, remove PLAUD accounts/audio configuration
 before downgrading the recordings package, and remove the audio tool from gateway
 profiles before downgrading its catalog. Keep Omi configuration unchanged.
+
+
+## Optional private text archive (ANYM-651)
+
+Add `archive` to the private configuration and an explicit `archive_namespace`
+to each account to be archived:
+
+```json
+{
+  "archive": {
+    "directory": "/private/recordings/archive",
+    "poll_seconds": 300,
+    "max_bytes": 1073741824,
+    "free_reserve_bytes": 1073741824
+  }
+}
+```
+
+This is a fragment, merged with the configuration above. `archive_namespace`
+is 32 lowercase hexadecimal characters, generated once per provider identity.
+Keep it across token rotation. **When reusing a local account ID for another
+provider identity, generate a new namespace.** The service cannot infer whether
+a replacement token belongs to the same person. Provider, account ID and this
+namespace jointly isolate stored history. An account without this field has no
+background collection. PLAUD remains available on demand; this initial archive
+slice reports `archive_provider_unsupported` for its background ingestion.
+
+Use a canonical absolute directory path with no symlink components. Its existing
+parent must be private operator-controlled storage outside the checkout. The
+service creates the archive directory as 0700 and SQLite/lock files as 0600;
+it rejects unsafe existing modes, foreign ownership, symlinks, unknown schema,
+corruption and a second writer. Run exactly one worker. Archive-only configuration validation, startup and
+collector errors stay isolated from the existing on-demand HTTP operations.
+Stopping this owned process cancels its collector, waits for bounded SQLite work
+and releases its writer lock; no other service or provider session is stopped.
+
+One serial collector uses at most one of the four aggregate provider-call slots.
+Polling revisits the newest page and advances a persisted history traversal.
+Discovered IDs and continuation commit atomically; restarting can repeat a page
+but cannot skip queued IDs. New, failed/pending and previously saved records each
+receive a bounded share of work, interleaved with persisted rotating priority
+across interrupted passes. Discovery failures or a saturated queue do not
+prevent processing already queued records; rejected discovery leaves its
+checkpoint unchanged. Provider coverage always remains `unknown`;
+a traversal ending is not proof of a complete account archive. Checks repeat
+before every provider call and commit; removing an account, changing namespace
+or rotating its token discards any in-flight result. Disabling `archive` stops
+new collection. Changing its directory requires a service restart.
+
+Only whitelisted metadata, provider IDs, transcript speaker/offset text and the
+vendor's overview are stored locally. No audio, bearer download URL, token or raw
+vendor inventory is stored. No transcription, model API, paid processing or
+inbound webhook runs. A ready transcript can be accepted while summary processing
+is pending. Empty, pending, malformed or failed observations never erase an
+accepted nonempty text part. Each part keeps its last accepted digest/time and
+its latest attempt state/error; these may differ. Only actual usable text changes
+produce reference-only journal events. Replays do not duplicate records/events.
+Latest accepted text is retained indefinitely; provider deletions do not purge it.
+No content or journal retention deletion is automated.
+
+Limits: 60 seconds per record/pass, 2 MiB combined accepted text per record,
+10,000 not-yet-attempted queued records per namespace, 100 ms SQLite busy wait and
+a 2-second SQL progress deadline. Poll interval is at least 60 seconds. Archive
+byte ceiling defaults to 1 GiB (minimum 128 MiB); filesystem free-space reserve
+defaults to 1 GiB (minimum 256 MiB). Admission counts SQLite/index/WAL files and
+reserves 64 MiB transaction headroom; SQLite pages are capped at one third of
+the configured archive ceiling to leave WAL space. At capacity or SQLite FULL,
+writes and checkpoint advancement stop with `archive_capacity`; accepted text
+and prior checkpoints survive rollback. Freeing space or raising the limits
+allows a later pass to resume. This archive does not reserve disk for other
+services beyond the configured filesystem reserve.
+
+The full-text index and reference-only journal commit with text and revision.
+Agent-facing archive search/context and outbound subscriptions are separate
+follow-up slices; this slice exposes no new gateway tool or public ingress.
+The private authenticated backend `POST /v1/archive_status` accepts an explicit
+`account` within the current principal ceiling and requires `recordings:read`.
+It returns counts, last success and fixed durable/runtime errors without reading
+provider tokens or contacting a vendor. In particular, `archive_capacity` stays
+visible even when no error-state write is possible, and clears after recovery.
+
+### Consistent local snapshot and restore probe
+
+The archive is **not automatically enrolled in the existing backup system**.
+Create a consistent private snapshot with the installed CLI while the writer runs:
+
+```sh
+deedkit-recordings --config /private/recordings/config.json --backup-to /private/snapshots/recordings.sqlite
+```
+
+The canonical destination parent must already exist as a private 0700 directory;
+the destination must be new and outside the live archive directory. The command
+uses SQLite Online Backup with a 5-second deadline, creates a 0600 file, never
+reads provider tokens and never contacts vendors. Do not copy an active SQLite
+file or its WAL separately. This snapshot is local; it is not a delivery receipt.
+For a restore probe, copy that snapshot into a separate private scratch directory
+as `archive.sqlite`, use a synthetic configuration and run `PRAGMA integrity_check`
+and synthetic text/event readback. Production restore/backup enrollment is a
+separate operation under the existing backup policy. Rollback of this feature:
+remove top-level `archive` and every account's `archive_namespace` from
+configuration, then stop only this owned service before package downgrade; keep the private state intact for re-enable or recovery.
