@@ -409,7 +409,7 @@ def test_schema38_database_migrates_with_floor_zero_and_quarantine_sets_the_hold
             restored.set_subscription_retention(True)
         restored.migrate()
         with restored.pool.connection() as c:
-            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '62'
+            assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '63'
             row = c.execute('SELECT retention_floor,retention_hold FROM subscriptions WHERE id=%s', (sid,)).fetchone()
             assert row == {'retention_floor': 0, 'retention_hold': False}
             assert legacy_matches(c) == references and len(references) == 3

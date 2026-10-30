@@ -828,13 +828,13 @@ def _journal_failed(kind, error):
 
 
 def journal_send_failures(c, rows):
-    """ANYM-535: one send.failed row per failed or uncertain send, in the caller's transaction.
+    """ANYM-535/655: one reference event per failed/uncertain/expired/cancelled send.
 
     Each row has its own savepoint: an error rolls back that row and its counter step only, is logged
     and counted, and the send status commits anyway. IDs and codes only, never text.
     """
     for row in rows:
-        if row['status'] not in ('failed', 'unknown'):
+        if row['status'] not in ('failed', 'unknown', 'expired', 'cancelled'):
             continue
         try:
             with c.transaction():

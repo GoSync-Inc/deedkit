@@ -3,7 +3,7 @@
 The public repository is a fresh source export, not the Personal OS git history.
 Never publish correspondence, operational state, backups, session data or tokens.
 Python and npm distribution versions must match `messaging_service.__version__`.
-The current source version is 0.9.19 (experimental), with PostgreSQL schema 62.
+The current source version is 0.9.19 (experimental), with PostgreSQL schema 63.
 The published npm/PyPI release remains 0.9.9 until a separate registry release.
 Sending is implemented in the source with explicit account opt-in and per-key
 permissions; see [SENDING.md](SENDING.md).

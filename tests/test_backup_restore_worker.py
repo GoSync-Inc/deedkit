@@ -147,10 +147,13 @@ def test_large_stream_keeps_original_ciphertext_source_distinct_from_tar_members
     assert hashlib.sha256((tmp_path/'large-restore/files'/digest).read_bytes()).hexdigest()==digest
 
 
-# The id '36-36' is a Tiden case ID; since schema 62 the first unsupported schema is 63.
+# The id '36-36' is a Tiden case ID; its matching-version case probes the current ceiling.
 @pytest.mark.parametrize('actual,manifest',[('34',31),('31',34),pytest.param('63',63,id='36-36'),('corrupt',34),(None,34)])
 def test_restored_database_schema_must_match_manifest_before_quarantine_or_proof(actual,manifest):
     from messaging_service import backup_restore_worker as worker
+    if actual == str(manifest):
+        from messaging_service.backup import SCHEMAS
+        manifest = SCHEMAS[-1]+1; actual = str(manifest)
     class Lease:
         def __enter__(self):return SimpleNamespace(execute=lambda query:SimpleNamespace(fetchone=lambda:({'value':actual} if actual is not None else None)))
         def __exit__(self,*args):pass

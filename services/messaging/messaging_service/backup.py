@@ -74,7 +74,7 @@ V57_TABLES={'conflict_reevaluations':'job,job_version,account'}
 V58_TABLES={'module_router_cursors':'source','module_router_gaps':'id'}
 # ANYM-520: each endpoint hint attempt, kept 7 days (no body, header value or URL).
 V61_TABLES={'delivery_attempts':'id'}
-SCHEMAS=range(2,63)
+SCHEMAS=range(2,64)
 V26_TABLES={'subscriptions':'id','subscription_sources':'subscription,account,chat',
             'subscription_matches':'subscription,event'}
 V17_TABLES={'message_conflicts':'receipt_digest'}
