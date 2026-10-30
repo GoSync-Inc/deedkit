@@ -241,9 +241,12 @@ class TelethonProvider:
                 self.read_gap_pending=True
                 logging.getLogger(__name__).warning('read_state_gap_failed: %s',type(exc).__name__)
 
-    async def rpc(self,operation,phase):
+    async def rpc(self,operation,phase,*,before=None):
         governor=getattr(self,'governor',None)
-        return await governor.call(operation,phase) if governor else await operation()
+        if governor:
+            return await governor.call(operation,phase,**({'before':before} if before is not None else {}))
+        if before is not None:await before()
+        return await operation()
 
     def subscribe(self,capture,deleted,receipts=None,*,owner_reads=None):
         from telethon import events,types
@@ -281,7 +284,7 @@ class TelethonProvider:
         from telethon import types
         from telethon.errors import FloodError
         report=job.get('_provider_phase')
-        # The shared rate gate may hold this send behind history or media.
+        # Admission pacing/cooldown is shared, unfinished background RPCs are not.
         if report is not None:report('waiting')
         payload=dispatch_payload(job,'telegram')
         options={'parse_mode':None,'link_preview':payload['link_preview'],
@@ -300,11 +303,13 @@ class TelethonProvider:
                 elif entity['type']=='pre':arguments['language']=entity.get('language','')
                 entities.append(constructors[entity['type']](**arguments))
             options['formatting_entities']=entities
-        async def send():
-            # Recheck after waiting for the shared rate/cooldown gate.
+        async def before():
             if datetime.now(timezone.utc).timestamp()>=job['expires_at']:
                 raise SendRejected('send_expired')
             if job.get('_preflight') is not None:await job['_preflight']()
+        async def send():
+            if datetime.now(timezone.utc).timestamp()>=job['expires_at']:
+                raise SendRejected('send_expired')
             if report is not None:report('started')
             try:message=await self.client.send_message(int(job['provider_chat']),payload['text'],**options)
             except FloodError:
@@ -314,7 +319,7 @@ class TelethonProvider:
             if not message or str(message.chat_id)!=job['provider_chat']:
                 raise RuntimeError('send_receipt_mismatch')
             return {'provider_message_id':str(message.id),'message':message}
-        return await self.rpc(send,'provider_send')
+        return await self.rpc(send,'provider_send',before=before)
 
     async def execute_operation(self,job):
         from .telegram_operations import execute
@@ -1048,6 +1053,36 @@ class TelegramCollector:
             with suppress(Exception): await asyncio.to_thread(self.archive.release,self.account,self.owner,epoch)
 
     async def outgoing_loop(self):
+        # Expiry is metadata housekeeping, never queued behind provider I/O or
+        # its FloodWait. Supervise both tasks and cancel only our own children.
+        tasks=[asyncio.create_task(self.outgoing_dispatch_loop()),
+               asyncio.create_task(self.outgoing_expiry_loop())]
+        try:
+            done,_=await asyncio.wait(tasks,return_when=asyncio.FIRST_COMPLETED)
+            for task in done:task.result()
+        finally:
+            for task in tasks:task.cancel()
+            await asyncio.gather(*tasks,return_exceptions=True)
+
+    async def outgoing_expiry_loop(self):
+        from .outgoing import OutgoingWorker
+        worker=OutgoingWorker(self.state,None)
+        delay=self.database_retry
+        while True:
+            pending=asyncio.create_task(asyncio.to_thread(worker.expire_queued))
+            try:await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                # The SQL is bounded; do not release this collector's fence
+                # while our housekeeping thread still owns its transaction.
+                try:await pending
+                except Exception:pass
+                raise
+            except database_errors():
+                await asyncio.sleep(delay);delay=min(60,delay*2);continue
+            delay=self.database_retry
+            await asyncio.sleep(1)
+
+    async def outgoing_dispatch_loop(self):
         from .outgoing import OutgoingWorker
         from .commands import CommandWorker
         worker=OutgoingWorker(self.state,self.send_outgoing,getattr(self.provider,'send_gate',None))

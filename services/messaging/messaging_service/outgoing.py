@@ -440,6 +440,26 @@ class OutgoingWorker:
     def __init__(self,state,send,gate=None):
         self.state,self.send,self.gate=state,send,gate
 
+    def expire_queued(self):
+        """ANYM-655: bounded housekeeping, independent of the provider and cooldown.
+
+        Row locks exclude a concurrent claim; never touch dispatching/unknown
+        attempts. A terminal event uses the same savepoint isolation as finish.
+        """
+        st=self.state
+        with st.archive.store.pool.connection() as c:
+            c.execute("SET LOCAL lock_timeout='100ms'")
+            c.execute("SET LOCAL statement_timeout='2s'")
+            st.archive.fence(c,st.account,st.lease)
+            rows=c.execute("""WITH due AS (
+                SELECT id FROM outgoing_messages WHERE account=%s AND status='queued'
+                AND expires_at<=clock_timestamp() ORDER BY expires_at,id LIMIT 16 FOR UPDATE SKIP LOCKED)
+                UPDATE outgoing_messages o SET status='expired',error_code='send_expired',finished_at=clock_timestamp()
+                FROM due WHERE o.id=due.id RETURNING o.id,o.account,o.chat,o.principal,o.key_id,o.status,o.error_code""",
+                (st.account,)).fetchall()
+            journal_send_failures(c,rows)
+            return len(rows)
+
     def claim(self):
         st=self.state
         with st.archive.store.pool.connection() as c:
@@ -471,8 +491,11 @@ class OutgoingWorker:
             elif not policy or not policy['enabled'] or not policy['send_enabled'] or not CollectorState.allows(policy,row['provider_chat']):
                 reason='sending_disabled'
             if reason:
-                c.execute("UPDATE outgoing_messages SET status=%s,error_code=%s,finished_at=clock_timestamp() WHERE id=%s",
-                    ('expired' if reason=='send_expired' else 'cancelled',reason,row['id']))
+                terminal=c.execute("""UPDATE outgoing_messages SET status=%s,error_code=%s,
+                    finished_at=clock_timestamp() WHERE id=%s
+                    RETURNING id,account,chat,principal,key_id,status,error_code""",
+                    ('expired' if reason=='send_expired' else 'cancelled',reason,row['id'])).fetchall()
+                journal_send_failures(c,terminal)
                 audit(c,{'id':row['principal'],'key_id':row['key_id']},'send_dispatch','denied',reason)
                 return {'cancelled':True}
             c.execute("UPDATE outgoing_messages SET status='dispatching',started_at=clock_timestamp(),lease_epoch=%s WHERE id=%s",

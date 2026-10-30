@@ -59,7 +59,11 @@ class RequestGovernor:
     def __init__(self,state,*,interval=1.0,clock=time.monotonic,sleep=asyncio.sleep,wall=time.time,budgets=None,
                  bound=None):
         self.state,self.interval,self.clock,self.sleep,self.wall=state,interval,clock,sleep,wall
-        self.lock=asyncio.Lock(); self.next_call=0
+        # Network completion is serial inside each lane, admission is shared.
+        # A background download may wait on Telegram for minutes; it must not
+        # hold the text-send lane for that entire network wait (ANYM-655).
+        self.lock=asyncio.Lock(); self.send_lock=asyncio.Lock()
+        self.pacing=asyncio.Lock(); self.next_call=0
         # bound(state, monotonic deadline) gives the same state with server-bounded transactions.
         self.bound=bound
         self.unrecorded=0  # monotonic end of an account cooldown whose write failed; retried before reads
@@ -137,16 +141,27 @@ class RequestGovernor:
             if self.unrecorded<=self.clock()+seconds:self.unrecorded=0
         if cancelled:raise asyncio.CancelledError
 
-    async def call(self,operation,phase):
+    async def _admission(self,phase,*,refusal=None,before=None):
+        async with self.pacing:
+            while True:
+                await (refusal() if refusal else self.wait())
+                delay=self.next_call-self.clock()
+                if delay>0:await self.sleep(delay)
+                # A concurrent operator or the other in-flight lane can extend
+                # the account pause while pacing or checking authorization.
+                await (refusal() if refusal else self.wait())
+                if before is not None:
+                    await before()
+                    if await self.account_remaining()>0:continue
+                await asyncio.to_thread(self.state.status,'receiving',phase)
+                if before is not None and await self.account_remaining()>0:continue
+                self.next_call=self.clock()+self.interval
+                return
+
+    async def call(self,operation,phase,*,before=None):
         from telethon.errors import FloodWaitError
-        async with self.lock:
-            await self.wait()
-            delay=self.next_call-self.clock()
-            if delay>0:await self.sleep(delay)
-            # A concurrent operator can extend the persisted cooldown while pacing.
-            await self.wait()
-            await asyncio.to_thread(self.state.status,'receiving',phase)
-            self.next_call=self.clock()+self.interval
+        async with (self.send_lock if phase=='provider_send' else self.lock):
+            await self._admission(phase,before=before)
             try:return await operation()
             except (FloodWaitError,ProviderRateLimited) as exc:
                 limited=ProviderRateLimited(exc.seconds)
@@ -164,12 +179,7 @@ class RequestGovernor:
             async def refusal():
                 remaining=max(self.scoped_remaining(scope),await self.account_remaining())
                 if remaining>0:raise ProviderRateLimited(remaining+0.999)
-            await refusal()
-            delay=self.next_call-self.clock()
-            if delay>0:await self.sleep(delay)
-            await refusal()
-            await asyncio.to_thread(self.state.status,'receiving',phase)
-            self.next_call=self.clock()+self.interval
+            await self._admission(phase,refusal=refusal)
             try:return await operation()
             except FloodWaitError as exc:
                 limited=ProviderRateLimited(exc.seconds)

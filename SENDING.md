@@ -89,10 +89,32 @@ Refresh MCP discovery after upgrading; the messaging manifest contains 41 tools.
 The 30-second provider timeout starts when the request leaves the collector.
 Waiting for the shared Telegram rate gate (history or media hit a flood wait)
 and the last-moment access check are bounded by the ten-minute expiry instead.
+An unfinished background RPC does not hold the text-send lane. One text send
+and one background request can be in flight on the same existing client; each
+lane remains serial and all request admissions share the one-second pacer and
+known account cooldown. A request already admitted before another reports a
+FloodWait may complete. Provider response time is still outside DeedKit's control.
 A send that fails before reaching the provider, or that Telegram refuses with a
 flood wait, ends as `failed` with `send_not_started` (or `expired` with
 `send_expired`): nothing was sent, so a new action with the owner's approval is
 safe. `unknown` remains only for attempts the provider may have received.
+
+Agents must keep the returned `send_id` and inspect `get_send_status` until a
+terminal result. `queued` and `dispatching` are not successful delivery. To receive
+failure events, explicitly select `send.failed` in a subscription for the same
+sending key and relevant chats; an existing configured delivery endpoint can
+notify its host. A subscription event or accepted webhook alone does not prove
+that the host ran an agent turn. No subscription or receiver is created by a send.
+
+From schema 63, `send.failed` also covers `expired` and `cancelled`, carrying only
+the send reference and status/error codes. An independent fenced sweep settles at
+most 16 expired queued requests per one-second tick, including during a stalled
+send or account cooldown. It never invokes a provider, replays a request or changes
+an uncertain attempt. Journal failures cannot undo terminal status; polling remains
+available. On schema 62 the old collector guard rejects these additional events
+without undoing the status. Migrate to 63 for their notification support; migration
+63 replaces a guard function and follows the manual production migration gates.
+The backup/restore runtime must support schema 63 before that migration.
 
 The provider payload is limited to 4000 UTF-16 units, with no automatic splitting.
 Plain is the default; Markdown and restricted HTML use the passive
