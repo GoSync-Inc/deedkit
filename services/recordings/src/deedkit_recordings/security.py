@@ -85,9 +85,17 @@ def private(path, maximum):
         os.close(fd)
 
 
-def read_document(path):
+def read_document(path, *, include_archive=True):
     try:
-        doc = Document.model_validate(loads(private(str(path), 262144)))
+        value = loads(private(str(path), 262144))
+        if not include_archive and isinstance(value, dict):
+            # Archive-only errors cannot disable existing provider reads. Keep
+            # every auth/grant field and every other unknown-field check strict.
+            value = {k:v for k,v in value.items() if k != 'archive'}
+            if isinstance(value.get('accounts'), list):
+                value['accounts'] = [{k:v for k,v in row.items() if k != 'archive_namespace'}
+                    if isinstance(row,dict) else row for row in value['accounts']]
+        doc = Document.model_validate(value)
         accounts = {a.id: a for a in doc.accounts}
         if len(accounts) != len(doc.accounts):
             raise ValueError('duplicate account')
@@ -111,7 +119,7 @@ def read_document(path):
 
 
 def configuration(path, key):
-    doc, secret = read_document(path)
+    doc, secret = read_document(path, include_archive=False)
     accounts = {a.id: a for a in doc.accounts}
     hashed = hashlib.sha256(key.encode()).hexdigest()
     for actor in doc.principals:

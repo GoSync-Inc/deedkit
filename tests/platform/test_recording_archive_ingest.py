@@ -376,3 +376,115 @@ def test_owned_background_cancellation_releases_admission_and_writer_lock(tmp_pa
         assert replacement.error is None
         await replacement.close()
     asyncio.run(run())
+
+
+# spec: ANYM-651
+@pytest.mark.parametrize('fault',['quota','shape','namespace'])
+def test_invalid_archive_configuration_never_disables_foreground_authentication(tmp_path,fault):
+    path,doc = fixture(tmp_path)
+    if fault == 'quota': doc['archive']['max_bytes'] = 0
+    elif fault == 'shape': doc['archive'] = 'invalid archive-only settings'
+    else: doc['accounts'][0]['archive_namespace'] = 'invalid namespace'
+    save(path,doc)
+    async def run():
+        app = create_app(path,transport=httpx.MockTransport(Vendor()),archive_background=False)
+        async with app.router.lifespan_context(app):
+            assert app.state.archive.error
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test',
+                    headers={'Authorization':'Bearer backend-a'}) as c:
+                result = await c.post('/v1/read_recording',json={'account':'omi-a','recording_id':'conv-a'})
+                assert result.status_code == 200
+                # Archive isolation must not weaken validation of authentication/grants.
+                doc['principals'][0]['permissions'] = ['invalid-grant']; save(path,doc)
+                assert (await c.post('/v1/read_recording',json={'account':'omi-a','recording_id':'conv-a'})).status_code == 503
+    asyncio.run(run())
+
+
+# spec: ANYM-651
+@pytest.mark.parametrize('listing_error',[False,True])
+def test_discovery_failure_and_queue_saturation_do_not_block_durable_work(tmp_path,monkeypatch,listing_error):
+    path,doc = fixture(tmp_path)
+    monkeypatch.setattr('deedkit_recordings.archive_store.QUEUE_LIMIT',3)
+    def vendor(request):
+        if request.url.path.endswith('/conversations'):
+            return httpx.Response(503) if listing_error else httpx.Response(200,json=[conversation(f'new-{i}') for i in range(3)])
+        return httpx.Response(200,json=conversation(request.url.path.rsplit('/',1)[-1]))
+    async def run():
+        r = runtime(path,vendor); await r.start(background=False)
+        account = r.document().accounts[0]
+        await r.db('discover',account,[{'id':'old-0'},{'id':'old-1'}],None,100)
+        await r.run_once(now=100)
+        assert (await r.db('status',account))['queued_count'] == 0
+        assert len(await r.db('events',0,100)) == 2
+        assert await r.db('checkpoint',account) is None
+        if not listing_error:
+            await r.run_once(now=200)
+            assert (await r.db('status',account))['queued_count'] == 0
+            assert len(await r.db('events',0,100)) == 5
+            await r.run_once(now=300)
+            assert len(await r.db('events',0,100)) == 5
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-651
+def test_work_classes_make_actual_progress_across_interrupted_passes(tmp_path,monkeypatch):
+    path,_ = fixture(tmp_path)
+    original_timeout = asyncio.timeout
+    monkeypatch.setattr('deedkit_recordings.archive.asyncio.timeout',
+                        lambda seconds: original_timeout(0.075 if seconds == 60 else seconds))
+    async def vendor(request):
+        if request.url.path.endswith('/conversations'):
+            return httpx.Response(200,json=[])
+        await asyncio.sleep(0.04)
+        return httpx.Response(200,json=conversation(request.url.path.rsplit('/',1)[-1]))
+    async def run():
+        r = runtime(path,vendor); await r.start(background=False)
+        account = r.document().accounts[0]
+        items = [{'id':f'new-{n}'} for n in range(30)] + [{'id':'retry'},{'id':'refresh'}]
+        await r.db('discover',account,items,None,1)
+        await r.db('observe',account,'retry',{'id':'retry'},{'summary':('error','','provider_unavailable')},1)
+        await r.db('observe',account,'refresh',{'id':'refresh'},{'summary':('available','old summary',None)},1)
+        for now in (4000,4010,4020): await r.run_once(now=now)
+        assert (await r.db('record',account,'retry'))['attempted'] > 1
+        assert (await r.db('record',account,'refresh'))['attempted'] > 1
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-651
+def test_capacity_status_is_readable_without_a_successful_state_write(tmp_path,monkeypatch):
+    path,_ = fixture(tmp_path)
+    async def run():
+        app = create_app(path,transport=httpx.MockTransport(Vendor()),archive_background=False)
+        async with app.router.lifespan_context(app):
+            r = app.state.archive; await r.run_once(now=100)
+            original = r.store.capacity
+            def full(): raise Failure('archive_capacity')
+            monkeypatch.setattr(r.store,'capacity',full)
+            await r.run_once(now=4000)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test',
+                    headers={'Authorization':'Bearer backend-a'}) as c:
+                paused = await c.post('/v1/archive_status',json={'account':'omi-a'})
+                assert paused.status_code == 200 and paused.json()['error'] == 'archive_capacity'
+                assert paused.json()['record_count'] == 1
+                denied = await c.post('/v1/archive_status',json={'account':'other-account'})
+                assert denied.status_code == 403
+                monkeypatch.setattr(r.store,'capacity',original)
+                await r.run_once(now=8000)
+                resumed = (await c.post('/v1/archive_status',json={'account':'omi-a'})).json()
+                assert resumed['error'] is None
+    asyncio.run(run())
+
+
+# spec: ANYM-651
+def test_backup_rejects_descendants_of_live_archive(tmp_path):
+    path,_ = fixture(tmp_path)
+    async def run():
+        r = runtime(path,Vendor()); await r.start(background=False)
+        child = r.store.directory / 'snapshots'; child.mkdir(mode=0o700)
+        with pytest.raises(Failure,match='archive_unavailable'):
+            await r.db('backup',child/'copy.sqlite')
+        assert not (child/'copy.sqlite').exists()
+        await r.close()
+    asyncio.run(run())

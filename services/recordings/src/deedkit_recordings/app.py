@@ -39,6 +39,10 @@ class Reading(Strict):
     cursor: str | None = Field(default=None, min_length=1, max_length=8192)
 
 
+class ArchiveStatus(Strict):
+    account: str = Field(pattern=r'^[A-Za-z0-9_-]{1,64}$')
+
+
 class Audio(Strict):
     account: str = Field(pattern=r'^[A-Za-z0-9_-]{1,64}$')
     recording_id: str = Field(pattern=r'^[A-Za-z0-9_-]{1,256}$')
@@ -94,7 +98,7 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
         if not authorization.startswith('Bearer ') or not 1 <= len(authorization[7:]) <= 512:
             raise Failure('unauthorized', 401)
         actor, accounts, secret = configuration(path, authorization[7:])
-        models = {'capabilities': Empty, 'list_recordings': Listing, 'read_recording': Reading, 'audio': Audio}
+        models = {'capabilities': Empty, 'list_recordings': Listing, 'read_recording': Reading, 'audio': Audio, 'archive_status': ArchiveStatus}
         model = models.get(operation)
         if model is None:
             raise Failure('not_found_or_forbidden', 404)
@@ -117,7 +121,7 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
         if operation == 'capabilities':
             return {'service': 'deedkit-recordings', 'version': '0.1.0', 'principal': actor.id,
                     'permissions': actor.permissions, 'tool_manifest': {'names': [n for n in models
-                        if (n != 'read_recording' or CONTENT in actor.permissions) and (n != 'audio' or AUDIO in actor.permissions)]},
+                        if (n != 'archive_status' or app.state.archive.store is not None) and (n != 'read_recording' or CONTENT in actor.permissions) and (n != 'audio' or AUDIO in actor.permissions)]},
                     'accounts': [{'id': a.id, 'provider': a.provider, 'label': a.label}
                                  for a in accounts.values() if a.id in actor.accounts],
                     'audio': 'plaud_link_requires_audio_scope' if any(a.provider == 'plaud' and a.id in actor.accounts for a in accounts.values()) else 'unsupported', 'coverage': 'on_demand_provider_reads_not_archive',
@@ -126,6 +130,8 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
         if args.account not in actor.accounts:
             raise Failure('not_found_or_forbidden', 403)
         account = accounts[args.account]
+        if operation == 'archive_status':
+            return await app.state.archive.status(account.id)
         token = provider_token(account)
         params = dates(args) if operation == 'list_recordings' else {}
         binding = {'provider': account.provider, 'account': account.id, 'principal': actor.key_sha256,

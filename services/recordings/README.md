@@ -213,7 +213,7 @@ Use a canonical absolute directory path with no symlink components. Its existing
 parent must be private operator-controlled storage outside the checkout. The
 service creates the archive directory as 0700 and SQLite/lock files as 0600;
 it rejects unsafe existing modes, foreign ownership, symlinks, unknown schema,
-corruption and a second writer. Run exactly one worker. Archive startup and
+corruption and a second writer. Run exactly one worker. Archive-only configuration validation, startup and
 collector errors stay isolated from the existing on-demand HTTP operations.
 Stopping this owned process cancels its collector, waits for bounded SQLite work
 and releases its writer lock; no other service or provider session is stopped.
@@ -222,7 +222,10 @@ One serial collector uses at most one of the four aggregate provider-call slots.
 Polling revisits the newest page and advances a persisted history traversal.
 Discovered IDs and continuation commit atomically; restarting can repeat a page
 but cannot skip queued IDs. New, failed/pending and previously saved records each
-receive a bounded share of work. Provider coverage always remains `unknown`;
+receive a bounded share of work, interleaved with persisted rotating priority
+across interrupted passes. Discovery failures or a saturated queue do not
+prevent processing already queued records; rejected discovery leaves its
+checkpoint unchanged. Provider coverage always remains `unknown`;
 a traversal ending is not proof of a complete account archive. Checks repeat
 before every provider call and commit; removing an account, changing namespace
 or rotating its token discards any in-flight result. Disabling `archive` stops
@@ -253,7 +256,12 @@ services beyond the configured filesystem reserve.
 
 The full-text index and reference-only journal commit with text and revision.
 Agent-facing archive search/context and outbound subscriptions are separate
-follow-up slices; this slice exposes neither new gateway tools nor public routes.
+follow-up slices; this slice exposes no new gateway tool or public ingress.
+The private authenticated backend `POST /v1/archive_status` accepts an explicit
+`account` within the current principal ceiling and requires `recordings:read`.
+It returns counts, last success and fixed durable/runtime errors without reading
+provider tokens or contacting a vendor. In particular, `archive_capacity` stays
+visible even when no error-state write is possible, and clears after recovery.
 
 ### Consistent local snapshot and restore probe
 
@@ -273,5 +281,5 @@ For a restore probe, copy that snapshot into a separate private scratch director
 as `archive.sqlite`, use a synthetic configuration and run `PRAGMA integrity_check`
 and synthetic text/event readback. Production restore/backup enrollment is a
 separate operation under the existing backup policy. Rollback of this feature:
-remove `archive` from configuration and stop only this owned service before
-package downgrade; keep the private state intact for re-enable or recovery.
+remove top-level `archive` and every account's `archive_namespace` from
+configuration, then stop only this owned service before package downgrade; keep the private state intact for re-enable or recovery.

@@ -14,6 +14,7 @@ class ArchiveRuntime:
         self.path, self.provider, self.remote = Path(path), provider, remote
         self.store, self.task, self.error = None, None, None
         self.collecting, self.turn = asyncio.Lock(), 0
+        self.errors = {}
 
     def document(self):
         return read_document(self.path)[0]
@@ -147,6 +148,28 @@ class ArchiveRuntime:
             rejected = {kind: ('error', '', 'archive_content_limit') for kind in observations}
             await self.db('observe', account, recording_id, old['metadata'], rejected, now, guard)
 
+    async def status(self, account):
+        account_id = account if isinstance(account,str) else account.id
+        result = {'account':account_id,'enabled':False,'coverage':'unknown','record_count':None,
+                  'queued_count':None,'retry_count':None,'last_success':None,'error':None,'collector_error':self.error}
+        try:
+            doc = self.document()
+            current = next((a for a in doc.accounts if a.id == account_id),None)
+            if doc.archive is None or current is None or current.archive_namespace is None:
+                return {**result,'error':'archive_disabled'}
+            result['enabled'] = True
+            if self.store is None or doc.archive.directory != str(self.store.directory):
+                return {**result,'error':self.error or 'archive_unavailable'}
+            result.update(await self.db('status',current))
+            # This overlay needs no write, including when quota prevents writing
+            # account_error. Account-specific failures never leak another account.
+            result['error'] = self.errors.get(namespace(current),result['error'])
+            if self.error in ('archive_capacity','archive_unavailable','archive_schema_unsupported'):
+                result['error'] = self.error
+            return result
+        except Failure as error:
+            return {**result,'error':error.code}
+
     async def run_once(self, *, now=None):
         if self.collecting.locked():
             return
@@ -174,11 +197,23 @@ class ArchiveRuntime:
                         try:
                             if account.provider != 'omi':
                                 raise Failure('archive_provider_unsupported')
-                            await self.discover(account, now)
-                            for recording_id in await self.db('work', account, now):
+                            await self.db('capacity')
+                            discovery_error = None
+                            try:
+                                await self.discover(account, now)
+                            except Failure as error:
+                                if error.code in ('archive_capacity','archive_unavailable','archive_disabled',
+                                                  'archive_authorization_changed','provider_auth_required'):
+                                    raise
+                                discovery_error = error.code
+                            for recording_id in await self.db('work', account, now, 8, lambda: self.current(account)):
                                 await self.observe(account, recording_id, now)
+                            if discovery_error:
+                                raise Failure(discovery_error)
+                            self.errors.pop(namespace(account),None)
                         except Failure as error:
                             self.error = error.code
+                            self.errors[namespace(account)] = error.code
                             try:
                                 await self.db('account_error', account, error.code)
                             except Failure:

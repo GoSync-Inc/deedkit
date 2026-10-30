@@ -18,7 +18,7 @@ QUEUE_LIMIT = 10000
 APPLICATION_ID = 0x444B5243
 SCHEMA = '''
 BEGIN IMMEDIATE;
-CREATE TABLE accounts(namespace TEXT PRIMARY KEY, checkpoint TEXT, last_success REAL, error TEXT);
+CREATE TABLE accounts(namespace TEXT PRIMARY KEY, checkpoint TEXT, last_success REAL, error TEXT, work_turn INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE records(
  ref TEXT PRIMARY KEY, namespace TEXT NOT NULL, provider_id TEXT NOT NULL,
  metadata TEXT NOT NULL, parts TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0,
@@ -198,18 +198,28 @@ class Store:
                        (canonical(checkpoint).decode(), ns))
         self.write(change, guard)
 
-    def work(self, account, now, limit=8):
+    def work(self, account, now, limit=8, guard=lambda: None):
         ns = namespace(account)
-        # Each class gets service even with an endless stream of new or failing rows.
-        # due/ref order prevents one pending record from monopolizing its class.
-        with self.connection() as db:
-            rows = []
+        def select(db):
+            db.execute('INSERT OR IGNORE INTO accounts(namespace) VALUES(?)',(ns,))
+            turn = db.execute('SELECT work_turn FROM accounts WHERE namespace=?',(ns,)).fetchone()[0]
+            groups = []
             for condition, budget in (('attempted IS NULL', 3),
                                       ('attempted IS NOT NULL AND failures>0', 3),
                                       ('attempted IS NOT NULL AND failures=0', 2)):
-                rows.extend(db.execute('SELECT provider_id FROM records WHERE namespace=? AND due<=? AND ' + condition +
-                    ' ORDER BY due,ref LIMIT ?', (ns, now, budget)).fetchall())
-            return [row[0] for row in rows][:limit]
+                groups.append([row[0] for row in db.execute('SELECT provider_id FROM records WHERE namespace=? AND due<=? AND ' + condition +
+                    ' ORDER BY due,ref LIMIT ?', (ns, now, budget))])
+            # Persist priority before execution: even a pass interrupted after
+            # its first slow record serves another class on its next attempt.
+            db.execute('UPDATE accounts SET work_turn=? WHERE namespace=?',((turn+1)%3,ns))
+            result = []
+            for index in range(3):
+                for offset in range(3):
+                    group = groups[(turn+offset)%3]
+                    if index < len(group):
+                        result.append(group[index])
+            return result[:limit]
+        return self.write(select,guard)
 
     @staticmethod
     def decoded(row):
@@ -278,7 +288,7 @@ class Store:
     def backup(self, destination):
         destination = Path(destination)
         private_directory(str(destination.parent))
-        if destination.parent == self.directory:
+        if destination.is_relative_to(self.directory):
             raise Failure('archive_unavailable')
         fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         os.close(fd)
