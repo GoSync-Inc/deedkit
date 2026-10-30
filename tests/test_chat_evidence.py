@@ -14,9 +14,9 @@ from messaging_service.chat_evidence import backfill
 from messaging_service.envelope import stable_id
 from messaging_service.store import APIError
 from messaging_service.result_evidence import decorate
-from test_archive import archive,event
-from test_collectors import worker,message
-from test_whatsapp import wa
+from test_archive import archive as archive,event
+from test_collectors import worker as worker,message
+from test_whatsapp import wa as wa
 
 
 def test_exact_provider_reference_and_scoped_conflict_lifecycle(archive):

@@ -8,7 +8,7 @@ from messaging_service.app import create_app
 from messaging_service.store import APIError
 from test_archive import event
 from test_client_contract import rpc
-from test_queue_demotion import components, demote, structured  # noqa: F401  (demote is a fixture)
+from test_queue_demotion import components, demote as demote, structured  # noqa: F401  (demote is a fixture)
 
 
 def mailing(add, chat, days, *, hours=2, **metadata):

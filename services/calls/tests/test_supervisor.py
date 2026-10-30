@@ -1,5 +1,4 @@
 import asyncio
-import pytest
 
 from core import BriefInput, VoiceService
 

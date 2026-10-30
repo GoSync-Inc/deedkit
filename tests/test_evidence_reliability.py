@@ -8,9 +8,9 @@ from psycopg.types.json import Jsonb
 from messaging_service.attachment_metadata import attachment_fields
 from messaging_service.file_index import file_response_fields
 from messaging_service.status_details import describe, freshness
-from test_archive import archive, event
+from test_archive import archive as archive, event
 from test_collector_operations import source
-from test_whatsapp import wa, capture, event as wa_event
+from test_whatsapp import wa as wa, capture, event as wa_event
 
 
 def test_freshness_preserves_scan_age_but_reports_capture_backlog_and_lease():
@@ -93,7 +93,7 @@ def test_media_storage_pause_and_terminal_failures_remain_independent(wa):
 def test_attachment_and_text_coverage_agree_and_stale_derivatives_are_excluded(archive):
     from messaging_service.blobs import BlobWriter
     ar, s, key, _ = archive
-    mid = ar.ingest(event(media=[{'provider_id': 'synthetic-media', 'filename': 'note.txt',
+    ar.ingest(event(media=[{'provider_id': 'synthetic-media', 'filename': 'note.txt',
         'mime': 'text/plain', 'bytes': 69}]))['message']
     job = ar.claim_media('synthetic-fixture')
     writer = BlobWriter(s.files, reserve_bytes=0)

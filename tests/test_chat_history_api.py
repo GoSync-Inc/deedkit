@@ -11,9 +11,9 @@ from messaging_service.messenger_operations import validate_operation
 from messaging_service.store import APIError
 from messaging_service.telegram_operations import execute
 from test_archive import event
-from test_collectors import worker  # noqa: F401  (worker is a fixture)
+from test_collectors import worker as worker  # noqa: F401  (worker is a fixture)
 from test_live_search_store import GROUP, MEMBER, OWNER, PERSON, Client, counts, hit, rows
-from test_whatsmeow_capabilities import native_account  # noqa: F401  (a fixture)
+from test_whatsmeow_capabilities import native_account as native_account  # noqa: F401  (a fixture)
 
 ACCOUNT = 'history-fixture'
 

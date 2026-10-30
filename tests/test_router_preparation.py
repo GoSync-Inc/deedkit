@@ -1,6 +1,5 @@
 """Router enrollment builds verified fetched source, never a dirty checkout."""
 import json
-from pathlib import Path
 import stat
 import subprocess
 

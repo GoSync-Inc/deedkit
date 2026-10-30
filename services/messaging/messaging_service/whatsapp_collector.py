@@ -16,7 +16,7 @@ from psycopg.types.json import Jsonb
 
 from .archive import Archive
 from .blobs import BlobWriter
-from .collector_state import CaptureSpool,CollectorState,session_lock,validate_capture
+from .collector_state import CaptureSpool,CollectorState,session_lock,validate_capture as validate_capture
 from .store import Store
 from .telegram_collector import TelegramCollector,ProviderUnavailable,private_json
 from .operational import CONNECTION_ERRORS,MEDIA_ERRORS,collector_stop

@@ -98,7 +98,7 @@ def test_conversation_pending_file_labels_distinguish_queue_from_active_transfer
     assert 'файл загружается' in active['display_text']
 
 
-from test_archive import archive,event
+from test_archive import archive as archive,event
 
 
 def test_history_pending_attachment_contains_declared_metadata_and_current_occurrence(archive):

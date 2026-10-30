@@ -2,7 +2,6 @@ import importlib
 import importlib.util
 import json
 
-import pytest
 from fastapi.testclient import TestClient
 
 HEADERS = {"Origin": "http://testserver", "X-Voice-Service": "1"}

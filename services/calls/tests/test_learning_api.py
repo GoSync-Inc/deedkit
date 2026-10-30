@@ -1,5 +1,4 @@
 import asyncio
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient

@@ -21,3 +21,8 @@ deedkit-platform-contracts = { path = "packages/platform-contracts", editable = 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q -p no:cacheprovider"
+
+[tool.ruff.lint]
+# Existing compact source style. Keep all default Pyflakes correctness rules enabled;
+# fixture imports explicitly reexport their names so duplicate test definitions still fail F811.
+ignore = ["E401", "E402", "E701", "E702", "E731"]

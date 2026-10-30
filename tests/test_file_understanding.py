@@ -196,7 +196,7 @@ def test_profiles_are_separate_from_asr_and_changed_profile_requeues_summary(see
 
 
 def test_video_limits_are_separate_from_text_summary_and_cannot_be_unbounded():
-    u=module();profile=local_profile('video',max_input_bytes=128*1024**2,video_frames=4,video_frame_edge=384,video_max_seconds=300)
+    module();profile=local_profile('video',max_input_bytes=128*1024**2,video_frames=4,video_frame_edge=384,video_max_seconds=300)
     assert profile['max_input_bytes']==128*1024**2 and profile['video_frames']==4
     for values in ({'video_frames':9},{'video_frame_edge':4096},{'max_input_bytes':2*1024**3},
                    {'video_max_seconds':float('inf')}):
@@ -227,7 +227,6 @@ def test_real_synthetic_video_sampling_has_explicit_partial_coverage(tmp_path):
 
 
 def test_isolated_summary_child_drops_database_and_provider_environment(tmp_path,monkeypatch):
-    import io
     u=module();captured={}
     monkeypatch.setenv('DATABASE_URL','synthetic-private-dsn')
     monkeypatch.setenv('TELEGRAM_SESSION','synthetic-session')
@@ -455,7 +454,7 @@ def test_unsupported_extraction_is_distinct_from_missing_summary_model(seeded):
 
 # These cases exercise collector ingestion and actual managed original removal,
 # rather than fabricating a missing file or only updating revision with SQL.
-from test_archive import archive, event
+from test_archive import archive as archive, event
 
 
 def retained_original(archive, kind):

@@ -11,7 +11,7 @@ from messaging_service.enrichment_providers import normalize_result
 from messaging_service.file_extract import Extraction
 from messaging_service.processing_events import artifact_version, safe_identifier
 from messaging_service.store import Store
-from test_archive import archive, media_event
+from test_archive import archive as archive, media_event
 from test_enrichment import add_audio, profile, worker as fixture_worker
 from test_file_index import add_file, drain, worker_for
 

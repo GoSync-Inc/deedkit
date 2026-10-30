@@ -9,12 +9,12 @@ import psycopg
 import pytest
 
 from messaging_service.adapters import telegram_message,whatsapp_message
-from messaging_service.blobs import Blob,BlobWriter
+from messaging_service.blobs import BlobWriter
 from messaging_service.commands import CommandWorker
 from messaging_service.outgoing import DispatchNotStarted,OutgoingWorker,dispatch,finish_durably
 from messaging_service.spool import DurableSpool,InvalidCapture,PoisonItem
 from messaging_service.telegram_collector import TelegramCollector,media_deadline
-from test_collectors import message,worker  # noqa: F401  (fixture)
+from test_collectors import message,worker as worker  # noqa: F401  (fixture)
 
 
 def strict(item):

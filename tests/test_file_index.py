@@ -13,7 +13,7 @@ import pytest
 import psycopg
 
 from messaging_service.file_extract import (Extraction, MAX_INPUT_BYTES, MAX_TEXT_CHARS,
-    _extract, _image_dimensions, _office, _xml, Rejected, extract_original)
+    _xml, Rejected, extract_original)
 from messaging_service.file_index import FileIndexer, get_file_text, search_files
 from messaging_service.store import APIError
 

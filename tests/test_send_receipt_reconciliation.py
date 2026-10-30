@@ -7,7 +7,7 @@ from messaging_service.collector_state import CollectorState
 from messaging_service.outgoing import OutgoingWorker, reconcile_send_receipt, validate_send_receipt
 from messaging_service.spool import DurableSpool
 from test_archive import event
-from test_whatsmeow_send_reference import native_sender, ACCOUNT, PN, LID, PUBLIC, WIRE, REFERENCE
+from test_whatsmeow_send_reference import native_sender as native_sender, ACCOUNT, PN, LID, PUBLIC, WIRE, REFERENCE
 
 
 def receipt(queued, **changes):

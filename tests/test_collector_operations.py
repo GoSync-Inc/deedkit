@@ -9,8 +9,8 @@ import pytest
 from messaging_service.collector_state import CollectorState, session_lock
 from messaging_service.sync_status import get_sync_status
 from messaging_service.whatsapp_collector import NodeProvider
-from test_collectors import worker
-from test_whatsapp import wa, event, capture
+from test_collectors import worker as worker
+from test_whatsapp import wa as wa, event, capture
 
 
 def source(w, s, chats=None):

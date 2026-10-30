@@ -2,7 +2,7 @@
 import pytest
 from messaging_service.blobs import BlobWriter
 from messaging_service.file_index import file_response_fields
-from test_archive import archive, event
+from test_archive import archive as archive, event
 
 @pytest.mark.parametrize('kind,generated',[('photo',True),('document',False)])
 def test_download_receipt_has_current_source_filename_proof(archive,kind,generated):

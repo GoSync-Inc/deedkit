@@ -7,7 +7,7 @@ import httpx
 from messaging_service.app import create_app
 from messaging_service.subscriptions import match_subscriptions
 from runtime_helpers import call, gateway, port, server
-from test_messenger_commands import operator, operation_args
+from test_messenger_commands import operator as operator, operation_args
 from test_subscriptions import emit
 
 

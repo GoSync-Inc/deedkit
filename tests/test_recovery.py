@@ -14,7 +14,7 @@ from messaging_service.archive import Archive
 from messaging_service.backup import create_snapshot,verify_snapshot
 from messaging_service.backup_crypto import encrypt_snapshot,decrypt_snapshot
 from messaging_service.collector_state import session_lock
-from messaging_service.recovery_state import materialize_recovery,verify_recovery,snapshot_sources
+from messaging_service.recovery_state import materialize_recovery,snapshot_sources
 
 DUMP=[sys.executable,'-c','print("UNIT_DUMP_NOT_A_DATABASE")']
 

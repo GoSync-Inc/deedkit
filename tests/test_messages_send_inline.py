@@ -16,7 +16,7 @@ from messaging_service.outgoing import CHILD_KEY_PREFIX
 from messaging_service.send_intent import INLINE_BYTES, INLINE_PLACEHOLDER, SEND_BODY_BYTES
 from messaging_service.store import APIError
 from platform_contracts.agent import PLACEHOLDER_REQUEST_ID, child_key
-from test_messages_send import CHAT, world  # noqa: F401  (the fixture)
+from test_messages_send import CHAT, world as world  # noqa: F401  (the fixture)
 
 CATALOG = Path(__file__).resolve().parents[1] / 'services/gateway/src/agent_gateway/catalog.json'
 

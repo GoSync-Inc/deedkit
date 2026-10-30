@@ -8,7 +8,7 @@ from telethon import types
 from messaging_service.envelope import stable_id
 from messaging_service.outgoing import OutgoingWorker
 from test_archive import event
-from test_sending import sender,submit
+from test_sending import sender as sender,submit
 
 
 def sent_fixture(sender,*,body='Exact synthetic text',direction='outgoing',chat_type='private'):

@@ -1,4 +1,4 @@
-"""CI hygiene: osv-scanner findings fail the security run, main push runs are never cancelled, every uv.lock
+"""CI hygiene: scanner findings fail the security run, main push runs are never cancelled, every uv.lock
 is checked for staleness and the DeedKit JavaScript package is tested in checks / verify."""
 from datetime import datetime
 from pathlib import Path
@@ -23,12 +23,16 @@ def _verify_steps():
 def test_osv_scanner_fails_the_security_run_except_for_listed_advisories():
     steps = _workflow("security.yml")["jobs"]["report"]["steps"]
     osv = next(step for step in steps if step.get("id") == "osv")
-    assert "continue-on-error" not in osv and "if" not in osv
+    assert "continue-on-error" not in osv and osv["if"] == "${{ !cancelled() }}"
     assert "osv-scanner scan source --recursive --config osv-scanner.toml" in osv["run"]
-    # Every later step still reports after an osv-scanner failure, and only osv-scanner can fail the run.
-    for step in steps[steps.index(osv) + 1:]:
-        assert step.get("if") in ("${{ !cancelled() }}", "${{ always() }}"), step
-        assert step.get("continue-on-error") is True, step
+    # A failed scan or installation fails the job, without preventing independent scans or the summary.
+    for step in steps:
+        if step.get("if") == "${{ always() }}":
+            assert step.get("continue-on-error") is True, step
+        else:
+            assert "continue-on-error" not in step, step
+    for step in steps[2:-1]:
+        assert step.get("if") == "${{ !cancelled() }}", step
     config = tomllib.loads((ROOT / "osv-scanner.toml").read_text())
     assert set(config) <= {"IgnoredVulns"}
     ids = [entry["id"] for entry in config.get("IgnoredVulns", ())]

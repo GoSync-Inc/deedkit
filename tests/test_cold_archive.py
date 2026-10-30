@@ -14,7 +14,7 @@ import sys
 
 import pytest
 
-from test_archive import archive  # noqa: F401  (fixture)
+from test_archive import archive as archive  # noqa: F401  (fixture)
 from test_file_lifecycle import processed, stored
 
 STUB=r'''

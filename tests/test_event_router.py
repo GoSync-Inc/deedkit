@@ -761,6 +761,26 @@ def test_router_role_reads_and_moves_only_its_own_rows_and_gateway_reads_tolerat
 
 
 # spec: ANYM-575
+def test_connect_uses_the_bounded_lookup_without_resolving_the_module_again(producers, tmp_path, monkeypatch):
+    producer = producers()
+    producer.add()
+    module = producer.module(tmp_path)
+    name, port = 'producer.synthetic.test', producer.server.server_address[1]
+    module.host = name
+    lookups = []
+
+    def resolve(host, requested_port, *args, **kwargs):
+        lookups.append((host, requested_port))
+        # A second lookup may block in libc outside the request's deadline. Refuse it without hanging the test.
+        assert lookups == [(name, port)], 'the module name was resolved again outside the bounded lookup'
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', port))]
+
+    monkeypatch.setattr(socket, 'getaddrinfo', resolve)
+    assert module.head() == {'journal_id': 'journal-1', 'head': 1}
+    assert lookups == [(name, port)]
+
+
+# spec: ANYM-575
 def test_a_refused_first_address_falls_back_to_the_next_within_the_deadline(producers, tmp_path, monkeypatch):
     producer = producers()
     producer.add()

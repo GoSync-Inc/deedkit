@@ -10,7 +10,7 @@ import pytest
 from messaging_service import archive as archive_module
 from messaging_service.blobs import BlobWriter
 from messaging_service.envelope import stable_id
-from test_archive import archive, event
+from test_archive import archive as archive, event
 
 
 ACCOUNT='archive-test'

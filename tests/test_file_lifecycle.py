@@ -1,10 +1,9 @@
 """Synthetic original residency, crash replay and bounded rehydration contracts."""
-import hashlib
 from importlib import import_module
 
 import pytest
 
-from test_archive import archive, event
+from test_archive import archive as archive, event
 
 
 def lifecycle():

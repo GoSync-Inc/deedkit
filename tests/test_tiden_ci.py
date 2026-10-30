@@ -3104,11 +3104,13 @@ def test_every_tiden_cli_install_accepts_only_a_well_formed_shared_pin(tmp_path,
     assert len(scripts) == 8
     for script in scripts:
         lines = script.splitlines()
-        check = next(index for index, line in enumerate(lines) if line.startswith("[ -n \"$ver\" ]"))
+        # Validate before downloading or checking a previously downloaded archive (the separate CI install step).
+        operation = next(index for index, line in enumerate(lines)
+                         if line.lstrip().startswith("curl ") or "| sha256sum " in line)
         # Every download names the vendor's release by the read version; every checksum check is strict.
         assert all("releases/download/v$ver/" in line for line in lines if "releases/download" in line)
         assert all("--strict" in line for line in lines if "sha256sum" in line)
-        result = subprocess.run(["bash", "-e", "-c", "\n".join(lines[:check + 1]) + '\necho "$ver $sum"'],
+        result = subprocess.run(["bash", "-e", "-c", "\n".join(lines[:operation]) + '\necho "$ver $sum"'],
                                 capture_output=True, text=True,
                                 env={"PATH": os.environ["PATH"], "GITHUB_WORKSPACE": str(tmp_path)})
         if installs:

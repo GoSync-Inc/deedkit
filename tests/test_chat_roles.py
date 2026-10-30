@@ -13,8 +13,8 @@ from messaging_service.collector_state import CollectorState
 from messaging_service.envelope import stable_id
 from messaging_service.telegram_collector import TelethonProvider
 from test_archive import event
-from test_collectors import worker  # noqa: F401  (fixture)
-from test_compact_queue_rows import recent_queue  # noqa: F401  (fixture)
+from test_collectors import worker as worker  # noqa: F401  (fixture)
+from test_compact_queue_rows import recent_queue as recent_queue  # noqa: F401  (fixture)
 from test_extend_key import old_schema_store
 from test_telegram_operations import GroupClient,run
 

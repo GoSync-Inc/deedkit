@@ -65,7 +65,7 @@ def test_owner_message_clears_group_hint_but_new_mention_reopens(groups):
 
 def test_attention_respects_chat_scope_channel_type_deletion_and_revision(groups):
     s,key,add=groups
-    hidden=add('100','1',1,metadata={'mentions_owner':True})
+    add('100','1',1,metadata={'mentions_owner':True})
     channel=add('200','1',2,metadata={'mentions_owner':True})
     removed=add('300','1',3,metadata={'mentions_owner':True})
     stale=add('400','1',4,metadata={'mentions_owner':True})

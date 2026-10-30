@@ -8,8 +8,8 @@ import pytest
 from messaging_service.telegram_collector import configuration as telegram_configuration
 from messaging_service.whatsapp_collector import configuration as whatsapp_configuration
 from test_live_media import config_path, original, writers, capacity
-from test_archive import archive
-from test_collectors import worker
+from test_archive import archive as archive
+from test_collectors import worker as worker
 
 
 def whatsapp_path(tmp_path, **overrides):

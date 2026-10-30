@@ -19,7 +19,7 @@ import signal
 import stat
 import struct
 import subprocess
-import sys
+import sys as sys  # Public binding used by the journal failure-isolation tests.
 import tempfile
 import time
 

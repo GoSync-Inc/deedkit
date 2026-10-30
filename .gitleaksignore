@@ -1,0 +1,15 @@
+# Historical synthetic fixtures only (ANYM-303). Fingerprints include the exact commit and line;
+# a new finding in any of these files is still reported. Never add real credentials here.
+# Explicitly synthetic migration fixture; public Standard Webhooks test vector.
+04ca9abc5e548f279ff5a1ded18f0e806d87c639:tests/test_auto_migration.py:generic-api-key:755
+832744b9003e2e048a0431f0e4f11fabfa3cb227:tests/test_delivery_endpoints.py:generic-api-key:75
+832744b9003e2e048a0431f0e4f11fabfa3cb227:tests/test_delivery_endpoints.py:generic-api-key:76
+# Synthetic request IDs, classified as keys because a neighbouring argument is named key.
+7cd965d79570f57b129076a8e2da543c08af6006:tests/test_live_search_api.py:generic-api-key:54
+7cd965d79570f57b129076a8e2da543c08af6006:tests/test_live_search_api.py:generic-api-key:57
+7cd965d79570f57b129076a8e2da543c08af6006:tests/test_live_search_api.py:generic-api-key:60
+7cd965d79570f57b129076a8e2da543c08af6006:tests/test_live_search_api.py:generic-api-key:61
+7cd965d79570f57b129076a8e2da543c08af6006:tests/test_live_search_api.py:generic-api-key:79
+7cd965d79570f57b129076a8e2da543c08af6006:tests/test_live_search_api.py:generic-api-key:93
+7cd965d79570f57b129076a8e2da543c08af6006:tests/test_live_search_api.py:generic-api-key:211
+bac015c0b021d92b85ed2960c3ea6bff5db1ce04:tests/test_messenger_commands.py:generic-api-key:874

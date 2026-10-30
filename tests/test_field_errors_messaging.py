@@ -7,7 +7,6 @@ from starlette.testclient import TestClient
 
 from messaging_service.app import create_app
 from messaging_service.field_errors import MAX_FIELD_ERRORS, field_error, one_per_field
-from messaging_service.policy import OPERATION_PERMISSIONS
 from messaging_service.store import APIError
 from tests.test_audit_api import Store
 from tests.test_event_delivery import call, identity

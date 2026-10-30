@@ -16,9 +16,9 @@ from messaging_service.collector_state import CaptureSpool,CollectorState
 from messaging_service.envelope import stable_id
 from messaging_service.telegram_collector import history_bound
 from messaging_service.whatsapp_collector import WhatsAppState
-from test_collectors import worker,message,FakeProvider
+from test_collectors import worker as worker,message,FakeProvider
 from test_telegram_window import at
-from test_whatsapp import wa,event,capture,Provider
+from test_whatsapp import wa as wa,event,capture,Provider
 
 
 def rpc(client,key,name,**arguments):

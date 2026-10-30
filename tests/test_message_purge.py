@@ -10,9 +10,9 @@ import pytest
 
 from messaging_service.blobs import BlobWriter
 from messaging_service.envelope import stable_id
-from test_archive import archive, event
-from test_messenger_commands import operator  # noqa: F401  (fixture)
-from test_sending import sender  # noqa: F401  (fixture)
+from test_archive import archive as archive, event
+from test_messenger_commands import operator as operator  # noqa: F401  (fixture)
+from test_sending import sender as sender  # noqa: F401  (fixture)
 
 CHAT=stable_id('chat','archive-test','100')
 VOICE={'provider_id':'voice-17','filename':'sentinel-a-voice.ogg','mime':'audio/ogg','bytes':5}

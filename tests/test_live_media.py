@@ -9,8 +9,8 @@ import pytest
 from messaging_service.blobs import BlobWriter
 from messaging_service.storage_admission import STREAM_WORKSPACE_BYTES
 from messaging_service.telegram_collector import configuration
-from test_archive import archive, event
-from test_collectors import worker
+from test_archive import archive as archive, event
+from test_collectors import worker as worker
 
 
 def original(ar, *, mid='17', age=300, size=4):

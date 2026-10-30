@@ -4,7 +4,7 @@ import hashlib
 import pytest
 
 from messaging_service.store import APIError
-from test_archive import archive
+from test_archive import archive as archive
 from test_enrichment import worker
 from test_media_requests import pending
 

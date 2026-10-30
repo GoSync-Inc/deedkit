@@ -1,6 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
-from pathlib import Path
 import threading
 
 import pytest

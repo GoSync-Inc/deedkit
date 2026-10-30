@@ -1,5 +1,3 @@
-import asyncio
-import base64
 import json
 import tempfile
 from pathlib import Path

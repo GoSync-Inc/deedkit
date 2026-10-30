@@ -9,7 +9,7 @@ from starlette.testclient import TestClient
 from messaging_service.app import create_app
 from messaging_service.store import APIError
 from test_archive import event
-from test_read_state_freshness import ago, live  # noqa: F401 (fixture)
+from test_read_state_freshness import ago, live as live  # noqa: F401 (fixture)
 
 ROOT=Path(__file__).resolve().parents[1]
 SINCE='2026-10-20T00:00:00Z'

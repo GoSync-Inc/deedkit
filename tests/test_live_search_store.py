@@ -10,7 +10,7 @@ from messaging_service.envelope import stable_id
 from messaging_service.messenger_operations import validate_operation
 from messaging_service.subscriptions import match_subscriptions
 from messaging_service.telegram_operations import execute
-from test_collectors import message,worker  # noqa: F401  (worker is a fixture)
+from test_collectors import message,worker as worker  # noqa: F401  (worker is a fixture)
 
 PERSON=types.User(100,access_hash=5,first_name='Fixture')
 MEMBER=types.User(11,access_hash=6,first_name='Synthetic',last_name='Member')

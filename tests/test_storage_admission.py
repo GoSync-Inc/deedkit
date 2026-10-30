@@ -16,8 +16,8 @@ from messaging_service.archive import Archive
 from messaging_service.storage_admission import (
     MediaReservation, STREAM_WORKSPACE_BYTES, has_capacity, payload_bound, volume_key,
 )
-from test_archive import archive, event, media_event
-from test_collectors import worker, message
+from test_archive import archive as archive, event, media_event
+from test_collectors import worker as worker, message
 
 
 def free(monkeypatch, amount):

@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 from psycopg.types.json import Jsonb
 
-from test_conversation_state import NOW, dialogue_archive, message, state  # noqa: F401
-from test_whatsapp import wa  # noqa: F401
+from test_conversation_state import NOW, dialogue_archive as dialogue_archive, message, state  # noqa: F401
+from test_whatsapp import wa as wa  # noqa: F401
 
 
 ROOT = Path(__file__).resolve().parents[1]
