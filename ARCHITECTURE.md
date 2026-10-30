@@ -1,6 +1,6 @@
 # Architecture and verification boundaries
 
-DeedKit is one repository with independent gateway, messaging, calendar and calls
+DeedKit is one repository with independent gateway, messaging, calendar, calls and recordings
 services. Each service keeps its own lockfile, process, API and durable state. The
 common MCP exposes only explicitly selected tools and never imports provider code.
 See [module runtime contracts](docs/platform-runtime.md).
@@ -32,6 +32,7 @@ principal sources.
 | AnyMsg Deployment & Verification | SQL migrations, `schema.sql`, `__init__.py` version, `release.py`, `telemetry.py`, root `Dockerfile`, Compose overlays, messaging packaging (`services/messaging/` Dockerfile, `pyproject.toml`, `hatch_build.py`, lockfiles), root `uv.lock`, release and branch-protection examples in `deploy/`, `services/release-router/`, `.github/`, `scripts/`, `tools/dev/` | Schema checksums, least privilege, images/packages, release routing, synthetic network drills and authentic CI evidence |
 | AnyMsg Python Client & Operator CLI | `services/messaging/anymsg/`, `__main__.py` operator entry point, root `client_check.py` and `media_benchmark.py`, packaged assets | Safe HTTP client, token-file CLI, source assets and explicit owner administration |
 | AnyMsg JavaScript Client | `packages/npm/` (`anymsg`), `packages/deedkit/` (`deedkit`) | Dependency-free HTTP clients for the messaging server and the DeedKit gateway, local argument validation, TypeScript declarations and token-file CLIs |
+| Recording Integrations | `services/recordings/` | Optional independent provider reads, per-credential account/content ceilings, bounded on-demand Omi metadata/transcripts/overview; no archive or provider sessions |
 | Platform Gateway | `services/gateway/`, gateway Compose overlays | Selected module tools, exact action ceilings, per-principal backend credentials, bounded original downloads and preserved domain receipts, without provider sessions |
 | Family Calendar | `services/calendar/`, calendar Compose overlay | Google and CalDAV accounts, explicit roles and grants, plan/apply receipts, encrypted provider credentials and a singleton synchronization worker |
 | Voice Calls | `services/calls/`, calls Compose overlays | Principal-owned briefs and call tasks, durable follow-ups and owner decisions, scoped messaging context, Pipecat runtime and signed provider media boundaries |

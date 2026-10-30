@@ -46,7 +46,10 @@
       "mcp__claude_ai_Deedkit__messages_search_files",
       "mcp__claude_ai_Deedkit__messages_search_people",
       "mcp__claude_ai_Deedkit__platform_capabilities",
-      "mcp__claude_ai_Deedkit__platform_resolve_target"
+      "mcp__claude_ai_Deedkit__platform_resolve_target",
+      "mcp__claude_ai_Deedkit__recordings_capabilities",
+      "mcp__claude_ai_Deedkit__recordings_list",
+      "mcp__claude_ai_Deedkit__recordings_read"
     ],
     "deny": [
       "Read(./.local/**)",

@@ -555,6 +555,36 @@ jobs:
               assert importlib.util.find_spec(module) is None, module
           PY
           "$RUNNER_TEMP/gateway-installed/bin/deedkit-gateway" --help
+          # The same required service step fails if the optional recordings package cannot build/install.
+          cd "$GITHUB_WORKSPACE/services/recordings"
+          uv sync --locked --group dev
+          uv run ruff check src
+          uv build --out-dir "$RUNNER_TEMP/recordings-dist"
+          uv venv "$RUNNER_TEMP/recordings-installed" --python 3.13
+          uv pip install --python "$RUNNER_TEMP/recordings-installed/bin/python" "$RUNNER_TEMP"/recordings-dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/recordings-installed/bin/python" - <<'PYCODE'
+          import importlib.util, pathlib, tarfile, zipfile
+          from deedkit_recordings.app import create_app
+          assert create_app
+          for module in ('family_calendar', 'messaging_service', 'agent_gateway', 'pipecat', 'telethon', 'psycopg'):
+              assert importlib.util.find_spec(module) is None, module
+          for archive in pathlib.Path('recordings-dist').iterdir():
+              if archive.suffix == '.whl':
+                  with zipfile.ZipFile(archive) as source:
+                      paths = source.namelist()
+                  assert 'deedkit_recordings/app.py' in paths
+              elif archive.name.endswith('.tar.gz'):
+                  with tarfile.open(archive) as source:
+                      paths = source.getnames()
+                  assert any(p.endswith('/src/deedkit_recordings/app.py') for p in paths)
+              elif archive.name == '.gitignore':
+                  continue
+              else:
+                  raise AssertionError(f'unexpected package artifact: {archive.name}')
+              assert not any(p.endswith(('.key', '.env', '.db', '.sqlite')) or '/.plaud/' in p for p in paths), paths
+          PYCODE
+          "$RUNNER_TEMP/recordings-installed/bin/deedkit-recordings" --help
       - name: Shared platform contract package tests
         id: platform_contracts
         if: ${{ !cancelled() && steps.source.outcome == 'success' }}

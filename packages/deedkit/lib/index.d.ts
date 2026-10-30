@@ -1,4 +1,7 @@
 export type ToolName =
+  | 'recordings_capabilities'
+  | 'recordings_list'
+  | 'recordings_read'
   | 'calendar_agenda'
   | 'calendar_apply'
   | 'calendar_assignment'
