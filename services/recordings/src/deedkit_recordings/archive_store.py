@@ -27,9 +27,19 @@ CREATE TABLE records(
 CREATE INDEX records_due ON records(namespace, due, attempted);
 CREATE TABLE events(sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,
  namespace TEXT NOT NULL, ref TEXT NOT NULL, revision INTEGER NOT NULL, occurred REAL NOT NULL);
-CREATE VIRTUAL TABLE texts USING fts5(ref UNINDEXED, namespace UNINDEXED, transcript, summary, tokenize='unicode61');
+CREATE VIRTUAL TABLE texts USING fts5(ref UNINDEXED, namespace UNINDEXED, title, transcript, summary, tokenize='unicode61');
 PRAGMA application_id=1145786947;
-PRAGMA user_version=1;
+PRAGMA user_version=2;
+COMMIT;
+'''
+UPGRADE_INDEX = '''
+BEGIN IMMEDIATE;
+DROP TABLE texts;
+CREATE VIRTUAL TABLE texts USING fts5(ref UNINDEXED, namespace UNINDEXED, title, transcript, summary, tokenize='unicode61');
+INSERT INTO texts(ref,namespace,title,transcript,summary)
+ SELECT ref,namespace,COALESCE(json_extract(metadata,'$.title'),''),
+ COALESCE(json_extract(parts,'$.transcript.text'),''),COALESCE(json_extract(parts,'$.summary.text'),'') FROM records;
+PRAGMA user_version=2;
 COMMIT;
 '''
 
@@ -70,7 +80,7 @@ def backup_archive(settings, destination):
     try:
         with store.connection() as db:
             if db.execute('PRAGMA application_id').fetchone()[0] != APPLICATION_ID or db.execute(
-                    'PRAGMA user_version').fetchone()[0] != 1:
+                    'PRAGMA user_version').fetchone()[0] not in (1, 2):
                 raise Failure('archive_schema_unsupported')
         return store.run('backup', destination)
     except (OSError, sqlite3.Error, ValueError):
@@ -95,9 +105,13 @@ class Store:
                 empty = self.path.stat().st_size == 0
                 if empty:
                     db.executescript(SCHEMA)
-                if db.execute('PRAGMA application_id').fetchone()[0] != APPLICATION_ID or db.execute(
-                        'PRAGMA user_version').fetchone()[0] != 1:
+                version = db.execute('PRAGMA user_version').fetchone()[0]
+                if db.execute('PRAGMA application_id').fetchone()[0] != APPLICATION_ID or version not in (1, 2):
                     raise Failure('archive_schema_unsupported')
+                if version == 1:
+                    # Only this derived index is rebuilt. Accepted records, refs,
+                    # revisions and journal survive atomically; interruption rolls back.
+                    db.executescript(UPGRADE_INDEX)
                 if db.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
                     raise Failure('archive_unavailable')
                 db.execute('PRAGMA journal_mode=WAL')
@@ -192,8 +206,11 @@ class Store:
                 raise Failure('archive_queue_full')
             db.execute('INSERT OR IGNORE INTO accounts(namespace) VALUES(?)', (ns,))
             for item in new:
+                ref = uuid.uuid4().hex
                 db.execute('INSERT INTO records(ref,namespace,provider_id,metadata,parts) VALUES(?,?,?,?,?)',
-                    (uuid.uuid4().hex, ns, item['id'], canonical(item).decode(), '{}'))
+                    (ref, ns, item['id'], canonical(item).decode(), '{}'))
+                db.execute('INSERT INTO texts(ref,namespace,title,transcript,summary) VALUES(?,?,?,?,?)',
+                           (ref, ns, item.get('title', ''), '', ''))
             db.execute('UPDATE accounts SET checkpoint=?,error=NULL WHERE namespace=?',
                        (canonical(checkpoint).decode(), ns))
         self.write(change, guard)
@@ -260,10 +277,11 @@ class Store:
             due = now + min(3600, 60 * 2 ** (failures - 1)) if failed else now + 3600
             db.execute('UPDATE records SET metadata=?,parts=?,revision=?,attempted=?,due=?,failures=? WHERE ref=?',
                 (body, canonical(parts).decode(), revision, now, due, failures, row['ref']))
-            if usable_change:
+            if usable_change or body != row['metadata']:
                 db.execute('DELETE FROM texts WHERE ref=?', (row['ref'],))
-                db.execute('INSERT INTO texts(ref,namespace,transcript,summary) VALUES(?,?,?,?)',
-                    (row['ref'], ns, parts.get('transcript', {}).get('text', ''), parts.get('summary', {}).get('text', '')))
+                db.execute('INSERT INTO texts(ref,namespace,title,transcript,summary) VALUES(?,?,?,?,?)',
+                    (row['ref'], ns, metadata.get('title', ''), parts.get('transcript', {}).get('text', ''), parts.get('summary', {}).get('text', '')))
+            if usable_change:
                 db.execute('INSERT INTO events(event_id,namespace,ref,revision,occurred) VALUES(?,?,?,?,?)',
                            (uuid.uuid4().hex, ns, row['ref'], revision, now))
             db.execute('UPDATE accounts SET last_success=COALESCE(?,last_success),error=? WHERE namespace=?',
@@ -282,6 +300,29 @@ class Store:
             counts = db.execute('SELECT count(*),sum(attempted IS NULL),sum(failures>0) FROM records WHERE namespace=?', (ns,)).fetchone()
             return {'coverage':'unknown', 'record_count':counts[0], 'queued_count':counts[1] or 0,
                     'retry_count':counts[2] or 0, 'last_success':row[0] if row else None, 'error':row[1] if row else None}
+
+    def search(self, account, expression, limit):
+        ns = namespace(account)
+        with self.connection() as db:
+            # FTS MATCH narrows by indexed terms; both sides of the join retain
+            # the current namespace. Never materialize accepted text for all hits.
+            rows = db.execute('''SELECT r.ref,r.provider_id,r.revision,
+                substr(COALESCE(json_extract(r.metadata,'$.title'),''),1,256) AS title,
+                json_remove(r.parts,'$.transcript.text','$.summary.text') AS evidence,
+                substr(snippet(texts,-1,'[',']','…',32),1,320) AS snippet
+                FROM texts JOIN records r ON r.ref=texts.ref
+                WHERE texts MATCH ? AND texts.namespace=? AND r.namespace=?
+                ORDER BY bm25(texts,0,0,5,1,2),r.ref LIMIT ?''', (expression, ns, ns, limit))
+            return [{'recording_ref': row['ref'], 'provider_recording_id': row['provider_id'],
+                     'revision': row['revision'], 'title': row['title'], 'snippet': row['snippet'],
+                     'parts': loads(row['evidence'])} for row in rows]
+
+    def context(self, account, ref):
+        with self.connection() as db:
+            row = db.execute('SELECT * FROM records WHERE namespace=? AND ref=?', (namespace(account), ref)).fetchone()
+            if row is None:
+                raise Failure('not_found_or_forbidden', 403)
+            return self.decoded(row)
 
     def events(self, after, limit):
         with self.connection() as db:

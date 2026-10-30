@@ -256,8 +256,8 @@ allows a later pass to resume. This archive does not reserve disk for other
 services beyond the configured filesystem reserve.
 
 The full-text index and reference-only journal commit with text and revision.
-Agent-facing archive search/context and outbound subscriptions are separate
-follow-up slices; this slice exposes no new gateway tool or public ingress.
+The local search/context tools below are separately opted into gateway profiles.
+Outbound subscriptions remain a separate follow-up slice; no public ingress is added.
 The private authenticated backend `POST /v1/archive_status` accepts an explicit
 `account` within the current principal ceiling and requires `recordings:read`.
 It returns counts, last success and fixed durable/runtime errors without reading
@@ -309,3 +309,54 @@ notes; a transcript does not wait for notes to become ready. Note requests have
 a 12-second budget, full transcript verification 40 seconds, within a 60-second
 record budget including commits. This service creates neither transcript nor
 summary; it reads the vendor's existing text and makes no paid processing call.
+
+### Local archive tools (ANYM-652)
+
+Explicitly add `recordings_search`, `recordings_context` and/or
+`recordings_archive_status` to the chosen gateway profile. No existing profile
+gains these tools or scopes. The module must be deployed and both the gateway
+and backend principal must grant `recordings:read`; search/context additionally
+require `recordings:content`. Every call checks the current backend key, expiry,
+account ceiling and namespace before selecting data and again before returning
+it. The backend manifest must explicitly implement each operation. Upgrade the
+recordings backend and gateway catalog before adding tools to a private profile;
+remove the tools before downgrading the gateway. These calls read no provider
+token and make no provider, model or embedding request.
+
+- `recordings_search({account, query, limit: 10})`: searches the local FTS5
+  index of titles, transcripts and summaries. A query is 1–256 characters,
+  containing 1–16 Unicode literal words of at most 64 characters each, joined
+  with AND. Operators, column selectors and wildcards are not an FTS language
+  exposed to the caller. Returns at most 50 hits with a snippet of at most
+  320 characters, stable `recording_ref`, revision and per-part digest,
+  freshness and attempt state. Ranking uses SQLite bm25. No total count or
+  cross-account search is returned. This is lexical search over observed local
+  text; an empty result is not proof of vendor history completeness.
+- `recordings_context({account, recording_ref, kind: "transcript", page_chars: 4000})`:
+  reads the accepted transcript or summary in 100–10,000 character pages,
+  retaining original speaker/offset text where the vendor supplied it. Results
+  are labelled `source_data: true`; they are evidence, never agent instructions.
+  `part` separates the last accepted digest/time from the latest failed or
+  pending attempt. Continue with identical arguments and `next_cursor`. The
+  signed 15-minute cursor binds key, account/provider/namespace, reference,
+  kind, exact arguments, revision and digest. Changed revisions return
+  `source_changed` (409); revoked grants, replaced namespaces and foreign
+  references are refused without content or existence details.
+- `recordings_archive_status({account})`: read-only metadata counts, coverage,
+  freshness and fixed archive errors, with no titles or text. Content scope is
+  not needed. Missing archive settings return `archive_disabled`.
+
+Local operations admit at most four simultaneous requests per process, returning
+`archive_busy` instead of building an unbounded queue. SQLite keeps its 100 ms
+busy wait and 2-second SQL progress deadline in worker threads. A busy/corrupt
+archive returns a fixed `archive_unavailable`; existing on-demand operations and
+capabilities remain independent. Status reports the archive's capacity errors.
+
+Archive schema 2 adds title to the derived index. Starting the single writer
+atomically rebuilds a schema-1 index from accepted local records under the same
+capacity/progress limits; refs, records, revisions and the event journal are
+preserved. A failed rebuild rolls back. Title-only changes update the index in
+the same transaction without emitting a text-change event. Online backup accepts
+schema 1 or 2. Older packages refuse schema 2: disable archive collection and
+retain its state before a package downgrade. There is no down migration or
+automatic archive deletion, and no production archive activation in this slice.

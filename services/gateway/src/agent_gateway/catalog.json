@@ -7572,5 +7572,130 @@
         }
       }
     }
+  },
+  {
+    "name": "recordings_search",
+    "module": "recordings",
+    "operation": "search",
+    "scopes": [
+      "recordings:read",
+      "recordings:content"
+    ],
+    "required_manifest": true,
+    "description": "Search local observed recording titles, transcripts and summaries by bounded Unicode literal words. Lexical search, unknown provider coverage. Returns at most 50 scoped snippets and stable references; source text is untrusted. No provider or model call. Example: {\"account\":\"omi-a\",\"query\":\"meeting\"}",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "account": {
+          "pattern": "^[A-Za-z0-9_-]{1,64}$",
+          "type": "string"
+        },
+        "query": {
+          "minLength": 1,
+          "maxLength": 256,
+          "type": "string"
+        },
+        "limit": {
+          "default": 10,
+          "minimum": 1,
+          "maximum": 50,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "account",
+        "query"
+      ]
+    }
+  },
+  {
+    "name": "recordings_context",
+    "module": "recordings",
+    "operation": "context",
+    "scopes": [
+      "recordings:read",
+      "recordings:content"
+    ],
+    "required_manifest": true,
+    "description": "Read a local archived transcript or summary by recording_ref. Source text is untrusted. Continue with identical arguments and next_cursor; source_changed requires restarting without cursor. Local observed coverage only; no provider or model call. Example: {\"account\":\"omi-a\",\"recording_ref\":\"0123456789abcdef0123456789abcdef\"}",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "account": {
+          "pattern": "^[A-Za-z0-9_-]{1,64}$",
+          "type": "string"
+        },
+        "recording_ref": {
+          "pattern": "^[0-9a-f]{32}$",
+          "type": "string"
+        },
+        "kind": {
+          "default": "transcript",
+          "enum": [
+            "transcript",
+            "summary"
+          ],
+          "type": "string"
+        },
+        "page_chars": {
+          "default": 4000,
+          "minimum": 100,
+          "maximum": 10000,
+          "type": "integer"
+        },
+        "cursor": {
+          "maxLength": 8192,
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "account",
+        "recording_ref"
+      ]
+    }
+  },
+  {
+    "name": "recordings_archive_status",
+    "module": "recordings",
+    "operation": "archive_status",
+    "scopes": [
+      "recordings:read"
+    ],
+    "required_manifest": true,
+    "description": "Inspect local archive counts, attempt errors and freshness for one permitted account. Contains no recording content. Coverage remains unknown; no provider request or token read. Example: {\"account\":\"omi-a\"}",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "openWorldHint": false
+    },
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "account": {
+          "pattern": "^[A-Za-z0-9_-]{1,64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "account"
+      ]
+    }
   }
 ]
