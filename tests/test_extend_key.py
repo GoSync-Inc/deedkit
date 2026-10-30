@@ -416,7 +416,7 @@ def test_migrate_gives_up_on_a_busy_messages_table_without_stalling_writers(seed
         replay_attempt, lambda c: c.execute('LOCK TABLE messages IN ROW EXCLUSIVE MODE'))
     assert outcome == ['lock_not_available']
     assert writer_seconds < 5 and migrate_seconds < 10
-    assert schema_state(store) == ('62', 62, True)
+    assert schema_state(store) == ('63', 63, True)
     store.migrate()
 
 
@@ -434,7 +434,7 @@ def test_migrate_lock_timeout_rolls_back_migrations_it_already_applied(database,
         # Nothing of 017-021 stays: same version, no new migration rows, no new table.
         assert schema_state(store) == ('16', 16, False)
         store.migrate()
-        assert schema_state(store) == ('62', 62, True)
+        assert schema_state(store) == ('63', 63, True)
 
 
 # spec: ANYM-422
@@ -447,9 +447,9 @@ def test_migrate_never_holds_one_replay_lock_while_waiting_for_another(seeded, r
         replay_attempt, lambda c: c.execute('LOCK TABLE messages IN ROW EXCLUSIVE MODE'))
     assert outcome == ['lock_not_available']
     assert writer_seconds < 1 and migrate_seconds < 10
-    assert schema_state(store) == ('62', 62, True)
+    assert schema_state(store) == ('63', 63, True)
     store.migrate()
-    assert schema_state(store) == ('62', 62, True)
+    assert schema_state(store) == ('63', 63, True)
 
 
 # spec: ANYM-422
@@ -458,7 +458,7 @@ def test_migrate_replays_replay_tables_missing_from_a_partial_restore(database, 
     partial = base[:base.index('CREATE TABLE IF NOT EXISTS deliveries')]
     with old_schema_store(database, tmp_path, 1, base=partial) as store:
         store.migrate()
-        assert schema_state(store) == ('62', 62, True)
+        assert schema_state(store) == ('63', 63, True)
         with store.pool.connection() as c:
             assert c.execute("""SELECT to_regclass('deliveries') IS NOT NULL
                 AND to_regclass('download_grants') IS NOT NULL AS present""").fetchone()['present']

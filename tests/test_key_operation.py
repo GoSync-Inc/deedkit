@@ -233,7 +233,9 @@ def test_check_validates_and_reports_the_schema_and_writes_nothing(seeded, run, 
         before = rows_any(store)
         reply, _ = run(command, *CHECKS[command](ids, path), '--check')
         assert rows_any(store) == before
-    assert reply == {'check': answer, 'schema_version': version, 'required': 44}
+    from messaging_service.store import RUNTIME_SCHEMA
+    expected = RUNTIME_SCHEMA if answer == 'ok' else version
+    assert reply == {'check': answer, 'schema_version': expected, 'required': 44}
 
 
 # spec: ANYM-495
