@@ -7,6 +7,7 @@ This is the existing AnyMsg repository. The messaging packages keep the names
 
 | Module | Source | Runtime |
 | --- | --- | --- |
+| Recording integrations | `services/recordings` | Optional Omi metadata, transcripts and overviews; [setup](services/recordings/README.md) |
 | Common MCP gateway | `services/gateway` | Selected tools, per-agent credentials and exact action ceilings |
 | Messaging (AnyMsg) | `services/messaging` | Telegram/WhatsApp archive and domain operations |
 | Family calendar | `services/calendar` | Google API/CalDAV, family roles, explicit coverage and plans |

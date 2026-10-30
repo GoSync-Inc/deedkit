@@ -122,7 +122,7 @@ class Policy:
             ):
                 raise ValueError
             modules = doc["deployment"]["modules"]
-            if set(modules) - {"calendar", "messaging", "calls"} or len(modules) != len(set(modules)):
+            if set(modules) - {"calendar", "messaging", "calls", "recordings"} or len(modules) != len(set(modules)):
                 raise ValueError
             if set(modules) - doc["deployment"]["backends"].keys():
                 raise ValueError

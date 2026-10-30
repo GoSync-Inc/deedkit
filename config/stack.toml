@@ -18,6 +18,8 @@ path = "services/messaging"
 path = "services/calendar"
 [modules.calls]
 path = "services/calls"
+[modules.recordings]
+path = "services/recordings"
 [modules.gateway]
 path = "services/gateway"
 

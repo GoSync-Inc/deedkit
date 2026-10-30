@@ -26,6 +26,7 @@ SEND_FILE = "send_file"
 # One line each for an agent choosing what to load (ANYM-271); the ids are the deployable modules.
 # No ", " or ": ": the MCP text block is compact JSON (ANYM-408).
 MODULE_PURPOSES = {
+    "recordings": "Wearable recording metadata plus transcripts and summaries from permitted accounts",
     "calendar": "Family calendar agenda and free slots with planned event changes",
     "calls": "Voice calls with briefs and preflight plus placed calls and their records",
     "messaging": "Messenger chats with search and the reply queue plus files and sending",
