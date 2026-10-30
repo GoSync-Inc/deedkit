@@ -1,6 +1,6 @@
 """Durable provider captures and reconciliation checkpoints, independent of clients."""
 from contextlib import contextmanager
-from datetime import datetime,timezone
+from datetime import datetime
 import fcntl
 import os
 from pathlib import Path

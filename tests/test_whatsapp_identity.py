@@ -98,7 +98,7 @@ def test_conflicting_pair_is_visible_as_conflict_but_not_used_for_search_or_alia
 
 def test_hidden_deleted_and_other_account_sources_cannot_supply_alias(identity_archive):
     s,a,state,key=identity_archive
-    first=state.apply(observed());visible=state.apply(observed(mid=2,chat='901@lid',sender='901@lid',pn='1111111111@c.us'))
+    state.apply(observed());visible=state.apply(observed(mid=2,chat='901@lid',sender='901@lid',pn='1111111111@c.us'))
     visible_chat=s.get_context(key,visible['message'])['message']['chat']
     s.set_access('identity-reader',chats=[visible_chat])
     assert s.search_people(key,'1234567890')['items']==[]

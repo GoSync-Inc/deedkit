@@ -23,7 +23,8 @@ def raw_name(name, sender):
     value=re.sub(r'^\s+|\s+$','',name) if isinstance(name,str) else ''
     if not value:return True
     if not isinstance(sender,str) or not sender:return False
-    local=sender.partition('@')[0];match=re.fullmatch(_ID_DIGITS,value)
+    local=sender.partition('@')[0]
+    match=re.fullmatch(_ID_DIGITS,value)
     return value in (sender,local) or bool(match and match[1]==local.split(':')[0])
 
 

@@ -8,7 +8,7 @@ import pytest
 from messaging_service.collector_state import CollectorState
 from messaging_service.envelope import stable_id
 from messaging_service.sync_status import _history,get_sync_status
-from test_collectors import worker,message
+from test_collectors import worker as worker,message
 
 
 @pytest.mark.parametrize('attempt',[None,True,'100',float('inf'),float('nan')])

@@ -5,7 +5,6 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import sqlite3
 from types import SimpleNamespace as NS
 
@@ -16,7 +15,7 @@ from messaging_service.collector_state import CaptureSpool, session_lock
 from messaging_service.telegram_collector import (
     ProviderPageError, TelegramCollector, TelethonProvider, configuration, private_json)
 from messaging_service.telegram_operations import execute
-from test_collectors import message, worker
+from test_collectors import message, worker as worker
 from test_telegram_operations import Client, job, run
 
 

@@ -5,7 +5,7 @@ import threading
 import time
 from pathlib import Path
 
-from core import ACTIVE, ServiceError
+from core import ServiceError
 from audio_probe import PCMProbe, StartTiming, diagnostics
 from telegram_broker import BrokerClient
 

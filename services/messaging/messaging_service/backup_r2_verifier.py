@@ -898,9 +898,9 @@ def run(config,*,client=None,engine=None,path=None):
                 # rechecks full ciphertext, immutable receipts and root marker CAS.
                 proof_path=Path(config['directory'])/('proof-'+journal['run']+'.json')
                 if journal['prior_sha256'] is None:
-                    result=r2.protect(receiver,config['protected_file'],proof_path,client=client)
+                    r2.protect(receiver,config['protected_file'],proof_path,client=client)
                 else:
-                    result=r2.rotate(receiver,config['protected_file'],proof_path,
+                    r2.rotate(receiver,config['protected_file'],proof_path,
                                      expected_protected_sha256=journal['prior_sha256'],client=client)
                 journal={**journal,'phase':'promoted'};local.write_maintenance_json('active.json',journal,dir_fd=fd)
                 status={'v':1,'status':'verified','backup_id':journal['receipt']['wire']['id'],'verification_id':journal['run'],'verified_at':now()}

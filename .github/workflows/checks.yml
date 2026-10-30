@@ -364,7 +364,7 @@ jobs:
         run: uv run python scripts/smoke.py --dsn-file "$RUNNER_TEMP/anymsg-test.dsn"
       - name: Installed distributions outside checkout
         id: distributions
-        run: |
+        run: | # zizmor: ignore[adhoc-packages] -- Install our own built tarball outside checkout, with lifecycle scripts disabled.
           uv venv "$RUNNER_TEMP/anymsg-wheel-env" --python 3.13
           uv pip install --python "$RUNNER_TEMP/anymsg-wheel-env/bin/python" dist/*.whl
           cd "$RUNNER_TEMP"
@@ -377,8 +377,8 @@ jobs:
           npm install --ignore-scripts --no-audit --no-fund "$GITHUB_WORKSPACE"/dist/*.tgz
           ./node_modules/.bin/anymsg --version
           node --input-type=module -e "import {AnyMsgClient} from 'anymsg'; if(typeof AnyMsgClient !== 'function')process.exit(1)"
-      # ANYM-618: blocking, unlike security.yml's report-only whatsmeow scan; a reachable finding in the
-      # attestation verifier fails this job (same pinned govulncheck as security.yml).
+      # ANYM-618: a reachable finding in the attestation verifier fails this job
+      # (same pinned govulncheck as security.yml's native WhatsApp scan).
       - name: govulncheck (attestation verifier, blocking)
         id: attest_verify_vulns
         if: ${{ !cancelled() }}
@@ -630,7 +630,7 @@ jobs:
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version: '1.26.9'
+          go-version: '1.26.10'
           cache-dependency-path: |
             whatsapp/whatsmeow/go.sum
             services/release-router/go.sum
@@ -992,7 +992,7 @@ jobs:
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         if: contains(steps.plan.outputs.languages, 'go')
         with:
-          go-version: '1.26.9'
+          go-version: '1.26.10'
           cache: false
       - name: Run only the added tests
         env:
@@ -1145,7 +1145,10 @@ jobs:
           pin="$GITHUB_WORKSPACE/docs/harness/tiden.md"
           ver=$(sed -n 's/^TIDEN_CLI_VERSION=\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' "$pin" | head -n 1)
           sum=$(sed -n 's/^TIDEN_CLI_SHA256_linux_amd64=\([0-9a-f]\{64\}\)$/\1/p' "$pin" | head -n 1)
-          [ -n "$ver" ] && [ -n "$sum" ] || { echo "no valid Tiden pin in $pin" >&2; exit 1; }
+          if [ -z "$ver" ] || [ -z "$sum" ]; then
+            echo "no valid Tiden pin in $pin" >&2
+            exit 1
+          fi
           curl --fail --silent --show-error --location -o "$RUNNER_TEMP/tiden.tar.gz" \
             "https://github.com/qase-tms/homebrew-tap/releases/download/v$ver/tiden_linux_amd64.tar.gz"
           echo "$sum  $RUNNER_TEMP/tiden.tar.gz" | sha256sum --check --strict
@@ -1293,7 +1296,10 @@ jobs:
           pin="$GITHUB_WORKSPACE/docs/harness/tiden.md"
           ver=$(sed -n 's/^TIDEN_CLI_VERSION=\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' "$pin" | head -n 1)
           sum=$(sed -n 's/^TIDEN_CLI_SHA256_linux_amd64=\([0-9a-f]\{64\}\)$/\1/p' "$pin" | head -n 1)
-          [ -n "$ver" ] && [ -n "$sum" ] || { echo "no valid Tiden pin in $pin" >&2; exit 1; }
+          if [ -z "$ver" ] || [ -z "$sum" ]; then
+            echo "no valid Tiden pin in $pin" >&2
+            exit 1
+          fi
           curl --fail --silent --show-error --location -o "$RUNNER_TEMP/tiden.tar.gz" \
             "https://github.com/qase-tms/homebrew-tap/releases/download/v$ver/tiden_linux_amd64.tar.gz"
           echo "$sum  $RUNNER_TEMP/tiden.tar.gz" | sha256sum --check --strict

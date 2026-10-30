@@ -13,8 +13,8 @@ from messaging_service.blobs import BlobWriter
 from messaging_service.commands import CommandWorker
 from messaging_service.storage_admission import StorageAdmission
 from test_archive import media_event
-from test_file_uploads import uploader, prepare, chunk, send_args
-from test_messenger_commands import operator
+from test_file_uploads import uploader as uploader, prepare, chunk, send_args
+from test_messenger_commands import operator as operator
 
 
 @pytest.mark.parametrize('phase', ['claim', 'preflight'])

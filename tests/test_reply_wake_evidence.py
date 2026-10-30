@@ -122,7 +122,6 @@ def test_whatsapp_unknown_projection_cannot_guess_group_stanza(seeded, target_st
     chat, stanza, sender = 'team_A@g.us', 'STANZA_A', 'owner_A@c.us'
     provider_id = f'true_{chat}_{stanza}_{sender}'
     archive.ingest(wa('wa-native', chat, f'false_{chat}_FIRST'))
-    target = None
     if target_state != 'missing':
         archive.ingest(wa('wa-native', chat, provider_id, outgoing=True,
             sender='' if target_state == 'ambiguous' else 'unknown@c.us'))

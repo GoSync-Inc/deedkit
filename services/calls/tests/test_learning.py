@@ -1,5 +1,4 @@
 """Private call evidence and the improvement loop, with no real provider calls."""
-import asyncio
 import json
 
 import pytest

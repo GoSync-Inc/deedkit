@@ -11,7 +11,7 @@ from messaging_service.enrichment_providers import normalize_result, validate_pr
 from messaging_service.file_extract import Extraction
 from messaging_service.file_index import FileIndexer
 from messaging_service.store import APIError
-from test_archive import archive, event
+from test_archive import archive as archive, event
 from test_incoming_formatting import proof
 
 

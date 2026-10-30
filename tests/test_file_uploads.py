@@ -17,7 +17,7 @@ from messaging_service.envelope import stable_id
 from messaging_service.store import APIError
 from messaging_service.uploads import CHUNK_BYTES, MAX_BYTES, RESERVE_BYTES
 from messaging_service.storage_admission import STREAM_WORKSPACE_BYTES
-from test_messenger_commands import operator
+from test_messenger_commands import operator as operator
 
 
 @pytest.fixture

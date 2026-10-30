@@ -20,7 +20,7 @@ from psycopg import sql
 from .blobs import Blob,BlobWriter
 from .envelope import canonical
 from .spool import fsync_dir
-from .store import serial
+from .store import serial as serial
 
 # Explicit tables and deterministic ordering; no SQL/identifiers supplied by agents.
 TABLES={'probe_metadata':'name','archive_migrations':'version','accounts':'id','principals':'id',

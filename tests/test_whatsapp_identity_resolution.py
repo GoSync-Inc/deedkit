@@ -5,7 +5,7 @@ import pytest
 
 from messaging_service.store import APIError
 from messaging_service.whatsapp_identity import resolve_alias
-from test_whatsapp_identity import identity_archive, observed
+from test_whatsapp_identity import identity_archive as identity_archive, observed
 
 
 def _unrelated_archive(c, account, count=10000):

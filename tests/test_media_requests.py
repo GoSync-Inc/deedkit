@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from messaging_service.store import APIError
-from test_archive import archive, event
+from test_archive import archive as archive, event
 
 
 def pending(ar, s, *, mid='201', age=90):
@@ -80,7 +80,7 @@ def test_request_limits_and_expiry(archive,monkeypatch):
     ar,s,key,_=archive
     monkeypatch.setattr(media_requests,'PER_KEY_LIMIT',1)
     first=pending(ar,s); second=pending(ar,s,mid='202')
-    initial=s.request_file_download(key,first)
+    s.request_file_download(key,first)
     with pytest.raises(APIError,match='media_request_limit'):s.request_file_download(key,second)
     with s.pool.connection() as c:c.execute("UPDATE media_jobs SET requested_until=now()-interval '1 second' WHERE id=%s",(first,))
     assert s.request_file_download(key,second)['request_status']=='queued'

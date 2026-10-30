@@ -26,7 +26,7 @@ from starlette.routing import Route
 from .store import APIError, Store, digest
 from .security_logging import redact_library_logs
 from . import __version__
-from .error_details import payload,classified
+from .error_details import payload,classified as classified
 from .field_errors import field_error,pydantic_field_errors
 from .presentation import options, render
 from .telemetry import capture as capture_error

@@ -9,7 +9,7 @@ import pytest
 from messaging_service.envelope import stable_id
 from messaging_service.presentation import render
 from messaging_service.store import APIError
-from test_archive import archive,event
+from test_archive import archive as archive,event
 
 ROOT=Path(__file__).resolve().parents[1]
 OLD_INSERT='''INSERT INTO message_conflicts(receipt_digest,message,observed_revision,

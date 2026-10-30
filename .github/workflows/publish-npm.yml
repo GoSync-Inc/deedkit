@@ -29,7 +29,7 @@ jobs:
           git merge-base --is-ancestor "$commit" refs/remotes/origin/main
   checks:
     needs: tag
-    uses: ./.github/workflows/checks.yml
+    uses: ./.github/workflows/checks.yml # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ workflow calls.
     with:
       version: ${{ inputs.version }}
       source_ref: refs/tags/v${{ inputs.version }}

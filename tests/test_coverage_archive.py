@@ -13,7 +13,7 @@ import pytest
 from messaging_service.archive import Archive
 from messaging_service.collector_state import CollectorState, validate_capture
 from messaging_service.envelope import MAX_ENVELOPE, fingerprint, stable_id, validate
-from test_archive import archive, event
+from test_archive import archive as archive, event
 
 
 @pytest.mark.parametrize('field,maximum', [

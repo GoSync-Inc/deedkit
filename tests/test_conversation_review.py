@@ -1,7 +1,7 @@
 """Independent regressions for source evidence surviving MCP compact rendering."""
 from messaging_service.conversation import present_message, presentation
 from messaging_service.presentation import message_summary
-from test_conversation_state import dialogue_archive
+from test_conversation_state import dialogue_archive as dialogue_archive
 
 
 def test_compact_conversation_keeps_provider_reference_and_precision_provenance():

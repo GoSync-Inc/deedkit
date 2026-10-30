@@ -8,7 +8,7 @@ import pytest
 from messaging_service import outgoing
 from messaging_service.envelope import stable_id
 from messaging_service.store import APIError
-from test_sending import sender
+from test_sending import sender as sender
 
 
 def invoke(s,key,operation,**args):

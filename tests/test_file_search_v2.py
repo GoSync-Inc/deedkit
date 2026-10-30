@@ -2,7 +2,6 @@
 import base64
 import json
 import shutil
-import struct
 import subprocess
 import zlib
 

@@ -1,6 +1,6 @@
 """Capabilities report per-account usable operations exactly as list_messenger_operations."""
 from messaging_service.envelope import stable_id
-from test_messenger_commands import operator
+from test_messenger_commands import operator as operator
 
 
 def available(s,key,account):

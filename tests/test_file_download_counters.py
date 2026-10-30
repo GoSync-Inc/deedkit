@@ -1,7 +1,7 @@
 """Chat/account download counters: one current state per file occurrence."""
 from messaging_service.blobs import BlobWriter
 from messaging_service.envelope import stable_id
-from test_archive import archive,event
+from test_archive import archive as archive,event
 
 CURRENT=('queued','leased','ready','failed','unavailable')
 

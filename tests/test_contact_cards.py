@@ -19,7 +19,7 @@ from messaging_service.collector_state import CaptureSpool,CollectorState
 from messaging_service.conversation import present_message
 from messaging_service.envelope import contact_block,stable_id,validate
 from test_archive import event as archive_event
-from test_whatsapp import capture,event,wa  # noqa: F401  (wa is a fixture)
+from test_whatsapp import capture,event,wa as wa  # noqa: F401  (wa is a fixture)
 
 PHONE='+6281200000001'
 CARD={'status':'parsed','contacts':[{'name':'Synthetic Friend','vcard_name':'Friend Card',

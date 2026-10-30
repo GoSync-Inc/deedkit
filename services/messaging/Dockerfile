@@ -1,7 +1,7 @@
 ARG PYTHON_IMAGE=python:3.13-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
 ARG NODE_IMAGE=node:24-bookworm-slim@sha256:51b1100cc2a83d370c6a60952e3f2989c8a43159d0e38586e090f3b3326efefd
 ARG POSTGRES_IMAGE=postgres:18-bookworm@sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c
-ARG GO_IMAGE=golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c
+ARG GO_IMAGE=golang:1.26.10-bookworm@sha256:23ce71337b726608afb1bc00986e630a05034a87a87ea1fc2cd1ae5cf33387eb
 FROM ${GO_IMAGE} AS whatsmeow-build
 WORKDIR /src
 COPY whatsapp/whatsmeow/go.mod whatsapp/whatsmeow/go.sum ./
@@ -29,6 +29,8 @@ ARG ANYMSG_INSTALL_TELEMETRY=0
 RUN if [ "$ANYMSG_INSTALL_TELEMETRY" = "1" ]; then pip install --no-cache-dir --require-hashes -r requirements-telemetry.lock; fi
 RUN groupadd -g 10001 probe && useradd -u 10001 -g probe -M probe \
     && mkdir -p /data/files/.uploads && chmod 0700 /data/files/.uploads && chown -R probe:probe /data
+# This user is defined by the pinned base or explicitly created above.
+# hadolint ignore=DL3066
 USER probe
 
 FROM python-dependencies AS runtime
@@ -43,16 +45,24 @@ ARG DEEDKIT_SOURCE_SHA
 ENV DEEDKIT_SOURCE_SHA=$DEEDKIT_SOURCE_SHA
 
 FROM python-dependencies AS indexer
+# This user is defined by the pinned base or explicitly created above.
+# hadolint ignore=DL3066
 USER root
+# Debian packages follow security updates within the digest-pinned base release; image scans verify the result.
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus \
     && dpkg-query -W > /app/indexer-system-packages.txt && rm -rf /var/lib/apt/lists/*
 COPY services/messaging/messaging_service ./messaging_service
+# This user is defined by the pinned base or explicitly created above.
+# hadolint ignore=DL3066
 USER probe
 CMD ["python", "-m", "messaging_service.file_index"]
 ARG DEEDKIT_SOURCE_SHA
 ENV DEEDKIT_SOURCE_SHA=$DEEDKIT_SOURCE_SHA
 
 FROM indexer AS test
+# This user is defined by the pinned base or explicitly created above.
+# hadolint ignore=DL3066
 USER root
 COPY packages/platform-contracts/src/platform_contracts ./platform_contracts
 # Contract tests inspect the same public deployment and workflow templates
@@ -74,27 +84,41 @@ COPY services/messaging/requirements-test.lock ./requirements-test.lock
 RUN pip install --no-cache-dir --require-hashes -r requirements-test.lock
 COPY tests ./tests
 COPY media_benchmark.py ./media_benchmark.py
+# This user is defined by the pinned base or explicitly created above.
+# hadolint ignore=DL3066
 USER probe
 CMD ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "--tb=short", "tests"]
 
 # Optional enrichment image. Neither native audio tools nor speech dependencies
 # are installed in the gateway, collector, indexer or regular test stages.
 FROM python-dependencies AS enricher
+# This user is defined by the pinned base or explicitly created above.
+# hadolint ignore=DL3066
 USER root
+# Debian packages follow security updates within the digest-pinned base release; image scans verify the result.
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates libgomp1 \
     && dpkg-query -W > /app/enricher-system-packages.txt && rm -rf /var/lib/apt/lists/*
 COPY services/messaging/messaging_service ./messaging_service
+# Fixed offline/telemetry booleans, with no credential value.
+# hadolint ignore=DL3064
 ENV HF_HUB_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1 TOKENIZERS_PARALLELISM=false \
     OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2
+# This user is defined by the pinned base or explicitly created above.
+# hadolint ignore=DL3066
 USER probe
 CMD ["python", "-m", "messaging_service.enrichment", "--config", "/run/secrets/enrichment_config"]
 
 # CPU inference only; model weights are installed separately and mounted read-only.
 FROM enricher AS enricher-local
+# This user is defined by the pinned base or explicitly created above.
+# hadolint ignore=DL3066
 USER root
 COPY services/messaging/requirements-enrichment.lock ./requirements-enrichment.lock
 RUN pip install --no-cache-dir --only-binary=:all: --require-hashes -r requirements-enrichment.lock \
     && pip check
+# This user is defined by the pinned base or explicitly created above.
+# hadolint ignore=DL3066
 USER probe
 ARG DEEDKIT_SOURCE_SHA
 ENV DEEDKIT_SOURCE_SHA=$DEEDKIT_SOURCE_SHA
@@ -102,22 +126,32 @@ ENV DEEDKIT_SOURCE_SHA=$DEEDKIT_SOURCE_SHA
 # Isolated smoke target. No database, credentials, model downloads or external
 # API calls are needed for native WAV/OGG and mocked provider tests.
 FROM enricher-local AS enricher-test
+# This user is defined by the pinned base or explicitly created above.
+# hadolint ignore=DL3066
 USER root
 COPY services/messaging/requirements-test.lock ./requirements-test.lock
 RUN pip install --no-cache-dir --require-hashes -r requirements-test.lock
 COPY tests ./tests
 ENV REQUIRE_NATIVE_AUDIO=1
+# This user is defined by the pinned base or explicitly created above.
+# hadolint ignore=DL3066
 USER probe
 CMD ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "--tb=short", "tests/test_audio_native.py"]
 
 # Default for new accounts: a single native session owner, no browser or Node.
 FROM python-dependencies AS whatsapp-native
+# This user is defined by the pinned base or explicitly created above.
+# hadolint ignore=DL3066
 USER root
+# Debian packages follow security updates within the digest-pinned base release; image scans verify the result.
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=whatsmeow-build /out/anymsg-whatsmeow /usr/local/bin/anymsg-whatsmeow
 COPY --from=whatsmeow-build /out/licenses /app/whatsmeow-licenses
 COPY services/messaging/messaging_service ./messaging_service
+# This user is defined by the pinned base or explicitly created above.
+# hadolint ignore=DL3066
 USER probe
 CMD ["python", "-m", "messaging_service.whatsapp_collector", "--config", "/run/secrets/whatsapp_config"]
 ARG DEEDKIT_SOURCE_SHA
@@ -125,8 +159,12 @@ ENV DEEDKIT_SOURCE_SHA=$DEEDKIT_SOURCE_SHA
 
 # Explicit rollback image for existing browser sessions; never auto-converted.
 FROM python-dependencies AS whatsapp
+# This user is defined by the pinned base or explicitly created above.
+# hadolint ignore=DL3066
 USER root
 ARG CHROMIUM_VERSION=154.0.8037.92-1~deb12u1
+# Debian packages follow security updates within the digest-pinned base release; image scans verify the result.
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends chromium=${CHROMIUM_VERSION} ca-certificates \
     && dpkg-query -W > /app/system-packages.txt && rm -rf /var/lib/apt/lists/*
 COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
@@ -134,6 +172,8 @@ COPY --from=whatsapp-dependencies /whatsapp/node_modules ./whatsapp/node_modules
 COPY whatsapp ./whatsapp
 COPY services/messaging/messaging_service ./messaging_service
 ENV HOME=/tmp PUPPETEER_SKIP_DOWNLOAD=true
+# This user is defined by the pinned base or explicitly created above.
+# hadolint ignore=DL3066
 USER probe
 CMD ["python", "-m", "messaging_service.whatsapp_collector", "--config", "/run/secrets/whatsapp_config"]
 
@@ -141,7 +181,11 @@ CMD ["python", "-m", "messaging_service.whatsapp_collector", "--config", "/run/s
 # recovery key; only the isolated restore helper gets an explicit read-only key.
 # The cold archiver mounts its own forced-command SSH key at runtime only.
 FROM ${POSTGRES_IMAGE} AS backup
+# Backup reads existing collector-owned files; deploy drops capabilities and restricts mounts (BACKUP.md).
+# hadolint ignore=DL3002,DL3066
 USER root
+# Debian packages follow security updates within the digest-pinned base release; image scans verify the result.
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssh-client \
     libsqlite3-0 libbz2-1.0 libffi8 liblzma5 libexpat1 libreadline8 libncursesw6 libgdbm6 \
     && rm -rf /var/lib/apt/lists/* \

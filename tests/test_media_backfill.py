@@ -7,10 +7,10 @@ import pytest
 
 from messaging_service.blobs import BlobWriter
 from messaging_service.telegram_collector import configuration
-from test_archive import archive, event
-from test_collectors import worker
+from test_archive import archive as archive, event
+from test_collectors import worker as worker
 from test_live_media import config_path
-from test_media_claim_performance import ACCOUNT, BOUND, backlog, explained, grow_dormant, index_tables, work
+from test_media_claim_performance import ACCOUNT, BOUND, backlog as backlog, explained, grow_dormant, index_tables, work
 
 
 DAY=86400

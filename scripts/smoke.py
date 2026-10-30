@@ -1,7 +1,6 @@
 """Owned synthetic network drill against a separate disposable PostgreSQL DB."""
 import argparse
 from importlib.resources import files
-import json
 import os
 from pathlib import Path
 import subprocess
@@ -10,7 +9,6 @@ import tempfile
 import time
 
 import psycopg
-from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from anymsg import Client
 from messaging_service.store import Store
@@ -22,7 +20,7 @@ def main():
     args=parser.parse_args()
     base=args.dsn_file.read_text().strip()
     assert conninfo_to_dict(base)['dbname']=='messaging_probe_test'
-    values=conninfo_to_dict(base)
+    conninfo_to_dict(base)
     owner=make_conninfo(base,dbname='anymsg_smoke_ci')
     gateway=make_conninfo(owner,user='anymsg_smoke_api',password='synthetic-smoke-password')
     source=Path(__file__).resolve().parents[1]

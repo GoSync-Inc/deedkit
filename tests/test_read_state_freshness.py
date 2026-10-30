@@ -287,7 +287,6 @@ def test_telegram_auto_reconnect_ends_continuity():
     import asyncio
     from telethon import TelegramClient
     from telethon.sessions import StringSession
-    from telethon.tl import types
     from messaging_service.telegram_collector import TelethonProvider
     # A real, never-connected client: the hooks are the ones Telethon itself calls.
     client = TelegramClient(StringSession(), 1, 'synthetic', receive_updates=False)

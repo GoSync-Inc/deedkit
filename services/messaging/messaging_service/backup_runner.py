@@ -19,7 +19,6 @@ import signal
 import stat
 import struct
 import subprocess
-import sys
 import tempfile
 import time
 

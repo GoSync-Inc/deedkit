@@ -88,7 +88,7 @@ def _active(row):
 
 
 def fetch_subscription_events(store, c, p, subscription_id, *, limit=50):
-    from .store import APIError, bounded
+    from .store import bounded
     bounded(limit)
     row = _owned(c, p, subscription_id)
     _active(row)

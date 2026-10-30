@@ -5,13 +5,13 @@ import asyncio
 import pytest
 from starlette.testclient import TestClient
 
-from messaging_service.adapters import telegram_message,whatsapp_message
+from messaging_service.adapters import telegram_message
 from messaging_service.app import create_app
 from messaging_service.archive import Archive
 from messaging_service.store import APIError
 from messaging_service.security_logging import redact_library_logs
 from test_archive import event
-from test_collectors import worker,message
+from test_collectors import worker as worker,message
 
 
 def directory(seeded):

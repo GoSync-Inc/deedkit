@@ -1,11 +1,9 @@
 """Regression checks of command boundaries, with synthetic providers only."""
 import asyncio
-from types import SimpleNamespace
 import pytest
-from messaging_service.envelope import stable_id
-from messaging_service.outgoing import OutgoingWorker,SendRejected
+from messaging_service.outgoing import OutgoingWorker
 from messaging_service.whatsapp_collector import NodeProvider
-from test_sending import sender,submit
+from test_sending import sender as sender,submit
 
 
 @pytest.mark.parametrize('regrant',[False,True])

@@ -6,7 +6,7 @@ from messaging_service.envelope import stable_id
 from messaging_service.outgoing import OutgoingWorker
 from messaging_service.presentation import render
 from test_archive import event
-from test_sending import sender, submit
+from test_sending import sender as sender, submit
 
 
 def read_capture(account='send-fixture', maximum=42):

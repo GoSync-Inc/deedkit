@@ -6,8 +6,8 @@ import pytest
 
 from messaging_service.collector_control import resume
 from messaging_service.collector_state import CollectorState
-from test_collectors import worker
-from test_whatsapp import wa
+from test_collectors import worker as worker
+from test_whatsapp import wa as wa
 
 
 @pytest.mark.parametrize(

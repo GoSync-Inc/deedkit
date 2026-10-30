@@ -5,7 +5,6 @@ CI builds the reviewed backup image and invokes only this file with sudo and the
 credentials or production mounts enter any container.
 """
 import hashlib
-import json
 import os
 from pathlib import Path
 import secrets

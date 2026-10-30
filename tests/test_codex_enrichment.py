@@ -126,7 +126,7 @@ def test_subscription_requires_isolated_runtime(tmp_path):
     ({'type':'error','message':'PRIVATE: you have hit your usage limit'},'model_rate_limited'),
     ({'type':'turn.started'},'codex_run_incomplete')])
 def test_subscription_failed_or_tool_using_runs_do_not_publish(monkeypatch,tmp_path,event,code):
-    p=profile(tmp_path);original=fake_runner(monkeypatch,tmp_path)
+    p=profile(tmp_path);fake_runner(monkeypatch,tmp_path)
     previous=subprocess.run
     def run(command,**kwargs):
         result=previous(command,**kwargs)

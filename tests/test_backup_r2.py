@@ -1,5 +1,5 @@
 """Synthetic S3 state machine checks; no credentials, provider sessions or data."""
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 import hashlib
 import io
 import json

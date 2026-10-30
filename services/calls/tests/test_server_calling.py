@@ -48,7 +48,6 @@ def test_private_server_credentials_routes_and_no_browser_dial_bypass(tmp_path,m
 
 def test_signed_provider_webhook_bound_to_exact_attempt(tmp_path):
     from outbound import ExternalBrief,TwilioCalls
-    from urllib.parse import urlencode
     import hmac,hashlib,base64
     app=create_app(tmp_path,Archive())
     cfg={'account_sid':'AC'+'1'*32,'auth_token':'fixture-secret','public_url':'https://voice.test/voice'}
@@ -67,7 +66,7 @@ def test_signed_provider_webhook_bound_to_exact_attempt(tmp_path):
 
 
 def test_signed_websocket_carries_real_twilio_audio_and_hangs_up(monkeypatch,tmp_path):
-    import asyncio,base64,hmac,hashlib
+    import base64,hmac,hashlib
     import numpy as np
     import voice
     from pipecat.frames.frames import OutputAudioRawFrame

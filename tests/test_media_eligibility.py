@@ -6,7 +6,7 @@ from psycopg.types.json import Jsonb
 
 from messaging_service.collector_state import CollectorState
 from messaging_service.sync_status import get_sync_status
-from test_archive import archive, event
+from test_archive import archive as archive, event
 
 
 ACCOUNT='archive-test'

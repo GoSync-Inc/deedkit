@@ -14,8 +14,8 @@ from messaging_service.messenger_operations import operation_manifest, validate_
 from messaging_service.outgoing import OutgoingWorker
 from messaging_service.store import APIError, digest
 from test_archive import event
-from test_messenger_commands import operator, operation_args
-from test_sending import sender, submit
+from test_messenger_commands import operator as operator, operation_args
+from test_sending import sender as sender, submit
 
 
 @pytest.mark.parametrize('request_id', ['', 'short', 'x'*129, 'contains space', 'bad/request', True])

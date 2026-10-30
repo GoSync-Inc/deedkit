@@ -1,5 +1,4 @@
 """Client contract regressions with synthetic data and the isolated test DB."""
-import json
 
 import pytest
 from starlette.testclient import TestClient

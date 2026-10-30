@@ -11,7 +11,7 @@ from messaging_service.adapters import telegram_message, whatsapp_message
 from messaging_service.envelope import fingerprint, validate
 from messaging_service.presentation import message_summary
 from messaging_service.store import APIError
-from test_archive import archive, event
+from test_archive import archive as archive, event
 
 
 def tg(body='😀 привет', entities=(), **changes):

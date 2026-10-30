@@ -8,7 +8,7 @@ import pytest
 from messaging_service.enrichment import EnrichmentWorker, verified_copy
 from messaging_service.enrichment_providers import ModelError, infer, normalize_result, validate_profile
 from messaging_service.envelope import fingerprint,validate
-from test_archive import archive,event
+from test_archive import archive as archive,event
 
 
 def profile(tmp_path,provider='openai',kind='image'):

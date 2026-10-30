@@ -54,7 +54,7 @@ class SessionBroker:
             await state['writer'].drain()
 
     async def _update(self,update):
-        from telethon.tl.types import UpdatePhoneCall,UpdatePhoneCallSignalingData,PhoneCallRequested,PhoneCallDiscarded
+        from telethon.tl.types import UpdatePhoneCall,UpdatePhoneCallSignalingData,PhoneCallRequested
         state=self.current
         if not state: return
         if isinstance(update,UpdatePhoneCall):

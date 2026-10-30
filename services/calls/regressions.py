@@ -3,11 +3,10 @@ import asyncio
 import copy
 import json
 import tempfile
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from core import ACTIVE, MODEL, BriefInput, TOOL_MODELS, VoiceService, build_prompt, now
+from core import ACTIVE, MODEL, BriefInput, TOOL_MODELS, VoiceService, build_prompt
 
 
 def guard_cases():

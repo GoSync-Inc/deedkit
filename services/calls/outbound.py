@@ -4,7 +4,6 @@ import contextlib
 from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
-import json
 import re
 import secrets
 from urllib.parse import urlsplit

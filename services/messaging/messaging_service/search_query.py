@@ -10,7 +10,6 @@ import base64
 from dataclasses import dataclass
 import hashlib
 import json
-import re
 
 LANGUAGES = ('simple', 'russian', 'english', 'indonesian')
 FUNCTIONS = {'all': 'plainto_tsquery', 'phrase': 'phraseto_tsquery', 'web': 'websearch_to_tsquery'}

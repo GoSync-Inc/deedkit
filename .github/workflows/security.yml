@@ -1,8 +1,7 @@
 name: Security report
-# Report-only, except osv-scanner: every other step continues on error. osv-scanner fails the run on any
-# advisory that osv-scanner.toml does not list with a reason, a card and an expiry. The workflow is not a
-# required check, but a red main push run stops wait-merge.sh --main. The daily scheduled run of main fails the same
-# way on an advisory published since the last push, so the next merge is not the first to notice.
+# Scanner findings and installation errors fail the run. Independent scanners still run after a failure.
+# OSV exceptions in osv-scanner.toml need a reason, a card and an expiry. The workflow is not a required
+# check, but a red main push run stops wait-merge.sh --main; its daily schedule also catches new advisories.
 # Tools are pinned to exact releases and verified by SHA-256 before use.
 on:
   pull_request:
@@ -25,13 +24,11 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        continue-on-error: true
         with:
           persist-credentials: false
           fetch-depth: 0
       - name: Install pinned scanners
         id: install
-        continue-on-error: true
         run: |
           set -euo pipefail
           bin="$RUNNER_TEMP/security-bin"
@@ -57,17 +54,17 @@ jobs:
           echo "$bin" >> "$GITHUB_PATH"
       - name: zizmor (workflow security)
         id: zizmor
-        continue-on-error: true
+        if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: zizmor --format github .
       - name: actionlint (workflow syntax)
         id: actionlint
-        continue-on-error: true
+        if: ${{ !cancelled() }}
         run: actionlint
       - name: hadolint (each Dockerfile)
         id: hadolint
-        continue-on-error: true
+        if: ${{ !cancelled() }}
         run: |
           status=0
           while IFS= read -r file; do
@@ -79,10 +76,12 @@ jobs:
           exit "$status"
       - name: gitleaks (history, redacted)
         id: gitleaks
-        continue-on-error: true
-        run: gitleaks git --redact --no-banner --verbose .
+        if: ${{ !cancelled() }}
+        # Scan the entire candidate history, including both parents of a PR merge, without unrelated local refs.
+        run: gitleaks git --log-opts=HEAD --redact --no-banner --verbose .
       - name: osv-scanner (lockfiles, blocking)
         id: osv
+        if: ${{ !cancelled() }}
         run: |
           osv-scanner scan source --recursive --config osv-scanner.toml \
             --lockfile requirements.txt:services/messaging/requirements.lock \
@@ -91,30 +90,26 @@ jobs:
             --lockfile requirements.txt:services/messaging/requirements-test.lock \
             .
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
-        # This and the scanners below run after a failed osv-scanner too, so their reports are never lost.
+        # This and the scanners below run after a failed scan too, so their reports are never lost.
         if: ${{ !cancelled() }}
-        continue-on-error: true
         with:
-          go-version: '1.26.9'
+          go-version: '1.26.10'
           cache: false
-      - name: govulncheck (native WhatsApp adapter)
+      - name: govulncheck (native WhatsApp adapter, blocking)
         id: govulncheck
         if: ${{ !cancelled() }}
-        continue-on-error: true
         working-directory: whatsapp/whatsmeow
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
         if: ${{ !cancelled() }}
-        continue-on-error: true
         with: {version: '0.9.26', enable-cache: false}
       - name: ruff check (pinned in tools/dev)
         id: ruff
         if: ${{ !cancelled() }}
-        continue-on-error: true
         run: |
           uv sync --project tools/dev --locked
           uv run --project tools/dev --locked ruff check --statistics .
-      - name: Summarize report-only outcomes
+      - name: Summarize scanner outcomes
         if: ${{ always() }}
         continue-on-error: true
         env:
@@ -137,5 +132,5 @@ jobs:
               echo "| ${pair%%=*} | ${pair#*=} |"
             done
             echo
-            echo "A failure outcome means findings or a tool error; see the step log. Only osv-scanner fails this run."
+            echo "A failure outcome means findings or a tool error and fails this run; see the step log."
           } >> "$GITHUB_STEP_SUMMARY"

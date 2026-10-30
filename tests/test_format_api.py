@@ -7,7 +7,7 @@ from starlette.testclient import TestClient
 from messaging_service.app import create_app
 from messaging_service.envelope import stable_id
 from messaging_service.store import APIError
-from test_sending import sender
+from test_sending import sender as sender
 
 
 class RecordingStore:

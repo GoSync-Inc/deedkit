@@ -5,14 +5,13 @@ import hashlib
 import os
 import stat
 import re
-import secrets
 import threading
 from time import monotonic
 
 from psycopg.types.json import Jsonb
 
 from .envelope import canonical, fingerprint, stable_id, validate
-from .store import serial
+from .store import serial as serial
 from .incoming_formatting import known as known_formatting, unknown as unknown_formatting, wire_digest
 
 # The retry-exhausted sweep has no selective index: one Archive (a collector)

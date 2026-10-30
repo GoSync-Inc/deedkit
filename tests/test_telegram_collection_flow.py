@@ -11,7 +11,7 @@ from messaging_service.envelope import stable_id
 from messaging_service.sync_status import get_sync_status
 from messaging_service.telegram_collector import TelegramCollector
 from messaging_service.telegram_governor import ProviderRateLimited,RequestGovernor
-from test_collectors import FakeProvider,message,worker  # noqa: F401  (worker is a fixture)
+from test_collectors import FakeProvider,message,worker as worker  # noqa: F401  (worker is a fixture)
 
 
 def dated(mid,chat,body=None,edited=None):

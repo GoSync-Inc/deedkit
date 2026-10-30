@@ -5,7 +5,7 @@ from datetime import datetime,timezone
 import pytest
 
 from messaging_service.telegram_collector import history_bound
-from test_collectors import worker, message
+from test_collectors import worker as worker, message
 
 
 def at(mid,date,chat='100',media=False):

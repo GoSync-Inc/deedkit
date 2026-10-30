@@ -17,7 +17,7 @@ def module():
 
 
 def test_server_verifier_disk_preflight_counts_plaintext_database_and_reserve(tmp_path,monkeypatch):
-    v=module();calls=[]
+    v=module()
     monkeypatch.setattr(v.shutil,'disk_usage',lambda path:SimpleNamespace(free=100))
     config={'directory':str(tmp_path),'max_plaintext_bytes':80,'postgres_headroom_bytes':20,'reserve_bytes':10}
     with pytest.raises(ValueError,match='restore_disk_capacity'):
@@ -74,7 +74,7 @@ def test_official_postgres_repo_digest_can_omit_configured_tag(monkeypatch):
 def operator(tmp_path,monkeypatch):
     # Virtualize root ownership/trust only; retain real FDs, links, modes, flock,
     # JSON hashing/fsync and conditional cloud operations. Native drill uses real UID.
-    from test_backup_r2 import Cloud,write_json,receive,BID
+    from test_backup_r2 import Cloud,write_json,receive,BID as BID
     v=module();original_fstat=os.fstat;original_stat=Path.stat
     ancestors={(original_stat(p).st_dev,original_stat(p).st_ino) for p in (tmp_path,*tmp_path.parents)}
     def root_info(info):
