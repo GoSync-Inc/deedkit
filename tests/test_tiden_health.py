@@ -1590,6 +1590,74 @@ def test_the_backlog_scope_starts_after_the_rollout_commit_and_within_seven_days
         f"no main commit in scope; not checked: {boundary[:12]} and earlier, 0 later commit(s) older than 7 days")
 
 
+class WindowPages(health.Actions):
+    """Synthetic GitHub listing: at most 1000 rows, even when total_count is greater."""
+
+    def __init__(self, rows, ci=(), elapsed=0):
+        self.ticks, self.elapsed, self.timeouts = 0.0, elapsed, []
+        super().__init__("o/r", clock=lambda: self.ticks)
+        self.rows, self.ci, self.queries, self.now = rows, ci, [], lambda: START
+
+    def page(self, number, created, end, workflow=health.SYNC_WORKFLOW, filters=()):
+        self.queries.append((created, workflow, filters))
+        self.timeouts.append(end - self.clock())
+        if self.clock() >= end:
+            raise health.Unknown("gh api timed out")
+        self.ticks += self.elapsed
+        lower, _, upper = created.removeprefix(">=").partition("..")
+        rows = self.rows if workflow == health.SYNC_WORKFLOW else self.ci
+        matches = [row for row in rows if lower <= row["created_at"] and
+                   (not upper or row["created_at"] <= upper) and
+                   ("event=push" not in filters or row.get("event") == "push")]
+        matches.sort(key=lambda row: row["created_at"], reverse=True)
+        return {"total_count": len(matches), "workflow_runs": matches[:1000][(number - 1) * 100:number * 100]}
+
+
+def window_rows():
+    # More than one listing can return, fewer than the cap on any one day.
+    return [sync_attempt(100 + number, SHA_C, minutes=number * 4) for number in range(1200)]
+
+
+# spec: ANYM-503
+def test_backlog_reads_beyond_the_api_cap_and_a_recovered_old_sync_passes(repo, server, monkeypatch):
+    history(repo)
+    boundary = dated(repo, "boundary", START - timedelta(days=6))
+    lost = dated(repo, "lost", START - timedelta(days=5))
+    head = dated(repo, "head", START - timedelta(hours=2))
+    monkeypatch.setattr(health, "SYNC_BACKLOG_SINCE", boundary)
+    server.world(head)
+    rows = [*window_rows(), sync_attempt(1, lost, "failure", minutes=5 * 24 * 60), sync_attempt(2, head)]
+    pages = WindowPages(rows, [ci_attempt(3, lost, minutes=5 * 24 * 60),
+                               ci_attempt(4, lost, event="pull_request")])
+    clock = Clock()
+    data = report(repo, Tiden(server.cli, "product", "workspace"), head, "refs/remotes/origin/main", False,
+                  clock, clock.sleep, backlog=pages, now=lambda: START)
+    entry = data["metrics"].pop("sync_backlog")
+    assert entry["state"] == FAIL and set(states(data).values()) == {PASS}
+    assert entry["commits"][1]["url"] == "https://example.invalid/runs/1"
+    assert entry["commits"][1]["reason"].startswith("last sync failure;")
+    assert entry["commits"][1]["dispatch"] == health.DISPATCH.format(sha=lost)
+    assert {filters for _, workflow, filters in pages.queries if workflow == "ci.yml"} == {("event=push",)}
+    pages.rows.append(sync_attempt(5, lost))
+    assert health.backlog_metric(repo, pages, head, START)["state"] == PASS
+
+
+# spec: ANYM-503
+def test_a_saturated_day_remains_unknown_instead_of_looking_like_a_complete_listing():
+    pages = WindowPages([sync_attempt(number, SHA_C) for number in range(1000)])
+    with pytest.raises(health.Unknown, match="listing cap"):
+        pages.listing(START - timedelta(days=2), health.TIMEOUT)
+
+
+# spec: ANYM-503
+def test_window_fallback_keeps_the_original_listing_deadline():
+    pages = WindowPages(window_rows(), elapsed=8)
+    with pytest.raises(health.Unknown, match="timed out"):
+        pages.listing(START - timedelta(days=5), health.TIMEOUT)
+    assert pages.ticks <= health.TIMEOUT
+    assert pages.timeouts == sorted(pages.timeouts, reverse=True)
+
+
 # spec: ANYM-503
 def test_pending_and_unsynced_commits_together_fail_and_both_are_listed_with_dates_out_of_order(repo, server,
                                                                                                monkeypatch):

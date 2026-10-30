@@ -13,7 +13,7 @@ retried: a fresh run reads the server watermark again.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 import json
 import os
@@ -25,9 +25,9 @@ import time
 from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-# The sync lookup of Tiden health (ANYM-438, ANYM-503): the same run titles, listing and checks.
-from tiden_health import (SYNC_READS, SYNC_SLACK, SYNC_WORKFLOW, Actions, Unknown, decisive, moment,  # noqa: E402
-                          sync_runs)
+# Shared read-only run listing and selection; drift no longer imports the health report.
+from tiden_actions import (SYNC_SLACK, Actions, Unknown, decisive, moment, sync_runs,  # noqa: E402
+                           SYNC_WINDOW as SYNC_WINDOW, LISTING_CAP as LISTING_CAP)
 
 REPOSITORY = "github.com/GoSync-Inc/deedkit"
 # Anchors recorded before the rename carry the former repository name, or none.
@@ -63,9 +63,6 @@ SHA = re.compile(r"[0-9a-f]{40}")
 TIMEOUT = 120
 RETRY_DELAY = 2  # seconds before the one retry of a read-only listing
 RETRY_MIN = 10  # a retry needs at least this many seconds left of the call's one TIMEOUT budget
-# A run listing returns at most 1,000 runs, so the sync runs are listed one day at a time (about 270 a day, 2026-10-28)
-# and a day that reaches the cap is unknown: a watermark stalled for days still reads every run of its range.
-SYNC_WINDOW, LISTING_CAP = timedelta(days=1), 1000
 
 
 class Refused(Exception):
@@ -200,33 +197,15 @@ def present(root: Path, sha: str) -> bool:
 
 class SyncRuns:
     """The `Tiden sync` runs of main created at or after a moment, all of them or only the successful ones, read one
-    SYNC_WINDOW at a time through Tiden health's run listing (`gh api`, token GH_TOKEN), every window within one
+    SYNC_WINDOW at a time through the shared run listing (`gh api`, token GH_TOKEN), every window within one
     TIMEOUT budget. A window that reaches LISTING_CAP, a changing or incomplete listing, or the budget is unknown."""
 
     def __init__(self, actions: Actions, now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
         self.actions, self.now = actions, now
 
     def __call__(self, since: datetime, success: bool) -> list[dict]:
-        end, filters = self.actions.clock() + TIMEOUT, ("status=success",) if success else ()
-        rows: dict[int, dict] = {}
-        start, now = since.astimezone(timezone.utc), self.now()
-        while start <= now:
-            stop = start + SYNC_WINDOW
-            # Both ends are inclusive, so a run created on a boundary is read twice and kept once.
-            created = f"{start:%Y-%m-%dT%H:%M:%SZ}..{stop:%Y-%m-%dT%H:%M:%SZ}"
-            for _ in range(SYNC_READS):
-                window = self.actions.read(created, end, SYNC_WORKFLOW, filters)
-                if window is not None:
-                    break
-            else:
-                raise Unknown("the run list changed on every read")
-            if len(window) >= LISTING_CAP:
-                raise Unknown(f"the runs created {created} reach the listing cap of {LISTING_CAP}")
-            rows |= {row["id"]: row for row in window}
-            start = stop
-        if self.actions.clock() >= end:
-            raise Unknown("gh api timed out")
-        return list(rows.values())
+        filters = ("status=success",) if success else ()
+        return self.actions.windows(since, self.actions.clock() + TIMEOUT, filters=filters, now=self.now())
 
 
 def listed(syncs: Callable[[datetime, bool], list[dict]], since: datetime, success: bool) -> list[dict]:
