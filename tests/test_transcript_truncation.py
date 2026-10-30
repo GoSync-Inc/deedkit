@@ -18,7 +18,7 @@ def test_transcript_marks_database_body_clipping_and_lists_affected_ids():
         'next_cursor':'synthetic-next'}, 'transcript')
     assert 'A clipped sentence […]' in result['transcript']
     assert result['truncated_message_ids']==['synthetic-message']
-    assert any(w['code']=='message_text_truncated' for w in result['warnings'])
+    assert [w['message_ids'] for w in result['warnings'] if w['code']=='message_text_truncated']==[['synthetic-message']]
     assert result['next_cursor']=='synthetic-next'
 
 
@@ -26,16 +26,17 @@ def test_transcript_marks_database_body_clipping_and_lists_affected_ids():
 def test_context_transcript_includes_a_hidden_clipped_anchor_without_duplicates():
     anchor=row(body_truncated=True)
     other=row('synthetic-neighbour', display_text_truncated=True)
-    result={'message':anchor, 'context':[other], 'attachments':[], 'pending_attachments':[],
-        'context_window':{'anchor_hidden':True, 'older_cursor':'synthetic-older',
-            'newer_cursor':'synthetic-newer'}, 'conversation_view':presentation([other])}
-    before=deepcopy(result)
-    output=render('get_context', result, 'transcript')
-    assert set(output['truncated_message_ids'])=={'synthetic-message','synthetic-neighbour'}
-    assert len(output['truncated_message_ids'])==2
-    assert any(w['code']=='message_text_truncated' for w in output['warnings'])
-    assert output['context_window']==before['context_window']
-    assert result==before
+    for hidden,context in [(True,[other]),(False,[anchor,other,anchor])]:
+        result={'message':anchor, 'context':context, 'attachments':[], 'pending_attachments':[],
+            'context_window':{'anchor_hidden':hidden, 'older_cursor':'synthetic-older',
+                'newer_cursor':'synthetic-newer'}, 'conversation_view':presentation(context)}
+        before=deepcopy(result)
+        output=render('get_context', result, 'transcript')
+        assert output['truncated_message_ids']==['synthetic-message','synthetic-neighbour']
+        assert [w['message_ids'] for w in output['warnings'] if w['code']=='message_text_truncated']==[
+            ['synthetic-message','synthetic-neighbour']]
+        assert output['context_window']==before['context_window']
+        assert result==before
 
 
 # spec: ANYM-647
@@ -65,5 +66,7 @@ def test_mcp_transcript_reports_clipping_for_context_page_and_search(seeded):
             output=data['structuredContent']
             assert output['truncated_message_ids']
             assert ' […]' in output['transcript']
-            assert any(w['code']=='message_text_truncated' for w in output['warnings'])
+            assert len(output['truncated_message_ids'])==len(set(output['truncated_message_ids']))
+            assert [w['message_ids'] for w in output['warnings'] if w['code']=='message_text_truncated']==[
+                output['truncated_message_ids']]
             if method=='get_context':assert 'demo-tg-1' in output['truncated_message_ids']
