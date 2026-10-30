@@ -39,7 +39,11 @@ features and epics alike.
 
 Who moves: the orchestrator moves a card to `Active` when it dispatches its worker; the worker
 moves it at its merge to `Review` or `Done` by the evidence; the orchestrator's status sweep
-(orchestration.md, Orchestrator) moves parents and fixes all drift. A due move never blocks
+(orchestration.md, Orchestrator) moves parents and fixes all drift. A card a PR's `Delivers:`
+line names whose `Evidence to close` names production, deploy or live goes to `Review` at that
+merge, never `Done` (owner 10-30): the project's sync B sets it where it can, else the worker by
+hand. It goes to `Done` only once the deploy evidence is recorded as below, moved by the agent
+that records it or the orchestrator's sweep. A due move never blocks
 work. A status update never weakens a contract, hides a failing test or removes it from
 verification.
 
@@ -67,7 +71,7 @@ A criterion that needs a human look at the running product with real users keeps
 then moves it without asking. Such a card is a digest FYI line naming what to look at, never an
 owner ask, and is not stale while it waits. One without
 such proof keeps it in `Review` as well; an `[open: live]` criterion whose check is CI, registry
-or command data closes like the evidence above. Every move is a hand write in the maintenance window the orchestrator opens (its own
+or command data closes like the evidence above. Every move except a `Review` sync B sets is a hand write in the maintenance window the orchestrator opens (its own
 dispatch move in the next one; a project without sync B: by hand); a `Done` move happens after sync B's
 read-back and records in the same edit on the evidence line the id of that push's test run and, per
 criterion, the test ids or the evidence (removing the criterion's open marker, as above). A
@@ -156,6 +160,14 @@ History: <legacy identity, related specs, feedback IDs, source/PR links, as-of S
 How others solve it: <open-source projects or standards; adopt | adapt | build, and why>
 Ready: <date>, <reviews and verdicts>; asked by <owner, date | agent or MCP relaying the owner | source>
 ```
+
+A card that changes a schema splits its migrations (owner 10-30): the expand part (tables,
+columns, indexes, grants on objects the same change creates) in its own migration, which rides
+unattended autodeploy (a `CONCURRENTLY` index the runner cannot apply: by hand, reviews.md
+Rounds 7); backfills, triggers and grants on existing objects in a separate one, the only part
+that needs a hand release. The split decides how each part is released, not its review: role
+SQL, grants included, keeps its Astra r1 (process.md section 2). `Expected paths:` names both
+migrations, `Evidence to close:` the production deploy of each.
 
 Categories: defect = current behaviour breaks a contract or spec; feature = a new owner-visible
 capability; improvement = a better existing one; infra = CI, release, deploy, observability,

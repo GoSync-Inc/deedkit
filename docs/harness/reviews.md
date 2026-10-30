@@ -156,7 +156,7 @@ VERDICT: APPROVE | CHANGES REQUIRED — <b> blocking, <m> major, <n> minor — <
    its reason in `Review record:` (`bin/review-codex.sh --over-cap "<reason>"`, which refuses r4
    without it and any r5). Plan and doc reviews (process text, Rounds 8, and plans other than those of Rounds 7) have
    no test to confirm a fix: a fix made after r2 gets the one r3, and no over-cap round. Cards (Rounds 6) and production operation plans (Rounds 7) keep their one
-   recheck: no r3 or r4. A blocking or major finding stays open until a recheck (on other code
+   recheck: no r3 or r4 (the script refuses both, also with `--over-cap`). A blocking or major finding stays open until a recheck (on other code
    after r2: its regression test plus CI) confirms the fix; never merge with it unconfirmed. A finding still open after the last round allowed is the
    worker's BLOCKED (needs: a smaller scope, a follow-up card or a revert). The orchestrator picks
    the cheapest that keeps the defect off `main`: drop the part with the finding, close or narrow
