@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from .catalog import CATALOG
+from .recordings_errors import failure as recordings_failure
 from .policy import Denied
 from .diagnostics import CONSUMPTION_OPERATIONS, consumption_failure, failure_details
 
@@ -209,6 +210,10 @@ class Clients:
                             failure = json.loads(body)
                         except (ValueError, UnicodeDecodeError, RecursionError):
                             failure = None
+                        if module == "recordings":
+                            reviewed = recordings_failure(failure, response.status_code)
+                            if reviewed is not None:
+                                raise reviewed
                         error = Denied("backend_unavailable", 503)
                         error.detail = failure_details(response.status_code, failure, response.headers.get("x-request-id"))
                         raise error
@@ -216,6 +221,10 @@ class Clients:
                     if not isinstance(result, dict):
                         raise Denied("backend_unavailable", 503)
                     if response.status_code >= 400:
+                        if module == "recordings":
+                            reviewed = recordings_failure(result, response.status_code)
+                            if reviewed is not None:
+                                raise reviewed
                         error = Denied("backend_denied", response.status_code)
                         # Existing operation receipts/ACK errors remain visible, but
                         # never leak transport exceptions or arbitrary response text.

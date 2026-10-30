@@ -574,10 +574,14 @@ jobs:
                   with zipfile.ZipFile(archive) as source:
                       paths = source.namelist()
                   assert 'deedkit_recordings/app.py' in paths
-              else:
+              elif archive.name.endswith('.tar.gz'):
                   with tarfile.open(archive) as source:
                       paths = source.getnames()
                   assert any(p.endswith('/src/deedkit_recordings/app.py') for p in paths)
+              elif archive.name == '.gitignore':
+                  continue
+              else:
+                  raise AssertionError(f'unexpected package artifact: {archive.name}')
               assert not any(p.endswith(('.key', '.env', '.db', '.sqlite')) or '/.plaud/' in p for p in paths), paths
           PYCODE
           "$RUNNER_TEMP/recordings-installed/bin/deedkit-recordings" --help

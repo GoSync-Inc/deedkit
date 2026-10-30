@@ -268,3 +268,12 @@ def test_provider_stream_read_deadline_private_files_and_input_bounds(tmp_path):
             path.chmod(0o644)
             assert (await c.post('/v1/capabilities',json={})).json()=={'error':'configuration_unavailable'}
     asyncio.run(run())
+
+
+# spec: ANYM-648
+def test_numeric_speaker_zero_is_distinct_from_missing_speaker():
+    from deedkit_recordings.omi import content
+    value = conversation(transcript_segments=[{'text':'first','speaker_id':0},{'text':'second'}])
+    state, text = content(value,'transcript')
+    assert state == 'available'
+    assert [json.loads(line)['speaker'] for line in text.splitlines()] == ['0','unknown']

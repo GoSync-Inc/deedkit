@@ -119,7 +119,8 @@ def content(value, kind):
         if not isinstance(segment, dict) or not isinstance(segment.get('text'), str):
             raise Failure('invalid_provider_response')
         # Preserve supplied diarization, without claiming an identity inferred from prose.
-        speaker = segment.get('speaker_name') or segment.get('speaker_id') or segment.get('speaker') or 'unknown'
+        speaker = next((segment[field] for field in ('speaker_name', 'speaker_id', 'speaker')
+                        if segment.get(field) is not None and segment[field] != ''), 'unknown')
         if not isinstance(speaker, (str, int)) or isinstance(speaker, bool) or len(str(speaker)) > 256:
             raise Failure('invalid_provider_response')
         offsets = []
