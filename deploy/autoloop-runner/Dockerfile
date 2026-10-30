@@ -14,6 +14,8 @@ ARG TIDEN_VERSION=0.43.0
 ARG TIDEN_SHA256_amd64=3332d6d1f5a0bdb37134109efba6266db3e9435d9de7b7753b4965cfbc9a04ea
 ARG TIDEN_SHA256_arm64=ca896b51d7a48f0d1660104211d4ac6542db743ac0f47a0ce99e67d192fb75b4
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+# Debian packages follow security updates within the digest-pinned base release; image scans verify the result.
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /tmp/tools
@@ -31,6 +33,8 @@ ARG CLAUDE_CODE_VERSION=2.1.310
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python UV_PYTHON_PREFERENCE=only-managed UV_LINK_MODE=copy \
     DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_TELEMETRY=1 \
     GH_NO_UPDATE_NOTIFIER=1 GH_PROMPT_DISABLED=1 NPM_CONFIG_UPDATE_NOTIFIER=false
+# Debian packages follow security updates within the digest-pinned base release; image scans verify the result.
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git python3 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=uv /uv /uvx /usr/local/bin/
@@ -40,6 +44,8 @@ RUN npm install --global --no-fund --no-audit "@anthropic-ai/claude-code@${CLAUD
     && useradd --create-home --uid 10001 --shell /bin/bash runner \
     && install -d -o runner -m 0700 /run/autoloop/outbox
 COPY --chmod=0555 proxy.py selfcheck.py entrypoint.sh /opt/runner/
+# This user is defined by the pinned base or explicitly created above.
+# hadolint ignore=DL3066
 USER runner
 WORKDIR /home/runner
 RUN printf '{"hasCompletedOnboarding": true, "bypassPermissionsModeAccepted": true}\n' > /home/runner/.claude.json
