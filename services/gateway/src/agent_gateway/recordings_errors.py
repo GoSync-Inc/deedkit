@@ -3,6 +3,9 @@ from .policy import Denied
 
 # Permanent failures must not invite a blind retry. Only explicitly transient states do.
 RECOVERY = {
+    'transcript_window_exceeded': (False, 'provider_transcript_window_limit'),
+    'unsupported_plaud_filters_or_limit': (False, 'correct_arguments'),
+    'audio_unsupported': (False, 'provider_audio_unsupported'),
     'response_too_large': (False, 'source_exceeds_read_limit'),
     'provider_auth_required': (False, 'owner_reauthorize_provider'),
     'invalid_provider_response': (False, 'operator_check_provider_contract'),

@@ -73,3 +73,20 @@ def test_plaud_audio_real_gateway_backend_roundtrip_requires_all_ceilings(tmp_pa
             assert len(seen) == 3
         else:
             assert result['isError'] and seen == []
+
+
+# spec: ANYM-649
+def test_plaud_window_limit_has_permanent_gateway_guidance():
+    import asyncio
+    from agent_gateway.http_clients import Clients
+    from agent_gateway.policy import Denied
+    async def run():
+        deployment={'modules':['recordings'],'backends':{'recordings':{'url':'http://recordings'}}}
+        transport=httpx.MockTransport(lambda request:httpx.Response(503,json={
+            'error':'transcript_window_exceeded','private':'untrusted provider details'}))
+        async with Clients(deployment,{'recordings':transport}) as clients:
+            with pytest.raises(Denied) as failure:
+                await clients.call('recordings','read_recording','synthetic',{})
+            assert failure.value.detail=={'error':'transcript_window_exceeded','retryable':False,
+                'next_action':'provider_transcript_window_limit'}
+    asyncio.run(run())
