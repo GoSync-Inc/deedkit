@@ -12,6 +12,15 @@ promotion. Direct source copies, ad hoc image overrides and `compose up --build`
 skip this contract. Root access can bypass deployment policy; keep that access
 for recovery and route routine changes through this tool.
 
+Confirmed production incidents follow [incident recovery](incident-recovery.md)
+and AGENTS.md section 2: restore the affected path first, then finish deferred
+review and records before other tasks. A compatible service-only recovery does
+not wait for a schema migration, unrelated service updates, fresh full backups
+or a restore drill. Main/CI/artifact verification, candidate inspection, locks,
+active-call checks and session/state preservation still apply. A restart of the
+existing failed service/session has standing incident authority. Routine releases
+and data/schema repairs retain the gates below.
+
 ## Required CI and main protection
 
 `CI gate` runs even when dependencies fail or skip and accepts only success from
