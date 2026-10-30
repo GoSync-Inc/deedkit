@@ -20,6 +20,8 @@ class Remote:
         self.mode, self.sse, self.calls = mode, sse, []
         self.observations = 0
         self.after_page = None
+        self.summary = 'A vendor summary about telescopes'
+        self.transcript_entered = self.transcript_release = None
 
     async def __call__(self, request):
         assert str(request.url) == 'https://mcp.plaud.ai/mcp'
@@ -37,13 +39,17 @@ class Remote:
             assert name in ('list_files','get_transcript','get_note')
             if name == 'list_files':
                 value = {'data':[{'id':'file-a','name':'Synthetic meeting'}] if args['page'] == 1 else []}
+                if self.mode in ('bad_duration','bad_created_at'):
+                    value['data'] = [{'id':'file-a',self.mode.removeprefix('bad_'):10**400}]
             elif name == 'get_note':
                 if self.mode == 'notes_error': return httpx.Response(503)
-                value = [{'data_type':'summary','data_content':'A vendor summary about telescopes',
+                value = [{'data_type':'summary','data_content':self.summary,
                           'data_link':'https://invalid.test/never-follow','private_field':'drop'}]
             else:
                 offset = json.loads(base64.urlsafe_b64decode(args['cursor'] + '=' * (-len(args['cursor']) % 4)))['offset'] if args.get('cursor') else 0
                 if offset == 0: self.observations += 1
+                if self.transcript_entered is not None:
+                    self.transcript_entered.set(); await self.transcript_release.wait()
                 if self.mode == 'timeout': await asyncio.Event().wait()
                 segments = [{'text':f'Synthetic telescope segment {n}', 'speaker':'SPEAKER_0','start':n,'end':n+1,
                              'download_url':'https://invalid.test/private'} for n in range(offset,min(offset+500,600))]
@@ -111,7 +117,9 @@ def test_rejected_transcript_never_replaces_previous_text_and_does_not_block_not
     async def run():
         await r.start(background=False); await r.run_once(now=100)
         old = await r.db('record',doc['accounts'][0],'file-a')
+        before = await r.db('events',0,100)
         remote.mode = mode; remote.observations = 0
+        remote.summary = 'Changed notes accepted during rejected transcript'
         await r.run_once(now=4000)
         row = await r.db('record',doc['accounts'][0],'file-a')
         assert row['parts']['transcript']['attempt_state'] == 'error'
@@ -119,7 +127,10 @@ def test_rejected_transcript_never_replaces_previous_text_and_does_not_block_not
         assert row['parts']['transcript']['digest'] == old['parts']['transcript']['digest']
         assert row['parts']['summary']['state'] == 'available'
         assert row['parts']['summary']['attempt_state'] == 'available'
-        assert await r.db('events',0,100)  # accepted notes remain independently usable
+        assert json.loads(row['parts']['summary']['text'])['text'] == remote.summary
+        assert row['parts']['summary']['digest'] != old['parts']['summary']['digest']
+        events = await r.db('events',0,100)
+        assert len(events) == len(before)+1 and events[-1]['revision'] == row['revision']
         await r.close()
     asyncio.run(run())
 
@@ -165,4 +176,53 @@ def test_unicode_separator_inside_utterance_is_not_a_segment_boundary(tmp_path):
         lines = row['parts']['transcript']['text'].split('\n')
         assert len(lines)==600 and '\u2028' in json.loads(lines[0])['text']
         await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-654
+@pytest.mark.parametrize('field',['duration','created_at'])
+def test_malformed_discovery_does_not_starve_durable_work_or_another_account(tmp_path,field):
+    from test_recording_archive_ingest import Vendor
+    remote = Remote(mode='bad_'+field); r,path,doc = configured(tmp_path,remote)
+    other = {**doc['accounts'][0],'id':'omi-b','provider':'omi','archive_namespace':'b'*32}
+    doc['accounts'].append(other); save(path,doc)
+    budget = Provider(httpx.MockTransport(Vendor()))
+    r.provider = budget; r.remote = PlaudProvider(budget,httpx.MockTransport(remote))
+    async def run():
+        await r.start(background=False)
+        await r.db('discover',doc['accounts'][0],[{'id':'file-a'}],None,100)
+        try:
+            await r.run_once(now=100)
+            row = await r.db('record',doc['accounts'][0],'file-a')
+            assert row['parts']['summary']['state'] == row['parts']['transcript']['state'] == 'available'
+            assert (await r.db('record',other,'conv-a'))['parts']['transcript']['state'] == 'available'
+            assert (await r.status(doc['accounts'][0]['id']))['error'] == 'invalid_provider_response'
+        finally:
+            await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-654
+def test_changed_notes_commit_before_stalled_transcript_finishes(tmp_path):
+    remote = Remote(); r,_,doc = configured(tmp_path,remote)
+    async def run():
+        await r.start(background=False); await r.run_once(now=100)
+        old = await r.db('record',doc['accounts'][0],'file-a'); before = await r.db('events',0,100)
+        remote.summary = 'New notes already searchable while transcript waits'
+        remote.transcript_entered,remote.transcript_release = asyncio.Event(),asyncio.Event()
+        task = asyncio.create_task(r.run_once(now=4000))
+        try:
+            await asyncio.wait_for(remote.transcript_entered.wait(),1)
+            assert not task.done()
+            row = await r.db('record',doc['accounts'][0],'file-a')
+            assert json.loads(row['parts']['summary']['text'])['text'] == remote.summary
+            assert row['parts']['summary']['digest'] != old['parts']['summary']['digest']
+            assert row['parts']['transcript'] == old['parts']['transcript']
+            events = await r.db('events',0,100)
+            assert len(events)==len(before)+1 and events[-1]['revision']==row['revision']
+            with r.store.connection() as db:
+                assert db.execute("SELECT ref FROM texts WHERE texts MATCH 'searchable'").fetchone()[0] == row['ref']
+        finally:
+            task.cancel(); remote.transcript_release.set()
+            await asyncio.gather(task,return_exceptions=True); await r.close()
     asyncio.run(run())

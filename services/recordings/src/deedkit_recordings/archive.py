@@ -106,7 +106,10 @@ class ArchiveRuntime:
                 if type(page) is not int or not 1 <= page <= 100000:
                     raise Failure('archive_unavailable')
                 value = await self.remote.call(token,'list_files',{'page':page,'page_size':25})
-                items, _, next_page = plaud.listing(value,25,page)
+                try:
+                    items, _, next_page = plaud.listing(value,25,page)
+                except (ValueError,TypeError,OverflowError,UnicodeError,RecursionError):
+                    raise Failure('invalid_provider_response') from None
             else:
                 params = {'limit':25, 'offset':0, 'include_transcript':'false'}
                 if position is not None:
