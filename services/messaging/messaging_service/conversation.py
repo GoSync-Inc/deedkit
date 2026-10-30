@@ -154,8 +154,18 @@ def decorate_messages(c,p,rows,*,include_system=False):
     return rows
 
 
+def truncation_warning(rows):
+    truncated_ids=list(dict.fromkeys(r['id'] for r in rows
+        if r.get('display_text_truncated') or r.get('body_truncated')))
+    if truncated_ids:
+        return {'code':'message_text_truncated',
+            'message':'Текст сообщений обрезан; для подробностей используйте get_context(message_id, body_chars=20000).',
+            'message_ids':truncated_ids}
+
+
 def presentation(rows,*,order='asc',include_system=False):
-    warnings=[]
+    warning=truncation_warning(rows)
+    warnings=[warning] if warning else []
     if any(r.get('order_status')=='ambiguous' for r in rows):
         warnings.append({'code':'ambiguous_timestamp_tie',
             'message':'Порядок сообщений с одинаковым временем неизвестен; позиции не доказывают порядок на телефоне.'})
@@ -171,7 +181,7 @@ def presentation(rows,*,order='asc',include_system=False):
         sender=row.get('sender_name') or row.get('username') or row.get('sender')
         stamp=row.get('sent_at');stamp=stamp.isoformat() if hasattr(stamp,'isoformat') else str(stamp or '')
         scope_label=(f" · аккаунт {row.get('account','')} · чат {row.get('chat_title') or row.get('chat','')} ({row.get('chat','')})" if mixed_scope else '')
-        text=row['display_text']+(' […]' if row.get('display_text_truncated') else '')
+        text=row['display_text']+(' […]' if row.get('display_text_truncated') or row.get('body_truncated') else '')
         if row.get('authorship')=='forwarded_by_sender':
             # Forwarded words are never the sender's own; name the stated origin or say it is unknown.
             author=((row.get('forward_origin') or {}).get('sender_name') or '')[:64]
