@@ -51,6 +51,9 @@ In the conversation view each message tool returns every message text once.
 - `detail="transcript"`: only the numbered transcript with message IDs, its
   warnings, cursors and file references (`files`). Message text defaults to
   2000 characters; `body_chars` changes it. Requires `view="conversation"`.
+  Clipped text ends with `[…]`; `truncated_message_ids` and the
+  `message_text_truncated` warning identify affected messages. Read more with
+  `get_context(message_id, body_chars=20000)`; that read still has a 20,000-character cap.
   A forwarded line adds `· переслано, автор: <name>` with the stated origin name,
   or `· переслано, автор неизвестен` when the origin is unknown or not captured.
 - `detail="full"`: every field documented below, including `body`, ordering,

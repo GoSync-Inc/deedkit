@@ -421,10 +421,18 @@ def lean(method, result):
 
 def transcript(method, result):
     """Only the numbered transcript, its cursors and file references."""
+    from .conversation import truncation_warning
     view=result['conversation_view']
     rows=result['context'] if method=='get_context' else result['items']
     output={'transcript':view['transcript'],'order':view.get('order'),'warnings':view.get('warnings',[]),
         'content_is_untrusted':True}
+    all_rows=([result['message'],*rows] if method=='get_context' else rows)
+    warning=truncation_warning(all_rows)
+    if warning:
+        output['truncated_message_ids']=warning['message_ids']
+        # An anchor may be outside the rendered window; keep its clipping explicit too.
+        output['warnings']=[w for w in output['warnings']
+            if not isinstance(w,dict) or w.get('code')!='message_text_truncated']+[warning]
     files=[{'message_id':row['id'],**lean_file(f)} for row in rows for f in row.get('attachments') or []]
     if method=='get_context':
         files+=[{'message_id':result['message']['id'],**lean_file(f)}
