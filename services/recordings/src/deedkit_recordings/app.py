@@ -1,6 +1,7 @@
 """Private HTTP backend; the gateway is the agent-facing MCP surface."""
 import asyncio
 import hashlib
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -62,13 +63,25 @@ def dates(args):
     return result
 
 
-def create_app(config_path, *, transport=None, provider_timeout=12, provider_bytes=2 * 1024 * 1024):
-    app = Starlette()
+def create_app(config_path, *, transport=None, provider_timeout=12, provider_bytes=2 * 1024 * 1024,
+               archive_background=True):
+    from .archive import ArchiveRuntime
+
+    @asynccontextmanager
+    async def lifespan(app):
+        await app.state.archive.start(background=archive_background)
+        try:
+            yield
+        finally:
+            await app.state.archive.close()
+
+    app = Starlette(lifespan=lifespan)
     provider = Provider(transport, provider_timeout, provider_bytes)
     app.state.provider = provider
     remote = plaud.Provider(provider, transport, provider_timeout, provider_bytes)
     app.state.plaud = remote
     path = Path(config_path).absolute()
+    app.state.archive = ArchiveRuntime(path, provider, remote)
 
     async def failure(request, error):
         return JSONResponse({'error': error.code}, status_code=error.status)
