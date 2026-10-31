@@ -459,6 +459,22 @@ def register_tools(mcp, call, async_call):
         """Identity, permitted accounts, source coverage and unavailable features. detail=summary (default) is a short index naming the sections; sections=[names] returns only those blocks; detail=full returns everything. An unknown section name returns invalid_filter. version is the package version and does not change per release; build.source_sha is the commit this messaging server was built from and build.started_at when it started (the gateway, calls and calendar services deploy separately and are not reported here). A null build.source_sha means the image was built without its commit: on production, report it as a deploy defect. A restart without a deploy also moves started_at, so compare SHAs when the expected one is known."""
         return call(ctx,'capabilities',detail=detail,**({} if sections is None else {'sections':sections}))
 
+    register_send_tools(mcp, call, async_call, read)
+
+    upload_write=ToolAnnotations(readOnlyHint=False,destructiveHint=False,
+        idempotentHint=True,openWorldHint=False)
+
+    register_upload_tools(mcp, call, read, upload_write)
+    register_messenger_operation_tools(mcp, call, async_call, read)
+    register_conversation_tools(mcp, call, read)
+    register_archive_tools(mcp, call, async_call, read)
+    register_update_tools(mcp, call)
+    register_subscription_tools(mcp, call, async_call, read, upload_write)
+    register_delivery_tools(mcp, call, async_call, read, upload_write)
+    register_feedback_tools(mcp, call, read, upload_write)
+
+
+def register_send_tools(mcp, call, async_call, read):
     # ANYM-532, ANYM-643: a phone or username preview contacts the provider (one lookup).
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(readOnlyHint=True,destructiveHint=False,openWorldHint=True))
     async def preview_message(ctx: Context,account: StrictStr,text: StrictStr,chat_id: StrictStr='',
@@ -572,9 +588,8 @@ def register_tools(mcp, call, async_call):
         """
         return call(ctx,'get_send_status',send_id=send_id)
 
-    upload_write=ToolAnnotations(readOnlyHint=False,destructiveHint=False,
-        idempotentHint=True,openWorldHint=False)
 
+def register_upload_tools(mcp, call, read, upload_write):
     @mcp.tool(structured_output=True,annotations=upload_write)
     def prepare_file_upload(ctx: Context,account: StrictStr,chat_id: StrictStr,
         filename: StrictStr,mime: StrictStr,bytes: StrictInt,sha256: StrictStr,
@@ -611,6 +626,8 @@ def register_tools(mcp, call, async_call):
         """
         return call(ctx,'get_file_upload',upload_id=upload_id)
 
+
+def register_messenger_operation_tools(mcp, call, async_call, read):
     @mcp.tool(structured_output=True, annotations=read)
     def list_messenger_operations(ctx: Context, account: StrictStr) -> dict[str, Any]:
         """Discover implemented operations and your account/key permissions.
@@ -685,6 +702,8 @@ def register_tools(mcp, call, async_call):
         """
         return call(ctx, 'get_messenger_operation', operation_id=operation_id)
 
+
+def register_conversation_tools(mcp, call, read):
     @mcp.tool(structured_output=True, annotations=read)
     def list_chats(ctx: Context, after: str='', limit: int=25, accounts: list[StrictStr] | None=None,
                    query: str='', chat_types: list[Literal['private','group','channel','unknown']] | None=None,
@@ -849,6 +868,8 @@ def register_tools(mcp, call, async_call):
         """
         return call(ctx,'list_reply_dismissals',kind=kind,after=after,limit=limit)
 
+
+def register_archive_tools(mcp, call, async_call, read):
     @mcp.tool(structured_output=True, annotations=read)
     def search_people(ctx: Context, query: str='', accounts: list[StrictStr] | None=None,
                       chats: list[StrictStr] | None=None, after: str='', limit: int=20,
@@ -1060,6 +1081,8 @@ def register_tools(mcp, call, async_call):
         """
         return call(ctx,'request_file_download',attachment_id=attachment_id)
 
+
+def register_update_tools(mcp, call):
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(readOnlyHint=False,
         destructiveHint=False, openWorldHint=False))
     def get_updates(ctx: Context, consumer: str='main', limit: int=20,
@@ -1093,6 +1116,8 @@ def register_tools(mcp, call, async_call):
         """Acknowledge exactly the delivered page after processing; independent of other clients."""
         return call(ctx,'ack_updates',consumer=consumer,receipt=receipt,expected_version=expected_version)
 
+
+def register_subscription_tools(mcp, call, async_call, read, upload_write):
     @mcp.tool(structured_output=True,annotations=ToolAnnotations(readOnlyHint=False,
         destructiveHint=False,idempotentHint=False,openWorldHint=False))
     def create_subscription(ctx: Context,chat_ids: SubscriptionReferences | None=None,
@@ -1207,6 +1232,8 @@ def register_tools(mcp, call, async_call):
         """Queue a rate-bounded synthetic hint to an existing receiver. No fake archive event, message send or event ACK."""
         return call(ctx,'test_subscription',subscription_id=subscription_id,request_id=request_id)
 
+
+def register_delivery_tools(mcp, call, async_call, read, upload_write):
     @mcp.tool(structured_output=True,annotations=upload_write)
     async def register_delivery_endpoint(ctx: Context,request_id: RequestReference,url: EndpointUrl,signing_secret: SigningSecret,label: EndpointLabel='',headers: EndpointHeaders | None=None) -> dict[str,Any]:
         """Register your own HTTPS webhook endpoint for subscription hints, then send it one signed test delivery.
@@ -1264,6 +1291,8 @@ def register_tools(mcp, call, async_call):
         """
         return await async_call(ctx,'test_delivery_endpoint',endpoint_id=endpoint_id,request_id=request_id)
 
+
+def register_feedback_tools(mcp, call, read, upload_write):
     @mcp.tool(structured_output=True,annotations=upload_write)
     def submit_feedback(ctx: Context,request_id: RequestReference,category: Literal['bug','feature','quality','other'],description: FeedbackDescription,operation: FeedbackOperation | None=None,refs: FeedbackReferences | None=None) -> dict[str,Any]:
         """Record bounded private feedback for this credential. `operation` is the tool name as listed, with or without the messages_ prefix. Reference only visible sources; no raw secrets, external messages or automatic issue publishing."""
