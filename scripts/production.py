@@ -4227,6 +4227,41 @@ def unresolved(state, http_state, history=None, serving=None):
     return None
 
 
+def settle_http_generation(http, s, serving, http_state, *, dry_run, halt):
+    """Finish a pending retirement before selecting another release; return its outcome when it must wait."""
+    if serving.get("status") == "serving-retirement-pending" and not serving_settled(serving):
+        # Retiring the managed predecessor HTTP pair is promote's last step, safe to repeat; it never cuts a request
+        # short. It changes the router (the admission fence), so its failure pauses.
+        if dry_run:
+            return serving, {"status": "plan", "sha": serving.get("sha"),
+                             "steps": ["retire the previous HTTP generation"]}
+        try:
+            s.retire(http, serving["sha"])
+        except Exception as exc:
+            message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+            return serving, halt(f"retiring the HTTP generation before {serving['sha']} failed: {message}; "
+                                 "inspect seamless_release.py status --sha " + serving["sha"])
+        serving = read(http_state / "http-current.json")
+        if not serving_settled(serving):
+            return serving, {"status": "waiting", "reason": "the previous HTTP generation is still draining"}
+    return serving, None
+
+
+def newest_attested_candidate(mirror, state, http_state, base, head, attested):
+    """Choose the newest published, unattempted main commit; an unreachable registry propagates to the caller."""
+    for sha in run(["git", "-C", str(mirror), "rev-list", "--first-parent", f"{base}..{head}"]).split():
+        # A commit whose deployment was attempted is never retried, and older ones never follow it.
+        if (state / sha / "attempted.json").exists() or (http_state / sha / "http-attempted.json").exists():
+            break
+        # Green CI is the attestation `publish` signs after `CI gate` (promotable); no GitHub API request.
+        try:
+            attested(sha)
+        except Unattested:
+            continue  # not published (yet): its CI still runs or failed, and an older commit may be deployed
+        return sha
+    return None
+
+
 def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, configs):
     state, http_state = Path(settings["state_directory"]), Path(http["state_directory"])
     # A tool update that stopped between `activating` and `active` is settled before anything else.
@@ -4255,20 +4290,9 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
     if current.get("status") != "applied" or not re.fullmatch(r"[0-9a-f]{40}", current.get("sha", "")):
         return halt(f"the current release is {current.get('status', 'missing')}, not applied; apply one by hand first")
     base = current["sha"]
-    if serving.get("status") == "serving-retirement-pending" and not serving_settled(serving):
-        # Retiring the managed predecessor HTTP pair is promote's last step, safe to repeat; it never cuts a request
-        # short. It changes the router (the admission fence), so its failure pauses.
-        if dry_run:
-            return {"status": "plan", "sha": serving.get("sha"), "steps": ["retire the previous HTTP generation"]}
-        try:
-            s.retire(http, serving["sha"])
-        except Exception as exc:
-            message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
-            return halt(f"retiring the HTTP generation before {serving['sha']} failed: {message}; "
-                        "inspect seamless_release.py status --sha " + serving["sha"])
-        serving = read(http_state / "http-current.json")
-        if not serving_settled(serving):
-            return {"status": "waiting", "reason": "the previous HTTP generation is still draining"}
+    serving, retirement = settle_http_generation(http, s, serving, http_state, dry_run=dry_run, halt=halt)
+    if retirement is not None:
+        return retirement
     if not serving_settled(serving) or not re.fullmatch(r"[0-9a-f]{40}", serving.get("sha", "")):
         return halt(f"the HTTP release is {serving.get('status', 'missing')}; inspect seamless_release.py status")
     try:
@@ -4310,26 +4334,16 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
         # by hand.
         candidate, since = base, serving["sha"]
     else:
-        candidate = None
-        for sha in run(["git", "-C", str(mirror), "rev-list", "--first-parent", f"{base}..{head}"]).split():
-            # A commit whose deployment was attempted is never retried, and older ones never follow it.
-            if (state / sha / "attempted.json").exists() or (http_state / sha / "http-attempted.json").exists():
-                break
-            # Green CI is the attestation `publish` signs after `CI gate` (promotable); no GitHub API request.
-            try:
-                attested(sha)
-            except Unattested:
-                continue  # not published (yet): its CI still runs or failed, and an older commit may be deployed
-            except Unreachable as exc:
-                # GHCR could not be read: no older commit is taken instead; nothing changed.
-                if misses + 1 >= FETCH_FAILURES:
-                    return halt(f"GHCR or git could not be read {misses + 1} times in a row, last: {exc}")
-                if not dry_run:
-                    write(state / "deploy.json", {**{key: value for key, value in last.items() if key != "unreachable"},
-                                                  "unreachable": {"count": misses + 1, "at": now(), "reason": str(exc)}})
-                return {"status": "error", "reason": f"{exc}; nothing changed, the next run retries"}
-            candidate = sha
-            break
+        try:
+            candidate = newest_attested_candidate(mirror, state, http_state, base, head, attested)
+        except Unreachable as exc:
+            # GHCR could not be read: no older commit is taken instead; nothing changed.
+            if misses + 1 >= FETCH_FAILURES:
+                return halt(f"GHCR or git could not be read {misses + 1} times in a row, last: {exc}")
+            if not dry_run:
+                write(state / "deploy.json", {**{key: value for key, value in last.items() if key != "unreachable"},
+                                              "unreachable": {"count": misses + 1, "at": now(), "reason": str(exc)}})
+            return {"status": "error", "reason": f"{exc}; nothing changed, the next run retries"}
         if candidate is None:
             if "unreachable" in last and not dry_run:
                 write(state / "deploy.json", {key: value for key, value in last.items() if key != "unreachable"})
