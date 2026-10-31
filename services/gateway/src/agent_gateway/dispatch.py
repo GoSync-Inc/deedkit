@@ -712,8 +712,7 @@ class Dispatch:
     def admit(self, key, name):
         return self.policy.authorize_agent(*self.authenticate(key), name)
 
-    async def call(self, key, name, values, route=None):
-        """One admitted tool call; `route` is the MCP connection path (REST passes None and ignores selection)."""
+    def admit_call(self, key, name, values, route):
         try:
             snapshot, agent, tool = self.admit(key, name)
         except Denied as error:
@@ -752,6 +751,11 @@ class Dispatch:
             raise denied from None
         except ValueError:
             raise Denied("invalid_arguments", 422) from None
+        return snapshot, agent, tool, selected, args
+
+    async def call(self, key, name, values, route=None):
+        """One admitted tool call; `route` is the MCP connection path (REST passes None and ignores selection)."""
+        snapshot, agent, tool, selected, args = self.admit_call(key, name, values, route)
         if tool["operation"] == "select_modules":
             return await self.select_modules(key, route, args["modules"])
         if tool["module"] == "gateway":
