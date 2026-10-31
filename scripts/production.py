@@ -4503,7 +4503,7 @@ def active_config():
     return found
 
 
-def main(argv=None):
+def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["verify", "prepare", "prepare-router", "apply", "rollback", "status",
                                            "images", "check-image", "deploy", "self-test", "tool-rollback",
@@ -4518,85 +4518,104 @@ def main(argv=None):
     parser.add_argument("--database", help="copy-database: a name under the configuration's migration.databases")
     parser.add_argument("--verifier", help="self-test: check this staged verifier build against the pin instead of "
                                            "the installed one (attest-verify install, production.md)")
+    return parser
+
+
+def locked_action(args):
+    """Run state commands while retaining each command's existing lock scope."""
+    settings, http = config(args.config), None
+    state = Path(settings["state_directory"])
+    with ExitStack() as locks:
+        if args.action == "prepare-router":
+            if os.geteuid() != 0:
+                raise Refused("router preparation requires the production host operator")
+            canonical = Path("/var/lib/deedkit-production")
+            locks.enter_context(lock(canonical))
+            if state.resolve() != canonical.resolve():
+                locks.enter_context(lock(state))
+        elif args.action == "rollback":
+            # Plan B's state is read, and the rollback runs, under the locks seamless_release.py holds (its
+            # global lock also without plan B, where the host has one); only an absent default HTTP
+            # configuration can mean no plan B (ANYM-642).
+            s = http_release_tool()
+            http = (None if args.http_config == HTTP_CONFIG and not os.path.lexists(args.http_config)
+                    else s.validate_settings(config(args.http_config)))
+            locks.enter_context(host_locks(settings, http, s) if http else s.locks(settings)
+                                if s.GLOBAL_LOCK.is_dir() else lock(state))
+        else:
+            locks.enter_context(lock(state))
+        if args.action == "status":
+            result = read(state / "current.json") if (state / "current.json").exists() else {"status": "not promoted by this tool"}
+            result["config"] = str(args.config)
+            if (state / "deploy.json").exists():
+                result["deploy"] = read(state / "deploy.json")
+            if PAUSE.exists():
+                result["autodeploy_pause"] = PAUSE.read_text()[:1000].strip()
+        elif args.action == "images":
+            result = remove_images(settings) if args.remove else images_report(settings)
+        elif args.action == "copy-database":
+            with database_copy(settings, args.database, args.sha) as copied:
+                result = copied
+        else:
+            if not re.fullmatch(r"[0-9a-f]{40}", args.sha or ""):
+                raise Refused("an exact lowercase 40-character commit SHA is required")
+            result = (rollback(settings, args.sha, http) if args.action == "rollback" else
+                      {"prepare": prepare, "prepare-router": prepare_router, "apply": apply}[args.action](
+                          settings, args.sha))
+            if args.action == "apply":
+                # Printed only: result.json and current.json stay the release receipts.
+                result = {**result, "image_removal": retain_images(settings)}
+    return result
+
+
+def execute_action(args):
+    if args.action == "check-image":
+        if not args.target:
+            raise Refused("select a target for container verification")
+        source = Path(__file__).resolve().parents[1]
+        sha = run(["git", "-C", str(source), "rev-parse", "HEAD"]).strip()
+        return {"sha": sha, "image": build_image(source, sha, args.target, check=True)}
+    if args.action == "verify":
+        return verify(args.sha or "")
+    if args.action == "self-test":
+        return self_test(args.config, args.http_config, args.verifier)
+    if args.action == "tool-rollback":
+        if os.geteuid() != 0:
+            raise Refused("tool-rollback requires the production host operator")
+        s = http_release_tool()
+        return tool_rollback(config(args.config), s.validate_settings(config(args.http_config)), s)
+    if args.action == "deploy":
+        if os.geteuid() != 0:
+            raise Refused("deploy requires the production host operator")
+        return deploy(config(args.config), http_release_tool().validate_settings(config(args.http_config)),
+                      auto=args.auto, dry_run=args.dry_run, configs=(args.config, args.http_config))
+    return locked_action(args)
+
+
+def print_result(args, result, parser):
+    if args.action == "self-test":
+        print(json.dumps(result))
+    elif args.action == "deploy":
+        # One line per run for the journal; a new pause, an error or a failed fetch exits 1, so the timer unit shows failed.
+        print(json.dumps(result, sort_keys=True))
+        if result["status"] in ("halted", "rolled-back", "error", "fetch_failed"):
+            parser.exit(1)
+    else:
+        # Receipts contain revisions/image IDs, never resolved Compose environments.
+        if args.action == "prepare":
+            result = {key: result[key] for key in ("sha", "ci", "images", "references")}
+        print(json.dumps(result, indent=2))
+
+
+def main(argv=None):
+    parser = argument_parser()
     args = parser.parse_args(argv)
     os.umask(0o077)
     try:
         if args.verifier and args.action != "self-test":
             raise Refused("--verifier is only for self-test; every other command uses the installed verifier")
         args.config = args.config or (active_config() if args.action == "status" else CONFIG)
-        if args.action == "check-image":
-            if not args.target:
-                raise Refused("select a target for container verification")
-            source = Path(__file__).resolve().parents[1]
-            sha = run(["git", "-C", str(source), "rev-parse", "HEAD"]).strip()
-            result = {"sha": sha, "image": build_image(source, sha, args.target, check=True)}
-        elif args.action == "verify":
-            result = verify(args.sha or "")
-        elif args.action == "self-test":
-            print(json.dumps(self_test(args.config, args.http_config, args.verifier)))
-            return
-        elif args.action == "tool-rollback":
-            if os.geteuid() != 0:
-                raise Refused("tool-rollback requires the production host operator")
-            s = http_release_tool()
-            result = tool_rollback(config(args.config), s.validate_settings(config(args.http_config)), s)
-        elif args.action == "deploy":
-            if os.geteuid() != 0:
-                raise Refused("deploy requires the production host operator")
-            result = deploy(config(args.config), http_release_tool().validate_settings(config(args.http_config)),
-                            auto=args.auto, dry_run=args.dry_run, configs=(args.config, args.http_config))
-            # One line per run for the journal; a new pause, an error or a failed fetch exits 1, so the timer unit shows failed.
-            print(json.dumps(result, sort_keys=True))
-            if result["status"] in ("halted", "rolled-back", "error", "fetch_failed"):
-                parser.exit(1)
-            return
-        else:
-            settings, http = config(args.config), None
-            state = Path(settings["state_directory"])
-            with ExitStack() as locks:
-                if args.action == "prepare-router":
-                    if os.geteuid() != 0:
-                        raise Refused("router preparation requires the production host operator")
-                    canonical = Path("/var/lib/deedkit-production")
-                    locks.enter_context(lock(canonical))
-                    if state.resolve() != canonical.resolve():
-                        locks.enter_context(lock(state))
-                elif args.action == "rollback":
-                    # Plan B's state is read, and the rollback runs, under the locks seamless_release.py holds (its
-                    # global lock also without plan B, where the host has one); only an absent default HTTP
-                    # configuration can mean no plan B (ANYM-642).
-                    s = http_release_tool()
-                    http = (None if args.http_config == HTTP_CONFIG and not os.path.lexists(args.http_config)
-                            else s.validate_settings(config(args.http_config)))
-                    locks.enter_context(host_locks(settings, http, s) if http else s.locks(settings)
-                                        if s.GLOBAL_LOCK.is_dir() else lock(state))
-                else:
-                    locks.enter_context(lock(state))
-                if args.action == "status":
-                    result = read(state / "current.json") if (state / "current.json").exists() else {"status": "not promoted by this tool"}
-                    result["config"] = str(args.config)
-                    if (state / "deploy.json").exists():
-                        result["deploy"] = read(state / "deploy.json")
-                    if PAUSE.exists():
-                        result["autodeploy_pause"] = PAUSE.read_text()[:1000].strip()
-                elif args.action == "images":
-                    result = remove_images(settings) if args.remove else images_report(settings)
-                elif args.action == "copy-database":
-                    with database_copy(settings, args.database, args.sha) as copied:
-                        result = copied
-                else:
-                    if not re.fullmatch(r"[0-9a-f]{40}", args.sha or ""):
-                        raise Refused("an exact lowercase 40-character commit SHA is required")
-                    result = (rollback(settings, args.sha, http) if args.action == "rollback" else
-                              {"prepare": prepare, "prepare-router": prepare_router, "apply": apply}[args.action](
-                                  settings, args.sha))
-                    if args.action == "apply":
-                        # Printed only: result.json and current.json stay the release receipts.
-                        result = {**result, "image_removal": retain_images(settings)}
-        # Receipts contain revisions/image IDs, never resolved Compose environments.
-        if args.action == "prepare":
-            result = {key: result[key] for key in ("sha", "ci", "images", "references")}
-        print(json.dumps(result, indent=2))
+        print_result(args, execute_action(args), parser)
     except Exception as exc:
         message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
         if isinstance(exc, OSError) and exc.filename:
