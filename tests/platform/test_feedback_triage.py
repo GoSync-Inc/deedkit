@@ -252,7 +252,7 @@ def test_only_tidens_merged_or_closed_branch_error_is_a_gone_branch(monkeypatch,
     (['tiden', 'spec'], 'word ' * 100, ': ' + ('word ' * 100)[:160].strip()),
     (['tiden', 'spec'], '\n', ''),
     (['ssh', 'host'], 'Permission denied (publickey) for prod.example\n', ''),
-], ids=['rate limit', 'secret-like and control characters', 'bounded', 'silent', 'not tiden'])
+], ids=['rate limit', 'token-like and control characters', 'bounded', 'silent', 'not tiden'])
 def test_a_failed_tiden_read_names_its_first_error_line_and_nothing_else(monkeypatch, argv, stderr, tail):
     # 11-01: "REFUSED tiden spec exited 1" said nothing about the cause.
     monkeypatch.setattr(triage.subprocess, 'run', lambda *a, **k: subprocess.CompletedProcess(argv, 1, '', stderr))

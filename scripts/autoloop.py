@@ -47,6 +47,18 @@ loop's fixed wording; caps used. A quiet day is one line. No feedback text, and 
 `gate` exits 1 on PAUSE, a held card, a dropped item or no live intent; `status` exits 1 when the last good tick is
 older than 2 hours, the stop is not effective or an audit paused the loop.
 
+Reader CLI pin: `CLI_VERSION`, `CLI_SHA256` and `PROFILE` are the pin. The reader runs the loop's own copy,
+`~/.deedkit/autoloop/cli/claude-<version>` (0500, in a 0700 directory), never `~/.local/share/claude/versions/`, which
+the CLI's auto-update prunes (10-30: the pinned 2.1.310 vanished and the loop halted). Before every run the copy must be
+a plain file of this user that nobody else can write, with the pinned sha256, and report the pinned version; the stream's
+init must still match `PROFILE`. Any miss is a `REFUSED reader CLI: ...` tick. `install-cli` (also after a lost copy)
+copies the build from `~/.local/share/claude/versions/<version>` or `--from PATH` only while it has the pinned digest.
+Re-pinning is a reviewed code change: copy the new build to a scratch directory, run `argv(cli)` with `environment()` on
+an empty projection from an empty directory, read the `init` event (version, plugins, agents, empty tools, MCP servers,
+slash commands and skills), record it as `tests/platform/fixtures/autoloop/init-<version>.json`, and change the three
+pin values together with the profile the canary shows. A plugin or agent that is not built-in is a refusal, never a
+profile update. The runner image's `CLAUDE_CODE_VERSION` (deploy/autoloop-runner/Dockerfile) is a separate pin.
+
 `read` hands the triage inbox (feedback_triage.py `pull`, `snapshot`, `match` first) to a model that has no tools,
 no settings, no MCP servers, no slash commands, no plugins beyond the pinned built-in set and no session memory: the
 pinned Claude Code CLI (the loop's own copy under `~/.deedkit/autoloop/cli/`, installed by `install-cli` and verified

@@ -90,22 +90,6 @@ add. Autodeploy classifies the release again before it migrates.
 - `autoloop.py hold|release ANYM-n`: the orchestrator's per-card control.
 - Resume: remove `PAUSE` (the owner, or the orchestrator on the owner's words), never by feedback.
 
-## Reader CLI pin
-
-The reader runs the loop's own copy of the pinned Claude Code build, `~/.deedkit/autoloop/cli/claude-<version>`
-(0500 in a 0700 directory), never `~/.local/share/claude/versions/`, which the CLI's auto-update prunes (10-30:
-the pinned 2.1.310 vanished and the loop halted). `CLI_VERSION`, `CLI_SHA256` and `PROFILE` in `scripts/autoloop.py`
-are the pin; before every run the copy must be a plain file of this user, not writable by others, with that sha256,
-and report that version, and the stream's init must still match `PROFILE`. Any miss is a `REFUSED reader CLI: ...`
-tick, as before. After a deploy or a lost copy: `python3 scripts/autoloop.py install-cli` (copies the pinned build
-from `~/.local/share/claude/versions/<version>` only while it has the pinned digest; `--from PATH` for another source).
-
-Re-pinning is a reviewed change: copy the new build to a scratch directory, run the reader argv on an empty
-projection from an empty directory (`autoloop.argv(cli)`, `autoloop.environment()`), read the `init` event (version,
-plugins, agents, empty tools/MCP/commands/skills), record it as `tests/platform/fixtures/autoloop/init-<version>.json`,
-and change the three pin values together with the `PROFILE` the canary shows. A plugin or agent that is not built-in
-is a refusal, never a profile update. The runner image's `CLAUDE_CODE_VERSION` (Dockerfile) is a separate pin.
-
 ## Caps
 
 Config defaults (owner-set): 20 items per principal per day into triage; 24 reader runs a day;
