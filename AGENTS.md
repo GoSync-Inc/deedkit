@@ -44,9 +44,16 @@ agents' under the harness section 2 gates. Item 2 asks only what docs/DATA-POLIC
 cover; item 3 is the Budget line above. The live actions act on the owner's messenger accounts
 under the owner's name (item 4) and the owner's devices and provider auth (item 5): they keep
 section 1's exact confirmation. In a task (a ready card) the agent applies its migration under
-production.md "Migration releases" (an additive one without a backup gate, owner 10-29); enabling
+production.md "Migration releases" (low or medium: no backup or copy, owner 10-29, 11-01); enabling
 a feature never includes send, call, pairing, session or allowlist changes, and none of it runs
 during an active call.
+
+Override: harness process.md section 2's fresh verified backup, for a low or medium migration
+release under any of its clauses (owner 11-01: «с копией базы надо только при опасных миграциях
+при ластовых и медиум рисках это не обязательно»; reason: backups as the release bottleneck). Only
+a dangerous one (production.md "Migration risk tiers") needs a fresh verified backup and a
+pre-migration copy; otherwise the latest verified daily backup is the restore point. Data deletion,
+restores, undo and plan review keep their gates. Enforcer: that section (ANYM-675, ANYM-680).
 
 Override: harness process.md sections 1–5 and reviews.md Rounds 7–8, incident recovery only
 (owner 10-30, Telegram sends: «это быстрый hotfix», «И только после этого уже продолжаем работу
