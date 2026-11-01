@@ -81,8 +81,11 @@ class FakeProbe:
         self.available, self.load = 16.0, 0.0
         self.between, self.ci, self.problem, self.busy_age = False, False, None, 0.0
         self.rss_fn = lambda pgid: 0.0
+        self.available_hook = None  # called on every memory read: a test makes the probe slow with it
 
     def available_gb(self):
+        if self.available_hook is not None:
+            self.available_hook()
         return self.available
 
     def load_1m(self):

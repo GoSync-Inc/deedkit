@@ -111,6 +111,12 @@ class Scheduler:
     def active(self):
         return sum(1 for slot in self.slots.values() if slot.running)
 
+    def transit(self):
+        """Running jobs that have a later phase: each will queue again for its next slot."""
+        return sum(
+            1 for s in self.slots.values() if s.running and s.running.index < len(s.running.job.spec.phases) - 1
+        )
+
     def estimated_wait(self, slot_name):
         slot = self.slots[slot_name]
         total = sum(w.est for w in slot.queue)
@@ -157,14 +163,22 @@ class Scheduler:
             error = waiter.fut.exception()
             if error is not None:
                 raise error
-        elif self.depth() > cfg.queue_size:
-            self._drop(slot, waiter)
+        if self._over_bound(waiter, len(job.spec.phases) > 1):
+            self._abandon(slot, waiter)
             raise ServiceError(503, "queue_full", "the queue is full", retry_after=cfg.retry_after_seconds)
         quota.accept(principal)
         task = asyncio.create_task(self._run(job, waiter))
         self.tasks.add(task)
         task.add_done_callback(lambda done: self._finished(done, job))
         return task
+
+    def _over_bound(self, waiter, later_phases):
+        """The queue bound counts the jobs that wait and the running ones that will wait again for a later phase,
+        so a phase transition can never push the queue past `queue_size`. A new job only counts if it waits
+        itself or will wait again."""
+        if waiter.granted and not later_phases:
+            return False
+        return self.depth() + self.transit() > self.config.queue_size
 
     def closed(self, reason):
         return ServiceError(503, "admission_closed", f"admission is closed: {reason}",
@@ -273,6 +287,10 @@ class Scheduler:
                 continue
             if verdict.action == "wait":
                 return
+            if self.now() > waiter.expires:  # the probes above may have taken the time that was left
+                slot.queue.popleft()
+                waiter.fut.set_exception(slot_busy(self.config.retry_after_seconds))
+                continue
             slot.queue.popleft()
             if verdict.action == "refuse":
                 waiter.fut.set_exception(self.closed(verdict.reason))

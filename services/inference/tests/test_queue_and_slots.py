@@ -212,6 +212,32 @@ async def test_a_job_that_must_wait_for_resident_room_counts_against_the_queue(e
 
 
 # spec: ANYM-682
+async def test_a_phase_transition_cannot_push_the_queue_past_its_bound(env):
+    env.write_policy([principal(concurrent=16)], 1)
+    async with env.running(queue_size=1) as s:
+        depth_seen = []
+
+        async def watch():
+            while True:
+                depth_seen.append(s.service.scheduler.depth())
+                await asyncio.sleep(0.005)
+
+        watcher = asyncio.create_task(watch())
+        running = s.spawn(s.chat(slow("running", 0.8)))
+        await s.until(lambda: s.service.scheduler.active() == 1)
+        waiter = await s.submit(s.chat(slow("waiter", 0.05)))  # fills the one place of the gpu queue
+        assert s.service.scheduler.depth() == 1
+        # A two-phase job would start on the idle cpu slot and then join the full gpu queue: refused up front.
+        two = await s.transcribe(audio("two", 0.05), model="audio-two-phase")
+        assert two.status == 503 and two.code == "queue_full"
+        assert (await running).status == 200 and (await waiter).status == 200
+        # With room for it, the same job passes through both phases.
+        assert (await s.transcribe(audio("two", 0.05), model="audio-two-phase")).status == 200
+        watcher.cancel()
+        assert max(depth_seen) <= 1, depth_seen
+
+
+# spec: ANYM-682
 async def test_the_deadline_clock_starts_when_the_request_arrives(env):
     async with env.running() as s:
         # An upload that takes 0.4 s of a 0.5 s deadline leaves less than the 0.3 s job needs.

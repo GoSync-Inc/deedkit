@@ -65,7 +65,6 @@ Not secret, but it must be a regular file that is not writable by group or other
 | `min_free_gb` | 3.0 | headroom above a phase's `resident_gb` (the remote-test `MIN_FREE_MEM_GB`) |
 | `max_load_1m`, `slot_max_load_1m` | 8, `{}` | 1-minute load cap; per-slot override, e.g. `{"gpu": 6}` |
 | `keep_alive_seconds` | 300 | an idle loaded engine is unloaded after this (only an engine with `"engine_options": {"persistent": true}` stays loaded when idle; any other engine's child exits with its phase and leaves the resident book at once) |
-| `alloc_settle_seconds` | 10 | a cold start's `resident_gb` is held back from the free memory the next phase sees for this long, so two phases cannot spend the same headroom; a phase that has to wait for it waits in the queue |
 | `max_inflight_upload_bytes` | 134217728 | pool of declared `Content-Length` of uploads in flight |
 | `upload_seconds` | 120 | a body must arrive within this |
 | `work_dir_max_bytes` | 536870912 | bytes reserved under `work_dir` |
@@ -163,7 +162,7 @@ A job is checked when it arrives and again when it leaves the queue to start a p
 | `busy_between`, `busy_deedkit_ci` | the busy file says Between or a DeedKit remote test is running |
 | `busy_file_missing`, `busy_file_invalid`, `busy_file_stale` | the busy file is missing, unparseable, or older than 30 s (fail closed) |
 | `load_high` | the 1-minute load average is above `max_load_1m` (or the slot's override) |
-| `memory_low` | free plus inactive memory is below the phase's `resident_gb` (0 when that engine is already loaded) plus `min_free_gb` |
+| `memory_low` | free plus inactive memory is below the phase's `resident_gb` plus `min_free_gb`; every phase is charged in full, also one of a warm worker. A running phase's `resident_gb` is held back from the figure the next phase sees until that phase ends, minus what has already shown up as a drop of the free memory; a phase that has to wait for it waits in the queue |
 | `resident_cap` | the phase alone does not fit `resident_cap_gb` |
 
 Resident accounting (`resident_cap_gb`, idle loaded engines count): when the only blocker is an idle loaded
@@ -186,14 +185,14 @@ The service only reads the file, never writes it.
 
 ## Queue and deadlines
 
-- At most `queue_size` jobs wait; a full queue is `503 queue_full`. A job is queued, and a free slot granted, in one step, so a burst cannot exceed the bound; a job that must wait for resident room counts too.
+- At most `queue_size` jobs wait; a full queue is `503 queue_full`. A job is queued, and a free slot granted, in one step, so a burst cannot exceed the bound; a job that must wait for resident room counts too, and so does a running job that will wait again for a later phase.
 - Two slots: `gpu` and `cpu`, one job each, arrival order. A job whose estimated wait exceeds
   `max_wait_seconds` is refused at once (`slot_busy`), so a client never waits past its own deadline.
 - The deadline clock starts when the request arrives (upload time counts). With `X-Request-Deadline-Seconds`, a job whose wait plus own estimate exceeds the deadline is refused at
   once (`slot_busy`; `deadline_too_short` 422 when the job's own estimate alone exceeds it), and a queued
   job that waited past `min(max_wait_seconds, deadline - estimate)` leaves the queue with `slot_busy`
   before it starts; the same bound is checked before every slot grant, also for a later phase, so a job whose
-  budget is over never gets a slot.
+  budget is over never gets a slot, also when the admission probes themselves were slow.
 
 ## Uploads and temp files
 

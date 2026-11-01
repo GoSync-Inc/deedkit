@@ -56,14 +56,16 @@ async def test_each_admission_rule_refuses_with_its_own_reason(env):
         gpu = await s.chat(job("gpu"))
         assert gpu.status == 503 and gpu.headers["x-admission-reason"] == "load_high"
         assert (await s.transcribe(audio("cpu"))).status == 200
-    # A warm worker that stays loaded needs no second helping of memory, only the reserve.
+    # Every phase is charged its full resident_gb plus the reserve, also one of a warm worker: its child is
+    # spawned per phase in this shell, and the rules only ever err towards waiting.
     warm = {"vision-default": {"engine_options": {"persistent": True}}}
     async with env.running(aliases=warm) as s:
         assert (await s.chat(job("first"))).status == 200
+        assert list(s.service.admission.loaded) == [("vision-default", "vlm")]  # idle, still in the book
         s.probe.available = 3.5
-        assert (await s.chat(job("warm"))).status == 200
-        assert (await s.transcribe(audio("cold"))).headers["x-admission-reason"] == "memory_low"
-    # An engine whose child exited is gone from the book: the next job is a cold start and is charged as one.
+        again = await s.chat(job("again"))
+        assert again.status == 503 and again.headers["x-admission-reason"] == "memory_low"
+    # An engine whose child exited is gone from the book, and is charged as a cold start.
     async with env.running() as s:
         assert (await s.chat(job("first"))).status == 200
         assert s.service.admission.loaded == {}
@@ -196,17 +198,46 @@ async def test_children_over_the_hard_cap_lose_the_largest(env):
 
 # spec: ANYM-682
 async def test_concurrent_cold_starts_do_not_spend_the_same_headroom(env):
-    # 6 GB free: one 2 GB cold start fits (5 GB needed), a second at the same moment would not (6 - 2 < 5).
     two_gb = {"audio-default": {"phases": [{"name": "stt", "slot": "cpu", "resident_gb": 2.0}]}}
-    async with env.running(alloc_settle_seconds=0.5, aliases=two_gb) as s:
+    # 6 GB free: one 2 GB start fits (5 GB needed), a second at the same time would not (6 - 2 < 5). The first
+    # one's memory is held back for as long as it runs, however long its child takes to allocate.
+    async with env.running(aliases=two_gb) as s:
         s.probe.available = 6.0
         gpu = s.spawn(s.chat(job("gpu", 1.5)))
         await s.until(lambda: s.service.scheduler.active() == 1)
         cpu = s.spawn(s.transcribe(audio("cpu")))
         await s.until(lambda: s.service.scheduler.depth() == 1)
-        await asyncio.sleep(0.2)
-        assert started() == ["gpu"]  # waiting for the first start to show in the figures, not refused
-        assert (await cpu).status == 200  # once its memory is counted (settle window over), the second starts
-        assert (await gpu).status == 200
+        await asyncio.sleep(1.0)  # far longer than any fixed settle time would be
+        assert started() == ["gpu"]  # waiting, not refused, and not started on a timer
+        assert (await cpu).status == 200 and (await gpu).status == 200
     names = [(e[0], e[1]) for e in fake.EVENTS]
-    assert names.index(("start", "gpu")) < names.index(("start", "cpu")) < names.index(("end", "gpu"))
+    assert names.index(("end", "gpu")) < names.index(("start", "cpu"))
+    # Once the first start's memory shows in the free figure, it is not counted twice.
+    fake.EVENTS.clear()
+    async with env.running(aliases=two_gb) as s:
+        s.probe.available = 7.0
+        gpu = s.spawn(s.chat(job("gpu", 1.0)))
+        await s.until(lambda: s.service.scheduler.active() == 1)
+        s.probe.available = 5.0  # the 2 GB are taken: 5 GB free is what the second one needs
+        cpu = s.spawn(s.transcribe(audio("cpu")))
+        await s.until(lambda: "cpu" in started())
+        assert ("end", "gpu") not in [(e[0], e[1]) for e in fake.EVENTS]  # it started beside the first
+        assert (await cpu).status == 200 and (await gpu).status == 200
+
+
+# spec: ANYM-682
+async def test_a_slow_probe_cannot_carry_a_job_past_its_deadline(env):
+    async with env.running() as s:
+        calls = []
+
+        def slow_second_read():
+            calls.append(1)
+            if len(calls) == 2:  # the check at the moment the slot would be granted
+                time.sleep(0.8)
+
+        s.probe.available_hook = slow_second_read
+        reply = await s.chat(job("late", 0.05), headers={"X-Request-Deadline-Seconds": "0.8"})
+        assert reply.status == 503 and reply.code == "slot_busy"
+        assert started() == []  # the slot was not granted after the time was over
+        s.probe.available_hook = None
+        assert (await s.chat(job("fine", 0.05), headers={"X-Request-Deadline-Seconds": "5"})).status == 200
