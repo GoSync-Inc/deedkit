@@ -18,7 +18,9 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from .enrichment_providers import ModelError, infer, private_text, profile_hash, validate_profile
+import math
+
+from .enrichment_providers import ModelBackpressure, ModelError, infer, private_text, profile_hash, validate_profile
 from . import resource_admission
 from . import processing_events
 
@@ -86,6 +88,15 @@ class WorkerStopping(Exception):
 STOP=threading.Event()
 CHILDREN=set()
 REQUEUE_SECONDS=30
+BACKPRESSURE_CAP_SECONDS=900
+
+
+def cooldown_seconds(profile,retry_after):
+    """The pause for a deferred job: the service's Retry-After when it is a usable number, else the profile's
+    `backpressure_seconds` (default 120); never more than BACKPRESSURE_CAP_SECONDS, never less than one."""
+    if type(retry_after) in (int,float) and math.isfinite(retry_after) and retry_after>=0:seconds=math.ceil(retry_after)
+    else:seconds=profile.get('backpressure_seconds',120)
+    return max(1,min(seconds,BACKPRESSURE_CAP_SECONDS))
 
 
 def kill_group(child):
@@ -140,6 +151,9 @@ def process(files,row,profile):
             import re
             code=result['error']
             if not isinstance(code,str) or not re.fullmatch('[a-z_]{1,64}',code):code='model_process_failed'
+            if code=='model_backpressure':  # the child could not reach the mini, or the mini said "not now"
+                hint=result.get('retry_after')
+                raise ModelBackpressure(hint if type(hint) in (int,float) else None)
             raise ModelError(code)
         result['truncated']=bool(result.get('truncated')) or input_truncated
         return result
@@ -262,6 +276,7 @@ class EnrichmentWorker:
                         provider=%s,model=%s,attempts=CASE WHEN profile_hash IS DISTINCT FROM %s THEN 1 ELSE attempts+1 END,
                         lease_token=%s,lease_until=clock_timestamp()+make_interval(secs=>%s),updated_at=clock_timestamp()
                         WHERE attachment=%s''',(kind,ph,profile['provider'],profile['model'],ph,token,ttl,row['attachment']))
+                    claim_day=c.execute('SELECT current_date AS day').fetchone()['day']
                     c.execute('UPDATE enrichment_budget SET attempts=attempts+1 WHERE day=current_date')
                     c.execute('''INSERT INTO processing_budget(day,account,kind,profile_hash,attempts)
                         VALUES(current_date,%s,%s,%s,1) ON CONFLICT(day,account,kind,profile_hash)
@@ -275,7 +290,7 @@ class EnrichmentWorker:
                     raise
                 return {**row,'kind':kind,'provider':profile['provider'],'model':profile['model'],
                     'attempts':1 if row['profile_hash']!=ph else row['attempts']+1,
-                    'lease_token':token,'profile_hash':ph,'_resource_lease':resource_lease},profile
+                    'lease_token':token,'profile_hash':ph,'_resource_lease':resource_lease,'_claim_day':claim_day},profile
         return None
     def finish(self,row,result=None,error=None):
         try:return self._finish(row,result,error)
@@ -353,12 +368,47 @@ class EnrichmentWorker:
             # The child group is already gone; only now drop the inherited OS lock.
             lease=row.get('_resource_lease')
             if lease:lease.close()
+    def _defer(self,row,profile,retry_after):
+        seconds=cooldown_seconds(profile,retry_after)
+        with self.connection() as c:
+            from .file_lifecycle import lifecycle_lock
+            lifecycle_lock(c)
+            # The lock the claim takes: a claim and a deferral of one scope never interleave.
+            c.execute('SELECT pg_advisory_xact_lock(74509139)')
+            gave_back=c.execute('''UPDATE attachment_enrichment SET state='queued',error_code='model_backpressure',
+                attempts=greatest(attempts-1,0),lease_token=NULL,lease_until=NULL,
+                next_due=clock_timestamp(),updated_at=clock_timestamp()
+                WHERE attachment=%s AND state='leased' AND lease_token=%s''',(row['attachment'],row['lease_token'])).rowcount
+            if gave_back:  # the claim's own counts, on the claim's own day, once (a replay finds no lease to give back)
+                day=row.get('_claim_day')
+                c.execute('UPDATE enrichment_budget SET attempts=greatest(attempts-1,0) WHERE day=coalesce(%s::date,current_date)',(day,))
+                c.execute('''UPDATE processing_budget SET attempts=greatest(attempts-1,0)
+                    WHERE day=coalesce(%s::date,current_date) AND account=%s AND kind=%s AND profile_hash=%s''',
+                    (day,row['account'],row['kind'],row['profile_hash']))
+            resource_admission.release(c,row.get('_resource_lease'))
+            resource_admission.defer_profile(c,row['account'],row['kind'],row['profile_hash'],seconds)
+    def defer(self,row,profile,retry_after=None):
+        """The mini cannot take the job now: give it back without an attempt or a budget count, and pause the scope.
+
+        Like the stop path, a lock wait or an uncertain commit is retried for REQUEUE_SECONDS; the token-matched
+        UPDATE makes a replay harmless."""
+        deadline=time.monotonic()+REQUEUE_SECONDS
+        try:
+            while True:
+                try:return self._defer(row,profile,retry_after)
+                except psycopg.Error:
+                    if time.monotonic()>=deadline:raise
+                    time.sleep(1)
+        finally:
+            lease=row.get('_resource_lease')
+            if lease:lease.close()
     def once(self):
         claim=self.claim()
         if not claim:return False
         row,profile=claim
         try:self.finish(row,self.processor(self.files,row,profile))
         except WorkerStopping:self.requeue(row)
+        except ModelBackpressure as exc:self.defer(row,profile,exc.retry_after)
         except ModelError as exc:self.finish(row,error=exc.code)
         except Exception as error:
             from .telemetry import capture
@@ -386,6 +436,7 @@ def main():
             encoded=json.dumps(result,ensure_ascii=False).encode()
             if len(encoded)>MAX_RESULT_BYTES:raise ModelError('model_response_too_large')
             sys.stdout.buffer.write(encoded)
+        except ModelBackpressure as exc:print(json.dumps({'error':exc.code,'retry_after':exc.retry_after}))
         except ModelError as exc:print(json.dumps({'error':exc.code}))
         except Exception:print(json.dumps({'error':'enrichment_failed'}))
         return

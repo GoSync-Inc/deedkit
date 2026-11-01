@@ -15,14 +15,68 @@ See [COLLECTOR_STATES.md](COLLECTOR_STATES.md).
 
 | Profile | Local | API |
 | --- | --- | --- |
-| Audio transcription | faster-whisper, preinstalled model directory | OpenAI or compatible transcription endpoint |
-| Image descriptions and visible text | Ollama vision model | OpenAI-compatible chat, Anthropic Messages, Gemini |
-| Document title and summary | Ollama text model | Same text/vision API connectors |
+| Audio transcription | faster-whisper, preinstalled model directory; `deedkit_inference` (the owner's Mac mini) | OpenAI or compatible transcription endpoint |
+| Image descriptions and visible text | Ollama vision model; `deedkit_inference` | OpenAI-compatible chat, Anthropic Messages, Gemini |
+| Document title and summary | Ollama text model; `deedkit_inference` | Same text/vision API connectors |
 | Optional document analysis/image description | — | Codex CLI with private ChatGPT subscription auth |
 
 The Codex connector is implemented locally but not deployed or enabled. Read
 [its isolation and rollout requirements](CODEX_ENRICHMENT.md) before using it;
 it is cloud inference and shares subscription usage with other Codex work.
+
+### deedkit_inference: the owner's Mac mini (ANYM-685)
+
+`deedkit_inference` sends audio, photos and document text to the inference service on the owner's Mac mini
+(`services/inference`, over the tailnet) instead of a cloud provider or the worker's own CPU. It is not cloud:
+it needs no `allow_cloud`, and a profile that sets `allow_cloud` (even `false`) is rejected, so the flow can never
+be labelled cloud. It takes no `local-heavy` lock: the work happens on the mini.
+
+| Key | Rule |
+| --- | --- |
+| `provider` | `deedkit_inference` |
+| `local_inference` | must be `true` (any other provider rejects this key) |
+| `model` | `audio-default` for `audio`; `vision-default` for `image` and `document` |
+| `base_url` | `https`, port 443 or none, a `*.ts.net` name (no IP literal, no credentials or query), path exactly `/v1` |
+| `api_key_file` | absolute path to the service key, mode 0600 |
+| `language` | optional ISO 639-1 code, `audio` profiles only; sent as the request's `language` and skips language identification on the mini |
+| `timeout_seconds` | up to 900 (a 4-hour recording takes about 8.5 minutes); sent to the service as `X-Request-Deadline-Seconds`, its queue deadline |
+| `backpressure_seconds` | cooldown when the mini says "not now" and gives no `Retry-After`: 1 to 900, default 120 |
+| `audio_response_format` | `verbose_json` (default, with segments) or `json` |
+
+Audio uses `POST {base_url}/audio/transcriptions` (an ogg note is transcoded to mp3 first, recorded as
+`transcode_lossy`, as for any ASR provider); photos and documents use `POST {base_url}/chat/completions`, a
+document sending its extracted text without an image (scanned-PDF page images are not part of this connector).
+Redirects and environment proxies are off. The prompt is the usual one plus a sentence asking for `title` and
+`summary` in Russian and the visible text in its own language; the description is stored with `prompt_version`
+`file-description-v2-ru`. Agents search in Russian, and without that sentence a photo with no source language is
+described in English.
+
+**What waits and what fails.** When the mini cannot take the job right now the job waits and costs nothing:
+
+- waits (`model_backpressure`): the mini is unreachable (connection refused, DNS or TLS failure, a connect
+  timeout); HTTP 429; HTTP 503 carrying the service's own error (`queue_full`, `slot_busy`, `upload_capacity`,
+  `admission_closed`, `draining`); and HTTP 502, 503 or 504 whose body is not the service's `{"error": {"code": ...}}`
+  envelope (Tailscale Serve answers those itself while the service process restarts, e.g. for a deploy);
+- fails (a normal attempt, `model_request_failed` / `model_http_error`, `retry_exhausted` after three): a read
+  timeout once the request was accepted, 504 `engine_timeout`, 502 `engine_failed`, any other error the service
+  itself answers with its envelope, 413, 422 and an invalid answer, so one file that hangs the engine cannot loop
+  forever;
+- 401 and 403 stay `model_auth_failed`, which pauses the scope until the operator clears it.
+
+A deferral puts the job back to `queued` under its lease token, restores its `attempts`, gives back that claim's
+`enrichment_budget` and `processing_budget` counts (on the day of the claim) and pauses the scope
+`(account, kind, profile_hash)` with `pause_reason = 'model_backpressure'` until now plus the cooldown: the
+service's `Retry-After` when present, else `backpressure_seconds`, at most 900 seconds. The pause never weakens
+another one: an indefinite pause (such as `model_auth_failed`) stays, and of two bounded pauses the later expiry
+wins. It is shown in the published profile state like any pause. A mini that is off therefore costs each worker one
+claim and one refund per scope per cooldown, and no attempt or daily budget.
+
+Readiness events for old attachments carry no message age. While a backlog drains, an agent that needs it looks
+up the message's `sent_at`.
+
+Data leaves the worker for the owner's mini only, over WireGuard and TLS: the original audio (mp3 when transcoded),
+the image bytes, up to `max_text_chars` of extracted text for a document, and the bearer key. Derived text comes
+back; the mini keeps nothing after the job. Nothing leaves the tailnet, and no cloud provider is involved.
 
 ## Retained descriptions and video (schema 34)
 
@@ -249,7 +303,8 @@ attempt limits, not token or monetary budgets.
 Controls are independent for `(account, kind, profile_hash)`. An auth error,
 missing local model, unavailable CLI or required CLI upgrade pauses that scope
 until an operator fixes the configuration and explicitly clears its control,
-or selects a changed profile. Rate limits pause it for 30 minutes. Another
+or selects a changed profile. Rate limits pause it for 30 minutes. A mini that cannot take work
+(`model_backpressure`, see `deedkit_inference`) pauses it for its cooldown and gives the attempt and budget back. Another
 account/profile may continue within its own subcaps and the shared ceiling.
 Worker restart does not clear controls. A paused or resource-blocked job is not
 leased and does not consume an attempt. Safe `pause_reason`/`paused_until` labels
