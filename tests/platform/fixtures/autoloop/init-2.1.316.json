@@ -16,6 +16,7 @@
   "interrupt_requeue_taken_v1",
   "msg_lifecycle_v1",
   "request_marker_lists_v1",
+  "ask_user_question_unanswered_v1",
   "lifecycle_wakeup_source_v1",
   "sdk_mcp_tools_list_changed",
   "sdk_mcp_manifests",
@@ -24,7 +25,7 @@
   "ui_surface_v1",
   "mcp_call_result_not_for_model_v1"
  ],
- "claude_code_version": "2.1.310",
+ "claude_code_version": "2.1.316",
  "cwd": "/tmp/autoloop-reader-x",
  "fast_mode_disabled_reason": "sdk_opt_in_required",
  "fast_mode_state": "off",
@@ -62,6 +63,7 @@
  "subtype": "init",
  "tools": [],
  "type": "system",
+ "ultrathink_available": false,
  "uuid": "00000000-0000-4000-8000-000000000000",
  "view_mode": "default"
 }

@@ -80,6 +80,10 @@ def run(argv, timeout, stdin=None):
     if done.returncode:
         message = f'{argv[0]} {argv[1] if len(argv) > 1 else ""} exited {done.returncode}'
         gone = GONE.fullmatch((done.stderr or '').strip()) if argv[0] == 'tiden' else None
+        if argv[0] == 'tiden':  # 11-01: a bare "exited 1" left the cause unknowable; Tiden's own first error line only
+            lines = re.sub(r'[^\x20-\x7e\n]', ' ', done.stderr or '').strip().splitlines()
+            line = re.sub(r'[A-Za-z0-9_-]{32,}', '<redacted>', lines[0].strip())[:160].rstrip() if lines else ''
+            message += f': {line}' if line else ''
         if gone:
             raise Gone(message, gone.group(1))
         raise Refused(message)

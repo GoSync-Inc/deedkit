@@ -10,6 +10,7 @@ reader (ANYM-570).
     autoloop.py hold|release CARD [--state DIR]
     autoloop.py read [--state DIR] [--triage-state DIR]
     autoloop.py review-run INTENT --head SHA --attempt ID [--state DIR]
+    autoloop.py install-cli [--from PATH]
 
 `tick` takes the triage lock, the feedback-sync lock and its own, non-blocking in that order, and ends as busy with
 no write if one is held. With `PAUSE` it only fences: it closes the terminals of the loop's own workspaces (names
@@ -48,7 +49,8 @@ older than 2 hours, the stop is not effective or an audit paused the loop.
 
 `read` hands the triage inbox (feedback_triage.py `pull`, `snapshot`, `match` first) to a model that has no tools,
 no settings, no MCP servers, no slash commands, no plugins beyond the pinned built-in set and no session memory: the
-pinned Claude Code CLI on the owner's subscription login, with PATH, HOME and USER and attachments and file mentions
+pinned Claude Code CLI (the loop's own copy under `~/.deedkit/autoloop/cli/`, installed by `install-cli` and verified
+by sha256 before every run, so the CLI's auto-update cannot remove or replace it) on the owner's subscription login, with PATH, HOME and USER and attachments and file mentions
 switched off, in an empty temporary directory, with the inbox on stdin and every `@` in it escaped as `\\u0040`, so
 no `@path` in feedback can pull a local file into the request. Before any answer is used, the stream's `init` event
 must match the profile pinned with the CLI version and the stream may hold nothing but that init, assistant text,
@@ -79,6 +81,8 @@ from pathlib import Path
 import re
 import secrets
 import shlex
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -90,10 +94,19 @@ import feedback_triage as triage  # noqa: E402
 import receipt_watch  # noqa: E402
 
 STATE = Path.home() / '.deedkit' / 'autoloop'
-CLI_VERSION = '2.1.310'
-CLI = Path.home() / '.local' / 'share' / 'claude' / 'versions' / CLI_VERSION
+# The reader runs the autoloop's own copy of the pinned CLI, never the user's `~/.local/share/claude/versions/`: the
+# CLI's auto-update deletes old versions there (10-30: 2.1.310 was gone and the loop halted). The copy is made by
+# `autoloop.py install-cli`, which accepts only a binary whose sha256 is CLI_SHA256, and the digest is checked again
+# before every run. A new pin is a reviewed change of the three constants and PROFILE below, after a canary run
+# (docs/operations/feedback-autoloop.md, "Re-pinning the reader CLI").
+CLI_VERSION = '2.1.316'
+CLI_SHA256 = '64c327e92b2c5e0f78c0a980c5a518121e1f0d140ca771ca5dd4488d1a2dcb3f'  # darwin-arm64 build
+CLI_DIR = STATE / 'cli'
+CLI = CLI_DIR / f'claude-{CLI_VERSION}'
+CLI_SOURCE = Path.home() / '.local' / 'share' / 'claude' / 'versions' / CLI_VERSION
 MODEL = 'claude-opus-5-5'
-# The init profile seen with the pinned CLI (2.1.310, 10-26): built-in plugins and agents only. The agents are inert
+# The init profile seen with the pinned CLI (canary of 2.1.316, 11-01; the same as 2.1.310, 10-26): built-in plugins
+# and agents only. The agents are inert
 # with `--tools ""` (no Agent tool); any change to either set needs a new pin after a canary run.
 PROFILE = {'plugins': {'cc-plugin-agents-md', 'cc-plugin-telemetry', 'cc-plugin-plugin-authoring'},
            'agents': {'claude', 'Explore', 'general-purpose', 'Plan', 'statusline-setup'}}
@@ -228,7 +241,65 @@ def version(cli):
         raise Refused(f'reader CLI is not the pinned {CLI_VERSION}')
 
 
-def run_reader(projection, cli=CLI):
+def digest(path):
+    hasher = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for block in iter(lambda: handle.read(1 << 20), b''):
+            hasher.update(block)
+    return hasher.hexdigest()
+
+
+def verify(cli, sha256):
+    """Refuses a reader binary that is missing, not a plain file, writable by anyone else or not the pinned build."""
+    try:
+        info = os.lstat(cli)
+    except OSError:
+        raise Refused(f'reader CLI: {Path(cli).name} is missing; run `autoloop.py install-cli`') from None
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        raise Refused('reader CLI: not a plain file of this user that only this user can write')
+    try:
+        found = digest(cli)
+    except OSError as error:
+        raise Refused(f'reader CLI: {type(error).__name__}') from None
+    if found != sha256:
+        raise Refused('reader CLI: sha256 differs from the pin')
+
+
+def install_cli(source=None, target=None, sha256=None):
+    """Copies the pinned build into the autoloop's own directory: the source must already have the pinned digest, the
+    copy is 0500 and replaces the target in one step, then it is verified again."""
+    verify_source, target, sha256 = Path(source or CLI_SOURCE), Path(target or CLI), sha256 or CLI_SHA256
+    try:
+        found = digest(verify_source)
+    except OSError as error:
+        raise Refused(f'install-cli: cannot read {verify_source}: {type(error).__name__}') from None
+    if found != sha256:
+        raise Refused('install-cli: the source is not the pinned build (sha256 differs)')
+    folder = target.parent
+    if triage.in_git(folder):
+        raise Refused('the reader CLI directory must be outside every Git checkout')
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if folder.stat().st_mode & 0o077:
+        raise Refused('the reader CLI directory must be 0700')
+    with tempfile.NamedTemporaryFile(dir=folder, prefix='.install-', delete=False) as copy:
+        temp = Path(copy.name)
+        try:
+            with open(verify_source, 'rb') as handle:
+                shutil.copyfileobj(handle, copy, 1 << 20)
+            copy.flush()
+            os.fsync(copy.fileno())
+            os.chmod(temp, 0o500)
+            verify(temp, sha256)  # the copy, not only the source
+            os.replace(temp, target)
+        except BaseException:
+            temp.unlink(missing_ok=True)
+            raise
+    verify(target, sha256)
+    return Path(target)
+
+
+def run_reader(projection, cli=CLI, sha256=CLI_SHA256):
+    verify(cli, sha256)
     version(cli)
     with tempfile.TemporaryDirectory(prefix='autoloop-reader-') as empty:
         try:
@@ -2278,18 +2349,21 @@ def status(state, now):
 def main(argv_=None):
     parser = argparse.ArgumentParser(description='Feedback autoloop driver (docs/operations/feedback-autoloop.md).')
     parser.add_argument('action', choices=['tick', 'fence', 'resume', 'status', 'gate', 'finish', 'hold', 'release', 'read',
-                                           'decline', 'large', 'bind', 'report', 'review-run', 'end'])
+                                           'decline', 'large', 'bind', 'report', 'review-run', 'end',
+                                           'install-cli'])
     parser.add_argument('name', nargs='?',
                         help='the intent (gate, finish, decline, large, bind, review-run, end) or the card (hold, release)')
     parser.add_argument('--reason', choices=sorted(DECLINED), help='decline: the reason code of the review reject')
     parser.add_argument('--card', help='bind: the card ANYM-n the worker created')
     parser.add_argument('--head', help='review-run: the exact commit the controller reviews')
     parser.add_argument('--attempt', help='review-run: the review attempt the tick recorded for that head')
+    parser.add_argument('--from', dest='source', type=Path, help='install-cli: the pinned build to copy')
     parser.add_argument('--state', type=Path, default=Path(os.environ.get('AUTOLOOP_STATE', STATE)))
     parser.add_argument('--triage-state', type=Path,
                         default=Path(os.environ.get('FEEDBACK_TRIAGE_STATE', triage.STATE)))
     args = parser.parse_args(argv_)
-    if (args.name is None) != (args.action in ('tick', 'fence', 'resume', 'status', 'read', 'report')):
+    if (args.name is None) != (args.action in ('tick', 'fence', 'resume', 'status', 'read', 'report',
+                                                                  'install-cli')):
         parser.error(f'{args.action} takes {"no argument" if args.name else "one argument"}')
     if (args.reason is None) == (args.action == 'decline'):
         parser.error('--reason goes with decline only, and decline needs it')
@@ -2297,6 +2371,8 @@ def main(argv_=None):
         parser.error('--card goes with bind only, and bind needs it')
     if (args.head is None) == (args.action == 'review-run') or (args.attempt is None) == (args.action == 'review-run'):
         parser.error('--head and --attempt go with review-run only, and review-run needs both')
+    if args.source is not None and args.action != 'install-cli':
+        parser.error('--from goes with install-cli only')
     if os.environ.get('AUTOLOOP_RUNNER'):  # inside the container runner (ANYM-574)
         return runner_request(Path(os.environ['AUTOLOOP_RUNNER']), args.action, args.name, args.reason)
     now = datetime.now(timezone.utc)
@@ -2334,6 +2410,9 @@ def main(argv_=None):
             with triage.locked(args.triage_state), own_lock(args.state):
                 count, written = read(args.state, args.triage_state)
                 print(f'read {count} decisions; report {written}' if written else 'inbox empty')
+            return 0
+        if args.action == 'install-cli':
+            print(f'installed {install_cli(args.source)}')
             return 0
         if args.action == 'review-run':  # detached from the tick for up to an hour: it holds no lock
             outcome = review_run(args.state, args.name, args.head, args.attempt)

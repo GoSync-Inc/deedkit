@@ -246,6 +246,22 @@ def test_only_tidens_merged_or_closed_branch_error_is_a_gone_branch(monkeypatch,
 
 
 # spec: ANYM-264
+@pytest.mark.parametrize('argv, stderr, tail', [
+    (['tiden', 'spec'], 'error: HTTP 429: rate limited\nretry later\n', ': error: HTTP 429: rate limited'),
+    (['tiden', 'spec'], 'error: token ' + 'a' * 40 + ' \x1b[31mbad\x1b[0m\n', ': error: token <redacted>  [31mbad [0m'),
+    (['tiden', 'spec'], 'word ' * 100, ': ' + ('word ' * 100)[:160].strip()),
+    (['tiden', 'spec'], '\n', ''),
+    (['ssh', 'host'], 'Permission denied (publickey) for prod.example\n', ''),
+], ids=['rate limit', 'secret-like and control characters', 'bounded', 'silent', 'not tiden'])
+def test_a_failed_tiden_read_names_its_first_error_line_and_nothing_else(monkeypatch, argv, stderr, tail):
+    # 11-01: "REFUSED tiden spec exited 1" said nothing about the cause.
+    monkeypatch.setattr(triage.subprocess, 'run', lambda *a, **k: subprocess.CompletedProcess(argv, 1, '', stderr))
+    with pytest.raises(triage.Refused) as error:
+        triage.run(argv, 5)
+    assert str(error.value) == f'{argv[0]} {argv[1]} exited 1{tail}'
+
+
+# spec: ANYM-264
 def test_local_match_and_classification_vocabulary(state):
     triage.pull(state, 'deedkit-prod', exporter([item(P1, 1), item(P2, 2, 'Reaction export would help',
                                                                  operation=None)], []))
