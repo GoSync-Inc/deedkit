@@ -28,6 +28,10 @@ First check that the hourly sync runs (ANYM-536, below): `python3 scripts/feedba
 prints its last run and exits 1 when no run ended with exit 0 in the last 3 hours or a call with an
 unknown outcome blocks writes. Fix that before triage, or the decisions wait unapplied.
 
+In a fresh worktree link the Tiden product first, or `snapshot` stops with "--product-id is
+required": `tiden product bind --product-id <product> --workspace-id <workspace>` (the IDs are in
+tiden-product-workflow.md) writes the local, gitignored `.tiden/config.json`; it holds only those two IDs.
+
 ```sh
 S=~/.deedkit/feedback-triage
 python3 scripts/feedback_triage.py snapshot   # Tiden main --include-sources + every open branch; stops on a failed or truncated read
