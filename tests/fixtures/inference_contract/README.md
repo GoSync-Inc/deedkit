@@ -17,5 +17,11 @@ Files:
 | `chat_image_engine.response.json`, `audio_transcription_verbose_engine.response.json` | ANYM-683: what the real engines' pipeline (fake runtime, fixed steering) answers: a chat model answer in a code fence reshaped to the JSON object with `title`, `summary`, `document_type`, `text`; a Russian voice note's verbose transcript. The service tests reproduce them; `tests/test_inference_contract.py` feeds every `*.response.json` through the real `normalize_result` |
 | `errors.golden.json` | the error envelope of the service's own answers, by name |
 
+ANYM-685 (`tests/test_enrichment.py::test_requests_match_the_service_contract_fixtures`) compares the real provider's
+requests with the request files. Two deltas are documented there and are not drift: the provider adds one sentence
+after `PROMPT` (`PROMPT_RU`, descriptions in Russian, `prompt_version` `file-description-v2-ru`), and a document is sent
+to `vision-default` (the shipped alias, ANYM-683), while `chat_document.request.json` was recorded against the service
+shell's test alias `document-default`. The files stay as they are because the service tests and the canary read them.
+
 `X-Request-Deadline-Seconds` is the profile's `timeout_seconds`. Model values are aliases (`vision-default`,
 `document-default`, `audio-default`), never repository ids. Everything here is synthetic.

@@ -130,3 +130,22 @@ def pause_profile(c, account, kind, profile_hash, error):
         ON CONFLICT(account,kind,profile_hash) DO UPDATE SET pause_reason=excluded.pause_reason,
         paused_until=excluded.paused_until,updated_at=clock_timestamp()''',
         (account,kind,profile_hash,error,error=='model_rate_limited'))
+
+
+def defer_profile(c, account, kind, profile_hash, seconds):
+    """Pause a scope for `seconds` because the model host cannot take work now (`model_backpressure`).
+
+    A merge that never weakens a pause already there: an indefinite one (`paused_until` NULL, such as
+    `model_auth_failed`) stays, and of two bounded ones the later expiry wins with its own reason, so a late
+    deferral cannot replace what another job's failure just set (the plain upsert of pause_profile would)."""
+    c.execute('''INSERT INTO processing_control(account,kind,profile_hash,pause_reason,paused_until)
+        VALUES(%s,%s,%s,'model_backpressure',clock_timestamp()+make_interval(secs=>%s))
+        ON CONFLICT(account,kind,profile_hash) DO UPDATE SET
+        pause_reason=CASE WHEN processing_control.pause_reason IS NOT NULL
+                AND (processing_control.paused_until IS NULL OR processing_control.paused_until>=excluded.paused_until)
+            THEN processing_control.pause_reason ELSE excluded.pause_reason END,
+        paused_until=CASE WHEN processing_control.pause_reason IS NOT NULL AND processing_control.paused_until IS NULL THEN NULL
+            WHEN processing_control.pause_reason IS NOT NULL AND processing_control.paused_until>clock_timestamp()
+            THEN greatest(processing_control.paused_until,excluded.paused_until)
+            ELSE excluded.paused_until END,
+        updated_at=clock_timestamp()''',(account,kind,profile_hash,seconds))
