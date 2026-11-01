@@ -14,8 +14,9 @@ from messaging_service import messenger_operations as ops
 from messaging_service import telegram_operations as telegram
 
 ROOT = Path(__file__).resolve().parents[1]
-GO = (ROOT / 'whatsapp/whatsmeow/operations.go').read_text()
-JS = (ROOT / 'whatsapp/operations.mjs').read_text()
+# All non-test sources of each adapter, so moving a table to another file of the same adapter does not fail here.
+GO = '\n'.join(p.read_text() for p in sorted((ROOT / 'whatsapp/whatsmeow').glob('*.go')) if not p.name.endswith('_test.go'))
+JS = '\n'.join(p.read_text() for p in sorted((ROOT / 'whatsapp').glob('*.mjs')))
 
 # Operations the browser fallback (operations.mjs) lacks: the native adapter alone implements them.
 # Mirrors messenger_operations._supported for a provider other than whatsmeow.
@@ -45,23 +46,27 @@ EXPECTED_GO_READ_MISSING = {'open_chat_by_phone'}
 
 
 def _go_fields():
-    body = GO.split('var operationFields = map[string]string{', 1)[1].split('\n}\n', 1)[0]
+    match = re.search(r'var operationFields\s*=\s*map\[string\]string\{(.*?)\n\}', GO, re.S)
+    assert match, 'operationFields'
+    body = match.group(1)
     return {name: set(fields.split()) for name, fields in re.findall(r'"(\w+)":\s*"([^"]*)"', body)}
 
 
 def _go_set(name):
-    match = re.search(r'var %s = wordSet\("([^"]*)"\)' % name, GO)
+    match = re.search(r'var %s\s*=\s*wordSet\("([^"]*)"\)' % name, GO)
     assert match, name
     return set(match.group(1).split())
 
 
 def _js_fields():
-    body = JS.split('const SPECS={', 1)[1].split('\n};', 1)[0]
+    match = re.search(r'const SPECS\s*=\s*\{(.*?)\n\s*\};', JS, re.S)
+    assert match, 'SPECS'
+    body = match.group(1)
     return {name: set(re.findall(r"'(\w+)'", fields)) for name, fields in re.findall(r'(\w+):\[([^\]]*)\]', body)}
 
 
 def _js_set(name):
-    match = re.search(r'const %s=new Set\(\[(.*?)\]\)' % name, JS, re.S)
+    match = re.search(r'const %s\s*=\s*new Set\(\[(.*?)\]\)' % name, JS, re.S)
     assert match, name
     return set(re.findall(r"'(\w+)'", match.group(1)))
 
@@ -77,6 +82,7 @@ def _extra_fields(copy, python):
     return {name: copy[name] - python[name] for name in copy if copy[name] - python[name]}
 
 
+# spec: ANYM-162
 def test_the_parsers_read_every_table():
     # Guards the guard: a source reformat that empties a parser must fail here, not pass the parity tests silently.
     assert len(_go_fields()) >= 50 and len(_js_fields()) >= 40

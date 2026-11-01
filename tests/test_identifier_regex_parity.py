@@ -12,16 +12,19 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = {
-    'py': sorted((ROOT / 'services/messaging/messaging_service').glob('*.py')),
-    'js': sorted((ROOT / 'whatsapp').glob('*.mjs')),
-    'go': [p for p in sorted((ROOT / 'whatsapp/whatsmeow').glob('*.go')) if not p.name.endswith('_test.go')],
+    'py': sorted((ROOT / 'services/messaging/messaging_service').rglob('*.py')),
+    'js': [p for p in sorted((ROOT / 'whatsapp').rglob('*.mjs'))
+           if 'node_modules' not in p.parts and 'tests' not in p.parts and not p.name.endswith('.test.mjs')],
+    'go': [p for p in sorted((ROOT / 'whatsapp/whatsmeow').rglob('*.go')) if not p.name.endswith('_test.go')],
 }
 ALL = ('go', 'js', 'py')
-# family -> signature (finds every copy of the family, canonical or not)
+# family -> signature: finds every copy of the family, canonical or not. The character class may be spelled
+# either way round (a-zA-Z / A-Za-z) and the dot escaped or not; any bounds count, so a changed bound is a variant.
+_CLASS = r'\[(?:a-zA-Z|A-Za-z)0-9_\\?\.'
 SIGNATURES = {
-    'chat': r'\[a-zA-Z0-9_\.:-\]\{1,140\}@\([^()]*\)',
-    'account': r'\[a-zA-Z0-9_\.-\]\{1,64\}',
-    'send_id': r'send_\[a-f0-9\]\{\d+\}',
+    'chat': _CLASS + r':-\]\{\d+,\d+\}@\([^()]*\)',
+    'account': _CLASS + r'-\]\{\d+,\d+\}',
+    'send_id': r'send_\[[^\]]+\]\{\d+\}',
     'wid': r'\[0-9\]\{\d+,\d+\}@c\\?\.us',
     'user': r'\[0-9\]\{1,\d+\}@\(c\\?\.us\|lid\)',
 }
@@ -42,7 +45,12 @@ EXPECTED_VARIANTS = {
         # By design: a sender is a person, never a group (reply_evidence.py, subscriptions.py SQL).
         r'[a-zA-Z0-9_.:-]{1,140}@(c\.us|lid)': ('py',),
     },
-    'account': {},
+    'account': {
+        # Not account ids: a backup-config value (backup_runner.py) and a URN tail (reviews.py); bound 128.
+        r'[a-zA-Z0-9_.-]{1,128}': ('py',),
+        # Not an account id: a Gemini model id (enrichment_providers.py); bound 120.
+        r'[A-Za-z0-9_.-]{1,120}': ('py',),
+    },
     'send_id': {},
     'wid': {
         # Unescaped dot (whatsapp_collector.py expected_wid).
@@ -60,7 +68,8 @@ def _inventory():
         for path in paths:
             text = path.read_text()
             if lang != 'py':
-                text = text.replace('\\d', '[0-9]')  # JS and Go \d are ASCII digits; a Python \d would stay and fail
+                text = text.replace('\\d', '[0-9]')  # JS and Go \d are ASCII digits: the same body
+            # A Python \d (Unicode digits) is not rewritten, so it never matches a [0-9] signature; no Python copy uses one.
             for family, signature in SIGNATURES.items():
                 for body in re.findall(signature, text):
                     found[family].setdefault(body, {}).setdefault(lang, set()).add(path.name)
