@@ -26,6 +26,9 @@ def payload(error,operation='',request_id=None):
     if hasattr(error,'field_errors'):info['field_errors']=error.field_errors
     for name in ('hint','resets_in_seconds'):  # Reviewed constants and counters, never input values.
         if hasattr(error,name):info[name]=getattr(error,name)
+    # ANYM-676: a refused press names the archived label and the unsupported kind, reviewed bot-supplied text.
+    for name in ('archived_label','kind'):
+        if hasattr(error,name):info[name]=getattr(error,name)
     # ANYM-531: the caller's own account and normalized number, and archive IDs the key may read.
     # ANYM-532: the normalized number the caller sent and the phone lookup's operation_id.
     for name in ('next_call','found_on_other_account','account','phone','operation_id'):

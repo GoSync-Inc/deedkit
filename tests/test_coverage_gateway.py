@@ -554,7 +554,7 @@ def test_catalog_covers_explicit_families_and_provider_differences():
                           'set_group_info_admins_only', 'set_slow_mode', 'set_join_approval',
                           'approve_join_requests', 'reject_join_requests', 'join_chat'],
         'contacts-manage': ['add_contact', 'delete_contact', 'block_contact', 'unblock_contact'],
-        'profile-manage': ['update_profile'],
+        'profile-manage': ['update_profile'], 'bot-press': ['press_button'],
     }
     assert set(telegram) == set(whatsapp) == {name for names in families.values() for name in names}
     for permission, names in families.items():
