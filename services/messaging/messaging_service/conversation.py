@@ -118,6 +118,12 @@ def present_message(row,position):
             row['display_text']='\n'.join(lines)
         else:row['display_text']=(body+'\n' if body else '')+'['+label+']'
     else:row['display_text']=body
+    # ANYM-658: the transcript has only display_text; a keyboard shows its first labels, never a link or a kind.
+    buttons=row.get('buttons')
+    flat=[b for r in buttons.get('rows',[]) for b in r] if isinstance(buttons,dict) else buttons if isinstance(buttons,list) else []
+    labels=[b['text'][:32] for b in flat[:8] if isinstance(b,dict) and b.get('text')]
+    if labels and kind!='system':
+        row['display_text']=(row['display_text']+'\n' if row['display_text'] else '')+'[Кнопки] '+' | '.join(labels)
     row['timestamp_precision']=row.get('timestamp_resolution') or 'unknown'
     row.setdefault('order_basis','timestamp_only');row.setdefault('order_status','timestamp_only')
     return row

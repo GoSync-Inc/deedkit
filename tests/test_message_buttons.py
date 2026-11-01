@@ -247,6 +247,61 @@ def test_an_older_or_same_version_reread_never_rewrites_the_keyboard(archive):
     assert stored(s,mid)['buttons']['rows'][0][0]['text']=='Done'
 
 
+# spec: ANYM-658
+def test_a_same_version_observation_of_another_keyboard_changes_nothing(archive):
+    ar,s,key,_=archive
+    mid=ingest_keyboard(ar,['Pay'])['message']
+    # Same provider version, another keyboard: not an edit. No revision, no event, and the reads keep what the
+    # revision's snapshot says.
+    assert ingest_keyboard(ar,['Done'])['outcome']=='unchanged'
+    assert stored(s,mid)['buttons']['rows'][0][0]['text']=='Pay' and stored(s,mid,1)['buttons']['rows'][0][0]['text']=='Pay'
+    with s.pool.connection() as c:
+        assert c.execute('SELECT revision FROM messages WHERE id=%s',(mid,)).fetchone()['revision']==1
+    assert s.get_messages(key,stable_id('chat','archive-test','100'))['items'][0]['buttons']['rows'][0][0]['text']=='Pay'
+
+
+# spec: ANYM-658
+def test_removal_after_a_completed_keyboard_still_makes_a_revision(archive):
+    ar,s,key,_=archive
+    # Archived while the flag was off, completed by a same-version re-read with the flag on, then the bot removes it.
+    mid=ingest_keyboard(ar,None)['message']
+    assert ingest_keyboard(ar,['Pay'])['outcome']=='unchanged' and stored(s,mid)['buttons']['rows'][0][0]['text']=='Pay'
+    assert ingest_keyboard(ar,None,when='2026-10-01T12:00:09+00:00')['outcome']=='edited'
+    assert 'buttons' not in stored(s,mid) and 'buttons' not in stored(s,mid,2)
+    assert 'buttons' not in s.get_messages(key,stable_id('chat','archive-test','100'))['items'][0]
+
+
+def conversation(s,key,method,detail,**kw):
+    from messaging_service.presentation import render
+    chat=stable_id('chat','archive-test','100')
+    if method=='get_messages':result=s.get_messages(key,chat,view='conversation',compact=detail=='compact',**kw)
+    elif method=='search':result=s.search(key,view='conversation',compact=detail=='compact',**kw)
+    else:
+        mid=s.get_messages(key,chat,view='conversation')['items'][0]['id']
+        result=s.get_context(key,mid,view='conversation',compact=detail=='compact')
+    return render(method,result,detail)
+
+
+def rows_of(output,method):
+    return [output['message'],*output['context']] if method=='get_context' else output['items']
+
+
+# spec: ANYM-658
+@pytest.mark.parametrize('method',['get_messages','search','get_context'])
+def test_compact_conversation_reads_and_transcripts_carry_the_buttons_without_links(archive,method):
+    ar,s,key,_=archive
+    keyboard={'rows':[[{'text':'B%d'%n,'kind':'url','url':'https://example.invalid/secret-%d'%n} for n in range(12)]]}
+    ar.ingest(event(body='Menu',metadata={'chat_type':'private','message_kind':'text','buttons':keyboard}))
+    compact=conversation(s,key,method,'compact')
+    shown=next(r for r in rows_of(compact,method) if r.get('buttons') or r.get('buttons_count'))
+    assert shown['buttons_count']==12 and len(shown['buttons'])==8 and all(set(b)=={'text','kind'} for b in shown['buttons'])
+    assert 'secret-' not in json.dumps(compact,default=str)
+    full=conversation(s,key,method,'full')
+    assert next(r for r in rows_of(full,method) if r.get('buttons'))['buttons']==keyboard
+    transcript=conversation(s,key,method,'transcript')
+    assert '[Кнопки] B0 | B1 | B2 | B3 | B4 | B5 | B6 | B7' in transcript['transcript'] and 'secret-' not in json.dumps(transcript)
+
+
 def three_chat(s,key):
     return stable_id('chat','archive-test','100')
 
