@@ -29,8 +29,10 @@ file, owner 11-01).
 - Bot buttons: the labels, kinds, URLs, Mini App links and callback data of a message's inline and
   reply buttons are stored and deleted with the message text (retention above, deletion below; owner
   11-01 «4 да» to the bot-buttons question, with «надо сделать чтоб он бот мог делать действия которые
-  я прошу в miniapp»). Decided, not yet built: today only the message text is captured. Link previews,
-  polls, invoices, contact cards and other message parts this file does not name: proposal.
+  я прошу в miniapp»). Decided, not yet built: today only the message text is captured. Link previews
+  and polls are stored and deleted under the message-text rules (retention above, deletion below; owner
+  11-02 «5 да» to the question «Превью ссылок и опросы. Храним по правилам текста?»). Invoices,
+  contact cards and other message parts this file does not name: proposal.
 - Pre-migration database copies and backups (ANYM-588, docs/operations/production.md "Migration risk
   tiers" and "Database copies"): only a dangerous migration gets a fresh verified backup and a
   pre-migration copy; a low or medium one gets neither, and the latest verified daily backup is its
