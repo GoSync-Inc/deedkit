@@ -10,6 +10,7 @@ import re
 
 from .envelope import E164, contact_block, validate
 from .incoming_formatting import telegram as telegram_formatting, unknown as unknown_formatting
+from .message_buttons import capture as capture_buttons
 
 
 def timestamp(value):
@@ -219,7 +220,7 @@ def telegram_message(account,message,*,chat_title='',origin='live',verified_self
     shared=getattr(message,'media',None)
     contact=telegram_contact(shared) if isinstance(shared,types.MessageMediaContact) and contact_card_capture() else None
     preview_id=telegram_web_preview_id(shared) if web_preview_capture() else None
-    return validate({'account':account,'platform':'telegram','chat':str(message.chat_id),
+    data={'account':account,'platform':'telegram','chat':str(message.chat_id),
         'chat_title':(chat_title if chat_title and chat_title!=str(message.chat_id) else observed_title) or str(message.chat_id),
         'provider_id':str(message.id),
         'sender':str(sender_id or ''),'body':message.message or '',
@@ -246,7 +247,11 @@ def telegram_message(account,message,*,chat_title='',origin='live',verified_self
             # Only a stated flag is captured; an absent one is unknown, never "not verified".
             **({'sender_is_business_or_verified':True} if provider_flags_capture() and isinstance(entity,types.User)
                 and (getattr(entity,'verified',None) is True or getattr(entity,'support',None) is True) else {}),
-            'media_kind':media_kind}})
+            'media_kind':media_kind}}
+    # The keyboard never costs the message: any failure in it, or no room left, leaves the key out (ANYM-658).
+    buttons=capture_buttons(getattr(message,'reply_markup',None),data)
+    if buttons:data['metadata']['buttons']=buttons
+    return validate(data)
 
 
 def whatsapp_message(account,event,*,origin='live',change='message',observed_at=None):

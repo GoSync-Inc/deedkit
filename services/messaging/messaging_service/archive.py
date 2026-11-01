@@ -115,7 +115,10 @@ def whatsapp_unreadable_shape(e):
         and not e['body'] and not e['media'] and not e['deleted'])
 
 
-def ingest_outcome(old,e,retained_snapshot,sender_alias=False):
+_SNAPSHOT=object()
+
+
+def ingest_outcome(old,e,retained_snapshot,sender_alias=False,retained_buttons=_SNAPSHOT):
     """What ingest does with the validated candidate `e` against the retained message row `old` (None: a new message)
     and the retained revision's snapshot: (outcome, sender_completed, sender_device_only, unreadable, sent_at_jitter,
     jitter_version, body_completed, web_preview_refresh, known_candidate, known_retained, old_format). The version a
@@ -129,6 +132,13 @@ def ingest_outcome(old,e,retained_snapshot,sender_alias=False):
     known_candidate=known_formatting(candidate_format);known_retained=known_formatting(old_format)
     formatting_changed=known_candidate and known_retained and candidate_format!=old_format
     formatting_completed=known_candidate and not known_retained
+    # A bot that replaces only its keyboard (same text, a later edit time) makes a new revision whose metadata
+    # carries the new `buttons`, or none when the edit removed it. A same-or-older version never rewrites it, so a
+    # re-read taken with the capture flag off cannot erase a keyboard (ANYM-658).
+    buttons_changed=bool(old and retained_snapshot and not old['deleted'] and not e['deleted'] and e['platform']=='telegram'
+        and old['provider_updated_at'] is not None and updated>old['provider_updated_at']
+        and (((retained_snapshot.get('metadata') or {}).get('buttons') if retained_buttons is _SNAPSHOT else retained_buttons)
+             !=(e.get('metadata') or {}).get('buttons')))
     sender_completed=bool(old and not old['sender'] and e['sender'] and not old['deleted']
         and not e['deleted'] and e['platform']=='telegram' and e['direction']=='outgoing'
         and e.get('metadata',{}).get('chat_type')=='private'
@@ -193,7 +203,7 @@ def ingest_outcome(old,e,retained_snapshot,sender_alias=False):
         elif web_preview_refresh:outcome='unchanged'
         elif (old['sent_at']!=datetime.fromisoformat(e['sent_at']) or old['direction']!=e['direction']
               or old['sender']!=e['sender']): outcome='conflict'
-        elif old['content_hash']==content and not (formatting_changed or formatting_completed): outcome='unchanged'
+        elif old['content_hash']==content and not (formatting_changed or formatting_completed or buttons_changed): outcome='unchanged'
         elif old['provider_updated_at'] and updated<old['provider_updated_at']: outcome='stale'
         elif old['content_hash']==content and formatting_completed:outcome='edited'
         elif (old['provider_updated_at']==updated and not e['deleted']): outcome='conflict'
@@ -202,6 +212,16 @@ def ingest_outcome(old,e,retained_snapshot,sender_alias=False):
     elif e['deleted']: outcome='deleted'
     return (outcome,sender_completed,sender_device_only,unreadable,sent_at_jitter,jitter_version,body_completed,
             web_preview_refresh,known_candidate,known_retained,old_format)
+
+
+def effective_buttons(c,mid,old,retained_snapshot):
+    """The keyboard the reads show for the retained revision: the current metadata row when it is that revision's
+    (a same-version re-read with the capture flag on completes it), else the revision's snapshot (ANYM-658)."""
+    if not old or not retained_snapshot or old['deleted']:return None
+    row=c.execute('SELECT metadata->\'buttons\' AS buttons FROM message_metadata WHERE message=%s AND revision=%s',
+                  (mid,old['revision'])).fetchone()
+    if row and row['buttons'] is not None:return row['buttons']
+    return (retained_snapshot.get('metadata') or {}).get('buttons')
 
 
 class Archive:
@@ -293,7 +313,8 @@ class Archive:
                 e={**e,'deleted':True,'body':'','media':[],
                    'updated_at':max(tombstone,datetime.fromisoformat(e['updated_at'])).isoformat()}
                 if 'formatting' in e:e['formatting']=unknown_formatting()
-                if 'contact' in e.get('metadata',{}):e['metadata']={k:v for k,v in e['metadata'].items() if k!='contact'}
+                if 'contact' in e.get('metadata',{}) or 'buttons' in e.get('metadata',{}):
+                    e['metadata']={k:v for k,v in e['metadata'].items() if k not in ('contact','buttons')}
             if (identity_observations and not e['deleted']
                     and c.execute('SELECT 1 FROM messages WHERE id=%s AND NOT deleted',(mid,)).fetchone()):
                 # A capture's identity evidence that contradicts a recorded pair is kept as a fence
@@ -337,7 +358,8 @@ class Archive:
                     (mid,old['revision'])).fetchone()
                 retained_snapshot=retained['snapshot'] if retained else None
             (outcome,sender_completed,sender_device_only,unreadable,sent_at_jitter,jitter_version,body_completed,
-             web_preview_refresh,known_candidate,known_retained,old_format)=ingest_outcome(old,e,retained_snapshot,sender_alias)
+             web_preview_refresh,known_candidate,known_retained,old_format)=ingest_outcome(old,e,retained_snapshot,sender_alias,
+                effective_buttons(c,mid,old,retained_snapshot))
             if replay and outcome!='edited':raise ValueError('replay_not_accepted')
             # An incomplete observation of the same retained provider body must
             # not erase known formatting, including authenticated sender repair.
@@ -393,7 +415,10 @@ class Archive:
                     ON CONFLICT(message) DO UPDATE SET
                     revision=excluded.revision,
                     metadata=CASE WHEN message_metadata.revision=excluded.revision
-                        THEN message_metadata.metadata || jsonb_strip_nulls(excluded.metadata) ||
+                        -- A kept keyboard is never overwritten by a same-version observation: a different one is a
+                        -- later edit (ANYM-658), and only that makes a revision. A missing one is completed.
+                        THEN message_metadata.metadata || (jsonb_strip_nulls(excluded.metadata) -
+                            CASE WHEN message_metadata.metadata ? 'buttons' THEN ARRAY['buttons'] ELSE ARRAY[]::text[] END) ||
                             -- A sparser re-read of the same stated origin keeps the fields it already named;
                             -- a conflicting ID or time is another origin and replaces it.
                             CASE WHEN message_metadata.metadata->'forward_origin'->'kind'=excluded.metadata->'forward_origin'->'kind'

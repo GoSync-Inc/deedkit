@@ -37,14 +37,42 @@ def boundaries(body):
     return result
 
 
+_TG_HOSTS=('resolve','join','addstickers')
+_CREDENTIAL_MIRRORS=('t.me','telegram.me','telegram.dog','telesco.pe')
+
+
 def safe_url(value):
+    """What the validator accepts: http(s) without userinfo, or a tg:// link to one of three harmless hosts."""
     if not isinstance(value,str) or not value or len(value)>2048 or any(c.isspace() or unicodedata.category(c) in ('Cc','Cf','Cs') for c in value):
         return False
     try:
         parsed=urlsplit(value)
+        if parsed.scheme=='tg':
+            # tg://resolve, join and addstickers only; login, passport, setlanguage and the rest are not links.
+            return parsed.netloc.lower() in _TG_HOSTS and parsed.username is None and parsed.port is None
         return parsed.scheme in ('http','https') and bool(parsed.hostname) and parsed.username is None and parsed.password is None
     except ValueError:
         return False
+
+
+def credential_link(value):
+    """A login-code link in either scheme: tg://login and https://t.me/login/<code> on Telegram's own hosts."""
+    try:
+        parsed=urlsplit(value)
+        if parsed.scheme=='tg':return parsed.netloc.lower()=='login'
+        return (parsed.hostname or '').lower() in _CREDENTIAL_MIRRORS and (parsed.path.lower()=='/login' or parsed.path.lower().startswith('/login/'))
+    except ValueError:
+        return True
+
+
+def capture_url(value):
+    """The capture-time link rule for text links and buttons: safe, no credential link, and a tg:// link only
+    while ANYMSG_CAPTURE_BUTTONS is on (the deployed validator rejects such spans, so a rollback must not receive them)."""
+    if not safe_url(value) or credential_link(value):return False
+    if urlsplit(value).scheme=='tg':
+        from .message_buttons import buttons_capture
+        return buttons_capture()
+    return True
 
 
 def _span(value, points, *, unsupported=False):
@@ -128,7 +156,7 @@ def telegram(body, native_entities):
         if kind in ('mention_name','input_mention_name','custom_emoji','unknown'):
             result['unsupported_entities'].append(span);warn('native_entities_unsupported');continue
         if kind=='text_link':
-            if not safe_url(getattr(entity,'url',None)):
+            if not capture_url(getattr(entity,'url',None)):
                 result['unsupported_entities'].append(span);warn('native_link_unsupported');continue
             span['url']=entity.url
         if kind=='pre' and getattr(entity,'language',None):

@@ -46,6 +46,8 @@ META = '''nullif(sp.display_name,'') AS sender_name,nullif(sp.username,'') AS us
     CASE WHEN NOT m.deleted AND coalesce(mm.metadata,mr.snapshot->'metadata')->>'message_kind'='contact'
         AND jsonb_typeof(coalesce(mm.metadata,mr.snapshot->'metadata')->'contact')='object'
       THEN coalesce(mm.metadata,mr.snapshot->'metadata')->'contact' END AS contact,
+    CASE WHEN NOT m.deleted AND jsonb_typeof(coalesce(mm.metadata,mr.snapshot->'metadata')->'buttons')='object'
+      THEN coalesce(mm.metadata,mr.snapshot->'metadata')->'buttons' END AS buttons,
     (SELECT platform FROM accounts WHERE id=m.account) AS platform,
     (SELECT observed_at FROM message_revisions WHERE message=m.id AND revision=1) AS first_observed_at,
     'archive_revision_observation'::text AS first_observed_at_basis'''

@@ -300,6 +300,107 @@ def test_checkpoint_backfill_catchup_and_overlap_edit(worker):
     assert len(s.search(key)['items'])==8
 
 
+def poisoned_keyboard():
+    """A real inline markup whose rows fail when read: the parser itself raises, past the type check."""
+    from telethon import types
+    class Poisoned(types.ReplyInlineMarkup):
+        rows=property(lambda self:(_ for _ in ()).throw(RuntimeError('keyboard exploded SYNTHETIC-CALLBACK')),
+                      lambda self,value:None)
+    return Poisoned(rows=[])
+
+
+def serialized_applies(w):
+    """Every capture the collector hands the state, as the spool serializes it."""
+    seen=[];original=w.state.apply
+    def apply(item):
+        seen.append(json.dumps(item,default=str));return original(item)
+    w.state.apply=apply
+    return seen
+
+
+# spec: ANYM-658
+def test_a_failing_keyboard_costs_neither_the_live_nor_the_history_message(worker,monkeypatch):
+    from telethon import types
+    monkeypatch.setenv('ANYMSG_CAPTURE_BUTTONS','1')
+    w,s,key=worker
+    seen=serialized_applies(w)
+    keyboard=types.ReplyInlineMarkup(rows=[types.KeyboardInlineButtonRow(buttons=[types.KeyboardInlineButton(
+        text='Pay',type=types.InlineButtonTypeCallback(data=b'SYNTHETIC-CALLBACK'))])])
+    history=[message(i) for i in range(1,6)]
+    for item,markup in zip(history,(poisoned_keyboard(),keyboard,poisoned_keyboard(),None,poisoned_keyboard())): item.reply_markup=markup
+    w.provider.messages[:]=history
+    live=message(9); live.reply_markup=poisoned_keyboard()
+    asyncio.run(w.capture(NS(message=live)))
+    asyncio.run(w.capture(NS(message=message(10))))
+    w.spool.drain(w.state.apply)
+    for _ in range(4):asyncio.run(w.sync_once())  # batch_size=2: the history pages come newest first
+    w.history_spool.drain(w.state.apply)
+    assert {m['body'] for m in s.search(key,limit=50)['items']}>={'message 9','message 10','message 1','message 2','message 3','message 4','message 5'}
+    pay=s.search(key,'message 2')['items'][0]
+    assert pay['buttons']['rows'][0][0]['text']=='Pay'
+    assert seen and all('SYNTHETIC-CALLBACK' not in item and 'keyboard exploded' not in item for item in seen)
+    assert 'SYNTHETIC-CALLBACK' not in repr(pay)
+
+
+# spec: ANYM-658
+def test_a_100_button_keyboard_with_2kb_links_survives_the_live_and_history_paths(worker,monkeypatch):
+    from messaging_service.envelope import MAX_ENVELOPE,canonical
+    from telethon import types
+    monkeypatch.setenv('ANYMSG_CAPTURE_BUTTONS','1')
+    w,s,key=worker
+    seen=serialized_applies(w)
+    link='https://example.invalid/'+'a'*2000
+    def keyboarded(item):
+        buttons=[types.KeyboardInlineButton(text='Link %d'%n,type=types.InlineButtonTypeUrl(url=link+str(n)))
+                 for n in range(99)]
+        buttons.append(types.KeyboardInlineButton(text='Pay',type=types.InlineButtonTypeCallback(data=b'SYNTHETIC-CALLBACK')))
+        item.reply_markup=types.ReplyInlineMarkup(rows=[types.KeyboardInlineButtonRow(buttons=[b]) for b in buttons])
+        return item
+    asyncio.run(w.capture(NS(message=keyboarded(message(9)))))
+    asyncio.run(w.capture(NS(message=message(10))))
+    w.spool.drain(w.state.apply)
+    w.provider.messages[:]=[keyboarded(message(i)) if i%2 else message(i) for i in range(1,6)]
+    for _ in range(4):asyncio.run(w.sync_once())
+    w.history_spool.drain(w.state.apply)
+    items=s.search(key,limit=50)['items']
+    assert len(items)>=7 and any(i['body']=='message 10' for i in items) and any(i['body']=='message 4' for i in items)
+    kept=[i for i in items if i.get('buttons')]
+    assert len(kept)==4
+    for item in kept:
+        flat=[b for row in item['buttons']['rows'] for b in row]
+        assert len(flat)==100 and flat[0]['url'].startswith('https://example.invalid/') and len(flat[0]['url'])>2000
+    assert all(len(item.encode())<=MAX_ENVELOPE for item in seen) and all('SYNTHETIC-CALLBACK' not in item for item in seen)
+    assert all(len(canonical(json.loads(item)))<=MAX_ENVELOPE for item in seen)
+
+
+# spec: ANYM-658
+def test_a_near_limit_keyboard_survives_the_live_and_history_paths_and_the_next_messages_too(worker,monkeypatch):
+    from telethon import types
+    monkeypatch.setenv('ANYMSG_CAPTURE_BUTTONS','1')
+    w,s,key=worker
+    seen=serialized_applies(w)
+    def heavy(item):
+        # A multibyte body and 150 long links leave the keyboard only a few KB of the 512 KB envelope.
+        item.message='𝔸'*65536
+        item.entities=[types.MessageEntityTextUrl(offset=2*n,length=2,url='https://example.invalid/'+'p'*1500) for n in range(150)]
+        item.reply_markup=types.ReplyInlineMarkup(rows=[types.KeyboardInlineButtonRow(buttons=[types.KeyboardInlineButton(
+            text='𝔸'*128,type=types.InlineButtonTypeCallback(data=b'SYNTHETIC-CALLBACK-%d'%n))]) for n in range(100)])
+        return item
+    live=heavy(message(9))
+    asyncio.run(w.capture(NS(message=live)))
+    asyncio.run(w.capture(NS(message=message(10))))
+    w.spool.drain(w.state.apply)
+    w.provider.messages[:]=[heavy(message(i)) if i%2 else message(i) for i in range(1,6)]
+    for _ in range(4):asyncio.run(w.sync_once())
+    w.history_spool.drain(w.state.apply)
+    items=s.search(key,limit=50)['items']
+    assert {len(i['body']) for i in items if i['body'].startswith('𝔸')}=={65536}
+    assert len(items)>=7 and any(i['body']=='message 10' for i in items)
+    kept=[i for i in items if i.get('buttons')]
+    assert kept and all(i['buttons'].get('truncated') is True for i in kept)
+    assert all('SYNTHETIC-CALLBACK' not in item for item in seen)
+
+
 def test_page_failure_leaves_checkpoint_and_durable_captures_for_replay(worker):
     w,s,key=worker; original=w.state.apply; calls=0
     def fail_second(item):

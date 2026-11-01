@@ -71,8 +71,19 @@ def forward_copies(row):
     return {k:row[k] for k in ('copies_total','latest_copy_at','copies') if row.get(k)}
 
 
+def keyboard_summary(row):
+    """ANYM-658: compact reads carry buttons_count and the text and kind of the first 8 buttons, never a link."""
+    buttons=row.get('buttons')
+    if isinstance(buttons,dict):
+        from .message_buttons import compact
+        return compact(buttons)
+    if isinstance(buttons,list) and buttons:return {'buttons':buttons,'buttons_count':row.get('buttons_count',len(buttons))}
+    return {}
+
+
 def message_summary(row):
     result={k:row[k] for k in MESSAGE_FIELDS if k in row and row[k] is not None}
+    result.update(keyboard_summary(row))
     if row.get('conversation_view_version')==1:
         result.update({k:row[k] for k in CONVERSATION_FIELDS if k in row})
     if 'formatting' in result:
@@ -137,6 +148,7 @@ def lean_message(row, *, search=False, files=True):
     result.update(forward_fields(row));result.update(forward_copies(row))
     if row.get('reply_to_provider_id'):result['reply_to_provider_id']=row['reply_to_provider_id']
     if row.get('reply_to'):result['reply_to']=row['reply_to']
+    result.update(keyboard_summary(row))
     if row.get('agent_send'):
         result['agent_send']={k:row['agent_send'][k] for k in ('send_id','basis') if k in row['agent_send']}
     receipt=row.get('delivery_receipt') or {}

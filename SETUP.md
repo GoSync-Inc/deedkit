@@ -226,6 +226,23 @@ collector's capture spool keep the field, and a collector or drainer older than
 this release rejects and quarantines them, so once the flag has been on, rollback
 targets stay at or after this release.
 
+### Telegram inline buttons
+
+The Telegram collector records the inline keyboard of a message
+(`metadata.buttons`: `rows` of `{text, kind, url?, copy_text?}`, at most 100 buttons)
+only when its environment sets `ANYMSG_CAPTURE_BUTTONS=1`; it is off by default. The
+same flag lets `tg://resolve`, `tg://join` and `tg://addstickers` links pass in
+buttons and text links (other `tg:` hosts and login-code links such as `tg://login` or
+`https://t.me/login/<code>` are always dropped). The callback data, an inline query
+and any other press token are never read. Nothing presses, opens or fetches a button.
+A keyboard that does not fit the envelope loses its links, then trailing buttons
+(`truncated: true`); a failure in the keyboard code leaves the message without it.
+Messages archived earlier have no keyboard and are not backfilled. Enabling it needs a
+collector restart, which stops and starts the provider session: it runs only on the
+owner's exact confirmation. Set it once the release a rollback would return to accepts
+the field. To roll back, remove the flag and restart, and let the spool drain first:
+an older server or drainer rejects and quarantines envelopes that still hold the field.
+
 ### Reply queue upgrade (0.9.17)
 
 Apply migration 027 as owner and reapply `gateway_role.sql` and

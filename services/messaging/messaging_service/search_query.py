@@ -194,6 +194,12 @@ def shape_messages(rows, *, compact=False, body_chars=None):
             if row['contact'] is None:
                 row.pop('contact')
                 if row.get('message_kind')=='contact' and not compact:row['contact_details']='unavailable'
+        if 'buttons' in row:
+            # ANYM-658: no keyboard is no key. Compact rows keep the count and the first eight labels and kinds, no links.
+            if row['buttons'] is None:row.pop('buttons')
+            elif compact and isinstance(row['buttons'],dict):
+                from .message_buttons import compact as compact_buttons
+                row.update(compact_buttons(row['buttons']))
         if compact:
             if body is not None:row.setdefault('snippet',body[:320])
             row.pop('body',None)
