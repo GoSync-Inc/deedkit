@@ -16,7 +16,8 @@ admission. Any failure to observe sets both flags true: Between and the test run
               Between's CI runs inside the colima VMs of the user _betweenci, whose containers the admin account cannot
               list (11-02: a full pytest job ran there while this flag read false). What the admin account does see is
               the VM's Virtualization process, whose CPU is the guest's CPU: `between` is also true while the summed
-              %cpu of those processes shows work (VmLoad below). The runner processes inside the guest are invisible.
+              %cpu of those processes shows work (VmLoad below), and for 120 s after the probe starts (it knows nothing of the minutes
+              before). The runner processes inside the guest are invisible. A VM reading that cannot be parsed is busy.
   deedkit_ci  a process of _deedkitci whose arguments name .locks/slot: the run slot is a flock held by a python
               process of that user in its private home, which the admin account cannot open.
 """
@@ -25,6 +26,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable
 import json
+import math
 import os
 from pathlib import Path
 import pwd
@@ -95,6 +97,11 @@ class VmLoad:
         self.samples: list[tuple[float, float]] = []
         self.last_high: float | None = None
 
+    def hold(self) -> None:
+        """Count this moment as a high reading. A probe that has just (re)started knows nothing of the minutes before;
+        launchd restarts it while a job may be running, so it starts busy and the hold is what lets it open."""
+        self.last_high = self.clock()
+
     def update(self, cpu: float) -> bool:
         now = self.clock()
         self.samples = [(at, value) for at, value in self.samples if now - at <= VM_WINDOW] + [(now, cpu)]
@@ -114,10 +121,10 @@ def vm_cpu(run: Callable[[list[str]], str], uid_of: Callable[[str], int]) -> flo
     for line in run(['/bin/ps', '-axo', 'uid=,pcpu=,comm=']).splitlines():
         fields = line.split(None, 2)
         if len(fields) == 3 and fields[0] == str(uid) and fields[2].endswith(VM_MARK):
-            try:
-                total += float(fields[1])
-            except ValueError:
-                continue
+            value = float(fields[1])  # ValueError on garbage: observe() turns it into busy
+            if not math.isfinite(value) or value < 0:
+                raise ValueError('vm_cpu_unreadable')
+            total += value
     return total
 
 
@@ -196,6 +203,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(state))
         return 0 if not any(state.values()) else 1
     vm_load = VmLoad()
+    vm_load.hold()
     loop(args.file, observe=lambda: observe(docker=args.docker, between_ci=vm_load), interval=args.interval)
     return 0
 

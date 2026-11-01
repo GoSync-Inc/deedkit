@@ -233,7 +233,7 @@ def vm_table(*cpus, admin=0.0):
     rows = ['  451   0.0 /opt/between-ci/bin/colima', '  451   0.4 /opt/between-ci/bin/limactl', '  451   0.0 /bin/bash',
             '  451   0.0 sleep', '  451   0.0 ssh: /Users/_betweenci/.colima/_lima/colima-betweenci/ssh.sock [mux]']
     rows += [f'  451 {cpu:5.1f} {VM}' for cpu in cpus]
-    rows += [f'  501 {admin:5.1f} {VM}', '  453 99.0 /usr/bin/python3', '  garbage line', '  451 not-a-number ' + VM]
+    rows += [f'  501 {admin:5.1f} {VM}', '  453 99.0 /usr/bin/python3', '  garbage line', '  501 not-a-number ' + VM]
     return '\n'.join(rows)
 
 
@@ -294,15 +294,38 @@ def test_probe_keeps_between_busy_through_the_gaps_of_a_bursty_job():
 
 
 # spec: ANYM-684
-def test_probe_sets_busy_when_the_vm_table_cannot_be_read():
-    # the table of the VMs fails while the docker side answers: fail closed, both flags true
-    class VmBroken(FakeHost):
+@pytest.mark.parametrize('failing', ['uid=,pcpu=,comm=', 'uid=,args='])
+def test_probe_sets_busy_when_either_process_table_cannot_be_read(failing):
+    # one of the two tables fails while the docker side answers: fail closed, both flags true
+    class OneBroken(FakeHost):
         def __call__(self, argv):
-            if Path(argv[0]).name == 'ps' and 'uid=,pcpu=,comm=' in argv:
+            if Path(argv[0]).name == 'ps' and failing in argv:
                 raise subprocess.CalledProcessError(1, argv)
             return super().__call__(argv)
 
-    assert observe(VmBroken(), between_ci=busy_probe.VmLoad(Clock())) == {'between': True, 'deedkit_ci': True}
+    assert observe(OneBroken(), between_ci=busy_probe.VmLoad(Clock())) == {'between': True, 'deedkit_ci': True}
+
+
+# spec: ANYM-684
+@pytest.mark.parametrize('reading', ['not-a-number', 'nan', 'inf', '-1.0'])
+def test_probe_sets_busy_when_a_between_vm_reading_is_unreadable(reading):
+    # a Between VM whose %cpu cannot be read is not "0 %": it must not hide the VM, or another busy one beside it
+    table = vm_table(0.3) + f'\n  451 {reading} {VM}'
+    assert observe(FakeHost(vm_processes=table), between_ci=busy_probe.VmLoad(Clock())) == {'between': True, 'deedkit_ci': True}
+
+
+# spec: ANYM-684
+def test_a_restarted_probe_starts_busy_and_opens_only_after_the_hold():
+    # launchd restarts the probe in a quiet gap of a running job: it knows nothing of the spike before, so it holds
+    clock = Clock()
+    load = busy_probe.VmLoad(clock)
+    load.hold()
+    host = FakeHost(vm_processes=vm_table(0.4, 0.2))
+    for waited in (0, 5, 60, 115):
+        clock.now = 1000.0 + waited
+        assert observe(host, between_ci=load)['between'] is True
+    clock.now = 1000.0 + 125
+    assert observe(host, between_ci=load)['between'] is False
 
 
 # spec: ANYM-684
