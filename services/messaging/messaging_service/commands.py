@@ -24,6 +24,7 @@ from .outgoing import finish_durably
 MAX_FILE_BYTES = 32 * 1024**2
 LIVE_SEARCH = 'search_messages_live'
 HISTORY = 'request_chat_history'
+INSPECT_BUTTONS = 'inspect_message_buttons'
 # ANYM-475: governor waits, resolution, the provider request and the receipt together.
 LIVE_SEARCH_TIMEOUT = 15
 # Kept free inside LIVE_SEARCH_TIMEOUT for the foreground loop's pacing, so a queued send starts within it.
@@ -113,7 +114,7 @@ def _required_permissions(permission,operation,parameters=None):
 
 def live_read(operation,platform):
     """ANYM-475/477: an agent-requested Telegram read that answers within the live deadline or is refused."""
-    return operation==LIVE_SEARCH or operation==HISTORY and platform=='telegram'
+    return operation==LIVE_SEARCH or operation in (HISTORY,INSPECT_BUTTONS) and platform=='telegram'
 
 
 def _spec(operation,platform=None):
@@ -160,16 +161,18 @@ def _chat(c,p,account,chat_id):
     return row
 
 
-def _message(c,p,account,message_id,expected_revision,chat_id=None,field='expected_revision'):
+def _message(c,p,account,message_id,expected_revision,chat_id=None,field='expected_revision',*,revision_optional=False):
     if not isinstance(message_id,str) or not 1<=len(message_id)<=256:
         raise APIError('not_found',404)
-    if type(expected_revision) is not int or expected_revision<1:
+    # ANYM-681: a live read of the keyboard names no archive revision (0); a given one must still be current.
+    unchecked=revision_optional and expected_revision==0 and type(expected_revision) is int
+    if not unchecked and (type(expected_revision) is not int or expected_revision<1):
         raise _rejected((field,'type' if type(expected_revision) is not int else 'minimum',REVISION))
     row=c.execute('SELECT * FROM messages WHERE id=%s AND account=%s AND NOT deleted',
                   (message_id,account)).fetchone()
     if not row or (chat_id is not None and row['chat']!=chat_id) or not permitted(p,account,row['chat']):
         raise APIError('not_found',404)
-    if row['revision']!=expected_revision:raise APIError('operation_target_changed',409)
+    if not unchecked and row['revision']!=expected_revision:raise APIError('operation_target_changed',409)
     return row
 
 
@@ -256,7 +259,8 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
         chat=_chat(c,p,account,chat_id)
         payload['provider_chat']=chat['provider_chat'];refs.append(chat_id);provider_chats.append(chat['provider_chat'])
         if spec['target']=='message':
-            message=_message(c,p,account,message_id,expected_revision,chat_id)
+            message=_message(c,p,account,message_id,expected_revision,chat_id,
+                             revision_optional=operation==INSPECT_BUTTONS)
             if operation in ('edit_message','delete_message') and message['direction']!='outgoing':
                 raise APIError('forbidden',403)
             payload['provider_message_id']=message['provider_id'];refs.append(message_id)

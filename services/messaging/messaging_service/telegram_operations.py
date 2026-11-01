@@ -22,7 +22,7 @@ import time
 from telethon import errors, functions, types, utils
 
 from .envelope import canonical, stable_id
-from .messenger_operations import HISTORY, LIVE_SEARCH, live_cursor_binding
+from .messenger_operations import HISTORY, INSPECT_BUTTONS, LIVE_SEARCH, live_cursor_binding
 
 log = logging.getLogger('anymsg.live_search')
 history_log = logging.getLogger('anymsg.chat_history')
@@ -33,7 +33,7 @@ MAX_PROFILE_PAGE = 50
 READ_OPERATIONS = frozenset({
     'chat_info', 'list_participants', 'get_reactions', 'get_message_info',
     'list_topics', 'get_profile', 'list_contacts', 'get_contact', 'list_blocked',
-    'get_invite_link', 'check_chat_link', LIVE_SEARCH, HISTORY,
+    'get_invite_link', 'check_chat_link', LIVE_SEARCH, HISTORY, INSPECT_BUTTONS,
 })
 PARAMETERS = {
     'chat_info': set(), 'list_participants': {'limit', 'offset'},
@@ -64,6 +64,7 @@ PARAMETERS = {
     'open_chat_by_username': {'username', 'create'},
     LIVE_SEARCH: {'query', 'chat_types', 'filter', 'from_time', 'to_time', 'limit', 'cursor'},
     HISTORY: {'count', 'before_message', 'around_message', 'from_time', 'to_time'},
+    INSPECT_BUTTONS: set(),
 }
 # ANYM-242: each setter owns one value; the default rights flag it changes, or slow mode.
 GROUP_SETTERS = {'set_group_messages_admins_only': ('messages_admins_only', 'enabled', 'send_messages'),
@@ -494,6 +495,8 @@ async def _execute(client, job, *, verified_self=None, governor=None):
                                      referenced_peers, check_policy)
         if operation == HISTORY:
             return await chat_history(client, job, parameters, governor, rpc, referenced_peers, check_policy)
+        if operation == INSPECT_BUTTONS:
+            return await inspect_message_buttons(client, job, governor, rpc, referenced_peers, check_policy)
 
         account_only = {'list_contacts', 'list_blocked', 'get_contact', 'get_profile',
                         'add_contact', 'delete_contact', 'block_contact', 'unblock_contact',
@@ -1304,6 +1307,77 @@ async def live_search(client, job, parameters, governor, rpc, allowed_provider_i
     counts['returned'] = len(hits)
     finish('done')
     return result
+
+
+async def inspect_message_buttons(client, job, governor, rpc, referenced_peers, check_policy):
+    """ANYM-681: one live read of one message's inline keyboard, with a keyed fingerprint per callback button.
+
+    It does not use exact_message: its reads go through the 'inspect_buttons' scope, so a FloodWait pauses only
+    this read, and the governor refuses (rate_limited) instead of waiting. The callback data stays in local
+    variables of button_inspection: the failure paths below format no exception text."""
+    from .button_inspection import inspect
+    from .commands import CommandRejected
+    from .telegram_governor import ProviderRateLimited
+    chat = number_id(job.get('provider_chat'), marked=True)
+    message_id = number_id(job.get('provider_message_id'))
+    if message_id > 2**31 - 1:
+        reject('invalid_parameters')
+    referenced_peers.add(str(chat))
+    check_policy()
+
+    def limited(seconds):
+        history_log.info('inspect_message_buttons state=rate_limited')
+        raise CommandRejected('rate_limited', retry_after=max(1, int(seconds)))
+
+    if governor is not None:
+        # Entity resolution and the message read: both are counted before any provider call.
+        wait = await governor.admit('inspect_buttons', 2)
+        if wait:
+            limited(wait)
+    # The SDK keeps its own FloodWait memory per RPC constructor, shared with every other get_messages. When one of
+    # THIS read's requests is flood-waited, put back only the entry of that request's constructor (to what it was
+    # before the request), so the governor's scope, not the SDK, decides who is paused; entries that other
+    # SDK work (updates, differences) writes meanwhile are never touched.
+    waits = getattr(client, '_flood_waited_requests', None)
+
+    def owned(call):
+        async def work():
+            before = dict(waits) if isinstance(waits, dict) else None
+            try:
+                return await call()
+            except errors.FloodWaitError as exc:
+                constructor = getattr(getattr(exc, 'request', None), 'CONSTRUCTOR_ID', None)
+                if before is not None and constructor is not None:
+                    if constructor in before:
+                        waits[constructor] = before[constructor]
+                    else:
+                        waits.pop(constructor, None)
+                raise
+        return work
+
+    try:
+        peer = await rpc(owned(lambda: client.get_input_entity(chat)), scope='inspect_buttons')
+        message = await rpc(owned(lambda: client.get_messages(peer, ids=message_id)), scope='inspect_buttons')
+    except ProviderRateLimited as exc:
+        limited(exc.seconds)
+    except (errors.ChannelPrivateError, errors.ChatAdminRequiredError, errors.PeerIdInvalidError,
+            errors.MessageIdInvalidError):
+        raise CommandRejected('not_found') from None
+    except errors.RPCError:
+        raise CommandRejected('operation_rejected') from None
+    except CommandRejected:
+        raise
+    except Exception:
+        # Provider text may carry anything: a fixed code, and no exception context to print.
+        raise CommandRejected('provider_preflight_failed') from None
+    if (message is None or getattr(message, 'id', None) != message_id or
+            str(getattr(message, 'chat_id', None)) != str(chat)):
+        reject('not_found')
+    try:
+        return {'outcome': 'confirmed', **inspect(message, chat, message_id)}
+    except Exception:
+        # The failure may carry callback bytes or the key in its frames: raise a fixed code with no context.
+        raise CommandRejected('provider_preflight_failed') from None
 
 
 async def chat_history(client, job, parameters, governor, rpc, referenced_peers, check_policy):

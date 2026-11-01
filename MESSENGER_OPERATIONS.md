@@ -53,7 +53,7 @@ python -m messaging_service set-messenger-operations --account account-demo --op
 
 | Permission | Reviewed operation family |
 | --- | --- |
-| `read-live` | Live chat/message information, reactions and provider-supported pins |
+| `read-live` | Live chat/message information, reactions, provider-supported pins and a Telegram message's inline keyboard (`inspect_message_buttons`) |
 | `send` | Registered original uploads, forwarding, polls, contact cards, locations and opening a WhatsApp chat by phone number |
 | `message-edit` / `message-delete` | Own outgoing message edit / Telegram global revoke |
 | `message-react` / `message-pin` | Reaction/poll voting / pin and unpin |
@@ -535,6 +535,49 @@ needs `read-live`, the account opt-in and, through the gateway, the
 
 Roll out as for live search: API and collectors, then the gateway, then the
 policy naming the action; roll back in the reverse order.
+
+## Inspecting a message's inline keyboard
+
+`inspect_message_buttons` (ANYM-681) is a live, read-only look at the inline
+keyboard of one Telegram message. It presses, opens and fetches nothing. It needs
+`read-live`, the account opt-in (`set-messenger-operations ... inspect_message_buttons`)
+and, through the gateway, the `inspect_message_buttons` action grant. Target:
+`chat_id` and `message_id`, no `expected_revision`. WhatsApp accounts have no such
+operation.
+
+- Result (`result.data`): `edit_date` (the live `edit_date`, else the send date),
+  `text_sha256` and `rows` of `{row, column, kind, text, url?, fp?}`: at most 100
+  buttons (`truncated: true` when more existed or when links, then trailing buttons,
+  were cut to keep the receipt under its 60 000-byte limit). `kind` is `url`,
+  `callback`, `callback_password`, `web_app`, `login_url`, `switch_inline`, `buy`,
+  `copy`, `game` or `unknown`; `text` is at most 128 characters; `url` appears for
+  `url` and `web_app` buttons only, when it passes the link rule of the stored buttons
+  (ANYM-658). Every button link is untrusted data: do not fetch it.
+- `fp` (callback buttons only) is the first 16 bytes, as 32 hex characters, of
+  HMAC-SHA256(key, m) over the chat ID, message ID, row, column and the callback
+  data, each as a 4-byte big-endian length-prefixed field. The key is 32 random
+  bytes made once per collector process and held in memory only: after a collector
+  restart every `fp` is stale. The press of a callback button (ANYM-676) carries the
+  `fp` of the button it presses and the collector recomputes it from the live
+  message; a bot that changes only the callback bytes behind an unchanged label is
+  caught. A `fp` is useless without the key and gives no press authority by itself.
+  A button that needs the owner's 2FA password is `callback_password` and has no
+  `fp`.
+- The callback data and the key are never in a result, a payload, an audit row, a
+  log line or an exception text, on success and on failure. The receipt is stored
+  in `messenger_commands.result` and reaches backups: labels, kinds, links, the text
+  hash, `edit_date` and the keyed fingerprints.
+- Pacing: its own governor scope, separate from live search and chat history. Per
+  account 3 requests at once, then one per 10 seconds, 300 per UTC day (entity
+  lookup and message read count as two), in memory; over it `rate_limited` with
+  `retry_after` before any provider request. A FloodWait of up to 3600 seconds
+  pauses only this operation on that account (sends and collection go on); a longer
+  one pauses the account, as for search. The read gets the bounded live-read
+  deadline and receipt of the other live reads; a refused or timed-out read is a
+  `failed` receipt that is safe to repeat. A missing message is `not_found`.
+
+Roll out messaging first, then the gateway, then the policy naming the action (an
+older gateway rejects a policy that names it); roll back in the reverse order.
 
 ## Important platform differences
 

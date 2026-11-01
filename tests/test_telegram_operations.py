@@ -1212,3 +1212,339 @@ def test_join_target_changed_refuses_without_join_call(change, code):
     with pytest.raises(Exception, match=code):
         link_run(client, 'join_chat', '+AbCd1234', **({} if change == 'missing' else {'expected_chat': expected}))
     assert client.joins() == []
+
+
+# --- ANYM-681: inspect_message_buttons -----------------------------------------------------------------------
+import hashlib
+import hmac
+import json
+import logging
+import struct
+
+from messaging_service import button_fingerprint
+from messaging_service.commands import CommandRejected, safe_result
+from test_live_search import governed
+
+CALLBACK_SECRET = b'SYNTHETIC-CALLBACK-DATA-9147'
+INSPECT_KEY = bytes(range(32))
+
+
+def inline(*rows):
+    return types.ReplyInlineMarkup(rows=[types.KeyboardInlineButtonRow(buttons=list(row)) for row in rows])
+
+
+def button(text, kind):
+    return types.KeyboardInlineButton(text=text, type=kind)
+
+
+def callback_button(text, data=CALLBACK_SECRET, **kw):
+    return button(text, types.InlineButtonTypeCallback(data=data, **kw))
+
+
+def inspect(client, governor=None):
+    return asyncio.run(execute(client, job('inspect_message_buttons'), governor=governor))
+
+
+def keyed(monkeypatch, key=INSPECT_KEY):
+    monkeypatch.setattr(button_fingerprint, '_KEY', key)
+
+
+# spec: ANYM-681
+def test_the_fingerprint_is_a_truncated_hmac_of_length_prefixed_fields(monkeypatch):
+    fields = [b'-1001', b'23', b'0', b'1', b'payload']
+    expected = hmac.new(INSPECT_KEY, b''.join(struct.pack('>I', len(f)) + f for f in fields),
+                        hashlib.sha256).digest()[:16].hex()
+    assert button_fingerprint.fingerprint(-1001, 23, 0, 1, b'payload', key=INSPECT_KEY) == expected
+    assert len(expected) == 32 and expected == expected.lower()
+    keyed(monkeypatch)
+    assert button_fingerprint.fingerprint(-1001, 23, 0, 1, b'payload') == expected
+
+
+# spec: ANYM-681
+def test_every_fingerprint_field_changes_the_fingerprint_independently():
+    base = (-1001, 23, 0, 1, b'payload')
+    seen = {button_fingerprint.fingerprint(*base, key=INSPECT_KEY)}
+    for index, other in enumerate((-1002, 24, 1, 2, b'payloaD')):
+        changed = list(base)
+        changed[index] = other
+        seen.add(button_fingerprint.fingerprint(*changed, key=INSPECT_KEY))
+    assert len(seen) == 6
+    # Length prefixes make the encoding unambiguous: moving a byte between fields cannot collide.
+    assert (button_fingerprint.fingerprint(1, 23, 0, 1, b'2payload', key=INSPECT_KEY)
+            != button_fingerprint.fingerprint(12, 3, 0, 1, b'payload', key=INSPECT_KEY))
+
+
+# spec: ANYM-681
+def test_the_process_key_is_random_32_bytes_made_once(monkeypatch):
+    monkeypatch.setattr(button_fingerprint, '_KEY', None)
+    first = button_fingerprint.process_key()
+    assert len(first) == 32 and button_fingerprint.process_key() is first
+    monkeypatch.setattr(button_fingerprint, '_KEY', None)
+    assert button_fingerprint.process_key() != first
+
+
+# spec: ANYM-681
+def test_inspection_lists_kinds_links_and_fingerprints_for_callback_buttons_only(monkeypatch):
+    keyed(monkeypatch)
+    client = Client()
+    client.message.edit_date = datetime(2026, 10, 14, 1, 2, 3, tzinfo=timezone.utc)
+    client.message.reply_markup = inline(
+        [callback_button('Pay'), callback_button('Locked', b'x', requires_password=True)],
+        [button('Site', types.InlineButtonTypeUrl(url='https://example.invalid/a')),
+         button('App', types.InlineButtonTypeWebView(url='https://example.invalid/app')),
+         button('Login', types.InlineButtonTypeUrlAuth(url='https://example.invalid/auth', button_id=3)),
+         button('Share', types.InlineButtonTypeSwitchInline(query='SYNTHETIC-INLINE-QUERY')),
+         button('Bad', types.InlineButtonTypeUrl(url='javascript:alert(1)'))])
+    result = run(client, 'inspect_message_buttons')
+    data = result['data']
+    assert result['outcome'] == 'confirmed' and data['edit_date'] == '2026-10-14T01:02:03+00:00'
+    assert data['text_sha256'] == hashlib.sha256(b'hello').hexdigest()
+    pay = button_fingerprint.fingerprint(100, 23, 0, 0, CALLBACK_SECRET, key=INSPECT_KEY)
+    assert data['rows'] == [
+        [{'row': 0, 'column': 0, 'kind': 'callback', 'text': 'Pay', 'fp': pay},
+         {'row': 0, 'column': 1, 'kind': 'callback_password', 'text': 'Locked'}],
+        [{'row': 1, 'column': 0, 'kind': 'url', 'text': 'Site', 'url': 'https://example.invalid/a'},
+         {'row': 1, 'column': 1, 'kind': 'web_app', 'text': 'App', 'url': 'https://example.invalid/app'},
+         {'row': 1, 'column': 2, 'kind': 'login_url', 'text': 'Login'},
+         {'row': 1, 'column': 3, 'kind': 'switch_inline', 'text': 'Share'},
+         {'row': 1, 'column': 4, 'kind': 'url', 'text': 'Bad'}]]
+    assert client.calls[-1][0] == 'get_messages' and not any(
+        isinstance(call, functions.messages.GetBotCallbackAnswerRequest) for call in client.calls)
+
+
+# spec: ANYM-681
+def test_fingerprints_differ_only_when_callback_bytes_or_the_process_key_change(monkeypatch):
+    def fingerprints(data, key=INSPECT_KEY):
+        keyed(monkeypatch, key)
+        client = Client()
+        client.message.reply_markup = inline([callback_button('Pay', data)])
+        return run(client, 'inspect_message_buttons')['data']['rows'][0][0]['fp']
+    one = fingerprints(b'aaaa')
+    # Same label, layout, text and second; only the callback bytes behind the button change.
+    assert fingerprints(b'aaaa') == one and fingerprints(b'aaab') != one
+    # Two collector processes hold two keys: a fingerprint from one is stale in the other.
+    assert fingerprints(b'aaaa', bytes(reversed(range(32)))) != one
+
+
+# spec: ANYM-681
+def test_a_message_without_a_keyboard_has_no_rows_and_a_wrong_message_is_not_found(monkeypatch):
+    keyed(monkeypatch)
+    client = Client()
+    assert run(client, 'inspect_message_buttons')['data']['rows'] == []
+    other = Client()
+    other.message.id = 24
+    with pytest.raises(Exception, match='not_found'):
+        run(other, 'inspect_message_buttons')
+    elsewhere = Client()
+    elsewhere.message.chat_id = 101
+    with pytest.raises(Exception, match='not_found'):
+        run(elsewhere, 'inspect_message_buttons')
+
+
+# spec: ANYM-681
+def test_the_result_is_capped_at_100_buttons_and_fits_the_receipt_limit(monkeypatch):
+    keyed(monkeypatch)
+    many = Client()
+    many.message.reply_markup = inline(*[[callback_button('b%d' % (10 * r + c), b'd%d' % c) for c in range(10)]
+                                         for r in range(15)])
+    data = run(many, 'inspect_message_buttons')['data']
+    assert sum(len(row) for row in data['rows']) == 100 and data['truncated'] is True
+    heavy = Client()
+    link = 'https://example.invalid/' + 'a' * 2000
+    heavy.message.reply_markup = inline(*[[button('B' * 128, types.InlineButtonTypeUrl(url=link))] for _ in range(100)])
+    result = run(heavy, 'inspect_message_buttons')
+    shown = result['data']
+    assert shown['truncated'] is True and sum(len(row) for row in shown['rows']) > 0
+    assert len(json.dumps(safe_result(result))) < 60000
+    assert safe_result(run(many, 'inspect_message_buttons'))
+
+
+# spec: ANYM-681
+def test_the_callback_data_and_the_key_appear_nowhere_on_success_or_failure(monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    keyed(monkeypatch)
+    secrets_seen = (CALLBACK_SECRET.decode(), CALLBACK_SECRET.hex(), INSPECT_KEY.hex(), repr(INSPECT_KEY))
+    client = Client()
+    client.message.reply_markup = inline([callback_button('Pay')])
+    result = run(client, 'inspect_message_buttons')
+    text = json.dumps(result) + repr(result) + caplog.text
+    assert not any(secret in text for secret in secrets_seen)
+
+    # A failure while fingerprinting or reading formats no exception text at all.
+    def boom(*args, **kwargs):
+        raise RuntimeError('exploded ' + CALLBACK_SECRET.decode() + INSPECT_KEY.hex())
+    monkeypatch.setattr('messaging_service.button_inspection.fingerprint', boom)
+    with pytest.raises(CommandRejected) as refused:
+        run(client, 'inspect_message_buttons')
+    assert refused.value.args == ('provider_preflight_failed',)
+    assert not any(secret in repr(refused.value) + caplog.text for secret in secrets_seen)
+
+    class Exploding(Client):
+        async def get_messages(self, peer, *, ids):
+            raise RuntimeError('provider said ' + CALLBACK_SECRET.decode())
+    with pytest.raises(CommandRejected) as refused:
+        run(Exploding(), 'inspect_message_buttons')
+    assert refused.value.args == ('provider_preflight_failed',) and CALLBACK_SECRET.decode() not in caplog.text
+
+
+# spec: ANYM-681
+@pytest.mark.parametrize('error,code', [
+    (errors.ChannelPrivateError(None), 'not_found'), (errors.MessageIdInvalidError(None), 'not_found'),
+    (errors.RPCError(None, 'SYNTHETIC_ERROR', 400), 'operation_rejected')])
+def test_a_provider_refusal_maps_to_a_safe_code(error, code):
+    class Refusing(Client):
+        async def get_messages(self, peer, *, ids):
+            raise error
+    with pytest.raises(CommandRejected) as refused:
+        run(Refusing(), 'inspect_message_buttons')
+    assert refused.value.args == (code,)
+
+
+# spec: ANYM-681
+def test_the_inspection_is_governed_in_its_own_scope(monkeypatch):
+    from messaging_service.telegram_governor import LIVE_BUDGETS
+    keyed(monkeypatch)
+    assert LIVE_BUDGETS['inspect_buttons'] == (3, 10.0, 300)
+    clock, state, governor = governed()
+    client = Client()
+    client.message.reply_markup = inline([callback_button('Pay')])
+    inspect(client, governor)  # entity resolution and the message read: two provider requests
+    before = len(client.calls)
+    with pytest.raises(CommandRejected) as refused:
+        inspect(client, governor)
+    assert refused.value.args == ('rate_limited',) and 1 <= refused.value.retry_after <= 10
+    assert len(client.calls) == before
+    clock.advance(10)
+    inspect(client, governor)
+    assert len(client.calls) > before
+
+
+# spec: ANYM-681
+# spec: ANYM-681
+def test_an_inspection_flood_wait_clears_only_its_own_sdk_entry_through_the_real_call(monkeypatch):
+    """Telethon's own _call remembers a FloodWait per RPC constructor, shared with every other get_messages and with
+    its update loop; the inspection puts back only the entry of the request that was flood-waited."""
+    from telethon import TelegramClient
+    from telethon.sessions import MemorySession
+    keyed(monkeypatch)
+    clock, state, governor = governed()
+    unrelated = functions.updates.GetDifferenceRequest.CONSTRUCTOR_ID
+    earlier = functions.messages.SendMessageRequest.CONSTRUCTOR_ID
+    sent = []
+
+    class Sender:
+        flood = True
+
+        def __init__(self, owner):
+            self.owner = owner
+
+        def send(self, request, ordered=False):
+            sent.append(type(request).__name__)
+            future = asyncio.get_running_loop().create_future()
+            if self.flood:
+                # The SDK's update loop records its own wait while the inspection's request is in flight.
+                self.owner._flood_waited_requests[unrelated] = time.time() + 600
+                future.set_exception(errors.FloodWaitError(request=request, capture=300))
+            else:
+                future.set_result(types.messages.Messages(messages=[], topics=[], chats=[], users=[]))
+            return future
+
+    class Real(TelegramClient):
+        async def get_input_entity(self, peer):
+            return types.InputPeerUser(peer, 1) if isinstance(peer, int) else peer
+
+    client = Real(MemorySession(), 1, 'a' * 32, flood_sleep_threshold=0, request_retries=0)
+    client._sender = Sender(client)
+    client._flood_waited_requests[earlier] = time.time() + 900  # an older, unrelated wait
+    kept_earlier = client._flood_waited_requests[earlier]
+    with pytest.raises(CommandRejected) as flooded:
+        asyncio.run(execute(client, job('inspect_message_buttons'), governor=governor))
+    assert flooded.value.retry_after == 300 and state.deferred == []
+    waits = client._flood_waited_requests
+    assert functions.messages.GetMessagesRequest.CONSTRUCTOR_ID not in waits  # this read's own entry is gone
+    assert unrelated in waits and waits[earlier] == kept_earlier  # nothing else was touched
+    # The next get_message_info-style read reaches the provider instead of meeting a cached SDK wait.
+    client._sender.flood = False
+    asyncio.run(client.get_messages(types.InputPeerUser(100, 1), ids=23))
+    assert sent.count('GetMessagesRequest') == 2
+
+
+# spec: ANYM-681
+def test_a_keyboard_over_100_rows_or_100_columns_is_marked_truncated(monkeypatch):
+    keyed(monkeypatch)
+    rows = Client()
+    rows.message.reply_markup = inline(*[[callback_button('R%d' % n, b'd%d' % n)] for n in range(101)])
+    data = run(rows, 'inspect_message_buttons')['data']
+    assert len(data['rows']) == 100 and data['truncated'] is True
+    wide = Client()
+    wide.message.reply_markup = inline([callback_button('C%d' % n, b'd%d' % n) for n in range(101)])
+    data = run(wide, 'inspect_message_buttons')['data']
+    assert sum(len(row) for row in data['rows']) == 100 and data['truncated'] is True
+    exact = Client()
+    exact.message.reply_markup = inline(*[[callback_button('R%d' % n, b'd%d' % n)] for n in range(100)])
+    assert 'truncated' not in run(exact, 'inspect_message_buttons')['data']
+
+
+# spec: ANYM-681
+def test_a_failed_inspection_prints_no_secret_in_its_exception_chain(monkeypatch):
+    import traceback
+    keyed(monkeypatch)
+    client = Client()
+    client.message.reply_markup = inline([callback_button('Pay')])
+
+    def boom(*args, **kwargs):
+        raise RuntimeError('exploded ' + CALLBACK_SECRET.decode() + INSPECT_KEY.hex())
+    monkeypatch.setattr('messaging_service.button_inspection.fingerprint', boom)
+    with pytest.raises(CommandRejected) as refused:
+        run(client, 'inspect_message_buttons')
+
+    class Exploding(Client):
+        async def get_messages(self, peer, *, ids):
+            raise RuntimeError('provider said ' + CALLBACK_SECRET.decode() + INSPECT_KEY.hex())
+    with pytest.raises(CommandRejected) as read:
+        run(Exploding(), 'inspect_message_buttons')
+
+    class Refusing(Client):
+        async def get_messages(self, peer, *, ids):
+            raise errors.RPCError(None, 'SYNTHETIC_' + CALLBACK_SECRET.decode(), 400)
+    with pytest.raises(CommandRejected) as mapped:
+        run(Refusing(), 'inspect_message_buttons')
+    assert mapped.value.args == ('operation_rejected',)
+    for error in (refused.value, read.value, mapped.value):
+        chain = ''.join(traceback.format_exception(error))
+        assert CALLBACK_SECRET.decode() not in chain and INSPECT_KEY.hex() not in chain
+
+
+# spec: ANYM-681
+def test_a_scoped_flood_wait_pauses_only_the_inspection_and_a_long_one_the_account(monkeypatch):
+    keyed(monkeypatch)
+    clock, state, governor = governed()
+
+    class Flooding(Client):
+        async def get_messages(self, peer, *, ids):
+            raise errors.FloodWaitError(None, capture=300)
+    with pytest.raises(CommandRejected) as flooded:
+        inspect(Flooding(), governor)
+    assert flooded.value.retry_after == 300 and state.deferred == []
+    calls = []
+
+    async def other(name):
+        async def work():
+            calls.append(name)
+        await governor.call(work, name)
+    asyncio.run(other('provider_send'))
+    asyncio.run(other('telegram_history'))
+    assert calls == ['provider_send', 'telegram_history']  # sends and collection proceed
+    paused = Client()
+    with pytest.raises(CommandRejected) as refused:
+        inspect(paused, governor)
+    assert refused.value.retry_after >= 290 and paused.calls == []  # only inspection is refused
+    # A FloodWait longer than the scoped maximum pauses the account, as search does.
+    clock2, state2, governor2 = governed()
+
+    class Long(Client):
+        async def get_messages(self, peer, *, ids):
+            raise errors.FloodWaitError(None, capture=7200)
+    with pytest.raises(CommandRejected):
+        inspect(Long(), governor2)
+    assert state2.deferred == [7200]
