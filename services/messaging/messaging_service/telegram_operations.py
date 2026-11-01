@@ -763,6 +763,10 @@ async def _execute(client, job, *, verified_self=None, governor=None):
                 return accepted(candidate, message=True, chat=chat)
         return accepted(value)
 
+    def join_refused():
+        nonlocal started_mutation
+        started_mutation = False  # A definite refusal: the provider joined nothing.
+
     try:
         # Validate every parameter before the first provider read/mutation.
         text_keys = {'caption': (1024, True), 'question': (300, False),
@@ -946,7 +950,7 @@ async def _execute(client, job, *, verified_self=None, governor=None):
             except errors.InviteRequestSentError:
                 return {'outcome': 'confirmed', 'state': 'pending_approval', 'basis': 'provider_join_request_sent'}
             except tuple(kind for kind, _ in JOIN_CHAT_REFUSALS) as error:
-                started_mutation = False  # A definite refusal: the provider joined nothing.
+                join_refused()
                 reject(next(code for kind, code in JOIN_CHAT_REFUSALS if isinstance(error, kind)))
             joined = [c for c in getattr(response, 'chats', [])[:100] if isinstance(c, (types.Chat, types.Channel)) and
                       (target is None or utils.get_peer_id(c) == utils.get_peer_id(target))]
