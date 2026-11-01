@@ -569,11 +569,13 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
    ботлнек у нас эти бек апы». A low or medium release ("Migration risk tiers" below) has no backup
    gate and no pre-migration copy: no fresh backup, no restore proof, no wait for a proof, no hold, no
    backup-age check and no `copy-database`; the latest verified daily backup is its restore point. This
-   holds for messaging and calendar, by hand or unattended. A database with no scheduled daily backup
-   running (calendar while its timer is off, ANYM-607) keeps a restore point anyway: unattended, its
-   pre-migration copy (Database copies); by hand, `copy-database` first. A dangerous release needs the
-   backup gate above (a fresh backup and its restore proof, never a reused daily backup) and
-   `copy-database` first. The release kit records each file's class and tier.
+   holds for messaging and calendar; a low release by hand or unattended, a medium one by hand. A
+   database with no scheduled daily backup running (calendar while its timer is off, ANYM-607) keeps a
+   restore point anyway (the orchestrator's reading of 11-01: a restore point must exist): unattended,
+   its pre-migration copy (Database copies); by hand, `copy-database` first. A dangerous release needs
+   the backup gate above (a fresh backup and its restore proof, never a reused daily backup) and
+   `copy-database` first. The release kit (the PR's release note and, once ANYM-680 ships, the pause's
+   per-file lines in `deploy.json`) records each file's class and tier.
 
    Accepted risk (owner 10-29 and 11-01, quoted above): if a low or medium `migrate` destroys or corrupts data, a
    restore returns the database to the latest daily backup (about 24 hours old at most while the
@@ -582,27 +584,38 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
 
 ### Migration risk tiers
 
-Owner 11-01 (item 3 above). A release takes the tier of its most dangerous pending migration file,
-changed role file or step. In doubt, or when a statement is not named below: dangerous.
+Owner 11-01 (item 3 above) named the tiers, not the forms; the lists below are the orchestrator's
+reading of 11-01 (brief), tightened by review. A release takes the tier of its most dangerous pending
+migration file, changed role file or step. In doubt, or when a statement is not named below: dangerous.
 
 - Dangerous (backup gate and `copy-database` first): DROP of any kind except the old constraint of a
-  CHECK widening pair; TRUNCATE; DELETE, UPDATE or MERGE of existing rows; RENAME; a narrowing ALTER
-  (a column type change, SET NOT NULL on existing data, a new constraint or unique index that can
-  reject existing rows); any other rewrite of existing data; a data-deleting step (item 2); a REVOKE
-  or role/login change; a top-level SELECT, CALL, DO or COPY other than the classifiers' known
-  preconditions.
-- Medium (no fresh backup, no copy): non-unique indexes, also on existing tables (CONCURRENTLY, or plain under a
-  `SET LOCAL lock_timeout`); CREATE OR REPLACE FUNCTION; triggers; the CHECK widening pair; grants on
-  existing objects (role SQL keeps its Astra r1).
-- Low (no fresh backup, no copy): what the candidate's `unattended_class` calls `expand` and
-  `role_class` calls `additive` (new tables, their indexes and grants, nullable or constant-default
-  columns, comments; M1, "Unattended migrations" below).
+  proven CHECK widening pair (below), DROP NOT NULL and DROP DEFAULT; TRUNCATE; DELETE, UPDATE or
+  MERGE of existing rows; RENAME; a narrowing ALTER (a column type change, SET NOT NULL on existing
+  data, a new constraint, `NOT VALID` included, or unique index that can reject existing rows); any
+  other rewrite of existing data; a data-deleting step (item 2); a top-level SELECT, CALL, DO or COPY
+  other than the `DO` precondition the classifiers accept (`precondition()` in each
+  `migration_rollout.py`); code that runs inside the migration's own transaction: a new or replaced
+  trigger or trigger function on a table the release or its runner writes (`archive_migrations`,
+  `probe_metadata`, `fcs.migrations` included), an event trigger (new or already present), an
+  expression or partial index that calls a function that is not built in; replacing a function that an
+  existing index, constraint, generated column or default uses.
+- Medium (no fresh backup, no copy; a hand release with its Astra-reviewed plan): non-unique indexes,
+  also on existing tables (CONCURRENTLY, or plain under a `SET LOCAL lock_timeout`); CREATE OR REPLACE
+  FUNCTION and row triggers that the release itself does not fire (above); a CHECK widening pair proven
+  a superset of the old constraint on the same column against the live catalog (by hand: in the plan
+  review); DROP NOT NULL, SET or DROP DEFAULT; grants on existing objects, a REVOKE or a role change
+  (role SQL keeps its Astra r1, read-back and undo).
+- Low (no fresh backup, no copy; by hand or unattended): what the candidate's `unattended_class` calls
+  `expand` and `role_class` calls `additive` (new tables, their indexes and grants, nullable or
+  constant-default columns, comments; M1, "Unattended migrations" below).
 
 The tier decides the backup and the copy only; which release runs it does not change: only low files
-run unattended, medium and dangerous ones are hand releases under their procedures, and every
-other gate (role SQL review, active-call check, the release order) stays. Until ANYM-675 ships, the
-author names each `manual` file's tier in its PR and release kit (reviewed with it), and the deployer
-still copies before every unattended range because its rehearsal runs on the copy.
+run unattended, medium and dangerous ones are hand releases under their procedures, and every other
+gate stays (the production plan's Astra r1, reviews.md Rounds 7, and its undo; role SQL review; the
+active-call check; the release order). Until ANYM-680 ships, the author names each `manual` file's tier
+in its PR and release note, and the PR review and the plan's Astra r1 check it against the file; until
+ANYM-675 ships, the deployer still copies before every unattended range because its rehearsal runs on
+the copy.
 
 ### Database copies
 
@@ -673,9 +686,7 @@ Undo: none needed; a copy changes no database. To remove a copy at once: `rm -r
 
 ### Unattended migrations
 
-ANYM-449, owner 2026-10-28: «Да, добавление миграции автоматически с копией.» (For low and medium
-migrations owner 11-01 dropped the copy as a restore point, "Migration risk tiers"; the copy below stays
-as the rehearsal's scratch database until ANYM-675.) `deploy` applies a messaging
+ANYM-449, owner 2026-10-28: «Да, добавление миграции автоматически с копией.» `deploy` applies a messaging
 range itself only when every step below passes; anything else pauses with today's text and you migrate by
 hand (above). Nothing is retried, a migration is never reversed and nothing is restored automatically (a
 restore is the gated restore procedure, from the copy or the backup).

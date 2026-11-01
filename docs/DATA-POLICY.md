@@ -26,15 +26,17 @@ file, owner 11-01).
   cold archive «yes»; owner 10-18 BL-33 disk vs retention «давай оставим как есть если так работает»).
   Backup copies age out by the backup rotation (BACKUP.md). Messages and other kinds: proposal (no
   owner decision on a limit).
-- Message content: everything that arrives in a message (its text, the labels and links of its inline and
-  reply buttons, its link previews) is stored and deleted under the message-text rules of this file
-  (retention above, deletion below; owner 11-01 «4 да»).
+- Bot buttons: the labels, kinds, URLs, Mini App links and callback data of a message's inline and
+  reply buttons are stored and deleted with the message text (retention above, deletion below; owner
+  11-01 «4 да» to the bot-buttons question, with «надо сделать чтоб он бот мог делать действия которые
+  я прошу в miniapp»). Decided, not yet built: today only the message text is captured. Link previews,
+  polls, invoices, contact cards and other message parts this file does not name: proposal.
 - Pre-migration database copies and backups (ANYM-588, docs/operations/production.md "Migration risk
   tiers" and "Database copies"): only a dangerous migration gets a fresh verified backup and a
   pre-migration copy; a low or medium one gets neither, and the latest verified daily backup is its
   restore point (owner 11-01, quoted in Status, replacing owner 10-28 «добавление миграции
   автоматически с копией» for low and medium ones). A database with no daily backup running keeps its
-  copy. Until ANYM-675 ships, the deployer still copies before every unattended migration (its rehearsal
+  copy (the orchestrator's reading of 11-01: a restore point must exist). Until ANYM-675 ships, the deployer still copies before every unattended migration (its rehearsal
   runs on the copy). The copy is plaintext, root-only, on the production host's disk, never leaves the host and is
   deleted after 48 h, whatever its state (the orchestrator's reading of 2026-10-28; a later owner line may
   tighten it). Its receipts hold table names, row counts, sizes, hashes, times and failure codes only.
@@ -47,7 +49,7 @@ file, owner 11-01).
   Closing that gap is open implementation and configuration work (story 516). Gates: a DELETE statement
   the running service executes on rows this line or a ready card names is ordinary, PR-listed code
   (harness reviews.md, `Deletes:`); any other deletion (TRUNCATE, DROP, a script, data fix, deploy hook or
-  other automation, a migration, a restore) needs an Astra-reviewed plan, a fresh verified backup and an
+  other automation, a deleting migration, a restore) needs an Astra-reviewed plan, a fresh verified backup and an
   undo (process.md section 2).
 - Visibility: the owner; agents through scoped API keys and gateway profiles, and production read-only
   over SSH (AGENTS.md section 1); explicit attachment download below `history_since` only on an explicit
@@ -84,7 +86,9 @@ file, owner 11-01).
     the autoloop config, a card in the card worker's own words, with no quote, name, phone number or message
     content, goes to Tiden and GitHub (owner 10-26, ANYM-568; SUBSCRIPTIONS.md:345-353).
   - Media understanding (photos, audio, files): local models on the owner's Mac mini; media and their
-    extracted text travel to it over the tailnet only and reach no cloud model provider (owner 11-01 «2 b»).
+    extracted text travel to it over the tailnet only (project rule, AGENTS.md section 1) and reach no
+    cloud model provider (owner 11-01 «2 b» on photos; audio and files by «инфру сделал чтоб могли все
+    пользоваться»).
     Decided, not yet built. The cloud enrichment endpoints (ENRICHMENT.md: OpenAI, Anthropic, Gemini;
     Codex not deployed) stay off: enabling one is a `user-data` ask.
   - Tiden error tracking (TELEMETRY.md, off by default): proposal, which fields go where is not yet an
