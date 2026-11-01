@@ -61,7 +61,7 @@ def granted(state, principal, key):
 
 def effective(site, principal):
     """The tools and messenger actions live discovery shows: the policy filter (Policy.visible/actions), then the
-    backend-scope filter of services/gateway/src/agent_gateway/dispatch.py:244-252 fed with each backend's own scopes."""
+    backend-scope filter of Dispatch.discover (services/gateway/src/agent_gateway/dispatch.py) fed with each backend's own scopes."""
     state, snapshot = site.operator.state, Policy(site.config["policy"]).load()
     agent = entry(snapshot, principal)
     key = next(k for k in state["messaging"]["keys"].values() if k["principal"] == principal and not k["revoked"])
