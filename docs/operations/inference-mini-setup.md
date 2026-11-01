@@ -237,9 +237,10 @@ SHA="$(git rev-parse HEAD)"; git merge-base --is-ancestor "$SHA" origin/main && 
 ```
 
 Config: `/Users/_deedkitinf/config.json` (placed in section 5) names `bind` 127.0.0.1, port 8090, the policy, the busy
-file, `work_dir`, `drain_seconds` 900 and an **empty** `aliases` table: the real aliases and their model pins are
-ANYM-683. If the service refuses an empty table, this card stops here with BLOCKED, "waiting for the first ANYM-683
-alias", and the rest of the install waits; nothing else changes.
+file, `work_dir`, `drain_seconds` 900 and an **empty** `aliases` table. Since ANYM-683 an empty table is valid: the service
+then serves the two aliases the package ships (`audio-default`, `vision-default`, pinned in `models.json`). Before
+ANYM-683 (service at `d9f547f6`) an empty table was refused (`config.py` `min_length=1`), so the install stopped at
+the staged release and the unloaded jobs; from `094a8581` on the config needs no change.
 
 Keys: the service refuses to start without a valid policy, so the first principals are issued before the first start,
 as the service user, from the release just unpacked (keygen is stdlib only). The enrichment key's numbers are above
@@ -259,6 +260,84 @@ owned by `_deedkitinf`; `grep -c dki_ policy.json` is `0` (hashes only); `revisi
 **expiry date** and its **rotation due date, 30 days before it**, in the card's History and in a calendar entry of
 the operator. Undo: delete the three files (they are inside the user's home, removed with the home in section 14).
 The `deedkit-inference keygen` subcommand named in the card is `/usr/local/libexec/deedkit-inference-keygen` here (stdlib, root-owned); ANYM-682's CLI may dispatch to it.
+
+### 6b. Models, tools, egress probe and canary (ANYM-683; as run on 11-02)
+
+Every block below starts after the busy check (`ssh "$MINI" '/opt/homebrew/bin/python3.13
+/usr/local/libexec/deedkit-busy-probe --once'`, exit 0 only when idle) and is chained to it with `&&`: a `;` after a busy
+verdict still runs the block (that slip happened once on 11-02, on a Serve write that did no harm). Order: tools,
+pull, verify, egress probe, canary.
+
+Tools: the engines call `ffmpeg` and `ffprobe` by absolute path (`/opt/homebrew/bin`; the service `PATH` is
+`/usr/bin:/bin`). The sandbox profile needs no change for them or for the model store: `(allow default)` leaves reads
+open and denies only the keys and `probe.key`.
+
+```bash
+MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
+ssh "$MINI" 'cd /; for t in ffprobe ffmpeg; do sudo -n -u _deedkitinf /opt/homebrew/bin/$t -version | head -1; done; df -g /Users | tail -1'
+```
+
+Pull (the only command that downloads; about 5.3 GB from `huggingface.co` and its CDN hosts, disk guard 15 GB free).
+It runs as the **admin account**, which owns the store: the release venv lives in the service home, which the admin
+cannot enter, so the admin runs the same release from its own stage copy (base dependencies only, no `engines` group).
+The stage directory is a ledger `stage` entry, removed by section 14:
+
+```bash
+MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
+SHA="$(git rev-parse HEAD)"; git merge-base --is-ancestor "$SHA" origin/main &&
+git archive -o "$TMPDIR/inference-$SHA.tar" "$SHA" services/inference &&
+D="$(ssh "$MINI" 'D=$(mktemp -d /tmp/deedkit-setup.XXXXXX) && echo "stage $D" >> ~/deedkit-inference-setup.created && echo $D')" &&
+case "$D" in /tmp/deedkit-setup.*) ;; *) echo "bad stage"; exit 1 ;; esac &&
+scp -q "$TMPDIR/inference-$SHA.tar" "$MINI:$D/pkg.tar" &&
+ssh "$MINI" "cd $D && tar -x -f pkg.tar && cd services/inference && /opt/homebrew/bin/uv sync --locked --no-dev --python /opt/homebrew/bin/python3.13 && (nohup nice -n 10 .venv/bin/deedkit-inference pull --model-dir /Users/Shared/deedkit-inference/models > $D/pull.log 2>&1 < /dev/null & echo \$! > $D/pull.pid)"
+```
+
+Wait until the pull process is gone (`kill -0 $(cat $D/pull.pid)`), then `tail $D/pull.log`: four `verified <alias>/<phase>`
+lines (11-02: 5.3 GB on disk). An interrupted pull leaves nothing served. Verify, as the service user, which
+also shows that it can read the store and not write it (11-02: `ok` for all four in 3.7 s):
+
+```bash
+MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
+ssh "$MINI" 'cd /; sudo -n -u _deedkitinf /Users/_deedkitinf/current/.venv/bin/deedkit-inference verify; sudo -n -u _deedkitinf touch /Users/Shared/deedkit-inference/models/x 2>&1 | head -1'
+```
+
+Egress probe, **inside the sandbox profile** as the service user (it is the engine child's own view): all four
+attempts must read `refused:PermissionError` and the exit status must be 0. The same command outside the profile is the
+control: it must show `OPEN` for the public targets, or the probe proves nothing (11-02: inside 4 of 4 refused, outside 3 of 4 `OPEN`).
+Any outbound connection inside the profile: stop and report BLOCKED.
+
+```bash
+MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
+ssh "$MINI" 'cd /; P=/Users/_deedkitinf/current/.venv/bin/python
+sudo -n -u _deedkitinf /usr/bin/sandbox-exec -f /usr/local/etc/deedkit-inference/deedkit-inference.sb $P -I -m deedkit_inference.egress_probe; echo "inside exit $?"
+sudo -n -u _deedkitinf $P -I -m deedkit_inference.egress_probe; echo "control exit $?"'
+```
+
+Canary (a client of the running service, so it runs **outside** the sandbox, which hides the key; synthetic data only).
+Generate the set as the admin account (it needs Pillow, macOS `say`, ffmpeg and the system fonts) into the shared
+directory (`generate.py` encodes with `libvorbis`; the mini's ffmpeg 8.1 has `libopus` and no `libvorbis`, so on a
+release that still says `libvorbis` run it from the stage copy with that word replaced by `libopus`: Ogg/Opus is also
+the format of Telegram voice notes):
+
+```bash
+MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
+D="$(ssh "$MINI" 'sed -n "s/^stage //p" ~/deedkit-inference-setup.created | tail -1')"; case "$D" in /tmp/deedkit-setup.*) ;; *) echo "no stage"; exit 1 ;; esac
+ssh "$MINI" "export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin; cd $D/services/inference && uv run --no-project --python /opt/homebrew/bin/python3.13 --with pillow python tests/canary/generate.py /Users/Shared/deedkit-inference/canary-set"
+```
+
+Then run it in a **quiet window**: `busy.json` false for a minute, load below 5 and free plus inactive memory (the
+figure admission uses, `vm_stat` free + inactive) at least 8.3 GB. A canary that meets `busy_deedkit_ci` or
+`memory_low` fails at once with HTTP 503 (that is the design, not a defect of the run), so wait and rerun:
+
+```bash
+MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
+ssh "$MINI" 'cd /; sudo -n -H -u _deedkitinf /Users/_deedkitinf/current/.venv/bin/deedkit-inference canary --key-file /Users/_deedkitinf/keys/messaging-enrichment.key --set /Users/Shared/deedkit-inference/canary-set'
+```
+
+Record from the output: character error per image, word error per note, real-time factor, the long recording's segment
+bounds and the JSON shape; and, from `ps` and `vm_stat` while it runs, the service user's resident size and the free
+plus inactive memory. On 11-02 the vision worker held about 3.8 GB resident and free plus inactive memory read 8.9 to 9.1 GB
+at rest but fell to 7.6 to 7.7 GB when a request ended, under the 7.9 GB a vision phase needs (4.9 + `min_free_gb` 3.0).
 
 ## 7. Start the jobs (busy probe first)
 
@@ -328,11 +407,15 @@ echo serve >> ~/deedkit-inference-setup.created
 ts serve --bg --https=443 http://127.0.0.1:8090
 ts serve status 2>&1 | tail -n +2; ts funnel status 2>&1 | tail -n +2
 N=$(ts status --json 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)[\"Self\"][\"DNSName\"].rstrip(\".\"))"); echo "$N"
-curl -sS --max-time 10 -w "\nhttp %{http_code} verify %{ssl_verify_result}\n" "https://$N/health"'
+echo "read it back from a tailnet client, not from here"'
 ```
 
 Expected: `serve status` lists `https://<mini>.<tailnet>.ts.net (tailnet only)` proxying `http://127.0.0.1:8090`, Funnel
-shows nothing, the request returns the health JSON with `verify 0` (a valid certificate). Then from production's
+shows nothing. The mini cannot reach its own tailnet address (its `utun` loops back: a request from the mini to the
+`.ts.net` name times out, and its system resolver does not know the name), so read the Serve back from another tailnet
+node, here the operator's laptop: `curl -sS -w "\nhttp %{http_code} verify %{ssl_verify_result}\n"
+https://<mini>.<tailnet>.ts.net/health` returns the health JSON with `http 200 verify 0` (a valid certificate; 11-02).
+Then from production's
 host (read-only ssh, a plain GET, no key): `curl -sS --max-time 10 https://<mini>.<tailnet>.ts.net/health` returns the
 same JSON, but only after section 10 lets production reach the mini (before it, a timeout is the expected answer
 under a restricting policy). Undo: `ts serve reset` (same socket) and check `ts serve status` says "No serve config".
