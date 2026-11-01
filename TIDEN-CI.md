@@ -8,8 +8,8 @@ Parameterized Python executions retain their parameter names and status.
 
 Test jobs run in parallel and each uploads a `ci-evidence-<job>` fragment:
 `checks / verify` the seven checks and its module reports, `checks / load` the
-gateway load gate, `checks / services` the gateway, platform-contracts, calls and
-calls-frontend module reports, and each `checks / python (<n>/9)` job its shard of the root
+gateway load gate, `checks / services` the gateway, platform-contracts, calls,
+calls-frontend and inference module reports, and each `checks / python (<n>/9)` job its shard of the root
 Python/PostgreSQL suite. The root suite runs in nine file-level shards
 (`scripts/python_shards.py`): `checks / verify` runs shard 1 and the eight
 `checks / python (<n>/9)` jobs (`python-2` to `python-9`) shards 2-9, each on its
@@ -962,10 +962,10 @@ Tiden through the main push run; otherwise link the migration PR to its intent
 branch and publish real results there before reviewing the merge. After
 merge, verify both main's gate and the GitHub App processing/drift state.
 
-The integrated CI includes gateway, platform-contracts, calendar, calls and
-calls-frontend reports, plus the measured gateway load gate, which runs on a
+The integrated CI includes gateway, platform-contracts, calendar, calls,
+calls-frontend and inference reports, plus the measured gateway load gate, which runs on a
 runner of its own in
-parallel with the suite; the gateway, platform-contracts, calls and calls-frontend
+parallel with the suite; the gateway, platform-contracts, calls, calls-frontend and inference
 suites run together in `checks / services`, also on a runner of their own. Existing messaging check/test identities
 and links remain intact. Module assertions support reviewed contracts in the
 same product; a successful messaging run alone cannot verify another module.

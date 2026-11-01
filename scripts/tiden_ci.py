@@ -30,6 +30,7 @@ MODULE_REPORTS = {
     "calendar": ("calendar.xml", "python", "services/calendar"),
     "calls": ("calls.xml", "python", "services/calls"),
     "calls_frontend": ("calls-frontend.xml", "node", "services/calls/frontend"),
+    "inference": ("inference.xml", "python", "services/inference"),
     "backup_restore": ("backup-restore.xml", "python", ""),
     # Root-suite tests that cannot run in the shards: one as root under sudo, two in the enricher-test image.
     "root_session_lock": ("root-session-lock.xml", "python", ""),
@@ -47,8 +48,8 @@ REQUIRED_EXECUTIONS = {
                                  "tests/test_audio_native.py::test_faster_whisper_decoder_compatibility_without_model[ogg]"}),
 }
 GO_MODULES = tuple(name for name, (_, framework, _) in MODULE_REPORTS.items() if framework == "go")
-# The gateway, its contract package and the calls service run on a runner of their own, in parallel with verify.
-SERVICE_MODULES = ("gateway", "platform_contracts", "calls", "calls_frontend")
+# The gateway, its contract package, the calls service and the inference service run on a runner of their own, in parallel with verify.
+SERVICE_MODULES = ("gateway", "platform_contracts", "calls", "calls_frontend", "inference")
 _VERIFY_MODULES = tuple(name for name in MODULE_REPORTS if name != "load" and name not in GO_MODULES and name not in SERVICE_MODULES)
 # The root Python suite runs in file-level shards (scripts/python_shards.py): verify runs shard 1, each
 # `checks / python` matrix job one of the others, and assembly merges their reports into python.xml.
