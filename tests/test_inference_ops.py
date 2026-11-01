@@ -156,10 +156,11 @@ def test_rendered_files_hold_no_unfilled_placeholder_and_the_log_rotation_names_
 class FakeHost:
     """docker contexts and containers, and the process table, of a fake admin account."""
 
-    def __init__(self, contexts=None, containers=None, processes='', broken=()):
+    def __init__(self, contexts=None, containers=None, processes='', broken=(), vm_processes=''):
         self.contexts = contexts if contexts is not None else {'default': '/var/run/docker.sock'}
         self.containers = containers or {}
         self.processes = processes
+        self.vm_processes = vm_processes  # the `uid pcpu comm` table the probe reads for Between's VMs
         self.broken = set(broken)
         self.calls = []
 
@@ -181,13 +182,17 @@ class FakeHost:
                 raise subprocess.CalledProcessError(1, argv)
             return '\n'.join(self.containers.get(context, []))
         if name == 'ps':
-            return self.processes
+            return self.vm_processes if 'uid=,pcpu=,comm=' in argv else self.processes
         raise AssertionError(f'unexpected command {argv}')
 
 
-def observe(host, *, existing=None, uids=None):
+UIDS = {'_deedkitci': 453, '_betweenci': 451}
+
+
+def observe(host, *, existing=None, uids=None, between_ci=None):
     existing = host.sockets() if existing is None else existing
-    return busy_probe.observe(host, socket_exists=lambda path: path in existing, uid_of=lambda user: (uids or {'_deedkitci': 453})[user])
+    return busy_probe.observe(host, socket_exists=lambda path: path in existing, uid_of=lambda user: (uids or UIDS)[user],
+                              between_ci=between_ci)
 
 
 CI_LINE = '  453 python3 -c import fcntl /Users/_deedkitci/deedkit-ci/.locks/slot1 4242'
@@ -217,6 +222,87 @@ def test_probe_reports_between_and_ci_activity():
     # the test user does not exist on this host: no process can run as it
     host = FakeHost(processes=CI_LINE)
     assert busy_probe.observe(host, socket_exists=lambda path: True, uid_of=lambda user: (_ for _ in ()).throw(KeyError(user)))['deedkit_ci'] is False
+
+
+VM = '/System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/com.apple.Virtualization.VirtualMachine'
+
+
+def vm_table(*cpus, admin=0.0):
+    """`ps -axo uid=,pcpu=,comm=` of the mini as recorded on 11-02: the _betweenci colima/lima helpers (all near 0 %),
+    one Virtualization process per VM with the given %cpu, and the admin account's own colima VM."""
+    rows = ['  451   0.0 /opt/between-ci/bin/colima', '  451   0.4 /opt/between-ci/bin/limactl', '  451   0.0 /bin/bash',
+            '  451   0.0 sleep', '  451   0.0 ssh: /Users/_betweenci/.colima/_lima/colima-betweenci/ssh.sock [mux]']
+    rows += [f'  451 {cpu:5.1f} {VM}' for cpu in cpus]
+    rows += [f'  501 {admin:5.1f} {VM}', '  453 99.0 /usr/bin/python3', '  garbage line', '  451 not-a-number ' + VM]
+    return '\n'.join(rows)
+
+
+class Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+# spec: ANYM-684
+def test_probe_sees_between_ci_that_runs_inside_its_colima_vms():
+    # 11-02: Between's runners ran a full pytest job inside the _betweenci VM (a Virtualization process near 100 %)
+    # while no Docker context of the admin account listed a container, and the file said between: false
+    host = FakeHost(vm_processes=vm_table(0.3, 97.6))
+    assert observe(host, between_ci=busy_probe.VmLoad(Clock())) == {'between': True, 'deedkit_ci': False}
+    # the same VMs idle (recorded 0.2-6.8 %): not busy
+    assert observe(FakeHost(vm_processes=vm_table(0.3, 2.4)), between_ci=busy_probe.VmLoad(Clock()))['between'] is False
+    # the admin account's own VM and other users' Virtualization processes are not Between's
+    assert observe(FakeHost(vm_processes=vm_table(0.3, 1.0, admin=99.0)), between_ci=busy_probe.VmLoad(Clock()))['between'] is False
+    # no _betweenci user on this host: no VM of it can run
+    gone = {'_deedkitci': 453}
+    assert observe(FakeHost(vm_processes=vm_table(99.0)), uids=gone, between_ci=busy_probe.VmLoad(Clock()))['between'] is False
+    # a container in a Docker context is still enough on its own
+    host = FakeHost(containers={'default': ['between-vm-1 x=y']}, vm_processes=vm_table(0.1))
+    assert observe(host, between_ci=busy_probe.VmLoad(Clock()))['between'] is True
+    # no Virtualization process at all (no VM running): idle
+    assert observe(FakeHost(vm_processes='  451 0.0 /opt/between-ci/bin/colima'), between_ci=busy_probe.VmLoad(Clock()))['between'] is False
+
+
+# spec: ANYM-684
+def test_probe_keeps_between_busy_through_the_gaps_of_a_bursty_job():
+    # pytest on the VM spikes and idles within seconds; one quiet sample must not reopen admission
+    clock = Clock()
+    load = busy_probe.VmLoad(clock)
+    host = FakeHost()
+    verdicts = []
+    for cpu, step in [(91.2, 5), (1.2, 5), (0.4, 5), (2.0, 60), (1.0, 50), (1.0, 20), (0.5, 5)]:
+        host.vm_processes = vm_table(cpu, 0.2)
+        verdicts.append((clock.now - 1000.0, observe(host, between_ci=load)['between']))
+        clock.now += step
+    # busy at the spike and for the hold afterwards, free again once a quiet window has also passed
+    assert verdicts[:4] == [(0.0, True), (5.0, True), (10.0, True), (15.0, True)]
+    assert verdicts[4] == (75.0, True) and verdicts[5] == (125.0, True)
+    assert verdicts[6] == (145.0, False)
+    # a sustained moderate load (15 % of a core for a minute) counts as busy; a steady 3 % does not
+    clock = Clock()
+    load = busy_probe.VmLoad(clock)
+    for _ in range(14):
+        assert observe(FakeHost(vm_processes=vm_table(15.0, 0.1)), between_ci=load)['between'] is True
+        clock.now += 5
+    clock = Clock()
+    load = busy_probe.VmLoad(clock)
+    for _ in range(30):
+        assert observe(FakeHost(vm_processes=vm_table(3.0, 0.1)), between_ci=load)['between'] is False
+        clock.now += 5
+
+
+# spec: ANYM-684
+def test_probe_sets_busy_when_the_vm_table_cannot_be_read():
+    # the table of the VMs fails while the docker side answers: fail closed, both flags true
+    class VmBroken(FakeHost):
+        def __call__(self, argv):
+            if Path(argv[0]).name == 'ps' and 'uid=,pcpu=,comm=' in argv:
+                raise subprocess.CalledProcessError(1, argv)
+            return super().__call__(argv)
+
+    assert observe(VmBroken(), between_ci=busy_probe.VmLoad(Clock())) == {'between': True, 'deedkit_ci': True}
 
 
 # spec: ANYM-684
