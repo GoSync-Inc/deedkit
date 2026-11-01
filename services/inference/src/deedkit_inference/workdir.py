@@ -1,5 +1,6 @@
 """The directory under which every request lives: created 0700, swept at start, byte-budgeted."""
 
+import fcntl
 import logging
 import os
 import shutil
@@ -10,6 +11,7 @@ from pathlib import Path
 from .errors import ConfigError
 
 MARKER = ".deedkit-inference-work"
+LOCK = ".deedkit-inference-lock"
 LOG = logging.getLogger("deedkit_inference.workdir")
 
 
@@ -17,6 +19,7 @@ class WorkDir:
     def __init__(self, root, max_bytes):
         self.root, self.max_bytes = Path(root), max_bytes
         self.reserved = 0
+        self._lock = None
 
     def prepare(self):
         """Create the directory, or sweep it. A non-empty directory without our marker is refused, so a
@@ -33,14 +36,31 @@ class WorkDir:
                     raise ConfigError("work_dir_not_empty_and_not_ours")
                 marker.write_text("deedkit-inference work directory\n")
             os.chmod(self.root, 0o700)
+            self._take_lock()
             self.sweep()
         except OSError:
             raise ConfigError("work_dir_unusable") from None
 
+    def _take_lock(self):
+        """One service per work directory for as long as it lives: a second start must never sweep the first
+        one's request directories, so it is refused before it touches a file."""
+        fd = os.open(self.root / LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise ConfigError("work_dir_in_use") from None
+        self._lock = fd
+
+    def close(self):
+        if self._lock is not None:
+            os.close(self._lock)
+            self._lock = None
+
     def sweep(self):
         removed = 0
         for entry in os.scandir(self.root):
-            if entry.name == MARKER:
+            if entry.name in (MARKER, LOCK):
                 continue
             path = Path(entry.path)
             if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):

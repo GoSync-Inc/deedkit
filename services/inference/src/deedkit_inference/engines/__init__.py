@@ -55,6 +55,8 @@ class Engine:
 
     def __init__(self, kind, options):
         self.kind, self.options = kind, options
+        # True for an engine that keeps a warm worker between jobs: it stays in the resident book while idle.
+        self.persistent = bool(options.get("persistent", False))
 
     def precheck(self, path):
         """Raise Rejected for an input that must not reach a model (audio over 4 h, an image over 20 MP)."""

@@ -55,7 +55,7 @@ Not secret, but it must be a regular file that is not writable by group or other
 | `bind`, `port` | `127.0.0.1`, `8090` | loopback IP literal only |
 | `policy_file` | required | absolute path of the key policy (below) |
 | `busy_file` | required | absolute path of `busy.json` (below) |
-| `work_dir` | required | absolute path; per-request directories live here (a `.deedkit-inference-work` marker is created; a non-empty directory without it is refused) |
+| `work_dir` | required | absolute path; per-request directories live here (a `.deedkit-inference-work` marker is created; a non-empty directory without it is refused; the service holds an exclusive lock on `.deedkit-inference-lock` for its lifetime, so a second start on the same directory is refused with `work_dir_in_use` before it removes anything) |
 | `usage_file` | unset | absolute path; the daily job counters survive a restart when set (metadata only) |
 | `release` | `unknown` | the git SHA the service runs; shown by `/v1/models` (env `DEEDKIT_INFERENCE_RELEASE` also works) |
 | `queue_size` | 16 | jobs waiting for a slot |
@@ -64,7 +64,8 @@ Not secret, but it must be a regular file that is not writable by group or other
 | `resident_cap_gb`, `resident_hard_cap_gb` | 6.0, 7.5 | admission cap and supervisor kill line |
 | `min_free_gb` | 3.0 | headroom above a phase's `resident_gb` (the remote-test `MIN_FREE_MEM_GB`) |
 | `max_load_1m`, `slot_max_load_1m` | 8, `{}` | 1-minute load cap; per-slot override, e.g. `{"gpu": 6}` |
-| `keep_alive_seconds` | 300 | an idle loaded engine is unloaded after this |
+| `keep_alive_seconds` | 300 | an idle loaded engine is unloaded after this (only an engine with `"engine_options": {"persistent": true}` stays loaded when idle; any other engine's child exits with its phase and leaves the resident book at once) |
+| `alloc_settle_seconds` | 10 | a cold start's `resident_gb` is held back from the free memory the next phase sees for this long, so two phases cannot spend the same headroom; a phase that has to wait for it waits in the queue |
 | `max_inflight_upload_bytes` | 134217728 | pool of declared `Content-Length` of uploads in flight |
 | `upload_seconds` | 120 | a body must arrive within this |
 | `work_dir_max_bytes` | 536870912 | bytes reserved under `work_dir` |
@@ -112,7 +113,7 @@ key), `scope_denied` (403), `unknown_model` (404), `payload_too_large` (413), `l
 `upload_timeout` (408), `invalid_request` (422), `audio_too_long` / `image_too_large` (422, the precheck),
 `deadline_too_short` (422), `quota_exceeded` / `concurrency_exceeded` (429, `Retry-After`), `queue_full`,
 `slot_busy`, `upload_capacity`, `admission_closed`, `draining` (all 503 with `Retry-After`),
-`engine_failed` (502), `engine_timeout` (504), `internal_error` (500). A 503 from this service always has
+`engine_failed` (502), `engine_timeout` (504), `internal_error` (500), `client_disconnected` (499, logged; the client is gone and never sees it). A 503 from this service always has
 one of those codes; a client treats `queue_full`, `slot_busy`, `upload_capacity`, `admission_closed` and
 `draining` (and connect errors, and 502/503/504 with another body) as backpressure. `admission_closed`
 adds the response header `X-Admission-Reason`.
@@ -185,13 +186,14 @@ The service only reads the file, never writes it.
 
 ## Queue and deadlines
 
-- At most `queue_size` jobs wait; a full queue is `503 queue_full`.
+- At most `queue_size` jobs wait; a full queue is `503 queue_full`. A job is queued, and a free slot granted, in one step, so a burst cannot exceed the bound; a job that must wait for resident room counts too.
 - Two slots: `gpu` and `cpu`, one job each, arrival order. A job whose estimated wait exceeds
   `max_wait_seconds` is refused at once (`slot_busy`), so a client never waits past its own deadline.
-- With `X-Request-Deadline-Seconds`, a job whose wait plus own estimate exceeds the deadline is refused at
+- The deadline clock starts when the request arrives (upload time counts). With `X-Request-Deadline-Seconds`, a job whose wait plus own estimate exceeds the deadline is refused at
   once (`slot_busy`; `deadline_too_short` 422 when the job's own estimate alone exceeds it), and a queued
   job that waited past `min(max_wait_seconds, deadline - estimate)` leaves the queue with `slot_busy`
-  before it starts.
+  before it starts; the same bound is checked before every slot grant, also for a later phase, so a job whose
+  budget is over never gets a slot.
 
 ## Uploads and temp files
 

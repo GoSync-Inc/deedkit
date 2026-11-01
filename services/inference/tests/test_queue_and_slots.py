@@ -1,3 +1,5 @@
+import asyncio
+import json
 import time
 
 import pytest
@@ -178,3 +180,53 @@ def test_defaults_match_the_card(env):
     assert default.work_dir_max_bytes == 512 * 1024**2 and default.drain_seconds == 900
     assert default.audio_body_max_bytes == 32 * 1024**2 and default.chat_body_max_bytes == 44 * 1024**2
     assert default.port == 8090 and default.bind == "127.0.0.1"
+
+
+# spec: ANYM-682
+async def test_a_burst_never_puts_more_jobs_in_the_queue_than_its_bound(env):
+    async with env.running(queue_size=1) as s:
+        running = s.spawn(s.chat(slow("running", 0.6)))
+        await s.until(lambda: s.service.scheduler.active() == 1)
+        burst = await asyncio.gather(*[s.chat(slow(f"b{i}", 0.05)) for i in range(4)])
+        statuses = sorted(r.status for r in burst)
+        assert statuses == [200, 503, 503, 503], statuses  # one waits, the rest are refused at once
+        assert {r.code for r in burst if r.status == 503} == {"queue_full"}
+        assert s.service.scheduler.depth() <= 1
+        assert (await running).status == 200
+
+
+# spec: ANYM-682
+async def test_a_job_that_must_wait_for_resident_room_counts_against_the_queue(env):
+    tight = {"resident_cap_gb": 4.0, "aliases": {
+        "vision-default": {"phases": [{"name": "vlm", "slot": "gpu", "resident_gb": 2.5}]},
+        "audio-default": {"phases": [{"name": "stt", "slot": "cpu", "resident_gb": 2.0}]}}}
+    async with env.running(queue_size=1, **tight) as s:
+        running = s.spawn(s.chat(slow("vision", 0.8)))
+        await s.until(lambda: s.service.scheduler.active() == 1)
+        first = await s.submit(s.transcribe(audio("first")))  # the cpu slot is idle, resident room is not
+        assert s.service.scheduler.depth() == 1
+        second = await s.transcribe(audio("second"))
+        assert second.status == 503 and second.code == "queue_full"
+        assert (await first).status == 200 and (await running).status == 200
+
+
+# spec: ANYM-682
+async def test_the_deadline_clock_starts_when_the_request_arrives(env):
+    async with env.running() as s:
+        # An upload that takes 0.4 s of a 0.5 s deadline leaves less than the 0.3 s job needs.
+        body = json.dumps(chat_body(image=fk(label="late", estimate=0.3))).encode()
+        half = len(body) // 2
+        reply = await s.request("POST", "/v1/chat/completions", chunks=[(0.2, body[:half]), (0.2, body[half:])],
+                                content_length=len(body),
+                                headers={"content-type": "application/json", "X-Request-Deadline-Seconds": "0.5"})
+        assert reply.status == 422 and reply.code == "deadline_too_short"
+        assert started() == []
+        # A job whose first phase overran its budget gets no slot for the second phase.
+        late = audio("late2", 0.5)
+        reply = await s.transcribe(late, model="audio-two-phase", headers={"X-Request-Deadline-Seconds": "0.8"})
+        assert reply.status == 503 and reply.code == "slot_busy"
+        assert [(e[0], e[2]) for e in fake.EVENTS if e[0] == "start"] == [("start", 0)]
+
+
+def started():
+    return [e[1] for e in fake.EVENTS if e[0] == "start"]

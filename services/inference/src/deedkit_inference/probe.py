@@ -1,6 +1,7 @@
 """One injectable probe for memory, load, the busy file and child sizes (no macOS needed in tests)."""
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -31,7 +32,9 @@ def parse_busy(raw):
     try:
         value = json.loads(raw)
         ts, between, ci = value["ts"], value["between"], value["deedkit_ci"]
-        if isinstance(ts, bool) or not isinstance(ts, (int, float)) or not isinstance(between, bool):
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)) or not math.isfinite(ts):
+            raise ValueError
+        if not isinstance(between, bool):
             raise ValueError
         if not isinstance(ci, bool):
             raise ValueError

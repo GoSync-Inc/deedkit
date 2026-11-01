@@ -14,7 +14,7 @@ from fastapi import FastAPI, Request
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException
 from starlette.requests import ClientDisconnect
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse
 
 from .admission import Admission
 from .config import resolve_release, work_path
@@ -213,7 +213,7 @@ class Service:
         estimate = max(0.0, float(await asyncio.to_thread(engine.estimate, job_input.primary)))
         if not math.isfinite(estimate):
             estimate = 0.0
-        return Job(ctx.rid, auth.id, ctx.alias, spec, engine, job_input, estimate, deadline, time.monotonic())
+        return Job(ctx.rid, auth.id, ctx.alias, spec, engine, job_input, estimate, deadline, ctx.started)
 
 
 def parse_deadline(request):
@@ -258,12 +258,12 @@ def endpoint(counts_job=False):
                 if error.headers.get("X-Admission-Reason"):
                     ctx.refusal += ":" + error.headers["X-Admission-Reason"]
             except ClientDisconnect:
-                response, status, ctx.refusal = Response(status_code=499), 499, "client_disconnected"
+                response = ServiceError(499, "client_disconnected", "the client went away").response()
+                status, ctx.refusal = 499, "client_disconnected"
             except asyncio.CancelledError:
                 ctx.refusal = "cancelled"
                 raise
-            except Exception as error:
-                ACCESS.error("unhandled %s", type(error).__name__)
+            except Exception:
                 response = ServiceError(500, "internal_error", "internal error").response()
                 status, ctx.refusal = 500, "internal_error"
             finally:
@@ -296,6 +296,7 @@ def create_app(config, probe=None, wall=time.time):
             yield
         finally:
             await service.scheduler.stop()
+            service.workdir.close()
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.service = service

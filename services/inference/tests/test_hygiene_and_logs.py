@@ -10,7 +10,7 @@ import pytest
 from deedkit_inference.app import create_app
 from deedkit_inference.engines import fake
 from deedkit_inference.errors import ConfigError
-from deedkit_inference.workdir import MARKER
+from deedkit_inference.workdir import LOCK, MARKER
 from support import ServerProc, chat_body, fk, multipart
 
 pytestmark = pytest.mark.anyio
@@ -110,7 +110,7 @@ def test_startup_sweep_removes_leftovers_after_a_hard_kill(env, tmp_path):
         end = time.monotonic() + 10
         while read_pids(sentinel) is None and time.monotonic() < end:
             time.sleep(0.05)
-        leftovers = [p for p in env.work.iterdir() if p.name != MARKER]
+        leftovers = [p for p in env.work.iterdir() if p.name not in (MARKER, LOCK)]
         assert len(leftovers) == 1  # the running job's directory
         server.proc.send_signal(signal.SIGKILL)  # a hard kill: no finally runs
         server.proc.wait(timeout=10)
@@ -122,13 +122,13 @@ def test_startup_sweep_removes_leftovers_after_a_hard_kill(env, tmp_path):
                 pass
     finally:
         server.stop()
-    assert len([p for p in env.work.iterdir() if p.name != MARKER]) == 1
+    assert len([p for p in env.work.iterdir() if p.name not in (MARKER, LOCK)]) == 1
     (env.work / "stray-file").write_text("x")
     (env.work / "link").symlink_to(outside)
     (env.work / "dir" / "deep").mkdir(parents=True)
     (env.work / "dir" / "deep" / "f").write_text("x")
     create_app(env.config(), None)
-    assert [p.name for p in env.work.iterdir()] == [MARKER]
+    assert sorted(p.name for p in env.work.iterdir()) == sorted([MARKER, LOCK])
     assert (outside / "precious.txt").read_text() == "keep me"  # a symlink is removed, never followed
     assert env.work.stat().st_mode & 0o777 == 0o700
     # A directory that is not ours is never swept.
@@ -138,6 +138,19 @@ def test_startup_sweep_removes_leftovers_after_a_hard_kill(env, tmp_path):
     with pytest.raises(ConfigError, match="work_dir_not_empty_and_not_ours"):
         create_app(env.config(work_dir=str(other)), None)
     assert (other / "important").read_text() == "data"
+
+
+# spec: ANYM-682
+async def test_second_instance_cannot_sweep_a_running_one(env):
+    async with env.running() as s:
+        victim = s.service.workdir.new_request_dir()
+        (victim / "input.bin").write_text("an active upload")
+        # A second start on the same directory is refused before it removes anything.
+        with pytest.raises(ConfigError, match="work_dir_in_use"):
+            create_app(env.config(), None)
+        assert (victim / "input.bin").read_text() == "an active upload"
+    create_app(env.config(), None)  # the first one is gone: now the leftover is swept
+    assert not victim.exists()
 
 
 # spec: ANYM-682
@@ -189,10 +202,8 @@ async def test_logs_hold_no_content_filename_or_key(env, caplog, monkeypatch):
     shape = re.compile(r"rid=[0-9a-f]{16} principal=\S+ alias=\S+ bytes_in=\d+ seconds=\d+\.\d{3} status=\d{3} "
                        r"refusal=\S+")
     for line in access:
-        if line.startswith("unhandled "):
-            assert line == "unhandled RuntimeError"
-        else:
-            assert shape.fullmatch(line), line
+        assert shape.fullmatch(line), line  # every line is the one metadata line, also the unhandled one
+    assert any("status=500" in line and "refusal=internal_error" in line for line in access)
     assert any("principal=tester alias=audio-default" in line and "status=200" in line for line in access)
     assert any("status=401" in line and "refusal=unauthorized" in line for line in access)
     assert not [r for r in caplog.records if r.exc_info]

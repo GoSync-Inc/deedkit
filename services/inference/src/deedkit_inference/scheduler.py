@@ -1,6 +1,8 @@
 """The bounded queue, the two slots (gpu, cpu), phases, deadlines and the engine children.
 
-One asyncio loop owns all state; every method here is called on it, so no lock is needed."""
+One asyncio loop owns all state; every method here is called on it, so no lock is needed. A job is queued
+(and, when its slot is free and admission lets it, granted the slot) in one synchronous step inside `admit`, so
+the queue bound and the slot are decided atomically."""
 
 import asyncio
 import contextlib
@@ -27,10 +29,10 @@ class Job:
     engine: object
     input: object  # JobInput
     estimate: float
-    deadline: float | None
-    accepted: float
+    deadline: float | None  # seconds from the arrival of the request
+    accepted: float  # monotonic time the request arrived: the deadline clock starts here
     result: object = None
-    proc: object = None
+    proc: asyncio.subprocess.Process | None = None
     kill_reason: str | None = None
 
 
@@ -41,6 +43,7 @@ class Waiter:
     phase: object
     fut: asyncio.Future
     est: float
+    expires: float  # monotonic time after which this wait is over, whatever the slot does
     granted: bool = False
 
 
@@ -63,6 +66,10 @@ class Slot:
 def kill_group(pgid):
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(pgid, signal.SIGKILL)
+
+
+def slot_busy(retry_after, message="the job waited past its deadline in the queue"):
+    return ServiceError(503, "slot_busy", message, retry_after=retry_after)
 
 
 class Scheduler:
@@ -118,33 +125,45 @@ class Scheduler:
     def phase_estimate(self, job, phase):
         return job.estimate * phase.share
 
-    def admit(self, job, quota_principal, quota):
-        """The arrival checks, in order. Raises ServiceError; otherwise the job is counted and started."""
+    def admit(self, job, principal, quota):
+        """The arrival checks, in order, then the queue step. Raises ServiceError; otherwise the job is counted
+        and its task runs."""
         cfg = self.config
         first = job.spec.phases[0]
         if self.draining:
             raise ServiceError(503, "draining", "the service is shutting down", retry_after=cfg.retry_after_seconds)
-        slot = self.slots[first.slot]
-        if (slot.running or slot.queue) and self.depth() >= cfg.queue_size:
-            raise ServiceError(503, "queue_full", "the queue is full", retry_after=cfg.retry_after_seconds)
         key = (job.alias, first.name)
         anything = any(s.running for s in self.slots.values())
         verdict = self.admission.check(key, first.resident_gb, first.slot, arrival=True, anything_running=anything)
         if verdict.action == "refuse":
             raise self.closed(verdict.reason)
         wait = self.estimated_wait(first.slot)
-        if job.deadline is not None and job.estimate > job.deadline:
-            raise ServiceError(422, "deadline_too_short", "the job alone takes longer than the stated deadline")
-        too_long = wait > cfg.max_wait_seconds
-        past_deadline = job.deadline is not None and wait + job.estimate > job.deadline
-        if too_long or past_deadline:
-            raise ServiceError(503, "slot_busy", "the slot is busy for longer than this request can wait",
-                               retry_after=min(max(wait, 1.0), cfg.max_wait_seconds))
-        if not quota.accept(quota_principal):
-            raise ServiceError(429, "quota_exceeded", "the daily job limit is reached", retry_after=self.until_utc_midnight())
-        task = asyncio.create_task(self._run(job))
+        budget = None if job.deadline is None else job.deadline - (self.now() - job.accepted)
+        if budget is not None and job.estimate > budget:
+            raise ServiceError(422, "deadline_too_short",
+                               "the job alone takes longer than what is left of the stated deadline")
+        if wait > cfg.max_wait_seconds or (budget is not None and wait + job.estimate > budget):
+            raise slot_busy(min(max(wait, 1.0), cfg.max_wait_seconds),
+                            "the slot is busy for longer than this request can wait")
+        if quota.daily_exhausted(principal):
+            raise ServiceError(429, "quota_exceeded", "the daily job limit is reached",
+                               retry_after=self.until_utc_midnight())
+        # One synchronous step: queue the job, let the pump grant a free slot, then bound the queue.
+        slot = self.slots[first.slot]
+        waiter = self._waiter(job, 0, first)
+        slot.queue.append(waiter)
+        self._pump(slot)
+        if waiter.fut.done():
+            error = waiter.fut.exception()
+            if error is not None:
+                raise error
+        elif self.depth() > cfg.queue_size:
+            self._drop(slot, waiter)
+            raise ServiceError(503, "queue_full", "the queue is full", retry_after=cfg.retry_after_seconds)
+        quota.accept(principal)
+        task = asyncio.create_task(self._run(job, waiter))
         self.tasks.add(task)
-        task.add_done_callback(self.tasks.discard)
+        task.add_done_callback(lambda done: self._finished(done, job))
         return task
 
     def closed(self, reason):
@@ -153,50 +172,64 @@ class Scheduler:
 
     @staticmethod
     def until_utc_midnight():
-        now = time.time()
-        return 86400 - (now % 86400)
+        return 86400 - (time.time() % 86400)
+
+    def _finished(self, task, job):
+        """Safety net: whatever way the task ended (even cancelled before its first step), the job holds nothing."""
+        self.tasks.discard(task)
+        for slot in self.slots.values():
+            for waiter in [w for w in slot.queue if w.job is job]:
+                slot.queue.remove(waiter)
+            if slot.running and slot.running.job is job:
+                self.admission.mark_idle(slot.running.key)
+                slot.running = None
+        self._pump_all()
 
     # --- running a job -------------------------------------------------------------------------------------
-    async def _run(self, job):
+    async def _run(self, job, first_waiter):
         for index, phase in enumerate(job.spec.phases):
-            await self._enter(job, index, phase)
+            await self._enter(job, index, phase, first_waiter if index == 0 else None)
             try:
                 await self._execute(job, index, phase)
             except BaseException:
                 # The child group is dead (crash, timeout, kill, cancel): its memory is back, drop the book entry.
-                self.admission.evict([(job.alias, phase.name)])
+                self.admission.drop((job.alias, phase.name))
                 raise
             finally:
-                self._leave(job, index, phase)
+                self._leave(job, phase)
         return job.result
 
-    async def _enter(self, job, index, phase):
-        slot = self.slots[phase.slot]
+    def _waiter(self, job, index, phase):
         remaining = job.estimate * sum(p.share for p in job.spec.phases[index:])
         limit = self.config.max_wait_seconds
         if job.deadline is not None:
             limit = min(limit, job.deadline - (self.now() - job.accepted) - remaining)
-        waiter = Waiter(job, index, phase, asyncio.get_running_loop().create_future(), self.phase_estimate(job, phase))
-        slot.queue.append(waiter)
-        self._pump(slot)
+        future = asyncio.get_running_loop().create_future()
+        return Waiter(job, index, phase, future, self.phase_estimate(job, phase), self.now() + limit)
+
+    async def _enter(self, job, index, phase, waiter):
+        slot = self.slots[phase.slot]
+        if waiter is None:
+            waiter = self._waiter(job, index, phase)
+            slot.queue.append(waiter)
+            self._pump(slot)
         try:
             if waiter.fut.done():
                 waiter.fut.result()
             else:
-                await asyncio.wait_for(waiter.fut, max(limit, 0.0))
+                await asyncio.wait_for(waiter.fut, max(waiter.expires - self.now(), 0.0))
         except TimeoutError:
-            if waiter.granted:
-                self._release(slot, waiter)
-            else:
-                self._drop(slot, waiter)
-            raise ServiceError(503, "slot_busy", "the job waited past its deadline in the queue",
-                               retry_after=self.config.retry_after_seconds) from None
+            self._abandon(slot, waiter)
+            raise slot_busy(self.config.retry_after_seconds) from None
         except BaseException:
-            if waiter.granted:
-                self._release(slot, waiter)
-            else:
-                self._drop(slot, waiter)
+            self._abandon(slot, waiter)
             raise
+
+    def _abandon(self, slot, waiter):
+        if waiter.granted:
+            self._release(slot, waiter)
+        else:
+            self._drop(slot, waiter)
 
     def _drop(self, slot, waiter):
         with contextlib.suppress(ValueError):
@@ -209,7 +242,7 @@ class Scheduler:
             slot.running = None
         self._pump_all()
 
-    def _leave(self, job, index, phase):
+    def _leave(self, job, phase):
         slot = self.slots[phase.slot]
         if slot.running and slot.running.job is job:
             self.admission.mark_idle(slot.running.key)
@@ -221,11 +254,16 @@ class Scheduler:
             self._pump(slot)
 
     def _pump(self, slot):
-        """Start the head of the slot's queue when the slot is free and admission lets it through."""
+        """Start the head of the slot's queue when the slot is free and admission lets it through. A wait whose
+        time is over gets no slot."""
         while slot.running is None and slot.queue:
             waiter = slot.queue[0]
             if waiter.fut.done():
                 slot.queue.popleft()
+                continue
+            if self.now() > waiter.expires:
+                slot.queue.popleft()
+                waiter.fut.set_exception(slot_busy(self.config.retry_after_seconds))
                 continue
             phase, job = waiter.phase, waiter.job
             key = (job.alias, phase.name)

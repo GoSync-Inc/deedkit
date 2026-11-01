@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import time
@@ -55,12 +56,20 @@ async def test_each_admission_rule_refuses_with_its_own_reason(env):
         gpu = await s.chat(job("gpu"))
         assert gpu.status == 503 and gpu.headers["x-admission-reason"] == "load_high"
         assert (await s.transcribe(audio("cpu"))).status == 200
-    # An engine that is loaded already needs no second helping of memory, only the reserve.
-    async with env.running() as s:
+    # A warm worker that stays loaded needs no second helping of memory, only the reserve.
+    warm = {"vision-default": {"engine_options": {"persistent": True}}}
+    async with env.running(aliases=warm) as s:
         assert (await s.chat(job("first"))).status == 200
         s.probe.available = 3.5
         assert (await s.chat(job("warm"))).status == 200
         assert (await s.transcribe(audio("cold"))).headers["x-admission-reason"] == "memory_low"
+    # An engine whose child exited is gone from the book: the next job is a cold start and is charged as one.
+    async with env.running() as s:
+        assert (await s.chat(job("first"))).status == 200
+        assert s.service.admission.loaded == {}
+        s.probe.available = 3.5
+        again = await s.chat(job("again"))
+        assert again.status == 503 and again.headers["x-admission-reason"] == "memory_low"
 
 
 # spec: ANYM-682
@@ -85,7 +94,10 @@ async def test_stale_or_missing_busy_file_is_busy(env):
     assert read_busy_file(path).problem == "missing"
     for text in ("", "{", "[]", '{"ts": "1", "between": false, "deedkit_ci": false}',
                  '{"ts": 1, "between": 0, "deedkit_ci": false}', '{"ts": 1, "between": false}',
-                 '{"ts": true, "between": false, "deedkit_ci": false}'):
+                 '{"ts": true, "between": false, "deedkit_ci": false}',
+                 '{"ts": NaN, "between": false, "deedkit_ci": false}',
+                 '{"ts": Infinity, "between": false, "deedkit_ci": false}',
+                 '{"ts": -Infinity, "between": false, "deedkit_ci": false}'):
         path.write_text(text)
         assert read_busy_file(path).problem == "invalid", text
     path.write_text(json.dumps({"ts": 1767225600, "between": True, "deedkit_ci": False}))
@@ -101,9 +113,10 @@ async def test_stale_or_missing_busy_file_is_busy(env):
 
 # spec: ANYM-682
 async def test_idle_engine_is_evicted_for_room_and_running_one_is_not(env):
+    keep = {"persistent": True}  # warm workers: they stay loaded, and so in the book, between jobs
     tight = {"resident_cap_gb": 4.0, "aliases": {
-        "vision-default": {"phases": [{"name": "vlm", "slot": "gpu", "resident_gb": 2.5}]},
-        "audio-default": {"phases": [{"name": "stt", "slot": "cpu", "resident_gb": 2.0}]}}}
+        "vision-default": {"engine_options": keep, "phases": [{"name": "vlm", "slot": "gpu", "resident_gb": 2.5}]},
+        "audio-default": {"engine_options": keep, "phases": [{"name": "stt", "slot": "cpu", "resident_gb": 2.0}]}}}
     # An idle loaded engine is evicted to make room.
     async with env.running(**tight) as s:
         assert (await s.chat(job("vision"))).status == 200
@@ -179,3 +192,21 @@ async def test_children_over_the_hard_cap_lose_the_largest(env):
             time.sleep(0.02)
         else:
             raise AssertionError(f"process {pid} survived")
+
+
+# spec: ANYM-682
+async def test_concurrent_cold_starts_do_not_spend_the_same_headroom(env):
+    # 6 GB free: one 2 GB cold start fits (5 GB needed), a second at the same moment would not (6 - 2 < 5).
+    two_gb = {"audio-default": {"phases": [{"name": "stt", "slot": "cpu", "resident_gb": 2.0}]}}
+    async with env.running(alloc_settle_seconds=0.5, aliases=two_gb) as s:
+        s.probe.available = 6.0
+        gpu = s.spawn(s.chat(job("gpu", 1.5)))
+        await s.until(lambda: s.service.scheduler.active() == 1)
+        cpu = s.spawn(s.transcribe(audio("cpu")))
+        await s.until(lambda: s.service.scheduler.depth() == 1)
+        await asyncio.sleep(0.2)
+        assert started() == ["gpu"]  # waiting for the first start to show in the figures, not refused
+        assert (await cpu).status == 200  # once its memory is counted (settle window over), the second starts
+        assert (await gpu).status == 200
+    names = [(e[0], e[1]) for e in fake.EVENTS]
+    assert names.index(("start", "gpu")) < names.index(("start", "cpu")) < names.index(("end", "gpu"))

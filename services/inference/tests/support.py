@@ -246,7 +246,8 @@ class Running:
         return getattr(self.client, name)
 
     def work_entries(self):
-        return sorted(p.name for p in self.env.work.iterdir() if p.name != ".deedkit-inference-work")
+        own = (".deedkit-inference-work", ".deedkit-inference-lock")
+        return sorted(p.name for p in self.env.work.iterdir() if p.name not in own)
 
     async def until(self, predicate, timeout=5.0):
         end = time.monotonic() + timeout

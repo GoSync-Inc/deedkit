@@ -1,7 +1,11 @@
 """Admission that protects Between and the remote tests, and the resident-memory book of loaded engines.
 
 The rules are checked when a job arrives and again when it leaves the queue to start a phase. Everything
-the rules read goes through the injected probe."""
+the rules read goes through the injected probe.
+
+An engine is "loaded" while a job runs its phase and, for an engine that keeps a warm worker between jobs
+(`persistent`, ANYM-683), while it sits idle. An engine whose child exits with the phase leaves the book at
+once: its memory is back, so the next job is a cold start and is charged as one."""
 
 import time
 from dataclasses import dataclass
@@ -24,12 +28,14 @@ class Loaded:
     last_used: float = 0.0
     engine: object = None
     phase_name: str = ""
+    persistent: bool = False
 
 
 class Admission:
     def __init__(self, config, probe, wall=time.time, monotonic=time.monotonic):
         self.config, self.probe, self.wall, self.monotonic = config, probe, wall, monotonic
         self.loaded = {}
+        self.pending = {}  # key -> (gb, until): memory a cold start is about to take but the probe may not show yet
         self.settle_until = 0.0
 
     # --- resident book ---------------------------------------------------------------------------------
@@ -39,27 +45,47 @@ class Admission:
     def mark_running(self, key, gb, engine, phase_name):
         item = self.loaded.get(key)
         if item is None:
-            item = self.loaded[key] = Loaded(key, gb, engine=engine, phase_name=phase_name)
+            item = self.loaded[key] = Loaded(
+                key, gb, engine=engine, phase_name=phase_name, persistent=bool(getattr(engine, "persistent", False)))
+            self.pending[key] = (gb, self.monotonic() + self.config.alloc_settle_seconds)
         item.running += 1
         item.last_used = self.monotonic()
 
     def mark_idle(self, key):
         item = self.loaded.get(key)
-        if item is not None:
-            item.running = max(0, item.running - 1)
-            item.last_used = self.monotonic()
+        if item is None:
+            return
+        item.running = max(0, item.running - 1)
+        item.last_used = self.monotonic()
+        if item.running == 0 and not item.persistent:
+            del self.loaded[key]
+            self.pending.pop(key, None)
 
     def evict(self, keys):
         for key in keys:
+            self.pending.pop(key, None)
             item = self.loaded.pop(key, None)
-            if item is not None and item.engine is not None:
+            if item is not None and item.engine is not None and item.persistent:
                 item.engine.unload(item.phase_name)
         if keys:
             self.settle_until = self.monotonic() + self.config.evict_settle_seconds
 
+    def drop(self, key):
+        """A dead child (crash, timeout, kill, cancel): its memory is back at once, nothing to wait for."""
+        self.pending.pop(key, None)
+        item = self.loaded.pop(key, None)
+        if item is not None and item.engine is not None and item.persistent:
+            item.engine.unload(item.phase_name)
+
     def expired_idle(self):
         horizon = self.monotonic() - self.config.keep_alive_seconds
         return tuple(k for k, v in self.loaded.items() if v.running == 0 and v.last_used <= horizon)
+
+    def pending_gb(self, exclude):
+        now = self.monotonic()
+        for key in [k for k, (_, until) in self.pending.items() if until <= now]:
+            del self.pending[key]
+        return sum(gb for key, (gb, _) in self.pending.items() if key != exclude)
 
     # --- the rules -------------------------------------------------------------------------------------
     def busy_reason(self):
@@ -89,10 +115,13 @@ class Admission:
         if resident_gb > self.config.resident_cap_gb:
             return Verdict("refuse", "resident_cap")
         if not arrival or not anything_running:
-            if self.probe.available_gb() < self.memory_need(key, resident_gb):
+            need, visible = self.memory_need(key, resident_gb), self.probe.available_gb()
+            if visible < need:
                 if self.monotonic() < self.settle_until:
                     return Verdict("wait")
                 return Verdict("refuse", "memory_low")
+            if visible - self.pending_gb(key) < need:
+                return Verdict("wait", "memory_pending")  # a cold start that is still taking its memory
         if arrival:
             return Verdict("go")
         if key not in self.loaded and self.resident_total() + resident_gb > self.config.resident_cap_gb:

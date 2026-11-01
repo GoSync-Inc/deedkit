@@ -90,6 +90,7 @@ class Config(Strict):
     pump_interval_seconds: Annotated[float, Field(gt=0, le=60)] = 0.5
     supervise_interval_seconds: Annotated[float, Field(gt=0, le=60)] = 2.0
     evict_settle_seconds: Annotated[float, Field(ge=0, le=60)] = 5.0
+    alloc_settle_seconds: Annotated[float, Field(ge=0, le=300)] = 10.0
     aliases: Annotated[dict[Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")], AliasSpec], Field(min_length=1)]
     test_probe: ProbeFigures | None = None
 
