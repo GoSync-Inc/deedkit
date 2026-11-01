@@ -319,7 +319,7 @@ def serialized_applies(w):
 
 
 # spec: ANYM-658
-def test_a_failing_keyboard_parser_costs_neither_the_live_nor_the_history_message(worker,monkeypatch):
+def test_a_failing_keyboard_costs_neither_the_live_nor_the_history_message(worker,monkeypatch):
     from telethon import types
     monkeypatch.setenv('ANYMSG_CAPTURE_BUTTONS','1')
     w,s,key=worker
@@ -340,6 +340,37 @@ def test_a_failing_keyboard_parser_costs_neither_the_live_nor_the_history_messag
     assert pay['buttons']['rows'][0][0]['text']=='Pay'
     assert seen and all('SYNTHETIC-CALLBACK' not in item and 'keyboard exploded' not in item for item in seen)
     assert 'SYNTHETIC-CALLBACK' not in repr(pay)
+
+
+# spec: ANYM-658
+def test_a_100_button_keyboard_with_2kb_links_survives_the_live_and_history_paths(worker,monkeypatch):
+    from messaging_service.envelope import MAX_ENVELOPE,canonical
+    from telethon import types
+    monkeypatch.setenv('ANYMSG_CAPTURE_BUTTONS','1')
+    w,s,key=worker
+    seen=serialized_applies(w)
+    link='https://example.invalid/'+'a'*2000
+    def keyboarded(item):
+        buttons=[types.KeyboardInlineButton(text='Link %d'%n,type=types.InlineButtonTypeUrl(url=link+str(n)))
+                 for n in range(99)]
+        buttons.append(types.KeyboardInlineButton(text='Pay',type=types.InlineButtonTypeCallback(data=b'SYNTHETIC-CALLBACK')))
+        item.reply_markup=types.ReplyInlineMarkup(rows=[types.KeyboardInlineButtonRow(buttons=[b]) for b in buttons])
+        return item
+    asyncio.run(w.capture(NS(message=keyboarded(message(9)))))
+    asyncio.run(w.capture(NS(message=message(10))))
+    w.spool.drain(w.state.apply)
+    w.provider.messages[:]=[keyboarded(message(i)) if i%2 else message(i) for i in range(1,6)]
+    for _ in range(4):asyncio.run(w.sync_once())
+    w.history_spool.drain(w.state.apply)
+    items=s.search(key,limit=50)['items']
+    assert len(items)>=7 and any(i['body']=='message 10' for i in items) and any(i['body']=='message 4' for i in items)
+    kept=[i for i in items if i.get('buttons')]
+    assert len(kept)==4
+    for item in kept:
+        flat=[b for row in item['buttons']['rows'] for b in row]
+        assert len(flat)==100 and flat[0]['url'].startswith('https://example.invalid/') and len(flat[0]['url'])>2000
+    assert all(len(item.encode())<=MAX_ENVELOPE for item in seen) and all('SYNTHETIC-CALLBACK' not in item for item in seen)
+    assert all(len(canonical(json.loads(item)))<=MAX_ENVELOPE for item in seen)
 
 
 # spec: ANYM-658
