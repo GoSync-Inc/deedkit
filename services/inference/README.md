@@ -2,12 +2,15 @@
 
 A small shared inference service for the Mac mini. Every DeedKit service calls it with its own key; it
 never takes the mini away from Between or from the remote tests. This package is the shell: the API,
-per-service keys, a bounded queue, admission, upload bounds, a graceful drain and temp-file hygiene. It
-ships a `fake` engine for tests only. Real engines, model pinning and `pull` arrive with ANYM-683; the
-install, LaunchDaemon, sandbox, Tailscale and the busy-file writer with ANYM-684.
+per-service keys, a bounded queue, admission, upload bounds, a graceful drain and temp-file hygiene. The real
+engines (ANYM-683: speech with language routing, vision), the pinned models, `pull`, `verify` and the canary
+are below ("Real engines"); a `fake` engine exists for tests only. The install, LaunchDaemon, sandbox,
+Tailscale and the busy-file writer are ANYM-684.
 
 Python 3.13, own `pyproject.toml` and `uv.lock`, no code shared with the other services. The service makes
-no outbound connection and imports no outbound HTTP client (`test_service_imports_no_outbound_http_client`).
+no outbound connection and imports no outbound HTTP client (`test_service_imports_no_outbound_http_client`):
+only `pull.py` (the model download), `canary.py` (a client of the running service) and `egress_probe.py` do, and
+the serving path never imports them.
 
 ## Launch contract
 
@@ -64,13 +67,15 @@ Not secret, but it must be a regular file that is not writable by group or other
 | `resident_cap_gb`, `resident_hard_cap_gb` | 6.0, 7.5 | admission cap and supervisor kill line |
 | `min_free_gb` | 3.0 | headroom above a phase's `resident_gb` (the remote-test `MIN_FREE_MEM_GB`) |
 | `max_load_1m`, `slot_max_load_1m` | 8, `{}` | 1-minute load cap; per-slot override, e.g. `{"gpu": 6}` |
-| `keep_alive_seconds` | 300 | an idle loaded engine is unloaded after this (only an engine with `"engine_options": {"persistent": true}` stays loaded when idle; any other engine's child exits with its phase and leaves the resident book at once) |
+| `keep_alive_seconds` | 300 | an idle loaded engine is unloaded after this (only an engine with `"engine_options": {"persistent": true}` stays loaded when idle; any other one-shot child exits with its phase and leaves the resident book at once; the real engines keep a warm worker, so they stay loaded until this time passes) |
 | `max_inflight_upload_bytes` | 134217728 | pool of declared `Content-Length` of uploads in flight |
 | `upload_seconds` | 120 | a body must arrive within this |
 | `work_dir_max_bytes` | 536870912 | bytes reserved under `work_dir` |
 | `audio_body_max_bytes`, `chat_body_max_bytes` | 32 MiB, 44 MiB | per-request body caps |
 | `drain_seconds` | 900 | see SIGTERM drain |
-| `aliases` | required | alias table (below) |
+| `model_dir` | `/Users/Shared/deedkit-inference/models` | the read-only store of verified model files (`deedkit-inference pull` fills it, run as the account that owns it) |
+| `models_file` | unset | test mode only: another pins file; production always uses the packaged `models.json` |
+| `aliases` | `{}` | alias table (below); an empty table serves the two aliases the package ships (`audio-default`, `vision-default`, see "Real engines") |
 
 Alias table entry (the alias is the only name a client can use; never a repository id or a path):
 
@@ -78,7 +83,7 @@ Alias table entry (the alias is the only name a client can use; never a reposito
 "audio-default": {
   "kind": "audio",              // "audio" -> /v1/audio/transcriptions, "chat" -> /v1/chat/completions
   "scope": "audio",             // audio | image | document
-  "engine": "fake",             // ANYM-683 registers the real ones
+  "engine": "fake",             // production: "speech" (audio) or "vision" (chat); "fake" is for tests only
   "engine_options": {},
   "timeout_seconds": 600,       // one phase's hard timeout; the child group is killed
   "default_max_tokens": 2000,   // chat only
@@ -109,11 +114,11 @@ carry `X-Request-Id`.
 
 Error codes (status): `unauthorized` (401, one body for a missing, malformed, unknown, expired or revoked
 key), `scope_denied` (403), `unknown_model` (404), `payload_too_large` (413), `length_required` (411),
-`upload_timeout` (408), `invalid_request` (422), `audio_too_long` / `image_too_large` (422, the precheck),
+`upload_timeout` (408), `invalid_request` (422), `audio_too_long` / `image_too_large` / `audio_unreadable` / `image_unreadable` (422, the precheck), `transcript_too_large` (422, a transcript over the client's 1,000,000 characters),
 `deadline_too_short` (422), `quota_exceeded` / `concurrency_exceeded` (429, `Retry-After`), `queue_full`,
-`slot_busy`, `upload_capacity`, `admission_closed`, `draining` (all 503 with `Retry-After`),
+`slot_busy`, `upload_capacity`, `admission_closed`, `draining`, `engine_unavailable` (all 503 with `Retry-After`),
 `engine_failed` (502), `engine_timeout` (504), `internal_error` (500), `client_disconnected` (499, logged; the client is gone and never sees it). A 503 from this service always has
-one of those codes; a client treats `queue_full`, `slot_busy`, `upload_capacity`, `admission_closed` and
+one of those codes; a client treats `queue_full`, `slot_busy`, `upload_capacity`, `admission_closed`, `engine_unavailable` and
 `draining` (and connect errors, and 502/503/504 with another body) as backpressure. `admission_closed`
 adds the response header `X-Admission-Reason`.
 
@@ -208,3 +213,76 @@ The service only reads the file, never writes it.
 `uv sync --locked --group dev && uv run pytest -q` in `services/inference`; fake engines, an injected
 probe, no macOS or GPU. The contract fixtures live in `tests/fixtures/inference_contract/` at the
 repository root.
+
+## Real engines (ANYM-683)
+
+The package ships this alias table; a config with an empty `aliases` serves it. A custom entry with a real
+engine must name phases that `models.json` pins (`<alias>/<phase>`), else the service refuses to start.
+
+| alias | scopes | phases (slot, `resident_gb`) |
+|---|---|---|
+| `audio-default` | `audio` | `langid` (gpu, 0.3: Whisper base, first 30 s, **skipped when the request names `language`**), then one route: Russian -> `gigaam` (cpu, 1.6: GigaAM v3 e2e-RNNT, onnx-asr, its Silero VAD for audio over 60 s), any other language -> `whisper` (gpu, 2.7: Whisper large-v3-turbo, mlx-whisper) |
+| `vision-default` | `image`, `document` | `vlm` (gpu, 4.9: Qwen3.5-4B MLX 4-bit, mlx-vlm); an image chat needs scope `image`, a text-only chat scope `document` |
+
+`resident_gb` is the measured peak of the research run (local-inference-11-01) plus headroom; each phase is admitted
+on its own slot and memory (above). GigaAM beside Qwen (1.6 + 4.9 = 6.5 GB) is over the 6.0 GB cap, so the two never
+run together; the idle one is unloaded first. Each alias's `timeout_seconds` (1800 audio, 600 vision) bounds one phase.
+
+**Warm workers.** Each loaded `<alias>/<phase>` is one child process in its own process group (`engines/worker.py`,
+a line protocol over stdin/stdout). It loads its model from verified local paths, answers jobs, and exits on
+unload (it clears its caches first), after `keep_alive_seconds` idle, on a timeout (504 `engine_timeout`), on a
+failed job (502 `engine_failed`), or when it exceeds 1.5 times its phase's `resident_gb` (the total over all workers
+stays under `resident_hard_cap_gb`). Its `HOME`, `TMPDIR` and every library cache directory are one scratch directory
+under `work_dir` (`w-<id>`, removed with the worker; a warm worker outlives any one request, so the request directory
+is not it); `HF_HUB_OFFLINE=1` and the telemetry switches are set before the interpreter starts and again before any
+engine import.
+
+**Inputs and outputs.** Audio duration comes from `ffprobe` (over 4 h: 422 `audio_too_long`; unreadable: 422
+`audio_unreadable`); the mini needs `ffmpeg` and `ffprobe` (options `ffmpeg`/`ffprobe` name absolute paths, else
+`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`); a missing tool is 503 `engine_unavailable`. Audio is decoded in
+10-minute 16 kHz windows, so memory does not grow with the recording. An image is checked from its header
+(over 20 MP: 422 `image_too_large`; not png/jpeg/gif/webp: 422 `image_unreadable`). Transcripts are cut to the
+client's limits (`segments.py`: at most 20,000 segments, 10,000 characters each, times 0..86400 and ordered); over
+1,000,000 characters in total is 422 `transcript_too_large`, never silently cut. The content of a `vision-default`
+answer is always the JSON object the enrichment prompt asks for: string `title`, `summary`, `document_type` (at most
+80 characters, no control characters) and `text`; a model answer that is not such an object becomes `text`.
+`/v1/models` shows the pinned revision of each phase's model.
+
+**503 `engine_unavailable`** (`Retry-After`): a pinned package is not installed at its pinned version, `ffmpeg`/`ffprobe`
+are missing, or the model files are missing or differ from `models.json` (checked in full before every worker load).
+
+### Pinned models
+
+`src/deedkit_inference/models.json` lists, per `<alias>/<phase>`, each artifact the loaders consume: Hub repository, a
+40-hex revision, and size and sha256 of every file (weights, configuration, tokenizer and processor files, the VAD
+model), plus the engine package versions (equal to `uv.lock`). The store layout is
+`<model_dir>/<alias>/<phase>/<artifact>/<file>`.
+
+- `deedkit-inference pull [--model-dir D] [--only alias[/phase]] [--min-free-gb 15]`: the only command that
+  downloads. Run it as the account that owns the store (not the service user, which can read and never write).
+  It fetches each file at its pinned revision into `.pull-*`, verifies the whole directory against the pins and
+  publishes it with one rename; an interrupted or mismatching pull leaves nothing served. About 5.7 GB.
+- `deedkit-inference verify [--model-dir D]`: re-hashes everything, no network; exit 1 on any difference.
+- The server never downloads. Loaders are given paths, never repository ids. Before every worker load every
+  consumed file is re-hashed in full (no cache keyed on size or mtime). A file that differs, is missing or is extra
+  makes the alias unavailable until the files verify again.
+- Only safetensors, ONNX, NPZ (no object arrays, MLX reads them without pickle), JSON, text and Jinja files are
+  allowed; a configuration naming `model_file`, an auto map, custom or remote code is refused at load and at `pull`;
+  no engine call enables remote code, and no runtime has a download fallback (source tests).
+
+### Dependencies
+
+The engine packages are the optional group `engines` of `pyproject.toml`, exact versions with the marker
+`sys_platform == 'darwin' and platform_machine == 'arm64'`, so `uv sync --locked --group dev` (Linux CI) installs none
+of them. `[tool.uv] no-build = true`: wheels with locked hashes only. On the mini: `uv sync --locked --group engines`.
+`mlx-whisper` declares `torch` as a dependency (never imported at run time); the supply-chain report is in the pull
+request.
+
+### Canary and egress probe
+
+`deedkit-inference canary --key-file F [--url U] [--set DIR] [--generate]` generates the synthetic set of
+`tests/canary/` (fixed seeds, no real data; needs Pillow, macOS `say` and ffmpeg), sends it through the live aliases
+with the enrichment prompt, scores it against `tests/canary/expected.json` (character error per image, word error per
+note, real-time factor, the 20-minute recording's segment bounds, the JSON shape) and exits non-zero outside the
+bounds. `--egress` runs `egress_probe.py` as an engine child would (run it inside the service's sandbox profile): TCP
+and UDP to a loopback port other than the service's and to a public address must all fail.

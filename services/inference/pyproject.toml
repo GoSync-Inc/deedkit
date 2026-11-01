@@ -17,6 +17,19 @@ deedkit-inference = "deedkit_inference.cli:main"
 
 [dependency-groups]
 dev = ["pytest==9.1.1", "ruff==0.15.7"]
+# The real engines (ANYM-683). Apple silicon only: `uv sync --locked --group dev` on Linux installs none of them and
+# CI runs the engines against the fake runtime. The mini installs with `uv sync --locked --group engines`.
+engines = [
+  "mlx-vlm==0.7.11; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "mlx-whisper==0.4.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "onnx-asr==0.12.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "onnxruntime==1.31.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "huggingface-hub==2.4.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[tool.uv]
+# Hash-verified wheels only: no sdist is ever built on the mini (a build runs arbitrary code).
+no-build = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/deedkit_inference"]
@@ -31,3 +44,7 @@ line-length = 110
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# The canary generator keeps the research scripts' compact one-line statements.
+"tests/canary/generate.py" = ["E401", "E701", "E702"]

@@ -187,8 +187,16 @@ def test_service_imports_no_outbound_http_client():
                  "ftplib", "smtplib", "poplib", "imaplib", "telnetlib", "xmlrpc", "websockets", "websocket", "grpc",
                  "pycurl", "treq", "socket"}
     seen = []
+    # ANYM-683: the three modules that exist to talk to the network are never imported by the serving path:
+    # the model download (`pull`), the canary client and the egress probe. `cli.py` loads them inside commands only.
+    outside = {"pull.py", "canary.py", "egress_probe.py"}
     for path in sorted(PACKAGE.rglob("*.py")):
         tree = ast.parse(path.read_text())
+        if path.name in outside:
+            continue
+        top = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
+        assert not [n for n in top if isinstance(n, ast.ImportFrom) and n.level == 1
+                    and (n.module or "").split(".")[0] in {"pull", "canary", "egress_probe"}], path.name
         for node in ast.walk(tree):
             names = []
             if isinstance(node, ast.Import):

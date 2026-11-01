@@ -2,17 +2,21 @@
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 from contextlib import contextmanager
+from pathlib import Path
 
 import uvicorn
 
 from .app import create_app
-from .config import load_config
+from .config import Config, load_config
 from .errors import ConfigError, PolicyError
+from .models import ModelError, load_models, verify_all
 
 EXIT_REFUSED = 2
 EXIT_DRAIN_TIMEOUT = 3
@@ -53,12 +57,83 @@ async def serve(app, config):
     return outcome["code"]
 
 
+DEFAULT_MODEL_DIR = Config.model_fields["model_dir"].default
+CANARY_DIR = Path(__file__).resolve().parents[2] / "tests" / "canary"
+
+
+def command_pull(args):
+    """The only command that downloads. Run it as the account that owns the model store, never as the service user."""
+    from .pull import pull  # not imported by the service: it is the one module that talks to the Hub
+
+    try:
+        done = pull(load_models(), args.model_dir, only=args.only, min_free_gb=args.min_free_gb,
+                    log=lambda line: print(line, file=sys.stderr))
+    except ModelError as error:
+        print(f"deedkit-inference pull: {error.code} {error.detail}".strip(), file=sys.stderr)
+        return 1
+    print("\n".join(f"verified {key}" for key in done))
+    return 0
+
+
+def command_verify(args):
+    try:
+        results = verify_all(load_models(), args.model_dir)
+    except ModelError as error:
+        print(f"deedkit-inference verify: {error.code}", file=sys.stderr)
+        return 1
+    for key, problem in results:
+        print(f"{'ok  ' if problem is None else 'FAIL'} {key}{'' if problem is None else ' ' + problem}")
+    return 0 if all(problem is None for _, problem in results) else 1
+
+
+def command_canary(args):
+    from . import canary
+
+    code = 0
+    if args.egress:
+        probe = subprocess.run([sys.executable, "-I", "-m", "deedkit_inference.egress_probe"], check=False,
+                               capture_output=True, text=True, timeout=60)
+        print("egress", probe.stdout.strip() or probe.stderr.strip()[:200])
+        code = probe.returncode
+    if not args.key_file:
+        return code
+    directory = Path(args.set)
+    if args.generate or not directory.is_dir():
+        subprocess.run([sys.executable, str(CANARY_DIR / "generate.py"), str(directory)], check=True)
+    expected = json.loads((CANARY_DIR / "expected.json").read_text())
+    truth = json.loads((directory / "truth.json").read_text())
+    truth.update({name: (directory / name).read_text() for name in ("voice_ru.txt", "voice_en.txt")})
+    key = Path(args.key_file).read_text().strip()
+    outputs = canary.run(args.url.rstrip("/"), key, directory, expected, (CANARY_DIR / "prompt.txt").read_text())
+    failures = canary.score(outputs, expected, truth)
+    print(json.dumps({"outputs": outputs, "failures": failures}, ensure_ascii=False, indent=1))
+    return 1 if failures else code
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="deedkit-inference", description="DeedKit shared inference service")
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("serve", help="validate the configuration and serve on loopback")
     run.add_argument("--config", default=os.environ.get("DEEDKIT_INFERENCE_CONFIG"))
+    fetch = sub.add_parser("pull", help="download and verify the pinned models (the only command that does)")
+    fetch.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
+    fetch.add_argument("--only", action="append", help="an alias or alias/phase; repeat")
+    fetch.add_argument("--min-free-gb", type=float, default=15.0)
+    check = sub.add_parser("verify", help="re-hash every pinned file, no network")
+    check.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
+    probe = sub.add_parser("canary", help="run the regression canary against a running service")
+    probe.add_argument("--url", default="http://127.0.0.1:8090")
+    probe.add_argument("--key-file")
+    probe.add_argument("--set", default=str(Path.home() / "canary-set"), help="directory of the generated set")
+    probe.add_argument("--generate", action="store_true", help="(re)generate the set (needs Pillow, say, ffmpeg)")
+    probe.add_argument("--egress", action="store_true", help="run the egress probe as an engine child would")
     args = parser.parse_args(argv)
+    if args.command == "pull":
+        raise SystemExit(command_pull(args))
+    if args.command == "verify":
+        raise SystemExit(command_verify(args))
+    if args.command == "canary":
+        raise SystemExit(command_canary(args))
     if not args.config:
         parser.error("--config or DEEDKIT_INFERENCE_CONFIG is required")
     try:
