@@ -265,6 +265,170 @@ def message_info(message):
     return result
 
 
+class OperationContext:
+    """The per-request state of one _execute call, handed to its same-file handlers."""
+
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+
+async def read_chat_details(op):
+    operation, invoke, peer, chat, channel, basic_chat = (
+        op.operation, op.invoke, op.peer, op.chat, op.channel, op.basic_chat)
+    if channel:
+        full = await invoke(functions.channels.GetFullChannelRequest(channel))
+    elif basic_chat:
+        full = await invoke(functions.messages.GetFullChatRequest(basic_chat))
+    elif operation == 'chat_info':
+        full = await invoke(functions.users.GetFullUserRequest(utils.get_input_user(peer)))
+    else:
+        reject('unsupported_operation')
+    details = getattr(full, 'full_chat', None) or getattr(full, 'full_user', None)
+    if operation == 'get_invite_link':
+        invite = getattr(details, 'exported_invite', None)
+        return {'outcome': 'confirmed', 'link': safe_text(getattr(invite, 'link', None), 512),
+                'existing_only': True, 'revoked': getattr(invite, 'revoked', None)}
+    entities = getattr(full, 'chats', None) or getattr(full, 'users', None) or []
+    observed = next((e for e in entities if peer_id(e) == str(chat)), None)
+    settings = group_settings(observed, details) if (channel or basic_chat) and observed is not None else None
+    # The account's own role, by the catalog's rules, from the entity this request returned (ANYM-533).
+    from .chat_roles import derive
+    my_role, can_post = derive(observed, 'private' if not (channel or basic_chat) else
+                               'group' if basic_chat or getattr(observed, 'megagroup', False) else 'channel')
+    return {'outcome': 'confirmed', 'provider_chat_id': str(chat), 'my_role': my_role, 'can_post': can_post,
+            'title': safe_text(getattr(observed, 'title', None), 512),
+            'username': safe_text(getattr(observed, 'username', None), 128),
+            'description': safe_text(getattr(details, 'about', None), 2048),
+            'participant_count': safe_int(getattr(details, 'participants_count', None)),
+            'is_forum': bool(getattr(observed, 'forum', False)),
+            'group_settings': settings, 'basis': 'live_provider_observation'}
+
+
+async def read_participants(op):
+    parameters, invoke, channel, basic_chat = op.parameters, op.invoke, op.channel, op.basic_chat
+    limit, offset = min(parameters.get('limit', 50), MAX_PROFILE_PAGE), parameters.get('offset', 0)
+    if channel:
+        response = await invoke(functions.channels.GetParticipantsRequest(channel,
+            types.ChannelParticipantsSearch(''), offset, limit, 0))
+        members = [p.user_id for p in getattr(response, 'participants', [])[:limit]
+                   if type(getattr(p, 'user_id', None)) is int]
+        profiles = {u.id: profile(u) for u in getattr(response, 'users', []) if isinstance(u, types.User)}
+        users = [profiles.get(member) for member in members]
+        users = [u for u in users if u is not None]
+        total = safe_int(getattr(response, 'count', None))
+    elif basic_chat:
+        response = await invoke(functions.messages.GetFullChatRequest(basic_chat))
+        participants = getattr(getattr(response, 'full_chat', None), 'participants', None)
+        if not isinstance(participants, types.ChatParticipants):
+            return {'outcome': 'confirmed', 'participants': [], 'coverage': 'unavailable',
+                    'next_offset': None}
+        member_ids = {p.user_id for p in participants.participants}
+        candidates = [profile(u) for u in getattr(response, 'users', [])
+                      if isinstance(u, types.User) and u.id in member_ids]
+        total = len(candidates)
+        users = candidates[offset:offset + limit]
+    else:
+        reject('unsupported_operation')
+    return {'outcome': 'confirmed', 'participants': users, 'reported_count': total,
+            'next_offset': offset + len(users) if len(users) == limit else None,
+            'page_limit': limit,
+            'coverage': 'provider_page_not_complete_membership'}
+
+
+async def read_message_info(op):
+    exact_message, peer, chat, message_id = op.exact_message, op.peer, op.chat, op.message_id
+    return {'outcome': 'confirmed', **message_info(await exact_message(peer, chat, message_id))}
+
+
+async def read_reactions(op):
+    invoke, peer, chat, message_id = op.invoke, op.peer, op.chat, op.message_id
+    response = await invoke(functions.messages.GetMessagesReactionsRequest(peer, [message_id]))
+    for update in getattr(response, 'updates', [])[:100]:
+        if isinstance(update, types.UpdateMessageReactions) and update.msg_id == message_id and peer_id(update.peer) == str(chat):
+            return {'outcome': 'confirmed', 'provider_message_id': str(message_id),
+                    'reactions': reaction_state(update.reactions)}
+    # An absent Update is not proof of empty reactions.
+    return {'outcome': 'confirmed', 'provider_message_id': str(message_id),
+            'reactions': reaction_state(None)}
+
+
+async def read_topics(op):
+    parameters, invoke, peer, channel = op.parameters, op.invoke, op.peer, op.channel
+    if channel is None:
+        reject('unsupported_operation')
+    limit = min(parameters.get('limit', 50), MAX_PROFILE_PAGE)
+    response = await invoke(functions.messages.GetForumTopicsRequest(peer, None,
+        0, 0, limit, q=None))
+    topics = [{'id': str(t.id), 'title': safe_text(t.title, 128), 'closed': bool(t.closed),
+               'hidden': bool(t.hidden), 'pinned': bool(t.pinned),
+               'top_message_id': str(t.top_message)}
+              for t in getattr(response, 'topics', [])[:limit]
+              if isinstance(t, types.ForumTopic)]
+    return {'outcome': 'confirmed', 'topics': topics,
+            'reported_count': safe_int(getattr(response, 'count', None)),
+            'next_offset': None, 'pagination_supported': False, 'page_limit': limit,
+            'coverage': 'first_provider_page'}
+
+
+async def read_profile(op):
+    operation, parameters, client, verified_self, rpc, invoke, allowed_provider_id = (
+        op.operation, op.parameters, op.client, op.verified_self, op.rpc, op.invoke, op.allowed_provider_id)
+    if operation == 'get_contact':
+        user_id = number_id(parameters.get('user_id'))
+        if not allowed_provider_id(user_id):
+            return {'outcome': 'confirmed', 'contact': None, 'found': False}
+        response = await invoke(functions.contacts.GetContactsRequest(0))
+        contact_ids = {u.user_id for u in getattr(response, 'contacts', [])}
+        user = next((u for u in getattr(response, 'users', [])
+                     if isinstance(u, types.User) and u.id == user_id and u.id in contact_ids), None)
+        return {'outcome': 'confirmed', 'contact': profile(user), 'found': user is not None}
+    if not isinstance(verified_self, types.User) or verified_self.is_self is not True:
+        reject('provider_identity_unverified')
+    user_id = verified_self.id
+    target = types.InputUserSelf()
+    user = await rpc(lambda: client.get_entity(target))
+    response = await invoke(functions.users.GetFullUserRequest(target))
+    result = profile(user)
+    if result is None or result['id'] != str(user_id):
+        reject('provider_reference_mismatch')
+    result['bio'] = safe_text(getattr(getattr(response, 'full_user', None), 'about', None), 2048)
+    return {'outcome': 'confirmed', 'profile': result}
+
+
+async def read_contacts(op):
+    operation, parameters, invoke, allowed_provider_id, collection_policy = (
+        op.operation, op.parameters, op.invoke, op.allowed_provider_id, op.collection_policy)
+    limit, offset = min(parameters.get('limit', 50), MAX_PROFILE_PAGE), parameters.get('offset', 0)
+    if operation == 'list_contacts':
+        response = await invoke(functions.contacts.GetContactsRequest(0))
+        contact_ids = {u.user_id for u in getattr(response, 'contacts', [])}
+        candidates = [profile(u) for u in getattr(response, 'users', [])
+                      if isinstance(u, types.User) and u.id in contact_ids and allowed_provider_id(u.id)]
+        return {'outcome': 'confirmed', 'contacts': candidates[offset:offset + limit],
+                'reported_count': len(candidates), 'page_limit': limit,
+                'next_offset': offset + limit if offset + limit < len(candidates) else None}
+    response = await invoke(functions.contacts.GetBlockedRequest(offset, limit))
+    entries = [{'peer_id': peer_id(item.peer_id),
+                'provider_at': item.date.isoformat() if isinstance(item.date, datetime) else None}
+               for item in getattr(response, 'blocked', [])[:limit]
+               if isinstance(item, types.PeerBlocked) and allowed_provider_id(peer_id(item.peer_id))]
+    raw_count = min(len(getattr(response, 'blocked', [])), limit)
+    return {'outcome': 'confirmed', 'blocked': entries,
+            'reported_count': None if collection_policy()['exclude_chats'] or
+                not collection_policy()['discover_chats'] else safe_int(getattr(response, 'count', None)),
+            'page_limit': limit, 'coverage': 'filtered_provider_page',
+            'next_offset': offset + raw_count if raw_count == limit else None}
+
+
+READ_HANDLERS = {
+    'chat_info': read_chat_details, 'get_invite_link': read_chat_details,
+    'list_participants': read_participants, 'get_message_info': read_message_info,
+    'get_reactions': read_reactions, 'list_topics': read_topics,
+    'get_profile': read_profile, 'get_contact': read_profile,
+    'list_contacts': read_contacts, 'list_blocked': read_contacts,
+}
+
+
 async def _execute(client, job, *, verified_self=None, governor=None):
     """Execute exactly one prepared, bounded operation without automatic retries.
 
@@ -596,136 +760,13 @@ async def _execute(client, job, *, verified_self=None, governor=None):
             return {'outcome': 'confirmed', 'state': 'joined', 'archive': 'not_collected', 'next_step': JOIN_NEXT_STEP,
                     'basis': 'provider_joined_chat'}
 
-        if operation in ('chat_info', 'get_invite_link'):
-            if channel:
-                full = await invoke(functions.channels.GetFullChannelRequest(channel))
-            elif basic_chat:
-                full = await invoke(functions.messages.GetFullChatRequest(basic_chat))
-            elif operation == 'chat_info':
-                full = await invoke(functions.users.GetFullUserRequest(utils.get_input_user(peer)))
-            else:
-                reject('unsupported_operation')
-            details = getattr(full, 'full_chat', None) or getattr(full, 'full_user', None)
-            if operation == 'get_invite_link':
-                invite = getattr(details, 'exported_invite', None)
-                return {'outcome': 'confirmed', 'link': safe_text(getattr(invite, 'link', None), 512),
-                        'existing_only': True, 'revoked': getattr(invite, 'revoked', None)}
-            entities = getattr(full, 'chats', None) or getattr(full, 'users', None) or []
-            observed = next((e for e in entities if peer_id(e) == str(chat)), None)
-            settings = group_settings(observed, details) if (channel or basic_chat) and observed is not None else None
-            # The account's own role, by the catalog's rules, from the entity this request returned (ANYM-533).
-            from .chat_roles import derive
-            my_role, can_post = derive(observed, 'private' if not (channel or basic_chat) else
-                                       'group' if basic_chat or getattr(observed, 'megagroup', False) else 'channel')
-            return {'outcome': 'confirmed', 'provider_chat_id': str(chat), 'my_role': my_role, 'can_post': can_post,
-                    'title': safe_text(getattr(observed, 'title', None), 512),
-                    'username': safe_text(getattr(observed, 'username', None), 128),
-                    'description': safe_text(getattr(details, 'about', None), 2048),
-                    'participant_count': safe_int(getattr(details, 'participants_count', None)),
-                    'is_forum': bool(getattr(observed, 'forum', False)),
-                    'group_settings': settings, 'basis': 'live_provider_observation'}
-
-        if operation == 'list_participants':
-            limit, offset = min(parameters.get('limit', 50), MAX_PROFILE_PAGE), parameters.get('offset', 0)
-            if channel:
-                response = await invoke(functions.channels.GetParticipantsRequest(channel,
-                    types.ChannelParticipantsSearch(''), offset, limit, 0))
-                members = [p.user_id for p in getattr(response, 'participants', [])[:limit]
-                           if type(getattr(p, 'user_id', None)) is int]
-                profiles = {u.id: profile(u) for u in getattr(response, 'users', []) if isinstance(u, types.User)}
-                users = [profiles.get(member) for member in members]
-                users = [u for u in users if u is not None]
-                total = safe_int(getattr(response, 'count', None))
-            elif basic_chat:
-                response = await invoke(functions.messages.GetFullChatRequest(basic_chat))
-                participants = getattr(getattr(response, 'full_chat', None), 'participants', None)
-                if not isinstance(participants, types.ChatParticipants):
-                    return {'outcome': 'confirmed', 'participants': [], 'coverage': 'unavailable',
-                            'next_offset': None}
-                member_ids = {p.user_id for p in participants.participants}
-                candidates = [profile(u) for u in getattr(response, 'users', [])
-                              if isinstance(u, types.User) and u.id in member_ids]
-                total = len(candidates)
-                users = candidates[offset:offset + limit]
-            else:
-                reject('unsupported_operation')
-            return {'outcome': 'confirmed', 'participants': users, 'reported_count': total,
-                    'next_offset': offset + len(users) if len(users) == limit else None,
-                    'page_limit': limit,
-                    'coverage': 'provider_page_not_complete_membership'}
-
-        if operation == 'get_message_info':
-            return {'outcome': 'confirmed', **message_info(await exact_message(peer, chat, message_id))}
-
-        if operation == 'get_reactions':
-            response = await invoke(functions.messages.GetMessagesReactionsRequest(peer, [message_id]))
-            for update in getattr(response, 'updates', [])[:100]:
-                if isinstance(update, types.UpdateMessageReactions) and update.msg_id == message_id and peer_id(update.peer) == str(chat):
-                    return {'outcome': 'confirmed', 'provider_message_id': str(message_id),
-                            'reactions': reaction_state(update.reactions)}
-            # An absent Update is not proof of empty reactions.
-            return {'outcome': 'confirmed', 'provider_message_id': str(message_id),
-                    'reactions': reaction_state(None)}
-
-        if operation == 'list_topics':
-            if channel is None:
-                reject('unsupported_operation')
-            limit = min(parameters.get('limit', 50), MAX_PROFILE_PAGE)
-            response = await invoke(functions.messages.GetForumTopicsRequest(peer, None,
-                0, 0, limit, q=None))
-            topics = [{'id': str(t.id), 'title': safe_text(t.title, 128), 'closed': bool(t.closed),
-                       'hidden': bool(t.hidden), 'pinned': bool(t.pinned),
-                       'top_message_id': str(t.top_message)}
-                      for t in getattr(response, 'topics', [])[:limit]
-                      if isinstance(t, types.ForumTopic)]
-            return {'outcome': 'confirmed', 'topics': topics,
-                    'reported_count': safe_int(getattr(response, 'count', None)),
-                    'next_offset': None, 'pagination_supported': False, 'page_limit': limit,
-                    'coverage': 'first_provider_page'}
-
-        if operation in ('get_profile', 'get_contact'):
-            if operation == 'get_contact':
-                user_id = number_id(parameters.get('user_id'))
-                if not allowed_provider_id(user_id):
-                    return {'outcome': 'confirmed', 'contact': None, 'found': False}
-                response = await invoke(functions.contacts.GetContactsRequest(0))
-                contact_ids = {u.user_id for u in getattr(response, 'contacts', [])}
-                user = next((u for u in getattr(response, 'users', [])
-                             if isinstance(u, types.User) and u.id == user_id and u.id in contact_ids), None)
-                return {'outcome': 'confirmed', 'contact': profile(user), 'found': user is not None}
-            if not isinstance(verified_self, types.User) or verified_self.is_self is not True:
-                reject('provider_identity_unverified')
-            user_id = verified_self.id
-            target = types.InputUserSelf()
-            user = await rpc(lambda: client.get_entity(target))
-            response = await invoke(functions.users.GetFullUserRequest(target))
-            result = profile(user)
-            if result is None or result['id'] != str(user_id):
-                reject('provider_reference_mismatch')
-            result['bio'] = safe_text(getattr(getattr(response, 'full_user', None), 'about', None), 2048)
-            return {'outcome': 'confirmed', 'profile': result}
-
-        if operation in ('list_contacts', 'list_blocked'):
-            limit, offset = min(parameters.get('limit', 50), MAX_PROFILE_PAGE), parameters.get('offset', 0)
-            if operation == 'list_contacts':
-                response = await invoke(functions.contacts.GetContactsRequest(0))
-                contact_ids = {u.user_id for u in getattr(response, 'contacts', [])}
-                candidates = [profile(u) for u in getattr(response, 'users', [])
-                              if isinstance(u, types.User) and u.id in contact_ids and allowed_provider_id(u.id)]
-                return {'outcome': 'confirmed', 'contacts': candidates[offset:offset + limit],
-                        'reported_count': len(candidates), 'page_limit': limit,
-                        'next_offset': offset + limit if offset + limit < len(candidates) else None}
-            response = await invoke(functions.contacts.GetBlockedRequest(offset, limit))
-            entries = [{'peer_id': peer_id(item.peer_id),
-                        'provider_at': item.date.isoformat() if isinstance(item.date, datetime) else None}
-                       for item in getattr(response, 'blocked', [])[:limit]
-                       if isinstance(item, types.PeerBlocked) and allowed_provider_id(peer_id(item.peer_id))]
-            raw_count = min(len(getattr(response, 'blocked', [])), limit)
-            return {'outcome': 'confirmed', 'blocked': entries,
-                    'reported_count': None if collection_policy()['exclude_chats'] or
-                        not collection_policy()['discover_chats'] else safe_int(getattr(response, 'count', None)),
-                    'page_limit': limit, 'coverage': 'filtered_provider_page',
-                    'next_offset': offset + raw_count if raw_count == limit else None}
+        handler = READ_HANDLERS.get(operation)
+        if handler is not None:
+            return await handler(OperationContext(
+                operation=operation, parameters=parameters, client=client, verified_self=verified_self,
+                rpc=rpc, invoke=invoke, exact_message=exact_message, allowed_provider_id=allowed_provider_id,
+                collection_policy=collection_policy, peer=peer, chat=chat, channel=channel,
+                basic_chat=basic_chat, message_id=message_id))
 
         if operation == 'send_file':
             mode = parameters.get('mode', 'document')
