@@ -151,17 +151,29 @@ async def test_a_warm_worker_lost_between_the_grant_and_the_start_is_asked_for_a
         worker = pids(pidfile)[0]
         real = admission.mark_running
 
+        scheduler = s.service.scheduler
+
         def grant_then_lose(*args):
             real(*args)
-            engine.workers.pop("vlm").kill()  # the supervisor's kill, between the grant and the job's first step
+            # The supervisor's own path, between the grant and the job's first step: the worker is discarded and,
+            # being idle, its book entry and its reservation go with it.
+            scheduler._kill_victim(("worker", engine, "vlm", engine.workers["vlm"]), "memory_hard_cap")
 
+        s.probe.available = 4.0  # the reserve alone fits: the grant is a warm one
         admission.mark_running = grant_then_lose
         reply = await s.chat(vis())
         assert reply.status == 503 and reply.code == "admission_closed" and reply.headers["x-admission-reason"] == "worker_lost"
         assert key not in admission.loaded and admission.pending == {}  # nothing is left reserved or warm
         admission.mark_running = real
         assert await gone(worker)
-        assert (await s.chat(vis(pidfile=str(pidfile)))).status == 200  # the retry is a normal cold start
+        # The retry is a cold start: at 4 GB it is refused for the memory it needs...
+        refused = await s.chat(vis())
+        assert refused.status == 503 and refused.headers["x-admission-reason"] == "memory_low"
+        # ... and with enough, it holds its full reservation while it runs.
+        s.probe.available = 9.0
+        retry = s.spawn(s.chat(vis(pidfile=str(pidfile), sleep=0.8)))
+        await s.until(lambda: admission.pending.get(key) == 4.9, timeout=5)
+        assert (await retry).status == 200
 
 
 # spec: ANYM-683

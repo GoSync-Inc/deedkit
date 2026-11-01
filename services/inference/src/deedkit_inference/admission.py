@@ -60,10 +60,6 @@ class Admission:
         item = self.loaded.get(key)
         return item is not None and item.persistent
 
-    def admitted_warm(self, key):
-        """The running phase was admitted on a warm worker's memory (it holds nothing back from others)."""
-        return self.pending.get(key) == 0.0
-
     def mark_running(self, key, gb, engine, phase_name):
         item = self.loaded.get(key)
         warm = item is not None and item.persistent

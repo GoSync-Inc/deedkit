@@ -64,6 +64,7 @@ class Running:
     started: float
     est: float
     later: bool = False
+    warm: bool = False  # admitted on a loaded worker's memory (the reserve only); fixed at the grant
 
 
 @dataclass
@@ -312,7 +313,8 @@ class Scheduler:
             if verdict.action == "refuse":
                 waiter.fut.set_exception(self.closed(verdict.reason))
                 continue
-            slot.running = Running(job, waiter.index, key, self.now(), waiter.est, waiter.later)
+            slot.running = Running(job, waiter.index, key, self.now(), waiter.est, waiter.later,
+                                   warm=self.admission.warm(key))
             self.admission.mark_running(key, phase.resident_gb, job.engine, phase.name)
             waiter.granted = True
             waiter.fut.set_result(None)
@@ -393,9 +395,11 @@ class Scheduler:
             async with asyncio.timeout(job.spec.timeout_seconds):
                 if worker is None or not worker.alive():
                     self._discard_worker(engine, phase.name, worker)
-                    if self.admission.admitted_warm((job.alias, phase.name)):
-                        # Admitted on the memory of a warm worker that is gone now: a replacement is a cold start
-                        # and goes through admission as one, so the client asks again.
+                    running = self.slots[phase.slot].running
+                    if running is not None and running.job is job and running.warm:
+                        # Admitted on the memory of a warm worker that is gone now (however it was lost: the book
+                        # entry may be gone with it): a replacement is a cold start and goes through admission as
+                        # one, so the client asks again.
                         raise self.closed("worker_lost")
                     launch = await self._prepare(engine, phase.name)
                     try:
