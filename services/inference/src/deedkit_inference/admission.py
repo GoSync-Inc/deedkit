@@ -36,7 +36,7 @@ class Admission:
     def __init__(self, config, probe, wall=time.time, monotonic=time.monotonic):
         self.config, self.probe, self.wall, self.monotonic = config, probe, wall, monotonic
         self.loaded = {}
-        self.pending = {}  # key -> (gb, free memory seen at the start): what a running phase may still take
+        self.pending = {}  # key -> resident_gb of a running phase, held back from the free memory others see
         self.settle_until = 0.0
 
     # --- resident book ---------------------------------------------------------------------------------
@@ -48,7 +48,7 @@ class Admission:
         if item is None:
             item = self.loaded[key] = Loaded(
                 key, gb, engine=engine, phase_name=phase_name, persistent=bool(getattr(engine, "persistent", False)))
-        self.pending[key] = (gb, self.probe.available_gb())
+        self.pending[key] = gb  # no probe read here: all probing is done before the deadline check and the grant
         item.running += 1
         item.last_used = self.monotonic()
 
@@ -82,14 +82,11 @@ class Admission:
         horizon = self.monotonic() - self.config.keep_alive_seconds
         return tuple(k for k, v in self.loaded.items() if v.running == 0 and v.last_used <= horizon)
 
-    def pending_gb(self, exclude, visible):
-        """Memory that running phases may still take: each one's resident_gb minus what has already shown up
-        as a drop of the free memory since it started. It lasts until the phase ends, never on a timer."""
-        total = 0.0
-        for key, (gb, baseline) in self.pending.items():
-            if key != exclude:
-                total += max(0.0, gb - max(0.0, baseline - visible))
-        return total
+    def pending_gb(self, exclude):
+        """Memory that running phases may take: each one's full resident_gb until the phase ends. Nothing is
+        subtracted for a drop of the free memory, because the probe cannot tell the child's allocation from
+        another process's: counting it twice only ever makes a second phase wait."""
+        return sum(gb for key, gb in self.pending.items() if key != exclude)
 
     # --- the rules -------------------------------------------------------------------------------------
     def busy_reason(self):
@@ -121,7 +118,7 @@ class Admission:
                 if self.monotonic() < self.settle_until:
                     return Verdict("wait")
                 return Verdict("refuse", "memory_low")
-            if visible - self.pending_gb(key, visible) < need:
+            if visible - self.pending_gb(key) < need:
                 return Verdict("wait", "memory_pending")  # a cold start that is still taking its memory
         if arrival:
             return Verdict("go")

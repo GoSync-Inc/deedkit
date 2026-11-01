@@ -212,17 +212,21 @@ async def test_concurrent_cold_starts_do_not_spend_the_same_headroom(env):
         assert (await cpu).status == 200 and (await gpu).status == 200
     names = [(e[0], e[1]) for e in fake.EVENTS]
     assert names.index(("end", "gpu")) < names.index(("start", "cpu"))
-    # Once the first start's memory shows in the free figure, it is not counted twice.
+    # A drop of the free memory is not taken as the first child's allocation: the probe cannot tell it from another
+    # process's (here 2 GB go to something else), so the reservation stays until the phase ends.
     fake.EVENTS.clear()
     async with env.running(aliases=two_gb) as s:
         s.probe.available = 7.0
         gpu = s.spawn(s.chat(job("gpu", 1.0)))
         await s.until(lambda: s.service.scheduler.active() == 1)
-        s.probe.available = 5.0  # the 2 GB are taken: 5 GB free is what the second one needs
+        s.probe.available = 5.0
         cpu = s.spawn(s.transcribe(audio("cpu")))
-        await s.until(lambda: "cpu" in started())
-        assert ("end", "gpu") not in [(e[0], e[1]) for e in fake.EVENTS]  # it started beside the first
+        await s.until(lambda: s.service.scheduler.depth() == 1)
+        await asyncio.sleep(0.4)
+        assert started() == ["gpu"]  # 5 - 2 < 5: still waiting
         assert (await cpu).status == 200 and (await gpu).status == 200
+    names = [(e[0], e[1]) for e in fake.EVENTS]
+    assert names.index(("end", "gpu")) < names.index(("start", "cpu"))
 
 
 # spec: ANYM-682
@@ -239,5 +243,9 @@ async def test_a_slow_probe_cannot_carry_a_job_past_its_deadline(env):
         reply = await s.chat(job("late", 0.05), headers={"X-Request-Deadline-Seconds": "0.8"})
         assert reply.status == 503 and reply.code == "slot_busy"
         assert started() == []  # the slot was not granted after the time was over
-        s.probe.available_hook = None
+        # All memory reads happen before the deadline check: a granted job costs exactly the two reads of its
+        # arrival check and its grant check, none after the grant.
+        calls.clear()
+        s.probe.available_hook = lambda: calls.append(1)
         assert (await s.chat(job("fine", 0.05), headers={"X-Request-Deadline-Seconds": "5"})).status == 200
+        assert len(calls) == 2, calls
