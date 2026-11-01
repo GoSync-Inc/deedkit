@@ -58,6 +58,12 @@ LIVE_SEARCH_LIMITATION = ('Telegram only. Searches Telegram itself: an empty cha
     'rate_limited with retry_after. Hits in chats the collection policy excludes are dropped. Writes nothing to the '
     'archive.')
 HISTORY = 'request_chat_history'
+INSPECT_BUTTONS = 'inspect_message_buttons'
+INSPECT_BUTTONS_LIMITATION = ('Telegram: one live read of one message\'s inline keyboard, nothing pressed or opened. Returns '
+    'edit_date, text_sha256 and rows of buttons with row, column, kind, text, link (url and web_app kinds) and, for callback '
+    'buttons, fp: a keyed fingerprint of the callback data that a later press must carry. The callback data and the key '
+    'never leave the collector; after a collector restart every fp is stale. Per account 3 requests at once, then one per '
+    '10 s, 300 per UTC day (in memory; a collector restart resets them); over it, rate_limited with retry_after.')
 TELEGRAM_HISTORY_LIMITATION = ('Telegram: one provider page of this archived chat, 1-100 messages (default 50), at '
     'one anchor: before_message (exclusive; default the oldest archived message, so a repeat goes further back), '
     'around_message (about half before, half after it) or from_time (inclusive) / to_time (exclusive), newest first. '
@@ -76,6 +82,7 @@ OPERATIONS = {
     'list_participants': _spec('groups-read', fields=_page),
     'get_reactions': _spec('read-live', 'message'),
     'get_message_info': _spec('read-live', 'message'),
+    INSPECT_BUTTONS: _spec('read-live', 'message', platforms=('telegram',), limitation=INSPECT_BUTTONS_LIMITATION),
     'get_pinned_messages': _spec('read-live', fields=_page, platforms=('whatsapp',)),
     'list_topics': _spec('groups-read', fields=_page, platforms=('telegram',)),
     'get_profile': _spec('profile-read', 'account', full_account=True),
@@ -212,6 +219,7 @@ ADVANCED_ONLY = {
     'list_join_requests': _LIVE_READ, 'check_chat_link': _LIVE_READ,
     LIVE_SEARCH: 'messages_search with live (ANYM-478) is its everyday route',
     HISTORY: 'an archive backfill request, not a chat or contact change',
+    INSPECT_BUTTONS: 'a live read of one message\'s keyboard for a later press (ANYM-681); no risk-class tool reads chats',
     'get_profile': 'the owner\'s own account profile, not a contact',
     'update_profile': 'changes the owner\'s own profile seen by every contact; kept advanced',
 }

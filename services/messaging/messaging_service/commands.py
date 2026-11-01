@@ -24,6 +24,7 @@ from .outgoing import finish_durably
 MAX_FILE_BYTES = 32 * 1024**2
 LIVE_SEARCH = 'search_messages_live'
 HISTORY = 'request_chat_history'
+INSPECT_BUTTONS = 'inspect_message_buttons'
 # ANYM-475: governor waits, resolution, the provider request and the receipt together.
 LIVE_SEARCH_TIMEOUT = 15
 # Kept free inside LIVE_SEARCH_TIMEOUT for the foreground loop's pacing, so a queued send starts within it.
@@ -113,7 +114,7 @@ def _required_permissions(permission,operation,parameters=None):
 
 def live_read(operation,platform):
     """ANYM-475/477: an agent-requested Telegram read that answers within the live deadline or is refused."""
-    return operation==LIVE_SEARCH or operation==HISTORY and platform=='telegram'
+    return operation==LIVE_SEARCH or operation in (HISTORY,INSPECT_BUTTONS) and platform=='telegram'
 
 
 def _spec(operation,platform=None):

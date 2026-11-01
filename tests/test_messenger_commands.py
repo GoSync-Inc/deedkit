@@ -1026,3 +1026,110 @@ def test_a_tracked_chat_the_policy_now_leaves_out_gives_no_chat_id(operator):
         c.execute('UPDATE account_policies SET exclude_chats=%s WHERE account=%s',([CREATED_CHAT],'command-fixture'))
     receipt=created_by_worker(s,key,state)
     assert receipt['status']=='succeeded' and 'chat_id' not in receipt['result']['data']
+
+
+# --- ANYM-681: inspect_message_buttons --------------------------------------------------------------------
+
+
+# spec: ANYM-681
+def test_inspect_message_buttons_is_a_telegram_only_read_live_message_operation():
+    from messaging_service.messenger_operations import operation_manifest
+    rows = {p: {r['operation']: r for r in operation_manifest(p)}['inspect_message_buttons'] for p in ('telegram', 'whatsapp')}
+    assert rows['telegram']['supported'] is True and rows['whatsapp']['supported'] is False
+    for row in rows.values():
+        assert (row['permission'], row['target'], row['mutation']) == ('read-live', 'message', False)
+    assert 'every fp is stale' in rows['telegram']['limitation'] and '300 per UTC day' in rows['telegram']['limitation']
+
+
+# spec: ANYM-681
+def test_inspection_needs_the_account_opt_in_and_the_read_live_permission(operator):
+    s, archive, key, state = operator
+    args = operation_args(operation='inspect_message_buttons')
+    with pytest.raises(APIError, match='operation_disabled'):
+        s.execute_messenger_operation(key, **args, request_id='synthetic-inspect-0001')
+    s.set_messenger_operations('command-fixture', ['inspect_message_buttons', 'get_message_info'])
+    reader = s.issue_key('command-reader', ['command-fixture'], permissions=['read'])
+    with pytest.raises(APIError, match='forbidden'):
+        s.execute_messenger_operation(reader, **args, request_id='synthetic-inspect-0002')
+    queued = s.execute_messenger_operation(key, **args, request_id='synthetic-inspect-0003')
+    assert queued['operation_id']
+
+
+# spec: ANYM-681
+def test_inspection_runs_as_a_live_read_and_stores_a_bounded_receipt(operator):
+    from messaging_service.commands import CommandWorker
+    s, _, key, state = operator
+    s.set_messenger_operations('command-fixture', ['inspect_message_buttons'])
+    queued = s.execute_messenger_operation(key, **operation_args(operation='inspect_message_buttons'),
+                                           request_id='synthetic-inspect-0004')
+    rows = [[{'row': 0, 'column': 0, 'kind': 'callback', 'text': 'Pay', 'fp': 'a' * 32}]]
+
+    async def provider(job):
+        assert job['operation'] == 'inspect_message_buttons' and job['provider_message_id'] == '1'
+        return {'outcome': 'confirmed', 'data': {'edit_date': '2026-10-01T12:00:00+00:00', 'text_sha256': '0' * 64, 'rows': rows}}
+    assert asyncio.run(CommandWorker(state, provider).once())
+    done = s.get_messenger_operation(key, queued['operation_id'])
+    assert done['status'] == 'succeeded' and done['result']['data']['rows'] == rows
+
+
+# spec: ANYM-681
+def test_the_worker_bounds_the_inspection_as_a_live_read_and_a_timeout_is_safe_to_repeat(monkeypatch):
+    import messaging_service.commands as commands
+    from types import SimpleNamespace
+    from messaging_service.commands import CommandWorker, live_read
+    from test_live_search import once
+    assert live_read('inspect_message_buttons', 'telegram') is True and live_read('inspect_message_buttons', 'whatsapp') is False
+    finished = []
+
+    class Worker(CommandWorker):
+        def claim(self):
+            return {'id': 'synthetic-job', 'mutation': False, 'operation': 'inspect_message_buttons', 'platform': 'telegram'}
+
+        def preflight(self, job, *, verify_file=True):
+            return job
+
+        def finish_live(self, job, status, result, code, budget):
+            finished.append((status, result, code))
+    monkeypatch.setattr(commands, 'LIVE_SEARCH_TIMEOUT', 0.05)
+    monkeypatch.setattr(commands, 'LIVE_FOREGROUND_RESERVE', 0)
+
+    async def hangs(job):
+        await asyncio.sleep(60)
+    assert once(Worker(SimpleNamespace(), hangs))
+    assert finished[-1] == ('failed', {'data': {'code': 'provider_timeout', 'retry': True}}, 'provider_timeout')
+
+
+# spec: ANYM-681
+def test_a_stalled_receipt_write_does_not_hold_the_send_loop(monkeypatch):
+    import threading
+    import time
+    from types import SimpleNamespace
+    import messaging_service.commands as commands
+    from messaging_service.commands import CommandWorker
+    release = threading.Event()
+    started = []
+
+    class Worker(CommandWorker):
+        def claim(self):
+            return {'id': 'synthetic-job', 'mutation': False, 'operation': 'inspect_message_buttons', 'platform': 'telegram'}
+
+        def preflight(self, job, *, verify_file=True):
+            return job
+
+        def finish_live(self, job, status, result, code, budget):
+            started.append(status)
+            release.wait(5)
+    monkeypatch.setattr(commands, 'LIVE_SEARCH_TIMEOUT', 5)
+
+    async def answer(job):
+        return {'outcome': 'confirmed', 'data': {'rows': []}}
+
+    async def turn():
+        worker = Worker(SimpleNamespace(), answer)
+        began = time.monotonic()
+        assert await worker._once()
+        elapsed = time.monotonic() - began
+        release.set()
+        await asyncio.gather(*list(worker.settling))
+        return elapsed
+    assert asyncio.run(turn()) < 2 and started == ['succeeded']

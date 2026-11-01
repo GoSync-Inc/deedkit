@@ -60,6 +60,9 @@
   "get_reactions": [
     "read-live"
   ],
+  "inspect_message_buttons": [
+    "read-live"
+  ],
   "join_chat": [
     "groups-manage"
   ],
