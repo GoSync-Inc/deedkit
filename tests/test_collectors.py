@@ -300,6 +300,32 @@ def test_checkpoint_backfill_catchup_and_overlap_edit(worker):
     assert len(s.search(key)['items'])==8
 
 
+class PoisonedKeyboard:
+    """A reply_markup whose every read fails: the keyboard parser must cost the keyboard, never the message."""
+    def __getattr__(self,name): raise RuntimeError('keyboard exploded')
+
+
+# spec: ANYM-658
+def test_a_failing_keyboard_costs_neither_the_live_nor_the_history_message(worker,monkeypatch):
+    from telethon import types
+    monkeypatch.setenv('ANYMSG_CAPTURE_BUTTONS','1')
+    w,s,key=worker
+    keyboard=types.ReplyInlineMarkup(rows=[types.KeyboardInlineButtonRow(buttons=[types.KeyboardInlineButton(
+        text='Pay',type=types.InlineButtonTypeCallback(data=b'SYNTHETIC-CALLBACK'))])])
+    history=[message(i) for i in range(1,6)]
+    for item,markup in zip(history,(PoisonedKeyboard(),keyboard,PoisonedKeyboard(),None,PoisonedKeyboard())): item.reply_markup=markup
+    w.provider.messages[:]=history
+    live=message(9); live.reply_markup=PoisonedKeyboard()
+    asyncio.run(w.capture(NS(message=live)))
+    asyncio.run(w.capture(NS(message=message(10))))
+    w.spool.drain(w.state.apply)
+    for _ in range(4):asyncio.run(w.sync_once())  # batch_size=2: the history pages come newest first
+    w.history_spool.drain(w.state.apply)
+    assert {m['body'] for m in s.search(key,limit=50)['items']}>={'message 9','message 10','message 1','message 2','message 3','message 4','message 5'}
+    pay=s.search(key,'message 2')['items'][0]
+    assert pay['buttons']['rows'][0][0]['text']=='Pay' and 'SYNTHETIC-CALLBACK' not in repr(pay)
+
+
 def test_page_failure_leaves_checkpoint_and_durable_captures_for_replay(worker):
     w,s,key=worker; original=w.state.apply; calls=0
     def fail_second(item):

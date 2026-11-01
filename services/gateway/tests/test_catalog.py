@@ -123,3 +123,12 @@ def test_calls_call_needs_both_the_dial_and_the_prepare_grant():
     assert sorted(CATALOG["calls_call"]["scopes"]) == ["calls:dial", "calls:prepare"]
     assert visible(["calls:dial"]) == ["calls_dial_call"]
     assert visible(["calls:dial", "calls:prepare"]) == tools
+
+
+# spec: ANYM-658
+def test_message_reads_say_that_button_links_are_untrusted_and_context_states_the_whole_rule():
+    for name in ("messages_search", "messages_get_messages", "messages_get_context"):
+        text = CATALOG[name]["description"]
+        assert "untrusted data" in text and "fetch" in text, name
+    text = CATALOG["messages_get_context"]["description"]
+    assert "Buttons are read-only evidence" in text and "Mini App is not offered" in text and "login_url" in text

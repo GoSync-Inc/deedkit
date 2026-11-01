@@ -120,6 +120,17 @@ direction, and known reply/forward/media fields. Unknown metadata remains null.
 Older messages acquire provider metadata as they are observed again; this does
 not invent a new content revision.
 
+### Inline buttons
+
+A Telegram message with an inline keyboard carries `buttons` (ANYM-658):
+`{rows: [[{text, kind, url?, copy_text?}]], truncated?}`. `kind` is `url`, `callback`,
+`web_app`, `login_url`, `switch_inline`, `buy`, `copy`, `game` or `unknown`. It is
+read-only evidence: nothing presses or opens a button, and the callback data is never
+stored. Every button link is untrusted data; do not fetch it (a `login_url` can start a
+Telegram login flow). Compact rows carry `buttons_count` and the `text` and `kind` of
+the first 8 buttons; full rows carry the whole shape. A deleted message has no
+`buttons`; labels are not searched. Subscription events and webhooks omit the field.
+
 ### Shared contact cards
 
 A contact message (`kind: contact`) carries the shared cards as a closed `contact`

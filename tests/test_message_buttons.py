@@ -154,7 +154,7 @@ def test_a_huge_keyboard_with_2kb_links_fits_the_envelope(captured):
 def crowded(captured,label,count=100):
     """A message whose body and 150 long links leave the keyboard only a few KB of the envelope."""
     body='𝔸'*65536
-    entities=[types.MessageEntityTextUrl(offset=n,length=1,url='https://example.invalid/'+'p'*1500) for n in range(150)]
+    entities=[types.MessageEntityTextUrl(offset=2*n,length=2,url='https://example.invalid/'+'p'*1500) for n in range(150)]
     layout=rows(*[[url(label)] for _ in range(count)])
     message=bot_message(layout,body=body,entities=entities)
     return captured(message)
@@ -346,3 +346,14 @@ def telegram_message_with_secret():
     finally:
         del os.environ['ANYMSG_CAPTURE_BUTTONS']
     return {'body':e['body'],'metadata':{k:v for k,v in e['metadata'].items() if v is not None}}
+
+
+# spec: ANYM-658
+def test_messaging_tool_descriptions_state_the_read_only_rule():
+    import pathlib
+    snapshot=json.loads((pathlib.Path(__file__).parent/'platform'/'fixtures'/'messaging-contracts.json').read_text())
+    tools={tool['name']:tool['description'] for tool in snapshot['tools']}
+    for name in ('search','get_messages','get_context'):
+        text=' '.join(tools[name].split())
+        assert 'read-only evidence' in text and 'Mini App is a live action and is not offered' in text, name
+        assert 'untrusted data' in text and 'login_url' in text, name
