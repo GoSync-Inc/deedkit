@@ -18,6 +18,7 @@ from .archive import Archive
 from .blobs import BlobWriter
 from .collector_state import CaptureSpool,CollectorState,session_lock,validate_capture as validate_capture
 from .store import Store
+from .collector_common import DbBackoff,commit_items,validate_common,validate_ranges
 from .telegram_collector import TelegramCollector,ProviderUnavailable,private_json
 from .operational import CONNECTION_ERRORS,MEDIA_ERRORS,collector_stop
 from .media_policy import MEDIA_POLICY_FIELDS,configure_media_policy
@@ -66,9 +67,7 @@ def configuration(path):
         'pages_directory','chromium_executable','node_executable','batch_size','scan_interval_seconds',
         'max_media_bytes','disk_reserve_bytes','max_dialogs',
         'provider','native_executable'}|MEDIA_POLICY_FIELDS
-    if not isinstance(cfg,dict) or set(cfg)-fields: raise ValueError('invalid_collector_config')
-    if cfg.get('enabled') is not True: raise RuntimeError('collector_disabled')
-    if not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',cfg.get('account','')): raise ValueError('invalid_account')
+    validate_common(cfg,fields)
     if not re.fullmatch(r'[0-9]{5,20}@c.us',cfg.get('expected_wid','')): raise ValueError('invalid_whatsapp_identity')
     # Legacy configs retain their existing session; new setup templates select native.
     provider=cfg.setdefault('provider','webjs')
@@ -79,11 +78,9 @@ def configuration(path):
     private=[Path(cfg[name]).resolve() for name in ['session_directory','events_directory','pages_directory']]
     if any(a==b or a in b.parents or b in a.parents for i,a in enumerate(private) for b in private[i+1:]):
         raise ValueError('collector_directories_overlap')
-    for name,default,lo,hi in [('batch_size',50,1,100),('scan_interval_seconds',60,10,3600),
+    validate_ranges(cfg,[('batch_size',50,1,100),('scan_interval_seconds',60,10,3600),
             ('max_media_bytes',512*1024**2,1,4*1024**3),('disk_reserve_bytes',1024**3,1024**3,100*1024**3),
-            ('max_dialogs',2000,1,10000)]:
-        value=cfg.setdefault(name,default)
-        if type(value) is not int or not lo<=value<=hi: raise ValueError('invalid_'+name)
+            ('max_dialogs',2000,1,10000)])
     configure_media_policy(cfg)
     permit=private_json(cfg['permit_file'])
     if not isinstance(permit,dict) or permit.get('account')!=cfg['account'] or permit.get('expected_wid')!=cfg['expected_wid'] or permit.get('prior_clients_stopped') is not True:
@@ -519,21 +516,18 @@ class WhatsAppCollector(TelegramCollector):
             raise RuntimeError('invalid_whatsapp_page')
         points=[]
         from datetime import datetime,timezone
-        for e in page['messages']:
+        def check(e):
             if not isinstance(e,dict) or e.get('chatId')!=chat: raise RuntimeError('provider_chat_mismatch')
-            item={'kind':'whatsapp_event','account':self.account,'event':{**e,'chatName':title},
-                  'change':'message','observed_at':datetime.now(timezone.utc).isoformat(),'origin':origin}
-            try:name=await asyncio.to_thread(self.history_spool.put,item)
-            except (ValueError,TypeError,KeyError):
-                # Deterministically unstorable. Keep traversing so one message
-                # cannot stall this chat's history or the account's capture.
-                self.invalid_messages+=1
-                with suppress(ValueError,TypeError,KeyError):points.append(position(e))
-                continue
-            await asyncio.to_thread(self.state.apply,item)
-            # Committed directly; draining the same capture again would only repeat the work.
-            await asyncio.to_thread(self.history_spool.discard,name)
-            points.append(position(e))
+        def build(e):
+            return {'kind':'whatsapp_event','account':self.account,'event':{**e,'chatName':title},
+                    'change':'message','observed_at':datetime.now(timezone.utc).isoformat(),'origin':origin}
+        def unstorable(e):
+            with suppress(ValueError,TypeError,KeyError):points.append(position(e))
+        # Deterministically unstorable entries (a spool ValueError, TypeError or KeyError): keep traversing so
+        # one message cannot stall this chat's history or the account's capture.
+        await commit_items(self,page['messages'],check=check,build=build,build_errors=(),
+            put_errors=(ValueError,TypeError,KeyError),record=lambda e:points.append(position(e)),
+            record_unstorable=unstorable)
         return sorted(points)
     async def sync_chat(self,chat,kind,title):
         progress=await asyncio.to_thread(self.state.begin_attempt,chat,kind)
@@ -593,7 +587,7 @@ class WhatsAppCollector(TelegramCollector):
         await asyncio.to_thread(self.state.phase,'history','waiting','history_scan_finished')
     async def reconcile_loop(self):
         from .telegram_collector import database_errors
-        delay=self.database_retry
+        backoff=DbBackoff(self)
         while True:
             try:await self.sync_once()
             except ProviderNotReady:
@@ -609,8 +603,8 @@ class WhatsAppCollector(TelegramCollector):
                 await asyncio.to_thread(self.state.phase,'history','error','provider_temporarily_unavailable')
             except database_errors():
                 # Checkpoints are committed per chat; retry instead of reconnecting the provider.
-                await asyncio.sleep(delay); delay=min(60,delay*2); continue
-            delay=self.database_retry
+                await backoff.wait(); continue
+            backoff.reset()
             await asyncio.sleep(self.interval)
     async def drain_loop(self):
         import psycopg
