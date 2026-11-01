@@ -6,7 +6,7 @@ import pytest
 from deedkit_inference.config import Config
 from deedkit_inference.engines import fake
 from pydantic import ValidationError
-from support import chat_body, fk
+from support import chat_body, fk, principal
 
 pytestmark = pytest.mark.anyio
 
@@ -184,6 +184,7 @@ def test_defaults_match_the_card(env):
 
 # spec: ANYM-682
 async def test_a_burst_never_puts_more_jobs_in_the_queue_than_its_bound(env):
+    env.write_policy([principal(concurrent=16)], 1)
     async with env.running(queue_size=1) as s:
         running = s.spawn(s.chat(slow("running", 0.6)))
         await s.until(lambda: s.service.scheduler.active() == 1)
