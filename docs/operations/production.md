@@ -588,8 +588,8 @@ Owner 11-01 (item 3 above) named the tiers, not the forms; the lists below are t
 reading of 11-01 (brief), tightened by review. A release takes the tier of its most dangerous pending
 migration file, changed role file or step. In doubt, or when a statement is not named below: dangerous.
 
-- Dangerous (backup gate and `copy-database` first): DROP of any kind except the old constraint of a
-  proven CHECK widening pair (below), DROP NOT NULL and DROP DEFAULT; TRUNCATE; DELETE, UPDATE or
+- Dangerous (backup gate and `copy-database` first): DROP of any kind except these medium ones: the
+  old constraint of a proven CHECK widening pair (below), DROP NOT NULL, DROP DEFAULT; TRUNCATE; DELETE, UPDATE or
   MERGE of existing rows; RENAME; a narrowing ALTER (a column type change, SET NOT NULL on existing
   data, a new constraint, `NOT VALID` included, or unique index that can reject existing rows); any
   other rewrite of existing data; a data-deleting step (item 2); a top-level SELECT, CALL, DO or COPY
@@ -598,13 +598,14 @@ migration file, changed role file or step. In doubt, or when a statement is not 
   trigger or trigger function on a table the release or its runner writes (`archive_migrations`,
   `probe_metadata`, `fcs.migrations` included), an event trigger (new or already present), an
   expression or partial index that calls a function that is not built in; replacing a function that an
-  existing index, constraint, generated column or default uses.
+  existing index, constraint, generated column or default uses, or that a trigger on a table the
+  release or its runner writes uses.
 - Medium (no fresh backup, no copy; a hand release with its Astra-reviewed plan): non-unique indexes,
   also on existing tables (CONCURRENTLY, or plain under a `SET LOCAL lock_timeout`); CREATE OR REPLACE
   FUNCTION and row triggers that the release itself does not fire (above); a CHECK widening pair proven
   a superset of the old constraint on the same column against the live catalog (by hand: in the plan
   review); DROP NOT NULL, SET or DROP DEFAULT; grants on existing objects, a REVOKE or a role change
-  (role SQL keeps its Astra r1, read-back and undo).
+  (role SQL keeps its Astra r1, read-back and undo; its backup is the latest verified daily one).
 - Low (no fresh backup, no copy; by hand or unattended): what the candidate's `unattended_class` calls
   `expand` and `role_class` calls `additive` (new tables, their indexes and grants, nullable or
   constant-default columns, comments; M1, "Unattended migrations" below).
