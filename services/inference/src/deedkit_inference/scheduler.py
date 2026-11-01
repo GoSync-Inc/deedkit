@@ -256,12 +256,17 @@ class Scheduler:
         except OSError:
             raise ServiceError(502, "engine_failed", "the engine could not start") from None
         job.proc = proc
+        reader = asyncio.create_task(self._read_capped(proc))
         try:
-            stdout = await asyncio.wait_for(self._collect(proc), job.spec.timeout_seconds)
+            await asyncio.wait_for(proc.wait(), job.spec.timeout_seconds)
+            # The child is gone: whatever it left behind in its group goes too, so no orphan keeps the pipe open.
+            kill_group(proc.pid)
+            stdout = await asyncio.wait_for(reader, 5)
         except TimeoutError:
             raise ServiceError(504, "engine_timeout", "the engine did not answer in time") from None
         finally:
             kill_group(proc.pid)
+            reader.cancel()
             with contextlib.suppress(Exception):
                 await asyncio.shield(proc.wait())
             job.proc = None
@@ -274,19 +279,17 @@ class Scheduler:
         if ctx.last:
             job.result = result
 
-    async def _collect(self, proc):
+    async def _read_capped(self, proc):
+        """The child's whole stdout, or None when it prints more than MAX_OUTPUT_BYTES (its group is killed)."""
         data = bytearray()
         while True:
             chunk = await proc.stdout.read(65536)
             if not chunk:
-                break
+                return bytes(data)
             data += chunk
             if len(data) > MAX_OUTPUT_BYTES:
                 kill_group(proc.pid)
-                await proc.wait()
                 return None
-        await proc.wait()
-        return bytes(data)
 
     # --- housekeeping ------------------------------------------------------------------------------------------
     async def _ticker(self):

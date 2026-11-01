@@ -258,6 +258,13 @@ class Running:
     def spawn(self, coro):
         return asyncio.create_task(coro)
 
+    async def submit(self, coro, principal="tester"):
+        """Start a request and wait until its job is accepted, so arrival order is the call order."""
+        before = self.service.quota.used_today(principal)
+        task = asyncio.create_task(coro)
+        await self.until(lambda: self.service.quota.used_today(principal) > before)
+        return task
+
 
 class Env:
     def __init__(self, tmp_path):

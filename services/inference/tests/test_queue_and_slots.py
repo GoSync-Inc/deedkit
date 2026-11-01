@@ -39,7 +39,7 @@ async def test_full_queue_is_503_with_retry_after(env):
     async with env.running(queue_size=2) as s:
         running = s.spawn(s.chat(slow("A")))
         await s.until(lambda: s.service.scheduler.active() == 1)
-        queued = [s.spawn(s.chat(slow(name))) for name in "BC"]
+        queued = [await s.submit(s.chat(slow(name))) for name in "BC"]
         await s.until(lambda: s.service.scheduler.depth() == 2)
         full = await s.chat(slow("D"))
         assert full.status == 503 and full.code == "queue_full"
@@ -55,8 +55,8 @@ async def test_full_queue_is_503_with_retry_after(env):
 # spec: ANYM-682
 async def test_gpu_and_cpu_jobs_overlap_but_never_two_per_slot(env):
     async with env.running() as s:
-        tasks = [s.spawn(s.chat(slow(f"g{i}"))) for i in range(2)]
-        tasks += [s.spawn(s.transcribe(audio(f"c{i}"))) for i in range(2)]
+        tasks = [await s.submit(s.chat(slow(f"g{i}"))) for i in range(2)]
+        tasks += [await s.submit(s.transcribe(audio(f"c{i}"))) for i in range(2)]
         for task in tasks:
             assert (await task).status == 200
     peak_slot, peak_total, overlap = active_profile(fake.EVENTS)
@@ -69,7 +69,7 @@ async def test_gpu_and_cpu_jobs_overlap_but_never_two_per_slot(env):
 # spec: ANYM-682
 async def test_phases_take_their_own_slots_in_order(env):
     async with env.running() as s:
-        tasks = [s.spawn(s.transcribe(audio(name, 0.25), model="audio-two-phase")) for name in "AB"]
+        tasks = [await s.submit(s.transcribe(audio(name, 0.25), model="audio-two-phase")) for name in "AB"]
         for task in tasks:
             assert (await task).status == 200
     position = {(kind, label, index): n for n, (kind, label, index, _slot) in enumerate(fake.EVENTS)}

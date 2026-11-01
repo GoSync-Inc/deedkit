@@ -99,9 +99,13 @@ def test_startup_sweep_removes_leftovers_after_a_hard_kill(env, tmp_path):
     try:
         sentinel = env.tmp / "hard.pids"
         body = json.dumps(chat_body(image=fk(sleep=10, estimate=1, pidfile=str(sentinel)))).encode()
-        thread = threading.Thread(
-            target=lambda: server.http("POST", "/v1/chat/completions", body, {"Content-Type": "application/json"}),
-            daemon=True)
+        def post():
+            try:
+                server.http("POST", "/v1/chat/completions", body, {"Content-Type": "application/json"})
+            except OSError:
+                pass  # the server is killed under it
+
+        thread = threading.Thread(target=post, daemon=True)
         thread.start()
         end = time.monotonic() + 10
         while read_pids(sentinel) is None and time.monotonic() < end:
