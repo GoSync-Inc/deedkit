@@ -56,13 +56,13 @@ async def test_each_admission_rule_refuses_with_its_own_reason(env):
         gpu = await s.chat(job("gpu"))
         assert gpu.status == 503 and gpu.headers["x-admission-reason"] == "load_high"
         assert (await s.transcribe(audio("cpu"))).status == 200
-    # Every phase is charged its full resident_gb plus the reserve, also one of a warm worker: its child is
-    # spawned per phase in this shell, and the rules only ever err towards waiting.
+    # A cold phase is charged its full resident_gb plus the reserve; a warm worker already loaded is charged the
+    # reserve only (its memory is spent, see test_a_warm_engine_is_charged_the_reserve_only...).
     warm = {"vision-default": {"engine_options": {"persistent": True}}}
     async with env.running(aliases=warm) as s:
         assert (await s.chat(job("first"))).status == 200
         assert list(s.service.admission.loaded) == [("vision-default", "vlm")]  # idle, still in the book
-        s.probe.available = 3.5
+        s.probe.available = 2.9  # below the 3 GB reserve alone
         again = await s.chat(job("again"))
         assert again.status == 503 and again.headers["x-admission-reason"] == "memory_low"
     # An engine whose child exited is gone from the book, and is charged as a cold start.
@@ -111,6 +111,49 @@ async def test_stale_or_missing_busy_file_is_busy(env):
     assert read_busy_file(link).problem == "invalid"  # a symlink is not followed
     # A field a later writer adds does not make the file unreadable.
     assert parse_busy(b'{"ts": 1, "between": false, "deedkit_ci": false, "x": 1}').problem is None
+
+
+# spec: ANYM-682
+async def test_a_warm_engine_is_charged_the_reserve_only_and_holds_nothing_back_from_others(env):
+    """Live install 11-02: with the 4.9 GB vision worker loaded the free memory reads about 8 GB, and the next vision
+    request was refused for needing 4.9 + 3 GB again. A loaded engine's memory is already spent."""
+    qwen = {"vision-default": {"engine_options": {"persistent": True}, "phases": [{"name": "vlm", "slot": "gpu", "resident_gb": 4.9}]}}
+    async with env.running(aliases=qwen) as s:
+        assert (await s.chat(job("cold"))).status == 200  # a cold start needs 7.9 GB, and had it
+        assert s.service.admission.warm(("vision-default", "vlm"))
+        s.probe.available = 3.4  # the reserve only: 3.0
+        assert (await s.chat(job("warm"))).status == 200
+        s.probe.available = 2.9
+        refused = await s.chat(job("tight"))
+        assert refused.status == 503 and refused.headers["x-admission-reason"] == "memory_low"
+        assert started() == ["cold", "warm"]
+    fake.EVENTS.clear()
+    # The same figure for a cold start is refused: 3.4 < 4.9 + 3.
+    async with env.running(aliases={"vision-default": {"phases": [{"name": "vlm", "slot": "gpu", "resident_gb": 4.9}]}}) as s:
+        s.probe.available = 3.4
+        cold = await s.chat(job("cold"))
+        assert cold.status == 503 and cold.headers["x-admission-reason"] == "memory_low"
+    fake.EVENTS.clear()
+    # A warm engine that is running holds back nothing from a cold start beside it: its memory is in the free figure.
+    beside = {"vision-default": {"engine_options": {"persistent": True}, "phases": [{"name": "vlm", "slot": "gpu", "resident_gb": 2.0}]},
+              "audio-default": {"phases": [{"name": "stt", "slot": "cpu", "resident_gb": 2.0}]}}
+    async with env.running(aliases=beside) as s:
+        assert (await s.chat(job("warm_up"))).status == 200
+        s.probe.available = 6.0  # 5.0 needed for the cold audio phase, with the vision worker already counted in
+        gpu = s.spawn(s.chat(job("vision", 1.0)))
+        await s.until(lambda: s.service.scheduler.active() == 1)
+        cpu = s.spawn(s.transcribe(audio("audio", 0.2)))
+        await s.until(lambda: s.service.scheduler.active() == 2, timeout=3)  # together, not one after the other
+        assert (await gpu).status == 200 and (await cpu).status == 200
+    # Rule (b) counts a warm engine once: 2.5 loaded plus the same 2.5 again is not 5.0 against a 4.0 cap.
+    fake.EVENTS.clear()
+    tight = {"resident_cap_gb": 4.0, "aliases": {"vision-default": {"engine_options": {"persistent": True},
+             "phases": [{"name": "vlm", "slot": "gpu", "resident_gb": 2.5}]}}}
+    async with env.running(**tight) as s:
+        assert (await s.chat(job("first"))).status == 200
+        assert (await s.chat(job("second"))).status == 200
+        assert not any(e[0] == "unload" for e in fake.EVENTS)  # nothing evicted to make room for itself
+        assert s.service.admission.resident_total() == 2.5
 
 
 # spec: ANYM-682

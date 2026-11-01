@@ -91,9 +91,9 @@ def run(*argv):
 run('say', '-v', 'Milena', '-f', str(HERE / 'voice_ru.txt'), '-o', str(out / 'note_ru.aiff'))
 run('say', '-v', 'Samantha', '-f', str(out / 'voice_en.txt'), '-o', str(out / 'note_en.aiff'))
 for name in ('note_ru', 'note_en'):
-    run('ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(out / f'{name}.aiff'), '-ar', '16000', '-ac', '1', '-c:a', 'libvorbis', str(out / f'{name}.ogg'))
+    run('ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(out / f'{name}.aiff'), '-ar', '16000', '-ac', '1', '-c:a', 'libopus', str(out / f'{name}.ogg'))
 run('ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(out / 'note_ru.ogg'), '-filter_complex',
     '[0:a]aformat=sample_rates=16000[a];anoisesrc=color=pink:amplitude=0.02:seed=11:sample_rate=16000[n];[a][n]amix=inputs=2:duration=first:normalize=0',
-    '-c:a', 'libvorbis', str(out / 'note_ru_noisy.ogg'))
-run('ffmpeg', '-nostdin', '-v', 'error', '-y', '-stream_loop', '16', '-i', str(out / 'note_ru.ogg'), '-c:a', 'libvorbis', str(out / 'note_ru_long.ogg'))
+    '-c:a', 'libopus', str(out / 'note_ru_noisy.ogg'))
+run('ffmpeg', '-nostdin', '-v', 'error', '-y', '-stream_loop', '16', '-i', str(out / 'note_ru.ogg'), '-c:a', 'libopus', str(out / 'note_ru_long.ogg'))
 print('ok', sorted(p.name for p in out.iterdir()))
