@@ -1,14 +1,20 @@
+import base64  # noqa: F401  (kept importable from here)
+import binascii  # noqa: F401
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 import asyncio
+import hashlib  # noqa: F401
 import logging
+import re  # noqa: F401
 from platform_contracts import Capability, safe_error
-from platform_contracts.agent import PLACEHOLDER_REQUEST_ID
+from platform_contracts.agent import MAX_CANDIDATES, PLACEHOLDER_REQUEST_ID, validate_candidate  # noqa: F401
+from .adapters.calls import receipt_reference  # noqa: F401
 
 from .catalog import arguments, CATALOG, InvalidArguments, routed
 from .diagnostics import FAILURE_FIELDS, discovery, manifest_summary, stale_arguments_hint, unavailable, unknown_tool_denial
 from .http_clients import WAIT_POOL, WAIT_RETRY_AFTER_S
 from .policy import Denied, key_from_file
+from .sections import capabilities_view, subscription_blocks  # noqa: F401
 from .tiers import ADVANCED, default_list, REPLACED_BY
 from .dispatch_shaping import (  # noqa: F401  (the moved names stay importable from here)
     CALENDAR_CONSTRAINTS, EXACT_TO, FILE_NAME, INLINE_UPLOAD_FIELDS, MIN_PAYLOAD, MIN_TOKEN, NAMED_WINDOWS, PHONE,
