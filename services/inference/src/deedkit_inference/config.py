@@ -26,11 +26,16 @@ class PhaseSpec(Strict):
     slot: Literal["gpu", "cpu"]
     resident_gb: Annotated[float, Field(ge=0, le=64)]
     share: Annotated[float, Field(gt=0, le=1)] = 1.0
+    # A phase that only some jobs run (the engine picks the route: Russian speech takes one, other languages another).
+    route: Annotated[str, Field(pattern=r"^[a-z0-9_]{1,16}$")] | None = None
 
 
 class AliasSpec(Strict):
     kind: Literal["audio", "chat"]
     scope: Literal["audio", "image", "document"]
+    # More scopes the alias serves (a chat alias that reads images and text-only documents); a key needs the
+    # scope of the request: `image` when it carries an image, else `document`.
+    extra_scopes: Annotated[list[Literal["image", "document"]], Field(max_length=2)] = Field(default_factory=list)
     engine: Annotated[str, Field(pattern=r"^[a-z0-9_-]{1,32}$")]
     engine_options: dict = Field(default_factory=dict)
     timeout_seconds: Annotated[float, Field(ge=0.1, le=7200)]
@@ -41,11 +46,20 @@ class AliasSpec(Strict):
     def consistent(self):
         if (self.kind == "audio") != (self.scope == "audio"):
             raise ValueError("kind_scope_mismatch")
-        if abs(sum(p.share for p in self.phases) - 1.0) > 1e-6:
-            raise ValueError("phase_shares_must_sum_to_one")
+        routes = {p.route for p in self.phases if p.route}
+        shared = sum(p.share for p in self.phases if not p.route)
+        for route in routes or {None}:
+            if abs(shared + sum(p.share for p in self.phases if route and p.route == route) - 1.0) > 1e-6:
+                raise ValueError("phase_shares_must_sum_to_one")
+        if self.extra_scopes and self.kind != "chat":
+            raise ValueError("extra_scopes_need_a_chat_alias")
         if len({p.name for p in self.phases}) != len(self.phases):
             raise ValueError("duplicate_phase_name")
         return self
+
+    @property
+    def scopes(self):
+        return [self.scope, *[s for s in self.extra_scopes if s != self.scope]]
 
 
 class ProbeFigures(Strict):
@@ -69,6 +83,9 @@ class Config(Strict):
     policy_file: str
     busy_file: str
     work_dir: str
+    # The read-only store of verified model files (`deedkit-inference pull` fills it, as another account).
+    model_dir: str = "/Users/Shared/deedkit-inference/models"
+    models_file: str | None = None  # test mode only: the pins come from the package otherwise
     usage_file: str | None = None
     release: Annotated[str, Field(pattern=r"^[A-Za-z0-9._-]{1,64}$")] = "unknown"
     queue_size: Annotated[int, Field(ge=1, le=256)] = 16
@@ -90,7 +107,8 @@ class Config(Strict):
     pump_interval_seconds: Annotated[float, Field(gt=0, le=60)] = 0.5
     supervise_interval_seconds: Annotated[float, Field(gt=0, le=60)] = 2.0
     evict_settle_seconds: Annotated[float, Field(ge=0, le=60)] = 5.0
-    aliases: Annotated[dict[Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")], AliasSpec], Field(min_length=1)]
+    # Empty: the aliases the package ships (aliases.py).
+    aliases: dict[Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,63}$")], AliasSpec] = Field(default_factory=dict)
     test_probe: ProbeFigures | None = None
 
     @field_validator("bind")
@@ -103,22 +121,28 @@ class Config(Strict):
             raise ValueError("bind_must_be_a_loopback_ip") from None
         return value
 
-    @field_validator("policy_file", "busy_file", "work_dir")
+    @field_validator("policy_file", "busy_file", "work_dir", "model_dir")
     @classmethod
     def paths(cls, value):
         return absolute(value)
 
-    @field_validator("usage_file")
+    @field_validator("usage_file", "models_file")
     @classmethod
     def usage_path(cls, value):
         return None if value is None else absolute(value)
 
     @model_validator(mode="after")
     def consistent(self):
+        if not self.aliases:
+            from .aliases import shipped_aliases
+
+            self.aliases = {name: AliasSpec.model_validate(spec) for name, spec in shipped_aliases().items()}
         if self.mode == "test":
             if os.environ.get(TEST_ENV) != "1":
                 raise ValueError("test_mode_needs_testing_env")
         else:
+            if self.models_file is not None:
+                raise ValueError("models_file_in_production_config")
             if any(a.engine == "fake" for a in self.aliases.values()):
                 raise ValueError("fake_engine_in_production_config")
             if self.test_probe is not None:

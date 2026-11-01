@@ -1,5 +1,6 @@
-"""The engine interface. A real engine (ANYM-683) runs in a child process the scheduler spawns and kills;
-this shell ships only the `fake` engine, which tests use and a production config refuses."""
+"""The engine interface. The `fake` engine (tests only; a production config refuses it) runs one child per phase.
+The real engines (`speech`, `vision`, ANYM-683) keep a warm worker per phase, a child process the scheduler
+spawns once, talks to by lines and kills on a timeout, a memory overrun, unload or shutdown."""
 
 import json
 from dataclasses import dataclass, field
@@ -35,12 +36,25 @@ class JobInput:
 
 
 @dataclass
+class EngineEnv:
+    """What an engine needs from the service: its alias and spec, the model store and pins, the work directory."""
+
+    alias: str
+    spec: object
+    model_dir: Path
+    models: dict | None
+    work_root: Path
+    testing: bool = False
+
+
+@dataclass
 class PhaseContext:
     index: int
     count: int
     name: str
     slot: str
     job: JobInput
+    state: dict = field(default_factory=dict)  # per job, shared by the phases of one job
 
     @property
     def last(self):
@@ -52,11 +66,15 @@ class Engine:
     only names the child that does."""
 
     id = "base"
+    worker = False  # True: one warm worker child per phase (see workers.py)
 
     def __init__(self, kind, options):
         self.kind, self.options = kind, options
         # True for an engine that keeps a warm worker between jobs: it stays in the resident book while idle.
-        self.persistent = bool(options.get("persistent", False))
+        self.persistent = bool(options.get("persistent", False)) or self.worker
+        self.workers = {}  # phase name -> Worker (worker engines)
+        # Workers told to exit or killed whose process is not reaped yet: their memory still counts.
+        self.retiring = set()
 
     def precheck(self, path):
         """Raise Rejected for an input that must not reach a model (audio over 4 h, an image over 20 MP)."""
@@ -65,6 +83,19 @@ class Engine:
         """Seconds the whole job is expected to take (audio duration times a real-time factor; a fixed
         figure for an image). `path` is the job's primary file."""
         return 1.0
+
+    def revision(self):
+        """What /v1/models shows as the alias's revision: None for an engine without pinned models."""
+        return None
+
+    def plan(self, spec, job_input, state):
+        """The phases still to run, given what the finished ones left in `state` (`state["done"]` lists them).
+        An engine with routes (the language picks the phase) answers differently as `state` grows."""
+        return list(spec.phases[len(state.get("done", ())):])
+
+    def unavailable(self) -> str | None:
+        """A reason (machine code) when this engine cannot serve now: packages missing, tools missing."""
+        return None
 
     def argv(self, ctx):
         raise NotImplementedError
@@ -84,11 +115,50 @@ class Engine:
 
     def unload(self, phase_name):
         """The scheduler evicted this engine's phase from memory; free it."""
+        worker = self.workers.pop(phase_name, None)
+        if worker is not None:
+            worker.stop()
+            self.retiring.add(worker)
+
+    def retire(self, worker):
+        """A worker was killed or stopped: keep it counted until its process is reaped."""
+        self.retiring.add(worker)
+
+    def retiring_workers(self):
+        self.retiring = {worker for worker in self.retiring if worker.proc.returncode is None}
+        return list(self.retiring)
+
+    def stop_workers(self):
+        for worker in list(self.workers.values()):
+            worker.kill()
+            self.retire(worker)
+        self.workers.clear()
+
+    # --- worker engines -------------------------------------------------------------------------------------
+    def prepare(self, phase_name, cancel=None):
+        """Blocking, off the loop: verify the phase's model files in full and return a WorkerLaunch. `cancel` is a
+        threading.Event the caller sets to stop the hashing early (ModelError "cancelled")."""
+        raise NotImplementedError
+
+    def job_message(self, ctx):
+        raise NotImplementedError
 
 
-def build_engine(spec):
+@dataclass
+class WorkerLaunch:
+    argv: list
+    env: dict
+    scratch: Path
+
+
+def build_engine(spec, env=None):
     from .fake import FakeEngine
+    from .speech import SpeechEngine
+    from .vision import VisionEngine
 
-    registry = {"fake": FakeEngine}
-    cls = registry.get(spec.engine)
-    return None if cls is None else cls(spec.kind, spec.engine_options)
+    if spec.engine == "fake":
+        return FakeEngine(spec.kind, spec.engine_options)
+    cls = {"speech": SpeechEngine, "vision": VisionEngine}.get(spec.engine)
+    if cls is None or env is None or spec.kind != cls.kind:
+        return None
+    return cls(spec.kind, spec.engine_options, env)

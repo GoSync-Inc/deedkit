@@ -9,6 +9,7 @@ import math
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from pydantic import ValidationError
@@ -18,8 +19,9 @@ from starlette.responses import JSONResponse
 
 from .admission import Admission
 from .config import resolve_release, work_path
-from .engines import JobInput, Rejected, build_engine
+from .engines import EngineEnv, JobInput, Rejected, build_engine
 from .errors import ConfigError, ServiceError
+from .models import ModelError, load_models, phase_key
 from .policy import PolicyStore, bearer
 from .probe import StaticProbe, SystemProbe
 from .quota import Quota
@@ -102,10 +104,21 @@ class Service:
         self.workdir = WorkDir(work_path(config), config.work_dir_max_bytes)
         self.workdir.prepare()
         self.engines = {}
+        self.models = None
+        if any(spec.engine != "fake" for spec in config.aliases.values()):
+            try:
+                self.models = load_models(config.models_file)
+            except (ModelError, OSError) as error:
+                raise ConfigError(error.code if isinstance(error, ModelError) else "models_unreadable") from None
         for alias, spec in config.aliases.items():
-            engine = build_engine(spec)
+            env = EngineEnv(alias, spec, Path(config.model_dir), self.models, work_path(config), config.mode == "test")
+            engine = build_engine(spec, env)
             if engine is None:
                 raise ConfigError(f"aliases.{alias}.engine: unknown_engine")
+            if getattr(engine, "worker", False):
+                for phase in spec.phases:
+                    if phase_key(alias, phase.name) not in self.models["phases"]:
+                        raise ConfigError(f"aliases.{alias}.phases.{phase.name}: model_not_pinned")
             self.engines[alias] = engine
         self.admission = Admission(config, probe, wall=wall)
         self.scheduler = Scheduler(config, self.admission, probe)
@@ -168,14 +181,20 @@ class Service:
         self.quota.enter(auth.id)
         return Reservation(self, auth, declared, factor), limit, declared
 
-    def resolve_alias(self, name, kind, auth, ctx):
+    def resolve_alias(self, name, kind, auth, ctx, wanted=None):
+        """`wanted` is the scope of this request when the alias serves several (image or document)."""
         spec = self.config.aliases.get(name) if isinstance(name, str) else None
         if spec is None or spec.kind != kind:
             raise ServiceError(404, "unknown_model", "no such model alias")
         ctx.alias = name
-        if spec.scope not in auth.scopes:
+        needed = wanted if wanted in spec.scopes and len(spec.scopes) > 1 else spec.scope
+        if needed not in auth.scopes:
             raise ServiceError(403, "scope_denied", "the key has no scope for this model")
-        return spec, self.engines[name]
+        engine = self.engines[name]
+        if engine.unavailable() is not None:
+            raise ServiceError(503, "engine_unavailable", "the engine cannot serve this request now",
+                               retry_after=self.config.retry_after_seconds)
+        return spec, engine
 
     async def precheck(self, engine, paths):
         try:
@@ -326,9 +345,10 @@ def create_app(config, probe=None, wall=time.time):
         auth = service.authenticate(request)
         ctx.principal = auth.id
         data = [
-            {"id": name, "object": "model", "scopes": [spec.scope], "engine": spec.engine, "revision": None}
+            {"id": name, "object": "model", "scopes": spec.scopes, "engine": spec.engine,
+             "revision": service.engines[name].revision()}
             for name, spec in sorted(config.aliases.items())
-            if spec.scope in auth.scopes
+            if auth.scopes & set(spec.scopes)
         ]
         return JSONResponse({
             "object": "list",
@@ -381,9 +401,11 @@ def create_app(config, probe=None, wall=time.time):
             except ValidationError as error:
                 raise invalid(validation_message(error)) from None
             del payload
-            spec, engine = service.resolve_alias(chat_request.model, "chat", reservation.auth, ctx)
+            spec, engine = service.resolve_alias(chat_request.model, "chat", reservation.auth, ctx,
+                                                 "image" if chat_request.image_count() else "document")
             images, prompt = extract_inputs(chat_request, directory)
             (directory / "prompt.txt").write_text(prompt)
+            (directory / "messages.json").write_text(json.dumps(message_texts(chat_request)))
             primary = images[0] if images else directory / "prompt.txt"
             job_input = JobInput("chat", directory, images, primary,
                                  {"max_tokens": chat_request.max_tokens or spec.default_max_tokens})
@@ -411,6 +433,16 @@ def load_json(path):
         return json.loads(path.read_bytes(), object_pairs_hook=unique)
     except (ValueError, UnicodeDecodeError, RecursionError):
         raise invalid("the body is not valid JSON") from None
+
+
+def message_texts(chat_request):
+    """[{role, text}]: the text parts of each message joined, for an engine that builds its own chat prompt."""
+    result = []
+    for message in chat_request.messages:
+        parts = [message.content] if isinstance(message.content, str) else message.content
+        text = "\n".join(p if isinstance(p, str) else p.text for p in parts if isinstance(p, str) or p.type == "text")
+        result.append({"role": message.role, "text": text})
+    return result
 
 
 def extract_inputs(chat_request, directory):

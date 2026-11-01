@@ -6,18 +6,22 @@ the queue bound and the slot are decided atomically."""
 
 import asyncio
 import contextlib
+import json
 import logging
-import os
-import signal
+import shutil
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 
 from .engines import BadOutput, PhaseContext
 from .errors import ServiceError
+from .workers import Worker, WorkerFailed, kill_group
 
 LOG = logging.getLogger("deedkit_inference.scheduler")
 MAX_OUTPUT_BYTES = 8 * 1024 * 1024
+#: A warm worker over this multiple of its phase's resident_gb loses its process group.
+MEMORY_SHARE_FACTOR = 1.5
 
 
 @dataclass
@@ -34,6 +38,10 @@ class Job:
     result: object = None
     proc: asyncio.subprocess.Process | None = None
     kill_reason: str | None = None
+    state: dict = field(default_factory=dict)  # what finished phases left for the next ones ("done", the language)
+
+    def remaining(self):
+        return self.engine.plan(self.spec, self.input, self.state)
 
 
 @dataclass
@@ -45,6 +53,7 @@ class Waiter:
     est: float
     expires: float  # monotonic time after which this wait is over, whatever the slot does
     granted: bool = False
+    later: bool = False  # the job has another phase after this one
 
 
 @dataclass
@@ -54,6 +63,7 @@ class Running:
     key: tuple
     started: float
     est: float
+    later: bool = False
 
 
 @dataclass
@@ -61,11 +71,6 @@ class Slot:
     name: str
     running: Running | None = None
     queue: deque = field(default_factory=deque)
-
-
-def kill_group(pgid):
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(pgid, signal.SIGKILL)
 
 
 def slot_busy(retry_after, message="the job waited past its deadline in the queue"):
@@ -78,6 +83,7 @@ class Scheduler:
         self.slots = {"gpu": Slot("gpu"), "cpu": Slot("cpu")}
         self.draining = False
         self.tasks = set()
+        self.engines = set()  # worker engines that have been given a job: their workers are watched and killed
         self._background = []
 
     # --- life ------------------------------------------------------------------------------------------
@@ -98,6 +104,8 @@ class Scheduler:
         for slot in self.slots.values():
             if slot.running and slot.running.job.proc:
                 kill_group(slot.running.job.proc.pid)
+        for engine in self.engines:
+            engine.stop_workers()
         for task in list(self.tasks):
             task.cancel()
 
@@ -113,9 +121,7 @@ class Scheduler:
 
     def transit(self):
         """Running jobs that have a later phase: each will queue again for its next slot."""
-        return sum(
-            1 for s in self.slots.values() if s.running and s.running.index < len(s.running.job.spec.phases) - 1
-        )
+        return sum(1 for s in self.slots.values() if s.running and s.running.later)
 
     def estimated_wait(self, slot_name):
         slot = self.slots[slot_name]
@@ -135,7 +141,8 @@ class Scheduler:
         """The arrival checks, in order, then the queue step. Raises ServiceError; otherwise the job is counted
         and its task runs."""
         cfg = self.config
-        first = job.spec.phases[0]
+        remaining = job.remaining()
+        first = remaining[0]
         if self.draining:
             raise ServiceError(503, "draining", "the service is shutting down", retry_after=cfg.retry_after_seconds)
         key = (job.alias, first.name)
@@ -156,17 +163,19 @@ class Scheduler:
                                retry_after=self.until_utc_midnight())
         # One synchronous step: queue the job, let the pump grant a free slot, then bound the queue.
         slot = self.slots[first.slot]
-        waiter = self._waiter(job, 0, first)
+        waiter = self._waiter(job, 0, first, remaining)
         slot.queue.append(waiter)
         self._pump(slot)
         if waiter.fut.done():
             error = waiter.fut.exception()
             if error is not None:
                 raise error
-        if self._over_bound(waiter, len(job.spec.phases) > 1):
+        if self._over_bound(waiter, len(remaining) > 1):
             self._abandon(slot, waiter)
             raise ServiceError(503, "queue_full", "the queue is full", retry_after=cfg.retry_after_seconds)
         quota.accept(principal)
+        if job.engine.worker:
+            self.engines.add(job.engine)
         task = asyncio.create_task(self._run(job, waiter))
         self.tasks.add(task)
         task.add_done_callback(lambda done: self._finished(done, job))
@@ -201,30 +210,36 @@ class Scheduler:
 
     # --- running a job -------------------------------------------------------------------------------------
     async def _run(self, job, first_waiter):
-        for index, phase in enumerate(job.spec.phases):
-            await self._enter(job, index, phase, first_waiter if index == 0 else None)
+        """The phases the engine plans, one after the other; the plan is asked again after each, because what a
+        phase found (the language of a voice note) can change which phase comes next."""
+        done = job.state.setdefault("done", [])
+        while remaining := job.remaining():
+            index, phase = len(done), remaining[0]
+            await self._enter(job, index, phase, remaining, first_waiter if index == 0 else None)
             try:
-                await self._execute(job, index, phase)
+                await self._execute(job, index, phase, len(remaining))
             except BaseException:
                 # The child group is dead (crash, timeout, kill, cancel): its memory is back, drop the book entry.
                 self.admission.drop((job.alias, phase.name))
                 raise
             finally:
                 self._leave(job, phase)
+            done.append(phase.name)
         return job.result
 
-    def _waiter(self, job, index, phase):
-        remaining = job.estimate * sum(p.share for p in job.spec.phases[index:])
+    def _waiter(self, job, index, phase, remaining):
+        left = job.estimate * sum(p.share for p in remaining)
         limit = self.config.max_wait_seconds
         if job.deadline is not None:
-            limit = min(limit, job.deadline - (self.now() - job.accepted) - remaining)
+            limit = min(limit, job.deadline - (self.now() - job.accepted) - left)
         future = asyncio.get_running_loop().create_future()
-        return Waiter(job, index, phase, future, self.phase_estimate(job, phase), self.now() + limit)
+        return Waiter(job, index, phase, future, self.phase_estimate(job, phase), self.now() + limit,
+                      later=len(remaining) > 1)
 
-    async def _enter(self, job, index, phase, waiter):
+    async def _enter(self, job, index, phase, remaining, waiter):
         slot = self.slots[phase.slot]
         if waiter is None:
-            waiter = self._waiter(job, index, phase)
+            waiter = self._waiter(job, index, phase, remaining)
             slot.queue.append(waiter)
             self._pump(slot)
         try:
@@ -287,6 +302,8 @@ class Scheduler:
                 continue
             if verdict.action == "wait":
                 return
+            if verdict.action == "go" and any(engine.retiring_workers() for engine in self.engines):
+                return  # an evicted or killed worker is not reaped yet: its memory is still in use
             if self.now() > waiter.expires:  # the probes above may have taken the time that was left
                 slot.queue.popleft()
                 waiter.fut.set_exception(slot_busy(self.config.retry_after_seconds))
@@ -295,13 +312,23 @@ class Scheduler:
             if verdict.action == "refuse":
                 waiter.fut.set_exception(self.closed(verdict.reason))
                 continue
-            slot.running = Running(job, waiter.index, key, self.now(), waiter.est)
+            slot.running = Running(job, waiter.index, key, self.now(), waiter.est, waiter.later)
             self.admission.mark_running(key, phase.resident_gb, job.engine, phase.name)
             waiter.granted = True
             waiter.fut.set_result(None)
 
-    async def _execute(self, job, index, phase):
-        ctx = PhaseContext(index, len(job.spec.phases), phase.name, phase.slot, job.input)
+    async def _execute(self, job, index, phase, left):
+        ctx = PhaseContext(index, index + left, phase.name, phase.slot, job.input, job.state)
+        stdout = await (self._call_worker(job, ctx, phase) if job.engine.worker else self._run_child(job, ctx))
+        try:
+            result = job.engine.parse(ctx, stdout)
+        except BadOutput:
+            raise ServiceError(502, "engine_failed", "the engine returned an invalid answer") from None
+        if ctx.last:
+            job.result = result
+
+    async def _run_child(self, job, ctx):
+        """One child for this phase: it runs, answers on stdout and its group is killed."""
         try:
             argv = job.engine.argv(ctx)
             proc = await asyncio.create_subprocess_exec(
@@ -328,12 +355,71 @@ class Scheduler:
             job.proc = None
         if job.kill_reason or proc.returncode != 0 or stdout is None:
             raise ServiceError(502, "engine_failed", "the engine failed")
+        return stdout
+
+    def _discard_worker(self, engine, phase_name, worker):
+        if worker is not None:
+            if engine.workers.get(phase_name) is worker:
+                del engine.workers[phase_name]
+            worker.kill()
+            engine.retire(worker)
+
+    @staticmethod
+    async def _prepare(engine, phase_name):
+        """engine.prepare in a thread (it hashes the model files in full). A timeout or a cancel stops the hashing at
+        its next chunk and the job keeps its slot until the thread is done, so no hashing outlives its admission and
+        a launch that finished anyway has its scratch directory removed."""
+        cancel = threading.Event()
+        task = asyncio.ensure_future(asyncio.to_thread(engine.prepare, phase_name, cancel))
         try:
-            result = job.engine.parse(ctx, stdout)
-        except BadOutput:
-            raise ServiceError(502, "engine_failed", "the engine returned an invalid answer") from None
-        if ctx.last:
-            job.result = result
+            return await asyncio.shield(task)
+        except BaseException:
+            cancel.set()
+            while not task.done():
+                try:
+                    await asyncio.wait({task})
+                except asyncio.CancelledError:
+                    pass
+            if task.exception() is None:
+                shutil.rmtree(task.result().scratch, ignore_errors=True)
+            raise
+
+    async def _call_worker(self, job, ctx, phase):
+        """Send the phase's job to the warm worker of `<alias>/<phase>`, starting it first when there is none (model
+        files verified in full, then loaded). The whole call is bounded by the alias's timeout; a worker that fails,
+        times out or is cancelled mid-job dies with its group, so no half-answered job is ever reused."""
+        engine, worker = job.engine, job.engine.workers.get(phase.name)
+        try:
+            async with asyncio.timeout(job.spec.timeout_seconds):
+                if worker is None or not worker.alive():
+                    self._discard_worker(engine, phase.name, worker)
+                    launch = await self._prepare(engine, phase.name)
+                    try:
+                        worker = await Worker.spawn(launch.argv, launch.env, launch.scratch, (job.alias, phase.name),
+                                                    phase.resident_gb)
+                    except OSError:
+                        shutil.rmtree(launch.scratch, ignore_errors=True)
+                        raise ServiceError(502, "engine_failed", "the engine could not start") from None
+                    engine.workers[phase.name] = worker
+                    await worker.ready()
+                worker.job = job
+                line = await worker.call({"op": "job", "job": engine.job_message(ctx)})
+            answer = json.loads(line)
+            if not isinstance(answer, dict) or answer.get("ok") is not True:
+                raise WorkerFailed("job_failed")
+            return json.dumps(answer.get("result")).encode()
+        except TimeoutError:
+            self._discard_worker(engine, phase.name, worker)
+            raise ServiceError(504, "engine_timeout", "the engine did not answer in time") from None
+        except (WorkerFailed, ValueError):
+            self._discard_worker(engine, phase.name, worker)
+            raise ServiceError(502, "engine_failed", "the engine failed") from None
+        except BaseException:
+            self._discard_worker(engine, phase.name, worker)
+            raise
+        finally:
+            if worker is not None:
+                worker.job = None
 
     async def _read_capped(self, proc):
         """The child's whole stdout, or None when it prints more than MAX_OUTPUT_BYTES (its group is killed)."""
@@ -357,16 +443,58 @@ class Scheduler:
             self._pump_all()
 
     async def _supervisor(self):
-        """When the children together exceed the hard cap, the largest one loses its process group."""
+        """Every warm worker over MEMORY_SHARE_FACTOR times its phase's resident_gb loses its process group; when the
+        children together (running one-shot children and all workers, idle ones too) still exceed the hard cap, the
+        largest loses its group."""
         while True:
             await asyncio.sleep(self.config.supervise_interval_seconds)
-            sizes = []
-            for job in self.children():
-                proc = job.proc
-                if proc is not None:
-                    sizes.append((await asyncio.to_thread(self.probe.rss_gb, proc.pid), job))
+            sizes = await self._measure()
             if sizes and sum(size for size, _ in sizes) > self.config.resident_hard_cap_gb:
                 _, victim = max(sizes, key=lambda item: item[0])
-                victim.kill_reason = "memory_hard_cap"
-                if victim.proc is not None:
-                    kill_group(victim.proc.pid)
+                self._kill_victim(victim, "memory_hard_cap")
+
+    async def _measure(self):
+        """(rss, victim) for every child that holds memory; victim = ("job", job) | ("worker", engine, phase name,
+        worker) | ("retiring", worker). A probe awaits a thread, so a worker can retire between two reads: each
+        process group is counted once, and a worker that was killed (its memory is already coming back) not at all."""
+        sizes, seen = [], set()
+        for job in self.children():
+            if job.proc is not None:
+                seen.add(job.proc.pid)
+                sizes.append((await asyncio.to_thread(self.probe.rss_gb, job.proc.pid), ("job", job)))
+        for engine in list(self.engines):
+            for name, worker in list(engine.workers.items()):
+                if worker.alive():
+                    seen.add(worker.proc.pid)
+                    size = await asyncio.to_thread(self.probe.rss_gb, worker.proc.pid)
+                    victim = ("worker", engine, name, worker)
+                    if size > MEMORY_SHARE_FACTOR * worker.resident_gb:
+                        self._kill_victim(victim, "memory_share")
+                    else:
+                        sizes.append((size, victim))
+        for engine in list(self.engines):
+            for worker in engine.retiring_workers():
+                if worker.killed or worker.proc.pid in seen:
+                    continue
+                seen.add(worker.proc.pid)
+                size = await asyncio.to_thread(self.probe.rss_gb, worker.proc.pid)
+                sizes.append((size, ("retiring", worker)))
+        return sizes
+
+    def _kill_victim(self, victim, reason):
+        if victim[0] == "retiring":
+            kill_group(victim[1].proc.pid)
+            return
+        if victim[0] == "job":
+            job = victim[1]
+            job.kill_reason = reason
+            if job.proc is not None:
+                kill_group(job.proc.pid)
+            return
+        _, engine, name, worker = victim
+        idle = worker.job is None
+        if worker.job is not None:
+            worker.job.kill_reason = reason
+        self._discard_worker(engine, name, worker)
+        if idle:
+            self.admission.drop(worker.key)  # gone from the resident book as well

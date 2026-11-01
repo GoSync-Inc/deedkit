@@ -14,6 +14,7 @@ Files:
 | `chat_image.request.json`, `chat_document.request.json` | `POST /v1/chat/completions`: `headers` (besides `Authorization: Bearer <key>`, which the client adds) and the exact `json` body. The prompt is `enrichment_providers.PROMPT`; `max_tokens` is the profile's `max_output_tokens` (default 2000) |
 | `audio_transcription.request.json`, `audio_transcription_verbose.request.json` | `POST /v1/audio/transcriptions`: `multipart.fields` and the `file` part (`filename`, `content_type`, `base64`); the multipart boundary is the client's |
 | `*.response.json` | the golden answer: `status` and `body`. In the chat bodies `id` is `chatcmpl-<request id>` and `created` is `0`: a comparison replaces both |
+| `chat_image_engine.response.json`, `audio_transcription_verbose_engine.response.json` | ANYM-683: what the real engines' pipeline (fake runtime, fixed steering) answers: a chat model answer in a code fence reshaped to the JSON object with `title`, `summary`, `document_type`, `text`; a Russian voice note's verbose transcript. The service tests reproduce them; `tests/test_inference_contract.py` feeds every `*.response.json` through the real `normalize_result` |
 | `errors.golden.json` | the error envelope of the service's own answers, by name |
 
 `X-Request-Deadline-Seconds` is the profile's `timeout_seconds`. Model values are aliases (`vision-default`,
