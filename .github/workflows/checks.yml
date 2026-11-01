@@ -610,8 +610,8 @@ jobs:
           node --test --test-reporter=junit tests/*.test.mjs > "$RUNNER_TEMP/ci-evidence/calls-frontend.xml"
           npm run build
       - name: Inference service tests
-        id: inference
-        # ANYM-682: the shared inference service for the Mac mini, fake engines and an injected probe. Its own
+        # ANYM-682: the shared inference service for the Mac mini, fake engines and an injected probe. No step id:
+        # tests/test_tiden_ci.py pins the id set of this job to the Tiden modules. Its own
         # lock and environment; no report in ci-evidence, so the module checks and the evidence set stay as they are.
         if: ${{ !cancelled() && steps.source.outcome == 'success' }}
         working-directory: services/inference
