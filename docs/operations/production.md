@@ -522,8 +522,8 @@ Before applying, follow [backup/migration and rollback](platform-cutover.md).
 This tool runs no migration by hand (`deploy` runs the qualifying messaging ones itself, "Unattended
 migrations" below), does not prove data compatibility, authorize external
 actions, or perform provider readback. A schema change needs the module's explicit
-migration procedure first; a contract or destructive one also the backup gate below (an additive
-release has none, item 3 below). Confirm that the pinned
+migration procedure first; a dangerous one also the backup gate below (a low or medium one has none,
+"Migration risk tiers" below). Confirm that the pinned
 backup/restore runtimes support both the current database schema and the planned
 target, so the daily backup keeps running after the migration. For the backup gate: resolve delivery
 failures, including receiver quota/capacity failures,
@@ -560,31 +560,54 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
    after it, in migration order; a procedure's "schema-N release" is the prepared release. A
    `migrate` retried after `LockNotAvailable` stays under the same gate.
 2. After the release, no backup is required unless the release deletes data: before such a step
-   (045 step 7, `purge-deleted --apply`) a fresh verified backup at the new schema. Otherwise the
-   next scheduled daily backup follows as usual.
+   (045 step 7, `purge-deleted --apply`, dangerous by "Migration risk tiers") a fresh verified backup
+   at the new schema. Otherwise the next scheduled daily backup follows as usual.
 3. Owner 10-29: «я бы максимально облегчил этот. сценарий и снял бы запрет на этот просто катил бы
    вот эти все штуки сейчас не дожидаясь и делал такую процедуру сложную очень-очень редко»; «Я готов
-   принять риск максимально. облегчить этот процесс.» An additive release has no backup gate: no
-   fresh backup, no restore proof, no wait for a proof, no hold and no backup-age check; the
-   scheduled daily backup is its restore point. A release is additive when every pending
-   migration file is `expand` by the candidate's `unattended_class` (no DROP of any kind), every
-   changed role file is `additive` by `role_class` (the classes of M1, "Unattended migrations"
-   below; the release kit records each file's class) and it has no data-deleting step (item 2).
-   This holds for messaging and calendar, by hand or unattended. A database with no scheduled
-   daily backup running (calendar while its timer is off, ANYM-607) keeps a restore point anyway:
-   unattended, its pre-migration copy (Database copies); by hand, `copy-database` first. Any other release (a contract:
-   drop, rename, narrow, the CHECK widening pair, a revoke, a data-deleting step or a file of
-   another class) needs the backup gate above: a fresh backup and its restore proof, never a
-   reused daily backup.
+   принять риск максимально. облегчить этот процесс.» Owner 11-01: «с копией базы надо только при
+   опасных миграциях при ластовых и медиум рисках это не обязательно короче не хочется чтоб это был
+   ботлнек у нас эти бек апы». A low or medium release ("Migration risk tiers" below) has no backup
+   gate and no pre-migration copy: no fresh backup, no restore proof, no wait for a proof, no hold, no
+   backup-age check and no `copy-database`; the latest verified daily backup is its restore point. This
+   holds for messaging and calendar, by hand or unattended. A database with no scheduled daily backup
+   running (calendar while its timer is off, ANYM-607) keeps a restore point anyway: unattended, its
+   pre-migration copy (Database copies); by hand, `copy-database` first. A dangerous release needs the
+   backup gate above (a fresh backup and its restore proof, never a reused daily backup) and
+   `copy-database` first. The release kit records each file's class and tier.
 
-   Accepted risk (owner 10-29, quoted above): if an additive `migrate` destroys or corrupts data, a
+   Accepted risk (owner 10-29 and 11-01, quoted above): if a low or medium `migrate` destroys or corrupts data, a
    restore returns the database to the latest daily backup (about 24 hours old at most while the
    daily backup succeeds), and everything written after it (messages, receipts, keys, operator
    changes) is lost.
 
+### Migration risk tiers
+
+Owner 11-01 (item 3 above). A release takes the tier of its most dangerous pending migration file,
+changed role file or step. In doubt, or when a statement is not named below: dangerous.
+
+- Dangerous (backup gate and `copy-database` first): DROP of any kind except the old constraint of a
+  CHECK widening pair; TRUNCATE; DELETE, UPDATE or MERGE of existing rows; RENAME; a narrowing ALTER
+  (a column type change, SET NOT NULL on existing data, a new constraint or unique index that can
+  reject existing rows); any other rewrite of existing data; a data-deleting step (item 2); a REVOKE
+  or role/login change; a top-level SELECT, CALL, DO or COPY other than the classifiers' known
+  preconditions.
+- Medium (no fresh backup, no copy): non-unique indexes, also on existing tables (CONCURRENTLY, or plain under a
+  `SET LOCAL lock_timeout`); CREATE OR REPLACE FUNCTION; triggers; the CHECK widening pair; grants on
+  existing objects (role SQL keeps its Astra r1).
+- Low (no fresh backup, no copy): what the candidate's `unattended_class` calls `expand` and
+  `role_class` calls `additive` (new tables, their indexes and grants, nullable or constant-default
+  columns, comments; M1, "Unattended migrations" below).
+
+The tier decides the backup and the copy only; which release runs it does not change: only low files
+run unattended, medium and dangerous ones are hand releases under their procedures, and every
+other gate (role SQL review, active-call check, the release order) stays. Until ANYM-675 ships, the
+author names each `manual` file's tier in its PR and release kit (reviewed with it), and the deployer
+still copies before every unattended range because its rehearsal runs on the copy.
+
 ### Database copies
 
-ANYM-588. `production.py copy-database --config <plan A config> --database <name> --sha <sha>` makes an
+ANYM-588. A copy is required only before a dangerous migration, or for a database with no daily backup
+running ("Migration risk tiers"; owner 11-01). `production.py copy-database --config <plan A config> --database <name> --sha <sha>` makes an
 exactly checked copy of one live database on this host without stopping its writers, proves it restores
 and leaves nothing running. Automatic migrations (ANYM-449) call the same function; a hand release kit can
 call the command. It runs under the plan A lock, like `prepare`.
@@ -650,7 +673,9 @@ Undo: none needed; a copy changes no database. To remove a copy at once: `rm -r
 
 ### Unattended migrations
 
-ANYM-449, owner 2026-10-28: «Да, добавление миграции автоматически с копией.» `deploy` applies a messaging
+ANYM-449, owner 2026-10-28: «Да, добавление миграции автоматически с копией.» (For low and medium
+migrations owner 11-01 dropped the copy as a restore point, "Migration risk tiers"; the copy below stays
+as the rehearsal's scratch database until ANYM-675.) `deploy` applies a messaging
 range itself only when every step below passes; anything else pauses with today's text and you migrate by
 hand (above). Nothing is retried, a migration is never reversed and nothing is restored automatically (a
 restore is the gated restore procedure, from the copy or the backup).

@@ -9,24 +9,33 @@
      BACKUP.md, BACKUP_R2.md, MEDIA_STORAGE.md, ENRICHMENT.md, SUBSCRIPTIONS.md, TELEMETRY.md and the decision log.
      After the owner's confirmation it changes only by a new owner decision. -->
 
-Status: draft, not yet confirmed by the owner. Until the orchestrator records the owner's one confirmation
-(a `user-data` ask) as a line here, this file covers nothing: every user-data question goes to the owner, and
-the lines below only describe current behaviour and the decisions on record.
+Status: confirmed by the owner 11-01 («5) я согласен но с копией базы надо только при опасных миграциях при
+ластовых и медиум рисках это не обязательно короче не хочется чтоб это был ботлнек у нас эти бек апы»;
+~/deedkit-orchestrator/DECISIONS.md 11-01). It covers each line below within its cited scope. A part still
+marked `proposal` has no owner decision and covers nothing: a question there goes to the owner as a
+`user-data` ask.
 
 Data held: messages, chats, contacts and sender identities, attachments (originals, extracted text,
 transcripts, descriptions), receipts, call records and calendar data from the owner's own messenger and
 calendar accounts; stores: PostgreSQL, the original/media directory, the private R2 cold archive of
-originals, encrypted backups on the shared backup server and its object storage, service logs. Proposal:
-the owner has decided parts (below), not this inventory as a whole.
+originals, encrypted backups on the shared backup server and its object storage, service logs (confirmed with this
+file, owner 11-01).
 
 - Retention: processed, unpinned originals may leave local disk after 30 days without a request, only
   with a verified cold copy; text, titles, summaries and transcripts stay (MEDIA_STORAGE.md; owner 10-17
   cold archive «yes»; owner 10-18 BL-33 disk vs retention «давай оставим как есть если так работает»).
   Backup copies age out by the backup rotation (BACKUP.md). Messages and other kinds: proposal (no
   owner decision on a limit).
-- Pre-migration database copies (ANYM-588, docs/operations/production.md "Database copies"): the
-  deployer copies a database before a migration (owner 10-28 «добавление миграции автоматически с
-  копией»). The copy is plaintext, root-only, on the production host's disk, never leaves the host and is
+- Message content: everything that arrives in a message (its text, the labels and links of its inline and
+  reply buttons, its link previews) is stored and deleted under the message-text rules of this file
+  (retention above, deletion below; owner 11-01 «4 да»).
+- Pre-migration database copies and backups (ANYM-588, docs/operations/production.md "Migration risk
+  tiers" and "Database copies"): only a dangerous migration gets a fresh verified backup and a
+  pre-migration copy; a low or medium one gets neither, and the latest verified daily backup is its
+  restore point (owner 11-01, quoted in Status, replacing owner 10-28 «добавление миграции
+  автоматически с копией» for low and medium ones). A database with no daily backup running keeps its
+  copy. Until ANYM-675 ships, the deployer still copies before every unattended migration (its rehearsal
+  runs on the copy). The copy is plaintext, root-only, on the production host's disk, never leaves the host and is
   deleted after 48 h, whatever its state (the orchestrator's reading of 2026-10-28; a later owner line may
   tighten it). Its receipts hold table names, row counts, sizes, hashes, times and failure codes only.
 - Deletion: a message deleted in the messenger (for everyone, the owner's own delete-for-me when
@@ -74,7 +83,10 @@ the owner has decided parts (below), not this inventory as a whole.
     autoloop's tool-less reader on the owner's workstation (owner decision D1, ANYM-264); for a principal in
     the autoloop config, a card in the card worker's own words, with no quote, name, phone number or message
     content, goes to Tiden and GitHub (owner 10-26, ANYM-568; SUBSCRIPTIONS.md:345-353).
-  - Model providers for enrichment (ENRICHMENT.md: OpenAI, Anthropic, Gemini endpoints; Codex not deployed)
-    and Tiden error tracking (TELEMETRY.md, off by default): proposal, which fields go where is not yet an
+  - Media understanding (photos, audio, files): local models on the owner's Mac mini; media and their
+    extracted text travel to it over the tailnet only and reach no cloud model provider (owner 11-01 «2 b»).
+    Decided, not yet built. The cloud enrichment endpoints (ENRICHMENT.md: OpenAI, Anthropic, Gemini;
+    Codex not deployed) stay off: enabling one is a `user-data` ask.
+  - Tiden error tracking (TELEMETRY.md, off by default): proposal, which fields go where is not yet an
     owner decision.
   - Any other recipient or field is a `user-data` ask before it ships.
