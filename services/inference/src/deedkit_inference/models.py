@@ -104,9 +104,11 @@ def phase_dir(store, alias, phase):
     return Path(store) / alias / phase
 
 
-def hash_open(fd, size_limit):
+def hash_open(fd, size_limit, cancel=None):
     digest, total = hashlib.sha256(), 0
     while True:
+        if cancel is not None and cancel.is_set():
+            raise ModelError("cancelled")
         chunk = os.read(fd, CHUNK)
         if not chunk:
             return digest.hexdigest(), total
@@ -116,7 +118,7 @@ def hash_open(fd, size_limit):
         digest.update(chunk)
 
 
-def hash_file(path, size_limit=MAX_FILE_BYTES):
+def hash_file(path, size_limit=MAX_FILE_BYTES, cancel=None):
     """Full sha256 and size of a regular file, never through a symlink. No cache of any kind."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
@@ -125,7 +127,7 @@ def hash_file(path, size_limit=MAX_FILE_BYTES):
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ModelError("model_file_not_regular")
-        return hash_open(fd, size_limit)
+        return hash_open(fd, size_limit, cancel)
     finally:
         os.close(fd)
 
@@ -183,7 +185,7 @@ def scan_artifact(directory, files):
             scan_npz(path)
 
 
-def verify_artifact(directory, entry):
+def verify_artifact(directory, entry, cancel=None):
     """Every pinned file present with the pinned size and sha256, nothing else in the directory."""
     directory = Path(directory)
     try:
@@ -196,13 +198,13 @@ def verify_artifact(directory, entry):
     if present != set(entry["files"]):
         raise ModelError("model_files_differ")
     for name, pinned in entry["files"].items():
-        digest, size = hash_file(directory / name, pinned["size"])
+        digest, size = hash_file(directory / name, pinned["size"], cancel)
         if size != pinned["size"] or digest != pinned["sha256"]:
             raise ModelError("model_file_mismatch", name)
     scan_artifact(directory, entry["files"])
 
 
-def verify_phase(models, store, alias, phase):
+def verify_phase(models, store, alias, phase, cancel=None):
     """The paths of a phase's artifacts, after the full check; ModelError otherwise."""
     artifacts = models["phases"].get(phase_key(alias, phase))
     if artifacts is None:
@@ -214,7 +216,7 @@ def verify_phase(models, store, alias, phase):
         raise ModelError("model_files_differ")
     paths = {}
     for name, entry in artifacts.items():
-        verify_artifact(root / name, entry)
+        verify_artifact(root / name, entry, cancel)
         paths[name] = root / name
     return paths
 

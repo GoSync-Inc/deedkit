@@ -1,9 +1,13 @@
 import asyncio
 import json
 import os
+import stat
+import sys
 import time
 
 import pytest
+from deedkit_inference import media
+from deedkit_inference.models import verify_phase
 from engine_support import engines, vis
 from support import fk
 
@@ -40,6 +44,73 @@ async def test_timeout_kills_the_whole_process_group(env):
         assert s.work_entries() == []  # the worker's scratch directory went with it
         # The service goes on: the next job gets a fresh worker.
         assert (await s.transcribe(fk(), extra_fields={"language": "ru"})).status == 200
+
+
+# spec: ANYM-683
+def test_ffmpeg_helper_stays_in_the_workers_process_group(tmp_path):
+    """A worker killed by its group takes its decoder with it, and the supervisor's group size includes the decoder."""
+    marker, hang_pid = tmp_path / "pgid", tmp_path / "hang.pid"
+    tool, hang = tmp_path / "ffmpeg", tmp_path / "hang"
+    tool.write_text(f"#!{sys.executable}\nimport os, sys\nopen({str(marker)!r}, 'w').write(str(os.getpgid(0)))\n"
+                    "open(sys.argv[-1], 'wb').write(b'0' * 100)\n")
+    hang.write_text(f"#!{sys.executable}\nimport os, time\nopen({str(hang_pid)!r}, 'w').write(str(os.getpid()))\n"
+                    "time.sleep(600)\n")
+    for item in (tool, hang):
+        item.chmod(item.stat().st_mode | stat.S_IXUSR)
+    assert media.chunk_wav(str(tool), "in.wav", 0.0, 1.0, str(tmp_path / "w.wav"), 10.0)
+    assert int(marker.read_text()) == os.getpgrp()  # the caller's group, not a new session
+    # A decoder that hangs is still killed and reaped when its own timeout runs out.
+    assert media.run_tool([str(hang)], 0.5, own_group=False) == (None, b"")
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(hang_pid.read_text()), 0)
+
+
+# spec: ANYM-683
+async def test_evicted_worker_stays_counted_until_it_is_reaped(env):
+    pidfile = env.tmp / "evict.pids"
+    options = {"runtime_options": {"unload_sleep": 1.5}}
+    async with env.running(**engines(env, extra_options=options)) as s:
+        vision, speech = s.service.engines["vision-default"], s.service.engines["audio-default"]
+        assert (await s.chat(vis(pidfile=str(pidfile)))).status == 200
+        old = pids(pidfile)[0]
+        # Whisper large beside the idle Qwen is over the cap: Qwen is evicted, and its unload takes 1.5 s.
+        task = s.spawn(s.transcribe(fk(), extra_fields={"language": "en"}))
+        await s.until(lambda: vision.retiring_workers(), timeout=5)
+        assert vision.workers == {} and await_alive(old)
+        await s.until(lambda: "whisper" in speech.workers, timeout=10)
+        assert not await_alive(old)  # the replacement started only after the old process was gone
+        assert vision.retiring_workers() == []
+        assert (await task).status == 200
+
+
+def await_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+# spec: ANYM-683
+async def test_cancelled_preparation_is_finished_and_cleaned_before_the_job_leaves(env, monkeypatch):
+    """A timeout during the full re-hash: the thread is told to stop, the job holds its slot until the thread is done,
+    and a launch that was finished anyway loses its scratch directory."""
+    seen = {}
+    real = verify_phase
+
+    def slow(models, store, alias, phase, cancel=None):
+        seen["cancel"] = cancel.wait(10)  # blocked in verification until the scheduler cancels it
+        paths = real(models, store, alias, phase)  # ... and the preparation completes anyway
+        seen["done"] = True
+        return paths
+
+    monkeypatch.setattr("deedkit_inference.engines.pinned.verify_phase", slow)
+    async with env.running(**engines(env, timeout=0.5)) as s:
+        reply = await s.chat(vis())
+        assert reply.status == 504 and reply.code == "engine_timeout"
+        assert seen == {"cancel": True, "done": True}  # the reply came after the preparation thread had ended
+        assert s.work_entries() == [] and s.service.engines["vision-default"].workers == {}
+        await s.until(lambda: s.service.scheduler.slots["gpu"].running is None)
 
 
 # spec: ANYM-683

@@ -86,6 +86,22 @@ def test_interrupted_pull_leaves_no_served_model(tmp_path):
 
 
 # spec: ANYM-683
+def test_pull_redirects_stay_on_the_hubs_domains():
+    import urllib.error
+    import urllib.request
+
+    for good in ("https://cdn-lfs.huggingface.co/x", "https://cas-bridge.xethub.hf.co/x", "https://hf.co/x"):
+        assert pulling.allowed_host(good)
+    for bad in ("http://huggingface.co/x", "https://evilhuggingface.co/x", "https://huggingface.co.evil.example/x",
+                "https://huggingface.co@evil.example/x", "https://example.com/x", "ftp://hf.co/x"):
+        assert not pulling.allowed_host(bad), bad
+    request = urllib.request.Request("https://huggingface.co/a/resolve/b/c")
+    handler = pulling._HttpsRedirects()
+    with pytest.raises(urllib.error.URLError):
+        handler.redirect_request(request, None, 302, "Found", {}, "https://evil.example/c")
+
+
+# spec: ANYM-683
 async def test_same_size_tampered_weight_makes_the_alias_unavailable(env):
     kwargs = engines(env)
     async with env.running(**kwargs) as s:

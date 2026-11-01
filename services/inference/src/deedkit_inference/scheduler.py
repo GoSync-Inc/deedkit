@@ -9,6 +9,7 @@ import contextlib
 import json
 import logging
 import shutil
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -301,6 +302,8 @@ class Scheduler:
                 continue
             if verdict.action == "wait":
                 return
+            if verdict.action == "go" and any(engine.retiring_workers() for engine in self.engines):
+                return  # an evicted or killed worker is not reaped yet: its memory is still in use
             if self.now() > waiter.expires:  # the probes above may have taken the time that was left
                 slot.queue.popleft()
                 waiter.fut.set_exception(slot_busy(self.config.retry_after_seconds))
@@ -359,6 +362,27 @@ class Scheduler:
             if engine.workers.get(phase_name) is worker:
                 del engine.workers[phase_name]
             worker.kill()
+            engine.retire(worker)
+
+    @staticmethod
+    async def _prepare(engine, phase_name):
+        """engine.prepare in a thread (it hashes the model files in full). A timeout or a cancel stops the hashing at
+        its next chunk and the job keeps its slot until the thread is done, so no hashing outlives its admission and
+        a launch that finished anyway has its scratch directory removed."""
+        cancel = threading.Event()
+        task = asyncio.ensure_future(asyncio.to_thread(engine.prepare, phase_name, cancel))
+        try:
+            return await asyncio.shield(task)
+        except BaseException:
+            cancel.set()
+            while not task.done():
+                try:
+                    await asyncio.wait({task})
+                except asyncio.CancelledError:
+                    pass
+            if task.exception() is None:
+                shutil.rmtree(task.result().scratch, ignore_errors=True)
+            raise
 
     async def _call_worker(self, job, ctx, phase):
         """Send the phase's job to the warm worker of `<alias>/<phase>`, starting it first when there is none (model
@@ -369,7 +393,7 @@ class Scheduler:
             async with asyncio.timeout(job.spec.timeout_seconds):
                 if worker is None or not worker.alive():
                     self._discard_worker(engine, phase.name, worker)
-                    launch = await asyncio.to_thread(engine.prepare, phase.name)
+                    launch = await self._prepare(engine, phase.name)
                     try:
                         worker = await Worker.spawn(launch.argv, launch.env, launch.scratch, (job.alias, phase.name),
                                                     phase.resident_gb)
@@ -437,11 +461,18 @@ class Scheduler:
                             self._kill_victim(victim, "memory_share")
                         else:
                             sizes.append((size, victim))
+            for engine in list(self.engines):
+                for worker in engine.retiring_workers():
+                    size = await asyncio.to_thread(self.probe.rss_gb, worker.proc.pid)
+                    sizes.append((size, ("retiring", worker)))
             if sizes and sum(size for size, _ in sizes) > self.config.resident_hard_cap_gb:
                 _, victim = max(sizes, key=lambda item: item[0])
                 self._kill_victim(victim, "memory_hard_cap")
 
     def _kill_victim(self, victim, reason):
+        if victim[0] == "retiring":
+            kill_group(victim[1].proc.pid)
+            return
         if victim[0] == "job":
             job = victim[1]
             job.kill_reason = reason

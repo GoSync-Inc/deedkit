@@ -7,6 +7,7 @@ every network client out of the serving path); `cli.py` loads it inside the `pul
 import os
 import shutil
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -14,14 +15,23 @@ from pathlib import Path
 from .models import CHUNK, ModelError, phase_dir, verify_all, verify_artifact, verify_phase
 
 HOST = "huggingface.co"
+#: The Hub sends large files to its CDN (cdn-lfs*.huggingface.co, cas-bridge.xethub.hf.co, ...). A redirect may go
+#: to these domains and their subdomains only; the sha256 pin decides what the bytes are, this decides who is asked.
+REDIRECT_DOMAINS = ("huggingface.co", "hf.co")
+
+
+def allowed_host(url):
+    parts = urllib.parse.urlsplit(url)
+    host = (parts.hostname or "").lower()
+    return parts.scheme == "https" and any(host == d or host.endswith("." + d) for d in REDIRECT_DOMAINS)
 
 
 class _HttpsRedirects(urllib.request.HTTPRedirectHandler):
-    """Redirects stay on https; the Hub sends large files to its CDN, so the host is not pinned, the hash is."""
+    """Redirects stay on https and on the Hub's own domains."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if not newurl.startswith("https://"):
-            raise urllib.error.URLError("redirect_not_https")
+        if not allowed_host(newurl):
+            raise urllib.error.URLError("redirect_not_allowed")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 

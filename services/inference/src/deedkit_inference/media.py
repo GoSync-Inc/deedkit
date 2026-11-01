@@ -59,10 +59,12 @@ def image_size(path):
     return None
 
 
-def run_tool(argv, timeout, env=None):
-    """Run a helper in its own process group with a timeout; (returncode, stdout) or (None, b"") on a timeout."""
+def run_tool(argv, timeout, env=None, own_group=True):
+    """Run a helper with a timeout; (returncode, stdout) or (None, b"") on a timeout. `own_group=False` keeps it in
+    the caller's process group: inside a worker that is the worker's group, so killing the worker kills the helper
+    and the supervisor counts its memory with the worker's."""
     process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                               env=env or {"PATH": TOOL_PATH}, start_new_session=True)
+                               env=env or {"PATH": TOOL_PATH}, start_new_session=own_group)
     try:
         out, _ = process.communicate(timeout=timeout)
         return process.returncode, out
@@ -70,7 +72,10 @@ def run_tool(argv, timeout, env=None):
         return None, b""
     finally:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            if own_group:
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
         except (ProcessLookupError, PermissionError):
             pass
         process.wait()
@@ -90,10 +95,11 @@ def probe_duration(path, ffprobe, timeout=20.0):
 
 
 def chunk_wav(ffmpeg, source, offset, length, destination, timeout):
-    """One window of `source` as 16 kHz mono 16-bit WAV. False when ffmpeg failed or produced nothing."""
+    """One window of `source` as 16 kHz mono 16-bit WAV. False when ffmpeg failed or produced nothing. Only workers
+    call it, so ffmpeg stays in the worker's process group (see run_tool)."""
     code, _ = run_tool([ffmpeg, "-nostdin", "-v", "error", "-y", "-ss", f"{offset:.3f}", "-t", f"{length:.3f}",
                         "-i", str(source), "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-f", "wav",
-                        str(destination)], timeout)
+                        str(destination)], timeout, own_group=False)
     try:
         return code == 0 and os.path.getsize(destination) > 44
     except OSError:

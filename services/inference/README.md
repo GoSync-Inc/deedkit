@@ -262,6 +262,9 @@ model), plus the engine package versions (equal to `uv.lock`). The store layout 
   downloads. Run it as the account that owns the store (not the service user, which can read and never write).
   It fetches each file at its pinned revision into `.pull-*`, verifies the whole directory against the pins and
   publishes it with one rename; an interrupted or mismatching pull leaves nothing served. About 5.7 GB.
+  It contacts `huggingface.co` and the redirect targets the Hub gives for large files (CDN hosts under
+  `huggingface.co` and `hf.co`, e.g. `cas-bridge.xethub.hf.co`); a redirect to any other host or to plain http is
+  refused. The sha256 pins decide the bytes; this limit decides who is asked.
 - `deedkit-inference verify [--model-dir D]`: re-hashes everything, no network; exit 1 on any difference.
 - The server never downloads. Loaders are given paths, never repository ids. Before every worker load every
   consumed file is re-hashed in full (no cache keyed on size or mtime). A file that differs, is missing or is extra

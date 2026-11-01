@@ -86,6 +86,8 @@ class Runtime:
                 "duration": job.get("duration", count * 2.0)}
 
     def unload(self):
+        if self.options.get("unload_sleep"):  # a slow unload: the parent must keep counting this process
+            time.sleep(float(self.options["unload_sleep"]))
         self.cache.clear()
         marker = self.options.get("unload_marker")
         if marker:

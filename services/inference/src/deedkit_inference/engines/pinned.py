@@ -69,9 +69,9 @@ class PinnedEngine(Engine):
         return None
 
     # --- the worker ---------------------------------------------------------------------------------------------
-    def prepare(self, phase_name):
+    def prepare(self, phase_name, cancel=None):
         try:
-            paths = verify_phase(self.context.models, self.context.model_dir, self.alias, phase_name)
+            paths = verify_phase(self.context.models, self.context.model_dir, self.alias, phase_name, cancel)
         except ModelError as error:
             raise unavailable_service(message="the model files are missing or do not match their pins") from error
         scratch = self.context.work_root / f"w-{uuid.uuid4().hex}"

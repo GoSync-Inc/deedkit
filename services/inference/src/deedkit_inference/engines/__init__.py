@@ -73,6 +73,8 @@ class Engine:
         # True for an engine that keeps a warm worker between jobs: it stays in the resident book while idle.
         self.persistent = bool(options.get("persistent", False)) or self.worker
         self.workers = {}  # phase name -> Worker (worker engines)
+        # Workers told to exit or killed whose process is not reaped yet: their memory still counts.
+        self.retiring = set()
 
     def precheck(self, path):
         """Raise Rejected for an input that must not reach a model (audio over 4 h, an image over 20 MP)."""
@@ -116,15 +118,26 @@ class Engine:
         worker = self.workers.pop(phase_name, None)
         if worker is not None:
             worker.stop()
+            self.retiring.add(worker)
+
+    def retire(self, worker):
+        """A worker was killed or stopped: keep it counted until its process is reaped."""
+        self.retiring.add(worker)
+
+    def retiring_workers(self):
+        self.retiring = {worker for worker in self.retiring if worker.proc.returncode is None}
+        return list(self.retiring)
 
     def stop_workers(self):
         for worker in list(self.workers.values()):
             worker.kill()
+            self.retire(worker)
         self.workers.clear()
 
     # --- worker engines -------------------------------------------------------------------------------------
-    def prepare(self, phase_name):
-        """Blocking, off the loop: verify the phase's model files in full and return a WorkerLaunch."""
+    def prepare(self, phase_name, cancel=None):
+        """Blocking, off the loop: verify the phase's model files in full and return a WorkerLaunch. `cancel` is a
+        threading.Event the caller sets to stop the hashing early (ModelError "cancelled")."""
         raise NotImplementedError
 
     def job_message(self, ctx):
