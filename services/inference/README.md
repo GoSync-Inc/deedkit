@@ -222,10 +222,10 @@ engine must name phases that `models.json` pins (`<alias>/<phase>`), else the se
 | alias | scopes | phases (slot, `resident_gb`) |
 |---|---|---|
 | `audio-default` | `audio` | `langid` (gpu, 0.3: Whisper base, first 30 s, **skipped when the request names `language`**), then one route: Russian -> `gigaam` (cpu, 1.6: GigaAM v3 e2e-RNNT, onnx-asr, its Silero VAD for audio over 60 s), any other language -> `whisper` (gpu, 2.7: Whisper large-v3-turbo, mlx-whisper) |
-| `vision-default` | `image`, `document` | `vlm` (gpu, 4.9: Qwen3.5-4B MLX 4-bit, mlx-vlm); an image chat needs scope `image`, a text-only chat scope `document` |
+| `vision-default` | `image`, `document` | `vlm` (gpu, 4.5: Qwen3.5-4B MLX 4-bit, mlx-vlm; measured 3.90 GB peak on the mini 11-02, plus 15 percent); an image chat needs scope `image`, a text-only chat scope `document` |
 
 `resident_gb` is the measured peak of the research run (local-inference-11-01) plus headroom; each phase is admitted
-on its own slot and memory (above). GigaAM beside Qwen (1.6 + 4.9 = 6.5 GB) is over the 6.0 GB cap, so the two never
+on its own slot and memory (above). GigaAM beside Qwen (1.6 + 4.5 = 6.1 GB) is over the 6.0 GB cap, so the two never
 run together; the idle one is unloaded first. Each alias's `timeout_seconds` (1800 audio, 600 vision) bounds one phase.
 
 **Warm workers.** Each loaded `<alias>/<phase>` is one child process in its own process group (`engines/worker.py`,

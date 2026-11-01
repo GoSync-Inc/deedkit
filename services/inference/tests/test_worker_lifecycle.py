@@ -132,7 +132,7 @@ async def test_a_dead_idle_worker_is_charged_as_a_cold_start_not_as_warm(env):
         assert s.service.admission.warm(key)
         os.kill(worker, signal.SIGKILL)  # the idle worker dies without the scheduler's doing
         assert await gone(worker)
-        s.probe.available = 4.0  # enough for the 3 GB reserve alone, not for 4.9 GB more
+        s.probe.available = 4.0  # enough for the 3 GB reserve alone, not for 4.5 GB more
         refused = await s.chat(vis())
         assert refused.status == 503 and refused.headers["x-admission-reason"] == "memory_low"
         assert key not in s.service.admission.loaded and s.service.admission.resident_total() == 0
@@ -172,7 +172,7 @@ async def test_a_warm_worker_lost_between_the_grant_and_the_start_is_asked_for_a
         # ... and with enough, it holds its full reservation while it runs.
         s.probe.available = 9.0
         retry = s.spawn(s.chat(vis(pidfile=str(pidfile), sleep=0.8)))
-        await s.until(lambda: admission.pending.get(key) == 4.9, timeout=5)
+        await s.until(lambda: admission.pending.get(key) == 4.5, timeout=5)
         assert (await retry).status == 200
 
 
@@ -202,15 +202,15 @@ async def test_cancelled_preparation_is_finished_and_cleaned_before_the_job_leav
 async def test_child_over_its_memory_share_is_killed(env):
     pidfile = env.tmp / "vlm.pids"
     async with env.running(**engines(env)) as s:
-        # 4.9 GB declared: 1.5 times is 7.35 GB. 7.0 GB is tolerated, 8.0 GB is not.
+        # 4.5 GB declared: 1.5 times is 6.75 GB. 6.5 GB is tolerated, 7.0 GB is not.
         task = s.spawn(s.chat(vis(mode="ok", sleep=1.0, pidfile=str(pidfile))))
         await s.until(lambda: pids(pidfile))
         worker = pids(pidfile)[0]
-        s.probe.rss_fn = lambda pgid: 7.0 if pgid == worker else 0.0
+        s.probe.rss_fn = lambda pgid: 6.5 if pgid == worker else 0.0
         assert (await task).status == 200
         task = s.spawn(s.chat(vis(mode="hang", pidfile=str(pidfile))))  # the same warm worker takes it
         await s.until(lambda: s.service.scheduler.slots["gpu"].running is not None)
-        s.probe.rss_fn = lambda pgid: 8.0 if pgid == worker else 0.0
+        s.probe.rss_fn = lambda pgid: 7.0 if pgid == worker else 0.0
         reply = await task
         assert reply.status == 502 and reply.code == "engine_failed"
         assert await gone(worker)
@@ -271,7 +271,7 @@ async def test_second_large_model_unloads_the_first_idle_one(env):
     async with env.running(**engines(env)) as s:
         vision, speech = s.service.engines["vision-default"], s.service.engines["audio-default"]
         assert (await s.chat(vis())).status == 200 and "vlm" in vision.workers
-        # Whisper large (2.7 GB) beside the idle Qwen (4.9 GB) is 7.6 GB, over the 6.0 GB cap: the idle one goes first.
+        # Whisper large (2.7 GB) beside the idle Qwen (4.5 GB) is 7.2 GB, over the 6.0 GB cap: the idle one goes first.
         reply = await s.transcribe(fk(), extra_fields={"language": "en"})
         assert reply.status == 200 and reply.json()["text"] == "whisper transcript 0"
         assert "vlm" not in vision.workers and "whisper" in speech.workers
@@ -285,9 +285,10 @@ async def test_pair_over_the_cap_is_serialized(env):
         scheduler = s.service.scheduler
         first = s.spawn(s.chat(vis(sleep=1.0)))
         await s.until(lambda: scheduler.slots["gpu"].running is not None)
-        # GigaAM (1.6 GB, CPU slot) is a free slot but 4.9 + 1.6 = 6.5 GB is over the 6.0 GB cap, and Qwen is running.
+        # GigaAM (1.6 GB, CPU slot) is a free slot but 4.5 + 1.6 = 6.1 GB is over the 6.0 GB cap, and Qwen is running.
         second = s.spawn(s.transcribe(fk(sleep=0.2), extra_fields={"language": "ru"}))
         await s.until(lambda: scheduler.depth() == 1)
         await asyncio.sleep(0.5)
         assert scheduler.slots["cpu"].running is None and scheduler.depth() == 1  # waiting, not refused
         assert (await first).status == 200 and (await second).status == 200
+
