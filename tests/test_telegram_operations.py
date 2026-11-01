@@ -1515,6 +1515,7 @@ def test_a_failed_inspection_prints_no_secret_in_its_exception_chain(monkeypatch
         assert CALLBACK_SECRET.decode() not in chain and INSPECT_KEY.hex() not in chain
 
 
+# spec: ANYM-681
 def test_a_scoped_flood_wait_pauses_only_the_inspection_and_a_long_one_the_account(monkeypatch):
     keyed(monkeypatch)
     clock, state, governor = governed()

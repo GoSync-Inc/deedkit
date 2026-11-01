@@ -1031,6 +1031,15 @@ def test_a_tracked_chat_the_policy_now_leaves_out_gives_no_chat_id(operator):
 # --- ANYM-681: inspect_message_buttons --------------------------------------------------------------------
 
 
+def run_live_job(worker):
+    """One worker turn, then the off-path receipt write of a live read (settled in the same loop)."""
+    async def turn():
+        assert await worker.once()
+        await asyncio.gather(*list(worker.settling))
+    asyncio.run(turn())
+
+
+
 # spec: ANYM-681
 def test_inspect_message_buttons_is_a_telegram_only_read_live_message_operation():
     from messaging_service.messenger_operations import operation_manifest
@@ -1067,7 +1076,7 @@ def test_inspection_runs_as_a_live_read_and_stores_a_bounded_receipt(operator):
     async def provider(job):
         assert job['operation'] == 'inspect_message_buttons' and job['provider_message_id'] == '1'
         return {'outcome': 'confirmed', 'data': {'edit_date': '2026-10-01T12:00:00+00:00', 'text_sha256': '0' * 64, 'rows': rows}}
-    assert asyncio.run(CommandWorker(state, provider).once())
+    run_live_job(CommandWorker(state, provider))
     done = s.get_messenger_operation(key, queued['operation_id'])
     assert done['status'] == 'succeeded' and done['result']['data']['rows'] == rows
 
@@ -1087,7 +1096,7 @@ def test_inspection_names_no_archive_revision_and_a_given_one_must_be_current(op
     async def provider(job):
         seen.append((job['expected_revision'], job['provider_message_id']))
         return {'outcome': 'confirmed', 'data': {'edit_date': None, 'text_sha256': '0' * 64, 'rows': []}}
-    assert asyncio.run(CommandWorker(state, provider).once())  # worker preflight re-resolves the saved request
+    run_live_job(CommandWorker(state, provider))  # worker preflight re-resolves the saved request
     assert s.get_messenger_operation(key, queued['operation_id'])['status'] == 'succeeded' and seen == [(0, '1')]
     with pytest.raises(APIError, match='operation_target_changed'):
         s.preview_messenger_operation(key, **{**args, 'expected_revision': 2})
@@ -1134,12 +1143,12 @@ def test_inspection_sentinels_reach_no_receipt_audit_payload_or_log_on_success_o
     s.set_messenger_operations('command-fixture', ['inspect_message_buttons'])
     args = operation_args(operation='inspect_message_buttons')
     ok = s.execute_messenger_operation(key, **args, request_id='synthetic-inspect-0011')
-    assert asyncio.run(CommandWorker(state, provider).once())
+    run_live_job(CommandWorker(state, provider))
     done = s.get_messenger_operation(key, ok['operation_id'])
     assert done['status'] == 'succeeded' and done['result']['data']['rows'][0][0]['fp']
     client.broken = True
     fail = s.execute_messenger_operation(key, **args, request_id='synthetic-inspect-0012')
-    assert asyncio.run(CommandWorker(state, provider).once())
+    run_live_job(CommandWorker(state, provider))
     assert s.get_messenger_operation(key, fail['operation_id'])['status'] == 'failed'
     with pytest.raises(CommandRejected) as refused:  # the chain of the fixed code carries nothing either
         asyncio.run(provider({'operation': 'inspect_message_buttons', 'parameters': {}, 'provider_chat': '100',
