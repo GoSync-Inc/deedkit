@@ -194,6 +194,17 @@ def test_install_cli_copies_only_the_pinned_build_to_a_private_read_only_file(tm
 
 
 # spec: ANYM-570
+def test_install_cli_makes_a_missing_state_directory_0700_and_refuses_a_wider_cli_directory(tmp_path):
+    source, pin = source_build(tmp_path)
+    target = tmp_path / 'state' / 'cli' / 'claude-pinned'  # `own_lock` refuses a state directory wider than 0700
+    autoloop.install_cli(source, target, pin)
+    assert stat.S_IMODE(target.parent.parent.stat().st_mode) == 0o700
+    target.parent.chmod(0o755)
+    with pytest.raises(autoloop.Refused, match='0700'):
+        autoloop.install_cli(source, target, pin)
+
+
+# spec: ANYM-570
 def test_install_cli_replaces_a_tampered_copy_and_the_entrypoint_installs_the_default_pin(tmp_path, monkeypatch, capsys):
     source, pin = source_build(tmp_path)
     target = tmp_path / 'own' / 'claude-pinned'

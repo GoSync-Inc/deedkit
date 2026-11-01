@@ -110,7 +110,7 @@ STATE = Path.home() / '.deedkit' / 'autoloop'
 # CLI's auto-update deletes old versions there (10-30: 2.1.310 was gone and the loop halted). The copy is made by
 # `autoloop.py install-cli`, which accepts only a binary whose sha256 is CLI_SHA256, and the digest is checked again
 # before every run. A new pin is a reviewed change of the three constants and PROFILE below, after a canary run
-# (docs/operations/feedback-autoloop.md, "Re-pinning the reader CLI").
+# (the module docstring, "Reader CLI pin").
 CLI_VERSION = '2.1.316'
 CLI_SHA256 = '64c327e92b2c5e0f78c0a980c5a518121e1f0d140ca771ca5dd4488d1a2dcb3f'  # darwin-arm64 build
 CLI_DIR = STATE / 'cli'
@@ -290,7 +290,8 @@ def install_cli(source=None, target=None, sha256=None):
     folder = target.parent
     if triage.in_git(folder):
         raise Refused('the reader CLI directory must be outside every Git checkout')
-    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    folder.parent.mkdir(exist_ok=True, mode=0o700)  # `mkdir(parents=True)` gives the parents the default mode, not 0700
+    folder.mkdir(exist_ok=True, mode=0o700)
     if folder.stat().st_mode & 0o077:
         raise Refused('the reader CLI directory must be 0700')
     with tempfile.NamedTemporaryFile(dir=folder, prefix='.install-', delete=False) as copy:
