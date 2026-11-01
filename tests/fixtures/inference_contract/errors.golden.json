@@ -1,0 +1,38 @@
+{
+  "unauthorized": {
+    "status": 401,
+    "body": {
+      "error": {
+        "code": "unauthorized",
+        "message": "missing or invalid key"
+      }
+    }
+  },
+  "unknown_model": {
+    "status": 404,
+    "body": {
+      "error": {
+        "code": "unknown_model",
+        "message": "no such model alias"
+      }
+    }
+  },
+  "scope_denied": {
+    "status": 403,
+    "body": {
+      "error": {
+        "code": "scope_denied",
+        "message": "the key has no scope for this model"
+      }
+    }
+  },
+  "invalid_request": {
+    "status": 422,
+    "body": {
+      "error": {
+        "code": "invalid_request",
+        "message": "invalid field max_tokens: less_than_equal"
+      }
+    }
+  }
+}

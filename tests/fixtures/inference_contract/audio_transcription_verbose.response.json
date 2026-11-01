@@ -1,0 +1,17 @@
+{
+  "status": 200,
+  "body": {
+    "task": "transcribe",
+    "language": "en",
+    "duration": 3.0,
+    "text": "fake transcript",
+    "segments": [
+      {
+        "id": 0,
+        "start": 0.0,
+        "end": 3.0,
+        "text": "fake transcript"
+      }
+    ]
+  }
+}
