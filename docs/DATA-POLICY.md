@@ -85,12 +85,16 @@ file, owner 11-01).
     autoloop's tool-less reader on the owner's workstation (owner decision D1, ANYM-264); for a principal in
     the autoloop config, a card in the card worker's own words, with no quote, name, phone number or message
     content, goes to Tiden and GitHub (owner 10-26, ANYM-568; SUBSCRIPTIONS.md:345-353).
-  - Media understanding (photos, audio, files): local models on the owner's Mac mini; media and their
-    extracted text travel to it over the tailnet only (project rule, AGENTS.md section 1) and reach no
-    cloud model provider (owner 11-01 «2 b» on photos; audio and files by «инфру сделал чтоб могли все
-    пользоваться»).
-    Decided, not yet built. The cloud enrichment endpoints (ENRICHMENT.md: OpenAI, Anthropic, Gemini;
-    Codex not deployed) stay off: enabling one is a `user-data` ask.
+  - Local model processing: originals of admitted attachments (audio, images, PDF page images) go
+    from the enrichment worker to the owner's Mac mini over the tailnet (WireGuard + TLS) for
+    processing by local models (`deedkit-inference`); the mini keeps them only for the duration of
+    the request (temporary files deleted after each job, no model caches on disk, metadata-only logs);
+    the derived text returns to DeedKit; no third party receives them (owner 11-01 «на мини я бы и аудио
+    и остальные файлы разбирал бы локальной моделью хорошей для всех сервисов наших»). Decided, not yet
+    built.
+  - Cloud model providers for enrichment (ENRICHMENT.md: OpenAI, Anthropic, Gemini endpoints; Codex not
+    deployed) stay off; media understanding uses the local models above (owner 11-01 «2 b»). Enabling a
+    cloud endpoint is a `user-data` ask.
   - Tiden error tracking (TELEMETRY.md, off by default): proposal, which fields go where is not yet an
     owner decision.
   - Any other recipient or field is a `user-data` ask before it ships.
