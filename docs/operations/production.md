@@ -1339,6 +1339,72 @@ unattempted candidate directory for the same SHA is renamed (for example to
 `prepared-older-tool-<sha>`), never deleted or edited, because preparation
 refuses an existing directory; receipts and their digests are never rewritten.
 
+## Mini enrichment worker: network confinement (ANYM-688)
+
+`deploy/compose.enrichment.yaml` holds `enricher-mini` (profile `enrichment-mini`, the published
+`enricher-local` image). It joins two networks and no other: `inference_db` (internal, bridge
+`dk-inferencedb0`, gateway mode `isolated`, so no host address; the overlay also attaches the `db`
+service) and `inference_egress` (bridge `dk-inference0`, this worker only). It never joins `backend` or
+`frontend`. The host rules narrow `dk-inference0` to TCP 443 to the mini's tailnet address. Select this
+profile alone: never with `enrichment-local` or `enrichment-cloud` (ENRICHMENT.md). This section is the
+hand apply; the production apply itself is ANYM-686, under its reviewed plan. Nothing here runs during
+an active call (check read-only first).
+
+Inputs: `INFERENCE_MINI_NAME` (the mini's `.ts.net` name, exactly the host of `base_url`) and
+`INFERENCE_MINI_IP` (its tailnet address, 100.64.0.0/10) in the project's env file; the overlay pins the
+name with `extra_hosts` and sets the same address as the worker's `dns`, so any other lookup goes where
+the rules drop it. `private/enrichment-mini.json` (from `deploy/enrichment-mini.example.json`, only
+`deedkit_inference` profiles, mode 0600, owned by uid 10001) and the directory `private/inference/`
+(mode 0700, `inference.key` mode 0600 inside, from ANYM-684). The worker mounts the directory, not the
+file: a bind-mounted file keeps the retired inode after an atomic rotation. The DSN is the
+`messaging_enricher` one (`private/enrichment-local.dsn`).
+
+Apply, in this order (a rule step that fails stops the apply; the worker starts last):
+1. Rules (host, as root, before the networks exist; they match bridge names):
+   `python3 scripts/inference_egress_check.py rules --mini-ip $INFERENCE_MINI_IP` prints them; apply
+   them and save them with the host's firewall persistence. They drop host-bound packets from
+   `dk-inference0` and `dk-inferencedb0`, and from `dk-inference0` everything but TCP 443 to the mini:
+   DNS to any address, RFC 1918, link-local and metadata (169.254.0.0/16), the rest of the tailnet,
+   loopback and all IPv6.
+2. Networks: `docker compose $F --profile enrichment-mini up --no-start --no-build --pull never --no-deps
+   enricher-mini` (`F` is the project's Compose arguments plus the enrichment overlay) creates both
+   networks and the stopped worker.
+3. Database: a Compose change that adds a network to `db` would recreate the container, and databases
+   are never restarted by the tool. Attach it live instead: `docker network connect --alias db
+   <project>_inference_db <db container>`. Its `backend` attachment, identity and sessions are
+   unchanged; no connection drops. A later recreate of `db` (a Postgres image bump) takes the network
+   from the overlay.
+4. Config: append `compose.enrichment.yaml` to the project's `files` in `/etc/deedkit/production.json`
+   (and the messaging project's `files` in `/etc/deedkit/http-production.json`) when it is not there
+   yet, and map `"enricher-mini": "enricher-local"` in `services` (the image target; back both files up
+   first). Autodeploy pauses on a Compose change ("apply the next release by hand"): under the pause
+   file apply the next green `main` SHA by hand as item 5 of the delivery enrollment above does, then
+   remove the pause.
+5. Start and check: `docker compose $F --profile enrichment-mini start enricher-mini` with the
+   config still `"enabled": false` (it claims no job), then run the check below from inside. On any
+   failure `stop enricher-mini` and fix the rules; enable the config only after a pass.
+
+Check (the receipt keeps the JSON). `listen` is a bounded synthetic listener; the positive control keeps
+"blocked" from meaning "nothing listens". Blocked targets are IP literals read with `docker inspect` and
+`ip addr`, each with a known listener; `<api ip>` is the API container's address on `backend`:
+```sh
+docker compose $F exec -T api python -I - listen --port 18081 --seconds 300 < scripts/inference_egress_check.py &
+docker compose $F exec -T api python -I - check --control <api ip>:8080 --control <api ip>:18081 \
+  < scripts/inference_egress_check.py
+docker compose $F exec -T enricher-mini python -I - check --open db:5432 --open $INFERENCE_MINI_IP:443 \
+  --blocked <api ip>:8080 --blocked <api ip>:18081 --blocked-name api:8080 --blocked <host public ip>:443 \
+  --blocked <dk-inference0 gateway ip>:443 --blocked 1.1.1.1:443 --blocked 1.1.1.1:53 --blocked-dns 1.1.1.1 \
+  --blocked-name example.com:443 < scripts/inference_egress_check.py
+```
+It exits 0 only when the database and the mini connect and every blocked target times out, has no route or
+does not resolve. A refusal means the address answered, which a DROP never does: it fails.
+
+Undo (reverse): `docker compose $F --profile enrichment-mini stop enricher-mini` and `rm enricher-mini`;
+`docker network disconnect <project>_inference_db <db container>`; `docker network rm
+<project>_inference_db <project>_inference_egress`; restore both configuration backups; as root
+`python3 scripts/inference_egress_check.py rules --undo` prints the mirror of the rules (hooks first, then
+the chain). The worker's jobs requeue on SIGTERM; nothing in the database changes.
+
 ## Image retention
 
 ```sh
