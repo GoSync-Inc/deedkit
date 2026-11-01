@@ -1421,30 +1421,52 @@ def test_the_inspection_is_governed_in_its_own_scope(monkeypatch):
 
 # spec: ANYM-681
 # spec: ANYM-681
-def test_a_flood_wait_of_the_inspection_leaves_no_sdk_cooldown_for_other_reads(monkeypatch):
-    """The SDK remembers a FloodWait per RPC constructor, shared with get_message_info; the inspection restores it."""
-    import inspect as pyinspect
+def test_an_inspection_flood_wait_clears_only_its_own_sdk_entry_through_the_real_call(monkeypatch):
+    """Telethon's own _call remembers a FloodWait per RPC constructor, shared with every other get_messages and with
+    its update loop; the inspection puts back only the entry of the request that was flood-waited."""
     from telethon import TelegramClient
-    # The bookkeeping this test models is the pinned SDK's own: it must exist and be consulted by every call.
-    assert '_flood_waited_requests' in pyinspect.getsource(TelegramClient._call)
+    from telethon.sessions import MemorySession
     keyed(monkeypatch)
     clock, state, governor = governed()
-    key = functions.messages.GetMessagesRequest.CONSTRUCTOR_ID
-    unrelated = functions.messages.SendMessageRequest.CONSTRUCTOR_ID
+    unrelated = functions.updates.GetDifferenceRequest.CONSTRUCTOR_ID
+    earlier = functions.messages.SendMessageRequest.CONSTRUCTOR_ID
+    sent = []
 
-    class Flooding(Client):
-        def __init__(self):
-            super().__init__()
-            self._flood_waited_requests = {unrelated: 4242.0}
+    class Sender:
+        flood = True
 
-        async def get_messages(self, peer, *, ids):
-            self._flood_waited_requests[key] = 99999.0  # what the SDK's _call writes before it raises
-            raise errors.FloodWaitError(None, capture=300)
-    client = Flooding()
+        def __init__(self, owner):
+            self.owner = owner
+
+        def send(self, request, ordered=False):
+            sent.append(type(request).__name__)
+            future = asyncio.get_running_loop().create_future()
+            if self.flood:
+                # The SDK's update loop records its own wait while the inspection's request is in flight.
+                self.owner._flood_waited_requests[unrelated] = time.time() + 600
+                future.set_exception(errors.FloodWaitError(request=request, capture=300))
+            else:
+                future.set_result(types.messages.Messages(messages=[], topics=[], chats=[], users=[]))
+            return future
+
+    class Real(TelegramClient):
+        async def get_input_entity(self, peer):
+            return types.InputPeerUser(peer, 1) if isinstance(peer, int) else peer
+
+    client = Real(MemorySession(), 1, 'a' * 32, flood_sleep_threshold=0, request_retries=0)
+    client._sender = Sender(client)
+    client._flood_waited_requests[earlier] = time.time() + 900  # an older, unrelated wait
+    kept_earlier = client._flood_waited_requests[earlier]
     with pytest.raises(CommandRejected) as flooded:
-        inspect(client, governor)
-    assert flooded.value.retry_after == 300
-    assert client._flood_waited_requests == {unrelated: 4242.0}  # unrelated waits kept, this one dropped
+        asyncio.run(execute(client, job('inspect_message_buttons'), governor=governor))
+    assert flooded.value.retry_after == 300 and state.deferred == []
+    waits = client._flood_waited_requests
+    assert functions.messages.GetMessagesRequest.CONSTRUCTOR_ID not in waits  # this read's own entry is gone
+    assert unrelated in waits and waits[earlier] == kept_earlier  # nothing else was touched
+    # The next get_message_info-style read reaches the provider instead of meeting a cached SDK wait.
+    client._sender.flood = False
+    asyncio.run(client.get_messages(types.InputPeerUser(100, 1), ids=23))
+    assert sent.count('GetMessagesRequest') == 2
 
 
 # spec: ANYM-681
@@ -1481,7 +1503,14 @@ def test_a_failed_inspection_prints_no_secret_in_its_exception_chain(monkeypatch
             raise RuntimeError('provider said ' + CALLBACK_SECRET.decode() + INSPECT_KEY.hex())
     with pytest.raises(CommandRejected) as read:
         run(Exploding(), 'inspect_message_buttons')
-    for error in (refused.value, read.value):
+
+    class Refusing(Client):
+        async def get_messages(self, peer, *, ids):
+            raise errors.RPCError(None, 'SYNTHETIC_' + CALLBACK_SECRET.decode(), 400)
+    with pytest.raises(CommandRejected) as mapped:
+        run(Refusing(), 'inspect_message_buttons')
+    assert mapped.value.args == ('operation_rejected',)
+    for error in (refused.value, read.value, mapped.value):
         chain = ''.join(traceback.format_exception(error))
         assert CALLBACK_SECRET.decode() not in chain and INSPECT_KEY.hex() not in chain
 

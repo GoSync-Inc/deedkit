@@ -1334,24 +1334,37 @@ async def inspect_message_buttons(client, job, governor, rpc, referenced_peers, 
         wait = await governor.admit('inspect_buttons', 2)
         if wait:
             limited(wait)
-    # The SDK keeps its own FloodWait memory per RPC constructor, shared with every other get_messages: restore it
-    # after a FloodWait of this read, so the governor's scope (not the SDK) decides who is paused.
+    # The SDK keeps its own FloodWait memory per RPC constructor, shared with every other get_messages. When one of
+    # THIS read's requests is flood-waited, put back only the entry of that request's constructor (to what it was
+    # before the request), so the governor's scope, not the SDK, decides who is paused; entries that other
+    # SDK work (updates, differences) writes meanwhile are never touched.
     waits = getattr(client, '_flood_waited_requests', None)
-    before = dict(waits) if isinstance(waits, dict) else None
+
+    def owned(call):
+        async def work():
+            before = dict(waits) if isinstance(waits, dict) else None
+            try:
+                return await call()
+            except errors.FloodWaitError as exc:
+                constructor = getattr(getattr(exc, 'request', None), 'CONSTRUCTOR_ID', None)
+                if before is not None and constructor is not None:
+                    if constructor in before:
+                        waits[constructor] = before[constructor]
+                    else:
+                        waits.pop(constructor, None)
+                raise
+        return work
+
     try:
-        peer = await rpc(lambda: client.get_input_entity(chat), scope='inspect_buttons')
-        message = await rpc(lambda: client.get_messages(peer, ids=message_id), scope='inspect_buttons')
+        peer = await rpc(owned(lambda: client.get_input_entity(chat)), scope='inspect_buttons')
+        message = await rpc(owned(lambda: client.get_messages(peer, ids=message_id)), scope='inspect_buttons')
     except ProviderRateLimited as exc:
-        if before is not None:
-            for key in [key for key in waits if key not in before]:
-                del waits[key]
-            waits.update(before)
         limited(exc.seconds)
     except (errors.ChannelPrivateError, errors.ChatAdminRequiredError, errors.PeerIdInvalidError,
             errors.MessageIdInvalidError):
-        reject('not_found')
+        raise CommandRejected('not_found') from None
     except errors.RPCError:
-        reject('operation_rejected')
+        raise CommandRejected('operation_rejected') from None
     except CommandRejected:
         raise
     except Exception:
