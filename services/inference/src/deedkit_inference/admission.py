@@ -5,8 +5,10 @@ the rules read goes through the injected probe.
 
 An engine is "loaded" while a job runs its phase and, for an engine that declares a warm worker between jobs
 (`persistent`, ANYM-683), while it sits idle. An engine whose child exits with the phase leaves the book at
-once. Every phase is charged its full `resident_gb` plus the reserve against the free memory the probe shows,
-warm or not: the rules only ever err towards waiting."""
+once. A phase that starts cold is charged its full `resident_gb` plus the reserve against the free memory the
+probe shows. A phase whose warm engine is already loaded (idle in the book) has its memory spent: it is charged the
+reserve only, and it holds nothing back from the free memory others see (live install, 11-02: the second request of a
+loaded 4.9 GB vision worker was refused for 4.9 GB more than the probe could show)."""
 
 import time
 from dataclasses import dataclass
@@ -43,12 +45,19 @@ class Admission:
     def resident_total(self):
         return sum(item.gb for item in self.loaded.values())
 
+    def warm(self, key):
+        """The key's engine keeps a worker between jobs and has it loaded now (running or idle)."""
+        item = self.loaded.get(key)
+        return item is not None and item.persistent
+
     def mark_running(self, key, gb, engine, phase_name):
         item = self.loaded.get(key)
+        warm = item is not None and item.persistent
         if item is None:
             item = self.loaded[key] = Loaded(
                 key, gb, engine=engine, phase_name=phase_name, persistent=bool(getattr(engine, "persistent", False)))
-        self.pending[key] = gb  # no probe read here: all probing is done before the deadline check and the grant
+        if key not in self.pending:  # a warm engine's memory is already in the free figure: nothing to hold back
+            self.pending[key] = 0.0 if warm else gb  # no probe read here: all probing is done before the deadline check
         item.running += 1
         item.last_used = self.monotonic()
 
@@ -83,7 +92,7 @@ class Admission:
         return tuple(k for k, v in self.loaded.items() if v.running == 0 and v.last_used <= horizon)
 
     def pending_gb(self, exclude):
-        """Memory that running phases may take: each one's full resident_gb until the phase ends. Nothing is
+        """Memory that running cold starts may take: each one's full resident_gb until the phase ends. Nothing is
         subtracted for a drop of the free memory, because the probe cannot tell the child's allocation from
         another process's: counting it twice only ever makes a second phase wait."""
         return sum(gb for key, gb in self.pending.items() if key != exclude)
@@ -113,7 +122,8 @@ class Admission:
         if resident_gb > self.config.resident_cap_gb:
             return Verdict("refuse", "resident_cap")
         if not arrival or not anything_running:
-            need, visible = resident_gb + self.config.min_free_gb, self.probe.available_gb()
+            need = (0.0 if self.warm(key) else resident_gb) + self.config.min_free_gb
+            visible = self.probe.available_gb()
             if visible < need:
                 if self.monotonic() < self.settle_until:
                     return Verdict("wait")

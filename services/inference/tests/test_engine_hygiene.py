@@ -45,6 +45,29 @@ def test_offline_and_telemetry_switches_are_set_before_engine_imports():
 
 
 # spec: ANYM-683
+def test_telemetry_switches_are_set_by_importing_the_package_in_every_process():
+    """Live install 11-02: a process that imported onnxruntime outside a worker printed "Failed to persist telemetry
+    device ID". The package applies the telemetry switches on import, so whichever process imports an engine
+    library after it has them; the offline switches stay out of it (`pull` needs the network)."""
+    env = {k: v for k, v in os.environ.items() if k not in offline.OFFLINE}
+    code = "import os, deedkit_inference; print(sorted(k for k in %r if os.environ.get(k) == %r[k]))" % (
+        switches_dict(), switches_dict())
+    out = subprocess.run([sys.executable, "-I", "-c", code], env={**env, "ORT_DISABLE_TELEMETRY": "0"}, capture_output=True,
+                         text=True, check=True).stdout
+    assert out.strip() == str(sorted(switches_dict()))  # all set, also over a value of 0 left by the caller
+    probe = "import os, deedkit_inference; print(os.environ.get('HF_HUB_OFFLINE'), os.environ.get('TRANSFORMERS_OFFLINE'))"
+    assert subprocess.run([sys.executable, "-I", "-c", probe], env=env, capture_output=True, text=True,
+                          check=True).stdout.strip() == "None None"
+    assert set(switches_dict()) <= set(offline.OFFLINE) and offline.OFFLINE["ORT_DISABLE_TELEMETRY"] == "1"
+
+
+def switches_dict():
+    from deedkit_inference.switches import TELEMETRY
+
+    return dict(TELEMETRY)
+
+
+# spec: ANYM-683
 async def test_worker_launch_carries_the_offline_switches_and_private_caches(env):
     async with env.running(**engines(env)) as s:
         engine = s.service.engines["vision-default"]

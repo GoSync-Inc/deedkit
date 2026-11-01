@@ -45,6 +45,14 @@ def test_canary_scorer_passes_recorded_good_outputs_and_fails_a_regression():
 
 
 # spec: ANYM-683
+def test_canary_voice_notes_are_ogg_opus_not_vorbis():
+    """Live install 11-02: ffmpeg 8.1 on the mini has libopus and no libvorbis; Ogg/Opus is also what Telegram voice
+    notes are, so the canary exercises the real container and codec."""
+    source = (CANARY / "generate.py").read_text()
+    assert "libvorbis" not in source and source.count("libopus") == 3  # the clean, the noisy and the long note
+
+
+# spec: ANYM-683
 def test_canary_prompt_is_the_enrichment_prompt_of_the_contract_fixtures():
     fixture = json.loads((CONTRACT / "chat_image.request.json").read_text())
     assert (CANARY / "prompt.txt").read_text() == fixture["json"]["messages"][0]["content"][0]["text"]
