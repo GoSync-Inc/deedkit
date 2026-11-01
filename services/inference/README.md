@@ -179,7 +179,7 @@ admission closed. The supervisor kills the largest engine child when all childre
 {"ts": 1767225600, "between": false, "deedkit_ci": false}
 ```
 
-`ts` is epoch seconds (a number); `between` and `deedkit_ci` are booleans. Anything else (missing file,
+`ts` is epoch seconds (a number); `between` and `deedkit_ci` are booleans. Extra fields are ignored. Anything else (missing file,
 not JSON, other types, `ts` older than 30 seconds or more than 30 seconds in the future) counts as busy.
 The service only reads the file, never writes it.
 
