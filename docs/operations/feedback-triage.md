@@ -226,8 +226,8 @@ inbox it makes no model call; it only publishes ledger entries a stopped run lef
   and stay untrusted; card briefs go to `briefs.json` in the autoloop state, and the card worker
   (ANYM-571) takes one only through `committed_briefs`: its item is in the ledger with the same
   new card.
-- A new CLI version needs a new pin: update `CLI_VERSION` and `PROFILE` in `scripts/autoloop.py`
-  after the canary run on the Mac: `AUTOLOOP_CANARY=1 uv run pytest tests/platform/test_autoloop.py
+- A new CLI version needs a new pin: update `CLI_VERSION`, `CLI_SHA256` and `PROFILE` in `scripts/autoloop.py`
+  (module docstring, "Reader CLI pin"), then `autoloop.py install-cli`, after the canary run on the Mac: `AUTOLOOP_CANARY=1 uv run pytest tests/platform/test_autoloop.py
   -k canary` (hostile settings, hook, MCP config, plugin, memory file and symlink around the
   reader's directory; a read, `@` mentions of a file and a symlink, and a write outside asked by
   the item; the canary text must not come back; one valid decision expected).
