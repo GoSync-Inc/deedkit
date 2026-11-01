@@ -343,6 +343,39 @@ def test_proxy_502_503_504_without_the_service_envelope_are_backpressure(tmp_pat
 
 
 # spec: ANYM-685
+def test_429_is_backpressure_even_when_its_body_breaks_and_an_error_body_is_never_expanded(tmp_path,monkeypatch):
+    import gzip
+    import messaging_service.enrichment_providers as providers
+    class Broken(httpx.SyncByteStream):
+        def __iter__(self):raise httpx.ReadError('synthetic disconnect')
+    class Raw(httpx.SyncByteStream):  # a streamed body, as on a real connection (not read in advance)
+        def __init__(self,data):self.data=data
+        def __iter__(self):
+            for start in range(0,len(self.data),1024):yield self.data[start:start+1024]
+    # A refusal needs no body: a body that breaks cannot turn it into a failed attempt.
+    with pytest.raises(ModelBackpressure) as error:
+        run_mini(tmp_path,'image',mini(tmp_path),reply=lambda _:httpx.Response(429,stream=Broken(),headers={'Retry-After':'17'}))
+    assert error.value.retry_after==17
+    with pytest.raises(ModelBackpressure):  # a proxy page that breaks is not the service's envelope
+        run_mini(tmp_path,'image',mini(tmp_path),reply=lambda _:httpx.Response(503,stream=Broken()))
+    # A compressed error page is read raw and bounded: 2 KiB of gzip never becomes 2 MiB in memory.
+    bomb=gzip.compress(b'x'*(2*1024**2));assert len(bomb)<4096
+    seen=[];real=providers.service_error_code
+    monkeypatch.setattr(providers,'service_error_code',lambda body:(seen.append(len(body)),real(body))[1])
+    with pytest.raises(ModelBackpressure):
+        run_mini(tmp_path,'image',mini(tmp_path),reply=lambda _:httpx.Response(503,stream=Raw(bomb),headers={'Content-Encoding':'gzip'}))
+    assert seen==[len(bomb)]
+    huge=b' '*(300*1024)+b'{"error":{"code":"engine_failed"}}'  # an oversized plain body is cut at 64 KiB
+    seen.clear()
+    with pytest.raises(ModelBackpressure):  # the envelope lies past the cut: none was readable
+        run_mini(tmp_path,'image',mini(tmp_path),reply=lambda _:httpx.Response(502,stream=Raw(huge)))
+    assert seen==[65536]
+    # The mini is asked for plain answers.
+    _,requests=run_mini(tmp_path,'image',mini(tmp_path))
+    assert requests[0].headers['accept-encoding']=='identity'
+
+
+# spec: ANYM-685
 def test_queue_wait_503_is_backpressure_but_a_post_accept_timeout_is_a_failure(tmp_path):
     for code in ('queue_full','slot_busy','upload_capacity','admission_closed','draining'):
         for status in (503,429):

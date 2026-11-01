@@ -379,14 +379,14 @@ class EnrichmentWorker:
                 attempts=greatest(attempts-1,0),lease_token=NULL,lease_until=NULL,
                 next_due=clock_timestamp(),updated_at=clock_timestamp()
                 WHERE attachment=%s AND state='leased' AND lease_token=%s''',(row['attachment'],row['lease_token'])).rowcount
-            if gave_back:  # the claim's own counts, on the claim's own day, once (a replay finds no lease to give back)
+            if gave_back:  # only the holder of the lease: a replay or a late answer after a new lease changes nothing
                 day=row.get('_claim_day')
                 c.execute('UPDATE enrichment_budget SET attempts=greatest(attempts-1,0) WHERE day=coalesce(%s::date,current_date)',(day,))
                 c.execute('''UPDATE processing_budget SET attempts=greatest(attempts-1,0)
                     WHERE day=coalesce(%s::date,current_date) AND account=%s AND kind=%s AND profile_hash=%s''',
                     (day,row['account'],row['kind'],row['profile_hash']))
+                resource_admission.defer_profile(c,row['account'],row['kind'],row['profile_hash'],seconds)
             resource_admission.release(c,row.get('_resource_lease'))
-            resource_admission.defer_profile(c,row['account'],row['kind'],row['profile_hash'],seconds)
     def defer(self,row,profile,retry_after=None):
         """The mini cannot take the job now: give it back without an attempt or a budget count, and pause the scope.
 

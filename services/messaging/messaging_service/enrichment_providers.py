@@ -201,6 +201,18 @@ def service_error_code(body):
     return code if isinstance(code,str) else None
 
 
+def error_body(response,limit=65536):
+    """At most `limit` raw bytes of an error answer (a compressed page is never expanded); b"" when it breaks."""
+    body=bytearray()
+    try:
+        for part in response.iter_raw():
+            body.extend(part[:limit-len(body)])
+            if len(body)>=limit:break
+    except httpx.StreamConsumed:body=bytearray(response.content[:limit])  # already in memory (a test transport)
+    except httpx.HTTPError:pass  # a body that breaks is not the service's envelope either
+    return bytes(body)
+
+
 def request_json(client,url,*,local=False,**kwargs):
     """`local`: the owner's inference service. A request that cannot be taken now is ModelBackpressure (a connect
     failure, 429, the service's busy codes, and a proxy's 502/503/504 that carries no service envelope: Tailscale Serve
@@ -208,13 +220,11 @@ def request_json(client,url,*,local=False,**kwargs):
     # Bound response memory; exception strings/HTTP bodies never leave this module.
     try:
         with client.stream('POST',url,**kwargs) as response:
-            if local and (response.status_code==429 or response.status_code in (502,503,504)):
-                body=bytearray()
-                for part in response.iter_bytes():
-                    body.extend(part)
-                    if len(body)>65536:break
-                code=service_error_code(bytes(body))
-                if response.status_code==429 or code is None or code in SERVICE_BACKPRESSURE:
+            if local and response.status_code==429:  # the service refused the job: no body is needed, none is read
+                raise ModelBackpressure(retry_after_seconds(response.headers.get('Retry-After')))
+            if local and response.status_code in (502,503,504):
+                code=service_error_code(error_body(response))
+                if code is None or code in SERVICE_BACKPRESSURE:
                     raise ModelBackpressure(retry_after_seconds(response.headers.get('Retry-After')))
                 raise ModelError('model_http_error')
             if response.status_code==429:raise ModelError('model_rate_limited')
@@ -291,7 +301,7 @@ def infer_audio(profile,path,mime,*,transport=None):
     if not key or any(c in key for c in '\r\n'):raise ModelError('invalid_model_key')
     headers={'Authorization':'Bearer '+key}
     mini=provider=='deedkit_inference'
-    if mini:headers['X-Request-Deadline-Seconds']=str(profile['timeout_seconds'])  # the service's queue deadline
+    if mini:headers.update({'X-Request-Deadline-Seconds':str(profile['timeout_seconds']),'Accept-Encoding':'identity'})  # the service's queue deadline; no compressed answers
     with tempfile.TemporaryDirectory(prefix='archive-audio-') as directory:
         upload=Path(path);upload_mime=mime;transcoded=False
         if mime in ('audio/ogg','application/ogg','audio/opus'):
@@ -335,7 +345,7 @@ def infer(profile,kind,path,mime,source_text='',*,transport=None):
         if provider=='anthropic':headers={'x-api-key':key,'anthropic-version':'2023-06-01'}
         elif provider=='gemini':headers={'x-goog-api-key':key}
         else:headers={'Authorization':'Bearer '+key}
-    if mini:headers['X-Request-Deadline-Seconds']=str(profile['timeout_seconds'])  # the service's queue deadline
+    if mini:headers.update({'X-Request-Deadline-Seconds':str(profile['timeout_seconds']),'Accept-Encoding':'identity'})  # the service's queue deadline; no compressed answers
     with httpx.Client(timeout=httpx.Timeout(profile['timeout_seconds'],connect=10),follow_redirects=False,
             trust_env=False,transport=transport) as client:
         url=profile['base_url']

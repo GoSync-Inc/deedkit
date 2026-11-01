@@ -337,11 +337,20 @@ def test_refund_targets_the_claims_own_day_and_never_goes_below_zero(configured,
             {'today':False,'attempts':0},{'today':True,'attempts':5}]
         assert c.execute('SELECT day=current_date today,attempts FROM processing_budget ORDER BY day').fetchall()==[
             {'today':False,'attempts':0},{'today':True,'attempts':5}]
-    w.defer(row,profile,30)  # a replay: the lease token no longer matches, nothing is refunded twice
+    with s.pool.connection() as c:before=control(c)
+    w.defer(row,profile,600)  # a replay: the lease token no longer matches, nothing is refunded twice, no pause is extended
     with s.pool.connection() as c:
         assert c.execute('SELECT min(attempts) n FROM enrichment_budget').fetchone()['n']==0
         assert c.execute('SELECT min(attempts) n FROM processing_budget').fetchone()['n']==0
         assert c.execute("SELECT attempts FROM attachment_enrichment WHERE attachment='photo'").fetchone()['attempts']==0
+        assert [r['paused_until'] for r in control(c)]==[r['paused_until'] for r in before]
+        c.execute("UPDATE processing_control SET paused_until=clock_timestamp()-interval '1 second'")
+    again,_=w.claim();assert again['lease_token']!=row['lease_token']  # a new lease on the same job
+    with s.pool.connection() as c:before=control(c)
+    w.defer(row,profile,600)  # a late answer for the old lease: it pauses nothing and takes nothing from the new one
+    with s.pool.connection() as c:
+        assert [r['paused_until'] for r in control(c)]==[r['paused_until'] for r in before]
+        assert c.execute("SELECT state FROM attachment_enrichment WHERE attachment='photo'").fetchone()['state']=='leased'
 
 
 # spec: ANYM-685
