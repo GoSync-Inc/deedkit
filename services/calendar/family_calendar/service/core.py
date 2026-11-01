@@ -8,6 +8,8 @@ from psycopg.types.json import Jsonb
 from family_calendar.errors import CalendarError
 from . import journal
 from .store import digest, instant, person_uuid, ref
+from .projection import (  # noqa: F401  (the moved names stay importable from here)
+    DRIFT_SKIP, ProjectionMixin, carried_step, carries, shown_time, uuid_token)
 from .validation import (  # noqa: F401  (the moved names stay importable from here)
     DATE_VALUE, LIMITS, day, event_span, invalid, validate_all_day, validate_event, validate_timed)
 from .windows import (  # noqa: F401
@@ -30,13 +32,6 @@ TIME_FORMAT = (
 )
 
 
-# A live link that `project` leaves alone, by its drift status (ANYM-436); moved and missing drives are planned.
-DRIFT_SKIP = {
-    "in_sync": "already_projected",
-    "unknown": "already_projected",
-    "projection_edited": "projection_edited",
-    "source_cancelled": "use_unproject",
-}
 EVENT_WRITE = (
     "guest-free single event, all-day event (date range, exclusive end), or one occurrence of a "
     "recurring series (update or cancel, chosen by its event_ref); series, this-and-following and "
@@ -74,26 +69,21 @@ SERIES_SCOPE = "series-v1"
 CARRIED_SCOPE = "series-exceptions-v1"
 
 
-def carries(step):
-    """A series step that checks the preview's read of the series, or one write of a carried exception (ANYM-614)."""
-    series = step.get("series") or {}
-    return "snapshot" in series or series.get("role") == "exception"
+class PlanDraft:
+    """What one `plan` call collects while its phases run: _plan_unproject, _plan_project, _plan_write and
+    _plan_linked add to it, _plan_finish stores it."""
+
+    def __init__(self):
+        self.calendars = []
+        self.prepared = []
+        self.touched = set()
+        self.selected = set()
+        self.sources, self.source_calendars, self.skipped, self.activities, self.projected = [], [], [], set(), set()
+        # Remote events this plan changes: one action per drive, whether by unproject or an ordinary write.
+        self.targets, self.unprojected, self.carried = set(), False, False
 
 
-def carried_step(step):
-    return (step.get("series") or {}).get("role") == "exception"
-
-
-def shown_time(value, zone):
-    """A series wall time as an aware ISO time in the series zone; a date stays a date."""
-    from . import series as recurrence
-
-    if zone is None:
-        return value.isoformat()
-    return recurrence.placed(value, zone).isoformat()
-
-
-class FamilyService:
+class FamilyService(ProjectionMixin):
     def __init__(self, store):
         self.store = store
 
@@ -644,13 +634,7 @@ class FamilyService:
         p = self.principal(key)
         if not isinstance(actions, list) or not 1 <= len(actions) <= 8:
             raise CalendarError("invalid_actions")
-        calendars = []
-        prepared = []
-        touched = set()
-        selected = set()
-        sources, source_calendars, skipped, activities, projected = [], [], [], set(), set()
-        # Remote events this plan changes: one action per drive, whether by unproject or an ordinary write.
-        targets, unprojected, carried = set(), False, False
+        draft = PlanDraft()
         allowed = {"action", "calendar_ref", "event_ref", "event", "activity", "operation_id"}
         if invitations:
             # calendar_schedule only (ANYM-555): calendar_plan never takes guests.
@@ -666,739 +650,235 @@ class FamilyService:
             if kind not in ("create", "update", "delete", "project", "unproject"):
                 raise CalendarError("unsupported_action")
             if kind == "unproject":
-                unprojected = True
-                for step, cal, source, scope in self._unproject(key, p, action, skipped):
-                    if (cal["ref"], step["target_id"]) in targets:
-                        raise CalendarError("duplicate_resource_action")
-                    targets.add((cal["ref"], step["target_id"]))
-                    if source["ref"] not in [s["calendar_ref"] for s in sources]:
-                        sources.append({"calendar_ref": source["ref"], "scope": scope})
-                        source_calendars.append(source)
-                    prepared.append(dict(step, ordinal=len(prepared)))
-                    calendars.append(cal)
+                self._plan_unproject(key, p, action, draft)
                 continue
             if "operation_id" in action or not isinstance(action.get("calendar_ref"), str):
                 raise CalendarError("invalid_action")
             if kind == "project":
-                label = action.get("activity")
-                if not isinstance(label, str) or not 1 <= len(label) <= 64 or "event" in action:
-                    raise CalendarError("invalid_action")
-                if action.get("event_ref") in projected:
-                    raise CalendarError("duplicate_resource_action")
-                projected.add(action.get("event_ref"))
-                source, scope, steps, skips, labels = self._project(key, p, action)
-                if source["ref"] not in [s["calendar_ref"] for s in sources]:
-                    sources.append({"calendar_ref": source["ref"], "scope": scope})
-                    source_calendars.append(source)
-                for step, cal in steps:
-                    if step["action"] == "update":
-                        # A reprojected drive moves: its cached occurrence is no overlap of its new span.
-                        if (cal["ref"], step["target_id"]) in targets:
-                            raise CalendarError("duplicate_resource_action")
-                        targets.add((cal["ref"], step["target_id"]))
-                        selected.update(
-                            o["ref"]
-                            for o in self.store.query(
-                                "SELECT ref FROM occurrences WHERE calendar_ref=%s AND resource_ref=%s",
-                                (cal["ref"], step["resource_ref"]),
-                            )
-                        )
-                    prepared.append(dict(step, ordinal=len(prepared)))
-                    calendars.append(cal)
-                skipped += skips
-                activities |= labels
+                self._plan_project(key, p, action, draft)
                 continue
-            label = action.get("activity")
-            if "activity" in action and (
-                kind != "create" or not carry_projections or not isinstance(label, str) or not 1 <= len(label) <= 64
-            ):
-                raise CalendarError("invalid_action")
-            _, cal = self.authorize(key, action.get("calendar_ref"), "plan:create")
-            self.authorize(key, cal["ref"], "event:" + kind)
-            calendars.append(cal)
-            step = {
-                "action": kind,
-                "calendar_ref": cal["ref"],
-                "provider": cal["provider"],
-                "ordinal": len(prepared),
-            }
-            if "invite" in action:
-                guests = action["invite"]
-                if (kind != "create" or not GUEST_WRITE[cal["provider"]]["supported"] or not isinstance(guests, dict)
-                        or guests.get("notify") not in ("none", "all") or not isinstance(guests.get("guests"), list)
-                        or not 1 <= len(guests["guests"]) <= 20):
-                    raise CalendarError("capability_unsupported")
-                if not self.invitations_enabled(cal["ref"]):
-                    raise CalendarError("invitations_not_enabled")
-                step["invite"] = {"guests": list(guests["guests"]), "notify": guests["notify"]}
-            if kind != "delete":
-                step["event"] = validate_event(action.get("event"), f"actions/{len(prepared)}/event")
-                a, b = event_span(step["event"], cal["timezone"])
-                step["span"] = {"start": a.isoformat(), "end": b.isoformat()}
-            if kind == "create":
-                if not step["event"].get("title"):
-                    raise CalendarError("invalid_event")
-                step["resource_ref"] = ref("res")
-                step["target_id"] = uuid_token()
-            elif "replacement" in action:
-                if kind != "delete":
-                    raise CalendarError("invalid_action")
-                step = self._undo_step(p, cal, action["replacement"], step)
-                if (cal["ref"], step["target_id"]) in targets:
+            written = self._plan_write(key, p, action, kind, draft, carry_projections, read)
+            if written is None:
+                continue
+            step, cal, label = written
+            draft.prepared.append(step)
+            self._plan_linked(key, p, action, kind, step, cal, label, carry_projections, draft)
+        return self._plan_finish(key, p, draft, read)
+
+    def _plan_unproject(self, key, p, action, draft):
+        """The `unproject` action of a plan."""
+        draft.unprojected = True
+        for step, cal, source, scope in self._unproject(key, p, action, draft.skipped):
+            if (cal["ref"], step["target_id"]) in draft.targets:
+                raise CalendarError("duplicate_resource_action")
+            draft.targets.add((cal["ref"], step["target_id"]))
+            if source["ref"] not in [s["calendar_ref"] for s in draft.sources]:
+                draft.sources.append({"calendar_ref": source["ref"], "scope": scope})
+                draft.source_calendars.append(source)
+            draft.prepared.append(dict(step, ordinal=len(draft.prepared)))
+            draft.calendars.append(cal)
+
+    def _plan_project(self, key, p, action, draft):
+        """The `project` action of a plan."""
+        label = action.get("activity")
+        if not isinstance(label, str) or not 1 <= len(label) <= 64 or "event" in action:
+            raise CalendarError("invalid_action")
+        if action.get("event_ref") in draft.projected:
+            raise CalendarError("duplicate_resource_action")
+        draft.projected.add(action.get("event_ref"))
+        source, scope, steps, skips, labels = self._project(key, p, action)
+        if source["ref"] not in [s["calendar_ref"] for s in draft.sources]:
+            draft.sources.append({"calendar_ref": source["ref"], "scope": scope})
+            draft.source_calendars.append(source)
+        for step, cal in steps:
+            if step["action"] == "update":
+                # A reprojected drive moves: its cached occurrence is no overlap of its new span.
+                if (cal["ref"], step["target_id"]) in draft.targets:
                     raise CalendarError("duplicate_resource_action")
-                targets.add((cal["ref"], step["target_id"]))
-            else:
-                row = self.store.one(
-                    "SELECT o.*,r.etag,r.target FROM occurrences o JOIN resources r ON r.ref=o.resource_ref "
-                    "WHERE o.ref=%s AND o.calendar_ref=%s",
-                    (action.get("event_ref"), cal["ref"]),
-                )
-                if not row:
-                    raise CalendarError("not_found_or_forbidden")
-                if row["resource_ref"] in touched or (cal["ref"], row["target"]) in targets:
-                    raise CalendarError("duplicate_resource_action")
-                touched.add(row["resource_ref"])
-                targets.add((cal["ref"], row["target"]))
-                selected.add(action["event_ref"])
-                details = row["details"]
-                if details.get("guests") or details.get("special"):
-                    raise CalendarError("capability_unverified")
-                if details.get("recurring"):
-                    # One occurrence only: a series-wide target (a master, or a row stored without
-                    # an occurrence identity) has no original start to name.
-                    if not (details.get("series_ref") and details.get("original_start")):
-                        raise CalendarError("capability_unverified")
-                    if kind == "update" and bool(step["event"].get("all_day")) != bool(details.get("all_day")):
-                        raise CalendarError("capability_unverified")
-                    step["occurrence"] = {
-                        "series_ref": details["series_ref"],
-                        "original_start": details["original_start"],
-                    }
-                if not row["etag"]:
-                    raise CalendarError("conditional_write_unavailable")
-                before = {
-                    "start": row["start_at"].isoformat(),
-                    # The stored instant span is internal; the source event ends at its start.
-                    "end": (row["start_at"] if details.get("instant") else row["end_at"]).isoformat(),
-                    **details,
-                }
-                if details.get("all_day"):
-                    # Stored at local midnight; the event itself is a date range.
-                    zone = ZoneInfo(cal["timezone"])
-                    for field, stored in (("start", row["start_at"]), ("end", row["end_at"])):
-                        before[field] = stored.astimezone(zone).date().isoformat()
-                step.update(
-                    resource_ref=row["resource_ref"],
-                    target_id=row["target"],
-                    expected_etag=row["etag"],
-                    before=before,
-                )
-                scope = action.get("series", "this")
-                if scope not in SERIES_SCOPES or (scope != "this" and "occurrence" not in step):
-                    raise CalendarError("invalid_action")
-                if scope != "this":
-                    steps = self._series_steps(key, cal, step, scope, len(prepared), read)
-                    # One calendar entry per step, as validate_plan recomputes the scope hash.
-                    calendars.extend([cal] * (len(steps) - 1))
-                    prepared.extend(steps)
-                    continue
-            prepared.append(step)
-            if kind == "create" and label:
-                # A new lesson and its drives in one plan; the drives wait for the lesson's verified create.
-                if self.store.guardian_readiness():
-                    raise CalendarError("capability_unverified")
-                if not self.rule_reader(p):
-                    raise CalendarError("not_found_or_forbidden")
-                source, scope = self._source(key, cal["ref"])
-                if step["event"].get("all_day"):
-                    raise CalendarError("source_all_day")
-                a, b = (instant(step["span"][k]) for k in ("start", "end"))
-                drives, skips, labels = self._drives(
-                    key, p, source, label, None, a, b, step["event"], source_step=step["ordinal"]
-                )
-                if not drives:
-                    raise CalendarError(
-                        "nothing_to_project", details={"projections_skipped": skips, "activities": sorted(labels)}
+                draft.targets.add((cal["ref"], step["target_id"]))
+                draft.selected.update(
+                    o["ref"]
+                    for o in self.store.query(
+                        "SELECT ref FROM occurrences WHERE calendar_ref=%s AND resource_ref=%s",
+                        (cal["ref"], step["resource_ref"]),
                     )
-                skipped += skips
-                carried = True
-            elif kind != "create" and carry_projections and (found := self._carry(key, p, step, action["event_ref"], cal, skipped, selected)):
-                source, scope, drives = found
-                carried = True
-            else:
-                continue
-            if source["ref"] not in [s["calendar_ref"] for s in sources]:
-                sources.append({"calendar_ref": source["ref"], "scope": scope})
-                source_calendars.append(source)
-            for linked_step, target in drives:
-                if (target["ref"], linked_step["target_id"]) in targets:
-                    raise CalendarError("duplicate_resource_action")
-                targets.add((target["ref"], linked_step["target_id"]))
-                prepared.append(dict(linked_step, ordinal=len(prepared)))
-                calendars.append(target)
-        if projected and not prepared:
+                )
+            draft.prepared.append(dict(step, ordinal=len(draft.prepared)))
+            draft.calendars.append(cal)
+        draft.skipped += skips
+        draft.activities |= labels
+
+    def _plan_write(self, key, p, action, kind, draft, carry_projections, read):
+        """A create, update or delete action: the checked step and its calendar, or None when it already added its own steps (a series scope)."""
+        label = action.get("activity")
+        if "activity" in action and (
+            kind != "create" or not carry_projections or not isinstance(label, str) or not 1 <= len(label) <= 64
+        ):
+            raise CalendarError("invalid_action")
+        _, cal = self.authorize(key, action.get("calendar_ref"), "plan:create")
+        self.authorize(key, cal["ref"], "event:" + kind)
+        draft.calendars.append(cal)
+        step = {
+            "action": kind,
+            "calendar_ref": cal["ref"],
+            "provider": cal["provider"],
+            "ordinal": len(draft.prepared),
+        }
+        if "invite" in action:
+            guests = action["invite"]
+            if (kind != "create" or not GUEST_WRITE[cal["provider"]]["supported"] or not isinstance(guests, dict)
+                    or guests.get("notify") not in ("none", "all") or not isinstance(guests.get("guests"), list)
+                    or not 1 <= len(guests["guests"]) <= 20):
+                raise CalendarError("capability_unsupported")
+            if not self.invitations_enabled(cal["ref"]):
+                raise CalendarError("invitations_not_enabled")
+            step["invite"] = {"guests": list(guests["guests"]), "notify": guests["notify"]}
+        if kind != "delete":
+            step["event"] = validate_event(action.get("event"), f"actions/{len(draft.prepared)}/event")
+            a, b = event_span(step["event"], cal["timezone"])
+            step["span"] = {"start": a.isoformat(), "end": b.isoformat()}
+        if kind == "create":
+            if not step["event"].get("title"):
+                raise CalendarError("invalid_event")
+            step["resource_ref"] = ref("res")
+            step["target_id"] = uuid_token()
+        elif "replacement" in action:
+            if kind != "delete":
+                raise CalendarError("invalid_action")
+            step = self._undo_step(p, cal, action["replacement"], step)
+            if (cal["ref"], step["target_id"]) in draft.targets:
+                raise CalendarError("duplicate_resource_action")
+            draft.targets.add((cal["ref"], step["target_id"]))
+        else:
+            row = self.store.one(
+                "SELECT o.*,r.etag,r.target FROM occurrences o JOIN resources r ON r.ref=o.resource_ref "
+                "WHERE o.ref=%s AND o.calendar_ref=%s",
+                (action.get("event_ref"), cal["ref"]),
+            )
+            if not row:
+                raise CalendarError("not_found_or_forbidden")
+            if row["resource_ref"] in draft.touched or (cal["ref"], row["target"]) in draft.targets:
+                raise CalendarError("duplicate_resource_action")
+            draft.touched.add(row["resource_ref"])
+            draft.targets.add((cal["ref"], row["target"]))
+            draft.selected.add(action["event_ref"])
+            details = row["details"]
+            if details.get("guests") or details.get("special"):
+                raise CalendarError("capability_unverified")
+            if details.get("recurring"):
+                # One occurrence only: a series-wide target (a master, or a row stored without
+                # an occurrence identity) has no original start to name.
+                if not (details.get("series_ref") and details.get("original_start")):
+                    raise CalendarError("capability_unverified")
+                if kind == "update" and bool(step["event"].get("all_day")) != bool(details.get("all_day")):
+                    raise CalendarError("capability_unverified")
+                step["occurrence"] = {
+                    "series_ref": details["series_ref"],
+                    "original_start": details["original_start"],
+                }
+            if not row["etag"]:
+                raise CalendarError("conditional_write_unavailable")
+            before = {
+                "start": row["start_at"].isoformat(),
+                # The stored instant span is internal; the source event ends at its start.
+                "end": (row["start_at"] if details.get("instant") else row["end_at"]).isoformat(),
+                **details,
+            }
+            if details.get("all_day"):
+                # Stored at local midnight; the event itself is a date range.
+                zone = ZoneInfo(cal["timezone"])
+                for field, stored in (("start", row["start_at"]), ("end", row["end_at"])):
+                    before[field] = stored.astimezone(zone).date().isoformat()
+            step.update(
+                resource_ref=row["resource_ref"],
+                target_id=row["target"],
+                expected_etag=row["etag"],
+                before=before,
+            )
+            scope = action.get("series", "this")
+            if scope not in SERIES_SCOPES or (scope != "this" and "occurrence" not in step):
+                raise CalendarError("invalid_action")
+            if scope != "this":
+                steps = self._series_steps(key, cal, step, scope, len(draft.prepared), read)
+                # One calendar entry per step, as validate_plan recomputes the scope hash.
+                draft.calendars.extend([cal] * (len(steps) - 1))
+                draft.prepared.extend(steps)
+                return None
+        return step, cal, label
+
+    def _plan_linked(self, key, p, action, kind, step, cal, label, carry_projections, draft):
+        """The drives a create with an activity, or a carried update or delete, adds to the plan."""
+        if kind == "create" and label:
+            # A new lesson and its drives in one plan; the drives wait for the lesson's verified create.
+            if self.store.guardian_readiness():
+                raise CalendarError("capability_unverified")
+            if not self.rule_reader(p):
+                raise CalendarError("not_found_or_forbidden")
+            source, scope = self._source(key, cal["ref"])
+            if step["event"].get("all_day"):
+                raise CalendarError("source_all_day")
+            a, b = (instant(step["span"][k]) for k in ("start", "end"))
+            drives, skips, labels = self._drives(
+                key, p, source, label, None, a, b, step["event"], source_step=step["ordinal"]
+            )
+            if not drives:
+                raise CalendarError(
+                    "nothing_to_project", details={"projections_skipped": skips, "activities": sorted(labels)}
+                )
+            draft.skipped += skips
+            draft.carried = True
+        elif kind != "create" and carry_projections and (found := self._carry(key, p, step, action["event_ref"], cal, draft.skipped, draft.selected)):
+            source, scope, drives = found
+            draft.carried = True
+        else:
+            return
+        if source["ref"] not in [s["calendar_ref"] for s in draft.sources]:
+            draft.sources.append({"calendar_ref": source["ref"], "scope": scope})
+            draft.source_calendars.append(source)
+        for linked_step, target in drives:
+            if (target["ref"], linked_step["target_id"]) in draft.targets:
+                raise CalendarError("duplicate_resource_action")
+            draft.targets.add((target["ref"], linked_step["target_id"]))
+            draft.prepared.append(dict(linked_step, ordinal=len(draft.prepared)))
+            draft.calendars.append(target)
+
+    def _plan_finish(self, key, p, draft, read):
+        """Limits, overlap check, the stored plan and its preview."""
+        if draft.projected and not draft.prepared:
             raise CalendarError(
                 "nothing_to_project",
-                details={"projections_skipped": skipped, "activities": sorted(activities)},
+                details={"projections_skipped": draft.skipped, "activities": sorted(draft.activities)},
             )
-        if unprojected and not prepared:
-            raise CalendarError("nothing_to_unproject", details={"projections_skipped": skipped})
+        if draft.unprojected and not draft.prepared:
+            raise CalendarError("nothing_to_unproject", details={"projections_skipped": draft.skipped})
         # The writes of exceptions a series move carries (at most 50, ANYM-614) come on top of the plan's 16 steps.
-        if len(prepared) - sum(carried_step(s) for s in prepared) > 16:
+        if len(draft.prepared) - sum(carried_step(s) for s in draft.prepared) > 16:
             raise CalendarError("too_many_steps")
-        overlap_check = self._overlap_check(key, p, prepared, selected)
+        overlap_check = self._overlap_check(key, p, draft.prepared, draft.selected)
         plan_id = ref("plan")
         expires = datetime.now(timezone.utc) + timedelta(minutes=10)
-        payload = {"steps": prepared, **({"sources": sources} if sources else {})}
-        if read is not None and any(carries(s) for s in prepared):
+        payload = {"steps": draft.prepared, **({"sources": draft.sources} if draft.sources else {})}
+        if read is not None and any(carries(s) for s in draft.prepared):
             # The series read the preview listed the exceptions from: a re-preview at confirm reuses it.
             payload["series_read"] = read
         self.store.query(
             "INSERT INTO plans(id,principal_id,payload,scope_hash,expires_at) VALUES (%s,%s,%s,%s,%s)",
             (plan_id, p["id"], Jsonb(payload),
-             self._scope_hash(p, calendars + source_calendars, any("invite" in s for s in prepared),
-                              any("series" in s for s in prepared), any(carries(s) for s in prepared)), expires),
+             self._scope_hash(p, draft.calendars + draft.source_calendars, any("invite" in s for s in draft.prepared),
+                              any("series" in s for s in draft.prepared), any(carries(s) for s in draft.prepared)), expires),
         )
         return {
             "plan_id": plan_id,
             "expires_at": expires.isoformat(),
-            "steps": [self._preview(s) for s in prepared],
+            "steps": [self._preview(s) for s in draft.prepared],
             "notifications": (
                 "per step invite: guests of a create, emailed only with notify all; edits of events with guests are "
-                "blocked" if any("invite" in s for s in prepared) else "none; events with guests are blocked"
+                "blocked" if any("invite" in s for s in draft.prepared) else "none; events with guests are blocked"
             ),
             "atomic": False,
             "overlap_check": overlap_check,
-            **({"projections_skipped": skipped} if projected or unprojected or carried else {}),
+            **({"projections_skipped": draft.skipped} if draft.projected or draft.unprojected or draft.carried else {}),
         }
-
-    def _fresh(self, calendar_ref, start, end, after=None):
-        """Complete coverage of [start, end] read in the last 5 minutes (SERVICE.md), and after `after`."""
-        cov = self.store.one("SELECT * FROM coverage WHERE calendar_ref=%s", (calendar_ref,))
-        since = datetime.now(timezone.utc) - timedelta(minutes=5)
-        return bool(
-            cov
-            and cov["status"] == "complete"
-            and cov["start_at"] <= start
-            and cov["end_at"] >= end
-            and cov["checked_at"] > (max(since, after) if after else since)
-        )
-
-    def _details(self, p, calendar_ref):
-        return self._can(p, calendar_ref, "agenda:read", details=True) or self._can(
-            p, calendar_ref, "event:read", details=True
-        )
-
-    def _drift(self, p, link):
-        """A link's status as p may know it: from fresh coverage only, and about the lesson only through p's own
-        details read of its calendar (authorized apart from the drive); anything else is `unknown`."""
-        target, source = link["target_calendar_ref"], link["source_calendar_ref"]
-        if link["state"] != "active" or not link["target_resource_ref"] or not self._details(p, target):
-            return "unknown"
-        drive = self.store.one(
-            "SELECT r.etag FROM occurrences o JOIN resources r ON r.ref=o.resource_ref "
-            "WHERE o.calendar_ref=%s AND o.resource_ref=%s LIMIT 1",
-            (target, link["target_resource_ref"]),
-        )
-        if not drive:
-            lead = self.store.one("SELECT lead_minutes FROM guardian_rules WHERE id=%s", (link["rule_id"],))
-            # Gone only in a complete read, after the link's last write, of the span the drive can occupy.
-            start = link["source_start"] - timedelta(minutes=lead["lead_minutes"])
-            return "projection_missing" if self._fresh(target, start, link["source_end"], link["updated_at"]) else "unknown"
-        if drive["etag"] != link["etag"]:
-            return "projection_edited"
-        if not self._details(p, source) or not self._fresh(source, link["source_start"], link["source_end"]):
-            return "unknown"
-        occ = self.store.one(
-            "SELECT start_at,end_at FROM occurrences WHERE ref=%s AND calendar_ref=%s",
-            (link["source_event_ref"], source),
-        )
-        if not occ:
-            # A cancelled occurrence is never published, so cancelled and deleted read alike.
-            return "source_cancelled"
-        if (occ["start_at"], occ["end_at"]) == (link["source_start"], link["source_end"]):
-            return "in_sync"
-        return "source_moved" if self._fresh(source, occ["start_at"], occ["end_at"]) else "unknown"
-
-    def _source(self, key, calendar_ref):
-        """The lesson's calendar as the principal reads it with details, and the scope that grants it."""
-        for scope in ("event:read", "agenda:read"):
-            try:
-                _, cal = self.authorize(key, calendar_ref, scope)
-            except CalendarError:
-                continue
-            if cal["visibility"] == "details":
-                return cal, scope
-        raise CalendarError("not_found_or_forbidden")
-
-    def _project(self, key, p, action):
-        """One linked create per enabled rule of the lesson's children whose Google target the principal can write."""
-        if self.store.guardian_readiness():
-            raise CalendarError("capability_unverified")
-        if not self.rule_reader(p):
-            raise CalendarError("not_found_or_forbidden")
-        source, scope = self._source(key, action.get("calendar_ref"))
-        occ = self.store.one(
-            "SELECT o.*,r.target FROM occurrences o JOIN resources r ON r.ref=o.resource_ref "
-            "WHERE o.ref=%s AND o.calendar_ref=%s",
-            (action.get("event_ref"), source["ref"]),
-        )
-        if not occ:
-            # A lesson gone since it was projected still names its links: they point to unproject.
-            gone = self.store.query(
-                self.LINKS + "l.source_calendar_ref=%s AND l.source_event_ref=%s AND r.activity=%s "
-                "ORDER BY l.duty,l.id",
-                (p["group_id"], source["ref"], action.get("event_ref"), action["activity"]),
-            ) if isinstance(action.get("event_ref"), str) else []
-            if not gone:
-                raise CalendarError("not_found_or_forbidden")
-            skips = [
-                {
-                    "rule_id": r["rule_id"],
-                    "duty": r["duty"],
-                    "guardian_id": r["guardian_id"],
-                    "reason": "projection_pending"
-                    if r["state"] == "pending"
-                    else "outcome_unknown"
-                    if r["state"] != "active"
-                    else {"projection_edited": "projection_edited", "unknown": "already_projected"}.get(
-                        self._drift(p, r), "use_unproject"
-                    ),
-                }
-                for r in gone
-            ]
-            labels = {
-                r["activity"]
-                for r in self.store.query(
-                    "SELECT activity FROM guardian_rules WHERE group_id=%s AND source_calendar_ref=%s AND enabled",
-                    (p["group_id"], source["ref"]),
-                )
-            }
-            return source, scope, [], skips, labels
-        if occ["details"].get("all_day"):
-            raise CalendarError("source_all_day")
-        # Projecting a drive would chain links; any link naming this event as its target refuses it.
-        if self.store.one(
-            "SELECT 1 FROM projection_links WHERE target_calendar_ref=%s AND target_id=%s",
-            (source["ref"], occ["target"]),
-        ):
-            raise CalendarError("projection_source_is_projection")
-        start = instant(occ["start_at"])
-        end = start if occ["details"].get("instant") else instant(occ["end_at"])
-        steps, skips, labels = self._drives(key, p, source, action["activity"], occ["ref"], start, end, occ["details"])
-        return source, scope, steps, skips, labels
-
-    def _drives(self, key, p, source, activity, event_ref, start, end, details, source_step=None):
-        """The linked creates for one lesson; a lesson created in the same plan has no event_ref yet and names
-        its create step instead, whose verified receipt supplies the event_ref."""
-        rules = self.store.query(
-            "SELECT r.*,m.enabled AS guardian_enabled,cn.provider AS target_provider,"
-            "(SELECT l.state FROM projection_links l WHERE l.source_event_ref=%s AND l.rule_id=r.id "
-            "AND l.state IN ('pending','active','repairing')) AS claim "
-            "FROM guardian_rules r JOIN bindings b ON b.group_id=r.group_id AND b.person_id=r.dependent_id "
-            "AND b.calendar_ref=r.source_calendar_ref "
-            "JOIN memberships m ON m.group_id=r.group_id AND m.person_id=r.guardian_id "
-            "JOIN calendars c ON c.ref=r.target_calendar_ref JOIN connections cn ON cn.id=c.connection_id "
-            "WHERE r.group_id=%s AND r.source_calendar_ref=%s ORDER BY r.dependent_id,r.duty,r.id",
-            (event_ref, p["group_id"], source["ref"]),
-        )
-        steps, skips = [], []
-        for r in rules:
-            if r["activity"] != activity:
-                continue
-            # A live link is planned again only to fix drift: a moved lesson or a drive gone (ANYM-436).
-            link = r["claim"] == "active" and self.store.one(
-                self.LINKS + "l.rule_id=%s AND l.source_event_ref=%s AND l.state='active'",
-                (p["group_id"], r["id"], event_ref),
-            )
-            drift = self._drift(p, link) if link else None
-            kind = "update" if drift == "source_moved" else "create"
-            # A live link's drive stays in the calendar it was placed in, even after the rule names another.
-            tcal = link["target_calendar_ref"] if link else r["target_calendar_ref"]
-            tprovider = (
-                self.store.one("SELECT provider FROM connections cn JOIN calendars c ON c.connection_id=cn.id "
-                               "WHERE c.ref=%s", (tcal,)) or {}
-            ).get("provider") if link else r["target_provider"]
-            reason = (
-                "disabled"
-                if not r["enabled"]
-                else "guardian_disabled"
-                if not r["guardian_enabled"]
-                else "projection_pending"
-                if r["claim"] == "pending"
-                else "outcome_unknown"
-                if r["claim"] == "repairing"
-                else DRIFT_SKIP.get(drift or "", "already_projected")
-                if r["claim"] and drift not in ("source_moved", "projection_missing")
-                # _source already proved source details through event:read or agenda:read. A live link is fixed in
-                # its own calendar, so the rule's current target is not consulted for it.
-                else (None if link else {"source_not_visible": None}.get(
-                    ready := self.rule_view(p, r)["not_ready_reason"], ready))
-                or (
-                    None
-                    if self._can(p, tcal, "plan:create") and self._can(p, tcal, "event:" + kind)
-                    else "target_not_writable"
-                )
-                or (None if tprovider == "google" else "provider_not_supported")
-            )
-            if reason:
-                skips.append({"rule_id": r["id"], "duty": r["duty"], "guardian_id": r["guardian_id"], "reason": reason})
-                continue
-            _, target = self.authorize(key, tcal, "event:" + kind)
-            lead = timedelta(minutes=r["lead_minutes"])
-            # Both drives end at the lesson boundary they serve.
-            a, b = (start - lead, start) if r["duty"] == "dropoff" else (end - lead, end)
-            event = {"title": r["title"], "start": a.isoformat(), "end": b.isoformat(), "timezone": target["timezone"]}
-            if r["copy_location"] and details.get("location"):
-                event["location"] = details["location"]
-            if kind == "update":
-                # Reproject: the drive moves to the lesson's new span, conditional on the link ETag.
-                drive = self.store.one(
-                    "SELECT start_at,end_at,details FROM occurrences WHERE calendar_ref=%s AND resource_ref=%s",
-                    (target["ref"], link["target_resource_ref"]),
-                )
-                del event["title"]
-                step = {
-                    "action": "update",
-                    "calendar_ref": target["ref"],
-                    "provider": target["provider"],
-                    "event": event,
-                    "span": {"start": a.isoformat(), "end": b.isoformat()},
-                    "resource_ref": link["target_resource_ref"],
-                    "target_id": link["target_id"],
-                    "expected_etag": link["etag"],
-                    "reproject": True,
-                    "link": {
-                        "rule_id": r["id"],
-                        "rule_version": r["version"],
-                        "duty": r["duty"],
-                        "guardian_id": link["guardian_id"],
-                        "source_event_ref": event_ref,
-                    },
-                    "source": {"start": start.isoformat(), "end": end.isoformat(), "title": details.get("title")},
-                    "before": {
-                        "start": drive["start_at"].isoformat(),
-                        "end": drive["end_at"].isoformat(),
-                        **{k: v for k, v in drive["details"].items() if k == "location"},
-                    },
-                }
-                steps.append((step, target))
-                continue
-            step = {
-                "action": "create",
-                "calendar_ref": target["ref"],
-                "provider": target["provider"],
-                "event": event,
-                "span": {"start": a.isoformat(), "end": b.isoformat()},
-                "resource_ref": ref("res"),
-                "target_id": uuid_token(),
-                "link": {
-                    "rule_id": r["id"],
-                    "rule_version": r["version"],
-                    "duty": r["duty"],
-                    "guardian_id": r["guardian_id"],
-                    "source_event_ref": event_ref,
-                    **({} if source_step is None else {"source_step": source_step}),
-                },
-                "source": {"start": start.isoformat(), "end": end.isoformat(), "title": details.get("title")},
-                # Worker-only: the opaque link ID is the one marker the provider event carries.
-                "projection": {"link_id": ref("link"), "source_calendar_ref": source["ref"], "visibility": r["visibility"]},
-            }
-            if link:
-                # Re-create a drive gone outside DeedKit, with a new client ID on the same link row; the worker
-                # takes the link over from its old target at admission, or fails projection_pending.
-                step["link"]["guardian_id"] = link["guardian_id"]
-                step["reproject"] = True
-                step["projection"].update(
-                    link_id=link["id"],
-                    repair_of={"target_id": link["target_id"], "resource_ref": link["target_resource_ref"]},
-                )
-            steps.append((step, target))
-        return steps, skips, {r["activity"] for r in rules if r["enabled"]}
-
-    def _unproject(self, key, p, action, skips):
-        """One delete per active link of a lesson occurrence or of one of p's operations; a link whose
-        outcome is unknown is skipped. Source authority rests on the link's stored source calendar."""
-        if self.store.guardian_readiness():
-            raise CalendarError("capability_unverified")
-        if not self.rule_reader(p):
-            raise CalendarError("not_found_or_forbidden")
-        if "operation_id" in action:
-            if set(action) != {"action", "operation_id"}:
-                raise CalendarError("invalid_action")
-            if not self.store.one(
-                "SELECT 1 FROM operations WHERE id=%s AND principal_id=%s", (action["operation_id"], p["id"])
-            ):
-                raise CalendarError("not_found_or_forbidden")
-            rows = self.store.query(
-                self.LINKS + "l.operation_id=%s ORDER BY l.ordinal,l.id", (p["group_id"], action["operation_id"])
-            )
-        else:
-            if set(action) != {"action", "calendar_ref", "event_ref"} or not isinstance(action["event_ref"], str):
-                raise CalendarError("invalid_action")
-            # Checked before the lookup, so a calendar the principal cannot read reveals no link.
-            self._source(key, action["calendar_ref"])
-            rows = self.store.query(
-                self.LINKS + "l.source_calendar_ref=%s AND l.source_event_ref=%s ORDER BY l.duty,l.id",
-                (p["group_id"], action["calendar_ref"], action["event_ref"]),
-            )
-        sources = {ref: self._source(key, ref) for ref in {r["source_calendar_ref"] for r in rows}}
-        result = []
-        for r in rows:
-            skip = {"rule_id": r["rule_id"], "duty": r["duty"], "guardian_id": r["guardian_id"]}
-            if r["state"] != "active":
-                # A pending or repairing link may name a write whose outcome is unknown: reconcile first.
-                skips.append(dict(skip, reason="outcome_unknown"))
-                continue
-            if not (self._can(p, r["target_calendar_ref"], "plan:create") and self._can(
-                p, r["target_calendar_ref"], "event:delete"
-            )):
-                skips.append(dict(skip, reason="target_not_writable"))
-                continue
-            _, target = self.authorize(key, r["target_calendar_ref"], "event:delete")
-            start, end = r["source_start"], r["source_end"]
-            # An instant lesson is stored with the smallest span the CHECK allows; it ends at its start.
-            end = start if end - start <= timedelta(microseconds=1) else end
-            step = {
-                "action": "delete",
-                "calendar_ref": target["ref"],
-                "provider": target["provider"],
-                "resource_ref": r["target_resource_ref"],
-                "target_id": r["target_id"],
-                "expected_etag": r["etag"],
-                "link": {
-                    "rule_id": r["rule_id"],
-                    "rule_version": r["rule_version"],
-                    "duty": r["duty"],
-                    "guardian_id": r["guardian_id"],
-                    "source_event_ref": r["source_event_ref"],
-                },
-                # The stored span: the lesson may since be moved, cancelled or gone.
-                "source": {"start": start.isoformat(), "end": end.isoformat(), "title": r["title"]},
-            }
-            result.append((step, target, *sources[r["source_calendar_ref"]]))
-        return result
-
-    def _carry(self, key, p, step, event_ref, source, skips, selected):
-        """The linked change of each active drive of a lesson that step moves or cancels: an update to the new
-        span by the link's rule, or a delete; both conditional on the link ETag. None when the lesson has no
-        link the principal may see."""
-        if self.store.guardian_readiness() or not self.rule_reader(p):
-            return None
-        try:
-            source, scope = self._source(key, source["ref"])
-        except CalendarError:
-            return None
-        rows = self.store.query(
-            self.LINKS + "l.source_calendar_ref=%s AND l.source_event_ref=%s ORDER BY l.duty,l.id",
-            (p["group_id"], source["ref"], event_ref),
-        )
-        if not rows:
-            return None
-        kind, result = step["action"], []
-        for r in rows:
-            skip = {"rule_id": r["rule_id"], "duty": r["duty"], "guardian_id": r["guardian_id"]}
-            reason = (
-                "projection_pending"
-                if r["state"] == "pending"
-                # A repairing link names a write whose outcome is unknown: reconcile first.
-                else "outcome_unknown"
-                if r["state"] != "active"
-                else None
-                if self._can(p, r["target_calendar_ref"], "plan:create")
-                and self._can(p, r["target_calendar_ref"], "event:" + kind)
-                else "target_not_writable"
-            )
-            if not reason and kind == "update" and step["event"].get("all_day"):
-                reason = "source_all_day"
-            if reason:
-                skips.append(dict(skip, reason=reason))
-                continue
-            _, target = self.authorize(key, r["target_calendar_ref"], "event:" + kind)
-            rule = self.store.one(
-                "SELECT version,lead_minutes,copy_location FROM guardian_rules WHERE id=%s", (r["rule_id"],)
-            )
-            drive = self.store.one(
-                "SELECT ref,start_at,end_at,details FROM occurrences WHERE calendar_ref=%s AND resource_ref=%s",
-                (target["ref"], r["target_resource_ref"]),
-            )
-            if drive:
-                # The drive's cached occurrence moves with the plan: it is no overlap of its own new span.
-                selected.add(drive["ref"])
-            if kind == "update":
-                start, end = (instant(step["span"][k]) for k in ("start", "end"))
-                lead = timedelta(minutes=rule["lead_minutes"])
-            else:
-                start, end = r["source_start"], r["source_end"]
-                end = start if end - start <= timedelta(microseconds=1) else end
-            linked = {
-                "action": kind,
-                "calendar_ref": target["ref"],
-                "provider": target["provider"],
-                "resource_ref": r["target_resource_ref"],
-                "target_id": r["target_id"],
-                "expected_etag": r["etag"],
-                "link": {
-                    "rule_id": r["rule_id"],
-                    "rule_version": rule["version"] if kind == "update" else r["rule_version"],
-                    "duty": r["duty"],
-                    "guardian_id": r["guardian_id"],
-                    "source_event_ref": r["source_event_ref"],
-                    "source_step": step["ordinal"],
-                },
-                "source": {
-                    "start": start.isoformat(),
-                    "end": end.isoformat(),
-                    "title": step.get("event", {}).get("title") or r["title"],
-                },
-            }
-            if kind == "update":
-                a, b = (start - lead, start) if r["duty"] == "dropoff" else (end - lead, end)
-                event = {"start": a.isoformat(), "end": b.isoformat(), "timezone": target["timezone"]}
-                if rule["copy_location"] and "location" in step["event"]:
-                    event["location"] = step["event"]["location"]
-                linked.update(event=event, span={"start": a.isoformat(), "end": b.isoformat()})
-                if drive:
-                    linked["before"] = {
-                        "start": drive["start_at"].isoformat(),
-                        "end": drive["end_at"].isoformat(),
-                        **{k: v for k, v in drive["details"].items() if k == "location"},
-                    }
-            result.append((linked, target))
-        return source, scope, result
-
-    LINKS = (
-        # The guardian the drive was made for, frozen in the projecting plan; the rule may since name another.
-        "SELECT l.*,coalesce((SELECT p.payload->'steps'->l.ordinal->'link'->>'guardian_id' FROM operations op "
-        "JOIN plans p ON p.id=op.plan_id WHERE op.id=l.operation_id),r.guardian_id) AS guardian_id,"
-        "o.details->>'title' AS title FROM projection_links l "
-        "JOIN guardian_rules r ON r.id=l.rule_id "
-        "LEFT JOIN occurrences o ON o.ref=l.source_event_ref AND o.calendar_ref=l.source_calendar_ref "
-        "WHERE r.group_id=%s AND l.state<>'removed' AND "
-    )
-
-    def replacement_of(self, p, handle):
-        """The verified replacement series one of p's own following moves created, by its series_ref: the plan step
-        that created it and the create's receipt. Durable, so an undo never waits for a read to publish it."""
-        from .providers import series_ref
-
-        rows = self.store.query(
-            "SELECT p.payload,s.receipt FROM operations o JOIN plans p ON p.id=o.plan_id "
-            "JOIN operation_steps s ON s.operation_id=o.id AND s.ordinal=0 "
-            "WHERE o.principal_id=%s AND s.state='verified' "
-            "AND p.payload->'steps'->0->'series'->>'role'='replacement' ORDER BY o.created_at",
-            (p["id"],),
-        )
-        for row in rows:
-            made = row["payload"]["steps"][0]
-            if series_ref(made["calendar_ref"], made["target_id"]) == handle and (row["receipt"] or {}).get("etag"):
-                return dict(made, receipt=row["receipt"])
-        raise CalendarError("not_found_or_forbidden")
-
-    def _undo_step(self, p, cal, handle, step):
-        """Delete the replacement series of a partial following move, only as its create left it (its etag)."""
-        made = self.replacement_of(p, handle)
-        if made["calendar_ref"] != cal["ref"] or cal["provider"] != "google":
-            raise CalendarError("not_found_or_forbidden")
-        return dict(step, target_id=made["target_id"], resource_ref=made["resource_ref"],
-                    expected_etag=made["receipt"]["etag"], before=dict(made["span"]),
-                    series={"scope": "all", "role": "undo", "series_ref": handle,
-                            "planned_at": datetime.now(timezone.utc).isoformat()})
-
-    def _series_steps(self, key, cal, step, scope, ordinal, read=None):
-        """The steps of a series edit (ANYM-556): `all` is one write to the master; `following` ends the master just
-        before the occurrence, and a following move first creates the replacement series under a stable,
-        client-generated ID (step 0), then truncates (step 1), so a failed truncation never loses an occurrence.
-        A time move previewed with a read of the series (ANYM-614) carries its exceptions: after those steps, one
-        write per exception to its instance in the moved series, and every series step first checks that the
-        series and its exceptions in range are still as read."""
-        if cal["provider"] != "google":
-            raise CalendarError("capability_unsupported")
-        planned = datetime.now(timezone.utc).isoformat()
-        carry = self._series_carry(cal, step, scope, read) if read is not None and step["action"] == "update" else None
-        extra = {} if carry is None else {"snapshot": carry["snapshot"]}
-        if scope == "all" or step["action"] == "delete":
-            steps = [dict(step, ordinal=ordinal, series={"scope": scope, "planned_at": planned, **extra})]
-            return self._carried_steps(key, cal, steps, carry, planned)
-        self.authorize(key, cal["ref"], "event:create")
-        replacement = {
-            "action": "create", "calendar_ref": step["calendar_ref"], "provider": step["provider"],
-            "ordinal": ordinal, "event": step["event"], "span": step["span"], "resource_ref": ref("res"),
-            "target_id": uuid_token(), "occurrence": step["occurrence"],
-            "series": {"scope": "following", "role": "replacement", "instance_id": step["target_id"],
-                       "instance_etag": step["expected_etag"], "planned_at": planned},
-        }
-        truncation = {k: v for k, v in step.items() if k not in ("event", "span")}
-        truncation.update(ordinal=ordinal + 1, series={"scope": "following", "role": "truncation",
-                                                       "replacement_step": ordinal, "planned_at": planned})
-        replacement["series"].update(extra)
-        truncation["series"].update(extra)
-        return self._carried_steps(key, cal, [replacement, truncation], carry, planned)
-
-    def _series_carry(self, cal, step, scope, read):
-        """The exceptions a series time move carries, from the preview's read of the series (ANYM-614); None when
-        the move's shape is one the carried writes do not express (the worker then refuses it before any write as
-        it always did: series_exceptions, unsupported_recurrence, capability_unverified)."""
-        from . import series as recurrence
-
-        if (read.get("instance") or {}).get("id") != step["target_id"]:
-            return None
-        if read["instance"].get("etag") != step["expected_etag"]:
-            # The cache and the read disagree on the occurrence: a refresh before the preview settles which is right.
-            raise CalendarError("version_conflict")
-        master, occurrence, event = read["master"], step["occurrence"], step["event"]
-        try:
-            zone = recurrence.zone_of(master)
-            if scope == "all":
-                recurrence.edit_all(master, occurrence, event, zone)
-            else:
-                recurrence.replacement(master, occurrence, event, zone, "preview")
-            items = recurrence.carried(master, read["exceptions"], occurrence, event, scope, zone)
-        except CalendarError:
-            return None
-        if len(items) > recurrence.MAX_CARRIED:
-            parts, _ = recurrence.rule_of(master)
-            delta, _ = recurrence.shift(occurrence, event, zone)
-            later = recurrence.later_start(parts, recurrence.master_start(master, zone),
-                                           [i["original"] for i in items], recurrence.MAX_CARRIED)
-            raise CalendarError("series_exceptions_too_many", details={
-                "count": len(items), "limit": recurrence.MAX_CARRIED,
-                **({"later": {"original_start": shown_time(later, zone), "start": shown_time(later + delta, zone)}}
-                   if later is not None else {})})
-        snapshot = {"master_etag": master["etag"], "exceptions": {i["id"]: i["etag"] for i in items}}
-        return {"zone": zone, "items": items, "master_id": master["id"], "snapshot": snapshot}
-
-    def _carried_steps(self, key, cal, steps, carry, planned):
-        """The series steps followed by one write per carried exception that needs one; the primary step (the
-        master's write, or a following move's truncation) keeps the list the preview shows."""
-        from . import series as recurrence
-        from .providers import source_ref
-
-        if carry is None:
-            return steps
-        zone, primary = carry["zone"], steps[-1]
-        # The moved series: the replacement a following move creates, or the master an all move patches.
-        series_id = steps[0]["target_id"] if steps[0]["action"] == "create" else carry["master_id"]
-        shown, out = [], list(steps)
-        for item in carry["items"]:
-            # Every exception gets its own write and read-back, also one whose fields equal the master's: its
-            # instance in the moved series is checked to be the one occurrence there, as previewed.
-            target = recurrence.instance_id(series_id, item["start"], zone)
-            shown.append({"fate": item["fate"], "original_start": shown_time(item["original"], zone),
-                          "start": shown_time(item["start"], zone),
-                          **({"own": item["own"]} if item["fate"] == "kept" else {})})
-            action = "delete" if item["fate"] == "cancelled" else "update"
-            self.authorize(key, cal["ref"], "event:" + action)
-            out.append({"action": action, "calendar_ref": cal["ref"], "provider": cal["provider"],
-                        "ordinal": steps[0]["ordinal"] + len(out), "target_id": target,
-                        "resource_ref": source_ref("res", cal["ref"], target),
-                        "series": {"scope": primary["series"]["scope"], "role": "exception", "planned_at": planned,
-                                   "series_id": series_id, "desired": item["desired"],
-                                   "exception": {"id": item["id"], "fate": item["fate"],
-                                                 "original_start": shown[-1]["original_start"],
-                                                 "start": shown[-1]["start"]}}})
-        primary["series"]["carried"] = shown
-        return out
 
     def _overlap_check(self, key, principal, prepared, selected):
         """Advisory cached evidence within current read grants, never permission
@@ -1714,9 +1194,3 @@ class FamilyService:
             "end": b.isoformat(),
         }
 
-
-def uuid_token():
-    # Google's client-generated IDs accept lowercase base32hex; hex is a valid subset.
-    from uuid import uuid4
-
-    return "fcs" + uuid4().hex
