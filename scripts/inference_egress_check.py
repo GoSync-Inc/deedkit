@@ -10,7 +10,8 @@ bridge dk-inferencedb0 (nothing here changes a firewall); `rules --undo` prints 
 
 Blocked targets with an address are IP:PORT pairs with a known listener (production.md lists them): an address that
 answers a refusal is not blocked (a DROP never sends one). `--blocked-name` is for names (the API alias, an external
-name): it passes when the name does not resolve or nothing answers. The positive control runs elsewhere: `listen` in
+name): it passes only when the name does not resolve; a lookup that succeeds fails, whatever a connection would do.
+A failed lookup alone does not prove no query left: production.md watches the host's other interfaces for port 53. The positive control runs elsewhere: `listen` in
 a sibling container, then `check --control IP:PORT` from another one that may reach it; it must connect, or "blocked"
 in the worker's run could mean that nothing listens.
 """
@@ -45,27 +46,54 @@ def mini_address(value):
     return address
 
 
-def rules(mini):
-    return ([f'iptables -N {CHAIN}', f'iptables -F {CHAIN}',
+def chain_rules(mini, table):
+    """The chain for one table: create, empty, then the one allow first and every drop after it."""
+    t = f'-t {table} ' if table else ''
+    return ([f'iptables {t}-N {CHAIN}', f'iptables {t}-F {CHAIN}',
              # The one way out: TCP 443 to the mini. Everything below it is a drop.
-             f'iptables -A {CHAIN} -d {mini} -p tcp --dport 443 -j RETURN'] +
-            [f'iptables -A {CHAIN} -p {proto} --dport 53 -j DROP' for proto in ('udp', 'tcp')] +
-            [f'iptables -A {CHAIN} -d {network} -j DROP' for network in DROPPED] +
-            [f'iptables -A {CHAIN} -j DROP',
-             f'iptables -I DOCKER-USER -i {BRIDGE} -j {CHAIN}',
+             f'iptables {t}-A {CHAIN} -d {mini} -p tcp --dport 443 -j RETURN'] +
+            [f'iptables {t}-A {CHAIN} -p {proto} --dport 53 -j DROP' for proto in ('udp', 'tcp')] +
+            [f'iptables {t}-A {CHAIN} -d {network} -j DROP' for network in DROPPED] +
+            [f'iptables {t}-A {CHAIN} -j DROP'])
+
+
+def rules(mini):
+    # Two hooks, the same chain. `raw` PREROUTING runs before conntrack and the filter FORWARD chain, where
+    # Tailscale's `ts-forward` accept can precede DOCKER-USER (it installs itself at position 1 and tailscaled
+    # reinstalls it on restart), so the raw hook cannot be passed over by a later reorder. DOCKER-USER stays as the
+    # second layer.
+    return (chain_rules(mini, '') + chain_rules(mini, 'raw') +
+            [f'iptables -I DOCKER-USER -i {BRIDGE} -j {CHAIN}',
+             f'iptables -t raw -I PREROUTING -i {BRIDGE} -j {CHAIN}',
              # Packets to the host itself are not forwarded, so DOCKER-USER never sees them; both bridges.
              *[f'iptables -I INPUT -i {bridge} -j DROP' for bridge in (BRIDGE, DB_BRIDGE)],
              # The bridges have no IPv6 (enable_ipv6: false); these drop ULA, NAT64 and everything else anyway.
              f'ip6tables -I DOCKER-USER -i {BRIDGE} -j DROP',
+             f'ip6tables -t raw -I PREROUTING -i {BRIDGE} -j DROP',
              *[f'ip6tables -I INPUT -i {bridge} -j DROP' for bridge in (BRIDGE, DB_BRIDGE)]])
 
 
 def undo():
     return [f'iptables -D DOCKER-USER -i {BRIDGE} -j {CHAIN}',
+            f'iptables -t raw -D PREROUTING -i {BRIDGE} -j {CHAIN}',
             *[f'iptables -D INPUT -i {bridge} -j DROP' for bridge in (BRIDGE, DB_BRIDGE)],
             f'ip6tables -D DOCKER-USER -i {BRIDGE} -j DROP',
+            f'ip6tables -t raw -D PREROUTING -i {BRIDGE} -j DROP',
             *[f'ip6tables -D INPUT -i {bridge} -j DROP' for bridge in (BRIDGE, DB_BRIDGE)],
-            f'iptables -F {CHAIN}', f'iptables -X {CHAIN}']
+            f'iptables -F {CHAIN}', f'iptables -X {CHAIN}',
+            f'iptables -t raw -F {CHAIN}', f'iptables -t raw -X {CHAIN}']
+
+
+def probe_name(target):
+    """'unresolved' only when the name does not resolve; a lookup that succeeds means a resolver answered."""
+    host, _, port = target.rpartition(':')
+    try:
+        socket.getaddrinfo(host, int(port), type=socket.SOCK_STREAM)
+    except ValueError:
+        return 'malformed'
+    except (OSError, UnicodeError):
+        return 'unresolved'
+    return 'resolved'
 
 
 def probe(target, timeout, literal=False):
@@ -123,11 +151,13 @@ def check(targets, timeout):
         if expect.endswith('dns'):
             outcome = probe_dns(target, timeout)
             passed = outcome == 'answered' if expect == 'open-dns' else outcome in ('timeout', 'unreachable')
+        elif expect == 'blocked-name':
+            # A name that resolves means a resolver answered from inside, whatever the connection then does.
+            outcome = probe_name(target)
+            passed = outcome == 'unresolved'
         else:
             outcome = probe(target, timeout, literal=expect == 'blocked')
-            # A name that does not resolve (no embedded-resolver answer) sends nothing: blocked for a name only.
-            blocked = ('unresolved', 'timeout', 'unreachable') if expect == 'blocked-name' else ('timeout', 'unreachable')
-            passed = outcome == 'connected' if expect in ('open', 'control') else outcome in blocked
+            passed = outcome == 'connected' if expect in ('open', 'control') else outcome in ('timeout', 'unreachable')
         results.append({'target': target, 'expect': expect, 'outcome': outcome, 'passed': passed})
     return {'passed': bool(results) and all(item['passed'] for item in results), 'results': results}
 
@@ -164,7 +194,7 @@ def main(argv=None):
     probe_parser.add_argument('--blocked', action=Target, const='blocked', metavar='IP:PORT',
                               help='an IP literal with a known listener: must get no answer')
     probe_parser.add_argument('--blocked-name', action=Target, const='blocked-name', metavar='NAME:PORT',
-                              help='a name: must not resolve, or get no answer')
+                              help='a name: must not resolve')
     probe_parser.add_argument('--blocked-dns', action=Target, const='blocked-dns', metavar='IP[:PORT]',
                               help='a UDP DNS query to this resolver must get no answer')
     probe_parser.add_argument('--control', action=Target, const='control', metavar='IP:PORT',

@@ -1359,51 +1359,71 @@ the rules drop it. `private/enrichment-mini.json` (from `deploy/enrichment-mini.
 file: a bind-mounted file keeps the retired inode after an atomic rotation. The DSN is the
 `messaging_enricher` one (`private/enrichment-local.dsn`).
 
-Apply, in this order (a rule step that fails stops the apply; the worker starts last):
+Apply, in this order (a failed step stops the apply; the worker is selected for promotion last).
+`F` is the project's Compose arguments plus `-f compose.enrichment.yaml`; `E` is the verified
+`enricher-local` image of the host's current release (`docker image inspect` it; never `--build`),
+tagged `docker tag $E anymsg-enricher-local:enroll-<sha>` (a new tag, never a production tag), and the
+Compose commands below run with `MESSAGING_VERSION=enroll-<sha>`:
 1. Rules (host, as root, before the networks exist; they match bridge names):
    `python3 scripts/inference_egress_check.py rules --mini-ip $INFERENCE_MINI_IP` prints them; apply
-   them and save them with the host's firewall persistence. They drop host-bound packets from
-   `dk-inference0` and `dk-inferencedb0`, and from `dk-inference0` everything but TCP 443 to the mini:
-   DNS to any address, RFC 1918, link-local and metadata (169.254.0.0/16), the rest of the tailnet,
-   loopback and all IPv6.
+   them and save them with the host's firewall persistence. The same chain hangs in two places:
+   `raw` PREROUTING (before conntrack and the filter `FORWARD` chain, so Tailscale's `ts-forward`
+   accept, which sits at position 1 and is reinstalled when `tailscaled` restarts, cannot pass it) and
+   `DOCKER-USER`. From `dk-inference0` they allow only TCP 443 to the mini and drop DNS to any address,
+   RFC 1918, link-local and metadata (169.254.0.0/16), the rest of the tailnet, loopback and all IPv6;
+   host-bound packets from `dk-inference0` and `dk-inferencedb0` are dropped in `INPUT`.
 2. Networks: `docker compose $F --profile enrichment-mini up --no-start --no-build --pull never --no-deps
-   enricher-mini` (`F` is the project's Compose arguments plus the enrichment overlay) creates both
-   networks and the stopped worker.
+   enricher-mini` creates both networks and the stopped worker.
 3. Database: a Compose change that adds a network to `db` would recreate the container, and databases
    are never restarted by the tool. Attach it live instead: `docker network connect --alias db
    <project>_inference_db <db container>`. Its `backend` attachment, identity and sessions are
    unchanged; no connection drops. A later recreate of `db` (a Postgres image bump) takes the network
    from the overlay.
-4. Config: append `compose.enrichment.yaml` to the project's `files` in `/etc/deedkit/production.json`
-   (and the messaging project's `files` in `/etc/deedkit/http-production.json`) when it is not there
-   yet, and map `"enricher-mini": "enricher-local"` in `services` (the image target; back both files up
-   first). Autodeploy pauses on a Compose change ("apply the next release by hand"): under the pause
-   file apply the next green `main` SHA by hand as item 5 of the delivery enrollment above does, then
-   remove the pause.
-5. Start and check: `docker compose $F --profile enrichment-mini start enricher-mini` with the
-   config still `"enabled": false` (it claims no job), then run the check below from inside. On any
-   failure `stop enricher-mini` and fix the rules; enable the config only after a pass.
+4. Check from a probe container. The worker with `"enabled": false` exits (`enrichment_disabled`) and
+   restarts in a loop, so it cannot host the check. `run` starts a bounded one-off container from the same
+   service definition (same networks, `extra_hosts`, `dns` and limits) with the interpreter as entrypoint:
+   `docker compose $F --profile enrichment-mini run --rm -T --no-deps --entrypoint python enricher-mini -I
+   - check ... < scripts/inference_egress_check.py` (below). Fix the rules on any failure.
+5. Start: with `private/enrichment-mini.json` enabled, `docker compose $F --profile enrichment-mini start
+   enricher-mini`; it runs, with no restarts.
+6. Only now select the worker for promotion (the host tool's `snapshot` needs a running container):
+   append `compose.enrichment.yaml` to the project's `files` in `/etc/deedkit/production.json` (and the
+   messaging project's `files` in `/etc/deedkit/http-production.json`) when it is not there yet, and map
+   `"enricher-mini": "enricher-local"` in `services` (back both files up first). Autodeploy pauses on a
+   Compose change ("apply the next release by hand"): under the pause file apply the next green `main`
+   SHA by hand as item 5 of the delivery enrollment above does, then remove the pause.
 
 Check (the receipt keeps the JSON). `listen` is a bounded synthetic listener; the positive control keeps
 "blocked" from meaning "nothing listens". Blocked targets are IP literals read with `docker inspect` and
-`ip addr`, each with a known listener; `<api ip>` is the API container's address on `backend`:
+`ip addr`, each with a known listener; `<api ip>` is the API container's address on `backend`,
+`<mini ip>:<port>` a port the mini listens on other than 443 (such as 22 while Remote Login is on) and
+`<tailnet node ip>:<port>` another tailnet node's listener. The two tailnet targets prove the raw hook
+beats `ts-forward`:
 ```sh
 docker compose $F exec -T api python -I - listen --port 18081 --seconds 300 < scripts/inference_egress_check.py &
 docker compose $F exec -T api python -I - check --control <api ip>:8080 --control <api ip>:18081 \
-  < scripts/inference_egress_check.py
-docker compose $F exec -T enricher-mini python -I - check --open db:5432 --open $INFERENCE_MINI_IP:443 \
+  --control <mini ip>:<port> --control <tailnet node ip>:<port> < scripts/inference_egress_check.py
+docker compose $F --profile enrichment-mini run --rm -T --no-deps --entrypoint python enricher-mini -I - check \
+  --open db:5432 --open $INFERENCE_MINI_IP:443 --blocked <mini ip>:<port> --blocked <tailnet node ip>:<port> \
   --blocked <api ip>:8080 --blocked <api ip>:18081 --blocked-name api:8080 --blocked <host public ip>:443 \
   --blocked <dk-inference0 gateway ip>:443 --blocked 1.1.1.1:443 --blocked 1.1.1.1:53 --blocked-dns 1.1.1.1 \
   --blocked-name example.com:443 < scripts/inference_egress_check.py
 ```
-It exits 0 only when the database and the mini connect and every blocked target times out, has no route or
-does not resolve. A refusal means the address answered, which a DROP never does: it fails.
+(The `--control` runs come from a container that may reach those addresses; the tailnet ones from the host
+itself: `python3 scripts/inference_egress_check.py check --control ...`.) It exits 0 only when the database
+and the mini connect, every blocked address times out or has no route, and every blocked name does not
+resolve. A refusal means the address answered, which a DROP never does; a name that resolves fails even if
+the connection is then dropped. A failed lookup does not prove that no query left, so watch the host during
+the check: `tcpdump -ni dk-inference0 'port 53'` shows the attempts (the run did generate them) and
+`tcpdump -ni any 'port 53 and not src host 127.0.0.1'` on the other interfaces (`tailscale0` and the uplink)
+must show none from the container subnet. Keep both outputs with the receipt.
 
 Undo (reverse): `docker compose $F --profile enrichment-mini stop enricher-mini` and `rm enricher-mini`;
 `docker network disconnect <project>_inference_db <db container>`; `docker network rm
-<project>_inference_db <project>_inference_egress`; restore both configuration backups; as root
+<project>_inference_db <project>_inference_egress`; restore both configuration backups (a promoted release
+needs the same newer-SHA hand apply as the delivery undo above); `docker image rm` the enroll tag; as root
 `python3 scripts/inference_egress_check.py rules --undo` prints the mirror of the rules (hooks first, then
-the chain). The worker's jobs requeue on SIGTERM; nothing in the database changes.
+both chains). The worker's jobs requeue on SIGTERM; nothing in the database changes.
 
 ## Image retention
 

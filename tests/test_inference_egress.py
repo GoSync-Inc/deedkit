@@ -33,7 +33,7 @@ def test_egress_rules_allow_exactly_the_mini_on_443_and_drop_everything_else():
     # The one allow comes first; everything after it is a drop, ending in a catch-all.
     assert chain[0] == f'iptables -A {CHAIN} -d {MINI} -p tcp --dport 443 -j RETURN'
     assert all(line.endswith('-j DROP') for line in chain[1:]) and chain[-1] == f'iptables -A {CHAIN} -j DROP'
-    assert sum(' -j RETURN' in line for line in lines) == 1 and not any('ACCEPT' in line for line in lines)
+    assert not any('ACCEPT' in line for line in lines)
     # The ranges the card names are dropped explicitly: RFC 1918, link-local with metadata, the tailnet, loopback.
     for network in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16', '100.64.0.0/10', '127.0.0.0/8'):
         assert f'iptables -A {CHAIN} -d {network} -j DROP' in chain, network
@@ -44,6 +44,14 @@ def test_egress_rules_allow_exactly_the_mini_on_443_and_drop_everything_else():
     assert 'ip6tables -I INPUT -i dk-inference0 -j DROP' in lines
     # The chain exists before it is filled and is emptied first, so a second run never doubles the rules.
     assert lines.index(f'iptables -N {CHAIN}') < lines.index(f'iptables -F {CHAIN}') < lines.index(chain[0])
+    # The same chain also hangs in `raw` PREROUTING, which runs before the filter FORWARD chain: a Tailscale
+    # `ts-forward` accept placed ahead of DOCKER-USER (or re-placed after a tailscaled restart) cannot pass it.
+    raw = [line.replace('iptables -t raw ', 'iptables ') for line in lines if line.startswith('iptables -t raw -A ')]
+    assert raw == chain
+    assert f'iptables -t raw -I PREROUTING -i dk-inference0 -j {CHAIN}' in lines
+    assert 'ip6tables -t raw -I PREROUTING -i dk-inference0 -j DROP' in lines
+    assert lines.index(f'iptables -t raw -N {CHAIN}') < lines.index(f'iptables -t raw -I PREROUTING -i dk-inference0 -j {CHAIN}')
+    assert sum(' -j RETURN' in line for line in lines) == 2
 
 
 # spec: ANYM-688
@@ -67,8 +75,9 @@ def test_egress_rules_undo_is_the_mirror():
     inserts = {line.replace(' -I ', ' -D ', 1) for line in applied if ' -I ' in line}
     deletes = {line for line in undone if ' -D ' in line}
     assert inserts == deletes and inserts
-    # The hooks are removed before the chain is flushed and deleted, or the delete would fail.
-    assert undone[-2:] == [f'iptables -F {CHAIN}', f'iptables -X {CHAIN}']
+    # The hooks are removed before either chain is flushed and deleted, or the delete would fail.
+    assert undone[-4:] == [f'iptables -F {CHAIN}', f'iptables -X {CHAIN}',
+                           f'iptables -t raw -F {CHAIN}', f'iptables -t raw -X {CHAIN}']
     assert max(undone.index(line) for line in deletes) < undone.index(f'iptables -F {CHAIN}')
     # `--undo` needs no address: it removes what any address added. A given address changes nothing.
     assert rules('--undo') == undone
@@ -131,10 +140,9 @@ def test_check_reports_open_and_blocked_targets_with_a_positive_control():
         report = json.loads(out)
         assert code == 1 and report['passed'] is False
         assert [r['passed'] for r in report['results']] == [False] * 6
-        # `localhost` answers on the first address it resolves to, which may be IPv6 where nothing listens.
+        # A name that resolves fails whatever the connection would do: DNS escaped even if TCP is then dropped.
         assert [r['outcome'] for r in report['results']] == [
-            'connected', 'refused', report['results'][2]['outcome'], 'answered', 'malformed', 'unresolved']
-        assert report['results'][2]['outcome'] in ('connected', 'refused')
+            'connected', 'refused', 'resolved', 'answered', 'malformed', 'unresolved']
         # An empty check proves nothing.
         code, out, _ = run('check')
         assert code == 1 and json.loads(out) == {'passed': False, 'results': []}
