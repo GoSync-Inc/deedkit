@@ -522,10 +522,11 @@ def verify_metadata(fragments, root):
 class Assembly:
     """What `assemble` collects while it merges the fragments of the producer jobs one by one."""
 
-    def __init__(self, producers, fragments, root, attempt, sha, metadata, directory, source_root):
+    def __init__(self, producers, fragments, root, attempt, sha, metadata, directory, source_root,
+                 checks, module_checks, provenance):
         self.producers, self.fragments, self.root, self.attempt = producers, fragments, root, attempt
         self.sha, self.metadata, self.directory, self.source_root = sha, metadata, directory, source_root
-        self.checks, self.module_checks, self.provenance = dict(metadata["checks"]), {}, {}
+        self.checks, self.module_checks, self.provenance = checks, module_checks, provenance
         self.present, self.missing, self.shards, self.suites, self.inventories = [], [], [], [], {}
 
 
@@ -623,9 +624,11 @@ def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict, *, 
     metadata, sha = verify_metadata(fragments, root)
     if directory.exists() and any(directory.iterdir()):
         raise ValueError("the evidence directory must be new or empty")
+    checks, module_checks, provenance = dict(metadata["checks"]), {}, {}
     directory.mkdir(parents=True, exist_ok=True)
     source_root = source_root or Path.cwd()
-    assembly = Assembly(producers, fragments, root, attempt, sha, metadata, directory, source_root)
+    assembly = Assembly(producers, fragments, root, attempt, sha, metadata, directory, source_root,
+                        checks, module_checks, provenance)
     for job, (names, files) in FRAGMENTS.items():
         merge_fragment(assembly, job, names, files)
     return merged_evidence(assembly, ci_url)
