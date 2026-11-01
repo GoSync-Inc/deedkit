@@ -158,3 +158,17 @@ def test_check_reports_open_and_blocked_targets_with_a_positive_control():
             process.terminate()
             process.wait(timeout=10)
             process.stdout.close()
+        # In-process: a name that resolves fails even when the connection to its address is then dropped (the
+        # lookup itself proves a resolver answered from inside), and an unresolved name passes.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('inference_egress_check', SCRIPT)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        original = module.socket.getaddrinfo
+        module.socket.getaddrinfo = lambda *args, **kwargs: [(2, 1, 6, '', ('192.0.2.1', 8080))]
+        try:
+            result = module.check([('leak.example:8080', 'blocked-name')], 1)['results'][0]
+        finally:
+            module.socket.getaddrinfo = original
+        assert (result['outcome'], result['passed']) == ('resolved', False)
