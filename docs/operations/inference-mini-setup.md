@@ -31,32 +31,40 @@ the candidates are:
 
 1. The tailnet admin console login or an API access token with the `policy_file` scope (section 9). Without it the
    policy step waits; the rest of the install does not.
-2. Turning on HTTPS certificates (and MagicDNS) for the tailnet, if section 1 shows they are off (a console toggle).
-3. A reboot window for the reboot drill (section 12), because a reboot of the mini stops Between's VMs.
+2. Turning on HTTPS certificates (and MagicDNS) for the tailnet, only if section 1 shows them off (`CertDomains` empty or
+   `MagicDNSEnabled` false; both were on at 11-02).
+3. Not part of the install: the reboot drill (section 13) waits for a window the owner picks later, because a reboot of
+   the mini stops Between's VMs. The install never reboots the mini and never stops Between's VMs.
 
 Passwords and MFA are never typed by an agent. sudo needs none on the mini.
 
 ## 1. Inventory (read-only, before any change)
 
-Save the output; it goes on the card (Evidence). Stop if it differs from the research of 11-01 in a way that makes a
-later block wrong (for example the standalone `tailscaled` does hold a login).
+Save the output; it goes on the card (Evidence). Stop if it differs from what a later block assumes. The mini has TWO
+Tailscale instances: the app's network extension (what the default `tailscale` CLI talks to) and a standalone root
+`tailscaled` with its own socket `/var/run/tailscaled.socket`. The research of 11-01 read only the default CLI and had
+the roles reversed: on 11-02 the standalone daemon was the one logged in (Running, node key, the tailnet address) and the
+app's extension was `NeedsLogin`. Read BOTH, by socket, and let the output say which one holds the identity.
 
 ```bash
 MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
-ssh "$MINI" 'TS=/Applications/Tailscale.app/Contents/MacOS/Tailscale; sw_vers -productVersion; hostname; uptime
-printf "\n== tailscale (app) ==\n"; $TS version; $TS status | head -20
-$TS status --json | python3 -c "import json,sys; d=json.load(sys.stdin); print({k: d.get(k) for k in (\"BackendState\",\"MagicDNSSuffix\",\"CertDomains\")}); print(d[\"Self\"][\"DNSName\"], d[\"Self\"][\"TailscaleIPs\"], d[\"Self\"].get(\"Tags\"))"
-$TS serve status; $TS funnel status
-printf "\n== standalone tailscaled ==\n"; ps -axo pid,user,args | grep -i "[t]ailscaled"; launchctl list | grep -i tailscale
+ssh "$MINI" 'T=/Applications/Tailscale.app/Contents/MacOS/Tailscale; sw_vers -productVersion; hostname; uptime
+app() { $T "$@"; }; std() { $T --socket=/var/run/tailscaled.socket "$@"; }
+printf "\n== instance A: the app extension (default socket) ==\n"; app version | head -1; app status 2>&1 | head -4
+printf "\n== instance B: the standalone tailscaled (its own socket) ==\n"
+std status --json 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print({k: d.get(k) for k in (\"Version\",\"BackendState\",\"MagicDNSSuffix\",\"CertDomains\",\"HaveNodeKey\")}); s=d[\"Self\"]; print(s[\"DNSName\"], s[\"TailscaleIPs\"], s.get(\"Tags\")); print(d.get(\"CurrentTailnet\")); [print(\"peer\", p[\"HostName\"], p[\"TailscaleIPs\"], p.get(\"Online\"), p.get(\"Tags\")) for p in d.get(\"Peer\", {}).values()]"
+std serve status 2>&1 | tail -n +2; std funnel status 2>&1 | tail -n +2
+printf "\n== processes, jobs, system extension ==\n"; ps -axo pid,user,args | grep -i "[t]ailscale" | cut -c1-160; launchctl list | grep -i tailscale
+systemextensionsctl list 2>&1 | grep -i tailscale; ifconfig | grep -E "^utun|inet 100\."; sudo -n ls /Library/Tailscale/certs
 ls -l /Library/LaunchDaemons /Library/LaunchAgents ~/Library/LaunchAgents 2>/dev/null | grep -i tailscale
 ls -l /var/db/tailscale /Library/Tailscale 2>/dev/null
 printf "\n== users, ids, ports, disk ==\n"; dscl . -list /Users | grep -i "^_deedkit"; lsof -nP -iTCP:8090 -sTCP:LISTEN
 df -h /Users | tail -1; vm_stat | head -4; command -v uv python3.13; ls /opt/homebrew/bin/python3.13 /opt/homebrew/bin/uv'
 ```
 
-For the standalone one: its state is read with its own socket/CLI (`tailscale --socket <path> status`, the path from
-its launch job); "holds no identity" means `BackendState` is `NeedsLogin`/`Stopped` with no node key, and no process
-or job other than its own launch job uses its socket. Write the answer in the inventory.
+Whichever instance reports `Running` with a node key (and holds the tailnet address on a `utun`) holds the identity;
+the other one is left alone. Nothing is retired: stopping the instance that holds the identity cuts the mini off the
+tailnet (and the owner's SSH with it). Write the answer in the inventory.
 
 Tailnet policy (ACL or grants, groups, tags, allow-all or not, and how an agent can change it): read through the
 API when a token exists (section 9, step 1) or in the console:
@@ -92,7 +100,7 @@ ID=""; for n in $(seq 400 499); do
 ```
 
 Undo of the whole setup is section 14; the ledger lines are `id N`, `group`, `user`, `home`, `shared`, `stage <dir>`,
-`probe-bin`, `keygen-bin`, `profile`, `newsyslog`, `plist-busy`, `plist-service`, `job-busy`, `job-service`, `standalone <label> <plist>`,
+`probe-bin`, `keygen-bin`, `profile`, `newsyslog`, `plist-busy`, `plist-service`, `job-busy`, `job-service`,
 `serve`, `duty <pid>|<start time>`.
 
 ## 3. Group and user `_deedkitinf`
@@ -298,44 +306,34 @@ makes read-only to the service) and no proxy setting can reach it.
 
 ## 9. Tailscale: one node, one Serve (criterion 4)
 
-Preconditions from section 1: which instance holds the identity (the app's network extension, per the research),
-that the standalone `tailscaled` holds none and nothing uses it, and that HTTPS certificates are enabled for the
-tailnet (else the owner-hands toggle of section 0, asked once).
+Precondition from section 1: which instance holds the identity (the `Running` one with a node key; **on 11-02 the
+standalone root `tailscaled`, node `egors-mac-mini-1`**, MagicDNS on, `CertDomains` non-empty, no serve config, nothing on
+443) and that HTTPS certificates are on for the tailnet (else the owner-hands toggle of section 0, asked once).
 
-Retire the standalone `tailscaled` (its launch job only; the plist is kept in the ledger and copied aside):
+Criterion 4 of the card said to retire "the standalone logged-out `tailscaled`". The inventory of 11-02 showed the roles
+the other way round (the research had read the default CLI, which talks to the app's extension), so **nothing is
+retired**: both instances are left alone and Serve goes on the one that holds the identity, through its socket
+(evidence-based change to the criterion, recorded in the card History). The CLI on the mini is older than the daemon (a
+version warning on stderr); read the configuration back after setting it.
 
-```bash
-MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
-LABEL="<label of the standalone job, from the inventory>"; PLIST="<its plist path, from the inventory>"
-ssh "$MINI" "LABEL=$LABEL; PLIST=$PLIST"'; set -e; test -f "$PLIST"
-echo "standalone $LABEL $PLIST" >> ~/deedkit-inference-setup.created
-sudo -n cp -p "$PLIST" ~/deedkit-standalone-tailscaled.plist.bak
-sudo -n launchctl bootout system/$LABEL
-if launchctl print system/$LABEL >/dev/null 2>&1; then echo "standalone job still loaded"; exit 1; fi
-echo "standalone job retired"; ps -axo pid,args | grep "[t]ailscaled" || echo "no tailscaled process left"
-TS=/Applications/Tailscale.app/Contents/MacOS/Tailscale; $TS status | head -3'
-```
-
-Read-back: the app's node is still `Running` with the same address as in the inventory (nothing but the standalone
-process stopped). Undo: `launchctl bootstrap system <the saved plist>`.
-
-Serve on the active node (never Funnel):
+Serve (never Funnel):
 
 ```bash
 MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
-ssh "$MINI" 'set -e; TS=/Applications/Tailscale.app/Contents/MacOS/Tailscale
+ssh "$MINI" 'set -e; ts() { /usr/local/bin/tailscale --socket=/var/run/tailscaled.socket "$@"; }
+ts serve status 2>&1 | tail -n +2; ts funnel status 2>&1 | tail -n +2
 echo serve >> ~/deedkit-inference-setup.created
-$TS serve --bg --https=443 http://127.0.0.1:8090
-$TS serve status; $TS funnel status
-N=$($TS status --json | python3 -c "import json,sys; print(json.load(sys.stdin)[\"Self\"][\"DNSName\"].rstrip(\".\"))"); echo "$N"
+ts serve --bg --https=443 http://127.0.0.1:8090
+ts serve status 2>&1 | tail -n +2; ts funnel status 2>&1 | tail -n +2
+N=$(ts status --json 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)[\"Self\"][\"DNSName\"].rstrip(\".\"))"); echo "$N"
 curl -sS --max-time 10 -w "\nhttp %{http_code} verify %{ssl_verify_result}\n" "https://$N/health"'
 ```
 
 Expected: `serve status` lists `https://<mini>.<tailnet>.ts.net (tailnet only)` proxying `http://127.0.0.1:8090`, Funnel
 shows nothing, the request returns the health JSON with `verify 0` (a valid certificate). Then from production's
 host (read-only ssh, a plain GET, no key): `curl -sS --max-time 10 https://<mini>.<tailnet>.ts.net/health` returns the
-same JSON — but only after section 10 lets production reach the mini (before it, a timeout is the expected answer
-under a restricting policy). Undo: `$TS serve reset` and `launchctl bootstrap` of the saved standalone plist.
+same JSON, but only after section 10 lets production reach the mini (before it, a timeout is the expected answer
+under a restricting policy). Undo: `ts serve reset` (same socket) and check `ts serve status` says "No serve config".
 
 ## 10. Who can reach it, without changing any identity (criterion 5)
 
@@ -469,10 +467,10 @@ forced the answer is `503 admission_closed` (`X-Admission-Reason: busy_between`)
 `ts` it is served. Then `launchctl bootstrap` the probe again and check `busy.json` refreshes. A forced file
 goes stale in 30 s, which also proves the stale rule.
 
-Reboot drill: a reboot stops Between's VMs, so it needs a window the owner or orchestrator names (section 0). After
-it, with no manual command: `launchctl print system/com.deedkit.inference` and `-busy` are running, `busy.json` is
-fresh, `/health` answers. Record the date. If no window is given, record the `bootout` + `bootstrap` equivalent and
-leave the reboot read-back open (BLOCKED with "needs a reboot window").
+Reboot drill: a reboot stops Between's VMs, so this install never does it. It is a remaining live item on the card, run
+in a window the owner picks later. Meanwhile record the `bootout` + `bootstrap` equivalent (what a boot does with the two
+plists). In the window, with no manual command after the reboot: `launchctl print system/com.deedkit.inference` and
+`-busy` are running, `busy.json` is fresh, `/health` answers. Record the date.
 
 24-hour duty record: as the admin account, copy `services/inference/launchd/duty_log.py` and run
 `nohup python3 duty_log.py log --out ~/deedkit-inference-duty.log --hours 24 --max-load 8 --need-gb 7.9 &`
@@ -490,7 +488,7 @@ removed only when everything is gone; otherwise it is rewritten to what remains 
 The undo never signals a process: an entry is dropped only on positive evidence (the pid is gone, or now has another start
 time); a logger that is still running, or that cannot be inspected, stays in the ledger and the undo exits 1.
 Not covered (section-specific undo above): the production key files, the tailnet policy (apply the saved policy), the Serve config
-(`serve reset`), the standalone `tailscaled` job (bootstrap the saved plist), and the production key file.
+(`serve reset` on the standalone daemon's socket), and the production key file.
 
 ```bash
 MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
