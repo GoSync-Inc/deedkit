@@ -473,6 +473,20 @@ func TestCharacterizeGroupOperationsRefuseBadParametersAndFailedSettlesBeforeAny
 }
 
 // spec: ANYM-549
+func TestCharacterizeDomainFunctionsRefuseAnOperationOfAnotherDomain(t *testing.T) {
+	env := &operationEnv{}
+	for name, run := range map[string]func(string) (any, error){"read": env.readOperation, "message": env.messageOperation, "group": env.groupOperation} {
+		t.Run(name, func(t *testing.T) {
+			result, err := run("add_contact")
+			requireError(t, err, "operation_unsupported")
+			if result != nil {
+				t.Fatalf("result = %v, want nil", result)
+			}
+		})
+	}
+}
+
+// spec: ANYM-549
 func TestCharacterizeProfileUpdateWritesOnlyTheFieldsGiven(t *testing.T) {
 	for name, tc := range map[string]struct {
 		params            map[string]any
