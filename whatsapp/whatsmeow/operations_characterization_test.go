@@ -45,7 +45,7 @@ func characterizeNoWrites(t *testing.T, d *operationDependencies) {
 }
 
 // spec: ANYM-549
-func TestCharacterizeOperationGateRefusesBeforeAnyWork(t *testing.T) {
+func TestCharacterizeOperationGateRefusesBeforeAnyChange(t *testing.T) {
 	disabled := allowedOperationPolicy()
 	disabled.Enabled = false
 	narrow := allowedOperationPolicy()
@@ -212,7 +212,10 @@ func TestCharacterizeSendContactBuildsEscapedVCardsAndNeedsAPhoneNumber(t *testi
 			r, e := executeOperation(context.Background(), job, d)
 			operationResult(t, r, e, "confirmed")
 			cards := wire.GetContactsArrayMessage().GetContacts()
-			if len(cards) != 1 || !strings.Contains(cards[0].GetVcard(), tc.card+"\r\n") || !strings.Contains(cards[0].GetVcard(), "TEL;type=CELL;waid=15551234567:+15551234567") {
+			if len(cards) != 1 {
+				t.Fatalf("cards %#v", cards)
+			}
+			if !strings.Contains(cards[0].GetVcard(), tc.card+"\r\n") || !strings.Contains(cards[0].GetVcard(), "TEL;type=CELL;waid=15551234567:+15551234567") {
 				t.Fatalf("vcard %q", cards[0].GetVcard())
 			}
 		})

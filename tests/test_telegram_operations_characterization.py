@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import os
 from datetime import datetime, timezone
+from itertools import chain, repeat
 from types import SimpleNamespace as NS
 
 import pytest
@@ -22,8 +23,8 @@ DATE = datetime(2026, 10, 20, tzinfo=timezone.utc)
 
 
 def reads_only(client):
-    """True when the client saw nothing but peer resolution (no read request, no mutation)."""
-    return all(isinstance(c, tuple) and c[0] == 'get_input_entity' for c in client.calls)
+    """True when the client saw peer resolution and nothing else (no read request, no mutation)."""
+    return bool(client.calls) and all(isinstance(c, tuple) and c[0] == 'get_input_entity' for c in client.calls)
 
 
 # spec: ANYM-549
@@ -111,12 +112,17 @@ def test_send_file_stops_when_the_file_is_shorter_than_its_reported_size(tmp_pat
     with pytest.raises(Exception, match='attachment_unavailable'):
         run(client, 'send_file', {'mode': 'document'}, registered_file_path=str(original),
             file_digest=hashlib.sha256(b'synthetic').hexdigest())
-    assert not any(isinstance(c, functions.messages.SendMediaRequest) for c in client.calls)
+    assert reads_only(client)
 
 
 # spec: ANYM-549
-def test_forward_into_a_different_chat_reports_the_provider_reference_mismatch():
-    client = Client()
+def test_forward_answered_from_another_chat_reports_the_provider_reference_mismatch():
+    class Misrouted(Client):
+        async def forward_messages(self, peer, messages, from_peer=None, **kwargs):
+            self.calls.append(('forward_messages', peer, messages, from_peer, kwargs))
+            return [NS(id=23, chat_id=999, message='source', out=True)]
+
+    client = Misrouted()
     client.messages[(300, 23)] = NS(id=23, chat_id=300, message='source', out=False)
     result = run(client, 'forward_message', {}, provider_chat='200', source_provider_chat='300',
                  source_provider_message='23')
@@ -200,7 +206,7 @@ def test_group_setter_fails_when_the_provider_answer_lacks_the_chat():
 
 
 # spec: ANYM-242
-def test_slow_mode_on_a_chat_whose_rights_the_provider_did_not_report_is_unsupported():
+def test_group_setter_on_a_chat_whose_rights_the_provider_did_not_report_is_unsupported():
     client = GroupClient()
     client.rights = None
     with pytest.raises(Exception, match='unsupported_operation'):
@@ -224,7 +230,7 @@ def test_join_request_list_stops_at_the_receipt_byte_budget_and_says_there_is_mo
 def test_join_batch_with_an_exhausted_budget_attempts_nothing():
     class Governor:
         def __init__(self):
-            self.ticks = iter([0.0, 100.0])
+            self.ticks = chain([0.0], repeat(100.0))
             self.clock = lambda: next(self.ticks)
 
         async def call(self, fn, phase):
