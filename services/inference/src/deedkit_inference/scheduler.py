@@ -448,26 +448,38 @@ class Scheduler:
         largest loses its group."""
         while True:
             await asyncio.sleep(self.config.supervise_interval_seconds)
-            sizes = []  # (rss, victim) with victim = ("job", job) | ("worker", engine, phase name, worker)
-            for job in self.children():
-                if job.proc is not None:
-                    sizes.append((await asyncio.to_thread(self.probe.rss_gb, job.proc.pid), ("job", job)))
-            for engine in list(self.engines):
-                for name, worker in list(engine.workers.items()):
-                    if worker.alive():
-                        size = await asyncio.to_thread(self.probe.rss_gb, worker.proc.pid)
-                        victim = ("worker", engine, name, worker)
-                        if size > MEMORY_SHARE_FACTOR * worker.resident_gb:
-                            self._kill_victim(victim, "memory_share")
-                        else:
-                            sizes.append((size, victim))
-            for engine in list(self.engines):
-                for worker in engine.retiring_workers():
-                    size = await asyncio.to_thread(self.probe.rss_gb, worker.proc.pid)
-                    sizes.append((size, ("retiring", worker)))
+            sizes = await self._measure()
             if sizes and sum(size for size, _ in sizes) > self.config.resident_hard_cap_gb:
                 _, victim = max(sizes, key=lambda item: item[0])
                 self._kill_victim(victim, "memory_hard_cap")
+
+    async def _measure(self):
+        """(rss, victim) for every child that holds memory; victim = ("job", job) | ("worker", engine, phase name,
+        worker) | ("retiring", worker). A probe awaits a thread, so a worker can retire between two reads: each
+        process group is counted once, and a worker that was killed (its memory is already coming back) not at all."""
+        sizes, seen = [], set()
+        for job in self.children():
+            if job.proc is not None:
+                seen.add(job.proc.pid)
+                sizes.append((await asyncio.to_thread(self.probe.rss_gb, job.proc.pid), ("job", job)))
+        for engine in list(self.engines):
+            for name, worker in list(engine.workers.items()):
+                if worker.alive():
+                    seen.add(worker.proc.pid)
+                    size = await asyncio.to_thread(self.probe.rss_gb, worker.proc.pid)
+                    victim = ("worker", engine, name, worker)
+                    if size > MEMORY_SHARE_FACTOR * worker.resident_gb:
+                        self._kill_victim(victim, "memory_share")
+                    else:
+                        sizes.append((size, victim))
+        for engine in list(self.engines):
+            for worker in engine.retiring_workers():
+                if worker.killed or worker.proc.pid in seen:
+                    continue
+                seen.add(worker.proc.pid)
+                size = await asyncio.to_thread(self.probe.rss_gb, worker.proc.pid)
+                sizes.append((size, ("retiring", worker)))
+        return sizes
 
     def _kill_victim(self, victim, reason):
         if victim[0] == "retiring":

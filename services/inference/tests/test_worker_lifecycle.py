@@ -3,6 +3,7 @@ import json
 import os
 import stat
 import sys
+import threading
 import time
 
 import pytest
@@ -89,6 +90,33 @@ def await_alive(pid):
     except ProcessLookupError:
         return False
     return True
+
+
+# spec: ANYM-683
+async def test_worker_retiring_during_a_probe_is_counted_once(env):
+    """The supervisor's probe awaits a thread; an eviction in that gap must not make the same process count twice
+    (that sum could cross the hard cap and kill a healthy job)."""
+    options = {"runtime_options": {"unload_sleep": 1.5}}
+    probing, release, calls = threading.Event(), threading.Event(), []
+
+    def rss(pgid):
+        calls.append(pgid)
+        if len(calls) == 1:
+            probing.set()
+            release.wait(10)
+        return 1.0
+
+    async with env.running(**engines(env, extra_options=options), supervise_interval_seconds=30) as s:
+        vision = s.service.engines["vision-default"]
+        assert (await s.chat(vis())).status == 200
+        s.probe.rss_fn = rss
+        task = asyncio.create_task(s.service.scheduler._measure())
+        await s.until(probing.is_set)
+        vision.unload("vlm")  # retires while its first probe is still out
+        assert len(vision.retiring_workers()) == 1
+        release.set()
+        sizes = await task
+        assert [size for size, _ in sizes] == [1.0] and len(calls) == 1  # once, and the retiring pass did not probe it
 
 
 # spec: ANYM-683

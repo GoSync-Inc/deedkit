@@ -31,6 +31,7 @@ class Worker:
         self.proc, self.scratch, self.key, self.resident_gb = proc, scratch, key, resident_gb
         self.job = None  # the Job it is running now, so a memory kill can name its reason
         self.stopped = False
+        self.killed = False  # SIGKILL sent: its memory is already coming back
         self.cold = True
 
     @classmethod
@@ -72,7 +73,7 @@ class Worker:
 
     def kill(self):
         """At once: the group dies and the scratch directory goes."""
-        self.stopped = True
+        self.stopped = self.killed = True
         kill_group(self.proc.pid)
         shutil.rmtree(self.scratch, ignore_errors=True)
         try:  # reap it: a killed child nobody waits for stays a zombie
