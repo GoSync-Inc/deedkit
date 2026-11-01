@@ -80,7 +80,7 @@ def _languages(found, family):
     return {body: tuple(sorted(langs)) for body, langs in found[family].items()}
 
 
-# spec: ANYM-162
+# spec: ANYM-286
 def test_every_identifier_copy_is_canonical_or_a_listed_variant():
     found = _inventory()
     for family in SIGNATURES:
@@ -94,7 +94,7 @@ def test_every_identifier_copy_is_canonical_or_a_listed_variant():
         assert variants == expected, (family, {b: sorted(found[family][b].items()) for b in variants})
 
 
-# spec: ANYM-162
+# spec: ANYM-286
 def test_canonical_chat_account_and_send_patterns_accept_and_refuse_the_same_samples():
     # Python is the one engine run here; the bodies above are textually identical in JS and Go, and use only
     # classes, bounds, groups and alternation, which the three engines read alike.
@@ -113,7 +113,7 @@ def test_canonical_chat_account_and_send_patterns_accept_and_refuse_the_same_sam
     assert not user.fullmatch('1' * 31 + '@lid') and not user.fullmatch('１@lid')
 
 
-# spec: ANYM-162
+# spec: ANYM-286
 def test_unescaped_dot_variants_accept_what_the_canonical_bodies_refuse():
     # Documents the drift behind the listed variants; the sample is synthetic.
     canonical = re.compile(next(iter(CANONICAL['chat'])))

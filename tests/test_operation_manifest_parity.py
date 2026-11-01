@@ -82,7 +82,7 @@ def _extra_fields(copy, python):
     return {name: copy[name] - python[name] for name in copy if copy[name] - python[name]}
 
 
-# spec: ANYM-162
+# spec: ANYM-286
 def test_the_parsers_read_every_table():
     # Guards the guard: a source reformat that empties a parser must fail here, not pass the parity tests silently.
     assert len(_go_fields()) >= 50 and len(_js_fields()) >= 40
@@ -92,7 +92,7 @@ def test_the_parsers_read_every_table():
     assert {'get_profile', 'add_contact'} <= _js_set('GLOBAL')
 
 
-# spec: ANYM-162
+# spec: ANYM-286
 def test_go_table_names_every_whatsapp_operation_of_the_python_catalog():
     python = _python_fields('whatsapp', 'whatsmeow')
     assert set(_go_fields()) == set(python)
@@ -101,7 +101,7 @@ def test_go_table_names_every_whatsapp_operation_of_the_python_catalog():
     assert unsupported == EXPECTED_GO_UNSUPPORTED
 
 
-# spec: ANYM-162
+# spec: ANYM-286
 def test_js_table_is_the_go_table_without_the_native_only_operations():
     go, js = _go_fields(), _js_fields()
     assert set(go) - set(js) == EXPECTED_NATIVE_ONLY
@@ -113,13 +113,13 @@ def test_js_table_is_the_go_table_without_the_native_only_operations():
     assert set(browser) - set(js) == EXPECTED_NATIVE_ONLY
 
 
-# spec: ANYM-162
+# spec: ANYM-286
 def test_go_and_js_accept_the_same_field_names_for_shared_operations():
     go, js = _go_fields(), _js_fields()
     assert {name: (go[name], js[name]) for name in js if go[name] != js[name]} == {}
 
 
-# spec: ANYM-162
+# spec: ANYM-286
 def test_go_and_js_fields_equal_the_python_whatsapp_fields_but_the_listed_extras():
     python = _python_fields('whatsapp', 'whatsmeow')
     go, js = _go_fields(), _js_fields()
@@ -132,7 +132,7 @@ def test_go_and_js_fields_equal_the_python_whatsapp_fields_but_the_listed_extras
     assert go['send_contact'] == js['send_contact'] == python['send_contact'] == {'contact_ids'}
 
 
-# spec: ANYM-162
+# spec: ANYM-286
 def test_telegram_parameters_equal_the_python_telegram_fields():
     python = _python_fields('telegram')
     assert set(telegram.PARAMETERS) == set(python)
@@ -141,7 +141,7 @@ def test_telegram_parameters_equal_the_python_telegram_fields():
     assert python['update_profile'] == {'first_name', 'last_name', 'bio'}
 
 
-# spec: ANYM-162
+# spec: ANYM-286
 def test_raw_field_table_differs_from_published_fields_only_for_the_listed_overrides():
     # W2-6 would derive PARAMETERS from OPERATIONS[name]['fields']; these four are resolved per platform by _fields.
     differing = {name for name, spec in ops.OPERATIONS.items() if 'telegram' in spec['platforms']
@@ -152,7 +152,7 @@ def test_raw_field_table_differs_from_published_fields_only_for_the_listed_overr
     assert whatsapp == (EXPECTED_RAW_FIELD_OVERRIDES & {'send_contact', 'update_profile'}) | set(EXPECTED_EXTRA_FIELDS)
 
 
-# spec: ANYM-162
+# spec: ANYM-286
 def test_go_and_js_classification_sets_follow_the_python_catalog():
     catalog = {name: spec for name, spec in ops.OPERATIONS.items() if 'whatsapp' in spec['platforms']}
     account = {name for name, spec in catalog.items() if spec['target'] == 'account'}
