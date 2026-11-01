@@ -73,7 +73,8 @@ def merge_to_count(segments):
             current = dict(segments[index])
             nxt = segments[index + 1] if index + 1 < len(segments) else None
             if nxt is not None and len(current["text"]) + 1 + len(nxt["text"]) <= MAX_SEGMENT_CHARS:
-                current = {"start": current["start"], "end": nxt["end"], "text": current["text"] + " " + nxt["text"]}
+                current = {"start": min(current["start"], nxt["start"]), "end": max(current["end"], nxt["end"]),
+                           "text": current["text"] + " " + nxt["text"]}
                 index += 1
             merged.append(current)
             index += 1

@@ -75,6 +75,16 @@ class Worker:
         self.stopped = True
         kill_group(self.proc.pid)
         shutil.rmtree(self.scratch, ignore_errors=True)
+        try:  # reap it: a killed child nobody waits for stays a zombie
+            task = asyncio.get_running_loop().create_task(self._wait())
+        except RuntimeError:
+            return
+        _REAPERS.add(task)
+        task.add_done_callback(_REAPERS.discard)
+
+    async def _wait(self):
+        with contextlib.suppress(Exception):
+            await self.proc.wait()
 
     def stop(self):
         """Ask the worker to clear its caches and exit; the group is killed if it is still there after the grace."""

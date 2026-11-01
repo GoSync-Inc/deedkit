@@ -15,14 +15,15 @@ def pids(path):
     return [int(p) for p in parts]
 
 
-def gone(pid, seconds=5.0):
+async def gone(pid, seconds=5.0):
+    """The process no longer exists. Async: the event loop must keep running so the service can reap its children."""
     end = time.monotonic() + seconds
     while time.monotonic() < end:
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
             return True
-        time.sleep(0.02)
+        await asyncio.sleep(0.02)
     return False
 
 
@@ -34,7 +35,7 @@ async def test_timeout_kills_the_whole_process_group(env):
                                    extra_fields={"language": "ru"})
         assert reply.status == 504 and reply.code == "engine_timeout"
         worker, grandchild = pids(pidfile)
-        assert gone(worker) and gone(grandchild)
+        assert await gone(worker) and await gone(grandchild)
         assert s.service.engines["audio-default"].workers == {}
         assert s.work_entries() == []  # the worker's scratch directory went with it
         # The service goes on: the next job gets a fresh worker.
@@ -56,7 +57,7 @@ async def test_child_over_its_memory_share_is_killed(env):
         s.probe.rss_fn = lambda pgid: 8.0 if pgid == worker else 0.0
         reply = await task
         assert reply.status == 502 and reply.code == "engine_failed"
-        assert gone(worker)
+        assert await gone(worker)
         assert s.service.engines["vision-default"].workers == {}
         assert ("vision-default", "vlm") not in s.service.admission.loaded
 
@@ -87,7 +88,7 @@ async def test_in_memory_caches_are_cleared_on_unload(env):
         worker = s.service.engines["audio-default"].workers["gigaam"]
         await s.until(lambda: marker.exists(), timeout=8)
         assert marker.read_text() == "cleared:0"  # the runtime emptied its cache before it left
-        assert gone(worker.proc.pid)
+        assert await gone(worker.proc.pid)
         await s.until(lambda: s.work_entries() == [])
 
 
@@ -100,7 +101,7 @@ async def test_idle_engine_unloads_after_keep_alive(env):
         first = pids(pidfile)[0]
         assert ("vision-default", "vlm") in s.service.admission.loaded and "vlm" in engine.workers
         await s.until(lambda: "vlm" not in engine.workers and ("vision-default", "vlm") not in s.service.admission.loaded)
-        assert gone(first)
+        assert await gone(first)
         # The next job starts a new worker (a cold start).
         assert (await s.chat(vis(pidfile=str(pidfile)))).status == 200
         assert pids(pidfile)[0] != first
