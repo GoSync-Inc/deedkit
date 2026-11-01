@@ -429,6 +429,204 @@ READ_HANDLERS = {
 }
 
 
+async def write_file(op):
+    parameters, job, info, stream, invoke, peer, accepted_updates, chat = (
+        op.parameters, op.job, op.info, op.stream, op.invoke, op.peer, op.accepted_updates, op.chat)
+    mode = parameters.get('mode', 'document')
+    name = job.get('file_name', 'attachment.bin')
+    mime = job.get('file_mime', 'application/octet-stream')
+    if (not isinstance(name, str) or not 1 <= len(name) <= 255 or
+            any(ord(c) < 32 or c in '/\\' for c in name) or
+            not isinstance(mime, str) or not re.fullmatch(r'[\w.+-]+/[\w.+-]+', mime)):
+        reject('attachment_unavailable')
+    if mode == 'photo' and (mime not in ('image/jpeg', 'image/png', 'image/webp') or info.st_size > 10 * 1024**2):
+        reject('unsupported_operation')
+    if mode in ('video', 'video_note') and not mime.startswith('video/'):
+        reject('invalid_parameters')
+    if mode in ('audio', 'voice') and not mime.startswith('audio/'):
+        reject('invalid_parameters')
+    expected_hash = job.get('file_digest', parameters.get('sha256'))
+    if not isinstance(expected_hash, str) or not re.fullmatch(r'[a-f0-9]{64}', expected_hash):
+        reject('attachment_unavailable')
+    sha = hashlib.sha256()
+    remaining = info.st_size
+    while remaining:
+        chunk = stream.read(min(512 * 1024, remaining))
+        if not chunk:
+            reject('attachment_unavailable')
+        sha.update(chunk)
+        remaining -= len(chunk)
+    after_hash = os.fstat(stream.fileno())
+    if (stream.read(1) or sha.hexdigest() != expected_hash or
+            (after_hash.st_size, after_hash.st_mtime_ns) != (info.st_size, info.st_mtime_ns)):
+        reject('attachment_unavailable')
+    stream.seek(0)
+    # Upload chunk requests are paced independently. Final SendMedia is a
+    # separate mutation, so expiry is checked again after all uploads.
+    upload_id = secrets.randbits(63)
+    part_size = 512 * 1024
+    parts = (info.st_size + part_size - 1) // part_size
+    large = info.st_size > 10 * 1024**2
+    md5 = hashlib.md5(usedforsecurity=False)
+    sha = hashlib.sha256()
+    for index in range(parts):
+        chunk = stream.read(part_size)
+        expected_size = min(part_size, info.st_size - index * part_size)
+        if len(chunk) != expected_size:
+            reject('attachment_unavailable')
+        md5.update(chunk)
+        sha.update(chunk)
+        request = functions.upload.SaveBigFilePartRequest(upload_id, index, parts, chunk) if large else \
+            functions.upload.SaveFilePartRequest(upload_id, index, chunk)
+        if await invoke(request, mutation=True) is not True:
+            return {'outcome': 'unknown', 'error': 'provider_upload_unverified'}
+    if stream.read(1) or sha.hexdigest() != expected_hash:
+        return {'outcome': 'unknown', 'error': 'attachment_changed_during_upload'}
+    uploaded = types.InputFileBig(upload_id, parts, name) if large else \
+        types.InputFile(upload_id, parts, name, md5.hexdigest())
+    if mode == 'photo':
+        media = types.InputMediaUploadedPhoto(uploaded)
+    else:
+        attributes = [types.DocumentAttributeFilename(name)]
+        if mode in ('audio', 'voice'):
+            attributes.append(types.DocumentAttributeAudio(0, voice=mode == 'voice'))
+        elif mode in ('video', 'video_note'):
+            attributes.append(types.DocumentAttributeVideo(0, 1, 1,
+                round_message=mode == 'video_note', supports_streaming=mode == 'video'))
+        media = types.InputMediaUploadedDocument(uploaded, mime, attributes, force_file=mode == 'document')
+    random_id = secrets.randbits(63)
+    response = await invoke(functions.messages.SendMediaRequest(peer, media,
+        parameters.get('caption', ''), random_id=random_id, clear_draft=False, entities=[]), mutation=True)
+    return accepted_updates(response, chat, random_id)
+
+
+async def write_forward(op):
+    input_peer, source_chat, exact_message, source_message, rpc, peer, client, accepted, chat = (
+        op.input_peer, op.source_chat, op.exact_message, op.source_message, op.rpc, op.peer, op.client, op.accepted, op.chat)
+    source = await input_peer(source_chat)
+    await exact_message(source, source_chat, source_message)
+    value = await rpc(lambda: client.forward_messages(peer, [source_message], from_peer=source,
+        drop_author=False, drop_media_captions=False), mutation=True)
+    return accepted(value, message=True, chat=chat)
+
+
+async def write_media_message(op):
+    operation, parameters, invoke, peer, accepted_updates, chat = (
+        op.operation, op.parameters, op.invoke, op.peer, op.accepted_updates, op.chat)
+    if operation == 'send_poll':
+        answers = [types.PollAnswer(types.TextWithEntities(value, []), index.to_bytes(1, 'big'))
+                   for index, value in enumerate(parameters['options'])]
+        media = types.InputMediaPoll(types.Poll(0,
+            types.TextWithEntities(parameters['question'], []), answers, hash=0,
+            multiple_choice=parameters.get('multiple', False), public_voters=False))
+    elif operation == 'send_contact':
+        if 'phone' not in parameters or 'first_name' not in parameters:
+            reject('invalid_parameters')
+        media = types.InputMediaContact(parameters['phone'], parameters['first_name'],
+            parameters.get('last_name', ''), '')
+    else:
+        media = types.InputMediaGeoPoint(types.InputGeoPoint(parameters['latitude'], parameters['longitude']))
+    random_id = secrets.randbits(63)
+    response = await invoke(functions.messages.SendMediaRequest(peer, media,
+        parameters.get('description', '') if operation == 'send_location' else '',
+        random_id=random_id, clear_draft=False, entities=[]), mutation=True)
+    return accepted_updates(response, chat, random_id)
+
+
+async def write_edit_delete(op):
+    exact_message, peer, chat, message_id, operation, accepted, rpc, parameters, client = (
+        op.exact_message, op.peer, op.chat, op.message_id, op.operation, op.accepted, op.rpc, op.parameters, op.client)
+    await exact_message(peer, chat, message_id, own=True)
+    if operation == 'edit_message':
+        bounded_text(parameters.get('text'), 4000)
+        response = await rpc(lambda: client.edit_message(peer, message_id, parameters['text'],
+            parse_mode=None, link_preview=False), mutation=True)
+        if getattr(response, 'message', None) != parameters['text'] or getattr(response, 'out', None) is not True:
+            return {'outcome': 'unknown', 'error': 'provider_result_unverified'}
+        return accepted(response, message=True, chat=chat, message_id=message_id)
+    response = await rpc(lambda: client.delete_messages(peer, [message_id], revoke=True), mutation=True)
+    return accepted(response)
+
+
+async def write_reaction(op):
+    parameters, accepted, invoke, peer, message_id = op.parameters, op.accepted, op.invoke, op.peer, op.message_id
+    reactions = [types.ReactionEmoji(parameters['emoji'])] if parameters['emoji'] else []
+    return accepted(await invoke(functions.messages.SendReactionRequest(peer, message_id,
+        big=False, add_to_recent=False, reaction=reactions), mutation=True))
+
+
+async def write_vote(op):
+    exact_message, peer, chat, message_id, parameters, accepted, invoke = (
+        op.exact_message, op.peer, op.chat, op.message_id, op.parameters, op.accepted, op.invoke)
+    message = await exact_message(peer, chat, message_id)
+    media = getattr(message, 'media', None)
+    if not isinstance(media, types.MessageMediaPoll):
+        reject('unsupported_operation')
+    poll = media.poll
+    choices = parameters['option_indices']
+    if (poll.closed or any(index >= len(poll.answers) for index in choices) or
+            (not poll.multiple_choice and len(choices) > 1)):
+        reject('invalid_parameters')
+    if getattr(poll, 'subscribers_only', False) or getattr(poll, 'countries_iso2', None):
+        reject('unsupported_operation')
+    selected = [poll.answers[index].option for index in choices]
+    return accepted(await invoke(functions.messages.SendVoteRequest(peer, message_id, selected), mutation=True))
+
+
+async def write_pin(op):
+    operation, client, accepted, rpc, peer, message_id = (
+        op.operation, op.client, op.accepted, op.rpc, op.peer, op.message_id)
+    fn = client.pin_message if operation == 'pin_message' else client.unpin_message
+    kwargs = {'notify': False} if operation == 'pin_message' else {}
+    return accepted(await rpc(lambda: fn(peer, message_id, **kwargs), mutation=True))
+
+
+async def write_mark_read(op):
+    channel, message_id, peer, accepted, invoke = op.channel, op.message_id, op.peer, op.accepted, op.invoke
+    request = functions.channels.ReadHistoryRequest(channel, message_id) if channel else \
+        functions.messages.ReadHistoryRequest(peer, message_id)
+    return accepted(await invoke(request, mutation=True))
+
+
+async def write_mark_unread(op):
+    accepted, invoke, peer = op.accepted, op.invoke, op.peer
+    return accepted(await invoke(functions.messages.MarkDialogUnreadRequest(
+        types.InputDialogPeer(peer), unread=True), mutation=True))
+
+
+async def write_archive(op):
+    accepted, rpc, peer, client, operation = op.accepted, op.rpc, op.peer, op.client, op.operation
+    return accepted(await rpc(lambda: client.edit_folder(peer,
+        folder=1 if operation == 'archive_chat' else 0), mutation=True))
+
+
+async def write_mute(op):
+    operation, parameters, accepted, invoke, peer = op.operation, op.parameters, op.accepted, op.invoke, op.peer
+    seconds = parameters.get('seconds') if operation == 'mute_chat' else 0
+    if operation == 'mute_chat':
+        integer(seconds, 1, 2**31 - 1)
+    # TL timestamps are signed 32-bit UTC epochs. Large requested durations
+    # beyond that bound cannot be represented faithfully.
+    mute_until = int(time.time()) + seconds if seconds else 0
+    if mute_until > 2**31 - 1:
+        reject('invalid_parameters')
+    settings = types.InputPeerNotifySettings(mute_until=datetime.fromtimestamp(mute_until, timezone.utc))
+    return accepted(await invoke(functions.account.UpdateNotifySettingsRequest(
+        types.InputNotifyPeer(peer), settings), mutation=True))
+
+
+MESSAGE_HANDLERS = {
+    'send_file': write_file, 'forward_message': write_forward, 'send_poll': write_media_message,
+    'send_contact': write_media_message, 'send_location': write_media_message, 'edit_message': write_edit_delete,
+    'delete_message': write_edit_delete, 'send_reaction': write_reaction, 'vote_poll': write_vote,
+    'pin_message': write_pin, 'unpin_message': write_pin, 'mark_read': write_mark_read,
+    'mark_unread': write_mark_unread, 'archive_chat': write_archive, 'unarchive_chat': write_archive,
+    'mute_chat': write_mute, 'unmute_chat': write_mute,
+}
+
+HANDLERS = {**READ_HANDLERS, **MESSAGE_HANDLERS}
+
+
 async def _execute(client, job, *, verified_self=None, governor=None):
     """Execute exactly one prepared, bounded operation without automatic retries.
 
@@ -462,6 +660,7 @@ async def _execute(client, job, *, verified_self=None, governor=None):
         # The shared rate gate and lookups may delay the first mutation.
         report('waiting')
     stream = None
+    info = source_chat = source_message = None
     referenced_peers = set()
 
     def collection_policy():
@@ -760,140 +959,15 @@ async def _execute(client, job, *, verified_self=None, governor=None):
             return {'outcome': 'confirmed', 'state': 'joined', 'archive': 'not_collected', 'next_step': JOIN_NEXT_STEP,
                     'basis': 'provider_joined_chat'}
 
-        handler = READ_HANDLERS.get(operation)
+        handler = HANDLERS.get(operation)
         if handler is not None:
             return await handler(OperationContext(
-                operation=operation, parameters=parameters, client=client, verified_self=verified_self,
-                rpc=rpc, invoke=invoke, exact_message=exact_message, allowed_provider_id=allowed_provider_id,
-                collection_policy=collection_policy, peer=peer, chat=chat, channel=channel,
-                basic_chat=basic_chat, message_id=message_id))
-
-        if operation == 'send_file':
-            mode = parameters.get('mode', 'document')
-            name = job.get('file_name', 'attachment.bin')
-            mime = job.get('file_mime', 'application/octet-stream')
-            if (not isinstance(name, str) or not 1 <= len(name) <= 255 or
-                    any(ord(c) < 32 or c in '/\\' for c in name) or
-                    not isinstance(mime, str) or not re.fullmatch(r'[\w.+-]+/[\w.+-]+', mime)):
-                reject('attachment_unavailable')
-            if mode == 'photo' and (mime not in ('image/jpeg', 'image/png', 'image/webp') or info.st_size > 10 * 1024**2):
-                reject('unsupported_operation')
-            if mode in ('video', 'video_note') and not mime.startswith('video/'):
-                reject('invalid_parameters')
-            if mode in ('audio', 'voice') and not mime.startswith('audio/'):
-                reject('invalid_parameters')
-            expected_hash = job.get('file_digest', parameters.get('sha256'))
-            if not isinstance(expected_hash, str) or not re.fullmatch(r'[a-f0-9]{64}', expected_hash):
-                reject('attachment_unavailable')
-            sha = hashlib.sha256()
-            remaining = info.st_size
-            while remaining:
-                chunk = stream.read(min(512 * 1024, remaining))
-                if not chunk:
-                    reject('attachment_unavailable')
-                sha.update(chunk)
-                remaining -= len(chunk)
-            after_hash = os.fstat(stream.fileno())
-            if (stream.read(1) or sha.hexdigest() != expected_hash or
-                    (after_hash.st_size, after_hash.st_mtime_ns) != (info.st_size, info.st_mtime_ns)):
-                reject('attachment_unavailable')
-            stream.seek(0)
-            # Upload chunk requests are paced independently. Final SendMedia is a
-            # separate mutation, so expiry is checked again after all uploads.
-            upload_id = secrets.randbits(63)
-            part_size = 512 * 1024
-            parts = (info.st_size + part_size - 1) // part_size
-            large = info.st_size > 10 * 1024**2
-            md5 = hashlib.md5(usedforsecurity=False)
-            sha = hashlib.sha256()
-            for index in range(parts):
-                chunk = stream.read(part_size)
-                expected_size = min(part_size, info.st_size - index * part_size)
-                if len(chunk) != expected_size:
-                    reject('attachment_unavailable')
-                md5.update(chunk)
-                sha.update(chunk)
-                request = functions.upload.SaveBigFilePartRequest(upload_id, index, parts, chunk) if large else \
-                    functions.upload.SaveFilePartRequest(upload_id, index, chunk)
-                if await invoke(request, mutation=True) is not True:
-                    return {'outcome': 'unknown', 'error': 'provider_upload_unverified'}
-            if stream.read(1) or sha.hexdigest() != expected_hash:
-                return {'outcome': 'unknown', 'error': 'attachment_changed_during_upload'}
-            uploaded = types.InputFileBig(upload_id, parts, name) if large else \
-                types.InputFile(upload_id, parts, name, md5.hexdigest())
-            if mode == 'photo':
-                media = types.InputMediaUploadedPhoto(uploaded)
-            else:
-                attributes = [types.DocumentAttributeFilename(name)]
-                if mode in ('audio', 'voice'):
-                    attributes.append(types.DocumentAttributeAudio(0, voice=mode == 'voice'))
-                elif mode in ('video', 'video_note'):
-                    attributes.append(types.DocumentAttributeVideo(0, 1, 1,
-                        round_message=mode == 'video_note', supports_streaming=mode == 'video'))
-                media = types.InputMediaUploadedDocument(uploaded, mime, attributes, force_file=mode == 'document')
-            random_id = secrets.randbits(63)
-            response = await invoke(functions.messages.SendMediaRequest(peer, media,
-                parameters.get('caption', ''), random_id=random_id, clear_draft=False, entities=[]), mutation=True)
-            return accepted_updates(response, chat, random_id)
-
-        if operation == 'forward_message':
-            source = await input_peer(source_chat)
-            await exact_message(source, source_chat, source_message)
-            value = await rpc(lambda: client.forward_messages(peer, [source_message], from_peer=source,
-                drop_author=False, drop_media_captions=False), mutation=True)
-            return accepted(value, message=True, chat=chat)
-
-        if operation in ('send_poll', 'send_contact', 'send_location'):
-            if operation == 'send_poll':
-                answers = [types.PollAnswer(types.TextWithEntities(value, []), index.to_bytes(1, 'big'))
-                           for index, value in enumerate(parameters['options'])]
-                media = types.InputMediaPoll(types.Poll(0,
-                    types.TextWithEntities(parameters['question'], []), answers, hash=0,
-                    multiple_choice=parameters.get('multiple', False), public_voters=False))
-            elif operation == 'send_contact':
-                if 'phone' not in parameters or 'first_name' not in parameters:
-                    reject('invalid_parameters')
-                media = types.InputMediaContact(parameters['phone'], parameters['first_name'],
-                    parameters.get('last_name', ''), '')
-            else:
-                media = types.InputMediaGeoPoint(types.InputGeoPoint(parameters['latitude'], parameters['longitude']))
-            random_id = secrets.randbits(63)
-            response = await invoke(functions.messages.SendMediaRequest(peer, media,
-                parameters.get('description', '') if operation == 'send_location' else '',
-                random_id=random_id, clear_draft=False, entities=[]), mutation=True)
-            return accepted_updates(response, chat, random_id)
-
-        if operation in ('edit_message', 'delete_message'):
-            await exact_message(peer, chat, message_id, own=True)
-            if operation == 'edit_message':
-                bounded_text(parameters.get('text'), 4000)
-                response = await rpc(lambda: client.edit_message(peer, message_id, parameters['text'],
-                    parse_mode=None, link_preview=False), mutation=True)
-                if getattr(response, 'message', None) != parameters['text'] or getattr(response, 'out', None) is not True:
-                    return {'outcome': 'unknown', 'error': 'provider_result_unverified'}
-                return accepted(response, message=True, chat=chat, message_id=message_id)
-            response = await rpc(lambda: client.delete_messages(peer, [message_id], revoke=True), mutation=True)
-            return accepted(response)
-
-        if operation == 'send_reaction':
-            reactions = [types.ReactionEmoji(parameters['emoji'])] if parameters['emoji'] else []
-            return accepted(await invoke(functions.messages.SendReactionRequest(peer, message_id,
-                big=False, add_to_recent=False, reaction=reactions), mutation=True))
-
-        if operation == 'vote_poll':
-            message = await exact_message(peer, chat, message_id)
-            media = getattr(message, 'media', None)
-            if not isinstance(media, types.MessageMediaPoll):
-                reject('unsupported_operation')
-            poll = media.poll
-            choices = parameters['option_indices']
-            if (poll.closed or any(index >= len(poll.answers) for index in choices) or
-                    (not poll.multiple_choice and len(choices) > 1)):
-                reject('invalid_parameters')
-            if getattr(poll, 'subscribers_only', False) or getattr(poll, 'countries_iso2', None):
-                reject('unsupported_operation')
-            selected = [poll.answers[index].option for index in choices]
-            return accepted(await invoke(functions.messages.SendVoteRequest(peer, message_id, selected), mutation=True))
+                accepted=accepted, accepted_updates=accepted_updates, allowed_provider_id=allowed_provider_id,
+                basic_chat=basic_chat, channel=channel, chat=chat, client=client,
+                collection_policy=collection_policy, exact_message=exact_message, info=info, input_peer=input_peer,
+                invoke=invoke, job=job, message_id=message_id, operation=operation, parameters=parameters, peer=peer,
+                rpc=rpc, source_chat=source_chat, source_message=source_message, stream=stream,
+                verified_self=verified_self))
 
         if operation == 'press_button':
             # ANYM-676: one press of one callback button, bound to the preview; the callback data never leaves
@@ -905,34 +979,6 @@ async def _execute(client, job, *, verified_self=None, governor=None):
                 started_mutation = False  # A definite refusal: the bot received nothing.
             return await press(client, job, governor, rpc, invoke, peer, chat, message_id, clear_started,
                                check_policy)
-
-        if operation in ('pin_message', 'unpin_message'):
-            fn = client.pin_message if operation == 'pin_message' else client.unpin_message
-            kwargs = {'notify': False} if operation == 'pin_message' else {}
-            return accepted(await rpc(lambda: fn(peer, message_id, **kwargs), mutation=True))
-
-        if operation == 'mark_read':
-            request = functions.channels.ReadHistoryRequest(channel, message_id) if channel else \
-                functions.messages.ReadHistoryRequest(peer, message_id)
-            return accepted(await invoke(request, mutation=True))
-        if operation == 'mark_unread':
-            return accepted(await invoke(functions.messages.MarkDialogUnreadRequest(
-                types.InputDialogPeer(peer), unread=True), mutation=True))
-        if operation in ('archive_chat', 'unarchive_chat'):
-            return accepted(await rpc(lambda: client.edit_folder(peer,
-                folder=1 if operation == 'archive_chat' else 0), mutation=True))
-        if operation in ('mute_chat', 'unmute_chat'):
-            seconds = parameters.get('seconds') if operation == 'mute_chat' else 0
-            if operation == 'mute_chat':
-                integer(seconds, 1, 2**31 - 1)
-            # TL timestamps are signed 32-bit UTC epochs. Large requested durations
-            # beyond that bound cannot be represented faithfully.
-            mute_until = int(time.time()) + seconds if seconds else 0
-            if mute_until > 2**31 - 1:
-                reject('invalid_parameters')
-            settings = types.InputPeerNotifySettings(mute_until=datetime.fromtimestamp(mute_until, timezone.utc))
-            return accepted(await invoke(functions.account.UpdateNotifySettingsRequest(
-                types.InputNotifyPeer(peer), settings), mutation=True))
 
         if operation == 'create_group':
             users = [await user_input(value) for value in ids]
