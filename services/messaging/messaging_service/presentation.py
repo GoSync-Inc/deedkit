@@ -4,7 +4,7 @@ import re
 MESSAGE_FIELDS = ('id','message','account','chat','sender','sent_at','revision','direction',
     'provider_message_id','kind','origin','historical','is_backfill','event_sequence','sender_name','sender_name_basis','username',
     'chat_title','chat_type','reply_to_provider_id','reply_to','mentions_owner','reply_to_owner','forwarded','media_kind','body_truncated',
-    'sender_identity_basis','agent_send','delivery_receipt','formatting')
+    'sender_identity_basis','agent_send','delivery_receipt','formatting','buttons','buttons_count')
 CONVERSATION_FIELDS = ('body','kind','is_service','display_text','position','order_basis',
     'order_status','timestamp_resolution','first_observed_at','first_observed_basis',
     'ingested_at','ordering_warning','conversation_view_version','provider_message_type',
@@ -137,6 +137,7 @@ def lean_message(row, *, search=False, files=True):
     result.update(forward_fields(row));result.update(forward_copies(row))
     if row.get('reply_to_provider_id'):result['reply_to_provider_id']=row['reply_to_provider_id']
     if row.get('reply_to'):result['reply_to']=row['reply_to']
+    if row.get('buttons'):result.update({k:row[k] for k in ('buttons','buttons_count') if k in row})
     if row.get('agent_send'):
         result['agent_send']={k:row['agent_send'][k] for k in ('send_id','basis') if k in row['agent_send']}
     receipt=row.get('delivery_receipt') or {}

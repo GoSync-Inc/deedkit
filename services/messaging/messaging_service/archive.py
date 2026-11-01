@@ -129,6 +129,12 @@ def ingest_outcome(old,e,retained_snapshot,sender_alias=False):
     known_candidate=known_formatting(candidate_format);known_retained=known_formatting(old_format)
     formatting_changed=known_candidate and known_retained and candidate_format!=old_format
     formatting_completed=known_candidate and not known_retained
+    # A bot that replaces only its keyboard (same text, a later edit time) makes a new revision whose metadata
+    # carries the new `buttons`, or none when the edit removed it. A same-or-older version never rewrites it, so a
+    # re-read taken with the capture flag off cannot erase a keyboard (ANYM-658).
+    buttons_changed=bool(old and retained_snapshot and not old['deleted'] and not e['deleted'] and e['platform']=='telegram'
+        and old['provider_updated_at'] is not None and updated>old['provider_updated_at']
+        and (retained_snapshot.get('metadata') or {}).get('buttons')!=(e.get('metadata') or {}).get('buttons'))
     sender_completed=bool(old and not old['sender'] and e['sender'] and not old['deleted']
         and not e['deleted'] and e['platform']=='telegram' and e['direction']=='outgoing'
         and e.get('metadata',{}).get('chat_type')=='private'
@@ -193,7 +199,7 @@ def ingest_outcome(old,e,retained_snapshot,sender_alias=False):
         elif web_preview_refresh:outcome='unchanged'
         elif (old['sent_at']!=datetime.fromisoformat(e['sent_at']) or old['direction']!=e['direction']
               or old['sender']!=e['sender']): outcome='conflict'
-        elif old['content_hash']==content and not (formatting_changed or formatting_completed): outcome='unchanged'
+        elif old['content_hash']==content and not (formatting_changed or formatting_completed or buttons_changed): outcome='unchanged'
         elif old['provider_updated_at'] and updated<old['provider_updated_at']: outcome='stale'
         elif old['content_hash']==content and formatting_completed:outcome='edited'
         elif (old['provider_updated_at']==updated and not e['deleted']): outcome='conflict'
@@ -293,7 +299,8 @@ class Archive:
                 e={**e,'deleted':True,'body':'','media':[],
                    'updated_at':max(tombstone,datetime.fromisoformat(e['updated_at'])).isoformat()}
                 if 'formatting' in e:e['formatting']=unknown_formatting()
-                if 'contact' in e.get('metadata',{}):e['metadata']={k:v for k,v in e['metadata'].items() if k!='contact'}
+                if 'contact' in e.get('metadata',{}) or 'buttons' in e.get('metadata',{}):
+                    e['metadata']={k:v for k,v in e['metadata'].items() if k not in ('contact','buttons')}
             if (identity_observations and not e['deleted']
                     and c.execute('SELECT 1 FROM messages WHERE id=%s AND NOT deleted',(mid,)).fetchone()):
                 # A capture's identity evidence that contradicts a recorded pair is kept as a fence

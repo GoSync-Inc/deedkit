@@ -72,6 +72,41 @@ def test_unsafe_native_links_do_not_drop_provider_message_or_copy_url(url):
     assert url not in repr(value['formatting'])
 
 
+LINK_RULE=[('tg://resolve?domain=synthetic_bot',True),('tg://join?invite=abc',True),('tg://addstickers?set=abc',True),
+    ('tg://login?code=1',False),('tg://passport',False),('tg://setlanguage?lang=x',False),('tg://msg?text=x',False),
+    ('https://t.me/login/12345',False),('https://telegram.me/login/12345',False),('https://telesco.pe/login/12345',False),
+    ('https://t.me/synthetic_bot',True),('javascript:alert(1)',False),('data:text/html,x',False),
+    ('https://user:pass@example.com/',False),('ftp://example.com/',False),('tg:resolve?domain=x',False)]
+
+
+# spec: ANYM-658
+@pytest.mark.parametrize('link,kept',LINK_RULE,ids=[link for link,_ in LINK_RULE])
+def test_link_rule_for_text_links_and_buttons_keeps_tg_resolve_and_drops_credential_links(monkeypatch,link,kept):
+    monkeypatch.setenv('ANYMSG_CAPTURE_BUTTONS','1')
+    value=telegram_message('telegram-demo',tg('site',[types.MessageEntityTextUrl(0,4,link)]))
+    assert value['body']=='site'
+    assert (value['formatting']['entities']==[{'type':'text_link','offset':0,'length':4,'url':link}])==kept
+    if not kept:assert value['formatting']['unsupported_entities']==[{'type':'text_link','offset':0,'length':4}]
+    button=types.KeyboardInlineButton(text='Go',type=types.InlineButtonTypeUrl(url=link))
+    message=tg('site',[],reply_markup=types.ReplyInlineMarkup(rows=[types.KeyboardInlineButtonRow(buttons=[button])]))
+    shown=telegram_message('telegram-demo',message)['metadata']['buttons']['rows'][0][0]
+    assert ('url' in shown)==kept and shown['kind']=='url'
+
+
+# spec: ANYM-658
+def test_tg_links_pass_only_under_the_buttons_flag_and_the_validator_reads_them_either_way(monkeypatch):
+    link='tg://resolve?domain=synthetic_bot'
+    monkeypatch.delenv('ANYMSG_CAPTURE_BUTTONS',raising=False)
+    off=telegram_message('telegram-demo',tg('site',[types.MessageEntityTextUrl(0,4,link)]))
+    assert off['formatting']['entities']==[] and off['formatting']['warnings']==['native_link_unsupported']
+    monkeypatch.setenv('ANYMSG_CAPTURE_BUTTONS','1')
+    on=telegram_message('telegram-demo',tg('site',[types.MessageEntityTextUrl(0,4,link)]))
+    assert on['formatting']['entities'][0]['url']==link
+    # A spooled envelope captured with the flag on still validates after the flag is turned off.
+    monkeypatch.delenv('ANYMSG_CAPTURE_BUTTONS')
+    assert validate(on)['formatting']['entities'][0]['url']==link
+
+
 @pytest.mark.parametrize('offset,length',[(1,1),(0,1),(2,100),(True,2),(-1,1)])
 def test_bad_native_offsets_fail_closed_without_dropping_text(offset,length):
     value=telegram_message('telegram-demo',tg('😀 hello',[types.MessageEntityBold(offset,length)]))
