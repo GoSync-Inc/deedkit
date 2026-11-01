@@ -624,7 +624,290 @@ MESSAGE_HANDLERS = {
     'mute_chat': write_mute, 'unmute_chat': write_mute,
 }
 
-HANDLERS = {**READ_HANDLERS, **MESSAGE_HANDLERS}
+
+async def chat_link(op):
+    parameters, invoke, rpc, client, operation, job, join_refused, allowed_provider_id = (
+        op.parameters, op.invoke, op.rpc, op.client, op.operation, op.job, op.join_refused, op.allowed_provider_id)
+    link = parameters['link']
+    if link[0] == '+':
+        try:
+            invite = await invoke(functions.messages.CheckChatInviteRequest(link[1:]))
+        except errors.InviteHashExpiredError:
+            reject('invite_expired')
+        except (errors.InviteHashInvalidError, errors.InviteHashEmptyError):
+            reject('invite_invalid')
+        if isinstance(invite, types.ChatInvite):
+            target = None
+            observed = {'title': safe_text(invite.title, 255),
+                        'kind': 'channel' if invite.broadcast else 'group',
+                        'member_count': safe_int(invite.participants_count),
+                        'approval_required': bool(invite.request_needed),
+                        'paid': invite.subscription_pricing is not None,
+                        'membership': 'not_member', 'membership_basis': 'provider_invite'}
+        elif (isinstance(invite, (types.ChatInviteAlready, types.ChatInvitePeek)) and
+                isinstance(invite.chat, (types.Chat, types.Channel))):
+            target = invite.chat
+            observed = link_chat(target, 'member' if isinstance(invite, types.ChatInviteAlready) else 'not_member',
+                                 'provider_invite')
+        else:
+            reject('provider_reference_mismatch')
+    else:
+        try:
+            target = await rpc(lambda: client.get_entity(link[1:]))
+        except (errors.UsernameNotOccupiedError, errors.UsernameInvalidError, ValueError):
+            reject('invite_invalid')
+        if not isinstance(target, types.Channel):
+            reject('invite_invalid')  # A user or bot name is not a chat link.
+        observed = link_chat(target, {True: 'not_member', False: 'member'}.get(target.left, 'unknown'),
+                             'provider_public_chat')
+    if operation == 'check_chat_link':
+        return {'outcome': 'confirmed', **observed}
+    # The digest the owner confirmed names this chat; the link must still lead to it.
+    expected = job.get('expected_chat')
+    if not isinstance(expected, dict) or (observed['title'], observed['kind']) != (
+            expected.get('title'), expected.get('kind')):
+        reject('operation_target_changed')
+    if observed['membership'] == 'member':
+        reject('already_member')
+    if observed['paid']:
+        reject('join_not_allowed')
+    if observed['membership'] != 'not_member':
+        reject('operation_target_changed')
+    request = (functions.messages.ImportChatInviteRequest(link[1:]) if link[0] == '+' else
+               functions.channels.JoinChannelRequest(utils.get_input_channel(target)))
+    try:
+        response = await invoke(request, mutation=True)
+    except errors.InviteRequestSentError:
+        return {'outcome': 'confirmed', 'state': 'pending_approval', 'basis': 'provider_join_request_sent'}
+    except tuple(kind for kind, _ in JOIN_CHAT_REFUSALS) as error:
+        join_refused()
+        reject(next(code for kind, code in JOIN_CHAT_REFUSALS if isinstance(error, kind)))
+    joined = [c for c in getattr(response, 'chats', [])[:100] if isinstance(c, (types.Chat, types.Channel)) and
+              (target is None or utils.get_peer_id(c) == utils.get_peer_id(target))]
+    if len(joined) != 1 or peer_id(joined[0]) is None:
+        return {'outcome': 'unknown', 'error': 'provider_result_unverified'}
+    provider = peer_id(joined[0])
+    if allowed_provider_id(provider):
+        return {'outcome': 'confirmed', 'state': 'joined', 'archive': 'collected', 'provider_chat_id': provider,
+                'basis': 'provider_joined_chat'}
+    return {'outcome': 'confirmed', 'state': 'joined', 'archive': 'not_collected', 'next_step': JOIN_NEXT_STEP,
+            'basis': 'provider_joined_chat'}
+
+
+async def write_create_group(op):
+    ids, user_input, invoke, parameters, accepted = op.ids, op.user_input, op.invoke, op.parameters, op.accepted
+    users = [await user_input(value) for value in ids]
+    response = await invoke(functions.messages.CreateChatRequest(users, parameters['title']), mutation=True)
+    updates = response.updates if isinstance(response, types.messages.InvitedUsers) else response
+    chats = [c for c in getattr(updates, 'chats', []) if isinstance(c, types.Chat)]
+    if len(chats) == 1:
+        missing = [str(item.user_id) for item in getattr(response, 'missing_invitees', [])[:20]
+                   if isinstance(item, types.MissingInvitee) and item.user_id in ids]
+        return {'outcome': 'confirmed', 'provider_chat_id': peer_id(chats[0]),
+                'missing_invitee_ids': missing, 'all_members_added': not missing
+                    if isinstance(response, types.messages.InvitedUsers) else None,
+                'basis': 'provider_created_chat'}
+    return accepted(response)
+
+
+async def write_group_change(op):
+    channel, basic_chat, operation, peer, parameters, verified_self, user_input, accepted, invoke = (
+        op.channel, op.basic_chat, op.operation, op.peer, op.parameters, op.verified_self, op.user_input,
+        op.accepted, op.invoke)
+    if channel is None and basic_chat is None:
+        reject('unsupported_operation')
+    if operation == 'rename_group':
+        bounded_text(parameters.get('title'), 128)
+        request = functions.channels.EditTitleRequest(channel, parameters['title']) if channel else \
+            functions.messages.EditChatTitleRequest(basic_chat, parameters['title'])
+    elif operation == 'set_group_description':
+        bounded_text(parameters.get('description'), 255, empty=True)
+        request = functions.messages.EditChatAboutRequest(peer, parameters['description'])
+    elif operation == 'leave_group':
+        if channel:
+            request = functions.channels.LeaveChannelRequest(channel)
+        else:
+            request = functions.messages.DeleteChatUserRequest(basic_chat, types.InputUserSelf(), revoke_history=False)
+    else:
+        user_id = number_id(parameters.get('user_id'))
+        if isinstance(verified_self, types.User) and user_id == verified_self.id:
+            reject('invalid_parameters')
+        if operation == 'promote_participant' and channel is None:
+            reject('unsupported_operation')
+        user = await user_input(user_id)
+        if operation == 'add_participant':
+            request = functions.channels.InviteToChannelRequest(channel, [user]) if channel else \
+                functions.messages.AddChatUserRequest(basic_chat, user, fwd_limit=0)
+        elif operation == 'remove_participant':
+            if channel:
+                # Basic kick/unban can have partial effects. Do not silently
+                # turn a remove operation into a persistent ban.
+                reject('unsupported_operation')
+            request = functions.messages.DeleteChatUserRequest(basic_chat, user, revoke_history=False)
+        elif channel:
+            rights = types.ChatAdminRights(change_info=operation == 'promote_participant',
+                invite_users=operation == 'promote_participant', pin_messages=operation == 'promote_participant',
+                post_messages=False, edit_messages=False, delete_messages=False, ban_users=False,
+                add_admins=False, anonymous=False, manage_call=False, other=False)
+            request = functions.channels.EditAdminRequest(channel, user, rights, rank='')
+        else:
+            request = functions.messages.EditChatAdminRequest(basic_chat, user, is_admin=False)
+    return accepted(await invoke(request, mutation=True))
+
+
+async def write_revoke_invite(op):
+    channel, basic_chat, invoke, accepted, peer = op.channel, op.basic_chat, op.invoke, op.accepted, op.peer
+    if channel is None and basic_chat is None:
+        reject('unsupported_operation')
+    response = await invoke(functions.channels.GetFullChannelRequest(channel) if channel else
+        functions.messages.GetFullChatRequest(basic_chat))
+    invite = getattr(getattr(response, 'full_chat', None), 'exported_invite', None)
+    link = safe_text(getattr(invite, 'link', None), 512)
+    if not isinstance(link, str) or not re.fullmatch(r'https://t\.me/(?:\+|joinchat/)[A-Za-z0-9_-]+', link):
+        reject('invite_link_unavailable')
+    return accepted(await invoke(functions.messages.EditExportedChatInviteRequest(peer,
+        link, revoked=True), mutation=True))
+
+
+async def write_group_setting(op):
+    channel, basic_chat, invoke, chat, operation, parameters, peer = (
+        op.channel, op.basic_chat, op.invoke, op.chat, op.operation, op.parameters, op.peer)
+    if channel is None and basic_chat is None:
+        reject('unsupported_operation')
+
+    async def group_state():
+        full = await invoke(functions.channels.GetFullChannelRequest(channel) if channel else
+            functions.messages.GetFullChatRequest(basic_chat))
+        entity = next((e for e in getattr(full, 'chats', None) or [] if peer_id(e) == str(chat)), None)
+        if entity is None:
+            reject('provider_reference_mismatch')
+        return entity, group_settings(entity, getattr(full, 'full_chat', None))
+
+    field, key, flag = GROUP_SETTERS[operation]
+    value = parameters[key]
+    entity, state = await group_state()
+    if (isinstance(entity, types.Channel) and not entity.megagroup) or (flag is None and channel is None):
+        reject('unsupported_operation')
+    # Both default rights and slow mode need the ban right; refuse before any mutation.
+    if not group_admin(entity, 'ban_users'):
+        reject('forbidden')
+    previous = state[field]
+    if previous is None:
+        reject('unsupported_operation')
+    if previous == value:
+        return {'outcome': 'confirmed', key: value, 'previous': previous, 'changed': False}
+    if flag is None:
+        request = functions.channels.ToggleSlowModeRequest(channel, value)
+    else:
+        # The freshly read rights with only the owned flag changed; until_date and the rest stay.
+        read = entity.default_banned_rights
+        rights = types.ChatBannedRights(**{name: getattr(read, name) for name in BANNED_RIGHTS_FIELDS})
+        setattr(rights, flag, value)
+        request = functions.messages.EditChatDefaultBannedRightsRequest(peer, rights)
+    await invoke(request, mutation=True)
+    _, state = await group_state()
+    if state[field] == value:
+        return {'outcome': 'confirmed', key: value, 'previous': previous, 'changed': True}
+    return {'outcome': 'submitted', key: value, 'previous': previous, 'changed': True,
+            'basis': 'provider_request_returned', 'effect_verified': False}
+
+
+async def read_join_requests(op):
+    channel, basic_chat, parameters, invoke, peer = op.channel, op.basic_chat, op.parameters, op.invoke, op.peer
+    if channel is None and basic_chat is None:
+        reject('unsupported_operation')
+
+    limit = parameters.get('limit', 50)
+    response = await invoke(functions.messages.GetChatInviteImportersRequest(peer, offset_date=None,
+        offset_user=types.InputUserEmpty(), limit=limit, requested=True))
+    users = {u.id: u for u in getattr(response, 'users', None) or [] if isinstance(u, types.User)}
+    importers = [i for i in getattr(response, 'importers', None) or []
+                 if isinstance(i, types.ChatInviteImporter) and safe_int(i.user_id)][:limit]
+    rows, size = [], 0
+    for item in importers:
+        user = users.get(item.user_id)
+        name = ' '.join(filter(None, (safe_text(getattr(user, 'first_name', None), 64),
+                                      safe_text(getattr(user, 'last_name', None), 64)))) or None
+        row = {'id': str(item.user_id), 'name': name, 'note': utf16_text(item.about, 200),
+               'requested_at': int(item.date.timestamp()) if isinstance(item.date, datetime) else None}
+        # Bounded so the receipt stays under the result budget; the rest is has_more.
+        size += len(json.dumps(row, ensure_ascii=False).encode())
+        if size > JOIN_REQUESTS_BYTES:
+            break
+        rows.append(row)
+    count = safe_int(getattr(response, 'count', None))
+    return {'outcome': 'confirmed', 'requests': rows, 'untrusted': ['name', 'note'],
+            'has_more': len(rows) < len(importers) or (count is not None and count > len(rows))}
+
+
+async def write_join_requests(op):
+    channel, basic_chat, operation, parameters, user_input, client, entered, clock, rpc, peer = (
+        op.channel, op.basic_chat, op.operation, op.parameters, op.user_input, op.client, op.entered, op.clock,
+        op.rpc, op.peer)
+    if channel is None and basic_chat is None:
+        reject('unsupported_operation')
+
+    approved, ids, rows = operation == 'approve_join_requests', parameters['user_ids'], []
+
+    async def requester(value):
+        # A requester cached in the session file (list_join_requests stores it) resolves
+        # locally without a paced call, so 20 IDs fit the worker's 30 s; only an uncached
+        # one costs a paced lookup.
+        uid = number_id(value)
+        try:
+            cached = await utils.maybe_async(client.session.get_input_entity(types.PeerUser(uid)))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            cached = None
+        if isinstance(cached, types.InputPeerUser) and cached.user_id == uid:
+            return utils.get_input_user(cached)
+        return await user_input(value)
+    for index, value in enumerate(ids):
+        attempted = False
+        if clock() - entered >= JOIN_BATCH_BUDGET_SECONDS:
+            rows.extend({'id': later, 'state': 'not_attempted'} for later in ids[index:])
+            break
+
+        async def hide():
+            nonlocal attempted
+            attempted = True
+            return await client(functions.messages.HideChatJoinRequestRequest(peer, user, approved=approved))
+        try:
+            # The mutation's rpc rechecks expiry, access and the trusted preflight right before it.
+            user = await requester(value)
+            # A spent budget raises JoinBatchBudgetSpent: this ID and the rest are not_attempted.
+            await rpc(hide, mutation=True, budget=True)
+            rows.append({'id': value, 'state': 'applied'})
+            continue
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            code = JOIN_REFUSAL_ERRORS.get(type(error))
+            if attempted and code:
+                rows.append({'id': value, 'state': 'refused', 'reason': JOIN_REFUSALS[code],
+                             'provider_code': code[:64]})
+                continue
+        rows.append({'id': value, 'state': 'unknown' if attempted else 'not_attempted'})
+        rows.extend({'id': later, 'state': 'not_attempted'} for later in ids[index + 1:])
+        break
+    settled = all(row['state'] in ('applied', 'refused') for row in rows)
+    return {'outcome': 'confirmed' if settled else 'unknown', 'results': rows,
+            'all_applied': all(row['state'] == 'applied' for row in rows)}
+
+
+GROUP_HANDLERS = {
+    'check_chat_link': chat_link, 'join_chat': chat_link, 'create_group': write_create_group,
+    'rename_group': write_group_change, 'set_group_description': write_group_change,
+    'add_participant': write_group_change, 'remove_participant': write_group_change,
+    'promote_participant': write_group_change, 'demote_participant': write_group_change,
+    'leave_group': write_group_change, 'revoke_invite_link': write_revoke_invite,
+    'set_group_messages_admins_only': write_group_setting, 'set_group_info_admins_only': write_group_setting,
+    'set_slow_mode': write_group_setting, 'list_join_requests': read_join_requests,
+    'approve_join_requests': write_join_requests, 'reject_join_requests': write_join_requests,
+}
+
+HANDLERS = {**READ_HANDLERS, **MESSAGE_HANDLERS, **GROUP_HANDLERS}
 
 
 async def _execute(client, job, *, verified_self=None, governor=None):
@@ -660,6 +943,7 @@ async def _execute(client, job, *, verified_self=None, governor=None):
         # The shared rate gate and lookups may delay the first mutation.
         report('waiting')
     stream = None
+    ids = None
     info = source_chat = source_message = None
     referenced_peers = set()
 
@@ -897,80 +1181,15 @@ async def _execute(client, job, *, verified_self=None, governor=None):
         channel = utils.get_input_channel(peer) if isinstance(peer, types.InputPeerChannel) else None
         basic_chat = peer.chat_id if isinstance(peer, types.InputPeerChat) else None
 
-        if operation in ('check_chat_link', 'join_chat'):
-            link = parameters['link']
-            if link[0] == '+':
-                try:
-                    invite = await invoke(functions.messages.CheckChatInviteRequest(link[1:]))
-                except errors.InviteHashExpiredError:
-                    reject('invite_expired')
-                except (errors.InviteHashInvalidError, errors.InviteHashEmptyError):
-                    reject('invite_invalid')
-                if isinstance(invite, types.ChatInvite):
-                    target = None
-                    observed = {'title': safe_text(invite.title, 255),
-                                'kind': 'channel' if invite.broadcast else 'group',
-                                'member_count': safe_int(invite.participants_count),
-                                'approval_required': bool(invite.request_needed),
-                                'paid': invite.subscription_pricing is not None,
-                                'membership': 'not_member', 'membership_basis': 'provider_invite'}
-                elif (isinstance(invite, (types.ChatInviteAlready, types.ChatInvitePeek)) and
-                        isinstance(invite.chat, (types.Chat, types.Channel))):
-                    target = invite.chat
-                    observed = link_chat(target, 'member' if isinstance(invite, types.ChatInviteAlready) else 'not_member',
-                                         'provider_invite')
-                else:
-                    reject('provider_reference_mismatch')
-            else:
-                try:
-                    target = await rpc(lambda: client.get_entity(link[1:]))
-                except (errors.UsernameNotOccupiedError, errors.UsernameInvalidError, ValueError):
-                    reject('invite_invalid')
-                if not isinstance(target, types.Channel):
-                    reject('invite_invalid')  # A user or bot name is not a chat link.
-                observed = link_chat(target, {True: 'not_member', False: 'member'}.get(target.left, 'unknown'),
-                                     'provider_public_chat')
-            if operation == 'check_chat_link':
-                return {'outcome': 'confirmed', **observed}
-            # The digest the owner confirmed names this chat; the link must still lead to it.
-            expected = job.get('expected_chat')
-            if not isinstance(expected, dict) or (observed['title'], observed['kind']) != (
-                    expected.get('title'), expected.get('kind')):
-                reject('operation_target_changed')
-            if observed['membership'] == 'member':
-                reject('already_member')
-            if observed['paid']:
-                reject('join_not_allowed')
-            if observed['membership'] != 'not_member':
-                reject('operation_target_changed')
-            request = (functions.messages.ImportChatInviteRequest(link[1:]) if link[0] == '+' else
-                       functions.channels.JoinChannelRequest(utils.get_input_channel(target)))
-            try:
-                response = await invoke(request, mutation=True)
-            except errors.InviteRequestSentError:
-                return {'outcome': 'confirmed', 'state': 'pending_approval', 'basis': 'provider_join_request_sent'}
-            except tuple(kind for kind, _ in JOIN_CHAT_REFUSALS) as error:
-                join_refused()
-                reject(next(code for kind, code in JOIN_CHAT_REFUSALS if isinstance(error, kind)))
-            joined = [c for c in getattr(response, 'chats', [])[:100] if isinstance(c, (types.Chat, types.Channel)) and
-                      (target is None or utils.get_peer_id(c) == utils.get_peer_id(target))]
-            if len(joined) != 1 or peer_id(joined[0]) is None:
-                return {'outcome': 'unknown', 'error': 'provider_result_unverified'}
-            provider = peer_id(joined[0])
-            if allowed_provider_id(provider):
-                return {'outcome': 'confirmed', 'state': 'joined', 'archive': 'collected', 'provider_chat_id': provider,
-                        'basis': 'provider_joined_chat'}
-            return {'outcome': 'confirmed', 'state': 'joined', 'archive': 'not_collected', 'next_step': JOIN_NEXT_STEP,
-                    'basis': 'provider_joined_chat'}
-
         handler = HANDLERS.get(operation)
         if handler is not None:
             return await handler(OperationContext(
                 accepted=accepted, accepted_updates=accepted_updates, allowed_provider_id=allowed_provider_id,
-                basic_chat=basic_chat, channel=channel, chat=chat, client=client,
-                collection_policy=collection_policy, exact_message=exact_message, info=info, input_peer=input_peer,
-                invoke=invoke, job=job, message_id=message_id, operation=operation, parameters=parameters, peer=peer,
-                rpc=rpc, source_chat=source_chat, source_message=source_message, stream=stream,
+                basic_chat=basic_chat, channel=channel, chat=chat, client=client, clock=clock,
+                collection_policy=collection_policy, entered=entered, exact_message=exact_message, ids=ids,
+                info=info, input_peer=input_peer, invoke=invoke, job=job, join_refused=join_refused,
+                message_id=message_id, operation=operation, parameters=parameters, peer=peer, rpc=rpc,
+                source_chat=source_chat, source_message=source_message, stream=stream, user_input=user_input,
                 verified_self=verified_self))
 
         if operation == 'press_button':
@@ -983,187 +1202,6 @@ async def _execute(client, job, *, verified_self=None, governor=None):
                 started_mutation = False  # A definite refusal: the bot received nothing.
             return await press(client, job, governor, rpc, invoke, peer, chat, message_id, clear_started,
                                check_policy)
-
-        if operation == 'create_group':
-            users = [await user_input(value) for value in ids]
-            response = await invoke(functions.messages.CreateChatRequest(users, parameters['title']), mutation=True)
-            updates = response.updates if isinstance(response, types.messages.InvitedUsers) else response
-            chats = [c for c in getattr(updates, 'chats', []) if isinstance(c, types.Chat)]
-            if len(chats) == 1:
-                missing = [str(item.user_id) for item in getattr(response, 'missing_invitees', [])[:20]
-                           if isinstance(item, types.MissingInvitee) and item.user_id in ids]
-                return {'outcome': 'confirmed', 'provider_chat_id': peer_id(chats[0]),
-                        'missing_invitee_ids': missing, 'all_members_added': not missing
-                            if isinstance(response, types.messages.InvitedUsers) else None,
-                        'basis': 'provider_created_chat'}
-            return accepted(response)
-
-        if operation in ('rename_group', 'set_group_description', 'add_participant', 'remove_participant',
-                         'promote_participant', 'demote_participant', 'leave_group'):
-            if channel is None and basic_chat is None:
-                reject('unsupported_operation')
-            if operation == 'rename_group':
-                bounded_text(parameters.get('title'), 128)
-                request = functions.channels.EditTitleRequest(channel, parameters['title']) if channel else \
-                    functions.messages.EditChatTitleRequest(basic_chat, parameters['title'])
-            elif operation == 'set_group_description':
-                bounded_text(parameters.get('description'), 255, empty=True)
-                request = functions.messages.EditChatAboutRequest(peer, parameters['description'])
-            elif operation == 'leave_group':
-                if channel:
-                    request = functions.channels.LeaveChannelRequest(channel)
-                else:
-                    request = functions.messages.DeleteChatUserRequest(basic_chat, types.InputUserSelf(), revoke_history=False)
-            else:
-                user_id = number_id(parameters.get('user_id'))
-                if isinstance(verified_self, types.User) and user_id == verified_self.id:
-                    reject('invalid_parameters')
-                if operation == 'promote_participant' and channel is None:
-                    reject('unsupported_operation')
-                user = await user_input(user_id)
-                if operation == 'add_participant':
-                    request = functions.channels.InviteToChannelRequest(channel, [user]) if channel else \
-                        functions.messages.AddChatUserRequest(basic_chat, user, fwd_limit=0)
-                elif operation == 'remove_participant':
-                    if channel:
-                        # Basic kick/unban can have partial effects. Do not silently
-                        # turn a remove operation into a persistent ban.
-                        reject('unsupported_operation')
-                    request = functions.messages.DeleteChatUserRequest(basic_chat, user, revoke_history=False)
-                elif channel:
-                    rights = types.ChatAdminRights(change_info=operation == 'promote_participant',
-                        invite_users=operation == 'promote_participant', pin_messages=operation == 'promote_participant',
-                        post_messages=False, edit_messages=False, delete_messages=False, ban_users=False,
-                        add_admins=False, anonymous=False, manage_call=False, other=False)
-                    request = functions.channels.EditAdminRequest(channel, user, rights, rank='')
-                else:
-                    request = functions.messages.EditChatAdminRequest(basic_chat, user, is_admin=False)
-            return accepted(await invoke(request, mutation=True))
-
-        if operation == 'revoke_invite_link':
-            if channel is None and basic_chat is None:
-                reject('unsupported_operation')
-            response = await invoke(functions.channels.GetFullChannelRequest(channel) if channel else
-                functions.messages.GetFullChatRequest(basic_chat))
-            invite = getattr(getattr(response, 'full_chat', None), 'exported_invite', None)
-            link = safe_text(getattr(invite, 'link', None), 512)
-            if not isinstance(link, str) or not re.fullmatch(r'https://t\.me/(?:\+|joinchat/)[A-Za-z0-9_-]+', link):
-                reject('invite_link_unavailable')
-            return accepted(await invoke(functions.messages.EditExportedChatInviteRequest(peer,
-                link, revoked=True), mutation=True))
-
-        if operation in GROUP_SETTERS or operation in ('list_join_requests', 'approve_join_requests', 'reject_join_requests'):
-            if channel is None and basic_chat is None:
-                reject('unsupported_operation')
-
-        async def group_state():
-            full = await invoke(functions.channels.GetFullChannelRequest(channel) if channel else
-                functions.messages.GetFullChatRequest(basic_chat))
-            entity = next((e for e in getattr(full, 'chats', None) or [] if peer_id(e) == str(chat)), None)
-            if entity is None:
-                reject('provider_reference_mismatch')
-            return entity, group_settings(entity, getattr(full, 'full_chat', None))
-
-        if operation in GROUP_SETTERS:
-            field, key, flag = GROUP_SETTERS[operation]
-            value = parameters[key]
-            entity, state = await group_state()
-            if (isinstance(entity, types.Channel) and not entity.megagroup) or (flag is None and channel is None):
-                reject('unsupported_operation')
-            # Both default rights and slow mode need the ban right; refuse before any mutation.
-            if not group_admin(entity, 'ban_users'):
-                reject('forbidden')
-            previous = state[field]
-            if previous is None:
-                reject('unsupported_operation')
-            if previous == value:
-                return {'outcome': 'confirmed', key: value, 'previous': previous, 'changed': False}
-            if flag is None:
-                request = functions.channels.ToggleSlowModeRequest(channel, value)
-            else:
-                # The freshly read rights with only the owned flag changed; until_date and the rest stay.
-                read = entity.default_banned_rights
-                rights = types.ChatBannedRights(**{name: getattr(read, name) for name in BANNED_RIGHTS_FIELDS})
-                setattr(rights, flag, value)
-                request = functions.messages.EditChatDefaultBannedRightsRequest(peer, rights)
-            await invoke(request, mutation=True)
-            _, state = await group_state()
-            if state[field] == value:
-                return {'outcome': 'confirmed', key: value, 'previous': previous, 'changed': True}
-            return {'outcome': 'submitted', key: value, 'previous': previous, 'changed': True,
-                    'basis': 'provider_request_returned', 'effect_verified': False}
-
-        if operation == 'list_join_requests':
-            limit = parameters.get('limit', 50)
-            response = await invoke(functions.messages.GetChatInviteImportersRequest(peer, offset_date=None,
-                offset_user=types.InputUserEmpty(), limit=limit, requested=True))
-            users = {u.id: u for u in getattr(response, 'users', None) or [] if isinstance(u, types.User)}
-            importers = [i for i in getattr(response, 'importers', None) or []
-                         if isinstance(i, types.ChatInviteImporter) and safe_int(i.user_id)][:limit]
-            rows, size = [], 0
-            for item in importers:
-                user = users.get(item.user_id)
-                name = ' '.join(filter(None, (safe_text(getattr(user, 'first_name', None), 64),
-                                              safe_text(getattr(user, 'last_name', None), 64)))) or None
-                row = {'id': str(item.user_id), 'name': name, 'note': utf16_text(item.about, 200),
-                       'requested_at': int(item.date.timestamp()) if isinstance(item.date, datetime) else None}
-                # Bounded so the receipt stays under the result budget; the rest is has_more.
-                size += len(json.dumps(row, ensure_ascii=False).encode())
-                if size > JOIN_REQUESTS_BYTES:
-                    break
-                rows.append(row)
-            count = safe_int(getattr(response, 'count', None))
-            return {'outcome': 'confirmed', 'requests': rows, 'untrusted': ['name', 'note'],
-                    'has_more': len(rows) < len(importers) or (count is not None and count > len(rows))}
-
-        if operation in ('approve_join_requests', 'reject_join_requests'):
-            approved, ids, rows = operation == 'approve_join_requests', parameters['user_ids'], []
-
-            async def requester(value):
-                # A requester cached in the session file (list_join_requests stores it) resolves
-                # locally without a paced call, so 20 IDs fit the worker's 30 s; only an uncached
-                # one costs a paced lookup.
-                uid = number_id(value)
-                try:
-                    cached = await utils.maybe_async(client.session.get_input_entity(types.PeerUser(uid)))
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    cached = None
-                if isinstance(cached, types.InputPeerUser) and cached.user_id == uid:
-                    return utils.get_input_user(cached)
-                return await user_input(value)
-            for index, value in enumerate(ids):
-                attempted = False
-                if clock() - entered >= JOIN_BATCH_BUDGET_SECONDS:
-                    rows.extend({'id': later, 'state': 'not_attempted'} for later in ids[index:])
-                    break
-
-                async def hide():
-                    nonlocal attempted
-                    attempted = True
-                    return await client(functions.messages.HideChatJoinRequestRequest(peer, user, approved=approved))
-                try:
-                    # The mutation's rpc rechecks expiry, access and the trusted preflight right before it.
-                    user = await requester(value)
-                    # A spent budget raises JoinBatchBudgetSpent: this ID and the rest are not_attempted.
-                    await rpc(hide, mutation=True, budget=True)
-                    rows.append({'id': value, 'state': 'applied'})
-                    continue
-                except asyncio.CancelledError:
-                    raise
-                except Exception as error:
-                    code = JOIN_REFUSAL_ERRORS.get(type(error))
-                    if attempted and code:
-                        rows.append({'id': value, 'state': 'refused', 'reason': JOIN_REFUSALS[code],
-                                     'provider_code': code[:64]})
-                        continue
-                rows.append({'id': value, 'state': 'unknown' if attempted else 'not_attempted'})
-                rows.extend({'id': later, 'state': 'not_attempted'} for later in ids[index + 1:])
-                break
-            settled = all(row['state'] in ('applied', 'refused') for row in rows)
-            return {'outcome': 'confirmed' if settled else 'unknown', 'results': rows,
-                    'all_applied': all(row['state'] == 'applied' for row in rows)}
 
         if operation == 'add_contact':
             if 'phone' not in parameters or 'first_name' not in parameters:
