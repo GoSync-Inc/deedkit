@@ -48,6 +48,7 @@ PARAMETERS = {
     'send_location': {'latitude', 'longitude', 'description'}, 'edit_message': {'text'},
     'delete_message': set(), 'send_reaction': {'emoji'},
     'vote_poll': {'option_indices'}, 'pin_message': set(), 'unpin_message': set(),
+    'press_button': {'row', 'column', 'label', 'fp', 'acknowledge_uncertain'},
     'mark_read': set(), 'mark_unread': set(), 'archive_chat': set(),
     'unarchive_chat': set(), 'mute_chat': {'seconds'}, 'unmute_chat': set(),
     'create_group': {'title', 'user_ids'}, 'rename_group': {'title'},
@@ -503,7 +504,8 @@ async def _execute(client, job, *, verified_self=None, governor=None):
                         'update_profile', 'create_group', 'check_chat_link', 'join_chat'}
         chat = None if operation in account_only else number_id(job.get('provider_chat'), marked=True)
         message_operations = {'get_reactions', 'get_message_info', 'edit_message', 'delete_message',
-                              'send_reaction', 'vote_poll', 'pin_message', 'unpin_message', 'mark_read'}
+                              'send_reaction', 'vote_poll', 'pin_message', 'unpin_message', 'mark_read',
+                              'press_button'}
         message_id = number_id(job.get('provider_message_id')) if operation in message_operations else None
         if message_id is not None and message_id > 2**31 - 1:
             reject('invalid_parameters')
@@ -520,6 +522,10 @@ async def _execute(client, job, *, verified_self=None, governor=None):
         if operation == 'create_group':
             referenced_peers.update(str(user) for user in ids)
         check_policy()
+        if operation == 'press_button':
+            # ANYM-676: over the pacing budget nothing reaches the provider, not even the peer lookup.
+            from .button_press_executor import admit
+            await admit(governor)
         peer = await input_peer(chat) if chat is not None else None
         channel = utils.get_input_channel(peer) if isinstance(peer, types.InputPeerChannel) else None
         basic_chat = peer.chat_id if isinstance(peer, types.InputPeerChat) else None
@@ -847,6 +853,17 @@ async def _execute(client, job, *, verified_self=None, governor=None):
                 reject('unsupported_operation')
             selected = [poll.answers[index].option for index in choices]
             return accepted(await invoke(functions.messages.SendVoteRequest(peer, message_id, selected), mutation=True))
+
+        if operation == 'press_button':
+            # ANYM-676: one press of one callback button, bound to the preview; the callback data never leaves
+            # button_press_executor except inside the one Telegram request.
+            from .button_press_executor import press
+
+            def clear_started():
+                nonlocal started_mutation
+                started_mutation = False  # A definite refusal: the bot received nothing.
+            return await press(client, job, governor, rpc, invoke, peer, chat, message_id, clear_started,
+                               check_policy)
 
         if operation in ('pin_message', 'unpin_message'):
             fn = client.pin_message if operation == 'pin_message' else client.unpin_message

@@ -25,6 +25,7 @@ MAX_FILE_BYTES = 32 * 1024**2
 LIVE_SEARCH = 'search_messages_live'
 HISTORY = 'request_chat_history'
 INSPECT_BUTTONS = 'inspect_message_buttons'
+PRESS = 'press_button'
 # ANYM-475: governor waits, resolution, the provider request and the receipt together.
 LIVE_SEARCH_TIMEOUT = 15
 # Kept free inside LIVE_SEARCH_TIMEOUT for the foreground loop's pacing, so a queued send starts within it.
@@ -50,8 +51,8 @@ BLOCKED_RESULT_KEYS = frozenset(('token','access_token','refresh_token','session
 
 class CommandRejected(RuntimeError):
     """Known local rejection before invoking a provider operation."""
-    def __init__(self,code,*,retry_after=None):
-        super().__init__(code);self.retry_after=retry_after
+    def __init__(self,code,*,retry_after=None,data=None):
+        super().__init__(code);self.retry_after=retry_after;self.data=data
 
 
 def safe_result(value):
@@ -303,6 +304,9 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
             raise APIError('unsupported_operation')
         if provider=='whatsmeow' and (mode=='sticker' and mime!='image/webp' or
             mode in ('audio','voice','sticker') and parameters['caption']):raise APIError('unsupported_operation')
+    if operation==PRESS:
+        from . import button_press
+        payload['press']=button_press.payload(c,chat,message,parameters)
     _policy(c,account,operation,provider_chats,ready=ready,live=live_read(operation,account_row['platform']))
     if operation=='open_chat_by_phone':
         _phone_policy(c,account,parameters['phone'])
@@ -472,7 +476,13 @@ def _digest(p,payload):
 def preview(store,c,p,account,operation,chat_id='',message_id='',expected_revision=0,parameters=None):
     payload,spec=_resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,parameters,
                           verify_file=True)
-    return serial({**payload,'permission':spec['permission'],'mutation':spec['mutation'],
+    shown={}
+    if operation==PRESS:
+        # ANYM-676: earlier presses of this button that may have happened; shown to the owner, not part of the digest.
+        from . import button_press
+        pressed=payload['parameters']
+        shown['earlier_presses']=button_press.earlier_presses(c,account,message_id,pressed['row'],pressed['column'])
+    return serial({**payload,**shown,'permission':spec['permission'],'mutation':spec['mutation'],
         'required_permissions':payload['authorization_binding']['required_permissions'],
         'preview_digest':_digest(p,payload),'owner_approval_verified_by_server':False,
         'changes_provider_state':spec['mutation'],'limitation':spec.get('limitation','')})
@@ -565,6 +575,10 @@ def enqueue(store,c,p,account,operation,chat_id='',message_id='',expected_revisi
     payload['request_input']=request_input
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('commands-account:'+account,))
     if operation=='join_chat':_join_guard(c,account,payload['parameters']['link'])
+    if operation==PRESS:
+        from . import button_press
+        pressed=payload['parameters']
+        button_press.guard(c,account,message_id,pressed['row'],pressed['column'],pressed.get('acknowledge_uncertain'))
     count=c.execute("SELECT count(*) AS n FROM messenger_commands WHERE account=%s AND created_at>clock_timestamp()-interval '1 minute'",
                     (account,)).fetchone()['n']
     if count>=60:raise APIError('rate_limited',429)
@@ -934,9 +948,14 @@ class CommandWorker:
                 'forbidden','not_found','operation_rejected','identity_unresolved','chat_not_collected',
                 'rate_limited','provider_timeout','invalid_phone','identity_changed','sending_disabled','invite_invalid','invite_expired','chat_full',
                 'join_not_allowed','already_member','invalid_cursor','invalid_anchor','username_not_found',
-                'recipient_not_user') else 'operation_rejected'
+                'recipient_not_user','message_changed','password_required','press_uncertain',
+                'button_kind_unsupported') else 'operation_rejected'
             # Nothing was sent, so a lookup that ran out of time is a retryable read.
             result={'data':{'code':code,'retry':True}} if code=='provider_timeout' else None
+            # ANYM-676: a press refused before it left (the live message differs from the preview) returns the live
+            # text and labels so the owner can reconfirm in one round; nothing was sent.
+            if code=='message_changed' and isinstance(exc.data,dict):
+                result={'data':{'code':code,**exc.data,'next_action':'inspect again, preview and confirm again'}}
             if code=='rate_limited' and exc.retry_after:
                 result={'data':{'code':code,'retry_after':exc.retry_after}}
                 if getattr(exc,'provider_lookup',None) is False:result['data']['provider_lookup']=False

@@ -1224,3 +1224,185 @@ def test_a_stalled_receipt_write_does_not_hold_the_send_loop(monkeypatch):
         await asyncio.gather(*list(worker.settling))
         return elapsed
     assert asyncio.run(turn()) < 2 and started == ['succeeded']
+
+
+# --- ANYM-676: press_button -------------------------------------------------------------------------------------
+PRESS_LAYOUT = {'rows': [[{'text': 'Pay', 'kind': 'callback'}, {'text': 'Site', 'kind': 'url', 'url': 'https://example.invalid/a'}],
+                         [{'text': 'Cancel', 'kind': 'callback'}]]}
+FP = 'a' * 32
+
+
+@pytest.fixture
+def pressing(operator):
+    s, archive, key, state = operator
+
+    def bot_message(provider_id='5', body='Pay now', updated='2026-10-01T12:00:00+00:00', buttons=PRESS_LAYOUT):
+        metadata = {'sender_is_bot': True, **({'buttons': buttons} if buttons else {})}
+        result = archive.ingest(event(account='command-fixture', chat='100', provider_id=provider_id, sender='555',
+                                      direction='incoming', body=body, sent_at='2026-10-01T12:00:00+00:00',
+                                      updated_at=updated, metadata=metadata))
+        return result['message']
+
+    s.set_messenger_operations('command-fixture', ['press_button', 'get_message_info'])
+    presser = s.issue_key('command-presser', ['command-fixture'], permissions=['read', 'bot-press'])
+    return s, archive, presser, state, bot_message
+
+
+def press_args(message_id, revision=1, **parameters):
+    return {'account': 'command-fixture', 'operation': 'press_button', 'chat_id': stable_id('chat', 'command-fixture', '100'),
+            'message_id': message_id, 'expected_revision': revision,
+            'parameters': {'row': 0, 'column': 0, 'label': 'Pay', 'fp': FP, **parameters}}
+
+
+def press_now(s, key, args, request_id):
+    draft = s.preview_messenger_operation(key, **args)
+    return s.execute_messenger_operation(key, **args, request_id=request_id, preview_digest=draft['preview_digest'])
+
+
+# spec: ANYM-676
+def test_the_press_preview_refuses_definitely_with_its_own_code_and_makes_no_provider_call(pressing):
+    from messaging_service.messenger_operations import validate_operation
+    s, _, key, _, bot_message = pressing
+    mid = bot_message()
+    plain = bot_message('6', buttons=None)
+    cases = [(press_args(plain), 'button_not_captured', {}), (press_args(mid, row=3), 'button_not_found', {}),
+             (press_args(mid, column=5), 'button_not_found', {}),
+             (press_args(mid, label='Buy'), 'label_mismatch', {'archived_label': 'Pay'}),
+             (press_args(mid, column=1, label='Site'), 'button_kind_unsupported', {'kind': 'url'})]
+    for args, code, extra in cases:
+        for call, extra_args in ((s.preview_messenger_operation, {}),
+                                 (s.execute_messenger_operation, {'request_id': 'synthetic-press-0000'})):
+            with pytest.raises(APIError) as refused:
+                call(key, **args, **extra_args)
+            assert refused.value.code == code and getattr(refused.value, 'next_action', '')
+            assert all(getattr(refused.value, name) == value for name, value in extra.items())
+    with pytest.raises(ValueError, match='unsupported_operation'):
+        validate_operation('whatsapp', 'press_button', {'row': 0, 'column': 0, 'label': 'Pay', 'fp': FP}, provider='whatsmeow')
+
+
+# spec: ANYM-676
+def test_the_press_preview_names_the_bot_shows_the_risk_and_binds_edit_date_layout_text_and_fp(pressing):
+    s, archive, key, _, bot_message = pressing
+    mid = bot_message()
+    base = s.preview_messenger_operation(key, **press_args(mid))
+    block = base['press']
+    assert block['bot']['known'] is True and block['bot']['id'] == '555' and block['risk'].startswith('live action by')
+    assert block['message_text']['untrusted'] is True and block['other_labels'] == ['Site', 'Cancel']
+    assert base['mutation'] is True and base['owner_approval_verified_by_server'] is False
+    assert s.preview_messenger_operation(key, **press_args(mid, fp='b' * 32))['preview_digest'] != base['preview_digest']
+    for field, edit in (('edit_date', dict(updated='2026-10-01T12:00:05+00:00')), ('text_sha256', dict(body='Pay later',
+                        updated='2026-10-01T12:00:01+00:00')), ('layout_digest', dict(buttons={'rows': [[
+                            {'text': 'Pay', 'kind': 'callback'}, {'text': 'Cancel', 'kind': 'callback'}]]},
+                            updated='2026-10-01T12:00:02+00:00'))):
+        other = bot_message(str(10 + len(field)), **edit)
+        changed = s.preview_messenger_operation(key, **press_args(other))
+        assert changed['press'][field] != block[field] and changed['preview_digest'] != base['preview_digest']
+    stale = archive.ingest(event(account='command-fixture', chat='100', provider_id='5', sender='555', direction='incoming',
+                                 body='Pay now', updated_at='2026-10-01T12:05:00+00:00',
+                                 metadata={'sender_is_bot': True, 'buttons': {'rows': [[{'text': 'Done', 'kind': 'callback'}]]}}))
+    assert stale['outcome'] == 'edited'
+    with pytest.raises(APIError, match='operation_target_changed'):
+        s.preview_messenger_operation(key, **press_args(mid))  # the keyboard moved on: a new revision is needed
+
+
+# spec: ANYM-676
+def test_an_earlier_uncertain_press_blocks_a_new_request_until_it_is_acknowledged(pressing):
+    s, _, key, state, bot_message = pressing
+    mid = bot_message()
+    first = press_now(s, key, press_args(mid), 'synthetic-press-0001')
+    assert first['status'] == 'queued'
+    assert s.execute_messenger_operation(key, **press_args(mid), request_id='synthetic-press-0001',
+                                         preview_digest=s.preview_messenger_operation(key, **press_args(mid))['preview_digest']
+                                         )['operation_id'] == first['operation_id']  # same ID replays the receipt
+    other = s.issue_key('command-presser-2', ['command-fixture'], permissions=['read', 'bot-press'])
+    for who, rid in zip((key, other), ('synthetic-press-0002', 'synthetic-press-0003')):  # queued blocks, any key
+        with pytest.raises(APIError) as blocked:
+            press_now(s, who, press_args(mid), rid)
+        assert blocked.value.code == 'press_uncertain' and blocked.value.operation_id == first['operation_id']
+    with s.pool.connection() as c:  # a worker timeout leaves status unknown and no result at all
+        c.execute("UPDATE messenger_commands SET status='unknown',result=NULL WHERE id=%s", (first['operation_id'],))
+    with pytest.raises(APIError, match='press_uncertain'):
+        press_now(s, key, press_args(mid), 'synthetic-press-0004')
+    with pytest.raises(APIError, match='press_uncertain'):  # acknowledging another operation lifts nothing
+        press_now(s, key, press_args(mid, acknowledge_uncertain='op_' + '0' * 32), 'synthetic-press-0005')
+    second = press_now(s, key, press_args(mid, acknowledge_uncertain=first['operation_id']), 'synthetic-press-0006')
+    assert second['status'] == 'queued'
+
+
+# spec: ANYM-676
+@pytest.mark.parametrize('result,blocks', [
+    ({'outcome': 'unknown', 'data': {'error': 'provider_result_unverified'}}, True),
+    ({'outcome': 'submitted', 'data': {'answer': None, 'answer_timeout': True, 'message_after': None}}, True),
+    ({'outcome': 'submitted', 'data': {'answer': None, 'answer_timeout': True,
+                                       'message_after': {'edited': False, 'deleted': False, 'new_messages': False}}}, True),
+    ({'outcome': 'submitted', 'data': {'answer': {'message': 'ok', 'alert': False, 'url': None}, 'message_after': None}}, False),
+    ({'outcome': 'submitted', 'data': {'answer': None, 'answer_timeout': True,
+                                       'message_after': {'edited': True, 'deleted': False, 'new_messages': False}}}, False),
+    ({'outcome': 'submitted', 'data': {'answer': None, 'answer_timeout': True,
+                                       'message_after': {'edited': False, 'deleted': False, 'new_messages': True}}}, False)])
+def test_only_a_press_with_an_answer_or_a_visible_change_may_be_repeated(pressing, result, blocks):
+    from messaging_service.commands import CommandWorker
+    s, _, key, state, bot_message = pressing
+    mid = bot_message()
+    first = press_now(s, key, press_args(mid), 'synthetic-press-0010')
+
+    async def provider(job):
+        assert job['operation'] == 'press_button' and job['press']['fp'] == FP
+        return result
+    assert asyncio.run(CommandWorker(state, provider).once())
+    done = s.get_messenger_operation(key, first['operation_id'])
+    assert done['status'] == 'unknown' and done['result']['outcome'] == result['outcome']  # submitted is stored unknown
+    if blocks:
+        with pytest.raises(APIError, match='press_uncertain'):
+            press_now(s, key, press_args(mid), 'synthetic-press-0011')
+    else:
+        assert press_now(s, key, press_args(mid), 'synthetic-press-0011')['status'] == 'queued'
+
+
+# spec: ANYM-676
+def test_a_press_refused_by_the_collector_is_failed_with_the_live_view_and_may_be_repeated(pressing):
+    from messaging_service.commands import CommandRejected, CommandWorker
+    s, _, key, state, bot_message = pressing
+    mid = bot_message()
+    first = press_now(s, key, press_args(mid), 'synthetic-press-0020')
+
+    async def provider(job):
+        raise CommandRejected('message_changed', data={'live': {'edit_date': None, 'text': 'Pay later', 'labels': ['Pay']}})
+    assert asyncio.run(CommandWorker(state, provider).once())
+    done = s.get_messenger_operation(key, first['operation_id'])
+    assert done['status'] == 'failed' and done['error_code'] == 'message_changed'
+    assert done['result']['data']['live']['text'] == 'Pay later' and 'inspect again' in done['result']['data']['next_action']
+    assert press_now(s, key, press_args(mid), 'synthetic-press-0021')['status'] == 'queued'  # a failed press repeats freely
+
+
+# spec: ANYM-676
+def test_acknowledging_the_latest_uncertain_press_is_enough_after_two_uncertain_generations(pressing):
+    s, _, key, state, bot_message = pressing
+    mid = bot_message()
+    first = press_now(s, key, press_args(mid), 'synthetic-press-0030')
+    with s.pool.connection() as c:
+        c.execute("UPDATE messenger_commands SET status='unknown',result=NULL WHERE id=%s", (first['operation_id'],))
+    second = press_now(s, key, press_args(mid, acknowledge_uncertain=first['operation_id']), 'synthetic-press-0031')
+    with s.pool.connection() as c:
+        c.execute("UPDATE messenger_commands SET status='unknown',result=NULL WHERE id=%s", (second['operation_id'],))
+    with pytest.raises(APIError) as blocked:  # only the newest uncertain press blocks; the first was acknowledged
+        press_now(s, key, press_args(mid), 'synthetic-press-0032')
+    assert blocked.value.operation_id == second['operation_id']
+    third = press_now(s, key, press_args(mid, acknowledge_uncertain=second['operation_id']), 'synthetic-press-0033')
+    assert third['status'] == 'queued'
+
+
+# spec: ANYM-676
+def test_the_preview_lists_the_earlier_uncertain_press_of_another_key_without_its_content(pressing):
+    s, _, key, state, bot_message = pressing
+    mid = bot_message()
+    assert s.preview_messenger_operation(key, **press_args(mid))['earlier_presses'] == []
+    first = press_now(s, key, press_args(mid), 'synthetic-press-0040')
+    other = s.issue_key('command-presser-3', ['command-fixture'], permissions=['read', 'bot-press'])
+    shown = s.preview_messenger_operation(other, **press_args(mid))['earlier_presses']
+    assert [item['operation_id'] for item in shown] == [first['operation_id']] and shown[0]['status'] == 'queued'
+    assert set(shown[0]) == {'operation_id', 'status', 'created_at', 'outcome', 'answer_timeout', 'pressed_at'}
+    digest = s.preview_messenger_operation(other, **press_args(mid))['preview_digest']
+    with pytest.raises(APIError, match='forbidden|not_found'):  # the other key cannot read the receipt itself
+        s.get_messenger_operation(other, first['operation_id'])
+    assert digest == s.preview_messenger_operation(other, **press_args(mid))['preview_digest']  # not bound

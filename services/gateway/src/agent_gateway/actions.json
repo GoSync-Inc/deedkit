@@ -105,6 +105,9 @@
   "pin_message": [
     "message-pin"
   ],
+  "press_button": [
+    "bot-press"
+  ],
   "promote_participant": [
     "groups-manage"
   ],
