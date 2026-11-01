@@ -1,0 +1,24 @@
+{
+  "status": 200,
+  "body": {
+    "id": "chatcmpl-<request id>",
+    "object": "chat.completion",
+    "created": 0,
+    "model": "vision-default",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "{\"title\": \"fake title\", \"summary\": \"fake summary\", \"document_type\": \"unknown\", \"text\": \"\"}"
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 12,
+      "completion_tokens": 7,
+      "total_tokens": 19
+    }
+  }
+}

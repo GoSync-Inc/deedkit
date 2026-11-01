@@ -1,0 +1,19 @@
+{
+  "method": "POST",
+  "path": "/v1/audio/transcriptions",
+  "headers": {
+    "X-Request-Deadline-Seconds": "600"
+  },
+  "multipart": {
+    "fields": {
+      "model": "audio-default",
+      "response_format": "verbose_json"
+    },
+    "file": {
+      "field": "file",
+      "filename": "recording.mp3",
+      "content_type": "audio/mpeg",
+      "base64": "c3ludGhldGljIGF1ZGlvIGJ5dGVz"
+    }
+  }
+}
