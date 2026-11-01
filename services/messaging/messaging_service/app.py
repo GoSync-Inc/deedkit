@@ -9,15 +9,15 @@ import logging
 import re
 import time
 from urllib.parse import urlsplit
-from datetime import datetime
-from typing import Annotated, Any, Literal, Required, TypedDict
+from datetime import datetime  # noqa: F401  (kept importable)
+from typing import Annotated, Any, Literal, Required, TypedDict  # noqa: F401
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
-from pydantic import AfterValidator, ConfigDict, Field, StrictBool, StrictInt, StrictStr, ValidationError
+from pydantic import AfterValidator, ConfigDict, Field, StrictBool, StrictInt, StrictStr, ValidationError  # noqa: F401
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
@@ -32,6 +32,15 @@ from .presentation import options, render
 from .telemetry import capture as capture_error
 from .uploads import UPLOAD_BODY_BYTES
 from .send_intent import SEND_BODY_BYTES
+from .tool_types import (  # noqa: F401  (the moved names stay importable from here)
+    WaitSeconds, LiveWaitSeconds, WakeRule, WakeRules, SendReference, SubscriptionReceipt,
+    ReceiverReference, RequestReference, FeedbackReference, FeedbackReferences, FeedbackDescription,
+    FeedbackOperation, FeedbackStatus, Detail, MessageDetail, ConversationView, QueryMode, SearchLanguage,
+    EventKind, SubscriptionEventKind, EventOrigin, MessageFormat, SubscriptionReference,
+    SubscriptionReferences, SubscriptionKinds, SubscriptionOrigins, SubscriptionLimit, SubscriptionVersion,
+    SubscriptionPosition, LocalClock, QuietWindow, QuietHours, DeliveryPolicy, EndpointReference,
+    EndpointUrl, SigningSecret, EndpointHeaders, EndpointLabel, AttemptLimit, SubscriptionSources,
+    SubscriptionEndpoint, subscription_expiry, SubscriptionExpiry)
 # The only calls whose body may pass 16 KiB (ANYM-547: inline files of messages_send); REST path or MCP tool name.
 # Both stage bytes as uploads, so only a key that may upload (upload_file_chunk) reads more than 16 KiB.
 LARGE_BODIES = {'upload_file_chunk': UPLOAD_BODY_BYTES, 'messages_send': SEND_BODY_BYTES}
@@ -73,80 +82,6 @@ def claimed_tool(prefix):
     except (ValueError,RecursionError):pass
     return name
 
-WaitSeconds = Annotated[float, Field(strict=True,ge=0,le=25,allow_inf_nan=False)]
-LiveWaitSeconds = Annotated[float, Field(strict=True,ge=0,le=20,allow_inf_nan=False)]
-WakeRule = Literal['incoming_message','owner_mention','reply_to_owner','reply_to_confirmed_send','reply_to_own_send']
-WakeRules = Annotated[list[WakeRule], Field(min_length=1,max_length=4)]
-SendReference = Annotated[StrictStr, Field(min_length=1,max_length=128)]
-SubscriptionReceipt = Annotated[StrictStr, Field(min_length=32,max_length=128)]
-ReceiverReference = Annotated[StrictStr, Field(pattern=r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
-RequestReference = Annotated[StrictStr, Field(min_length=8,max_length=128,pattern=r'^[A-Za-z0-9_.:-]+$')]
-FeedbackReference = Annotated[StrictStr, Field(min_length=1,max_length=256,pattern=r'^[^\x00-\x1f\x7f]+$')]
-FeedbackReferences = dict[Literal['message_ids','chat_ids','subscription_ids'],Annotated[list[FeedbackReference],Field(max_length=32)]]
-FeedbackDescription = Annotated[StrictStr,Field(min_length=1,max_length=4000,pattern=r'^[^\x00-\x08\x0b-\x1f\x7f]+$')]
-# A tool name as tools/list shows it (feedback.py canonical_operation, ANYM-342). The name list is not repeated
-# here: the gateway owns the catalog, so the schema carries the shape only.
-FeedbackOperation = Annotated[StrictStr,Field(min_length=1,max_length=129,pattern=r'^[a-z][a-z0-9_]*$')]
-FeedbackStatus = Literal['received','accepted','declined','duplicate','fixed','verify_requested','verified','reopened']
-Detail = Literal['compact','full']
-MessageDetail = Literal['compact','full','transcript']
-ConversationView = Literal['archive','conversation']
-QueryMode = Literal['all','phrase','web','exact']
-SearchLanguage = Literal['auto','simple','russian','english','indonesian']
-EventKind = Literal['message.created','message.edited','message.deleted','message.status','attachment.ready']
-SubscriptionEventKind = Literal['message.created','message.edited','message.deleted',
-    'message.status','attachment.ready','file.text.ready','file.transcript.ready',
-    'file.description.ready','file.processing.failed','send.failed','source.health']
-EventOrigin = Literal['live','backfill','reconcile','fixture']
-MessageFormat = Literal['plain','markdown','html']
-SubscriptionReference = Annotated[StrictStr, Field(min_length=1,max_length=256,
-    pattern=r'^[^\x00-\x20\x7f]+$')]
-SubscriptionReferences = Annotated[list[SubscriptionReference], Field(min_length=1,max_length=64)]
-SubscriptionKinds = Annotated[list[SubscriptionEventKind], Field(min_length=1,max_length=11)]
-SubscriptionOrigins = Annotated[list[EventOrigin], Field(min_length=1,max_length=4)]
-SubscriptionLimit = Annotated[StrictInt, Field(ge=1,le=100)]
-SubscriptionVersion = Annotated[StrictInt, Field(ge=1,le=9007199254740991)]
-SubscriptionPosition = Annotated[StrictInt, Field(ge=0,le=9007199254740991)]
-# Hint timing only (delivery_policy.py validates again): never changes matches, ACK or passive reads.
-LocalClock = Annotated[StrictStr, Field(pattern=r'^(?:[01][0-9]|2[0-3]):[0-5][0-9]$')]
-class QuietWindow(TypedDict):
-    __pydantic_config__ = ConfigDict(extra='forbid')
-    days: Annotated[list[Literal['mon','tue','wed','thu','fri','sat','sun']], Field(min_length=1,max_length=7)]
-    start: LocalClock
-    end: LocalClock
-class QuietHours(TypedDict):
-    __pydantic_config__ = ConfigDict(extra='forbid')
-    timezone: Annotated[StrictStr, Field(min_length=1,max_length=64)]
-    windows: Annotated[list[QuietWindow], Field(min_length=1,max_length=4)]
-class DeliveryPolicy(TypedDict, total=False):
-    __pydantic_config__ = ConfigDict(extra='forbid')
-    debounce_s: Annotated[StrictInt, Field(ge=0,le=600)]
-    max_wait_s: Annotated[StrictInt, Field(ge=1,le=3600)]
-    batch_window_s: Annotated[StrictInt, Field(ge=0,le=86400)]
-    batch_count: Annotated[StrictInt, Field(ge=1,le=1000)]
-    quiet_hours: QuietHours
-    quiet_bypass: Annotated[list[Literal['incoming_message','owner_mention','reply_to_owner',
-        'reply_to_confirmed_send','silence']], Field(min_length=1,max_length=5)]
-    expect_reply_within_s: Annotated[StrictInt, Field(ge=60,le=1209600)]
-# ANYM-519: an agent's own webhook endpoint. delivery_endpoints.py checks URL, secret and headers again.
-EndpointReference = ReceiverReference
-EndpointUrl = Annotated[StrictStr, Field(min_length=1,max_length=2048)]
-SigningSecret = Annotated[StrictStr, Field(pattern=r'^whsec_[A-Za-z0-9+/=]{32,96}$')]
-EndpointHeaders = Annotated[dict[StrictStr,StrictStr], Field(max_length=4)]
-EndpointLabel = Annotated[StrictStr, Field(max_length=128,pattern=r'^[^\x00-\x1f\x7f]*$')]
-# ANYM-520: one page of an endpoint's attempt log.
-AttemptLimit = Annotated[StrictInt, Field(ge=1,le=50)]
-class SubscriptionSources(TypedDict, total=False):
-    # ANYM-522: every chat the key can see now, optionally per account; channels and bots only when asked for.
-    __pydantic_config__ = ConfigDict(extra='forbid')
-    all_visible_chats: Required[Literal[True]]
-    account_ids: SubscriptionReferences
-    include_channels: StrictBool
-    include_bots: StrictBool
-class SubscriptionEndpoint(TypedDict, total=False):
-    __pydantic_config__ = ConfigDict(extra='forbid')
-    endpoint_id: Required[EndpointReference]
-    delivery_policy: DeliveryPolicy
 # Optional arguments dropped when None, so payloads and audit records of callers that omit them stay unchanged.
 OMITTED_WHEN_NONE = {'create_subscription':('chat_ids','sources','wake_rules','reply_to_send','delivery'),
     'configure_subscription_delivery':('delivery_policy','endpoint_id'),
@@ -173,20 +108,6 @@ LIST_CHATS_OUTPUT_PROPERTIES={
         'awaiting_their_reply=true: chats left out because their head order or kind is unknown.'},
     'excluded_without_question_total':{'type':'integer','minimum':0,'description':
         'awaiting_their_reply=true with only_questions=true: runs left out because no message asks a question.'}}
-def subscription_expiry(value):
-    """Validate a zoned ISO timestamp without coercing or echoing input values."""
-    try:
-        parsed=datetime.fromisoformat(value.replace('Z','+00:00'))
-        if parsed.tzinfo is None or parsed.utcoffset() is None:raise ValueError
-    except ValueError:
-        raise ValueError('invalid_subscription_expiry') from None
-    return value
-
-
-SubscriptionExpiry = Annotated[StrictStr, Field(min_length=20,max_length=64,
-    pattern=r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$'),
-    AfterValidator(subscription_expiry)]
-
 
 def validate_arguments(models, method, arguments):
     if method not in models:return arguments
