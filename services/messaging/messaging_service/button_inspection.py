@@ -79,24 +79,26 @@ def inspect(message, chat, message_id):
     """The result data for a live Telethon message: {edit_date, text_sha256, rows[, truncated]}."""
     from telethon import types
     markup = getattr(message, 'reply_markup', None)
-    rows, kept, truncated = [], 0, False
+    rows, kept, truncated, full = [], 0, False, False
     if isinstance(markup, types.ReplyInlineMarkup) and isinstance(markup.rows, (list, tuple)):
+        truncated = len(markup.rows) > MAX_BUTTONS
         for row_index, raw_row in enumerate(markup.rows[:MAX_BUTTONS]):
             if not isinstance(raw_row, types.KeyboardInlineButtonRow) or not isinstance(raw_row.buttons, (list, tuple)):
                 continue
             row = []
+            truncated = truncated or len(raw_row.buttons) > MAX_BUTTONS
             for column, raw in enumerate(raw_row.buttons[:MAX_BUTTONS]):
                 item = _button(raw, chat, message_id, row_index, column)
                 if item is None:
                     continue
                 if kept >= MAX_BUTTONS:
-                    truncated = True
+                    truncated = full = True
                     break
                 row.append(item)
                 kept += 1
             if row:
                 rows.append(row)
-            if truncated:
+            if full:
                 break
     rows, truncated = fit(rows, truncated)
     moment = getattr(message, 'edit_date', None) or getattr(message, 'date', None)

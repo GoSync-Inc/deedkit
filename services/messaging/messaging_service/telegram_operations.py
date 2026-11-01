@@ -1334,20 +1334,37 @@ async def inspect_message_buttons(client, job, governor, rpc, referenced_peers, 
         wait = await governor.admit('inspect_buttons', 2)
         if wait:
             limited(wait)
+    # The SDK keeps its own FloodWait memory per RPC constructor, shared with every other get_messages: restore it
+    # after a FloodWait of this read, so the governor's scope (not the SDK) decides who is paused.
+    waits = getattr(client, '_flood_waited_requests', None)
+    before = dict(waits) if isinstance(waits, dict) else None
     try:
         peer = await rpc(lambda: client.get_input_entity(chat), scope='inspect_buttons')
         message = await rpc(lambda: client.get_messages(peer, ids=message_id), scope='inspect_buttons')
     except ProviderRateLimited as exc:
+        if before is not None:
+            for key in [key for key in waits if key not in before]:
+                del waits[key]
+            waits.update(before)
         limited(exc.seconds)
     except (errors.ChannelPrivateError, errors.ChatAdminRequiredError, errors.PeerIdInvalidError,
             errors.MessageIdInvalidError):
         reject('not_found')
     except errors.RPCError:
         reject('operation_rejected')
+    except CommandRejected:
+        raise
+    except Exception:
+        # Provider text may carry anything: a fixed code, and no exception context to print.
+        raise CommandRejected('provider_preflight_failed') from None
     if (message is None or getattr(message, 'id', None) != message_id or
             str(getattr(message, 'chat_id', None)) != str(chat)):
         reject('not_found')
-    return {'outcome': 'confirmed', **inspect(message, chat, message_id)}
+    try:
+        return {'outcome': 'confirmed', **inspect(message, chat, message_id)}
+    except Exception:
+        # The failure may carry callback bytes or the key in its frames: raise a fixed code with no context.
+        raise CommandRejected('provider_preflight_failed') from None
 
 
 async def chat_history(client, job, parameters, governor, rpc, referenced_peers, check_policy):

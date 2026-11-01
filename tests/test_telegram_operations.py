@@ -1420,6 +1420,72 @@ def test_the_inspection_is_governed_in_its_own_scope(monkeypatch):
 
 
 # spec: ANYM-681
+# spec: ANYM-681
+def test_a_flood_wait_of_the_inspection_leaves_no_sdk_cooldown_for_other_reads(monkeypatch):
+    """The SDK remembers a FloodWait per RPC constructor, shared with get_message_info; the inspection restores it."""
+    import inspect as pyinspect
+    from telethon import TelegramClient
+    # The bookkeeping this test models is the pinned SDK's own: it must exist and be consulted by every call.
+    assert '_flood_waited_requests' in pyinspect.getsource(TelegramClient._call)
+    keyed(monkeypatch)
+    clock, state, governor = governed()
+    key = functions.messages.GetMessagesRequest.CONSTRUCTOR_ID
+    unrelated = functions.messages.SendMessageRequest.CONSTRUCTOR_ID
+
+    class Flooding(Client):
+        def __init__(self):
+            super().__init__()
+            self._flood_waited_requests = {unrelated: 4242.0}
+
+        async def get_messages(self, peer, *, ids):
+            self._flood_waited_requests[key] = 99999.0  # what the SDK's _call writes before it raises
+            raise errors.FloodWaitError(None, capture=300)
+    client = Flooding()
+    with pytest.raises(CommandRejected) as flooded:
+        inspect(client, governor)
+    assert flooded.value.retry_after == 300
+    assert client._flood_waited_requests == {unrelated: 4242.0}  # unrelated waits kept, this one dropped
+
+
+# spec: ANYM-681
+def test_a_keyboard_over_100_rows_or_100_columns_is_marked_truncated(monkeypatch):
+    keyed(monkeypatch)
+    rows = Client()
+    rows.message.reply_markup = inline(*[[callback_button('R%d' % n, b'd%d' % n)] for n in range(101)])
+    data = run(rows, 'inspect_message_buttons')['data']
+    assert len(data['rows']) == 100 and data['truncated'] is True
+    wide = Client()
+    wide.message.reply_markup = inline([callback_button('C%d' % n, b'd%d' % n) for n in range(101)])
+    data = run(wide, 'inspect_message_buttons')['data']
+    assert sum(len(row) for row in data['rows']) == 100 and data['truncated'] is True
+    exact = Client()
+    exact.message.reply_markup = inline(*[[callback_button('R%d' % n, b'd%d' % n)] for n in range(100)])
+    assert 'truncated' not in run(exact, 'inspect_message_buttons')['data']
+
+
+# spec: ANYM-681
+def test_a_failed_inspection_prints_no_secret_in_its_exception_chain(monkeypatch):
+    import traceback
+    keyed(monkeypatch)
+    client = Client()
+    client.message.reply_markup = inline([callback_button('Pay')])
+
+    def boom(*args, **kwargs):
+        raise RuntimeError('exploded ' + CALLBACK_SECRET.decode() + INSPECT_KEY.hex())
+    monkeypatch.setattr('messaging_service.button_inspection.fingerprint', boom)
+    with pytest.raises(CommandRejected) as refused:
+        run(client, 'inspect_message_buttons')
+
+    class Exploding(Client):
+        async def get_messages(self, peer, *, ids):
+            raise RuntimeError('provider said ' + CALLBACK_SECRET.decode() + INSPECT_KEY.hex())
+    with pytest.raises(CommandRejected) as read:
+        run(Exploding(), 'inspect_message_buttons')
+    for error in (refused.value, read.value):
+        chain = ''.join(traceback.format_exception(error))
+        assert CALLBACK_SECRET.decode() not in chain and INSPECT_KEY.hex() not in chain
+
+
 def test_a_scoped_flood_wait_pauses_only_the_inspection_and_a_long_one_the_account(monkeypatch):
     keyed(monkeypatch)
     clock, state, governor = governed()
