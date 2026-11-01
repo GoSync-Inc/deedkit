@@ -34,6 +34,7 @@ def test_offline_and_telemetry_switches_are_set_before_engine_imports():
     assert ast.unparse(first_update.value.args[0]) == "OFFLINE"
     assert offline.OFFLINE["HF_HUB_OFFLINE"] == "1" and offline.OFFLINE["HF_HUB_DISABLE_TELEMETRY"] == "1"
     assert offline.OFFLINE["TRANSFORMERS_OFFLINE"] == "1" and offline.OFFLINE["DO_NOT_TRACK"] == "1"
+    assert offline.OFFLINE["ORT_DISABLE_TELEMETRY"] == "1"  # onnxruntime reports to a vendor endpoint unless told not to
     # No module of an engine library is imported at the top level of a runtime (only inside load/run).
     libraries = {"mlx", "mlx_vlm", "mlx_whisper", "onnx_asr", "onnxruntime", "transformers", "torch"}
     for source in (WORKER.parent / "runtimes").glob("*.py"):

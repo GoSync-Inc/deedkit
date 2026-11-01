@@ -25,7 +25,12 @@ def test_engines_group_is_darwin_only_and_pinned():
     names = {re.split(r"[=<>!~; \[]", item)[0].lower() for item in config["project"]["dependencies"]}
     assert not names & RUNTIME_PACKAGES and not any(
         re.split(r"[=<>!~; \[]", item)[0].lower() in RUNTIME_PACKAGES for item in config["dependency-groups"]["dev"])
-    assert config["tool"]["uv"]["no-build"] is True  # wheels only, never a source build on the mini
+    # Wheels only, never a source build of a third-party package on the mini: every locked package is named (the
+    # project itself is built, so `no-build = true` cannot be used), and the list follows uv.lock.
+    locked = tomllib.loads((ROOT / "uv.lock").read_text())["package"]
+    assert sorted(config["tool"]["uv"]["no-build-package"]) == sorted(
+        package["name"] for package in locked if package["name"] != "deedkit-inference")
+    assert "no-build" not in config["tool"]["uv"]
     # models.json pins the same package versions the lock installs.
     assert pins.load_models()["packages"] == {e.group(1): e.group(2) for e in entries}
 
