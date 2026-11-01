@@ -8,8 +8,9 @@ def test_ci_runs_the_inference_suite_in_the_services_job():
     step = re.search(r"      - name: Inference service tests\n(?P<body>(?:        .*\n|\n)+)", services)
     assert step, "the inference step is missing from the services job"
     body = step.group("body")
-    # No step id: tests/test_tiden_ci.py pins the id set of the services job to the Tiden modules.
-    assert not re.search(r"^        id:", body, re.M) and "working-directory: services/inference" in body
+    # The step id is the Tiden module name: tests/test_tiden_ci.py pins the id set of the services job to the modules.
+    assert re.search(r"^        id: inference$", body, re.M) and "working-directory: services/inference" in body
+    assert '--junitxml="$RUNNER_TEMP/ci-evidence/inference.xml"' in body
     assert "uv sync --locked --group dev" in body and "uv run pytest -q" in body
     assert "uv run ruff check src" in body
     # The existing step ids of the job are untouched; the seven anymsg-ci checks live in the verify job.
