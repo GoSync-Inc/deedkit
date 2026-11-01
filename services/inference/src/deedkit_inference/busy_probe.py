@@ -13,6 +13,11 @@ admission. Any failure to observe sets both flags true: Between and the test run
 
   between     a container named or labelled Between runs in any Docker context of the admin account whose socket
               exists (scripts/remote-test.sh checks only the default context); a context that cannot be queried is busy.
+              Between's CI runs inside the colima VMs of the user _betweenci, whose containers the admin account cannot
+              list (11-02: a full pytest job ran there while this flag read false). What the admin account does see is
+              the VM's Virtualization process, whose CPU is the guest's CPU: `between` is also true while the summed
+              %cpu of those processes shows work (VmLoad below), and for 120 s after the probe starts (it knows nothing of the minutes
+              before). The runner processes inside the guest are invisible. A VM reading that cannot be parsed is busy.
   deedkit_ci  a process of _deedkitci whose arguments name .locks/slot: the run slot is a flock held by a python
               process of that user in its private home, which the admin account cannot open.
 """
@@ -21,6 +26,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable
 import json
+import math
 import os
 from pathlib import Path
 import pwd
@@ -36,6 +42,13 @@ INTERVAL = 5
 COMMAND_TIMEOUT = 5
 CI_USER = '_deedkitci'
 SLOT_MARK = '.locks/slot'
+BETWEEN_USER = '_betweenci'
+VM_MARK = 'com.apple.Virtualization.VirtualMachine'
+# Recorded on the mini 11-02: idle VMs sit at 0.2-7 % (summed), a CI job spikes to 90-100 % and idles within seconds.
+VM_WINDOW = 60.0  # seconds of samples averaged
+VM_MEAN = 10.0  # busy while the window's mean is at least this many % of one core
+VM_SPIKE = 50.0  # one sample this high is busy at once
+VM_HOLD = 120.0  # and stays busy this long after the last high reading: a bursty job must not reopen admission
 BETWEEN = re.compile(r'^between-|io\.between\.', re.IGNORECASE)
 BUSY = {'between': True, 'deedkit_ci': True}
 
@@ -75,12 +88,58 @@ def ci_busy(run: Callable[[list[str]], str], uid_of: Callable[[str], int]) -> bo
     return False
 
 
+class VmLoad:
+    """The CPU of Between's VMs over time. Keeps the samples of the last VM_WINDOW seconds and the time of the last
+    high reading; the state lives as long as the probe process (a restart starts empty and reads one sample)."""
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self.clock = clock
+        self.samples: list[tuple[float, float]] = []
+        self.last_high: float | None = None
+
+    def hold(self) -> None:
+        """Count this moment as a high reading. A probe that has just (re)started knows nothing of the minutes before;
+        launchd restarts it while a job may be running, so it starts busy and the hold is what lets it open."""
+        self.last_high = self.clock()
+
+    def update(self, cpu: float) -> bool:
+        now = self.clock()
+        self.samples = [(at, value) for at, value in self.samples if now - at <= VM_WINDOW] + [(now, cpu)]
+        mean = sum(value for _, value in self.samples) / len(self.samples)
+        if cpu >= VM_SPIKE or mean >= VM_MEAN:
+            self.last_high = now
+        return self.last_high is not None and now - self.last_high < VM_HOLD
+
+
+def vm_cpu(run: Callable[[list[str]], str], uid_of: Callable[[str], int]) -> float | None:
+    """Summed %cpu of the Virtualization processes of _betweenci, or None when that user does not exist."""
+    try:
+        uid = uid_of(BETWEEN_USER)
+    except KeyError:
+        return None
+    total = 0.0
+    for line in run(['/bin/ps', '-axo', 'uid=,pcpu=,comm=']).splitlines():
+        fields = line.split(None, 2)
+        if len(fields) == 3 and fields[0] == str(uid) and fields[2].endswith(VM_MARK):
+            value = float(fields[1])  # ValueError on garbage: observe() turns it into busy
+            if not math.isfinite(value) or value < 0:
+                raise ValueError('vm_cpu_unreadable')
+            total += value
+    return total
+
+
 def observe(run: Callable[[list[str]], str] = default_run, *, socket_exists: Callable[[str], bool] = os.path.exists,
-            uid_of: Callable[[str], int] = default_uid, docker: str | None = None) -> dict[str, bool]:
-    """Both flags, or both true when anything could not be observed. Never raises."""
+            uid_of: Callable[[str], int] = default_uid, docker: str | None = None,
+            between_ci: VmLoad | None = None) -> dict[str, bool]:
+    """Both flags, or both true when anything could not be observed. Never raises. `between_ci` carries the VM
+    readings from one call to the next; without one a call sees a single reading."""
     try:
         docker = docker or shutil.which('docker', path='/opt/homebrew/bin:/usr/local/bin:/usr/bin') or 'docker'
-        return {'between': between_busy(run, socket_exists, docker), 'deedkit_ci': ci_busy(run, uid_of)}
+        between = between_busy(run, socket_exists, docker)
+        cpu = vm_cpu(run, uid_of)
+        if cpu is not None:
+            between = (between_ci or VmLoad()).update(cpu) or between
+        return {'between': between, 'deedkit_ci': ci_busy(run, uid_of)}
     except Exception:  # noqa: BLE001 - every failure to observe is busy
         return dict(BUSY)
 
@@ -143,7 +202,9 @@ def main(argv: list[str] | None = None) -> int:
         state = observe_safely(lambda: observe(docker=args.docker))
         print(json.dumps(state))
         return 0 if not any(state.values()) else 1
-    loop(args.file, observe=lambda: observe(docker=args.docker), interval=args.interval)
+    vm_load = VmLoad()
+    vm_load.hold()
+    loop(args.file, observe=lambda: observe(docker=args.docker, between_ci=vm_load), interval=args.interval)
     return 0
 
 

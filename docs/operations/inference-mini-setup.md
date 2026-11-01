@@ -277,7 +277,9 @@ curl -sS --max-time 5 http://127.0.0.1:8090/health; echo'
 ```
 
 Expected: `busy.json` is `-rw-r----- <admin> _deedkitinf`, `ts` within a few seconds of now, `between`/`deedkit_ci`
-true only if Between or a test run is active; the service is `running` under `/usr/bin/sandbox-exec`, `ps -axo
+true only if Between or a test run is active (`between` also reads the CPU of the `_betweenci` colima VMs' Virtualization
+processes: Between's CI runs inside them, where no Docker context of the admin account sees it; busy while their summed
+%cpu averages 10 % over 60 s or spikes to 50 %, and for 120 s after the last such reading or after the probe's own start); the service is `running` under `/usr/bin/sandbox-exec`, `ps -axo
 user,nice,args` shows `_deedkitinf` with NI 10; `/health` answers `{"status": "ok", "queue": ..., "admission":
 "open"|"closed"}` (closed while Between is busy: that is the design). If the `logs/` files were created by launchd as
 root, `chown _deedkitinf` them and record it. Then the deploy script's own read-back, which also proves
