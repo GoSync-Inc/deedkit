@@ -393,6 +393,10 @@ class Scheduler:
             async with asyncio.timeout(job.spec.timeout_seconds):
                 if worker is None or not worker.alive():
                     self._discard_worker(engine, phase.name, worker)
+                    if self.admission.admitted_warm((job.alias, phase.name)):
+                        # Admitted on the memory of a warm worker that is gone now: a replacement is a cold start
+                        # and goes through admission as one, so the client asks again.
+                        raise self.closed("worker_lost")
                     launch = await self._prepare(engine, phase.name)
                     try:
                         worker = await Worker.spawn(launch.argv, launch.env, launch.scratch, (job.alias, phase.name),

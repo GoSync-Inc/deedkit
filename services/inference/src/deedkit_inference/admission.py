@@ -45,10 +45,24 @@ class Admission:
     def resident_total(self):
         return sum(item.gb for item in self.loaded.values())
 
+    def reconcile(self):
+        """Forget an idle persistent worker engine whose worker has died (a crash, a kill that did not come through
+        the scheduler): its memory is back and nothing is warm, so the next phase is charged as a cold start."""
+        for key, item in list(self.loaded.items()):
+            if item.running == 0 and item.persistent and getattr(item.engine, "worker", False):
+                worker = item.engine.workers.get(item.phase_name)
+                if worker is None or not worker.alive():
+                    del self.loaded[key]
+                    self.pending.pop(key, None)
+
     def warm(self, key):
         """The key's engine keeps a worker between jobs and has it loaded now (running or idle)."""
         item = self.loaded.get(key)
         return item is not None and item.persistent
+
+    def admitted_warm(self, key):
+        """The running phase was admitted on a warm worker's memory (it holds nothing back from others)."""
+        return self.pending.get(key) == 0.0
 
     def mark_running(self, key, gb, engine, phase_name):
         item = self.loaded.get(key)
@@ -116,6 +130,7 @@ class Admission:
 
     def check(self, key, resident_gb, slot, *, arrival=False, anything_running=False):
         """The verdict for one phase about to start (or, with `arrival`, for a job that just arrived)."""
+        self.reconcile()
         reason = self.busy_reason() or self.load_reason(slot)
         if reason:
             return Verdict("refuse", reason)

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import signal
 import stat
 import sys
 import threading
@@ -117,6 +118,50 @@ async def test_worker_retiring_during_a_probe_is_counted_once(env):
         release.set()
         sizes = await task
         assert [size for size, _ in sizes] == [1.0] and len(calls) == 1  # once, and the retiring pass did not probe it
+
+
+# spec: ANYM-682
+async def test_a_dead_idle_worker_is_charged_as_a_cold_start_not_as_warm(env):
+    """Sol r1 on the live-install fix: a warm worker's discount is for a worker that is loaded. One that died while
+    idle leaves the book, and the next phase needs its full memory plus the reserve."""
+    pidfile = env.tmp / "dead.pids"
+    key = ("vision-default", "vlm")
+    async with env.running(**engines(env)) as s:
+        assert (await s.chat(vis(pidfile=str(pidfile)))).status == 200
+        worker = pids(pidfile)[0]
+        assert s.service.admission.warm(key)
+        os.kill(worker, signal.SIGKILL)  # the idle worker dies without the scheduler's doing
+        assert await gone(worker)
+        s.probe.available = 4.0  # enough for the 3 GB reserve alone, not for 4.9 GB more
+        refused = await s.chat(vis())
+        assert refused.status == 503 and refused.headers["x-admission-reason"] == "memory_low"
+        assert key not in s.service.admission.loaded and s.service.admission.resident_total() == 0
+        s.probe.available = 9.0
+        assert (await s.chat(vis(pidfile=str(pidfile)))).status == 200  # a cold start, as usual
+        assert pids(pidfile)[0] != worker
+
+
+# spec: ANYM-682
+async def test_a_warm_worker_lost_between_the_grant_and_the_start_is_asked_for_again_cold(env):
+    pidfile = env.tmp / "lost.pids"
+    key = ("vision-default", "vlm")
+    async with env.running(**engines(env)) as s:
+        engine, admission = s.service.engines["vision-default"], s.service.admission
+        assert (await s.chat(vis(pidfile=str(pidfile)))).status == 200
+        worker = pids(pidfile)[0]
+        real = admission.mark_running
+
+        def grant_then_lose(*args):
+            real(*args)
+            engine.workers.pop("vlm").kill()  # the supervisor's kill, between the grant and the job's first step
+
+        admission.mark_running = grant_then_lose
+        reply = await s.chat(vis())
+        assert reply.status == 503 and reply.code == "admission_closed" and reply.headers["x-admission-reason"] == "worker_lost"
+        assert key not in admission.loaded and admission.pending == {}  # nothing is left reserved or warm
+        admission.mark_running = real
+        assert await gone(worker)
+        assert (await s.chat(vis(pidfile=str(pidfile)))).status == 200  # the retry is a normal cold start
 
 
 # spec: ANYM-683
