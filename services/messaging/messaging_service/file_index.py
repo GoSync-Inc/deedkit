@@ -22,6 +22,7 @@ from psycopg.types.json import Jsonb
 
 from .file_extract import (Extraction, MAX_INPUT_BYTES, MAX_TEXT_CHARS, PROCESSOR_VERSION, extract_original,
                           extraction_profile, valid_metadata)
+from .field_errors import cursor_refusal, date_range_refusal
 from .policy import scope_filter, targets
 from . import resource_admission
 from . import processing_events
@@ -241,7 +242,7 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
         raise APIError('invalid_filter')
     lower, upper = date_bound(from_time), date_bound(to_time)
     if lower and upper and lower >= upper:
-        raise APIError('invalid_date_range')
+        raise date_range_refusal()
     scope, args = scope_filter(p, 'm')
     clauses = [CURRENT, scope]
     filters = {'query': query, 'query_mode': query_mode, 'search_language': search_language,
@@ -358,11 +359,11 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
             if (set(position) != {'attachment_id', 'rank'} or not isinstance(position['attachment_id'], str)
                     or not 1 <= len(position['attachment_id']) <= 256 or '\x00' in position['attachment_id']
                     or type(position['rank']) is not int):
-                raise APIError('invalid_cursor')
+                raise cursor_refusal()
             anchor_id = position['attachment_id']
         else:
             if order == 'relevance' or len(after or before) > 256:
-                raise APIError('invalid_cursor')
+                raise cursor_refusal()
             anchor_id = after or before
         # Recompute and authorize the anchor; opaque cursor data never grants access.
         anchor = c.execute('WITH ' + ','.join(search_ctes) + ' SELECT a.id,m.id AS message_id,m.sent_at,' + rank + ' AS rank ' + search_join +
@@ -370,7 +371,7 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
         if not anchor:
             raise APIError('not_found', 404)
         if position is not None and position['rank'] != anchor['rank']:
-            raise APIError('invalid_cursor')
+            raise cursor_refusal()
         if order == 'relevance':
             clauses.append('(' + rank + ',m.sent_at,m.id,a.id)<(%s,%s,%s,%s)')
             args.extend([anchor['rank'], anchor['sent_at'], anchor['message_id'], anchor['id']])

@@ -11,6 +11,8 @@ from dataclasses import dataclass
 import hashlib
 import json
 
+from .field_errors import cursor_refusal
+
 LANGUAGES = ('simple', 'russian', 'english', 'indonesian')
 FUNCTIONS = {'all': 'plainto_tsquery', 'phrase': 'phraseto_tsquery', 'web': 'websearch_to_tsquery'}
 
@@ -29,9 +31,9 @@ def valid_text(value, maximum=256, *, empty=True):
 def position_text(value):
     """A text field inside a decoded cursor position: any defect is invalid_cursor."""
     if not isinstance(value, str) or not value or len(value)>256 or '\x00' in value:
-        invalid('invalid_cursor')
+        raise cursor_refusal()
     try: value.encode()
-    except UnicodeEncodeError: invalid('invalid_cursor')
+    except UnicodeEncodeError: raise cursor_refusal()
     return value
 
 
@@ -40,7 +42,7 @@ def position_date(value):
     from .store import APIError, date_bound
     position_text(value)
     try: return date_bound(value)
-    except (APIError, OverflowError): invalid('invalid_cursor')
+    except (APIError, OverflowError): raise cursor_refusal()
 
 
 def filter_values(values):
@@ -72,14 +74,14 @@ def decode_cursor(value, binding):
     """
     valid_text(value, 4096, empty=False)
     if not value.startswith('q1.'):
-        invalid('invalid_cursor')
+        raise cursor_refusal()
     try:
         body=json.loads(base64.b64decode(value[3:]+'='*(-len(value[3:])%4), altchars=b'-_', validate=True))
         if not isinstance(body,dict) or set(body)!= {'b','p'} or body['b']!=binding or not isinstance(body['p'],dict):
             raise ValueError
         return body['p']
     except (ValueError, TypeError, UnicodeError, RecursionError):
-        invalid('invalid_cursor')
+        raise cursor_refusal()
 
 
 @dataclass(frozen=True)

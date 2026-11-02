@@ -93,12 +93,22 @@ def subscription_blocks(result, visible):
     return result
 
 
+def refused(entry, hint=None):
+    """invalid_filter with the ANYM-295 field_errors (ANYM-660); names and allowed values are constants, never input."""
+    denied = Denied("invalid_filter", 400)
+    denied.detail = {"error": "invalid_filter", "field_errors": [entry], "next_action": "check_parameters",
+                     **({"hint": hint} if hint else {})}
+    return denied
+
+
 def capabilities_view(result, args):
     """`detail=full` is the payload unchanged; `sections` only those blocks; otherwise the summary."""
     sections = args.get("sections")
     if sections is not None:
-        if not sections or any(name not in SECTIONS for name in sections):
-            raise Denied("invalid_filter", 400)
+        if not sections:
+            raise refused({"field": "sections", "reason": "min_items"}, "omit sections to get all sections")
+        if any(name not in SECTIONS for name in sections):
+            raise refused({"field": "sections", "reason": "enum", "allowed": list(SECTIONS)})
         return {key: result[key] for name in SECTIONS if name in sections
                 for key in SECTIONS[name] if key in result}
     if args.get("detail", "summary") == "full":

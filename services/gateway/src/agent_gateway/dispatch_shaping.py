@@ -209,6 +209,15 @@ def carries(value, payload):
                for s in exposed(value))
 
 
+# ANYM-660: constants of the messaging backend's read refusals. A hint that equals one of these exactly cannot carry the
+# caller's payload, so it survives even when a query word happens to occur in it; any other hint is still checked.
+REVIEWED_HINTS = frozenset({
+    "omit sections to get all sections",
+    "omit my_roles for all roles",
+    "swap the bounds or widen the range; the range is half-open and must not be empty",
+})
+
+
 def relayed_error(detail, runnable, read_only, payload, candidate_payload=None):
     # candidate_payload(candidate): the payload that candidate is checked against (default: the whole payload).
     """A backend error as the gateway relays it (ANYM-544). Every `next` (top level and per candidate) must run as
@@ -216,7 +225,8 @@ def relayed_error(detail, runnable, read_only, payload, candidate_payload=None):
     file name outside an ID or reference field is dropped. `selection_required` keeps a mutating continuation on
     candidates only."""
     detail = dict(detail)
-    if "hint" in detail and (not isinstance(detail["hint"], str) or carries(detail["hint"], payload)):
+    if "hint" in detail and (not isinstance(detail["hint"], str)
+                             or detail["hint"] not in REVIEWED_HINTS and carries(detail["hint"], payload)):
         detail.pop("hint")
 
     def safe(value, payload=payload):

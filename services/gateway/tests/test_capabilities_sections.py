@@ -19,6 +19,24 @@ def call(client, arguments):
     return (json.loads(result["content"][0]["text"]) if result.get("isError") else result["structuredContent"]), bool(result.get("isError"))
 
 
+# spec: ANYM-660
+def test_gateway_capabilities_unknown_section_names_the_field_and_the_allowed_sections(tmp_path):
+    # The gateway serves messages_capabilities itself, so this is the layer that refuses an MCP agent's unknown section.
+    app, seen = capabilities(tmp_path, SUPPORTED)
+    with TestClient(app) as client:
+        names = call(client, {})[0]["sections"]
+        entry = {"field": "sections", "reason": "enum", "allowed": list(__import__("agent_gateway.sections", fromlist=["SECTIONS"]).SECTIONS)}
+        assert set(entry["allowed"]) >= set(names)
+        bad, error = call(client, {"sections": ["unknown"]})
+        assert error and bad["error"] == "invalid_filter" and bad["field_errors"] == [entry]
+        assert bad["next_action"] == "check_parameters" and "hint" not in bad
+        response = client.post("/v1/messages_capabilities", json={"sections": ["unknown"]}, headers=HEADERS)
+        assert response.status_code == 400 and response.json()["field_errors"] == [entry]
+        # An empty list is refused by the tool schema (minItems 1) before the view.
+        empty = client.post("/v1/messages_capabilities", json={"sections": []}, headers=HEADERS)
+        assert empty.status_code == 422 and empty.json()["error"] == "invalid_arguments"
+
+
 # spec: ANYM-270
 def test_gateway_capabilities_summary_sections_and_full(tmp_path):
     app, seen = capabilities(tmp_path, SUPPORTED)

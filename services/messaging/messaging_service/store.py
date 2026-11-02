@@ -23,6 +23,7 @@ from psycopg.errors import LockNotAvailable, QueryCanceled, TransactionTimeout
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from . import __version__  # noqa: F401  (still importable from here)
+from .field_errors import date_range_refusal
 from .policy import (  # noqa: F401  (key_admin reads these through this module)
                      DEFAULT_PERMISSIONS, OPERATION_PERMISSIONS, UNSET, audit,
                      key_id, lock_principal, normalize_policy, principal_id,
@@ -715,7 +716,7 @@ class Store:
             if chat_id:
                 from .chat_evidence import chat_statuses
                 lower,upper=date_bound(from_time),date_bound(to_time)
-                if lower and upper and lower>=upper:raise APIError('invalid_date_range')
+                if lower and upper and lower>=upper:raise date_range_refusal()
                 if not isinstance(chat_id,str) or len(chat_id)>256:raise APIError('invalid_filter')
                 data=chat_statuses(c,p,[chat_id],lower,upper,conflict_items=True)
                 if not data:raise APIError('not_found',404)

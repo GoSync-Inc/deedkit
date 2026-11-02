@@ -10,6 +10,7 @@ from telethon.extensions import BinaryReader
 from messaging_service.archive import Archive
 from messaging_service.chat_roles import derive,observation,valid
 from messaging_service.collector_state import CollectorState
+from messaging_service.store import APIError
 from messaging_service.envelope import stable_id
 from messaging_service.telegram_collector import TelethonProvider
 from test_archive import event
@@ -270,6 +271,30 @@ def test_list_chats_refuses_an_empty_role_filter(worker):
     discover(w.state,CATALOG)
     with pytest.raises(Exception,match='invalid_filter'):s.list_chats(key,my_roles=[])
     with pytest.raises(Exception,match='invalid_filter'):s.list_chats(key,my_roles=[],chat_types=['channel'],can_post=True)
+
+
+# spec: ANYM-660
+@pytest.mark.parametrize('arguments,errors,hint',[
+    ({'chat_types':['channel','nope']},[{'field':'chat_types','reason':'enum','allowed':['private','group','channel','unknown']}],None),
+    ({'my_roles':['owner']},[{'field':'my_roles','reason':'enum','allowed':['creator','admin','member','left','unknown']}],None),
+    ({'my_roles':[]},[{'field':'my_roles','reason':'min_items','allowed':['creator','admin','member','left','unknown']}],
+        'omit my_roles for all roles'),
+    ({'can_post':'yes'},[{'field':'can_post','reason':'type','expected':'boolean'}],None)])
+def test_list_chats_filter_refusals_name_the_field_and_the_allowed_values(worker,arguments,errors,hint):
+    w,s,key=worker
+    with pytest.raises(APIError,match='invalid_filter') as failure:s.list_chats(key,**arguments)
+    assert failure.value.field_errors==errors
+    assert getattr(failure.value,'hint',None)==hint
+
+
+# spec: ANYM-660
+def test_list_chats_names_every_bad_filter_in_one_response(worker):
+    w,s,key=worker
+    with pytest.raises(APIError,match='invalid_filter') as failure:s.list_chats(key,chat_types=['nope'],my_roles=[],can_post='yes')
+    assert [e['field'] for e in failure.value.field_errors]==['chat_types','my_roles','can_post']
+    assert failure.value.hint=='omit my_roles for all roles'
+    # An input value is never echoed back.
+    assert 'nope' not in str(failure.value.field_errors) and 'yes' not in str(failure.value.field_errors)
 
 
 # spec: ANYM-533

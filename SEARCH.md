@@ -38,7 +38,7 @@ normalized filter continues, for example dropping `exclude_channels: true` under
 conversation cursors are always bound, and those issued before this filter existed
 return `invalid_cursor` once: restart the search. Without named chats,
 `result_evidence` counts only chats of the searched types; an empty effective set is
-`empty_filter`.
+`empty_filter`, which names `empty_fields` and sets `next_action: fix_filter` (AGENT_API.md, Read refusals).
 `capabilities.search_options.search_channels_default` states the default.
 
 `query_mode`:

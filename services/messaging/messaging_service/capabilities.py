@@ -4,6 +4,7 @@ tests patch; this module reads them through the store module at call time."""
 from datetime import timezone
 
 from . import __version__
+from .field_errors import refusal
 from .policy import LEGACY_PERMISSIONS, OPERATION_PERMISSIONS
 
 
@@ -23,7 +24,10 @@ def capability_view(full, detail='full', sections=None, permitted=None):
     an account's operations only where `permitted` (the key may use them there) names them."""
     from .store import APIError
     if sections is not None:
-        if not sections or any(name not in CAPABILITY_SECTIONS for name in sections):raise APIError('invalid_filter')
+        if not sections:
+            raise refusal('invalid_filter',[('sections','min_items')],hint='omit sections to get all sections')
+        if any(name not in CAPABILITY_SECTIONS for name in sections):
+            raise refusal('invalid_filter',[('sections','enum',None,tuple(CAPABILITY_SECTIONS))])
         result={key:full[key] for name in CAPABILITY_SECTIONS if name in sections
                 for key in CAPABILITY_SECTIONS[name] if key in full}
         if 'messenger_operations' in result:
