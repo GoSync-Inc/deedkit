@@ -18,6 +18,12 @@
     },
     "note_hand.jpg": {
       "max_cer": 0.1
+    },
+    "receipt_large_worker.jpg": {
+      "max_cer": 0.02
+    },
+    "receipt_large_exif6_worker.jpg": {
+      "max_cer": 0.02
     }
   },
   "describe": {
@@ -38,6 +44,14 @@
       "max_wer": 0.06
     },
     "note_en": {
+      "truth": "voice_en.txt",
+      "max_wer": 0.1
+    },
+    "note_ru_opus": {
+      "truth": "voice_ru.txt",
+      "max_wer": 0.03
+    },
+    "note_en_opus": {
       "truth": "voice_en.txt",
       "max_wer": 0.1
     }

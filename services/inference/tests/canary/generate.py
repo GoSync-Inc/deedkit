@@ -74,6 +74,29 @@ img.save(out / 'note_hand.jpg', quality=50); hard['note_hand.jpg'] = '\n'.join(n
 s = Image.open(out / 'scan_ru.png'); s = s.resize((int(s.size[0] * 0.42), int(s.size[1] * 0.42)))
 s.save(out / 'scan_lowdpi.png'); hard['scan_lowdpi.png'] = truth['scan_ru.png']
 
+# ANYM-696: what the worker sends the mini. The same ffmpeg arguments as messaging_service.enrichment_providers
+# (OPUS_ARGS, IMAGE_EDGE, ORIENTATION_FILTERS; tests/test_enrichment.py checks the two stay equal), so the canary scores the
+# picture and the Opus the worker really produces, not a file posted directly.
+WORKER_OPUS = ['-c:a', 'libopus', '-b:a', '24k', '-application', 'voip', '-ac', '1', '-ar', '16000', '-threads', '1', '-f', 'ogg']
+WORKER_SCALE = 'scale=2048:2048:force_original_aspect_ratio=decrease'
+WORKER_UPRIGHT_FOR_ORIENTATION_6 = 'transpose=1'
+
+def worker_scale(src, dst, *first_filters):
+    subprocess.run(['ffmpeg', '-v', 'error', '-nostdin', '-y', '-noautorotate', '-i', str(src), '-map', '0:v:0', '-frames:v', '1',
+                    '-vf', ','.join([*first_filters, WORKER_SCALE]), '-map_metadata', '-1', '-c:v', 'mjpeg', '-q:v', '4',
+                    '-update', '1', '-f', 'image2', str(dst)], check=True, stdin=subprocess.DEVNULL)
+
+# 4000x3000 receipt photo (a 12 MP phone picture), upright, and the same stored sideways with EXIF orientation 6.
+random.seed(13)
+big = Image.new('RGB', (4000, 3000), (246, 243, 236)); d = ImageDraw.Draw(big); f = ImageFont.truetype(MONO, 100)
+for i, t in enumerate(lines): d.text((120, 120 + 190 * i), t, font=f, fill=(30, 30, 30))
+photoize(big, 0, 'receipt_large.jpg')
+upright = Image.open(out / 'receipt_large.jpg'); exif = Image.Exif(); exif[0x0112] = 6
+upright.rotate(90, expand=True).save(out / 'receipt_large_exif6.jpg', quality=70, exif=exif)
+worker_scale(out / 'receipt_large.jpg', out / 'receipt_large_worker.jpg')
+worker_scale(out / 'receipt_large_exif6.jpg', out / 'receipt_large_exif6_worker.jpg', WORKER_UPRIGHT_FOR_ORIENTATION_6)
+for name in ('receipt_large_worker.jpg', 'receipt_large_exif6_worker.jpg'): hard[name] = truth['receipt_ru.jpg']
+
 truth.update(hard)
 (out / 'truth.json').write_text(json.dumps(truth, ensure_ascii=False, indent=1))
 # The text-only document: the extracted text of the scan (the document kind sends text and no image).
@@ -96,4 +119,6 @@ run('ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(out / 'note_ru.ogg'), '
     '[0:a]aformat=sample_rates=16000[a];anoisesrc=color=pink:amplitude=0.02:seed=11:sample_rate=16000[n];[a][n]amix=inputs=2:duration=first:normalize=0',
     '-c:a', 'libopus', str(out / 'note_ru_noisy.ogg'))
 run('ffmpeg', '-nostdin', '-v', 'error', '-y', '-stream_loop', '16', '-i', str(out / 'note_ru.ogg'), '-c:a', 'libopus', str(out / 'note_ru_long.ogg'))
+for name in ('note_ru', 'note_en'):  # the worker's own Opus transcode of each note (ANYM-696)
+    run('ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(out / f'{name}.ogg'), '-map', '0:a:0', '-vn', *WORKER_OPUS, str(out / f'{name}_opus.ogg'))
 print('ok', sorted(p.name for p in out.iterdir()))
