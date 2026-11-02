@@ -375,13 +375,37 @@ system/com.deedkit.inference` (then `-busy`) and remove the plists, section 14.
 
 `ProcessType` of the service is `Standard`, not `Background`: Background put the engines on the efficiency cores with
 throttled I/O and made speech about 17 times slower on the mini (A/B 11-02, same requests: warm `note_ru` RTF 0.36 against
-0.021). Between's priority comes from `Nice` 10 and the admission gate, not from the QoS class; the busy probe stays
-`Background`. Changing an installed plist is a live step, in a quiet window after the busy check (`&&`-chained): back up
-the installed file (`sudo -n cp -p /Library/LaunchDaemons/com.deedkit.inference.plist "$D/plist.orig"`), render the new one
-(section 5), `sudo -n install -o root -g wheel -m 644 <new> /Library/LaunchDaemons/com.deedkit.inference.plist`, then
-`sudo -n launchctl bootout system/com.deedkit.inference` and `bootstrap` it again and read `ProcessType` back with
-`plutil -extract ProcessType raw`. Undo: install `plist.orig` the same way, `bootout`, `bootstrap`, `cmp` it with the
-backup.
+0.021). The busy probe stays `Background`. Between's and the test runs' priority does not come from the QoS class: the
+service runs at `Nice` 10 like the remote tests, and an executing phase is not suspended when they start; protection is
+admission (no new request or phase while `busy.json` says busy) and the length of a phase. The overlap measurement of
+11-02 is in the PR that made the change (ANYM-684).
+
+Changing an installed plist is a live step, in a quiet window, after the busy check and `&&`-chained to it. `swap` puts
+a plist in place and restarts the job: it waits (bounded) until the old job is gone, starts the new one and waits for
+`/health`; a job that is already unloaded is not an error. The same function is the undo.
+
+```bash
+MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
+ssh "$MINI" 'set -e; D=$(mktemp -d /tmp/deedkit-setup.XXXXXX); echo "stage $D" >> ~/deedkit-inference-setup.created
+PL=/Library/LaunchDaemons/com.deedkit.inference.plist; L=system/com.deedkit.inference
+sudo -n cp -p $PL $D/plist.orig && sudo -n chown "$(id -un)" $D/plist.orig; echo "backup in $D/plist.orig"
+swap() {  # $1 = the plist to install
+  sudo -n install -o root -g wheel -m 644 "$1" $PL
+  sudo -n launchctl bootout $L 2>/dev/null || true
+  for i in $(seq 1 100); do sudo -n launchctl print $L >/dev/null 2>&1 || break; sleep 3; done
+  ! sudo -n launchctl print $L >/dev/null 2>&1 || { echo "old job still loaded after 300 s: stop, inspect"; return 1; }
+  sudo -n launchctl bootstrap system $PL
+  for i in $(seq 1 30); do curl -sS --max-time 2 http://127.0.0.1:8090/health 2>/dev/null | grep -q "\"status\":\"ok\"" && break; sleep 2; done
+  curl -sS --max-time 2 http://127.0.0.1:8090/health | grep -q "\"status\":\"ok\"" || { echo "service did not come up"; return 1; }
+  sudo -n launchctl print $L | grep -E "state = running|pid = "
+}
+cp $D/plist.orig $D/plist.new && plutil -replace ProcessType -string Standard $D/plist.new   # or the rendered file of section 5
+swap $D/plist.new && plutil -extract ProcessType raw $PL && ps -axo user,nice,args | grep "[_]deedkitinf.*sandbox-exec" | cut -c1-60
+echo "UNDO: swap $D/plist.orig, then cmp it with $PL"'
+```
+
+Read-back: `ProcessType` `Standard`, the job `running` with a new `pid`, `/health` `ok`. Undo: the same `swap` with
+`plist.orig` (paste the function into a new `ssh`), then `sudo -n cmp <stage>/plist.orig /Library/LaunchDaemons/com.deedkit.inference.plist`.
 
 Rotation of logs: `newsyslog` rotates at 10 MB; launchd keeps its descriptor, so lines go to the rotated file until
 the next deploy restarts the service (the logs hold metadata only; a day of 2000 jobs is well under 1 MB).
