@@ -166,14 +166,16 @@ def _chat(c,p,account,chat_id):
     return row
 
 
-def _message(c,p,account,message_id,expected_revision,chat_id=None,field='expected_revision',*,revision_optional=False):
+def _message(c,p,account,message_id,expected_revision,chat_id=None,field='expected_revision',*,revision_optional=False,
+             allow_deleted=False):
     if not isinstance(message_id,str) or not 1<=len(message_id)<=256:
         raise APIError('not_found',404)
     # ANYM-681: a live read of the keyboard names no archive revision (0); a given one must still be current.
     unchecked=revision_optional and expected_revision==0 and type(expected_revision) is int
     if not unchecked and (type(expected_revision) is not int or expected_revision<1):
         raise _rejected((field,'type' if type(expected_revision) is not int else 'minimum',REVISION))
-    row=c.execute('SELECT * FROM messages WHERE id=%s AND account=%s AND NOT deleted',
+    # ANYM-666: get_message_info asks whether a message still exists, so an archive-deleted row is a valid target.
+    row=c.execute('SELECT * FROM messages WHERE id=%s AND account=%s'+('' if allow_deleted else ' AND NOT deleted'),
                   (message_id,account)).fetchone()
     if not row or (chat_id is not None and row['chat']!=chat_id) or not permitted(p,account,row['chat']):
         raise APIError('not_found',404)
@@ -264,7 +266,7 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
         payload['provider_chat']=chat['provider_chat'];refs.append(chat_id);provider_chats.append(chat['provider_chat'])
         if spec['target']=='message':
             message=_message(c,p,account,message_id,expected_revision,chat_id,
-                             revision_optional=operation==INSPECT_BUTTONS)
+                             revision_optional=operation==INSPECT_BUTTONS,allow_deleted=operation=='get_message_info')
             if operation in ('edit_message','delete_message') and message['direction']!='outgoing':
                 raise APIError('forbidden',403)
             payload['provider_message_id']=message['provider_id'];refs.append(message_id)
@@ -369,6 +371,34 @@ def manifest(c,p,account):
             'owner_approval_verified_by_server':False,'automatic_retry':False}
 
 
+VERIFY={'delete_message':{'operation':'get_message_info','requires':'read-live','decides':'exists:false means deleted'},
+    'send_reaction':{'operation':'get_reactions','requires':'read-live',
+        'decides':'a reaction with chosen:true was set by this account'}}
+
+
+def _verify(row,c=None):
+    """ANYM-666: what an agent reads when a delete or reaction stayed unknown (the receipt carries no secrets)."""
+    base=VERIFY.get(row['operation'])
+    if base is None or row['status']!='unknown':return None
+    platform=c.execute('SELECT platform FROM accounts WHERE id=%s',(row['account'],)).fetchone() if c is not None else None
+    if not platform or platform['platform']!='telegram':return None  # WhatsApp keeps its receipts as they are
+    answer=row['result']
+    data=answer.get('data') if isinstance(answer,dict) else None
+    evidence=data.get('evidence') if isinstance(data,dict) else None
+    evidence=evidence if isinstance(evidence,dict) else {}
+    wanted=((row.get('payload') or {}).get('parameters') or {}).get('emoji')
+    not_applied=evidence.get('message_present') is True if row['operation']=='delete_message' else (
+        evidence.get('basis')=='provider_read_back' and isinstance(evidence.get('reaction_present'),bool)
+        and evidence['reaction_present']==(not wanted))
+    if not_applied:
+        # The read-back answered: the request did not take effect. Another check will not change that.
+        return {'next_step':'new_request','decides':'The provider read after the request shows it has not taken effect. '
+            'Another check will not change this: a new request needs a new request ID and the owner\'s confirmation.'}
+    verify=dict(base)
+    if type(evidence.get('retry_after_s')) is int:verify['retry_after_s']=evidence['retry_after_s']
+    return verify
+
+
 def _public(row,c=None,p=None):
     answer=row['result']
     if row['operation']=='open_chat_by_phone' and isinstance(answer,dict) and isinstance(answer.get('data'),dict):
@@ -388,6 +418,7 @@ def _public(row,c=None,p=None):
         'finished_at':row['finished_at'],'error_code':row['error_code'],'result':answer,
         'request_id':row['request_id'],'preview_digest':row['preview_digest'],
         'owner_approval_verified_by_server':False,'automatic_retry':False,
+        **({'verify':verify} if (verify:=_verify(row,c)) else {}),
         'next_action':refusal['next_action'] if refusal else
             'get_messenger_operation' if row['status'] in ('queued','dispatching') else
             'verify_provider_state_before_any_new_action' if row['status']=='unknown' else 'none'})

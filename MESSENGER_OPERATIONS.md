@@ -126,6 +126,38 @@ with `operation_not_started`.
 `result.outcome` separately preserves `confirmed`, `submitted` or `unknown` provider
 evidence when it exists. Status is visible only within the originating key/principal's permitted scope.
 No automatic retry of ambiguous writes is provided by the SDK or command worker.
+
+### Telegram delete and reaction read-back (ANYM-666)
+
+After the one accepted request, `delete_message` and `send_reaction` on Telegram make one
+bounded read of the state they addressed (a scoped provider read inside the operation's
+own 30-second timeout) and settle from it:
+
+- Delete: the message is gone (`result.data`: `outcome: confirmed`, `basis: provider_read_back`,
+  `effect_verified: true`, `evidence.message_present: false`) and the receipt is `succeeded`
+  with no error code. Still there: `unknown`, `evidence.message_present: true`.
+- Reaction: `succeeded` when the response (`basis: provider_response`) or one
+  `GetMessagesReactionsRequest` read (`basis: provider_read_back`) shows the requested emoji
+  chosen by this account; for a removal (empty `emoji`), when none is chosen. A partial or
+  absent reaction update never confirms. A read-back that shows the reaction not set adds
+  `evidence.reaction_present`.
+- A read error, a timeout or a flood wait leaves exactly the previous result (`unknown`,
+  `operation_result_unknown`); a flood wait adds `evidence.retry_after_s`, and the scoped
+  read never pauses sends. Nothing is re-sent: one mutating request per command.
+
+`succeeded` means the message is gone or the reaction is in the stated state, not that this
+request caused it (the owner may have acted by hand first). Receipts settled before this
+release are not reconciled.
+
+An `unknown` delete or reaction carries `verify`: `{operation, requires, decides}` names the
+read that settles it (`get_message_info` with `read-live`: `exists:false` on the same
+`message_id` means deleted, also when the archive already marks it deleted; `get_reactions`
+with `read-live`: `chosen: true` marks this account's reaction), and `retry_after_s` when a
+flood wait stopped the read-back. When the read-back showed the request had no effect,
+`verify` is `{next_step: "new_request", decides}`: a new request needs a new request ID and
+the owner's confirmation, and another check will not change the answer. A key may delete or
+react without holding `read-live`; the owner's opt-in for the read operation applies too.
+
 Native WhatsApp operations and sends write each provider frame once (no resend
 after a reconnect) and answer within 20 s, `send_file` within 75 s; a late
 change or send ends `unknown` (docs/whatsapp-native.md).
