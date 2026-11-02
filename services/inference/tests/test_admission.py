@@ -363,18 +363,32 @@ async def test_the_admission_floor_fails_closed_when_memory_cannot_be_read(env):
 
 
 # spec: ANYM-682
-async def test_the_floor_counts_the_engines_this_service_holds_as_free(env):
-    # A warm worker's memory is in use and out of the free figure; the live service showed 6.7 GB median with the
-    # 3.7 GB vision worker loaded. The floor reads what Between would see without us: free plus our loaded engines.
-    warm = {"vision-default": {"engine_options": {"persistent": True}, "phases": [{"name": "vlm", "slot": "gpu", "resident_gb": 3.7}]}}
+async def test_the_floor_credits_what_the_engines_measure_not_what_is_configured(env):
+    # A warm worker's memory is in use and out of the free figure (the live service showed 6.7 GB median with the vision
+    # worker loaded). The floor reads what Between would see without us: free memory plus what the supervisor measured
+    # of our workers. The configured resident_gb has headroom in it (4.5 charged for a worker that holds 3.84), and a
+    # reservation that nothing measured has allocated nothing: neither is credited.
+    warm = {"vision-default": {"engine_options": {"persistent": True}, "phases": [{"name": "vlm", "slot": "gpu", "resident_gb": 4.5}]}}
     async with env.running(aliases=warm, **FLOOR) as s:
+        admission, key = s.service.admission, ("vision-default", "vlm")
         assert (await s.chat(job("first"))).status == 200
-        assert list(s.service.admission.loaded) == [("vision-default", "vlm")]  # idle, still in the book
-        s.probe.available = 3.4  # 3.4 + 3.7 = 7.1: the per-phase rule (reserve 3.0) and the floor both pass
+        assert list(admission.loaded) == [key] and admission.resident_total() == 4.5  # idle, still in the book
+        await s.until(lambda: key in admission.measured)  # the supervisor ticked: the fake probe measures 0.0
+        s.probe.available = 6.9  # the configured 4.5 would credit it up to 11.4: nothing measured, nothing credited
+        reply = await s.chat(job("unmeasured"))
+        assert reply.status == 503 and reply.headers["x-admission-reason"] == "memory_low"
+        s.probe.rss_fn = lambda pgid: 3.84  # the worker really holds 3.84 GB
+        await s.until(lambda: admission.credit() == 3.84)
+        s.probe.available = 3.2  # 3.2 + 3.84 = 7.04: the floor and the per-phase reserve (3.0) both pass
         assert (await s.chat(job("warm_again"))).status == 200
-        s.probe.available = 3.2  # 3.2 + 3.7 = 6.9, and the reserve alone is met: only the floor refuses
+        s.probe.available = 3.1  # 3.1 + 3.84 = 6.94 (4.5 configured would have said 7.6): only the floor refuses
         reply = await s.chat(job("too_low"))
         assert reply.status == 503 and reply.headers["x-admission-reason"] == "memory_low"
+        s.probe.rss_fn = lambda pgid: 6.0  # a measurement above the configured figure is not credited above it (and is within the supervisor's share limit)
+        await s.until(lambda: admission.measured.get(key) == 6.0)
+        assert admission.credit() == 4.5
+        admission.drop(key)  # a dropped engine leaves the book and the credit with it
+        assert admission.credit() == 0.0 and key not in admission.measured
 
 
 # spec: ANYM-682

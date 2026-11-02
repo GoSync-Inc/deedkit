@@ -723,24 +723,33 @@ active. The first rule (a 60 s mean of 0.1 core, one sample of 0.5 core) kept mo
 | Between busy: one sample | `--vm-spike-cores` | 4.0 | `0.5` |
 | Hold after the last high reading (and after a probe start) | `--vm-hold-seconds` | 120 (unchanged) | |
 | `deedkit_ci` and a Between container | the probe | unchanged: still busy | |
-| Admission floor: free memory + the memory of the engines this service holds loaded, at admit and at the start of every phase | `admit_min_available_gb` in `config.json` (default 7.0 in the code) | 7.0; unreadable memory = 0 = refused, reason `memory_low` | `0` (off) |
+| Admission floor: free memory + what the supervisor measured of the engines this service holds loaded, at admit and at the start of every phase | `admit_min_available_gb` in `config.json` (default 7.0 in the code) | 7.0; unreadable memory = 0 = refused, reason `memory_low` | `0` (off) |
 
 The memory supervisor's kill is unchanged. With the yielder off (it ships off, section 13c) a job that is running when Between starts
 is not stopped: it runs on at Nice 20 and Standard QoS (section 5). Watch the duty and impact logs (13, 13b): `avail_gb` minimum,
 the overlap minutes and Between's VM p90 during the overlap.
 
-**Install (busy check `&&`-chained, the orchestrator's go first):** render on the checkout, stage as in section 5, then
-`sudo -n install -o root -g wheel -m 0755 busy_probe.py /usr/local/libexec/deedkit-busy-probe` BEFORE the plist (an old probe
-refuses the new arguments and the job would crash-loop, which reads as busy), then
-`sudo -n install -o root -g wheel -m 0644 com.deedkit.inference-busy.plist /Library/LaunchDaemons/`,
-`sudo -n launchctl bootout system/com.deedkit.inference-busy; sudo -n launchctl bootstrap system /Library/LaunchDaemons/com.deedkit.inference-busy.plist`.
-The probe starts busy and opens 120 s later. Read-back: `plutil -p /Library/LaunchDaemons/com.deedkit.inference-busy.plist` shows the three
-`--vm-*` arguments, `cat /Users/Shared/deedkit-inference/busy.json` is fresh, `python3 -I - --once < busy_probe.py` runs. The floor needs
-the release with `admit_min_available_gb` (a normal deploy, section 8); until then the old service ignores the new rule's memory side and
-keeps its per-phase memory rules.
-**Undo:** write the old values into the plist and reload the job as above (the probe file keeps its defaults, the plist wins); for the
-floor put `"admit_min_available_gb": 0` into `/Users/_deedkitinf/config.json` (root-installed, restart after the drain). Take the key out of
-`config.json` again before rolling back to a release older than this change (a strict config refuses an unknown key).
+The floor counts the engines this service holds loaded as free **by what the supervisor measured of them** (the resident size of each warm worker's
+process group, every 2 s, never more than the configured `resident_gb`, which has headroom in it): taken literally, a warm 3.8 GB vision worker
+keeps the free figure near 6.7 GB (impact log 11-02, phase 1 samples) and every second request on a warm engine would be refused. A reservation
+nobody measured (a cold start that has not allocated, a one-shot child) is credited nothing. Orchestrator 11-02: this reading is the intended one.
+
+**Install, in this order (busy check `&&`-chained, the orchestrator's go first).** The relaxed probe is only safe where the floor exists: a service
+without it (5d4191bd) would admit a cold 1.6 GB phase on 4.6 GB free while Between is light.
+1. Deploy the release that has `admit_min_available_gb` (section 8). Read-back: `/v1/models` says the SHA, and the start-up line
+   `grep 'admission: floor=' /Users/_deedkitinf/logs/*` shows `floor=7.0 GB`.
+2. Only then relax the probe. Render on the checkout and stage as in section 5, then
+   `sudo -n install -o root -g wheel -m 0755 busy_probe.py /usr/local/libexec/deedkit-busy-probe` BEFORE the plist (an old probe
+   refuses the new arguments and the job would crash-loop, which reads as busy), then
+   `sudo -n install -o root -g wheel -m 0644 com.deedkit.inference-busy.plist /Library/LaunchDaemons/`,
+   `sudo -n launchctl bootout system/com.deedkit.inference-busy; sudo -n launchctl bootstrap system /Library/LaunchDaemons/com.deedkit.inference-busy.plist`.
+   The probe starts busy and opens 120 s later. Read-back: `plutil -p /Library/LaunchDaemons/com.deedkit.inference-busy.plist` shows the three
+   `--vm-*` arguments, `cat /Users/Shared/deedkit-inference/busy.json` is fresh, `python3 -I - --once < busy_probe.py` runs.
+
+**Undo (reverse order):** first write the old values (`0.1`, `0.5`) into the plist and reload the job as in step 2, so the strict rule is back;
+then, if wanted, the floor: put `"admit_min_available_gb": 0` into `/Users/_deedkitinf/config.json` (root-installed, restart after the drain). Take
+that key out of `config.json` again, and restore the strict thresholds, before rolling back to a release older than this change (a strict config
+refuses an unknown key; a floorless release must never run beside the relaxed probe).
 
 ## 14. Undo of the whole setup
 

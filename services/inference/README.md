@@ -66,7 +66,7 @@ Not secret, but it must be a regular file that is not writable by group or other
 | `retry_after_seconds` | 30 | `Retry-After` of 503 answers that have no better figure |
 | `resident_cap_gb`, `resident_hard_cap_gb` | 6.0, 7.5 | admission cap and supervisor kill line |
 | `min_free_gb` | 3.0 | headroom above a phase's `resident_gb` (the remote-test `MIN_FREE_MEM_GB`) |
-| `admit_min_available_gb` | 7.0 | the admission floor (ANYM-682/684): free memory plus the engines this service holds loaded must reach it at admit and at each phase start; 0 = off (runbook 13d) |
+| `admit_min_available_gb` | 7.0 | the admission floor (ANYM-682/684): free memory plus what the supervisor measured of the engines this service holds loaded must reach it at admit and at each phase start; 0 = off (runbook 13d) |
 | `max_load_1m`, `slot_max_load_1m` | 8, `{}` | 1-minute load cap; per-slot override, e.g. `{"gpu": 6}` |
 | `keep_alive_seconds` | 300 | an idle loaded engine is unloaded after this (only an engine with `"engine_options": {"persistent": true}` stays loaded when idle; any other one-shot child exits with its phase and leaves the resident book at once; the real engines keep a warm worker, so they stay loaded until this time passes) |
 | `max_inflight_upload_bytes` | 134217728 | pool of declared `Content-Length` of uploads in flight |
@@ -168,7 +168,7 @@ A job is checked when it arrives and again when it leaves the queue to start a p
 | `busy_between`, `busy_deedkit_ci` | the busy file says Between or a DeedKit remote test is running |
 | `busy_file_missing`, `busy_file_invalid`, `busy_file_stale` | the busy file is missing, unparseable, or older than 30 s (fail closed) |
 | `load_high` | the 1-minute load average is above `max_load_1m` (or the slot's override) |
-| `memory_low` | free plus inactive plus speculative memory (`vm_stat`, as `scripts/remote-test.sh` counts it) is below the phase's `resident_gb` plus `min_free_gb`, or below `admit_min_available_gb` (7 GB shipped, ANYM-682/684; the memory of the engines this service holds loaded counts as free for that floor; unreadable memory is zero and refuses; 0 turns the floor off); every phase is charged in full, also one of a warm worker. A running phase's full `resident_gb` is held back from the figure the next phase sees until that phase ends (a drop of the free memory is not taken as that phase's allocation: the probe cannot tell whose it is); a phase that has to wait for it waits in the queue |
+| `memory_low` | free plus inactive plus speculative memory (`vm_stat`, as `scripts/remote-test.sh` counts it) is below the phase's `resident_gb` plus `min_free_gb`, or below `admit_min_available_gb` (7 GB shipped, ANYM-682/684; what the supervisor measured of the engines this service holds loaded counts as free for that floor (never above their configured `resident_gb`; unmeasured reservations count for nothing); unreadable memory is zero and refuses; 0 turns the floor off); every phase is charged in full, also one of a warm worker. A running phase's full `resident_gb` is held back from the figure the next phase sees until that phase ends (a drop of the free memory is not taken as that phase's allocation: the probe cannot tell whose it is); a phase that has to wait for it waits in the queue |
 | `resident_cap` | the phase alone does not fit `resident_cap_gb` |
 
 Resident accounting (`resident_cap_gb`, idle loaded engines count): when the only blocker is an idle loaded

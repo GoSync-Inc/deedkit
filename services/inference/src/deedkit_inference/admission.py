@@ -39,6 +39,7 @@ class Admission:
         self.config, self.probe, self.wall, self.monotonic = config, probe, wall, monotonic
         self.loaded = {}
         self.pending = {}  # key -> resident_gb of a running phase, held back from the free memory others see
+        self.measured = {}  # key -> the last measured resident size of a warm worker (the supervisor's tick), for the floor
         self.settle_until = 0.0
 
     # --- resident book ---------------------------------------------------------------------------------
@@ -54,6 +55,7 @@ class Admission:
                 if worker is None or not worker.alive():
                     del self.loaded[key]
                     self.pending.pop(key, None)
+                    self.measured.pop(key, None)
 
     def warm(self, key):
         """The key's engine keeps a worker between jobs and has it loaded now (running or idle)."""
@@ -71,6 +73,17 @@ class Admission:
         item.running += 1
         item.last_used = self.monotonic()
 
+    def note_resident(self, key, gb):
+        """The supervisor's latest measurement of a worker's resident size: the only memory the floor credits."""
+        if key in self.loaded:
+            self.measured[key] = gb
+
+    def credit(self):
+        """What the engines this service holds really occupy: measured, never above the configured figure (which has
+        headroom in it, aliases.py), and nothing for a reservation that has not been measured (a cold start that has not
+        allocated, a one-shot child)."""
+        return sum(min(self.measured.get(key, 0.0), item.gb) for key, item in self.loaded.items())
+
     def mark_idle(self, key):
         self.pending.pop(key, None)
         item = self.loaded.get(key)
@@ -80,10 +93,12 @@ class Admission:
         item.last_used = self.monotonic()
         if item.running == 0 and not item.persistent:
             del self.loaded[key]
+            self.measured.pop(key, None)
 
     def evict(self, keys):
         for key in keys:
             self.pending.pop(key, None)
+            self.measured.pop(key, None)
             item = self.loaded.pop(key, None)
             if item is not None and item.engine is not None and item.persistent:
                 item.engine.unload(item.phase_name)
@@ -93,6 +108,7 @@ class Admission:
     def drop(self, key):
         """A dead child (crash, timeout, kill, cancel): its memory is back at once, nothing to wait for."""
         self.pending.pop(key, None)
+        self.measured.pop(key, None)
         item = self.loaded.pop(key, None)
         if item is not None and item.engine is not None and item.persistent:
             item.engine.unload(item.phase_name)
@@ -126,13 +142,14 @@ class Admission:
 
     def floor_open(self, visible=None):
         """The admission floor (`admit_min_available_gb`): the memory a job leaves Between and the tests, counting the
-        engines this service holds loaded as free (they are ours to give back: a warm 3.7 GB worker would otherwise keep
-        the figure under the floor for ever). Zero from the probe is "unreadable" and never opens."""
+        engines this service holds loaded as free by what the supervisor measured of them (they are ours to give back: a
+        warm 3.8 GB worker would otherwise keep the figure under the floor for ever). Zero from the probe is "unreadable"
+        and never opens."""
         floor = self.config.admit_min_available_gb
         if floor <= 0:
             return True
         visible = self.probe.available_gb() if visible is None else visible
-        return visible > 0 and visible + self.resident_total() >= floor
+        return visible > 0 and visible + self.credit() >= floor
 
     def floor_verdict(self, visible):
         if self.floor_open(visible):
