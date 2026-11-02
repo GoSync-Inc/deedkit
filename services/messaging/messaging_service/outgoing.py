@@ -417,7 +417,7 @@ def _outbound_block(row):
         parts.append('Nothing was sent: '+('every queued send will expire before the cooldown ends; ask for a new action with the '
             'owner\'s approval after the cooldown.' if block['cooldown_remaining_s']>last else
             'the oldest queued send will expire before the cooldown ends and later ones may still go out; check each with '
-            'get_send_status before replacing any.'))
+            'get_send_status, and for each that expires ask for a new action with the owner\'s approval.'))
     elif queued:
         parts.append('Queued sends are waiting; if one expires (send.failed or status expired), a new action with the '
             'owner\'s approval is needed.')

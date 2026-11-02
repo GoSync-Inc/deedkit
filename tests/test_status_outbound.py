@@ -290,6 +290,7 @@ def test_staggered_expiries_qualify_the_cooldown_advice_to_the_affected_sends(ou
     assert block['sender'] == 'cooling_down' and block['expires_in_s'] <= 30 and block['cooldown_remaining_s'] > 30
     assert 'oldest queued send will expire' in block['next_action'] and 'later ones may still go out' in block['next_action']
     assert 'get_send_status' in block['next_action'] and 'every queued send' not in block['next_action']
+    assert "new action with the owner's approval" in block['next_action']
 
 
 # spec: ANYM-671
