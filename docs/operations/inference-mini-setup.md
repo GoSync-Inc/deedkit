@@ -380,32 +380,31 @@ service runs at `Nice` 10 like the remote tests, and an executing phase is not s
 admission (no new request or phase while `busy.json` says busy) and the length of a phase. The overlap measurement of
 11-02 is in the PR that made the change (ANYM-684).
 
-Changing an installed plist is a live step, in a quiet window, after the busy check and `&&`-chained to it. `swap` puts
-a plist in place and restarts the job: it waits (bounded) until the old job is gone, starts the new one and waits for
-`/health`; a job that is already unloaded is not an error. The same function is the undo.
+Changing an installed plist is a live step, in a quiet window, after the busy check and `&&`-chained to it. It rides on a
+deploy, because `scripts/inference_deploy.py` is the reviewed tool that already does what a restart needs: it closes
+admission and waits for the drain up to the service's own limit (`drain_seconds` 900, `ExitTimeOut` 960; it refuses to kill
+without `--force`), unloads the job, switches `current`, runs `launchctl bootstrap` and `kickstart` from the plist on disk,
+and reads back `/health` and `/v1/models`, whose `release` must equal the deployed SHA. launchd does not re-read an installed
+plist while the job is loaded, so the file can be replaced first and takes effect at that deploy.
 
 ```bash
 MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
-ssh "$MINI" 'set -e; D=$(mktemp -d /tmp/deedkit-setup.XXXXXX); echo "stage $D" >> ~/deedkit-inference-setup.created
-PL=/Library/LaunchDaemons/com.deedkit.inference.plist; L=system/com.deedkit.inference
-sudo -n cp -p $PL $D/plist.orig && sudo -n chown "$(id -un)" $D/plist.orig; echo "backup in $D/plist.orig"
-swap() {  # $1 = the plist to install
-  sudo -n install -o root -g wheel -m 644 "$1" $PL
-  sudo -n launchctl bootout $L 2>/dev/null || true
-  for i in $(seq 1 100); do sudo -n launchctl print $L >/dev/null 2>&1 || break; sleep 3; done
-  ! sudo -n launchctl print $L >/dev/null 2>&1 || { echo "old job still loaded after 300 s: stop, inspect"; return 1; }
-  sudo -n launchctl bootstrap system $PL
-  for i in $(seq 1 30); do curl -sS --max-time 2 http://127.0.0.1:8090/health 2>/dev/null | grep -q "\"status\":\"ok\"" && break; sleep 2; done
-  curl -sS --max-time 2 http://127.0.0.1:8090/health | grep -q "\"status\":\"ok\"" || { echo "service did not come up"; return 1; }
-  sudo -n launchctl print $L | grep -E "state = running|pid = "
-}
-cp $D/plist.orig $D/plist.new && plutil -replace ProcessType -string Standard $D/plist.new   # or the rendered file of section 5
-swap $D/plist.new && plutil -extract ProcessType raw $PL && ps -axo user,nice,args | grep "[_]deedkitinf.*sandbox-exec" | cut -c1-60
-echo "UNDO: swap $D/plist.orig, then cmp it with $PL"'
+D="$(ssh "$MINI" 'D=$(mktemp -d /tmp/deedkit-setup.XXXXXX) && echo "stage $D" >> ~/deedkit-inference-setup.created && echo $D')" || exit 1
+PL=/Library/LaunchDaemons/com.deedkit.inference.plist
+ssh "$MINI" "set -e; sudo -n cp -p $PL $D/plist.orig; sudo -n chown \$(id -un) $D/plist.orig; cp $D/plist.orig $D/plist.new
+plutil -replace ProcessType -string Standard $D/plist.new   # or the rendered file of section 5
+sudo -n install -o root -g wheel -m 644 $D/plist.new $PL; plutil -extract ProcessType raw $PL; echo 'installed; backup: $D/plist.orig'"
+# the new plist takes effect at the deploy; its read-back (release == SHA) is the check that the job came back
+python3 scripts/inference_deploy.py "$SHA" || echo "deploy failed: the job may be unloaded, see below"
 ```
 
-Read-back: `ProcessType` `Standard`, the job `running` with a new `pid`, `/health` `ok`. Undo: the same `swap` with
-`plist.orig` (paste the function into a new `ssh`), then `sudo -n cmp <stage>/plist.orig /Library/LaunchDaemons/com.deedkit.inference.plist`.
+Read-back after the deploy: `ssh "$MINI" 'ps -axo user,nice,args | grep "[_]deedkitinf.*sandbox-exec"'` shows the new process (NI 10) and
+`sudo -n launchctl print system/com.deedkit.inference | grep -E "state|pid"` says `running` under a pid different from before. Undo:
+`ssh "$MINI" "sudo -n install -o root -g wheel -m 644 $D/plist.orig $PL && sudo -n cmp $D/plist.orig $PL"`, then the same deploy
+(`inference_deploy.py "$SHA"` again: a release already on the mini is only drained, re-pointed and restarted) so the job is loaded
+from the restored file. If a deploy fails midway the script says which command repairs it and, by design, a failed read-back
+leaves the job unloaded rather than serving the wrong release: `sudo -n launchctl bootstrap system $PL` and `kickstart` it, then
+read `/health`.
 
 Rotation of logs: `newsyslog` rotates at 10 MB; launchd keeps its descriptor, so lines go to the rotated file until
 the next deploy restarts the service (the logs hold metadata only; a day of 2000 jobs is well under 1 MB).
