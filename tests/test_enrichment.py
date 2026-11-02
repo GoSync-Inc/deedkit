@@ -537,12 +537,13 @@ def test_segments_have_aggregate_bound_and_audio_provenance_survives_validation(
     with pytest.raises(ModelError):normalize_result({'metadata':{'duration_seconds':float('inf')}},audio=True)
 
 
-def fake_audio_tools(monkeypatch,*,duration=12,converted_duration=None,output_size=32,codec=None,container=None):
+def fake_audio_tools(monkeypatch,*,duration=12,converted_duration=None,output_size=32,codec=None,container=None,timeouts=None):
     import subprocess
     import messaging_service.enrichment_providers as providers
     calls=[]
     def run(command,**kwargs):
         calls.append(command)
+        if timeouts is not None and command[0]=='ffmpeg':timeouts.append(kwargs.get('timeout'))
         if command[0]=='ffprobe' and 'v:0' in command:  # a picture (ANYM-696): a tiny still, nothing to convert
             kwargs['stdout'].write(json.dumps({'streams':[{'codec_name':'png','width':1,'height':1}],'format':{'format_name':'png_pipe'}}).encode())
         elif command[0]=='ffprobe':
@@ -696,6 +697,91 @@ def test_the_opus_transcode_keeps_the_duration_and_size_checks(tmp_path,monkeypa
     fake_audio_tools(monkeypatch,duration=100,codec='mp3',container='mp3',output_size=1001)
     with pytest.raises(ModelError,match='audio_transcode_size_limit'):
         infer(small,'audio',data,'audio/mpeg',transport=httpx.MockTransport(lambda _:(_ for _ in ()).throw(AssertionError())))
+
+
+def refuse_request(_):
+    raise AssertionError('No request is allowed')
+
+
+# spec: ANYM-697
+def test_an_audio_profile_keeps_originals_up_to_200_mib_and_other_kinds_stay_at_32(tmp_path):
+    for kind,limit,accepted in [('audio',200*1024**2,True),('audio',200*1024**2+1,False),
+            ('image',32*1024**2,True),('image',32*1024**2+1,False),('document',33*1024**2,False)]:
+        if accepted:assert mini(tmp_path,kind,max_input_bytes=limit)['max_input_bytes']==limit
+        else:
+            with pytest.raises(ValueError,match='invalid_model_limit'):mini(tmp_path,kind,max_input_bytes=limit)
+    assert mini(tmp_path,'audio')['max_input_bytes']==20*1024**2
+
+
+# spec: ANYM-697
+def test_a_46_mib_mp3_reaches_the_mini_as_small_opus_when_the_original_cap_is_200_mib(tmp_path,monkeypatch):
+    p=mini(tmp_path,'audio',max_input_bytes=200*1024**2,max_audio_seconds=14400,timeout_seconds=900)
+    calls=fake_audio_tools(monkeypatch,duration=3000,codec='mp3',container='mp3',output_size=9000000)
+    result,seen=run_mini(tmp_path,'audio',p,mime='audio/mpeg',data=bytes(46*1024**2))
+    assert len(seen)==1 and [c[0] for c in calls].count('ffmpeg')==1
+    file=multipart_parts(seen[0])[1]
+    assert len(file['bytes'])==9000000 and file['filename']=='recording.ogg' and file['content_type']=='audio/ogg'
+    meta=result['metadata']
+    assert meta['transcoded'] is True and meta['transcode_format']=='opus' and meta['duration_seconds']==3000
+
+
+# spec: ANYM-697
+def test_a_source_over_the_upload_cap_is_transcoded_or_refused_never_sent_as_it_is(tmp_path,monkeypatch):
+    import messaging_service.enrichment_providers as providers
+    monkeypatch.setattr(providers,'UPLOAD_LIMIT_BYTES',300000)
+    p=mini(tmp_path,'audio',max_input_bytes=200*1024**2)
+    # 40 kbps Opus in ogg and 32 kbps mp3 over 100 s would go unchanged; over the cap they become Opus.
+    for codec,container,mime,size in [('opus','ogg','audio/ogg',500000),('mp3','mp3','audio/mpeg',400000)]:
+        calls=fake_audio_tools(monkeypatch,duration=100,codec=codec,container=container,output_size=1000)
+        result,seen=run_mini(tmp_path,'audio',p,mime=mime,data=bytes(size))
+        assert [c[0] for c in calls].count('ffmpeg')==1 and len(seen)==1,(codec,size)
+        file=multipart_parts(seen[0])[1]
+        assert len(file['bytes'])==1000 and file['filename']=='recording.ogg'
+        assert result['metadata']['transcode_format']=='opus'
+    # An Opus form over the cap is refused with nothing sent; so is a source of another provider.
+    original=tmp_path/'original';original.write_bytes(bytes(400000))
+    fake_audio_tools(monkeypatch,duration=100,codec='mp3',container='mp3',output_size=300001)
+    with pytest.raises(ModelError,match='audio_transcode_size_limit'):
+        infer(p,'audio',original,'audio/mpeg',transport=httpx.MockTransport(refuse_request))
+    key=tmp_path/'mini-key'
+    compat=validate_profile({'provider':'openai_compatible','model':'whisper','allow_cloud':True,'api_key_file':str(key),
+        'base_url':'https://llm.example/v1'},'audio')
+    fake_audio_tools(monkeypatch,duration=100)
+    with pytest.raises(ModelError,match='original_size_limit'):
+        infer(compat,'audio',original,'audio/mpeg',transport=httpx.MockTransport(refuse_request))
+
+
+# spec: ANYM-697
+def test_the_transcode_timeout_grows_with_the_duration_inside_the_profile_budget(tmp_path,monkeypatch):
+    import subprocess
+    import messaging_service.enrichment_providers as providers
+    monkeypatch.setattr(providers,'UPLOAD_LIMIT_BYTES',1000)  # every source here is over the cap: always transcoded
+    for budget,duration,expected in [(900,60,120),(900,3000,210),(900,3600,240),(900,14400,780),(300,14400,300),(60,60,60)]:
+        p=mini(tmp_path,'audio',timeout_seconds=budget,max_audio_seconds=14400)
+        timeouts=[];fake_audio_tools(monkeypatch,duration=duration,codec='mp3',container='mp3',output_size=100,timeouts=timeouts)
+        run_mini(tmp_path,'audio',p,mime='audio/mpeg',data=bytes(2000))
+        assert timeouts==[expected],(budget,duration)
+    inner=providers.subprocess.run
+    def expire(command,**kwargs):
+        if command[0]=='ffmpeg':raise subprocess.TimeoutExpired(command,kwargs.get('timeout'))
+        return inner(command,**kwargs)
+    monkeypatch.setattr(providers.subprocess,'run',expire)
+    with pytest.raises(ModelError,match='audio_processing_timeout'):
+        run_mini(tmp_path,'audio',mini(tmp_path,'audio'),mime='audio/mpeg',data=bytes(2000),reply=refuse_request)
+
+
+# spec: ANYM-697
+def test_a_copy_that_does_not_fit_the_worker_disk_fails_that_job_with_the_generic_code(seeded,tmp_path):
+    import errno
+    s,_,_=seeded;add_audio(s)
+    def disk_full(*_):raise OSError(errno.ENOSPC,'No space left on device')
+    cfg={'accounts':['telegram-demo'],'max_jobs_per_day':20,'profiles':{'audio':profile(tmp_path,kind='audio')}}
+    w=EnrichmentWorker(s.pool.conninfo,s.files,cfg,processor=disk_full)
+    with s.pool.connection() as c:c.execute('TRUNCATE enrichment_budget')
+    assert w.once() is True
+    with s.pool.connection() as c:
+        row=c.execute("SELECT state,error_code FROM attachment_enrichment WHERE attachment='enrich-audio'").fetchone()
+    assert row['error_code']=='enrichment_failed' and row['state']=='failed'
 
 
 def synth_image(tmp_path,name,size,*,noise=False):

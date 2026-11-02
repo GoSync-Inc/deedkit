@@ -12,7 +12,8 @@
       "base_url": "https://deedkit-inference.example-tailnet.ts.net/v1",
       "api_key_file": "/run/secrets/inference/inference.key",
       "timeout_seconds": 900,
-      "max_audio_seconds": 14400
+      "max_audio_seconds": 14400,
+      "max_input_bytes": 209715200
     },
     "image": {
       "provider": "deedkit_inference",

@@ -116,6 +116,8 @@ services:
     extra_hosts:
       - "${INFERENCE_MINI_NAME:-deedkit-inference.example-tailnet.ts.net}:${INFERENCE_MINI_IP:-100.64.0.1}"
     dns: ["${INFERENCE_MINI_IP:-100.64.0.1}"]
+    # ANYM-697: room for an original of up to 200 MiB (the audio profile maximum) plus the Opus form (at most 32 MiB).
+    tmpfs: ["/tmp:size=320m,noexec,nosuid"]
     volumes:
       - type: bind
         source: ./private/enrichment-local.dsn
