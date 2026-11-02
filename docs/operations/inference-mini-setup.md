@@ -391,6 +391,16 @@ plist while the job is loaded, so the file can be replaced first and takes effec
 MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
 D="$(ssh "$MINI" 'D=$(mktemp -d /tmp/deedkit-setup.XXXXXX) && echo "stage $D" >> ~/deedkit-inference-setup.created && echo $D')" || exit 1
 PL=/Library/LaunchDaemons/com.deedkit.inference.plist
+# launchd's pid of the job: sandbox-exec execs the shell and the shell execs the service, so it is the service's pid
+mini_pid() { ssh "$MINI" "sudo -n launchctl print system/com.deedkit.inference" | sed -n 's/^[[:space:]]*pid = //p'; }
+readback() {  # $1 = expected NI, $2 = the pid before the deploy; the release read-back is the deploy script's own
+  local PID; PID="$(mini_pid)"
+  [ -n "$PID" ] && [ "$PID" != "$2" ] || { echo "no new pid (before '$2', now '$PID')"; return 1; }
+  [ "$(ssh "$MINI" "ps -p $PID -o user=,nice= | awk '{print \$1, \$2}'")" = "_deedkitinf $1" ] || { echo "pid $PID: wrong user or NI"; return 1; }
+  ssh "$MINI" "sudo -n launchctl print system/com.deedkit.inference | grep -q 'state = running'" || { echo "job not running"; return 1; }
+  echo "read-back ok: pid $PID, user _deedkitinf, NI $1, running"
+}
+OLD="$(mini_pid)"; [ -n "$OLD" ] || { echo "the service is not running: stop"; exit 1; }
 # 1. install the plist; a failing command stops the remote script (set -e) and this block (exit 1) before the deploy
 ssh "$MINI" "set -e; sudo -n cp -p $PL $D/plist.orig; sudo -n chown \$(id -un) $D/plist.orig; cp $D/plist.orig $D/plist.new
 plutil -replace ProcessType -string Standard $D/plist.new
@@ -400,32 +410,34 @@ sudo -n install -o root -g wheel -m 644 $D/plist.new $PL
 test \"\$(plutil -extract ProcessType raw $PL)\" = Standard
 test \"\$(plutil -extract Nice raw $PL)\" = 20
 echo \"installed; backup: $D/plist.orig\"" || { echo "plist install failed: stop, see Recovery (the loaded job is untouched)"; exit 1; }
-# 2. the new plist takes effect at the deploy, whose own read-back (release == SHA) says that the job came back
+# 2. the new plist takes effect at the deploy; its own read-back (release == SHA, /health, /v1/models) fails the command otherwise
 python3 scripts/inference_deploy.py "$SHA" || { echo "deploy failed: stop, see Recovery (read the job state first)"; exit 1; }
+# 3. the process that runs now is a new one, of the service user, at NI 20
+readback 20 "$OLD" || { echo "read-back failed: stop, see Recovery"; exit 1; }
 ```
 
 `$SHA` is the release served now (`readlink current` on the mini) or the one being deployed. The block stops at the first failure:
-it never reaches the deploy after a failed install, and a failed deploy is not reported as success.
+it never reaches the deploy after a failed install, a failed deploy is not reported as success, and the NI is read from the exact
+pid launchd reports (the `sandbox-exec` wrapper is gone after its exec, so a `grep sandbox-exec` finds nothing). The step is done
+when the block prints `read-back ok`, after the deploy's own `read-back: release=<SHA> status=ok`.
 
-Read-back after the deploy: `ssh "$MINI" 'ps -axo user,nice,args | grep "[_]deedkitinf.*sandbox-exec"'` shows a new process with
-NI 20, `sudo -n launchctl print system/com.deedkit.inference | grep -E "state|pid"` says `running` under a pid different from
-before, and the deploy's own line `read-back: release=<SHA> status=ok` is on screen (`/health` and `/v1/models` with the probe
-key). The step is not done without all three.
-
-Recovery. The deploy script can leave the job in three states and the next step depends on which: read it first
-(`sudo -n launchctl print system/com.deedkit.inference | grep -E "state|pid"`).
+Recovery. Read the state first: `sudo -n launchctl print system/com.deedkit.inference | grep -E "state|pid"`.
 - The install failed (the block stopped at 1): launchd has not re-read anything and the loaded job is as before. If `$PL` was
   already replaced, put the original back: `ssh "$MINI" "sudo -n install -o root -g wheel -m 644 $D/plist.orig $PL && sudo -n cmp $D/plist.orig $PL"`.
-- The deploy refused or stopped before the switch (exit 2 busy, drain timeout, refused): nothing was switched and the old process
-  still serves with its in-memory plist. Rerun the same command in a quiet window, or restore the original as above.
-- The deploy failed after the switch (`/health` or `/v1/models` read-back, wrong `release`, `bootstrap` or `kickstart` error): the
-  job may be **loaded and running** (a failed read-back does not unload it) or unloaded; do not assume either. Fix or restore the
-  plist on disk (restore command above) and rerun the same `python3 scripts/inference_deploy.py "$SHA"`: it handles both states
-  (a running job is drained and booted out, an unloaded one is bootstrapped), is idempotent for a release already on the mini and
-  ends with the release read-back. `--rollback` is for a bad release, not for a plist problem.
+- The deploy stopped before it touched the job: exit 2 (`busy`: another deploy holds the lock) or `refused` (the SHA is not green
+  on `main`), with no `SIGTERM to the service` line yet. The old process still serves with its in-memory plist. Rerun later, or
+  restore the original as above.
+- Any other deploy failure, or a deploy that printed `SIGTERM to the service`: the script has begun to stop the job (a drain
+  that timed out has closed admission and the service exits 0 on its own, and KeepAlive does not restart a clean exit; a
+  failure while switching `current` comes after the unload), so the job may be draining, stopped, unloaded, or, after a failed
+  read-back, **loaded and running with the wrong release**. Restoring the plist alone can leave the service stopped. Do not
+  assume a state: fix the cause (or restore the original plist as above), then rerun the same
+  `python3 scripts/inference_deploy.py "$SHA"`. It handles every state (a running job is drained and booted out, an unloaded one
+  is bootstrapped), is idempotent for a release already on the mini and ends with the release read-back; then run `readback` as
+  in the block. `--rollback` is for a bad release, not for a plist problem.
 
-Undo (back to Background, Nice 10): restore the original (command above), rerun the same deploy so the job is loaded from the
-restored file, and read back as above with NI 10. Models, policy and ledger are untouched.
+Undo (back to Background, Nice 10): in the same shell, `OLD="$(mini_pid)"`, restore the original (command above), rerun the same
+deploy so the job is loaded from the restored file, and `readback 10 "$OLD"`. Models, policy and ledger are untouched.
 
 Rotation of logs: `newsyslog` rotates at 10 MB; launchd keeps its descriptor, so lines go to the rotated file until
 the next deploy restarts the service (the logs hold metadata only; a day of 2000 jobs is well under 1 MB).
