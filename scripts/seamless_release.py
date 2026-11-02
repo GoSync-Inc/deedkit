@@ -794,18 +794,20 @@ def discover(settings, deadline=None):
     receipt names the same containers as the successor's copy of it and whose own ancestry is consistent: a generation
     that had a managed predecessor must have retired it itself, only the first managed generation (no `previous`) may
     still read `serving-retirement-pending`. Two receipts of one generation that differ are a conflict, never merged.
-    `unresolved` counts every other generation with a receipt; `kept` are the serving and previous generations."""
+    `unresolved` counts every other generation with a receipt plus every receipt file that cannot be read as one;
+    `kept` are the serving and previous generations; `known` every generation a readable receipt names."""
     state = Path(settings['state_directory'])
     current = readable(state / 'http-current.json')
     if not current or not GENERATION.fullmatch(str(current.get('generation'))):
-        return {}, 0, set()
+        return {}, 0, set(), set()
     kept = {current['generation'], (current.get('previous') or {}).get('generation')}
-    own, retired, conflicts = {}, {}, set()
+    own, retired, conflicts, unreadable = {}, {}, set(), 0
     for path in sorted(state.glob('*/http-result.json')):
-        if deadline is not None and time.monotonic() > deadline:
+        if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError('receipt discovery')
         receipt, attempted = readable(path), readable(path.parent / 'http-attempted.json')
         if not receipt or not GENERATION.fullmatch(str(receipt.get('generation'))):
+            unreadable += 1
             continue
         generation = receipt['generation']
         if generation in own and own[generation] != (receipt, attempted):
@@ -831,11 +833,12 @@ def discover(settings, deadline=None):
         if all(isinstance(item, dict) and CONTAINER_ID.fullmatch(str(item.get('container'))) and IMAGE.fullmatch(str(item.get('image')))
                for item in containers.values()):
             eligible[generation] = containers
-    return eligible, len([generation for generation in own if generation not in kept and generation not in eligible]), kept
+    unresolved = len([generation for generation in own if generation not in kept and generation not in eligible]) + unreadable
+    return eligible, unresolved, kept, set(own)
 
 
 def retired_generations(settings, deadline=None):
-    eligible, unresolved, _ = discover(settings, deadline)
+    eligible, unresolved, _, _ = discover(settings, deadline)
     return eligible, unresolved
 
 
@@ -858,7 +861,7 @@ def clean(settings, remove):
     """Remove (or with `remove=False` list) the exited containers of retired generations; the caller holds the HTTP locks.
 
     Bounded as a whole (CLEAN_BUDGET seconds: every docker command gets the smaller of CLEAN_COMMAND and what is left,
-    and no command starts after the deadline), never waits for a lock, never raises and never changes a release's
+    and no command starts at or after the deadline), never waits for a lock, never raises and never changes a release's
     outcome: every failure is a line of the summary. A plain `docker rm <full id>` only (no force, no volumes, no
     prune). A removal that gave no answer is `unknown` and is not repeated in this run; the next run inspects the same
     ID again (absent: already removed). Deletion is selected by receipts alone; a bounded listing of the labelled
@@ -867,9 +870,13 @@ def clean(settings, remove):
     deadline = time.monotonic() + CLEAN_BUDGET
 
     def left():
-        return max(1.0, min(CLEAN_COMMAND, deadline - time.monotonic()))
+        # Called right after the `expired()` check: never more than what is left, never the old one-second floor.
+        return min(CLEAN_COMMAND, max(0.001, deadline - time.monotonic()))
+
+    def expired():
+        return time.monotonic() >= deadline
     try:
-        eligible, summary['unresolved'], kept = discover(settings, deadline)
+        eligible, summary['unresolved'], kept, known = discover(settings, deadline)
     except Exception as exc:
         summary['error'] = type(exc).__name__
         return summary
@@ -877,7 +884,7 @@ def clean(settings, remove):
     for generation, containers in eligible.items():
         for role in ['api', 'gateway']:
             identity, name = containers[role], generation + '/' + role
-            if time.monotonic() > deadline:
+            if expired():
                 summary['stopped'] = 'budget'
                 return summary
             try:
@@ -894,7 +901,7 @@ def clean(settings, remove):
                 summary['would_remove'].append(name)
                 summary['ids'].append(identity['container'][:12])
                 continue
-            if time.monotonic() > deadline:
+            if expired():
                 summary['stopped'] = 'budget'
                 return summary
             try:
@@ -906,14 +913,19 @@ def clean(settings, remove):
             summary['ids'].append(identity['container'][:12])
             if generation not in summary['generations']:
                 summary['generations'].append(generation)
-    if time.monotonic() <= deadline:
+    if not expired():
         try:
-            listing = p.run(['docker', 'ps', '--all', '--no-trunc', '--filter', 'label=ai.deedkit.http-release', '--format',
+            # Observation only, never a deletion input: every container of the host, its release label (empty when it has
+            # none) and its state. Unlabelled ones are only counted (R2).
+            listing = p.run(['docker', 'ps', '--all', '--no-trunc', '--format',
                              '{{.ID}} {{.Label "ai.deedkit.http-release"}} {{.State}}'], timeout=left(), reason=True)
-            others = [line.split() for line in listing.splitlines() if len(line.split()) == 3
-                      and line.split()[0] not in selected and line.split()[1] not in kept]
+            rows = [line.split() for line in listing.splitlines() if line.split()]
+            summary['unlabelled_count'] = len([row for row in rows if len(row) == 2])
+            others = [row for row in rows if len(row) == 3 and row[0] not in selected and row[1] not in kept]
             summary['not_selected_count'] = len(others)
-            summary['not_selected'] = [{'id': item[0][:12], 'generation': item[1], 'state': item[2]} for item in others[:20]]
+            summary['not_selected'] = [{'id': row[0][:12], 'generation': row[1], 'state': row[2],
+                                        'reason': 'generation not eligible' if row[1] in known else 'no receipt'}
+                                       for row in others[:20]]
         except Exception as exc:
             summary['not_selected_error'] = type(exc).__name__
     return summary

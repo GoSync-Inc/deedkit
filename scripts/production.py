@@ -1830,7 +1830,7 @@ def remove_images(settings, *, held=(), deadline=None, reasons=False):
                 raise Refused(f"another production operation holds the deploy lock of {directory}; no image is removed")
             mine.add(directory.resolve())
         stack.enter_context(image_lock())
-        if deadline is not None and time.monotonic() > deadline:
+        if deadline is not None and time.monotonic() >= deadline:
             # The budget went on the container pass: no discovery starts after it.
             return {"removed": [], "failed": [], "kept": 0, "interrupted": "time budget", "remaining": None}
         # The report refuses a state that appeared meanwhile instead of locking it.
@@ -1839,7 +1839,7 @@ def remove_images(settings, *, held=(), deadline=None, reasons=False):
         for number, item in enumerate(report["candidates"]):
             image = item["image"]
             entry = {"image": image.removeprefix("sha256:")[:12], "tags": item["tags"]}
-            if deadline is not None and time.monotonic() > deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 summary = {"interrupted": "time budget", "remaining": len(report["candidates"]) - number}
                 break
             try:

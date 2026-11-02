@@ -768,7 +768,7 @@ def retired_chain(tmp_path, monkeypatch, count=5):
             del containers[argv[2]]
             return ''
         if argv[:3] == ['docker', 'ps', '--all']:
-            return ''.join('%s %s %s\n' % (identity, value['Config']['Labels']['ai.deedkit.http-release'], value['State']['Status'])
+            return ''.join('%s %s %s\n' % (identity, value['Config']['Labels'].get('ai.deedkit.http-release', ''), value['State']['Status'])
                            for identity, value in containers.items())
         raise AssertionError(argv)
     monkeypatch.setattr(s.p, 'run', run)
@@ -790,7 +790,7 @@ def test_clean_removes_exactly_the_older_retired_generations_by_receipt_id(tmp_p
     assert sorted(argv[2] for argv in calls if argv[1] == 'rm') == sorted(sum(older.values(), []))
     assert all(argv[:2] in (['docker', 'inspect'], ['docker', 'rm']) and len(argv) == 3 for argv in calls if argv[1] != 'ps')
     assert sorted(containers) == sorted(kept)
-    assert sorted(summary['ids']) == sorted(identity[:12] for identity in sum(older.values(), [])) and summary['not_selected_count'] == 0
+    assert sorted(summary['ids']) == sorted(identity[:12] for identity in sum(older.values(), [])) and summary['not_selected_count'] == 0 and summary['unlabelled_count'] == 0
 
 
 # spec: ANYM-689
@@ -868,7 +868,8 @@ def test_clean_skips_what_a_malformed_receipt_cannot_prove_and_raises_nothing(tm
     (state / ('%040x' % 2) / 'http-result.json').write_text('not json')
     summary = s.clean(cfg, True)
     # The second generation's receipt carries the proof for the first one and its own identities: neither is removed.
-    assert summary['generations'] == [generations[2]] and summary['unresolved'] == 1
+    # Generation 0 lost its proof and the unreadable receipt is itself counted, so neither accumulates unseen.
+    assert summary['generations'] == [generations[2]] and summary['unresolved'] == 2
     (state / 'http-current.json').write_text('{')
     assert s.clean(cfg, True)['removed'] == [] and s.retired_generations(cfg) == ({}, 0)
 
@@ -936,10 +937,48 @@ def test_every_docker_command_of_a_clean_gets_a_timeout_that_never_exceeds_what_
 # spec: ANYM-689
 def test_clean_lists_the_labelled_containers_it_did_not_select_without_touching_them(tmp_path, monkeypatch):
     cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
-    containers['f' * 64] = containers[container_of(containers, generations[0], 'api')] | {'Id': 'f' * 64}
+    # A foreign copy of a known generation, one of a generation without any receipt, and two unlabelled containers.
+    copy_of = containers[container_of(containers, generations[0], 'api')]
+    containers['f' * 64] = copy_of | {'Id': 'f' * 64}
+    containers['e' * 64] = copy_of | {'Id': 'e' * 64, 'Config': {'Labels': {'ai.deedkit.http-release': 'ffffffffffff'}}}
+    for number in range(2):
+        containers['%064x' % (0xd0 + number)] = {'Id': '%064x' % (0xd0 + number), 'Image': IMAGE, 'State': {'Status': 'exited', 'Running': False}, 'Config': {'Labels': {}}}
     summary = s.clean(cfg, True)
-    assert summary['not_selected_count'] == 1 and summary['not_selected'] == [{'id': 'f' * 12, 'generation': generations[0], 'state': 'exited'}]
-    assert 'f' * 64 in containers and not any('f' * 64 in argv for argv in calls if argv[1] != 'ps')
+    assert summary['not_selected_count'] == 2 and summary['unlabelled_count'] == 2
+    assert sorted(summary['not_selected'], key=lambda item: item['id']) == [
+        {'id': 'e' * 12, 'generation': 'ffffffffffff', 'state': 'exited', 'reason': 'no receipt'},
+        {'id': 'f' * 12, 'generation': generations[0], 'state': 'exited', 'reason': 'generation not eligible'}]
+    assert {'e' * 64, 'f' * 64} <= set(containers) and not any(argv[1] == 'rm' and argv[2] in {'e' * 64, 'f' * 64} for argv in calls if argv[1] != 'ps')
+    assert len(containers) == 4 + 2 + 2
+
+
+def clock_after_first_inspect(monkeypatch, spent):
+    """A fake clock that jumps by `spent` seconds during the first docker command; returns it and the (verb, timeout) log."""
+    clock, timeouts, real = [0.0], [], s.p.run
+    def spy(argv, **kwargs):
+        timeouts.append((argv[1], kwargs.get('timeout')))
+        if len(timeouts) == 1:
+            clock[0] += spent
+        return real(argv, **kwargs)
+    monkeypatch.setattr(s.p, 'run', spy)
+    monkeypatch.setattr(s.time, 'monotonic', lambda: clock[0])
+    return timeouts
+
+
+# spec: ANYM-689
+def test_no_command_starts_exactly_at_the_deadline(tmp_path, monkeypatch):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    timeouts = clock_after_first_inspect(monkeypatch, s.CLEAN_BUDGET)
+    summary = s.clean(cfg, True)
+    assert [verb for verb, _ in timeouts] == ['inspect'] and summary['stopped'] == 'budget' and summary['removed'] == []
+
+
+# spec: ANYM-689
+def test_the_last_command_gets_only_the_fraction_of_a_second_that_is_left(tmp_path, monkeypatch):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    timeouts = clock_after_first_inspect(monkeypatch, s.CLEAN_BUDGET - 0.2)
+    s.clean(cfg, True)
+    assert timeouts[0][1] == 30 and timeouts[1] == ('rm', pytest.approx(0.2, abs=1e-6))
 
 
 def plan_a(tmp_path, monkeypatch, images):
