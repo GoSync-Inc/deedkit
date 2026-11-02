@@ -48,7 +48,8 @@ def test_canary_scorer_passes_recorded_good_outputs_and_fails_a_regression():
 def test_canary_loads_each_modality_once_before_the_timed_items_and_judges_the_cold_start_apart(tmp_path, monkeypatch):
     """Live run 11-02 on 9d2ccef1: the first request of each modality loads its models (vision 54 to 100 s, audio 67 s),
     and scoring it against the warm bounds failed receipt_ru and note_ru. The timed items now run warm."""
-    for name in list(EXPECTED["vision"]) + ["note_ru.ogg", "note_ru_noisy.ogg", "note_en.ogg", "note_ru_long.ogg", "doc_text.txt"]:
+    for name in list(EXPECTED["vision"]) + ["note_ru.ogg", "note_ru_noisy.ogg", "note_en.ogg", "note_ru_long.ogg", "doc_text.txt",
+                                            "note_ru_opus.ogg", "note_en_opus.ogg"]:  # the last two: the worker's own Opus (ANYM-696)
         (tmp_path / name).write_bytes(b"x")
     calls, clock = [], {"cold": {"vision": True, "note_en": True, "note_ru": True}}
 
@@ -86,7 +87,8 @@ def test_canary_voice_notes_are_ogg_opus_not_vorbis():
     """Live install 11-02: ffmpeg 8.1 on the mini has libopus and no libvorbis; Ogg/Opus is also what Telegram voice
     notes are, so the canary exercises the real container and codec."""
     source = (CANARY / "generate.py").read_text()
-    assert "libvorbis" not in source and source.count("libopus") == 3  # the clean, the noisy and the long note
+    # the clean, the noisy and the long note, and the worker's own Opus transcode argument list (ANYM-696)
+    assert "libvorbis" not in source and source.count("libopus") == 4
 
 
 # spec: ANYM-683
