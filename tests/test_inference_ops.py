@@ -18,6 +18,7 @@ from pathlib import Path
 import plistlib
 import re
 import shutil
+import signal
 import ssl
 import stat
 import subprocess
@@ -463,6 +464,46 @@ def test_undo_drops_a_duty_logger_entry_only_on_positive_evidence(tmp_path, shel
                           env={'PATH': f'{fakes}:/usr/bin:/bin', 'HOME': str(tmp_path), 'PS_MODE': mode})
     assert done.returncode == 0 and 'kill must never' not in done.stderr, done.stderr
     assert (left.read_text().strip() != '') is kept, (mode, left.read_text())
+
+
+SUDO_FAKE = '''#!/bin/sh
+while [ "$1" = -n ] || [ "$1" = -H ]; do shift; done
+if [ "$1" = -u ]; then shift 2; fi
+exec "$@"
+'''
+
+
+# spec: ANYM-691
+@pytest.mark.parametrize('shell', ['bash', 'zsh'])
+@pytest.mark.parametrize('recover_rc,ledger,loaded,stops', [
+    (0, False, False, False), (2, False, False, False),  # done / a release before the feature, no ledger
+    (4, False, False, True), (1, False, False, True),  # recover failed: nothing more is removed
+    (2, True, False, True), (0, True, False, True),  # the ledger is still there
+    (0, False, True, True)])  # the service job is still loaded
+def test_undo_stops_before_removing_anything_when_recovery_fails(tmp_path, shell, recover_rc, ledger, loaded, stops):
+    if not shutil.which(shell):
+        pytest.skip(f'{shell} is not installed')
+    doc = (ROOT / 'docs' / 'operations' / 'inference-mini-setup.md').read_text()
+    start = doc.index('if grep -qx job-service $L;')
+    snippet = doc[start:doc.index('if grep -qx job-busy $L;', start)].replace('/Users/', f'{tmp_path}/')
+    fakes, release = tmp_path / 'bin', tmp_path / '_u' / 'current' / '.venv' / 'bin'
+    for directory in (fakes, release, tmp_path / '_u' / 'state'):
+        directory.mkdir(parents=True)
+    (fakes / 'sudo').write_text(SUDO_FAKE)
+    (fakes / 'launchctl').write_text(f'#!/bin/sh\n[ "$1" = print ] && exit {0 if loaded else 113}\nexit 0\n')
+    (release / 'deedkit-inference').write_text(f'#!/bin/sh\n[ "$1" = recover ] || exit 9\nexit {recover_rc}\n')
+    for fake in (fakes / 'sudo', fakes / 'launchctl', release / 'deedkit-inference'):
+        fake.chmod(0o755)
+    if ledger:
+        (tmp_path / '_u' / 'state' / 'paused.json').write_text('{}')
+    list_file, left = tmp_path / 'ledger', tmp_path / 'left'
+    list_file.write_text('job-service\nhome\n')
+    left.write_text('')
+    done = subprocess.run([shell, '-c', f'U=_u; L={list_file}; R={left}\n{snippet}\necho reached-removal'], capture_output=True,
+                          text=True, env={'PATH': f'{fakes}:/usr/bin:/bin', 'HOME': str(tmp_path)})
+    assert (done.returncode == 1) is stops, (done.stdout, done.stderr)
+    assert ('reached-removal' not in done.stdout) is stops and ('undo stopped' in done.stdout) is stops
+    assert stops or done.returncode == 0
 
 
 # spec: ANYM-684
@@ -927,13 +968,259 @@ def test_keygen_refuses_a_symlinked_or_loose_policy(kg):
     assert not (kg.dir / 'b.key').exists()
 
 
+# ---------------------------------------------------------------- ANYM-691 criterion 5: pause ledger and recovery
+PAUSE = load('inference_ops_pausestate', PACKAGE / 'pausestate.py')
+GROUP_CODE = "import subprocess, sys, time\nsubprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\ntime.sleep(600)"
+
+
+def members_of(pgid):
+    return [row for row in PAUSE.process_table() if row['pgid'] == pgid and not row['stat'].startswith('Z')]  # a zombie is gone
+
+
+def wait_for(condition, seconds=10.0):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if condition():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+@pytest.fixture()
+def groups():
+    """Real process groups (own session: a leader and one helper). `make()` returns the stopped group's leader."""
+    made = []
+
+    def make(stopped=True):
+        leader = subprocess.Popen([sys.executable, '-c', GROUP_CODE], start_new_session=True)
+        made.append(leader)
+        assert wait_for(lambda: len(members_of(leader.pid)) == 2), 'the helper did not start'
+        if stopped:
+            os.killpg(leader.pid, signal.SIGSTOP)
+            assert wait_for(lambda: all(row['stat'].startswith('T') for row in members_of(leader.pid)))
+        return leader
+
+    yield make
+    for leader in made:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(leader.pid, signal.SIGKILL)
+        leader.wait()
+
+
+def ledgered(tmp_path, leader, stopped_at=None):
+    """A ledger naming `leader`'s group, written the way the service writes it: before the stop."""
+    ledger = PAUSE.Ledger(tmp_path / 'state' / 'paused.json', instance='test')
+    started = PAUSE.start_text(leader.pid)
+    assert started
+    ledger.record(leader.pid, leader.pid, started, stopped_at=time.time() if stopped_at is None else stopped_at)
+    return ledger
+
+
+# spec: ANYM-691
+def test_recover_finds_a_stopped_helper_whose_leader_was_killed_and_leaves_foreign_groups_alone(tmp_path, groups):
+    ours, foreign = groups(), groups()
+    ledger = ledgered(tmp_path, ours)
+    helper = next(row['pid'] for row in members_of(ours.pid) if row['pid'] != ours.pid)
+    os.kill(ours.pid, signal.SIGKILL)  # the leader dies; its stopped helper keeps the group (and the memory) alive
+    ours.wait()
+    assert wait_for(lambda: [row['pid'] for row in members_of(ours.pid)] == [helper])
+    report = PAUSE.recover(ledger.path)
+    assert report['killed'] == [helper] and report['kept'] == []
+    assert wait_for(lambda: members_of(ours.pid) == [])
+    # a stopped group that is not in the ledger is not touched, whatever its uid and parent
+    assert len(members_of(foreign.pid)) == 2 and all(row['stat'].startswith('T') for row in members_of(foreign.pid))
+    assert not ledger.path.exists()  # nothing left to recover: the ledger goes away
+
+
+# spec: ANYM-691
+def test_recover_ignores_a_reused_pgid_that_started_after_the_stop(tmp_path, groups):
+    stranger = groups()
+    started = next(row['start'] for row in members_of(stranger.pid) if row['pid'] == stranger.pid)
+    ledger = ledgered(tmp_path, stranger, stopped_at=started - 100)  # the entry's group stopped long before this one began
+    report = PAUSE.recover(ledger.path)
+    assert report['killed'] == [] and len(members_of(stranger.pid)) == 2
+    assert not ledger.path.exists()  # no member matched: the entry is dropped, the process survives
+
+
+# spec: ANYM-691
+def test_recover_drops_an_entry_only_when_no_member_remains(tmp_path, groups):
+    ours = groups()
+    ledger = ledgered(tmp_path, ours)
+    report = PAUSE.recover(ledger.path, send=lambda pid, number: None, sleep=lambda seconds: None)  # nothing dies
+    assert report['kept'] == [ours.pid] and [g['pgid'] for g in ledger.groups()] == [ours.pid]
+    PAUSE.recover(ledger.path)
+    assert wait_for(lambda: members_of(ours.pid) == []) and not ledger.path.exists()
+    # a process that is running again (state R/S) is not a member: only stopped ones are recovered
+    running = groups(stopped=False)
+    ledger = ledgered(tmp_path, running)
+    assert PAUSE.recover(ledger.path)['killed'] == [] and len(members_of(running.pid)) == 2
+
+
+# spec: ANYM-691
+def test_ownership_cutoff_is_the_whole_second_of_the_stop_and_a_reused_leader_pid_matches_nothing():
+    def table(*rows):
+        return lambda: ''.join(f'{pid} {pgid} {stat} {when}\n' for pid, pgid, stat, when in rows)
+
+    stop = time.mktime(time.strptime('Mon Nov 2 13:00:00 2026', PAUSE.START_FORMAT)) + 0.25
+    group = {'pgid': 700, 'leader': 700, 'leader_start': 'Mon Nov 2 12:59:00 2026', 'stopped_at': stop}
+    rows = PAUSE.process_table(table((701, 700, 'T', 'Mon Nov 2 13:00:00 2026'), (702, 700, 'T', 'Mon Nov 2 13:00:01 2026')))
+    assert [row['pid'] for row in PAUSE.members(group, rows)] == [701]  # printed in the next second: started after the stop
+    # the process that has the pgid as its pid started at another time than the leader did: the number was reused
+    rows = PAUSE.process_table(table((700, 700, 'T', 'Mon Nov 2 12:00:00 2026'), (701, 700, 'T', 'Mon Nov 2 12:00:00 2026')))
+    assert PAUSE.members(group, rows) == []
+    rows = PAUSE.process_table(table((700, 700, 'T', 'Mon Nov 2 12:59:00 2026'), (701, 700, 'T', 'Mon Nov 2 12:59:30 2026')))
+    assert [row['pid'] for row in PAUSE.members(group, rows)] == [700, 701]
+
+
+# spec: ANYM-691
+def test_a_retried_recovery_still_kills_a_process_it_continued_earlier(tmp_path):
+    stop = time.mktime(time.strptime('Mon Nov 2 13:00:00 2026', PAUSE.START_FORMAT))
+    ledger = PAUSE.Ledger(tmp_path / 'state' / 'paused.json')
+    ledger.record(700, 700, 'Mon Nov 2 12:59:00 2026', stopped_at=stop)
+    state = {'stat': 'T', 'alive': True, 'sent': []}
+
+    def send(pid, number, fail_kill=True):
+        state['sent'].append(number)
+        if number == signal.SIGCONT:
+            state['stat'] = 'S'  # running again: it no longer looks stopped
+        elif fail_kill:
+            raise PermissionError
+        else:
+            state['alive'] = False
+
+    def table():
+        return f"700 700 {state['stat']} Mon Nov 2 12:59:00 2026\n" if state['alive'] else ''
+
+    PAUSE.recover(ledger.path, run_ps=table, send=send, sleep=lambda seconds: None)  # the first run cannot kill it
+    assert [g['pgid'] for g in ledger.groups()] == [700]
+    assert ledger.groups()[0]['members'] == [{'pid': 700, 'started': 'Mon Nov 2 12:59:00 2026'}]
+    state['sent'].clear()
+    report = PAUSE.recover(ledger.path, run_ps=table, send=lambda pid, number: send(pid, number, fail_kill=False),
+                           sleep=lambda seconds: None)
+    assert state['sent'] == [signal.SIGCONT, signal.SIGKILL] and report['kept'] == [] and not ledger.path.exists()
+
+
+# spec: ANYM-691
+def test_a_continued_survivor_that_left_the_group_keeps_its_entry_and_is_killed_on_the_retry(tmp_path):
+    stop = time.mktime(time.strptime('Mon Nov 2 13:00:00 2026', PAUSE.START_FORMAT))
+    ledger = PAUSE.Ledger(tmp_path / 'state' / 'paused.json')
+    ledger.record(700, 700, 'Mon Nov 2 12:59:00 2026', stopped_at=stop)
+    state = {'pgid': 700, 'stat': 'T', 'alive': True, 'kill_works': False, 'sent': []}
+
+    def send(pid, number):
+        state['sent'].append((pid, number))
+        if number == signal.SIGCONT:
+            state['stat'], state['pgid'] = 'S', 701  # it runs again and has become its own group leader
+        elif state['kill_works']:
+            state['alive'] = False
+        else:
+            raise PermissionError
+
+    def table():
+        # the group leader (700) is gone; the stopped helper 701 is the only member
+        return f"701 {state['pgid']} {state['stat']} Mon Nov 2 12:59:30 2026\n" if state['alive'] else ''
+
+    report = PAUSE.recover(ledger.path, run_ps=table, send=send, sleep=lambda seconds: None)
+    assert report['kept'] == [700] and [g['pgid'] for g in ledger.groups()] == [700]  # by identity, not by its new pgid
+    # a retry that fails to kill it again (it already left the group, so only the persisted identity finds it) keeps the entry
+    report = PAUSE.recover(ledger.path, run_ps=table, send=send, sleep=lambda seconds: None)
+    assert report['kept'] == [700] and [g['pgid'] for g in ledger.groups()] == [700]
+    state['kill_works'] = True
+    state['sent'].clear()
+    report = PAUSE.recover(ledger.path, run_ps=table, send=send, sleep=lambda seconds: None)
+    assert state['sent'] == [(701, signal.SIGCONT), (701, signal.SIGKILL)] and report['kept'] == [] and not ledger.path.exists()
+
+
+# spec: ANYM-691
+def test_recover_keeps_the_entry_of_a_continued_process_that_could_not_be_killed(tmp_path):
+    stop = time.mktime(time.strptime('Mon Nov 2 13:00:00 2026', PAUSE.START_FORMAT))
+    ledger = PAUSE.Ledger(tmp_path / 'state' / 'paused.json')
+    ledger.record(700, 700, 'Mon Nov 2 12:59:00 2026', stopped_at=stop)
+    state = {'stat': 'T'}
+
+    def send(pid, number):
+        if number == signal.SIGCONT:
+            state['stat'] = 'S'  # it runs again, so it no longer looks stopped ...
+        else:
+            raise PermissionError  # ... but it could not be killed
+
+    report = PAUSE.recover(ledger.path, run_ps=lambda: f"700 700 {state['stat']} Mon Nov 2 12:59:00 2026\n", send=send,
+                           sleep=lambda seconds: None)
+    assert report['kept'] == [700] and [g['pgid'] for g in ledger.groups()] == [700]
+
+
+# spec: ANYM-691
+def test_ledger_is_written_atomically_validated_and_private(tmp_path):
+    path = tmp_path / 'state' / 'paused.json'
+    ledger = PAUSE.Ledger(path, instance='abc', clock=lambda: 1000.0)
+    assert ledger.groups() == []
+    ledger.record(40, 40, 'Mon Nov  2 13:00:00 2026')
+    ledger.record(41, 41, 'Mon Nov  2 13:00:01 2026')
+    ledger.record(40, 40, 'Mon Nov  2 13:00:00 2026', stopped_at=2000.0)  # the same group again replaces its entry
+    assert [(g['pgid'], g['stopped_at']) for g in ledger.groups()] == [(41, 1000.0), (40, 2000.0)]
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600 and not list(path.parent.glob('.*.part'))
+    ledger.remove(41)
+    ledger.remove(999)
+    assert [g['pgid'] for g in ledger.groups()] == [40]
+    ledger.remove(40)
+    ledger.clear_if_empty()
+    assert not path.exists()
+    for bad in ('not json', '{}', '{"version": 2, "groups": []}', '{"version": 1, "groups": [{"pgid": 1}]}',
+                '{"version": 1, "groups": [{"pgid": 1, "leader": 1, "leader_start": "x", "stopped_at": 1}]}',
+                '{"version": 1, "groups": [{"pgid": "9", "leader": 9, "leader_start": "x", "stopped_at": 1}]}'):
+        path.write_text(bad)
+        with pytest.raises(PAUSE.LedgerError):
+            ledger.groups()
+        with pytest.raises(PAUSE.LedgerError):
+            PAUSE.recover(path)
+    # a failed write leaves the previous ledger untouched and no partial file behind
+    path.write_text(json.dumps({'version': 1, 'instance': 'x', 'groups': []}))
+    blocked = PAUSE.Ledger(tmp_path / 'state' / 'missing' / 'x' / 'paused.json')
+    (tmp_path / 'state' / 'missing').write_text('a file where a directory should be')
+    with pytest.raises(PAUSE.LedgerError):
+        blocked.record(40, 40, 'Mon Nov  2 13:00:00 2026')
+
+
+# spec: ANYM-691
+def test_ledger_never_writes_or_reads_through_a_symlink(tmp_path):
+    # the engines can write the state directory and recovery runs unsandboxed: a planted link must not redirect a write
+    state = tmp_path / 'state'
+    state.mkdir()
+    victim = tmp_path / 'config.json'
+    victim.write_text('protected')
+    (state / '.paused.json.part').symlink_to(victim)  # the old predictable temporary name
+    (state / 'paused.json').symlink_to(victim)
+    ledger = PAUSE.Ledger(state / 'paused.json')
+    with pytest.raises(PAUSE.LedgerError):  # a ledger that is a link is refused, not followed
+        ledger.groups()
+    with pytest.raises(PAUSE.LedgerError):
+        PAUSE.recover(state / 'paused.json')
+    assert victim.read_text() == 'protected'
+    (state / 'paused.json').unlink()
+    ledger.record(40, 40, 'Mon Nov 2 13:00:00 2026', stopped_at=1000.0)
+    assert victim.read_text() == 'protected' and not (state / 'paused.json').is_symlink()
+    assert [g['pgid'] for g in ledger.groups()] == [40]
+
+
+# spec: ANYM-691
+def test_process_table_reads_ps_and_rejects_garbage():
+    rows = PAUSE.process_table(lambda: '  501     1 Ss   Mon Nov  2 13:00:00 2026\n  600   600 T+   Mon Nov  2 13:05:09 2026\n\n')
+    assert [(r['pid'], r['pgid'], r['stat']) for r in rows] == [(501, 1, 'Ss'), (600, 600, 'T+')]
+    assert rows[1]['start'] - rows[0]['start'] == 309 and PAUSE.start_text(600, lambda: '600 600 T Mon Nov  2 13:05:09 2026\n') == 'Mon Nov 2 13:05:09 2026'
+    assert PAUSE.start_text(7, lambda: '600 600 T Mon Nov  2 13:05:09 2026\n') is None
+    for bad in ('garbage\n', '600 600 T Mon Nov 99 13:05:09 2026\n'):
+        with pytest.raises(PAUSE.LedgerError):
+            PAUSE.process_table(lambda bad=bad: bad)
+
+
 # ---------------------------------------------------------------- criterion 7: deploy and rollback
 
 class FakeMini:
     """A mini that drains: after SIGTERM the service runs `jobs` more ticks of its sleep and then exits 0."""
 
     def __init__(self, jobs=0, running=True, current=None, previous=None, lock_path=None, stale_release=False,
-                 health_failures=0, never_exits=False, respawn=False, gap=0, work_on_respawn=0):
+                 health_failures=0, never_exits=False, respawn=False, gap=0, work_on_respawn=0, capable=(), ledger=False,
+                 recover_fails=False, unreadable=(), check_fails_unloaded=False):
         self.log, self.jobs, self.running, self.draining = [], jobs, running, False
         self.current, self.previous = current, previous
         self.releases = {r for r in (current, previous) if r}
@@ -943,6 +1230,8 @@ class FakeMini:
         self.killed, self.respawn, self.pid, self.terms = False, respawn, 100, 0
         self.loaded, self.gap, self.respawn_in, self.work_on_respawn, self.unloading = running, gap, 0, work_on_respawn, False
         self.now = 0.0
+        self.capable, self.ledger, self.recover_fails, self.unreadable = set(capable), ledger, recover_fails, set(unreadable)
+        self.check_fails_unloaded = check_fails_unloaded
 
     # the injected sleep and clock
     def sleep(self, seconds):
@@ -1028,6 +1317,20 @@ class FakeMini:
         self.log.append('kill')
         self.killed = True
         self.exit_service(9)
+
+    def recover_capable(self, sha):
+        if sha in self.unreadable or (self.check_fails_unloaded and not self.loaded):  # --check fails (exit 4)
+            raise deploy.MiniError('recover --check failed: the ledger is malformed')
+        return sha in self.capable  # a release that has the `recover` command (ANYM-691)
+
+    def ledger_exists(self):
+        return self.ledger
+
+    def recover(self, sha):
+        assert not self.running and not self.loaded, 'recovering while the job can still run'
+        self.log.append(('recover', sha))
+        if self.recover_fails:
+            raise deploy.MiniError('recover failed: a group remains')
 
     def point(self, sha):
         assert not self.running and not self.loaded, 'switching current while the old release can still run'
@@ -1215,6 +1518,96 @@ def test_rollback_repoints_current(tmp_path):
     assert mini.log == []
 
 
+# spec: ANYM-691
+def test_deploy_runs_recover_after_unload_and_before_switching_current_also_on_rollback(tmp_path):
+    mini = FakeMini(jobs=2, current=SHA2, lock_path=tmp_path / 'lock', capable={SHA, SHA2})
+    runner, out = run_deploy(mini)
+    runner.deploy(SHA)
+    order = [entry for entry in mini.log if entry != 'sleep']
+    assert order[order.index('unload'):] == ['unload', ('recover', SHA2), ('point', SHA), 'start']  # the release being left first
+    assert any('recovering stopped engine groups' in line for line in out)
+    mini = FakeMini(jobs=2, current=SHA, previous=SHA2, lock_path=tmp_path / 'lock2', capable={SHA, SHA2})
+    runner, _ = run_deploy(mini)
+    runner.rollback()
+    order = [entry for entry in mini.log if entry != 'sleep']
+    assert order == ['term', 'unload', ('recover', SHA), ('point', SHA2), 'start']
+
+
+# spec: ANYM-691
+def test_deploy_from_a_release_without_recover_uses_the_target_release(tmp_path):
+    mini = FakeMini(jobs=1, current=SHA2, lock_path=tmp_path / 'lock', capable={SHA})  # SHA2 is the release before the feature
+    runner, _ = run_deploy(mini)
+    runner.deploy(SHA)
+    assert [entry for entry in mini.log if isinstance(entry, tuple) and entry[0] == 'recover'] == [('recover', SHA)]
+    assert mini.current == SHA
+
+
+# spec: ANYM-691
+def test_deploy_with_no_capable_release_and_no_ledger_continues_and_with_a_ledger_fails_closed(tmp_path):
+    mini = FakeMini(jobs=1, current=SHA2, lock_path=tmp_path / 'lock')
+    runner, out = run_deploy(mini)
+    runner.deploy(SHA)
+    assert mini.current == SHA and not any(isinstance(e, tuple) and e[0] == 'recover' for e in mini.log)
+    assert any('recovery skipped' in line for line in out)
+    mini = FakeMini(jobs=1, current=SHA2, lock_path=tmp_path / 'lock2', ledger=True)
+    runner, _ = run_deploy(mini)
+    with pytest.raises(deploy.DeployError, match='pause ledger'):
+        runner.deploy(SHA)
+    assert mini.current == SHA2 and not {'term', 'unload', 'start'} & set(mini.log) and mini.running  # refused before the drain
+
+
+# spec: ANYM-691
+def test_rollback_to_a_release_without_the_feature_recovers_from_the_leaving_release(tmp_path):
+    mini = FakeMini(jobs=1, current=SHA, previous=SHA2, lock_path=tmp_path / 'lock', capable={SHA})
+    runner, _ = run_deploy(mini)
+    runner.rollback()
+    assert [entry for entry in mini.log if isinstance(entry, tuple) and entry[0] == 'recover'] == [('recover', SHA)]
+    assert mini.current == SHA2 and mini.log[-1] == 'start'
+
+
+# spec: ANYM-691
+@pytest.mark.parametrize('action', ['deploy', 'rollback'])
+def test_deploy_refuses_to_start_when_recover_fails(tmp_path, action):
+    mini = FakeMini(jobs=1, current=SHA, previous=SHA2, lock_path=tmp_path / 'lock', capable={SHA, SHA2}, recover_fails=True)
+    runner, _ = run_deploy(mini)
+    with pytest.raises(deploy.DeployError, match='nothing was switched') as caught:
+        runner.rollback() if action == 'rollback' else runner.deploy(SHA2)
+    assert mini.current == SHA and not any(e == ('point', SHA2) for e in mini.log)  # the target is never promoted
+    # the unchanged release is started again, so a failed recovery does not strand the service
+    assert mini.log[-2:] == [('recover', SHA), 'start'] and mini.running and mini.served == SHA
+    assert 'serving again' in str(caught.value)
+    # a service that was not running before is not started by the failure path
+    mini = FakeMini(running=False, current=SHA, previous=SHA2, lock_path=tmp_path / 'lock2', capable={SHA, SHA2}, recover_fails=True)
+    runner, _ = run_deploy(mini)
+    with pytest.raises(deploy.DeployError, match='was not running before'):
+        runner.rollback() if action == 'rollback' else runner.deploy(SHA2)
+    assert 'start' not in mini.log and not mini.running
+
+
+# spec: ANYM-691
+@pytest.mark.parametrize('action', ['deploy', 'rollback'])
+def test_a_capability_check_that_fails_after_the_unload_still_restores_the_unchanged_release(tmp_path, action):
+    mini = FakeMini(jobs=1, current=SHA, previous=SHA2, lock_path=tmp_path / 'lock', capable={SHA, SHA2}, check_fails_unloaded=True)
+    runner, _ = run_deploy(mini)
+    with pytest.raises(deploy.DeployError, match='serving again'):  # the preflight passed (loaded); the repeat after the unload fails
+        runner.rollback() if action == 'rollback' else runner.deploy(SHA2)
+    assert mini.current == SHA and mini.log[-1] == 'start' and mini.running and mini.served == SHA
+    assert not any(e == ('point', SHA2) for e in mini.log)
+
+
+# spec: ANYM-691
+@pytest.mark.parametrize('case', ['ledger-no-reader', 'unreadable-ledger'])
+def test_deploy_checks_the_ledger_before_it_drains(tmp_path, case):
+    # a ledger that no release can read (none has the command, or --check fails) stops the deploy while the service still serves
+    options = {'ledger': True} if case == 'ledger-no-reader' else {'capable': {SHA, SHA2}, 'unreadable': {SHA2}}
+    for action in ('deploy', 'rollback'):
+        mini = FakeMini(jobs=1, current=SHA2, previous=SHA, lock_path=tmp_path / f'lock-{action}', **options)
+        runner, _ = run_deploy(mini)
+        with pytest.raises(deploy.DeployError, match='nothing was switched or stopped'):
+            runner.rollback() if action == 'rollback' else runner.deploy(SHA)
+        assert not {'term', 'unload', 'start'} & set(mini.log) and mini.running and mini.current == SHA2  # not drained or unloaded
+
+
 # spec: ANYM-684
 def test_two_deploys_cannot_run_at_once(tmp_path):
     first = FakeMini(current=SHA2, lock_path=tmp_path / 'lock')
@@ -1301,7 +1694,7 @@ def test_deploy_never_touches_models_policy_or_ledger():
     text = '\n'.join(commands)
     for forbidden in ('models', 'policy.json', 'busy.json', '.created', 'ledger', 'rm -r', 'prune', 'chmod', 'chown', 'tailscale'):
         assert forbidden not in text, forbidden
-    allowed = re.compile(r'/Users/_deedkitinf/(releases(/[0-9a-f]{40}(/[\w./-]*)?|/\.deploy\.lock|/\.uv-cache(/[\w./-]*)?)?|current(\.new)?|previous|probe\.key)$')
+    allowed = re.compile(r'/Users/_deedkitinf/(releases(/[0-9a-f]{40}(/[\w./-]*)?|/\.deploy\.lock|/\.uv-cache(/[\w./-]*)?)?|current(\.new)?|previous|probe\.key|state(/paused\.json)?)$')  # state/: ANYM-691 recovery only
     paths = re.findall(r'(?<!HOME=)/Users/_deedkitinf[\w./-]*', text)  # HOME=<home> is uv's environment, not a path touched
     assert paths and all(allowed.match(path) for path in paths), [p for p in paths if not allowed.match(p)]
     # uv runs unsandboxed as the service user: empty environment, no configuration file of that user's home

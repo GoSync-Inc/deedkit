@@ -16,10 +16,13 @@ import uvicorn
 from .app import create_app
 from .config import Config, load_config
 from .errors import ConfigError, PolicyError
+from . import pausestate
 from .models import ModelError, load_models, verify_all
 
 EXIT_REFUSED = 2
 EXIT_DRAIN_TIMEOUT = 3
+EXIT_RECOVER_FAILED = 4
+log = logging.getLogger(__name__)
 
 
 class DrainingServer(uvicorn.Server):
@@ -110,6 +113,35 @@ def command_canary(args):
     return 1 if failures else code
 
 
+def command_recover(args):
+    """Continue and kill the process groups a previous service left stopped (ANYM-691 criterion 5); --check only reads."""
+    path = pausestate.ledger_path(args.state_dir)
+    try:
+        if args.check:
+            groups = pausestate.Ledger(path).groups()
+            pausestate.process_table()
+            print(json.dumps({"check": "ok", "groups": len(groups)}))
+            return 0
+        report = pausestate.recover(path)
+    except pausestate.LedgerError as error:
+        print(json.dumps({"error": str(error)}), file=sys.stderr)
+        return EXIT_RECOVER_FAILED
+    print(json.dumps(report))
+    return EXIT_RECOVER_FAILED if report["kept"] else 0
+
+
+def recover_at_start(config):
+    """Never blocks or fails the start: a stopped group left by the previous instance is continued and killed, or logged."""
+    if not config.usage_file:
+        return
+    try:
+        report = pausestate.recover(pausestate.ledger_path(Path(config.usage_file).parent))
+        if report["groups"]:
+            log.warning("startup recovery of stopped engine groups: %s", report)
+    except Exception as error:  # noqa: BLE001 - recovery must never stop the service from starting
+        log.error("startup recovery failed: %s", error)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="deedkit-inference", description="DeedKit shared inference service")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -127,7 +159,12 @@ def main(argv=None):
     probe.add_argument("--set", default=str(Path.home() / "canary-set"), help="directory of the generated set")
     probe.add_argument("--generate", action="store_true", help="(re)generate the set (needs Pillow, say, ffmpeg)")
     probe.add_argument("--egress", action="store_true", help="run the egress probe as an engine child would")
+    rec = sub.add_parser("recover", help="continue and kill engine groups a dead service left stopped")
+    rec.add_argument("--state-dir", required=True)
+    rec.add_argument("--check", action="store_true", help="only read the ledger and the process table")
     args = parser.parse_args(argv)
+    if args.command == "recover":
+        raise SystemExit(command_recover(args))
     if args.command == "pull":
         raise SystemExit(command_pull(args))
     if args.command == "verify":
@@ -145,4 +182,5 @@ def main(argv=None):
     logging.basicConfig(
         stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s", force=True
     )
+    recover_at_start(config)
     raise SystemExit(asyncio.run(serve(app, config)))
