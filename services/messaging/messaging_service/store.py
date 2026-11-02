@@ -768,7 +768,7 @@ class Store:
         # None is the internal no-default sentinel of message_queries.search, never a public value.
         if type(include_channels) is not bool:raise APIError('invalid_filter')
         from .message_queries import named_chats
-        from .live_search import suggest, scope
+        from .live_search import scope
         with self.authorized(token,'search') as (c,p):
             # ANYM-478: the live search keeps the scope this page was read under (F-478a); never in the answer.
             if isinstance(_scope,list):_scope.append(scope(p))
@@ -778,16 +778,21 @@ class Store:
                 order=order,before=before,direction=direction,search_language=search_language,
                 fuzzy=fuzzy,compact=compact,body_chars=body_chars,include_coverage=include_coverage,view=view,include_system=include_system,exclude_channels=exclude_channels,
                 chat_types=chat_types,include_channels=include_channels,person=person)
-            # ANYM-478: a thin archive answer names the call that may find more; the hint is optional, so its
-            # failure (in a savepoint) never costs the archive answer.
-            try:
-                with c.transaction():
-                    suggest(c,p,{'account':account,'accounts':accounts,'chat':chat,'chats':chats,'chat_types':chat_types,
-                        'exclude_channels':exclude_channels},result['result_evidence'])
-            except Exception as error:
-                import logging
-                logging.getLogger(__name__).warning('search_suggestion_failed exception_type=%s',type(error).__name__)
+            self._search_suggestion(c,p,account,accounts,chat,chats,chat_types,exclude_channels,result)
             return result
+
+    @staticmethod
+    def _search_suggestion(c,p,account,accounts,chat,chats,chat_types,exclude_channels,result):
+        from .live_search import suggest
+        # ANYM-478: a thin archive answer names the call that may find more; the hint is optional, so its
+        # failure (in a savepoint) never costs the archive answer.
+        try:
+            with c.transaction():
+                suggest(c,p,{'account':account,'accounts':accounts,'chat':chat,'chats':chats,'chat_types':chat_types,
+                    'exclude_channels':exclude_channels},result['result_evidence'])
+        except Exception as error:
+            import logging
+            logging.getLogger(__name__).warning('search_suggestion_failed exception_type=%s',type(error).__name__)
 
     def live_search_plan(self,token,arguments,*,paged,request_id):
         """ANYM-478: per-account live entries and the operations to queue; reads only."""
@@ -826,96 +831,25 @@ class Store:
 
     def get_context(self, token, message_id, limit=10, *, before_count=None,after_count=None,
                     compact=False,body_chars=None,include_coverage=True,view='archive',include_system=False):
-        from .message_queries import enrich
-        from .search_query import coverage,output_options,shape_messages
-        from .conversation import options,order_terms,visible_sql,sort_key,decorate_messages,presentation
+        from .search_query import coverage,output_options
+        from .message_queries import history_snapshot
+        from .conversation import options
         options(view,include_system)
         conversation=view=='conversation'
         with self.authorized(token,'get_context') as (c,p):
             bounded(limit,50)
             cap=output_options(compact,body_chars,include_coverage)
-            explicit=before_count is not None or after_count is not None
-            if explicit:
-                before_count=5 if before_count is None else before_count
-                after_count=5 if after_count is None else after_count
-                if any(type(v) is not int or not 0<=v<=50 for v in (before_count,after_count)):
-                    raise APIError('invalid_limit')
-            anchor=self.message(c,p,message_id)
-            snapshot=None
-            if conversation:
-                from .message_queries import history_snapshot
-                snapshot=history_snapshot(c,p,anchor['chat'],include_system=include_system)
-                # Authorization remains READ COMMITTED. Re-read source evidence
-                # after pinning the view, then reject changes around all scans.
-                anchor=self.message(c,p,message_id)
-                enrich(c,[anchor],p)
-            provider=str(anchor['provider_id'])
-            numeric=int(provider) if anchor.get('platform')=='telegram' and provider.isascii() and provider.isdigit() and len(provider)<=18 else 0
-            scans=[]
-            for op,sort,count in [('<','DESC',before_count if explicit else limit),
-                                  ('>','ASC',after_count if explicit else limit)]:
-                if conversation:
-                    terms=order_terms('m')
-                    selected=c.execute('SELECT m.id,m.account,m.chat,m.sender,m.body,m.sent_at,m.revision,m.direction '
-                        'FROM messages m LEFT JOIN message_metadata cmd ON cmd.message=m.id AND cmd.revision=m.revision '
-                        'WHERE m.account=%s AND m.chat=%s AND NOT m.deleted AND '+
-                        (visible_sql('m','cmd')+' AND ' if not include_system else '')+
-                        '('+','.join(terms)+')'+op+'(%s,%s,%s) ORDER BY '+
-                        ','.join(t+' '+sort for t in terms)+' LIMIT %s',
-                        (anchor['account'],anchor['chat'],anchor['sent_at'],numeric,anchor['id'],count+1)).fetchall()
-                else:
-                    selected=c.execute('SELECT id,account,chat,sender,body,sent_at,revision,direction FROM messages '
-                        'WHERE account=%s AND chat=%s AND NOT deleted AND (sent_at,id)'+op+'(%s,%s) '
-                        'ORDER BY sent_at '+sort+',id '+sort+' LIMIT %s',
-                        (anchor['account'],anchor['chat'],anchor['sent_at'],anchor['id'],count+1)).fetchall()
-                scans.append((selected[:count],len(selected)>count))
-            older,newer=scans[0][0],scans[1][0]
-            center=[] if anchor['deleted'] or (conversation and not include_system and (anchor.get('is_service') or anchor.get('message_kind')=='system')) else [{key:anchor[key] for key in
-                ('id','account','chat','sender','body','sent_at','revision','direction')}]
-            rows=older+center+newer
-            if not explicit:
-                rows=sorted(rows,key=lambda r:(r['id']!=anchor['id'],
-                    abs((r['sent_at']-anchor['sent_at']).total_seconds())))[:limit]
-            if conversation:
-                # Excerpts spend their budget in the returned order (ANYM-490).
-                enrich(c,rows,p,order_key=sort_key);rows.sort(key=sort_key)
-                shape_messages(rows,compact=False,body_chars=cap)
-                shape_messages([anchor],compact=False,body_chars=cap)
-                decorate_messages(c,p,rows,include_system=include_system);decorate_messages(c,p,[anchor],include_system=include_system)
-                if cap is not None:
-                    for row in [*rows,anchor]:
-                        if len(row['display_text'])>cap:
-                            row['display_text']=row['display_text'][:cap];row['display_text_truncated']=True
-            else:
-                rows.sort(key=lambda r:(r['sent_at'],r['id']))
-                enrich(c,rows,p);enrich(c,[anchor],p)
-                shape_messages(rows,compact=compact,body_chars=cap)
-                shape_messages([anchor],compact=compact,body_chars=cap)
+            explicit,before_count,after_count=self._context_counts(before_count,after_count)
+            anchor,snapshot=self._context_anchor(c,p,message_id,conversation,include_system)
+            scans=self._context_scans(c,anchor,conversation,include_system,explicit,limit,before_count,after_count)
+            rows,older,newer=self._context_rows(c,p,anchor,scans,conversation,include_system,explicit,limit,compact,cap)
             files=[f for f in anchor['attachments'] if f['download_status']=='ready']
             jobs=[f for f in anchor['attachments'] if f['download_status']!='ready']
             from .reviews import list_reviews
             reviews=list_reviews(c,p,message_id,limit=5)
-            window={'older_cursor':rows[0]['id'] if rows else message_id,
-                'newer_cursor':rows[-1]['id'] if rows else message_id}
-            if explicit:
-                window.update({'before_count':len(older),'after_count':len(newer),
-                    'has_more_before':scans[0][1],'has_more_after':scans[1][1],
-                    'requested_before':before_count,'requested_after':after_count,
-                    'neighbors_coverage':'archived_messages_only'})
+            window=self._context_window(rows,message_id,explicit,older,newer,scans,before_count,after_count)
             from .chat_evidence import chat_statuses
-            extra={}
-            if conversation:
-                from .conversation_state import conversation_state
-                extra={'conversation_view':presentation(rows,order='asc',include_system=include_system),
-                    'conversation':conversation_state(c,p,anchor['account'],anchor['chat'])}
-                from .message_queries import history_cursor
-                # A hidden/tombstoned anchor still defines usable boundaries
-                # when the requested visible window is empty.
-                window.update(older_cursor=history_cursor(c,p,rows[0] if rows else anchor,order='desc',include_system=include_system,snapshot=snapshot),
-                    newer_cursor=history_cursor(c,p,rows[-1] if rows else anchor,order='asc',include_system=include_system,snapshot=snapshot),
-                    older_order='desc',newer_order='asc')
-                window.update(view='conversation',include_system=include_system,
-                    anchor_hidden=bool(anchor['deleted'] or (not include_system and anchor['is_service'])))
+            extra=self._context_conversation(c,p,anchor,rows,window,snapshot,include_system,conversation)
             result=serial({'message':anchor,'context':rows,'context_window':window,
                 'attachments':files,'pending_attachments':jobs,'reviews':reviews,
                 **extra,'chat_sync':chat_statuses(c,p,[anchor['chat']])[anchor['chat']] if include_coverage else None,
@@ -923,6 +857,112 @@ class Store:
             if conversation and history_snapshot(c,p,anchor['chat'],include_system=include_system)!=snapshot:
                 raise APIError('cursor_changed',409)
             return result
+
+    @staticmethod
+    def _context_counts(before_count,after_count):
+        explicit=before_count is not None or after_count is not None
+        if explicit:
+            before_count=5 if before_count is None else before_count
+            after_count=5 if after_count is None else after_count
+            if any(type(v) is not int or not 0<=v<=50 for v in (before_count,after_count)):
+                raise APIError('invalid_limit')
+        return explicit,before_count,after_count
+
+    def _context_anchor(self,c,p,message_id,conversation,include_system):
+        from .message_queries import enrich
+        anchor=self.message(c,p,message_id)
+        snapshot=None
+        if conversation:
+            from .message_queries import history_snapshot
+            snapshot=history_snapshot(c,p,anchor['chat'],include_system=include_system)
+            # Authorization remains READ COMMITTED. Re-read source evidence
+            # after pinning the view, then reject changes around all scans.
+            anchor=self.message(c,p,message_id)
+            enrich(c,[anchor],p)
+        return anchor,snapshot
+
+    @staticmethod
+    def _context_scans(c,anchor,conversation,include_system,explicit,limit,before_count,after_count):
+        from .conversation import order_terms,visible_sql
+        provider=str(anchor['provider_id'])
+        numeric=int(provider) if anchor.get('platform')=='telegram' and provider.isascii() and provider.isdigit() and len(provider)<=18 else 0
+        scans=[]
+        for op,sort,count in [('<','DESC',before_count if explicit else limit),
+                              ('>','ASC',after_count if explicit else limit)]:
+            if conversation:
+                terms=order_terms('m')
+                selected=c.execute('SELECT m.id,m.account,m.chat,m.sender,m.body,m.sent_at,m.revision,m.direction '
+                    'FROM messages m LEFT JOIN message_metadata cmd ON cmd.message=m.id AND cmd.revision=m.revision '
+                    'WHERE m.account=%s AND m.chat=%s AND NOT m.deleted AND '+
+                    (visible_sql('m','cmd')+' AND ' if not include_system else '')+
+                    '('+','.join(terms)+')'+op+'(%s,%s,%s) ORDER BY '+
+                    ','.join(t+' '+sort for t in terms)+' LIMIT %s',
+                    (anchor['account'],anchor['chat'],anchor['sent_at'],numeric,anchor['id'],count+1)).fetchall()
+            else:
+                selected=c.execute('SELECT id,account,chat,sender,body,sent_at,revision,direction FROM messages '
+                    'WHERE account=%s AND chat=%s AND NOT deleted AND (sent_at,id)'+op+'(%s,%s) '
+                    'ORDER BY sent_at '+sort+',id '+sort+' LIMIT %s',
+                    (anchor['account'],anchor['chat'],anchor['sent_at'],anchor['id'],count+1)).fetchall()
+            scans.append((selected[:count],len(selected)>count))
+        return scans
+
+    @staticmethod
+    def _context_rows(c,p,anchor,scans,conversation,include_system,explicit,limit,compact,cap):
+        from .message_queries import enrich
+        from .search_query import shape_messages
+        from .conversation import sort_key,decorate_messages
+        older,newer=scans[0][0],scans[1][0]
+        center=[] if anchor['deleted'] or (conversation and not include_system and (anchor.get('is_service') or anchor.get('message_kind')=='system')) else [{key:anchor[key] for key in
+            ('id','account','chat','sender','body','sent_at','revision','direction')}]
+        rows=older+center+newer
+        if not explicit:
+            rows=sorted(rows,key=lambda r:(r['id']!=anchor['id'],
+                abs((r['sent_at']-anchor['sent_at']).total_seconds())))[:limit]
+        if conversation:
+            # Excerpts spend their budget in the returned order (ANYM-490).
+            enrich(c,rows,p,order_key=sort_key);rows.sort(key=sort_key)
+            shape_messages(rows,compact=False,body_chars=cap)
+            shape_messages([anchor],compact=False,body_chars=cap)
+            decorate_messages(c,p,rows,include_system=include_system);decorate_messages(c,p,[anchor],include_system=include_system)
+            if cap is not None:
+                for row in [*rows,anchor]:
+                    if len(row['display_text'])>cap:
+                        row['display_text']=row['display_text'][:cap];row['display_text_truncated']=True
+        else:
+            rows.sort(key=lambda r:(r['sent_at'],r['id']))
+            enrich(c,rows,p);enrich(c,[anchor],p)
+            shape_messages(rows,compact=compact,body_chars=cap)
+            shape_messages([anchor],compact=compact,body_chars=cap)
+        return rows,older,newer
+
+    @staticmethod
+    def _context_window(rows,message_id,explicit,older,newer,scans,before_count,after_count):
+        window={'older_cursor':rows[0]['id'] if rows else message_id,
+            'newer_cursor':rows[-1]['id'] if rows else message_id}
+        if explicit:
+            window.update({'before_count':len(older),'after_count':len(newer),
+                'has_more_before':scans[0][1],'has_more_after':scans[1][1],
+                'requested_before':before_count,'requested_after':after_count,
+                'neighbors_coverage':'archived_messages_only'})
+        return window
+
+    @staticmethod
+    def _context_conversation(c,p,anchor,rows,window,snapshot,include_system,conversation):
+        from .conversation import presentation
+        extra={}
+        if conversation:
+            from .conversation_state import conversation_state
+            extra={'conversation_view':presentation(rows,order='asc',include_system=include_system),
+                'conversation':conversation_state(c,p,anchor['account'],anchor['chat'])}
+            from .message_queries import history_cursor
+            # A hidden/tombstoned anchor still defines usable boundaries
+            # when the requested visible window is empty.
+            window.update(older_cursor=history_cursor(c,p,rows[0] if rows else anchor,order='desc',include_system=include_system,snapshot=snapshot),
+                newer_cursor=history_cursor(c,p,rows[-1] if rows else anchor,order='asc',include_system=include_system,snapshot=snapshot),
+                older_order='desc',newer_order='asc')
+            window.update(view='conversation',include_system=include_system,
+                anchor_hidden=bool(anchor['deleted'] or (not include_system and anchor['is_service'])))
+        return extra
 
     def get_reviews(self, token, message_id, after='', limit=20):
         from .reviews import list_reviews
