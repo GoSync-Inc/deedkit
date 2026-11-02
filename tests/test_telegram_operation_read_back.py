@@ -163,6 +163,8 @@ def test_stalled_read_back_is_cut_by_the_worker_timeout_and_stays_unknown(operat
     receipt = run(operator, client, operation, {'emoji': '👍'} if operation == 'send_reaction' else None)
     assert receipt['status'] == 'unknown' and receipt['error_code'] == 'operation_result_unknown'
     assert client.cancelled  # the cancellation reached the read-back and was not swallowed
+    # A swallowed cancellation would return `submitted` and store it; the worker's timeout path stores no result.
+    assert receipt['result'] is None
     assert len(client.mutations()) == 1
     s = operator[0]
     with s.pool.connection() as c:
