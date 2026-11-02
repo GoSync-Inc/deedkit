@@ -201,6 +201,20 @@ async def test_worker_failure_publishes_coverage_even_without_previous_cache(hou
     assert "private provider detail" not in str(result)
 
 
+# spec: ANYM-662
+def test_capabilities_report_the_deployed_build(household, access, monkeypatch):
+    service = FamilyService(household)
+    monkeypatch.setenv("DEEDKIT_SOURCE_SHA", "c" * 40)
+    build = service.capabilities(access)["build"]
+    assert build["source_sha"] == "c" * 40 and build["started_at"].endswith("Z")
+    # An invalid or absent value reads as null, like messaging's rule.
+    for value in ("not-a-sha", "C" * 40, "c" * 39, ""):
+        monkeypatch.setenv("DEEDKIT_SOURCE_SHA", value)
+        assert service.capabilities(access)["build"]["source_sha"] is None
+    monkeypatch.delenv("DEEDKIT_SOURCE_SHA")
+    assert service.capabilities(access)["build"]["source_sha"] is None
+
+
 def test_capabilities_describe_limits_and_calendar_specific_write_admission(household, access):
     household.write_opt_in("cal-a", True)
     service = FamilyService(household)

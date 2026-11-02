@@ -11,3 +11,5 @@ COPY --from=build /app/services/gateway/.venv /app/services/gateway/.venv
 ENV PATH="/app/services/gateway/.venv/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 USER 10001:10001
 ENTRYPOINT ["deedkit-gateway"]
+ARG DEEDKIT_SOURCE_SHA
+ENV DEEDKIT_SOURCE_SHA=$DEEDKIT_SOURCE_SHA

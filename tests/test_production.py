@@ -667,6 +667,25 @@ def test_production_messaging_stages_end_with_the_source_revision():
     assert {target for target, build in p.BUILDS.items() if build[1] == "services/messaging/Dockerfile"} == set(MESSAGING_STAGES)
 
 
+# spec: ANYM-662
+@pytest.mark.parametrize("dockerfile", ["services/gateway/Dockerfile", "services/calendar/Dockerfile", "services/calls/Dockerfile"])
+def test_gateway_calendar_and_calls_images_end_with_the_source_revision(dockerfile):
+    # production.py already passes the build argument to every target; the final stage must keep it as ENV so the
+    # service can report its build. It sits after the build layers so they stay cached; the calls image keeps CMD
+    # last (test_coverage_deployment pins it).
+    lines = (ROOT / dockerfile).read_text().replace("\\\n", " ").splitlines()
+    final = []
+    for line in (value.strip() for value in lines):
+        if not line or line.startswith("#"):
+            continue
+        if line.upper().startswith("FROM "):
+            final = []
+        final.append(line)
+    pair = ["ARG DEEDKIT_SOURCE_SHA", "ENV DEEDKIT_SOURCE_SHA=$DEEDKIT_SOURCE_SHA"]
+    assert any(final[i:i + 2] == pair for i in range(len(final))) and sum("DEEDKIT_SOURCE_SHA" in line for line in final) == 2
+    assert final.index(pair[0]) > max(i for i, line in enumerate(final) if line.startswith(("COPY ", "RUN ")))
+
+
 # spec: ANYM-300
 def test_the_runtime_image_smoke_imports_the_app_its_serve_command_loads():
     # `python -m messaging_service serve` imports messaging_service.app; importing only the package passed an image

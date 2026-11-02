@@ -466,6 +466,22 @@ async def test_lists_are_owned_newest_first_paged_and_summarized(tmp_path):
     service.close()
 
 
+# spec: ANYM-662
+async def test_capabilities_report_the_deployed_build(tmp_path, monkeypatch):
+    path, _, _ = registry(tmp_path)
+    service = VoiceService(tmp_path / "data")
+    surface = api(service, path, None)
+    monkeypatch.setenv("DEEDKIT_SOURCE_SHA", "d" * 40)
+    build = (await surface.call("alice", "capabilities", {}))["build"]
+    assert build["source_sha"] == "d" * 40 and build["started_at"].endswith("Z")
+    for value in ("not-a-sha", "D" * 40, "d" * 41, ""):
+        monkeypatch.setenv("DEEDKIT_SOURCE_SHA", value)
+        assert (await surface.call("alice", "capabilities", {}))["build"]["source_sha"] is None
+    monkeypatch.delenv("DEEDKIT_SOURCE_SHA")
+    assert (await surface.call("alice", "capabilities", {}))["build"]["source_sha"] is None
+    service.close()
+
+
 async def test_capabilities_report_enforced_limits(tmp_path):
     path, _, _ = registry(tmp_path)
     service = VoiceService(tmp_path / "data")

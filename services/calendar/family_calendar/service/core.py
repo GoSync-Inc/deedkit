@@ -7,6 +7,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 from family_calendar.errors import CalendarError
 from . import journal
+from .build import build
 from .store import digest, instant, person_uuid, ref
 from .projection import (  # noqa: F401  (the moved names stay importable from here)
     DRIFT_SKIP, ProjectionMixin, carried_step, carries, shown_time, uuid_token)
@@ -301,6 +302,7 @@ class FamilyService(ProjectionMixin):
         return dict(
             calendars,
             permissions=sorted(self.principal(key)["scopes"]),
+            build=build(),
             constraints={
                 "event_write": EVENT_WRITE,
                 "time_format": TIME_FORMAT,

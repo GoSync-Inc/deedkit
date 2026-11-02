@@ -89,6 +89,20 @@ of an undeployed module) returns one identical `not_found_or_forbidden` body wit
 `next_action: "refresh_tool_list_once"` and a `hint`: if the tool is still absent after a refresh, the key does
 not have it.
 
+A call to a tool the key's policy allows, whose module build does not list the tool's operation in its tool
+manifest (or reports no manifest), returns `operation_not_in_module_build` with `module`, `operation`,
+`module_manifest` (the manifest version or null), `module_build` (the build commit or null) and
+`next_action: "refresh_tools_after_release"`; the HTTP status stays 403. A changed build or manifest version is a signal
+to read `tools/list` and `platform_capabilities` again, never proof the operation exists. A module whose backend is
+down keeps `backend_unavailable`, and a tool hidden for any other reason (a missing action or grant) keeps the bare
+denial above. `platform_capabilities` adds `unavailable` (one entry per module: `state` `unavailable` or `outdated`,
+`reason`, `module_manifest`, `module_build`, `required_by`), `backend_builds` (each module's `{source_sha, started_at}`,
+null for an older module) and `gateway.build`. Everything new concerns only modules in which the key has at least one
+tool its policy allows: no other module is queried or described, and a name outside the policy, an unknown name or a
+tool of an undeployed module still gets the one identical body with no backend call. Nothing here widens a grant, a
+profile, a permission or a scope. Calendar, calls and the gateway report `build` by messaging's rule (the 40-hex
+`DEEDKIT_SOURCE_SHA` of the image, else null).
+
 A messaging consumption rejection (for example `invalid_feedback`) relays the backend's `field_errors` only when
 the whole list passes `platform_contracts.field_errors.validated` and the tool's reviewed schema: at most 20
 entries, one per field; each `field` a declared path of that tool's input schema (or `arguments`); a `reason`

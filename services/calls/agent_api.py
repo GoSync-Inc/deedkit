@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 
 from anymsg import AnyMsg
 import call_events
+from build_info import build
 from core import AgentBrief, ServiceError
 from outbound import AgentExternalBrief
 import destination_policy as policy
@@ -561,6 +562,7 @@ class AgentAPI:
             cap = self.outbound.cap_status(principal.id) if self.outbound else None
             return {
                 "service": "deedkit-calls",
+                "build": build(),
                 "principal": principal.id,
                 "permissions": principal.scopes,
                 "channels": principal.channels,
