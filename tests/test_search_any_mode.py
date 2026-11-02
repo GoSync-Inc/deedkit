@@ -257,10 +257,11 @@ def bulk(s):
             c.execute('SELECT gin_clean_pending_list(%s::regclass)', (index,))
 
 
-def measured_search(s, token, **arguments):
+def measured_search(s, token, forced=False, **arguments):
     from messaging_service.message_queries import search
     with s.authorized(token, 'search') as (c, p):
-        c.execute('SET LOCAL enable_seqscan=off')
+        if forced:
+            c.execute('SET LOCAL enable_seqscan=off')
         measured = Measured(c)
         result = search(s, measured, p, **arguments)
     return result, measured.plans
@@ -291,7 +292,7 @@ def test_any_mode_many_short_terms_stay_inside_the_limit(seeded):
 def test_any_mode_rare_terms_use_the_existing_text_indexes(seeded):
     s, a, b = seeded
     bulk(s)
-    result, plans = measured_search(s, b, query='scarcelexicalneedle absentqxzword', query_mode='any', order='relevance', limit=20)
+    result, plans = measured_search(s, b, forced=True, query='scarcelexicalneedle absentqxzword', query_mode='any', order='relevance', limit=20)
     assert len(result['items']) == 20 and plans
     assert 'message_fts' in json.dumps(plans), [scans(plan) for plan in plans]
 
