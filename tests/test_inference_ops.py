@@ -1929,24 +1929,26 @@ def test_upload_probe_reports_a_rate_and_valid_yes_for_a_full_body_then_audio_un
 
 
 # spec: ANYM-692
-@pytest.mark.parametrize('status,body,refusal', [
-    (408, b'{"error": {"code": "upload_timeout"}}', 'upload_timeout'),
-    (503, b'{"error": {"code": "upload_capacity"}}', 'upload_capacity'),
-    (429, b'{"error": {"code": "quota_exceeded"}}', 'quota_exceeded'),
-    (403, b'{"error": {"code": "scope_denied"}}', 'scope_denied'),
-    (502, b'<html>Bad Gateway</html>', '-'),
-    (422, b'{"error": {"code": "invalid_request", "message": "unknown field"}}', 'invalid_request'),
-    (200, b'{"text": "x"}', '-'),
-    (302, b'', '-')])
-def test_upload_probe_is_valid_no_for_every_other_answer(tls_server, tmp_path, capsys, status, body, refusal):
+def test_upload_probe_is_valid_no_for_every_other_answer(tls_server, tmp_path, capsys):
+    # The python report of CI holds at most 10,000 cases (scripts/tiden_ci.py): one case per behaviour, loops inside.
     server, url, trusted = tls_server
     key, key_file = upload_key(tmp_path)
-    Handler.post = {**Handler.post, 'status': status, 'body': body}
-    assert probe.main(['--url', url, '--key-file', key_file, '--upload-bytes', '5000'], context=trusted) == 0
-    out = capsys.readouterr().out
-    match = UPLOAD_LINE.match(out.rstrip('\n'))
-    assert match and match.group(4) == str(status) and match.group(5) == refusal and match.group(6) == 'no', out
-    assert key not in out
+    default = dict(Handler.post)
+    for status, body, refusal in [
+            (408, b'{"error": {"code": "upload_timeout"}}', 'upload_timeout'),
+            (503, b'{"error": {"code": "upload_capacity"}}', 'upload_capacity'),
+            (429, b'{"error": {"code": "quota_exceeded"}}', 'quota_exceeded'),
+            (403, b'{"error": {"code": "scope_denied"}}', 'scope_denied'),
+            (502, b'<html>Bad Gateway</html>', '-'),
+            (422, b'{"error": {"code": "invalid_request", "message": "unknown field"}}', 'invalid_request'),
+            (200, b'{"text": "x"}', '-'),
+            (302, b'', '-')]:
+        Handler.post = {**default, 'status': status, 'body': body}
+        assert probe.main(['--url', url, '--key-file', key_file, '--upload-bytes', '5000'], context=trusted) == 0
+        out = capsys.readouterr().out
+        match = UPLOAD_LINE.match(out.rstrip('\n'))
+        assert match and match.group(4) == str(status) and match.group(5) == refusal and match.group(6) == 'no', out
+        assert key not in out
 
 
 # spec: ANYM-692
@@ -1962,17 +1964,17 @@ def test_upload_probe_reads_an_early_refusal_sent_before_the_body_was_read(tls_s
 
 
 # spec: ANYM-692
-@pytest.mark.parametrize('code', ['audio unreadable', 'Audio_Unreadable', 'audio_unreadable ', 'audio-unreadable', 'x' * 60, 'KEY'])
-def test_upload_probe_takes_the_refusal_code_exactly_and_never_echoes_the_key(tls_server, tmp_path, capsys, code):
+def test_upload_probe_takes_the_refusal_code_exactly_and_never_echoes_the_key(tls_server, tmp_path, capsys):
     server, url, trusted = tls_server
     key, key_file = upload_key(tmp_path)
-    code = key if code == 'KEY' else code
-    Handler.post = {**Handler.post, 'status': 422, 'body': json.dumps({'error': {'code': code}}).encode()}
-    assert probe.main(['--url', url, '--key-file', key_file, '--upload-bytes', '3000'], context=trusted) == 0
-    out = capsys.readouterr().out
-    match = UPLOAD_LINE.match(out.rstrip('\n'))
-    assert match and match.group(4) == '422' and match.group(5) == '-' and match.group(6) == 'no', out
-    assert key not in out
+    default = dict(Handler.post)
+    for code in ['audio unreadable', 'Audio_Unreadable', 'audio_unreadable ', 'audio-unreadable', 'x' * 60, key]:
+        Handler.post = {**default, 'status': 422, 'body': json.dumps({'error': {'code': code}}).encode()}
+        assert probe.main(['--url', url, '--key-file', key_file, '--upload-bytes', '3000'], context=trusted) == 0
+        out = capsys.readouterr().out
+        match = UPLOAD_LINE.match(out.rstrip('\n'))
+        assert match and match.group(4) == '422' and match.group(5) == '-' and match.group(6) == 'no', (code, out)
+        assert key not in out
 
 
 # spec: ANYM-692
@@ -2001,40 +2003,39 @@ def test_upload_probe_ends_at_its_own_timeout_with_valid_no(tls_server, tmp_path
 
 
 # spec: ANYM-692
-@pytest.mark.parametrize('size', ['0', '-5', '8388609', '99999999999'])
-def test_upload_probe_refuses_a_size_outside_the_limit_and_sends_nothing(tls_server, tmp_path, capsys, size):
+def test_upload_probe_refuses_a_size_outside_the_limit_and_sends_nothing(tls_server, tmp_path, capsys):
     server, url, trusted = tls_server
     key, key_file = upload_key(tmp_path)
-    assert probe.main(['--url', url, '--key-file', key_file, '--upload-bytes', size], context=trusted) == 0
-    out = capsys.readouterr().out
-    assert 'valid=no' in out and 'status=usage' in out and Handler.uploads == [] and Handler.seen == []
+    for size in ['0', '-5', '8388609', '99999999999']:
+        assert probe.main(['--url', url, '--key-file', key_file, '--upload-bytes', size], context=trusted) == 0
+        out = capsys.readouterr().out
+        assert 'valid=no' in out and 'status=usage' in out and Handler.uploads == [] and Handler.seen == [], size
     # the largest allowed size is accepted
     assert probe.main(['--url', url, '--key-file', key_file, '--upload-bytes', '8388608'], context=trusted) == 0
     assert 'valid=yes' in capsys.readouterr().out and Handler.uploads[0]['length'] > 8388608
 
 
 # spec: ANYM-692
-@pytest.mark.parametrize('failure', ['refused', 'bad-certificate', 'no-key', 'no-key-file-argument', 'http-url'])
-def test_upload_probe_exits_zero_with_one_line_and_never_prints_the_key(tls_server, tmp_path, capsys, failure):
-    server, url, trusted = tls_server
+def test_upload_probe_exits_zero_with_one_line_and_never_prints_the_key(tls_server, tmp_path, capsys):
+    server, good_url, trusted = tls_server
     key, key_file = upload_key(tmp_path)
-    context, args = trusted, ['--key-file', key_file]
-    expected = {'refused': 'status=refused', 'bad-certificate': 'status=bad_certificate', 'no-key': 'status=key_unreadable',
-                'no-key-file-argument': 'reason=usage', 'http-url': 'status=usage'}[failure]
-    if failure == 'refused':
-        url = 'https://127.0.0.1:1'
-    elif failure == 'bad-certificate':
-        context = ssl.create_default_context()
-    elif failure == 'no-key':
-        args = ['--key-file', str(tmp_path / 'missing')]
-    elif failure == 'no-key-file-argument':
-        args = []
-    else:
-        url = url.replace('https://', 'http://')
-    assert probe.main(['--url', url, *args, '--upload-bytes', '1000'], context=context) == 0
-    out = capsys.readouterr().out
-    assert out.count('\n') == 1 and expected in out and 'valid=yes' not in out, out
-    assert key not in out and Handler.uploads == []
+    for failure, expected in [('refused', 'status=refused'), ('bad-certificate', 'status=bad_certificate'),
+                              ('no-key', 'status=key_unreadable'), ('no-key-file-argument', 'reason=usage'), ('http-url', 'status=usage')]:
+        url, context, args = good_url, trusted, ['--key-file', key_file]
+        if failure == 'refused':
+            url = 'https://127.0.0.1:1'
+        elif failure == 'bad-certificate':
+            context = ssl.create_default_context()
+        elif failure == 'no-key':
+            args = ['--key-file', str(tmp_path / 'missing')]
+        elif failure == 'no-key-file-argument':
+            args = []
+        else:
+            url = good_url.replace('https://', 'http://')
+        assert probe.main(['--url', url, *args, '--upload-bytes', '1000'], context=context) == 0
+        out = capsys.readouterr().out
+        assert out.count('\n') == 1 and expected in out and 'valid=yes' not in out, (failure, out)
+        assert key not in out and Handler.uploads == []
 
 
 # spec: ANYM-684
