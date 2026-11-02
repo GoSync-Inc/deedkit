@@ -93,7 +93,34 @@ async def test_a_refused_external_brief_names_every_bad_field(tmp_path):
     with pytest.raises(ServiceError) as caught:
         await surface.call("alice", "prepare_external_call", {"brief": {**good, "channel": "phone", "account": "twilio",
                                                                        "destination": "0628123456"}})
-    assert caught.value.detail["field_errors"][0]["expected"] == "an E.164 number: + and 7 to 15 digits"
+    assert caught.value.detail["field_errors"][0]["expected"] == "an E.164 number: + and 8 to 15 digits"
+    service.close()
+
+
+# spec: ANYM-657
+async def test_a_bad_destination_is_named_beside_other_failing_fields(tmp_path):
+    path, _, _ = registry(tmp_path)
+    service = VoiceService(tmp_path / "data")
+    surface = api(service, path)
+    good = {**BRIEF, "channel": "telegram", "account": "telegram", "destination": "123456789"}
+    cases = [  # pydantic skips the route check when another brief field fails
+        ({"destination": "+123456789", "goal": "no"}, {"brief/destination", "brief/goal"}),
+        ({"channel": "phone", "account": "twilio", "destination": "+1234567", "language": "xx"},
+         {"brief/destination", "brief/language"}),
+        # a valid destination with the wrong account blames the account, not the destination
+        ({"account": "twilio"}, {"brief/account"}),
+        ({"account": "twilio", "goal": "no"}, {"brief/account", "brief/goal"}),
+        ({"channel": "phone", "account": "telegram", "destination": "+12345678"}, {"brief/account"}),
+    ]
+    for change, fields in cases:
+        with pytest.raises(ServiceError) as caught:
+            await surface.call("alice", "prepare_external_call", {"brief": {**good, **change}})
+        entries = {entry["field"]: entry for entry in caught.value.detail["field_errors"]}
+        assert set(entries) == fields, change
+        if "brief/account" in entries:
+            assert entries["brief/account"]["allowed"] == ["telegram" if change.get("channel") != "phone" else "twilio"]
+        if "brief/destination" in entries:
+            assert entries["brief/destination"]["reason"] == "format" and "expected" in entries["brief/destination"]
     service.close()
 
 

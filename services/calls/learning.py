@@ -339,7 +339,8 @@ class Learning:
 SERVER_ONLY_AUDIO={'input_frames','input_zero_frames','input_max_rms','first_active_input_ms','input_sample_rates','media','start'}
 SERVER_ONLY_START={'peer_connected_at','input_ready_ms','call_active_ms','pre_ready_frames','inbound_start','inbound_start_unavailable'}
 SERVER_ONLY_EVENTS={'inbound_audio','language_hint_failed'}
-SERVER_ONLY_KEYS=SERVER_ONLY_START|{'media'}
+# provider_error (ANYM-657): Twilio's code and cause stay on the server too, in the call and in its provider_status event.
+SERVER_ONLY_KEYS=SERVER_ONLY_START|{'media','provider_error'}
 
 
 def without_start(value):

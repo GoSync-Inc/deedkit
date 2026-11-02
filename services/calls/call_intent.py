@@ -17,7 +17,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from core import ACTIVE, ServiceError, TimeZone, VoiceEngine
-from outbound import AgentExternalBrief
+from outbound import E164, SIP, AgentExternalBrief
 import destination_policy as policy
 
 # The calls image ships without platform_contracts: these copy its rulebook values (test_call_intent checks equality).
@@ -26,6 +26,7 @@ STATUS_STATES = {
     "active": "running", "finished": "succeeded", "failed": "failed", "interrupted": "failed",
 }
 FINAL_STATES = frozenset(("previewed", "succeeded", "failed", "cancelled", "expired"))
+TELEGRAM_ID = re.compile(r"[1-9][0-9]{0,17}")
 REQUEST_ID = re.compile(r"[a-zA-Z0-9_.:-]{8,128}")
 PLACEHOLDER_REQUEST_ID = "REPLACE_WITH_YOUR_ID"
 PREVIEW_TTL_S = 600
@@ -92,30 +93,51 @@ def invalid(field_errors, **detail):
 
 DESTINATION_FORMATS = {"telegram": "digits only (Telegram user ID)",
                        "sip": "a sip: or sips: URI without credentials",
-                       "phone": "an E.164 number: + and 7 to 15 digits",
-                       "whatsapp": "an E.164 number: + and 7 to 15 digits"}
+                       "phone": "an E.164 number: + and 8 to 15 digits",
+                       "whatsapp": "an E.164 number: + and 8 to 15 digits"}
+ROUTE_ERROR = "invalid_call_destination_or_account"
+
+
+def route_errors(brief):
+    """The brief's route fault, judged on its own because pydantic skips the route check when another brief field
+    fails (ANYM-657). A wrong account names `brief/account` with the one it allows, a wrong destination
+    `brief/destination` with the format it expects. Empty when the route is fine or cannot be judged."""
+    if not isinstance(brief, dict):
+        return []
+    channel, account, destination = brief.get("channel"), brief.get("account"), brief.get("destination")
+    if channel not in DESTINATION_FORMATS or account not in ("telegram", "twilio") or not isinstance(destination, str):
+        return []
+    wanted = "telegram" if channel == "telegram" else "twilio"
+    if account != wanted:
+        return [{"field": "brief/account", "reason": "enum", "allowed": [wanted]}]
+    pattern = TELEGRAM_ID if channel == "telegram" else SIP if channel == "sip" else E164
+    if pattern.fullmatch(destination) and (channel != "sip" or len(destination) < 255):
+        return []
+    return [{"field": "brief/destination", "reason": "format", "expected": DESTINATION_FORMATS[channel]}]
 
 
 def field_errors(error, arguments=None):
     """At most 20 {field, reason} entries of a ValidationError (ANYM-295 vocabulary; `allowed` for an enum).
-    A refused brief route reports the destination with the format it expects (ANYM-657)."""
-    entries = []
+    A refused brief route comes from `route_errors`, next to the other failing fields (ANYM-657)."""
+    entries, route = [], False
     for item in error.errors()[:20]:
-        if item["type"] == "value_error" and "invalid_call_destination_or_account" in str(item.get("msg", "")):
-            brief = arguments.get("brief") if isinstance(arguments, dict) else None
-            expected = DESTINATION_FORMATS.get(brief.get("channel")) if isinstance(brief, dict) else None
-            entry = {"field": "brief/destination", "reason": "format"}
-            entries.append({**entry, "expected": expected} if expected else entry)
+        if item["type"] == "value_error" and ROUTE_ERROR in str(item.get("msg", "")):
+            route = True
             continue
         field = "/".join(str(part) for part in item["loc"]) or "arguments"
         reason = REASONS.get(item["type"], "type" if item["type"].endswith("_type") else "format")
-        entry = {"field": field[:128], "reason": reason}
+        entry: dict = {"field": field[:128], "reason": reason}
         if item["type"] == "literal_error":
             allowed = re.findall(r"'([^']{1,64})'", str((item.get("ctx") or {}).get("expected", "")))[:20]
             if allowed:
                 entry["allowed"] = allowed
         entries.append(entry)
-    return entries
+    found = route_errors(arguments.get("brief") if isinstance(arguments, dict) else None)
+    if route and not found:
+        found = [{"field": "brief/destination", "reason": "format"}]
+    known = {entry["field"] for entry in entries}
+    entries.extend(entry for entry in found if entry["field"] not in known)
+    return entries[:20]
 
 
 def parse(model, arguments):

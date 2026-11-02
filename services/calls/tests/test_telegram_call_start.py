@@ -258,6 +258,18 @@ async def test_analysis_gets_only_late_inbound_and_summary_missing(monkeypatch,t
     service.close()
 
 
+# spec: ANYM-657
+def test_analyzer_never_receives_the_twilio_provider_error():
+    import learning
+    error={'code':21215,'cause':'geo_permission_missing','http_status':400}
+    view=learning.analysis_view({'status':'failed','provider_status':'provider_rejected','provider_error':error,
+        'events':[{'kind':'provider_status','provider_status':'provider_rejected','provider_error':error},
+                  {'kind':'transcript','role':'user','text':'Hello'}]})
+    text=json.dumps(view)
+    assert 'provider_error' not in text and 'geo_permission_missing' not in text and '21215' not in text
+    assert view['provider_status']=='provider_rejected' and view['events'][1]['text']=='Hello'
+
+
 # spec: ANYM-450
 @pytest.mark.parametrize('location',['top','events','metrics','telegram_audio'])
 async def test_raw_start_timing_leaves_no_copy_in_the_analysis_request(monkeypatch,location):

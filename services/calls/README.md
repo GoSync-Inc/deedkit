@@ -121,7 +121,7 @@ A call placed through Twilio (phone, WhatsApp and SIP routes) that Twilio refuse
 | cause | meaning | who acts |
 | --- | --- | --- |
 | `geo_permission_missing` (21215, 13227) | The Twilio account may not call that country | The owner, in the Twilio console (Voice geo permissions). The agent must not retry with another number format |
-| `invalid_destination` (21211, 13224) | Twilio does not accept the destination as a phone number | The agent, with another input (E.164: `+` and 7 to 15 digits) |
+| `invalid_destination` (21211, 13224) | Twilio does not accept the destination as a phone number | The agent, with another input (E.164: `+` and 8 to 15 digits) |
 | `destination_not_reachable` (21214) | The destination cannot be reached | The agent, with another input |
 | `destination_not_dialable` (21217) | No dialable number matches the destination | The agent, with another input |
 | `destination_unverified` (21219) | A trial account may call only verified numbers | The owner, in the Twilio console |
@@ -132,7 +132,7 @@ A call placed through Twilio (phone, WhatsApp and SIP routes) that Twilio refuse
 | `provider_rejected_other` | A create-call refusal with another or no code | The owner reads `code` in Twilio's error catalog |
 | `call_failed_other` | A `failed` callback with a code outside this table (a carrier or SIP failure after Twilio accepted the dial) | The owner reads `code`; nothing is retried automatically |
 
-A refused `prepare_external_call` returns `invalid_arguments` with `field_errors` for every failing field (at most 20): `{field, reason}`, plus `allowed` for an enum and `expected` for a destination in the wrong format, for example `{field: "brief/destination", reason: "format", expected: "digits only (Telegram user ID)"}`. Other bare `invalid_arguments` paths are unchanged.
+The post-call analyzer never receives `provider_error`. A refused `prepare_external_call` returns `invalid_arguments` with `field_errors` for every failing field (at most 20): `{field, reason}`, plus `allowed` for an enum (a Telegram brief with a `twilio` account names `brief/account`) and `expected` for a destination in the wrong format, even when other fields fail too, for example `{field: "brief/destination", reason: "format", expected: "digits only (Telegram user ID)"}`. Other bare `invalid_arguments` paths are unchanged.
 
 ## Storage and MVP limits
 
