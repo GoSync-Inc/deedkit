@@ -159,7 +159,8 @@ revision labels alone cannot prove clean source. `check-image` is a local
 diagnostic and cannot authorize enrollment. Preparation starts no serving units.
 
 The [operator](../../scripts/seamless_release.py) exposes `bootstrap`, `prepare`,
-`promote`, `retire` and `status`; use `--help` from the reviewed checkout. Commands
+`promote`, `retire`, `status` and `clean` (the containers of retired generations,
+production.md "Image retention"); use `--help` from the reviewed checkout. Commands
 coordinate with both the canonical host deployment lock and scoped state lock.
 Keep resolved Compose/policy files, socket directories and journals out of Git
 and distribution artifacts.
@@ -184,6 +185,12 @@ Neither control surface is available through public HTTP or agent tools.
   never force-stop them to satisfy a timeout.
 - Rollback is a new reviewed routing decision. Drained processes cannot simply
   reactivate; an image rollback implies no database or state rollback.
+
+- Retired generations keep nothing a rollback needs: a drained generation cannot
+  reactivate. The serving generation and its one previous generation keep their
+  containers; the exited containers of older generations are removed by receipt ID
+  after a complete retirement (`clean`, and automatically after `retire` and before
+  a deploy's disk check). Volumes, networks and images are not touched here.
 
 Synthetic CI verifies ordering, isolation, request leases, slow-header handoff,
 issuer routing, streamed transfers, admission fences, drift and failure receipts.

@@ -2697,9 +2697,10 @@ class Deployer:
         for module, name in ((p, "prepare"), (p, "apply"), (p, "rollback"), (s, "prepare"), (s, "promote"),
                              (s, "retire")):
             monkeypatch.setattr(module, name, self.step(module is s, name))
-        self.retained = []
-        def retain(settings, *, held=()):
-            self.retained.append(held)
+        self.retained, self.preflight = [], []
+        def retain(settings, *, held=(), **extra):
+            # ANYM-689: the preflight pass before the disk check passes a deadline; the post-release pass never does.
+            (self.preflight if extra else self.retained).append(held)
             return {"removed": [], "failed": [], "kept": 2}
         monkeypatch.setattr(p, "retain_images", retain)
 
@@ -3714,6 +3715,80 @@ def test_a_failed_image_removal_or_summary_leaves_the_deploy_deployed_without_a_
         assert outcome["image_removal"] == {"skipped": "RuntimeError"} and receipt == outcome
     else:
         assert outcome["image_removal"]["receipt"].startswith("not written") and "image_removal" not in receipt
+
+
+# spec: ANYM-689
+def test_deploy_cleans_retired_containers_then_images_before_any_release_step_and_records_one_line(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    seen = []
+    def containers(settings, remove):
+        seen.append(("containers", remove, list(host.steps)))
+        return {"removed": ["a/api", "a/gateway"], "generations": ["a"], "skipped": [], "unknown": [], "unresolved": 0}
+    monkeypatch.setattr(host.s, "clean", containers)
+    def images(settings, *, held=(), **extra):
+        seen.append(("preflight images" if extra else "final images", sorted(extra), list(host.steps)))
+        return {"removed": [{"image": "x"}], "failed": [], "kept": 3}
+    monkeypatch.setattr(p, "retain_images", images)
+    outcome = host.deploy()
+    assert outcome["status"] == "deployed"
+    # Containers first, then the image pass with a deadline and the keep reasons, both before the first release step.
+    assert seen[0] == ("containers", True, []) and seen[1] == ("preflight images", ["deadline", "reasons"], [])
+    assert seen[2][0] == "final images" and seen[2][1] == [] and host.steps
+    assert outcome["cleanup"]["containers_removed"] == 2 and outcome["cleanup"]["generations"] == ["a"]
+    assert outcome["cleanup"]["images_removed"] == 2 and "disk_free_after_gib" in outcome["cleanup"]
+    assert p.read(host.state / "deploy.json")["cleanup"] == outcome["cleanup"]
+
+
+# spec: ANYM-689
+def test_a_dry_run_and_a_current_host_do_not_run_the_preflight(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch, history=())
+    monkeypatch.setattr(host.s, "clean", lambda *a: pytest.fail("cleanup ran"))
+    assert host.deploy()["status"] == "current" and host.preflight == []
+    host = Deployer(tmp_path / "again", monkeypatch) if (tmp_path / "again").mkdir() is None else None
+    monkeypatch.setattr(host.s, "clean", lambda *a: pytest.fail("cleanup ran"))
+    assert host.deploy(dry_run=True)["status"] == "plan" and host.preflight == []
+
+
+# spec: ANYM-689
+@pytest.mark.parametrize("failure", ["containers", "images", "both"])
+def test_a_failing_preflight_never_changes_the_deploy_outcome(tmp_path, monkeypatch, failure):
+    host = Deployer(tmp_path, monkeypatch)
+    if failure in {"containers", "both"}:
+        monkeypatch.setattr(host.s, "clean", lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
+    if failure in {"images", "both"}:
+        monkeypatch.setattr(p, "retain_images", lambda settings, *, held=(), **extra: {"skipped": "RuntimeError"})
+    outcome = host.deploy()
+    assert outcome["status"] == "deployed" and host.paused() is None
+    assert outcome["preflight"]["containers"] == ({"error": "RuntimeError"} if failure != "images" else outcome["preflight"]["containers"])
+
+
+# spec: ANYM-689
+def test_the_preflight_image_pass_lifts_a_host_under_the_gate_that_container_removal_alone_cannot(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    free = {"bytes": p.MIN_FREE_BYTES - 1}
+    def prepare_checks_space(sha):
+        if free["bytes"] < p.MIN_FREE_BYTES:
+            raise p.Refused("at least 15 GiB free is required on /var/lib/containerd before obtaining production images")
+    host.fail_prepare = prepare_checks_space
+    # The fake credits bytes to the image removal only: stopped containers hold no bytes, their images do.
+    monkeypatch.setattr(host.s, "clean", lambda *a: {"removed": ["a/api"], "generations": ["a"]})
+    def images(settings, *, held=(), **extra):
+        if extra:
+            free["bytes"] += 20 * 1024**3
+        return {"removed": [], "failed": [], "kept": 1, **({"kept_reasons": {"used by container": 1}} if extra else {})}
+    monkeypatch.setattr(p, "retain_images", images)
+    assert host.deploy()["status"] == "deployed"
+    # Without the image pass the same host halts, and deploy.json names why the images stay.
+    host = Deployer(tmp_path / "halted", monkeypatch) if (tmp_path / "halted").mkdir() is None else None
+    free["bytes"] = p.MIN_FREE_BYTES - 1
+    host.fail_prepare = prepare_checks_space
+    monkeypatch.setattr(host.s, "clean", lambda *a: {"removed": ["a/api"], "generations": ["a"]})
+    monkeypatch.setattr(p, "retain_images", lambda settings, *, held=(), **extra: {
+        "removed": [], "failed": [], "kept": 4, **({"kept_reasons": {"prepared release <id> is not applied": 4}} if extra else {})})
+    host.deploy()
+    pause = p.read(host.state / "deploy.json")
+    assert pause["status"] == "halted" and "15 GiB" in pause["reason"]
+    assert pause["preflight"]["images"]["kept_reasons"] == {"prepared release <id> is not applied": 4}
 
 
 # spec: ANYM-439

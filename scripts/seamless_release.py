@@ -17,6 +17,7 @@ from pathlib import Path, PurePosixPath
 import posixpath
 import re
 import shlex
+import shutil
 import socket
 import stat
 import time
@@ -729,7 +730,7 @@ def retire(settings, sha):
     for role, identity in receipt['containers'].items():
         owned_container(identity, receipt, role)
     if receipt['status'] == 'serving':
-        return public_status(receipt)
+        return retired_status(settings, receipt)
     previous = receipt.get('previous')
     if not previous:
         receipt['retirement_reason'] = 'legacy instances have no trusted drain protocol; retained with legacy file route'
@@ -752,11 +753,128 @@ def retire(settings, sha):
             # The persisted fence rejects all later requests for this issuer.
     durable_write(release / 'http-result.json', receipt)
     durable_write(Path(settings['state_directory']) / 'http-current.json', receipt)
-    return public_status(receipt)
+    return retired_status(settings, receipt)
 
 
 def public_status(receipt):
     return {key: receipt[key] for key in ['sha', 'generation', 'status', 'images', 'ci', 'retirement_reason'] if key in receipt}
+
+
+# Retired generations' containers (ANYM-689, seamless-release.md "Retired generations"). `retire` only stops a drained
+# predecessor, so every release left two exited containers whose images the image retention then kept ("used by
+# container"). A generation is removable only on the successor's recorded evidence, by the exact IDs of its own receipt.
+CLEAN_BUDGET, CLEAN_COMMAND = 120, 30
+CONTAINER_ID = re.compile(r'[0-9a-f]{64}')
+
+
+def retired_status(settings, receipt):
+    """The `retire` result of a serving generation, with the bounded cleanup of older generations beside it."""
+    result = public_status(receipt)
+    if receipt.get('status') == 'serving':
+        try:
+            result['cleanup'] = clean(settings, True)
+        except Exception as exc:
+            result['cleanup'] = {'error': type(exc).__name__}
+    return result
+
+
+def readable(path):
+    try:
+        value = p.read(path)
+    except Exception:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def retired_generations(settings):
+    """(eligible, unresolved): `eligible` maps a generation to its receipt's container identities per role, for every
+    generation that is neither the serving one nor its previous and whose retirement a successor receipt records as
+    complete (status serving, retired_roles gateway and api: `retire` writes it after both roles are drained and
+    stopped), whose own attempt was published (`serving`) and whose own receipt names the same containers as the
+    successor's copy of it. `unresolved` counts every other generation with a receipt."""
+    state = Path(settings['state_directory'])
+    current = readable(state / 'http-current.json')
+    if not current or not GENERATION.fullmatch(str(current.get('generation'))):
+        return {}, 0
+    kept = {current['generation'], (current.get('previous') or {}).get('generation')}
+    own, retired = {}, {}
+    for path in sorted(state.glob('*/http-result.json')):
+        receipt, attempted = readable(path), readable(path.parent / 'http-attempted.json')
+        if not receipt or not GENERATION.fullmatch(str(receipt.get('generation'))):
+            continue
+        own[receipt['generation']] = (receipt, attempted)
+        previous = receipt.get('previous') or {}
+        if receipt.get('status') == 'serving' and receipt.get('retired_roles') == ['gateway', 'api'] and previous.get('generation'):
+            retired[previous['generation']] = previous.get('containers')
+    eligible = {}
+    for generation, (receipt, attempted) in own.items():
+        containers = receipt.get('containers')
+        if generation in kept or generation not in retired or (attempted or {}).get('status') != 'serving':
+            continue
+        if not isinstance(containers, dict) or containers != retired[generation] or sorted(containers) != ['api', 'gateway']:
+            continue
+        if all(CONTAINER_ID.fullmatch(str(item.get('container'))) and IMAGE.fullmatch(str(item.get('image')))
+               for item in containers.values() if isinstance(item, dict)) and all(isinstance(item, dict) for item in containers.values()):
+            eligible[generation] = containers
+    return eligible, len([generation for generation in own if generation not in kept and generation not in eligible])
+
+
+def stale_container(actual, identity, generation, role):
+    """Why a retired generation's container must stay, or None when every receipt fact still holds."""
+    labels = (actual.get('Config') or {}).get('Labels') or {}
+    state = (actual.get('State') or {}).get('Status')
+    if actual.get('Id') != identity['container'] or actual.get('Image') != identity['image']:
+        return 'identity changed'
+    if state != 'exited' or (actual.get('State') or {}).get('Running'):
+        return 'state ' + str(state)
+    if (labels.get('com.docker.compose.project') != 'deedkit-http-' + generation
+            or labels.get('com.docker.compose.service') != 'http-' + role + '-' + generation
+            or labels.get('ai.deedkit.http-release') != generation):
+        return 'labels changed'
+    return None
+
+
+def clean(settings, remove):
+    """Remove (or with `remove=False` list) the exited containers of retired generations; the caller holds the HTTP locks.
+
+    Bounded (CLEAN_BUDGET seconds, CLEAN_COMMAND per docker command), never waits for a lock, never raises and never
+    changes a release's outcome: every failure is a line of the summary. A plain `docker rm <full id>` only (no force,
+    no volumes, no prune). A removal that gave no answer is `unknown` and is not repeated in this run; the next run
+    inspects the same ID again (absent: already removed)."""
+    summary = {'removed': [], 'would_remove': [], 'skipped': [], 'unknown': [], 'generations': [], 'unresolved': 0}
+    deadline = time.monotonic() + CLEAN_BUDGET
+    try:
+        eligible, summary['unresolved'] = retired_generations(settings)
+    except Exception as exc:
+        summary['error'] = type(exc).__name__
+        return summary
+    for generation, containers in eligible.items():
+        for role in ['api', 'gateway']:
+            identity, name = containers[role], generation + '/' + role
+            if time.monotonic() > deadline:
+                summary['stopped'] = 'budget'
+                return summary
+            try:
+                actual = json.loads(p.run(['docker', 'inspect', identity['container']], timeout=CLEAN_COMMAND, reason=True))[0]
+            except Exception as exc:
+                absent = 'No such' in str(exc)
+                summary['skipped'].append({'container': name, 'reason': 'already absent' if absent else 'inspect failed'})
+                continue
+            if reason := stale_container(actual, identity, generation, role):
+                summary['skipped'].append({'container': name, 'reason': reason})
+                continue
+            if not remove:
+                summary['would_remove'].append(name)
+                continue
+            try:
+                p.run(['docker', 'rm', identity['container']], timeout=CLEAN_COMMAND, reason=True)
+            except Exception as exc:
+                summary['unknown'].append({'container': name, 'reason': type(exc).__name__})
+                continue
+            summary['removed'].append(name)
+            if generation not in summary['generations']:
+                summary['generations'].append(generation)
+    return summary
 
 
 def status(settings, sha=None):
@@ -778,11 +896,34 @@ def locks(settings):
                 yield
 
 
+def disk_free(path='/var/lib/containerd'):
+    try:
+        return round(shutil.disk_usage(path).free / 2**30, 2)
+    except Exception:
+        return None
+
+
+def clean_command(settings, remove, plan_a_config):
+    """`clean`: the retired generations' containers, report only unless `remove`, and with it the existing image pass
+    (production.md "Image retention") so one command ends in freed bytes; both under the HTTP locks of `main`."""
+    if remove and not plan_a_config:
+        raise Refused('--remove needs --plan-a-config, the plan A configuration the image pass reads')
+    before = disk_free()
+    summary = clean(settings, remove)
+    if not remove:
+        return {'mode': 'report only, nothing removed; pass --remove', 'containers': summary, 'disk_free_gib': before}
+    images = p.remove_images(p.config(plan_a_config), held=(settings['state_directory'], GLOBAL_LOCK))
+    return {'mode': 'removed', 'containers': summary, 'images_removed': len(images['removed']), 'images': images,
+            'disk_free_gib_before': before, 'disk_free_gib_after': disk_free()}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['bootstrap', 'prepare', 'promote', 'retire', 'status'])
+    parser.add_argument('action', choices=['bootstrap', 'prepare', 'promote', 'retire', 'status', 'clean'])
     parser.add_argument('--sha')
     parser.add_argument('--config', default='/etc/deedkit/http-production.json')
+    parser.add_argument('--remove', action='store_true', help='clean: remove the listed containers and then old release images')
+    parser.add_argument('--plan-a-config', help='clean --remove: the plan A configuration for the image pass')
     args = parser.parse_args(argv)
     os.umask(0o077)
     try:
@@ -794,7 +935,8 @@ def main(argv=None):
         with locks(settings):
             result = {'bootstrap': lambda: bootstrap(settings, args.sha), 'prepare': lambda: prepare(settings, args.sha),
                 'promote': lambda: promote(settings, args.sha), 'retire': lambda: retire(settings, args.sha),
-                'status': lambda: status(settings, args.sha)}[args.action]()
+                'status': lambda: status(settings, args.sha),
+                'clean': lambda: clean_command(settings, args.remove, args.plan_a_config)}[args.action]()
         print(json.dumps(result, indent=2))
     except Exception as exc:
         parser.exit(1, 'HTTP release refused: ' + (str(exc) if isinstance(exc, Refused) else type(exc).__name__) + '\n')

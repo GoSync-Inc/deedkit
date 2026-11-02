@@ -1807,13 +1807,14 @@ def owned_reference(name, target):
     return repository in ("deedkit-production-" + target, REGISTRY + target)
 
 
-def remove_images(settings, *, held=()):
+def remove_images(settings, *, held=(), deadline=None, reasons=False):
     """Remove the retention report's candidates (production.md "Image retention"): each by its other references and then
     by image ID, never forced or pruned, so Docker still refuses an image a container uses. The caller holds the deploy
     locks of `held` and this state. Like a preparation it takes every other state's deploy lock before the image lock,
     without waiting, and holds them to the end: while another operation holds one it removes nothing, so it never takes
     the image lock from a preparation in progress. IDs and Docker's reasons are reported short, so a receipt holding this
-    summary never pins an image."""
+    summary never pins an image. `deadline` (a time.monotonic() value) stops the pass between two images (ANYM-689, the
+    preflight before a deploy's disk check) and `reasons` adds how many kept images each keep reason holds."""
     state = Path(settings["state_directory"])
     with ExitStack() as stack:
         mine = {Path(path).resolve() for path in (*held, state)}
@@ -1828,6 +1829,9 @@ def remove_images(settings, *, held=()):
         for number, item in enumerate(report["candidates"]):
             image = item["image"]
             entry = {"image": image.removeprefix("sha256:")[:12], "tags": item["tags"]}
+            if deadline is not None and time.monotonic() > deadline:
+                summary = {"interrupted": "time budget", "remaining": len(report["candidates"]) - number}
+                break
             try:
                 (target,) = {release_name(name) for name in item["tags"]}
                 actual = json.loads(run(["docker", "image", "inspect", image]))[0]
@@ -1853,15 +1857,49 @@ def remove_images(settings, *, held=()):
                 summary = {"interrupted": f"{type(exc).__name__} at {entry['image']}",
                            "remaining": len(report["candidates"]) - number}
                 break
-        return {"removed": removed, "failed": failed, "kept": len(report["keep"]), **summary}
+        counts = {}
+        if reasons:
+            for item in report["keep"]:
+                why = IMAGE_DIGEST.sub(lambda found: found[0][7:19], re.sub(r"[0-9a-f]{12,}", "<id>", (item["reasons"] or ["?"])[0]))
+                counts[why] = counts.get(why, 0) + 1
+        return {"removed": removed, "failed": failed, "kept": len(report["keep"]), **({"kept_reasons": counts} if reasons else {}), **summary}
 
 
-def retain_images(settings, *, held=()):
+def retain_images(settings, *, held=(), deadline=None, reasons=False):
     """`remove_images` after a successful release. It never changes the release's outcome: a failure is only reported."""
     try:
-        return remove_images(settings, held=held)
+        # Only a preflight sets these; the post-release pass is called exactly as before.
+        return remove_images(settings, held=held, **{key: value for key, value in (("deadline", deadline), ("reasons", reasons)) if value})
     except Exception as exc:
         return {"skipped": str(exc) if isinstance(exc, Refused) else type(exc).__name__}
+
+
+PREFLIGHT_BUDGET = 300
+
+
+def preflight_cleanup(settings, http, s, http_state):
+    """ANYM-689: before a deploy's disk check, remove the containers of retired HTTP generations and then the images they
+    pinned, so a host just under the gate recovers itself instead of halting. Best effort: it never raises, never
+    waits for a lock and never changes the deploy's outcome; every failure is a line of the summary."""
+    deadline = time.monotonic() + PREFLIGHT_BUDGET
+    try:
+        containers = s.clean(http, True)
+    except Exception as exc:
+        containers = {"error": type(exc).__name__}
+    images = retain_images(settings, held=(http_state, s.GLOBAL_LOCK), deadline=deadline, reasons=True)
+    return {"containers": containers, "images": images}
+
+
+def cleanup_line(preflight, final):
+    """The deploy journal's one line: what the cleanup removed and how much room is left."""
+    containers, images = (preflight or {}).get("containers", {}), (preflight or {}).get("images", {})
+    try:
+        free = round(shutil.disk_usage(CONTAINERD_ROOT).free / 2**30, 2)
+    except Exception:
+        free = None
+    return {"containers_removed": len(containers.get("removed", [])), "generations": containers.get("generations", []),
+            "images_removed": len(images.get("removed", [])) + len((final or {}).get("removed", [])),
+            "disk_free_after_gib": free}
 
 
 # Database copies (ANYM-588, production.md "Database copies"): an exactly checked copy of a live database on this host,
@@ -4511,6 +4549,7 @@ def deploy_finish(settings, s, state, http_state, finish, served):
     outcome = finish("deployed", http=served.get("status"))
     # Recorded as deployed first: removing old release images never changes that outcome, nor does adding its summary.
     outcome["image_removal"] = retain_images(settings, held=(http_state, s.GLOBAL_LOCK))
+    outcome["cleanup"] = cleanup_line(outcome.get("preflight"), outcome["image_removal"])
     try:
         write(state / "deploy.json", outcome)
     except Exception:
@@ -4578,6 +4617,9 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
     record.update(sha=candidate, base=base, started_at=now(), status="deploying")
     write(state / "deploy.json", record)
     finish, retry = deploy_closers(record, state, misses, halt)
+    # ANYM-689: containers of retired HTTP generations and the images they pinned go before the disk check of the
+    # preparation; the summary rides in deploy.json whether the deploy ends or halts.
+    record["preflight"] = preflight_cleanup(settings, http, s, http_state)
     release = state / candidate
     if candidate != base:
         halted = deploy_plan_a(settings, http, plans, mirror, base, serving, candidate, release, gated, waits, halt, finish,
