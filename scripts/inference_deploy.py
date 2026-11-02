@@ -399,15 +399,17 @@ class Deploy:
         """After the job is unloaded and before `current` moves: continue and kill engine groups the service left stopped
         (ANYM-691 criterion 5). A failure never promotes the target: the unchanged release is started again (its own start
         runs the same recovery) when the service was running before, so a failed recovery does not strand the service."""
-        release = self.recovery_release(target)
-        if release is None:
-            self.out('no release on the mini can pause engines and no pause ledger exists: recovery skipped')
-            return
-        self.out(f'recovering stopped engine groups with release {release[:12]}')
         try:
+            release = self.recovery_release(target)
+            if release is None:
+                self.out('no release on the mini can pause engines and no pause ledger exists: recovery skipped')
+                return
+            self.out(f'recovering stopped engine groups with release {release[:12]}')
             self.mini.recover(release)
-        except MiniError as exc:
+        except MiniError as exc:  # MiniError is a DeployError: first
             raise DeployError(f'{exc}; nothing was switched. {self.restore()}') from None
+        except DeployError as exc:  # the preflight's own refusals, repeated after the unload
+            raise DeployError(f'{exc} {self.restore()}') from None
 
     def restore(self) -> str:
         """Start the unchanged `current` release again after a failure that came after the unload."""

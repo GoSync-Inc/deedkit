@@ -94,6 +94,9 @@ class Ledger:
                         or not isinstance(group["leader_start"], str) or isinstance(group["stopped_at"], bool)
                         or not isinstance(group["stopped_at"], (int, float))):
                     raise ValueError("entry")
+                for known in group.get("members", []):
+                    if type(known["pid"]) is not int or not isinstance(known["started"], str):
+                        raise ValueError("members")
         except (ValueError, KeyError, TypeError):
             raise LedgerError("the ledger is malformed") from None
         return groups
@@ -166,9 +169,24 @@ def recover(path: str | Path, run_ps: Callable[[], str] | None = None,
         ledger.clear_if_empty()
         return {"groups": 0, "killed": killed, "kept": kept}
     table = process_table(run_ps)
-    selected: list[dict] = []
+    plan: list[tuple[dict, list[dict]]] = []
     for group in entries:
-        for row in members(group, table):
+        rows = members(group, table)
+        have = {(row["pid"], row["started"]) for row in rows}
+        for known in group.get("members", []):  # selected by an earlier run: still ours while that same process lives
+            row = next((r for r in table if r["pid"] == known["pid"] and r["started"] == known["started"]
+                        and not r["stat"].startswith("Z")), None)
+            if row is not None and (row["pid"], row["started"]) not in have:
+                rows.append(row)
+        plan.append((group, rows))
+    if any(rows for _, rows in plan):
+        # Persist the selected processes BEFORE any signal: after SIGCONT a survivor no longer looks stopped, and a retry
+        # (or the start-up recovery of a restored service) must still know it. A failed write stops here, nothing signalled.
+        entries = [{**g, "members": [{"pid": r["pid"], "started": r["started"]} for r in rows]} if rows else g for g, rows in plan]
+        ledger._write(entries)
+    selected: list[dict] = []
+    for _, rows in plan:
+        for row in rows:
             selected.append(row)
             for number in (signal.SIGCONT, signal.SIGKILL):  # the parent is gone: nobody reads its answer
                 try:

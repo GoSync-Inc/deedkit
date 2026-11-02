@@ -1073,6 +1073,34 @@ def test_ownership_cutoff_is_the_whole_second_of_the_stop_and_a_reused_leader_pi
 
 
 # spec: ANYM-691
+def test_a_retried_recovery_still_kills_a_process_it_continued_earlier(tmp_path):
+    stop = time.mktime(time.strptime('Mon Nov 2 13:00:00 2026', PAUSE.START_FORMAT))
+    ledger = PAUSE.Ledger(tmp_path / 'state' / 'paused.json')
+    ledger.record(700, 700, 'Mon Nov 2 12:59:00 2026', stopped_at=stop)
+    state = {'stat': 'T', 'alive': True, 'sent': []}
+
+    def send(pid, number, fail_kill=True):
+        state['sent'].append(number)
+        if number == signal.SIGCONT:
+            state['stat'] = 'S'  # running again: it no longer looks stopped
+        elif fail_kill:
+            raise PermissionError
+        else:
+            state['alive'] = False
+
+    def table():
+        return f"700 700 {state['stat']} Mon Nov 2 12:59:00 2026\n" if state['alive'] else ''
+
+    PAUSE.recover(ledger.path, run_ps=table, send=send, sleep=lambda seconds: None)  # the first run cannot kill it
+    assert [g['pgid'] for g in ledger.groups()] == [700]
+    assert ledger.groups()[0]['members'] == [{'pid': 700, 'started': 'Mon Nov 2 12:59:00 2026'}]
+    state['sent'].clear()
+    report = PAUSE.recover(ledger.path, run_ps=table, send=lambda pid, number: send(pid, number, fail_kill=False),
+                           sleep=lambda seconds: None)
+    assert state['sent'] == [signal.SIGCONT, signal.SIGKILL] and report['kept'] == [] and not ledger.path.exists()
+
+
+# spec: ANYM-691
 def test_recover_keeps_the_entry_of_a_continued_process_that_could_not_be_killed(tmp_path):
     stop = time.mktime(time.strptime('Mon Nov 2 13:00:00 2026', PAUSE.START_FORMAT))
     ledger = PAUSE.Ledger(tmp_path / 'state' / 'paused.json')
@@ -1161,7 +1189,7 @@ class FakeMini:
 
     def __init__(self, jobs=0, running=True, current=None, previous=None, lock_path=None, stale_release=False,
                  health_failures=0, never_exits=False, respawn=False, gap=0, work_on_respawn=0, capable=(), ledger=False,
-                 recover_fails=False, unreadable=()):
+                 recover_fails=False, unreadable=(), check_fails_unloaded=False):
         self.log, self.jobs, self.running, self.draining = [], jobs, running, False
         self.current, self.previous = current, previous
         self.releases = {r for r in (current, previous) if r}
@@ -1172,6 +1200,7 @@ class FakeMini:
         self.loaded, self.gap, self.respawn_in, self.work_on_respawn, self.unloading = running, gap, 0, work_on_respawn, False
         self.now = 0.0
         self.capable, self.ledger, self.recover_fails, self.unreadable = set(capable), ledger, recover_fails, set(unreadable)
+        self.check_fails_unloaded = check_fails_unloaded
 
     # the injected sleep and clock
     def sleep(self, seconds):
@@ -1259,7 +1288,7 @@ class FakeMini:
         self.exit_service(9)
 
     def recover_capable(self, sha):
-        if sha in self.unreadable:  # a release with the command whose --check fails (exit 4)
+        if sha in self.unreadable or (self.check_fails_unloaded and not self.loaded):  # --check fails (exit 4)
             raise deploy.MiniError('recover --check failed: the ledger is malformed')
         return sha in self.capable  # a release that has the `recover` command (ANYM-691)
 
@@ -1522,6 +1551,17 @@ def test_deploy_refuses_to_start_when_recover_fails(tmp_path, action):
     with pytest.raises(deploy.DeployError, match='was not running before'):
         runner.rollback() if action == 'rollback' else runner.deploy(SHA2)
     assert 'start' not in mini.log and not mini.running
+
+
+# spec: ANYM-691
+@pytest.mark.parametrize('action', ['deploy', 'rollback'])
+def test_a_capability_check_that_fails_after_the_unload_still_restores_the_unchanged_release(tmp_path, action):
+    mini = FakeMini(jobs=1, current=SHA, previous=SHA2, lock_path=tmp_path / 'lock', capable={SHA, SHA2}, check_fails_unloaded=True)
+    runner, _ = run_deploy(mini)
+    with pytest.raises(deploy.DeployError, match='serving again'):  # the preflight passed (loaded); the repeat after the unload fails
+        runner.rollback() if action == 'rollback' else runner.deploy(SHA2)
+    assert mini.current == SHA and mini.log[-1] == 'start' and mini.running and mini.served == SHA
+    assert not any(e == ('point', SHA2) for e in mini.log)
 
 
 # spec: ANYM-691
