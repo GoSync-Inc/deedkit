@@ -94,6 +94,10 @@ class Config(Strict):
     resident_cap_gb: Annotated[float, Field(gt=0, le=64)] = 6.0
     resident_hard_cap_gb: Annotated[float, Field(gt=0, le=64)] = 7.5
     min_free_gb: Annotated[float, Field(ge=0, le=64)] = 3.0
+    # The admission floor (ANYM-682/684): a job is admitted only while the free memory, counting what the service's own loaded
+    # engines hold, is at least this much; unreadable memory is zero and refuses. Between's runs need the room, now that
+    # a light Between no longer closes admission. 0 switches the floor off (the undo, no code).
+    admit_min_available_gb: Annotated[float, Field(ge=0, le=64)] = 7.0
     max_load_1m: Annotated[float, Field(gt=0)] = 8.0
     slot_max_load_1m: dict[Literal["gpu", "cpu"], Annotated[float, Field(gt=0)]] = Field(default_factory=dict)
     keep_alive_seconds: Annotated[float, Field(ge=0, le=86400)] = 300

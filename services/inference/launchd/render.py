@@ -33,6 +33,9 @@ SHARED = '/Users/Shared/deedkit-inference'
 BUSY_FILE = SHARED + '/busy.json'
 PROFILE_PATH = '/usr/local/etc/deedkit-inference/deedkit-inference.sb'
 PROBE_PATH = '/usr/local/libexec/deedkit-busy-probe'
+# The busy rule for Between's VMs (ANYM-684 criterion 10): the probe's defaults, written out so the plist is where it is changed.
+# Undo = '0.1', '0.5' (the first rule), then reload the job. tests/test_inference_ops.py keeps these equal to busy_probe's.
+VM_MEAN_CORES, VM_SPIKE_CORES, VM_HOLD_SECONDS = '2.0', '4.0', '120'
 IMPACT_PATH = '/usr/local/libexec/deedkit-impact-log'
 LOG_OUT = HOME + '/logs/service.out.log'
 LOG_ERR = HOME + '/logs/service.err.log'
@@ -71,7 +74,8 @@ def render_busy_plist(admin: str, admin_home: str, python: str) -> bytes:
     return plistlib.dumps({
         'Label': BUSY_LABEL,
         'UserName': admin,
-        'ProgramArguments': [python, PROBE_PATH, '--file', BUSY_FILE],
+        'ProgramArguments': [python, PROBE_PATH, '--vm-mean-cores', VM_MEAN_CORES, '--vm-spike-cores', VM_SPIKE_CORES,
+                             '--vm-hold-seconds', VM_HOLD_SECONDS, '--file', BUSY_FILE],
         'EnvironmentVariables': {'HOME': admin_home, 'PATH': '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin'},
         'RunAtLoad': True,
         'KeepAlive': True,

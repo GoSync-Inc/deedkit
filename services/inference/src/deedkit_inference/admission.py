@@ -124,6 +124,23 @@ class Admission:
         cap = self.config.slot_max_load_1m.get(slot, self.config.max_load_1m)
         return "load_high" if self.probe.load_1m() > cap else None
 
+    def floor_open(self, visible=None):
+        """The admission floor (`admit_min_available_gb`): the memory a job leaves Between and the tests, counting the
+        engines this service holds loaded as free (they are ours to give back: a warm 3.7 GB worker would otherwise keep
+        the figure under the floor for ever). Zero from the probe is "unreadable" and never opens."""
+        floor = self.config.admit_min_available_gb
+        if floor <= 0:
+            return True
+        visible = self.probe.available_gb() if visible is None else visible
+        return visible > 0 and visible + self.resident_total() >= floor
+
+    def floor_verdict(self, visible):
+        if self.floor_open(visible):
+            return None
+        if self.monotonic() < self.settle_until:
+            return Verdict("wait")  # an eviction's memory is still coming back, as for the per-phase rule
+        return Verdict("refuse", "memory_low")
+
     def check(self, key, resident_gb, slot, *, arrival=False, anything_running=False):
         """The verdict for one phase about to start (or, with `arrival`, for a job that just arrived)."""
         self.reconcile()
@@ -132,9 +149,14 @@ class Admission:
             return Verdict("refuse", reason)
         if resident_gb > self.config.resident_cap_gb:
             return Verdict("refuse", "resident_cap")
+        floor_on = self.config.admit_min_available_gb > 0
+        visible = self.probe.available_gb() if floor_on or not arrival or not anything_running else None  # one read per check
+        if floor_on:
+            floor = self.floor_verdict(visible)
+            if floor is not None:
+                return floor
         if not arrival or not anything_running:
             need = (0.0 if self.warm(key) else resident_gb) + self.config.min_free_gb
-            visible = self.probe.available_gb()
             if visible < need:
                 if self.monotonic() < self.settle_until:
                     return Verdict("wait")
@@ -162,4 +184,7 @@ class Admission:
         """Open or closed for /health: would a job that needs nothing resident be admitted right now."""
         if self.busy_reason() or (self.load_reason("gpu") and self.load_reason("cpu")):
             return "closed"
-        return "open" if self.probe.available_gb() >= self.config.min_free_gb else "closed"
+        visible = self.probe.available_gb()
+        if not self.floor_open(visible):
+            return "closed"
+        return "open" if visible >= self.config.min_free_gb else "closed"

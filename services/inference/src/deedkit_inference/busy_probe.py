@@ -45,9 +45,13 @@ SLOT_MARK = '.locks/slot'
 BETWEEN_USER = '_betweenci'
 VM_MARK = 'com.apple.Virtualization.VirtualMachine'
 # Recorded on the mini 11-02: idle VMs sit at 0.2-7 % (summed), a CI job spikes to 90-100 % and idles within seconds.
+# The impact log of 11-02 (1549 samples, 12 cores) showed the first rule (a 60 s mean of 0.1 core, one sample of 0.5 core)
+# kept the service shut 83 % of the time while Between's median use was 0.9 core: the rule is now 2.0 and 4.0 cores
+# (ANYM-684 criterion 10, owner via the orchestrator), with the hold unchanged. The three values are arguments of the probe, set in
+# its plist (launchd/render.py), so the old rule is back by editing the plist: --vm-mean-cores 0.1 --vm-spike-cores 0.5.
 VM_WINDOW = 60.0  # seconds of samples averaged
-VM_MEAN = 10.0  # busy while the window's mean is at least this many % of one core
-VM_SPIKE = 50.0  # one sample this high is busy at once
+VM_MEAN_CORES = 2.0  # busy while the window's mean is at least this many cores (ps %cpu is per core: 100 = one core)
+VM_SPIKE_CORES = 4.0  # one sample this high is busy at once
 VM_HOLD = 120.0  # and stays busy this long after the last high reading: a bursty job must not reopen admission
 BETWEEN = re.compile(r'^between-|io\.between\.', re.IGNORECASE)
 BUSY = {'between': True, 'deedkit_ci': True}
@@ -92,8 +96,10 @@ class VmLoad:
     """The CPU of Between's VMs over time. Keeps the samples of the last VM_WINDOW seconds and the time of the last
     high reading; the state lives as long as the probe process (a restart starts empty and reads one sample)."""
 
-    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, clock: Callable[[], float] = time.monotonic, *, mean_cores: float = VM_MEAN_CORES,
+                 spike_cores: float = VM_SPIKE_CORES, hold_seconds: float = VM_HOLD) -> None:
         self.clock = clock
+        self.mean, self.spike, self.hold_seconds = mean_cores * 100.0, spike_cores * 100.0, hold_seconds  # in % of one core
         self.samples: list[tuple[float, float]] = []
         self.last_high: float | None = None
 
@@ -106,9 +112,9 @@ class VmLoad:
         now = self.clock()
         self.samples = [(at, value) for at, value in self.samples if now - at <= VM_WINDOW] + [(now, cpu)]
         mean = sum(value for _, value in self.samples) / len(self.samples)
-        if cpu >= VM_SPIKE or mean >= VM_MEAN:
+        if cpu >= self.spike or mean >= self.mean:
             self.last_high = now
-        return self.last_high is not None and now - self.last_high < VM_HOLD
+        return self.last_high is not None and now - self.last_high < self.hold_seconds
 
 
 def vm_cpu(run: Callable[[list[str]], str], uid_of: Callable[[str], int]) -> float | None:
@@ -191,18 +197,32 @@ def loop(path: str | Path, *, observe: Callable[[], dict[str, bool]] = observe, 
             sleep(interval)
 
 
+def positive(text: str) -> float:
+    """A finite number above zero: zero or a negative value would switch the rule off (always idle), so it is refused."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'not a number: {text}') from None
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f'must be a finite number above zero: {text}')
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or '').split('\n')[0])
+    parser.add_argument('--vm-mean-cores', type=positive, default=VM_MEAN_CORES, help='busy at this 60 s mean of Between VM cores')
+    parser.add_argument('--vm-spike-cores', type=positive, default=VM_SPIKE_CORES, help='busy at one sample this high, in cores')
+    parser.add_argument('--vm-hold-seconds', type=positive, default=VM_HOLD, help='stay busy this long after the last high reading')
     parser.add_argument('--file', default=DEFAULT_FILE)
     parser.add_argument('--interval', type=float, default=INTERVAL)
     parser.add_argument('--docker', default=None)
     parser.add_argument('--once', action='store_true', help='print one observation as JSON; exit 0 only if idle')
     args = parser.parse_args(argv)
+    vm_load = VmLoad(mean_cores=args.vm_mean_cores, spike_cores=args.vm_spike_cores, hold_seconds=args.vm_hold_seconds)
     if args.once:
-        state = observe_safely(lambda: observe(docker=args.docker))
+        state = observe_safely(lambda: observe(docker=args.docker, between_ci=vm_load))
         print(json.dumps(state))
         return 0 if not any(state.values()) else 1
-    vm_load = VmLoad()
     vm_load.hold()
     loop(args.file, observe=lambda: observe(docker=args.docker, between_ci=vm_load), interval=args.interval)
     return 0
