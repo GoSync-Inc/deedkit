@@ -290,10 +290,10 @@ def over(client, transport, name=FETCH, values=FETCH_ARGS):
     if transport == "rest":
         response = client.post("/v1/" + name, json=values, headers=HEADERS)
         return response.status_code, response.json()
-    result = client.post("/mcp", json={"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": name, "arguments": values}},
-                         headers={**HEADERS, "Accept": "application/json, text/event-stream"}).json()["result"]
-    assert result["isError"]
-    return None, result["structuredContent"]
+    response = client.post("/mcp", json={"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": name, "arguments": values}},
+                           headers={**HEADERS, "Accept": "application/json, text/event-stream"})
+    assert response.json()["result"]["isError"]
+    return response.status_code, response.json()["result"]["structuredContent"]
 
 
 # spec: ANYM-662
@@ -310,7 +310,8 @@ def test_a_mid_request_revocation_over_either_transport_leaves_the_exact_denial_
     app, paths = revoking_app(fresh(tmp_path, "case"), mutate)
     with TestClient(app) as client:
         code, body = over(client, transport)
-    assert body == expected and (code is None or code == status)
+    # A tool error over MCP is an HTTP 200 result with isError; over REST the denial's own status.
+    assert body == expected and code == (status if transport == "rest" else 200)
     assert paths == ["capabilities"] and "module_manifest" not in str(body) and SHA_A not in str(body)
 
 
