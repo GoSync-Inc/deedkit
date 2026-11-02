@@ -168,6 +168,34 @@ def test_absent_file_query_reads_bounded_file_candidates(seeded):
         'attachment_enrichment','attachment_enrichment_chunks','messages'}) for plan in measured.plans)<100, [scans(plan) for plan in measured.plans]
 
 
+# spec: ANYM-661
+def test_file_media_and_ready_filters_keep_absent_query_candidates_bounded(seeded):
+    s,a,b=seeded
+    with s.pool.connection() as c:
+        c.execute("SET LOCAL statement_timeout='60s'")
+        c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at)
+            SELECT 'caption-filter-'||n,'telegram-demo','telegram-demo-chat',n::text,'fixture',
+                repeat('ordinary caption content ',5),now()+n*interval '1 second'
+            FROM generate_series(1,4000) n''')
+        c.execute('''INSERT INTO attachments(id,message,digest,filename,mime,bytes)
+            SELECT 'file-filter-'||n,'demo-tg-1',repeat('2',64),'ordinary.ogg','audio/ogg',1
+            FROM generate_series(1,400) n''')
+        c.execute("UPDATE attachment_text SET state='ready',text_content='ordinary content' WHERE attachment LIKE 'file-filter-%'")
+        for table in ('messages','attachments','attachment_text','attachment_text_chunks','attachment_enrichment','attachment_enrichment_chunks'):
+            c.execute('ANALYZE '+table)
+        indexes=c.execute("SELECT indexname FROM pg_indexes WHERE tablename=ANY(%s) AND indexdef LIKE '%%USING gin%%'",
+            (['messages','attachment_text','attachment_text_chunks','attachment_enrichment','attachment_enrichment_chunks'],)).fetchall()
+        for index in indexes:c.execute('SELECT gin_clean_pending_list(%s::regclass)',(index['indexname'],))
+    with s.authorized(b,'search_files') as (c,p):
+        c.execute('SET LOCAL enable_seqscan=off')
+        measured=Measured(c)
+        result=search_files(s,measured,p,query='absentlexicalneedleqxz',media_kind=['voice','audio'],ready=['transcript','description'])
+    assert result['items']==[]
+    # The same bound as without the filters: the query candidates are found through the text indexes first.
+    assert measured.plans and sum(visited(plan,{'attachment_text','attachments','attachment_text_chunks',
+        'attachment_enrichment','attachment_enrichment_chunks','messages'}) for plan in measured.plans)<100, [scans(plan) for plan in measured.plans]
+
+
 def nodes(node):
     return [node]+sum((nodes(child) for child in node.get('Plans',[])),[])
 

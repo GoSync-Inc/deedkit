@@ -54,6 +54,38 @@ PostgreSQL stemming uses the same configuration for index and query. Auto tries
 each complete query under all four configurations. There is no semantic search
 or implicit spelling correction in file search.
 
+### Media kind and readiness filters (ANYM-661)
+
+`media_kind` is a list of `voice`, `audio`, `image`, `video`, `document`; the provider labels shown in a row's
+`media_kind` are accepted as aliases (`photo` and `sticker` are `image`, `animation` is `video`, `other` is
+`document`). A file's class is the provider label (`voice`, `audio`, `photo`/`sticker`, `video`/`animation`);
+for `document`, `other` or no label it comes from the MIME type (`audio/ogg`, `audio/opus` and
+`application/ogg` are `voice`, other `audio/*` is `audio`, `image/*`, `video/*`, anything else `document`).
+Each result row returns the class as `media_class`; its `media_kind` keeps the provider's label. Values are
+OR-ed, duplicates are ignored, an empty list is no filter, an unknown value is `invalid_filter` with
+`field_errors` (`media_kind`, `enum`, the allowed list).
+
+Which collector writes which label: Telegram (`adapters.py`) writes `voice`, `video` (also for video notes),
+`sticker`, `animation`, `audio`, `photo`, `document`. whatsapp-web.js (`capture.mjs`) maps `ptt` to `voice`,
+`audio` to `audio`, `image` to `photo`, `video` and `ptv` to `video`, `gif` to `animation`, `sticker`,
+`document`, and `other` for any other media; whatsmeow writes the same vocabulary. The messengers do not
+always label a voice note alike, so for voice notes across accounts the safe filter is `["voice","audio"]`.
+
+`ready` is a list (`ready=["transcript"]`) of `text` (extracted text or OCR in state `ready`), `transcript` (a
+ready enrichment of an audio or voice file only: speech inside a video is never a transcript) and
+`description` (a ready enrichment of a non-audio file, or a ready file understanding); values are OR-ed. The
+single value `["none"]` (not combined with others) selects files with no ready text, transcript or description,
+for example voice notes still without a transcript. Only the file's current revision counts: a ready row of
+an older revision of a re-uploaded file does not. Low-quality OCR text still counts as `text`. A boolean or an
+unknown value is `invalid_filter` with `field_errors`. The filters never hide a file's original: availability
+fields and `read_more` of a returned row are the same with and without them. Each page is a snapshot of
+readiness. To tell "none exist" from "not ready yet", repeat the query without `ready` and read the per-row
+availability fields.
+
+Both filters bind the relevance cursor (a cursor made without them is `invalid_cursor` once they are added,
+and the reverse; `file_search_version` stays 2). A keyset (`asc`/`desc`) attachment-ID anchor continues from
+its position under new filters even when it does not pass them.
+
 `order=asc|desc` retains attachment-ID cursors; `order=relevance` returns an opaque
 query/principal/scope-bound cursor and recomputes its authorized anchor and rank.
 Query-centered `excerpt` is capped at 800 characters. Both raw extraction and

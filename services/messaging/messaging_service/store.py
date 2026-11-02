@@ -686,13 +686,14 @@ class Store:
 
     def search_files(self,token,query='',account='',chat='',sender='',from_time='',to_time='',
                      after='',limit=20,*,accounts=None,chats=None,senders=None,query_mode='all',
-                     order='asc',before='',direction='',filename='',search_language='auto',include_coverage=True):
+                     order='asc',before='',direction='',filename='',search_language='auto',include_coverage=True,
+                     media_kind=None,ready=None):
         from .file_index import search_files
         with self.authorized(token,'search_files') as (c,p):
             return search_files(self,c,p,query,account,chat,sender,from_time,to_time,after,limit,
                 accounts=accounts,chats=chats,senders=senders,query_mode=query_mode,order=order,
                 before=before,direction=direction,filename=filename,search_language=search_language,
-                include_coverage=include_coverage)
+                include_coverage=include_coverage,media_kind=media_kind,ready=ready)
 
     def get_file_text(self,token,attachment_id,offset=0,limit=4000,content=None):
         from .file_index import get_file_text

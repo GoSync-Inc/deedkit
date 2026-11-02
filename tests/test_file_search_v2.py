@@ -124,6 +124,148 @@ def test_file_morphology_centered_snippet_relevance_and_bound_cursor(seeded):
         search(s, b, 'договор', search_language='russian', order='relevance', after=tampered)
 
 
+CLASSES = {  # attachment -> (provider label, MIME, expected media_class)
+    'm-voice': ('voice', 'audio/ogg', 'voice'), 'm-voice-mp4': ('voice', 'audio/mp4', 'voice'),
+    'm-voice-nolabel': (None, 'audio/ogg', 'voice'), 'm-voice-opus': (None, 'audio/opus', 'voice'),
+    'm-voice-app': (None, 'application/ogg', 'voice'),
+    'm-audio': ('audio', 'audio/mpeg', 'audio'), 'm-audio-nolabel': (None, 'audio/mpeg', 'audio'),
+    'm-photo': ('photo', 'image/jpeg', 'image'), 'm-sticker': ('sticker', 'image/webp', 'image'),
+    'm-image-nolabel': (None, 'image/png', 'image'),
+    'm-video': ('video', 'video/mp4', 'video'), 'm-animation': ('animation', 'video/mp4', 'video'),
+    'm-video-nolabel': (None, 'video/webm', 'video'),
+    'm-document': ('document', 'application/pdf', 'document'), 'm-other': ('other', 'application/zip', 'document'),
+    'm-text-nolabel': (None, 'text/plain', 'document'), 'm-photo-as-doc': ('document', 'image/jpeg', 'image'),
+}
+
+
+def media_files(s):
+    """One message per file (the provider label belongs to the message), then every file indexed."""
+    from test_search_v2 import add
+    for attachment, (label, mime, _) in CLASSES.items():
+        add(s, 'msg-' + attachment, 'caption of ' + attachment)
+        if label:
+            with s.pool.connection() as c:
+                c.execute('INSERT INTO message_metadata(message,revision,metadata) VALUES(%s,1,%s)',
+                          ('msg-' + attachment, Jsonb({'media_kind': label})))
+        add_file(s, attachment, 'msg-' + attachment, b'synthetic ' + attachment.encode(), attachment + '.bin', mime)
+    drain(worker_for(s))
+
+
+def only(result, prefix):
+    return sorted(x['attachment_id'] for x in result['items'] if x['attachment_id'].startswith(prefix))
+
+
+# spec: ANYM-661
+def test_media_kind_filter_classes_provider_labels_mime_fallback_and_aliases(seeded):
+    s, a, b = seeded
+    media_files(s)
+    everything = search(s, b, limit=100)
+    assert {x['attachment_id']: x['media_class'] for x in everything['items'] if x['attachment_id'].startswith('m-')} == {
+        name: expected for name, (_, _, expected) in CLASSES.items()}
+    by_class = lambda *kinds: sorted(n for n, (_, _, c) in CLASSES.items() if c in kinds)
+    for kinds, classes in ((['voice'], ('voice',)), (['audio'], ('audio',)), (['voice', 'audio'], ('voice', 'audio')),
+                           (['image'], ('image',)), (['photo'], ('image',)), (['sticker', 'image', 'photo'], ('image',)),
+                           (['video'], ('video',)), (['animation'], ('video',)), (['document'], ('document',)),
+                           (['other'], ('document',)), (['voice', 'voice', 'photo'], ('voice', 'image'))):
+        assert only(search(s, b, media_kind=kinds, limit=100), 'm-') == by_class(*classes), kinds
+    assert only(search(s, b, media_kind=[], limit=100), 'm-') == by_class('voice', 'audio', 'image', 'video', 'document')
+    row = [x for x in search(s, b, media_kind=['photo'], limit=100)['items'] if x['attachment_id'] == 'm-photo'][0]
+    assert row['media_class'] == 'image' and row['media_kind'] == 'photo'    # the provider label is unchanged
+
+
+# spec: ANYM-661
+@pytest.mark.parametrize('kwargs,field,reason', [
+    ({'media_kind': ['gif']}, 'media_kind', 'enum'), ({'media_kind': ['VOICE']}, 'media_kind', 'enum'),
+    ({'media_kind': 'voice'}, 'media_kind', 'type'), ({'media_kind': [1]}, 'media_kind', 'type'),
+    ({'ready': True}, 'ready', 'type'), ({'ready': ['transcripts']}, 'ready', 'enum'),
+    ({'ready': ['none', 'text']}, 'ready', 'format')])
+def test_media_filters_refuse_bad_values_with_field_errors(seeded, kwargs, field, reason):
+    s, a, b = seeded
+    with pytest.raises(APIError) as error:
+        search(s, b, **kwargs)
+    assert error.value.code == 'invalid_filter' and error.value.fields == [field]
+    entry, = error.value.field_errors
+    assert entry['field'] == field and entry['reason'] == reason
+    if reason == 'enum':
+        assert {'voice', 'photo'} <= set(entry['allowed']) or {'text', 'none'} <= set(entry['allowed'])
+
+
+READY = {  # attachment -> (MIME, what is ready)
+    'r-text': ('text/plain', 'text'), 'r-voice-ok': ('audio/ogg', 'transcript'), 'r-voice-none': ('audio/ogg', None),
+    'r-voice-old': ('audio/ogg', 'old-revision'), 'r-voice-super': ('audio/ogg', 'superseded'),
+    'r-image-desc': ('image/png', 'enrichment'), 'r-video-und': ('video/mp4', 'understanding'),
+    'r-doc-enriched': ('application/pdf', 'enrichment'), 'r-image-none': ('image/png', None)}
+
+
+def ready_files(s):
+    from test_search_v2 import add
+    for attachment, (mime, _) in READY.items():
+        add(s, 'msg-' + attachment, 'caption of ' + attachment)
+        add_file(s, attachment, 'msg-' + attachment, b'synthetic ' + attachment.encode(), attachment + '.bin', mime)
+    drain(worker_for(s))
+    with s.pool.connection() as c:
+        for attachment, (mime, what) in READY.items():
+            kind = {'audio/ogg': 'audio', 'image/png': 'image'}.get(mime, 'document')
+            if what in ('transcript', 'enrichment', 'old-revision', 'superseded'):
+                c.execute("""UPDATE attachment_enrichment SET state=%s,kind=%s,provider='test-local',model='fixture',title='T',
+                    summary='S',text_content='synthetic derived text',indexed_at=clock_timestamp(),
+                    source_digest=CASE WHEN %s THEN repeat('0',64) ELSE source_digest END WHERE attachment=%s""",
+                    ('superseded' if what == 'superseded' else 'ready', kind, what == 'old-revision', attachment))
+            if what == 'understanding':
+                c.execute("""UPDATE attachment_understanding SET state='ready',source_artifact_hash=repeat('a',64),
+                    published_profile_hash=repeat('b',64),title='T',summary='S',indexed_at=clock_timestamp() WHERE attachment=%s""",
+                    (attachment,))
+            if what == 'text':
+                c.execute("UPDATE attachment_text SET state='ready',text_content='synthetic text' WHERE attachment=%s", (attachment,))
+
+
+# spec: ANYM-661
+def test_ready_filter_reads_each_readiness_table_for_the_current_revision_only(seeded):
+    s, a, b = seeded
+    ready_files(s)
+    got = lambda **kw: only(search(s, b, limit=100, **kw), 'r-')
+    assert got(ready=['text']) == ['r-text']
+    assert got(ready=['transcript']) == ['r-voice-ok']        # a doc/image enrichment is a description, never a transcript
+    assert got(ready=['description']) == ['r-doc-enriched', 'r-image-desc', 'r-video-und']
+    assert got(ready=['text', 'transcript']) == ['r-text', 'r-voice-ok']
+    assert got(ready=['transcript', 'description', 'text']) == ['r-doc-enriched', 'r-image-desc', 'r-text', 'r-video-und', 'r-voice-ok']
+    # An older revision of a re-uploaded file and a superseded row never count.
+    assert got(ready=['none']) == ['r-image-none', 'r-voice-none', 'r-voice-old', 'r-voice-super']
+    assert got(media_kind=['voice'], ready=['transcript']) == ['r-voice-ok']
+    assert got(media_kind=['voice'], ready=['none']) == ['r-voice-none', 'r-voice-old', 'r-voice-super']
+    assert got(media_kind=['voice', 'audio']) == sorted(n for n, (m, _) in READY.items() if m == 'audio/ogg')
+    assert got(ready=[]) == sorted(READY)
+    # No match is an empty page, not an error; the original and its availability fields are never hidden by a filter.
+    empty = search(s, b, media_kind=['video'], ready=['transcript'])
+    assert empty['items'] == [] and empty['next_cursor'] is None
+    plain = {x['attachment_id']: x for x in search(s, b, limit=100)['items']}
+    fields = ('download_status', 'original_available', 'original_residency', 'extraction_status')
+    for item in search(s, b, ready=['description'], limit=100)['items']:
+        assert {k: item.get(k) for k in fields} == {k: plain[item['attachment_id']].get(k) for k in fields}
+
+
+# spec: ANYM-661
+def test_media_filters_bind_the_relevance_cursor_both_ways_and_a_keyset_anchor_continues(seeded):
+    s, a, b = seeded
+    ready_files(s)
+    kinds = ['voice', 'audio', 'document']
+    first = search(s, b, 'synthetic', order='relevance', limit=1, media_kind=kinds)
+    assert first['next_cursor'].startswith('q1.')
+    assert search(s, b, 'synthetic', order='relevance', limit=1, media_kind=['audio', 'voice', 'document'],
+                  after=first['next_cursor'])['items']
+    for changes in ({}, {'media_kind': ['voice']}, {'media_kind': kinds, 'ready': ['text']}):
+        with pytest.raises(APIError, match='invalid_cursor'):
+            search(s, b, 'synthetic', order='relevance', limit=1, after=first['next_cursor'], **changes)
+    plain = search(s, b, 'synthetic', order='relevance', limit=1)
+    for changes in ({'ready': ['none']}, {'media_kind': ['voice']}):
+        with pytest.raises(APIError, match='invalid_cursor'):
+            search(s, b, 'synthetic', order='relevance', limit=1, after=plain['next_cursor'], **changes)
+    # A keyset anchor need not pass the new filters: the page continues from its position.
+    rest = search(s, b, after='r-image-desc', media_kind=['document'], limit=100)
+    assert [x['attachment_id'] for x in rest['items'] if x['attachment_id'].startswith('r-')] == ['r-text']
+    assert all(x['media_class'] == 'document' for x in rest['items'])
+
+
 def test_reuse_context_free_text_and_occurrences_never_leak_hidden_names(seeded):
     s, a, b = seeded
     drain(worker_for(s))
