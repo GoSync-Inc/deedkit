@@ -140,7 +140,9 @@ def test_agent_cannot_choose_or_change_call_voice(tmp_path,field,value):
             body={**BRIEF,'source_message_ids':[],**(ROUTES[channel] or {}),field:value}
             operation='prepare_call' if channel=='browser' else 'prepare_external_call'
             response=client.post(f'/v1/{operation}',json={'brief':body},headers=AGENT)
-            assert response.status_code==422 and response.json()=={'error':'invalid_arguments'}
+            # ANYM-657: a refused prepare_external_call also names the fields; the refusal itself is unchanged.
+            assert response.status_code==422 and response.json()['error']=='invalid_arguments'
+            if channel=='browser':assert response.json()=={'error':'invalid_arguments'}
         assert client.app.state.service.db.execute('SELECT count(*) FROM briefs').fetchone()[0]==0
     assert {'goal','destination'}<=property_names(METHODS['prepare_external_call'][0].model_json_schema())
     for name,(model,_) in METHODS.items():
