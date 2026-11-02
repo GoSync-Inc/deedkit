@@ -142,27 +142,18 @@ def for_rows(c,rows):
         for mid,proofs in grouped.items()}
 
 
-def _reference_chat(c,account,provider_chat,provider_id):
-    """Self-chat, stored chat type and bot-peer evidence of the chat an outbox reference points to.
-    The bot flag reads only the 20 newest incoming messages, like the self-chat evidence of the chat list."""
-    row=c.execute('''SELECT coalesce(bool_or('''+SELF_CHAT_SQL+'''),false) AS self_chat,max(ch.chat_type) AS chat_type,
-        (SELECT coalesce(bool_or(bmd.metadata->'sender_is_bot'='true'::jsonb),false) FROM (
-            SELECT bm.id,bm.revision FROM messages bm JOIN chats bc ON bc.id=bm.chat AND bc.account=bm.account
-            WHERE bc.account=%s AND bc.provider_chat=%s AND bm.direction='incoming'
-            ORDER BY bm.sent_at DESC LIMIT 20) recent
-            JOIN message_metadata bmd ON bmd.message=recent.id AND bmd.revision=recent.revision) AS bot
+def _reference_self_chat(c,account,provider_chat,provider_id):
+    row=c.execute('''SELECT coalesce(bool_or('''+SELF_CHAT_SQL+'''),false) AS self_chat
         FROM chats ch LEFT JOIN chat_read_observations ro ON ro.chat=ch.id
         LEFT JOIN messages m ON m.chat=ch.id AND m.account=ch.account AND m.provider_id=%s
         LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision
-        WHERE ch.account=%s AND ch.provider_chat=%s''',(account,provider_chat,provider_id,account,provider_chat)).fetchone()
-    return {'self_chat':bool(row and row['self_chat']),'chat_type':row['chat_type'] if row else None,
-        'bot':bool(row and row['bot'])}
+        WHERE ch.account=%s AND ch.provider_chat=%s''',(provider_id,account,provider_chat)).fetchone()
+    return bool(row and row['self_chat'])
 
 
 def for_reference(c,account,provider_chat,provider_id,platform=None,context=None):
     """Authorized outbox reference, including receipts captured before ingestion.
-    context: an optional dict that receives the platform and chat facts this lookup already reads
-    (ANYM-659), so a caller needs no further query."""
+    context: an optional dict that receives the platform this lookup already reads (ANYM-659)."""
     if platform is None:
         found=c.execute('SELECT platform FROM accounts WHERE id=%s',(account,)).fetchone()
         platform=found['platform'] if found else None
@@ -180,9 +171,27 @@ def for_reference(c,account,provider_chat,provider_id,platform=None,context=None
             ORDER BY r.state,r.observed_at,r.id''',
             (account,provider_chat,provider_id)).fetchall())
     else:return unknown_evidence()
-    chat=_reference_chat(c,account,provider_chat,provider_id)
-    if context is not None:context.update(chat)
-    return self_chat_evidence(proof) if chat['self_chat'] else proof
+    return self_chat_evidence(proof) if _reference_self_chat(c,account,provider_chat,provider_id) else proof
+
+
+# ANYM-659 chat facts for the receipt hint. Optional enrichment: bounded to the 20 newest messages of the chat
+# (index message_chat_date, as the chat list's self-chat evidence) and run in a savepoint, so a failure or
+# timeout here gives unknown facts and never fails the send-status read.
+HINT_CHAT_SQL='''SELECT ch.chat_type,{self_chat} AS self_chat,
+    EXISTS(SELECT 1 FROM (SELECT r.id,r.revision FROM messages r WHERE r.account=ch.account AND r.chat=ch.id
+        ORDER BY r.sent_at DESC LIMIT 20) recent JOIN message_metadata bmd ON bmd.message=recent.id
+        AND bmd.revision=recent.revision WHERE bmd.metadata->'sender_is_bot'='true'::jsonb) AS bot
+    FROM chats ch WHERE ch.account=%s AND ch.provider_chat=%s'''
+
+
+def hint_chat_facts(c,account,provider_chat):
+    """{'chat_type','self_chat','bot'} of the chat, or {} when it is not found or the lookup fails."""
+    try:
+        from .chat_queries import self_chat_sql
+        with c.transaction():
+            row=c.execute(HINT_CHAT_SQL.replace('{self_chat}',self_chat_sql('ch')),(account,provider_chat)).fetchone()
+        return {'chat_type':row['chat_type'],'self_chat':bool(row['self_chat']),'bot':bool(row['bot'])} if row else {}
+    except Exception:return {}
 
 
 OVERDUE_AFTER_S=600
@@ -202,16 +211,20 @@ def messenger_reports(platform,chat_type=None,bot=False,self_chat=False):
 
 def receipt_hint(platform,chat_type,bot,self_chat,evidence_state,sent_at,now):
     """messenger_reports and receipt_state for a send in status sent: pure and total, no I/O.
-    Any missing or malformed input gives (None,'unknown')."""
+    A missing or malformed input (None for an unknown fact, never False) gives (None,'unknown')."""
+    unknown=(None,'unknown')
     try:
-        reports=messenger_reports(platform,chat_type,bool(bot),bool(self_chat))
+        if platform not in ('whatsapp','telegram') or type(self_chat) is not bool:return unknown
+        if not isinstance(evidence_state,str) or not isinstance(sent_at,datetime) or not isinstance(now,datetime):return unknown
+        if platform=='telegram' and not self_chat and (chat_type not in ('private','group','channel') or type(bot) is not bool):
+            return unknown
+        reports=messenger_reports(platform,chat_type,bot,self_chat)
+        if reports is None:return unknown
         if evidence_state in RECEIPT_LEVELS:return reports,evidence_state
         if evidence_state=='error':return reports,'receipt_error'
-        if reports is None:return None,'unknown'
         if 'delivered' not in reports:return reports,'not_reported'
-        if not isinstance(sent_at,datetime) or not isinstance(now,datetime):return reports,'unknown'
         return reports,'overdue' if (now-sent_at).total_seconds()>=OVERDUE_AFTER_S else 'pending'
-    except Exception:return None,'unknown'
+    except Exception:return unknown
 
 
 def publish(c,account,limit=100):

@@ -78,12 +78,27 @@ def test_self_chat_and_bot_peer_never_report_delivery():
 
 
 # spec: ANYM-659
-@pytest.mark.parametrize('bad', [None, 'x', 1, [], {}])
-def test_hint_is_total_for_missing_or_malformed_input(bad):
-    assert receipt_hint(bad, bad, bad, bad, bad, bad, bad)[1] in ('unknown', 'receipt_error', 'not_reported')
-    assert hint('whatsapp', 'private', sent_at=None) == (['delivered', 'read'], 'unknown')
-    assert receipt_hint('whatsapp', 'private', False, False, 'unknown', NOW, None) == (['delivered', 'read'], 'unknown')
+@pytest.mark.parametrize('missing', ['platform', 'chat_type', 'bot', 'self_chat', 'evidence', 'sent_at', 'now'])
+def test_each_missing_input_gives_null_and_unknown(missing):
+    args = dict(platform='telegram', chat_type='private', bot=False, self_chat=False, evidence='read',
+        sent_at=NOW - timedelta(minutes=5), now=NOW)
+    assert receipt_hint(*args.values())[1] == 'read'
+    args[missing] = None
+    assert receipt_hint(*args.values()) == (None, 'unknown')
+    # WhatsApp needs neither a chat type nor a bot flag, but every other input
+    whatsapp = dict(platform='whatsapp', chat_type=None, bot=None, self_chat=False, evidence='delivered',
+        sent_at=NOW - timedelta(minutes=5), now=NOW)
+    assert receipt_hint(*whatsapp.values()) == (['delivered', 'read'], 'delivered')
+    if missing not in ('chat_type', 'bot'):
+        assert receipt_hint(*{**whatsapp, missing: None}.values()) == (None, 'unknown')
+
+
+# spec: ANYM-659
+@pytest.mark.parametrize('bad', ['x', 1, [], {}, True])
+def test_hint_is_total_for_malformed_input(bad):
+    assert receipt_hint(bad, bad, bad, bad, bad, bad, bad) == (None, 'unknown')
     assert receipt_hint('signal', None, False, False, 'unknown', None, None) == (None, 'unknown')
+    assert receipt_hint('whatsapp', 'private', False, False, 'unknown', 'yesterday', NOW) == (None, 'unknown')
 
 
 def row(**changes):
@@ -210,3 +225,62 @@ def test_whatsapp_send_walks_pending_overdue_delivered_and_error(seeded):
     assert final['recipient_delivery_confirmed'] is True
     assert store.send_message(key, account, stable_id('chat', account, chat), 'Synthetic hint payload',
         'receipt-hint-wa-0001')['receipt_state'] == 'read'
+
+
+def _whatsapp(seeded, account, **event_changes):
+    from messaging_service.archive import Archive
+    from messaging_service.collector_state import CollectorState
+    store, _, _ = seeded
+    archive = Archive(store)
+    chat = '100@c.us'
+    archive.register(account, 'whatsapp', 'Synthetic hint account', discover=True)
+    archive.ingest(event(account=account, platform='whatsapp', chat=chat, provider_id='existing', **event_changes))
+    key = store.issue_key(account + '-reader', [account], permissions=['read', 'send'])
+    epoch = archive.acquire(account, account + '-worker')
+    state = CollectorState(archive, account, (account + '-worker', epoch))
+    state.phase('connection', 'connected', 'provider_ready')
+    archive.set_sending(account, True)
+    action = store.send_message(key, account, stable_id('chat', account, chat), 'Synthetic hint payload',
+        account + '-0001')
+
+    async def provider(job):
+        return {'provider_message_id': 'true_' + chat + '_synthetic'}
+    assert asyncio.run(OutgoingWorker(state, provider).once())
+    return store, key, action
+
+
+# spec: ANYM-659
+def test_known_self_chat_reports_nothing_before_the_sent_message_is_archived(seeded):
+    # earlier archived messages carry the self-chat flag; the new outgoing message is not archived yet
+    store, key, action = _whatsapp(seeded, 'hint-self-wa', metadata={'is_self_chat': True})
+    sent = store.get_send_status(key, action['send_id'])
+    assert sent['messenger_reports'] == [] and sent['receipt_state'] == 'not_reported'
+    assert sent['delivery_receipt']['state'] == 'unknown' and sent['next_action'] == 'none'
+
+
+# spec: ANYM-659
+def test_a_failing_chat_lookup_leaves_the_send_status_readable(seeded, monkeypatch):
+    from messaging_service import receipts
+    store, key, action = _whatsapp(seeded, 'hint-fail-wa')
+    assert store.get_send_status(key, action['send_id'])['receipt_state'] == 'pending'
+    monkeypatch.setattr(receipts, 'HINT_CHAT_SQL', 'SELECT nope FROM nowhere WHERE a=%s AND b=%s')
+    failed = store.get_send_status(key, action['send_id'])
+    assert failed['status'] == 'sent' and failed['provider_message_id']
+    assert failed['messenger_reports'] is None and failed['receipt_state'] == 'unknown'
+    assert failed['delivery_receipt']['state'] == 'unknown' and failed['next_action'] == 'none'
+    again = store.get_send_status(key, action['send_id'])
+    assert again['status'] == 'sent'
+    assert store.send_message(key, 'hint-fail-wa', stable_id('chat', 'hint-fail-wa', '100@c.us'),
+        'Synthetic hint payload', 'hint-fail-wa-0001')['send_id'] == action['send_id']
+
+
+# spec: ANYM-659
+def test_the_chat_lookup_is_bounded_by_the_chat_date_index(seeded):
+    from messaging_service.receipts import HINT_CHAT_SQL
+    from messaging_service.chat_queries import self_chat_sql
+    store, _, _ = seeded
+    with store.pool.connection() as c:
+        c.execute('SET LOCAL enable_seqscan=off')
+        plan = '\n'.join(r['QUERY PLAN'] for r in c.execute(
+            'EXPLAIN ' + HINT_CHAT_SQL.replace('{self_chat}', self_chat_sql('ch')), ('telegram-demo', '100')))
+    assert 'message_chat_date' in plan

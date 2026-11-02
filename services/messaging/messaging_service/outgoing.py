@@ -320,7 +320,7 @@ def project_reference(c,p,account,reference):
 
 
 def result(row,c=None,p=None):
-    from .receipts import for_reference,receipt_hint,unknown_evidence
+    from .receipts import for_reference,hint_chat_facts,receipt_hint,unknown_evidence
     actual,reference_state=project_reference(c,p,row['account'],row.get('archive_reference'))
     context={}
     receipt=for_reference(c,row['account'],
@@ -333,10 +333,14 @@ def result(row,c=None,p=None):
     warning_codes=artifact.get('warnings',[]) if isinstance(artifact,dict) else []
     hint={}
     if row['status']=='sent':
-        # ANYM-659: pure function of facts the receipt lookup already read; a restricted scope hides the evidence.
-        reports,state=receipt_hint(context.get('platform'),context.get('chat_type'),context.get('bot'),
-            context.get('self_chat'),receipt['state'],
-            row.get('finished_at'),datetime.now(timezone.utc))
+        # ANYM-659: a pure function of facts already read plus one guarded, bounded chat lookup; a restricted scope
+        # hides the evidence, and any failure gives the unknown pair.
+        try:
+            facts=hint_chat_facts(c,row['account'],actual['provider_chat_id'] if actual else row['provider_chat']) if c is not None and context.get('platform') else {}
+            reports,state=receipt_hint(context.get('platform'),facts.get('chat_type'),facts.get('bot'),
+                True if receipt['basis']=='self_chat' else facts.get('self_chat'),receipt['state'],
+                row.get('finished_at'),datetime.now(timezone.utc))
+        except Exception:reports,state=None,'unknown'
         hint={'messenger_reports':reports,'receipt_state':'unknown' if reference_state=='scope_restricted' else state}
     return serial({
         **hint,
