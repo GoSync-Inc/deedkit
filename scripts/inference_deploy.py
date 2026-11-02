@@ -265,6 +265,27 @@ class SshMini:
         if code and 'Could not find service' not in out and 'No such process' not in out:
             raise MiniError('launchctl bootout failed: ' + out[-200:])
 
+    def _recover_command(self, sha: str, *flags: str) -> str:
+        return sudo('env', '-i', f'HOME={self.home}', 'PATH=/usr/bin:/bin', f'{self.home}/releases/{sha}/.venv/bin/deedkit-inference',
+                    'recover', '--state-dir', f'{self.home}/state', *flags)
+
+    def recover_capable(self, sha: str) -> bool:
+        """True when that release has `recover` and can read the ledger and the process table (exit 0 of --check)."""
+        return self._run(self._recover_command(sha, '--check'), timeout=60)[0] == 0
+
+    def ledger_exists(self) -> bool:
+        script = f'if test -e {self.home}/state/paused.json ; then echo present ; else echo absent ; fi'
+        code, out = self._run(sudo('sh', '-c', shlex.quote(script)))
+        if code or out.strip() not in ('present', 'absent'):
+            raise MiniError('could not look for the pause ledger: ' + out[-200:])
+        return out.strip() == 'present'
+
+    def recover(self, sha: str) -> None:
+        """Continue and kill the engine groups a stopped service left paused (ANYM-691); fails when one remains."""
+        code, out = self._run(self._recover_command(sha), timeout=120)
+        if code:
+            raise MiniError('recover failed: ' + out[-300:])
+
     def point(self, sha: str) -> None:
         h = self.home
         script = (f'set -e ; test -f {h}/releases/{sha}/.ready ; '
@@ -319,6 +340,7 @@ class Deploy:
                 self.mini.upload(sha, self.archive(sha))
                 self.mini.sync(sha)
             self.drain()
+            self.recover(sha)
             self.mini.point(sha)
             self.mini.start()
             self.read_back(sha)
@@ -340,9 +362,30 @@ class Deploy:
             if previous is None or not self.mini.has_release(previous):
                 raise DeployError('there is no previous release to roll back to')
             self.drain()
+            self.recover(previous)
             self.mini.point(previous)
             self.mini.start()
             self.read_back(previous)
+
+    def recover(self, target: str) -> None:
+        """After the job is unloaded and before `current` moves: continue and kill engine groups the service left stopped
+        (ANYM-691 criterion 5). The release being left created any ledger, so it goes first; then the target. A release
+        without the command (the one deployed before the feature, or a rollback to it) is skipped; when none has it no
+        release could pause anything, so a ledger cannot exist, and one that does exist fails the deploy closed."""
+        leaving = self.mini.current_release()
+        for release in dict.fromkeys(r for r in (leaving, target) if r):
+            if self.mini.recover_capable(release):
+                self.out(f'recovering stopped engine groups with release {release[:12]}')
+                try:
+                    self.mini.recover(release)
+                except MiniError as exc:
+                    raise DeployError(f'{exc}; nothing was switched and the service was not started. Fix it, then run the '
+                                      'same command again') from None
+                return
+        if self.mini.ledger_exists():
+            raise DeployError('a pause ledger (state/paused.json) exists and no release on the mini can read it; nothing was '
+                              'switched. Read the runbook section 14, recover by hand, then run the same command again')
+        self.out('no release on the mini can pause engines and no pause ledger exists: recovery skipped')
 
     def drain(self) -> None:
         pid = self.mini.service_pid()

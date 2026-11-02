@@ -172,5 +172,5 @@ def recover(path: str | Path, run_ps: Callable[[], str] | None = None,
     if remaining:
         ledger._write(remaining)
     else:
-        ledger.clear_if_empty()
+        unlink_quietly(ledger.path)
     return {"groups": len(entries), "killed": killed, "kept": kept}
