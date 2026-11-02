@@ -131,6 +131,29 @@ def test_feedback_operation_other_modules(seeded):
             submitted(store, token, 'synthetic-bad-%d' % index, name)
 
 
+# spec: ANYM-670
+def test_feedback_operation_accepts_the_messenger_action_tools(seeded):
+    store, _, _ = seeded
+    token = identity(store)
+    names = ('change_message', 'manage_chat', 'change_contacts', 'read_contacts')
+    for index, name in enumerate(names):
+        first = submitted(store, token, 'synthetic-action-%d' % index, 'messages_' + name)
+        # The bare spelling of the same name is the same request, stored bare.
+        assert submitted(store, token, 'synthetic-action-%d' % index, name) == first
+    stored = {item['operation'] for item in feedback_call(store, token, 'list_feedback')['items']}
+    assert stored == set(names)
+
+
+# spec: ANYM-670
+def test_feedback_operation_accepts_recordings_tools(seeded):
+    store, _, _ = seeded
+    token = identity(store)
+    names = ('recordings_capabilities', 'recordings_list', 'recordings_read', 'recordings_audio')
+    for index, name in enumerate(names):
+        submitted(store, token, 'synthetic-recording-%d' % index, name)
+    assert {item['operation'] for item in feedback_call(store, token, 'list_feedback')['items']} == set(names)
+
+
 # spec: ANYM-342
 def test_feedback_operation_unknown_field_error(seeded):
     store, _, _ = seeded

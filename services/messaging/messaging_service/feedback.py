@@ -7,6 +7,7 @@ import json
 import re
 from psycopg.types.json import Jsonb
 from .field_errors import field_error, one_per_field
+from .messenger_operations import OPERATION_TOOLS
 from .policy import OPERATION_PERMISSIONS, audit, scope_filter, targets
 
 
@@ -21,8 +22,9 @@ FIXED_IN = re.compile(r'deedkit@[0-9a-f]{40}|anymsg@(0|[1-9][0-9]*)\.(0|[1-9][0-
 SPEC_REF = re.compile(r'ANYM-[1-9][0-9]{0,5}')
 # ANYM-342: `operation` names the tool as the agent sees it. Messaging keeps no copy of the other modules' tool
 # lists (the gateway checks those against its catalog), so another module's tool is accepted by shape alone.
+# ANYM-670: its own tools are the operation keys plus the risk-class tools of messenger_operations.OPERATION_TOOLS.
 GATEWAY_PREFIX = 'messages_'
-OTHER_MODULE_TOOL = re.compile(r'(calendar|calls|platform)_[a-z0-9_]{1,120}')
+OTHER_MODULE_TOOL = re.compile(r'(calendar|calls|platform|recordings)_[a-z0-9_]{1,120}')
 UUID = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 # A submission transaction ends within this bound or is aborted, never committed late (ANYM-265). The export
 # overlap minimum (2 minutes) exceeds it plus the 5 s statements that authorize the key before it starts.
@@ -34,10 +36,13 @@ DISPOSITION_FIELDS = ('id', 'status', 'status_note', 'fixed_in', 'spec_ref', 'du
 
 def canonical_operation(name):
     """The stored form of an `operation`, or None: messaging operations bare, other modules' tools as given."""
-    if name in OPERATION_PERMISSIONS:
+    if name in OPERATION_PERMISSIONS or name in OPERATION_TOOLS:
         return name
-    if name.startswith(GATEWAY_PREFIX) and name[len(GATEWAY_PREFIX):] in OPERATION_PERMISSIONS:
-        return name[len(GATEWAY_PREFIX):]
+    bare = name[len(GATEWAY_PREFIX):]
+    if name.startswith(GATEWAY_PREFIX) and (bare in OPERATION_PERMISSIONS or bare in OPERATION_TOOLS):
+        return bare
+    if GATEWAY_PREFIX + name in OPERATION_PERMISSIONS:  # `send`: the gateway tool messages_send is itself the operation key
+        return GATEWAY_PREFIX + name
     return name if OTHER_MODULE_TOOL.fullmatch(name) else None
 
 
