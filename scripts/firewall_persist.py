@@ -92,12 +92,24 @@ def covers(tokens, bridge):
     return not hit if index > 0 and tokens[index - 1] == '!' else hit
 
 
+def plain_jump(rule):
+    """A rule whose only condition is an interface: any other match (protocol, address) limits what it carries."""
+    tokens = rule.split()[2:]
+    while tokens:
+        if tokens[0] == '!' or tokens[0] in ('-i', '-j'):
+            tokens = tokens[1:] if tokens[0] == '!' else tokens[2:]
+        else:
+            return False
+    return True
+
+
 def bypasses(rule, bridge, chains, top=True, seen=()):
     """Whether a rule can accept or return `bridge`'s traffic out of its chain (following jumps and gotos into user chains).
 
     Conditions other than the interface are ignored, so this errs towards "yes": an unclear flow is rejected, not trusted.
     A RETURN ends a user chain's walk quietly (back to the caller) and only leaves the base chain from the base chain itself
-    or through a goto.
+    or through a goto; a goto into a chain that does not end in an unconditional DROP also leaves it by falling off the
+    chain's end (an empty chain, or one that only logs, included).
     """
     tokens = rule.split()
     flag = '-g' if '-g' in tokens else '-j'
@@ -108,6 +120,10 @@ def bypasses(rule, bridge, chains, top=True, seen=()):
         return True
     if target == 'RETURN':
         return top
+    if flag == '-g' and top and target not in seen and target not in ('DROP', 'REJECT'):
+        inner = chains.get(target, [])
+        if not inner or inner[-1].split()[2:] != ['-j', 'DROP']:
+            return True
     if target in chains and target not in seen:
         return any(bypasses(inner, bridge, chains, top and flag == '-g', (*seen, target)) for inner in chains[target])
     return False
@@ -154,7 +170,7 @@ def extract(text, table, chain, bridges, family='v4', kernel=False):
             entry, part = ' '.join(['-A', 'INPUT', *rule.split()[2:]]), 'inputs'
             if name == ufw_input and kernel:
                 jump = next((i for i, other in enumerate(chains.get('INPUT', []))
-                             if other.split()[-2:] == ['-j', ufw_input] and covers(other.split(), bridge)), None)
+                             if other.split()[-2:] == ['-j', ufw_input] and plain_jump(other) and covers(other.split(), bridge)), None)
                 if jump is None:
                     continue
                 path.insert(0, ('INPUT', jump))
@@ -383,10 +399,29 @@ def command_output(command, *arguments):
     return result.stdout if result.returncode == 0 else ''
 
 
-def unit_wall(systemctl, unit, name):
-    """A unit timestamp as wall-clock seconds (systemctl --timestamp=unix prints @SECONDS), or None."""
-    value = command_output(systemctl, 'show', unit, '-p', name, '--timestamp=unix', '--value').strip()
+def manager_wall(systemctl, name):
+    """A timestamp of the service manager as wall-clock seconds (--timestamp=unix prints @SECONDS), or None."""
+    value = command_output(systemctl, 'show', '-p', name, '--timestamp=unix', '--value').strip()
     return int(value[1:]) if value.startswith('@') and value[1:].isdigit() else None
+
+
+def manager_time(systemctl, name):
+    value = command_output(systemctl, 'show', '-p', name, '--value').strip()
+    return int(value) / 1_000_000 if value.isdigit() and int(value) > 0 else None
+
+
+def clock_mapping(systemctl):
+    """(wall time of boot, whether the wall clock is unchanged since), from the manager's own pair of timestamps.
+
+    UserspaceTimestamp and its monotonic twin are taken once, at one instant, when the manager starts at boot; they do not
+    change when docker.service restarts. If the clock differs from that pair by more than 2 s now, it stepped since boot.
+    """
+    wall = manager_wall(systemctl, 'UserspaceTimestamp')
+    mono = manager_time(systemctl, 'UserspaceTimestampMonotonic')
+    if wall is None or mono is None:
+        return None, False
+    boot_wall = wall - mono
+    return boot_wall, abs((time.time() - time.monotonic()) - boot_wall) < 2.0
 
 
 def unit_time(systemctl, unit, name):
@@ -468,12 +503,7 @@ def receipt_cli(argv):
     raw_time = state.get('uptime') if mine and isinstance(state.get('uptime'), (int, float)) else None
     raw_ok = bool(mine and state.get('ok') is True)
     ufw = unit_time(args.systemctl, 'ufw.service', 'ExecMainExitTimestampMonotonic')
-    # The wall clock has not stepped since docker.service started when its wall and monotonic start times still differ by
-    # what the clock differs by now (they were taken at one instant).
-    docker_wall = unit_wall(args.systemctl, 'docker.service', 'ExecMainStartTimestamp')
-    docker_mono = unit_time(args.systemctl, 'docker.service', 'ExecMainStartTimestampMonotonic')
-    boot_wall = docker_wall - docker_mono if docker_wall is not None and docker_mono is not None else None
-    stable = boot_wall is not None and abs((time.time() - time.monotonic()) - boot_wall) < 2.0
+    boot_wall, stable = clock_mapping(args.systemctl)
     container = first_container_start(args.docker, boot_wall=boot_wall, stable=stable)
     receipt = {'boot_id': boot, 'inference': results['inference'], 'delivery': results['delivery'],
                'ok': all(value == 'ok' for value in results.values()),

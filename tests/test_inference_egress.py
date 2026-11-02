@@ -1,5 +1,6 @@
 """The mini-facing enrichment worker's host rules and egress check (ANYM-688); local sockets only, no firewall is changed."""
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -478,6 +479,18 @@ def test_verify_rejects_a_rule_that_accepts_the_bridge_before_the_managed_hook(t
         host.kernel[('iptables', 'raw')] = text.replace(raw_hook, early + '\n' + raw_hook).replace('COMMIT', ':EARLY - [0:0]\n' + inside + '\nCOMMIT')
         code, out, _ = host.run()
         assert code == 1 and out.splitlines()[0] == f'kernel_vs_repo extra:{early}', (early, inside, out)
+    # A goto falls off the end of its chain back out of the base chain: an empty chain or one that only logs is a bypass,
+    # one that ends in an unconditional DROP is not.
+    for inside, bypass in (('', True), ('-A EARLY -j LOG', True), ('-A EARLY -j LOG\n-A EARLY -j DROP', False)):
+        host = Host(tmp_path)
+        text = host.kernel[('iptables', 'raw')]
+        host.kernel[('iptables', 'raw')] = text.replace(raw_hook, '-A PREROUTING -g EARLY\n' + raw_hook).replace(
+            'COMMIT', ':EARLY - [0:0]\n' + inside + '\nCOMMIT')
+        code, out, _ = host.run()
+        if bypass:
+            assert code == 1 and out.splitlines()[0] == 'kernel_vs_repo extra:-A PREROUTING -g EARLY', (inside, out)
+        else:
+            assert (code, out) == (0, 'ok\n'), inside
     # A chain that only logs, returns to its caller or is for another bridge is no bypass.
     for early, inside in (('-A PREROUTING -j EARLY', '-A EARLY -j LOG'), ('-A PREROUTING -j EARLY', '-A EARLY -j RETURN'),
                           ('-A PREROUTING -i br-other -j EARLY', '-A EARLY -j ACCEPT')):
@@ -515,6 +528,13 @@ def test_verify_counts_host_bound_drops_only_in_their_family_and_reachable_chain
             'COMMIT', jump + '\nCOMMIT')
         code, out, _ = host.run()
         assert code == 1 and out.splitlines()[0] in ('kernel_vs_repo hook_absent:dk-inference0', 'kernel_vs_repo extra:-A INPUT -j ACCEPT'), out
+    # A jump limited by a protocol carries only part of the traffic; a wildcard interface jump carries all of it.
+    host = Host(tmp_path)
+    host.kernel[('iptables', 'filter')] = host.kernel[('iptables', 'filter')].replace(drops, '-A ufw-before-input -i dk-inference').replace(
+        'COMMIT', '-A INPUT -p tcp -j ufw-before-input\nCOMMIT')
+    assert host.run()[1].splitlines()[0] == 'kernel_vs_repo hook_absent:dk-inference0'
+    host.kernel[('iptables', 'filter')] = host.kernel[('iptables', 'filter')].replace('-A INPUT -p tcp -j', '-A INPUT -i dk-inference+ -j')
+    assert host.run()[:2] == (0, 'ok\n')
     # The IPv6 file's chain is not the IPv4 file's.
     host = Host(tmp_path)
     host.files['v4'].write_text(host.files['v4'].read_text().replace('-A ufw-before-input -i dk-inference', '-A ufw6-before-input -i dk-inference'))
@@ -677,6 +697,58 @@ def test_receipt_command_writes_the_boot_receipt_and_fails_when_a_verify_fails(t
     state.write_text(json.dumps({'boot_id': 'b-0', 'uptime': 12.5, 'ok': True, 'reason': 'ok'}))
     subprocess.run([*base, '--verify', 'inference=echo ok', '--verify', 'delivery=echo ok'], text=True, capture_output=True, timeout=30)
     assert json.loads(out.read_text())['raw_step_monotonic'] is None
+
+
+# spec: ANYM-693
+def test_receipt_continuity_comes_from_the_service_managers_boot_pair(tmp_path):
+    offset = time.time() - time.monotonic()
+    systemctl = tmp_path / 'systemctl'
+    state = tmp_path / 'raw-step.json'
+
+    def receipt(shift):
+        # The manager's UserspaceTimestamp pair: 5 s after boot, as the wall clock read then (shift: it was set since).
+        systemctl.write_text('#!/bin/sh\ncase "$*" in\n  *--timestamp=unix*) echo @%d;;\n  *UserspaceTimestampMonotonic*) echo 5000000;;\n'
+                             '  *) echo;;\nesac\n' % int(offset + 5 + shift))
+        systemctl.chmod(0o755)
+        out = tmp_path / f'receipt{shift}.json'
+        subprocess.run([sys.executable, '-I', str(PERSIST), 'receipt', '--out', str(out), '--boot-id', 'b-1', '--raw-state', str(state),
+                        '--systemctl', str(systemctl), '--docker', 'true', '--verify', 'inference=echo ok', '--verify', 'delivery=echo ok'],
+                       text=True, capture_output=True, timeout=30)
+        return json.loads(out.read_text())
+    assert receipt(0)['clock_continuous'] is True
+    # A clock stepped since boot (60 s), or no pair at all, is not continuity; the manager's pair does not move when
+    # docker.service restarts, so a restart cannot hide the step.
+    assert receipt(60)['clock_continuous'] is False
+    systemctl.write_text('#!/bin/sh\necho\n')
+    out = tmp_path / 'none.json'
+    subprocess.run([sys.executable, '-I', str(PERSIST), 'receipt', '--out', str(out), '--boot-id', 'b-1', '--raw-state', str(state),
+                    '--systemctl', str(systemctl), '--docker', 'true', '--verify', 'inference=echo ok', '--verify', 'delivery=echo ok'],
+                   text=True, capture_output=True, timeout=30)
+    assert json.loads(out.read_text())['clock_continuous'] is False
+
+
+# spec: ANYM-693
+@pytest.mark.skipif(shutil.which('timeout') is None or not Path('/proc/uptime').exists(), reason='needs GNU timeout and /proc (Linux)')
+def test_outer_kill_of_a_term_ignoring_command_with_a_full_stderr_still_ends_with_exit_zero(tmp_path):
+    hook, state = after_init(tmp_path), tmp_path / 'raw-step.json'
+    wrappers = tmp_path / 'bin'
+    wrappers.mkdir()
+    # The restore ignores TERM and writes more to stderr than a pipe holds, with nobody reading it.
+    (wrappers / 'iptables-restore').write_text("#!/bin/sh\ntrap '' TERM\nhead -c 300000 /dev/zero | tr '\\0' x >&2\nwhile :; do sleep 1; done\n")
+    (wrappers / 'iptables-restore').chmod(0o755)
+    env = {**os.environ, 'PATH': f'{wrappers}:{os.environ["PATH"]}', 'DEEDKIT_HOOK_TIMEOUT': '3', 'DEEDKIT_STEP_TIMEOUT': '30',
+           'DEEDKIT_RAW_STATE': str(state)}
+    started = time.monotonic()
+    process = subprocess.Popen(['sh', str(hook), 'start'], stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, env=env)
+    try:
+        assert process.wait(timeout=40) == 0
+        assert time.monotonic() - started < 40
+    finally:
+        process.kill()
+        assert process.stderr is not None
+        process.stderr.close()
+    record = json.loads(state.read_text())
+    assert record['ok'] is False and record['reason'].startswith('hook_'), record
 
 
 # spec: ANYM-693
