@@ -1423,7 +1423,9 @@ masquerading rewrites the source of a packet that leaves the host, so do not fil
 subnet; search for the unique label instead. The bridge capture must show the label on `dk-inference0`
 (the check did generate the query), and no other interface (`tailscale0`, the uplink) may show it. First
 the positive control: from the host, `getent hosts probe-control-<random>.example.com` must show its label
-on the uplink in the same capture, or the capture proves nothing. Keep `dns.txt` with the receipt.
+on the uplink in the same capture, or the capture proves nothing. `dns.txt` holds every name the host
+resolved: keep it private on the host (mode 0600, removed after the review), and give the receipt only the
+labels, the interfaces that showed them and the verdict.
 
 Undo (reverse): `docker compose $F --profile enrichment-mini stop enricher-mini` and `rm enricher-mini`;
 `docker network disconnect <project>_inference_db <db container>`; `docker network rm
@@ -1436,23 +1438,31 @@ both chains). The worker's jobs requeue on SIGTERM; nothing in the database chan
 
 The plan to enable it is [inference-enable.md](inference-enable.md). Whoever reads the production status of a
 day also does this read-only watch (operator DSN, `psql` through the host's documented database access; no write)
-and reports any hit as a digest FYI line:
+and reports any hit as a digest FYI line, with the time of the reading (two readings 24 hours apart that show the
+same scope held, with no success between, are one sustained stall):
 
 ```sql
 -- 1. the oldest queued enrichment row waiting for its turn (hours); report above 24
 SELECT round(extract(epoch FROM clock_timestamp() - min(next_due)) / 3600, 1) AS oldest_queued_hours, count(*) AS queued
   FROM attachment_enrichment WHERE state = 'queued' AND error_code IS DISTINCT FROM 'model_backpressure'
    AND next_due <= clock_timestamp();
--- 2. jobs held by the mini (model_backpressure) and the hours since the last success from it; report when
---    held > 0 and hours_since_ready is above 24 (a deferral refreshes the row and the pause timestamps, so the
---    age of one pause cannot be read; "no success for 24 hours while jobs are held" is the same fact)
-SELECT (SELECT count(*) FROM attachment_enrichment WHERE state = 'queued' AND error_code = 'model_backpressure') AS held,
-       round(extract(epoch FROM clock_timestamp() - max(updated_at)) / 3600, 1) AS hours_since_ready
-  FROM attachment_enrichment WHERE state = 'ready' AND provider = 'deedkit_inference';
+-- 2. per account and kind: jobs held by the mini (model_backpressure) and the hours since the last success from
+--    it. A deferral refreshes the row and the pause timestamps, so one pause's age cannot be read; "held, with
+--    no success for 24 hours" is the same fact. NULL hours = never a success: compare with the enable date on
+--    the card. Another scope's success does not hide a stalled one: the groups are separate.
+SELECT m.account, e.kind,
+       count(*) FILTER (WHERE e.state = 'queued' AND e.error_code = 'model_backpressure') AS held,
+       round(extract(epoch FROM clock_timestamp() - max(e.updated_at)
+             FILTER (WHERE e.state = 'ready' AND e.provider = 'deedkit_inference')) / 3600, 1) AS hours_since_ready
+  FROM attachment_enrichment e JOIN attachments a ON a.id = e.attachment JOIN messages m ON m.id = a.message
+ WHERE e.kind IS NOT NULL GROUP BY m.account, e.kind
+HAVING count(*) FILTER (WHERE e.state = 'queued' AND e.error_code = 'model_backpressure') > 0;
 ```
-and the key: `python3 scripts/inference_probe.py --key-file private/inference/inference.key --url
-https://<mini>.<tailnet>.ts.net` prints `key_days_left=`; report at 30 days or fewer (the rotation of
-inference-mini-setup.md section 12 is due) and when `reachable=no`. The probe exits 0 whatever it finds.
+Report a row of query 2 when `hours_since_ready` is above 24 or NULL. The key and the service: `python3
+scripts/inference_probe.py --url https://<mini>.<tailnet>.ts.net --key-file private/inference/inference.key`
+prints one line and exits 0 whatever it finds; report any line that is not `reachable=yes status=ok` with a
+`key_expires=` value (`status=http_502`, `reachable=no` and a rejected key all count), and `key_days_left` of 30
+or fewer (the rotation of inference-mini-setup.md section 12 is due).
 
 The enable record on the ANYM-686 card keeps: the date and `S`; the three attachment ids of the end-to-end run (not
 their content); the egress `check` JSON and the `tcpdump` evidence; the offline and admission drill times; the key's

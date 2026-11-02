@@ -46,12 +46,15 @@ hidden like any other header value. A request that may have reached the vendor i
 
 The inference service on the owner's Mac mini (`services/inference`, ANYM-682 to ANYM-688) processes
 audio, photos and document text locally. It binds only loopback; Tailscale Serve (never Funnel) is its
-one tailnet entry on port 443, and where the tailnet policy restricts at all, one rule lets only the
-production host reach it. Each calling service has its own key, stored on the mini only as a hash in a
-0600 policy file, with an expiry, an overlapping rotation (at most two keys per principal) and
-revocation by removing the hash. The process runs in a sandbox that denies the service tree any
-outbound network, and each job's files live in a per-request directory deleted afterwards. A leaked key
-allows jobs within its scopes and daily cap; nothing stored can be read back. On the production side the
-worker reaches only its database and the mini (docs/operations/production.md, "Mini enrichment
-worker"). Model output is untrusted data, like any extracted text. Runbook and rotation:
+one tailnet entry on port 443, and the tailnet policy gets one additive rule that lets the production host
+reach it (access the policy already grants to other devices is not changed, so the effective reachability is
+whatever the policy and its recorded before and after matrices say). Each calling service has its own key;
+the mini's policy file (mode 0600) holds only its hash, with an expiry, an overlapping rotation (at most two
+keys per principal) and revocation by removing the hash. The key itself exists as a 0600 file in a
+directory only the production worker mounts, and briefly on the mini during delivery or rotation. The
+process runs in a sandbox that denies the service tree any outbound network, and each job's files live in
+a per-request directory removed afterwards. A leaked key allows jobs within its scopes and daily cap; the
+service stores nothing that can be read back. On the production side the worker reaches only its database
+and the mini (docs/operations/production.md, "Mini enrichment worker"). Model output is untrusted data,
+like any extracted text. Runbook and rotation:
 [docs/operations/inference-mini-setup.md](docs/operations/inference-mini-setup.md).
