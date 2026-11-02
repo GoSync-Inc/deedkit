@@ -77,6 +77,9 @@ CONTROL_FILES = {"source-sha", "attempt", "metadata.json", "outcomes.json"}
 ASSEMBLED_FILES = frozenset({REPORTS["python"], *(name for _, files in FRAGMENTS.values() for name in files
                                                   if name not in CONTROL_FILES and name not in SHARD_REPORTS)})
 MAX_BYTES = 20 * 1024 * 1024
+# A JUnit report's case bound: a sanity limit of ours (`tiden run report` uploads any number of rows in chunks of 2000).
+# The merged python report is ~220 bytes a case (2.2 MB for 9975 cases, 11-02), so 50000 cases stay far under MAX_BYTES.
+MAX_JUNIT_CASES = 50000
 # Tiden branch names: lowercase letters, digits, slashes, underscores and hyphens.
 TIDEN_BRANCH_NAME = re.compile(r"[a-z0-9]+(?:[/_-][a-z0-9]+)*")
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
@@ -181,7 +184,7 @@ def normalize_junit(path: Path, root: Path, framework: str, source_prefix: str =
     if document.tag not in {"testsuites", "testsuite"}:
         raise ValueError("not a JUnit report")
     cases = list(document.iter("testcase"))
-    if not cases or len(cases) > 10000:
+    if not cases or len(cases) > MAX_JUNIT_CASES:
         raise ValueError("JUnit report must contain bounded real executions")
     counts = Counter()
     for case in cases:
