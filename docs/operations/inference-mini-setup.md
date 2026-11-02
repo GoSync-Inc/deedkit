@@ -691,6 +691,16 @@ not `?` (a `?` means `busy.json` is stale or the probe is down: fix that first).
 four entries `job-impact`, `plist-impact`, `impact-dir`, `impact-bin`); copy `summary-*.json` and the logs out first, the
 undo removes the directory. A daily file is 5760 lines (about 1 MB); nothing rotates them, remove old days by hand.
 
+**The daily line (owner via the orchestrator 11-02).** `summary-DAY.json` has a `headline`:
+`admitted 76.0 % | overlap 12.5 min | avail_gb min 6.1 in overlap, 4.5 all day | Between VM p90 2.30 cores in overlap`, and the fields
+`admitted_percent` (neither busy flag true and `avail_gb` at the 7 GB floor: an upper bound, the per-phase memory rule and the load cap are
+not in the log), `busy_open_percent`, `avail_gb_min`, `swap_mb_first/last/max` and `vm_cores_p90` per situation.
+`python3 impact_log.py summarize impact-DAY.log` prints the same, also for a day that is still running. To install the new monitor:
+`sudo -n install -o root -g wheel -m 0755 impact_log.py /usr/local/libexec/deedkit-impact-log`, then
+`sudo -n launchctl kickstart -k system/com.deedkit.inference-impact` (it only reads; the samples have a gap of a few seconds, which the
+summary counts as a gap). Undo: install the previous file from the checkout and kickstart again. A refusal by the floor is logged as
+`memory_floor`, by the per-phase rule as `memory_low`: `grep -c 'refusal=admission_closed:memory_floor' /Users/_deedkitinf/logs/service.err.log`.
+
 ### 13c. Yielding: what it does on the mini, how to read it, how to switch it off (ANYM-691)
 
 The service stops a running phase while Between or the remote tests use the host (README, Yielding). **It ships off**: without
