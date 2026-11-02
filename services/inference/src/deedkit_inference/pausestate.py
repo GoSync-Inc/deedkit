@@ -6,7 +6,7 @@ what the ledger names. Ownership is a property of the GROUP: a process belongs t
 ledgered pgid, it is stopped (state T) and it started no later than the whole second of the ledgered stop time (every
 member existed when the group was stopped, and a stopped group cannot spawn; `ps` truncates to seconds, so the cutoff is
 floor(stop), never later). The entry is written in two phases (PR 3): "freezing" before the stop, owning every stopped member
-that started within FREEZE_SECONDS of the record, and "stopped" right after it with the real time; the process whose pid is the pgid, when it exists, must be the ledgered leader (same start
+of the recorded group however late it started or whatever its parent, witnessed by the leader or a process `seen` at the record, and "stopped" right after it with the real time; the process whose pid is the pgid, when it exists, must be the ledgered leader (same start
 time). The ledger is read and written without following links (the engines can write its directory). A stopped helper whose leader died still matches; a pgid
 number reused by a process that started after the stop, and every foreign group, never match. Nothing here looks at
 "stopped, parent pid 1, same user": the deploy runs `uv sync` as that user.
@@ -29,12 +29,13 @@ PS = ["/bin/ps", "-axo", "pid=,pgid=,stat=,lstart=,ppid="]
 #: An entry written by a release before the two-phase freeze (no "phase") owns a helper that started in a later second than the
 #: recorded one when it started within this many seconds after it AND descends from an owned member (see `members`).
 LATE_SECONDS = 10.0
-#: The two-phase freeze (ANYM-691 PR 3). Before the stop the entry is "freezing": it owns every stopped member of the group that
-#: started up to FREEZE_SECONDS after the record, whatever its parent is now (a crash may leave an orphan of ppid 1), and the
-#: service stops the group only while the record is younger than the yielder's STOP_WITHIN_SECONDS, so the real freeze always
-#: falls inside that bound. Right after the stop the entry becomes "stopped" with the real stop time: no later process exists.
-FREEZE_SECONDS = 5.0
-MAX_FREEZE_SECONDS = 30.0  # the largest bound a ledger file may carry (the engines can write the directory)
+#: The two-phase freeze (ANYM-691 PR 3). Before the stop the entry is "freezing" and carries `seen`, the (pid, start text) of every
+#: process of the group at that moment. It owns EVERY stopped member of the group, whatever its start time or parent (a crash may
+#: leave an orphan of ppid 1, and nothing bounds how late the stop lands), but only while the group is provably the same one that
+#: was recorded: the leader still has the recorded start, or one of the `seen` processes is still alive in the group (the kernel
+#: keeps a group number in use while any member lives, so it cannot have been reused). Without such a witness a freezing entry
+#: owns only what existed at the record, like any entry. Right after the stop it becomes "stopped" with the real stop time.
+MAX_SEEN = 256  # the most processes a ledger file may list as seen (the engines can write the directory)
 START_FORMAT = "%a %b %d %H:%M:%S %Y"
 SETTLE_POLLS = 20
 SETTLE_SECONDS = 0.1
@@ -108,9 +109,10 @@ class Ledger:
                     raise ValueError("entry")
                 if group.get("phase", "stopped") not in ("freezing", "stopped"):
                     raise ValueError("phase")
-                bound = group.get("bound", FREEZE_SECONDS)
-                if isinstance(bound, bool) or not isinstance(bound, (int, float)) or not 0 < bound <= MAX_FREEZE_SECONDS:
-                    raise ValueError("bound")
+                seen = group.get("seen", [])
+                if not isinstance(seen, list) or len(seen) > MAX_SEEN or any(
+                        type(known["pid"]) is not int or not isinstance(known["started"], str) for known in seen):
+                    raise ValueError("seen")
                 for known in group.get("members", []):
                     if type(known["pid"]) is not int or not isinstance(known["started"], str):
                         raise ValueError("members")
@@ -136,26 +138,27 @@ class Ledger:
                 unlink_quietly(partial)
             raise LedgerError(f"cannot write the ledger: {error}") from None
 
-    def record(self, pgid: int, leader: int, leader_start: str, stopped_at: float | None = None, freezing: bool = False) -> None:
+    def record(self, pgid: int, leader: int, leader_start: str, stopped_at: float | None = None, freezing: bool = False,
+               seen: list[dict] | None = None) -> None:
         """Write the group BEFORE it is stopped. A failure here means: do not stop it."""
         groups = [g for g in self.groups() if g["pgid"] != pgid]
         entry = {"pgid": pgid, "leader": leader, "leader_start": leader_start,
                  "stopped_at": self.clock() if stopped_at is None else stopped_at}
         if freezing:
-            entry.update({"phase": "freezing", "bound": FREEZE_SECONDS})
+            entry.update({"phase": "freezing", "seen": list(seen or [])[:MAX_SEEN]})
         groups.append(entry)
         self._write(groups)
 
     def confirm(self, pgid: int, recorded_at: float, stopped_at: float) -> bool:
         """Second phase: the group was stopped at `stopped_at`. Only the entry written at `recorded_at` becomes "stopped" (a
         later record of the same group number is left alone); False when there is none. A failed write leaves the freezing
-        entry, which still owns every member (its bound covers the real stop)."""
+        entry, which still owns every member."""
         groups = self.groups()
         entry = next((g for g in groups if g["pgid"] == pgid and g.get("phase") == "freezing"
                       and g["stopped_at"] == recorded_at), None)
         if entry is None:
             return False
-        entry.pop("bound", None)
+        entry.pop("seen", None)
         entry.update({"phase": "stopped", "stopped_at": max(stopped_at, recorded_at)})
         self._write(groups)
         return True
@@ -188,13 +191,19 @@ def members(group: dict, table: list[dict]) -> list[dict]:
     if leader is not None and leader["started"] != group["leader_start"]:
         return []
     phase = group.get("phase")
-    # "freezing": the stop may have landed at any moment up to the bound after the record, so every stopped member that started
-    # by then is ours, orphans included. "stopped": the recorded time is the real one. No phase: an older release's entry.
-    cutoff = math.floor(group["stopped_at"] + (group.get("bound", FREEZE_SECONDS) if phase == "freezing" else 0.0))
+    cutoff = math.floor(group["stopped_at"])
     stopped = [row for row in table if row["pgid"] == group["pgid"] and row["stat"].startswith("T")]
+    if phase == "freezing":
+        # The freeze may have landed at any moment after the record, so a stopped member can have started after it, and its parent
+        # may be gone. Every stopped member is ours while the group is the recorded one: the leader (checked above) or a process
+        # seen at the record still lives in it. No such witness (the group is gone, its number may be reused): only what existed at
+        # the record.
+        seen = {(known["pid"], known["started"]) for known in group.get("seen", [])}
+        if leader is not None or any((row["pid"], row["started"]) in seen for row in table if row["pgid"] == group["pgid"]):
+            return stopped
     found = [row for row in stopped if row["start"] <= cutoff]
     if phase is not None:
-        return found
+        return found  # "stopped" (the recorded time is the real one), or an unwitnessed freezing entry
     # The ledger is written just BEFORE the freeze: a helper started in between carries a later second. It is a member
     # when it is stopped in the group, started within LATE_SECONDS of the record and descends from a member; a process of
     # a group number that was reused has no member as an ancestor, so it is never claimed this way.

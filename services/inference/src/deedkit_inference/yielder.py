@@ -38,9 +38,6 @@ PS_TIMEOUT = 2.0
 TICK_TIMEOUT = 8.0  # one whole tick: a ps that hangs, a ledger that blocks
 MAX_BACKOFF = 30.0
 LOG_EVERY_FAILURE = 30  # a SIGCONT that keeps failing is retried on every tick but logged on the first and every 30th
-#: The stop follows its freezing record by at most this long (pausestate.FREEZE_SECONDS is the ledger's bound, the margin is the
-#: signal itself and clock steps).
-STOP_WITHIN_SECONDS = 2.0
 
 
 class YieldSettings(BaseModel):
@@ -168,7 +165,7 @@ class Candidate:
     worker: object | None
     marker: str | None
     allowance: float = 0.0
-    recorded_at: float = 0.0  # the wall time of the freezing record: the stop must follow within STOP_WITHIN_SECONDS
+    recorded_at: float = 0.0  # the wall time of the freezing record: the second phase rewrites exactly that entry
 
 
 @dataclass
@@ -360,16 +357,20 @@ class Yielder:
 
     def _record(self, candidate):
         """Ledger thread: write the group BEFORE the stop. False when the leader is gone; a LedgerError fails the tick."""
-        started = pausestate.start_text(candidate.proc.pid)
-        if started is None:
+        pid = candidate.proc.pid
+        table = pausestate.process_table()
+        leader = next((row for row in table if row["pid"] == pid), None)
+        if leader is None:
             return None
+        # `seen` is what proves, after a crash, that the group is still this one (see pausestate.members)
+        seen = [{"pid": row["pid"], "started": row["started"]} for row in table if row["pgid"] == pid]
         at = self.wall()
-        self.ledger.record(candidate.proc.pid, candidate.proc.pid, started, stopped_at=at, freezing=True)
+        self.ledger.record(pid, pid, leader["started"], stopped_at=at, freezing=True, seen=seen)
         return at
 
     def _confirm(self, pgid, recorded_at, stopped_at):
-        """Ledger thread, second phase: the entry gets the real stop time. A failure leaves the freezing entry, whose bound still
-        covers the stop, so it is logged and nothing else."""
+        """Ledger thread, second phase: the entry gets the real stop time. A failure leaves the freezing entry, which still owns
+        every member of the group, so it is logged and nothing else."""
         try:
             self.ledger.confirm(pgid, recorded_at, stopped_at)
         except Exception as error:  # noqa: BLE001
@@ -391,15 +392,13 @@ class Yielder:
 
     def _stop(self, candidate, flags):
         """One synchronous step: look again, stop the group, register it. Nothing awaits in between, so a
-        cancellation can never leave a stopped group that `resume_all` does not know. The freezing record owns members only up
-        to its bound: when the write is older than STOP_WITHIN_SECONDS now (a stall of the loop or the ledger thread) the stop
-        is not sent and the next tick records again."""
+        cancellation can never leave a stopped group that `resume_all` does not know. However late the signal lands after the
+        record, every member it freezes is recoverable: the freezing entry owns them by the group's identity, not by a time."""
         running, proc = candidate.running, candidate.proc
         job = running.job
         now = self.now()
         current = any(slot.running is running for slot in self.scheduler.slots.values())
         if (not self.on or not current or proc.returncode is not None or job.paused_since is not None
-                or self.wall() - candidate.recorded_at > STOP_WITHIN_SECONDS
                 or (candidate.worker is not None and (candidate.worker.job is not job or not candidate.worker.alive()))
                 or (candidate.worker is None and job.proc is not proc)):
             self._unrecord(proc.pid)
