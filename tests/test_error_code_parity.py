@@ -26,15 +26,19 @@ EXPECTED_JS_CONNECTION_MISSING = {
     'telegram_identity_mismatch', 'telegram_pairing_required'}
 # The same for the Go adapter, which also lacks provider_page_stalled (a browser-fallback condition).
 EXPECTED_GO_CONNECTION_MISSING = EXPECTED_JS_CONNECTION_MISSING | {'provider_page_stalled'}
-# Codes Python turns into a typed exception or keeps from provider replies that the Go safe-error list does not
-# carry: the Python-only collector conditions above and the codes the native adapter never answers with.
+# Python reply codes the Go safe-error lists (both initializers in runtime.go) do not carry: the Python-only
+# collector conditions above, and codes Go never answers with. Without an entry Go would turn the code into
+# provider_operation_failed (send_receipt_missing and provider_operation_failed are Python-side outcomes).
 EXPECTED_GO_SAFE_MISSING = {
-    'already_member', 'chat_full', 'collector_lease_lost', 'forbidden', 'invite_expired', 'invite_invalid',
-    'join_not_allowed', 'link_preview_unsupported', 'operation_invalid_parameters', 'operation_query_failed',
-    'operation_result_too_large', 'operation_target_changed', 'operation_target_unavailable',
-    'provider_connect_timeout', 'provider_operation_failed', 'provider_operation_uncertain',
-    'provider_page_stalled', 'provider_protocol_error', 'registered_file_invalid', 'send_receipt_missing',
-    'spool_corrupt', 'telegram_identity_mismatch', 'telegram_pairing_required'}
+    'collector_lease_lost', 'forbidden', 'provider_connect_timeout', 'provider_operation_failed',
+    'provider_page_stalled', 'provider_protocol_error', 'send_receipt_missing', 'spool_corrupt',
+    'telegram_identity_mismatch', 'telegram_pairing_required'}
+# The other direction: codes Go answers with that no Python list maps; Python reports them as provider_operation_failed.
+EXPECTED_GO_SAFE_ONLY = {
+    'collector_disabled', 'history_request_unknown', 'invalid_cursor', 'invalid_limit', 'invalid_policy',
+    'invalid_request', 'message_target_unavailable', 'operation_invalid', 'operation_outcome_unknown',
+    'owner_terminal_required', 'policy_expired', 'provider_already_started', 'provider_response_too_large',
+    'session_already_owned', 'unsupported_method'}
 
 
 def _strings(text, quote):
@@ -51,6 +55,13 @@ def _go_set(pattern):
     match = re.search(pattern, GO_RUNTIME, re.S)
     assert match, pattern
     return _strings(match.group(1), '"')
+
+
+def _go_safe_errors():
+    """Every code of every `for ... range []string{...} { safeErrors[...] = true }` initializer in runtime.go."""
+    lists = re.findall(r'range \[\]string\{(.*?)\} \{\n\t\tsafeErrors\[', GO_RUNTIME, re.S)
+    assert len(lists) == 2, len(lists)  # a third initializer must be read too: update this count with it
+    return set().union(*(_strings(codes, '"') for codes in lists))
 
 
 def _python_reply_codes():
@@ -112,8 +123,9 @@ def test_js_operation_and_media_errors_are_known_to_python():
 
 # spec: ANYM-116
 def test_go_safe_errors_cover_the_python_codes_but_the_listed_ones():
-    go = _go_set(r'for _, v := range \[\]string\{(.*?)\} \{\n\t\tsafeErrors')
+    go = _go_safe_errors()
     python = _python_reply_codes()
     assert python - go == EXPECTED_GO_SAFE_MISSING
+    assert go - python == EXPECTED_GO_SAFE_ONLY
     # Every media code Python accepts is a code the native adapter can answer with.
     assert set(CODES['media_errors']) <= go
