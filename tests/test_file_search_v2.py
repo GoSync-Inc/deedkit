@@ -190,11 +190,46 @@ def test_media_filters_refuse_bad_values_with_field_errors(seeded, kwargs, field
         assert {'voice', 'photo'} <= set(entry['allowed']) or {'text', 'none'} <= set(entry['allowed'])
 
 
+# spec: ANYM-661
+@pytest.mark.parametrize('arguments,field', [({'media_kind': 'voice'}, 'media_kind'), ({'ready': True}, 'ready'),
+                                             ({'media_kind': [1]}, 'media_kind'), ({'ready': ['transcripts']}, 'ready')])
+def test_media_filters_refuse_a_wrong_type_as_invalid_filter_on_rest_and_mcp(seeded, arguments, field):
+    from starlette.testclient import TestClient
+    from messaging_service.app import create_app
+    s, a, b = seeded
+    headers = {'Authorization': 'Bearer ' + b, 'Accept': 'application/json, text/event-stream'}
+    with TestClient(create_app(s, ['testserver'])) as client:
+        rest = client.post('/v1/search_files', json=arguments, headers=headers)
+        mcp = client.post('/mcp', headers=headers, json={'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                                                         'params': {'name': 'search_files', 'arguments': arguments}})
+    assert rest.status_code == 400 and rest.json()['error'] == 'invalid_filter', rest.text
+    assert rest.json()['field_errors'][0]['field'] == field
+    assert 'invalid_filter' in mcp.text and 'field_errors' in mcp.text and '-32602' not in mcp.text, mcp.text
+
+
+# spec: ANYM-661
+def test_compact_file_rows_keep_media_class_on_rest_and_mcp(seeded):
+    from starlette.testclient import TestClient
+    from messaging_service.app import create_app
+    s, a, b = seeded
+    media_files(s)
+    headers = {'Authorization': 'Bearer ' + b, 'Accept': 'application/json, text/event-stream'}
+    with TestClient(create_app(s, ['testserver'])) as client:
+        rest = client.post('/v1/search_files', json={'media_kind': ['voice'], 'limit': 5}, headers=headers)
+        mcp = client.post('/mcp', headers=headers, json={'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                          'params': {'name': 'search_files', 'arguments': {'media_kind': ['voice'], 'limit': 5}}})
+    assert rest.status_code == 200 and rest.json()['items'], rest.text
+    assert {row['media_class'] for row in rest.json()['items']} == {'voice'}
+    assert '"media_class":"voice"' in mcp.text.replace(' ', ''), mcp.text
+
+
 READY = {  # attachment -> (MIME, what is ready)
     'r-text': ('text/plain', 'text'), 'r-voice-ok': ('audio/ogg', 'transcript'), 'r-voice-none': ('audio/ogg', None),
     'r-voice-old': ('audio/ogg', 'old-revision'), 'r-voice-super': ('audio/ogg', 'superseded'),
     'r-image-desc': ('image/png', 'enrichment'), 'r-video-und': ('video/mp4', 'understanding'),
-    'r-doc-enriched': ('application/pdf', 'enrichment'), 'r-image-none': ('image/png', None)}
+    'r-doc-enriched': ('application/pdf', 'enrichment'), 'r-image-none': ('image/png', None),
+    # Same digest, but derived from another revision of the message than the current one: not ready.
+    'r-doc-stale-rev': ('application/pdf', 'stale-enrichment'), 'r-video-stale-und': ('video/mp4', 'stale-understanding')}
 
 
 def ready_files(s):
@@ -206,15 +241,19 @@ def ready_files(s):
     with s.pool.connection() as c:
         for attachment, (mime, what) in READY.items():
             kind = {'audio/ogg': 'audio', 'image/png': 'image'}.get(mime, 'document')
-            if what in ('transcript', 'enrichment', 'old-revision', 'superseded'):
+            if what in ('transcript', 'enrichment', 'old-revision', 'superseded', 'stale-enrichment'):
                 c.execute("""UPDATE attachment_enrichment SET state=%s,kind=%s,provider='test-local',model='fixture',title='T',
                     summary='S',text_content='synthetic derived text',indexed_at=clock_timestamp(),
                     source_digest=CASE WHEN %s THEN repeat('0',64) ELSE source_digest END WHERE attachment=%s""",
                     ('superseded' if what == 'superseded' else 'ready', kind, what == 'old-revision', attachment))
-            if what == 'understanding':
+            if what == 'stale-enrichment':
+                c.execute('UPDATE attachment_enrichment SET source_revision=source_revision+1 WHERE attachment=%s', (attachment,))
+            if what in ('understanding', 'stale-understanding'):
                 c.execute("""UPDATE attachment_understanding SET state='ready',source_artifact_hash=repeat('a',64),
                     published_profile_hash=repeat('b',64),title='T',summary='S',indexed_at=clock_timestamp() WHERE attachment=%s""",
                     (attachment,))
+                if what == 'stale-understanding':
+                    c.execute('UPDATE attachment_understanding SET source_revision=source_revision+1 WHERE attachment=%s', (attachment,))
             if what == 'text':
                 c.execute("UPDATE attachment_text SET state='ready',text_content='synthetic text' WHERE attachment=%s", (attachment,))
 
@@ -230,7 +269,7 @@ def test_ready_filter_reads_each_readiness_table_for_the_current_revision_only(s
     assert got(ready=['text', 'transcript']) == ['r-text', 'r-voice-ok']
     assert got(ready=['transcript', 'description', 'text']) == ['r-doc-enriched', 'r-image-desc', 'r-text', 'r-video-und', 'r-voice-ok']
     # An older revision of a re-uploaded file and a superseded row never count.
-    assert got(ready=['none']) == ['r-image-none', 'r-voice-none', 'r-voice-old', 'r-voice-super']
+    assert got(ready=['none']) == ['r-doc-stale-rev', 'r-image-none', 'r-video-stale-und', 'r-voice-none', 'r-voice-old', 'r-voice-super']
     assert got(media_kind=['voice'], ready=['transcript']) == ['r-voice-ok']
     assert got(media_kind=['voice'], ready=['none']) == ['r-voice-none', 'r-voice-old', 'r-voice-super']
     assert got(media_kind=['voice', 'audio']) == sorted(n for n, (m, _) in READY.items() if m == 'audio/ogg')

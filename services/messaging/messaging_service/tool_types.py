@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Literal, Required, TypedDict
+from typing import Annotated, Any, Literal, Required, TypedDict
 
 from pydantic import AfterValidator, ConfigDict, Field, StrictBool, StrictInt, StrictStr
 
@@ -25,14 +25,16 @@ MessageDetail = Literal['compact','full','transcript']
 ConversationView = Literal['archive','conversation']
 QUERY_MODE_DESCRIPTION = 'Five modes, one line each:\nall (default): every word, any order.\nany: at least one of the words (OR), no syntax to learn; best for spelling variants and transliteration, e.g. `счёт счет invoice`.\nphrase: the words adjacent and in order.\nweb: `"exact phrase" OR other -excluded`; or/OR in any case is the operator, so the word `or` itself cannot be searched in web; for a literal `or`, a leading `-` or quotes as text use any or exact; for phrases and exclusion use web.\nexact: case-insensitive literal substring, including punctuation and identifiers.\nWith any and web prefer order=relevance, because asc lists the oldest hits first.\nLive search applies to all and phrase only; for a live search of several words run one live search per word.'
 QueryMode = Annotated[Literal['all','any','phrase','web','exact'], Field(description=QUERY_MODE_DESCRIPTION)]
-# ANYM-661: values are checked by search_files itself, so a bad one is invalid_filter with field_errors naming the field.
-MediaKindFilter = Annotated[list[StrictStr] | None, Field(description=
+# ANYM-661: values are checked by search_files itself, so a bad one (also a wrong JSON type) is invalid_filter with
+# field_errors naming the field, not invalid_parameters from the pydantic model; the published schema stays array|null.
+LIST_OR_NULL = {'anyOf': [{'type': 'array', 'items': {'type': 'string'}}, {'type': 'null'}]}
+MediaKindFilter = Annotated[Any, Field(json_schema_extra=LIST_OR_NULL, description=
     'Narrow to files of these media kinds: a list of voice, audio, image, video, document (a file is voice for a Telegram '
     'or WhatsApp voice note, and for audio/ogg, audio/opus or application/ogg without a provider label); provider labels '
     'shown in media_kind are accepted too: photo and sticker are image, animation is video, other is document. '
     'Values are OR-ed; an empty list is no filter. Each row returns its class as media_class. '
     'For voice notes across accounts use ["voice","audio"].')]
-ReadyFilter = Annotated[list[StrictStr] | None, Field(description=
+ReadyFilter = Annotated[Any, Field(json_schema_extra=LIST_OR_NULL, description=
     'Narrow to files whose derived content is ready, a list: ready=["transcript"] (voice notes with a transcript). '
     'Values text (extracted text or OCR), transcript (speech of an audio or voice file only), description '
     '(model description of a non-audio file or an understanding); OR-ed. ready=["none"] alone: files with none of the '
