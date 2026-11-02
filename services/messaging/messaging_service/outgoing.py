@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import re
 import time
+from datetime import datetime, timezone
 
 from psycopg.types.json import Jsonb
 
@@ -319,17 +320,30 @@ def project_reference(c,p,account,reference):
 
 
 def result(row,c=None,p=None):
-    from .receipts import for_reference,unknown_evidence
+    from .receipts import for_reference,hint_chat_facts,receipt_hint,unknown_evidence
     actual,reference_state=project_reference(c,p,row['account'],row.get('archive_reference'))
+    context={}
     receipt=for_reference(c,row['account'],
         actual['provider_chat_id'] if actual else row['provider_chat'],
-        actual['provider_message_id'] if actual else row['provider_message_id']) \
+        actual['provider_message_id'] if actual else row['provider_message_id'],context=context) \
         if c is not None and row['status']=='sent' and row['provider_message_id'] else unknown_evidence()
     if reference_state=='scope_restricted':receipt=unknown_evidence()
     artifact=row.get('render_artifact')
     artifact=artifact if isinstance(artifact,dict) else {}
     warning_codes=artifact.get('warnings',[]) if isinstance(artifact,dict) else []
+    hint={}
+    if row['status']=='sent':
+        # ANYM-659: a pure function of facts already read plus one guarded, bounded chat lookup; a restricted scope
+        # hides the evidence, and any failure gives the unknown pair.
+        try:
+            facts=hint_chat_facts(c,row['account'],actual['provider_chat_id'] if actual else row['provider_chat']) if c is not None and context.get('platform') else {}
+            reports,state=receipt_hint(context.get('platform'),facts.get('chat_type'),facts.get('bot'),
+                True if receipt['basis']=='self_chat' else facts.get('self_chat'),receipt['state'],
+                row.get('finished_at'),datetime.now(timezone.utc))
+        except Exception:reports,state=None,'unknown'
+        hint={'messenger_reports':reports,'receipt_state':'unknown' if reference_state=='scope_restricted' else state}
     return serial({
+        **hint,
         'send_id':row['id'],'status':row['status'],'account':row['account'],
         'chat_id':row['chat'],'provider_chat_id':row['provider_chat'],
         'provider_message_id':row['provider_message_id'],

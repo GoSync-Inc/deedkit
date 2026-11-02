@@ -151,11 +151,13 @@ def _reference_self_chat(c,account,provider_chat,provider_id):
     return bool(row and row['self_chat'])
 
 
-def for_reference(c,account,provider_chat,provider_id,platform=None):
-    """Authorized outbox reference, including receipts captured before ingestion."""
+def for_reference(c,account,provider_chat,provider_id,platform=None,context=None):
+    """Authorized outbox reference, including receipts captured before ingestion.
+    context: an optional dict that receives the platform this lookup already reads (ANYM-659)."""
     if platform is None:
         found=c.execute('SELECT platform FROM accounts WHERE id=%s',(account,)).fetchone()
         platform=found['platform'] if found else None
+    if context is not None:context['platform']=platform
     if platform=='telegram':
         if not isinstance(provider_id,str) or not re.fullmatch(r'[1-9][0-9]{0,18}',provider_id):
             return unknown_evidence()
@@ -170,6 +172,59 @@ def for_reference(c,account,provider_chat,provider_id,platform=None):
             (account,provider_chat,provider_id)).fetchall())
     else:return unknown_evidence()
     return self_chat_evidence(proof) if _reference_self_chat(c,account,provider_chat,provider_id) else proof
+
+
+# ANYM-659 chat facts for the receipt hint. Optional enrichment: bounded to the 20 newest messages of the chat
+# (index message_chat_date, as the chat list's self-chat evidence) and run in a savepoint, so a failure or
+# timeout here gives unknown facts and never fails the send-status read.
+HINT_CHAT_SQL='''SELECT ch.chat_type,{self_chat} AS self_chat,
+    EXISTS(SELECT 1 FROM (SELECT r.id,r.revision FROM messages r WHERE r.account=ch.account AND r.chat=ch.id
+        ORDER BY r.sent_at DESC LIMIT 20) recent JOIN message_metadata bmd ON bmd.message=recent.id
+        AND bmd.revision=recent.revision WHERE bmd.metadata->'sender_is_bot'='true'::jsonb) AS bot
+    FROM chats ch WHERE ch.account=%s AND ch.provider_chat=%s'''
+
+
+def hint_chat_facts(c,account,provider_chat):
+    """{'chat_type','self_chat','bot'} of the chat, or {} when it is not found or the lookup fails."""
+    try:
+        from .chat_queries import self_chat_sql
+        with c.transaction():
+            row=c.execute(HINT_CHAT_SQL.replace('{self_chat}',self_chat_sql('ch')),(account,provider_chat)).fetchone()
+        return {'chat_type':row['chat_type'],'self_chat':bool(row['self_chat']),'bot':bool(row['bot'])} if row else {}
+    except Exception:return {}
+
+
+OVERDUE_AFTER_S=600
+RECEIPT_LEVELS=('delivered','read','played')
+
+
+def messenger_reports(platform,chat_type=None,bot=False,self_chat=False):
+    """The receipt levels this messenger can report for this chat (ANYM-659): a capability list, never a status.
+    None = unknown (a platform or Telegram chat type outside the table)."""
+    if platform not in ('whatsapp','telegram'):return None
+    if self_chat:return []
+    if platform=='whatsapp':return ['delivered','read']
+    if chat_type=='private':return [] if bot else ['read']
+    if chat_type in ('group','channel'):return []
+    return None
+
+
+def receipt_hint(platform,chat_type,bot,self_chat,evidence_state,sent_at,now):
+    """messenger_reports and receipt_state for a send in status sent: pure and total, no I/O.
+    A missing or malformed input (None for an unknown fact, never False) gives (None,'unknown')."""
+    unknown=(None,'unknown')
+    try:
+        if platform not in ('whatsapp','telegram') or type(self_chat) is not bool:return unknown
+        if not isinstance(evidence_state,str) or not isinstance(sent_at,datetime) or not isinstance(now,datetime):return unknown
+        if platform=='telegram' and not self_chat and (chat_type not in ('private','group','channel') or type(bot) is not bool):
+            return unknown
+        reports=messenger_reports(platform,chat_type,bot,self_chat)
+        if reports is None:return unknown
+        if evidence_state in RECEIPT_LEVELS:return reports,evidence_state
+        if evidence_state=='error':return reports,'receipt_error'
+        if 'delivered' not in reports:return reports,'not_reported'
+        return reports,'overdue' if (now-sent_at).total_seconds()>=OVERDUE_AFTER_S else 'pending'
+    except Exception:return unknown
 
 
 def publish(c,account,limit=100):

@@ -59,6 +59,16 @@ wait immediately and remains uncertain. A matching body or timestamp in history
 does not become a provider receipt. `sent` continues to mean provider acceptance,
 with recipient delivery described separately by `delivery_receipt`.
 
+A `sent` result also carries `messenger_reports` (the receipt levels this messenger
+can report for this chat: WhatsApp `["delivered","read"]`, a Telegram private chat
+`["read"]`, Telegram groups, channels, bots and self chats `[]`, `null` when unknown)
+and `receipt_state` in one word (`pending`, `overdue`, `delivered`, `read`, `played`,
+`not_reported`, `receipt_error`, `unknown`). `next_action` stays `none`. Do not tell
+the owner "delivered" unless `receipt_state` says so; `not_reported` means this
+messenger never reports delivery, and `overdue` with the provider offline in
+`get_sync_status` means delayed, not lost. To be pushed instead of polling, subscribe
+to `message.status` events. The table is in RECEIPTS.md.
+
 The service admits at most 32 concurrent waits per process. `send_wait_busy`
 or `send_status_timeout` describes the observation request, not a failed send.
 Inspect the same action; after a lost enqueue response, reuse its original
@@ -80,7 +90,7 @@ Refresh MCP discovery after upgrading; the messaging manifest contains 41 tools.
 | --- | --- | --- |
 | `queued` | Durable request, no provider send has begun | Poll status |
 | `dispatching` | The collector started one provider attempt | Poll status |
-| `sent` | Provider returned a matching outgoing message ID | Inspect the separate `delivery_receipt` evidence |
+| `sent` | Provider returned a matching outgoing message ID | Read `receipt_state` and `messenger_reports`, then the separate `delivery_receipt` evidence |
 | `cancelled` | Access or account policy changed before dispatch | Review permissions and obtain approval for a new action |
 | `expired` | The ten-minute pending window elapsed | Review and obtain approval for a new action |
 | `failed` | Locally rejected before invoking send | Inspect safe error code |

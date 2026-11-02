@@ -442,7 +442,8 @@ def register_send_tools(mcp, call, async_call, read):
         chat_id/reply_to are archive IDs; account must be explicit. request_id is a
         unique 8–128 character key for this approved action; reuse it after network
         failure with the SAME payload. queued is not sent. Poll get_send_status.
-        sent means provider accepted, not recipient read/delivered. unknown must be
+        sent means provider accepted, not recipient read/delivered; a sent result adds
+        messenger_reports (receipt levels this chat can report) and receipt_state. unknown must be
         checked against history before any newly approved send. Text only, provider
         payload at most 4000 UTF-16 units; source at most 16000 units subject to the
         16384-byte HTTP JSON envelope. No splitting or server human-approval gate.
@@ -505,7 +506,9 @@ def register_send_tools(mcp, call, async_call, read):
     def get_send_status(ctx: Context,send_id: StrictStr) -> dict[str,Any]:
         """Read your own scoped send result and separate delivery_receipt observations.
         Provider acceptance is not recipient delivery/read. Missing receipts are unknown;
-        exact provider times remain null. Never sends, retries or marks a chat read.
+        exact provider times remain null. A sent result adds messenger_reports (the receipt
+        levels this chat can ever report) and receipt_state (pending, overdue, delivered, read,
+        played, not_reported, receipt_error or unknown). Never sends, retries or marks a chat read.
         """
         return call(ctx,'get_send_status',send_id=send_id)
 
