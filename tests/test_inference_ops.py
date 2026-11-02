@@ -143,7 +143,7 @@ def test_plist_keepalive_does_not_respawn_after_a_clean_exit():
 
 # spec: ANYM-684
 def test_rendered_files_hold_no_unfilled_placeholder_and_the_log_rotation_names_the_log():
-    for blob in (render.render_service_plist(**ADMIN).decode(), render.render_busy_plist(**ADMIN).decode(),
+    for blob in (render.render_service_plist(**ADMIN).decode(), render.render_busy_plist(**ADMIN).decode(), render.render_impact_plist(**ADMIN).decode(),
                  render.render_sandbox_profile(), render.render_newsyslog()):
         assert '@' not in blob.replace('@@', '')
     rotation = render.render_newsyslog()
@@ -481,6 +481,114 @@ def test_duty_log_verdicts_and_summary():
     assert duty.summarize(rows) == {'samples': 8, 'open_fraction': 0.5, 'longest_closed_minutes': 3.0,
                                     'closed_by': {'busy_between': 3, 'load_high': 1, 'memory_low': 1}}
     assert duty.summarize([]) == {'samples': 0}
+
+
+IMPACT = load('inference_ops_impact_log', ROOT / 'services' / 'inference' / 'launchd' / 'impact_log.py')
+IMPACT_VM = '/System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/com.apple.Virtualization.VirtualMachine'
+
+
+# spec: ANYM-684
+def test_impact_log_reads_ps_cputime_and_counts_a_phase_by_cpu_not_by_a_resident_worker():
+    assert IMPACT.parse_cputime('0:12.34') == pytest.approx(12.34)
+    assert IMPACT.parse_cputime('1:02:03.50') == pytest.approx(3723.5)
+    assert IMPACT.parse_cputime('2-01:00:00') == pytest.approx(2 * 86400 + 3600)
+    text = f'  501 10 0:01.00 2048 /sbin/launchd\n  600 20 0:10.00 4000000 python\n  451 30 5:00.00 900000 {IMPACT_VM}\n'
+    before = IMPACT.read_processes(lambda: text)
+    assert before[20] == (600, 10.0, 4000000, 'python')
+    # a warm engine worker holds 4 GB and burns nothing: not a phase; the same process burning 6 s in 10 s is 0.6 cores
+    idle = IMPACT.read_processes(lambda: text.replace('0:10.00', '0:10.02'))
+    busy = IMPACT.read_processes(lambda: text.replace('0:10.00', '0:16.00') + '  600 21 0:03.00 100 child\n')
+    assert IMPACT.cores(before, idle, 600, 10.0)[0] < IMPACT.PHASE_CORES
+    used, count, rss = IMPACT.cores(before, busy, 600, 10.0)
+    assert used == pytest.approx(0.9) and count == 2 and rss == 4000100  # the child that started in the interval counts from zero
+    # another user's processes and, with a mark, non-matching commands are not counted
+    assert IMPACT.cores(before, busy, 451, 10.0, IMPACT.VM_MARK)[0] == 0.0
+    vm_busy = IMPACT.read_processes(lambda: text.replace('5:00.00', '5:20.00'))
+    assert IMPACT.cores(before, vm_busy, 451, 10.0, IMPACT.VM_MARK)[0] == pytest.approx(2.0)
+    assert IMPACT.cores(before, vm_busy, 600, 10.0, IMPACT.VM_MARK)[0] == 0.0
+    with pytest.raises(ValueError):
+        IMPACT.read_processes(lambda: 'garbage\n')
+
+
+# spec: ANYM-684
+def test_impact_log_busy_flags_fail_to_unknown_and_the_line_round_trips():
+    now = 1_000_000.0
+    fresh = json.dumps({'ts': now - 3, 'between': True, 'deedkit_ci': False})
+    assert IMPACT.busy_flags(fresh, now) == ('t', 'f')
+    for broken in (None, 'not json', json.dumps({'ts': now - 31, 'between': True, 'deedkit_ci': True}),
+                   json.dumps({'ts': now, 'between': 'yes', 'deedkit_ci': False})):
+        assert IMPACT.busy_flags(broken, now) == ('?', '?')
+    figures = {'inf_cpu': 0.62, 'inf_rss_kb': 4096 * 1024, 'vm_cores': 3.5, 'ci_cores': 0.0, 'load': 9.25, 'avail_gb': 6.04, 'swap_mb': 2300}
+    row = IMPACT.parse_line(IMPACT.sample_line(now, ('t', 'f'), figures))
+    assert row == {'ts': 1_000_000, 'between': 't', 'ci': 'f', 'phase': True, 'inf_cpu': 0.62, 'inf_rss_mb': 4096.0, 'vm_cores': 3.5,
+                   'ci_cores': 0.0, 'load': 9.25, 'avail_gb': 6.0, 'swap_mb': 2300.0}
+    assert IMPACT.parse_line('ts=1 between=t') is None and IMPACT.parse_line('') is None
+    assert IMPACT.free_gb('Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free: 65536.\nPages inactive: 65536.\nPages speculative: 65536.\nPages active: 9.\n'.replace('.\n', '\n')) == pytest.approx(3.0)
+    assert IMPACT.swap_mb('vm.swapusage: total = 3072.00M  used = 2300.50M  free = 771.50M  (encrypted)') == pytest.approx(2300.5)
+    assert IMPACT.swap_mb('total = 4.00G  used = 1.50G') == pytest.approx(1536.0)
+
+
+# spec: ANYM-684
+def test_impact_summary_separates_overlap_from_between_alone_and_idle():
+    def line(n, between, ci, phase, load, avail, vm=0.0):
+        figures = {'inf_cpu': 1.0 if phase else 0.0, 'inf_rss_kb': 0, 'vm_cores': vm, 'ci_cores': 0.0, 'load': load, 'avail_gb': avail, 'swap_mb': 100}
+        return IMPACT.sample_line(1_000_000 + 15 * n, (between, ci), figures)
+    rows = [line(0, 'f', 'f', 0, 1.0, 7.0), line(1, 't', 'f', 0, 6.0, 5.0, 4.0), line(2, 't', 'f', 0, 8.0, 5.0, 4.0),
+            line(3, 't', 'f', 1, 12.0, 3.0, 4.0), line(4, 'f', 't', 1, 14.0, 2.0), line(5, 'f', 'f', 1, 3.0, 6.0),
+            line(6, 't', 'f', 0, 6.0, 5.0), line(7, '?', '?', 0, 1.0, 7.0), 'garbage', '']
+    summary = IMPACT.summarize(rows)
+    assert summary['samples'] == 8 and summary['unknown_busy_samples'] == 1
+    assert summary['overlap_minutes'] == 0.5 and summary['overlap_episodes'] == 1 and summary['longest_overlap_minutes'] == 0.5
+    assert summary['overlap_while'] == {'between': 1, 'ci': 1}
+    assert summary['overlap']['samples'] == 2 and summary['overlap']['load_mean'] == 13.0 and summary['overlap']['avail_gb_min'] == 2.0
+    assert summary['contended_alone']['samples'] == 3 and summary['contended_alone']['load_mean'] == pytest.approx(6.667, abs=0.001)
+    assert summary['contended_alone']['vm_cores_mean'] == pytest.approx(2.667, abs=0.001)
+    assert summary['phase_alone']['samples'] == 1 and summary['idle']['samples'] == 2  # the unknown-flag sample is idle: not contended
+    assert IMPACT.summarize([]) == {'samples': 0} and IMPACT.summarize(['x']) == {'samples': 0}
+
+
+# spec: ANYM-684
+def test_impact_log_collects_one_line_skips_the_first_and_never_signals(tmp_path, monkeypatch):
+    tables = iter([IMPACT.read_processes(lambda: f'  600 20 0:10.00 4000000 python\n  451 30 5:00.00 900000 {IMPACT_VM}\n'),
+                   IMPACT.read_processes(lambda: f'  600 20 0:15.00 4000000 python\n  451 30 5:20.00 900000 {IMPACT_VM}\n')])
+    clock = iter([100.0, 110.0])
+    monkeypatch.setattr(IMPACT, 'read_processes', lambda: next(tables))
+    monkeypatch.setattr(IMPACT.time, 'monotonic', lambda: next(clock))
+    monkeypatch.setattr(IMPACT, 'uid_of', {'_deedkitinf': 600, '_deedkitci': None, '_betweenci': 451}.get)
+    monkeypatch.setattr(IMPACT.os, 'getloadavg', lambda: (7.5, 0.0, 0.0))
+    answers = {'/usr/bin/vm_stat': 'page size of 16384 bytes\nPages free: 65536\nPages inactive: 0\nPages speculative: 0\n',
+               '/usr/sbin/sysctl': 'vm.swapusage: total = 3072.00M  used = 100.00M  free = 2972.00M'}
+    monkeypatch.setattr(IMPACT.subprocess, 'run', lambda argv, **kw: type('R', (), {'stdout': answers[argv[0]]})())
+    busy = tmp_path / 'busy.json'
+    busy.write_text(json.dumps({'ts': 1_000_000, 'between': True, 'deedkit_ci': False}))
+    state = {}
+    with pytest.raises(ValueError):
+        IMPACT.collect(state, 1_000_000.0, str(busy))  # the first sample has no interval: the logger skips it
+    line = IMPACT.collect(state, 1_000_010.0, str(busy))
+    row = IMPACT.parse_line(line)
+    assert row['between'] == 't' and row['ci'] == 'f' and row['phase'] is True and row['inf_cpu'] == 0.5  # 5 s of CPU in 10 s is a phase (>= 0.3 cores)
+    assert row['vm_cores'] == 2.0 and row['load'] == 7.5 and row['avail_gb'] == 1.0 and row['swap_mb'] == 100.0
+    # the monitor is read-only: nothing in it signals, escalates or talks to launchd
+    source = (ROOT / 'services' / 'inference' / 'launchd' / 'impact_log.py').read_text()
+    for forbidden in ('kill', 'sudo', 'launchctl', 'os.system', 'signal'):
+        assert forbidden not in source.split('"""', 2)[2]
+    # a day's file becomes a summary file, and a missing day writes nothing
+    (tmp_path / 'impact-2026-11-02.log').write_text(line + '\n')
+    IMPACT.write_summary(tmp_path, '2026-11-02', 15)
+    IMPACT.write_summary(tmp_path, '2026-11-03', 15)
+    assert json.loads((tmp_path / 'summary-2026-11-02.json').read_text())['samples'] == 1
+    assert not (tmp_path / 'summary-2026-11-03.json').exists()
+
+
+# spec: ANYM-684
+def test_impact_plist_is_a_read_only_background_job_of_the_admin_account():
+    plist = plistlib.loads(render.render_impact_plist(**ADMIN))
+    assert plist['Label'] == 'com.deedkit.inference-impact' and plist['UserName'] == 'miniadmin'
+    assert plist['KeepAlive'] is True and plist['RunAtLoad'] is True and plist['ProcessType'] == 'Background' and plist['Nice'] == 10
+    assert plist['ProgramArguments'] == [ADMIN['python'], '/usr/local/libexec/deedkit-impact-log', 'log', '--dir',
+                                         '/Users/miniadmin/deedkit-inference-impact']
+    assert plist['StandardOutPath'] == plist['StandardErrorPath'] == '/Users/miniadmin/deedkit-inference-impact/launchd.log'
+    assert 'sudo' not in ' '.join(plist['ProgramArguments'])
 
 
 # ---------------------------------------------------------------- criterion 6: keygen
