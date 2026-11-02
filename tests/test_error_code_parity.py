@@ -59,7 +59,7 @@ def _python_reply_codes():
             | set(reply['send_rejected']) | set(reply['operation_safe']))
 
 
-# spec: ANYM-286
+# spec: ANYM-116
 def test_python_constants_are_the_json_lists():
     assert operational.CONNECTION_ERRORS == set(CODES['connection_errors'])
     assert operational.MEDIA_ERRORS == set(CODES['media_errors'])
@@ -83,7 +83,7 @@ def test_python_constants_are_the_json_lists():
     assert not set(reply['send_rejected']) & operational.CONNECTION_ERRORS
 
 
-# spec: ANYM-286
+# spec: ANYM-116
 def test_js_connection_errors_are_a_subset_with_the_listed_gap():
     js = _js_set('transport-state.mjs', r'CONNECTION_ERRORS=new Set\(\[(.*?)\]\)')
     python = set(CODES['connection_errors'])
@@ -91,7 +91,7 @@ def test_js_connection_errors_are_a_subset_with_the_listed_gap():
     assert python - js == EXPECTED_JS_CONNECTION_MISSING
 
 
-# spec: ANYM-286
+# spec: ANYM-116
 def test_go_transport_failures_are_a_subset_with_the_listed_gap():
     go = _go_set(r'var transportFailures = map\[string\]bool\{(.*?)\}\n')
     python = set(CODES['connection_errors'])
@@ -99,7 +99,7 @@ def test_go_transport_failures_are_a_subset_with_the_listed_gap():
     assert python - go == EXPECTED_GO_CONNECTION_MISSING
 
 
-# spec: ANYM-286
+# spec: ANYM-116
 def test_js_operation_and_media_errors_are_known_to_python():
     operation = _js_set('operations.mjs', r'OPERATION_ERRORS=new Set\(\[(.*?)\]\)')
     assert operation <= set(CODES['provider_reply']['command_rejected']), sorted(operation)
@@ -110,7 +110,7 @@ def test_js_operation_and_media_errors_are_known_to_python():
     assert safe - _python_reply_codes() == {'provider_response_too_large'}
 
 
-# spec: ANYM-286
+# spec: ANYM-116
 def test_go_safe_errors_cover_the_python_codes_but_the_listed_ones():
     go = _go_set(r'for _, v := range \[\]string\{(.*?)\} \{\n\t\tsafeErrors')
     python = _python_reply_codes()
