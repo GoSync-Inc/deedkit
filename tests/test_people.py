@@ -207,6 +207,45 @@ def test_people_query_normalizer_and_fold_pattern():
     assert fold_pattern('ёa(%_\\')=='[её]a\\(\\%\\_\\\\'
 
 
+def contacts_key(s,name='people-contacts',*,permissions=('read','contacts-read'),enable=True,chats=None):
+    s.set_messenger_operations('people-test',['list_contacts'] if enable else [])
+    return s.issue_key(name,['people-test'],permissions=list(permissions),**({} if chats is None else {'chats':chats}))
+
+
+# spec: ANYM-673
+def test_empty_people_result_points_to_list_contacts_for_accounts_the_key_may_read(seeded):
+    s,ar,key,mid=directory(seeded)
+    reader=contacts_key(s)
+    result=s.search_people(reader,'nobody-by-that-name')
+    assert result['items']==[]
+    assert result['see_also']=={'tool':'list_contacts','argument':'query','accounts':['people-test']}
+    # A result with a row from a Telegram account does not carry it; the key's reach is not widened.
+    assert 'see_also' not in s.search_people(reader,'Анна')
+    assert 'see_also' not in s.search_people(key,'nobody-by-that-name')
+
+
+# spec: ANYM-673
+def test_people_see_also_needs_the_contacts_permission_the_account_opt_in_and_a_full_account_key(seeded):
+    s,ar,key,mid=directory(seeded)
+    assert 'see_also' not in s.search_people(contacts_key(s,'no-permission',permissions=('read',)),'nobody')
+    assert 'see_also' not in s.search_people(contacts_key(s,'not-enabled',enable=False),'nobody')
+    chat=s.search_people(key,'Анна')['items'][0]['chat']
+    assert 'see_also' not in s.search_people(contacts_key(s,'one-chat',chats=[chat]),'nobody')
+    assert 'see_also' in s.search_people(contacts_key(s),'nobody')
+
+
+# spec: ANYM-673
+def test_people_see_also_names_only_telegram_accounts_and_is_omitted_when_none(seeded):
+    s,ar,key,mid=directory(seeded)
+    ar.register('people-wa','whatsapp','Synthetic WhatsApp',discover=True)
+    s.set_messenger_operations('people-wa',['list_contacts'])
+    s.set_messenger_operations('people-test',['list_contacts'])
+    reader=s.issue_key('people-both',['people-test','people-wa'],permissions=['read','contacts-read'])
+    assert s.search_people(reader,'nobody')['see_also']['accounts']==['people-test']
+    only_wa=s.issue_key('people-wa-only',['people-wa'],permissions=['read','contacts-read'])
+    assert 'see_also' not in s.search_people(only_wa,'nobody')
+
+
 def test_people_rest_mcp_permission_and_audit(seeded):
     s,_,key,_=directory(seeded)
     with TestClient(create_app(s,['testserver'])) as client:

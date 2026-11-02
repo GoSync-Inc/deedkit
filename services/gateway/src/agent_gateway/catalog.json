@@ -469,7 +469,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Read-only. Find provider-reported name or username fragments, or sender IDs, in permitted archived chats; no contact-book or provider call. Rows are account/chat-scoped observations, not verified identities; a missing match may mean the name was never observed. Use account + sender_id with messages_search and source_message with messages_get_context. A row the owner linked carries person (a UUID); links are owner-made, never inferred from names. Example: {\"query\":\"Anna\",\"limit\":10}",
+    "description": "Read-only. Find provider-reported name or username fragments, or sender IDs, in permitted archived chats; no contact-book or provider call. Rows are account/chat-scoped observations, not verified identities; a missing match may mean the name was never observed; an empty result may carry see_also: messages_read_contacts list_contacts with query. Use account + sender_id with messages_search and source_message with messages_get_context. A row the owner linked carries person (a UUID); links are owner-made, never inferred from names. Example: {\"query\":\"Anna\",\"limit\":10}",
     "inputSchema": {
       "properties": {
         "query": {
@@ -3558,7 +3558,7 @@
         "parameters": {
           "additionalProperties": true,
           "default": {},
-          "description": "Per operation (account and operation always): list_contacts {limit, offset}; get_contact {user_id}; list_blocked {limit}; get_labels none.",
+          "description": "Per operation (account and operation always): list_contacts {limit, offset, query}; get_contact {user_id}; list_blocked {limit}; get_labels none. query (Telegram, 1-64 characters): display name and username only, no phone number; ё=е, a Latin spelling finds the Cyrillic name. One call per account: for many names page the full list once without query.",
           "type": "object"
         },
         "request_id": {

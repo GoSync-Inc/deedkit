@@ -39,8 +39,8 @@ EXPECTED_EXTRA_FIELDS = {
     'get_reactions': {'limit', 'offset'},
 }
 # Operations whose raw OPERATIONS[name]['fields'] differ from the per-platform fields the manifest publishes
-# (_fields overrides them); deriving PARAMETERS from the raw field table would change these four.
-EXPECTED_RAW_FIELD_OVERRIDES = {'pin_message', 'request_chat_history', 'send_contact', 'update_profile'}
+# (_fields overrides them); deriving PARAMETERS from the raw field table would change these five.
+EXPECTED_RAW_FIELD_OVERRIDES = {'list_contacts', 'pin_message', 'request_chat_history', 'send_contact', 'update_profile'}
 # Go readOperations lists every non-mutating WhatsApp operation except this local write.
 EXPECTED_GO_READ_MISSING = {'open_chat_by_phone'}
 
@@ -155,7 +155,7 @@ def test_telegram_parameters_are_derived_with_the_per_platform_overrides():
 
 # spec: ANYM-286
 def test_raw_field_table_differs_from_published_fields_only_for_the_listed_overrides():
-    # W2-6 would derive PARAMETERS from OPERATIONS[name]['fields']; these four are resolved per platform by _fields.
+    # W2-6 would derive PARAMETERS from OPERATIONS[name]['fields']; these five are resolved per platform by _fields.
     differing = {name for name, spec in ops.OPERATIONS.items() if 'telegram' in spec['platforms']
                  and set(spec['fields']) != telegram.PARAMETERS[name]}
     assert differing == EXPECTED_RAW_FIELD_OVERRIDES

@@ -399,6 +399,15 @@ def _verify(row,c=None):
     return verify
 
 
+def contact_accounts(c,p):
+    """ANYM-673: the Telegram accounts where this key may run list_contacts now, read from its own grants (never widened)."""
+    if p['chat_ids'] is not None or 'contacts-read' not in p['permissions'] or not p['accounts']:return []
+    rows=c.execute("""SELECT a.id FROM accounts a JOIN account_policies ap ON ap.account=a.id
+        WHERE a.id=ANY(%s) AND a.platform='telegram' AND ap.enabled AND 'list_contacts'=ANY(ap.operations_enabled)
+        ORDER BY a.id""",(list(p['accounts']),)).fetchall()
+    return [row['id'] for row in rows]
+
+
 def _public(row,c=None,p=None):
     answer=row['result']
     if row['operation']=='open_chat_by_phone' and isinstance(answer,dict) and isinstance(answer.get('data'),dict):

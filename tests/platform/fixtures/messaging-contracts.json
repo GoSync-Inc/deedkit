@@ -1393,7 +1393,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "Find provider-reported name/username fragments or sender IDs in permitted archived chats.\nResults are account/chat-scoped observations, not verified or merged identities.\nUse account + sender_id with search() and source_message with get_context().\nMissing matches may mean metadata has not been observed; no contact-book/provider call.\nA row whose identity the owner linked to a person carries person (a UUID); person=<id>\nlists the name observations of that person's identities you can read (across messengers),\nand search(person=<id>) finds their messages. Links are owner-made, never inferred from names.\n",
+      "description": "Find provider-reported name/username fragments or sender IDs in permitted archived chats.\nResults are account/chat-scoped observations, not verified or merged identities.\nUse account + sender_id with search() and source_message with get_context().\nMissing matches may mean metadata has not been observed; no contact-book/provider call.\nAn empty result may carry see_also: list_contacts with query (Telegram contact book) for accounts you may read.\nA row whose identity the owner linked to a person carries person (a UUID); person=<id>\nlists the name observations of that person's identities you can read (across messengers),\nand search(person=<id>) finds their messages. Links are owner-made, never inferred from names.\n",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {

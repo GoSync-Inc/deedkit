@@ -22,7 +22,9 @@ import time
 from telethon import errors, functions, types, utils
 
 from .envelope import canonical, stable_id
-from .messenger_operations import HISTORY, INSPECT_BUTTONS, LIVE_SEARCH, live_cursor_binding, platform_parameters
+from .name_variants import contact_matcher
+from .messenger_operations import (HISTORY, INSPECT_BUTTONS, LIVE_SEARCH, live_cursor_binding, platform_parameters,
+                                   validate_operation)
 
 log = logging.getLogger('anymsg.live_search')
 history_log = logging.getLogger('anymsg.chat_history')
@@ -460,6 +462,10 @@ async def read_contacts(op):
         contact_ids = {u.user_id for u in getattr(response, 'contacts', [])}
         candidates = [profile(u) for u in getattr(response, 'users', [])
                       if isinstance(u, types.User) and u.id in contact_ids and allowed_provider_id(u.id)]
+        if 'query' in parameters:
+            # ANYM-673: display name and username only, never the phone; the filter runs after the one provider call.
+            matches = contact_matcher(parameters['query'])
+            candidates = [c for c in candidates if matches(' '.join(filter(None, (c['first_name'], c['last_name']))), c['username'])]
         return {'outcome': 'confirmed', 'contacts': candidates[offset:offset + limit],
                 'reported_count': len(candidates), 'page_limit': limit,
                 'next_offset': offset + limit if offset + limit < len(candidates) else None}
@@ -984,6 +990,12 @@ async def _execute(client, job, *, verified_self=None, governor=None):
     parameters = job.get('parameters', {})
     if not isinstance(parameters, dict) or set(parameters) - PARAMETERS[operation]:
         reject('invalid_parameters')
+    if operation == 'list_contacts' and 'query' in parameters:
+        # ANYM-673: the backend validated it already; a malformed query never reaches the provider call either way.
+        try:
+            validate_operation('telegram', operation, parameters)
+        except ValueError:
+            reject('invalid_parameters')
     expiry = job.get('expires_at')
     if type(expiry) not in (int, float) or not math.isfinite(expiry):
         reject('invalid_parameters')
