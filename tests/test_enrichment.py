@@ -885,13 +885,13 @@ def test_the_scaled_copy_drops_the_exif_block(tmp_path):
     assert b'Exif' not in sent_image(seen[0])[1]
 
 
-# spec: ANYM-696
 BAD_PICTURES={'corrupt':bytes(range(256))*400,  # the test id carries the name only: a 100 KB id would be PYTEST_CURRENT_TEST, too big for exec
     'concat':b"ffconcat version 1.0\nfile 'original'\n",
     'svg':b'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>',
     'playlist':b'#EXTM3U\n#EXTINF:1,x\nfile:///etc/passwd\n'}
 
 
+# spec: ANYM-696
 @pytest.mark.parametrize('name',list(BAD_PICTURES))
 def test_a_bad_picture_fails_as_invalid_image_sends_nothing_and_the_next_job_succeeds(tmp_path,monkeypatch,name):
     import tempfile
