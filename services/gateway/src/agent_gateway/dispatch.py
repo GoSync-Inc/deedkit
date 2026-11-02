@@ -491,7 +491,7 @@ class Dispatch:
         authorized again after the capability read and before any detail is built, so a revocation mid-request leaves the
         one identical body of a tool the key cannot call."""
         try:
-            current, _, _ = self.admit(key, name)
+            current, principal, _ = self.admit(key, name)
         except Denied as error:
             if error.code == "not_found_or_forbidden" and error.status == 403:
                 error.detail = unknown_tool_denial("platform_capabilities" in self.visible_to(key))
@@ -499,7 +499,7 @@ class Dispatch:
         if current["revision"] != snapshot["revision"]:
             raise Denied("policy_changed", 409)
         try:
-            return operation_missing_detail(tool, caps)
+            return operation_missing_detail(tool, caps, "platform_capabilities" in self.policy.visible(current, principal))
         except Exception:  # noqa: BLE001 - a diagnostic never replaces the denial; today's bare body stays
             return None
 

@@ -69,6 +69,20 @@ TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?
 STARTED_AT = datetime.now(timezone.utc)
 OPERATION_MISSING_HINT = ("A changed module build or manifest version is a signal to read tools/list and "
                           "platform_capabilities again, never proof that the operation exists.")
+# The same hint for a key whose policy does not allow platform_capabilities: it never names a tool outside its list.
+OPERATION_MISSING_HINT_WITHOUT_PLATFORM = ("A changed module build or manifest version is a signal to read tools/list "
+                                           "again, never proof that the operation exists.")
+
+
+def valid_timestamp(value):
+    """A bounded ISO-8601 timestamp with an offset whose date, time and offset are real."""
+    if not (isinstance(value, str) and len(value) <= 40 and TIMESTAMP.match(value)):
+        return False
+    try:
+        datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except ValueError:
+        return False
+    return True
 
 
 def gateway_build():
@@ -86,7 +100,7 @@ def build_summary(capabilities):
         return None
     sha, started = build.get("source_sha"), build.get("started_at")
     return {"source_sha": sha if isinstance(sha, str) and SOURCE_SHA.match(sha) else None,
-            "started_at": started if isinstance(started, str) and len(started) <= 40 and TIMESTAMP.match(started) else None}
+            "started_at": started if valid_timestamp(started) else None}
 
 
 def manifest_lacks(tool, capabilities):
@@ -110,12 +124,15 @@ def module_identity(capabilities):
     return summary.get("version"), build.get("source_sha")
 
 
-def operation_missing_detail(tool, capabilities):
-    """The body of a call to a policy-allowed tool whose operation the module's build does not have (ANYM-662)."""
+def operation_missing_detail(tool, capabilities, platform_allowed):
+    """The body of a call to a policy-allowed tool whose operation the module's build does not have (ANYM-662).
+
+    The hint names platform_capabilities only when the re-authorized key's policy allows that tool.
+    """
     manifest, build = module_identity(capabilities)
     return {"error": "operation_not_in_module_build", "module": tool["module"], "operation": tool["operation"],
             "module_manifest": manifest, "module_build": build, "next_action": "refresh_tools_after_release",
-            "hint": OPERATION_MISSING_HINT}
+            "hint": OPERATION_MISSING_HINT if platform_allowed else OPERATION_MISSING_HINT_WITHOUT_PLATFORM}
 
 
 def module_conditions(allowed, states, capabilities):

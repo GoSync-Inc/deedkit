@@ -4,6 +4,7 @@ import json
 import re
 
 import httpx
+import pytest
 from starlette.testclient import TestClient
 
 from agent_gateway import diagnostics
@@ -249,22 +250,95 @@ def test_a_backend_that_is_down_keeps_backend_unavailable_and_is_listed_as_unava
     assert result["backend_builds"] == {}
 
 
+def revoking_app(tmp_path, mutate, tools=(FETCH, "platform_capabilities")):
+    """A messaging stub that changes the key's access while the gateway reads the module's capabilities."""
+    held, paths = {}, []
+
+    def backend(request):
+        if request.url.path == "/v1/capabilities":
+            paths.append("capabilities")
+            held["value"]["revision"] += 1
+            mutate(held["value"])
+            held["path"].write_text(json.dumps(held["value"]))
+            return httpx.Response(200, json=OLD_MODULE)
+        paths.append(request.url.path)
+        return httpx.Response(200, json={"synthetic": True})
+
+    app, path, value = configured(tmp_path, backend, module="messaging", tools=list(tools), grants=["read"])
+    held.update(path=path, value=value)
+    return app, paths
+
+
+def drop_tool(value):
+    value["profiles"]["reader"]["tools"].remove(FETCH)
+
+
+def drop_tool_and_platform(value):
+    value["profiles"]["reader"]["tools"][:] = []
+
+
+def drop_grant(value):
+    value["principals"][0]["grants"] = {"messaging": []}
+
+
+def disable_key(value):
+    value["principals"][0]["enabled"] = False
+
+
 # spec: ANYM-662
-def test_a_mid_request_revocation_leaves_no_detail(tmp_path):
-    # The key is re-authorized after the capability read: a policy change in between is policy_changed, never the detail.
-    app, calls = module_app(tmp_path, OLD_MODULE)
-    path = next(tmp_path.glob("policy.json"))
-    value = json.loads(path.read_text())
+@pytest.mark.parametrize("mutate,expected", [
+    (drop_tool, {**UNKNOWN_BODY, "next": {"tool": "platform_capabilities", "arguments": {}}}),
+    (drop_tool_and_platform, UNKNOWN_BODY),
+], ids=["tool removed", "profile emptied"])
+def test_a_mid_request_revocation_leaves_the_canonical_denial_and_no_metadata(tmp_path, mutate, expected):
+    # The key is re-authorized after the capability read and before any detail is built; the tool is gone by then.
+    app, paths = revoking_app(tmp_path, mutate)
+    with TestClient(app) as client:
+        rest = call_both(client, FETCH, FETCH_ARGS)
+    assert rest.status_code == 403 and rest.json() == expected
+    assert paths == ["capabilities"] and "module_manifest" not in rest.text and "9.9.9" not in rest.text
 
-    def revoke(request):
-        value["revision"] += 1
-        path.write_text(json.dumps(value))
-        return httpx.Response(200, json=OLD_MODULE)
 
-    app = create_app(path, "http://testserver", transports={"messaging": httpx.MockTransport(revoke)})
+# spec: ANYM-662
+@pytest.mark.parametrize("mutate", [drop_grant, disable_key], ids=["grant removed", "key disabled"])
+def test_a_mid_request_loss_of_the_grant_or_the_key_leaves_no_detail_and_no_operation_call(tmp_path, mutate):
+    app, paths = revoking_app(tmp_path, mutate)
     with TestClient(app) as client:
         rest = client.post("/v1/" + FETCH, json=FETCH_ARGS, headers=HEADERS)
-    assert rest.status_code == 409 and rest.json().get("error") != "operation_not_in_module_build"
+        mcp = client.post("/mcp", json={"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": FETCH, "arguments": FETCH_ARGS}},
+                          headers={**HEADERS, "Accept": "application/json, text/event-stream"})
+    assert rest.status_code in (401, 403, 409) and rest.json().get("error") != "operation_not_in_module_build"
+    for text in (rest.text, mcp.text):
+        assert "module_manifest" not in text and "module_build" not in text and "9.9.9" not in text and SHA_A not in text
+    assert set(paths) == {"capabilities"}
+
+
+# spec: ANYM-662
+def test_a_policy_change_in_between_is_policy_changed_not_the_detail(tmp_path):
+    app, paths = revoking_app(tmp_path, lambda value: None)
+    with TestClient(app) as client:
+        rest = client.post("/v1/" + FETCH, json=FETCH_ARGS, headers=HEADERS)
+    assert rest.status_code == 409 and rest.json().get("error") != "operation_not_in_module_build" and paths == ["capabilities"]
+
+
+# spec: ANYM-662
+def test_a_key_that_may_not_call_platform_capabilities_is_never_pointed_to_it(tmp_path):
+    app, calls = module_app(tmp_path, OLD_MODULE, tools=(FETCH,))
+    with TestClient(app) as client:
+        rest = call_both(client, FETCH, FETCH_ARGS)
+    assert rest.status_code == 403 and rest.json()["error"] == "operation_not_in_module_build"
+    assert rest.json()["hint"] == diagnostics.OPERATION_MISSING_HINT_WITHOUT_PLATFORM
+    assert "platform_capabilities" not in rest.text and "next" not in rest.json()
+
+
+# spec: ANYM-662
+@pytest.mark.parametrize("started_at,kept", [
+    ("2026-11-02T10:00:00.000000Z", True), ("2026-11-02T10:00:00+01:00", True), ("2026-99-99T99:99:99Z", False),
+    ("2026-11-02T25:00:00Z", False), ("2026-11-02T10:00:00+99:99", False), ("2026-11-02", False), (5, False),
+])
+def test_build_timestamps_are_parsed_not_just_shaped(started_at, kept):
+    summary = diagnostics.build_summary({"build": {"source_sha": SHA_A, "started_at": started_at}})
+    assert summary == {"source_sha": SHA_A, "started_at": started_at if kept else None}
 
 
 # spec: ANYM-662
