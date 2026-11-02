@@ -229,10 +229,10 @@ def test_a_stored_provider_error_outside_the_closed_list_or_range_is_dropped_fro
         lines = capsys.readouterr().err.splitlines()
         assert len(lines) == 1 and json.loads(lines[0])['error'] == 'provider_error_cause_dropped', error
         assert 'Ignore' not in lines[0] and '21215' not in lines[0]
-    # A good cause with a bad code keeps the cause and drops the code.
+    # A good cause with a bad non-null code: the whole provider_error is dropped, never the event.
     for code in (0, 1000000, -5, '21215', 21215.0, True, 'x' * 300):
         kind, data = call_events.terminal({**base, 'provider_error': {'code': code, 'cause': 'rate_limited'}})
-        assert kind == 'call.failed' and data['provider_cause'] == 'rate_limited' and 'provider_code' not in data, code
+        assert kind == 'call.failed' and tuple(data) == THREE, code
         lines = capsys.readouterr().err.splitlines()
         assert len(lines) == 1 and json.loads(lines[0])['error'] == 'provider_error_code_dropped', code
     # A null code is the status read's own "no code": no code key and nothing to log.

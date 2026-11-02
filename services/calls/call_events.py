@@ -71,8 +71,9 @@ def deadline(decision):
 def _provider_error(v):
     """The event's provider_cause and provider_code from the stored call's provider_error (ANYM-695), nothing else.
 
-    A cause outside the closed list drops both keys, a code that is not an integer in 1..999999 drops only the code;
-    the event itself is always written. The log line names the code, never a value."""
+    A cause outside the closed list, or a code that is neither null nor an integer in 1..999999, drops both keys (the
+    whole provider_error is dropped from the event); a null code only leaves the code key out. The event itself is
+    always written. The log line names the code, never a value."""
     error=v.get('provider_error')
     if not error: return {}
     cause=error.get('cause') if isinstance(error,dict) else None
@@ -82,7 +83,9 @@ def _provider_error(v):
     data={'provider_cause':cause}
     code=error.get('code')
     if type(code) is int and 1<=code<=999999: data['provider_code']=code
-    elif code is not None: log('provider_error_code_dropped',ValueError('code'))
+    elif code is not None:
+        log('provider_error_code_dropped',ValueError('code'))
+        return {}
     return data
 
 
