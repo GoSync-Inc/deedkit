@@ -695,8 +695,8 @@ undo removes the directory. A daily file is 5760 lines (about 1 MB); nothing rot
 
 The service stops a running phase while Between or the remote tests use the host (README, Yielding). **It ships off**: without
 `yield.json` containing `{"enabled": true}` nothing is ever stopped. Deploying it is a normal release (section 8) and changes
-nothing for the phases; turning it on is gated on ANYM-691 PR 3 (the ownership of a helper that starts between the ledger write
-and the stop, README Yielding) and on criterion 7(a) of the card (three daily summaries of the monitor as the "before").
+nothing for the phases; turning it on is gated on criterion 7(a) of the card (three daily summaries of the monitor as the "before"; the ownership
+of a helper that starts between the ledger write and the stop was closed by ANYM-691 PR 3, README Yielding: a two-phase freeze).
 **What a deploy-time canary looks like:** `deedkit-inference canary` sends `X-Request-Deadline-Seconds` equal to its read
 timeout; during a pause a canary request is slow, not hung (`yield:` lines say how long), and the response carries
 `X-Paused-Seconds`. A dead or stale probe closes admission for new work, lets running work finish and resumes any pause.

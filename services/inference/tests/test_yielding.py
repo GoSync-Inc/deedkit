@@ -818,6 +818,147 @@ def test_process_table_reads_the_parent_pid():
     assert row["ppid"] == os.getppid()
 
 
+# --- PR 3: the two-phase freeze ----------------------------------------------------------------------------------------
+LEADER_AT = "Mon Nov 2 09:00:00 2026"
+RECORDED = time.mktime(time.strptime("Mon Nov 2 10:00:04 2026", pausestate.START_FORMAT)) + 0.5  # the freezing record; bound 5 s
+
+
+def ps_lines(*lines):
+    return pausestate.process_table(lambda: "".join(f"{line}\n" for line in lines))
+
+
+def owned_by(entry, *lines):
+    return sorted(row["pid"] for row in pausestate.members(entry, ps_lines(*lines)))
+
+
+def freezing(**over):
+    return {"pgid": 500, "leader": 500, "leader_start": LEADER_AT, "stopped_at": RECORDED, "phase": "freezing", "bound": 5.0, **over}
+
+
+# spec: ANYM-691
+def test_a_freezing_entry_owns_a_late_helper_whose_parent_is_gone():
+    """Sol r4 of PR 2: the record precedes the freeze, a helper starts in a later second, the service dies right after the
+    stop, and the helper's parent is killed before recovery: the orphan (ppid 1) must still be recovered. A freezing entry owns
+    every stopped member that started within its bound, whatever its parent; the older descent rule is not needed."""
+    orphan, edge, beyond = "Mon Nov 2 10:00:05 2026", "Mon Nov 2 10:00:09 2026", "Mon Nov 2 10:00:10 2026"
+    base = (f"500 500 T {LEADER_AT} 1", f"777 500 T {orphan} 1", f"778 500 T {edge} 1")
+    assert owned_by(freezing(), *base) == [500, 777, 778]
+    assert owned_by(freezing(), *base, f"779 500 T {beyond} 1") == [500, 777, 778]  # past the bound
+    assert owned_by(freezing(), *base, f"780 500 S {orphan} 1") == [500, 777, 778]  # a member that is not stopped is not claimed
+    assert owned_by(freezing(), *base[1:]) == [777, 778]  # the leader is gone too: the group is still ours
+    # the entry of a release before the two-phase freeze (no phase) never owned an orphan
+    legacy = {k: v for k, v in freezing().items() if k not in ("phase", "bound")}
+    assert owned_by(legacy, *base) == [500]
+
+
+# spec: ANYM-691
+def test_recovery_continues_and_kills_a_reparented_late_helper_of_a_freezing_entry(tmp_path):
+    table = {500: f"500 500 T {LEADER_AT} 1", 777: "777 500 T Mon Nov 2 10:00:05 2026 1"}
+    sent = []
+
+    def send(pid, number):
+        sent.append((pid, number))
+        if number == signal.SIGKILL:
+            table.pop(pid, None)
+
+    path = tmp_path / pausestate.LEDGER_NAME
+    pausestate.Ledger(path).record(500, 500, LEADER_AT, stopped_at=RECORDED, freezing=True)
+    report = pausestate.recover(path, run_ps=lambda: "".join(f"{line}\n" for line in table.values()), send=send,
+                                sleep=lambda seconds: None)
+    assert (777, signal.SIGCONT) in sent and (777, signal.SIGKILL) in sent and sorted(report["killed"]) == [500, 777]
+    assert report["kept"] == [] and not path.exists()  # the entry goes only when no member is left
+
+
+# spec: ANYM-691
+def test_a_reused_leaderless_group_is_never_claimed():
+    """The group number is reused after the old group died: its leader is gone or started later, its members started after
+    the bound. Nothing of it is ours, in either phase."""
+    later = "Mon Nov 2 10:00:30 2026"
+    assert owned_by(freezing(), f"790 500 T {later} 1", f"791 500 T {later} 790") == []  # leaderless, all after the bound
+    assert owned_by(freezing(), f"500 500 S {later} 1", "792 500 T Mon Nov 2 10:00:06 2026 500") == []  # the leader pid is a newer process
+    stopped = freezing(phase="stopped", stopped_at=RECORDED + 1.0)
+    stopped.pop("bound")
+    assert owned_by(stopped, f"790 500 T {later} 1") == []
+    # a confirmed entry has no slack: a process of the next second after the real stop is not a member
+    assert owned_by(stopped, f"793 500 T {LEADER_AT} 1", "794 500 T Mon Nov 2 10:00:06 2026 1") == [793]
+
+
+# spec: ANYM-691
+def test_a_ledger_file_cannot_widen_the_bound(tmp_path):
+    ledger = pausestate.Ledger(tmp_path / pausestate.LEDGER_NAME)
+    ledger.record(500, 500, LEADER_AT, stopped_at=RECORDED, freezing=True)
+    assert ledger.groups()[0]["phase"] == "freezing" and ledger.groups()[0]["bound"] == pausestate.FREEZE_SECONDS
+    for bad in ({"bound": 3600}, {"bound": -1}, {"bound": True}, {"phase": "thawing"}):
+        (tmp_path / pausestate.LEDGER_NAME).write_text(__import__("json").dumps(
+            {"version": 1, "instance": "x", "groups": [{**freezing(), **bad}]}))
+        with pytest.raises(pausestate.LedgerError):
+            ledger.groups()
+
+
+# spec: ANYM-691
+async def test_the_entry_is_freezing_when_the_signal_goes_out_and_stopped_with_the_real_time_after(env, monkeypatch):
+    clock, seen = Virtual(), []
+    real = os.killpg
+
+    def killpg(pgid, number):
+        if number == signal.SIGSTOP:
+            seen.append(pausestate.Ledger(env.tmp / "state" / pausestate.LEDGER_NAME).groups()[0])
+        result = real(pgid, number)
+        if number == signal.SIGSTOP:
+            seen.append(time.time())  # the stop has landed
+        return result
+
+    monkeypatch.setattr(os, "killpg", killpg)
+    async with manual(env, clock) as (s, cpu):
+        task, pid = await paused_child(s, clock, env.tmp / "prog")
+        before, landed = seen
+        assert before["phase"] == "freezing" and before["bound"] == pausestate.FREEZE_SECONDS and before["pgid"] == pid
+        ledger = pausestate.Ledger(env.tmp / "state" / pausestate.LEDGER_NAME)
+        await s.until(lambda: ledger.groups()[0].get("phase") == "stopped")  # the second write, off the loop
+        entry = ledger.groups()[0]
+        assert "bound" not in entry and landed - 0.001 <= entry["stopped_at"] <= time.time() + 1
+        assert entry["stopped_at"] >= before["stopped_at"]
+        await finish(task)
+
+
+# spec: ANYM-691
+async def test_a_stop_delayed_past_the_freeze_bound_is_not_sent_and_the_group_is_recorded_again(env, monkeypatch):
+    clock, sent, skew = Virtual(), [], [0.0]
+    real_killpg = os.killpg
+
+    def killpg(pgid, number):
+        sent.append(number)
+        return real_killpg(pgid, number)
+
+    monkeypatch.setattr(os, "killpg", killpg)
+    path = env.tmp / "prog"
+    async with manual(env, clock) as (s, cpu):
+        y = s.service.yielder
+        y.wall = lambda: time.time() + skew[0]
+        record = y.ledger.record
+
+        def stalled(*args, **kwargs):
+            record(*args, **kwargs)
+            skew[0] += 3.0  # the loop or the ledger thread stalls between the write and the stop (more than STOP_WITHIN_SECONDS)
+
+        y.ledger.record = stalled
+        task = await s.submit(s.transcribe(fk(tick=str(path), ticks=100)))
+        await s.until(lambda: size(f"{path}.main") > 2)
+        pid = s.service.scheduler.children()[0].proc.pid
+        s.probe.between = True
+        await tick(s, clock, times=2)
+        assert signal.SIGSTOP not in sent and not y.paused and not stopped(pid)  # the record had outlived its bound: no stop
+        seen = size(f"{path}.main")
+        await s.until(lambda: size(f"{path}.main") > seen)  # the phase runs on
+        ledger = pausestate.Ledger(env.tmp / "state" / pausestate.LEDGER_NAME)
+        await s.until(lambda: not ledger.groups() if ledger.path.exists() else True)  # the stale record is withdrawn
+        y.ledger.record = record  # the stall is over
+        await tick(s, clock, times=1)
+        await s.until(lambda: stopped(pid))
+        assert sent.count(signal.SIGSTOP) == 1 and y.paused  # the next tick recorded again and stopped inside the bound
+        await finish(task)
+
+
 # spec: ANYM-691
 async def test_a_worker_whose_call_ended_while_it_was_stopped_is_continued(env):
     """A worker can answer just before the stop lands: the scheduler then clears `worker.job` while the group stays

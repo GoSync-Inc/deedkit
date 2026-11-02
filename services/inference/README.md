@@ -198,9 +198,13 @@ service's own children and the load average are not counted) is at least `pause_
 ticks of `supervise_interval_seconds`. It continues (`SIGCONT`) when no `pause_on` flag has been true for
 `resume_after_seconds`, or at once when the file is missing, invalid or stale or anything in the yielder fails (back to Nice 20
 alone). A stopped group keeps its memory: the pause buys CPU for Between and the tests and costs RAM-minutes.
-**Off by default.** Known residual (ANYM-691 PR 3 closes it before anything enables the feature): a crash of the service right after
-the stop, followed by the kill of the parent of a helper that started in the milliseconds between the ledger write and the
-stop, can leave that one helper stopped and unowned by recovery (`pausestate.members`).
+**Off by default.** The ledger is written in two phases (ANYM-691 PR 3, which closes the residual of PR 2): a "freezing" entry
+before the SIGSTOP, which owns every stopped member of the group that started within `FREEZE_SECONDS` (5 s) of the record whatever
+its parent is by then (a crash plus the kill of a late helper's parent leaves an orphan of ppid 1: it is still recovered), then a
+"stopped" entry with the real stop time right after the signal. The service stops a group only while its freezing record is
+younger than `STOP_WITHIN_SECONDS` (2 s, checked in the same synchronous step as the signal); an older record is withdrawn and the
+next tick records again. A group number reused by another process is rejected by the leader identity and by the start-time
+bound, so a leaderless reused group is never claimed. Enabling is still gated on criterion 7(a) of the card.
 
 - Only the last phase of a job, from its spawn (a child) or from the moment its call is sent (a worker). Not paused:
   loading, model-hash preparation, idle warm workers, earlier phases of a multi-phase job, a phase with less than
@@ -214,7 +218,7 @@ stop, can leave that one helper stopped and unowned by recovery (`pausestate.mem
 - Before every stop the group is written to `state/paused.json` (see `recover`); a drain continues every paused group first.
 - Settings: the optional `yield.json` next to `config.json` (same owner, not writable by others; read at start; absent,
   unreadable or invalid means the defaults and one logged line, never a failed start): `enabled` **false (ships off:
-  turning it on needs `{"enabled": true}` here, gated on ANYM-691 PR 3, below)**, `pause_on`
+  turning it on needs `{"enabled": true}` here, gated on card criterion 7(a), below)**, `pause_on`
   `["between", "deedkit_ci"]`, `pause_min_foreign_cores` 1.0, `resume_after_seconds` 10, `min_remaining_seconds` 20,
   `max_pause_seconds` 300, `deadline_margin_seconds` 10, `deadline_safety_factor` 3. `config.json` is unchanged (it rejects
   unknown fields, and a rollback only switches the release). `/health` is unchanged.

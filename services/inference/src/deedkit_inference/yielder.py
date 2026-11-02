@@ -38,6 +38,9 @@ PS_TIMEOUT = 2.0
 TICK_TIMEOUT = 8.0  # one whole tick: a ps that hangs, a ledger that blocks
 MAX_BACKOFF = 30.0
 LOG_EVERY_FAILURE = 30  # a SIGCONT that keeps failing is retried on every tick but logged on the first and every 30th
+#: The stop follows its freezing record by at most this long (pausestate.FREEZE_SECONDS is the ledger's bound, the margin is the
+#: signal itself and clock steps).
+STOP_WITHIN_SECONDS = 2.0
 
 
 class YieldSettings(BaseModel):
@@ -165,6 +168,7 @@ class Candidate:
     worker: object | None
     marker: str | None
     allowance: float = 0.0
+    recorded_at: float = 0.0  # the wall time of the freezing record: the stop must follow within STOP_WITHIN_SECONDS
 
 
 @dataclass
@@ -358,9 +362,18 @@ class Yielder:
         """Ledger thread: write the group BEFORE the stop. False when the leader is gone; a LedgerError fails the tick."""
         started = pausestate.start_text(candidate.proc.pid)
         if started is None:
-            return False
-        self.ledger.record(candidate.proc.pid, candidate.proc.pid, started, stopped_at=self.wall())
-        return True
+            return None
+        at = self.wall()
+        self.ledger.record(candidate.proc.pid, candidate.proc.pid, started, stopped_at=at, freezing=True)
+        return at
+
+    def _confirm(self, pgid, recorded_at, stopped_at):
+        """Ledger thread, second phase: the entry gets the real stop time. A failure leaves the freezing entry, whose bound still
+        covers the stop, so it is logged and nothing else."""
+        try:
+            self.ledger.confirm(pgid, recorded_at, stopped_at)
+        except Exception as error:  # noqa: BLE001
+            LOG.error("yield: ledger entry not confirmed: %s", type(error).__name__)
 
     async def _enter(self, now, flags):
         for running in self._running():
@@ -370,18 +383,23 @@ class Yielder:
             candidate = self._assess(running, now)
             if isinstance(candidate, str):
                 continue
-            if not await asyncio.wrap_future(self.io.submit(self._record, candidate)):
+            recorded_at = await asyncio.wrap_future(self.io.submit(self._record, candidate))
+            if recorded_at is None:
                 continue
+            candidate.recorded_at = recorded_at
             self._stop(candidate, flags)
 
     def _stop(self, candidate, flags):
         """One synchronous step: look again, stop the group, register it. Nothing awaits in between, so a
-        cancellation can never leave a stopped group that `resume_all` does not know."""
+        cancellation can never leave a stopped group that `resume_all` does not know. The freezing record owns members only up
+        to its bound: when the write is older than STOP_WITHIN_SECONDS now (a stall of the loop or the ledger thread) the stop
+        is not sent and the next tick records again."""
         running, proc = candidate.running, candidate.proc
         job = running.job
         now = self.now()
         current = any(slot.running is running for slot in self.scheduler.slots.values())
         if (not self.on or not current or proc.returncode is not None or job.paused_since is not None
+                or self.wall() - candidate.recorded_at > STOP_WITHIN_SECONDS
                 or (candidate.worker is not None and (candidate.worker.job is not job or not candidate.worker.alive()))
                 or (candidate.worker is None and job.proc is not proc)):
             self._unrecord(proc.pid)
@@ -398,6 +416,9 @@ class Yielder:
         except (ProcessLookupError, PermissionError):
             self._resume(pause, "gone")
             return
+        stopped_at = self.wall()  # right after the signal: no member can start after this
+        with contextlib.suppress(RuntimeError):  # the executor is shut down: the process is going away
+            self.io.submit(self._confirm, pause.pgid, candidate.recorded_at, stopped_at)
         if pause.marker is not None and os.path.exists(pause.marker):
             self._resume(pause, "decode")  # the marker appeared before the stop landed: the decoder keeps its deadline
 
