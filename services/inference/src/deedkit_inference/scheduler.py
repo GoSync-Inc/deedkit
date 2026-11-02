@@ -530,6 +530,7 @@ class Scheduler:
                     seen.add(worker.proc.pid)
                     size = await asyncio.to_thread(self.probe.rss_gb, worker.proc.pid)
                     victim = ("worker", engine, name, worker)
+                    self.admission.note_resident(worker.key, size)
                     if size > MEMORY_SHARE_FACTOR * worker.resident_gb:
                         self._kill_victim(victim, "memory_share")
                     else:

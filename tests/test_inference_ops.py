@@ -250,17 +250,29 @@ class Clock:
 
 # spec: ANYM-684
 def test_probe_sees_between_ci_that_runs_inside_its_colima_vms():
-    # 11-02: Between's runners ran a full pytest job inside the _betweenci VM (a Virtualization process near 100 %)
-    # while no Docker context of the admin account listed a container, and the file said between: false
-    host = FakeHost(vm_processes=vm_table(0.3, 97.6))
+    # 11-02: Between's runners ran a full pytest job inside the _betweenci VM while no Docker context of the admin
+    # account listed a container, and the file said between: false. The rule since 11-02 evening (owner via the
+    # orchestrator): busy at a 60 s mean of 2.0 cores or one sample of 4.0 cores (the VM's %cpu is summed over its cores)
+    host = FakeHost(vm_processes=vm_table(0.3, 450.0))
     assert observe(host, between_ci=busy_probe.VmLoad(Clock())) == {'between': True, 'deedkit_ci': False}
+    # after a quiet minute one sample just under the spike line, and a job that fills one core (the old rule's busy),
+    # are not busy; the line itself is
+    def after_a_quiet_minute(cpu):
+        clock = Clock()
+        load = busy_probe.VmLoad(clock)
+        for _ in range(12):
+            assert observe(FakeHost(vm_processes=vm_table(1.0)), between_ci=load)['between'] is False
+            clock.now += 5
+        return observe(FakeHost(vm_processes=vm_table(cpu)), between_ci=load)['between']
+    assert after_a_quiet_minute(399.0) is False and after_a_quiet_minute(97.6) is False
+    assert after_a_quiet_minute(400.0) is True
     # the same VMs idle (recorded 0.2-6.8 %): not busy
     assert observe(FakeHost(vm_processes=vm_table(0.3, 2.4)), between_ci=busy_probe.VmLoad(Clock()))['between'] is False
     # the admin account's own VM and other users' Virtualization processes are not Between's
-    assert observe(FakeHost(vm_processes=vm_table(0.3, 1.0, admin=99.0)), between_ci=busy_probe.VmLoad(Clock()))['between'] is False
+    assert observe(FakeHost(vm_processes=vm_table(0.3, 1.0, admin=999.0)), between_ci=busy_probe.VmLoad(Clock()))['between'] is False
     # no _betweenci user on this host: no VM of it can run
     gone = {'_deedkitci': 453}
-    assert observe(FakeHost(vm_processes=vm_table(99.0)), uids=gone, between_ci=busy_probe.VmLoad(Clock()))['between'] is False
+    assert observe(FakeHost(vm_processes=vm_table(999.0)), uids=gone, between_ci=busy_probe.VmLoad(Clock()))['between'] is False
     # a container in a Docker context is still enough on its own
     host = FakeHost(containers={'default': ['between-vm-1 x=y']}, vm_processes=vm_table(0.1))
     assert observe(host, between_ci=busy_probe.VmLoad(Clock()))['between'] is True
@@ -270,30 +282,86 @@ def test_probe_sees_between_ci_that_runs_inside_its_colima_vms():
 
 # spec: ANYM-684
 def test_probe_keeps_between_busy_through_the_gaps_of_a_bursty_job():
-    # pytest on the VM spikes and idles within seconds; one quiet sample must not reopen admission
+    # a burst on the VM spikes and idles within seconds; one quiet sample must not reopen admission (hold 120 s)
     clock = Clock()
     load = busy_probe.VmLoad(clock)
     host = FakeHost()
     verdicts = []
-    for cpu, step in [(91.2, 5), (1.2, 5), (0.4, 5), (2.0, 60), (1.0, 50), (1.0, 20), (0.5, 5)]:
+    for cpu, step in [(450.0, 5), (5.0, 5), (5.0, 5), (5.0, 60), (5.0, 30), (5.0, 25), (5.0, 5)]:
         host.vm_processes = vm_table(cpu, 0.2)
         verdicts.append((clock.now - 1000.0, observe(host, between_ci=load)['between']))
         clock.now += step
-    # busy at the spike and for the hold afterwards, free again once a quiet window has also passed
-    assert verdicts[:4] == [(0.0, True), (5.0, True), (10.0, True), (15.0, True)]
-    assert verdicts[4] == (75.0, True) and verdicts[5] == (125.0, True)
-    assert verdicts[6] == (145.0, False)
-    # a sustained moderate load (15 % of a core for a minute) counts as busy; a steady 3 % does not
+    # busy at the spike and for the hold after the last high reading (the second sample's window mean is still high),
+    # free again once a quiet window and the hold have passed
+    assert verdicts[:5] == [(0.0, True), (5.0, True), (10.0, True), (15.0, True), (75.0, True)]
+    assert verdicts[5] == (105.0, True)
+    assert verdicts[6] == (130.0, False)
+    # a sustained 2.5 cores for a minute counts as busy; a steady 1.5 cores (busy under the old 10 % rule) does not
     clock = Clock()
     load = busy_probe.VmLoad(clock)
     for _ in range(14):
-        assert observe(FakeHost(vm_processes=vm_table(15.0, 0.1)), between_ci=load)['between'] is True
+        assert observe(FakeHost(vm_processes=vm_table(250.0, 0.1)), between_ci=load)['between'] is True
         clock.now += 5
     clock = Clock()
     load = busy_probe.VmLoad(clock)
     for _ in range(30):
-        assert observe(FakeHost(vm_processes=vm_table(3.0, 0.1)), between_ci=load)['between'] is False
+        assert observe(FakeHost(vm_processes=vm_table(150.0, 0.1)), between_ci=load)['between'] is False
         clock.now += 5
+
+
+# spec: ANYM-684
+def test_the_probe_thresholds_are_arguments_and_the_old_values_still_work():
+    # undo without code: the plist carries the three values; the old rule is mean 0.1 core, spike 0.5 core, hold 120 s
+    clock = Clock()
+    old = busy_probe.VmLoad(clock, mean_cores=0.1, spike_cores=0.5, hold_seconds=120.0)
+    assert observe(FakeHost(vm_processes=vm_table(0.3, 97.6)), between_ci=old)['between'] is True
+    clock = Clock()
+    old = busy_probe.VmLoad(clock, mean_cores=0.1, spike_cores=0.5, hold_seconds=120.0)
+    for _ in range(14):
+        assert observe(FakeHost(vm_processes=vm_table(15.0, 0.1)), between_ci=old)['between'] is True
+        clock.now += 5
+    # the shipped values are the new rule, and the hold is a parameter too
+    default = busy_probe.VmLoad(Clock())
+    assert (default.mean, default.spike, default.hold_seconds) == (200.0, 400.0, 120.0)
+    clock = Clock()
+    short = busy_probe.VmLoad(clock, hold_seconds=30.0)
+    assert observe(FakeHost(vm_processes=vm_table(450.0)), between_ci=short)['between'] is True
+    clock.now += 100  # the burst has left the 60 s window; 30 s of hold are over, the default 120 s would not be
+    assert observe(FakeHost(vm_processes=vm_table(1.0)), between_ci=short)['between'] is False
+    clock = Clock()
+    long = busy_probe.VmLoad(clock)
+    assert observe(FakeHost(vm_processes=vm_table(450.0)), between_ci=long)['between'] is True
+    clock.now += 100
+    assert observe(FakeHost(vm_processes=vm_table(1.0)), between_ci=long)['between'] is True
+
+
+# spec: ANYM-684
+def test_the_probe_reads_its_thresholds_from_the_command_line(monkeypatch, capsys):
+    seen = []
+    monkeypatch.setattr(busy_probe, 'observe', lambda **kwargs: seen.append(kwargs['between_ci']) or {'between': False, 'deedkit_ci': False})
+    args = ['--vm-mean-cores', '0.1', '--vm-spike-cores', '0.5', '--vm-hold-seconds', '90', '--once']
+    assert busy_probe.main(args) == 0
+    assert (seen[0].mean, seen[0].spike, seen[0].hold_seconds) == (10.0, 50.0, 90.0)
+    capsys.readouterr()
+    # no argument: the shipped rule
+    assert busy_probe.main(['--once']) == 0
+    assert (seen[1].mean, seen[1].spike, seen[1].hold_seconds) == (200.0, 400.0, 120.0)
+    capsys.readouterr()
+    # values that would switch the rule off or cannot be compared are refused, not read as "never busy"
+    for flag, value in [('--vm-mean-cores', '0'), ('--vm-mean-cores', '-1'), ('--vm-mean-cores', 'nan'), ('--vm-spike-cores', 'inf'),
+                        ('--vm-spike-cores', '0'), ('--vm-hold-seconds', '-5'), ('--vm-hold-seconds', 'nan'), ('--vm-hold-seconds', 'x')]:
+        with pytest.raises(SystemExit):
+            busy_probe.main([flag, value, '--once'])
+        capsys.readouterr()
+
+
+# spec: ANYM-684
+def test_the_busy_plist_passes_the_rule_and_it_matches_the_probe_defaults():
+    arguments = plistlib.loads(render.render_busy_plist(**ADMIN))['ProgramArguments']
+    flags = {a: arguments[i + 1] for i, a in enumerate(arguments) if a.startswith('--vm-')}
+    assert flags == {'--vm-mean-cores': '2.0', '--vm-spike-cores': '4.0', '--vm-hold-seconds': '120'}
+    default = busy_probe.VmLoad(Clock())
+    assert (default.mean, default.spike, default.hold_seconds) == (float(flags['--vm-mean-cores']) * 100, float(flags['--vm-spike-cores']) * 100, float(flags['--vm-hold-seconds']))
 
 
 # spec: ANYM-684

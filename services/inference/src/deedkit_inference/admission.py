@@ -39,6 +39,7 @@ class Admission:
         self.config, self.probe, self.wall, self.monotonic = config, probe, wall, monotonic
         self.loaded = {}
         self.pending = {}  # key -> resident_gb of a running phase, held back from the free memory others see
+        self.measured = {}  # key -> the last measured resident size of a warm worker (the supervisor's tick), for the floor
         self.settle_until = 0.0
 
     # --- resident book ---------------------------------------------------------------------------------
@@ -54,6 +55,7 @@ class Admission:
                 if worker is None or not worker.alive():
                     del self.loaded[key]
                     self.pending.pop(key, None)
+                    self.measured.pop(key, None)
 
     def warm(self, key):
         """The key's engine keeps a worker between jobs and has it loaded now (running or idle)."""
@@ -71,6 +73,17 @@ class Admission:
         item.running += 1
         item.last_used = self.monotonic()
 
+    def note_resident(self, key, gb):
+        """The supervisor's latest measurement of a worker's resident size: the only memory the floor credits."""
+        if key in self.loaded:
+            self.measured[key] = gb
+
+    def credit(self):
+        """What the engines this service holds really occupy: measured, never above the configured figure (which has
+        headroom in it, aliases.py), and nothing for a reservation that has not been measured (a cold start that has not
+        allocated, a one-shot child)."""
+        return sum(min(self.measured.get(key, 0.0), item.gb) for key, item in self.loaded.items())
+
     def mark_idle(self, key):
         self.pending.pop(key, None)
         item = self.loaded.get(key)
@@ -80,10 +93,12 @@ class Admission:
         item.last_used = self.monotonic()
         if item.running == 0 and not item.persistent:
             del self.loaded[key]
+            self.measured.pop(key, None)
 
     def evict(self, keys):
         for key in keys:
             self.pending.pop(key, None)
+            self.measured.pop(key, None)
             item = self.loaded.pop(key, None)
             if item is not None and item.engine is not None and item.persistent:
                 item.engine.unload(item.phase_name)
@@ -93,6 +108,7 @@ class Admission:
     def drop(self, key):
         """A dead child (crash, timeout, kill, cancel): its memory is back at once, nothing to wait for."""
         self.pending.pop(key, None)
+        self.measured.pop(key, None)
         item = self.loaded.pop(key, None)
         if item is not None and item.engine is not None and item.persistent:
             item.engine.unload(item.phase_name)
@@ -124,6 +140,24 @@ class Admission:
         cap = self.config.slot_max_load_1m.get(slot, self.config.max_load_1m)
         return "load_high" if self.probe.load_1m() > cap else None
 
+    def floor_open(self, visible=None):
+        """The admission floor (`admit_min_available_gb`): the memory a job leaves Between and the tests, counting the
+        engines this service holds loaded as free by what the supervisor measured of them (they are ours to give back: a
+        warm 3.8 GB worker would otherwise keep the figure under the floor for ever). Zero from the probe is "unreadable"
+        and never opens."""
+        floor = self.config.admit_min_available_gb
+        if floor <= 0:
+            return True
+        visible = self.probe.available_gb() if visible is None else visible
+        return visible > 0 and visible + self.credit() >= floor
+
+    def floor_verdict(self, visible):
+        if self.floor_open(visible):
+            return None
+        if self.monotonic() < self.settle_until:
+            return Verdict("wait")  # an eviction's memory is still coming back, as for the per-phase rule
+        return Verdict("refuse", "memory_low")
+
     def check(self, key, resident_gb, slot, *, arrival=False, anything_running=False):
         """The verdict for one phase about to start (or, with `arrival`, for a job that just arrived)."""
         self.reconcile()
@@ -132,9 +166,14 @@ class Admission:
             return Verdict("refuse", reason)
         if resident_gb > self.config.resident_cap_gb:
             return Verdict("refuse", "resident_cap")
+        floor_on = self.config.admit_min_available_gb > 0
+        visible = self.probe.available_gb() if floor_on or not arrival or not anything_running else None  # one read per check
+        if floor_on:
+            floor = self.floor_verdict(visible)
+            if floor is not None:
+                return floor
         if not arrival or not anything_running:
             need = (0.0 if self.warm(key) else resident_gb) + self.config.min_free_gb
-            visible = self.probe.available_gb()
             if visible < need:
                 if self.monotonic() < self.settle_until:
                     return Verdict("wait")
@@ -162,4 +201,7 @@ class Admission:
         """Open or closed for /health: would a job that needs nothing resident be admitted right now."""
         if self.busy_reason() or (self.load_reason("gpu") and self.load_reason("cpu")):
             return "closed"
-        return "open" if self.probe.available_gb() >= self.config.min_free_gb else "closed"
+        visible = self.probe.available_gb()
+        if not self.floor_open(visible):
+            return "closed"
+        return "open" if visible >= self.config.min_free_gb else "closed"

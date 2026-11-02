@@ -365,7 +365,7 @@ curl -sS --max-time 5 http://127.0.0.1:8090/health; echo'
 Expected: `busy.json` is `-rw-r----- <admin> _deedkitinf`, `ts` within a few seconds of now, `between`/`deedkit_ci`
 true only if Between or a test run is active (`between` also reads the CPU of the `_betweenci` colima VMs' Virtualization
 processes: Between's CI runs inside them, where no Docker context of the admin account sees it; busy while their summed
-%cpu averages 10 % over 60 s or spikes to 50 %, and for 120 s after the last such reading or after the probe's own start); the service is `running` under `/usr/bin/sandbox-exec`, `ps -axo
+%cpu averages 2.0 cores (200 %) over 60 s or one sample reaches 4.0 cores (400 %), and for 120 s after the last such reading or after the probe's own start; the first rule was 0.1 and 0.5 core, section 13d); the service is `running` under `/usr/bin/sandbox-exec`, `ps -axo
 user,nice,args` shows `_deedkitinf` with NI 20; `/health` answers `{"status": "ok", "queue": ..., "admission":
 "open"|"closed"}` (closed while Between is busy: that is the design). If the `logs/` files were created by launchd as
 root, `chown _deedkitinf` them and record it. Then the deploy script's own read-back, which also proves
@@ -710,6 +710,46 @@ timeout; during a pause a canary request is slow, not hung (`yield:` lines say h
   (or remove the file: the default is off) and restart; or roll back to a release without the feature. Either restores today's behaviour (Nice 20 alone).
 - A stopped group left by a service that died is continued and killed by `deedkit-inference recover` (sections 8, 14), by the
   next start, and by the deploy; check read-only first: `ps -axo pid,pgid,stat,user,comm | awk '$3 ~ /^T/ && $4 == "_deedkitinf"'`.
+
+### 13d. The busy rule and the admission floor (ANYM-684 criterion 10, owner via the orchestrator 11-02)
+
+Why: the impact log of 11-02 (1549 samples, 07:17Z-13:48Z, 12 cores, 24 GB) showed `between: true` for 83 % of the time while Between's
+VM median use was 0.9 core (p90 2.1), the mini's free memory (free + inactive + speculative) 9.1 GB median, 6.0 GB minimum with Between
+active. The first rule (a 60 s mean of 0.1 core, one sample of 0.5 core) kept models waiting on an almost idle host. The rule now:
+
+| Part | Where | Value | Undo (no code) |
+|---|---|---|---|
+| Between busy: 60 s mean of the VMs' summed cores | busy probe plist `--vm-mean-cores` | 2.0 | `0.1` |
+| Between busy: one sample | `--vm-spike-cores` | 4.0 | `0.5` |
+| Hold after the last high reading (and after a probe start) | `--vm-hold-seconds` | 120 (unchanged) | |
+| `deedkit_ci` and a Between container | the probe | unchanged: still busy | |
+| Admission floor: free memory + what the supervisor measured of the engines this service holds loaded, at admit and at the start of every phase | `admit_min_available_gb` in `config.json` (default 7.0 in the code) | 7.0; unreadable memory = 0 = refused, reason `memory_low` | `0` (off) |
+
+The memory supervisor's kill is unchanged. With the yielder off (it ships off, section 13c) a job that is running when Between starts
+is not stopped: it runs on at Nice 20 and Standard QoS (section 5). Watch the duty and impact logs (13, 13b): `avail_gb` minimum,
+the overlap minutes and Between's VM p90 during the overlap.
+
+The floor counts the engines this service holds loaded as free **by what the supervisor measured of them** (the resident size of each warm worker's
+process group, every 2 s, never more than the configured `resident_gb`, which has headroom in it): taken literally, a warm 3.8 GB vision worker
+keeps the free figure near 6.7 GB (impact log 11-02, phase 1 samples) and every second request on a warm engine would be refused. A reservation
+nobody measured (a cold start that has not allocated, a one-shot child) is credited nothing. Orchestrator 11-02: this reading is the intended one.
+
+**Install, in this order (busy check `&&`-chained, the orchestrator's go first).** The relaxed probe is only safe where the floor exists: a service
+without it (5d4191bd) would admit a cold 1.6 GB phase on 4.6 GB free while Between is light.
+1. Deploy the release that has `admit_min_available_gb` (section 8). Read-back: `/v1/models` says the SHA, and the start-up line
+   `grep 'admission: floor=' /Users/_deedkitinf/logs/*` shows `floor=7.0 GB`.
+2. Only then relax the probe. Render on the checkout and stage as in section 5, then
+   `sudo -n install -o root -g wheel -m 0755 busy_probe.py /usr/local/libexec/deedkit-busy-probe` BEFORE the plist (an old probe
+   refuses the new arguments and the job would crash-loop, which reads as busy), then
+   `sudo -n install -o root -g wheel -m 0644 com.deedkit.inference-busy.plist /Library/LaunchDaemons/`,
+   `sudo -n launchctl bootout system/com.deedkit.inference-busy; sudo -n launchctl bootstrap system /Library/LaunchDaemons/com.deedkit.inference-busy.plist`.
+   The probe starts busy and opens 120 s later. Read-back: `plutil -p /Library/LaunchDaemons/com.deedkit.inference-busy.plist` shows the three
+   `--vm-*` arguments, `cat /Users/Shared/deedkit-inference/busy.json` is fresh, `python3 -I - --once < busy_probe.py` runs.
+
+**Undo (reverse order):** first write the old values (`0.1`, `0.5`) into the plist and reload the job as in step 2, so the strict rule is back;
+then, if wanted, the floor: put `"admit_min_available_gb": 0` into `/Users/_deedkitinf/config.json` (root-installed, restart after the drain). Take
+that key out of `config.json` again, and restore the strict thresholds, before rolling back to a release older than this change (a strict config
+refuses an unknown key; a floorless release must never run beside the relaxed probe).
 
 ## 14. Undo of the whole setup
 

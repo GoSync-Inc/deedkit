@@ -286,6 +286,7 @@ class Env:
             "busy_file": str(self.busy_path), "work_dir": str(self.work), "release": "rel-abc123",
             "max_wait_seconds": 50, "pump_interval_seconds": 0.02, "supervise_interval_seconds": 0.05,
             "evict_settle_seconds": 0.2, "aliases": merge_aliases(aliases),
+            "admit_min_available_gb": 0.0,  # the floor (ANYM-682/684) is off unless a test turns it on: the per-phase rules are tested bare
         }
         base.update(over)
         return base

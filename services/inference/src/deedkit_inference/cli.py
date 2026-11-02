@@ -183,5 +183,6 @@ def main(argv=None):
     logging.basicConfig(
         stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s", force=True
     )
+    log.info("admission: floor=%.1f GB (admit_min_available_gb), reserve=%.1f GB (min_free_gb)", config.admit_min_available_gb, config.min_free_gb)
     recover_at_start(config)
     raise SystemExit(asyncio.run(serve(app, config)))

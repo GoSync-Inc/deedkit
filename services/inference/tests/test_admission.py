@@ -4,8 +4,10 @@ import os
 import time
 
 import pytest
+from deedkit_inference.config import Config
 from deedkit_inference.engines import fake
 from deedkit_inference.probe import SystemProbe, parse_busy, read_busy_file
+from engine_support import engines, vis
 from support import chat_body, fk
 
 pytestmark = pytest.mark.anyio
@@ -314,6 +316,92 @@ async def test_a_slow_probe_cannot_carry_a_job_past_its_deadline(env):
         # All memory reads happen before the deadline check: a granted job costs exactly the two reads of its
         # arrival check and its grant check, none after the grant.
         calls.clear()
+        s.probe.available_hook = lambda: calls.append(1)
+        assert (await s.chat(job("fine", 0.05), headers={"X-Request-Deadline-Seconds": "5"})).status == 200
+        assert len(calls) == 2, calls
+
+
+FLOOR = {"admit_min_available_gb": 7.0}
+
+
+# spec: ANYM-682
+async def test_the_admission_floor_refuses_below_seven_gb_and_admits_at_it(env):
+    # The busy rule now lets a job in while Between is light, so the memory is the guard: free plus inactive plus
+    # speculative memory must be at least admit_min_available_gb (7 GB shipped) at admit. The per-phase rule alone would
+    # let a 2 GB phase in at 5.0 GB.
+    shipped = Config.model_validate({k: v for k, v in env.config_dict().items() if k != "admit_min_available_gb"})
+    assert shipped.admit_min_available_gb == 7.0
+    async with env.running(**FLOOR) as s:
+        for free in (5.1, 6.9):
+            s.probe.available = free
+            reply = await s.chat(job("low"))
+            assert reply.status == 503 and reply.headers["x-admission-reason"] == "memory_low", free
+            assert (await s.get("/health", key=None)).json()["admission"] == "closed", free
+        assert started() == []
+        s.probe.available = 7.0  # the floor itself is admitted
+        assert (await s.chat(job("at_floor"))).status == 200
+        assert (await s.get("/health", key=None)).json()["admission"] == "open"
+    # the undo is the config: 0 switches the floor off and the per-phase rules (here 2.0 + 3.0 GB) are all that is left
+    async with env.running(admit_min_available_gb=0.0) as s:
+        s.probe.available = 5.1
+        assert (await s.chat(job("floor_off"))).status == 200
+    with pytest.raises(Exception):
+        Config.model_validate({**env.config_dict(), "admit_min_available_gb": -1})
+
+
+# spec: ANYM-682
+async def test_the_admission_floor_fails_closed_when_memory_cannot_be_read(env):
+    # SystemProbe returns 0.0 for a vm_stat that failed (test_available_memory_counts_...): zero never opens the floor,
+    # not even with an engine loaded whose memory would be added to it
+    warm = {"vision-default": {"engine_options": {"persistent": True}, "phases": [{"name": "vlm", "slot": "gpu", "resident_gb": 8.0}]}}
+    async with env.running(aliases=warm, **FLOOR, resident_cap_gb=9.0, resident_hard_cap_gb=9.0) as s:
+        assert (await s.chat(job("first"))).status == 200
+        assert s.service.admission.resident_total() == 8.0
+        s.probe.available = 0.0
+        reply = await s.chat(job("unreadable"))
+        assert reply.status == 503 and reply.headers["x-admission-reason"] == "memory_low"
+        assert (await s.get("/health", key=None)).json()["admission"] == "closed"
+
+
+# spec: ANYM-682
+async def test_the_floor_credits_what_the_engines_measure_not_what_is_configured(env):
+    # A warm worker's memory is in use and out of the free figure (the live service showed 6.7 GB median with the vision
+    # worker loaded). The floor reads what Between would see without us: free memory plus what the supervisor measured
+    # of our workers. The configured resident_gb has headroom in it (4.5 charged for a worker that holds 3.84), and a
+    # reservation that nothing measured has allocated nothing: neither is credited.
+    async with env.running(**engines(env), **FLOOR) as s:  # the shipped vision alias: a warm worker, 4.5 GB charged
+        admission, key = s.service.admission, ("vision-default", "vlm")
+        assert (await s.chat(vis())).status == 200
+        assert list(admission.loaded) == [key] and admission.resident_total() == 4.5  # idle, still in the book
+        await s.until(lambda: key in admission.measured)  # the supervisor ticked: the fake probe measures 0.0
+        s.probe.available = 6.9  # the configured 4.5 would credit it up to 11.4: nothing measured, nothing credited
+        reply = await s.chat(vis())
+        assert reply.status == 503 and reply.headers["x-admission-reason"] == "memory_low"
+        s.probe.rss_fn = lambda pgid: 3.84  # the worker really holds 3.84 GB
+        await s.until(lambda: admission.credit() == 3.84)
+        s.probe.available = 3.2  # 3.2 + 3.84 = 7.04: the floor and the per-phase reserve (3.0) both pass
+        assert (await s.chat(vis())).status == 200
+        s.probe.available = 3.1  # 3.1 + 3.84 = 6.94 (4.5 configured would have said 7.6): only the floor refuses
+        reply = await s.chat(vis())
+        assert reply.status == 503 and reply.headers["x-admission-reason"] == "memory_low"
+        s.probe.rss_fn = lambda pgid: 6.0  # above the configured figure is not credited above it (and within the supervisor's share limit)
+        await s.until(lambda: admission.measured.get(key) == 6.0)
+        assert admission.credit() == 4.5
+        admission.drop(key)  # a dropped engine leaves the book and the credit with it
+        assert admission.credit() == 0.0 and key not in admission.measured
+
+
+# spec: ANYM-682
+async def test_the_floor_is_checked_again_when_the_phase_starts_and_costs_no_extra_read(env):
+    async with env.running(**FLOOR) as s:
+        admission, key = s.service.admission, ("vision-default", "vlm")
+        s.probe.available = 6.5
+        assert admission.check(key, 2.0, "gpu").reason == "memory_low"  # the check at the moment the slot would be granted
+        s.probe.available = 7.5
+        assert admission.check(key, 2.0, "gpu").action == "go"
+        # the arrival check and the grant check read the memory once each, floor or not (the deadline contract)
+        calls = []
+        s.probe.available = 16.0
         s.probe.available_hook = lambda: calls.append(1)
         assert (await s.chat(job("fine", 0.05), headers={"X-Request-Deadline-Seconds": "5"})).status == 200
         assert len(calls) == 2, calls
