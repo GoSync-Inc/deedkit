@@ -38,6 +38,16 @@ def die(message):
     raise SystemExit(2)
 
 
+def words(rule):
+    """The arguments of a canonical rule, quoting honoured: text inside an option value (a `--comment`) is one argument."""
+    return shlex.split(rule)
+
+
+def join(tokens):
+    """The inverse of `words`: an argument with whitespace or a quote keeps its quoting, so boundaries survive."""
+    return ' '.join(shlex.quote(token) if re.search(r'[\s\'"\\]', token) or not token else token for token in tokens)
+
+
 def canon(line):
     """One rule in a form that is the same in our text and in `iptables-save`: no `-m tcp` after `-p tcp`, no /32."""
     tokens = shlex.split(line)
@@ -54,7 +64,7 @@ def canon(line):
             i += 1
     if out and out[0] == '-I':
         out[0] = '-A'
-    return ' '.join(out)
+    return join(out)
 
 
 def empty_table():
@@ -65,19 +75,19 @@ def spec_from_commands(commands, chain):
     """The canonical rules per table, read back from the command form, so the two forms cannot differ."""
     tables = {name: empty_table() for name in TABLES}
     for command in commands:
-        binary, *words = command.split()
-        raw = words[:2] == ['-t', 'raw']
-        words = words[2:] if raw else words
-        if words[0] not in ('-A', '-I'):
+        binary, *arguments = command.split()
+        raw = arguments[:2] == ['-t', 'raw']
+        arguments = arguments[2:] if raw else arguments
+        if arguments[0] not in ('-A', '-I'):
             continue
         table = ('raw6' if raw else 'v6') if binary == 'ip6tables' else ('raw' if raw else 'filter')
-        part = 'chain' if words[1] == chain else 'inputs' if words[1] == 'INPUT' else 'hooks'
-        tables[table][part].append(canon(' '.join(['-A', *words[1:]])))
+        part = 'chain' if arguments[1] == chain else 'inputs' if arguments[1] == 'INPUT' else 'hooks'
+        tables[table][part].append(canon(' '.join(['-A', *arguments[1:]])))
     return tables
 
 
 def bridge_of(rule):
-    tokens = rule.split()
+    tokens = words(rule)
     return tokens[tokens.index('-i') + 1] if '-i' in tokens else rule
 
 
@@ -93,7 +103,7 @@ def covers(tokens, bridge):
 
 def plain_jump(rule):
     """A rule whose only condition is an interface: any other match (protocol, address) limits what it carries."""
-    tokens = rule.split()[2:]
+    tokens = words(rule)[2:]
     while tokens:
         if tokens[0] == '!' or tokens[0] in ('-i', '-j'):
             tokens = tokens[1:] if tokens[0] == '!' else tokens[2:]
@@ -110,7 +120,7 @@ def bypasses(rule, bridge, chains, top=True, seen=()):
     or through a goto; a goto into a chain that does not end in an unconditional DROP also leaves it by falling off the
     chain's end (an empty chain, or one that only logs, included).
     """
-    tokens = rule.split()
+    tokens = words(rule)
     flag = '-g' if '-g' in tokens else '-j'
     if flag not in tokens or not covers(tokens, bridge):
         return False
@@ -121,7 +131,7 @@ def bypasses(rule, bridge, chains, top=True, seen=()):
         return top
     if flag == '-g' and top and target not in seen and target not in ('DROP', 'REJECT'):
         inner = chains.get(target, [])
-        if not inner or inner[-1].split()[2:] != ['-j', 'DROP']:
+        if not inner or words(inner[-1])[2:] != ['-j', 'DROP']:
             return True
     if target in chains and target not in seen:
         return any(bypasses(inner, bridge, chains, top and flag == '-g', (*seen, target)) for inner in chains[target])
@@ -153,7 +163,7 @@ def extract(text, table, chain, bridges, family='v4', kernel=False):
             found['declared'].add(name)
         elif line.startswith('-A '):
             rule = canon(line)
-            tokens = rule.split()
+            tokens = words(rule)
             chains.setdefault(tokens[1], []).append(rule)
             if tokens[1] == chain:
                 found['chain'].append(rule)
@@ -168,10 +178,10 @@ def extract(text, table, chain, bridges, family='v4', kernel=False):
         path = [(name, index)]
         entry, part = rule, 'hooks'
         if name in ('INPUT', ufw_input):
-            entry, part = ' '.join(['-A', 'INPUT', *rule.split()[2:]]), 'inputs'
+            entry, part = join(['-A', 'INPUT', *words(rule)[2:]]), 'inputs'
             if name == ufw_input and kernel:
                 jump = next((i for i, other in enumerate(chains.get('INPUT', []))
-                             if other.split()[-2:] == ['-j', ufw_input] and plain_jump(other) and covers(other.split(), bridge)), None)
+                             if words(other)[-2:] == ['-j', ufw_input] and plain_jump(other) and covers(words(other), bridge)), None)
                 if jump is None:
                     continue
                 path.insert(0, ('INPUT', jump))

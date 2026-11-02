@@ -608,6 +608,15 @@ def test_verify_ignores_a_negated_interface_rule_docker_owns_and_still_flags_a_p
         host.kernel[key] = host.kernel[key].replace('COMMIT', rule + '\nCOMMIT')
     code, out, err = host.run()
     assert (code, out) == (0, 'ok\n'), (out, err)
+    # Text inside an option value is not an option: a comment that reads "! -i dk-inference0" does not restrict the interface, so an
+    # allowance that carries it ahead of a hook still shadows that hook (Astra r1 on this change).
+    for key, hook in (('raw', f'-A PREROUTING -i dk-inference0 -j {CHAIN}'), ('filter', f'-A DOCKER-USER -i dk-inference0 -j {CHAIN}')):
+        for allowance in ('-j ACCEPT', '-d 198.51.100.7/32 -p tcp -m tcp --dport 8443 -j ACCEPT'):
+            drifted = Host(tmp_path)
+            commented = f'-A {hook.split()[1]} {allowance.split(" -j ")[0]} -m comment --comment "! -i dk-inference0" -j ACCEPT'.replace('  ', ' ')
+            drifted.kernel[('iptables', key)] = drifted.kernel[('iptables', key)].replace(hook, commented + '\n' + hook)
+            code, out, _ = drifted.run()
+            assert code == 1 and out.splitlines()[0].startswith('kernel_vs_repo extra:'), (key, allowance, out)
     # A rule that does match the bridge, next to the same Docker rule, is still drift.
     host.kernel[('iptables', 'raw')] = host.kernel[('iptables', 'raw')].replace('COMMIT', '-A PREROUTING -i dk-inference0 -j ACCEPT\nCOMMIT')
     code, out, _ = host.run()
