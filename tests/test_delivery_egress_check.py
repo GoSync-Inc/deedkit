@@ -1,11 +1,16 @@
 """The dispatcher's egress check and host rules (ANYM-534); local sockets only, no firewall is changed."""
 import json
 from pathlib import Path
+import re
+import shutil
 import socket
 import subprocess
 import sys
 
+import pytest
+
 SCRIPT = Path(__file__).resolve().parents[1] / 'scripts/delivery_egress_check.py'
+CHAIN = 'DEEDKIT-DELIVERY'
 
 
 def run(*args):
@@ -123,6 +128,123 @@ def test_rules_also_drop_host_bound_packets_from_the_proxy_bridge():
     undo = out.splitlines()
     assert code == 0
     assert 'iptables -D INPUT -i dk-deliverypx0 -j DROP' in undo and 'ip6tables -D INPUT -i dk-deliverypx0 -j DROP' in undo
+
+
+RESOLVER = '192.0.2.53'
+TEMPLATE_V4 = '''*filter
+:ufw-before-input - [0:0]
+:ufw-before-output - [0:0]
+:ufw-before-forward - [0:0]
+# End required lines
+-A ufw-before-input -i lo -j ACCEPT
+COMMIT
+'''
+TEMPLATE_V6 = TEMPLATE_V4.replace('ufw-', 'ufw6-')
+
+
+def namespace_ready():
+    if shutil.which('sudo') is None or shutil.which('unshare') is None or shutil.which('iptables-restore') is None:
+        return False
+    return subprocess.run(['sudo', '-n', 'unshare', '-n', 'true'], capture_output=True).returncode == 0
+
+
+def delivery_files(tmp_path):
+    files = {}
+    for family, template in (('v4', TEMPLATE_V4), ('v6', TEMPLATE_V6)):
+        base = tmp_path / f'base.{family}'
+        base.write_text(template)
+        code, out = run('rules', '--resolver', RESOLVER, '--format', 'ufw', '--family', family, '--source', str(base))
+        assert code == 0
+        files[family] = tmp_path / f'full.{family}'
+        files[family].write_text(out)
+    return files
+
+
+def delivery_kernel(commands, binary, extra=(), drop=()):
+    """`iptables-save -t filter` as the command form leaves it in the kernel (nft style), plus unrelated rules."""
+    body = [f':{CHAIN} - [0:0]'] if binary == 'iptables' else []
+    for command in commands:
+        words = command.split()
+        if words[0] != binary or words[1] not in ('-A', '-I'):
+            continue
+        rule = ' '.join(['-A', *words[2:]])
+        rule = re.sub(r'(-p (?:tcp|udp)) --dport', lambda m: f'{m.group(1)} -m {m.group(1)[3:]} --dport', rule)
+        rule = re.sub(r'-d ([0-9.]+) ', r'-d \1/32 ', rule)
+        if rule not in drop:
+            body.append(rule)
+    return '\n'.join(['*filter', *body, *extra, '-A INPUT -i lo -j ACCEPT', 'COMMIT', ''])
+
+
+def delivery_verify(tmp_path, kernel4, kernel6, files, resolver=RESOLVER, *extra):
+    env = tmp_path / 'env'
+    env.write_text(f'DELIVERY_RESOLVER={resolver}\n')
+    for binary, text in (('iptables', kernel4), ('ip6tables', kernel6)):
+        (tmp_path / f'{binary}.filter').write_text(text)
+        script = tmp_path / f'{binary}-save'
+        script.write_text(f'#!/bin/sh\ncat "{tmp_path}/{binary}.$2"\n')
+        script.chmod(0o755)
+    return run('verify', '--env-file', str(env), '--rules-v4', str(files['v4']), '--rules-v6', str(files['v6']),
+               '--iptables-save', str(tmp_path / 'iptables-save'), '--ip6tables-save', str(tmp_path / 'ip6tables-save'), *extra)
+
+
+# spec: ANYM-693
+def test_ufw_form_is_exactly_the_delivery_rules_of_the_command_form_in_order(tmp_path):
+    lines = [line for line in run('rules', '--resolver', RESOLVER)[1].splitlines() if ' -N ' not in line and ' -F ' not in line]
+
+    def ufw(line, chain):
+        return ' '.join(['-A', *line.split()[2:]]).replace('-A INPUT ', f'-A {chain} ', 1)
+    v4 = [ufw(line, 'ufw-before-input') for line in lines if line.startswith('iptables ')]
+    v6 = [ufw(line, 'ufw6-before-input') for line in lines if line.startswith('ip6tables ')]
+    block4 = run('rules', '--resolver', RESOLVER, '--format', 'ufw', '--family', 'v4')[1].splitlines()
+    block6 = run('rules', '--resolver', RESOLVER, '--format', 'ufw', '--family', 'v6')[1].splitlines()
+    # This block declares DOCKER-USER itself (it is the first block in the file); the inference block relies on it.
+    assert block4 == ['# deedkit-delivery begin', ':DOCKER-USER - [0:0]', f':{CHAIN} - [0:0]', *v4, '# deedkit-delivery end']
+    assert block6 == ['# deedkit-delivery begin', ':DOCKER-USER - [0:0]', *v6, '# deedkit-delivery end']
+    assert sum(RESOLVER in line for line in block4) == 2 and RESOLVER not in '\n'.join(block6)
+    for bad in ('2001:db8::1', 'resolver.example', ''):
+        assert run('rules', '--resolver', bad, '--format', 'ufw', '--family', 'v4')[0] != 0
+    code, out = run('rules', '--resolver', '198.51.100.9', '--format', 'ufw', '--family', 'v4')
+    assert code == 0 and out.startswith('# deedkit-delivery begin') and '198.51.100.9' in out
+
+
+# spec: ANYM-693
+@pytest.mark.skipif(not namespace_ready(), reason='needs sudo, unshare and iptables-restore on Linux')
+def test_ufw_block_restores_once_in_a_disposable_namespace(tmp_path):
+    files = delivery_files(tmp_path)
+    twice = ''.join(f'iptables-restore --noflush < {files["v4"]}; ip6tables-restore --noflush < {files["v6"]}; ' for _ in range(2))
+    result = subprocess.run(['sudo', '-n', 'unshare', '-n', 'sh', '-ec', twice + 'iptables-save; ip6tables-save'], text=True,
+                            capture_output=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    for hook in ('-A DOCKER-USER -i dk-delivery0 -j DEEDKIT-DELIVERY', '-A DOCKER-USER -i dk-delivery0 -j DROP',
+                 *[f'-A ufw-before-input -i {bridge} -j DROP' for bridge in ('dk-delivery0', 'dk-deliverydb0', 'dk-deliverypx0')],
+                 *[f'-A ufw6-before-input -i {bridge} -j DROP' for bridge in ('dk-delivery0', 'dk-deliverydb0', 'dk-deliverypx0')]):
+        assert lines.count(hook) == 1, hook
+    assert sum(line.startswith('-A DEEDKIT-DELIVERY ') for line in lines) == 15
+
+
+# spec: ANYM-693
+def test_verify_names_a_changed_resolver_a_dropped_hook_and_a_shared_extra_allowance(tmp_path):
+    files = delivery_files(tmp_path)
+    commands = [line for line in run('rules', '--resolver', RESOLVER)[1].splitlines() if ' -N ' not in line and ' -F ' not in line]
+    kernel4, kernel6 = delivery_kernel(commands, 'iptables'), delivery_kernel(commands, 'ip6tables')
+    assert delivery_verify(tmp_path, kernel4, kernel6, files)[:2] == (0, 'ok\n')
+    code, out = delivery_verify(tmp_path, kernel4, kernel6, files, '192.0.2.99')[:2]
+    assert code == 1 and out.splitlines() == [
+        f'file_vs_repo missing:-A {CHAIN} -d 192.0.2.99 -p udp --dport 53 -j RETURN',
+        f'kernel_vs_repo missing:-A {CHAIN} -d 192.0.2.99 -p udp --dport 53 -j RETURN']
+    hook = f'-A DOCKER-USER -i dk-delivery0 -j {CHAIN}\n'
+    code, out = delivery_verify(tmp_path, kernel4.replace(hook, ''), kernel6, files)[:2]
+    assert code == 1 and out.splitlines() == ['kernel_vs_repo hook_absent:dk-delivery0', 'file_vs_kernel hook_absent:dk-delivery0']
+    extra = f'-A {CHAIN} -d 198.51.100.7 -j ACCEPT'
+    final = f'-A {CHAIN} -j DROP'
+    files['v4'].write_text(files['v4'].read_text().replace(final, extra + '\n' + final))
+    code, out = delivery_verify(tmp_path, kernel4.replace(final, extra + '\n' + final), kernel6, files)[:2]
+    assert code == 1 and out.splitlines() == [f'file_vs_repo extra:{extra}', f'kernel_vs_repo extra:{extra}']
+    # An empty kernel table is a table difference, not fifteen missing rules.
+    files = delivery_files(tmp_path)
+    code, out = delivery_verify(tmp_path, '*filter\nCOMMIT\n', kernel6, files)[:2]
+    assert code == 1 and out.splitlines() == ['kernel_vs_repo table_differs:filter', 'file_vs_kernel table_differs:filter']
 
 
 # spec: ANYM-581

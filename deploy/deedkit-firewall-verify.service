@@ -1,0 +1,17 @@
+[Unit]
+Description=Compare the host firewall rules with the repository and write the boot receipt (ANYM-693)
+# Ordered after what it reads; nothing is ordered after it and nothing requires it, so it can never delay or stop
+# another unit. A failure here shows in the journal and in the receipt, never as a host that does not boot.
+After=ufw.service docker.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0022
+TimeoutStartSec=60
+ExecStart=/usr/bin/python3 /usr/local/lib/deedkit/firewall_persist.py receipt
+
+[Install]
+# Started when docker.service is (a Wants=, not an ordering): a target would wait for it.
+WantedBy=docker.service

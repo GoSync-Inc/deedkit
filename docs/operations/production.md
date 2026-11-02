@@ -1036,6 +1036,12 @@ Read-back: a synthetic module event published by a test producer appears in `mod
 compose $F stop event-router`, remove it from `files`; cursors and gaps stay (schema 58 is
 additive) and a later start resumes from the stored cursor.
 
+Host steps that touch the firewall (the delivery and inference rules) read the boot receipt first: `python3
+scripts/inference_egress_check.py verify --receipt-check` and the same for `delivery_egress_check.py` print
+`ok` and `receipt ok` only when the rules agree and `/var/lib/deedkit/firewall-verify.json` is ok for the current boot
+ID; any other line (`receipt unknown`, `receipt not_ok`, a differing pair) stops the step ("Host firewall
+persistence" below).
+
 ## Roll back the current release
 
 A release whose `up --wait` failed while every replacement it started runs the
@@ -1133,7 +1139,8 @@ first).
    passes it as the proxy's `dns`. The host rules are the second layer (a host step):
    `python3 scripts/delivery_egress_check.py rules --resolver <ip>` (the same IP) prints them; as
    root, apply them before the first start (they match bridge names, which may not exist yet) and
-   save them with the host's firewall persistence. They drop host-bound packets from all three
+   persist them as the `deedkit-delivery` block of `/etc/ufw/before.rules` and `before6.rules`
+   (`rules --resolver <ip> --format ufw --family v4|v6`; "Host firewall persistence" below). They drop host-bound packets from all three
    bridges, `dk-delivery0` (egress), `dk-deliverydb0` and `dk-deliverypx0` (internal networks in gateway
    mode `isolated` have no host address; the rules are the second layer), and, from `dk-delivery0`, the tailnet (100.64.0.0/10), RFC 1918,
    link-local and metadata (169.254.0.0/16), loopback and every IPv6 packet; they allow DNS to `<ip>`
@@ -1357,6 +1364,92 @@ unattempted candidate directory for the same SHA is renamed (for example to
 `prepared-older-tool-<sha>`), never deleted or edited, because preparation
 refuses an existing directory; receipts and their digests are never rewritten.
 
+## Host firewall persistence (ANYM-693)
+
+What is persisted and where (ufw owns `DOCKER-USER`, so a second restore file would flush or duplicate a hook):
+
+| part | where | loaded by |
+|---|---|---|
+| delivery filter chain, `DOCKER-USER` hook, host-bound drops, IPv6 drops | `deedkit-delivery` block in `/etc/ufw/before.rules` and `before6.rules` (the first block; it declares `:DOCKER-USER`) | ufw, at boot and at every `ufw reload` |
+| inference filter chain, `DOCKER-USER` hook, host-bound drops (`dk-inference0`, `dk-inferencedb0`), IPv6 drops | `deedkit-inference` block in the same two files, after the delivery block (it declares only its own chain) | ufw |
+| inference raw chain and the `raw` `PREROUTING` jumps (IPv4 chain, IPv4 and IPv6 jump) | `/etc/ufw/after.init` (mode 0755, root), `rules --format after-init` | ufw, with `start`, after it has loaded its rules |
+| comparison and boot receipt | `verify` of both scripts; `deedkit-firewall-verify.service`, which writes `/var/lib/deedkit/firewall-verify.json` | each boot, after `ufw.service` and `docker.service` |
+
+The raw table is not in ufw's files because restoring them would flush Docker's own raw rules. `after.init` replaces
+the raw chain in one `iptables-restore --noflush -T raw` (one kernel commit: a failure or a kill leaves the previous
+complete chain, never an empty one), adds the jump only after the chain is complete, bounds every command to 30 s
+(a command that ignores TERM is killed 2 s later), runs the whole hook, log and record included, under an outer bound of
+60 s (its failure record is written by a bounded child with no terminal and no pipe of the caller; the supervising
+shell's own diagnostics go to /dev/null, and the caller's stderr is restored only inside the supervised child, so no shell,
+dash included, can block on it), logs and records a failure in `/var/lib/deedkit/raw-step.json` and still exits 0, so ufw and Docker start. The failure
+shows in `verify` (`kernel_vs_repo table_differs:raw`), in the boot receipt and in the worker's own exit 78. The IPv6
+raw rule is the single `PREROUTING -i dk-inference0 -j DROP` of `rules()` (there is no IPv6 chain), added if absent.
+
+Facts to know: a `ufw reload`, `ufw disable/enable` or a ufw restart loads `before.rules` with `iptables-restore
+--noflush`, and its `:DOCKER-USER` declaration empties that chain; before ANYM-693 this removed the inference hook from
+`DOCKER-USER`. After a reboot `enricher-mini` stays stopped (restart policy `no`); a promotion-tool `up` before the
+rules exist starts it into exit 78. With the rules persisted they are there first (`ufw.service` starts before
+`docker.service`).
+
+`verify` (root, read-only, stdlib) compares three texts for each chain: the repository (the authority; the mini address
+from `INFERENCE_MINI_IP` and the resolver from `DELIVERY_RESOLVER` in `/opt/personal-os-probe/.env`), the persisted
+files and the kernel (`iptables-save`, `ip6tables-save`). It prints `ok`, or one line per differing pair
+(`file_vs_repo`, `kernel_vs_repo`, `file_vs_kernel`) with the first difference: `missing:<rule>`, `extra:<rule>`,
+`hook_absent:<bridge>`, `mini_differs`, `table_differs:<filter|raw|v6>` or `missing::<chain>` (a file that uses
+`DOCKER-USER` or its chain without declaring it, which would stop ufw from loading); exit 1 on any, 2 when an input or
+the kernel cannot be read. `--persisted-only` reads no kernel (the check before loading); `--receipt-check` also reads
+the boot receipt. A file and a kernel that agree on an allowance the repository does not have still fail: the
+repository is the authority. The host-bound drops count as one fact whether the kernel holds them in `INPUT` (the
+command form) or in ufw's chain of the same family (`ufw-before-input`, `ufw6-before-input`; in the kernel only when `INPUT`
+jumps to it), but a rule present in both is a duplicate and fails as `extra:`. A rule that accepts or returns the bridge's
+traffic before a managed hook in `DOCKER-USER` or raw `PREROUTING` (no `-i`, a wildcard or a negated `-i`; also through a
+`-j` or `-g` into a chain that accepts; a goto that can fall off the chain's end, an empty chain included, leaves the
+base chain too) fails as `extra:<rule>`, since the hook would never see those
+packets; the same check covers the path through `INPUT` to ufw's chain, whose jump must cover the managed bridge and carry no
+other condition (a `-p tcp` jump carries only part of the traffic). A rules file that declares `:DOCKER-USER` or the managed
+chain twice, or after rules that use it, fails as `table_differs:filter` or `table_differs:v6` (restoring the late
+declaration empties the chain).
+
+Safe order for any firewall change (as root; the plan is Astra-reviewed, none runs during an active call):
+1. Back up the files that change: copy `/etc/ufw/before.rules`, `before6.rules` and `after.init` (if it exists) with
+   `cp -a` to a dated directory under `/root`, and write `iptables-save` and `ip6tables-save` next to them.
+2. Build the new files without touching the old ones: `python3 scripts/inference_egress_check.py rules --mini-ip
+   $INFERENCE_MINI_IP --format ufw --family v4 --source /etc/ufw/before.rules` writes the whole new file to a new path
+   (v6 with `before6.rules`). It replaces a block of the same label, inserts after the delivery block (after its end marker when it has one, never inside it) and refuses a file
+   with no delivery block or no `:DOCKER-USER` declared before the insertion point. `--format after-init` writes the hook.
+3. `iptables-restore --test --noflush` on the new v4 file and `ip6tables-restore --test --noflush` on the v6 file: syntax
+   only. A syntax error in a ufw rules file stops ufw from loading, so nothing is installed before this passes.
+4. Install the two rules files (mode 0640 as they are now, root) and the hook (mode 0755, root), then `verify
+   --persisted-only` for both scripts.
+5. Load: `ufw reload` (the reload empties and refills `DOCKER-USER` and loads the block), then `/etc/ufw/after.init start`
+   (idempotent; ufw's reload may not run it). The first time only, delete the hand-added copies of the host-bound drops,
+   which ufw's chain now holds too: `iptables -D INPUT -i dk-inference0 -j DROP` and the same for `dk-inferencedb0`, and
+   for `ip6tables` both (delete only what `iptables -S INPUT` and `ip6tables -S INPUT` show).
+6. Full `verify` for both scripts, then `systemctl start deedkit-firewall-verify.service` and `verify --receipt-check`.
+   Stop on any line other than `ok` and `receipt ok`.
+
+Rollback: copy the saved rules files and `after.init` back, `ufw reload`, `verify`. Undo of the whole card: the same
+copy-back (remove `/etc/ufw/after.init` if it did not exist before), `systemctl disable --now
+deedkit-firewall-verify.service`, remove the unit and `firewall_persist.py`, `ufw reload`; the kernel rules of the command
+form (`rules --undo`) are removed only by an explicit decision.
+
+Install of the scripts and the unit (once per tool update): copy `scripts/firewall_persist.py`,
+`scripts/inference_egress_check.py` and `scripts/delivery_egress_check.py` to `/usr/local/lib/deedkit/` (mode 0755,
+root) and `deploy/deedkit-firewall-verify.service` to `/etc/systemd/system/`; `systemd-analyze verify` it, `systemctl
+daemon-reload`, `systemctl enable` it. It is wanted by `docker.service`, not by a target: nothing waits for it, nothing is
+ordered after it, `TimeoutStartSec=60`, and a failure fails only itself.
+
+The boot receipt (`/var/lib/deedkit/firewall-verify.json`, written at each boot) holds the boot ID, the result of both
+`verify` commands, `ufw_rules_loaded_monotonic` (ufw.service's `ExecMainExitTimestampMonotonic`), `raw_step_monotonic`
+(the step's own `/proc/uptime` on success and on failure), `docker_start_monotonic`, `first_container_monotonic` (the start of the earliest running container's main process this boot, from
+`/proc/PID/stat`, never from Docker's wall-clock times; a container that restarted shows its latest start; unknown when a
+container cannot be read, and whenever a stopped container that ever ran exists, since without a reliable boot-wide
+clock mapping its start cannot be placed on this boot's clock) and
+`rules_before_first_container` = `yes`, `no` or `unknown` (unknown when a time is missing or a step failed). The times are
+seconds on one monotonic clock (the host does not suspend, so `/proc/uptime` equals it). A boot with no receipt for the
+current boot ID reads as `receipt unknown` in `verify --receipt-check`, never as ok. The first reboot that happens for
+another reason is read through the receipt and recorded here as supplementary evidence; nothing is rebooted for it.
+
 ## Mini enrichment worker: network confinement (ANYM-688)
 
 `deploy/compose.enrichment.yaml` holds `enricher-mini` (profile `enrichment-mini`, the published
@@ -1386,8 +1479,10 @@ Apply, in this order (a failed step stops the apply; the worker is selected for 
 tagged `docker tag $E anymsg-enricher-local:enroll-<sha>` (a new tag, never a production tag), and the
 Compose commands below run with `MESSAGING_VERSION=enroll-<sha>`:
 1. Rules (host, as root, before the networks exist; they match bridge names):
-   `python3 scripts/inference_egress_check.py rules --mini-ip $INFERENCE_MINI_IP` prints them; apply
-   them and save them with the host's firewall persistence. The same chain hangs in two places:
+   `python3 scripts/inference_egress_check.py rules --mini-ip $INFERENCE_MINI_IP` prints them; load them
+   and persist them as "Host firewall persistence" below says (the `deedkit-inference` block in ufw's two
+   rules files for the filter table and the host-bound drops, `/etc/ufw/after.init` for the raw table), then
+   `verify`. The same chain hangs in two places:
    `raw` PREROUTING (before conntrack and the filter `FORWARD` chain, so Tailscale's `ts-forward`
    accept, which sits at position 1 and is reinstalled when `tailscaled` restarts, cannot pass it) and
    `DOCKER-USER`. From `dk-inference0` they allow only TCP 443 to the mini and drop DNS to any address,
@@ -1484,7 +1579,8 @@ Undo (reverse): `docker compose $F --profile enrichment-mini stop enricher-mini`
 <project>_inference_db <project>_inference_egress`; restore both configuration backups (a promoted release
 needs the same newer-SHA hand apply as the delivery undo above); `docker image rm` the enroll tag; as root
 `python3 scripts/inference_egress_check.py rules --undo` prints the mirror of the rules (hooks first, then
-both chains). The worker's jobs requeue on SIGTERM; nothing in the database changes.
+both chains); with the rules persisted, also restore the saved copies of the rules files and `after.init` and
+`ufw reload` ("Host firewall persistence", Rollback), or the next reload or reboot puts the rules back. The worker's jobs requeue on SIGTERM; nothing in the database changes.
 
 ## Mini inference: watch and enable record (ANYM-686)
 
