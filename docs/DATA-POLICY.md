@@ -90,7 +90,7 @@ file, owner 11-01).
   - Local model processing (ANYM-682 to ANYM-688; in force for the owner's messenger accounts from the
     production enablement, ANYM-686): originals of admitted attachments (audio, images, document text)
     go from the enrichment worker to the owner's Mac mini over the tailnet (WireGuard and TLS, one
-    pinned address, port 443; Ogg/Opus voice notes are converted to MP3 first) for processing by local models (`deedkit-inference`). The worker's
+    pinned address, port 443; voice notes above about 32 kbps are re-encoded to Opus and large photos are scaled to 2048 px as jpeg first, smaller ones go as they are; the originals stay in the archive, ENRICHMENT.md) for processing by local models (`deedkit-inference`). The worker's
     network reaches only its database and that address (docs/operations/production.md, "Mini
     enrichment worker"). The mini keeps them only for the duration of the request: a per-request
     directory is removed after each job and any leftover at the next start (removal is attempted; a failure

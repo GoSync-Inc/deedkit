@@ -43,8 +43,7 @@ be labelled cloud. It takes no `local-heavy` lock: the work happens on the mini.
 | `backpressure_seconds` | cooldown when the mini says "not now" and gives no `Retry-After`: 1 to 900, default 120 |
 | `audio_response_format` | `verbose_json` (default, with segments) or `json` |
 
-Audio uses `POST {base_url}/audio/transcriptions` (an ogg note is transcoded to mp3 first, recorded as
-`transcode_lossy`, as for any ASR provider); photos and documents use `POST {base_url}/chat/completions`, a
+Audio uses `POST {base_url}/audio/transcriptions`; photos and documents use `POST {base_url}/chat/completions`, a
 document sending its extracted text without an image (scanned-PDF page images are not part of this connector).
 Redirects and environment proxies are off. The prompt is the usual one plus a sentence asking for `title` and
 `summary` in Russian and the visible text in its own language; the description is stored with `prompt_version`
@@ -74,9 +73,32 @@ claim and one refund per scope per cooldown, and no attempt or daily budget.
 Readiness events for old attachments carry no message age. While a backlog drains, an agent that needs it looks
 up the message's `sent_at`.
 
-Data leaves the worker for the owner's mini only, over WireGuard and TLS: the original audio (mp3 when transcoded),
-the image bytes, up to `max_text_chars` of extracted text for a document, and the bearer key. Derived text comes
+Data leaves the worker for the owner's mini only, over WireGuard and TLS: the audio (the original, or Opus when
+transcoded), the image bytes (the original, or a scaled jpeg), up to `max_text_chars` of extracted text for a document, and the bearer key. Derived text comes
 back; the mini keeps nothing after the job. Nothing leaves the tailnet, and no cloud provider is involved.
+
+### What reaches the mini: audio and photos (ANYM-696)
+
+The mini decodes any ffmpeg-readable audio by content and takes photos up to 20 MP, so the worker sends only the
+bytes it needs. The original always stays in the archive; the metadata says what was done.
+
+- **Audio, `deedkit_inference` only.** A voice note whose first audio stream is Opus in an ogg container with an
+  average bitrate (bytes x 8 / duration) of at most 48 kbps goes **unchanged** as `recording.ogg`, with no ffmpeg run
+  (chat apps send about 32 kbps; the margin covers Ogg page overhead). Any other source above 32 kbps (an Opus note
+  above 48 kbps, mp3, m4a, wav, mp4 including video notes, an ogg that is not Opus) is transcoded to **Opus** (24 kbps
+  voip, mono, 16 kHz, ogg): about 1.8 MB for ten minutes instead of 7.2 MB. A source that is not Opus and at or below
+  32 kbps goes unchanged, an ogg/vorbis note included. The transcode keeps the duration check (0.25 s), the output size
+  limit and the timeouts, and records `transcoded` and `transcode_lossy` true with `transcode_format` `opus`. On a note
+  that was an mp3 or an mp4 that is expected: `opus` names the format sent, not the source's. Every other ASR provider
+  keeps the mp3 transcode of ogg notes and `transcode_format` `mp3`.
+- **Photos, `deedkit_inference` only.** A picture whose longer edge is over 2048 px or whose file is over 700 KB (700,000
+  bytes, so about 930 KB as base64) is scaled by ffmpeg to a longer edge of at most 2048 px (never enlarged, EXIF
+  orientation applied, one frame) and sent as jpeg, also when the source is png, webp or gif; the EXIF block, GPS
+  included, is not carried over. A result still over 700 KB is recoded once at lower quality; if it is still over, it is
+  sent as it is. The stored metadata carries `image_downscaled` and `image_over_budget`. A small picture goes
+  unchanged. A picture ffmpeg cannot read as png, jpeg, webp or gif (a corrupt file, svg, a playlist), a timeout or an
+  oversized output ends the job with `invalid_image` and nothing is sent. The ffmpeg run takes a fixed list of image
+  demuxers, `-protocol_whitelist file,pipe`, no stdin, the worker's time and file-size limits.
 
 ## Retained descriptions and video (schema 34)
 

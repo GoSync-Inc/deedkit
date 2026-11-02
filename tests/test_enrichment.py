@@ -93,7 +93,10 @@ def multipart_parts(request):
     return fields,file
 
 
-def run_mini(tmp_path,kind,profile,*,mime='image/png',data=b'synthetic image',text='',reply=None):
+PNG_1X1=base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==')
+
+
+def run_mini(tmp_path,kind,profile,*,mime='image/png',data=PNG_1X1,text='',reply=None):
     """Run `infer` against a mock transport; returns (result, the requests the provider sent)."""
     path=tmp_path/'original';path.write_bytes(data);seen=[]
     def respond(request):
@@ -206,10 +209,10 @@ def test_audio_request_shape_and_segments_for_deedkit_inference(tmp_path,monkeyp
     # Without a named language the field is absent: the mini identifies it.
     _,seen=run_mini(tmp_path,'audio',mini(tmp_path,'audio'),mime='audio/mpeg',data=b'synthetic audio bytes')
     assert 'language' not in multipart_parts(seen[0])[0]
-    # An ogg note takes the lossy mp3 transcode and records it, as for any ASR provider.
+    # A small ogg note that is not Opus goes as it is (ANYM-696): the mini decodes by content, no transcode.
     result,seen=run_mini(tmp_path,'audio',p,mime='audio/ogg',data=b'synthetic-original')
-    assert multipart_parts(seen[0])[1]['filename']=='recording.mp3'
-    assert result['metadata']['transcoded'] and result['metadata']['transcode_lossy'] and result['metadata']['transcode_format']=='mp3'
+    assert multipart_parts(seen[0])[1]['filename']=='recording.ogg'
+    assert result['metadata']['transcoded'] is False and result['metadata']['transcode_format'] is None
 
 
 # spec: ANYM-685
@@ -219,12 +222,12 @@ def test_image_and_document_request_shape_for_deedkit_inference(tmp_path,monkeyp
     class Recording(httpx.Client):
         def __init__(self,*args,**kwargs):clients.append(kwargs);super().__init__(*args,**kwargs)
     monkeypatch.setattr(providers.httpx,'Client',Recording)
-    result,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'),data=b'synthetic image')
+    result,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'),data=PNG_1X1)
     body=json.loads(seen[0].content)
     assert seen[0].url.path=='/v1/chat/completions' and set(body)=={'model','messages','max_tokens'}
     assert body['model']=='vision-default' and body['max_tokens']==2000
     content=body['messages'][0]['content']
-    assert content[1]['image_url']['url']=='data:image/png;base64,'+base64.b64encode(b'synthetic image').decode()
+    assert content[1]['image_url']['url']=='data:image/png;base64,'+base64.b64encode(PNG_1X1).decode()
     assert seen[0].headers['authorization']=='Bearer synthetic-key' and 'tools' not in body
     assert result['title'] and result['metadata']['generated_by_model']
     # A document sends the extracted text only, no image part; the text is cut at max_text_chars.
@@ -279,6 +282,20 @@ def test_the_inference_canary_sends_the_prompt_the_mini_provider_sends():
     the canary's Cyrillic check failed on a request the worker never makes."""
     canary_prompt=(Path(__file__).resolve().parents[1]/'services'/'inference'/'tests'/'canary'/'prompt.txt').read_text()
     assert canary_prompt==PROMPT+' '+PROMPT_RU
+
+
+# spec: ANYM-696
+def test_the_canary_generator_uses_the_workers_own_opus_and_scaling_arguments():
+    """The canary scores the picture and the Opus the worker really makes: its generator carries the worker's
+    arguments (services/inference cannot import the worker), and this keeps the two equal."""
+    from messaging_service.enrichment_providers import IMAGE_EDGE,ORIENTATION_FILTERS,OPUS_ARGS
+    text=(Path(__file__).resolve().parents[1]/'services'/'inference'/'tests'/'canary'/'generate.py').read_text()
+    assert 'WORKER_OPUS = '+repr(OPUS_ARGS) in text
+    assert f"WORKER_SCALE = 'scale={IMAGE_EDGE}:{IMAGE_EDGE}:force_original_aspect_ratio=decrease'" in text
+    assert f"WORKER_UPRIGHT_FOR_ORIENTATION_6 = '{ORIENTATION_FILTERS[6][0]}'" in text
+    expected=json.loads((Path(__file__).resolve().parents[1]/'services'/'inference'/'tests'/'canary'/'expected.json').read_text())
+    assert {'receipt_large_worker.jpg','receipt_large_exif6_worker.jpg'}<=set(expected['vision'])
+    assert {'note_ru_opus','note_en_opus'}<=set(expected['speech'])
 
 
 # spec: ANYM-685
@@ -442,6 +459,28 @@ def worker(s,tmp_path,maximum=20):
     return EnrichmentWorker(s.pool.conninfo,s.files,cfg,processor=lambda *_:normalize_result({'text':'Расшифровка договора','segments':[{'start':0,'end':1,'text':'Расшифровка договора'}]},audio=True))
 
 
+def add_image(s):
+    sha=hashlib.sha256(PNG_1X1).hexdigest();(s.files/sha).write_bytes(PNG_1X1)
+    with s.pool.connection() as c:
+        c.execute("INSERT INTO attachments(id,message,digest,filename,mime,bytes) VALUES('enrich-image','demo-tg-2',%s,'photo.png','image/png',%s)",(sha,len(PNG_1X1)))
+    return sha
+
+
+# spec: ANYM-696
+def test_the_image_flags_survive_the_worker_to_database_read_back(seeded,tmp_path):
+    s,_,_=seeded;add_image(s)
+    cfg={'accounts':['telegram-demo'],'max_jobs_per_day':20,'profiles':{'image':profile(tmp_path,kind='image')}}
+    w=EnrichmentWorker(s.pool.conninfo,s.files,cfg,processor=lambda *_:None)
+    with s.pool.connection() as c:c.execute('TRUNCATE enrichment_budget')
+    row,_=w.claim();assert row['attachment']=='enrich-image'
+    child={'title':'t','summary':'s','metadata':{'image_downscaled':True,'image_over_budget':True}}
+    assert w.finish(row,normalize_result(child))
+    with s.pool.connection() as c:
+        saved=c.execute("SELECT state,metadata FROM attachment_enrichment WHERE attachment='enrich-image'").fetchone()
+    assert saved['state']=='ready'
+    assert saved['metadata']['image_downscaled'] is True and saved['metadata']['image_over_budget'] is True
+
+
 def test_enrichment_budget_fencing_and_deletion(seeded,tmp_path):
     s,_,_=seeded;add_audio(s);w=worker(s,tmp_path,1)
     with s.pool.connection() as c:c.execute('TRUNCATE enrichment_budget')
@@ -496,16 +535,20 @@ def test_segments_have_aggregate_bound_and_audio_provenance_survives_validation(
     with pytest.raises(ModelError):normalize_result({'metadata':{'duration_seconds':float('inf')}},audio=True)
 
 
-def fake_audio_tools(monkeypatch,*,duration=12,converted_duration=None,output_size=32):
+def fake_audio_tools(monkeypatch,*,duration=12,converted_duration=None,output_size=32,codec=None,container=None):
     import subprocess
     import messaging_service.enrichment_providers as providers
     calls=[]
     def run(command,**kwargs):
         calls.append(command)
-        if command[0]=='ffprobe':
-            seconds=(converted_duration if converted_duration is not None else duration) if str(command[-1]).endswith('.mp3') else duration
-            kwargs['stdout'].write(json.dumps({'streams':[{'duration':str(seconds)}],
-                'format':{'duration':str(seconds)}}).encode())
+        if command[0]=='ffprobe' and 'v:0' in command:  # a picture (ANYM-696): a tiny still, nothing to convert
+            kwargs['stdout'].write(json.dumps({'streams':[{'codec_name':'png','width':1,'height':1}],'format':{'format_name':'png_pipe'}}).encode())
+        elif command[0]=='ffprobe':
+            converted=str(command[-1]).endswith(('.mp3','.ogg'))
+            seconds=(converted_duration if converted_duration is not None else duration) if converted else duration
+            stream={'duration':str(seconds),**({'codec_name':codec} if codec and not converted else {})}
+            kwargs['stdout'].write(json.dumps({'streams':[stream],
+                'format':{'duration':str(seconds),**({'format_name':container} if container and not converted else {})}}).encode())
         elif command[0]=='ffmpeg':Path(command[-1]).write_bytes(b'x'*output_size)
         else:raise AssertionError(command)
         return subprocess.CompletedProcess(command,0)
@@ -544,6 +587,297 @@ def test_ogg_transcode_preserves_original_checks_complete_duration_and_labels_lo
     p['max_input_bytes']=100
     fake_audio_tools(monkeypatch,output_size=101)
     with pytest.raises(ModelError,match='audio_transcode_size_limit'):infer(p,'audio',audio,'audio/ogg')
+
+
+import subprocess as real_subprocess
+
+
+def synth_audio(tmp_path,name,*args,source='anoisesrc=d=60:c=pink:r=48000:a=0.3'):
+    """A synthetic 60 s signal encoded by the real ffmpeg; no speech, no owner data."""
+    out=tmp_path/name
+    real_subprocess.run(['ffmpeg','-v','error','-nostdin','-y','-f','lavfi','-i',source,*args,str(out)],
+        check=True,stdin=real_subprocess.DEVNULL)
+    return out
+
+
+def probe_json(path,entries):
+    done=real_subprocess.run(['ffprobe','-v','error','-show_entries',entries,'-of','json',str(path)],
+        check=True,stdin=real_subprocess.DEVNULL,capture_output=True)
+    return json.loads(done.stdout)
+
+
+def bitrate(path):
+    return path.stat().st_size*8/60
+
+
+# spec: ANYM-696
+def test_opus_voice_note_at_chat_app_bitrate_reaches_the_mini_byte_identical(tmp_path):
+    note=synth_audio(tmp_path,'note.ogg','-c:a','libopus','-b:a','32k')
+    assert bitrate(note)<=48000
+    result,seen=run_mini(tmp_path,'audio',mini(tmp_path,'audio'),mime='audio/ogg',data=note.read_bytes())
+    _,file=multipart_parts(seen[0])
+    assert file['bytes']==note.read_bytes() and file['filename']=='recording.ogg' and file['content_type']=='audio/ogg'
+    meta=result['metadata']
+    assert meta['transcoded'] is False and meta['transcode_lossy'] is False and meta['transcode_format'] is None
+
+
+# spec: ANYM-696
+@pytest.mark.parametrize('name,mime,encode',[
+    ('opus64.ogg','audio/ogg',['-c:a','libopus','-b:a','64k']),
+    ('mp3_128.mp3','audio/mpeg',['-c:a','libmp3lame','-b:a','128k'])])
+def test_a_heavy_note_is_transcoded_to_small_opus_for_the_mini(tmp_path,name,mime,encode):
+    note=synth_audio(tmp_path,name,*encode);before=note.read_bytes()
+    assert bitrate(note)>48000
+    result,seen=run_mini(tmp_path,'audio',mini(tmp_path,'audio'),mime=mime,data=before)
+    _,file=multipart_parts(seen[0])
+    assert len(file['bytes'])<=200000 and file['bytes'].startswith(b'OggS')
+    assert file['filename']=='recording.ogg' and file['content_type']=='audio/ogg'
+    sent=tmp_path/'sent.ogg';sent.write_bytes(file['bytes'])
+    assert probe_json(sent,'stream=codec_name,channels,sample_rate')['streams'][0]=={'codec_name':'opus','channels':1,'sample_rate':'48000'}
+    meta=result['metadata']
+    assert meta['transcoded'] is True and meta['transcode_lossy'] is True and meta['transcode_format']=='opus'
+    assert (tmp_path/'original').read_bytes()==before  # the original is never modified
+
+
+# spec: ANYM-696
+def test_a_low_bitrate_vorbis_note_is_sent_as_it_is_and_not_labelled_opus(tmp_path):
+    note=synth_audio(tmp_path,'vorbis.ogg','-ac','2','-c:a','vorbis','-strict','-2',source='sine=frequency=440:duration=60:sample_rate=16000')
+    assert probe_json(note,'stream=codec_name')['streams'][0]['codec_name']=='vorbis' and bitrate(note)<=32000
+    result,seen=run_mini(tmp_path,'audio',mini(tmp_path,'audio'),mime='audio/ogg',data=note.read_bytes())
+    _,file=multipart_parts(seen[0])
+    assert file['bytes']==note.read_bytes() and file['filename']=='recording.ogg'
+    assert result['metadata']['transcoded'] is False and result['metadata']['transcode_format'] is None
+
+
+# spec: ANYM-696
+def test_other_asr_providers_still_receive_mp3_for_an_ogg_note(tmp_path):
+    note=synth_audio(tmp_path,'note.ogg','-c:a','libopus','-b:a','32k')
+    key=tmp_path/'k';key.write_text('synthetic-key');key.chmod(0o600)
+    p=validate_profile({'provider':'openai_compatible','model':'whisper','allow_cloud':True,'api_key_file':str(key),
+        'base_url':'https://llm.example/v1'},'audio')
+    result,seen=run_mini(tmp_path,'audio',p,mime='audio/ogg',data=note.read_bytes())
+    _,file=multipart_parts(seen[0])
+    assert file['filename']=='recording.mp3' and file['content_type']=='audio/mpeg'
+    assert result['metadata']['transcode_format']=='mp3' and result['metadata']['transcoded'] is True
+
+
+# spec: ANYM-696
+@pytest.mark.parametrize('codec,container,size,unchanged',[
+    ('opus','ogg',600000,True),      # exactly 48 kbps over 100 s: the Opus-in-ogg ceiling
+    ('opus','ogg',600001,False),
+    ('opus','ogg',410000,True),      # between 32 and 48 kbps: the chat apps' headroom
+    ('mp3','mp3',400000,None),       # exactly 32 kbps, not Opus: as it is
+    ('mp3','mp3',400001,False),
+    ('opus','matroska,webm',400001,False),  # Opus outside ogg is not the unchanged branch
+    ('aac','mov,mp4,m4a,3gp,3g2,mj2',500000,False)])
+def test_audio_thresholds_choose_unchanged_or_opus(tmp_path,monkeypatch,codec,container,size,unchanged):
+    calls=fake_audio_tools(monkeypatch,duration=100,codec=codec,container=container,output_size=1000)
+    mime='audio/ogg' if container=='ogg' else 'audio/mpeg'
+    result,seen=run_mini(tmp_path,'audio',mini(tmp_path,'audio'),mime=mime,data=b'x'*size)
+    ffmpeg=[c for c in calls if c[0]=='ffmpeg']
+    if unchanged is False:
+        assert len(ffmpeg)==1
+        command=ffmpeg[0]
+        for flag,value in [('-c:a','libopus'),('-b:a','24k'),('-application','voip'),('-ac','1'),('-ar','16000')]:
+            assert command[command.index(flag)+1]==value
+        assert '-vn' in command and '-t' not in command and '-ss' not in command and '-fs' not in command
+        assert result['metadata']['transcode_format']=='opus'
+        assert multipart_parts(seen[0])[1]['filename']=='recording.ogg'
+    else:
+        assert ffmpeg==[] and result['metadata']['transcoded'] is False
+        assert len(multipart_parts(seen[0])[1]['bytes'])==size
+
+
+# spec: ANYM-696
+def test_the_opus_transcode_keeps_the_duration_and_size_checks(tmp_path,monkeypatch):
+    p=mini(tmp_path,'audio')
+    data=tmp_path/'original';data.write_bytes(b'x'*500000)
+    fake_audio_tools(monkeypatch,duration=100,codec='mp3',container='mp3',converted_duration=60)
+    with pytest.raises(ModelError,match='audio_transcode_incomplete'):
+        infer(p,'audio',data,'audio/mpeg',transport=httpx.MockTransport(lambda _:(_ for _ in ()).throw(AssertionError())))
+    small=mini(tmp_path,'audio',max_input_bytes=1000)
+    fake_audio_tools(monkeypatch,duration=100,codec='mp3',container='mp3',output_size=1001)
+    with pytest.raises(ModelError,match='audio_transcode_size_limit'):
+        infer(small,'audio',data,'audio/mpeg',transport=httpx.MockTransport(lambda _:(_ for _ in ()).throw(AssertionError())))
+
+
+def synth_image(tmp_path,name,size,*,noise=False):
+    """A synthetic picture made by the real ffmpeg: a test card, or incompressible noise."""
+    source=(f"nullsrc=s={size},format=rgb24,geq=r='random(1)*255':g='random(2)*255':b='random(3)*255'" if noise
+        else f'testsrc2=size={size}:rate=1')
+    out=tmp_path/name
+    real_subprocess.run(['ffmpeg','-v','error','-nostdin','-y','-f','lavfi','-i',source,'-frames:v','1',str(out)],
+        check=True,stdin=real_subprocess.DEVNULL)
+    return out
+
+
+def with_exif_orientation(jpeg,orientation):
+    """The jpeg with a minimal EXIF block (big-endian TIFF, one Orientation entry) right after SOI."""
+    tiff=b'MM\x00*\x00\x00\x00\x08'+b'\x00\x01'+b'\x01\x12'+b'\x00\x03'+b'\x00\x00\x00\x01'+bytes([0,orientation,0,0])+b'\x00\x00\x00\x00'
+    payload=b'Exif\x00\x00'+tiff
+    return jpeg[:2]+b'\xff\xe1'+(len(payload)+2).to_bytes(2,'big')+payload+jpeg[2:]
+
+
+def sent_image(request):
+    """(mime, bytes, data-URL length) of the picture in a chat request."""
+    url=json.loads(request.content)['messages'][0]['content'][1]['image_url']['url']
+    head,encoded=url.split(',',1)
+    return head[len('data:'):-len(';base64')],base64.b64decode(encoded),len(encoded)
+
+
+def picture_size(tmp_path,data):
+    path=tmp_path/'sent-picture';path.write_bytes(data)
+    stream=probe_json(path,'stream=width,height')['streams'][0]
+    return stream['width'],stream['height']
+
+
+def fake_image_tools(monkeypatch,*,width=4000,height=3000,sizes=(1000,),timeout=False):
+    """ffprobe answers a still picture of this size; each ffmpeg run writes the next size of `sizes` as its output."""
+    import messaging_service.enrichment_providers as providers
+    calls=[];outputs=list(sizes)
+    def run(command,**kwargs):
+        calls.append(command)
+        if command[0]=='ffprobe':
+            kwargs['stdout'].write(json.dumps({'streams':[{'codec_name':'mjpeg','width':width,'height':height}],
+                'format':{'format_name':'jpeg_pipe'}}).encode())
+        elif command[0]=='ffmpeg':
+            if timeout:raise real_subprocess.TimeoutExpired(command,1)
+            Path(command[-1]).write_bytes(b'x'*(outputs.pop(0) if len(outputs)>1 else outputs[0]))
+        else:raise AssertionError(command)
+        return real_subprocess.CompletedProcess(command,0)
+    monkeypatch.setattr(providers.subprocess,'run',run)
+    return calls
+
+
+def forbidden(_):raise AssertionError('Nothing may be sent')
+
+
+# spec: ANYM-696
+def test_a_phone_photo_is_scaled_to_2048_and_under_the_byte_budget_before_upload(tmp_path):
+    photo=synth_image(tmp_path,'photo.jpg','4000x3000');before=photo.read_bytes()
+    result,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'),mime='image/jpeg',data=before)
+    mime,data,encoded=sent_image(seen[0])
+    assert mime=='image/jpeg' and len(data)<=700000 and encoded<=940000
+    assert picture_size(tmp_path,data)==(2048,1536)
+    assert result['metadata']['image_downscaled'] is True and result['metadata']['image_over_budget'] is False
+    assert (tmp_path/'original').read_bytes()==before  # the original is never modified
+
+
+# spec: ANYM-696
+def test_a_small_picture_goes_byte_identical(tmp_path):
+    small=synth_image(tmp_path,'small.jpg','1000x800')
+    assert small.stat().st_size<700000
+    result,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'),mime='image/jpeg',data=small.read_bytes())
+    mime,data,_=sent_image(seen[0])
+    assert mime=='image/jpeg' and data==small.read_bytes()
+    assert result['metadata']['image_downscaled'] is False and result['metadata']['image_over_budget'] is False
+
+
+# spec: ANYM-696
+def test_an_incompressible_picture_ends_over_budget_and_is_sent(tmp_path):
+    noise=synth_image(tmp_path,'noise.png','3000x2000',noise=True)
+    result,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'),mime='image/png',data=noise.read_bytes())
+    mime,data,_=sent_image(seen[0])
+    assert mime=='image/jpeg' and len(data)>700000 and picture_size(tmp_path,data)==(2048,1365)
+    assert result['metadata']['image_downscaled'] is True and result['metadata']['image_over_budget'] is True
+
+
+# spec: ANYM-696
+def test_a_heavy_picture_under_the_edge_is_recoded_but_never_upscaled(tmp_path):
+    noise=synth_image(tmp_path,'noise.png','1500x1000',noise=True)
+    assert noise.stat().st_size>700000
+    _,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'),mime='image/png',data=noise.read_bytes())
+    mime,data,_=sent_image(seen[0])
+    assert mime=='image/jpeg' and picture_size(tmp_path,data)==(1500,1000)
+
+
+# spec: ANYM-696
+@pytest.mark.parametrize('orientation,expected',[(1,(2048,1536)),(3,(2048,1536)),(6,(1536,2048)),(8,(1536,2048))])
+def test_the_exif_orientation_is_applied_when_a_photo_is_scaled(tmp_path,orientation,expected):
+    photo=with_exif_orientation(synth_image(tmp_path,'photo.jpg','4000x3000').read_bytes(),orientation)
+    _,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'),mime='image/jpeg',data=photo)
+    assert picture_size(tmp_path,sent_image(seen[0])[1])==expected
+
+
+# spec: ANYM-696
+def test_the_scaled_copy_drops_the_exif_block(tmp_path):
+    photo=with_exif_orientation(synth_image(tmp_path,'photo.jpg','4000x3000').read_bytes(),6)
+    assert b'Exif' in photo
+    _,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'),mime='image/jpeg',data=photo)
+    assert b'Exif' not in sent_image(seen[0])[1]
+
+
+# spec: ANYM-696
+@pytest.mark.parametrize('name,data',[
+    ('corrupt',bytes(range(256))*400),
+    ('concat',b"ffconcat version 1.0\nfile 'original'\n"),
+    ('svg',b'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>'),
+    ('playlist',b'#EXTM3U\n#EXTINF:1,x\nfile:///etc/passwd\n')])
+def test_a_bad_picture_fails_as_invalid_image_sends_nothing_and_the_next_job_succeeds(tmp_path,monkeypatch,name,data):
+    import tempfile
+    scratch=tmp_path/'scratch';scratch.mkdir();monkeypatch.setattr(tempfile,'tempdir',str(scratch))
+    path=tmp_path/'original';path.write_bytes(data)
+    with pytest.raises(ModelError) as error:
+        infer(mini(tmp_path,'image'),'image',path,'image/jpeg',transport=httpx.MockTransport(forbidden))
+    assert error.value.code=='invalid_image' and list(scratch.iterdir())==[]
+    result,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'))
+    assert len(seen)==1 and result['title'] and list(scratch.iterdir())==[]
+
+
+# spec: ANYM-696
+def test_a_picture_tool_timeout_or_oversized_output_fails_as_invalid_image(tmp_path,monkeypatch):
+    path=tmp_path/'original';path.write_bytes(b'x'*10)
+    fake_image_tools(monkeypatch,timeout=True)
+    with pytest.raises(ModelError) as error:
+        infer(mini(tmp_path,'image'),'image',path,'image/jpeg',transport=httpx.MockTransport(forbidden))
+    assert error.value.code=='invalid_image'
+    fake_image_tools(monkeypatch,sizes=(101,))
+    with pytest.raises(ModelError) as error:
+        infer(mini(tmp_path,'image',max_input_bytes=100),'image',path,'image/jpeg',transport=httpx.MockTransport(forbidden))
+    assert error.value.code=='invalid_image'
+    fake_image_tools(monkeypatch,width=100000,height=100000)  # a decompression bomb is refused before any decode
+    with pytest.raises(ModelError) as error:
+        infer(mini(tmp_path,'image'),'image',path,'image/jpeg',transport=httpx.MockTransport(forbidden))
+    assert error.value.code=='invalid_image'
+
+
+# spec: ANYM-696
+def test_the_picture_command_is_fixed_and_a_result_over_budget_is_recoded_once_at_q8(tmp_path,monkeypatch):
+    path=tmp_path/'original';path.write_bytes(b'x'*10)
+    calls=fake_image_tools(monkeypatch,sizes=(800000,750000))
+    result,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'),mime='image/jpeg',data=b'x'*10)
+    ffmpeg=[c for c in calls if c[0]=='ffmpeg']
+    assert [c[c.index('-q:v')+1] for c in ffmpeg]==['4','8']
+    first=ffmpeg[0]
+    assert first[first.index('-protocol_whitelist')+1]=='file,pipe'
+    formats=first[first.index('-format_whitelist')+1].split(',')
+    assert set(formats)<={'png_pipe','jpeg_pipe','webp_pipe','gif','image2','mjpeg'} and not {'concat','hls','ffconcat'}&set(formats)
+    assert first[first.index('-frames:v')+1]=='1' and '-nostdin' in first
+    assert 'force_original_aspect_ratio=decrease' in first[first.index('-vf')+1]
+    assert len(sent_image(seen[0])[1])==750000
+    assert result['metadata']['image_downscaled'] is True and result['metadata']['image_over_budget'] is True
+    # The second run is only for a result still over budget: a first result inside it is final.
+    calls=fake_image_tools(monkeypatch,sizes=(500000,))
+    result,_=run_mini(tmp_path,'image',mini(tmp_path,'image'),mime='image/jpeg',data=b'x'*10)
+    assert len([c for c in calls if c[0]=='ffmpeg'])==1 and result['metadata']['image_over_budget'] is False
+
+
+# spec: ANYM-696
+def test_image_flags_are_validated_and_the_model_and_other_providers_cannot_plant_them(tmp_path):
+    ok=normalize_result({'metadata':{'image_downscaled':True,'image_over_budget':False}})
+    assert ok['metadata']['image_downscaled'] is True and ok['metadata']['image_over_budget'] is False
+    for bad in ('yes',1,None):
+        with pytest.raises(ModelError):normalize_result({'metadata':{'image_downscaled':bad}})
+    assert normalize_result({'metadata':{'transcode_format':'opus'}},audio=True)['metadata']['transcode_format']=='opus'
+    with pytest.raises(ModelError):normalize_result({'metadata':{'transcode_format':'wav'}},audio=True)
+    planted=lambda _:httpx.Response(200,json={'choices':[{'message':{'content':json.dumps(
+        {'title':'t','summary':'s','metadata':{'image_downscaled':True,'image_over_budget':True}})}}]})
+    result,_=run_mini(tmp_path,'image',mini(tmp_path,'image'),reply=planted)
+    assert result['metadata']['image_downscaled'] is False and result['metadata']['image_over_budget'] is False
+    big=synth_image(tmp_path,'big.jpg','4000x3000').read_bytes()
+    result,seen=run_mini(tmp_path,'image',compat(tmp_path),mime='image/jpeg',data=big,reply=planted)
+    assert sent_image(seen[0])[1]==big  # other providers get the original, as before
+    assert 'image_downscaled' not in result['metadata'] and 'image_over_budget' not in result['metadata']
 
 
 def test_process_uses_bounded_file_output_and_cleans_timeout_group(tmp_path,monkeypatch):
