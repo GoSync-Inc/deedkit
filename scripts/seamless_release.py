@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import copy
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import hashlib
 import http.client
 import json
@@ -786,37 +786,57 @@ def readable(path):
     return value if isinstance(value, dict) else None
 
 
-def retired_generations(settings):
-    """(eligible, unresolved): `eligible` maps a generation to its receipt's container identities per role, for every
-    generation that is neither the serving one nor its previous and whose retirement a successor receipt records as
-    complete (status serving, retired_roles gateway and api: `retire` writes it after both roles are drained and
-    stopped), whose own attempt was published (`serving`) and whose own receipt names the same containers as the
-    successor's copy of it. `unresolved` counts every other generation with a receipt."""
+def discover(settings, deadline=None):
+    """Read every receipt of the HTTP state once: (eligible, unresolved, kept). `eligible` maps a generation to its
+    receipt's container identities per role, for every generation that is neither the serving one nor its previous and
+    whose retirement a successor receipt records as complete (status serving, retired_roles gateway and api: `retire`
+    writes it after both roles are drained and stopped), whose own attempt was published (`serving`), whose own
+    receipt names the same containers as the successor's copy of it and whose own ancestry is consistent: a generation
+    that had a managed predecessor must have retired it itself, only the first managed generation (no `previous`) may
+    still read `serving-retirement-pending`. Two receipts of one generation that differ are a conflict, never merged.
+    `unresolved` counts every other generation with a receipt; `kept` are the serving and previous generations."""
     state = Path(settings['state_directory'])
     current = readable(state / 'http-current.json')
     if not current or not GENERATION.fullmatch(str(current.get('generation'))):
-        return {}, 0
+        return {}, 0, set()
     kept = {current['generation'], (current.get('previous') or {}).get('generation')}
-    own, retired = {}, {}
+    own, retired, conflicts = {}, {}, set()
     for path in sorted(state.glob('*/http-result.json')):
+        if deadline is not None and time.monotonic() > deadline:
+            raise TimeoutError('receipt discovery')
         receipt, attempted = readable(path), readable(path.parent / 'http-attempted.json')
         if not receipt or not GENERATION.fullmatch(str(receipt.get('generation'))):
             continue
-        own[receipt['generation']] = (receipt, attempted)
+        generation = receipt['generation']
+        if generation in own and own[generation] != (receipt, attempted):
+            conflicts.add(generation)
+        own[generation] = (receipt, attempted)
         previous = receipt.get('previous') or {}
         if receipt.get('status') == 'serving' and receipt.get('retired_roles') == ['gateway', 'api'] and previous.get('generation'):
+            if previous['generation'] in retired and retired[previous['generation']] != previous.get('containers'):
+                conflicts.add(previous['generation'])
             retired[previous['generation']] = previous.get('containers')
     eligible = {}
     for generation, (receipt, attempted) in own.items():
         containers = receipt.get('containers')
-        if generation in kept or generation not in retired or (attempted or {}).get('status') != 'serving':
+        if generation in kept or generation in conflicts or generation not in retired or (attempted or {}).get('status') != 'serving':
             continue
         if not isinstance(containers, dict) or containers != retired[generation] or sorted(containers) != ['api', 'gateway']:
             continue
-        if all(CONTAINER_ID.fullmatch(str(item.get('container'))) and IMAGE.fullmatch(str(item.get('image')))
-               for item in containers.values() if isinstance(item, dict)) and all(isinstance(item, dict) for item in containers.values()):
+        managed = bool(receipt.get('previous'))
+        if managed and (receipt.get('status') != 'serving' or receipt.get('retired_roles') != ['gateway', 'api']):
+            continue
+        if not managed and receipt.get('status') not in {'serving', 'serving-retirement-pending'}:
+            continue
+        if all(isinstance(item, dict) and CONTAINER_ID.fullmatch(str(item.get('container'))) and IMAGE.fullmatch(str(item.get('image')))
+               for item in containers.values()):
             eligible[generation] = containers
-    return eligible, len([generation for generation in own if generation not in kept and generation not in eligible])
+    return eligible, len([generation for generation in own if generation not in kept and generation not in eligible]), kept
+
+
+def retired_generations(settings, deadline=None):
+    eligible, unresolved, _ = discover(settings, deadline)
+    return eligible, unresolved
 
 
 def stale_container(actual, identity, generation, role):
@@ -837,17 +857,23 @@ def stale_container(actual, identity, generation, role):
 def clean(settings, remove):
     """Remove (or with `remove=False` list) the exited containers of retired generations; the caller holds the HTTP locks.
 
-    Bounded (CLEAN_BUDGET seconds, CLEAN_COMMAND per docker command), never waits for a lock, never raises and never
-    changes a release's outcome: every failure is a line of the summary. A plain `docker rm <full id>` only (no force,
-    no volumes, no prune). A removal that gave no answer is `unknown` and is not repeated in this run; the next run
-    inspects the same ID again (absent: already removed)."""
-    summary = {'removed': [], 'would_remove': [], 'skipped': [], 'unknown': [], 'generations': [], 'unresolved': 0}
+    Bounded as a whole (CLEAN_BUDGET seconds: every docker command gets the smaller of CLEAN_COMMAND and what is left,
+    and no command starts after the deadline), never waits for a lock, never raises and never changes a release's
+    outcome: every failure is a line of the summary. A plain `docker rm <full id>` only (no force, no volumes, no
+    prune). A removal that gave no answer is `unknown` and is not repeated in this run; the next run inspects the same
+    ID again (absent: already removed). Deletion is selected by receipts alone; a bounded listing of the labelled
+    containers that were not selected is observation only (`not_selected`)."""
+    summary = {'removed': [], 'would_remove': [], 'skipped': [], 'unknown': [], 'generations': [], 'ids': [], 'unresolved': 0}
     deadline = time.monotonic() + CLEAN_BUDGET
+
+    def left():
+        return max(1.0, min(CLEAN_COMMAND, deadline - time.monotonic()))
     try:
-        eligible, summary['unresolved'] = retired_generations(settings)
+        eligible, summary['unresolved'], kept = discover(settings, deadline)
     except Exception as exc:
         summary['error'] = type(exc).__name__
         return summary
+    selected = {identity['container'] for containers in eligible.values() for identity in containers.values()}
     for generation, containers in eligible.items():
         for role in ['api', 'gateway']:
             identity, name = containers[role], generation + '/' + role
@@ -855,25 +881,41 @@ def clean(settings, remove):
                 summary['stopped'] = 'budget'
                 return summary
             try:
-                actual = json.loads(p.run(['docker', 'inspect', identity['container']], timeout=CLEAN_COMMAND, reason=True))[0]
+                actual = json.loads(p.run(['docker', 'inspect', identity['container']], timeout=left(), reason=True))[0]
             except Exception as exc:
                 absent = 'No such' in str(exc)
-                summary['skipped'].append({'container': name, 'reason': 'already absent' if absent else 'inspect failed'})
+                summary['skipped'].append({'container': name, 'id': identity['container'][:12],
+                                           'reason': 'already absent' if absent else 'inspect failed'})
                 continue
             if reason := stale_container(actual, identity, generation, role):
-                summary['skipped'].append({'container': name, 'reason': reason})
+                summary['skipped'].append({'container': name, 'id': identity['container'][:12], 'reason': reason})
                 continue
             if not remove:
                 summary['would_remove'].append(name)
+                summary['ids'].append(identity['container'][:12])
                 continue
+            if time.monotonic() > deadline:
+                summary['stopped'] = 'budget'
+                return summary
             try:
-                p.run(['docker', 'rm', identity['container']], timeout=CLEAN_COMMAND, reason=True)
+                p.run(['docker', 'rm', identity['container']], timeout=left(), reason=True)
             except Exception as exc:
-                summary['unknown'].append({'container': name, 'reason': type(exc).__name__})
+                summary['unknown'].append({'container': name, 'id': identity['container'][:12], 'reason': type(exc).__name__})
                 continue
             summary['removed'].append(name)
+            summary['ids'].append(identity['container'][:12])
             if generation not in summary['generations']:
                 summary['generations'].append(generation)
+    if time.monotonic() <= deadline:
+        try:
+            listing = p.run(['docker', 'ps', '--all', '--no-trunc', '--filter', 'label=ai.deedkit.http-release', '--format',
+                             '{{.ID}} {{.Label "ai.deedkit.http-release"}} {{.State}}'], timeout=left(), reason=True)
+            others = [line.split() for line in listing.splitlines() if len(line.split()) == 3
+                      and line.split()[0] not in selected and line.split()[1] not in kept]
+            summary['not_selected_count'] = len(others)
+            summary['not_selected'] = [{'id': item[0][:12], 'generation': item[1], 'state': item[2]} for item in others[:20]]
+        except Exception as exc:
+            summary['not_selected_error'] = type(exc).__name__
     return summary
 
 
@@ -905,14 +947,25 @@ def disk_free(path='/var/lib/containerd'):
 
 def clean_command(settings, remove, plan_a_config):
     """`clean`: the retired generations' containers, report only unless `remove`, and with it the existing image pass
-    (production.md "Image retention") so one command ends in freed bytes; both under the HTTP locks of `main`."""
+    (production.md "Image retention") so one command ends in freed bytes. `main` holds the global and HTTP locks; the
+    plan A configuration is loaded first and its state lock taken without waiting before anything is deleted, so a
+    concurrent preparation keeps its in-flight image protection."""
     if remove and not plan_a_config:
         raise Refused('--remove needs --plan-a-config, the plan A configuration the image pass reads')
     before = disk_free()
-    summary = clean(settings, remove)
     if not remove:
-        return {'mode': 'report only, nothing removed; pass --remove', 'containers': summary, 'disk_free_gib': before}
-    images = p.remove_images(p.config(plan_a_config), held=(settings['state_directory'], GLOBAL_LOCK))
+        return {'mode': 'report only, nothing removed; pass --remove', 'containers': clean(settings, False), 'disk_free_gib': before}
+    plan = p.config(plan_a_config)
+    plan_state = Path(plan['state_directory'])
+    with ExitStack() as stack:
+        mine = {Path(settings['state_directory']).resolve(), GLOBAL_LOCK.resolve()}
+        if plan_state.resolve() not in mine and not p.free_lock(plan_state, stack):
+            raise Refused('the plan A deploy lock is held by another production operation; nothing was removed')
+        summary = clean(settings, True)
+        try:
+            images = p.remove_images(plan, held=(settings['state_directory'], GLOBAL_LOCK, plan_state))
+        except Exception as exc:
+            images = {'removed': [], 'error': str(exc) if isinstance(exc, Refused) else type(exc).__name__}
     return {'mode': 'removed', 'containers': summary, 'images_removed': len(images['removed']), 'images': images,
             'disk_free_gib_before': before, 'disk_free_gib_after': disk_free()}
 

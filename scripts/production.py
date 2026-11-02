@@ -129,10 +129,17 @@ class CallActive(Refused):
 
 
 
+DEADLINE = None  # a time.monotonic() value: set only by `preflight_cleanup`, so every command of that pass is bounded by it
+
+
 def run(argv, *, cwd=None, umask=-1, env=None, reason=False, timeout=1800, binary=False):
     # Never include command output in an exception: Compose can contain secrets. Only a tool that prints
     # nothing secret (the attestation verifier, git on the public source mirror) may pass its last stderr line on,
     # with `reason`.
+    if DEADLINE is not None:
+        if (left := DEADLINE - time.monotonic()) <= 0:
+            raise Refused("the cleanup time budget is used; no further command starts")
+        timeout = min(timeout, left)
     result = subprocess.run(argv, cwd=cwd, text=not binary, capture_output=True, timeout=timeout, umask=umask, env=env)
     if result.returncode:
         stderr = result.stderr.decode(errors="replace") if binary else result.stderr
@@ -1823,6 +1830,9 @@ def remove_images(settings, *, held=(), deadline=None, reasons=False):
                 raise Refused(f"another production operation holds the deploy lock of {directory}; no image is removed")
             mine.add(directory.resolve())
         stack.enter_context(image_lock())
+        if deadline is not None and time.monotonic() > deadline:
+            # The budget went on the container pass: no discovery starts after it.
+            return {"removed": [], "failed": [], "kept": 0, "interrupted": "time budget", "remaining": None}
         # The report refuses a state that appeared meanwhile instead of locking it.
         report = images_report(settings, held=mine, stack=stack)
         removed, failed, summary = [], [], {}
@@ -1880,26 +1890,47 @@ PREFLIGHT_BUDGET = 300
 def preflight_cleanup(settings, http, s, http_state):
     """ANYM-689: before a deploy's disk check, remove the containers of retired HTTP generations and then the images they
     pinned, so a host just under the gate recovers itself instead of halting. Best effort: it never raises, never
-    waits for a lock and never changes the deploy's outcome; every failure is a line of the summary."""
-    deadline = time.monotonic() + PREFLIGHT_BUDGET
+    waits for a lock and never changes the deploy's outcome; every failure is a line of the summary. One budget bounds
+    the whole pass: `DEADLINE` caps every command `run` starts while it is set."""
+    global DEADLINE
+    deadline = DEADLINE = time.monotonic() + PREFLIGHT_BUDGET
     try:
-        containers = s.clean(http, True)
-    except Exception as exc:
-        containers = {"error": type(exc).__name__}
-    images = retain_images(settings, held=(http_state, s.GLOBAL_LOCK), deadline=deadline, reasons=True)
+        try:
+            containers = s.clean(http, True)
+        except Exception as exc:
+            containers = {"error": type(exc).__name__}
+        images = retain_images(settings, held=(http_state, s.GLOBAL_LOCK), deadline=deadline, reasons=True)
+    finally:
+        DEADLINE = None
     return {"containers": containers, "images": images}
 
 
-def cleanup_line(preflight, final):
-    """The deploy journal's one line: what the cleanup removed and how much room is left."""
+def cleanup_line(preflight, final, retired=None):
+    """The deploy journal's one line: what the cleanup removed (the preflight pass, the retirement of the predecessor in
+    this run, the image pass after it) and how much room is left."""
     containers, images = (preflight or {}).get("containers", {}), (preflight or {}).get("images", {})
+    later = retired if isinstance(retired, dict) else {}
     try:
         free = round(shutil.disk_usage(CONTAINERD_ROOT).free / 2**30, 2)
     except Exception:
         free = None
-    return {"containers_removed": len(containers.get("removed", [])), "generations": containers.get("generations", []),
+    generations = list(dict.fromkeys([*containers.get("generations", []), *later.get("generations", [])]))
+    return {"containers_removed": len(containers.get("removed", [])) + len(later.get("removed", [])),
+            "generations": generations,
             "images_removed": len(images.get("removed", [])) + len((final or {}).get("removed", [])),
             "disk_free_after_gib": free}
+
+
+def attach_cleanup(state, record, outcome, preflight, retired=None):
+    """A halted or errored deploy keeps the cleanup summary too (ANYM-689). Best effort and after the outcome was
+    written: only the receipt of this run is rewritten, and a failed write leaves the first one (with its pause reason)."""
+    try:
+        outcome["preflight"], outcome["cleanup"] = preflight, cleanup_line(preflight, None, retired)
+        if outcome is record:
+            write(state / "deploy.json", outcome)
+    except Exception:
+        pass
+    return outcome
 
 
 # Database copies (ANYM-588, production.md "Database copies"): an exactly checked copy of a live database on this host,
@@ -4545,11 +4576,12 @@ def deploy_plan_b(http, s, http_state, candidate, halt, finish, retry):
     return None, served
 
 
-def deploy_finish(settings, s, state, http_state, finish, served):
+def deploy_finish(settings, s, state, http_state, finish, served, preflight=None):
     outcome = finish("deployed", http=served.get("status"))
     # Recorded as deployed first: removing old release images never changes that outcome, nor does adding its summary.
     outcome["image_removal"] = retain_images(settings, held=(http_state, s.GLOBAL_LOCK))
-    outcome["cleanup"] = cleanup_line(outcome.get("preflight"), outcome["image_removal"])
+    outcome["preflight"] = preflight
+    outcome["cleanup"] = cleanup_line(preflight, outcome["image_removal"], served.get("cleanup"))
     try:
         write(state / "deploy.json", outcome)
     except Exception:
@@ -4619,17 +4651,17 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
     finish, retry = deploy_closers(record, state, misses, halt)
     # ANYM-689: containers of retired HTTP generations and the images they pinned go before the disk check of the
     # preparation; the summary rides in deploy.json whether the deploy ends or halts.
-    record["preflight"] = preflight_cleanup(settings, http, s, http_state)
+    preflight = preflight_cleanup(settings, http, s, http_state)
     release = state / candidate
     if candidate != base:
         halted = deploy_plan_a(settings, http, plans, mirror, base, serving, candidate, release, gated, waits, halt, finish,
                                retry)
         if halted is not None:
-            return halted
+            return attach_cleanup(state, record, halted, preflight)
     halted, served = deploy_plan_b(http, s, http_state, candidate, halt, finish, retry)
     if halted is not None:
-        return halted
-    return deploy_finish(settings, s, state, http_state, finish, served)
+        return attach_cleanup(state, record, halted, preflight)
+    return deploy_finish(settings, s, state, http_state, finish, served, preflight)
 
 
 def transient(exc):

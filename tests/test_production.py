@@ -3791,6 +3791,160 @@ def test_the_preflight_image_pass_lifts_a_host_under_the_gate_that_container_rem
     assert pause["preflight"]["images"]["kept_reasons"] == {"prepared release <id> is not applied": 4}
 
 
+# spec: ANYM-689
+def test_the_retirement_of_the_predecessor_in_this_run_is_counted_in_the_one_cleanup_line(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    monkeypatch.setattr(host.s, "clean", lambda *a: {"removed": ["a/api"], "generations": ["a"]})
+    promote = host.s.promote
+    monkeypatch.setattr(host.s, "promote", lambda settings, sha: {**promote(settings, sha), "status": "serving",
+                        "cleanup": {"removed": ["b/api", "b/gateway"], "generations": ["b", "a"]}})
+    outcome = host.deploy()
+    assert outcome["status"] == "deployed"
+    assert outcome["cleanup"]["containers_removed"] == 3 and outcome["cleanup"]["generations"] == ["a", "b"]
+    assert p.read(host.state / "deploy.json")["cleanup"] == outcome["cleanup"]
+
+
+# spec: ANYM-689
+@pytest.mark.parametrize("stage", ["plan A", "plan B"])
+def test_a_halted_deploy_keeps_the_cleanup_summary_and_its_own_reason(tmp_path, monkeypatch, stage):
+    host = Deployer(tmp_path, monkeypatch)
+    monkeypatch.setattr(host.s, "clean", lambda *a: {"removed": ["a/api"], "generations": ["a"]})
+    def refuse(sha):
+        raise p.Refused("synthetic refusal")
+    setattr(host, "fail_prepare" if stage == "plan A" else "fail_seamless_promote", refuse)
+    host.deploy()
+    receipt = p.read(host.state / "deploy.json")
+    assert receipt["status"] == "halted" and "synthetic refusal" in receipt["reason"] and "synthetic refusal" in host.paused()
+    assert receipt["cleanup"]["containers_removed"] == 1 and receipt["preflight"]["containers"]["generations"] == ["a"]
+
+
+# spec: ANYM-689
+def test_a_failed_write_of_the_cleanup_summary_leaves_the_halt_receipt_and_the_pause_reason(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    monkeypatch.setattr(host.s, "clean", lambda *a: {"removed": ["a/api"], "generations": ["a"]})
+    def refuse(sha):
+        raise p.Refused("synthetic refusal")
+    host.fail_prepare = refuse
+    write = p.write
+    def full(target, value):
+        if target.name == "deploy.json" and "cleanup" in value:
+            raise OSError("No space left on device")
+        write(target, value)
+    monkeypatch.setattr(p, "write", full)
+    outcome = host.deploy()
+    receipt = p.read(host.state / "deploy.json")
+    assert outcome["status"] == receipt["status"] == "halted" and "synthetic refusal" in receipt["reason"]
+    assert "cleanup" not in receipt and "synthetic refusal" in host.paused()
+
+
+# spec: ANYM-689
+def test_the_preflight_budget_bounds_every_command_and_is_always_reset(tmp_path, monkeypatch):
+    seen = []
+    def fake(argv, **kwargs):
+        seen.append(kwargs["timeout"])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(p.subprocess, "run", fake)
+    assert p.run(["true"]) == "" and seen == [1800]
+    monkeypatch.setattr(p, "DEADLINE", p.time.monotonic() + 60)
+    p.run(["true"])
+    assert 0 < seen[-1] <= 60
+    monkeypatch.setattr(p, "DEADLINE", p.time.monotonic() - 1)
+    with pytest.raises(p.Refused, match="time budget"):
+        p.run(["true"])
+    assert len(seen) == 2
+    monkeypatch.setattr(p, "DEADLINE", None)
+    # The pass sets the deadline for both stages and clears it whether they end or raise.
+    during = []
+    stage = SimpleNamespace(GLOBAL_LOCK=tmp_path, clean=lambda http, remove: during.append(p.DEADLINE) or {"removed": []})
+    monkeypatch.setattr(p, "retain_images", lambda settings, **extra: during.append(p.DEADLINE) or {"removed": []})
+    p.preflight_cleanup({}, {}, stage, tmp_path)
+    assert len(during) == 2 and all(value is not None for value in during) and p.DEADLINE is None
+    monkeypatch.setattr(p, "retain_images", lambda settings, **extra: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        p.preflight_cleanup({}, {}, stage, tmp_path)
+    assert p.DEADLINE is None
+
+
+# spec: ANYM-689
+def test_the_image_pass_starts_no_discovery_after_its_deadline(tmp_path, monkeypatch):
+    settings = retention_settings(tmp_path)
+    store = Images(monkeypatch, [runtime("1")])
+    summary = p.remove_images(settings, deadline=p.time.monotonic() - 1)
+    assert summary["interrupted"] == "time budget" and summary["removed"] == [] and store.calls == []
+
+
+class RetiredHost(Images):
+    """`Images` plus the HTTP generations' exited containers: `docker inspect <id>` answers the full object, `docker rm
+    <id>` deletes it (so its image is no longer in use) and the labelled listing shows what is left."""
+
+    def __init__(self, monkeypatch, images, detail):
+        super().__init__(monkeypatch, images, {identity: item["Image"] for identity, item in detail.items()})
+        self.detail = detail
+
+    def run(self, argv, **kwargs):
+        if argv[:2] == ["docker", "inspect"] and len(argv) == 3 and argv[2] in self.detail:
+            self.calls.append(argv)
+            return json.dumps([self.detail[argv[2]]])
+        if argv[:2] == ["docker", "rm"] and len(argv) == 3:
+            self.calls.append(argv)
+            del self.detail[argv[2]], self.containers[argv[2]]
+            return ""
+        if argv[:2] == ["docker", "ps"] and "label=ai.deedkit.http-release" in argv:
+            self.calls.append(argv)
+            return "".join(f"{identity} {item['Config']['Labels']['ai.deedkit.http-release']} {item['State']['Status']}\n"
+                           for identity, item in self.detail.items())
+        return super().run(argv, **kwargs)
+
+
+def http_generations(directory, images):
+    """Three HTTP generations as `retire` leaves them: g0 retired by g1's receipt, g1 the previous, g2 serving."""
+    state = directory / "http-state"
+    state.mkdir(mode=0o700)
+    detail, previous = {}, None
+    for number, image in enumerate(images):
+        generation, sha = "%012x" % (number + 1), "%040x" % (number + 1)
+        identities = {role: {"container": "%064x" % (0x100 + number * 2 + (role == "gateway")), "image": image}
+                      for role in ("api", "gateway")}
+        receipt = {"sha": sha, "generation": generation, "status": "serving", "containers": identities,
+                   "retired_roles": ["gateway", "api"] if previous else [], "previous": previous}
+        (state / sha).mkdir()
+        p.write(state / sha / "http-result.json", receipt)
+        p.write(state / sha / "http-attempted.json", {"status": "serving", "sha": sha})
+        p.write(state / "http-current.json", receipt)
+        for role, identity in identities.items():
+            detail[identity["container"]] = {"Id": identity["container"], "Image": image,
+                "State": {"Status": "running" if number == len(images) - 1 else "exited", "Running": number == len(images) - 1},
+                "Config": {"Labels": {"com.docker.compose.project": "deedkit-http-" + generation,
+                                      "com.docker.compose.service": f"http-{role}-{generation}",
+                                      "ai.deedkit.http-release": generation}}}
+        previous = {**receipt, "previous": None}
+    return state, detail
+
+
+# spec: ANYM-689
+def test_the_preflight_removes_retired_containers_and_then_the_image_they_pinned(tmp_path, monkeypatch):
+    from scripts import seamless_release as s
+    settings = retention_settings(tmp_path)
+    state = Path(settings["state_directory"])
+    for seed, before in (("1", OLD_IMAGE), ("2", image_id("1")), ("3", image_id("2"))):
+        released(state, seed * 40, image_id(seed), before)
+    (tmp_path / "global").mkdir()
+    monkeypatch.setattr(s, "GLOBAL_LOCK", tmp_path / "global")
+    http_state, detail = http_generations(tmp_path, [image_id("1"), image_id("3"), image_id("3")])
+    http = {"state_directory": str(http_state)}
+    store = RetiredHost(monkeypatch, [runtime(seed) for seed in "123"], detail)
+    # Before: the exited containers of the retired generation keep its image ("used by container").
+    assert candidates(settings) == [] and image_id("1") in store.references
+    result = p.preflight_cleanup(settings, http, s, http_state)
+    assert sorted(result["containers"]["removed"]) == ["000000000001/api", "000000000001/gateway"]
+    assert [item["image"] for item in result["images"]["removed"]] == ["1" * 12] and result["images"]["failed"] == []
+    assert set(store.references) == {image_id("2"), image_id("3")} and len(store.detail) == 4
+    # The order is the point: both containers go before the image removal is even attempted.
+    kinds = ["rm" if call[1] == "rm" and len(call) == 3 else "image" for call in store.calls if call[1] == "rm" or call[:3] == ["docker", "image", "rm"]]
+    assert kinds == ["rm", "rm", "image"] and p.DEADLINE is None
+    assert p.cleanup_line(result, None)["containers_removed"] == 2
+
+
 # spec: ANYM-439
 def test_the_command_line_apply_and_images_remove_remove_old_images_under_the_deploy_lock(tmp_path, monkeypatch, capsys):
     import fcntl
