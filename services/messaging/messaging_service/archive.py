@@ -10,6 +10,7 @@ from time import monotonic
 
 from psycopg.types.json import Jsonb
 
+from .identifiers import ACCOUNT_RE
 from .envelope import canonical, fingerprint, stable_id, validate
 from .store import serial as serial
 from .incoming_formatting import known as known_formatting, unknown as unknown_formatting, wire_digest
@@ -239,7 +240,7 @@ class Archive:
             audit(c,None,'set_sending','ok')
 
     def register(self,account,platform,label,*,synthetic=True,include_chats=(),exclude_chats=(),discover=False):
-        if not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',account) or platform not in ('telegram','whatsapp'):
+        if not ACCOUNT_RE.fullmatch(account) or platform not in ('telegram','whatsapp'):
             raise ValueError('invalid_account')
         if not discover and not include_chats: raise ValueError('empty_collection_policy')
         with self.store.pool.connection() as c:

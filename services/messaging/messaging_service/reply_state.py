@@ -1,6 +1,7 @@
 """Owner-read snapshots and credential-local dismissals, no provider actions."""
 from datetime import datetime, timezone
 
+from .identifiers import ACCOUNT_RE
 from .envelope import stable_id, utc
 from .policy import scope_filter, targets
 
@@ -51,9 +52,8 @@ def validate_observation(value):
 
 def telegram_read_capture(account,update,*,verified_self,expected_user_id):
     """Observe inbox read boundaries from the verified existing client, no RPC."""
-    import re
     from telethon import types,utils
-    if (not isinstance(account,str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',account)
+    if (not isinstance(account,str) or not ACCOUNT_RE.fullmatch(account)
         or type(expected_user_id) is not int or not 0<expected_user_id<2**63
         or not isinstance(verified_self,types.User) or verified_self.is_self is not True
         or verified_self.id!=expected_user_id):return None

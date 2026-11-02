@@ -14,6 +14,7 @@ import time
 
 from psycopg.types.json import Jsonb
 
+from .identifiers import SEND_ID_RE
 from .archive import Archive
 from .blobs import BlobWriter
 from .collector_state import CaptureSpool,CollectorState,session_lock,validate_capture as validate_capture
@@ -358,7 +359,7 @@ class NodeProvider:
         if report is not None:report('started')
         return await self._call_unlocked('send_text',{'chat':job['provider_chat'],'text':payload['text'],
             'link_preview':payload['link_preview'],
-            **({'send_id':job['id']} if re.fullmatch(r'send_[a-f0-9]{32}',job.get('id','')) else {}),
+            **({'send_id':job['id']} if SEND_ID_RE.fullmatch(job.get('id','')) else {}),
             'reply_provider_id':job.get('reply_provider_id'),'expires_at':job['expires_at']},sending=True)
     async def execute_operation(self,job):
         if not self.send_lock.locked():raise RuntimeError('send_gate_required')

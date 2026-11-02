@@ -9,6 +9,7 @@ import stat
 from psycopg.errors import CheckViolation
 from psycopg.types.json import Jsonb
 
+from .identifiers import ACCOUNT_RE
 from .operational import CAPTURE_STOP_DETAILS,OVERLOAD_STOP_DETAILS,CONNECTION_ERRORS,TERMINAL,PHASE_STATES,PHASE_REASONS
 from .operational import identity_safe,self_provider_id as verified_self_id
 
@@ -24,7 +25,7 @@ def validate_capture(value):
     if value.get('kind')=='owner_read_state':
         from .reply_state import validate_observation
         if (set(value)!={'kind','account','chat','observed_at','observation'}
-            or not isinstance(value['account'],str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',value['account'])
+            or not isinstance(value['account'],str) or not ACCOUNT_RE.fullmatch(value['account'])
             or not isinstance(value['chat'],str)):
             raise ValueError('invalid_read_capture')
         from .reply_state import WHATSAPP_READ_BASES
@@ -39,7 +40,7 @@ def validate_capture(value):
     if value.get('kind')=='read_state_gap':
         # A provider update gap (whatsmeow app-state sync error): read events may be missing.
         if (set(value)!={'kind','account','observed_at','reason'} or value['reason'] not in GAP_REASONS
-                or not isinstance(value['account'],str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',value['account'])):
+                or not isinstance(value['account'],str) or not ACCOUNT_RE.fullmatch(value['account'])):
             raise ValueError('invalid_capture')
         return {**value,'observed_at':utc(value['observed_at'])}
     if value.get('kind')=='message_receipt':
@@ -70,7 +71,7 @@ def validate_capture(value):
             **({'identity_observations':identity} if identity is not None else {})}
     if value.get('kind') in ('telegram_delete','whatsapp_delete'):
         if set(value)!={'kind','account','chat','ids','observed_at'}: raise ValueError('invalid_capture')
-        if not isinstance(value['account'],str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',value['account']):
+        if not isinstance(value['account'],str) or not ACCOUNT_RE.fullmatch(value['account']):
             raise ValueError('invalid_capture_account')
         whatsapp=value['kind']=='whatsapp_delete'
         pattern=r'[a-zA-Z0-9_.:-]{1,140}@(c.us|g.us|lid)' if whatsapp else r'-?[0-9]{1,20}|'

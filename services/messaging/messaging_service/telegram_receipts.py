@@ -1,6 +1,6 @@
 """Normalize cached Telegram outbox boundaries without fetching provider data."""
 from datetime import datetime, timezone
-import re
+from .identifiers import ACCOUNT_RE
 
 
 def telegram_receipt(account, update, *, verified_self, expected_user_id, observed_at=None):
@@ -12,7 +12,7 @@ def telegram_receipt(account, update, *, verified_self, expected_user_id, observ
     """
     from telethon import types
 
-    if not isinstance(account, str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}', account):
+    if not isinstance(account, str) or not ACCOUNT_RE.fullmatch(account):
         return None
     if type(expected_user_id) is not int or not 0 < expected_user_id < 2**63:
         return None
