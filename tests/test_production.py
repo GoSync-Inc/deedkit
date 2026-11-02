@@ -5638,6 +5638,19 @@ def test_status_names_an_unreadable_freshness_file_and_never_fails_because_of_it
     result.mkdir()
     printed = status_with_freshness(tmp_path, monkeypatch, capsys, result)
     assert printed.err == "calendar backup: freshness file unreadable (IsADirectoryError)\n"
+    # A user who cannot traverse the root-only job directory gets a named reason, not a failed `status`.
+    if os.geteuid() != 0:
+        result.rmdir()
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        freshness_file(locked / "freshness.json")
+        locked.chmod(0)
+        try:
+            printed = status_with_freshness(tmp_path, monkeypatch, capsys, locked / "freshness.json")
+        finally:
+            locked.chmod(0o700)
+        assert printed.err == "calendar backup: freshness file unreadable (PermissionError)\n"
+        assert json.loads(printed.out)["status"] == "applied"
 
 
 # spec: ANYM-694

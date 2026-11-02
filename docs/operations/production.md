@@ -999,8 +999,12 @@ nothing here is sequenced with a release. Steps, as root: install `deploy/calend
 `/opt/deedkit/calendar-backup/freshness.py` (root, `0755`); copy the four files
 `deploy/deedkit-calendar-backup-fresh.service`, `-fresh.timer`, `-catchup.service` and `-catchup.timer` to
 `/etc/systemd/system/` (`0644`); `systemctl daemon-reload`; `systemctl enable --now
-deedkit-calendar-backup-fresh.timer deedkit-calendar-backup-catchup.timer`. Not during an active call, and not
-17:30Z-19:30Z. Read back: `systemctl start deedkit-calendar-backup-fresh.service` succeeds and `freshness.json`
+deedkit-calendar-backup-fresh.timer deedkit-calendar-backup-catchup.timer`. `freshness.json` is mode `0644`, but
+`/opt/deedkit/calendar-backup/` and its `backups/` are root `0700`, so `production.py status` run by another user
+prints `freshness file unreadable (PermissionError)` until that user may traverse both: grant search only, for
+example `setfacl -m u:<user>:x /opt/deedkit/calendar-backup /opt/deedkit/calendar-backup/backups` (undo: `setfacl -x
+u:<user>` on both); that exposes names, not contents (the other files stay `0600`). Run as root, `status` needs
+nothing. Not during an active call, and not 17:30Z-19:30Z. Read back: `systemctl start deedkit-calendar-backup-fresh.service` succeeds and `freshness.json`
 says `fresh`; `production.py status` prints `calendar backup: fresh age=...`; `systemctl list-timers
 'deedkit-calendar-backup-*'` lists both new timers; the first 19:15 fire is skipped by its condition (journal) and
 no second snapshot exists that day. Undo: `systemctl disable --now deedkit-calendar-backup-catchup.timer

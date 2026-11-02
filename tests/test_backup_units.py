@@ -216,12 +216,13 @@ def test_the_catchup_timer_fires_at_19_15_utc_persistent_with_one_second_accurac
 
 
 # spec: ANYM-694
-def test_the_catchup_clock_condition_admits_19_00_to_13_00_next_day_and_fails_closed(tmp_path):
+def test_the_catchup_clock_condition_admits_19_00_to_23_59_only_and_fails_closed(tmp_path):
     script = sh_script(unit_lines('deedkit-calendar-backup-catchup.service')['Service']['ExecCondition'][0])
     assert 'date -u' in script
-    for clock in ('1900', '1915', '2359', '0000', '0100', '0859', '1300'):
+    for clock in ('1900', '1915', '2200', '2359'):
         assert run_condition(script, tmp_path, clock=clock, freshness=0), clock
-    for clock in ('1301', '1400', '1600', '1602', '1800', '1859', 'x', ''):
+    # The morning is the daily unit's Persistent boot run (admitted to 16:02): a catch-up there is a second snapshot.
+    for clock in ('0000', '0100', '0859', '1300', '1400', '1600', '1602', '1800', '1859', 'x', ''):
         assert not run_condition(script, tmp_path, clock=clock, freshness=0), clock
 
 
@@ -245,13 +246,14 @@ def test_the_catchups_whole_budget_ends_before_the_next_daily_run_and_its_timer_
     service = {'Service': {key: values[0] for key, values in
                            unit_lines('deedkit-calendar-backup-catchup.service')['Service'].items()}}
     conditions = unit_lines('deedkit-calendar-backup-catchup.service')['Service']['ExecCondition']
-    bound = int(re.search(r'-le (\d{4}) \]', sh_script(conditions[0]))[1])
-    last = int(str(bound)[:-2]) * 3600 + int(str(bound)[-2:]) * 60 + 59  # 13:00:59, next morning
-    assert last + whole_budget(service['Service']) < 16 * 3600  # before the next 16:00 run
+    opens = re.search(r'-ge (\d{4})', sh_script(conditions[0]))[1]
+    assert not re.search(r'-le \d{4}', sh_script(conditions[0]))  # no morning branch
+    day = 24 * 3600
+    last = day - 1  # 23:59:59, the latest minute a four-digit clock can admit
+    assert last + whole_budget(service['Service']) < day + 16 * 3600  # before the next 16:00 run
     timer = unit_lines('deedkit-calendar-backup-catchup.timer')['Timer']
     start = 19 * 3600 + 15 * 60 + seconds(timer['AccuracySec'][0])
-    opens = re.search(r'-ge (\d{4})', sh_script(conditions[0]))[1]
-    assert int(opens[:2]) * 3600 + int(opens[2:]) * 60 <= start
+    assert int(opens[:2]) * 3600 + int(opens[2:]) * 60 <= start <= last
     # The daily service's own window and tests are untouched: the catch-up never moves its 16:02 admission.
     assert admission()[1] == 16 * 3600 + 2 * 60 + 59
 

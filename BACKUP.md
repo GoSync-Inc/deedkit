@@ -437,7 +437,7 @@ late manual start is skipped; an unreadable clock skips too; the timer fires wit
 its own `TimeoutStopSec=180s`, ends every admitted run, its lock wait and recovery included, before
 18:00; a skipped start runs no recovery (`SERVICE_RESULT=exec-condition`), and the unit has no
 `Restart=`, so the calendar never holds messaging's lock into messaging's run. A skipped or failed day
-stays in `status.json` until the next day's run; a journal an earlier recovery left waits for the next
+is made up the same night by the catch-up below (before ANYM-694 it stayed in `status.json` until the next day's run); a journal an earlier recovery left waits for the next
 admitted run, and its `.unsettled` marker keeps deploys out meanwhile. The unit may write only its job directory and messaging's
 backup directory (the shared lock and its `.unsettled` marker). The capture limit is
 `timeout_seconds` 900 and the receiver busy wait `busy_wait_seconds` 1800.
@@ -496,13 +496,16 @@ age 0). The age counts from the snapshot, never from a delivery retry.
   follow-up).
 - **22 h, the catch-up.** `deedkit-calendar-backup-catchup.timer` fires at 19:15 UTC (`Persistent=true`) and
   `deedkit-calendar-backup-catchup.service` runs the same runner, recovery, sandbox and budget as the daily unit, but
-  starts only when two `ExecCondition` lines pass: the clock is between 19:00 and 13:00 the next day (an unreadable
-  clock skips), and the freshness script with `--max-age-hours 22` exits 4 or 5. On a healthy day it is a no-op, so
-  there is never a second snapshot: at the window's end (13:00 next day) a normal snapshot is 21 h old, under 22 h.
-  The window reaches into the morning so that a host down from before 16:00 until night makes the day up at boot; the
-  latest admitted start (13:00:59) plus `TimeoutStartSec` plus 2 x `TimeoutStopSec` ends at 14:51, before the next
-  16:00. It repairs a failed 16:00 run as well as a skipped one. Exclusion with messaging's 18:00 run and a deploy is
-  the runner's host lock, as for the daily run.
+  starts only when two `ExecCondition` lines pass: the clock is between 19:00 and 23:59 (an unreadable clock skips),
+  and the freshness script with `--max-age-hours 22` exits 4 or 5. On a healthy day it is a no-op, so there is never a
+  second snapshot: a normal snapshot is at most 8 h old at 23:59. The window stops at midnight because the morning is
+  the daily unit's: after downtime across 16:00, its own `Persistent=true` boot run is admitted until 16:02, and both
+  timers fire at boot, so a morning catch-up would make a second snapshot (the runner's lock orders two runs, it does
+  not stop the second). The latest admitted start (23:59:59) plus `TimeoutStartSec` plus 2 x `TimeoutStopSec` ends at
+  01:50, long before the next 16:00. It repairs a failed 16:00 run as well as a skipped one. Exclusion with
+  messaging's 18:00 run and a deploy is the runner's host lock, as for the daily run. Residual: a 16:00 run that
+  failed, followed by a host that is down at 19:15 and up the next morning, waits for the next 16:00 run (24 h, under
+  the 29 h alert).
 
 A skipped 16:00 start no longer waits for the next day. The daily unit, its 16:02 admission and the 16:00 timer are
 unchanged. Host install: `docs/operations/production.md`, "Calendar backup freshness and same-night catch-up".
@@ -512,5 +515,5 @@ runner reads the previous file when it writes status). Steps: stop both calendar
 (`systemctl stop deedkit-calendar-backup.timer deedkit-calendar-backup-catchup.timer`); under the runner lock
 (`/opt/personal-os-probe/backups/.runner.lock`) rename `/opt/deedkit/calendar-backup/backups/status.json` to
 `status.json.corrupt-<date>` in the same directory; start the catch-up service once
-(`systemctl start deedkit-calendar-backup-catchup.service`; it is admitted only 19:00-13:00, otherwise start the daily
+(`systemctl start deedkit-calendar-backup-catchup.service`; it is admitted only 19:00-23:59, otherwise start the daily
 service before 16:02); read `fresh` from the freshness command; start both timers again.
