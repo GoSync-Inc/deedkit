@@ -113,12 +113,7 @@ class SearchPlan:
         if not self.query or self.mode=='exact':
             return '0::bigint'
         if self.mode=='any':
-            # ANYM-668: the more distinct terms a hit has, the higher it ranks (minimum_should_match in spirit);
-            # (count+[0,1))/(terms+1) stays inside the 0..1000000 cursor bound and ties keep the time order.
-            found='greatest('+','.join('(SELECT count(*) FROM unnest(q.terms_'+lang+') t WHERE '+self.vector(alias,lang)+' @@ t)'
-                for lang in self.languages)+')'
-            base='greatest('+','.join('ts_rank_cd('+self.vector(alias,lang)+',q.'+lang+',32)' for lang in self.languages)+')'
-            return '(round((('+found+'+'+base+'::float8)/'+str(self.terms+1)+'*1000000)::numeric))::bigint'
+            return self.any_rank([(alias,None)])
         base='greatest('+','.join('ts_rank_cd('+self.vector(alias,lang)+',q.'+lang+',32)' for lang in self.languages)+')'
         if text_sql is None or self.mode not in ('all','phrase'):
             return '(round(('+base+'*1000000)::numeric))::bigint'
@@ -132,6 +127,23 @@ class SearchPlan:
         tier=('(CASE WHEN lower('+text_sql+") LIKE lower(q.literal_pattern) ESCAPE E'\\\\' THEN 2 WHEN "+
             phrase+' THEN 1 ELSE 0 END)')
         return '(round((('+tier+'+'+base+'::float8)/3*1000000)::numeric))::bigint'
+
+    def any_rank(self, sources, extra=None):
+        """ANYM-668: `any` ranks by distinct matching terms; ties keep the time order (card criterion 3).
+
+        `sources` are (alias, gate) pairs whose documents all count: a term matches when ANY source matches it under ANY
+        language, so a file whose name has one term and whose caption has another counts both. One pass over the
+        per-language term arrays serves every row. No cover-density tie-breaker: ts_rank_cd over a long OR query cost
+        6.7 of 8 s for 99 terms over 40,000 matching rows. count/terms*1000000 stays inside the 0..1000000 cursor bound.
+        """
+        langs=self.languages
+        def hit(alias, gate):
+            matched='('+' OR '.join(self.vector(alias,lang)+' @@ t.c'+str(i) for i,lang in enumerate(langs))+')'
+            return '('+gate+' AND '+matched+')' if gate else matched
+        found=('(SELECT count(*) FROM unnest('+','.join('q.terms_'+lang for lang in langs)+') AS t('+
+            ','.join('c'+str(i) for i in range(len(langs)))+') WHERE '+' OR '.join(hit(a,g) for a,g in sources)+')')
+        rank='(round(('+found+'::float8/'+str(self.terms)+'*1000000)::numeric))::bigint'
+        return rank if extra is None else 'greatest('+rank+','+extra+')'
 
     def snippet(self, text_sql):
         if not self.query:
@@ -171,8 +183,9 @@ def compile_query(query='', query_mode='all', search_language='auto'):
     terms=[]
     if query_mode=='any':
         # ANYM-668: every whitespace-separated term is its own plain query, so quotes, OR and a leading - are text.
+        # Terms that differ only in case compile to the same query in every dictionary (lower(), not casefold: Straße / STRASSE differ).
         first={}
-        for term in query.split():first.setdefault(term.casefold(),term)
+        for term in query.split():first.setdefault(term.lower(),term)
         terms=list(first.values()) or [query]
         for lang in languages:
             columns.append(' || '.join("plainto_tsquery('"+lang+"',%s)" for _ in terms)+' AS '+lang); params.extend(terms)

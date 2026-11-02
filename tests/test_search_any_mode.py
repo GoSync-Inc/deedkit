@@ -47,6 +47,10 @@ def test_query_mode_is_described_with_all_modes_the_traps_and_an_example():
                    'the word `or` itself cannot be searched in web', 'use any or exact', 'order=relevance',
                    'one live search per word'):
         assert needle in text, needle
+    # One line per mode, in the order the enum lists them.
+    modes = ('all', 'any', 'phrase', 'web', 'exact')
+    mode_lines = [line for line in text.split('\n') if line.split(' ')[0].rstrip(':') in modes]
+    assert [line.split(' ')[0].rstrip(':') for line in mode_lines] == list(modes)
     catalog = json.loads((ROOT / 'services/gateway/src/agent_gateway/catalog.json').read_text())
     for operation in ('search', 'search_files'):
         entry, = [e for e in catalog if e['operation'] == operation]
@@ -185,6 +189,37 @@ def test_search_files_any_mode_ranks_by_distinct_terms(seeded):
 
 
 # spec: ANYM-668
+def test_search_files_any_mode_counts_terms_across_text_and_caption(seeded):
+    s, a, b = seeded
+    add(s, 'any-cap-a', 'receipt')
+    add(s, 'any-cap-b', 'nothing here')
+    add_file(s, 'any-x-a', 'any-cap-a', b'invoice attached', 'a.txt')     # invoice in the text, receipt in the caption
+    add_file(s, 'any-x-b', 'any-cap-b', b'invoice invoice invoice invoice', 'b.txt')
+    drain(worker_for(s))
+    ranked = search_files(s, b, 'invoice receipt', query_mode='any', order='relevance')
+    assert [x['attachment_id'] for x in ranked['items']] == ['any-x-a', 'any-x-b']
+    assert ranked['items'][0]['rank'] > ranked['items'][1]['rank']
+    page = search_files(s, b, 'invoice receipt', query_mode='any', order='relevance', limit=1)
+    rest = search_files(s, b, 'invoice receipt', query_mode='any', order='relevance', limit=1, after=page['next_cursor'])
+    assert [x['attachment_id'] for x in page['items'] + rest['items']] == ['any-x-a', 'any-x-b']
+
+
+# spec: ANYM-668
+@pytest.mark.parametrize('query', ['Straße STRASSE', 'STRASSE Straße'])
+def test_any_mode_keeps_spellings_that_differ_after_lowercasing(seeded, query):
+    s, a, b = seeded
+    add(s, 'any-ss-1', 'Straße', day=5)
+    add(s, 'any-ss-2', 'STRASSE', day=6)
+    add_file(s, 'any-ss-f1', 'demo-tg-1', 'Straße'.encode(), 'f1.txt')
+    add_file(s, 'any-ss-f2', 'demo-tg-2', 'STRASSE'.encode(), 'f2.txt')
+    drain(worker_for(s))
+    assert ids(s.search(b, query, query_mode='any', search_language='simple')) == ['any-ss-1', 'any-ss-2']
+    assert sorted(x['attachment_id'] for x in search_files(s, b, query, query_mode='any', search_language='simple')['items']
+                  if x['attachment_id'].startswith('any-ss-f')) == ['any-ss-f1', 'any-ss-f2']
+    assert compile_query(query, 'any').terms == 2 and compile_query('invoice INVOICE Invoice', 'any').terms == 1
+
+
+# spec: ANYM-668
 def test_any_mode_with_live_auto_searches_the_archive_only(live):
     s, _, key, _, _ = live
     # The archive has a hit: auto never goes live.
@@ -204,14 +239,19 @@ def test_any_mode_with_live_forced_is_unsupported_filter_on_query_mode(live):
     assert entry['state'] == 'unsupported_filter' and entry['fields'] == ['query_mode'] and 'items' in result and queued(s) == 0
 
 
+# 99 distinct one-character terms: 197 characters, the longest query the 200-character bound allows.
+SHORT_TERMS = ([chr(c) for c in range(0x430, 0x450)] + [chr(c) for c in range(0x61, 0x7b)] + list('0123456789')
+               + [chr(c) for c in range(0x3b1, 0x3ca) if c != 0x3c2] + [chr(c) for c in range(0x5d0, 0x5eb)])[:99]
+
+
 def bulk(s):
     with s.pool.connection() as c:
         c.execute("SET LOCAL statement_timeout='60s'")
         c.execute('''INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at)
             SELECT 'anybulk-'||n,'telegram-demo','telegram-demo-chat','anybulk-'||n,'fixture',
-                CASE WHEN n%400=7 THEN 'scarcelexicalneedle ' ELSE '' END||repeat('ordinary conversation content ',5),
+                %s||' '||CASE WHEN n%%400=7 THEN 'scarcelexicalneedle ' ELSE '' END||repeat('ordinary conversation content ',5),
                 now()+n*interval '1 second'
-            FROM generate_series(1,40000) n''')
+            FROM generate_series(1,40000) n''', [' '.join(SHORT_TERMS[:6])])
         c.execute('ANALYZE messages')
         for index in ('message_fts', 'message_fts_english', 'message_fts_indonesian', 'message_fts_russian'):
             c.execute('SELECT gin_clean_pending_list(%s::regclass)', (index,))
@@ -243,5 +283,26 @@ def test_any_mode_many_short_terms_stay_inside_the_limit(seeded):
     query = ' '.join(f'w{n:02d}' for n in range(40)) + ' scarcelexicalneedle'
     assert 150 <= len(query) <= 200
     result, plans = measured_search(s, b, query=query, query_mode='any', order='relevance', limit=20)
+    # At this volume the planner may prefer a heap read to 41 x 4 index lookups; either way it is far inside the limit.
+    assert len(result['items']) == 20 and plans and plans[0]['Actual Total Time'] < 2000, [scans(plan) for plan in plans]
+
+
+# spec: ANYM-668
+def test_any_mode_rare_terms_use_the_existing_text_indexes(seeded):
+    s, a, b = seeded
+    bulk(s)
+    result, plans = measured_search(s, b, query='scarcelexicalneedle absentqxzword', query_mode='any', order='relevance', limit=20)
     assert len(result['items']) == 20 and plans
     assert 'message_fts' in json.dumps(plans), [scans(plan) for plan in plans]
+
+
+# spec: ANYM-668
+def test_any_mode_boundary_query_over_broad_matches_stays_inside_the_limit(seeded):
+    s, a, b = seeded
+    bulk(s)
+    query = ' '.join(SHORT_TERMS)
+    assert len(query) == 197 and len(SHORT_TERMS) == 99
+    # Six of the 99 terms are in every one of 40,000 rows: all of them match and are ranked before the page is cut.
+    result, plans = measured_search(s, b, query=query, query_mode='any', order='relevance', limit=20)
+    assert len(result['items']) == 20 and plans and plans[0]['Actual Total Time'] < 4000, [scans(plan) for plan in plans]
+    assert result['items'][0]['score'] == round(6 / 99 * 1000000)
