@@ -5,6 +5,7 @@ leader is polled for `T`. The rules that depend on time run on a virtual clock a
 is 60 there, so the real loop never ticks); the end-to-end ones run on real ticks of 50 ms."""
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -816,6 +817,205 @@ def test_recovery_owns_a_helper_spawned_between_the_record_and_the_stop_by_desce
 def test_process_table_reads_the_parent_pid():
     row = next(r for r in pausestate.process_table() if r["pid"] == os.getpid())
     assert row["ppid"] == os.getppid()
+
+
+# --- PR 3: the two-phase freeze ----------------------------------------------------------------------------------------
+LEADER_AT = "Mon Nov 2 09:00:00 2026"
+HELPER_AT = "Mon Nov 2 09:00:01 2026"
+RECORDED = time.mktime(time.strptime("Mon Nov 2 10:00:04 2026", pausestate.START_FORMAT)) + 0.5  # the freezing record
+SEEN = [{"pid": 500, "started": LEADER_AT}, {"pid": 600, "started": HELPER_AT}]  # what the group held at the record
+
+
+def ps_lines(*lines):
+    return pausestate.process_table(lambda: "".join(f"{line}\n" for line in lines))
+
+
+def owned_by(entry, *lines):
+    return sorted(row["pid"] for row in pausestate.members(entry, ps_lines(*lines)))
+
+
+def freezing(**over):
+    return {"pgid": 500, "leader": 500, "leader_start": LEADER_AT, "stopped_at": RECORDED, "phase": "freezing", "seen": SEEN, **over}
+
+
+# spec: ANYM-691
+def test_a_freezing_entry_owns_a_late_helper_whose_parent_is_gone_however_late_the_stop_landed():
+    """Sol r4 of PR 2: the record precedes the freeze, a helper starts in a later second, the service dies right after the stop,
+    and the helper's parent is killed before recovery: the orphan (ppid 1) must still be recovered. Sol r1 and Astra r1 of PR 3:
+    no time bound is relied on (a stall can delay the signal by any amount), the group's identity is the witness."""
+    orphan, much_later = "Mon Nov 2 10:00:05 2026", "Mon Nov 2 10:05:00 2026"
+    base = (f"500 500 T {LEADER_AT} 1", f"777 500 T {orphan} 1", f"778 500 T {much_later} 1")
+    assert owned_by(freezing(), *base) == [500, 777, 778]  # the leader lives: the group is the recorded one
+    assert owned_by(freezing(), *base, f"780 500 S {orphan} 1") == [500, 777, 778]  # a member that is not stopped is not claimed
+    # the leader is gone too: a process seen at the record still lives in the group, so it is still the same group
+    assert owned_by(freezing(), f"600 500 T {HELPER_AT} 1", *base[1:]) == [600, 777, 778]
+    # an entry of a release before the two-phase freeze (no phase) never owned an orphan
+    legacy = {k: v for k, v in freezing().items() if k not in ("phase", "seen")}
+    assert owned_by(legacy, *base) == [500]
+
+
+# spec: ANYM-691
+def test_recovery_continues_and_kills_a_reparented_late_helper_of_a_freezing_entry(tmp_path):
+    table = {500: f"500 500 T {LEADER_AT} 1", 777: "777 500 T Mon Nov 2 10:00:05 2026 1"}
+    sent = []
+
+    def send(pid, number):
+        sent.append((pid, number))
+        if number == signal.SIGKILL:
+            table.pop(pid, None)
+
+    path = tmp_path / pausestate.LEDGER_NAME
+    pausestate.Ledger(path).record(500, 500, LEADER_AT, stopped_at=RECORDED, freezing=True, seen=SEEN)
+    report = pausestate.recover(path, run_ps=lambda: "".join(f"{line}\n" for line in table.values()), send=send,
+                                sleep=lambda seconds: None)
+    assert (777, signal.SIGCONT) in sent and (777, signal.SIGKILL) in sent and sorted(report["killed"]) == [500, 777]
+    assert report["kept"] == [] and not path.exists()  # the entry goes only when no member is left
+
+
+# spec: ANYM-691
+def test_a_reused_leaderless_group_is_never_claimed_not_even_inside_the_freezing_window():
+    """Sol r1 and Astra r1: no time quarantine keeps a group number from being reused within seconds. The old group is gone, the
+    number is reused, the new leader exited, an unrelated stopped helper remains: without a witness of the recorded group nothing
+    started after the record is claimed, whenever it started."""
+    inside, later = "Mon Nov 2 10:00:06 2026", "Mon Nov 2 10:00:30 2026"
+    assert owned_by(freezing(), f"790 500 T {inside} 1", f"791 500 T {inside} 790") == []  # leaderless, nothing seen is alive
+    assert owned_by(freezing(), f"790 500 T {later} 1") == []
+    assert owned_by(freezing(), f"600 500 T {inside} 1", f"792 500 T {inside} 600") == []  # a seen pid, reused: another start time
+    assert owned_by(freezing(), f"500 500 S {inside} 1", f"793 500 T {inside} 500") == []  # the leader number is a newer process
+    # a process that was not seen is no witness: it is claimed only for having existed at the record, its child is not
+    assert owned_by(freezing(), f"601 500 T {HELPER_AT} 1", f"794 500 T {inside} 601") == [601]
+    # without a witness the entry owns only what existed at the record, like any entry
+    assert owned_by(freezing(), f"795 500 T {LEADER_AT} 1", f"796 500 T {inside} 1") == [795]
+    # a confirmed entry has no slack: a process of the next second after the real stop is not a member
+    stopped = freezing(phase="stopped", stopped_at=RECORDED + 1.0)
+    stopped.pop("seen")
+    assert owned_by(stopped, f"797 500 T {LEADER_AT} 1", "798 500 T Mon Nov 2 10:00:06 2026 1") == [797]
+
+
+# spec: ANYM-691
+def test_recovery_continues_but_never_kills_a_late_helper_when_every_witness_of_the_group_is_gone(tmp_path):
+    """Sol r2: the stop stalled, a helper was born at 10:00:10, the service crashed before the second write, and then the leader
+    and every process seen at the record were killed. Nothing witnesses the group, and a stranger of a reused number looks the same:
+    the stopped process is only CONTINUED (it frees its memory when it ends), never killed, and the entry goes."""
+    table = {777: "777 500 T Mon Nov 2 10:00:10 2026 1"}
+    sent = []
+
+    def send(pid, number):
+        sent.append((pid, number))
+        if number == signal.SIGCONT and pid in table:
+            table[pid] = table[pid].replace(" T ", " S ")
+
+    path = tmp_path / pausestate.LEDGER_NAME
+    pausestate.Ledger(path).record(500, 500, LEADER_AT, stopped_at=RECORDED, freezing=True, seen=SEEN)
+    report = pausestate.recover(path, run_ps=lambda: "".join(f"{line}\n" for line in table.values()), send=send,
+                                sleep=lambda seconds: None)
+    assert sent == [(777, signal.SIGCONT)] and report["killed"] == [] and report["continued"] == [777]
+    assert report["kept"] == [] and not path.exists()
+
+
+# spec: ANYM-691
+def test_only_a_freezing_entry_without_any_witness_continues_strays():
+    late = "Mon Nov 2 10:00:10 2026"
+
+    def strays(entry, *lines):
+        return sorted(row["pid"] for row in pausestate.late_strays(entry, ps_lines(*lines)))
+
+    assert strays(freezing(), f"777 500 T {late} 1", f"778 500 S {late} 1") == [777]  # stopped, in the group, unclaimed
+    assert strays(freezing(), f"500 500 T {LEADER_AT} 1", f"777 500 T {late} 1") == []  # the leader lives: members owns it all
+    assert strays(freezing(), f"500 500 S {late} 1", f"777 500 T {late} 1") == []  # a newer leader: the number is reused for certain
+    assert strays(freezing(), f"600 500 T {HELPER_AT} 1", f"777 500 T {late} 1") == []  # a seen process lives: witnessed
+    legacy = {k: v for k, v in freezing().items() if k not in ("phase", "seen")}
+    stopped = {**freezing(phase="stopped"), "seen": []}
+    assert strays(legacy, f"777 500 T {late} 1") == [] and strays(stopped, f"777 500 T {late} 1") == []  # only the freezing phase
+
+
+# spec: ANYM-691
+def test_a_stray_that_cannot_be_continued_keeps_the_entry_and_is_not_reported_as_continued(tmp_path):
+    """Sol r3: a PermissionError on the SIGCONT of a stray must not delete the ledger entry or claim a continue."""
+    table = {777: "777 500 T Mon Nov 2 10:00:10 2026 1"}
+    sent = []
+
+    def send(pid, number):
+        sent.append((pid, number))
+        raise PermissionError
+
+    path = tmp_path / pausestate.LEDGER_NAME
+    pausestate.Ledger(path).record(500, 500, LEADER_AT, stopped_at=RECORDED, freezing=True, seen=SEEN)
+    report = pausestate.recover(path, run_ps=lambda: "".join(f"{line}\n" for line in table.values()), send=send,
+                                sleep=lambda seconds: None)
+    assert sent == [(777, signal.SIGCONT)] and "continued" not in report and report["killed"] == []
+    assert report["kept"] == [500] and path.exists()  # the deploy sees a failed recovery and does not go on
+
+
+# spec: ANYM-691
+def test_a_ledger_file_cannot_carry_a_malformed_witness(tmp_path):
+    ledger = pausestate.Ledger(tmp_path / pausestate.LEDGER_NAME)
+    ledger.record(500, 500, LEADER_AT, stopped_at=RECORDED, freezing=True, seen=SEEN)
+    entry = ledger.groups()[0]
+    assert entry["phase"] == "freezing" and entry["seen"] == SEEN
+    assert ledger.confirm(500, RECORDED, RECORDED + 0.3) and "seen" not in ledger.groups()[0]
+    assert ledger.groups()[0]["phase"] == "stopped" and ledger.groups()[0]["stopped_at"] == RECORDED + 0.3
+    huge = [{"pid": n, "started": LEADER_AT} for n in range(pausestate.MAX_SEEN + 1)]
+    for bad in ({"seen": huge}, {"seen": "x"}, {"seen": [{"pid": "1", "started": LEADER_AT}]}, {"seen": [{"pid": 1}]}, {"phase": "thawing"}):
+        (tmp_path / pausestate.LEDGER_NAME).write_text(json.dumps({"version": 1, "instance": "x", "groups": [{**freezing(), **bad}]}))
+        with pytest.raises(pausestate.LedgerError):
+            ledger.groups()
+
+
+# spec: ANYM-691
+async def test_the_entry_is_freezing_with_the_group_seen_when_the_signal_goes_out_and_stopped_with_the_real_time_after(env, monkeypatch):
+    clock, seen = Virtual(), []
+    real = os.killpg
+
+    def killpg(pgid, number):
+        if number == signal.SIGSTOP:
+            seen.append(pausestate.Ledger(env.tmp / "state" / pausestate.LEDGER_NAME).groups()[0])
+        result = real(pgid, number)
+        if number == signal.SIGSTOP:
+            seen.append(time.time())  # the stop has landed
+        return result
+
+    monkeypatch.setattr(os, "killpg", killpg)
+    async with manual(env, clock) as (s, cpu):
+        task, pid = await paused_child(s, clock, env.tmp / "prog")
+        before, landed = seen
+        assert before["phase"] == "freezing" and before["pgid"] == pid
+        assert pid in {known["pid"] for known in before["seen"]}  # the leader, and its helper if it had started
+        ledger = pausestate.Ledger(env.tmp / "state" / pausestate.LEDGER_NAME)
+        await s.until(lambda: ledger.groups()[0].get("phase") == "stopped")  # the second write, off the loop
+        entry = ledger.groups()[0]
+        assert "seen" not in entry and landed - 0.001 <= entry["stopped_at"] <= time.time() + 1
+        assert entry["stopped_at"] >= before["stopped_at"]
+        await finish(task)
+
+
+# spec: ANYM-691
+async def test_a_stop_that_lands_long_after_the_record_is_still_sent_and_stays_recoverable(env, monkeypatch):
+    """No time bound is relied on: the loop or the ledger thread stalls for 30 s between the write and the signal, the signal is
+    sent, and until the second write the freezing entry (which owns by the group's identity) is what a crash would find."""
+    clock, entries, skew = Virtual(), [], [0.0]
+    real_killpg = os.killpg
+
+    def killpg(pgid, number):
+        if number == signal.SIGSTOP:
+            entries.append(pausestate.Ledger(env.tmp / "state" / pausestate.LEDGER_NAME).groups()[0])
+        return real_killpg(pgid, number)
+
+    monkeypatch.setattr(os, "killpg", killpg)
+    async with manual(env, clock) as (s, cpu):
+        y = s.service.yielder
+        y.wall = lambda: time.time() + skew[0]
+        record = y.ledger.record
+
+        def stalled(*args, **kwargs):
+            record(*args, **kwargs)
+            skew[0] += 30.0  # far beyond any bound the old design could have used
+
+        y.ledger.record = stalled
+        task, pid = await paused_child(s, clock, env.tmp / "prog")
+        assert entries and entries[0]["phase"] == "freezing" and pid in {known["pid"] for known in entries[0]["seen"]}
+        assert stopped(pid) and y.paused  # the stop was sent although the record was 30 s old
+        await finish(task)
 
 
 # spec: ANYM-691

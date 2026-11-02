@@ -165,6 +165,7 @@ class Candidate:
     worker: object | None
     marker: str | None
     allowance: float = 0.0
+    recorded_at: float = 0.0  # the wall time of the freezing record: the second phase rewrites exactly that entry
 
 
 @dataclass
@@ -356,11 +357,24 @@ class Yielder:
 
     def _record(self, candidate):
         """Ledger thread: write the group BEFORE the stop. False when the leader is gone; a LedgerError fails the tick."""
-        started = pausestate.start_text(candidate.proc.pid)
-        if started is None:
-            return False
-        self.ledger.record(candidate.proc.pid, candidate.proc.pid, started, stopped_at=self.wall())
-        return True
+        pid = candidate.proc.pid
+        table = pausestate.process_table()
+        leader = next((row for row in table if row["pid"] == pid), None)
+        if leader is None:
+            return None
+        # `seen` is what proves, after a crash, that the group is still this one (see pausestate.members)
+        seen = [{"pid": row["pid"], "started": row["started"]} for row in table if row["pgid"] == pid]
+        at = self.wall()
+        self.ledger.record(pid, pid, leader["started"], stopped_at=at, freezing=True, seen=seen)
+        return at
+
+    def _confirm(self, pgid, recorded_at, stopped_at):
+        """Ledger thread, second phase: the entry gets the real stop time. A failure leaves the freezing entry, which still owns
+        every member of the group, so it is logged and nothing else."""
+        try:
+            self.ledger.confirm(pgid, recorded_at, stopped_at)
+        except Exception as error:  # noqa: BLE001
+            LOG.error("yield: ledger entry not confirmed: %s", type(error).__name__)
 
     async def _enter(self, now, flags):
         for running in self._running():
@@ -370,13 +384,16 @@ class Yielder:
             candidate = self._assess(running, now)
             if isinstance(candidate, str):
                 continue
-            if not await asyncio.wrap_future(self.io.submit(self._record, candidate)):
+            recorded_at = await asyncio.wrap_future(self.io.submit(self._record, candidate))
+            if recorded_at is None:
                 continue
+            candidate.recorded_at = recorded_at
             self._stop(candidate, flags)
 
     def _stop(self, candidate, flags):
         """One synchronous step: look again, stop the group, register it. Nothing awaits in between, so a
-        cancellation can never leave a stopped group that `resume_all` does not know."""
+        cancellation can never leave a stopped group that `resume_all` does not know. However late the signal lands after the
+        record, every member it freezes is recoverable: the freezing entry owns them by the group's identity, not by a time."""
         running, proc = candidate.running, candidate.proc
         job = running.job
         now = self.now()
@@ -398,6 +415,9 @@ class Yielder:
         except (ProcessLookupError, PermissionError):
             self._resume(pause, "gone")
             return
+        stopped_at = self.wall()  # right after the signal: no member can start after this
+        with contextlib.suppress(RuntimeError):  # the executor is shut down: the process is going away
+            self.io.submit(self._confirm, pause.pgid, candidate.recorded_at, stopped_at)
         if pause.marker is not None and os.path.exists(pause.marker):
             self._resume(pause, "decode")  # the marker appeared before the stop landed: the decoder keeps its deadline
 
