@@ -597,6 +597,24 @@ def test_verify_names_the_raw_table_when_only_the_filter_part_was_loaded(tmp_pat
 
 
 # spec: ANYM-693
+def test_verify_ignores_a_negated_interface_rule_docker_owns_and_still_flags_a_positive_one(tmp_path):
+    # Production's raw PREROUTING holds Docker's own `-d <container> ! -i <bridge> -j DROP` for the mini's bridge: a rule that
+    # never matches that bridge's traffic is neither a hook nor an allowance, so it is not drift (found on the host, 11-02).
+    docker_owned = {('iptables', 'raw'): '-A PREROUTING -d 192.168.0.2/32 ! -i dk-inference0 -j DROP',
+                    ('ip6tables', 'raw'): '-A PREROUTING -d fd00:1::2/128 ! -i dk-inference0 -j DROP',
+                    ('iptables', 'filter'): '-A DOCKER-USER ! -i dk-inference0 -j RETURN'}
+    host = Host(tmp_path)
+    for key, rule in docker_owned.items():
+        host.kernel[key] = host.kernel[key].replace('COMMIT', rule + '\nCOMMIT')
+    code, out, err = host.run()
+    assert (code, out) == (0, 'ok\n'), (out, err)
+    # A rule that does match the bridge, next to the same Docker rule, is still drift.
+    host.kernel[('iptables', 'raw')] = host.kernel[('iptables', 'raw')].replace('COMMIT', '-A PREROUTING -i dk-inference0 -j ACCEPT\nCOMMIT')
+    code, out, _ = host.run()
+    assert code == 1 and out.splitlines()[0].startswith('kernel_vs_repo '), out
+
+
+# spec: ANYM-693
 def test_verify_persisted_only_reads_no_kernel_and_a_file_without_the_docker_user_declaration_fails(tmp_path):
     host = Host(tmp_path)
     code, out, err = host.run('--persisted-only', '--iptables-save', '/bin/false', '--ip6tables-save', '/bin/false')

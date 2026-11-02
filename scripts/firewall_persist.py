@@ -157,7 +157,9 @@ def extract(text, table, chain, bridges, family='v4', kernel=False):
             chains.setdefault(tokens[1], []).append(rule)
             if tokens[1] == chain:
                 found['chain'].append(rule)
-            elif '-i' in tokens and bridge_of(rule) in bridges:
+            elif '-i' in tokens and tokens[tokens.index('-i') - 1] != '!' and bridge_of(rule) in bridges:
+                # `! -i <bridge>` (Docker's own `-d <container> ! -i <bridge> -j DROP` in raw PREROUTING) never matches the
+                # bridge's traffic: it is neither a hook nor an allowance, and the walk over earlier rules ignores it too.
                 drop = tokens[1] in ('INPUT', ufw_input) and tokens[-2:] == ['-j', 'DROP']
                 if drop or tokens[1] in ('DOCKER-USER', 'PREROUTING'):
                     managed.append((tokens[1], len(chains[tokens[1]]) - 1, rule))
