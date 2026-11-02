@@ -404,7 +404,7 @@ def test_after_init_text_is_bounded_idempotent_and_never_stops_ufw():
                for line in text.splitlines() if re.search(r'\biptables(-restore)?\b', line) and not line.startswith(('#', '-', ':')))
     assert 'LIMIT=30' in text
     # The diagnostics and the record are bounded too, and the whole hook runs under an outer bound.
-    assert 'timeout -k 1 5 logger' in text and 'timeout -k 1 5 sh -c' in text and 'timeout -k 2 "$TOTAL" sh "$0" start' in text and 'TOTAL=60' in text
+    assert 'timeout -k 1 5 logger' in text and 'timeout -k 1 5 sh -c' in text and 'timeout -k 2 "$TOTAL" sh -c \'exec 2>&3 3>&-; exec sh "$0" start\' "$0"' in text and 'TOTAL=60' in text
     assert 'timeout -k 1 10 sh "$0" fallback >/dev/null 2>&1 </dev/null' in text
     assert 'timeout -k 2 "$LIMIT" iptables-restore' in text and text.count('timeout -k 2 "$LIMIT" "$bin"') == 2
     # The generated text carries exactly the raw rules of the command form.
@@ -646,9 +646,7 @@ def test_receipt_order_is_yes_no_or_unknown():
 
 # spec: ANYM-693
 def test_first_container_start_uses_process_start_and_is_unknown_when_a_container_cannot_be_placed(tmp_path):
-    import datetime
     module = load_persist()
-    boot_wall = datetime.datetime(2026, 11, 2, 9, 0, tzinfo=datetime.timezone.utc).timestamp()
     ids, inspect = tmp_path / 'ids', tmp_path / 'inspect'
     docker = tmp_path / 'docker'
     docker.write_text(f'#!/bin/sh\nif [ "$1" = ps ]; then cat {ids}; else cat {inspect}; fi\n')
@@ -657,24 +655,21 @@ def test_first_container_start_uses_process_start_and_is_unknown_when_a_containe
     def first(lines, proc=lambda pid: {11: 20.0, 12: 15.5}.get(pid)):
         ids.write_text('\n'.join(f'c{i}' for i in range(len(lines))) + '\n')
         inspect.write_text('\n'.join(lines) + '\n')
-        return module.first_container_start(str(docker), proc_start=proc, boot_wall=boot_wall, stable=True)
-    old = 'false 0 2026-10-01T10:00:00.123456789Z'
-    assert first(['true 11 2026-11-02T09:00:20Z', 'true 12 2026-11-02T09:00:15Z', old]) == 15.5
-    # A container that is not running and started this boot cannot be placed on the clock: unknown, not a guess.
-    assert first(['true 11 2026-11-02T09:00:20Z', 'false 0 2026-11-02T10:00:00Z']) is None
+        return module.first_container_start(str(docker), proc_start=proc)
+    never = 'false 0 0001-01-01T00:00:00Z'
+    assert first(['true 11 2026-11-02T09:00:20Z', 'true 12 2026-11-02T09:00:15Z', never]) == 15.5
+    # A stopped container that ever ran cannot be placed on this boot's clock (a wall-clock estimate can be moved by any
+    # clock step, a stepped-back-and-returned clock included): unknown, whatever its timestamp says.
+    for stamp in ('2026-11-02T10:00:00Z', '2026-10-01T10:00:00.123456789Z'):
+        assert first(['true 11 2026-11-02T09:00:20Z', f'false 0 {stamp}']) is None, stamp
     # A line that cannot be read, a process whose start cannot be read, a missing line: unknown.
     assert first(['true 11 2026-11-02T09:00:20Z', 'false 0 not-a-time']) is None
     assert first(['true 99 2026-11-02T09:00:20Z']) is None
     ids.write_text('c0\nc1\n')
     inspect.write_text('true 11 2026-11-02T09:00:20Z\n')
-    assert module.first_container_start(str(docker), proc_start=lambda pid: 20.0, boot_wall=boot_wall) is None
-    # Without proof that the wall clock has not stepped since boot, a stopped container that ever ran cannot be placed.
-    ids.write_text('c0\nc1\n')
-    inspect.write_text(f'true 11 2026-11-02T09:00:20Z\n{old}\n')
-    assert module.first_container_start(str(docker), proc_start=lambda pid: 20.0, boot_wall=boot_wall, stable=False) is None
-    assert module.first_container_start(str(docker), proc_start=lambda pid: 20.0, boot_wall=boot_wall, stable=True) == 20.0
+    assert module.first_container_start(str(docker), proc_start=lambda pid: 20.0) is None
     # Nothing ran this boot: unknown (an empty host has no first container to compare with).
-    assert first([old]) is None
+    assert first([never]) is None
 
 
 # spec: ANYM-693
@@ -700,36 +695,11 @@ def test_receipt_command_writes_the_boot_receipt_and_fails_when_a_verify_fails(t
 
 
 # spec: ANYM-693
-def test_receipt_continuity_comes_from_the_service_managers_boot_pair(tmp_path):
-    offset = time.time() - time.monotonic()
-    systemctl = tmp_path / 'systemctl'
-    state = tmp_path / 'raw-step.json'
-
-    def receipt(shift):
-        # The manager's UserspaceTimestamp pair: 5 s after boot, as the wall clock read then (shift: it was set since).
-        systemctl.write_text('#!/bin/sh\ncase "$*" in\n  *--timestamp=unix*) echo @%d;;\n  *UserspaceTimestampMonotonic*) echo 5000000;;\n'
-                             '  *) echo;;\nesac\n' % int(offset + 5 + shift))
-        systemctl.chmod(0o755)
-        out = tmp_path / f'receipt{shift}.json'
-        subprocess.run([sys.executable, '-I', str(PERSIST), 'receipt', '--out', str(out), '--boot-id', 'b-1', '--raw-state', str(state),
-                        '--systemctl', str(systemctl), '--docker', 'true', '--verify', 'inference=echo ok', '--verify', 'delivery=echo ok'],
-                       text=True, capture_output=True, timeout=30)
-        return json.loads(out.read_text())
-    assert receipt(0)['clock_continuous'] is True
-    # A clock stepped since boot (60 s), or no pair at all, is not continuity; the manager's pair does not move when
-    # docker.service restarts, so a restart cannot hide the step.
-    assert receipt(60)['clock_continuous'] is False
-    systemctl.write_text('#!/bin/sh\necho\n')
-    out = tmp_path / 'none.json'
-    subprocess.run([sys.executable, '-I', str(PERSIST), 'receipt', '--out', str(out), '--boot-id', 'b-1', '--raw-state', str(state),
-                    '--systemctl', str(systemctl), '--docker', 'true', '--verify', 'inference=echo ok', '--verify', 'delivery=echo ok'],
-                   text=True, capture_output=True, timeout=30)
-    assert json.loads(out.read_text())['clock_continuous'] is False
-
-
-# spec: ANYM-693
 @pytest.mark.skipif(shutil.which('timeout') is None or not Path('/proc/uptime').exists(), reason='needs GNU timeout and /proc (Linux)')
-def test_outer_kill_of_a_term_ignoring_command_with_a_full_stderr_still_ends_with_exit_zero(tmp_path):
+@pytest.mark.parametrize('shell', ['sh', 'dash', 'bash'])
+def test_outer_kill_of_a_term_ignoring_command_with_a_full_stderr_still_ends_with_exit_zero(tmp_path, shell):
+    if shutil.which(shell) is None:
+        pytest.skip(f'{shell} is not installed')
     hook, state = after_init(tmp_path), tmp_path / 'raw-step.json'
     wrappers = tmp_path / 'bin'
     wrappers.mkdir()
@@ -739,7 +709,7 @@ def test_outer_kill_of_a_term_ignoring_command_with_a_full_stderr_still_ends_wit
     env = {**os.environ, 'PATH': f'{wrappers}:{os.environ["PATH"]}', 'DEEDKIT_HOOK_TIMEOUT': '3', 'DEEDKIT_STEP_TIMEOUT': '30',
            'DEEDKIT_RAW_STATE': str(state)}
     started = time.monotonic()
-    process = subprocess.Popen(['sh', str(hook), 'start'], stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, env=env)
+    process = subprocess.Popen([shell, str(hook), 'start'], stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, env=env)
     try:
         assert process.wait(timeout=40) == 0
         assert time.monotonic() - started < 40

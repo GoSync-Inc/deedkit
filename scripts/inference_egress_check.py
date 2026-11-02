@@ -143,7 +143,9 @@ DEEDKIT_V4
 if [ "$1" = start ] && [ -z "$DEEDKIT_RAW_INNER" ]; then
     # The supervising shell's own diagnostics (such as "Killed") go to /dev/null; only the inner run keeps the caller's stderr.
     exec 3>&2 2>/dev/null
-    DEEDKIT_RAW_INNER=1 timeout -k 2 "$TOTAL" sh "$0" start 2>&3
+    # The caller's stderr (fd 3) is restored inside the child only: no redirection of the supervisor's own commands
+    # reaches it, whichever shell prints the job message.
+    DEEDKIT_RAW_INNER=1 timeout -k 2 "$TOTAL" sh -c 'exec 2>&3 3>&-; exec sh "$0" start' "$0"
     rc=$?
     # The fallback is a bounded child with no terminal and no pipe of the caller: a full stderr cannot hold ufw.
     if [ "$rc" -ne 0 ]; then DEEDKIT_RAW_INNER=1 DEEDKIT_RAW_RC=$rc timeout -k 1 10 sh "$0" fallback >/dev/null 2>&1 </dev/null; fi

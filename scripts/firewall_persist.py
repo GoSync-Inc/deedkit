@@ -20,7 +20,6 @@ import re
 import shlex
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 # v4 filter, v4 raw, v6 filter, v6 raw. The raw pair is reported as `raw`: it is loaded by one step.
@@ -399,31 +398,6 @@ def command_output(command, *arguments):
     return result.stdout if result.returncode == 0 else ''
 
 
-def manager_wall(systemctl, name):
-    """A timestamp of the service manager as wall-clock seconds (--timestamp=unix prints @SECONDS), or None."""
-    value = command_output(systemctl, 'show', '-p', name, '--timestamp=unix', '--value').strip()
-    return int(value[1:]) if value.startswith('@') and value[1:].isdigit() else None
-
-
-def manager_time(systemctl, name):
-    value = command_output(systemctl, 'show', '-p', name, '--value').strip()
-    return int(value) / 1_000_000 if value.isdigit() and int(value) > 0 else None
-
-
-def clock_mapping(systemctl):
-    """(wall time of boot, whether the wall clock is unchanged since), from the manager's own pair of timestamps.
-
-    UserspaceTimestamp and its monotonic twin are taken once, at one instant, when the manager starts at boot; they do not
-    change when docker.service restarts. If the clock differs from that pair by more than 2 s now, it stepped since boot.
-    """
-    wall = manager_wall(systemctl, 'UserspaceTimestamp')
-    mono = manager_time(systemctl, 'UserspaceTimestampMonotonic')
-    if wall is None or mono is None:
-        return None, False
-    boot_wall = wall - mono
-    return boot_wall, abs((time.time() - time.monotonic()) - boot_wall) < 2.0
-
-
 def unit_time(systemctl, unit, name):
     value = command_output(systemctl, 'show', unit, '-p', name, '--value').strip()
     return int(value) / 1_000_000 if value.isdigit() and int(value) > 0 else None
@@ -438,15 +412,13 @@ def process_start(pid):
         return None
 
 
-def first_container_start(docker, proc_start=process_start, boot_wall=None, stable=False):
+def first_container_start(docker, proc_start=process_start):
     """The earliest start of a running container's main process this boot, on the boot clock, or None (= unknown).
 
     The container start times Docker prints are wall-clock and a clock step would move them, so the start of the
-    process itself is used. Unknown (None) when any container cannot be read, or when a container that is not running
-    started during this boot (its start cannot be placed on the clock). It is the earliest *observable* start: a
-    container that restarted shows its latest one. A stopped container that ever ran can be told from this boot only when
-    the wall clock is known not to have stepped since boot (`stable`, with `boot_wall` the wall time of boot, both from
-    systemd's own pair of timestamps for docker.service); otherwise it makes the answer unknown.
+    process itself is used. Unknown (None) when any container cannot be read, and when a container that is not running
+    ever ran (it may have run before the rules, and without a reliable boot-wide clock mapping its start cannot be placed
+    on this boot's clock). It is the earliest *observable* start: a container that restarted shows its latest one.
     """
     ids = command_output(docker, 'ps', '-aq').split()
     if not ids:
@@ -468,7 +440,7 @@ def first_container_start(docker, proc_start=process_start, boot_wall=None, stab
             when = datetime.datetime.fromisoformat(re.sub(r'(\.\d{6})\d*', r'\1', stamp.replace('Z', '+00:00')))
         except ValueError:
             return None
-        if when.year > 1970 and (not stable or boot_wall is None or when.timestamp() >= boot_wall):
+        if when.year > 1970:
             return None
     return min(starts) if starts else None
 
@@ -503,13 +475,12 @@ def receipt_cli(argv):
     raw_time = state.get('uptime') if mine and isinstance(state.get('uptime'), (int, float)) else None
     raw_ok = bool(mine and state.get('ok') is True)
     ufw = unit_time(args.systemctl, 'ufw.service', 'ExecMainExitTimestampMonotonic')
-    boot_wall, stable = clock_mapping(args.systemctl)
-    container = first_container_start(args.docker, boot_wall=boot_wall, stable=stable)
+    container = first_container_start(args.docker)
     receipt = {'boot_id': boot, 'inference': results['inference'], 'delivery': results['delivery'],
                'ok': all(value == 'ok' for value in results.values()),
                'ufw_rules_loaded_monotonic': ufw, 'raw_step_monotonic': raw_time, 'raw_step_ok': raw_ok,
                'docker_start_monotonic': unit_time(args.systemctl, 'docker.service', 'ExecMainStartTimestampMonotonic'),
-               'first_container_monotonic': container, 'clock_continuous': stable,
+               'first_container_monotonic': container,
                'rules_before_first_container': rules_before_first_container(ufw, raw_time, raw_ok, container)}
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

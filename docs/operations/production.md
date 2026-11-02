@@ -1361,8 +1361,9 @@ The raw table is not in ufw's files because restoring them would flush Docker's 
 the raw chain in one `iptables-restore --noflush -T raw` (one kernel commit: a failure or a kill leaves the previous
 complete chain, never an empty one), adds the jump only after the chain is complete, bounds every command to 30 s
 (a command that ignores TERM is killed 2 s later), runs the whole hook, log and record included, under an outer bound of
-60 s (its failure record is written by a bounded child with no terminal and no pipe of the caller, and the supervising
-shell's own diagnostics go to /dev/null), logs and records a failure in `/var/lib/deedkit/raw-step.json` and still exits 0, so ufw and Docker start. The failure
+60 s (its failure record is written by a bounded child with no terminal and no pipe of the caller; the supervising
+shell's own diagnostics go to /dev/null, and the caller's stderr is restored only inside the supervised child, so no shell,
+dash included, can block on it), logs and records a failure in `/var/lib/deedkit/raw-step.json` and still exits 0, so ufw and Docker start. The failure
 shows in `verify` (`kernel_vs_repo table_differs:raw`), in the boot receipt and in the worker's own exit 78. The IPv6
 raw rule is the single `PREROUTING -i dk-inference0 -j DROP` of `rules()` (there is no IPv6 chain), added if absent.
 
@@ -1424,9 +1425,8 @@ The boot receipt (`/var/lib/deedkit/firewall-verify.json`, written at each boot)
 `verify` commands, `ufw_rules_loaded_monotonic` (ufw.service's `ExecMainExitTimestampMonotonic`), `raw_step_monotonic`
 (the step's own `/proc/uptime` on success and on failure), `docker_start_monotonic`, `first_container_monotonic` (the start of the earliest running container's main process this boot, from
 `/proc/PID/stat`, never from Docker's wall-clock times; a container that restarted shows its latest start; unknown when a
-container cannot be read, or when a stopped container that ever ran cannot be placed because the wall clock may have
-stepped since boot: `clock_continuous` compares the service manager's own boot pair, `UserspaceTimestamp` and its monotonic twin, which a
-docker restart does not move, with the clock now) and
+container cannot be read, and whenever a stopped container that ever ran exists, since without a reliable boot-wide
+clock mapping its start cannot be placed on this boot's clock) and
 `rules_before_first_container` = `yes`, `no` or `unknown` (unknown when a time is missing or a step failed). The times are
 seconds on one monotonic clock (the host does not suspend, so `/proc/uptime` equals it). A boot with no receipt for the
 current boot ID reads as `receipt unknown` in `verify --receipt-check`, never as ok. The first reboot that happens for
