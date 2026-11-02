@@ -315,7 +315,9 @@ def transcode_audio(profile,path,upload,duration,codec_args):
 
 
 def infer_audio(profile,path,mime,*,transport=None):
-    provider=profile['provider'];duration,codec,container=audio_probe(path,profile['max_audio_seconds'])
+    provider=profile['provider'];codec=container=None
+    if provider=='faster_whisper':duration=audio_duration(path,profile['max_audio_seconds'])
+    else:duration,codec,container=audio_probe(path,profile['max_audio_seconds'])
     if provider=='faster_whisper':
         try:from faster_whisper import WhisperModel
         except ImportError:raise ModelError('local_model_not_installed') from None
@@ -464,7 +466,7 @@ def prepare_image(profile,path):
                 if not out.is_file() or not 0<out.stat().st_size<=profile['max_input_bytes']:raise ModelError('invalid_image')
                 if out.stat().st_size<=IMAGE_BUDGET:break
             data=out.read_bytes()
-    except OSError:raise ModelError('invalid_image') from None
+    except OSError as exc:raise ModelError('invalid_image') from exc  # the cause stays in the traceback, never in the code
     flags.update(image_downscaled=True,image_over_budget=len(data)>IMAGE_BUDGET)
     return data,'image/jpeg',flags
 

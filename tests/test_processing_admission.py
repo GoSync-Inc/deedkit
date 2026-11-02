@@ -1,6 +1,7 @@
 """Admission protects independent scopes, native children and archive fences."""
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import base64
 import hashlib
 import json
 import os
@@ -31,7 +32,12 @@ def cloud_profile(tmp_path,kind='image'):
         'api_key_file':str(tmp_path/'unused-secret')},kind)
 
 
-def add_file(s,name,message='demo-tg-1',mime='audio/ogg',data=b'synthetic-audio'):
+# A real 1x1 PNG: the mini provider decodes a picture before it sends it (ANYM-696), so an image row needs one.
+PNG_1X1=base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==')
+
+
+def add_file(s,name,message='demo-tg-1',mime='audio/ogg',data=None):
+    data=data or (PNG_1X1 if mime.startswith('image/') else b'synthetic-audio')
     digest=hashlib.sha256(data).hexdigest();(s.files/digest).write_bytes(data)
     with s.pool.connection() as c:
         c.execute('INSERT INTO attachments(id,message,digest,filename,mime,bytes) VALUES(%s,%s,%s,%s,%s,%s)',
