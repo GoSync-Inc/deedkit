@@ -306,19 +306,106 @@ async def read_participants(op):
 
 async def read_message_info(op):
     exact_message, peer, chat, message_id = op.exact_message, op.peer, op.chat, op.message_id
-    return {'outcome': 'confirmed', **message_info(await exact_message(peer, chat, message_id))}
+    message = await exact_message(peer, chat, message_id, missing_ok=True)
+    if message is None:
+        # ANYM-666: a message the provider no longer returns is gone; a wrong ID or chat still fails as a mismatch.
+        return {'outcome': 'confirmed', 'exists': False, 'provider_message_id': str(message_id),
+                'provider_chat_id': str(chat), 'basis': 'live_provider_observation'}
+    return {'outcome': 'confirmed', 'exists': True, **message_info(message)}
+
+
+def reactions_update(response, chat, message_id):
+    """The UpdateMessageReactions of this message in a response, else None. An absent Update is not proof of empty reactions."""
+    for update in getattr(response, 'updates', [])[:100]:
+        if isinstance(update, types.UpdateMessageReactions) and update.msg_id == message_id and peer_id(update.peer) == str(chat):
+            return update
+    return None
 
 
 async def read_reactions(op):
     invoke, peer, chat, message_id = op.invoke, op.peer, op.chat, op.message_id
     response = await invoke(functions.messages.GetMessagesReactionsRequest(peer, [message_id]))
-    for update in getattr(response, 'updates', [])[:100]:
-        if isinstance(update, types.UpdateMessageReactions) and update.msg_id == message_id and peer_id(update.peer) == str(chat):
-            return {'outcome': 'confirmed', 'provider_message_id': str(message_id),
-                    'reactions': reaction_state(update.reactions)}
-    # An absent Update is not proof of empty reactions.
+    update = reactions_update(response, chat, message_id)
     return {'outcome': 'confirmed', 'provider_message_id': str(message_id),
-            'reactions': reaction_state(None)}
+            'reactions': reaction_state(update.reactions if update is not None else None)}
+
+
+def read_back_evidence(**fields):
+    return {'basis': 'provider_read_back', **fields}
+
+
+def flood_evidence(error):
+    return read_back_evidence(retry_after_s=error.seconds)
+
+
+async def delete_read_back(op, submitted):
+    """ANYM-666: one scoped read of the message the delete addressed. Total: only a definite answer changes the
+    submitted result; a read error, timeout or flood wait leaves it as it was (a cancellation propagates)."""
+    from .telegram_governor import ProviderRateLimited
+    peer, chat, message_id, client, rpc = op.peer, op.chat, op.message_id, op.client, op.rpc
+    try:
+        # The scalar `ids` form: a list returns [None] in Telethon 1.45, which must not read as "present".
+        message = await rpc(lambda: client.get_messages(peer, ids=message_id), scope='read_back')
+    except asyncio.CancelledError:
+        raise
+    except ProviderRateLimited as error:
+        return {**submitted, 'evidence': flood_evidence(error)}
+    except Exception:
+        return submitted
+    if message is None or isinstance(message, types.MessageEmpty):
+        return {'outcome': 'confirmed', 'basis': 'provider_read_back', 'effect_verified': True,
+                'evidence': {'message_present': False}}
+    if getattr(message, 'id', None) == message_id and str(getattr(message, 'chat_id', None)) == str(chat):
+        return {**submitted, 'evidence': read_back_evidence(message_present=True)}
+    return submitted
+
+
+def chosen_reactions(reactions):
+    """The reactions this account chose, or None when the list is not authoritative (missing or a partial `min` copy)."""
+    if not isinstance(reactions, types.MessageReactions) or reactions.min:
+        return None
+    return [item for item in reaction_state(reactions)['counts'] if item['chosen']]
+
+
+async def reaction_read_back(op, response, submitted):
+    """ANYM-666: settle a reaction from its own response, else from one scoped read; never a second mutation."""
+    from .telegram_governor import ProviderRateLimited
+    peer, chat, message_id, rpc, client = op.peer, op.chat, op.message_id, op.rpc, op.client
+    wanted = op.parameters['emoji']
+
+    def verdict(reactions, basis):
+        chosen = chosen_reactions(reactions)
+        if chosen is None:
+            return None
+        mine = any(item['type'] == 'emoji' and item['emoji'] == wanted for item in chosen)
+        if mine if wanted else not chosen:
+            return {'outcome': 'confirmed', 'basis': basis, 'effect_verified': True,
+                    'evidence': {'reaction_present': bool(wanted)}}
+        # Definite but negative: the requested state is not the provider's (removal: a reaction is still chosen).
+        return {**submitted, 'evidence': read_back_evidence(reaction_present=not wanted)}
+
+    def settled(source, basis):
+        # A malformed update (an absent result list, a bad peer) is no answer: the submitted result stays.
+        try:
+            update = reactions_update(source, chat, message_id)
+            return verdict(update.reactions, basis) if update is not None else None
+        except Exception:
+            return None
+
+    answer = settled(response, 'provider_response')
+    if answer is not None:
+        # The response is authoritative; a response that shows the reaction missing is not re-read.
+        return answer if answer['outcome'] == 'confirmed' else submitted
+    try:
+        read = await rpc(lambda: client(functions.messages.GetMessagesReactionsRequest(peer, [message_id])),
+                         scope='read_back')
+    except asyncio.CancelledError:
+        raise
+    except ProviderRateLimited as error:
+        return {**submitted, 'evidence': flood_evidence(error)}
+    except Exception:
+        return submitted
+    return settled(read, 'provider_read_back') or submitted
 
 
 async def read_topics(op):
@@ -514,14 +601,17 @@ async def write_edit_delete(op):
             return {'outcome': 'unknown', 'error': 'provider_result_unverified'}
         return accepted(response, message=True, chat=chat, message_id=message_id)
     response = await rpc(lambda: client.delete_messages(peer, [message_id], revoke=True), mutation=True)
-    return accepted(response)
+    submitted = accepted(response)
+    return await delete_read_back(op, submitted) if submitted['outcome'] == 'submitted' else submitted
 
 
 async def write_reaction(op):
     parameters, accepted, invoke, peer, message_id = op.parameters, op.accepted, op.invoke, op.peer, op.message_id
     reactions = [types.ReactionEmoji(parameters['emoji'])] if parameters['emoji'] else []
-    return accepted(await invoke(functions.messages.SendReactionRequest(peer, message_id,
-        big=False, add_to_recent=False, reaction=reactions), mutation=True))
+    response = await invoke(functions.messages.SendReactionRequest(peer, message_id,
+        big=False, add_to_recent=False, reaction=reactions), mutation=True)
+    submitted = accepted(response)
+    return await reaction_read_back(op, response, submitted) if submitted['outcome'] == 'submitted' else submitted
 
 
 async def write_vote(op):
@@ -945,7 +1035,9 @@ async def _execute(client, job, *, verified_self=None, governor=None):
         async def guarded():
             nonlocal started_mutation
             check_expiry()
-            preflight = job.get('_preflight')
+            # ANYM-666: the read-back after a mutation runs the governor and the expiry check, not the dispatch
+            # preflight: its saved-state rules (a message the archive already marks deleted) describe the request.
+            preflight = None if scope == 'read_back' else job.get('_preflight')
             if preflight is not None:
                 if not callable(preflight):
                     reject('operation_access_changed')
@@ -977,8 +1069,10 @@ async def _execute(client, job, *, verified_self=None, governor=None):
             reject('invalid_parameters')
         return utils.get_input_user(candidate)
 
-    async def exact_message(peer, chat, message_id, *, own=False):
+    async def exact_message(peer, chat, message_id, *, own=False, missing_ok=False):
         message = await rpc(lambda: client.get_messages(peer, ids=message_id))
+        if missing_ok and (message is None or isinstance(message, types.MessageEmpty)):
+            return None
         if (message is None or getattr(message, 'id', None) != message_id or
                 str(getattr(message, 'chat_id', None)) != str(chat)):
             reject('provider_reference_mismatch')
