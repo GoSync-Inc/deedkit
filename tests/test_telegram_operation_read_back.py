@@ -42,10 +42,27 @@ class ReadBackClient(Client):
         self.read_error = None
         self.after_delete = None
         self.deleted = False
+        self.stall = False  # the read-back never answers; `cancelled` records that the worker's timeout reached it
+        self.cancelled = False
+
+    async def hang(self):
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+    async def __call__(self, request):
+        if self.stall and isinstance(request, functions.messages.GetMessagesReactionsRequest):
+            self.calls.append(request)
+            await self.hang()
+        return await super().__call__(request)
 
     async def get_messages(self, peer, *, ids):
         self.calls.append(('get_messages', peer, ids))
         if self.deleted:
+            if self.stall:
+                await self.hang()
             if self.read_error is not None:
                 raise self.read_error
             return self.message if self.present else None
@@ -130,6 +147,39 @@ def test_delete_stays_unknown_when_the_read_back_fails(operator, error):
     assert receipt['result']['outcome'] == 'submitted'
     assert receipt['result']['data'] == {'basis': 'provider_request_returned', 'effect_verified': False}
     assert receipt['verify']['operation'] == 'get_message_info'
+    assert len(client.mutations()) == 1
+
+
+# spec: ANYM-666
+@pytest.mark.parametrize('operation', ['delete_message', 'send_reaction'])
+def test_stalled_read_back_is_cut_by_the_worker_timeout_and_stays_unknown(operator, monkeypatch, operation):
+    original = asyncio.wait_for
+
+    async def short(awaitable, timeout):
+        return await original(awaitable, 0.5 if timeout == 30 else timeout)  # the worker's 30 s operation timeout
+    monkeypatch.setattr(asyncio, 'wait_for', short)
+    client = ReadBackClient()
+    client.stall = True
+    receipt = run(operator, client, operation, {'emoji': '👍'} if operation == 'send_reaction' else None)
+    assert receipt['status'] == 'unknown' and receipt['error_code'] == 'operation_result_unknown'
+    assert client.cancelled  # the cancellation reached the read-back and was not swallowed
+    assert len(client.mutations()) == 1
+    s = operator[0]
+    with s.pool.connection() as c:
+        assert c.execute('SELECT count(*) AS n FROM messenger_commands').fetchone()['n'] == 1
+
+
+# spec: ANYM-666
+def test_reaction_with_a_malformed_update_keeps_submitted(operator):
+    client = ReadBackClient()
+    bad = types.UpdateMessageReactions(peer=types.PeerUser(100), msg_id=1,
+        reactions=types.MessageReactions(results=None))
+    client.responses[functions.messages.SendReactionRequest] = updates(bad)
+    client.responses[functions.messages.GetMessagesReactionsRequest] = updates(bad)
+    receipt = run(operator, client, 'send_reaction', {'emoji': '👍'})
+    assert receipt['status'] == 'unknown' and receipt['error_code'] == 'operation_result_unknown'
+    assert receipt['result']['outcome'] == 'submitted'
+    assert receipt['result']['data'] == {'basis': 'provider_request_returned', 'effect_verified': False}
     assert len(client.mutations()) == 1
 
 

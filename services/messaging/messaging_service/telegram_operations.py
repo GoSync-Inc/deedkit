@@ -384,8 +384,15 @@ async def reaction_read_back(op, response, submitted):
         # Definite but negative: the requested state is not the provider's (removal: a reaction is still chosen).
         return {**submitted, 'evidence': read_back_evidence(reaction_present=not wanted)}
 
-    update = reactions_update(response, chat, message_id)
-    answer = verdict(update.reactions, 'provider_response') if update is not None else None
+    def settled(source, basis):
+        # A malformed update (an absent result list, a bad peer) is no answer: the submitted result stays.
+        try:
+            update = reactions_update(source, chat, message_id)
+            return verdict(update.reactions, basis) if update is not None else None
+        except Exception:
+            return None
+
+    answer = settled(response, 'provider_response')
     if answer is not None:
         # The response is authoritative; a response that shows the reaction missing is not re-read.
         return answer if answer['outcome'] == 'confirmed' else submitted
@@ -398,8 +405,7 @@ async def reaction_read_back(op, response, submitted):
         return {**submitted, 'evidence': flood_evidence(error)}
     except Exception:
         return submitted
-    update = reactions_update(read, chat, message_id)
-    return (verdict(update.reactions, 'provider_read_back') if update is not None else None) or submitted
+    return settled(read, 'provider_read_back') or submitted
 
 
 async def read_topics(op):

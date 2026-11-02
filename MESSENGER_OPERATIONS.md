@@ -133,7 +133,7 @@ After the one accepted request, `delete_message` and `send_reaction` on Telegram
 bounded read of the state they addressed (a scoped provider read inside the operation's
 own 30-second timeout) and settle from it:
 
-- Delete: the message is gone (`result.data`: `outcome: confirmed`, `basis: provider_read_back`,
+- Delete: the message is gone (`result.outcome: confirmed`; `result.data`: `basis: provider_read_back`,
   `effect_verified: true`, `evidence.message_present: false`) and the receipt is `succeeded`
   with no error code. Still there: `unknown`, `evidence.message_present: true`.
 - Reaction: `succeeded` when the response (`basis: provider_response`) or one
@@ -142,8 +142,10 @@ own 30-second timeout) and settle from it:
   absent reaction update never confirms. A read-back that shows the reaction not set adds
   `evidence.reaction_present`.
 - A read error, a timeout or a flood wait leaves exactly the previous result (`unknown`,
-  `operation_result_unknown`); a flood wait adds `evidence.retry_after_s`, and the scoped
-  read never pauses sends. Nothing is re-sent: one mutating request per command.
+  `operation_result_unknown`); a flood wait adds `evidence.retry_after_s`. A flood wait of up
+  to 3600 s on the scoped read pauses only that read scope, not sends; a longer one, or another
+  420 error, still pauses the account as the governor does for any request. Nothing is re-sent:
+  one mutating request per command.
 
 `succeeded` means the message is gone or the reaction is in the stated state, not that this
 request caused it (the owner may have acted by hand first). Receipts settled before this
