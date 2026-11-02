@@ -575,10 +575,10 @@ policy naming the action; roll back in the reverse order.
 
 `list_contacts` on a Telegram account takes an optional `query` besides `limit` and `offset`
 (`contacts-read`, full-account key; WhatsApp does not accept it). One call reads the account's
-contact book once from Telegram (one `GetContactsRequest`, method-scoped FloodWait handling,
-read-only, never retried when uncertain); the query then filters it in the service:
+contact book once from Telegram (one `GetContactsRequest`; FloodWait handling is unchanged: the
+governor pauses the whole account; read-only, never retried when uncertain); the query then filters it in the service:
 
-- 1-64 characters, not blank (`@` alone is blank), no control characters; a bad value is refused before any
+- 1-64 characters after trimming, not blank (`@` alone is blank), no control characters (tab and newline included); a bad value is refused before any
   provider call with a `field_errors` entry for `query`.
 - Normalized like `search_people` (NFC, whitespace collapsed, lowercase, leading `@` dropped) and matched as a
   literal substring of the display name (first and last name) and the username. ё and е are one letter. A Latin

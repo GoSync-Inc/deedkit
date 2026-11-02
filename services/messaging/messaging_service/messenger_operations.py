@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import json
 import math
 import re
+import unicodedata
 
 from .field_errors import FIELD_NAME, field_error, one_per_field
 from .name_variants import normalize
@@ -425,6 +426,20 @@ def parameter_format(platform, kind):
         'label_ids': 'up to 20 unique label IDs of 1-64 letters, digits, _ or -, from get_labels'}.get(kind)
 
 
+def _contact_query_problem(value):
+    """ANYM-673: 1-64 characters after trim, no control character (tab, newline and C1 included), not only an @."""
+    def fail(reason, expected): return [field_error('query', reason, expected)]
+    if not isinstance(value, str): return fail('type', 'string')
+    try: value.encode('utf-8')
+    except UnicodeError: return fail('format', 'valid Unicode text')
+    if any(unicodedata.category(c) == 'Cc' for c in value):
+        return fail('pattern', 'no control characters')
+    text = value.strip()
+    if not normalize(text): return fail('blank', 'non-blank text')
+    if len(text) > 64: return fail('max_length', 'at most 64 characters after trimming')
+    return None
+
+
 def _problem(platform, descriptor, value, field):
     """First failing check for one parameter as a field error, or None when valid."""
     kind = descriptor['type']
@@ -541,9 +556,9 @@ def validate_operation(platform, operation, parameters, *, provider=None):
                 if descriptor['default'] is None: continue
                 value = deepcopy(descriptor['default'])
             else: value = parameters[name]
-            problem = _problem(platform, descriptor, value, name)
+            problem = _contact_query_problem(value) if (operation, name) == ('list_contacts', 'query') else _problem(platform, descriptor, value, name)
             if problem: errors.extend(problem)
-            else: output[name] = (phone_digits(value)[0] if descriptor['type'] == 'phone_number' else
+            else: output[name] = (value.strip() if (operation, name) == ('list_contacts', 'query') else phone_digits(value)[0] if descriptor['type'] == 'phone_number' else
                 chat_link_key(platform, value) if descriptor['type'] == 'chat_link' else
                 telegram_username(value) if descriptor['type'] == 'telegram_username' else
                 timestamp(value) if descriptor['type'] == 'timestamp' else value)
@@ -564,8 +579,6 @@ def validate_operation(platform, operation, parameters, *, provider=None):
     if operation == 'send_file' and (('attachment_id' in output)+('upload_id' in output)!=1):
         raise ParameterError(field_error('upload_id' if 'upload_id' in output else 'attachment_id',
             'unique' if 'upload_id' in output else 'required', 'exactly one of attachment_id or upload_id'))
-    if operation == 'list_contacts' and platform == 'telegram' and 'query' in output and not normalize(output['query']):
-        raise ParameterError(field_error('query', 'blank', 'non-blank text'))
     if operation == LIVE_SEARCH and 'from_time' in output and 'to_time' in output and (
             datetime.fromisoformat(output['from_time']) >= datetime.fromisoformat(output['to_time'])):
         raise ParameterError(field_error('to_time', 'minimum', 'later than from_time'))

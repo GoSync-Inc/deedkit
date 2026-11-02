@@ -540,8 +540,17 @@ def test_list_contacts_query_is_refused_before_any_provider_call(query):
 
 
 # spec: ANYM-673
+def test_list_contacts_query_length_counts_characters_after_trim():
+    from messaging_service.messenger_operations import validate_operation
+    for query in (' ' + 'x' * 64 + ' ', '😀' * 64, '\u00a0' + 'я' * 64):
+        assert validate_operation('telegram', 'list_contacts', {'query': query})['query'] == query.strip()
+    assert found(contact_book(*BOOK), '  anna  ')[0] == ['202']
+
+
+# spec: ANYM-673
 @pytest.mark.parametrize('query, reason', [('', 'blank'), ('   ', 'blank'), ('@', 'blank'), ('x' * 65, 'max_length'),
-                                           ('a\x00b', 'pattern'), (7, 'type'), (None, 'type'), (['a'], 'type')])
+                                           ('a\x00b', 'pattern'), (7, 'type'), (None, 'type'), (['a'], 'type'),
+                                           ('a\tb', 'pattern'), ('a\nb', 'pattern'), ('a\x9bb', 'pattern'), (' ' + 'x' * 65 + ' ', 'max_length')])
 def test_list_contacts_query_refusal_names_the_field(query, reason):
     from messaging_service.messenger_operations import ParameterError, validate_operation
     with pytest.raises(ParameterError) as error:
@@ -560,7 +569,7 @@ def test_the_query_parameter_is_telegram_only_and_published_with_its_limits():
     assert 'query' not in whatsapp['parameters_schema']
     with pytest.raises(ParameterError):
         validate_operation('whatsapp', 'list_contacts', {'query': 'anna'})
-    assert validate_operation('telegram', 'list_contacts', {'query': ' Анна '})['query'] == ' Анна '
+    assert validate_operation('telegram', 'list_contacts', {'query': ' Анна '})['query'] == 'Анна'
 
 
 def test_private_participant_queries_do_not_claim_a_group_member_list():
