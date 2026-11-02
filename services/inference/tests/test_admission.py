@@ -23,6 +23,30 @@ def started():
     return [e[1] for e in fake.EVENTS if e[0] == "start"]
 
 
+# spec: ANYM-683
+def test_available_memory_counts_free_inactive_and_speculative_pages(monkeypatch):
+    """The mini at 08:55 on 11-02: free 4.05 GiB, inactive 3.42, speculative 1.99. Without the speculative pages the
+    figure read 7.47, under the 7.5 GB a cold vision start needs, so vision was refused `memory_low` about half
+    the time with nothing running; the research guard and scripts/remote-test.sh both count them."""
+    import subprocess
+    import sys
+
+    vm_stat = ("Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+               "Pages free:                             265294.\n"
+               "Pages active:                           297958.\n"
+               "Pages inactive:                         224065.\n"
+               "Pages speculative:                      130216.\n"
+               "Pages wired down:                       118464.\n")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=vm_stat))
+    pages = 265294 + 224065 + 130216
+    assert SystemProbe._read_available() == pytest.approx(pages * 16384 / 1024**3)
+    assert SystemProbe._read_available() > 7.5 + 1.0  # a cold vision start (4.5 + 3.0) is admitted with room to spare
+    # An unreadable answer fails closed.
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="garbage"))
+    assert SystemProbe._read_available() == 0.0
+
+
 # spec: ANYM-682
 async def test_each_admission_rule_refuses_with_its_own_reason(env):
     big = {"vision-default": {"phases": [{"name": "vlm", "slot": "gpu", "resident_gb": 7.0}]}}

@@ -167,7 +167,7 @@ A job is checked when it arrives and again when it leaves the queue to start a p
 | `busy_between`, `busy_deedkit_ci` | the busy file says Between or a DeedKit remote test is running |
 | `busy_file_missing`, `busy_file_invalid`, `busy_file_stale` | the busy file is missing, unparseable, or older than 30 s (fail closed) |
 | `load_high` | the 1-minute load average is above `max_load_1m` (or the slot's override) |
-| `memory_low` | free plus inactive memory is below the phase's `resident_gb` plus `min_free_gb`; every phase is charged in full, also one of a warm worker. A running phase's full `resident_gb` is held back from the figure the next phase sees until that phase ends (a drop of the free memory is not taken as that phase's allocation: the probe cannot tell whose it is); a phase that has to wait for it waits in the queue |
+| `memory_low` | free plus inactive plus speculative memory (`vm_stat`, as `scripts/remote-test.sh` counts it) is below the phase's `resident_gb` plus `min_free_gb`; every phase is charged in full, also one of a warm worker. A running phase's full `resident_gb` is held back from the figure the next phase sees until that phase ends (a drop of the free memory is not taken as that phase's allocation: the probe cannot tell whose it is); a phase that has to wait for it waits in the queue |
 | `resident_cap` | the phase alone does not fit `resident_cap_gb` |
 
 Resident accounting (`resident_cap_gb`, idle loaded engines count): when the only blocker is an idle loaded
