@@ -1,17 +1,17 @@
 """Owner-only resume of a diagnosed connection block. No pairing or message sends."""
 import argparse
 from pathlib import Path
-import re
 
 import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from .identifiers import ACCOUNT_RE
 from .enrichment_providers import private_text
 
 
 def resume(c,account):
-    if not isinstance(account,str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',account):
+    if not isinstance(account,str) or not ACCOUNT_RE.fullmatch(account):
         raise ValueError('invalid_account')
     row=c.execute('SELECT operations,clock_timestamp() AS observed FROM collector_health '
         'WHERE account=%s FOR UPDATE',(account,)).fetchone()

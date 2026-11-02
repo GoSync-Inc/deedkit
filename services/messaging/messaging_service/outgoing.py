@@ -10,6 +10,7 @@ import time
 
 from psycopg.types.json import Jsonb
 
+from .identifiers import ACCOUNT_RE, SEND_ID_RE, WA_CHAT_RE
 from .envelope import canonical, stable_id
 from .policy import audit, effective_permissions, lock_principal, targets
 from .store import APIError, serial
@@ -231,7 +232,7 @@ def archive_reference(job,receipt):
         not all(isinstance(v,str) and 1<=len(v)<=256 for v in ref.values())):
         raise RuntimeError('send_receipt_mismatch')
     chat,mid=ref['provider_chat_id'],ref['provider_message_id']
-    if not re.fullmatch(r'[a-zA-Z0-9_.:-]{1,140}@(c\.us|g\.us|lid)',chat):
+    if not WA_CHAT_RE.fullmatch(chat):
         raise RuntimeError('send_receipt_mismatch')
     def suffix(target,value):
         prefix='true_'+target+'_'
@@ -258,10 +259,10 @@ def validate_send_receipt(value):
     from .envelope import utc
     if (not isinstance(value,dict) or set(value)!={'kind','account','send_id','requested_chat',
         'provider_message_id','archive_reference','observed_at'} or value['kind']!='outgoing_send_receipt'
-        or not isinstance(value['account'],str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',value['account'])
-        or not isinstance(value['send_id'],str) or not re.fullmatch(r'send_[a-f0-9]{32}',value['send_id'])
+        or not isinstance(value['account'],str) or not ACCOUNT_RE.fullmatch(value['account'])
+        or not isinstance(value['send_id'],str) or not SEND_ID_RE.fullmatch(value['send_id'])
         or not isinstance(value['requested_chat'],str) or
-        not re.fullmatch(r'[a-zA-Z0-9_.:-]{1,140}@(c\.us|g\.us|lid)',value['requested_chat'])
+        not WA_CHAT_RE.fullmatch(value['requested_chat'])
         or not isinstance(value['provider_message_id'],str)):
         raise ValueError('invalid_send_receipt')
     try:
@@ -424,7 +425,7 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
 
 
 def status(c,p,send_id):
-    if not isinstance(send_id,str) or not re.fullmatch(r'send_[a-f0-9]{32}',send_id):
+    if not isinstance(send_id,str) or not SEND_ID_RE.fullmatch(send_id):
         raise APIError('not_found',404)
     row=c.execute('SELECT * FROM outgoing_messages WHERE id=%s AND principal=%s',(send_id,p['id'])).fetchone()
     if not row or not permitted(p,row['account'],row['chat']):raise APIError('not_found',404)

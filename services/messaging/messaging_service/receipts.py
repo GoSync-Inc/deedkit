@@ -5,6 +5,7 @@ import re
 
 from psycopg.types.json import Jsonb
 
+from .identifiers import ACCOUNT_RE, WA_CHAT_RE
 from .envelope import canonical, utc
 
 RANK={'unknown':-2,'pending':-1,'error':0,'server':1,'delivered':2,'read':3,'played':4}
@@ -43,7 +44,7 @@ REFERENCE_TG_SQL='''SELECT r.state,r.basis,r.audience,r.observed_at FROM message
 def validate_capture(value):
     if not isinstance(value,dict) or set(value)!=FIELDS or value['kind']!='message_receipt':
         raise ValueError('invalid_receipt')
-    if not isinstance(value['account'],str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',value['account']):
+    if not isinstance(value['account'],str) or not ACCOUNT_RE.fullmatch(value['account']):
         raise ValueError('invalid_receipt_account')
     chat=value['chat']
     if value['provider_at'] is not None:raise ValueError('unsupported_receipt_provider_time')
@@ -55,7 +56,7 @@ def validate_capture(value):
                 or value['audience']!='private_peer'):
             raise ValueError('invalid_receipt_reference')
     elif value['platform']=='whatsapp':
-        if not isinstance(chat,str) or not re.fullmatch(r'[a-zA-Z0-9_.:-]{1,140}@(c\.us|g\.us|lid)',chat):
+        if not isinstance(chat,str) or not WA_CHAT_RE.fullmatch(chat):
             raise ValueError('invalid_receipt_chat')
         reference=value['provider_id']
         prefix='true_'+chat+'_'

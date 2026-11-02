@@ -95,6 +95,21 @@ def test_every_identifier_copy_is_canonical_or_a_listed_variant():
 
 
 # spec: ANYM-286
+def test_python_identifier_bodies_live_in_identifiers_py():
+    from messaging_service import identifiers
+    found = _inventory()
+    assert identifiers.ACCOUNT_RE.pattern == next(iter(CANONICAL['account']))
+    assert identifiers.WA_CHAT_RE.pattern == next(iter(CANONICAL['chat']))
+    assert identifiers.SEND_ID_RE.pattern == next(iter(CANONICAL['send_id']))
+    # Chat and send IDs: no other Python module spells the body. Account names: the same body also checks other
+    # names (archive worker owner, commands result keys, policy principals, consumers), which are not accounts.
+    assert found['chat'][next(iter(CANONICAL['chat']))]['py'] == {'identifiers.py'}
+    assert found['send_id'][next(iter(CANONICAL['send_id']))]['py'] == {'identifiers.py'}
+    assert found['account'][next(iter(CANONICAL['account']))]['py'] == {
+        'identifiers.py', 'archive.py', 'commands.py', 'policy.py', 'store.py', 'update_queries.py'}
+
+
+# spec: ANYM-286
 def test_canonical_chat_account_and_send_patterns_accept_and_refuse_the_same_samples():
     # Python is the one engine run here; the bodies above are textually identical in JS and Go, and use only
     # classes, bounds, groups and alternation, which the three engines read alike.

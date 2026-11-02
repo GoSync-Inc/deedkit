@@ -5,14 +5,14 @@ Every function keeps the order of the statements it replaced, so the first faili
 effect stay where they were in each collector.
 """
 import asyncio
-import re
+from .identifiers import ACCOUNT_RE
 
 
 def validate_common(cfg,fields):
     """The first three checks of both collector configurations: known keys only, enabled, a valid account."""
     if not isinstance(cfg,dict) or set(cfg)-fields: raise ValueError('invalid_collector_config')
     if cfg.get('enabled') is not True: raise RuntimeError('collector_disabled')
-    if not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',cfg.get('account','')): raise ValueError('invalid_account')
+    if not ACCOUNT_RE.fullmatch(cfg.get('account','')): raise ValueError('invalid_account')
 
 
 def validate_ranges(cfg,ranges):
