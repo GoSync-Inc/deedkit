@@ -49,11 +49,11 @@ def test_untrusted_or_incomplete_junit_is_rejected(tmp_path, xml):
 
 # spec: ANYM-429
 def test_a_report_past_the_old_ten_thousand_case_bound_is_accepted_up_to_the_new_one(tmp_path):
-    from scripts.tiden_ci import MAX_JUNIT_CASES
-    assert MAX_JUNIT_CASES > 10000
     cases = lambda count: "".join(f'<testcase name="t{i}" classname="tests.test_sample" file="tests/test_sample.py"/>' for i in range(count))
     _, counts = normalize_junit(report(tmp_path, f"<testsuite>{cases(10001)}</testsuite>"), tmp_path, "python")
     assert counts == Counter(passed=10001)
+    from scripts.tiden_ci import MAX_JUNIT_CASES
+    assert MAX_JUNIT_CASES > 10000
     _, counts = normalize_junit(report(tmp_path, f"<testsuite>{cases(MAX_JUNIT_CASES)}</testsuite>"), tmp_path, "python")
     assert counts == Counter(passed=MAX_JUNIT_CASES)
     with pytest.raises(ValueError, match="bounded"):
