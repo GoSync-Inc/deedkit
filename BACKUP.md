@@ -504,8 +504,8 @@ age 0). The age counts from the snapshot, never from a delivery retry.
   not stop the second). The latest admitted start (23:59:59) plus `TimeoutStartSec` plus 2 x `TimeoutStopSec` ends at
   01:50, long before the next 16:00. It repairs a failed 16:00 run as well as a skipped one. Exclusion with
   messaging's 18:00 run and a deploy is the runner's host lock, as for the daily run. Residual: a 16:00 run that
-  failed, followed by a host that is down at 19:15 and up the next morning, waits for the next 16:00 run (24 h, under
-  the 29 h alert).
+  failed, followed by a host that is down at 19:15 and up the next morning, waits for the next 16:00 run: the newest
+  snapshot is then about 48 h old at that run, so `status` shows STALE from 29 h until that run makes it up.
 
 A skipped 16:00 start no longer waits for the next day. The daily unit, its 16:02 admission and the 16:00 timer are
 unchanged. Host install: `docs/operations/production.md`, "Calendar backup freshness and same-night catch-up".
