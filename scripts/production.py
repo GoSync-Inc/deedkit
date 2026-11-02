@@ -4262,11 +4262,8 @@ def newest_attested_candidate(mirror, state, http_state, base, head, attested):
     return None
 
 
-def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, configs):
-    state, http_state = Path(settings["state_directory"]), Path(http["state_directory"])
-    # A tool update that stopped between `activating` and `active` is settled before anything else.
-    if reconciled := reconcile_tool(settings, configs, s, dry_run=dry_run, halt=halt):
-        return reconciled
+def deploy_receipt(state, halt):
+    """The previous deploy receipt and its counters: `(halted, None)` when it is malformed, else `(None, counters)`."""
     try:
         last = read(state / "deploy.json") if (state / "deploy.json").exists() else {}
         started, failures, misses, waits = deploy_counts(last)
@@ -4274,7 +4271,205 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
         if type(gated) is not int or gated < 0:
             raise ValueError("migration wait count")
     except (ValueError, TypeError, AttributeError, KeyError):
-        return halt(f"the previous deploy receipt {state / 'deploy.json'} is malformed; inspect it")
+        return halt(f"the previous deploy receipt {state / 'deploy.json'} is malformed; inspect it"), None
+    return None, (last, started, failures, misses, waits, gated)
+
+
+def deploy_fetch_main(state, base, serving, last, failures, dry_run, halt):
+    """Read main's head: `(result, None)` ends the run (a failed read or a pause), else `(None, mirror)`; the mirror is
+    None when everything already serves main."""
+    try:
+        # Every failure here precedes any change: this run does nothing, and the third in a row pauses.
+        head = remote_main()
+        mirror = None if head == base == serving["sha"] else main_history(state)
+    except Exception as exc:
+        message, failures = (str(exc) if isinstance(exc, Refused) else type(exc).__name__), failures + 1
+        rest = {key: value for key, value in last.items() if key != "fetch_failures"}
+        if failures >= FETCH_FAILURES:
+            if not dry_run:
+                write(state / "deploy.json", rest)
+            return halt(f"git could not read main {failures} times in a row, last: {message}; "
+                        f"inspect the network and {state / 'deploy-source.git'}"), None
+        if not dry_run:
+            write(state / "deploy.json", {**rest, "fetch_failures": {"count": failures, "at": now(), "reason": message}})
+        return {"status": "fetch_failed", "reason": message, "failures": failures}, None
+    if "fetch_failures" in last and not dry_run:
+        write(state / "deploy.json", {key: value for key, value in last.items() if key != "fetch_failures"})
+    return None, mirror
+
+
+def deploy_candidate(state, http_state, mirror, base, head, serving, last, misses, attested, dry_run, halt):
+    """The release this run deploys and the commit it starts from: `(result, None, None)` ends the run, else
+    `(None, candidate, since)`."""
+    if unsettled := unsettled_migrations(state):
+        # An unattended migration may have changed the database before its plan A ran: that release is finished
+        # first, whatever main took since (ANYM-449 M4).
+        if len(unsettled) != 1 or serving["sha"] != base or unsettled[0] == base or not on_main(mirror, base, unsettled[0]):
+            return halt("an unattended migration is unsettled: " + ", ".join(unsettled) + "; inspect its migration.json"), None, None
+        candidate, since = unsettled[0], base
+    elif serving["sha"] != base:
+        # Plan A is ahead of the HTTP pair: a deploy whose HTTP release stopped before any change, or plan A applied
+        # by hand.
+        candidate, since = base, serving["sha"]
+    else:
+        try:
+            candidate = newest_attested_candidate(mirror, state, http_state, base, head, attested)
+        except Unreachable as exc:
+            # GHCR could not be read: no older commit is taken instead; nothing changed.
+            if misses + 1 >= FETCH_FAILURES:
+                return halt(f"GHCR or git could not be read {misses + 1} times in a row, last: {exc}"), None, None
+            if not dry_run:
+                write(state / "deploy.json", {**{key: value for key, value in last.items() if key != "unreachable"},
+                                              "unreachable": {"count": misses + 1, "at": now(), "reason": str(exc)}})
+            return {"status": "error", "reason": f"{exc}; nothing changed, the next run retries"}, None, None
+        if candidate is None:
+            if "unreachable" in last and not dry_run:
+                write(state / "deploy.json", {key: value for key, value in last.items() if key != "unreachable"})
+            return {"status": "waiting", "reason": "no newer main commit has attested images yet", "sha": base}, None, None
+        since = base
+    return None, candidate, since
+
+
+def deploy_plan(settings, s, configs, mirror, base, since, candidate, sql, pending, dry_run, halt):
+    """The migration plans of the range: `(result, None)` ends the run (a tool update or a pause), else `(None, plans)`."""
+    # M1 (ANYM-449, ANYM-586 K3): a messaging or calendar range migrate-expand may run without a person migrates
+    # instead of pausing.
+    plans = migration_plans(settings, mirror, since, candidate, sql) if sql and not pending and candidate != base else None
+    if (reasons := [] if plans else pause_text(sql, pending, migration_classes(mirror, since, candidate, sql))) and not sql and set(pending) <= TOOL_FILES.keys():
+        # Only the tool pair waits for an install: the self-updating layout installs it, when this run is its tool.
+        try:
+            tool = installed_tool()
+        except Refused as exc:
+            tool = reasons.append(f"the tool does not update itself: {exc}")
+        if tool and [blob(RUNNING), blob(s.__file__)] != [tool["blobs"][path] for path in TOOL_FILES]:
+            tool = reasons.append(f"the tool does not update itself: this run is not {TOOL_ROOT / 'current'}")
+        if tool:
+            return update_tool(settings, configs, s, mirror, candidate, base, tool, dry_run=dry_run, halt=halt), None
+    if reasons:
+        return halt("; ".join(reasons), sha=candidate), None
+    return None, plans
+
+
+def deploy_closers(record, state, misses, halt):
+    """The two ways a started deploy ends: `finish` records a status, `retry` a change-free error."""
+    def finish(status, **fields):
+        record.update(status=status, finished_at=now(), **fields)
+        write(state / "deploy.json", record)
+        return record
+    def retry(exc, message):
+        # A network error changed nothing; git or GHCR failing to be read the third run in a row pauses.
+        if isinstance(exc, Unreachable):
+            if misses + 1 >= FETCH_FAILURES:
+                return finish(**halt(f"GHCR or git could not be read {misses + 1} times in a row, last: {message}"))
+            record["unreachable"] = {"count": misses + 1, "at": now(), "reason": message}
+        return finish("error", reason=message + "; nothing changed, the next run retries")
+    return finish, retry
+
+
+def deploy_plan_a(settings, http, plans, mirror, base, serving, candidate, release, gated, waits, halt, finish, retry):
+    """Plan A: migrations, preparation and apply, with the rollback of an unhealthy apply. None: applied and healthy."""
+    migrated = False
+    try:
+        # M2 admission (read-only) before preparation; a run that finds migration.json resumes from it (M4).
+        if plans and not (migrated := resumed_migration(settings, plans, candidate, release)):
+            for plan in plans:
+                migration_gate(settings, http, plan, mirror, base, serving["sha"])
+        if not (release / "prepared.json").exists():
+            if release.exists():
+                return finish(**halt(f"an earlier preparation of {candidate} did not finish; inspect {release}"))
+            prepare(settings, candidate)
+        if plans and not migrated:
+            migrate(settings, http, plans, mirror, base, serving["sha"], candidate, release)
+            migrated = True
+        apply(settings, candidate)
+    except Exception as exc:
+        message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+        if isinstance(exc, MigrationRefused):
+            return finish(**halt(message))
+        if isinstance(exc, MigrationWait) and not (release / "attempted.json").exists():
+            if gated + 1 >= MIGRATION_WAITS:
+                return finish(**halt(f"the migration of {candidate} waited {gated + 1} runs in a row: {message}"))
+            return finish("waiting", reason=message + "; nothing changed, the next run retries",
+                          migration_waits={"count": gated + 1, "at": now(), "reason": message})
+        if migrated:
+            assert plans
+            message += " (" + " and ".join(f"{plan['database']} is already at schema {plan['target']}"
+                                           for plan in plans) + ")"
+        if isinstance(exc, (CallActive, CallsUnknown)) and not (release / "attempted.json").exists():
+            # Nothing was stopped: the prepared release waits for a later run; the fourth wait in a row pauses.
+            if waits + 1 >= CALL_WAITS:
+                return finish(**halt(f"plan A of {candidate} waited {waits + 1} runs in a row for calls: {message}; "
+                                     "inspect the calls service"))
+            return finish("waiting", reason=message + "; nothing changed, the next run retries",
+                          call_waits={"count": waits + 1, "at": now(), "reason": message})
+        if not (release / "attempted.json").exists():
+            # A network or quota error before preparation started or after it finished changed nothing.
+            if transient(exc) and ((release / "prepared.json").exists() or not release.exists()):
+                return retry(exc, message)
+            return finish(**halt(f"plan A of {candidate} was refused before any change: {message}"))
+        result = read(release / "result.json") if (release / "result.json").exists() else {}
+        if result.get("status") != "unhealthy":
+            return finish(**halt(f"plan A of {candidate} stopped in an unknown state: {message}; inspect it"))
+        # The previous release still fits: a range either leaves the SQL inventory alone (pause_reasons) or only
+        # expands the schema (ANYM-449 M5), and the base runs on the target schema; a migration is never reversed.
+        try:
+            rollback(settings, candidate, http)
+        except Exception as again:
+            detail = str(again) if isinstance(again, Refused) else type(again).__name__
+            return finish(**halt(f"plan A of {candidate} failed its health wait and its rollback failed: {detail}; "
+                                 "production state is unknown, inspect it"))
+        if migrated:
+            assert plans
+            named = len(plans) > 1 or plans[0]["database"] != AUTO_DATABASE
+            def schemas(text):
+                return " and ".join((f"{plan['database']} " if named else "") + text.format(**plan) for plan in plans)
+            return finish(**halt(f"plan A of {candidate} failed its health wait after migrating "
+                                 f"{schemas('schema {base} to {target}')}; rolled back to {base} on "
+                                 f"{schemas('schema {target}')}", status="rolled-back"))
+        return finish(**halt(f"plan A of {candidate} failed its health wait; rolled back to {base}",
+                             status="rolled-back"))
+    return None
+
+
+def deploy_plan_b(http, s, http_state, candidate, halt, finish, retry):
+    """Plan B (the HTTP pair): `(result, None)` ends the run, else `(None, served)`."""
+    try:
+        if not (http_state / candidate / "http-prepared.json").exists():
+            if (http_state / candidate).exists():
+                return finish(**halt(f"an earlier HTTP preparation of {candidate} did not finish; inspect it")), None
+            s.prepare(http, candidate)
+        served = s.promote(http, candidate)
+    except Exception as exc:
+        message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+        directory = http_state / candidate
+        if transient(exc) and not (directory / "http-attempted.json").exists() and (
+                (directory / "http-prepared.json").exists() or not directory.exists()):
+            return retry(exc, message), None
+        return finish(**halt(f"plan A of {candidate} is applied, but its HTTP release stopped: {message}; "
+                             "inspect seamless_release.py status --sha " + candidate)), None
+    return None, served
+
+
+def deploy_finish(settings, s, state, http_state, finish, served):
+    outcome = finish("deployed", http=served.get("status"))
+    # Recorded as deployed first: removing old release images never changes that outcome, nor does adding its summary.
+    outcome["image_removal"] = retain_images(settings, held=(http_state, s.GLOBAL_LOCK))
+    try:
+        write(state / "deploy.json", outcome)
+    except Exception:
+        outcome["image_removal"]["receipt"] = "not written; deploy.json keeps the deployed receipt without this summary"
+    return outcome
+
+
+def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, configs):
+    state, http_state = Path(settings["state_directory"]), Path(http["state_directory"])
+    # A tool update that stopped between `activating` and `active` is settled before anything else.
+    if reconciled := reconcile_tool(settings, configs, s, dry_run=dry_run, halt=halt):
+        return reconciled
+    halted, counts = deploy_receipt(state, halt)
+    if halted is not None:
+        return halted
+    last, started, failures, misses, waits, gated = counts
     if auto and started and (datetime.now(timezone.utc) - started).total_seconds() < DEPLOY_INTERVAL:
         return {"status": "waiting", "reason": "less than 20 minutes since the last deploy started"}
     if "call_waits" in last or "migration_waits" in last:
@@ -4295,23 +4490,9 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
         return retirement
     if not serving_settled(serving) or not re.fullmatch(r"[0-9a-f]{40}", serving.get("sha", "")):
         return halt(f"the HTTP release is {serving.get('status', 'missing')}; inspect seamless_release.py status")
-    try:
-        # Every failure here precedes any change: this run does nothing, and the third in a row pauses.
-        head = remote_main()
-        mirror = None if head == base == serving["sha"] else main_history(state)
-    except Exception as exc:
-        message, failures = (str(exc) if isinstance(exc, Refused) else type(exc).__name__), failures + 1
-        rest = {key: value for key, value in last.items() if key != "fetch_failures"}
-        if failures >= FETCH_FAILURES:
-            if not dry_run:
-                write(state / "deploy.json", rest)
-            return halt(f"git could not read main {failures} times in a row, last: {message}; "
-                        f"inspect the network and {state / 'deploy-source.git'}")
-        if not dry_run:
-            write(state / "deploy.json", {**rest, "fetch_failures": {"count": failures, "at": now(), "reason": message}})
-        return {"status": "fetch_failed", "reason": message, "failures": failures}
-    if "fetch_failures" in last and not dry_run:
-        write(state / "deploy.json", {key: value for key, value in last.items() if key != "fetch_failures"})
+    halted, mirror = deploy_fetch_main(state, base, serving, last, failures, dry_run, halt)
+    if halted is not None:
+        return halted
     if mirror is None:
         return {"status": "current", "sha": base}
     head = run(["git", "-C", str(mirror), "rev-parse", "refs/heads/main"]).strip()
@@ -4323,48 +4504,14 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
         return halt(drift + "; apply the next release by hand")
     installed = {"scripts/production.py": RUNNING, "scripts/seamless_release.py": s.__file__,
                  **{path: SYSTEMD_DIRECTORY / Path(path).name for path in UNITS}}
-    if unsettled := unsettled_migrations(state):
-        # An unattended migration may have changed the database before its plan A ran: that release is finished
-        # first, whatever main took since (ANYM-449 M4).
-        if len(unsettled) != 1 or serving["sha"] != base or unsettled[0] == base or not on_main(mirror, base, unsettled[0]):
-            return halt("an unattended migration is unsettled: " + ", ".join(unsettled) + "; inspect its migration.json")
-        candidate, since = unsettled[0], base
-    elif serving["sha"] != base:
-        # Plan A is ahead of the HTTP pair: a deploy whose HTTP release stopped before any change, or plan A applied
-        # by hand.
-        candidate, since = base, serving["sha"]
-    else:
-        try:
-            candidate = newest_attested_candidate(mirror, state, http_state, base, head, attested)
-        except Unreachable as exc:
-            # GHCR could not be read: no older commit is taken instead; nothing changed.
-            if misses + 1 >= FETCH_FAILURES:
-                return halt(f"GHCR or git could not be read {misses + 1} times in a row, last: {exc}")
-            if not dry_run:
-                write(state / "deploy.json", {**{key: value for key, value in last.items() if key != "unreachable"},
-                                              "unreachable": {"count": misses + 1, "at": now(), "reason": str(exc)}})
-            return {"status": "error", "reason": f"{exc}; nothing changed, the next run retries"}
-        if candidate is None:
-            if "unreachable" in last and not dry_run:
-                write(state / "deploy.json", {key: value for key, value in last.items() if key != "unreachable"})
-            return {"status": "waiting", "reason": "no newer main commit has attested images yet", "sha": base}
-        since = base
+    halted, candidate, since = deploy_candidate(state, http_state, mirror, base, head, serving, last, misses, attested,
+                                                dry_run, halt)
+    if halted is not None:
+        return halted
     sql, pending = range_changes(mirror, since, candidate, installed)
-    # M1 (ANYM-449, ANYM-586 K3): a messaging or calendar range migrate-expand may run without a person migrates
-    # instead of pausing.
-    plans = migration_plans(settings, mirror, since, candidate, sql) if sql and not pending and candidate != base else None
-    if (reasons := [] if plans else pause_text(sql, pending, migration_classes(mirror, since, candidate, sql))) and not sql and set(pending) <= TOOL_FILES.keys():
-        # Only the tool pair waits for an install: the self-updating layout installs it, when this run is its tool.
-        try:
-            tool = installed_tool()
-        except Refused as exc:
-            tool = reasons.append(f"the tool does not update itself: {exc}")
-        if tool and [blob(RUNNING), blob(s.__file__)] != [tool["blobs"][path] for path in TOOL_FILES]:
-            tool = reasons.append(f"the tool does not update itself: this run is not {TOOL_ROOT / 'current'}")
-        if tool:
-            return update_tool(settings, configs, s, mirror, candidate, base, tool, dry_run=dry_run, halt=halt)
-    if reasons:
-        return halt("; ".join(reasons), sha=candidate)
+    halted, plans = deploy_plan(settings, s, configs, mirror, base, since, candidate, sql, pending, dry_run, halt)
+    if halted is not None:
+        return halted
     if dry_run:
         migration = [f"migrate {plan['database']} schema {plan['base']} to {plan['target']} after a verified copy and "
                      "its rehearsal" + (", then db-roles and db-roles --check" if plan["database"] == CALENDAR else "")
@@ -4373,101 +4520,17 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
                 "steps": migration + (["plan A"] if candidate != base else []) + ["plan B"]}
     record.update(sha=candidate, base=base, started_at=now(), status="deploying")
     write(state / "deploy.json", record)
-    def finish(status, **fields):
-        record.update(status=status, finished_at=now(), **fields)
-        write(state / "deploy.json", record)
-        return record
-    def retry(exc, message):
-        # A network error changed nothing; git or GHCR failing to be read the third run in a row pauses.
-        if isinstance(exc, Unreachable):
-            if misses + 1 >= FETCH_FAILURES:
-                return finish(**halt(f"GHCR or git could not be read {misses + 1} times in a row, last: {message}"))
-            record["unreachable"] = {"count": misses + 1, "at": now(), "reason": message}
-        return finish("error", reason=message + "; nothing changed, the next run retries")
+    finish, retry = deploy_closers(record, state, misses, halt)
     release = state / candidate
     if candidate != base:
-        migrated = False
-        try:
-            # M2 admission (read-only) before preparation; a run that finds migration.json resumes from it (M4).
-            if plans and not (migrated := resumed_migration(settings, plans, candidate, release)):
-                for plan in plans:
-                    migration_gate(settings, http, plan, mirror, base, serving["sha"])
-            if not (release / "prepared.json").exists():
-                if release.exists():
-                    return finish(**halt(f"an earlier preparation of {candidate} did not finish; inspect {release}"))
-                prepare(settings, candidate)
-            if plans and not migrated:
-                migrate(settings, http, plans, mirror, base, serving["sha"], candidate, release)
-                migrated = True
-            apply(settings, candidate)
-        except Exception as exc:
-            message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
-            if isinstance(exc, MigrationRefused):
-                return finish(**halt(message))
-            if isinstance(exc, MigrationWait) and not (release / "attempted.json").exists():
-                if gated + 1 >= MIGRATION_WAITS:
-                    return finish(**halt(f"the migration of {candidate} waited {gated + 1} runs in a row: {message}"))
-                return finish("waiting", reason=message + "; nothing changed, the next run retries",
-                              migration_waits={"count": gated + 1, "at": now(), "reason": message})
-            if migrated:
-                assert plans
-                message += " (" + " and ".join(f"{plan['database']} is already at schema {plan['target']}"
-                                               for plan in plans) + ")"
-            if isinstance(exc, (CallActive, CallsUnknown)) and not (release / "attempted.json").exists():
-                # Nothing was stopped: the prepared release waits for a later run; the fourth wait in a row pauses.
-                if waits + 1 >= CALL_WAITS:
-                    return finish(**halt(f"plan A of {candidate} waited {waits + 1} runs in a row for calls: {message}; "
-                                         "inspect the calls service"))
-                return finish("waiting", reason=message + "; nothing changed, the next run retries",
-                              call_waits={"count": waits + 1, "at": now(), "reason": message})
-            if not (release / "attempted.json").exists():
-                # A network or quota error before preparation started or after it finished changed nothing.
-                if transient(exc) and ((release / "prepared.json").exists() or not release.exists()):
-                    return retry(exc, message)
-                return finish(**halt(f"plan A of {candidate} was refused before any change: {message}"))
-            result = read(release / "result.json") if (release / "result.json").exists() else {}
-            if result.get("status") != "unhealthy":
-                return finish(**halt(f"plan A of {candidate} stopped in an unknown state: {message}; inspect it"))
-            # The previous release still fits: a range either leaves the SQL inventory alone (pause_reasons) or only
-            # expands the schema (ANYM-449 M5), and the base runs on the target schema; a migration is never reversed.
-            try:
-                rollback(settings, candidate, http)
-            except Exception as again:
-                detail = str(again) if isinstance(again, Refused) else type(again).__name__
-                return finish(**halt(f"plan A of {candidate} failed its health wait and its rollback failed: {detail}; "
-                                     "production state is unknown, inspect it"))
-            if migrated:
-                assert plans
-                named = len(plans) > 1 or plans[0]["database"] != AUTO_DATABASE
-                def schemas(text):
-                    return " and ".join((f"{plan['database']} " if named else "") + text.format(**plan) for plan in plans)
-                return finish(**halt(f"plan A of {candidate} failed its health wait after migrating "
-                                     f"{schemas('schema {base} to {target}')}; rolled back to {base} on "
-                                     f"{schemas('schema {target}')}", status="rolled-back"))
-            return finish(**halt(f"plan A of {candidate} failed its health wait; rolled back to {base}",
-                                 status="rolled-back"))
-    try:
-        if not (http_state / candidate / "http-prepared.json").exists():
-            if (http_state / candidate).exists():
-                return finish(**halt(f"an earlier HTTP preparation of {candidate} did not finish; inspect it"))
-            s.prepare(http, candidate)
-        served = s.promote(http, candidate)
-    except Exception as exc:
-        message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
-        directory = http_state / candidate
-        if transient(exc) and not (directory / "http-attempted.json").exists() and (
-                (directory / "http-prepared.json").exists() or not directory.exists()):
-            return retry(exc, message)
-        return finish(**halt(f"plan A of {candidate} is applied, but its HTTP release stopped: {message}; "
-                             "inspect seamless_release.py status --sha " + candidate))
-    outcome = finish("deployed", http=served.get("status"))
-    # Recorded as deployed first: removing old release images never changes that outcome, nor does adding its summary.
-    outcome["image_removal"] = retain_images(settings, held=(http_state, s.GLOBAL_LOCK))
-    try:
-        write(state / "deploy.json", outcome)
-    except Exception:
-        outcome["image_removal"]["receipt"] = "not written; deploy.json keeps the deployed receipt without this summary"
-    return outcome
+        halted = deploy_plan_a(settings, http, plans, mirror, base, serving, candidate, release, gated, waits, halt, finish,
+                               retry)
+        if halted is not None:
+            return halted
+    halted, served = deploy_plan_b(http, s, http_state, candidate, halt, finish, retry)
+    if halted is not None:
+        return halted
+    return deploy_finish(settings, s, state, http_state, finish, served)
 
 
 def transient(exc):
