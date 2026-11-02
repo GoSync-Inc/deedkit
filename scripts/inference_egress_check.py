@@ -109,35 +109,41 @@ AFTER_INIT = r"""#!/bin/sh
 # raw-table half of the mini worker's egress rules, which ufw's rules files cannot hold: restoring them would flush
 # Docker's own raw rules. The chain is replaced in one kernel commit, so a failure leaves the previous complete chain
 # and never an empty one; the jump is added only after the chain is complete; every command is bounded; a failure is
-# logged and recorded, and the step still exits 0 so that ufw and Docker start.
+# logged and recorded, and the step still exits 0 so that ufw and Docker start. The whole hook, diagnostics and the
+# record included, runs under an outer bound of 60 s (a command that ignores TERM is killed 2 s later).
 STATE=${DEEDKIT_RAW_STATE:-/var/lib/deedkit/raw-step.json}
 LIMIT=${DEEDKIT_STEP_TIMEOUT:-30}
 if [ "$LIMIT" -ge 1 ] 2>/dev/null && [ "$LIMIT" -le 30 ] 2>/dev/null; then :; else LIMIT=30; fi
-log() { echo "deedkit-inference raw step: $*" >&2; logger -t deedkit-inference-raw "$*" 2>/dev/null || true; }
+log() { echo "deedkit-inference raw step: $*" >&2; timeout -k 1 5 logger -t deedkit-inference-raw "$*" 2>/dev/null || true; }
 record() {
     up=$(cut -d' ' -f1 /proc/uptime 2>/dev/null) || up=0
     boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || boot=unknown
-    mkdir -p "$(dirname "$STATE")" 2>/dev/null
-    printf '{"boot_id": "%s", "uptime": %s, "ok": %s, "reason": "%s"}\n' "$boot" "${up:-0}" "$1" "$2" > "$STATE.tmp" 2>/dev/null &&
-        mv "$STATE.tmp" "$STATE" 2>/dev/null
+    timeout -k 1 5 sh -c 'mkdir -p "$(dirname "$1")" && printf "%s\n" "{\"boot_id\": \"$2\", \"uptime\": $3, \"ok\": $4, \"reason\": \"$5\"}" > "$1.tmp" && mv "$1.tmp" "$1"' \
+        record "$STATE" "$boot" "${up:-0}" "$1" "$2" 2>/dev/null
     return 0
 }
 fail() { log "failed: $1"; record false "$1"; exit 0; }
 ensure() {
     bin=$1; shift
-    timeout "$LIMIT" "$bin" -t raw -C "$@" 2>/dev/null
+    timeout -k 2 "$LIMIT" "$bin" -t raw -C "$@" 2>/dev/null
     rc=$?
     [ "$rc" -eq 0 ] && return 0
     [ "$rc" -eq 1 ] || return 1
-    timeout "$LIMIT" "$bin" -t raw -I "$@"
+    timeout -k 2 "$LIMIT" "$bin" -t raw -I "$@"
 }
 step() {
-    timeout "$LIMIT" iptables-restore --noflush -T raw <<'DEEDKIT_V4' || fail restore_v4
+    timeout -k 2 "$LIMIT" iptables-restore --noflush -T raw <<'DEEDKIT_V4' || fail restore_v4
 @RAW@
 DEEDKIT_V4
 @ENSURE@
     record true ok
 }
+if [ "$1" = start ] && [ -z "$DEEDKIT_RAW_INNER" ]; then
+    DEEDKIT_RAW_INNER=1 timeout -k 2 60 sh "$0" start
+    rc=$?
+    if [ "$rc" -ne 0 ]; then log "failed: hook rc=$rc"; record false "hook_$rc"; fi
+    exit 0
+fi
 case "$1" in
     start) step ;;
 esac
@@ -163,7 +169,8 @@ def ufw_form(mini, family, source):
     block = module.ufw_block(built['tables'], 'deedkit-inference', CHAIN, family, False)
     if source is None:
         return block
-    return module.merge_block(Path(source).read_text(), block, 'deedkit-inference', r'DEEDKIT-DELIVERY|dk-delivery', False)
+    return module.merge_block(Path(source).read_text(), block, 'deedkit-inference', r'DEEDKIT-DELIVERY|dk-delivery', False,
+                              '# deedkit-delivery end')
 
 
 def probe_name(target):

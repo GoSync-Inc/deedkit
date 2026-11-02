@@ -1359,8 +1359,9 @@ What is persisted and where (ufw owns `DOCKER-USER`, so a second restore file wo
 
 The raw table is not in ufw's files because restoring them would flush Docker's own raw rules. `after.init` replaces
 the raw chain in one `iptables-restore --noflush -T raw` (one kernel commit: a failure or a kill leaves the previous
-complete chain, never an empty one), adds the jump only after the chain is complete, bounds every command to 30 s,
-logs and records a failure in `/var/lib/deedkit/raw-step.json` and still exits 0, so ufw and Docker start. The failure
+complete chain, never an empty one), adds the jump only after the chain is complete, bounds every command to 30 s
+(a command that ignores TERM is killed 2 s later), runs the whole hook, log and record included, under an outer bound of
+60 s, logs and records a failure in `/var/lib/deedkit/raw-step.json` and still exits 0, so ufw and Docker start. The failure
 shows in `verify` (`kernel_vs_repo table_differs:raw`), in the boot receipt and in the worker's own exit 78. The IPv6
 raw rule is the single `PREROUTING -i dk-inference0 -j DROP` of `rules()` (there is no IPv6 chain), added if absent.
 
@@ -1379,14 +1380,19 @@ files and the kernel (`iptables-save`, `ip6tables-save`). It prints `ok`, or one
 the kernel cannot be read. `--persisted-only` reads no kernel (the check before loading); `--receipt-check` also reads
 the boot receipt. A file and a kernel that agree on an allowance the repository does not have still fail: the
 repository is the authority. The host-bound drops count as one fact whether the kernel holds them in `INPUT` (the
-command form) or in `ufw-before-input` (the file), but a rule present in both is a duplicate and fails as `extra:`.
+command form) or in ufw's chain of the same family (`ufw-before-input`, `ufw6-before-input`; in the kernel only when `INPUT`
+jumps to it), but a rule present in both is a duplicate and fails as `extra:`. A rule that accepts or returns the bridge's
+traffic before a managed hook in `DOCKER-USER` or raw `PREROUTING` (no `-i`, a wildcard or a negated `-i`) fails as
+`extra:<rule>`, since the hook would never see those packets. A rules file that declares `:DOCKER-USER` or the managed
+chain twice, or after rules that use it, fails as `table_differs:filter` or `table_differs:v6` (restoring the late
+declaration empties the chain).
 
 Safe order for any firewall change (as root; the plan is Astra-reviewed, none runs during an active call):
 1. Back up the files that change: copy `/etc/ufw/before.rules`, `before6.rules` and `after.init` (if it exists) with
    `cp -a` to a dated directory under `/root`, and write `iptables-save` and `ip6tables-save` next to them.
 2. Build the new files without touching the old ones: `python3 scripts/inference_egress_check.py rules --mini-ip
    $INFERENCE_MINI_IP --format ufw --family v4 --source /etc/ufw/before.rules` writes the whole new file to a new path
-   (v6 with `before6.rules`). It replaces a block of the same label, inserts after the delivery block and refuses a file
+   (v6 with `before6.rules`). It replaces a block of the same label, inserts after the delivery block (after its end marker when it has one, never inside it) and refuses a file
    with no delivery block or no `:DOCKER-USER` declared before the insertion point. `--format after-init` writes the hook.
 3. `iptables-restore --test --noflush` on the new v4 file and `ip6tables-restore --test --noflush` on the v6 file: syntax
    only. A syntax error in a ufw rules file stops ufw from loading, so nothing is installed before this passes.
@@ -1412,7 +1418,9 @@ ordered after it, `TimeoutStartSec=60`, and a failure fails only itself.
 
 The boot receipt (`/var/lib/deedkit/firewall-verify.json`, written at each boot) holds the boot ID, the result of both
 `verify` commands, `ufw_rules_loaded_monotonic` (ufw.service's `ExecMainExitTimestampMonotonic`), `raw_step_monotonic`
-(the step's own `/proc/uptime` on success and on failure), `docker_start_monotonic`, `first_container_monotonic` and
+(the step's own `/proc/uptime` on success and on failure), `docker_start_monotonic`, `first_container_monotonic` (the start of the earliest running container's main process this boot, from
+`/proc/PID/stat`, never from Docker's wall-clock times; a container that restarted shows its latest start; unknown when a
+container that started this boot is not running or cannot be read) and
 `rules_before_first_container` = `yes`, `no` or `unknown` (unknown when a time is missing or a step failed). The times are
 seconds on one monotonic clock (the host does not suspend, so `/proc/uptime` equals it). A boot with no receipt for the
 current boot ID reads as `receipt unknown` in `verify --receipt-check`, never as ok. The first reboot that happens for

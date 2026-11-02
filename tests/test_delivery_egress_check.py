@@ -203,6 +203,8 @@ def test_ufw_form_is_exactly_the_delivery_rules_of_the_command_form_in_order(tmp
     assert sum(RESOLVER in line for line in block4) == 2 and RESOLVER not in '\n'.join(block6)
     for bad in ('2001:db8::1', 'resolver.example', ''):
         assert run('rules', '--resolver', bad, '--format', 'ufw', '--family', 'v4')[0] != 0
+    code, out = run('rules', '--resolver', '198.51.100.9', '--format', 'ufw', '--family', 'v4')
+    assert code == 0 and out.startswith('# deedkit-delivery begin') and '198.51.100.9' in out
 
 
 # spec: ANYM-693

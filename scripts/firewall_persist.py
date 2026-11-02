@@ -25,7 +25,8 @@ from pathlib import Path
 
 # v4 filter, v4 raw, v6 filter, v6 raw. The raw pair is reported as `raw`: it is loaded by one step.
 TABLES = ('filter', 'raw', 'v6', 'raw6')
-INPUT_CHAINS = ('INPUT', 'ufw-before-input', 'ufw6-before-input')
+# ufw's own host-bound chain per family: the kernel's INPUT jumps to it, the rules files hold the drops in it.
+UFW_INPUT = {'v4': 'ufw-before-input', 'v6': 'ufw6-before-input'}
 ENV_FILE = '/opt/personal-os-probe/.env'
 BOOT_ID = '/proc/sys/kernel/random/boot_id'
 RECEIPT = '/var/lib/deedkit/firewall-verify.json'
@@ -54,8 +55,6 @@ def canon(line):
             i += 1
     if out and out[0] == '-I':
         out[0] = '-A'
-    if len(out) > 1 and out[1] in INPUT_CHAINS:
-        out[1] = 'INPUT'
     return ' '.join(out)
 
 
@@ -83,10 +82,27 @@ def bridge_of(rule):
     return tokens[tokens.index('-i') + 1] if '-i' in tokens else rule
 
 
-def extract(text, table, chain, bridges):
-    """The rules of one table of an `iptables-save`/ufw rules text that belong to one block."""
-    found = {**empty_table(), 'declared': set()}
-    inside = False
+def covers(tokens, bridge):
+    """Whether a rule's interface condition can match traffic from `bridge` (no -i, a wildcard, or a negation)."""
+    if '-i' not in tokens:
+        return True
+    index = tokens.index('-i')
+    name = tokens[index + 1]
+    hit = name == bridge or (name.endswith('+') and bridge.startswith(name[:-1]))
+    return not hit if index > 0 and tokens[index - 1] == '!' else hit
+
+
+def extract(text, table, chain, bridges, family='v4', kernel=False):
+    """The rules of one table of an `iptables-save`/ufw rules text that belong to one block.
+
+    Besides the block's own rules it records `shadowed` (a rule before a managed hook in its parent chain that accepts or
+    returns that bridge's traffic, so the hook never sees it) and `late` (a managed chain declared twice or after a rule
+    that uses it: restoring the declaration empties the chain). Host-bound drops count in INPUT, or in ufw's own chain of
+    this family; in the kernel the latter only when INPUT jumps to it.
+    """
+    found = {**empty_table(), 'declared': set(), 'late': [], 'shadowed': []}
+    parents, used, pending, jumped, inside = {}, set(), [], False, False
+    ufw_input = UFW_INPUT[family]
     for raw in text.splitlines():
         line = raw.strip()
         if line.startswith('*'):
@@ -94,17 +110,33 @@ def extract(text, table, chain, bridges):
         elif not inside:
             continue
         elif line.startswith(':'):
-            found['declared'].add(line.split()[0][1:])
+            name = line.split()[0][1:]
+            if name in (chain, 'DOCKER-USER') and (name in found['declared'] or name in used):
+                found['late'].append(name)
+            found['declared'].add(name)
         elif line.startswith('-A '):
             rule = canon(line)
             tokens = rule.split()
-            if tokens[1] == chain:
+            name = tokens[1]
+            used.add(name)
+            managed = '-i' in tokens and bridge_of(rule) in bridges
+            if name == chain:
                 found['chain'].append(rule)
-            elif '-i' in tokens and bridge_of(rule) in bridges:
-                if tokens[1] == 'INPUT':
-                    found['inputs'].append(rule)
-                elif tokens[1] in ('DOCKER-USER', 'PREROUTING'):
+            elif name == 'INPUT' and tokens[-2:] == ['-j', ufw_input]:
+                jumped = True
+            elif managed and name in ('INPUT', ufw_input) and tokens[-1] == 'DROP':
+                (found['inputs'] if name == 'INPUT' or not kernel else pending).append(' '.join(['-A', 'INPUT', *tokens[2:]]))
+            elif name in ('DOCKER-USER', 'PREROUTING'):
+                if managed:
+                    for earlier in parents.get(name, []):
+                        before = earlier.split()
+                        if before[-2] == '-j' and before[-1] in ('ACCEPT', 'RETURN') and covers(before, bridge_of(rule)):
+                            found['shadowed'].append(earlier)
+                            break
                     found['hooks'].append(rule)
+                parents.setdefault(name, []).append(rule)
+    if jumped:
+        found['inputs'] += pending
     return found
 
 
@@ -136,6 +168,8 @@ def compare(expected, actual, label, address=None):
         return f'extra:{extra[0]}'
     if expected['chain'] != actual['chain']:
         return f'table_differs:{label}'
+    if actual.get('shadowed'):
+        return f"extra:{actual['shadowed'][0]}"
     for part in ('hooks', 'inputs'):
         want, have = collections.Counter(expected[part]), collections.Counter(actual[part])
         for rule in (want - have).elements():
@@ -156,6 +190,8 @@ def first_diff(expected, actual, address=None):
 def declaration_diff(expected, found, chain):
     """A rules file that uses DOCKER-USER or the chain without declaring it would stop ufw from loading."""
     for table in ('filter', 'v6'):
+        if found[table]['late']:
+            return f'table_differs:{table}'
         needs = [('DOCKER-USER', any(rule.startswith('-A DOCKER-USER ') for rule in expected[table]['hooks']))]
         needs.append((chain, table == 'filter' and bool(expected[table]['chain'])))
         for declared, needed in needs:
@@ -177,12 +213,13 @@ def ufw_block(tables, label, chain, family, declares_docker_user):
     return '\n'.join([*lines, f'# {label} end']) + '\n'
 
 
-def merge_block(text, block, label, anchor, declares_docker_user):
+def merge_block(text, block, label, anchor, declares_docker_user, anchor_end=None):
     """The rules file with the block inserted (a block of the same label is replaced), or exit 2.
 
     The block goes after `anchor` (the last matching line of the filter table: the delivery block, which declares
     DOCKER-USER; a second declaration after a hook would flush the hook), or after ufw's `# End required lines` when it
-    declares DOCKER-USER itself.
+    declares DOCKER-USER itself. When the anchor block has an end marker (`anchor_end`), the new block goes after that line, never
+    inside the anchor block (replacing the anchor block later would delete it).
     """
     lines = text.splitlines()
     begin, end = f'# {label} begin', f'# {label} end'
@@ -199,6 +236,9 @@ def merge_block(text, block, label, anchor, declares_docker_user):
         if not hits:
             die(f'no delivery block found in the filter table (nothing matches {anchor}); not inserting')
         at = hits[-1] + 1
+        ends = [i for i in body if anchor_end and lines[i] == anchor_end]
+        if ends:
+            at = max(at, ends[-1] + 1)
     else:
         marks = [i for i in body if lines[i].strip() == '# End required lines']
         at = (marks[0] if marks else max((i for i in body if lines[i].startswith(':')), default=start)) + 1
@@ -266,7 +306,7 @@ def verify_cli(argv, spec_for, key, description, address=None):
         die(f'{key}: {error}')
     expected, chain, bridges = spec['tables'], spec['chain'], spec['bridges']
     v4, v6 = read(args.rules_v4), read(args.rules_v6)
-    found = {'filter': extract(v4, 'filter', chain, bridges), 'v6': extract(v6, 'filter', chain, bridges)}
+    found = {'filter': extract(v4, 'filter', chain, bridges, 'v4'), 'v6': extract(v6, 'filter', chain, bridges, 'v6')}
     hook = read(args.after_init)
     # ufw runs the hook only when it is executable; a hook that is not byte for byte the generated one differs even when
     # its rules are the same (it could stop early).
@@ -281,10 +321,11 @@ def verify_cli(argv, spec_for, key, description, address=None):
         lines.append(f'file_vs_repo {code}')
     if not args.persisted_only:
         wants_raw = spec['after_init'] is not None
-        kernel = {'filter': extract(kernel_text(args.iptables_save, 'filter'), 'filter', chain, bridges),
-                  'v6': extract(kernel_text(args.ip6tables_save, 'filter'), 'filter', chain, bridges),
-                  'raw': extract(kernel_text(args.iptables_save, 'raw'), 'raw', chain, bridges) if wants_raw else empty_table(),
-                  'raw6': extract(kernel_text(args.ip6tables_save, 'raw'), 'raw', chain, bridges) if wants_raw else empty_table()}
+        def read_kernel(command, table, family):
+            return extract(kernel_text(command, table), table, chain, bridges, family, kernel=True)
+        kernel = {'filter': read_kernel(args.iptables_save, 'filter', 'v4'), 'v6': read_kernel(args.ip6tables_save, 'filter', 'v6'),
+                  'raw': read_kernel(args.iptables_save, 'raw', 'v4') if wants_raw else empty_table(),
+                  'raw6': read_kernel(args.ip6tables_save, 'raw', 'v6') if wants_raw else empty_table()}
         for pair, left, right in (('kernel_vs_repo', expected, kernel), ('file_vs_kernel', persisted, kernel)):
             code = first_diff(left, right, address)
             if code:
@@ -320,20 +361,50 @@ def unit_time(systemctl, unit, name):
     return int(value) / 1_000_000 if value.isdigit() and int(value) > 0 else None
 
 
-def first_container_start(docker):
-    """The earliest container start of this boot on the monotonic clock, from the wall-clock StartedAt values."""
+def process_start(pid):
+    """Seconds since boot at which a process started (/proc/PID/stat field 22), or None."""
+    try:
+        fields = Path(f'/proc/{pid}/stat').read_text().rpartition(')')[2].split()
+        return int(fields[19]) / os.sysconf('SC_CLK_TCK')
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def first_container_start(docker, proc_start=process_start, boot_wall=None):
+    """The earliest start of a running container's main process this boot, on the boot clock, or None (= unknown).
+
+    The container start times Docker prints are wall-clock and a clock step would move them, so the start of the
+    process itself is used. Unknown (None) when any container cannot be read, or when a container that is not running
+    started during this boot (its start cannot be placed on the clock). It is the earliest *observable* start: a
+    container that restarted shows its latest one.
+    """
     ids = command_output(docker, 'ps', '-aq').split()
     if not ids:
         return None
-    now_wall, now_mono, starts = time.time(), time.monotonic(), []
-    for stamp in command_output(docker, 'inspect', '-f', '{{.State.StartedAt}}', *ids).split():
+    if boot_wall is None:
+        try:
+            boot_wall = time.time() - float(read('/proc/uptime').split()[0])
+        except (ValueError, IndexError):
+            return None
+    lines = command_output(docker, 'inspect', '-f', '{{.State.Running}} {{.State.Pid}} {{.State.StartedAt}}', *ids).splitlines()
+    if len(lines) != len(ids):
+        return None
+    starts = []
+    for line in lines:
+        running, _, rest = line.partition(' ')
+        pid, _, stamp = rest.partition(' ')
+        if running == 'true' and pid.isdigit():
+            mono = proc_start(int(pid))
+            if mono is None:
+                return None
+            starts.append(mono)
+            continue
         try:
             when = datetime.datetime.fromisoformat(re.sub(r'(\.\d{6})\d*', r'\1', stamp.replace('Z', '+00:00')))
         except ValueError:
-            continue
-        mono = now_mono - (now_wall - when.timestamp())
-        if when.year > 1970 and mono >= 0:
-            starts.append(mono)
+            return None
+        if when.year > 1970 and when.timestamp() >= boot_wall:
+            return None
     return min(starts) if starts else None
 
 

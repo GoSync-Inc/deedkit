@@ -102,6 +102,7 @@ def test_egress_rules_refuse_a_non_tailnet_or_ipv6_address():
 
 
 PERSIST = Path(__file__).resolve().parents[1] / 'scripts/firewall_persist.py'
+DELIVERY = Path(__file__).resolve().parents[1] / 'scripts/delivery_egress_check.py'
 UNIT = Path(__file__).resolve().parents[1] / 'deploy/deedkit-firewall-verify.service'
 # A minimal ufw before.rules / before6.rules with the delivery block already in place (what production holds).
 TEMPLATE_V4 = '''*filter
@@ -250,6 +251,8 @@ def test_ufw_form_refuses_an_address_outside_the_tailnet_and_needs_a_family():
         code, out, err = run('rules', '--mini-ip', bad, '--format', 'ufw', '--family', 'v4')
         assert code != 0 and out == '' and err, bad
     assert run('rules', '--mini-ip', MINI, '--format', 'ufw')[0] != 0
+    code, out, err = run('rules', '--mini-ip', '100.127.255.254', '--format', 'ufw', '--family', 'v4')
+    assert code == 0 and '100.127.255.254' in out and out.startswith('# deedkit-inference begin'), err
 
 
 # spec: ANYM-693
@@ -350,13 +353,18 @@ def test_raw_step_failure_or_hang_exits_zero_and_leaves_the_previous_complete_ch
     wrappers = tmp_path / 'bin'
     wrappers.mkdir()
     state = tmp_path / 'raw-step.json'
-    # The injection: a failing iptables-restore that commits nothing (an input cut after the first rule, no COMMIT).
-    for name, body in (('error', f'#!/bin/sh\nhead -n 3 | {real} "$@"\nexit 1\n'), ('hang', '#!/bin/sh\nexec sleep 60\n')):
-        folder = wrappers / name
-        folder.mkdir()
-        (folder / 'iptables-restore').write_text(body)
-        (folder / 'iptables-restore').chmod(0o755)
-    for name in ('error', 'hang'):
+    # The injections: a failing iptables-restore that commits nothing (an input cut after the first rule, no COMMIT), one
+    # that hangs, one that ignores TERM, and a failure whose diagnostics (logger) stall.
+    error = f'#!/bin/sh\nhead -n 3 | {real} "$@"\nexit 1\n'
+    variants = {'error': {'iptables-restore': error}, 'hang': {'iptables-restore': '#!/bin/sh\nexec sleep 60\n'},
+                'ignores_term': {'iptables-restore': "#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n"},
+                'stalled_logger': {'iptables-restore': error, 'logger': '#!/bin/sh\nexec sleep 60\n'}}
+    for name, files in variants.items():
+        (wrappers / name).mkdir()
+        for file_name, body in files.items():
+            (wrappers / name / file_name).write_text(body)
+            (wrappers / name / file_name).chmod(0o755)
+    for name in variants:
         script = (f'iptables -t raw -A PREROUTING -d 192.0.2.77 -j ACCEPT; DEEDKIT_RAW_STATE={state} sh {first}/after.init start; '
                   'iptables-save -t raw > ' + f'{tmp_path}/{name}.before; '
                   f'PATH={wrappers}/{name}:$PATH DEEDKIT_STEP_TIMEOUT=2 DEEDKIT_RAW_STATE={state} sh {second}/after.init start; '
@@ -364,7 +372,7 @@ def test_raw_step_failure_or_hang_exits_zero_and_leaves_the_previous_complete_ch
         started = time.monotonic()
         result = in_namespace(script)
         assert result.returncode == 0 and 'rc=0' in result.stdout, (name, result.stderr)
-        assert time.monotonic() - started < 40
+        assert time.monotonic() - started < 40, name
         before, after = (tmp_path / f'{name}.before').read_text(), (tmp_path / f'{name}.after').read_text()
         stable = lambda text: [re.sub(r'\[\d+:\d+\]', '', line) for line in text.splitlines() if not line.startswith('#')]
         assert stable(before) == stable(after), name
@@ -387,6 +395,9 @@ def test_after_init_text_is_bounded_idempotent_and_never_stops_ufw():
     assert all(line.lstrip().startswith(('timeout', '#', 'log', 'echo', 'record', 'fail', 'ensure', '[')) or 'timeout "$LIMIT"' in line
                for line in text.splitlines() if re.search(r'\biptables(-restore)?\b', line) and not line.startswith(('#', '-', ':')))
     assert 'LIMIT=30' in text
+    # The diagnostics and the record are bounded too, and the whole hook runs under an outer bound.
+    assert 'timeout -k 1 5 logger' in text and 'timeout -k 1 5 sh -c' in text and 'timeout -k 2 60 sh "$0" start' in text
+    assert 'timeout -k 2 "$LIMIT" iptables-restore' in text and text.count('timeout -k 2 "$LIMIT" "$bin"') == 2
     # The generated text carries exactly the raw rules of the command form.
     raw = [line for line in text.splitlines() if line.startswith(f'-A {CHAIN} ')]
     assert raw == [line for line in ufw_block('v4').splitlines() if line.startswith(f'-A {CHAIN} ')]
@@ -398,7 +409,8 @@ def test_verify_is_ok_when_repository_file_and_kernel_agree(tmp_path):
     assert (code, out) == (0, 'ok\n'), (out, err)
     # ufw's own chain name for the host-bound drop and the command form's INPUT are the same fact.
     host = Host(tmp_path)
-    host.kernel[('iptables', 'filter')] = host.kernel[('iptables', 'filter')].replace('-A INPUT -i dk-inference', '-A ufw-before-input -i dk-inference')
+    host.kernel[('iptables', 'filter')] = host.kernel[('iptables', 'filter')].replace(
+        '-A INPUT -i dk-inference', '-A ufw-before-input -i dk-inference').replace('COMMIT', '-A INPUT -j ufw-before-input\nCOMMIT')
     assert host.run()[:2] == (0, 'ok\n')
 
 
@@ -432,6 +444,91 @@ def test_verify_does_not_pass_an_allowance_that_file_and_kernel_share(tmp_path):
     code, out, _ = host.run()
     # The file and the kernel agree with each other, and still the repository says no.
     assert code == 1 and out.splitlines() == [f'file_vs_repo extra:{extra}', f'kernel_vs_repo extra:{extra}'], out
+
+
+# spec: ANYM-693
+def test_verify_rejects_a_rule_that_accepts_the_bridge_before_the_managed_hook(tmp_path):
+    raw_hook = f'-A PREROUTING -i dk-inference0 -j {CHAIN}'
+    for shadow in ('-A PREROUTING -j ACCEPT', '-A PREROUTING -i dk-inference+ -j ACCEPT', '-A PREROUTING ! -i br-other -j RETURN'):
+        host = Host(tmp_path)
+        host.kernel[('iptables', 'raw')] = host.kernel[('iptables', 'raw')].replace(raw_hook, shadow + '\n' + raw_hook)
+        code, out, _ = host.run()
+        assert code == 1 and out.splitlines()[0] == f'kernel_vs_repo extra:{shadow}', (shadow, out)
+    # The same in the filter table's DOCKER-USER, in the kernel and in the persisted file.
+    filter_hook = f'-A DOCKER-USER -i dk-inference0 -j {CHAIN}'
+    host = Host(tmp_path)
+    host.kernel[('iptables', 'filter')] = host.kernel[('iptables', 'filter')].replace(filter_hook, '-A DOCKER-USER -j ACCEPT\n' + filter_hook)
+    assert host.run()[1].splitlines()[0] == 'kernel_vs_repo extra:-A DOCKER-USER -j ACCEPT'
+    host = Host(tmp_path)
+    host.files['v4'].write_text(host.files['v4'].read_text().replace(filter_hook, '-A DOCKER-USER -j ACCEPT\n' + filter_hook))
+    assert host.run('--persisted-only')[1].splitlines() == ['file_vs_repo extra:-A DOCKER-USER -j ACCEPT']
+    # Rules that cannot pass this bridge's traffic, or come after the hook, are not shadows.
+    for harmless in ('-A PREROUTING ! -i br-other -d 172.18.0.2/32 -j DROP', '-A PREROUTING -i br-other -j ACCEPT'):
+        host = Host(tmp_path)
+        host.kernel[('iptables', 'raw')] = host.kernel[('iptables', 'raw')].replace(raw_hook, harmless + '\n' + raw_hook)
+        assert host.run()[:2] == (0, 'ok\n'), harmless
+    host = Host(tmp_path)
+    host.kernel[('iptables', 'raw')] = host.kernel[('iptables', 'raw')].replace(raw_hook, raw_hook + '\n-A PREROUTING -j ACCEPT')
+    assert host.run()[:2] == (0, 'ok\n')
+
+
+# spec: ANYM-693
+def test_verify_counts_host_bound_drops_only_in_their_family_and_reachable_chain(tmp_path):
+    drops = '-A INPUT -i dk-inference'
+    host = Host(tmp_path)
+    host.kernel[('iptables', 'filter')] = host.kernel[('iptables', 'filter')].replace(drops, '-A ufw6-before-input -i dk-inference')
+    assert host.run()[1].splitlines()[0] == 'kernel_vs_repo hook_absent:dk-inference0'
+    # ufw's chain with no jump from INPUT is unreachable; with the jump it is the same fact as INPUT.
+    host = Host(tmp_path)
+    host.kernel[('iptables', 'filter')] = host.kernel[('iptables', 'filter')].replace(drops, '-A ufw-before-input -i dk-inference')
+    assert host.run()[1].splitlines()[0] == 'kernel_vs_repo hook_absent:dk-inference0'
+    host.kernel[('iptables', 'filter')] = host.kernel[('iptables', 'filter')].replace('COMMIT', '-A INPUT -j ufw-before-input\nCOMMIT')
+    assert host.run()[:2] == (0, 'ok\n')
+    # The IPv6 file's chain is not the IPv4 file's.
+    host = Host(tmp_path)
+    host.files['v4'].write_text(host.files['v4'].read_text().replace('-A ufw-before-input -i dk-inference', '-A ufw6-before-input -i dk-inference'))
+    assert host.run('--persisted-only')[1].splitlines() == ['file_vs_repo hook_absent:dk-inference0']
+
+
+# spec: ANYM-693
+def test_verify_rejects_a_managed_chain_declared_twice_or_after_its_rules(tmp_path):
+    for late in (':DOCKER-USER - [0:0]', f':{CHAIN} - [0:0]'):
+        host = Host(tmp_path)
+        host.files['v4'].write_text(host.files['v4'].read_text().replace('COMMIT', late + '\nCOMMIT'))
+        code, out, _ = host.run('--persisted-only')
+        assert code == 1 and out.splitlines() == ['file_vs_repo table_differs:filter'], (late, out)
+    host = Host(tmp_path)
+    host.files['v6'].write_text(host.files['v6'].read_text().replace('COMMIT', ':DOCKER-USER - [0:0]\nCOMMIT'))
+    assert host.run('--persisted-only')[1].splitlines() == ['file_vs_repo table_differs:v6']
+
+
+# spec: ANYM-693
+def test_inference_block_goes_after_a_generated_delivery_block_and_both_survive_a_replacement(tmp_path):
+    plain = tmp_path / 'plain.rules'
+    plain.write_text(TEMPLATE_V4.replace(':DOCKER-USER - [0:0]\n', '').replace(':DEEDKIT-DELIVERY - [0:0]\n', '').replace(
+        '-A DEEDKIT-DELIVERY -d 192.0.2.53 -p udp --dport 53 -j RETURN\n-A DEEDKIT-DELIVERY -j DROP\n', '').replace(
+        '-A DOCKER-USER -i dk-delivery0 -j DEEDKIT-DELIVERY\n-A ufw-before-input -i dk-delivery0 -j DROP\n', ''))
+
+    def merged(script, source, *flag):
+        result = subprocess.run([sys.executable, '-I', str(script), 'rules', *flag, '--format', 'ufw', '--family', 'v4',
+                                 '--source', str(source)], text=True, capture_output=True, timeout=30)
+        assert result.returncode == 0, result.stderr
+        out = tmp_path / 'next.rules'
+        out.write_text(result.stdout)
+        return out
+    with_delivery = merged(DELIVERY, plain, '--resolver', '192.0.2.53')
+    with_both = merged(SCRIPT, with_delivery, '--mini-ip', MINI)
+    replaced = merged(DELIVERY, with_both, '--resolver', '192.0.2.54')
+    again = merged(SCRIPT, replaced, '--mini-ip', MINI)
+    for path in (with_both, replaced, again):
+        lines = path.read_text().splitlines()
+        markers = [lines.index(f'# deedkit-{name} {edge}') for name in ('delivery', 'inference') for edge in ('begin', 'end')]
+        # Two blocks side by side, never nested, each once, the delivery one first (it declares DOCKER-USER).
+        assert markers == sorted(markers) and len({*markers}) == 4, path
+        assert sum(line.startswith('# deedkit-') for line in lines) == 4
+        assert lines.index(':DOCKER-USER - [0:0]') < markers[2] and lines.count(':DOCKER-USER - [0:0]') == 1
+        assert f'-A {CHAIN} -d {MINI} -p tcp --dport 443 -j RETURN' in lines
+    assert '192.0.2.54' in replaced.read_text() and '192.0.2.53' not in replaced.read_text()
 
 
 # spec: ANYM-693
@@ -494,6 +591,34 @@ def test_receipt_order_is_yes_no_or_unknown():
     assert order(ufw=10.0, raw=None, raw_ok=True, container=20.0) == 'unknown'
     assert order(ufw=10.0, raw=9.5, raw_ok=True, container=None) == 'unknown'
     assert order(ufw=10.0, raw=9.5, raw_ok=False, container=20.0) == 'unknown'
+
+
+# spec: ANYM-693
+def test_first_container_start_uses_process_start_and_is_unknown_when_a_container_cannot_be_placed(tmp_path):
+    import datetime
+    module = load_persist()
+    boot_wall = datetime.datetime(2026, 11, 2, 9, 0, tzinfo=datetime.timezone.utc).timestamp()
+    ids, inspect = tmp_path / 'ids', tmp_path / 'inspect'
+    docker = tmp_path / 'docker'
+    docker.write_text(f'#!/bin/sh\nif [ "$1" = ps ]; then cat {ids}; else cat {inspect}; fi\n')
+    docker.chmod(0o755)
+
+    def first(lines, proc=lambda pid: {11: 20.0, 12: 15.5}.get(pid)):
+        ids.write_text('\n'.join(f'c{i}' for i in range(len(lines))) + '\n')
+        inspect.write_text('\n'.join(lines) + '\n')
+        return module.first_container_start(str(docker), proc_start=proc, boot_wall=boot_wall)
+    old = 'false 0 2026-10-01T10:00:00.123456789Z'
+    assert first(['true 11 2026-11-02T09:00:20Z', 'true 12 2026-11-02T09:00:15Z', old]) == 15.5
+    # A container that is not running and started this boot cannot be placed on the clock: unknown, not a guess.
+    assert first(['true 11 2026-11-02T09:00:20Z', 'false 0 2026-11-02T10:00:00Z']) is None
+    # A line that cannot be read, a process whose start cannot be read, a missing line: unknown.
+    assert first(['true 11 2026-11-02T09:00:20Z', 'false 0 not-a-time']) is None
+    assert first(['true 99 2026-11-02T09:00:20Z']) is None
+    ids.write_text('c0\nc1\n')
+    inspect.write_text('true 11 2026-11-02T09:00:20Z\n')
+    assert module.first_container_start(str(docker), proc_start=lambda pid: 20.0, boot_wall=boot_wall) is None
+    # Nothing ran this boot: unknown (an empty host has no first container to compare with).
+    assert first([old]) is None
 
 
 # spec: ANYM-693
