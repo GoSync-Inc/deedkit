@@ -1572,12 +1572,15 @@ first, as a positive list, and only that list is requeued.
       AND e.updated_at BETWEEN :storm_start AND :storm_end
     ORDER BY e.updated_at;
    ```
-2. Keep a row only with evidence that its last attempt was an upload or transcode failure: `audio_transcode_size_limit`
-   and `model_request_failed` (the worker's own timeout) qualify; a `model_http_error` or `retry_exhausted` row
-   qualifies only when the mini's access log (read-only) shows a 408 `upload_timeout` for it in the window, or its bytes
-   exceed what the rate could carry in `upload_seconds`. Every other row (an unreadable file, an auth refusal, an
-   engine failure) is left out and listed with its reason. The kept rows are the frozen cohort: their ids and their
-   `updated_at` values from step 1.
+2. Keep a row only with per-row evidence that its last attempt was an upload or transcode failure. Only
+   `audio_transcode_size_limit` qualifies by its code (the transcode produced a file over the limit; nothing was sent).
+   `model_request_failed` is also the code of a malformed JSON answer and of any transport error unrelated to the
+   upload, so it is ambiguous like `model_http_error` (every non-2xx answer) and `retry_exhausted` (a catch-all): each
+   of those qualifies only when the worker log shows an upload timeout for that attachment's last attempt, or the
+   mini's access log (read-only) shows a 408 `upload_timeout` for that request in the window. A size or rate estimate
+   (the bytes against what the measured rate could carry in `upload_seconds`) is a hint for where to look, never
+   evidence. Every other row (an unreadable file, an auth refusal, an engine failure, an unattributed row) is left out
+   and listed with its reason. The kept rows are the frozen cohort: their ids and their `updated_at` values from step 1.
 3. Requeue exactly that cohort, in one transaction, guarded by the state the freeze saw:
 
    ```sql
