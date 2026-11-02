@@ -273,8 +273,14 @@ container memory limit. Models and account IDs in examples must be selected by
 the operator.
 
 The optional Compose overlay is `deploy/compose.enrichment.yaml`.
-Select only one intended profile (`enrichment-local` or `enrichment-cloud`);
-ordinary startup leaves both off. The local image includes hash-locked CPU
+Select only one intended profile (`enrichment-local`, `enrichment-cloud` or
+`enrichment-mini`); ordinary startup leaves all off. `enrichment-mini` runs
+`enricher-mini` for `deedkit_inference` (the owner's Mac mini) on its own
+networks, with no route to the API or the host and egress only to the mini on
+443 (ANYM-688); its config (`deploy/enrichment-mini.example.json`) holds only
+`deedkit_inference` profiles, its key is the directory `private/inference/`, and
+the apply and rules are in `docs/operations/production.md`. Never run it together
+with another profile: two workers would claim the same jobs. The local image includes hash-locked CPU
 faster-whisper dependencies, with PyAV 18.1.0 pinned for decoder compatibility.
 Neither image downloads models. Native smoke tests use synthetic speech and
 network-disabled containers. The local profile has only the internal DB network.

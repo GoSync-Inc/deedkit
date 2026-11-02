@@ -65,7 +65,7 @@ def volumes(unit):
 def test_application_units_enforce_sandbox_resource_and_log_bounds():
     applications = units()
     assert set(applications) == {'api', 'db', 'telegram', 'whatsapp1', 'whatsapp2',
-        'indexer', 'enricher', 'enricher-local', 'operator', 'subscriptions',
+        'indexer', 'enricher', 'enricher-local', 'enricher-mini', 'operator', 'subscriptions',
         'calendar-db', 'calendar-api', 'calendar-worker', 'gateway', 'calls',
         'file-lifecycle', 'file-understanding', 'cold-archive', 'cold-restore', 'message-purge', 'delivery',
         'delivery-egress', 'event-router'}
