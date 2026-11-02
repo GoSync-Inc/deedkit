@@ -184,10 +184,8 @@ def recover(path: str | Path, run_ps: Callable[[], str] | None = None,
         # (or the start-up recovery of a restored service) must still know it. A failed write stops here, nothing signalled.
         entries = [{**g, "members": [{"pid": r["pid"], "started": r["started"]} for r in rows]} if rows else g for g, rows in plan]
         ledger._write(entries)
-    selected: list[dict] = []
     for _, rows in plan:
         for row in rows:
-            selected.append(row)
             for number in (signal.SIGCONT, signal.SIGKILL):  # the parent is gone: nobody reads its answer
                 try:
                     send(row["pid"], number)
@@ -198,9 +196,10 @@ def recover(path: str | Path, run_ps: Callable[[], str] | None = None,
     for _ in range(SETTLE_POLLS):  # a killed process takes a moment to leave the table
         table = process_table(run_ps)
         alive = {(row["pid"], row["started"]) for row in table if not row["stat"].startswith("Z")}
-        # a selected process that was continued but not killed is no longer stopped: it still counts until it is gone
-        survivors = [row for row in selected if (row["pid"], row["started"]) in alive]
-        remaining = [g for g in entries if members(g, table) or any(row["pgid"] == g["pgid"] for row in survivors)]
+        # a selected process that was continued but not killed is no longer stopped, and may have left the group: it counts
+        # for its entry by the identity persisted above (pid + start text), not by its current pgid, until it is gone
+        remaining = [g for g in entries if members(g, table)
+                     or any((known["pid"], known["started"]) in alive for known in g.get("members", []))]
         if not remaining:
             break
         sleep(SETTLE_SECONDS)

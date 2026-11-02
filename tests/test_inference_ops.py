@@ -1101,6 +1101,34 @@ def test_a_retried_recovery_still_kills_a_process_it_continued_earlier(tmp_path)
 
 
 # spec: ANYM-691
+def test_a_continued_survivor_that_left_the_group_keeps_its_entry_and_is_killed_on_the_retry(tmp_path):
+    stop = time.mktime(time.strptime('Mon Nov 2 13:00:00 2026', PAUSE.START_FORMAT))
+    ledger = PAUSE.Ledger(tmp_path / 'state' / 'paused.json')
+    ledger.record(700, 700, 'Mon Nov 2 12:59:00 2026', stopped_at=stop)
+    state = {'pgid': 700, 'stat': 'T', 'alive': True, 'kill_works': False, 'sent': []}
+
+    def send(pid, number):
+        state['sent'].append((pid, number))
+        if number == signal.SIGCONT:
+            state['stat'], state['pgid'] = 'S', 701  # it runs again and has become its own group leader
+        elif state['kill_works']:
+            state['alive'] = False
+        else:
+            raise PermissionError
+
+    def table():
+        # the group leader (700) is gone; the stopped helper 701 is the only member
+        return f"701 {state['pgid']} {state['stat']} Mon Nov 2 12:59:30 2026\n" if state['alive'] else ''
+
+    report = PAUSE.recover(ledger.path, run_ps=table, send=send, sleep=lambda seconds: None)
+    assert report['kept'] == [700] and [g['pgid'] for g in ledger.groups()] == [700]  # by identity, not by its new pgid
+    state['kill_works'] = True
+    state['sent'].clear()
+    report = PAUSE.recover(ledger.path, run_ps=table, send=send, sleep=lambda seconds: None)
+    assert state['sent'] == [(701, signal.SIGCONT), (701, signal.SIGKILL)] and report['kept'] == [] and not ledger.path.exists()
+
+
+# spec: ANYM-691
 def test_recover_keeps_the_entry_of_a_continued_process_that_could_not_be_killed(tmp_path):
     stop = time.mktime(time.strptime('Mon Nov 2 13:00:00 2026', PAUSE.START_FORMAT))
     ledger = PAUSE.Ledger(tmp_path / 'state' / 'paused.json')
