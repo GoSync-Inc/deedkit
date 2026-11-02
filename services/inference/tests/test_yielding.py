@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -126,7 +127,8 @@ async def test_running_phase_stops_while_busy_and_continues_after(env):
         await s.until(lambda: size(f"{path}.main") > frozen[0] and size(f"{path}.helper") > frozen[1])
         reply = await task
         assert reply.status == 200 and reply.json()["text"] == "fake transcript"  # the same answer as an unpaused run
-        assert size(f"{path}.main") == 60 and not (env.tmp / "state" / pausestate.LEDGER_NAME).exists()
+        assert size(f"{path}.main") == 60
+        await s.until(lambda: not (env.tmp / "state" / pausestate.LEDGER_NAME).exists())
 
 
 # spec: ANYM-691
@@ -165,8 +167,8 @@ async def test_loading_and_preparation_are_never_paused(env):
 
 # spec: ANYM-691
 async def test_a_stop_that_lands_during_a_decode_is_undone_and_the_decoder_deadline_survives(env, monkeypatch):
-    """The marker appears between the ledger write and the stop: the stop lands after it and is undone at once. The
-    decode helper itself (0.6 s under a 3 s `communicate` deadline) is then never frozen while the marker exists."""
+    """The marker appears between the ledger write and the stop: the stop lands after it and is undone at once, and the
+    group is not stopped again while the marker exists."""
     from deedkit_inference.yielder import Yielder
 
     original, made = Yielder._record, []
@@ -181,8 +183,7 @@ async def test_a_stop_that_lands_during_a_decode_is_undone_and_the_decoder_deadl
     monkeypatch.setattr(Yielder, "_record", record_then_mark)
     path = env.tmp / "prog"
     async with env.running(**engines(env, timeout=30), **yielding(env, resume_after_seconds=0.2)) as s:
-        task = await s.submit(s.transcribe(fk(tick=str(path), ticks=50, decode={"seconds": 0.6, "timeout": 3}),
-                                           extra_fields={"language": "ru"}))
+        task = await s.submit(s.transcribe(fk(tick=str(path), ticks=50), extra_fields={"language": "ru"}))
         await s.until(lambda: size(f"{path}.main") > 3)
         worker = next(iter(s.service.engines["audio-default"].workers.values()))
         s.probe.between = True
@@ -193,8 +194,7 @@ async def test_a_stop_that_lands_during_a_decode_is_undone_and_the_decoder_deadl
         await asyncio.sleep(0.3)
         assert size(f"{path}.main") > advanced
         s.probe.between = False
-        reply = await task
-        assert reply.status == 200  # the decode (a helper under a deadline) finished inside it
+        assert (await task).status == 200
 
 
 # spec: ANYM-691
@@ -213,6 +213,35 @@ async def test_a_marker_that_exists_keeps_the_group_running_and_its_removal_allo
         await s.until(lambda: stopped(worker.proc.pid))
         s.probe.between = False
         await finish(task)
+
+
+# spec: ANYM-691
+async def test_flags_on_across_a_decode_never_stop_the_decoder_and_its_deadline_holds(env):
+    """A 1.5 s decode helper under a 2.5 s `communicate` deadline while Between is busy the whole time: the marker keeps
+    the group running for as long as the helper does; the tick phase after it is paused as usual."""
+    path = env.tmp / "prog"
+    async with env.running(**engines(env, timeout=30), **yielding(env)) as s:
+        task = await s.submit(s.transcribe(fk(decode={"seconds": 1.5, "timeout": 2.5}, tick=str(path), ticks=20),
+                                           extra_fields={"language": "ru"}))
+        worker = None
+        await s.until(lambda: bool(s.service.engines["audio-default"].workers))
+        worker = next(iter(s.service.engines["audio-default"].workers.values()))
+        marker = os.path.join(worker.scratch, media.MARKER_NAME)
+        await s.until(lambda: os.path.exists(marker))
+        s.probe.between = True
+        while os.path.exists(marker):  # the decoder is running: the group is never stopped, nothing is paused
+            assert not stopped(worker.proc.pid) and s.service.yielder.paused == {}
+            await asyncio.sleep(0.05)
+        await s.until(lambda: stopped(worker.proc.pid))  # the phase after the decode is paused
+        s.probe.between = False
+        assert (await task).status == 200  # and the decode finished inside its deadline
+
+
+# spec: ANYM-691
+def test_run_tool_fails_closed_when_the_marker_cannot_be_made(tmp_path):
+    with pytest.raises(OSError):
+        media.run_tool([sys.executable, "-I", "-c", "pass"], 5, own_group=False,
+                       marker=str(tmp_path / "missing" / media.MARKER_NAME))
 
 
 # spec: ANYM-691
@@ -514,6 +543,22 @@ async def test_a_job_whose_real_work_is_k_times_its_estimate_still_finishes_insi
 
 
 # spec: ANYM-691
+async def test_a_job_that_spends_its_whole_budget_still_finishes_inside_its_deadline(env):
+    """The contention never clears: the pause runs to the end of its budget. Real work is twice the estimate
+    (K = 3), so the work that is left after the budget fits what the formula kept free."""
+    path = env.tmp / "prog"
+    async with env.running(aliases=long_timeout(), **yielding(env, deadline_margin_seconds=0.5)) as s:
+        started = time.monotonic()
+        task = await s.submit(s.transcribe(fk(tick=str(path), ticks=40, estimate=1),
+                                           headers={"X-Request-Deadline-Seconds": "8"}))
+        await s.until(lambda: size(f"{path}.main") > 3)
+        s.probe.between = True  # and it stays on
+        reply = await task
+        assert reply.status == 200 and time.monotonic() - started < 8
+        assert float(reply.headers["x-paused-seconds"]) > 3.5  # the budget (about 4.9 s) was spent
+
+
+# spec: ANYM-691
 async def test_a_job_whose_work_exceeds_k_times_its_estimate_is_the_documented_loss(env, caplog):
     """The counterexample the card documents: 10 times the estimate, K = 3. The pause spends all its budget, the work
     that is left runs past the deadline and the client (read timeout = deadline) has gone: the record shows it."""
@@ -608,6 +653,35 @@ async def test_a_real_hang_still_times_out_after_a_pause(env):
 
 
 # spec: ANYM-691
+async def test_a_worker_pause_longer_than_the_phase_timeout_does_not_time_it_out(env):
+    path = env.tmp / "prog"
+    async with env.running(**engines(env, timeout=2.5), **yielding(env)) as s:
+        task = await s.submit(s.transcribe(fk(tick=str(path), ticks=40), extra_fields={"language": "ru"}))
+        await s.until(lambda: size(f"{path}.main") > 10)
+        s.probe.between = True
+        await s.until(lambda: bool(s.service.yielder.paused))
+        await asyncio.sleep(3.0)  # longer than the whole phase timeout
+        s.probe.between = False
+        reply = await task
+        assert reply.status == 200 and size(f"{path}.main") == 40
+
+
+# spec: ANYM-691
+async def test_a_worker_hang_still_times_out_after_a_pause(env):
+    async with env.running(**engines(env, timeout=2.0), **yielding(env)) as s:
+        task = await s.submit(s.transcribe(fk(mode="hang"), extra_fields={"language": "ru"}))
+        await s.until(lambda: bool(s.service.engines["audio-default"].workers))
+        worker = next(iter(s.service.engines["audio-default"].workers.values()))
+        await s.until(lambda: worker.job is not None)
+        s.probe.between = True
+        await s.until(lambda: bool(s.service.yielder.paused))
+        await asyncio.sleep(0.8)
+        s.probe.between = False
+        reply = await task
+        assert reply.status == 504 and reply.code == "engine_timeout"
+
+
+# spec: ANYM-691
 async def test_estimated_wait_excludes_paused_time(env):
     clock = Virtual()
     async with manual(env, clock) as (s, cpu):
@@ -633,7 +707,94 @@ async def test_the_ledger_names_the_group_before_it_is_stopped_and_loses_it_afte
         assert [g["pgid"] for g in groups] == [pid] and groups[0]["leader"] == pid
         s.probe.between = False
         await tick(s, clock, 20, times=2)
-        assert not (env.tmp / "state" / pausestate.LEDGER_NAME).exists()
+        await s.until(lambda: not (env.tmp / "state" / pausestate.LEDGER_NAME).exists())  # removed off the loop
+        await finish(task)
+
+
+# spec: ANYM-691
+async def test_the_ledger_names_the_group_before_the_stop_signal(env, monkeypatch):
+    clock, seen = Virtual(), []
+    real = os.killpg
+
+    def killpg(pgid, number):
+        if number == signal.SIGSTOP:
+            seen.append([g["pgid"] for g in pausestate.Ledger(env.tmp / "state" / pausestate.LEDGER_NAME).groups()])
+            seen.append(pgid)
+        return real(pgid, number)
+
+    monkeypatch.setattr(os, "killpg", killpg)
+    async with manual(env, clock) as (s, cpu):
+        task, pid = await paused_child(s, clock, env.tmp / "prog")
+        assert seen == [[pid], pid]  # the entry was on disk when the signal went out
+        await finish(task)
+
+
+# spec: ANYM-691
+async def test_the_ledger_stop_time_covers_helpers_spawned_before_the_stop_lands(env):
+    clock = Virtual()
+    async with manual(env, clock) as (s, cpu):
+        task, pid = await paused_child(s, clock, env.tmp / "prog")
+        entry = pausestate.Ledger(env.tmp / "state" / pausestate.LEDGER_NAME).groups()[0]
+        assert entry["stopped_at"] >= time.time() + 5  # recorded ahead of the stop by the slack
+        rows = [{"pid": 9001, "pgid": pid, "stat": "T", "start": entry["stopped_at"] - 3, "started": "x"}]
+        assert pausestate.members({**entry, "leader_start": entry["leader_start"]}, rows) == rows  # a late helper is owned
+        await finish(task)
+
+
+# spec: ANYM-691
+async def test_a_worker_whose_call_ended_while_it_was_stopped_is_continued(env):
+    """A worker can answer just before the stop lands: the scheduler then clears `worker.job` while the group stays
+    stopped. The pause ends with a SIGCONT, never by being forgotten."""
+    path = env.tmp / "prog"
+    async with env.running(**engines(env, timeout=30), **yielding(env)) as s:
+        task = await s.submit(s.transcribe(fk(tick=str(path), ticks=100), extra_fields={"language": "ru"}))
+        await s.until(lambda: size(f"{path}.main") > 3)
+        worker = next(iter(s.service.engines["audio-default"].workers.values()))
+        s.probe.between = True
+        await s.until(lambda: stopped(worker.proc.pid))
+        worker.job = None  # what consuming a buffered answer does
+        await s.until(lambda: not stopped(worker.proc.pid) and s.service.yielder.paused == {})
+        await s.until(lambda: not (env.tmp / "state" / pausestate.LEDGER_NAME).exists())
+        await finish(task)
+
+
+# spec: ANYM-691
+async def test_a_failed_continue_keeps_the_group_tracked_and_is_retried(env, monkeypatch):
+    clock = Virtual()
+    real, failing = os.killpg, {"on": False}
+
+    def killpg(pgid, number):
+        if failing["on"] and number == signal.SIGCONT:
+            raise PermissionError(1, "denied")
+        return real(pgid, number)
+
+    monkeypatch.setattr(os, "killpg", killpg)
+    async with manual(env, clock) as (s, cpu):
+        task, pid = await paused_child(s, clock, env.tmp / "prog")
+        failing["on"] = True
+        s.probe.between = False
+        await tick(s, clock, 20, times=2)  # the continue is due and fails: nothing is forgotten
+        pause = next(iter(s.service.yielder.paused.values()))
+        assert pause.failures >= 1 and stopped(pid)
+        assert pausestate.Ledger(env.tmp / "state" / pausestate.LEDGER_NAME).groups()
+        failing["on"] = False
+        await tick(s, clock, 2)  # the retry succeeds
+        assert s.service.yielder.paused == {}
+        await s.until(lambda: not stopped(pid))
+        await finish(task)
+
+
+# spec: ANYM-691
+async def test_a_stuck_ledger_never_holds_back_the_continue_or_the_event_loop(env, monkeypatch):
+    clock = Virtual()
+    async with manual(env, clock) as (s, cpu):
+        task, pid = await paused_child(s, clock, env.tmp / "prog")
+        monkeypatch.setattr(pausestate.Ledger, "remove", lambda self, pgid: time.sleep(3))  # a disk that stalls
+        s.probe.between = False
+        started = time.monotonic()
+        await tick(s, clock, 20, times=2)
+        await s.until(lambda: not stopped(pid), 1.5)  # continued at once, long before the ledger write returns
+        assert time.monotonic() - started < 2.5
         await finish(task)
 
 

@@ -63,10 +63,9 @@ def image_size(path):
 
 
 def _mark(marker):
-    try:
-        os.close(os.open(marker, os.O_WRONLY | os.O_CREAT, 0o600))
-    except OSError:
-        pass  # no marker: the yielder may then pause this phase, which only costs the helper its deadline margin
+    """Create the no-pause marker. A failure raises: a decoder that cannot be protected from a pause does not start
+    (the scratch directory also holds the decoded window, so a scratch that cannot be written fails the job anyway)."""
+    os.close(os.open(marker, os.O_WRONLY | os.O_CREAT, 0o600))
 
 
 def run_tool(argv, timeout, env=None, own_group=True, marker=None):

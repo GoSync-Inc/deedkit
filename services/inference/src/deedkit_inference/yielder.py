@@ -16,8 +16,8 @@ import pwd
 import signal
 import stat
 import subprocess
-import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Annotated, Literal
 
@@ -37,6 +37,11 @@ PS_CPU = ["/bin/ps", "-axo", "uid=,pid=,lstart=,cputime="]
 PS_TIMEOUT = 2.0
 TICK_TIMEOUT = 8.0  # one whole tick: a ps that hangs, a ledger that blocks
 MAX_BACKOFF = 30.0
+MAX_CONT_FAILURES = 5  # SIGCONT attempts on one group before its ledger entry is left to recovery
+#: The ledger is written before the stop and the stop lands later (a thread hop, at worst a whole tick). Recovery
+#: owns the members that started no later than `stopped_at`, so it is recorded this far ahead: a helper spawned
+#: in between is a member of the group the stop freezes, and a crash must not strand it.
+STOP_SLACK_SECONDS = TICK_TIMEOUT + 1.0
 
 
 class YieldSettings(BaseModel):
@@ -177,6 +182,7 @@ class Pause:
     flags: set = field(default_factory=set)
     cores: list = field(default_factory=list)
     wasted: float = 0.0
+    failures: int = 0  # SIGCONT attempts that failed
 
     @property
     def pgid(self):
@@ -195,7 +201,8 @@ class Yielder:
         self.clear_since = None
         self.last_tick = None
         self.task = None
-        self.lock = threading.Lock()  # the ledger is read-modify-write: one writer at a time, thread or loop
+        # The ledger is read-modify-write: one thread does all of it, in submission order, and the event loop never waits for it.
+        self.io = ThreadPoolExecutor(max_workers=1, thread_name_prefix="yield-ledger")
 
     # --- life ------------------------------------------------------------------------------------------------
     def start(self):
@@ -208,6 +215,8 @@ class Yielder:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         self.resume_all("stop")
+        with contextlib.suppress(Exception):  # let the ledger cleanup finish, but never wait long for a stuck disk
+            await asyncio.wait_for(asyncio.to_thread(self.io.shutdown, True), 5)
 
     def disable(self):
         """Yielding off for good (a drain): every stopped group continues now, and nothing is stopped again."""
@@ -293,8 +302,10 @@ class Yielder:
                 pause.cores.append(cores)
                 if cores < self.cfg.pause_min_foreign_cores:
                     pause.wasted += seconds
-            if self._ended(pause):
-                self._resume(pause, "ended", signal_group=False)
+            if pause.failures:
+                self._resume(pause, "retry")
+            elif self._ended(pause):
+                self._resume(pause, "ended")  # a live worker whose call was answered just before the stop stays stopped
             elif pause.marker is not None and os.path.exists(pause.marker):
                 self._resume(pause, "decode")  # a decode helper started after the stop: undone within one tick
             elif now >= pause.until:
@@ -347,12 +358,11 @@ class Yielder:
         return Candidate(running, "worker" if worker is not None else "child", proc, worker, marker, allowance)
 
     def _record(self, candidate):
-        """Thread: write the ledger BEFORE the stop. False when the leader is gone; a LedgerError fails the tick."""
+        """Ledger thread: write the group BEFORE the stop. False when the leader is gone; a LedgerError fails the tick."""
         started = pausestate.start_text(candidate.proc.pid)
         if started is None:
             return False
-        with self.lock:
-            self.ledger.record(candidate.proc.pid, candidate.proc.pid, started, stopped_at=self.wall())
+        self.ledger.record(candidate.proc.pid, candidate.proc.pid, started, stopped_at=self.wall() + STOP_SLACK_SECONDS)
         return True
 
     async def _enter(self, now, flags):
@@ -363,7 +373,7 @@ class Yielder:
             candidate = self._assess(running, now)
             if isinstance(candidate, str):
                 continue
-            if not await asyncio.to_thread(self._record, candidate):
+            if not await asyncio.wrap_future(self.io.submit(self._record, candidate)):
                 continue
             self._stop(candidate, flags)
 
@@ -389,28 +399,46 @@ class Yielder:
         try:
             os.killpg(pause.pgid, signal.SIGSTOP)
         except (ProcessLookupError, PermissionError):
-            self._resume(pause, "gone", signal_group=False)
+            self._resume(pause, "gone")
             return
         if pause.marker is not None and os.path.exists(pause.marker):
             self._resume(pause, "decode")  # the marker appeared before the stop landed: the decoder keeps its deadline
 
     # --- continuing --------------------------------------------------------------------------------------------
-    def _unrecord(self, pgid):
+    def _remove(self, pgid):
         try:
-            with self.lock:
-                self.ledger.remove(pgid)
-                self.ledger.clear_if_empty()
+            self.ledger.remove(pgid)
+            self.ledger.clear_if_empty()
         except Exception as error:  # noqa: BLE001 - a stale entry is harmless: recovery only touches stopped members
             LOG.error("yield: ledger entry not removed: %s", type(error).__name__)
 
-    def _resume(self, pause, why, *, signal_group=True):
-        """Continue the group and close the books. Never raises: it also runs from `finally` blocks."""
-        self.paused.pop(pause.pgid, None)
+    def _unrecord(self, pgid):
+        """Queue the removal on the ledger thread: after a continue it is only bookkeeping, and a later record of the
+        same group queues behind it."""
+        with contextlib.suppress(RuntimeError):  # the executor is shut down: the process is going away
+            self.io.submit(self._remove, pgid)
+
+    def _resume(self, pause, why):
+        """Continue the group, then close the books. True when closed. A SIGCONT that fails keeps the pause tracked
+        (retried on every tick); after MAX_CONT_FAILURES the books close but the ledger entry stays for recovery."""
         LOG.debug("yield: continue reason=%s", why)
-        job, now = pause.job, self.now()
-        if signal_group and pause.proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
+        if pause.proc.returncode is None:
+            try:
                 os.killpg(pause.pgid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+            except OSError as error:
+                pause.failures += 1
+                LOG.error("yield: continue failed (%d of %d): %s", pause.failures, MAX_CONT_FAILURES, type(error).__name__)
+                if pause.failures >= MAX_CONT_FAILURES:
+                    self._close(pause, keep_ledger=True)
+                return False
+        self._close(pause)
+        return True
+
+    def _close(self, pause, keep_ledger=False):
+        self.paused.pop(pause.pgid, None)
+        job, now = pause.job, self.now()
         spent = max(0.0, now - pause.since)
         job.paused += spent
         job.paused_since = None
@@ -421,11 +449,15 @@ class Yielder:
             self.scheduler.release_timeout(job)
         except Exception:  # noqa: BLE001
             LOG.error("yield: phase timeout not restored")
-        self._unrecord(pause.pgid)
+        if not keep_ledger:
+            self._unrecord(pause.pgid)
         mean = sum(pause.cores) / len(pause.cores) if pause.cores else 0.0
         LOG.info("yield: job=%s paused=%.1f flags=%s foreign_cores_mean=%.2f wasted=%.1f budget_exhausted=%d",
                  job.log_id, spent, ",".join(sorted(pause.flags)), mean, pause.wasted, int(job.budget_exhausted))
 
     def resume_all(self, why):
         for pause in list(self.paused.values()):
-            self._resume(pause, why)
+            try:
+                self._resume(pause, why)
+            except Exception as error:  # noqa: BLE001 - one group's failure never keeps another stopped
+                LOG.error("yield: resume failed: %s", type(error).__name__)
