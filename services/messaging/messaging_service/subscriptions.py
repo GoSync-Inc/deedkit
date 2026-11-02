@@ -909,7 +909,7 @@ def prune_subscriptions(store, *, max_subscriptions=16):
 
 def _retention_batch(c, *gates):
     from . import subscription_retention
-    return subscription_retention._retention_batch(c)
+    return subscription_retention._retention_batch(c, *gates)
 
 
 def _prune_batch(c, candidate, days):
