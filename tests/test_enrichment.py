@@ -613,43 +613,37 @@ def bitrate(path):
     return path.stat().st_size*8/60
 
 
-# spec: ANYM-696
-def test_opus_voice_note_at_chat_app_bitrate_reaches_the_mini_byte_identical(tmp_path):
-    note=synth_audio(tmp_path,'note.ogg','-c:a','libopus','-b:a','32k')
-    assert bitrate(note)<=48000
-    result,seen=run_mini(tmp_path,'audio',mini(tmp_path,'audio'),mime='audio/ogg',data=note.read_bytes())
-    _,file=multipart_parts(seen[0])
-    assert file['bytes']==note.read_bytes() and file['filename']=='recording.ogg' and file['content_type']=='audio/ogg'
-    meta=result['metadata']
-    assert meta['transcoded'] is False and meta['transcode_lossy'] is False and meta['transcode_format'] is None
-
+# The python report of CI holds at most 10,000 cases (scripts/tiden_ci.py): one case per behaviour, loops inside.
 
 # spec: ANYM-696
-@pytest.mark.parametrize('name,mime,encode',[
-    ('opus64.ogg','audio/ogg',['-c:a','libopus','-b:a','64k']),
-    ('mp3_128.mp3','audio/mpeg',['-c:a','libmp3lame','-b:a','128k'])])
-def test_a_heavy_note_is_transcoded_to_small_opus_for_the_mini(tmp_path,name,mime,encode):
-    note=synth_audio(tmp_path,name,*encode);before=note.read_bytes()
-    assert bitrate(note)>48000
-    result,seen=run_mini(tmp_path,'audio',mini(tmp_path,'audio'),mime=mime,data=before)
-    _,file=multipart_parts(seen[0])
-    assert len(file['bytes'])<=200000 and file['bytes'].startswith(b'OggS')
-    assert file['filename']=='recording.ogg' and file['content_type']=='audio/ogg'
-    sent=tmp_path/'sent.ogg';sent.write_bytes(file['bytes'])
-    assert probe_json(sent,'stream=codec_name,channels,sample_rate')['streams'][0]=={'codec_name':'opus','channels':1,'sample_rate':'48000'}
-    meta=result['metadata']
-    assert meta['transcoded'] is True and meta['transcode_lossy'] is True and meta['transcode_format']=='opus'
-    assert (tmp_path/'original').read_bytes()==before  # the original is never modified
+def test_opus_at_chat_app_bitrate_and_low_bitrate_vorbis_reach_the_mini_byte_identical(tmp_path):
+    opus=synth_audio(tmp_path,'note.ogg','-c:a','libopus','-b:a','32k')
+    assert bitrate(opus)<=48000
+    vorbis=synth_audio(tmp_path,'vorbis.ogg','-ac','2','-c:a','vorbis','-strict','-2',source='sine=frequency=440:duration=60:sample_rate=16000')
+    assert probe_json(vorbis,'stream=codec_name')['streams'][0]['codec_name']=='vorbis' and bitrate(vorbis)<=32000
+    for note in (opus,vorbis):  # an ogg/vorbis note is not labelled Opus: it is sent as it is
+        result,seen=run_mini(tmp_path,'audio',mini(tmp_path,'audio'),mime='audio/ogg',data=note.read_bytes())
+        _,file=multipart_parts(seen[0])
+        assert file['bytes']==note.read_bytes() and file['filename']=='recording.ogg' and file['content_type']=='audio/ogg'
+        meta=result['metadata']
+        assert meta['transcoded'] is False and meta['transcode_lossy'] is False and meta['transcode_format'] is None
 
 
 # spec: ANYM-696
-def test_a_low_bitrate_vorbis_note_is_sent_as_it_is_and_not_labelled_opus(tmp_path):
-    note=synth_audio(tmp_path,'vorbis.ogg','-ac','2','-c:a','vorbis','-strict','-2',source='sine=frequency=440:duration=60:sample_rate=16000')
-    assert probe_json(note,'stream=codec_name')['streams'][0]['codec_name']=='vorbis' and bitrate(note)<=32000
-    result,seen=run_mini(tmp_path,'audio',mini(tmp_path,'audio'),mime='audio/ogg',data=note.read_bytes())
-    _,file=multipart_parts(seen[0])
-    assert file['bytes']==note.read_bytes() and file['filename']=='recording.ogg'
-    assert result['metadata']['transcoded'] is False and result['metadata']['transcode_format'] is None
+def test_a_heavy_note_is_transcoded_to_small_opus_for_the_mini(tmp_path):
+    for name,mime,encode in [('opus64.ogg','audio/ogg',['-c:a','libopus','-b:a','64k']),
+            ('mp3_128.mp3','audio/mpeg',['-c:a','libmp3lame','-b:a','128k'])]:
+        note=synth_audio(tmp_path,name,*encode);before=note.read_bytes()
+        assert bitrate(note)>48000
+        result,seen=run_mini(tmp_path,'audio',mini(tmp_path,'audio'),mime=mime,data=before)
+        _,file=multipart_parts(seen[0])
+        assert len(file['bytes'])<=200000 and file['bytes'].startswith(b'OggS')
+        assert file['filename']=='recording.ogg' and file['content_type']=='audio/ogg'
+        sent=tmp_path/'sent.ogg';sent.write_bytes(file['bytes'])
+        assert probe_json(sent,'stream=codec_name,channels,sample_rate')['streams'][0]=={'codec_name':'opus','channels':1,'sample_rate':'48000'}
+        meta=result['metadata']
+        assert meta['transcoded'] is True and meta['transcode_lossy'] is True and meta['transcode_format']=='opus'
+        assert (tmp_path/'original').read_bytes()==before  # the original is never modified
 
 
 # spec: ANYM-696
@@ -665,30 +659,30 @@ def test_other_asr_providers_still_receive_mp3_for_an_ogg_note(tmp_path):
 
 
 # spec: ANYM-696
-@pytest.mark.parametrize('codec,container,size,unchanged',[
-    ('opus','ogg',600000,True),      # exactly 48 kbps over 100 s: the Opus-in-ogg ceiling
-    ('opus','ogg',600001,False),
-    ('opus','ogg',410000,True),      # between 32 and 48 kbps: the chat apps' headroom
-    ('mp3','mp3',400000,None),       # exactly 32 kbps, not Opus: as it is
-    ('mp3','mp3',400001,False),
-    ('opus','matroska,webm',400001,False),  # Opus outside ogg is not the unchanged branch
-    ('aac','mov,mp4,m4a,3gp,3g2,mj2',500000,False)])
-def test_audio_thresholds_choose_unchanged_or_opus(tmp_path,monkeypatch,codec,container,size,unchanged):
-    calls=fake_audio_tools(monkeypatch,duration=100,codec=codec,container=container,output_size=1000)
-    mime='audio/ogg' if container=='ogg' else 'audio/mpeg'
-    result,seen=run_mini(tmp_path,'audio',mini(tmp_path,'audio'),mime=mime,data=b'x'*size)
-    ffmpeg=[c for c in calls if c[0]=='ffmpeg']
-    if unchanged is False:
-        assert len(ffmpeg)==1
-        command=ffmpeg[0]
-        for flag,value in [('-c:a','libopus'),('-b:a','24k'),('-application','voip'),('-ac','1'),('-ar','16000')]:
-            assert command[command.index(flag)+1]==value
-        assert '-vn' in command and '-t' not in command and '-ss' not in command and '-fs' not in command
-        assert result['metadata']['transcode_format']=='opus'
-        assert multipart_parts(seen[0])[1]['filename']=='recording.ogg'
-    else:
-        assert ffmpeg==[] and result['metadata']['transcoded'] is False
-        assert len(multipart_parts(seen[0])[1]['bytes'])==size
+def test_audio_thresholds_choose_unchanged_or_opus(tmp_path,monkeypatch):
+    for codec,container,size,unchanged in [
+            ('opus','ogg',600000,True),      # exactly 48 kbps over 100 s: the Opus-in-ogg ceiling
+            ('opus','ogg',600001,False),
+            ('opus','ogg',410000,True),      # between 32 and 48 kbps: the chat apps' headroom
+            ('mp3','mp3',400000,True),       # exactly 32 kbps, not Opus: as it is
+            ('mp3','mp3',400001,False),
+            ('opus','matroska,webm',400001,False),  # Opus outside ogg is not the unchanged branch
+            ('aac','mov,mp4,m4a,3gp,3g2,mj2',500000,False)]:
+        calls=fake_audio_tools(monkeypatch,duration=100,codec=codec,container=container,output_size=1000)
+        mime='audio/ogg' if container=='ogg' else 'audio/mpeg'
+        result,seen=run_mini(tmp_path,'audio',mini(tmp_path,'audio'),mime=mime,data=b'x'*size)
+        ffmpeg=[c for c in calls if c[0]=='ffmpeg']
+        if not unchanged:
+            assert len(ffmpeg)==1,(codec,container,size)
+            command=ffmpeg[0]
+            for flag,value in [('-c:a','libopus'),('-b:a','24k'),('-application','voip'),('-ac','1'),('-ar','16000')]:
+                assert command[command.index(flag)+1]==value
+            assert '-vn' in command and '-t' not in command and '-ss' not in command and '-fs' not in command
+            assert result['metadata']['transcode_format']=='opus'
+            assert multipart_parts(seen[0])[1]['filename']=='recording.ogg'
+        else:
+            assert ffmpeg==[] and result['metadata']['transcoded'] is False,(codec,container,size)
+            assert len(multipart_parts(seen[0])[1]['bytes'])==size
 
 
 # spec: ANYM-696
@@ -760,50 +754,33 @@ def forbidden(_):raise AssertionError('Nothing may be sent')
 
 
 # spec: ANYM-696
-def test_a_phone_photo_is_scaled_to_2048_and_under_the_byte_budget_before_upload(tmp_path):
-    photo=synth_image(tmp_path,'photo.jpg','4000x3000');before=photo.read_bytes()
-    result,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'),mime='image/jpeg',data=before)
+def test_pictures_are_scaled_recoded_or_sent_as_they_are_by_size_and_budget(tmp_path):
+    mini_image=mini(tmp_path,'image')
+    # A phone photo: longer edge 2048, under the byte budget (base64 included), the original untouched.
+    before=synth_image(tmp_path,'photo.jpg','4000x3000').read_bytes()
+    result,seen=run_mini(tmp_path,'image',mini_image,mime='image/jpeg',data=before)
     mime,data,encoded=sent_image(seen[0])
-    assert mime=='image/jpeg' and len(data)<=700000 and encoded<=940000
-    assert picture_size(tmp_path,data)==(2048,1536)
+    assert mime=='image/jpeg' and len(data)<=700000 and encoded<=940000 and picture_size(tmp_path,data)==(2048,1536)
     assert result['metadata']['image_downscaled'] is True and result['metadata']['image_over_budget'] is False
-    assert (tmp_path/'original').read_bytes()==before  # the original is never modified
-
-
-# spec: ANYM-696
-def test_a_small_picture_goes_byte_identical(tmp_path):
-    small=synth_image(tmp_path,'small.jpg','1000x800')
-    assert small.stat().st_size<700000
-    result,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'),mime='image/jpeg',data=small.read_bytes())
-    mime,data,_=sent_image(seen[0])
-    assert mime=='image/jpeg' and data==small.read_bytes()
+    assert (tmp_path/'original').read_bytes()==before
+    # A small picture goes byte-identical.
+    small=synth_image(tmp_path,'small.jpg','1000x800').read_bytes()
+    assert len(small)<700000
+    result,seen=run_mini(tmp_path,'image',mini_image,mime='image/jpeg',data=small)
+    assert sent_image(seen[0])[:2]==('image/jpeg',small)
     assert result['metadata']['image_downscaled'] is False and result['metadata']['image_over_budget'] is False
-
-
-# spec: ANYM-696
-def test_an_incompressible_picture_ends_over_budget_and_is_sent(tmp_path):
-    noise=synth_image(tmp_path,'noise.png','3000x2000',noise=True)
-    result,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'),mime='image/png',data=noise.read_bytes())
+    # An incompressible one ends over budget and is sent anyway.
+    noise=synth_image(tmp_path,'noise.png','3000x2000',noise=True).read_bytes()
+    result,seen=run_mini(tmp_path,'image',mini_image,mime='image/png',data=noise)
     mime,data,_=sent_image(seen[0])
     assert mime=='image/jpeg' and len(data)>700000 and picture_size(tmp_path,data)==(2048,1365)
     assert result['metadata']['image_downscaled'] is True and result['metadata']['image_over_budget'] is True
-
-
-# spec: ANYM-696
-def test_a_heavy_picture_under_the_edge_is_recoded_but_never_upscaled(tmp_path):
-    noise=synth_image(tmp_path,'noise.png','1500x1000',noise=True)
-    assert noise.stat().st_size>700000
-    _,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'),mime='image/png',data=noise.read_bytes())
+    # A heavy one under the edge is recoded but never enlarged.
+    heavy=synth_image(tmp_path,'heavy.png','1500x1000',noise=True).read_bytes()
+    assert len(heavy)>700000
+    _,seen=run_mini(tmp_path,'image',mini_image,mime='image/png',data=heavy)
     mime,data,_=sent_image(seen[0])
     assert mime=='image/jpeg' and picture_size(tmp_path,data)==(1500,1000)
-
-
-# spec: ANYM-696
-@pytest.mark.parametrize('orientation,expected',[(1,(2048,1536)),(3,(2048,1536)),(6,(1536,2048)),(8,(1536,2048))])
-def test_the_exif_orientation_is_applied_when_a_photo_is_scaled(tmp_path,orientation,expected):
-    photo=with_exif_orientation(synth_image(tmp_path,'photo.jpg','4000x3000').read_bytes(),orientation)
-    _,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'),mime='image/jpeg',data=photo)
-    assert picture_size(tmp_path,sent_image(seen[0])[1])==expected
 
 
 def marker_picture(tmp_path):
@@ -829,17 +806,20 @@ ORIENTED_CORNER={1:lambda x,y:(x,y),2:lambda x,y:(1-x,y),3:lambda x,y:(1-x,1-y),
 
 
 # spec: ANYM-696
-@pytest.mark.parametrize('padding',[0,70000])
-@pytest.mark.parametrize('orientation',range(1,9))
-def test_the_exif_orientation_puts_every_corner_where_it_belongs_even_behind_other_segments(tmp_path,orientation,padding):
-    photo=with_exif_orientation(marker_picture(tmp_path),orientation,padding)
-    _,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'),mime='image/jpeg',data=photo)
-    values,size=corners(tmp_path,sent_image(seen[0])[1])
-    assert size==((2048,1536) if orientation<5 else (1536,2048))
+def test_the_exif_orientation_puts_every_corner_where_it_belongs_even_behind_other_segments_and_the_exif_is_dropped(tmp_path):
     stored={(0,0):255,(1,0):170,(0,1):85,(1,1):0}  # (x, y) of the stored picture's corner: its gray value
-    shown={(0,0):values[0],(1,0):values[1],(0,1):values[2],(1,1):values[3]}
-    for (x,y),gray in stored.items():
-        assert abs(shown[ORIENTED_CORNER[orientation](x,y)]-gray)<=30,(orientation,padding,(x,y),shown)
+    for padding in (0,70000):
+        for orientation in range(1,9):
+            photo=with_exif_orientation(marker_picture(tmp_path),orientation,padding)
+            assert b'Exif' in photo
+            _,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'),mime='image/jpeg',data=photo)
+            sent=sent_image(seen[0])[1]
+            assert b'Exif' not in sent  # the scaled copy carries no EXIF, GPS included
+            values,size=corners(tmp_path,sent)
+            assert size==((2048,1536) if orientation<5 else (1536,2048))
+            shown={(0,0):values[0],(1,0):values[1],(0,1):values[2],(1,1):values[3]}
+            for (x,y),gray in stored.items():
+                assert abs(shown[ORIENTED_CORNER[orientation](x,y)]-gray)<=30,(orientation,padding,(x,y),shown)
 
 
 # spec: ANYM-696
@@ -877,32 +857,23 @@ def test_a_slow_picture_tool_ends_inside_the_profile_deadline_as_invalid_image_t
     assert error.value.code=='invalid_image'
 
 
-# spec: ANYM-696
-def test_the_scaled_copy_drops_the_exif_block(tmp_path):
-    photo=with_exif_orientation(synth_image(tmp_path,'photo.jpg','4000x3000').read_bytes(),6)
-    assert b'Exif' in photo
-    _,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'),mime='image/jpeg',data=photo)
-    assert b'Exif' not in sent_image(seen[0])[1]
-
-
-BAD_PICTURES={'corrupt':bytes(range(256))*400,  # the test id carries the name only: a 100 KB id would be PYTEST_CURRENT_TEST, too big for exec
+BAD_PICTURES={'corrupt':bytes(range(256))*400,
     'concat':b"ffconcat version 1.0\nfile 'original'\n",
     'svg':b'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>',
     'playlist':b'#EXTM3U\n#EXTINF:1,x\nfile:///etc/passwd\n'}
 
 
 # spec: ANYM-696
-@pytest.mark.parametrize('name',list(BAD_PICTURES))
-def test_a_bad_picture_fails_as_invalid_image_sends_nothing_and_the_next_job_succeeds(tmp_path,monkeypatch,name):
+def test_a_bad_picture_fails_as_invalid_image_sends_nothing_and_the_next_job_succeeds(tmp_path,monkeypatch):
     import tempfile
-    data=BAD_PICTURES[name]
     scratch=tmp_path/'scratch';scratch.mkdir();monkeypatch.setattr(tempfile,'tempdir',str(scratch))
-    path=tmp_path/'original';path.write_bytes(data)
-    with pytest.raises(ModelError) as error:
-        infer(mini(tmp_path,'image'),'image',path,'image/jpeg',transport=httpx.MockTransport(forbidden))
-    assert error.value.code=='invalid_image' and list(scratch.iterdir())==[]
-    result,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'))
-    assert len(seen)==1 and result['title'] and list(scratch.iterdir())==[]
+    for name,data in BAD_PICTURES.items():
+        path=tmp_path/'original';path.write_bytes(data)
+        with pytest.raises(ModelError) as error:
+            infer(mini(tmp_path,'image'),'image',path,'image/jpeg',transport=httpx.MockTransport(forbidden))
+        assert error.value.code=='invalid_image' and list(scratch.iterdir())==[],name
+        result,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'))
+        assert len(seen)==1 and result['title'] and list(scratch.iterdir())==[],name
 
 
 # spec: ANYM-696
