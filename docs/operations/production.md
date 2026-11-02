@@ -992,6 +992,24 @@ is absent and `--check` prints `idle`; then remove the units (`daemon-reload`) a
 (`/opt/deedkit/calendar-backup.removed-<date>`, root `0700`) rather than deleting its journal and evidence. A
 failed check stops the undo. Messaging's files are not touched.
 
+Calendar backup freshness and same-night catch-up (ANYM-694, BACKUP.md "Daily run and freshness"): a hand install
+under the section 2 gates (units and a script, no schema, no data). The script is outside every file autodeploy
+compares (it compares only the runner, `BACKUP_RUNNER`), and `production.py` installs itself with the release, so
+nothing here is sequenced with a release. Steps, as root: install `deploy/calendar-backup-freshness.py` as
+`/opt/deedkit/calendar-backup/freshness.py` (root, `0755`); copy the four files
+`deploy/deedkit-calendar-backup-fresh.service`, `-fresh.timer`, `-catchup.service` and `-catchup.timer` to
+`/etc/systemd/system/` (`0644`); `systemctl daemon-reload`; `systemctl enable --now
+deedkit-calendar-backup-fresh.timer deedkit-calendar-backup-catchup.timer`. `freshness.json` is mode `0644`, but
+`/opt/deedkit/calendar-backup/` and its `backups/` stay root `0700` (the runner refuses a job directory with any
+group or other permission bit, `private_backup_directory_required`, so never loosen them or add an ACL there). Run
+`production.py status` as root, as `deploy` does; another user sees `calendar backup: freshness file unreadable
+(PermissionError)`. Not during an active call, and not 17:30Z-19:30Z. Read back: `systemctl start deedkit-calendar-backup-fresh.service` succeeds and `freshness.json`
+says `fresh`; `production.py status` prints `calendar backup: fresh age=...`; `systemctl list-timers
+'deedkit-calendar-backup-*'` lists both new timers; the first 19:15 fire is skipped by its condition (journal) and
+no second snapshot exists that day. Undo: `systemctl disable --now deedkit-calendar-backup-catchup.timer
+deedkit-calendar-backup-fresh.timer`, remove the four unit files and `freshness.py`, `daemon-reload`; the daily
+service and timer are never touched.
+
 ### Module event router (ANYM-575)
 
 The router (`deploy/compose.event-router.yaml`, SUBSCRIPTIONS.md "Module event router") is not

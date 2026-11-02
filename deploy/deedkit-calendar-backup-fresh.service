@@ -1,0 +1,19 @@
+[Unit]
+Description=DeedKit family calendar backup freshness check (ANYM-694)
+
+[Service]
+Type=oneshot
+# Read-only reader of status.json: no lock, no container runtime, no network, so it can never delay a backup, a deploy or
+# messaging's run. It fails the unit when the newest snapshot is over 29 h old (16:00 + the 19:15 catch-up and its
+# 5400 s lock wait ends before 21:00 the next day) or when nothing can be read; the failure line names the remedy.
+# freshness.json is what `production.py status` prints from.
+ExecStart=/usr/bin/python3 -I /opt/deedkit/calendar-backup/freshness.py --status /opt/deedkit/calendar-backup/backups/status.json --max-age-hours 29 --write /opt/deedkit/calendar-backup/backups/freshness.json --remedy
+TimeoutStartSec=60s
+User=root
+UMask=0077
+Nice=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/deedkit/calendar-backup/backups

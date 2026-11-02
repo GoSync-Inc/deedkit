@@ -437,7 +437,7 @@ late manual start is skipped; an unreadable clock skips too; the timer fires wit
 its own `TimeoutStopSec=180s`, ends every admitted run, its lock wait and recovery included, before
 18:00; a skipped start runs no recovery (`SERVICE_RESULT=exec-condition`), and the unit has no
 `Restart=`, so the calendar never holds messaging's lock into messaging's run. A skipped or failed day
-stays in `status.json` until the next day's run; a journal an earlier recovery left waits for the next
+is made up the same night by the catch-up below (before ANYM-694 it stayed in `status.json` until the next day's run); a journal an earlier recovery left waits for the next
 admitted run, and its `.unsettled` marker keeps deploys out meanwhile. The unit may write only its job directory and messaging's
 backup directory (the shared lock and its `.unsettled` marker). The capture limit is
 `timeout_seconds` 900 and the receiver busy wait `busy_wait_seconds` 1800.
@@ -478,4 +478,42 @@ for name,directory in (("messaging","/srv/backups/deedkit/verifier"),("calendar"
     print(name,s.get("status","no status"),s.get("error") or "-","last proof",at or "never","age",age)'
 ```
 
-Nothing alerts on a stale age yet (alerting is a separate card).
+What alerts (ANYM-694). `deploy/calendar-backup-freshness.py` (stdlib only, read-only: no lock, no docker, no
+network; installed as `/opt/deedkit/calendar-backup/freshness.py`) reads `last_snapshot_at` and prints one JSON line:
+`fresh` (exit 0), `stale` (exit 4: older than the limit, or no `last_snapshot_at`) or `unknown` (exit 5: no file, an
+unreadable or corrupt one, a time that cannot be parsed or more than 5 minutes ahead; up to 5 minutes ahead counts as
+age 0). The age counts from the snapshot, never from a delivery retry.
+
+- **29 h, the alert.** `deedkit-calendar-backup-fresh.timer` runs `deedkit-calendar-backup-fresh.service` hourly with
+  `--max-age-hours 29`; the unit fails on stale or unknown and writes `backups/freshness.json` (mode 0644:
+  `checked_at`, `last_snapshot_at`, `max_age_hours`, `status`, `exit_code`, `age_hours`). `scripts/production.py status`
+  prints one line from it on stderr, beside the JSON:
+  `calendar backup: fresh|STALE|UNKNOWN age=12.3h (checked <time>)`; an absent file or one older than 3 hours prints
+  `calendar backup: no recent freshness check`, an unreadable one `calendar backup: freshness file unreadable (<reason>)`.
+  29 h because the daily snapshot is 16:00, the catch-up runs by 19:15 and its lock wait is at most 5400 s, so a day
+  the design repairs is made up before 16:00 + 29 h = 21:00 the next day: STALE means the catch-up also failed or
+  could not run. This is a status line and a failed unit, not a message to the owner (that would be a send, a named
+  follow-up).
+- **22 h, the catch-up.** `deedkit-calendar-backup-catchup.timer` fires at 19:15 UTC (`Persistent=true`) and
+  `deedkit-calendar-backup-catchup.service` runs the same runner, recovery, sandbox and budget as the daily unit, but
+  starts only when two `ExecCondition` lines pass: the clock is between 19:00 and 23:59 (an unreadable clock skips),
+  and the freshness script with `--max-age-hours 22` exits 4 or 5. On a healthy day it is a no-op, so there is never a
+  second snapshot: a normal snapshot is at most 8 h old at 23:59. The window stops at midnight because the morning is
+  the daily unit's: after downtime across 16:00, its own `Persistent=true` boot run is admitted until 16:02, and both
+  timers fire at boot, so a morning catch-up would make a second snapshot (the runner's lock orders two runs, it does
+  not stop the second). The latest admitted start (23:59:59) plus `TimeoutStartSec` plus 2 x `TimeoutStopSec` ends at
+  01:50, long before the next 16:00. It repairs a failed 16:00 run as well as a skipped one. Exclusion with
+  messaging's 18:00 run and a deploy is the runner's host lock, as for the daily run. Residual: a 16:00 run that
+  failed, followed by a host that is down at 19:15 and up the next morning, waits for the next 16:00 run: the newest
+  snapshot is then about 48 h old at that run, so `status` shows STALE from 29 h until that run makes it up.
+
+A skipped 16:00 start no longer waits for the next day. The daily unit, its 16:02 admission and the 16:00 timer are
+unchanged. Host install: `docs/operations/production.md`, "Calendar backup freshness and same-night catch-up".
+
+A corrupt `status.json` is an operator case: the freshness line says `unknown`, and a catch-up cannot repair it (the
+runner reads the previous file when it writes status). Steps: stop both calendar timers
+(`systemctl stop deedkit-calendar-backup.timer deedkit-calendar-backup-catchup.timer`); under the runner lock
+(`/opt/personal-os-probe/backups/.runner.lock`) rename `/opt/deedkit/calendar-backup/backups/status.json` to
+`status.json.corrupt-<date>` in the same directory; start the catch-up service once
+(`systemctl start deedkit-calendar-backup-catchup.service`; it is admitted only 19:00-23:59, otherwise start the daily
+service before 16:02); read `fresh` from the freshness command; start both timers again.

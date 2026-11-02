@@ -1,6 +1,7 @@
 """Promotion guards use synthetic GitHub/Compose responses; no live runtime access."""
 import contextlib
 import copy
+from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import importlib.util
@@ -5573,6 +5574,89 @@ def test_status_reads_the_configuration_the_autodeploy_unit_reads(tmp_path, monk
     monkeypatch.setattr(p, "images_report", lambda settings: {})
     p.main(["images"])
     assert seen == [p.CONFIG]
+
+
+def freshness_file(path, *, checked_ago=timedelta(minutes=20), status="fresh", age=12.3, **extra):
+    checked = datetime.now(timezone.utc) - checked_ago
+    p.write(path, {"checked_at": checked.strftime("%Y-%m-%dT%H:%M:%SZ"), "last_snapshot_at": "2026-11-01T16:00:27Z",
+                   "max_age_hours": 29, "status": status, "age_hours": age, "exit_code": {"fresh": 0, "stale": 4}.get(status, 5),
+                   **extra})
+    return checked.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def status_with_freshness(tmp_path, monkeypatch, capsys, freshness):
+    monkeypatch.delenv("DEEDKIT_DEPLOY_CONFIG", raising=False)
+    monkeypatch.setattr(p, "CONFIG_DIRECTORY", tmp_path / "etc")
+    monkeypatch.setattr(p, "PAUSE", tmp_path / "etc" / "autodeploy.pause")
+    monkeypatch.setattr(p, "lock", lambda state: contextlib.nullcontext())
+    monkeypatch.setattr(p, "CALENDAR_FRESHNESS", freshness)
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    p.write(state / "current.json", {"sha": "c" * 40, "status": "applied"})
+    monkeypatch.setattr(p, "config", lambda path: {"state_directory": str(state)})
+    p.main(["status"])
+    return capsys.readouterr()
+
+
+# spec: ANYM-694
+def test_status_prints_the_calendar_backup_freshness_line_beside_the_json_a_reader_parses(tmp_path, monkeypatch, capsys):
+    result = tmp_path / "freshness.json"
+    checked = freshness_file(result)
+    printed = status_with_freshness(tmp_path, monkeypatch, capsys, result)
+    assert json.loads(printed.out)["sha"] == "c" * 40
+    assert printed.err == f"calendar backup: fresh age=12.3h (checked {checked})\n"
+    checked = freshness_file(result, status="stale", age=30.0)
+    printed = status_with_freshness(tmp_path, monkeypatch, capsys, result)
+    assert printed.err == f"calendar backup: STALE age=30.0h (checked {checked})\n"
+    checked = freshness_file(result, status="unknown", age=None, last_snapshot_at=None)
+    printed = status_with_freshness(tmp_path, monkeypatch, capsys, result)
+    assert printed.err == f"calendar backup: UNKNOWN age=? (checked {checked})\n"
+
+
+# spec: ANYM-694
+def test_status_says_there_is_no_recent_freshness_check_for_an_absent_or_old_file(tmp_path, monkeypatch, capsys):
+    result = tmp_path / "freshness.json"
+    line = "calendar backup: no recent freshness check\n"
+    assert status_with_freshness(tmp_path, monkeypatch, capsys, result).err == line
+    freshness_file(result, checked_ago=timedelta(hours=3, minutes=1))
+    assert status_with_freshness(tmp_path, monkeypatch, capsys, result).err == line
+    freshness_file(result, checked_ago=timedelta(hours=2, minutes=59))
+    assert status_with_freshness(tmp_path, monkeypatch, capsys, result).err.startswith("calendar backup: fresh ")
+
+
+# spec: ANYM-694
+def test_status_names_an_unreadable_freshness_file_and_never_fails_because_of_it(tmp_path, monkeypatch, capsys):
+    result = tmp_path / "freshness.json"
+    for text, reason in (("{broken", "not JSON"), ("[1]", "not an object"),
+                         ('{"checked_at": "yesterday", "status": "fresh"}', "bad checked_at"),
+                         (json.dumps({"checked_at": "2026-11-02T10:00:00Z", "status": "great"}), "bad status")):
+        result.write_text(text)
+        printed = status_with_freshness(tmp_path, monkeypatch, capsys, result)
+        assert printed.err == f"calendar backup: freshness file unreadable ({reason})\n", text
+        assert json.loads(printed.out)["status"] == "applied"
+    result.unlink()
+    result.mkdir()
+    printed = status_with_freshness(tmp_path, monkeypatch, capsys, result)
+    assert printed.err == "calendar backup: freshness file unreadable (IsADirectoryError)\n"
+    # A user who cannot traverse the root-only job directory gets a named reason, not a failed `status`.
+    if os.geteuid() != 0:
+        result.rmdir()
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        freshness_file(locked / "freshness.json")
+        locked.chmod(0)
+        try:
+            printed = status_with_freshness(tmp_path, monkeypatch, capsys, locked / "freshness.json")
+        finally:
+            locked.chmod(0o700)
+        assert printed.err == "calendar backup: freshness file unreadable (PermissionError)\n"
+        assert json.loads(printed.out)["status"] == "applied"
+
+
+# spec: ANYM-694
+def test_the_catchup_service_is_one_of_the_backup_units_the_migration_deploy_waits_for():
+    assert p.BACKUP_UNITS == ("personal-os-backup.service", "deedkit-calendar-backup.service",
+                              "deedkit-calendar-backup-catchup.service")
 
 
 # spec: ANYM-443

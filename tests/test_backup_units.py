@@ -137,6 +137,127 @@ def test_the_admission_condition_admits_only_minutes_up_to_its_bound_and_fails_c
     assert not any(admitted(clock) for clock in ('1603', '1605', '1700', '1759', '1800', '2359', 'x', ''))
 
 
+FRESHNESS_DIRECTORY = '/opt/deedkit/calendar-backup/backups'
+FRESHNESS_SCRIPT = '/opt/deedkit/calendar-backup/freshness.py'
+
+
+def unit_lines(name):
+    """Every key of a unit file as a list of values per section (a key may repeat, as ExecCondition does)."""
+    sections, current = {}, None
+    for line in (DEPLOY / name).read_text().splitlines():
+        if not line.strip() or line.startswith('#'):
+            continue
+        if re.fullmatch(r'\[\w+\]', line):
+            current = sections.setdefault(line[1:-1], {})
+        else:
+            key, value = line.split('=', 1)
+            current.setdefault(key, []).append(value)
+    return sections
+
+
+def sh_script(command):
+    """An Exec line of the form /bin/sh -c '<script>' as the shell runs it."""
+    shell = shlex.split(command)
+    assert shell[:2] == ['/bin/sh', '-c'] and len(shell) == 3
+    return shell[2].replace('$$', '$').replace('%%', '%')
+
+
+def run_condition(script, tmp_path, *, clock=None, freshness=None):
+    """Run an ExecCondition script with a fake ``date`` and a fake freshness script (python3) on its path."""
+    for name, body in (('date', 'echo ' + clock if clock else 'exit 1'), ('python3', f'exit {freshness}')):
+        fake = tmp_path / name
+        fake.write_text('#!/bin/sh\n' + body + '\n')
+        fake.chmod(0o700)
+    script = script.replace('/usr/bin/python3', str(tmp_path / 'python3'))
+    return subprocess.run(['/bin/sh', '-c', script], env={'PATH': f'{tmp_path}:/usr/bin:/bin'}).returncode == 0
+
+
+# spec: ANYM-694
+def test_the_freshness_unit_is_read_only_takes_no_lock_and_writes_only_its_result_file():
+    unit_file = unit_lines('deedkit-calendar-backup-fresh.service')
+    service, text = unit_file['Service'], (DEPLOY / 'deedkit-calendar-backup-fresh.service').read_text()
+    assert 'ExecCondition' not in service and 'docker' not in text and 'Requires' not in unit_file['Unit']
+    assert service['Type'] == ['oneshot'] and seconds(service['TimeoutStartSec'][0]) <= 60
+    assert service['ProtectSystem'] == ['strict'] and service['NoNewPrivileges'] == ['yes']
+    assert service['ReadWritePaths'] == [FRESHNESS_DIRECTORY]
+    start = shlex.split(service['ExecStart'][0])
+    assert start[:3] == ['/usr/bin/python3', '-I', FRESHNESS_SCRIPT]
+    assert start[start.index('--max-age-hours') + 1] == '29'
+    assert start[start.index('--status') + 1] == FRESHNESS_DIRECTORY + '/status.json'
+    assert start[start.index('--write') + 1] == FRESHNESS_DIRECTORY + '/freshness.json' and '--remedy' in start
+    assert 'Restart' not in service and 'ExecStopPost' not in service
+
+
+# spec: ANYM-694
+def test_the_freshness_timer_fires_at_least_hourly_and_catches_up_after_a_reboot():
+    timer = unit_lines('deedkit-calendar-backup-fresh.timer')['Timer']
+    assert timer['Persistent'] == ['true'] and timer['Unit'] == ['deedkit-calendar-backup-fresh.service']
+    assert re.fullmatch(r'\*-\*-\* \*:\d\d:00 UTC', timer['OnCalendar'][0])
+    assert unit_lines('deedkit-calendar-backup-fresh.timer')['Install']['WantedBy'] == ['timers.target']
+
+
+# spec: ANYM-694
+def test_the_catchup_service_runs_the_same_runner_recovery_sandbox_and_budget_as_the_daily_service():
+    daily, catchup = unit_lines('deedkit-calendar-backup.service'), unit_lines('deedkit-calendar-backup-catchup.service')
+    for key in ('ExecStart', 'ExecStopPost', 'TimeoutStartSec', 'TimeoutStopSec', 'User', 'UMask', 'ProtectSystem',
+                'ProtectHome', 'PrivateTmp', 'NoNewPrivileges', 'ReadWritePaths', 'MemoryMax', 'Type'):
+        assert catchup['Service'][key] == daily['Service'][key], key
+    assert catchup['Unit']['Requires'] == daily['Unit']['Requires']
+    assert 'Restart' not in catchup['Service']
+    assert len(catchup['Service']['ExecCondition']) == 2
+
+
+# spec: ANYM-694
+def test_the_catchup_timer_fires_at_19_15_utc_persistent_with_one_second_accuracy():
+    timer = unit_lines('deedkit-calendar-backup-catchup.timer')['Timer']
+    assert timer['OnCalendar'] == ['*-*-* 19:15:00 UTC'] and timer['Persistent'] == ['true']
+    assert timer['AccuracySec'] == ['1s'] and timer['Unit'] == ['deedkit-calendar-backup-catchup.service']
+    assert 'RandomizedDelaySec' not in timer
+
+
+# spec: ANYM-694
+def test_the_catchup_clock_condition_admits_19_00_to_23_59_only_and_fails_closed(tmp_path):
+    script = sh_script(unit_lines('deedkit-calendar-backup-catchup.service')['Service']['ExecCondition'][0])
+    assert 'date -u' in script
+    for clock in ('1900', '1915', '2200', '2359'):
+        assert run_condition(script, tmp_path, clock=clock, freshness=0), clock
+    # The morning is the daily unit's Persistent boot run (admitted to 16:02): a catch-up there is a second snapshot.
+    for clock in ('0000', '0100', '0859', '1300', '1400', '1600', '1602', '1800', '1859', 'x', ''):
+        assert not run_condition(script, tmp_path, clock=clock, freshness=0), clock
+
+
+# spec: ANYM-694
+def test_the_catchup_freshness_condition_runs_only_for_a_stale_or_unknown_snapshot(tmp_path):
+    script = sh_script(unit_lines('deedkit-calendar-backup-catchup.service')['Service']['ExecCondition'][1])
+    start = shlex.split(script.split(';', 1)[0].replace('>/dev/null 2>&1', ''))
+    assert start[:3] == ['/usr/bin/python3', '-I', FRESHNESS_SCRIPT]
+    assert start[start.index('--max-age-hours') + 1] == '22'
+    assert start[start.index('--status') + 1] == FRESHNESS_DIRECTORY + '/status.json'
+    assert '--write' not in start
+    # Fresh: a no-op, so the two timers never make two snapshots a day. Stale and unknown: admitted.
+    assert not run_condition(script, tmp_path, freshness=0)
+    assert run_condition(script, tmp_path, freshness=4) and run_condition(script, tmp_path, freshness=5)
+    # A script that cannot run (argument error, missing interpreter) does not start a snapshot.
+    assert not run_condition(script, tmp_path, freshness=2) and not run_condition(script, tmp_path, freshness=127)
+
+
+# spec: ANYM-694
+def test_the_catchups_whole_budget_ends_before_the_next_daily_run_and_its_timer_start_is_admitted():
+    service = {'Service': {key: values[0] for key, values in
+                           unit_lines('deedkit-calendar-backup-catchup.service')['Service'].items()}}
+    conditions = unit_lines('deedkit-calendar-backup-catchup.service')['Service']['ExecCondition']
+    opens = re.search(r'-ge (\d{4})', sh_script(conditions[0]))[1]
+    assert not re.search(r'-le \d{4}', sh_script(conditions[0]))  # no morning branch
+    day = 24 * 3600
+    last = day - 1  # 23:59:59, the latest minute a four-digit clock can admit
+    assert last + whole_budget(service['Service']) < day + 16 * 3600  # before the next 16:00 run
+    timer = unit_lines('deedkit-calendar-backup-catchup.timer')['Timer']
+    start = 19 * 3600 + 15 * 60 + seconds(timer['AccuracySec'][0])
+    assert int(opens[:2]) * 3600 + int(opens[2:]) * 60 <= start <= last
+    # The daily service's own window and tests are untouched: the catch-up never moves its 16:02 admission.
+    assert admission()[1] == 16 * 3600 + 2 * 60 + 59
+
+
 # spec: ANYM-607
 def test_a_start_the_condition_skipped_recovers_nothing_and_every_other_end_recovers(tmp_path):
     script = stop_post()

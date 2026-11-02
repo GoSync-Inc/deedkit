@@ -350,8 +350,8 @@ def test_an_incompatible_producer_pin_moves_to_the_candidates_backup_image_and_t
     host = PinHost(tmp_path, monkeypatch)
     outcome = host.deploy()
     assert outcome["status"] == "deployed" and host.migration()["status"] == "migrated"
-    assert phases(host)[:8] == ["live ledger", "producer", "backup pull", "backup image", "unit", "unit", "producer",
-                                "copy"]
+    assert phases(host)[:9] == ["live ledger", "producer", "backup pull", "backup image", "unit", "unit", "unit",
+                                "producer", "copy"]
     # The final gate reads the new pin.
     assert phases(host)[phases(host).index("rehearse"):][:3] == ["rehearse", "live ledger", "producer"]
     moved = json.loads(host.runner.read_text())

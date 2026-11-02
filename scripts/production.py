@@ -3425,7 +3425,42 @@ def producer_reads(settings, mirror, target):
 
 
 # ANYM-589 B1: the units that run a backup with the producer pin (messaging's and the calendar's runner).
-BACKUP_UNITS = ("personal-os-backup.service", "deedkit-calendar-backup.service")
+BACKUP_UNITS = ("personal-os-backup.service", "deedkit-calendar-backup.service",
+                "deedkit-calendar-backup-catchup.service")
+
+# ANYM-694: the hourly freshness check (deploy/calendar-backup-freshness.py) writes this; `status` prints one line from it.
+CALENDAR_FRESHNESS = Path("/opt/deedkit/calendar-backup/backups/freshness.json")
+CALENDAR_FRESHNESS_MAX_AGE = 3 * 3600
+
+
+def calendar_backup_line(path=None, at=None):
+    """The `status` line for the calendar backup's freshness; read-only, and never an error for `status`."""
+    prefix = "calendar backup: "
+    try:
+        try:
+            with open(path or CALENDAR_FRESHNESS, "rb") as handle:
+                data = json.loads(handle.read(65536))
+        except FileNotFoundError:
+            return prefix + "no recent freshness check"
+        if not isinstance(data, dict):
+            return prefix + "freshness file unreadable (not an object)"
+        checked = data.get("checked_at")
+        try:
+            moment = datetime.strptime(checked, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return prefix + "freshness file unreadable (bad checked_at)"
+        word = {"fresh": "fresh", "stale": "STALE", "unknown": "UNKNOWN"}.get(data.get("status"))
+        if word is None:
+            return prefix + "freshness file unreadable (bad status)"
+        elapsed = ((at or datetime.now(timezone.utc)) - moment).total_seconds()
+        if elapsed > CALENDAR_FRESHNESS_MAX_AGE or elapsed < -300:
+            return prefix + "no recent freshness check"
+        age = data.get("age_hours")
+        shown = f"{age:.1f}h" if isinstance(age, (int, float)) and not isinstance(age, bool) else "?"
+        return f"{prefix}{word} age={shown} (checked {checked})"
+    except Exception as exc:
+        reason = "not JSON" if isinstance(exc, ValueError) else type(exc).__name__
+        return f"{prefix}freshness file unreadable ({reason})"
 
 
 def leaf_identity(found):
@@ -4813,6 +4848,9 @@ def print_result(args, result, parser):
         if args.action == "prepare":
             result = {key: result[key] for key in ("sha", "ci", "images", "references")}
         print(json.dumps(result, indent=2))
+        if args.action == "status":
+            # Beside the JSON, not in it: a reader that parses stdout keeps getting one document.
+            print(calendar_backup_line(), file=sys.stderr)
 
 
 def main(argv=None):
