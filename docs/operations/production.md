@@ -1432,6 +1432,32 @@ needs the same newer-SHA hand apply as the delivery undo above); `docker image r
 `python3 scripts/inference_egress_check.py rules --undo` prints the mirror of the rules (hooks first, then
 both chains). The worker's jobs requeue on SIGTERM; nothing in the database changes.
 
+## Mini inference: watch and enable record (ANYM-686)
+
+The plan to enable it is [inference-enable.md](inference-enable.md). Whoever reads the production status of a
+day also does this read-only watch (operator DSN, `psql` through the host's documented database access; no write)
+and reports any hit as a digest FYI line:
+
+```sql
+-- 1. the oldest queued enrichment row waiting for its turn (hours); report above 24
+SELECT round(extract(epoch FROM clock_timestamp() - min(next_due)) / 3600, 1) AS oldest_queued_hours, count(*) AS queued
+  FROM attachment_enrichment WHERE state = 'queued' AND error_code IS DISTINCT FROM 'model_backpressure'
+   AND next_due <= clock_timestamp();
+-- 2. jobs held by the mini (model_backpressure) and the hours since the last success from it; report when
+--    held > 0 and hours_since_ready is above 24 (a deferral refreshes the row and the pause timestamps, so the
+--    age of one pause cannot be read; "no success for 24 hours while jobs are held" is the same fact)
+SELECT (SELECT count(*) FROM attachment_enrichment WHERE state = 'queued' AND error_code = 'model_backpressure') AS held,
+       round(extract(epoch FROM clock_timestamp() - max(updated_at)) / 3600, 1) AS hours_since_ready
+  FROM attachment_enrichment WHERE state = 'ready' AND provider = 'deedkit_inference';
+```
+and the key: `python3 scripts/inference_probe.py --key-file private/inference/inference.key --url
+https://<mini>.<tailnet>.ts.net` prints `key_days_left=`; report at 30 days or fewer (the rotation of
+inference-mini-setup.md section 12 is due) and when `reachable=no`. The probe exits 0 whatever it finds.
+
+The enable record on the ANYM-686 card keeps: the date and `S`; the three attachment ids of the end-to-end run (not
+their content); the egress `check` JSON and the `tcpdump` evidence; the offline and admission drill times; the key's
+expiry date and its rotation due date (30 days before); never the key, a DSN or a file name.
+
 ## Image retention
 
 ```sh

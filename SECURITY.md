@@ -43,3 +43,15 @@ self-registration a Grok routine URL recognised by its shape, ANYM-585) receives
 same content-free bodies plus the agent's own routine key as `Authorization: Bearer`, stored and
 hidden like any other header value. A request that may have reached the vendor is never sent again
 (SUBSCRIPTIONS.md, Vendor hosts).
+
+The inference service on the owner's Mac mini (`services/inference`, ANYM-682 to ANYM-688) processes
+audio, photos and document text locally. It binds only loopback; Tailscale Serve (never Funnel) is its
+one tailnet entry on port 443, and where the tailnet policy restricts at all, one rule lets only the
+production host reach it. Each calling service has its own key, stored on the mini only as a hash in a
+0600 policy file, with an expiry, an overlapping rotation (at most two keys per principal) and
+revocation by removing the hash. The process runs in a sandbox that denies the service tree any
+outbound network, and each job's files live in a per-request directory deleted afterwards. A leaked key
+allows jobs within its scopes and daily cap; nothing stored can be read back. On the production side the
+worker reaches only its database and the mini (docs/operations/production.md, "Mini enrichment
+worker"). Model output is untrusted data, like any extracted text. Runbook and rotation:
+[docs/operations/inference-mini-setup.md](docs/operations/inference-mini-setup.md).

@@ -87,13 +87,17 @@ file, owner 11-01).
     autoloop's tool-less reader on the owner's workstation (owner decision D1, ANYM-264); for a principal in
     the autoloop config, a card in the card worker's own words, with no quote, name, phone number or message
     content, goes to Tiden and GitHub (owner 10-26, ANYM-568; SUBSCRIPTIONS.md:345-353).
-  - Local model processing: originals of admitted attachments (audio, images, PDF page images) go
-    from the enrichment worker to the owner's Mac mini over the tailnet (WireGuard + TLS) for
-    processing by local models (`deedkit-inference`); the mini keeps them only for the duration of
-    the request (temporary files deleted after each job, no model caches on disk, metadata-only logs);
-    the derived text returns to DeedKit; no third party receives them (owner 11-01 «на мини я бы и аудио
-    и остальные файлы разбирал бы локальной моделью хорошей для всех сервисов наших»). Decided, not yet
-    built.
+  - Local model processing (ANYM-682 to ANYM-688; in force for the owner's messenger accounts from the
+    production enablement, ANYM-686): originals of admitted attachments (audio, images, document text)
+    go from the enrichment worker to the owner's Mac mini over the tailnet (WireGuard and TLS, one
+    pinned address, port 443) for processing by local models (`deedkit-inference`). The worker's
+    network reaches only its database and that address (docs/operations/production.md, "Mini
+    enrichment worker"). The mini keeps them only for the duration of the request: a per-request
+    directory deleted after each job, no prompt or media cache on disk, and logs with principal,
+    alias, size, seconds and status only. The derived text returns to DeedKit and is stored as
+    untrusted, model-generated enrichment (ENRICHMENT.md). No third party receives them (owner 11-01
+    «на мини я бы и аудио и остальные файлы разбирал бы локальной моделью хорошей для всех сервисов
+    наших»; photos: owner 11-01 «2 b»).
   - Cloud model providers for enrichment (ENRICHMENT.md: OpenAI, Anthropic, Gemini endpoints; Codex not
     deployed) stay off; media understanding uses the local models above (owner 11-01 «2 b»). Enabling a
     cloud endpoint is a `user-data` ask.
