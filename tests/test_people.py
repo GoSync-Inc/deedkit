@@ -143,6 +143,36 @@ def test_people_cursors_issued_before_the_fold_still_continue(seeded):
 
 
 # spec: ANYM-663
+def test_people_group_with_a_folded_and_a_transliteration_observation_sorts_after_literal_groups(seeded):
+    s,ar,key=fold_directory(seeded)
+    # Sender 51 is "Фёдор Пример" in chat 100 (folded, rank 7); in chat 200 it is a transliteration-only hit (rank 1).
+    ar.ingest(event(account='people-test',chat='200',sender='51',provider_id='fold-51b',
+        sender_profile={'display_name':'Другой','username':'fedor'}))
+    groups=s.search_people(key,'федор',transliterate=True,group_by_sender=True)['items']
+    assert [(g['sender_id'],g['match_type']) for g in groups]==[('52','literal'),('51','literal_folded')]
+
+
+# spec: ANYM-663
+def test_people_cursor_of_a_row_that_moved_to_the_folded_rank_still_continues(seeded):
+    from messaging_service.search_query import encode_cursor
+    s,ar,key=fold_directory(seeded)
+    for sender,name,username in (('56','Фёдор Пример Два','fedor'),('57','Фёдор Третий','')):
+        ar.ingest(event(account='people-test',sender=sender,provider_id='moved-'+sender,
+            sender_profile={'display_name':name,'username':username}))
+    with s.pool.connection() as c:c.execute("UPDATE sender_profiles SET id='cursor-'||sender WHERE account='people-test'")
+    with s.authorized(key,'search_people') as (c,p):
+        # Before ANYM-663 sender 56 was a transliteration hit of rank 1; it is a folded hit of rank 7 now.
+        flat=encode_cursor(people_binding(p,'федор',transliterate=True),{'rank':1,'id':'cursor-56'})
+        grouped=encode_cursor(people_binding(p,'федор',transliterate=True,group_by_sender=True),
+            {'rank':1,'account':'people-test','sender':'56'})
+    assert [r['id'] for r in s.search_people(key,'федор',transliterate=True,after=flat)['items']]==['cursor-57']
+    assert [r['sender_id'] for r in s.search_people(key,'федор',transliterate=True,group_by_sender=True,after=grouped)['items']]==['57']
+    with s.authorized(key,'search_people') as (c,p):
+        wrong=encode_cursor(people_binding(p,'федор',transliterate=True),{'rank':3,'id':'cursor-56'})
+    with pytest.raises(APIError,match='cursor_changed'):s.search_people(key,'федор',transliterate=True,after=wrong)
+
+
+# spec: ANYM-663
 def test_people_rank_eight_is_still_an_invalid_cursor_for_a_fold_query(seeded):
     from messaging_service.search_query import encode_cursor
     s,_,key=fold_directory(seeded)
