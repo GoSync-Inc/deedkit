@@ -195,7 +195,7 @@ sudo -n newsyslog -nv 2>&1 | grep -i deedkit || true'; rm -r "$OUT"
 ```
 
 Read-back: `plutil -lint` says `OK` for both; `ls -l` shows root:wheel and the modes above; the plist prints with
-`plutil -p` (UserName `_deedkitinf`, `Nice` 10, `KeepAlive` `{SuccessfulExit = false}`, `ExitTimeOut` 960).
+`plutil -p` (UserName `_deedkitinf`, `ProcessType` `Standard`, `Nice` 10, `KeepAlive` `{SuccessfulExit = false}`, `ExitTimeOut` 960).
 
 ### Sandbox proof (card criterion 2, `[open: measured]`)
 
@@ -372,6 +372,16 @@ root, `chown _deedkitinf` them and record it. Then the deploy script's own read-
 `/v1/models` with the probe key and that `release` equals the SHA: `python3 scripts/inference_deploy.py "$SHA"`
 (it drains, which is instant on an idle service, and restarts). Undo: `sudo -n launchctl bootout
 system/com.deedkit.inference` (then `-busy`) and remove the plists, section 14.
+
+`ProcessType` of the service is `Standard`, not `Background`: Background put the engines on the efficiency cores with
+throttled I/O and made speech about 17 times slower on the mini (A/B 11-02, same requests: warm `note_ru` RTF 0.36 against
+0.021). Between's priority comes from `Nice` 10 and the admission gate, not from the QoS class; the busy probe stays
+`Background`. Changing an installed plist is a live step, in a quiet window after the busy check (`&&`-chained): back up
+the installed file (`sudo -n cp -p /Library/LaunchDaemons/com.deedkit.inference.plist "$D/plist.orig"`), render the new one
+(section 5), `sudo -n install -o root -g wheel -m 644 <new> /Library/LaunchDaemons/com.deedkit.inference.plist`, then
+`sudo -n launchctl bootout system/com.deedkit.inference` and `bootstrap` it again and read `ProcessType` back with
+`plutil -extract ProcessType raw`. Undo: install `plist.orig` the same way, `bootout`, `bootstrap`, `cmp` it with the
+backup.
 
 Rotation of logs: `newsyslog` rotates at 10 MB; launchd keeps its descriptor, so lines go to the rotated file until
 the next deploy restarts the service (the logs hold metadata only; a day of 2000 jobs is well under 1 MB).
