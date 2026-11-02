@@ -865,16 +865,17 @@ def clean(settings, remove):
     outcome: every failure is a line of the summary. A plain `docker rm <full id>` only (no force, no volumes, no
     prune). A removal that gave no answer is `unknown` and is not repeated in this run; the next run inspects the same
     ID again (absent: already removed). Deletion is selected by receipts alone; a bounded listing of the labelled
-    containers that were not selected is observation only (`not_selected`)."""
+    containers that were not selected is observation only (`not_selected`); `unresolved` adds the generations it finds
+    there without any receipt, so one generation whose receipt file is unreadable can be counted twice (the file and
+    its receipt-less containers): an over-count, never a hidden generation."""
     summary = {'removed': [], 'would_remove': [], 'skipped': [], 'unknown': [], 'generations': [], 'ids': [], 'unresolved': 0}
     deadline = time.monotonic() + CLEAN_BUDGET
 
-    def left():
-        # Called right after the `expired()` check: never more than what is left, never the old one-second floor.
-        return min(CLEAN_COMMAND, max(0.001, deadline - time.monotonic()))
-
-    def expired():
-        return time.monotonic() >= deadline
+    def slot():
+        # One reading of the clock: the timeout of the next docker command, or None when nothing is left (no floor, no
+        # race between a check and a second reading).
+        remaining = deadline - time.monotonic()
+        return min(CLEAN_COMMAND, remaining) if remaining > 0 else None
     try:
         eligible, summary['unresolved'], kept, known = discover(settings, deadline)
     except Exception as exc:
@@ -884,11 +885,11 @@ def clean(settings, remove):
     for generation, containers in eligible.items():
         for role in ['api', 'gateway']:
             identity, name = containers[role], generation + '/' + role
-            if expired():
+            if (timeout := slot()) is None:
                 summary['stopped'] = 'budget'
                 return summary
             try:
-                actual = json.loads(p.run(['docker', 'inspect', identity['container']], timeout=left(), reason=True))[0]
+                actual = json.loads(p.run(['docker', 'inspect', identity['container']], timeout=timeout, reason=True))[0]
             except Exception as exc:
                 absent = 'No such' in str(exc)
                 summary['skipped'].append({'container': name, 'id': identity['container'][:12],
@@ -901,11 +902,11 @@ def clean(settings, remove):
                 summary['would_remove'].append(name)
                 summary['ids'].append(identity['container'][:12])
                 continue
-            if expired():
+            if (timeout := slot()) is None:
                 summary['stopped'] = 'budget'
                 return summary
             try:
-                p.run(['docker', 'rm', identity['container']], timeout=left(), reason=True)
+                p.run(['docker', 'rm', identity['container']], timeout=timeout, reason=True)
             except Exception as exc:
                 summary['unknown'].append({'container': name, 'id': identity['container'][:12], 'reason': type(exc).__name__})
                 continue
@@ -913,16 +914,19 @@ def clean(settings, remove):
             summary['ids'].append(identity['container'][:12])
             if generation not in summary['generations']:
                 summary['generations'].append(generation)
-    if not expired():
+    if (timeout := slot()) is not None:
         try:
             # Observation only, never a deletion input: every container of the host, its release label (empty when it has
             # none) and its state. Unlabelled ones are only counted (R2).
             listing = p.run(['docker', 'ps', '--all', '--no-trunc', '--format',
-                             '{{.ID}} {{.Label "ai.deedkit.http-release"}} {{.State}}'], timeout=left(), reason=True)
+                             '{{.ID}} {{.Label "ai.deedkit.http-release"}} {{.State}}'], timeout=timeout, reason=True)
             rows = [line.split() for line in listing.splitlines() if line.split()]
             summary['unlabelled_count'] = len([row for row in rows if len(row) == 2])
             others = [row for row in rows if len(row) == 3 and row[0] not in selected and row[1] not in kept]
             summary['not_selected_count'] = len(others)
+            # A generation whose receipt is missing altogether is as unresolved as one with an ineligible receipt (R2).
+            summary['no_receipt_generations'] = len({row[1] for row in others if row[1] not in known})
+            summary['unresolved'] += summary['no_receipt_generations']
             summary['not_selected'] = [{'id': row[0][:12], 'generation': row[1], 'state': row[2],
                                         'reason': 'generation not eligible' if row[1] in known else 'no receipt'}
                                        for row in others[:20]]

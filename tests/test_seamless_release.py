@@ -868,8 +868,9 @@ def test_clean_skips_what_a_malformed_receipt_cannot_prove_and_raises_nothing(tm
     (state / ('%040x' % 2) / 'http-result.json').write_text('not json')
     summary = s.clean(cfg, True)
     # The second generation's receipt carries the proof for the first one and its own identities: neither is removed.
-    # Generation 0 lost its proof and the unreadable receipt is itself counted, so neither accumulates unseen.
-    assert summary['generations'] == [generations[2]] and summary['unresolved'] == 2
+    # Generation 0 lost its proof, the unreadable receipt file is counted, and so are the receipt-less labelled containers
+    # of that same generation: an over-count by one is the price of never hiding one.
+    assert summary['generations'] == [generations[2]] and summary['unresolved'] == 3 and summary['no_receipt_generations'] == 1
     (state / 'http-current.json').write_text('{')
     assert s.clean(cfg, True)['removed'] == [] and s.retired_generations(cfg) == ({}, 0)
 
@@ -945,6 +946,8 @@ def test_clean_lists_the_labelled_containers_it_did_not_select_without_touching_
         containers['%064x' % (0xd0 + number)] = {'Id': '%064x' % (0xd0 + number), 'Image': IMAGE, 'State': {'Status': 'exited', 'Running': False}, 'Config': {'Labels': {}}}
     summary = s.clean(cfg, True)
     assert summary['not_selected_count'] == 2 and summary['unlabelled_count'] == 2
+    # The generation with no receipt at all is as unresolved as one with an ineligible receipt, and counted once.
+    assert summary['no_receipt_generations'] == 1 and summary['unresolved'] == 1
     assert sorted(summary['not_selected'], key=lambda item: item['id']) == [
         {'id': 'e' * 12, 'generation': 'ffffffffffff', 'state': 'exited', 'reason': 'no receipt'},
         {'id': 'f' * 12, 'generation': generations[0], 'state': 'exited', 'reason': 'generation not eligible'}]
@@ -974,11 +977,13 @@ def test_no_command_starts_exactly_at_the_deadline(tmp_path, monkeypatch):
 
 
 # spec: ANYM-689
-def test_the_last_command_gets_only_the_fraction_of_a_second_that_is_left(tmp_path, monkeypatch):
+@pytest.mark.parametrize('left', [0.2, 0.0002])
+def test_the_last_command_gets_only_the_fraction_of_a_second_that_is_left(tmp_path, monkeypatch, left):
     cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
-    timeouts = clock_after_first_inspect(monkeypatch, s.CLEAN_BUDGET - 0.2)
+    timeouts = clock_after_first_inspect(monkeypatch, s.CLEAN_BUDGET - left)
     s.clean(cfg, True)
-    assert timeouts[0][1] == 30 and timeouts[1] == ('rm', pytest.approx(0.2, abs=1e-6))
+    # No floor: a command never gets more time than the budget has left, even below a millisecond.
+    assert timeouts[0][1] == 30 and timeouts[1] == ('rm', pytest.approx(left, abs=1e-9))
 
 
 def plan_a(tmp_path, monkeypatch, images):
