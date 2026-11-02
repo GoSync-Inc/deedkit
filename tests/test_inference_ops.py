@@ -485,6 +485,14 @@ def test_duty_log_verdicts_and_summary():
 
 IMPACT = load('inference_ops_impact_log', ROOT / 'services' / 'inference' / 'launchd' / 'impact_log.py')
 IMPACT_VM = '/System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/com.apple.Virtualization.VirtualMachine'
+T0 = 'Mon Nov  2 13:00:00 2026'
+T1 = 'Mon Nov  2 13:05:00 2026'
+
+
+def ps_text(*rows):
+    """A fake `ps -axo uid=,pid=,stat=,lstart=,cputime=,rss=,comm=` table: (uid, pid, started, cputime, rss_kb, command[, state])."""
+    return ''.join(f'{uid:>5} {pid:>5} {(state or ["S"])[0]} {started} {cpu} {rss} {command}\n'
+                   for uid, pid, started, cpu, rss, command, *state in rows)
 
 
 # spec: ANYM-684
@@ -492,22 +500,35 @@ def test_impact_log_reads_ps_cputime_and_counts_a_phase_by_cpu_not_by_a_resident
     assert IMPACT.parse_cputime('0:12.34') == pytest.approx(12.34)
     assert IMPACT.parse_cputime('1:02:03.50') == pytest.approx(3723.5)
     assert IMPACT.parse_cputime('2-01:00:00') == pytest.approx(2 * 86400 + 3600)
-    text = f'  501 10 0:01.00 2048 /sbin/launchd\n  600 20 0:10.00 4000000 python\n  451 30 5:00.00 900000 {IMPACT_VM}\n'
-    before = IMPACT.read_processes(lambda: text)
-    assert before[20] == (600, 10.0, 4000000, 'python')
+    base = (501, 10, T0, '0:01.00', 2048, '/sbin/launchd'), (600, 20, T0, '0:10.00', 4000000, 'python'), (451, 30, T0, '5:00.00', 900000, IMPACT_VM)
+    before = IMPACT.read_processes(lambda: ps_text(*base))
+    assert before[20] == (600, 10.0, 4000000, 'python', ' '.join(T0.split()), 'S')  # the start time is compared as words
     # a warm engine worker holds 4 GB and burns nothing: not a phase; the same process burning 6 s in 10 s is 0.6 cores
-    idle = IMPACT.read_processes(lambda: text.replace('0:10.00', '0:10.02'))
-    busy = IMPACT.read_processes(lambda: text.replace('0:10.00', '0:16.00') + '  600 21 0:03.00 100 child\n')
+    idle = IMPACT.read_processes(lambda: ps_text(base[0], (600, 20, T0, '0:10.02', 4000000, 'python'), base[2]))
+    busy = IMPACT.read_processes(lambda: ps_text(base[0], (600, 20, T0, '0:16.00', 4000000, 'python'), base[2], (600, 21, T1, '0:03.00', 100, 'child')))
     assert IMPACT.cores(before, idle, 600, 10.0)[0] < IMPACT.PHASE_CORES
     used, count, rss = IMPACT.cores(before, busy, 600, 10.0)
     assert used == pytest.approx(0.9) and count == 2 and rss == 4000100  # the child that started in the interval counts from zero
     # another user's processes and, with a mark, non-matching commands are not counted
     assert IMPACT.cores(before, busy, 451, 10.0, IMPACT.VM_MARK)[0] == 0.0
-    vm_busy = IMPACT.read_processes(lambda: text.replace('5:00.00', '5:20.00'))
+    vm_busy = IMPACT.read_processes(lambda: ps_text(base[0], base[1], (451, 30, T0, '5:20.00', 900000, IMPACT_VM)))
     assert IMPACT.cores(before, vm_busy, 451, 10.0, IMPACT.VM_MARK)[0] == pytest.approx(2.0)
     assert IMPACT.cores(before, vm_busy, 600, 10.0, IMPACT.VM_MARK)[0] == 0.0
     with pytest.raises(ValueError):
         IMPACT.read_processes(lambda: 'garbage\n')
+
+
+# spec: ANYM-684
+def test_impact_log_counts_a_reused_pid_from_zero_whatever_its_counter():
+    old = IMPACT.read_processes(lambda: ps_text((600, 20, T0, '1:40.00', 1000, 'python')))  # 100 s of CPU
+    # the pid was reused by a process that started later and has burned 6 s: 0.4 cores over 15 s, not 0 (counter went down)
+    reborn = IMPACT.read_processes(lambda: ps_text((600, 20, T1, '0:06.00', 1000, 'python')))
+    assert IMPACT.cores(old, reborn, 600, 15.0)[0] == pytest.approx(0.4)
+    # and a replacement with a larger counter is not compared with its predecessor either
+    bigger = IMPACT.read_processes(lambda: ps_text((600, 20, T1, '2:00.00', 1000, 'python')))
+    assert IMPACT.cores(old, bigger, 600, 15.0)[0] == pytest.approx(8.0)
+    same = IMPACT.read_processes(lambda: ps_text((600, 20, T0, '1:43.00', 1000, 'python')))
+    assert IMPACT.cores(old, same, 600, 15.0)[0] == pytest.approx(0.2)
 
 
 # spec: ANYM-684
@@ -516,41 +537,67 @@ def test_impact_log_busy_flags_fail_to_unknown_and_the_line_round_trips():
     fresh = json.dumps({'ts': now - 3, 'between': True, 'deedkit_ci': False})
     assert IMPACT.busy_flags(fresh, now) == ('t', 'f')
     for broken in (None, 'not json', json.dumps({'ts': now - 31, 'between': True, 'deedkit_ci': True}),
-                   json.dumps({'ts': now, 'between': 'yes', 'deedkit_ci': False})):
+                   json.dumps({'ts': now, 'between': 'yes', 'deedkit_ci': False}),
+                   '{"ts": NaN, "between": false, "deedkit_ci": false}', '{"ts": Infinity, "between": false, "deedkit_ci": false}',
+                   '{"ts": 1' + '0' * 400 + ', "between": false, "deedkit_ci": false}'):
         assert IMPACT.busy_flags(broken, now) == ('?', '?')
-    figures = {'inf_cpu': 0.62, 'inf_rss_kb': 4096 * 1024, 'vm_cores': 3.5, 'ci_cores': 0.0, 'load': 9.25, 'avail_gb': 6.04, 'swap_mb': 2300}
+    figures = {'inf_cpu': 0.62, 'inf_rss_kb': 4096 * 1024, 'stopped_kb': 0, 'vm_cores': 3.5, 'ci_cores': 0.0, 'load': 9.25, 'avail_gb': 6.04, 'swap_mb': 2300}
     row = IMPACT.parse_line(IMPACT.sample_line(now, ('t', 'f'), figures))
-    assert row == {'ts': 1_000_000, 'between': 't', 'ci': 'f', 'phase': True, 'inf_cpu': 0.62, 'inf_rss_mb': 4096.0, 'vm_cores': 3.5,
+    assert row == {'ts': 1_000_000, 'between': 't', 'ci': 'f', 'phase': True, 'stopped_mb': 0.0, 'inf_cpu': 0.62, 'inf_rss_mb': 4096.0, 'vm_cores': 3.5,
                    'ci_cores': 0.0, 'load': 9.25, 'avail_gb': 6.0, 'swap_mb': 2300.0}
     assert IMPACT.parse_line('ts=1 between=t') is None and IMPACT.parse_line('') is None
-    assert IMPACT.free_gb('Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free: 65536.\nPages inactive: 65536.\nPages speculative: 65536.\nPages active: 9.\n'.replace('.\n', '\n')) == pytest.approx(3.0)
+    vm_stat = 'Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free: 65536\nPages inactive: 65536\nPages speculative: 65536\nPages active: 9\n'
+    assert IMPACT.free_gb(vm_stat) == pytest.approx(3.0)
+    # a header without all three counters is a rejected sample, not a 0.0 GB reading
+    for broken_stat in ('page size of 16384 bytes\n', vm_stat.replace('Pages inactive: 65536\n', ''), vm_stat.replace('page size of 16384 bytes', '')):
+        with pytest.raises(ValueError):
+            IMPACT.free_gb(broken_stat)
     assert IMPACT.swap_mb('vm.swapusage: total = 3072.00M  used = 2300.50M  free = 771.50M  (encrypted)') == pytest.approx(2300.5)
     assert IMPACT.swap_mb('total = 4.00G  used = 1.50G') == pytest.approx(1536.0)
 
 
+def impact_line(n, between, ci, phase, load, avail, vm=0.0, base=1_000_000, stopped_mb=0):
+    figures = {'inf_cpu': 1.0 if phase else 0.0, 'inf_rss_kb': 0, 'stopped_kb': stopped_mb * 1024, 'vm_cores': vm, 'ci_cores': 0.0, 'load': load, 'avail_gb': avail, 'swap_mb': 100}
+    return IMPACT.sample_line(base + 15 * n, (between, ci), figures)
+
+
 # spec: ANYM-684
-def test_impact_summary_separates_overlap_from_between_alone_and_idle():
-    def line(n, between, ci, phase, load, avail, vm=0.0):
-        figures = {'inf_cpu': 1.0 if phase else 0.0, 'inf_rss_kb': 0, 'vm_cores': vm, 'ci_cores': 0.0, 'load': load, 'avail_gb': avail, 'swap_mb': 100}
-        return IMPACT.sample_line(1_000_000 + 15 * n, (between, ci), figures)
-    rows = [line(0, 'f', 'f', 0, 1.0, 7.0), line(1, 't', 'f', 0, 6.0, 5.0, 4.0), line(2, 't', 'f', 0, 8.0, 5.0, 4.0),
-            line(3, 't', 'f', 1, 12.0, 3.0, 4.0), line(4, 'f', 't', 1, 14.0, 2.0), line(5, 'f', 'f', 1, 3.0, 6.0),
-            line(6, 't', 'f', 0, 6.0, 5.0), line(7, '?', '?', 0, 1.0, 7.0), 'garbage', '']
+def test_impact_summary_separates_overlap_from_between_alone_and_idle_and_leaves_unknown_out():
+    rows = [impact_line(0, 'f', 'f', 0, 1.0, 7.0), impact_line(1, 't', 'f', 0, 6.0, 5.0, 4.0), impact_line(2, 't', 'f', 0, 8.0, 5.0, 4.0),
+            impact_line(3, 't', 'f', 1, 12.0, 3.0, 4.0), impact_line(4, 'f', 't', 1, 14.0, 2.0), impact_line(5, 'f', 'f', 1, 3.0, 6.0),
+            impact_line(6, 't', 'f', 0, 6.0, 5.0), impact_line(7, '?', '?', 0, 1.0, 7.0), impact_line(8, '?', '?', 1, 1.0, 7.0),
+            impact_line(9, '?', 'f', 0, 1.0, 7.0), impact_line(10, 't', 'f', 0, 7.0, 2.0, 1.0, stopped_mb=4096), 'garbage', '']
     summary = IMPACT.summarize(rows)
-    assert summary['samples'] == 8 and summary['unknown_busy_samples'] == 1
+    assert summary['samples'] == 11 and summary['unknown_busy_samples'] == 3 and summary['gaps'] == 0
+    # a stopped phase (no CPU, RAM still held) is its own situation, not "Between alone"
+    assert summary['paused']['samples'] == 1 and summary['paused']['stopped_mb_max'] == 4096.0 and summary['paused']['avail_gb_min'] == 2.0
+    assert summary['contended_alone']['stopped_samples'] == 0
     assert summary['overlap_minutes'] == 0.5 and summary['overlap_episodes'] == 1 and summary['longest_overlap_minutes'] == 0.5
     assert summary['overlap_while'] == {'between': 1, 'ci': 1}
     assert summary['overlap']['samples'] == 2 and summary['overlap']['load_mean'] == 13.0 and summary['overlap']['avail_gb_min'] == 2.0
     assert summary['contended_alone']['samples'] == 3 and summary['contended_alone']['load_mean'] == pytest.approx(6.667, abs=0.001)
     assert summary['contended_alone']['vm_cores_mean'] == pytest.approx(2.667, abs=0.001)
-    assert summary['phase_alone']['samples'] == 1 and summary['idle']['samples'] == 2  # the unknown-flag sample is idle: not contended
+    # unknown busy flags are neither "alone" nor "idle": the two quiet samples are the only known ones
+    assert summary['phase_alone']['samples'] == 1 and summary['idle']['samples'] == 1
     assert IMPACT.summarize([]) == {'samples': 0} and IMPACT.summarize(['x']) == {'samples': 0}
 
 
 # spec: ANYM-684
+def test_impact_summary_breaks_an_overlap_episode_at_a_hole_in_the_samples():
+    rows = [impact_line(0, 't', 'f', 1, 9.0, 4.0), impact_line(1, 't', 'f', 1, 9.0, 4.0),
+            impact_line(241, 't', 'f', 1, 9.0, 4.0), impact_line(242, 't', 'f', 1, 9.0, 4.0), impact_line(243, 't', 'f', 1, 9.0, 4.0)]
+    summary = IMPACT.summarize(rows)  # one hour (240 samples) missing between the second and the third
+    assert summary['overlap_episodes'] == 2 and summary['longest_overlap_minutes'] == 0.8
+    assert summary['gaps'] == 1 and summary['gap_minutes'] == pytest.approx(59.8, abs=0.05)
+    assert IMPACT.summarize(list(reversed(rows)))['overlap_episodes'] == 2  # the order of the lines does not matter
+
+
+# spec: ANYM-684
 def test_impact_log_collects_one_line_skips_the_first_and_never_signals(tmp_path, monkeypatch):
-    tables = iter([IMPACT.read_processes(lambda: f'  600 20 0:10.00 4000000 python\n  451 30 5:00.00 900000 {IMPACT_VM}\n'),
-                   IMPACT.read_processes(lambda: f'  600 20 0:15.00 4000000 python\n  451 30 5:20.00 900000 {IMPACT_VM}\n')])
+    first = ps_text((600, 20, T0, '0:10.00', 4000000, 'python'), (451, 30, T0, '5:00.00', 900000, IMPACT_VM))
+    second = ps_text((600, 20, T0, '0:15.00', 4000000, 'python'), (451, 30, T0, '5:20.00', 900000, IMPACT_VM),
+                     (600, 22, T0, '0:00.00', 2048 * 1024, 'worker', 'T+'))  # a stopped worker holding 2 GB
+    tables = iter([IMPACT.read_processes(lambda: first), IMPACT.read_processes(lambda: second)])
     clock = iter([100.0, 110.0])
     monkeypatch.setattr(IMPACT, 'read_processes', lambda: next(tables))
     monkeypatch.setattr(IMPACT.time, 'monotonic', lambda: next(clock))
@@ -568,16 +615,70 @@ def test_impact_log_collects_one_line_skips_the_first_and_never_signals(tmp_path
     row = IMPACT.parse_line(line)
     assert row['between'] == 't' and row['ci'] == 'f' and row['phase'] is True and row['inf_cpu'] == 0.5  # 5 s of CPU in 10 s is a phase (>= 0.3 cores)
     assert row['vm_cores'] == 2.0 and row['load'] == 7.5 and row['avail_gb'] == 1.0 and row['swap_mb'] == 100.0
+    assert row['stopped_mb'] == 2048.0 and row['inf_rss_mb'] == pytest.approx(4000000 / 1024 + 2048, abs=1)  # the line keeps whole MB
     # the monitor is read-only: nothing in it signals, escalates or talks to launchd
     source = (ROOT / 'services' / 'inference' / 'launchd' / 'impact_log.py').read_text()
     for forbidden in ('kill', 'sudo', 'launchctl', 'os.system', 'signal'):
         assert forbidden not in source.split('"""', 2)[2]
-    # a day's file becomes a summary file, and a missing day writes nothing
+
+
+# spec: ANYM-684
+def test_impact_log_loop_survives_failed_appends_and_summaries_and_retries_the_summary(tmp_path, monkeypatch):
+    day1, day2 = 1_700_000_000.0, 1_700_000_000.0 + 86400  # two local days
+    d1, d2 = IMPACT.day_of(day1), IMPACT.day_of(day2)
+    ticks = [day1 + n * 15 for n in range(4)] + [day2 + n * 15 for n in range(120)]
+    now = {'t': ticks[0]}
+
+    class Done(Exception):
+        pass
+
+    def sleep(_seconds):
+        ticks.pop(0)
+        if not ticks:
+            raise Done  # the clock has run out: end the endless loop
+        now['t'] = ticks[0]
+
+    calls = {'append': 0, 'summary': 0}
+    real_append, real_summary = IMPACT.append_line, IMPACT.write_summary
+
+    def append(directory, day, line):
+        calls['append'] += 1
+        if calls['append'] in (2, 3):
+            raise OSError('disk full')
+        real_append(directory, day, line)
+
+    def summary(directory, day, interval):
+        calls['summary'] += 1
+        if calls['summary'] <= 2:
+            (directory / f'.summary-{day}.json.part').write_text('{"trunc')  # a half-written partial file
+            raise OSError('disk full')
+        real_summary(directory, day, interval)
+
+    monkeypatch.setattr(IMPACT, 'append_line', append)
+    monkeypatch.setattr(IMPACT, 'write_summary', summary)
+    monkeypatch.setattr(IMPACT, 'collect', lambda state, started, busy: impact_line(0, 'f', 'f', 0, 1.0, 7.0, base=int(started)))
+    with pytest.raises(Done):
+        IMPACT.run_log(tmp_path, str(tmp_path / 'busy.json'), 15, 0, clock=lambda: now['t'], sleep=sleep)
+    logs = sorted(path.name for path in tmp_path.glob('impact-*.log'))
+    assert logs == [f'impact-{d1}.log', f'impact-{d2}.log']
+    # two appends failed and were skipped; the loop went on to the next day
+    assert (tmp_path / f'impact-{d1}.log').read_text().count('\n') == 2
+    # the summary of day one failed twice (rollover, then the retry) and was written by a later retry, never truncated
+    final = json.loads((tmp_path / f'summary-{d1}.json').read_text())
+    assert final['samples'] == 2 and calls['summary'] >= 3
+
+
+# spec: ANYM-684
+def test_impact_summary_write_is_atomic_and_a_missing_day_writes_nothing(tmp_path):
+    line = impact_line(0, 't', 'f', 1, 9.0, 4.0)
     (tmp_path / 'impact-2026-11-02.log').write_text(line + '\n')
+    (tmp_path / 'impact-2026-11-03.log').write_text(line + '\n')
+    assert IMPACT.pending_days(tmp_path, '2026-11-03') == ['2026-11-02']
     IMPACT.write_summary(tmp_path, '2026-11-02', 15)
-    IMPACT.write_summary(tmp_path, '2026-11-03', 15)
+    IMPACT.write_summary(tmp_path, '2026-11-04', 15)
     assert json.loads((tmp_path / 'summary-2026-11-02.json').read_text())['samples'] == 1
-    assert not (tmp_path / 'summary-2026-11-03.json').exists()
+    assert not (tmp_path / 'summary-2026-11-04.json').exists() and not list(tmp_path.glob('.summary-*'))
+    assert IMPACT.pending_days(tmp_path, '2026-11-03') == [] and IMPACT.pending_days(tmp_path, '2026-11-04') == ['2026-11-03']
 
 
 # spec: ANYM-684

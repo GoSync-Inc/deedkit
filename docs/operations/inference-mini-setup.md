@@ -601,7 +601,7 @@ MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]
 ADMIN="${MINI%@*}"; OUT="$(mktemp -d)"
 ssh "$MINI" 'PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; python3 -I - --once' < services/inference/src/deedkit_inference/busy_probe.py &&
 python3 services/inference/launchd/render.py --admin "$ADMIN" --admin-home "/Users/$ADMIN" --python /opt/homebrew/bin/python3.13 --out "$OUT" &&
-D="$(ssh "$MINI" 'D=$(mktemp -d /tmp/deedkit-setup.XXXXXX) && echo "stage $D" >> ~/deedkit-inference-setup.created && echo $D')" &&
+D="$(ssh "$MINI" 'D=$(mktemp -u /tmp/deedkit-setup.XXXXXX) && echo "stage $D" >> ~/deedkit-inference-setup.created && mkdir -m 700 "$D" && echo $D')" &&
 [ -n "$D" ] &&
 scp "$OUT/com.deedkit.inference-impact.plist" services/inference/launchd/impact_log.py "$MINI:$D/" &&
 ssh "$MINI" "D=$D"'; set -e; cd "$D"; chmod 644 *
@@ -617,7 +617,7 @@ plutil -lint /Library/LaunchDaemons/com.deedkit.inference-impact.plist
 echo job-impact >> ~/deedkit-inference-setup.created
 sudo -n launchctl bootstrap system /Library/LaunchDaemons/com.deedkit.inference-impact.plist
 sleep 40; sudo -n launchctl print system/com.deedkit.inference-impact | grep -E "state|pid"
-tail -n 3 ~/deedkit-inference-impact/impact-$(date +%F).log'; rm -r "$OUT"
+tail -n 3 ~/deedkit-inference-impact/impact-$(date +%F).log'; RC=$?; rm -r "$OUT"; [ "$RC" = 0 ]   # the exit status of the block is the install's, not the cleanup's
 ```
 
 Read-back: `state = running`, and the last lines are `ts=... between=... phase=... load=... avail_gb=...` with `between` and `ci`
