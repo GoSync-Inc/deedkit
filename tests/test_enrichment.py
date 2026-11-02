@@ -886,13 +886,16 @@ def test_the_scaled_copy_drops_the_exif_block(tmp_path):
 
 
 # spec: ANYM-696
-@pytest.mark.parametrize('name,data',[
-    ('corrupt',bytes(range(256))*400),
-    ('concat',b"ffconcat version 1.0\nfile 'original'\n"),
-    ('svg',b'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>'),
-    ('playlist',b'#EXTM3U\n#EXTINF:1,x\nfile:///etc/passwd\n')])
-def test_a_bad_picture_fails_as_invalid_image_sends_nothing_and_the_next_job_succeeds(tmp_path,monkeypatch,name,data):
+BAD_PICTURES={'corrupt':bytes(range(256))*400,  # the test id carries the name only: a 100 KB id would be PYTEST_CURRENT_TEST, too big for exec
+    'concat':b"ffconcat version 1.0\nfile 'original'\n",
+    'svg':b'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>',
+    'playlist':b'#EXTM3U\n#EXTINF:1,x\nfile:///etc/passwd\n'}
+
+
+@pytest.mark.parametrize('name',list(BAD_PICTURES))
+def test_a_bad_picture_fails_as_invalid_image_sends_nothing_and_the_next_job_succeeds(tmp_path,monkeypatch,name):
     import tempfile
+    data=BAD_PICTURES[name]
     scratch=tmp_path/'scratch';scratch.mkdir();monkeypatch.setattr(tempfile,'tempdir',str(scratch))
     path=tmp_path/'original';path.write_bytes(data)
     with pytest.raises(ModelError) as error:
