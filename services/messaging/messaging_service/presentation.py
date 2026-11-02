@@ -38,6 +38,8 @@ def options(method, arguments):
             arguments['body_chars']=TRANSCRIPT_BODY_CHARS
     if 'include_coverage' in arguments and arguments['include_coverage'] is None:
         arguments['include_coverage']=detail=='full'
+    # ANYM-667: a compact page keeps page and sheet spans only; the store caps what it keeps, so it must know.
+    if method=='get_file_text' and detail=='compact':arguments['compact_spans']=True
     return arguments,detail
 
 
@@ -167,10 +169,21 @@ def lean_message(row, *, search=False, files=True):
 
 
 def lean_view(view):
-    result={k:view[k] for k in ('view','contract_version','order','system_filter','warnings','content_is_untrusted') if k in view}
-    # Applies to every returned message; detail=full repeats it per message.
-    result['provider_currentness_verified']=False
+    """ANYM-667: the untrusted-content flag, the contract and order, and warnings when there are any."""
+    result={k:view[k] for k in ('contract_version','order','content_is_untrusted') if k in view}
+    if view.get('warnings'):result['warnings']=view['warnings']
     return result
+
+
+EVIDENCE_SUMMARY=('empty_reason','requested_range_traversed','active_conflicts_in_range','next_action','empty_fields')
+EVIDENCE_LIVE=('live','live_wait','suggested_call','archive_reread')
+EVIDENCE_CONSTANTS=('basis','full_history_verified','message_index')
+
+
+def lean_evidence(evidence, include_coverage):
+    """ANYM-667: the ANYM-53 summary and the live keys; include_coverage=true keeps the counts and per-chat statuses."""
+    if include_coverage:return {k:v for k,v in evidence.items() if k not in EVIDENCE_CONSTANTS}
+    return {k:evidence[k] for k in (*EVIDENCE_SUMMARY,*EVIDENCE_LIVE) if k in evidence}
 
 
 def lean_conversation(state, *, shown=(), place=True):
@@ -392,7 +405,7 @@ def lean_queue_conversation(state, last, hint, *, kind=None, self_chat=False):
     return omit_fixed(result,last,hint,kind,self_chat)
 
 
-def lean(method, result):
+def lean(method, result, include_coverage=False):
     """Conversation-view compact: every message text once, qualifiers only when they apply."""
     result=dict(result)
     for key in ('sources','chat_sync'):result.pop(key,None)
@@ -408,6 +421,10 @@ def lean(method, result):
         return result
     search=method=='search'
     result['conversation_view']=lean_view(result['conversation_view'])
+    if 'result_evidence' in result:result['result_evidence']=lean_evidence(result['result_evidence'],include_coverage)
+    # The search block echoes the request; only a fuzzy match changes how to read the rows (they are near misses).
+    block=result.pop('search',None)
+    if block and block.get('fuzzy_used'):result['search']={'fuzzy_used':True}
     if method=='get_context':
         anchor=result['message']
         rows=result['context']
@@ -467,11 +484,33 @@ def transcript(method, result):
     return output
 
 
-def render(method, result, detail):
+FILE_TEXT_KEYS=('text','content','offset','next_offset','content_chars','truncated','extraction_status',
+    'enrichment_status','download_status','empty_reason','empty_reason_detail','failure_reason','next_action',
+    'message_id','mime','display_name','model_generated','notice')
+PROVENANCE_KEYS=('attachment_id','message_id','revision','content','extractor','model','provider','processor_version','sha256')
+
+
+def lean_file_text(result):
+    """ANYM-667: the text, its paging, the readiness reasons, the truncation flags and the provenance an agent cites."""
+    output={k:result[k] for k in FILE_TEXT_KEYS if k in result}
+    if isinstance(result.get('content_coverage'),dict):
+        output['content_coverage']={k:v for k,v in result['content_coverage'].items()
+            if k in ('retained_chars','truncated','complete')}
+    if isinstance(result.get('provenance'),dict):
+        output['provenance']={k:v for k,v in result['provenance'].items() if k in PROVENANCE_KEYS and v is not None}
+    spans=[s for s in result.get('source_spans') or [] if s.get('kind') in ('page','sheet')]
+    if spans:output['source_spans']=spans
+    if result.get('source_spans_truncated'):output['source_spans_truncated']=True
+    output['detail']='compact'
+    return output
+
+
+def render(method, result, detail, include_coverage=False):
     if detail=='transcript':return transcript(method,result)
+    if detail=='compact' and method=='get_file_text':return lean_file_text(result)
     if detail=='compact' and (result.get('view')=='conversation' if method=='list_chats' else
             method in ('search','get_messages','get_context') and 'conversation_view' in result):
-        return lean(method,result)
+        return lean(method,result,include_coverage)
     if detail=='full' or method not in ('list_chats','search','get_messages','get_updates',
         'get_context','search_files','get_file_text','get_file_segments','get_sync_status'):return result
     if method=='get_sync_status':
