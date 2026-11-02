@@ -233,6 +233,10 @@ def get_sync_status(c, p):
         conflicts = grouped(c, 'account', [row['account'] for row in sources])
         from .conflict_reevaluation import status as reevaluation_status
         reevaluations = reevaluation_status(c, [row['account'] for row in sources])
+    outbound = {}
+    if sources and not scoped:
+        from .outgoing import outbound_status
+        outbound = outbound_status(c, [row['account'] for row in sources])
     deletion_status = {}
     if sources and not scoped:
         from .message_purge import deletions
@@ -265,6 +269,9 @@ def get_sync_status(c, p):
             row['operations']=operations(row,row['history'],row['files'],eligibility=eligibility.get(account))
             row['liveness']=liveness(row['operations'])
             row['freshness']=freshness(row['history'].get('last_scan_at'),operational=row['operations'])
+            row['outbound']=outbound[account]
+            from .outgoing import outbound_alerts
+            row['alerts'].extend(outbound_alerts(row['outbound']))
             if row['freshness']['scan_state']=='scan_stale':row['alerts'].append('successful_scan_older_than_5_minutes')
             if row['freshness']['state']=='capture_backlogged':row['alerts'].append('capture_backlog')
             if row['freshness']['state']=='collector_not_running':row['alerts'].append('collector_not_running')

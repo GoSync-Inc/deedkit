@@ -1405,7 +1405,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Account summary, or one chat's history traversal, scan times, gaps and file states.\nOptional UTC [from_time,to_time) tests traversal of a finite range, not full provider history.\nAccount summaries cache for at most 10s with observed_at/cache age; refresh=true bypasses.\ndetail=compact is the default overview; full includes complete account diagnostics.\nChat status is uncached. No provider requests; scans do not verify older edits/deletions.\n",
+    "description": "Account summary, or one chat's history traversal, scan times, gaps and file states.\nOptional UTC [from_time,to_time) tests traversal of a finite range, not full provider history.\nAccount summaries cache for at most 10s with observed_at/cache age; refresh=true bypasses.\ndetail=compact is the default overview; full includes complete account diagnostics.\nChat status is uncached. No provider requests; scans do not verify older edits/deletions.\nEach account also carries an outbound block (sender ready, cooling_down or not_ready; queued sends, age,\ntime to expiry; alerts outbound_queue_stalled, outbound_sender_not_ready); never answer a waiting send by sending again.\n",
     "inputSchema": {
       "properties": {
         "chat_id": {

@@ -355,6 +355,95 @@ def result(row,c=None,p=None):
     })
 
 
+def policy_blocks(policy):
+    """The account-policy gate of send admission; the outbound status (ANYM-671) uses the same predicate."""
+    return not policy or not policy['enabled'] or not policy['send_enabled']
+
+
+def connection_blocks(connected):
+    """The sender gate of send admission: a live collector lease and a connected provider session."""
+    return not connected or not connected['active'] or connected['operations'].get('connection',{}).get('state')!='connected'
+
+
+STALL_AFTER_S=120
+OUTBOUND_SQL='''SELECT a.id AS account,p.account IS NOT NULL AS has_policy,p.enabled,p.send_enabled,
+    l.account IS NOT NULL AS has_lease,l.expires_at>clock_timestamp() AS active,h.account IS NOT NULL AS has_health,h.operations,
+    greatest(0,extract(epoch FROM h.cooldown_until-clock_timestamp())) AS cooldown_s,
+    q.queued,q.oldest_age,q.expires_in,x.expired_unsettled
+    FROM accounts a LEFT JOIN account_policies p ON p.account=a.id
+    LEFT JOIN collector_leases l ON l.account=a.id LEFT JOIN collector_health h ON h.account=a.id
+    CROSS JOIN LATERAL (SELECT count(*) AS queued,extract(epoch FROM clock_timestamp()-min(created_at)) AS oldest_age,
+        extract(epoch FROM (array_agg(expires_at ORDER BY created_at,id))[1]-clock_timestamp()) AS expires_in
+        FROM outgoing_messages WHERE account=a.id AND status='queued' AND expires_at>clock_timestamp()) q
+    CROSS JOIN LATERAL (SELECT count(*) AS expired_unsettled FROM outgoing_messages
+        WHERE account=a.id AND status='queued' AND expires_at<=clock_timestamp()) x
+    WHERE a.id=ANY(%s)'''
+UNAVAILABLE={'sender':'unavailable','queued':None,'oldest_queued_age_s':None,'expires_in_s':None,'expired_unsettled':None}
+
+
+def _outbound_block(row):
+    from .status_details import describe
+    account=row['account']
+    policy={'enabled':row['enabled'],'send_enabled':row['send_enabled']} if row['has_policy'] else None
+    connected={'active':bool(row['active']),'operations':row['operations'] or {}} if row['has_lease'] and row['has_health'] else None
+    queued=int(row['queued']);expired=int(row['expired_unsettled'])
+    age=None if not queued else max(0.0,round(float(row['oldest_age']),1))
+    left=None if not queued else max(0.0,round(float(row['expires_in']),1))
+    block={'sender':'ready','queued':queued,'oldest_queued_age_s':age,'expires_in_s':left,'expired_unsettled':expired}
+    if policy_blocks(policy):
+        block.update(sender='not_ready',reason_code='sending_disabled',reason='Sending is disabled for this account by its policy.')
+    elif connection_blocks(connected):
+        phase=(connected or {}).get('operations',{}).get('connection') or {}
+        code='collector_not_running' if not connected or not connected['active'] else phase.get('reason_code') or 'not_checked'
+        block.update(sender='not_ready',reason_code=code,
+            reason='The collector is not running, so nothing can be sent.' if code=='collector_not_running'
+                else 'The provider session is not connected: '+describe(code)['explanation'])
+        if code!='collector_not_running' and phase.get('retry_at'):block['retry_at']=phase['retry_at']
+    elif row['cooldown_s'] and row['cooldown_s']>0:
+        block.update(sender='cooling_down',cooldown_remaining_s=round(float(row['cooldown_s']),1),
+            reason='The provider asked the account to slow down; the sender resumes when the cooldown ends.')
+    sender=block['sender']
+    if sender=='cooling_down' and queued and block['cooldown_remaining_s']>left:
+        block['next_action']=('Nothing was sent: the queued sends will expire before the cooldown ends. '
+            'Do not send the same thing again now; after the cooldown a new action with the owner\'s approval is needed.')
+    elif expired:
+        block['next_action']=(str(expired)+' queued send(s) are past their expiry and will not be sent'
+            +(' even once the account is back' if sender!='ready' else '')+'; a new action with the owner\'s approval is needed.')
+    elif sender=='not_ready':
+        block['next_action']=('Wait until '+str(block['retry_at'])+' and read this status again; do not send the same thing again.'
+            if block.get('retry_at') else 'Tell the owner that sending from account '+account+' is not available.')
+    elif queued:
+        block['next_action']=('Queued sends are waiting: do not send the same thing again. If they expire (send.failed or status '
+            'expired), a new action with the owner\'s approval is needed.')
+    if sender=='ready' and queued and age>STALL_AFTER_S:
+        block['reason']='Oldest queued send has waited '+str(int(age))+' s with the sender connected and no cooldown.'
+    return block
+
+
+def outbound_alerts(block):
+    """Alert codes for one outbound block (ANYM-671); none during a cooldown, which is a sender state."""
+    if not block.get('queued'):return []
+    if block['sender']=='not_ready':return ['outbound_sender_not_ready']
+    if block['sender']=='ready' and block['oldest_queued_age_s']>STALL_AFTER_S:return ['outbound_queue_stalled']
+    return []
+
+
+def outbound_status(c,accounts):
+    """Per-account outbound block from one read-only query in its own savepoint with a 2 s statement timeout:
+    an error or timeout gives the unavailable block for every account and never reaches the caller (ANYM-671)."""
+    accounts=list(accounts)
+    try:
+        with c.transaction():
+            previous=c.execute("SELECT current_setting('statement_timeout') AS v").fetchone()['v']
+            c.execute("SELECT set_config('statement_timeout','2000',true)")
+            rows=c.execute(OUTBOUND_SQL,(accounts,)).fetchall()
+            c.execute("SELECT set_config('statement_timeout',%s,true)",(previous,))
+        found={row['account']:_outbound_block(row) for row in rows}
+    except Exception:
+        found={}
+    return {account:found.get(account) or dict(UNAVAILABLE) for account in accounts}
+
+
 def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
             preview_digest='',link_preview=False,allow_lossy=False,phone_hash=None,child=False):
     """phone_hash: a phone send (ANYM-532) whose digest the caller checked; it is the request hash.
@@ -402,15 +491,13 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
     request_hash=phone_hash or legacy_hash if default_policy else phone_hash or hashlib.sha256(canonical([
         account,chat_id,chat['provider_chat'],reply_id,artifact,draft['render_policy'],preview_digest])).hexdigest()
     policy=c.execute('SELECT * FROM account_policies WHERE account=%s',(account,)).fetchone()
-    if not policy or not policy['enabled'] or not policy['send_enabled']:
-        raise APIError('sending_disabled',409)
+    if policy_blocks(policy):raise APIError('sending_disabled',409)
     from .collector_state import CollectorState
     if not CollectorState.allows(policy,chat['provider_chat']):raise APIError('not_found',404)
     connected=c.execute('''SELECT l.expires_at>clock_timestamp() AS active,h.operations
         FROM collector_leases l JOIN collector_health h USING(account) WHERE l.account=%s''',
         (account,)).fetchone()
-    if not connected or not connected['active'] or connected['operations'].get('connection',{}).get('state')!='connected':
-        raise APIError('sender_not_ready',409)
+    if connection_blocks(connected):raise APIError('sender_not_ready',409)
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('outgoing-account:'+account,))
     count=c.execute("SELECT count(*) AS n FROM outgoing_messages WHERE account=%s AND created_at>clock_timestamp()-interval '1 minute'",
         (account,)).fetchone()['n']
