@@ -1,5 +1,6 @@
 """Synthetic release proof: never connects to a provider or production database."""
 import copy
+import fcntl
 import json
 from pathlib import Path
 import shutil
@@ -731,6 +732,337 @@ def staged_predecessor(tmp_path, monkeypatch):
     s.p.write(Path(cfg['state_directory']) / 'http-current.json', receipt)
     monkeypatch.setattr(s, 'control', lambda path, action, generation, sha: {**status(phase='draining'), 'generation': generation})
     return cfg, release, calls, receipt
+
+
+def retired_chain(tmp_path, monkeypatch, count=5):
+    """`count` HTTP generations, the last serving with the one before it as `previous`; every older one retired by its
+    successor's receipt. Returns the config, the generations (oldest first), the fake docker's containers and the argv log."""
+    cfg = settings(tmp_path)
+    state = Path(cfg['state_directory'])
+    generations = ['%012x' % (number + 1) for number in range(count)]
+    containers, calls, previous = {}, [], None
+    for number, generation in enumerate(generations):
+        sha = '%040x' % (number + 1)
+        identities = {role: {'container': '%064x' % (0x100 + number * 2 + (role == 'gateway')), 'image': IMAGE} for role in ['api', 'gateway']}
+        receipt = {'sha': sha, 'generation': generation, 'status': 'serving', 'containers': identities,
+                   'retired_roles': ['gateway', 'api'] if previous else [], 'previous': previous}
+        (state / sha).mkdir()
+        s.p.write(state / sha / 'http-result.json', receipt)
+        s.p.write(state / sha / 'http-attempted.json', {'status': 'serving', 'sha': sha})
+        current = number == count - 1
+        for role, identity in identities.items():
+            containers[identity['container']] = {'Id': identity['container'], 'Image': IMAGE,
+                'State': {'Status': 'running' if current else 'exited', 'Running': current},
+                'Config': {'Labels': {'com.docker.compose.project': 'deedkit-http-' + generation,
+                    'com.docker.compose.service': 'http-' + role + '-' + generation, 'ai.deedkit.http-release': generation}}}
+        previous = {key: copy.deepcopy(value) for key, value in receipt.items() if key != 'previous'} | {'previous': None}
+        s.p.write(state / 'http-current.json', receipt)
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if argv[:2] == ['docker', 'inspect']:
+            if argv[2] not in containers:
+                raise s.Refused('docker failed (exit 1): Error: No such object: ' + argv[2])
+            return json.dumps([containers[argv[2]]])
+        if argv[:2] == ['docker', 'rm']:
+            del containers[argv[2]]
+            return ''
+        if argv[:3] == ['docker', 'ps', '--all']:
+            return ''.join('%s %s %s\n' % (identity, value['Config']['Labels'].get('ai.deedkit.http-release', ''), value['State']['Status'])
+                           for identity, value in containers.items())
+        raise AssertionError(argv)
+    monkeypatch.setattr(s.p, 'run', run)
+    return cfg, generations, containers, calls
+
+
+def container_of(containers, generation, role):
+    return next(identity for identity, value in containers.items() if value['Config']['Labels']['com.docker.compose.service'] == 'http-' + role + '-' + generation)
+
+
+# spec: ANYM-689
+def test_clean_removes_exactly_the_older_retired_generations_by_receipt_id(tmp_path, monkeypatch):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    older = {generation: [container_of(containers, generation, role) for role in ['api', 'gateway']] for generation in generations[:3]}
+    kept = [identity for identity in containers if identity not in sum(older.values(), [])]
+    summary = s.clean(cfg, True)
+    assert sorted(summary['removed']) == sorted(g + '/' + role for g in generations[:3] for role in ['api', 'gateway'])
+    assert summary['generations'] == generations[:3] and summary['unresolved'] == 0
+    assert sorted(argv[2] for argv in calls if argv[1] == 'rm') == sorted(sum(older.values(), []))
+    assert all(argv[:2] in (['docker', 'inspect'], ['docker', 'rm']) and len(argv) == 3 for argv in calls if argv[1] != 'ps')
+    assert sorted(containers) == sorted(kept)
+    assert sorted(summary['ids']) == sorted(identity[:12] for identity in sum(older.values(), [])) and summary['not_selected_count'] == 0 and summary['unlabelled_count'] == 0
+
+
+# spec: ANYM-689
+def test_clean_never_selects_a_foreign_container_that_carries_a_receipted_label(tmp_path, monkeypatch):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    foreign = containers[container_of(containers, generations[0], 'api')] | {'Id': 'f' * 64}
+    containers['f' * 64] = foreign
+    s.clean(cfg, True)
+    assert 'f' * 64 in containers and not any('f' * 64 in argv for argv in calls)
+
+
+# spec: ANYM-689
+def test_clean_skips_a_generation_whose_retirement_the_successor_does_not_record(tmp_path, monkeypatch):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    state = Path(cfg['state_directory'])
+    successor = state / ('%040x' % 3) / 'http-result.json'
+    value = s.p.read(successor)
+    s.p.write(successor, value | {'status': 'serving-retirement-pending', 'retired_roles': ['gateway']})
+    summary = s.clean(cfg, True)
+    # Generation 2 itself reads pending with a managed predecessor, and generation 1's retirement is no longer recorded.
+    assert summary['generations'] == [generations[0]] and summary['unresolved'] == 2
+    assert container_of(containers, generations[1], 'api') in containers and container_of(containers, generations[2], 'api') in containers
+
+
+# spec: ANYM-689
+@pytest.mark.parametrize('state', ['running', 'restarting', 'created', 'dead', 'paused', 'removing'])
+def test_clean_removes_nothing_that_is_not_exited(tmp_path, monkeypatch, state):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    target = container_of(containers, generations[0], 'api')
+    containers[target]['State'] = {'Status': state, 'Running': state in {'running', 'restarting'}}
+    summary = s.clean(cfg, True)
+    assert target in containers and {'container': generations[0] + '/api', 'id': target[:12], 'reason': 'state ' + state} in summary['skipped']
+    assert ['docker', 'rm', target] not in calls
+
+
+# spec: ANYM-689
+@pytest.mark.parametrize('change', ['image', 'project', 'service', 'release'])
+def test_clean_skips_a_container_whose_identity_or_labels_changed_since_the_receipt(tmp_path, monkeypatch, change):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    target = container_of(containers, generations[1], 'gateway')
+    labels = containers[target]['Config']['Labels']
+    if change == 'image':
+        containers[target]['Image'] = OLD
+    else:
+        labels[{'project': 'com.docker.compose.project', 'service': 'com.docker.compose.service', 'release': 'ai.deedkit.http-release'}[change]] = 'other'
+    summary = s.clean(cfg, True)
+    assert target in containers and any(item['container'] == generations[1] + '/gateway' for item in summary['skipped'])
+
+
+# spec: ANYM-689
+def test_a_failed_removal_is_reported_never_repeated_and_never_raises(tmp_path, monkeypatch):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    first, second = container_of(containers, generations[0], 'api'), container_of(containers, generations[0], 'gateway')
+    real = s.p.run
+    def lost(argv, **kwargs):
+        if argv == ['docker', 'rm', second]:
+            calls.append(argv)
+            raise TimeoutError('no answer')
+        return real(argv, **kwargs)
+    monkeypatch.setattr(s.p, 'run', lost)
+    summary = s.clean(cfg, True)
+    assert summary['unknown'] == [{'container': generations[0] + '/gateway', 'id': second[:12], 'reason': 'TimeoutError'}]
+    assert calls.count(['docker', 'rm', second]) == 1 and first not in containers and second in containers
+    assert len(summary['removed']) == 5
+    # The next run inspects the same ID: still present and unchanged it is removable again; absent it is only reported.
+    monkeypatch.setattr(s.p, 'run', real)
+    assert s.clean(cfg, True)['removed'] == [generations[0] + '/gateway']
+    assert s.clean(cfg, True)['removed'] == []
+
+
+# spec: ANYM-689
+def test_clean_skips_what_a_malformed_receipt_cannot_prove_and_raises_nothing(tmp_path, monkeypatch):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    state = Path(cfg['state_directory'])
+    (state / ('%040x' % 2) / 'http-result.json').write_text('not json')
+    summary = s.clean(cfg, True)
+    # The second generation's receipt carries the proof for the first one and its own identities: neither is removed.
+    # Generation 0 lost its proof, the unreadable receipt file is counted, and so are the receipt-less labelled containers
+    # of that same generation: an over-count by one is the price of never hiding one.
+    assert summary['generations'] == [generations[2]] and summary['unresolved'] == 3 and summary['no_receipt_generations'] == 1
+    (state / 'http-current.json').write_text('{')
+    assert s.clean(cfg, True)['removed'] == [] and s.retired_generations(cfg) == ({}, 0)
+
+
+# spec: ANYM-689
+def test_clean_stops_at_its_time_budget_between_two_removals(tmp_path, monkeypatch):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    clock, real = [0.0], s.p.run
+    def slow(argv, **kwargs):
+        if argv[1] == 'rm':
+            clock[0] += 1000
+        return real(argv, **kwargs)
+    monkeypatch.setattr(s.p, 'run', slow)
+    monkeypatch.setattr(s.time, 'monotonic', lambda: clock[0])
+    summary = s.clean(cfg, True)
+    assert summary['stopped'] == 'budget' and len(summary['removed']) == 1
+
+
+# spec: ANYM-689
+def test_clean_skips_a_pending_generation_that_had_a_managed_predecessor(tmp_path, monkeypatch):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    receipt = Path(cfg['state_directory']) / ('%040x' % 2) / 'http-result.json'
+    s.p.write(receipt, s.p.read(receipt) | {'status': 'serving-retirement-pending', 'retired_roles': ['gateway']})
+    summary = s.clean(cfg, True)
+    # Generation 1 never retired its own predecessor (so generation 0 has no proof either); generation 2 is still removable.
+    assert summary['generations'] == [generations[2]] and summary['unresolved'] == 2
+    assert container_of(containers, generations[0], 'api') in containers and container_of(containers, generations[1], 'api') in containers
+
+
+# spec: ANYM-689
+def test_clean_removes_the_first_managed_generation_while_its_own_retirement_is_pending(tmp_path, monkeypatch):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    receipt = Path(cfg['state_directory']) / ('%040x' % 1) / 'http-result.json'
+    s.p.write(receipt, s.p.read(receipt) | {'status': 'serving-retirement-pending'})
+    assert s.clean(cfg, True)['generations'] == generations[:3]
+
+
+# spec: ANYM-689
+def test_clean_skips_a_generation_with_two_conflicting_receipts(tmp_path, monkeypatch):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    state = Path(cfg['state_directory'])
+    twin = state / ('%040x' % 99)
+    twin.mkdir()
+    s.p.write(twin / 'http-result.json', s.p.read(state / ('%040x' % 1) / 'http-result.json') | {'sha': '%040x' % 99, 'status': 'serving-retirement-pending'})
+    s.p.write(twin / 'http-attempted.json', {'status': 'serving', 'sha': '%040x' % 99})
+    summary = s.clean(cfg, True)
+    assert summary['generations'] == generations[1:3] and container_of(containers, generations[0], 'api') in containers
+
+
+# spec: ANYM-689
+def test_every_docker_command_of_a_clean_gets_a_timeout_that_never_exceeds_what_is_left(tmp_path, monkeypatch):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    timeouts, clock, real = [], [0.0], s.p.run
+    def spy(argv, **kwargs):
+        timeouts.append(kwargs.get('timeout'))
+        clock[0] += 50
+        return real(argv, **kwargs)
+    monkeypatch.setattr(s.p, 'run', spy)
+    monkeypatch.setattr(s.time, 'monotonic', lambda: clock[0])
+    summary = s.clean(cfg, True)
+    assert timeouts[:3] == [30, 30, 20] and summary['stopped'] == 'budget'
+    assert all(value is not None and 1 <= value <= 30 for value in timeouts) and timeouts == sorted(timeouts, reverse=True)
+
+
+# spec: ANYM-689
+def test_clean_lists_the_labelled_containers_it_did_not_select_without_touching_them(tmp_path, monkeypatch):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    # A foreign copy of a known generation, one of a generation without any receipt, and two unlabelled containers.
+    copy_of = containers[container_of(containers, generations[0], 'api')]
+    containers['f' * 64] = copy_of | {'Id': 'f' * 64}
+    containers['e' * 64] = copy_of | {'Id': 'e' * 64, 'Config': {'Labels': {'ai.deedkit.http-release': 'ffffffffffff'}}}
+    for number in range(2):
+        containers['%064x' % (0xd0 + number)] = {'Id': '%064x' % (0xd0 + number), 'Image': IMAGE, 'State': {'Status': 'exited', 'Running': False}, 'Config': {'Labels': {}}}
+    summary = s.clean(cfg, True)
+    assert summary['not_selected_count'] == 2 and summary['unlabelled_count'] == 2
+    # The generation with no receipt at all is as unresolved as one with an ineligible receipt, and counted once.
+    assert summary['no_receipt_generations'] == 1 and summary['unresolved'] == 1
+    assert sorted(summary['not_selected'], key=lambda item: item['id']) == [
+        {'id': 'e' * 12, 'generation': 'ffffffffffff', 'state': 'exited', 'reason': 'no receipt'},
+        {'id': 'f' * 12, 'generation': generations[0], 'state': 'exited', 'reason': 'generation not eligible'}]
+    assert {'e' * 64, 'f' * 64} <= set(containers) and not any(argv[1] == 'rm' and argv[2] in {'e' * 64, 'f' * 64} for argv in calls if argv[1] != 'ps')
+    assert len(containers) == 4 + 2 + 2
+
+
+def clock_after_first_inspect(monkeypatch, spent):
+    """A fake clock that jumps by `spent` seconds during the first docker command; returns it and the (verb, timeout) log."""
+    clock, timeouts, real = [0.0], [], s.p.run
+    def spy(argv, **kwargs):
+        timeouts.append((argv[1], kwargs.get('timeout')))
+        if len(timeouts) == 1:
+            clock[0] += spent
+        return real(argv, **kwargs)
+    monkeypatch.setattr(s.p, 'run', spy)
+    monkeypatch.setattr(s.time, 'monotonic', lambda: clock[0])
+    return timeouts
+
+
+# spec: ANYM-689
+def test_no_command_starts_exactly_at_the_deadline(tmp_path, monkeypatch):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    timeouts = clock_after_first_inspect(monkeypatch, s.CLEAN_BUDGET)
+    summary = s.clean(cfg, True)
+    assert [verb for verb, _ in timeouts] == ['inspect'] and summary['stopped'] == 'budget' and summary['removed'] == []
+
+
+# spec: ANYM-689
+@pytest.mark.parametrize('left', [0.2, 0.0002])
+def test_the_last_command_gets_only_the_fraction_of_a_second_that_is_left(tmp_path, monkeypatch, left):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    timeouts = clock_after_first_inspect(monkeypatch, s.CLEAN_BUDGET - left)
+    s.clean(cfg, True)
+    # No floor: a command never gets more time than the budget has left, even below a millisecond.
+    assert timeouts[0][1] == 30 and timeouts[1] == ('rm', pytest.approx(left, abs=1e-9))
+
+
+def plan_a(tmp_path, monkeypatch, images):
+    """A plan A configuration whose state directory exists, and a fake image pass that records the locks it was handed."""
+    plan_state = tmp_path / 'plan-a'
+    plan_state.mkdir()
+    seen = []
+    monkeypatch.setattr(s.p, 'config', lambda path: {'state_directory': str(plan_state), 'path': path})
+    def remove(plan, held=()):
+        seen.append((plan, held))
+        return images() if callable(images) else images
+    monkeypatch.setattr(s.p, 'remove_images', remove)
+    return plan_state, seen
+
+
+# spec: ANYM-689
+def test_clean_command_loads_the_plan_a_configuration_before_removing_anything(tmp_path, monkeypatch):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    monkeypatch.setattr(s.p, 'config', lambda path: (_ for _ in ()).throw(s.Refused('bad plan configuration')))
+    before = dict(containers)
+    with pytest.raises(s.Refused, match='bad plan configuration'):
+        s.clean_command(cfg, True, 'plan.json')
+    assert containers == before and not any(argv[1] == 'rm' for argv in calls)
+
+
+# spec: ANYM-689
+def test_clean_command_refuses_while_another_operation_holds_the_plan_a_lock(tmp_path, monkeypatch):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    plan_state, seen = plan_a(tmp_path, monkeypatch, {'removed': []})
+    before = dict(containers)
+    with (plan_state / 'deploy.lock').open('a') as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(s.Refused, match='plan A deploy lock'):
+            s.clean_command(cfg, True, 'plan.json')
+    assert containers == before and seen == []
+
+
+# spec: ANYM-689
+def test_clean_command_ends_with_the_image_pass_and_holds_all_three_states(tmp_path, monkeypatch):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    plan_state, seen = plan_a(tmp_path, monkeypatch, {'removed': [{'image': 'x'}]})
+    monkeypatch.setattr(s, 'disk_free', lambda path='/var/lib/containerd': 12.5)
+    result = s.clean_command(cfg, True, 'plan.json')
+    assert result['mode'] == 'removed' and result['images_removed'] == 1 and len(result['containers']['removed']) == 6
+    assert seen[0][1] == (cfg['state_directory'], s.GLOBAL_LOCK, plan_state)
+
+
+# spec: ANYM-689
+def test_a_failed_image_pass_keeps_the_container_summary(tmp_path, monkeypatch):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    plan_a(tmp_path, monkeypatch, lambda: (_ for _ in ()).throw(s.Refused('another production operation holds a lock')))
+    result = s.clean_command(cfg, True, 'plan.json')
+    assert len(result['containers']['removed']) == 6 and result['images_removed'] == 0
+    assert result['images'] == {'removed': [], 'error': 'another production operation holds a lock'}
+
+
+# spec: ANYM-689
+def test_report_only_changes_nothing_and_remove_needs_the_plan_a_configuration(tmp_path, monkeypatch):
+    cfg, generations, containers, calls = retired_chain(tmp_path, monkeypatch)
+    before = dict(containers)
+    monkeypatch.setattr(s, 'disk_free', lambda path='/var/lib/containerd': 12.5)
+    report = s.clean_command(cfg, False, None)
+    assert report['mode'].startswith('report only, nothing removed') and len(report['containers']['would_remove']) == 6
+    assert containers == before and not any(argv[1] == 'rm' for argv in calls)
+    with pytest.raises(s.Refused, match='--plan-a-config'):
+        s.clean_command(cfg, True, None)
+
+
+# spec: ANYM-689
+def test_retire_of_a_serving_generation_cleans_older_ones_again_and_a_cleanup_failure_changes_nothing(tmp_path, monkeypatch):
+    cfg, release, calls, receipt = staged_predecessor(tmp_path, monkeypatch)
+    receipt.update({'status': 'serving', 'retired_roles': ['gateway', 'api']})
+    s.p.write(release / 'http-result.json', receipt)
+    s.p.write(Path(cfg['state_directory']) / 'http-current.json', receipt)
+    first = s.retire(cfg, SHA)
+    assert first['status'] == 'serving' and set(first['cleanup']) >= {'removed', 'skipped', 'unknown'}
+    monkeypatch.setattr(s, 'clean', lambda *a: (_ for _ in ()).throw(RuntimeError('boom')))
+    again = s.retire(cfg, SHA)
+    assert again['status'] == 'serving' and again['cleanup'] == {'error': 'RuntimeError'}
 
 
 def test_fence_closes_late_admission_then_waits_existing_router_lease(tmp_path, monkeypatch):

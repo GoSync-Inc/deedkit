@@ -1482,6 +1482,33 @@ after `--dry-run`, `rollback`, a refused or failed apply, or a deploy ending in 
 other status. `images --remove` runs the same removal by hand, for example after
 a disk-space pause.
 
+Containers of retired HTTP generations (ANYM-689). `retire` only stops a drained
+predecessor, so each release left two exited containers, and every image "used by
+container" is kept: after a few weeks 200 stopped containers pinned 200 images and the
+15 GiB floor halted autodeploy (2026-11-02). The tool therefore removes them too, by the
+exact container IDs of the receipts, never by a label alone: a generation qualifies only
+when a successor's `http-result.json` records its retirement as complete (status
+`serving`, `retired_roles` gateway and api), it is neither the serving generation nor its
+one `previous`, its own attempt was published (`serving`) and its receipt names the same
+containers as the successor's copy. Each container is inspected immediately before its
+removal (ID, image, project, service and release labels, state `exited`) and removed with
+a plain `docker rm <id>`: no force, no volumes, no prune. It runs (a) after `retire` of a
+serving generation and (b) at the start of a real `deploy`, before the preparation and its
+disk check, followed there by a time-bounded image pass with the same keep rules, because
+the gate counts the bytes of images, not of containers (order: container cleanup, image
+removal, disk check, preparation; the pass after a deployed release stays). Both are
+best effort: 120 seconds and 30 per docker command for the containers, no lock waited
+for, every failure only a line of the summary, an unknown removal outcome never repeated
+in the same run. `deploy.json` carries the summary (`preflight`, and `cleanup`:
+containers removed, generations, images removed, disk free after) whether the deploy
+ends or halts at the floor; a halt shows `kept_reasons` of the images that stay.
+`seamless_release.py clean --config <http config>` lists the same set (report only by
+default); `clean --remove --plan-a-config <plan A config>` removes it and runs the image
+pass. What is lost: a removed container's metadata and json-file logs; an image comes back
+only from `prepared.json` registry references while the package version exists (a
+local-only build cannot be restored). Unresolved generations (no receipt, no recorded
+retirement, an interrupted promotion) are counted, never removed by the tool.
+
 Only images carrying a `deedkit-production-<target>:*` tag of the eight
 CI-published targets are considered. Kept, with reasons:
 

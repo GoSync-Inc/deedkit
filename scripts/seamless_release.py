@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import copy
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import hashlib
 import http.client
 import json
@@ -17,6 +17,7 @@ from pathlib import Path, PurePosixPath
 import posixpath
 import re
 import shlex
+import shutil
 import socket
 import stat
 import time
@@ -729,7 +730,7 @@ def retire(settings, sha):
     for role, identity in receipt['containers'].items():
         owned_container(identity, receipt, role)
     if receipt['status'] == 'serving':
-        return public_status(receipt)
+        return retired_status(settings, receipt)
     previous = receipt.get('previous')
     if not previous:
         receipt['retirement_reason'] = 'legacy instances have no trusted drain protocol; retained with legacy file route'
@@ -752,11 +753,186 @@ def retire(settings, sha):
             # The persisted fence rejects all later requests for this issuer.
     durable_write(release / 'http-result.json', receipt)
     durable_write(Path(settings['state_directory']) / 'http-current.json', receipt)
-    return public_status(receipt)
+    return retired_status(settings, receipt)
 
 
 def public_status(receipt):
     return {key: receipt[key] for key in ['sha', 'generation', 'status', 'images', 'ci', 'retirement_reason'] if key in receipt}
+
+
+# Retired generations' containers (ANYM-689, seamless-release.md "Retired generations"). `retire` only stops a drained
+# predecessor, so every release left two exited containers whose images the image retention then kept ("used by
+# container"). A generation is removable only on the successor's recorded evidence, by the exact IDs of its own receipt.
+CLEAN_BUDGET, CLEAN_COMMAND = 120, 30
+CONTAINER_ID = re.compile(r'[0-9a-f]{64}')
+
+
+def retired_status(settings, receipt):
+    """The `retire` result of a serving generation, with the bounded cleanup of older generations beside it."""
+    result = public_status(receipt)
+    if receipt.get('status') == 'serving':
+        try:
+            result['cleanup'] = clean(settings, True)
+        except Exception as exc:
+            result['cleanup'] = {'error': type(exc).__name__}
+    return result
+
+
+def readable(path):
+    try:
+        value = p.read(path)
+    except Exception:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def discover(settings, deadline=None):
+    """Read every receipt of the HTTP state once: (eligible, unresolved, kept). `eligible` maps a generation to its
+    receipt's container identities per role, for every generation that is neither the serving one nor its previous and
+    whose retirement a successor receipt records as complete (status serving, retired_roles gateway and api: `retire`
+    writes it after both roles are drained and stopped), whose own attempt was published (`serving`), whose own
+    receipt names the same containers as the successor's copy of it and whose own ancestry is consistent: a generation
+    that had a managed predecessor must have retired it itself, only the first managed generation (no `previous`) may
+    still read `serving-retirement-pending`. Two receipts of one generation that differ are a conflict, never merged.
+    `unresolved` counts every other generation with a receipt plus every receipt file that cannot be read as one;
+    `kept` are the serving and previous generations; `known` every generation a readable receipt names."""
+    state = Path(settings['state_directory'])
+    current = readable(state / 'http-current.json')
+    if not current or not GENERATION.fullmatch(str(current.get('generation'))):
+        return {}, 0, set(), set()
+    kept = {current['generation'], (current.get('previous') or {}).get('generation')}
+    own, retired, conflicts, unreadable = {}, {}, set(), 0
+    for path in sorted(state.glob('*/http-result.json')):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError('receipt discovery')
+        receipt, attempted = readable(path), readable(path.parent / 'http-attempted.json')
+        if not receipt or not GENERATION.fullmatch(str(receipt.get('generation'))):
+            unreadable += 1
+            continue
+        generation = receipt['generation']
+        if generation in own and own[generation] != (receipt, attempted):
+            conflicts.add(generation)
+        own[generation] = (receipt, attempted)
+        previous = receipt.get('previous') or {}
+        if receipt.get('status') == 'serving' and receipt.get('retired_roles') == ['gateway', 'api'] and previous.get('generation'):
+            if previous['generation'] in retired and retired[previous['generation']] != previous.get('containers'):
+                conflicts.add(previous['generation'])
+            retired[previous['generation']] = previous.get('containers')
+    eligible = {}
+    for generation, (receipt, attempted) in own.items():
+        containers = receipt.get('containers')
+        if generation in kept or generation in conflicts or generation not in retired or (attempted or {}).get('status') != 'serving':
+            continue
+        if not isinstance(containers, dict) or containers != retired[generation] or sorted(containers) != ['api', 'gateway']:
+            continue
+        managed = bool(receipt.get('previous'))
+        if managed and (receipt.get('status') != 'serving' or receipt.get('retired_roles') != ['gateway', 'api']):
+            continue
+        if not managed and receipt.get('status') not in {'serving', 'serving-retirement-pending'}:
+            continue
+        if all(isinstance(item, dict) and CONTAINER_ID.fullmatch(str(item.get('container'))) and IMAGE.fullmatch(str(item.get('image')))
+               for item in containers.values()):
+            eligible[generation] = containers
+    unresolved = len([generation for generation in own if generation not in kept and generation not in eligible]) + unreadable
+    return eligible, unresolved, kept, set(own)
+
+
+def retired_generations(settings, deadline=None):
+    eligible, unresolved, _, _ = discover(settings, deadline)
+    return eligible, unresolved
+
+
+def stale_container(actual, identity, generation, role):
+    """Why a retired generation's container must stay, or None when every receipt fact still holds."""
+    labels = (actual.get('Config') or {}).get('Labels') or {}
+    state = (actual.get('State') or {}).get('Status')
+    if actual.get('Id') != identity['container'] or actual.get('Image') != identity['image']:
+        return 'identity changed'
+    if state != 'exited' or (actual.get('State') or {}).get('Running'):
+        return 'state ' + str(state)
+    if (labels.get('com.docker.compose.project') != 'deedkit-http-' + generation
+            or labels.get('com.docker.compose.service') != 'http-' + role + '-' + generation
+            or labels.get('ai.deedkit.http-release') != generation):
+        return 'labels changed'
+    return None
+
+
+def clean(settings, remove):
+    """Remove (or with `remove=False` list) the exited containers of retired generations; the caller holds the HTTP locks.
+
+    Bounded as a whole (CLEAN_BUDGET seconds: every docker command gets the smaller of CLEAN_COMMAND and what is left,
+    and no command starts at or after the deadline), never waits for a lock, never raises and never changes a release's
+    outcome: every failure is a line of the summary. A plain `docker rm <full id>` only (no force, no volumes, no
+    prune). A removal that gave no answer is `unknown` and is not repeated in this run; the next run inspects the same
+    ID again (absent: already removed). Deletion is selected by receipts alone; a bounded listing of the labelled
+    containers that were not selected is observation only (`not_selected`); `unresolved` adds the generations it finds
+    there without any receipt, so one generation whose receipt file is unreadable can be counted twice (the file and
+    its receipt-less containers): an over-count, never a hidden generation."""
+    summary = {'removed': [], 'would_remove': [], 'skipped': [], 'unknown': [], 'generations': [], 'ids': [], 'unresolved': 0}
+    deadline = time.monotonic() + CLEAN_BUDGET
+
+    def slot():
+        # One reading of the clock: the timeout of the next docker command, or None when nothing is left (no floor, no
+        # race between a check and a second reading).
+        remaining = deadline - time.monotonic()
+        return min(CLEAN_COMMAND, remaining) if remaining > 0 else None
+    try:
+        eligible, summary['unresolved'], kept, known = discover(settings, deadline)
+    except Exception as exc:
+        summary['error'] = type(exc).__name__
+        return summary
+    selected = {identity['container'] for containers in eligible.values() for identity in containers.values()}
+    for generation, containers in eligible.items():
+        for role in ['api', 'gateway']:
+            identity, name = containers[role], generation + '/' + role
+            if (timeout := slot()) is None:
+                summary['stopped'] = 'budget'
+                return summary
+            try:
+                actual = json.loads(p.run(['docker', 'inspect', identity['container']], timeout=timeout, reason=True))[0]
+            except Exception as exc:
+                absent = 'No such' in str(exc)
+                summary['skipped'].append({'container': name, 'id': identity['container'][:12],
+                                           'reason': 'already absent' if absent else 'inspect failed'})
+                continue
+            if reason := stale_container(actual, identity, generation, role):
+                summary['skipped'].append({'container': name, 'id': identity['container'][:12], 'reason': reason})
+                continue
+            if not remove:
+                summary['would_remove'].append(name)
+                summary['ids'].append(identity['container'][:12])
+                continue
+            if (timeout := slot()) is None:
+                summary['stopped'] = 'budget'
+                return summary
+            try:
+                p.run(['docker', 'rm', identity['container']], timeout=timeout, reason=True)
+            except Exception as exc:
+                summary['unknown'].append({'container': name, 'id': identity['container'][:12], 'reason': type(exc).__name__})
+                continue
+            summary['removed'].append(name)
+            summary['ids'].append(identity['container'][:12])
+            if generation not in summary['generations']:
+                summary['generations'].append(generation)
+    if (timeout := slot()) is not None:
+        try:
+            # Observation only, never a deletion input: every container of the host, its release label (empty when it has
+            # none) and its state. Unlabelled ones are only counted (R2).
+            listing = p.run(['docker', 'ps', '--all', '--no-trunc', '--format',
+                             '{{.ID}} {{.Label "ai.deedkit.http-release"}} {{.State}}'], timeout=timeout, reason=True)
+            rows = [line.split() for line in listing.splitlines() if line.split()]
+            summary['unlabelled_count'] = len([row for row in rows if len(row) == 2])
+            others = [row for row in rows if len(row) == 3 and row[0] not in selected and row[1] not in kept]
+            summary['not_selected_count'] = len(others)
+            # A generation whose receipt is missing altogether is as unresolved as one with an ineligible receipt (R2).
+            summary['no_receipt_generations'] = len({row[1] for row in others if row[1] not in known})
+            summary['unresolved'] += summary['no_receipt_generations']
+            summary['not_selected'] = [{'id': row[0][:12], 'generation': row[1], 'state': row[2],
+                                        'reason': 'generation not eligible' if row[1] in known else 'no receipt'}
+                                       for row in others[:20]]
+        except Exception as exc:
+            summary['not_selected_error'] = type(exc).__name__
+    return summary
 
 
 def status(settings, sha=None):
@@ -778,11 +954,45 @@ def locks(settings):
                 yield
 
 
+def disk_free(path='/var/lib/containerd'):
+    try:
+        return round(shutil.disk_usage(path).free / 2**30, 2)
+    except Exception:
+        return None
+
+
+def clean_command(settings, remove, plan_a_config):
+    """`clean`: the retired generations' containers, report only unless `remove`, and with it the existing image pass
+    (production.md "Image retention") so one command ends in freed bytes. `main` holds the global and HTTP locks; the
+    plan A configuration is loaded first and its state lock taken without waiting before anything is deleted, so a
+    concurrent preparation keeps its in-flight image protection."""
+    if remove and not plan_a_config:
+        raise Refused('--remove needs --plan-a-config, the plan A configuration the image pass reads')
+    before = disk_free()
+    if not remove:
+        return {'mode': 'report only, nothing removed; pass --remove', 'containers': clean(settings, False), 'disk_free_gib': before}
+    plan = p.config(plan_a_config)
+    plan_state = Path(plan['state_directory'])
+    with ExitStack() as stack:
+        mine = {Path(settings['state_directory']).resolve(), GLOBAL_LOCK.resolve()}
+        if plan_state.resolve() not in mine and not p.free_lock(plan_state, stack):
+            raise Refused('the plan A deploy lock is held by another production operation; nothing was removed')
+        summary = clean(settings, True)
+        try:
+            images = p.remove_images(plan, held=(settings['state_directory'], GLOBAL_LOCK, plan_state))
+        except Exception as exc:
+            images = {'removed': [], 'error': str(exc) if isinstance(exc, Refused) else type(exc).__name__}
+    return {'mode': 'removed', 'containers': summary, 'images_removed': len(images['removed']), 'images': images,
+            'disk_free_gib_before': before, 'disk_free_gib_after': disk_free()}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['bootstrap', 'prepare', 'promote', 'retire', 'status'])
+    parser.add_argument('action', choices=['bootstrap', 'prepare', 'promote', 'retire', 'status', 'clean'])
     parser.add_argument('--sha')
     parser.add_argument('--config', default='/etc/deedkit/http-production.json')
+    parser.add_argument('--remove', action='store_true', help='clean: remove the listed containers and then old release images')
+    parser.add_argument('--plan-a-config', help='clean --remove: the plan A configuration for the image pass')
     args = parser.parse_args(argv)
     os.umask(0o077)
     try:
@@ -794,7 +1004,8 @@ def main(argv=None):
         with locks(settings):
             result = {'bootstrap': lambda: bootstrap(settings, args.sha), 'prepare': lambda: prepare(settings, args.sha),
                 'promote': lambda: promote(settings, args.sha), 'retire': lambda: retire(settings, args.sha),
-                'status': lambda: status(settings, args.sha)}[args.action]()
+                'status': lambda: status(settings, args.sha),
+                'clean': lambda: clean_command(settings, args.remove, args.plan_a_config)}[args.action]()
         print(json.dumps(result, indent=2))
     except Exception as exc:
         parser.exit(1, 'HTTP release refused: ' + (str(exc) if isinstance(exc, Refused) else type(exc).__name__) + '\n')
