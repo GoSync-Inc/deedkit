@@ -273,6 +273,15 @@ def test_requests_match_the_service_contract_fixtures(tmp_path,monkeypatch):
 
 
 # spec: ANYM-685
+def test_the_inference_canary_sends_the_prompt_the_mini_provider_sends():
+    """The live canary (services/inference/tests/canary/prompt.txt) is the worker's real chat prompt: PROMPT and the
+    Russian sentence. Live run 11-02 on 9d2ccef1: without the sentence the model described the poster in English and
+    the canary's Cyrillic check failed on a request the worker never makes."""
+    canary_prompt=(Path(__file__).resolve().parents[1]/'services'/'inference'/'tests'/'canary'/'prompt.txt').read_text()
+    assert canary_prompt==PROMPT+' '+PROMPT_RU
+
+
+# spec: ANYM-685
 def test_request_carries_the_deadline_header(tmp_path,monkeypatch):
     fake_audio_tools(monkeypatch,duration=3)
     for kind,mime,data in [('image','image/png',b'x'),('document','application/pdf',b''),('audio','audio/mpeg',b'synthetic')]:

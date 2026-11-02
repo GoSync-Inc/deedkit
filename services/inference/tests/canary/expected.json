@@ -46,5 +46,6 @@
   "long": {
     "file": "note_ru_long.ogg",
     "min_segments": 5
-  }
+  },
+  "cold_max_seconds": 300
 }
