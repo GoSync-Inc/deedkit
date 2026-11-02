@@ -86,8 +86,10 @@ Check: the file's mode and owner; `docker image inspect anymsg-enricher-local:en
 restore the env file, `docker image rm anymsg-enricher-local:enroll-S`.
 
 ## 6. Host rules, networks and the stopped worker (ANYM-688, steps 1 to 3)
-`inference_egress_check.py rules --mini-ip <ip>` printed, applied as root and saved with the host's firewall
-persistence (the file the persistence tool wrote before is copied to `rules.before` first); `MESSAGING_VERSION=
+`inference_egress_check.py rules --mini-ip <ip>` printed and applied as root, and persisted as production.md "Host
+firewall persistence" says: the `deedkit-inference` block in `/etc/ufw/before.rules` and `before6.rules` (filter
+table, host-bound drops) and `/etc/ufw/after.init` (raw table); the files are copied to `rules.before` first, and
+`verify` for both scripts must print `ok`; `MESSAGING_VERSION=
 enroll-S docker compose $F --profile enrichment-mini up --no-start --no-build --pull never --no-deps
 enricher-mini`; `docker network connect --alias db <project>_inference_db <db container>`. Check: `iptables -S
 DEEDKIT-INFERENCE`, `iptables -t raw -S PREROUTING`, both networks exist, the database container's ID and start
@@ -123,7 +125,7 @@ Stop the worker before removing its confinement. Each row undoes everything up t
 |---|---|
 | 8 (promoted, or the edit/apply failed) | `"enabled": false`, `docker compose $F --profile enrichment-mini stop enricher-mini`. **Hold state:** the stopped worker is still selected, so the release tool and autodeploy refuse ("each selected service must already have exactly one running container"); the autodeploy pause stays and nothing else is released. Restore both configuration backups. The receipts name the overlay, so the way out is a hand apply of a **newer green `main` SHA that has never been prepared** (`prepare` refuses an existing candidate directory, so never the SHA just applied; if none exists yet, stay in the hold state until the next merge). After a failed apply that left `attempted.json`, recover it first as production.md "Apply and verify" says. Then the stage 7 row |
 | 7 (running) | `stop` then `rm` the worker; `"enabled": false`; stage 6 row |
-| 6 (networks, rules) | `docker network disconnect <project>_inference_db <db container>`; `docker network rm` both; `rules --undo` (hooks first, then both chains), and restore `rules.before` into the firewall persistence; check `iptables -S` is as before |
+| 6 (networks, rules) | `docker network disconnect <project>_inference_db <db container>`; `docker network rm` both; `rules --undo` (hooks first, then both chains), and restore `rules.before` (the saved `before.rules`, `before6.rules` and `after.init`) with `ufw reload`, then `verify`; check `iptables -S` is as before |
 | 5 (files) | delete `private/enrichment-mini.json`; restore the env file; remove the enroll image tag |
 | 4 (key) | restore `inference.key.prev` or remove the key and the directory; the mini's copy was still there until step 7 |
 | 3 (role) | the role's `DROP ROLE` and DSN removal |
