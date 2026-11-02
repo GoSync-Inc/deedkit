@@ -142,6 +142,18 @@ def test_telegram_parameters_equal_the_python_telegram_fields():
 
 
 # spec: ANYM-286
+def test_telegram_parameters_are_derived_with_the_per_platform_overrides():
+    # PARAMETERS comes from the catalog (platform_parameters), not from a second literal: the four operations whose
+    # raw field table differs keep their Telegram fields, and every value is a plain set the validator can subtract from.
+    assert telegram.PARAMETERS == ops.platform_parameters('telegram')
+    assert all(type(fields) is set for fields in telegram.PARAMETERS.values())
+    assert telegram.PARAMETERS['pin_message'] == set()
+    assert telegram.PARAMETERS['send_contact'] == {'phone', 'first_name', 'last_name'}
+    assert telegram.PARAMETERS['update_profile'] == {'first_name', 'last_name', 'bio'}
+    assert telegram.PARAMETERS[ops.HISTORY] == {'count', 'before_message', 'around_message', 'from_time', 'to_time'}
+
+
+# spec: ANYM-286
 def test_raw_field_table_differs_from_published_fields_only_for_the_listed_overrides():
     # W2-6 would derive PARAMETERS from OPERATIONS[name]['fields']; these four are resolved per platform by _fields.
     differing = {name for name, spec in ops.OPERATIONS.items() if 'telegram' in spec['platforms']

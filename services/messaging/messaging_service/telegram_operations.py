@@ -22,7 +22,7 @@ import time
 from telethon import errors, functions, types, utils
 
 from .envelope import canonical, stable_id
-from .messenger_operations import HISTORY, INSPECT_BUTTONS, LIVE_SEARCH, live_cursor_binding
+from .messenger_operations import HISTORY, INSPECT_BUTTONS, LIVE_SEARCH, live_cursor_binding, platform_parameters
 
 log = logging.getLogger('anymsg.live_search')
 history_log = logging.getLogger('anymsg.chat_history')
@@ -35,38 +35,7 @@ READ_OPERATIONS = frozenset({
     'list_topics', 'get_profile', 'list_contacts', 'get_contact', 'list_blocked',
     'get_invite_link', 'check_chat_link', LIVE_SEARCH, HISTORY, INSPECT_BUTTONS,
 })
-PARAMETERS = {
-    'chat_info': set(), 'list_participants': {'limit', 'offset'},
-    'get_reactions': set(), 'get_message_info': set(),
-    'list_topics': {'limit', 'offset'},
-    'get_profile': set(), 'list_contacts': {'limit', 'offset'},
-    'get_contact': {'user_id'}, 'list_blocked': {'limit', 'offset'},
-    'send_file': {'mode', 'caption', 'attachment_id', 'upload_id', 'sha256'},
-    'forward_message': {'source_message_id', 'source_revision'},
-    'send_poll': {'question', 'options', 'multiple'},
-    'send_contact': {'phone', 'first_name', 'last_name'},
-    'send_location': {'latitude', 'longitude', 'description'}, 'edit_message': {'text'},
-    'delete_message': set(), 'send_reaction': {'emoji'},
-    'vote_poll': {'option_indices'}, 'pin_message': set(), 'unpin_message': set(),
-    'press_button': {'row', 'column', 'label', 'fp', 'acknowledge_uncertain'},
-    'mark_read': set(), 'mark_unread': set(), 'archive_chat': set(),
-    'unarchive_chat': set(), 'mute_chat': {'seconds'}, 'unmute_chat': set(),
-    'create_group': {'title', 'user_ids'}, 'rename_group': {'title'},
-    'set_group_description': {'description'}, 'add_participant': {'user_id'},
-    'remove_participant': {'user_id'}, 'promote_participant': {'user_id'},
-    'demote_participant': {'user_id'}, 'leave_group': set(), 'get_invite_link': set(),
-    'revoke_invite_link': set(), 'add_contact': {'phone', 'first_name', 'last_name'},
-    'delete_contact': {'user_id'}, 'block_contact': {'user_id'},
-    'unblock_contact': {'user_id'}, 'update_profile': {'first_name', 'last_name', 'bio'},
-    'set_group_messages_admins_only': {'enabled'}, 'set_group_info_admins_only': {'enabled'},
-    'set_slow_mode': {'seconds'}, 'list_join_requests': {'limit'},
-    'approve_join_requests': {'user_ids'}, 'reject_join_requests': {'user_ids'},
-    'check_chat_link': {'link'}, 'join_chat': {'link'},
-    'open_chat_by_username': {'username', 'create'},
-    LIVE_SEARCH: {'query', 'chat_types', 'filter', 'from_time', 'to_time', 'limit', 'cursor'},
-    HISTORY: {'count', 'before_message', 'around_message', 'from_time', 'to_time'},
-    INSPECT_BUTTONS: set(),
-}
+PARAMETERS = platform_parameters('telegram')
 # ANYM-242: each setter owns one value; the default rights flag it changes, or slow mode.
 GROUP_SETTERS = {'set_group_messages_admins_only': ('messages_admins_only', 'enabled', 'send_messages'),
                  'set_group_info_admins_only': ('info_admins_only', 'enabled', 'change_info'),

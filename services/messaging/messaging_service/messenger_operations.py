@@ -285,6 +285,11 @@ def _fields(platform, name, spec):
     return spec['fields']
 
 
+def platform_parameters(platform):
+    """The field names each operation of the platform's catalog accepts, as the manifest publishes them."""
+    return {name: set(_fields(platform, name, spec)) for name, spec in OPERATIONS.items() if platform in spec['platforms']}
+
+
 def _schema(platform, fields):
     # Published metadata only; validation and persisted parameters never read it.
     schema = deepcopy(fields)
