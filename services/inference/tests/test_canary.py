@@ -97,3 +97,13 @@ def test_canary_prompt_is_the_enrichment_prompt_of_the_contract_fixtures():
     sentence = " Write title and summary in Russian whatever the language of the file, and copy visible text in its own language."
     assert (CANARY / "prompt.txt").read_text() == fixture["json"]["messages"][0]["content"][0]["text"] + sentence
     assert canary.cer("абв", "абв") == 0 and canary.wer("a b c d", "a b x d") == 0.25
+
+
+# spec: ANYM-683
+def test_canary_scores_a_double_escaped_line_break_as_a_break():
+    # The model sometimes answers a JSON text field with literal backslash-n; the service passes it on untouched
+    # and the canary must not count each one as a stray "n" letter.
+    truth = "ООО Ветер\nИТОГО 12,50\nСпасибо"
+    assert canary.cer(truth, "ООО Ветер\\nИТОГО 12,50\\nСпасибо") == 0
+    assert canary.cer(truth, truth) == 0
+    assert canary.cer(truth, "ООО Ветер ИТОГО 99,99 Спасибо") > 0
