@@ -5,17 +5,20 @@ a partial load, a start path that skips the operator's checks), so the worker tr
 before EVERY claim, and in the background every `INTERVAL` seconds. If any attempt gets out, or any check cannot be
 completed, it exits (code `EXIT_CODE`) and claims nothing.
 
-What this is: a guard against the operational loss of the rules for the worker as shipped (every start path, a reload,
-a partial load, a shadowed hook). What it is not: a defence against a compromised worker (code that skips the check) or
-a proof of the whole allowlist: it samples the exits that matter (public addresses, public and configured resolvers,
-the host and metadata addresses, other ports of the mini). The host rules stay the security boundary.
+What this is: a guard against the operational loss of the rules for the worker as shipped. What it is not: a defence
+against a compromised worker (code that skips the check), or a proof of the whole allowlist: it samples the exits that
+matter (public addresses, public and configured resolvers, the host and metadata addresses, other ports of the mini and,
+when the config lists them in `confinement_blocked`, known-listening addresses such as another tailnet node). The host
+rules stay the security boundary.
 
 The attempts carry no data: TCP connects that are dropped when confined and UDP DNS queries with a random label.
 Only a dropped attempt (timeout, no route) counts as confined. A connection, a refusal, a reply, an ICMP port-unreachable,
-an unexpected local error (for instance EMFILE) or a check that does not finish in time all count as NOT confined.
+an unexpected local error (for instance EMFILE), a probe that cannot be set up and a check that does not finish in time
+all count as NOT confined.
 """
 from collections.abc import Callable
 import errno
+import ipaddress
 import json
 import os
 import socket
@@ -35,6 +38,7 @@ INTERVAL = 15.0   # and in the background while a job runs
 EXIT_CODE = 78
 DROPPED_V4 = {errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN}
 DROPPED_V6 = DROPPED_V4 | {errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT}
+NO_ANSWER_CODES = {2, 5}      # SERVFAIL, REFUSED: what Docker's embedded resolver says when its upstream is unreachable
 
 
 class ConfinementLost(RuntimeError):
@@ -49,12 +53,12 @@ class Network:
             sock.connect((host, port))
 
     def dns_reply(self, host, port, query, timeout):
-        """True when anything comes back for `query`; ConnectionRefusedError when the port answered with an ICMP error."""
+        """The reply bytes, or TimeoutError; ConnectionRefusedError when the port answered with an ICMP error."""
         with socket.socket(socket.AF_INET6 if ':' in host else socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.settimeout(timeout)
             sock.connect((host, port))
             sock.send(query)
-            return len(sock.recv(512)) > 0
+            return sock.recv(512)
 
     def nameservers(self):
         with open('/etc/resolv.conf') as handle:
@@ -78,6 +82,24 @@ def dns_query(label):
     return os.urandom(2) + struct.pack('>HHHHH', 0x0100, 1, 0, 0, 0) + name + struct.pack('>HH', 1, 1)
 
 
+def parse_targets(raw):
+    """`confinement_blocked` of the worker config: up to 16 `ip:port` strings (IPv6 as `[ip]:port`) that must NOT answer."""
+    if not isinstance(raw, list) or len(raw) > 16:
+        raise ValueError('invalid_confinement_targets')
+    targets = []
+    for item in raw:
+        try:
+            host, _, port = item.rpartition(':')
+            host = host[1:-1] if host.startswith('[') and host.endswith(']') else host
+            ipaddress.ip_address(host)
+            if not port.isdecimal() or not 1 <= int(port) <= 65535:
+                raise ValueError
+        except (ValueError, AttributeError):
+            raise ValueError('invalid_confinement_targets') from None
+        targets.append((host, int(port)))
+    return targets
+
+
 def required(config):
     return any(profile.get('provider') == 'deedkit_inference' for profile in config['profiles'].values())
 
@@ -87,9 +109,14 @@ def mini_hosts(config):
                    if profile.get('provider') == 'deedkit_inference'})
 
 
+def blocked_targets(config):
+    return parse_targets(config.get('confinement_blocked', []))
+
+
 class Confinement:
-    def __init__(self, hosts, *, network=None, clock=time.monotonic, timeout=TIMEOUT, fresh=FRESH, interval=INTERVAL):
-        self.hosts, self.network, self.clock = list(hosts), network or Network(), clock
+    def __init__(self, hosts, *, blocked=(), network=None, clock=time.monotonic, timeout=TIMEOUT, fresh=FRESH,
+                 interval=INTERVAL):
+        self.hosts, self.blocked, self.network, self.clock = list(hosts), list(blocked), network or Network(), clock
         self.timeout, self.fresh, self.interval = timeout, fresh, interval
         self.verified_at, self.lost = None, None
         self.lock, self.stopping = threading.Lock(), threading.Event()
@@ -107,14 +134,22 @@ class Confinement:
         return True
 
     def dns_got_out(self, host):
+        """A resolver at `host` answered a query for an external name. Docker's embedded resolver (a loopback address in
+        resolv.conf) always answers locally; it counts only when it ANSWERS (NOERROR or NXDOMAIN), not when it reports
+        that its upstream is unreachable (SERVFAIL, REFUSED) or stays silent."""
         try:
-            return bool(self.network.dns_reply(host, 53, dns_query('probe' + os.urandom(4).hex()), self.timeout))
+            reply = self.network.dns_reply(host, 53, dns_query('probe' + os.urandom(4).hex()), self.timeout)
         except ConnectionRefusedError:
             return True        # ICMP port unreachable: the address answered
         except TimeoutError:
             return False
         except OSError as error:
             return error.errno not in (DROPPED_V6 if ':' in host else DROPPED_V4)
+        if not reply:
+            return False
+        if ipaddress.ip_address(host).is_loopback:
+            return len(reply) < 4 or (reply[3] & 0x0f) not in NO_ANSWER_CODES
+        return True
 
     def checks(self) -> list[tuple[str, Callable[[], bool]]]:
         """(name, test) for every check. Reading local facts (resolv.conf, routes) failing is itself a failed check."""
@@ -130,7 +165,8 @@ class Confinement:
             checks.append(('resolv_conf_unreadable', lambda: True))
         for server in servers or []:
             checks.append((f'dns:configured_udp:{server}', lambda server=server: self.dns_got_out(server)))
-            checks.append((f'dns:configured_tcp:{server}', lambda server=server: self.got_out(server, 53)))
+            if not ipaddress.ip_address(server).is_loopback:     # a local stub always listens; its answers are judged above
+                checks.append((f'dns:configured_tcp:{server}', lambda server=server: self.got_out(server, 53)))
         try:
             gateway = self.network.gateway()
         except (OSError, ValueError):
@@ -138,6 +174,8 @@ class Confinement:
             checks.append(('gateway_unreadable', lambda: True))
         for port in GATEWAY_PORTS if gateway else ():
             checks.append((f'host:{gateway}:{port}', lambda port=port: self.got_out(gateway, port)))
+        for host, port in self.blocked:
+            checks.append((f'configured:{host}:{port}', lambda host=host, port=port: self.got_out(host, port)))
         for name in self.hosts:
             try:
                 addresses = self.network.resolve(name)     # the pinned name; failing to resolve it is not confined-and-working
@@ -173,7 +211,10 @@ class Confinement:
 
     def verify(self):
         with self.lock:
-            failed = self.probe()
+            try:
+                failed = self.probe()
+            except Exception:
+                failed = ['probe_error']      # e.g. no thread could be started: the proof cannot be made
             if failed:
                 self.lost = failed
                 raise ConfinementLost(failed)

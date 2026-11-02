@@ -3,6 +3,7 @@ import errno
 import json
 import socket
 import sys
+import threading
 import time
 
 import pytest
@@ -20,15 +21,19 @@ GATEWAY = '192.168.0.1'
 class Fake:
     """What the worker's network looks like: by default confined (everything times out, the resolver is the mini)."""
     def __init__(self, open_ports=(), refused=(), dns_answers=(), dns_refused=(), errors=None, delays=None,
-                 nameservers=(MINI_IP,), gateway=GATEWAY):
+                 nameservers=(MINI_IP,), gateway=GATEWAY, dns_rcodes=None, barrier=None, explode=False):
         self.open_ports, self.refused = set(open_ports), set(refused)
         self.dns_answers, self.dns_refused = set(dns_answers), set(dns_refused)
+        self.dns_rcodes = dict(dns_rcodes or {})      # host -> RCODE of the reply that host gives
         self.errors, self.delays = dict(errors or {}), dict(delays or {})
         self.servers, self.gate = nameservers, gateway
+        self.barrier, self.explode = barrier, explode
         self.attempts = []
 
     def connect(self, host, port, timeout):
         self.attempts.append((host, port))
+        if self.barrier is not None and host == MINI_IP and port in (22, 80):
+            self.barrier.wait(timeout=1)        # two checks must be running at the same time, or this breaks
         if (host, port) in self.delays:
             time.sleep(self.delays[(host, port)])
         if (host, port) in self.errors:
@@ -41,13 +46,15 @@ class Fake:
 
     def dns_reply(self, host, port, query, timeout):
         self.attempts.append((host, 'udp53'))
-        if host in self.dns_answers:
-            return True
+        if host in self.dns_answers or host in self.dns_rcodes:
+            return b'\x12\x34\x81' + bytes([self.dns_rcodes.get(host, 0)]) + bytes(8)      # a DNS header with this RCODE
         if host in self.dns_refused:
             raise ConnectionRefusedError()
         raise TimeoutError()
 
     def nameservers(self):
+        if self.explode:
+            raise RuntimeError("can't start new thread")
         if isinstance(self.servers, Exception):
             raise self.servers
         return list(self.servers)
@@ -65,6 +72,9 @@ class Fake:
 
 def guard(network=None, **kw):
     return Confinement([HOST], network=network or Fake(), timeout=kw.pop('timeout', 0.2), **kw)
+
+
+STUB = '127.0.0.11'      # Docker's embedded resolver, what resolv.conf names on a custom network
 
 
 # spec: ANYM-688
@@ -139,11 +149,64 @@ def test_a_check_that_does_not_finish_in_time_fails_closed():
 
 # spec: ANYM-688
 def test_the_other_mini_ports_are_probed_in_parallel_and_a_late_answer_is_not_missed():
-    started = time.monotonic()
-    # port 22 is slow and dropped; port 80 answers a little later than port 22 would have in a serial probe
-    fake = Fake(delays={(MINI_IP, 22): 0.15, (MINI_IP, 80): 0.1}, open_ports=[(MINI_IP, 80)])
+    # the two attempts wait for each other at a barrier: a serial probe would break it and fail BOTH checks
+    fake = Fake(barrier=threading.Barrier(2), delays={(MINI_IP, 22): 0.1}, open_ports=[(MINI_IP, 80)])
     assert guard(fake).probe() == [f'mini:{HOST}:80']
-    assert time.monotonic() - started < 0.9
+
+
+# spec: ANYM-688
+@pytest.mark.parametrize('rcode,failed', [
+    (2, []),                                  # SERVFAIL: the stub could not reach its upstream (the confined case)
+    (5, []),                                  # REFUSED
+    (3, [f'dns:configured_udp:{STUB}']),      # NXDOMAIN: an upstream resolver answered about an external name
+    (0, [f'dns:configured_udp:{STUB}']),      # NOERROR
+])
+def test_dockers_embedded_resolver_is_judged_by_what_it_answers_not_by_listening(rcode, failed):
+    # resolv.conf names Docker's local stub; it always listens (TCP and UDP), so listening proves nothing
+    fake = Fake(nameservers=[STUB], dns_rcodes={STUB: rcode}, open_ports=[(STUB, 53)])
+    assert guard(fake).probe() == failed
+
+
+# spec: ANYM-688
+def test_a_silent_embedded_resolver_is_confined_and_a_remote_resolver_reply_of_any_kind_is_not():
+    assert guard(Fake(nameservers=[STUB])).probe() == []
+    assert guard(Fake(dns_rcodes={MINI_IP: 2})).probe() == [f'dns:configured_udp:{MINI_IP}']     # not loopback: any reply
+
+
+# spec: ANYM-688
+def test_a_probe_that_cannot_be_set_up_is_a_failure_and_stops_a_running_job(stop_state):
+    fake = Fake()
+    worker = Recorder(guard(fake, fresh=3600.0, interval=0.05),
+                      after_first=lambda: (setattr(fake, 'explode', True), stop_state.STOP.wait(10)))
+    started = time.monotonic()
+    with pytest.raises(ConfinementLost) as lost:
+        worker.run()
+    assert lost.value.args[0] == ['probe_error']
+    assert time.monotonic() - started < 5 and worker.calls[-1] == 'unpublish'
+    with pytest.raises(ConfinementLost):
+        guard(Fake(explode=True)).ensure()
+
+
+# spec: ANYM-688
+def test_known_listening_addresses_from_the_config_must_not_answer():
+    other_node = ('100.91.112.119', 22)
+    assert guard(Fake(open_ports=[other_node]), blocked=[other_node]).probe() == ['configured:100.91.112.119:22']
+    assert guard(Fake(open_ports=[other_node])).probe() == []            # not listed: not probed
+    assert guard(Fake(), blocked=[other_node]).probe() == []             # listed and dropped
+
+
+# spec: ANYM-688
+def test_the_config_lists_blocked_targets_as_ip_and_port_only(tmp_path):
+    assert inference_confinement.parse_targets(['100.91.112.119:22', '[2606:4700:4700::1111]:443']) == [
+        ('100.91.112.119', 22), ('2606:4700:4700::1111', 443)]
+    for bad in ('x', ['host.example:22'], ['1.2.3.4'], ['1.2.3.4:0'], ['1.2.3.4:70000'], [5], ['1.2.3.4:22'] * 17):
+        with pytest.raises(ValueError, match='invalid_confinement_targets'):
+            inference_confinement.parse_targets(bad)
+    path, _ = mini_config(tmp_path, blocked=['100.91.112.119:22'])
+    assert enrichment.configuration(path)['confinement_blocked'] == ['100.91.112.119:22']
+    path, _ = mini_config(tmp_path, blocked=['not an address'])
+    with pytest.raises(ValueError, match='invalid_confinement_targets'):
+        enrichment.configuration(path)
 
 
 # spec: ANYM-688
@@ -260,14 +323,15 @@ def test_a_worker_without_the_guard_runs_as_before(stop_state):
     assert worker.calls == ['publish', 'once', 'unpublish']
 
 
-def mini_config(tmp_path):
+def mini_config(tmp_path, blocked=None):
     key = tmp_path / 'inference.key'
     key.write_text('synthetic-key')
     key.chmod(0o600)
     profile = {'provider': 'deedkit_inference', 'local_inference': True, 'model': 'audio-default',
                'base_url': f'https://{HOST}/v1', 'api_key_file': str(key)}
     path = tmp_path / 'enrichment-mini.json'
-    path.write_text(json.dumps({'enabled': True, 'accounts': ['a'], 'max_jobs_per_day': 5, 'profiles': {'audio': profile}}))
+    extra = {'confinement_blocked': blocked} if blocked is not None else {}
+    path.write_text(json.dumps({'enabled': True, 'accounts': ['a'], 'max_jobs_per_day': 5, 'profiles': {'audio': profile}, **extra}))
     path.chmod(0o600)
     dsn = tmp_path / 'db.dsn'
     dsn.write_text('postgresql://nobody@127.0.0.1:1/none')

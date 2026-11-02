@@ -1443,14 +1443,23 @@ fix them, never disable the check. The same probe is a command, for the probe co
 messaging_service.inference_confinement <mini .ts.net name>` prints `{"confined": true, "failed": []}` and exits 0 on the
 confined bridge, and a list of failed checks with exit 78 anywhere else.
 
+On a custom Docker network `/etc/resolv.conf` names Docker's embedded resolver (a loopback address): it always listens, so
+it is judged by its answer to a query for an external name, not by listening. NOERROR or NXDOMAIN means an upstream
+answered (not confined); SERVFAIL, REFUSED or silence is what it says when its upstream (the mini's address, dropped by
+the rules) is unreachable. Add the known-listening addresses that must stay unreachable to the worker config as
+`"confinement_blocked": ["100.x.y.z:22"]` (up to 16 `ip:port`, IPv6 as `[ip]:port`), for instance another tailnet node's
+SSH, the target the egress `check` above uses as `--blocked <tailnet node ip>:<port>`: without it a bypass that opens
+only an unprobed tailnet destination (a `ts-forward` accept) is not seen.
+
 What it is and is not. It is a guard against the operational loss of the rules for the worker as shipped (a start path
-that skips the operator's checks, a reload, a partial load, a shadowed hook): a claim is never started on an unproved
-network, and a rule loss during a job is noticed within about 15 seconds plus one probe. It is not a defence against a
-compromised worker (code that skips the check) and not a proof of the whole allowlist: it samples the exits that matter.
-The host rules (and their persistence in ufw) remain the security boundary and the second layer; an independently
-enforced destination restriction (a network without a gateway plus a fixed-destination relay) is the stronger design
-and a follow-up card, not part of this change. What the worker sends to the mini goes only to the pinned name of its
-profile, so a window of lost rules does not change where a benign worker sends a file.
+that skips the operator's checks, a reload, a partial load, a shadowed hook that opens one of the probed exits): a claim
+is never started on an unproved network, and a rule loss during a job is noticed within about 15 seconds plus one probe.
+It is not a defence against a compromised worker (code that skips the check) and not a proof of the whole allowlist: it
+samples the exits that matter. The host rules (and their persistence in ufw) remain the security boundary. An
+independently enforced destination restriction (a network without a gateway plus a fixed-destination relay) is the
+stronger design: until it exists, do not read this check as making `restart: unless-stopped` risk-free. What the worker
+sends to the mini goes only to the pinned name of its profile, so a window of lost rules does not change where a benign
+worker sends a file.
 
 Undo (reverse): `docker compose $F --profile enrichment-mini stop enricher-mini` and `rm enricher-mini`;
 `docker network disconnect <project>_inference_db <db container>`; `docker network rm

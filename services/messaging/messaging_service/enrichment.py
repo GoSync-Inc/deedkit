@@ -30,7 +30,7 @@ from .inference_confinement import ConfinementLost
 def configuration(path):
     raw=json.loads(private_text(path,65536))
     if not isinstance(raw,dict) or set(raw)-{'enabled','profiles','max_jobs_per_day','accounts',
-            'profile_max_jobs_per_day','account_max_jobs_per_day'}:
+            'profile_max_jobs_per_day','account_max_jobs_per_day','confinement_blocked'}:
         raise ValueError('invalid_enrichment_config')
     if raw.get('enabled') is not True:raise ValueError('enrichment_disabled')
     profiles=raw.get('profiles')
@@ -46,6 +46,7 @@ def configuration(path):
         if (not isinstance(limits,dict) or set(limits)-set(allowed)
                 or any(type(value) is not int or not 1<=value<=10000 for value in limits.values())):
             raise ValueError('invalid_enrichment_budget')
+    if 'confinement_blocked' in raw:inference_confinement.parse_targets(raw['confinement_blocked'])
     return {**raw,'max_jobs_per_day':maximum,'profiles':{k:validate_profile(v,k) for k,v in profiles.items()}}
 
 
@@ -457,7 +458,7 @@ def main():
     from .telemetry import configure
     configure('enricher')
     cfg=configuration(args.config)
-    guard=inference_confinement.Confinement(inference_confinement.mini_hosts(cfg)) if inference_confinement.required(cfg) else None
+    guard=inference_confinement.Confinement(inference_confinement.mini_hosts(cfg),blocked=inference_confinement.blocked_targets(cfg)) if inference_confinement.required(cfg) else None
     worker=EnrichmentWorker(private_text(os.environ['DATABASE_URL_FILE']).strip(),os.environ['PROBE_FILES'],cfg,confinement=guard)
     for sig in (signal.SIGINT,signal.SIGTERM):signal.signal(sig,lambda *_:request_stop())
     try:worker.run()
