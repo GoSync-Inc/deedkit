@@ -195,7 +195,7 @@ sudo -n newsyslog -nv 2>&1 | grep -i deedkit || true'; rm -r "$OUT"
 ```
 
 Read-back: `plutil -lint` says `OK` for both; `ls -l` shows root:wheel and the modes above; the plist prints with
-`plutil -p` (UserName `_deedkitinf`, `Nice` 10, `KeepAlive` `{SuccessfulExit = false}`, `ExitTimeOut` 960).
+`plutil -p` (UserName `_deedkitinf`, `ProcessType` `Standard`, `Nice` 20, `KeepAlive` `{SuccessfulExit = false}`, `ExitTimeOut` 960).
 
 ### Sandbox proof (card criterion 2, `[open: measured]`)
 
@@ -366,12 +366,66 @@ Expected: `busy.json` is `-rw-r----- <admin> _deedkitinf`, `ts` within a few sec
 true only if Between or a test run is active (`between` also reads the CPU of the `_betweenci` colima VMs' Virtualization
 processes: Between's CI runs inside them, where no Docker context of the admin account sees it; busy while their summed
 %cpu averages 10 % over 60 s or spikes to 50 %, and for 120 s after the last such reading or after the probe's own start); the service is `running` under `/usr/bin/sandbox-exec`, `ps -axo
-user,nice,args` shows `_deedkitinf` with NI 10; `/health` answers `{"status": "ok", "queue": ..., "admission":
+user,nice,args` shows `_deedkitinf` with NI 20; `/health` answers `{"status": "ok", "queue": ..., "admission":
 "open"|"closed"}` (closed while Between is busy: that is the design). If the `logs/` files were created by launchd as
 root, `chown _deedkitinf` them and record it. Then the deploy script's own read-back, which also proves
 `/v1/models` with the probe key and that `release` equals the SHA: `python3 scripts/inference_deploy.py "$SHA"`
 (it drains, which is instant on an idle service, and restarts). Undo: `sudo -n launchctl bootout
 system/com.deedkit.inference` (then `-busy`) and remove the plists, section 14.
+
+`ProcessType` of the service is `Standard`, not `Background`: Background put the engines on the efficiency cores with
+throttled I/O and made speech about 17 times slower on the mini (A/B 11-02, same requests: warm `note_ru` RTF 0.36 against
+0.021). The busy probe stays `Background`. Between's and the test runs' priority does not come from the QoS class: the
+service runs at `Nice` 20, below the remote tests (10), and an executing phase is not suspended when they start; protection is
+admission (no new request or phase while `busy.json` says busy) and the length of a phase. The overlap measurement of
+11-02 is in the PR that made the change (ANYM-684).
+
+Changing an installed plist is a live step, in a quiet window, after the busy check and `&&`-chained to it. It rides on a
+deploy, because `scripts/inference_deploy.py` is the reviewed tool that already does what a restart needs: it closes
+admission and waits for the drain up to the service's own limit (`drain_seconds` 900, `ExitTimeOut` 960; it refuses to kill
+without `--force`), unloads the job, switches `current`, runs `launchctl bootstrap` and `kickstart` from the plist on disk,
+and reads back `/health` and `/v1/models`, whose `release` must equal the deployed SHA. launchd does not re-read an installed
+plist while the job is loaded, so the file can be replaced first and takes effect at that deploy.
+
+```bash
+MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
+D="$(ssh "$MINI" 'D=$(mktemp -d /tmp/deedkit-setup.XXXXXX) && echo "stage $D" >> ~/deedkit-inference-setup.created && echo $D')" || exit 1
+PL=/Library/LaunchDaemons/com.deedkit.inference.plist
+# 1. install the plist; a failing command stops the remote script (set -e) and this block (exit 1) before the deploy
+ssh "$MINI" "set -e; sudo -n cp -p $PL $D/plist.orig; sudo -n chown \$(id -un) $D/plist.orig; cp $D/plist.orig $D/plist.new
+plutil -replace ProcessType -string Standard $D/plist.new
+plutil -replace Nice -integer 20 $D/plist.new
+plutil -lint $D/plist.new
+sudo -n install -o root -g wheel -m 644 $D/plist.new $PL
+test \"\$(plutil -extract ProcessType raw $PL)\" = Standard
+test \"\$(plutil -extract Nice raw $PL)\" = 20
+echo \"installed; backup: $D/plist.orig\"" || { echo "plist install failed: stop, see Recovery (the loaded job is untouched)"; exit 1; }
+# 2. the new plist takes effect at the deploy, whose own read-back (release == SHA) says that the job came back
+python3 scripts/inference_deploy.py "$SHA" || { echo "deploy failed: stop, see Recovery (read the job state first)"; exit 1; }
+```
+
+`$SHA` is the release served now (`readlink current` on the mini) or the one being deployed. The block stops at the first failure:
+it never reaches the deploy after a failed install, and a failed deploy is not reported as success.
+
+Read-back after the deploy: `ssh "$MINI" 'ps -axo user,nice,args | grep "[_]deedkitinf.*sandbox-exec"'` shows a new process with
+NI 20, `sudo -n launchctl print system/com.deedkit.inference | grep -E "state|pid"` says `running` under a pid different from
+before, and the deploy's own line `read-back: release=<SHA> status=ok` is on screen (`/health` and `/v1/models` with the probe
+key). The step is not done without all three.
+
+Recovery. The deploy script can leave the job in three states and the next step depends on which: read it first
+(`sudo -n launchctl print system/com.deedkit.inference | grep -E "state|pid"`).
+- The install failed (the block stopped at 1): launchd has not re-read anything and the loaded job is as before. If `$PL` was
+  already replaced, put the original back: `ssh "$MINI" "sudo -n install -o root -g wheel -m 644 $D/plist.orig $PL && sudo -n cmp $D/plist.orig $PL"`.
+- The deploy refused or stopped before the switch (exit 2 busy, drain timeout, refused): nothing was switched and the old process
+  still serves with its in-memory plist. Rerun the same command in a quiet window, or restore the original as above.
+- The deploy failed after the switch (`/health` or `/v1/models` read-back, wrong `release`, `bootstrap` or `kickstart` error): the
+  job may be **loaded and running** (a failed read-back does not unload it) or unloaded; do not assume either. Fix or restore the
+  plist on disk (restore command above) and rerun the same `python3 scripts/inference_deploy.py "$SHA"`: it handles both states
+  (a running job is drained and booted out, an unloaded one is bootstrapped), is idempotent for a release already on the mini and
+  ends with the release read-back. `--rollback` is for a bad release, not for a plist problem.
+
+Undo (back to Background, Nice 10): restore the original (command above), rerun the same deploy so the job is loaded from the
+restored file, and read back as above with NI 10. Models, policy and ledger are untouched.
 
 Rotation of logs: `newsyslog` rotates at 10 MB; launchd keeps its descriptor, so lines go to the rotated file until
 the next deploy restarts the service (the logs hold metadata only; a day of 2000 jobs is well under 1 MB).
