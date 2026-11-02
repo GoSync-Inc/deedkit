@@ -280,7 +280,11 @@ networks, with no route to the API or the host and egress only to the mini on
 443 (ANYM-688); its config (`deploy/enrichment-mini.example.json`) holds only
 `deedkit_inference` profiles, its key is the directory `private/inference/`, and
 the apply and rules are in `docs/operations/production.md`. Never run it together
-with another profile: two workers would claim the same jobs. The local image includes hash-locked CPU
+with another profile: two workers would claim the same jobs. A worker with a
+`deedkit_inference` profile also proves its own confinement before it claims and while it
+runs, by trying to reach public addresses, an external resolver and other ports of the
+mini, before every claim and every 15 seconds; if anything answers it claims nothing and exits with code 78
+(`messaging_service/inference_confinement.py`). The local image includes hash-locked CPU
 faster-whisper dependencies, with PyAV 18.1.0 pinned for decoder compatibility.
 Neither image downloads models. Native smoke tests use synthetic speech and
 network-disabled containers. The local profile has only the internal DB network.

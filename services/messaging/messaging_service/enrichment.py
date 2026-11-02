@@ -23,12 +23,14 @@ import math
 from .enrichment_providers import ModelBackpressure, ModelError, infer, private_text, profile_hash, validate_profile
 from . import resource_admission
 from . import processing_events
+from . import inference_confinement
+from .inference_confinement import ConfinementLost
 
 
 def configuration(path):
     raw=json.loads(private_text(path,65536))
     if not isinstance(raw,dict) or set(raw)-{'enabled','profiles','max_jobs_per_day','accounts',
-            'profile_max_jobs_per_day','account_max_jobs_per_day'}:
+            'profile_max_jobs_per_day','account_max_jobs_per_day','confinement_blocked'}:
         raise ValueError('invalid_enrichment_config')
     if raw.get('enabled') is not True:raise ValueError('enrichment_disabled')
     profiles=raw.get('profiles')
@@ -44,6 +46,7 @@ def configuration(path):
         if (not isinstance(limits,dict) or set(limits)-set(allowed)
                 or any(type(value) is not int or not 1<=value<=10000 for value in limits.values())):
             raise ValueError('invalid_enrichment_budget')
+    if 'confinement_blocked' in raw:inference_confinement.parse_targets(raw['confinement_blocked'])
     return {**raw,'max_jobs_per_day':maximum,'profiles':{k:validate_profile(v,k) for k,v in profiles.items()}}
 
 
@@ -160,8 +163,9 @@ def process(files,row,profile):
 
 
 class EnrichmentWorker:
-    def __init__(self,dsn,files,config,*,processor=process,lock_directory=None):
+    def __init__(self,dsn,files,config,*,processor=process,lock_directory=None,confinement=None):
         self.dsn,self.files,self.config,self.processor=dsn,Path(files),config,processor
+        self.confinement=confinement
         self.lock_directory=lock_directory or os.environ.get('PROCESSING_LOCK_DIR','/processing-locks')
     def connection(self):
         return psycopg.connect(self.dsn,row_factory=dict_row,connect_timeout=5,
@@ -416,13 +420,23 @@ class EnrichmentWorker:
             self.finish(row,error='enrichment_failed')
         return True
     def run(self):
+        guard=self.confinement
+        if guard:
+            # ANYM-688: a worker that sends files to the mini proves it cannot leave its network before it
+            # publishes a profile or claims anything (raises ConfinementLost; nothing was published yet), and
+            # again before every claim older than the guard's freshness and in the background.
+            guard.ensure()
+            guard.start_monitor(request_stop)
         try:
             while not STOP.is_set():
+                if guard:guard.ensure()
                 self.publish_profiles()
                 if not self.once():STOP.wait(10)
         finally:
             # Also when the stop path itself fails: never keep advertising a worker that is going away.
+            if guard:guard.stop_monitor()
             self.unpublish_profiles()
+        if guard and guard.lost:raise ConfinementLost(guard.lost)
 
 
 def main():
@@ -444,8 +458,13 @@ def main():
     from .telemetry import configure
     configure('enricher')
     cfg=configuration(args.config)
-    worker=EnrichmentWorker(private_text(os.environ['DATABASE_URL_FILE']).strip(),os.environ['PROBE_FILES'],cfg)
+    guard=inference_confinement.Confinement(inference_confinement.mini_hosts(cfg),blocked=inference_confinement.blocked_targets(cfg)) if inference_confinement.required(cfg) else None
+    worker=EnrichmentWorker(private_text(os.environ['DATABASE_URL_FILE']).strip(),os.environ['PROBE_FILES'],cfg,confinement=guard)
     for sig in (signal.SIGINT,signal.SIGTERM):signal.signal(sig,lambda *_:request_stop())
-    worker.run()
+    try:worker.run()
+    except ConfinementLost as lost:
+        # Names of the failed checks only; the worker has claimed nothing (or stopped claiming) and exits non-zero.
+        print(json.dumps({'error':'confinement_not_effective','checks':lost.args[0]}),file=sys.stderr)
+        sys.exit(inference_confinement.EXIT_CODE)
 
 if __name__=='__main__':main()
