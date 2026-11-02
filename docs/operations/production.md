@@ -1429,18 +1429,28 @@ labels, the interfaces that showed them and the verdict.
 
 Self-check of the worker (ANYM-688). The rules above can be missing when the worker starts or later: after a reboot, a
 `ufw reload`, a partial load, or a start that skips this section (`docker start`, the promotion tool's `up`). So
-`enricher-mini` proves its own confinement by trying to leave: before it publishes a profile or claims a job, before a
-claim when the last proof is older than 60 seconds, and every 120 seconds in the background. It tries TCP to a public
-IPv4 and IPv6 address on 443, to 1.1.1.1 on 53, a DNS query with a random label to 1.1.1.1, a lookup of a random name
-through the system resolver, and ports 22 and 80 of the mini. Only a dropped attempt (no answer, no route) counts as
-confined; a connection, a refusal or a reply does not. On any failure it exits with code 78, prints one JSON line with the
+`enricher-mini` proves its own confinement by trying to leave: before it publishes a profile or claims a job, before
+every claim, and every 15 seconds in the background while a job runs. It tries TCP to public IPv4 and IPv6 addresses
+on 443, to 1.1.1.1 on 53 and to the metadata address 169.254.169.254, a UDP DNS query with a random label to 1.1.1.1
+and to every resolver in `/etc/resolv.conf` (plus TCP 53 to the configured ones), the container's default gateway
+(the host) on 22, 53, 80 and 443, and ports 22 and 80 of the mini. Only a dropped attempt (timeout, no route) counts as
+confined. A connection, a refusal, a reply, an ICMP error, an unexpected local error, a local fact it cannot read and a
+check that does not finish in time all count as NOT confined. Then it exits with code 78, prints one JSON line with the
 failed check names to stderr (`{"error": "confinement_not_effective", "checks": [...]}`), and claims nothing (a job in
 flight is given back). The attempts carry no data. A worker that restarts with 78 means the rules or networks are wrong:
 fix them, never disable the check. The same probe is a command, for the probe container or any container on the bridge:
 `docker compose $F --profile enrichment-mini run --rm -T --no-deps --entrypoint python enricher-mini -m
 messaging_service.inference_confinement <mini .ts.net name>` prints `{"confined": true, "failed": []}` and exits 0 on the
-confined bridge, and a list of failed checks with exit 78 anywhere else. The host rules (and their persistence in ufw) stay
-as defence in depth; this check is what makes a missing rule stop the worker.
+confined bridge, and a list of failed checks with exit 78 anywhere else.
+
+What it is and is not. It is a guard against the operational loss of the rules for the worker as shipped (a start path
+that skips the operator's checks, a reload, a partial load, a shadowed hook): a claim is never started on an unproved
+network, and a rule loss during a job is noticed within about 15 seconds plus one probe. It is not a defence against a
+compromised worker (code that skips the check) and not a proof of the whole allowlist: it samples the exits that matter.
+The host rules (and their persistence in ufw) remain the security boundary and the second layer; an independently
+enforced destination restriction (a network without a gateway plus a fixed-destination relay) is the stronger design
+and a follow-up card, not part of this change. What the worker sends to the mini goes only to the pinned name of its
+profile, so a window of lost rules does not change where a benign worker sends a file.
 
 Undo (reverse): `docker compose $F --profile enrichment-mini stop enricher-mini` and `rm enricher-mini`;
 `docker network disconnect <project>_inference_db <db container>`; `docker network rm

@@ -1,15 +1,21 @@
 """Effective-confinement self-check of the worker that sends files to the owner's Mac mini (ANYM-688).
 
 The host firewall rules confine the worker's bridge to TCP 443 to the mini. Rules can be missing (a reboot, a reload,
-a partial load, a start path that bypasses the operator's checks), so the worker proves the confinement itself, by
-trying to leave, before it claims any job, before a claim when the last proof is older than `FRESH` seconds, and in the
-background every `INTERVAL` seconds. If any attempt gets out, it exits (code `EXIT_CODE`) and claims nothing.
+a partial load, a start path that skips the operator's checks), so the worker tries to leave before it claims any job,
+before EVERY claim, and in the background every `INTERVAL` seconds. If any attempt gets out, or any check cannot be
+completed, it exits (code `EXIT_CODE`) and claims nothing.
 
-The attempts carry no data: TCP connects that are dropped when confined (a public IPv4 and IPv6 address on 443, a
-public resolver on 53, two other ports of the mini), one DNS query with a random label to a public resolver, and one
-lookup of a random name through the system resolver. Only a dropped attempt (no answer, or no route) counts as
-confined; a connection, a refusal or a reply means something answered and the worker is not confined.
+What this is: a guard against the operational loss of the rules for the worker as shipped (every start path, a reload,
+a partial load, a shadowed hook). What it is not: a defence against a compromised worker (code that skips the check) or
+a proof of the whole allowlist: it samples the exits that matter (public addresses, public and configured resolvers,
+the host and metadata addresses, other ports of the mini). The host rules stay the security boundary.
+
+The attempts carry no data: TCP connects that are dropped when confined and UDP DNS queries with a random label.
+Only a dropped attempt (timeout, no route) counts as confined. A connection, a refusal, a reply, an ICMP port-unreachable,
+an unexpected local error (for instance EMFILE) or a check that does not finish in time all count as NOT confined.
 """
+from collections.abc import Callable
+import errno
 import json
 import os
 import socket
@@ -19,17 +25,20 @@ import threading
 import time
 from urllib.parse import urlsplit
 
-PUBLIC_TCP = (('1.1.1.1', 443), ('8.8.8.8', 443), ('2606:4700:4700::1111', 443), ('1.1.1.1', 53))
+PUBLIC_TCP = (('1.1.1.1', 443), ('8.8.8.8', 443), ('2606:4700:4700::1111', 443), ('1.1.1.1', 53), ('169.254.169.254', 80))
 PUBLIC_DNS = ('1.1.1.1', 53)
+GATEWAY_PORTS = (22, 53, 80, 443)
 MINI_OTHER_PORTS = (22, 80)
 TIMEOUT = 2.0
-FRESH = 60.0
-INTERVAL = 120.0
+FRESH = 0.0       # the proof is repeated before every claim
+INTERVAL = 15.0   # and in the background while a job runs
 EXIT_CODE = 78
+DROPPED_V4 = {errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN}
+DROPPED_V6 = DROPPED_V4 | {errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT}
 
 
 class ConfinementLost(RuntimeError):
-    """The worker could leave its network. `args[0]` lists the failed checks (names only)."""
+    """The worker could leave its network, or the proof could not be completed. `args[0]` lists the failed checks."""
 
 
 class Network:
@@ -40,12 +49,25 @@ class Network:
             sock.connect((host, port))
 
     def dns_reply(self, host, port, query, timeout):
-        """True when anything that looks like an answer to `query` comes back."""
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        """True when anything comes back for `query`; ConnectionRefusedError when the port answered with an ICMP error."""
+        with socket.socket(socket.AF_INET6 if ':' in host else socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.settimeout(timeout)
-            sock.sendto(query, (host, port))
-            data, _ = sock.recvfrom(512)
-        return len(data) >= 12 and data[:2] == query[:2]
+            sock.connect((host, port))
+            sock.send(query)
+            return len(sock.recv(512)) > 0
+
+    def nameservers(self):
+        with open('/etc/resolv.conf') as handle:
+            return [parts[1] for parts in (line.split() for line in handle) if len(parts) > 1 and parts[0] == 'nameserver']
+
+    def gateway(self):
+        """The default gateway of the container (the host side of its bridge), or None."""
+        with open('/proc/net/route') as handle:
+            for line in list(handle)[1:]:
+                fields = line.split()
+                if len(fields) > 2 and fields[1] == '00000000':
+                    return socket.inet_ntoa(struct.pack('<I', int(fields[2], 16)))
+        return None
 
     def resolve(self, name):
         return sorted({item[4][0] for item in socket.getaddrinfo(name, None)})
@@ -72,60 +94,82 @@ class Confinement:
         self.verified_at, self.lost = None, None
         self.lock, self.stopping = threading.Lock(), threading.Event()
 
-    def reaches(self, host, port):
+    def got_out(self, host, port):
+        """True: something answered, or the attempt could not be observed. False: the packet was dropped."""
         try:
             self.network.connect(host, port, self.timeout)
         except ConnectionRefusedError:
             return True        # a refusal is an answer; a dropped packet never gets one
-        except OSError:
-            return False       # timeout, no route, unreachable network
+        except TimeoutError:
+            return False
+        except OSError as error:
+            return error.errno not in (DROPPED_V6 if ':' in host else DROPPED_V4)   # EMFILE and the like: unobserved
         return True
 
-    def probe(self):
-        """Every check, in parallel and bounded; the names of those that got out (empty: confined)."""
-        failed, jobs = [], []
+    def dns_got_out(self, host):
+        try:
+            return bool(self.network.dns_reply(host, 53, dns_query('probe' + os.urandom(4).hex()), self.timeout))
+        except ConnectionRefusedError:
+            return True        # ICMP port unreachable: the address answered
+        except TimeoutError:
+            return False
+        except OSError as error:
+            return error.errno not in (DROPPED_V6 if ':' in host else DROPPED_V4)
 
-        def job(name, test):
-            def run():
-                try:
-                    out = test()
-                except Exception:
-                    out = True     # a check that cannot run proves nothing: not confined
-                if out:
-                    failed.append(name)
-            jobs.append(threading.Thread(target=run, daemon=True))
-
+    def checks(self) -> list[tuple[str, Callable[[], bool]]]:
+        """(name, test) for every check. Reading local facts (resolv.conf, routes) failing is itself a failed check."""
+        checks: list[tuple[str, Callable[[], bool]]] = []
         for host, port in PUBLIC_TCP:
-            job(f'tcp:{host}:{port}', lambda host=host, port=port: self.reaches(host, port))
-        job('dns:public_udp', lambda: self.dns_reply_leaks())
-        job('dns:system_resolver', lambda: self.system_resolver_answers())
+            checks.append((f'tcp:{host}:{port}', lambda host=host, port=port: self.got_out(host, port)))
+        checks.append((f'dns:public_udp:{PUBLIC_DNS[0]}', lambda: self.dns_got_out(PUBLIC_DNS[0])))
+        try:
+            servers = list(dict.fromkeys(self.network.nameservers()))
+        except OSError:
+            servers = None
+        if servers is None:
+            checks.append(('resolv_conf_unreadable', lambda: True))
+        for server in servers or []:
+            checks.append((f'dns:configured_udp:{server}', lambda server=server: self.dns_got_out(server)))
+            checks.append((f'dns:configured_tcp:{server}', lambda server=server: self.got_out(server, 53)))
+        try:
+            gateway = self.network.gateway()
+        except (OSError, ValueError):
+            gateway = None
+            checks.append(('gateway_unreadable', lambda: True))
+        for port in GATEWAY_PORTS if gateway else ():
+            checks.append((f'host:{gateway}:{port}', lambda port=port: self.got_out(gateway, port)))
         for name in self.hosts:
-            job(f'mini_ports:{name}', lambda name=name: self.mini_other_ports_open(name))
-        for thread in jobs:
+            try:
+                addresses = self.network.resolve(name)     # the pinned name; failing to resolve it is not confined-and-working
+            except OSError:
+                checks.append((f'mini_unresolved:{name}', lambda: True))
+                continue
+            for address in addresses:
+                for port in MINI_OTHER_PORTS:
+                    checks.append((f'mini:{name}:{port}', lambda address=address, port=port: self.got_out(address, port)))
+        return checks
+
+    def probe(self):
+        """Run every check in parallel. The names of the checks that got out, errored or did not finish (empty: confined)."""
+        outcome = {}
+        threads = []
+        checks = self.checks()
+
+        def runner(index, test):
+            try:
+                outcome[index] = bool(test())
+            except Exception:
+                outcome[index] = True      # a check that cannot run proves nothing: not confined
+
+        for index, (_, test) in enumerate(checks):
+            threads.append(threading.Thread(target=runner, args=(index, test), daemon=True))
+        for thread in threads:
             thread.start()
         deadline = time.monotonic() + self.timeout + 1.0
-        for thread in jobs:
+        for thread in threads:
             thread.join(max(0.0, deadline - time.monotonic()))
-        return sorted(failed)
-
-    def dns_reply_leaks(self):
-        try:
-            return bool(self.network.dns_reply(*PUBLIC_DNS, dns_query('probe' + os.urandom(4).hex()), self.timeout))
-        except OSError:
-            return False
-
-    def system_resolver_answers(self):
-        try:
-            return bool(self.network.resolve(f'probe-{os.urandom(6).hex()}.example.com'))
-        except socket.gaierror as error:
-            # NXDOMAIN, SERVFAIL and REFUSED are answers from a resolver; only silence (EAI_AGAIN) is confinement.
-            return error.errno != socket.EAI_AGAIN
-        except OSError:
-            return False
-
-    def mini_other_ports_open(self, name):
-        addresses = self.network.resolve(name)     # the pinned name; failing to resolve it is not confined-and-working
-        return any(self.reaches(address, port) for address in addresses for port in MINI_OTHER_PORTS)
+        # a check that has not finished by now is NOT confined (fail closed), whatever it would have said later
+        return sorted(name for index, (name, _) in enumerate(checks) if outcome.get(index, True))
 
     def verify(self):
         with self.lock:
@@ -136,7 +180,7 @@ class Confinement:
             self.verified_at = self.clock()
 
     def ensure(self):
-        """Called before a claim: raise at once once lost; probe again when the last proof is older than `fresh`."""
+        """Called before every claim: raise at once once lost; probe again when the last proof is older than `fresh`."""
         if self.lost:
             raise ConfinementLost(self.lost)
         if self.verified_at is None or self.clock() - self.verified_at >= self.fresh:

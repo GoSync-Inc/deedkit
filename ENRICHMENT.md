@@ -283,7 +283,7 @@ the apply and rules are in `docs/operations/production.md`. Never run it togethe
 with another profile: two workers would claim the same jobs. A worker with a
 `deedkit_inference` profile also proves its own confinement before it claims and while it
 runs, by trying to reach public addresses, an external resolver and other ports of the
-mini; if anything answers it claims nothing and exits with code 78
+mini, before every claim and every 15 seconds; if anything answers it claims nothing and exits with code 78
 (`messaging_service/inference_confinement.py`). The local image includes hash-locked CPU
 faster-whisper dependencies, with PyAV 18.1.0 pinned for decoder compatibility.
 Neither image downloads models. Native smoke tests use synthetic speech and
