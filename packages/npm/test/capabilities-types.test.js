@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 
 const declared=readFileSync(new URL('../lib/index.d.ts',import.meta.url),'utf8');
-const store=readFileSync(new URL('../../../services/messaging/messaging_service/store.py',import.meta.url),'utf8');
+const store=readFileSync(new URL('../../../services/messaging/messaging_service/capabilities.py',import.meta.url),'utf8');
 
 // spec: ANYM-270
 test('capabilities declares detail and the backend section names',()=>{
