@@ -1488,14 +1488,9 @@ def guard_rollback(serving, plan):
                           "its workers. " + way_out)
 
 
-def rollback(settings, sha, http=None):
-    """Return the current release's selected services to the images and configuration that ran before it, or
-    those of a release whose apply failed its health wait (`unhealthy`), which never became current.
-
-    Owner-confirmed like apply, except as `deploy`'s one automatic rollback. It never calls promotable(): the previous
-    revision is no longer current main. The caller holds the host lock, as main() does for every state-changing action,
-    and with plan B (`http`, its validated configuration; None when there is none) the locks of seamless_release.py.
-    """
+def rollback_state(settings, sha, http):
+    """What a rollback of `sha` starts from: the release's receipts, whether its apply failed, plan B's serving
+    generation and the rollback data; refuses anything unfinished, changed or already attempted."""
     state = Path(settings["state_directory"])
     release = state / sha
     current = read(state / "current.json") if (state / "current.json").exists() else None
@@ -1518,6 +1513,11 @@ def rollback(settings, sha, http=None):
     # current.json still names the release that ran before the failed one, unless another one was applied since.
     if failed and prepared.get("current_digest") != digest(current):
         raise Refused("another release was applied or rolled back after this one was prepared")
+    return state, release, result, failed, serving, data
+
+
+def rollback_plan(settings, release, data, failed):
+    """The projects to restore with their before-release files and previous images (all checked, nothing changed)."""
     names = [project["name"] for project in settings["projects"]]
     touched = [item.get("name") for item in data["projects"]]
     # An applied release replaced every project; a failed health wait, those up to the one that failed.
@@ -1548,6 +1548,11 @@ def rollback(settings, sha, http=None):
             if not present:
                 raise Refused("a previous image is no longer present on this host")
         plan.append((project, before, previous))
+    return plan
+
+
+def rollback_restore(settings, release, sha, serving, plan):
+    """The guard, then each project's stop, `up` on the previous images and the check that they run."""
     guard_rollback(serving, plan)
     wait_for_calls(settings, time.monotonic() + CALL_WAIT)
     write(release / "rollback-attempted.json", {"sha": sha, "status": "rolling-back", "started_at": now()})
@@ -1567,6 +1572,19 @@ def rollback(settings, sha, http=None):
             actual = json.loads(run(["docker", "inspect", ids[0]]))[0]
             if actual["Image"] != image or not actual["State"]["Running"]:
                 raise Refused("restored service does not run its previous image")
+
+
+def rollback(settings, sha, http=None):
+    """Return the current release's selected services to the images and configuration that ran before it, or
+    those of a release whose apply failed its health wait (`unhealthy`), which never became current.
+
+    Owner-confirmed like apply, except as `deploy`'s one automatic rollback. It never calls promotable(): the previous
+    revision is no longer current main. The caller holds the host lock, as main() does for every state-changing action,
+    and with plan B (`http`, its validated configuration; None when there is none) the locks of seamless_release.py.
+    """
+    state, release, result, failed, serving, data = rollback_state(settings, sha, http)
+    plan = rollback_plan(settings, release, data, failed)
+    rollback_restore(settings, release, sha, serving, plan)
     outcome = {"sha": sha, "status": "rolled-back", "rolled_back_at": now(),
                "previous_images": {project["name"]: previous for project, _, previous in plan}}
     write(release / "rollback.json", outcome)
@@ -2143,50 +2161,39 @@ def claim(copy, kind, name):
     write_record(Path(copy["directory"]) / "owner.json", copy)
 
 
-def snapshot_copy(copy, timeout, keep, catalog=None):
-    """C1-C3: the snapshot, its dumps and their verified restore; writes `copy.json`. With `keep` the scratch container
-    stays up for the caller; with `catalog` the snapshot's catalog lines are returned (`catalog`) and their digest is
-    recorded."""
-    source, directory = copy["source"], Path(copy["directory"])
-    container, owner, database = source["container"], source["owner"], source["database"]
-    # Only the image, the mounts and PGDATA: the container's other variables hold its password.
-    image, mounts, data = (run(["docker", "inspect", "--type", "container", "--format", INSPECT_COPY, container],
-                               timeout=60).splitlines() + ["", "", ""])[:3]
-    inspected = {"Image": json.loads(image), "Mounts": json.loads(mounts),
-                 "Config": {"Env": [json.loads(data)] if data else []}}
-    paths = [str(directory), data_filesystem(inspected)]
-    watch = {"timeout": timeout, "paths": paths}
-    keeper = Keeper(copy, copy_exec(copy, "keeper", container, "psql", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1",
-                                    "-U", owner, "-d", database), copy_clock() + timeout)
-    try:
-        keeper.query(f"SET idle_in_transaction_session_timeout = '{timeout}s'; SET statement_timeout = '{timeout}s';"
-                     " BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;")
-        found = json.loads(keeper.query(
-            "SELECT json_build_object('snapshot', pg_export_snapshot(), 'at', now(), 'version',"
-            " current_setting('server_version'), 'bytes', pg_database_size(d.oid), 'owner', pg_get_userbyid(d.datdba),"
-            " 'encoding', pg_encoding_to_char(d.encoding), 'collate', d.datcollate, 'ctype', d.datctype)"
-            " FROM pg_database d WHERE d.datname = current_database();")[0])
-        if (not SNAPSHOT_ID.fullmatch(found["snapshot"]) or not SQL_NAME.fullmatch(found["owner"])
-                or not all(LOCALE.fullmatch(found[key]) for key in ("encoding", "collate", "ctype"))):
-            raise CopyFailed(copy["id"], "dump_failed")
-        for path in paths:
-            free, size = filesystem(path)
-            if free < 2 * found["bytes"] + copy_reserve(size):
-                raise CopyFailed(copy["id"], "disk_reserve")
-        reference = counts(copy, keeper.query(COUNTS), "dump_failed")
-        shape = keeper.query(catalog) if catalog else None
-        snapshot = "--snapshot=" + found["snapshot"]
-        dumped(copy, copy_exec(copy, "schema", container, "pg_dump", "--schema-only", snapshot, "-U", owner,
-                               "-d", database), directory / "reference.schema", failure="dump_failed", **watch)
-        dumped(copy, copy_exec(copy, "dump", container, "pg_dump", "-Fc", snapshot, "-U", owner, "-d", database),
-               directory / f"{database}.dump", failure="dump_failed", **watch)
-        dumped(copy, copy_exec(copy, "roles", container, "pg_dumpall", "--roles-only", "--no-role-passwords",
-                               "-U", owner, "-l", database), directory / "roles.sql", failure="dump_failed", **watch)
-        keeper.query("COMMIT;")
-    finally:
-        keeper.close()
-    files = {name: file_digest(directory / name) for name in (f"{database}.dump", "roles.sql", "reference.schema")}
-    image = inspected["Image"]
+def copy_dumps(copy, keeper, timeout, catalog, container, owner, database, directory, paths, watch):
+    """The snapshot transaction on the live database: its identity, free space, counts, catalog and the three dumps;
+    returns the snapshot facts, the reference counts and the catalog lines (None without `catalog`)."""
+    keeper.query(f"SET idle_in_transaction_session_timeout = '{timeout}s'; SET statement_timeout = '{timeout}s';"
+                 " BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;")
+    found = json.loads(keeper.query(
+        "SELECT json_build_object('snapshot', pg_export_snapshot(), 'at', now(), 'version',"
+        " current_setting('server_version'), 'bytes', pg_database_size(d.oid), 'owner', pg_get_userbyid(d.datdba),"
+        " 'encoding', pg_encoding_to_char(d.encoding), 'collate', d.datcollate, 'ctype', d.datctype)"
+        " FROM pg_database d WHERE d.datname = current_database();")[0])
+    if (not SNAPSHOT_ID.fullmatch(found["snapshot"]) or not SQL_NAME.fullmatch(found["owner"])
+            or not all(LOCALE.fullmatch(found[key]) for key in ("encoding", "collate", "ctype"))):
+        raise CopyFailed(copy["id"], "dump_failed")
+    for path in paths:
+        free, size = filesystem(path)
+        if free < 2 * found["bytes"] + copy_reserve(size):
+            raise CopyFailed(copy["id"], "disk_reserve")
+    reference = counts(copy, keeper.query(COUNTS), "dump_failed")
+    shape = keeper.query(catalog) if catalog else None
+    snapshot = "--snapshot=" + found["snapshot"]
+    dumped(copy, copy_exec(copy, "schema", container, "pg_dump", "--schema-only", snapshot, "-U", owner,
+                           "-d", database), directory / "reference.schema", failure="dump_failed", **watch)
+    dumped(copy, copy_exec(copy, "dump", container, "pg_dump", "-Fc", snapshot, "-U", owner, "-d", database),
+           directory / f"{database}.dump", failure="dump_failed", **watch)
+    dumped(copy, copy_exec(copy, "roles", container, "pg_dumpall", "--roles-only", "--no-role-passwords",
+                           "-U", owner, "-l", database), directory / "roles.sql", failure="dump_failed", **watch)
+    keeper.query("COMMIT;")
+    return found, reference, shape
+
+
+def copy_scratch(copy, image, directory, timeout, paths):
+    """Start the scratch PostgreSQL and wait until its final server answers; returns its container name and the
+    client arguments to reach it."""
     scratch, scratch_container = directory / "scratch", copy["container"]
     scratch.mkdir(mode=0o700)
     # A root operator lets the image's entrypoint own the data directory; anyone else runs PostgreSQL as itself, so
@@ -2206,6 +2213,11 @@ def snapshot_copy(copy, timeout, keep, catalog=None):
         check_reserve(copy, paths)
         time.sleep(0.5)
     psql = ("psql", "-X", "-q", "-v", "ON_ERROR_STOP=1", *scratch_sql)
+    return scratch_container, scratch_sql, psql
+
+
+def copy_verify(copy, directory, database, found, reference, scratch_container, scratch_sql, psql, timeout, watch):
+    """Restore the dumps into the scratch server and compare counts and schema with the live reference."""
     restored(copy, copy_exec(copy, "roles", scratch_container, *psql, "-d", "postgres"), directory / "roles.sql",
              failure="restore_failed", **watch)
     helper_output(copy, copy_exec(copy, "create", scratch_container, *psql, "-d", "postgres"), timeout=timeout,
@@ -2225,6 +2237,31 @@ def snapshot_copy(copy, timeout, keep, catalog=None):
     if schema_lines(directory / "restored.schema") != schema_lines(directory / "reference.schema"):
         raise CopyFailed(copy["id"], "schema_mismatch")
     (directory / "restored.schema").unlink()
+
+
+def snapshot_copy(copy, timeout, keep, catalog=None):
+    """C1-C3: the snapshot, its dumps and their verified restore; writes `copy.json`. With `keep` the scratch container
+    stays up for the caller; with `catalog` the snapshot's catalog lines are returned (`catalog`) and their digest is
+    recorded."""
+    source, directory = copy["source"], Path(copy["directory"])
+    container, owner, database = source["container"], source["owner"], source["database"]
+    # Only the image, the mounts and PGDATA: the container's other variables hold its password.
+    image, mounts, data = (run(["docker", "inspect", "--type", "container", "--format", INSPECT_COPY, container],
+                               timeout=60).splitlines() + ["", "", ""])[:3]
+    inspected = {"Image": json.loads(image), "Mounts": json.loads(mounts),
+                 "Config": {"Env": [json.loads(data)] if data else []}}
+    paths = [str(directory), data_filesystem(inspected)]
+    watch = {"timeout": timeout, "paths": paths}
+    keeper = Keeper(copy, copy_exec(copy, "keeper", container, "psql", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1",
+                                    "-U", owner, "-d", database), copy_clock() + timeout)
+    try:
+        found, reference, shape = copy_dumps(copy, keeper, timeout, catalog, container, owner, database, directory, paths, watch)
+    finally:
+        keeper.close()
+    files = {name: file_digest(directory / name) for name in (f"{database}.dump", "roles.sql", "reference.schema")}
+    image = inspected["Image"]
+    scratch_container, scratch_sql, psql = copy_scratch(copy, image, directory, timeout, paths)
+    copy_verify(copy, directory, database, found, reference, scratch_container, scratch_sql, psql, timeout, watch)
     record = {"id": copy["id"], "verified": True, "database": database, "counts": reference, "files": files,
               "snapshot_at": found["at"], "server_version": found["version"], "database_bytes": found["bytes"],
               "image": image, "scratch_container": scratch_container if keep else None, "verified_at": now()}
@@ -3656,20 +3693,9 @@ def unsettled_migrations(state):
     return found
 
 
-def migrate(settings, http, plans, mirror, base, serving, candidate, release):
-    """M2 after preparation, M3 and M4 for each database of the range (K3): the producer check, every copy and its
-    rehearsal before any production write, the final gates, then one production `migrate-expand` per database,
-    calendar first and then its db-roles and db-roles --check. Returns when every database is at its target with its
-    rehearsal's effect; raises MigrationWait or CallActive/CallsUnknown (nothing changed), or MigrationRefused."""
-    messaging = [plan for plan in plans if plan["database"] == AUTO_DATABASE]
-    limit = rehearsal_limit(settings)
-    if messaging:
-        follow_producer(settings, mirror, messaging[0], candidate, release)
-    images ={plan["database"]: migration_image(release, candidate, plan["database"]) for plan in plans}
-    progress = Progress(release, plans)
-    def refused(name, reason, phase):
-        progress.update(name, status="refused", phase=phase)
-        return progress.refused(name, "refused", reason, phase=phase, reason=reason)
+def migrate_rehearse(settings, plans, candidate, images, limit, progress, refused):
+    """M3 for each database of the range: its verified copy and the rehearsal of the migration on it;
+    returns the copies and the rehearsals by database name."""
     copies, rehearsals = {}, {}
     for plan in plans:
         name = plan["database"]
@@ -3685,6 +3711,12 @@ def migrate(settings, http, plans, mirror, base, serving, candidate, release):
                           + (str(exc) if isinstance(exc, Refused) else type(exc).__name__), "copy") from exc
         copies[name] = copied
         progress.update(name, status="rehearsed", copy=copied["id"], rehearsal_ms=rehearsals[name]["took_ms"])
+    return copies, rehearsals
+
+
+def migrate_gate(settings, http, plans, mirror, base, serving, candidate, release, messaging, images, copies,
+                 rehearsals, refused):
+    """The final gates before any production write; returns each database's plan file and expected catalog change."""
     # The final gate: everything admission read, again, and each live catalog still its copy's.
     for plan in plans:
         migration_gate(settings, http, plan, mirror, base, serving)
@@ -3720,6 +3752,11 @@ def migrate(settings, http, plans, mirror, base, serving, candidate, release):
                                      key=json.dumps), "difference": rehearsals[name]["difference"]}
         write_record(evidence_file(release, name, "migration-catalog.json"), expected)
         evidence[name] = plan_file, expected
+    return evidence
+
+
+def migrate_expand(settings, plans, candidate, images, copies, rehearsals, evidence, progress):
+    """M4: one production `migrate-expand` per database (calendar also db-roles); each outcome is recorded."""
     last = plans[-1]["database"]
     summary = {"copy": copies[last]["id"], "rehearsal_ms": rehearsals[last]["took_ms"]}
     for plan in plans:
@@ -3740,6 +3777,26 @@ def migrate(settings, http, plans, mirror, base, serving, candidate, release):
         if name == CALENDAR:
             progress.roles(settings, plan, candidate, images[name])
     progress.record("migrated", **summary)
+
+
+def migrate(settings, http, plans, mirror, base, serving, candidate, release):
+    """M2 after preparation, M3 and M4 for each database of the range (K3): the producer check, every copy and its
+    rehearsal before any production write, the final gates, then one production `migrate-expand` per database,
+    calendar first and then its db-roles and db-roles --check. Returns when every database is at its target with its
+    rehearsal's effect; raises MigrationWait or CallActive/CallsUnknown (nothing changed), or MigrationRefused."""
+    messaging = [plan for plan in plans if plan["database"] == AUTO_DATABASE]
+    limit = rehearsal_limit(settings)
+    if messaging:
+        follow_producer(settings, mirror, messaging[0], candidate, release)
+    images ={plan["database"]: migration_image(release, candidate, plan["database"]) for plan in plans}
+    progress = Progress(release, plans)
+    def refused(name, reason, phase):
+        progress.update(name, status="refused", phase=phase)
+        return progress.refused(name, "refused", reason, phase=phase, reason=reason)
+    copies, rehearsals = migrate_rehearse(settings, plans, candidate, images, limit, progress, refused)
+    evidence = migrate_gate(settings, http, plans, mirror, base, serving, candidate, release, messaging, images, copies,
+                            rehearsals, refused)
+    migrate_expand(settings, plans, candidate, images, copies, rehearsals, evidence, progress)
 
 
 # Deploy tool updates (ANYM-443, production.md "Deploy tool updates"). Each installed tool pair has its own directory
