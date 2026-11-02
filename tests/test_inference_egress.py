@@ -244,10 +244,10 @@ def test_ufw_form_is_exactly_the_filter_and_ipv6_rules_of_the_command_form_in_or
     assert 'PREROUTING' not in ufw_block('v4') + ufw_block('v6')
     # The mini's address appears once in the filter chain and nowhere else.
     assert ufw_block('v4').count(MINI) == 1 and MINI not in ufw_block('v6')
+    check_ufw_form_refuses_an_address_outside_the_tailnet_and_needs_a_family()
 
 
-# spec: ANYM-693
-def test_ufw_form_refuses_an_address_outside_the_tailnet_and_needs_a_family():
+def check_ufw_form_refuses_an_address_outside_the_tailnet_and_needs_a_family():
     for bad in ('192.168.1.5', '8.8.8.8', 'fd7a:115c:a1e0::1', ''):
         code, out, err = run('rules', '--mini-ip', bad, '--format', 'ufw', '--family', 'v4')
         assert code != 0 and out == '' and err, bad
@@ -412,8 +412,7 @@ def test_after_init_text_is_bounded_idempotent_and_never_stops_ufw():
     assert raw == [line for line in ufw_block('v4').splitlines() if line.startswith(f'-A {CHAIN} ')]
 
 
-# spec: ANYM-693
-def test_verify_is_ok_when_repository_file_and_kernel_agree(tmp_path):
+def check_verify_is_ok_when_repository_file_and_kernel_agree(tmp_path):
     code, out, err = Host(tmp_path).run()
     assert (code, out) == (0, 'ok\n'), (out, err)
     # ufw's own chain name for the host-bound drop and the command form's INPUT are the same fact.
@@ -441,10 +440,11 @@ def test_verify_names_a_dropped_hook_an_extra_accept_and_a_changed_mini_address(
     code, out, _ = host.run()
     assert code == 1 and out.splitlines() == ['file_vs_repo mini_differs', 'kernel_vs_repo mini_differs'], out
     assert 'file_vs_kernel' not in out
+    check_verify_does_not_pass_an_allowance_that_file_and_kernel_share(tmp_path)
+    check_verify_is_ok_when_repository_file_and_kernel_agree(tmp_path)
 
 
-# spec: ANYM-693
-def test_verify_does_not_pass_an_allowance_that_file_and_kernel_share(tmp_path):
+def check_verify_does_not_pass_an_allowance_that_file_and_kernel_share(tmp_path):
     host = Host(tmp_path)
     final = f'-A {CHAIN} -j DROP'
     extra = f'-A {CHAIN} -d 198.51.100.7 -j ACCEPT'
@@ -541,8 +541,7 @@ def test_verify_counts_host_bound_drops_only_in_their_family_and_reachable_chain
     assert host.run('--persisted-only')[1].splitlines() == ['file_vs_repo hook_absent:dk-inference0']
 
 
-# spec: ANYM-693
-def test_verify_rejects_a_managed_chain_declared_twice_or_after_its_rules(tmp_path):
+def check_verify_rejects_a_managed_chain_declared_twice_or_after_its_rules(tmp_path):
     for late in (':DOCKER-USER - [0:0]', f':{CHAIN} - [0:0]'):
         host = Host(tmp_path)
         host.files['v4'].write_text(host.files['v4'].read_text().replace('COMMIT', late + '\nCOMMIT'))
@@ -607,6 +606,7 @@ def test_verify_persisted_only_reads_no_kernel_and_a_file_without_the_docker_use
     assert code == 1 and out.splitlines()[0] == 'file_vs_repo missing::DOCKER-USER', out
     # The kernel read failing in the full form is an error (exit 2), never a silent ok.
     assert Host(tmp_path).run('--iptables-save', '/bin/false')[0] == 2
+    check_verify_rejects_a_managed_chain_declared_twice_or_after_its_rules(tmp_path)
 
 
 # spec: ANYM-693
@@ -631,8 +631,7 @@ def load_persist():
     return module
 
 
-# spec: ANYM-693
-def test_receipt_order_is_yes_no_or_unknown():
+def check_receipt_order_is_yes_no_or_unknown():
     order = load_persist().rules_before_first_container
     assert order(ufw=10.0, raw=9.5, raw_ok=True, container=20.0) == 'yes'
     assert order(ufw=25.0, raw=9.5, raw_ok=True, container=20.0) == 'no'
@@ -670,6 +669,7 @@ def test_first_container_start_uses_process_start_and_is_unknown_when_a_containe
     assert module.first_container_start(str(docker), proc_start=lambda pid: 20.0) is None
     # Nothing ran this boot: unknown (an empty host has no first container to compare with).
     assert first([never]) is None
+    check_receipt_order_is_yes_no_or_unknown()
 
 
 # spec: ANYM-693
@@ -696,10 +696,7 @@ def test_receipt_command_writes_the_boot_receipt_and_fails_when_a_verify_fails(t
 
 # spec: ANYM-693
 @pytest.mark.skipif(shutil.which('timeout') is None or not Path('/proc/uptime').exists(), reason='needs GNU timeout and /proc (Linux)')
-@pytest.mark.parametrize('shell', ['sh', 'dash', 'bash'])
-def test_outer_kill_of_a_term_ignoring_command_with_a_full_stderr_still_ends_with_exit_zero(tmp_path, shell):
-    if shutil.which(shell) is None:
-        pytest.skip(f'{shell} is not installed')
+def test_outer_kill_of_a_term_ignoring_command_with_a_full_stderr_still_ends_with_exit_zero(tmp_path):
     hook, state = after_init(tmp_path), tmp_path / 'raw-step.json'
     wrappers = tmp_path / 'bin'
     wrappers.mkdir()
@@ -708,17 +705,22 @@ def test_outer_kill_of_a_term_ignoring_command_with_a_full_stderr_still_ends_wit
     (wrappers / 'iptables-restore').chmod(0o755)
     env = {**os.environ, 'PATH': f'{wrappers}:{os.environ["PATH"]}', 'DEEDKIT_HOOK_TIMEOUT': '3', 'DEEDKIT_STEP_TIMEOUT': '30',
            'DEEDKIT_RAW_STATE': str(state)}
-    started = time.monotonic()
-    process = subprocess.Popen([shell, str(hook), 'start'], stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, env=env)
-    try:
-        assert process.wait(timeout=40) == 0
-        assert time.monotonic() - started < 40
-    finally:
-        process.kill()
-        assert process.stderr is not None
-        process.stderr.close()
-    record = json.loads(state.read_text())
-    assert record['ok'] is False and record['reason'].startswith('hook_'), record
+    # The supervising shell is the one ufw's shebang names (dash on Debian and Ubuntu); each prints its job messages its own way.
+    shells = [shell for shell in ('sh', 'dash', 'bash') if shutil.which(shell)]
+    assert shells
+    for shell in shells:
+        state.unlink(missing_ok=True)
+        started = time.monotonic()
+        process = subprocess.Popen([shell, str(hook), 'start'], stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, env=env)
+        try:
+            assert process.wait(timeout=40) == 0, shell
+            assert time.monotonic() - started < 40, shell
+        finally:
+            process.kill()
+            assert process.stderr is not None
+            process.stderr.close()
+        record = json.loads(state.read_text())
+        assert record['ok'] is False and record['reason'].startswith('hook_'), (shell, record)
 
 
 # spec: ANYM-693
