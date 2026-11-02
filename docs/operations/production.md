@@ -1423,7 +1423,9 @@ masquerading rewrites the source of a packet that leaves the host, so do not fil
 subnet; search for the unique label instead. The bridge capture must show the label on `dk-inference0`
 (the check did generate the query), and no other interface (`tailscale0`, the uplink) may show it. First
 the positive control: from the host, `getent hosts probe-control-<random>.example.com` must show its label
-on the uplink in the same capture, or the capture proves nothing. Keep `dns.txt` with the receipt.
+on the uplink in the same capture, or the capture proves nothing. `dns.txt` holds every name the host
+resolved: keep it private on the host (mode 0600, removed after the review), and give the receipt only the
+labels, the interfaces that showed them and the verdict.
 
 Undo (reverse): `docker compose $F --profile enrichment-mini stop enricher-mini` and `rm enricher-mini`;
 `docker network disconnect <project>_inference_db <db container>`; `docker network rm
@@ -1431,6 +1433,41 @@ Undo (reverse): `docker compose $F --profile enrichment-mini stop enricher-mini`
 needs the same newer-SHA hand apply as the delivery undo above); `docker image rm` the enroll tag; as root
 `python3 scripts/inference_egress_check.py rules --undo` prints the mirror of the rules (hooks first, then
 both chains). The worker's jobs requeue on SIGTERM; nothing in the database changes.
+
+## Mini inference: watch and enable record (ANYM-686)
+
+The plan to enable it is [inference-enable.md](inference-enable.md). Whoever reads the production status of a
+day also does this read-only watch (operator DSN, `psql` through the host's documented database access; no write).
+One query lists the scopes (account, kind, profile) that have queued work:
+
+```sql
+SELECT m.account, e.kind, e.profile_hash,
+       count(*) FILTER (WHERE e.state = 'queued' AND e.next_due <= clock_timestamp()) AS due,
+       count(*) FILTER (WHERE e.state = 'queued' AND e.error_code = 'model_backpressure') AS held,
+       round(extract(epoch FROM clock_timestamp() - max(e.updated_at)
+             FILTER (WHERE e.state = 'ready' AND e.provider = 'deedkit_inference')) / 3600, 1) AS hours_since_ready
+  FROM attachment_enrichment e JOIN attachments a ON a.id = e.attachment JOIN messages m ON m.id = a.message
+ WHERE e.kind IS NOT NULL AND e.profile_hash IS NOT NULL GROUP BY m.account, e.kind, e.profile_hash
+HAVING count(*) FILTER (WHERE e.state = 'queued') > 0;
+```
+Timestamps of rows cannot give continuous waiting (a deferral refreshes `next_due`, `updated_at` and the
+pause), so the reader keeps a ledger, a text file on the host (`private/inference-watch.tsv`, mode 0600, no
+content) with one line per scope: `account kind profile_hash first_seen_utc`. At each reading: a scope the query
+lists and the ledger does not is added with the reading's time; a scope the ledger has and the query no longer
+lists (the queue drained) is removed. Report, separately: (a) every scope whose ledger time is more than 24
+hours old (elapsed continuous waiting) together with its `hours_since_ready`; (b) a stall when that elapsed
+waiting is above 24 hours **and** `hours_since_ready` is above 24 or NULL (never a success from the mini; compare
+with the enable date). A long wait with fresh successes is a backlog draining at its caps, not a stall. Another
+scope's success does not hide a stalled one: the groups are separate.
+
+The key and the service: `python3 scripts/inference_probe.py --url https://<mini>.<tailnet>.ts.net --key-file
+private/inference/inference.key` prints one line and exits 0 whatever it finds; report any line that is not
+`reachable=yes status=ok` with a `key_expires=` value (`status=http_502`, `reachable=no` and a rejected key all
+count), and `key_days_left` of 30 or fewer (the rotation of inference-mini-setup.md section 12 is due).
+
+The enable record on the ANYM-686 card keeps: the date and `S`; the three attachment ids of the end-to-end run (not
+their content); the egress `check` JSON and the `tcpdump` evidence; the offline and admission drill times; the key's
+expiry date and its rotation due date (30 days before); never the key, a DSN or a file name.
 
 ## Image retention
 
