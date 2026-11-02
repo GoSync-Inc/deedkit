@@ -1,0 +1,45 @@
+{
+  "connection_errors": [
+    "whatsapp_logged_out", "whatsapp_pairing_required", "provider_auth_failed", "whatsapp_identity_mismatch",
+    "telegram_pairing_required", "telegram_identity_mismatch", "provider_disconnected", "provider_not_ready",
+    "provider_initialization_failed", "provider_connect_timeout", "provider_page_stalled",
+    "provider_protocol_error", "durable_capture_failed", "capture_overload", "spool_full",
+    "disk_reserve", "spool_corrupt", "collector_lease_lost"
+  ],
+  "media_errors": [
+    "media_unavailable", "media_reference_changed", "unsupported_media_type", "media_hash_mismatch",
+    "media_size_mismatch", "media_size_limit", "media_metadata_unavailable", "invalid_media_path",
+    "media_timeout", "media_network_error", "media_storage_unavailable"
+  ],
+  "supervisor_stop_codes": {
+    "telegram": [
+      "collector_disabled", "session_handover_not_confirmed", "telegram_pairing_required",
+      "telegram_identity_mismatch", "private_session_required", "live_account_required",
+      "collector_already_owned", "session_already_owned", "collector_lease_lost",
+      "durable_capture_failed", "capture_overload", "collection_disabled", "provider_disconnected"
+    ],
+    "whatsapp": [
+      "collector_disabled", "session_handover_not_confirmed", "whatsapp_pairing_required",
+      "whatsapp_identity_mismatch", "private_session_required", "live_account_required",
+      "collector_already_owned", "session_already_owned", "collector_lease_lost",
+      "collection_disabled", "provider_disconnected"
+    ]
+  },
+  "provider_reply": {
+    "command_rejected": [
+      "operation_invalid_parameters", "operation_disabled", "operation_expired",
+      "operation_target_invalid", "operation_target_unavailable", "operation_unsupported",
+      "operation_query_failed", "operation_result_too_large", "registered_file_invalid",
+      "history_rate_limited", "history_anchor_unavailable",
+      "invalid_phone", "identity_unresolved", "chat_not_collected", "provider_timeout", "rate_limited", "forbidden",
+      "invite_invalid", "invite_expired", "chat_full", "join_not_allowed", "already_member", "operation_target_changed"
+    ],
+    "send_rejected": ["send_expired", "sending_disabled", "send_target_invalid", "link_preview_unsupported"],
+    "media_unavailable": ["media_unavailable", "media_reference_changed", "unsupported_media_type"],
+    "operation_safe": [
+      "provider_operation_failed", "chat_excluded", "send_receipt_mismatch",
+      "send_receipt_missing", "provider_operation_uncertain"
+    ]
+  },
+  "operation_validation": ["unsupported_operation", "invalid_operation_parameters", "invalid_phone", "invalid_username"]
+}
