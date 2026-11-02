@@ -40,6 +40,35 @@ WhatsApp listens to the existing client's
 [`message_ack`](https://docs.wwebjs.dev/Client.html#event:message_ack) events;
 it does not poll message info or open a second browser.
 
+## What a `sent` result tells the agent (ANYM-659)
+
+A send in status `sent` carries two additive fields, computed from the row, the
+platform, the chat type and the clock (no wait, no poll, no provider call).
+`next_action` stays `none`; `recipient_delivery_confirmed` keeps its rule.
+
+`messenger_reports` is a capability list, never a status: the receipt levels this
+messenger can report for this chat.
+
+| Messenger and chat | `messenger_reports` |
+| --- | --- |
+| WhatsApp (private chat or group) | `["delivered","read"]`; read and played are best-effort and depend on the recipient's settings |
+| Telegram private chat with a human peer | `["read"]` (never delivered) |
+| Telegram group, channel, bot peer; any self chat (Saved Messages, note to self) | `[]` |
+| A platform or Telegram chat type not in this table | `null` (unknown) |
+
+`receipt_state` is one word: `delivered`, `read` or `played` when that evidence has
+arrived (the highest level, including a Telegram private `read`); `pending` when
+`messenger_reports` includes `delivered`, none has arrived and the send is under 10
+minutes old; `overdue` at 10 minutes or more; `not_reported` when the messenger can
+never report delivery; `unknown` when `messenger_reports` is `null` or an input is
+missing; `receipt_error` when the provider reported a delivery failure. `overdue`
+means delayed, not lost: the recipient may be offline or the provider session may be
+down (check `get_sync_status`; a provider shown offline there confirms it). A
+WhatsApp group state comes from the receipts the provider reports for the message
+from any participant (`audience: provider_aggregate`; the adapter does not record
+which one), so `delivered` there never means every member got it. An agent that
+needs a push subscribes to `message.status` events instead of polling.
+
 ## Durable updates and coverage
 
 The account-scoped observation ledger accepts evidence before a message or chat
