@@ -148,7 +148,9 @@ class Confinement:
         if not reply:
             return False
         if ipaddress.ip_address(host).is_loopback:
-            return len(reply) < 4 or (reply[3] & 0x0f) not in NO_ANSWER_CODES
+            # only a complete DNS response (a header with the QR bit) that says SERVFAIL or REFUSED counts as "its upstream is
+            # unreachable"; a short or malformed reply is not evidence of anything
+            return len(reply) < 12 or not reply[2] & 0x80 or (reply[3] & 0x0f) not in NO_ANSWER_CODES
         return True
 
     def checks(self) -> list[tuple[str, Callable[[], bool]]]:
@@ -167,6 +169,7 @@ class Confinement:
             checks.append((f'dns:configured_udp:{server}', lambda server=server: self.dns_got_out(server)))
             if not ipaddress.ip_address(server).is_loopback:     # a local stub always listens; its answers are judged above
                 checks.append((f'dns:configured_tcp:{server}', lambda server=server: self.got_out(server, 53)))
+        configured = set(servers or [])
         try:
             gateway = self.network.gateway()
         except (OSError, ValueError):
@@ -183,6 +186,10 @@ class Confinement:
                 checks.append((f'mini_unresolved:{name}', lambda: True))
                 continue
             for address in addresses:
+                if address not in configured:
+                    # the stub's SERVFAIL can hide a reachable upstream that failed: ask the pinned upstream (the mini) directly
+                    checks.append((f'dns:mini_udp:{address}', lambda address=address: self.dns_got_out(address)))
+                    checks.append((f'dns:mini_tcp:{address}', lambda address=address: self.got_out(address, 53)))
                 for port in MINI_OTHER_PORTS:
                     checks.append((f'mini:{name}:{port}', lambda address=address, port=port: self.got_out(address, port)))
         return checks

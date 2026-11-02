@@ -174,6 +174,31 @@ def test_a_silent_embedded_resolver_is_confined_and_a_remote_resolver_reply_of_a
 
 
 # spec: ANYM-688
+def test_a_reachable_upstream_behind_a_servfailing_stub_is_found_by_asking_the_upstream_directly():
+    # Docker's stub says SERVFAIL when a REACHABLE upstream returned SERVFAIL or REFUSED: the stub alone proves nothing,
+    # so the pinned upstream (the mini) is probed on UDP and TCP 53 itself
+    stub = {STUB: 2}
+    assert guard(Fake(nameservers=[STUB], dns_rcodes=stub)).probe() == []
+    assert guard(Fake(nameservers=[STUB], dns_rcodes={**stub, MINI_IP: 2})).probe() == [f'dns:mini_udp:{MINI_IP}']
+    assert guard(Fake(nameservers=[STUB], dns_refused=[MINI_IP], dns_rcodes=stub)).probe() == [f'dns:mini_udp:{MINI_IP}']
+    assert guard(Fake(nameservers=[STUB], dns_rcodes=stub, open_ports=[(MINI_IP, 53)])).probe() == [f'dns:mini_tcp:{MINI_IP}']
+    # when the mini is itself the configured resolver it is probed once, as a configured one
+    assert guard(Fake(dns_answers=[MINI_IP])).probe() == [f'dns:configured_udp:{MINI_IP}']
+
+
+# spec: ANYM-688
+@pytest.mark.parametrize('reply', [b'\x12\x34\x81\x02', b'\x12\x34\x81\x02' + bytes(7), b'\x12\x34\x01\x02' + bytes(8), b''])
+def test_a_short_or_malformed_stub_reply_is_not_evidence_of_confinement(reply):
+    class Odd(Fake):
+        def dns_reply(self, host, port, query, timeout):
+            if host == STUB:
+                return reply
+            return super().dns_reply(host, port, query, timeout)
+    expected = [] if reply == b'' else [f'dns:configured_udp:{STUB}']      # silence is silence; anything incomplete fails
+    assert guard(Odd(nameservers=[STUB])).probe() == expected
+
+
+# spec: ANYM-688
 def test_a_probe_that_cannot_be_set_up_is_a_failure_and_stops_a_running_job(stop_state):
     fake = Fake()
     worker = Recorder(guard(fake, fresh=3600.0, interval=0.05),
