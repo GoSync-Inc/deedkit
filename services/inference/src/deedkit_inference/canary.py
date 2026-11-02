@@ -69,6 +69,11 @@ def score(outputs, expected, truth):
             failures.append(f"{name}: character error {error:.3f} > {bound['max_cer']}")
         if got["seconds"] > expected["vision_max_seconds"]:
             failures.append(f"{name}: {got['seconds']:.1f} s > {expected['vision_max_seconds']} s")
+    for name, got in (outputs.get("cold") or {}).items():
+        # The first request after a model is not resident loads it (a cold start); it is timed apart from the warm
+        # bounds above and only has to finish within a loose limit, so a broken load still fails the canary.
+        if got["seconds"] > expected.get("cold_max_seconds", 300):
+            failures.append(f"cold {name}: {got['seconds']:.1f} s > {expected.get('cold_max_seconds', 300)} s")
     described = chat_object(outputs.get("describe", {}).get("content"))
     if described is None or (expected["describe"]["cyrillic"] and not CYRILLIC.search(described["summary"])):
         failures.append("describe: no Cyrillic summary")
@@ -143,13 +148,23 @@ def transcribe(base, key, path, verbose=False):
 
 
 def run(base, key, directory, expected, prompt):
-    """Record the canary's outputs from a running service. `directory` holds the generated set."""
+    """Record the canary's outputs from a running service. `directory` holds the generated set.
+
+    Each modality starts with one untimed-for-scoring request that loads its models (research/local-inference-11-01:
+    the benchmarks time warm runs, and the first request of a live service also loads them, 24 to 70 s). The
+    cold start is recorded under `cold` and judged by `cold_max_seconds`; the scored items run warm."""
     directory = Path(directory)
-    outputs = {"vision": {}, "speech": {}}
+    outputs = {"vision": {}, "speech": {}, "cold": {}}
+    first_image = next(iter(expected["vision"]))
+    outputs["cold"]["vision"] = chat(base, key, prompt, "", directory / first_image)
     for name in expected["vision"]:
         outputs["vision"][name] = chat(base, key, prompt, "", directory / name)
     outputs["describe"] = chat(base, key, prompt, "", directory / expected["describe"]["image"])
     outputs["text_only"] = chat(base, key, prompt, "\nUNTRUSTED SOURCE TEXT:\n" + (directory / expected["text_only"]["file"]).read_text())
+    # Both speech routes load once before the timed notes: English (Whisper) first, then Russian (GigaAM).
+    for label, name in (("speech_en", "note_en"), ("speech_ru", "note_ru")):
+        _, seconds = transcribe(base, key, directory / f"{name}.ogg", verbose=True)
+        outputs["cold"][label] = {"seconds": seconds}
     for name in expected["speech"]:
         answer, seconds = transcribe(base, key, directory / f"{name}.ogg", verbose=True)
         outputs["speech"][name] = {"text": answer["text"], "seconds": seconds, "audio_seconds": answer["duration"]}

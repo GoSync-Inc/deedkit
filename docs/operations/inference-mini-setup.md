@@ -334,6 +334,12 @@ MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]
 ssh "$MINI" 'cd /; sudo -n -H -u _deedkitinf /Users/_deedkitinf/current/.venv/bin/deedkit-inference canary --key-file /Users/_deedkitinf/keys/messaging-enrichment.key --set /Users/Shared/deedkit-inference/canary-set'
 ```
 
+The canary sends the worker's real chat prompt (`tests/canary/prompt.txt` is `PROMPT` and the Russian sentence of
+ANYM-685) and loads each modality once before the timed items: one vision request, then one English and one Russian
+note. Those cold starts (24 to 100 s on 11-02) are recorded under `cold` and only have to finish within
+`cold_max_seconds` (300); the scored items are warm. Before this change a live run on 9d2ccef1 scored the cold
+requests against the warm bounds and described the poster in English (the prompt lacked the Russian sentence).
+
 Record from the output: character error per image, word error per note, real-time factor, the long recording's segment
 bounds and the JSON shape; and, from `ps` and `vm_stat` while it runs, the service user's resident size and the free
 plus inactive memory. On 11-02 the vision worker held about 3.8 GB resident and free plus inactive memory read 8.9 to 9.1 GB
