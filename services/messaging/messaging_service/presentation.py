@@ -485,6 +485,13 @@ def render(method, result, detail):
                 'archive_detail_code','oldest_message_at','newest_message_at','last_ingest_at','alerts') if k in source}
             # The compact budget carries only the live verdict; full detail has the evidence.
             if 'liveness' in source:row['liveness_state']=source['liveness']['state']
+            # ANYM-671: the outbound block when something is wrong, waiting or alerting; quiet accounts omit it.
+            block=source.get('outbound')
+            if block and (block['sender']!='ready' or block['queued'] or block['expired_unsettled']
+                    or any(a.startswith('outbound_') for a in source.get('alerts',[]))):
+                # Lean form for the compact budget: no null or zero counts, and the explaining sentence only where it is the
+                # basis of a stall alert (a not_ready or cooling_down sender is explained by reason_code and next_action).
+                row['outbound']={k:v for k,v in block.items() if v not in (None,0) and (k!='reason' or block['sender']=='ready')}
             conflicts=source.get('conflicts') or {}
             if conflicts.get('attention') or conflicts.get('known'):row['conflicts']=conflicts
             row['freshness']={k:v for k,v in source.get('freshness',{}).items()

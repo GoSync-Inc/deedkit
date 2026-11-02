@@ -899,6 +899,9 @@ def register_archive_tools(mcp, call, async_call, read):
         Account summaries cache for at most 10s with observed_at/cache age; refresh=true bypasses.
         detail=compact is the default overview; full includes complete account diagnostics.
         Chat status is uncached. No provider requests; scans do not verify older edits/deletions.
+        Unscoped keys: each account row has an outbound block (full always; compact only when the sender is not ready,
+        sends wait or an outbound alert fires): sender ready, cooling_down, not_ready or unavailable, queued sends, age,
+        time to expiry. Alerts outbound_queue_stalled, outbound_sender_not_ready. Never answer a waiting send by sending again.
         """
         return call(ctx,'get_sync_status',detail=detail,chat_id=chat_id,from_time=from_time,to_time=to_time,refresh=refresh)
 

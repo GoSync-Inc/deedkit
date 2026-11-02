@@ -306,6 +306,34 @@ the bytes: a `next` repeats an inline file as `REPLACE_WITH_THE_SAME_BASE64` or,
 staged, by its `upload_id`. The Python client's `messages_send` and the npm client's
 `messagesSend` take the same arguments.
 
+### Is sending working? (`outbound` in `get_sync_status`)
+
+Every account row of an unscoped `get_sync_status` (Telegram and WhatsApp) carries
+`outbound`: `sender` (`ready`, `cooling_down` or `not_ready`; `unavailable` when the
+read itself failed), `queued` (sends waiting and not yet expired), `oldest_queued_age_s`,
+`expires_in_s` (time until the oldest waiting send expires), `expired_unsettled` (queued
+sends past their expiry that nothing has settled, because the collector is not sweeping
+them: they will not be sent) and, when something needs saying, `reason_code`, `reason`,
+`next_action`, `retry_at` and `cooldown_remaining_s`. It holds counts and ages only, no
+text, chat, request ID or principal.
+
+`not_ready` is the same check that rejects a new send (`sending_disabled` from the
+account policy, then a live collector lease and a connected provider session,
+`sender_not_ready`). `cooling_down` is a connected sender whose provider cooldown has
+not ended: the send worker pauses, and queued sends that would expire before it ends
+are never sent. The alert `outbound_queue_stalled` appears when the oldest queued send
+has waited more than 120 seconds with the sender ready (a burst of about 30 sends
+legitimately waits tens of seconds); `outbound_sender_not_ready` when sends are queued
+while the sender is `not_ready`. Never answer a waiting send by sending again: it acts on
+the owner's account. Wait, read `get_send_status`, subscribe to `send.failed`, and after
+an expiry ask for a new approved action.
+
+The compact view includes `outbound` when the sender is not `ready`, sends are queued,
+`expired_unsettled` is above zero or an outbound alert exists. A key limited to chats
+gets no `outbound` block: it relies on `wait_s`, `get_send_status` and a `send.failed`
+subscription. The status is cached for 10 seconds; `refresh=true` re-reads and
+`observed_at` dates an alert.
+
 ## Sender identity and provenance (0.9.12)
 
 Telegram private short-send receipts may omit the sender. The collector uses its
