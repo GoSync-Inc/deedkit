@@ -32,6 +32,17 @@ this metadata, unknown usernames or unavailable contacts cannot be found by
 name; use the exact sender ID in `search`. Checking the completeness of the catalog on
 working accounts remains part of live acceptance.
 
+### The Telegram contact book (ANYM-673)
+
+An empty `search_people` result carries `see_also: {tool: "list_contacts", argument: "query", accounts: [...]}`
+when no row came from a Telegram account the key may read contacts for. The accounts are the Telegram accounts
+where the key holds `contacts-read` (and is a full-account key) and the owner enabled `list_contacts`; the
+field is absent when there are none. Follow it with the messenger operation `list_contacts` and `parameters.query`
+(1-64 characters): it filters the account's contacts live by display name and username only, no phone number;
+ё and е are one letter and a Latin spelling finds the Cyrillic name (`fedor` finds Федор; Фёдор is `fyodor`).
+`limit`/`offset` page the filtered list. Each call reads the whole book once per account, so for many names page
+the full list once without `query`. Nothing is stored; the contact book is not merged into the archive results.
+
 ## Linked people (ANYM-283, schema 43)
 
 The owner may state that identities in different messengers are one person. Links are

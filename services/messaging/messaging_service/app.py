@@ -764,6 +764,7 @@ def register_archive_tools(mcp, call, async_call, read):
         Results are account/chat-scoped observations, not verified or merged identities.
         Use account + sender_id with search() and source_message with get_context().
         Missing matches may mean metadata has not been observed; no contact-book/provider call.
+        An empty result may carry see_also: list_contacts with query (Telegram contact book) for accounts you may read.
         A row whose identity the owner linked to a person carries person (a UUID); person=<id>
         lists the name observations of that person's identities you can read (across messengers),
         and search(person=<id>) finds their messages. Links are owner-made, never inferred from names.

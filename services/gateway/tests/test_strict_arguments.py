@@ -36,6 +36,17 @@ def test_integer_schema_rejects_integral_floats(name, values):
         arguments(CATALOG[name], values)
 
 
+# spec: ANYM-673
+def test_list_contacts_query_passes_the_gateway_argument_check_and_is_described():
+    tool = CATALOG["messages_read_contacts"]
+    values = {"account": "telegram-synthetic", "operation": "list_contacts", "request_id": "contacts-find-0001",
+              "parameters": {"query": "федор", "limit": 20, "offset": 0}}
+    assert arguments(tool, values)["parameters"] == values["parameters"]
+    text = json.dumps(tool["inputSchema"]["properties"]["parameters"], ensure_ascii=False) + tool["description"]
+    assert "list_contacts {limit, offset, query}" in text and "display name and username only, no phone number" in text
+    assert "once without query" in text and len(tool["description"].split()) <= 80
+
+
 def test_strict_integer_schema_applies_recursively_through_arrays_and_unions():
     tool = {"operation": "synthetic", "inputSchema": {
         "type": "object", "properties": {"rows": {"type": "array", "items": {

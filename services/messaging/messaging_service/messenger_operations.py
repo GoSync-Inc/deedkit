@@ -10,6 +10,7 @@ import math
 import re
 
 from .field_errors import FIELD_NAME, field_error, one_per_field
+from .name_variants import normalize
 
 MAX_REGISTERED_FILE_BYTES = 32 * 1024**2
 CATALOG_VERSION = 1
@@ -84,6 +85,10 @@ PRESS_BUTTON_LIMITATION = ('Telegram only: one press of one inline callback butt
     'owner\'s new confirmation. DeedKit cannot know what the bot does, undo it or verify its effect. Payments, '
     'URL, Mini App, login, inline-query and 2FA-protected buttons are not pressed. Per account 3 presses at once, then '
     'one per 5 s, 200 per UTC day (in memory); over it rate_limited with retry_after.')
+CONTACTS_QUERY_LIMITATION = ('Telegram: one call per account reads the whole contact book once; query filters it by display '
+    'name and username only, no phone number (ё and е are one letter; a Latin spelling finds the Cyrillic name: fedor finds '
+    'Федор, fyodor finds Фёдор), and limit/offset page the filtered list. For many names page the full list once without '
+    'query instead of one call per name.')
 LIVE_CHAT_TYPES = ('private', 'group', 'channel')
 LIVE_FILTERS = ('documents', 'photos', 'links', 'voice')
 BATCH_LIMITATION = ('One row per ID: applied, refused, unknown or not_attempted; an uncertain ID is never retried.')
@@ -248,6 +253,8 @@ def operation_spec(name, platform=None):
     if name == HISTORY and platform == 'telegram':
         # ANYM-477: Telegram answers at once and changes nothing at the provider; WhatsApp asks the phone.
         spec.update(mutation=False, limitation=TELEGRAM_HISTORY_LIMITATION)
+    if name == 'list_contacts' and platform == 'telegram':
+        spec.update(limitation=CONTACTS_QUERY_LIMITATION)
     return spec
 
 
@@ -278,6 +285,8 @@ def _fields(platform, name, spec):
             {'phone': _field('phone', required=True),
              'first_name': _field('string', required=True, maximum=64, nonempty=True),
              'last_name': _field('string', default='', maximum=64)})
+    if platform == 'telegram' and name == 'list_contacts':
+        return {**spec['fields'], 'query': _field('string', maximum=64, nonempty=True)}
     if name == 'update_profile':
         names = ('name', 'status') if platform == 'whatsapp' else ('first_name', 'last_name', 'bio')
         return {n: _field('string', maximum=64 if n in ('name', 'first_name', 'last_name') else 139,
@@ -555,6 +564,8 @@ def validate_operation(platform, operation, parameters, *, provider=None):
     if operation == 'send_file' and (('attachment_id' in output)+('upload_id' in output)!=1):
         raise ParameterError(field_error('upload_id' if 'upload_id' in output else 'attachment_id',
             'unique' if 'upload_id' in output else 'required', 'exactly one of attachment_id or upload_id'))
+    if operation == 'list_contacts' and platform == 'telegram' and 'query' in output and not normalize(output['query']):
+        raise ParameterError(field_error('query', 'blank', 'non-blank text'))
     if operation == LIVE_SEARCH and 'from_time' in output and 'to_time' in output and (
             datetime.fromisoformat(output['from_time']) >= datetime.fromisoformat(output['to_time'])):
         raise ParameterError(field_error('to_time', 'minimum', 'later than from_time'))

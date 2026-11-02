@@ -475,6 +475,94 @@ def test_account_lists_use_contact_membership_and_bounded_provider_pages():
     assert result['data']['blocked'][0]['peer_id'] == '300'
 
 
+def contact_book(*users):
+    client = Client()
+    client.responses[functions.contacts.GetContactsRequest] = NS(contacts=[NS(user_id=u.id) for u in users], users=list(users))
+    return client
+
+
+BOOK = (types.User(200, first_name='Федор', last_name='Петров', username='fedor_p', phone='100200300'),
+        types.User(201, first_name='Фёдор', last_name='Иванов'),
+        types.User(202, first_name='Anna', username='Anna_K', phone='79990001111'),
+        types.User(203, first_name='Борис', phone='555'))
+
+
+def found(client, query, **parameters):
+    result = run(client, 'list_contacts', {'query': query, **parameters})['data']
+    return [u['id'] for u in result['contacts']], result
+
+
+# spec: ANYM-673
+@pytest.mark.parametrize('query, expected', [
+    ('федор', ['200', '201']), ('ФЁДОР', ['200', '201']), ('  фёдор  петр ', ['200']), ('фёдор иван', ['201']),
+    ('fedor', ['200']), ('fyodor', ['201']), ('@anna_k', ['202']), ('ANNA', ['202']), ('борис', ['203']),
+    ('boris', ['203']), ('nobody', []), ('федор%', [])])
+def test_list_contacts_query_matches_name_and_username_with_yo_fold_and_latin_spelling(query, expected):
+    ids, result = found(contact_book(*BOOK), query)
+    assert ids == expected and result['reported_count'] == len(expected)
+
+
+# spec: ANYM-673
+@pytest.mark.parametrize('query', ['79990001111', '100200300', '555', '+7999'])
+def test_list_contacts_query_never_matches_a_phone_number(query):
+    assert found(contact_book(*BOOK), query)[0] == []
+
+
+# spec: ANYM-673
+def test_list_contacts_query_pages_the_filtered_list_with_one_provider_call():
+    users = [types.User(300 + n, first_name='Иван %d' % n) for n in range(5)] + [types.User(400, first_name='Другой')]
+    client = contact_book(*users)
+    first = run(client, 'list_contacts', {'query': 'иван', 'limit': 2})['data']
+    assert [u['id'] for u in first['contacts']] == ['300', '301']
+    assert first['reported_count'] == 5 and first['next_offset'] == 2 and first['page_limit'] == 2
+    last = run(client, 'list_contacts', {'query': 'иван', 'limit': 2, 'offset': 4})['data']
+    assert [u['id'] for u in last['contacts']] == ['304'] and last['next_offset'] is None
+    assert sum(isinstance(c, functions.contacts.GetContactsRequest) for c in client.calls) == 2
+
+
+# spec: ANYM-673
+def test_list_contacts_without_query_is_unchanged_and_the_filter_respects_the_allowed_ids():
+    client = contact_book(*BOOK)
+    plain = run(client, 'list_contacts', {})['data']
+    assert [u['id'] for u in plain['contacts']] == ['200', '201', '202', '203'] and plain['reported_count'] == 4
+    only = run(client, 'list_contacts', {'query': 'федор'}, _policy={'enabled': True, 'discover_chats': False,
+        'include_chats': ['200'], 'exclude_chats': []})['data']
+    assert [u['id'] for u in only['contacts']] == ['200']
+
+
+# spec: ANYM-673
+@pytest.mark.parametrize('query', ['', '   ', '@', 'x' * 65, 'a\x00b', 7, None, ['a']])
+def test_list_contacts_query_is_refused_before_any_provider_call(query):
+    client = contact_book(*BOOK)
+    with pytest.raises(Exception, match='invalid_parameters'):
+        run(client, 'list_contacts', {'query': query})
+    assert client.calls == []
+
+
+# spec: ANYM-673
+@pytest.mark.parametrize('query, reason', [('', 'blank'), ('   ', 'blank'), ('@', 'blank'), ('x' * 65, 'max_length'),
+                                           ('a\x00b', 'pattern'), (7, 'type'), (None, 'type'), (['a'], 'type')])
+def test_list_contacts_query_refusal_names_the_field(query, reason):
+    from messaging_service.messenger_operations import ParameterError, validate_operation
+    with pytest.raises(ParameterError) as error:
+        validate_operation('telegram', 'list_contacts', {'query': query})
+    entry, = error.value.field_errors
+    assert entry['field'] == 'query' and entry['reason'] == reason
+
+
+# spec: ANYM-673
+def test_the_query_parameter_is_telegram_only_and_published_with_its_limits():
+    from messaging_service.messenger_operations import ParameterError, operation_manifest, validate_operation
+    entry = next(e for e in operation_manifest('telegram') if e['operation'] == 'list_contacts')
+    assert entry['parameters_schema']['query']['maximum'] == 64 and entry['parameters_schema']['query']['nonempty']
+    assert 'display name and username only, no phone number' in entry['limitation'] and 'once without query' in entry['limitation']
+    whatsapp = next(e for e in operation_manifest('whatsapp') if e['operation'] == 'list_contacts')
+    assert 'query' not in whatsapp['parameters_schema']
+    with pytest.raises(ParameterError):
+        validate_operation('whatsapp', 'list_contacts', {'query': 'anna'})
+    assert validate_operation('telegram', 'list_contacts', {'query': ' Анна '})['query'] == ' Анна '
+
+
 def test_private_participant_queries_do_not_claim_a_group_member_list():
     client = Client()
     with pytest.raises(Exception, match='unsupported_operation'):

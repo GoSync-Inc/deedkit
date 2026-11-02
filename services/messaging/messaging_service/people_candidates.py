@@ -140,8 +140,14 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
     chat_titles(c,observations,p=p)
     refs=[r['source_message'] for r in observations]
     targets(p,refs)
+    # ANYM-673: nothing seen from a Telegram account may only mean the person is in the contact book, not in the archive.
+    from .commands import contact_accounts
+    pointer={}
+    accounts_to_read=contact_accounts(c,p)
+    if accounts_to_read and not any(r['account'] in accounts_to_read for r in observations):
+        pointer={'see_also':{'tool':'list_contacts','argument':'query','accounts':accounts_to_read}}
     return serial({'items':items,'next_cursor':cursor,'identity_model':'provider_sender_per_account_and_chat',
         'names_are_verified_identity':False,'directory_coverage':'observed_provider_names_only',
         'grouping':'same_account_provider_sender' if group_by_sender else 'per_chat_observation',
         'observations_coverage':'matching_visible_profiles_only','transliteration_is_identity_proof':False,
-        **store.dataset(c,p)})
+        **pointer,**store.dataset(c,p)})

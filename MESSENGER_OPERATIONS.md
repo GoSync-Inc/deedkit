@@ -571,6 +571,25 @@ needs `read-live`, the account opt-in and, through the gateway, the
 Roll out as for live search: API and collectors, then the gateway, then the
 policy naming the action; roll back in the reverse order.
 
+## Finding a Telegram contact by name (ANYM-673)
+
+`list_contacts` on a Telegram account takes an optional `query` besides `limit` and `offset`
+(`contacts-read`, full-account key; WhatsApp does not accept it). One call reads the account's
+contact book once from Telegram (one `GetContactsRequest`, method-scoped FloodWait handling,
+read-only, never retried when uncertain); the query then filters it in the service:
+
+- 1-64 characters, not blank (`@` alone is blank), no control characters; a bad value is refused before any
+  provider call with a `field_errors` entry for `query`.
+- Normalized like `search_people` (NFC, whitespace collapsed, lowercase, leading `@` dropped) and matched as a
+  literal substring of the display name (first and last name) and the username. ё and е are one letter. A Latin
+  spelling finds a Cyrillic name through the same `name_variants` transliteration: `fedor` finds Федор, while
+  Фёдор is `fyodor`; a Cyrillic query finds both. Phone numbers are never matched.
+- `reported_count` and `next_offset` count the filtered list, `limit`/`offset` page it. Without `query` the
+  result is unchanged. For many names page the full list once instead of one call per name.
+- Nothing is stored or logged; the result is the same profile fields the unfiltered list already returns.
+
+`search_people` points here: see PEOPLE.md.
+
 ## Inspecting a message's inline keyboard
 
 `inspect_message_buttons` (ANYM-681) is a live, read-only look at the inline
