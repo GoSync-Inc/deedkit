@@ -109,8 +109,9 @@ bytes it needs. The original always stays in the archive; the metadata says what
   `enrichment_failed` on a large original means the tmpfs is smaller than the profile's cap (an operator mistake), not
   a bad file. Order on a host: the new image first (an older image refuses `max_input_bytes` above 32 MiB with
   `invalid_model_limit` and then the audio profile is not usable), then the profile line; on a rollback restore the
-  line first. Editing the profile changes its hash, and the worker then picks every failed row of that kind again,
-  within the day budgets: check the budget before the edit and track all of those rows.
+  line first. Editing the profile changes its hash, and the worker, which reads its profile once at start, picks every
+  failed row of that kind again after its next restart, within the day budgets: check the budget before the edit,
+  restart once, and track all of those rows.
 - **Photos, `deedkit_inference` only.** A picture whose longer edge is over 2048 px or whose file is over 700 KB (700,000
   bytes, so about 930 KB as base64) is scaled by ffmpeg to a longer edge of at most 2048 px (never enlarged, EXIF
   orientation applied, one frame) and sent as jpeg, also when the source is png, webp or gif; the EXIF block, GPS
