@@ -327,8 +327,11 @@ private feedback locally with explicit `feedback-write`. Categories are `bug`,
 `feature`, `quality` and `other`; descriptions are limited to 4000 characters and
 references to 32 IDs per type. `operation`, when given, is the tool name as `tools/list`
 shows it, for any module: a messaging operation bare (`search`) or with the gateway prefix
-(`messages_search`), or a tool of another module under its gateway name (`calendar_slots`,
-`calls_get_call_status`, `platform_capabilities`). It is stored in one canonical form: messaging
+(`messages_search`), including the four messenger action tools (`change_message`, `manage_chat`,
+`change_contacts`, `read_contacts`, bare or with `messages_`; `send` is the bare spelling of `messages_send`),
+or a tool of another module under its gateway name (`calendar_slots`, `calls_get_call_status`,
+`platform_capabilities`, `recordings_list`). Every name in `tools/list` is accepted (a parity test reads
+the gateway catalog). It is stored in one canonical form: messaging
 operations bare (existing rows keep their meaning), other modules' tools under the full gateway name,
 and `list_feedback` returns the stored value. The idempotency hash uses the stored form, so replaying a
 `request_id` with the other spelling of the same name returns the same feedback ID. The common gateway
@@ -338,7 +341,7 @@ with `invalid_arguments` and a `field_errors` entry for `operation`; the bare `d
 the check although it has no gateway tool, stays accepted so a recorded request can be replayed. The
 `operation` schema allows up to 129 characters (`calendar_` or `platform_` plus 120). The messaging REST API, called
 directly, checks the shape only: a messaging operation, the same with the `messages_` prefix, or
-`calendar_`, `calls_` or `platform_` followed by 1–120 lowercase letters, digits or `_`. The name list is
+`calendar_`, `calls_`, `platform_` or `recordings_` followed by 1–120 lowercase letters, digits or `_`. The name list is
 not returned in the error. Message/chat/subscription references are validated
 against the current credential. Each key has a 1000-record bound; request-ID
 retries are idempotent and changed payloads conflict. `list_feedback(limit=50)`
