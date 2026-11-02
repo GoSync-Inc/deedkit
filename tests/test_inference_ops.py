@@ -1812,6 +1812,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if Handler.post['hang']:
             time.sleep(5)
             return
+        if Handler.post.get('drip'):  # an answer that trickles in one byte at a time: each gap is short, the whole is not
+            raw = b'HTTP/1.0 422 Unprocessable\r\nContent-Length: 60\r\n\r\n' + b'x' * 60
+            try:
+                for i in range(30):
+                    self.wfile.write(raw[i:i + 1])
+                    self.wfile.flush()
+                    time.sleep(0.1)
+            except OSError:
+                pass
+            return
         self.send_response(Handler.post['status'])
         self.send_header('Content-Length', str(len(Handler.post['body'])))
         self.end_headers()
@@ -1947,7 +1957,34 @@ def test_upload_probe_reads_an_early_refusal_sent_before_the_body_was_read(tls_s
     assert probe.main(['--url', url, '--key-file', key_file, '--upload-bytes', str(4 * 1024 * 1024)], context=trusted) == 0
     out = capsys.readouterr().out
     match = UPLOAD_LINE.match(out.rstrip('\n'))
-    assert match and match.group(6) == 'no' and match.group(5) in ('invalid_request', '-'), out
+    # a body far larger than the socket buffers: the service closed on it, and its answer is still the result
+    assert match and match.group(4) == '422' and match.group(5) == 'invalid_request' and match.group(6) == 'no', out
+
+
+# spec: ANYM-692
+@pytest.mark.parametrize('code', ['audio unreadable', 'Audio_Unreadable', 'audio_unreadable ', 'audio-unreadable', 'x' * 60, 'KEY'])
+def test_upload_probe_takes_the_refusal_code_exactly_and_never_echoes_the_key(tls_server, tmp_path, capsys, code):
+    server, url, trusted = tls_server
+    key, key_file = upload_key(tmp_path)
+    code = key if code == 'KEY' else code
+    Handler.post = {**Handler.post, 'status': 422, 'body': json.dumps({'error': {'code': code}}).encode()}
+    assert probe.main(['--url', url, '--key-file', key_file, '--upload-bytes', '3000'], context=trusted) == 0
+    out = capsys.readouterr().out
+    match = UPLOAD_LINE.match(out.rstrip('\n'))
+    assert match and match.group(4) == '422' and match.group(5) == '-' and match.group(6) == 'no', out
+    assert key not in out
+
+
+# spec: ANYM-692
+def test_upload_probe_timeout_is_a_total_deadline_also_for_an_answer_that_trickles_in(tls_server, tmp_path, capsys):
+    server, url, trusted = tls_server
+    key, key_file = upload_key(tmp_path)
+    Handler.post = {**Handler.post, 'drip': True}
+    started = time.monotonic()
+    assert probe.main(['--url', url, '--key-file', key_file, '--upload-bytes', '1000', '--timeout', '1'], context=trusted) == 0
+    out = capsys.readouterr().out
+    match = UPLOAD_LINE.match(out.rstrip('\n'))
+    assert match and match.group(4) == 'timeout' and match.group(6) == 'no' and time.monotonic() - started < 2.5, out
 
 
 # spec: ANYM-692
@@ -1982,6 +2019,8 @@ def test_upload_probe_exits_zero_with_one_line_and_never_prints_the_key(tls_serv
     server, url, trusted = tls_server
     key, key_file = upload_key(tmp_path)
     context, args = trusted, ['--key-file', key_file]
+    expected = {'refused': 'status=refused', 'bad-certificate': 'status=bad_certificate', 'no-key': 'status=key_unreadable',
+                'no-key-file-argument': 'reason=usage', 'http-url': 'status=usage'}[failure]
     if failure == 'refused':
         url = 'https://127.0.0.1:1'
     elif failure == 'bad-certificate':
@@ -1994,7 +2033,7 @@ def test_upload_probe_exits_zero_with_one_line_and_never_prints_the_key(tls_serv
         url = url.replace('https://', 'http://')
     assert probe.main(['--url', url, *args, '--upload-bytes', '1000'], context=context) == 0
     out = capsys.readouterr().out
-    assert out.count('\n') == 1 and 'valid=no' in out or 'reason=usage' in out
+    assert out.count('\n') == 1 and expected in out and 'valid=yes' not in out, out
     assert key not in out and Handler.uploads == []
 
 

@@ -1557,19 +1557,41 @@ SELECT count(*), error_code FROM attachment_enrichment
  WHERE state = 'failed' AND provider = 'deedkit_inference' GROUP BY error_code;
 ```
 
-`retry_exhausted` is a catch-all: list the rows whose last recorded error was not an upload or transcode failure (an
-unreadable file, for example) and leave them out. Requeue the rest in one transaction and keep the returned ids in the
-operation record:
+The error codes alone do not say which rows timed out: `model_http_error` is every non-2xx answer of the mini (its 408
+`upload_timeout`, but also a 422 for an unreadable file) and `retry_exhausted` is a catch-all. So the cohort is frozen
+first, as a positive list, and only that list is requeued.
 
-```sql
-BEGIN;
-UPDATE attachment_enrichment SET state = 'queued', attempts = 0, next_due = clock_timestamp()
- WHERE state = 'failed' AND provider = 'deedkit_inference'
-   AND error_code IN ('model_http_error', 'model_request_failed', 'audio_transcode_size_limit', 'retry_exhausted')
-   AND attachment <> ALL (:left_out)
-RETURNING attachment;
-COMMIT;
-```
+1. Name the storm window (first and last failure, from the mini's access log and the worker log) and freeze the
+   candidates, with their pre-update state, into the operation record (a file, no content):
+
+   ```sql
+   SELECT e.attachment, e.state, e.error_code, e.attempts, e.updated_at, a.mime, a.bytes
+     FROM attachment_enrichment e JOIN attachments a ON a.id = e.attachment
+    WHERE e.state = 'failed' AND e.provider = 'deedkit_inference'
+      AND e.error_code IN ('model_http_error', 'model_request_failed', 'audio_transcode_size_limit', 'retry_exhausted')
+      AND e.updated_at BETWEEN :storm_start AND :storm_end
+    ORDER BY e.updated_at;
+   ```
+2. Keep a row only with evidence that its last attempt was an upload or transcode failure: `audio_transcode_size_limit`
+   and `model_request_failed` (the worker's own timeout) qualify; a `model_http_error` or `retry_exhausted` row
+   qualifies only when the mini's access log (read-only) shows a 408 `upload_timeout` for it in the window, or its bytes
+   exceed what the rate could carry in `upload_seconds`. Every other row (an unreadable file, an auth refusal, an
+   engine failure) is left out and listed with its reason. The kept rows are the frozen cohort: their ids and their
+   `updated_at` values from step 1.
+3. Requeue exactly that cohort, in one transaction, guarded by the state the freeze saw:
+
+   ```sql
+   BEGIN;
+   UPDATE attachment_enrichment e SET state = 'queued', attempts = 0, next_due = clock_timestamp()
+     FROM unnest(:ids::text[], :stamps::timestamptz[]) AS frozen(attachment, updated_at)
+    WHERE e.attachment = frozen.attachment AND e.updated_at = frozen.updated_at
+      AND e.state = 'failed' AND e.provider = 'deedkit_inference'
+   RETURNING e.attachment;
+   COMMIT;
+   ```
+   The guard makes it repeat-safe: a row that has failed again, or was requeued and processed meanwhile, has a newer
+   `updated_at` and is not matched, so its attempts are never reset twice. Compare the returned ids with the frozen
+   cohort and record both.
 
 Undo: a row that fails again returns to `failed` by itself; nothing else changes. The profile's daily job budget still
 applies, so a large cohort can take several days. Track each returned id until it has a stored transcript or

@@ -37,6 +37,7 @@ import re
 import socket
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -151,13 +152,22 @@ def probe(url: str, key_file: str | None, timeout: float, context: ssl.SSLContex
         return f'{line} key=error_bad_response'
 
 
-def error_code(body: bytes) -> str:
-    """The service's `{"error": {"code": ...}}` code, `-` for any other body."""
+def error_code(body: bytes) -> str | None:
+    """The service's `{"error": {"code": ...}}` code exactly as sent, None for any other body."""
     try:
         code = json.loads(body.decode())['error']['code']
     except (ValueError, KeyError, TypeError, UnicodeDecodeError):
-        return '-'
-    return clean(code) if isinstance(code, str) and code else '-'
+        return None
+    return code if isinstance(code, str) and code else None
+
+
+CODE_SHAPE = re.compile(r'[a-z][a-z0-9_]{0,39}')
+
+
+def shown_code(code: str | None, key: str) -> str:
+    """What may be printed of a refusal code: only the service's own shape (short, lower case, digits, underscore) and
+    never text that contains the bearer key; anything else is `-`."""
+    return code if code is not None and CODE_SHAPE.fullmatch(code) and key not in code else '-'
 
 
 def upload_line(size: int, seconds: float, status: str, refusal: str = '-', valid: bool = False) -> str:
@@ -213,6 +223,17 @@ def upload(url: str, key_file: str, size: int, timeout: float, context: ssl.SSLC
                'Content-Length': str(len(head_bytes) + size + len(tail)), 'Accept': 'application/json',
                'Accept-Encoding': 'identity', 'Connection': 'close',
                'X-Request-Deadline-Seconds': str(max(1, int(timeout)))}
+    sock = connection.sock
+
+    def expire() -> None:  # the total deadline: also ends a read that trickles in byte by byte
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    watchdog = threading.Timer(timeout, expire)
+    watchdog.daemon = True
+    watchdog.start()
     try:
         try:
             connection.request('POST', '/v1/audio/transcriptions', body=body(), headers=headers)
@@ -224,14 +245,21 @@ def upload(url: str, key_file: str, size: int, timeout: float, context: ssl.SSLC
         response = connection.getresponse()
         answer = response.read(LIMIT + 1)[:LIMIT]
         elapsed = time.monotonic() - started
-        refusal = error_code(answer)
-        return upload_line(size, elapsed, str(response.status), refusal, response.status == 422 and refusal == 'audio_unreadable')
+        if elapsed >= timeout:
+            raise TimeoutError
+        code = error_code(answer)
+        return upload_line(size, elapsed, str(response.status), shown_code(code, key),
+                           response.status == 422 and code == 'audio_unreadable')
     except (TimeoutError, socket.timeout):
         return upload_line(size, time.monotonic() - started, 'timeout')
     except (OSError, http.client.HTTPException) as exc:
+        elapsed = time.monotonic() - started
+        if elapsed >= timeout:  # the watchdog closed the connection
+            return upload_line(size, elapsed, 'timeout')
         reason = 'bad_response' if isinstance(exc, http.client.HTTPException) else classify(exc)
-        return upload_line(size, time.monotonic() - started, reason)
+        return upload_line(size, elapsed, reason)
     finally:
+        watchdog.cancel()
         connection.close()
 
 
