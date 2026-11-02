@@ -6,6 +6,7 @@ import secrets
 
 from psycopg.types.json import Jsonb
 
+from .field_errors import date_range_refusal
 from .policy import scope_filter,targets
 from .search_query import coverage,filter_values,output_options,shape_messages
 
@@ -37,7 +38,7 @@ def get_updates(store,c,p,consumer,limit=20,*,accounts=None,chats=None,senders=N
         if type(expected_ack_version) is not int or expected_ack_version<0:raise APIError('invalid_version')
     elif expected_ack_version is not None:raise APIError('invalid_version')
     lower,upper=date_bound(from_time),date_bound(to_time)
-    if lower and upper and lower>=upper:raise APIError('invalid_date_range')
+    if lower and upper and lower>=upper:raise date_range_refusal()
     filters={}
     for name,values in [('accounts',accounts),('chats',chats),('senders',senders),('origins',origins),('kinds',kinds)]:
         values=filter_values(values)

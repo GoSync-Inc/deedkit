@@ -56,6 +56,67 @@ def test_message_cursor_valid_shapes_keep_their_own_codes(seeded):
         call(after='q1.'+'A'*4094)
 
 
+CURSOR_EXPECTED = 'a next_cursor returned by the same call with the same filters and order'
+
+
+def assert_cursor_refusal(failure):
+    assert failure.value.code == 'invalid_cursor' and failure.value.status == 400
+    assert failure.value.field_errors == [{'field': 'after', 'reason': 'format', 'expected': CURSOR_EXPECTED}]
+    assert failure.value.next_action == 'restart_query_without_cursor'
+
+
+# spec: ANYM-660
+@pytest.mark.parametrize('cursor', ['not-a-cursor', 'q1.!!!', 'q1.' + 'A' * 40, 'x1.abcd'], ids=['no-prefix-text', 'bad-base64', 'not-json', 'wrong-prefix'])
+def test_malformed_cursor_names_the_cursor_rule_and_the_next_step(seeded, cursor):
+    s, a, _ = seeded
+    for call in (lambda: s.list_chats(a, after=cursor, order='activity'), lambda: s.search(a, limit=1, exclude_channels=True, after=cursor, query='x', view='conversation')):
+        with pytest.raises(APIError, match='invalid_cursor') as failure:
+            call()
+        assert_cursor_refusal(failure)
+
+
+# spec: ANYM-660
+def test_cursor_made_for_other_filters_gets_the_same_refusal_through_search_search_files_and_list_chats(seeded):
+    s, a, _ = seeded
+    search_cursor = s.search(a, limit=1, exclude_channels=True)['next_cursor']
+    assert search_cursor.startswith('q1.')
+    with pytest.raises(APIError, match='invalid_cursor') as changed:
+        s.search(a, limit=1, exclude_channels=False, include_channels=True, after=search_cursor)
+    assert_cursor_refusal(changed)
+    with pytest.raises(APIError, match='invalid_cursor') as files:
+        s.search_files(a, 'x', after=search_cursor)
+    assert_cursor_refusal(files)
+    chats_cursor = s.list_chats(a, limit=1, order='activity')['next_cursor']
+    with pytest.raises(APIError, match='invalid_cursor') as chats:
+        s.list_chats(a, limit=1, order='activity', query='other', after=chats_cursor)
+    assert_cursor_refusal(chats)
+    # The error does not say which filter changed, and a tampered cursor reads the same as a changed filter (ANYM-307).
+    with pytest.raises(APIError, match='invalid_cursor') as tamper:
+        s.list_chats(a, limit=1, order='activity', after=chats_cursor[:-3] + 'AAA')
+    assert (tamper.value.field_errors, tamper.value.next_action) == (chats.value.field_errors, chats.value.next_action)
+
+
+# spec: ANYM-660
+def test_list_chats_position_checks_return_the_cursor_refusal(seeded):
+    s, a, _ = seeded
+    cursor = s.list_chats(a, limit=1, order='activity')['next_cursor']
+    raw = cursor[3:]
+    body = json.loads(base64.urlsafe_b64decode(raw + '=' * (-len(raw) % 4)))
+    body['p']['unexpected'] = 1
+    forged = 'q1.' + base64.urlsafe_b64encode(json.dumps(body, separators=(',', ':')).encode()).decode().rstrip('=')
+    with pytest.raises(APIError, match='invalid_cursor') as failure:
+        s.list_chats(a, limit=1, order='activity', after=forged)
+    assert_cursor_refusal(failure)
+
+
+# spec: ANYM-660
+def test_limit_is_not_part_of_what_a_cursor_binds(seeded):
+    s, a, _ = seeded
+    for call in (lambda limit, **kw: s.search(a, limit=limit, exclude_channels=True, **kw), lambda limit, **kw: s.list_chats(a, limit=limit, order='activity', **kw)):
+        cursor = call(1)['next_cursor']
+        assert call(2, after=cursor)['items']
+
+
 # spec: ANYM-307
 @pytest.mark.parametrize('grouped', [False, True])
 @pytest.mark.parametrize('field,value', matrix([('account', BAD_TEXT), ('sender', BAD_TEXT), ('rank', [-1, 8, '1', None, True, 1.5]),

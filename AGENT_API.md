@@ -35,6 +35,30 @@ Rulebook v1 adds:
 `hint`, `next` and candidates never carry message text, file names or phone numbers taken from a request or a backend
 error; the ANYM-295 privacy allowlist is unchanged.
 
+## Read refusals name the field (ANYM-660)
+
+A refused archive read says which parameter to change, the rule and the next step; codes and HTTP statuses stay.
+`field_errors` entries are `{field, reason, expected?, allowed?}`, built from constants of the code, never from input.
+
+- `capabilities(sections=[...])`: an unknown name is `invalid_filter` with `{field: sections, reason: enum, allowed: [section names]}`
+  (the gateway serves `messages_capabilities` itself and names its own sections); an empty list is `{field: sections, reason: min_items}`
+  with `hint: "omit sections to get all sections"` (the request schemas refuse it first over MCP and REST, as `invalid_parameters`).
+- `list_chats`: one `invalid_filter` response lists every bad filter: `chat_types` (`enum`, allowed `private`, `group`, `channel`,
+  `unknown`), `my_roles` (`enum`, or `min_items` for an empty list with `hint: "omit my_roles for all roles"`) and `can_post`
+  (`type`, expected `boolean`).
+- `invalid_date_range` (`list_chats`, `search`, `get_messages`, `get_updates`, `search_files`, `get_sync_status`):
+  `{field: to_time, reason: minimum, expected: "later than from_time"}` and a hint; the range is half-open, so equal bounds are refused.
+- `invalid_cursor` (every cursor tool): `{field: after, reason: format, expected: "a next_cursor returned by the same call with the same
+  filters and order"}` and `next_action: restart_query_without_cursor`. A cursor binds the principal's scope, the filters and the order;
+  `limit` is not part of it, so a cursor continues with a different `limit`. The error never says which filter changed (the cursor holds
+  only a one-way fingerprint) and a tampered cursor reads the same as a changed filter (ANYM-307).
+- `empty_filter` (`result_evidence.empty_reason`): `empty_fields` names the request parameters whose list is empty (`chat`, `chats`,
+  `account`, `accounts`, `chat_types`) and `next_action` is `fix_filter`: the caller's own list left nothing to search, so change that
+  list. Every other `empty_reason` keeps its `next_action`.
+
+Sites that still return a bare `invalid_filter` or `invalid_cursor` (people, subscriptions, reply dismissals, the remaining
+`search_files` and `get_updates` filters) are the next card's scope.
+
 ## `request_id`
 
 - 8-128 characters of `[a-zA-Z0-9_.:-]`.

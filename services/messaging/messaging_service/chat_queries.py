@@ -3,11 +3,14 @@ import os
 import re
 from psycopg.types.json import Jsonb
 
+from .field_errors import cursor_refusal,date_range_refusal,refusal
 from .policy import scope_filter,targets
 from .search_query import coverage,cursor_binding,decode_cursor,encode_cursor,filter_values,position_date,position_text,valid_text
 from .conversation import meaningful_sql,options
 from .conversation_state import conversation_state,group_thread_query
 from .time_references import owner_zone,passed_reference
+
+CHAT_TYPES=('private','group','channel','unknown')
 
 
 def meaningful(alias='m',metadata='md'):
@@ -333,18 +336,21 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     c.execute('SET LOCAL jit=off')
     accounts=filter_values(accounts);chat_types=filter_values(chat_types)
     exclude_chats=filter_values(exclude_chats);exclude_senders=filter_values(exclude_senders)
-    if chat_types is not None and any(t not in ('private','group','channel','unknown') for t in chat_types):
-        raise APIError('invalid_filter')
     # ANYM-533: the account's own role in a Telegram channel or group; before migration 046 every row reads unknown.
     from .chat_roles import CHAT_ROLE_SCHEMA,ROLES
     from .store import schema_version
     my_roles=filter_values(my_roles);roles_ready=schema_version(c)>=CHAT_ROLE_SCHEMA
+    # ANYM-660: the independent filter checks are collected, so one response names every bad filter.
     # An empty role list asks for nothing: refused, never an empty IN ().
-    if my_roles is not None and (not my_roles or any(r not in ROLES for r in my_roles)) or can_post is not None and type(can_post) is not bool:
-        raise APIError('invalid_filter')
+    bad=[]
+    if chat_types is not None and any(t not in CHAT_TYPES for t in chat_types):bad.append(('chat_types','enum',None,CHAT_TYPES))
+    if my_roles is not None and not my_roles:bad.append(('my_roles','min_items',None,ROLES))
+    elif my_roles is not None and any(r not in ROLES for r in my_roles):bad.append(('my_roles','enum',None,ROLES))
+    if can_post is not None and type(can_post) is not bool:bad.append(('can_post','type','boolean'))
+    if bad:raise refusal('invalid_filter',bad,hint='omit my_roles for all roles' if my_roles==[] else None)
     role_sql="coalesce(c.my_role,'unknown')" if roles_ready else "'unknown'::text"
     lower,upper=date_bound(from_time),date_bound(to_time)
-    if lower and upper and lower>=upper:raise APIError('invalid_date_range')
+    if lower and upper and lower>=upper:raise date_range_refusal()
     scope,args=scope_filter(p,'c',chat_column='id');clauses=[scope]
     aliases,listed=_alias_pairs(accounts,c,p)
     hidden={v['chat']['id']:shown for shown,v in listed.items()}
@@ -395,11 +401,11 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         binding=cursor_binding(p,'chats-conversation-v1',{'archive_binding':binding})
     pos=decode_cursor(after,binding) if after and order!='id' else None
     now=c.execute('SELECT CURRENT_TIMESTAMP AS t').fetchone()['t'];score_at=now
-    if pos and order in ('activity','waiting_longest') and set(pos)!={'id','at'}:raise APIError('invalid_cursor')
+    if pos and order in ('activity','waiting_longest') and set(pos)!={'id','at'}:raise cursor_refusal()
     if pos and order=='priority':
-        if set(pos)!={'id','at','score','as_of'} or type(pos['score']) is not int:raise APIError('invalid_cursor')
+        if set(pos)!={'id','at','score','as_of'} or type(pos['score']) is not int:raise cursor_refusal()
         score_at=position_date(pos['as_of'])
-        if score_at is None or score_at>now:raise APIError('invalid_cursor')
+        if score_at is None or score_at>now:raise cursor_refusal()
     age='true' if not awaiting_reply_days else f"attention.sent_at>=CURRENT_TIMESTAMP-interval '{awaiting_reply_days} days'"
     attention_age='true' if not awaiting_reply_days else f"m.sent_at>=CURRENT_TIMESTAMP-interval '{awaiting_reply_days} days'"
     # ANYM-281: the key's snoozes and the principal's mutes. Literals, because the

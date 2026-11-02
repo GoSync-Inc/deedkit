@@ -3,14 +3,14 @@ from __future__ import annotations
 
 import re
 
-from .chat_queries import title_sql
+from .chat_queries import CHAT_TYPES, title_sql  # noqa: F401  (CHAT_TYPES stays importable from here)
 from .chat_titles import retitle
+from .field_errors import cursor_refusal, date_range_refusal
 from .policy import scope_filter, targets
 from .sender_names import resolve
 from .search_query import (compile_query, coverage, cursor_binding, decode_cursor,
     encode_cursor, filter_values, fingerprint, output_options, position_date, position_text, shape_messages, valid_text)
 
-CHAT_TYPES = ('private','group','channel','unknown')
 
 JOINS = '''JOIN chats ch ON ch.id=m.chat AND ch.account=m.account
     LEFT JOIN sender_profiles sp ON sp.account=m.account AND sp.chat=m.chat AND sp.sender=m.sender
@@ -261,7 +261,7 @@ def filters(p, *, account='',chat='',sender='',accounts=None,chats=None,senders=
         types=[t for t in (CHAT_TYPES if types is None else types) if t!='channel']
     lower,upper=date_bound(from_time),date_bound(to_time)
     if lower and upper and lower>=upper:
-        raise APIError('invalid_date_range')
+        raise date_range_refusal()
     scope,args=scope_filter(p,'m'); clauses=[scope,'NOT m.deleted']
     normalized={'direction':direction,'from_time':lower,'to_time':upper}
     if include_channels:normalized['include_channels']=True
@@ -405,16 +405,16 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
             # A visible membership change is cursor_changed; a hidden one leaves the digest alone.
             if members is not None and position.pop('members',None)!=digest:raise APIError('cursor_changed',409)
             if set(position)!=({'id','at','score','revision','fuzzy','source_order','snapshot'} if conversation else {'id','at','score','revision','fuzzy'}):
-                raise APIError('invalid_cursor')
+                raise cursor_refusal()
             mid=position_text(position['id'])
             at=position_date(position['at'])
             if (at is None or type(position['score']) is not int or not 0<=position['score']<=1000000
                     or type(position['revision']) is not int or type(position['fuzzy']) is not bool
                     or position['fuzzy']!=fuzzy_used):
-                raise APIError('invalid_cursor')
+                raise cursor_refusal()
             anchor=store.message(c,p,mid)
             if conversation:
-                if type(position['source_order']) is not int or not isinstance(position['snapshot'],str):raise APIError('invalid_cursor')
+                if type(position['source_order']) is not int or not isinstance(position['snapshot'],str):raise cursor_refusal()
                 snapshot=read_snapshot()
                 if snapshot!=position['snapshot']:raise APIError('cursor_changed',409)
             if anchor['revision']!=position['revision'] or anchor['sent_at']!=at:
@@ -430,7 +430,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
                     cursor_clause='WHERE (sent_at,id)'+('<' if before or order=='desc' else '>')+'(%s,%s)'
                     cursor_args=[at,mid]
         else:
-            if order=='relevance' or conversation or typed or flat or members is not None:raise APIError('invalid_cursor')
+            if order=='relevance' or conversation or typed or flat or members is not None:raise cursor_refusal()
             anchor=store.message(c,p,cursor)
             cursor_clause='WHERE (sent_at,id)'+('<' if before or order=='desc' else '>')+'(%s,%s)'
             cursor_args=[anchor['sent_at'],anchor['id']]

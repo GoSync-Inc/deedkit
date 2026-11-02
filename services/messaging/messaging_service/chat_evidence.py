@@ -141,6 +141,17 @@ def chat_statuses(c,p,chat_ids,lower=None,upper=None,*,conflict_items=False):
     return result
 
 
+def empty_fields(chat,chats,account,accounts,types):
+    """ANYM-660: the request parameters whose own list left nothing to search; reviewed names, never input."""
+    fields=[]
+    if chat and chats is not None and chat not in chats:fields+=['chat','chats'] if chats else ['chats']
+    elif chats==[]:fields.append('chats')
+    if account and accounts is not None and account not in accounts:fields+=['account','accounts'] if accounts else ['accounts']
+    elif accounts==[]:fields.append('accounts')
+    if types==[]:fields.append('chat_types')
+    return fields
+
+
 def query_evidence(c,p,normalized,items,*,paged=False,include=True):
     """Small summary plus at most20 explicit chat statuses. ACLs precede every count."""
     chat=normalized.get('chat');chats=normalized.get('chats')
@@ -186,6 +197,9 @@ def query_evidence(c,p,normalized,items,*,paged=False,include=True):
         else 'wait_for_provider_cooldown' if reason=='provider_rate_limited'
         else 'list_chats' if reason=='not_found_or_not_permitted'
         else 'inspect_chat' if attention else 'read_context' if items else 'inspect_chat_coverage'}
+    if reason=='empty_filter':
+        # ANYM-660: the caller's own empty list caused this, so the next step is to fix that filter.
+        result.update(empty_fields=empty_fields(chat,chats,account,accounts,types),next_action='fix_filter')
     if include:
         result.update(chats_considered=len(records),chats_not_scanned=sum(h['state']=='not_scanned' for h in histories),
             chats_loading=sum(h['state']=='loading' for h in histories),chats_with_gaps=sum(bool(h['gaps']) for h in histories))

@@ -92,6 +92,28 @@ def test_hidden_and_absent_chats_have_identical_empty_diagnostics(seeded):
     assert s.search(b,accounts=[],query='missing')['result_evidence']['empty_reason']=='empty_filter'
 
 
+# spec: ANYM-660
+@pytest.mark.parametrize('arguments,fields',[({'accounts':[]},['accounts']),({'chats':[]},['chats']),
+    ({'chat_types':[]},['chat_types']),({'chats':['@second'],'chat':'@first'},['chat','chats']),
+    ({'accounts':['telegram-demo'],'account':'whatsapp-demo-1'},['account','accounts']),
+    ({'accounts':[],'chat_types':[]},['accounts','chat_types'])])
+def test_empty_filter_names_the_empty_parameters_and_the_next_step(seeded,arguments,fields):
+    s,a,b=seeded
+    first,second=[row['id'] for row in s.list_chats(a)['items'][:2]]
+    arguments={k:([second] if v==['@second'] else first if v=='@first' else v) for k,v in arguments.items()}
+    evidence=s.search(a,'missing',**arguments)['result_evidence']
+    assert evidence['empty_reason']=='empty_filter'
+    assert evidence['empty_fields']==fields and evidence['next_action']=='fix_filter'
+
+
+# spec: ANYM-660
+def test_other_empty_reasons_keep_their_next_action_and_have_no_empty_fields(seeded):
+    s,a,b=seeded
+    evidence=s.search(a,'zzzznotpresent')['result_evidence']
+    assert evidence['empty_reason']!='empty_filter' and 'empty_fields' not in evidence
+    assert evidence['next_action']!='fix_filter'
+
+
 def test_media_states_match_history_and_context_before_and_after_download(worker):
     w,s,key=worker
     asyncio.run(w.capture(NS(message=message(9,media=True))));w.spool.drain(w.state.apply)
