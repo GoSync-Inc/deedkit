@@ -625,7 +625,7 @@ class VoiceService:
 
     def provider_update(self,identity,**values):
         allowed={'dial_state','provider_call_id','authorization_reference','provider_status','transport',
-                 'owner_instruction','destination_source','destination_evidence','dial_units'}
+                 'owner_instruction','destination_source','destination_evidence','dial_units','provider_error'}
         if set(values)-allowed:
             raise ValueError('invalid_provider_update')
         with self.lock:

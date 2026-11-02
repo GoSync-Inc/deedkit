@@ -29,6 +29,12 @@ ARCHIVE_WORDS = "Call the supplier and ask about the delivery"
 TYPED_WORDS = "Call +1 202 555 0199 and ask about the delivery"
 
 
+def brief_for_view():
+    from outbound import ExternalBrief
+    from test_tasks import BRIEF
+    return ExternalBrief(**BRIEF, channel="phone", account="twilio", destination=PHONE)
+
+
 class Died(BaseException):
     """The process dies inside the provider request: nothing below it catches this."""
 
@@ -282,6 +288,19 @@ def test_source_drift_between_preview_and_dial_is_stale(world):
     assert w.effects == 0
 
 
+# spec: ANYM-657
+def test_the_call_view_carries_the_provider_error_next_to_dial_state_and_end_reason(tmp_path):
+    service = VoiceService(tmp_path)
+    brief = service.prepare(brief_for_view(), [])
+    call = service.start(brief["id"])
+    assert "provider_error" not in call_intent.view(service.get_call(call["id"]), None)
+    error = {"http_status": 400, "code": 21215, "cause": "geo_permission_missing"}
+    service.provider_update(call["id"], dial_state="rejected", provider_status="provider_rejected", provider_error=error)
+    shown = call_intent.view(service.get_call(call["id"]), "req-view-1")
+    assert shown["provider_error"] == error and shown["dial_state"] == "rejected" and "end_reason" in shown
+    service.close()
+
+
 # spec: ANYM-551
 def test_instruction_is_required_and_an_archive_destination_needs_a_token(world):
     w = world()
@@ -374,6 +393,15 @@ def test_an_uncertain_dial_is_unknown_with_the_call_handle_and_never_retried(wor
     assert first["state"] == "unknown" and first["operation"] == {"module": "calls", "id": first["call_id"]}
     assert first["next"]["tool"] == "calls_call_result"
     assert w.tool("p1", "call", args) == first and w.effects == 1
+
+
+# spec: ANYM-657
+def test_other_tools_keep_their_field_errors_for_a_malformed_brief_key(world):
+    w = world()
+    # only prepare_external_call inspects the brief's route; any other model keeps its plain field errors
+    refused = error(w.tool("p1", "call_result", {"call_id": "synthetic", "brief": {
+        "channel": [], "account": "telegram", "destination": "123456789"}}), "invalid_arguments")
+    assert refused["field_errors"] == [{"field": "brief", "reason": "unknown_field"}]
 
 
 # spec: ANYM-551
