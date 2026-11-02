@@ -1,0 +1,11 @@
+[Unit]
+Description=DeedKit family calendar backup freshness check (hourly)
+
+[Timer]
+OnCalendar=*-*-* *:07:00 UTC
+Persistent=true
+AccuracySec=1min
+Unit=deedkit-calendar-backup-fresh.service
+
+[Install]
+WantedBy=timers.target

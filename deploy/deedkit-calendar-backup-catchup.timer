@@ -1,0 +1,11 @@
+[Unit]
+Description=DeedKit family calendar backup catch-up (19:15 UTC, only when the newest snapshot is old)
+
+[Timer]
+OnCalendar=*-*-* 19:15:00 UTC
+Persistent=true
+AccuracySec=1s
+Unit=deedkit-calendar-backup-catchup.service
+
+[Install]
+WantedBy=timers.target
