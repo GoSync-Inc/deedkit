@@ -18,6 +18,7 @@ from .config import Config, load_config
 from .errors import ConfigError, PolicyError
 from . import pausestate
 from .models import ModelError, load_models, verify_all
+from .yielder import YIELD_FILE, load_yield_settings
 
 EXIT_REFUSED = 2
 EXIT_DRAIN_TIMEOUT = 3
@@ -175,7 +176,7 @@ def main(argv=None):
         parser.error("--config or DEEDKIT_INFERENCE_CONFIG is required")
     try:
         config = load_config(args.config)
-        app = create_app(config)
+        app = create_app(config, yield_settings=load_yield_settings(Path(args.config).parent / YIELD_FILE))
     except (ConfigError, PolicyError) as error:
         print(f"deedkit-inference: refusing to start: {error}", file=sys.stderr)
         raise SystemExit(EXIT_REFUSED) from None

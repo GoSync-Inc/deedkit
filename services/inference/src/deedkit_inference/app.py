@@ -21,6 +21,7 @@ from .admission import Admission
 from .config import resolve_release, work_path
 from .engines import EngineEnv, JobInput, Rejected, build_engine
 from .errors import ConfigError, ServiceError
+from . import pausestate
 from .models import ModelError, load_models, phase_key
 from .policy import PolicyStore, bearer
 from .probe import StaticProbe, SystemProbe
@@ -28,6 +29,7 @@ from .quota import Quota
 from .scheduler import Job, Scheduler
 from .schemas import ChatRequest, TranscriptionForm, audio_response, chat_response
 from .uploads import read_audio_form, stream_to_file
+from .yielder import Yielder, YieldSettings
 from .workdir import WorkDir
 
 ACCESS = logging.getLogger("deedkit_inference.access")
@@ -56,6 +58,7 @@ class Context:
         self.bytes_in = 0
         self.started = time.monotonic()
         self.refusal = "-"
+        self.job = None  # the Job this request made, once it exists: the response reports what yielding did to it
 
 
 class Reservation:
@@ -89,7 +92,7 @@ class Reservation:
 
 
 class Service:
-    def __init__(self, config, probe=None, wall=time.time):
+    def __init__(self, config, probe=None, wall=time.time, yield_settings=None, sampler=None):
         self.config = config
         self.release = resolve_release(config)
         if probe is None:
@@ -122,6 +125,12 @@ class Service:
             self.engines[alias] = engine
         self.admission = Admission(config, probe, wall=wall)
         self.scheduler = Scheduler(config, self.admission, probe)
+        # Yielding needs the ledger (a stop is never made without one), which lives in the state directory.
+        self.yielder = None
+        if config.usage_file:
+            ledger = pausestate.Ledger(pausestate.ledger_path(Path(config.usage_file).parent), uuid.uuid4().hex)
+            self.yielder = Yielder(self.scheduler, yield_settings or YieldSettings(), probe, ledger, sampler=sampler,
+                                   wall=wall)
         self.draining = False
         self.pool_used = 0
         self.jobs_inflight = 0
@@ -132,6 +141,8 @@ class Service:
         deadline and kill what is left. True when everything finished."""
         self.draining = True
         self.scheduler.draining = True
+        if self.yielder is not None:
+            self.yielder.disable()  # a stopped phase never finishes: the drain would wait out drain_seconds
         deadline = time.monotonic() + self.config.drain_seconds
         while (not self.scheduler.idle() or self.jobs_inflight > 0) and time.monotonic() < deadline:
             await asyncio.sleep(0.05)
@@ -290,6 +301,8 @@ def endpoint(counts_job=False):
                     service.jobs_inflight -= 1
                 log_line(ctx, status)
             response.headers["X-Request-Id"] = ctx.rid
+            if ctx.job is not None:
+                response.headers["X-Paused-Seconds"] = f"{service.scheduler.paused_seconds(ctx.job):.3f}"
             return response
 
         run.__name__ = fn.__name__
@@ -305,15 +318,19 @@ def log_line(ctx, status):
     )
 
 
-def create_app(config, probe=None, wall=time.time):
-    service = Service(config, probe, wall)
+def create_app(config, probe=None, wall=time.time, yield_settings=None, sampler=None):
+    service = Service(config, probe, wall, yield_settings, sampler)
 
     @asynccontextmanager
     async def lifespan(app):
         service.scheduler.start()
+        if service.yielder is not None:
+            service.yielder.start()
         try:
             yield
         finally:
+            if service.yielder is not None:
+                await service.yielder.stop()  # continues every group it stopped, before the scheduler kills them
             await service.scheduler.stop()
             service.workdir.close()
 
@@ -376,6 +393,7 @@ def create_app(config, probe=None, wall=time.time):
                                  {"language": form.language, "response_format": form.response_format})
             await service.precheck(engine, job_input.paths)
             job = await service.new_job(ctx, reservation.auth, spec, engine, job_input, request.state.deadline)
+            ctx.job = job
             task = service.scheduler.admit(job, reservation.auth.principal, service.quota)
             result = await service.await_job(request, task)
             return JSONResponse(audio_response(result, form.response_format == "verbose_json"))
@@ -411,6 +429,7 @@ def create_app(config, probe=None, wall=time.time):
                                  {"max_tokens": chat_request.max_tokens or spec.default_max_tokens})
             await service.precheck(engine, images)
             job = await service.new_job(ctx, reservation.auth, spec, engine, job_input, request.state.deadline)
+            ctx.job = job
             task = service.scheduler.admit(job, reservation.auth.principal, service.quota)
             result = await service.await_job(request, task)
             return JSONResponse(chat_response(ctx.rid, int(time.time()), ctx.alias, result))

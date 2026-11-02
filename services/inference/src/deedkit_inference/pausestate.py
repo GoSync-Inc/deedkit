@@ -24,7 +24,10 @@ import time
 
 LEDGER_NAME = "paused.json"
 VERSION = 1
-PS = ["/bin/ps", "-axo", "pid=,pgid=,stat=,lstart="]
+PS = ["/bin/ps", "-axo", "pid=,pgid=,stat=,lstart=,ppid="]
+#: A helper may start between the ledger write and the freeze, in a later second than the recorded one: it is owned when it
+#: started within this many seconds after that second AND descends from an owned member (see `members`).
+LATE_SECONDS = 10.0
 START_FORMAT = "%a %b %d %H:%M:%S %Y"
 SETTLE_POLLS = 20
 SETTLE_SECONDS = 0.1
@@ -39,7 +42,8 @@ def ledger_path(state_dir: str | Path) -> Path:
 
 
 def process_table(run_ps: Callable[[], str] | None = None) -> list[dict]:
-    """[{pid, pgid, stat, start (epoch seconds), started (the lstart text)}] for every process."""
+    """[{pid, pgid, stat, start (epoch seconds), started (the lstart text), ppid (None when the table has no such column)}]
+    for every process."""
     try:
         text = run_ps() if run_ps else subprocess.run(
             PS, capture_output=True, text=True, timeout=10, check=True, stdin=subprocess.DEVNULL,
@@ -56,7 +60,8 @@ def process_table(run_ps: Callable[[], str] | None = None) -> list[dict]:
         started = " ".join(fields[3:8])
         try:
             start = time.mktime(time.strptime(started, START_FORMAT))
-            rows.append({"pid": int(fields[0]), "pgid": int(fields[1]), "stat": fields[2], "start": start, "started": started})
+            rows.append({"pid": int(fields[0]), "pgid": int(fields[1]), "stat": fields[2], "start": start, "started": started,
+                         "ppid": int(fields[8]) if len(fields) > 8 else None})
         except (ValueError, OverflowError):
             raise LedgerError("unreadable ps line") from None
     return rows
@@ -145,7 +150,7 @@ def unlink_quietly(path: Path) -> None:
 
 
 def members(group: dict, table: list[dict]) -> list[dict]:
-    """The processes that belong to a ledgered group (see the module docstring). `lstart` has a resolution of one second
+    """The processes that belong to a ledgered group (see the module docstring and LATE_SECONDS). `lstart` has a resolution of one second
     and truncates, so a member's printed start is at most the whole second of the stop; a process printed in a later
     second is not a member, whatever its pgid. When the process that has the pgid as its pid exists and started at another
     time than the leader did, the number was reused and the whole group is gone (a kernel keeps a pid while its group is
@@ -154,7 +159,22 @@ def members(group: dict, table: list[dict]) -> list[dict]:
     if leader is not None and leader["started"] != group["leader_start"]:
         return []
     cutoff = math.floor(group["stopped_at"])
-    return [row for row in table if row["pgid"] == group["pgid"] and row["stat"].startswith("T") and row["start"] <= cutoff]
+    stopped = [row for row in table if row["pgid"] == group["pgid"] and row["stat"].startswith("T")]
+    found = [row for row in stopped if row["start"] <= cutoff]
+    # The ledger is written just BEFORE the freeze: a helper started in between carries a later second. It is a member
+    # when it is stopped in the group, started within LATE_SECONDS of the record and descends from a member; a process of
+    # a group number that was reused has no member as an ancestor, so it is never claimed this way.
+    owned = {row["pid"] for row in found}
+    late = [row for row in stopped if cutoff < row["start"] <= cutoff + LATE_SECONDS and row["ppid"] is not None]
+    grew = True
+    while grew:
+        grew = False
+        for row in late:
+            if row["pid"] not in owned and row["ppid"] in owned:
+                owned.add(row["pid"])
+                found.append(row)
+                grew = True
+    return found
 
 
 def recover(path: str | Path, run_ps: Callable[[], str] | None = None,

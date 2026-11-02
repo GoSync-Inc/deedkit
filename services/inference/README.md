@@ -188,6 +188,40 @@ admission closed. The supervisor kills the largest engine child when all childre
 not JSON, other types, `ts` older than 30 seconds or more than 30 seconds in the future) counts as busy.
 The service only reads the file, never writes it.
 
+### Yielding (ANYM-691)
+
+Admission only closes the door for NEW work. A phase that is already executing is stopped (`SIGSTOP` on its process group)
+by the `Yielder`, a task of its own (the memory supervisor is not touched), while the busy file is valid and fresh, a flag in
+`pause_on` is true and the foreign CPU (the Between VM user and the remote-test user, per-process `ps` cputime deltas; the
+service's own children and the load average are not counted) is at least `pause_min_foreign_cores`, on two consecutive
+ticks of `supervise_interval_seconds`. It continues (`SIGCONT`) when no `pause_on` flag has been true for
+`resume_after_seconds`, or at once when the file is missing, invalid or stale or anything in the yielder fails (back to Nice 20
+alone). A stopped group keeps its memory: the pause buys CPU for Between and the tests and costs RAM-minutes.
+**Off by default.** Known residual (ANYM-691 PR 3 closes it before anything enables the feature): a crash of the service right after
+the stop, followed by the kill of the parent of a helper that started in the milliseconds between the ledger write and the
+stop, can leave that one helper stopped and unowned by recovery (`pausestate.members`).
+
+- Only the last phase of a job, from its spawn (a child) or from the moment its call is sent (a worker). Not paused:
+  loading, model-hash preparation, idle warm workers, earlier phases of a multi-phase job, a phase with less than
+  `min_remaining_seconds` of estimate left, and a worker that is decoding: a decode helper runs behind the marker
+  `<scratch>/nopause` (made by `media.run_tool`), the service looks for it right after the stop and continues the group at once.
+- Budget per job: the smaller of `max_pause_seconds` and the slack to the request's `X-Request-Deadline-Seconds`
+  (`deadline - elapsed - max(deadline_margin_seconds, K * left) - left`, K = `deadline_safety_factor`, computed when the
+  pause starts); no positive slack means no pause. A phase that is slower than K times its estimate can still miss the
+  deadline: a `yield-job:` line with `paused>0`, `total` beyond `deadline` and an outcome other than `ok` is that loss.
+- The phase timeout and `estimated_wait` exclude the stopped time. The response carries `X-Paused-Seconds`.
+- Before every stop the group is written to `state/paused.json` (see `recover`); a drain continues every paused group first.
+- Settings: the optional `yield.json` next to `config.json` (same owner, not writable by others; read at start; absent,
+  unreadable or invalid means the defaults and one logged line, never a failed start): `enabled` **false (ships off:
+  turning it on needs `{"enabled": true}` here, gated on ANYM-691 PR 3, below)**, `pause_on`
+  `["between", "deedkit_ci"]`, `pause_min_foreign_cores` 1.0, `resume_after_seconds` 10, `min_remaining_seconds` 20,
+  `max_pause_seconds` 300, `deadline_margin_seconds` 10, `deadline_safety_factor` 3. `config.json` is unchanged (it rejects
+  unknown fields, and a rollback only switches the release). `/health` is unchanged.
+- Log lines (counts and durations, never content): at each resume `yield: job=<id> paused=<s> flags=<..> foreign_cores_mean=<n>
+  wasted=<s> budget_exhausted=<0|1>`; at each end of a job that was paused or ran under a flag `yield-job: job=<id> alias=<a>
+  phase=<p> est=<s> deadline=<s|none> paused=<s> excluded=<s> total=<s> outcome=<ok|engine_timeout|client_gone|error>`.
+  `job` is a random id for the log only; `excluded` is the time the job ran under a flag and could not be paused.
+
 ## Queue and deadlines
 
 - At most `queue_size` jobs wait; a full queue is `503 queue_full`. A job is queued, and a free slot granted, in one step, so a burst cannot exceed the bound; a job that must wait for resident room counts too, and so does a running job that will wait again for a later phase.

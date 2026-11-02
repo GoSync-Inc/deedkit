@@ -7,6 +7,7 @@ import sys
 import time
 
 from .fake import directive
+from .ticker import tick
 
 
 def main():
@@ -27,6 +28,8 @@ def main():
     if mode == "hang":
         while True:
             time.sleep(1)
+    if d.get("tick") and d.get("tick_phase", index) == index:
+        tick(d["tick"], int(d.get("ticks", 100)))
     time.sleep(float(d.get("sleep", 0)))
     if mode == "garbage":
         sys.stdout.write("not json {")

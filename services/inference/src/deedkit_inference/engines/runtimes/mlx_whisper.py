@@ -39,7 +39,8 @@ class Runtime:
         from mlx_whisper.audio import N_SAMPLES, load_audio, log_mel_spectrogram, pad_or_trim
 
         wav = os.path.join(self.options["scratch"], "langid.wav")
-        if not media.chunk_wav(self.options["ffmpeg"], job["files"][0], 0.0, 30.0, wav, 120.0):
+        if not media.chunk_wav(self.options["ffmpeg"], job["files"][0], 0.0, 30.0, wav, 120.0,
+                              os.path.join(self.options["scratch"], media.MARKER_NAME)):
             raise RuntimeError("decode_failed")
         try:
             audio = pad_or_trim(load_audio(wav), N_SAMPLES)

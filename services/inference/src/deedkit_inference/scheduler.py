@@ -11,6 +11,7 @@ import logging
 import shutil
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -39,6 +40,17 @@ class Job:
     proc: asyncio.subprocess.Process | None = None
     kill_reason: str | None = None
     state: dict = field(default_factory=dict)  # what finished phases left for the next ones ("done", the language)
+    # ANYM-691: what yielding did to this job (yielder.py). `log_id` exists for the yield log lines only.
+    log_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    paused: float = 0.0  # seconds its process group stood stopped, closed episodes
+    paused_since: float | None = None  # monotonic time of the open episode
+    excluded: float = 0.0  # seconds it ran under a busy flag and could not be paused
+    busy_seen: bool = False
+    budget_exhausted: bool = False
+    no_pause: bool = False  # the budget is used or the deadline leaves no slack: the phase runs on at Nice 20
+    phase_timeout: object = None  # the asyncio.Timeout of the phase now executing
+    timeout_left: float | None = None  # what the phase timeout had left when the group was stopped
+    last_phase: str = "-"
 
     def remaining(self):
         return self.engine.plan(self.spec, self.input, self.state)
@@ -128,8 +140,28 @@ class Scheduler:
         slot = self.slots[slot_name]
         total = sum(w.est for w in slot.queue)
         if slot.running:
-            total += max(0.0, slot.running.est - (self.now() - slot.running.started))
+            running = slot.running
+            total += max(0.0, running.est - (self.now() - running.started - self.paused_seconds(running.job)))
         return total
+
+    def paused_seconds(self, job):
+        """Seconds the job's group stood stopped, the open episode included: time that is not progress."""
+        return job.paused + (0.0 if job.paused_since is None else max(0.0, self.now() - job.paused_since))
+
+    def hold_timeout(self, job):
+        """The group is stopped: the phase timeout stops with it (a stopped phase must not time out as a hang)."""
+        budget = job.phase_timeout
+        if budget is None or budget.when() is None or job.timeout_left is not None:
+            return
+        job.timeout_left = max(0.0, budget.when() - asyncio.get_running_loop().time())
+        with contextlib.suppress(RuntimeError):
+            budget.reschedule(None)
+
+    def release_timeout(self, job):
+        left, budget, job.timeout_left = job.timeout_left, job.phase_timeout, None
+        if left is not None and budget is not None:
+            with contextlib.suppress(RuntimeError):  # the phase ended meanwhile
+                budget.reschedule(asyncio.get_running_loop().time() + left)
 
     def children(self):
         return [s.running.job for s in self.slots.values() if s.running and s.running.job.proc]
@@ -201,6 +233,7 @@ class Scheduler:
     def _finished(self, task, job):
         """Safety net: whatever way the task ended (even cancelled before its first step), the job holds nothing."""
         self.tasks.discard(task)
+        self._log_yield(task, job)
         for slot in self.slots.values():
             for waiter in [w for w in slot.queue if w.job is job]:
                 slot.queue.remove(waiter)
@@ -209,6 +242,22 @@ class Scheduler:
                 slot.running = None
         self._pump_all()
 
+    def _log_yield(self, task, job):
+        """One content-free line for a job that was paused or ran under a busy flag (ANYM-691 criterion 2)."""
+        paused = self.paused_seconds(job)
+        if paused <= 0 and not job.busy_seen:
+            return
+        if task.cancelled():
+            outcome = "client_gone"
+        elif task.exception() is None:
+            outcome = "ok"
+        else:
+            outcome = "engine_timeout" if getattr(task.exception(), "code", None) == "engine_timeout" else "error"
+        deadline = "none" if job.deadline is None else f"{job.deadline:.1f}"
+        LOG.info("yield-job: job=%s alias=%s phase=%s est=%.1f deadline=%s paused=%.1f excluded=%.1f total=%.1f "
+                 "outcome=%s", job.log_id, job.alias, job.last_phase, job.estimate, deadline, paused, job.excluded,
+                 self.now() - job.accepted, outcome)
+
     # --- running a job -------------------------------------------------------------------------------------
     async def _run(self, job, first_waiter):
         """The phases the engine plans, one after the other; the plan is asked again after each, because what a
@@ -216,6 +265,7 @@ class Scheduler:
         done = job.state.setdefault("done", [])
         while remaining := job.remaining():
             index, phase = len(done), remaining[0]
+            job.last_phase = phase.name
             await self._enter(job, index, phase, remaining, first_waiter if index == 0 else None)
             try:
                 await self._execute(job, index, phase, len(remaining))
@@ -343,7 +393,9 @@ class Scheduler:
         job.proc = proc
         reader = asyncio.create_task(self._read_capped(proc))
         try:
-            await asyncio.wait_for(proc.wait(), job.spec.timeout_seconds)
+            async with asyncio.timeout(job.spec.timeout_seconds) as budget:  # reschedulable: a pause stops its clock
+                job.phase_timeout = budget
+                await proc.wait()
             # The child is gone: whatever it left behind in its group goes too, so no orphan keeps the pipe open.
             kill_group(proc.pid)
             stdout = await asyncio.wait_for(reader, 5)
@@ -354,7 +406,7 @@ class Scheduler:
             reader.cancel()
             with contextlib.suppress(Exception):
                 await asyncio.shield(proc.wait())
-            job.proc = None
+            job.proc = job.phase_timeout = job.timeout_left = None
         if job.kill_reason or proc.returncode != 0 or stdout is None:
             raise ServiceError(502, "engine_failed", "the engine failed")
         return stdout
@@ -392,7 +444,8 @@ class Scheduler:
         times out or is cancelled mid-job dies with its group, so no half-answered job is ever reused."""
         engine, worker = job.engine, job.engine.workers.get(phase.name)
         try:
-            async with asyncio.timeout(job.spec.timeout_seconds):
+            async with asyncio.timeout(job.spec.timeout_seconds) as budget:
+                job.phase_timeout = budget
                 if worker is None or not worker.alive():
                     self._discard_worker(engine, phase.name, worker)
                     running = self.slots[phase.slot].running
@@ -426,6 +479,7 @@ class Scheduler:
             self._discard_worker(engine, phase.name, worker)
             raise
         finally:
+            job.phase_timeout = job.timeout_left = None
             if worker is not None:
                 worker.job = None
 

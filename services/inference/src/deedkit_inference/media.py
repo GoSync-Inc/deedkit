@@ -10,6 +10,9 @@ SNIFF_BYTES = 1 << 20
 JPEG_SOF = frozenset({0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF})
 TOOL_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 CHUNK_SECONDS = 600
+#: ANYM-691 criterion 1: while a decode helper of a worker runs, `<scratch>/nopause` exists and the service never leaves
+#: the worker's group stopped (a stopped decoder would spend its `communicate` deadline asleep).
+MARKER_NAME = "nopause"
 
 
 def _webp(head):
@@ -59,26 +62,42 @@ def image_size(path):
     return None
 
 
-def run_tool(argv, timeout, env=None, own_group=True):
+def _mark(marker):
+    """Create the no-pause marker. A failure raises: a decoder that cannot be protected from a pause does not start
+    (the scratch directory also holds the decoded window, so a scratch that cannot be written fails the job anyway)."""
+    os.close(os.open(marker, os.O_WRONLY | os.O_CREAT, 0o600))
+
+
+def run_tool(argv, timeout, env=None, own_group=True, marker=None):
     """Run a helper with a timeout; (returncode, stdout) or (None, b"") on a timeout. `own_group=False` keeps it in
     the caller's process group: inside a worker that is the worker's group, so killing the worker kills the helper
-    and the supervisor counts its memory with the worker's."""
-    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                               env=env or {"PATH": TOOL_PATH}, start_new_session=own_group)
+    and the supervisor counts its memory with the worker's. `marker` is the path of the no-pause marker that exists
+    from before the helper starts until it is done."""
+    if marker is not None:
+        _mark(marker)
     try:
-        out, _ = process.communicate(timeout=timeout)
-        return process.returncode, out
-    except subprocess.TimeoutExpired:
-        return None, b""
-    finally:
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   env=env or {"PATH": TOOL_PATH}, start_new_session=own_group)
         try:
-            if own_group:
-                os.killpg(process.pid, signal.SIGKILL)
-            else:
-                process.kill()
-        except (ProcessLookupError, PermissionError):
-            pass
-        process.wait()
+            out, _ = process.communicate(timeout=timeout)
+            return process.returncode, out
+        except subprocess.TimeoutExpired:
+            return None, b""
+        finally:
+            try:
+                if own_group:
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except (ProcessLookupError, PermissionError):
+                pass
+            process.wait()
+    finally:
+        if marker is not None:
+            try:
+                os.unlink(marker)
+            except OSError:
+                pass
 
 
 def probe_duration(path, ffprobe, timeout=20.0):
@@ -94,12 +113,12 @@ def probe_duration(path, ffprobe, timeout=20.0):
     return value
 
 
-def chunk_wav(ffmpeg, source, offset, length, destination, timeout):
+def chunk_wav(ffmpeg, source, offset, length, destination, timeout, marker=None):
     """One window of `source` as 16 kHz mono 16-bit WAV. False when ffmpeg failed or produced nothing. Only workers
     call it, so ffmpeg stays in the worker's process group (see run_tool)."""
     code, _ = run_tool([ffmpeg, "-nostdin", "-v", "error", "-y", "-ss", f"{offset:.3f}", "-t", f"{length:.3f}",
                         "-i", str(source), "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-f", "wav",
-                        str(destination)], timeout, own_group=False)
+                        str(destination)], timeout, own_group=False, marker=marker)
     try:
         return code == 0 and os.path.getsize(destination) > 44
     except OSError:
@@ -120,10 +139,10 @@ def find_tool(name, option=None):
 def iter_chunks(ffmpeg, source, duration, scratch, window=CHUNK_SECONDS, timeout=180.0):
     """(offset, length, wav path) for consecutive windows of `source`; the WAV is replaced for the next window, so
     at most one window of decoded audio exists at a time. RuntimeError when ffmpeg cannot decode a window."""
-    path, offset = os.path.join(scratch, "window.wav"), 0.0
+    path, offset, marker = os.path.join(scratch, "window.wav"), 0.0, os.path.join(scratch, MARKER_NAME)
     while offset < duration:
         length = min(float(window), duration - offset)
-        if not chunk_wav(ffmpeg, source, offset, length, path, timeout):
+        if not chunk_wav(ffmpeg, source, offset, length, path, timeout, marker):
             raise RuntimeError("decode_failed")
         try:
             yield offset, length, path
