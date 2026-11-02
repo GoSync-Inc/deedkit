@@ -1122,6 +1122,9 @@ def test_a_continued_survivor_that_left_the_group_keeps_its_entry_and_is_killed_
 
     report = PAUSE.recover(ledger.path, run_ps=table, send=send, sleep=lambda seconds: None)
     assert report['kept'] == [700] and [g['pgid'] for g in ledger.groups()] == [700]  # by identity, not by its new pgid
+    # a retry that fails to kill it again (it already left the group, so only the persisted identity finds it) keeps the entry
+    report = PAUSE.recover(ledger.path, run_ps=table, send=send, sleep=lambda seconds: None)
+    assert report['kept'] == [700] and [g['pgid'] for g in ledger.groups()] == [700]
     state['kill_works'] = True
     state['sent'].clear()
     report = PAUSE.recover(ledger.path, run_ps=table, send=send, sleep=lambda seconds: None)
