@@ -712,121 +712,156 @@ class Parts:
             raise interrupted
 
 
+def receive_duplicate(config, client, header, bid, state_fd):
+    """A logical ID already stored or in flight: the duplicate result, or None for a new upload."""
+    attempt = state_read(state_fd, attempt_name(bid))
+    if attempt is not None:
+        validate_attempt(config, attempt, bid)
+        if attempt['header']['snapshot_sha256'] != header['snapshot_sha256']:
+            raise ValueError('backup_id_conflict')
+        saved = reconcile(config, client, attempt, state_fd)
+        return {**saved['wire'], 'duplicate': True}
+    saved = get_receipt(config, client, bid)
+    if saved is not None:
+        if saved['wire']['snapshot_sha256'] != header['snapshot_sha256']:
+            raise ValueError('backup_id_conflict')
+        verify_object(config, client, saved)
+        return {**saved['wire'], 'duplicate': True}
+    return None
+
+
+def receive_open(config, client, header, bid, state_fd):
+    """Refuse unresolved attempts and a full receiver, journal the new attempt and open its multipart upload;
+    returns the attempt, its object key and the upload ID."""
+    # Unknown attempts in another logical ID block further full candidates.
+    for name in os.listdir(state_fd):
+        if name.endswith('.attempt.json'):
+            other_id = name[:-len('.attempt.json')]; valid_id(other_id)
+            other = validate_attempt(config, state_read(state_fd, name), other_id)
+            if other['phase'] != 'committed':
+                raise RuntimeError('unresolved_upload_required')
+    objects = inventory(config, client)
+    if len(objects) >= config['max_objects'] or sum(objects.values()) + header['max_bytes'] > config['quota_bytes']:
+        raise RuntimeError('receiver_quota')
+    key = config['prefix'] + '/objects/' + bid + '-' + secrets.token_hex(16) + '.tar.age'
+    attempt = {'v': 1, 'destination': destination(config), 'header': header, 'key': key,
+               'phase': 'creating', 'upload_id': None, 'receipt': None}
+    state_write(state_fd, attempt_name(bid), attempt)
+    created = cloud_call(client.create_multipart_upload, Bucket=config['bucket'], Key=key, ContentType='application/octet-stream')
+    upload_id = created.get('UploadId')
+    if not isinstance(upload_id, str) or not 1 <= len(upload_id) <= 1024:
+        raise ValueError('invalid_upload_id')
+    attempt['upload_id'] = upload_id; attempt['phase'] = 'uploading'
+    state_write(state_fd, attempt_name(bid), attempt)
+    return attempt, key, upload_id
+
+
+def receive_stream(config, source, header, uploads):
+    """Read the framed backup into parts and check its footer; returns the digest and the size."""
+    digest = hashlib.sha256(); size = 0; prefix = b''; part_bytes = config['part_bytes']
+    # Each part fills its own exact-size buffer, which is handed over, never copied.
+    buffer = None; filled = 0
+    while True:
+        with uploads.window():
+            length = struct.unpack('!I', local.exact_read(source, 4))[0]
+        if length == 0:
+            break
+        if length > MIB:
+            raise ValueError('invalid_backup_frame')
+        if size + length > header['max_bytes']:
+            raise ValueError('backup_size_mismatch')
+        with uploads.window():
+            data = local.exact_read(source, length)
+        size += length; digest.update(data)
+        if len(prefix) < len(AGE_HEADER):
+            prefix += data[:len(AGE_HEADER) - len(prefix)]
+        view = memoryview(data)
+        while view:
+            if buffer is None:
+                buffer = bytearray(part_bytes); filled = 0
+            take = min(len(view), part_bytes - filled)
+            buffer[filled:filled + take] = view[:take]; filled += take; view = view[take:]
+            if filled == part_bytes:
+                full, buffer = buffer, None
+                uploads.add(full); full = None
+        view = data = None
+    with uploads.window():
+        raw = source.readline(4097)
+    if len(raw) > 4096 or not raw.endswith(b'\n'):
+        raise ValueError('truncated_backup')
+    footer = unique_json(raw)
+    if (not isinstance(footer, dict) or set(footer) != {'bytes', 'sha256'} or
+            type(footer['bytes']) is not int or footer['bytes'] != size or size < 64):
+        raise ValueError('backup_size_mismatch')
+    if footer['sha256'] != digest.hexdigest():
+        raise ValueError('backup_hash_mismatch')
+    with uploads.window():
+        tail = source.read(1)
+    if tail:
+        raise ValueError('backup_size_mismatch')
+    if prefix != AGE_HEADER:
+        raise ValueError('encrypted_backup_required')
+    if buffer is not None and filled:
+        del buffer[filled:]
+        full, buffer = buffer, None
+        uploads.add(full); full = None
+    return digest, size
+
+
+def receive_completing(config, state_fd, attempt, bid, header, key, digest, size):
+    """Journal the receipt in the `completing` phase, before CompleteMultipartUpload."""
+    wire = {'v': 2, 'status': 'stored', 'id': bid, 'bytes': size, 'sha256': digest.hexdigest(),
+            'snapshot_sha256': header['snapshot_sha256'], 'duplicate': False,
+            'received_at': datetime.now(timezone.utc).isoformat()}
+    attempt['receipt'] = {'v': 1, 'destination': destination(config), 'object_key': key, 'wire': wire}
+    attempt['phase'] = 'completing'
+    state_write(state_fd, attempt_name(bid), attempt)
+
+
+def receive_abort(config, client, uploads, key, upload_id, bid, state_fd):
+    uploads.stop()
+    cloud_call(client.abort_multipart_upload, Bucket=config['bucket'], Key=key, UploadId=upload_id)
+    os.unlink(attempt_name(bid), dir_fd=state_fd); local.fsync_dir(state_fd)
+
+
+def receive_complete(config, client, key, upload_id, parts, attempt, state_fd):
+    """Complete the multipart upload, verify the stored object and publish the logical ID; returns its wire."""
+    try:
+        client.complete_multipart_upload(Bucket=config['bucket'], Key=key, UploadId=upload_id,
+                                         MultipartUpload={'Parts': parts})
+    except Exception:
+        raise RuntimeError('completion_outcome_unknown') from None
+    # A successful multipart acknowledgement plus an actual body verification
+    # precedes publishing the logical ID. No ETag equality is assumed.
+    verify_object(config, client, attempt['receipt'])
+    result = publish(config, client, attempt, state_fd)
+    return result['wire']
+
+
 def receive(config, source, *, client=None, respond=None):
     header = read_header(config, source); bid = header['id']
     client = client if client is not None else make_client(config)
     with state_lock(config) as state_fd:
-        attempt = state_read(state_fd, attempt_name(bid))
-        if attempt is not None:
-            validate_attempt(config, attempt, bid)
-            if attempt['header']['snapshot_sha256'] != header['snapshot_sha256']:
-                raise ValueError('backup_id_conflict')
-            saved = reconcile(config, client, attempt, state_fd)
-            return {**saved['wire'], 'duplicate': True}
-        saved = get_receipt(config, client, bid)
-        if saved is not None:
-            if saved['wire']['snapshot_sha256'] != header['snapshot_sha256']:
-                raise ValueError('backup_id_conflict')
-            verify_object(config, client, saved)
-            return {**saved['wire'], 'duplicate': True}
-        # Unknown attempts in another logical ID block further full candidates.
-        for name in os.listdir(state_fd):
-            if name.endswith('.attempt.json'):
-                other_id = name[:-len('.attempt.json')]; valid_id(other_id)
-                other = validate_attempt(config, state_read(state_fd, name), other_id)
-                if other['phase'] != 'committed':
-                    raise RuntimeError('unresolved_upload_required')
-        objects = inventory(config, client)
-        if len(objects) >= config['max_objects'] or sum(objects.values()) + header['max_bytes'] > config['quota_bytes']:
-            raise RuntimeError('receiver_quota')
-        key = config['prefix'] + '/objects/' + bid + '-' + secrets.token_hex(16) + '.tar.age'
-        attempt = {'v': 1, 'destination': destination(config), 'header': header, 'key': key,
-                   'phase': 'creating', 'upload_id': None, 'receipt': None}
-        state_write(state_fd, attempt_name(bid), attempt)
-        created = cloud_call(client.create_multipart_upload, Bucket=config['bucket'], Key=key, ContentType='application/octet-stream')
-        upload_id = created.get('UploadId')
-        if not isinstance(upload_id, str) or not 1 <= len(upload_id) <= 1024:
-            raise ValueError('invalid_upload_id')
-        attempt['upload_id'] = upload_id; attempt['phase'] = 'uploading'
-        state_write(state_fd, attempt_name(bid), attempt)
+        duplicate = receive_duplicate(config, client, header, bid, state_fd)
+        if duplicate is not None:
+            return duplicate
+        attempt, key, upload_id = receive_open(config, client, header, bid, state_fd)
         uploads = Parts(config, client, key, upload_id)
         with uploads.held():
             try:
                 if respond:
                     respond({'v': 2, 'status': 'ready', 'id': bid, 'snapshot_sha256': header['snapshot_sha256']})
-                digest = hashlib.sha256(); size = 0; prefix = b''; part_bytes = config['part_bytes']
-                # Each part fills its own exact-size buffer, which is handed over, never copied.
-                buffer = None; filled = 0
-                while True:
-                    with uploads.window():
-                        length = struct.unpack('!I', local.exact_read(source, 4))[0]
-                    if length == 0:
-                        break
-                    if length > MIB:
-                        raise ValueError('invalid_backup_frame')
-                    if size + length > header['max_bytes']:
-                        raise ValueError('backup_size_mismatch')
-                    with uploads.window():
-                        data = local.exact_read(source, length)
-                    size += length; digest.update(data)
-                    if len(prefix) < len(AGE_HEADER):
-                        prefix += data[:len(AGE_HEADER) - len(prefix)]
-                    view = memoryview(data)
-                    while view:
-                        if buffer is None:
-                            buffer = bytearray(part_bytes); filled = 0
-                        take = min(len(view), part_bytes - filled)
-                        buffer[filled:filled + take] = view[:take]; filled += take; view = view[take:]
-                        if filled == part_bytes:
-                            full, buffer = buffer, None
-                            uploads.add(full); full = None
-                    view = data = None
-                with uploads.window():
-                    raw = source.readline(4097)
-                if len(raw) > 4096 or not raw.endswith(b'\n'):
-                    raise ValueError('truncated_backup')
-                footer = unique_json(raw)
-                if (not isinstance(footer, dict) or set(footer) != {'bytes', 'sha256'} or
-                        type(footer['bytes']) is not int or footer['bytes'] != size or size < 64):
-                    raise ValueError('backup_size_mismatch')
-                if footer['sha256'] != digest.hexdigest():
-                    raise ValueError('backup_hash_mismatch')
-                with uploads.window():
-                    tail = source.read(1)
-                if tail:
-                    raise ValueError('backup_size_mismatch')
-                if prefix != AGE_HEADER:
-                    raise ValueError('encrypted_backup_required')
-                if buffer is not None and filled:
-                    del buffer[filled:]
-                    full, buffer = buffer, None
-                    uploads.add(full); full = None
+                digest, size = receive_stream(config, source, header, uploads)
                 # Joins every worker and lets a held deadline through before `completing`.
                 parts = uploads.finish()
-                wire = {'v': 2, 'status': 'stored', 'id': bid, 'bytes': size, 'sha256': digest.hexdigest(),
-                        'snapshot_sha256': header['snapshot_sha256'], 'duplicate': False,
-                        'received_at': datetime.now(timezone.utc).isoformat()}
-                attempt['receipt'] = {'v': 1, 'destination': destination(config), 'object_key': key, 'wire': wire}
-                attempt['phase'] = 'completing'
-                state_write(state_fd, attempt_name(bid), attempt)
+                receive_completing(config, state_fd, attempt, bid, header, key, digest, size)
             except BaseException:
                 # This path is reachable only before CompleteMultipartUpload. Never
                 # abort a completion whose response may have been lost. No part
                 # upload may still run when the abort or the lock release happens.
-                uploads.stop()
-                cloud_call(client.abort_multipart_upload, Bucket=config['bucket'], Key=key, UploadId=upload_id)
-                os.unlink(attempt_name(bid), dir_fd=state_fd); local.fsync_dir(state_fd)
+                receive_abort(config, client, uploads, key, upload_id, bid, state_fd)
                 raise
-        try:
-            client.complete_multipart_upload(Bucket=config['bucket'], Key=key, UploadId=upload_id,
-                                             MultipartUpload={'Parts': parts})
-        except Exception:
-            raise RuntimeError('completion_outcome_unknown') from None
-        # A successful multipart acknowledgement plus an actual body verification
-        # precedes publishing the logical ID. No ETag equality is assumed.
-        verify_object(config, client, attempt['receipt'])
-        result = publish(config, client, attempt, state_fd)
-        return result['wire']
+        return receive_complete(config, client, key, upload_id, parts, attempt, state_fd)
 
 
 def download(config, bid, output, *, client=None):
@@ -1183,6 +1218,56 @@ def cold_head(config, client, key):
     return size
 
 
+def cold_footer(source, size, digest, prefix):
+    """The footer, the end of the stream and the age header of a cold put."""
+    raw = source.readline(4097)
+    if len(raw) > 4096 or not raw.endswith(b'\n'):
+        raise ValueError('truncated_backup')
+    footer = unique_json(raw)
+    if (not isinstance(footer, dict) or set(footer) != {'bytes', 'sha256'} or
+            type(footer['bytes']) is not int or footer['bytes'] != size or size < 64):
+        raise ValueError('backup_size_mismatch')
+    if footer['sha256'] != digest.hexdigest():
+        raise ValueError('backup_hash_mismatch')
+    if source.read(1):
+        raise ValueError('backup_size_mismatch')
+    if prefix != AGE_HEADER:
+        raise ValueError('encrypted_backup_required')
+
+
+def cold_abort(config, client, key, upload_id, journal, state_fd):
+    if upload_id is not None:
+        cloud_call(client.abort_multipart_upload, Bucket=config['bucket'], Key=key, UploadId=upload_id)
+    try:
+        os.unlink(journal, dir_fd=state_fd); local.fsync_dir(state_fd)
+    except FileNotFoundError:
+        pass
+
+
+def cold_complete(config, client, key, upload_id, journal, state_fd, parts, buffer, respond, phase):
+    """Store the object: one conditional put, or complete the multipart upload. True when the key already exists
+    (reported to the producer); False when the object was written and the caller reports it."""
+    if upload_id is None:
+        try:
+            client.put_object(Bucket=config['bucket'], Key=key, Body=bytes(buffer),
+                              ContentType='application/octet-stream', IfNoneMatch='*')
+        except Exception as exc:
+            if code(exc) not in {'412', 'PreconditionFailed'}:
+                raise RuntimeError('storage_unavailable') from None
+            respond({'v': 1, 'status': 'exists', 'key': key, 'bytes': cold_head(config, client, key)})
+            return True
+    else:
+        phase('completing', upload_id)
+        try:
+            client.complete_multipart_upload(Bucket=config['bucket'], Key=key, UploadId=upload_id,
+                                             MultipartUpload={'Parts': parts})
+        except Exception:
+            # The journal stays: the next attempt aborts this upload, then re-checks the key.
+            raise RuntimeError('completion_outcome_unknown') from None
+        os.unlink(journal, dir_fd=state_fd); local.fsync_dir(state_fd)
+    return False
+
+
 def cold_put(config, client, key, source, respond, state_fd):
     """Write once under <prefix>/cold/: an existing key is reported, never replaced."""
     cold_reconcile(config, client, key, state_fd)
@@ -1226,49 +1311,16 @@ def cold_put(config, client, key, source, respond, state_fd):
                         raise ValueError('invalid_upload_id')
                     phase('uploading', created_id); upload_id = created_id
                 part(bytes(buffer[:config['part_bytes']])); del buffer[:config['part_bytes']]
-        raw = source.readline(4097)
-        if len(raw) > 4096 or not raw.endswith(b'\n'):
-            raise ValueError('truncated_backup')
-        footer = unique_json(raw)
-        if (not isinstance(footer, dict) or set(footer) != {'bytes', 'sha256'} or
-                type(footer['bytes']) is not int or footer['bytes'] != size or size < 64):
-            raise ValueError('backup_size_mismatch')
-        if footer['sha256'] != digest.hexdigest():
-            raise ValueError('backup_hash_mismatch')
-        if source.read(1):
-            raise ValueError('backup_size_mismatch')
-        if prefix != AGE_HEADER:
-            raise ValueError('encrypted_backup_required')
+        cold_footer(source, size, digest, prefix)
         if upload_id is not None and buffer:
             part(bytes(buffer))
     except BaseException:
         # Before completion only. A failed abort keeps the journal for the next
         # attempt's reconciliation; a successful one clears it.
-        if upload_id is not None:
-            cloud_call(client.abort_multipart_upload, Bucket=config['bucket'], Key=key, UploadId=upload_id)
-        try:
-            os.unlink(journal, dir_fd=state_fd); local.fsync_dir(state_fd)
-        except FileNotFoundError:
-            pass
+        cold_abort(config, client, key, upload_id, journal, state_fd)
         raise
-    if upload_id is None:
-        try:
-            client.put_object(Bucket=config['bucket'], Key=key, Body=bytes(buffer),
-                              ContentType='application/octet-stream', IfNoneMatch='*')
-        except Exception as exc:
-            if code(exc) not in {'412', 'PreconditionFailed'}:
-                raise RuntimeError('storage_unavailable') from None
-            respond({'v': 1, 'status': 'exists', 'key': key, 'bytes': cold_head(config, client, key)})
-            return
-    else:
-        phase('completing', upload_id)
-        try:
-            client.complete_multipart_upload(Bucket=config['bucket'], Key=key, UploadId=upload_id,
-                                             MultipartUpload={'Parts': parts})
-        except Exception:
-            # The journal stays: the next attempt aborts this upload, then re-checks the key.
-            raise RuntimeError('completion_outcome_unknown') from None
-        os.unlink(journal, dir_fd=state_fd); local.fsync_dir(state_fd)
+    if cold_complete(config, client, key, upload_id, journal, state_fd, parts, buffer, respond, phase):
+        return
     respond({'v': 1, 'status': 'stored', 'key': key, 'bytes': size, 'sha256': digest.hexdigest()})
 
 
