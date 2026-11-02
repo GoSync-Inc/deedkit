@@ -238,6 +238,45 @@ async def test_flags_on_across_a_decode_never_stop_the_decoder_and_its_deadline_
 
 
 # spec: ANYM-691
+async def test_a_stop_before_the_marker_exists_keeps_the_decoder_deadline_unspent(env):
+    """The group is stopped for 1.5 s BEFORE the decode helper starts (no marker yet): the helper's 1.5 s deadline
+    starts after the continue, so the 1.0 s decode finishes inside it."""
+    async with env.running(**engines(env, timeout=30), **yielding(env)) as s:
+        task = await s.submit(s.transcribe(fk(pre=1.0, decode={"seconds": 1.0, "timeout": 1.5}),
+                                           extra_fields={"language": "ru"}))
+        await s.until(lambda: bool(s.service.engines["audio-default"].workers))
+        s.probe.between = True
+        await s.until(lambda: bool(s.service.yielder.paused))
+        await asyncio.sleep(1.5)
+        s.probe.between = False
+        assert (await task).status == 200
+
+
+# spec: ANYM-691
+async def test_a_stop_after_the_marker_exists_is_undone_before_the_decoder_deadline_runs_out(env, monkeypatch):
+    """The ledger write is held until the decode helper's marker exists, so the stop lands after it, with the helper
+    running under a 1.5 s deadline. Contention never clears: without the marker protocol the group would stay stopped."""
+    from deedkit_inference.yielder import Yielder
+
+    original = Yielder._record
+
+    def record_when_marked(self, candidate):
+        end = time.monotonic() + 8
+        while not os.path.exists(candidate.marker) and time.monotonic() < end:
+            time.sleep(0.01)
+        return original(self, candidate)
+
+    monkeypatch.setattr(Yielder, "_record", record_when_marked)
+    async with env.running(**engines(env, timeout=30), **yielding(env, resume_after_seconds=0.2)) as s:
+        task = await s.submit(s.transcribe(fk(pre=0.6, decode={"seconds": 1.0, "timeout": 1.5}),
+                                           extra_fields={"language": "ru"}))
+        await s.until(lambda: bool(s.service.engines["audio-default"].workers))
+        s.probe.between = True  # and it stays on
+        reply = await task
+        assert reply.status == 200 and float(reply.headers["x-paused-seconds"]) < 0.3
+
+
+# spec: ANYM-691
 def test_run_tool_fails_closed_when_the_marker_cannot_be_made(tmp_path):
     with pytest.raises(OSError):
         media.run_tool([sys.executable, "-I", "-c", "pass"], 5, own_group=False,
@@ -730,15 +769,39 @@ async def test_the_ledger_names_the_group_before_the_stop_signal(env, monkeypatc
 
 
 # spec: ANYM-691
-async def test_the_ledger_stop_time_covers_helpers_spawned_before_the_stop_lands(env):
+async def test_the_ledger_names_the_frozen_members_by_identity_after_the_stop(env):
     clock = Virtual()
     async with manual(env, clock) as (s, cpu):
         task, pid = await paused_child(s, clock, env.tmp / "prog")
-        entry = pausestate.Ledger(env.tmp / "state" / pausestate.LEDGER_NAME).groups()[0]
-        assert entry["stopped_at"] >= time.time() + 5  # recorded ahead of the stop by the slack
-        rows = [{"pid": 9001, "pgid": pid, "stat": "T", "start": entry["stopped_at"] - 3, "started": "x"}]
-        assert pausestate.members({**entry, "leader_start": entry["leader_start"]}, rows) == rows  # a late helper is owned
+        ledger = pausestate.Ledger(env.tmp / "state" / pausestate.LEDGER_NAME)
+        await s.until(lambda: len(ledger.groups()[0].get("members", [])) >= 2)  # the engine and its helper
+        entry = ledger.groups()[0]
+        assert entry["stopped_at"] <= time.time() + 1  # the real stop time: no window ahead of it to be reused in
+        assert pid in {m["pid"] for m in entry["members"]}
         await finish(task)
+
+
+# spec: ANYM-691
+def test_recovery_owns_a_helper_spawned_between_the_record_and_the_stop_by_identity_only(tmp_path):
+    """The ledger write precedes the freeze. A helper born in a later second is owned through the members snapshot
+    (pid and start time), and a leaderless group whose number was reused later is still not claimed."""
+    leader, late = "Mon Nov 2 09:00:00 2026", "Mon Nov 2 10:00:05 2026"
+    stop = time.mktime(time.strptime("Mon Nov 2 10:00:04 2026", pausestate.START_FORMAT))
+    path = tmp_path / pausestate.LEDGER_NAME
+    ledger = pausestate.Ledger(path)
+
+    def run(table):
+        return pausestate.recover(path, run_ps=lambda: table, send=lambda pid, number: None, sleep=lambda _: None)
+
+    table = f"500 500 T {leader}\n777 500 T {late}\n"
+    ledger.record(500, 500, leader, stopped_at=stop)
+    assert run(table)["killed"] == [500]  # beyond the cutoff and unnamed: not owned
+    ledger.record(500, 500, leader, stopped_at=stop)
+    ledger.set_members(500, [{"pid": 500, "started": leader}, {"pid": 777, "started": late}])
+    assert set(run(table)["killed"]) == {500, 777}  # named by identity: continued and killed
+    ledger.record(600, 600, leader, stopped_at=stop)  # a reused number: the original is gone, another leader started later
+    reused = "600 600 S Mon Nov 2 10:00:30 2026\n778 600 T Mon Nov 2 10:00:31 2026\n"
+    assert run(reused)["killed"] == []
 
 
 # spec: ANYM-691
@@ -773,9 +836,9 @@ async def test_a_failed_continue_keeps_the_group_tracked_and_is_retried(env, mon
         task, pid = await paused_child(s, clock, env.tmp / "prog")
         failing["on"] = True
         s.probe.between = False
-        await tick(s, clock, 20, times=2)  # the continue is due and fails: nothing is forgotten
+        await tick(s, clock, 20, times=12)  # the continue is due and fails again and again: nothing is forgotten
         pause = next(iter(s.service.yielder.paused.values()))
-        assert pause.failures >= 1 and stopped(pid)
+        assert pause.failures >= 10 and stopped(pid) and not pause.worker
         assert pausestate.Ledger(env.tmp / "state" / pausestate.LEDGER_NAME).groups()
         failing["on"] = False
         await tick(s, clock, 2)  # the retry succeeds

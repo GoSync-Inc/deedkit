@@ -68,6 +68,7 @@ class Runtime:
         if mode == "hang":
             while True:
                 time.sleep(1)
+        time.sleep(float(d.get("pre", 0)))  # work before the decode: a stop here lands before the marker exists
         if d.get("decode"):  # a decode helper behind the no-pause marker, as media.iter_chunks runs ffmpeg
             code, _ = media.run_tool([sys.executable, "-I", "-c", f"import time; time.sleep({float(d['decode']['seconds'])})"],
                                      float(d["decode"]["timeout"]), own_group=False,

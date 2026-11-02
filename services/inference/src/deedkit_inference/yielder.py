@@ -37,11 +37,7 @@ PS_CPU = ["/bin/ps", "-axo", "uid=,pid=,lstart=,cputime="]
 PS_TIMEOUT = 2.0
 TICK_TIMEOUT = 8.0  # one whole tick: a ps that hangs, a ledger that blocks
 MAX_BACKOFF = 30.0
-MAX_CONT_FAILURES = 5  # SIGCONT attempts on one group before its ledger entry is left to recovery
-#: The ledger is written before the stop and the stop lands later (a thread hop, at worst a whole tick). Recovery
-#: owns the members that started no later than `stopped_at`, so it is recorded this far ahead: a helper spawned
-#: in between is a member of the group the stop freezes, and a crash must not strand it.
-STOP_SLACK_SECONDS = TICK_TIMEOUT + 1.0
+LOG_EVERY_FAILURE = 30  # a SIGCONT that keeps failing is retried on every tick but logged on the first and every 30th
 
 
 class YieldSettings(BaseModel):
@@ -182,7 +178,7 @@ class Pause:
     flags: set = field(default_factory=set)
     cores: list = field(default_factory=list)
     wasted: float = 0.0
-    failures: int = 0  # SIGCONT attempts that failed
+    failures: int = 0  # SIGCONT attempts that failed in a row
 
     @property
     def pgid(self):
@@ -362,8 +358,21 @@ class Yielder:
         started = pausestate.start_text(candidate.proc.pid)
         if started is None:
             return False
-        self.ledger.record(candidate.proc.pid, candidate.proc.pid, started, stopped_at=self.wall() + STOP_SLACK_SECONDS)
+        self.ledger.record(candidate.proc.pid, candidate.proc.pid, started, stopped_at=self.wall())
         return True
+
+    def _snapshot(self, pgid):
+        """Ledger thread, after the stop: the exact members of the frozen group (pid and start time) go into the entry.
+        The recorded stop time is that of the ledger write, a little before the freeze, and recovery only owns members
+        that started no later than it; a helper spawned in between is named here by identity instead, so a crash after
+        this write strands nothing (a crash inside the milliseconds before it is the one window that remains)."""
+        try:
+            rows = [{"pid": row["pid"], "started": row["started"]} for row in pausestate.process_table()
+                    if row["pgid"] == pgid and row["stat"].startswith("T")]
+            if rows:
+                self.ledger.set_members(pgid, rows)
+        except Exception as error:  # noqa: BLE001 - the entry written before the stop still stands
+            LOG.error("yield: group members not recorded: %s", type(error).__name__)
 
     async def _enter(self, now, flags):
         for running in self._running():
@@ -403,6 +412,9 @@ class Yielder:
             return
         if pause.marker is not None and os.path.exists(pause.marker):
             self._resume(pause, "decode")  # the marker appeared before the stop landed: the decoder keeps its deadline
+            return
+        with contextlib.suppress(RuntimeError):
+            self.io.submit(self._snapshot, pause.pgid)
 
     # --- continuing --------------------------------------------------------------------------------------------
     def _remove(self, pgid):
@@ -419,8 +431,8 @@ class Yielder:
             self.io.submit(self._remove, pgid)
 
     def _resume(self, pause, why):
-        """Continue the group, then close the books. True when closed. A SIGCONT that fails keeps the pause tracked
-        (retried on every tick); after MAX_CONT_FAILURES the books close but the ledger entry stays for recovery."""
+        """Continue the group, then close the books. True when closed. A SIGCONT that fails keeps the pause tracked and
+        is retried on every tick for as long as the group exists: a stopped group is never forgotten."""
         LOG.debug("yield: continue reason=%s", why)
         if pause.proc.returncode is None:
             try:
@@ -429,14 +441,13 @@ class Yielder:
                 pass
             except OSError as error:
                 pause.failures += 1
-                LOG.error("yield: continue failed (%d of %d): %s", pause.failures, MAX_CONT_FAILURES, type(error).__name__)
-                if pause.failures >= MAX_CONT_FAILURES:
-                    self._close(pause, keep_ledger=True)
+                if pause.failures % LOG_EVERY_FAILURE == 1:
+                    LOG.error("yield: continue failed (%d in a row): %s", pause.failures, type(error).__name__)
                 return False
         self._close(pause)
         return True
 
-    def _close(self, pause, keep_ledger=False):
+    def _close(self, pause):
         self.paused.pop(pause.pgid, None)
         job, now = pause.job, self.now()
         spent = max(0.0, now - pause.since)
@@ -449,8 +460,7 @@ class Yielder:
             self.scheduler.release_timeout(job)
         except Exception:  # noqa: BLE001
             LOG.error("yield: phase timeout not restored")
-        if not keep_ledger:
-            self._unrecord(pause.pgid)
+        self._unrecord(pause.pgid)
         mean = sum(pause.cores) / len(pause.cores) if pause.cores else 0.0
         LOG.info("yield: job=%s paused=%.1f flags=%s foreign_cores_mean=%.2f wasted=%.1f budget_exhausted=%d",
                  job.log_id, spent, ",".join(sorted(pause.flags)), mean, pause.wasted, int(job.budget_exhausted))

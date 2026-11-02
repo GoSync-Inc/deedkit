@@ -126,6 +126,15 @@ class Ledger:
                        "stopped_at": self.clock() if stopped_at is None else stopped_at})
         self._write(groups)
 
+    def set_members(self, pgid: int, members_: list[dict]) -> None:
+        """Name the processes of a recorded group by identity ({pid, started}); no-op when the group has no entry."""
+        groups = self.groups()
+        for group in groups:
+            if group["pgid"] == pgid:
+                group["members"] = members_
+                self._write(groups)
+                return
+
     def remove(self, pgid: int) -> None:
         groups = self.groups()
         left = [g for g in groups if g["pgid"] != pgid]
