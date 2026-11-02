@@ -52,6 +52,9 @@ whatever the policy and its recorded before and after matrices say). Each callin
 the mini's policy file (mode 0600) holds only its hash, with an expiry, an overlapping rotation (at most two
 keys per principal) and revocation by removing the hash. The key itself exists as a 0600 file in a
 directory only the production worker mounts, and briefly on the mini during delivery or rotation. The
+mini also keeps one persistent deploy-probe key (`probe.key`, 0600, in the service account's home, outside
+the service's sandbox reads) that `inference_deploy.py` uses for its health probe; its scope is a single
+audio principal with a daily cap and an expiry. The
 process runs in a sandbox that denies the service tree any outbound network, and each job's files live in
 a per-request directory removed afterwards. A leaked key allows jobs within its scopes and daily cap; the
 service stores nothing that can be read back. On the production side the worker reaches only its database

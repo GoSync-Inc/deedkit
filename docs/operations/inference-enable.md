@@ -24,12 +24,12 @@ to prove it works (it must print `no active call`).
 
 **Gate G1 (owner's Tailscale token pending):** production must reach the mini on 443, which needs the tailnet
 policy of inference-mini-setup.md section 10 (or the recorded "policy does not restrict the mini"). Nothing on
-the host changes before G1 (step 3) passes: steps 1 and 2 are the normal release route and a role check.
+the host or in the database changes before G1 (step 1) passes: no release, no role, no DSN, no file, no rule.
 
 ## 0. Pre-check (read-only)
 - `production.py status`: `S` and schema. Evidence on 11-02 22:06Z (deployed snapshot): `S` = b4a9ab5f, schema 64,
-  an ancestor of the ANYM-685 squash d9866f94, so it lacks `deedkit_inference` and `enricher-mini`: step 1 is
-  needed. Re-read at execution time; if `S` already contains c4ccecbc (ANYM-688), skip step 1.
+  an ancestor of the ANYM-685 squash d9866f94, so it lacks `deedkit_inference` and `enricher-mini`: a release
+  is needed (step 2). Re-read at execution time; if `S` already contains c4ccecbc (ANYM-688), skip step 2.
 - The active-call gate once (it proves itself); `docker inspect` of the database container: ID and start time.
 - ANYM-682 to 684 installed on the mini with their `[open: measured]` evidence on their cards; the 24-hour
   record of ANYM-684 criterion 10 meets its target (open at least 60% of a weekday, no closed stretch over 3
@@ -41,22 +41,22 @@ the host changes before G1 (step 3) passes: steps 1 and 2 are the normal release
 - Nothing already runs: `docker compose $F ps` shows no `enricher-mini`; `private/enrichment-mini.json` and
   `private/inference/` do not exist, or are a previous attempt's, which the stage table removes.
 
-## 1. A release containing ANYM-685 and ANYM-688
+## 1. Tailnet policy (G1; inference-mini-setup.md section 10, the owner's token)
+Check: the after-matrix; production reaches the mini's `/health` with a verified certificate (`curl --max-time
+10 https://<mini>.<tailnet>.ts.net/health`, a plain GET). Undo: the saved `policy.before.hujson`.
+
+## 2. A release containing ANYM-685 and ANYM-688
 Normal route only (`production.py`, autodeploy or the by-hand next green `main` SHA, production.md). Check:
 `production.py status` shows a `current` SHA containing c4ccecbc, and the running services as before (this
 plan starts no worker here; `compose.enrichment.yaml` need not be selected yet). The release does not change
 the database container. Undo: the release's own rollback (production.md "Roll back the current release"). No
 schema change is in this range; if one appears, the migration risk tiers of production.md apply first.
 
-## 2. Role and DSN (only if the pre-check found them missing)
+## 3. Role and DSN (only if the pre-check found them missing)
 Apply `messaging_service/enrichment_role.sql` as the database owner and create the login per ENRICHMENT.md
 "Isolation and limits", with the backup and undo the section 2 gates ask for (fresh verified backup of the
 affected data; undo `DROP ROLE` and removing the DSN file). The DSN goes to `private/enrichment-local.dsn`
 (mode 0600, owner uid 10001). Skipped when present.
-
-## 3. Tailnet policy (G1; inference-mini-setup.md section 10, the owner's token)
-Check: the after-matrix; production reaches the mini's `/health` with a verified certificate (`curl --max-time
-10 https://<mini>.<tailnet>.ts.net/health`, a plain GET). Undo: the saved `policy.before.hujson`.
 
 ## 4. Key delivery (inference-mini-setup.md section 11)
 Stage, hash-compare, probe the new file from production, keep `.prev`, rename. This creates
@@ -121,13 +121,14 @@ Stop the worker before removing its confinement. Each row undoes everything up t
 
 | reached | undo, in order |
 |---|---|
-| 8 (promoted) | `"enabled": false`, `docker compose $F --profile enrichment-mini stop enricher-mini`; remove `"enricher-mini"` from `services` and the overlay from both `files` (restore the backups); a hand apply of the newest green `main` SHA, because the receipts name the overlay (production.md delivery undo), then the stage 7 row |
+| 8 (promoted, or the edit/apply failed) | `"enabled": false`, `docker compose $F --profile enrichment-mini stop enricher-mini`. **Hold state:** the stopped worker is still selected, so the release tool and autodeploy refuse ("each selected service must already have exactly one running container"); the autodeploy pause stays and nothing else is released. Restore both configuration backups. The receipts name the overlay, so the way out is a hand apply of a **newer green `main` SHA that has never been prepared** (`prepare` refuses an existing candidate directory, so never the SHA just applied; if none exists yet, stay in the hold state until the next merge). After a failed apply that left `attempted.json`, recover it first as production.md "Apply and verify" says. Then the stage 7 row |
 | 7 (running) | `stop` then `rm` the worker; `"enabled": false`; stage 6 row |
 | 6 (networks, rules) | `docker network disconnect <project>_inference_db <db container>`; `docker network rm` both; `rules --undo` (hooks first, then both chains), and restore `rules.before` into the firewall persistence; check `iptables -S` is as before |
 | 5 (files) | delete `private/enrichment-mini.json`; restore the env file; remove the enroll image tag |
 | 4 (key) | restore `inference.key.prev` or remove the key and the directory; the mini's copy was still there until step 7 |
-| 3 (policy) | the saved `policy.before.hujson` |
-| 2, 1 | the role's `DROP ROLE` and DSN removal; the release rollback |
+| 3 (role) | the role's `DROP ROLE` and DSN removal |
+| 2 (release) | the release rollback |
+| 1 (policy) | the saved `policy.before.hujson` |
 Read back after any undo: `docker compose $F ps` (no worker), `iptables -S` equals the before state, the key
 directory as expected, `processing_profiles` rows disabled, the database container unchanged. Queued jobs stay
 queued and drain when a worker returns. Nothing is sent, called, paired or allow-listed at any stage.
@@ -139,8 +140,11 @@ Real archived attachments only; no message is sent. Every drill is preceded by t
   transcript or description with the `model_generated` label and provider `deedkit_inference`; the photo's title
   and summary are Russian; the `events` row of its message (`file.transcript.ready` for the voice note) exists.
   On the mini the log shows `messaging-enrichment`, alias, bytes, seconds and `200`, and no content or file name;
-  after the jobs `work/` holds no per-request directory and no file other than markers, locks and the warm
-  engines' `w-*` scratch (names and sizes on the card, none the size or digest of an original).
+  after the jobs, `find work -mindepth 1` is read recursively: no per-request directory remains, and no file is
+  media or request text. The check: `file --mime-type` finds no `audio/*`, `image/*` or `video/*` file and
+  no decoded or transcoded copy; `grep -rIlF` for three distinctive words of each returned transcript or
+  description (the words are not written to the card) finds nothing; only markers, locks and the warm engines'
+  `w-*` scratch remain, with names and sizes on the card.
 - (6) Offline drill: the mini's service is stopped with its `launchctl bootout` (Tailscale stays up) and started
   again, once also by a real `inference_deploy.py` restart: within one cooldown the three profiles show
   `model_backpressure`; `enrichment_budget` and `attempts` are unchanged; then the jobs finish by themselves.

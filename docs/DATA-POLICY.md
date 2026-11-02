@@ -93,7 +93,8 @@ file, owner 11-01).
     pinned address, port 443; Ogg/Opus voice notes are converted to MP3 first) for processing by local models (`deedkit-inference`). The worker's
     network reaches only its database and that address (docs/operations/production.md, "Mini
     enrichment worker"). The mini keeps them only for the duration of the request: a per-request
-    directory deleted after each job (a leftover of a crash is removed at the next start), no prompt or
+    directory is removed after each job and any leftover at the next start (removal is attempted; a failure
+    is logged as `cleanup_incomplete` and the files can stay until a later removal succeeds), no prompt or
     media cache on disk, and logs with principal, alias, size, seconds, status, request ID and a refusal
     reason only, never content or file names. The derived text returns to DeedKit and is stored as
     untrusted, model-generated enrichment (ENRICHMENT.md). No third party receives them (owner 11-01
