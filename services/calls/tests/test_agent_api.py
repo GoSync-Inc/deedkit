@@ -111,13 +111,19 @@ async def test_a_bad_destination_is_named_beside_other_failing_fields(tmp_path):
         ({"account": "twilio"}, {"brief/account"}),
         ({"account": "twilio", "goal": "no"}, {"brief/account", "brief/goal"}),
         ({"channel": "phone", "account": "telegram", "destination": "+12345678"}, {"brief/account"}),
+        # an account fault never hides a destination fault, and an unknown or missing account does not either
+        ({"account": "twilio", "destination": "+123456789", "goal": "no"},
+         {"brief/account", "brief/destination", "brief/goal"}),
+        ({"account": "nope", "destination": "+123456789", "goal": "no"},
+         {"brief/account", "brief/destination", "brief/goal"}),
+        ({"account": None, "destination": "+123456789"}, {"brief/account", "brief/destination"}),
     ]
     for change, fields in cases:
         with pytest.raises(ServiceError) as caught:
             await surface.call("alice", "prepare_external_call", {"brief": {**good, **change}})
         entries = {entry["field"]: entry for entry in caught.value.detail["field_errors"]}
         assert set(entries) == fields, change
-        if "brief/account" in entries:
+        if entries.get("brief/account", {}).get("reason") == "enum":
             assert entries["brief/account"]["allowed"] == ["telegram" if change.get("channel") != "phone" else "twilio"]
         if "brief/destination" in entries:
             assert entries["brief/destination"]["reason"] == "format" and "expected" in entries["brief/destination"]

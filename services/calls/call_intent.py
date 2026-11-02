@@ -105,15 +105,18 @@ def route_errors(brief):
     if not isinstance(brief, dict):
         return []
     channel, account, destination = brief.get("channel"), brief.get("account"), brief.get("destination")
-    if channel not in DESTINATION_FORMATS or account not in ("telegram", "twilio") or not isinstance(destination, str):
+    if not isinstance(channel, str) or channel not in DESTINATION_FORMATS:
         return []
+    found = []
     wanted = "telegram" if channel == "telegram" else "twilio"
-    if account != wanted:
-        return [{"field": "brief/account", "reason": "enum", "allowed": [wanted]}]
+    # The account and the destination are judged independently once the channel is known.
+    if isinstance(account, str) and account in ("telegram", "twilio") and account != wanted:
+        found.append({"field": "brief/account", "reason": "enum", "allowed": [wanted]})
     pattern = TELEGRAM_ID if channel == "telegram" else SIP if channel == "sip" else E164
-    if pattern.fullmatch(destination) and (channel != "sip" or len(destination) < 255):
-        return []
-    return [{"field": "brief/destination", "reason": "format", "expected": DESTINATION_FORMATS[channel]}]
+    if isinstance(destination, str) and not (pattern.fullmatch(destination)
+                                             and (channel != "sip" or len(destination) < 255)):
+        found.append({"field": "brief/destination", "reason": "format", "expected": DESTINATION_FORMATS[channel]})
+    return found
 
 
 def field_errors(error, arguments=None):
@@ -145,7 +148,7 @@ def parse(model, arguments):
     try:
         return model.model_validate(arguments)
     except ValidationError as error:
-        raise invalid(field_errors(error, arguments)) from None
+        raise invalid(field_errors(error)) from None  # no `arguments`: route inspection is for prepare_external_call only
 
 
 def channel_of(value):

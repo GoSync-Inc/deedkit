@@ -395,6 +395,15 @@ def test_an_uncertain_dial_is_unknown_with_the_call_handle_and_never_retried(wor
     assert w.tool("p1", "call", args) == first and w.effects == 1
 
 
+# spec: ANYM-657
+def test_other_tools_keep_their_field_errors_for_a_malformed_brief_key(world):
+    w = world()
+    # only prepare_external_call inspects the brief's route; any other model keeps its plain field errors
+    refused = error(w.tool("p1", "call_result", {"call_id": "synthetic", "brief": {
+        "channel": [], "account": "telegram", "destination": "123456789"}}), "invalid_arguments")
+    assert refused["field_errors"] == [{"field": "brief", "reason": "unknown_field"}]
+
+
 # spec: ANYM-551
 def test_call_result_waits_then_returns_state_expected_wait_and_next(world):
     w = world()
