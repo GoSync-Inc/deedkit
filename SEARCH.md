@@ -347,6 +347,21 @@ For the messages themselves in time order use the default view with `direction: 
 `origins: ["live"]` and `from_time`. `order: sent_at` sorts one delivered page only: read every
 page (ACK each after processing), then sort the union by `sent_at`.
 
+## Compact search shape (ANYM-667)
+
+In the conversation view `detail="compact"` (default) of `search` and `get_messages` returns `items`,
+`next_cursor`, `coverage`, `synthetic`, `result_evidence` and `conversation_view`. `result_evidence` is the
+ANYM-53 summary (`empty_reason`, `requested_range_traversed`, `active_conflicts_in_range`, `next_action`, and
+`empty_fields` when a filter is empty) plus the live keys (`live`, `live_wait`, `suggested_call`,
+`archive_reread`) where they exist. `conversation_view` is `contract_version`, `order`,
+`content_is_untrusted` and `warnings` when there are any. The `search` block appears only as
+`{fuzzy_used: true}` when a fuzzy match was used (the rows are near misses). `detail="full"` adds
+`basis`, `full_history_verified`, `message_index`, the `search` echo (`language`, `query_mode`, `order`,
+`fuzzy_candidate_limit`, `collapse_forwards`) and the `view` and `system_filter` fields of
+`conversation_view` (every full message row's `evidence` states `provider_currentness_verified`);
+`include_coverage=true` adds the per-chat counts and statuses to
+`result_evidence`. `view="archive"` is unchanged.
+
 ## Live Telegram search inside `search` (ANYM-478)
 
 `search` takes `live`: `off` (default), `auto` or `on`. With `off` nothing changes and no provider is

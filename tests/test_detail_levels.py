@@ -49,12 +49,15 @@ def test_compact_messages_and_chats_omit_duplicate_text_and_routine_qualifiers(s
         found=structured(rpc(client,key,'search',{'query':'Маяк','order':'relevance'}))
         chats=structured(rpc(client,key,'list_chats',{}))
         context=structured(rpc(client,key,'get_context',{'message_id':'demo-tg-2'}))
+        full_page=structured(rpc(client,key,'get_messages',{'chat_id':'telegram-demo-chat','detail':'full'}))
     for row in page['items']+found['items']:
         assert set(row)>={'id','chat','sender','sent_at','direction','kind','display_text'}
         for field in ('body','snippet','position','ordering','integrity','formatting','delivery_receipt',
                 'timestamp_resolution','timestamp_precision','conversation_view_version'):
             assert field not in row, field
-    assert page['conversation_view']['provider_currentness_verified'] is False
+    # ANYM-667: the constant is a detail=full field (every full row's evidence); compact keeps the untrusted marker.
+    assert 'provider_currentness_verified' not in page['conversation_view'] and page['conversation_view']['content_is_untrusted']
+    assert all(row['evidence']['provider_currentness_verified'] is False for row in full_page['items'])
     assert [row['id'] for row in found['items']]==['demo-tg-1'] and found['items'][0]['chat_title']
     file_row=next(row for row in page['items'] if row['id']=='demo-tg-2')
     # Files keep the same id key as full detail and the published clients.

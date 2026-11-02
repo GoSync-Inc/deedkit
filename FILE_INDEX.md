@@ -122,6 +122,15 @@ reads `content='extracted'`. When that transcript is not ready, the reply has em
 (`processing_pending`, `processing_paused`, `processing_worker_unavailable`,
 `processing_failed` with `failure_reason`, or `processing_not_configured`, which only
 the owner can change). Explicit `content` values keep their meaning.
+
+Compact `get_file_text` (ANYM-667) returns the text and its paging (`offset`, `next_offset`,
+`content_chars`, `truncated`), the status and readiness reasons (`extraction_status`,
+`enrichment_status`, `download_status`, `empty_reason`, `empty_reason_detail`, `failure_reason`,
+`next_action`), `message_id`, `mime`, `display_name`, `model_generated`, `notice`,
+`content_coverage` (`retained_chars`, `truncated`, `complete`), `provenance` (attachment, message,
+revision, content, extractor or model and provider, processor version, `sha256`) and the page and sheet
+spans. `detail="full"` adds `understanding`, `extraction_coverage`, `content_coverage.notice`,
+`enrichment_notice`, the cell spans, `coverage` and `synthetic`.
 Message rows mark a voice note whose transcript is ready with `transcript_ready: true`.
 In `get_messages`, `search` and `get_context` (every detail, and the transcript's file list)
 an attachment whose default `get_file_text` text is ready carries `text_excerpt` (ANYM-490):

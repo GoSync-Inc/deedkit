@@ -52,7 +52,9 @@ def test_three_forwarded_copies_in_three_chats_are_one_row(copies):
         for detail in ('compact','full'):
             result=structured(rpc(client,key,'search',{'query':'synthetic marquee','detail':detail,'include_coverage':False}))
             items=result['items']
-            assert result['search']['collapse_forwards'] is True,detail
+            # ANYM-667: the collapse echo is a detail=full field; compact shows the grouping in the rows.
+            if detail=='full':assert result['search']['collapse_forwards'] is True,detail
+            else:assert 'search' not in result
             assert len(items)==1 and items[0]['copies_total']==3,detail
             assert items[0]['latest_copy_at']=='2026-10-01T12:02:00+00:00',detail
             assert [c['message_id'] for c in items[0]['copies']]==ids[1:],detail
@@ -108,7 +110,7 @@ def test_collapse_forwards_false_returns_every_copy(copies):
     assert error.value.code=='invalid_filter'
     with TestClient(create_app(s,['testserver'])) as client:
         result=structured(rpc(client,key,'search',{'query':'synthetic marquee','collapse_forwards':False,
-            'include_coverage':False}))
+            'include_coverage':False,'detail':'full'}))
         assert [r['id'] for r in result['items']]==ids and result['search']['collapse_forwards'] is False
 
 

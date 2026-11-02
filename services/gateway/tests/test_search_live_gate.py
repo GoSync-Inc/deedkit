@@ -119,6 +119,23 @@ def test_transcript_denial_says_not_permitted_and_drops_the_live_hint(tmp_path):
     assert "suggested_call" not in plain and plain["empty_reason"] == "history_loading"
 
 
+# spec: ANYM-667
+def test_the_live_gate_works_on_the_compact_evidence_keys(tmp_path, monkeypatch):
+    # The compact evidence of a search is the ANYM-53 summary plus the live keys; the constants are gone.
+    monkeypatch.setitem(THIN, "result_evidence", {
+        "empty_reason": "history_loading", "requested_range_traversed": False, "active_conflicts_in_range": 0,
+        "next_action": "read_history_or_wait_for_collection",
+        "suggested_call": {"tool": "messages_search", "args": {"live": "on"}}})
+    app, _ = setup(tmp_path, ["rename_group"], ["read", "read-live", "groups-manage"])
+    with TestClient(app) as client:
+        denied = client.post("/v1/messages_search", json={"query": "needle", "live": "on"}, headers=HEADERS).json()
+        plain = client.post("/v1/messages_search", json={"query": "needle"}, headers=HEADERS).json()
+    assert denied["result_evidence"]["live"] == [{"state": "not_permitted", "reason": "gateway_action"}]
+    assert "suggested_call" not in denied["result_evidence"] and "suggested_call" not in plain["result_evidence"]
+    assert plain["result_evidence"]["next_action"] == "read_history_or_wait_for_collection"
+    assert not {"basis", "full_history_verified", "message_index"} & set(denied["result_evidence"])
+
+
 # spec: ANYM-478
 def test_waiting_live_searches_leave_sends_and_archive_reads_admitted():
     async def run():

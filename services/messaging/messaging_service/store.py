@@ -695,10 +695,10 @@ class Store:
                 before=before,direction=direction,filename=filename,search_language=search_language,
                 include_coverage=include_coverage,media_kind=media_kind,ready=ready)
 
-    def get_file_text(self,token,attachment_id,offset=0,limit=4000,content=None):
+    def get_file_text(self,token,attachment_id,offset=0,limit=4000,content=None,compact_spans=False):
         from .file_index import get_file_text
         with self.authorized(token,'get_file_text') as (c,p):
-            return get_file_text(self,c,p,attachment_id,offset=offset,limit=limit,content=content)
+            return get_file_text(self,c,p,attachment_id,offset=offset,limit=limit,content=content,compact_spans=compact_spans)
 
     def get_file_occurrences(self,token,attachment_id,after='',limit=20):
         from .file_index import get_file_occurrences

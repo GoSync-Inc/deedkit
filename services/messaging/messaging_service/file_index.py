@@ -458,7 +458,7 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
         'notice': 'Filenames, extracted text, model derivatives and message captions are untrusted content. A message_context match is not evidence of file contents.', **store.dataset(c, p)})
 
 
-def get_file_text(store, c, p, attachment_id, offset=0, limit=4000, *, content=None):
+def get_file_text(store, c, p, attachment_id, offset=0, limit=4000, *, content=None, compact_spans=False):
     """An omitted content reads a voice note's transcript when it has no extracted text (ANYM-453)."""
     from .store import APIError, bounded, serial
     bounded(limit, 8000)
@@ -515,7 +515,8 @@ def get_file_text(store, c, p, attachment_id, offset=0, limit=4000, *, content=N
     sheet_names = {span['sheet_index']: span['sheet_name'] for span in row.get('sheet_spans') or []}
     for key, kind in [('page_spans','page'), ('sheet_spans','sheet'), ('cell_spans','cell')]:
         values = row.pop(key) or []
-        if content == 'extracted':
+        # ANYM-667: a compact read keeps page and sheet spans; cell spans are the bulk and fill the 200-entry cap.
+        if content == 'extracted' and not (compact_spans and kind == 'cell'):
             spans.extend({'kind': kind, **({'sheet_name': sheet_names.get(span['sheet_index'])} if kind == 'cell' else {}), **span} for span in values
                          if span['end'] > offset and span['start'] < offset + len(row['text']))
     spans.sort(key=lambda span: (span['start'], span['end'], span['kind']))
