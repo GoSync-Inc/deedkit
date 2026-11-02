@@ -120,9 +120,12 @@ def chat_content(model_text):
     if parsed is None:
         parsed = {"title": "", "summary": "", "document_type": "unknown", "text": text}
     document_type = CONTROL.sub(" ", _field(parsed.get("document_type", "unknown"), 1000)).strip()[:MAX_DOC_TYPE]
+    body = _field(parsed.get("text"), MAX_TOTAL_CHARS)
+    if "\n" not in body and body.count("\\n") >= 2:  # the model double-escaped the line breaks in JSON mode
+        body = body.replace("\\n", "\n")
     return json.dumps({
         "title": _field(parsed.get("title"), MAX_TITLE),
         "summary": _field(parsed.get("summary"), MAX_SUMMARY),
         "document_type": document_type or "unknown",
-        "text": _field(parsed.get("text"), MAX_TOTAL_CHARS),
+        "text": body,
     }, ensure_ascii=False)

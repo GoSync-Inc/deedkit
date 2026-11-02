@@ -94,6 +94,20 @@ def test_chat_content_unit():
 
 
 # spec: ANYM-683
+def test_chat_content_unescapes_a_double_escaped_text_field():
+    # The model sometimes double-escapes in JSON mode: the field holds a literal backslash-n, not a newline.
+    double = json.dumps({"title": "R", "text": "Shop\\nTotal 12.50\\nThanks"})
+    assert json.loads(chat_content(double))["text"] == "Shop\nTotal 12.50\nThanks"
+    # Only when the field has no real newline and at least two literal ones: real text is left alone.
+    mixed = json.dumps({"text": "Shop\nTotal\\nThanks"})
+    assert json.loads(chat_content(mixed))["text"] == "Shop\nTotal\\nThanks"
+    single = json.dumps({"text": "path C:\\new"})
+    assert json.loads(chat_content(single))["text"] == "path C:\\new"
+    # Other fields are never touched.
+    assert json.loads(chat_content(json.dumps({"title": "a\\nb\\nc"})))["title"] == "a\\nb\\nc"
+
+
+# spec: ANYM-683
 async def test_engine_answers_match_the_contract_goldens(env):
     from support import CONTRACT
 
