@@ -168,7 +168,7 @@ sandbox. For the same reason the profile makes `releases/`, `keys/`, `current`, 
 MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
 ADMIN="${MINI%@*}"; OUT="$(mktemp -d)"
 python3 services/inference/launchd/render.py --admin "$ADMIN" --admin-home "/Users/$ADMIN" --python /opt/homebrew/bin/python3.13 --out "$OUT" &&
-D="$(ssh "$MINI" 'D=$(mktemp -d /tmp/deedkit-setup.XXXXXX) && echo "stage $D" >> ~/deedkit-inference-setup.created && echo $D')" &&
+D="$(ssh "$MINI" 'D=$(mktemp -u /tmp/deedkit-setup.XXXXXX) && echo "stage $D" >> ~/deedkit-inference-setup.created && mkdir -m 700 "$D" && echo $D')" &&
 [ -n "$D" ] &&
 scp "$OUT"/* services/inference/src/deedkit_inference/busy_probe.py services/inference/src/deedkit_inference/keygen.py services/inference/launchd/sandbox_proof.py "$MINI:$D/" &&
 ssh "$MINI" "D=$D"'; set -e; cd "$D"; chmod 755 "$D"; chmod 644 *   # no secret in it; the proof runs as the service user from here
@@ -191,7 +191,7 @@ echo plist-service >> ~/deedkit-inference-setup.created
 sudo -n install -o root -g wheel -m 0644 com.deedkit.inference.plist /Library/LaunchDaemons/
 sudo -n install -o _deedkitinf -g _deedkitinf -m 0640 config.json /Users/_deedkitinf/config.json
 plutil -lint /Library/LaunchDaemons/com.deedkit.inference.plist /Library/LaunchDaemons/com.deedkit.inference-busy.plist
-sudo -n newsyslog -nv 2>&1 | grep -i deedkit || true'; rm -r "$OUT"
+sudo -n newsyslog -nv 2>&1 | grep -i deedkit || true'; RC=$?; rm -r "$OUT"; [ "$RC" = 0 ]   # the exit status of the block is the install's, not the cleanup's
 ```
 
 Read-back: `plutil -lint` says `OK` for both; `ls -l` shows root:wheel and the modes above; the plist prints with
@@ -286,7 +286,7 @@ The stage directory is a ledger `stage` entry, removed by section 14:
 MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
 SHA="$(git rev-parse HEAD)"; git merge-base --is-ancestor "$SHA" origin/main &&
 git archive -o "$TMPDIR/inference-$SHA.tar" "$SHA" services/inference &&
-D="$(ssh "$MINI" 'D=$(mktemp -d /tmp/deedkit-setup.XXXXXX) && echo "stage $D" >> ~/deedkit-inference-setup.created && echo $D')" &&
+D="$(ssh "$MINI" 'D=$(mktemp -u /tmp/deedkit-setup.XXXXXX) && echo "stage $D" >> ~/deedkit-inference-setup.created && mkdir -m 700 "$D" && echo $D')" &&
 case "$D" in /tmp/deedkit-setup.*) ;; *) echo "bad stage"; exit 1 ;; esac &&
 scp -q "$TMPDIR/inference-$SHA.tar" "$MINI:$D/pkg.tar" &&
 ssh "$MINI" "cd $D && tar -x -f pkg.tar && cd services/inference && /opt/homebrew/bin/uv sync --locked --no-dev --python /opt/homebrew/bin/python3.13 && (nohup nice -n 10 .venv/bin/deedkit-inference pull --model-dir /Users/Shared/deedkit-inference/models > $D/pull.log 2>&1 < /dev/null & echo \$! > $D/pull.pid)"
