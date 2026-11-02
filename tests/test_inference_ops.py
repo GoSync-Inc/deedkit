@@ -694,6 +694,27 @@ def test_impact_summary_separates_overlap_from_between_alone_and_idle():
 
 
 # spec: ANYM-684
+def test_impact_summary_has_the_daily_line_admitted_share_overlap_memory_and_vm_p90():
+    # owner via the orchestrator 11-02: after the relaxed busy rule the day is read as one line
+    rows = [impact_line(0, 'f', 'f', 0, 1.0, 9.0), impact_line(1, 'f', 'f', 0, 1.0, 6.9), impact_line(2, 't', 'f', 1, 3.0, 8.0, 1.0),
+            impact_line(3, 't', 'f', 1, 3.0, 5.0, 3.0), impact_line(4, 't', 'f', 1, 3.0, 7.5, 2.0), impact_line(5, 't', 'f', 1, 3.0, 7.0, 4.0),
+            impact_line(6, 'f', 'f', 1, 1.0, 8.0), impact_line(7, 'f', 'f', 0, 1.0, 7.0), impact_line(8, '?', 'f', 0, 1.0, 9.0),
+            impact_line(9, 'f', 't', 0, 1.0, 9.0)]
+    summary = IMPACT.summarize(rows)
+    # admitted: no busy flag true (an unknown one is not open) and the free memory at the 7 GB floor, the floor itself included
+    assert summary['admitted_percent'] == 30.0 and summary['busy_open_percent'] == 40.0
+    assert summary['overlap_minutes'] == 1.0 and summary['overlap']['avail_gb_min'] == 5.0 and summary['avail_gb_min'] == 5.0
+    assert summary['overlap']['vm_cores_p90'] == 4.0 and summary['contended_alone']['vm_cores_p90'] == 0.0
+    assert (summary['swap_mb_first'], summary['swap_mb_last'], summary['swap_mb_max']) == (100.0, 100.0, 100.0)
+    assert summary['headline'] == 'admitted 30.0 % | overlap 1.0 min | avail_gb min 5.0 in overlap, 5.0 all day | Between VM p90 4.00 cores in overlap'
+    # nearest rank: ten values, the ninth is the p90
+    assert IMPACT.percentile([float(n) for n in range(1, 11)], 0.9) == 9.0 and IMPACT.percentile([], 0.9) == 0.0
+    # no overlap: the line says so instead of printing zeros as a measurement
+    quiet = IMPACT.summarize([impact_line(0, 'f', 'f', 0, 1.0, 9.0), impact_line(1, 't', 'f', 0, 1.0, 9.0, 0.5)])
+    assert quiet['headline'] == 'admitted 50.0 % | overlap 0.0 min | avail_gb min n/a (no overlap), 9.0 all day | Between VM p90 n/a (no overlap)'
+
+
+# spec: ANYM-684
 def test_impact_summary_breaks_an_overlap_episode_at_a_hole_in_the_samples():
     rows = [impact_line(0, 't', 'f', 1, 9.0, 4.0), impact_line(1, 't', 'f', 1, 9.0, 4.0),
             impact_line(241, 't', 'f', 1, 9.0, 4.0), impact_line(242, 't', 'f', 1, 9.0, 4.0), impact_line(243, 't', 'f', 1, 9.0, 4.0)]

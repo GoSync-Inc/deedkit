@@ -48,6 +48,7 @@ GAP_FACTOR = 1.5     # two samples further apart than this many intervals mean a
 PS = ['/bin/ps', '-axo', 'uid=,pid=,stat=,lstart=,cputime=,rss=,comm=']
 CLASSES = ('overlap', 'paused', 'contended_alone', 'phase_alone', 'idle')
 COUNTERS = ('free', 'inactive', 'speculative')
+ADMIT_FLOOR_GB = 7.0  # the service's admit_min_available_gb (ANYM-684): the summary estimates admission from the busy flags and this
 RETRY_EVERY = 40     # loop passes between two retries of a summary that could not be written
 
 
@@ -157,6 +158,12 @@ def parse_line(line: str) -> dict | None:
         return None
 
 
+def percentile(values: list[float], q: float) -> float:
+    """Nearest rank: the smallest value with at least q of the values at or below it."""
+    ordered = sorted(values)
+    return ordered[min(len(ordered), max(1, math.ceil(q * len(ordered)))) - 1] if ordered else 0.0
+
+
 def mean(values: list[float]) -> float:
     return round(sum(values) / len(values), 3) if values else 0.0
 
@@ -207,16 +214,30 @@ def summarize(lines: list[str], interval: int = INTERVAL) -> dict:
                 'load_mean': mean([r['load'] for r in group]), 'load_max': max((r['load'] for r in group), default=0.0),
                 'avail_gb_mean': mean([r['avail_gb'] for r in group]), 'avail_gb_min': min((r['avail_gb'] for r in group), default=0.0),
                 'swap_mb_mean': mean([r['swap_mb'] for r in group]), 'vm_cores_mean': mean([r['vm_cores'] for r in group]),
+                'vm_cores_p90': percentile([r['vm_cores'] for r in group], 0.9),
                 'ci_cores_mean': mean([r['ci_cores'] for r in group]), 'inf_cpu_mean': mean([r['inf_cpu'] for r in group]),
                 'inf_rss_mb_max': max((r['inf_rss_mb'] for r in group), default=0.0),
                 'stopped_mb_max': max((r['stopped_mb'] for r in group), default=0.0),
                 'stopped_samples': sum(1 for r in group if r['stopped_mb'] > 0)}
 
-    return {'samples': len(rows), 'minutes': round(len(rows) * interval / 60, 1), 'unknown_busy_samples': unknown,
-            'gaps': gaps, 'gap_minutes': round(gap_seconds / 60, 1),
-            'overlap_minutes': round(len(groups['overlap']) * interval / 60, 1), 'overlap_episodes': episodes,
-            'longest_overlap_minutes': round(longest * interval / 60, 1), 'overlap_while': dict(by_who),
-            **{name: describe(group) for name, group in groups.items()}}
+    # Admission as the service would have decided from what the log holds: neither busy flag true (unknown is not open) and the free
+    # memory at the floor. The per-phase memory rule and the load cap are not in the log, so this is an upper bound of the share.
+    open_rows = [r for r in rows if r['between'] == 'f' and r['ci'] == 'f']
+    admitted = [r for r in open_rows if r['avail_gb'] >= ADMIT_FLOOR_GB]
+    result = {'samples': len(rows), 'minutes': round(len(rows) * interval / 60, 1), 'unknown_busy_samples': unknown,
+              'gaps': gaps, 'gap_minutes': round(gap_seconds / 60, 1),
+              'busy_open_percent': round(100 * len(open_rows) / len(rows), 1), 'admitted_percent': round(100 * len(admitted) / len(rows), 1),
+              'overlap_minutes': round(len(groups['overlap']) * interval / 60, 1), 'overlap_episodes': episodes,
+              'longest_overlap_minutes': round(longest * interval / 60, 1), 'overlap_while': dict(by_who),
+              'avail_gb_min': min(r['avail_gb'] for r in rows),
+              'swap_mb_first': rows[0]['swap_mb'], 'swap_mb_last': rows[-1]['swap_mb'], 'swap_mb_max': max(r['swap_mb'] for r in rows),
+              **{name: describe(group) for name, group in groups.items()}}
+    overlap = groups['overlap']
+    result['headline'] = (f"admitted {result['admitted_percent']:.1f} % | overlap {result['overlap_minutes']:.1f} min | avail_gb min "
+                          + (f"{result['overlap']['avail_gb_min']:.1f} in overlap" if overlap else "n/a (no overlap)")
+                          + f", {result['avail_gb_min']:.1f} all day | Between VM p90 "
+                          + (f"{result['overlap']['vm_cores_p90']:.2f} cores in overlap" if overlap else "n/a (no overlap)"))
+    return result
 
 
 def day_of(now: float) -> str:
@@ -325,7 +346,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == 'summarize':
         lines = [line for file in args.files for line in file.read_text().splitlines()]
-        print(json.dumps(summarize(lines, args.interval), indent=2))
+        summary = summarize(lines, args.interval)
+        print(json.dumps(summary, indent=2))
+        if 'headline' in summary:
+            print(summary['headline'])
         return 0
     return run_log(args.dir, args.busy_file, args.interval, args.hours)
 

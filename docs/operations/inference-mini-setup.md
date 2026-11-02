@@ -723,7 +723,7 @@ active. The first rule (a 60 s mean of 0.1 core, one sample of 0.5 core) kept mo
 | Between busy: one sample | `--vm-spike-cores` | 4.0 | `0.5` |
 | Hold after the last high reading (and after a probe start) | `--vm-hold-seconds` | 120 (unchanged) | |
 | `deedkit_ci` and a Between container | the probe | unchanged: still busy | |
-| Admission floor: free memory + what the supervisor measured of the engines this service holds loaded, at admit and at the start of every phase | `admit_min_available_gb` in `config.json` (default 7.0 in the code) | 7.0; unreadable memory = 0 = refused, reason `memory_low` | `0` (off) |
+| Admission floor: free memory + what the supervisor measured of the engines this service holds loaded, at admit and at the start of every phase | `admit_min_available_gb` in `config.json` (default 7.0 in the code) | 7.0; unreadable memory = 0 = refused, reason `memory_floor` (the per-phase rule keeps `memory_low`) | `0` (off) |
 
 The memory supervisor's kill is unchanged. With the yielder off (it ships off, section 13c) a job that is running when Between starts
 is not stopped: it runs on at Nice 20 and Standard QoS (section 5). Watch the duty and impact logs (13, 13b): `avail_gb` minimum,

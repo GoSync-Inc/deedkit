@@ -335,7 +335,7 @@ async def test_the_admission_floor_refuses_below_seven_gb_and_admits_at_it(env):
         for free in (5.1, 6.9):
             s.probe.available = free
             reply = await s.chat(job("low"))
-            assert reply.status == 503 and reply.headers["x-admission-reason"] == "memory_low", free
+            assert reply.status == 503 and reply.headers["x-admission-reason"] == "memory_floor", free
             assert (await s.get("/health", key=None)).json()["admission"] == "closed", free
         assert started() == []
         s.probe.available = 7.0  # the floor itself is admitted
@@ -359,7 +359,7 @@ async def test_the_admission_floor_fails_closed_when_memory_cannot_be_read(env):
         assert s.service.admission.resident_total() == 8.0
         s.probe.available = 0.0
         reply = await s.chat(job("unreadable"))
-        assert reply.status == 503 and reply.headers["x-admission-reason"] == "memory_low"
+        assert reply.status == 503 and reply.headers["x-admission-reason"] == "memory_floor"
         assert (await s.get("/health", key=None)).json()["admission"] == "closed"
 
 
@@ -376,14 +376,14 @@ async def test_the_floor_credits_what_the_engines_measure_not_what_is_configured
         await s.until(lambda: key in admission.measured)  # the supervisor ticked: the fake probe measures 0.0
         s.probe.available = 6.9  # the configured 4.5 would credit it up to 11.4: nothing measured, nothing credited
         reply = await s.chat(vis())
-        assert reply.status == 503 and reply.headers["x-admission-reason"] == "memory_low"
+        assert reply.status == 503 and reply.headers["x-admission-reason"] == "memory_floor"
         s.probe.rss_fn = lambda pgid: 3.84  # the worker really holds 3.84 GB
         await s.until(lambda: admission.credit() == 3.84)
         s.probe.available = 3.2  # 3.2 + 3.84 = 7.04: the floor and the per-phase reserve (3.0) both pass
         assert (await s.chat(vis())).status == 200
         s.probe.available = 3.1  # 3.1 + 3.84 = 6.94 (4.5 configured would have said 7.6): only the floor refuses
         reply = await s.chat(vis())
-        assert reply.status == 503 and reply.headers["x-admission-reason"] == "memory_low"
+        assert reply.status == 503 and reply.headers["x-admission-reason"] == "memory_floor"
         s.probe.rss_fn = lambda pgid: 6.0  # above the configured figure is not credited above it (and within the supervisor's share limit)
         await s.until(lambda: admission.measured.get(key) == 6.0)
         assert admission.credit() == 4.5
@@ -396,7 +396,7 @@ async def test_the_floor_is_checked_again_when_the_phase_starts_and_costs_no_ext
     async with env.running(**FLOOR) as s:
         admission, key = s.service.admission, ("vision-default", "vlm")
         s.probe.available = 6.5
-        assert admission.check(key, 2.0, "gpu").reason == "memory_low"  # the check at the moment the slot would be granted
+        assert admission.check(key, 2.0, "gpu").reason == "memory_floor"  # the check at the moment the slot would be granted
         s.probe.available = 7.5
         assert admission.check(key, 2.0, "gpu").action == "go"
         # the arrival check and the grant check read the memory once each, floor or not (the deadline contract)
