@@ -195,7 +195,7 @@ sudo -n newsyslog -nv 2>&1 | grep -i deedkit || true'; rm -r "$OUT"
 ```
 
 Read-back: `plutil -lint` says `OK` for both; `ls -l` shows root:wheel and the modes above; the plist prints with
-`plutil -p` (UserName `_deedkitinf`, `ProcessType` `Standard`, `Nice` 10, `KeepAlive` `{SuccessfulExit = false}`, `ExitTimeOut` 960).
+`plutil -p` (UserName `_deedkitinf`, `ProcessType` `Standard`, `Nice` 20, `KeepAlive` `{SuccessfulExit = false}`, `ExitTimeOut` 960).
 
 ### Sandbox proof (card criterion 2, `[open: measured]`)
 
@@ -366,7 +366,7 @@ Expected: `busy.json` is `-rw-r----- <admin> _deedkitinf`, `ts` within a few sec
 true only if Between or a test run is active (`between` also reads the CPU of the `_betweenci` colima VMs' Virtualization
 processes: Between's CI runs inside them, where no Docker context of the admin account sees it; busy while their summed
 %cpu averages 10 % over 60 s or spikes to 50 %, and for 120 s after the last such reading or after the probe's own start); the service is `running` under `/usr/bin/sandbox-exec`, `ps -axo
-user,nice,args` shows `_deedkitinf` with NI 10; `/health` answers `{"status": "ok", "queue": ..., "admission":
+user,nice,args` shows `_deedkitinf` with NI 20; `/health` answers `{"status": "ok", "queue": ..., "admission":
 "open"|"closed"}` (closed while Between is busy: that is the design). If the `logs/` files were created by launchd as
 root, `chown _deedkitinf` them and record it. Then the deploy script's own read-back, which also proves
 `/v1/models` with the probe key and that `release` equals the SHA: `python3 scripts/inference_deploy.py "$SHA"`
@@ -376,7 +376,7 @@ system/com.deedkit.inference` (then `-busy`) and remove the plists, section 14.
 `ProcessType` of the service is `Standard`, not `Background`: Background put the engines on the efficiency cores with
 throttled I/O and made speech about 17 times slower on the mini (A/B 11-02, same requests: warm `note_ru` RTF 0.36 against
 0.021). The busy probe stays `Background`. Between's and the test runs' priority does not come from the QoS class: the
-service runs at `Nice` 10 like the remote tests, and an executing phase is not suspended when they start; protection is
+service runs at `Nice` 20, below the remote tests (10), and an executing phase is not suspended when they start; protection is
 admission (no new request or phase while `busy.json` says busy) and the length of a phase. The overlap measurement of
 11-02 is in the PR that made the change (ANYM-684).
 
@@ -398,7 +398,7 @@ sudo -n install -o root -g wheel -m 644 $D/plist.new $PL; plutil -extract Proces
 python3 scripts/inference_deploy.py "$SHA" || echo "deploy failed: the job may be unloaded, see below"
 ```
 
-Read-back after the deploy: `ssh "$MINI" 'ps -axo user,nice,args | grep "[_]deedkitinf.*sandbox-exec"'` shows the new process (NI 10) and
+Read-back after the deploy: `ssh "$MINI" 'ps -axo user,nice,args | grep "[_]deedkitinf.*sandbox-exec"'` shows the new process (NI 20) and
 `sudo -n launchctl print system/com.deedkit.inference | grep -E "state|pid"` says `running` under a pid different from before. Undo:
 `ssh "$MINI" "sudo -n install -o root -g wheel -m 644 $D/plist.orig $PL && sudo -n cmp $D/plist.orig $PL"`, then the same deploy
 (`inference_deploy.py "$SHA"` again: a release already on the mini is only drained, re-pointed and restarted) so the job is loaded

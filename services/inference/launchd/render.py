@@ -3,7 +3,7 @@
 
 Stdlib only; nothing here touches the mini. `render.py --admin NAME --admin-home DIR --python PATH --out DIR` writes
 
-    com.deedkit.inference.plist       LaunchDaemon of the service: user _deedkitinf, sandboxed, nice 10, ProcessType Standard
+    com.deedkit.inference.plist       LaunchDaemon of the service: user _deedkitinf, sandboxed, nice 20, ProcessType Standard
     com.deedkit.inference-busy.plist  LaunchDaemon of the busy probe: the admin account, KeepAlive
     deedkit-inference.sb              sandbox-exec profile: no network but accepting on loopback 8090; the service home read-only
     deedkit-inference.newsyslog       /etc/newsyslog.d line for the service logs
@@ -52,10 +52,11 @@ def render_service_plist(admin: str, admin_home: str, python: str) -> bytes:
         # drain: a deploy's SIGTERM must leave the old release stopped until `kickstart`.
         'KeepAlive': {'SuccessfulExit': False},
         # Standard, not Background: Background pins the process to the efficiency cores with low I/O priority and made
-        # speech 17x slower on the mini (A/B 11-02: warm RTF 0.36 vs 0.021, same requests, same load). Between keeps
-        # its priority through Nice 10 and the admission gate, not through the QoS class.
+        # speech 17x slower on the mini (A/B 11-02: warm RTF 0.36 vs 0.021, same requests, same load). Between and the
+        # remote tests keep their priority through Nice 20, the lowest the scheduler offers, so the engines yield under
+        # contention but still run on the performance cores, and through the admission gate (no new work while busy).
         'ProcessType': 'Standard',
-        'Nice': 10,
+        'Nice': 20,
         'ExitTimeOut': EXIT_TIMEOUT,
         'ThrottleInterval': 10,
         'StandardOutPath': LOG_OUT,

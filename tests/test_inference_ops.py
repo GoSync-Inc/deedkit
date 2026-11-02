@@ -64,8 +64,8 @@ def test_plist_is_loopback_nice_sandboxed_and_runs_as_the_service_user():
     profile = render.render_sandbox_profile()
     args = plist['ProgramArguments']
     assert plist['UserName'] == '_deedkitinf' and plist['GroupName'] == '_deedkitinf'
-    # Standard: Background (efficiency cores, throttled I/O) made speech 17x slower on the mini; the busy probe stays Background
-    assert plist['ProcessType'] == 'Standard' and plist['Nice'] == 10
+    # Standard at Nice 20: Background (efficiency cores, throttled I/O) made speech 17x slower on the mini; the busy probe stays Background
+    assert plist['ProcessType'] == 'Standard' and plist['Nice'] == 20
     assert plistlib.loads(render.render_busy_plist(**{k: ADMIN[k] for k in ('admin', 'admin_home', 'python')}))['ProcessType'] == 'Background'
     assert plist['ExitTimeOut'] >= 900 and plist['RunAtLoad'] is True
     # sandbox-exec wraps the whole service (a shell that sets the release and execs it, so the tree is one), with the
