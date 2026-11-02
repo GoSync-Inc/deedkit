@@ -88,7 +88,8 @@ Expanding a result:
 Search, context and history do not call Telegram/WhatsApp and do not move the ACK.
 MCP and REST use one Store/policy layer. For a name, first call
 `search_people`, then search messages by the returned account/sender_id.
-For files, `search_files` gives attachment_id, the source message and the indexing status;
+For files, `search_files` (narrowed by `media_kind` and `ready`, see [FILE_INDEX.md](FILE_INDEX.md))
+gives attachment_id, the source message and the indexing status;
 `get_file_text` returns the text in parts with the original's SHA256 and the source revision.
 
 ## 0.9 query options

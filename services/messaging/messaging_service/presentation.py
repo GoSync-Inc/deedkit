@@ -13,7 +13,7 @@ CONVERSATION_FIELDS = ('body','kind','is_service','display_text','position','ord
 FILE_FIELDS = ('attachment_id','id','message_id','account','chat','revision','sha256','mime',
     'bytes','display_name','download_status','extraction_status','enrichment_status',
     'truncated','error_code','title','document_type','snippet','match_type',
-    'matched_content','match_sources','message_context','excerpt_source','transcript_ready','text_excerpt','processing_profile','error_detail','attempts','next_due')
+    'matched_content','media_class','match_sources','message_context','excerpt_source','transcript_ready','text_excerpt','processing_profile','error_detail','attempts','next_due')
 
 
 TRANSCRIPT_BODY_CHARS = 2000
