@@ -1094,7 +1094,7 @@ attribute names, not the CloudEvents HTTP binding:
 | `calendar.event.cancelled` | `calendar_ref`, `event_ref`, `start_at` |
 | `calendar.event.starting` | `calendar_ref`, `event_ref`, `start_at`, `lead_minutes` (1–1440); `expires_at` must equal `start_at` |
 | `call.finished` | `call_id`, `status` (`finished`), `end_reason`, `transcript` (`final`); optional `duration_s` (0–86400), `outcome` |
-| `call.failed` | `call_id`, `status`, `end_reason` |
+| `call.failed` | `call_id`, `status` (`failed` or `finished`), `end_reason`; optional `provider_cause` (a token) and `provider_code` (1–999999, only beside a cause), see below |
 | `call.not_answered` | `call_id`, `end_reason` (`no_answer`, `busy`, `canceled`) |
 | `call.interrupted` | `call_id`, `end_reason` (`service_restart`) |
 | `call.owner_request` | `call_id`, `decision_id`, `state` (`pending`); `urgency=now` and `expires_at` = the decision's stored deadline |
@@ -1103,6 +1103,37 @@ References are `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`; `end_reason` and `outcome` a
 tokens of at most 48 characters. No titles, places, descriptions, guest names, destinations,
 transcripts or owner answers. `data` is at most 1 KiB (as PostgreSQL prints jsonb); the module
 seq in `id` is at most 2^53-1.
+
+#### `call.failed` provider cause (ANYM-695)
+
+`call.failed` is the event of a call that did not reach a normal end: a model error, a Twilio status
+`failed` (`end_reason` `provider_failed`) and a refused dial (`end_reason` `provider_rejected`, `status`
+`finished`: Twilio refused the create-call, so the call never rang). A subscriber to `call.finished`
+therefore no longer receives refusals and one to `call.failed` does; `call.finished` keeps every call that
+ended after the dial was accepted without a provider failure.
+
+When the call has a Twilio `provider_error`, the event adds two flat keys: `provider_cause`, one of the closed
+list below, and `provider_code`, Twilio's integer error code (1–999999), absent when Twilio gave none. The list
+equals `get_call_status`'s `provider_error.cause`; in one sentence, `provider_error.cause` is the event's
+`provider_cause` and `provider_error.code` its `provider_code`. No provider text, number or destination is in
+an event. **No `provider_cause` means the cause was not known when the call ended, or the route is not Twilio;
+read `get_call_status`.** The usual case is a mid-call drop: the poll ends the call as `provider_failed` before
+Twilio's status callback with the `ErrorCode` arrives, and an event is written once and never edited.
+Refusals from before this change get no new event.
+
+| Cause (`provider_cause`) | Who acts |
+| --- | --- |
+| `geo_permission_missing` | The owner, in the Twilio console (Voice geo permissions). Never retry it with another number format |
+| `destination_unverified` | The owner, in the Twilio console (a trial account calls only verified numbers) |
+| `source_number_invalid` | The owner, in the Twilio console |
+| `destination_blocked` | The owner, in the Twilio console |
+| `provider_auth_failed` | The owner, in the Twilio console and the service environment |
+| `provider_rejected_other` | The owner reads `provider_code` in Twilio's error catalog |
+| `call_failed_other` | The owner reads `provider_code`; nothing is retried automatically |
+| `invalid_destination` | The agent, with another input (E.164: `+` and 8 to 15 digits) |
+| `destination_not_reachable` | The agent, with another input |
+| `destination_not_dialable` | The agent, with another input |
+| `rate_limited` | Nobody: wait, then prepare a new call |
 
 Producers' read endpoint (`GET /v1/events?after=<seq>&limit=<n>`, ANYM-563 and ANYM-565; the router,
 ANYM-575, applies `read_page`). A page is `{events, next_after, has_more, retention_floor,

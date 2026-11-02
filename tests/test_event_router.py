@@ -331,6 +331,29 @@ def test_a_stalled_module_never_holds_a_database_transaction(routed, producers, 
         'idle_in_transaction_session_timeout': '5000'}
 
 
+# spec: ANYM-695
+def test_a_five_key_call_failed_page_is_published_and_opens_no_gap(routed, producers, tmp_path):
+    store, connect = routed
+    token = subscriber(store)
+    sid = mixed(store, token, types=('call.failed',))
+    producer = producers()
+    module = producer.module(tmp_path)
+    sweep(connect, module)
+    data = {'call_id': 'call-1', 'status': 'finished', 'end_reason': 'provider_rejected',
+        'provider_cause': 'geo_permission_missing', 'provider_code': 21215}
+    producer.add({**call_event(1), 'type': 'call.failed', 'data': data})
+    producer.add({**call_event(2, 'call-2'), 'type': 'call.failed', 'data': {k: data[k] for k in list(data)[:3]} | {
+        'call_id': 'call-2'}})
+    sweep(connect, module)
+    assert [key for _, key, _ in journal(store)] == ['calls:1', 'calls:2']
+    with store.pool.connection() as c:
+        assert c.execute('SELECT data FROM module_events WHERE seq=1').fetchone()['data'] == data
+    cursor, gaps = router_state(store)
+    assert cursor['after_seq'] == 2 and gaps == []
+    view = store.get_subscription(token, sid)['module_stream']
+    assert view['health'] == [] and view['sources'][0]['coverage'] == 'complete'
+
+
 # spec: ANYM-575
 def test_a_malformed_event_is_quarantined_the_page_continues_and_coverage_stays_incomplete(routed, producers,
         tmp_path):
