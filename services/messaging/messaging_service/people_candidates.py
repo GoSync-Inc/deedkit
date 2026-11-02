@@ -16,7 +16,8 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
     bounded(limit);valid_text(query,200);valid_text(after,4096)
     if type(transliterate) is not bool or type(group_by_sender) is not bool:raise APIError('invalid_filter')
     accounts=filter_values(accounts);chats=filter_values(chats)
-    query=normalize(query);fold=fold_pattern(query)
+    # The cursor binding keeps the form it always had, so a cursor issued before ANYM-663 still continues.
+    bound_query=query.strip().lstrip('@').lower();query=normalize(query);fold=fold_pattern(query)
     pattern='%'+query.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
     scope,args=scope_filter(p,'m')
     clauses=[scope,'NOT m.deleted','sp.account=m.account','sp.chat=m.chat','sp.sender=m.sender']
@@ -43,7 +44,9 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
     literal_fields="ARRAY[lower(sp.sender),lower(sp.username),lower(sp.display_name)]"
     tokens="regexp_split_to_array(lower(sp.display_name||' '||sp.username),'[^[:alnum:]]+')"
     translit_tokens="regexp_split_to_array(messenger_transliterate(sp.display_name||' '||sp.username),'[^[:alnum:]]+')"
-    rank="0" if not query else """CASE
+    # ANYM-663: a row only the ё/е fold finds (no literal match) is rank 7, behind every literal row; the
+    # transliteration ranks 1, 3 and 5 would otherwise put it ahead of one. NULL (no identity row) is no match.
+    rank="0" if not query else """CASE"""+("" if fold is None else " WHEN NOT coalesce("+match+",false) AND "+folded+" THEN 7")+"""
         WHEN q.literal=ANY("""+literal_fields+""") OR q.literal=ANY(string_to_array(coalesce(identity.search_text,''),' ')) THEN 0
         WHEN q.transliterate AND EXISTS(SELECT 1 FROM unnest("""+literal_fields+""") field
           WHERE messenger_transliterate(field)=ANY(q.terms)) THEN 1
@@ -52,7 +55,7 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
         WHEN EXISTS(SELECT 1 FROM unnest("""+tokens+""") token WHERE token LIKE q.prefix) THEN 4
         WHEN q.transliterate AND EXISTS(SELECT 1 FROM unnest("""+translit_tokens+""") token
           WHERE token LIKE ANY(q.prefixes)) THEN 5
-        WHEN """+match+""" THEN 6"""+("" if fold is None else " WHEN "+folded+" THEN 7")+""" ELSE """+("7" if fold is None else "8")+""" END"""
+        WHEN """+match+""" THEN 6 ELSE 7 END"""
     identity_cte,identity_args=visible_cte(p)
     cte='WITH '+identity_cte+''', q AS (SELECT %s::text AS pattern,%s::text[] AS variants,%s::text AS literal,
         %s::text[] AS terms,%s::text AS prefix,%s::text[] AS prefixes,%s::boolean AS transliterate,%s::text AS fold), observed AS MATERIALIZED (
@@ -62,7 +65,7 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
             '''+rank+''' AS match_rank
         FROM sender_profiles sp JOIN messages m ON m.id=sp.source_message '''+people_join()+''' CROSS JOIN q
         WHERE '''+' AND '.join(clauses)+') '
-    binding=cursor_binding(p,'people',{'query':query,'accounts':accounts,'chats':chats,
+    binding=cursor_binding(p,'people',{'query':bound_query,'accounts':accounts,'chats':chats,
         'transliterate':transliterate,'group_by_sender':group_by_sender,'spelling_candidates':2,
         **({'person':person} if members is not None else {})})
     # A visible membership change is cursor_changed; a hidden one leaves the digest alone.
@@ -82,7 +85,7 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
             " min(match_rank) AS match_rank FROM observed GROUP BY account,sender_id) "
         if after:
             pos=position(decode_cursor(after,binding),{'rank','account','sender'})
-            if type(pos['rank']) is not int or not 0<=pos['rank']<=8:
+            if type(pos['rank']) is not int or not 0<=pos['rank']<=7:
                 raise APIError('invalid_cursor')
             position_text(pos['account']);position_text(pos['sender'])
             anchor=c.execute(cte+'SELECT match_rank FROM grouped WHERE account=%s AND sender_id=%s',
@@ -96,7 +99,7 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
         if after:
             if query or members is not None:
                 pos=position(decode_cursor(after,binding),{'rank','id'})
-                if type(pos['rank']) is not int or not 0<=pos['rank']<=8:
+                if type(pos['rank']) is not int or not 0<=pos['rank']<=7:
                     raise APIError('invalid_cursor')
                 position_text(pos['id'])
                 anchor=c.execute(cte+'SELECT match_rank FROM observed WHERE id=%s',[*query_args,pos['id']]).fetchone()

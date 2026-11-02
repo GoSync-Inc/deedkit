@@ -108,6 +108,52 @@ def test_people_fold_keeps_group_by_sender_and_hidden_chats(seeded):
 
 
 # spec: ANYM-663
+def test_people_folded_rows_sort_after_literal_ones_also_with_transliteration(seeded):
+    s,ar,key=fold_directory(seeded)
+    ar.ingest(event(account='people-test',sender='56',provider_id='fold-56',
+        sender_profile={'display_name':'Фёдор Пример Два','username':'fedor'}))
+    for grouped in (False,True):
+        rows=s.search_people(key,'федор',transliterate=True,group_by_sender=grouped)['items']
+        assert [r['match_type'] for r in rows]==['literal']+['literal_folded']*2
+
+
+def people_binding(p,query,**changes):
+    from messaging_service.search_query import cursor_binding
+    return cursor_binding(p,'people',{'query':query,'accounts':None,'chats':None,'transliterate':False,
+        'group_by_sender':False,'spelling_candidates':2,**changes})
+
+
+# spec: ANYM-663
+def test_people_cursors_issued_before_the_fold_still_continue(seeded):
+    from messaging_service.search_query import decode_cursor,encode_cursor
+    s,ar,key,_=directory(seeded)
+    for sender,name in (('71','xxfedor'),('72','yyfedor'),('73','Анна Иванова Вторая')):
+        ar.ingest(event(account='people-test',sender=sender,provider_id='old-'+sender,sender_profile={'display_name':name}))
+    with s.pool.connection() as c:c.execute("UPDATE sender_profiles SET id='cursor-'||sender WHERE sender IN ('71','72')")
+    with s.authorized(key,'search_people') as (c,p):
+        # A transliteration-only candidate was rank 7 and still is: its old cursor continues after it.
+        old=encode_cursor(people_binding(p,'федор',transliterate=True),{'rank':7,'id':'cursor-71'})
+        legacy_double_space=people_binding(p,'анна  иванова')
+    assert [r['id'] for r in s.search_people(key,'федор',transliterate=True,after=old)['items']]==['cursor-72']
+    # The binding of a query with inner spaces is the one it always had (the match itself collapses them).
+    first=s.search_people(key,'Анна  Иванова',limit=1)
+    assert len(first['items'])==1 and first['next_cursor']
+    assert set(decode_cursor(first['next_cursor'],legacy_double_space))=={'rank','id'}
+    assert len(s.search_people(key,'Анна  Иванова',after=first['next_cursor'],limit=1)['items'])==1
+
+
+# spec: ANYM-663
+def test_people_rank_eight_is_still_an_invalid_cursor_for_a_fold_query(seeded):
+    from messaging_service.search_query import encode_cursor
+    s,_,key=fold_directory(seeded)
+    with s.authorized(key,'search_people') as (c,p):
+        flat=encode_cursor(people_binding(p,'федор'),{'rank':8,'id':'x'})
+        grouped=encode_cursor(people_binding(p,'федор',group_by_sender=True),{'rank':8,'account':'people-test','sender':'51'})
+    with pytest.raises(APIError,match='invalid_cursor'):s.search_people(key,'федор',after=flat)
+    with pytest.raises(APIError,match='invalid_cursor'):s.search_people(key,'федор',group_by_sender=True,after=grouped)
+
+
+# spec: ANYM-663
 def test_people_fold_pattern_is_never_user_controlled(seeded):
     s,ar,key,_=directory(seeded)
     for sender,name in (('61','ёж.* (x)'),('62','ежабв'),('63','еж50xx'),('64','ёж[y]'),('65','ёж\\z'),
