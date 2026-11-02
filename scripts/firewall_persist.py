@@ -92,16 +92,38 @@ def covers(tokens, bridge):
     return not hit if index > 0 and tokens[index - 1] == '!' else hit
 
 
+def bypasses(rule, bridge, chains, top=True, seen=()):
+    """Whether a rule can accept or return `bridge`'s traffic out of its chain (following jumps and gotos into user chains).
+
+    Conditions other than the interface are ignored, so this errs towards "yes": an unclear flow is rejected, not trusted.
+    A RETURN ends a user chain's walk quietly (back to the caller) and only leaves the base chain from the base chain itself
+    or through a goto.
+    """
+    tokens = rule.split()
+    flag = '-g' if '-g' in tokens else '-j'
+    if flag not in tokens or not covers(tokens, bridge):
+        return False
+    target = tokens[tokens.index(flag) + 1]
+    if target == 'ACCEPT':
+        return True
+    if target == 'RETURN':
+        return top
+    if target in chains and target not in seen:
+        return any(bypasses(inner, bridge, chains, top and flag == '-g', (*seen, target)) for inner in chains[target])
+    return False
+
+
 def extract(text, table, chain, bridges, family='v4', kernel=False):
     """The rules of one table of an `iptables-save`/ufw rules text that belong to one block.
 
-    Besides the block's own rules it records `shadowed` (a rule before a managed hook in its parent chain that accepts or
-    returns that bridge's traffic, so the hook never sees it) and `late` (a managed chain declared twice or after a rule
-    that uses it: restoring the declaration empties the chain). Host-bound drops count in INPUT, or in ufw's own chain of
-    this family; in the kernel the latter only when INPUT jumps to it.
+    Besides the block's own rules it records `shadowed` (a rule before a managed hook, or before the INPUT path to a
+    managed drop, that accepts or returns that bridge's traffic directly or through jumps, so the hook never sees it) and
+    `late` (a managed chain declared twice or after a rule that uses it: restoring the declaration empties the chain).
+    Host-bound drops count in INPUT, or in ufw's own chain of this family; in the kernel the latter only when a rule of
+    INPUT that covers the bridge jumps to it.
     """
     found = {**empty_table(), 'declared': set(), 'late': [], 'shadowed': []}
-    parents, used, pending, jumped, inside = {}, set(), [], False, False
+    chains, managed, inside = {}, [], False
     ufw_input = UFW_INPUT[family]
     for raw in text.splitlines():
         line = raw.strip()
@@ -111,32 +133,37 @@ def extract(text, table, chain, bridges, family='v4', kernel=False):
             continue
         elif line.startswith(':'):
             name = line.split()[0][1:]
-            if name in (chain, 'DOCKER-USER') and (name in found['declared'] or name in used):
+            if name in (chain, 'DOCKER-USER') and (name in found['declared'] or name in chains):
                 found['late'].append(name)
             found['declared'].add(name)
         elif line.startswith('-A '):
             rule = canon(line)
             tokens = rule.split()
-            name = tokens[1]
-            used.add(name)
-            managed = '-i' in tokens and bridge_of(rule) in bridges
-            if name == chain:
+            chains.setdefault(tokens[1], []).append(rule)
+            if tokens[1] == chain:
                 found['chain'].append(rule)
-            elif name == 'INPUT' and tokens[-2:] == ['-j', ufw_input]:
-                jumped = True
-            elif managed and name in ('INPUT', ufw_input) and tokens[-1] == 'DROP':
-                (found['inputs'] if name == 'INPUT' or not kernel else pending).append(' '.join(['-A', 'INPUT', *tokens[2:]]))
-            elif name in ('DOCKER-USER', 'PREROUTING'):
-                if managed:
-                    for earlier in parents.get(name, []):
-                        before = earlier.split()
-                        if before[-2] == '-j' and before[-1] in ('ACCEPT', 'RETURN') and covers(before, bridge_of(rule)):
-                            found['shadowed'].append(earlier)
-                            break
-                    found['hooks'].append(rule)
-                parents.setdefault(name, []).append(rule)
-    if jumped:
-        found['inputs'] += pending
+            elif '-i' in tokens and bridge_of(rule) in bridges:
+                drop = tokens[1] in ('INPUT', ufw_input) and tokens[-2:] == ['-j', 'DROP']
+                if drop or tokens[1] in ('DOCKER-USER', 'PREROUTING'):
+                    managed.append((tokens[1], len(chains[tokens[1]]) - 1, rule))
+    for name, index, rule in managed:
+        bridge = bridge_of(rule)
+        path = [(name, index)]
+        entry, part = rule, 'hooks'
+        if name in ('INPUT', ufw_input):
+            entry, part = ' '.join(['-A', 'INPUT', *rule.split()[2:]]), 'inputs'
+            if name == ufw_input and kernel:
+                jump = next((i for i, other in enumerate(chains.get('INPUT', []))
+                             if other.split()[-2:] == ['-j', ufw_input] and covers(other.split(), bridge)), None)
+                if jump is None:
+                    continue
+                path.insert(0, ('INPUT', jump))
+        for where, upto in path:
+            hit = next((other for other in chains[where][:upto] if bypasses(other, bridge, chains)), None)
+            if hit:
+                found['shadowed'].append(hit)
+                break
+        found[part].append(entry)
     return found
 
 
@@ -356,6 +383,12 @@ def command_output(command, *arguments):
     return result.stdout if result.returncode == 0 else ''
 
 
+def unit_wall(systemctl, unit, name):
+    """A unit timestamp as wall-clock seconds (systemctl --timestamp=unix prints @SECONDS), or None."""
+    value = command_output(systemctl, 'show', unit, '-p', name, '--timestamp=unix', '--value').strip()
+    return int(value[1:]) if value.startswith('@') and value[1:].isdigit() else None
+
+
 def unit_time(systemctl, unit, name):
     value = command_output(systemctl, 'show', unit, '-p', name, '--value').strip()
     return int(value) / 1_000_000 if value.isdigit() and int(value) > 0 else None
@@ -370,22 +403,19 @@ def process_start(pid):
         return None
 
 
-def first_container_start(docker, proc_start=process_start, boot_wall=None):
+def first_container_start(docker, proc_start=process_start, boot_wall=None, stable=False):
     """The earliest start of a running container's main process this boot, on the boot clock, or None (= unknown).
 
     The container start times Docker prints are wall-clock and a clock step would move them, so the start of the
     process itself is used. Unknown (None) when any container cannot be read, or when a container that is not running
     started during this boot (its start cannot be placed on the clock). It is the earliest *observable* start: a
-    container that restarted shows its latest one.
+    container that restarted shows its latest one. A stopped container that ever ran can be told from this boot only when
+    the wall clock is known not to have stepped since boot (`stable`, with `boot_wall` the wall time of boot, both from
+    systemd's own pair of timestamps for docker.service); otherwise it makes the answer unknown.
     """
     ids = command_output(docker, 'ps', '-aq').split()
     if not ids:
         return None
-    if boot_wall is None:
-        try:
-            boot_wall = time.time() - float(read('/proc/uptime').split()[0])
-        except (ValueError, IndexError):
-            return None
     lines = command_output(docker, 'inspect', '-f', '{{.State.Running}} {{.State.Pid}} {{.State.StartedAt}}', *ids).splitlines()
     if len(lines) != len(ids):
         return None
@@ -403,7 +433,7 @@ def first_container_start(docker, proc_start=process_start, boot_wall=None):
             when = datetime.datetime.fromisoformat(re.sub(r'(\.\d{6})\d*', r'\1', stamp.replace('Z', '+00:00')))
         except ValueError:
             return None
-        if when.year > 1970 and when.timestamp() >= boot_wall:
+        if when.year > 1970 and (not stable or boot_wall is None or when.timestamp() >= boot_wall):
             return None
     return min(starts) if starts else None
 
@@ -438,12 +468,18 @@ def receipt_cli(argv):
     raw_time = state.get('uptime') if mine and isinstance(state.get('uptime'), (int, float)) else None
     raw_ok = bool(mine and state.get('ok') is True)
     ufw = unit_time(args.systemctl, 'ufw.service', 'ExecMainExitTimestampMonotonic')
-    container = first_container_start(args.docker)
+    # The wall clock has not stepped since docker.service started when its wall and monotonic start times still differ by
+    # what the clock differs by now (they were taken at one instant).
+    docker_wall = unit_wall(args.systemctl, 'docker.service', 'ExecMainStartTimestamp')
+    docker_mono = unit_time(args.systemctl, 'docker.service', 'ExecMainStartTimestampMonotonic')
+    boot_wall = docker_wall - docker_mono if docker_wall is not None and docker_mono is not None else None
+    stable = boot_wall is not None and abs((time.time() - time.monotonic()) - boot_wall) < 2.0
+    container = first_container_start(args.docker, boot_wall=boot_wall, stable=stable)
     receipt = {'boot_id': boot, 'inference': results['inference'], 'delivery': results['delivery'],
                'ok': all(value == 'ok' for value in results.values()),
                'ufw_rules_loaded_monotonic': ufw, 'raw_step_monotonic': raw_time, 'raw_step_ok': raw_ok,
                'docker_start_monotonic': unit_time(args.systemctl, 'docker.service', 'ExecMainStartTimestampMonotonic'),
-               'first_container_monotonic': container,
+               'first_container_monotonic': container, 'clock_continuous': stable,
                'rules_before_first_container': rules_before_first_container(ufw, raw_time, raw_ok, container)}
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

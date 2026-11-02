@@ -114,6 +114,8 @@ AFTER_INIT = r"""#!/bin/sh
 STATE=${DEEDKIT_RAW_STATE:-/var/lib/deedkit/raw-step.json}
 LIMIT=${DEEDKIT_STEP_TIMEOUT:-30}
 if [ "$LIMIT" -ge 1 ] 2>/dev/null && [ "$LIMIT" -le 30 ] 2>/dev/null; then :; else LIMIT=30; fi
+TOTAL=${DEEDKIT_HOOK_TIMEOUT:-60}
+if [ "$TOTAL" -ge 1 ] 2>/dev/null && [ "$TOTAL" -le 60 ] 2>/dev/null; then :; else TOTAL=60; fi
 log() { echo "deedkit-inference raw step: $*" >&2; timeout -k 1 5 logger -t deedkit-inference-raw "$*" 2>/dev/null || true; }
 record() {
     up=$(cut -d' ' -f1 /proc/uptime 2>/dev/null) || up=0
@@ -139,13 +141,15 @@ DEEDKIT_V4
     record true ok
 }
 if [ "$1" = start ] && [ -z "$DEEDKIT_RAW_INNER" ]; then
-    DEEDKIT_RAW_INNER=1 timeout -k 2 60 sh "$0" start
+    DEEDKIT_RAW_INNER=1 timeout -k 2 "$TOTAL" sh "$0" start
     rc=$?
-    if [ "$rc" -ne 0 ]; then log "failed: hook rc=$rc"; record false "hook_$rc"; fi
+    # The fallback is a bounded child with no terminal and no pipe of the caller: a full stderr cannot hold ufw.
+    if [ "$rc" -ne 0 ]; then DEEDKIT_RAW_INNER=1 DEEDKIT_RAW_RC=$rc timeout -k 1 10 sh "$0" fallback >/dev/null 2>&1 </dev/null; fi
     exit 0
 fi
 case "$1" in
     start) step ;;
+    fallback) log "failed: hook rc=$DEEDKIT_RAW_RC"; record false "hook_$DEEDKIT_RAW_RC" ;;
 esac
 exit 0
 """

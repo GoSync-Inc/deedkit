@@ -358,16 +358,19 @@ def test_raw_step_failure_or_hang_exits_zero_and_leaves_the_previous_complete_ch
     error = f'#!/bin/sh\nhead -n 3 | {real} "$@"\nexit 1\n'
     variants = {'error': {'iptables-restore': error}, 'hang': {'iptables-restore': '#!/bin/sh\nexec sleep 60\n'},
                 'ignores_term': {'iptables-restore': "#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n"},
-                'stalled_logger': {'iptables-restore': error, 'logger': '#!/bin/sh\nexec sleep 60\n'}}
+                'stalled_logger': {'iptables-restore': error, 'logger': '#!/bin/sh\nexec sleep 60\n'},
+                # The per-command bound is longer than the outer one, so the outer bound and its fallback record the failure.
+                'outer_timeout': {'iptables-restore': '#!/bin/sh\nexec sleep 60\n', 'logger': '#!/bin/sh\nexec sleep 60\n'}}
     for name, files in variants.items():
         (wrappers / name).mkdir()
         for file_name, body in files.items():
             (wrappers / name / file_name).write_text(body)
             (wrappers / name / file_name).chmod(0o755)
     for name in variants:
+        limits = 'DEEDKIT_STEP_TIMEOUT=30 DEEDKIT_HOOK_TIMEOUT=3' if name == 'outer_timeout' else 'DEEDKIT_STEP_TIMEOUT=2'
         script = (f'iptables -t raw -A PREROUTING -d 192.0.2.77 -j ACCEPT; DEEDKIT_RAW_STATE={state} sh {first}/after.init start; '
                   'iptables-save -t raw > ' + f'{tmp_path}/{name}.before; '
-                  f'PATH={wrappers}/{name}:$PATH DEEDKIT_STEP_TIMEOUT=2 DEEDKIT_RAW_STATE={state} sh {second}/after.init start; '
+                  f'PATH={wrappers}/{name}:$PATH {limits} DEEDKIT_RAW_STATE={state} sh {second}/after.init start; '
                   f'echo rc=$?; iptables-save -t raw > {tmp_path}/{name}.after')
         started = time.monotonic()
         result = in_namespace(script)
@@ -379,8 +382,12 @@ def test_raw_step_failure_or_hang_exits_zero_and_leaves_the_previous_complete_ch
         assert f'-A {CHAIN} -d {MINI}/32 -p tcp -m tcp --dport 443 -j RETURN' in after and '100.101.102.104' not in after
         assert f'-A {CHAIN} -j DROP' in after and '-A PREROUTING -d 192.0.2.77/32 -j ACCEPT' in after
         record = json.loads(state.read_text())
-        assert record['ok'] is False and record['reason'].startswith('restore'), record
-        assert 'restore' in result.stderr
+        assert record['ok'] is False, record
+        if name == 'outer_timeout':
+            # Killed by the outer bound: the fallback (a bounded child with no terminal) records it and says nothing here.
+            assert record['reason'] == 'hook_124' and 'hook' not in result.stderr, (record, result.stderr)
+        else:
+            assert record['reason'].startswith('restore') and 'restore' in result.stderr, (record, result.stderr)
 
 
 # spec: ANYM-693
@@ -396,7 +403,8 @@ def test_after_init_text_is_bounded_idempotent_and_never_stops_ufw():
                for line in text.splitlines() if re.search(r'\biptables(-restore)?\b', line) and not line.startswith(('#', '-', ':')))
     assert 'LIMIT=30' in text
     # The diagnostics and the record are bounded too, and the whole hook runs under an outer bound.
-    assert 'timeout -k 1 5 logger' in text and 'timeout -k 1 5 sh -c' in text and 'timeout -k 2 60 sh "$0" start' in text
+    assert 'timeout -k 1 5 logger' in text and 'timeout -k 1 5 sh -c' in text and 'timeout -k 2 "$TOTAL" sh "$0" start' in text and 'TOTAL=60' in text
+    assert 'timeout -k 1 10 sh "$0" fallback >/dev/null 2>&1 </dev/null' in text
     assert 'timeout -k 2 "$LIMIT" iptables-restore' in text and text.count('timeout -k 2 "$LIMIT" "$bin"') == 2
     # The generated text carries exactly the raw rules of the command form.
     raw = [line for line in text.splitlines() if line.startswith(f'-A {CHAIN} ')]
@@ -462,6 +470,21 @@ def test_verify_rejects_a_rule_that_accepts_the_bridge_before_the_managed_hook(t
     host = Host(tmp_path)
     host.files['v4'].write_text(host.files['v4'].read_text().replace(filter_hook, '-A DOCKER-USER -j ACCEPT\n' + filter_hook))
     assert host.run('--persisted-only')[1].splitlines() == ['file_vs_repo extra:-A DOCKER-USER -j ACCEPT']
+    # Through a jump or a goto into a chain that accepts (or, for a goto, returns): the same bypass.
+    for early, inside in (('-A PREROUTING -j EARLY', '-A EARLY -j ACCEPT'), ('-A PREROUTING -g EARLY', '-A EARLY -j RETURN'),
+                          ('-A PREROUTING -j EARLY', '-A EARLY -j NEXT\n-A NEXT -i dk-inference0 -j ACCEPT')):
+        host = Host(tmp_path)
+        text = host.kernel[('iptables', 'raw')]
+        host.kernel[('iptables', 'raw')] = text.replace(raw_hook, early + '\n' + raw_hook).replace('COMMIT', ':EARLY - [0:0]\n' + inside + '\nCOMMIT')
+        code, out, _ = host.run()
+        assert code == 1 and out.splitlines()[0] == f'kernel_vs_repo extra:{early}', (early, inside, out)
+    # A chain that only logs, returns to its caller or is for another bridge is no bypass.
+    for early, inside in (('-A PREROUTING -j EARLY', '-A EARLY -j LOG'), ('-A PREROUTING -j EARLY', '-A EARLY -j RETURN'),
+                          ('-A PREROUTING -i br-other -j EARLY', '-A EARLY -j ACCEPT')):
+        host = Host(tmp_path)
+        text = host.kernel[('iptables', 'raw')]
+        host.kernel[('iptables', 'raw')] = text.replace(raw_hook, early + '\n' + raw_hook).replace('COMMIT', ':EARLY - [0:0]\n' + inside + '\nCOMMIT')
+        assert host.run()[:2] == (0, 'ok\n'), (early, inside)
     # Rules that cannot pass this bridge's traffic, or come after the hook, are not shadows.
     for harmless in ('-A PREROUTING ! -i br-other -d 172.18.0.2/32 -j DROP', '-A PREROUTING -i br-other -j ACCEPT'):
         host = Host(tmp_path)
@@ -484,6 +507,14 @@ def test_verify_counts_host_bound_drops_only_in_their_family_and_reachable_chain
     assert host.run()[1].splitlines()[0] == 'kernel_vs_repo hook_absent:dk-inference0'
     host.kernel[('iptables', 'filter')] = host.kernel[('iptables', 'filter')].replace('COMMIT', '-A INPUT -j ufw-before-input\nCOMMIT')
     assert host.run()[:2] == (0, 'ok\n')
+    # A jump from INPUT that cannot carry the managed bridges (`-i lo`) does not make ufw's chain reachable; nor can an
+    # unconditional accept before the jump be skipped over.
+    for jump in ('-A INPUT -i lo -j ufw-before-input', '-A INPUT -j ACCEPT\n-A INPUT -j ufw-before-input'):
+        host = Host(tmp_path)
+        host.kernel[('iptables', 'filter')] = host.kernel[('iptables', 'filter')].replace(drops, '-A ufw-before-input -i dk-inference').replace(
+            'COMMIT', jump + '\nCOMMIT')
+        code, out, _ = host.run()
+        assert code == 1 and out.splitlines()[0] in ('kernel_vs_repo hook_absent:dk-inference0', 'kernel_vs_repo extra:-A INPUT -j ACCEPT'), out
     # The IPv6 file's chain is not the IPv4 file's.
     host = Host(tmp_path)
     host.files['v4'].write_text(host.files['v4'].read_text().replace('-A ufw-before-input -i dk-inference', '-A ufw6-before-input -i dk-inference'))
@@ -606,7 +637,7 @@ def test_first_container_start_uses_process_start_and_is_unknown_when_a_containe
     def first(lines, proc=lambda pid: {11: 20.0, 12: 15.5}.get(pid)):
         ids.write_text('\n'.join(f'c{i}' for i in range(len(lines))) + '\n')
         inspect.write_text('\n'.join(lines) + '\n')
-        return module.first_container_start(str(docker), proc_start=proc, boot_wall=boot_wall)
+        return module.first_container_start(str(docker), proc_start=proc, boot_wall=boot_wall, stable=True)
     old = 'false 0 2026-10-01T10:00:00.123456789Z'
     assert first(['true 11 2026-11-02T09:00:20Z', 'true 12 2026-11-02T09:00:15Z', old]) == 15.5
     # A container that is not running and started this boot cannot be placed on the clock: unknown, not a guess.
@@ -617,6 +648,11 @@ def test_first_container_start_uses_process_start_and_is_unknown_when_a_containe
     ids.write_text('c0\nc1\n')
     inspect.write_text('true 11 2026-11-02T09:00:20Z\n')
     assert module.first_container_start(str(docker), proc_start=lambda pid: 20.0, boot_wall=boot_wall) is None
+    # Without proof that the wall clock has not stepped since boot, a stopped container that ever ran cannot be placed.
+    ids.write_text('c0\nc1\n')
+    inspect.write_text(f'true 11 2026-11-02T09:00:20Z\n{old}\n')
+    assert module.first_container_start(str(docker), proc_start=lambda pid: 20.0, boot_wall=boot_wall, stable=False) is None
+    assert module.first_container_start(str(docker), proc_start=lambda pid: 20.0, boot_wall=boot_wall, stable=True) == 20.0
     # Nothing ran this boot: unknown (an empty host has no first container to compare with).
     assert first([old]) is None
 
