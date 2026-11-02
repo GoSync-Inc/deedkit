@@ -17,6 +17,7 @@ import psycopg.errors
 from psycopg.types.json import Jsonb
 
 from .envelope import canonical, stable_id
+from .error_codes import CODES
 from .policy import audit, effective_permissions, lock_principal, targets
 from .store import APIError, serial
 from .outgoing import finish_durably
@@ -229,8 +230,7 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
     if validate_parameters:
         try:parameters=validate_operation(account_row['platform'],operation,parameters,provider=provider)
         except (ValueError,TypeError,UnicodeError) as exc:
-            code=str(exc) if str(exc) in ('unsupported_operation','invalid_operation_parameters','invalid_phone',
-                                          'invalid_username') else 'invalid_operation_parameters'
+            code=str(exc) if str(exc) in CODES['operation_validation'] else 'invalid_operation_parameters'
             failure=APIError(code)
             if isinstance(exc,ParameterError):failure.field_errors=exc.field_errors
             if getattr(exc,'hint',None):failure.hint=exc.hint

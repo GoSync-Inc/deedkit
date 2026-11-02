@@ -20,8 +20,12 @@ from .collector_state import CaptureSpool,CollectorState,session_lock,validate_c
 from .store import Store
 from .collector_common import DbBackoff,commit_items,validate_common,validate_ranges
 from .telegram_collector import TelegramCollector,ProviderUnavailable,private_json
+from .error_codes import CODES
 from .operational import CONNECTION_ERRORS,MEDIA_ERRORS,collector_stop
 from .media_policy import MEDIA_POLICY_FIELDS,configure_media_policy
+
+# How the adapter's error replies map to exceptions (error_codes.json, parity with the Go and JS adapters).
+PROVIDER_REPLY=CODES['provider_reply']
 
 # open_chat_by_phone: both adapter calls and the archive check (the native lookup's 10 s).
 PHONE_RESOLUTION_SECONDS=10
@@ -279,22 +283,16 @@ class NodeProvider:
         if not isinstance(result,dict) or result.get('id')!=request: raise RuntimeError('provider_protocol_error')
         if 'error' in result:
             code=result['error']
-            if isinstance(code,str) and code in ('operation_invalid_parameters','operation_disabled','operation_expired',
-                'operation_target_invalid','operation_target_unavailable','operation_unsupported',
-                'operation_query_failed','operation_result_too_large','registered_file_invalid',
-                'history_rate_limited','history_anchor_unavailable',
-                'invalid_phone','identity_unresolved','chat_not_collected','provider_timeout','rate_limited','forbidden',
-                'invite_invalid','invite_expired','chat_full','join_not_allowed','already_member','operation_target_changed'):
+            if isinstance(code,str) and code in PROVIDER_REPLY['command_rejected']:
                 from .commands import CommandRejected
                 raise CommandRejected(code)
-            if code in ('send_expired','sending_disabled','send_target_invalid','link_preview_unsupported'):
+            if code in PROVIDER_REPLY['send_rejected']:
                 from .outgoing import SendRejected
                 raise SendRejected(code)
             if code=='provider_not_ready':raise ProviderNotReady(code)
             if isinstance(code,str) and code in CONNECTION_ERRORS:raise RuntimeError(code)
-            if code in ('media_unavailable','media_reference_changed','unsupported_media_type'): raise ProviderUnavailable(code)
-            safe=MEDIA_ERRORS|{'provider_operation_failed','chat_excluded','send_receipt_mismatch',
-                'send_receipt_missing','provider_operation_uncertain'}
+            if code in PROVIDER_REPLY['media_unavailable']: raise ProviderUnavailable(code)
+            safe=MEDIA_ERRORS|set(PROVIDER_REPLY['operation_safe'])
             raise ProviderOperationError(code if isinstance(code,str) and code in safe else 'provider_operation_failed')
         return result
     @property
