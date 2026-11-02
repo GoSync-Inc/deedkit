@@ -14,6 +14,7 @@ import re
 import stat
 import subprocess
 import tempfile
+import time
 from urllib.parse import urlsplit
 
 import httpx
@@ -393,26 +394,37 @@ def exif_orientation(tiff):
     return 1
 
 
-def jpeg_orientation(head):
-    """EXIF orientation from the first bytes of a JPEG; 1 for anything else."""
-    if head[:2]!=b'\xff\xd8':return 1
-    i=2
-    while i+4<=len(head) and head[i]==0xff:
-        marker=head[i+1]
-        if marker==0xff:i+=1;continue
-        if marker==0x01 or 0xd0<=marker<=0xd8:i+=2;continue
-        if marker in (0xd9,0xda):return 1
-        length=int.from_bytes(head[i+2:i+4],'big')
+def jpeg_orientation(file):
+    """EXIF orientation of a JPEG from its segments before the image data (any number of earlier APPn segments, each
+    at most 64 KiB, read from the file the worker already holds); 1 for anything else."""
+    if file.read(2)!=b'\xff\xd8':return 1
+    for _ in range(4096):
+        marker=file.read(1)
+        if marker!=b'\xff':return 1
+        code=file.read(1)
+        while code==b'\xff':code=file.read(1)  # fill bytes
+        if not code:return 1
+        if code[0]==0x01 or 0xd0<=code[0]<=0xd8:continue
+        if code[0] in (0xd9,0xda):return 1
+        length=int.from_bytes(file.read(2),'big')
         if length<2:return 1
-        if marker==0xe1 and head[i+4:i+10]==b'Exif\x00\x00':return exif_orientation(head[i+10:i+2+length])
-        i+=2+length
+        data=file.read(length-2)
+        if len(data)<length-2:return 1
+        if code[0]==0xe1 and data[:6]==b'Exif\x00\x00':return exif_orientation(data[6:])
     return 1
 
 
-def image_probe(path):
-    raw=audio_tool(['ffprobe','-v','error','-protocol_whitelist','file,pipe','-format_whitelist',IMAGE_FORMATS,
+def image_tool(command,deadline,cap,*,capture=False):
+    """One native run inside the picture's shared deadline: what is left of it, at most `cap` seconds."""
+    left=deadline-time.monotonic()
+    if left<=0:raise ModelError('invalid_image')
+    return audio_tool(command,timeout=min(cap,left),capture=capture,codes=IMAGE_CODES)
+
+
+def image_probe(path,deadline):
+    raw=image_tool(['ffprobe','-v','error','-protocol_whitelist','file,pipe','-format_whitelist',IMAGE_FORMATS,
         '-select_streams','v:0','-show_entries','stream=codec_name,width,height:format=format_name','-of','json',str(path)],
-        timeout=20,capture=True,codes=IMAGE_CODES)
+        deadline,20,capture=True)
     try:
         value=json.loads(raw);stream=value['streams'][0]
         width,height=stream['width'],stream['height']
@@ -421,28 +433,38 @@ def image_probe(path):
     except (ValueError,TypeError,KeyError,IndexError,AttributeError):raise ModelError('invalid_image') from None
 
 
+def image_command(path,*extra):
+    # -xerror: a decode error ends the run (a header that probes fine over damaged data must not pass); -y: a second
+    # run may write over the first one's file (ffmpeg 5.1 refuses without it, also with -update 1).
+    return ['ffmpeg','-v','error','-nostdin','-y','-xerror','-noautorotate','-protocol_whitelist','file,pipe',
+        '-format_whitelist',IMAGE_FORMATS,'-i',str(path),'-map','0:v:0','-frames:v','1',*extra]
+
+
 def prepare_image(profile,path):
-    """(bytes to upload, mime, flags) for the mini: the original when it is small enough, else a scaled jpeg. The
-    original file is never touched; a failure of any kind is `invalid_image` and nothing is sent."""
-    width,height,is_jpeg=image_probe(path)
-    flags={'image_downscaled':False,'image_over_budget':False}
-    small_enough=max(width,height)<=IMAGE_EDGE and path.stat().st_size<=IMAGE_BUDGET
-    if small_enough:return path.read_bytes(),None,flags
-    filters=[]
-    if is_jpeg:
-        with path.open('rb') as head:filters+=ORIENTATION_FILTERS.get(jpeg_orientation(head.read(65536)),[])
-    if max(width,height)>IMAGE_EDGE:
-        filters.append(f'scale={IMAGE_EDGE}:{IMAGE_EDGE}:force_original_aspect_ratio=decrease')
-    with tempfile.TemporaryDirectory(prefix='archive-image-') as directory:
-        out=Path(directory)/'picture.jpg'
-        for quality in ('4','8'):
-            audio_tool(['ffmpeg','-v','error','-nostdin','-noautorotate','-protocol_whitelist','file,pipe',
-                '-format_whitelist',IMAGE_FORMATS,'-i',str(path),'-map','0:v:0','-frames:v','1',
-                *(['-vf',','.join(filters)] if filters else []),'-map_metadata','-1','-c:v','mjpeg','-q:v',quality,
-                '-update','1','-f','image2',str(out)],timeout=min(120,profile['timeout_seconds']),codes=IMAGE_CODES)
-            if not out.is_file() or not 0<out.stat().st_size<=profile['max_input_bytes']:raise ModelError('invalid_image')
-            if out.stat().st_size<=IMAGE_BUDGET:break
-        data=out.read_bytes()
+    """(bytes to upload, mime, flags) for the mini: the original (after a full decode check) when it is small enough,
+    else a scaled jpeg. The original file is never touched; every failure, timeout and file error is `invalid_image`
+    (or `image_tools_unavailable`) inside one deadline, and nothing is sent."""
+    deadline=time.monotonic()+min(120,profile['timeout_seconds'])
+    try:
+        width,height,is_jpeg=image_probe(path,deadline)
+        flags={'image_downscaled':False,'image_over_budget':False}
+        if max(width,height)<=IMAGE_EDGE and path.stat().st_size<=IMAGE_BUDGET:
+            image_tool(image_command(path,'-f','null','-'),deadline,120)  # decodes; the upload is the original bytes
+            return path.read_bytes(),None,flags
+        filters=[]
+        if is_jpeg:
+            with path.open('rb') as stream:filters+=ORIENTATION_FILTERS.get(jpeg_orientation(stream),[])
+        if max(width,height)>IMAGE_EDGE:
+            filters.append(f'scale={IMAGE_EDGE}:{IMAGE_EDGE}:force_original_aspect_ratio=decrease')
+        with tempfile.TemporaryDirectory(prefix='archive-image-') as directory:
+            for quality in ('4','8'):
+                out=Path(directory)/f'picture-q{quality}.jpg'
+                image_tool(image_command(path,*(['-vf',','.join(filters)] if filters else []),'-map_metadata','-1',
+                    '-c:v','mjpeg','-q:v',quality,'-update','1','-f','image2',str(out)),deadline,120)
+                if not out.is_file() or not 0<out.stat().st_size<=profile['max_input_bytes']:raise ModelError('invalid_image')
+                if out.stat().st_size<=IMAGE_BUDGET:break
+            data=out.read_bytes()
+    except OSError:raise ModelError('invalid_image') from None
     flags.update(image_downscaled=True,image_over_budget=len(data)>IMAGE_BUDGET)
     return data,'image/jpeg',flags
 

@@ -1,7 +1,9 @@
 import base64
 import hashlib
 import json
+import os
 from pathlib import Path
+import time
 
 import httpx
 import pytest
@@ -549,7 +551,8 @@ def fake_audio_tools(monkeypatch,*,duration=12,converted_duration=None,output_si
             stream={'duration':str(seconds),**({'codec_name':codec} if codec and not converted else {})}
             kwargs['stdout'].write(json.dumps({'streams':[stream],
                 'format':{'duration':str(seconds),**({'format_name':container} if container and not converted else {})}}).encode())
-        elif command[0]=='ffmpeg':Path(command[-1]).write_bytes(b'x'*output_size)
+        elif command[0]=='ffmpeg':
+            if command[-1]!='-':Path(command[-1]).write_bytes(b'x'*output_size)  # '-' is a decode check, no output file
         else:raise AssertionError(command)
         return subprocess.CompletedProcess(command,0)
     monkeypatch.setattr(providers.subprocess,'run',run)
@@ -711,11 +714,15 @@ def synth_image(tmp_path,name,size,*,noise=False):
     return out
 
 
-def with_exif_orientation(jpeg,orientation):
-    """The jpeg with a minimal EXIF block (big-endian TIFF, one Orientation entry) right after SOI."""
+def with_exif_orientation(jpeg,orientation,padding=0):
+    """The jpeg with a minimal EXIF block (big-endian TIFF, one Orientation entry) right after SOI, behind `padding`
+    bytes of earlier APP2 segments (a camera's ICC profile or maker data)."""
     tiff=b'MM\x00*\x00\x00\x00\x08'+b'\x00\x01'+b'\x01\x12'+b'\x00\x03'+b'\x00\x00\x00\x01'+bytes([0,orientation,0,0])+b'\x00\x00\x00\x00'
     payload=b'Exif\x00\x00'+tiff
-    return jpeg[:2]+b'\xff\xe1'+(len(payload)+2).to_bytes(2,'big')+payload+jpeg[2:]
+    app2=b''
+    while padding>0:
+        size=min(padding,65000);app2+=b'\xff\xe2'+(size+2).to_bytes(2,'big')+b'\x00'*size;padding-=size
+    return jpeg[:2]+app2+b'\xff\xe1'+(len(payload)+2).to_bytes(2,'big')+payload+jpeg[2:]
 
 
 def sent_image(request):
@@ -742,7 +749,7 @@ def fake_image_tools(monkeypatch,*,width=4000,height=3000,sizes=(1000,),timeout=
                 'format':{'format_name':'jpeg_pipe'}}).encode())
         elif command[0]=='ffmpeg':
             if timeout:raise real_subprocess.TimeoutExpired(command,1)
-            Path(command[-1]).write_bytes(b'x'*(outputs.pop(0) if len(outputs)>1 else outputs[0]))
+            if command[-1]!='-':Path(command[-1]).write_bytes(b'x'*(outputs.pop(0) if len(outputs)>1 else outputs[0]))
         else:raise AssertionError(command)
         return real_subprocess.CompletedProcess(command,0)
     monkeypatch.setattr(providers.subprocess,'run',run)
@@ -799,6 +806,77 @@ def test_the_exif_orientation_is_applied_when_a_photo_is_scaled(tmp_path,orienta
     assert picture_size(tmp_path,sent_image(seen[0])[1])==expected
 
 
+def marker_picture(tmp_path):
+    """4000x3000: white top-left quarter-box, light grey top-right, dark grey bottom-left, black elsewhere."""
+    out=tmp_path/'markers.jpg'
+    boxes=''.join(f',drawbox=x={x}:y={y}:w=1000:h=750:c={c}:t=fill' for x,y,c in [(0,0,'white'),(3000,0,'0xAAAAAA'),(0,2250,'0x555555')])
+    real_subprocess.run(['ffmpeg','-v','error','-nostdin','-y','-f','lavfi','-i','color=c=black:s=4000x3000:r=1'+boxes,
+        '-frames:v','1',str(out)],check=True,stdin=real_subprocess.DEVNULL)
+    return out.read_bytes()
+
+
+def corners(tmp_path,data):
+    """Gray values of the four corners (TL, TR, BL, BR) of a 4x4 reduction of the picture, and its size."""
+    path=tmp_path/'corner-probe';path.write_bytes(data)
+    done=real_subprocess.run(['ffmpeg','-v','error','-nostdin','-f','jpeg_pipe','-i',str(path),'-vf','scale=4:4:flags=area',
+        '-pix_fmt','gray','-f','rawvideo','-'],check=True,stdin=real_subprocess.DEVNULL,capture_output=True)
+    return [done.stdout[i] for i in (0,3,12,15)],picture_size(tmp_path,data)
+
+
+# EXIF orientation: where the stored picture's corner (x, y in 0..1) lands in the upright picture.
+ORIENTED_CORNER={1:lambda x,y:(x,y),2:lambda x,y:(1-x,y),3:lambda x,y:(1-x,1-y),4:lambda x,y:(x,1-y),
+    5:lambda x,y:(y,x),6:lambda x,y:(1-y,x),7:lambda x,y:(1-y,1-x),8:lambda x,y:(y,1-x)}
+
+
+# spec: ANYM-696
+@pytest.mark.parametrize('padding',[0,70000])
+@pytest.mark.parametrize('orientation',range(1,9))
+def test_the_exif_orientation_puts_every_corner_where_it_belongs_even_behind_other_segments(tmp_path,orientation,padding):
+    photo=with_exif_orientation(marker_picture(tmp_path),orientation,padding)
+    _,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'),mime='image/jpeg',data=photo)
+    values,size=corners(tmp_path,sent_image(seen[0])[1])
+    assert size==((2048,1536) if orientation<5 else (1536,2048))
+    stored={(0,0):255,(1,0):170,(0,1):85,(1,1):0}  # (x, y) of the stored picture's corner: its gray value
+    shown={(0,0):values[0],(1,0):values[1],(0,1):values[2],(1,1):values[3]}
+    for (x,y),gray in stored.items():
+        assert abs(shown[ORIENTED_CORNER[orientation](x,y)]-gray)<=30,(orientation,padding,(x,y),shown)
+
+
+# spec: ANYM-696
+def test_a_small_picture_with_a_valid_header_over_damaged_data_is_refused_and_nothing_is_sent(tmp_path):
+    noise=synth_image(tmp_path,'noise.png','500x400',noise=True).read_bytes()
+    assert len(noise)<700000
+    damaged=bytearray(noise)
+    for i in range(20000,20300):damaged[i]^=0xff  # the header and chunk layout stay valid
+    for name,data in (('damaged',bytes(damaged)),('truncated',noise[:30000])):
+        path=tmp_path/'original';path.write_bytes(data)
+        with pytest.raises(ModelError) as error:
+            infer(mini(tmp_path,'image'),'image',path,'image/png',transport=httpx.MockTransport(forbidden))
+        assert error.value.code=='invalid_image',name
+    _,seen=run_mini(tmp_path,'image',mini(tmp_path,'image'),data=noise)  # the intact one goes unchanged
+    assert sent_image(seen[0])[1]==noise
+
+
+# spec: ANYM-696
+def test_a_slow_picture_tool_ends_inside_the_profile_deadline_as_invalid_image_through_process(tmp_path,monkeypatch):
+    import messaging_service.enrichment as worker_module
+    fake=tmp_path/'bin';fake.mkdir()
+    (fake/'ffprobe').write_text('#!/bin/sh\nexec sleep 30\n');(fake/'ffprobe').chmod(0o755)
+    data=PNG_1X1;sha=hashlib.sha256(data).hexdigest();(tmp_path/sha).write_bytes(data)
+    row={'source_digest':sha,'bytes':len(data),'kind':'image','mime':'image/png'}
+    p=mini(tmp_path,'image',timeout_seconds=1)
+    real_path=os.environ['PATH']
+    monkeypatch.setenv('PATH',f'{fake}:{real_path}')
+    started=time.monotonic()
+    with pytest.raises(ModelError) as error:worker_module.process(tmp_path,row,p)
+    assert error.value.code=='invalid_image' and time.monotonic()-started<9  # the worker's own kill is at 11 s
+    monkeypatch.setenv('PATH',real_path)  # the next job runs with the real tools
+    bad=b'not a picture';bad_sha=hashlib.sha256(bad).hexdigest();(tmp_path/bad_sha).write_bytes(bad)
+    with pytest.raises(ModelError) as error:
+        worker_module.process(tmp_path,{**row,'source_digest':bad_sha,'bytes':len(bad)},p)
+    assert error.value.code=='invalid_image'
+
+
 # spec: ANYM-696
 def test_the_scaled_copy_drops_the_exif_block(tmp_path):
     photo=with_exif_orientation(synth_image(tmp_path,'photo.jpg','4000x3000').read_bytes(),6)
@@ -849,6 +927,7 @@ def test_the_picture_command_is_fixed_and_a_result_over_budget_is_recoded_once_a
     ffmpeg=[c for c in calls if c[0]=='ffmpeg']
     assert [c[c.index('-q:v')+1] for c in ffmpeg]==['4','8']
     first=ffmpeg[0]
+    assert '-y' in first and '-xerror' in first and first[-1]!=ffmpeg[1][-1]  # ffmpeg 5.1 will not overwrite without -y
     assert first[first.index('-protocol_whitelist')+1]=='file,pipe'
     formats=first[first.index('-format_whitelist')+1].split(',')
     assert set(formats)<={'png_pipe','jpeg_pipe','webp_pipe','gif','image2','mjpeg'} and not {'concat','hls','ffconcat'}&set(formats)
