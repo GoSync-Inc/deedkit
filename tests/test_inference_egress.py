@@ -613,7 +613,9 @@ def test_verify_ignores_a_negated_interface_rule_docker_owns_and_still_flags_a_p
     # An option the parser does not know with an option-shaped value is read as "may match", never as "does not".
     hooks = {'raw': ('PREROUTING', f'-A PREROUTING -i dk-inference0 -j {CHAIN}'), 'filter': ('DOCKER-USER', f'-A DOCKER-USER -i dk-inference0 -j {CHAIN}')}
     shapes = ('-m comment --comment "! -i dk-inference0" -j ACCEPT', '-m comment --comment "-i" -j ACCEPT', '-m comment --comment "-j" -j ACCEPT',
-              '-m comment --comment "!" -i dk-delivery0 -j ACCEPT', '-m unknownmatch --unknown-option -i -j ACCEPT')
+              '-m comment --comment "!" -i dk-delivery0 -j ACCEPT',
+              '-m comment --comment "--comment" -j ACCEPT', '-m comment --comment "--log-prefix" -j ACCEPT', '-m comment --comment "-m" -j ACCEPT',
+              '-m unknownmatch --unknown-option -i -j ACCEPT')
     for key, (chain, hook) in hooks.items():
         for shape in shapes:
             for scope in ('', '-d 198.51.100.7/32 -p tcp -m tcp --dport 8443 '):

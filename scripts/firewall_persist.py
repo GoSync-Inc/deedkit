@@ -59,8 +59,12 @@ def fields(rule):
     Anything still ambiguous (an option twice, an interface after a match) is read by the callers as "may match", so a rule
     that hides an allowance behind option-shaped text is rejected, not trusted.
     """
-    tokens = words(rule)
-    return ['\0' + token if index and tokens[index - 1] in FREE_TEXT else token for index, token in enumerate(tokens)]
+    out, consume = [], False
+    for token in words(rule):
+        # Each free-text option consumes exactly the next argument, whatever it reads like ("--comment" included).
+        out.append('\0' + token if consume else token)
+        consume = not consume and token in FREE_TEXT
+    return out
 
 
 def interface_index(tokens):
