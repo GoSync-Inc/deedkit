@@ -42,6 +42,7 @@ be labelled cloud. It takes no `local-heavy` lock: the work happens on the mini.
 | `timeout_seconds` | up to 900 (a 4-hour recording takes about 8.5 minutes); sent to the service as `X-Request-Deadline-Seconds`, its queue deadline |
 | `backpressure_seconds` | cooldown when the mini says "not now" and gives no `Retry-After`: 1 to 900, default 120 |
 | `audio_response_format` | `verbose_json` (default, with segments) or `json` |
+| `max_input_bytes` | the largest original the worker copies: default 20 MiB; up to 200 MiB for an `audio` profile, 32 MiB for `image` and `document` (ANYM-697). What is sent is capped separately, below |
 
 Audio uses `POST {base_url}/audio/transcriptions`; photos and documents use `POST {base_url}/chat/completions`, a
 document sending its extracted text without an image (scanned-PDF page images are not part of this connector).
@@ -91,6 +92,25 @@ bytes it needs. The original always stays in the archive; the metadata says what
   limit and the timeouts, and records `transcoded` and `transcode_lossy` true with `transcode_format` `opus`. On a note
   that was an mp3 or an mp4 that is expected: `opus` names the format sent, not the source's. Every other ASR provider
   keeps the mp3 transcode of ogg notes and `transcode_format` `mp3`.
+- **Large recordings (ANYM-697).** The original cap (`max_input_bytes`, up to 200 MiB for audio) is separate from
+  the upload cap: the file that is sent is at most 32 MiB less 64 KiB (the mini's body cap counts the multipart
+  framing; `UPLOAD_LIMIT_BYTES`), whatever the profile says. A source that would go unchanged but is over that cap
+  is transcoded to Opus too, so a 48 MiB mp3 of 50 minutes is sent as about 9 MB. By bytes a note of about 3 hours
+  still fits; a longer one ends as `audio_transcode_size_limit` with nothing sent: the recording is too long for one
+  upload and needs chunking (a later card), the original is kept, and the remedy is not a smaller file. A recording
+  over `max_audio_seconds` (at most 4 hours) ends as `audio_duration_limit` before any ffmpeg run. The transcode time
+  limit is `max(120 s, 60 s + duration / 20)` inside the profile's `timeout_seconds`: 120 s up to 20 minutes, 3 minutes
+  for 40, 10 minutes for 3 hours. Time is the second ceiling: one job (copy, transcode, upload of the Opus bytes at
+  the link rate, and the mini's own 0.04 x duration) must finish inside `timeout_seconds + 10`, 910 s for the mini,
+  and the mini refuses a body slower than its `upload_seconds`; in a bad link window a note that fits by bytes ends as
+  `model_timeout` or `model_http_error` and is retried. A `video/mp4` note is transcribed from its audio track
+  (`-vn`). The copy of a large original lives in the worker's `/tmp`: the `enricher-mini` tmpfs is 320 MiB; the other
+  workers keep 128 MiB, so raise their `/tmp` in the same edit before raising a local profile above 100 MiB.
+  `enrichment_failed` on a large original means the tmpfs is smaller than the profile's cap (an operator mistake), not
+  a bad file. Order on a host: the new image first (an older image refuses `max_input_bytes` above 32 MiB with
+  `invalid_model_limit` and then the audio profile is not usable), then the profile line; on a rollback restore the
+  line first. Editing the profile changes its hash, and the worker then picks every failed row of that kind again,
+  within the day budgets: check the budget before the edit and track all of those rows.
 - **Photos, `deedkit_inference` only.** A picture whose longer edge is over 2048 px or whose file is over 700 KB (700,000
   bytes, so about 930 KB as base64) is scaled by ffmpeg to a longer edge of at most 2048 px (never enlarged, EXIF
   orientation applied, one frame) and sent as jpeg, also when the source is png, webp or gif; the EXIF block, GPS

@@ -248,6 +248,12 @@ def services_on(network):
     return found
 
 
+# spec: ANYM-697
+def test_enricher_mini_has_a_tmpfs_for_a_200_mib_original_and_the_others_keep_128m():
+    assert mini_service()["tmpfs"] == ["/tmp:size=320m,noexec,nosuid"]
+    assert overlay()["x-enrichment-common"]["tmpfs"] == ["/tmp:size=128m,noexec,nosuid"]
+
+
 # spec: ANYM-688
 def test_enricher_mini_uses_a_published_build_target():
     service = mini_service()
