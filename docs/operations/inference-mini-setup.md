@@ -325,8 +325,8 @@ D="$(ssh "$MINI" 'sed -n "s/^stage //p" ~/deedkit-inference-setup.created | tail
 ssh "$MINI" "export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin; cd $D/services/inference && uv run --no-project --python /opt/homebrew/bin/python3.13 --with pillow python tests/canary/generate.py /Users/Shared/deedkit-inference/canary-set"
 ```
 
-Then run it in a **quiet window**: `busy.json` false for a minute, load below 5 and free plus inactive memory (the
-figure admission uses, `vm_stat` free + inactive) at least 8.3 GB. A canary that meets `busy_deedkit_ci` or
+Then run it in a **quiet window**: `busy.json` false for a minute, load below 5 and free plus inactive plus speculative memory
+(the figure admission uses: `vm_stat` free + inactive + speculative, as `scripts/remote-test.sh` counts it) at least 8.3 GB. A canary that meets `busy_deedkit_ci` or
 `memory_low` fails at once with HTTP 503 (that is the design, not a defect of the run), so wait and rerun:
 
 ```bash
@@ -342,7 +342,8 @@ requests against the warm bounds and described the poster in English (the prompt
 
 Record from the output: character error per image, word error per note, real-time factor, the long recording's segment
 bounds and the JSON shape; and, from `ps` and `vm_stat` while it runs, the service user's resident size and the free
-plus inactive memory. On 11-02 the vision worker held about 3.8 GB resident and free plus inactive memory read 8.9 to 9.1 GB
+plus inactive memory (before the speculative pages were counted, 11-02: the idle mini read 7.2 to 7.5 GB of free + inactive
+with 2.0 GiB more speculative, under the 7.5 GB a cold vision start needs). On 11-02 the vision worker held about 3.8 GB resident and free plus inactive memory read 8.9 to 9.1 GB
 at rest but fell to 7.6 to 7.7 GB when a request ended, under the 7.9 GB a vision phase needs (4.9 + `min_free_gb` 3.0).
 
 ## 7. Start the jobs (busy probe first)

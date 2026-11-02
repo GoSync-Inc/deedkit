@@ -73,12 +73,15 @@ class SystemProbe:
 
     @staticmethod
     def _read_available():
-        """Free plus inactive memory, the figure scripts/remote-test.sh uses. Unknown means zero (fail closed)."""
+        """Free plus inactive plus speculative memory, the figure scripts/remote-test.sh uses. Unknown means zero
+        (fail closed). macOS reclaims speculative (read-ahead) pages like free ones, and `vm_stat` reports them
+        apart: on the mini they were 2.0 GiB of 9.5 while `free + inactive` read 7.5, under the 7.5 GB a cold
+        vision start needs with nothing running (live canary 11-02)."""
         try:
             if sys.platform == "darwin":
                 text = subprocess.run(["/usr/bin/vm_stat"], capture_output=True, text=True, timeout=2).stdout
                 page = int(re.search(r"page size of (\d+) bytes", text).group(1))
-                pages = sum(int(m.group(1)) for m in re.finditer(r"Pages (?:free|inactive):\s+(\d+)", text))
+                pages = sum(int(m.group(1)) for m in re.finditer(r"Pages (?:free|inactive|speculative):\s+(\d+)", text))
                 return pages * page / 1024**3
             with open("/proc/meminfo") as handle:
                 text = handle.read()
