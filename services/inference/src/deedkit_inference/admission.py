@@ -156,7 +156,7 @@ class Admission:
             return None
         if self.monotonic() < self.settle_until:
             return Verdict("wait")  # an eviction's memory is still coming back, as for the per-phase rule
-        return Verdict("refuse", "memory_low")
+        return Verdict("refuse", "memory_floor")  # its own reason: the logs tell the floor from the per-phase memory_low
 
     def check(self, key, resident_gb, slot, *, arrival=False, anything_running=False):
         """The verdict for one phase about to start (or, with `arrival`, for a job that just arrived)."""

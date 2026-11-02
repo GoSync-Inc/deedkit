@@ -691,6 +691,17 @@ not `?` (a `?` means `busy.json` is stale or the probe is down: fix that first).
 four entries `job-impact`, `plist-impact`, `impact-dir`, `impact-bin`); copy `summary-*.json` and the logs out first, the
 undo removes the directory. A daily file is 5760 lines (about 1 MB); nothing rotates them, remove old days by hand.
 
+**The daily line (owner via the orchestrator 11-02).** `summary-DAY.json` has a `headline`:
+`flags clear 76.0 % (with raw RAM >= 7 GB 61.0 %) | overlap 12.5 min | avail_gb min 6.1 in overlap, 4.5 all day | Between VM p90 2.30 cores in overlap`, and the fields
+`flags_clear_percent` (neither busy flag true: the busy rule alone) and `flags_clear_and_ram_percent` (also raw `avail_gb` at 7 GB). Neither is
+the service's admission rate: it credits the engines it holds, can have another floor and applies the per-phase rule and the load cap; the real
+rate is the 200s against the 503s in the service log. Also `avail_gb_min`, `swap_mb_first/last/max` and `vm_cores_p90` per situation.
+`python3 impact_log.py summarize impact-DAY.log` prints the same, also for a day that is still running. To install the new monitor:
+`sudo -n install -o root -g wheel -m 0755 impact_log.py /usr/local/libexec/deedkit-impact-log`, then
+`sudo -n launchctl kickstart -k system/com.deedkit.inference-impact` (it only reads; the samples have a gap of a few seconds, which the
+summary counts as a gap). Undo: install the previous file from the checkout and kickstart again. A refusal by the floor is logged as
+`memory_floor`, by the per-phase rule as `memory_low`: `grep -c 'refusal=admission_closed:memory_floor' /Users/_deedkitinf/logs/service.err.log`.
+
 ### 13c. Yielding: what it does on the mini, how to read it, how to switch it off (ANYM-691)
 
 The service stops a running phase while Between or the remote tests use the host (README, Yielding). **It ships off**: without
@@ -723,7 +734,7 @@ active. The first rule (a 60 s mean of 0.1 core, one sample of 0.5 core) kept mo
 | Between busy: one sample | `--vm-spike-cores` | 4.0 | `0.5` |
 | Hold after the last high reading (and after a probe start) | `--vm-hold-seconds` | 120 (unchanged) | |
 | `deedkit_ci` and a Between container | the probe | unchanged: still busy | |
-| Admission floor: free memory + what the supervisor measured of the engines this service holds loaded, at admit and at the start of every phase | `admit_min_available_gb` in `config.json` (default 7.0 in the code) | 7.0; unreadable memory = 0 = refused, reason `memory_low` | `0` (off) |
+| Admission floor: free memory + what the supervisor measured of the engines this service holds loaded, at admit and at the start of every phase | `admit_min_available_gb` in `config.json` (default 7.0 in the code) | 7.0; unreadable memory = 0 = refused, reason `memory_floor` (the per-phase rule keeps `memory_low`) | `0` (off) |
 
 The memory supervisor's kill is unchanged. With the yielder off (it ships off, section 13c) a job that is running when Between starts
 is not stopped: it runs on at Nice 20 and Standard QoS (section 5). Watch the duty and impact logs (13, 13b): `avail_gb` minimum,
