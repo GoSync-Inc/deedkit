@@ -38,6 +38,11 @@ class Outbound:
         self.sql("UPDATE outgoing_messages SET created_at=created_at-%s*interval '1 second',"
             "expires_at=expires_at-%s*interval '1 second' WHERE account=%s AND status='queued'", seconds, seconds, account)
 
+    def store_send_ids(self, account):
+        with self.store.pool.connection() as c:
+            return [r['id'] for r in c.execute("SELECT id FROM outgoing_messages WHERE account=%s AND status='queued' "
+                "ORDER BY created_at,id", (account,))]
+
     def expire(self, send_id):
         self.sql("UPDATE outgoing_messages SET expires_at=clock_timestamp()-interval '5 seconds' WHERE id=%s", send_id)
 
@@ -161,6 +166,7 @@ def test_next_action_when_the_cooldown_outlasts_the_queue(out):
     block = out.outbound('out-tg')
     assert block['sender'] == 'cooling_down' and block['cooldown_remaining_s'] > block['expires_in_s']
     assert 'Nothing was sent' in block['next_action'] and 'expire before the cooldown ends' in block['next_action']
+    assert 'every queued send' in block['next_action']
     out.sql("UPDATE collector_health SET cooldown_until=clock_timestamp()+interval '30 seconds' WHERE account='out-tg'")
     short = out.outbound('out-tg')
     assert short['sender'] == 'cooling_down' and 'same thing again' in short['next_action']
@@ -273,3 +279,31 @@ def test_outbound_queue_query_uses_the_pending_index(out):
         c.execute('SET LOCAL enable_seqscan=off')
         plan = '\n'.join(row['QUERY PLAN'] for row in c.execute('EXPLAIN ' + OUTBOUND_SQL, (list(ACCOUNTS),)))
     assert 'outgoing_pending' in plan
+
+
+# spec: ANYM-671
+def test_staggered_expiries_qualify_the_cooldown_advice_to_the_affected_sends(out):
+    first, second = out.send('out-tg', 2)
+    out.sql("UPDATE outgoing_messages SET expires_at=clock_timestamp()+interval '30 seconds' WHERE id=%s", first)
+    out.states['out-tg'][0].defer(60)
+    block = out.outbound('out-tg')
+    assert block['sender'] == 'cooling_down' and block['expires_in_s'] <= 30 and block['cooldown_remaining_s'] > 30
+    assert 'oldest queued send will expire' in block['next_action'] and 'later ones may still go out' in block['next_action']
+    assert 'get_send_status' in block['next_action'] and 'every queued send' not in block['next_action']
+
+
+# spec: ANYM-671
+def test_expired_rows_and_a_disconnected_sender_give_both_instructions(out):
+    first, second = out.send('out-tg', 2)
+    out.expire(first)
+    out.connection('out-tg', 'retry_wait', 'provider_temporarily_unavailable', retry_at='2026-11-02T12:30:00+00:00')
+    waiting = out.outbound('out-tg')
+    assert waiting['queued'] == 1 and waiting['expired_unsettled'] == 1
+    assert 'even once the account is back' in waiting['next_action']
+    assert 'Wait until 2026-11-02T12:30:00' in waiting['next_action'] and 'same thing again' in waiting['next_action']
+    out.send('out-wa', 2)
+    out.expire(out.store_send_ids('out-wa')[0])
+    out.connection('out-wa', 'blocked', 'provider_temporarily_unavailable')
+    owner = out.outbound('out-wa')
+    assert 'even once the account is back' in owner['next_action'] and 'Tell the owner' in owner['next_action']
+    assert 'out-wa' in owner['next_action'] and 'same thing again' in owner['next_action']

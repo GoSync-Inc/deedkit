@@ -369,11 +369,12 @@ STALL_AFTER_S=120
 OUTBOUND_SQL='''SELECT a.id AS account,p.account IS NOT NULL AS has_policy,p.enabled,p.send_enabled,
     l.account IS NOT NULL AS has_lease,l.expires_at>clock_timestamp() AS active,h.account IS NOT NULL AS has_health,h.operations,
     greatest(0,extract(epoch FROM h.cooldown_until-clock_timestamp())) AS cooldown_s,
-    q.queued,q.oldest_age,q.expires_in,x.expired_unsettled
+    q.queued,q.oldest_age,q.expires_in,q.last_expires_in,x.expired_unsettled
     FROM accounts a LEFT JOIN account_policies p ON p.account=a.id
     LEFT JOIN collector_leases l ON l.account=a.id LEFT JOIN collector_health h ON h.account=a.id
     CROSS JOIN LATERAL (SELECT count(*) AS queued,extract(epoch FROM clock_timestamp()-min(created_at)) AS oldest_age,
-        extract(epoch FROM (array_agg(expires_at ORDER BY created_at,id))[1]-clock_timestamp()) AS expires_in
+        extract(epoch FROM (array_agg(expires_at ORDER BY created_at,id))[1]-clock_timestamp()) AS expires_in,
+        extract(epoch FROM max(expires_at)-clock_timestamp()) AS last_expires_in
         FROM outgoing_messages WHERE account=a.id AND status='queued' AND expires_at>clock_timestamp()) q
     CROSS JOIN LATERAL (SELECT count(*) AS expired_unsettled FROM outgoing_messages
         WHERE account=a.id AND status='queued' AND expires_at<=clock_timestamp()) x
@@ -403,18 +404,25 @@ def _outbound_block(row):
         block.update(sender='cooling_down',cooldown_remaining_s=round(float(row['cooldown_s']),1),
             reason='The provider asked the account to slow down; the sender resumes when the cooldown ends.')
     sender=block['sender']
-    if sender=='cooling_down' and queued and block['cooldown_remaining_s']>left:
-        block['next_action']=('Nothing was sent: the queued sends will expire before the cooldown ends. '
-            'Do not send the same thing again now; after the cooldown a new action with the owner\'s approval is needed.')
-    elif expired:
-        block['next_action']=(str(expired)+' queued send(s) are past their expiry and will not be sent'
-            +(' even once the account is back' if sender!='ready' else '')+'; a new action with the owner\'s approval is needed.')
-    elif sender=='not_ready':
-        block['next_action']=('Wait until '+str(block['retry_at'])+' and read this status again; do not send the same thing again.'
-            if block.get('retry_at') else 'Tell the owner that sending from account '+account+' is not available.')
+    # One instruction per state, composed: expired rows, the sender's recovery and the waiting queue all apply at once.
+    parts=[]
+    if expired:
+        parts.append(str(expired)+' queued send(s) are past their expiry and will not be sent'
+            +(' even once the account is back' if sender!='ready' else '')+'; a new action with the owner\'s approval is needed for them.')
+    if sender=='not_ready':
+        parts.append('Wait until '+str(block['retry_at'])+' and read this status again.' if block.get('retry_at')
+            else 'Tell the owner that sending from account '+account+' is not available.')
+    elif sender=='cooling_down' and queued and block['cooldown_remaining_s']>left:
+        last=max(0.0,float(row['last_expires_in']))
+        parts.append('Nothing was sent: '+('every queued send will expire before the cooldown ends; ask for a new action with the '
+            'owner\'s approval after the cooldown.' if block['cooldown_remaining_s']>last else
+            'the oldest queued send will expire before the cooldown ends and later ones may still go out; check each with '
+            'get_send_status before replacing any.'))
     elif queued:
-        block['next_action']=('Queued sends are waiting: do not send the same thing again. If they expire (send.failed or status '
-            'expired), a new action with the owner\'s approval is needed.')
+        parts.append('Queued sends are waiting; if one expires (send.failed or status expired), a new action with the '
+            'owner\'s approval is needed.')
+    if queued:parts.append('Do not send the same thing again while sends wait.')
+    if parts:block['next_action']=' '.join(parts)
     if sender=='ready' and queued and age>STALL_AFTER_S:
         block['reason']='Oldest queued send has waited '+str(int(age))+' s with the sender connected and no cooldown.'
     return block
