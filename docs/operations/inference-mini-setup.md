@@ -692,9 +692,10 @@ four entries `job-impact`, `plist-impact`, `impact-dir`, `impact-bin`); copy `su
 undo removes the directory. A daily file is 5760 lines (about 1 MB); nothing rotates them, remove old days by hand.
 
 **The daily line (owner via the orchestrator 11-02).** `summary-DAY.json` has a `headline`:
-`admitted 76.0 % | overlap 12.5 min | avail_gb min 6.1 in overlap, 4.5 all day | Between VM p90 2.30 cores in overlap`, and the fields
-`admitted_percent` (neither busy flag true and `avail_gb` at the 7 GB floor: an upper bound, the per-phase memory rule and the load cap are
-not in the log), `busy_open_percent`, `avail_gb_min`, `swap_mb_first/last/max` and `vm_cores_p90` per situation.
+`flags clear 76.0 % (with raw RAM >= 7 GB 61.0 %) | overlap 12.5 min | avail_gb min 6.1 in overlap, 4.5 all day | Between VM p90 2.30 cores in overlap`, and the fields
+`flags_clear_percent` (neither busy flag true: the busy rule alone) and `flags_clear_and_ram_percent` (also raw `avail_gb` at 7 GB). Neither is
+the service's admission rate: it credits the engines it holds, can have another floor and applies the per-phase rule and the load cap; the real
+rate is the 200s against the 503s in the service log. Also `avail_gb_min`, `swap_mb_first/last/max` and `vm_cores_p90` per situation.
 `python3 impact_log.py summarize impact-DAY.log` prints the same, also for a day that is still running. To install the new monitor:
 `sudo -n install -o root -g wheel -m 0755 impact_log.py /usr/local/libexec/deedkit-impact-log`, then
 `sudo -n launchctl kickstart -k system/com.deedkit.inference-impact` (it only reads; the samples have a gap of a few seconds, which the

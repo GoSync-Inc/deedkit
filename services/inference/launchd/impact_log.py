@@ -48,7 +48,7 @@ GAP_FACTOR = 1.5     # two samples further apart than this many intervals mean a
 PS = ['/bin/ps', '-axo', 'uid=,pid=,stat=,lstart=,cputime=,rss=,comm=']
 CLASSES = ('overlap', 'paused', 'contended_alone', 'phase_alone', 'idle')
 COUNTERS = ('free', 'inactive', 'speculative')
-ADMIT_FLOOR_GB = 7.0  # the service's admit_min_available_gb (ANYM-684): the summary estimates admission from the busy flags and this
+ADMIT_FLOOR_GB = 7.0  # the shipped admit_min_available_gb (ANYM-684): the summary reports the share of samples at or above it
 RETRY_EVERY = 40     # loop passes between two retries of a summary that could not be written
 
 
@@ -220,20 +220,23 @@ def summarize(lines: list[str], interval: int = INTERVAL) -> dict:
                 'stopped_mb_max': max((r['stopped_mb'] for r in group), default=0.0),
                 'stopped_samples': sum(1 for r in group if r['stopped_mb'] > 0)}
 
-    # Admission as the service would have decided from what the log holds: neither busy flag true (unknown is not open) and the free
-    # memory at the floor. The per-phase memory rule and the load cap are not in the log, so this is an upper bound of the share.
+    # What the log can say about admission, and no more: neither busy flag true (an unknown one does not count), and in addition the
+    # raw free memory at the shipped floor. It is NOT the service's decision: that credits the memory of the engines the service holds
+    # loaded, can have another floor, and also applies the per-phase memory rule and the load cap, none of which is in the log. The
+    # second figure can therefore be lower or higher than the real share; the first is the busy rule alone.
     open_rows = [r for r in rows if r['between'] == 'f' and r['ci'] == 'f']
     admitted = [r for r in open_rows if r['avail_gb'] >= ADMIT_FLOOR_GB]
     result = {'samples': len(rows), 'minutes': round(len(rows) * interval / 60, 1), 'unknown_busy_samples': unknown,
               'gaps': gaps, 'gap_minutes': round(gap_seconds / 60, 1),
-              'busy_open_percent': round(100 * len(open_rows) / len(rows), 1), 'admitted_percent': round(100 * len(admitted) / len(rows), 1),
+              'flags_clear_percent': round(100 * len(open_rows) / len(rows), 1),
+              'flags_clear_and_ram_percent': round(100 * len(admitted) / len(rows), 1),
               'overlap_minutes': round(len(groups['overlap']) * interval / 60, 1), 'overlap_episodes': episodes,
               'longest_overlap_minutes': round(longest * interval / 60, 1), 'overlap_while': dict(by_who),
               'avail_gb_min': min(r['avail_gb'] for r in rows),
               'swap_mb_first': rows[0]['swap_mb'], 'swap_mb_last': rows[-1]['swap_mb'], 'swap_mb_max': max(r['swap_mb'] for r in rows),
               **{name: describe(group) for name, group in groups.items()}}
     overlap = groups['overlap']
-    result['headline'] = (f"admitted {result['admitted_percent']:.1f} % | overlap {result['overlap_minutes']:.1f} min | avail_gb min "
+    result['headline'] = (f"flags clear {result['flags_clear_percent']:.1f} % (with raw RAM >= {ADMIT_FLOOR_GB:g} GB {result['flags_clear_and_ram_percent']:.1f} %) | overlap {result['overlap_minutes']:.1f} min | avail_gb min "
                           + (f"{result['overlap']['avail_gb_min']:.1f} in overlap" if overlap else "n/a (no overlap)")
                           + f", {result['avail_gb_min']:.1f} all day | Between VM p90 "
                           + (f"{result['overlap']['vm_cores_p90']:.2f} cores in overlap" if overlap else "n/a (no overlap)"))
