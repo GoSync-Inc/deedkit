@@ -466,6 +466,46 @@ def test_undo_drops_a_duty_logger_entry_only_on_positive_evidence(tmp_path, shel
     assert (left.read_text().strip() != '') is kept, (mode, left.read_text())
 
 
+SUDO_FAKE = '''#!/bin/sh
+while [ "$1" = -n ] || [ "$1" = -H ]; do shift; done
+if [ "$1" = -u ]; then shift 2; fi
+exec "$@"
+'''
+
+
+# spec: ANYM-691
+@pytest.mark.parametrize('shell', ['bash', 'zsh'])
+@pytest.mark.parametrize('recover_rc,ledger,loaded,stops', [
+    (0, False, False, False), (2, False, False, False),  # done / a release before the feature, no ledger
+    (4, False, False, True), (1, False, False, True),  # recover failed: nothing more is removed
+    (2, True, False, True), (0, True, False, True),  # the ledger is still there
+    (0, False, True, True)])  # the service job is still loaded
+def test_undo_stops_before_removing_anything_when_recovery_fails(tmp_path, shell, recover_rc, ledger, loaded, stops):
+    if not shutil.which(shell):
+        pytest.skip(f'{shell} is not installed')
+    doc = (ROOT / 'docs' / 'operations' / 'inference-mini-setup.md').read_text()
+    start = doc.index('if grep -qx job-service $L;')
+    snippet = doc[start:doc.index('if grep -qx job-busy $L;', start)].replace('/Users/', f'{tmp_path}/')
+    fakes, release = tmp_path / 'bin', tmp_path / '_u' / 'current' / '.venv' / 'bin'
+    for directory in (fakes, release, tmp_path / '_u' / 'state'):
+        directory.mkdir(parents=True)
+    (fakes / 'sudo').write_text(SUDO_FAKE)
+    (fakes / 'launchctl').write_text(f'#!/bin/sh\n[ "$1" = print ] && exit {0 if loaded else 113}\nexit 0\n')
+    (release / 'deedkit-inference').write_text(f'#!/bin/sh\n[ "$1" = recover ] || exit 9\nexit {recover_rc}\n')
+    for fake in (fakes / 'sudo', fakes / 'launchctl', release / 'deedkit-inference'):
+        fake.chmod(0o755)
+    if ledger:
+        (tmp_path / '_u' / 'state' / 'paused.json').write_text('{}')
+    list_file, left = tmp_path / 'ledger', tmp_path / 'left'
+    list_file.write_text('job-service\nhome\n')
+    left.write_text('')
+    done = subprocess.run([shell, '-c', f'U=_u; L={list_file}; R={left}\n{snippet}\necho reached-removal'], capture_output=True,
+                          text=True, env={'PATH': f'{fakes}:/usr/bin:/bin', 'HOME': str(tmp_path)})
+    assert (done.returncode == 1) is stops, (done.stdout, done.stderr)
+    assert ('reached-removal' not in done.stdout) is stops and ('undo stopped' in done.stdout) is stops
+    assert stops or done.returncode == 0
+
+
 # spec: ANYM-684
 def test_duty_log_verdicts_and_summary():
     duty = load('inference_ops_duty_log', ROOT / 'services' / 'inference' / 'launchd' / 'duty_log.py')
@@ -1017,6 +1057,40 @@ def test_recover_drops_an_entry_only_when_no_member_remains(tmp_path, groups):
 
 
 # spec: ANYM-691
+def test_ownership_cutoff_is_the_whole_second_of_the_stop_and_a_reused_leader_pid_matches_nothing():
+    def table(*rows):
+        return lambda: ''.join(f'{pid} {pgid} {stat} {when}\n' for pid, pgid, stat, when in rows)
+
+    stop = time.mktime(time.strptime('Mon Nov 2 13:00:00 2026', PAUSE.START_FORMAT)) + 0.25
+    group = {'pgid': 700, 'leader': 700, 'leader_start': 'Mon Nov 2 12:59:00 2026', 'stopped_at': stop}
+    rows = PAUSE.process_table(table((701, 700, 'T', 'Mon Nov 2 13:00:00 2026'), (702, 700, 'T', 'Mon Nov 2 13:00:01 2026')))
+    assert [row['pid'] for row in PAUSE.members(group, rows)] == [701]  # printed in the next second: started after the stop
+    # the process that has the pgid as its pid started at another time than the leader did: the number was reused
+    rows = PAUSE.process_table(table((700, 700, 'T', 'Mon Nov 2 12:00:00 2026'), (701, 700, 'T', 'Mon Nov 2 12:00:00 2026')))
+    assert PAUSE.members(group, rows) == []
+    rows = PAUSE.process_table(table((700, 700, 'T', 'Mon Nov 2 12:59:00 2026'), (701, 700, 'T', 'Mon Nov 2 12:59:30 2026')))
+    assert [row['pid'] for row in PAUSE.members(group, rows)] == [700, 701]
+
+
+# spec: ANYM-691
+def test_recover_keeps_the_entry_of_a_continued_process_that_could_not_be_killed(tmp_path):
+    stop = time.mktime(time.strptime('Mon Nov 2 13:00:00 2026', PAUSE.START_FORMAT))
+    ledger = PAUSE.Ledger(tmp_path / 'state' / 'paused.json')
+    ledger.record(700, 700, 'Mon Nov 2 12:59:00 2026', stopped_at=stop)
+    state = {'stat': 'T'}
+
+    def send(pid, number):
+        if number == signal.SIGCONT:
+            state['stat'] = 'S'  # it runs again, so it no longer looks stopped ...
+        else:
+            raise PermissionError  # ... but it could not be killed
+
+    report = PAUSE.recover(ledger.path, run_ps=lambda: f"700 700 {state['stat']} Mon Nov 2 12:59:00 2026\n", send=send,
+                           sleep=lambda seconds: None)
+    assert report['kept'] == [700] and [g['pgid'] for g in ledger.groups()] == [700]
+
+
+# spec: ANYM-691
 def test_ledger_is_written_atomically_validated_and_private(tmp_path):
     path = tmp_path / 'state' / 'paused.json'
     ledger = PAUSE.Ledger(path, instance='abc', clock=lambda: 1000.0)
@@ -1049,6 +1123,27 @@ def test_ledger_is_written_atomically_validated_and_private(tmp_path):
 
 
 # spec: ANYM-691
+def test_ledger_never_writes_or_reads_through_a_symlink(tmp_path):
+    # the engines can write the state directory and recovery runs unsandboxed: a planted link must not redirect a write
+    state = tmp_path / 'state'
+    state.mkdir()
+    victim = tmp_path / 'config.json'
+    victim.write_text('protected')
+    (state / '.paused.json.part').symlink_to(victim)  # the old predictable temporary name
+    (state / 'paused.json').symlink_to(victim)
+    ledger = PAUSE.Ledger(state / 'paused.json')
+    with pytest.raises(PAUSE.LedgerError):  # a ledger that is a link is refused, not followed
+        ledger.groups()
+    with pytest.raises(PAUSE.LedgerError):
+        PAUSE.recover(state / 'paused.json')
+    assert victim.read_text() == 'protected'
+    (state / 'paused.json').unlink()
+    ledger.record(40, 40, 'Mon Nov 2 13:00:00 2026', stopped_at=1000.0)
+    assert victim.read_text() == 'protected' and not (state / 'paused.json').is_symlink()
+    assert [g['pgid'] for g in ledger.groups()] == [40]
+
+
+# spec: ANYM-691
 def test_process_table_reads_ps_and_rejects_garbage():
     rows = PAUSE.process_table(lambda: '  501     1 Ss   Mon Nov  2 13:00:00 2026\n  600   600 T+   Mon Nov  2 13:05:09 2026\n\n')
     assert [(r['pid'], r['pgid'], r['stat']) for r in rows] == [(501, 1, 'Ss'), (600, 600, 'T+')]
@@ -1066,7 +1161,7 @@ class FakeMini:
 
     def __init__(self, jobs=0, running=True, current=None, previous=None, lock_path=None, stale_release=False,
                  health_failures=0, never_exits=False, respawn=False, gap=0, work_on_respawn=0, capable=(), ledger=False,
-                 recover_fails=False):
+                 recover_fails=False, unreadable=()):
         self.log, self.jobs, self.running, self.draining = [], jobs, running, False
         self.current, self.previous = current, previous
         self.releases = {r for r in (current, previous) if r}
@@ -1076,7 +1171,7 @@ class FakeMini:
         self.killed, self.respawn, self.pid, self.terms = False, respawn, 100, 0
         self.loaded, self.gap, self.respawn_in, self.work_on_respawn, self.unloading = running, gap, 0, work_on_respawn, False
         self.now = 0.0
-        self.capable, self.ledger, self.recover_fails = set(capable), ledger, recover_fails
+        self.capable, self.ledger, self.recover_fails, self.unreadable = set(capable), ledger, recover_fails, set(unreadable)
 
     # the injected sleep and clock
     def sleep(self, seconds):
@@ -1164,6 +1259,8 @@ class FakeMini:
         self.exit_service(9)
 
     def recover_capable(self, sha):
+        if sha in self.unreadable:  # a release with the command whose --check fails (exit 4)
+            raise deploy.MiniError('recover --check failed: the ledger is malformed')
         return sha in self.capable  # a release that has the `recover` command (ANYM-691)
 
     def ledger_exists(self):
@@ -1396,7 +1493,7 @@ def test_deploy_with_no_capable_release_and_no_ledger_continues_and_with_a_ledge
     runner, _ = run_deploy(mini)
     with pytest.raises(deploy.DeployError, match='pause ledger'):
         runner.deploy(SHA)
-    assert mini.current == SHA2 and 'start' not in mini.log and ('point', SHA) not in mini.log
+    assert mini.current == SHA2 and not {'term', 'unload', 'start'} & set(mini.log) and mini.running  # refused before the drain
 
 
 # spec: ANYM-691
@@ -1413,9 +1510,31 @@ def test_rollback_to_a_release_without_the_feature_recovers_from_the_leaving_rel
 def test_deploy_refuses_to_start_when_recover_fails(tmp_path, action):
     mini = FakeMini(jobs=1, current=SHA, previous=SHA2, lock_path=tmp_path / 'lock', capable={SHA, SHA2}, recover_fails=True)
     runner, _ = run_deploy(mini)
-    with pytest.raises(deploy.DeployError, match='nothing was switched'):
+    with pytest.raises(deploy.DeployError, match='nothing was switched') as caught:
         runner.rollback() if action == 'rollback' else runner.deploy(SHA2)
-    assert mini.current == SHA and 'start' not in mini.log and not any(e == ('point', SHA2) for e in mini.log)
+    assert mini.current == SHA and not any(e == ('point', SHA2) for e in mini.log)  # the target is never promoted
+    # the unchanged release is started again, so a failed recovery does not strand the service
+    assert mini.log[-2:] == [('recover', SHA), 'start'] and mini.running and mini.served == SHA
+    assert 'serving again' in str(caught.value)
+    # a service that was not running before is not started by the failure path
+    mini = FakeMini(running=False, current=SHA, previous=SHA2, lock_path=tmp_path / 'lock2', capable={SHA, SHA2}, recover_fails=True)
+    runner, _ = run_deploy(mini)
+    with pytest.raises(deploy.DeployError, match='was not running before'):
+        runner.rollback() if action == 'rollback' else runner.deploy(SHA2)
+    assert 'start' not in mini.log and not mini.running
+
+
+# spec: ANYM-691
+@pytest.mark.parametrize('case', ['ledger-no-reader', 'unreadable-ledger'])
+def test_deploy_checks_the_ledger_before_it_drains(tmp_path, case):
+    # a ledger that no release can read (none has the command, or --check fails) stops the deploy while the service still serves
+    options = {'ledger': True} if case == 'ledger-no-reader' else {'capable': {SHA, SHA2}, 'unreadable': {SHA2}}
+    for action in ('deploy', 'rollback'):
+        mini = FakeMini(jobs=1, current=SHA2, previous=SHA, lock_path=tmp_path / f'lock-{action}', **options)
+        runner, _ = run_deploy(mini)
+        with pytest.raises(deploy.DeployError, match='nothing was switched or stopped'):
+            runner.rollback() if action == 'rollback' else runner.deploy(SHA)
+        assert not {'term', 'unload', 'start'} & set(mini.log) and mini.running and mini.current == SHA2  # not drained or unloaded
 
 
 # spec: ANYM-684

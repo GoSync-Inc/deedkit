@@ -370,7 +370,7 @@ user,nice,args` shows `_deedkitinf` with NI 20; `/health` answers `{"status": "o
 "open"|"closed"}` (closed while Between is busy: that is the design). If the `logs/` files were created by launchd as
 root, `chown _deedkitinf` them and record it. Then the deploy script's own read-back, which also proves
 `/v1/models` with the probe key and that `release` equals the SHA: `python3 scripts/inference_deploy.py "$SHA"`
-(it drains, which is instant on an idle service, and restarts). Undo: `sudo -n launchctl bootout
+(it drains, which is instant on an idle service, and restarts). Undo: `sudo -n launchctl bootout --wait
 system/com.deedkit.inference`, then the section 14 Recover command, (then `-busy`) and remove the plists, section 14.
 
 `ProcessType` of the service is `Standard`, not `Background`: Background put the engines on the efficiency cores with
@@ -697,13 +697,21 @@ Removes, newest first, only what the ledger names, whole or half-made, and check
 removed only when everything is gone; otherwise it is rewritten to what remains and the undo exits 1 (rerun it).
 The undo never signals a process: an entry is dropped only on positive evidence (the pid is gone, or now has another start
 time); a logger that is still running, or that cannot be inspected, stays in the ledger and the undo exits 1.
+
 Recover (ANYM-691): a release that can pause an engine group writes `state/paused.json` before it stops one. If the service dies
 while a group is stopped, the group keeps its memory until `recover` continues and kills it; the service runs it at every start and
-`scripts/inference_deploy.py` runs it on every deploy and `--rollback` (after the unload, before `current` moves; it refuses to start
-the release when it fails, and fails closed on a ledger that no release can read). After any `launchctl bootout` of the service by
-hand run `sudo -n -H -u _deedkitinf env -i HOME=/Users/_deedkitinf PATH=/usr/bin:/bin /Users/_deedkitinf/current/.venv/bin/deedkit-inference recover --state-dir /Users/_deedkitinf/state`
-(JSON; exit 0 is done, 4 means a group remains or the ledger is unreadable, 2 means that release has no such command, so it
-cannot have paused anything). `recover --check` only reads. It touches only groups the ledger names.
+`scripts/inference_deploy.py` runs it on every deploy and `--rollback` (after the unload, before `current` moves). Before it drains
+anything the deploy checks read-only that a release can read the ledger and the process table, and stops while the service still
+serves when none can. If `recover` fails after the unload, the unchanged release is started again (and read back) and the target
+is not promoted. The undo below runs it once the service job is gone and removes nothing more (exit 1, rerun) when it fails or the
+ledger remains. After any `launchctl bootout` of the service by hand run
+`sudo -n -H -u _deedkitinf env -i HOME=/Users/_deedkitinf PATH=/usr/bin:/bin /Users/_deedkitinf/releases/<sha>/.venv/bin/deedkit-inference recover --state-dir /Users/_deedkitinf/state`
+with any release that has the command (`current` may still be the one from before the feature): JSON on stdout; exit 0 is done, 4 means a
+group remains or the ledger is unreadable, 2 means that release has no such command (it cannot have paused anything; then
+`state/paused.json` must not exist). `recover --check` only reads. It touches only groups the ledger names. A malformed ledger
+(`--check` exits 4): list the stopped processes by hand (`ps -axo pid,pgid,stat,lstart,args | awk '$3 ~ /^T/'`), send `kill -CONT` and then
+`kill -KILL` to those that are inference engines, set the ledger aside by renaming it to `paused.json.bad` in the same `state/` directory,
+and run the deploy again.
 
 Not covered (section-specific undo above): the production key files, the tailnet policy (apply the saved policy), the Serve config
 (`serve reset` on the standalone daemon's socket), and the production key file.
@@ -723,11 +731,15 @@ sed -n "s/^duty //p" $L | while IFS="|" read -r P S; do
   else echo "pid $P belongs to another process now: the logger is gone"; fi; done
 if grep -qx job-impact $L; then sudo -n launchctl bootout system/com.deedkit.inference-impact 2>/dev/null
   launchctl print system/com.deedkit.inference-impact >/dev/null 2>&1 && echo job-impact >> $R; fi
-if grep -qx job-service $L; then sudo -n launchctl bootout system/com.deedkit.inference 2>/dev/null
-  launchctl print system/com.deedkit.inference >/dev/null 2>&1 && echo job-service >> $R; fi
-  RB=/Users/$U/current/.venv/bin/deedkit-inference   # ANYM-691: a service that died while an engine group was stopped left it stopped
-  if [ -x $RB ]; then sudo -n -H -u $U env -i HOME=/Users/$U PATH=/usr/bin:/bin $RB recover --state-dir /Users/$U/state; RC=$?
-    [ $RC = 0 ] || [ $RC = 2 ] || echo "WARNING: recover exited $RC: stopped engine groups may remain (section 14, Recover)"; fi
+if grep -qx job-service $L; then sudo -n launchctl bootout --wait system/com.deedkit.inference 2>/dev/null
+  launchctl print system/com.deedkit.inference >/dev/null 2>&1 && echo job-service >> $R
+  # ANYM-691 recovery guard: stopped engine groups of a dead service are continued and killed BEFORE anything is removed
+  RB=/Users/$U/current/.venv/bin/deedkit-inference; STOP=
+  if launchctl print system/com.deedkit.inference >/dev/null 2>&1; then STOP="the service job is still loaded"
+  else if [ -x $RB ]; then sudo -n -H -u $U env -i HOME=/Users/$U PATH=/usr/bin:/bin $RB recover --state-dir /Users/$U/state; RC=$?
+      [ $RC = 0 ] || [ $RC = 2 ] || STOP="recover exited $RC"; fi
+    [ -n "$STOP" ] || ! sudo -n test -e /Users/$U/state/paused.json || STOP="state/paused.json still exists"; fi
+  if [ -n "$STOP" ]; then rm -f $R; echo "undo stopped, nothing more was removed: $STOP (section 14, Recover); fix it and rerun this block"; exit 1; fi; fi
 if grep -qx job-busy $L; then sudo -n launchctl bootout system/com.deedkit.inference-busy 2>/dev/null
   launchctl print system/com.deedkit.inference-busy >/dev/null 2>&1 && echo job-busy >> $R; fi
 printf "%s\n" "plist-impact /Library/LaunchDaemons/com.deedkit.inference-impact.plist" "impact-bin /usr/local/libexec/deedkit-impact-log" \

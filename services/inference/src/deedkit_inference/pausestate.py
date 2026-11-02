@@ -3,8 +3,10 @@
 A stopped group never finishes and never reads its stdin, so if the service that stopped it dies the group stays
 stopped and keeps its memory. Before every SIGSTOP the service records the group here; `recover` continues and kills
 what the ledger names. Ownership is a property of the GROUP: a process belongs to a ledgered group iff its pgid is the
-ledgered pgid, it is stopped (state T) and it started at or before the ledgered stop time (every member existed when
-the group was stopped, and a stopped group cannot spawn). A stopped helper whose leader died still matches; a pgid
+ledgered pgid, it is stopped (state T) and it started no later than the whole second of the ledgered stop time (every
+member existed when the group was stopped, and a stopped group cannot spawn; `ps` truncates to seconds, so the cutoff is
+floor(stop), never later); the process whose pid is the pgid, when it exists, must be the ledgered leader (same start
+time). The ledger is read and written without following links (the engines can write its directory). A stopped helper whose leader died still matches; a pgid
 number reused by a process that started after the stop, and every foreign group, never match. Nothing here looks at
 "stopped, parent pid 1, same user": the deploy runs `uv sync` as that user.
 """
@@ -12,17 +14,18 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import json
+import math
 import os
 from pathlib import Path
 import signal
 import subprocess
+import tempfile
 import time
 
 LEDGER_NAME = "paused.json"
 VERSION = 1
 PS = ["/bin/ps", "-axo", "pid=,pgid=,stat=,lstart="]
 START_FORMAT = "%a %b %d %H:%M:%S %Y"
-SLACK_SECONDS = 1.0  # `lstart` has a resolution of one second
 SETTLE_POLLS = 20
 SETTLE_SECONDS = 0.1
 
@@ -74,8 +77,9 @@ class Ledger:
         self.path, self.instance, self.clock = Path(path), instance, clock
 
     def groups(self) -> list[dict]:
-        try:
-            text = self.path.read_text()
+        try:  # never through a symlink: the service's engines can write this directory, recovery runs unsandboxed
+            with os.fdopen(os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW), "r") as handle:
+                text = handle.read()
         except FileNotFoundError:
             return []
         except OSError as error:
@@ -95,18 +99,21 @@ class Ledger:
         return groups
 
     def _write(self, groups: list[dict]) -> None:
-        """Atomically: a partial file is never visible, and a failed write leaves the previous ledger."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        partial = self.path.with_name(f".{self.path.name}.part")
+        """Atomically: a partial file is never visible, and a failed write leaves the previous ledger. The temporary file
+        is created exclusively under a random name (a planted symlink or file cannot be written through), mode 0600."""
+        partial: Path | None = None
         try:
-            descriptor = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, name = tempfile.mkstemp(prefix=f".{self.path.name}.", suffix=".part", dir=self.path.parent)
+            partial = Path(name)
             with os.fdopen(descriptor, "w") as out:
                 json.dump({"version": VERSION, "instance": self.instance, "groups": groups}, out)
                 out.flush()
                 os.fsync(out.fileno())
             os.replace(partial, self.path)
         except OSError as error:
-            unlink_quietly(partial)
+            if partial is not None:
+                unlink_quietly(partial)
             raise LedgerError(f"cannot write the ledger: {error}") from None
 
     def record(self, pgid: int, leader: int, leader_start: str, stopped_at: float | None = None) -> None:
@@ -135,9 +142,16 @@ def unlink_quietly(path: Path) -> None:
 
 
 def members(group: dict, table: list[dict]) -> list[dict]:
-    """The processes that belong to a ledgered group (see the module docstring)."""
-    return [row for row in table if row["pgid"] == group["pgid"] and row["stat"].startswith("T")
-            and row["start"] <= group["stopped_at"] + SLACK_SECONDS]
+    """The processes that belong to a ledgered group (see the module docstring). `lstart` has a resolution of one second
+    and truncates, so a member's printed start is at most the whole second of the stop; a process printed in a later
+    second is not a member, whatever its pgid. When the process that has the pgid as its pid exists and started at another
+    time than the leader did, the number was reused and the whole group is gone (a kernel keeps a pid while its group is
+    in use), so nothing matches."""
+    leader = next((row for row in table if row["pid"] == group["pgid"]), None)
+    if leader is not None and leader["started"] != group["leader_start"]:
+        return []
+    cutoff = math.floor(group["stopped_at"])
+    return [row for row in table if row["pgid"] == group["pgid"] and row["stat"].startswith("T") and row["start"] <= cutoff]
 
 
 def recover(path: str | Path, run_ps: Callable[[], str] | None = None,
@@ -152,19 +166,23 @@ def recover(path: str | Path, run_ps: Callable[[], str] | None = None,
         ledger.clear_if_empty()
         return {"groups": 0, "killed": killed, "kept": kept}
     table = process_table(run_ps)
+    selected: list[dict] = []
     for group in entries:
         for row in members(group, table):
+            selected.append(row)
             for number in (signal.SIGCONT, signal.SIGKILL):  # the parent is gone: nobody reads its answer
                 try:
                     send(row["pid"], number)
-                except ProcessLookupError:
-                    break
-                except PermissionError:
+                except (ProcessLookupError, PermissionError):
                     break
             killed.append(row["pid"])
-    remaining = entries
+    remaining: list[dict] = entries
     for _ in range(SETTLE_POLLS):  # a killed process takes a moment to leave the table
-        remaining = [g for g in entries if members(g, process_table(run_ps))]
+        table = process_table(run_ps)
+        alive = {(row["pid"], row["started"]) for row in table if not row["stat"].startswith("Z")}
+        # a selected process that was continued but not killed is no longer stopped: it still counts until it is gone
+        survivors = [row for row in selected if (row["pid"], row["started"]) in alive]
+        remaining = [g for g in entries if members(g, table) or any(row["pgid"] == g["pgid"] for row in survivors)]
         if not remaining:
             break
         sleep(SETTLE_SECONDS)
