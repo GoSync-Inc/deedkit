@@ -101,7 +101,7 @@ ID=""; for n in $(seq 400 499); do
 
 Undo of the whole setup is section 14; the ledger lines are `id N`, `group`, `user`, `home`, `shared`, `stage <dir>`,
 `probe-bin`, `keygen-bin`, `profile`, `newsyslog`, `plist-busy`, `plist-service`, `job-busy`, `job-service`,
-`serve`, `duty <pid>|<start time>`.
+`serve`, `duty <pid>|<start time>`, and for the overlap monitor (13b) `impact-bin`, `impact-dir`, `plist-impact`, `job-impact`.
 
 ## 3. Group and user `_deedkitinf`
 
@@ -639,6 +639,58 @@ stretch over 3 hours; if missed, adjust `max_load_1m` (per slot) or the definiti
 data, in a config change before the feature is enabled (ANYM-686 refuses to start otherwise), never by weakening
 Between's priority. `--need-gb` is the largest phase's `resident_gb` plus `min_free_gb`.
 
+### 13b. Overlap monitor: does an inference phase get in the way? (owner 11-02)
+
+The service runs at `Standard`/`Nice` 20 (section 7), so a phase that is already executing when Between or a test run starts is
+not suspended. The owner accepted that residual risk on the condition that the real effect is watched
+(«мониторинг поставить, посмотреть, мешает по факту он или нет»). `services/inference/launchd/impact_log.py` is that
+watch: a LaunchDaemon `com.deedkit.inference-impact` of the admin account (`Background`, `Nice` 10) that only **reads**
+(`ps`, `vm_stat`, `sysctl`, `busy.json`; a test asserts the source has no signal, `sudo` or `launchctl` call) and every 15 s
+writes one line to `~/deedkit-inference-impact/impact-YYYY-MM-DD.log`: the `between` and `ci` flags (`?` when `busy.json` is
+missing, invalid or stale), `phase=1` when the service user burned at least 0.3 cores over the interval (a warm, idle
+engine worker holds RAM and burns none, so it is not a phase), the CPU in cores of the service user, of Between's colima VMs
+(`_betweenci` Virtualization processes) and of the test user, the 1-minute load, free+inactive+speculative memory, swap used
+and the service's resident size. At midnight (local time) it writes `summary-YYYY-MM-DD.json`: minutes and episodes of
+overlap (a phase while `between` or `ci` is true) and, for four situations (`overlap`, `contended_alone` = Between or tests
+without a phase, `phase_alone`, `idle`), the mean and worst load, mean and lowest available memory, swap, and mean VM and
+test CPU. **Reading it:** overlap against `contended_alone` is the comparison; a higher load or lower available memory in
+`overlap` points at the phase, and the VM cores under the same Between work are the direct cost to Between. Differences in
+what Between happened to run make the rows noisy, so a verdict needs several days and Between's own CI job durations from
+before and after the change (asked of the Between orchestrator; the monitor never touches Between). If overlap shows harm, the
+yielding phase (the card that pauses a running phase while `busy.json` says busy) is the remedy; `sudo -n launchctl bootout
+system/com.deedkit.inference-impact` stops the monitor.
+
+Install (a live step on the shared host: the busy check above, `&&`-chained; nothing of the inference service is restarted):
+
+```bash
+MINI="$(head -1 ~/.config/deedkit/mini-host)"; case "$MINI" in ""|-*|*[[:space:]]*) echo "bad mini address"; exit 1 ;; esac
+ADMIN="${MINI%@*}"; OUT="$(mktemp -d)"
+ssh "$MINI" 'PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; python3 -I - --once' < services/inference/src/deedkit_inference/busy_probe.py &&
+python3 services/inference/launchd/render.py --admin "$ADMIN" --admin-home "/Users/$ADMIN" --python /opt/homebrew/bin/python3.13 --out "$OUT" &&
+D="$(ssh "$MINI" 'D=$(mktemp -u /tmp/deedkit-setup.XXXXXX) && echo "stage $D" >> ~/deedkit-inference-setup.created && mkdir -m 700 "$D" && echo $D')" &&
+[ -n "$D" ] &&
+scp "$OUT/com.deedkit.inference-impact.plist" services/inference/launchd/impact_log.py "$MINI:$D/" &&
+ssh "$MINI" "D=$D"'; set -e; cd "$D"; chmod 644 *
+for p in /usr/local/libexec/deedkit-impact-log /Library/LaunchDaemons/com.deedkit.inference-impact.plist ~/deedkit-inference-impact; do
+  if [ -e $p ]; then echo "$p exists"; exit 1; fi; done
+echo impact-bin >> ~/deedkit-inference-setup.created
+sudo -n install -o root -g wheel -m 0755 impact_log.py /usr/local/libexec/deedkit-impact-log
+echo impact-dir >> ~/deedkit-inference-setup.created
+mkdir -m 0700 ~/deedkit-inference-impact
+echo plist-impact >> ~/deedkit-inference-setup.created
+sudo -n install -o root -g wheel -m 0644 com.deedkit.inference-impact.plist /Library/LaunchDaemons/
+plutil -lint /Library/LaunchDaemons/com.deedkit.inference-impact.plist
+echo job-impact >> ~/deedkit-inference-setup.created
+sudo -n launchctl bootstrap system /Library/LaunchDaemons/com.deedkit.inference-impact.plist
+sleep 40; sudo -n launchctl print system/com.deedkit.inference-impact | grep -E "state|pid"
+tail -n 3 ~/deedkit-inference-impact/impact-$(date +%F).log'; RC=$?; rm -r "$OUT"; [ "$RC" = 0 ]   # the exit status of the block is the install's, not the cleanup's
+```
+
+Read-back: `state = running`, and the last lines are `ts=... between=... phase=... load=... avail_gb=...` with `between` and `ci`
+not `?` (a `?` means `busy.json` is stale or the probe is down: fix that first). Undo: section 14 (the ledger names the
+four entries `job-impact`, `plist-impact`, `impact-dir`, `impact-bin`); copy `summary-*.json` and the logs out first, the
+undo removes the directory. A daily file is 5760 lines (about 1 MB); nothing rotates them, remove old days by hand.
+
 ## 14. Undo of the whole setup
 
 Removes, newest first, only what the ledger names, whole or half-made, and checks that each is gone. The ledger is
@@ -661,17 +713,21 @@ sed -n "s/^duty //p" $L | while IFS="|" read -r P S; do
   if [ $RC != 0 ] || [ -z "$NOW" ]; then echo "duty $P|$S" >> $R; continue; fi   # could not tell: keep the entry
   if [ "$NOW" = "$S" ]; then echo "duty $P|$S" >> $R; echo "the duty logger (pid $P) is still running; it stops by itself after its --hours, or: kill $P"
   else echo "pid $P belongs to another process now: the logger is gone"; fi; done
+if grep -qx job-impact $L; then sudo -n launchctl bootout system/com.deedkit.inference-impact 2>/dev/null
+  launchctl print system/com.deedkit.inference-impact >/dev/null 2>&1 && echo job-impact >> $R; fi
 if grep -qx job-service $L; then sudo -n launchctl bootout system/com.deedkit.inference 2>/dev/null
   launchctl print system/com.deedkit.inference >/dev/null 2>&1 && echo job-service >> $R; fi
 if grep -qx job-busy $L; then sudo -n launchctl bootout system/com.deedkit.inference-busy 2>/dev/null
   launchctl print system/com.deedkit.inference-busy >/dev/null 2>&1 && echo job-busy >> $R; fi
-printf "%s\n" "plist-service /Library/LaunchDaemons/com.deedkit.inference.plist" "plist-busy /Library/LaunchDaemons/com.deedkit.inference-busy.plist" \
+printf "%s\n" "plist-impact /Library/LaunchDaemons/com.deedkit.inference-impact.plist" "impact-bin /usr/local/libexec/deedkit-impact-log" \
+  "plist-service /Library/LaunchDaemons/com.deedkit.inference.plist" "plist-busy /Library/LaunchDaemons/com.deedkit.inference-busy.plist" \
   "newsyslog /etc/newsyslog.d/deedkit-inference.conf" "probe-bin /usr/local/libexec/deedkit-busy-probe" \
   "keygen-bin /usr/local/libexec/deedkit-inference-keygen" | while read -r NAME FILE; do
   if grep -qx $NAME $L; then sudo -n rm -f $FILE; [ -e $FILE ] && echo $NAME >> $R; fi; done
 if grep -qx profile $L; then sudo -n rm -f /usr/local/etc/deedkit-inference/deedkit-inference.sb; sudo -n rmdir /usr/local/etc/deedkit-inference 2>/dev/null
   [ -e /usr/local/etc/deedkit-inference ] && echo profile >> $R; fi
 for D in $(sed -n "s/^stage //p" $L); do case $D in /tmp/deedkit-setup.*) rm -rf "$D"; [ -e "$D" ] && echo "stage $D" >> $R ;; esac; done
+if grep -qx impact-dir $L; then rm -r ~/deedkit-inference-impact; [ -e ~/deedkit-inference-impact ] && echo impact-dir >> $R; fi
 if grep -qx shared $L; then sudo -n rm -rf /Users/Shared/deedkit-inference; [ -e /Users/Shared/deedkit-inference ] && echo shared >> $R; fi
 if grep -qx home $L; then sudo -n rm -rf /Users/$U; [ -e /Users/$U ] && echo home >> $R; fi
 if grep -qx user $L; then dscl . -read /Users/$U >/dev/null 2>&1 && sudo -n dscl . -delete /Users/$U

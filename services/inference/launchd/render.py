@@ -5,6 +5,7 @@ Stdlib only; nothing here touches the mini. `render.py --admin NAME --admin-home
 
     com.deedkit.inference.plist       LaunchDaemon of the service: user _deedkitinf, sandboxed, nice 20, ProcessType Standard
     com.deedkit.inference-busy.plist  LaunchDaemon of the busy probe: the admin account, KeepAlive
+    com.deedkit.inference-impact.plist  LaunchDaemon of the overlap monitor (impact_log.py): the admin account, read-only
     deedkit-inference.sb              sandbox-exec profile: no network but accepting on loopback 8090; the service home read-only
     deedkit-inference.newsyslog       /etc/newsyslog.d line for the service logs
     config.json                       the service config (ANYM-682 README), aliases left to ANYM-683
@@ -23,6 +24,7 @@ SERVICE_USER = '_deedkitinf'
 HOME = '/Users/' + SERVICE_USER
 LABEL = 'com.deedkit.inference'
 BUSY_LABEL = 'com.deedkit.inference-busy'
+IMPACT_LABEL = 'com.deedkit.inference-impact'
 PORT = 8090
 BIND = '127.0.0.1'
 DRAIN_SECONDS = 900
@@ -31,6 +33,7 @@ SHARED = '/Users/Shared/deedkit-inference'
 BUSY_FILE = SHARED + '/busy.json'
 PROFILE_PATH = '/usr/local/etc/deedkit-inference/deedkit-inference.sb'
 PROBE_PATH = '/usr/local/libexec/deedkit-busy-probe'
+IMPACT_PATH = '/usr/local/libexec/deedkit-impact-log'
 LOG_OUT = HOME + '/logs/service.out.log'
 LOG_ERR = HOME + '/logs/service.err.log'
 BUSY_LOG = SHARED + '/busy-probe.log'
@@ -77,6 +80,24 @@ def render_busy_plist(admin: str, admin_home: str, python: str) -> bytes:
         'ThrottleInterval': 10,
         'StandardOutPath': BUSY_LOG,
         'StandardErrorPath': BUSY_LOG,
+    })
+
+
+def render_impact_plist(admin: str, admin_home: str, python: str) -> bytes:
+    """The overlap monitor (impact_log.py): read-only, the admin account, Background; it signals and changes nothing."""
+    directory = admin_home + '/deedkit-inference-impact'
+    return plistlib.dumps({
+        'Label': IMPACT_LABEL,
+        'UserName': admin,
+        'ProgramArguments': [python, IMPACT_PATH, 'log', '--dir', directory],
+        'EnvironmentVariables': {'HOME': admin_home, 'PATH': '/usr/bin:/bin:/usr/sbin'},
+        'RunAtLoad': True,
+        'KeepAlive': True,
+        'ProcessType': 'Background',
+        'Nice': 10,
+        'ThrottleInterval': 30,
+        'StandardOutPath': directory + '/launchd.log',
+        'StandardErrorPath': directory + '/launchd.log',
     })
 
 
@@ -135,6 +156,7 @@ def main(argv: list[str] | None = None) -> int:
     files = {
         LABEL + '.plist': render_service_plist(**values),
         BUSY_LABEL + '.plist': render_busy_plist(**values),
+        IMPACT_LABEL + '.plist': render_impact_plist(**values),
         'deedkit-inference.sb': render_sandbox_profile().encode(),
         'deedkit-inference.newsyslog': render_newsyslog().encode(),
         'config.json': render_config().encode(),
