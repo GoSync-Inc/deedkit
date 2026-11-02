@@ -294,13 +294,14 @@ class Env:
         return Config.model_validate(self.config_dict(aliases, **over))
 
     @asynccontextmanager
-    async def running(self, *, probe=None, principals=None, revision=1, aliases=None, **over):
+    async def running(self, *, probe=None, principals=None, revision=1, aliases=None, yield_settings=None,
+                      sampler=None, **over):
         if not self.policy_path.exists():
             self.write_policy(principals, revision)
         elif principals is not None:
             self.write_policy(principals, revision)
         probe = probe or FakeProbe()
-        app = create_app(self.config(aliases, **over), probe)
+        app = create_app(self.config(aliases, **over), probe, yield_settings=yield_settings, sampler=sampler)
         async with app.router.lifespan_context(app):
             yield Running(app, probe, self)
 

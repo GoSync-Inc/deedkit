@@ -8,6 +8,10 @@ import subprocess
 import sys
 import time
 
+from deedkit_inference import media
+
+from ..ticker import tick
+
 
 def directive(path):
     try:
@@ -64,6 +68,14 @@ class Runtime:
         if mode == "hang":
             while True:
                 time.sleep(1)
+        if d.get("tick"):
+            tick(d["tick"], int(d.get("ticks", 100)))
+        if d.get("decode"):  # a decode helper behind the no-pause marker, as media.iter_chunks runs ffmpeg
+            code, _ = media.run_tool([sys.executable, "-I", "-c", f"import time; time.sleep({float(d['decode']['seconds'])})"],
+                                     float(d["decode"]["timeout"]), own_group=False,
+                                     marker=os.path.join(os.getcwd(), media.MARKER_NAME))
+            if code != 0:
+                raise RuntimeError("decode_failed")
         time.sleep(float(d.get("sleep", 0)))
         phase = job["phase"]
         self.cache["jobs"] = self.cache.get("jobs", 0) + 1

@@ -31,6 +31,7 @@ class Worker:
         self.proc, self.scratch, self.key, self.resident_gb = proc, scratch, key, resident_gb
         self.job = None  # the Job it is running now, so a memory kill can name its reason
         self.stopped = False
+        self.paused = False  # ANYM-691: its group is stopped by the yielder; alive() and stopped keep their meaning
         self.killed = False  # SIGKILL sent: its memory is already coming back
         self.cold = True
 

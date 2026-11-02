@@ -118,7 +118,9 @@ def score_long(got, bound):
 # --- talking to the live service ---------------------------------------------------------------------------------
 def post(url, key, body, content_type, timeout=3600):
     request = urllib.request.Request(url, data=body, method="POST", headers={
-        "Authorization": f"Bearer {key}", "Content-Type": content_type})
+        "Authorization": f"Bearer {key}", "Content-Type": content_type,
+        # The client's own read timeout: a request that waits out a pause is slow, not hung (ANYM-691 criterion 7b).
+        "X-Request-Deadline-Seconds": str(int(timeout))})
     started = time.monotonic()
     try:
         with urllib.request.urlopen(request, timeout=timeout) as reply:
