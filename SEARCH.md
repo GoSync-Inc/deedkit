@@ -44,8 +44,22 @@ return `invalid_cursor` once: restart the search. Without named chats,
 `query_mode`:
 
 - `all` by default: all words in any order;
+- `any`: at least one of the words (OR), no syntax to learn; best for spelling variants and
+  transliteration, for example `счёт счет invoice`. Each space-separated word is a plain
+  query of its own, so quotes, `OR` and a leading `-` inside it are ordinary text. With
+  `order=relevance` a hit with more distinct words ranks above one with fewer; equal hits keep
+  the time order. Not available for `fuzzy`; a live search (`live=auto|on`) applies `all` and
+  `phrase` only, so `any` runs on the archive, and a live search of several words is one live
+  search per word;
 - `phrase`: words in the given order as a phrase;
-- `web`: quotes, `OR`, exclusion `-word`, for example `"срок оплаты" OR invoice`.
+- `web`: `"exact phrase" OR other -excluded`, for example `"срок оплаты" OR invoice`. `or`/`OR` in
+  any case is the operator, so the word `or` itself cannot be searched in `web`; for a literal
+  `or`, a leading `-` or quotes as text use `any` or `exact`; for phrases and exclusion use `web`;
+- `exact`: case-insensitive literal substring, including punctuation and identifiers.
+
+With `any` and `web` prefer `order=relevance`: the default `order=asc` lists the oldest hits
+of the commonest word first, which looks like a broken OR search. Phrase and exclusion belong
+to `web`. The same modes apply to `search_files`.
 
 Search uses the built-in PostgreSQL dictionaries for word forms; languages, exact
 search and the explicit approximate fallback are described below. Synonyms are not added automatically. `search` indexes message text;
@@ -83,7 +97,7 @@ For files, `search_files` gives attachment_id, the source message and the indexi
 `auto` tries complete queries under matching PostgreSQL dictionaries; it does
 not detect a message's language. `query_mode: exact` means case-insensitive
 literal substring, including punctuation and identifiers. Existing `all`,
-`phrase`, `web` modes and chronological `asc`/`desc` remain available.
+`phrase`, `web` modes (and `any`, ANYM-668) and chronological `asc`/`desc` remain available.
 
 Messages in another language (ANYM-539): DeedKit stores and returns each
 message in the language it was written in and translates nothing. When the
@@ -105,7 +119,8 @@ For `all` and `phrase` message queries, relevance ranks three tiers: the typed
 query as a case-insensitive substring, then its words adjacent and in order in
 any word form, then other matches; cover density orders each tier. Stemming can
 merge different words (договор/договориться), so an exact phrase stays above
-scattered morphology-only matches. `web` and file search ranking are unchanged.
+scattered morphology-only matches. `web` ranking and the ranking of `search_files` for `all` and `phrase` are unchanged;
+`any` ranks by distinct matching words (ANYM-668), in messages and in files.
 
 `compact: true` omits full message bodies while retaining snippets and identity.
 `body_chars` bounds returned bodies; `include_coverage: false` suppresses the
@@ -360,7 +375,7 @@ account `state`, `stored_new` and the provider `hits`:
 
 Live search applies `query` (`query_mode` `all` or `phrase`), at most one chat (`chat` or `chats` of
 length 1), `chat_types` / `include_channels` / `exclude_channels` (channels only when asked for, as in
-the archive) and `from_time` / `to_time`. `web` and `exact` modes, `fuzzy`, `sender`/`senders`, `person`,
+the archive) and `from_time` / `to_time`. `web`, `any` and `exact` modes, `fuzzy`, `sender`/`senders`, `person`,
 `direction`, several chats and `chats: []` give `unsupported_filter`. Keep one `request_id` per intent:
 the same id maps to the same operation per account, so a repeat after a lost response asks the provider
 nothing new. A failure to queue or a provider error never fails or empties the archive answer. When the

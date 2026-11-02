@@ -23,7 +23,8 @@ FeedbackStatus = Literal['received','accepted','declined','duplicate','fixed','v
 Detail = Literal['compact','full']
 MessageDetail = Literal['compact','full','transcript']
 ConversationView = Literal['archive','conversation']
-QueryMode = Literal['all','phrase','web','exact']
+QUERY_MODE_DESCRIPTION = 'Five modes. all (default): every word, any order. any: at least one of the words (OR), no syntax; best for spelling variants and transliteration, e.g. `счёт счет invoice`. phrase: the words adjacent in order. web: `"exact phrase" OR other -excluded`; or/OR in any case is the operator, so the word `or` itself cannot be searched in web; for a literal `or`, a leading `-` or quotes as text use any or exact; for phrases and exclusion use web. exact: case-insensitive literal substring incl. punctuation and identifiers. With any and web prefer order=relevance, because asc lists the oldest hits first. Live search applies to all and phrase only; for a live search of several words run one live search per word.'
+QueryMode = Annotated[Literal['all','any','phrase','web','exact'], Field(description=QUERY_MODE_DESCRIPTION)]
 SearchLanguage = Literal['auto','simple','russian','english','indonesian']
 EventKind = Literal['message.created','message.edited','message.deleted','message.status','attachment.ready']
 SubscriptionEventKind = Literal['message.created','message.edited','message.deleted',

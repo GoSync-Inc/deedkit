@@ -13,6 +13,7 @@ import json
 
 LANGUAGES = ('simple', 'russian', 'english', 'indonesian')
 FUNCTIONS = {'all': 'plainto_tsquery', 'phrase': 'phraseto_tsquery', 'web': 'websearch_to_tsquery'}
+MODES = (*FUNCTIONS, 'any', 'exact')
 
 
 def invalid(code='invalid_filter'):
@@ -89,6 +90,7 @@ class SearchPlan:
     languages: tuple[str, ...]
     cte: str
     params: list
+    terms: int = 0
 
     @staticmethod
     def vector(alias, language):
@@ -110,6 +112,13 @@ class SearchPlan:
     def rank(self, alias, text_sql=None):
         if not self.query or self.mode=='exact':
             return '0::bigint'
+        if self.mode=='any':
+            # ANYM-668: the more distinct terms a hit has, the higher it ranks (minimum_should_match in spirit);
+            # (count+[0,1))/(terms+1) stays inside the 0..1000000 cursor bound and ties keep the time order.
+            found='greatest('+','.join('(SELECT count(*) FROM unnest(q.terms_'+lang+') t WHERE '+self.vector(alias,lang)+' @@ t)'
+                for lang in self.languages)+')'
+            base='greatest('+','.join('ts_rank_cd('+self.vector(alias,lang)+',q.'+lang+',32)' for lang in self.languages)+')'
+            return '(round((('+found+'+'+base+'::float8)/'+str(self.terms+1)+'*1000000)::numeric))::bigint'
         base='greatest('+','.join('ts_rank_cd('+self.vector(alias,lang)+',q.'+lang+',32)' for lang in self.languages)+')'
         if text_sql is None or self.mode not in ('all','phrase'):
             return '(round(('+base+'*1000000)::numeric))::bigint'
@@ -151,7 +160,7 @@ class SearchPlan:
 def compile_query(query='', query_mode='all', search_language='auto'):
     if not isinstance(query,str) or len(query)>200 or '\x00' in query:
         invalid('invalid_query')
-    if not isinstance(query_mode,str) or query_mode not in (*FUNCTIONS,'exact'):
+    if not isinstance(query_mode,str) or query_mode not in MODES:
         invalid('invalid_query')
     if not isinstance(search_language,str) or search_language not in ('auto',*LANGUAGES):
         invalid('invalid_query')
@@ -159,7 +168,16 @@ def compile_query(query='', query_mode='all', search_language='auto'):
     columns=['%s::text AS literal','%s::text AS literal_pattern']
     pattern='%'+query.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
     params=[query,pattern]
-    if query_mode!='exact':
+    terms=[]
+    if query_mode=='any':
+        # ANYM-668: every whitespace-separated term is its own plain query, so quotes, OR and a leading - are text.
+        first={}
+        for term in query.split():first.setdefault(term.casefold(),term)
+        terms=list(first.values()) or [query]
+        for lang in languages:
+            columns.append(' || '.join("plainto_tsquery('"+lang+"',%s)" for _ in terms)+' AS '+lang); params.extend(terms)
+            columns.append('ARRAY['+','.join("plainto_tsquery('"+lang+"',%s)" for _ in terms)+'] AS terms_'+lang); params.extend(terms)
+    elif query_mode!='exact':
         for lang in languages:
             columns.append(FUNCTIONS[query_mode]+"('"+lang+"',%s) AS "+lang); params.append(query)
     if query_mode=='all':
@@ -168,7 +186,7 @@ def compile_query(query='', query_mode='all', search_language='auto'):
     # This CTE is referenced by filtering, ranking and presentation. A shared
     # materialized row hides constant tsqueries from GIN index conditions and
     # can turn a selective LIMIT query into a date-ordered archive traversal.
-    return SearchPlan(query,query_mode,languages,'search_query AS NOT MATERIALIZED (SELECT '+','.join(columns)+')',params)
+    return SearchPlan(query,query_mode,languages,'search_query AS NOT MATERIALIZED (SELECT '+','.join(columns)+')',params,len(terms))
 
 
 def output_options(compact=False, body_chars=None, include_coverage=True):
