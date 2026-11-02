@@ -68,7 +68,9 @@ KINDS = {
     'call.finished': ({'call_id': _ref, 'status': _enum('finished'), 'end_reason': _token,
         'duration_s': _int(0, 86400), 'outcome': _token, 'transcript': _enum('final')},
         frozenset(('duration_s', 'outcome')), 'call_id'),
-    'call.failed': ({'call_id': _ref, 'status': _enum('failed', 'finished'), 'end_reason': _token}, frozenset(),
+    # ANYM-695: Twilio's cause (the closed list of the calls README) and integer code, flat and optional.
+    'call.failed': ({'call_id': _ref, 'status': _enum('failed', 'finished'), 'end_reason': _token,
+        'provider_cause': _token, 'provider_code': _int(1, 999999)}, frozenset(('provider_cause', 'provider_code')),
         'call_id'),
     'call.not_answered': ({'call_id': _ref, 'end_reason': _enum('no_answer', 'busy', 'canceled')}, frozenset(),
         'call_id'),
@@ -113,6 +115,8 @@ def validate_event(event):
         _fail('invalid_envelope')
     if event['urgency'] not in URGENCIES or event['expires_at'] is not None and not _time(event['expires_at']):
         _fail('invalid_envelope')
+    if event['type'] == 'call.failed' and 'provider_code' in data and 'provider_cause' not in data:
+        _fail('provider_code_needs_cause')
     if event['type'] == 'call.owner_request' and (event['urgency'] != 'now' or event['expires_at'] is None):
         # The decision's stored deadline: an owner request is never held by batching or kept past it.
         _fail('owner_request_needs_now_and_deadline')
