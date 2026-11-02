@@ -26,8 +26,9 @@ def started():
 # spec: ANYM-683
 def test_available_memory_counts_free_inactive_and_speculative_pages(monkeypatch):
     """The mini at 08:55 on 11-02: free 4.05 GiB, inactive 3.42, speculative 1.99. Without the speculative pages the
-    figure read 7.47, under the 7.5 GB a cold vision start needs, so vision was refused `memory_low` about half
-    the time with nothing running; the research guard and scripts/remote-test.sh both count them."""
+    figure read 7.47, under the 7.5 GB a cold vision start needs, so vision was refused `memory_low` at such moments
+    (13% of the idle-service samples of 07:49-08:49 were below 7.5); the research guard and scripts/remote-test.sh
+    both count them."""
     import subprocess
     import sys
 
