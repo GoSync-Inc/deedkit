@@ -3,7 +3,12 @@
 `search_people(query, accounts, chats, after, limit)` searches by observed name,
 username (with or without `@`) and provider sender ID. The search is case-insensitive
 and matches a literal fragment; `%` and `_` are not wildcards. For fragments
-of three or more characters a PostgreSQL trigram GIN is used. The page limit is 100.
+of three or more characters a PostgreSQL trigram GIN is used. The query is normalized
+(Unicode NFC, trimmed, inner spaces collapsed, lowercase, leading `@` removed) and "literal" means
+literal after lowercase and the ё/е fold: a query of three or more characters reads ё and е as the same
+letter in both directions ("Федор" finds "Фёдор" and the reverse). A row found only through the fold
+reports `match_type: literal_folded` and sorts after the literal rows. The fold does not touch the
+Latin transliteration path (`fedor` does not find `fyodor`). The page limit is 100.
 
 The result contains `account`, `chat`, `sender_id`, `display_name`, `username`,
 `sender_name`, `sender_name_basis`, `source_message`, the message date and the

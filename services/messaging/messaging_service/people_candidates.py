@@ -3,7 +3,7 @@ import re
 
 from .policy import scope_filter,targets
 from .search_query import cursor_binding,decode_cursor,encode_cursor,filter_values,position_text,valid_text
-from .name_variants import patterns
+from .name_variants import fold_pattern,normalize,patterns
 from .whatsapp_identity import visible_cte,people_join
 from .sender_names import resolve
 from .message_queries import chat_titles
@@ -16,7 +16,7 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
     bounded(limit);valid_text(query,200);valid_text(after,4096)
     if type(transliterate) is not bool or type(group_by_sender) is not bool:raise APIError('invalid_filter')
     accounts=filter_values(accounts);chats=filter_values(chats)
-    query=query.strip().lstrip('@').lower()
+    query=normalize(query);fold=fold_pattern(query)
     pattern='%'+query.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
     scope,args=scope_filter(p,'m')
     clauses=[scope,'NOT m.deleted','sp.account=m.account','sp.chat=m.chat','sp.sender=m.sender']
@@ -28,8 +28,10 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
         person,members,digest=visible_members(c,p,person)
         clause,values=member_clause('sp','account','sender',members);clauses.append(clause);args.extend(values)
     match='(sp.search_text LIKE q.pattern OR identity.search_text LIKE q.pattern)'
+    # ANYM-663: the class [её] already contains the typed letter, so it replaces the LIKE test in the filter.
+    folded='(sp.search_text ~ q.fold OR identity.search_text ~ q.fold)'
     if query:
-        condition=match
+        condition=folded if fold is not None else match
         if transliterate:condition+=' OR messenger_transliterate(sp.search_text) LIKE ANY(q.variants)'
         clauses.append('('+condition+')')
     # Rank independently of the provider/account and archive-generated profile
@@ -50,13 +52,13 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
         WHEN EXISTS(SELECT 1 FROM unnest("""+tokens+""") token WHERE token LIKE q.prefix) THEN 4
         WHEN q.transliterate AND EXISTS(SELECT 1 FROM unnest("""+translit_tokens+""") token
           WHERE token LIKE ANY(q.prefixes)) THEN 5
-        WHEN """+match+""" THEN 6 ELSE 7 END"""
+        WHEN """+match+""" THEN 6"""+("" if fold is None else " WHEN "+folded+" THEN 7")+""" ELSE """+("7" if fold is None else "8")+""" END"""
     identity_cte,identity_args=visible_cte(p)
     cte='WITH '+identity_cte+''', q AS (SELECT %s::text AS pattern,%s::text[] AS variants,%s::text AS literal,
-        %s::text[] AS terms,%s::text AS prefix,%s::text[] AS prefixes,%s::boolean AS transliterate), observed AS MATERIALIZED (
+        %s::text[] AS terms,%s::text AS prefix,%s::text[] AS prefixes,%s::boolean AS transliterate,%s::text AS fold), observed AS MATERIALIZED (
         SELECT sp.id,sp.account,sp.chat,sp.sender AS sender_id,sp.display_name,sp.username,
             sp.source_message,sp.source_sent_at,sp.observed_at,identity.metadata AS identity,
-            CASE WHEN '''+match+''' THEN 'literal' ELSE 'transliteration_candidate' END AS match_type,
+            CASE WHEN '''+match+''' THEN 'literal' '''+("" if fold is None else "WHEN "+folded+" THEN 'literal_folded' ")+'''ELSE 'transliteration_candidate' END AS match_type,
             '''+rank+''' AS match_rank
         FROM sender_profiles sp JOIN messages m ON m.id=sp.source_message '''+people_join()+''' CROSS JOIN q
         WHERE '''+' AND '.join(clauses)+') '
@@ -71,15 +73,16 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
         if set(pos)!=keys:raise APIError('invalid_cursor')
         return pos
     query_args=[*identity_args,pattern,variants,query,terms,pattern[1:],
-        [value[1:] for value in variants],transliterate,*args]
+        [value[1:] for value in variants],transliterate,fold,*args]
     cursor_args=[];cursor_clause=''
     if group_by_sender:
         cte+=", grouped AS (SELECT account,sender_id,jsonb_agg(to_jsonb(observed) ORDER BY chat,id) AS observations,"+\
-            " CASE WHEN bool_or(match_type='literal') THEN 'literal' ELSE 'transliteration_candidate' END AS match_type,"+\
+            " CASE WHEN bool_or(match_type='literal') THEN 'literal' WHEN bool_or(match_type='literal_folded')"+\
+            " THEN 'literal_folded' ELSE 'transliteration_candidate' END AS match_type,"+\
             " min(match_rank) AS match_rank FROM observed GROUP BY account,sender_id) "
         if after:
             pos=position(decode_cursor(after,binding),{'rank','account','sender'})
-            if type(pos['rank']) is not int or not 0<=pos['rank']<=7:
+            if type(pos['rank']) is not int or not 0<=pos['rank']<=8:
                 raise APIError('invalid_cursor')
             position_text(pos['account']);position_text(pos['sender'])
             anchor=c.execute(cte+'SELECT match_rank FROM grouped WHERE account=%s AND sender_id=%s',
@@ -93,7 +96,7 @@ def search_people(store,c,p,query='',*,accounts=None,chats=None,after='',limit=2
         if after:
             if query or members is not None:
                 pos=position(decode_cursor(after,binding),{'rank','id'})
-                if type(pos['rank']) is not int or not 0<=pos['rank']<=7:
+                if type(pos['rank']) is not int or not 0<=pos['rank']<=8:
                     raise APIError('invalid_cursor')
                 position_text(pos['id'])
                 anchor=c.execute(cte+'SELECT match_rank FROM observed WHERE id=%s',[*query_args,pos['id']]).fetchone()

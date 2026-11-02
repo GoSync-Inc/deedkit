@@ -62,6 +62,75 @@ def test_people_pagination_and_literal_patterns(seeded):
     with pytest.raises(APIError,match='not_found'):s.search_people(seeded[1],after=first['next_cursor'])
 
 
+def fold_directory(seeded):
+    s,ar,key,_=directory(seeded)
+    for sender,name in (('51','Фёдор Пример'),('52','Федор Другой'),('53','Ёлка Лесная'),('54','Елена Ёлкина')):
+        ar.ingest(event(account='people-test',sender=sender,provider_id='fold-'+sender,sender_profile={'display_name':name}))
+    return s,ar,key
+
+
+# spec: ANYM-663
+def test_people_yo_and_ye_are_one_letter_in_both_directions(seeded):
+    s,_,key=fold_directory(seeded)
+    names=lambda q,**kw:{r['display_name']:r['match_type'] for r in s.search_people(key,q,**kw)['items']}
+    assert names('Федор')=={'Федор Другой':'literal','Фёдор Пример':'literal_folded'}
+    assert names('фёдор')=={'Федор Другой':'literal_folded','Фёдор Пример':'literal'}
+    assert set(names('ФЕДОР'))==set(names('фёдор'))=={'Федор Другой','Фёдор Пример'}
+    assert set(names('Фёдор'))=={'Федор Другой','Фёдор Пример'}   # е + U+0308 is read as ё
+    assert names('  @Елка   ')=={'Ёлка Лесная':'literal_folded'} and names('ёлка')=={'Ёлка Лесная':'literal'}
+    assert names('Анна')=={'Анна Иванова':'literal'}    # no е or ё in the query: today's LIKE path
+
+
+# spec: ANYM-663
+def test_people_literal_matches_sort_before_folded_ones_and_the_cursor_pages(seeded):
+    s,_,key=fold_directory(seeded)
+    full=s.search_people(key,'федор')['items']
+    assert [r['match_type'] for r in full]==['literal','literal_folded']
+    seen=[];page=s.search_people(key,'федор',limit=1)
+    while True:
+        seen+=[r['id'] for r in page['items']]
+        if not page['next_cursor']:break
+        page=s.search_people(key,'федор',limit=1,after=page['next_cursor'])
+    assert seen==[r['id'] for r in full]
+
+
+# spec: ANYM-663
+def test_people_fold_keeps_group_by_sender_and_hidden_chats(seeded):
+    s,ar,key=fold_directory(seeded)
+    grouped=s.search_people(key,'федор',group_by_sender=True)['items']
+    assert {r['match_type'] for r in grouped}=={'literal','literal_folded'}
+    ar.ingest(event(account='people-test',chat='private',sender='55',provider_id='fold-55',sender_profile={'display_name':'Тайный Фёдор'}))
+    assert len(s.search_people(key,'федор')['items'])==3
+    first=s.search_people(key,'анна')['items'][0]
+    s.set_access('people-reader',chats=[first['chat']])
+    assert {r['display_name'] for r in s.search_people(key,'федор')['items']}=={'Федор Другой','Фёдор Пример'}
+    assert s.search_people(key,'тайный фёдор')['items']==[] and s.search_people(key,'тайный федор')['items']==[]
+
+
+# spec: ANYM-663
+def test_people_fold_pattern_is_never_user_controlled(seeded):
+    s,ar,key,_=directory(seeded)
+    for sender,name in (('61','ёж.* (x)'),('62','ежабв'),('63','еж50xx'),('64','ёж[y]'),('65','ёж\\z'),
+                        ('66','ёж50%_'),('67','ёж('),('68','ёж|аб')):
+        ar.ingest(event(account='people-test',sender=sender,provider_id='meta-'+sender,sender_profile={'display_name':name}))
+    found=lambda q:sorted(r['sender_id'] for r in s.search_people(key,q)['items'])
+    assert found('еж.*')==['61'] and found('еж.* (x)')==['61'] and found('еж.')==['61']
+    assert found('еж[y]')==['64'] and found('еж\\z')==['65'] and found('еж50%_')==['66']
+    assert found('еж(')==['67'] and found('еж|аб')==['68'] and found('еж|ёж')==[] and found('еж%')==[]
+    assert found('еж50')==['63','66']
+
+
+# spec: ANYM-663
+def test_people_query_normalizer_and_fold_pattern():
+    from messaging_service.name_variants import fold_pattern,normalize
+    assert normalize('  @Фёдор \t Иванов ')=='фёдор иванов'
+    assert normalize('@@Anna')=='anna' and normalize('')==''
+    assert fold_pattern('федор')=='ф[её]дор' and fold_pattern('фёдор')=='ф[её]дор'
+    assert fold_pattern('ёж') is None and fold_pattern('anna') is None and fold_pattern('ann') is None
+    assert fold_pattern('еж.*')=='[её]ж\\.\\*' and fold_pattern('еле на')=='[её]л[её]\\ на'
+    assert fold_pattern('ёa(%_\\')=='[её]a\\(\\%\\_\\\\'
+
+
 def test_people_rest_mcp_permission_and_audit(seeded):
     s,_,key,_=directory(seeded)
     with TestClient(create_app(s,['testserver'])) as client:
