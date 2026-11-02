@@ -2697,7 +2697,8 @@ def test_the_real_go_suites_produce_every_existing_tiden_go_identity(tmp_path):
     identities = json.loads((root / "tests/fixtures/tiden-go-identities.json").read_text())
     assert identities and {item["signature"]: (item["title"], [{"title": item["suite"]}], item["file"])
                            for item in identities}.items() <= produced.items()
-    assert {row["execution"]["status"] for row in rows} == {"passed"}
+    assert {row["execution"]["status"] for row in rows} == {"passed"}, [
+        (row["title"], row["execution"]["status"]) for row in rows if row["execution"]["status"] != "passed"]
     # Leaf-only: no row is an ancestor of another, so a new test cannot add a parent row unnoticed.
     assert not [name for name in produced if any(other.startswith(name + "/") for other in produced)]
 
