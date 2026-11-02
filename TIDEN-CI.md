@@ -5,6 +5,9 @@ the exact **tested checkout SHA**, step outcomes and the GitHub Actions URL in
 the `ci-evidence` artifact, including failed runs. Python uses xunit1 to retain
 source paths; Node's generic `test` classname is qualified by its source file.
 Parameterized Python executions retain their parameter names and status.
+A JUnit report may hold at most `MAX_JUNIT_CASES` (50000) test cases and `MAX_BYTES` (20 MiB); both are
+local sanity bounds, since `tiden run report` uploads any number of rows in chunks of 2000. The merged
+Python report is about 220 bytes a case (2.2 MB for 9975 cases, 11-02).
 
 Test jobs run in parallel and each uploads a `ci-evidence-<job>` fragment:
 `checks / verify` the seven checks and its module reports, `checks / load` the
