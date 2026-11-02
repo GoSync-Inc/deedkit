@@ -2,7 +2,9 @@
 import hashlib
 import json
 import logging
+import os
 import re
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from platform_contracts.field_errors import MATCHING, validated
@@ -60,6 +62,90 @@ def manifest_summary(capabilities):
     if manifest.get("discovery_action") == NEXT_DISCOVERY_ACTION:
         result["discovery_action"] = NEXT_DISCOVERY_ACTION
     return result or None
+
+
+SOURCE_SHA = re.compile(r"[0-9a-f]{40}\Z")
+TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})\Z")
+STARTED_AT = datetime.now(timezone.utc)
+OPERATION_MISSING_HINT = ("A changed module build or manifest version is a signal to read tools/list and "
+                          "platform_capabilities again, never proof that the operation exists.")
+
+
+def gateway_build():
+    """The gateway's own build by messaging's rule: the 40-hex DEEDKIT_SOURCE_SHA of the image, else null (ANYM-662)."""
+    sha = os.environ.get("DEEDKIT_SOURCE_SHA", "")
+    return {"source_sha": sha if SOURCE_SHA.match(sha) else None,
+            "started_at": STARTED_AT.strftime("%Y-%m-%dT%H:%M:%S.%fZ")}
+
+
+def build_summary(capabilities):
+    """A module's reported build, validated and bounded: `{source_sha, started_at}` with null for what is malformed,
+    or None when the module reports none (an older build)."""
+    build = capabilities.get("build") if isinstance(capabilities, dict) else None
+    if not isinstance(build, dict):
+        return None
+    sha, started = build.get("source_sha"), build.get("started_at")
+    return {"source_sha": sha if isinstance(sha, str) and SOURCE_SHA.match(sha) else None,
+            "started_at": started if isinstance(started, str) and len(started) <= 40 and TIMESTAMP.match(started) else None}
+
+
+def manifest_lacks(tool, capabilities):
+    """True when the tool needs its operation in the module's manifest and the manifest does not list it.
+
+    Membership of the operation, not a version; a module with no (or a malformed) manifest lacks every operation.
+    """
+    if not tool.get("required_manifest"):
+        return False
+    manifest = capabilities.get("tool_manifest") if isinstance(capabilities, dict) else None
+    names = manifest.get("names") if isinstance(manifest, dict) else None
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        return True
+    return tool["operation"] not in names
+
+
+def module_identity(capabilities):
+    """`(module_manifest, module_build)`: the manifest version and the build commit, each null when not reported."""
+    summary = manifest_summary(capabilities) or {}
+    build = build_summary(capabilities) or {}
+    return summary.get("version"), build.get("source_sha")
+
+
+def operation_missing_detail(tool, capabilities):
+    """The body of a call to a policy-allowed tool whose operation the module's build does not have (ANYM-662)."""
+    manifest, build = module_identity(capabilities)
+    return {"error": "operation_not_in_module_build", "module": tool["module"], "operation": tool["operation"],
+            "module_manifest": manifest, "module_build": build, "next_action": "refresh_tools_after_release",
+            "hint": OPERATION_MISSING_HINT}
+
+
+def module_conditions(allowed, states, capabilities):
+    """What the key's own policy-allowed tools can learn about their modules: `(unavailable, builds)`.
+
+    `allowed` holds only tools the key's policy allows, so a module in which it has none never appears. Each module is
+    handled alone and built from data `discover` already loaded; an exception there omits that module's entry and
+    never fails a listing for healthy modules.
+    """
+    unavailable, builds = [], {}
+    by_module = {}
+    for name in allowed:
+        if CATALOG[name]["module"] != "gateway":
+            by_module.setdefault(CATALOG[name]["module"], []).append(name)
+    for module in sorted(by_module):
+        try:
+            caps = capabilities.get(module) or {}
+            if states.get(module) != "ready":
+                unavailable.append({"module": module, "state": "unavailable", "reason": "backend_unavailable",
+                                    "module_manifest": None, "module_build": None, "required_by": sorted(by_module[module])})
+                continue
+            builds[module] = build_summary(caps)
+            lacking = sorted(n for n in by_module[module] if manifest_lacks(CATALOG[n], caps))
+            if lacking:
+                manifest, build = module_identity(caps)
+                unavailable.append({"module": module, "state": "outdated", "reason": "operation_not_in_module_build",
+                                    "module_manifest": manifest, "module_build": build, "required_by": lacking})
+        except Exception:  # noqa: BLE001 - a diagnostic must never fail discovery for healthy modules
+            logging.getLogger(__name__).warning("module_condition_failed module=%s", module)
+    return unavailable, builds
 
 
 def failure_details(status, value, header_request_id=None):

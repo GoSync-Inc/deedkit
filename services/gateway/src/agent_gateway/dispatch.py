@@ -11,7 +11,8 @@ from platform_contracts.agent import MAX_CANDIDATES, PLACEHOLDER_REQUEST_ID, val
 from .adapters.calls import receipt_reference  # noqa: F401
 
 from .catalog import arguments, CATALOG, InvalidArguments, routed
-from .diagnostics import FAILURE_FIELDS, discovery, manifest_summary, stale_arguments_hint, unavailable, unknown_tool_denial
+from .diagnostics import (FAILURE_FIELDS, discovery, gateway_build, manifest_lacks, manifest_summary, module_conditions,
+                          operation_missing_detail, stale_arguments_hint, unavailable, unknown_tool_denial)
 from .http_clients import WAIT_POOL, WAIT_RETRY_AFTER_S
 from .policy import Denied, key_from_file
 from .sections import capabilities_view, subscription_blocks  # noqa: F401
@@ -291,6 +292,7 @@ class Dispatch:
         if current["revision"] != snapshot["revision"]:
             raise Denied("policy_changed", 409)
         visible = [n for n in visible if n in self.policy.visible(current, principal)]
+        allowed = list(visible)
         actions = self.actions(current, principal, capabilities.get("messaging", {}))
         visible = [
             n
@@ -314,8 +316,10 @@ class Dispatch:
             visible = route.listed(visible)
         manifests = {module: summary for module, caps, _ in results
                      if (summary := manifest_summary(caps)) is not None}
+        unavailable_modules, builds = module_conditions(allowed, states, capabilities)
         return current, principal, visible, {
             "states": states, "scopes": scopes, "actions": actions,
+            "unavailable_modules": unavailable_modules, "backend_builds": builds,
             "discovery": discovery(visible, actions, current["revision"]),
             "backend_tool_manifests": manifests, "selected": selected,
         }
@@ -413,7 +417,11 @@ class Dispatch:
             # ANYM-519: binding a self-service endpoint needs the local delivery-write grant too.
             raise Denied()
         if not self.implemented(tool, snapshot, agent, caps, args.get("account")):
-            raise Denied()
+            denied = Denied()
+            if manifest_lacks(tool, caps):
+                # ANYM-662: `call` explains this after it re-authorizes the key; any other cause stays this bare denial.
+                denied.operation_missing_caps = caps
+            raise denied
         rules_ceiling = "assignment:read" in set(agent["grants"].get(module, [])) & set(caps["permissions"])
         if (module == "calendar" and tool["operation"] == "plan"
                 and any(isinstance(a, dict) and (a.get("action") in ("project", "unproject")
@@ -478,6 +486,23 @@ class Dispatch:
     def admit(self, key, name):
         return self.policy.authorize_agent(*self.authenticate(key), name)
 
+    def operation_missing(self, key, name, snapshot, tool, caps):
+        """The detailed body for a policy-allowed tool whose operation the module build lacks (ANYM-662). The key is
+        authorized again after the capability read and before any detail is built, so a revocation mid-request leaves the
+        one identical body of a tool the key cannot call."""
+        try:
+            current, _, _ = self.admit(key, name)
+        except Denied as error:
+            if error.code == "not_found_or_forbidden" and error.status == 403:
+                error.detail = unknown_tool_denial("platform_capabilities" in self.visible_to(key))
+            raise
+        if current["revision"] != snapshot["revision"]:
+            raise Denied("policy_changed", 409)
+        try:
+            return operation_missing_detail(tool, caps)
+        except Exception:  # noqa: BLE001 - a diagnostic never replaces the denial; today's bare body stays
+            return None
+
     def admit_call(self, key, name, values, route):
         try:
             snapshot, agent, tool = self.admit(key, name)
@@ -538,6 +563,9 @@ class Dispatch:
                 "tools": visible,
                 "modules": sorted({CATALOG[n]["module"] for n in visible} - {"gateway"}),
                 "backend_states": states["states"],
+                "unavailable": states["unavailable_modules"],
+                "backend_builds": states["backend_builds"],
+                "gateway": {"build": gateway_build()},
                 "coverage": "query selected module capabilities; unavailable/stale sources remain unknown",
                 "subscriptions": "existing backend identity; passive events do not ACK",
                 # The gateway's own local write (platform_select_modules) is not a provider mutation.
@@ -565,7 +593,14 @@ class Dispatch:
                 error.detail = unavailable(tool["operation"], getattr(error, "detail", None),
                                            phase="capabilities", read_only=read_only)
             raise
-        allowed_actions = self.argument_admission(tool, args, snapshot, agent, caps)
+        try:
+            allowed_actions = self.argument_admission(tool, args, snapshot, agent, caps)
+        except Denied as denied:
+            if getattr(denied, "operation_missing_caps", None) is not None:
+                detail = self.operation_missing(key, name, snapshot, tool, denied.operation_missing_caps)
+                if detail is not None:
+                    denied.detail = detail
+            raise
         operation, args = self.backend_call(tool, args, caps)
         # A preview has no effect, also when a risk-class tool asks for it.
         read_only = read_only or operation == "preview_messenger_operation"

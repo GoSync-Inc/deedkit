@@ -19,3 +19,5 @@ ENV PATH=/app/.venv/bin:$PATH VOICE_BIND=0.0.0.0 VOICE_PORT=13842 VOICE_DATA_DIR
 USER 10001:10001
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 CMD ["python", "healthcheck.py"]
 CMD ["python", "app.py"]
+ARG DEEDKIT_SOURCE_SHA
+ENV DEEDKIT_SOURCE_SHA=$DEEDKIT_SOURCE_SHA
