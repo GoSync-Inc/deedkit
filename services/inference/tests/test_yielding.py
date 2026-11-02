@@ -64,7 +64,7 @@ def stopped(pid):
 
 
 def settings(**over):
-    return YieldSettings(**{"min_remaining_seconds": 0, "resume_after_seconds": 0.3, **over})
+    return YieldSettings(**{"enabled": True, "min_remaining_seconds": 0, "resume_after_seconds": 0.3, **over})
 
 
 def yielding(env, cpu=None, **over):
@@ -974,6 +974,21 @@ def test_yield_json_absent_or_invalid_means_defaults_and_the_service_starts(tmp_
 
 
 # spec: ANYM-691
+async def test_the_yielder_ships_disabled_and_a_service_without_yield_json_never_stops_a_phase(env):
+    assert YieldSettings().enabled is False  # the default: no yield.json, an invalid one, or one without `enabled`
+    path = env.tmp / "prog"
+    (env.tmp / "state").mkdir()
+    async with env.running(aliases=long_timeout(), usage_file=str(env.tmp / "state" / "usage.json"),
+                           sampler=ScriptedCpu()) as s:  # no yield_settings: the defaults, as the CLI passes them
+        assert s.service.yielder.task is None
+        task = await s.submit(s.transcribe(fk(tick=str(path), ticks=30)))
+        await s.until(lambda: size(f"{path}.main") > 2)
+        s.probe.between = True
+        assert (await task).status == 200 and size(f"{path}.main") == 30  # busy the whole time, never stopped
+        assert s.service.yielder.paused == {}
+
+
+# spec: ANYM-691
 async def test_enabled_false_restores_todays_behaviour(env):
     path = env.tmp / "prog"
     async with env.running(aliases=long_timeout(), **yielding(env, enabled=False)) as s:
@@ -983,6 +998,16 @@ async def test_enabled_false_restores_todays_behaviour(env):
         s.probe.between = True
         assert (await task).status == 200 and size(f"{path}.main") == 30  # busy the whole time, never stopped
         assert s.service.yielder.paused == {}
+
+
+# spec: ANYM-691
+def test_yield_json_enabled_true_is_the_only_way_to_turn_it_on(tmp_path):
+    path = tmp_path / "yield.json"
+    path.write_text('{"enabled": true}')
+    path.chmod(0o600)
+    assert load_yield_settings(path).enabled is True
+    path.write_text('{"max_pause_seconds": 60}')  # other settings alone do not switch it on
+    assert load_yield_settings(path).enabled is False
 
 
 # spec: ANYM-691

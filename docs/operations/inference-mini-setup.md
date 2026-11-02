@@ -693,8 +693,10 @@ undo removes the directory. A daily file is 5760 lines (about 1 MB); nothing rot
 
 ### 13c. Yielding: what it does on the mini, how to read it, how to switch it off (ANYM-691)
 
-The service stops a running phase while Between or the remote tests use the host (README, Yielding). Deploying it is a normal
-release (section 8); criterion 7(a) of the card (three daily summaries of the monitor as the "before") gates the deploy.
+The service stops a running phase while Between or the remote tests use the host (README, Yielding). **It ships off**: without
+`yield.json` containing `{"enabled": true}` nothing is ever stopped. Deploying it is a normal release (section 8) and changes
+nothing for the phases; turning it on is gated on ANYM-691 PR 3 (the ownership of a helper that starts between the ledger write
+and the stop, README Yielding) and on criterion 7(a) of the card (three daily summaries of the monitor as the "before").
 **What a deploy-time canary looks like:** `deedkit-inference canary` sends `X-Request-Deadline-Seconds` equal to its read
 timeout; during a pause a canary request is slow, not hung (`yield:` lines say how long), and the response carries
 `X-Paused-Seconds`. A dead or stale probe closes admission for new work, lets running work finish and resumes any pause.
@@ -702,10 +704,10 @@ timeout; during a pause a canary request is slow, not hung (`yield:` lines say h
 - Log: `grep -E 'yield(-job)?:' /Users/_deedkitinf/logs/*` (counts and durations only). Paused minutes per flag and `wasted`
   seconds tune `pause_on` and `pause_min_foreign_cores`; a `yield-job:` line with `paused>0`, `total` beyond `deadline` and an
   outcome other than `ok` is the documented loss: raise `deadline_safety_factor` or switch the feature off.
-- Settings: `/Users/_deedkitinf/yield.json` (optional; read at the next start). Install or change it with the busy check
+- Settings: `/Users/_deedkitinf/yield.json` (optional; read at the next start; `{"enabled": true}` turns the feature on). Install or change it with the busy check
   `&&`-chained, then a normal restart of the job (drain first): `sudo -n install -o _deedkitinf -g _deedkitinf -m 0640 yield.json /Users/_deedkitinf/yield.json`.
 - Switch off (decision rule, card 7(d): the CPU gain is not visible or the RAM cost is): put `{"enabled": false}` in `yield.json`
-  and restart; or remove the file and roll back to a release without the feature. Either restores today's behaviour (Nice 20 alone).
+  (or remove the file: the default is off) and restart; or roll back to a release without the feature. Either restores today's behaviour (Nice 20 alone).
 - A stopped group left by a service that died is continued and killed by `deedkit-inference recover` (sections 8, 14), by the
   next start, and by the deploy; check read-only first: `ps -axo pid,pgid,stat,user,comm | awk '$3 ~ /^T/ && $4 == "_deedkitinf"'`.
 

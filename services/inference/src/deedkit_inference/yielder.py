@@ -44,7 +44,8 @@ class YieldSettings(BaseModel):
     """`yield.json` next to config.json. Strict, but never fatal: an invalid file means the defaults."""
 
     model_config = ConfigDict(extra="forbid")
-    enabled: StrictBool = True
+    # Ships OFF (orchestrator 11-02): enabling waits for the ownership fix of ANYM-691 PR 3 and the monitor data (criterion 7a).
+    enabled: StrictBool = False
     pause_on: list[Literal["between", "deedkit_ci"]] = Field(default_factory=lambda: ["between", "deedkit_ci"])
     pause_min_foreign_cores: Annotated[float, Field(ge=0, le=64)] = 1.0
     resume_after_seconds: Annotated[float, Field(ge=0, le=3600)] = 10.0
