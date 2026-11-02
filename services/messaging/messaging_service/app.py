@@ -785,7 +785,7 @@ def register_archive_tools(mcp, call, async_call, read):
                live: Literal['off','auto','on']='off', wait_s: LiveWaitSeconds | None=None, request_id: StrictStr='') -> dict[str, Any]:
         """Search archived text across chosen accounts/chats/sender IDs. Lists use OR within each
         dimension, AND between dimensions; [] matches nothing. Exact account-scoped sender IDs,
-        not a merged person directory. query_mode: all words (all), phrase, or web (quotes/OR/-word).
+        not a merged person directory. query_mode: all, any (at least one word), phrase, web (quotes/OR/-word) or exact; see the query_mode parameter.
         UTC range [from_time,to_time). order asc/desc; use next_cursor as after with unchanged
         filters/order. before is an exclusive chronological boundary, incompatible with after.
         Conversation view hides known system events unless include_system=true.

@@ -115,7 +115,7 @@ def capabilities(self, token, detail='full', sections=None):
             'search_options':{'filters':['accounts','chats','senders','from_time','to_time','direction','exclude_channels',
                     'chat_types','include_channels'],
                 'search_channels_default':'excluded_unless_include_channels_chat_types_or_named_chats',
-                'query_modes':['all','phrase','web','exact'],'orders':['asc','desc','relevance'],
+                'query_modes':['all','any','phrase','web','exact'],'orders':['asc','desc','relevance'],
                 'languages':['auto','simple','russian','english','indonesian'],
                 'fuzzy':'explicit_bounded_fallback','compact':True,'optional_coverage':True,
                 'context':'independent_before_and_after_counts','chat_orders':['id','activity','last_activity_desc','priority'],

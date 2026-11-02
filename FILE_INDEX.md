@@ -44,7 +44,7 @@ Native parser packages must receive normal security updates.
 ## Retrieval contract
 
 `search_files` uses the same account/chat ACL and `read` permission as message
-search. It supports `query_mode=all|phrase|web|exact`,
+search. It supports `query_mode=all|any|phrase|web|exact` (`any`: at least one word, ranked by distinct terms under `order=relevance`; see SEARCH.md),
 `search_language=auto|simple|russian|english|indonesian`, scalar/list account,
 chat and sender filters, `[from_time,to_time)` dates and direction. Lists are OR
 within one dimension and AND across dimensions; empty lists match nothing.

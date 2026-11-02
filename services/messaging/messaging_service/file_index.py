@@ -324,6 +324,8 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
             ') candidates ORDER BY rank DESC,content ASC,start_offset ASC LIMIT 1) hit ON true')
         predicate = '(' + base_raw + ' OR ' + base_enriched + ' OR ' + base_understanding + ' OR hit.content IS NOT NULL OR ' + base_context + ')'
         rank = 'greatest(' + plan.rank('f') + ',coalesce(CASE WHEN ' + ENRICH_READY + ' THEN ' + plan.rank('e') + ' ELSE 0 END,0),coalesce(CASE WHEN '+UNDERSTANDING_READY+' THEN '+plan.rank('u')+' ELSE 0 END,0),coalesce(hit.rank,0),' + plan.rank('m') + ')'
+        if plan.mode == 'any':  # ANYM-668: distinct terms across the name, text, transcript, description and caption
+            rank = plan.any_rank([('f', None), ('e', ENRICH_READY), ('u', UNDERSTANDING_READY), ('m', None)], 'coalesce(hit.rank,0)')
         # Empty ready extraction still has a filename-header chunk; it is not file content.
         voice_excerpt = "(coalesce(hit.content,'extracted')='extracted' AND " + voice_excerpt + ')'
         snippet_text = '(CASE WHEN ' + voice_excerpt + ' THEN left(e.text_content,32000) WHEN hit.content IS NOT NULL THEN hit.passage WHEN ' + base_raw + ' THEN ' + raw_preview + ' WHEN ' + base_enriched + ' THEN ' + enriched_preview + ' WHEN '+base_understanding+' THEN '+UNDERSTANDING_TEXT+' ELSE m.body END)'

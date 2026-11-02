@@ -15,6 +15,7 @@ from .field_errors import cursor_refusal
 
 LANGUAGES = ('simple', 'russian', 'english', 'indonesian')
 FUNCTIONS = {'all': 'plainto_tsquery', 'phrase': 'phraseto_tsquery', 'web': 'websearch_to_tsquery'}
+MODES = (*FUNCTIONS, 'any', 'exact')
 
 
 def invalid(code='invalid_filter'):
@@ -91,6 +92,7 @@ class SearchPlan:
     languages: tuple[str, ...]
     cte: str
     params: list
+    terms: int = 0
 
     @staticmethod
     def vector(alias, language):
@@ -112,6 +114,8 @@ class SearchPlan:
     def rank(self, alias, text_sql=None):
         if not self.query or self.mode=='exact':
             return '0::bigint'
+        if self.mode=='any':
+            return self.any_rank([(alias,None)])
         base='greatest('+','.join('ts_rank_cd('+self.vector(alias,lang)+',q.'+lang+',32)' for lang in self.languages)+')'
         if text_sql is None or self.mode not in ('all','phrase'):
             return '(round(('+base+'*1000000)::numeric))::bigint'
@@ -125,6 +129,23 @@ class SearchPlan:
         tier=('(CASE WHEN lower('+text_sql+") LIKE lower(q.literal_pattern) ESCAPE E'\\\\' THEN 2 WHEN "+
             phrase+' THEN 1 ELSE 0 END)')
         return '(round((('+tier+'+'+base+'::float8)/3*1000000)::numeric))::bigint'
+
+    def any_rank(self, sources, extra=None):
+        """ANYM-668: `any` ranks by distinct matching terms; ties keep the time order (card criterion 3).
+
+        `sources` are (alias, gate) pairs whose documents all count: a term matches when ANY source matches it under ANY
+        language, so a file whose name has one term and whose caption has another counts both. One pass over the
+        per-language term arrays serves every row. No cover-density tie-breaker: ts_rank_cd over a long OR query cost
+        6.7 of 8 s for 99 terms over 40,000 matching rows. count/terms*1000000 stays inside the 0..1000000 cursor bound.
+        """
+        langs=self.languages
+        def hit(alias, gate):
+            matched='('+' OR '.join(self.vector(alias,lang)+' @@ t.c'+str(i) for i,lang in enumerate(langs))+')'
+            return '('+gate+' AND '+matched+')' if gate else matched
+        found=('(SELECT count(*) FROM unnest('+','.join('q.terms_'+lang for lang in langs)+') AS t('+
+            ','.join('c'+str(i) for i in range(len(langs)))+') WHERE '+' OR '.join(hit(a,g) for a,g in sources)+')')
+        rank='(round(('+found+'::float8/'+str(self.terms)+'*1000000)::numeric))::bigint'
+        return rank if extra is None else 'greatest('+rank+','+extra+')'
 
     def snippet(self, text_sql):
         if not self.query:
@@ -153,7 +174,7 @@ class SearchPlan:
 def compile_query(query='', query_mode='all', search_language='auto'):
     if not isinstance(query,str) or len(query)>200 or '\x00' in query:
         invalid('invalid_query')
-    if not isinstance(query_mode,str) or query_mode not in (*FUNCTIONS,'exact'):
+    if not isinstance(query_mode,str) or query_mode not in MODES:
         invalid('invalid_query')
     if not isinstance(search_language,str) or search_language not in ('auto',*LANGUAGES):
         invalid('invalid_query')
@@ -161,7 +182,17 @@ def compile_query(query='', query_mode='all', search_language='auto'):
     columns=['%s::text AS literal','%s::text AS literal_pattern']
     pattern='%'+query.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'
     params=[query,pattern]
-    if query_mode!='exact':
+    terms=[]
+    if query_mode=='any':
+        # ANYM-668: every whitespace-separated term is its own plain query, so quotes, OR and a leading - are text.
+        # Terms that differ only in case compile to the same query in every dictionary (lower(), not casefold: Straße / STRASSE differ).
+        first={}
+        for term in query.split():first.setdefault(term.lower(),term)
+        terms=list(first.values()) or [query]
+        for lang in languages:
+            columns.append(' || '.join("plainto_tsquery('"+lang+"',%s)" for _ in terms)+' AS '+lang); params.extend(terms)
+            columns.append('ARRAY['+','.join("plainto_tsquery('"+lang+"',%s)" for _ in terms)+'] AS terms_'+lang); params.extend(terms)
+    elif query_mode!='exact':
         for lang in languages:
             columns.append(FUNCTIONS[query_mode]+"('"+lang+"',%s) AS "+lang); params.append(query)
     if query_mode=='all':
@@ -170,7 +201,7 @@ def compile_query(query='', query_mode='all', search_language='auto'):
     # This CTE is referenced by filtering, ranking and presentation. A shared
     # materialized row hides constant tsqueries from GIN index conditions and
     # can turn a selective LIMIT query into a date-ordered archive traversal.
-    return SearchPlan(query,query_mode,languages,'search_query AS NOT MATERIALIZED (SELECT '+','.join(columns)+')',params)
+    return SearchPlan(query,query_mode,languages,'search_query AS NOT MATERIALIZED (SELECT '+','.join(columns)+')',params,len(terms))
 
 
 def output_options(compact=False, body_chars=None, include_coverage=True):
