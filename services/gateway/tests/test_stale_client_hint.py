@@ -285,32 +285,33 @@ def disable_key(value):
     value["principals"][0]["enabled"] = False
 
 
-# spec: ANYM-662
-@pytest.mark.parametrize("mutate,expected", [
-    (drop_tool, {**UNKNOWN_BODY, "next": {"tool": "platform_capabilities", "arguments": {}}}),
-    (drop_tool_and_platform, UNKNOWN_BODY),
-], ids=["tool removed", "profile emptied"])
-def test_a_mid_request_revocation_leaves_the_canonical_denial_and_no_metadata(tmp_path, mutate, expected):
-    # The key is re-authorized after the capability read and before any detail is built; the tool is gone by then.
-    app, paths = revoking_app(tmp_path, mutate)
-    with TestClient(app) as client:
-        rest = call_both(client, FETCH, FETCH_ARGS)
-    assert rest.status_code == 403 and rest.json() == expected
-    assert paths == ["capabilities"] and "module_manifest" not in rest.text and "9.9.9" not in rest.text
+def over(client, transport, name=FETCH, values=FETCH_ARGS):
+    """One call over REST or MCP; the status and the error body the agent sees."""
+    if transport == "rest":
+        response = client.post("/v1/" + name, json=values, headers=HEADERS)
+        return response.status_code, response.json()
+    result = client.post("/mcp", json={"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": name, "arguments": values}},
+                         headers={**HEADERS, "Accept": "application/json, text/event-stream"}).json()["result"]
+    assert result["isError"]
+    return None, result["structuredContent"]
 
 
 # spec: ANYM-662
-@pytest.mark.parametrize("mutate", [drop_grant, disable_key], ids=["grant removed", "key disabled"])
-def test_a_mid_request_loss_of_the_grant_or_the_key_leaves_no_detail_and_no_operation_call(tmp_path, mutate):
-    app, paths = revoking_app(tmp_path, mutate)
+@pytest.mark.parametrize("transport", ["rest", "mcp"])
+@pytest.mark.parametrize("mutate,status,expected", [
+    (drop_tool, 403, {**UNKNOWN_BODY, "next": {"tool": "platform_capabilities", "arguments": {}}}),
+    (drop_tool_and_platform, 403, UNKNOWN_BODY),
+    (drop_grant, 403, {**UNKNOWN_BODY, "next": {"tool": "platform_capabilities", "arguments": {}}}),
+    (disable_key, 401, {"error": "unauthorized"}),
+], ids=["tool removed", "profile emptied", "grant removed", "key disabled"])
+def test_a_mid_request_revocation_over_either_transport_leaves_the_exact_denial_and_no_metadata(tmp_path, transport, mutate, status, expected):
+    # A fresh app and policy for every transport and mutation: the key is re-authorized after the capability read,
+    # before any detail is built, and the access it lost is gone by then.
+    app, paths = revoking_app(fresh(tmp_path, "case"), mutate)
     with TestClient(app) as client:
-        rest = client.post("/v1/" + FETCH, json=FETCH_ARGS, headers=HEADERS)
-        mcp = client.post("/mcp", json={"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": FETCH, "arguments": FETCH_ARGS}},
-                          headers={**HEADERS, "Accept": "application/json, text/event-stream"})
-    assert rest.status_code in (401, 403, 409) and rest.json().get("error") != "operation_not_in_module_build"
-    for text in (rest.text, mcp.text):
-        assert "module_manifest" not in text and "module_build" not in text and "9.9.9" not in text and SHA_A not in text
-    assert set(paths) == {"capabilities"}
+        code, body = over(client, transport)
+    assert body == expected and (code is None or code == status)
+    assert paths == ["capabilities"] and "module_manifest" not in str(body) and SHA_A not in str(body)
 
 
 # spec: ANYM-662
@@ -335,6 +336,7 @@ def test_a_key_that_may_not_call_platform_capabilities_is_never_pointed_to_it(tm
 @pytest.mark.parametrize("started_at,kept", [
     ("2026-11-02T10:00:00.000000Z", True), ("2026-11-02T10:00:00+01:00", True), ("2026-99-99T99:99:99Z", False),
     ("2026-11-02T25:00:00Z", False), ("2026-11-02T10:00:00+99:99", False), ("2026-11-02", False), (5, False),
+    ("2026-11-02T10:00:00+00:99", False), ("2026-11-02T10:00:00+01:60", False), ("2026-11-02T10:00:00-23:59", True),
 ])
 def test_build_timestamps_are_parsed_not_just_shaped(started_at, kept):
     summary = diagnostics.build_summary({"build": {"source_sha": SHA_A, "started_at": started_at}})

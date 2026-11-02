@@ -78,6 +78,9 @@ def valid_timestamp(value):
     """A bounded ISO-8601 timestamp with an offset whose date, time and offset are real."""
     if not (isinstance(value, str) and len(value) <= 40 and TIMESTAMP.match(value)):
         return False
+    offset = re.search(r"[+-]([0-9]{2}):([0-9]{2})\Z", value)
+    if offset and (int(offset[1]) > 23 or int(offset[2]) > 59):  # fromisoformat accepts +00:99 on some Pythons
+        return False
     try:
         datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
     except ValueError:
