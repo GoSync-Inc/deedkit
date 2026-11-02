@@ -90,17 +90,40 @@ def invalid(field_errors, **detail):
     return ServiceError("invalid_arguments", 422, {"field_errors": field_errors, "retryable": False, **detail})
 
 
+DESTINATION_FORMATS = {"telegram": "digits only (Telegram user ID)",
+                       "sip": "a sip: or sips: URI without credentials",
+                       "phone": "an E.164 number: + and 7 to 15 digits",
+                       "whatsapp": "an E.164 number: + and 7 to 15 digits"}
+
+
+def field_errors(error, arguments=None):
+    """At most 20 {field, reason} entries of a ValidationError (ANYM-295 vocabulary; `allowed` for an enum).
+    A refused brief route reports the destination with the format it expects (ANYM-657)."""
+    entries = []
+    for item in error.errors()[:20]:
+        if item["type"] == "value_error" and "invalid_call_destination_or_account" in str(item.get("msg", "")):
+            brief = arguments.get("brief") if isinstance(arguments, dict) else None
+            expected = DESTINATION_FORMATS.get(brief.get("channel")) if isinstance(brief, dict) else None
+            entry = {"field": "brief/destination", "reason": "format"}
+            entries.append({**entry, "expected": expected} if expected else entry)
+            continue
+        field = "/".join(str(part) for part in item["loc"]) or "arguments"
+        reason = REASONS.get(item["type"], "type" if item["type"].endswith("_type") else "format")
+        entry = {"field": field[:128], "reason": reason}
+        if item["type"] == "literal_error":
+            allowed = re.findall(r"'([^']{1,64})'", str((item.get("ctx") or {}).get("expected", "")))[:20]
+            if allowed:
+                entry["allowed"] = allowed
+        entries.append(entry)
+    return entries
+
+
 def parse(model, arguments):
     """The request model, or invalid_arguments with field_errors in the ANYM-295 vocabulary."""
     try:
         return model.model_validate(arguments)
     except ValidationError as error:
-        entries = []
-        for item in error.errors()[:20]:
-            field = "/".join(str(part) for part in item["loc"]) or "arguments"
-            reason = REASONS.get(item["type"], "type" if item["type"].endswith("_type") else "format")
-            entries.append({"field": field[:128], "reason": reason})
-        raise invalid(entries) from None
+        raise invalid(field_errors(error, arguments)) from None
 
 
 def channel_of(value):
@@ -549,6 +572,8 @@ def view(call, request_id):
              "call_id": call["id"], "status": call["status"], "outcome": call.get("outcome"),
              "dial_state": call.get("dial_state"), "end_reason": call.get("end_reason"),
              "destination": call_origin(call), **voice_engine(call)}
+    if call.get("provider_error"):
+        value["provider_error"] = call["provider_error"]
     if request_id:
         value["request_id"] = request_id
     if state == "unknown":

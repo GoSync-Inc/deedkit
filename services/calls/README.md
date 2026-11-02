@@ -114,6 +114,26 @@ Call events **wake an agent**. They never notify the owner: DeedKit still sends 
 
 `GET /v1/events?after=<seq>&limit=<1-200>` and `GET /v1/events/head` serve the producers' cursor contract of [SUBSCRIPTIONS.md](../../SUBSCRIPTIONS.md#module-events-schema-56): `{events, next_after, has_more, retention_floor, journal_id}`. Each event is the ANYM-562 envelope plus a top-level `scope_ref`, the call's `owner_principal`. Only a registry principal whose sole scope is `calls:events` (the module router's read-only token) may read them; that token can call no tool. The journal holds every principal's calls, so an agent key never reads it. The endpoint skips some rows and moves `next_after` past them: rehearsals (browser calls) unless `include_rehearsal=1`, which then marks each event `rehearsal: true/false`; calls without an owner principal; and owner-request states other than `pending`, which ANYM-562 does not accept yet. A journal read uses its own read-only SQLite connection, so it never takes the service lock a live call writes under, and it sees committed rows only. The only read-side holder of that lock is the expiry pass, which runs at most every 30 seconds. One pass covers at most 20 due calls, found through a deadline index, with one commit. `test_call_events.py` measures the bound while 10,000 events are read back to back and the archive holds 10,000 calls with due requests. At the 99th percentile, a live call's event write waits for the lock no longer than its own slowest write takes alone, plus 100 ms. No write waits a second for it.
 
+## Why an outbound call failed (ANYM-657)
+
+A call placed through Twilio (phone, WhatsApp and SIP routes) that Twilio refuses on create-call, or that ends `failed` with a Twilio `ErrorCode` on the status callback, carries `provider_error = {code, cause}` (a refusal on create-call also has `http_status`) in `get_call_status` and in the call view of `call` / `call_result`. `provider_status` and `end_reason` are unchanged: `end_reason` is the lifecycle word, `cause` the explanation. `code` is Twilio's integer error code or null; `cause` is a fixed word, and no provider text, number or destination is passed on. A 5xx or a network error keeps the `ambiguous_provider_response` path, sets no `provider_error`, and nothing re-dials. Telegram routes never set `provider_error`, so its absence does not mean there was no error. The `call.failed` event does **not** carry it yet: read `get_call_status` after the event.
+
+| cause | meaning | who acts |
+| --- | --- | --- |
+| `geo_permission_missing` (21215, 13227) | The Twilio account may not call that country | The owner, in the Twilio console (Voice geo permissions). The agent must not retry with another number format |
+| `invalid_destination` (21211, 13224) | Twilio does not accept the destination as a phone number | The agent, with another input (E.164: `+` and 7 to 15 digits) |
+| `destination_not_reachable` (21214) | The destination cannot be reached | The agent, with another input |
+| `destination_not_dialable` (21217) | No dialable number matches the destination | The agent, with another input |
+| `destination_unverified` (21219) | A trial account may call only verified numbers | The owner, in the Twilio console |
+| `source_number_invalid` (21210, 21212, 21213) | The caller number is not usable | The owner, in the Twilio console |
+| `destination_blocked` (21216) | Twilio blocks calls to the destination | The owner, in the Twilio console |
+| `rate_limited` (20429) | Twilio throttles create-call | Nobody: wait, then prepare a new call |
+| `provider_auth_failed` (20003, 20404) | The Twilio credentials are refused | The owner, in the Twilio console and the service environment |
+| `provider_rejected_other` | A create-call refusal with another or no code | The owner reads `code` in Twilio's error catalog |
+| `call_failed_other` | A `failed` callback with a code outside this table (a carrier or SIP failure after Twilio accepted the dial) | The owner reads `code`; nothing is retried automatically |
+
+A refused `prepare_external_call` returns `invalid_arguments` with `field_errors` for every failing field (at most 20): `{field, reason}`, plus `allowed` for an enum and `expected` for a destination in the wrong format, for example `{field: "brief/destination", reason: "format", expected: "digits only (Telegram user ID)"}`. Other bare `invalid_arguments` paths are unchanged.
+
 ## Storage and MVP limits
 
 The ignored `.local/voice-service/data/voice.sqlite3` contains tasks, conversation text, tools, decisions and ratings; directory permissions 0700, files 0600. The Gemini key does not get into the database. One active check; at most 10 minutes, Pipecat idle timeout 180 seconds. An unfinished conversation after a restart gets `interrupted`. There is no automatic retry. SQLite is designed for one process — do not start a second service with the same database.

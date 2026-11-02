@@ -29,6 +29,12 @@ ARCHIVE_WORDS = "Call the supplier and ask about the delivery"
 TYPED_WORDS = "Call +1 202 555 0199 and ask about the delivery"
 
 
+def brief_for_view():
+    from outbound import ExternalBrief
+    from test_tasks import BRIEF
+    return ExternalBrief(**BRIEF, channel="phone", account="twilio", destination=PHONE)
+
+
 class Died(BaseException):
     """The process dies inside the provider request: nothing below it catches this."""
 
@@ -280,6 +286,19 @@ def test_source_drift_between_preview_and_dial_is_stale(world):
     stale = error(execute(w, token), "preview_stale")
     assert stale["changed"] == ["destination"] and stale["preview"]["destination"]["destination"] == OTHER_PHONE
     assert w.effects == 0
+
+
+# spec: ANYM-657
+def test_the_call_view_carries_the_provider_error_next_to_dial_state_and_end_reason(tmp_path):
+    service = VoiceService(tmp_path)
+    brief = service.prepare(brief_for_view(), [])
+    call = service.start(brief["id"])
+    assert "provider_error" not in call_intent.view(service.get_call(call["id"]), None)
+    error = {"http_status": 400, "code": 21215, "cause": "geo_permission_missing"}
+    service.provider_update(call["id"], dial_state="rejected", provider_status="provider_rejected", provider_error=error)
+    shown = call_intent.view(service.get_call(call["id"]), "req-view-1")
+    assert shown["provider_error"] == error and shown["dial_state"] == "rejected" and "end_reason" in shown
+    service.close()
 
 
 # spec: ANYM-551

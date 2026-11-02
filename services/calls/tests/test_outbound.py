@@ -87,6 +87,91 @@ async def test_twilio_channels_signed_stream_and_no_cross_channel_fallback():
     await client.aclose()
 
 
+CANARY ='PROVIDER_TEXT_CANARY'
+LEAKY_NUMBER = '+442071838750'
+
+
+def twilio_rejecting(status, body, content=None):
+    seen = []
+
+    async def receive(request):
+        seen.append(request)
+        return httpx.Response(status, json=body) if content is None else httpx.Response(status, content=content)
+    http = httpx.AsyncClient(transport=httpx.MockTransport(receive))
+    config = {'account_sid': 'AC' + '2' * 32, 'auth_token': 'fixture-token', 'phone_from': '+12025550123',
+              'public_url': 'https://voice.example.test'}
+    return TwilioCalls(config, http=http), seen
+
+
+async def dial_with(tmp_path, provider):
+    service = VoiceService(tmp_path)
+    saved = service.prepare(brief(), [])
+    settings = CallingSettings(enabled=True, allowed={'phone': ['+628123456789']})
+    manager = Outbound(service, lambda: 'fake', settings, {'twilio': provider})
+    call = await manager.dial(saved['id'], 'Exact owner instruction')
+    return service, service.get_call(call['id'])
+
+
+# spec: ANYM-657
+@pytest.mark.parametrize('code,cause', [
+    (21215, 'geo_permission_missing'), (13227, 'geo_permission_missing'), (21211, 'invalid_destination'),
+    (13224, 'invalid_destination'), (21214, 'destination_not_reachable'), (21217, 'destination_not_dialable'),
+    (21219, 'destination_unverified'), (21210, 'source_number_invalid'), (21212, 'source_number_invalid'),
+    (21213, 'source_number_invalid'), (21216, 'destination_blocked'), (20429, 'rate_limited'),
+    (20003, 'provider_auth_failed'), (20404, 'provider_auth_failed'), (99999, 'provider_rejected_other'),
+    (None, 'provider_rejected_other'), ('21215', 'provider_rejected_other'), (1234567, 'provider_rejected_other'),
+])
+async def test_a_twilio_4xx_stores_the_code_and_a_fixed_cause_and_no_provider_text(tmp_path, code, cause):
+    body = {'message': CANARY + ' to ' + LEAKY_NUMBER, 'more_info': 'https://www.twilio.com/docs/errors/' + CANARY,
+            'status': 400, **({'code': code} if code is not None else {})}
+    provider, seen = twilio_rejecting(400, body)
+    service, call = await dial_with(tmp_path, provider)
+    assert len(seen) == 1
+    stored = {'http_status': 400, 'code': code if type(code) is int and code < 10**6 else None, 'cause': cause}
+    assert call['provider_error'] == stored
+    assert call['provider_status'] == 'provider_rejected' and call['dial_state'] == 'rejected'
+    assert call['end_reason'] == 'provider_rejected'
+    everything = json.dumps([call, service.get_call(call['id']), service.list_calls()])
+    assert CANARY not in everything and LEAKY_NUMBER not in everything and 'twilio.com/docs' not in everything
+    service.close()
+
+
+# spec: ANYM-657
+@pytest.mark.parametrize('content', [b'<html>' + b'PROVIDER_TEXT_CANARY' * 10 + b'</html>',
+    b'{"code": 21215, "message": "' + b'x' * 70000 + b'"}', b'[21215]', b'{"code": true}'])
+async def test_an_unreadable_or_oversized_4xx_body_gives_no_code(tmp_path, content):
+    provider, _ = twilio_rejecting(403, None, content=content)
+    service, call = await dial_with(tmp_path, provider)
+    assert call['provider_error'] == {'http_status': 403, 'code': None, 'cause': 'provider_rejected_other'}
+    assert CANARY not in json.dumps(call)
+    service.close()
+
+
+# spec: ANYM-657
+@pytest.mark.parametrize('status', [500, 503])
+async def test_a_5xx_keeps_the_ambiguous_path_with_no_provider_error_and_no_redial(tmp_path, status):
+    provider, seen = twilio_rejecting(status, {'code': 21215, 'message': CANARY})
+    service, call = await dial_with(tmp_path, provider)
+    assert call['dial_state'] == 'unknown' and 'provider_error' not in call
+    assert call['provider_status'] == 'reconciliation_required'
+    assert len(seen) == 1
+    assert CANARY not in json.dumps(call)
+    service.close()
+
+
+# spec: ANYM-657
+async def test_a_network_error_keeps_the_ambiguous_path_with_no_provider_error(tmp_path):
+    async def broken(request):
+        raise httpx.ConnectError('socket closed ' + CANARY)
+    config = {'account_sid': 'AC' + '2' * 32, 'auth_token': 'fixture-token', 'phone_from': '+12025550123',
+              'public_url': 'https://voice.example.test'}
+    provider = TwilioCalls(config, http=httpx.AsyncClient(transport=httpx.MockTransport(broken)))
+    service, call = await dial_with(tmp_path, provider)
+    assert call['dial_state'] == 'unknown' and 'provider_error' not in call
+    assert CANARY not in json.dumps(call)
+    service.close()
+
+
 def test_destination_validation_no_credentials_or_uri_injection():
     from pydantic import ValidationError
     for channel,dest in [('phone','sip:a@x'),('telegram','-100123'),('sip','sip:alice:password@pbx.test'),('sip','sip:a@pbx.test?method=INVITE')]:

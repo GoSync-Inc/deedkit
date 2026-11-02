@@ -53,6 +53,50 @@ def api(service, path, outbound=None, archive_factory=None):
     )
 
 
+# spec: ANYM-657
+async def test_get_call_status_returns_the_provider_error(tmp_path):
+    path, _, _ = registry(tmp_path)
+    service = VoiceService(tmp_path / "data")
+    surface = api(service, path)
+    brief = await surface.call("alice", "prepare_call", {"brief": {**BRIEF, "source_message_ids": []}})
+    call = service.start(brief["id"])
+    quiet = await surface.call("alice", "get_call_status", {"call_id": call["id"]})
+    assert "provider_error" not in quiet
+    error = {"http_status": 400, "code": 21215, "cause": "geo_permission_missing"}
+    service.provider_update(call["id"], provider_status="provider_rejected", dial_state="rejected", provider_error=error)
+    status = await surface.call("alice", "get_call_status", {"call_id": call["id"]})
+    assert status["provider_error"] == error and status["provider_status"] == "provider_rejected"
+    service.close()
+
+
+# spec: ANYM-657
+async def test_a_refused_external_brief_names_every_bad_field(tmp_path):
+    path, _, _ = registry(tmp_path)
+    service = VoiceService(tmp_path / "data")
+    surface = api(service, path)
+    good = {**BRIEF, "channel": "telegram", "account": "telegram", "destination": "123456789"}
+    for destination in ("+123456789", "12ab", "12 34"):
+        with pytest.raises(ServiceError) as caught:
+            await surface.call("alice", "prepare_external_call", {"brief": {**good, "destination": destination}})
+        assert caught.value.code == "invalid_arguments" and caught.value.status == 422
+        assert caught.value.detail["field_errors"] == [{"field": "brief/destination", "reason": "format",
+                                                        "expected": "digits only (Telegram user ID)"}]
+    with pytest.raises(ServiceError) as caught:
+        await surface.call("alice", "prepare_external_call",
+                           {"brief": {**good, "goal": "no", "max_duration_secs": 5, "language": "xx", "surprise": 1}})
+    fields = {entry["field"]: entry for entry in caught.value.detail["field_errors"]}
+    assert {"brief/goal", "brief/max_duration_secs", "brief/language", "brief/surprise"} <= set(fields)
+    assert fields["brief/language"]["reason"] == "enum" and fields["brief/language"]["allowed"] == ["ru", "en", "id"]
+    assert fields["brief/surprise"]["reason"] == "unknown_field"
+    assert len(caught.value.detail["field_errors"]) <= 20
+    # a phone number is checked against the E.164 form, and a valid brief is still prepared
+    with pytest.raises(ServiceError) as caught:
+        await surface.call("alice", "prepare_external_call", {"brief": {**good, "channel": "phone", "account": "twilio",
+                                                                       "destination": "0628123456"}})
+    assert caught.value.detail["field_errors"][0]["expected"] == "an E.164 number: + and 7 to 15 digits"
+    service.close()
+
+
 async def test_ownership_cannot_be_spoofed_and_survives_restart(tmp_path):
     path, _, _ = registry(tmp_path)
     service = VoiceService(tmp_path / "data")
