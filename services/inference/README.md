@@ -208,7 +208,9 @@ group is gone and its number may belong to a stranger) the entry owns only what 
 of that group number that started later is only continued by `recover` (it may be a stranded late helper, which then ends and frees its
 memory, or a stranger), never killed. Right after the signal the
 entry becomes "stopped" with the real stop time. A leader that exists with another start time rejects the whole group, as before.
-Enabling is still gated on criterion 7(a) of the card.
+Known residual (Sol r3 of PR 3): a stalled stop, a helper born in the stall, a crash before the second write, and then the leader and
+every `seen` process killed; `recover` then only continues the stopped process, it never kills it. Enabling is gated on criterion 7(a) of
+the card and on the guardian card (a dead-man guardian outside the group, written only if the daily summary shows that overlap hurts Between).
 
 - Only the last phase of a job, from its spawn (a child) or from the moment its call is sent (a worker). Not paused:
   loading, model-hash preparation, idle warm workers, earlier phases of a multi-phase job, a phase with less than
