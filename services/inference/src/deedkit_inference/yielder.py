@@ -361,19 +361,6 @@ class Yielder:
         self.ledger.record(candidate.proc.pid, candidate.proc.pid, started, stopped_at=self.wall())
         return True
 
-    def _snapshot(self, pgid):
-        """Ledger thread, after the stop: the exact members of the frozen group (pid and start time) go into the entry.
-        The recorded stop time is that of the ledger write, a little before the freeze, and recovery only owns members
-        that started no later than it; a helper spawned in between is named here by identity instead, so a crash after
-        this write strands nothing (a crash inside the milliseconds before it is the one window that remains)."""
-        try:
-            rows = [{"pid": row["pid"], "started": row["started"]} for row in pausestate.process_table()
-                    if row["pgid"] == pgid and row["stat"].startswith("T")]
-            if rows:
-                self.ledger.set_members(pgid, rows)
-        except Exception as error:  # noqa: BLE001 - the entry written before the stop still stands
-            LOG.error("yield: group members not recorded: %s", type(error).__name__)
-
     async def _enter(self, now, flags):
         for running in self._running():
             job = running.job
@@ -412,9 +399,6 @@ class Yielder:
             return
         if pause.marker is not None and os.path.exists(pause.marker):
             self._resume(pause, "decode")  # the marker appeared before the stop landed: the decoder keeps its deadline
-            return
-        with contextlib.suppress(RuntimeError):
-            self.io.submit(self._snapshot, pause.pgid)
 
     # --- continuing --------------------------------------------------------------------------------------------
     def _remove(self, pgid):

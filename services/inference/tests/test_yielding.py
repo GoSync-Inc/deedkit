@@ -258,7 +258,7 @@ async def test_a_stop_after_the_marker_exists_is_undone_before_the_decoder_deadl
     running under a 1.5 s deadline. Contention never clears: without the marker protocol the group would stay stopped."""
     from deedkit_inference.yielder import Yielder
 
-    original = Yielder._record
+    original, real, calls = Yielder._record, os.killpg, []
 
     def record_when_marked(self, candidate):
         end = time.monotonic() + 8
@@ -266,14 +266,25 @@ async def test_a_stop_after_the_marker_exists_is_undone_before_the_decoder_deadl
             time.sleep(0.01)
         return original(self, candidate)
 
+    def killpg(pgid, number):
+        if number in (signal.SIGSTOP, signal.SIGCONT):
+            calls.append((number, any(os.path.exists(p) for p in marker_paths())))
+        return real(pgid, number)
+
+    marker_paths = lambda: [os.path.join(w.scratch, media.MARKER_NAME) for w in workers()]  # noqa: E731
     monkeypatch.setattr(Yielder, "_record", record_when_marked)
+    monkeypatch.setattr(os, "killpg", killpg)
     async with env.running(**engines(env, timeout=30), **yielding(env, resume_after_seconds=0.2)) as s:
+        workers = lambda: list(s.service.engines["audio-default"].workers.values())  # noqa: E731
         task = await s.submit(s.transcribe(fk(pre=0.6, decode={"seconds": 1.0, "timeout": 1.5}),
                                            extra_fields={"language": "ru"}))
-        await s.until(lambda: bool(s.service.engines["audio-default"].workers))
+        await s.until(lambda: bool(workers()))
         s.probe.between = True  # and it stays on
         reply = await task
-        assert reply.status == 200 and float(reply.headers["x-paused-seconds"]) < 0.3
+        assert reply.status == 200
+        # the SIGSTOP really went out, while the decode helper's marker existed, and was followed by a SIGCONT
+        assert calls[0] == (signal.SIGSTOP, True) and calls[1][0] == signal.SIGCONT
+        assert float(reply.headers["x-paused-seconds"]) < 0.3
 
 
 # spec: ANYM-691
@@ -769,39 +780,42 @@ async def test_the_ledger_names_the_group_before_the_stop_signal(env, monkeypatc
 
 
 # spec: ANYM-691
-async def test_the_ledger_names_the_frozen_members_by_identity_after_the_stop(env):
+async def test_the_ledger_keeps_the_real_stop_time_so_no_window_ahead_of_it_exists(env):
     clock = Virtual()
     async with manual(env, clock) as (s, cpu):
         task, pid = await paused_child(s, clock, env.tmp / "prog")
-        ledger = pausestate.Ledger(env.tmp / "state" / pausestate.LEDGER_NAME)
-        await s.until(lambda: len(ledger.groups()[0].get("members", [])) >= 2)  # the engine and its helper
-        entry = ledger.groups()[0]
-        assert entry["stopped_at"] <= time.time() + 1  # the real stop time: no window ahead of it to be reused in
-        assert pid in {m["pid"] for m in entry["members"]}
+        entry = pausestate.Ledger(env.tmp / "state" / pausestate.LEDGER_NAME).groups()[0]
+        assert time.time() - 30 < entry["stopped_at"] <= time.time() + 1
         await finish(task)
 
 
 # spec: ANYM-691
-def test_recovery_owns_a_helper_spawned_between_the_record_and_the_stop_by_identity_only(tmp_path):
-    """The ledger write precedes the freeze. A helper born in a later second is owned through the members snapshot
-    (pid and start time), and a leaderless group whose number was reused later is still not claimed."""
-    leader, late = "Mon Nov 2 09:00:00 2026", "Mon Nov 2 10:00:05 2026"
-    stop = time.mktime(time.strptime("Mon Nov 2 10:00:04 2026", pausestate.START_FORMAT))
-    path = tmp_path / pausestate.LEDGER_NAME
-    ledger = pausestate.Ledger(path)
+def test_recovery_owns_a_helper_spawned_between_the_record_and_the_stop_by_descent_with_no_later_write():
+    """The ledger write precedes the freeze, so a crash right after the stop leaves only that entry. A stopped process
+    that started in a later second (within LATE_SECONDS) is a member when it descends from a member; a process of a
+    reused group number has no member as an ancestor and is never claimed."""
+    leader, late, later = "Mon Nov 2 09:00:00 2026", "Mon Nov 2 10:00:05 2026", "Mon Nov 2 10:00:06 2026"
+    stop = time.mktime(time.strptime("Mon Nov 2 10:00:04 2026", pausestate.START_FORMAT)) + 0.5
+    group = {"pgid": 500, "leader": 500, "leader_start": leader, "stopped_at": stop}
 
-    def run(table):
-        return pausestate.recover(path, run_ps=lambda: table, send=lambda pid, number: None, sleep=lambda _: None)
+    def owned(*lines, entry=group):
+        table = pausestate.process_table(lambda: "".join(f"{line}\n" for line in lines))
+        return sorted(row["pid"] for row in pausestate.members(entry, table))
 
-    table = f"500 500 T {leader}\n777 500 T {late}\n"
-    ledger.record(500, 500, leader, stopped_at=stop)
-    assert run(table)["killed"] == [500]  # beyond the cutoff and unnamed: not owned
-    ledger.record(500, 500, leader, stopped_at=stop)
-    ledger.set_members(500, [{"pid": 500, "started": leader}, {"pid": 777, "started": late}])
-    assert set(run(table)["killed"]) == {500, 777}  # named by identity: continued and killed
-    ledger.record(600, 600, leader, stopped_at=stop)  # a reused number: the original is gone, another leader started later
-    reused = "600 600 S Mon Nov 2 10:00:30 2026\n778 600 T Mon Nov 2 10:00:31 2026\n"
-    assert run(reused)["killed"] == []
+    base = (f"500 500 T {leader} 1", f"777 500 T {late} 500", f"778 500 T {later} 777")
+    assert owned(*base) == [500, 777, 778]  # a helper of the leader, and its own child
+    assert owned(*base, f"779 500 T {late} 1") == [500, 777, 778]  # stopped in the group but not a descendant
+    assert owned(*base, "780 500 T Mon Nov 2 10:00:30 2026 500") == [500, 777, 778]  # beyond the late window
+    assert owned(f"500 500 T {leader} 1", f"777 500 S {late} 500") == [500]  # only stopped members
+    # a reused number: the leader pid started later (nothing matches), or no member exists at all (a leaderless group)
+    assert owned(f"500 500 S {later} 1", f"781 500 T {late} 500") == []
+    assert owned(f"782 500 T {late} 1", f"783 500 T {later} 782") == []
+
+
+# spec: ANYM-691
+def test_process_table_reads_the_parent_pid():
+    row = next(r for r in pausestate.process_table() if r["pid"] == os.getpid())
+    assert row["ppid"] == os.getppid()
 
 
 # spec: ANYM-691
