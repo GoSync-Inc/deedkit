@@ -100,14 +100,16 @@ bytes it needs. The original always stays in the archive; the metadata says what
   upload and needs chunking (a later card), the original is kept, and the remedy is not a smaller file. A recording
   over `max_audio_seconds` (at most 4 hours) ends as `audio_duration_limit` before any ffmpeg run. The transcode time
   limit is `max(120 s, 60 s + duration / 20)` inside the profile's `timeout_seconds`: 120 s up to 20 minutes, 3 minutes
-  for 40, 10 minutes for 3 hours. Time is the second ceiling: one job (copy, transcode, upload of the Opus bytes at
-  the link rate, and the mini's own 0.04 x duration) must finish inside `timeout_seconds + 10`, 910 s for the mini,
-  and the mini refuses a body slower than its `upload_seconds`; in a bad link window a note that fits by bytes ends as
+  for 40, 10 minutes for 3 hours. Time is the second ceiling: the worker's child (transcode, upload of the Opus bytes at
+  the link rate, and the mini's own 0.04 x duration) must finish inside `timeout_seconds + 10`, 910 s for the mini
+  (the parent's copy of the original runs before that clock, bounded by bytes, and uses part of the lease's
+  50-second margin), and the mini refuses a body slower than its `upload_seconds`; in a bad link window a note that fits by bytes ends as
   `model_timeout` or `model_http_error` and is retried. A `video/mp4` note is transcribed from its audio track
   (`-vn`). The copy of a large original lives in the worker's `/tmp`: the `enricher-mini` tmpfs is 320 MiB; the other
   workers keep 128 MiB, so raise their `/tmp` in the same edit before raising a local profile above 100 MiB.
-  `enrichment_failed` on a large original means the tmpfs is smaller than the profile's cap (an operator mistake), not
-  a bad file. Order on a host: the new image first (an older image refuses `max_input_bytes` above 32 MiB with
+  `enrichment_failed` on a large original can mean the tmpfs is smaller than the profile's cap (an operator mistake);
+  it is also the worker's code for any unexpected error (a missing file, a permission or I/O error), so read the mount
+  size (`df /tmp` in the container) and the worker's error before concluding. Order on a host: the new image first (an older image refuses `max_input_bytes` above 32 MiB with
   `invalid_model_limit` and then the audio profile is not usable), then the profile line; on a rollback restore the
   line first. Editing the profile changes its hash, and the worker, which reads its profile once at start, picks every
   failed row of that kind again after its next restart, within the day budgets: check the budget before the edit,
