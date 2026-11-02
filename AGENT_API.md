@@ -42,7 +42,7 @@ A refused archive read says which parameter to change, the rule and the next ste
 
 - `capabilities(sections=[...])`: an unknown name is `invalid_filter` with `{field: sections, reason: enum, allowed: [section names]}`
   (the gateway serves `messages_capabilities` itself and names its own sections); an empty list is `{field: sections, reason: min_items}`
-  with `hint: "omit sections to get all sections"` (the request schemas refuse it first over MCP and REST, as `invalid_parameters`).
+  with `hint: "omit sections to get all sections"` (the request schemas refuse it first: `invalid_arguments`, REST 422, at the gateway; `invalid_parameters` at the messaging backend).
 - `list_chats`: one `invalid_filter` response lists every bad filter: `chat_types` (`enum`, allowed `private`, `group`, `channel`,
   `unknown`), `my_roles` (`enum`, or `min_items` for an empty list with `hint: "omit my_roles for all roles"`) and `can_post`
   (`type`, expected `boolean`).

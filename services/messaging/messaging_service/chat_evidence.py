@@ -218,8 +218,9 @@ def file_query_evidence(c,p,normalized,items,paged=False,include=True):
         if not items:
             if result['empty_reason']=='no_matches_in_traversed_range':
                 result['empty_reason']='file_index_coverage_not_checked'
-            # A filter that names no visible chat keeps list_chats: there is no selected chat to inspect.
-            if result['empty_reason']!='not_found_or_not_permitted':result['next_action']='get_sync_status_for_selected_chat'
+            # A filter that names no visible chat keeps list_chats: there is no selected chat to inspect. An empty
+            # filter keeps fix_filter (ANYM-660): the caller's own list left nothing to search.
+            if result['empty_reason'] not in ('not_found_or_not_permitted','empty_filter'):result['next_action']='get_sync_status_for_selected_chat'
         return result
     chat=normalized.get('chat');chats=normalized.get('chats')
     ids=[chat] if chat else chats

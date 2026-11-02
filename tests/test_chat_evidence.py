@@ -107,6 +107,15 @@ def test_empty_filter_names_the_empty_parameters_and_the_next_step(seeded,argume
 
 
 # spec: ANYM-660
+@pytest.mark.parametrize('coverage',[True,False])
+def test_file_search_keeps_fix_filter_with_and_without_coverage(seeded,coverage):
+    s,a,b=seeded
+    evidence=s.search_files(a,'missing',accounts=[],include_coverage=coverage)['result_evidence']
+    assert evidence['empty_reason']=='empty_filter'
+    assert evidence['empty_fields']==['accounts'] and evidence['next_action']=='fix_filter'
+
+
+# spec: ANYM-660
 def test_other_empty_reasons_keep_their_next_action_and_have_no_empty_fields(seeded):
     s,a,b=seeded
     evidence=s.search(a,'zzzznotpresent')['result_evidence']

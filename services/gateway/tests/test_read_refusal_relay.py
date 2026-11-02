@@ -67,3 +67,23 @@ def test_gateway_schema_refuses_these_cases_before_the_backend(tmp_path, tool, v
     rest, mcp = post_both(app, tool, values)
     assert rest.status_code == 422 and rest.json()["error"] == "invalid_arguments"
     assert field in [e["field"] for e in rest.json()["field_errors"]] and mcp["isError"] and requests == []
+
+
+# spec: ANYM-660
+@pytest.mark.parametrize("case,values", [
+    ("date", {"query": "range", "from_time": "2026-10-02T00:00:00Z", "to_time": "2026-10-01T00:00:00Z"}),
+    ("my_roles", {"query": "roles", "my_roles": []}),
+])
+def test_reviewed_hint_survives_a_query_word_that_occurs_in_it(tmp_path, case, values):
+    # The payload-overlap check drops a backend hint that repeats the caller's words; these exact constants cannot.
+    _, body = BODIES["messages_list_chats", case if case == "date" else "my_roles"]
+    rest, mcp = post_both(app_with_refusing_backend(tmp_path, "messages_list_chats", body), "messages_list_chats", values)
+    assert rest.status_code == 400 and rest.json()["hint"] == body["hint"]
+    assert mcp["isError"] and mcp["structuredContent"]["hint"] == body["hint"]
+
+
+# spec: ANYM-660
+def test_an_unreviewed_hint_that_repeats_the_query_is_still_dropped(tmp_path):
+    body = {"error": "invalid_filter", "request_id": "r1", "retryable": False, "hint": "swap the range bounds"}
+    rest, mcp = post_both(app_with_refusing_backend(tmp_path, "messages_list_chats", body), "messages_list_chats", {"query": "range"})
+    assert "hint" not in rest.json() and "hint" not in mcp["structuredContent"]
