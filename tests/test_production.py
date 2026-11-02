@@ -671,7 +671,8 @@ def test_production_messaging_stages_end_with_the_source_revision():
 @pytest.mark.parametrize("dockerfile", ["services/gateway/Dockerfile", "services/calendar/Dockerfile", "services/calls/Dockerfile"])
 def test_gateway_calendar_and_calls_images_end_with_the_source_revision(dockerfile):
     # production.py already passes the build argument to every target; the final stage must keep it as ENV so the
-    # service can report its build, and as its last two instructions so earlier layers stay cached.
+    # service can report its build. It sits after the build layers so they stay cached; the calls image keeps CMD
+    # last (test_coverage_deployment pins it).
     lines = (ROOT / dockerfile).read_text().replace("\\\n", " ").splitlines()
     final = []
     for line in (value.strip() for value in lines):
@@ -680,8 +681,9 @@ def test_gateway_calendar_and_calls_images_end_with_the_source_revision(dockerfi
         if line.upper().startswith("FROM "):
             final = []
         final.append(line)
-    assert final[-2:] == ["ARG DEEDKIT_SOURCE_SHA", "ENV DEEDKIT_SOURCE_SHA=$DEEDKIT_SOURCE_SHA"]
-    assert sum("DEEDKIT_SOURCE_SHA" in line for line in final) == 2
+    pair = ["ARG DEEDKIT_SOURCE_SHA", "ENV DEEDKIT_SOURCE_SHA=$DEEDKIT_SOURCE_SHA"]
+    assert any(final[i:i + 2] == pair for i in range(len(final))) and sum("DEEDKIT_SOURCE_SHA" in line for line in final) == 2
+    assert final.index(pair[0]) > max(i for i, line in enumerate(final) if line.startswith(("COPY ", "RUN ")))
 
 
 # spec: ANYM-300
