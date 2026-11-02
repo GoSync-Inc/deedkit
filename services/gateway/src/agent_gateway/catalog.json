@@ -352,7 +352,7 @@
           ],
           "title": "Promotional",
           "type": "string",
-          "description": "Queue only. exclude (default), include or only for likely promotional rows (excluded_promotional_total); only is not combinable with exclude_likely_broadcasts."
+          "description": "Queue only. exclude (default), include or only for likely promotional rows (excluded_promotional_total); include/only are not combinable with exclude_likely_broadcasts."
         },
         "my_roles": {
           "anyOf": [

@@ -12,7 +12,7 @@ RULE_MARKERS = (
     "priority requires awaiting_reply=true", "scores owner_request", "awaiting_reply_priority_components",
     "chat_types=['private']", "snoozed_until", "Archive chat IDs", "Account-scoped provider sender IDs",
     "read observations only", "question punctuation", "excluded_likely_broadcasts_total",
-    "excluded_promotional_total", "muted_total", "longest wait first", "default 24, 0-720",
+    "excluded_promotional_total", "include/only are not combinable with exclude_likely_broadcasts", "muted_total", "longest wait first", "default 24, 0-720",
     "unknown_role_rows", "null = unknown", "omit an unknown my_role", "an absent field means the value below",
     "rows without type omit nothing", "channel_or_self_chat", "no_observed_owner_attention",
     "last_archived_message_incoming", "head_freshness: stale", "provider_head_stale", "message_version_conflict",
