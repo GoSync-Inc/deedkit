@@ -930,6 +930,24 @@ def test_only_a_freezing_entry_without_any_witness_continues_strays():
 
 
 # spec: ANYM-691
+def test_a_stray_that_cannot_be_continued_keeps_the_entry_and_is_not_reported_as_continued(tmp_path):
+    """Sol r3: a PermissionError on the SIGCONT of a stray must not delete the ledger entry or claim a continue."""
+    table = {777: "777 500 T Mon Nov 2 10:00:10 2026 1"}
+    sent = []
+
+    def send(pid, number):
+        sent.append((pid, number))
+        raise PermissionError
+
+    path = tmp_path / pausestate.LEDGER_NAME
+    pausestate.Ledger(path).record(500, 500, LEADER_AT, stopped_at=RECORDED, freezing=True, seen=SEEN)
+    report = pausestate.recover(path, run_ps=lambda: "".join(f"{line}\n" for line in table.values()), send=send,
+                                sleep=lambda seconds: None)
+    assert sent == [(777, signal.SIGCONT)] and "continued" not in report and report["killed"] == []
+    assert report["kept"] == [500] and path.exists()  # the deploy sees a failed recovery and does not go on
+
+
+# spec: ANYM-691
 def test_a_ledger_file_cannot_carry_a_malformed_witness(tmp_path):
     ledger = pausestate.Ledger(tmp_path / pausestate.LEDGER_NAME)
     ledger.record(500, 500, LEADER_AT, stopped_at=RECORDED, freezing=True, seen=SEEN)

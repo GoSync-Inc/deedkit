@@ -274,9 +274,15 @@ def recover(path: str | Path, run_ps: Callable[[], str] | None = None,
                     break
             killed.append(row["pid"])
     continued: list[int] = []
+    failed: set[int] = set()
     for row in strays:  # only continued, never killed (see late_strays); not persisted as members, so a retry never kills them
-        with contextlib.suppress(ProcessLookupError, PermissionError):
+        try:
             send(row["pid"], signal.SIGCONT)
+        except ProcessLookupError:
+            continue  # gone already
+        except PermissionError:
+            failed.add(row["pgid"])  # still stopped, and not ours to continue: the entry stays, the report says so
+            continue
         continued.append(row["pid"])
     remaining: list[dict] = entries
     for _ in range(SETTLE_POLLS):  # a killed process takes a moment to leave the table
@@ -289,6 +295,7 @@ def recover(path: str | Path, run_ps: Callable[[], str] | None = None,
         if not remaining:
             break
         sleep(SETTLE_SECONDS)
+    remaining = remaining + [g for g in entries if g["pgid"] in failed and g not in remaining]
     kept = [g["pgid"] for g in remaining]
     if remaining:
         ledger._write(remaining)
