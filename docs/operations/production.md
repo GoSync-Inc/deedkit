@@ -1521,6 +1521,104 @@ The enable record on the ANYM-686 card keeps: the date and `S`; the three attach
 their content); the egress `check` JSON and the `tcpdump` evidence; the offline and admission drill times; the key's
 expiry date and its rotation due date (30 days before); never the key, a DSN or a file name.
 
+## Mini inference: slow uploads (ANYM-692)
+
+Use when an upload of a note or photo to the mini is slow (drill 5 of ANYM-686: 6.4 MB in 579 s of the 600 s
+`upload_seconds`; the failed attempts end as `model_http_error` for the mini's 408, `model_request_failed` for the
+worker's own timeout, then `retry_exhausted`). Everything here is read-only except the probe's one refused request
+and the requeue at the end. The probe posts random bytes that the mini refuses with 422 `audio_unreadable` before
+any engine runs (not counted against the daily quota); it is not a listed live action. Never during an active call
+(read-only check first). Its `refusal=audio_unreadable` lines in the mini's log are probe traffic: the daily watch
+above (and ANYM-686 criterion 8) must not read them as failures.
+
+Three candidate causes, told apart before anyone works on one of them: the link, the worker's container path, the
+mini's receive side. The measurement is a hypothesis test with an `inconclusive` outcome, never a verdict.
+
+1. Host, read-only: `tailscale status` (direct or relay), `tailscale ping <mini>`, `ip link show tailscale0` (MTU 1280
+   expected), `sysctl net.ipv4.tcp_congestion_control net.ipv4.ip_no_pmtu_disc`.
+2. Container, read-only: `docker compose $F exec -T enricher-mini sh -c 'for f in /sys/class/net/*/mtu; do echo $f
+   $(cat $f); done'`. On the host: `iptables -t mangle -S` and `nft list ruleset | grep -i maxseg` for a TCPMSS clamp.
+   A bridge `dk-inference0` at MTU 1500 over a route through `tailscale0` at 1280 with no clamp is the suspect.
+3. The probe, once at 1 MiB from the host and once from the worker's container, in the same hour (more bytes only while
+   the last run took under a third of `upload_seconds`; at 11 KB/s even 8 MiB cannot finish in 600 s):
+
+   ```sh
+   python3 scripts/inference_probe.py --url https://<mini>.<tailnet>.ts.net --key-file private/inference/inference.key --upload-bytes 1048576
+   docker compose $F exec -T enricher-mini python3 -I - --url https://<mini>.<tailnet>.ts.net \
+     --key-file /run/secrets/inference/inference.key --upload-bytes 1048576 < scripts/inference_probe.py
+   ```
+   Each prints one line `inference upload bytes=N seconds=S kbytes_per_s=R status=<code> refusal=<code|-> valid=yes|no`
+   and exits 0. Only `valid=yes` (422 `audio_unreadable`: the whole body was read, then refused) is a rate; anything
+   else (408 from the mini's `upload_seconds`, 429, 403, 503 `upload_capacity` or `draining`, 502 from Serve, a probe
+   `timeout`, an early 422) is `valid=no` with its status. The seconds start after the TCP and TLS connect and end with
+   the reply, so the rate (1 KB = 1000 bytes) is the endpoint's effective throughput including the mini's body read, not
+   raw link capacity. The probe's default timeout is 300 s (`--timeout`).
+4. How to read the two rates: the container below a third of the host points at the container path; both slow points at
+   the link or at the mini's receive side (both probes end at the same receiver) and leaves bytes (ANYM-696) as the only
+   certain lever; both fast while real uploads crawl points at scheduling or inference on the mini (its busy state,
+   `Between`, the access log `seconds=`; a real request is also scheduled and inferred), which the probe cannot show.
+5. Before the container path is called the cause, record in the same hour, read-only and header-only, for 60 s during the
+   container probe: `tcpdump -nn -s 96 -i tailscale0 'host <mini ip> and (icmp or tcp[tcpflags] & tcp-syn != 0)'` (the
+   SYN's MSS, any ICMP fragmentation-needed, no payload) and the `TcpRetransSegs` delta from `nstat`. Without it the
+   outcome is `inconclusive`. Put the two rates, the evidence, the date and the hour on the card once.
+6. Only a confirmed container path is fixed: `com.docker.network.driver.mtu: "1280"` on `inference_egress` in
+   `deploy/compose.enrichment.yaml` (bridge name unchanged), applied by stopping the worker with the normal `stop`,
+   recreating that network and starting it, under the section 2 gates with an Astra-reviewed plan; undo is the previous
+   compose file and a recreate. Repeat the container probe in the same hour: at least 5 times the earlier rate, else
+   revert and record `inconclusive`.
+
+Requeue after a timeout storm (the agent that releases it, under the section 2 gates; run it once the fix of the bytes
+or the link is live, or the notes fail again). Read, through the host's documented database access:
+
+```sql
+SELECT count(*), error_code FROM attachment_enrichment
+ WHERE state = 'failed' AND provider = 'deedkit_inference' GROUP BY error_code;
+```
+
+The error codes alone do not say which rows timed out: `model_http_error` is every non-2xx answer of the mini (its 408
+`upload_timeout`, but also a 422 for an unreadable file) and `retry_exhausted` is a catch-all. So the cohort is frozen
+first, as a positive list, and only that list is requeued.
+
+1. Name the storm window (first and last failure, from the mini's access log and the worker log) and freeze the
+   candidates, with their pre-update state, into the operation record (a file, no content):
+
+   ```sql
+   SELECT e.attachment, e.state, e.error_code, e.attempts, e.updated_at, a.mime, a.bytes
+     FROM attachment_enrichment e JOIN attachments a ON a.id = e.attachment
+    WHERE e.state = 'failed' AND e.provider = 'deedkit_inference'
+      AND e.error_code IN ('model_http_error', 'model_request_failed', 'audio_transcode_size_limit', 'retry_exhausted')
+      AND e.updated_at BETWEEN :storm_start AND :storm_end
+    ORDER BY e.updated_at;
+   ```
+2. Keep a row only with per-row evidence that its last attempt was an upload or transcode failure. Only
+   `audio_transcode_size_limit` qualifies by its code (the transcode produced a file over the limit; nothing was sent).
+   `model_request_failed` is also the code of a malformed JSON answer and of any transport error unrelated to the
+   upload, so it is ambiguous like `model_http_error` (every non-2xx answer) and `retry_exhausted` (a catch-all): each
+   of those qualifies only when the worker log shows an upload timeout for that attachment's last attempt, or the
+   mini's access log (read-only) shows a 408 `upload_timeout` for that request in the window. A size or rate estimate
+   (the bytes against what the measured rate could carry in `upload_seconds`) is a hint for where to look, never
+   evidence. Every other row (an unreadable file, an auth refusal, an engine failure, an unattributed row) is left out
+   and listed with its reason. The kept rows are the frozen cohort: their ids and their `updated_at` values from step 1.
+3. Requeue exactly that cohort, in one transaction, guarded by the state the freeze saw:
+
+   ```sql
+   BEGIN;
+   UPDATE attachment_enrichment e SET state = 'queued', attempts = 0, next_due = clock_timestamp()
+     FROM unnest(:ids::text[], :stamps::timestamptz[]) AS frozen(attachment, updated_at)
+    WHERE e.attachment = frozen.attachment AND e.updated_at = frozen.updated_at
+      AND e.state = 'failed' AND e.provider = 'deedkit_inference'
+   RETURNING e.attachment;
+   COMMIT;
+   ```
+   The guard makes it repeat-safe: a row that has failed again, or was requeued and processed meanwhile, has a newer
+   `updated_at` and is not matched, so its attempts are never reset twice. Compare the returned ids with the frozen
+   cohort and record both.
+
+Undo: a row that fails again returns to `failed` by itself; nothing else changes. The profile's daily job budget still
+applies, so a large cohort can take several days. Track each returned id until it has a stored transcript or
+description or a recorded disposition (failed again with its code, or still queued with the budget spent); the failed
+count falls the moment the rows are queued and proves nothing. A queued or leased row is open evidence.
+
 ## Image retention
 
 ```sh
