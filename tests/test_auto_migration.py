@@ -286,6 +286,17 @@ def test_an_incompatible_producer_pin_waits_after_preparation_and_a_compatible_o
     assert [name for name, _ in host.steps].count("prepare") == 1
 
 
+# spec: ANYM-449
+def test_backup_schemas_is_the_runtime_range_in_the_literal_form_the_host_tool_reads():
+    # The host tool reads backup.py as text (producer_reads, the pin step), so the line stays two integers;
+    # a migration that bumps RUNTIME_SCHEMA and forgets this line fails here, not at the producer check.
+    from messaging_service import backup
+    source = Path(__file__).resolve().parents[1].joinpath(p.BACKUP_SOURCE).read_text()
+    found = p.BACKUP_SCHEMAS.search(source)
+    assert found and (int(found[1]), int(found[2])) == (2, RUNTIME_SCHEMA + 1)
+    assert backup.SCHEMAS == range(2, RUNTIME_SCHEMA + 1)
+
+
 BACKUP_IMAGE, PINNED = "sha256:" + "6" * 64, "sha256:" + "5" * 64
 
 
