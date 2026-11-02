@@ -562,7 +562,7 @@ def impact_line(n, between, ci, phase, load, avail, vm=0.0, base=1_000_000, stop
 
 
 # spec: ANYM-684
-def test_impact_summary_separates_overlap_from_between_alone_and_idle_and_leaves_unknown_out():
+def test_impact_summary_separates_overlap_from_between_alone_and_idle():
     rows = [impact_line(0, 'f', 'f', 0, 1.0, 7.0), impact_line(1, 't', 'f', 0, 6.0, 5.0, 4.0), impact_line(2, 't', 'f', 0, 8.0, 5.0, 4.0),
             impact_line(3, 't', 'f', 1, 12.0, 3.0, 4.0), impact_line(4, 'f', 't', 1, 14.0, 2.0), impact_line(5, 'f', 'f', 1, 3.0, 6.0),
             impact_line(6, 't', 'f', 0, 6.0, 5.0), impact_line(7, '?', '?', 0, 1.0, 7.0), impact_line(8, '?', '?', 1, 1.0, 7.0),
@@ -590,6 +590,12 @@ def test_impact_summary_breaks_an_overlap_episode_at_a_hole_in_the_samples():
     assert summary['overlap_episodes'] == 2 and summary['longest_overlap_minutes'] == 0.8
     assert summary['gaps'] == 1 and summary['gap_minutes'] == pytest.approx(59.8, abs=0.05)
     assert IMPACT.summarize(list(reversed(rows)))['overlap_episodes'] == 2  # the order of the lines does not matter
+    # one missed sample (30 s between two lines at a 15 s interval) already ends the episode; ordinary jitter does not
+    one_missing = IMPACT.summarize([impact_line(0, 't', 'f', 1, 9.0, 4.0), impact_line(2, 't', 'f', 1, 9.0, 4.0)])
+    assert one_missing['overlap_episodes'] == 2 and one_missing['gaps'] == 1 and one_missing['gap_minutes'] == 0.2
+    jitter = IMPACT.summarize([impact_line(0, 't', 'f', 1, 9.0, 4.0), IMPACT.sample_line(1_000_000 + 15 + 6, ('t', 'f'), {
+        'inf_cpu': 1.0, 'inf_rss_kb': 0, 'stopped_kb': 0, 'vm_cores': 0.0, 'ci_cores': 0.0, 'load': 9.0, 'avail_gb': 4.0, 'swap_mb': 100})])
+    assert jitter['overlap_episodes'] == 1 and jitter['gaps'] == 0
 
 
 # spec: ANYM-684
@@ -679,6 +685,25 @@ def test_impact_summary_write_is_atomic_and_a_missing_day_writes_nothing(tmp_pat
     assert json.loads((tmp_path / 'summary-2026-11-02.json').read_text())['samples'] == 1
     assert not (tmp_path / 'summary-2026-11-04.json').exists() and not list(tmp_path.glob('.summary-*'))
     assert IMPACT.pending_days(tmp_path, '2026-11-03') == [] and IMPACT.pending_days(tmp_path, '2026-11-04') == ['2026-11-03']
+
+
+# spec: ANYM-684
+def test_impact_summary_catch_up_goes_on_past_a_day_that_keeps_failing(tmp_path, monkeypatch):
+    line = impact_line(0, 't', 'f', 1, 9.0, 4.0)
+    for day in ('2026-11-01', '2026-11-02', '2026-11-03'):
+        (tmp_path / f'impact-{day}.log').write_text(line + '\n')
+    real = IMPACT.write_summary
+
+    def failing(directory, day, interval):
+        if day == '2026-11-01':
+            raise OSError('unreadable')
+        real(directory, day, interval)
+
+    monkeypatch.setattr(IMPACT, 'write_summary', failing)
+    assert IMPACT.catch_up(tmp_path, '2026-11-04', 15) is False  # the failed day is reported for another try
+    assert not (tmp_path / 'summary-2026-11-01.json').exists()
+    assert (tmp_path / 'summary-2026-11-02.json').exists() and (tmp_path / 'summary-2026-11-03.json').exists()
+    assert IMPACT.pending_days(tmp_path, '2026-11-04') == ['2026-11-01']
 
 
 # spec: ANYM-684

@@ -44,7 +44,7 @@ PHASE_CORES = 0.30   # CPU of the inference user, in cores, that counts as a run
 STALE_SECONDS = 30
 INTERVAL = 15
 COMMAND_TIMEOUT = 10
-GAP_FACTOR = 2.5     # a hole longer than this many intervals between two samples ends an overlap episode
+GAP_FACTOR = 1.5     # two samples further apart than this many intervals mean at least one sample is missing (jitter is below 1)
 PS = ['/bin/ps', '-axo', 'uid=,pid=,stat=,lstart=,cputime=,rss=,comm=']
 CLASSES = ('overlap', 'paused', 'contended_alone', 'phase_alone', 'idle')
 COUNTERS = ('free', 'inactive', 'speculative')
@@ -271,10 +271,14 @@ def catch_up(directory: Path, today: str, interval: int) -> bool:
     """Write every missing summary of a finished day; True when none is left. A failure is kept for the next try."""
     clean = True
     try:
-        for day in pending_days(directory, today):
-            write_summary(directory, day, interval)
-    except (OSError, ValueError):
-        clean = False
+        days = pending_days(directory, today)
+    except OSError:
+        return False
+    for day in days:
+        try:
+            write_summary(directory, day, interval)  # one bad day never blocks the newer ones
+        except (OSError, ValueError):
+            clean = False
     return clean
 
 
