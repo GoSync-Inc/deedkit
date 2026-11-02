@@ -893,6 +893,43 @@ def test_a_reused_leaderless_group_is_never_claimed_not_even_inside_the_freezing
 
 
 # spec: ANYM-691
+def test_recovery_continues_but_never_kills_a_late_helper_when_every_witness_of_the_group_is_gone(tmp_path):
+    """Sol r2: the stop stalled, a helper was born at 10:00:10, the service crashed before the second write, and then the leader
+    and every process seen at the record were killed. Nothing witnesses the group, and a stranger of a reused number looks the same:
+    the stopped process is only CONTINUED (it frees its memory when it ends), never killed, and the entry goes."""
+    table = {777: "777 500 T Mon Nov 2 10:00:10 2026 1"}
+    sent = []
+
+    def send(pid, number):
+        sent.append((pid, number))
+        if number == signal.SIGCONT and pid in table:
+            table[pid] = table[pid].replace(" T ", " S ")
+
+    path = tmp_path / pausestate.LEDGER_NAME
+    pausestate.Ledger(path).record(500, 500, LEADER_AT, stopped_at=RECORDED, freezing=True, seen=SEEN)
+    report = pausestate.recover(path, run_ps=lambda: "".join(f"{line}\n" for line in table.values()), send=send,
+                                sleep=lambda seconds: None)
+    assert sent == [(777, signal.SIGCONT)] and report["killed"] == [] and report["continued"] == [777]
+    assert report["kept"] == [] and not path.exists()
+
+
+# spec: ANYM-691
+def test_only_a_freezing_entry_without_any_witness_continues_strays():
+    late = "Mon Nov 2 10:00:10 2026"
+
+    def strays(entry, *lines):
+        return sorted(row["pid"] for row in pausestate.late_strays(entry, ps_lines(*lines)))
+
+    assert strays(freezing(), f"777 500 T {late} 1", f"778 500 S {late} 1") == [777]  # stopped, in the group, unclaimed
+    assert strays(freezing(), f"500 500 T {LEADER_AT} 1", f"777 500 T {late} 1") == []  # the leader lives: members owns it all
+    assert strays(freezing(), f"500 500 S {late} 1", f"777 500 T {late} 1") == []  # a newer leader: the number is reused for certain
+    assert strays(freezing(), f"600 500 T {HELPER_AT} 1", f"777 500 T {late} 1") == []  # a seen process lives: witnessed
+    legacy = {k: v for k, v in freezing().items() if k not in ("phase", "seen")}
+    stopped = {**freezing(phase="stopped"), "seen": []}
+    assert strays(legacy, f"777 500 T {late} 1") == [] and strays(stopped, f"777 500 T {late} 1") == []  # only the freezing phase
+
+
+# spec: ANYM-691
 def test_a_ledger_file_cannot_carry_a_malformed_witness(tmp_path):
     ledger = pausestate.Ledger(tmp_path / pausestate.LEDGER_NAME)
     ledger.record(500, 500, LEADER_AT, stopped_at=RECORDED, freezing=True, seen=SEEN)

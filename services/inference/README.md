@@ -204,7 +204,9 @@ member of the group however late it started and whatever its parent is by then (
 leaves an orphan of ppid 1: it is still recovered), as long as the group is provably the recorded one: the leader still has the
 recorded start time, or a `seen` process still lives in the group (the kernel keeps a group number in use while any member lives,
 so it cannot have been reused). No time bound is relied on: a stall can delay the signal by any amount. Without a witness (the
-group is gone and its number may belong to a stranger) the entry owns only what existed at the record. Right after the signal the
+group is gone and its number may belong to a stranger) the entry owns only what existed at the record, and a stopped process
+of that group number that started later is only continued by `recover` (it may be a stranded late helper, which then ends and frees its
+memory, or a stranger), never killed. Right after the signal the
 entry becomes "stopped" with the real stop time. A leader that exists with another start time rejects the whole group, as before.
 Enabling is still gated on criterion 7(a) of the card.
 

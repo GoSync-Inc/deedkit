@@ -14,6 +14,7 @@ number reused by a process that started after the stop, and every foreign group,
 from __future__ import annotations
 
 from collections.abc import Callable
+import contextlib
 import json
 import math
 import os
@@ -220,10 +221,25 @@ def members(group: dict, table: list[dict]) -> list[dict]:
     return found
 
 
+def late_strays(group: dict, table: list[dict]) -> list[dict]:
+    """Stopped processes of a freezing entry's group number that `members` does not claim because nothing witnesses the recorded group
+    any more (the leader and every process seen at the record are gone) and that started after the record. They are either late
+    helpers of the dead group (a stalled stop let them start before the freeze, and they hold their memory stopped) or strangers of a
+    group number that was reused: nothing tells them apart, so recovery CONTINUES them and never kills them. A leader that exists with
+    another start time means the number is reused for certain: none of them is ours, not even to continue."""
+    if group.get("phase") != "freezing":
+        return []
+    leader = next((row for row in table if row["pid"] == group["pgid"]), None)
+    if leader is not None:
+        return []  # the same leader: the group is witnessed and `members` owns it all; another leader: the number is reused
+    claimed = {row["pid"] for row in members(group, table)}
+    return [row for row in table if row["pgid"] == group["pgid"] and row["stat"].startswith("T") and row["pid"] not in claimed]
+
+
 def recover(path: str | Path, run_ps: Callable[[], str] | None = None,
             send: Callable[[int, int], None] = os.kill, sleep: Callable[[float], None] = time.sleep) -> dict:
     """Continue and kill every member of every ledgered group; drop an entry only when no member remains.
-    Returns {"groups": n, "killed": [pids], "kept": [pgids]}. LedgerError when the ledger or `ps` cannot be read."""
+    Returns {"groups": n, "killed": [pids], "kept": [pgids], plus "continued": [pids that were only continued, see `late_strays`] when there are any. LedgerError when the ledger or `ps` cannot be read."""
     ledger = Ledger(path)
     entries = ledger.groups()
     killed: list[int] = []
@@ -233,7 +249,9 @@ def recover(path: str | Path, run_ps: Callable[[], str] | None = None,
         return {"groups": 0, "killed": killed, "kept": kept}
     table = process_table(run_ps)
     plan: list[tuple[dict, list[dict]]] = []
+    strays: list[dict] = []
     for group in entries:
+        strays.extend(late_strays(group, table))
         rows = members(group, table)
         have = {(row["pid"], row["started"]) for row in rows}
         for known in group.get("members", []):  # selected by an earlier run: still ours while that same process lives
@@ -255,6 +273,11 @@ def recover(path: str | Path, run_ps: Callable[[], str] | None = None,
                 except (ProcessLookupError, PermissionError):
                     break
             killed.append(row["pid"])
+    continued: list[int] = []
+    for row in strays:  # only continued, never killed (see late_strays); not persisted as members, so a retry never kills them
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            send(row["pid"], signal.SIGCONT)
+        continued.append(row["pid"])
     remaining: list[dict] = entries
     for _ in range(SETTLE_POLLS):  # a killed process takes a moment to leave the table
         table = process_table(run_ps)
@@ -271,4 +294,7 @@ def recover(path: str | Path, run_ps: Callable[[], str] | None = None,
         ledger._write(remaining)
     else:
         unlink_quietly(ledger.path)
-    return {"groups": len(entries), "killed": killed, "kept": kept}
+    report = {"groups": len(entries), "killed": killed, "kept": kept}
+    if continued:
+        report["continued"] = continued  # only when there were some: the report of a plain recovery keeps its shape
+    return report
