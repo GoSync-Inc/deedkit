@@ -371,7 +371,7 @@ user,nice,args` shows `_deedkitinf` with NI 20; `/health` answers `{"status": "o
 root, `chown _deedkitinf` them and record it. Then the deploy script's own read-back, which also proves
 `/v1/models` with the probe key and that `release` equals the SHA: `python3 scripts/inference_deploy.py "$SHA"`
 (it drains, which is instant on an idle service, and restarts). Undo: `sudo -n launchctl bootout
-system/com.deedkit.inference` (then `-busy`) and remove the plists, section 14.
+system/com.deedkit.inference`, then the section 14 Recover command, (then `-busy`) and remove the plists, section 14.
 
 `ProcessType` of the service is `Standard`, not `Background`: Background put the engines on the efficiency cores with
 throttled I/O and made speech about 17 times slower on the mini (A/B 11-02, same requests: warm `note_ru` RTF 0.36 against
@@ -697,6 +697,14 @@ Removes, newest first, only what the ledger names, whole or half-made, and check
 removed only when everything is gone; otherwise it is rewritten to what remains and the undo exits 1 (rerun it).
 The undo never signals a process: an entry is dropped only on positive evidence (the pid is gone, or now has another start
 time); a logger that is still running, or that cannot be inspected, stays in the ledger and the undo exits 1.
+Recover (ANYM-691): a release that can pause an engine group writes `state/paused.json` before it stops one. If the service dies
+while a group is stopped, the group keeps its memory until `recover` continues and kills it; the service runs it at every start and
+`scripts/inference_deploy.py` runs it on every deploy and `--rollback` (after the unload, before `current` moves; it refuses to start
+the release when it fails, and fails closed on a ledger that no release can read). After any `launchctl bootout` of the service by
+hand run `sudo -n -H -u _deedkitinf env -i HOME=/Users/_deedkitinf PATH=/usr/bin:/bin /Users/_deedkitinf/current/.venv/bin/deedkit-inference recover --state-dir /Users/_deedkitinf/state`
+(JSON; exit 0 is done, 4 means a group remains or the ledger is unreadable, 2 means that release has no such command, so it
+cannot have paused anything). `recover --check` only reads. It touches only groups the ledger names.
+
 Not covered (section-specific undo above): the production key files, the tailnet policy (apply the saved policy), the Serve config
 (`serve reset` on the standalone daemon's socket), and the production key file.
 
@@ -717,6 +725,9 @@ if grep -qx job-impact $L; then sudo -n launchctl bootout system/com.deedkit.inf
   launchctl print system/com.deedkit.inference-impact >/dev/null 2>&1 && echo job-impact >> $R; fi
 if grep -qx job-service $L; then sudo -n launchctl bootout system/com.deedkit.inference 2>/dev/null
   launchctl print system/com.deedkit.inference >/dev/null 2>&1 && echo job-service >> $R; fi
+  RB=/Users/$U/current/.venv/bin/deedkit-inference   # ANYM-691: a service that died while an engine group was stopped left it stopped
+  if [ -x $RB ]; then sudo -n -H -u $U env -i HOME=/Users/$U PATH=/usr/bin:/bin $RB recover --state-dir /Users/$U/state; RC=$?
+    [ $RC = 0 ] || [ $RC = 2 ] || echo "WARNING: recover exited $RC: stopped engine groups may remain (section 14, Recover)"; fi
 if grep -qx job-busy $L; then sudo -n launchctl bootout system/com.deedkit.inference-busy 2>/dev/null
   launchctl print system/com.deedkit.inference-busy >/dev/null 2>&1 && echo job-busy >> $R; fi
 printf "%s\n" "plist-impact /Library/LaunchDaemons/com.deedkit.inference-impact.plist" "impact-bin /usr/local/libexec/deedkit-impact-log" \
