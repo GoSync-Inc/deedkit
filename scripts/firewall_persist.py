@@ -38,6 +38,43 @@ def die(message):
     raise SystemExit(2)
 
 
+def words(rule):
+    """The arguments of a canonical rule, quoting honoured: text inside an option value (a `--comment`) is one argument."""
+    return shlex.split(rule)
+
+
+def join(tokens):
+    """The inverse of `words`: an argument with whitespace or a quote keeps its quoting, so boundaries survive."""
+    return ' '.join(shlex.quote(token) if re.search(r'[\s\'"\\]', token) or not token else token for token in tokens)
+
+
+# Options whose value is free text chosen by whoever wrote the rule: a value such as "-i" or "! -i x" is text, not an option.
+FREE_TEXT = ('--comment', '--log-prefix', '--string', '--hex-string', '--name', '--hashlimit-name', '--match-set', '--set-name',
+             '--helper', '--cmd-owner', '--ctlabel')
+
+
+def fields(rule):
+    """The arguments of a canonical rule for analysis: the value of a free-text option can never pose as an option.
+
+    Anything still ambiguous (an option twice, an interface after a match) is read by the callers as "may match", so a rule
+    that hides an allowance behind option-shaped text is rejected, not trusted.
+    """
+    out, consume = [], False
+    for token in words(rule):
+        # Each free-text option consumes exactly the next argument, whatever it reads like ("--comment" included).
+        out.append('\0' + token if consume else token)
+        consume = not consume and token in FREE_TEXT
+    return out
+
+
+def interface_index(tokens):
+    """Where the one `-i` condition is, or None when there is none or the rule is ambiguous about it (twice, or after a match)."""
+    if tokens.count('-i') != 1:
+        return None
+    index = tokens.index('-i')
+    return None if '-m' in tokens[:index] or index + 1 >= len(tokens) else index
+
+
 def canon(line):
     """One rule in a form that is the same in our text and in `iptables-save`: no `-m tcp` after `-p tcp`, no /32."""
     tokens = shlex.split(line)
@@ -54,7 +91,7 @@ def canon(line):
             i += 1
     if out and out[0] == '-I':
         out[0] = '-A'
-    return ' '.join(out)
+    return join(out)
 
 
 def empty_table():
@@ -65,35 +102,41 @@ def spec_from_commands(commands, chain):
     """The canonical rules per table, read back from the command form, so the two forms cannot differ."""
     tables = {name: empty_table() for name in TABLES}
     for command in commands:
-        binary, *words = command.split()
-        raw = words[:2] == ['-t', 'raw']
-        words = words[2:] if raw else words
-        if words[0] not in ('-A', '-I'):
+        binary, *arguments = command.split()
+        raw = arguments[:2] == ['-t', 'raw']
+        arguments = arguments[2:] if raw else arguments
+        if arguments[0] not in ('-A', '-I'):
             continue
         table = ('raw6' if raw else 'v6') if binary == 'ip6tables' else ('raw' if raw else 'filter')
-        part = 'chain' if words[1] == chain else 'inputs' if words[1] == 'INPUT' else 'hooks'
-        tables[table][part].append(canon(' '.join(['-A', *words[1:]])))
+        part = 'chain' if arguments[1] == chain else 'inputs' if arguments[1] == 'INPUT' else 'hooks'
+        tables[table][part].append(canon(' '.join(['-A', *arguments[1:]])))
     return tables
 
 
 def bridge_of(rule):
-    tokens = rule.split()
+    tokens = fields(rule)
     return tokens[tokens.index('-i') + 1] if '-i' in tokens else rule
 
 
 def covers(tokens, bridge):
     """Whether a rule's interface condition can match traffic from `bridge` (no -i, a wildcard, or a negation)."""
-    if '-i' not in tokens:
+    index = interface_index(tokens)
+    if index is None:
         return True
-    index = tokens.index('-i')
     name = tokens[index + 1]
     hit = name == bridge or (name.endswith('+') and bridge.startswith(name[:-1]))
     return not hit if index > 0 and tokens[index - 1] == '!' else hit
 
 
+def negated_interface(tokens):
+    """Whether the rule's one interface condition is a plain `! -i <name>` (an ambiguous rule is not: it stays a managed rule)."""
+    index = interface_index(tokens)
+    return index is not None and index > 0 and tokens[index - 1] == '!'
+
+
 def plain_jump(rule):
     """A rule whose only condition is an interface: any other match (protocol, address) limits what it carries."""
-    tokens = rule.split()[2:]
+    tokens = fields(rule)[2:]
     while tokens:
         if tokens[0] == '!' or tokens[0] in ('-i', '-j'):
             tokens = tokens[1:] if tokens[0] == '!' else tokens[2:]
@@ -110,10 +153,12 @@ def bypasses(rule, bridge, chains, top=True, seen=()):
     or through a goto; a goto into a chain that does not end in an unconditional DROP also leaves it by falling off the
     chain's end (an empty chain, or one that only logs, included).
     """
-    tokens = rule.split()
+    tokens = fields(rule)
     flag = '-g' if '-g' in tokens else '-j'
     if flag not in tokens or not covers(tokens, bridge):
         return False
+    if tokens.count('-j') + tokens.count('-g') != 1:
+        return True  # which one is the target is unclear: assume it can accept
     target = tokens[tokens.index(flag) + 1]
     if target == 'ACCEPT':
         return True
@@ -121,7 +166,7 @@ def bypasses(rule, bridge, chains, top=True, seen=()):
         return top
     if flag == '-g' and top and target not in seen and target not in ('DROP', 'REJECT'):
         inner = chains.get(target, [])
-        if not inner or inner[-1].split()[2:] != ['-j', 'DROP']:
+        if not inner or fields(inner[-1])[2:] != ['-j', 'DROP']:
             return True
     if target in chains and target not in seen:
         return any(bypasses(inner, bridge, chains, top and flag == '-g', (*seen, target)) for inner in chains[target])
@@ -153,11 +198,13 @@ def extract(text, table, chain, bridges, family='v4', kernel=False):
             found['declared'].add(name)
         elif line.startswith('-A '):
             rule = canon(line)
-            tokens = rule.split()
+            tokens = fields(rule)
             chains.setdefault(tokens[1], []).append(rule)
             if tokens[1] == chain:
                 found['chain'].append(rule)
-            elif '-i' in tokens and bridge_of(rule) in bridges:
+            elif '-i' in tokens and not negated_interface(tokens) and bridge_of(rule) in bridges:
+                # `! -i <bridge>` (Docker's own `-d <container> ! -i <bridge> -j DROP` in raw PREROUTING) never matches the
+                # bridge's traffic: it is neither a hook nor an allowance, and the walk over earlier rules ignores it too.
                 drop = tokens[1] in ('INPUT', ufw_input) and tokens[-2:] == ['-j', 'DROP']
                 if drop or tokens[1] in ('DOCKER-USER', 'PREROUTING'):
                     managed.append((tokens[1], len(chains[tokens[1]]) - 1, rule))
@@ -166,10 +213,10 @@ def extract(text, table, chain, bridges, family='v4', kernel=False):
         path = [(name, index)]
         entry, part = rule, 'hooks'
         if name in ('INPUT', ufw_input):
-            entry, part = ' '.join(['-A', 'INPUT', *rule.split()[2:]]), 'inputs'
+            entry, part = join(['-A', 'INPUT', *words(rule)[2:]]), 'inputs'
             if name == ufw_input and kernel:
                 jump = next((i for i, other in enumerate(chains.get('INPUT', []))
-                             if other.split()[-2:] == ['-j', ufw_input] and plain_jump(other) and covers(other.split(), bridge)), None)
+                             if fields(other)[-2:] == ['-j', ufw_input] and plain_jump(other) and covers(fields(other), bridge)), None)
                 if jump is None:
                     continue
                 path.insert(0, ('INPUT', jump))
