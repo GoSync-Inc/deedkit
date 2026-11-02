@@ -7,6 +7,7 @@ import pytest
 from deedkit_inference.config import Config
 from deedkit_inference.engines import fake
 from deedkit_inference.probe import SystemProbe, parse_busy, read_busy_file
+from engine_support import engines, vis
 from support import chat_body, fk
 
 pytestmark = pytest.mark.anyio
@@ -368,23 +369,22 @@ async def test_the_floor_credits_what_the_engines_measure_not_what_is_configured
     # worker loaded). The floor reads what Between would see without us: free memory plus what the supervisor measured
     # of our workers. The configured resident_gb has headroom in it (4.5 charged for a worker that holds 3.84), and a
     # reservation that nothing measured has allocated nothing: neither is credited.
-    warm = {"vision-default": {"engine_options": {"persistent": True}, "phases": [{"name": "vlm", "slot": "gpu", "resident_gb": 4.5}]}}
-    async with env.running(aliases=warm, **FLOOR) as s:
+    async with env.running(**engines(env), **FLOOR) as s:  # the shipped vision alias: a warm worker, 4.5 GB charged
         admission, key = s.service.admission, ("vision-default", "vlm")
-        assert (await s.chat(job("first"))).status == 200
+        assert (await s.chat(vis())).status == 200
         assert list(admission.loaded) == [key] and admission.resident_total() == 4.5  # idle, still in the book
         await s.until(lambda: key in admission.measured)  # the supervisor ticked: the fake probe measures 0.0
         s.probe.available = 6.9  # the configured 4.5 would credit it up to 11.4: nothing measured, nothing credited
-        reply = await s.chat(job("unmeasured"))
+        reply = await s.chat(vis())
         assert reply.status == 503 and reply.headers["x-admission-reason"] == "memory_low"
         s.probe.rss_fn = lambda pgid: 3.84  # the worker really holds 3.84 GB
         await s.until(lambda: admission.credit() == 3.84)
         s.probe.available = 3.2  # 3.2 + 3.84 = 7.04: the floor and the per-phase reserve (3.0) both pass
-        assert (await s.chat(job("warm_again"))).status == 200
+        assert (await s.chat(vis())).status == 200
         s.probe.available = 3.1  # 3.1 + 3.84 = 6.94 (4.5 configured would have said 7.6): only the floor refuses
-        reply = await s.chat(job("too_low"))
+        reply = await s.chat(vis())
         assert reply.status == 503 and reply.headers["x-admission-reason"] == "memory_low"
-        s.probe.rss_fn = lambda pgid: 6.0  # a measurement above the configured figure is not credited above it (and is within the supervisor's share limit)
+        s.probe.rss_fn = lambda pgid: 6.0  # above the configured figure is not credited above it (and within the supervisor's share limit)
         await s.until(lambda: admission.measured.get(key) == 6.0)
         assert admission.credit() == 4.5
         admission.drop(key)  # a dropped engine leaves the book and the credit with it
