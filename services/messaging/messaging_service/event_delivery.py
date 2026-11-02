@@ -554,6 +554,237 @@ def _next_endpoint_hint(c, served):
     return next_endpoint_item(c, served, 'hint', 'SELECT * FROM subscription_outbox WHERE id=%s FOR UPDATE SKIP LOCKED')
 
 
+def _reserve_hint(store, lane, served, lease, stats, suspects, record_attempt):
+    """The reservation block of one dispatch_hints iteration: (hint, now), or 'stop' / 'skip'."""
+    with store.pool.connection() as c:
+        if lane == 'endpoint':
+            hint = _next_endpoint_hint(c, served)
+        else:
+            hint = c.execute('''SELECT o.* FROM subscription_outbox o WHERE ''' + _DUE +
+                (" AND o.receiver IS NOT NULL" if lane == 'operator' else '') +
+                ''' ORDER BY o.next_attempt_at,o.created_at,o.id LIMIT 1 FOR UPDATE SKIP LOCKED''').fetchone()
+        if hint is None:
+            return 'stop'
+        if hint['attempts'] >= 8:
+            c.execute("""UPDATE subscription_outbox SET state='dead_letter',
+                    finished_at=clock_timestamp(),error_code='delivery_budget_exhausted',
+                    lease_token=NULL,lease_until=NULL WHERE id=%s""", (hint['id'],))
+            if record_attempt(c, hint, 'dead_letter', hint['attempts'], error='delivery_budget_exhausted'):
+                suspects.add(hint['endpoint'])
+            stats['dead_letter'] += 1
+            return 'skip'
+        if hint['kind'] == 'module_events':
+            # ANYM-562: expiry is rechecked before each attempt; a hint with no live reference is not sent.
+            from .module_events import hint_references
+            if not hint_references(c, hint['subscription'], hint['through_position']):
+                c.execute("""UPDATE subscription_outbox SET state='cancelled',finished_at=clock_timestamp(),
+                        error_code='module_events_expired',lease_token=NULL,lease_until=NULL WHERE id=%s""",
+                    (hint['id'],))
+                record_attempt(c, hint, 'cancelled', hint['attempts'], error='module_events_expired')
+                stats['cancelled'] += 1
+                return 'skip'
+        if hint['state'] == 'leased' and hint.get('endpoint') is not None:
+            # ANYM-582/585: a lease that ran out mid-attempt may have reached an at-most-once receiver. Settle it
+            # before DNS, quiet hours or the budget can turn it back into a pending hint that is sent again.
+            from .delivery_endpoints import at_most_once_endpoint
+            if at_most_once_endpoint(c, hint['endpoint']):
+                c.execute("""UPDATE subscription_outbox SET state='dead_letter',finished_at=clock_timestamp(),
+                        error_code='outcome_unknown',lease_token=NULL,lease_until=NULL WHERE id=%s""", (hint['id'],))
+                if record_attempt(c, hint, 'dead_letter', hint['attempts'], error='outcome_unknown'):
+                    suspects.add(hint['endpoint'])
+                stats['dead_letter'] += 1
+                return 'skip'
+        now = c.execute('SELECT clock_timestamp() AS t').fetchone()['t']
+        if hint['kind'] != 'test' and not hint['quiet_bypass']:
+            # A hint deferred by the budget or retried after receiver downtime can reach a
+            # quiet window after it was committed: it waits, no attempt is consumed.
+            from .delivery_policy import quiet_until
+            binding = c.execute('''SELECT policy FROM subscription_delivery WHERE subscription=%s
+                    AND policy_version=%s''', (hint['subscription'], hint['subscription_version'])).fetchone()
+            quiet = quiet_until(c, binding['policy'], now) if binding else None
+            if quiet is not None:
+                c.execute("""UPDATE subscription_outbox SET state='pending',next_attempt_at=%s,
+                        lease_token=NULL,lease_until=NULL WHERE id=%s""", (quiet, hint['id']))
+                stats['deferred'] += 1
+                return 'skip'
+        if hint['admitted_at'] is None:
+            # The first POST of a hint ID takes one slot of the key's rolling hour, with or
+            # without a delivery policy. At the limit it waits for the next slot: no attempt
+            # is consumed and it never dead-letters for the budget.
+            from .delivery_policy import admission_slot
+            owner = c.execute('SELECT principal,key_id FROM subscriptions WHERE id=%s',
+                (hint['subscription'],)).fetchone()
+            slot = admission_slot(c, owner, now)
+            if slot is None and hint.get('endpoint') is not None:
+                from .delivery_policy import host_admission_slot
+                slot = host_admission_slot(c, hint['endpoint'], now)
+            if slot is not None:
+                c.execute("""UPDATE subscription_outbox SET state='pending',next_attempt_at=%s,
+                        lease_token=NULL,lease_until=NULL WHERE id=%s""", (slot, hint['id']))
+                stats['deferred'] += 1
+                return 'skip'
+        # Commit the reservation before any external I/O. A process crash
+        # after POST can lose the result, never the consumed attempt slot.
+        c.execute("""UPDATE subscription_outbox SET state='leased',lease_token=%s,attempts=attempts+1,
+                admitted_at=coalesce(admitted_at,clock_timestamp()),
+                lease_until=clock_timestamp()+interval '1 minute' WHERE id=%s""", (lease, hint['id']))
+    return hint, now
+
+
+def _prepare_hint(store, hint, resolver):
+    # DNS validation, the secret read and the body build run before the fence, so the
+    # fence hold is bounded by the transport deadline plus database time. Registrations
+    # are immutable; the fence rechecks the exact binding. The body carries the hint's
+    # version, which the fence requires to equal the locked subscription's.
+    state, error, prepared, unsafe = 'pending', 'receiver_unavailable', None, False
+    target = refused = problem = status = failure = latency = None
+    if hint.get('endpoint') is not None:
+        # ANYM-519: a self-service endpoint; DNS and the host policy here, secrets and body inside the fence.
+        from .delivery_endpoints import prepare
+        registered, (target, problem) = None, prepare(store, hint['endpoint'], resolver)
+        unsafe = problem == 'unsafe_endpoint'
+        refused = problem if problem in ('endpoint_policy_refused', 'access_or_configuration_changed') else None
+    else:
+        with store.pool.connection() as c:
+            registered = c.execute('SELECT endpoint,secret_file FROM subscription_receivers WHERE id=%s AND enabled',
+                (hint['receiver'],)).fetchone()
+    if registered is not None:
+        try:
+            prepared = (validate_endpoint(registered['endpoint'], resolver=resolver),
+                _secret(registered['secret_file']), json.dumps(dict(hint_id=str(hint['id']),
+                subscription_id=str(hint['subscription']), subscription_version=hint['subscription_version'],
+                through=hint['through_position'], kind=hint['kind'], host_turn_verified=False),
+                sort_keys=True, separators=(',', ':')).encode())
+        except (OSError, TimeoutError):
+            # Includes ssl.SSLCertVerificationError, which is also a ValueError:
+            # a certificate problem can be transient and keeps the bounded retry budget.
+            pass
+        except ValueError:
+            unsafe = True
+    return state, error, prepared, unsafe, target, refused, problem, status, failure, latency, registered
+
+
+def _fence_hint(store, hint, lease, now, registered, refused, target, unsafe, state, error, prepared,
+        status, failure, latency, problem, transport, suspects, record_attempt, lock_principal):
+    with store.pool.connection() as c:
+        # Principal lock precedes subscription lock, matching gateway ACL
+        # order. The bounded TLS exchange holds this shared ACL fence so a
+        # concurrent revocation cannot commit between authorization and send.
+        owner = c.execute('SELECT principal,key_id FROM subscriptions WHERE id=%s',
+            (hint['subscription'],)).fetchone()
+        if owner:
+            lock_principal(c, owner['principal'], shared=True)
+        # The hold starts once the principal lock is held: waiting for it is contention, not hold.
+        fenced = time.monotonic()
+        p = _worker_identity(c, owner) if owner else None
+        row = c.execute('SELECT * FROM subscriptions WHERE id=%s FOR UPDATE',
+            (hint['subscription'],)).fetchone()
+        receiver = c.execute('''SELECT r.* FROM subscription_receivers r JOIN subscription_delivery d
+                ON d.receiver=r.id WHERE d.subscription=%s AND r.id=%s AND r.enabled''',
+            (hint['subscription'], hint['receiver'])).fetchone()
+        if p is not None and row is not None:
+            row = _state(c, row, p)
+        endpoint = None
+        if hint.get('endpoint') is not None:
+            from .delivery_endpoints import fenced as fence_endpoint
+            endpoint, refused = (None, refused) if refused else fence_endpoint(c, p, hint['endpoint'],
+                target[0] if target else None)
+            bound = c.execute('SELECT 1 FROM subscription_delivery WHERE subscription=%s AND endpoint=%s',
+                (hint['subscription'], hint['endpoint'])).fetchone()
+            receiver = endpoint if bound else None
+            if receiver is not None:
+                receiver = {'principal': p['id'], 'key_id': p['key_id']}
+        expired = False
+        if hint['kind'] == 'module_events':
+            # ANYM-562: rechecked under the fence too, so an event that expires during preparation is never sent.
+            from .module_events import hint_references
+            expired = not hint_references(c, hint['subscription'], hint['through_position'])
+        eligible = (not expired and p is not None and row is not None and row['state'] == 'active' and
+            row['version'] == hint['subscription_version'] and receiver is not None and
+            receiver['principal'] == p['id'] and receiver['key_id'] == p['key_id'] and
+            (registered is None or (receiver['endpoint'], receiver['secret_file']) ==
+             (registered['endpoint'], registered['secret_file'])))
+        if eligible and hint['kind'] == 'events' and dynamic(row):
+            # ANYM-522: under the fence, a hint whose references all left the key's scope is not sent.
+            # A resume's backlog wake covers every unACKed event, so its range starts at the ACK position.
+            eligible = hint_visible(c, row, p, hint['through_position'],
+                acked=(hint['request_id'] or '').startswith('resume:'))
+            refused = refused or (None if eligible else 'scope_changed')
+        live = c.execute("""SELECT 1 FROM subscription_outbox WHERE id=%s AND state='leased'
+                AND lease_token=%s AND lease_until>clock_timestamp() FOR UPDATE""", (hint['id'], lease)).fetchone()
+        if live:
+            delay = min(3600, 2**(hint['attempts'] + 1))
+            if not eligible:
+                state, error = 'cancelled', refused or ('module_events_expired' if expired else
+                    'access_or_configuration_changed')
+            # The retry age starts at admission: waiting for a budget slot or quiet hours never expires a hint.
+            elif hint['attempts'] >= 8 or c.execute("SELECT %s<clock_timestamp()-interval '7 days' AS expired",
+                    (hint['admitted_at'] or now,)).fetchone()['expired']:
+                state, error = 'dead_letter', 'delivery_budget_exhausted'
+            elif unsafe:
+                state, error = 'dead_letter', 'unsafe_endpoint' if endpoint else 'unsafe_receiver_configuration'
+            elif endpoint is not None and endpoint['at_most_once'] and hint['state'] == 'leased':
+                # ANYM-582/585: a lease that ran out mid-attempt may have reached the receiver; never send it again.
+                state, error = 'dead_letter', 'outcome_unknown'
+            elif endpoint is not None and target is not None:
+                from .delivery_endpoints import caller_headers, hint_body, outcome, signed_headers
+                body = hint_body(c, hint, row, p)
+                headers = signed_headers((endpoint['signing_secret'], endpoint['pending_secret']), hint['id'], body,
+                    caller_headers(endpoint))
+                status = failure = retry_after = None
+                started = time.monotonic()
+                try:
+                    status, retry_after = answer(transport(endpoint['url'], body, headers, resolved=target[1], timeout=5))
+                    if type(status) is int and 200 <= status < 300:
+                        state, error = 'delivered', None
+                    elif type(status) is int and 300 <= status < 400:
+                        state, error = 'dead_letter', 'redirect_rejected'
+                except (OSError, TimeoutError) as caught:
+                    failure = caught
+                except ValueError as caught:
+                    failure, state, error = caught, 'dead_letter', 'unsafe_endpoint'
+                latency = round((time.monotonic() - started) * 1000)
+                if endpoint['at_most_once']:
+                    # A vendor endpoint retries only its documented "no run started" statuses and an unsent
+                    # request; a generic self-registered one only an unsent request.
+                    result, error = outcome(endpoint, status, failure)
+                    state = {'delivered': 'delivered', 'retry': 'pending', 'final': 'dead_letter'}[result]
+                if status in (429, 503) and type(retry_after) is int and retry_after > 0:
+                    # ANYM-604: the receiver's Retry-After, never sooner than the own backoff, capped at an hour.
+                    delay = min(3600, max(delay, retry_after))
+            elif prepared is not None:
+                resolved, secret, body = prepared
+                try:
+                    timestamp = str(int(time.time()))
+                    headers = {'Content-Type': 'application/json', 'X-DeedKit-Hint-ID': str(hint['id']),
+                        'X-DeedKit-Timestamp': timestamp, 'X-DeedKit-Signature': 'sha256=' +
+                        hmac.new(secret, timestamp.encode() + b'.' + body, hashlib.sha256).hexdigest()}
+                    status = answer(transport(receiver['endpoint'], body, headers, resolved=resolved, timeout=5))[0]
+                    if type(status) is int and 200 <= status < 300:
+                        state, error = 'delivered', None
+                    elif type(status) is int and 300 <= status < 400:
+                        state, error = 'dead_letter', 'redirect_rejected'
+                except (OSError, TimeoutError):
+                    pass
+                except ValueError:
+                    state, error = 'dead_letter', 'unsafe_receiver_configuration'
+            if state == 'pending' and hint['attempts'] + 1 >= 8:
+                state, error = 'dead_letter', 'delivery_budget_exhausted'
+            c.execute('''UPDATE subscription_outbox SET state=%s,
+                    error_code=%s,lease_token=NULL,lease_until=NULL,
+                    next_attempt_at=clock_timestamp()+(%s*interval '1 second'),
+                    finished_at=CASE WHEN %s='pending' THEN NULL ELSE clock_timestamp() END
+                    WHERE id=%s AND state='leased' AND lease_token=%s''',
+                (state, error, delay, state, hint['id'], lease))
+            # ANYM-520: the attempt log; the HTTP status or the error code, never a body, header value or URL.
+            from .delivery_endpoints import attempt_error
+            if record_attempt(c, hint, state, hint['attempts'] + 1, status=status, latency=latency,
+                    error=attempt_error(status, failure, None if state == 'cancelled' else problem, error)) and \
+                    state in ('pending', 'dead_letter'):
+                suspects.add(hint['endpoint'])
+    return fenced, live, state
+
+
 def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses, lane=None, served=None):
     """Leased at-least-once hints, independently reauthorized before each send.
 
@@ -579,223 +810,16 @@ def dispatch_hints(store, *, limit=16, transport=_transport, resolver=_addresses
     from .delivery_endpoints import record_attempt
     for _ in range(limit):
         lease = uuid4()
-        with store.pool.connection() as c:
-            if lane == 'endpoint':
-                hint = _next_endpoint_hint(c, served)
-            else:
-                hint = c.execute('''SELECT o.* FROM subscription_outbox o WHERE ''' + _DUE +
-                    (" AND o.receiver IS NOT NULL" if lane == 'operator' else '') +
-                    ''' ORDER BY o.next_attempt_at,o.created_at,o.id LIMIT 1 FOR UPDATE SKIP LOCKED''').fetchone()
-            if hint is None:
-                break
-            if hint['attempts'] >= 8:
-                c.execute("""UPDATE subscription_outbox SET state='dead_letter',
-                    finished_at=clock_timestamp(),error_code='delivery_budget_exhausted',
-                    lease_token=NULL,lease_until=NULL WHERE id=%s""", (hint['id'],))
-                if record_attempt(c, hint, 'dead_letter', hint['attempts'], error='delivery_budget_exhausted'):
-                    suspects.add(hint['endpoint'])
-                stats['dead_letter'] += 1
-                continue
-            if hint['kind'] == 'module_events':
-                # ANYM-562: expiry is rechecked before each attempt; a hint with no live reference is not sent.
-                from .module_events import hint_references
-                if not hint_references(c, hint['subscription'], hint['through_position']):
-                    c.execute("""UPDATE subscription_outbox SET state='cancelled',finished_at=clock_timestamp(),
-                        error_code='module_events_expired',lease_token=NULL,lease_until=NULL WHERE id=%s""",
-                        (hint['id'],))
-                    record_attempt(c, hint, 'cancelled', hint['attempts'], error='module_events_expired')
-                    stats['cancelled'] += 1
-                    continue
-            if hint['state'] == 'leased' and hint.get('endpoint') is not None:
-                # ANYM-582/585: a lease that ran out mid-attempt may have reached an at-most-once receiver. Settle it
-                # before DNS, quiet hours or the budget can turn it back into a pending hint that is sent again.
-                from .delivery_endpoints import at_most_once_endpoint
-                if at_most_once_endpoint(c, hint['endpoint']):
-                    c.execute("""UPDATE subscription_outbox SET state='dead_letter',finished_at=clock_timestamp(),
-                        error_code='outcome_unknown',lease_token=NULL,lease_until=NULL WHERE id=%s""", (hint['id'],))
-                    if record_attempt(c, hint, 'dead_letter', hint['attempts'], error='outcome_unknown'):
-                        suspects.add(hint['endpoint'])
-                    stats['dead_letter'] += 1
-                    continue
-            now = c.execute('SELECT clock_timestamp() AS t').fetchone()['t']
-            if hint['kind'] != 'test' and not hint['quiet_bypass']:
-                # A hint deferred by the budget or retried after receiver downtime can reach a
-                # quiet window after it was committed: it waits, no attempt is consumed.
-                from .delivery_policy import quiet_until
-                binding = c.execute('''SELECT policy FROM subscription_delivery WHERE subscription=%s
-                    AND policy_version=%s''', (hint['subscription'], hint['subscription_version'])).fetchone()
-                quiet = quiet_until(c, binding['policy'], now) if binding else None
-                if quiet is not None:
-                    c.execute("""UPDATE subscription_outbox SET state='pending',next_attempt_at=%s,
-                        lease_token=NULL,lease_until=NULL WHERE id=%s""", (quiet, hint['id']))
-                    stats['deferred'] += 1
-                    continue
-            if hint['admitted_at'] is None:
-                # The first POST of a hint ID takes one slot of the key's rolling hour, with or
-                # without a delivery policy. At the limit it waits for the next slot: no attempt
-                # is consumed and it never dead-letters for the budget.
-                from .delivery_policy import admission_slot
-                owner = c.execute('SELECT principal,key_id FROM subscriptions WHERE id=%s',
-                    (hint['subscription'],)).fetchone()
-                slot = admission_slot(c, owner, now)
-                if slot is None and hint.get('endpoint') is not None:
-                    from .delivery_policy import host_admission_slot
-                    slot = host_admission_slot(c, hint['endpoint'], now)
-                if slot is not None:
-                    c.execute("""UPDATE subscription_outbox SET state='pending',next_attempt_at=%s,
-                        lease_token=NULL,lease_until=NULL WHERE id=%s""", (slot, hint['id']))
-                    stats['deferred'] += 1
-                    continue
-            # Commit the reservation before any external I/O. A process crash
-            # after POST can lose the result, never the consumed attempt slot.
-            c.execute("""UPDATE subscription_outbox SET state='leased',lease_token=%s,attempts=attempts+1,
-                admitted_at=coalesce(admitted_at,clock_timestamp()),
-                lease_until=clock_timestamp()+interval '1 minute' WHERE id=%s""", (lease, hint['id']))
-        # DNS validation, the secret read and the body build run before the fence, so the
-        # fence hold is bounded by the transport deadline plus database time. Registrations
-        # are immutable; the fence rechecks the exact binding. The body carries the hint's
-        # version, which the fence requires to equal the locked subscription's.
-        state, error, prepared, unsafe = 'pending', 'receiver_unavailable', None, False
-        target = refused = problem = status = failure = latency = None
-        if hint.get('endpoint') is not None:
-            # ANYM-519: a self-service endpoint; DNS and the host policy here, secrets and body inside the fence.
-            from .delivery_endpoints import prepare
-            registered, (target, problem) = None, prepare(store, hint['endpoint'], resolver)
-            unsafe = problem == 'unsafe_endpoint'
-            refused = problem if problem in ('endpoint_policy_refused', 'access_or_configuration_changed') else None
-        else:
-            with store.pool.connection() as c:
-                registered = c.execute('SELECT endpoint,secret_file FROM subscription_receivers WHERE id=%s AND enabled',
-                    (hint['receiver'],)).fetchone()
-        if registered is not None:
-            try:
-                prepared = (validate_endpoint(registered['endpoint'], resolver=resolver),
-                    _secret(registered['secret_file']), json.dumps(dict(hint_id=str(hint['id']),
-                    subscription_id=str(hint['subscription']), subscription_version=hint['subscription_version'],
-                    through=hint['through_position'], kind=hint['kind'], host_turn_verified=False),
-                    sort_keys=True, separators=(',', ':')).encode())
-            except (OSError, TimeoutError):
-                # Includes ssl.SSLCertVerificationError, which is also a ValueError:
-                # a certificate problem can be transient and keeps the bounded retry budget.
-                pass
-            except ValueError:
-                unsafe = True
-        with store.pool.connection() as c:
-            # Principal lock precedes subscription lock, matching gateway ACL
-            # order. The bounded TLS exchange holds this shared ACL fence so a
-            # concurrent revocation cannot commit between authorization and send.
-            owner = c.execute('SELECT principal,key_id FROM subscriptions WHERE id=%s',
-                (hint['subscription'],)).fetchone()
-            if owner:
-                lock_principal(c, owner['principal'], shared=True)
-            # The hold starts once the principal lock is held: waiting for it is contention, not hold.
-            fenced = time.monotonic()
-            p = _worker_identity(c, owner) if owner else None
-            row = c.execute('SELECT * FROM subscriptions WHERE id=%s FOR UPDATE',
-                (hint['subscription'],)).fetchone()
-            receiver = c.execute('''SELECT r.* FROM subscription_receivers r JOIN subscription_delivery d
-                ON d.receiver=r.id WHERE d.subscription=%s AND r.id=%s AND r.enabled''',
-                (hint['subscription'], hint['receiver'])).fetchone()
-            if p is not None and row is not None:
-                row = _state(c, row, p)
-            endpoint = None
-            if hint.get('endpoint') is not None:
-                from .delivery_endpoints import fenced as fence_endpoint
-                endpoint, refused = (None, refused) if refused else fence_endpoint(c, p, hint['endpoint'],
-                    target[0] if target else None)
-                bound = c.execute('SELECT 1 FROM subscription_delivery WHERE subscription=%s AND endpoint=%s',
-                    (hint['subscription'], hint['endpoint'])).fetchone()
-                receiver = endpoint if bound else None
-                if receiver is not None:
-                    receiver = {'principal': p['id'], 'key_id': p['key_id']}
-            expired = False
-            if hint['kind'] == 'module_events':
-                # ANYM-562: rechecked under the fence too, so an event that expires during preparation is never sent.
-                from .module_events import hint_references
-                expired = not hint_references(c, hint['subscription'], hint['through_position'])
-            eligible = (not expired and p is not None and row is not None and row['state'] == 'active' and
-                row['version'] == hint['subscription_version'] and receiver is not None and
-                receiver['principal'] == p['id'] and receiver['key_id'] == p['key_id'] and
-                (registered is None or (receiver['endpoint'], receiver['secret_file']) ==
-                 (registered['endpoint'], registered['secret_file'])))
-            if eligible and hint['kind'] == 'events' and dynamic(row):
-                # ANYM-522: under the fence, a hint whose references all left the key's scope is not sent.
-                # A resume's backlog wake covers every unACKed event, so its range starts at the ACK position.
-                eligible = hint_visible(c, row, p, hint['through_position'],
-                    acked=(hint['request_id'] or '').startswith('resume:'))
-                refused = refused or (None if eligible else 'scope_changed')
-            live = c.execute("""SELECT 1 FROM subscription_outbox WHERE id=%s AND state='leased'
-                AND lease_token=%s AND lease_until>clock_timestamp() FOR UPDATE""", (hint['id'], lease)).fetchone()
-            if live:
-                delay = min(3600, 2**(hint['attempts'] + 1))
-                if not eligible:
-                    state, error = 'cancelled', refused or ('module_events_expired' if expired else
-                        'access_or_configuration_changed')
-                # The retry age starts at admission: waiting for a budget slot or quiet hours never expires a hint.
-                elif hint['attempts'] >= 8 or c.execute("SELECT %s<clock_timestamp()-interval '7 days' AS expired",
-                        (hint['admitted_at'] or now,)).fetchone()['expired']:
-                    state, error = 'dead_letter', 'delivery_budget_exhausted'
-                elif unsafe:
-                    state, error = 'dead_letter', 'unsafe_endpoint' if endpoint else 'unsafe_receiver_configuration'
-                elif endpoint is not None and endpoint['at_most_once'] and hint['state'] == 'leased':
-                    # ANYM-582/585: a lease that ran out mid-attempt may have reached the receiver; never send it again.
-                    state, error = 'dead_letter', 'outcome_unknown'
-                elif endpoint is not None and target is not None:
-                    from .delivery_endpoints import caller_headers, hint_body, outcome, signed_headers
-                    body = hint_body(c, hint, row, p)
-                    headers = signed_headers((endpoint['signing_secret'], endpoint['pending_secret']), hint['id'], body,
-                        caller_headers(endpoint))
-                    status = failure = retry_after = None
-                    started = time.monotonic()
-                    try:
-                        status, retry_after = answer(transport(endpoint['url'], body, headers, resolved=target[1], timeout=5))
-                        if type(status) is int and 200 <= status < 300:
-                            state, error = 'delivered', None
-                        elif type(status) is int and 300 <= status < 400:
-                            state, error = 'dead_letter', 'redirect_rejected'
-                    except (OSError, TimeoutError) as caught:
-                        failure = caught
-                    except ValueError as caught:
-                        failure, state, error = caught, 'dead_letter', 'unsafe_endpoint'
-                    latency = round((time.monotonic() - started) * 1000)
-                    if endpoint['at_most_once']:
-                        # A vendor endpoint retries only its documented "no run started" statuses and an unsent
-                        # request; a generic self-registered one only an unsent request.
-                        result, error = outcome(endpoint, status, failure)
-                        state = {'delivered': 'delivered', 'retry': 'pending', 'final': 'dead_letter'}[result]
-                    if status in (429, 503) and type(retry_after) is int and retry_after > 0:
-                        # ANYM-604: the receiver's Retry-After, never sooner than the own backoff, capped at an hour.
-                        delay = min(3600, max(delay, retry_after))
-                elif prepared is not None:
-                    resolved, secret, body = prepared
-                    try:
-                        timestamp = str(int(time.time()))
-                        headers = {'Content-Type': 'application/json', 'X-DeedKit-Hint-ID': str(hint['id']),
-                            'X-DeedKit-Timestamp': timestamp, 'X-DeedKit-Signature': 'sha256=' +
-                            hmac.new(secret, timestamp.encode() + b'.' + body, hashlib.sha256).hexdigest()}
-                        status = answer(transport(receiver['endpoint'], body, headers, resolved=resolved, timeout=5))[0]
-                        if type(status) is int and 200 <= status < 300:
-                            state, error = 'delivered', None
-                        elif type(status) is int and 300 <= status < 400:
-                            state, error = 'dead_letter', 'redirect_rejected'
-                    except (OSError, TimeoutError):
-                        pass
-                    except ValueError:
-                        state, error = 'dead_letter', 'unsafe_receiver_configuration'
-                if state == 'pending' and hint['attempts'] + 1 >= 8:
-                    state, error = 'dead_letter', 'delivery_budget_exhausted'
-                c.execute('''UPDATE subscription_outbox SET state=%s,
-                    error_code=%s,lease_token=NULL,lease_until=NULL,
-                    next_attempt_at=clock_timestamp()+(%s*interval '1 second'),
-                    finished_at=CASE WHEN %s='pending' THEN NULL ELSE clock_timestamp() END
-                    WHERE id=%s AND state='leased' AND lease_token=%s''',
-                    (state, error, delay, state, hint['id'], lease))
-                # ANYM-520: the attempt log; the HTTP status or the error code, never a body, header value or URL.
-                from .delivery_endpoints import attempt_error
-                if record_attempt(c, hint, state, hint['attempts'] + 1, status=status, latency=latency,
-                        error=attempt_error(status, failure, None if state == 'cancelled' else problem, error)) and \
-                        state in ('pending', 'dead_letter'):
-                    suspects.add(hint['endpoint'])
+        reserved = _reserve_hint(store, lane, served, lease, stats, suspects, record_attempt)
+        if reserved == 'stop':
+            break
+        if reserved == 'skip':
+            continue
+        hint, now = reserved
+        (state, error, prepared, unsafe, target, refused, problem, status, failure, latency,
+            registered) = _prepare_hint(store, hint, resolver)
+        fenced, live, state = _fence_hint(store, hint, lease, now, registered, refused, target, unsafe, state,
+            error, prepared, status, failure, latency, problem, transport, suspects, record_attempt, lock_principal)
         # Each attempt's fence hold, so a latency regression shows up in a measurement.
         holds.append(round((time.monotonic() - fenced) * 1000))
         if live:
