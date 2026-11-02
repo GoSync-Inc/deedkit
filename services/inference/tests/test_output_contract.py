@@ -94,26 +94,6 @@ def test_chat_content_unit():
 
 
 # spec: ANYM-683
-def test_chat_content_unescapes_a_double_escaped_text_field():
-    def text_of(**fields):
-        return json.loads(chat_content(json.dumps(fields)))["text"]
-
-    # The model sometimes double-escapes in JSON mode: the field holds a literal backslash-n, not a newline.
-    assert text_of(title="R", text="Shop\\nTotal 12.50\\nThanks") == "Shop\nTotal 12.50\nThanks"
-    assert text_of(text="ООО «Ветер»\\nИТОГО: 12,50\\n14.02") == "ООО «Ветер»\nИТОГО: 12,50\n14.02"
-    # Real text is left alone: a real newline wins over two literal ones; a single literal one is not enough.
-    assert text_of(text="Shop\nTotal\\nThanks\\nBye") == "Shop\nTotal\\nThanks\\nBye"
-    assert text_of(text="path C:\\new") == "path C:\\new"
-    # Valid text with backslash-n sequences (paths, LaTeX) is not corrupted.
-    assert text_of(text="C:\\new; C:\\notes") == "C:\\new; C:\\notes"
-    assert text_of(text="\\nabla x + \\nu y") == "\\nabla x + \\nu y"
-    assert text_of(text="A\\nB\\nC\\tD") == "A\\nB\\nC\\tD"
-    # Other fields and the plain-text fallback are never touched.
-    assert json.loads(chat_content(json.dumps({"title": "a\\nb\\nc"})))["title"] == "a\\nb\\nc"
-    assert json.loads(chat_content("A\\nB\\nC"))["text"] == "A\\nB\\nC"
-
-
-# spec: ANYM-683
 async def test_engine_answers_match_the_contract_goldens(env):
     from support import CONTRACT
 

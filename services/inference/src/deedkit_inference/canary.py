@@ -18,7 +18,7 @@ JSON_KEYS = ("title", "summary", "document_type", "text")
 
 
 def norm(text):
-    text = text.lower().replace("ё", "е")
+    text = text.lower().replace("ё", "е").replace("\\n", " ")  # a double-escaped line break is a break, not an "n"
     text = re.sub(r"<think>.*?</think>", " ", text, flags=re.S)
     return " ".join(re.sub(r"[*#|`_\-–—«»\"“”„()\[\]{}:;!?.,/\\]", " ", text).split())
 

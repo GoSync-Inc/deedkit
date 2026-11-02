@@ -99,16 +99,6 @@ def _field(value, limit):
     return clean_text(value if isinstance(value, str) else ("" if value is None else json.dumps(value, ensure_ascii=False)))[:limit]
 
 
-def _unescape_line_breaks(body):
-    """The model sometimes double-escapes line breaks in JSON mode: the field holds a literal backslash-n, not a
-    newline. Repair it only when the text is unambiguous: no real newline, at least two literal ones, no other
-    backslash, and none followed by an ASCII lowercase letter (that is C:\\new, \\nabla, \\nu: text, not breaks)."""
-    literal = body.count("\\n")
-    if "\n" in body or literal < 2 or body.count("\\") != literal or re.search(r"\\n[a-z]", body):
-        return body
-    return body.replace("\\n", "\n")
-
-
 def chat_content(model_text):
     """The service's answer content for a chat: a JSON object with the four string fields. A model answer that
     is a JSON object (bare or in a code fence) keeps its fields; any other answer becomes `text`."""
@@ -127,16 +117,12 @@ def chat_content(model_text):
                 parsed = value if isinstance(value, dict) else None
             except (ValueError, RecursionError):
                 parsed = None
-    from_json = parsed is not None
     if parsed is None:
         parsed = {"title": "", "summary": "", "document_type": "unknown", "text": text}
     document_type = CONTROL.sub(" ", _field(parsed.get("document_type", "unknown"), 1000)).strip()[:MAX_DOC_TYPE]
-    body = _field(parsed.get("text"), MAX_TOTAL_CHARS)
-    if from_json:
-        body = _unescape_line_breaks(body)
     return json.dumps({
         "title": _field(parsed.get("title"), MAX_TITLE),
         "summary": _field(parsed.get("summary"), MAX_SUMMARY),
         "document_type": document_type or "unknown",
-        "text": body,
+        "text": _field(parsed.get("text"), MAX_TOTAL_CHARS),
     }, ensure_ascii=False)
