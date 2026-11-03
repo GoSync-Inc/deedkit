@@ -44,8 +44,12 @@ class ArchiveStatus(Strict):
 
 
 class Searching(ArchiveStatus):
-    query: str = Field(min_length=1, max_length=256)
+    query: str | None = Field(default=None, min_length=1, max_length=256)
     limit: int = Field(default=10, ge=1, le=50)
+    created_after: str | None = Field(default=None, max_length=64)
+    created_before: str | None = Field(default=None, max_length=64)
+    speaker: str | None = Field(default=None, min_length=1, max_length=64)
+    order: Literal['relevance', 'newest'] = 'relevance'
 
 
 class Context(ArchiveStatus):

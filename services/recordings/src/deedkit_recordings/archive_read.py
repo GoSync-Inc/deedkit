@@ -1,9 +1,10 @@
 """Bounded, credential-current local text retrieval. Never reads provider tokens."""
 import asyncio
+from datetime import datetime
 import re
 import unicodedata
 
-from .archive_store import namespace
+from .archive_store import namespace, utc_text
 from .security import Failure, read_document, principal, cursor, continuation
 
 
@@ -14,6 +15,17 @@ def expression(query):
     # All tokens are quoted literal words, ANDed. Caller FTS operators,
     # column selectors, prefixes and grouping never reach the query parser.
     return ' AND '.join('"' + word + '"' for word in words)
+
+
+def instant(value):
+    """A timezone-aware ISO instant as the fixed-width UTC text the archive stores; anything else is a fixed refusal."""
+    try:
+        moment = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if 'T' not in value or moment.tzinfo is None:
+            raise ValueError
+        return utc_text(moment)
+    except (ValueError, OverflowError):
+        raise Failure('invalid_parameters', 422) from None
 
 
 def evidence(part):
@@ -48,7 +60,14 @@ class LocalArchive:
             raise Failure('archive_busy')
         async with self.budget:
             if operation == 'search':
-                items = await self.runtime.db('search', account, expression(args.query), args.limit)
+                after = instant(args.created_after) if args.created_after is not None else None
+                before = instant(args.created_before) if args.created_before is not None else None
+                if after is not None and before is not None and after > before:
+                    raise Failure('invalid_parameters', 422)
+                if args.query is None and after is None and before is None and args.speaker is None:
+                    raise Failure('query_or_filter_required', 422)
+                items = await self.runtime.db('search', account, expression(args.query) if args.query is not None else None, args.limit,
+                                              after, before, args.speaker.lower() if args.speaker is not None else None, args.order)
                 result = {'account': account.id, 'provider': account.provider, 'items': [
                     {**item, 'account': account.id, 'provider': account.provider, 'source_data': True} for item in items],
                     'search_mode': 'lexical', 'coverage': 'local_observed_unknown', 'limit': args.limit}

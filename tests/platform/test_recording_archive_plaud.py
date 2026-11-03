@@ -221,7 +221,7 @@ def test_changed_notes_commit_before_stalled_transcript_finishes(tmp_path):
             events = await r.db('events',0,100)
             assert len(events)==len(before)+1 and events[-1]['revision']==row['revision']
             with r.store.connection() as db:
-                assert db.execute("SELECT ref FROM texts WHERE texts MATCH 'searchable'").fetchone()[0] == row['ref']
+                assert db.execute("SELECT ref FROM texts4 WHERE texts4 MATCH 'searchable'").fetchone()[0] == row['ref']
         finally:
             task.cancel(); remote.transcript_release.set()
             await asyncio.gather(task,return_exceptions=True); await r.close()

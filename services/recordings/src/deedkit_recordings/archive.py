@@ -26,6 +26,7 @@ class ArchiveRuntime:
     def __init__(self, path, provider, remote):
         self.path, self.provider, self.remote = Path(path), provider, remote
         self.store, self.task, self.error = None, None, None
+        self.index_error = None  # the schema-4 index build's own last failure; it never stops collection
         self.collecting, self.turn, self.ledger = asyncio.Lock(), 0, asyncio.Lock()
         self.errors = {}
         self.started = monotonic()
@@ -337,6 +338,8 @@ class ArchiveRuntime:
             result.update(await self.db('status', current, time.time() if now is None else now, budget))
             # This overlay needs no write, including when quota prevents writing
             # account_error. Account-specific failures never leak another account.
+            if 'index' in result:
+                result['index']['error'] = self.index_error
             result['error'] = self.errors.get(namespace(current),result['error'])
             if self.error in ('archive_capacity','archive_unavailable','archive_schema_unsupported'):
                 result['error'] = self.error
@@ -384,6 +387,18 @@ class ArchiveRuntime:
                                   {kind:('error','','archive_content_limit')},now,guard)
 
 
+    async def build_index(self):
+        """Advance the schema-4 index build by a bounded step. A failure here is recorded for the status and never
+        reaches collection: the old index (or the published one) keeps serving reads."""
+        try:
+            async with asyncio.timeout(30):
+                await self.db('index_step')
+            self.index_error = None
+        except Failure as error:
+            self.index_error = error.code
+        except Exception:
+            self.index_error = 'archive_unavailable'
+
     async def run_once(self, *, now=None):
         if self.collecting.locked():
             return
@@ -397,6 +412,7 @@ class ArchiveRuntime:
                 if doc.archive.directory != str(self.store.directory):
                     raise Failure('archive_unavailable')
                 self.store.settings = doc.archive
+                await self.build_index()
                 accounts = [a for a in doc.accounts if a.archive_namespace is not None]
                 if not accounts:
                     self.error = None

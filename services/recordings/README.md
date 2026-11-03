@@ -373,15 +373,28 @@ recordings backend and gateway catalog before adding tools to a private profile;
 remove the tools before downgrading the gateway. These calls read no provider
 token and make no provider, model or embedding request.
 
-- `recordings_search({account, query, limit: 10})`: searches the local FTS5
-  index of titles, transcripts and summaries. A query is 1–256 characters,
-  containing 1–16 Unicode literal words of at most 64 characters each, joined
-  with AND. Operators, column selectors and wildcards are not an FTS language
-  exposed to the caller. Returns at most 50 hits with a snippet of at most
-  320 characters, stable `recording_ref`, revision and per-part digest,
-  freshness and attempt state. Order is a title hit, then a summary hit, then a transcript hit, then the newer revision (no corpus statistics, so other accounts cannot influence it). No total count or
-  cross-account search is returned. This is lexical search over observed local
-  text; an empty result is not proof of vendor history completeness.
+- `recordings_search({account, query?, limit: 10, created_after?, created_before?, speaker?, order?})`: searches the
+  local FTS5 index of titles, transcripts and summaries. The index holds plain text: the spoken words, not the stored
+  JSON keys, and not the speaker labels (ANYM-725). A query is 1–256 characters, containing 1–16 Unicode literal words of
+  at most 64 characters each, joined with AND. Operators, column selectors and wildcards are not an FTS language
+  exposed to the caller. Optional filters, all ANDed with the query:
+  `created_after` / `created_before` (timezone-aware ISO instants, inclusive, compared in UTC with the provider's
+  `created_at`; a reversed or malformed range is `invalid_parameters`), `speaker` (one literal label, at most 64
+  characters, case-insensitive exact match: the label is whatever the provider sent, such as `SPEAKER_01` or a name
+  the owner set in Omi; there is no identity resolution or voice recognition) and `order` (`relevance`, the default, or
+  `newest`). Without a query, at least one filter is required (`query_or_filter_required`, 422) and the call lists the
+  newest matching recordings (browse; the snippet is the start of the summary or transcript). Records without a usable
+  `created_at` are returned by calls without a date filter (after the dated ones in newest order) and excluded by a date
+  filter; `recordings_archive_status` counts them as `undated`. Returns at most 50 hits with a snippet of at most
+  320 characters, stable `recording_ref`, revision and per-part digest, freshness and attempt state, plus
+  `created_at` (fixed-width UTC, microseconds), `started_at`, `duration_s` (whole seconds; Omi `finished_at - started_at`,
+  PLAUD `duration` in milliseconds; null when missing, unparsable or negative) and up to 8 `speakers` labels (at most
+  256 labels per recording are indexed, 64 characters each). PLAUD numeric timestamps have no documented unit: below
+  10^11 they are read as Unix seconds, from 10^11 up as milliseconds (a heuristic), accepted only in the years 2000–2100.
+  Everything in a hit, labels included, is untrusted source data inside the `source_data: true` envelope. Relevance
+  order is a title hit, then a summary hit, then a transcript hit, then the newer revision (no corpus statistics, so
+  other accounts cannot influence it). No total count or cross-account search is returned. This is lexical search over
+  observed local text; an empty result is not proof of vendor history completeness.
 - `recordings_context({account, recording_ref, kind: "transcript", page_chars: 4000})`:
   reads the accepted transcript or summary in 100–10,000 character pages,
   retaining original speaker/offset text where the vendor supplied it. Results
@@ -395,6 +408,25 @@ token and make no provider, model or embedding request.
 - `recordings_archive_status({account})`: read-only metadata counts, coverage,
   freshness and fixed archive errors, with no titles or text. Content scope is
   not needed. Missing archive settings return `archive_disabled`.
+
+#### Schema 4 and the index build (ANYM-725)
+
+A new archive starts at schema 4. An existing schema-3 archive is upgraded additively at the writer's start (new
+columns `created_at`, `duration_s`, `part_digest` on `records` and the derived tables `texts4`, `speakers`,
+`index_rows`, `index_skips`); no record, ref, revision, part digest or event is changed, and the build emits no events.
+The new index is then filled in bounded batches (at most 4 MiB of stored text or 500 records per write transaction, up
+to 10 s per collector pass), tracked by `index_cursor` in `meta`, so an archive of any size converts across passes and a
+crash resumes from the cursor. While it builds, schema 3 stays fully usable: plain queries read the old index, and
+`observe()` also writes the new index for every record at or behind the cursor; date and speaker filters and browse
+answer `index_building` (409, retryable) until publication. When the cursor reaches the end, one short transaction
+verifies against `records` the row count and, row by row, the revision and the digest of the accepted parts of each
+indexed row (a mismatch rebuilds exactly those rows and continues; it never publishes), then sets
+`PRAGMA user_version=4`. A later transaction drops the superseded `texts` table. A stored row whose metadata or parts
+cannot be read (malformed, or metadata over 64 KiB) is counted in `recordings_archive_status` as `index.skipped` and
+does not stop the build. `recordings_archive_status` shows `index.state` (`building` or `ready`), `built`, `total`
+and the index error code, if any. Older packages refuse schema 4 (`archive_schema_unsupported`); rolling back means
+disabling archive collection and keeping the state files. The online backup and the backup tooling accept schemas 1–4
+(ANYM-714 accepts 1–5).
 
 Local operations admit at most four simultaneous requests per process, returning
 `archive_busy` instead of building an unbounded queue. SQLite keeps its 100 ms

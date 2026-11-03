@@ -87,3 +87,36 @@ def test_archive_status_is_available_with_read_permission_only(tmp_path):
         assert not response.get('isError') and seen == [('recordings', 'archive_status', {'account': 'omi-a'})]
         for name in ('recordings_search', 'recordings_context'):
             assert name not in {t['name'] for t in rpc(client, 'tools/list').json()['result']['tools']}
+
+
+# spec: ANYM-725
+def test_search_forwards_filters_and_browse_without_a_query_and_defaults_stay(tmp_path):
+    app, seen = setup(tmp_path)
+    full = {'account': 'omi-a', 'query': 'telescope', 'created_after': '2026-01-01T00:00:00Z',
+            'created_before': '2026-02-01T00:00:00Z', 'speaker': 'Alice', 'order': 'newest', 'limit': 5}
+    with TestClient(app) as client:
+        for args, expected in [(full, full), ({'account': 'omi-a', 'created_after': '2026-01-01T00:00:00Z'},
+                                              {'account': 'omi-a', 'created_after': '2026-01-01T00:00:00Z', 'limit': 10}),
+                               ({'account': 'omi-a', 'speaker': 'SPEAKER_01'}, {'account': 'omi-a', 'speaker': 'SPEAKER_01', 'limit': 10})]:
+            result = rpc(client, 'tools/call', {'name': 'recordings_search', 'arguments': args}).json()['result']
+            assert not result.get('isError'), result
+            assert seen[-1] == ('recordings', 'search', expected)
+        schema = CATALOG['recordings_search']['inputSchema']
+        assert schema['required'] == ['account'] and schema['additionalProperties'] is False
+        assert schema['properties']['order']['enum'] == ['relevance', 'newest']
+        assert {'created_after', 'created_before', 'speaker'} <= set(schema['properties'])
+        sent = len(seen)
+        for bad in ({'account': 'omi-a', 'query': 'x', 'order': 'oldest'}, {'account': 'omi-a', 'query': 'x', 'speaker': ''},
+                    {'account': 'omi-a', 'query': 'x', 'speaker': 'x' * 65}, {'account': 'omi-a', 'query': 'x', 'extra': 1}):
+            result = rpc(client, 'tools/call', {'name': 'recordings_search', 'arguments': bad}).json()['result']
+            assert result['isError'], bad
+        assert len(seen) == sent  # refused at the gateway, never forwarded
+
+
+# spec: ANYM-725
+def test_new_backend_refusals_are_relayed_with_fixed_guidance():
+    from agent_gateway.recordings_errors import failure
+    building = failure({'error': 'index_building'}, 409)
+    assert building.detail == {'error': 'index_building', 'retryable': True, 'next_action': 'retry_after_delay', 'retry_after_seconds': 2}
+    needed = failure({'error': 'query_or_filter_required'}, 422)
+    assert needed.detail == {'error': 'query_or_filter_required', 'retryable': False, 'next_action': 'correct_arguments'}
