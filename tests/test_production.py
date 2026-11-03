@@ -3051,8 +3051,20 @@ def test_enrollment_and_the_fresh_sha_undo_pass_the_real_preparation_guards(tmp_
     settings, _, _ = fixture(tmp_path, monkeypatch)
     second, third = "2" * 40, "3" * 40
     fixture_run = p.run
-    monkeypatch.setattr(p, "run", lambda argv, **kw: next(iter(wanted)) if "FETCH_HEAD" in argv else fixture_run(argv, **kw))
-    wanted = [SHA]
+    stores, wanted = {}, [SHA]  # one synthetic image store per commit: identities, revision labels and recipes per target
+    def routed(argv, **kwargs):
+        if "FETCH_HEAD" in argv:
+            return wanted[0]
+        store = stores.setdefault(wanted[0], ImageStore())
+        if argv[:2] in (["docker", "pull"], ["docker", "tag"], ["docker", "run"]) or argv[:3] in (
+                ["docker", "image", "ls"], ["docker", "image", "inspect"]):
+            try:
+                return store.run(argv, **kwargs)
+            except (KeyError, StopIteration):
+                pass  # an image the store never held (the running container's): the fixture answers
+        return fixture_run(argv, **kwargs)
+    monkeypatch.setattr(p, "run", routed)
+    monkeypatch.setattr(p, "published", lambda target, sha: stores.setdefault(sha, ImageStore()).published(target, sha))
     plain_digest = p.settings_digest(settings)
     state = Path(settings["state_directory"])
     p.prepare(settings, SHA)
