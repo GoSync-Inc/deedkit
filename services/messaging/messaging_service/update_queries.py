@@ -206,6 +206,11 @@ def overview(store,c,p,consumer,limit,filters,lower,upper,width):
         if r['chat'] in aliases:
             chats[-1].update(alias_chats=[{'id':aliases[r['chat']]}],alias_provenance=provenance[r['chat']],
                 alias_confidence='provider_cache_observation')
+    # ANYM-656: a read-only heuristic hint; any failure inside leaves the rows exactly as they are.
+    from . import related_chats
+    found=related_chats.hints(c,p,[{'id':r['chat'],'type':named.get('chat_type'),'last_activity':r['latest_at']}
+        for r,named in zip(rows,names)])
+    for row in chats:row.update(found.get(row['chat'],{}))
     targets(p,[mid for mid in ids if mid])
     total=rows[0] if rows else {'chats_total':0,'live_total':0,'backfill_total':0}
     # An empty account may be a quiet one or a stopped collector: each scoped account's
@@ -230,10 +235,11 @@ def within_budget(result):
     import json
     def size():return len(json.dumps(result,ensure_ascii=False,default=str))
     if len(result['chats'])>25 or size()<=OVERVIEW_BUDGET:return result
-    for step in ('text:40','names:32','text:0','sender_id','observed_at','names:16','names:0'):
+    for step in ('hints','text:40','names:32','text:0','sender_id','observed_at','names:16','names:0'):
         kind,_,n=step.partition(':')
         for row in result['chats']:
             newest=row.get('newest') or {}
+            if kind=='hints':row.pop('related_chats',None);row.pop('continued_by',None)  # ANYM-656: optional, before any base row
             if kind=='text' and 'text' in newest:
                 if not int(n):newest.pop('text')
                 elif len(newest['text'])>int(n):newest['text']=newest['text'][:int(n)].rstrip()+'…'

@@ -288,6 +288,8 @@ def lean_chat(row):
         result.update(alias_provenance=row.get('alias_provenance'),alias_confidence=row.get('alias_confidence'))
     if row.get('peer_phone'):result.update(peer_phone=row['peer_phone'],peer_phone_provenance=row.get('peer_phone_provenance'))
     result.update(chat_role(row))
+    for key in ('related_chats','continued_by'):  # ANYM-656: heuristic hints, only when found
+        if row.get(key):result[key]=row[key]
     state=row.get('conversation')
     latest=(state or {}).get('latest_known_meaningful_message')
     kind=row.get('type')
