@@ -566,7 +566,8 @@ class Store:
     def get_send_status(self,token,send_id=None,request_id=None):
         from .outgoing import status
         with self.authorized(token,'get_send_status') as (c,p):
-            return status(c,p,send_id,request_id)
+            # A send_id call keeps the old call shape; only a request_id lookup (ANYM-736) names it.
+            return status(c,p,send_id) if request_id is None else status(c,p,send_id,request_id)
 
     def prepare_file_upload(self,token,account,chat_id,filename,mime,bytes,sha256,request_id):
         from .uploads import prepare
