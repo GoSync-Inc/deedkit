@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from messaging_service.telegram_collector import configuration as telegram_configuration
+from messaging_service.media_retry import MEDIA_MAX_ATTEMPTS
 from messaging_service.whatsapp_collector import configuration as whatsapp_configuration
 from test_live_media import config_path, original, writers, capacity
 from test_archive import archive as archive
@@ -104,7 +105,7 @@ def test_demand_cannot_bypass_collection_safety(archive,change):
         if change=='deleted':c.execute('UPDATE messages SET deleted=true WHERE id=%s',(mid,))
         elif change=='excluded':c.execute("UPDATE account_policies SET exclude_chats=ARRAY['100'] WHERE account='archive-test'")
         elif change=='disabled':c.execute("UPDATE account_policies SET enabled=false WHERE account='archive-test'")
-        elif change=='attempts':c.execute('UPDATE media_jobs SET attempts=5 WHERE message=%s',(mid,))
+        elif change=='attempts':c.execute('UPDATE media_jobs SET attempts=%s WHERE message=%s',(MEDIA_MAX_ATTEMPTS,mid))
         elif change=='cooldown':c.execute("UPDATE media_jobs SET next_due=clock_timestamp()+interval '1 hour' WHERE message=%s",(mid,))
     since=datetime.now(timezone.utc)-timedelta(days=3) if change=='history' else None
     assert ar.claim_media('worker',media_prefetch_days=0,since=since) is None

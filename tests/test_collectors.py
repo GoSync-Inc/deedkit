@@ -14,6 +14,7 @@ import pytest
 
 from messaging_service.archive import Archive
 from messaging_service.blobs import BlobWriter
+from messaging_service.media_retry import MEDIA_MAX_ATTEMPTS
 from messaging_service.collector_state import CaptureSpool,CollectorState,session_lock,validate_capture
 from messaging_service.envelope import stable_id
 from messaging_service.telegram_collector import TelegramCollector,configuration
@@ -218,11 +219,11 @@ def test_unclassified_telegram_media_error_fails_only_that_job(worker,caplog):
     assert 'synthetic-secret-text' not in caplog.text
     # The last attempt ends the job failed; the collector keeps running.
     with s.pool.connection() as c:
-        c.execute('UPDATE media_jobs SET attempts=4,next_due=now() WHERE message=%s',(broken_id,))
+        c.execute('UPDATE media_jobs SET attempts=%s,next_due=now() WHERE message=%s',(MEDIA_MAX_ATTEMPTS-1,broken_id))
     assert asyncio.run(w.media_once())
     with s.pool.connection() as c:
         job=c.execute('SELECT state,error_code,attempts FROM media_jobs WHERE message=%s',(broken_id,)).fetchone()
-    assert (job['state'],job['error_code'],job['attempts'])==('failed','network_error',5)
+    assert (job['state'],job['error_code'],job['attempts'])==('failed','network_error',MEDIA_MAX_ATTEMPTS)
     assert not asyncio.run(w.media_once())
     assert s.get_context(key,broken_id)['attachments']==[]
     assert set(s.files.iterdir())==originals|{s.files/hashlib.sha256(b'data').hexdigest()}
@@ -875,7 +876,7 @@ def test_backup_covers_collector_positions_and_pending_deletions(worker,tmp_path
     directory=tmp_path/'snapshot'
     create_snapshot(s,directory,[sys.executable,'-c','print("unit-dump-stub")'])
     manifest=json.loads((directory/'manifest.json').read_text())
-    assert manifest['schema_version']==65
+    assert manifest['schema_version']==66
     assert manifest['tables']['collector_chats']['rows']==1
     assert manifest['tables']['provider_tombstones']['rows']==1
     assert verify_snapshot(s,directory)['status']=='verified'

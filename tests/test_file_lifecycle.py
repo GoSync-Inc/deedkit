@@ -3,6 +3,8 @@ from importlib import import_module
 
 import pytest
 
+from messaging_service.media_retry import MEDIA_MAX_ATTEMPTS
+
 from test_archive import archive as archive, event
 
 
@@ -347,7 +349,7 @@ def test_managed_redownload_preserves_terminal_backoff_and_provider_absence(arch
     api.LifecycleWorker(s).run_once(apply=True)
     with s.pool.connection() as c:
         if case=='failed':c.execute("UPDATE media_jobs SET state='failed',error_code='integrity_error',attempts=3 WHERE id=%s",(fid,))
-        if case=='exhausted':c.execute('UPDATE media_jobs SET attempts=5 WHERE id=%s',(fid,))
+        if case=='exhausted':c.execute('UPDATE media_jobs SET attempts=%s WHERE id=%s',(MEDIA_MAX_ATTEMPTS,fid))
         if case=='cooldown':c.execute("UPDATE media_jobs SET next_due=now()+interval '3 hours',error_code='rate_limited' WHERE id=%s",(fid,))
     result=s.request_file_download(key,fid)
     if case in ('failed','exhausted'):assert result['request_status']=='failed'

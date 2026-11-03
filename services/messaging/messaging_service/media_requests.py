@@ -4,9 +4,12 @@ Only collectors contact providers. Requests never reset attempts, bypass provide
 cooldowns or change source references. The shared demand lock precedes job locks;
 this path never acquires the collector/capacity lock while holding either one.
 """
+import psycopg
+
 from .attachment_metadata import attachment_fields, processing_phases
 from .file_index import _available,_absent
 from .media_policy import ELIGIBILITY_JOIN
+from .media_retry import MEDIA_MAX_ATTEMPTS,MEDIA_REQUEST_WAKE_SECONDS
 from .policy import scope_filter, targets
 from .storage_admission import cold_grant
 from .store import APIError, serial
@@ -150,7 +153,7 @@ def _request(store,c,p,attachment_id):
             cold.update(restore_state='failed',restore_error=error);fallback=True
         if cold and cold['restore_state']=='failed' and cold['restore_error']:result['cold_failure']=cold['restore_error']
         # A provider job that is not running (ready, failed or exhausted) never blocks the owner's own copy.
-        idle_job=row['job_state'] in ('ready','failed') or (row['job_state']=='queued' and row['attempts']>=5)
+        idle_job=row['job_state'] in ('ready','failed') or (row['job_state']=='queued' and row['attempts']>=MEDIA_MAX_ATTEMPTS)
         if cold and cold['verified'] and idle_job:
             if cold['restore_state']=='requested':
                 result.update(request_status='coalesced',reason='managed_original_evicted',rehydration_source='cold_archive',
@@ -176,21 +179,26 @@ def _request(store,c,p,attachment_id):
         result.update(request_status='processing',requested_until=row['requested_until'],
             next_action='get_attachment')
         return serial(result)
-    if row['job_state']=='failed' or row['attempts']>=5:
+    if row['job_state']=='failed' or row['attempts']>=MEDIA_MAX_ATTEMPTS:
         result.update(request_status='failed',reason=row['error_code'] or 'retry_exhausted',
             requested_until=None)
         return serial(result)
     active=c.execute('SELECT %s::timestamptz>clock_timestamp() AS active',
         (row['requested_until'],)).fetchone()['active']
+    deferred=c.execute('''SELECT %s::timestamptz>=clock_timestamp()+%s*interval '1 second' AS deferred,
+        greatest(0,ceil(extract(epoch FROM %s::timestamptz-clock_timestamp())))::bigint AS retry_after_seconds''',
+        (row['next_due'],MEDIA_REQUEST_WAKE_SECONDS,row['next_due'])).fetchone()
+    # A long transient backoff (hours) does not defer an explicit request; a provider wait still running does.
+    long_backoff=deferred['deferred'] and row['job_state']=='queued' and row['error_code']!='rate_limited'
     # A ready managed job in its window is only a cold restore's reserved fallback;
     # nobody serves it without the restore grant (undo), so the provider is asked now.
     if active and not fallback and not (managed and row['job_state']=='ready'):
+        # The window of an earlier request is open: no new quota is taken, but the backoff that began after it still yields.
+        if long_backoff:wake_backoff(c,row,result,attachment_id)
         result.update(request_status='coalesced',requested_until=row['requested_until'])
         return serial(result)
-    deferred=c.execute('''SELECT %s::timestamptz>=clock_timestamp()+interval '1 hour' AS deferred,
-        greatest(0,ceil(extract(epoch FROM %s::timestamptz-clock_timestamp())))::bigint AS retry_after_seconds''',
-        (row['next_due'],row['next_due'])).fetchone()
-    if deferred['deferred']:
+    if deferred['deferred'] and row['error_code']=='rate_limited':
+        # A provider-requested wait still running holds the job.
         result.update(request_status='deferred',reason='retry_after_request_window',
             requested_until=None,retry_after_seconds=deferred['retry_after_seconds'],
             next_action='request_file_download_after_retry')
@@ -201,6 +209,7 @@ def _request(store,c,p,attachment_id):
     until=c.execute('''UPDATE media_jobs SET requested_until=clock_timestamp()+interval '1 hour',
         request_key_digest=%s WHERE id=%s RETURNING requested_until''',
         (p['key_digest'],attachment_id)).fetchone()['requested_until']
+    if long_backoff:wake_backoff(c,row,result,attachment_id)
     if managed and row['job_state']=='ready':
         changed=c.execute('SELECT public.queue_managed_original(%s) AS queued',(attachment_id,)).fetchone()['queued']
         if not changed:raise APIError('original_requeue_conflict',409)
@@ -211,6 +220,22 @@ def _request(store,c,p,attachment_id):
         download_request={'state':'requested','until':until},next_action='get_attachment')
     if managed:result['reason']='managed_original_evicted'
     return serial(result)
+
+
+def wake_backoff(c,row,result,attachment_id):
+    """Make a queued job due now for an open request window; no attempt is spent (ANYM-699).
+
+    The gateway role cannot write next_due: schema 66 offers wake_media_job. Before that migration (or without the
+    grant) the call is skipped and the job keeps waiting, which is the behaviour of the previous release.
+    """
+    try:
+        with c.transaction():
+            due=c.execute('SELECT public.wake_media_job(%s) AS due',(attachment_id,)).fetchone()['due']
+    except (psycopg.errors.UndefinedFunction,psycopg.errors.InsufficientPrivilege):
+        return
+    if due is not None:
+        row['next_due']=due
+        if 'next_due' in result:result['next_due']=due
 
 
 def cold_request(c,p,attachment_id,row,result):
@@ -225,7 +250,7 @@ def cold_request(c,p,attachment_id,row,result):
         AND restore_requested_at>clock_timestamp()-make_interval(secs=>%s)""",(COLD_RESTORE_STALL_SECONDS,)).fetchone()['total']
     if outstanding>=GLOBAL_LIMIT:raise APIError('media_request_limit',429)
     provider=(row['job_state']=='ready' and row['collection_enabled'] and row['provider_chat_id'] not in row['exclude_chats'] and
-        (row['discover_chats'] or row['provider_chat_id'] in row['include_chats']) and row['attempts']<5 and not c.execute(
+        (row['discover_chats'] or row['provider_chat_id'] in row['include_chats']) and row['attempts']<MEDIA_MAX_ATTEMPTS and not c.execute(
         "SELECT %s::timestamptz>=clock_timestamp()+interval '1 hour' AS deferred",(row['next_due'],)).fetchone()['deferred'])
     if provider:
         # The fallback is provider demand: it is admitted against the same quotas now.

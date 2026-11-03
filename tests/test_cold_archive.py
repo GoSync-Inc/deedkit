@@ -14,6 +14,7 @@ import sys
 
 import pytest
 
+from messaging_service.media_retry import MEDIA_MAX_ATTEMPTS
 from test_archive import archive as archive  # noqa: F401  (fixture)
 from test_file_lifecycle import processed, stored
 
@@ -812,7 +813,7 @@ def test_reserved_fallbacks_count_against_provider_quotas(env,archive,monkeypatc
 # spec: ANYM-350
 def test_refused_provider_and_disproved_copy_answer_without_a_provider_source(env,archive):
     ar,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive)
-    with s.pool.connection() as c:c.execute('UPDATE media_jobs SET attempts=5 WHERE id=%s',(fid,))
+    with s.pool.connection() as c:c.execute('UPDATE media_jobs SET attempts=%s WHERE id=%s',(MEDIA_MAX_ATTEMPTS,fid))
     queued=s.request_file_download(key,fid)
     # The owner's own copy is restored even when provider rules refuse a download.
     assert queued['rehydration_source']=='cold_archive' and queued['requested_until'] is None
