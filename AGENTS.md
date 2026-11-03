@@ -94,13 +94,12 @@ Every Astra task starts with DeedKit's copy of the four questions (harness `proc
   1. Failure isolation: can an exception, timeout or bad input in the new code break or silence an
      existing path (call audio, sends, collectors, queue, backup)? Name the line.
   2. Data egress vs PR claims: what data leaves the process (model APIs, logs, telemetry, third
-     parties, files), and does it match what the PR description and spec say? Anything unlisted is
-     a finding.
+     parties, files), and does it match the PR description and spec? Anything unlisted is a
+     finding.
   3. Deployed-version compatibility: does it work against what is deployed now (other services at
      the current prod SHA, schema N-1, the host `production.py`, the installed gateway)? Name the
      breaking consumer.
-  4. Tests: do the new tests fail on the base commit, and do they assert the spec
-     criterion?
+  4. Tests: do new tests fail on the base commit and assert the spec criterion?
 
 ## 6. Working with the orchestrator
 
