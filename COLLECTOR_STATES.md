@@ -153,6 +153,14 @@ which can carry provider bytes, is never kept. The trade-off: a provider bug
 that hits every chat now leaves the collector running with every chat failed
 and status degraded, instead of restarting it.
 
+A stored peer kind that differs from the kind the dialog reports for the same
+chat id (`collector_chats.peer_kind`, ANYM-102) fails only that chat, with reason
+`peer_kind_conflict` in `history.chat_errors` and `last_error_code`
+`provider_unavailable`; the pass and live capture go on. Discovery does not
+rewrite the stored kind: Telegram gives a basic group and the supergroup it
+becomes different ids (`-N` and `-100N`), so one chat id never legitimately
+changes kind, and a rewrite would hide an id mix-up instead of surfacing it.
+
 Connection failures survive Node exits through a private fsynced side-channel
 file. No unsolicited stdout frame can interleave with a page/media RPC. Raw
 exception text, QR contents, credentials, media keys and paths are not exposed.

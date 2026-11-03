@@ -89,7 +89,13 @@ MAX_REJECTED_MESSAGES=20
 # Per-chat history scan errors (ANYM-293): an unavailable peer, a rate limit, a transient server
 # error after its retries, or any other provider error of that chat. The last two are stored as
 # provider_unavailable, which every deployed reader knows; history.chat_errors keeps the exact one.
-CHAT_SCAN_ERRORS=('provider_unavailable','rate_limited','provider_temporarily_unavailable','provider_chat_error')
+CHAT_SCAN_ERRORS=('provider_unavailable','rate_limited','provider_temporarily_unavailable','provider_chat_error',
+    'peer_kind_conflict')
+
+
+class PeerKindConflict(RuntimeError):
+    """The stored peer kind of a chat differs from the kind the provider reports for the same chat id."""
+    def __init__(self): super().__init__('peer_kind_conflict')
 MAX_CHAT_ERRORS=20
 
 
@@ -393,7 +399,7 @@ class CollectorState:
                 ON CONFLICT DO NOTHING''',(self.account,provider_chat,peer_kind))
             row=c.execute('SELECT * FROM collector_chats WHERE account=%s AND provider_chat=%s',
                           (self.account,provider_chat)).fetchone()
-            if row['peer_kind']!=peer_kind: raise RuntimeError('peer_kind_conflict')
+            if row['peer_kind']!=peer_kind: raise PeerKindConflict()
             return row
 
     def inventory(self,dialogs,history_since,*,discovery=False):

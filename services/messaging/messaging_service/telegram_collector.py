@@ -23,7 +23,7 @@ from .adapters import telegram_message
 from .archive import Archive
 from .blobs import BlobWriter
 from .envelope import stable_id
-from .collector_state import LIVE_REJECT_CODES,CaptureSpool,CollectorState,session_lock
+from .collector_state import LIVE_REJECT_CODES,CaptureSpool,CollectorState,PeerKindConflict,session_lock
 from .spool import InvalidCapture
 from .collector_common import DbBackoff,commit_items,validate_common,validate_ranges
 from .store import Store
@@ -744,8 +744,10 @@ class TelegramCollector:
             except FloodWaitError:
                 await asyncio.to_thread(self.state.failed,chat,'rate_limited')
                 raise
-            except ChatPageFailed as failure:
-                # One chat's provider error marks only that chat; the pass goes on (ANYM-293).
+            except (ChatPageFailed,PeerKindConflict) as failure:
+                # One chat's provider error marks only that chat; the pass goes on (ANYM-293). A stored kind
+                # that differs from the dialog's is the same: the row never clears by itself, and it must not end the worker.
+                if isinstance(failure,PeerKindConflict):failure=ChatPageFailed('peer_kind_conflict',failure)
                 unavailable=True
                 self.chat_failed(chat,failure)
                 await asyncio.to_thread(self.state.failed,chat,failure.code,chat_error_evidence(failure.error))

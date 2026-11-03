@@ -388,6 +388,28 @@ def test_one_chat_provider_errors_fail_only_that_chat_in_history_reconcile(worke
     assert w.state.inventory(asyncio.run(w.provider.dialogs(10)), None) == ['101', '102', '103', '104', '105']
 
 
+# spec: ANYM-102
+def test_peer_kind_mismatch_fails_only_that_chat_and_the_pass_goes_on(worker, capsys):
+    w, store, _ = worker
+    w.provider = ChatErrorProvider({})
+    # Chat 102 is stored as a basic group while the dialog reports a user: the stored kind never clears.
+    w.state.chat('102', 'chat')
+    asyncio.run(w.sync_once())
+    for chat in ('101', '103', '104', '105'):
+        assert w.state.chat(chat, 'user')['initialized'] is True
+    with store.pool.connection() as c:
+        row = c.execute('SELECT peer_kind,initialized,last_error_code FROM collector_chats WHERE account=%s '
+            'AND provider_chat=%s', (w.account, '102')).fetchone()
+        health = c.execute('SELECT status,detail_code,operations FROM collector_health WHERE account=%s',
+            (w.account,)).fetchone()
+    assert (row['peer_kind'], row['initialized'], row['last_error_code']) == ('chat', False, 'provider_unavailable')
+    assert (health['status'], health['detail_code']) == ('degraded', 'configured_chat_unavailable')
+    recorded = {e['chat']: e for e in health['operations']['history']['chat_errors']}
+    assert list(recorded) == ['102'] and recorded['102']['reason_code'] == 'peer_kind_conflict'
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines() if 'telegram_chat_error' in line]
+    assert [(line['chat'], line['code']) for line in lines] == [('102', 'peer_kind_conflict')]
+
+
 def fake_reconcile(provider, failed):
     async def dialogs(limit): return [('100', 'user', 'One'), ('200', 'user', 'Two')]
     provider.dialogs = dialogs
