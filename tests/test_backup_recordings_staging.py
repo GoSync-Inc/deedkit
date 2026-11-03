@@ -498,8 +498,15 @@ def test_the_randomized_delay_of_a_timer_file_is_read_and_an_unknown_form_stops_
 # spec: ANYM-727
 def test_every_phase_is_admitted_against_the_whole_unit_bound_including_a_resumed_upload(tmp_path, age_stub, monkeypatch):
     runner, _, _ = snapshot_runner(tmp_path, age_stub, monkeypatch)
-    assert admission_bound(runner.cfg) == worst_case(runner.cfg) + 2 * backup_runner.UNIT_STOP_SECONDS
+    assert admission_bound(runner.cfg) == max(worst_case(runner.cfg), 4400) + 2 * backup_runner.UNIT_STOP_SECONDS
     runner.clock = lambda: at(14, 58)  # the delivery tail alone would end 15:20; the unit may run to 16:19
+    for phase in ('full', 'upload'):
+        with pytest.raises(Skip, match='recordings_skipped_window'):
+            runner.admit(phase)
+    # A short configured budget does not shorten what the unit allows (TimeoutStartSec is a floor).
+    runner.cfg['busy_wait_seconds'] = 0
+    assert worst_case(runner.cfg) + 2 * backup_runner.UNIT_STOP_SECONDS < 3100
+    runner.clock = lambda: at(14, 45)
     for phase in ('full', 'upload'):
         with pytest.raises(Skip, match='recordings_skipped_window'):
             runner.admit(phase)
@@ -690,12 +697,32 @@ def test_a_producer_not_verified_gone_keeps_the_plaintext_marked_until_the_recov
         runner.run()
     assert status_of(runner)['error_code'] == 'recordings_exec_unverified'
     assert list(runner.staging_root.iterdir()) != [] and runner.journal['exec_target'].startswith('/backup-staging/')
-    with pytest.raises(RuntimeError, match='recordings_exec_unverified'):
-        runner.recover_stop()
-    assert list(runner.staging_root.iterdir()) != [], 'nothing is cleaned under a live writer'
+    for _ in range(2):  # again and again: the journal that names the producer is never abandoned while it lives
+        with pytest.raises(RuntimeError, match='recordings_exec_unverified'):
+            runner.recover_stop()
+        assert runner.journal_path.exists() and list(runner.staging_root.iterdir()) != [], 'nothing is cleaned under a live writer'
     docker.processes.clear()
     runner.recover_stop()
     assert clean(runner)
+
+
+# spec: ANYM-727
+def test_a_retry_with_the_producer_still_alive_neither_cleans_staging_nor_starts_another_snapshot(tmp_path, age_stub, monkeypatch):
+    runner, docker, delivered = snapshot_runner(tmp_path, age_stub, monkeypatch)
+    docker.mode = 'timeout'
+    monkeypatch.setattr(backup_runner.os, 'kill', lambda pid, sig: None)
+    with pytest.raises(RuntimeError, match='recordings_exec_unverified'):
+        runner.run()
+    job = runner.journal['id']
+    marker = runner.staging_root / job / 'still-written'
+    marker.write_text('x')
+    docker.mode = 'ok'
+    with pytest.raises(RuntimeError, match='recordings_exec_unverified'):
+        runner.run()
+    assert marker.exists() and len(docker.execs) == 1, 'no second snapshot while the first producer lives'
+    docker.processes.clear()
+    runner.run()
+    assert len(delivered) == 1 and clean(runner)
 
 
 # spec: ANYM-727
@@ -907,6 +934,8 @@ def test_the_service_runs_the_runner_with_the_examples_directory_and_recovers_wi
         for sandbox in ('NoNewPrivileges', 'PrivateTmp', 'ProtectHome', 'ProtectSystem'):
             assert sandbox in service
         assert seconds(service['TimeoutStartSec']) >= worst_case(cfg) - RECOVERY_BUDGET
+        assert seconds(service['TimeoutStartSec']) == backup_runner.UNIT_START_SECONDS
+        assert seconds(service['TimeoutStopSec']) == backup_runner.UNIT_STOP_SECONDS
         assert seconds(service['TimeoutStopSec']) >= RECOVERY_BUDGET
 
 

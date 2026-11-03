@@ -63,6 +63,7 @@ RECOVERY_BUDGET=120
 # Admission also counts the unit's own stop budgets (TimeoutStopSec of the main process and of ExecStopPost), and refuses a
 # start while another profile's scheduled start is this recent (it may be due but waiting for its randomized delay).
 UNIT_STOP_SECONDS=180
+UNIT_START_SECONDS=4400  # TimeoutStartSec of both recordings units (a unit test keeps them equal)
 DUE_GRACE_SECONDS=120
 REAP_SECONDS=20
 CLEANUP_CODES={'staging_cleanup_failed','staging_mount_refused','recordings_exec_unverified'}
@@ -221,8 +222,9 @@ def worst_case(cfg,phase='full'):
 
 
 def admission_bound(cfg):
-    """Seconds from a start to the end of its recovery as the unit enforces them (any phase)."""
-    return worst_case(cfg,'full')+2*UNIT_STOP_SECONDS
+    """Seconds from a start to the end of its recovery as the unit enforces them (any phase): the unit's own time limit
+    is a floor, so a short configured budget never admits a run the unit would still let hold the lock."""
+    return max(worst_case(cfg,'full'),UNIT_START_SECONDS)+2*UNIT_STOP_SECONDS
 
 
 def container_path(value):
@@ -625,6 +627,8 @@ class Runner:
     def prepare(self):
         if self.journal_path.exists():
             self.load()
+            # A snapshot producer of an earlier attempt must be gone before anything is staged, cleaned or run again.
+            if self.recordings:self.reap_snapshot()
             # A job past its capture needs no plaintext: whatever a crash left in staging goes before delivery resumes.
             if self.recordings and self.journal['phase']=='upload':self.clean_staging()
             return
@@ -1146,8 +1150,10 @@ class Runner:
                 failure=exc;reaped=False
                 try:self.status('error','recordings_exec_unverified' if str(exc)=='recordings_exec_unverified' else 'backup_job_failed')
                 except Exception:pass
-        try:self.settle_job()
-        except BaseException as exc:failure=failure or exc
+        # With a producer not verified gone nothing is settled: the journal (which names it) stays for the next recovery.
+        if reaped:
+            try:self.settle_job()
+            except BaseException as exc:failure=failure or exc
         if self.recordings and reaped:
             try:self.clean_staging()
             except Exception as exc:
