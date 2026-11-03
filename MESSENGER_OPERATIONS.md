@@ -234,7 +234,8 @@ and `source_revision` for a forward source), a list element such as `user_ids/0`
 an outer argument (`chat_id`, `message_id`, `expected_revision`) or `parameters`
 for the whole object. `reason` is one of `required`, `unknown_field`, `type`, `enum`,
 `min_length`, `max_length`, `pattern`, `minimum`, `maximum`, `min_items`,
-`max_items`, `unique`, `format`, `blank`, `size`. `expected` is a reviewed hint and
+`max_items`, `unique`, `format`, `blank`, `size`, `expected_message_unknown` (a guarded send's unknown
+expected message ID, SENDING.md). `expected` is a reviewed hint and
 `allowed` lists values from the catalog. String limits count UTF-16 code units, so
 most emoji count as 2. There is one entry per field, in schema
 order, at most 20. A submitted value is never returned; an unknown parameter is

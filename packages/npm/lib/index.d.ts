@@ -53,6 +53,11 @@ export interface MessageActionFields {
   preview_digest?: string;
   /** Bounded receipt wait, 0–25 seconds. Zero is omitted for older servers. */
   wait_s?: number;
+  /** ANYM-736, chat_id sends only: the archive ID of the newest message you read in this chat. Newer eligible
+   * messages refuse the send as `chat_changed_since_seen` and nothing is queued. */
+  expected_last_message_id?: string;
+  /** With `expected_last_message_id`: `any_message` (default) or `outgoing_only` (only the owner's own messages count). */
+  guard?: 'any_message' | 'outgoing_only';
 }
 export interface MessengerOperationPreview {
   account: string;

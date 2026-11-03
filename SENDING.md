@@ -319,6 +319,45 @@ the bytes: a `next` repeats an inline file as `REPLACE_WITH_THE_SAME_BASE64` or,
 staged, by its `upload_id`. The Python client's `messages_send` and the npm client's
 `messagesSend` take the same arguments.
 
+### Did the chat change since you read it? (`expected_last_message_id`, ANYM-736)
+
+The owner and an agent often write in one chat, so a reply prepared from an older read can repeat what
+the owner already wrote from the phone. `send_message` to an archive `chat_id` takes an optional
+precondition, like HTTP `If-Match`:
+
+- `expected_last_message_id`: the archive ID of the newest message you actually read in this chat
+  (never one taken from a preview). After your own send, pass the archive ID of that message from the receipt.
+- `guard`: `any_message` (the default when absent) counts every newer visible message, your own earlier
+  send included; `outgoing_only` counts only messages the owner wrote from any device. `guard` without
+  `expected_last_message_id` is `invalid_parameters`.
+
+If newer eligible messages reached the archive, nothing is queued and the call is refused
+`chat_changed_since_seen` (HTTP 409) with `newer_count` (at most 20, `newer_count_capped: true` beyond),
+`newer_outgoing_count`, `first_newer_message_id`, `newest_message_id` and a `next_call` for `get_context`
+with `message_id` = `first_newer_message_id`, `before_count` 0 and `after_count` 20. Read, then decide again;
+page on with the returned cursor when capped. The window shows every message, so with `outgoing_only` or
+hidden rows it can also show messages that were not counted. The body carries no message text, name or
+file name. Newer means a later `sent_at` or, on Telegram, the same `sent_at` and a larger numeric ID;
+deleted and service rows never count. On WhatsApp and at an equal `sent_at` without a numeric order the
+guard cannot see same-instant messages.
+
+An unknown ID (also one from another chat or account, or outside the key's scope), a key without `read`
+on the chat, and a `phone` or `username` recipient (no archive chat yet) all get the same
+`invalid_parameters` body with `field_errors` reason `expected_message_unknown`. If the guard's read
+fails or takes over 1 s the call is refused `chat_guard_unavailable` (HTTP 503) and nothing was queued.
+
+A retry with the same `request_id` returns the first saved result (`unknown` included) without a new
+check, even after newer messages arrived; a different payload under that ID is still `idempotency_conflict`.
+A lost response is recovered with `get_send_status`, never by repeating the guarded call. Through the
+gateway the guard needs read access to `get_context` on the account: without it the call is refused
+`send_guard_not_permitted` before any backend request.
+
+Honest scope: the guard compares the eligible messages visible in the archive when it runs. A message the
+collector has not ingested yet, an older backfilled message and an edit are not seen, and a message that
+arrives after the check and before the provider send is a race it cannot close. It does not replace the
+owner's confirmation or the duplicate rules above. Against a messaging service from before this change a
+guarded call fails closed (`invalid_parameters`, `unknown_field`).
+
 ### Is sending working? (`outbound` in `get_sync_status`)
 
 Every account row of an unscoped `get_sync_status` (Telegram and WhatsApp) carries

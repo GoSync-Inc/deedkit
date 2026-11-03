@@ -87,7 +87,12 @@ OMITTED_WHEN_NONE = {'create_subscription':('chat_ids','sources','wake_rules','r
     'configure_subscription_delivery':('delivery_policy','endpoint_id'),
     'register_delivery_endpoint':('headers',),'update_delivery_endpoint':('new_secret','headers'),
     'search_files':('media_kind','ready'),
-    'list_delivery_attempts':('before',)}
+    'list_delivery_attempts':('before',),
+    # ANYM-736: an omitted guard keeps every request, hash and stored row as before.
+    'send_message':('expected_last_message_id','guard')}
+def no_schema_default(schema):
+    """ANYM-736: an optional guard argument declares no default, so the gateway never inserts a null for it."""
+    schema.pop('default',None)
 def drop_omitted(method, arguments):
     for name in OMITTED_WHEN_NONE.get(method,()):
         if arguments.get(name) is None:arguments.pop(name,None)
@@ -431,7 +436,10 @@ def register_send_tools(mcp, call, async_call, read):
     async def send_message(ctx: Context,account: StrictStr,text: StrictStr,request_id: StrictStr,
                      chat_id: StrictStr='',phone: StrictStr='',username: StrictStr='',reply_to: StrictStr='',
                      format: MessageFormat='plain',preview_digest: StrictStr='',link_preview: StrictBool=False,
-                     allow_lossy: StrictBool=False, wait_s: WaitSeconds=0) -> dict[str,Any]:
+                     allow_lossy: StrictBool=False, wait_s: WaitSeconds=0,
+                     expected_last_message_id: Annotated[StrictStr | None,Field(json_schema_extra=no_schema_default)]=None,
+                     guard: Annotated[Literal['any_message','outgoing_only'] | None,
+                                      Field(json_schema_extra=no_schema_default)]=None) -> dict[str,Any]:
         """Send exact confirmed content using this account's existing collector.
 
         For rich formatting or nondefault policies, call preview_message first and
@@ -457,11 +465,24 @@ def register_send_tools(mcp, call, async_call, read):
         with no chat: preview_message with username, then send_message with the same username
         and that preview_digest; the send resolves the username again and refuses a different
         person (identity_changed), then returns chat_id, chat_existed, user_id and name.
+        Optional guard for a chat_id send (needs read on the chat): expected_last_message_id is the archive ID
+        of the newest message you actually read in this chat (never an ID from a preview). If newer eligible
+        messages reached the archive since, nothing is queued and the call is refused chat_changed_since_seen
+        (409) with newer_count, newer_outgoing_count, first_newer_message_id, newest_message_id and a next_call
+        that reads them: read, then decide again. guard any_message (default) counts every newer visible
+        message, including your own earlier send (after a send pass its archive ID); outgoing_only counts only
+        messages the owner wrote from any device. A retry with the same request_id returns the first result,
+        never a new check. The guard sees only what the archive holds at that moment: a message not yet ingested,
+        an older backfilled message and an edit are not seen, and one arriving after the check and before the
+        provider send is a race it cannot close. It does not replace the owner's confirmation or the duplicate
+        rules. An unknown ID, or a phone or username recipient, is invalid_parameters expected_message_unknown;
+        chat_guard_unavailable (503) queued nothing.
         """
+        guarded={k:v for k,v in (('expected_last_message_id',expected_last_message_id),('guard',guard)) if v is not None}
         return await async_call(ctx,'send_message',account=account,chat_id=chat_id,phone=phone,username=username,
             text=text,
             request_id=request_id,reply_to=reply_to,format=format,preview_digest=preview_digest,
-            link_preview=link_preview,allow_lossy=allow_lossy,wait_s=wait_s)
+            link_preview=link_preview,allow_lossy=allow_lossy,wait_s=wait_s,**guarded)
 
     @mcp.tool(structured_output=True, annotations=ToolAnnotations(readOnlyHint=False,
         destructiveHint=True,idempotentHint=True,openWorldHint=True))
@@ -1304,6 +1325,12 @@ def create_app(store: Store, allowed_hosts: list[str]):
             else:
                 phone=phone_send.recipient(arguments.get('chat_id',''),arguments.pop('phone',''))
                 if phone is not None:arguments.pop('chat_id',None);arguments['phone']=phone
+        if method == 'send_message' and (phone is not None or username is not None) and (
+                'expected_last_message_id' in arguments or 'guard' in arguments):
+            # ANYM-736: no archive chat yet, so nothing to compare; the same body as an unknown ID.
+            from .send_guard import unknown, validate
+            validate(arguments.get('expected_last_message_id'),arguments.get('guard'))
+            raise unknown()
         if method == 'messages_send':
             # ANYM-546: messages_send previews, admits and advances in short transactions, waiting between them.
             from .send_intent import send

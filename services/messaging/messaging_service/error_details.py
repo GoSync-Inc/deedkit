@@ -20,7 +20,8 @@ EXPECTED={'invalid_utc_date':'ISO 8601 date-time with an offset, for example 202
 
 def payload(error,operation='',request_id=None):
     code=classified(error)
-    retry=code in ('query_timeout','service_busy','service_unavailable','temporarily_unavailable')
+    # chat_guard_unavailable (ANYM-736) queued nothing, so repeating the same call is safe.
+    retry=code in ('query_timeout','service_busy','service_unavailable','temporarily_unavailable','chat_guard_unavailable')
     info={'error':code,'request_id':request_id or uuid4().hex,'retryable':retry}
     if hasattr(error,'fields'):info['fields']=error.fields
     if hasattr(error,'field_errors'):info['field_errors']=error.field_errors
@@ -45,6 +46,9 @@ def payload(error,operation='',request_id=None):
         if hasattr(error,name):info[name]=getattr(error,name)
     # ANYM-546: preview_stale's changed fields, fresh preview and its new confirm_token (the caller's own send).
     for name in ('changed','preview','confirm_token'):
+        if hasattr(error,name):info[name]=getattr(error,name)
+    # ANYM-736: a refused guarded send; counts and archive IDs the key may read, never message text or names.
+    for name in ('newer_count','newer_count_capped','newer_outgoing_count','first_newer_message_id','newest_message_id'):
         if hasattr(error,name):info[name]=getattr(error,name)
     if retry:info['retry_after_seconds']=2
     if code in EXPECTED:info['expected']=EXPECTED[code]

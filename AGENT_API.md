@@ -32,6 +32,10 @@ Rulebook v1 adds:
   continuation exists only on a candidate. `validate_error(value, read_only=...)` rejects a violating error; each story's
   tests run it.
 
+A guarded `send_message` refusal (`chat_changed_since_seen`, ANYM-736) carries only counts and archive IDs
+(`newer_count`, `newer_count_capped`, `newer_outgoing_count`, `first_newer_message_id`, `newest_message_id`)
+and a reference-only `next_call`; see SENDING.md.
+
 `hint`, `next` and candidates never carry message text, file names or phone numbers taken from a request or a backend
 error; the ANYM-295 privacy allowlist is unchanged.
 

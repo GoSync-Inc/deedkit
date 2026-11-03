@@ -467,8 +467,10 @@ def outbound_status(c,accounts):
 
 
 def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
-            preview_digest='',link_preview=False,allow_lossy=False,phone_hash=None,child=False):
-    """phone_hash: a phone send (ANYM-532) whose digest the caller checked; it is the request hash.
+            preview_digest='',link_preview=False,allow_lossy=False,phone_hash=None,child=False,
+            expected_last_message_id=None,guard=None):
+    """expected_last_message_id, guard (ANYM-736): the optional chat-head precondition, send_guard.py.
+    phone_hash: a phone send (ANYM-532) whose digest the caller checked; it is the request hash.
     child: a messages_send step (ANYM-546) under its child key; only such a call may use the child prefix."""
     def refused(error,resolved=False):
         # ANYM-646: a caller's own send names the preview call; a phone step or a messages_send child keeps its body.
@@ -491,7 +493,17 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
     if not isinstance(request_id,str) or not re.fullmatch(r'[a-zA-Z0-9_.:-]{8,128}',request_id) or (
             request_id.startswith(CHILD_KEY_PREFIX)!=child):
         raise APIError('invalid_request_id')
+    guarded=expected_last_message_id is not None or guard is not None
+    if guarded:
+        from . import send_guard
+        send_guard.validate(expected_last_message_id,guard)
     chat,reply_id=target(c,p,account,chat_id,reply_to)
+    if guarded and not c.execute('SELECT 1 FROM outgoing_messages WHERE principal=%s AND request_id=%s',
+            (p['id'],request_id)).fetchone():
+        # ANYM-736: before the principal lock, so a slow guard read never delays another send; a request_id with a
+        # saved row skips it and returns the saved result below, whatever arrived since. The race between this
+        # read and the insert is the guard's documented limit.
+        send_guard.check(c,p,account,chat_id,chat['platform'],expected_last_message_id,guard)
     default_policy=format=='plain' and not link_preview and not allow_lossy
     legacy_hash=hashlib.sha256(canonical([account,chat_id,text,reply_id])).hexdigest()
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('outgoing:'+p['id'],))

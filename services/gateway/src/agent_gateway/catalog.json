@@ -2413,7 +2413,7 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Send exact confirmed content using this account's existing collector.\n\nFor rich formatting or nondefault policies, call preview_message first and\npass its matching preview_digest. Show account, recipient, visible text,\nformatting, warnings, link destinations and reply target to the owner and\nobtain explicit confirmation. Digest is not approval. Requires send permission\nand operator opt-in. plain remains the default and native WhatsApp delimiters\ncan still be interpreted by WhatsApp.\nchat_id/reply_to are archive IDs; account must be explicit. request_id is a\nunique 8–128 character key for this approved action; reuse it after network\nfailure with the SAME payload. queued is not sent. Poll get_send_status.\nsent means provider accepted, not recipient read/delivered; a sent result adds\nmessenger_reports (receipt levels this chat can report) and receipt_state. unknown must be\nchecked against history before any newly approved send. Text only, provider\npayload at most 4000 UTF-16 units; source at most 16000 units subject to the\n16384-byte HTTP JSON envelope. No splitting or server human-approval gate.\nPass exactly one recipient, chat_id, phone or username. A new WhatsApp number: messages_preview_message\nwith phone, then messages_send_message with the same phone and that preview_digest; it opens\nor reuses the chat with no second lookup and returns chat_id, chat_existed and\nverified_name. status opening_chat: repeat with the same request_id. A changed\nidentity or expired digest asks for a new preview. Opening the chat without a message\nstays messages_execute_messenger_operation operation open_chat_by_phone. A Telegram @username\nwith no chat: messages_preview_message with username, then messages_send_message with the same username\nand that preview_digest; the send resolves the username again and refuses a different\nperson (identity_changed), then returns chat_id, chat_existed, user_id and name.\n",
+    "description": "Send exact confirmed content using this account's existing collector.\n\nFor rich formatting or nondefault policies, call preview_message first and\npass its matching preview_digest. Show account, recipient, visible text,\nformatting, warnings, link destinations and reply target to the owner and\nobtain explicit confirmation. Digest is not approval. Requires send permission\nand operator opt-in. plain remains the default and native WhatsApp delimiters\ncan still be interpreted by WhatsApp.\nchat_id/reply_to are archive IDs; account must be explicit. request_id is a\nunique 8–128 character key for this approved action; reuse it after network\nfailure with the SAME payload. queued is not sent. Poll get_send_status.\nsent means provider accepted, not recipient read/delivered; a sent result adds\nmessenger_reports (receipt levels this chat can report) and receipt_state. unknown must be\nchecked against history before any newly approved send. Text only, provider\npayload at most 4000 UTF-16 units; source at most 16000 units subject to the\n16384-byte HTTP JSON envelope. No splitting or server human-approval gate.\nPass exactly one recipient, chat_id, phone or username. A new WhatsApp number: messages_preview_message\nwith phone, then messages_send_message with the same phone and that preview_digest; it opens\nor reuses the chat with no second lookup and returns chat_id, chat_existed and\nverified_name. status opening_chat: repeat with the same request_id. A changed\nidentity or expired digest asks for a new preview. Opening the chat without a message\nstays messages_execute_messenger_operation operation open_chat_by_phone. A Telegram @username\nwith no chat: messages_preview_message with username, then messages_send_message with the same username\nand that preview_digest; the send resolves the username again and refuses a different\nperson (identity_changed), then returns chat_id, chat_existed, user_id and name.\nOptional guard for a chat_id send (needs read on the chat): expected_last_message_id is the archive ID\nof the newest message you actually read in this chat (never an ID from a preview). If newer eligible\nmessages reached the archive since, nothing is queued and the call is refused chat_changed_since_seen\n(409) with newer_count, newer_outgoing_count, first_newer_message_id, newest_message_id and a next_call\nthat reads them: read, then decide again. guard any_message (default) counts every newer visible\nmessage, including your own earlier send (after a send pass its archive ID); outgoing_only counts only\nmessages the owner wrote from any device. A retry with the same request_id returns the first result,\nnever a new check. The guard sees only what the archive holds at that moment: a message not yet ingested,\nan older backfilled message and an edit are not seen, and one arriving after the check and before the\nprovider send is a race it cannot close. It does not replace the owner's confirmation or the duplicate\nrules. An unknown ID, or a phone or username recipient, is invalid_parameters expected_message_unknown;\nchat_guard_unavailable (503) queued nothing.\n",
     "inputSchema": {
       "properties": {
         "account": {
@@ -2479,6 +2479,32 @@
           "minimum": 0,
           "title": "Wait S",
           "type": "number"
+        },
+        "expected_last_message_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Expected Last Message Id"
+        },
+        "guard": {
+          "anyOf": [
+            {
+              "enum": [
+                "any_message",
+                "outgoing_only"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Guard"
         }
       },
       "required": [
