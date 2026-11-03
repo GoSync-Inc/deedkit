@@ -301,13 +301,16 @@ def test_the_one_generated_hook_composes_both_families_and_inference_alone_stays
     assert 'ensure ip6tables PREROUTING -i dk-recordings0 -j DROP || ' in body
     assert 'record true ok' in composed and 'record false "$REC_FAIL"' in composed and composed.rstrip().endswith('exit 0')
     # The recordings half is a bounded child with its own aggregate budget, so it cannot take the inference half's share
-    # of the hook's 60 s: at most 15 s (default 12) plus the 2 s kill grace.
-    assert 'timeout -k 2 "$RBUDGET" sh "$0" recordings' in composed and 'RBUDGET=${DEEDKIT_RECORDINGS_TIMEOUT:-12}' in composed
-    assert '"$RBUDGET" -le 15' in composed and 'REC_FAIL=hook_recordings_$?' in composed
+    # of the hook's 60 s: at most 10 s (default 8) plus the 2 s kill grace. Nested commands live in their own process groups,
+    # so the child gets the budget as its per-command limit and no pipe of the caller: the result is its exit status.
+    assert 'DEEDKIT_STEP_TIMEOUT=$RBUDGET timeout -k 2 "$RBUDGET" sh "$0" recordings </dev/null >/dev/null 2>&1' in composed
+    assert 'RBUDGET=${DEEDKIT_RECORDINGS_TIMEOUT:-8}' in composed and '"$RBUDGET" -le 10' in composed
+    assert '$(' not in composed[composed.index('RBUDGET='):composed.index('record true ok')]
+    assert '11) REC_FAIL=restore_recordings_v4' in composed and '*) REC_FAIL=hook_recordings_$?' in composed
     assert 'TOTAL=60' in composed and 'LIMIT=30' in composed
     # The inference half is the base text with only the recordings additions around it.
-    stripped = composed.replace(body, '').replace('    recordings) recordings_step; echo "$REC_FAIL" ;;\n', '')
-    stripped = re.sub(r'    RBUDGET=.*\n.*RBUDGET=12; fi\n    REC_FAIL=.*\n', '', stripped)
+    stripped = composed.replace(body, '').replace('    recordings) recordings_step; exit $? ;;\n', '')
+    stripped = re.sub(r'    RBUDGET=.*?    esac\n', '', stripped, flags=re.S)
     stripped = re.sub(r'    if \[ -n "\$REC_FAIL" \].*\n', '    record true ok\n', stripped)
     assert stripped == inference_only
 
@@ -496,6 +499,75 @@ def in_namespace(script, timeout=120):
     return subprocess.run(['sudo', '-n', 'unshare', '-n', 'sh', '-ec', script], text=True, capture_output=True, timeout=timeout)
 
 
+NET_HELPER = """import socket, sys, time
+if sys.argv[1] == 'serve':
+    server = socket.create_server(('0.0.0.0', int(sys.argv[2])))
+    server.settimeout(0.5)
+    end = time.monotonic() + 40
+    while time.monotonic() < end:
+        try:
+            conn = server.accept()[0]
+        except OSError:
+            continue
+        conn.sendall(b'ok')
+        conn.close()
+else:
+    try:
+        with socket.create_connection((sys.argv[2], int(sys.argv[3])), timeout=2) as conn:
+            sys.exit(0 if conn.recv(2) == b'ok' else 1)
+    except OSError:
+        sys.exit(1)
+"""
+TOPOLOGY = """
+modprobe br_netfilter 2>/dev/null || true
+[ -e /proc/sys/net/bridge/bridge-nf-call-iptables ] || exit 77
+sysctl -qw net.bridge.bridge-nf-call-iptables=1 || exit 77
+ip link add dk-recbackend0 type bridge && ip link set dk-recbackend0 up || exit 77
+unshare -n sleep 90 >/dev/null 2>&1 &
+GW=$!
+unshare -n sleep 90 >/dev/null 2>&1 &
+REC=$!
+sleep 0.5
+ip link add vgw type veth peer name vgw1 && ip link add vrec type veth peer name vrec1 || exit 77
+ip link set vgw1 netns $GW && ip link set vrec1 netns $REC || exit 77
+ip link set vgw master dk-recbackend0 && ip link set vgw up && ip link set vrec master dk-recbackend0 && ip link set vrec up || exit 77
+nsenter -t $GW -n sh -c 'ip addr add 10.77.0.2/24 dev vgw1 && ip link set vgw1 up && ip link set lo up' || exit 77
+nsenter -t $REC -n sh -c 'ip addr add 10.77.0.3/24 dev vrec1 && ip link set vrec1 up && ip link set lo up' || exit 77
+# Docker's own rules: DOCKER-USER first, then the inter-container accept on the bridge.
+iptables -N DOCKER-USER; iptables -P FORWARD DROP; iptables -A FORWARD -j DOCKER-USER
+iptables -A FORWARD -i dk-recbackend0 -o dk-recbackend0 -j ACCEPT
+nsenter -t $GW -n python3 HELPER serve 13240 >/dev/null 2>&1 &
+nsenter -t $REC -n python3 HELPER serve 13234 >/dev/null 2>&1 &
+sleep 1
+gw_to_rec() { nsenter -t $GW -n python3 HELPER connect 10.77.0.3 13234; }
+rec_to_gw() { nsenter -t $REC -n python3 HELPER connect 10.77.0.2 13240; }
+# The baseline proves the topology works here (both directions open); otherwise this environment cannot run the test.
+gw_to_rec && rec_to_gw || exit 77
+sh APPLY
+if gw_to_rec; then echo gateway_to_recordings=ok; else echo gateway_to_recordings=fail; fi
+if rec_to_gw; then echo recordings_to_gateway=ok; else echo recordings_to_gateway=fail; fi
+kill $GW $REC 2>/dev/null || true
+kill $(jobs -p) 2>/dev/null || true
+"""
+
+
+# spec: ANYM-712
+@needs_namespace
+@pytest.mark.skipif(shutil.which('nsenter') is None or shutil.which('ip') is None, reason='needs nsenter and ip')
+def test_on_a_real_bridge_the_gateway_reaches_recordings_and_gets_replies_but_recordings_cannot_open_a_connection_to_the_gateway(tmp_path):
+    helper, apply = tmp_path / 'net.py', tmp_path / 'apply.sh'
+    helper.write_text(NET_HELPER)
+    # The filter half of the command form: the chain, its rules and the DOCKER-USER hooks (host-bound INPUT drops and the
+    # raw table are not part of this path).
+    lines = [line for line in commands() if line.startswith('iptables ') and ' -t raw ' not in line and ' -I INPUT ' not in line]
+    apply.write_text('\n'.join(lines) + '\n')
+    result = in_namespace(TOPOLOGY.replace('HELPER', str(helper)).replace('APPLY', str(apply)), timeout=180)
+    if result.returncode == 77:
+        pytest.skip('this environment cannot build the bridge topology (br_netfilter, veth or nsenter)')
+    assert result.returncode == 0, result.stderr
+    assert 'gateway_to_recordings=ok' in result.stdout and 'recordings_to_gateway=fail' in result.stdout, (result.stdout, result.stderr)
+
+
 # spec: ANYM-712
 @needs_namespace
 def test_repeated_loads_add_each_jump_once_and_leave_docker_and_inference_raw_rules_alone(tmp_path):
@@ -529,25 +601,29 @@ def test_an_injected_failure_or_hang_keeps_the_previous_complete_recordings_chai
     wrappers, state = tmp_path / 'bin', tmp_path / 'raw-step.json'
     # The first restore (the recordings half runs first) commits nothing: its input is cut after three lines, no COMMIT.
     # The second variant hangs every restore.
-    marker = tmp_path / 'failed-once'
+    marker, counter = tmp_path / 'failed-once', tmp_path / 'calls'
     variants = {'error_first': f'#!/bin/sh\nif [ ! -e {marker} ]; then touch {marker}; head -n 3 | {real} "$@"; exit 1; fi\nexec {real} "$@"\n',
                 'hang': '#!/bin/sh\nexec sleep 60\n',
-                # Only the first restore (the recordings half) hangs, with the default 30 s per-command limit: the
-                # recordings budget (3 s here) ends it and the inference half still loads inside the hook's own bound.
-                'recordings_hang': f'#!/bin/sh\nif [ ! -e {marker} ]; then touch {marker}; exec sleep 60; fi\nexec {real} "$@"\n'}
+                # The recordings restore (the first call) hangs under the DEFAULT 30 s limit while the inference restore is slow
+                # but succeeds (2 s): the recordings budget ends the first, nothing it left behind holds the hook, and the
+                # inference half still loads.
+                'recordings_hang': (f'#!/bin/sh\nn=$(cat {counter} 2>/dev/null || echo 0); echo $((n+1)) > {counter}\n'
+                                    f'case $n in 0) exec sleep 60;; 1) sleep 2;; esac\nexec {real} "$@"\n')}
     for name, body in variants.items():
         (wrappers / name).mkdir(parents=True)
         (wrappers / name / 'iptables-restore').write_text(body)
         (wrappers / name / 'iptables-restore').chmod(0o755)
     for name in variants:
         marker.unlink(missing_ok=True)
+        counter.unlink(missing_ok=True)
         limits = 'DEEDKIT_RECORDINGS_TIMEOUT=3' if name == 'recordings_hang' else 'DEEDKIT_STEP_TIMEOUT=2'
         script = (f'DEEDKIT_RAW_STATE={state} sh {first}/after.init start; iptables-save -t raw > {tmp_path}/{name}.before; '
                   f'PATH={wrappers}/{name}:$PATH {limits} DEEDKIT_RAW_STATE={state} sh {second}/after.init start; '
                   f'echo rc=$?; iptables-save -t raw > {tmp_path}/{name}.after')
         started = time.monotonic()
         result = in_namespace(script)
-        assert time.monotonic() - started < 40, name
+        # With a 3 s recordings budget (+2 s grace) and a 2 s inference restore the whole second run ends well inside 20 s.
+        assert time.monotonic() - started < (20 if name == 'recordings_hang' else 40), name
         assert result.returncode == 0 and 'rc=0' in result.stdout, (name, result.stderr)
         before, after = (tmp_path / f'{name}.before').read_text(), (tmp_path / f'{name}.after').read_text()
         mine = lambda text: [re.sub(r'\[\d+:\d+\]', '', line) for line in text.splitlines() if CHAIN in line]
@@ -556,7 +632,8 @@ def test_an_injected_failure_or_hang_keeps_the_previous_complete_recordings_chai
         record = json.loads(state.read_text())
         assert record['ok'] is False, (name, record)
         if name == 'recordings_hang':
-            assert '100.101.102.104/32' in after and record['reason'] == 'hook_recordings_124', (record, after)
+            # The child's own command limit and the outer budget are the same value: either one ends the hang first.
+            assert '100.101.102.104/32' in after and record['reason'] in ('hook_recordings_124', 'restore_recordings_v4'), (record, after)
             continue
         if name == 'error_first':
             # The recordings failure did not skip the inference half: the new mini address is loaded, the reason recorded.

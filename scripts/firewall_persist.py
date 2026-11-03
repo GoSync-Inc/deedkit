@@ -259,22 +259,32 @@ def compose_after_init(base, step):
     """The inference after.init `base` with the recordings function `step` added (ANYM-712), or `base` when `step` is None.
 
     The recordings half runs first, as a child of the hook (`sh "$0" recordings`) under its own aggregate budget
-    (DEEDKIT_RECORDINGS_TIMEOUT, 1-15 s, default 12 s, plus a 2 s kill grace), so it can neither take the inference half's
-    share of the hook's outer 60 s nor stop it; a budget overrun or a failure is a reason (REC_FAIL) recorded in the same
-    raw-step record after the inference half has run, and the hook still exits 0. The inference text is otherwise
-    unchanged.
+    (DEEDKIT_RECORDINGS_TIMEOUT, 1-10 s, default 8 s, plus a 2 s kill grace), so it takes at most 12 s of the hook's outer
+    60 s and the inference half keeps the rest. GNU timeout puts every command in its own process group, so killing the
+    child leaves nested commands running: the child therefore gets the same value as its per-command limit
+    (DEEDKIT_STEP_TIMEOUT), its stdin, stdout and stderr are /dev/null (nothing it leaves behind can hold a pipe of the
+    caller), and its result is its exit status (11 restore, 12 and 13 the IPv4 and IPv6 hook), never captured output. An
+    overrun or a failure is a reason (REC_FAIL) recorded in the same raw-step record after the inference half has run,
+    and the hook still exits 0. The inference text is otherwise unchanged.
     """
     if step is None:
         return base
     head, tail, case = 'step() {\n', '    record true ok\n}', 'case "$1" in\n    start) step ;;\n'
     if base.count(head) != 1 or base.count(tail) != 1 or base.count(case) != 1:
         die('the inference after.init has an unexpected shape; not composing')
-    run = ('    RBUDGET=${DEEDKIT_RECORDINGS_TIMEOUT:-12}\n'
-           '    if [ "$RBUDGET" -ge 1 ] 2>/dev/null && [ "$RBUDGET" -le 15 ] 2>/dev/null; then :; else RBUDGET=12; fi\n'
-           '    REC_FAIL=$(DEEDKIT_RAW_INNER=1 timeout -k 2 "$RBUDGET" sh "$0" recordings) || REC_FAIL=hook_recordings_$?\n')
+    run = ('    RBUDGET=${DEEDKIT_RECORDINGS_TIMEOUT:-8}\n'
+           '    if [ "$RBUDGET" -ge 1 ] 2>/dev/null && [ "$RBUDGET" -le 10 ] 2>/dev/null; then :; else RBUDGET=8; fi\n'
+           '    DEEDKIT_RAW_INNER=1 DEEDKIT_STEP_TIMEOUT=$RBUDGET timeout -k 2 "$RBUDGET" sh "$0" recordings </dev/null >/dev/null 2>&1\n'
+           '    case $? in\n'
+           '        0) REC_FAIL= ;;\n'
+           '        11) REC_FAIL=restore_recordings_v4 ;;\n'
+           '        12) REC_FAIL=hook_recordings_v4 ;;\n'
+           '        13) REC_FAIL=hook_recordings_v6 ;;\n'
+           '        *) REC_FAIL=hook_recordings_$? ;;\n'
+           '    esac\n')
     done = '    if [ -n "$REC_FAIL" ]; then log "failed: $REC_FAIL"; record false "$REC_FAIL"; else record true ok; fi\n}'
     return (base.replace(head, step + head + run).replace(tail, done)
-            .replace(case, case + '    recordings) recordings_step; echo "$REC_FAIL" ;;\n'))
+            .replace(case, case + '    recordings) recordings_step; exit $? ;;\n'))
 
 
 def compare(expected, actual, label, address=None):

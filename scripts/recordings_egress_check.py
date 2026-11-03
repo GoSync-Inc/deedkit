@@ -97,10 +97,10 @@ def persist():
 
 
 # The recordings half of the generated /etc/ufw/after.init. It is a function the inference step calls first (see
-# firewall_persist.compose_after_init): its failure is recorded in the same raw-step record, never stops the inference
-# half and never the hook. Heredoc lines start at column 0 on purpose.
+# firewall_persist.compose_after_init) as a bounded child: its exit status (0, 11 restore, 12 and 13 the IPv4 and IPv6
+# hook) is recorded in the same raw-step record, and it never stops the inference half or the hook. Heredoc lines start at column 0 on purpose.
 STEP = r"""recordings_step() {
-    timeout -k 2 "$LIMIT" iptables-restore --noflush -T raw <<'DEEDKIT_REC_V4' || { REC_FAIL=restore_recordings_v4; return 1; }
+    timeout -k 2 "$LIMIT" iptables-restore --noflush -T raw <<'DEEDKIT_REC_V4' || return 11
 @RAW@
 DEEDKIT_REC_V4
 @ENSURE@
@@ -108,14 +108,14 @@ DEEDKIT_REC_V4
 }
 """
 # The failure marker `extract_hook` reads the recordings hook lines by.
-HOOK_FAIL = r'\{ REC_FAIL='
+HOOK_FAIL = r'return 1[23]'
 
 
 def step_text(tables):
     """The recordings function of the generated hook, from the canonical tables."""
     raw = ['*raw', f':{CHAIN} - [0:0]', *tables['raw']['chain'], 'COMMIT']
-    ensure = [f'    ensure {binary} {hook.removeprefix("-A ")} || {{ REC_FAIL=hook_recordings_{family}; return 1; }}'
-              for binary, family, table in (('iptables', 'v4', 'raw'), ('ip6tables', 'v6', 'raw6'))
+    ensure = [f'    ensure {binary} {hook.removeprefix("-A ")} || return {code}'
+              for binary, code, table in (('iptables', 12, 'raw'), ('ip6tables', 13, 'raw6'))
               for hook in tables[table]['hooks']]
     return STEP.replace('@RAW@', '\n'.join(raw)).replace('@ENSURE@', '\n'.join(ensure))
 

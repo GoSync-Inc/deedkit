@@ -1777,8 +1777,10 @@ use the host's inherited resolvers from the host namespace, outside them. Read-b
 container and a query to any other resolver (`check --blocked-dns IP`) gets no answer.
 
 **Boot budget.** The recordings half of `after.init` runs first as a child under its own aggregate bound
-(`DEEDKIT_RECORDINGS_TIMEOUT`, 1-15 s, default 12 s, plus a 2 s kill grace), so it cannot use the inference half's share of the
-hook's 60 s; an overrun records `hook_recordings_124`, a restore or hook failure `restore_recordings_v4` or
+(`DEEDKIT_RECORDINGS_TIMEOUT`, 1-10 s, default 8 s, plus a 2 s kill grace; at most 12 s of the hook's 60 s, the rest stays
+the inference half's). GNU `timeout` puts each command in its own process group, so the child gets the same value as its
+per-command limit and `/dev/null` for stdin, stdout and stderr, and reports by exit status (11 restore, 12 and 13 the hook),
+never by captured output; an overrun records `hook_recordings_124` (or `restore_recordings_v4` when the command's own limit, the same value, ends first), a restore or hook failure `restore_recordings_v4` or
 `hook_recordings_v4|v6`, in the same raw-step record, after the inference half has loaded. The hook still exits 0.
 
 **Egress admission.** The overlay sets `RECORDINGS_EGRESS_ADMISSION=required` and requires `RECORDINGS_EGRESS_BLOCKED` and
