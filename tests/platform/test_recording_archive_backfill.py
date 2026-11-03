@@ -48,7 +48,7 @@ class Omi:
     def __init__(self, count=0, created=None):
         self.items, self.now, self.calls = [], float(T0), []
         self.windows, self.peak, self.limited = {}, {}, {}
-        self.truncated, self.hide_overview, self.no_headers = 0, False, False
+        self.truncated, self.hide_overview, self.no_headers, self.on_list = 0, False, False, None
         for n in range(count):
             self.add(f'c{n:05d}', (created if created is not None else T0 - 86400 * 30) - n * 60)
 
@@ -91,6 +91,8 @@ class Omi:
             ident = request.url.path.rsplit('/', 1)[-1]
             item = next((i for i in self.items if i['id'] == ident), None)
             return httpx.Response(200, json=self.view(item, True)) if item else httpx.Response(404)
+        if self.on_list:
+            self.on_list()
         params = request.url.params
         size, cursor = int(params['limit']), params.get('cursor')
         assert 1 <= size <= 200 and params.get('include_transcript') == 'false' and params.get('offset') == '0'
@@ -147,7 +149,7 @@ PRAGMA user_version=2;
 '''
 
 
-def seed_v2(doc):
+def seed_v2(doc, ns='a' * 32):
     directory = Path(doc['archive']['directory'])
     directory.mkdir(mode=0o700)
     (directory / '.lock').touch(mode=0o600)
@@ -155,14 +157,14 @@ def seed_v2(doc):
     database.touch(mode=0o600)
     with sqlite3.connect(database) as db:
         db.executescript(OLD_V2)
-        db.execute('INSERT INTO accounts(namespace,checkpoint) VALUES(?,?)', ('a' * 32, '"old-cursor"'))
+        db.execute('INSERT INTO accounts(namespace,checkpoint) VALUES(?,?)', (ns, '"old-cursor"'))
         for n in range(3):
             db.execute('INSERT INTO records VALUES(?,?,?,?,?,?,?,?,?)',
-                       (f'{n:032x}', 'a' * 32, f'old-{n}', '{"id":"old-%d","title":"Old %d"}' % (n, n),
+                       (f'{n:032x}', ns, f'old-{n}', '{"id":"old-%d","title":"Old %d"}' % (n, n),
                         '{"transcript":{"state":"available","text":"old words %d","digest":"d%d"}}' % (n, n), 1, 50.0, 3650.0, 0))
-            db.execute('INSERT INTO texts VALUES(?,?,?,?,?)', (f'{n:032x}', 'a' * 32, f'Old {n}', f'old words {n}', ''))
+            db.execute('INSERT INTO texts VALUES(?,?,?,?,?)', (f'{n:032x}', ns, f'Old {n}', f'old words {n}', ''))
             db.execute('INSERT INTO events(event_id,namespace,ref,revision,occurred) VALUES(?,?,?,?,?)',
-                       (f'e{n}', 'a' * 32, f'{n:032x}', 1, 50.0))
+                       (f'e{n}', ns, f'{n:032x}', 1, 50.0))
         db.commit()
 
 
@@ -294,6 +296,7 @@ def test_a_foreground_read_cannot_erase_the_evidence_of_a_clock_that_stepped_bac
     async def run():
         r = runtime(path, omi); await r.start(background=False)
         credential = hashlib.sha256(b'tokenaaaa').hexdigest()
+        assert await r.reserve(credential, [('reads', 45)], T0) is True
         assert await r.reserve(credential, [('reads', 45)], T0 + 500) is True
         await r.count('tokenaaaa', False, now=T0 + 200)
         with pytest.raises(Failure, match='ledger_uncertain'):
@@ -713,6 +716,8 @@ def test_summary_arriving_48_hours_after_creation_is_picked_up_within_the_daily_
         assert found_at is not None and T0 + 48 * 3600 < found_at <= T0 + 48 * 3600 + 24 * 3600 + 3600
         details = [c[0] for c in omi.of('tokenaaaa', 'detail')]
         assert min(b - a for a, b in zip(details, details[1:])) >= 3 * 3600
+        after_day_one = [t for t in details if t >= T0 + 25 * 3600]
+        assert after_day_one and all(b - a >= 24 * 3600 for a, b in zip(after_day_one, after_day_one[1:]))
         first_day = [t for t in details if t < T0 + 24 * 3600]
         assert len(first_day) <= 9 and len([t for t in details if T0 + 24 * 3600 <= t < T0 + 48 * 3600]) <= 2
         await r.close()
@@ -765,6 +770,47 @@ def test_status_reports_progress_capacity_and_budget_without_any_content(tmp_pat
         small = r.store.settings.model_copy(update={'max_bytes': 20_000})
         r.store.settings = small
         assert (await r.status(account, now=T0 + 7200))['capacity_warning'] is True
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-724
+def test_a_slow_earlier_call_in_the_pass_moves_the_reservation_and_the_429_expiry_to_the_real_time(tmp_path, monkeypatch):
+    path, doc = build(tmp_path, omi_budget={'transcript_per_hour': 1}); omi = Omi(2, created=T0 - 86400 * 2)
+    clock = [0.0]
+    monkeypatch.setattr('deedkit_recordings.archive.monotonic', lambda: clock[0])
+    omi.on_list = lambda: clock.__setitem__(0, clock[0] + 120)  # the list call (like a slow PLAUD pass) takes 120 s
+    omi.limited[('tokenaaaa', 'detail')] = (T0 + 10 ** 6, '1800')
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        omi.now = T0
+        await r.run_once(now=T0)
+        assert sql(doc, "SELECT window_start FROM ledger WHERE bucket='transcripts'") == [(T0 + 120,)]
+        assert sql(doc, 'SELECT throttled_until FROM accounts') == [(T0 + 120 + 1800,)]
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-724
+def test_text_saved_before_an_upgrade_is_counted_once_so_the_projection_sees_it(tmp_path):
+    path, doc = build(tmp_path); omi = Omi(0)
+    account = {'provider': 'omi', 'id': 'omi-a', 'archive_namespace': 'a' * 32}
+    ns = namespace(account)
+    seed_v2(doc, ns)
+    with sqlite3.connect(Path(doc['archive']['directory']) / 'archive.sqlite') as db:
+        for n in range(3):
+            db.execute('INSERT INTO records VALUES(?,?,?,?,?,?,?,?,?)',
+                       (f'b{n:031x}', ns, f'big-{n}', '{"id":"big-%d"}' % n,
+                        '{"transcript":{"state":"available","text":"%s","digest":"x"}}' % ('w' * 20000), 1, 50.0, 3650.0, 0))
+        for n in range(700):
+            db.execute('INSERT INTO records VALUES(?,?,?,?,?,?,?,?,?)',
+                       (f'c{n:031x}', ns, f'queued-{n}', '{"id":"q%d","title":"%s"}' % (n, 'T' * 450), '{}', 0, None, 0.0, 0))
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        await r.run_once(now=T0)
+        status = await r.status(account, now=T0 + 10)
+        assert status['with_text'] == 6 and status['traversal']['discovered_total'] == 706
+        assert status['projected_db_bytes'] > 15_000_000
         await r.close()
     asyncio.run(run())
 

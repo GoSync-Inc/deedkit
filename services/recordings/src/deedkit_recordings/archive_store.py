@@ -40,7 +40,7 @@ CREATE VIRTUAL TABLE texts USING fts5(ref UNINDEXED, namespace UNINDEXED, title,
 CREATE TABLE ledger(credential TEXT NOT NULL, bucket TEXT NOT NULL, window_start REAL NOT NULL, count INTEGER NOT NULL,
  updated REAL NOT NULL, PRIMARY KEY(credential, bucket, window_start));
 CREATE TABLE meta(key TEXT PRIMARY KEY, value);  -- key/value rows: the backup tooling reads archive_id and incarnation (ANYM-714)
-INSERT INTO meta(key,value) VALUES('archive_id','{archive}'),('incarnation',1),('journal_id','{journal}');
+INSERT INTO meta(key,value) VALUES('archive_id','{archive}'),('incarnation',1),('journal_id','{journal}'),('text_reconciled',1);
 PRAGMA application_id=1145786947;
 PRAGMA user_version=3;
 COMMIT;
@@ -294,6 +294,13 @@ class Store:
             db.execute('INSERT OR IGNORE INTO accounts(namespace) VALUES(?)', (ns,))
             db.execute('UPDATE accounts SET credential=?,started_at=COALESCE(started_at,?) WHERE namespace=?',
                        (credential, now, ns))
+            if db.execute("SELECT 1 FROM meta WHERE key='text_reconciled'").fetchone() is None:
+                # An archive upgraded from schema 2: count the text it already holds once (account counters only; no
+                # record is rewritten), so the capacity projection sees accepted text saved before the upgrade.
+                db.execute("UPDATE accounts SET text_bytes=(SELECT COALESCE(SUM(length(CAST(json_extract(parts,'$.transcript.text') AS BLOB))"
+                           "+length(CAST(json_extract(parts,'$.summary.text') AS BLOB))),0) FROM records "
+                           "WHERE records.namespace=accounts.namespace)")
+                db.execute("INSERT INTO meta(key,value) VALUES('text_reconciled',1)")
             row = db.execute('SELECT * FROM accounts WHERE namespace=?', (ns,)).fetchone()
             queued = db.execute('SELECT count(*) FROM records WHERE namespace=? AND attempted IS NULL', (ns,)).fetchone()[0]
             checkpoint = loads(row['checkpoint']) if row['checkpoint'] is not None else None

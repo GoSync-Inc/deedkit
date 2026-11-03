@@ -17,12 +17,18 @@ HARD = ('archive_capacity', 'archive_unavailable', 'archive_disabled', 'archive_
         'provider_auth_required', 'ledger_uncertain')
 
 
+def monotonic():
+    """One seam for the pass clock (tests move it without touching the event loop's own)."""
+    return time.monotonic()
+
+
 class ArchiveRuntime:
     def __init__(self, path, provider, remote):
         self.path, self.provider, self.remote = Path(path), provider, remote
         self.store, self.task, self.error = None, None, None
         self.collecting, self.turn, self.ledger = asyncio.Lock(), 0, asyncio.Lock()
         self.errors = {}
+        self.started = monotonic()
 
     def document(self):
         return read_document(self.path)[0]
@@ -135,6 +141,12 @@ class ArchiveRuntime:
         if discovery_error:
             raise Failure(discovery_error)
 
+    def clock(self, now):
+        """The pass's `now` moved on by the time this pass has really spent (earlier accounts, slow calls): a
+        reservation or a 429 is stamped with when it is made, not with when the pass began. Whole seconds, rounded
+        down: the ledger's drift margin covers the fraction."""
+        return now + int(monotonic() - self.started)
+
     async def reserve(self, credential, specs, now):
         """Count the collector's own provider call before it is made; False when its share of a window is spent."""
         async with self.ledger:
@@ -179,7 +191,8 @@ class ArchiveRuntime:
     async def list_page(self, account, token, credential, now, settings, *, kind, cursor, limit):
         """One cheap list call (IDs and list metadata, never a transcript); None when the budget has no slot."""
         reads = settings.omi_budget.reads_per_hour
-        if not await self.reserve(credential, [('reads', reads - HEAD_RESERVE if kind in ('first', 'history') else reads)], now):
+        if not await self.reserve(credential, [('reads', reads - HEAD_RESERVE if kind in ('first', 'history') else reads)],
+                                  self.clock(now)):
             return None
         params = {'limit': limit, 'offset': 0, 'include_transcript': 'false'}
         if cursor is not None:
@@ -240,7 +253,7 @@ class ArchiveRuntime:
         plan = await self.db('plan', account, credential, now)
         if plan['throttled_until'] is not None and plan['throttled_until'] > now:
             return  # Retry-After is honoured: no provider call, no error, no record touched
-        budget, discovery_error, started = settings.omi_budget, None, time.monotonic()
+        budget, discovery_error = settings.omi_budget, None
         try:
             try:
                 await self.discover_omi(account, token, credential, now, settings, plan)
@@ -255,7 +268,8 @@ class ArchiveRuntime:
             rotated = False
             for recording_id, fresh in items:
                 reads = budget.reads_per_hour if fresh else budget.reads_per_hour - HEAD_RESERVE
-                if not await self.reserve(credential, [('reads', reads), ('transcripts', budget.transcript_per_hour)], now):
+                if not await self.reserve(credential, [('reads', reads), ('transcripts', budget.transcript_per_hour)],
+                                          self.clock(now)):
                     break
                 if not rotated:
                     # Fairness advances with dispatched work, not with passes a spent window denied.
@@ -263,7 +277,7 @@ class ArchiveRuntime:
                     rotated = True
                 await self.observe(account, recording_id, now)
         except RateLimited as limited:
-            await self.throttle(credential, limited.retry_after_s, now + int(time.monotonic() - started))
+            await self.throttle(credential, limited.retry_after_s, self.clock(now))
             return
         if discovery_error:
             raise Failure(discovery_error)
@@ -388,6 +402,7 @@ class ArchiveRuntime:
                     self.error = None
                     return
                 now = time.time() if now is None else now
+                self.started = monotonic()
                 indexes = [(self.turn + i) % len(accounts) for i in range(min(4, len(accounts)))]
                 self.error = None
                 async with asyncio.timeout(300 if any(a.provider == 'plaud' for a in accounts) else 60):
