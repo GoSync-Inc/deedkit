@@ -186,10 +186,25 @@ def test_a_readback_cannot_be_satisfied_by_an_empty_row_a_title_or_newer_records
 
 
 # spec: ANYM-728
-def test_a_readback_finds_the_words_of_a_real_shaped_transcript_and_ignores_short_words(tmp_path):
+def test_a_readback_passes_healthy_archives_whatever_their_text_shape_or_unicode_form(tmp_path):
     lines = '\n'.join(json.dumps({'speaker': 'A', 'text': text}) for text in ('ok hi', 'planning the quarterly review'))
-    path = archive(tmp_path, [rec(1, transcript=lines), rec(2, transcript='ok hi', summary='')])
-    cont.readback(path)
+    cont.readback(archive(tmp_path, [rec(1, transcript=lines), rec(2, transcript='ok hi', summary='')], 'shaped'))
+    # A decomposed accent (a tokenizer would index "reunion") and a summary line that is not a {type, text} object.
+    cont.readback(archive(tmp_path, [rec(1, transcript='re\u0301union', summary='{"description":"quarterly planning"}')], 'unicode'))
+    # An archive without any accepted text has nothing to look up.
+    cont.readback(archive(tmp_path, [rec(1, transcript='', summary='')], 'no_text'))
+
+
+# spec: ANYM-728
+def test_a_readback_fails_for_an_emptied_index_with_a_json_summary_line(tmp_path):
+    import sqlite3
+    path = archive(tmp_path, [rec(1, transcript='', summary='{"description":"quarterly planning"}')], 'json_summary')
+    db = sqlite3.connect(path)
+    db.execute('DELETE FROM texts4')
+    db.commit()
+    db.close()
+    with pytest.raises(ValueError, match='readback_failed'):
+        cont.readback(path)
 
 
 # spec: ANYM-728
