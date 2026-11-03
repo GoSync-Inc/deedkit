@@ -222,15 +222,16 @@ def test_restore_without_acls_does_not_leave_wake_media_job_open_to_public(archi
     _,s,_,_=archive
     wake="'public.wake_media_job(text)'::regprocedure"
     role='media_ungranted_'+uuid4().hex
-    with s.pool.connection() as c:
-        c.execute('GRANT EXECUTE ON FUNCTION public.wake_media_job(text) TO PUBLIC')  # what a restore does
-        assert c.execute(f"SELECT has_function_privilege('public',{wake},'EXECUTE') AS open").fetchone()['open'] is True
-    s.migrate();s.migrate()
     try:
-        with s.pool.connection() as c:
-            assert c.execute(f"SELECT has_function_privilege('public',{wake},'EXECUTE') AS open").fetchone()['open'] is False
-            c.execute(sql.SQL('CREATE ROLE {}').format(sql.Identifier(role)))
+        with s.pool.connection() as c:c.execute(sql.SQL('CREATE ROLE {}').format(sql.Identifier(role)))
+        # The gateway role exists with its grant before the ACLs are lost and stays through both migrations.
         with gateway(s) as restricted:
+            with s.pool.connection() as c:
+                c.execute('GRANT EXECUTE ON FUNCTION public.wake_media_job(text) TO PUBLIC')  # what a restore does
+                assert c.execute(f"SELECT has_function_privilege('public',{wake},'EXECUTE') AS open").fetchone()['open'] is True
+            s.migrate();s.migrate()
+            with s.pool.connection() as c:
+                assert c.execute(f"SELECT has_function_privilege('public',{wake},'EXECUTE') AS open").fetchone()['open'] is False
             with restricted.pool.connection() as c:
                 assert c.execute(f"SELECT has_function_privilege({wake},'EXECUTE') AS ok").fetchone()['ok'] is True
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
