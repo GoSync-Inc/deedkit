@@ -9,7 +9,7 @@ import sqlite3
 from types import SimpleNamespace as NS
 
 import pytest
-from telethon import events, functions, types
+from telethon import events, functions, types, utils
 
 from messaging_service.collector_state import CaptureSpool, session_lock
 from messaging_service.telegram_collector import (
@@ -425,30 +425,34 @@ def test_live_capture_of_a_peer_kind_conflict_is_quarantined_and_other_chats_kee
 
 
 # spec: ANYM-102
-def test_discovery_repairs_only_a_chat_stored_as_basic_group_under_a_marked_channel_id(worker):
+def test_discovery_repairs_a_basic_group_row_of_a_dialog_the_provider_reports_as_channel(worker):
     w, store, _ = worker
-    for chat, kind in (('-1001', 'chat'), ('-7', 'channel'), ('300', 'chat')):
+    for chat, kind in (('201', 'chat'), ('202', 'channel'), ('203', 'chat'), ('204', 'user')):
         w.state.chat(chat, kind)
-    w.state.inventory([('-1001', 'channel', 'A', 'channel'), ('-7', 'chat', 'B', 'group'),
-                       ('300', 'channel', 'C', 'channel')], None, discovery=True)
+    # A cached replay (no discovery) never rewrites a kind; a discovery pass rewrites only chat -> channel.
+    w.state.inventory([('201', 'channel', 'A', 'channel')], None)
+    w.state.inventory([('201', 'channel', 'A', 'channel'), ('202', 'chat', 'B', 'group'),
+                       ('203', 'chat', 'C', 'group'), ('204', 'channel', 'D', 'channel')], None, discovery=True)
     with store.pool.connection() as c:
         kinds = {r['provider_chat']: r['peer_kind'] for r in c.execute(
             'SELECT provider_chat,peer_kind FROM collector_chats WHERE account=%s', (w.account,))}
-    assert kinds == {'-1001': 'channel', '-7': 'channel', '300': 'chat'}
-    assert w.state.chat('-1001', 'channel')['peer_kind'] == 'channel'
+    assert kinds == {'201': 'channel', '202': 'channel', '203': 'chat', '204': 'user'}
 
 
 # spec: ANYM-102
-def test_dialog_of_a_forbidden_channel_is_discovered_as_a_channel():
+def test_dialog_kind_comes_from_the_raw_peer_so_a_forbidden_channel_is_a_channel_and_a_100_basic_group_is_not():
     from test_chat_roles import Dialogs
     class Governor:
         async def call(self, operation, phase): return await operation()
-    # Telethon's Dialog.is_channel is False for a ChannelForbidden, whose marked id is still a channel id.
-    forbidden = NS(id=-1002, is_channel=False, is_user=False, is_group=False, name='Forbidden', entity=None, dialog=None)
+    # Telethon's Dialog.is_channel is False for a ChannelForbidden; a basic group with id 100123 is marked -100123.
+    forbidden = NS(id=utils.get_peer_id(types.PeerChannel(2)), is_channel=False, is_user=False, is_group=False,
+        name='Forbidden', entity=None, dialog=NS(peer=types.PeerChannel(2)))
+    basic = NS(id=utils.get_peer_id(types.PeerChat(100123)), is_channel=False, is_user=False, is_group=True,
+        name='Basic', entity=None, dialog=NS(peer=types.PeerChat(100123)))
     provider = TelethonProvider.__new__(TelethonProvider)
-    provider.client = NS(iter_dialogs=lambda **kwargs: Dialogs([forbidden])); provider.governor = Governor()
+    provider.client = NS(iter_dialogs=lambda **kwargs: Dialogs([forbidden, basic])); provider.governor = Governor()
     async def collect(): return [row async for batch in provider.dialog_batches(None) for row in batch]
-    assert [row[1] for row in asyncio.run(collect())] == ['channel']
+    assert [(row[0], row[1]) for row in asyncio.run(collect())] == [(str(forbidden.id), 'channel'), ('-100123', 'chat')]
 
 
 def fake_reconcile(provider, failed):

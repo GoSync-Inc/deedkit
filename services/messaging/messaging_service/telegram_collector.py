@@ -162,9 +162,14 @@ def history_bound(value):
     return result.astimezone(timezone.utc)
 
 
-def marked_channel(peer_id):
-    """A marked -100... id is a channel even where Telethon's Dialog.is_channel is False (a ChannelForbidden)."""
-    return re.fullmatch(r'-100[0-9]+',str(peer_id)) is not None
+def dialog_kind(dialog):
+    """The dialog's peer kind from its raw TL peer, which also names a ChannelForbidden.
+
+    Telethon's Dialog.is_channel is False for a ChannelForbidden; a marked-id pattern cannot tell
+    that from a basic group whose id starts with 100, so the raw peer decides."""
+    peer=getattr(getattr(dialog,'dialog',None),'peer',None)
+    if dialog.is_channel or getattr(peer,'channel_id',None) is not None:return 'channel'
+    return 'user' if dialog.is_user else 'chat'
 
 
 def peer_kind(message):
@@ -351,7 +356,7 @@ class TelethonProvider:
             except ProviderRateLimited:
                 if batch:yield batch;batch=[]
                 continue
-            kind='channel' if dialog.is_channel or marked_channel(dialog.id) else ('user' if dialog.is_user else 'chat')
+            kind=dialog_kind(dialog)
             chat_type='private' if dialog.is_user else ('group' if dialog.is_group else 'channel')
             raw=getattr(dialog,'dialog',None)
             observation={'observed_at':page_observed_at,

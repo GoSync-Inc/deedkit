@@ -426,9 +426,9 @@ class CollectorState:
                         window_complete=CASE WHEN collector_chats.history_since IS DISTINCT FROM
                             excluded.history_since THEN false ELSE collector_chats.window_complete END,
                         history_since=excluded.history_since,
-                        peer_kind=CASE WHEN collector_chats.peer_kind='chat' AND excluded.peer_kind='channel'
-                            AND excluded.provider_chat ~ '^-100[0-9]+$' THEN 'channel' ELSE collector_chats.peer_kind END''',
-                        (self.account,chat,kind,history_since))
+                        peer_kind=CASE WHEN %s AND collector_chats.peer_kind='chat' AND excluded.peer_kind='channel'
+                            THEN 'channel' ELSE collector_chats.peer_kind END''',
+                        (self.account,chat,kind,history_since,discovery))
                     c.execute('''INSERT INTO chats(id,account,title,chat_type,provider_chat) VALUES(%s,%s,%s,%s,%s)
                         ON CONFLICT(id) DO UPDATE SET
                         title=CASE WHEN excluded.title<>%s AND excluded.title<>'' THEN excluded.title ELSE chats.title END,

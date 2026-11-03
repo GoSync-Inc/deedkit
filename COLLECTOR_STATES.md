@@ -160,9 +160,10 @@ chat id (`collector_chats.peer_kind`, ANYM-102) fails only that chat, with reaso
 spool's quarantine with the same reason (bytes kept, counted in `capture_progress`),
 so other chats keep draining. Discovery does not rewrite the stored kind, with one
 exception: Telethon's `Dialog.is_channel` is false for a `ChannelForbidden`, so
-discovery now takes a marked `-100...` id as a channel, and a row stored as `chat`
-under such an id is repaired to `channel` (a basic group never has a `-100` id). Other
-mismatches stay failures: Telegram gives a basic group and the supergroup it becomes
+discovery now takes the kind from the dialog's raw TL peer (a marked id cannot tell a
+channel from a basic group whose id starts with 100), and a discovery pass repairs a row
+stored as `chat` to `channel` when the provider reports a channel; a cached replay
+never rewrites it. Other mismatches stay failures: Telegram gives a basic group and the supergroup it becomes
 different ids (`-N` and `-100N`), so one chat id never legitimately changes kind, and a
 rewrite would hide an id mix-up instead of surfacing it.
 
