@@ -24,6 +24,11 @@ END_REASONS=frozenset(('owner_stop','agent_stop','model_error','service_shutdown
     'keypress_handover_failed','provider_rejected','provider_completed','provider_failed','dial_unknown',
     'duration_limit','credentials_removed','disconnected','connection_error','media_disconnected','media_error',
     'task_completed','awaiting_owner','counterparty_hangup','completed','needs_owner','refused','unavailable'))
+# The closed cause list of provider_error (ANYM-657, README "Why an outbound call failed"); outbound.TWILIO_CAUSES values
+# plus the two catch-alls. A test keeps the three lists (this, outbound.py, SUBSCRIPTIONS.md) equal.
+PROVIDER_CAUSES=frozenset(('geo_permission_missing','invalid_destination','destination_not_reachable',
+    'destination_not_dialable','destination_unverified','source_number_invalid','destination_blocked','rate_limited',
+    'provider_auth_failed','provider_rejected_other','call_failed_other'))
 OUTCOMES=frozenset(('unresolved','needs_owner','needs_summary','followup_ready','refused','unavailable','incomplete',
     'collected_needs_review'))
 # An owner request is answerable for a day (owner decision 10-29, option A); then it is expired.
@@ -63,6 +68,27 @@ def deadline(decision):
     return (datetime.fromisoformat(decision['created_at'])+timedelta(seconds=DECISION_TTL_S)).isoformat()
 
 
+def _provider_error(v):
+    """The event's provider_cause and provider_code from the stored call's provider_error (ANYM-695), nothing else.
+
+    A cause outside the closed list, or a code that is neither null nor an integer in 1..999999, drops both keys (the
+    whole provider_error is dropped from the event); a null code only leaves the code key out. The event itself is
+    always written. The log line names the code, never a value."""
+    error=v.get('provider_error')
+    if not error: return {}
+    cause=error.get('cause') if isinstance(error,dict) else None
+    if not isinstance(cause,str) or cause not in PROVIDER_CAUSES:
+        log('provider_error_cause_dropped',ValueError('cause'))
+        return {}
+    data={'provider_cause':cause}
+    code=error.get('code')
+    if type(code) is int and 1<=code<=999999: data['provider_code']=code
+    elif code is not None:
+        log('provider_error_code_dropped',ValueError('code'))
+        return {}
+    return data
+
+
 def terminal(v):
     """(type, data) of a terminal call; end_reason decides before status (card crit 2)."""
     reason=v.get('end_reason') or ''
@@ -71,8 +97,9 @@ def terminal(v):
     if reason=='service_restart' or v['status']=='interrupted':
         return 'call.interrupted',{'call_id':v['id'],'end_reason':'service_restart'}
     token=reason if reason in END_REASONS else 'other'
-    if reason=='provider_failed' or v['status']=='failed':
-        return 'call.failed',{'call_id':v['id'],'status':v['status'],'end_reason':token}
+    # A refused dial (provider_rejected, status finished) is a failure to a subscriber too (ANYM-695).
+    if reason in ('provider_failed','provider_rejected') or v['status']=='failed':
+        return 'call.failed',{'call_id':v['id'],'status':v['status'],'end_reason':token,**_provider_error(v)}
     if v['status']!='finished':
         raise ValueError('not_terminal')
     data={'call_id':v['id'],'status':'finished','end_reason':token,

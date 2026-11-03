@@ -17,13 +17,19 @@ import psycopg.errors
 from psycopg.types.json import Jsonb
 
 from .envelope import canonical, stable_id
+from .error_codes import CODES
 from .policy import audit, effective_permissions, lock_principal, targets
 from .store import APIError, serial
 from .outgoing import finish_durably
+from .open_chat_policy import (  # noqa: F401  (the moved names stay importable from here)
+    _link_check, _join_guard, _phone_policy, _username_policy, _lookup_budget, _other_account_chat,
+    other_account_chats, _open_chat_refusal, phone_next_step, _open_chat_next, _check_saved)
 
 MAX_FILE_BYTES = 32 * 1024**2
 LIVE_SEARCH = 'search_messages_live'
 HISTORY = 'request_chat_history'
+INSPECT_BUTTONS = 'inspect_message_buttons'
+PRESS = 'press_button'
 # ANYM-475: governor waits, resolution, the provider request and the receipt together.
 LIVE_SEARCH_TIMEOUT = 15
 # Kept free inside LIVE_SEARCH_TIMEOUT for the foreground loop's pacing, so a queued send starts within it.
@@ -49,8 +55,8 @@ BLOCKED_RESULT_KEYS = frozenset(('token','access_token','refresh_token','session
 
 class CommandRejected(RuntimeError):
     """Known local rejection before invoking a provider operation."""
-    def __init__(self,code,*,retry_after=None):
-        super().__init__(code);self.retry_after=retry_after
+    def __init__(self,code,*,retry_after=None,data=None):
+        super().__init__(code);self.retry_after=retry_after;self.data=data
 
 
 def safe_result(value):
@@ -113,7 +119,7 @@ def _required_permissions(permission,operation,parameters=None):
 
 def live_read(operation,platform):
     """ANYM-475/477: an agent-requested Telegram read that answers within the live deadline or is refused."""
-    return operation==LIVE_SEARCH or operation==HISTORY and platform=='telegram'
+    return operation==LIVE_SEARCH or operation in (HISTORY,INSPECT_BUTTONS) and platform=='telegram'
 
 
 def _spec(operation,platform=None):
@@ -160,16 +166,20 @@ def _chat(c,p,account,chat_id):
     return row
 
 
-def _message(c,p,account,message_id,expected_revision,chat_id=None,field='expected_revision'):
+def _message(c,p,account,message_id,expected_revision,chat_id=None,field='expected_revision',*,revision_optional=False,
+             allow_deleted=False):
     if not isinstance(message_id,str) or not 1<=len(message_id)<=256:
         raise APIError('not_found',404)
-    if type(expected_revision) is not int or expected_revision<1:
+    # ANYM-681: a live read of the keyboard names no archive revision (0); a given one must still be current.
+    unchecked=revision_optional and expected_revision==0 and type(expected_revision) is int
+    if not unchecked and (type(expected_revision) is not int or expected_revision<1):
         raise _rejected((field,'type' if type(expected_revision) is not int else 'minimum',REVISION))
-    row=c.execute('SELECT * FROM messages WHERE id=%s AND account=%s AND NOT deleted',
+    # ANYM-666: get_message_info asks whether a message still exists, so an archive-deleted row is a valid target.
+    row=c.execute('SELECT * FROM messages WHERE id=%s AND account=%s'+('' if allow_deleted else ' AND NOT deleted'),
                   (message_id,account)).fetchone()
     if not row or (chat_id is not None and row['chat']!=chat_id) or not permitted(p,account,row['chat']):
         raise APIError('not_found',404)
-    if row['revision']!=expected_revision:raise APIError('operation_target_changed',409)
+    if not unchecked and row['revision']!=expected_revision:raise APIError('operation_target_changed',409)
     return row
 
 
@@ -222,8 +232,7 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
     if validate_parameters:
         try:parameters=validate_operation(account_row['platform'],operation,parameters,provider=provider)
         except (ValueError,TypeError,UnicodeError) as exc:
-            code=str(exc) if str(exc) in ('unsupported_operation','invalid_operation_parameters','invalid_phone',
-                                          'invalid_username') else 'invalid_operation_parameters'
+            code=str(exc) if str(exc) in CODES['operation_validation'] else 'invalid_operation_parameters'
             failure=APIError(code)
             if isinstance(exc,ParameterError):failure.field_errors=exc.field_errors
             if getattr(exc,'hint',None):failure.hint=exc.hint
@@ -256,7 +265,8 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
         chat=_chat(c,p,account,chat_id)
         payload['provider_chat']=chat['provider_chat'];refs.append(chat_id);provider_chats.append(chat['provider_chat'])
         if spec['target']=='message':
-            message=_message(c,p,account,message_id,expected_revision,chat_id)
+            message=_message(c,p,account,message_id,expected_revision,chat_id,
+                             revision_optional=operation==INSPECT_BUTTONS,allow_deleted=operation=='get_message_info')
             if operation in ('edit_message','delete_message') and message['direction']!='outgoing':
                 raise APIError('forbidden',403)
             payload['provider_message_id']=message['provider_id'];refs.append(message_id)
@@ -299,6 +309,9 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
             raise APIError('unsupported_operation')
         if provider=='whatsmeow' and (mode=='sticker' and mime!='image/webp' or
             mode in ('audio','voice','sticker') and parameters['caption']):raise APIError('unsupported_operation')
+    if operation==PRESS:
+        from . import button_press
+        payload['press']=button_press.payload(c,chat,message,parameters)
     _policy(c,account,operation,provider_chats,ready=ready,live=live_read(operation,account_row['platform']))
     if operation=='open_chat_by_phone':
         _phone_policy(c,account,parameters['phone'])
@@ -313,152 +326,6 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
     return payload,spec
 
 
-def _link_check(c,p,account,link):
-    """The chat a join may target: this key's latest successful check of the link key within 60 minutes."""
-    row=c.execute('''SELECT result FROM messenger_commands WHERE principal=%s AND key_id=%s AND account=%s
-        AND operation='check_chat_link' AND payload->'parameters'->>'link'=%s AND status='succeeded'
-        AND finished_at>clock_timestamp()-interval '60 minutes' ORDER BY finished_at DESC,created_at DESC LIMIT 1''',
-        (p['id'],p['key_id'],account,link)).fetchone()
-    data=(row['result'] or {}).get('data') if row else None
-    if not isinstance(data,dict):raise APIError('preview_required',409)
-    if data.get('membership')=='member':raise APIError('already_member',409)
-    if (data.get('membership')!='not_member' or not isinstance(data.get('title'),str) or
-        data.get('kind') not in ('group','channel')):raise APIError('preview_required',409)
-    count=data.get('member_count')
-    return {'title':data['title'],'kind':data['kind'],'member_count':count if type(count) is int else None}
-
-
-def _join_guard(c,account,link):
-    """An earlier join of this link key on the account, from any key, that may have happened blocks a new
-    one until a later check settles membership (member or not_member); no time limit ends it."""
-    if c.execute('''SELECT 1 FROM messenger_commands j WHERE j.account=%s AND j.operation='join_chat'
-        AND j.payload->'parameters'->>'link'=%s AND (j.status IN ('queued','dispatching') OR j.status='unknown'
-        AND NOT EXISTS (SELECT 1 FROM messenger_commands k WHERE k.account=j.account AND k.operation='check_chat_link'
-            AND k.payload->'parameters'->>'link'=%s AND k.status='succeeded'
-            AND k.result->'data'->>'membership' IN ('member','not_member')
-            AND k.started_at>coalesce(j.finished_at,j.started_at,j.created_at))) LIMIT 1''',
-        (account,link,link)).fetchone():
-        raise APIError('operation_result_unknown',409)
-
-
-def _phone_policy(c,account,phone):
-    """Conservative admission: the LID is unknown before the query, so it can
-    only be collected under discovery; exclusions apply to every known namespace."""
-    from .collector_state import CollectorState
-    row=c.execute('SELECT * FROM account_policies WHERE account=%s',(account,)).fetchone()
-    known=[phone+'@c.us',*(r['lid'] for r in c.execute('''SELECT DISTINCT lid FROM whatsapp_identity_observations
-        WHERE account=%s AND pn=%s LIMIT 20''',(account,phone+'@c.us')).fetchall())]
-    if not row or not row['discover_chats'] or any(not CollectorState.allows(row,chat) for chat in known):
-        raise APIError('chat_not_collected',409)
-
-
-def _username_policy(c,account):
-    """ANYM-643: the user ID is unknown before the lookup, so it can only be collected under discovery; the
-    collector and the chat step refuse a resolved ID the exclusions name."""
-    row=c.execute('SELECT discover_chats FROM account_policies WHERE account=%s',(account,)).fetchone()
-    if not row or not row['discover_chats']:raise APIError('chat_not_collected',409)
-
-
-def _lookup_budget(c,account,command,operation='open_chat_by_phone'):
-    """Whether this dispatch may query the provider (WhatsApp by phone, Telegram by username), and when the oldest counted query
-    leaves the window. A dispatched row counts until an hour after it finished
-    (a query runs between claim and finish; an unfinished row counts now), so
-    neither a queue delay, a slow store read nor a restart resets the bound.
-    Dispatch is serial per account (one fenced worker), so two principals cannot
-    both take the last slot. Local answers and bound refusals do not count."""
-    rows=c.execute('''SELECT coalesce(finished_at,clock_timestamp()) AS at FROM messenger_commands
-        WHERE account=%s AND operation=%s AND id<>%s AND started_at IS NOT NULL
-        AND coalesce(finished_at,clock_timestamp())>clock_timestamp()-interval '1 hour'
-        AND coalesce(result->'data'->>'provider_lookup','true')<>'false'
-        ORDER BY 1 DESC LIMIT %s''',(account,operation,command,LOOKUP_BUDGETS[operation])).fetchall()
-    if len(rows)<LOOKUP_BUDGETS[operation]:return True,None
-    return False,c.execute('''SELECT greatest(1,ceil(extract(epoch FROM
-        %s::timestamptz+interval '1 hour'-clock_timestamp())))::int AS s''',(rows[-1]['at'],)).fetchone()['s']
-
-
-def _other_account_chat(c,p,account,phone):
-    """ANYM-531: an archived chat of this number on another account the key reads; archive only."""
-    return next(other_account_chats(c,p,account,phone),None)
-
-
-def other_account_chats(c,p,account,phone):
-    """Archived chats of this number on the key's other accounts, by account and chat authorization;
-    archive only, never a provider call (ANYM-531, ANYM-532)."""
-    from .policy import scope_filter
-    from .whatsapp_identity import resolve_alias
-    if 'read' not in p['permissions']:return
-    for other in sorted(set(p['accounts'])-{account}):
-        where,args=scope_filter({**p,'accounts':[other]},'c',chat_column='id')
-        row=c.execute("SELECT c.id FROM chats c JOIN accounts a ON a.id=c.account WHERE a.platform='whatsapp' "
-            'AND c.provider_chat=%s AND '+where+' ORDER BY c.id LIMIT 1',[phone+'@c.us',*args]).fetchone()
-        if not row:
-            try:row=resolve_alias(c,p,other,phone+'@c.us')
-            except APIError:row=None  # Ambiguous evidence names nothing.
-        if row:yield {'account':other,'chat_id':row['id']}
-
-
-def _open_chat_refusal(c,p,account,phone,parameters):
-    """ANYM-531: why open_chat_by_phone with these parameters would be refused now, else None.
-    The admission checks of execution, as reads only; it never dispatches a lookup."""
-    if (set(_required_permissions('send','open_chat_by_phone',parameters))-set(p['permissions'])
-            or p['chat_ids'] is not None):return {'next_action':'key_cannot_open_new_chats'}
-    try:_policy(c,account,'open_chat_by_phone',ready=True)
-    except APIError as exc:
-        if exc.code=='operation_disabled':
-            return {'next_action':'ask_operator_to_enable_open_chat_by_phone','account':account}
-        return {'next_action':exc.code}
-    try:_phone_policy(c,account,phone)
-    except APIError:return {'next_action':'chat_not_collected'}
-    allowed,resets=_lookup_budget(c,account,'')
-    if not allowed:return {'next_action':'rate_limited','resets_in_seconds':resets}
-    return None
-
-
-def phone_next_step(c,p,account,reference):
-    """ANYM-531: the exact next call for a phone reference that is not found, or why there is none.
-    Archive and policy reads only: it never dispatches a lookup. Only the caller's normalized number is echoed."""
-    from .messenger_operations import phone_digits
-    from .whatsapp_capabilities import account_provider
-    if not isinstance(account,str) or account not in p['accounts']:return {}
-    row=c.execute('SELECT platform FROM accounts WHERE id=%s',(account,)).fetchone()
-    if not row:return {}
-    phone,_=phone_digits(reference.split('@',1)[0])
-    if phone is None:return {'next_action':'invalid_phone'}
-    found=_other_account_chat(c,p,account,phone)
-    if found:return {'found_on_other_account':found,'next_action':'use_existing_chat'}
-    if row['platform']!='whatsapp' or account_provider(c,account,row['platform'])!='whatsmeow':
-        return {'hint':'native_whatsapp_accounts_only','next_action':'use_username_or_existing_chat'}
-    refusal=_open_chat_refusal(c,p,account,phone,{'phone':'+'+phone,'create':False})
-    if refusal:return refusal
-    # ANYM-532: the phone preview does the lookup; its digest then sends to the number.
-    return {'next_action':'preview_message_then_send_message_with_its_digest',
-        'next_call':{'tool':'preview_message','arguments':{'account':account,'phone':'+'+phone},
-            'caller_supplies':['text'],'caller_may_supply':['format','reply_to']}}
-
-
-def _open_chat_next(row,c=None,p=None):
-    """ANYM-531: the next call after an open_chat_by_phone receipt, the shortest permitted path,
-    as (next_call, refusal); a create step that execution would refuse now gives its refusal instead."""
-    if row['operation']!='open_chat_by_phone':return None,None
-    if row['status'] in ('queued','dispatching'):
-        return {'tool':'get_messenger_operation','arguments':{'operation_id':row['id']},'caller_supplies':[]},None
-    data=(row['result'] or {}).get('data') if row['status']=='succeeded' else None
-    if not isinstance(data,dict) or data.get('on_whatsapp') is not True:return None,None
-    if isinstance(data.get('chat_id'),str):
-        if p is not None and 'read' not in p['permissions']:return None,None
-        return {'tool':'preview_message','arguments':{'account':row['account'],'chat_id':data['chat_id']},
-            'caller_supplies':['text']},None
-    if c is None or p is None:return None,None
-    phone=row['payload']['parameters']['phone'];parameters={'phone':'+'+phone,'create':True}
-    try:
-        with c.transaction():refusal=_open_chat_refusal(c,p,row['account'],phone,parameters)
-    except Exception:return None,None  # The suggestion never makes a receipt unreadable.
-    if refusal:return None,refusal
-    # A new stable request ID for this separately confirmed intent, never a replacement of an uncertain one.
-    return {'tool':'execute_messenger_operation','arguments':{'account':row['account'],'operation':'open_chat_by_phone',
-        'parameters':parameters},'caller_supplies':['request_id'],'owner_confirmation_required':True},None
-
-
 def _digest(p,payload):
     return hashlib.sha256(canonical({'principal':p['id'],'key_id':str(p['key_id']),
         'scope_version':p['scope_version'],'key_permission_version':p['key_permission_version'],
@@ -468,7 +335,13 @@ def _digest(p,payload):
 def preview(store,c,p,account,operation,chat_id='',message_id='',expected_revision=0,parameters=None):
     payload,spec=_resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,parameters,
                           verify_file=True)
-    return serial({**payload,'permission':spec['permission'],'mutation':spec['mutation'],
+    shown={}
+    if operation==PRESS:
+        # ANYM-676: earlier presses of this button that may have happened; shown to the owner, not part of the digest.
+        from . import button_press
+        pressed=payload['parameters']
+        shown['earlier_presses']=button_press.earlier_presses(c,account,message_id,pressed['row'],pressed['column'])
+    return serial({**payload,**shown,'permission':spec['permission'],'mutation':spec['mutation'],
         'required_permissions':payload['authorization_binding']['required_permissions'],
         'preview_digest':_digest(p,payload),'owner_approval_verified_by_server':False,
         'changes_provider_state':spec['mutation'],'limitation':spec.get('limitation','')})
@@ -498,6 +371,43 @@ def manifest(c,p,account):
             'owner_approval_verified_by_server':False,'automatic_retry':False}
 
 
+VERIFY={'delete_message':{'operation':'get_message_info','requires':'read-live','decides':'exists:false means deleted'},
+    'send_reaction':{'operation':'get_reactions','requires':'read-live',
+        'decides':'a reaction with chosen:true was set by this account'}}
+
+
+def _verify(row,c=None):
+    """ANYM-666: what an agent reads when a delete or reaction stayed unknown (the receipt carries no secrets)."""
+    base=VERIFY.get(row['operation'])
+    if base is None or row['status']!='unknown':return None
+    platform=c.execute('SELECT platform FROM accounts WHERE id=%s',(row['account'],)).fetchone() if c is not None else None
+    if not platform or platform['platform']!='telegram':return None  # WhatsApp keeps its receipts as they are
+    answer=row['result']
+    data=answer.get('data') if isinstance(answer,dict) else None
+    evidence=data.get('evidence') if isinstance(data,dict) else None
+    evidence=evidence if isinstance(evidence,dict) else {}
+    wanted=((row.get('payload') or {}).get('parameters') or {}).get('emoji')
+    not_applied=evidence.get('message_present') is True if row['operation']=='delete_message' else (
+        evidence.get('basis')=='provider_read_back' and isinstance(evidence.get('reaction_present'),bool)
+        and evidence['reaction_present']==(not wanted))
+    if not_applied:
+        # The read-back answered: the request did not take effect. Another check will not change that.
+        return {'next_step':'new_request','decides':'The provider read after the request shows it has not taken effect. '
+            'Another check will not change this: a new request needs a new request ID and the owner\'s confirmation.'}
+    verify=dict(base)
+    if type(evidence.get('retry_after_s')) is int:verify['retry_after_s']=evidence['retry_after_s']
+    return verify
+
+
+def contact_accounts(c,p):
+    """ANYM-673: the Telegram accounts where this key may run list_contacts now, read from its own grants (never widened)."""
+    if p['chat_ids'] is not None or 'contacts-read' not in p['permissions'] or not p['accounts']:return []
+    rows=c.execute("""SELECT a.id FROM accounts a JOIN account_policies ap ON ap.account=a.id
+        WHERE a.id=ANY(%s) AND a.platform='telegram' AND ap.enabled AND 'list_contacts'=ANY(ap.operations_enabled)
+        ORDER BY a.id""",(list(p['accounts']),)).fetchall()
+    return [row['id'] for row in rows]
+
+
 def _public(row,c=None,p=None):
     answer=row['result']
     if row['operation']=='open_chat_by_phone' and isinstance(answer,dict) and isinstance(answer.get('data'),dict):
@@ -517,6 +427,7 @@ def _public(row,c=None,p=None):
         'finished_at':row['finished_at'],'error_code':row['error_code'],'result':answer,
         'request_id':row['request_id'],'preview_digest':row['preview_digest'],
         'owner_approval_verified_by_server':False,'automatic_retry':False,
+        **({'verify':verify} if (verify:=_verify(row,c)) else {}),
         'next_action':refusal['next_action'] if refusal else
             'get_messenger_operation' if row['status'] in ('queued','dispatching') else
             'verify_provider_state_before_any_new_action' if row['status']=='unknown' else 'none'})
@@ -561,6 +472,10 @@ def enqueue(store,c,p,account,operation,chat_id='',message_id='',expected_revisi
     payload['request_input']=request_input
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('commands-account:'+account,))
     if operation=='join_chat':_join_guard(c,account,payload['parameters']['link'])
+    if operation==PRESS:
+        from . import button_press
+        pressed=payload['parameters']
+        button_press.guard(c,account,message_id,pressed['row'],pressed['column'],pressed.get('acknowledge_uncertain'))
     count=c.execute("SELECT count(*) AS n FROM messenger_commands WHERE account=%s AND created_at>clock_timestamp()-interval '1 minute'",
                     (account,)).fetchone()['n']
     if count>=60:raise APIError('rate_limited',429)
@@ -572,60 +487,6 @@ def enqueue(store,c,p,account,operation,chat_id='',message_id='',expected_revisi
          spec['mutation'],Jsonb(payload),preview_digest or None)).fetchone()
     targets(p,[row['id'],*p.get('_audit_targets',[])])
     return _public(row,c,p)
-
-
-def _check_saved(store,c,p,row,*,ready=True,check_versions=True,verify_file=True,check_dispatch=True):
-    if row['principal']!=p['id'] or str(row['key_id'])!=str(p['key_id']):raise APIError('not_found',404)
-    payload=row['payload']
-    binding=payload.get('authorization_binding')
-    if (not isinstance(binding,dict) or binding.get('target') not in ('account','chat','message') or
-        type(binding.get('full_account')) is not bool or
-        not isinstance(binding.get('required_permissions'),list)):
-        raise APIError('operation_access_changed',409)
-    required=set(binding['required_permissions'])|set(_required_permissions(row['permission'],row['operation'],payload['parameters']))
-    if required-set(p['permissions']):raise APIError('forbidden',403)
-    if row['key_permission_version']!=p['key_permission_version'] or (
-        check_versions and row['scope_version']!=p['scope_version']):
-        raise APIError('operation_access_changed',409)
-    _account(c,p,row['account'])
-    if binding['full_account'] and p['chat_ids'] is not None:raise APIError('forbidden',403)
-    if not check_dispatch or row['status'] not in ('queued','dispatching'):
-        # The completed operation may itself edit/delete the target, archive a
-        # chat, or revoke its invitation. Receipts remain readable without
-        # authorizing another action or requiring its former revision to exist.
-        # Passive status reads use the same scope checks while still pending;
-        # worker admission/preflight independently revalidate dispatch support.
-        def scoped_message(message_id,chat_id):
-            message=c.execute('SELECT account,chat FROM messages WHERE id=%s',(message_id,)).fetchone()
-            if not message or message['account']!=row['account'] or message['chat']!=chat_id:
-                raise APIError('not_found',404)
-            _chat(c,p,row['account'],chat_id)
-        if row['chat']:
-            chat=_chat(c,p,row['account'],row['chat'])
-            if chat['provider_chat']!=payload['provider_chat']:raise APIError('not_found',404)
-        if row['message']:scoped_message(row['message'],row['chat'])
-        if row['operation']=='forward_message':
-            scoped_message(payload['parameters']['source_message_id'],payload['source_chat_id'])
-        if row['operation']=='send_file':
-            if 'upload_id' in payload['parameters']:
-                from .uploads import owned
-                original=owned(c,p,payload['parameters']['upload_id'])
-                if original['account']!=row['account'] or original['chat']!=row['chat']:raise APIError('not_found',404)
-            else:
-                scoped_message(payload['file_message_id'],payload['file_chat_id'])
-                original=c.execute('SELECT message FROM attachments WHERE id=%s',
-                                   (payload['parameters']['attachment_id'],)).fetchone()
-                if not original or original['message']!=payload['file_message_id']:raise APIError('not_found',404)
-        return {key:value for key,value in payload.items() if key!='request_input'}
-    current,spec=_resolve(store,c,p,row['account'],row['operation'],row['chat'] or '',row['message'] or '',
-        row['expected_revision'],payload['parameters'],ready=ready,verify_file=verify_file,
-        validate_parameters=False,retained_upload=True,saved=payload)
-    # A catalog release must not rewrite reviewed, persisted normalized intent.
-    current['catalog_version']=payload['catalog_version']
-    saved={key:value for key,value in payload.items() if key!='request_input'}
-    if current!=saved or spec['permission']!=row['permission'] or spec['mutation']!=row['mutation']:
-        raise APIError('operation_target_changed',409)
-    return current
 
 
 def status(store,c,p,operation_id):
@@ -930,9 +791,14 @@ class CommandWorker:
                 'forbidden','not_found','operation_rejected','identity_unresolved','chat_not_collected',
                 'rate_limited','provider_timeout','invalid_phone','identity_changed','sending_disabled','invite_invalid','invite_expired','chat_full',
                 'join_not_allowed','already_member','invalid_cursor','invalid_anchor','username_not_found',
-                'recipient_not_user') else 'operation_rejected'
+                'recipient_not_user','message_changed','password_required','press_uncertain',
+                'button_kind_unsupported') else 'operation_rejected'
             # Nothing was sent, so a lookup that ran out of time is a retryable read.
             result={'data':{'code':code,'retry':True}} if code=='provider_timeout' else None
+            # ANYM-676: a press refused before it left (the live message differs from the preview) returns the live
+            # text and labels so the owner can reconfirm in one round; nothing was sent.
+            if code=='message_changed' and isinstance(exc.data,dict):
+                result={'data':{'code':code,**exc.data,'next_action':'inspect again, preview and confirm again'}}
             if code=='rate_limited' and exc.retry_after:
                 result={'data':{'code':code,'retry_after':exc.retry_after}}
                 if getattr(exc,'provider_lookup',None) is False:result['data']['provider_lookup']=False

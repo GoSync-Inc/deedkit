@@ -114,6 +114,7 @@
   "send_via": "preview_and_execute_messenger_operation_send_file"
  },
  "key_permission_ceiling": [
+  "bot-press",
   "chat-manage",
   "contacts-manage",
   "contacts-read",
@@ -136,7 +137,8 @@
   "send",
   "subscription-ack",
   "subscription-write",
-  "upload"
+  "upload",
+  "webview-open"
  ],
  "key_permission_version": "<volatile>",
  "limits": {
@@ -169,7 +171,7 @@
   "independent_key_permissions": true,
   "mutation_preview_digest_required": true,
   "new_permissions_inherited_by_existing_keys": false,
-  "operation_count": 61,
+  "operation_count": 63,
   "platform_counts_basis": "legacy_defaults_use_account_manifest_for_actual_support",
   "preview_accepts_request_id": true,
   "preview_digest_proves_owner_approval": false,
@@ -179,7 +181,7 @@
   "supported_by_account": {
    "telegram-demo": {
     "available_operations": [],
-    "count": 52,
+    "count": 54,
     "operations": [
      "add_contact",
      "add_participant",
@@ -199,6 +201,7 @@
      "get_message_info",
      "get_profile",
      "get_reactions",
+     "inspect_message_buttons",
      "join_chat",
      "leave_group",
      "list_blocked",
@@ -211,6 +214,7 @@
      "mute_chat",
      "open_chat_by_username",
      "pin_message",
+     "press_button",
      "promote_participant",
      "reject_join_requests",
      "remove_participant",
@@ -290,7 +294,7 @@
    }
   },
   "supported_count_by_platform": {
-   "telegram": 52,
+   "telegram": 54,
    "whatsapp": 45
   },
   "tools": [
@@ -301,6 +305,7 @@
   ]
  },
  "permissions": [
+  "bot-press",
   "chat-manage",
   "contacts-manage",
   "contacts-read",
@@ -323,7 +328,8 @@
   "send",
   "subscription-ack",
   "subscription-write",
-  "upload"
+  "upload",
+  "webview-open"
  ],
  "principal": "agent-all",
  "scope_version": "<volatile>",
@@ -427,6 +433,7 @@
   "provider_id_lookup": "resolve_reference",
   "query_modes": [
    "all",
+   "any",
    "phrase",
    "web",
    "exact"

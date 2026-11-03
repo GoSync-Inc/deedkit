@@ -13,7 +13,7 @@ CONVERSATION_FIELDS = ('body','kind','is_service','display_text','position','ord
 FILE_FIELDS = ('attachment_id','id','message_id','account','chat','revision','sha256','mime',
     'bytes','display_name','download_status','extraction_status','enrichment_status',
     'truncated','error_code','title','document_type','snippet','match_type',
-    'matched_content','match_sources','message_context','excerpt_source','transcript_ready','text_excerpt','processing_profile','error_detail','attempts','next_due')
+    'matched_content','media_class','match_sources','message_context','excerpt_source','transcript_ready','text_excerpt','processing_profile','error_detail','attempts','next_due')
 
 
 TRANSCRIPT_BODY_CHARS = 2000
@@ -38,6 +38,8 @@ def options(method, arguments):
             arguments['body_chars']=TRANSCRIPT_BODY_CHARS
     if 'include_coverage' in arguments and arguments['include_coverage'] is None:
         arguments['include_coverage']=detail=='full'
+    # ANYM-667: a compact page keeps page and sheet spans only; the store caps what it keeps, so it must know.
+    if method=='get_file_text' and detail=='compact':arguments['compact_spans']=True
     return arguments,detail
 
 
@@ -71,8 +73,19 @@ def forward_copies(row):
     return {k:row[k] for k in ('copies_total','latest_copy_at','copies') if row.get(k)}
 
 
+def keyboard_summary(row):
+    """ANYM-658: compact reads carry buttons_count and the text and kind of the first 8 buttons, never a link."""
+    buttons=row.get('buttons')
+    if isinstance(buttons,dict):
+        from .message_buttons import compact
+        return compact(buttons)
+    if isinstance(buttons,list) and buttons:return {'buttons':buttons,'buttons_count':row.get('buttons_count',len(buttons))}
+    return {}
+
+
 def message_summary(row):
     result={k:row[k] for k in MESSAGE_FIELDS if k in row and row[k] is not None}
+    result.update(keyboard_summary(row))
     if row.get('conversation_view_version')==1:
         result.update({k:row[k] for k in CONVERSATION_FIELDS if k in row})
     if 'formatting' in result:
@@ -137,6 +150,7 @@ def lean_message(row, *, search=False, files=True):
     result.update(forward_fields(row));result.update(forward_copies(row))
     if row.get('reply_to_provider_id'):result['reply_to_provider_id']=row['reply_to_provider_id']
     if row.get('reply_to'):result['reply_to']=row['reply_to']
+    result.update(keyboard_summary(row))
     if row.get('agent_send'):
         result['agent_send']={k:row['agent_send'][k] for k in ('send_id','basis') if k in row['agent_send']}
     receipt=row.get('delivery_receipt') or {}
@@ -155,10 +169,21 @@ def lean_message(row, *, search=False, files=True):
 
 
 def lean_view(view):
-    result={k:view[k] for k in ('view','contract_version','order','system_filter','warnings','content_is_untrusted') if k in view}
-    # Applies to every returned message; detail=full repeats it per message.
-    result['provider_currentness_verified']=False
+    """ANYM-667: the untrusted-content flag, the contract and order, and warnings when there are any."""
+    result={k:view[k] for k in ('contract_version','order','content_is_untrusted') if k in view}
+    if view.get('warnings'):result['warnings']=view['warnings']
     return result
+
+
+EVIDENCE_SUMMARY=('empty_reason','requested_range_traversed','active_conflicts_in_range','next_action','empty_fields')
+EVIDENCE_LIVE=('live','live_wait','suggested_call','archive_reread')
+EVIDENCE_CONSTANTS=('basis','full_history_verified','message_index')
+
+
+def lean_evidence(evidence, include_coverage):
+    """ANYM-667: the ANYM-53 summary and the live keys; include_coverage=true keeps the counts and per-chat statuses."""
+    if include_coverage:return {k:v for k,v in evidence.items() if k not in EVIDENCE_CONSTANTS}
+    return {k:evidence[k] for k in (*EVIDENCE_SUMMARY,*EVIDENCE_LIVE) if k in evidence}
 
 
 def lean_conversation(state, *, shown=(), place=True):
@@ -380,7 +405,7 @@ def lean_queue_conversation(state, last, hint, *, kind=None, self_chat=False):
     return omit_fixed(result,last,hint,kind,self_chat)
 
 
-def lean(method, result):
+def lean(method, result, include_coverage=False):
     """Conversation-view compact: every message text once, qualifiers only when they apply."""
     result=dict(result)
     for key in ('sources','chat_sync'):result.pop(key,None)
@@ -396,6 +421,10 @@ def lean(method, result):
         return result
     search=method=='search'
     result['conversation_view']=lean_view(result['conversation_view'])
+    if 'result_evidence' in result:result['result_evidence']=lean_evidence(result['result_evidence'],include_coverage)
+    # The search block echoes the request; only a fuzzy match changes how to read the rows (they are near misses).
+    block=result.pop('search',None)
+    if block and block.get('fuzzy_used'):result['search']={'fuzzy_used':True}
     if method=='get_context':
         anchor=result['message']
         rows=result['context']
@@ -455,11 +484,33 @@ def transcript(method, result):
     return output
 
 
-def render(method, result, detail):
+FILE_TEXT_KEYS=('text','content','offset','next_offset','content_chars','truncated','extraction_status',
+    'enrichment_status','download_status','empty_reason','empty_reason_detail','failure_reason','next_action',
+    'message_id','mime','display_name','model_generated','notice')
+PROVENANCE_KEYS=('attachment_id','message_id','revision','content','extractor','model','provider','processor_version','sha256')
+
+
+def lean_file_text(result):
+    """ANYM-667: the text, its paging, the readiness reasons, the truncation flags and the provenance an agent cites."""
+    output={k:result[k] for k in FILE_TEXT_KEYS if k in result}
+    if isinstance(result.get('content_coverage'),dict):
+        output['content_coverage']={k:v for k,v in result['content_coverage'].items()
+            if k in ('retained_chars','truncated','complete')}
+    if isinstance(result.get('provenance'),dict):
+        output['provenance']={k:v for k,v in result['provenance'].items() if k in PROVENANCE_KEYS and v is not None}
+    spans=[s for s in result.get('source_spans') or [] if s.get('kind') in ('page','sheet')]
+    if spans:output['source_spans']=spans
+    if result.get('source_spans_truncated'):output['source_spans_truncated']=True
+    output['detail']='compact'
+    return output
+
+
+def render(method, result, detail, include_coverage=False):
     if detail=='transcript':return transcript(method,result)
+    if detail=='compact' and method=='get_file_text':return lean_file_text(result)
     if detail=='compact' and (result.get('view')=='conversation' if method=='list_chats' else
             method in ('search','get_messages','get_context') and 'conversation_view' in result):
-        return lean(method,result)
+        return lean(method,result,include_coverage)
     if detail=='full' or method not in ('list_chats','search','get_messages','get_updates',
         'get_context','search_files','get_file_text','get_file_segments','get_sync_status'):return result
     if method=='get_sync_status':
@@ -473,6 +524,13 @@ def render(method, result, detail):
                 'archive_detail_code','oldest_message_at','newest_message_at','last_ingest_at','alerts') if k in source}
             # The compact budget carries only the live verdict; full detail has the evidence.
             if 'liveness' in source:row['liveness_state']=source['liveness']['state']
+            # ANYM-671: the outbound block when something is wrong, waiting or alerting; quiet accounts omit it.
+            block=source.get('outbound')
+            if block and (block['sender']!='ready' or block['queued'] or block['expired_unsettled']
+                    or any(a.startswith('outbound_') for a in source.get('alerts',[]))):
+                # Lean form for the compact budget: no null or zero counts, and the explaining sentence only where it is the
+                # basis of a stall alert (a not_ready or cooling_down sender is explained by reason_code and next_action).
+                row['outbound']={k:v for k,v in block.items() if v not in (None,0) and (k!='reason' or block['sender']=='ready')}
             conflicts=source.get('conflicts') or {}
             if conflicts.get('attention') or conflicts.get('known'):row['conflicts']=conflicts
             row['freshness']={k:v for k,v in source.get('freshness',{}).items()

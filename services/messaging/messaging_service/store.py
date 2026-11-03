@@ -6,7 +6,7 @@ exposed to agents. Reviewed opt-in operations use the existing fenced collectors
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta  # noqa: F401  (timedelta moved with key admin)
 import hashlib
 import os
 from pathlib import Path
@@ -22,12 +22,15 @@ import psycopg
 from psycopg.errors import LockNotAvailable, QueryCanceled, TransactionTimeout
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
-from . import __version__
-from .policy import (DEFAULT_PERMISSIONS, OPERATION_PERMISSIONS, UNSET, audit,
+from . import __version__  # noqa: F401  (still importable from here)
+from .field_errors import date_range_refusal
+from .policy import (  # noqa: F401  (key_admin reads these through this module)
+                     DEFAULT_PERMISSIONS, OPERATION_PERMISSIONS, UNSET, audit,
                      key_id, lock_principal, normalize_policy, principal_id,
                      scope_filter, targets, effective_permissions, PERMISSIONS, normalize_list,
                      LEGACY_PERMISSIONS)
 from .telemetry import source_sha
+from .capabilities import CAPABILITY_SECTIONS, capability_view  # noqa: F401  (moved; still importable from here)
 
 
 # When this messaging server process started (ANYM-592): with the source commit, "commit X running since T".
@@ -215,53 +218,12 @@ def lock_replay_tables(c, seconds=2):
             time.sleep(0.05)
 
 
-# capabilities sections (ANYM-270): each key of the full payload sits in exactly one
-# named block, with today's shape; summary is the short index an agent reads first.
-CAPABILITY_SECTIONS={
-    'identity':('service','version','build','principal','scope_version','credential_id','permissions','expires_at','key_permission_ceiling',
-                'key_permission_version','chat_scope','auth_mode'),
-    'accounts':('accounts',),'coverage':('synthetic','sources','coverage'),
-    'tool_manifest':('tool_manifest','available'),'search_options':('search_options',),'sending':('sending',),
-    'file_uploads':('file_uploads',),'subscriptions':('subscriptions','events'),'feedback':('feedback',),
-    'messenger_operations':('messenger_operations',),'limits':('limits','unavailable')}
-
-
-def capability_view(full, detail='full', sections=None, permitted=None):
-    """`full` unchanged, only the named `sections`, or the summary index. A section lists
-    an account's operations only where `permitted` (the key may use them there) names them."""
-    if sections is not None:
-        if not sections or any(name not in CAPABILITY_SECTIONS for name in sections):raise APIError('invalid_filter')
-        result={key:full[key] for name in CAPABILITY_SECTIONS if name in sections
-                for key in CAPABILITY_SECTIONS[name] if key in full}
-        if 'messenger_operations' in result:
-            block=dict(result['messenger_operations']);accounts={}
-            for account,row in block['supported_by_account'].items():
-                allowed=set((permitted or {}).get(account,()))
-                operations=[name for name in row['operations'] if name in allowed]
-                accounts[account]={**row,'operations':operations,'count':len(operations),
-                    'available_operations':[name for name in row['available_operations'] if name in allowed]}
-            block['supported_by_account']=accounts;result['messenger_operations']=block
-        return result
-    if detail=='full':return full
-    if detail!='summary':raise APIError('invalid_filter')
-    scope=full['chat_scope']
-    return {'service':full['service'],'version':full['version'],'build':full['build'],'principal':full['principal'],
-        'credential_id':full['credential_id'],'permissions':full['permissions'],'expires_at':full['expires_at'],
-        # ANYM-470: the key's expiry and each owner's ID stay in the default view.
-        'accounts':[{k:a[k] for k in ('id','platform','label','self_provider_id')} for a in full['accounts']],
-        'chat_scope':{'all_in_permitted_accounts':scope['all_in_permitted_accounts'],
-                      'chat_count':None if scope['chat_ids'] is None else len(scope['chat_ids'])},
-        'tool_manifest':{'version':full['tool_manifest']['version']},
-        'detail':'summary','sections':list(CAPABILITY_SECTIONS),
-        'next_action':'call capabilities again with sections=[names] for those blocks or detail=full for everything'}
-
-
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
 KEY_OPERATION_SCHEMA=44  # api_key_operations (ANYM-495)
-RUNTIME_SCHEMA=63  # the newest schema this runtime knows; migrate() refuses a newer database
+RUNTIME_SCHEMA=66  # the newest schema this runtime knows; migrate() refuses a newer database
 
 
 def revocable_token(value):
@@ -498,177 +460,8 @@ class Store:
         return row
 
     def capabilities(self, token, detail='full', sections=None):
-        # Python callers keep today's payload; MCP asks for the summary by default (ANYM-270).
-        with self.authorized(token,'capabilities') as (c, p):
-            from .messenger_operations import CATALOG_VERSION,OPERATIONS,operation_manifest
-            from .event_delivery import delivery_transports
-            from .commands import manifest
-            dataset=self.dataset(c,p)
-            from .operational import identity_safe,self_provider_id
-            # Same visible accounts as before; each adds the owner's ID its collector
-            # verified at connect, or null (ANYM-470). Never derived from messages. Only
-            # identity's written shape leaves SQL: the driver never decodes another one.
-            accounts = c.execute('''SELECT a.id,a.platform,a.label,a.synthetic,
-                ('''+identity_safe('h.operations')+''')->'identity'->>'self_provider_id' AS self_provider_id FROM accounts a
-                LEFT JOIN collector_health h ON h.account=a.id WHERE a.id=ANY(%s) ORDER BY a.id''',
-                ([r['id'] for r in dataset['sources']],)).fetchall()
-            for account in accounts:
-                account['self_provider_id']=self_provider_id(account['platform'],account['self_provider_id'])
-            expires_at=p['key_expires_at']
-            supported_by_account={};permitted={}
-            for account in accounts:
-                # Same rows as list_messenger_operations: supported, plus what this key
-                # can use now (key permitted and opted in for the account).
-                listed=manifest(c,p,account['id'])
-                supported=[row['operation'] for row in listed['items']]
-                permitted[account['id']]=[row['operation'] for row in listed['items'] if row['key_permitted']]
-                supported_by_account[account['id']]={'provider':listed['provider'],'count':len(supported),
-                    'operations':supported,'available_operations':[row['operation'] for row in listed['items'] if row['available']]}
-            features={'read':['search','history','context','updates','reviews','search_people','search_files','get_file_text','get_file_occurrences','get_sync_status','get_file_segments','resolve_reference','resolve_target','preview_message'], 'download':['attachment','request_file_download'], 'cursor-write':['ack'], 'send':['send_message','messages_send','get_send_status']}
-            if 'read' in p['permissions']:
-                features['review-write']=['record_review']
-                features['cursor-write'].append('dismiss_reply')
-                features['cursor-write'].extend(['snooze_reply','restore_reply','mute_reply_source','unmute_reply_source'])
-                features['read'].append('list_reply_dismissals')
-                features['read'].extend(['list_subscriptions','get_subscription','get_subscription_events','fetch_subscription_events','wait_for_subscription_events','list_feedback'])
-                features['subscription-ack']=['ack_subscription_events']
-                features['feedback-write']=['submit_feedback']
-                features['subscription-write']=['create_subscription','update_subscription','configure_subscription_delivery','test_subscription']
-                from .delivery_endpoints import TOOLS as delivery_tools
-                features['delivery-write']=list(delivery_tools)
-            available=[feature for permission,names in features.items() if permission in p['permissions'] for feature in names]
-            if {'read','send','upload'}<=set(p['permissions']):
-                available.extend(['prepare_file_upload','upload_file_chunk','get_file_upload'])
-            operation_tools=['list_messenger_operations','preview_messenger_operation',
-                             'execute_messenger_operation','get_messenger_operation']
-            if any(spec['permission'] in p['permissions'] for spec in OPERATIONS.values()):
-                available.extend(operation_tools)
-            else:available.append('list_messenger_operations')
-            return capability_view({'service': 'anymsg', 'version': __version__, 'build': build(), **dataset,
-                'tool_manifest':{'version':__version__,'names':sorted(OPERATION_PERMISSIONS.keys()-{'download'}),
-                    'discovery_action':'refresh_connection_if_tools_list_differs',
-                    'rest_fallback':'POST /v1/{tool_name} with the same bearer and JSON parameters'},
-                'principal': p['id'], 'scope_version': p['scope_version'], 'accounts': accounts,
-                'credential_id':str(p['key_id']), 'permissions':p['permissions'],
-                'expires_at':expires_at.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ') if expires_at else None,
-                'key_permission_ceiling':p['key_permissions'] if p['key_permissions'] is not None else sorted(LEGACY_PERMISSIONS),
-                'key_permission_version':p['key_permission_version'],
-                'chat_scope':{'all_in_permitted_accounts':p['chat_ids'] is None,'chat_ids':p['chat_ids']},
-                'auth_mode': 'managed_bearer_keys',
-                'search_options':{'filters':['accounts','chats','senders','from_time','to_time','direction','exclude_channels',
-                        'chat_types','include_channels'],
-                    'search_channels_default':'excluded_unless_include_channels_chat_types_or_named_chats',
-                    'query_modes':['all','phrase','web','exact'],'orders':['asc','desc','relevance'],
-                    'languages':['auto','simple','russian','english','indonesian'],
-                    'fuzzy':'explicit_bounded_fallback','compact':True,'optional_coverage':True,
-                    'context':'independent_before_and_after_counts','chat_orders':['id','activity','last_activity_desc','priority'],
-                    'chat_order_default':'activity','awaiting_reply_default_days':14,
-                    'awaiting_reply_bots':'exclude_observed_bot_senders_not_name_guesses',
-                    'reply_queue_filters':['exclude_chats','exclude_senders','only_questions','only_unread','chat_types','exclude_likely_broadcasts','promotional'],
-                    'reply_queue_dismissal':'credential_local_until_next_meaningful_incoming',
-                    'owner_read_state':'timestamped_provider_observations_unknown_or_stale_explicit',
-                    'sync_status_details':['compact','full'],
-                    'updates':'version_checked_filter_reset_preserves_ack_position',
-                    'update_orders':['event','sent_at_within_delivered_batch'],
-                    'updates_exclude_channels':True,'updates_start_from':['beginning','now_creation_only'],'is_backfill':True,
-                    'detail_default':'compact','details':['compact','full'],
-                    'message_details':['compact','full','transcript'],
-                    'collector_operations':['connection','live_capture','history','media'],
-                'connection_failures':'durable_terminal_gate_and_capped_retry','status_cache_seconds':10,'status_refresh':True,
-                    'people_candidates':['transliteration','same_sender_grouping'],
-                    'list_limit':100,'people_lookup':'observed_name_username_or_sender_id',
-                    'indexed_content':['message_text','filename','bounded_file_text','configured_model_results'],
-                    'model_processing':'optional_operator_configured_local_or_api',
-                    'file_content_search':True,'file_indexing':'asynchronous_local_worker',
-                    'file_search_sources':['extracted','enriched','understanding','message_context'],
-                    'file_caption_provenance':'current_parent_message_revision_only',
-                    'chat_coverage':True,'provider_id_lookup':'resolve_reference',
-                    'empty_result_diagnostics':True,'message_conflicts':'scoped_active_and_historical',
-                    'forwarded_messages':{'origin_field':'forward_origin','authorship':'forwarded_by_sender',
-                        'rule':'sender_is_the_forwarder_never_quote_forwarded_words_as_written_by_sender',
-                        'origin_kinds':['user','chat','channel','hidden_user','status','newsletter','unknown','not_captured'],
-                        'origin_grants_chat_access':False}},
-                'available':available,
-                'file_uploads':{'implemented':True,'permission':'upload','required_permissions':['read','send','upload'],
-                    'new_permission_inherited':False,'ownership':'originating_key_account_destination_chat',
-                    'expires_seconds':3600,'chunk_bytes':262144,'max_bytes':32*1024**2,
-                    'changes_provider_state':False,'paths_and_urls_accepted':False,
-                    'send_via':'preview_and_execute_messenger_operation_send_file'},
-                'subscriptions':{'implemented':True,'definitions':True,'passive_events':True,
-                    'source_selection':'frozen_explicit_chats_and_account_scoped_sender_ids',
-                    'event_selection':'structural_exact_revision','origin_default':'live',
-                    'mutation_permission':'subscription-write','read_permission_required':True,
-                    'ownership':'originating_credential_and_principal','new_permission_inherited':False,
-                    'source_scope_change':'masked_access_changed_recreate_required',
-                    'ack':True,'ack_permission':'subscription-ack','push':'operator_registered_signed_hints','wait_max_seconds':25,'verified_host':False,'native_reply_preset':True,
-                    'provider_polling':False,'start_boundary':'committed_archive_frontier',
-                    'existing_update_consumers_unchanged':True,'transports':delivery_transports(c,p),
-                    'delivery_policy':{'tool':'configure_subscription_delivery','argument':'delivery_policy',
-                        'changes':'hint_timing_only','changes_matches_ack_or_reads':False,'requires_receiver':True,
-                        'bounds':{'debounce_s':[0,600],'max_wait_s':[1,3600],'batch_window_s':[0,86400],
-                            'batch_count':[1,1000],'expect_reply_within_s':[60,1209600],'quiet_windows':[1,4]},
-                        'debounce_and_batch_exclusive':True,'max_wait_default':'max(300,debounce_s)',
-                        'quiet_hours':'iana_timezone_weekday_windows_held_not_dropped',
-                        'quiet_bypass':['incoming_message','owner_mention','reply_to_owner','reply_to_confirmed_send','silence'],
-                        'silence_timer':'reply_to_send_subscriptions_only','silence_hint_kind':'silence',
-                        'key_budget':{'setting':'SUBSCRIPTION_MAX_HINTS_PER_HOUR','default':20,'bounds':[1,1000],
-                            'scope':'every_hint_of_the_key','applies_without_policy':True,'over_budget':'coalesced_never_dropped'},
-                        'held_reasons':['debounce','batch','quiet_hours','budget'],'clock':'database_utc',
-                        'idempotency':'one_hint_per_subscription_version_window'}},
-                'events':{'fetch':'fetch_subscription_events','ack':'ack_subscription_events','wait':'wait_for_subscription_events','wait_max_seconds':25,'test':'test_subscription','delivery':'operator_registered_signed_hints','host_turn_verified':False},
-                'feedback':{'implemented':True,'write_permission':'feedback-write','ownership':'exact_credential','external_delivery':False},
-                'sending':{'implemented':True,'wait_max_seconds':25,'approval_mode':'acting_agent_obtains_exact_owner_confirmation',
-                    'server_approval_gate':False,'text_only':False,'legacy_send_message_text_only':True,
-                    'request_id_required':True,
-                    'formatting':{'formats':['plain','markdown','html'],
-                        'preview_tool':'preview_message','preview_permission':'read',
-                        'preview_contacts_provider':False,'plain_default':True,
-                        'rich_preview_digest_required':True,'digest_proves_owner_approval':False,
-                        'digest_binds':['principal','scope_version','account','chat','reply_target',
-                            'source','format','rendered_payload','renderer_version','link_preview','allow_lossy'],
-                        'link_preview_default':False,'automatic_splitting':False,
-                        'whatsapp_link_preview_control':'provider_multi_device_limitation',
-                        'whatsapp_plain_native_markup':'provider_may_interpret_delimiters'},
-                    # ANYM-532: chat_id or phone; a phone preview does one open_chat_by_phone lookup.
-                    'recipients':{'chat_id':{'preview_contacts_provider':False},
-                        'phone':{'platforms':['whatsapp_native'],'preview_contacts_provider':True,
-                            'requires':['send','full_account','open_chat_by_phone','gateway_action_grant'],
-                            'send_requires_preview_digest':True,'digest_binds_identity':True,
-                            'lookup_quota':'shared_with_open_chat_by_phone'},
-                        # ANYM-643: a username preview resolves it at Telegram; the send rechecks the user ID.
-                        'username':{'platforms':['telegram'],'preview_contacts_provider':True,
-                            'requires':['send','full_account','open_chat_by_username','gateway_action_grant'],
-                            'send_requires_preview_digest':True,'digest_binds_identity':True,
-                            'send_rechecks_identity':True,'lookup_quota':'shared_with_open_chat_by_username'}},
-                    'ambiguous_result_policy':'unknown_no_automatic_retry',
-                    'delivery_observations':{'telegram':'private_outbox_read_boundary',
-                        'whatsapp':'message_ack_private_or_group_aggregate',
-                        'provider_timestamps_available':False,'historical_coverage_guaranteed':False,
-                        'event_kind':'message.status','changes_provider_read_state':False},
-                    'read_permission_does_not_allow_send':True},
-                'messenger_operations':{'implemented':True,'catalog_version':CATALOG_VERSION,
-                    'operation_count':len(OPERATIONS),'tools':operation_tools,
-                    'supported_count_by_platform':{platform:sum(item['supported'] for item in operation_manifest(platform))
-                                                   for platform in ('telegram','whatsapp')},
-                    'platform_counts_basis':'legacy_defaults_use_account_manifest_for_actual_support',
-                    'supported_by_account':supported_by_account,
-                    'availability_tool':'list_messenger_operations','account_opt_in_required':True,
-                    'independent_key_permissions':True,'new_permissions_inherited_by_existing_keys':False,
-                    'administration':['groups','contacts','account_profile'],
-                    'archive_read_remains_passive':True,'provider_session_owner':'existing_fenced_collector',
-                    'mutation_preview_digest_required':True,'preview_digest_proves_owner_approval':False,
-                    'ambiguous_mutations':'unknown_no_automatic_retry','registered_file_limit_bytes':32*1024**2,
-                    'read_state_requires_explicit_permission':True,
-                    # ANYM-549: execute takes wait_s up to this bound; preview takes and ignores request_id.
-                    'execute_wait_s_max':25,'preview_accepts_request_id':True},
-                'unavailable': ['guaranteed_full_history', 'drafts',
-                                'owner_approval', 'project_memory', 'schedules', 'oauth'],
-                'limits': {'page_size': 100, 'query_chars': 200,
-                           'download_grant_seconds': 120, 'delivery_seconds': 900,
-                           'review_sources':20, 'context_reviews':5,'send_text_utf16_units':4000,
-                           'format_source_utf16_units':16000,'http_json_body_bytes':16384,
-                           'upload_chunk_http_json_body_bytes':360448,
-                           'send_queue_ttl_seconds':600,'send_per_account_per_minute':60}},detail,sections,permitted)
+        from .capabilities import capabilities
+        return capabilities(self, token, detail, sections)
 
     def preview_message(self,token,account,chat_id,text,reply_to='',format='plain',
                         link_preview=False,allow_lossy=False):
@@ -893,18 +686,19 @@ class Store:
 
     def search_files(self,token,query='',account='',chat='',sender='',from_time='',to_time='',
                      after='',limit=20,*,accounts=None,chats=None,senders=None,query_mode='all',
-                     order='asc',before='',direction='',filename='',search_language='auto',include_coverage=True):
+                     order='asc',before='',direction='',filename='',search_language='auto',include_coverage=True,
+                     media_kind=None,ready=None):
         from .file_index import search_files
         with self.authorized(token,'search_files') as (c,p):
             return search_files(self,c,p,query,account,chat,sender,from_time,to_time,after,limit,
                 accounts=accounts,chats=chats,senders=senders,query_mode=query_mode,order=order,
                 before=before,direction=direction,filename=filename,search_language=search_language,
-                include_coverage=include_coverage)
+                include_coverage=include_coverage,media_kind=media_kind,ready=ready)
 
-    def get_file_text(self,token,attachment_id,offset=0,limit=4000,content=None):
+    def get_file_text(self,token,attachment_id,offset=0,limit=4000,content=None,compact_spans=False):
         from .file_index import get_file_text
         with self.authorized(token,'get_file_text') as (c,p):
-            return get_file_text(self,c,p,attachment_id,offset=offset,limit=limit,content=content)
+            return get_file_text(self,c,p,attachment_id,offset=offset,limit=limit,content=content,compact_spans=compact_spans)
 
     def get_file_occurrences(self,token,attachment_id,after='',limit=20):
         from .file_index import get_file_occurrences
@@ -923,7 +717,7 @@ class Store:
             if chat_id:
                 from .chat_evidence import chat_statuses
                 lower,upper=date_bound(from_time),date_bound(to_time)
-                if lower and upper and lower>=upper:raise APIError('invalid_date_range')
+                if lower and upper and lower>=upper:raise date_range_refusal()
                 if not isinstance(chat_id,str) or len(chat_id)>256:raise APIError('invalid_filter')
                 data=chat_statuses(c,p,[chat_id],lower,upper,conflict_items=True)
                 if not data:raise APIError('not_found',404)
@@ -976,7 +770,7 @@ class Store:
         # None is the internal no-default sentinel of message_queries.search, never a public value.
         if type(include_channels) is not bool:raise APIError('invalid_filter')
         from .message_queries import named_chats
-        from .live_search import suggest, scope
+        from .live_search import scope
         with self.authorized(token,'search') as (c,p):
             # ANYM-478: the live search keeps the scope this page was read under (F-478a); never in the answer.
             if isinstance(_scope,list):_scope.append(scope(p))
@@ -986,16 +780,21 @@ class Store:
                 order=order,before=before,direction=direction,search_language=search_language,
                 fuzzy=fuzzy,compact=compact,body_chars=body_chars,include_coverage=include_coverage,view=view,include_system=include_system,exclude_channels=exclude_channels,
                 chat_types=chat_types,include_channels=include_channels,person=person)
-            # ANYM-478: a thin archive answer names the call that may find more; the hint is optional, so its
-            # failure (in a savepoint) never costs the archive answer.
-            try:
-                with c.transaction():
-                    suggest(c,p,{'account':account,'accounts':accounts,'chat':chat,'chats':chats,'chat_types':chat_types,
-                        'exclude_channels':exclude_channels},result['result_evidence'])
-            except Exception as error:
-                import logging
-                logging.getLogger(__name__).warning('search_suggestion_failed exception_type=%s',type(error).__name__)
+            self._search_suggestion(c,p,account,accounts,chat,chats,chat_types,exclude_channels,result)
             return result
+
+    @staticmethod
+    def _search_suggestion(c,p,account,accounts,chat,chats,chat_types,exclude_channels,result):
+        from .live_search import suggest
+        # ANYM-478: a thin archive answer names the call that may find more; the hint is optional, so its
+        # failure (in a savepoint) never costs the archive answer.
+        try:
+            with c.transaction():
+                suggest(c,p,{'account':account,'accounts':accounts,'chat':chat,'chats':chats,'chat_types':chat_types,
+                    'exclude_channels':exclude_channels},result['result_evidence'])
+        except Exception as error:
+            import logging
+            logging.getLogger(__name__).warning('search_suggestion_failed exception_type=%s',type(error).__name__)
 
     def live_search_plan(self,token,arguments,*,paged,request_id):
         """ANYM-478: per-account live entries and the operations to queue; reads only."""
@@ -1034,96 +833,25 @@ class Store:
 
     def get_context(self, token, message_id, limit=10, *, before_count=None,after_count=None,
                     compact=False,body_chars=None,include_coverage=True,view='archive',include_system=False):
-        from .message_queries import enrich
-        from .search_query import coverage,output_options,shape_messages
-        from .conversation import options,order_terms,visible_sql,sort_key,decorate_messages,presentation
+        from .search_query import coverage,output_options
+        from .message_queries import history_snapshot
+        from .conversation import options
         options(view,include_system)
         conversation=view=='conversation'
         with self.authorized(token,'get_context') as (c,p):
             bounded(limit,50)
             cap=output_options(compact,body_chars,include_coverage)
-            explicit=before_count is not None or after_count is not None
-            if explicit:
-                before_count=5 if before_count is None else before_count
-                after_count=5 if after_count is None else after_count
-                if any(type(v) is not int or not 0<=v<=50 for v in (before_count,after_count)):
-                    raise APIError('invalid_limit')
-            anchor=self.message(c,p,message_id)
-            snapshot=None
-            if conversation:
-                from .message_queries import history_snapshot
-                snapshot=history_snapshot(c,p,anchor['chat'],include_system=include_system)
-                # Authorization remains READ COMMITTED. Re-read source evidence
-                # after pinning the view, then reject changes around all scans.
-                anchor=self.message(c,p,message_id)
-                enrich(c,[anchor],p)
-            provider=str(anchor['provider_id'])
-            numeric=int(provider) if anchor.get('platform')=='telegram' and provider.isascii() and provider.isdigit() and len(provider)<=18 else 0
-            scans=[]
-            for op,sort,count in [('<','DESC',before_count if explicit else limit),
-                                  ('>','ASC',after_count if explicit else limit)]:
-                if conversation:
-                    terms=order_terms('m')
-                    selected=c.execute('SELECT m.id,m.account,m.chat,m.sender,m.body,m.sent_at,m.revision,m.direction '
-                        'FROM messages m LEFT JOIN message_metadata cmd ON cmd.message=m.id AND cmd.revision=m.revision '
-                        'WHERE m.account=%s AND m.chat=%s AND NOT m.deleted AND '+
-                        (visible_sql('m','cmd')+' AND ' if not include_system else '')+
-                        '('+','.join(terms)+')'+op+'(%s,%s,%s) ORDER BY '+
-                        ','.join(t+' '+sort for t in terms)+' LIMIT %s',
-                        (anchor['account'],anchor['chat'],anchor['sent_at'],numeric,anchor['id'],count+1)).fetchall()
-                else:
-                    selected=c.execute('SELECT id,account,chat,sender,body,sent_at,revision,direction FROM messages '
-                        'WHERE account=%s AND chat=%s AND NOT deleted AND (sent_at,id)'+op+'(%s,%s) '
-                        'ORDER BY sent_at '+sort+',id '+sort+' LIMIT %s',
-                        (anchor['account'],anchor['chat'],anchor['sent_at'],anchor['id'],count+1)).fetchall()
-                scans.append((selected[:count],len(selected)>count))
-            older,newer=scans[0][0],scans[1][0]
-            center=[] if anchor['deleted'] or (conversation and not include_system and (anchor.get('is_service') or anchor.get('message_kind')=='system')) else [{key:anchor[key] for key in
-                ('id','account','chat','sender','body','sent_at','revision','direction')}]
-            rows=older+center+newer
-            if not explicit:
-                rows=sorted(rows,key=lambda r:(r['id']!=anchor['id'],
-                    abs((r['sent_at']-anchor['sent_at']).total_seconds())))[:limit]
-            if conversation:
-                # Excerpts spend their budget in the returned order (ANYM-490).
-                enrich(c,rows,p,order_key=sort_key);rows.sort(key=sort_key)
-                shape_messages(rows,compact=False,body_chars=cap)
-                shape_messages([anchor],compact=False,body_chars=cap)
-                decorate_messages(c,p,rows,include_system=include_system);decorate_messages(c,p,[anchor],include_system=include_system)
-                if cap is not None:
-                    for row in [*rows,anchor]:
-                        if len(row['display_text'])>cap:
-                            row['display_text']=row['display_text'][:cap];row['display_text_truncated']=True
-            else:
-                rows.sort(key=lambda r:(r['sent_at'],r['id']))
-                enrich(c,rows,p);enrich(c,[anchor],p)
-                shape_messages(rows,compact=compact,body_chars=cap)
-                shape_messages([anchor],compact=compact,body_chars=cap)
+            explicit,before_count,after_count=self._context_counts(before_count,after_count)
+            anchor,snapshot=self._context_anchor(c,p,message_id,conversation,include_system)
+            scans=self._context_scans(c,anchor,conversation,include_system,explicit,limit,before_count,after_count)
+            rows,older,newer=self._context_rows(c,p,anchor,scans,conversation,include_system,explicit,limit,compact,cap)
             files=[f for f in anchor['attachments'] if f['download_status']=='ready']
             jobs=[f for f in anchor['attachments'] if f['download_status']!='ready']
             from .reviews import list_reviews
             reviews=list_reviews(c,p,message_id,limit=5)
-            window={'older_cursor':rows[0]['id'] if rows else message_id,
-                'newer_cursor':rows[-1]['id'] if rows else message_id}
-            if explicit:
-                window.update({'before_count':len(older),'after_count':len(newer),
-                    'has_more_before':scans[0][1],'has_more_after':scans[1][1],
-                    'requested_before':before_count,'requested_after':after_count,
-                    'neighbors_coverage':'archived_messages_only'})
+            window=self._context_window(rows,message_id,explicit,older,newer,scans,before_count,after_count)
             from .chat_evidence import chat_statuses
-            extra={}
-            if conversation:
-                from .conversation_state import conversation_state
-                extra={'conversation_view':presentation(rows,order='asc',include_system=include_system),
-                    'conversation':conversation_state(c,p,anchor['account'],anchor['chat'])}
-                from .message_queries import history_cursor
-                # A hidden/tombstoned anchor still defines usable boundaries
-                # when the requested visible window is empty.
-                window.update(older_cursor=history_cursor(c,p,rows[0] if rows else anchor,order='desc',include_system=include_system,snapshot=snapshot),
-                    newer_cursor=history_cursor(c,p,rows[-1] if rows else anchor,order='asc',include_system=include_system,snapshot=snapshot),
-                    older_order='desc',newer_order='asc')
-                window.update(view='conversation',include_system=include_system,
-                    anchor_hidden=bool(anchor['deleted'] or (not include_system and anchor['is_service'])))
+            extra=self._context_conversation(c,p,anchor,rows,window,snapshot,include_system,conversation)
             result=serial({'message':anchor,'context':rows,'context_window':window,
                 'attachments':files,'pending_attachments':jobs,'reviews':reviews,
                 **extra,'chat_sync':chat_statuses(c,p,[anchor['chat']])[anchor['chat']] if include_coverage else None,
@@ -1131,6 +859,112 @@ class Store:
             if conversation and history_snapshot(c,p,anchor['chat'],include_system=include_system)!=snapshot:
                 raise APIError('cursor_changed',409)
             return result
+
+    @staticmethod
+    def _context_counts(before_count,after_count):
+        explicit=before_count is not None or after_count is not None
+        if explicit:
+            before_count=5 if before_count is None else before_count
+            after_count=5 if after_count is None else after_count
+            if any(type(v) is not int or not 0<=v<=50 for v in (before_count,after_count)):
+                raise APIError('invalid_limit')
+        return explicit,before_count,after_count
+
+    def _context_anchor(self,c,p,message_id,conversation,include_system):
+        from .message_queries import enrich
+        anchor=self.message(c,p,message_id)
+        snapshot=None
+        if conversation:
+            from .message_queries import history_snapshot
+            snapshot=history_snapshot(c,p,anchor['chat'],include_system=include_system)
+            # Authorization remains READ COMMITTED. Re-read source evidence
+            # after pinning the view, then reject changes around all scans.
+            anchor=self.message(c,p,message_id)
+            enrich(c,[anchor],p)
+        return anchor,snapshot
+
+    @staticmethod
+    def _context_scans(c,anchor,conversation,include_system,explicit,limit,before_count,after_count):
+        from .conversation import order_terms,visible_sql
+        provider=str(anchor['provider_id'])
+        numeric=int(provider) if anchor.get('platform')=='telegram' and provider.isascii() and provider.isdigit() and len(provider)<=18 else 0
+        scans=[]
+        for op,sort,count in [('<','DESC',before_count if explicit else limit),
+                              ('>','ASC',after_count if explicit else limit)]:
+            if conversation:
+                terms=order_terms('m')
+                selected=c.execute('SELECT m.id,m.account,m.chat,m.sender,m.body,m.sent_at,m.revision,m.direction '
+                    'FROM messages m LEFT JOIN message_metadata cmd ON cmd.message=m.id AND cmd.revision=m.revision '
+                    'WHERE m.account=%s AND m.chat=%s AND NOT m.deleted AND '+
+                    (visible_sql('m','cmd')+' AND ' if not include_system else '')+
+                    '('+','.join(terms)+')'+op+'(%s,%s,%s) ORDER BY '+
+                    ','.join(t+' '+sort for t in terms)+' LIMIT %s',
+                    (anchor['account'],anchor['chat'],anchor['sent_at'],numeric,anchor['id'],count+1)).fetchall()
+            else:
+                selected=c.execute('SELECT id,account,chat,sender,body,sent_at,revision,direction FROM messages '
+                    'WHERE account=%s AND chat=%s AND NOT deleted AND (sent_at,id)'+op+'(%s,%s) '
+                    'ORDER BY sent_at '+sort+',id '+sort+' LIMIT %s',
+                    (anchor['account'],anchor['chat'],anchor['sent_at'],anchor['id'],count+1)).fetchall()
+            scans.append((selected[:count],len(selected)>count))
+        return scans
+
+    @staticmethod
+    def _context_rows(c,p,anchor,scans,conversation,include_system,explicit,limit,compact,cap):
+        from .message_queries import enrich
+        from .search_query import shape_messages
+        from .conversation import sort_key,decorate_messages
+        older,newer=scans[0][0],scans[1][0]
+        center=[] if anchor['deleted'] or (conversation and not include_system and (anchor.get('is_service') or anchor.get('message_kind')=='system')) else [{key:anchor[key] for key in
+            ('id','account','chat','sender','body','sent_at','revision','direction')}]
+        rows=older+center+newer
+        if not explicit:
+            rows=sorted(rows,key=lambda r:(r['id']!=anchor['id'],
+                abs((r['sent_at']-anchor['sent_at']).total_seconds())))[:limit]
+        if conversation:
+            # Excerpts spend their budget in the returned order (ANYM-490).
+            enrich(c,rows,p,order_key=sort_key);rows.sort(key=sort_key)
+            shape_messages(rows,compact=False,body_chars=cap)
+            shape_messages([anchor],compact=False,body_chars=cap)
+            decorate_messages(c,p,rows,include_system=include_system);decorate_messages(c,p,[anchor],include_system=include_system)
+            if cap is not None:
+                for row in [*rows,anchor]:
+                    if len(row['display_text'])>cap:
+                        row['display_text']=row['display_text'][:cap];row['display_text_truncated']=True
+        else:
+            rows.sort(key=lambda r:(r['sent_at'],r['id']))
+            enrich(c,rows,p);enrich(c,[anchor],p)
+            shape_messages(rows,compact=compact,body_chars=cap)
+            shape_messages([anchor],compact=compact,body_chars=cap)
+        return rows,older,newer
+
+    @staticmethod
+    def _context_window(rows,message_id,explicit,older,newer,scans,before_count,after_count):
+        window={'older_cursor':rows[0]['id'] if rows else message_id,
+            'newer_cursor':rows[-1]['id'] if rows else message_id}
+        if explicit:
+            window.update({'before_count':len(older),'after_count':len(newer),
+                'has_more_before':scans[0][1],'has_more_after':scans[1][1],
+                'requested_before':before_count,'requested_after':after_count,
+                'neighbors_coverage':'archived_messages_only'})
+        return window
+
+    @staticmethod
+    def _context_conversation(c,p,anchor,rows,window,snapshot,include_system,conversation):
+        from .conversation import presentation
+        extra={}
+        if conversation:
+            from .conversation_state import conversation_state
+            extra={'conversation_view':presentation(rows,order='asc',include_system=include_system),
+                'conversation':conversation_state(c,p,anchor['account'],anchor['chat'])}
+            from .message_queries import history_cursor
+            # A hidden/tombstoned anchor still defines usable boundaries
+            # when the requested visible window is empty.
+            window.update(older_cursor=history_cursor(c,p,rows[0] if rows else anchor,order='desc',include_system=include_system,snapshot=snapshot),
+                newer_cursor=history_cursor(c,p,rows[-1] if rows else anchor,order='asc',include_system=include_system,snapshot=snapshot),
+                older_order='desc',newer_order='asc')
+            window.update(view='conversation',include_system=include_system,
+                anchor_hidden=bool(anchor['deleted'] or (not include_system and anchor['is_service'])))
+        return extra
 
     def get_reviews(self, token, message_id, after='', limit=20):
         from .reviews import list_reviews
@@ -1519,7 +1353,7 @@ class Store:
             c.execute(Path(__file__).with_name('schema.sql').read_text())
             version=int(c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'])
             if version>RUNTIME_SCHEMA: raise RuntimeError('database_newer_than_runtime')
-            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql'),(43,'043_person_links.sql'),(44,'044_key_operation_id.sql'),(45,'045_message_purge.sql'),(46,'046_chat_roles.sql'),(47,'047_contact_search.sql'),(48,'048_dispatcher_heartbeat.sql'),(49,'049_delivery_endpoints.sql'),(50,'050_component_heartbeats.sql'),(51,'051_send_intents.sql'),(52,'052_host_admission_index.sql'),(53,'053_person_preferences.sql'),(54,'054_conflict_classes.sql'),(55,'055_failure_events.sql'),(56,'056_module_events.sql'),(57,'057_conflict_reevaluation.sql'),(58,'058_module_router.sql'),(59,'059_endpoint_refusal_indexes.sql'),(60,'060_dynamic_subscription_sources.sql'),(61,'061_delivery_attempts.sql'),(62,'062_subscription_tombstones.sql'),(63,'063_send_terminal_events.sql')]:
+            for target,name in [(2,'002_archive.sql'),(3,'003_collectors.sql'),(4,'004_whatsapp.sql'),(5,'005_access.sql'),(6,'006_reviews.sql'),(7,'007_search_indexes.sql'),(8,'008_people.sql'),(9,'009_file_index.sql'),(10,'010_search_audit.sql'),(11,'011_telegram_window.sql'),(12,'012_search.sql'),(13,'013_file_search.sql'),(14,'014_collector_health.sql'),(15,'015_enrichment.sql'),(16,'016_file_content.sql'),(17,'017_chat_evidence.sql'),(18,'018_collector_operations.sql'),(19,'019_whatsapp_identities.sql'),(20,'020_processing_admission.sql'),(21,'021_media_storage.sql'),(22,'022_outgoing.sql'),(23,'023_receipts.sql'),(24,'024_formatting.sql'),(25,'025_operations.sql'),(26,'026_subscriptions.sql'),(27,'027_reply_queue.sql'),(28,'028_send_reference.sql'),(29,'029_file_uploads.sql'),(30,'030_whatsapp_native_identities.sql'),(31,'031_media_requests.sql'),(32,'032_event_delivery.sql'),(33,'033_file_lifecycle.sql'),(34,'034_file_understanding.sql'),(35,'035_cold_archive.sql'),(36,'036_extend_key_audit.sql'),(37,'037_narrow_worker_roles.sql'),(38,'038_hint_policy.sql'),(39,'039_feedback_status.sql'),(40,'040_subscription_retention.sql'),(41,'041_reply_queue_controls.sql'),(42,'042_read_state_freshness.sql'),(43,'043_person_links.sql'),(44,'044_key_operation_id.sql'),(45,'045_message_purge.sql'),(46,'046_chat_roles.sql'),(47,'047_contact_search.sql'),(48,'048_dispatcher_heartbeat.sql'),(49,'049_delivery_endpoints.sql'),(50,'050_component_heartbeats.sql'),(51,'051_send_intents.sql'),(52,'052_host_admission_index.sql'),(53,'053_person_preferences.sql'),(54,'054_conflict_classes.sql'),(55,'055_failure_events.sql'),(56,'056_module_events.sql'),(57,'057_conflict_reevaluation.sql'),(58,'058_module_router.sql'),(59,'059_endpoint_refusal_indexes.sql'),(60,'060_dynamic_subscription_sources.sql'),(61,'061_delivery_attempts.sql'),(62,'062_subscription_tombstones.sql'),(63,'063_send_terminal_events.sql'),(64,'064_bot_press_permission.sql'),(65,'065_call_failed_provider_error.sql'),(66,'066_media_attempt_budget.sql')]:
                 migration=Path(__file__).with_name('migrations')/name
                 sha=hashlib.sha256(migration.read_bytes()).hexdigest()
                 if version<target:
@@ -1559,6 +1393,28 @@ class Store:
                   public.module_event_valid(text,text,text,text,text,jsonb,text,text),
                   public.module_hints_ready(),public.subscription_module_fence() FROM PUBLIC;
                 END IF;
+                -- ANYM-699: only the gateway role (gateway_role.sql) wakes a media job; a restore must not open it.
+                IF pg_has_role((SELECT proowner FROM pg_proc WHERE oid=to_regprocedure(
+                    'public.wake_media_job(text)')),'USAGE') THEN
+                 REVOKE ALL ON FUNCTION public.wake_media_job(text) FROM PUBLIC;
+                END IF;
+                -- Migration 033: queue_managed_original reopens a ready job for the gateway and cold-archive roles only.
+                IF pg_has_role((SELECT proowner FROM pg_proc WHERE oid=to_regprocedure(
+                    'public.queue_managed_original(text)')),'USAGE') THEN
+                 REVOKE ALL ON FUNCTION public.queue_managed_original(text) FROM PUBLIC;
+                END IF;
+                -- Migration 033: the rest of the file-lifecycle functions (backup fences, residency, lifecycle locks).
+                -- Each is guarded on its own owner; the constants below are the only text that reaches EXECUTE.
+                DECLARE f text;
+                BEGIN
+                 FOREACH f IN ARRAY ARRAY['public.touch_original(text,bigint)','public.begin_backup_fence(text)',
+                   'public.end_backup_fence(text)','public.register_original_residency()',
+                   'public.register_resident_original(text,bigint)','public.lock_lifecycle_sources(text)'] LOOP
+                  IF pg_has_role((SELECT proowner FROM pg_proc WHERE oid=to_regprocedure(f)),'USAGE') THEN
+                   EXECUTE 'REVOKE ALL ON FUNCTION '||f||' FROM PUBLIC';
+                  END IF;
+                 END LOOP;
+                END;
             END $$''')
 
     def expand_status(self):
@@ -1570,167 +1426,34 @@ class Store:
     def issue_key(self, principal, accounts, days=7, *, chats=UNSET, permissions=UNSET,
                   key_permissions=UNSET, token=None, operation_id=None, check=False, new_principal=False,
                   key_permissions_of=None):
-        """A new key; returns its token. With the caller's token and an operation ID (ANYM-495) it stores
-        only the digest and returns public fields, and the same request again returns the same record.
-        `new_principal` (ANYM-496) refuses an existing principal under its lock instead of rewriting its scope;
-        `key_permissions_of` (ANYM-496) gives the new key that key's stored ceiling as is, a NULL legacy one too."""
-        principal_id(principal)
-        if key_permissions_of is not None:
-            key_permissions_of=key_id(key_permissions_of)
-            if key_permissions is not UNSET:raise ValueError('key_permissions_conflict')
-        # Up to one year (owner 2026-10-24, ANYM-499); the default stays 7 days.
-        if type(days) is not int or not 1<=days<=365:
-            raise ValueError('invalid_key_lifetime')
-        once=operation_id is not None
-        if once!=(token is not None):raise ValueError('token_and_operation_id_required')
-        if once:
-            token,operation_id=caller_token(token),operation_name(operation_id)
-            request=issue_request(principal,accounts,days,chats,permissions,key_permissions,key_permissions_of)
-        else:token = 'pos_probe_'+secrets.token_urlsafe(32)
-        try:
-            issued,replayed=self._issue_key(principal,accounts,days,chats,permissions,key_permissions,token,
-                                            (operation_id,request) if once else None,check,new_principal,
-                                            key_permissions_of)
-        except OperationTaken:
-            # A concurrent call won the operation ID or the token (either commit is visible now).
-            with self.pool.connection() as c:issued=key_operation(c,operation_id)
-            if issued is None:raise ValueError('token_in_use') from None
-            replayed=True
-        if check and issued is None:return {'check':'ok'}
-        if not once:return token
-        if replayed and (issued['operation_request']!=request or issued['digest'] is None or
-                         not secrets.compare_digest(issued['digest'],digest(token))):
-            raise ValueError('operation_conflict')
-        return serial({'key_id':issued['id'],'principal':issued['principal'],'expires_at':issued['expires_at'],
-                       'revoked':issued['revoked'],'operation_id':operation_id,'replayed':replayed})
+        from . import key_admin
+        return key_admin.issue_key(self, principal, accounts, days, chats=chats, permissions=permissions, key_permissions=key_permissions, token=token, operation_id=operation_id, check=check, new_principal=new_principal, key_permissions_of=key_permissions_of)
 
     def _issue_key(self,principal,accounts,days,chats,permissions,key_permissions,token,operation,check=False,
                    new_principal=False,key_of=None):
-        with self.pool.connection() as c:
-            if operation:require_schema(c,KEY_OPERATION_SCHEMA)
-            lock_principal(c,principal)
-            if operation and (prior:=key_operation(c,operation[0])) is not None:return prior,True
-            old = c.execute('SELECT * FROM principals WHERE id=%s FOR UPDATE', (principal,)).fetchone()
-            if new_principal and old:raise ValueError('principal_exists')
-            if chats is UNSET:chats=old['chat_ids'] if old else None
-            if permissions is UNSET:permissions=old['permissions'] if old else DEFAULT_PERMISSIONS
-            accounts,chats,permissions=normalize_policy(c,accounts,chats,permissions)
-            if key_of is not None:
-                # A clone repeats the source key's stored ceiling, never wider: effective access is still the
-                # principal's permissions narrowed by it, exactly as for the source.
-                like=c.execute('SELECT permissions FROM api_keys WHERE id=%s',(key_of,)).fetchone()
-                if like is None:raise ValueError('unknown_key')
-                key_permissions=like['permissions']
-            else:
-                implicit_ceiling=key_permissions is UNSET
-                if implicit_ceiling:key_permissions=sorted(LEGACY_PERMISSIONS|set(permissions))
-                key_permissions=normalize_list(key_permissions,maximum=len(PERMISSIONS))
-                if set(key_permissions)-(set(permissions)|(LEGACY_PERMISSIONS if implicit_ceiling else set())):
-                    raise ValueError('invalid_key_permissions')
-            if check:
-                # ANYM-495 check mode: the same validation as an issue, then nothing is written.
-                if operation and c.execute('SELECT 1 FROM api_keys WHERE digest=%s',(digest(token),)).fetchone():
-                    raise ValueError('token_in_use')
-                return None,False
-            self._write_policy(c,principal,old,accounts,chats,permissions,old['enabled'] if old else True)
-            operation_id,request=operation or (None,None)
-            # A taken operation ID or token is not an error statement, so no key digest reaches the database log.
-            issued=c.execute('INSERT INTO api_keys(digest,principal,expires_at,permissions) VALUES(%s,%s,%s,%s)'+
-                (' ON CONFLICT DO NOTHING' if operation else '')+' RETURNING id,principal,expires_at,revoked',
-                (digest(token),principal,datetime.now(timezone.utc)+timedelta(days=days),key_permissions)).fetchone()
-            if issued is None or operation and not c.execute('''INSERT INTO api_key_operations(operation_id,
-                    operation_request,key_id) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING RETURNING key_id''',
-                    (operation_id,request,issued['id'])).fetchone():
-                raise OperationTaken
-            audit(c,{'id':principal,'key_id':issued['id']},'issue_key','ok')
-            return issued,False
+        from . import key_admin
+        return key_admin._issue_key(self, principal, accounts, days, chats, permissions, key_permissions, token, operation, check, new_principal, key_of)
 
     def set_key_permissions(self,credential_id,permissions):
-        credential_id=key_id(credential_id)
-        permissions=normalize_list(permissions,maximum=len(PERMISSIONS))
-        if set(permissions)-PERMISSIONS:raise ValueError('invalid_scope')
-        with self.pool.connection() as c:
-            known=c.execute('SELECT principal FROM api_keys WHERE id=%s',(credential_id,)).fetchone()
-            if not known:raise ValueError('unknown_key')
-            lock_principal(c,known['principal'])
-            principal=c.execute('SELECT permissions FROM principals WHERE id=%s',
-                                (known['principal'],)).fetchone()
-            if set(permissions)-set(principal['permissions']):raise ValueError('invalid_key_permissions')
-            row=c.execute('''UPDATE api_keys SET permissions=%s,
-                permission_version=permission_version+1 WHERE id=%s
-                RETURNING id,principal,permissions,permission_version''',
-                (permissions,credential_id)).fetchone()
-            if not {'read','subscription-write'}<=set(permissions):
-                # ANYM-522: restoring the permission later does not revive this key's dynamic definitions.
-                from .subscriptions import invalidate_dynamic
-                invalidate_dynamic(c,known['principal'],credential_id)
-            audit(c,{'id':known['principal'],'key_id':credential_id},'set_key_permissions','ok')
-            return serial(row)
+        from . import key_admin
+        return key_admin.set_key_permissions(self, credential_id, permissions)
 
     @staticmethod
     def _write_policy(c,principal,old,accounts,chats,permissions,enabled):
-        if old:
-            changed=(set(old['accounts'])!=set(accounts) or old['chat_ids']!=chats or
-                     set(old['permissions'])!=set(permissions) or old['enabled']!=enabled)
-            if changed:
-                c.execute('''UPDATE principals SET accounts=%s,chat_ids=%s,permissions=%s,enabled=%s,
-                    scope_version=scope_version+1 WHERE id=%s''',(accounts,chats,permissions,enabled,principal))
-                # ANYM-522: references to chats leaving the scope stay hidden, also after a re-add; a lost
-                # read or subscription-write ends the dynamic definitions for good.
-                from .subscriptions import hide_out_of_scope,invalidate_dynamic
-                hide_out_of_scope(c,principal,accounts,chats)
-                if not enabled or not {'read','subscription-write'}<=set(permissions):invalidate_dynamic(c,principal)
-        else:
-            c.execute('INSERT INTO principals(id,accounts,chat_ids,permissions,enabled) VALUES(%s,%s,%s,%s,%s)',
-                      (principal,accounts,chats,permissions,enabled))
+        from . import key_admin
+        return key_admin._write_policy(c, principal, old, accounts, chats, permissions, enabled)
 
     def set_access(self,principal,*,accounts=UNSET,chats=UNSET,permissions=UNSET,enabled=UNSET):
-        principal_id(principal)
-        with self.pool.connection() as c:
-            lock_principal(c,principal)
-            old=c.execute('SELECT * FROM principals WHERE id=%s FOR UPDATE',(principal,)).fetchone()
-            if not old:raise ValueError('unknown_principal')
-            if accounts is UNSET:accounts=old['accounts']
-            if chats is UNSET:chats=old['chat_ids']
-            if permissions is UNSET:permissions=old['permissions']
-            if enabled is UNSET:enabled=old['enabled']
-            if type(enabled) is not bool:raise ValueError('invalid_enabled')
-            accounts,chats,permissions=normalize_policy(c,accounts,chats,permissions)
-            self._write_policy(c,principal,old,accounts,chats,permissions,enabled)
-            audit(c,{'id':principal},'set_access','ok')
-            return serial(c.execute('SELECT * FROM principals WHERE id=%s',(principal,)).fetchone())
+        from . import key_admin
+        return key_admin.set_access(self, principal, accounts=accounts, chats=chats, permissions=permissions, enabled=enabled)
 
     def revoke(self, token=None, *, credential_id=None):
-        if (token is None)==(credential_id is None):raise ValueError('one_key_selector_required')
-        if token is not None:
-            clause,selector='digest=%s',digest(revocable_token(token))
-        else:clause,selector='id=%s',key_id(credential_id)
-        with self.pool.connection() as c:
-            row=c.execute('SELECT principal,id FROM api_keys WHERE '+clause,(selector,)).fetchone()
-            if not row:return 0
-            lock_principal(c,row['principal'])
-            changed=c.execute('UPDATE api_keys SET revoked=true WHERE '+clause,(selector,)).rowcount
-            audit(c,{'id':row['principal'],'key_id':row['id']},'revoke_key','ok')
-            return changed
+        from . import key_admin
+        return key_admin.revoke(self, token, credential_id=credential_id)
 
     def extend_key(self,credential_id,days):
-        # Renewal in place (ANYM-422): token, digest, permissions and scope stay unchanged.
-        credential_id=key_id(credential_id)
-        if type(days) is not int or not 1<=days<=365:raise ValueError('invalid_key_lifetime')
-        with self.pool.connection() as c:
-            known=c.execute('SELECT principal FROM api_keys WHERE id=%s',(credential_id,)).fetchone()
-            if not known:raise ValueError('unknown_key')
-            lock_principal(c,known['principal'])
-            # The clock is read after the lock, as authentication does.
-            row=c.execute('''SELECT id,principal,revoked,expires_at,clock_timestamp() AS now,
-                clock_timestamp()+make_interval(days=>%s) AS extended FROM api_keys WHERE id=%s FOR UPDATE''',
-                (days,credential_id)).fetchone()
-            if row['revoked']:raise ValueError('key_revoked')
-            if row['expires_at']<=row['now']:raise ValueError('key_expired')
-            if row['extended']<row['expires_at']:raise ValueError('key_lifetime_would_shorten')
-            c.execute('UPDATE api_keys SET expires_at=%s WHERE id=%s',(row['extended'],credential_id))
-            audit(c,{'id':row['principal'],'key_id':row['id']},'extend_key','ok')
-            return serial({'key_id':row['id'],'previous_expires_at':row['expires_at'],'expires_at':row['extended']})
+        from . import key_admin
+        return key_admin.extend_key(self, credential_id, days)
 
     def list_keys(self,principal):
         principal_id(principal)

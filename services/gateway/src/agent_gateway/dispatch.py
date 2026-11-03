@@ -1,21 +1,27 @@
-import base64
-import binascii
+import base64  # noqa: F401  (kept importable from here)
+import binascii  # noqa: F401
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 import asyncio
-import hashlib
+import hashlib  # noqa: F401
 import logging
-import re
+import re  # noqa: F401
 from platform_contracts import Capability, safe_error
-from platform_contracts.agent import MAX_CANDIDATES, PLACEHOLDER_REQUEST_ID, validate_candidate
-from .adapters.calls import receipt_reference
+from platform_contracts.agent import MAX_CANDIDATES, PLACEHOLDER_REQUEST_ID, validate_candidate  # noqa: F401
+from .adapters.calls import receipt_reference  # noqa: F401
 
 from .catalog import arguments, CATALOG, InvalidArguments, routed
-from .diagnostics import FAILURE_FIELDS, discovery, manifest_summary, stale_arguments_hint, unavailable, unknown_tool_denial
+from .diagnostics import (FAILURE_FIELDS, discovery, gateway_build, manifest_lacks, manifest_summary, module_conditions,
+                          operation_missing_detail, stale_arguments_hint, unavailable, unknown_tool_denial)
 from .http_clients import WAIT_POOL, WAIT_RETRY_AFTER_S
 from .policy import Denied, key_from_file
-from .sections import capabilities_view, subscription_blocks
+from .sections import capabilities_view, subscription_blocks  # noqa: F401
 from .tiers import ADVANCED, default_list, REPLACED_BY
+from .dispatch_shaping import (  # noqa: F401  (the moved names stay importable from here)
+    CALENDAR_CONSTRAINTS, EXACT_TO, FILE_NAME, INLINE_UPLOAD_FIELDS, MIN_PAYLOAD, MIN_TOKEN, NAMED_WINDOWS, PHONE,
+    REFERENCE_KEY, TIME_KEY, TIMESTAMP, WRITE_ONLY_ARGUMENTS, branches, caller_payload, candidate_query, carries,
+    exposed, fixed, found, inline_upload_next, payload_strings, relayed_error, resolver_query, sensitive,
+    shape_result)
 
 PLAIN_PATH = "/mcp"
 MODULE_PATH = "/mcp/modules/"
@@ -31,245 +37,6 @@ MODULE_PURPOSES = {
     "calls": "Voice calls with briefs and preflight plus placed calls and their records",
     "messaging": "Messenger chats with search and the reply queue plus files and sending",
 }
-
-CALENDAR_CONSTRAINTS = {
-    "event_write",
-    "time_format",
-    "occurrence_write",
-    "all_day_write",
-    "provider_write",
-    "recurrence_write",
-    "future_split",
-    "series_write",
-    "invitations",
-    "refresh",
-    "window_limit_days",
-    "calendar_limit",
-    "event_limit",
-    "cache_max_age_seconds",
-    "refresh_wait_seconds",
-    "plan_action_limit",
-    "plan_step_limit",
-    "plan_ttl_seconds",
-    "atomic_cross_provider",
-    "availability_sources",
-}
-
-
-# A request key that names something the caller already chose (an ID, an account, a mode); any other string the
-# caller sent is payload: message text, file names, phone numbers, queries.
-REFERENCE_KEY = re.compile(r"(?:^|_)(?:ids?|digest|ref|token)$|^(?:account|chat|person|sender|receipt|operation|"
-                           r"consumer|reply_to|network|kind|view|detail|direction|order|format|status|live|modules|tool|"
-                           r"purpose|calendar)$")
-# platform_resolve_target's `to` (ANYM-545) is a reference only when it holds an exact archive ID or person UUID.
-EXACT_TO = re.compile(r"(?:chat|msg)_[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-# At least 7 digits, at most 3 separators between two digits, so "555 - 123 - 4567" and "(555)  123  4567" count.
-PHONE = re.compile(r"\+?\d(?:[\s().-]{0,3}\d){6,}")
-# A name, a dot and an extension of 1-10 letters or digits with at least one letter (.c, .7z, .sqlite3).
-FILE_NAME = re.compile(r"[\w-]+\.(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{1,10}\b")
-TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?")
-# The fields a whole timestamp of the caller may stand in without counting as payload (caller_payload).
-TIME_KEY = re.compile(r"start|end|date")
-MIN_PAYLOAD, MIN_TOKEN = 4, 6
-
-
-def payload_strings(value, key=None):
-    """The non-empty strings of `value` that are not under a reference key, and their words of at least MIN_TOKEN
-    characters, so an echoed fragment (a file name inside the text) counts too."""
-    if isinstance(value, dict):
-        return {s for k, v in value.items() for s in payload_strings(v, k)}
-    if isinstance(value, list):
-        return {s for v in value for s in payload_strings(v, key)}
-    if isinstance(value, str) and value.strip() and not (key and REFERENCE_KEY.search(key)):
-        return {value} | {word for word in value.split() if len(word) >= MIN_TOKEN}
-    return set()
-
-
-def branches(schema, defs):
-    """The object schemas `schema` stands for: itself, its anyOf/oneOf/allOf members and local $defs references."""
-    if not isinstance(schema, dict):
-        return []
-    ref = schema.get("$ref")
-    if isinstance(ref, str) and ref.startswith("#/$defs/"):
-        return branches(defs.get(ref.removeprefix("#/$defs/")), defs)
-    nested = [b for k in ("anyOf", "oneOf", "allOf") if isinstance(schema.get(k), list) for s in schema[k]
-              for b in branches(s, defs)]
-    return [schema, *nested]
-
-
-def fixed(value, schema, key, defs):
-    """A caller string its own field fixes (ANYM-552): one of that field's enum or const words, or a whole
-    timestamp in a declared time field (TIME_KEY). The same words in any other field stay payload."""
-    if schema is None:
-        return False
-    for branch in branches(schema, defs):
-        enum = branch.get("enum")
-        if value == branch.get("const") or (isinstance(enum, list) and value in enum):
-            return True
-    return bool(key and TIME_KEY.fullmatch(key) and TIMESTAMP.fullmatch(value))
-
-
-def caller_payload(value, schema, key=None, defs=None):
-    """payload_strings, walking the tool's input schema beside the values: a continuation that echoes the
-    caller's action ("cancel") or start time carries no payload; free text, titles and queries still do."""
-    if defs is None:
-        defs = schema.get("$defs", {}) if isinstance(schema, dict) else {}
-    if isinstance(value, dict):
-        fields = {}
-        for branch in branches(schema, defs):
-            fields.update(branch.get("properties") if isinstance(branch.get("properties"), dict) else {})
-        return {s for k, v in value.items() for s in caller_payload(v, fields.get(k), k, defs)}
-    if isinstance(value, list):
-        items = [b["items"] for b in branches(schema, defs) if isinstance(b.get("items"), dict)]
-        return {s for v in value for s in caller_payload(v, items[0] if items else None, key, defs)}
-    if isinstance(value, str) and fixed(value, schema, key, defs):
-        return set()
-    return payload_strings(value, key)
-
-
-def sensitive(text):
-    """A phone-shaped number or a file name, whoever wrote it: never relayed in backend guidance."""
-    return bool(PHONE.search(text) or FILE_NAME.search(text))
-
-
-def exposed(value, key=None):
-    """The strings of `value` outside a reference key; dict keys are field names, not values."""
-    if isinstance(value, dict):
-        return [s for k, v in value.items() for s in exposed(v, k)]
-    if isinstance(value, list):
-        return [s for v in value for s in exposed(v, key)]
-    if key == "to" and isinstance(value, str) and EXACT_TO.fullmatch(value):
-        return []
-    return [value] if isinstance(value, str) and not (key and REFERENCE_KEY.search(key)) else []
-
-
-NAMED_WINDOWS = frozenset({"today", "tomorrow", "this_week", "next_week"})
-
-
-def resolver_query(name, values):
-    """platform_resolve_target's `to` (ANYM-545) is the name to look up: its candidates' labels and their read-only
-    listing repeat it by design. Only that request's `to` stops being payload; phones and file names in the relayed
-    error are still dropped (`sensitive`), and a `to` in any relayed `next` is still checked."""
-    if name == "platform_resolve_target" and isinstance(values, dict):
-        return {key: value for key, value in values.items() if key != "to"}
-    return values
-
-
-def candidate_query(name, values, candidate):
-    """The payload one relayed candidate is checked against. calendar_find_time's `people` (ANYM-553) are names too,
-    and a candidate's label and read-only retry repeat them and the `window`: for that candidate an entry stops being
-    payload only as a member ID or as part of its own label, and the `window` only as a named window or two
-    timestamps. Any other entry (an unknown trailing name, free text in `from`) and the `title` stay payload; another
-    candidate's label exempts nothing here, and the hint and top-level next keep the whole payload."""
-    if name == "calendar_find_time" and isinstance(values, dict):
-        label = candidate.get("label") if isinstance(candidate, dict) else None
-        label = " ".join(label.split()).casefold() if isinstance(label, str) else ""
-
-        def member(entry):
-            if not isinstance(entry, str):
-                return False
-            wanted = " ".join(entry.split()).casefold()
-            return bool(EXACT_TO.fullmatch(entry)) or bool(wanted and label) and wanted in label
-
-        window = values.get("window")
-        checked = (isinstance(window, str) and window in NAMED_WINDOWS) or (
-            isinstance(window, dict) and set(window) == {"from", "to"}
-            and all(isinstance(v, str) and TIMESTAMP.fullmatch(v) for v in window.values()))
-        rest = {key: value for key, value in values.items() if key not in ("people", "window")}
-        people = values.get("people")
-        kept = [entry for entry in people if not member(entry)] if isinstance(people, list) else people
-        if kept:
-            rest["people"] = kept
-        if not checked and "window" in values:
-            rest["window"] = window
-        return rest
-    return values
-
-
-INLINE_UPLOAD_FIELDS = frozenset({"account", "chat_id", "filename", "mime", "bytes", "sha256", "request_id"})
-
-
-def inline_upload_next(name, values, detail):
-    """ANYM-547: messages_send over its inline cap names the upload call that takes that file instead. Its file
-    fields are the caller's payload, so the relay keeps that `next` only when they are one inline file of this very
-    call, recomputed here from its bytes; account and chat_id are references and request_id is the placeholder."""
-    step = detail.get("next") if isinstance(detail, dict) else None
-    args = step.get("arguments") if isinstance(step, dict) else None
-    if (name != "messages_send" or not isinstance(args, dict) or step.get("tool") != "messages_prepare_file_upload"
-            or set(args) != INLINE_UPLOAD_FIELDS or args["request_id"] != PLACEHOLDER_REQUEST_ID):
-        return None
-    files = values.get("files") if isinstance(values, dict) else None
-    for item in files if isinstance(files, list) else []:
-        if not isinstance(item, dict) or not isinstance(item.get("base64"), str):
-            continue
-        try:
-            raw = base64.b64decode(item["base64"], validate=True)
-        except (ValueError, binascii.Error):
-            continue
-        if (args["filename"], args["mime"], args["bytes"], args["sha256"]) == (
-                item.get("name"), item.get("mime"), len(raw), hashlib.sha256(raw).hexdigest()):
-            return step
-    return None
-
-
-# ANYM-519: write-only arguments of the endpoint tools; no gateway response repeats them.
-WRITE_ONLY_ARGUMENTS = frozenset({"signing_secret", "new_secret", "headers"})
-
-
-def found(piece, text):
-    """A piece of payload in `text`: a substring, or a whole word when shorter than MIN_PAYLOAD."""
-    if len(piece) >= MIN_PAYLOAD:
-        return piece in text
-    return re.search(rf"(?<!\w){re.escape(piece)}(?!\w)", text) is not None
-
-
-def carries(value, payload):
-    """The caller's payload, a phone number or a file name in any string of `value` outside a reference key."""
-    # A whole timestamp (a schedule's start) is no phone number, though its digits match PHONE (ANYM-552).
-    return any((sensitive(s) and not TIMESTAMP.fullmatch(s)) or any(found(p, s) for p in payload)
-               for s in exposed(value))
-
-
-def relayed_error(detail, runnable, read_only, payload, candidate_payload=None):
-    # candidate_payload(candidate): the payload that candidate is checked against (default: the whole payload).
-    """A backend error as the gateway relays it (ANYM-544). Every `next` (top level and per candidate) must run as
-    given for this caller and route; a `hint`, `next` or candidate with the caller's payload, a phone number or a
-    file name outside an ID or reference field is dropped. `selection_required` keeps a mutating continuation on
-    candidates only."""
-    detail = dict(detail)
-    if "hint" in detail and (not isinstance(detail["hint"], str) or carries(detail["hint"], payload)):
-        detail.pop("hint")
-
-    def safe(value, payload=payload):
-        return runnable(value) and not carries(value, payload)
-
-    candidate_payload = candidate_payload or (lambda candidate: payload)
-
-    if "next" in detail and not (safe(detail["next"]) and (detail.get("error") != "selection_required"
-                                                           or detail["next"]["tool"] in read_only)):
-        detail.pop("next")
-    if "candidates" in detail:
-        kept = []
-        for candidate in detail["candidates"] if isinstance(detail["candidates"], list) else []:
-            own = candidate_payload(candidate)
-            if isinstance(candidate, dict) and "next" in candidate and not safe(candidate["next"], own):
-                candidate = {k: v for k, v in candidate.items() if k != "next"}
-            if (isinstance(candidate, dict) and "last_activity" in candidate
-                    and not (isinstance(candidate["last_activity"], str)
-                             and TIMESTAMP.fullmatch(candidate["last_activity"]))):
-                candidate = {k: v for k, v in candidate.items() if k != "last_activity"}
-            try:
-                validate_candidate(candidate)
-            except ValueError:
-                continue
-            if not carries({k: v for k, v in candidate.items() if k not in ("next", "last_activity")}, own):
-                kept.append(candidate)
-        more = len(kept) > MAX_CANDIDATES or detail.get("more") is True
-        detail["candidates"] = kept[:MAX_CANDIDATES]
-        detail.pop("more", None)
-        if more and "next" in detail and detail["next"]["tool"] in read_only:
-            detail["more"] = True
-    return detail
 
 
 class Route:
@@ -525,6 +292,7 @@ class Dispatch:
         if current["revision"] != snapshot["revision"]:
             raise Denied("policy_changed", 409)
         visible = [n for n in visible if n in self.policy.visible(current, principal)]
+        allowed = list(visible)
         actions = self.actions(current, principal, capabilities.get("messaging", {}))
         visible = [
             n
@@ -548,8 +316,10 @@ class Dispatch:
             visible = route.listed(visible)
         manifests = {module: summary for module, caps, _ in results
                      if (summary := manifest_summary(caps)) is not None}
+        unavailable_modules, builds = module_conditions(allowed, states, capabilities)
         return current, principal, visible, {
             "states": states, "scopes": scopes, "actions": actions,
+            "unavailable_modules": unavailable_modules, "backend_builds": builds,
             "discovery": discovery(visible, actions, current["revision"]),
             "backend_tool_manifests": manifests, "selected": selected,
         }
@@ -647,7 +417,11 @@ class Dispatch:
             # ANYM-519: binding a self-service endpoint needs the local delivery-write grant too.
             raise Denied()
         if not self.implemented(tool, snapshot, agent, caps, args.get("account")):
-            raise Denied()
+            denied = Denied()
+            if manifest_lacks(tool, caps):
+                # ANYM-662: `call` explains this after it re-authorizes the key; any other cause stays this bare denial.
+                denied.operation_missing_caps = caps
+            raise denied
         rules_ceiling = "assignment:read" in set(agent["grants"].get(module, [])) & set(caps["permissions"])
         if (module == "calendar" and tool["operation"] == "plan"
                 and any(isinstance(a, dict) and (a.get("action") in ("project", "unproject")
@@ -712,8 +486,24 @@ class Dispatch:
     def admit(self, key, name):
         return self.policy.authorize_agent(*self.authenticate(key), name)
 
-    async def call(self, key, name, values, route=None):
-        """One admitted tool call; `route` is the MCP connection path (REST passes None and ignores selection)."""
+    def operation_missing(self, key, name, snapshot, tool, caps):
+        """The detailed body for a policy-allowed tool whose operation the module build lacks (ANYM-662). The key is
+        authorized again after the capability read and before any detail is built, so a revocation mid-request leaves the
+        one identical body of a tool the key cannot call."""
+        try:
+            current, principal, _ = self.admit(key, name)
+        except Denied as error:
+            if error.code == "not_found_or_forbidden" and error.status == 403:
+                error.detail = unknown_tool_denial("platform_capabilities" in self.visible_to(key))
+            raise
+        if current["revision"] != snapshot["revision"]:
+            raise Denied("policy_changed", 409)
+        try:
+            return operation_missing_detail(tool, caps, "platform_capabilities" in self.policy.visible(current, principal))
+        except Exception:  # noqa: BLE001 - a diagnostic never replaces the denial; today's bare body stays
+            return None
+
+    def admit_call(self, key, name, values, route):
         try:
             snapshot, agent, tool = self.admit(key, name)
         except Denied as error:
@@ -752,6 +542,11 @@ class Dispatch:
             raise denied from None
         except ValueError:
             raise Denied("invalid_arguments", 422) from None
+        return snapshot, agent, tool, selected, args
+
+    async def call(self, key, name, values, route=None):
+        """One admitted tool call; `route` is the MCP connection path (REST passes None and ignores selection)."""
+        snapshot, agent, tool, selected, args = self.admit_call(key, name, values, route)
         if tool["operation"] == "select_modules":
             return await self.select_modules(key, route, args["modules"])
         if tool["module"] == "gateway":
@@ -768,6 +563,9 @@ class Dispatch:
                 "tools": visible,
                 "modules": sorted({CATALOG[n]["module"] for n in visible} - {"gateway"}),
                 "backend_states": states["states"],
+                "unavailable": states["unavailable_modules"],
+                "backend_builds": states["backend_builds"],
+                "gateway": {"build": gateway_build()},
                 "coverage": "query selected module capabilities; unavailable/stale sources remain unknown",
                 "subscriptions": "existing backend identity; passive events do not ACK",
                 # The gateway's own local write (platform_select_modules) is not a provider mutation.
@@ -795,7 +593,14 @@ class Dispatch:
                 error.detail = unavailable(tool["operation"], getattr(error, "detail", None),
                                            phase="capabilities", read_only=read_only)
             raise
-        allowed_actions = self.argument_admission(tool, args, snapshot, agent, caps)
+        try:
+            allowed_actions = self.argument_admission(tool, args, snapshot, agent, caps)
+        except Denied as denied:
+            if getattr(denied, "operation_missing_caps", None) is not None:
+                detail = self.operation_missing(key, name, snapshot, tool, denied.operation_missing_caps)
+                if detail is not None:
+                    denied.detail = detail
+            raise
         operation, args = self.backend_call(tool, args, caps)
         # A preview has no effect, also when a risk-class tool asks for it.
         read_only = read_only or operation == "preview_messenger_operation"
@@ -875,110 +680,8 @@ class Dispatch:
                         visible, module, current, principal, caps):
                     error.detail["next"] = upload
             raise
-        if module == "messaging":
-            result = self.next_call(result, snapshot, agent, caps)
-        if live_denied and isinstance(result, dict):
-            # detail=transcript moves live and suggested_call from result_evidence to the top level.
-            evidence = result["result_evidence"] if isinstance(result.get("result_evidence"), dict) else result
-            if (evidence.get("suggested_call") or {}).get("tool") == "messages_search":
-                evidence.pop("suggested_call")
-            if live_requested:
-                evidence["live"] = [{"state": "not_permitted", "reason": "gateway_action"}]
-        if module == "calls":
-            receipt_reference(tool["operation"], result)
-        if (module == "calendar" and tool["operation"] == "plan" and not rules_ceiling and isinstance(result, dict)
-                and ("projections_skipped" in result
-                     or any(isinstance(st, dict) and "link" in st for st in result.get("steps") or []))):
-            # A lesson change the backend carried to its drives shows rule IDs past this gateway's ceiling;
-            # the stored plan is never applied through it and expires.
-            raise Denied()
-        if module == "calendar" and tool["operation"] in {"calendars", "capabilities"}:
-            result = dict(result)
-            if "constraints" in result:
-                constraints = result["constraints"]
-                result["constraints"] = (
-                    {field: value for field, value in constraints.items() if field in CALENDAR_CONSTRAINTS}
-                    if isinstance(constraints, dict)
-                    else {}
-                )
-            selected = set(self.policy.visible(current, principal))
-            scopes = set(principal["grants"].get("calendar", [])) & set(caps["permissions"])
-            result["calendars"] = [
-                dict(
-                    row,
-                    allowed_event_actions=[
-                        action
-                        for action in row.get("allowed_event_actions", [])
-                        if action in {"create", "update", "delete"}
-                        and {"calendar_plan", "calendar_apply"} <= selected
-                        and {"plan:create", "plan:execute", "event:" + action} <= scopes
-                    ],
-                )
-                for row in result.get("calendars", [])
-            ]
-        if module == "calendar" and tool["operation"] == "members":
-            # Guardian rules follow the gateway's assignment ceiling, not only the backend key's.
-            if "assignment:read" not in set(principal["grants"].get("calendar", [])) & set(caps["permissions"]):
-                result = dict(result)
-                result["members"] = [
-                    {k: v for k, v in row.items() if k != "guardian_rules"} if isinstance(row, dict) else row
-                    for row in result.get("members", [])
-                ]
-        if tool.get("action_group"):
-            if tool["operation"] == "list_messenger_operations":
-                result = {
-                    **result,
-                    "items": [
-                        row
-                        for row in result.get("items", [])
-                        if row.get("operation") in allowed_actions and row.get("supported") is True
-                    ],
-                }
-            elif result.get("operation") not in allowed_actions:
-                raise Denied()
-        if tool["operation"] == "get_attachment" and result.get("download_url"):
-            result = self.tickets.issue(
-                result, key, agent, snapshot, credential, args["attachment_id"], started
-            )
-        if tool["operation"] == "capabilities":
-            # Preserve scoped coverage/account data, while avoiding the upstream
-            # catalog advertising methods unavailable through this connection.
-            visible = [
-                n
-                for n in self.policy.visible(snapshot, agent)
-                if CATALOG[n]["module"] == module
-                and set(CATALOG[n]["scopes"]) <= set(caps["permissions"])
-                and self.implemented(CATALOG[n], snapshot, agent, caps)
-                and (
-                    not CATALOG[n].get("action_group")
-                    or bool(routed(CATALOG[n], allowed_actions))
-                    or (
-                        CATALOG[n]["operation"] == "get_messenger_operation"
-                        and bool(self.policy.actions(snapshot, agent, caps["permissions"]))
-                    )
-                )
-            ]
-            result = dict(result)
-            for field in (
-                "tool_manifest",
-                "messenger_operations",
-                "available",
-                "features",
-                "key_permission_ceiling",
-                "permissions",
-            ):
-                result.pop(field, None)
-            result["gateway_tools"] = visible
-            result["gateway_principal"] = agent["id"]
-            result["backend_principal"] = result.get("principal")
-            result["gateway_actions"] = allowed_actions
-            result["gateway_actions_scope"] = "messenger_operations"
-            manifest = manifest_summary(caps)
-            if manifest is not None:
-                result["backend_tool_manifest"] = manifest
-            if module == "messaging":
-                result.update(self.usable_actions(snapshot, agent, caps))
-            result["gateway_policy_revision"] = snapshot["revision"]
-            if module == "messaging":
-                result = capabilities_view(subscription_blocks(result, visible), args)
-        return result
+        return shape_result(
+            self, result, tool=tool, module=module, snapshot=snapshot, agent=agent, caps=caps, current=current,
+            principal=principal, allowed_actions=allowed_actions, rules_ceiling=rules_ceiling,
+            live_denied=live_denied, live_requested=live_requested, key=key, credential=credential, args=args,
+            started=started)

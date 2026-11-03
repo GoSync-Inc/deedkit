@@ -3,7 +3,12 @@
 `search_people(query, accounts, chats, after, limit)` searches by observed name,
 username (with or without `@`) and provider sender ID. The search is case-insensitive
 and matches a literal fragment; `%` and `_` are not wildcards. For fragments
-of three or more characters a PostgreSQL trigram GIN is used. The page limit is 100.
+of three or more characters a PostgreSQL trigram GIN is used. The query is normalized
+(Unicode NFC, trimmed, inner spaces collapsed, lowercase, leading `@` removed) and "literal" means
+literal after lowercase and the ё/е fold: a query of three or more characters reads ё and е as the same
+letter in both directions ("Федор" finds "Фёдор" and the reverse). A row found only through the fold
+reports `match_type: literal_folded` and sorts after the literal rows. The fold does not touch the
+Latin transliteration path (`fedor` does not find `fyodor`). The page limit is 100.
 
 The result contains `account`, `chat`, `sender_id`, `display_name`, `username`,
 `sender_name`, `sender_name_basis`, `source_message`, the message date and the
@@ -26,6 +31,17 @@ network lookup and does not import the whole address book. Therefore old records
 this metadata, unknown usernames or unavailable contacts cannot be found by
 name; use the exact sender ID in `search`. Checking the completeness of the catalog on
 working accounts remains part of live acceptance.
+
+### The Telegram contact book (ANYM-673)
+
+An empty `search_people` result carries `see_also: {tool: "list_contacts", argument: "query", accounts: [...]}`
+when no row came from a Telegram account the key may read contacts for. The accounts are the Telegram accounts
+where the key holds `contacts-read` (and is a full-account key) and the owner enabled `list_contacts`; the
+field is absent when there are none. Follow it with the messenger operation `list_contacts` and `parameters.query`
+(1-64 characters): it filters the account's contacts live by display name and username only, no phone number;
+ё and е are one letter and a Latin spelling finds the Cyrillic name (`fedor` finds Федор; Фёдор is `fyodor`).
+`limit`/`offset` page the filtered list. Each call reads the whole book once per account, so for many names page
+the full list once without `query`. Nothing is stored; the contact book is not merged into the archive results.
 
 ## Linked people (ANYM-283, schema 43)
 

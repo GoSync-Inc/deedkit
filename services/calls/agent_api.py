@@ -15,11 +15,12 @@ from fastapi.responses import JSONResponse
 
 from anymsg import AnyMsg
 import call_events
+from build_info import build
 from core import AgentBrief, ServiceError
 from outbound import AgentExternalBrief
 import destination_policy as policy
 import voice_engines
-from call_intent import CallArgs, CallIntents, CallResultArgs, parse
+from call_intent import CallArgs, CallIntents, CallResultArgs, field_errors, invalid, parse
 
 
 class Strict(BaseModel):
@@ -551,13 +552,17 @@ class AgentAPI:
                 policy.unsupported(selected.get("channel"), selected.get("destination"))
         try:
             args = model.model_validate(arguments)
-        except ValidationError:
+        except ValidationError as error:
+            if name == "prepare_external_call":
+                # ANYM-657: every failing field in one response, in the vocabulary the other call tools use.
+                raise invalid(field_errors(error, arguments)) from None
             raise ServiceError("invalid_arguments", 422) from None
         if name == "capabilities":
             # One snapshot of the effective cap, raises included (ANYM-353).
             cap = self.outbound.cap_status(principal.id) if self.outbound else None
             return {
                 "service": "deedkit-calls",
+                "build": build(),
                 "principal": principal.id,
                 "permissions": principal.scopes,
                 "channels": principal.channels,
@@ -674,6 +679,7 @@ class AgentAPI:
                     "end_reason",
                     "dial_state",
                     "provider_status",
+                    "provider_error",
                     "inbound_audio",
                     "late_inbound_ms",
                     "summary_missing",

@@ -23,8 +23,9 @@ from .adapters import telegram_message
 from .archive import Archive
 from .blobs import BlobWriter
 from .envelope import stable_id
-from .collector_state import LIVE_REJECT_CODES,CaptureSpool,CollectorState,session_lock
-from .spool import InvalidCapture
+from .collector_state import LIVE_REJECT_CODES,CaptureSpool,CollectorState,PeerKindConflict,session_lock
+from .spool import InvalidCapture,PoisonItem
+from .collector_common import DbBackoff,commit_items,validate_common,validate_ranges
 from .store import Store
 from .telegram_governor import LIVE_BUDGETS,LIVE_STATE,ProviderRateLimited,RequestGovernor
 from .operational import CONNECTION_ERRORS,MEDIA_ERRORS,collector_stop
@@ -115,17 +116,13 @@ def configuration(path):
     fields={'enabled','account','credentials_file','session_file','permit_file','spool_directory',
             'batch_size','scan_interval_seconds','max_media_bytes','disk_reserve_bytes',
             'max_dialogs','history_since','media_backfill','live_search_budget'}|MEDIA_POLICY_FIELDS
-    if not isinstance(cfg,dict) or set(cfg)-fields: raise ValueError('invalid_collector_config')
-    if cfg.get('enabled') is not True: raise RuntimeError('collector_disabled')
-    if not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',cfg.get('account','')): raise ValueError('invalid_account')
+    validate_common(cfg,fields)
     for key in ['credentials_file','session_file','permit_file','spool_directory']:
         if not isinstance(cfg.get(key),str) or not Path(cfg[key]).is_absolute(): raise ValueError('invalid_private_path')
     if not cfg['session_file'].endswith('.session'): raise ValueError('invalid_session_filename')
-    for key,default,lo,hi in [('batch_size',100,1,100),('scan_interval_seconds',60,10,3600),
-                            ('max_media_bytes',512*1024**2,1,4*1024**3),
-                            ('disk_reserve_bytes',1024**3,1024**3,100*1024**3)]:
-        value=cfg.setdefault(key,default)
-        if type(value) is not int or not lo<=value<=hi: raise ValueError('invalid_'+key)
+    validate_ranges(cfg,[('batch_size',100,1,100),('scan_interval_seconds',60,10,3600),
+                         ('max_media_bytes',512*1024**2,1,4*1024**3),
+                         ('disk_reserve_bytes',1024**3,1024**3,100*1024**3)])
     configure_media_policy(cfg)
     if type(cfg.setdefault('media_backfill',True)) is not bool: raise ValueError('invalid_media_backfill')
     maximum=cfg.setdefault('max_dialogs',None)
@@ -163,6 +160,16 @@ def history_bound(value):
     except ValueError: raise ValueError('invalid_history_since') from None
     if result.tzinfo is None: raise ValueError('invalid_history_since')
     return result.astimezone(timezone.utc)
+
+
+def dialog_kind(dialog):
+    """The dialog's peer kind from its raw TL peer, which also names a ChannelForbidden.
+
+    Telethon's Dialog.is_channel is False for a ChannelForbidden; a marked-id pattern cannot tell
+    that from a basic group whose id starts with 100, so the raw peer decides."""
+    peer=getattr(getattr(dialog,'dialog',None),'peer',None)
+    if dialog.is_channel or getattr(peer,'channel_id',None) is not None:return 'channel'
+    return 'user' if dialog.is_user else 'chat'
 
 
 def peer_kind(message):
@@ -349,7 +356,7 @@ class TelethonProvider:
             except ProviderRateLimited:
                 if batch:yield batch;batch=[]
                 continue
-            kind='channel' if dialog.is_channel else ('user' if dialog.is_user else 'chat')
+            kind=dialog_kind(dialog)
             chat_type='private' if dialog.is_user else ('group' if dialog.is_group else 'channel')
             raw=getattr(dialog,'dialog',None)
             observation={'observed_at':page_observed_at,
@@ -421,8 +428,9 @@ class TelethonProvider:
         except FloodWaitError as exc: raise ProviderRateLimited(exc.seconds) from None
         except (FileReferenceExpiredError,FilerefUpgradeNeededError):
             # Even a freshly fetched preview can contain an expired reference.
-            # Retry this job with a fresh message on the next bounded attempt;
-            # one unavailable original must not stop every chat's collection.
+            # Retry this job with a fresh message on the next attempt (its own code and a
+            # three-attempt budget, media_retry.MEDIA_ATTEMPT_CAPS); one unavailable original
+            # must not stop every chat's collection.
             raise OSError('media_reference_expired') from None
 
 
@@ -630,23 +638,16 @@ class TelegramCollector:
 
     async def commit_page(self,messages,chat,title,kind,origin):
         ids=[]
-        for message in messages:
+        def check(message):
             if str(message.chat_id)!=chat: raise RuntimeError('provider_chat_mismatch')
-            try:
-                e=telegram_message(self.account,message,chat_title=title,origin=origin,
-                    verified_self=getattr(self.provider,'verified_self',None))
-            except ValueError:
-                # One unstorable message must not stop history for the chat or account.
-                self.invalid_messages+=1; ids.append(message.id); continue
-            item={'kind':'message','peer_kind':kind,'envelope':e}
-            try:name=await asyncio.to_thread(self.history_spool.put,item)
-            except InvalidCapture:
-                # The same rejection a live callback counts; capacity and I/O still raise.
-                self.invalid_messages+=1; ids.append(message.id); continue
-            await asyncio.to_thread(self.state.apply,item)
-            # Committed directly; draining the same bytes again would only repeat the work.
-            await asyncio.to_thread(self.history_spool.discard,name)
-            ids.append(message.id)
+        def build(message):
+            e=telegram_message(self.account,message,chat_title=title,origin=origin,
+                verified_self=getattr(self.provider,'verified_self',None))
+            return {'kind':'message','peer_kind':kind,'envelope':e}
+        # An unstorable message (a build ValueError) must not stop history for the chat or account; a spool
+        # InvalidCapture is the same rejection a live callback counts, while capacity and I/O still raise.
+        await commit_items(self,messages,check=check,build=build,build_errors=ValueError,put_errors=InvalidCapture,
+            record=lambda message:ids.append(message.id),record_unstorable=lambda message:ids.append(message.id))
         return ids
 
     async def chat_page(self,chat,**query):
@@ -754,8 +755,10 @@ class TelegramCollector:
             except FloodWaitError:
                 await asyncio.to_thread(self.state.failed,chat,'rate_limited')
                 raise
-            except ChatPageFailed as failure:
-                # One chat's provider error marks only that chat; the pass goes on (ANYM-293).
+            except (ChatPageFailed,PeerKindConflict) as failure:
+                # One chat's provider error marks only that chat; the pass goes on (ANYM-293). A stored kind
+                # that differs from the dialog's is the same: the row never clears by itself, and it must not end the worker.
+                if isinstance(failure,PeerKindConflict):failure=ChatPageFailed('peer_kind_conflict',failure)
                 unavailable=True
                 self.chat_failed(chat,failure)
                 await asyncio.to_thread(self.state.failed,chat,failure.code,chat_error_evidence(failure.error))
@@ -769,7 +772,7 @@ class TelegramCollector:
         from .telegram_identity import repair_sent_senders
         await asyncio.to_thread(repair_sent_senders,self.archive,self.account,self.state.lease,
             getattr(self.provider,'verified_self',None))
-        delay=self.database_retry
+        backoff=DbBackoff(self)
         while True:
             try: await self.sync_once()
             except (FloodWaitError,ProviderRateLimited) as exc:
@@ -781,8 +784,8 @@ class TelegramCollector:
                 continue
             except database_errors():
                 # Checkpoints are committed per page; retry instead of reconnecting the provider.
-                await asyncio.sleep(delay); delay=min(60,delay*2); continue
-            delay=self.database_retry
+                await backoff.wait(); continue
+            backoff.reset()
             await asyncio.sleep(self.interval)
 
     async def drain_loop(self):
@@ -800,15 +803,20 @@ class TelegramCollector:
 
     async def drain_captures(self,spools,history_spools=()):
         last=None;count=0
+        def settle(item):
+            # A kept item whose chat has another stored kind can never apply: quarantine its bytes so the
+            # other chats keep draining (counted in capture_progress), instead of ending the worker.
+            try:return self.state.apply(item)
+            except PeerKindConflict as exc:raise PoisonItem('peer_kind_conflict') from exc
         def apply(item):
             nonlocal last,count
-            self.state.apply(item);last=item;count+=1
+            settle(item);last=item;count+=1
         gap_lock=getattr(getattr(self,'provider',None),'read_gap_lock',None) or nullcontext()
         async with gap_lock:await self.flush_read_gap()
         for spool in spools:await asyncio.to_thread(spool.drain,apply,100)
         # History pages were applied inline when fetched. Replaying them is
         # idempotent and is neither live progress nor live backlog.
-        for spool in history_spools:await asyncio.to_thread(spool.drain,self.state.apply,100)
+        for spool in history_spools:await asyncio.to_thread(spool.drain,settle,100)
         publish=getattr(self.state,'publish_receipts',None)
         if callable(publish):await asyncio.to_thread(publish,limit=100)
         if count or time.monotonic()>=getattr(self,'_next_capture_status',0):
@@ -938,6 +946,7 @@ class TelegramCollector:
                 # A missing directory, permission or read-only mount is local
                 # storage, not the provider network.
                 code,permanent='storage_unavailable',False
+            elif str(exc)=='media_reference_expired': code,permanent='media_reference_expired',False
             elif str(exc) in ('media_size_mismatch','media_hash_mismatch','blob_corrupt'):
                 code,permanent='integrity_error',False
             else: code,permanent='network_error',False
@@ -966,13 +975,13 @@ class TelegramCollector:
         return True
 
     async def media_loop(self):
-        delay=self.database_retry
+        backoff=DbBackoff(self)
         while True:
             try:active=await self.media_once()
             except database_errors():
                 # An unfinished job's lease expires and it is claimed again later.
-                await asyncio.sleep(delay); delay=min(60,delay*2); continue
-            delay=self.database_retry
+                await backoff.wait(); continue
+            backoff.reset()
             if not active: await asyncio.sleep(1)
 
     def disk_floors(self):
@@ -1066,9 +1075,10 @@ class TelegramCollector:
 
     async def outgoing_expiry_loop(self):
         from psycopg import Error
+        from psycopg.errors import LockNotAvailable
         from .outgoing import OutgoingWorker,EXPIRY_SECONDS,EXPIRY_GRACE
         worker=OutgoingWorker(self.state,None)
-        delay=self.database_retry
+        backoff=DbBackoff(self)
         while True:
             deadline=time.monotonic()+EXPIRY_SECONDS
             pending=asyncio.create_task(asyncio.to_thread(worker.expire_queued,deadline=deadline))
@@ -1079,10 +1089,16 @@ class TelegramCollector:
                 await asyncio.wait({pending},timeout=max(0,deadline+EXPIRY_GRACE-time.monotonic()))
                 pending.add_done_callback(lambda t:t.cancelled() or t.exception())
                 raise
+            except LockNotAvailable:
+                # Every ingest transaction holds this account's collector_leases row (fence) and expire_queued
+                # waits only 100 ms for it, so a busy archive is routine contention, not a fault. The pass
+                # skips, tries again at the fixed database_retry (no doubling) and logs nothing; claim()
+                # still expires a due send before it dispatches and reads report it expired by the clock.
+                await asyncio.sleep(self.database_retry);continue
             except (Error,TimeoutError,*database_errors()) as exc:
                 log.warning('outgoing_expiry_failed exception_type=%s',type(exc).__name__)
-                await asyncio.sleep(delay);delay=min(60,delay*2);continue
-            delay=self.database_retry
+                await backoff.wait();continue
+            backoff.reset()
             await asyncio.sleep(1)
 
     async def outgoing_dispatch_loop(self):
@@ -1090,7 +1106,7 @@ class TelegramCollector:
         from .commands import CommandWorker
         worker=OutgoingWorker(self.state,self.send_outgoing,getattr(self.provider,'send_gate',None))
         commands=CommandWorker(self.state,self.execute_operation,getattr(self.provider,'send_gate',None))
-        delay=self.database_retry
+        backoff=DbBackoff(self)
         while True:
             try:
                 active=await worker.once()
@@ -1099,8 +1115,8 @@ class TelegramCollector:
                 active=await commands.once() or active
             except database_errors():
                 # Dispatched rows keep their lease epoch; nothing is retried automatically.
-                await asyncio.sleep(delay); delay=min(60,delay*2); continue
-            delay=self.database_retry
+                await backoff.wait(); continue
+            backoff.reset()
             await asyncio.sleep(.25 if active else 1)
 
     async def execute_operation(self,job):

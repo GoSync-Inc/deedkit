@@ -53,6 +53,83 @@ def api(service, path, outbound=None, archive_factory=None):
     )
 
 
+# spec: ANYM-657
+async def test_get_call_status_returns_the_provider_error(tmp_path):
+    path, _, _ = registry(tmp_path)
+    service = VoiceService(tmp_path / "data")
+    surface = api(service, path)
+    brief = await surface.call("alice", "prepare_call", {"brief": {**BRIEF, "source_message_ids": []}})
+    call = service.start(brief["id"])
+    quiet = await surface.call("alice", "get_call_status", {"call_id": call["id"]})
+    assert "provider_error" not in quiet
+    error = {"http_status": 400, "code": 21215, "cause": "geo_permission_missing"}
+    service.provider_update(call["id"], provider_status="provider_rejected", dial_state="rejected", provider_error=error)
+    status = await surface.call("alice", "get_call_status", {"call_id": call["id"]})
+    assert status["provider_error"] == error and status["provider_status"] == "provider_rejected"
+    service.close()
+
+
+# spec: ANYM-657
+async def test_a_refused_external_brief_names_every_bad_field(tmp_path):
+    path, _, _ = registry(tmp_path)
+    service = VoiceService(tmp_path / "data")
+    surface = api(service, path)
+    good = {**BRIEF, "channel": "telegram", "account": "telegram", "destination": "123456789"}
+    for destination in ("+123456789", "12ab", "12 34"):
+        with pytest.raises(ServiceError) as caught:
+            await surface.call("alice", "prepare_external_call", {"brief": {**good, "destination": destination}})
+        assert caught.value.code == "invalid_arguments" and caught.value.status == 422
+        assert caught.value.detail["field_errors"] == [{"field": "brief/destination", "reason": "format",
+                                                        "expected": "digits only (Telegram user ID)"}]
+    with pytest.raises(ServiceError) as caught:
+        await surface.call("alice", "prepare_external_call",
+                           {"brief": {**good, "goal": "no", "max_duration_secs": 5, "language": "xx", "surprise": 1}})
+    fields = {entry["field"]: entry for entry in caught.value.detail["field_errors"]}
+    assert {"brief/goal", "brief/max_duration_secs", "brief/language", "brief/surprise"} <= set(fields)
+    assert fields["brief/language"]["reason"] == "enum" and fields["brief/language"]["allowed"] == ["ru", "en", "id"]
+    assert fields["brief/surprise"]["reason"] == "unknown_field"
+    assert len(caught.value.detail["field_errors"]) <= 20
+    # a phone number is checked against the E.164 form, and a valid brief is still prepared
+    with pytest.raises(ServiceError) as caught:
+        await surface.call("alice", "prepare_external_call", {"brief": {**good, "channel": "phone", "account": "twilio",
+                                                                       "destination": "0628123456"}})
+    assert caught.value.detail["field_errors"][0]["expected"] == "an E.164 number: + and 8 to 15 digits"
+    service.close()
+
+
+# spec: ANYM-657
+async def test_a_bad_destination_is_named_beside_other_failing_fields(tmp_path):
+    path, _, _ = registry(tmp_path)
+    service = VoiceService(tmp_path / "data")
+    surface = api(service, path)
+    good = {**BRIEF, "channel": "telegram", "account": "telegram", "destination": "123456789"}
+    cases = [  # pydantic skips the route check when another brief field fails
+        ({"destination": "+123456789", "goal": "no"}, {"brief/destination", "brief/goal"}),
+        ({"channel": "phone", "account": "twilio", "destination": "+1234567", "language": "xx"},
+         {"brief/destination", "brief/language"}),
+        # a valid destination with the wrong account blames the account, not the destination
+        ({"account": "twilio"}, {"brief/account"}),
+        ({"account": "twilio", "goal": "no"}, {"brief/account", "brief/goal"}),
+        ({"channel": "phone", "account": "telegram", "destination": "+12345678"}, {"brief/account"}),
+        # an account fault never hides a destination fault, and an unknown or missing account does not either
+        ({"account": "twilio", "destination": "+123456789", "goal": "no"},
+         {"brief/account", "brief/destination", "brief/goal"}),
+        ({"account": "nope", "destination": "+123456789", "goal": "no"},
+         {"brief/account", "brief/destination", "brief/goal"}),
+        ({"account": None, "destination": "+123456789"}, {"brief/account", "brief/destination"}),
+    ]
+    for change, fields in cases:
+        with pytest.raises(ServiceError) as caught:
+            await surface.call("alice", "prepare_external_call", {"brief": {**good, **change}})
+        entries = {entry["field"]: entry for entry in caught.value.detail["field_errors"]}
+        assert set(entries) == fields, change
+        if entries.get("brief/account", {}).get("reason") == "enum":
+            assert entries["brief/account"]["allowed"] == ["telegram" if change.get("channel") != "phone" else "twilio"]
+        if "brief/destination" in entries:
+            assert entries["brief/destination"]["reason"] == "format" and "expected" in entries["brief/destination"]
+    service.close()
+
+
 async def test_ownership_cannot_be_spoofed_and_survives_restart(tmp_path):
     path, _, _ = registry(tmp_path)
     service = VoiceService(tmp_path / "data")
@@ -386,6 +463,22 @@ async def test_lists_are_owned_newest_first_paged_and_summarized(tmp_path):
     for operation in ("list_briefs", "list_calls"):
         with pytest.raises(ServiceError, match="not_found_or_forbidden"):
             await surface.call("alice", operation, {})
+    service.close()
+
+
+# spec: ANYM-662
+async def test_capabilities_report_the_deployed_build(tmp_path, monkeypatch):
+    path, _, _ = registry(tmp_path)
+    service = VoiceService(tmp_path / "data")
+    surface = api(service, path, None)
+    monkeypatch.setenv("DEEDKIT_SOURCE_SHA", "d" * 40)
+    build = (await surface.call("alice", "capabilities", {}))["build"]
+    assert build["source_sha"] == "d" * 40 and build["started_at"].endswith("Z")
+    for value in ("not-a-sha", "D" * 40, "d" * 41, ""):
+        monkeypatch.setenv("DEEDKIT_SOURCE_SHA", value)
+        assert (await surface.call("alice", "capabilities", {}))["build"]["source_sha"] is None
+    monkeypatch.delenv("DEEDKIT_SOURCE_SHA")
+    assert (await surface.call("alice", "capabilities", {}))["build"]["source_sha"] is None
     service.close()
 
 

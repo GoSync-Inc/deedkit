@@ -540,7 +540,9 @@ def test_search_named_chat_with_empty_type_filter_reports_empty_filter(seeded,op
     s,a,b=seeded
     typed_chats(s)
     evidence=s.search(b,'typedneedle',**options)['result_evidence']
-    assert evidence['empty_reason']=='empty_filter' and evidence['next_action']=='inspect_chat_coverage'
+    # ANYM-660: an empty_filter is the caller's own list, so the next step is to fix that filter.
+    assert evidence['empty_reason']=='empty_filter' and evidence['next_action']=='fix_filter'
+    assert evidence['empty_fields']==['chat_types']
 
 
 # spec: ANYM-272

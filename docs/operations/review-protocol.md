@@ -26,6 +26,12 @@ backup is itself a failure.
 Process text here is AGENTS.md, CLAUDE.md, `.claude/`, `docs/operations/` and TIDEN-CI.md;
 AGENTS.md stays within 1,000 words.
 
+For confirmed production recovery only, AGENTS.md section 2 and
+[incident recovery](incident-recovery.md) move independent review and plan
+ceremonies after restoring the affected path. Required CI and green-main artifact
+verification remain before promotion. Finish deferred reviews and any fixes
+before unrelated work; this changes ordering, not the findings that must be fixed.
+
 ## Codex budget
 
 DeedKit spends at most 4 points a day: the line is `68% + 4 × days since 10-19 03:30Z` until the

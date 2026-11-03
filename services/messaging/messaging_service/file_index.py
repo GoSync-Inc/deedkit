@@ -22,9 +22,11 @@ from psycopg.types.json import Jsonb
 
 from .file_extract import (Extraction, MAX_INPUT_BYTES, MAX_TEXT_CHARS, PROCESSOR_VERSION, extract_original,
                           extraction_profile, valid_metadata)
+from .field_errors import cursor_refusal, date_range_refusal
 from .policy import scope_filter, targets
 from . import resource_admission
 from . import processing_events
+from .field_errors import field_error
 from .search_query import compile_query, cursor_binding, encode_cursor, decode_cursor
 
 
@@ -160,6 +162,15 @@ ENRICH_READY = "e.state='ready'"
 # Audio by MIME, the rule processing profiles use; the enrichment kind is set only on lease.
 VOICE = "(a.mime LIKE 'audio/%%' OR a.mime='application/ogg')"
 ENRICH_TEXT = "(CASE WHEN e.state='ready' THEN e.title||' '||e.summary||' '||coalesce(e.metadata->>'document_type','')||' '||e.text_content ELSE '' END)"
+# ANYM-661: a file's media class, from the provider's label and otherwise its MIME type. `%%` is the psycopg escape.
+MEDIA_KINDS = ('voice', 'audio', 'image', 'video', 'document')
+MEDIA_ALIASES = {'photo': 'image', 'sticker': 'image', 'animation': 'video', 'other': 'document'}
+READY_VALUES = ('text', 'transcript', 'description')
+MEDIA_LABEL = "(SELECT metadata->>'media_kind' FROM message_metadata WHERE message=m.id AND revision=m.revision)"
+MEDIA_CLASS = ("(CASE " + MEDIA_LABEL + " WHEN 'voice' THEN 'voice' WHEN 'audio' THEN 'audio' WHEN 'photo' THEN 'image'"
+    " WHEN 'sticker' THEN 'image' WHEN 'video' THEN 'video' WHEN 'animation' THEN 'video' ELSE"
+    " (CASE WHEN a.mime IN ('audio/ogg','audio/opus','application/ogg') THEN 'voice' WHEN a.mime LIKE 'audio/%%' THEN 'audio'"
+    " WHEN a.mime LIKE 'image/%%' THEN 'image' WHEN a.mime LIKE 'video/%%' THEN 'video' ELSE 'document' END) END)")
 ENRICH_COLUMNS = """CASE WHEN coalesce(e.state,'unconfigured')='unconfigured' AND EXISTS(
     SELECT FROM processing_profiles pp WHERE pp.account=m.account AND pp.enabled
     AND pp.kind=CASE WHEN a.mime LIKE 'audio/%%' OR a.mime='application/ogg' THEN 'audio'
@@ -182,6 +193,9 @@ UNDERSTANDING_JOIN = """LEFT JOIN attachment_understanding u ON u.attachment=a.i
     AND u.source_digest=a.digest AND u.source_revision=m.revision AND u.state<>'superseded'
     LEFT JOIN file_understanding_profiles up ON up.account=m.account AND up.kind=u.kind"""
 UNDERSTANDING_READY = "(u.indexed_at IS NOT NULL AND u.published_profile_hash IS NOT NULL)"
+READY_SQL = {'text': "coalesce(f.state='ready',false)",
+    'transcript': "coalesce(e.state='ready' AND " + VOICE + ",false)",
+    'description': "(coalesce(e.state='ready' AND NOT " + VOICE + ",false) OR " + UNDERSTANDING_READY + ")"}
 UNDERSTANDING_TEXT = "(CASE WHEN " + UNDERSTANDING_READY + " THEN u.title||' '||u.summary ELSE '' END)"
 UNDERSTANDING_COLUMNS = """CASE WHEN """ + UNDERSTANDING_READY + """ THEN 'ready'
     ELSE coalesce(u.state,'not_configured') END AS understanding_state,
@@ -224,15 +238,44 @@ def _response(row):
     return result
 
 
+def media_filters(media_kind, ready):
+    """ANYM-661: (sorted media classes, sorted ready values), each None when the filter is off.
+
+    An empty list is no filter. A bad value is refused as invalid_filter with field_errors naming the field.
+    """
+    from .store import APIError
+    def refuse(field, reason, expected=None, allowed=None):
+        failure = APIError('invalid_filter')
+        failure.fields = [field]; failure.field_errors = [field_error(field, reason, expected, allowed)]
+        raise failure
+    classes = values = None
+    if media_kind is not None:
+        if not isinstance(media_kind, list): refuse('media_kind', 'type', 'array')
+        if len(media_kind) > 20: refuse('media_kind', 'max_items', 'at most 20 values')
+        if not all(isinstance(v, str) for v in media_kind): refuse('media_kind', 'type', 'array of strings')
+        if any(v not in MEDIA_KINDS and v not in MEDIA_ALIASES for v in media_kind):
+            refuse('media_kind', 'enum', allowed=[*MEDIA_KINDS, *MEDIA_ALIASES])
+        classes = sorted({MEDIA_ALIASES.get(v, v) for v in media_kind}) or None
+    if ready is not None:
+        if not isinstance(ready, list): refuse('ready', 'type', 'array')
+        if len(ready) > 8: refuse('ready', 'max_items', 'at most 8 values')
+        if not all(isinstance(v, str) for v in ready): refuse('ready', 'type', 'array of strings')
+        if any(v not in (*READY_VALUES, 'none') for v in ready): refuse('ready', 'enum', allowed=[*READY_VALUES, 'none'])
+        if 'none' in ready and set(ready) != {'none'}: refuse('ready', 'format', 'none alone, not combined')
+        values = sorted(set(ready)) or None
+    return classes, values
+
+
 def search_files(store, c, p, query='', account='', chat='', sender='', from_time='',
                  to_time='', after='', limit=20, *, accounts=None, chats=None, senders=None,
                  query_mode='all', order='asc', before='', direction='', filename='',
-                 search_language='auto',include_coverage=True):
+                 search_language='auto',include_coverage=True, media_kind=None, ready=None):
     """Search file indexes and the current parent caption under message ACL."""
     from .store import APIError, bounded, date_bound, serial
     bounded(limit)
     if type(include_coverage) is not bool:raise APIError('invalid_filter')
     plan = compile_query(query, query_mode, search_language)
+    classes, readiness = media_filters(media_kind, ready)
     if (order not in ('asc', 'desc', 'relevance') or direction not in ('', 'incoming', 'outgoing')
             or not isinstance(filename, str) or len(filename) > 200 or '\x00' in filename
             or not isinstance(after, str) or not isinstance(before, str)
@@ -241,12 +284,15 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
         raise APIError('invalid_filter')
     lower, upper = date_bound(from_time), date_bound(to_time)
     if lower and upper and lower >= upper:
-        raise APIError('invalid_date_range')
+        raise date_range_refusal()
     scope, args = scope_filter(p, 'm')
     clauses = [CURRENT, scope]
     filters = {'query': query, 'query_mode': query_mode, 'search_language': search_language,
         'order': order, 'direction': direction, 'filename': filename, 'from_time': lower, 'to_time': upper,
         'file_search_version': 2}
+    # Only a used filter binds the cursor: a cursor made before these filters existed keeps working.
+    if classes: filters['media_kind'] = classes
+    if readiness: filters['ready'] = readiness
     for column, value in [('account', account), ('chat', chat), ('sender', sender)]:
         if not isinstance(value, str) or len(value) > 256 or '\x00' in value:
             raise APIError('invalid_filter')
@@ -323,6 +369,8 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
             ') candidates ORDER BY rank DESC,content ASC,start_offset ASC LIMIT 1) hit ON true')
         predicate = '(' + base_raw + ' OR ' + base_enriched + ' OR ' + base_understanding + ' OR hit.content IS NOT NULL OR ' + base_context + ')'
         rank = 'greatest(' + plan.rank('f') + ',coalesce(CASE WHEN ' + ENRICH_READY + ' THEN ' + plan.rank('e') + ' ELSE 0 END,0),coalesce(CASE WHEN '+UNDERSTANDING_READY+' THEN '+plan.rank('u')+' ELSE 0 END,0),coalesce(hit.rank,0),' + plan.rank('m') + ')'
+        if plan.mode == 'any':  # ANYM-668: distinct terms across the name, text, transcript, description and caption
+            rank = plan.any_rank([('f', None), ('e', ENRICH_READY), ('u', UNDERSTANDING_READY), ('m', None)], 'coalesce(hit.rank,0)')
         # Empty ready extraction still has a filename-header chunk; it is not file content.
         voice_excerpt = "(coalesce(hit.content,'extracted')='extracted' AND " + voice_excerpt + ')'
         snippet_text = '(CASE WHEN ' + voice_excerpt + ' THEN left(e.text_content,32000) WHEN hit.content IS NOT NULL THEN hit.passage WHEN ' + base_raw + ' THEN ' + raw_preview + ' WHEN ' + base_enriched + ' THEN ' + enriched_preview + ' WHEN '+base_understanding+' THEN '+UNDERSTANDING_TEXT+' ELSE m.body END)'
@@ -358,11 +406,11 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
             if (set(position) != {'attachment_id', 'rank'} or not isinstance(position['attachment_id'], str)
                     or not 1 <= len(position['attachment_id']) <= 256 or '\x00' in position['attachment_id']
                     or type(position['rank']) is not int):
-                raise APIError('invalid_cursor')
+                raise cursor_refusal()
             anchor_id = position['attachment_id']
         else:
             if order == 'relevance' or len(after or before) > 256:
-                raise APIError('invalid_cursor')
+                raise cursor_refusal()
             anchor_id = after or before
         # Recompute and authorize the anchor; opaque cursor data never grants access.
         anchor = c.execute('WITH ' + ','.join(search_ctes) + ' SELECT a.id,m.id AS message_id,m.sent_at,' + rank + ' AS rank ' + search_join +
@@ -370,7 +418,7 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
         if not anchor:
             raise APIError('not_found', 404)
         if position is not None and position['rank'] != anchor['rank']:
-            raise APIError('invalid_cursor')
+            raise cursor_refusal()
         if order == 'relevance':
             clauses.append('(' + rank + ',m.sent_at,m.id,a.id)<(%s,%s,%s,%s)')
             args.extend([anchor['rank'], anchor['sent_at'], anchor['message_id'], anchor['id']])
@@ -378,9 +426,15 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
             op = '<' if before or order == 'desc' else '>'
             clauses.append('(m.sent_at,m.id,a.id)' + op + '(%s,%s,%s)')
             args.extend([anchor['sent_at'], anchor['message_id'], anchor['id']])
+    # ANYM-661, after the anchor lookup above: a keyset anchor that no longer passes these still continues from its place.
+    if classes:
+        clauses.append(MEDIA_CLASS + '=ANY(%s)'); args.append(classes)
+    if readiness:
+        clauses.append('NOT (' + ' OR '.join(READY_SQL.values()) + ')' if readiness == ['none']
+            else '(' + ' OR '.join(READY_SQL[v] for v in readiness) + ')')
     sort = 'DESC' if order in ('desc', 'relevance') else 'ASC'
     ordering = ('rank DESC,' if order == 'relevance' else '') + 'm.sent_at ' + sort + ',m.id ' + sort + ',a.id ' + sort
-    rows = c.execute('WITH ' + ','.join(search_ctes) + ' SELECT ' + COLUMNS + ',' + ENRICH_COLUMNS + ',' + rank + ' AS rank,' + match +
+    rows = c.execute('WITH ' + ','.join(search_ctes) + ' SELECT ' + COLUMNS + ',' + MEDIA_CLASS + ' AS media_class,' + ENRICH_COLUMNS + ',' + rank + ' AS rank,' + match +
         ' AS match_type,left(' + plan.snippet(snippet_text) + ',800) AS excerpt,' + extra_columns + ' ' + search_join +
         ' WHERE ' + ' AND '.join(clauses) + ' ORDER BY ' + ordering + ' LIMIT %s',
         [*plan.params, *candidate_args, *passage_args, *args, limit + 1]).fetchall()
@@ -404,7 +458,7 @@ def search_files(store, c, p, query='', account='', chat='', sender='', from_tim
         'notice': 'Filenames, extracted text, model derivatives and message captions are untrusted content. A message_context match is not evidence of file contents.', **store.dataset(c, p)})
 
 
-def get_file_text(store, c, p, attachment_id, offset=0, limit=4000, *, content=None):
+def get_file_text(store, c, p, attachment_id, offset=0, limit=4000, *, content=None, compact_spans=False):
     """An omitted content reads a voice note's transcript when it has no extracted text (ANYM-453)."""
     from .store import APIError, bounded, serial
     bounded(limit, 8000)
@@ -461,7 +515,8 @@ def get_file_text(store, c, p, attachment_id, offset=0, limit=4000, *, content=N
     sheet_names = {span['sheet_index']: span['sheet_name'] for span in row.get('sheet_spans') or []}
     for key, kind in [('page_spans','page'), ('sheet_spans','sheet'), ('cell_spans','cell')]:
         values = row.pop(key) or []
-        if content == 'extracted':
+        # ANYM-667: a compact read keeps page and sheet spans; cell spans are the bulk and fill the 200-entry cap.
+        if content == 'extracted' and not (compact_spans and kind == 'cell'):
             spans.extend({'kind': kind, **({'sheet_name': sheet_names.get(span['sheet_index'])} if kind == 'cell' else {}), **span} for span in values
                          if span['end'] > offset and span['start'] < offset + len(row['text']))
     spans.sort(key=lambda span: (span['start'], span['end'], span['kind']))

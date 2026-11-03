@@ -9,6 +9,7 @@ import stat
 from psycopg.errors import CheckViolation
 from psycopg.types.json import Jsonb
 
+from .identifiers import ACCOUNT_RE
 from .operational import CAPTURE_STOP_DETAILS,OVERLOAD_STOP_DETAILS,CONNECTION_ERRORS,TERMINAL,PHASE_STATES,PHASE_REASONS
 from .operational import identity_safe,self_provider_id as verified_self_id
 
@@ -24,7 +25,7 @@ def validate_capture(value):
     if value.get('kind')=='owner_read_state':
         from .reply_state import validate_observation
         if (set(value)!={'kind','account','chat','observed_at','observation'}
-            or not isinstance(value['account'],str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',value['account'])
+            or not isinstance(value['account'],str) or not ACCOUNT_RE.fullmatch(value['account'])
             or not isinstance(value['chat'],str)):
             raise ValueError('invalid_read_capture')
         from .reply_state import WHATSAPP_READ_BASES
@@ -39,7 +40,7 @@ def validate_capture(value):
     if value.get('kind')=='read_state_gap':
         # A provider update gap (whatsmeow app-state sync error): read events may be missing.
         if (set(value)!={'kind','account','observed_at','reason'} or value['reason'] not in GAP_REASONS
-                or not isinstance(value['account'],str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',value['account'])):
+                or not isinstance(value['account'],str) or not ACCOUNT_RE.fullmatch(value['account'])):
             raise ValueError('invalid_capture')
         return {**value,'observed_at':utc(value['observed_at'])}
     if value.get('kind')=='message_receipt':
@@ -70,7 +71,7 @@ def validate_capture(value):
             **({'identity_observations':identity} if identity is not None else {})}
     if value.get('kind') in ('telegram_delete','whatsapp_delete'):
         if set(value)!={'kind','account','chat','ids','observed_at'}: raise ValueError('invalid_capture')
-        if not isinstance(value['account'],str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',value['account']):
+        if not isinstance(value['account'],str) or not ACCOUNT_RE.fullmatch(value['account']):
             raise ValueError('invalid_capture_account')
         whatsapp=value['kind']=='whatsapp_delete'
         pattern=r'[a-zA-Z0-9_.:-]{1,140}@(c.us|g.us|lid)' if whatsapp else r'-?[0-9]{1,20}|'
@@ -89,6 +90,13 @@ MAX_REJECTED_MESSAGES=20
 # error after its retries, or any other provider error of that chat. The last two are stored as
 # provider_unavailable, which every deployed reader knows; history.chat_errors keeps the exact one.
 CHAT_SCAN_ERRORS=('provider_unavailable','rate_limited','provider_temporarily_unavailable','provider_chat_error')
+# Reasons kept only in history.chat_errors: the column stores provider_unavailable, so no reader's mapping grows.
+CHAT_DIAGNOSTIC_ERRORS=('peer_kind_conflict',)
+
+
+class PeerKindConflict(RuntimeError):
+    """The stored peer kind of a chat differs from the kind the provider reports for the same chat id."""
+    def __init__(self): super().__init__('peer_kind_conflict')
 MAX_CHAT_ERRORS=20
 
 
@@ -392,7 +400,7 @@ class CollectorState:
                 ON CONFLICT DO NOTHING''',(self.account,provider_chat,peer_kind))
             row=c.execute('SELECT * FROM collector_chats WHERE account=%s AND provider_chat=%s',
                           (self.account,provider_chat)).fetchone()
-            if row['peer_kind']!=peer_kind: raise RuntimeError('peer_kind_conflict')
+            if row['peer_kind']!=peer_kind: raise PeerKindConflict()
             return row
 
     def inventory(self,dialogs,history_since,*,discovery=False):
@@ -417,7 +425,10 @@ class CollectorState:
                         VALUES(%s,%s,%s,%s) ON CONFLICT(account,provider_chat) DO UPDATE SET
                         window_complete=CASE WHEN collector_chats.history_since IS DISTINCT FROM
                             excluded.history_since THEN false ELSE collector_chats.window_complete END,
-                        history_since=excluded.history_since''',(self.account,chat,kind,history_since))
+                        history_since=excluded.history_since,
+                        peer_kind=CASE WHEN %s AND collector_chats.peer_kind='chat' AND excluded.peer_kind='channel'
+                            THEN 'channel' ELSE collector_chats.peer_kind END''',
+                        (self.account,chat,kind,history_since,discovery))
                     c.execute('''INSERT INTO chats(id,account,title,chat_type,provider_chat) VALUES(%s,%s,%s,%s,%s)
                         ON CONFLICT(id) DO UPDATE SET
                         title=CASE WHEN excluded.title<>%s AND excluded.title<>'' THEN excluded.title ELSE chats.title END,
@@ -468,7 +479,7 @@ class CollectorState:
                       (self.account,chat))
 
     def failed(self,chat,code,evidence=None):
-        if code not in CHAT_SCAN_ERRORS:raise ValueError('invalid_scan_error')
+        if code not in CHAT_SCAN_ERRORS+CHAT_DIAGNOSTIC_ERRORS:raise ValueError('invalid_scan_error')
         if evidence is not None:evidence=validate_chat_error(evidence)
         with self.archive.store.pool.connection() as c:
             self.archive.fence(c,self.account,self.lease)

@@ -44,7 +44,7 @@ Native parser packages must receive normal security updates.
 ## Retrieval contract
 
 `search_files` uses the same account/chat ACL and `read` permission as message
-search. It supports `query_mode=all|phrase|web|exact`,
+search. It supports `query_mode=all|any|phrase|web|exact` (`any`: at least one word, ranked by distinct terms under `order=relevance`; see SEARCH.md),
 `search_language=auto|simple|russian|english|indonesian`, scalar/list account,
 chat and sender filters, `[from_time,to_time)` dates and direction. Lists are OR
 within one dimension and AND across dimensions; empty lists match nothing.
@@ -53,6 +53,38 @@ Each item names its chat in `chat_title` (at most 64 characters) and the source 
 PostgreSQL stemming uses the same configuration for index and query. Auto tries
 each complete query under all four configurations. There is no semantic search
 or implicit spelling correction in file search.
+
+### Media kind and readiness filters (ANYM-661)
+
+`media_kind` is a list of `voice`, `audio`, `image`, `video`, `document`; the provider labels shown in a row's
+`media_kind` are accepted as aliases (`photo` and `sticker` are `image`, `animation` is `video`, `other` is
+`document`). A file's class is the provider label (`voice`, `audio`, `photo`/`sticker`, `video`/`animation`);
+for `document`, `other` or no label it comes from the MIME type (`audio/ogg`, `audio/opus` and
+`application/ogg` are `voice`, other `audio/*` is `audio`, `image/*`, `video/*`, anything else `document`).
+Each result row returns the class as `media_class`; its `media_kind` keeps the provider's label. Values are
+OR-ed, duplicates are ignored, an empty list is no filter, an unknown value is `invalid_filter` with
+`field_errors` (`media_kind`, `enum`, the allowed list).
+
+Which collector writes which label: Telegram (`adapters.py`) writes `voice`, `video` (also for video notes),
+`sticker`, `animation`, `audio`, `photo`, `document`. whatsapp-web.js (`capture.mjs`) maps `ptt` to `voice`,
+`audio` to `audio`, `image` to `photo`, `video` and `ptv` to `video`, `gif` to `animation`, `sticker`,
+`document`, and `other` for any other media; whatsmeow writes the same vocabulary. The messengers do not
+always label a voice note alike, so for voice notes across accounts the safe filter is `["voice","audio"]`.
+
+`ready` is a list (`ready=["transcript"]`) of `text` (extracted text or OCR in state `ready`), `transcript` (a
+ready enrichment of an audio or voice file only: speech inside a video is never a transcript) and
+`description` (a ready enrichment of a non-audio file, or a ready file understanding); values are OR-ed. The
+single value `["none"]` (not combined with others) selects files with no ready text, transcript or description,
+for example voice notes still without a transcript. Only the file's current revision counts: a ready row of
+an older revision of a re-uploaded file does not. Low-quality OCR text still counts as `text`. A boolean or an
+unknown value is `invalid_filter` with `field_errors`. The filters never hide a file's original: availability
+fields and `read_more` of a returned row are the same with and without them. Each page is a snapshot of
+readiness. To tell "none exist" from "not ready yet", repeat the query without `ready` and read the per-row
+availability fields.
+
+Both filters bind the relevance cursor (a cursor made without them is `invalid_cursor` once they are added,
+and the reverse; `file_search_version` stays 2). A keyset (`asc`/`desc`) attachment-ID anchor continues from
+its position under new filters even when it does not pass them.
 
 `order=asc|desc` retains attachment-ID cursors; `order=relevance` returns an opaque
 query/principal/scope-bound cursor and recomputes its authorized anchor and rank.
@@ -90,6 +122,15 @@ reads `content='extracted'`. When that transcript is not ready, the reply has em
 (`processing_pending`, `processing_paused`, `processing_worker_unavailable`,
 `processing_failed` with `failure_reason`, or `processing_not_configured`, which only
 the owner can change). Explicit `content` values keep their meaning.
+
+Compact `get_file_text` (ANYM-667) returns the text and its paging (`offset`, `next_offset`,
+`content_chars`, `truncated`), the status and readiness reasons (`extraction_status`,
+`enrichment_status`, `download_status`, `empty_reason`, `empty_reason_detail`, `failure_reason`,
+`next_action`), `message_id`, `mime`, `display_name`, `model_generated`, `notice`,
+`content_coverage` (`retained_chars`, `truncated`, `complete`), `provenance` (attachment, message,
+revision, content, extractor or model and provider, processor version, `sha256`) and the page and sheet
+spans. `detail="full"` adds `understanding`, `extraction_coverage`, `content_coverage.notice`,
+`enrichment_notice`, the cell spans, `coverage` and `synthetic`.
 Message rows mark a voice note whose transcript is ready with `transcript_ready: true`.
 In `get_messages`, `search` and `get_context` (every detail, and the transcript's file list)
 an attachment whose default `get_file_text` text is ready carries `text_excerpt` (ANYM-490):

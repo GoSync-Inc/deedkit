@@ -1,0 +1,32 @@
+[Unit]
+Description=DeedKit family calendar encrypted backup, same-night catch-up (ANYM-694)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Starts only when both conditions pass. 1: the clock is between 19:00 and 23:59 (a failed read skips). The morning
+# is the daily unit's: its own Persistent= boot run is admitted until 16:02, so a catch-up there would make a second
+# snapshot (both timers fire at boot, and the lock only orders them). The latest admitted start, 23:59:59, plus
+# TimeoutStartSec and two TimeoutStopSec ends at 01:50 next day, long before the next 16:00. 2: the newest snapshot
+# is over 22 h old or unknown (the script exits 4 or 5); on a healthy day this is a no-op, so the timers never make
+# two snapshots a day. The daily service and its 16:02 admission are unchanged.
+ExecCondition=/bin/sh -c 'm=$$(date -u +%%H%%M) || exit 1; case "$$m" in [0-2][0-9][0-5][0-9]) ;; *) exit 1;; esac; [ "$$m" -ge 1900 ]'
+ExecCondition=/bin/sh -c '/usr/bin/python3 -I /opt/deedkit/calendar-backup/freshness.py --status /opt/deedkit/calendar-backup/backups/status.json --max-age-hours 22 >/dev/null 2>&1; r=$$?; [ "$$r" -eq 4 ] || [ "$$r" -eq 5 ]'
+ExecStart=/usr/bin/python3 -I /opt/personal-os-probe/ops/backup_runner.py --config /opt/deedkit/calendar-backup/runner.json
+ExecStopPost=/bin/sh -c '[ "$$SERVICE_RESULT" = exec-condition ] || exec /usr/bin/python3 -I /opt/personal-os-probe/ops/backup_runner.py --config /opt/deedkit/calendar-backup/runner.json --recover-stop'
+# Exclusion with messaging's run and with a deploy is the runner's host lock (5400 s wait), as for the daily service.
+TimeoutStartSec=6300s
+TimeoutStopSec=180s
+User=root
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+MemoryMax=192M
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/deedkit/calendar-backup/backups /opt/personal-os-probe/backups

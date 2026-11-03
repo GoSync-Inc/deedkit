@@ -132,7 +132,7 @@ Calls (buildable now from `voice_events` and `stop`):
 | type | when | data |
 |---|---|---|
 | `call.finished` | terminal status `finished` | `call_id, status, end_reason (enum), duration_s, outcome (enum), transcript: final` |
-| `call.failed` | terminal `failed` (model error, `call_errors.py:36`) or `end_reason` `provider_failed` | `call_id, status, end_reason` |
+| `call.failed` | terminal `failed` (model error, `call_errors.py:36`), `end_reason` `provider_failed`, or (ANYM-695) `end_reason` `provider_rejected`: a refused dial, `status` stays `finished`; a `call.finished` subscriber no longer gets refusals | `call_id, status, end_reason`; optional `provider_cause, provider_code` (ANYM-695: the call's Twilio `provider_error`, SUBSCRIPTIONS.md) |
 | `call.not_answered` | the card's "missed": outbound with `provider_no-answer`, `provider_busy` or `provider_canceled` | `call_id, end_reason` |
 | `call.interrupted` | startup sweep (`core.py:392-394`) | `call_id, end_reason: service_restart` |
 | `call.owner_request` | `decision_requested` (`core.py:877`) | `call_id, decision_id, state: pending` (no question text) |

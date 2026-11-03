@@ -36,7 +36,7 @@ POSTGRES_UID = 999
 HELPER_TMPFS = {'/tmp':'rw,noexec,nosuid,size=64m',
                 PG_DATA_PATH:'ro,noexec,nosuid,nodev,size=1m,mode=0700'}
 # Backup schema versions this verifier accepts from its helper (`capabilities` reports them).
-SCHEMAS = range(2,64)
+SCHEMAS = range(2,67)
 # Host admission (ANYM-609): every instance on the receiver shares this root-private directory.
 # It holds the one heavy-restore lock, the holder's admission record and the pin step's journal.
 HOST_DIRECTORY = '/var/lib/deedkit-backup-verify'
@@ -75,6 +75,17 @@ def private_file(path, limit=65536):
 def load_config(path):
     if os.geteuid()!=0:raise ValueError('root_verifier_required')
     value=r2.unique_json(private_file(path,16384))
+    value=config_fields(value)
+    host=config_paths(value)
+    directory,state,host=config_evidence(value,host)
+    config_data_directory(value,directory,state,host)
+    private_file(value['identity_file'])
+    with local.trusted_directory(Path(value['protected_file']).parent):pass
+    return value
+
+
+def config_fields(value):
+    """The config's shape, defaults, reviewed images and limits: the first checks of load_config."""
     required={'v','receiver_config_file','directory','identity_file','protected_file','helper_image','helper_revision','postgres_image'}
     defaults={'max_plaintext_bytes':40*GIB,'postgres_headroom_bytes':8*GIB,'reserve_bytes':2*GIB,'timeout_seconds':21600}
     # Optional `profile` (ANYM-606): absent is messaging, exactly as before; `calendar` selects the calendar
@@ -96,6 +107,11 @@ def load_config(path):
             not 2*GIB<=value['postgres_headroom_bytes']<=64*GIB or
             not GIB<=value['reserve_bytes']<=32*GIB or not 300<=value['timeout_seconds']<=21600):
         raise ValueError('invalid_verifier_limits')
+    return value
+
+
+def config_paths(value):
+    """The host settings and the absolute, `..`-free paths; returns the host directory setting."""
     host,wait=host_settings(value)
     if type(wait) is not int or not 0<=wait<=21600:raise ValueError('invalid_verifier_limits')
     if type(busy_wait(value)) is not int or not 0<=busy_wait(value)<=BUSY_WAIT_MAX:raise ValueError('invalid_verifier_limits')
@@ -104,6 +120,12 @@ def load_config(path):
             raise ValueError('invalid_verifier_path')
     if not isinstance(host,str) or not Path(host).is_absolute() or '..' in Path(host).parts:
         raise ValueError('invalid_verifier_path')
+    return host
+
+
+def config_evidence(value,host):
+    """The verifier directory, its receiver and the separation of root evidence from the receiver's state;
+    returns the directory and state paths and the host directory as a Path."""
     with local.trusted_directory(value['directory']) as directory:
         if os.fstat(directory).st_mode&0o077:raise ValueError('private_verifier_directory_required')
     receiver=r2.load_config(value['receiver_config_file'])
@@ -124,6 +146,11 @@ def load_config(path):
     host=Path(host)
     if any(host.is_relative_to(path) or path.is_relative_to(host) for path in (directory,state)):
         raise ValueError('separate_operator_evidence_required')
+    return directory,state,host
+
+
+def config_data_directory(value,directory,state,host):
+    """The optional `postgres_data_directory` (ANYM-634)."""
     if 'postgres_data_directory' in value:
         # Absent: the scratch PostgreSQL keeps a Docker volume, as before. The path enters a --mount argument.
         data=value['postgres_data_directory']
@@ -134,9 +161,6 @@ def load_config(path):
             raise ValueError('separate_operator_evidence_required')
         with local.trusted_directory(data) as fd:
             if os.fstat(fd).st_mode&0o077:raise ValueError('private_verifier_directory_required')
-    private_file(value['identity_file'])
-    with local.trusted_directory(Path(value['protected_file']).parent):pass
-    return value
 
 
 def lexical(path):
@@ -824,6 +848,123 @@ def verify_run(config,receiver,client,engine,journal,fd):
 FAILED=[]
 
 
+def pin_state(config):
+    """A stopped pin step recovered (ANYM-609), and the error that must fail this run before it uses a pin."""
+    try:recovered=finish_pin_switch(config);pins_error=None
+    except Exception as error:recovered=None;pins_error=error
+    if pins_error is None and code_switch_pending(config):pins_error=RuntimeError('verifier_code_unfinished')
+    return recovered,pins_error
+
+
+def fresh_config(config,path):
+    # The receiver update follow (ANYM-597) rewrites the pins under this lock: a
+    # config loaded before the lock must never start a journal on the old pair.
+    fresh=load_config(path)
+    if fresh['directory']!=config['directory']:raise ValueError('invalid_verifier_config')
+    return fresh
+
+
+def check_journal(receiver,config,journal,profile):
+    """A retry's journal must still match the receiver, the profile, this config's pins and its marker."""
+    validate_journal(receiver,journal)
+    if r2.profile(journal)!=profile:raise ValueError('verifier_profile_mismatch')
+    if any(journal[k]!=config[k] for k in ('helper_image','helper_revision')):
+        raise ValueError('restore_image_changed_during_retry')
+    if journal['protected_file']!=config['protected_file']:raise ValueError('verifier_control_changed_during_retry')
+
+
+def new_journal(config,receiver,candidate,prior,profile):
+    pending={'v':1,'run':secrets.token_hex(16),'destination':r2.destination(receiver),'receipt':candidate,
+             'prior_sha256':prior,'protected_file':config['protected_file'],'phase':'restoring','helper_image':config['helper_image'],'helper_revision':config['helper_revision']}
+    if profile=='calendar':pending['profile']=profile
+    return pending
+
+
+def admit_restore(engine,host,config,pending,profile):
+    """Admit a restoring run under the host lock and return the lock; a retry after its proof only clears its own
+    leftover record. Returns None when nothing was admitted."""
+    if pending['phase']=='restoring':
+        # One heavy restore per host (ANYM-609): wait, clear a dead holder's resources and
+        # record ours, all before a new run's journal or any scratch resource exists.
+        # The wait has its own bound (verify_wait_seconds): the restore deadline pauses while
+        # it waits, so the restore keeps its whole budget; SIGTERM still stops the wait.
+        lock=untimed(engine,host,host_lock(config))
+        # A refused admission keeps the record it could not clear for the next holder.
+        admit(engine,lock,profile,pending['run'],
+              run_resources(pending['run'],profile,data_directory(config,pending['run'])))
+        return lock
+    elif own_record(config,pending['run']):
+        # A retry after its proof whose own record a crash left: it names the run's data directory
+        # as it was then (ANYM-634), whatever the config says now. Only then does it wait.
+        clear_admission(engine,untimed(engine,host,host_lock(config)))
+    return None
+
+
+def confirm_candidate(receiver,client,journal):
+    # Even after a marker switch, exact committed candidate remains
+    # available by ID. Never silently adopt another new capture.
+    actual=r2.get_receipt(receiver,client,journal['receipt']['wire']['id'])
+    if actual!=journal['receipt']:raise ValueError('restore_candidate_changed')
+
+
+def promote_proof(receiver,config,client,journal):
+    # Existing maintenance takes the same upload lock and independently
+    # rechecks full ciphertext, immutable receipts and root marker CAS.
+    proof_path=Path(config['directory'])/('proof-'+journal['run']+'.json')
+    if journal['prior_sha256'] is None:
+        r2.protect(receiver,config['protected_file'],proof_path,client=client)
+    else:
+        r2.rotate(receiver,config['protected_file'],proof_path,
+                         expected_protected_sha256=journal['prior_sha256'],client=client)
+
+
+def record_verified(engine,journal,fd):
+    status={'v':1,'status':'verified','backup_id':journal['receipt']['wire']['id'],'verification_id':journal['run'],'verified_at':now()}
+    if type(resumes:=getattr(engine,'stream_resumes',None)) is int:status['stream_resumes']=resumes
+    local.write_maintenance_json('last-success.json',status,dir_fd=fd)
+    local.write_maintenance_json('status.json',status,dir_fd=fd)
+    os.unlink('active.json',dir_fd=fd);local.fsync_dir(fd)
+    return status
+
+
+def run_failure(error,engine,config,journal,admitted,profile,fd):
+    """A failed run's record under its control directory. Returns the `busy` status of a wait that ran out before
+    anything was journaled; otherwise None, and the caller raises `error`."""
+    if isinstance(error,ReceiverBusy) and journal is None:
+        # An upload still holds the receiver: not a failure. Nothing was journaled or created,
+        # and last-failure.json keeps the last real failure.
+        status={'v':1,'status':'busy','code':'receiver_busy','checked_at':now()}
+        local.write_maintenance_json('status.json',status,dir_fd=fd);return status
+    # Generic safe codes only; SDK errors, DSNs and stderr never enter
+    # durable status. Keep journal/proof and the old protected recovery point.
+    cleanup_ok=True;resumes=getattr(engine,'stream_resumes',None)
+    # Its own short bound, so a slow answer never spends the cleanup's.
+    state=None if journal is None else helper_state(Docker(10) if isinstance(engine,Docker) else engine,journal,profile)
+    if isinstance(engine,Docker):engine=Docker(120)
+    # A refused admission created nothing and leaves its retry's resources to the next holder.
+    if journal is not None and str(error) not in ('verifier_host_busy','verifier_cleanup_unconfirmed'):
+        try:
+            cleanup_resources(engine,journal['run'],profile,data_directory(config,journal['run']))
+            remove_payload(config['directory'],journal['run'])
+        except Exception:cleanup_ok=False
+    if admitted is not None and cleanup_ok:
+        try:release_admission(admitted)
+        except Exception:cleanup_ok=False
+    failure={'v':1,'status':'failed','error':failure_code(error),'failed_at':now(),
+             'cleanup_complete':cleanup_ok,'diagnostic':describe(error)}
+    if isinstance(error,HelperFailure) and error.detail:failure['detail']=error.detail
+    # Counts and Docker's fixed state words only (ANYM-633): the stream's ranged GETs and the helper's end.
+    if type(resumes) is int:failure['stream_resumes']=resumes
+    if state is not None:failure['helper_state']=state
+    # The journal line (main) carries them too: a later failure overwrites last-failure.json.
+    FAILED[:]=[failure]
+    local.write_maintenance_json('status.json',failure,dir_fd=fd)
+    # A later busy/idle/verified run overwrites status.json; keep the last failure's cause.
+    try:local.write_maintenance_json('last-failure.json',failure,dir_fd=fd)
+    except Exception:pass
+    return None
+
+
 def run(config,*,client=None,engine=None,path=None):
     FAILED.clear()
     if os.geteuid()!=0:raise ValueError('root_verifier_required')
@@ -833,16 +974,10 @@ def run(config,*,client=None,engine=None,path=None):
     with verifier_lock(config['directory']) as fd,ExitStack() as host:
         journal=None;admitted=None
         # A pin step stopped between two config writes (ANYM-609): every config back on its old pair first.
-        try:recovered=finish_pin_switch(config);pins_error=None
-        except Exception as error:recovered=None;pins_error=error
-        if pins_error is None and code_switch_pending(config):pins_error=RuntimeError('verifier_code_unfinished')
+        recovered,pins_error=pin_state(config)
         path=path if path is not None else recovered
         if path is not None:
-            # The receiver update follow (ANYM-597) rewrites the pins under this lock: a
-            # config loaded before the lock must never start a journal on the old pair.
-            fresh=load_config(path)
-            if fresh['directory']!=config['directory']:raise ValueError('invalid_verifier_config')
-            config=fresh
+            config=fresh_config(config,path)
         profile=r2.profile(config)
         try:
             with deadline(config['timeout_seconds']):
@@ -850,11 +985,7 @@ def run(config,*,client=None,engine=None,path=None):
                 if pins_error is not None:raise pins_error
                 _,journal=r2.read_root(fd,'active.json',missing=True)
                 if journal is not None:
-                    validate_journal(receiver,journal)
-                    if r2.profile(journal)!=profile:raise ValueError('verifier_profile_mismatch')
-                    if any(journal[k]!=config[k] for k in ('helper_image','helper_revision')):
-                        raise ValueError('restore_image_changed_during_retry')
-                    if journal['protected_file']!=config['protected_file']:raise ValueError('verifier_control_changed_during_retry')
+                    check_journal(receiver,config,journal,profile)
                 with local.trusted_directory(receiver['state_directory'],archive=True) as state_fd,ExitStack() as held:
                     # Only a run that journaled nothing waits out an upload (ANYM-632); a retry fails as before.
                     untimed(engine,held,receiver_lock(state_fd,busy_wait(config) if journal is None else None))
@@ -864,28 +995,11 @@ def run(config,*,client=None,engine=None,path=None):
                     if journal is None:
                         if candidate is None:
                             status={'v':1,'status':'idle','checked_at':now()};local.write_maintenance_json('status.json',status,dir_fd=fd);return status
-                        pending={'v':1,'run':secrets.token_hex(16),'destination':r2.destination(receiver),'receipt':candidate,
-                                 'prior_sha256':prior,'protected_file':config['protected_file'],'phase':'restoring','helper_image':config['helper_image'],'helper_revision':config['helper_revision']}
-                        if profile=='calendar':pending['profile']=profile
-                    if pending['phase']=='restoring':
-                        # One heavy restore per host (ANYM-609): wait, clear a dead holder's resources and
-                        # record ours, all before a new run's journal or any scratch resource exists.
-                        # The wait has its own bound (verify_wait_seconds): the restore deadline pauses while
-                        # it waits, so the restore keeps its whole budget; SIGTERM still stops the wait.
-                        lock=untimed(engine,host,host_lock(config))
-                        # A refused admission keeps the record it could not clear for the next holder.
-                        admit(engine,lock,profile,pending['run'],
-                              run_resources(pending['run'],profile,data_directory(config,pending['run'])));admitted=lock
-                    elif own_record(config,pending['run']):
-                        # A retry after its proof whose own record a crash left: it names the run's data directory
-                        # as it was then (ANYM-634), whatever the config says now. Only then does it wait.
-                        clear_admission(engine,untimed(engine,host,host_lock(config)))
+                        pending=new_journal(config,receiver,candidate,prior,profile)
+                    admitted=admit_restore(engine,host,config,pending,profile)
                     if journal is None:
                         journal=pending;local.write_maintenance_json('active.json',journal,dir_fd=fd)
-                    # Even after a marker switch, exact committed candidate remains
-                    # available by ID. Never silently adopt another new capture.
-                    actual=r2.get_receipt(receiver,client,journal['receipt']['wire']['id'])
-                    if actual!=journal['receipt']:raise ValueError('restore_candidate_changed')
+                    confirm_candidate(receiver,client,journal)
                     if journal['phase']=='restoring':journal=verify_run(config,receiver,client,engine,journal,fd)
                     else:
                         _,proof=r2.read_root(fd,'proof-'+journal['run']+'.json')
@@ -894,54 +1008,12 @@ def run(config,*,client=None,engine=None,path=None):
                     remove_payload(config['directory'],journal['run'])
                     if admitted is not None:release_admission(admitted);admitted=None
                     host.close()
-                # Existing maintenance takes the same upload lock and independently
-                # rechecks full ciphertext, immutable receipts and root marker CAS.
-                proof_path=Path(config['directory'])/('proof-'+journal['run']+'.json')
-                if journal['prior_sha256'] is None:
-                    r2.protect(receiver,config['protected_file'],proof_path,client=client)
-                else:
-                    r2.rotate(receiver,config['protected_file'],proof_path,
-                                     expected_protected_sha256=journal['prior_sha256'],client=client)
+                promote_proof(receiver,config,client,journal)
                 journal={**journal,'phase':'promoted'};local.write_maintenance_json('active.json',journal,dir_fd=fd)
-                status={'v':1,'status':'verified','backup_id':journal['receipt']['wire']['id'],'verification_id':journal['run'],'verified_at':now()}
-                if type(resumes:=getattr(engine,'stream_resumes',None)) is int:status['stream_resumes']=resumes
-                local.write_maintenance_json('last-success.json',status,dir_fd=fd)
-                local.write_maintenance_json('status.json',status,dir_fd=fd)
-                os.unlink('active.json',dir_fd=fd);local.fsync_dir(fd)
-                return status
+                return record_verified(engine,journal,fd)
         except BaseException as error:
-            if isinstance(error,ReceiverBusy) and journal is None:
-                # An upload still holds the receiver: not a failure. Nothing was journaled or created,
-                # and last-failure.json keeps the last real failure.
-                status={'v':1,'status':'busy','code':'receiver_busy','checked_at':now()}
-                local.write_maintenance_json('status.json',status,dir_fd=fd);return status
-            # Generic safe codes only; SDK errors, DSNs and stderr never enter
-            # durable status. Keep journal/proof and the old protected recovery point.
-            cleanup_ok=True;resumes=getattr(engine,'stream_resumes',None)
-            # Its own short bound, so a slow answer never spends the cleanup's.
-            state=None if journal is None else helper_state(Docker(10) if isinstance(engine,Docker) else engine,journal,profile)
-            if isinstance(engine,Docker):engine=Docker(120)
-            # A refused admission created nothing and leaves its retry's resources to the next holder.
-            if journal is not None and str(error) not in ('verifier_host_busy','verifier_cleanup_unconfirmed'):
-                try:
-                    cleanup_resources(engine,journal['run'],profile,data_directory(config,journal['run']))
-                    remove_payload(config['directory'],journal['run'])
-                except Exception:cleanup_ok=False
-            if admitted is not None and cleanup_ok:
-                try:release_admission(admitted)
-                except Exception:cleanup_ok=False
-            failure={'v':1,'status':'failed','error':failure_code(error),'failed_at':now(),
-                     'cleanup_complete':cleanup_ok,'diagnostic':describe(error)}
-            if isinstance(error,HelperFailure) and error.detail:failure['detail']=error.detail
-            # Counts and Docker's fixed state words only (ANYM-633): the stream's ranged GETs and the helper's end.
-            if type(resumes) is int:failure['stream_resumes']=resumes
-            if state is not None:failure['helper_state']=state
-            # The journal line (main) carries them too: a later failure overwrites last-failure.json.
-            FAILED[:]=[failure]
-            local.write_maintenance_json('status.json',failure,dir_fd=fd)
-            # A later busy/idle/verified run overwrites status.json; keep the last failure's cause.
-            try:local.write_maintenance_json('last-failure.json',failure,dir_fd=fd)
-            except Exception:pass
+            busy=run_failure(error,engine,config,journal,admitted,profile,fd)
+            if busy is not None:return busy
             raise error
 
 

@@ -1,7 +1,7 @@
 """Typed Telegram operation tests; never connect a provider session."""
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace as NS
 
 import pytest
@@ -473,6 +473,103 @@ def test_account_lists_use_contact_membership_and_bounded_provider_pages():
         blocked=[types.PeerBlocked(types.PeerUser(300), datetime.now(timezone.utc))], count=1)
     result = run(client, 'list_blocked', {'limit': 1})
     assert result['data']['blocked'][0]['peer_id'] == '300'
+
+
+def contact_book(*users):
+    client = Client()
+    client.responses[functions.contacts.GetContactsRequest] = NS(contacts=[NS(user_id=u.id) for u in users], users=list(users))
+    return client
+
+
+BOOK = (types.User(200, first_name='Федор', last_name='Петров', username='fedor_p', phone='100200300'),
+        types.User(201, first_name='Фёдор', last_name='Иванов'),
+        types.User(202, first_name='Anna', username='Anna_K', phone='79990001111'),
+        types.User(203, first_name='Борис', phone='555'))
+
+
+def found(client, query, **parameters):
+    result = run(client, 'list_contacts', {'query': query, **parameters})['data']
+    return [u['id'] for u in result['contacts']], result
+
+
+# spec: ANYM-673
+@pytest.mark.parametrize('query, expected', [
+    ('федор', ['200', '201']), ('ФЁДОР', ['200', '201']), ('  фёдор  петр ', ['200']), ('фёдор иван', ['201']),
+    ('fedor', ['200']), ('fyodor', ['201']), ('@anna_k', ['202']), ('ANNA', ['202']), ('борис', ['203']),
+    ('boris', ['203']), ('nobody', []), ('федор%', [])])
+def test_list_contacts_query_matches_name_and_username_with_yo_fold_and_latin_spelling(query, expected):
+    ids, result = found(contact_book(*BOOK), query)
+    assert ids == expected and result['reported_count'] == len(expected)
+
+
+# spec: ANYM-673
+@pytest.mark.parametrize('query', ['79990001111', '100200300', '555', '+7999'])
+def test_list_contacts_query_never_matches_a_phone_number(query):
+    assert found(contact_book(*BOOK), query)[0] == []
+
+
+# spec: ANYM-673
+def test_list_contacts_query_pages_the_filtered_list_with_one_provider_call():
+    users = [types.User(300 + n, first_name='Иван %d' % n) for n in range(5)] + [types.User(400, first_name='Другой')]
+    client = contact_book(*users)
+    first = run(client, 'list_contacts', {'query': 'иван', 'limit': 2})['data']
+    assert [u['id'] for u in first['contacts']] == ['300', '301']
+    assert first['reported_count'] == 5 and first['next_offset'] == 2 and first['page_limit'] == 2
+    last = run(client, 'list_contacts', {'query': 'иван', 'limit': 2, 'offset': 4})['data']
+    assert [u['id'] for u in last['contacts']] == ['304'] and last['next_offset'] is None
+    assert sum(isinstance(c, functions.contacts.GetContactsRequest) for c in client.calls) == 2
+
+
+# spec: ANYM-673
+def test_list_contacts_without_query_is_unchanged_and_the_filter_respects_the_allowed_ids():
+    client = contact_book(*BOOK)
+    plain = run(client, 'list_contacts', {})['data']
+    assert [u['id'] for u in plain['contacts']] == ['200', '201', '202', '203'] and plain['reported_count'] == 4
+    only = run(client, 'list_contacts', {'query': 'федор'}, _policy={'enabled': True, 'discover_chats': False,
+        'include_chats': ['200'], 'exclude_chats': []})['data']
+    assert [u['id'] for u in only['contacts']] == ['200']
+
+
+# spec: ANYM-673
+@pytest.mark.parametrize('query', ['', '   ', '@', 'x' * 65, 'a\x00b', 7, None, ['a']])
+def test_list_contacts_query_is_refused_before_any_provider_call(query):
+    client = contact_book(*BOOK)
+    with pytest.raises(Exception, match='invalid_parameters'):
+        run(client, 'list_contacts', {'query': query})
+    assert client.calls == []
+
+
+# spec: ANYM-673
+def test_list_contacts_query_length_counts_characters_after_trim():
+    from messaging_service.messenger_operations import validate_operation
+    for query in (' ' + 'x' * 64 + ' ', '😀' * 64, '\u00a0' + 'я' * 64):
+        assert validate_operation('telegram', 'list_contacts', {'query': query})['query'] == query.strip()
+    assert found(contact_book(*BOOK), '  anna  ')[0] == ['202']
+
+
+# spec: ANYM-673
+@pytest.mark.parametrize('query, reason', [('', 'blank'), ('   ', 'blank'), ('@', 'blank'), ('x' * 65, 'max_length'),
+                                           ('a\x00b', 'pattern'), (7, 'type'), (None, 'type'), (['a'], 'type'),
+                                           ('a\tb', 'pattern'), ('a\nb', 'pattern'), ('a\x9bb', 'pattern'), (' ' + 'x' * 65 + ' ', 'max_length')])
+def test_list_contacts_query_refusal_names_the_field(query, reason):
+    from messaging_service.messenger_operations import ParameterError, validate_operation
+    with pytest.raises(ParameterError) as error:
+        validate_operation('telegram', 'list_contacts', {'query': query})
+    entry, = error.value.field_errors
+    assert entry['field'] == 'query' and entry['reason'] == reason
+
+
+# spec: ANYM-673
+def test_the_query_parameter_is_telegram_only_and_published_with_its_limits():
+    from messaging_service.messenger_operations import ParameterError, operation_manifest, validate_operation
+    entry = next(e for e in operation_manifest('telegram') if e['operation'] == 'list_contacts')
+    assert entry['parameters_schema']['query']['maximum'] == 64 and entry['parameters_schema']['query']['nonempty']
+    assert 'display name and username only, no phone number' in entry['limitation'] and 'once without query' in entry['limitation']
+    whatsapp = next(e for e in operation_manifest('whatsapp') if e['operation'] == 'list_contacts')
+    assert 'query' not in whatsapp['parameters_schema']
+    with pytest.raises(ParameterError):
+        validate_operation('whatsapp', 'list_contacts', {'query': 'anna'})
+    assert validate_operation('telegram', 'list_contacts', {'query': ' Анна '})['query'] == 'Анна'
 
 
 def test_private_participant_queries_do_not_claim_a_group_member_list():
@@ -1212,3 +1309,775 @@ def test_join_target_changed_refuses_without_join_call(change, code):
     with pytest.raises(Exception, match=code):
         link_run(client, 'join_chat', '+AbCd1234', **({} if change == 'missing' else {'expected_chat': expected}))
     assert client.joins() == []
+
+
+# --- ANYM-681: inspect_message_buttons -----------------------------------------------------------------------
+import hashlib
+import hmac
+import json
+import logging
+import struct
+
+from messaging_service import button_fingerprint
+from messaging_service.commands import CommandRejected, safe_result
+from test_live_search import governed
+
+CALLBACK_SECRET = b'SYNTHETIC-CALLBACK-DATA-9147'
+INSPECT_KEY = bytes(range(32))
+
+
+def inline(*rows):
+    return types.ReplyInlineMarkup(rows=[types.KeyboardInlineButtonRow(buttons=list(row)) for row in rows])
+
+
+def button(text, kind):
+    return types.KeyboardInlineButton(text=text, type=kind)
+
+
+def callback_button(text, data=CALLBACK_SECRET, **kw):
+    return button(text, types.InlineButtonTypeCallback(data=data, **kw))
+
+
+def inspect(client, governor=None):
+    return asyncio.run(execute(client, job('inspect_message_buttons'), governor=governor))
+
+
+def keyed(monkeypatch, key=INSPECT_KEY):
+    monkeypatch.setattr(button_fingerprint, '_KEY', key)
+
+
+# spec: ANYM-681
+def test_the_fingerprint_is_a_truncated_hmac_of_length_prefixed_fields(monkeypatch):
+    fields = [b'-1001', b'23', b'0', b'1', b'payload']
+    expected = hmac.new(INSPECT_KEY, b''.join(struct.pack('>I', len(f)) + f for f in fields),
+                        hashlib.sha256).digest()[:16].hex()
+    assert button_fingerprint.fingerprint(-1001, 23, 0, 1, b'payload', key=INSPECT_KEY) == expected
+    assert len(expected) == 32 and expected == expected.lower()
+    keyed(monkeypatch)
+    assert button_fingerprint.fingerprint(-1001, 23, 0, 1, b'payload') == expected
+
+
+# spec: ANYM-681
+def test_every_fingerprint_field_changes_the_fingerprint_independently():
+    base = (-1001, 23, 0, 1, b'payload')
+    seen = {button_fingerprint.fingerprint(*base, key=INSPECT_KEY)}
+    for index, other in enumerate((-1002, 24, 1, 2, b'payloaD')):
+        changed = list(base)
+        changed[index] = other
+        seen.add(button_fingerprint.fingerprint(*changed, key=INSPECT_KEY))
+    assert len(seen) == 6
+    # Length prefixes make the encoding unambiguous: moving a byte between fields cannot collide.
+    assert (button_fingerprint.fingerprint(1, 23, 0, 1, b'2payload', key=INSPECT_KEY)
+            != button_fingerprint.fingerprint(12, 3, 0, 1, b'payload', key=INSPECT_KEY))
+
+
+# spec: ANYM-681
+def test_the_process_key_is_random_32_bytes_made_once(monkeypatch):
+    monkeypatch.setattr(button_fingerprint, '_KEY', None)
+    first = button_fingerprint.process_key()
+    assert len(first) == 32 and button_fingerprint.process_key() is first
+    monkeypatch.setattr(button_fingerprint, '_KEY', None)
+    assert button_fingerprint.process_key() != first
+
+
+# spec: ANYM-681
+def test_inspection_lists_kinds_links_and_fingerprints_for_callback_buttons_only(monkeypatch):
+    keyed(monkeypatch)
+    client = Client()
+    client.message.edit_date = datetime(2026, 10, 14, 1, 2, 3, tzinfo=timezone.utc)
+    client.message.reply_markup = inline(
+        [callback_button('Pay'), callback_button('Locked', b'x', requires_password=True)],
+        [button('Site', types.InlineButtonTypeUrl(url='https://example.invalid/a')),
+         button('App', types.InlineButtonTypeWebView(url='https://example.invalid/app')),
+         button('Login', types.InlineButtonTypeUrlAuth(url='https://example.invalid/auth', button_id=3)),
+         button('Share', types.InlineButtonTypeSwitchInline(query='SYNTHETIC-INLINE-QUERY')),
+         button('Bad', types.InlineButtonTypeUrl(url='javascript:alert(1)'))])
+    result = run(client, 'inspect_message_buttons')
+    data = result['data']
+    assert result['outcome'] == 'confirmed' and data['edit_date'] == '2026-10-14T01:02:03+00:00'
+    assert data['text_sha256'] == hashlib.sha256(b'hello').hexdigest()
+    pay = button_fingerprint.fingerprint(100, 23, 0, 0, CALLBACK_SECRET, key=INSPECT_KEY)
+    assert data['rows'] == [
+        [{'row': 0, 'column': 0, 'kind': 'callback', 'text': 'Pay', 'fp': pay},
+         {'row': 0, 'column': 1, 'kind': 'callback_password', 'text': 'Locked'}],
+        [{'row': 1, 'column': 0, 'kind': 'url', 'text': 'Site', 'url': 'https://example.invalid/a'},
+         {'row': 1, 'column': 1, 'kind': 'web_app', 'text': 'App', 'url': 'https://example.invalid/app'},
+         {'row': 1, 'column': 2, 'kind': 'login_url', 'text': 'Login'},
+         {'row': 1, 'column': 3, 'kind': 'switch_inline', 'text': 'Share'},
+         {'row': 1, 'column': 4, 'kind': 'url', 'text': 'Bad'}]]
+    assert client.calls[-1][0] == 'get_messages' and not any(
+        isinstance(call, functions.messages.GetBotCallbackAnswerRequest) for call in client.calls)
+
+
+# spec: ANYM-681
+def test_fingerprints_differ_only_when_callback_bytes_or_the_process_key_change(monkeypatch):
+    def fingerprints(data, key=INSPECT_KEY):
+        keyed(monkeypatch, key)
+        client = Client()
+        client.message.reply_markup = inline([callback_button('Pay', data)])
+        return run(client, 'inspect_message_buttons')['data']['rows'][0][0]['fp']
+    one = fingerprints(b'aaaa')
+    # Same label, layout, text and second; only the callback bytes behind the button change.
+    assert fingerprints(b'aaaa') == one and fingerprints(b'aaab') != one
+    # Two collector processes hold two keys: a fingerprint from one is stale in the other.
+    assert fingerprints(b'aaaa', bytes(reversed(range(32)))) != one
+
+
+# spec: ANYM-681
+def test_a_message_without_a_keyboard_has_no_rows_and_a_wrong_message_is_not_found(monkeypatch):
+    keyed(monkeypatch)
+    client = Client()
+    assert run(client, 'inspect_message_buttons')['data']['rows'] == []
+    other = Client()
+    other.message.id = 24
+    with pytest.raises(Exception, match='not_found'):
+        run(other, 'inspect_message_buttons')
+    elsewhere = Client()
+    elsewhere.message.chat_id = 101
+    with pytest.raises(Exception, match='not_found'):
+        run(elsewhere, 'inspect_message_buttons')
+
+
+# spec: ANYM-681
+def test_the_result_is_capped_at_100_buttons_and_fits_the_receipt_limit(monkeypatch):
+    keyed(monkeypatch)
+    many = Client()
+    many.message.reply_markup = inline(*[[callback_button('b%d' % (10 * r + c), b'd%d' % c) for c in range(10)]
+                                         for r in range(15)])
+    data = run(many, 'inspect_message_buttons')['data']
+    assert sum(len(row) for row in data['rows']) == 100 and data['truncated'] is True
+    heavy = Client()
+    link = 'https://example.invalid/' + 'a' * 2000
+    heavy.message.reply_markup = inline(*[[button('B' * 128, types.InlineButtonTypeUrl(url=link))] for _ in range(100)])
+    result = run(heavy, 'inspect_message_buttons')
+    shown = result['data']
+    assert shown['truncated'] is True and sum(len(row) for row in shown['rows']) > 0
+    assert len(json.dumps(safe_result(result))) < 60000
+    assert safe_result(run(many, 'inspect_message_buttons'))
+
+
+# spec: ANYM-681
+def test_the_callback_data_and_the_key_appear_nowhere_on_success_or_failure(monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    keyed(monkeypatch)
+    secrets_seen = (CALLBACK_SECRET.decode(), CALLBACK_SECRET.hex(), INSPECT_KEY.hex(), repr(INSPECT_KEY))
+    client = Client()
+    client.message.reply_markup = inline([callback_button('Pay')])
+    result = run(client, 'inspect_message_buttons')
+    text = json.dumps(result) + repr(result) + caplog.text
+    assert not any(secret in text for secret in secrets_seen)
+
+    # A failure while fingerprinting or reading formats no exception text at all.
+    def boom(*args, **kwargs):
+        raise RuntimeError('exploded ' + CALLBACK_SECRET.decode() + INSPECT_KEY.hex())
+    monkeypatch.setattr('messaging_service.button_inspection.fingerprint', boom)
+    with pytest.raises(CommandRejected) as refused:
+        run(client, 'inspect_message_buttons')
+    assert refused.value.args == ('provider_preflight_failed',)
+    assert not any(secret in repr(refused.value) + caplog.text for secret in secrets_seen)
+
+    class Exploding(Client):
+        async def get_messages(self, peer, *, ids):
+            raise RuntimeError('provider said ' + CALLBACK_SECRET.decode())
+    with pytest.raises(CommandRejected) as refused:
+        run(Exploding(), 'inspect_message_buttons')
+    assert refused.value.args == ('provider_preflight_failed',) and CALLBACK_SECRET.decode() not in caplog.text
+
+
+# spec: ANYM-681
+@pytest.mark.parametrize('error,code', [
+    (errors.ChannelPrivateError(None), 'not_found'), (errors.MessageIdInvalidError(None), 'not_found'),
+    (errors.RPCError(None, 'SYNTHETIC_ERROR', 400), 'operation_rejected')])
+def test_a_provider_refusal_maps_to_a_safe_code(error, code):
+    class Refusing(Client):
+        async def get_messages(self, peer, *, ids):
+            raise error
+    with pytest.raises(CommandRejected) as refused:
+        run(Refusing(), 'inspect_message_buttons')
+    assert refused.value.args == (code,)
+
+
+# spec: ANYM-681
+def test_the_inspection_is_governed_in_its_own_scope(monkeypatch):
+    from messaging_service.telegram_governor import LIVE_BUDGETS
+    keyed(monkeypatch)
+    assert LIVE_BUDGETS['inspect_buttons'] == (3, 10.0, 300)
+    clock, state, governor = governed()
+    client = Client()
+    client.message.reply_markup = inline([callback_button('Pay')])
+    inspect(client, governor)  # entity resolution and the message read: two provider requests
+    before = len(client.calls)
+    with pytest.raises(CommandRejected) as refused:
+        inspect(client, governor)
+    assert refused.value.args == ('rate_limited',) and 1 <= refused.value.retry_after <= 10
+    assert len(client.calls) == before
+    clock.advance(10)
+    inspect(client, governor)
+    assert len(client.calls) > before
+
+
+# spec: ANYM-681
+# spec: ANYM-681
+def test_an_inspection_flood_wait_clears_only_its_own_sdk_entry_through_the_real_call(monkeypatch):
+    """Telethon's own _call remembers a FloodWait per RPC constructor, shared with every other get_messages and with
+    its update loop; the inspection puts back only the entry of the request that was flood-waited."""
+    from telethon import TelegramClient
+    from telethon.sessions import MemorySession
+    keyed(monkeypatch)
+    clock, state, governor = governed()
+    unrelated = functions.updates.GetDifferenceRequest.CONSTRUCTOR_ID
+    earlier = functions.messages.SendMessageRequest.CONSTRUCTOR_ID
+    sent = []
+
+    class Sender:
+        flood = True
+
+        def __init__(self, owner):
+            self.owner = owner
+
+        def send(self, request, ordered=False):
+            sent.append(type(request).__name__)
+            future = asyncio.get_running_loop().create_future()
+            if self.flood:
+                # The SDK's update loop records its own wait while the inspection's request is in flight.
+                self.owner._flood_waited_requests[unrelated] = time.time() + 600
+                future.set_exception(errors.FloodWaitError(request=request, capture=300))
+            else:
+                future.set_result(types.messages.Messages(messages=[], topics=[], chats=[], users=[]))
+            return future
+
+    class Real(TelegramClient):
+        async def get_input_entity(self, peer):
+            return types.InputPeerUser(peer, 1) if isinstance(peer, int) else peer
+
+    client = Real(MemorySession(), 1, 'a' * 32, flood_sleep_threshold=0, request_retries=0)
+    client._sender = Sender(client)
+    client._flood_waited_requests[earlier] = time.time() + 900  # an older, unrelated wait
+    kept_earlier = client._flood_waited_requests[earlier]
+    with pytest.raises(CommandRejected) as flooded:
+        asyncio.run(execute(client, job('inspect_message_buttons'), governor=governor))
+    assert flooded.value.retry_after == 300 and state.deferred == []
+    waits = client._flood_waited_requests
+    assert functions.messages.GetMessagesRequest.CONSTRUCTOR_ID not in waits  # this read's own entry is gone
+    assert unrelated in waits and waits[earlier] == kept_earlier  # nothing else was touched
+    # The next get_message_info-style read reaches the provider instead of meeting a cached SDK wait.
+    client._sender.flood = False
+    asyncio.run(client.get_messages(types.InputPeerUser(100, 1), ids=23))
+    assert sent.count('GetMessagesRequest') == 2
+
+
+# spec: ANYM-681
+def test_a_keyboard_over_100_rows_or_100_columns_is_marked_truncated(monkeypatch):
+    keyed(monkeypatch)
+    rows = Client()
+    rows.message.reply_markup = inline(*[[callback_button('R%d' % n, b'd%d' % n)] for n in range(101)])
+    data = run(rows, 'inspect_message_buttons')['data']
+    assert len(data['rows']) == 100 and data['truncated'] is True
+    wide = Client()
+    wide.message.reply_markup = inline([callback_button('C%d' % n, b'd%d' % n) for n in range(101)])
+    data = run(wide, 'inspect_message_buttons')['data']
+    assert sum(len(row) for row in data['rows']) == 100 and data['truncated'] is True
+    exact = Client()
+    exact.message.reply_markup = inline(*[[callback_button('R%d' % n, b'd%d' % n)] for n in range(100)])
+    assert 'truncated' not in run(exact, 'inspect_message_buttons')['data']
+
+
+# spec: ANYM-681
+def test_a_failed_inspection_prints_no_secret_in_its_exception_chain(monkeypatch):
+    import traceback
+    keyed(monkeypatch)
+    client = Client()
+    client.message.reply_markup = inline([callback_button('Pay')])
+
+    def boom(*args, **kwargs):
+        raise RuntimeError('exploded ' + CALLBACK_SECRET.decode() + INSPECT_KEY.hex())
+    monkeypatch.setattr('messaging_service.button_inspection.fingerprint', boom)
+    with pytest.raises(CommandRejected) as refused:
+        run(client, 'inspect_message_buttons')
+
+    class Exploding(Client):
+        async def get_messages(self, peer, *, ids):
+            raise RuntimeError('provider said ' + CALLBACK_SECRET.decode() + INSPECT_KEY.hex())
+    with pytest.raises(CommandRejected) as read:
+        run(Exploding(), 'inspect_message_buttons')
+
+    class Refusing(Client):
+        async def get_messages(self, peer, *, ids):
+            raise errors.RPCError(None, 'SYNTHETIC_' + CALLBACK_SECRET.decode(), 400)
+    with pytest.raises(CommandRejected) as mapped:
+        run(Refusing(), 'inspect_message_buttons')
+    assert mapped.value.args == ('operation_rejected',)
+    for error in (refused.value, read.value, mapped.value):
+        chain = ''.join(traceback.format_exception(error))
+        assert CALLBACK_SECRET.decode() not in chain and INSPECT_KEY.hex() not in chain
+
+
+# spec: ANYM-681
+def test_a_scoped_flood_wait_pauses_only_the_inspection_and_a_long_one_the_account(monkeypatch):
+    keyed(monkeypatch)
+    clock, state, governor = governed()
+
+    class Flooding(Client):
+        async def get_messages(self, peer, *, ids):
+            raise errors.FloodWaitError(None, capture=300)
+    with pytest.raises(CommandRejected) as flooded:
+        inspect(Flooding(), governor)
+    assert flooded.value.retry_after == 300 and state.deferred == []
+    calls = []
+
+    async def other(name):
+        async def work():
+            calls.append(name)
+        await governor.call(work, name)
+    asyncio.run(other('provider_send'))
+    asyncio.run(other('telegram_history'))
+    assert calls == ['provider_send', 'telegram_history']  # sends and collection proceed
+    paused = Client()
+    with pytest.raises(CommandRejected) as refused:
+        inspect(paused, governor)
+    assert refused.value.retry_after >= 290 and paused.calls == []  # only inspection is refused
+    # A FloodWait longer than the scoped maximum pauses the account, as search does.
+    clock2, state2, governor2 = governed()
+
+    class Long(Client):
+        async def get_messages(self, peer, *, ids):
+            raise errors.FloodWaitError(None, capture=7200)
+    with pytest.raises(CommandRejected):
+        inspect(Long(), governor2)
+    assert state2.deferred == [7200]
+
+
+# --- ANYM-676: press_button -------------------------------------------------------------------------------------
+from messaging_service import button_press_executor
+from messaging_service.button_press import layout_digest, text_digest
+from messaging_service.message_buttons import build_rows
+
+PRESS_KEY = bytes(range(32))
+
+
+class PressClient(Client):
+    """A bot message with a Pay and a Cancel callback button; get_messages also answers the newest-message probe."""
+
+    def __init__(self, data=CALLBACK_SECRET):
+        super().__init__()
+        self.message.out = False
+        self.message.edit_date = None
+        self.message.message = 'Pay now'
+        self.message.reply_markup = inline([callback_button('Pay', data), callback_button('Cancel', b'cancel-data')])
+        self.newer = None
+        self.reread_error = None
+        self.reads = 0
+
+    async def get_messages(self, peer, *, ids=None, limit=None):
+        self.calls.append(('get_messages', peer, ids, limit))
+        if limit is not None:
+            return [self.newer or self.message]
+        self.reads += 1
+        if self.reads > 1 and self.reread_error:
+            raise self.reread_error
+        return self.message
+
+    def pressed(self):
+        return [c for c in self.calls if isinstance(c, functions.messages.GetBotCallbackAnswerRequest)]
+
+
+def press_block(message, row=0, column=0, label='Pay', data=CALLBACK_SECRET):
+    rows, _ = build_rows(message.reply_markup)
+    moment = message.edit_date or message.date
+    return {'row': row, 'column': column, 'label': label, 'edit_date': moment.isoformat(),
+            'fp': button_fingerprint.fingerprint(100, message.id, row, column, data, key=PRESS_KEY),
+            'layout_digest': layout_digest(rows), 'text_sha256': text_digest(message.message)}
+
+
+def press(client, block=None, governor=None, **kwargs):
+    block = block or press_block(client.message)
+    parameters = {key: block[key] for key in ('row', 'column', 'label', 'fp')}
+    return asyncio.run(execute(client, job('press_button', parameters, press=block, **kwargs), governor=governor))
+
+
+@pytest.fixture
+def pressing(monkeypatch):
+    monkeypatch.setattr(button_fingerprint, '_KEY', PRESS_KEY)
+    monkeypatch.setattr(button_press_executor, 'AFTER_DELAY', 0)
+
+
+# spec: ANYM-676
+def test_a_press_sends_exactly_one_request_and_returns_the_answer_and_the_message_afterwards(pressing):
+    client = PressClient()
+    client.responses[functions.messages.GetBotCallbackAnswerRequest] = types.messages.BotCallbackAnswer(
+        cache_time=0, alert=True, message='Order placed')
+    result = press(client)
+    data = result['data']
+    assert result['outcome'] == 'submitted' and data['effect_verified'] is False
+    assert data['answer'] == {'message': 'Order placed', 'alert': True, 'url': None}
+    assert data['message_after'] == {'edited': False, 'deleted': False, 'text': 'Pay now', 'new_messages': False,
+                                     'buttons': [{'text': 'Pay', 'kind': 'callback'}, {'text': 'Cancel', 'kind': 'callback'}]}
+    assert data['pressed_at'] and 'pressed_at' in data['next_action'] and safe_result(result)
+    request, = client.pressed()
+    assert request.msg_id == 23 and request.data == CALLBACK_SECRET and len(client.pressed()) == 1
+
+
+# spec: ANYM-676
+@pytest.mark.parametrize('change', [
+    lambda m: setattr(m, 'reply_markup', inline([callback_button('Pay'), callback_button('Cancel', b'cancel-data'),
+                                                 callback_button('Extra', b'e')])),  # layout
+    lambda m: setattr(m, 'message', 'Pay later'),  # text
+    lambda m: setattr(m, 'edit_date', datetime(2026, 10, 14, 0, 0, 5, tzinfo=timezone.utc)),  # edit_date
+    lambda m: setattr(m, 'reply_markup', inline([callback_button('Pay', b'DIFFERENT-BYTES'),
+                                                 callback_button('Cancel', b'cancel-data')])),  # callback bytes only
+    lambda m: setattr(m, 'reply_markup', inline([callback_button('Pay', requires_password=True),
+                                                 callback_button('Cancel', b'cancel-data')])) or
+              setattr(m, 'message', 'x'),  # a changed message and a password button: the password code wins below
+], ids=['layout', 'text', 'edit_date', 'callback_bytes_only', 'password_and_text'])
+def test_a_press_is_refused_when_the_live_message_differs_from_the_preview_and_nothing_is_sent(pressing, change):
+    client = PressClient()
+    block = press_block(client.message)
+    change(client.message)
+    with pytest.raises(CommandRejected) as refused:
+        press(client, block)
+    assert refused.value.args[0] in ('message_changed', 'password_required') and client.pressed() == []
+    if refused.value.args[0] == 'message_changed':
+        live = refused.value.data['live']
+        assert set(live) == {'edit_date', 'text', 'labels'} and CALLBACK_SECRET.decode() not in repr(live)
+
+
+# spec: ANYM-676
+def test_the_callback_bytes_swap_inside_the_same_second_changes_only_the_fingerprint(pressing):
+    client = PressClient()
+    block = press_block(client.message)
+    client.message.reply_markup = inline([callback_button('Pay', b'SWAPPED'), callback_button('Cancel', b'cancel-data')])
+    rows, _ = build_rows(client.message.reply_markup)
+    assert layout_digest(rows) == block['layout_digest'] and client.message.message == 'Pay now'  # all else equal
+    with pytest.raises(CommandRejected, match='message_changed'):
+        press(client, block)
+    assert client.pressed() == []
+
+
+# spec: ANYM-676
+def test_a_password_button_a_via_bot_message_and_other_kinds_are_not_pressed(pressing):
+    client = PressClient()
+    block = press_block(client.message)
+    client.message.reply_markup = inline([callback_button('Pay', requires_password=True)])
+    with pytest.raises(CommandRejected, match='password_required'):
+        press(client, block)
+    client = PressClient()
+    block = press_block(client.message)
+    client.message.via_bot_id = 777
+    with pytest.raises(CommandRejected, match='unsupported_operation'):
+        press(client, block)
+    client = PressClient()
+    block = press_block(client.message)
+    client.message.reply_markup = inline([button('Pay', types.InlineButtonTypeUrl(url='https://example.invalid/a'))])
+    with pytest.raises(CommandRejected, match='message_changed'):
+        press(client, block)
+    assert client.pressed() == []
+
+
+# spec: ANYM-676
+@pytest.mark.parametrize('error', [errors.BotResponseTimeoutError(None), errors.rpcerrorlist.TimeoutError(None)])
+def test_a_bot_response_timeout_is_a_delivered_press(pressing, error):
+    client = PressClient()
+    client.responses[functions.messages.GetBotCallbackAnswerRequest] = error
+    result = press(client)
+    assert result['outcome'] == 'submitted' and result['data']['answer'] is None
+    assert result['data']['answer_timeout'] is True and result['data']['message_after']['deleted'] is False
+    assert len(client.pressed()) == 1
+
+
+# spec: ANYM-676
+def test_a_connection_loss_after_dispatch_is_unknown_with_exactly_one_request(pressing, caplog):
+    client = PressClient()
+    client.responses[functions.messages.GetBotCallbackAnswerRequest] = ConnectionError('boom ' + CALLBACK_SECRET.decode())
+    result = press(client)
+    assert result == {'outcome': 'unknown', 'data': {'error': 'provider_result_unverified'}}
+    assert len(client.pressed()) == 1 and CALLBACK_SECRET.decode() not in repr(result) + caplog.text
+
+
+# spec: ANYM-676
+@pytest.mark.parametrize('error,code', [
+    (errors.DataInvalidError(None), 'message_changed'), (errors.PasswordMissingError(None), 'password_required'),
+    (errors.MessageIdInvalidError(None), 'not_found'), (errors.MsgIdInvalidError(None), 'not_found'),
+    (errors.PeerIdInvalidError(None), 'not_found'), (errors.ChannelInvalidError(None), 'not_found'),
+    (errors.ChannelPrivateError(None), 'not_found')])
+def test_a_definite_provider_refusal_is_a_failed_press_not_an_unknown_one(pressing, error, code):
+    client = PressClient()
+    client.responses[functions.messages.GetBotCallbackAnswerRequest] = error
+    with pytest.raises(CommandRejected) as refused:
+        press(client)
+    assert refused.value.args == (code,) and len(client.pressed()) == 1
+
+
+# spec: ANYM-676
+def test_callback_bytes_reach_no_result_log_or_exception_text_and_an_echoing_answer_is_redacted(pressing, caplog):
+    import logging
+    import traceback
+    caplog.set_level(logging.DEBUG)
+    client = PressClient()
+    client.responses[functions.messages.GetBotCallbackAnswerRequest] = types.messages.BotCallbackAnswer(
+        cache_time=0, message='you pressed ' + CALLBACK_SECRET.decode(),
+        url='https://example.invalid/?q=' + CALLBACK_SECRET.decode())
+    result = press(client)
+    answer = result['data']['answer']
+    assert answer == {'message': '[redacted]', 'alert': False, 'url': '[redacted]', 'answer_redacted': True}
+    assert CALLBACK_SECRET.decode() not in repr(result) + caplog.text
+    short = PressClient(data=b'ab')  # under 8 bytes is not a credential and is not suppressed
+    short.responses[functions.messages.GetBotCallbackAnswerRequest] = types.messages.BotCallbackAnswer(cache_time=0, message='ab ok')
+    assert press(short, press_block(short.message, data=b'ab'))['data']['answer']['message'] == 'ab ok'
+    # A failure whose text carries the bytes: unknown, a fixed code, and no chain that prints them.
+    failing = PressClient()
+    failing.responses[functions.messages.GetBotCallbackAnswerRequest] = RuntimeError('provider said ' + CALLBACK_SECRET.decode())
+    outcome = press(failing)
+    assert outcome == {'outcome': 'unknown', 'data': {'error': 'provider_result_unverified'}}
+    assert CALLBACK_SECRET.decode() not in repr(outcome) + caplog.text
+    refused = PressClient()
+    block = press_block(refused.message)
+    refused.message.reply_markup = inline([callback_button('Pay', b'OTHER-BYTES-123')])
+    with pytest.raises(CommandRejected) as rejected:
+        press(refused, block)
+    assert CALLBACK_SECRET.decode() not in ''.join(traceback.format_exception(rejected.value)) + repr(rejected.value.data)
+
+
+# spec: ANYM-676
+def test_the_answer_url_is_data_kept_only_when_it_passes_the_link_rule(pressing):
+    client = PressClient()
+    client.responses[functions.messages.GetBotCallbackAnswerRequest] = types.messages.BotCallbackAnswer(
+        cache_time=0, message='x', url='https://example.invalid/ok')
+    assert press(client)['data']['answer']['url'] == 'https://example.invalid/ok'
+    client.responses[functions.messages.GetBotCallbackAnswerRequest] = types.messages.BotCallbackAnswer(
+        cache_time=0, message='x', url='javascript:alert(1)')
+    answer = press(client)['data']['answer']
+    assert answer['url'] is None and answer['url_dropped'] is True
+    assert not any(call[0] == 'get_url' for call in client.calls if isinstance(call, tuple))
+
+
+# spec: ANYM-676
+def test_a_failed_reread_never_changes_the_outcome_and_a_new_message_or_edit_is_reported(pressing):
+    client = PressClient()
+    client.reread_error = RuntimeError('reread failed ' + CALLBACK_SECRET.decode())
+    result = press(client)
+    assert result['outcome'] == 'submitted' and result['data']['message_after'] is None
+    assert result['data']['message_after_code'] == 'reread_failed' and CALLBACK_SECRET.decode() not in repr(result)
+    edited = PressClient()
+    block = press_block(edited.message)
+
+    class Edits(PressClient):
+        async def get_messages(self, peer, *, ids=None, limit=None):
+            if ids is not None and self.reads:
+                self.message = NS(**{**vars(self.message), 'message': 'Paid', 'edit_date': datetime(2026, 10, 14, 0, 1, tzinfo=timezone.utc)})
+            if limit is not None:
+                return [NS(id=24)] if self.reads > 1 else [self.message]  # message 24 appears only after the press
+            return await super().get_messages(peer, ids=ids, limit=limit)
+    live = Edits()
+    after = press(live, block)['data']['message_after']
+    assert after['edited'] is True and after['new_messages'] is True and after['text'] == 'Paid'
+
+
+# spec: ANYM-676
+def test_presses_are_paced_per_account_in_memory_and_refuse_before_any_request(pressing):
+    from messaging_service.telegram_governor import LIVE_BUDGETS
+    assert LIVE_BUDGETS['press_button'] == (3, 5.0, 200)
+    clock, state, governor = governed()
+    governor.interval = 0  # the fake clock then moves only when the test moves it
+    for _ in range(3):
+        press(PressClient(), governor=governor)
+    client = PressClient()
+    with pytest.raises(CommandRejected) as limited:
+        press(client, governor=governor)
+    assert limited.value.args == ('rate_limited',) and limited.value.retry_after >= 1 and client.calls == []
+
+
+# spec: ANYM-676
+def test_a_message_that_already_existed_before_the_press_is_not_a_visible_change(pressing):
+    client = PressClient()
+    client.newer = NS(id=24)  # the chat already holds message 24 when the press goes out and when it is re-read
+    client.responses[functions.messages.GetBotCallbackAnswerRequest] = errors.BotResponseTimeoutError(None)
+    after = press(client)['data']['message_after']
+    assert after['new_messages'] is False and after['edited'] is False
+
+
+# spec: ANYM-676
+def test_callback_bytes_echoed_by_the_bot_in_its_edited_message_are_redacted(pressing):
+    client = PressClient()
+
+    class Echo(PressClient):
+        async def get_messages(self, peer, *, ids=None, limit=None):
+            if ids is not None and self.reads:
+                self.message = NS(**{**vars(self.message), 'message': 'echo ' + CALLBACK_SECRET.decode(),
+                                     'reply_markup': inline([callback_button('pressed ' + CALLBACK_SECRET.decode(), b'z')])})
+            return await super().get_messages(peer, ids=ids, limit=limit)
+    echo = Echo()
+    result = press(echo, press_block(client.message))
+    after = result['data']['message_after']
+    assert after['redacted'] is True and after['text'] == '[redacted]'
+    assert after['buttons'] == [{'text': '[redacted]', 'kind': 'callback'}]
+    assert CALLBACK_SECRET.decode() not in repr(result)
+
+
+# spec: ANYM-676
+def test_pressed_at_is_taken_before_the_request_leaves(pressing, monkeypatch):
+    events = []
+    dispatch_time = datetime(2026, 10, 14, 9, 0, 1, tzinfo=timezone.utc)
+
+    def controlled():
+        events.append('now')
+        return dispatch_time if events.count('now') == 1 else dispatch_time + timedelta(seconds=30)
+
+    class Slow(PressClient):
+        async def __call__(self, request):
+            if isinstance(request, functions.messages.GetBotCallbackAnswerRequest):
+                events.append('request')
+            return await super().__call__(request)
+    monkeypatch.setattr(button_press_executor, 'now_utc', controlled)
+    result = press(Slow())
+    assert events[:2] == ['now', 'request']  # the timestamp is taken first, once
+    assert result['data']['pressed_at'] == '2026-10-14T09:00:01+00:00'
+
+
+# spec: ANYM-676
+def test_a_preflight_that_rejects_the_saved_revision_after_the_press_does_not_block_the_reread(pressing):
+    """Capture archives the bot's edit, so the command's saved expected_revision is stale once the press is delivered."""
+    client = PressClient()
+
+    class Edits(PressClient):
+        async def get_messages(self, peer, *, ids=None, limit=None):
+            if ids is not None and self.reads:
+                self.message = NS(**{**vars(self.message), 'message': 'Paid',
+                                     'edit_date': datetime(2026, 10, 14, 0, 1, tzinfo=timezone.utc)})
+            return await super().get_messages(peer, ids=ids, limit=limit)
+    live = Edits()
+    block = press_block(client.message)
+
+    async def preflight():
+        if live.pressed():
+            raise CommandRejected('operation_target_changed')
+    policy_checks = []
+    work = job('press_button', {k: block[k] for k in ('row', 'column', 'label', 'fp')}, press=block, _preflight=preflight)
+    work['_policy'] = {'enabled': True, 'discover_chats': True, 'include_chats': [], 'exclude_chats': []}
+    clock, state, governor = governed()
+    governor.interval = 0
+    original = governor.call
+
+    async def watched(operation, phase, **kwargs):
+        policy_checks.append(phase)
+        return await original(operation, phase, **kwargs)
+    governor.call = watched
+    result = asyncio.run(execute(live, work, governor=governor))
+    assert result['outcome'] == 'submitted' and result['data']['message_after']['text'] == 'Paid'
+    assert result['data']['message_after']['edited'] is True and policy_checks  # read through the governor
+    excluded = job('press_button', {k: block[k] for k in ('row', 'column', 'label', 'fp')}, press=block)
+    assert excluded['_policy']['exclude_chats'] == []
+
+
+# spec: ANYM-676
+@pytest.mark.parametrize('echo', [CALLBACK_SECRET.decode() + ' ', '   ' + CALLBACK_SECRET.decode(),
+                                  'x' * 200 + CALLBACK_SECRET.decode(), CALLBACK_SECRET.decode()[:10] + '\x07' + 'tail'])
+def test_the_echo_of_callback_bytes_is_found_in_the_raw_label_before_cleaning_or_truncation(pressing, echo):
+    client = PressClient(data=CALLBACK_SECRET + b' ' if echo.endswith(' ') and not echo.startswith(' ') else CALLBACK_SECRET)
+    block = press_block(client.message, data=CALLBACK_SECRET + b' ' if echo.endswith(' ') and not echo.startswith(' ') else CALLBACK_SECRET)
+
+    class Echo(PressClient):
+        async def get_messages(self, peer, *, ids=None, limit=None):
+            if ids is not None and self.reads:
+                self.message = NS(**{**vars(self.message), 'reply_markup': inline([callback_button(echo, b'z')])})
+            return await super().get_messages(peer, ids=ids, limit=limit)
+    live = Echo(data=CALLBACK_SECRET + b' ' if echo.endswith(' ') and not echo.startswith(' ') else CALLBACK_SECRET)
+    result = press(live, block)
+    after = result['data']['message_after']
+    if echo.startswith(CALLBACK_SECRET.decode()[:10] + '\x07'):
+        assert not after.get('redacted')  # a control character inside is a different string: not an echo
+    else:
+        assert after['redacted'] is True and after['buttons'] == [{'text': '[redacted]', 'kind': 'callback'}]
+    assert CALLBACK_SECRET.decode() not in repr(result)
+
+
+# spec: ANYM-676
+def test_an_exhausted_deadline_or_a_shutdown_keeps_the_delivered_press_submitted(pressing):
+    skipped = PressClient()
+    block = press_block(skipped.message)
+    result = asyncio.run(execute(skipped, job('press_button', {k: block[k] for k in ('row', 'column', 'label', 'fp')},
+                                              press=block, _ends_at=time.monotonic() + 0.5)))
+    assert result['outcome'] == 'submitted' and result['data']['message_after'] is None
+    assert result['data']['message_after_code'] == 'reread_skipped'
+    interrupted = PressClient()
+    interrupted.reread_error = asyncio.CancelledError()
+    marker = job('press_button', {k: block[k] for k in ('row', 'column', 'label', 'fp')}, press=block)
+    result = asyncio.run(execute(interrupted, marker))
+    assert result['outcome'] == 'submitted' and result['data']['message_after_code'] == 'reread_interrupted'
+    assert marker['_cancel_after_settle'] is True  # the worker settles the receipt, then resumes the cancellation
+    slow = PressClient()
+    original = button_press_executor.message_after
+
+    async def never(*args, **kwargs):
+        await asyncio.sleep(30)
+    button_press_executor.message_after = never
+    try:
+        late = asyncio.run(execute(slow, job('press_button', {k: block[k] for k in ('row', 'column', 'label', 'fp')},
+                                             press=block, _ends_at=time.monotonic() + 4.0)))
+    finally:
+        button_press_executor.message_after = original
+    assert late['outcome'] == 'submitted' and late['data']['message_after_code'] == 'reread_timeout'
+
+
+# spec: ANYM-676
+def test_a_reconnect_never_replays_a_pending_press_but_replays_other_requests():
+    """Telethon re-queues every pending request after a reconnect, whatever request_retries says."""
+    import collections
+    import logging
+    from telethon.network import MTProtoSender
+    from telethon.network.requeststate import RequestState
+    press_request = functions.messages.GetBotCallbackAnswerRequest(types.InputPeerUser(1, 1), 23, data=b'x')
+    other_request = functions.messages.GetMessagesRequest(id=[types.InputMessageID(1)])
+
+    class Connection:
+        async def disconnect(self):
+            pass
+
+    async def scenario(guarded):
+        sender = MTProtoSender(None, loggers=collections.defaultdict(lambda: logging.getLogger('synthetic')))
+        sender._user_connected, sender._connection = True, Connection()
+
+        async def connect():
+            pass
+        sender._connect = connect
+        sender._send_loop_handle = asyncio.ensure_future(asyncio.sleep(0))
+        sender._recv_loop_handle = asyncio.ensure_future(asyncio.sleep(0))
+        await asyncio.sleep(0.01)
+        pressing_state, other_state = RequestState(press_request), RequestState(other_request)
+        pressing_state.msg_id, other_state.msg_id = 1, 2
+        sender._pending_state = {1: pressing_state, 2: other_state}
+        client = NS(_sender=sender)
+        if guarded:
+            with button_press_executor.without_transport_replay(client, press_request):
+                await sender._reconnect(ConnectionError('lost'))
+            assert '_reconnect' not in sender.__dict__  # restored
+        else:
+            await sender._reconnect(ConnectionError('lost'))
+        queued = [state.request for state in list(sender._send_queue._deque)]
+        return queued, pressing_state
+    async def cancelled_then_reconnect():
+        sender = MTProtoSender(None, loggers=collections.defaultdict(lambda: logging.getLogger('synthetic')))
+        sender._user_connected, sender._connection = True, Connection()
+
+        async def connect():
+            pass
+        sender._connect = connect
+        sender._send_loop_handle = asyncio.ensure_future(asyncio.sleep(0))
+        sender._recv_loop_handle = asyncio.ensure_future(asyncio.sleep(0))
+        await asyncio.sleep(0.01)
+        dispatched, other_state, unsent = RequestState(press_request), RequestState(other_request), RequestState(press_request)
+        dispatched.msg_id, other_state.msg_id = 1, 2
+        sender._pending_state = {1: dispatched, 2: other_state}
+        sender._send_queue.append(unsent)  # queued, never sent
+        client = NS(_sender=sender)
+        with pytest.raises(asyncio.CancelledError):  # the worker's 30 s timeout cancels the awaiting call
+            with button_press_executor.without_transport_replay(client, press_request):
+                raise asyncio.CancelledError()
+        await sender._reconnect(ConnectionError('lost later'))  # a LATER reconnect, after the guard was removed
+        return [state.request for state in list(sender._send_queue._deque)]
+    later = asyncio.run(cancelled_then_reconnect())
+    assert press_request not in later and later == [other_request]
+    plain, _ = asyncio.run(scenario(False))
+    assert press_request in plain  # the transport would have sent the callback a second time
+    queued, state = asyncio.run(scenario(True))
+    assert press_request not in queued and other_request in queued
+    assert isinstance(state.future.exception(), ConnectionError)

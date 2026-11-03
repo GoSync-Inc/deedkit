@@ -25,7 +25,7 @@ import production  # noqa: E402
 
 REGISTRY = "ghcr.io/gosync-inc"
 # The images.yml matrix; tests/test_publish_images.py keeps both lists equal.
-TARGETS = ("runtime", "indexer", "enricher-local", "whatsapp-native", "gateway", "calendar", "calls", "backup")
+TARGETS = ("runtime", "indexer", "enricher-local", "whatsapp-native", "gateway", "calendar", "recordings", "calls", "backup")
 WORKFLOW = production.REPOSITORY + "/.github/workflows/ci.yml"
 SOURCE = "https://github.com/" + production.REPOSITORY
 ABSENT = ("manifest unknown", "name unknown")  # the registry's MANIFEST_UNKNOWN / NAME_UNKNOWN error codes

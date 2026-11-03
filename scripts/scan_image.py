@@ -40,7 +40,7 @@ HEURISTIC_RULES = frozenset({"generic-api-key", "jwt"})
 # System files: only /usr/lib and /usr/include (and /lib*, their merged-usr aliases on Debian), never
 # /usr/share or /usr/local, where our Dockerfiles COPY.
 THIRD_PARTY = re.compile(r"(?:^|/)(?:site|dist)-packages/[^/]+/|^usr/include/|^(?:usr/)?(?:lib|lib32|lib64|libx32)/")
-OWN_PACKAGES = frozenset({"agent_gateway", "anymsg", "deedkit_gateway", "deedkit_platform_contracts",
+OWN_PACKAGES = frozenset({"agent_gateway", "anymsg", "deedkit_gateway", "deedkit_platform_contracts", "deedkit_recordings",
                           "family_calendar", "family_calendar_service", "messaging_service",
                           "personal_os_voice_service", "platform_contracts", "telegram_broker",
                           "telegram_session_owner"})

@@ -26,7 +26,7 @@ docs/operations/parallel-development.md.
 ## 1. Always
 
 - No send, call, ACK, pairing or provider-session start/stop without the owner's exact
-  confirmation. Never retry an uncertain mutation or mint a new request ID. Never run two clients
+  confirmation, except the incident recovery authority in section 2. Never retry an uncertain mutation or mint a new request ID. Never run two clients
   on one provider session. Tests and health checks never touch a live provider.
 - Never change applied migrations, provider IDs, existing test paths, names or parameters (Tiden
   IDs) or the seven `anymsg-ci::*` checks.
@@ -44,9 +44,30 @@ agents' under the harness section 2 gates. Item 2 asks only what docs/DATA-POLIC
 cover; item 3 is the Budget line above. The live actions act on the owner's messenger accounts
 under the owner's name (item 4) and the owner's devices and provider auth (item 5): they keep
 section 1's exact confirmation. In a task (a ready card) the agent applies its migration under
-production.md "Migration releases" (an additive one without a backup gate, owner 10-29); enabling
+production.md "Migration releases" (low or medium: no backup or copy, owner 10-29, 11-01); enabling
 a feature never includes send, call, pairing, session or allowlist changes, and none of it runs
 during an active call.
+
+Override: harness process.md section 2's fresh verified backup, for a low or medium migration
+release under any of its clauses (owner 11-01: «с копией базы надо только при опасных миграциях
+при ластовых и медиум рисках это не обязательно»; reason: backups as the release bottleneck). Only
+a dangerous one (production.md "Migration risk tiers") needs a fresh verified backup and a
+pre-migration copy; otherwise the latest verified daily backup is the restore point. Data deletion,
+restores, undo and plan review keep their gates. Enforcer: that section (ANYM-675, ANYM-680).
+
+Override: harness process.md sections 1–5 and reviews.md Rounds 7–8, incident recovery only
+(owner 10-30, Telegram sends: «это быстрый hotfix», «И только после этого уже продолжаем работу
+над задачами»). A confirmed production outage or broken critical user path takes priority over
+all other work. The agent immediately performs the smallest reversible recovery: restart the
+existing service/session, compatible rollback, or a service-only hotfix from verified green main
+through the promotion tool. This is standing authority; do not ask again for those actions.
+For recovery without schema/data changes, no fresh backup or restore drill is required; defer
+Tiden/card intake and independent review until recovery. Preserve CI, source/image checks, active-call checks,
+state and session identity. No sends/replays, new auth, access changes or destructive actions are
+included. Enforcer: follow [incident recovery](docs/operations/incident-recovery.md), including
+before/after evidence and undo; complete deferred checks and process corrections before resuming
+other tasks. This local override takes precedence over the pinned harness; its replaced gates
+and owner words are recorded in that runbook.
 
 Override: harness tiden.md Card intake step 1 (owner 10-26). A defect, improvement or feature
 idea in feedback from a principal in the autoloop config is written, readied, built, merged by the

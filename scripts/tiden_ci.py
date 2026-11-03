@@ -30,6 +30,7 @@ MODULE_REPORTS = {
     "calendar": ("calendar.xml", "python", "services/calendar"),
     "calls": ("calls.xml", "python", "services/calls"),
     "calls_frontend": ("calls-frontend.xml", "node", "services/calls/frontend"),
+    "inference": ("inference.xml", "python", "services/inference"),
     "backup_restore": ("backup-restore.xml", "python", ""),
     # Root-suite tests that cannot run in the shards: one as root under sudo, two in the enricher-test image.
     "root_session_lock": ("root-session-lock.xml", "python", ""),
@@ -47,8 +48,8 @@ REQUIRED_EXECUTIONS = {
                                  "tests/test_audio_native.py::test_faster_whisper_decoder_compatibility_without_model[ogg]"}),
 }
 GO_MODULES = tuple(name for name, (_, framework, _) in MODULE_REPORTS.items() if framework == "go")
-# The gateway, its contract package and the calls service run on a runner of their own, in parallel with verify.
-SERVICE_MODULES = ("gateway", "platform_contracts", "calls", "calls_frontend")
+# The gateway, its contract package, the calls service and the inference service run on a runner of their own, in parallel with verify.
+SERVICE_MODULES = ("gateway", "platform_contracts", "calls", "calls_frontend", "inference")
 _VERIFY_MODULES = tuple(name for name in MODULE_REPORTS if name != "load" and name not in GO_MODULES and name not in SERVICE_MODULES)
 # The root Python suite runs in file-level shards (scripts/python_shards.py): verify runs shard 1, each
 # `checks / python` matrix job one of the others, and assembly merges their reports into python.xml.
@@ -76,6 +77,9 @@ CONTROL_FILES = {"source-sha", "attempt", "metadata.json", "outcomes.json"}
 ASSEMBLED_FILES = frozenset({REPORTS["python"], *(name for _, files in FRAGMENTS.values() for name in files
                                                   if name not in CONTROL_FILES and name not in SHARD_REPORTS)})
 MAX_BYTES = 20 * 1024 * 1024
+# A JUnit report's case bound: a sanity limit of ours (`tiden run report` uploads any number of rows in chunks of 2000).
+# The merged python report is ~220 bytes a case (2.2 MB for 9975 cases, 11-02), so 50000 cases stay far under MAX_BYTES.
+MAX_JUNIT_CASES = 50000
 # Tiden branch names: lowercase letters, digits, slashes, underscores and hyphens.
 TIDEN_BRANCH_NAME = re.compile(r"[a-z0-9]+(?:[/_-][a-z0-9]+)*")
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
@@ -180,7 +184,7 @@ def normalize_junit(path: Path, root: Path, framework: str, source_prefix: str =
     if document.tag not in {"testsuites", "testsuite"}:
         raise ValueError("not a JUnit report")
     cases = list(document.iter("testcase"))
-    if not cases or len(cases) > 10000:
+    if not cases or len(cases) > MAX_JUNIT_CASES:
         raise ValueError("JUnit report must contain bounded real executions")
     counts = Counter()
     for case in cases:
@@ -503,6 +507,100 @@ def combined_outcome(outcomes: list[str]) -> str:
     return next((state for state in ("failure", "cancelled") if state in outcomes), "skipped")
 
 
+def verify_metadata(fragments, root):
+    """The run metadata of the verify fragment, and the SHA verify tested."""
+    verify = fragments / "ci-evidence-verify"
+    if not fresh_fragment(verify, root, "verify", "success", ""):
+        raise ValueError("the verify fragment with the run metadata is missing")
+    try:
+        metadata = json.loads(control_file(verify, "metadata.json"))
+        sha = metadata["sha"]
+    except (ValueError, KeyError, TypeError):
+        raise ValueError("the verify fragment with the run metadata is missing") from None
+    if not re.fullmatch(r"[a-f0-9]{40}", str(sha)) or set(metadata.get("checks") or {}) != set(CHECKS):
+        raise ValueError("the verify fragment does not name its tested source SHA and its seven checks")
+    return metadata, sha
+
+
+class Assembly:
+    """What `assemble` collects while it merges the fragments of the producer jobs one by one."""
+
+    def __init__(self, producers, fragments, root, attempt, sha, metadata, directory, source_root,
+                 checks, module_checks, provenance):
+        self.producers, self.fragments, self.root, self.attempt = producers, fragments, root, attempt
+        self.sha, self.metadata, self.directory, self.source_root = sha, metadata, directory, source_root
+        self.checks, self.module_checks, self.provenance = checks, module_checks, provenance
+        self.present, self.missing, self.shards, self.suites, self.inventories = [], [], [], [], {}
+
+
+def merge_fragment(assembly, job, names, files):
+    """Merge the fragment of one producer job into the assembly."""
+    result, captured = assembly.producers[job]
+    # A job's own captured checkout always has to agree with verify's, whatever its fragment.
+    if captured and captured != assembly.sha:
+        raise ValueError(f"the {job} job captured another source than verify")
+    fragment = assembly.fragments / f"ci-evidence-{job}"
+    assembly.provenance[job] = {"result": result, "sha": captured, "attempt": None}
+    if not fresh_fragment(fragment, assembly.root, job, result, assembly.attempt.group(1)):
+        assembly.missing.append(job)
+        state = result if result in {"failure", "cancelled"} else "skipped"
+        assembly.module_checks.update(dict.fromkeys(names, state))
+        if job == "verify":
+            assembly.checks = dict.fromkeys(CHECKS, state)
+        if job == "verify" or job in SHARD_JOBS:
+            assembly.shards.append(state)
+        return
+    if control_file(fragment, "source-sha") != assembly.sha or captured != assembly.sha:
+        raise ValueError(f"the {job} fragment tested another source than verify")
+    assembly.provenance[job]["attempt"] = control_file(fragment, "attempt")
+    assembly.inventories[job] = control_file(fragment, EXCLUSIONS)
+    if len(set(assembly.inventories.values())) > 1:
+        raise ValueError(f"the {job} fragment excluded other added tests than another job")
+    if not assembly.provenance[job]["attempt"].isdigit():
+        raise ValueError(f"the {job} fragment does not name its run attempt")
+    if job == "added" and added_result(control_file(fragment, ADDED_REPORT)) == "failed" and result == "success":
+        raise ValueError("the added job succeeded although its added tests failed")
+    try:
+        outcomes = assembly.metadata if job == "verify" else json.loads(control_file(fragment, "outcomes.json"))
+        reported = outcomes["checks"] if job in SHARD_JOBS else outcomes["module_checks"]
+        if job in SHARD_JOBS and set(outcomes) != {"checks"}:
+            reported = None
+    except (ValueError, KeyError, TypeError):
+        reported = None
+    if not isinstance(reported, dict) or set(reported) != ({"python"} if job in SHARD_JOBS else set(names)):
+        raise ValueError(f"the {job} fragment may report only its own checks")
+    if job in SHARD_JOBS:
+        state = shard_outcome(reported["python"], fragment / files[1], assembly.source_root, assembly.suites)
+        if state == "success" and result != "success":
+            state = result if result in {"failure", "cancelled"} else "skipped"
+        assembly.shards.append(state)
+    else:
+        assembly.module_checks.update(reported)
+        if job == "verify":
+            assembly.shards.append(shard_outcome(assembly.checks["python"], fragment / SHARD_REPORTS[0], assembly.source_root, assembly.suites))
+    for path in fragment.iterdir():
+        if path.name not in CONTROL_FILES and path.name not in SHARD_REPORTS:
+            (assembly.directory / path.name).write_bytes(path.read_bytes())
+    assembly.present.append(job)
+
+
+def merged_evidence(assembly, ci_url):
+    """Write the merged evidence and return its metadata with the jobs that had no fresh fragment."""
+    assembly.checks["python"] = combined_outcome(assembly.shards)
+    required = set().union(*REQUIRED_EXECUTIONS.values())
+    if any(name in required for name, _ in executions((case for suite in assembly.suites for case in suite.iter("testcase")), assembly.source_root)):
+        raise ValueError("a shard report holds a test that only its own module check may run")
+    if assembly.suites:
+        merged = ET.Element("testsuites", {"name": "pytest tests"})
+        merged.extend(assembly.suites)
+        (assembly.directory / REPORTS["python"]).write_bytes(ET.tostring(merged, encoding="utf-8", xml_declaration=True))
+    (assembly.directory / "source-sha").write_text(assembly.sha + "\n")
+    assembly.metadata.update({"ci_url": ci_url, "checks": assembly.checks, "module_checks": assembly.module_checks, "fragments": assembly.present,
+                     "producers": assembly.provenance})
+    (assembly.directory / "metadata.json").write_text(json.dumps(assembly.metadata))
+    return {**assembly.metadata, "missing": assembly.missing}
+
+
 def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict, *, source_root: Path | None = None) -> dict:
     """Merge the evidence fragments that the parallel test jobs uploaded into the directory `prepare` reads.
 
@@ -526,83 +624,17 @@ def assemble(directory: Path, fragments: Path, ci_url: str, producers: dict, *, 
     if not attempt or set(producers) != set(FRAGMENTS):
         raise ValueError("the assembling run's attempt URL and every producer's result are required")
     root = fragments.resolve()
-    verify = fragments / "ci-evidence-verify"
-    if not fresh_fragment(verify, root, "verify", "success", ""):
-        raise ValueError("the verify fragment with the run metadata is missing")
-    try:
-        metadata = json.loads(control_file(verify, "metadata.json"))
-        sha = metadata["sha"]
-    except (ValueError, KeyError, TypeError):
-        raise ValueError("the verify fragment with the run metadata is missing") from None
-    if not re.fullmatch(r"[a-f0-9]{40}", str(sha)) or set(metadata.get("checks") or {}) != set(CHECKS):
-        raise ValueError("the verify fragment does not name its tested source SHA and its seven checks")
+    metadata, sha = verify_metadata(fragments, root)
     if directory.exists() and any(directory.iterdir()):
         raise ValueError("the evidence directory must be new or empty")
     checks, module_checks, provenance = dict(metadata["checks"]), {}, {}
     directory.mkdir(parents=True, exist_ok=True)
-    present, missing, shards, suites, inventories = [], [], [], [], {}
     source_root = source_root or Path.cwd()
+    assembly = Assembly(producers, fragments, root, attempt, sha, metadata, directory, source_root,
+                        checks, module_checks, provenance)
     for job, (names, files) in FRAGMENTS.items():
-        result, captured = producers[job]
-        # A job's own captured checkout always has to agree with verify's, whatever its fragment.
-        if captured and captured != sha:
-            raise ValueError(f"the {job} job captured another source than verify")
-        fragment = fragments / f"ci-evidence-{job}"
-        provenance[job] = {"result": result, "sha": captured, "attempt": None}
-        if not fresh_fragment(fragment, root, job, result, attempt.group(1)):
-            missing.append(job)
-            state = result if result in {"failure", "cancelled"} else "skipped"
-            module_checks.update(dict.fromkeys(names, state))
-            if job == "verify":
-                checks = dict.fromkeys(CHECKS, state)
-            if job == "verify" or job in SHARD_JOBS:
-                shards.append(state)
-            continue
-        if control_file(fragment, "source-sha") != sha or captured != sha:
-            raise ValueError(f"the {job} fragment tested another source than verify")
-        provenance[job]["attempt"] = control_file(fragment, "attempt")
-        inventories[job] = control_file(fragment, EXCLUSIONS)
-        if len(set(inventories.values())) > 1:
-            raise ValueError(f"the {job} fragment excluded other added tests than another job")
-        if not provenance[job]["attempt"].isdigit():
-            raise ValueError(f"the {job} fragment does not name its run attempt")
-        if job == "added" and added_result(control_file(fragment, ADDED_REPORT)) == "failed" and result == "success":
-            raise ValueError("the added job succeeded although its added tests failed")
-        try:
-            outcomes = metadata if job == "verify" else json.loads(control_file(fragment, "outcomes.json"))
-            reported = outcomes["checks"] if job in SHARD_JOBS else outcomes["module_checks"]
-            if job in SHARD_JOBS and set(outcomes) != {"checks"}:
-                reported = None
-        except (ValueError, KeyError, TypeError):
-            reported = None
-        if not isinstance(reported, dict) or set(reported) != ({"python"} if job in SHARD_JOBS else set(names)):
-            raise ValueError(f"the {job} fragment may report only its own checks")
-        if job in SHARD_JOBS:
-            state = shard_outcome(reported["python"], fragment / files[1], source_root, suites)
-            if state == "success" and result != "success":
-                state = result if result in {"failure", "cancelled"} else "skipped"
-            shards.append(state)
-        else:
-            module_checks.update(reported)
-            if job == "verify":
-                shards.append(shard_outcome(checks["python"], fragment / SHARD_REPORTS[0], source_root, suites))
-        for path in fragment.iterdir():
-            if path.name not in CONTROL_FILES and path.name not in SHARD_REPORTS:
-                (directory / path.name).write_bytes(path.read_bytes())
-        present.append(job)
-    checks["python"] = combined_outcome(shards)
-    required = set().union(*REQUIRED_EXECUTIONS.values())
-    if any(name in required for name, _ in executions((case for suite in suites for case in suite.iter("testcase")), source_root)):
-        raise ValueError("a shard report holds a test that only its own module check may run")
-    if suites:
-        merged = ET.Element("testsuites", {"name": "pytest tests"})
-        merged.extend(suites)
-        (directory / REPORTS["python"]).write_bytes(ET.tostring(merged, encoding="utf-8", xml_declaration=True))
-    (directory / "source-sha").write_text(sha + "\n")
-    metadata.update({"ci_url": ci_url, "checks": checks, "module_checks": module_checks, "fragments": present,
-                     "producers": provenance})
-    (directory / "metadata.json").write_text(json.dumps(metadata))
-    return {**metadata, "missing": missing}
+        merge_fragment(assembly, job, names, files)
+    return merged_evidence(assembly, ci_url)
 
 
 def published_manifest(directory: Path, manifest: dict) -> dict:
@@ -772,6 +804,74 @@ def evidence_failures(manifest: dict) -> str:
     return ", ".join(failures + [f"{checks[status]} {status} check(s)" for status in ("failed", "blocked") if checks.get(status)])
 
 
+def register_branch(call, directory, manifest, branch, routed, source, branches):
+    """Write the route receipt and return the ID of the Tiden branch the run goes to."""
+    # A reusing main push names, in its retained receipt, the merge queue run attempt that ran the tests.
+    tested_in = {"tested_in": manifest["tested_in"]} if manifest.get("tested_in") else {}
+    (directory / "tiden-route.json").write_text(json.dumps({"branch": branch, "source": source, **tested_in}))
+    expected = next((b["id"] for b in branches if b["name"] == branch), None)
+    if not expected and routed:
+        # Tiden skips live-doc sync for a branch name it does not know, so create it first.
+        try:
+            call(["branch", "create", "--name", branch,
+                  "--description", "CI evidence for Git branch " + branch], "branch-create")
+        except (RuntimeError, ValueError):
+            pass  # A concurrent run may have created it; the listing below decides.
+        branches = call(["branch", "list"], "branches-created")["branches"]
+        expected = next((b["id"] for b in branches if b["name"] == branch), None)
+    if not expected:
+        raise ValueError("Tiden branch does not exist; refusing unassociated results")
+    return expected
+
+
+def evidence_paths(directory, manifest):
+    """The evidence files of the manifest, checked to be plain, present and not oversized."""
+    paths = []
+    for filename in manifest["reports"]:
+        if Path(filename).name != filename or (directory / filename).is_symlink():
+            raise ValueError("invalid evidence file path")
+        if not (directory / filename).is_file() or (directory / filename).stat().st_size > MAX_BYTES:
+            raise ValueError("missing or oversized evidence")
+        paths.append(str((directory / filename).resolve()))
+    if not {"ci-checks.json", PUBLISHED_CHECKS} & set(manifest["reports"]):
+        raise ValueError("CI step evidence is required")
+    return paths
+
+
+def wait_for_live_doc(call, seq, result):
+    """Poll the run until Tiden's live-doc sync has finished (at most 20 reads, 3 seconds apart)."""
+    for attempt in range(20):
+        result = call(["run", "get", seq], "final")
+        if result.get("liveDocStatus") in {"succeeded", "failed", "skipped"}:
+            break
+        time.sleep(3)
+    return result
+
+
+def check_association(call, result, routed, expected, branch):
+    """The run must be associated with the expected branch."""
+    if routed and result.get("liveDocStatus") == "succeeded" and result.get("branchId") != expected:
+        # Tiden may attribute the run to an intent branch linked to this Git branch.
+        final = call(["branch", "list"], "branches-final")["branches"]
+        expected = next((b["id"] for b in final if b["id"] == result.get("branchId")
+                         and routed_target(b["name"], branch)), None)
+    if result.get("liveDocStatus") != "succeeded" or not expected or result.get("branchId") != expected:
+        raise RuntimeError("Run recorded, but Tiden did not associate test evidence with the expected branch "
+                           f"(live doc {result.get('liveDocStatus')}, branch {result.get('branchId')})")
+
+
+def check_result(manifest, result):
+    """The run needs a terminal verdict that agrees with the manifest's counts and failures."""
+    if result.get("status") not in {"passed", "failed"}:
+        raise RuntimeError("Tiden run has no terminal test verdict")
+    check_count = len(CHECKS) + (len(MODULE_REPORTS) if "module_checks" in manifest else 0)
+    expected_attempts = sum(manifest["test_counts"].values()) + check_count
+    if int(result["stats"]["attempts"]) != expected_attempts:
+        raise RuntimeError("Tiden result count differs from the authentic CI evidence")
+    if evidence_failures(manifest) and result["status"] != "failed":
+        raise RuntimeError("Tiden verdict contradicts failed or incomplete CI evidence")
+
+
 def publish(directory: Path, manifest: dict, branch: str | None, product: str, cli: str = "tiden",
             routed: bool = False, workspace: str = "") -> dict:
     if manifest.get("schema") != 1 or not re.fullmatch(r"[a-f0-9]{40}", manifest.get("sha", "")):
@@ -815,21 +915,7 @@ def publish(directory: Path, manifest: dict, branch: str | None, product: str, c
     if branch is None:
         raise ValueError("No Tiden branch mapping, no usable pull request intent link, and the Git branch "
                          "is not a valid Tiden branch name; register this Git branch before publishing evidence")
-    # A reusing main push names, in its retained receipt, the merge queue run attempt that ran the tests.
-    tested_in = {"tested_in": manifest["tested_in"]} if manifest.get("tested_in") else {}
-    (directory / "tiden-route.json").write_text(json.dumps({"branch": branch, "source": source, **tested_in}))
-    expected = next((b["id"] for b in branches if b["name"] == branch), None)
-    if not expected and routed:
-        # Tiden skips live-doc sync for a branch name it does not know, so create it first.
-        try:
-            call(["branch", "create", "--name", branch,
-                  "--description", "CI evidence for Git branch " + branch], "branch-create")
-        except (RuntimeError, ValueError):
-            pass  # A concurrent run may have created it; the listing below decides.
-        branches = call(["branch", "list"], "branches-created")["branches"]
-        expected = next((b["id"] for b in branches if b["name"] == branch), None)
-    if not expected:
-        raise ValueError("Tiden branch does not exist; refusing unassociated results")
+    expected = register_branch(call, directory, manifest, branch, routed, source, branches)
     run = call(["run", "create", "--branch", branch, "--intent-session", "none",
                 "--build-sha", manifest["sha"], "--environment", "github-actions-synthetic",
                 "--title", f"GitHub CI {manifest['sha'][:12]}", "--description", manifest["ci_url"],
@@ -842,39 +928,13 @@ def publish(directory: Path, manifest: dict, branch: str | None, product: str, c
         named = routed_target(run["branchName"], branch) if routed else run["branchName"] == branch
         if not named or run["buildSha"] != manifest["sha"]:
             raise RuntimeError("Tiden rewrote the explicit source association")
-        paths = []
-        for filename in manifest["reports"]:
-            if Path(filename).name != filename or (directory / filename).is_symlink():
-                raise ValueError("invalid evidence file path")
-            if not (directory / filename).is_file() or (directory / filename).stat().st_size > MAX_BYTES:
-                raise ValueError("missing or oversized evidence")
-            paths.append(str((directory / filename).resolve()))
-        if not {"ci-checks.json", PUBLISHED_CHECKS} & set(manifest["reports"]):
-            raise ValueError("CI step evidence is required")
+        paths = evidence_paths(directory, manifest)
         call(["run", "report", seq, *paths], "report")
         result = call(["run", "complete", seq], "complete", allow_verdict=True)
         completed = True
-        for attempt in range(20):
-            result = call(["run", "get", seq], "final")
-            if result.get("liveDocStatus") in {"succeeded", "failed", "skipped"}:
-                break
-            time.sleep(3)
-        if routed and result.get("liveDocStatus") == "succeeded" and result.get("branchId") != expected:
-            # Tiden may attribute the run to an intent branch linked to this Git branch.
-            final = call(["branch", "list"], "branches-final")["branches"]
-            expected = next((b["id"] for b in final if b["id"] == result.get("branchId")
-                             and routed_target(b["name"], branch)), None)
-        if result.get("liveDocStatus") != "succeeded" or not expected or result.get("branchId") != expected:
-            raise RuntimeError("Run recorded, but Tiden did not associate test evidence with the expected branch "
-                               f"(live doc {result.get('liveDocStatus')}, branch {result.get('branchId')})")
-        if result.get("status") not in {"passed", "failed"}:
-            raise RuntimeError("Tiden run has no terminal test verdict")
-        check_count = len(CHECKS) + (len(MODULE_REPORTS) if "module_checks" in manifest else 0)
-        expected_attempts = sum(manifest["test_counts"].values()) + check_count
-        if int(result["stats"]["attempts"]) != expected_attempts:
-            raise RuntimeError("Tiden result count differs from the authentic CI evidence")
-        if evidence_failures(manifest) and result["status"] != "failed":
-            raise RuntimeError("Tiden verdict contradicts failed or incomplete CI evidence")
+        result = wait_for_live_doc(call, seq, result)
+        check_association(call, result, routed, expected, branch)
+        check_result(manifest, result)
         return result
     finally:
         if not completed:
@@ -960,6 +1020,62 @@ def when(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def check_release_request(sha, environment, url, released_at):
+    """The request's exact SHA, known environment, run URL and past RFC3339 UTC time."""
+    if not re.fullmatch(r"[a-f0-9]{40}", sha):
+        raise ValueError("an exact lowercase 40-character commit SHA is required")
+    if environment not in RELEASE_ENVIRONMENTS:
+        raise ValueError("unknown release environment; Tiden would create a duplicate")
+    if not RUN_URL.fullmatch(url):
+        raise ValueError("the release URL must be a GitHub Actions run")
+    if not RELEASED_AT.fullmatch(released_at):
+        raise ValueError("the release time must be RFC3339 UTC, YYYY-MM-DDTHH:MM:SSZ")
+    if when(released_at) > datetime.now(timezone.utc) + timedelta(minutes=5):
+        raise ValueError("the release time is in the future")
+
+
+def settle_gate(ours, deadline):
+    """Wait until Tiden has had GATE_SETTLE after our run to recompute the main gate (or until the deadline)."""
+    # Tiden recomputes the main gate only after the run's live-doc sync.
+    wait = when(ours["completedAt"]) + GATE_SETTLE - datetime.now(timezone.utc)
+    if deadline is not None:
+        wait = min(wait, timedelta(seconds=max(0.0, deadline - time.monotonic())))
+    if wait > timedelta(0):
+        time.sleep(wait.total_seconds())
+
+
+def check_release_identity(release, version, environment, url):
+    """Tiden must not have rewritten the release identity."""
+    if (release.get("version"), release.get("environmentSlug"), release.get("url")) != (version, environment, url):
+        raise RuntimeError("Tiden rewrote the release identity")
+
+
+def release_gate(run, unavailable, release, version, own_gate):
+    """Tiden's verdict on the gate the release captured, and whether that gate is this commit's."""
+    returncode, output = run(["gate", "check", "--release", release["id"]], "release-gate")
+    try:
+        answer = json.loads(output) if output.strip() else None
+    except json.JSONDecodeError:
+        answer = output
+    gate = answer if isinstance(answer, dict) else {}
+    if returncode and not output.strip():
+        # Tiden exits non-zero and prints nothing when the release captured no gate.
+        print("::warning title=Tiden release gate::no gate was captured for " + version)
+        own_gate = None
+    elif not isinstance(gate.get("status"), str):
+        # A verdict, passed or not, always names its status; anything else is not an answer.
+        raise unavailable("Tiden release-gate printed no gate verdict; the release was not verified")
+    return gate, own_gate
+
+
+def release_receipt(release, version, environment, url, released_at, ours, captured, own_gate, gate):
+    """The receipt of a recorded release."""
+    return {"state": "recorded", "releaseId": release["id"], "version": version, "environment": environment,
+               "url": url, "releasedAt": released_at, "createdAt": release["createdAt"], "mainRun": ours["id"],
+               "gateRun": captured.get("id"), "gateFromThisCommit": own_gate,
+               "gate": gate.get("status"), "gateComputedAt": gate.get("computedAt")}
+
+
 def record_release(directory: Path, sha: str, environment: str, url: str, released_at: str, product: str,
                    cli: str = "tiden", deadline: float | None = None) -> dict:
     """Record release deedkit@<sha> and prove its captured gate came from this commit's passed main run.
@@ -973,16 +1089,7 @@ def record_release(directory: Path, sha: str, environment: str, url: str, releas
     receipt records `not_attempted` before the create call is sent and `not_verified` after it; a create whose
     outcome is uncertain is never retried.
     """
-    if not re.fullmatch(r"[a-f0-9]{40}", sha):
-        raise ValueError("an exact lowercase 40-character commit SHA is required")
-    if environment not in RELEASE_ENVIRONMENTS:
-        raise ValueError("unknown release environment; Tiden would create a duplicate")
-    if not RUN_URL.fullmatch(url):
-        raise ValueError("the release URL must be a GitHub Actions run")
-    if not RELEASED_AT.fullmatch(released_at):
-        raise ValueError("the release time must be RFC3339 UTC, YYYY-MM-DDTHH:MM:SSZ")
-    if when(released_at) > datetime.now(timezone.utc) + timedelta(minutes=5):
-        raise ValueError("the release time is in the future")
+    check_release_request(sha, environment, url, released_at)
 
     version = "deedkit@" + sha
     progress = {"state": "not_attempted", "version": version, "environment": environment, "url": url,
@@ -1053,17 +1160,11 @@ def record_release(directory: Path, sha: str, environment: str, url: str, releas
     ours = latest_main_run(datetime.now(timezone.utc), "release-runs")
     if ours.get("buildSha") != sha or ours.get("status") != "passed":
         raise StaleRelease("this commit's passed run is not the latest completed main run in Tiden")
-    # Tiden recomputes the main gate only after the run's live-doc sync.
-    wait = when(ours["completedAt"]) + GATE_SETTLE - datetime.now(timezone.utc)
-    if deadline is not None:
-        wait = min(wait, timedelta(seconds=max(0.0, deadline - time.monotonic())))
-    if wait > timedelta(0):
-        time.sleep(wait.total_seconds())
+    settle_gate(ours, deadline)
     release = call(["release", "create", "--version", version, "--environment", environment,
                     "--name", "DeedKit " + sha[:12], "--url", url, "--released-at", released_at],
                    "release", create=True)
-    if (release.get("version"), release.get("environmentSlug"), release.get("url")) != (version, environment, url):
-        raise RuntimeError("Tiden rewrote the release identity")
+    check_release_identity(release, version, environment, url)
     progress.update(releaseId=release["id"], createdAt=release["createdAt"])
     save()
     # A repeated create keeps the original creation time, and with it the original gate.
@@ -1071,23 +1172,8 @@ def record_release(directory: Path, sha: str, environment: str, url: str, releas
     captured = latest_main_run(created, "release-runs-captured")
     own_gate = (captured.get("buildSha") == sha and captured.get("status") == "passed"
                 and created - when(captured["completedAt"]) >= GATE_SETTLE)
-    returncode, output = run(["gate", "check", "--release", release["id"]], "release-gate")
-    try:
-        answer = json.loads(output) if output.strip() else None
-    except json.JSONDecodeError:
-        answer = output
-    gate = answer if isinstance(answer, dict) else {}
-    if returncode and not output.strip():
-        # Tiden exits non-zero and prints nothing when the release captured no gate.
-        print("::warning title=Tiden release gate::no gate was captured for " + version)
-        own_gate = None
-    elif not isinstance(gate.get("status"), str):
-        # A verdict, passed or not, always names its status; anything else is not an answer.
-        raise unavailable("Tiden release-gate printed no gate verdict; the release was not verified")
-    receipt = {"state": "recorded", "releaseId": release["id"], "version": version, "environment": environment,
-               "url": url, "releasedAt": released_at, "createdAt": release["createdAt"], "mainRun": ours["id"],
-               "gateRun": captured.get("id"), "gateFromThisCommit": own_gate,
-               "gate": gate.get("status"), "gateComputedAt": gate.get("computedAt")}
+    gate, own_gate = release_gate(run, unavailable, release, version, own_gate)
+    receipt = release_receipt(release, version, environment, url, released_at, ours, captured, own_gate, gate)
     (directory / RELEASE_RECEIPT).write_text(json.dumps(receipt, indent=2))
     if own_gate is False:
         raise ForeignGate(f"release {version} captured the main gate after run {captured.get('id')} of "

@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import re
 import sqlite3
 import sys
 import threading
@@ -136,7 +137,8 @@ def test_kind_selection_reads_end_reason_before_status_for_every_terminal_shape(
             kind, data = call_events.terminal(v)
             expected = ('call.not_answered' if reason in call_events.NOT_ANSWERED else
                         'call.interrupted' if reason == 'service_restart' or status == 'interrupted' else
-                        'call.failed' if reason == 'provider_failed' or status == 'failed' else 'call.finished')
+                        'call.failed' if reason in ('provider_failed', 'provider_rejected') or status == 'failed'
+                        else 'call.finished')
             assert kind == expected, (reason, status)
             event = {'specversion': '1.0', 'id': 'calls:1', 'source': 'deedkit:calls', 'type': kind,
                      'subject': 'call-1', 'time': '2026-10-29T10:02:05Z', 'data': data, 'urgency': 'now',
@@ -144,6 +146,139 @@ def test_kind_selection_reads_end_reason_before_status_for_every_terminal_shape(
             assert CONTRACT.validate_event(event) == 1
             if kind == 'call.finished':
                 assert data['duration_s'] == 125 and data['outcome'] == 'other'
+
+
+CANARY = 'CANARY-twilio-message-text'
+PHONE_LIKE = '+628123456789'
+THREE = ('call_id', 'status', 'end_reason')
+
+
+class Refusal:
+    """A Twilio 4xx on create-call whose message holds free text a subscriber must never see."""
+    status_code = 403
+    body = {'code': 21215, 'message': f'Permission to call {PHONE_LIKE} is not enabled. {CANARY}',
+            'more_info': 'https://www.twilio.com/docs/errors/21215'}
+    content = json.dumps(body).encode()
+
+    def json(self):
+        return self.body
+
+
+def refuse(store, identity, error):
+    store.provider_update(identity, dial_state='rejected', provider_status='provider_rejected', provider_error=error)
+    store.stop(identity, 'provider_rejected')
+
+
+# spec: ANYM-695
+def test_a_refused_dial_is_a_failed_call_that_carries_the_cause_and_the_code(tmp_path):
+    store = VoiceService(tmp_path)
+    identity = external(store)
+    head = store.events_head()
+    refuse(store, identity, {'http_status': 403, 'code': 21215, 'cause': 'geo_permission_missing'})
+    result, _ = read(store, {'after': head['head'], 'journal_id': head['journal_id']})
+    [event] = result['events']
+    assert event['type'] == 'call.failed'
+    assert event['data'] == {'call_id': identity, 'status': 'finished', 'end_reason': 'provider_rejected',
+                             'provider_cause': 'geo_permission_missing', 'provider_code': 21215}
+    store.close()
+
+
+# spec: ANYM-695
+def test_a_failed_callback_with_an_error_code_gives_call_failed_other_and_the_code(tmp_path):
+    store = VoiceService(tmp_path)
+    identity = external(store)
+    store.provider_update(identity, provider_status='failed', provider_error={'code': 30003, 'cause': 'call_failed_other'})
+    store.stop(identity, 'provider_failed')
+    [(kind, data)] = journal(store)
+    assert kind == 'call.failed' and data['end_reason'] == 'provider_failed'
+    assert (data['provider_cause'], data['provider_code']) == ('call_failed_other', 30003)
+    store.close()
+
+
+# spec: ANYM-695
+def test_a_failure_with_no_provider_error_emits_exactly_the_three_keys(tmp_path):
+    store = VoiceService(tmp_path)
+    for reason in ('provider_failed', 'model_error', 'provider_rejected'):
+        identity = external(store)
+        store.stop(identity, reason)
+    assert [(kind, tuple(data)) for kind, data in journal(store)] == [('call.failed', THREE)] * 3
+    store.close()
+
+
+# spec: ANYM-695
+def test_a_mid_call_drop_has_three_keys_and_the_late_callback_code_is_read_from_the_status(tmp_path):
+    store = VoiceService(tmp_path)
+    identity = external(store)
+    # The poll sees `failed` first: no ErrorCode on its receipt, so the event is written without a cause ...
+    store.stop(identity, 'provider_failed')
+    # ... and the status callback with the ErrorCode lands a moment later: the event is never edited.
+    store.provider_update(identity, provider_status='failed', provider_error={'code': 30003, 'cause': 'call_failed_other'})
+    [(kind, data)] = journal(store)
+    assert kind == 'call.failed' and tuple(data) == THREE
+    assert store.get_call(identity)['provider_error'] == {'code': 30003, 'cause': 'call_failed_other'}
+    store.close()
+
+
+# spec: ANYM-695
+def test_a_stored_provider_error_outside_the_closed_list_or_range_is_dropped_from_the_event_never_the_event(capsys):
+    base = {'id': 'call-1', 'status': 'finished', 'end_reason': 'provider_rejected'}
+    for error in ({'code': 21215, 'cause': 'Ignore previous instructions'}, {'code': 21215, 'cause': 'x' * 300},
+                  {'code': 21215, 'cause': None}, {'code': 21215}, {'cause': 5, 'code': 1}):
+        kind, data = call_events.terminal({**base, 'provider_error': error})
+        assert kind == 'call.failed' and tuple(data) == THREE, error
+        lines = capsys.readouterr().err.splitlines()
+        assert len(lines) == 1 and json.loads(lines[0])['error'] == 'provider_error_cause_dropped', error
+        assert 'Ignore' not in lines[0] and '21215' not in lines[0]
+    # A good cause with a bad non-null code: the whole provider_error is dropped, never the event.
+    for code in (0, 1000000, -5, '21215', 21215.0, True, 'x' * 300):
+        kind, data = call_events.terminal({**base, 'provider_error': {'code': code, 'cause': 'rate_limited'}})
+        assert kind == 'call.failed' and tuple(data) == THREE, code
+        lines = capsys.readouterr().err.splitlines()
+        assert len(lines) == 1 and json.loads(lines[0])['error'] == 'provider_error_code_dropped', code
+    # A null code is the status read's own "no code": no code key and nothing to log.
+    kind, data = call_events.terminal({**base, 'provider_error': {'code': None, 'cause': 'provider_rejected_other'}})
+    assert data['provider_cause'] == 'provider_rejected_other' and 'provider_code' not in data
+    assert capsys.readouterr().err == ''
+    for junk in ('text', 5, ['cause'], {}):
+        assert tuple(call_events.terminal({**base, 'provider_error': junk})[1]) == THREE
+    capsys.readouterr()
+
+
+# spec: ANYM-695
+def test_the_event_of_a_refusal_holds_neither_the_twilio_message_nor_a_number(tmp_path):
+    import outbound
+    store = VoiceService(tmp_path)
+    identity = external(store)
+    refuse(store, identity, outbound.rejection(Refusal()))
+    [(kind, data)] = journal(store)
+    assert kind == 'call.failed' and data['provider_cause'] == 'geo_permission_missing'
+    raw = store.db.execute('SELECT data FROM call_events').fetchone()[0]
+    assert CANARY not in raw and PHONE_LIKE not in raw and 'twilio.com' not in raw
+    page = json.dumps(store.events_page(0, 100, False))
+    assert CANARY not in page and PHONE_LIKE not in page
+    store.close()
+
+
+# spec: ANYM-695
+def test_the_closed_cause_list_is_the_one_the_calls_code_the_readme_and_subscriptions_md_name():
+    import outbound
+    code = set(outbound.TWILIO_CAUSES.values()) | {'provider_rejected_other', 'call_failed_other'}
+    assert code == set(call_events.PROVIDER_CAUSES)
+    root = Path(__file__).resolve().parents[3]
+    def table(path, heading):
+        text = (root / path).read_text()
+        section = text[text.index(heading):]
+        rows = []
+        for line in section.splitlines()[1:]:
+            found = re.match(r'\| `([a-z_]+)`', line)
+            if found:
+                rows.append(found[1])
+            elif rows and not line.startswith('|'):
+                break  # the table ends at its first non-row line
+        return rows
+    assert set(table('services/calls/README.md', '## Why an outbound call failed (ANYM-657)')) == code
+    listed = table('SUBSCRIPTIONS.md', '#### `call.failed` provider cause (ANYM-695)')
+    assert set(listed) == code and len(listed) == len(code)
 
 
 # spec: ANYM-563

@@ -12,6 +12,15 @@ promotion. Direct source copies, ad hoc image overrides and `compose up --build`
 skip this contract. Root access can bypass deployment policy; keep that access
 for recovery and route routine changes through this tool.
 
+Confirmed production incidents follow [incident recovery](incident-recovery.md)
+and AGENTS.md section 2: restore the affected path first, then finish deferred
+review and records before other tasks. A compatible service-only recovery does
+not wait for a schema migration, unrelated service updates, fresh full backups
+or a restore drill. Main/CI/artifact verification, candidate inspection, locks,
+active-call checks and session/state preservation still apply. A restart of the
+existing failed service/session has standing incident authority. Routine releases
+and data/schema repairs retain the gates below.
+
 ## Required CI and main protection
 
 `CI gate` runs even when dependencies fail or skip and accepts only success from
@@ -106,7 +115,7 @@ the currently running application services to replace. Obtain those paths from
 overlays. Do not replace the host's Compose topology with the example.
 
 Available build targets are `runtime` (API, Telegram, subscriptions), `indexer`,
-`enricher-local`, `whatsapp-native`, `gateway`, `calendar`, `calls` and `backup`.
+`enricher-local`, `whatsapp-native`, `gateway`, `calendar`, `recordings`, `calls` and `backup`.
 The backup target supplies the producer and isolated restore helper; building it
 does not start a capture or a restore. The two
 calendar services share the `calendar` image; a legacy service named `voice`
@@ -227,7 +236,7 @@ or add storage before retrying.
 
 ## CI-published images
 
-Every `main` push run publishes the eight images its `images / build (<target>)`
+Every `main` push run publishes the nine images its `images / build (<target>)`
 jobs built and smoke-tested as `ghcr.io/gosync-inc/deedkit-<target>:<sha40>`,
 where `<sha40>` is the full source commit. Preparation pulls them by verified
 digest instead of building them ([Prepare and inspect](#prepare-and-inspect),
@@ -513,8 +522,8 @@ Before applying, follow [backup/migration and rollback](platform-cutover.md).
 This tool runs no migration by hand (`deploy` runs the qualifying messaging ones itself, "Unattended
 migrations" below), does not prove data compatibility, authorize external
 actions, or perform provider readback. A schema change needs the module's explicit
-migration procedure first; a contract or destructive one also the backup gate below (an additive
-release has none, item 3 below). Confirm that the pinned
+migration procedure first; a dangerous one also the backup gate below (a low or medium one has none,
+"Migration risk tiers" below). Confirm that the pinned
 backup/restore runtimes support both the current database schema and the planned
 target, so the daily backup keeps running after the migration. For the backup gate: resolve delivery
 failures, including receiver quota/capacity failures,
@@ -551,31 +560,68 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
    after it, in migration order; a procedure's "schema-N release" is the prepared release. A
    `migrate` retried after `LockNotAvailable` stays under the same gate.
 2. After the release, no backup is required unless the release deletes data: before such a step
-   (045 step 7, `purge-deleted --apply`) a fresh verified backup at the new schema. Otherwise the
-   next scheduled daily backup follows as usual.
+   (045 step 7, `purge-deleted --apply`, dangerous by "Migration risk tiers") a fresh verified backup
+   at the new schema. Otherwise the next scheduled daily backup follows as usual.
 3. Owner 10-29: «я бы максимально облегчил этот. сценарий и снял бы запрет на этот просто катил бы
    вот эти все штуки сейчас не дожидаясь и делал такую процедуру сложную очень-очень редко»; «Я готов
-   принять риск максимально. облегчить этот процесс.» An additive release has no backup gate: no
-   fresh backup, no restore proof, no wait for a proof, no hold and no backup-age check; the
-   scheduled daily backup is its restore point. A release is additive when every pending
-   migration file is `expand` by the candidate's `unattended_class` (no DROP of any kind), every
-   changed role file is `additive` by `role_class` (the classes of M1, "Unattended migrations"
-   below; the release kit records each file's class) and it has no data-deleting step (item 2).
-   This holds for messaging and calendar, by hand or unattended. A database with no scheduled
-   daily backup running (calendar while its timer is off, ANYM-607) keeps a restore point anyway:
-   unattended, its pre-migration copy (Database copies); by hand, `copy-database` first. Any other release (a contract:
-   drop, rename, narrow, the CHECK widening pair, a revoke, a data-deleting step or a file of
-   another class) needs the backup gate above: a fresh backup and its restore proof, never a
-   reused daily backup.
+   принять риск максимально. облегчить этот процесс.» Owner 11-01: «с копией базы надо только при
+   опасных миграциях при ластовых и медиум рисках это не обязательно короче не хочется чтоб это был
+   ботлнек у нас эти бек апы». A low or medium release ("Migration risk tiers" below) has no backup
+   gate and no pre-migration copy: no fresh backup, no restore proof, no wait for a proof, no hold, no
+   backup-age check and no `copy-database`; the latest verified daily backup is its restore point. This
+   holds for messaging and calendar; a low release by hand or unattended, a medium one by hand. A
+   database with no scheduled daily backup running (calendar while its timer is off, ANYM-607) keeps a
+   restore point anyway (the orchestrator's reading of 11-01: a restore point must exist): unattended,
+   its pre-migration copy (Database copies); by hand, `copy-database` first. A dangerous release needs
+   the backup gate above (a fresh backup and its restore proof, never a reused daily backup) and
+   `copy-database` first. The release kit (the PR's release note and, once ANYM-680 ships, the pause's
+   per-file lines in `deploy.json`) records each file's class and tier.
 
-   Accepted risk (owner 10-29, quoted above): if an additive `migrate` destroys or corrupts data, a
+   Accepted risk (owner 10-29 and 11-01, quoted above): if a low or medium `migrate` destroys or corrupts data, a
    restore returns the database to the latest daily backup (about 24 hours old at most while the
    daily backup succeeds), and everything written after it (messages, receipts, keys, operator
    changes) is lost.
 
+### Migration risk tiers
+
+Owner 11-01 (item 3 above) named the tiers, not the forms; the lists below are the orchestrator's
+reading of 11-01 (brief), tightened by review. A release takes the tier of its most dangerous pending
+migration file, changed role file or step. In doubt, or when a statement is not named below: dangerous.
+
+- Dangerous (backup gate and `copy-database` first): DROP of any kind except these medium ones: the
+  old constraint of a proven CHECK widening pair (below), DROP NOT NULL, DROP DEFAULT; TRUNCATE; DELETE, UPDATE or
+  MERGE of existing rows; RENAME; a narrowing ALTER (a column type change, SET NOT NULL on existing
+  data, a new constraint, `NOT VALID` included, or unique index that can reject existing rows); any
+  other rewrite of existing data; a data-deleting step (item 2); a top-level SELECT, CALL, DO or COPY
+  other than the `DO` precondition the classifiers accept (`precondition()` in each
+  `migration_rollout.py`); code that runs inside the migration's own transaction: a new or replaced
+  trigger or trigger function on a table the release or its runner writes (`archive_migrations`,
+  `probe_metadata`, `fcs.migrations` included), an event trigger (new or already present), an
+  expression or partial index that calls a function that is not built in; replacing a function that an
+  existing index, constraint, generated column or default uses, or that a trigger on a table the
+  release or its runner writes uses.
+- Medium (no fresh backup, no copy; a hand release with its Astra-reviewed plan): non-unique indexes,
+  also on existing tables (CONCURRENTLY, or plain under a `SET LOCAL lock_timeout`); CREATE OR REPLACE
+  FUNCTION and row triggers that the release itself does not fire (above); a CHECK widening pair proven
+  a superset of the old constraint on the same column against the live catalog (by hand: in the plan
+  review); DROP NOT NULL, SET or DROP DEFAULT; grants on existing objects, a REVOKE or a role change
+  (role SQL keeps its Astra r1, read-back and undo; its backup is the latest verified daily one).
+- Low (no fresh backup, no copy; by hand or unattended): what the candidate's `unattended_class` calls
+  `expand` and `role_class` calls `additive` (new tables, their indexes and grants, nullable or
+  constant-default columns, comments; M1, "Unattended migrations" below).
+
+The tier decides the backup and the copy only; which release runs it does not change: only low files
+run unattended, medium and dangerous ones are hand releases under their procedures, and every other
+gate stays (the production plan's Astra r1, reviews.md Rounds 7, and its undo; role SQL review; the
+active-call check; the release order). Until ANYM-680 ships, the author names each `manual` file's tier
+in its PR and release note, and the PR review and the plan's Astra r1 check it against the file; until
+ANYM-675 ships, the deployer still copies before every unattended range because its rehearsal runs on
+the copy.
+
 ### Database copies
 
-ANYM-588. `production.py copy-database --config <plan A config> --database <name> --sha <sha>` makes an
+ANYM-588. A copy is required only before a dangerous migration, or for a database with no daily backup
+running ("Migration risk tiers"; owner 11-01). `production.py copy-database --config <plan A config> --database <name> --sha <sha>` makes an
 exactly checked copy of one live database on this host without stopping its writers, proves it restores
 and leaves nothing running. Automatic migrations (ANYM-449) call the same function; a hand release kit can
 call the command. It runs under the plan A lock, like `prepare`.
@@ -796,8 +842,9 @@ or restart policy counts as a change. If another operator changed a runtime or
 config after preparation, prepare a fresh reviewed candidate. The selected services stop before their replacements start; `up` uses
 `--no-build --pull never --no-deps --wait`. Databases and other Compose projects
 are not restarted. Routine promotion may briefly interrupt selected services.
-The messaging API, gateway and calendar API define Compose liveness healthchecks
-(their unauthenticated health routes, with an allowed Host, on loopback), so
+The messaging API, gateway, calendar API and recordings API define Compose liveness healthchecks
+(their unauthenticated health routes, with an allowed Host, on loopback; the recordings API has no health
+route, so its probe sends one unauthenticated POST and requires the 401 refusal, contacting no vendor), so
 `--wait` also requires them to report healthy; the first probe runs about 30
 seconds after start. Collectors, workers, indexer and enrichment expose no
 container-local health signal and are verified only as running. Docker does not
@@ -946,6 +993,24 @@ is absent and `--check` prints `idle`; then remove the units (`daemon-reload`) a
 (`/opt/deedkit/calendar-backup.removed-<date>`, root `0700`) rather than deleting its journal and evidence. A
 failed check stops the undo. Messaging's files are not touched.
 
+Calendar backup freshness and same-night catch-up (ANYM-694, BACKUP.md "Daily run and freshness"): a hand install
+under the section 2 gates (units and a script, no schema, no data). The script is outside every file autodeploy
+compares (it compares only the runner, `BACKUP_RUNNER`), and `production.py` installs itself with the release, so
+nothing here is sequenced with a release. Steps, as root: install `deploy/calendar-backup-freshness.py` as
+`/opt/deedkit/calendar-backup/freshness.py` (root, `0755`); copy the four files
+`deploy/deedkit-calendar-backup-fresh.service`, `-fresh.timer`, `-catchup.service` and `-catchup.timer` to
+`/etc/systemd/system/` (`0644`); `systemctl daemon-reload`; `systemctl enable --now
+deedkit-calendar-backup-fresh.timer deedkit-calendar-backup-catchup.timer`. `freshness.json` is mode `0644`, but
+`/opt/deedkit/calendar-backup/` and its `backups/` stay root `0700` (the runner refuses a job directory with any
+group or other permission bit, `private_backup_directory_required`, so never loosen them or add an ACL there). Run
+`production.py status` as root, as `deploy` does; another user sees `calendar backup: freshness file unreadable
+(PermissionError)`. Not during an active call, and not 17:30Z-19:30Z. Read back: `systemctl start deedkit-calendar-backup-fresh.service` succeeds and `freshness.json`
+says `fresh`; `production.py status` prints `calendar backup: fresh age=...`; `systemctl list-timers
+'deedkit-calendar-backup-*'` lists both new timers; the first 19:15 fire is skipped by its condition (journal) and
+no second snapshot exists that day. Undo: `systemctl disable --now deedkit-calendar-backup-catchup.timer
+deedkit-calendar-backup-fresh.timer`, remove the four unit files and `freshness.py`, `daemon-reload`; the daily
+service and timer are never touched.
+
 ### Module event router (ANYM-575)
 
 The router (`deploy/compose.event-router.yaml`, SUBSCRIPTIONS.md "Module event router") is not
@@ -971,6 +1036,12 @@ Read-back: a synthetic module event published by a test producer appears in `mod
 (cursor moved) and in `module_events`, only after the owner-kept tokens exist. Undo: `docker
 compose $F stop event-router`, remove it from `files`; cursors and gaps stay (schema 58 is
 additive) and a later start resumes from the stored cursor.
+
+Host steps that touch the firewall (the delivery and inference rules) read the boot receipt first: `python3
+scripts/inference_egress_check.py verify --receipt-check` and the same for `delivery_egress_check.py` print
+`ok` and `receipt ok` only when the rules agree and `/var/lib/deedkit/firewall-verify.json` is ok for the current boot
+ID; any other line (`receipt unknown`, `receipt not_ok`, a differing pair) stops the step ("Host firewall
+persistence" below).
 
 ## Roll back the current release
 
@@ -1069,7 +1140,8 @@ first).
    passes it as the proxy's `dns`. The host rules are the second layer (a host step):
    `python3 scripts/delivery_egress_check.py rules --resolver <ip>` (the same IP) prints them; as
    root, apply them before the first start (they match bridge names, which may not exist yet) and
-   save them with the host's firewall persistence. They drop host-bound packets from all three
+   persist them as the `deedkit-delivery` block of `/etc/ufw/before.rules` and `before6.rules`
+   (`rules --resolver <ip> --format ufw --family v4|v6`; "Host firewall persistence" below). They drop host-bound packets from all three
    bridges, `dk-delivery0` (egress), `dk-deliverydb0` and `dk-deliverypx0` (internal networks in gateway
    mode `isolated` have no host address; the rules are the second layer), and, from `dk-delivery0`, the tailnet (100.64.0.0/10), RFC 1918,
    link-local and metadata (169.254.0.0/16), loopback and every IPv6 packet; they allow DNS to `<ip>`
@@ -1293,6 +1365,511 @@ unattempted candidate directory for the same SHA is renamed (for example to
 `prepared-older-tool-<sha>`), never deleted or edited, because preparation
 refuses an existing directory; receipts and their digests are never rewritten.
 
+## Host firewall persistence (ANYM-693)
+
+What is persisted and where (ufw owns `DOCKER-USER`, so a second restore file would flush or duplicate a hook):
+
+| part | where | loaded by |
+|---|---|---|
+| delivery filter chain, `DOCKER-USER` hook, host-bound drops, IPv6 drops | `deedkit-delivery` block in `/etc/ufw/before.rules` and `before6.rules` (the first block; it declares `:DOCKER-USER`) | ufw, at boot and at every `ufw reload` |
+| inference filter chain, `DOCKER-USER` hook, host-bound drops (`dk-inference0`, `dk-inferencedb0`), IPv6 drops | `deedkit-inference` block in the same two files, after the delivery block (it declares only its own chain) | ufw |
+| inference raw chain and the `raw` `PREROUTING` jumps (IPv4 chain, IPv4 and IPv6 jump) | `/etc/ufw/after.init` (mode 0755, root), `rules --format after-init` | ufw, with `start`, after it has loaded its rules |
+| recordings filter chain, `DOCKER-USER` hook, host-bound drops (`dk-recordings0`, `dk-recbackend0`), IPv6 drops (ANYM-712) | `deedkit-recordings` block in the same two files, after the delivery block (it declares only its own chain) | ufw |
+| recordings raw chain and the `raw` `PREROUTING` jumps | a function of the same `/etc/ufw/after.init`, which is then generated from both families (`rules --format after-init` of either script) | ufw, with `start` |
+| comparison and boot receipt | `verify` of both scripts; `deedkit-firewall-verify.service`, which writes `/var/lib/deedkit/firewall-verify.json` | each boot, after `ufw.service` and `docker.service` |
+
+The raw table is not in ufw's files because restoring them would flush Docker's own raw rules. `after.init` replaces
+the raw chain in one `iptables-restore --noflush -T raw` (one kernel commit: a failure or a kill leaves the previous
+complete chain, never an empty one), adds the jump only after the chain is complete, bounds every command to 30 s
+(a command that ignores TERM is killed 2 s later), runs the whole hook, log and record included, under an outer bound of
+60 s (its failure record is written by a bounded child with no terminal and no pipe of the caller; the supervising
+shell's own diagnostics go to /dev/null, and the caller's stderr is restored only inside the supervised child, so no shell,
+dash included, can block on it), logs and records a failure in `/var/lib/deedkit/raw-step.json` and still exits 0, so ufw and Docker start. The failure
+shows in `verify` (`kernel_vs_repo table_differs:raw`), in the boot receipt and in the worker's own exit 78. The IPv6
+raw rule is the single `PREROUTING -i dk-inference0 -j DROP` of `rules()` (there is no IPv6 chain), added if absent.
+
+Facts to know: a `ufw reload`, `ufw disable/enable` or a ufw restart loads `before.rules` with `iptables-restore
+--noflush`, and its `:DOCKER-USER` declaration empties that chain; before ANYM-693 this removed the inference hook from
+`DOCKER-USER`. After a reboot `enricher-mini` stays stopped (restart policy `no`); a promotion-tool `up` before the
+rules exist starts it into exit 78. With the rules persisted they are there first (`ufw.service` starts before
+`docker.service`).
+
+`verify` (root, read-only, stdlib) compares three texts for each chain: the repository (the authority; the mini address
+from `INFERENCE_MINI_IP` and the resolver from `DELIVERY_RESOLVER` in `/opt/personal-os-probe/.env`), the persisted
+files and the kernel (`iptables-save`, `ip6tables-save`). It prints `ok`, or one line per differing pair
+(`file_vs_repo`, `kernel_vs_repo`, `file_vs_kernel`) with the first difference: `missing:<rule>`, `extra:<rule>`,
+`hook_absent:<bridge>`, `mini_differs`, `table_differs:<filter|raw|v6>` or `missing::<chain>` (a file that uses
+`DOCKER-USER` or its chain without declaring it, which would stop ufw from loading); exit 1 on any, 2 when an input or
+the kernel cannot be read. `--persisted-only` reads no kernel (the check before loading); `--receipt-check` also reads
+the boot receipt. A file and a kernel that agree on an allowance the repository does not have still fail: the
+repository is the authority. The host-bound drops count as one fact whether the kernel holds them in `INPUT` (the
+command form) or in ufw's chain of the same family (`ufw-before-input`, `ufw6-before-input`; in the kernel only when `INPUT`
+jumps to it), but a rule present in both is a duplicate and fails as `extra:`. A rule that accepts or returns the bridge's
+traffic before a managed hook in `DOCKER-USER` or raw `PREROUTING` (no `-i`, a wildcard or a negated `-i`; also through a
+`-j` or `-g` into a chain that accepts; a goto that can fall off the chain's end, an empty chain included, leaves the
+base chain too) fails as `extra:<rule>`, since the hook would never see those
+packets; the same check covers the path through `INPUT` to ufw's chain, whose jump must cover the managed bridge and carry no
+other condition (a `-p tcp` jump carries only part of the traffic). A rules file that declares `:DOCKER-USER` or the managed
+chain twice, or after rules that use it, fails as `table_differs:filter` or `table_differs:v6` (restoring the late
+declaration empties the chain).
+
+Safe order for any firewall change (as root; the plan is Astra-reviewed, none runs during an active call):
+1. Back up the files that change: copy `/etc/ufw/before.rules`, `before6.rules` and `after.init` (if it exists) with
+   `cp -a` to a dated directory under `/root`, and write `iptables-save` and `ip6tables-save` next to them.
+2. Build the new files without touching the old ones: `python3 scripts/inference_egress_check.py rules --mini-ip
+   $INFERENCE_MINI_IP --format ufw --family v4 --source /etc/ufw/before.rules` writes the whole new file to a new path
+   (v6 with `before6.rules`). It replaces a block of the same label, inserts after the delivery block (after its end marker when it has one, never inside it) and refuses a file
+   with no delivery block or no `:DOCKER-USER` declared before the insertion point. `--format after-init` writes the hook.
+3. `iptables-restore --test --noflush` on the new v4 file and `ip6tables-restore --test --noflush` on the v6 file: syntax
+   only. A syntax error in a ufw rules file stops ufw from loading, so nothing is installed before this passes.
+4. Install the two rules files (mode 0640 as they are now, root) and the hook (mode 0755, root), then `verify
+   --persisted-only` for both scripts.
+5. Load: `ufw reload` (the reload empties and refills `DOCKER-USER` and loads the block), then `/etc/ufw/after.init start`
+   (idempotent; ufw's reload may not run it). The first time only, delete the hand-added copies of the host-bound drops,
+   which ufw's chain now holds too: `iptables -D INPUT -i dk-inference0 -j DROP` and the same for `dk-inferencedb0`, and
+   for `ip6tables` both (delete only what `iptables -S INPUT` and `ip6tables -S INPUT` show).
+6. Full `verify` for both scripts, then `systemctl start deedkit-firewall-verify.service` and `verify --receipt-check`.
+   Stop on any line other than `ok` and `receipt ok`.
+
+Rollback: copy the saved rules files and `after.init` back, `ufw reload`, `verify`. Undo of the whole card: the same
+copy-back (remove `/etc/ufw/after.init` if it did not exist before), `systemctl disable --now
+deedkit-firewall-verify.service`, remove the unit and `firewall_persist.py`, `ufw reload`; the kernel rules of the command
+form (`rules --undo`) are removed only by an explicit decision.
+
+Install of the scripts and the unit (once per tool update): copy `scripts/firewall_persist.py`,
+`scripts/inference_egress_check.py` and `scripts/delivery_egress_check.py` to `/usr/local/lib/deedkit/` (mode 0755,
+root) and `deploy/deedkit-firewall-verify.service` to `/etc/systemd/system/`; `systemd-analyze verify` it, `systemctl
+daemon-reload`, `systemctl enable` it. It is wanted by `docker.service`, not by a target: nothing waits for it, nothing is
+ordered after it, `TimeoutStartSec=60`, and a failure fails only itself.
+
+The boot receipt (`/var/lib/deedkit/firewall-verify.json`, written at each boot) holds the boot ID, the result of both
+`verify` commands, `ufw_rules_loaded_monotonic` (ufw.service's `ExecMainExitTimestampMonotonic`), `raw_step_monotonic`
+(the step's own `/proc/uptime` on success and on failure), `docker_start_monotonic`, `first_container_monotonic` (the start of the earliest running container's main process this boot, from
+`/proc/PID/stat`, never from Docker's wall-clock times; a container that restarted shows its latest start; unknown when a
+container cannot be read, and whenever a stopped container that ever ran exists, since without a reliable boot-wide
+clock mapping its start cannot be placed on this boot's clock) and
+`rules_before_first_container` = `yes`, `no` or `unknown` (unknown when a time is missing or a step failed). The times are
+seconds on one monotonic clock (the host does not suspend, so `/proc/uptime` equals it). A boot with no receipt for the
+current boot ID reads as `receipt unknown` in `verify --receipt-check`, never as ok. The first reboot that happens for
+another reason is read through the receipt and recorded here as supplementary evidence; nothing is rebooted for it.
+
+## Mini enrichment worker: network confinement (ANYM-688)
+
+`deploy/compose.enrichment.yaml` holds `enricher-mini` (profile `enrichment-mini`, the published
+`enricher-local` image). It joins two networks and no other: `inference_db` (internal, bridge
+`dk-inferencedb0`, gateway mode `isolated`, so no host address; the overlay also attaches the `db`
+service) and `inference_egress` (bridge `dk-inference0`, this worker only). It never joins `backend` or
+`frontend`. The host rules narrow `dk-inference0` to TCP 443 to the mini's tailnet address. Select this
+profile alone: never with `enrichment-local` or `enrichment-cloud` (ENRICHMENT.md). This section is the
+hand apply; the production apply itself is ANYM-686, under its reviewed plan. Nothing here runs during
+an active call (check read-only first).
+
+Inputs: `INFERENCE_MINI_NAME` (the mini's `.ts.net` name, exactly the host of `base_url`) and
+`INFERENCE_MINI_IP` (its tailnet address, 100.64.0.0/10) in the project's env file; the overlay pins the
+name with `extra_hosts` and sets the same address as the worker's `dns`, so any other lookup goes where
+the rules drop it. `private/enrichment-mini.json` (from `deploy/enrichment-mini.example.json`, only
+`deedkit_inference` profiles, mode 0600, owned by uid 10001) and the directory `private/inference/`
+(mode 0700, `inference.key` mode 0600 inside, from ANYM-684). The worker mounts the directory, not the
+file: a bind-mounted file keeps the retired inode after an atomic rotation. The DSN is the
+`messaging_enricher` one (`private/enrichment-local.dsn`).
+
+Prerequisite: the host's current release contains ANYM-685 (the `deedkit_inference` profile). A release
+before it rejects the profile (`invalid_model_profile`), so the enabled worker exits before it can be
+promoted: apply that release through the normal route first (`production.py`), and only then enroll.
+Apply, in this order (a failed step stops the apply; the worker is selected for promotion last).
+`F` is the project's Compose arguments plus `-f compose.enrichment.yaml`; `E` is the verified
+`enricher-local` image of the host's current release (`docker image inspect` it; never `--build`),
+tagged `docker tag $E anymsg-enricher-local:enroll-<sha>` (a new tag, never a production tag), and the
+Compose commands below run with `MESSAGING_VERSION=enroll-<sha>`:
+1. Rules (host, as root, before the networks exist; they match bridge names):
+   `python3 scripts/inference_egress_check.py rules --mini-ip $INFERENCE_MINI_IP` prints them; load them
+   and persist them as "Host firewall persistence" below says (the `deedkit-inference` block in ufw's two
+   rules files for the filter table and the host-bound drops, `/etc/ufw/after.init` for the raw table), then
+   `verify`. The same chain hangs in two places:
+   `raw` PREROUTING (before conntrack and the filter `FORWARD` chain, so Tailscale's `ts-forward`
+   accept, which sits at position 1 and is reinstalled when `tailscaled` restarts, cannot pass it) and
+   `DOCKER-USER`. From `dk-inference0` they allow only TCP 443 to the mini and drop DNS to any address,
+   RFC 1918, link-local and metadata (169.254.0.0/16), the rest of the tailnet, loopback and all IPv6;
+   host-bound packets from `dk-inference0` and `dk-inferencedb0` are dropped in `INPUT`.
+2. Networks: `docker compose $F --profile enrichment-mini up --no-start --no-build --pull never --no-deps
+   enricher-mini` creates both networks and the stopped worker.
+3. Database: a Compose change that adds a network to `db` would recreate the container, and databases
+   are never restarted by the tool. Attach it live instead: `docker network connect --alias db
+   <project>_inference_db <db container>`. Its `backend` attachment, identity and sessions are
+   unchanged; no connection drops. A later recreate of `db` (a Postgres image bump) takes the network
+   from the overlay.
+4. Check from a probe container. The worker with `"enabled": false` exits (`enrichment_disabled`) and
+   restarts in a loop, so it cannot host the check. `run` starts a bounded one-off container from the same
+   service definition (same networks, `extra_hosts`, `dns` and limits) with the interpreter as entrypoint:
+   `docker compose $F --profile enrichment-mini run --rm -T --no-deps --entrypoint python enricher-mini -I
+   - check ... < scripts/inference_egress_check.py` (below). Fix the rules on any failure.
+5. Start: with `private/enrichment-mini.json` enabled, `docker compose $F --profile enrichment-mini start
+   enricher-mini`; it runs, with no restarts.
+6. Only now select the worker for promotion (the host tool's `snapshot` needs a running container):
+   append `compose.enrichment.yaml` to the project's `files` in `/etc/deedkit/production.json` (and the
+   messaging project's `files` in `/etc/deedkit/http-production.json`) when it is not there yet, and map
+   `"enricher-mini": "enricher-local"` in `services` (back both files up first). Autodeploy pauses on a
+   Compose change ("apply the next release by hand"): under the pause file apply the next green `main`
+   SHA by hand as item 5 of the delivery enrollment above does, then remove the pause.
+
+Check (the receipt keeps the JSON). `listen` is a bounded synthetic listener; the positive control keeps
+"blocked" from meaning "nothing listens". Blocked targets are IP literals read with `docker inspect` and
+`ip addr`, each with a known listener; `<api ip>` is the API container's address on `backend`,
+`<mini ip>:<port>` a port the mini listens on other than 443 (such as 22 while Remote Login is on) and
+`<tailnet node ip>:<port>` another tailnet node's listener. The two tailnet targets prove the raw hook
+beats `ts-forward`:
+```sh
+docker compose $F exec -T api python -I - listen --port 18081 --seconds 300 < scripts/inference_egress_check.py &
+docker compose $F exec -T api python -I - check --control <api ip>:8080 --control <api ip>:18081 \
+  --control <mini ip>:<port> --control <tailnet node ip>:<port> < scripts/inference_egress_check.py
+docker compose $F --profile enrichment-mini run --rm -T --no-deps --entrypoint python enricher-mini -I - check \
+  --open db:5432 --open $INFERENCE_MINI_IP:443 --blocked <mini ip>:<port> --blocked <tailnet node ip>:<port> \
+  --blocked <api ip>:8080 --blocked <api ip>:18081 --blocked-name api:8080 --blocked <host public ip>:443 \
+  --blocked <dk-inference0 gateway ip>:443 --blocked 1.1.1.1:443 --blocked 1.1.1.1:53 --blocked-dns 1.1.1.1 \
+  --blocked-name example.com:443 < scripts/inference_egress_check.py
+```
+(The `--control` runs come from a container that may reach those addresses; the tailnet ones from the host
+itself: `python3 scripts/inference_egress_check.py check --control ...`.) It exits 0 only when the database
+and the mini connect, every blocked address times out or has no route, and every blocked name does not
+resolve. A refusal means the address answered, which a DROP never does; a name that resolves fails even if
+the connection is then dropped. A failed lookup does not prove that no query left, so watch the host during
+the check with a unique probe name: use `--blocked-name probe-<random>.example.com:443` instead of
+`example.com:443`, and capture the whole host: `tcpdump -ni any -l 'port 53' | tee dns.txt`. Docker
+masquerading rewrites the source of a packet that leaves the host, so do not filter by the container
+subnet; search for the unique label instead. The bridge capture must show the label on `dk-inference0`
+(the check did generate the query), and no other interface (`tailscale0`, the uplink) may show it. First
+the positive control: from the host, `getent hosts probe-control-<random>.example.com` must show its label
+on the uplink in the same capture, or the capture proves nothing. `dns.txt` holds every name the host
+resolved: keep it private on the host (mode 0600, removed after the review), and give the receipt only the
+labels, the interfaces that showed them and the verdict.
+
+Self-check of the worker (ANYM-688). The rules above can be missing when the worker starts or later: after a reboot, a
+`ufw reload`, a partial load, or a start that skips this section (`docker start`, the promotion tool's `up`). So
+`enricher-mini` proves its own confinement by trying to leave: before it publishes a profile or claims a job, before
+every claim, and every 15 seconds in the background while a job runs. It tries TCP to public IPv4 and IPv6 addresses
+on 443, to 1.1.1.1 on 53 and to the metadata address 169.254.169.254, a UDP DNS query with a random label to 1.1.1.1
+and to every resolver in `/etc/resolv.conf` (plus TCP 53 to the configured ones), the container's default gateway
+(the host) on 22, 53, 80 and 443, and ports 22 and 80 of the mini. Only a dropped attempt (timeout, no route) counts as
+confined. A connection, a refusal, a reply, an ICMP error, an unexpected local error, a local fact it cannot read and a
+check that does not finish in time all count as NOT confined. Then it exits with code 78, prints one JSON line with the
+failed check names to stderr (`{"error": "confinement_not_effective", "checks": [...]}`), and claims nothing (a job in
+flight is given back). The attempts carry no data. A worker that restarts with 78 means the rules or networks are wrong:
+fix them, never disable the check. The same probe is a command, for the probe container or any container on the bridge:
+`docker compose $F --profile enrichment-mini run --rm -T --no-deps --entrypoint python enricher-mini -m
+messaging_service.inference_confinement <mini .ts.net name>` prints `{"confined": true, "failed": []}` and exits 0 on the
+confined bridge, and a list of failed checks with exit 78 anywhere else.
+
+On a custom Docker network `/etc/resolv.conf` names Docker's embedded resolver (a loopback address): it always listens, so
+it is judged by its answer to a query for an external name, not by listening. NOERROR or NXDOMAIN means an upstream
+answered (not confined); SERVFAIL, REFUSED or silence is what it says when its upstream (the mini's address, dropped by
+the rules) is unreachable. Add the known-listening addresses that must stay unreachable to the worker config as
+`"confinement_blocked": ["100.x.y.z:22"]` (up to 16 `ip:port`, IPv6 as `[ip]:port`), for instance another tailnet node's
+SSH, the target the egress `check` above uses as `--blocked <tailnet node ip>:<port>`: without it a bypass that opens
+only an unprobed tailnet destination (a `ts-forward` accept) is not seen.
+
+What it is and is not. It is a guard against the operational loss of the rules for the worker as shipped (a start path
+that skips the operator's checks, a reload, a partial load, a shadowed hook that opens one of the probed exits): a claim
+is never started on an unproved network, and a rule loss during a job is noticed within about 15 seconds plus one probe.
+It is not a defence against a compromised worker (code that skips the check) and not a proof of the whole allowlist: it
+samples the exits that matter. The host rules (and their persistence in ufw) remain the security boundary. An
+independently enforced destination restriction (a network without a gateway plus a fixed-destination relay) is the
+stronger design: until it exists, do not read this check as making `restart: unless-stopped` risk-free. What the worker
+sends to the mini goes only to the pinned name of its profile, so a window of lost rules does not change where a benign
+worker sends a file.
+
+Undo (reverse): `docker compose $F --profile enrichment-mini stop enricher-mini` and `rm enricher-mini`;
+`docker network disconnect <project>_inference_db <db container>`; `docker network rm
+<project>_inference_db <project>_inference_egress`; restore both configuration backups (a promoted release
+needs the same newer-SHA hand apply as the delivery undo above); `docker image rm` the enroll tag; as root
+`python3 scripts/inference_egress_check.py rules --undo` prints the mirror of the rules (hooks first, then
+both chains); with the rules persisted, also restore the saved copies of the rules files and `after.init` and
+`ufw reload` ("Host firewall persistence", Rollback), or the next reload or reboot puts the rules back. The worker's jobs requeue on SIGTERM; nothing in the database changes.
+
+## Mini inference: watch and enable record (ANYM-686)
+
+The plan to enable it is [inference-enable.md](inference-enable.md). Whoever reads the production status of a
+day also does this read-only watch (operator DSN, `psql` through the host's documented database access; no write).
+One query lists the scopes (account, kind, profile) that have queued work:
+
+```sql
+SELECT m.account, e.kind, e.profile_hash,
+       count(*) FILTER (WHERE e.state = 'queued' AND e.next_due <= clock_timestamp()) AS due,
+       count(*) FILTER (WHERE e.state = 'queued' AND e.error_code = 'model_backpressure') AS held,
+       round(extract(epoch FROM clock_timestamp() - max(e.updated_at)
+             FILTER (WHERE e.state = 'ready' AND e.provider = 'deedkit_inference')) / 3600, 1) AS hours_since_ready
+  FROM attachment_enrichment e JOIN attachments a ON a.id = e.attachment JOIN messages m ON m.id = a.message
+ WHERE e.kind IS NOT NULL AND e.profile_hash IS NOT NULL GROUP BY m.account, e.kind, e.profile_hash
+HAVING count(*) FILTER (WHERE e.state = 'queued') > 0;
+```
+Timestamps of rows cannot give continuous waiting (a deferral refreshes `next_due`, `updated_at` and the
+pause), so the reader keeps a ledger, a text file on the host (`private/inference-watch.tsv`, mode 0600, no
+content) with one line per scope: `account kind profile_hash first_seen_utc`. At each reading: a scope the query
+lists and the ledger does not is added with the reading's time; a scope the ledger has and the query no longer
+lists (the queue drained) is removed. Report, separately: (a) every scope whose ledger time is more than 24
+hours old (elapsed continuous waiting) together with its `hours_since_ready`; (b) a stall when that elapsed
+waiting is above 24 hours **and** `hours_since_ready` is above 24 or NULL (never a success from the mini; compare
+with the enable date). A long wait with fresh successes is a backlog draining at its caps, not a stall. Another
+scope's success does not hide a stalled one: the groups are separate.
+
+The key and the service: `python3 scripts/inference_probe.py --url https://<mini>.<tailnet>.ts.net --key-file
+private/inference/inference.key` prints one line and exits 0 whatever it finds; report any line that is not
+`reachable=yes status=ok` with a `key_expires=` value (`status=http_502`, `reachable=no` and a rejected key all
+count), and `key_days_left` of 30 or fewer (the rotation of inference-mini-setup.md section 12 is due).
+
+The enable record on the ANYM-686 card keeps: the date and `S`; the three attachment ids of the end-to-end run (not
+their content); the egress `check` JSON and the `tcpdump` evidence; the offline and admission drill times; the key's
+expiry date and its rotation due date (30 days before); never the key, a DSN or a file name.
+
+## Mini inference: slow uploads (ANYM-692)
+
+Use when an upload of a note or photo to the mini is slow (drill 5 of ANYM-686: 6.4 MB in 579 s of the 600 s
+`upload_seconds`; the failed attempts end as `model_http_error` for the mini's 408, `model_request_failed` for the
+worker's own timeout, then `retry_exhausted`). Everything here is read-only except the probe's one refused request
+and the requeue at the end. The probe posts random bytes that the mini refuses with 422 `audio_unreadable` before
+any engine runs (not counted against the daily quota); it is not a listed live action. Never during an active call
+(read-only check first). Its `refusal=audio_unreadable` lines in the mini's log are probe traffic: the daily watch
+above (and ANYM-686 criterion 8) must not read them as failures.
+
+Three candidate causes, told apart before anyone works on one of them: the link, the worker's container path, the
+mini's receive side. The measurement is a hypothesis test with an `inconclusive` outcome, never a verdict.
+
+1. Host, read-only: `tailscale status` (direct or relay), `tailscale ping <mini>`, `ip link show tailscale0` (MTU 1280
+   expected), `sysctl net.ipv4.tcp_congestion_control net.ipv4.ip_no_pmtu_disc`.
+2. Container, read-only: `docker compose $F exec -T enricher-mini sh -c 'for f in /sys/class/net/*/mtu; do echo $f
+   $(cat $f); done'`. On the host: `iptables -t mangle -S` and `nft list ruleset | grep -i maxseg` for a TCPMSS clamp.
+   A bridge `dk-inference0` at MTU 1500 over a route through `tailscale0` at 1280 with no clamp is the suspect.
+3. The probe, once at 1 MiB from the host and once from the worker's container, in the same hour (more bytes only while
+   the last run took under a third of `upload_seconds`; at 11 KB/s even 8 MiB cannot finish in 600 s):
+
+   ```sh
+   python3 scripts/inference_probe.py --url https://<mini>.<tailnet>.ts.net --key-file private/inference/inference.key --upload-bytes 1048576
+   docker compose $F exec -T enricher-mini python3 -I - --url https://<mini>.<tailnet>.ts.net \
+     --key-file /run/secrets/inference/inference.key --upload-bytes 1048576 < scripts/inference_probe.py
+   ```
+   Each prints one line `inference upload bytes=N seconds=S kbytes_per_s=R status=<code> refusal=<code|-> valid=yes|no`
+   and exits 0. Only `valid=yes` (422 `audio_unreadable`: the whole body was read, then refused) is a rate; anything
+   else (408 from the mini's `upload_seconds`, 429, 403, 503 `upload_capacity` or `draining`, 502 from Serve, a probe
+   `timeout`, an early 422) is `valid=no` with its status. The seconds start after the TCP and TLS connect and end with
+   the reply, so the rate (1 KB = 1000 bytes) is the endpoint's effective throughput including the mini's body read, not
+   raw link capacity. The probe's default timeout is 300 s (`--timeout`).
+4. How to read the two rates: the container below a third of the host points at the container path; both slow points at
+   the link or at the mini's receive side (both probes end at the same receiver) and leaves bytes (ANYM-696) as the only
+   certain lever; both fast while real uploads crawl points at scheduling or inference on the mini (its busy state,
+   `Between`, the access log `seconds=`; a real request is also scheduled and inferred), which the probe cannot show.
+5. Before the container path is called the cause, record in the same hour, read-only and header-only, for 60 s during the
+   container probe: `tcpdump -nn -s 96 -i tailscale0 'host <mini ip> and (icmp or tcp[tcpflags] & tcp-syn != 0)'` (the
+   SYN's MSS, any ICMP fragmentation-needed, no payload) and the `TcpRetransSegs` delta from `nstat`. Without it the
+   outcome is `inconclusive`. Put the two rates, the evidence, the date and the hour on the card once.
+6. Only a confirmed container path is fixed: `com.docker.network.driver.mtu: "1280"` on `inference_egress` in
+   `deploy/compose.enrichment.yaml` (bridge name unchanged), applied by stopping the worker with the normal `stop`,
+   recreating that network and starting it, under the section 2 gates with an Astra-reviewed plan; undo is the previous
+   compose file and a recreate. Repeat the container probe in the same hour: at least 5 times the earlier rate, else
+   revert and record `inconclusive`.
+
+Requeue after a timeout storm (the agent that releases it, under the section 2 gates; run it once the fix of the bytes
+or the link is live, or the notes fail again). Read, through the host's documented database access:
+
+```sql
+SELECT count(*), error_code FROM attachment_enrichment
+ WHERE state = 'failed' AND provider = 'deedkit_inference' GROUP BY error_code;
+```
+
+The error codes alone do not say which rows timed out: `model_http_error` is every non-2xx answer of the mini (its 408
+`upload_timeout`, but also a 422 for an unreadable file) and `retry_exhausted` is a catch-all. So the cohort is frozen
+first, as a positive list, and only that list is requeued.
+
+1. Name the storm window (first and last failure, from the mini's access log and the worker log) and freeze the
+   candidates, with their pre-update state, into the operation record (a file, no content):
+
+   ```sql
+   SELECT e.attachment, e.state, e.error_code, e.attempts, e.updated_at, a.mime, a.bytes
+     FROM attachment_enrichment e JOIN attachments a ON a.id = e.attachment
+    WHERE e.state = 'failed' AND e.provider = 'deedkit_inference'
+      AND e.error_code IN ('model_http_error', 'model_request_failed', 'audio_transcode_size_limit', 'retry_exhausted')
+      AND e.updated_at BETWEEN :storm_start AND :storm_end
+    ORDER BY e.updated_at;
+   ```
+2. Keep a row only with per-row evidence that its last attempt was an upload or transcode failure. Only
+   `audio_transcode_size_limit` qualifies by its code (the transcode produced a file over the limit; nothing was sent).
+   `model_request_failed` is also the code of a malformed JSON answer and of any transport error unrelated to the
+   upload, so it is ambiguous like `model_http_error` (every non-2xx answer) and `retry_exhausted` (a catch-all): each
+   of those qualifies only when the worker log shows an upload timeout for that attachment's last attempt, or the
+   mini's access log (read-only) shows a 408 `upload_timeout` for that request in the window. A size or rate estimate
+   (the bytes against what the measured rate could carry in `upload_seconds`) is a hint for where to look, never
+   evidence. Every other row (an unreadable file, an auth refusal, an engine failure, an unattributed row) is left out
+   and listed with its reason. The kept rows are the frozen cohort: their ids and their `updated_at` values from step 1.
+3. Requeue exactly that cohort, in one transaction, guarded by the state the freeze saw:
+
+   ```sql
+   BEGIN;
+   UPDATE attachment_enrichment e SET state = 'queued', attempts = 0, next_due = clock_timestamp()
+     FROM unnest(:ids::text[], :stamps::timestamptz[]) AS frozen(attachment, updated_at)
+    WHERE e.attachment = frozen.attachment AND e.updated_at = frozen.updated_at
+      AND e.state = 'failed' AND e.provider = 'deedkit_inference'
+   RETURNING e.attachment;
+   COMMIT;
+   ```
+   The guard makes it repeat-safe: a row that has failed again, or was requeued and processed meanwhile, has a newer
+   `updated_at` and is not matched, so its attempts are never reset twice. Compare the returned ids with the frozen
+   cohort and record both.
+
+Undo: a row that fails again returns to `failed` by itself; nothing else changes. The profile's daily job budget still
+applies, so a large cohort can take several days. Track each returned id until it has a stored transcript or
+description or a recorded disposition (failed again with its code, or still queued with the budget spent); the failed
+count falls the moment the rows are queued and proves nothing. A queued or leased row is open evidence.
+
+## Recordings (ANYM-711)
+
+`deploy/compose.recordings.yaml` runs the optional recordings backend (Omi and PLAUD reads,
+[services/recordings/README.md](../../services/recordings/README.md)) as `recordings-api`. Merging and promoting the
+image enable nothing: the service needs the private configuration directory, a gateway policy grant, a first
+start by hand and an enrollment release, all of them under the section 2 gates and none of them during an active
+call. The container joins no `integration` network. The gateway reaches it over the internal network
+`deedkit-recordings-backend` (bridge `dk-recbackend0`, gateway mode `isolated`, no host address), and its one
+way out is the filtered bridge `dk-recordings0` (ANYM-712; the host rules come first). Archive polling, audio
+links and the archive backup are separate gates (docs/DATA-POLICY.md).
+
+**Private directory** (`RECORDINGS_STATE_DIR`, outside Git, mounted read-only as a DIRECTORY at
+`/run/deedkit/recordings`, so an atomic replace inside it reaches the running service): mode 0700, owner
+10001, holding `config.json`, `cursor.key`, `omi.key`, `plaud.key` and the per-agent backend key files, every
+file a regular file of mode 0600 owned by 10001. Paths inside `config.json` are the in-container ones;
+`deploy/recordings.example.json` is the synthetic structure (token files under `/run/deedkit/recordings/`);
+`deploy/recordings-archive.example.json` adds the archive (under `/data/archive`, never a `/private/...` path of the
+README example) and each account's `archive_namespace`, and is used only after the archive gates pass. The owner
+writes the provider keys by hand; the agent only checks modes and that a file is not empty.
+
+**Network confinement (ANYM-712).** `recordings-api` joins only `recordings-backend` (internal) and `recordings-egress`
+(bridge `dk-recordings0`, no IPv6); no other service joins the egress bridge. `scripts/recordings_egress_check.py` prints the
+host rules (`rules --resolver IP`, with `--undo` for the exact inverse): the chain `DEEDKIT-RECORDINGS` allows UDP and TCP 53
+to the host resolver, drops `0.0.0.0/8`, `10/8`, `100.64/10` (tailnet), `127/8`, `169.254/16` (metadata), `172.16/12`,
+`192.0.0/24`, `192.168/16`, `198.18/15`, multicast and reserved, allows TCP 443 and drops everything else. It is hooked twice,
+in `DOCKER-USER` and in raw `PREROUTING` (Tailscale's `ts-forward` accept can precede `DOCKER-USER`; the raw hook runs before
+conntrack and cannot be passed over by a reorder), plus `INPUT` drops for `dk-recordings0` and `dk-recbackend0` (no route to the
+host itself) and IPv6 drops in all three places. It never edits the inference or delivery rules.
+
+The internal backend bridge `dk-recbackend0` also needs a rule: peers on it reach each other, and the gateway listens there on
+0.0.0.0, so without one the recordings container could open a connection to the gateway. The filter chain therefore starts
+with three rules for traffic entering from `dk-recbackend0` (a third `DOCKER-USER` hook): replies (conntrack
+`RELATED,ESTABLISHED`) pass, a NEW connection to the service port 13234 passes (the gateway's requests), everything else is
+dropped. The raw chain does not hold them (no conntrack before raw). This relies on Docker's `br_netfilter`, which also
+carries its own inter-container rules. Read-back: `check --blocked GATEWAY_BACKEND_IP:13240` from the container is
+blocked, while a gateway request to recordings-api still answers.
+
+Persistence follows "Host firewall persistence (ANYM-693)": the filter blocks go into the `deedkit-recordings` block of
+`/etc/ufw/before.rules` and `before6.rules` (`rules --resolver $RECORDINGS_RESOLVER --format ufw --family v4|v6 --source FILE`
+merges it after the delivery block), the raw half is a function of the ONE generated `/etc/ufw/after.init`
+(`rules --resolver $RECORDINGS_RESOLVER --mini-ip $INFERENCE_MINI_IP --format after-init`; the inference script prints the same
+text with `--recordings-resolver`). `RECORDINGS_RESOLVER` (the host's DNS resolver the container uses, IPv4) is a new line of
+`/opt/personal-os-probe/.env`; with it set, both `verify` commands expect the composed hook, without it the hook is the
+inference-only text of before. `recordings_egress_check.py verify` prints `ok` or `<pair> <code>`; the boot receipt gets a
+`recordings` key (`not_installed` until the resolver is configured, then it decides `ok`).
+
+Order for the root activation (the plan is Astra-reviewed, none runs during an active call): install the updated
+`firewall_persist.py`, `inference_egress_check.py`, `recordings_egress_check.py` to `/usr/local/lib/deedkit/` FIRST (the old
+inference verifier would read the composed hook as `table_differs:raw`); then the ANYM-693 "Safe order" steps with the new
+block and hook; `verify` of all three scripts must print `ok`; only then start `recordings-api`. To remove: stop
+`recordings-api` first, then run the rules' `undo` (it removes only the recordings rules and the composed hook goes back to
+the inference-only text, with `RECORDINGS_RESOLVER` removed from the env file).
+
+**DNS.** The overlay sets `dns: [$RECORDINGS_RESOLVER]` (required), the same address the host rules allow: Docker's embedded
+resolver then queries that server from the container's namespace, where the bridge rules apply; without `dns` it would
+use the host's inherited resolvers from the host namespace, outside them. Read-back: `getent hosts api.omi.me` works in the
+container and a query to any other resolver (`check --blocked-dns IP`) gets no answer.
+
+**Boot order and budget.** The recordings half of `after.init` runs LAST, after the inference half has loaded and just before
+the record is written, so it cannot delay, shorten or break the inference half, which runs exactly as before under the
+hook's unchanged 60 s bound. When inference fails or is slow, the recordings rules are not loaded in that boot: the failure
+is in the raw-step record, in `verify` and in the receipt, and `recordings-api` refuses to serve without them (admission,
+fail closed). The recordings half is a child of the hook under its own bound (`DEEDKIT_RECORDINGS_TIMEOUT`, 1-10 s, default
+8 s, plus a 2 s kill grace). GNU `timeout` puts each command in its own process group, so the child gets the same value as its
+per-command limit and `/dev/null` for stdin, stdout and stderr, and reports by exit status (11 restore, 12 and 13 the hook),
+never by captured output. An overrun records `hook_recordings_124` (or `restore_recordings_v4` when the command's own limit,
+the same value, ends first), a restore or hook failure `restore_recordings_v4` or `hook_recordings_v4|v6`, in the same
+raw-step record. The hook still exits 0.
+
+**Egress admission.** The overlay sets `RECORDINGS_EGRESS_ADMISSION=required` and requires `RECORDINGS_EGRESS_BLOCKED` and
+`RECORDINGS_EGRESS_OPEN` (comma-separated, in the project's env file; Compose refuses a missing one). Before the CLI binds its
+port it probes them from inside the container: every blocked `IP:PORT` (a known host listener, a tailnet address with a known
+listener, the gateway's listener; `dns:IP` for a DNS query) must get no answer (timeout or no route; a refusal fails, since a
+DROP never sends one), every open target (`api.omi.me:443`, `dns:<RESOLVER_IP>`) must answer. Otherwise it exits 78 and
+`restart: unless-stopped` loops only this service; the gateway returns its recordings tool error, nothing else depends on
+it. This covers boot, promotion and any restart. Source runs and tests leave the variable unset and skip it. The probes send
+a TCP handshake and one DNS query, never a token.
+
+**The canary proves the raw layer.** `RECORDINGS_EGRESS_BLOCKED` must name `192.0.2.254:9` (TEST-NET-1, RFC 5737: never
+routable, no listener anywhere); admission refuses to start without it. The raw chain drops that destination first (the probe
+times out), the filter chain REJECTs it with a reset. In a boot where inference failed or was slow, ufw has loaded the filter
+rules but the recordings raw rules were skipped: the canary then gets a refusal instead of a timeout and the start is refused,
+so `recordings-api` cannot serve without the raw layer (the one that survives a tailscaled `ts-forward` reorder) in that boot.
+Example: `RECORDINGS_EGRESS_BLOCKED=192.0.2.254:9,<host listener>,<tailnet listener>,<gateway listener>` and
+`RECORDINGS_EGRESS_OPEN=api.omi.me:443,dns:<resolver>`.
+
+The production read-back runs `check` from the real two-network container (`docker compose $F exec -T recordings-api python -I -
+check --open api.omi.me:443 --open-dns RESOLVER --blocked HOST_BRIDGE_IP:PORT --blocked TAILNET_IP:PORT --blocked
+GATEWAY_IP:PORT < scripts/recordings_egress_check.py`; every blocked target needs a known listener, or "blocked" could mean
+that nothing listens; `listen` in a sibling container is the positive control).
+
+*Residual, documented:* the bridge does not pin hostnames. Any public HTTPS host is reachable by the container; host pinning
+rests on the adapters' fixed origins (`api.omi.me`, `mcp.plaud.ai`) and refused redirects and proxies (`trust_env=False` in
+`omi.py` and `plaud.py`, with their tests) until a proxy-capable adapter exists. Follow-up card candidate: a hostname-allowlisting
+egress (a proxy or DNS-level allowlist) for the recordings bridge.
+
+**First publication (owner action, once).** GHCR creates the new package `deedkit-recordings` private. The host has
+no GitHub token and `production.py` reads the registry anonymously, so before the first start an organization owner
+sets the package public in its package settings (as for the other packages, "CI-published images"), and an
+anonymous check passes: `docker logout ghcr.io`, then `docker manifest inspect ghcr.io/gosync-inc/deedkit-recordings:<sha>`
+answers. Until then promotion cannot resolve the image; changing visibility is the owner's.
+
+**First start by hand** (`production.py` cannot start a service that is not enrolled: `snapshot` needs one
+running container). `F` is `-p deedkit-recordings -f /opt/deedkit/deploy/compose.recordings.yaml` with
+`RECORDINGS_STATE_DIR` and `DEEDKIT_VERSION` set. With `<sha>` a green `main` SHA whose `publish` job finished:
+1. `gh attestation verify oci://ghcr.io/gosync-inc/deedkit-recordings:<sha> --repo GoSync-Inc/deedkit
+   --signer-workflow GoSync-Inc/deedkit/.github/workflows/ci.yml --source-ref refs/heads/main --source-digest <sha>
+   --deny-self-hosted-runners` (see "CI-published images"), `docker pull` that digest and
+   `docker tag <digest ref> deedkit-recordings:enroll-<sha>` (a new tag, never `--build`).
+2. Once: `docker network create --internal -o com.docker.network.bridge.name=dk-recbackend0 -o
+   com.docker.network.bridge.gateway_mode_ipv4=isolated deedkit-recordings-backend`.
+3. `DEEDKIT_VERSION=enroll-<sha> docker compose $F up -d --no-build --pull never` and read `docker ps` health
+   (healthy after about 30 seconds).
+
+**Gateway.** Upgrade the gateway to a release that knows the module before the policy names it (an old gateway
+rejects the module name). The policy gets, in one atomic replace with a higher `revision` and a backup first:
+`deployment.modules` + `recordings`, `deployment.backends.recordings.url` = `http://recordings-api:13234`, the
+profile's `recordings_capabilities` / `recordings_list` / `recordings_read` tools, per principal
+`credentials.recordings` = `{key_file: /run/deedkit/keys/recordings-<agent>.key, key_sha256}` (the key file is
+0600, owned by 10001, in the gateway keys directory) and `grants.recordings` = `recordings:read` +
+`recordings:content` (no `recordings:audio`). A backend URL change needs a gateway restart.
+
+**Enrollment is a hand release**, modelled on the delivery enrollment (step 5 of "Apply and verify"). The host
+lists `deploy/compose.recordings.yaml` as a new project `deedkit-recordings` (the Compose project name of the first
+start; `snapshot()` finds the running container by that label) with `"services": {"recordings-api":
+"recordings"}` in `/etc/deedkit/production.json` ONLY (plan B accepts exactly two services, the API and the
+gateway), and `deploy/compose.gateway-recordings.yaml` after `compose.gateway.yaml` in the gateway project's
+`files` in BOTH `/etc/deedkit/production.json` and `/etc/deedkit/http-production.json`, so the promoted HTTP gateway
+generation joins `deedkit-recordings-backend`. The change makes the recorded configuration digests differ, so
+autodeploy halts at "apply the next release by hand". Sequence: create the pause file; back up and edit both
+configuration files; `production.py prepare --sha S` and `apply --sha S` (plan A); `seamless_release.py prepare
+--sha S` and `promote --sha S` (plan B); `status`; remove the pause; `production.py deploy --dry-run` must report
+the new state current (a dry run with the pause file present returns `paused` before it checks drift). Plan A apply
+restarts the selected services of the enrolled projects as in any release.
+
+**Undo**, in order: remove the module, tools, grants and credential from the policy (new revision); stop
+`recordings-api` only (`docker compose $F stop recordings-api`) and leave autodeploy paused, which is the
+holding state; at a NEWER green `main` SHA (a docs-only pull request creates one) restore both configuration backups
+and repeat the hand release sequence above (a SHA prepared with recordings can never be prepared again); `deploy
+--dry-run` must report current without a drift halt; then `docker compose $F down`, remove the
+network `deedkit-recordings-backend` and the enroll tag; the owner revokes the provider keys in Omi and PLAUD.
+
+**Operations on the running service.**
+- *Add an account:* add it to `config.json` (atomic replace inside the directory) with its token file; a new
+  provider identity gets a new `archive_namespace` when it is archived.
+- *Rotate a token:* replace the token file (atomically, 0600); the service re-reads it on every provider call, so no
+  restart is needed; keep the archive namespace.
+- *Replace an account:* a different provider identity under a reused local account ID needs a new
+  `archive_namespace`; remove the old account first.
+- *Read archive health:* `docker exec` into `recordings-api` and send `POST /v1/archive_status` for an account with an
+  operator backend key; it returns counts, last success and fixed error codes and contacts no vendor.
+
 ## Image retention
 
 ```sh
@@ -1305,6 +1882,33 @@ ends `deployed` (the timer included) and after a successful manual `apply`. Not
 after `--dry-run`, `rollback`, a refused or failed apply, or a deploy ending in any
 other status. `images --remove` runs the same removal by hand, for example after
 a disk-space pause.
+
+Containers of retired HTTP generations (ANYM-689). `retire` only stops a drained
+predecessor, so each release left two exited containers, and every image "used by
+container" is kept: after a few weeks 200 stopped containers pinned 200 images and the
+15 GiB floor halted autodeploy (2026-11-02). The tool therefore removes them too, by the
+exact container IDs of the receipts, never by a label alone: a generation qualifies only
+when a successor's `http-result.json` records its retirement as complete (status
+`serving`, `retired_roles` gateway and api), it is neither the serving generation nor its
+one `previous`, its own attempt was published (`serving`) and its receipt names the same
+containers as the successor's copy. Each container is inspected immediately before its
+removal (ID, image, project, service and release labels, state `exited`) and removed with
+a plain `docker rm <id>`: no force, no volumes, no prune. It runs (a) after `retire` of a
+serving generation and (b) at the start of a real `deploy`, before the preparation and its
+disk check, followed there by a time-bounded image pass with the same keep rules, because
+the gate counts the bytes of images, not of containers (order: container cleanup, image
+removal, disk check, preparation; the pass after a deployed release stays). Both are
+best effort: 120 seconds and 30 per docker command for the containers, no lock waited
+for, every failure only a line of the summary, an unknown removal outcome never repeated
+in the same run. `deploy.json` carries the summary (`preflight`, and `cleanup`:
+containers removed, generations, images removed, disk free after) whether the deploy
+ends or halts at the floor; a halt shows `kept_reasons` of the images that stay.
+`seamless_release.py clean --config <http config>` lists the same set (report only by
+default); `clean --remove --plan-a-config <plan A config>` removes it and runs the image
+pass. What is lost: a removed container's metadata and json-file logs; an image comes back
+only from `prepared.json` registry references while the package version exists (a
+local-only build cannot be restored). Unresolved generations (no receipt, no recorded
+retirement, an interrupted promotion) are counted, never removed by the tool.
 
 Only images carrying a `deedkit-production-<target>:*` tag of the eight
 CI-published targets are considered. Kept, with reasons:

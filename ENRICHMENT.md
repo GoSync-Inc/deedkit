@@ -15,14 +15,129 @@ See [COLLECTOR_STATES.md](COLLECTOR_STATES.md).
 
 | Profile | Local | API |
 | --- | --- | --- |
-| Audio transcription | faster-whisper, preinstalled model directory | OpenAI or compatible transcription endpoint |
-| Image descriptions and visible text | Ollama vision model | OpenAI-compatible chat, Anthropic Messages, Gemini |
-| Document title and summary | Ollama text model | Same text/vision API connectors |
+| Audio transcription | faster-whisper, preinstalled model directory; `deedkit_inference` (the owner's Mac mini) | OpenAI or compatible transcription endpoint |
+| Image descriptions and visible text | Ollama vision model; `deedkit_inference` | OpenAI-compatible chat, Anthropic Messages, Gemini |
+| Document title and summary | Ollama text model; `deedkit_inference` | Same text/vision API connectors |
 | Optional document analysis/image description | — | Codex CLI with private ChatGPT subscription auth |
 
 The Codex connector is implemented locally but not deployed or enabled. Read
 [its isolation and rollout requirements](CODEX_ENRICHMENT.md) before using it;
 it is cloud inference and shares subscription usage with other Codex work.
+
+### deedkit_inference: the owner's Mac mini (ANYM-685)
+
+`deedkit_inference` sends audio, photos and document text to the inference service on the owner's Mac mini
+(`services/inference`, over the tailnet) instead of a cloud provider or the worker's own CPU. It is not cloud:
+it needs no `allow_cloud`, and a profile that sets `allow_cloud` (even `false`) is rejected, so the flow can never
+be labelled cloud. It takes no `local-heavy` lock: the work happens on the mini.
+
+| Key | Rule |
+| --- | --- |
+| `provider` | `deedkit_inference` |
+| `local_inference` | must be `true` (any other provider rejects this key) |
+| `model` | `audio-default` for `audio`; `vision-default` for `image` and `document` |
+| `base_url` | `https`, port 443 or none, a `*.ts.net` name (no IP literal, no credentials or query), path exactly `/v1` |
+| `api_key_file` | absolute path to the service key, mode 0600 |
+| `language` | optional ISO 639-1 code, `audio` profiles only; sent as the request's `language` and skips language identification on the mini |
+| `timeout_seconds` | up to 900 (a 4-hour recording takes about 8.5 minutes); sent to the service as `X-Request-Deadline-Seconds`, its queue deadline |
+| `backpressure_seconds` | cooldown when the mini says "not now" and gives no `Retry-After`: 1 to 900, default 120 |
+| `audio_response_format` | `verbose_json` (default, with segments) or `json` |
+| `max_input_bytes` | the largest original the worker copies: default 20 MiB for `audio` and `image`, 32 MiB for `document` (ANYM-702); the most a profile may set is 200 MiB for `audio` and 32 MiB for `image` and `document` (ANYM-697). What is sent is capped separately, below |
+
+Audio uses `POST {base_url}/audio/transcriptions`; photos and documents use `POST {base_url}/chat/completions`, a
+document sending its extracted text without an image (scanned-PDF page images are not part of this connector).
+Redirects and environment proxies are off. The prompt is the usual one plus a sentence asking for `title` and
+`summary` in Russian and the visible text in its own language; the description is stored with `prompt_version`
+`file-description-v2-ru`. Agents search in Russian, and without that sentence a photo with no source language is
+described in English.
+
+**What waits and what fails.** When the mini cannot take the job right now the job waits and costs nothing:
+
+- waits (`model_backpressure`): the mini is unreachable (connection refused, DNS or TLS failure, a connect
+  timeout); HTTP 429; HTTP 503 carrying the service's own error (`queue_full`, `slot_busy`, `upload_capacity`,
+  `admission_closed`, `draining`); and HTTP 502, 503 or 504 whose body is not the service's `{"error": {"code": ...}}`
+  envelope (Tailscale Serve answers those itself while the service process restarts, e.g. for a deploy);
+- fails (a normal attempt, `model_request_failed` / `model_http_error`, `retry_exhausted` after three): a read
+  timeout once the request was accepted, 504 `engine_timeout`, 502 `engine_failed`, any other error the service
+  itself answers with its envelope, 413, 422 and an invalid answer, so one file that hangs the engine cannot loop
+  forever;
+- 401 and 403 stay `model_auth_failed`, which pauses the scope until the operator clears it.
+
+A deferral puts the job back to `queued` under its lease token, restores its `attempts`, gives back that claim's
+`enrichment_budget` and `processing_budget` counts (on the day of the claim) and pauses the scope
+`(account, kind, profile_hash)` with `pause_reason = 'model_backpressure'` until now plus the cooldown: the
+service's `Retry-After` when present, else `backpressure_seconds`, at most 900 seconds. The pause never weakens
+another one: an indefinite pause (such as `model_auth_failed`) stays, and of two bounded pauses the later expiry
+wins. It is shown in the published profile state like any pause. A mini that is off therefore costs each worker one
+claim and one refund per scope per cooldown, and no attempt or daily budget.
+
+Readiness events for old attachments carry no message age. While a backlog drains, an agent that needs it looks
+up the message's `sent_at`.
+
+Data leaves the worker for the owner's mini only, over WireGuard and TLS: the audio (the original, or Opus when
+transcoded), the image bytes (the original, or a scaled jpeg), up to `max_text_chars` of extracted text for a document, and the bearer key. Derived text comes
+back; the mini keeps nothing after the job. Nothing leaves the tailnet, and no cloud provider is involved.
+
+### What reaches the mini: audio and photos (ANYM-696)
+
+The mini decodes any ffmpeg-readable audio by content and takes photos up to 20 MP, so the worker sends only the
+bytes it needs. The original always stays in the archive; the metadata says what was done.
+
+- **Audio, `deedkit_inference` only.** A voice note whose first audio stream is Opus in an ogg container with an
+  average bitrate (bytes x 8 / duration) of at most 48 kbps goes **unchanged** as `recording.ogg`, with no ffmpeg run
+  (chat apps send about 32 kbps; the margin covers Ogg page overhead). Any other source above 32 kbps (an Opus note
+  above 48 kbps, mp3, m4a, wav, mp4 including video notes, an ogg that is not Opus) is transcoded to **Opus** (24 kbps
+  voip, mono, 16 kHz, ogg): about 1.8 MB for ten minutes instead of 7.2 MB. A source that is not Opus and at or below
+  32 kbps goes unchanged, an ogg/vorbis note included. The transcode keeps the duration check (0.25 s), the output size
+  limit and the timeouts, and records `transcoded` and `transcode_lossy` true with `transcode_format` `opus`. On a note
+  that was an mp3 or an mp4 that is expected: `opus` names the format sent, not the source's. Every other ASR provider
+  keeps the mp3 transcode of ogg notes and `transcode_format` `mp3`.
+- **Large recordings (ANYM-697).** The original cap (`max_input_bytes`, up to 200 MiB for audio) is separate from
+  the upload cap: the file that is sent is at most 32 MiB less 64 KiB (the mini's body cap counts the multipart
+  framing; `UPLOAD_LIMIT_BYTES`), whatever the profile says. A source that would go unchanged but is over that cap
+  is transcoded to Opus too, so a 48 MiB mp3 of 50 minutes is sent as about 9 MB. By bytes a note of about 3 hours
+  still fits; a longer one ends as `audio_transcode_size_limit` with nothing sent: the recording is too long for one
+  upload and needs chunking (a later card), the original is kept, and the remedy is not a smaller file. A recording
+  over `max_audio_seconds` (at most 4 hours) ends as `audio_duration_limit` before any ffmpeg run. The transcode time
+  limit is `max(120 s, 60 s + duration / 20)` inside the profile's `timeout_seconds`: 120 s up to 20 minutes, 3 minutes
+  for 40, 10 minutes for 3 hours. Time is the second ceiling: the worker's child (transcode, upload of the Opus bytes at
+  the link rate, and the mini's own 0.04 x duration) must finish inside `timeout_seconds + 10`, 910 s for the mini
+  (the parent's copy of the original runs before that clock, bounded by bytes, and uses part of the lease's
+  50-second margin), and the mini refuses a body slower than its `upload_seconds`; in a bad link window a note that fits by bytes ends as
+  `model_timeout` or `model_http_error` and is retried. A `video/mp4` note is transcribed from its audio track
+  (`-vn`). The copy of a large original lives in the worker's `/tmp`: the `enricher-mini` tmpfs is 320 MiB; the other
+  workers keep 128 MiB, so raise their `/tmp` in the same edit before raising a local profile above 100 MiB.
+  `enrichment_failed` on a large original can mean the tmpfs is smaller than the profile's cap (an operator mistake);
+  it is also the worker's code for any unexpected error (a missing file, a permission or I/O error), so read the mount
+  size (`df /tmp` in the container) and the worker's error before concluding. Order on a host: the new image first (an older image refuses `max_input_bytes` above 32 MiB with
+  `invalid_model_limit` and then the audio profile is not usable), then the profile line; on a rollback restore the
+  line first. Editing the profile changes its hash, and the worker, which reads its profile once at start, picks every
+  failed row of that kind again after its next restart, within the day budgets: check the budget before the edit,
+  restart once, and track all of those rows.
+- **Documents up to 32 MiB (ANYM-702).** A `document` profile without `max_input_bytes` takes 32 MiB, the validator's
+  maximum, not 20: for a document the limit only bounds the worker's disk copy (digest-checked in its `/tmp`) and the
+  child's file-size limit, while the request of every provider (`deedkit_inference`, the OpenAI-style ones and the
+  optional `codex_cli`, which opens a file only for an image) carries just the extracted text, at most
+  `max_text_chars`, never the file. A document over 32 MiB ends as `original_size_limit` and no profile can raise the limit.
+- **Final limit codes (ANYM-702).** Three codes mean the file can never pass the profile as it is, so the job is
+  attempted once, the event says `retryable` false, and `attempts` stays 1 (the number of attempts made). The code
+  is what an agent sees as `enrichment_failure` on a file read:
+  - `original_size_limit`: the original is larger than the profile's `max_input_bytes`;
+  - `audio_duration_limit`: the recording is longer than the profile's `max_audio_seconds`;
+  - `audio_transcode_size_limit`: the Opus form does not fit one upload; the recording needs splitting (a later card).
+
+  These rows are final for their profile: the worker takes them again only after the profile changes (a different
+  hash), which restarts the attempts as for any failed row. `audio_transcode_size_limit` depends on the worker image's
+  transcode settings, so a new image alone does not reopen it. A file whose size differs from the recorded one is not
+  a size limit: it fails as `original_integrity_error` and stays retryable.
+- **Photos, `deedkit_inference` only.** A picture whose longer edge is over 2048 px or whose file is over 700 KB (700,000
+  bytes, so about 930 KB as base64) is scaled by ffmpeg to a longer edge of at most 2048 px (never enlarged, EXIF
+  orientation applied, one frame) and sent as jpeg, also when the source is png, webp or gif; the EXIF block, GPS
+  included, is not carried over. A result still over 700 KB is recoded once at lower quality; if it is still over, it is
+  sent as it is. The stored metadata carries `image_downscaled` and `image_over_budget`. A small picture goes
+  unchanged. A picture ffmpeg cannot read as png, jpeg, webp or gif (a corrupt file, svg, a playlist), a timeout or an
+  oversized output ends the job with `invalid_image` and nothing is sent. The ffmpeg run takes a fixed list of image
+  demuxers, `-protocol_whitelist file,pipe`, no stdin, the worker's time and file-size limits.
 
 ## Retained descriptions and video (schema 34)
 
@@ -219,8 +334,18 @@ container memory limit. Models and account IDs in examples must be selected by
 the operator.
 
 The optional Compose overlay is `deploy/compose.enrichment.yaml`.
-Select only one intended profile (`enrichment-local` or `enrichment-cloud`);
-ordinary startup leaves both off. The local image includes hash-locked CPU
+Select only one intended profile (`enrichment-local`, `enrichment-cloud` or
+`enrichment-mini`); ordinary startup leaves all off. `enrichment-mini` runs
+`enricher-mini` for `deedkit_inference` (the owner's Mac mini) on its own
+networks, with no route to the API or the host and egress only to the mini on
+443 (ANYM-688); its config (`deploy/enrichment-mini.example.json`) holds only
+`deedkit_inference` profiles, its key is the directory `private/inference/`, and
+the apply and rules are in `docs/operations/production.md`. Never run it together
+with another profile: two workers would claim the same jobs. A worker with a
+`deedkit_inference` profile also proves its own confinement before it claims and while it
+runs, by trying to reach public addresses, an external resolver and other ports of the
+mini, before every claim and every 15 seconds; if anything answers it claims nothing and exits with code 78
+(`messaging_service/inference_confinement.py`). The local image includes hash-locked CPU
 faster-whisper dependencies, with PyAV 18.1.0 pinned for decoder compatibility.
 Neither image downloads models. Native smoke tests use synthetic speech and
 network-disabled containers. The local profile has only the internal DB network.
@@ -249,7 +374,8 @@ attempt limits, not token or monetary budgets.
 Controls are independent for `(account, kind, profile_hash)`. An auth error,
 missing local model, unavailable CLI or required CLI upgrade pauses that scope
 until an operator fixes the configuration and explicitly clears its control,
-or selects a changed profile. Rate limits pause it for 30 minutes. Another
+or selects a changed profile. Rate limits pause it for 30 minutes. A mini that cannot take work
+(`model_backpressure`, see `deedkit_inference`) pauses it for its cooldown and gives the attempt and budget back. Another
 account/profile may continue within its own subcaps and the shared ceiling.
 Worker restart does not clear controls. A paused or resource-blocked job is not
 leased and does not consume an attempt. Safe `pause_reason`/`paused_until` labels

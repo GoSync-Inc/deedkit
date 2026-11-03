@@ -1,6 +1,7 @@
 """Bounded operational diagnostics; never provider payloads or credentials."""
 from datetime import datetime, timezone
 import re
+from .error_codes import CODES
 from .status_details import describe
 
 TERMINAL = {
@@ -11,13 +12,9 @@ TERMINAL = {
     'telegram_pairing_required':'relink_in_owner_terminal',
     'telegram_identity_mismatch':'check_configured_account_identity',
 }
-CONNECTION_ERRORS = set(TERMINAL) | {'provider_disconnected','provider_not_ready',
-    'provider_initialization_failed','provider_connect_timeout','provider_page_stalled',
-    'provider_protocol_error','durable_capture_failed','capture_overload','spool_full',
-    'disk_reserve','spool_corrupt','collector_lease_lost'}
-MEDIA_ERRORS = {'media_unavailable','media_reference_changed','unsupported_media_type',
-    'media_hash_mismatch','media_size_mismatch','media_size_limit','media_metadata_unavailable',
-    'invalid_media_path','media_timeout','media_network_error','media_storage_unavailable'}
+# The code lists live in error_codes.json (parity with the Go and JS copies: tests/test_error_code_parity.py).
+CONNECTION_ERRORS = set(CODES['connection_errors'])
+MEDIA_ERRORS = set(CODES['media_errors'])
 # Why a queued original is not automatic work of the current run (ANYM-284).
 INELIGIBLE = ('outside_prefetch_window','outside_history_bounds','history_bound_unknown','collection_excluded')
 LOCAL_STORAGE_ERRORS = {'storage_unavailable','media_storage_unavailable'}
@@ -30,16 +27,7 @@ OVERLOAD_STOP_DETAILS = {'waiters_limit','slot_wait_timeout'}
 # status, SIGKILL (OOM or forced) or another signal.
 CHILD_EXIT_DETAILS = {'exit_clean','exit_error','exit_panic','exit_other','exit_killed','exit_signal'}
 # Fixed codes each collector prints to its supervisor when it stops.
-SUPERVISOR_STOP_CODES = {
-    'telegram':frozenset({'collector_disabled','session_handover_not_confirmed','telegram_pairing_required',
-        'telegram_identity_mismatch','private_session_required','live_account_required',
-        'collector_already_owned','session_already_owned','collector_lease_lost',
-        'durable_capture_failed','capture_overload','collection_disabled','provider_disconnected'}),
-    'whatsapp':frozenset({'collector_disabled','session_handover_not_confirmed','whatsapp_pairing_required',
-        'whatsapp_identity_mismatch','private_session_required','live_account_required',
-        'collector_already_owned','session_already_owned','collector_lease_lost',
-        'collection_disabled','provider_disconnected'}),
-}
+SUPERVISOR_STOP_CODES = {component:frozenset(codes) for component,codes in CODES['supervisor_stop_codes'].items()}
 PHASE_STATES = {
     'connection':{'connecting','connected','retry_wait','blocked','stopped'},
     'live_capture':{'starting','receiving','backlogged','paused','stopped'},

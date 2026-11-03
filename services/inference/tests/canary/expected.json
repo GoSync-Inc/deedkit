@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "vision": {
+    "receipt_ru.jpg": {
+      "max_cer": 0.02
+    },
+    "poster_mixed.jpg": {
+      "max_cer": 0.02
+    },
+    "scan_ru.png": {
+      "max_cer": 0.02
+    },
+    "receipt_hard.jpg": {
+      "max_cer": 0.30
+    },
+    "scan_lowdpi.png": {
+      "max_cer": 0.04
+    },
+    "note_hand.jpg": {
+      "max_cer": 0.1
+    },
+    "receipt_large_worker.jpg": {
+      "max_cer": 0.02
+    },
+    "receipt_large_exif6_worker.jpg": {
+      "max_cer": 0.02
+    }
+  },
+  "describe": {
+    "image": "poster_mixed.jpg",
+    "cyrillic": true
+  },
+  "text_only": {
+    "file": "doc_text.txt"
+  },
+  "vision_max_seconds": 15,
+  "speech": {
+    "note_ru": {
+      "truth": "voice_ru.txt",
+      "max_wer": 0.03
+    },
+    "note_ru_noisy": {
+      "truth": "voice_ru.txt",
+      "max_wer": 0.06
+    },
+    "note_en": {
+      "truth": "voice_en.txt",
+      "max_wer": 0.1
+    },
+    "note_ru_opus": {
+      "truth": "voice_ru.txt",
+      "max_wer": 0.03
+    },
+    "note_en_opus": {
+      "truth": "voice_en.txt",
+      "max_wer": 0.1
+    }
+  },
+  "max_rtf": 0.1,
+  "long": {
+    "file": "note_ru_long.ogg",
+    "min_segments": 5
+  },
+  "cold_max_seconds": 300
+}

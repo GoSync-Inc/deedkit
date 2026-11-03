@@ -14,6 +14,7 @@ import pytest
 
 from messaging_service.archive import Archive
 from messaging_service.blobs import BlobWriter
+from messaging_service.media_retry import MEDIA_MAX_ATTEMPTS
 from messaging_service.collector_state import CaptureSpool,CollectorState,session_lock,validate_capture
 from messaging_service.envelope import stable_id
 from messaging_service.telegram_collector import TelegramCollector,configuration
@@ -165,7 +166,7 @@ def test_expired_telegram_media_is_retried_without_stopping_other_jobs(worker,er
     with s.pool.connection() as c:
         failed=c.execute('SELECT state,error_code,attempts,next_due>now() AS delayed FROM media_jobs WHERE message=%s',
                          (stable_id('msg',w.account,'100','24'),)).fetchone()
-        assert failed['state']=='queued' and failed['error_code']=='network_error'
+        assert failed['state']=='queued' and failed['error_code']=='media_reference_expired'
         assert failed['attempts']==1 and failed['delayed']
         c.execute('UPDATE media_jobs SET next_due=now() WHERE message=%s',
                   (stable_id('msg',w.account,'100','24'),))
@@ -218,11 +219,11 @@ def test_unclassified_telegram_media_error_fails_only_that_job(worker,caplog):
     assert 'synthetic-secret-text' not in caplog.text
     # The last attempt ends the job failed; the collector keeps running.
     with s.pool.connection() as c:
-        c.execute('UPDATE media_jobs SET attempts=4,next_due=now() WHERE message=%s',(broken_id,))
+        c.execute('UPDATE media_jobs SET attempts=%s,next_due=now() WHERE message=%s',(MEDIA_MAX_ATTEMPTS-1,broken_id))
     assert asyncio.run(w.media_once())
     with s.pool.connection() as c:
         job=c.execute('SELECT state,error_code,attempts FROM media_jobs WHERE message=%s',(broken_id,)).fetchone()
-    assert (job['state'],job['error_code'],job['attempts'])==('failed','network_error',5)
+    assert (job['state'],job['error_code'],job['attempts'])==('failed','network_error',MEDIA_MAX_ATTEMPTS)
     assert not asyncio.run(w.media_once())
     assert s.get_context(key,broken_id)['attachments']==[]
     assert set(s.files.iterdir())==originals|{s.files/hashlib.sha256(b'data').hexdigest()}
@@ -298,6 +299,107 @@ def test_checkpoint_backfill_catchup_and_overlap_edit(worker):
     assert s.search(key,'edited')['items'][0]['id']==stable_id('msg',w.account,'100','8')
     w.spool.drain(w.state.apply)
     assert len(s.search(key)['items'])==8
+
+
+def poisoned_keyboard():
+    """A real inline markup whose rows fail when read: the parser itself raises, past the type check."""
+    from telethon import types
+    class Poisoned(types.ReplyInlineMarkup):
+        rows=property(lambda self:(_ for _ in ()).throw(RuntimeError('keyboard exploded SYNTHETIC-CALLBACK')),
+                      lambda self,value:None)
+    return Poisoned(rows=[])
+
+
+def serialized_applies(w):
+    """Every capture the collector hands the state, as the spool serializes it."""
+    seen=[];original=w.state.apply
+    def apply(item):
+        seen.append(json.dumps(item,default=str));return original(item)
+    w.state.apply=apply
+    return seen
+
+
+# spec: ANYM-658
+def test_a_failing_keyboard_costs_neither_the_live_nor_the_history_message(worker,monkeypatch):
+    from telethon import types
+    monkeypatch.setenv('ANYMSG_CAPTURE_BUTTONS','1')
+    w,s,key=worker
+    seen=serialized_applies(w)
+    keyboard=types.ReplyInlineMarkup(rows=[types.KeyboardInlineButtonRow(buttons=[types.KeyboardInlineButton(
+        text='Pay',type=types.InlineButtonTypeCallback(data=b'SYNTHETIC-CALLBACK'))])])
+    history=[message(i) for i in range(1,6)]
+    for item,markup in zip(history,(poisoned_keyboard(),keyboard,poisoned_keyboard(),None,poisoned_keyboard())): item.reply_markup=markup
+    w.provider.messages[:]=history
+    live=message(9); live.reply_markup=poisoned_keyboard()
+    asyncio.run(w.capture(NS(message=live)))
+    asyncio.run(w.capture(NS(message=message(10))))
+    w.spool.drain(w.state.apply)
+    for _ in range(4):asyncio.run(w.sync_once())  # batch_size=2: the history pages come newest first
+    w.history_spool.drain(w.state.apply)
+    assert {m['body'] for m in s.search(key,limit=50)['items']}>={'message 9','message 10','message 1','message 2','message 3','message 4','message 5'}
+    pay=s.search(key,'message 2')['items'][0]
+    assert pay['buttons']['rows'][0][0]['text']=='Pay'
+    assert seen and all('SYNTHETIC-CALLBACK' not in item and 'keyboard exploded' not in item for item in seen)
+    assert 'SYNTHETIC-CALLBACK' not in repr(pay)
+
+
+# spec: ANYM-658
+def test_a_100_button_keyboard_with_2kb_links_survives_the_live_and_history_paths(worker,monkeypatch):
+    from messaging_service.envelope import MAX_ENVELOPE,canonical
+    from telethon import types
+    monkeypatch.setenv('ANYMSG_CAPTURE_BUTTONS','1')
+    w,s,key=worker
+    seen=serialized_applies(w)
+    link='https://example.invalid/'+'a'*2000
+    def keyboarded(item):
+        buttons=[types.KeyboardInlineButton(text='Link %d'%n,type=types.InlineButtonTypeUrl(url=link+str(n)))
+                 for n in range(99)]
+        buttons.append(types.KeyboardInlineButton(text='Pay',type=types.InlineButtonTypeCallback(data=b'SYNTHETIC-CALLBACK')))
+        item.reply_markup=types.ReplyInlineMarkup(rows=[types.KeyboardInlineButtonRow(buttons=[b]) for b in buttons])
+        return item
+    asyncio.run(w.capture(NS(message=keyboarded(message(9)))))
+    asyncio.run(w.capture(NS(message=message(10))))
+    w.spool.drain(w.state.apply)
+    w.provider.messages[:]=[keyboarded(message(i)) if i%2 else message(i) for i in range(1,6)]
+    for _ in range(4):asyncio.run(w.sync_once())
+    w.history_spool.drain(w.state.apply)
+    items=s.search(key,limit=50)['items']
+    assert len(items)>=7 and any(i['body']=='message 10' for i in items) and any(i['body']=='message 4' for i in items)
+    kept=[i for i in items if i.get('buttons')]
+    assert len(kept)==4
+    for item in kept:
+        flat=[b for row in item['buttons']['rows'] for b in row]
+        assert len(flat)==100 and flat[0]['url'].startswith('https://example.invalid/') and len(flat[0]['url'])>2000
+    assert all(len(item.encode())<=MAX_ENVELOPE for item in seen) and all('SYNTHETIC-CALLBACK' not in item for item in seen)
+    assert all(len(canonical(json.loads(item)))<=MAX_ENVELOPE for item in seen)
+
+
+# spec: ANYM-658
+def test_a_near_limit_keyboard_survives_the_live_and_history_paths_and_the_next_messages_too(worker,monkeypatch):
+    from telethon import types
+    monkeypatch.setenv('ANYMSG_CAPTURE_BUTTONS','1')
+    w,s,key=worker
+    seen=serialized_applies(w)
+    def heavy(item):
+        # A multibyte body and 150 long links leave the keyboard only a few KB of the 512 KB envelope.
+        item.message='𝔸'*65536
+        item.entities=[types.MessageEntityTextUrl(offset=2*n,length=2,url='https://example.invalid/'+'p'*1500) for n in range(150)]
+        item.reply_markup=types.ReplyInlineMarkup(rows=[types.KeyboardInlineButtonRow(buttons=[types.KeyboardInlineButton(
+            text='𝔸'*128,type=types.InlineButtonTypeCallback(data=b'SYNTHETIC-CALLBACK-%d'%n))]) for n in range(100)])
+        return item
+    live=heavy(message(9))
+    asyncio.run(w.capture(NS(message=live)))
+    asyncio.run(w.capture(NS(message=message(10))))
+    w.spool.drain(w.state.apply)
+    w.provider.messages[:]=[heavy(message(i)) if i%2 else message(i) for i in range(1,6)]
+    for _ in range(4):asyncio.run(w.sync_once())
+    w.history_spool.drain(w.state.apply)
+    items=s.search(key,limit=50)['items']
+    assert {len(i['body']) for i in items if i['body'].startswith('𝔸')}=={65536}
+    assert len(items)>=7 and any(i['body']=='message 10' for i in items)
+    kept=[i for i in items if i.get('buttons')]
+    assert kept and all(i['buttons'].get('truncated') is True for i in kept)
+    assert all('SYNTHETIC-CALLBACK' not in item for item in seen)
 
 
 def test_page_failure_leaves_checkpoint_and_durable_captures_for_replay(worker):
@@ -774,7 +876,7 @@ def test_backup_covers_collector_positions_and_pending_deletions(worker,tmp_path
     directory=tmp_path/'snapshot'
     create_snapshot(s,directory,[sys.executable,'-c','print("unit-dump-stub")'])
     manifest=json.loads((directory/'manifest.json').read_text())
-    assert manifest['schema_version']==63
+    assert manifest['schema_version']==66
     assert manifest['tables']['collector_chats']['rows']==1
     assert manifest['tables']['provider_tombstones']['rows']==1
     assert verify_snapshot(s,directory)['status']=='verified'

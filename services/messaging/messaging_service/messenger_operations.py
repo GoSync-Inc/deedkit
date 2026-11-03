@@ -8,8 +8,10 @@ from datetime import datetime, timezone
 import json
 import math
 import re
+import unicodedata
 
 from .field_errors import FIELD_NAME, field_error, one_per_field
+from .name_variants import normalize
 
 MAX_REGISTERED_FILE_BYTES = 32 * 1024**2
 CATALOG_VERSION = 1
@@ -58,6 +60,13 @@ LIVE_SEARCH_LIMITATION = ('Telegram only. Searches Telegram itself: an empty cha
     'rate_limited with retry_after. Hits in chats the collection policy excludes are dropped. Writes nothing to the '
     'archive.')
 HISTORY = 'request_chat_history'
+INSPECT_BUTTONS = 'inspect_message_buttons'
+PRESS_BUTTON = 'press_button'
+INSPECT_BUTTONS_LIMITATION = ('Telegram: one live read of one message\'s inline keyboard, nothing pressed or opened. Returns '
+    'edit_date, text_sha256 and rows of buttons with row, column, kind, text, link (url and web_app kinds) and, for callback '
+    'buttons, fp: a keyed fingerprint of the callback data that a later press must carry. The callback data and the key '
+    'never leave the collector; after a collector restart every fp is stale. Per account 3 requests at once, then one per '
+    '10 s, 300 per UTC day (in memory; a collector restart resets them); over it, rate_limited with retry_after.')
 TELEGRAM_HISTORY_LIMITATION = ('Telegram: one provider page of this archived chat, 1-100 messages (default 50), at '
     'one anchor: before_message (exclusive; default the oldest archived message, so a repeat goes further back), '
     'around_message (about half before, half after it) or from_time (inclusive) / to_time (exclusive), newest first. '
@@ -68,6 +77,19 @@ TELEGRAM_HISTORY_FIELDS = {
     'count': _field('integer', default=50, minimum=1, maximum=100),
     'before_message': _field('message_id'), 'around_message': _field('message_id'),
     'from_time': _field('timestamp'), 'to_time': _field('timestamp')}
+PRESS_BUTTON_LIMITATION = ('Telegram only: one press of one inline callback button of an archived bot message, in the '
+    'owner\'s name, after the owner\'s exact confirmation. The button is named by row, column, label and fp (the keyed '
+    'fingerprint from inspect_message_buttons of the same message); the collector re-reads the live message and presses '
+    'only when its edit time, layout, text and fingerprint still match the preview. Many bots answer by editing or '
+    'replying, so a bot-response timeout is a delivered press (submitted, answer_timeout); any other uncertain result is '
+    'unknown and is never repeated: a new request needs acknowledge_uncertain naming the earlier operation after the '
+    'owner\'s new confirmation. DeedKit cannot know what the bot does, undo it or verify its effect. Payments, '
+    'URL, Mini App, login, inline-query and 2FA-protected buttons are not pressed. Per account 3 presses at once, then '
+    'one per 5 s, 200 per UTC day (in memory); over it rate_limited with retry_after.')
+CONTACTS_QUERY_LIMITATION = ('Telegram: one call per account reads the whole contact book once; query filters it by display '
+    'name and username only, no phone number (ё and е are one letter; a Latin spelling finds the Cyrillic name: fedor finds '
+    'Федор, fyodor finds Фёдор), and limit/offset page the filtered list. For many names page the full list once without '
+    'query instead of one call per name.')
 LIVE_CHAT_TYPES = ('private', 'group', 'channel')
 LIVE_FILTERS = ('documents', 'photos', 'links', 'voice')
 BATCH_LIMITATION = ('One row per ID: applied, refused, unknown or not_attempted; an uncertain ID is never retried.')
@@ -76,6 +98,13 @@ OPERATIONS = {
     'list_participants': _spec('groups-read', fields=_page),
     'get_reactions': _spec('read-live', 'message'),
     'get_message_info': _spec('read-live', 'message'),
+    INSPECT_BUTTONS: _spec('read-live', 'message', platforms=('telegram',), limitation=INSPECT_BUTTONS_LIMITATION),
+    PRESS_BUTTON: _spec('bot-press', 'message', mutation=True, platforms=('telegram',), fields={
+        'row': _field('integer', required=True, minimum=0, maximum=99),
+        'column': _field('integer', required=True, minimum=0, maximum=99),
+        'label': _field('string', required=True, maximum=128, nonempty=True),
+        'fp': _field('button_fp', required=True),
+        'acknowledge_uncertain': _field('operation_id')}, limitation=PRESS_BUTTON_LIMITATION),
     'get_pinned_messages': _spec('read-live', fields=_page, platforms=('whatsapp',)),
     'list_topics': _spec('groups-read', fields=_page, platforms=('telegram',)),
     'get_profile': _spec('profile-read', 'account', full_account=True),
@@ -190,7 +219,7 @@ OPERATIONS = {
 # open_chat_by_username are local writes (a lookup and an archived chat), the only non-mutations of an effect tool.
 OPERATION_TOOLS = {
     'change_message': ('edit_message', 'delete_message', 'send_reaction', 'vote_poll', 'pin_message',
-                       'unpin_message', 'star_message', 'unstar_message'),
+                       'unpin_message', 'star_message', 'unstar_message', PRESS_BUTTON),
     'manage_chat': ('open_chat_by_phone', 'open_chat_by_username', 'archive_chat', 'unarchive_chat', 'mute_chat', 'unmute_chat',
                     'pin_chat', 'unpin_chat', 'mark_read', 'mark_unread', 'set_chat_labels', 'create_group',
                     'rename_group', 'set_group_description', 'add_participant', 'remove_participant',
@@ -212,6 +241,7 @@ ADVANCED_ONLY = {
     'list_join_requests': _LIVE_READ, 'check_chat_link': _LIVE_READ,
     LIVE_SEARCH: 'messages_search with live (ANYM-478) is its everyday route',
     HISTORY: 'an archive backfill request, not a chat or contact change',
+    INSPECT_BUTTONS: 'a live read of one message\'s keyboard for a later press (ANYM-681); no risk-class tool reads chats',
     'get_profile': 'the owner\'s own account profile, not a contact',
     'update_profile': 'changes the owner\'s own profile seen by every contact; kept advanced',
 }
@@ -224,6 +254,8 @@ def operation_spec(name, platform=None):
     if name == HISTORY and platform == 'telegram':
         # ANYM-477: Telegram answers at once and changes nothing at the provider; WhatsApp asks the phone.
         spec.update(mutation=False, limitation=TELEGRAM_HISTORY_LIMITATION)
+    if name == 'list_contacts' and platform == 'telegram':
+        spec.update(limitation=CONTACTS_QUERY_LIMITATION)
     return spec
 
 
@@ -254,11 +286,18 @@ def _fields(platform, name, spec):
             {'phone': _field('phone', required=True),
              'first_name': _field('string', required=True, maximum=64, nonempty=True),
              'last_name': _field('string', default='', maximum=64)})
+    if platform == 'telegram' and name == 'list_contacts':
+        return {**spec['fields'], 'query': _field('string', maximum=64, nonempty=True)}
     if name == 'update_profile':
         names = ('name', 'status') if platform == 'whatsapp' else ('first_name', 'last_name', 'bio')
         return {n: _field('string', maximum=64 if n in ('name', 'first_name', 'last_name') else 139,
                          nonempty=n in ('name', 'first_name')) for n in names}
     return spec['fields']
+
+
+def platform_parameters(platform):
+    """The field names each operation of the platform's catalog accepts, as the manifest publishes them."""
+    return {name: set(_fields(platform, name, spec)) for name, spec in OPERATIONS.items() if platform in spec['platforms']}
 
 
 def _schema(platform, fields):
@@ -377,12 +416,28 @@ def parameter_format(platform, kind):
         'slow_mode_seconds': 'one of ' + ', '.join(map(str, SLOW_MODE_SECONDS)) + ' seconds; 0 turns slow mode off',
         'poll_options': '2-10 unique non-blank strings of at most 100 UTF-16 code units',
         'poll_indices': 'up to 20 unique integers from 0 to 9 (zero-based option positions)',
+        'button_fp': '32 lowercase hex characters: the fp of this button from inspect_message_buttons of the same message',
+        'operation_id': 'operation ID op_ plus 32 lowercase hex characters, from the earlier press receipt',
         'chat_types': '1-3 unique items of ' + ', '.join(LIVE_CHAT_TYPES),
         'search_filter': 'one of ' + ', '.join(LIVE_FILTERS),
         'timestamp': 'ISO 8601 date and time with a UTC offset, such as 2026-10-22T08:00:00Z; from_time is inclusive, '
             'to_time exclusive',
         'search_cursor': 'next_cursor of an earlier search_messages_live with the same account, chat_id and parameters',
         'label_ids': 'up to 20 unique label IDs of 1-64 letters, digits, _ or -, from get_labels'}.get(kind)
+
+
+def _contact_query_problem(value):
+    """ANYM-673: 1-64 characters after trim, no control character (tab, newline and C1 included), not only an @."""
+    def fail(reason, expected): return [field_error('query', reason, expected)]
+    if not isinstance(value, str): return fail('type', 'string')
+    try: value.encode('utf-8')
+    except UnicodeError: return fail('format', 'valid Unicode text')
+    if any(unicodedata.category(c) == 'Cc' for c in value):
+        return fail('pattern', 'no control characters')
+    text = value.strip()
+    if not normalize(text): return fail('blank', 'non-blank text')
+    if len(text) > 64: return fail('max_length', 'at most 64 characters after trimming')
+    return None
 
 
 def _problem(platform, descriptor, value, field):
@@ -429,7 +484,8 @@ def _problem(platform, descriptor, value, field):
         if not isinstance(value, str): return fail('type', 'string')
         return None if value in _modes(platform) else fail('enum', allowed=_modes(platform))
     pattern = {'upload_id': r'up_[a-f0-9]{32}', 'attachment_id': r'att_[a-f0-9]{32}', 'message_id': r'msg_[a-f0-9]{32}',
-        'sha256': r'[a-f0-9]{64}', 'phone': r'\+?[1-9][0-9]{4,19}',
+        'sha256': r'[a-f0-9]{64}', 'phone': r'\+?[1-9][0-9]{4,19}', 'button_fp': r'[a-f0-9]{32}',
+        'operation_id': r'op_[a-f0-9]{32}',
         'contact_id': r'[1-9][0-9]{0,18}' if platform == 'telegram' else r'[0-9]{1,30}@(c\.us|lid)'}.get(kind)
     if pattern:
         if not isinstance(value, str): return fail('type', 'string')
@@ -500,9 +556,9 @@ def validate_operation(platform, operation, parameters, *, provider=None):
                 if descriptor['default'] is None: continue
                 value = deepcopy(descriptor['default'])
             else: value = parameters[name]
-            problem = _problem(platform, descriptor, value, name)
+            problem = _contact_query_problem(value) if (operation, name) == ('list_contacts', 'query') else _problem(platform, descriptor, value, name)
             if problem: errors.extend(problem)
-            else: output[name] = (phone_digits(value)[0] if descriptor['type'] == 'phone_number' else
+            else: output[name] = (value.strip() if (operation, name) == ('list_contacts', 'query') else phone_digits(value)[0] if descriptor['type'] == 'phone_number' else
                 chat_link_key(platform, value) if descriptor['type'] == 'chat_link' else
                 telegram_username(value) if descriptor['type'] == 'telegram_username' else
                 timestamp(value) if descriptor['type'] == 'timestamp' else value)

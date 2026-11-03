@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from messaging_service.media_retry import MEDIA_MAX_ATTEMPTS
 from messaging_service.store import APIError
 from test_archive import archive as archive, event
 
@@ -68,7 +69,7 @@ def test_request_preserves_provider_backoff_and_terminal_failures(archive):
     with s.pool.connection() as c:
         assert c.execute('SELECT next_due FROM media_jobs WHERE id=%s',(fid,)).fetchone()['next_due']==due
         assert c.execute('SELECT requested_until FROM media_jobs WHERE id=%s',(fid,)).fetchone()['requested_until'] is None
-        c.execute("UPDATE media_jobs SET attempts=5,state='failed',error_code='retry_exhausted',requested_until=NULL WHERE id=%s",(fid,))
+        c.execute("UPDATE media_jobs SET attempts=%s,state='failed',error_code='retry_exhausted',requested_until=NULL WHERE id=%s",(MEDIA_MAX_ATTEMPTS,fid))
     result=s.request_file_download(key,fid)
     assert result['request_status']=='failed' and result['reason']=='retry_exhausted'
     with s.pool.connection() as c:

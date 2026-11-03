@@ -15,7 +15,9 @@ UNKNOWN_FLOOD_SECONDS=60
 # Per-scope admission: burst, refill seconds per request and requests per UTC day.
 # In memory: a collector restart resets them (MESSENGER_OPERATIONS.md).
 # ANYM-477: agent-requested chat history has its own scope, so its pause and budget never touch search.
-LIVE_BUDGETS={'search':(3,10.0,100),'chat_history':(3,10.0,300)}
+# ANYM-681: the inspection of a message's inline keyboard has its own scope as well.
+LIVE_BUDGETS={'search':(3,10.0,100),'chat_history':(3,10.0,300),'inspect_buttons':(3,10.0,300),
+    'press_button':(3,5.0,200)}
 # The deadline-bound CollectorState of the live read running in this task (release-042 B1).
 LIVE_STATE=contextvars.ContextVar('live_state',default=None)
 # A cooldown write is one transaction that PostgreSQL ends after this many seconds, so a stalled write

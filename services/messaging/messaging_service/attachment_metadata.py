@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from .file_index import file_response_fields
+from .media_retry import MEDIA_MAX_ATTEMPTS
 from .status_details import describe
 
 
@@ -65,8 +66,8 @@ def attachment_fields(row, *, original_present=None):
     state=row.get('job_state') or row.get('state') or row.get('status') or ('ready' if registered else 'unknown')
     expired_transfer=state=='leased' and row.get('transfer_active') is False
     if expired_transfer:
-        state='failed' if row.get('attempts',0)>=5 else 'queued'
-    diagnostic_state='failed' if state=='queued' and row.get('attempts',0)>=5 else state
+        state='failed' if row.get('attempts',0)>=MEDIA_MAX_ATTEMPTS else 'queued'
+    diagnostic_state='failed' if state=='queued' and row.get('attempts',0)>=MEDIA_MAX_ATTEMPTS else state
     filename=row.get('filename') if row.get('filename') is not None else descriptor.get('filename')
     mime=row.get('mime') if row.get('mime') is not None else descriptor.get('mime')
     size=row.get('bytes') if row.get('bytes') is not None else descriptor.get('bytes')

@@ -78,6 +78,29 @@ def test_capabilities_full_matches_previous_payload(seeded,monkeypatch):
     assert s.capabilities(key)==full
 
 
+# spec: ANYM-660
+def test_capabilities_sections_refusals_name_the_field_and_the_allowed_sections(seeded):
+    s,_,_=seeded
+    key=all_permissions_key(s)
+    names=s.capabilities(key,detail='summary')['sections']
+    with pytest.raises(APIError,match='invalid_filter') as unknown:s.capabilities(key,sections=['search_options','nope'])
+    assert unknown.value.field_errors==[{'field':'sections','reason':'enum','allowed':names}]
+    assert not hasattr(unknown.value,'hint')
+    with pytest.raises(APIError,match='invalid_filter') as empty:s.capabilities(key,sections=[])
+    assert empty.value.field_errors==[{'field':'sections','reason':'min_items'}]
+    assert empty.value.hint=='omit sections to get all sections'
+    # The backend refuses both for an MCP agent too (the gateway schema takes any list of strings): same body on REST.
+    headers={'Authorization':'Bearer '+key}
+    with TestClient(create_app(s,['testserver'])) as client:
+        body=client.post('/v1/capabilities',headers=headers,json={'sections':['nope']}).json()
+        assert body['error']=='invalid_filter' and body['field_errors']==unknown.value.field_errors and body['next_action']=='check_parameters'
+        assert tool_error(rpc(client,key,'capabilities',{'sections':['nope']}))['field_errors']==unknown.value.field_errors
+        # An empty list never reaches the backend over MCP or REST: the request schema (min_length 1) refuses it first,
+        # as invalid_parameters with its own field_errors; the min_items body above is the Store-level guard.
+        assert 'sections' in rpc(client,key,'capabilities',{'sections':[]}).json()['error']['data']['fields']
+        assert client.post('/v1/capabilities',headers=headers,json={'sections':[]}).json()['error']=='invalid_parameters'
+
+
 # spec: ANYM-270
 def test_capabilities_sections_return_named_blocks(seeded):
     s,_,_=seeded

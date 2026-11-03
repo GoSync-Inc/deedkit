@@ -346,6 +346,16 @@ def test_a_shard_fragment_may_report_only_its_python_check_of_verifys_commit(tmp
         tiden_ci.assemble(tmp_path / "foreign" / "ci-evidence", fragments, ATTEMPT_URL, PASSED)
 
 
+# spec: ANYM-578
+def test_malformed_checks_in_verifys_metadata_fail_before_the_evidence_directory_exists(tmp_path):
+    fragments = evidence_fragments(tmp_path)
+    path = fragments / "ci-evidence-verify" / "metadata.json"
+    path.write_text(json.dumps({**json.loads(path.read_text()), "checks": list(tiden_ci.CHECKS)}))
+    with pytest.raises(ValueError):
+        tiden_ci.assemble(tmp_path / "ci-evidence", fragments, ATTEMPT_URL, PASSED)
+    assert not (tmp_path / "ci-evidence").exists()
+
+
 def test_the_python_producer_names_every_shard_job_of_the_matrix(tmp_path):
     evidence_fragments(tmp_path)
     env = {"PATH": os.environ["PATH"], "GITHUB_REPOSITORY": "example/repo", "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "2"}

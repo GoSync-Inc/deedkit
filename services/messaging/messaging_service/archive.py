@@ -10,6 +10,8 @@ from time import monotonic
 
 from psycopg.types.json import Jsonb
 
+from .identifiers import ACCOUNT_RE
+from .media_retry import MEDIA_ATTEMPT_CAPS,MEDIA_MAX_ATTEMPTS,MEDIA_PERMANENT_CODES,MEDIA_RATE_LIMIT_FREE_DAYS,retry_delay
 from .envelope import canonical, fingerprint, stable_id, validate
 from .store import serial as serial
 from .incoming_formatting import known as known_formatting, unknown as unknown_formatting, wire_digest
@@ -115,7 +117,10 @@ def whatsapp_unreadable_shape(e):
         and not e['body'] and not e['media'] and not e['deleted'])
 
 
-def ingest_outcome(old,e,retained_snapshot,sender_alias=False):
+_SNAPSHOT=object()
+
+
+def ingest_outcome(old,e,retained_snapshot,sender_alias=False,retained_buttons=_SNAPSHOT):
     """What ingest does with the validated candidate `e` against the retained message row `old` (None: a new message)
     and the retained revision's snapshot: (outcome, sender_completed, sender_device_only, unreadable, sent_at_jitter,
     jitter_version, body_completed, web_preview_refresh, known_candidate, known_retained, old_format). The version a
@@ -129,6 +134,13 @@ def ingest_outcome(old,e,retained_snapshot,sender_alias=False):
     known_candidate=known_formatting(candidate_format);known_retained=known_formatting(old_format)
     formatting_changed=known_candidate and known_retained and candidate_format!=old_format
     formatting_completed=known_candidate and not known_retained
+    # A bot that replaces only its keyboard (same text, a later edit time) makes a new revision whose metadata
+    # carries the new `buttons`, or none when the edit removed it. A same-or-older version never rewrites it, so a
+    # re-read taken with the capture flag off cannot erase a keyboard (ANYM-658).
+    buttons_changed=bool(old and retained_snapshot and not old['deleted'] and not e['deleted'] and e['platform']=='telegram'
+        and old['provider_updated_at'] is not None and updated>old['provider_updated_at']
+        and (((retained_snapshot.get('metadata') or {}).get('buttons') if retained_buttons is _SNAPSHOT else retained_buttons)
+             !=(e.get('metadata') or {}).get('buttons')))
     sender_completed=bool(old and not old['sender'] and e['sender'] and not old['deleted']
         and not e['deleted'] and e['platform']=='telegram' and e['direction']=='outgoing'
         and e.get('metadata',{}).get('chat_type')=='private'
@@ -193,7 +205,7 @@ def ingest_outcome(old,e,retained_snapshot,sender_alias=False):
         elif web_preview_refresh:outcome='unchanged'
         elif (old['sent_at']!=datetime.fromisoformat(e['sent_at']) or old['direction']!=e['direction']
               or old['sender']!=e['sender']): outcome='conflict'
-        elif old['content_hash']==content and not (formatting_changed or formatting_completed): outcome='unchanged'
+        elif old['content_hash']==content and not (formatting_changed or formatting_completed or buttons_changed): outcome='unchanged'
         elif old['provider_updated_at'] and updated<old['provider_updated_at']: outcome='stale'
         elif old['content_hash']==content and formatting_completed:outcome='edited'
         elif (old['provider_updated_at']==updated and not e['deleted']): outcome='conflict'
@@ -202,6 +214,16 @@ def ingest_outcome(old,e,retained_snapshot,sender_alias=False):
     elif e['deleted']: outcome='deleted'
     return (outcome,sender_completed,sender_device_only,unreadable,sent_at_jitter,jitter_version,body_completed,
             web_preview_refresh,known_candidate,known_retained,old_format)
+
+
+def effective_buttons(c,mid,old,retained_snapshot):
+    """The keyboard the reads show for the retained revision: the current metadata row when it is that revision's
+    (a same-version re-read with the capture flag on completes it), else the revision's snapshot (ANYM-658)."""
+    if not old or not retained_snapshot or old['deleted']:return None
+    row=c.execute('SELECT metadata->\'buttons\' AS buttons FROM message_metadata WHERE message=%s AND revision=%s',
+                  (mid,old['revision'])).fetchone()
+    if row and row['buttons'] is not None:return row['buttons']
+    return (retained_snapshot.get('metadata') or {}).get('buttons')
 
 
 class Archive:
@@ -219,7 +241,7 @@ class Archive:
             audit(c,None,'set_sending','ok')
 
     def register(self,account,platform,label,*,synthetic=True,include_chats=(),exclude_chats=(),discover=False):
-        if not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',account) or platform not in ('telegram','whatsapp'):
+        if not ACCOUNT_RE.fullmatch(account) or platform not in ('telegram','whatsapp'):
             raise ValueError('invalid_account')
         if not discover and not include_chats: raise ValueError('empty_collection_policy')
         with self.store.pool.connection() as c:
@@ -293,7 +315,8 @@ class Archive:
                 e={**e,'deleted':True,'body':'','media':[],
                    'updated_at':max(tombstone,datetime.fromisoformat(e['updated_at'])).isoformat()}
                 if 'formatting' in e:e['formatting']=unknown_formatting()
-                if 'contact' in e.get('metadata',{}):e['metadata']={k:v for k,v in e['metadata'].items() if k!='contact'}
+                if 'contact' in e.get('metadata',{}) or 'buttons' in e.get('metadata',{}):
+                    e['metadata']={k:v for k,v in e['metadata'].items() if k not in ('contact','buttons')}
             if (identity_observations and not e['deleted']
                     and c.execute('SELECT 1 FROM messages WHERE id=%s AND NOT deleted',(mid,)).fetchone()):
                 # A capture's identity evidence that contradicts a recorded pair is kept as a fence
@@ -337,7 +360,8 @@ class Archive:
                     (mid,old['revision'])).fetchone()
                 retained_snapshot=retained['snapshot'] if retained else None
             (outcome,sender_completed,sender_device_only,unreadable,sent_at_jitter,jitter_version,body_completed,
-             web_preview_refresh,known_candidate,known_retained,old_format)=ingest_outcome(old,e,retained_snapshot,sender_alias)
+             web_preview_refresh,known_candidate,known_retained,old_format)=ingest_outcome(old,e,retained_snapshot,sender_alias,
+                effective_buttons(c,mid,old,retained_snapshot))
             if replay and outcome!='edited':raise ValueError('replay_not_accepted')
             # An incomplete observation of the same retained provider body must
             # not erase known formatting, including authenticated sender repair.
@@ -393,7 +417,10 @@ class Archive:
                     ON CONFLICT(message) DO UPDATE SET
                     revision=excluded.revision,
                     metadata=CASE WHEN message_metadata.revision=excluded.revision
-                        THEN message_metadata.metadata || jsonb_strip_nulls(excluded.metadata) ||
+                        -- A kept keyboard is never overwritten by a same-version observation: a different one is a
+                        -- later edit (ANYM-658), and only that makes a revision. A missing one is completed.
+                        THEN message_metadata.metadata || (jsonb_strip_nulls(excluded.metadata) -
+                            CASE WHEN message_metadata.metadata ? 'buttons' THEN ARRAY['buttons'] ELSE ARRAY[]::text[] END) ||
                             -- A sparser re-read of the same stated origin keeps the fields it already named;
                             -- a conflicting ID or time is another origin and replaces it.
                             CASE WHEN message_metadata.metadata->'forward_origin'->'kind'=excluded.metadata->'forward_origin'->'kind'
@@ -489,11 +516,11 @@ class Archive:
                 if account is None: raise ValueError('collector_account_required')
                 self.fence(c,account,collector_lease)
             if sweep:
-                # Attachment status already reports an expired fifth lease as
+                # Attachment status already reports an expired last-attempt lease as
                 # retry_exhausted until this sweep rewrites it.
                 c.execute("""UPDATE media_jobs SET state='failed',error_code='retry_exhausted',lease_until=NULL
-                    WHERE state='leased' AND attempts>=5 AND lease_until<clock_timestamp()
-                    AND (%s::text IS NULL OR account=%s)""",(account,account))
+                    WHERE state='leased' AND attempts>=%s AND lease_until<clock_timestamp()
+                    AND (%s::text IS NULL OR account=%s)""",(MEDIA_MAX_ATTEMPTS,account,account))
             # One fresh time, taken after the lock waits, bounds the prefetch and live
             # windows; unlike per-row clock_timestamp() it can bound an index range.
             now=c.execute('SELECT clock_timestamp() AS at').fetchone()['at']
@@ -523,7 +550,7 @@ class Archive:
                     m.sent_at>=%(now)s-%(live_window)s*interval '1 second' AND
                     m.sent_at<=%(now)s+interval '5 minutes',false) AS live_media,
                     COALESCE(j.requested_until>clock_timestamp(),false) AS requested,'''+MEDIA_TIER+''' AS tier) priority
-                WHERE p.enabled AND (%(account)s::text IS NULL OR j.account=%(account)s) AND j.attempts<5 AND
+                WHERE p.enabled AND (%(account)s::text IS NULL OR j.account=%(account)s) AND j.attempts<%(max_attempts)s AND
                 NOT m.deleted AND NOT(ch.provider_chat=ANY(p.exclude_chats)) AND
                 (p.discover_chats OR ch.provider_chat=ANY(p.include_chats)) AND
                 (%(since)s::timestamptz IS NULL OR m.sent_at>=%(since)s OR
@@ -545,7 +572,7 @@ class Archive:
                     CASE WHEN NOT priority.requested THEN m.sent_at END DESC,j.next_due,j.id
                 FOR UPDATE OF j SKIP LOCKED LIMIT 1''',
                 {'live_max':live_max,'live_window':live_window_seconds,'account':account,'since':since,
-                    'days':media_prefetch_days,'now':now,'backfill_ids':backfill_ids,**tiers}).fetchone()
+                    'days':media_prefetch_days,'now':now,'backfill_ids':backfill_ids,'max_attempts':MEDIA_MAX_ATTEMPTS,**tiers}).fetchone()
             if not job: return None
             expires=c.execute("SELECT clock_timestamp()+%s*interval '1 second' AS at",(ttl,)).fetchone()['at']
             reservation=None
@@ -578,13 +605,13 @@ class Archive:
                 JOIN chats ch ON ch.id=m.chat AND ch.account=j.account
                 CROSS JOIN LATERAL (SELECT '''+MEDIA_TIER+''' AS tier) priority
                 WHERE ((j.state='queued' AND j.next_due<=clock_timestamp()) OR
-                    (j.state='leased' AND j.lease_until<clock_timestamp())) AND j.attempts<5 AND
+                    (j.state='leased' AND j.lease_until<clock_timestamp())) AND j.attempts<%(max_attempts)s AND
                 (%(account)s::text IS NULL OR j.account=%(account)s) AND p.enabled AND NOT m.deleted AND
                 NOT(ch.provider_chat=ANY(p.exclude_chats)) AND (p.discover_chats OR ch.provider_chat=ANY(p.include_chats)) AND
                 (%(since)s::timestamptz IS NULL OR m.sent_at>=%(since)s) AND
                 m.sent_at<clock_timestamp()-%(days)s*interval '1 day' AND priority.tier<2
                 ORDER BY priority.tier,m.sent_at DESC,j.next_due,j.id LIMIT %(limit)s''',
-                {'account':account,'since':since,'days':days,'limit':BACKFILL_CANDIDATES,**tiers})]
+                {'account':account,'since':since,'days':days,'limit':BACKFILL_CANDIDATES,'max_attempts':MEDIA_MAX_ATTEMPTS,**tiers})]
 
     @contextmanager
     def _media_sweep(self,account):
@@ -709,7 +736,7 @@ class Archive:
     def fail_media(self,job,code,*,permanent=False,retry_after=None,collector_lease=None):
         from .operational import LOCAL_STORAGE_ERRORS,MEDIA_ERRORS
         allowed={'unavailable','size_limit','rate_limited','network_error','disk_reserve','paused_storage',
-            'integrity_error','storage_unavailable'}
+            'integrity_error','storage_unavailable','media_reference_expired'}
         if code not in allowed|MEDIA_ERRORS: raise ValueError('invalid_error_code')
         if retry_after is not None and (type(retry_after) is not int or not 1<=retry_after<2**31):
             raise ValueError('invalid_retry_delay')
@@ -720,12 +747,18 @@ class Archive:
             # Unwritable local storage is operator-fixable: it never consumes a
             # provider attempt or fails the original terminally.
             local_storage=code in LOCAL_STORAGE_ERRORS
-            attempts=max(0,row['attempts']-1) if local_pause or local_storage else row['attempts']
-            terminal=not (local_pause or local_storage) and (permanent or attempts>=5)
+            # A provider-requested wait is not a failure of the job: it gives the attempt back
+            # until the job is a week old, so a long FloodWait cannot exhaust the budget.
+            asked=code=='rate_limited' and retry_after is not None and not permanent and c.execute(
+                "SELECT created_at>clock_timestamp()-make_interval(days=>%s) AS young FROM media_jobs WHERE id=%s",
+                (MEDIA_RATE_LIMIT_FREE_DAYS,job['id'])).fetchone()['young']
+            attempts=max(0,row['attempts']-1) if local_pause or local_storage or asked else row['attempts']
+            terminal=not (local_pause or local_storage or asked) and (
+                permanent or code in MEDIA_PERMANENT_CODES or attempts>=MEDIA_ATTEMPT_CAPS.get(code,MEDIA_MAX_ATTEMPTS))
             stored='paused_storage' if local_pause else 'storage_unavailable' if code=='media_storage_unavailable' else code
+            wait=60 if local_pause else 300 if local_storage else retry_delay(attempts,retry_after)
             c.execute('''UPDATE media_jobs SET state=%s,error_code=%s,lease_until=NULL,attempts=%s,
                 next_due=clock_timestamp()+%s*interval '1 second' WHERE id=%s''',
-                ('failed' if terminal else 'queued',stored,attempts,
-                 60 if local_pause else 300 if local_storage else max(min(3600,10*2**attempts),retry_after or 0),job['id']))
+                ('failed' if terminal else 'queued',stored,attempts,wait,job['id']))
             from .storage_admission import StorageAdmission
             StorageAdmission.release(c,job)

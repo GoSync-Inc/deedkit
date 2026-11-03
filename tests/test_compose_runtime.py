@@ -16,6 +16,9 @@ import tempfile
 import uuid
 
 import pytest
+import yaml
+
+from scripts import production, publish_images
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -26,14 +29,14 @@ BASE = ["compose.yaml", "compose.collectors.yaml", "compose.whatsapp.yaml", "com
 NATIVE = "compose.whatsapp-native.yaml"
 APPLICATIONS = {"api", "telegram", "whatsapp1", "whatsapp2", "indexer", "enricher", "enricher-local",
                 "operator", "subscriptions", "file-lifecycle", "cold-archive", "cold-restore",
-                "file-understanding", "message-purge", "delivery", "delivery-egress"}
+                "file-understanding", "message-purge", "delivery", "delivery-egress", "enricher-mini"}
 COLLECTORS = {"telegram", "whatsapp1", "whatsapp2"}
 SECRET_DIRECTORIES = ["processing-locks", "telegram-session", "whatsapp1-session", "whatsapp2-session",
-                      "issued-keys", "cold-archive-identity", "cold-archive-ssh", "enrichment-models", "delivery-receivers"]
+                      "issued-keys", "cold-archive-identity", "cold-archive-ssh", "enrichment-models", "delivery-receivers", "inference"]
 SECRET_FILES = ["app.dsn", "collector.dsn", "indexer.dsn", "owner.dsn", "subscriptions.dsn", "enrichment.dsn",
                 "enrichment-local.dsn", "file-lifecycle.dsn", "cold-archive.dsn", "file-understanding.dsn", "message-purge.dsn",
                 "delivery.dsn", "delivery-policy.json",
-                "enrichment.keys", "enrichment.json", "enrichment-local.json", "file-understanding.json",
+                "enrichment.keys", "enrichment.json", "enrichment-local.json", "enrichment-mini.json", "file-understanding.json",
                 "cold-archive.json", "telegram.json", "telegram.credentials.json", "telegram.permit.json",
                 "whatsapp1.json", "whatsapp1.permit.json", "whatsapp2.json", "whatsapp2.permit.json"]
 # What the generated override may change in every application service; `ports` only for the api and
@@ -175,7 +178,7 @@ def assert_runtime(stack, declared, native):
     db = containers["db"]
     assert db["State"]["Running"]
     assert db["HostConfig"]["LogConfig"] == {"Type": "json-file", "Config": {"max-size": "5m", "max-file": "2"}}
-    assert networks_of(db) == {f"{stack.project}_backend", f"{stack.project}_delivery_db"}
+    assert networks_of(db) == {f"{stack.project}_backend", f"{stack.project}_delivery_db", f"{stack.project}_inference_db"}
     assert stack.network("backend")["Internal"] is True
     # ANYM-534/581: the dispatcher joins only internal networks; only the egress proxy joins the egress bridge.
     members = members_of(containers)
@@ -185,6 +188,12 @@ def assert_runtime(stack, declared, native):
     assert {name for name, joined in members.items() if f"{stack.project}_delivery_egress" in joined} == {"delivery-egress"}
     assert stack.network("delivery_db")["Internal"] is True and stack.network("delivery_proxy")["Internal"] is True
     assert stack.network("delivery_egress")["Internal"] is False
+    # ANYM-688: the mini-facing worker joins only its internal database network and its own egress bridge.
+    members = members_of(containers)
+    assert networks_of(containers["enricher-mini"]) == {f"{stack.project}_inference_db", f"{stack.project}_inference_egress"}
+    assert {name for name, joined in members.items() if f"{stack.project}_inference_db" in joined} == {"db", "enricher-mini"}
+    assert {name for name, joined in members.items() if f"{stack.project}_inference_egress" in joined} == {"enricher-mini"}
+    assert stack.network("inference_db")["Internal"] is True and stack.network("inference_egress")["Internal"] is False
     members = members_of(containers)
     assert {name for name, joined in members.items() if f"{stack.project}_collector_egress" in joined} == COLLECTORS
     assert {name for name, joined in members.items() if f"{stack.project}_cold_archive_egress" in joined} == {"cold-archive", "cold-restore"}
@@ -210,6 +219,141 @@ def assert_runtime(stack, declared, native):
         256 * 1024 * 1024, 32, 512)
     assert worker["HostConfig"]["Tmpfs"] == {"/tmp": "size=16m,noexec,nosuid"}
     return containers
+
+
+class ComposeLoader(yaml.SafeLoader):
+    """Reads Compose's `!override` and `!reset` tags without constructing Python objects."""
+
+
+ComposeLoader.add_constructor("!override", lambda loader, node: loader.construct_sequence(node)
+                              if isinstance(node, yaml.SequenceNode) else loader.construct_mapping(node))
+ComposeLoader.add_constructor("!reset", lambda loader, node: None)
+
+
+def overlay(name="compose.enrichment.yaml"):
+    return yaml.load((REPO / "deploy" / name).read_text(), Loader=ComposeLoader)
+
+
+def mini_service():
+    return overlay()["services"]["enricher-mini"]
+
+
+def services_on(network):
+    """Every service of any overlay that joins `network` (a service's lists merge across overlays)."""
+    found = set()
+    for path in sorted((REPO / "deploy").glob("compose*.yaml")):
+        for name, service in (yaml.load(path.read_text(), Loader=ComposeLoader).get("services") or {}).items():
+            if network in (service.get("networks") or []):
+                found.add(name)
+    return found
+
+
+# spec: ANYM-697
+def test_enricher_mini_has_a_tmpfs_for_a_200_mib_original_and_the_others_keep_128m():
+    assert mini_service()["tmpfs"] == ["/tmp:size=320m,noexec,nosuid"]
+    assert overlay()["x-enrichment-common"]["tmpfs"] == ["/tmp:size=128m,noexec,nosuid"]
+
+
+# spec: ANYM-688
+def test_enricher_mini_uses_a_published_build_target():
+    service = mini_service()
+    assert service["profiles"] == ["enrichment-mini"]
+    target = service["build"]["target"]
+    assert target == "enricher-local" and target in production.BUILDS and target in publish_images.TARGETS
+    assert service["image"].startswith("anymsg-enricher-local:")
+    # The `enricher` target is neither built nor published, and the mini service does not use it.
+    assert "enricher" not in production.BUILDS and "enricher" not in publish_images.TARGETS
+
+
+# spec: ANYM-688
+def test_mini_example_config_has_only_deedkit_inference_profiles(tmp_path):
+    from messaging_service.enrichment_providers import validate_profile
+    config = json.loads((REPO / "deploy" / "enrichment-mini.example.json").read_text())
+    assert config["enabled"] is False and set(config["profiles"]) == {"audio", "image", "document"}
+    key = tmp_path / "key"
+    key.write_text("synthetic-key")
+    key.chmod(0o600)
+    for kind, profile in config["profiles"].items():
+        assert profile["provider"] == "deedkit_inference" and profile["local_inference"] is True, kind
+        assert "allow_cloud" not in profile and profile["api_key_file"] == "/run/secrets/inference/inference.key", kind
+        # The real profile validation (ANYM-685) accepts it with the key path pointed at a synthetic file.
+        validate_profile({**profile, "api_key_file": str(key)}, kind)
+
+
+# spec: ANYM-688
+def test_enricher_mini_joins_only_inference_db_and_inference_egress():
+    service = mini_service()
+    assert sorted(service["networks"]) == ["inference_db", "inference_egress"]
+    assert "network_mode" not in service
+    egress = overlay()["networks"]["inference_egress"]
+    assert egress["driver"] == "bridge" and not egress.get("internal") and egress["enable_ipv6"] is False
+    assert egress["driver_opts"]["com.docker.network.bridge.name"] == "dk-inference0"
+    # No other service joins the egress bridge, and the worker is on neither `backend` nor `frontend`.
+    assert services_on("inference_egress") == {"enricher-mini"}
+    assert not {"backend", "frontend"} & set(service["networks"])
+
+
+# spec: ANYM-688
+def test_inference_db_is_internal_isolated_and_holds_only_db_and_the_worker():
+    network = overlay()["networks"]["inference_db"]
+    assert network["internal"] is True and network["enable_ipv6"] is False
+    assert network["driver_opts"] == {"com.docker.network.bridge.name": "dk-inferencedb0",
+                                      "com.docker.network.bridge.gateway_mode_ipv4": "isolated"}
+    assert overlay()["services"]["db"]["networks"] == ["inference_db"]
+    assert services_on("inference_db") == {"db", "enricher-mini"}
+
+
+# spec: ANYM-688
+def test_enricher_mini_has_no_ports_no_socket_ro_mounts_and_the_hardening():
+    service = mini_service()
+    assert not service.get("ports") and not service.get("expose")
+    assert not {"privileged", "cap_add", "pid", "ipc", "devices"} & set(service)
+    mounts = [mount for mount in service["volumes"] if isinstance(mount, dict)] + [
+        {"source": item.split(":")[0], "target": item.split(":")[1], "read_only": item.endswith(":ro")}
+        for item in service["volumes"] if isinstance(item, str)]
+    assert not any("docker.sock" in str(mount.get("source")) for mount in mounts)
+    by_target = {mount["target"]: mount for mount in mounts}
+    assert set(by_target) == {"/run/secrets/database_url", "/run/secrets/enrichment_config", "/run/secrets/inference",
+                              "/data", "/processing-locks"}
+    # Same as enricher-local: the files volume and the secrets read-only; the lock directory is the one writable bind.
+    for target in ("/run/secrets/database_url", "/run/secrets/enrichment_config", "/run/secrets/inference", "/data"):
+        assert by_target[target]["read_only"] is True, target
+    for target in ("/run/secrets/database_url", "/run/secrets/enrichment_config", "/run/secrets/inference", "/processing-locks"):
+        assert by_target[target]["bind"] == {"create_host_path": False}, target
+    assert not by_target["/processing-locks"].get("read_only")
+    assert by_target["/run/secrets/database_url"]["source"] == "./private/enrichment-local.dsn"
+    assert by_target["/run/secrets/enrichment_config"]["source"] == "./private/enrichment-mini.json"
+    assert service["read_only"] is True and service["user"] == "10001:10001" and service["cap_drop"] == ["ALL"]
+    assert service["security_opt"] == ["no-new-privileges:true"]
+    assert service["mem_limit"] and 0 < service["pids_limit"] <= 256 and service["cpus"]
+    assert all("noexec" in mount and "nosuid" in mount and "size=" in mount for mount in service["tmpfs"])
+    assert service["logging"] == {"driver": "json-file", "options": {"max-size": "5m", "max-file": "2"}}
+
+
+# spec: ANYM-688
+def test_key_is_mounted_as_a_directory_not_a_single_file():
+    key = [m for m in mini_service()["volumes"] if isinstance(m, dict) and m["target"].startswith("/run/secrets/inference")]
+    # A bind-mounted file keeps the old inode after an atomic replace; a directory shows the rotated key.
+    assert len(key) == 1 and key[0]["source"] == "./private/inference" and key[0]["target"] == "/run/secrets/inference"
+    assert not any(str(m.get("target", "")).endswith(".key") for m in mini_service()["volumes"] if isinstance(m, dict))
+    config = json.loads((REPO / "deploy" / "enrichment-mini.example.json").read_text())
+    assert {p["api_key_file"] for p in config["profiles"].values()} == {"/run/secrets/inference/inference.key"}
+
+
+# spec: ANYM-688
+def test_enricher_mini_pins_the_mini_name_and_sets_dns():
+    from ipaddress import ip_address, ip_network
+    from urllib.parse import urlsplit
+    service = mini_service()
+    config = json.loads((REPO / "deploy" / "enrichment-mini.example.json").read_text())
+    host = urlsplit(config["profiles"]["audio"]["base_url"]).hostname
+    assert len(service["extra_hosts"]) == 1
+    pinned = re.fullmatch(r"([^:]+):\$\{INFERENCE_MINI_IP:-([0-9.]+)\}", service["extra_hosts"][0].replace(
+        "${INFERENCE_MINI_NAME:-" + host + "}", host))
+    assert pinned and pinned.group(1) == host and host.endswith(".ts.net")
+    assert ip_address(pinned.group(2)) in ip_network("100.64.0.0/10")
+    # The resolver is the mini's address too: any lookup but the pinned one goes where the host rules drop it.
+    assert service["dns"] == ["${INFERENCE_MINI_IP:-" + pinned.group(2) + "}"]
 
 
 # spec: ANYM-417

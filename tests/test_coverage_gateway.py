@@ -538,7 +538,7 @@ def test_catalog_covers_explicit_families_and_provider_differences():
     whatsapp = {row['operation']: row for row in operation_manifest('whatsapp')}
     families = {
         'read-live': ['chat_info', 'get_reactions', 'get_message_info', 'get_pinned_messages', 'request_chat_history',
-                      'search_messages_live'],
+                      'search_messages_live', 'inspect_message_buttons'],
         'groups-read': ['list_participants', 'list_topics', 'list_join_requests', 'check_chat_link'],
         'profile-read': ['get_profile'], 'contacts-read': ['list_contacts', 'get_contact', 'list_blocked', 'get_labels'],
         'send': ['send_file', 'forward_message', 'send_poll', 'send_contact', 'send_location', 'open_chat_by_phone',
@@ -554,7 +554,7 @@ def test_catalog_covers_explicit_families_and_provider_differences():
                           'set_group_info_admins_only', 'set_slow_mode', 'set_join_approval',
                           'approve_join_requests', 'reject_join_requests', 'join_chat'],
         'contacts-manage': ['add_contact', 'delete_contact', 'block_contact', 'unblock_contact'],
-        'profile-manage': ['update_profile'],
+        'profile-manage': ['update_profile'], 'bot-press': ['press_button'],
     }
     assert set(telegram) == set(whatsapp) == {name for names in families.values() for name in names}
     for permission, names in families.items():

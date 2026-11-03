@@ -281,7 +281,7 @@ An unexpired explicit original request is selected ahead of automatic prefetch,
 including outside its rolling window and below `history_since` (owner decision
 2026-10-23, ANYM-477; the run never claims such a job by itself). It does not override
 collection/account/chat access, deleted or superseded revisions, the attempt cap,
-provider cooldown, file-size limits or storage admission. Outside-window jobs
+provider cooldown (a rate-limit wait; a long transient backoff does yield to the request), file-size limits or storage admission. Outside-window jobs
 remain queued without consuming a provider attempt. Requests do not reset failed
 or exhausted jobs; originals may no longer be available from the provider.
 
@@ -449,6 +449,46 @@ retries every 5 minutes, and account media operations report
 described above: an aged-out job resumes only on request). Fix the storage path,
 then downloads resume on their own. Jobs recorded as `network_error` before this
 classification keep their recorded code.
+
+Provider attempt budget (ANYM-699; before it the budget was five attempts in about five
+minutes). A job is claimed only while `attempts<MEDIA_MAX_ATTEMPTS` (8, `media_retry.py`), and
+every claim adds one attempt. A transient failure (`network_error`, a lost adapter or
+`provider_disconnected`, a reply timeout, `media_timeout`, `integrity_error` and the other typed
+media codes that are not permanent) re-queues the job after attempt 1 to 7 with these waits:
+30 s, 5 min, 30 min, 2 h, 6 h, 12 h, 12 h (32.6 h in total), each lengthened by at most 10 %
+jitter and never shortened. The eighth failure, or a permanent code (`unavailable`, `size_limit`,
+and the typed codes in the collector's permanent list), makes the job `failed`; a crashed attempt
+whose lease expires spends its attempt the same way, and the expired lease of the eighth goes
+`failed` with `retry_exhausted`. A provider-requested wait (`rate_limited` with a
+`retry_after`) spends no attempt and sets `next_due` to at least that wait; once the job is
+older than 7 days (`created_at`) it spends one again, so no job waits forever. The storage
+pauses above also give the attempt back. A job waiting out a backoff never blocks another job
+(the claim takes the next due one), and an explicit `request_file_download` makes a job whose
+backoff is an hour or longer due at once, without an attempt, also while an earlier request
+window is open (`coalesced`), except while a provider `rate_limited` wait runs (then the request
+is `deferred`). The wake is the SQL function `wake_media_job` (migration 066; the gateway role
+holds only EXECUTE on it, not UPDATE on `next_due`); before 066 the request is still recorded
+and the job keeps waiting. The same migration raises the cap of `queue_managed_original` to 8. Nothing re-queues a `failed` job,
+and a request does not (above); rows that failed under the old five-attempt budget stay
+`failed` until the operator recovery of DK-05. The code stored on a job is the last failure's.
+`network_error` is the catch-all for a failure that has no typed code: a lost adapter, a reply
+timeout and an unclassified error. A Telegram file reference that expired during the download
+is `media_reference_expired`: every attempt reads the message again, so it is retried twice (30 s, then
+5 min) and a third failure makes the job `failed` (`MEDIA_ATTEMPT_CAPS`, `media_retry.py`); it never
+follows the 32.6 h schedule. Rows stored before this code carry `network_error`. A WhatsApp media
+code the adapter returns (for example `media_network_error`, `media_timeout`) is stored as that
+code. So a `failed` original with `network_error` or `rate_limited` is not proof the provider no
+longer has the file. Attachment status reports `queued`, not `failed`, while attempts remain;
+`operations.media.retry_queued_jobs` counts the waiting jobs.
+
+`outside_history_bounds` is deliberate (ANYM-477), not a failure. Such a job is
+`queued`, is never claimed by the collector alone, does not set `needs_attention`
+(only `terminal_failed_jobs` does) and is counted in `operations.media` as
+`outside_history_bounds_jobs`, apart from `eligible_queued_jobs`; an explicit
+`request_file_download` fetches it. The raw `files.download` counters group by job
+state only, so these jobs are included in `queued` there, and `download_errors` keeps
+the last code of a queued job (for example an old `rate_limited`). Read the eligible
+subset from `operations.media`, not from `files.download.queued`.
 
 Media reservation expiry follows the media lease and is renewed with it.
 Expiry, edit/delete supersession, successful completion and failure release

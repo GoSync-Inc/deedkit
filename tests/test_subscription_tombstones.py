@@ -324,6 +324,37 @@ def test_unfinished_hint_or_disabled_retention_keeps_the_closed_definition(seede
 
 
 # spec: ANYM-447
+def test_each_retirement_batch_rechecks_the_tombstone_gate_after_selection(seeded):
+    store, _, _ = seeded
+    _, sid, _ = acked_subscription(store, name='tombstone-recheck-open')
+    old = hints(store, sid, ['delivered'], '40 days')
+    closed_token, closed_sid, closed_events = acked_subscription(store, name='tombstone-recheck-closed')
+    close(store, closed_token, closed_sid)
+    backdate(store, closed_sid, 'closed_at', '31 days')
+
+    def candidate(c, subscription):
+        row = c.execute('SELECT id,principal FROM subscriptions WHERE id=%s', (subscription,)).fetchone()
+        return {'id': row['id'], 'principal': row['principal']}
+
+    def gate(value):
+        with store.pool.connection() as c:
+            c.execute("UPDATE probe_metadata SET value=%s WHERE name=%s", (value, subscriptions.TOMBSTONE_GATE))
+    # The candidates were selected while both gates were on; the tombstone gate goes off before their batches.
+    gate('disabled')
+    with store.pool.connection() as c:
+        assert subscriptions._retire_hints(c, candidate(c, sid)) is None
+        assert subscriptions._retire_definition(c, candidate(c, closed_sid)) is None
+    assert outbox(store, sid) == old and refs(store, closed_sid) == closed_events
+    assert column(store, closed_sid, 'tombstoned_at') is None
+    # With the gate back on, the same two batches delete: the recheck above was the gate, nothing else.
+    gate('enabled')
+    with store.pool.connection() as c:
+        assert subscriptions._retire_hints(c, candidate(c, sid))['hints'] == 1
+        assert subscriptions._retire_definition(c, candidate(c, closed_sid))['rows'] > 0
+    assert outbox(store, sid) == []
+
+
+# spec: ANYM-447
 def test_dynamic_counts_and_visibility_survive_hint_deletion_and_the_tombstone(seeded):
     store, _, _ = seeded
     store.set_dynamic_subscriptions(True)

@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import re
 from uuid import uuid4
 
 from hypothesis import given, settings, strategies as st
@@ -501,6 +502,121 @@ def test_definer_function_enforces_the_same_schema_as_the_contract(modules):
                 event['urgency'], event['expires_at'])).fetchone()['ok']
             assert python == database == name.startswith('valid_'), name
     assert {event['type'] for name, event in _mutations().items() if name.startswith('valid_')} == set(KINDS)
+
+
+CAUSES = ('geo_permission_missing', 'invalid_destination', 'destination_not_reachable', 'destination_not_dialable',
+    'destination_unverified', 'source_number_invalid', 'destination_blocked', 'rate_limited', 'provider_auth_failed',
+    'provider_rejected_other', 'call_failed_other')
+
+
+def failed_event(seq=1, **data):
+    """A call.failed event: today's three keys plus whatever provider keys the case names."""
+    base = {'call_id': 'call-1', 'status': 'finished', 'end_reason': 'provider_rejected'}
+    return {**call_event(seq), 'type': 'call.failed', 'data': {**base, **data}}
+
+
+def _provider_error_cases():
+    ok = {'provider_cause': 'geo_permission_missing', 'provider_code': 21215}
+    valid = {'three_keys': {}, 'five_keys': ok, 'cause_only': {'provider_cause': 'call_failed_other'},
+        'code_smallest': {**ok, 'provider_code': 1}, 'code_largest': {**ok, 'provider_code': 999999},
+        **{f'cause_{cause}': {'provider_cause': cause, 'provider_code': 21215} for cause in CAUSES}}
+    refused = {'cause_capital': {**ok, 'provider_cause': 'Geo_permission'}, 'cause_space': {**ok, 'provider_cause': 'a b'},
+        'cause_digit_first': {**ok, 'provider_cause': '1abc'}, 'cause_empty': {**ok, 'provider_cause': ''},
+        'cause_too_long': {**ok, 'provider_cause': 'a' * 49}, 'cause_number': {**ok, 'provider_cause': 5},
+        'cause_null': {**ok, 'provider_cause': None}, 'code_zero': {**ok, 'provider_code': 0},
+        'code_above_range': {**ok, 'provider_code': 1000000}, 'code_negative': {**ok, 'provider_code': -1},
+        'code_text': {**ok, 'provider_code': '21215'}, 'code_float': {**ok, 'provider_code': 21215.0},
+        'code_fraction': {**ok, 'provider_code': 21215.5}, 'code_bool': {**ok, 'provider_code': True},
+        'code_null': {**ok, 'provider_code': None}, 'code_without_cause': {'provider_code': 21215},
+        'unknown_key': {**ok, 'provider_text': 'x'}, 'provider_error_object': {'provider_error': ok}}
+    return valid, refused
+
+
+# spec: ANYM-695
+def test_call_failed_provider_keys_are_one_contract_in_the_python_check_and_the_definer_function(modules):
+    store = modules[0]
+    valid, refused = _provider_error_cases()
+    assert not set(valid) & set(refused)
+    with store.pool.connection() as c:
+        for name, data in {**valid, **refused}.items():
+            event = failed_event(1, **data)
+            try:
+                validate_event(event)
+                python = True
+            except ModuleContractError:
+                python = False
+            database = c.execute('SELECT public.module_event_valid(%s,%s,%s,%s,%s,%s,%s,%s) AS ok', (event['id'],
+                event['source'], event['type'], event['subject'], event['time'], json.dumps(event['data']),
+                event['urgency'], event['expires_at'])).fetchone()['ok']
+            assert python == database == (name in valid), name
+
+
+# spec: ANYM-695
+def test_a_five_key_call_failed_publishes_beside_the_three_key_one(modules):
+    store = modules[0]
+    three = failed_event(1)
+    five = failed_event(2, provider_cause='geo_permission_missing', provider_code=21215)
+    assert validate_event(five) == 2
+    assert [publish(store, three), publish(store, five)] == [1, 2]
+    assert publish(store, five) == 2
+    with store.pool.connection() as c:
+        stored = [row['data'] for row in c.execute('SELECT data FROM module_events ORDER BY seq')]
+    assert stored == [three['data'], five['data']]
+    with pytest.raises(errors.CheckViolation, match='invalid_module_event'):
+        with store.pool.connection() as c:
+            c.execute('SELECT public.publish_module_event(%s,%s,%s,%s,%s,%s,%s,%s,%s)', ('calls:9', 'deedkit:calls',
+                'call.failed', 'call-1', 'owner-calls', '2026-10-29T10:00:00Z',
+                json.dumps({**three['data'], 'provider_code': 21215}), 'batch', None))
+
+
+# spec: ANYM-695
+def test_the_python_kinds_and_the_newest_sql_spec_agree_on_keys_optional_keys_and_subject_for_every_kind():
+    newest = [path for path in sorted((SOURCE / 'migrations').glob('*.sql'))
+        if 'FUNCTION public.module_event_valid(' in path.read_text()][-1]
+    found = re.search(r"specs constant jsonb := '(\{.*?\})';", newest.read_text(), re.S)
+    spec = json.loads(found[1])
+    assert set(spec) == set(KINDS)
+    for kind, (checks, optional, subject) in KINDS.items():
+        assert (set(spec[kind]['keys']), set(spec[kind]['optional']), spec[kind]['subject']) == (
+            set(checks), set(optional), subject), kind
+
+
+# spec: ANYM-695
+def test_schema65_replaces_only_the_validator_function_keeps_its_acl_and_is_repeatable(modules):
+    from messaging_service import store as store_module
+    store = modules[0]
+    root = Path(store_module.__file__).parent / 'migrations'
+    old = (root / '056_module_events.sql').read_text()
+    start = old.index('CREATE FUNCTION public.module_event_valid(')
+    previous = old[start:old.index('REVOKE ALL ON FUNCTION public.module_event_valid', start)]
+    previous = previous.replace('CREATE FUNCTION', 'CREATE OR REPLACE FUNCTION', 1)
+    five = failed_event(1, provider_cause='geo_permission_missing', provider_code=21215)
+    function = "'public.module_event_valid(text,text,text,text,text,jsonb,text,text)'::regprocedure"
+    def accepts(c, event):
+        return c.execute('SELECT public.module_event_valid(%s,%s,%s,%s,%s,%s,%s,%s) AS ok', (event['id'],
+            event['source'], event['type'], event['subject'], event['time'], json.dumps(event['data']),
+            event['urgency'], event['expires_at'])).fetchone()['ok']
+    with store.pool.connection() as c:
+        # Synthetic disposable database only: the schema-64 function, ledger and version.
+        c.execute(previous)
+        assert accepts(c, failed_event(1)) and not accepts(c, five)
+        c.execute('DELETE FROM archive_migrations WHERE version IN (65,66)')
+        c.execute("UPDATE probe_metadata SET value='64' WHERE name='schema_version'")
+        acl = c.execute(f'SELECT proacl::text AS acl, proowner::regrole::text AS owner FROM pg_proc WHERE oid={function}').fetchone()
+        grants = c.execute("SELECT oid,relacl::text FROM pg_class WHERE relnamespace='public'::regnamespace ORDER BY oid").fetchall()
+    store.migrate()
+    store.migrate()
+    with store.pool.connection() as c:
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '66'
+        assert c.execute('SELECT count(*) AS n FROM archive_migrations WHERE version=65').fetchone()['n'] == 1
+        assert accepts(c, five) and accepts(c, failed_event(1))
+        assert not accepts(c, failed_event(1, provider_code=21215)) and not accepts(c, failed_event(1, provider_text='x'))
+        assert c.execute(f'SELECT proacl::text AS acl, proowner::regrole::text AS owner FROM pg_proc WHERE oid={function}').fetchone() == acl
+        assert c.execute("SELECT oid,relacl::text FROM pg_class WHERE relnamespace='public'::regnamespace ORDER BY oid").fetchall() == grants
+    # The data bound of migration 056 stays, and the migration changes no table, column, index or grant.
+    text = (root / '065_call_failed_provider_error.sql').read_text()
+    assert 'octet_length(p_data::text)>1024' in text
+    assert not re.search(r'\b(GRANT|REVOKE|CREATE\s+TABLE|CREATE\s+INDEX|ALTER\s+TABLE|DROP|INSERT|UPDATE|DELETE)\b', text, re.I)
 
 
 # spec: ANYM-562

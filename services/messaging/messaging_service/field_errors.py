@@ -23,6 +23,31 @@ def field_error(field, reason, expected=None, allowed=None):
             **({'allowed': list(allowed)[:MAX_ALLOWED]} if allowed else {})}
 
 
+def refusal(code, errors, *, hint=None, next_action=None):
+    """An APIError that names each bad parameter (ANYM-660); `hint` and `next_action` are reviewed constants."""
+    from .store import APIError
+    failure = APIError(code)
+    failure.field_errors = one_per_field(field_error(*e) for e in errors)
+    if hint: failure.hint = hint
+    if next_action: failure.next_action = next_action
+    return failure
+
+
+DATE_RANGE_HINT = 'swap the bounds or widen the range; the range is half-open and must not be empty'
+CURSOR_EXPECTED = 'a next_cursor returned by the same call with the same filters and order'
+
+
+def date_range_refusal():
+    """invalid_date_range for from_time >= to_time, the same body at every raise site."""
+    return refusal('invalid_date_range', [('to_time', 'minimum', 'later than from_time')], hint=DATE_RANGE_HINT)
+
+
+def cursor_refusal():
+    """invalid_cursor: malformed, made for other filters or tampered; the cursor holds only a one-way fingerprint,
+    so which of these it was is not said (ANYM-307)."""
+    return refusal('invalid_cursor', [('after', 'format', CURSOR_EXPECTED)], next_action='restart_query_without_cursor')
+
+
 def one_per_field(errors):
     """First entry per field path, in the given order, at most MAX_FIELD_ERRORS."""
     seen = set()

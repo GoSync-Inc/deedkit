@@ -3,6 +3,8 @@ from importlib import import_module
 
 import pytest
 
+from messaging_service.media_retry import MEDIA_MAX_ATTEMPTS
+
 from test_archive import archive as archive, event
 
 
@@ -347,7 +349,7 @@ def test_managed_redownload_preserves_terminal_backoff_and_provider_absence(arch
     api.LifecycleWorker(s).run_once(apply=True)
     with s.pool.connection() as c:
         if case=='failed':c.execute("UPDATE media_jobs SET state='failed',error_code='integrity_error',attempts=3 WHERE id=%s",(fid,))
-        if case=='exhausted':c.execute('UPDATE media_jobs SET attempts=5 WHERE id=%s',(fid,))
+        if case=='exhausted':c.execute('UPDATE media_jobs SET attempts=%s WHERE id=%s',(MEDIA_MAX_ATTEMPTS,fid))
         if case=='cooldown':c.execute("UPDATE media_jobs SET next_due=now()+interval '3 hours',error_code='rate_limited' WHERE id=%s",(fid,))
     result=s.request_file_download(key,fid)
     if case in ('failed','exhausted'):assert result['request_status']=='failed'
@@ -633,7 +635,10 @@ def test_explicit_policy_expires_old_unprocessed_media_without_fabricating_detai
     'grant','text_lease','asr_lease','understanding_lease','shared_recent_source'])
 def test_unprocessed_policy_preserves_current_use_pins_fences_and_shared_recent_sources(archive,blocker):
     _,s,key,_=archive;fid,blob=old_unprocessed(archive);api=lifecycle()
-    if blocker=='shared_recent_source':stored(archive,mid='shared-recent')
+    if blocker=='shared_recent_source':
+        shared,_=stored(archive,mid='shared-recent')  # event() carries a fixed 2026-10-01 sent_at: make it recent now
+        with s.pool.connection() as c:
+            c.execute("UPDATE messages SET sent_at=clock_timestamp() WHERE id=(SELECT message FROM attachments WHERE id=%s)",(shared,))
     if blocker=='grant':s.get_attachment(key,fid)
     with s.pool.connection() as c:
         if blocker in ('grant','shared_recent_source'):

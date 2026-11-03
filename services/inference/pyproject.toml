@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "deedkit-inference"
+version = "0.1.0"
+description = "Shared local inference service for the Mac mini: per-service keys, bounded queue, admission"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "fastapi==0.143.0", "starlette==1.8.0",
+  "pydantic>=2.12,<3", "uvicorn==0.54.0", "python-multipart==0.0.33",
+]
+
+[project.scripts]
+deedkit-inference = "deedkit_inference.cli:main"
+
+[dependency-groups]
+dev = ["pytest==9.1.1", "ruff==0.15.7"]
+# The real engines (ANYM-683). Apple silicon only: `uv sync --locked --group dev` on Linux installs none of them and
+# CI runs the engines against the fake runtime. The mini installs with `uv sync --locked --group engines`.
+engines = [
+  "mlx-vlm==0.7.11; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "mlx-whisper==0.4.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "onnx-asr==0.12.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "onnxruntime==1.31.1; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "huggingface-hub==2.4.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[tool.uv]
+# Wheels with locked hashes only: no third-party sdist is ever built on the mini (a build runs arbitrary code).
+# The project itself is built (editable), so this names every locked package instead of `no-build = true`;
+# tests/test_engines_dependencies.py keeps the list equal to uv.lock.
+no-build-package = [
+  "aiohappyeyeballs", "aiohttp", "aiosignal", "annotated-doc", "annotated-types", "anyio", "attrs",
+  "certifi", "cffi", "charset-normalizer", "click", "colorama", "cryptography", "datasets", "dill",
+  "fastapi", "filelock", "flatbuffers", "frozenlist", "fsspec", "h11", "hf-xet", "httpcore2", "httpx2",
+  "huggingface-hub", "idna", "iniconfig", "jinja2", "llguidance", "llvmlite", "markdown-it-py", "markupsafe",
+  "mdurl", "miniaudio", "mlx", "mlx-audio", "mlx-metal", "mlx-vlm", "mlx-whisper", "more-itertools",
+  "mpmath", "multidict", "multiprocess", "networkx", "numba", "numpy", "onnx-asr", "onnxruntime",
+  "opencv-python", "opentelemetry-api", "packaging", "pandas", "pillow", "pluggy", "propcache", "protobuf",
+  "pyarrow", "pycparser", "pydantic", "pydantic-core", "pygments", "pytest", "python-dateutil",
+  "python-multipart", "pyyaml", "regex", "requests", "rich", "ruff", "safetensors", "scipy", "sentencepiece",
+  "setuptools", "shellingham", "sounddevice", "starlette", "sympy", "tiktoken", "tokenizers", "torch",
+  "tqdm", "transformers", "truststore", "typer", "typing-extensions", "typing-inspection", "tzdata",
+  "urllib3", "uvicorn", "websockets", "xxhash", "yarl",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/deedkit_inference"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::pytest.PytestUnraisableExceptionWarning"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# The canary generator keeps the research scripts' compact one-line statements.
+"tests/canary/generate.py" = ["E401", "E701", "E702"]

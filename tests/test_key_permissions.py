@@ -39,3 +39,16 @@ def test_new_key_cannot_grant_permissions_outside_principal(seeded):
     with pytest.raises(ValueError, match='invalid_key_permissions'):
         s.issue_key('agent-a', ['telegram-demo', 'whatsapp-demo-1'],
                     key_permissions=['groups-manage'])
+
+
+# spec: ANYM-676
+def test_bot_press_is_never_inherited_and_must_be_named_in_the_ceiling(seeded):
+    from messaging_service.policy import effective_permissions
+    assert effective_permissions(['read', 'bot-press', 'webview-open'], None) == ['read']
+    s, old, _ = seeded
+    s.set_access('agent-a', permissions=['read', 'bot-press'])
+    assert s.capabilities(old)['permissions'] == ['read']  # an existing key gains nothing
+    named = s.issue_key('agent-a', ['telegram-demo', 'whatsapp-demo-1'], key_permissions=['read', 'bot-press'])
+    assert s.capabilities(named)['permissions'] == ['bot-press', 'read']
+    credential = s.capabilities(old)['credential_id']
+    assert s.set_key_permissions(credential, ['read', 'bot-press'])['permissions'] == ['bot-press', 'read']

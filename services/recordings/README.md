@@ -72,8 +72,9 @@ this module name. Configure its existing private policy with:
 Backend permissions/account ceilings still apply. `recordings:content` alone does
 not grant metadata or content. Existing profiles gain nothing automatically.
 Use `/mcp/modules/recordings`, or select recordings on the common MCP route.
-The source package is run explicitly; the Compose launcher has no recordings
-manifest/image in this slice. No production configuration is changed by install.
+The source package is run explicitly. Production runs it as the published `recordings` image through
+`deploy/compose.recordings.yaml` (docs/operations/production.md, "Recordings"); nothing there is enabled by
+install or merge. No production configuration is changed by install.
 Undo: remove the module/tools/grants/credential from the policy before gateway
 downgrade, then stop only this owned service. Revoke the key in Omi separately if
 needed. Configuration/key/grant removal is checked on the next backend request;
@@ -200,7 +201,9 @@ to each account to be archived:
 }
 ```
 
-This is a fragment, merged with the configuration above. `archive_namespace`
+This is a fragment, merged with the configuration above. In the container image the configuration
+directory is `/run/deedkit/recordings` (read-only) and the archive directory is `/data/archive`; the
+`/private/...` paths in these examples are for a source run (`deploy/recordings-archive.example.json`). `archive_namespace`
 is 32 lowercase hexadecimal characters, generated once per provider identity.
 Keep it across token rotation. **When reusing a local account ID for another
 provider identity, generate a new namespace.** The service cannot infer whether

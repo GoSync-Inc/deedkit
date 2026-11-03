@@ -118,9 +118,9 @@ Synthetic tests do not establish that live quiescence.
 If current and candidate SQL inventories differ, complete a separate reviewed
 compatibility and migration plan before enrollment. Verify that the pinned
 backup and restore runtimes support the current database schema and the planned
-target schema. An additive release needs no pre-migration backup: the daily
+target schema. A low or medium release needs no pre-migration backup or copy: the latest verified daily
 backup is its restore point ([production.md](production.md#migration-releases-and-the-backup-gate)
-item 3). For a contract or destructive release, resolve receiver capacity or delivery failures such as
+item 3, "Migration risk tiers"). For a dangerous release, resolve receiver capacity or delivery failures such as
 `receiver_quota` through a reviewed storage/retention operation that preserves
 the protected restore anchor. Then obtain a fresh compatible pre-migration
 snapshot with confirmed durable delivery. Retain its ID, snapshot time, schema,
@@ -159,7 +159,8 @@ revision labels alone cannot prove clean source. `check-image` is a local
 diagnostic and cannot authorize enrollment. Preparation starts no serving units.
 
 The [operator](../../scripts/seamless_release.py) exposes `bootstrap`, `prepare`,
-`promote`, `retire` and `status`; use `--help` from the reviewed checkout. Commands
+`promote`, `retire`, `status` and `clean` (the containers of retired generations,
+production.md "Image retention"); use `--help` from the reviewed checkout. Commands
 coordinate with both the canonical host deployment lock and scoped state lock.
 Keep resolved Compose/policy files, socket directories and journals out of Git
 and distribution artifacts.
@@ -184,6 +185,12 @@ Neither control surface is available through public HTTP or agent tools.
   never force-stop them to satisfy a timeout.
 - Rollback is a new reviewed routing decision. Drained processes cannot simply
   reactivate; an image rollback implies no database or state rollback.
+
+- Retired generations keep nothing a rollback needs: a drained generation cannot
+  reactivate. The serving generation and its one previous generation keep their
+  containers; the exited containers of older generations are removed by receipt ID
+  after a complete retirement (`clean`, and automatically after `retire` and before
+  a deploy's disk check). Volumes, networks and images are not touched here.
 
 Synthetic CI verifies ordering, isolation, request leases, slow-header handoff,
 issuer routing, streamed transfers, admission fences, drift and failure receipts.

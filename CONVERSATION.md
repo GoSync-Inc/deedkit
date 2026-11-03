@@ -29,7 +29,10 @@ In the conversation view each message tool returns every message text once.
   when it locates a match inside a long text. Attachments, owner mentions,
   replies, delivery state, `order_status="ambiguous"` and integrity problems
   appear only when they apply. `conversation_view` keeps warnings and the
-  untrusted-content marker, without the transcript. `get_context` returns the
+  untrusted-content marker, without the transcript (ANYM-667: `contract_version`, `order`,
+  `content_is_untrusted` and `warnings` when any; `detail="full"` adds `view` and `system_filter`, and
+  each message's `evidence` states `provider_currentness_verified`; the `result_evidence` and `search` blocks of `search` and
+  `get_messages` are described in [SEARCH.md](SEARCH.md#compact-search-shape-anym-667)). `get_context` returns the
   anchor once, in `message`; `context_window.anchor_index` is its position among
   the `context` neighbours. `list_chats` groups the reply hint into one
   `awaiting_reply` object and shows the latest message once in `last_message`.

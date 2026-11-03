@@ -74,6 +74,8 @@ GRANT SELECT ON attachment_residency,attachment_eviction_journal,
     attachment_understanding,file_understanding_profiles TO messaging_gateway;
 GRANT EXECUTE ON FUNCTION public.touch_original(text,bigint) TO messaging_gateway;
 GRANT EXECUTE ON FUNCTION public.queue_managed_original(text) TO messaging_gateway;
+-- ANYM-699: an explicit request wakes one queued job that waits out a long retry backoff (066).
+GRANT EXECUTE ON FUNCTION public.wake_media_job(text) TO messaging_gateway;
 -- Cold-first rehydration (ANYM-350): queue a restore of a verified R2 copy.
 -- Without these grants the request path keeps the provider re-download.
 GRANT SELECT ON attachment_cold_copies TO messaging_gateway;

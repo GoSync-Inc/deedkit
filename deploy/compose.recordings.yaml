@@ -1,0 +1,78 @@
+# The recordings backend (ANYM-711): Omi and PLAUD reads for the gateway, optional text archive. Nothing here is
+# enabled by itself: it needs the private configuration directory, a policy grant and a first start by hand
+# (docs/operations/production.md, "Recordings"). The container joins no `integration` network: the gateway reaches it
+# only over the internal `recordings-backend` network (created once by hand, no host address on its bridge), and
+# its one way out is the filtered bridge `recordings-egress` (ANYM-712; the host rules come first).
+name: deedkit-recordings
+services:
+  recordings-api:
+    image: deedkit-recordings:${DEEDKIT_VERSION:-0.1.0}
+    build: {context: ../services/recordings}
+    volumes:
+      # The DIRECTORY, never a single file: an atomic replace inside it reaches the running service.
+      - ${RECORDINGS_STATE_DIR:?Set the private recordings configuration directory}:/run/deedkit/recordings:ro
+      - recordings-data:/data
+    networks:
+      recordings-backend:
+        aliases: [recordings-api]
+      recordings-egress: {}
+    # Docker's embedded resolver then queries this server from the container's own namespace, where the bridge rules apply
+    # (without it the host's resolvers are queried from the host namespace, outside them). The same address the host rules
+    # allow (RECORDINGS_RESOLVER in the host env file).
+    dns: ["${RECORDINGS_RESOLVER:?Set the DNS resolver the host rules allow}"]
+    restart: unless-stopped
+    environment:
+      # ANYM-712: the service refuses to bind its port unless the host egress rules are in force (production.md,
+      # "Recordings"): every BLOCKED target (IP:PORT with a known listener, or dns:IP; the list must include the canary 192.0.2.254:9) must get no answer, every OPEN
+      # target (HOST:PORT, or dns:RESOLVER_IP) must answer. Both lists are required: a missing one refuses the start.
+      RECORDINGS_EGRESS_ADMISSION: required
+      RECORDINGS_EGRESS_BLOCKED: ${RECORDINGS_EGRESS_BLOCKED:?Set the blocked egress probe targets (IP:PORT, comma-separated)}
+      RECORDINGS_EGRESS_OPEN: ${RECORDINGS_EGRESS_OPEN:?Set the open egress probe targets (HOST:PORT or dns:IP, comma-separated)}
+    # Liveness only: one unauthenticated POST must be refused with 401, which proves the app answers without
+    # any key and without contacting a vendor. Prints nothing.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.error, urllib.request
+          try:
+              request = urllib.request.Request("http://127.0.0.1:13234/v1/capabilities", data=b"{}", method="POST",
+                                               headers={"Content-Type": "application/json"})
+              urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=8)
+              healthy = False
+          except urllib.error.HTTPError as error:
+              healthy = error.code == 401
+          except Exception:
+              healthy = False
+          sys.exit(0 if healthy else 1)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    read_only: true
+    user: "10001:10001"
+    cpu_shares: 512
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:size=16m,noexec,nosuid"]
+    mem_limit: 256m
+    pids_limit: 96
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options: {max-size: 5m, max-file: "2"}
+volumes:
+  recordings-data: {}
+networks:
+  # Created once by hand: docker network create --internal -o com.docker.network.bridge.name=dk-recbackend0
+  #   -o com.docker.network.bridge.gateway_mode_ipv4=isolated deedkit-recordings-backend
+  recordings-backend:
+    external: true
+    name: ${RECORDINGS_BACKEND_NETWORK:-deedkit-recordings-backend}
+  recordings-egress:
+    driver: bridge
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: dk-recordings0

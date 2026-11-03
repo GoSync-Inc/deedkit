@@ -1,0 +1,46 @@
+{
+  "enabled": false,
+  "accounts": [
+    "replace-with-account-id"
+  ],
+  "max_jobs_per_day": 20,
+  "profiles": {
+    "audio": {
+      "provider": "deedkit_inference",
+      "local_inference": true,
+      "model": "audio-default",
+      "base_url": "https://deedkit-inference.example-tailnet.ts.net/v1",
+      "api_key_file": "/run/secrets/inference/inference.key",
+      "timeout_seconds": 900,
+      "max_audio_seconds": 14400,
+      "max_input_bytes": 209715200
+    },
+    "image": {
+      "provider": "deedkit_inference",
+      "local_inference": true,
+      "model": "vision-default",
+      "base_url": "https://deedkit-inference.example-tailnet.ts.net/v1",
+      "api_key_file": "/run/secrets/inference/inference.key",
+      "timeout_seconds": 300,
+      "max_output_tokens": 2000
+    },
+    "document": {
+      "provider": "deedkit_inference",
+      "local_inference": true,
+      "model": "vision-default",
+      "base_url": "https://deedkit-inference.example-tailnet.ts.net/v1",
+      "api_key_file": "/run/secrets/inference/inference.key",
+      "timeout_seconds": 300,
+      "max_text_chars": 40000,
+      "max_output_tokens": 2000
+    }
+  },
+  "profile_max_jobs_per_day": {
+    "audio": 12,
+    "image": 4,
+    "document": 4
+  },
+  "account_max_jobs_per_day": {
+    "replace-with-account-id": 20
+  }
+}

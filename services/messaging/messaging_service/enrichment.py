@@ -18,15 +18,19 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from .enrichment_providers import ModelError, infer, private_text, profile_hash, validate_profile
+import math
+
+from .enrichment_providers import ModelBackpressure, ModelError, infer, private_text, profile_hash, validate_profile
 from . import resource_admission
 from . import processing_events
+from . import inference_confinement
+from .inference_confinement import ConfinementLost
 
 
 def configuration(path):
     raw=json.loads(private_text(path,65536))
     if not isinstance(raw,dict) or set(raw)-{'enabled','profiles','max_jobs_per_day','accounts',
-            'profile_max_jobs_per_day','account_max_jobs_per_day'}:
+            'profile_max_jobs_per_day','account_max_jobs_per_day','confinement_blocked'}:
         raise ValueError('invalid_enrichment_config')
     if raw.get('enabled') is not True:raise ValueError('enrichment_disabled')
     profiles=raw.get('profiles')
@@ -42,6 +46,7 @@ def configuration(path):
         if (not isinstance(limits,dict) or set(limits)-set(allowed)
                 or any(type(value) is not int or not 1<=value<=10000 for value in limits.values())):
             raise ValueError('invalid_enrichment_budget')
+    if 'confinement_blocked' in raw:inference_confinement.parse_targets(raw['confinement_blocked'])
     return {**raw,'max_jobs_per_day':maximum,'profiles':{k:validate_profile(v,k) for k,v in profiles.items()}}
 
 
@@ -53,17 +58,22 @@ def verified_copy(files,row,directory,maximum):
     out=Path(directory)/'original';sha=hashlib.sha256();total=0
     with os.fdopen(fd,'rb') as f,out.open('xb') as target:
         st=os.fstat(f.fileno())
-        if not stat.S_ISREG(st.st_mode) or st.st_size!=row['bytes'] or st.st_size>maximum:
-            raise ModelError('original_size_limit')
+        # `original_size_limit` means only "larger than the profile's max_input_bytes" and is final for the profile
+        # (FINAL_LIMIT_CODES); a file that is not what the row recorded is an integrity problem and stays retryable.
+        if not stat.S_ISREG(st.st_mode) or st.st_size!=row['bytes']:raise ModelError('original_integrity_error')
+        if st.st_size>maximum:raise ModelError('original_size_limit')
         while b:=f.read(65536):
             total+=len(b)
-            if total>maximum:raise ModelError('original_size_limit')
+            if total>row['bytes']:raise ModelError('original_integrity_error')  # grew while it was read
             sha.update(b);target.write(b)
     if total!=row['bytes'] or sha.hexdigest()!=digest:raise ModelError('original_integrity_error')
     return out
 
 
 MAX_RESULT_BYTES=8*1024**2
+# A file that can never pass these limits fails once: `claim` does not take the row again while its profile hash is
+# unchanged, and the event says `retryable` false. Editing the profile (a new hash) is the way back (ANYM-702).
+FINAL_LIMIT_CODES=('original_size_limit','audio_duration_limit','audio_transcode_size_limit')
 
 
 def child_limits(profile):
@@ -86,6 +96,15 @@ class WorkerStopping(Exception):
 STOP=threading.Event()
 CHILDREN=set()
 REQUEUE_SECONDS=30
+BACKPRESSURE_CAP_SECONDS=900
+
+
+def cooldown_seconds(profile,retry_after):
+    """The pause for a deferred job: the service's Retry-After when it is a usable number, else the profile's
+    `backpressure_seconds` (default 120); never more than BACKPRESSURE_CAP_SECONDS, never less than one."""
+    if type(retry_after) in (int,float) and math.isfinite(retry_after) and retry_after>=0:seconds=math.ceil(retry_after)
+    else:seconds=profile.get('backpressure_seconds',120)
+    return max(1,min(seconds,BACKPRESSURE_CAP_SECONDS))
 
 
 def kill_group(child):
@@ -140,14 +159,18 @@ def process(files,row,profile):
             import re
             code=result['error']
             if not isinstance(code,str) or not re.fullmatch('[a-z_]{1,64}',code):code='model_process_failed'
+            if code=='model_backpressure':  # the child could not reach the mini, or the mini said "not now"
+                hint=result.get('retry_after')
+                raise ModelBackpressure(hint if type(hint) in (int,float) else None)
             raise ModelError(code)
         result['truncated']=bool(result.get('truncated')) or input_truncated
         return result
 
 
 class EnrichmentWorker:
-    def __init__(self,dsn,files,config,*,processor=process,lock_directory=None):
+    def __init__(self,dsn,files,config,*,processor=process,lock_directory=None,confinement=None):
         self.dsn,self.files,self.config,self.processor=dsn,Path(files),config,processor
+        self.confinement=confinement
         self.lock_directory=lock_directory or os.environ.get('PROCESSING_LOCK_DIR','/processing-locks')
     def connection(self):
         return psycopg.connect(self.dsn,row_factory=dict_row,connect_timeout=5,
@@ -243,11 +266,12 @@ class EnrichmentWorker:
                     LEFT JOIN processing_control pc ON pc.account=m.account AND pc.kind=%s AND pc.profile_hash=%s
                     WHERE '''+PROCESSABLE_ORIGINAL+''' AND (pc.pause_reason IS NULL OR pc.paused_until<=clock_timestamp()) AND a.active AND NOT m.deleted AND e.source_digest=a.digest AND e.source_revision=m.revision
                     AND m.account=ANY(%s) AND '''+condition+''' AND e.next_due<=clock_timestamp()
-                    AND ((e.state IN ('unconfigured','queued','failed') AND (e.attempts<3 OR e.profile_hash IS DISTINCT FROM %s))
+                    AND ((e.state IN ('unconfigured','queued','failed') AND (e.attempts<3 OR e.profile_hash IS DISTINCT FROM %s)
+                            AND NOT (e.state='failed' AND coalesce(e.error_code,'')=ANY(%s) AND e.profile_hash IS NOT DISTINCT FROM %s))
                         OR (e.state='leased' AND e.lease_until<clock_timestamp() AND e.attempts<3)
                         OR (e.state='unsupported' AND e.profile_hash IS DISTINCT FROM %s))
                     ORDER BY fresh DESC,last_started_at,m.sent_at DESC,a.id LIMIT 1 FOR UPDATE OF e SKIP LOCKED''',
-                    (kind,ph,eligible,ph,ph)).fetchone()
+                    (kind,ph,eligible,ph,list(FINAL_LIMIT_CODES),ph,ph)).fetchone()
                 if row:candidates.append((row,kind,profile,ph))
             candidates.sort(key=lambda item:(not item[0]['fresh'],item[0]['last_started_at'],-item[0]['sent_at'].timestamp()))
             for row,kind,profile,ph in candidates:
@@ -262,6 +286,7 @@ class EnrichmentWorker:
                         provider=%s,model=%s,attempts=CASE WHEN profile_hash IS DISTINCT FROM %s THEN 1 ELSE attempts+1 END,
                         lease_token=%s,lease_until=clock_timestamp()+make_interval(secs=>%s),updated_at=clock_timestamp()
                         WHERE attachment=%s''',(kind,ph,profile['provider'],profile['model'],ph,token,ttl,row['attachment']))
+                    claim_day=c.execute('SELECT current_date AS day').fetchone()['day']
                     c.execute('UPDATE enrichment_budget SET attempts=attempts+1 WHERE day=current_date')
                     c.execute('''INSERT INTO processing_budget(day,account,kind,profile_hash,attempts)
                         VALUES(current_date,%s,%s,%s,1) ON CONFLICT(day,account,kind,profile_hash)
@@ -275,7 +300,7 @@ class EnrichmentWorker:
                     raise
                 return {**row,'kind':kind,'provider':profile['provider'],'model':profile['model'],
                     'attempts':1 if row['profile_hash']!=ph else row['attempts']+1,
-                    'lease_token':token,'profile_hash':ph,'_resource_lease':resource_lease},profile
+                    'lease_token':token,'profile_hash':ph,'_resource_lease':resource_lease,'_claim_day':claim_day},profile
         return None
     def finish(self,row,result=None,error=None):
         try:return self._finish(row,result,error)
@@ -325,7 +350,7 @@ class EnrichmentWorker:
                         'model_auth_failed','codex_private_auth_required','codex_chatgpt_login_required',
                         'codex_login_check_failed',
                         'codex_cli_unavailable','codex_upgrade_required','invalid_model_key',
-                        'local_model_not_installed','audio_tools_unavailable','retry_exhausted'))
+                        'local_model_not_installed','audio_tools_unavailable','retry_exhausted')+FINAL_LIMIT_CODES)
             resource_admission.release(c,row.get('_resource_lease'))
             if finished and error:resource_admission.pause_profile(c,row['account'],row['kind'],row['profile_hash'],error)
             return finished
@@ -353,12 +378,47 @@ class EnrichmentWorker:
             # The child group is already gone; only now drop the inherited OS lock.
             lease=row.get('_resource_lease')
             if lease:lease.close()
+    def _defer(self,row,profile,retry_after):
+        seconds=cooldown_seconds(profile,retry_after)
+        with self.connection() as c:
+            from .file_lifecycle import lifecycle_lock
+            lifecycle_lock(c)
+            # The lock the claim takes: a claim and a deferral of one scope never interleave.
+            c.execute('SELECT pg_advisory_xact_lock(74509139)')
+            gave_back=c.execute('''UPDATE attachment_enrichment SET state='queued',error_code='model_backpressure',
+                attempts=greatest(attempts-1,0),lease_token=NULL,lease_until=NULL,
+                next_due=clock_timestamp(),updated_at=clock_timestamp()
+                WHERE attachment=%s AND state='leased' AND lease_token=%s''',(row['attachment'],row['lease_token'])).rowcount
+            if gave_back:  # only the holder of the lease: a replay or a late answer after a new lease changes nothing
+                day=row.get('_claim_day')
+                c.execute('UPDATE enrichment_budget SET attempts=greatest(attempts-1,0) WHERE day=coalesce(%s::date,current_date)',(day,))
+                c.execute('''UPDATE processing_budget SET attempts=greatest(attempts-1,0)
+                    WHERE day=coalesce(%s::date,current_date) AND account=%s AND kind=%s AND profile_hash=%s''',
+                    (day,row['account'],row['kind'],row['profile_hash']))
+                resource_admission.defer_profile(c,row['account'],row['kind'],row['profile_hash'],seconds)
+            resource_admission.release(c,row.get('_resource_lease'))
+    def defer(self,row,profile,retry_after=None):
+        """The mini cannot take the job now: give it back without an attempt or a budget count, and pause the scope.
+
+        Like the stop path, a lock wait or an uncertain commit is retried for REQUEUE_SECONDS; the token-matched
+        UPDATE makes a replay harmless."""
+        deadline=time.monotonic()+REQUEUE_SECONDS
+        try:
+            while True:
+                try:return self._defer(row,profile,retry_after)
+                except psycopg.Error:
+                    if time.monotonic()>=deadline:raise
+                    time.sleep(1)
+        finally:
+            lease=row.get('_resource_lease')
+            if lease:lease.close()
     def once(self):
         claim=self.claim()
         if not claim:return False
         row,profile=claim
         try:self.finish(row,self.processor(self.files,row,profile))
         except WorkerStopping:self.requeue(row)
+        except ModelBackpressure as exc:self.defer(row,profile,exc.retry_after)
         except ModelError as exc:self.finish(row,error=exc.code)
         except Exception as error:
             from .telemetry import capture
@@ -366,13 +426,23 @@ class EnrichmentWorker:
             self.finish(row,error='enrichment_failed')
         return True
     def run(self):
+        guard=self.confinement
+        if guard:
+            # ANYM-688: a worker that sends files to the mini proves it cannot leave its network before it
+            # publishes a profile or claims anything (raises ConfinementLost; nothing was published yet), and
+            # again before every claim older than the guard's freshness and in the background.
+            guard.ensure()
+            guard.start_monitor(request_stop)
         try:
             while not STOP.is_set():
+                if guard:guard.ensure()
                 self.publish_profiles()
                 if not self.once():STOP.wait(10)
         finally:
             # Also when the stop path itself fails: never keep advertising a worker that is going away.
+            if guard:guard.stop_monitor()
             self.unpublish_profiles()
+        if guard and guard.lost:raise ConfinementLost(guard.lost)
 
 
 def main():
@@ -386,6 +456,7 @@ def main():
             encoded=json.dumps(result,ensure_ascii=False).encode()
             if len(encoded)>MAX_RESULT_BYTES:raise ModelError('model_response_too_large')
             sys.stdout.buffer.write(encoded)
+        except ModelBackpressure as exc:print(json.dumps({'error':exc.code,'retry_after':exc.retry_after}))
         except ModelError as exc:print(json.dumps({'error':exc.code}))
         except Exception:print(json.dumps({'error':'enrichment_failed'}))
         return
@@ -393,8 +464,13 @@ def main():
     from .telemetry import configure
     configure('enricher')
     cfg=configuration(args.config)
-    worker=EnrichmentWorker(private_text(os.environ['DATABASE_URL_FILE']).strip(),os.environ['PROBE_FILES'],cfg)
+    guard=inference_confinement.Confinement(inference_confinement.mini_hosts(cfg),blocked=inference_confinement.blocked_targets(cfg)) if inference_confinement.required(cfg) else None
+    worker=EnrichmentWorker(private_text(os.environ['DATABASE_URL_FILE']).strip(),os.environ['PROBE_FILES'],cfg,confinement=guard)
     for sig in (signal.SIGINT,signal.SIGTERM):signal.signal(sig,lambda *_:request_stop())
-    worker.run()
+    try:worker.run()
+    except ConfinementLost as lost:
+        # Names of the failed checks only; the worker has claimed nothing (or stopped claiming) and exits non-zero.
+        print(json.dumps({'error':'confinement_not_effective','checks':lost.args[0]}),file=sys.stderr)
+        sys.exit(inference_confinement.EXIT_CODE)
 
 if __name__=='__main__':main()

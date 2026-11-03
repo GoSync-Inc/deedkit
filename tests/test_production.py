@@ -1,6 +1,7 @@
 """Promotion guards use synthetic GitHub/Compose responses; no live runtime access."""
 import contextlib
 import copy
+from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import importlib.util
@@ -665,6 +666,25 @@ def test_production_messaging_stages_end_with_the_source_revision():
         assert stages[stage][-2:] == ["ARG DEEDKIT_SOURCE_SHA", "ENV DEEDKIT_SOURCE_SHA=$DEEDKIT_SOURCE_SHA"], stage
         assert sum("DEEDKIT_SOURCE_SHA" in line for line in stages[stage]) == 2, stage
     assert {target for target, build in p.BUILDS.items() if build[1] == "services/messaging/Dockerfile"} == set(MESSAGING_STAGES)
+
+
+# spec: ANYM-662
+@pytest.mark.parametrize("dockerfile", ["services/gateway/Dockerfile", "services/calendar/Dockerfile", "services/calls/Dockerfile"])
+def test_gateway_calendar_and_calls_images_end_with_the_source_revision(dockerfile):
+    # production.py already passes the build argument to every target; the final stage must keep it as ENV so the
+    # service can report its build. It sits after the build layers so they stay cached; the calls image keeps CMD
+    # last (test_coverage_deployment pins it).
+    lines = (ROOT / dockerfile).read_text().replace("\\\n", " ").splitlines()
+    final = []
+    for line in (value.strip() for value in lines):
+        if not line or line.startswith("#"):
+            continue
+        if line.upper().startswith("FROM "):
+            final = []
+        final.append(line)
+    pair = ["ARG DEEDKIT_SOURCE_SHA", "ENV DEEDKIT_SOURCE_SHA=$DEEDKIT_SOURCE_SHA"]
+    assert any(final[i:i + 2] == pair for i in range(len(final))) and sum("DEEDKIT_SOURCE_SHA" in line for line in final) == 2
+    assert final.index(pair[0]) > max(i for i, line in enumerate(final) if line.startswith(("COPY ", "RUN ")))
 
 
 # spec: ANYM-300
@@ -2697,16 +2717,18 @@ class Deployer:
         for module, name in ((p, "prepare"), (p, "apply"), (p, "rollback"), (s, "prepare"), (s, "promote"),
                              (s, "retire")):
             monkeypatch.setattr(module, name, self.step(module is s, name))
-        self.retained = []
-        def retain(settings, *, held=()):
-            self.retained.append(held)
+        self.retained, self.preflight = [], []
+        def retain(settings, *, held=(), **extra):
+            # ANYM-689: the preflight pass before the disk check passes a deadline; the post-release pass never does.
+            (self.preflight if extra else self.retained).append(held)
             return {"removed": [], "failed": [], "kept": 2}
         monkeypatch.setattr(p, "retain_images", retain)
 
     def current(self, sha):
         p.write(self.state / "current.json", {"sha": sha, "status": "applied", "ci": {"url": "https://example.invalid"},
                                               "rollback": {"version": 1, "projects": [
-                                                  {"name": "synthetic", "after_digest": p.digest(self.document)}]}})
+                                                  {"name": project["name"], "after_digest": p.digest(self.document)}
+                                                  for project in self.settings["projects"]]}})
         (self.state / sha).mkdir(exist_ok=True)
         p.write(self.state / sha / "prepared.json", {"sha": sha, "config_digest": p.digest(self.settings)})
 
@@ -2980,6 +3002,103 @@ def test_deploy_pauses_when_the_configuration_changed_since_the_current_release(
         host.http["http_release"]["drain_timeout"] = 1
     outcome = host.deploy()
     assert outcome["status"] == "halted" and "changed since" in outcome["reason"] and host.steps == []
+
+
+# spec: ANYM-711
+def test_recordings_enrollment_and_undo_are_hand_releases_through_both_plans(tmp_path, monkeypatch):
+    third = "3" * 40
+    host = Deployer(tmp_path, monkeypatch, history=(NEWER, NEWEST, third), green=(NEWER, NEWEST, third))
+    unrelated = copy.deepcopy(host.settings["projects"])
+    overlay = str(tmp_path / "compose.gateway-recordings.yaml")
+    project = host.settings["projects"][0]  # the same dict serves plan A and plan B
+    project["files"].append(overlay)
+    host.settings["projects"].append({"name": "deedkit-recordings", "directory": str(tmp_path),
+                                      "files": [str(tmp_path / "compose.recordings.yaml")],
+                                      "services": {"recordings-api": "recordings"}})
+    # Both configurations changed: autodeploy halts before any step and leaves the pause file.
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and "changed since" in outcome["reason"] and host.steps == []
+    assert host.paused() == outcome["reason"]
+    # A dry run under the pause file answers `paused` before it looks at drift.
+    assert host.deploy(dry_run=True)["status"] == "paused"
+    # The hand release: plan A, then plan B (promote re-records the HTTP digest), then the pause goes.
+    for step, configuration in ((p.prepare, host.settings), (p.apply, host.settings),
+                                (host.s.prepare, host.http), (host.s.promote, host.http)):
+        step(configuration, NEWER)
+    assert [name for name, _ in host.steps] == ["prepare", "apply", "seamless prepare", "seamless promote"]
+    p.PAUSE.unlink()
+    assert p.read(host.http_state / "http-current.json")["config_digest"] == p.digest(host.http)
+    plan = host.deploy(dry_run=True)
+    assert plan["status"] != "halted" and "changed since" not in json.dumps(plan)
+    # Undo: the configurations go back; autodeploy halts again and does not undo anything itself.
+    project["files"].remove(overlay)
+    host.settings["projects"] = [project]
+    host.steps.clear()
+    halted = host.deploy()
+    assert halted["status"] == "halted" and "changed since" in halted["reason"] and host.steps == []
+    # The undo is a release at a SHA newer than any prepared with recordings, through both plans.
+    for step, configuration in ((p.prepare, host.settings), (p.apply, host.settings),
+                                (host.s.prepare, host.http), (host.s.promote, host.http)):
+        step(configuration, third)
+    p.PAUSE.unlink()
+    assert host.deploy() == {"status": "current", "sha": third}
+    assert host.settings["projects"] == unrelated
+
+
+# spec: ANYM-711
+def test_enrollment_and_the_fresh_sha_undo_pass_the_real_preparation_guards(tmp_path, monkeypatch):
+    # The real prepare(), receipt files and drift check; only the Docker, git and registry calls are the fixture's.
+    settings, _, _ = fixture(tmp_path, monkeypatch)
+    second, third = "2" * 40, "3" * 40
+    fixture_run = p.run
+    stores, wanted = {}, [SHA]  # one synthetic image store per commit: identities, revision labels and recipes per target
+    def routed(argv, **kwargs):
+        if "FETCH_HEAD" in argv:
+            return wanted[0]
+        store = stores.setdefault(wanted[0], ImageStore())
+        if argv[:2] in (["docker", "pull"], ["docker", "tag"], ["docker", "run"]) or argv[:3] in (
+                ["docker", "image", "ls"], ["docker", "image", "inspect"]):
+            try:
+                return store.run(argv, **kwargs)
+            except (KeyError, StopIteration):
+                pass  # an image the store never held (the running container's): the fixture answers
+        return fixture_run(argv, **kwargs)
+    monkeypatch.setattr(p, "run", routed)
+    monkeypatch.setattr(p, "published", lambda target, sha: stores.setdefault(sha, ImageStore()).published(target, sha))
+    plain_digest = p.settings_digest(settings)
+    state = Path(settings["state_directory"])
+    p.prepare(settings, SHA)
+    assert p.read(state / SHA / "prepared.json")["config_digest"] == plain_digest
+    (tmp_path / "recordings.json").write_text(json.dumps({"name": "deedkit-recordings", "services": {
+        "recordings-api": {"image": "old", "build": {"context": "/unused"}}}}))
+    enrolled = copy.deepcopy(settings)
+    enrolled["projects"][0]["files"].append(str(tmp_path / "compose.gateway-recordings.yaml"))
+    enrolled["projects"].append({"name": "deedkit-recordings", "directory": str(tmp_path),
+                                 "files": [str(tmp_path / "recordings.json")], "services": {"recordings-api": "recordings"}})
+    (tmp_path / "compose.gateway-recordings.yaml").write_text("{}")
+    assert p.settings_digest(enrolled) != plain_digest
+    current = {"sha": SHA, "rollback": {"projects": []}}
+    assert "production configuration changed since" in p.configuration_drift(enrolled, {}, current, {})
+    # The enrollment release prepares both projects at a SHA not prepared before.
+    wanted[:] = [second]
+    receipt = p.prepare(enrolled, second)
+    assert [item["name"] for item in receipt["projects"]] == ["synthetic", "deedkit-recordings"]
+    assert p.read(state / second / "prepared.json")["config_digest"] == p.settings_digest(enrolled)
+    # The undo cannot reuse the enrolled SHA; a newer one prepares the plain configuration again.
+    with pytest.raises(p.Refused, match="already exists"):
+        p.prepare(settings, second)
+    wanted[:] = [third]
+    undo = p.prepare(settings, third)
+    assert [item["name"] for item in undo["projects"]] == ["synthetic"]
+    assert p.read(state / third / "prepared.json")["config_digest"] == plain_digest
+
+
+# spec: ANYM-711
+def test_a_sha_prepared_with_recordings_cannot_be_prepared_again(tmp_path, monkeypatch):
+    settings, _, _ = fixture(tmp_path, monkeypatch)
+    p.prepare(settings, SHA)
+    with pytest.raises(p.Refused, match="already exists"):
+        p.prepare(settings, SHA)
 
 
 def test_a_failed_health_wait_rolls_back_once_and_pauses(tmp_path, monkeypatch):
@@ -3714,6 +3833,322 @@ def test_a_failed_image_removal_or_summary_leaves_the_deploy_deployed_without_a_
         assert outcome["image_removal"] == {"skipped": "RuntimeError"} and receipt == outcome
     else:
         assert outcome["image_removal"]["receipt"].startswith("not written") and "image_removal" not in receipt
+
+
+# spec: ANYM-689
+def test_deploy_cleans_retired_containers_then_images_before_any_release_step_and_records_one_line(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    seen = []
+    def containers(settings, remove):
+        seen.append(("containers", remove, list(host.steps)))
+        return {"removed": ["a/api", "a/gateway"], "generations": ["a"], "skipped": [], "unknown": [], "unresolved": 0}
+    monkeypatch.setattr(host.s, "clean", containers)
+    def images(settings, *, held=(), **extra):
+        seen.append(("preflight images" if extra else "final images", sorted(extra), list(host.steps)))
+        return {"removed": [{"image": "x"}], "failed": [], "kept": 3}
+    monkeypatch.setattr(p, "retain_images", images)
+    outcome = host.deploy()
+    assert outcome["status"] == "deployed"
+    # Containers first, then the image pass with a deadline and the keep reasons, both before the first release step.
+    assert seen[0] == ("containers", True, []) and seen[1] == ("preflight images", ["deadline", "reasons"], [])
+    assert seen[2][0] == "final images" and seen[2][1] == [] and host.steps
+    assert outcome["cleanup"]["containers_removed"] == 2 and outcome["cleanup"]["generations"] == ["a"]
+    assert outcome["cleanup"]["images_removed"] == 2 and "disk_free_after_gib" in outcome["cleanup"]
+    assert p.read(host.state / "deploy.json")["cleanup"] == outcome["cleanup"]
+
+
+# spec: ANYM-689
+def test_a_dry_run_and_a_current_host_do_not_run_the_preflight(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch, history=())
+    monkeypatch.setattr(host.s, "clean", lambda *a: pytest.fail("cleanup ran"))
+    assert host.deploy()["status"] == "current" and host.preflight == []
+    host = Deployer(tmp_path / "again", monkeypatch) if (tmp_path / "again").mkdir() is None else None
+    monkeypatch.setattr(host.s, "clean", lambda *a: pytest.fail("cleanup ran"))
+    assert host.deploy(dry_run=True)["status"] == "plan" and host.preflight == []
+
+
+# spec: ANYM-689
+@pytest.mark.parametrize("failure", ["containers", "images", "both"])
+def test_a_failing_preflight_never_changes_the_deploy_outcome(tmp_path, monkeypatch, failure):
+    host = Deployer(tmp_path, monkeypatch)
+    if failure in {"containers", "both"}:
+        monkeypatch.setattr(host.s, "clean", lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
+    if failure in {"images", "both"}:
+        monkeypatch.setattr(p, "retain_images", lambda settings, *, held=(), **extra: {"skipped": "RuntimeError"})
+    outcome = host.deploy()
+    assert outcome["status"] == "deployed" and host.paused() is None
+    assert outcome["preflight"]["containers"] == ({"error": "RuntimeError"} if failure != "images" else outcome["preflight"]["containers"])
+
+
+# spec: ANYM-689
+def test_the_preflight_image_pass_lifts_a_host_under_the_gate_that_container_removal_alone_cannot(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    free = {"bytes": p.MIN_FREE_BYTES - 1}
+    def prepare_checks_space(sha):
+        if free["bytes"] < p.MIN_FREE_BYTES:
+            raise p.Refused("at least 15 GiB free is required on /var/lib/containerd before obtaining production images")
+    host.fail_prepare = prepare_checks_space
+    # The fake credits bytes to the image removal only: stopped containers hold no bytes, their images do.
+    monkeypatch.setattr(host.s, "clean", lambda *a: {"removed": ["a/api"], "generations": ["a"]})
+    def images(settings, *, held=(), **extra):
+        if extra:
+            free["bytes"] += 20 * 1024**3
+        return {"removed": [], "failed": [], "kept": 1, **({"kept_reasons": {"used by container": 1}} if extra else {})}
+    monkeypatch.setattr(p, "retain_images", images)
+    assert host.deploy()["status"] == "deployed"
+    # Without the image pass the same host halts, and deploy.json names why the images stay.
+    host = Deployer(tmp_path / "halted", monkeypatch) if (tmp_path / "halted").mkdir() is None else None
+    free["bytes"] = p.MIN_FREE_BYTES - 1
+    host.fail_prepare = prepare_checks_space
+    monkeypatch.setattr(host.s, "clean", lambda *a: {"removed": ["a/api"], "generations": ["a"]})
+    monkeypatch.setattr(p, "retain_images", lambda settings, *, held=(), **extra: {
+        "removed": [], "failed": [], "kept": 4, **({"kept_reasons": {"prepared release <id> is not applied": 4}} if extra else {})})
+    host.deploy()
+    pause = p.read(host.state / "deploy.json")
+    assert pause["status"] == "halted" and "15 GiB" in pause["reason"]
+    assert pause["preflight"]["images"]["kept_reasons"] == {"prepared release <id> is not applied": 4}
+
+
+# spec: ANYM-689
+def test_the_retirement_of_the_predecessor_in_this_run_is_counted_in_the_one_cleanup_line(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    monkeypatch.setattr(host.s, "clean", lambda *a: {"removed": ["a/api"], "generations": ["a"]})
+    promote = host.s.promote
+    monkeypatch.setattr(host.s, "promote", lambda settings, sha: {**promote(settings, sha), "status": "serving",
+                        "cleanup": {"removed": ["b/api", "b/gateway"], "generations": ["b", "a"]}})
+    outcome = host.deploy()
+    assert outcome["status"] == "deployed"
+    assert outcome["cleanup"]["containers_removed"] == 3 and outcome["cleanup"]["generations"] == ["a", "b"]
+    assert p.read(host.state / "deploy.json")["cleanup"] == outcome["cleanup"]
+
+
+# spec: ANYM-689
+@pytest.mark.parametrize("stage", ["plan A", "plan B"])
+def test_a_halted_deploy_keeps_the_cleanup_summary_and_its_own_reason(tmp_path, monkeypatch, stage):
+    host = Deployer(tmp_path, monkeypatch)
+    monkeypatch.setattr(host.s, "clean", lambda *a: {"removed": ["a/api"], "generations": ["a"]})
+    def refuse(sha):
+        raise p.Refused("synthetic refusal")
+    setattr(host, "fail_prepare" if stage == "plan A" else "fail_seamless_promote", refuse)
+    host.deploy()
+    receipt = p.read(host.state / "deploy.json")
+    assert receipt["status"] == "halted" and "synthetic refusal" in receipt["reason"] and "synthetic refusal" in host.paused()
+    assert receipt["cleanup"]["containers_removed"] == 1 and receipt["preflight"]["containers"]["generations"] == ["a"]
+
+
+# spec: ANYM-689
+def test_a_failed_write_of_the_cleanup_summary_leaves_the_halt_receipt_and_the_pause_reason(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    monkeypatch.setattr(host.s, "clean", lambda *a: {"removed": ["a/api"], "generations": ["a"]})
+    def refuse(sha):
+        raise p.Refused("synthetic refusal")
+    host.fail_prepare = refuse
+    write = p.write
+    def full(target, value):
+        if target.name == "deploy.json" and "cleanup" in value:
+            raise OSError("No space left on device")
+        write(target, value)
+    monkeypatch.setattr(p, "write", full)
+    outcome = host.deploy()
+    receipt = p.read(host.state / "deploy.json")
+    assert outcome["status"] == receipt["status"] == "halted" and "synthetic refusal" in receipt["reason"]
+    assert "cleanup" not in receipt and "synthetic refusal" in host.paused()
+
+
+# spec: ANYM-689
+def test_the_preflight_budget_bounds_every_command_and_is_always_reset(tmp_path, monkeypatch):
+    seen = []
+    def fake(argv, **kwargs):
+        seen.append(kwargs["timeout"])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(p.subprocess, "run", fake)
+    assert p.run(["true"]) == "" and seen == [1800]
+    monkeypatch.setattr(p, "DEADLINE", p.time.monotonic() + 60)
+    p.run(["true"])
+    assert 0 < seen[-1] <= 60
+    monkeypatch.setattr(p, "DEADLINE", p.time.monotonic() - 1)
+    with pytest.raises(p.Refused, match="time budget"):
+        p.run(["true"])
+    assert len(seen) == 2
+    monkeypatch.setattr(p, "DEADLINE", None)
+    # The pass sets the deadline for both stages and clears it whether they end or raise.
+    during = []
+    stage = SimpleNamespace(GLOBAL_LOCK=tmp_path, clean=lambda http, remove: during.append(p.DEADLINE) or {"removed": []})
+    monkeypatch.setattr(p, "retain_images", lambda settings, **extra: during.append(p.DEADLINE) or {"removed": []})
+    p.preflight_cleanup({}, {}, stage, tmp_path)
+    assert len(during) == 2 and all(value is not None for value in during) and p.DEADLINE is None
+    monkeypatch.setattr(p, "retain_images", lambda settings, **extra: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        p.preflight_cleanup({}, {}, stage, tmp_path)
+    assert p.DEADLINE is None
+
+
+# spec: ANYM-689
+def test_the_image_pass_starts_no_discovery_after_its_deadline(tmp_path, monkeypatch):
+    settings = retention_settings(tmp_path)
+    store = Images(monkeypatch, [runtime("1")])
+    summary = p.remove_images(settings, deadline=p.time.monotonic() - 1)
+    assert summary["interrupted"] == "time budget" and summary["removed"] == [] and store.calls == []
+
+
+class RetiredHost(Images):
+    """`Images` plus the HTTP generations' exited containers: `docker inspect <id>` answers the full object, `docker rm
+    <id>` deletes it (so its image is no longer in use) and the labelled listing shows what is left."""
+
+    def __init__(self, monkeypatch, images, detail):
+        super().__init__(monkeypatch, images, {identity: item["Image"] for identity, item in detail.items()})
+        self.detail = detail
+
+    def run(self, argv, **kwargs):
+        if argv[:2] == ["docker", "inspect"] and len(argv) == 3 and argv[2] in self.detail:
+            self.calls.append(argv)
+            return json.dumps([self.detail[argv[2]]])
+        if argv[:2] == ["docker", "rm"] and len(argv) == 3:
+            self.calls.append(argv)
+            del self.detail[argv[2]], self.containers[argv[2]]
+            return ""
+        if argv[:2] == ["docker", "ps"] and any("ai.deedkit.http-release" in part for part in argv):
+            self.calls.append(argv)
+            return "".join(f"{identity} {item['Config']['Labels']['ai.deedkit.http-release']} {item['State']['Status']}\n"
+                           for identity, item in self.detail.items())
+        return super().run(argv, **kwargs)
+
+
+def http_generations(state, images, *, serving=None, digest=None):
+    """HTTP generations as `retire` leaves them: each retired by its successor's receipt, the last one serving (with the
+    revision `serving` and the configuration digest `digest` when given)."""
+    state.mkdir(mode=0o700, exist_ok=True)
+    detail, previous = {}, None
+    for number, image in enumerate(images):
+        generation, sha = "%012x" % (number + 1), "%040x" % (number + 1)
+        if serving:
+            # Older revisions sit before the serving one on main, as `unresolved` requires of every serving attempt.
+            sha = serving if number == len(images) - 1 else "%040x" % (0xa0 + number)
+        identities = {role: {"container": "%064x" % (0x100 + number * 2 + (role == "gateway")), "image": image}
+                      for role in ("api", "gateway")}
+        receipt = {"sha": sha, "generation": generation, "status": "serving", "containers": identities,
+                   "retired_roles": ["gateway", "api"] if previous else [], "previous": previous,
+                   **({"config_digest": digest} if digest else {})}
+        (state / sha).mkdir(exist_ok=True)
+        p.write(state / sha / "http-result.json", receipt)
+        p.write(state / sha / "http-attempted.json", {"status": "serving", "sha": sha})
+        p.write(state / "http-current.json", receipt)
+        for role, identity in identities.items():
+            detail[identity["container"]] = {"Id": identity["container"], "Image": image,
+                "State": {"Status": "running" if number == len(images) - 1 else "exited", "Running": number == len(images) - 1},
+                "Config": {"Labels": {"com.docker.compose.project": "deedkit-http-" + generation,
+                                      "com.docker.compose.service": f"http-{role}-{generation}",
+                                      "ai.deedkit.http-release": generation}}}
+        previous = {**receipt, "previous": None}
+    return state, detail
+
+
+# spec: ANYM-689
+def test_the_preflight_removes_retired_containers_and_then_the_image_they_pinned(tmp_path, monkeypatch):
+    from scripts import seamless_release as s
+    settings = retention_settings(tmp_path)
+    state = Path(settings["state_directory"])
+    for seed, before in (("1", OLD_IMAGE), ("2", image_id("1")), ("3", image_id("2"))):
+        released(state, seed * 40, image_id(seed), before)
+    (tmp_path / "global").mkdir()
+    monkeypatch.setattr(s, "GLOBAL_LOCK", tmp_path / "global")
+    http_state, detail = http_generations(tmp_path / "http-state", [image_id("1"), image_id("3"), image_id("3")])
+    http = {"state_directory": str(http_state)}
+    store = RetiredHost(monkeypatch, [runtime(seed) for seed in "123"], detail)
+    # Before: the exited containers of the retired generation keep its image ("used by container").
+    assert candidates(settings) == [] and image_id("1") in store.references
+    result = p.preflight_cleanup(settings, http, s, http_state)
+    assert sorted(result["containers"]["removed"]) == ["000000000001/api", "000000000001/gateway"]
+    assert [item["image"] for item in result["images"]["removed"]] == ["1" * 12] and result["images"]["failed"] == []
+    assert set(store.references) == {image_id("2"), image_id("3")} and len(store.detail) == 4
+    # The order is the point: both containers go before the image removal is even attempted.
+    kinds = ["rm" if call[1] == "rm" and len(call) == 3 else "image" for call in store.calls if call[1] == "rm" or call[:3] == ["docker", "image", "rm"]]
+    assert kinds == ["rm", "rm", "image"] and p.DEADLINE is None
+    assert p.cleanup_line(result, None)["containers_removed"] == 2
+
+
+class LifecycleHost:
+    """A `Deployer` whose docker is a `RetiredHost`: the real container cleanup, image retention and capacity gate run
+    against one fake Docker, and the space the gate sees is credited only when image 1 has actually disappeared."""
+
+    def __init__(self, tmp_path, monkeypatch, images, *, running=False):
+        self.host = Deployer(tmp_path, monkeypatch, history=(NEWER,), green=(NEWER,))
+        host = self.host
+        state, detail = http_generations(host.http_state, images, serving=BASE, digest=p.digest(host.http))
+        host.history = ["%040x" % (0xa0 + number) for number in range(len(images) - 1)] + [BASE, NEWER]
+        if running:
+            for identity in sorted(detail)[:2]:
+                detail[identity]["State"] = {"Status": "running", "Running": True}
+        # The image pass reads complete plan A receipts of the current release (images and rollback snapshot).
+        current = host.current
+        def complete(sha):
+            current(sha)
+            image, before = (image_id("3"), image_id("2")) if sha == BASE else (image_id("4"), image_id("3"))
+            release = host.state / sha
+            p.write(release / "prepared.json", p.read(release / "prepared.json") | {"images": {"runtime": image}, "projects": [{"name": "synthetic"}]})
+            p.write(release / "synthetic.json", {"services": {"api": {"image": image}}})
+            p.write(release / "synthetic.before.json", {"services": {"api": {"image": before}, "db": {"image": "postgres"}}})
+            p.write(release / "result.json", {"sha": sha, "images": {"runtime": image}, "status": "applied", "applied_at": "2026-10-20T00:00:00Z"})
+        host.current = complete
+        complete(BASE)
+        self.http_state, self.store = state, RetiredHost(monkeypatch, [runtime(seed) for seed in "13"], detail)
+        monkeypatch.setattr(p, "retain_images", RETAIN_IMAGES)
+        def route(argv, **kwargs):
+            return host.run(argv, **kwargs) if argv[0] == "git" or argv[:2] == ["docker", "compose"] else self.store.run(argv, **kwargs)
+        monkeypatch.setattr(p, "run", route)
+        def gate(sha):
+            if image_id("1") in self.store.references:
+                raise p.Refused("at least 15 GiB free is required on /var/lib/containerd before obtaining production images")
+        host.fail_prepare = gate
+
+    def order(self):
+        return ["container" if call[1] == "rm" else "image" for call in self.store.calls
+                if call[:2] == ["docker", "rm"] or call[:3] == ["docker", "image", "rm"]]
+
+
+# spec: ANYM-689
+def test_a_deploy_under_the_gate_recovers_through_real_container_and_image_removal(tmp_path, monkeypatch):
+    life = LifecycleHost(tmp_path, monkeypatch, [image_id("1"), image_id("3"), image_id("3")])
+    outcome = life.host.deploy()
+    # The gate only passes once image 1 is gone, and it is gone only after the real cleanup removed its two containers.
+    assert outcome["status"] == "deployed", (outcome.get("reason"), outcome.get("preflight"))
+    assert life.order() == ["container", "container", "image"]
+    assert outcome["cleanup"]["containers_removed"] == 2 and outcome["cleanup"]["images_removed"] == 1
+    assert outcome["cleanup"]["generations"] == ["000000000001"] and image_id("1") not in life.store.references
+
+
+# spec: ANYM-689
+def test_a_deploy_whose_pinned_image_stays_stops_with_the_refusal_and_names_the_keep_reason(tmp_path, monkeypatch):
+    life = LifecycleHost(tmp_path, monkeypatch, [image_id("1"), image_id("3"), image_id("3")], running=True)
+    life.host.deploy()
+    receipt = p.read(life.host.state / "deploy.json")
+    assert receipt["status"] == "halted" and "15 GiB" in receipt["reason"] and life.order() == []
+    assert receipt["preflight"]["images"]["kept_reasons"]["used by container <id>"] >= 1
+    assert receipt["cleanup"]["containers_removed"] == 0 and image_id("1") in life.store.references
+
+
+# spec: ANYM-689
+def test_the_retirement_in_a_deploy_removes_the_older_containers_and_the_final_pass_frees_their_image(tmp_path, monkeypatch):
+    life = LifecycleHost(tmp_path, monkeypatch, [image_id("1"), image_id("3")])
+    host, state = life.host, life.http_state
+    life.host.fail_prepare = None
+    def promote(settings, sha):
+        host.steps.append(("seamless promote", sha))
+        receipt = {"sha": sha, "generation": "%012x" % 3, "status": "serving", "retired_roles": ["gateway", "api"],
+                   "previous": {**p.read(state / BASE / "http-result.json"), "previous": None}, "config_digest": p.digest(host.http),
+                   "containers": {role: {"container": "%064x" % (0x900 + number), "image": image_id("3")} for number, role in enumerate(("api", "gateway"))}}
+        p.write(state / sha / "http-result.json", receipt)
+        p.write(state / sha / "http-attempted.json", {"status": "serving", "sha": sha})
+        p.write(state / "http-current.json", receipt)
+        return host.s.retired_status(settings, receipt)
+    monkeypatch.setattr(host.s, "promote", promote)
+    outcome = host.deploy()
+    # Nothing was removable before the promotion; its retirement removed generation 1, and only then the image pass ran.
+    assert outcome["status"] == "deployed", (outcome.get("reason"), outcome.get("preflight"))
+    assert outcome["preflight"]["containers"]["removed"] == []
+    assert life.order() == ["container", "container", "image"], (outcome.get("image_removal"), outcome.get("preflight"), life.store.references)
+    assert image_id("1") not in life.store.references
+    assert outcome["cleanup"]["containers_removed"] == 2 and outcome["cleanup"]["images_removed"] == 1
 
 
 # spec: ANYM-439
@@ -5237,6 +5672,89 @@ def test_status_reads_the_configuration_the_autodeploy_unit_reads(tmp_path, monk
     monkeypatch.setattr(p, "images_report", lambda settings: {})
     p.main(["images"])
     assert seen == [p.CONFIG]
+
+
+def freshness_file(path, *, checked_ago=timedelta(minutes=20), status="fresh", age=12.3, **extra):
+    checked = datetime.now(timezone.utc) - checked_ago
+    p.write(path, {"checked_at": checked.strftime("%Y-%m-%dT%H:%M:%SZ"), "last_snapshot_at": "2026-11-01T16:00:27Z",
+                   "max_age_hours": 29, "status": status, "age_hours": age, "exit_code": {"fresh": 0, "stale": 4}.get(status, 5),
+                   **extra})
+    return checked.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def status_with_freshness(tmp_path, monkeypatch, capsys, freshness):
+    monkeypatch.delenv("DEEDKIT_DEPLOY_CONFIG", raising=False)
+    monkeypatch.setattr(p, "CONFIG_DIRECTORY", tmp_path / "etc")
+    monkeypatch.setattr(p, "PAUSE", tmp_path / "etc" / "autodeploy.pause")
+    monkeypatch.setattr(p, "lock", lambda state: contextlib.nullcontext())
+    monkeypatch.setattr(p, "CALENDAR_FRESHNESS", freshness)
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    p.write(state / "current.json", {"sha": "c" * 40, "status": "applied"})
+    monkeypatch.setattr(p, "config", lambda path: {"state_directory": str(state)})
+    p.main(["status"])
+    return capsys.readouterr()
+
+
+# spec: ANYM-694
+def test_status_prints_the_calendar_backup_freshness_line_beside_the_json_a_reader_parses(tmp_path, monkeypatch, capsys):
+    result = tmp_path / "freshness.json"
+    checked = freshness_file(result)
+    printed = status_with_freshness(tmp_path, monkeypatch, capsys, result)
+    assert json.loads(printed.out)["sha"] == "c" * 40
+    assert printed.err == f"calendar backup: fresh age=12.3h (checked {checked})\n"
+    checked = freshness_file(result, status="stale", age=30.0)
+    printed = status_with_freshness(tmp_path, monkeypatch, capsys, result)
+    assert printed.err == f"calendar backup: STALE age=30.0h (checked {checked})\n"
+    checked = freshness_file(result, status="unknown", age=None, last_snapshot_at=None)
+    printed = status_with_freshness(tmp_path, monkeypatch, capsys, result)
+    assert printed.err == f"calendar backup: UNKNOWN age=? (checked {checked})\n"
+
+
+# spec: ANYM-694
+def test_status_says_there_is_no_recent_freshness_check_for_an_absent_or_old_file(tmp_path, monkeypatch, capsys):
+    result = tmp_path / "freshness.json"
+    line = "calendar backup: no recent freshness check\n"
+    assert status_with_freshness(tmp_path, monkeypatch, capsys, result).err == line
+    freshness_file(result, checked_ago=timedelta(hours=3, minutes=1))
+    assert status_with_freshness(tmp_path, monkeypatch, capsys, result).err == line
+    freshness_file(result, checked_ago=timedelta(hours=2, minutes=59))
+    assert status_with_freshness(tmp_path, monkeypatch, capsys, result).err.startswith("calendar backup: fresh ")
+
+
+# spec: ANYM-694
+def test_status_names_an_unreadable_freshness_file_and_never_fails_because_of_it(tmp_path, monkeypatch, capsys):
+    result = tmp_path / "freshness.json"
+    for text, reason in (("{broken", "not JSON"), ("[1]", "not an object"),
+                         ('{"checked_at": "yesterday", "status": "fresh"}', "bad checked_at"),
+                         (json.dumps({"checked_at": "2026-11-02T10:00:00Z", "status": "great"}), "bad status")):
+        result.write_text(text)
+        printed = status_with_freshness(tmp_path, monkeypatch, capsys, result)
+        assert printed.err == f"calendar backup: freshness file unreadable ({reason})\n", text
+        assert json.loads(printed.out)["status"] == "applied"
+    result.unlink()
+    result.mkdir()
+    printed = status_with_freshness(tmp_path, monkeypatch, capsys, result)
+    assert printed.err == "calendar backup: freshness file unreadable (IsADirectoryError)\n"
+    # A user who cannot traverse the root-only job directory gets a named reason, not a failed `status`.
+    if os.geteuid() != 0:
+        result.rmdir()
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        freshness_file(locked / "freshness.json")
+        locked.chmod(0)
+        try:
+            printed = status_with_freshness(tmp_path, monkeypatch, capsys, locked / "freshness.json")
+        finally:
+            locked.chmod(0o700)
+        assert printed.err == "calendar backup: freshness file unreadable (PermissionError)\n"
+        assert json.loads(printed.out)["status"] == "applied"
+
+
+# spec: ANYM-694
+def test_the_catchup_service_is_one_of_the_backup_units_the_migration_deploy_waits_for():
+    assert p.BACKUP_UNITS == ("personal-os-backup.service", "deedkit-calendar-backup.service",
+                              "deedkit-calendar-backup-catchup.service")
 
 
 # spec: ANYM-443

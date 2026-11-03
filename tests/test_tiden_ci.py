@@ -47,6 +47,19 @@ def test_untrusted_or_incomplete_junit_is_rejected(tmp_path, xml):
         normalize_junit(report(tmp_path, xml), tmp_path, "python")
 
 
+# spec: ANYM-429
+def test_a_report_past_the_old_ten_thousand_case_bound_is_accepted_up_to_the_new_one(tmp_path):
+    cases = lambda count: "".join(f'<testcase name="t{i}" classname="tests.test_sample" file="tests/test_sample.py"/>' for i in range(count))
+    _, counts = normalize_junit(report(tmp_path, f"<testsuite>{cases(10001)}</testsuite>"), tmp_path, "python")
+    assert counts == Counter(passed=10001)
+    from scripts.tiden_ci import MAX_JUNIT_CASES
+    assert MAX_JUNIT_CASES > 10000
+    _, counts = normalize_junit(report(tmp_path, f"<testsuite>{cases(MAX_JUNIT_CASES)}</testsuite>"), tmp_path, "python")
+    assert counts == Counter(passed=MAX_JUNIT_CASES)
+    with pytest.raises(ValueError, match="bounded"):
+        normalize_junit(report(tmp_path, f"<testsuite>{cases(MAX_JUNIT_CASES + 1)}</testsuite>"), tmp_path, "python")
+
+
 def metadata():
     return {"sha": "a" * 40, "git_branch": "codex/feature", "ci_url": "https://github.com/example/repo/actions/runs/1",
             "checks": {check: "success" for check in CHECKS}}
@@ -770,7 +783,7 @@ def test_image_build_job_is_gated_only_by_the_change_decision():
     assert build["needs"] == "changes" and build["if"] == "${{ needs.changes.outputs.build == 'true' }}"
     assert "name" not in build  # production.py finds `images / build (backup)` by the job key
     assert build["strategy"]["matrix"]["target"] == [
-        "runtime", "indexer", "enricher-local", "whatsapp-native", "gateway", "calendar", "calls", "backup"]
+        "runtime", "indexer", "enricher-local", "whatsapp-native", "gateway", "calendar", "recordings", "calls", "backup"]
     # The build and smoke test come first; the publication steps after it only export what was tested.
     names = [step.get("name") for step in build["steps"]]
     check = names.index("Build and smoke-test the production target without providers")
@@ -2697,7 +2710,8 @@ def test_the_real_go_suites_produce_every_existing_tiden_go_identity(tmp_path):
     identities = json.loads((root / "tests/fixtures/tiden-go-identities.json").read_text())
     assert identities and {item["signature"]: (item["title"], [{"title": item["suite"]}], item["file"])
                            for item in identities}.items() <= produced.items()
-    assert {row["execution"]["status"] for row in rows} == {"passed"}
+    assert {row["execution"]["status"] for row in rows} == {"passed"}, [
+        (row["title"], row["execution"]["status"]) for row in rows if row["execution"]["status"] != "passed"]
     # Leaf-only: no row is an ancestor of another, so a new test cannot add a parent row unnoticed.
     assert not [name for name in produced if any(other.startswith(name + "/") for other in produced)]
 

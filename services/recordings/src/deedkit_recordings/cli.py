@@ -21,6 +21,9 @@ def main():
             parser.exit(1, 'Archive backup failed: ' + error.code + '\n')
         print('Archive backup saved.')
         return
+    # Fail closed before anything binds: with RECORDINGS_EGRESS_ADMISSION=required the host egress rules must be in force.
+    from .admission import require
+    require()
     import uvicorn
     from .app import create_app
     # Provider URLs may carry source IDs/cursors. No request URL/body logging.

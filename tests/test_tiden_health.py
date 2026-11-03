@@ -3,6 +3,8 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -11,7 +13,8 @@ import pytest
 import yaml
 
 import scripts.tiden_health as health
-from scripts.tiden_health import ENVIRONMENT, FAIL, PASS, UNKNOWN, Tiden, outcome, parse_no_spec_list, report, suite
+from scripts.tiden_ci import MODULE_REPORTS
+from scripts.tiden_health import ENVIRONMENT, FAIL, PASS, SUITES, UNKNOWN, Tiden, outcome, parse_no_spec_list, report, suite
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/tiden-health.yml"
@@ -526,6 +529,7 @@ def test_a_suite_with_rows_and_no_active_case_fails_as_not_reporting(repo, serve
     ("", "s:tests.test_webrtc::test_a", "calls"),
     ("", "s:tests.test_other::test_a", "unassigned"),
     ("services/gateway/tests/test_a.py", "", "gateway"),
+    ("services/inference/tests/test_a.py", "", "inference"),
     ("whatsapp/whatsmeow/send_test.go", "", "whatsmeow-go"),
     ("send_test.go", "", "whatsmeow-go"),
     ("internal/send_test.go", "", "unassigned"),
@@ -547,6 +551,91 @@ def test_wake_relay_cases_belong_to_the_npm_suite_that_runs_them():
 # spec: ANYM-360
 def test_shared_contract_package_cases_belong_to_their_own_suite():
     assert suite({"filePath": "packages/platform-contracts/tests/test_agent.py", "externalId": ""}) == "platform-contracts"
+
+
+# spec: ANYM-360
+def test_inference_service_cases_belong_to_their_own_suite_and_are_not_unassigned(repo, server):
+    assert suite({"filePath": "services/inference/tests/test_admission.py", "externalId": ""}) == "inference"
+    _, b = history(repo)
+    server.world(b, cases=[case("c1"), case("inf", "services/inference/tests/test_admission.py")])
+    metric = measure(repo, server, b)[1]["metrics"]["unlinked_tests"]
+    assert metric["state"] == PASS and metric["numbers"]["suites"]["inference"]["active"] == 1
+    assert metric["numbers"]["suites"]["unassigned"]["cases"] == 0
+
+
+# Every tracked test file and every CI module path has a suite (ANYM-703). Tiden health measures the same invariant one
+# merge later (scripts/tiden_health.py, "unlinked_tests"); here the pull request that adds the file is the one that fails.
+TEST_FILE = re.compile(r"(^|/)(test_[^/]*\.py|[^/]*_test\.py|[^/]*\.test\.(js|jsx|ts|tsx|mjs)|[^/]*\.spec\.[^/]*|[^/]*_test\.go)$")
+VENDORED = {"node_modules", ".venv", "vendor"}
+# Test files CI never publishes to Tiden, by prefix with the reason. A suite for them is impossible: a suite with no
+# active case is itself a finding ("not reporting", tiden_health.py). The test fails when a prefix matches no tracked
+# test file any more, so this list cannot rot; a new entry needs its reason on the same line.
+UNPUBLISHED = {
+    "packages/deedkit/": "checks.yml runs these with no Tiden evidence file yet (ANYM-261)",
+    "tools/attest-verify/": "checks.yml runs only govulncheck there, never its Go tests",
+}
+# Suites that have no tracked test file by design: their cases are CI module checks under .github/.
+SYNTHETIC_PATHS = {"ci": ".github/workflows/checks.yml"}
+
+
+def tracked_test_files():
+    if not (ROOT / ".git").exists() or shutil.which("git") is None:
+        pytest.skip("not a git checkout (a source tarball run): no tracked files to walk")
+    listing = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=True).stdout
+    paths = [p for p in listing.decode().split("\0") if p]
+    return [p for p in paths if TEST_FILE.search(p) and not VENDORED.intersection(p.split("/"))]
+
+
+def unassigned_test_files():
+    """Tracked test files `suite()` cannot place and that are not listed as unpublished (module attribute: patchable)."""
+    return [p for p in tracked_test_files()
+            if health.suite({"filePath": p, "externalId": ""}) == "unassigned"
+            and not p.startswith(tuple(UNPUBLISHED))]
+
+
+# spec: ANYM-703
+def test_no_tracked_test_file_is_unassigned():
+    offenders = unassigned_test_files()
+    assert not offenders, ("Tiden health would read these test files as `unassigned path`; add a rule to `suite()` and a name "
+                           "to `SUITES` (scripts/tiden_health.py):\n" + "\n".join(offenders))
+
+
+# spec: ANYM-703
+def test_every_unpublished_prefix_still_matches_a_tracked_test_file():
+    tracked = tracked_test_files()
+    stale = [prefix for prefix in UNPUBLISHED if not any(p.startswith(prefix) for p in tracked)]
+    assert not stale, f"remove from UNPUBLISHED (no tracked test file under it any more): {stale}"
+    assert all(UNPUBLISHED.values()), "every unpublished prefix needs its reason"
+
+
+# spec: ANYM-703
+def test_the_walk_names_the_inference_tests_when_the_inference_rule_is_gone(monkeypatch):
+    real = health.suite
+
+    def without_inference_rule(case):
+        return "unassigned" if (case.get("filePath") or "").startswith("services/inference/") else real(case)
+
+    monkeypatch.setattr(health, "suite", without_inference_rule)
+    offenders = unassigned_test_files()
+    assert offenders and all(p.startswith("services/inference/") for p in offenders)
+
+
+# spec: ANYM-703
+def test_every_ci_module_path_resolves_to_a_suite():
+    # Entries with an empty path (load, backup_restore, root_session_lock, enricher_audio) run root-suite tests whose
+    # files are under tests/ and are covered by the walk above; they are skipped on purpose, not given an invented path.
+    unresolved = {name: path for name, (_report, _kind, path) in MODULE_REPORTS.items()
+                  if path and suite({"filePath": f"{path}/synthetic_case", "externalId": ""}) == "unassigned"}
+    assert not unresolved, f"add a `suite()` rule for these MODULE_REPORTS paths (scripts/tiden_ci.py): {unresolved}"
+
+
+# spec: ANYM-703
+def test_every_declared_suite_is_reachable():
+    reached = {suite({"filePath": p, "externalId": ""}) for p in tracked_test_files()}
+    reached |= {suite({"filePath": p, "externalId": ""}) for p in SYNTHETIC_PATHS.values()}
+    reached |= {suite({"filePath": f"{path}/synthetic_case", "externalId": ""})
+                for _report, _kind, path in MODULE_REPORTS.values() if path}
+    assert set(SUITES) <= reached, f"no test path resolves to these SUITES names: {sorted(set(SUITES) - reached)}"
 
 
 # Stale anchors.

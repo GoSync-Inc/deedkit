@@ -65,6 +65,42 @@ def test_signed_provider_webhook_bound_to_exact_attempt(tmp_path):
         assert app.state.service.get_call(call['id'])['status']=='finished'
 
 
+# spec: ANYM-657
+def test_status_callback_stores_a_fixed_cause_from_a_failed_error_code(tmp_path):
+    from outbound import ExternalBrief, TwilioCalls
+    import hmac, hashlib, base64
+    app = create_app(tmp_path, Archive())
+    cfg = {'account_sid': 'AC' + '1' * 32, 'auth_token': 'fixture-secret', 'public_url': 'https://voice.test/voice'}
+    app.state.outbound.providers['twilio'] = TwilioCalls(cfg)
+    service = app.state.service
+
+    def callback(client, status, error=None, existing=None):
+        brief = service.prepare(ExternalBrief(**BRIEF, channel='phone', account='twilio', destination='+628123456789'), [])
+        call = service.start(brief['id'])
+        sid = 'CA' + '2' * 32
+        service.provider_update(call['id'], provider_call_id=sid, dial_state='accepted',
+                                **({'provider_error': existing} if existing else {}))
+        path = '/provider/twilio/status/' + call['id']
+        payload = {'AccountSid': cfg['account_sid'], 'CallSid': sid, 'CallStatus': status,
+                   **({'ErrorCode': error} if error is not None else {})}
+        url = cfg['public_url'] + path
+        signature = base64.b64encode(hmac.new(b'fixture-secret', (url + ''.join(k + payload[k] for k in sorted(payload))).encode(),
+                                              hashlib.sha1).digest()).decode()
+        assert client.post('https://voice.test' + path, data=payload, headers={'X-Twilio-Signature': signature}).status_code == 200
+        return service.get_call(call['id'])
+
+    with TestClient(app, headers=owner_headers(tmp_path)) as client:
+        geo = callback(client, 'failed', '21215')
+        assert geo['provider_error'] == {'code': 21215, 'cause': 'geo_permission_missing'} and geo['provider_status'] == 'failed'
+        # a carrier or SIP code after Twilio accepted the dial is never provider_rejected_other
+        assert callback(client, 'failed', '30003')['provider_error'] == {'code': 30003, 'cause': 'call_failed_other'}
+        for status, error in [('busy', '21215'), ('no-answer', '30003'), ('completed', '21215'), ('failed', None),
+                              ('failed', 'ABC'), ('failed', '123456'), ('failed', '')]:
+            assert 'provider_error' not in callback(client, status, error), (status, error)
+        carried = {'http_status': 400, 'code': 21211, 'cause': 'invalid_destination'}
+        assert callback(client, 'failed', '21215', existing=carried)['provider_error'] == carried
+
+
 def test_signed_websocket_carries_real_twilio_audio_and_hangs_up(monkeypatch,tmp_path):
     import base64,hmac,hashlib
     import numpy as np

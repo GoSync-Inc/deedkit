@@ -9,24 +9,44 @@
      BACKUP.md, BACKUP_R2.md, MEDIA_STORAGE.md, ENRICHMENT.md, SUBSCRIPTIONS.md, TELEMETRY.md and the decision log.
      After the owner's confirmation it changes only by a new owner decision. -->
 
-Status: draft, not yet confirmed by the owner. Until the orchestrator records the owner's one confirmation
-(a `user-data` ask) as a line here, this file covers nothing: every user-data question goes to the owner, and
-the lines below only describe current behaviour and the decisions on record.
+Status: confirmed by the owner 11-01 («5) я согласен но с копией базы надо только при опасных миграциях при
+ластовых и медиум рисках это не обязательно короче не хочется чтоб это был ботлнек у нас эти бек апы»;
+~/deedkit-orchestrator/DECISIONS.md 11-01). It covers each line below within its cited scope. A part still
+marked `proposal` has no owner decision and covers nothing: a question there goes to the owner as a
+`user-data` ask.
 
 Data held: messages, chats, contacts and sender identities, attachments (originals, extracted text,
 transcripts, descriptions), receipts, call records and calendar data from the owner's own messenger and
 calendar accounts; stores: PostgreSQL, the original/media directory, the private R2 cold archive of
-originals, encrypted backups on the shared backup server and its object storage, service logs. Proposal:
-the owner has decided parts (below), not this inventory as a whole.
+originals, encrypted backups on the shared backup server and its object storage, service logs (confirmed with this
+file, owner 11-01). Wearable recordings of the owner's Omi and PLAUD accounts (conversation metadata,
+transcripts, summaries; they include other people's speech) are read on demand without being stored, and,
+once archive polling is enabled, held as text in the recordings archive (SQLite on the recordings service
+volume) (owner 11-03, see Data egress).
 
 - Retention: processed, unpinned originals may leave local disk after 30 days without a request, only
   with a verified cold copy; text, titles, summaries and transcripts stay (MEDIA_STORAGE.md; owner 10-17
   cold archive «yes»; owner 10-18 BL-33 disk vs retention «давай оставим как есть если так работает»).
   Backup copies age out by the backup rotation (BACKUP.md). Messages and other kinds: proposal (no
   owner decision on a limit).
-- Pre-migration database copies (ANYM-588, docs/operations/production.md "Database copies"): the
-  deployer copies a database before a migration (owner 10-28 «добавление миграции автоматически с
-  копией»). The copy is plaintext, root-only, on the production host's disk, never leaves the host and is
+- Recording texts (recordings archive, owner 11-03 «2) ок»): kept until the owner sets a term; deleted on
+  the owner's request (this wording is the orchestrator's reading of «2) ок», an interim default). No deletion tool or automatic deletion exists today: a deletion is manual, under the
+  data-deletion gates (process.md section 2), and a provider-side deletion does not purge the local text
+  (services/recordings/README.md). The owner named no term; a term is a new owner decision.
+- Bot buttons: the labels, kinds, URLs, Mini App links and callback data of a message's inline and
+  reply buttons are stored and deleted with the message text (retention above, deletion below; owner
+  11-01 «4 да» to the bot-buttons question, with «надо сделать чтоб он бот мог делать действия которые
+  я прошу в miniapp»). Decided, not yet built: today only the message text is captured. Link previews
+  and polls are stored and deleted under the message-text rules (retention above, deletion below; owner
+  11-02 «5 да» to the question «Превью ссылок и опросы. Храним по правилам текста?»). Invoices,
+  contact cards and other message parts this file does not name: proposal.
+- Pre-migration database copies and backups (ANYM-588, docs/operations/production.md "Migration risk
+  tiers" and "Database copies"): only a dangerous migration gets a fresh verified backup and a
+  pre-migration copy; a low or medium one gets neither, and the latest verified daily backup is its
+  restore point (owner 11-01, quoted in Status, replacing owner 10-28 «добавление миграции
+  автоматически с копией» for low and medium ones). A database with no daily backup running keeps its
+  copy (the orchestrator's reading of 11-01: a restore point must exist). Until ANYM-675 ships, the deployer still copies before every unattended migration (its rehearsal
+  runs on the copy). The copy is plaintext, root-only, on the production host's disk, never leaves the host and is
   deleted after 48 h, whatever its state (the orchestrator's reading of 2026-10-28; a later owner line may
   tighten it). Its receipts hold table names, row counts, sizes, hashes, times and failure codes only.
 - Deletion: a message deleted in the messenger (for everyone, the owner's own delete-for-me when
@@ -38,15 +58,15 @@ the owner has decided parts (below), not this inventory as a whole.
   Closing that gap is open implementation and configuration work (story 516). Gates: a DELETE statement
   the running service executes on rows this line or a ready card names is ordinary, PR-listed code
   (harness reviews.md, `Deletes:`); any other deletion (TRUNCATE, DROP, a script, data fix, deploy hook or
-  other automation, a migration, a restore) needs an Astra-reviewed plan, a fresh verified backup and an
+  other automation, a deleting migration, a restore) needs an Astra-reviewed plan, a fresh verified backup and an
   undo (process.md section 2).
 - Visibility: the owner; agents through scoped API keys and gateway profiles, and production read-only
   over SSH (AGENTS.md section 1); explicit attachment download below `history_since` only on an explicit
   request (owner 10-23 «да, разреши явное скачивание вложений»). Never in a PR, issue, log excerpt,
   screenshot or digest (SECURITY.md: synthetic reproducers only). Which data each agent may read and any
   masking: proposal.
-- Consent: the data is the owner's own accounts and their correspondents; correspondents gave no
-  consent to DeedKit. Any use beyond the owner's own assistant (another user, a public mention, a new
+- Consent: the data is the owner's own accounts, their correspondents and the people the owner's
+  wearables record; neither gave consent to DeedKit. Any use beyond the owner's own assistant (another user, a public mention, a new
   purpose): proposal, a `user-data` ask.
 - Data egress (current flows; each covers only its cited scope):
   - Backups, encrypted, to the shared backup server over the tailnet and its object storage; originals,
@@ -74,7 +94,40 @@ the owner has decided parts (below), not this inventory as a whole.
     autoloop's tool-less reader on the owner's workstation (owner decision D1, ANYM-264); for a principal in
     the autoloop config, a card in the card worker's own words, with no quote, name, phone number or message
     content, goes to Tiden and GitHub (owner 10-26, ANYM-568; SUBSCRIPTIONS.md:345-353).
-  - Model providers for enrichment (ENRICHMENT.md: OpenAI, Anthropic, Gemini endpoints; Codex not deployed)
-    and Tiden error tracking (TELEMETRY.md, off by default): proposal, which fields go where is not yet an
+  - Local model processing (ANYM-682 to ANYM-688; in force for the owner's messenger accounts from the
+    production enablement, ANYM-686): originals of admitted attachments (audio, images, document text)
+    go from the enrichment worker to the owner's Mac mini over the tailnet (WireGuard and TLS, one
+    pinned address, port 443; voice notes above about 32 kbps are re-encoded to Opus and large photos are scaled to 2048 px as jpeg first, smaller ones go as they are; the originals stay in the archive, ENRICHMENT.md) for processing by local models (`deedkit-inference`). The worker's
+    network reaches only its database and that address (docs/operations/production.md, "Mini
+    enrichment worker"). The mini keeps them only for the duration of the request: a per-request
+    directory is removed after each job and any leftover at the next start (removal is attempted; a failure
+    is logged as `cleanup_incomplete` and the files can stay until a later removal succeeds), no prompt or
+    media cache on disk, and logs with principal, alias, size, seconds, status, request ID and a refusal
+    reason only, never content or file names. The derived text returns to DeedKit and is stored as
+    untrusted, model-generated enrichment (ENRICHMENT.md). No third party receives them (owner 11-01
+    «на мини я бы и аудио и остальные файлы разбирал бы локальной моделью хорошей для всех сервисов
+    наших»; photos: owner 11-01 «2 b»).
+  - Cloud model providers for enrichment (ENRICHMENT.md: OpenAI, Anthropic, Gemini endpoints; Codex not
+    deployed) stay off; media understanding uses the local models above (owner 11-01 «2 b»). Enabling a
+    cloud endpoint is a `user-data` ask.
+  - Wearable recordings (Omi, PLAUD; services/recordings/README.md; PLAUD documents US-hosted transit and
+    the owner's question named both vendors as US clouds; the PLAUD remote MCP has its own logging that
+    DeedKit cannot verify):
+    - On-demand reads: the owner's provider key (Omi) or OAuth token (PLAUD), recording identifiers, date
+      bounds and page parameters go to api.omi.me and mcp.plaud.ai; the returned metadata, transcript or
+      summary text goes to the requesting agent through the gateway, and so into that agent's model
+      context. Nothing is stored by the read itself. Owner 11-03, asked by the orchestrator: «Можно ли,
+      чтобы ваши агенты по запросу читали разговоры из Omi и Plaud? Ключи уходят в их облака (оба в США),
+      текст разговора попадает к модели агента.» Answer: «1) да». Covers these reads only: no other
+      vendor, no other recipient. Not covered: `recordings_audio` (a PLAUD 24-hour bearer download link
+      returned to the caller); enabling it is a `user-data` ask.
+    - Local copy: the archive keeps the accepted text, titles, summaries, vendor identifiers, a full-text
+      index, per-part digests and attempt state, and reference-only change events on the DeedKit server,
+      including other people's speech, for the retention line above. Archive polling sends the same fields
+      as the reads to the same two hosts on a schedule. Owner 11-03: «Можно ли хранить копию расшифровок на
+      нашем сервере, включая речь других людей? Сколько хранить?» Answer: «2) ок». Covers the local copy
+      only. Putting the archive into the shared backup server and its object storage is a separate
+      `user-data` ask; archive polling stays off on production until that is decided.
+  - Tiden error tracking (TELEMETRY.md, off by default): proposal, which fields go where is not yet an
     owner decision.
   - Any other recipient or field is a `user-data` ask before it ships.

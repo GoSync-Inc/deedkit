@@ -22,7 +22,9 @@ import time
 from telethon import errors, functions, types, utils
 
 from .envelope import canonical, stable_id
-from .messenger_operations import HISTORY, LIVE_SEARCH, live_cursor_binding
+from .name_variants import contact_matcher
+from .messenger_operations import (HISTORY, INSPECT_BUTTONS, LIVE_SEARCH, live_cursor_binding, platform_parameters,
+                                   validate_operation)
 
 log = logging.getLogger('anymsg.live_search')
 history_log = logging.getLogger('anymsg.chat_history')
@@ -33,38 +35,9 @@ MAX_PROFILE_PAGE = 50
 READ_OPERATIONS = frozenset({
     'chat_info', 'list_participants', 'get_reactions', 'get_message_info',
     'list_topics', 'get_profile', 'list_contacts', 'get_contact', 'list_blocked',
-    'get_invite_link', 'check_chat_link', LIVE_SEARCH, HISTORY,
+    'get_invite_link', 'check_chat_link', LIVE_SEARCH, HISTORY, INSPECT_BUTTONS,
 })
-PARAMETERS = {
-    'chat_info': set(), 'list_participants': {'limit', 'offset'},
-    'get_reactions': set(), 'get_message_info': set(),
-    'list_topics': {'limit', 'offset'},
-    'get_profile': set(), 'list_contacts': {'limit', 'offset'},
-    'get_contact': {'user_id'}, 'list_blocked': {'limit', 'offset'},
-    'send_file': {'mode', 'caption', 'attachment_id', 'upload_id', 'sha256'},
-    'forward_message': {'source_message_id', 'source_revision'},
-    'send_poll': {'question', 'options', 'multiple'},
-    'send_contact': {'phone', 'first_name', 'last_name'},
-    'send_location': {'latitude', 'longitude', 'description'}, 'edit_message': {'text'},
-    'delete_message': set(), 'send_reaction': {'emoji'},
-    'vote_poll': {'option_indices'}, 'pin_message': set(), 'unpin_message': set(),
-    'mark_read': set(), 'mark_unread': set(), 'archive_chat': set(),
-    'unarchive_chat': set(), 'mute_chat': {'seconds'}, 'unmute_chat': set(),
-    'create_group': {'title', 'user_ids'}, 'rename_group': {'title'},
-    'set_group_description': {'description'}, 'add_participant': {'user_id'},
-    'remove_participant': {'user_id'}, 'promote_participant': {'user_id'},
-    'demote_participant': {'user_id'}, 'leave_group': set(), 'get_invite_link': set(),
-    'revoke_invite_link': set(), 'add_contact': {'phone', 'first_name', 'last_name'},
-    'delete_contact': {'user_id'}, 'block_contact': {'user_id'},
-    'unblock_contact': {'user_id'}, 'update_profile': {'first_name', 'last_name', 'bio'},
-    'set_group_messages_admins_only': {'enabled'}, 'set_group_info_admins_only': {'enabled'},
-    'set_slow_mode': {'seconds'}, 'list_join_requests': {'limit'},
-    'approve_join_requests': {'user_ids'}, 'reject_join_requests': {'user_ids'},
-    'check_chat_link': {'link'}, 'join_chat': {'link'},
-    'open_chat_by_username': {'username', 'create'},
-    LIVE_SEARCH: {'query', 'chat_types', 'filter', 'from_time', 'to_time', 'limit', 'cursor'},
-    HISTORY: {'count', 'before_message', 'around_message', 'from_time', 'to_time'},
-}
+PARAMETERS = platform_parameters('telegram')
 # ANYM-242: each setter owns one value; the default rights flag it changes, or slow mode.
 GROUP_SETTERS = {'set_group_messages_admins_only': ('messages_admins_only', 'enabled', 'send_messages'),
                  'set_group_info_admins_only': ('info_admins_only', 'enabled', 'change_info'),
@@ -263,6 +236,745 @@ def message_info(message):
     return result
 
 
+class OperationContext:
+    """The per-request state of one _execute call, handed to its same-file handlers."""
+
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+
+async def read_chat_details(op):
+    operation, invoke, peer, chat, channel, basic_chat = (
+        op.operation, op.invoke, op.peer, op.chat, op.channel, op.basic_chat)
+    if channel:
+        full = await invoke(functions.channels.GetFullChannelRequest(channel))
+    elif basic_chat:
+        full = await invoke(functions.messages.GetFullChatRequest(basic_chat))
+    elif operation == 'chat_info':
+        full = await invoke(functions.users.GetFullUserRequest(utils.get_input_user(peer)))
+    else:
+        reject('unsupported_operation')
+    details = getattr(full, 'full_chat', None) or getattr(full, 'full_user', None)
+    if operation == 'get_invite_link':
+        invite = getattr(details, 'exported_invite', None)
+        return {'outcome': 'confirmed', 'link': safe_text(getattr(invite, 'link', None), 512),
+                'existing_only': True, 'revoked': getattr(invite, 'revoked', None)}
+    entities = getattr(full, 'chats', None) or getattr(full, 'users', None) or []
+    observed = next((e for e in entities if peer_id(e) == str(chat)), None)
+    settings = group_settings(observed, details) if (channel or basic_chat) and observed is not None else None
+    # The account's own role, by the catalog's rules, from the entity this request returned (ANYM-533).
+    from .chat_roles import derive
+    my_role, can_post = derive(observed, 'private' if not (channel or basic_chat) else
+                               'group' if basic_chat or getattr(observed, 'megagroup', False) else 'channel')
+    return {'outcome': 'confirmed', 'provider_chat_id': str(chat), 'my_role': my_role, 'can_post': can_post,
+            'title': safe_text(getattr(observed, 'title', None), 512),
+            'username': safe_text(getattr(observed, 'username', None), 128),
+            'description': safe_text(getattr(details, 'about', None), 2048),
+            'participant_count': safe_int(getattr(details, 'participants_count', None)),
+            'is_forum': bool(getattr(observed, 'forum', False)),
+            'group_settings': settings, 'basis': 'live_provider_observation'}
+
+
+async def read_participants(op):
+    parameters, invoke, channel, basic_chat = op.parameters, op.invoke, op.channel, op.basic_chat
+    limit, offset = min(parameters.get('limit', 50), MAX_PROFILE_PAGE), parameters.get('offset', 0)
+    if channel:
+        response = await invoke(functions.channels.GetParticipantsRequest(channel,
+            types.ChannelParticipantsSearch(''), offset, limit, 0))
+        members = [p.user_id for p in getattr(response, 'participants', [])[:limit]
+                   if type(getattr(p, 'user_id', None)) is int]
+        profiles = {u.id: profile(u) for u in getattr(response, 'users', []) if isinstance(u, types.User)}
+        users = [profiles.get(member) for member in members]
+        users = [u for u in users if u is not None]
+        total = safe_int(getattr(response, 'count', None))
+    elif basic_chat:
+        response = await invoke(functions.messages.GetFullChatRequest(basic_chat))
+        participants = getattr(getattr(response, 'full_chat', None), 'participants', None)
+        if not isinstance(participants, types.ChatParticipants):
+            return {'outcome': 'confirmed', 'participants': [], 'coverage': 'unavailable',
+                    'next_offset': None}
+        member_ids = {p.user_id for p in participants.participants}
+        candidates = [profile(u) for u in getattr(response, 'users', [])
+                      if isinstance(u, types.User) and u.id in member_ids]
+        total = len(candidates)
+        users = candidates[offset:offset + limit]
+    else:
+        reject('unsupported_operation')
+    return {'outcome': 'confirmed', 'participants': users, 'reported_count': total,
+            'next_offset': offset + len(users) if len(users) == limit else None,
+            'page_limit': limit,
+            'coverage': 'provider_page_not_complete_membership'}
+
+
+async def read_message_info(op):
+    exact_message, peer, chat, message_id = op.exact_message, op.peer, op.chat, op.message_id
+    message = await exact_message(peer, chat, message_id, missing_ok=True)
+    if message is None:
+        # ANYM-666: a message the provider no longer returns is gone; a wrong ID or chat still fails as a mismatch.
+        return {'outcome': 'confirmed', 'exists': False, 'provider_message_id': str(message_id),
+                'provider_chat_id': str(chat), 'basis': 'live_provider_observation'}
+    return {'outcome': 'confirmed', 'exists': True, **message_info(message)}
+
+
+def reactions_update(response, chat, message_id):
+    """The UpdateMessageReactions of this message in a response, else None. An absent Update is not proof of empty reactions."""
+    for update in getattr(response, 'updates', [])[:100]:
+        if isinstance(update, types.UpdateMessageReactions) and update.msg_id == message_id and peer_id(update.peer) == str(chat):
+            return update
+    return None
+
+
+async def read_reactions(op):
+    invoke, peer, chat, message_id = op.invoke, op.peer, op.chat, op.message_id
+    response = await invoke(functions.messages.GetMessagesReactionsRequest(peer, [message_id]))
+    update = reactions_update(response, chat, message_id)
+    return {'outcome': 'confirmed', 'provider_message_id': str(message_id),
+            'reactions': reaction_state(update.reactions if update is not None else None)}
+
+
+def read_back_evidence(**fields):
+    return {'basis': 'provider_read_back', **fields}
+
+
+def flood_evidence(error):
+    return read_back_evidence(retry_after_s=error.seconds)
+
+
+async def delete_read_back(op, submitted):
+    """ANYM-666: one scoped read of the message the delete addressed. Total: only a definite answer changes the
+    submitted result; a read error, timeout or flood wait leaves it as it was (a cancellation propagates)."""
+    from .telegram_governor import ProviderRateLimited
+    peer, chat, message_id, client, rpc = op.peer, op.chat, op.message_id, op.client, op.rpc
+    try:
+        # The scalar `ids` form: a list returns [None] in Telethon 1.45, which must not read as "present".
+        message = await rpc(lambda: client.get_messages(peer, ids=message_id), scope='read_back')
+    except asyncio.CancelledError:
+        raise
+    except ProviderRateLimited as error:
+        return {**submitted, 'evidence': flood_evidence(error)}
+    except Exception:
+        return submitted
+    if message is None or isinstance(message, types.MessageEmpty):
+        return {'outcome': 'confirmed', 'basis': 'provider_read_back', 'effect_verified': True,
+                'evidence': {'message_present': False}}
+    if getattr(message, 'id', None) == message_id and str(getattr(message, 'chat_id', None)) == str(chat):
+        return {**submitted, 'evidence': read_back_evidence(message_present=True)}
+    return submitted
+
+
+def chosen_reactions(reactions):
+    """The reactions this account chose, or None when the list is not authoritative (missing or a partial `min` copy)."""
+    if not isinstance(reactions, types.MessageReactions) or reactions.min:
+        return None
+    return [item for item in reaction_state(reactions)['counts'] if item['chosen']]
+
+
+async def reaction_read_back(op, response, submitted):
+    """ANYM-666: settle a reaction from its own response, else from one scoped read; never a second mutation."""
+    from .telegram_governor import ProviderRateLimited
+    peer, chat, message_id, rpc, client = op.peer, op.chat, op.message_id, op.rpc, op.client
+    wanted = op.parameters['emoji']
+
+    def verdict(reactions, basis):
+        chosen = chosen_reactions(reactions)
+        if chosen is None:
+            return None
+        mine = any(item['type'] == 'emoji' and item['emoji'] == wanted for item in chosen)
+        if mine if wanted else not chosen:
+            return {'outcome': 'confirmed', 'basis': basis, 'effect_verified': True,
+                    'evidence': {'reaction_present': bool(wanted)}}
+        # Definite but negative: the requested state is not the provider's (removal: a reaction is still chosen).
+        return {**submitted, 'evidence': read_back_evidence(reaction_present=not wanted)}
+
+    def settled(source, basis):
+        # A malformed update (an absent result list, a bad peer) is no answer: the submitted result stays.
+        try:
+            update = reactions_update(source, chat, message_id)
+            return verdict(update.reactions, basis) if update is not None else None
+        except Exception:
+            return None
+
+    answer = settled(response, 'provider_response')
+    if answer is not None:
+        # The response is authoritative; a response that shows the reaction missing is not re-read.
+        return answer if answer['outcome'] == 'confirmed' else submitted
+    try:
+        read = await rpc(lambda: client(functions.messages.GetMessagesReactionsRequest(peer, [message_id])),
+                         scope='read_back')
+    except asyncio.CancelledError:
+        raise
+    except ProviderRateLimited as error:
+        return {**submitted, 'evidence': flood_evidence(error)}
+    except Exception:
+        return submitted
+    return settled(read, 'provider_read_back') or submitted
+
+
+async def read_topics(op):
+    parameters, invoke, peer, channel = op.parameters, op.invoke, op.peer, op.channel
+    if channel is None:
+        reject('unsupported_operation')
+    limit = min(parameters.get('limit', 50), MAX_PROFILE_PAGE)
+    response = await invoke(functions.messages.GetForumTopicsRequest(peer, None,
+        0, 0, limit, q=None))
+    topics = [{'id': str(t.id), 'title': safe_text(t.title, 128), 'closed': bool(t.closed),
+               'hidden': bool(t.hidden), 'pinned': bool(t.pinned),
+               'top_message_id': str(t.top_message)}
+              for t in getattr(response, 'topics', [])[:limit]
+              if isinstance(t, types.ForumTopic)]
+    return {'outcome': 'confirmed', 'topics': topics,
+            'reported_count': safe_int(getattr(response, 'count', None)),
+            'next_offset': None, 'pagination_supported': False, 'page_limit': limit,
+            'coverage': 'first_provider_page'}
+
+
+async def read_profile(op):
+    operation, parameters, client, verified_self, rpc, invoke, allowed_provider_id = (
+        op.operation, op.parameters, op.client, op.verified_self, op.rpc, op.invoke, op.allowed_provider_id)
+    if operation == 'get_contact':
+        user_id = number_id(parameters.get('user_id'))
+        if not allowed_provider_id(user_id):
+            return {'outcome': 'confirmed', 'contact': None, 'found': False}
+        response = await invoke(functions.contacts.GetContactsRequest(0))
+        contact_ids = {u.user_id for u in getattr(response, 'contacts', [])}
+        user = next((u for u in getattr(response, 'users', [])
+                     if isinstance(u, types.User) and u.id == user_id and u.id in contact_ids), None)
+        return {'outcome': 'confirmed', 'contact': profile(user), 'found': user is not None}
+    if not isinstance(verified_self, types.User) or verified_self.is_self is not True:
+        reject('provider_identity_unverified')
+    user_id = verified_self.id
+    target = types.InputUserSelf()
+    user = await rpc(lambda: client.get_entity(target))
+    response = await invoke(functions.users.GetFullUserRequest(target))
+    result = profile(user)
+    if result is None or result['id'] != str(user_id):
+        reject('provider_reference_mismatch')
+    result['bio'] = safe_text(getattr(getattr(response, 'full_user', None), 'about', None), 2048)
+    return {'outcome': 'confirmed', 'profile': result}
+
+
+async def read_contacts(op):
+    operation, parameters, invoke, allowed_provider_id, collection_policy = (
+        op.operation, op.parameters, op.invoke, op.allowed_provider_id, op.collection_policy)
+    limit, offset = min(parameters.get('limit', 50), MAX_PROFILE_PAGE), parameters.get('offset', 0)
+    if operation == 'list_contacts':
+        response = await invoke(functions.contacts.GetContactsRequest(0))
+        contact_ids = {u.user_id for u in getattr(response, 'contacts', [])}
+        candidates = [profile(u) for u in getattr(response, 'users', [])
+                      if isinstance(u, types.User) and u.id in contact_ids and allowed_provider_id(u.id)]
+        if 'query' in parameters:
+            # ANYM-673: display name and username only, never the phone; the filter runs after the one provider call.
+            matches = contact_matcher(parameters['query'])
+            candidates = [c for c in candidates if matches(' '.join(filter(None, (c['first_name'], c['last_name']))), c['username'])]
+        return {'outcome': 'confirmed', 'contacts': candidates[offset:offset + limit],
+                'reported_count': len(candidates), 'page_limit': limit,
+                'next_offset': offset + limit if offset + limit < len(candidates) else None}
+    response = await invoke(functions.contacts.GetBlockedRequest(offset, limit))
+    entries = [{'peer_id': peer_id(item.peer_id),
+                'provider_at': item.date.isoformat() if isinstance(item.date, datetime) else None}
+               for item in getattr(response, 'blocked', [])[:limit]
+               if isinstance(item, types.PeerBlocked) and allowed_provider_id(peer_id(item.peer_id))]
+    raw_count = min(len(getattr(response, 'blocked', [])), limit)
+    return {'outcome': 'confirmed', 'blocked': entries,
+            'reported_count': None if collection_policy()['exclude_chats'] or
+                not collection_policy()['discover_chats'] else safe_int(getattr(response, 'count', None)),
+            'page_limit': limit, 'coverage': 'filtered_provider_page',
+            'next_offset': offset + raw_count if raw_count == limit else None}
+
+
+READ_HANDLERS = {
+    'chat_info': read_chat_details, 'get_invite_link': read_chat_details,
+    'list_participants': read_participants, 'get_message_info': read_message_info,
+    'get_reactions': read_reactions, 'list_topics': read_topics,
+    'get_profile': read_profile, 'get_contact': read_profile,
+    'list_contacts': read_contacts, 'list_blocked': read_contacts,
+}
+
+
+async def write_file(op):
+    parameters, job, info, stream, invoke, peer, accepted_updates, chat = (
+        op.parameters, op.job, op.info, op.stream, op.invoke, op.peer, op.accepted_updates, op.chat)
+    mode = parameters.get('mode', 'document')
+    name = job.get('file_name', 'attachment.bin')
+    mime = job.get('file_mime', 'application/octet-stream')
+    if (not isinstance(name, str) or not 1 <= len(name) <= 255 or
+            any(ord(c) < 32 or c in '/\\' for c in name) or
+            not isinstance(mime, str) or not re.fullmatch(r'[\w.+-]+/[\w.+-]+', mime)):
+        reject('attachment_unavailable')
+    if mode == 'photo' and (mime not in ('image/jpeg', 'image/png', 'image/webp') or info.st_size > 10 * 1024**2):
+        reject('unsupported_operation')
+    if mode in ('video', 'video_note') and not mime.startswith('video/'):
+        reject('invalid_parameters')
+    if mode in ('audio', 'voice') and not mime.startswith('audio/'):
+        reject('invalid_parameters')
+    expected_hash = job.get('file_digest', parameters.get('sha256'))
+    if not isinstance(expected_hash, str) or not re.fullmatch(r'[a-f0-9]{64}', expected_hash):
+        reject('attachment_unavailable')
+    sha = hashlib.sha256()
+    remaining = info.st_size
+    while remaining:
+        chunk = stream.read(min(512 * 1024, remaining))
+        if not chunk:
+            reject('attachment_unavailable')
+        sha.update(chunk)
+        remaining -= len(chunk)
+    after_hash = os.fstat(stream.fileno())
+    if (stream.read(1) or sha.hexdigest() != expected_hash or
+            (after_hash.st_size, after_hash.st_mtime_ns) != (info.st_size, info.st_mtime_ns)):
+        reject('attachment_unavailable')
+    stream.seek(0)
+    # Upload chunk requests are paced independently. Final SendMedia is a
+    # separate mutation, so expiry is checked again after all uploads.
+    upload_id = secrets.randbits(63)
+    part_size = 512 * 1024
+    parts = (info.st_size + part_size - 1) // part_size
+    large = info.st_size > 10 * 1024**2
+    md5 = hashlib.md5(usedforsecurity=False)
+    sha = hashlib.sha256()
+    for index in range(parts):
+        chunk = stream.read(part_size)
+        expected_size = min(part_size, info.st_size - index * part_size)
+        if len(chunk) != expected_size:
+            reject('attachment_unavailable')
+        md5.update(chunk)
+        sha.update(chunk)
+        request = functions.upload.SaveBigFilePartRequest(upload_id, index, parts, chunk) if large else \
+            functions.upload.SaveFilePartRequest(upload_id, index, chunk)
+        if await invoke(request, mutation=True) is not True:
+            return {'outcome': 'unknown', 'error': 'provider_upload_unverified'}
+    if stream.read(1) or sha.hexdigest() != expected_hash:
+        return {'outcome': 'unknown', 'error': 'attachment_changed_during_upload'}
+    uploaded = types.InputFileBig(upload_id, parts, name) if large else \
+        types.InputFile(upload_id, parts, name, md5.hexdigest())
+    if mode == 'photo':
+        media = types.InputMediaUploadedPhoto(uploaded)
+    else:
+        attributes = [types.DocumentAttributeFilename(name)]
+        if mode in ('audio', 'voice'):
+            attributes.append(types.DocumentAttributeAudio(0, voice=mode == 'voice'))
+        elif mode in ('video', 'video_note'):
+            attributes.append(types.DocumentAttributeVideo(0, 1, 1,
+                round_message=mode == 'video_note', supports_streaming=mode == 'video'))
+        media = types.InputMediaUploadedDocument(uploaded, mime, attributes, force_file=mode == 'document')
+    random_id = secrets.randbits(63)
+    response = await invoke(functions.messages.SendMediaRequest(peer, media,
+        parameters.get('caption', ''), random_id=random_id, clear_draft=False, entities=[]), mutation=True)
+    return accepted_updates(response, chat, random_id)
+
+
+async def write_forward(op):
+    input_peer, source_chat, exact_message, source_message, rpc, peer, client, accepted, chat = (
+        op.input_peer, op.source_chat, op.exact_message, op.source_message, op.rpc, op.peer, op.client, op.accepted, op.chat)
+    source = await input_peer(source_chat)
+    await exact_message(source, source_chat, source_message)
+    value = await rpc(lambda: client.forward_messages(peer, [source_message], from_peer=source,
+        drop_author=False, drop_media_captions=False), mutation=True)
+    return accepted(value, message=True, chat=chat)
+
+
+async def write_media_message(op):
+    operation, parameters, invoke, peer, accepted_updates, chat = (
+        op.operation, op.parameters, op.invoke, op.peer, op.accepted_updates, op.chat)
+    if operation == 'send_poll':
+        answers = [types.PollAnswer(types.TextWithEntities(value, []), index.to_bytes(1, 'big'))
+                   for index, value in enumerate(parameters['options'])]
+        media = types.InputMediaPoll(types.Poll(0,
+            types.TextWithEntities(parameters['question'], []), answers, hash=0,
+            multiple_choice=parameters.get('multiple', False), public_voters=False))
+    elif operation == 'send_contact':
+        if 'phone' not in parameters or 'first_name' not in parameters:
+            reject('invalid_parameters')
+        media = types.InputMediaContact(parameters['phone'], parameters['first_name'],
+            parameters.get('last_name', ''), '')
+    else:
+        media = types.InputMediaGeoPoint(types.InputGeoPoint(parameters['latitude'], parameters['longitude']))
+    random_id = secrets.randbits(63)
+    response = await invoke(functions.messages.SendMediaRequest(peer, media,
+        parameters.get('description', '') if operation == 'send_location' else '',
+        random_id=random_id, clear_draft=False, entities=[]), mutation=True)
+    return accepted_updates(response, chat, random_id)
+
+
+async def write_edit_delete(op):
+    exact_message, peer, chat, message_id, operation, accepted, rpc, parameters, client = (
+        op.exact_message, op.peer, op.chat, op.message_id, op.operation, op.accepted, op.rpc, op.parameters, op.client)
+    await exact_message(peer, chat, message_id, own=True)
+    if operation == 'edit_message':
+        bounded_text(parameters.get('text'), 4000)
+        response = await rpc(lambda: client.edit_message(peer, message_id, parameters['text'],
+            parse_mode=None, link_preview=False), mutation=True)
+        if getattr(response, 'message', None) != parameters['text'] or getattr(response, 'out', None) is not True:
+            return {'outcome': 'unknown', 'error': 'provider_result_unverified'}
+        return accepted(response, message=True, chat=chat, message_id=message_id)
+    response = await rpc(lambda: client.delete_messages(peer, [message_id], revoke=True), mutation=True)
+    submitted = accepted(response)
+    return await delete_read_back(op, submitted) if submitted['outcome'] == 'submitted' else submitted
+
+
+async def write_reaction(op):
+    parameters, accepted, invoke, peer, message_id = op.parameters, op.accepted, op.invoke, op.peer, op.message_id
+    reactions = [types.ReactionEmoji(parameters['emoji'])] if parameters['emoji'] else []
+    response = await invoke(functions.messages.SendReactionRequest(peer, message_id,
+        big=False, add_to_recent=False, reaction=reactions), mutation=True)
+    submitted = accepted(response)
+    return await reaction_read_back(op, response, submitted) if submitted['outcome'] == 'submitted' else submitted
+
+
+async def write_vote(op):
+    exact_message, peer, chat, message_id, parameters, accepted, invoke = (
+        op.exact_message, op.peer, op.chat, op.message_id, op.parameters, op.accepted, op.invoke)
+    message = await exact_message(peer, chat, message_id)
+    media = getattr(message, 'media', None)
+    if not isinstance(media, types.MessageMediaPoll):
+        reject('unsupported_operation')
+    poll = media.poll
+    choices = parameters['option_indices']
+    if (poll.closed or any(index >= len(poll.answers) for index in choices) or
+            (not poll.multiple_choice and len(choices) > 1)):
+        reject('invalid_parameters')
+    if getattr(poll, 'subscribers_only', False) or getattr(poll, 'countries_iso2', None):
+        reject('unsupported_operation')
+    selected = [poll.answers[index].option for index in choices]
+    return accepted(await invoke(functions.messages.SendVoteRequest(peer, message_id, selected), mutation=True))
+
+
+async def write_pin(op):
+    operation, client, accepted, rpc, peer, message_id = (
+        op.operation, op.client, op.accepted, op.rpc, op.peer, op.message_id)
+    fn = client.pin_message if operation == 'pin_message' else client.unpin_message
+    kwargs = {'notify': False} if operation == 'pin_message' else {}
+    return accepted(await rpc(lambda: fn(peer, message_id, **kwargs), mutation=True))
+
+
+async def write_mark_read(op):
+    channel, message_id, peer, accepted, invoke = op.channel, op.message_id, op.peer, op.accepted, op.invoke
+    request = functions.channels.ReadHistoryRequest(channel, message_id) if channel else \
+        functions.messages.ReadHistoryRequest(peer, message_id)
+    return accepted(await invoke(request, mutation=True))
+
+
+async def write_mark_unread(op):
+    accepted, invoke, peer = op.accepted, op.invoke, op.peer
+    return accepted(await invoke(functions.messages.MarkDialogUnreadRequest(
+        types.InputDialogPeer(peer), unread=True), mutation=True))
+
+
+async def write_archive(op):
+    accepted, rpc, peer, client, operation = op.accepted, op.rpc, op.peer, op.client, op.operation
+    return accepted(await rpc(lambda: client.edit_folder(peer,
+        folder=1 if operation == 'archive_chat' else 0), mutation=True))
+
+
+async def write_mute(op):
+    operation, parameters, accepted, invoke, peer = op.operation, op.parameters, op.accepted, op.invoke, op.peer
+    seconds = parameters.get('seconds') if operation == 'mute_chat' else 0
+    if operation == 'mute_chat':
+        integer(seconds, 1, 2**31 - 1)
+    # TL timestamps are signed 32-bit UTC epochs. Large requested durations
+    # beyond that bound cannot be represented faithfully.
+    mute_until = int(time.time()) + seconds if seconds else 0
+    if mute_until > 2**31 - 1:
+        reject('invalid_parameters')
+    settings = types.InputPeerNotifySettings(mute_until=datetime.fromtimestamp(mute_until, timezone.utc))
+    return accepted(await invoke(functions.account.UpdateNotifySettingsRequest(
+        types.InputNotifyPeer(peer), settings), mutation=True))
+
+
+MESSAGE_HANDLERS = {
+    'send_file': write_file, 'forward_message': write_forward, 'send_poll': write_media_message,
+    'send_contact': write_media_message, 'send_location': write_media_message, 'edit_message': write_edit_delete,
+    'delete_message': write_edit_delete, 'send_reaction': write_reaction, 'vote_poll': write_vote,
+    'pin_message': write_pin, 'unpin_message': write_pin, 'mark_read': write_mark_read,
+    'mark_unread': write_mark_unread, 'archive_chat': write_archive, 'unarchive_chat': write_archive,
+    'mute_chat': write_mute, 'unmute_chat': write_mute,
+}
+
+
+async def chat_link(op):
+    parameters, invoke, rpc, client, operation, job, join_refused, allowed_provider_id = (
+        op.parameters, op.invoke, op.rpc, op.client, op.operation, op.job, op.join_refused, op.allowed_provider_id)
+    link = parameters['link']
+    if link[0] == '+':
+        try:
+            invite = await invoke(functions.messages.CheckChatInviteRequest(link[1:]))
+        except errors.InviteHashExpiredError:
+            reject('invite_expired')
+        except (errors.InviteHashInvalidError, errors.InviteHashEmptyError):
+            reject('invite_invalid')
+        if isinstance(invite, types.ChatInvite):
+            target = None
+            observed = {'title': safe_text(invite.title, 255),
+                        'kind': 'channel' if invite.broadcast else 'group',
+                        'member_count': safe_int(invite.participants_count),
+                        'approval_required': bool(invite.request_needed),
+                        'paid': invite.subscription_pricing is not None,
+                        'membership': 'not_member', 'membership_basis': 'provider_invite'}
+        elif (isinstance(invite, (types.ChatInviteAlready, types.ChatInvitePeek)) and
+                isinstance(invite.chat, (types.Chat, types.Channel))):
+            target = invite.chat
+            observed = link_chat(target, 'member' if isinstance(invite, types.ChatInviteAlready) else 'not_member',
+                                 'provider_invite')
+        else:
+            reject('provider_reference_mismatch')
+    else:
+        try:
+            target = await rpc(lambda: client.get_entity(link[1:]))
+        except (errors.UsernameNotOccupiedError, errors.UsernameInvalidError, ValueError):
+            reject('invite_invalid')
+        if not isinstance(target, types.Channel):
+            reject('invite_invalid')  # A user or bot name is not a chat link.
+        observed = link_chat(target, {True: 'not_member', False: 'member'}.get(target.left, 'unknown'),
+                             'provider_public_chat')
+    if operation == 'check_chat_link':
+        return {'outcome': 'confirmed', **observed}
+    # The digest the owner confirmed names this chat; the link must still lead to it.
+    expected = job.get('expected_chat')
+    if not isinstance(expected, dict) or (observed['title'], observed['kind']) != (
+            expected.get('title'), expected.get('kind')):
+        reject('operation_target_changed')
+    if observed['membership'] == 'member':
+        reject('already_member')
+    if observed['paid']:
+        reject('join_not_allowed')
+    if observed['membership'] != 'not_member':
+        reject('operation_target_changed')
+    request = (functions.messages.ImportChatInviteRequest(link[1:]) if link[0] == '+' else
+               functions.channels.JoinChannelRequest(utils.get_input_channel(target)))
+    try:
+        response = await invoke(request, mutation=True)
+    except errors.InviteRequestSentError:
+        return {'outcome': 'confirmed', 'state': 'pending_approval', 'basis': 'provider_join_request_sent'}
+    except tuple(kind for kind, _ in JOIN_CHAT_REFUSALS) as error:
+        join_refused()
+        reject(next(code for kind, code in JOIN_CHAT_REFUSALS if isinstance(error, kind)))
+    joined = [c for c in getattr(response, 'chats', [])[:100] if isinstance(c, (types.Chat, types.Channel)) and
+              (target is None or utils.get_peer_id(c) == utils.get_peer_id(target))]
+    if len(joined) != 1 or peer_id(joined[0]) is None:
+        return {'outcome': 'unknown', 'error': 'provider_result_unverified'}
+    provider = peer_id(joined[0])
+    if allowed_provider_id(provider):
+        return {'outcome': 'confirmed', 'state': 'joined', 'archive': 'collected', 'provider_chat_id': provider,
+                'basis': 'provider_joined_chat'}
+    return {'outcome': 'confirmed', 'state': 'joined', 'archive': 'not_collected', 'next_step': JOIN_NEXT_STEP,
+            'basis': 'provider_joined_chat'}
+
+
+async def write_create_group(op):
+    ids, user_input, invoke, parameters, accepted = op.ids, op.user_input, op.invoke, op.parameters, op.accepted
+    users = [await user_input(value) for value in ids]
+    response = await invoke(functions.messages.CreateChatRequest(users, parameters['title']), mutation=True)
+    updates = response.updates if isinstance(response, types.messages.InvitedUsers) else response
+    chats = [c for c in getattr(updates, 'chats', []) if isinstance(c, types.Chat)]
+    if len(chats) == 1:
+        missing = [str(item.user_id) for item in getattr(response, 'missing_invitees', [])[:20]
+                   if isinstance(item, types.MissingInvitee) and item.user_id in ids]
+        return {'outcome': 'confirmed', 'provider_chat_id': peer_id(chats[0]),
+                'missing_invitee_ids': missing, 'all_members_added': not missing
+                    if isinstance(response, types.messages.InvitedUsers) else None,
+                'basis': 'provider_created_chat'}
+    return accepted(response)
+
+
+async def write_group_change(op):
+    channel, basic_chat, operation, peer, parameters, verified_self, user_input, accepted, invoke = (
+        op.channel, op.basic_chat, op.operation, op.peer, op.parameters, op.verified_self, op.user_input,
+        op.accepted, op.invoke)
+    if channel is None and basic_chat is None:
+        reject('unsupported_operation')
+    if operation == 'rename_group':
+        bounded_text(parameters.get('title'), 128)
+        request = functions.channels.EditTitleRequest(channel, parameters['title']) if channel else \
+            functions.messages.EditChatTitleRequest(basic_chat, parameters['title'])
+    elif operation == 'set_group_description':
+        bounded_text(parameters.get('description'), 255, empty=True)
+        request = functions.messages.EditChatAboutRequest(peer, parameters['description'])
+    elif operation == 'leave_group':
+        if channel:
+            request = functions.channels.LeaveChannelRequest(channel)
+        else:
+            request = functions.messages.DeleteChatUserRequest(basic_chat, types.InputUserSelf(), revoke_history=False)
+    else:
+        user_id = number_id(parameters.get('user_id'))
+        if isinstance(verified_self, types.User) and user_id == verified_self.id:
+            reject('invalid_parameters')
+        if operation == 'promote_participant' and channel is None:
+            reject('unsupported_operation')
+        user = await user_input(user_id)
+        if operation == 'add_participant':
+            request = functions.channels.InviteToChannelRequest(channel, [user]) if channel else \
+                functions.messages.AddChatUserRequest(basic_chat, user, fwd_limit=0)
+        elif operation == 'remove_participant':
+            if channel:
+                # Basic kick/unban can have partial effects. Do not silently
+                # turn a remove operation into a persistent ban.
+                reject('unsupported_operation')
+            request = functions.messages.DeleteChatUserRequest(basic_chat, user, revoke_history=False)
+        elif channel:
+            rights = types.ChatAdminRights(change_info=operation == 'promote_participant',
+                invite_users=operation == 'promote_participant', pin_messages=operation == 'promote_participant',
+                post_messages=False, edit_messages=False, delete_messages=False, ban_users=False,
+                add_admins=False, anonymous=False, manage_call=False, other=False)
+            request = functions.channels.EditAdminRequest(channel, user, rights, rank='')
+        else:
+            request = functions.messages.EditChatAdminRequest(basic_chat, user, is_admin=False)
+    return accepted(await invoke(request, mutation=True))
+
+
+async def write_revoke_invite(op):
+    channel, basic_chat, invoke, accepted, peer = op.channel, op.basic_chat, op.invoke, op.accepted, op.peer
+    if channel is None and basic_chat is None:
+        reject('unsupported_operation')
+    response = await invoke(functions.channels.GetFullChannelRequest(channel) if channel else
+        functions.messages.GetFullChatRequest(basic_chat))
+    invite = getattr(getattr(response, 'full_chat', None), 'exported_invite', None)
+    link = safe_text(getattr(invite, 'link', None), 512)
+    if not isinstance(link, str) or not re.fullmatch(r'https://t\.me/(?:\+|joinchat/)[A-Za-z0-9_-]+', link):
+        reject('invite_link_unavailable')
+    return accepted(await invoke(functions.messages.EditExportedChatInviteRequest(peer,
+        link, revoked=True), mutation=True))
+
+
+async def write_group_setting(op):
+    channel, basic_chat, invoke, chat, operation, parameters, peer = (
+        op.channel, op.basic_chat, op.invoke, op.chat, op.operation, op.parameters, op.peer)
+    if channel is None and basic_chat is None:
+        reject('unsupported_operation')
+
+    async def group_state():
+        full = await invoke(functions.channels.GetFullChannelRequest(channel) if channel else
+            functions.messages.GetFullChatRequest(basic_chat))
+        entity = next((e for e in getattr(full, 'chats', None) or [] if peer_id(e) == str(chat)), None)
+        if entity is None:
+            reject('provider_reference_mismatch')
+        return entity, group_settings(entity, getattr(full, 'full_chat', None))
+
+    field, key, flag = GROUP_SETTERS[operation]
+    value = parameters[key]
+    entity, state = await group_state()
+    if (isinstance(entity, types.Channel) and not entity.megagroup) or (flag is None and channel is None):
+        reject('unsupported_operation')
+    # Both default rights and slow mode need the ban right; refuse before any mutation.
+    if not group_admin(entity, 'ban_users'):
+        reject('forbidden')
+    previous = state[field]
+    if previous is None:
+        reject('unsupported_operation')
+    if previous == value:
+        return {'outcome': 'confirmed', key: value, 'previous': previous, 'changed': False}
+    if flag is None:
+        request = functions.channels.ToggleSlowModeRequest(channel, value)
+    else:
+        # The freshly read rights with only the owned flag changed; until_date and the rest stay.
+        read = entity.default_banned_rights
+        rights = types.ChatBannedRights(**{name: getattr(read, name) for name in BANNED_RIGHTS_FIELDS})
+        setattr(rights, flag, value)
+        request = functions.messages.EditChatDefaultBannedRightsRequest(peer, rights)
+    await invoke(request, mutation=True)
+    _, state = await group_state()
+    if state[field] == value:
+        return {'outcome': 'confirmed', key: value, 'previous': previous, 'changed': True}
+    return {'outcome': 'submitted', key: value, 'previous': previous, 'changed': True,
+            'basis': 'provider_request_returned', 'effect_verified': False}
+
+
+async def read_join_requests(op):
+    channel, basic_chat, parameters, invoke, peer = op.channel, op.basic_chat, op.parameters, op.invoke, op.peer
+    if channel is None and basic_chat is None:
+        reject('unsupported_operation')
+
+    limit = parameters.get('limit', 50)
+    response = await invoke(functions.messages.GetChatInviteImportersRequest(peer, offset_date=None,
+        offset_user=types.InputUserEmpty(), limit=limit, requested=True))
+    users = {u.id: u for u in getattr(response, 'users', None) or [] if isinstance(u, types.User)}
+    importers = [i for i in getattr(response, 'importers', None) or []
+                 if isinstance(i, types.ChatInviteImporter) and safe_int(i.user_id)][:limit]
+    rows, size = [], 0
+    for item in importers:
+        user = users.get(item.user_id)
+        name = ' '.join(filter(None, (safe_text(getattr(user, 'first_name', None), 64),
+                                      safe_text(getattr(user, 'last_name', None), 64)))) or None
+        row = {'id': str(item.user_id), 'name': name, 'note': utf16_text(item.about, 200),
+               'requested_at': int(item.date.timestamp()) if isinstance(item.date, datetime) else None}
+        # Bounded so the receipt stays under the result budget; the rest is has_more.
+        size += len(json.dumps(row, ensure_ascii=False).encode())
+        if size > JOIN_REQUESTS_BYTES:
+            break
+        rows.append(row)
+    count = safe_int(getattr(response, 'count', None))
+    return {'outcome': 'confirmed', 'requests': rows, 'untrusted': ['name', 'note'],
+            'has_more': len(rows) < len(importers) or (count is not None and count > len(rows))}
+
+
+async def write_join_requests(op):
+    channel, basic_chat, operation, parameters, user_input, client, entered, clock, rpc, peer = (
+        op.channel, op.basic_chat, op.operation, op.parameters, op.user_input, op.client, op.entered, op.clock,
+        op.rpc, op.peer)
+    if channel is None and basic_chat is None:
+        reject('unsupported_operation')
+
+    approved, ids, rows = operation == 'approve_join_requests', parameters['user_ids'], []
+
+    async def requester(value):
+        # A requester cached in the session file (list_join_requests stores it) resolves
+        # locally without a paced call, so 20 IDs fit the worker's 30 s; only an uncached
+        # one costs a paced lookup.
+        uid = number_id(value)
+        try:
+            cached = await utils.maybe_async(client.session.get_input_entity(types.PeerUser(uid)))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            cached = None
+        if isinstance(cached, types.InputPeerUser) and cached.user_id == uid:
+            return utils.get_input_user(cached)
+        return await user_input(value)
+    for index, value in enumerate(ids):
+        attempted = False
+        if clock() - entered >= JOIN_BATCH_BUDGET_SECONDS:
+            rows.extend({'id': later, 'state': 'not_attempted'} for later in ids[index:])
+            break
+
+        async def hide():
+            nonlocal attempted
+            attempted = True
+            return await client(functions.messages.HideChatJoinRequestRequest(peer, user, approved=approved))
+        try:
+            # The mutation's rpc rechecks expiry, access and the trusted preflight right before it.
+            user = await requester(value)
+            # A spent budget raises JoinBatchBudgetSpent: this ID and the rest are not_attempted.
+            await rpc(hide, mutation=True, budget=True)
+            rows.append({'id': value, 'state': 'applied'})
+            continue
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            code = JOIN_REFUSAL_ERRORS.get(type(error))
+            if attempted and code:
+                rows.append({'id': value, 'state': 'refused', 'reason': JOIN_REFUSALS[code],
+                             'provider_code': code[:64]})
+                continue
+        rows.append({'id': value, 'state': 'unknown' if attempted else 'not_attempted'})
+        rows.extend({'id': later, 'state': 'not_attempted'} for later in ids[index + 1:])
+        break
+    settled = all(row['state'] in ('applied', 'refused') for row in rows)
+    return {'outcome': 'confirmed' if settled else 'unknown', 'results': rows,
+            'all_applied': all(row['state'] == 'applied' for row in rows)}
+
+
+GROUP_HANDLERS = {
+    'check_chat_link': chat_link, 'join_chat': chat_link, 'create_group': write_create_group,
+    'rename_group': write_group_change, 'set_group_description': write_group_change,
+    'add_participant': write_group_change, 'remove_participant': write_group_change,
+    'promote_participant': write_group_change, 'demote_participant': write_group_change,
+    'leave_group': write_group_change, 'revoke_invite_link': write_revoke_invite,
+    'set_group_messages_admins_only': write_group_setting, 'set_group_info_admins_only': write_group_setting,
+    'set_slow_mode': write_group_setting, 'list_join_requests': read_join_requests,
+    'approve_join_requests': write_join_requests, 'reject_join_requests': write_join_requests,
+}
+
+HANDLERS = {**READ_HANDLERS, **MESSAGE_HANDLERS, **GROUP_HANDLERS}
+
+
 async def _execute(client, job, *, verified_self=None, governor=None):
     """Execute exactly one prepared, bounded operation without automatic retries.
 
@@ -278,6 +990,12 @@ async def _execute(client, job, *, verified_self=None, governor=None):
     parameters = job.get('parameters', {})
     if not isinstance(parameters, dict) or set(parameters) - PARAMETERS[operation]:
         reject('invalid_parameters')
+    if operation == 'list_contacts' and 'query' in parameters:
+        # ANYM-673: the backend validated it already; a malformed query never reaches the provider call either way.
+        try:
+            validate_operation('telegram', operation, parameters)
+        except ValueError:
+            reject('invalid_parameters')
     expiry = job.get('expires_at')
     if type(expiry) not in (int, float) or not math.isfinite(expiry):
         reject('invalid_parameters')
@@ -296,6 +1014,8 @@ async def _execute(client, job, *, verified_self=None, governor=None):
         # The shared rate gate and lookups may delay the first mutation.
         report('waiting')
     stream = None
+    ids = None
+    info = source_chat = source_message = None
     referenced_peers = set()
 
     def collection_policy():
@@ -327,7 +1047,9 @@ async def _execute(client, job, *, verified_self=None, governor=None):
         async def guarded():
             nonlocal started_mutation
             check_expiry()
-            preflight = job.get('_preflight')
+            # ANYM-666: the read-back after a mutation runs the governor and the expiry check, not the dispatch
+            # preflight: its saved-state rules (a message the archive already marks deleted) describe the request.
+            preflight = None if scope == 'read_back' else job.get('_preflight')
             if preflight is not None:
                 if not callable(preflight):
                     reject('operation_access_changed')
@@ -359,8 +1081,10 @@ async def _execute(client, job, *, verified_self=None, governor=None):
             reject('invalid_parameters')
         return utils.get_input_user(candidate)
 
-    async def exact_message(peer, chat, message_id, *, own=False):
+    async def exact_message(peer, chat, message_id, *, own=False, missing_ok=False):
         message = await rpc(lambda: client.get_messages(peer, ids=message_id))
+        if missing_ok and (message is None or isinstance(message, types.MessageEmpty)):
+            return None
         if (message is None or getattr(message, 'id', None) != message_id or
                 str(getattr(message, 'chat_id', None)) != str(chat)):
             reject('provider_reference_mismatch')
@@ -397,6 +1121,10 @@ async def _execute(client, job, *, verified_self=None, governor=None):
                     peer_id(getattr(candidate, 'peer_id', None)) == str(chat)):
                 return accepted(candidate, message=True, chat=chat)
         return accepted(value)
+
+    def join_refused():
+        nonlocal started_mutation
+        started_mutation = False  # A definite refusal: the provider joined nothing.
 
     try:
         # Validate every parameter before the first provider read/mutation.
@@ -494,13 +1222,16 @@ async def _execute(client, job, *, verified_self=None, governor=None):
                                      referenced_peers, check_policy)
         if operation == HISTORY:
             return await chat_history(client, job, parameters, governor, rpc, referenced_peers, check_policy)
+        if operation == INSPECT_BUTTONS:
+            return await inspect_message_buttons(client, job, governor, rpc, referenced_peers, check_policy)
 
         account_only = {'list_contacts', 'list_blocked', 'get_contact', 'get_profile',
                         'add_contact', 'delete_contact', 'block_contact', 'unblock_contact',
                         'update_profile', 'create_group', 'check_chat_link', 'join_chat'}
         chat = None if operation in account_only else number_id(job.get('provider_chat'), marked=True)
         message_operations = {'get_reactions', 'get_message_info', 'edit_message', 'delete_message',
-                              'send_reaction', 'vote_poll', 'pin_message', 'unpin_message', 'mark_read'}
+                              'send_reaction', 'vote_poll', 'pin_message', 'unpin_message', 'mark_read',
+                              'press_button'}
         message_id = number_id(job.get('provider_message_id')) if operation in message_operations else None
         if message_id is not None and message_id > 2**31 - 1:
             reject('invalid_parameters')
@@ -517,542 +1248,35 @@ async def _execute(client, job, *, verified_self=None, governor=None):
         if operation == 'create_group':
             referenced_peers.update(str(user) for user in ids)
         check_policy()
+        if operation == 'press_button':
+            # ANYM-676: over the pacing budget nothing reaches the provider, not even the peer lookup.
+            from .button_press_executor import admit
+            await admit(governor)
         peer = await input_peer(chat) if chat is not None else None
         channel = utils.get_input_channel(peer) if isinstance(peer, types.InputPeerChannel) else None
         basic_chat = peer.chat_id if isinstance(peer, types.InputPeerChat) else None
 
-        if operation in ('check_chat_link', 'join_chat'):
-            link = parameters['link']
-            if link[0] == '+':
-                try:
-                    invite = await invoke(functions.messages.CheckChatInviteRequest(link[1:]))
-                except errors.InviteHashExpiredError:
-                    reject('invite_expired')
-                except (errors.InviteHashInvalidError, errors.InviteHashEmptyError):
-                    reject('invite_invalid')
-                if isinstance(invite, types.ChatInvite):
-                    target = None
-                    observed = {'title': safe_text(invite.title, 255),
-                                'kind': 'channel' if invite.broadcast else 'group',
-                                'member_count': safe_int(invite.participants_count),
-                                'approval_required': bool(invite.request_needed),
-                                'paid': invite.subscription_pricing is not None,
-                                'membership': 'not_member', 'membership_basis': 'provider_invite'}
-                elif (isinstance(invite, (types.ChatInviteAlready, types.ChatInvitePeek)) and
-                        isinstance(invite.chat, (types.Chat, types.Channel))):
-                    target = invite.chat
-                    observed = link_chat(target, 'member' if isinstance(invite, types.ChatInviteAlready) else 'not_member',
-                                         'provider_invite')
-                else:
-                    reject('provider_reference_mismatch')
-            else:
-                try:
-                    target = await rpc(lambda: client.get_entity(link[1:]))
-                except (errors.UsernameNotOccupiedError, errors.UsernameInvalidError, ValueError):
-                    reject('invite_invalid')
-                if not isinstance(target, types.Channel):
-                    reject('invite_invalid')  # A user or bot name is not a chat link.
-                observed = link_chat(target, {True: 'not_member', False: 'member'}.get(target.left, 'unknown'),
-                                     'provider_public_chat')
-            if operation == 'check_chat_link':
-                return {'outcome': 'confirmed', **observed}
-            # The digest the owner confirmed names this chat; the link must still lead to it.
-            expected = job.get('expected_chat')
-            if not isinstance(expected, dict) or (observed['title'], observed['kind']) != (
-                    expected.get('title'), expected.get('kind')):
-                reject('operation_target_changed')
-            if observed['membership'] == 'member':
-                reject('already_member')
-            if observed['paid']:
-                reject('join_not_allowed')
-            if observed['membership'] != 'not_member':
-                reject('operation_target_changed')
-            request = (functions.messages.ImportChatInviteRequest(link[1:]) if link[0] == '+' else
-                       functions.channels.JoinChannelRequest(utils.get_input_channel(target)))
-            try:
-                response = await invoke(request, mutation=True)
-            except errors.InviteRequestSentError:
-                return {'outcome': 'confirmed', 'state': 'pending_approval', 'basis': 'provider_join_request_sent'}
-            except tuple(kind for kind, _ in JOIN_CHAT_REFUSALS) as error:
-                started_mutation = False  # A definite refusal: the provider joined nothing.
-                reject(next(code for kind, code in JOIN_CHAT_REFUSALS if isinstance(error, kind)))
-            joined = [c for c in getattr(response, 'chats', [])[:100] if isinstance(c, (types.Chat, types.Channel)) and
-                      (target is None or utils.get_peer_id(c) == utils.get_peer_id(target))]
-            if len(joined) != 1 or peer_id(joined[0]) is None:
-                return {'outcome': 'unknown', 'error': 'provider_result_unverified'}
-            provider = peer_id(joined[0])
-            if allowed_provider_id(provider):
-                return {'outcome': 'confirmed', 'state': 'joined', 'archive': 'collected', 'provider_chat_id': provider,
-                        'basis': 'provider_joined_chat'}
-            return {'outcome': 'confirmed', 'state': 'joined', 'archive': 'not_collected', 'next_step': JOIN_NEXT_STEP,
-                    'basis': 'provider_joined_chat'}
+        handler = HANDLERS.get(operation)
+        if handler is not None:
+            return await handler(OperationContext(
+                accepted=accepted, accepted_updates=accepted_updates, allowed_provider_id=allowed_provider_id,
+                basic_chat=basic_chat, channel=channel, chat=chat, client=client, clock=clock,
+                collection_policy=collection_policy, entered=entered, exact_message=exact_message, ids=ids,
+                info=info, input_peer=input_peer, invoke=invoke, job=job, join_refused=join_refused,
+                message_id=message_id, operation=operation, parameters=parameters, peer=peer, rpc=rpc,
+                source_chat=source_chat, source_message=source_message, stream=stream, user_input=user_input,
+                verified_self=verified_self))
 
-        if operation in ('chat_info', 'get_invite_link'):
-            if channel:
-                full = await invoke(functions.channels.GetFullChannelRequest(channel))
-            elif basic_chat:
-                full = await invoke(functions.messages.GetFullChatRequest(basic_chat))
-            elif operation == 'chat_info':
-                full = await invoke(functions.users.GetFullUserRequest(utils.get_input_user(peer)))
-            else:
-                reject('unsupported_operation')
-            details = getattr(full, 'full_chat', None) or getattr(full, 'full_user', None)
-            if operation == 'get_invite_link':
-                invite = getattr(details, 'exported_invite', None)
-                return {'outcome': 'confirmed', 'link': safe_text(getattr(invite, 'link', None), 512),
-                        'existing_only': True, 'revoked': getattr(invite, 'revoked', None)}
-            entities = getattr(full, 'chats', None) or getattr(full, 'users', None) or []
-            observed = next((e for e in entities if peer_id(e) == str(chat)), None)
-            settings = group_settings(observed, details) if (channel or basic_chat) and observed is not None else None
-            # The account's own role, by the catalog's rules, from the entity this request returned (ANYM-533).
-            from .chat_roles import derive
-            my_role, can_post = derive(observed, 'private' if not (channel or basic_chat) else
-                                       'group' if basic_chat or getattr(observed, 'megagroup', False) else 'channel')
-            return {'outcome': 'confirmed', 'provider_chat_id': str(chat), 'my_role': my_role, 'can_post': can_post,
-                    'title': safe_text(getattr(observed, 'title', None), 512),
-                    'username': safe_text(getattr(observed, 'username', None), 128),
-                    'description': safe_text(getattr(details, 'about', None), 2048),
-                    'participant_count': safe_int(getattr(details, 'participants_count', None)),
-                    'is_forum': bool(getattr(observed, 'forum', False)),
-                    'group_settings': settings, 'basis': 'live_provider_observation'}
+        if operation == 'press_button':
+            # ANYM-676: one press of one callback button, bound to the preview; the callback data never leaves
+            # button_press_executor except inside the one Telegram request.
+            from .button_press_executor import press
 
-        if operation == 'list_participants':
-            limit, offset = min(parameters.get('limit', 50), MAX_PROFILE_PAGE), parameters.get('offset', 0)
-            if channel:
-                response = await invoke(functions.channels.GetParticipantsRequest(channel,
-                    types.ChannelParticipantsSearch(''), offset, limit, 0))
-                members = [p.user_id for p in getattr(response, 'participants', [])[:limit]
-                           if type(getattr(p, 'user_id', None)) is int]
-                profiles = {u.id: profile(u) for u in getattr(response, 'users', []) if isinstance(u, types.User)}
-                users = [profiles.get(member) for member in members]
-                users = [u for u in users if u is not None]
-                total = safe_int(getattr(response, 'count', None))
-            elif basic_chat:
-                response = await invoke(functions.messages.GetFullChatRequest(basic_chat))
-                participants = getattr(getattr(response, 'full_chat', None), 'participants', None)
-                if not isinstance(participants, types.ChatParticipants):
-                    return {'outcome': 'confirmed', 'participants': [], 'coverage': 'unavailable',
-                            'next_offset': None}
-                member_ids = {p.user_id for p in participants.participants}
-                candidates = [profile(u) for u in getattr(response, 'users', [])
-                              if isinstance(u, types.User) and u.id in member_ids]
-                total = len(candidates)
-                users = candidates[offset:offset + limit]
-            else:
-                reject('unsupported_operation')
-            return {'outcome': 'confirmed', 'participants': users, 'reported_count': total,
-                    'next_offset': offset + len(users) if len(users) == limit else None,
-                    'page_limit': limit,
-                    'coverage': 'provider_page_not_complete_membership'}
-
-        if operation == 'get_message_info':
-            return {'outcome': 'confirmed', **message_info(await exact_message(peer, chat, message_id))}
-
-        if operation == 'get_reactions':
-            response = await invoke(functions.messages.GetMessagesReactionsRequest(peer, [message_id]))
-            for update in getattr(response, 'updates', [])[:100]:
-                if isinstance(update, types.UpdateMessageReactions) and update.msg_id == message_id and peer_id(update.peer) == str(chat):
-                    return {'outcome': 'confirmed', 'provider_message_id': str(message_id),
-                            'reactions': reaction_state(update.reactions)}
-            # An absent Update is not proof of empty reactions.
-            return {'outcome': 'confirmed', 'provider_message_id': str(message_id),
-                    'reactions': reaction_state(None)}
-
-        if operation == 'list_topics':
-            if channel is None:
-                reject('unsupported_operation')
-            limit = min(parameters.get('limit', 50), MAX_PROFILE_PAGE)
-            response = await invoke(functions.messages.GetForumTopicsRequest(peer, None,
-                0, 0, limit, q=None))
-            topics = [{'id': str(t.id), 'title': safe_text(t.title, 128), 'closed': bool(t.closed),
-                       'hidden': bool(t.hidden), 'pinned': bool(t.pinned),
-                       'top_message_id': str(t.top_message)}
-                      for t in getattr(response, 'topics', [])[:limit]
-                      if isinstance(t, types.ForumTopic)]
-            return {'outcome': 'confirmed', 'topics': topics,
-                    'reported_count': safe_int(getattr(response, 'count', None)),
-                    'next_offset': None, 'pagination_supported': False, 'page_limit': limit,
-                    'coverage': 'first_provider_page'}
-
-        if operation in ('get_profile', 'get_contact'):
-            if operation == 'get_contact':
-                user_id = number_id(parameters.get('user_id'))
-                if not allowed_provider_id(user_id):
-                    return {'outcome': 'confirmed', 'contact': None, 'found': False}
-                response = await invoke(functions.contacts.GetContactsRequest(0))
-                contact_ids = {u.user_id for u in getattr(response, 'contacts', [])}
-                user = next((u for u in getattr(response, 'users', [])
-                             if isinstance(u, types.User) and u.id == user_id and u.id in contact_ids), None)
-                return {'outcome': 'confirmed', 'contact': profile(user), 'found': user is not None}
-            if not isinstance(verified_self, types.User) or verified_self.is_self is not True:
-                reject('provider_identity_unverified')
-            user_id = verified_self.id
-            target = types.InputUserSelf()
-            user = await rpc(lambda: client.get_entity(target))
-            response = await invoke(functions.users.GetFullUserRequest(target))
-            result = profile(user)
-            if result is None or result['id'] != str(user_id):
-                reject('provider_reference_mismatch')
-            result['bio'] = safe_text(getattr(getattr(response, 'full_user', None), 'about', None), 2048)
-            return {'outcome': 'confirmed', 'profile': result}
-
-        if operation in ('list_contacts', 'list_blocked'):
-            limit, offset = min(parameters.get('limit', 50), MAX_PROFILE_PAGE), parameters.get('offset', 0)
-            if operation == 'list_contacts':
-                response = await invoke(functions.contacts.GetContactsRequest(0))
-                contact_ids = {u.user_id for u in getattr(response, 'contacts', [])}
-                candidates = [profile(u) for u in getattr(response, 'users', [])
-                              if isinstance(u, types.User) and u.id in contact_ids and allowed_provider_id(u.id)]
-                return {'outcome': 'confirmed', 'contacts': candidates[offset:offset + limit],
-                        'reported_count': len(candidates), 'page_limit': limit,
-                        'next_offset': offset + limit if offset + limit < len(candidates) else None}
-            response = await invoke(functions.contacts.GetBlockedRequest(offset, limit))
-            entries = [{'peer_id': peer_id(item.peer_id),
-                        'provider_at': item.date.isoformat() if isinstance(item.date, datetime) else None}
-                       for item in getattr(response, 'blocked', [])[:limit]
-                       if isinstance(item, types.PeerBlocked) and allowed_provider_id(peer_id(item.peer_id))]
-            raw_count = min(len(getattr(response, 'blocked', [])), limit)
-            return {'outcome': 'confirmed', 'blocked': entries,
-                    'reported_count': None if collection_policy()['exclude_chats'] or
-                        not collection_policy()['discover_chats'] else safe_int(getattr(response, 'count', None)),
-                    'page_limit': limit, 'coverage': 'filtered_provider_page',
-                    'next_offset': offset + raw_count if raw_count == limit else None}
-
-        if operation == 'send_file':
-            mode = parameters.get('mode', 'document')
-            name = job.get('file_name', 'attachment.bin')
-            mime = job.get('file_mime', 'application/octet-stream')
-            if (not isinstance(name, str) or not 1 <= len(name) <= 255 or
-                    any(ord(c) < 32 or c in '/\\' for c in name) or
-                    not isinstance(mime, str) or not re.fullmatch(r'[\w.+-]+/[\w.+-]+', mime)):
-                reject('attachment_unavailable')
-            if mode == 'photo' and (mime not in ('image/jpeg', 'image/png', 'image/webp') or info.st_size > 10 * 1024**2):
-                reject('unsupported_operation')
-            if mode in ('video', 'video_note') and not mime.startswith('video/'):
-                reject('invalid_parameters')
-            if mode in ('audio', 'voice') and not mime.startswith('audio/'):
-                reject('invalid_parameters')
-            expected_hash = job.get('file_digest', parameters.get('sha256'))
-            if not isinstance(expected_hash, str) or not re.fullmatch(r'[a-f0-9]{64}', expected_hash):
-                reject('attachment_unavailable')
-            sha = hashlib.sha256()
-            remaining = info.st_size
-            while remaining:
-                chunk = stream.read(min(512 * 1024, remaining))
-                if not chunk:
-                    reject('attachment_unavailable')
-                sha.update(chunk)
-                remaining -= len(chunk)
-            after_hash = os.fstat(stream.fileno())
-            if (stream.read(1) or sha.hexdigest() != expected_hash or
-                    (after_hash.st_size, after_hash.st_mtime_ns) != (info.st_size, info.st_mtime_ns)):
-                reject('attachment_unavailable')
-            stream.seek(0)
-            # Upload chunk requests are paced independently. Final SendMedia is a
-            # separate mutation, so expiry is checked again after all uploads.
-            upload_id = secrets.randbits(63)
-            part_size = 512 * 1024
-            parts = (info.st_size + part_size - 1) // part_size
-            large = info.st_size > 10 * 1024**2
-            md5 = hashlib.md5(usedforsecurity=False)
-            sha = hashlib.sha256()
-            for index in range(parts):
-                chunk = stream.read(part_size)
-                expected_size = min(part_size, info.st_size - index * part_size)
-                if len(chunk) != expected_size:
-                    reject('attachment_unavailable')
-                md5.update(chunk)
-                sha.update(chunk)
-                request = functions.upload.SaveBigFilePartRequest(upload_id, index, parts, chunk) if large else \
-                    functions.upload.SaveFilePartRequest(upload_id, index, chunk)
-                if await invoke(request, mutation=True) is not True:
-                    return {'outcome': 'unknown', 'error': 'provider_upload_unverified'}
-            if stream.read(1) or sha.hexdigest() != expected_hash:
-                return {'outcome': 'unknown', 'error': 'attachment_changed_during_upload'}
-            uploaded = types.InputFileBig(upload_id, parts, name) if large else \
-                types.InputFile(upload_id, parts, name, md5.hexdigest())
-            if mode == 'photo':
-                media = types.InputMediaUploadedPhoto(uploaded)
-            else:
-                attributes = [types.DocumentAttributeFilename(name)]
-                if mode in ('audio', 'voice'):
-                    attributes.append(types.DocumentAttributeAudio(0, voice=mode == 'voice'))
-                elif mode in ('video', 'video_note'):
-                    attributes.append(types.DocumentAttributeVideo(0, 1, 1,
-                        round_message=mode == 'video_note', supports_streaming=mode == 'video'))
-                media = types.InputMediaUploadedDocument(uploaded, mime, attributes, force_file=mode == 'document')
-            random_id = secrets.randbits(63)
-            response = await invoke(functions.messages.SendMediaRequest(peer, media,
-                parameters.get('caption', ''), random_id=random_id, clear_draft=False, entities=[]), mutation=True)
-            return accepted_updates(response, chat, random_id)
-
-        if operation == 'forward_message':
-            source = await input_peer(source_chat)
-            await exact_message(source, source_chat, source_message)
-            value = await rpc(lambda: client.forward_messages(peer, [source_message], from_peer=source,
-                drop_author=False, drop_media_captions=False), mutation=True)
-            return accepted(value, message=True, chat=chat)
-
-        if operation in ('send_poll', 'send_contact', 'send_location'):
-            if operation == 'send_poll':
-                answers = [types.PollAnswer(types.TextWithEntities(value, []), index.to_bytes(1, 'big'))
-                           for index, value in enumerate(parameters['options'])]
-                media = types.InputMediaPoll(types.Poll(0,
-                    types.TextWithEntities(parameters['question'], []), answers, hash=0,
-                    multiple_choice=parameters.get('multiple', False), public_voters=False))
-            elif operation == 'send_contact':
-                if 'phone' not in parameters or 'first_name' not in parameters:
-                    reject('invalid_parameters')
-                media = types.InputMediaContact(parameters['phone'], parameters['first_name'],
-                    parameters.get('last_name', ''), '')
-            else:
-                media = types.InputMediaGeoPoint(types.InputGeoPoint(parameters['latitude'], parameters['longitude']))
-            random_id = secrets.randbits(63)
-            response = await invoke(functions.messages.SendMediaRequest(peer, media,
-                parameters.get('description', '') if operation == 'send_location' else '',
-                random_id=random_id, clear_draft=False, entities=[]), mutation=True)
-            return accepted_updates(response, chat, random_id)
-
-        if operation in ('edit_message', 'delete_message'):
-            await exact_message(peer, chat, message_id, own=True)
-            if operation == 'edit_message':
-                bounded_text(parameters.get('text'), 4000)
-                response = await rpc(lambda: client.edit_message(peer, message_id, parameters['text'],
-                    parse_mode=None, link_preview=False), mutation=True)
-                if getattr(response, 'message', None) != parameters['text'] or getattr(response, 'out', None) is not True:
-                    return {'outcome': 'unknown', 'error': 'provider_result_unverified'}
-                return accepted(response, message=True, chat=chat, message_id=message_id)
-            response = await rpc(lambda: client.delete_messages(peer, [message_id], revoke=True), mutation=True)
-            return accepted(response)
-
-        if operation == 'send_reaction':
-            reactions = [types.ReactionEmoji(parameters['emoji'])] if parameters['emoji'] else []
-            return accepted(await invoke(functions.messages.SendReactionRequest(peer, message_id,
-                big=False, add_to_recent=False, reaction=reactions), mutation=True))
-
-        if operation == 'vote_poll':
-            message = await exact_message(peer, chat, message_id)
-            media = getattr(message, 'media', None)
-            if not isinstance(media, types.MessageMediaPoll):
-                reject('unsupported_operation')
-            poll = media.poll
-            choices = parameters['option_indices']
-            if (poll.closed or any(index >= len(poll.answers) for index in choices) or
-                    (not poll.multiple_choice and len(choices) > 1)):
-                reject('invalid_parameters')
-            if getattr(poll, 'subscribers_only', False) or getattr(poll, 'countries_iso2', None):
-                reject('unsupported_operation')
-            selected = [poll.answers[index].option for index in choices]
-            return accepted(await invoke(functions.messages.SendVoteRequest(peer, message_id, selected), mutation=True))
-
-        if operation in ('pin_message', 'unpin_message'):
-            fn = client.pin_message if operation == 'pin_message' else client.unpin_message
-            kwargs = {'notify': False} if operation == 'pin_message' else {}
-            return accepted(await rpc(lambda: fn(peer, message_id, **kwargs), mutation=True))
-
-        if operation == 'mark_read':
-            request = functions.channels.ReadHistoryRequest(channel, message_id) if channel else \
-                functions.messages.ReadHistoryRequest(peer, message_id)
-            return accepted(await invoke(request, mutation=True))
-        if operation == 'mark_unread':
-            return accepted(await invoke(functions.messages.MarkDialogUnreadRequest(
-                types.InputDialogPeer(peer), unread=True), mutation=True))
-        if operation in ('archive_chat', 'unarchive_chat'):
-            return accepted(await rpc(lambda: client.edit_folder(peer,
-                folder=1 if operation == 'archive_chat' else 0), mutation=True))
-        if operation in ('mute_chat', 'unmute_chat'):
-            seconds = parameters.get('seconds') if operation == 'mute_chat' else 0
-            if operation == 'mute_chat':
-                integer(seconds, 1, 2**31 - 1)
-            # TL timestamps are signed 32-bit UTC epochs. Large requested durations
-            # beyond that bound cannot be represented faithfully.
-            mute_until = int(time.time()) + seconds if seconds else 0
-            if mute_until > 2**31 - 1:
-                reject('invalid_parameters')
-            settings = types.InputPeerNotifySettings(mute_until=datetime.fromtimestamp(mute_until, timezone.utc))
-            return accepted(await invoke(functions.account.UpdateNotifySettingsRequest(
-                types.InputNotifyPeer(peer), settings), mutation=True))
-
-        if operation == 'create_group':
-            users = [await user_input(value) for value in ids]
-            response = await invoke(functions.messages.CreateChatRequest(users, parameters['title']), mutation=True)
-            updates = response.updates if isinstance(response, types.messages.InvitedUsers) else response
-            chats = [c for c in getattr(updates, 'chats', []) if isinstance(c, types.Chat)]
-            if len(chats) == 1:
-                missing = [str(item.user_id) for item in getattr(response, 'missing_invitees', [])[:20]
-                           if isinstance(item, types.MissingInvitee) and item.user_id in ids]
-                return {'outcome': 'confirmed', 'provider_chat_id': peer_id(chats[0]),
-                        'missing_invitee_ids': missing, 'all_members_added': not missing
-                            if isinstance(response, types.messages.InvitedUsers) else None,
-                        'basis': 'provider_created_chat'}
-            return accepted(response)
-
-        if operation in ('rename_group', 'set_group_description', 'add_participant', 'remove_participant',
-                         'promote_participant', 'demote_participant', 'leave_group'):
-            if channel is None and basic_chat is None:
-                reject('unsupported_operation')
-            if operation == 'rename_group':
-                bounded_text(parameters.get('title'), 128)
-                request = functions.channels.EditTitleRequest(channel, parameters['title']) if channel else \
-                    functions.messages.EditChatTitleRequest(basic_chat, parameters['title'])
-            elif operation == 'set_group_description':
-                bounded_text(parameters.get('description'), 255, empty=True)
-                request = functions.messages.EditChatAboutRequest(peer, parameters['description'])
-            elif operation == 'leave_group':
-                if channel:
-                    request = functions.channels.LeaveChannelRequest(channel)
-                else:
-                    request = functions.messages.DeleteChatUserRequest(basic_chat, types.InputUserSelf(), revoke_history=False)
-            else:
-                user_id = number_id(parameters.get('user_id'))
-                if isinstance(verified_self, types.User) and user_id == verified_self.id:
-                    reject('invalid_parameters')
-                if operation == 'promote_participant' and channel is None:
-                    reject('unsupported_operation')
-                user = await user_input(user_id)
-                if operation == 'add_participant':
-                    request = functions.channels.InviteToChannelRequest(channel, [user]) if channel else \
-                        functions.messages.AddChatUserRequest(basic_chat, user, fwd_limit=0)
-                elif operation == 'remove_participant':
-                    if channel:
-                        # Basic kick/unban can have partial effects. Do not silently
-                        # turn a remove operation into a persistent ban.
-                        reject('unsupported_operation')
-                    request = functions.messages.DeleteChatUserRequest(basic_chat, user, revoke_history=False)
-                elif channel:
-                    rights = types.ChatAdminRights(change_info=operation == 'promote_participant',
-                        invite_users=operation == 'promote_participant', pin_messages=operation == 'promote_participant',
-                        post_messages=False, edit_messages=False, delete_messages=False, ban_users=False,
-                        add_admins=False, anonymous=False, manage_call=False, other=False)
-                    request = functions.channels.EditAdminRequest(channel, user, rights, rank='')
-                else:
-                    request = functions.messages.EditChatAdminRequest(basic_chat, user, is_admin=False)
-            return accepted(await invoke(request, mutation=True))
-
-        if operation == 'revoke_invite_link':
-            if channel is None and basic_chat is None:
-                reject('unsupported_operation')
-            response = await invoke(functions.channels.GetFullChannelRequest(channel) if channel else
-                functions.messages.GetFullChatRequest(basic_chat))
-            invite = getattr(getattr(response, 'full_chat', None), 'exported_invite', None)
-            link = safe_text(getattr(invite, 'link', None), 512)
-            if not isinstance(link, str) or not re.fullmatch(r'https://t\.me/(?:\+|joinchat/)[A-Za-z0-9_-]+', link):
-                reject('invite_link_unavailable')
-            return accepted(await invoke(functions.messages.EditExportedChatInviteRequest(peer,
-                link, revoked=True), mutation=True))
-
-        if operation in GROUP_SETTERS or operation in ('list_join_requests', 'approve_join_requests', 'reject_join_requests'):
-            if channel is None and basic_chat is None:
-                reject('unsupported_operation')
-
-        async def group_state():
-            full = await invoke(functions.channels.GetFullChannelRequest(channel) if channel else
-                functions.messages.GetFullChatRequest(basic_chat))
-            entity = next((e for e in getattr(full, 'chats', None) or [] if peer_id(e) == str(chat)), None)
-            if entity is None:
-                reject('provider_reference_mismatch')
-            return entity, group_settings(entity, getattr(full, 'full_chat', None))
-
-        if operation in GROUP_SETTERS:
-            field, key, flag = GROUP_SETTERS[operation]
-            value = parameters[key]
-            entity, state = await group_state()
-            if (isinstance(entity, types.Channel) and not entity.megagroup) or (flag is None and channel is None):
-                reject('unsupported_operation')
-            # Both default rights and slow mode need the ban right; refuse before any mutation.
-            if not group_admin(entity, 'ban_users'):
-                reject('forbidden')
-            previous = state[field]
-            if previous is None:
-                reject('unsupported_operation')
-            if previous == value:
-                return {'outcome': 'confirmed', key: value, 'previous': previous, 'changed': False}
-            if flag is None:
-                request = functions.channels.ToggleSlowModeRequest(channel, value)
-            else:
-                # The freshly read rights with only the owned flag changed; until_date and the rest stay.
-                read = entity.default_banned_rights
-                rights = types.ChatBannedRights(**{name: getattr(read, name) for name in BANNED_RIGHTS_FIELDS})
-                setattr(rights, flag, value)
-                request = functions.messages.EditChatDefaultBannedRightsRequest(peer, rights)
-            await invoke(request, mutation=True)
-            _, state = await group_state()
-            if state[field] == value:
-                return {'outcome': 'confirmed', key: value, 'previous': previous, 'changed': True}
-            return {'outcome': 'submitted', key: value, 'previous': previous, 'changed': True,
-                    'basis': 'provider_request_returned', 'effect_verified': False}
-
-        if operation == 'list_join_requests':
-            limit = parameters.get('limit', 50)
-            response = await invoke(functions.messages.GetChatInviteImportersRequest(peer, offset_date=None,
-                offset_user=types.InputUserEmpty(), limit=limit, requested=True))
-            users = {u.id: u for u in getattr(response, 'users', None) or [] if isinstance(u, types.User)}
-            importers = [i for i in getattr(response, 'importers', None) or []
-                         if isinstance(i, types.ChatInviteImporter) and safe_int(i.user_id)][:limit]
-            rows, size = [], 0
-            for item in importers:
-                user = users.get(item.user_id)
-                name = ' '.join(filter(None, (safe_text(getattr(user, 'first_name', None), 64),
-                                              safe_text(getattr(user, 'last_name', None), 64)))) or None
-                row = {'id': str(item.user_id), 'name': name, 'note': utf16_text(item.about, 200),
-                       'requested_at': int(item.date.timestamp()) if isinstance(item.date, datetime) else None}
-                # Bounded so the receipt stays under the result budget; the rest is has_more.
-                size += len(json.dumps(row, ensure_ascii=False).encode())
-                if size > JOIN_REQUESTS_BYTES:
-                    break
-                rows.append(row)
-            count = safe_int(getattr(response, 'count', None))
-            return {'outcome': 'confirmed', 'requests': rows, 'untrusted': ['name', 'note'],
-                    'has_more': len(rows) < len(importers) or (count is not None and count > len(rows))}
-
-        if operation in ('approve_join_requests', 'reject_join_requests'):
-            approved, ids, rows = operation == 'approve_join_requests', parameters['user_ids'], []
-
-            async def requester(value):
-                # A requester cached in the session file (list_join_requests stores it) resolves
-                # locally without a paced call, so 20 IDs fit the worker's 30 s; only an uncached
-                # one costs a paced lookup.
-                uid = number_id(value)
-                try:
-                    cached = await utils.maybe_async(client.session.get_input_entity(types.PeerUser(uid)))
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    cached = None
-                if isinstance(cached, types.InputPeerUser) and cached.user_id == uid:
-                    return utils.get_input_user(cached)
-                return await user_input(value)
-            for index, value in enumerate(ids):
-                attempted = False
-                if clock() - entered >= JOIN_BATCH_BUDGET_SECONDS:
-                    rows.extend({'id': later, 'state': 'not_attempted'} for later in ids[index:])
-                    break
-
-                async def hide():
-                    nonlocal attempted
-                    attempted = True
-                    return await client(functions.messages.HideChatJoinRequestRequest(peer, user, approved=approved))
-                try:
-                    # The mutation's rpc rechecks expiry, access and the trusted preflight right before it.
-                    user = await requester(value)
-                    # A spent budget raises JoinBatchBudgetSpent: this ID and the rest are not_attempted.
-                    await rpc(hide, mutation=True, budget=True)
-                    rows.append({'id': value, 'state': 'applied'})
-                    continue
-                except asyncio.CancelledError:
-                    raise
-                except Exception as error:
-                    code = JOIN_REFUSAL_ERRORS.get(type(error))
-                    if attempted and code:
-                        rows.append({'id': value, 'state': 'refused', 'reason': JOIN_REFUSALS[code],
-                                     'provider_code': code[:64]})
-                        continue
-                rows.append({'id': value, 'state': 'unknown' if attempted else 'not_attempted'})
-                rows.extend({'id': later, 'state': 'not_attempted'} for later in ids[index + 1:])
-                break
-            settled = all(row['state'] in ('applied', 'refused') for row in rows)
-            return {'outcome': 'confirmed' if settled else 'unknown', 'results': rows,
-                    'all_applied': all(row['state'] == 'applied' for row in rows)}
+            def clear_started():
+                nonlocal started_mutation
+                started_mutation = False  # A definite refusal: the bot received nothing.
+            return await press(client, job, governor, rpc, invoke, peer, chat, message_id, clear_started,
+                               check_policy)
 
         if operation == 'add_contact':
             if 'phone' not in parameters or 'first_name' not in parameters:
@@ -1304,6 +1528,77 @@ async def live_search(client, job, parameters, governor, rpc, allowed_provider_i
     counts['returned'] = len(hits)
     finish('done')
     return result
+
+
+async def inspect_message_buttons(client, job, governor, rpc, referenced_peers, check_policy):
+    """ANYM-681: one live read of one message's inline keyboard, with a keyed fingerprint per callback button.
+
+    It does not use exact_message: its reads go through the 'inspect_buttons' scope, so a FloodWait pauses only
+    this read, and the governor refuses (rate_limited) instead of waiting. The callback data stays in local
+    variables of button_inspection: the failure paths below format no exception text."""
+    from .button_inspection import inspect
+    from .commands import CommandRejected
+    from .telegram_governor import ProviderRateLimited
+    chat = number_id(job.get('provider_chat'), marked=True)
+    message_id = number_id(job.get('provider_message_id'))
+    if message_id > 2**31 - 1:
+        reject('invalid_parameters')
+    referenced_peers.add(str(chat))
+    check_policy()
+
+    def limited(seconds):
+        history_log.info('inspect_message_buttons state=rate_limited')
+        raise CommandRejected('rate_limited', retry_after=max(1, int(seconds)))
+
+    if governor is not None:
+        # Entity resolution and the message read: both are counted before any provider call.
+        wait = await governor.admit('inspect_buttons', 2)
+        if wait:
+            limited(wait)
+    # The SDK keeps its own FloodWait memory per RPC constructor, shared with every other get_messages. When one of
+    # THIS read's requests is flood-waited, put back only the entry of that request's constructor (to what it was
+    # before the request), so the governor's scope, not the SDK, decides who is paused; entries that other
+    # SDK work (updates, differences) writes meanwhile are never touched.
+    waits = getattr(client, '_flood_waited_requests', None)
+
+    def owned(call):
+        async def work():
+            before = dict(waits) if isinstance(waits, dict) else None
+            try:
+                return await call()
+            except errors.FloodWaitError as exc:
+                constructor = getattr(getattr(exc, 'request', None), 'CONSTRUCTOR_ID', None)
+                if before is not None and constructor is not None:
+                    if constructor in before:
+                        waits[constructor] = before[constructor]
+                    else:
+                        waits.pop(constructor, None)
+                raise
+        return work
+
+    try:
+        peer = await rpc(owned(lambda: client.get_input_entity(chat)), scope='inspect_buttons')
+        message = await rpc(owned(lambda: client.get_messages(peer, ids=message_id)), scope='inspect_buttons')
+    except ProviderRateLimited as exc:
+        limited(exc.seconds)
+    except (errors.ChannelPrivateError, errors.ChatAdminRequiredError, errors.PeerIdInvalidError,
+            errors.MessageIdInvalidError):
+        raise CommandRejected('not_found') from None
+    except errors.RPCError:
+        raise CommandRejected('operation_rejected') from None
+    except CommandRejected:
+        raise
+    except Exception:
+        # Provider text may carry anything: a fixed code, and no exception context to print.
+        raise CommandRejected('provider_preflight_failed') from None
+    if (message is None or getattr(message, 'id', None) != message_id or
+            str(getattr(message, 'chat_id', None)) != str(chat)):
+        reject('not_found')
+    try:
+        return {'outcome': 'confirmed', **inspect(message, chat, message_id)}
+    except Exception:
+        # The failure may carry callback bytes or the key in its frames: raise a fixed code with no context.
+        raise CommandRejected('provider_preflight_failed') from None
 
 
 async def chat_history(client, job, parameters, governor, rpc, referenced_peers, check_policy):

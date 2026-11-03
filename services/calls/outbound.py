@@ -15,6 +15,36 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from core import ACTIVE, AgentBrief, BriefInput, ServiceError, now
 import destination_policy as policy
 
+# ANYM-657: Twilio's error code -> a fixed cause word. Only an integer code and this vocabulary leave the process:
+# never Twilio's message, more_info or body text.
+TWILIO_CAUSES={21215:'geo_permission_missing',13227:'geo_permission_missing',21211:'invalid_destination',
+    13224:'invalid_destination',21214:'destination_not_reachable',21217:'destination_not_dialable',
+    21219:'destination_unverified',21210:'source_number_invalid',21212:'source_number_invalid',
+    21213:'source_number_invalid',21216:'destination_blocked',20429:'rate_limited',
+    20003:'provider_auth_failed',20404:'provider_auth_failed'}
+MAX_ERROR_BODY=65536
+
+
+def rejection(response):
+    """{http_status, code, cause} of a Twilio 4xx on create-call; code is the body's integer `code` of 1-6 digits."""
+    code=None
+    try:
+        if len(response.content)<=MAX_ERROR_BODY:
+            body=response.json()
+            value=body.get('code') if isinstance(body,dict) else None
+            if type(value) is int and 1<=value<=999999: code=value
+    except Exception:
+        code=None
+    return {'http_status':response.status_code,'code':code,'cause':TWILIO_CAUSES.get(code,'provider_rejected_other')}
+
+
+def callback_error(value):
+    """{code, cause} of a status callback's ErrorCode (1-5 digits), else None. A code outside the table is call_failed_other."""
+    if not isinstance(value,str) or not re.fullmatch(r'[0-9]{1,5}',value): return None
+    code=int(value)
+    return {'code':code,'cause':TWILIO_CAUSES.get(code,'call_failed_other')}
+
+
 E164=re.compile(r'\+[1-9][0-9]{7,14}')
 RAISE_FIELDS=('id','created_at','expires_at','principal','owner_instruction','extra_units')
 SIP=re.compile(r'sips?:[A-Za-z0-9_.+-]{1,80}@[A-Za-z0-9.-]{1,200}(?::[0-9]{1,5})?(?:;transport=(?:tcp|tls|udp))?(?:;secure=true)?')
@@ -121,7 +151,8 @@ class TwilioCalls:
             data.update(SipAuthUsername=self.config['sip_auth_username'],SipAuthPassword=self.config['sip_auth_password'])
         r=await self.http.post(self._root()+'/Calls.json',data=data,auth=self._auth())
         if r.status_code not in {200,201}:
-            if 400<=r.status_code<500: raise ServiceError('provider_rejected')
+            if 400<=r.status_code<500:
+                error=ServiceError('provider_rejected'); error.provider_error=rejection(r); raise error
             raise httpx.ReadError('ambiguous_provider_response')
         value=r.json()
         if not re.fullmatch(r'CA[0-9a-fA-F]{32}',value.get('sid','')):
@@ -277,7 +308,8 @@ class Outbound:
                 else:
                     await self.providers[call['brief']['account']].hangup(receipt['provider_call_id'])
             except ServiceError as exc:
-                self.service.provider_update(cid,dial_state='rejected',provider_status=exc.code)
+                self.service.provider_update(cid,dial_state='rejected',provider_status=exc.code,
+                                             **({'provider_error':exc.provider_error} if getattr(exc,'provider_error',None) else {}))
                 await self._end_runtime(cid,'provider_rejected')
             except (Exception,asyncio.CancelledError) as exc:
                 # A timeout/connection loss is not proof that the provider did not dial.

@@ -1,7 +1,16 @@
-# Explicit opt-in overlay; ordinary `compose up` does not start either worker.
+# Explicit opt-in overlay; ordinary `compose up` does not start any worker.
 # Build targets: enricher (native audio + configured API) and enricher-local
 # (also CPU faster-whisper). No model weights are downloaded by either image.
-# Use exactly the intended profile and a private enabled/account-scoped config.
+# Use exactly the intended profile (enrichment-local, enrichment-cloud or
+# enrichment-mini) and a private enabled/account-scoped config.
+# ANYM-688: enricher-mini (profile enrichment-mini) sends files to the owner's Mac
+# mini only. It runs the published enricher-local image on two networks: inference_db
+# (internal, gateway mode `isolated`: PostgreSQL and no other container, no host
+# address) and inference_egress (bridge dk-inference0, this worker only), which the
+# host rules of `scripts/inference_egress_check.py rules --mini-ip <ip>` narrow to
+# the mini's address on TCP 443. It never joins backend or frontend. Set
+# INFERENCE_MINI_NAME (the mini's .ts.net name, as in base_url) and INFERENCE_MINI_IP
+# (its tailnet address) in the project's env file; the placeholders below fail closed.
 # Each DSN must use messaging_enricher, never the gateway or migration role.
 x-enrichment-common: &enrichment-common
   init: true
@@ -91,3 +100,59 @@ services:
         source: ./private/processing-locks
         target: /processing-locks
         bind: {create_host_path: false}
+  # ANYM-688: the worker for the owner's Mac mini. Config holds only deedkit_inference
+  # profiles (deploy/enrichment-mini.example.json). The key is mounted as a directory,
+  # so an atomic rotation of inference.key reaches the running worker.
+  enricher-mini:
+    <<: *enrichment-common
+    profiles: [enrichment-mini]
+    image: anymsg-enricher-local:${MESSAGING_VERSION:-0.9.9}
+    build:
+      context: ..
+      target: enricher-local
+    networks: [inference_db, inference_egress]
+    # The mini's name is pinned (no DNS needed for it); the resolver is the mini's
+    # address too, so any other lookup goes where the host rules drop it.
+    extra_hosts:
+      - "${INFERENCE_MINI_NAME:-deedkit-inference.example-tailnet.ts.net}:${INFERENCE_MINI_IP:-100.64.0.1}"
+    dns: ["${INFERENCE_MINI_IP:-100.64.0.1}"]
+    # ANYM-697: room for an original of up to 200 MiB (the audio profile maximum) plus the Opus form (at most 32 MiB).
+    tmpfs: ["/tmp:size=320m,noexec,nosuid"]
+    volumes:
+      - type: bind
+        source: ./private/enrichment-local.dsn
+        target: /run/secrets/database_url
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ./private/enrichment-mini.json
+        target: /run/secrets/enrichment_config
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ./private/inference
+        target: /run/secrets/inference
+        read_only: true
+        bind: {create_host_path: false}
+      - files:/data:ro
+      - type: bind
+        source: ./private/processing-locks
+        target: /processing-locks
+        bind: {create_host_path: false}
+  # The database joins the worker's internal network, as it joins delivery_db.
+  db:
+    networks: [inference_db]
+
+networks:
+  inference_db:
+    internal: true
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: dk-inferencedb0
+      # No host address on the bridge: the host is unreachable even without host rules.
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+  inference_egress:
+    driver: bridge
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: dk-inference0

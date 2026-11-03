@@ -1,0 +1,130 @@
+{
+ "version": 1,
+ "packages": {
+  "mlx-vlm": "0.7.11",
+  "mlx-whisper": "0.4.3",
+  "onnx-asr": "0.12.0",
+  "onnxruntime": "1.31.1",
+  "huggingface-hub": "2.4.0"
+ },
+ "phases": {
+  "vision-default/vlm": {
+   "model": {
+    "repo": "mlx-community/Qwen3.5-4B-MLX-4bit",
+    "revision": "32f3e8ecf65426fc3306969496342d504bfa13f3",
+    "files": {
+     "config.json": {
+      "size": 3366,
+      "sha256": "f3efc81b2ea8d96a45301037d3ccccbcccdef44a961845c87f286aaddbc6eaaa"
+     },
+     "model.safetensors": {
+      "size": 3034300695,
+      "sha256": "5fb9acd0246866381cf8c5c354c6db1019f6498eec4ccb4f5edcc71ffeacb2db"
+     },
+     "model.safetensors.index.json": {
+      "size": 101944,
+      "sha256": "52e534c41f7b97708329c85f762e5882bf48bd5955a422c6ae74eba321e6048a"
+     },
+     "tokenizer.json": {
+      "size": 19989343,
+      "sha256": "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4"
+     },
+     "tokenizer_config.json": {
+      "size": 1139,
+      "sha256": "e98f1901ac6f0adff67b1d540bfa0c36ac1a0cf59eb72ed78146ef89aafa1182"
+     },
+     "vocab.json": {
+      "size": 6722759,
+      "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+     },
+     "chat_template.jinja": {
+      "size": 7756,
+      "sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
+     },
+     "preprocessor_config.json": {
+      "size": 390,
+      "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+     },
+     "processor_config.json": {
+      "size": 1300,
+      "sha256": "14932921ca485d458a04dafd8069fbb0a4505622a48208d19ed247115801385b"
+     },
+     "video_preprocessor_config.json": {
+      "size": 385,
+      "sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+     }
+    }
+   }
+  },
+  "audio-default/langid": {
+   "model": {
+    "repo": "mlx-community/whisper-base-mlx",
+    "revision": "1e3e249fb8d01c655324bd6841b1deadffd6d04c",
+    "files": {
+     "config.json": {
+      "size": 262,
+      "sha256": "737220a6d958b3ad48e78f840fa991556266983c84ea2ca40e413389c62e4c2f"
+     },
+     "weights.npz": {
+      "size": 143724204,
+      "sha256": "2f57d5f3ef473054c638961f90716f4ee415e8108de81313eccb2c5fd62eff0b"
+     }
+    }
+   }
+  },
+  "audio-default/gigaam": {
+   "model": {
+    "repo": "istupakov/gigaam-v3-onnx",
+    "revision": "322c3b29492673eb7d0b434bfa9dfb8653e34d02",
+    "files": {
+     "config.json": {
+      "size": 135,
+      "sha256": "0641fcf73f4af791c73f05083e38a658ff5dcbee3534a0c61396c10f4b97f0fe"
+     },
+     "v3_e2e_rnnt_encoder.onnx": {
+      "size": 885084534,
+      "sha256": "cd60b3764a832e8560ae6d3ad0b10adc1a42ffae412b9476f25620aae4f4a508"
+     },
+     "v3_e2e_rnnt_decoder.onnx": {
+      "size": 4599910,
+      "sha256": "7b0a16d67fd2cb37061decc93c69e364a9ab27afee3c57495d55b1c974cf7231"
+     },
+     "v3_e2e_rnnt_joint.onnx": {
+      "size": 2712896,
+      "sha256": "602ff7017a93311aad34df1437c8d7f49911353c13d6eae7a6ee7b041339465c"
+     },
+     "v3_e2e_rnnt_vocab.txt": {
+      "size": 13354,
+      "sha256": "39abae20e692998290c574e606f11a9edef2902a1995463fcff63d1490cf22b7"
+     }
+    }
+   },
+   "vad": {
+    "repo": "istupakov/silero-vad-onnx",
+    "revision": "b3e3ee3cce4c11ceb63b1a0b229d916069c1ddf6",
+    "files": {
+     "silero_vad.onnx": {
+      "size": 2327524,
+      "sha256": "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
+     }
+    }
+   }
+  },
+  "audio-default/whisper": {
+   "model": {
+    "repo": "mlx-community/whisper-large-v3-turbo",
+    "revision": "a4aaeec0636e6fef84abdcbe3544cb2bf7e9f6fb",
+    "files": {
+     "config.json": {
+      "size": 268,
+      "sha256": "b34fc29e4e11e0a25e812775dd67f4dd16fc2c8eb43d28ae25ff7d660ecb6379"
+     },
+     "weights.safetensors": {
+      "size": 1613977612,
+      "sha256": "951ed3fc1203e6a62467abb2144a96ce7eafca8fa77e3704fdb8635ff3e7f8a6"
+     }
+    }
+   }
+  }
+ }
+}

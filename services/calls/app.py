@@ -24,7 +24,7 @@ from control import control_key, create_control
 from agent_api import AgentAPI, AgentRegistry
 from learning import LearningWorker, ANALYZER_MODEL
 from supervisor import Supervisor, SUPERVISOR_MODEL
-from outbound import Outbound,CallingSettings,TwilioCalls,ExternalBrief
+from outbound import Outbound,CallingSettings,TwilioCalls,ExternalBrief,callback_error
 from destination_policy import PREMIUM_UNITS,recipient_policy
 from settings import Setup,read_private,write_private
 from call_errors import record_model_error
@@ -562,7 +562,11 @@ def create_app(data_dir=None, archive=None, control_token=None, reviewer=None, a
             raise HTTPException(403,'Attempt mismatch')
         status=params.get('CallStatus','')
         if status not in {'completed','busy','failed','no-answer','canceled'}:return {'ok':True}
-        service.provider_update(identity,provider_status=status)
+        values={'provider_status':status}
+        # ANYM-657: a failed callback's ErrorCode is a fixed cause; busy, no-answer and a bare failed set none.
+        error=callback_error(params.get('ErrorCode')) if status=='failed' and 'provider_error' not in call else None
+        if error:values['provider_error']=error
+        service.provider_update(identity,**values)
         if call['status'] in ACTIVE:await stop_runtime(identity,'provider_'+status)
         return {'ok':True}
 

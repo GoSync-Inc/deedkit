@@ -18,15 +18,21 @@ Blocked targets are explicit IP:PORT pairs with a known listener (production.md 
 the dispatcher cannot resolve sends no packet and proves nothing. An open target passes only when TCP connects. A
 blocked target passes only when nothing answers (timeout, no route): a refused connection means the address
 answered, which a DROP rule never does, and an unresolved or malformed target fails.
+
+Persistence (ANYM-693, as root on the host): `rules --resolver IP --format ufw --family v4|v6` prints the block that
+/etc/ufw/before.rules and before6.rules hold, and `verify` compares the repository (`DELIVERY_RESOLVER` in the env file),
+those files and the kernel: `ok`, or `<pair> <code>` per differing pair, exit 1. Nothing here changes a firewall.
 """
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import ipaddress
 import json
 import socket
 import sys
 import time
+from pathlib import Path
 
 BRIDGE = 'dk-delivery0'
 # Internal bridges in gateway mode `isolated` hold no host address (a plain internal network reaches the host
@@ -59,6 +65,31 @@ def undo():
             f'ip6tables -D DOCKER-USER -i {BRIDGE} -j DROP',
             *[f'ip6tables -D INPUT -i {bridge} -j DROP' for bridge in (BRIDGE, *INTERNAL)],
             f'iptables -F {CHAIN}', f'iptables -X {CHAIN}']
+
+
+def persist():
+    """firewall_persist.py next to this file (not needed by `check`, which also runs from stdin)."""
+    path = Path(__file__).resolve().with_name('firewall_persist.py')
+    spec = importlib.util.spec_from_file_location('firewall_persist', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def spec(resolver):
+    """The canonical rules per table, read back from `rules()` (the one rule list)."""
+    lines = [line for line in rules(resolver) if ' -N ' not in line and ' -F ' not in line]
+    return {'chain': CHAIN, 'bridges': (BRIDGE, *INTERNAL), 'tables': persist().spec_from_commands(lines, CHAIN),
+            'after_init': None}
+
+
+def ufw_form(resolver, family, source):
+    """The block for before.rules (v4) or before6.rules (v6), or `source` with it merged in."""
+    module = persist()
+    block = module.ufw_block(spec(resolver)['tables'], 'deedkit-delivery', CHAIN, family, True)
+    if source is None:
+        return block
+    return module.merge_block(Path(source).read_text(), block, 'deedkit-delivery', None, True)
 
 
 def probe(target, timeout, literal=False):
@@ -201,11 +232,20 @@ class Target(argparse.Action):
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ['verify']:
+        return persist().verify_cli(argv[1:], lambda value: spec(ipaddress.IPv4Address(value)), 'DELIVERY_RESOLVER',
+                                    'compare the repository, the ufw files and the kernel for the delivery rules')
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     commands = parser.add_subparsers(dest='command', required=True)
     rule = commands.add_parser('rules', help='print the host firewall commands')
     rule.add_argument('--resolver', type=ipaddress.IPv4Address, help='the DNS resolver the containers use')
     rule.add_argument('--undo', action='store_true', help='print the commands that remove the rules')
+    rule.add_argument('--format', choices=('commands', 'ufw'), default='commands',
+                      help='commands (default) or the block for ufw rules files')
+    rule.add_argument('--family', choices=('v4', 'v6'), help='with --format ufw: before.rules (v4) or before6.rules (v6)')
+    rule.add_argument('--source', help='with --format ufw: the rules file to merge the block into (printed whole)')
+    commands.add_parser('verify', add_help=False, help='compare repository, ufw files and kernel (root, read-only)')
     probe_parser = commands.add_parser('check', help='probe targets from inside the dispatcher container')
     probe_parser.set_defaults(targets=[])
     probe_parser.add_argument('--open', action=Target, const='open', metavar='HOST:PORT')
@@ -231,7 +271,12 @@ def main(argv=None):
     if args.command == 'rules':
         if not args.undo and args.resolver is None:
             parser.error('rules needs --resolver')
-        print('\n'.join(undo() if args.undo else rules(args.resolver)))
+        if args.format == 'ufw' and (args.undo or args.family is None):
+            parser.error('--format ufw needs --family and cannot be combined with --undo')
+        if args.format == 'ufw':
+            print(ufw_form(args.resolver, args.family, args.source), end='')
+        else:
+            print('\n'.join(undo() if args.undo else rules(args.resolver)))
         return 0
     report = check(args.targets, args.timeout, args.proxy)
     print(json.dumps(report))

@@ -7,6 +7,11 @@ is harness `tiden.md`; how a change records itself is harness `process.md` and
 [AGENTS.md](../../AGENTS.md) section 4; CI details in [TIDEN-CI.md](../../TIDEN-CI.md). This
 document holds DeedKit's values.
 
+During a confirmed production incident, [incident recovery](incident-recovery.md)
+takes precedence: recover first and complete deferred intake/links afterward,
+before other tasks. Tiden availability or card ceremony must not hold a minimal
+reversible recovery. Existing check identities and publication evidence remain.
+
 Use the existing [DeedKit product](https://app.tiden.ai/1dc18e09-4a09-4d74-8300-cd4302622357/products/75bd0580-2af4-4d5a-b236-c5a9d7ff7ce1)
 (workspace `1dc18e09-4a09-4d74-8300-cd4302622357`, product
 `75bd0580-2af4-4d5a-b236-c5a9d7ff7ce1`; pass them when a worktree is not bound). The `Tiden

@@ -11,7 +11,11 @@ SUBSCRIPTION_PERMISSIONS = frozenset(('subscription-write', 'subscription-ack', 
 UPLOAD_PERMISSIONS = frozenset(('upload',))
 # ANYM-519: agent self-registered webhook endpoints; no existing key ceiling inherits it.
 DELIVERY_PERMISSIONS = frozenset(('delivery-write',))
-PERMISSIONS = LEGACY_PERMISSIONS | MESSENGER_PERMISSIONS | SUBSCRIPTION_PERMISSIONS | UPLOAD_PERMISSIONS | DELIVERY_PERMISSIONS
+# ANYM-676/678: pressing a bot's inline button and opening its Mini App act in the owner's name; no existing key
+# ceiling inherits them (a NULL ceiling is LEGACY_PERMISSIONS only).
+BOT_PERMISSIONS = frozenset(('bot-press', 'webview-open'))
+PERMISSIONS = (LEGACY_PERMISSIONS | MESSENGER_PERMISSIONS | SUBSCRIPTION_PERMISSIONS | UPLOAD_PERMISSIONS |
+               DELIVERY_PERMISSIONS | BOT_PERMISSIONS)
 
 
 def effective_permissions(principal_permissions, key_permissions):
@@ -66,6 +70,7 @@ AUDIT_CODES = frozenset({
     'lossy_formatting_requires_confirmation','message_too_long','preview_required','preview_mismatch',
     'unsupported_operation','invalid_operation_parameters','operation_disabled','operation_expired',
     'operation_access_changed','operation_result_unknown','operation_target_changed','operation_rejected',
+    'button_not_captured','button_not_found','label_mismatch','button_kind_unsupported','message_changed','password_required','press_uncertain',
     'reply_target_changed','invalid_subscription','subscription_limit','subscription_conflict','subscription_closed',
     'subscription_access_changed','invalid_subscription_state',
     'invalid_upload','invalid_upload_chunk','upload_limit','upload_capacity','upload_expired',

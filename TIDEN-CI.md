@@ -5,11 +5,14 @@ the exact **tested checkout SHA**, step outcomes and the GitHub Actions URL in
 the `ci-evidence` artifact, including failed runs. Python uses xunit1 to retain
 source paths; Node's generic `test` classname is qualified by its source file.
 Parameterized Python executions retain their parameter names and status.
+A JUnit report may hold at most `MAX_JUNIT_CASES` (50000) test cases and `MAX_BYTES` (20 MiB); both are
+local sanity bounds, since `tiden run report` uploads any number of rows in chunks of 2000. The merged
+Python report is about 220 bytes a case (2.2 MB for 9975 cases, 11-02).
 
 Test jobs run in parallel and each uploads a `ci-evidence-<job>` fragment:
 `checks / verify` the seven checks and its module reports, `checks / load` the
-gateway load gate, `checks / services` the gateway, platform-contracts, calls and
-calls-frontend module reports, and each `checks / python (<n>/9)` job its shard of the root
+gateway load gate, `checks / services` the gateway, platform-contracts, calls,
+calls-frontend and inference module reports, and each `checks / python (<n>/9)` job its shard of the root
 Python/PostgreSQL suite. The root suite runs in nine file-level shards
 (`scripts/python_shards.py`): `checks / verify` runs shard 1 and the eight
 `checks / python (<n>/9)` jobs (`python-2` to `python-9`) shards 2-9, each on its
@@ -114,6 +117,11 @@ exactly its `REQUIRED_EXECUTIONS` (scripts/tiden_ci.py), each once and passed;
 a missing, skipped, extra or duplicate case fails it. A missing report blocks
 it, and that is what happens for a tested source without the node or the target.
 Assembly refuses evidence whose shard reports hold one of these cases.
+
+A pull request that adds a test location or a CI module adds its `suite()` rule and `SUITES` name
+(`scripts/tiden_health.py`) and, for a module, its `MODULE_REPORTS` entry (`scripts/tiden_ci.py`); the tests in
+`tests/test_tiden_health.py` fail on a tracked test file or a module path that no suite claims, and name the missing rule.
+Test files CI never publishes to Tiden are listed there by prefix with the reason (`UNPUBLISHED`).
 
 The separate reporting job receives no database or messenger credentials. It
 uses Tiden CLI 0.41.0 from the official release with a pinned SHA-256 checksum.
@@ -652,7 +660,7 @@ then shown only with its own SHA. A case is active when it has a result in that
 run (`run results --latest-only`) and linked when its `linkedRequirementCount`
 is above zero. Other case rows are stale: counted and listed in the artifact,
 never deleted. The suites are fixed in the script, one path rule each: root
-`tests/`, calendar, calls frontend, calls, gateway, platform contracts
+`tests/`, calendar, calls frontend, calls, gateway, inference (`services/inference/`), platform contracts
 (`packages/platform-contracts/`), release router Go
 (`services/release-router/`, or an `externalId` starting with
 `s:github.com/GoSync-Inc/deedkit/services/release-router::`, since Tiden's Go
@@ -962,10 +970,10 @@ Tiden through the main push run; otherwise link the migration PR to its intent
 branch and publish real results there before reviewing the merge. After
 merge, verify both main's gate and the GitHub App processing/drift state.
 
-The integrated CI includes gateway, platform-contracts, calendar, calls and
-calls-frontend reports, plus the measured gateway load gate, which runs on a
+The integrated CI includes gateway, platform-contracts, calendar, calls,
+calls-frontend and inference reports, plus the measured gateway load gate, which runs on a
 runner of its own in
-parallel with the suite; the gateway, platform-contracts, calls and calls-frontend
+parallel with the suite; the gateway, platform-contracts, calls, calls-frontend and inference
 suites run together in `checks / services`, also on a runner of their own. Existing messaging check/test identities
 and links remain intact. Module assertions support reviewed contracts in the
 same product; a successful messaging run alone cannot verify another module.

@@ -3,11 +3,14 @@ import os
 import re
 from psycopg.types.json import Jsonb
 
+from .field_errors import cursor_refusal,date_range_refusal,refusal
 from .policy import scope_filter,targets
 from .search_query import coverage,cursor_binding,decode_cursor,encode_cursor,filter_values,position_date,position_text,valid_text
 from .conversation import meaningful_sql,options
 from .conversation_state import conversation_state,group_thread_query
 from .time_references import owner_zone,passed_reference
+
+CHAT_TYPES=('private','group','channel','unknown')
 
 
 def meaningful(alias='m',metadata='md'):
@@ -162,49 +165,7 @@ def read_state_sql(c):
     return read_sources,fresh,unread
 
 
-def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=None,
-        order='id',exclude_channels=False,awaiting_reply=False,from_time='',to_time='',
-        include_coverage=True,awaiting_reply_days=14,exclude_chats=None,exclude_senders=None,
-        only_questions=False,only_unread=False,selected_chat=None,include_dismissed=False,
-        view='archive',exclude_likely_broadcasts=False,include_muted=False,promotional='exclude',
-        my_roles=None,can_post=None,awaiting_their_reply=False,min_wait_hours=None):
-    from .store import APIError,bounded,date_bound,serial
-    from . import owner_waits
-    bounded(limit);valid_text(after,4096);valid_text(query,200)
-    options(view)
-    if order=='last_activity_desc':order='activity'
-    if order not in ('id','activity','priority','waiting_longest') or any(type(v) is not bool for v in
-            (exclude_channels,awaiting_reply,include_coverage,only_questions,only_unread,exclude_likely_broadcasts,include_muted)):
-        raise APIError('invalid_filter')
-    if type(awaiting_reply_days) is not int or not 0<=awaiting_reply_days<=365:
-        raise APIError('invalid_filter')
-    # ANYM-537: the owner's unanswered runs, refused with any filter that reads the reply queue's hint or the head time.
-    min_wait_hours=owner_waits.validate(order,min_wait_hours,awaiting_their_reply=awaiting_their_reply,
-        awaiting_reply=awaiting_reply,others={'only_unread':only_unread,'exclude_senders':exclude_senders is not None,
-        'exclude_likely_broadcasts':exclude_likely_broadcasts,'from_time':from_time,'to_time':to_time,
-        'my_roles':my_roles is not None,'can_post':can_post is not None,'promotional':promotional!='exclude'})
-    if awaiting_reply and order=='id':order='activity'
-    if (order=='priority' or exclude_likely_broadcasts) and not awaiting_reply:raise APIError('invalid_filter')
-    if include_muted and not (awaiting_reply or awaiting_their_reply):raise APIError('invalid_filter')
-    # ANYM-427: likely promotional rows leave the queue by default; include returns them marked, only lists just them.
-    if promotional not in PROMOTIONAL or promotional!='exclude' and (exclude_likely_broadcasts or not awaiting_reply):
-        raise APIError('invalid_filter')
-    c.execute('SET LOCAL jit=off')
-    accounts=filter_values(accounts);chat_types=filter_values(chat_types)
-    exclude_chats=filter_values(exclude_chats);exclude_senders=filter_values(exclude_senders)
-    if chat_types is not None and any(t not in ('private','group','channel','unknown') for t in chat_types):
-        raise APIError('invalid_filter')
-    # ANYM-533: the account's own role in a Telegram channel or group; before migration 046 every row reads unknown.
-    from .chat_roles import CHAT_ROLE_SCHEMA,ROLES
-    from .store import schema_version
-    my_roles=filter_values(my_roles);roles_ready=schema_version(c)>=CHAT_ROLE_SCHEMA
-    # An empty role list asks for nothing: refused, never an empty IN ().
-    if my_roles is not None and (not my_roles or any(r not in ROLES for r in my_roles)) or can_post is not None and type(can_post) is not bool:
-        raise APIError('invalid_filter')
-    role_sql="coalesce(c.my_role,'unknown')" if roles_ready else "'unknown'::text"
-    lower,upper=date_bound(from_time),date_bound(to_time)
-    if lower and upper and lower>=upper:raise APIError('invalid_date_range')
-    scope,args=scope_filter(p,'c',chat_column='id');clauses=[scope]
+def _alias_pairs(accounts,c,p):
     # ANYM-278: a peer's private PN chat and LID chat, joined by a verified visible
     # link, are one conversation. The chat with the newest meaningful message is
     # listed; the other one names it in alias_chats. Second-resolution WhatsApp
@@ -236,6 +197,162 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
             listed[shown['id']]={'chat':{'id':other['id'],'provider_chat_id':other['provider_chat'],
                 'title':other['title'],'last_activity':other['at'],'unread_count':other['unread_count']},
                 'provenance':link['provenance']}
+    return aliases,listed
+
+
+def _page_cursor(binding,limit,order,rows,score_at,waits):
+    items=rows[:limit];cursor=None
+    if len(rows)>limit:
+        row=items[-1];position={'id':row['id'],'at':row['last_activity']}
+        if order=='priority':position.update(at=row['awaiting_reply_sent_at'],score=row['awaiting_reply_priority'],as_of=score_at)
+        if waits:position['at']=row['_wait_since']
+        cursor=row['id'] if order=='id' else encode_cursor(binding,position)
+    return items,cursor
+
+
+def _page_titles(c,items,p):
+    # Titles of raw-titled private chats are resolved once per page; conversation reads reuse them.
+    from .chat_titles import labels
+    private=[row for row in items if row['type']=='private']
+    selves=set()
+    if private:
+        selves={r['id'] for r in c.execute('SELECT c.id FROM chats c WHERE c.id=ANY(%s) AND '+self_chat_sql(),
+            ([row['id'] for row in private],))}
+    titles=labels(c,p,[(row['account'],row['id']) for row in private if row['id'] not in selves])
+    return private,selves,titles
+
+
+def _enrich_page(aliases,c,group_attention_age,include_dismissed,items,p,score_at,titles,view,waits):
+    from . import owner_waits
+    zone=owner_zone(os.environ)
+    if waits:
+        from .receipts import for_rows
+        receipts=for_rows(c,[{'id':row['_wait_last_id']} for row in items])
+    # Compute run counts only for the returned page, never for every chat.
+    for row in items:
+        if waits:row['_wait_count']=owner_waits.run_count(c,row,aliases)
+        if row['awaiting_reply'] and row.get('awaiting_reply_snoozed_until'):
+            # The agent asked to be reminded; the row is back for that reason (ANYM-281).
+            row['awaiting_reply_priority_reasons']=[*row['awaiting_reply_priority_reasons'],'snooze_due']
+        if row['awaiting_reply'] and (flag:=passed_reference(row.get('awaiting_reply_snippet'),row['awaiting_reply_sent_at'],score_at,zone)):
+            # The message names a date that has passed (ANYM-282): explained, never scored, so order and cursors hold.
+            row['awaiting_reply_time_reference']=flag
+            row['awaiting_reply_priority_reasons']=[*row['awaiting_reply_priority_reasons'],'referenced_date_passed']
+        if row['awaiting_reply']:
+            if row.get('awaiting_reply_promotional_basis'):row['awaiting_reply_likely_promotional']=True
+            if view=='conversation' and row['type']=='group':
+                row['awaiting_reply_incoming_count']=c.execute('''SELECT threads.n FROM chats c
+                    JOIN accounts a ON a.id=c.account CROSS JOIN LATERAL ('''+group_thread_query(
+                        'count(*) AS n',criteria=group_attention_age,count=True)+
+                    ') threads WHERE c.account=%s AND c.id=%s',
+                    (row['account'],row['id'])).fetchone()['n']
+            else:row['awaiting_reply_incoming_count']=c.execute(f'''SELECT count(*) AS n FROM messages m
+                LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision
+                WHERE m.account=%s AND m.chat=ANY(%s) AND m.direction='incoming' AND {meaningful()}
+                  AND NOT coalesce(md.metadata->'sender_is_bot'='true'::jsonb,false)
+                  AND (%s::timestamptz IS NULL OR m.sent_at>%s::timestamptz OR
+                    (%s='telegram' AND m.sent_at=%s::timestamptz AND {number('m')} >%s::bigint) OR
+                    (%s='whatsapp' AND m.sent_at=%s::timestamptz))''',
+                (row['account'],[row['id'],*([aliases[row['id']]] if row['id'] in aliases else [])],row['_own_sent_at'],row['_own_sent_at'],
+                 row['_platform'],row['_own_sent_at'],row['_own_numeric_id'],
+                 row['_platform'],row['_own_sent_at'])).fetchone()['n']
+        else:
+            for key in tuple(row):
+                if key.startswith('awaiting_reply_'):row[key]=None
+        for key in ('_own_sent_at','_own_numeric_id','_platform'):row.pop(key,None)
+        # Rows without a mute or a due snooze keep their earlier shape.
+        for key in ('awaiting_reply_muted','awaiting_reply_snoozed_until','awaiting_reply_promotional_basis'):
+            if row.get(key) is None:row.pop(key,None)
+        if not include_dismissed:row.pop('_incoming_head',None)
+        if view=='conversation':
+            state=conversation_state(c,p,row['account'],row['id'],titles=titles)
+            row['conversation']=state
+            latest=state['latest_known_meaningful_message']
+            if latest is None:
+                row['last_message_id']=None;row['last_message_snippet']=None
+            if state['last_turn']=='unknown':row['last_message_direction']=None
+            if row['awaiting_reply'] and state['suggested_action']=='unclear':
+                row['awaiting_reply_confidence']=state['basis']['code']
+        if waits:
+            outcome=owner_waits.finish(row,state if view=='conversation' else conversation_state(c,p,row['account'],row['id'],titles=titles),receipts)
+            if outcome:
+                # Changed since the page query: left out, counted as the head now reads (ANYM-537).
+                waits['totals']['listed']-=1;waits['totals']['uncertain']+=outcome=='uncertain';row['_wait_dropped']=True
+
+
+def _decorate_peers(c,items,listed,p,private,selected_chat,selves,titles):
+    from .whatsapp_identity import chat_links
+    # The queue hint names its sender like a message; the raw ID stays in awaiting_reply_sender.
+    from .sender_names import raw_name,resolve
+    resolve(c,p,items,chat='id',sender='awaiting_reply_sender',name='awaiting_reply_sender_name',
+        basis='awaiting_reply_sender_name_basis')
+    lid_rows=[row['id'] for row in private if (row['provider_chat_id'] or '').endswith('@lid')]
+    phones={link['lid_chat']:('+'+link['pn'].split('@')[0],link['provenance'])
+        for link in (chat_links(c,p,lid_chats=lid_rows,profiled=True) if lid_rows else [])}
+    for row in private:
+        if row['id'] in listed and not selected_chat:
+            row.update(alias_chats=[listed[row['id']]['chat']],alias_provenance=listed[row['id']]['provenance'],
+                alias_confidence='provider_cache_observation')
+        if row['id'] in phones:
+            row['peer_phone'],row['peer_phone_provenance']=phones[row['id']]
+        if row['id'] in selves:row.update(title=SELF_CHAT_TITLE,title_basis='self_chat')
+        elif (row['account'],row['id']) in titles:
+            row['title'],basis=titles[(row['account'],row['id'])]
+            if basis:row['title_basis']=basis
+        alias=listed.get(row['id'],{}).get('chat') if not selected_chat else None
+        if (alias and not raw_name(alias['title'],alias['provider_chat_id']) and row['id'] not in selves and
+                (raw_name(row['title'],row['provider_chat_id']) or row.get('title_basis')=='phone_number')):
+            # A raw or number-only title borrows the alias chat's stored name.
+            row.update(title=alias['title'],title_basis='alias_chat')
+
+
+def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=None,
+        order='id',exclude_channels=False,awaiting_reply=False,from_time='',to_time='',
+        include_coverage=True,awaiting_reply_days=14,exclude_chats=None,exclude_senders=None,
+        only_questions=False,only_unread=False,selected_chat=None,include_dismissed=False,
+        view='archive',exclude_likely_broadcasts=False,include_muted=False,promotional='exclude',
+        my_roles=None,can_post=None,awaiting_their_reply=False,min_wait_hours=None):
+    from .store import APIError,bounded,date_bound,serial
+    from . import owner_waits
+    bounded(limit);valid_text(after,4096);valid_text(query,200)
+    options(view)
+    if order=='last_activity_desc':order='activity'
+    if order not in ('id','activity','priority','waiting_longest') or any(type(v) is not bool for v in
+            (exclude_channels,awaiting_reply,include_coverage,only_questions,only_unread,exclude_likely_broadcasts,include_muted)):
+        raise APIError('invalid_filter')
+    if type(awaiting_reply_days) is not int or not 0<=awaiting_reply_days<=365:
+        raise APIError('invalid_filter')
+    # ANYM-537: the owner's unanswered runs, refused with any filter that reads the reply queue's hint or the head time.
+    min_wait_hours=owner_waits.validate(order,min_wait_hours,awaiting_their_reply=awaiting_their_reply,
+        awaiting_reply=awaiting_reply,others={'only_unread':only_unread,'exclude_senders':exclude_senders is not None,
+        'exclude_likely_broadcasts':exclude_likely_broadcasts,'from_time':from_time,'to_time':to_time,
+        'my_roles':my_roles is not None,'can_post':can_post is not None,'promotional':promotional!='exclude'})
+    if awaiting_reply and order=='id':order='activity'
+    if (order=='priority' or exclude_likely_broadcasts) and not awaiting_reply:raise APIError('invalid_filter')
+    if include_muted and not (awaiting_reply or awaiting_their_reply):raise APIError('invalid_filter')
+    # ANYM-427: likely promotional rows leave the queue by default; include returns them marked, only lists just them.
+    if promotional not in PROMOTIONAL or promotional!='exclude' and (exclude_likely_broadcasts or not awaiting_reply):
+        raise APIError('invalid_filter')
+    c.execute('SET LOCAL jit=off')
+    accounts=filter_values(accounts);chat_types=filter_values(chat_types)
+    exclude_chats=filter_values(exclude_chats);exclude_senders=filter_values(exclude_senders)
+    # ANYM-533: the account's own role in a Telegram channel or group; before migration 046 every row reads unknown.
+    from .chat_roles import CHAT_ROLE_SCHEMA,ROLES
+    from .store import schema_version
+    my_roles=filter_values(my_roles);roles_ready=schema_version(c)>=CHAT_ROLE_SCHEMA
+    # ANYM-660: the independent filter checks are collected, so one response names every bad filter.
+    # An empty role list asks for nothing: refused, never an empty IN ().
+    bad=[]
+    if chat_types is not None and any(t not in CHAT_TYPES for t in chat_types):bad.append(('chat_types','enum',None,CHAT_TYPES))
+    if my_roles is not None and not my_roles:bad.append(('my_roles','min_items',None,ROLES))
+    elif my_roles is not None and any(r not in ROLES for r in my_roles):bad.append(('my_roles','enum',None,ROLES))
+    if can_post is not None and type(can_post) is not bool:bad.append(('can_post','type','boolean'))
+    if bad:raise refusal('invalid_filter',bad,hint='omit my_roles for all roles' if my_roles==[] else None)
+    role_sql="coalesce(c.my_role,'unknown')" if roles_ready else "'unknown'::text"
+    lower,upper=date_bound(from_time),date_bound(to_time)
+    if lower and upper and lower>=upper:raise date_range_refusal()
+    scope,args=scope_filter(p,'c',chat_column='id');clauses=[scope]
+    aliases,listed=_alias_pairs(accounts,c,p)
     hidden={v['chat']['id']:shown for shown,v in listed.items()}
     if hidden and not selected_chat:clauses.append('NOT c.id=ANY(%s)');args.append(list(hidden))
     if selected_chat:clauses.append('c.id=%s');args.append(selected_chat)
@@ -284,11 +401,11 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
         binding=cursor_binding(p,'chats-conversation-v1',{'archive_binding':binding})
     pos=decode_cursor(after,binding) if after and order!='id' else None
     now=c.execute('SELECT CURRENT_TIMESTAMP AS t').fetchone()['t'];score_at=now
-    if pos and order in ('activity','waiting_longest') and set(pos)!={'id','at'}:raise APIError('invalid_cursor')
+    if pos and order in ('activity','waiting_longest') and set(pos)!={'id','at'}:raise cursor_refusal()
     if pos and order=='priority':
-        if set(pos)!={'id','at','score','as_of'} or type(pos['score']) is not int:raise APIError('invalid_cursor')
+        if set(pos)!={'id','at','score','as_of'} or type(pos['score']) is not int:raise cursor_refusal()
         score_at=position_date(pos['as_of'])
-        if score_at is None or score_at>now:raise APIError('invalid_cursor')
+        if score_at is None or score_at>now:raise cursor_refusal()
     age='true' if not awaiting_reply_days else f"attention.sent_at>=CURRENT_TIMESTAMP-interval '{awaiting_reply_days} days'"
     attention_age='true' if not awaiting_reply_days else f"m.sent_at>=CURRENT_TIMESTAMP-interval '{awaiting_reply_days} days'"
     # ANYM-281: the key's snoozes and the principal's mutes. Literals, because the
@@ -600,98 +717,12 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     if inline_totals:
         totals={'n':rows[0]['_total'] if rows else 0,'unknown':rows[0]['_unknown'] if rows else 0};total=totals['n']
         for row in rows:row.pop('_total');row.pop('_unknown')
-    items=rows[:limit];cursor=None
-    if len(rows)>limit:
-        row=items[-1];position={'id':row['id'],'at':row['last_activity']}
-        if order=='priority':position.update(at=row['awaiting_reply_sent_at'],score=row['awaiting_reply_priority'],as_of=score_at)
-        if waits:position['at']=row['_wait_since']
-        cursor=row['id'] if order=='id' else encode_cursor(binding,position)
-    # Titles of raw-titled private chats are resolved once per page; conversation reads reuse them.
-    from .chat_titles import labels
-    private=[row for row in items if row['type']=='private']
-    selves=set()
-    if private:
-        selves={r['id'] for r in c.execute('SELECT c.id FROM chats c WHERE c.id=ANY(%s) AND '+self_chat_sql(),
-            ([row['id'] for row in private],))}
-    titles=labels(c,p,[(row['account'],row['id']) for row in private if row['id'] not in selves])
-    zone=owner_zone(os.environ)
-    if waits:
-        from .receipts import for_rows
-        receipts=for_rows(c,[{'id':row['_wait_last_id']} for row in items])
-    # Compute run counts only for the returned page, never for every chat.
-    for row in items:
-        if waits:row['_wait_count']=owner_waits.run_count(c,row,aliases)
-        if row['awaiting_reply'] and row.get('awaiting_reply_snoozed_until'):
-            # The agent asked to be reminded; the row is back for that reason (ANYM-281).
-            row['awaiting_reply_priority_reasons']=[*row['awaiting_reply_priority_reasons'],'snooze_due']
-        if row['awaiting_reply'] and (flag:=passed_reference(row.get('awaiting_reply_snippet'),row['awaiting_reply_sent_at'],score_at,zone)):
-            # The message names a date that has passed (ANYM-282): explained, never scored, so order and cursors hold.
-            row['awaiting_reply_time_reference']=flag
-            row['awaiting_reply_priority_reasons']=[*row['awaiting_reply_priority_reasons'],'referenced_date_passed']
-        if row['awaiting_reply']:
-            if row.get('awaiting_reply_promotional_basis'):row['awaiting_reply_likely_promotional']=True
-            if view=='conversation' and row['type']=='group':
-                row['awaiting_reply_incoming_count']=c.execute('''SELECT threads.n FROM chats c
-                    JOIN accounts a ON a.id=c.account CROSS JOIN LATERAL ('''+group_thread_query(
-                        'count(*) AS n',criteria=group_attention_age,count=True)+
-                    ') threads WHERE c.account=%s AND c.id=%s',
-                    (row['account'],row['id'])).fetchone()['n']
-            else:row['awaiting_reply_incoming_count']=c.execute(f'''SELECT count(*) AS n FROM messages m
-                LEFT JOIN message_metadata md ON md.message=m.id AND md.revision=m.revision
-                WHERE m.account=%s AND m.chat=ANY(%s) AND m.direction='incoming' AND {meaningful()}
-                  AND NOT coalesce(md.metadata->'sender_is_bot'='true'::jsonb,false)
-                  AND (%s::timestamptz IS NULL OR m.sent_at>%s::timestamptz OR
-                    (%s='telegram' AND m.sent_at=%s::timestamptz AND {number('m')} >%s::bigint) OR
-                    (%s='whatsapp' AND m.sent_at=%s::timestamptz))''',
-                (row['account'],[row['id'],*([aliases[row['id']]] if row['id'] in aliases else [])],row['_own_sent_at'],row['_own_sent_at'],
-                 row['_platform'],row['_own_sent_at'],row['_own_numeric_id'],
-                 row['_platform'],row['_own_sent_at'])).fetchone()['n']
-        else:
-            for key in tuple(row):
-                if key.startswith('awaiting_reply_'):row[key]=None
-        for key in ('_own_sent_at','_own_numeric_id','_platform'):row.pop(key,None)
-        # Rows without a mute or a due snooze keep their earlier shape.
-        for key in ('awaiting_reply_muted','awaiting_reply_snoozed_until','awaiting_reply_promotional_basis'):
-            if row.get(key) is None:row.pop(key,None)
-        if not include_dismissed:row.pop('_incoming_head',None)
-        if view=='conversation':
-            state=conversation_state(c,p,row['account'],row['id'],titles=titles)
-            row['conversation']=state
-            latest=state['latest_known_meaningful_message']
-            if latest is None:
-                row['last_message_id']=None;row['last_message_snippet']=None
-            if state['last_turn']=='unknown':row['last_message_direction']=None
-            if row['awaiting_reply'] and state['suggested_action']=='unclear':
-                row['awaiting_reply_confidence']=state['basis']['code']
-        if waits:
-            outcome=owner_waits.finish(row,state if view=='conversation' else conversation_state(c,p,row['account'],row['id'],titles=titles),receipts)
-            if outcome:
-                # Changed since the page query: left out, counted as the head now reads (ANYM-537).
-                waits['totals']['listed']-=1;waits['totals']['uncertain']+=outcome=='uncertain';row['_wait_dropped']=True
+    items,cursor=_page_cursor(binding,limit,order,rows,score_at,waits)
+    private,selves,titles=_page_titles(c,items,p)
+    _enrich_page(aliases,c,group_attention_age,include_dismissed,items,p,score_at,titles,view,waits)
     if waits:
         items=[row for row in items if not row.get('_wait_dropped')];private=[row for row in items if row['type']=='private']
-    # The queue hint names its sender like a message; the raw ID stays in awaiting_reply_sender.
-    from .sender_names import raw_name,resolve
-    resolve(c,p,items,chat='id',sender='awaiting_reply_sender',name='awaiting_reply_sender_name',
-        basis='awaiting_reply_sender_name_basis')
-    lid_rows=[row['id'] for row in private if (row['provider_chat_id'] or '').endswith('@lid')]
-    phones={link['lid_chat']:('+'+link['pn'].split('@')[0],link['provenance'])
-        for link in (chat_links(c,p,lid_chats=lid_rows,profiled=True) if lid_rows else [])}
-    for row in private:
-        if row['id'] in listed and not selected_chat:
-            row.update(alias_chats=[listed[row['id']]['chat']],alias_provenance=listed[row['id']]['provenance'],
-                alias_confidence='provider_cache_observation')
-        if row['id'] in phones:
-            row['peer_phone'],row['peer_phone_provenance']=phones[row['id']]
-        if row['id'] in selves:row.update(title=SELF_CHAT_TITLE,title_basis='self_chat')
-        elif (row['account'],row['id']) in titles:
-            row['title'],basis=titles[(row['account'],row['id'])]
-            if basis:row['title_basis']=basis
-        alias=listed.get(row['id'],{}).get('chat') if not selected_chat else None
-        if (alias and not raw_name(alias['title'],alias['provider_chat_id']) and row['id'] not in selves and
-                (raw_name(row['title'],row['provider_chat_id']) or row.get('title_basis')=='phone_number')):
-            # A raw or number-only title borrows the alias chat's stored name.
-            row.update(title=alias['title'],title_basis='alias_chat')
+    _decorate_peers(c,items,listed,p,private,selected_chat,selves,titles)
     targets(p,[r['id'] for r in items])
     if include_coverage:
         from .chat_evidence import chat_statuses

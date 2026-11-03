@@ -68,8 +68,10 @@ def observed(tmp_path, tools, **backend):
 
 def assert_truthful(listed, blocks, platform):
     """Criterion 1: every call named in the blocks and the platform text is listed, by its public name."""
-    # The platform payload's `capability` record names the gateway's own operation, not a messaging call.
-    text = {k: v for k, v in platform.items() if k != "capability"}
+    # The platform payload's `capability` record names the gateway's own operation, not a messaging call. ANYM-662:
+    # `unavailable.required_by` names tools the key's policy allows and the module's build lacks, as "cannot run",
+    # never as callable; it is covered by test_stale_client_hint.py.
+    text = {k: v for k, v in platform.items() if k not in ("capability", "unavailable")}
     named = {s for s in [*strings(blocks), *strings(text)] if s in NAMES}
     assert named <= listed, named - listed
     subscriptions, events = blocks.get("subscriptions"), blocks.get("events")

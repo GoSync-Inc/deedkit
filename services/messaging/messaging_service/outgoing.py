@@ -7,9 +7,11 @@ import asyncio
 import hashlib
 import re
 import time
+from datetime import datetime, timezone
 
 from psycopg.types.json import Jsonb
 
+from .identifiers import ACCOUNT_RE, SEND_ID_RE, WA_CHAT_RE
 from .envelope import canonical, stable_id
 from .policy import audit, effective_permissions, lock_principal, targets
 from .store import APIError, serial
@@ -231,7 +233,7 @@ def archive_reference(job,receipt):
         not all(isinstance(v,str) and 1<=len(v)<=256 for v in ref.values())):
         raise RuntimeError('send_receipt_mismatch')
     chat,mid=ref['provider_chat_id'],ref['provider_message_id']
-    if not re.fullmatch(r'[a-zA-Z0-9_.:-]{1,140}@(c\.us|g\.us|lid)',chat):
+    if not WA_CHAT_RE.fullmatch(chat):
         raise RuntimeError('send_receipt_mismatch')
     def suffix(target,value):
         prefix='true_'+target+'_'
@@ -258,10 +260,10 @@ def validate_send_receipt(value):
     from .envelope import utc
     if (not isinstance(value,dict) or set(value)!={'kind','account','send_id','requested_chat',
         'provider_message_id','archive_reference','observed_at'} or value['kind']!='outgoing_send_receipt'
-        or not isinstance(value['account'],str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,64}',value['account'])
-        or not isinstance(value['send_id'],str) or not re.fullmatch(r'send_[a-f0-9]{32}',value['send_id'])
+        or not isinstance(value['account'],str) or not ACCOUNT_RE.fullmatch(value['account'])
+        or not isinstance(value['send_id'],str) or not SEND_ID_RE.fullmatch(value['send_id'])
         or not isinstance(value['requested_chat'],str) or
-        not re.fullmatch(r'[a-zA-Z0-9_.:-]{1,140}@(c\.us|g\.us|lid)',value['requested_chat'])
+        not WA_CHAT_RE.fullmatch(value['requested_chat'])
         or not isinstance(value['provider_message_id'],str)):
         raise ValueError('invalid_send_receipt')
     try:
@@ -318,17 +320,30 @@ def project_reference(c,p,account,reference):
 
 
 def result(row,c=None,p=None):
-    from .receipts import for_reference,unknown_evidence
+    from .receipts import for_reference,hint_chat_facts,receipt_hint,unknown_evidence
     actual,reference_state=project_reference(c,p,row['account'],row.get('archive_reference'))
+    context={}
     receipt=for_reference(c,row['account'],
         actual['provider_chat_id'] if actual else row['provider_chat'],
-        actual['provider_message_id'] if actual else row['provider_message_id']) \
+        actual['provider_message_id'] if actual else row['provider_message_id'],context=context) \
         if c is not None and row['status']=='sent' and row['provider_message_id'] else unknown_evidence()
     if reference_state=='scope_restricted':receipt=unknown_evidence()
     artifact=row.get('render_artifact')
     artifact=artifact if isinstance(artifact,dict) else {}
     warning_codes=artifact.get('warnings',[]) if isinstance(artifact,dict) else []
+    hint={}
+    if row['status']=='sent':
+        # ANYM-659: a pure function of facts already read plus one guarded, bounded chat lookup; a restricted scope
+        # hides the evidence, and any failure gives the unknown pair.
+        try:
+            facts=hint_chat_facts(c,row['account'],actual['provider_chat_id'] if actual else row['provider_chat']) if c is not None and context.get('platform') else {}
+            reports,state=receipt_hint(context.get('platform'),facts.get('chat_type'),facts.get('bot'),
+                True if receipt['basis']=='self_chat' else facts.get('self_chat'),receipt['state'],
+                row.get('finished_at'),datetime.now(timezone.utc))
+        except Exception:reports,state=None,'unknown'
+        hint={'messenger_reports':reports,'receipt_state':'unknown' if reference_state=='scope_restricted' else state}
     return serial({
+        **hint,
         'send_id':row['id'],'status':row['status'],'account':row['account'],
         'chat_id':row['chat'],'provider_chat_id':row['provider_chat'],
         'provider_message_id':row['provider_message_id'],
@@ -352,6 +367,103 @@ def result(row,c=None,p=None):
         'next_action':'get_send_status' if row['status'] in ('queued','dispatching') else
             'verify_history_before_any_new_send' if row['status']=='unknown' else 'none',
     })
+
+
+def policy_blocks(policy):
+    """The account-policy gate of send admission; the outbound status (ANYM-671) uses the same predicate."""
+    return not policy or not policy['enabled'] or not policy['send_enabled']
+
+
+def connection_blocks(connected):
+    """The sender gate of send admission: a live collector lease and a connected provider session."""
+    return not connected or not connected['active'] or connected['operations'].get('connection',{}).get('state')!='connected'
+
+
+STALL_AFTER_S=120
+OUTBOUND_SQL='''SELECT a.id AS account,p.account IS NOT NULL AS has_policy,p.enabled,p.send_enabled,
+    l.account IS NOT NULL AS has_lease,l.expires_at>clock_timestamp() AS active,h.account IS NOT NULL AS has_health,h.operations,
+    greatest(0,extract(epoch FROM h.cooldown_until-clock_timestamp())) AS cooldown_s,
+    q.queued,q.oldest_age,q.expires_in,q.last_expires_in,x.expired_unsettled
+    FROM accounts a LEFT JOIN account_policies p ON p.account=a.id
+    LEFT JOIN collector_leases l ON l.account=a.id LEFT JOIN collector_health h ON h.account=a.id
+    CROSS JOIN LATERAL (SELECT count(*) AS queued,extract(epoch FROM clock_timestamp()-min(created_at)) AS oldest_age,
+        extract(epoch FROM (array_agg(expires_at ORDER BY created_at,id))[1]-clock_timestamp()) AS expires_in,
+        extract(epoch FROM max(expires_at)-clock_timestamp()) AS last_expires_in
+        FROM outgoing_messages WHERE account=a.id AND status='queued' AND expires_at>clock_timestamp()) q
+    CROSS JOIN LATERAL (SELECT count(*) AS expired_unsettled FROM outgoing_messages
+        WHERE account=a.id AND status='queued' AND expires_at<=clock_timestamp()) x
+    WHERE a.id=ANY(%s)'''
+UNAVAILABLE={'sender':'unavailable','queued':None,'oldest_queued_age_s':None,'expires_in_s':None,'expired_unsettled':None}
+
+
+def _outbound_block(row):
+    from .status_details import describe
+    account=row['account']
+    policy={'enabled':row['enabled'],'send_enabled':row['send_enabled']} if row['has_policy'] else None
+    connected={'active':bool(row['active']),'operations':row['operations'] or {}} if row['has_lease'] and row['has_health'] else None
+    queued=int(row['queued']);expired=int(row['expired_unsettled'])
+    age=None if not queued else max(0.0,round(float(row['oldest_age']),1))
+    left=None if not queued else max(0.0,round(float(row['expires_in']),1))
+    block={'sender':'ready','queued':queued,'oldest_queued_age_s':age,'expires_in_s':left,'expired_unsettled':expired}
+    if policy_blocks(policy):
+        block.update(sender='not_ready',reason_code='sending_disabled',reason='Sending is disabled for this account by its policy.')
+    elif connection_blocks(connected):
+        phase=(connected or {}).get('operations',{}).get('connection') or {}
+        code='collector_not_running' if not connected or not connected['active'] else phase.get('reason_code') or 'not_checked'
+        block.update(sender='not_ready',reason_code=code,
+            reason='The collector is not running, so nothing can be sent.' if code=='collector_not_running'
+                else 'The provider session is not connected: '+describe(code)['explanation'])
+        if code!='collector_not_running' and phase.get('retry_at'):block['retry_at']=phase['retry_at']
+    elif row['cooldown_s'] and row['cooldown_s']>0:
+        block.update(sender='cooling_down',cooldown_remaining_s=round(float(row['cooldown_s']),1),
+            reason='The provider asked the account to slow down; the sender resumes when the cooldown ends.')
+    sender=block['sender']
+    # One instruction per state, composed: expired rows, the sender's recovery and the waiting queue all apply at once.
+    parts=[]
+    if expired:
+        parts.append(str(expired)+' queued send(s) are past their expiry and will not be sent'
+            +(' even once the account is back' if sender!='ready' else '')+'; a new action with the owner\'s approval is needed for them.')
+    if sender=='not_ready':
+        parts.append('Wait until '+str(block['retry_at'])+' and read this status again.' if block.get('retry_at')
+            else 'Tell the owner that sending from account '+account+' is not available.')
+    elif sender=='cooling_down' and queued and block['cooldown_remaining_s']>left:
+        last=max(0.0,float(row['last_expires_in']))
+        parts.append('Nothing was sent: '+('every queued send will expire before the cooldown ends; ask for a new action with the '
+            'owner\'s approval after the cooldown.' if block['cooldown_remaining_s']>last else
+            'the oldest queued send will expire before the cooldown ends and later ones may still go out; check each with '
+            'get_send_status, and for each that expires ask for a new action with the owner\'s approval.'))
+    elif queued:
+        parts.append('Queued sends are waiting; if one expires (send.failed or status expired), a new action with the '
+            'owner\'s approval is needed.')
+    if queued:parts.append('Do not send the same thing again while sends wait.')
+    if parts:block['next_action']=' '.join(parts)
+    if sender=='ready' and queued and age>STALL_AFTER_S:
+        block['reason']='Oldest queued send has waited '+str(int(age))+' s with the sender connected and no cooldown.'
+    return block
+
+
+def outbound_alerts(block):
+    """Alert codes for one outbound block (ANYM-671); none during a cooldown, which is a sender state."""
+    if not block.get('queued'):return []
+    if block['sender']=='not_ready':return ['outbound_sender_not_ready']
+    if block['sender']=='ready' and block['oldest_queued_age_s']>STALL_AFTER_S:return ['outbound_queue_stalled']
+    return []
+
+
+def outbound_status(c,accounts):
+    """Per-account outbound block from one read-only query in its own savepoint with a 2 s statement timeout:
+    an error or timeout gives the unavailable block for every account and never reaches the caller (ANYM-671)."""
+    accounts=list(accounts)
+    try:
+        with c.transaction():
+            previous=c.execute("SELECT current_setting('statement_timeout') AS v").fetchone()['v']
+            c.execute("SELECT set_config('statement_timeout','2000',true)")
+            rows=c.execute(OUTBOUND_SQL,(accounts,)).fetchall()
+            c.execute("SELECT set_config('statement_timeout',%s,true)",(previous,))
+        found={row['account']:_outbound_block(row) for row in rows}
+    except Exception:
+        found={}
+    return {account:found.get(account) or dict(UNAVAILABLE) for account in accounts}
 
 
 def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
@@ -401,15 +513,13 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
     request_hash=phone_hash or legacy_hash if default_policy else phone_hash or hashlib.sha256(canonical([
         account,chat_id,chat['provider_chat'],reply_id,artifact,draft['render_policy'],preview_digest])).hexdigest()
     policy=c.execute('SELECT * FROM account_policies WHERE account=%s',(account,)).fetchone()
-    if not policy or not policy['enabled'] or not policy['send_enabled']:
-        raise APIError('sending_disabled',409)
+    if policy_blocks(policy):raise APIError('sending_disabled',409)
     from .collector_state import CollectorState
     if not CollectorState.allows(policy,chat['provider_chat']):raise APIError('not_found',404)
     connected=c.execute('''SELECT l.expires_at>clock_timestamp() AS active,h.operations
         FROM collector_leases l JOIN collector_health h USING(account) WHERE l.account=%s''',
         (account,)).fetchone()
-    if not connected or not connected['active'] or connected['operations'].get('connection',{}).get('state')!='connected':
-        raise APIError('sender_not_ready',409)
+    if connection_blocks(connected):raise APIError('sender_not_ready',409)
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('outgoing-account:'+account,))
     count=c.execute("SELECT count(*) AS n FROM outgoing_messages WHERE account=%s AND created_at>clock_timestamp()-interval '1 minute'",
         (account,)).fetchone()['n']
@@ -424,7 +534,7 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
 
 
 def status(c,p,send_id):
-    if not isinstance(send_id,str) or not re.fullmatch(r'send_[a-f0-9]{32}',send_id):
+    if not isinstance(send_id,str) or not SEND_ID_RE.fullmatch(send_id):
         raise APIError('not_found',404)
     row=c.execute('SELECT * FROM outgoing_messages WHERE id=%s AND principal=%s',(send_id,p['id'])).fetchone()
     if not row or not permitted(p,row['account'],row['chat']):raise APIError('not_found',404)

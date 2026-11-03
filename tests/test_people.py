@@ -62,6 +62,190 @@ def test_people_pagination_and_literal_patterns(seeded):
     with pytest.raises(APIError,match='not_found'):s.search_people(seeded[1],after=first['next_cursor'])
 
 
+def fold_directory(seeded):
+    s,ar,key,_=directory(seeded)
+    for sender,name in (('51','Фёдор Пример'),('52','Федор Другой'),('53','Ёлка Лесная'),('54','Елена Ёлкина')):
+        ar.ingest(event(account='people-test',sender=sender,provider_id='fold-'+sender,sender_profile={'display_name':name}))
+    return s,ar,key
+
+
+# spec: ANYM-663
+def test_people_yo_and_ye_are_one_letter_in_both_directions(seeded):
+    s,_,key=fold_directory(seeded)
+    names=lambda q,**kw:{r['display_name']:r['match_type'] for r in s.search_people(key,q,**kw)['items']}
+    assert names('Федор')=={'Федор Другой':'literal','Фёдор Пример':'literal_folded'}
+    assert names('фёдор')=={'Федор Другой':'literal_folded','Фёдор Пример':'literal'}
+    assert set(names('ФЕДОР'))==set(names('фёдор'))=={'Федор Другой','Фёдор Пример'}
+    assert set(names('Фёдор'))=={'Федор Другой','Фёдор Пример'}   # е + U+0308 is read as ё
+    assert names('  @Елка   ')=={'Ёлка Лесная':'literal_folded'} and names('ёлка')=={'Ёлка Лесная':'literal'}
+    assert names('Анна')=={'Анна Иванова':'literal'}    # no е or ё in the query: today's LIKE path
+
+
+# spec: ANYM-663
+def test_people_literal_matches_sort_before_folded_ones_and_the_cursor_pages(seeded):
+    s,_,key=fold_directory(seeded)
+    full=s.search_people(key,'федор')['items']
+    assert [r['match_type'] for r in full]==['literal','literal_folded']
+    seen=[];page=s.search_people(key,'федор',limit=1)
+    while True:
+        seen+=[r['id'] for r in page['items']]
+        if not page['next_cursor']:break
+        page=s.search_people(key,'федор',limit=1,after=page['next_cursor'])
+    assert seen==[r['id'] for r in full]
+
+
+# spec: ANYM-663
+def test_people_fold_keeps_group_by_sender_and_hidden_chats(seeded):
+    s,ar,key=fold_directory(seeded)
+    grouped=s.search_people(key,'федор',group_by_sender=True)['items']
+    assert {r['match_type'] for r in grouped}=={'literal','literal_folded'}
+    ar.ingest(event(account='people-test',chat='private',sender='55',provider_id='fold-55',sender_profile={'display_name':'Тайный Фёдор'}))
+    assert len(s.search_people(key,'федор')['items'])==3
+    first=s.search_people(key,'анна')['items'][0]
+    s.set_access('people-reader',chats=[first['chat']])
+    assert {r['display_name'] for r in s.search_people(key,'федор')['items']}=={'Федор Другой','Фёдор Пример'}
+    assert s.search_people(key,'тайный фёдор')['items']==[] and s.search_people(key,'тайный федор')['items']==[]
+
+
+# spec: ANYM-663
+def test_people_folded_rows_sort_after_literal_ones_also_with_transliteration(seeded):
+    s,ar,key=fold_directory(seeded)
+    ar.ingest(event(account='people-test',sender='56',provider_id='fold-56',
+        sender_profile={'display_name':'Фёдор Пример Два','username':'fedor'}))
+    for grouped in (False,True):
+        rows=s.search_people(key,'федор',transliterate=True,group_by_sender=grouped)['items']
+        assert [r['match_type'] for r in rows]==['literal']+['literal_folded']*2
+
+
+def people_binding(p,query,**changes):
+    from messaging_service.search_query import cursor_binding
+    return cursor_binding(p,'people',{'query':query,'accounts':None,'chats':None,'transliterate':False,
+        'group_by_sender':False,'spelling_candidates':2,**changes})
+
+
+# spec: ANYM-663
+def test_people_cursors_issued_before_the_fold_still_continue(seeded):
+    from messaging_service.search_query import decode_cursor,encode_cursor
+    s,ar,key,_=directory(seeded)
+    for sender,name in (('71','xxfedor'),('72','yyfedor'),('73','Анна Иванова Вторая')):
+        ar.ingest(event(account='people-test',sender=sender,provider_id='old-'+sender,sender_profile={'display_name':name}))
+    with s.pool.connection() as c:c.execute("UPDATE sender_profiles SET id='cursor-'||sender WHERE sender IN ('71','72')")
+    with s.authorized(key,'search_people') as (c,p):
+        # A transliteration-only candidate was rank 7 and still is: its old cursor continues after it.
+        old=encode_cursor(people_binding(p,'федор',transliterate=True),{'rank':7,'id':'cursor-71'})
+        legacy_double_space=people_binding(p,'анна  иванова')
+    assert [r['id'] for r in s.search_people(key,'федор',transliterate=True,after=old)['items']]==['cursor-72']
+    # The binding of a query with inner spaces is the one it always had (the match itself collapses them).
+    first=s.search_people(key,'Анна  Иванова',limit=1)
+    assert len(first['items'])==1 and first['next_cursor']
+    assert set(decode_cursor(first['next_cursor'],legacy_double_space))=={'rank','id'}
+    assert len(s.search_people(key,'Анна  Иванова',after=first['next_cursor'],limit=1)['items'])==1
+
+
+# spec: ANYM-663
+def test_people_group_with_a_folded_and_a_transliteration_observation_sorts_after_literal_groups(seeded):
+    s,ar,key=fold_directory(seeded)
+    # Sender 51 is "Фёдор Пример" in chat 100 (folded, rank 7); in chat 200 it is a transliteration-only hit (rank 1).
+    ar.ingest(event(account='people-test',chat='200',sender='51',provider_id='fold-51b',
+        sender_profile={'display_name':'Другой','username':'fedor'}))
+    groups=s.search_people(key,'федор',transliterate=True,group_by_sender=True)['items']
+    assert [(g['sender_id'],g['match_type']) for g in groups]==[('52','literal'),('51','literal_folded')]
+
+
+# spec: ANYM-663
+def test_people_cursor_of_a_row_that_moved_to_the_folded_rank_still_continues(seeded):
+    from messaging_service.search_query import encode_cursor
+    s,ar,key=fold_directory(seeded)
+    for sender,name,username in (('56','Фёдор Пример Два','fedor'),('57','Фёдор Третий','')):
+        ar.ingest(event(account='people-test',sender=sender,provider_id='moved-'+sender,
+            sender_profile={'display_name':name,'username':username}))
+    with s.pool.connection() as c:c.execute("UPDATE sender_profiles SET id='cursor-'||sender WHERE account='people-test'")
+    with s.authorized(key,'search_people') as (c,p):
+        # Before ANYM-663 sender 56 was a transliteration hit of rank 1; it is a folded hit of rank 7 now.
+        flat=encode_cursor(people_binding(p,'федор',transliterate=True),{'rank':1,'id':'cursor-56'})
+        grouped=encode_cursor(people_binding(p,'федор',transliterate=True,group_by_sender=True),
+            {'rank':1,'account':'people-test','sender':'56'})
+    assert [r['id'] for r in s.search_people(key,'федор',transliterate=True,after=flat)['items']]==['cursor-57']
+    assert [r['sender_id'] for r in s.search_people(key,'федор',transliterate=True,group_by_sender=True,after=grouped)['items']]==['57']
+    with s.authorized(key,'search_people') as (c,p):
+        wrong=encode_cursor(people_binding(p,'федор',transliterate=True),{'rank':3,'id':'cursor-56'})
+    with pytest.raises(APIError,match='cursor_changed'):s.search_people(key,'федор',transliterate=True,after=wrong)
+
+
+# spec: ANYM-663
+def test_people_rank_eight_is_still_an_invalid_cursor_for_a_fold_query(seeded):
+    from messaging_service.search_query import encode_cursor
+    s,_,key=fold_directory(seeded)
+    with s.authorized(key,'search_people') as (c,p):
+        flat=encode_cursor(people_binding(p,'федор'),{'rank':8,'id':'x'})
+        grouped=encode_cursor(people_binding(p,'федор',group_by_sender=True),{'rank':8,'account':'people-test','sender':'51'})
+    with pytest.raises(APIError,match='invalid_cursor'):s.search_people(key,'федор',after=flat)
+    with pytest.raises(APIError,match='invalid_cursor'):s.search_people(key,'федор',group_by_sender=True,after=grouped)
+
+
+# spec: ANYM-663
+def test_people_fold_pattern_is_never_user_controlled(seeded):
+    s,ar,key,_=directory(seeded)
+    for sender,name in (('61','ёж.* (x)'),('62','ежабв'),('63','еж50xx'),('64','ёж[y]'),('65','ёж\\z'),
+                        ('66','ёж50%_'),('67','ёж('),('68','ёж|аб')):
+        ar.ingest(event(account='people-test',sender=sender,provider_id='meta-'+sender,sender_profile={'display_name':name}))
+    found=lambda q:sorted(r['sender_id'] for r in s.search_people(key,q)['items'])
+    assert found('еж.*')==['61'] and found('еж.* (x)')==['61'] and found('еж.')==['61']
+    assert found('еж[y]')==['64'] and found('еж\\z')==['65'] and found('еж50%_')==['66']
+    assert found('еж(')==['67'] and found('еж|аб')==['68'] and found('еж|ёж')==[] and found('еж%')==[]
+    assert found('еж50')==['63','66']
+
+
+# spec: ANYM-663
+def test_people_query_normalizer_and_fold_pattern():
+    from messaging_service.name_variants import fold_pattern,normalize
+    assert normalize('  @Фёдор \t Иванов ')=='фёдор иванов'
+    assert normalize('@@Anna')=='anna' and normalize('')==''
+    assert fold_pattern('федор')=='ф[её]дор' and fold_pattern('фёдор')=='ф[её]дор'
+    assert fold_pattern('ёж') is None and fold_pattern('anna') is None and fold_pattern('ann') is None
+    assert fold_pattern('еж.*')=='[её]ж\\.\\*' and fold_pattern('еле на')=='[её]л[её]\\ на'
+    assert fold_pattern('ёa(%_\\')=='[её]a\\(\\%\\_\\\\'
+
+
+def contacts_key(s,name='people-contacts',*,permissions=('read','contacts-read'),enable=True,chats=None):
+    s.set_messenger_operations('people-test',['list_contacts'] if enable else [])
+    return s.issue_key(name,['people-test'],permissions=list(permissions),**({} if chats is None else {'chats':chats}))
+
+
+# spec: ANYM-673
+def test_empty_people_result_points_to_list_contacts_for_accounts_the_key_may_read(seeded):
+    s,ar,key,mid=directory(seeded)
+    reader=contacts_key(s)
+    result=s.search_people(reader,'nobody-by-that-name')
+    assert result['items']==[]
+    assert result['see_also']=={'tool':'list_contacts','argument':'query','accounts':['people-test']}
+    # A result with a row from a Telegram account does not carry it; the key's reach is not widened.
+    assert 'see_also' not in s.search_people(reader,'Анна')
+    assert 'see_also' not in s.search_people(key,'nobody-by-that-name')
+
+
+# spec: ANYM-673
+def test_people_see_also_needs_the_contacts_permission_the_account_opt_in_and_a_full_account_key(seeded):
+    s,ar,key,mid=directory(seeded)
+    assert 'see_also' not in s.search_people(contacts_key(s,'no-permission',permissions=('read',)),'nobody')
+    assert 'see_also' not in s.search_people(contacts_key(s,'not-enabled',enable=False),'nobody')
+    chat=s.search_people(key,'Анна')['items'][0]['chat']
+    assert 'see_also' not in s.search_people(contacts_key(s,'one-chat',chats=[chat]),'nobody')
+    assert 'see_also' in s.search_people(contacts_key(s),'nobody')
+
+
+# spec: ANYM-673
+def test_people_see_also_names_only_telegram_accounts_and_is_omitted_when_none(seeded):
+    s,ar,key,mid=directory(seeded)
+    ar.register('people-wa','whatsapp','Synthetic WhatsApp',discover=True)
+    s.set_messenger_operations('people-wa',['list_contacts'])
+    s.set_messenger_operations('people-test',['list_contacts'])
+    reader=s.issue_key('people-both',['people-test','people-wa'],permissions=['read','contacts-read'])
+    assert s.search_people(reader,'nobody')['see_also']['accounts']==['people-test']
+    only_wa=s.issue_key('people-wa-only',['people-wa'],permissions=['read','contacts-read'])
+    assert 'see_also' not in s.search_people(only_wa,'nobody')
+
+
 def test_people_rest_mcp_permission_and_audit(seeded):
     s,_,key,_=directory(seeded)
     with TestClient(create_app(s,['testserver'])) as client:

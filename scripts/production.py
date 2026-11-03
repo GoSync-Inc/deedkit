@@ -67,6 +67,7 @@ BUILDS = {
     "whatsapp-native": (".", "services/messaging/Dockerfile", "whatsapp-native", "import messaging_service.whatsapp_collector"),
     "gateway": (".", "services/gateway/Dockerfile", "", "import agent_gateway, platform_contracts.release"),
     "calendar": ("services/calendar", "services/calendar/Dockerfile", "", "import family_calendar"),
+    "recordings": ("services/recordings", "services/recordings/Dockerfile", "", "import deedkit_recordings.app"),
     "calls": ("services/calls", "services/calls/Dockerfile", "", "import fastapi, pipecat"),
     "backup": (".", "services/messaging/Dockerfile", "backup",
                "import messaging_service.backup_restore_worker; import subprocess; "
@@ -75,7 +76,7 @@ BUILDS = {
 }
 # The images the main push run publishes (scripts/publish_images.py TARGETS): preparation pulls these by verified
 # digest instead of building them; `http-router` and `check-image` still build locally (ANYM-301 B1).
-PUBLISHED = ("runtime", "indexer", "enricher-local", "whatsapp-native", "gateway", "calendar", "calls", "backup")
+PUBLISHED = ("runtime", "indexer", "enricher-local", "whatsapp-native", "gateway", "calendar", "recordings", "calls", "backup")
 REGISTRY = "ghcr.io/gosync-inc/deedkit-"
 # The tokenless attestation verifier, built reproducibly from tools/attest-verify and installed by the owner;
 # tests keep this hash equal to tools/attest-verify/attest-verify.linux-amd64.sha256.
@@ -129,10 +130,17 @@ class CallActive(Refused):
 
 
 
+DEADLINE = None  # a time.monotonic() value: set only by `preflight_cleanup`, so every command of that pass is bounded by it
+
+
 def run(argv, *, cwd=None, umask=-1, env=None, reason=False, timeout=1800, binary=False):
     # Never include command output in an exception: Compose can contain secrets. Only a tool that prints
     # nothing secret (the attestation verifier, git on the public source mirror) may pass its last stderr line on,
     # with `reason`.
+    if DEADLINE is not None:
+        if (left := DEADLINE - time.monotonic()) <= 0:
+            raise Refused("the cleanup time budget is used; no further command starts")
+        timeout = min(timeout, left)
     result = subprocess.run(argv, cwd=cwd, text=not binary, capture_output=True, timeout=timeout, umask=umask, env=env)
     if result.returncode:
         stderr = result.stderr.decode(errors="replace") if binary else result.stderr
@@ -1488,14 +1496,9 @@ def guard_rollback(serving, plan):
                           "its workers. " + way_out)
 
 
-def rollback(settings, sha, http=None):
-    """Return the current release's selected services to the images and configuration that ran before it, or
-    those of a release whose apply failed its health wait (`unhealthy`), which never became current.
-
-    Owner-confirmed like apply, except as `deploy`'s one automatic rollback. It never calls promotable(): the previous
-    revision is no longer current main. The caller holds the host lock, as main() does for every state-changing action,
-    and with plan B (`http`, its validated configuration; None when there is none) the locks of seamless_release.py.
-    """
+def rollback_state(settings, sha, http):
+    """What a rollback of `sha` starts from: the release's receipts, whether its apply failed, plan B's serving
+    generation and the rollback data; refuses anything unfinished, changed or already attempted."""
     state = Path(settings["state_directory"])
     release = state / sha
     current = read(state / "current.json") if (state / "current.json").exists() else None
@@ -1518,6 +1521,11 @@ def rollback(settings, sha, http=None):
     # current.json still names the release that ran before the failed one, unless another one was applied since.
     if failed and prepared.get("current_digest") != digest(current):
         raise Refused("another release was applied or rolled back after this one was prepared")
+    return state, release, result, failed, serving, data
+
+
+def rollback_plan(settings, release, data, failed):
+    """The projects to restore with their before-release files and previous images (all checked, nothing changed)."""
     names = [project["name"] for project in settings["projects"]]
     touched = [item.get("name") for item in data["projects"]]
     # An applied release replaced every project; a failed health wait, those up to the one that failed.
@@ -1548,6 +1556,11 @@ def rollback(settings, sha, http=None):
             if not present:
                 raise Refused("a previous image is no longer present on this host")
         plan.append((project, before, previous))
+    return plan
+
+
+def rollback_restore(settings, release, sha, serving, plan):
+    """The guard, then each project's stop, `up` on the previous images and the check that they run."""
     guard_rollback(serving, plan)
     wait_for_calls(settings, time.monotonic() + CALL_WAIT)
     write(release / "rollback-attempted.json", {"sha": sha, "status": "rolling-back", "started_at": now()})
@@ -1567,6 +1580,19 @@ def rollback(settings, sha, http=None):
             actual = json.loads(run(["docker", "inspect", ids[0]]))[0]
             if actual["Image"] != image or not actual["State"]["Running"]:
                 raise Refused("restored service does not run its previous image")
+
+
+def rollback(settings, sha, http=None):
+    """Return the current release's selected services to the images and configuration that ran before it, or
+    those of a release whose apply failed its health wait (`unhealthy`), which never became current.
+
+    Owner-confirmed like apply, except as `deploy`'s one automatic rollback. It never calls promotable(): the previous
+    revision is no longer current main. The caller holds the host lock, as main() does for every state-changing action,
+    and with plan B (`http`, its validated configuration; None when there is none) the locks of seamless_release.py.
+    """
+    state, release, result, failed, serving, data = rollback_state(settings, sha, http)
+    plan = rollback_plan(settings, release, data, failed)
+    rollback_restore(settings, release, sha, serving, plan)
     outcome = {"sha": sha, "status": "rolled-back", "rolled_back_at": now(),
                "previous_images": {project["name"]: previous for project, _, previous in plan}}
     write(release / "rollback.json", outcome)
@@ -1789,13 +1815,14 @@ def owned_reference(name, target):
     return repository in ("deedkit-production-" + target, REGISTRY + target)
 
 
-def remove_images(settings, *, held=()):
+def remove_images(settings, *, held=(), deadline=None, reasons=False):
     """Remove the retention report's candidates (production.md "Image retention"): each by its other references and then
     by image ID, never forced or pruned, so Docker still refuses an image a container uses. The caller holds the deploy
     locks of `held` and this state. Like a preparation it takes every other state's deploy lock before the image lock,
     without waiting, and holds them to the end: while another operation holds one it removes nothing, so it never takes
     the image lock from a preparation in progress. IDs and Docker's reasons are reported short, so a receipt holding this
-    summary never pins an image."""
+    summary never pins an image. `deadline` (a time.monotonic() value) stops the pass between two images (ANYM-689, the
+    preflight before a deploy's disk check) and `reasons` adds how many kept images each keep reason holds."""
     state = Path(settings["state_directory"])
     with ExitStack() as stack:
         mine = {Path(path).resolve() for path in (*held, state)}
@@ -1804,12 +1831,18 @@ def remove_images(settings, *, held=()):
                 raise Refused(f"another production operation holds the deploy lock of {directory}; no image is removed")
             mine.add(directory.resolve())
         stack.enter_context(image_lock())
+        if deadline is not None and time.monotonic() >= deadline:
+            # The budget went on the container pass: no discovery starts after it.
+            return {"removed": [], "failed": [], "kept": 0, "interrupted": "time budget", "remaining": None}
         # The report refuses a state that appeared meanwhile instead of locking it.
         report = images_report(settings, held=mine, stack=stack)
         removed, failed, summary = [], [], {}
         for number, item in enumerate(report["candidates"]):
             image = item["image"]
             entry = {"image": image.removeprefix("sha256:")[:12], "tags": item["tags"]}
+            if deadline is not None and time.monotonic() >= deadline:
+                summary = {"interrupted": "time budget", "remaining": len(report["candidates"]) - number}
+                break
             try:
                 (target,) = {release_name(name) for name in item["tags"]}
                 actual = json.loads(run(["docker", "image", "inspect", image]))[0]
@@ -1835,15 +1868,70 @@ def remove_images(settings, *, held=()):
                 summary = {"interrupted": f"{type(exc).__name__} at {entry['image']}",
                            "remaining": len(report["candidates"]) - number}
                 break
-        return {"removed": removed, "failed": failed, "kept": len(report["keep"]), **summary}
+        counts = {}
+        if reasons:
+            for item in report["keep"]:
+                why = IMAGE_DIGEST.sub(lambda found: found[0][7:19], re.sub(r"[0-9a-f]{12,}", "<id>", (item["reasons"] or ["?"])[0]))
+                counts[why] = counts.get(why, 0) + 1
+        return {"removed": removed, "failed": failed, "kept": len(report["keep"]), **({"kept_reasons": counts} if reasons else {}), **summary}
 
 
-def retain_images(settings, *, held=()):
+def retain_images(settings, *, held=(), deadline=None, reasons=False):
     """`remove_images` after a successful release. It never changes the release's outcome: a failure is only reported."""
     try:
-        return remove_images(settings, held=held)
+        # Only a preflight sets these; the post-release pass is called exactly as before.
+        return remove_images(settings, held=held, **{key: value for key, value in (("deadline", deadline), ("reasons", reasons)) if value})
     except Exception as exc:
         return {"skipped": str(exc) if isinstance(exc, Refused) else type(exc).__name__}
+
+
+PREFLIGHT_BUDGET = 300
+
+
+def preflight_cleanup(settings, http, s, http_state):
+    """ANYM-689: before a deploy's disk check, remove the containers of retired HTTP generations and then the images they
+    pinned, so a host just under the gate recovers itself instead of halting. Best effort: it never raises, never
+    waits for a lock and never changes the deploy's outcome; every failure is a line of the summary. One budget bounds
+    the whole pass: `DEADLINE` caps every command `run` starts while it is set."""
+    global DEADLINE
+    deadline = DEADLINE = time.monotonic() + PREFLIGHT_BUDGET
+    try:
+        try:
+            containers = s.clean(http, True)
+        except Exception as exc:
+            containers = {"error": type(exc).__name__}
+        images = retain_images(settings, held=(http_state, s.GLOBAL_LOCK), deadline=deadline, reasons=True)
+    finally:
+        DEADLINE = None
+    return {"containers": containers, "images": images}
+
+
+def cleanup_line(preflight, final, retired=None):
+    """The deploy journal's one line: what the cleanup removed (the preflight pass, the retirement of the predecessor in
+    this run, the image pass after it) and how much room is left."""
+    containers, images = (preflight or {}).get("containers", {}), (preflight or {}).get("images", {})
+    later = retired if isinstance(retired, dict) else {}
+    try:
+        free = round(shutil.disk_usage(CONTAINERD_ROOT).free / 2**30, 2)
+    except Exception:
+        free = None
+    generations = list(dict.fromkeys([*containers.get("generations", []), *later.get("generations", [])]))
+    return {"containers_removed": len(containers.get("removed", [])) + len(later.get("removed", [])),
+            "generations": generations,
+            "images_removed": len(images.get("removed", [])) + len((final or {}).get("removed", [])),
+            "disk_free_after_gib": free}
+
+
+def attach_cleanup(state, record, outcome, preflight, retired=None):
+    """A halted or errored deploy keeps the cleanup summary too (ANYM-689). Best effort and after the outcome was
+    written: only the receipt of this run is rewritten, and a failed write leaves the first one (with its pause reason)."""
+    try:
+        outcome["preflight"], outcome["cleanup"] = preflight, cleanup_line(preflight, None, retired)
+        if outcome is record:
+            write(state / "deploy.json", outcome)
+    except Exception:
+        pass
+    return outcome
 
 
 # Database copies (ANYM-588, production.md "Database copies"): an exactly checked copy of a live database on this host,
@@ -2143,50 +2231,39 @@ def claim(copy, kind, name):
     write_record(Path(copy["directory"]) / "owner.json", copy)
 
 
-def snapshot_copy(copy, timeout, keep, catalog=None):
-    """C1-C3: the snapshot, its dumps and their verified restore; writes `copy.json`. With `keep` the scratch container
-    stays up for the caller; with `catalog` the snapshot's catalog lines are returned (`catalog`) and their digest is
-    recorded."""
-    source, directory = copy["source"], Path(copy["directory"])
-    container, owner, database = source["container"], source["owner"], source["database"]
-    # Only the image, the mounts and PGDATA: the container's other variables hold its password.
-    image, mounts, data = (run(["docker", "inspect", "--type", "container", "--format", INSPECT_COPY, container],
-                               timeout=60).splitlines() + ["", "", ""])[:3]
-    inspected = {"Image": json.loads(image), "Mounts": json.loads(mounts),
-                 "Config": {"Env": [json.loads(data)] if data else []}}
-    paths = [str(directory), data_filesystem(inspected)]
-    watch = {"timeout": timeout, "paths": paths}
-    keeper = Keeper(copy, copy_exec(copy, "keeper", container, "psql", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1",
-                                    "-U", owner, "-d", database), copy_clock() + timeout)
-    try:
-        keeper.query(f"SET idle_in_transaction_session_timeout = '{timeout}s'; SET statement_timeout = '{timeout}s';"
-                     " BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;")
-        found = json.loads(keeper.query(
-            "SELECT json_build_object('snapshot', pg_export_snapshot(), 'at', now(), 'version',"
-            " current_setting('server_version'), 'bytes', pg_database_size(d.oid), 'owner', pg_get_userbyid(d.datdba),"
-            " 'encoding', pg_encoding_to_char(d.encoding), 'collate', d.datcollate, 'ctype', d.datctype)"
-            " FROM pg_database d WHERE d.datname = current_database();")[0])
-        if (not SNAPSHOT_ID.fullmatch(found["snapshot"]) or not SQL_NAME.fullmatch(found["owner"])
-                or not all(LOCALE.fullmatch(found[key]) for key in ("encoding", "collate", "ctype"))):
-            raise CopyFailed(copy["id"], "dump_failed")
-        for path in paths:
-            free, size = filesystem(path)
-            if free < 2 * found["bytes"] + copy_reserve(size):
-                raise CopyFailed(copy["id"], "disk_reserve")
-        reference = counts(copy, keeper.query(COUNTS), "dump_failed")
-        shape = keeper.query(catalog) if catalog else None
-        snapshot = "--snapshot=" + found["snapshot"]
-        dumped(copy, copy_exec(copy, "schema", container, "pg_dump", "--schema-only", snapshot, "-U", owner,
-                               "-d", database), directory / "reference.schema", failure="dump_failed", **watch)
-        dumped(copy, copy_exec(copy, "dump", container, "pg_dump", "-Fc", snapshot, "-U", owner, "-d", database),
-               directory / f"{database}.dump", failure="dump_failed", **watch)
-        dumped(copy, copy_exec(copy, "roles", container, "pg_dumpall", "--roles-only", "--no-role-passwords",
-                               "-U", owner, "-l", database), directory / "roles.sql", failure="dump_failed", **watch)
-        keeper.query("COMMIT;")
-    finally:
-        keeper.close()
-    files = {name: file_digest(directory / name) for name in (f"{database}.dump", "roles.sql", "reference.schema")}
-    image = inspected["Image"]
+def copy_dumps(copy, keeper, timeout, catalog, container, owner, database, directory, paths, watch):
+    """The snapshot transaction on the live database: its identity, free space, counts, catalog and the three dumps;
+    returns the snapshot facts, the reference counts and the catalog lines (None without `catalog`)."""
+    keeper.query(f"SET idle_in_transaction_session_timeout = '{timeout}s'; SET statement_timeout = '{timeout}s';"
+                 " BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;")
+    found = json.loads(keeper.query(
+        "SELECT json_build_object('snapshot', pg_export_snapshot(), 'at', now(), 'version',"
+        " current_setting('server_version'), 'bytes', pg_database_size(d.oid), 'owner', pg_get_userbyid(d.datdba),"
+        " 'encoding', pg_encoding_to_char(d.encoding), 'collate', d.datcollate, 'ctype', d.datctype)"
+        " FROM pg_database d WHERE d.datname = current_database();")[0])
+    if (not SNAPSHOT_ID.fullmatch(found["snapshot"]) or not SQL_NAME.fullmatch(found["owner"])
+            or not all(LOCALE.fullmatch(found[key]) for key in ("encoding", "collate", "ctype"))):
+        raise CopyFailed(copy["id"], "dump_failed")
+    for path in paths:
+        free, size = filesystem(path)
+        if free < 2 * found["bytes"] + copy_reserve(size):
+            raise CopyFailed(copy["id"], "disk_reserve")
+    reference = counts(copy, keeper.query(COUNTS), "dump_failed")
+    shape = keeper.query(catalog) if catalog else None
+    snapshot = "--snapshot=" + found["snapshot"]
+    dumped(copy, copy_exec(copy, "schema", container, "pg_dump", "--schema-only", snapshot, "-U", owner,
+                           "-d", database), directory / "reference.schema", failure="dump_failed", **watch)
+    dumped(copy, copy_exec(copy, "dump", container, "pg_dump", "-Fc", snapshot, "-U", owner, "-d", database),
+           directory / f"{database}.dump", failure="dump_failed", **watch)
+    dumped(copy, copy_exec(copy, "roles", container, "pg_dumpall", "--roles-only", "--no-role-passwords",
+                           "-U", owner, "-l", database), directory / "roles.sql", failure="dump_failed", **watch)
+    keeper.query("COMMIT;")
+    return found, reference, shape
+
+
+def copy_scratch(copy, image, directory, timeout, paths):
+    """Start the scratch PostgreSQL and wait until its final server answers; returns its container name and the
+    client arguments to reach it."""
     scratch, scratch_container = directory / "scratch", copy["container"]
     scratch.mkdir(mode=0o700)
     # A root operator lets the image's entrypoint own the data directory; anyone else runs PostgreSQL as itself, so
@@ -2206,6 +2283,11 @@ def snapshot_copy(copy, timeout, keep, catalog=None):
         check_reserve(copy, paths)
         time.sleep(0.5)
     psql = ("psql", "-X", "-q", "-v", "ON_ERROR_STOP=1", *scratch_sql)
+    return scratch_container, scratch_sql, psql
+
+
+def copy_verify(copy, directory, database, found, reference, scratch_container, scratch_sql, psql, timeout, watch):
+    """Restore the dumps into the scratch server and compare counts and schema with the live reference."""
     restored(copy, copy_exec(copy, "roles", scratch_container, *psql, "-d", "postgres"), directory / "roles.sql",
              failure="restore_failed", **watch)
     helper_output(copy, copy_exec(copy, "create", scratch_container, *psql, "-d", "postgres"), timeout=timeout,
@@ -2225,6 +2307,31 @@ def snapshot_copy(copy, timeout, keep, catalog=None):
     if schema_lines(directory / "restored.schema") != schema_lines(directory / "reference.schema"):
         raise CopyFailed(copy["id"], "schema_mismatch")
     (directory / "restored.schema").unlink()
+
+
+def snapshot_copy(copy, timeout, keep, catalog=None):
+    """C1-C3: the snapshot, its dumps and their verified restore; writes `copy.json`. With `keep` the scratch container
+    stays up for the caller; with `catalog` the snapshot's catalog lines are returned (`catalog`) and their digest is
+    recorded."""
+    source, directory = copy["source"], Path(copy["directory"])
+    container, owner, database = source["container"], source["owner"], source["database"]
+    # Only the image, the mounts and PGDATA: the container's other variables hold its password.
+    image, mounts, data = (run(["docker", "inspect", "--type", "container", "--format", INSPECT_COPY, container],
+                               timeout=60).splitlines() + ["", "", ""])[:3]
+    inspected = {"Image": json.loads(image), "Mounts": json.loads(mounts),
+                 "Config": {"Env": [json.loads(data)] if data else []}}
+    paths = [str(directory), data_filesystem(inspected)]
+    watch = {"timeout": timeout, "paths": paths}
+    keeper = Keeper(copy, copy_exec(copy, "keeper", container, "psql", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1",
+                                    "-U", owner, "-d", database), copy_clock() + timeout)
+    try:
+        found, reference, shape = copy_dumps(copy, keeper, timeout, catalog, container, owner, database, directory, paths, watch)
+    finally:
+        keeper.close()
+    files = {name: file_digest(directory / name) for name in (f"{database}.dump", "roles.sql", "reference.schema")}
+    image = inspected["Image"]
+    scratch_container, scratch_sql, psql = copy_scratch(copy, image, directory, timeout, paths)
+    copy_verify(copy, directory, database, found, reference, scratch_container, scratch_sql, psql, timeout, watch)
     record = {"id": copy["id"], "verified": True, "database": database, "counts": reference, "files": files,
               "snapshot_at": found["at"], "server_version": found["version"], "database_bytes": found["bytes"],
               "image": image, "scratch_container": scratch_container if keep else None, "verified_at": now()}
@@ -3319,7 +3426,42 @@ def producer_reads(settings, mirror, target):
 
 
 # ANYM-589 B1: the units that run a backup with the producer pin (messaging's and the calendar's runner).
-BACKUP_UNITS = ("personal-os-backup.service", "deedkit-calendar-backup.service")
+BACKUP_UNITS = ("personal-os-backup.service", "deedkit-calendar-backup.service",
+                "deedkit-calendar-backup-catchup.service")
+
+# ANYM-694: the hourly freshness check (deploy/calendar-backup-freshness.py) writes this; `status` prints one line from it.
+CALENDAR_FRESHNESS = Path("/opt/deedkit/calendar-backup/backups/freshness.json")
+CALENDAR_FRESHNESS_MAX_AGE = 3 * 3600
+
+
+def calendar_backup_line(path=None, at=None):
+    """The `status` line for the calendar backup's freshness; read-only, and never an error for `status`."""
+    prefix = "calendar backup: "
+    try:
+        try:
+            with open(path or CALENDAR_FRESHNESS, "rb") as handle:
+                data = json.loads(handle.read(65536))
+        except FileNotFoundError:
+            return prefix + "no recent freshness check"
+        if not isinstance(data, dict):
+            return prefix + "freshness file unreadable (not an object)"
+        checked = data.get("checked_at")
+        try:
+            moment = datetime.strptime(checked, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return prefix + "freshness file unreadable (bad checked_at)"
+        word = {"fresh": "fresh", "stale": "STALE", "unknown": "UNKNOWN"}.get(data.get("status"))
+        if word is None:
+            return prefix + "freshness file unreadable (bad status)"
+        elapsed = ((at or datetime.now(timezone.utc)) - moment).total_seconds()
+        if elapsed > CALENDAR_FRESHNESS_MAX_AGE or elapsed < -300:
+            return prefix + "no recent freshness check"
+        age = data.get("age_hours")
+        shown = f"{age:.1f}h" if isinstance(age, (int, float)) and not isinstance(age, bool) else "?"
+        return f"{prefix}{word} age={shown} (checked {checked})"
+    except Exception as exc:
+        reason = "not JSON" if isinstance(exc, ValueError) else type(exc).__name__
+        return f"{prefix}freshness file unreadable ({reason})"
 
 
 def leaf_identity(found):
@@ -3656,20 +3798,9 @@ def unsettled_migrations(state):
     return found
 
 
-def migrate(settings, http, plans, mirror, base, serving, candidate, release):
-    """M2 after preparation, M3 and M4 for each database of the range (K3): the producer check, every copy and its
-    rehearsal before any production write, the final gates, then one production `migrate-expand` per database,
-    calendar first and then its db-roles and db-roles --check. Returns when every database is at its target with its
-    rehearsal's effect; raises MigrationWait or CallActive/CallsUnknown (nothing changed), or MigrationRefused."""
-    messaging = [plan for plan in plans if plan["database"] == AUTO_DATABASE]
-    limit = rehearsal_limit(settings)
-    if messaging:
-        follow_producer(settings, mirror, messaging[0], candidate, release)
-    images ={plan["database"]: migration_image(release, candidate, plan["database"]) for plan in plans}
-    progress = Progress(release, plans)
-    def refused(name, reason, phase):
-        progress.update(name, status="refused", phase=phase)
-        return progress.refused(name, "refused", reason, phase=phase, reason=reason)
+def migrate_rehearse(settings, plans, candidate, images, limit, progress, refused):
+    """M3 for each database of the range: its verified copy and the rehearsal of the migration on it;
+    returns the copies and the rehearsals by database name."""
     copies, rehearsals = {}, {}
     for plan in plans:
         name = plan["database"]
@@ -3685,6 +3816,12 @@ def migrate(settings, http, plans, mirror, base, serving, candidate, release):
                           + (str(exc) if isinstance(exc, Refused) else type(exc).__name__), "copy") from exc
         copies[name] = copied
         progress.update(name, status="rehearsed", copy=copied["id"], rehearsal_ms=rehearsals[name]["took_ms"])
+    return copies, rehearsals
+
+
+def migrate_gate(settings, http, plans, mirror, base, serving, candidate, release, messaging, images, copies,
+                 rehearsals, refused):
+    """The final gates before any production write; returns each database's plan file and expected catalog change."""
     # The final gate: everything admission read, again, and each live catalog still its copy's.
     for plan in plans:
         migration_gate(settings, http, plan, mirror, base, serving)
@@ -3720,6 +3857,11 @@ def migrate(settings, http, plans, mirror, base, serving, candidate, release):
                                      key=json.dumps), "difference": rehearsals[name]["difference"]}
         write_record(evidence_file(release, name, "migration-catalog.json"), expected)
         evidence[name] = plan_file, expected
+    return evidence
+
+
+def migrate_expand(settings, plans, candidate, images, copies, rehearsals, evidence, progress):
+    """M4: one production `migrate-expand` per database (calendar also db-roles); each outcome is recorded."""
     last = plans[-1]["database"]
     summary = {"copy": copies[last]["id"], "rehearsal_ms": rehearsals[last]["took_ms"]}
     for plan in plans:
@@ -3740,6 +3882,26 @@ def migrate(settings, http, plans, mirror, base, serving, candidate, release):
         if name == CALENDAR:
             progress.roles(settings, plan, candidate, images[name])
     progress.record("migrated", **summary)
+
+
+def migrate(settings, http, plans, mirror, base, serving, candidate, release):
+    """M2 after preparation, M3 and M4 for each database of the range (K3): the producer check, every copy and its
+    rehearsal before any production write, the final gates, then one production `migrate-expand` per database,
+    calendar first and then its db-roles and db-roles --check. Returns when every database is at its target with its
+    rehearsal's effect; raises MigrationWait or CallActive/CallsUnknown (nothing changed), or MigrationRefused."""
+    messaging = [plan for plan in plans if plan["database"] == AUTO_DATABASE]
+    limit = rehearsal_limit(settings)
+    if messaging:
+        follow_producer(settings, mirror, messaging[0], candidate, release)
+    images ={plan["database"]: migration_image(release, candidate, plan["database"]) for plan in plans}
+    progress = Progress(release, plans)
+    def refused(name, reason, phase):
+        progress.update(name, status="refused", phase=phase)
+        return progress.refused(name, "refused", reason, phase=phase, reason=reason)
+    copies, rehearsals = migrate_rehearse(settings, plans, candidate, images, limit, progress, refused)
+    evidence = migrate_gate(settings, http, plans, mirror, base, serving, candidate, release, messaging, images, copies,
+                            rehearsals, refused)
+    migrate_expand(settings, plans, candidate, images, copies, rehearsals, evidence, progress)
 
 
 # Deploy tool updates (ANYM-443, production.md "Deploy tool updates"). Each installed tool pair has its own directory
@@ -4227,11 +4389,43 @@ def unresolved(state, http_state, history=None, serving=None):
     return None
 
 
-def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, configs):
-    state, http_state = Path(settings["state_directory"]), Path(http["state_directory"])
-    # A tool update that stopped between `activating` and `active` is settled before anything else.
-    if reconciled := reconcile_tool(settings, configs, s, dry_run=dry_run, halt=halt):
-        return reconciled
+def settle_http_generation(http, s, serving, http_state, *, dry_run, halt):
+    """Finish a pending retirement before selecting another release; return its outcome when it must wait."""
+    if serving.get("status") == "serving-retirement-pending" and not serving_settled(serving):
+        # Retiring the managed predecessor HTTP pair is promote's last step, safe to repeat; it never cuts a request
+        # short. It changes the router (the admission fence), so its failure pauses.
+        if dry_run:
+            return serving, {"status": "plan", "sha": serving.get("sha"),
+                             "steps": ["retire the previous HTTP generation"]}
+        try:
+            s.retire(http, serving["sha"])
+        except Exception as exc:
+            message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+            return serving, halt(f"retiring the HTTP generation before {serving['sha']} failed: {message}; "
+                                 "inspect seamless_release.py status --sha " + serving["sha"])
+        serving = read(http_state / "http-current.json")
+        if not serving_settled(serving):
+            return serving, {"status": "waiting", "reason": "the previous HTTP generation is still draining"}
+    return serving, None
+
+
+def newest_attested_candidate(mirror, state, http_state, base, head, attested):
+    """Choose the newest published, unattempted main commit; an unreachable registry propagates to the caller."""
+    for sha in run(["git", "-C", str(mirror), "rev-list", "--first-parent", f"{base}..{head}"]).split():
+        # A commit whose deployment was attempted is never retried, and older ones never follow it.
+        if (state / sha / "attempted.json").exists() or (http_state / sha / "http-attempted.json").exists():
+            break
+        # Green CI is the attestation `publish` signs after `CI gate` (promotable); no GitHub API request.
+        try:
+            attested(sha)
+        except Unattested:
+            continue  # not published (yet): its CI still runs or failed, and an older commit may be deployed
+        return sha
+    return None
+
+
+def deploy_receipt(state, halt):
+    """The previous deploy receipt and its counters: `(halted, None)` when it is malformed, else `(None, counters)`."""
     try:
         last = read(state / "deploy.json") if (state / "deploy.json").exists() else {}
         started, failures, misses, waits = deploy_counts(last)
@@ -4239,7 +4433,207 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
         if type(gated) is not int or gated < 0:
             raise ValueError("migration wait count")
     except (ValueError, TypeError, AttributeError, KeyError):
-        return halt(f"the previous deploy receipt {state / 'deploy.json'} is malformed; inspect it")
+        return halt(f"the previous deploy receipt {state / 'deploy.json'} is malformed; inspect it"), None
+    return None, (last, started, failures, misses, waits, gated)
+
+
+def deploy_fetch_main(state, base, serving, last, failures, dry_run, halt):
+    """Read main's head: `(result, None)` ends the run (a failed read or a pause), else `(None, mirror)`; the mirror is
+    None when everything already serves main."""
+    try:
+        # Every failure here precedes any change: this run does nothing, and the third in a row pauses.
+        head = remote_main()
+        mirror = None if head == base == serving["sha"] else main_history(state)
+    except Exception as exc:
+        message, failures = (str(exc) if isinstance(exc, Refused) else type(exc).__name__), failures + 1
+        rest = {key: value for key, value in last.items() if key != "fetch_failures"}
+        if failures >= FETCH_FAILURES:
+            if not dry_run:
+                write(state / "deploy.json", rest)
+            return halt(f"git could not read main {failures} times in a row, last: {message}; "
+                        f"inspect the network and {state / 'deploy-source.git'}"), None
+        if not dry_run:
+            write(state / "deploy.json", {**rest, "fetch_failures": {"count": failures, "at": now(), "reason": message}})
+        return {"status": "fetch_failed", "reason": message, "failures": failures}, None
+    if "fetch_failures" in last and not dry_run:
+        write(state / "deploy.json", {key: value for key, value in last.items() if key != "fetch_failures"})
+    return None, mirror
+
+
+def deploy_candidate(state, http_state, mirror, base, head, serving, last, misses, attested, dry_run, halt):
+    """The release this run deploys and the commit it starts from: `(result, None, None)` ends the run, else
+    `(None, candidate, since)`."""
+    if unsettled := unsettled_migrations(state):
+        # An unattended migration may have changed the database before its plan A ran: that release is finished
+        # first, whatever main took since (ANYM-449 M4).
+        if len(unsettled) != 1 or serving["sha"] != base or unsettled[0] == base or not on_main(mirror, base, unsettled[0]):
+            return halt("an unattended migration is unsettled: " + ", ".join(unsettled) + "; inspect its migration.json"), None, None
+        candidate, since = unsettled[0], base
+    elif serving["sha"] != base:
+        # Plan A is ahead of the HTTP pair: a deploy whose HTTP release stopped before any change, or plan A applied
+        # by hand.
+        candidate, since = base, serving["sha"]
+    else:
+        try:
+            candidate = newest_attested_candidate(mirror, state, http_state, base, head, attested)
+        except Unreachable as exc:
+            # GHCR could not be read: no older commit is taken instead; nothing changed.
+            if misses + 1 >= FETCH_FAILURES:
+                return halt(f"GHCR or git could not be read {misses + 1} times in a row, last: {exc}"), None, None
+            if not dry_run:
+                write(state / "deploy.json", {**{key: value for key, value in last.items() if key != "unreachable"},
+                                              "unreachable": {"count": misses + 1, "at": now(), "reason": str(exc)}})
+            return {"status": "error", "reason": f"{exc}; nothing changed, the next run retries"}, None, None
+        if candidate is None:
+            if "unreachable" in last and not dry_run:
+                write(state / "deploy.json", {key: value for key, value in last.items() if key != "unreachable"})
+            return {"status": "waiting", "reason": "no newer main commit has attested images yet", "sha": base}, None, None
+        since = base
+    return None, candidate, since
+
+
+def deploy_plan(settings, s, configs, mirror, base, since, candidate, sql, pending, dry_run, halt):
+    """The migration plans of the range: `(result, None)` ends the run (a tool update or a pause), else `(None, plans)`."""
+    # M1 (ANYM-449, ANYM-586 K3): a messaging or calendar range migrate-expand may run without a person migrates
+    # instead of pausing.
+    plans = migration_plans(settings, mirror, since, candidate, sql) if sql and not pending and candidate != base else None
+    if (reasons := [] if plans else pause_text(sql, pending, migration_classes(mirror, since, candidate, sql))) and not sql and set(pending) <= TOOL_FILES.keys():
+        # Only the tool pair waits for an install: the self-updating layout installs it, when this run is its tool.
+        try:
+            tool = installed_tool()
+        except Refused as exc:
+            tool = reasons.append(f"the tool does not update itself: {exc}")
+        if tool and [blob(RUNNING), blob(s.__file__)] != [tool["blobs"][path] for path in TOOL_FILES]:
+            tool = reasons.append(f"the tool does not update itself: this run is not {TOOL_ROOT / 'current'}")
+        if tool:
+            return update_tool(settings, configs, s, mirror, candidate, base, tool, dry_run=dry_run, halt=halt), None
+    if reasons:
+        return halt("; ".join(reasons), sha=candidate), None
+    return None, plans
+
+
+def deploy_closers(record, state, misses, halt):
+    """The two ways a started deploy ends: `finish` records a status, `retry` a change-free error."""
+    def finish(status, **fields):
+        record.update(status=status, finished_at=now(), **fields)
+        write(state / "deploy.json", record)
+        return record
+    def retry(exc, message):
+        # A network error changed nothing; git or GHCR failing to be read the third run in a row pauses.
+        if isinstance(exc, Unreachable):
+            if misses + 1 >= FETCH_FAILURES:
+                return finish(**halt(f"GHCR or git could not be read {misses + 1} times in a row, last: {message}"))
+            record["unreachable"] = {"count": misses + 1, "at": now(), "reason": message}
+        return finish("error", reason=message + "; nothing changed, the next run retries")
+    return finish, retry
+
+
+def deploy_plan_a(settings, http, plans, mirror, base, serving, candidate, release, gated, waits, halt, finish, retry):
+    """Plan A: migrations, preparation and apply, with the rollback of an unhealthy apply. None: applied and healthy."""
+    migrated = False
+    try:
+        # M2 admission (read-only) before preparation; a run that finds migration.json resumes from it (M4).
+        if plans and not (migrated := resumed_migration(settings, plans, candidate, release)):
+            for plan in plans:
+                migration_gate(settings, http, plan, mirror, base, serving["sha"])
+        if not (release / "prepared.json").exists():
+            if release.exists():
+                return finish(**halt(f"an earlier preparation of {candidate} did not finish; inspect {release}"))
+            prepare(settings, candidate)
+        if plans and not migrated:
+            migrate(settings, http, plans, mirror, base, serving["sha"], candidate, release)
+            migrated = True
+        apply(settings, candidate)
+    except Exception as exc:
+        message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+        if isinstance(exc, MigrationRefused):
+            return finish(**halt(message))
+        if isinstance(exc, MigrationWait) and not (release / "attempted.json").exists():
+            if gated + 1 >= MIGRATION_WAITS:
+                return finish(**halt(f"the migration of {candidate} waited {gated + 1} runs in a row: {message}"))
+            return finish("waiting", reason=message + "; nothing changed, the next run retries",
+                          migration_waits={"count": gated + 1, "at": now(), "reason": message})
+        if migrated:
+            assert plans
+            message += " (" + " and ".join(f"{plan['database']} is already at schema {plan['target']}"
+                                           for plan in plans) + ")"
+        if isinstance(exc, (CallActive, CallsUnknown)) and not (release / "attempted.json").exists():
+            # Nothing was stopped: the prepared release waits for a later run; the fourth wait in a row pauses.
+            if waits + 1 >= CALL_WAITS:
+                return finish(**halt(f"plan A of {candidate} waited {waits + 1} runs in a row for calls: {message}; "
+                                     "inspect the calls service"))
+            return finish("waiting", reason=message + "; nothing changed, the next run retries",
+                          call_waits={"count": waits + 1, "at": now(), "reason": message})
+        if not (release / "attempted.json").exists():
+            # A network or quota error before preparation started or after it finished changed nothing.
+            if transient(exc) and ((release / "prepared.json").exists() or not release.exists()):
+                return retry(exc, message)
+            return finish(**halt(f"plan A of {candidate} was refused before any change: {message}"))
+        result = read(release / "result.json") if (release / "result.json").exists() else {}
+        if result.get("status") != "unhealthy":
+            return finish(**halt(f"plan A of {candidate} stopped in an unknown state: {message}; inspect it"))
+        # The previous release still fits: a range either leaves the SQL inventory alone (pause_reasons) or only
+        # expands the schema (ANYM-449 M5), and the base runs on the target schema; a migration is never reversed.
+        try:
+            rollback(settings, candidate, http)
+        except Exception as again:
+            detail = str(again) if isinstance(again, Refused) else type(again).__name__
+            return finish(**halt(f"plan A of {candidate} failed its health wait and its rollback failed: {detail}; "
+                                 "production state is unknown, inspect it"))
+        if migrated:
+            assert plans
+            named = len(plans) > 1 or plans[0]["database"] != AUTO_DATABASE
+            def schemas(text):
+                return " and ".join((f"{plan['database']} " if named else "") + text.format(**plan) for plan in plans)
+            return finish(**halt(f"plan A of {candidate} failed its health wait after migrating "
+                                 f"{schemas('schema {base} to {target}')}; rolled back to {base} on "
+                                 f"{schemas('schema {target}')}", status="rolled-back"))
+        return finish(**halt(f"plan A of {candidate} failed its health wait; rolled back to {base}",
+                             status="rolled-back"))
+    return None
+
+
+def deploy_plan_b(http, s, http_state, candidate, halt, finish, retry):
+    """Plan B (the HTTP pair): `(result, None)` ends the run, else `(None, served)`."""
+    try:
+        if not (http_state / candidate / "http-prepared.json").exists():
+            if (http_state / candidate).exists():
+                return finish(**halt(f"an earlier HTTP preparation of {candidate} did not finish; inspect it")), None
+            s.prepare(http, candidate)
+        served = s.promote(http, candidate)
+    except Exception as exc:
+        message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+        directory = http_state / candidate
+        if transient(exc) and not (directory / "http-attempted.json").exists() and (
+                (directory / "http-prepared.json").exists() or not directory.exists()):
+            return retry(exc, message), None
+        return finish(**halt(f"plan A of {candidate} is applied, but its HTTP release stopped: {message}; "
+                             "inspect seamless_release.py status --sha " + candidate)), None
+    return None, served
+
+
+def deploy_finish(settings, s, state, http_state, finish, served, preflight=None):
+    outcome = finish("deployed", http=served.get("status"))
+    # Recorded as deployed first: removing old release images never changes that outcome, nor does adding its summary.
+    outcome["image_removal"] = retain_images(settings, held=(http_state, s.GLOBAL_LOCK))
+    outcome["preflight"] = preflight
+    outcome["cleanup"] = cleanup_line(preflight, outcome["image_removal"], served.get("cleanup"))
+    try:
+        write(state / "deploy.json", outcome)
+    except Exception:
+        outcome["image_removal"]["receipt"] = "not written; deploy.json keeps the deployed receipt without this summary"
+    return outcome
+
+
+def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, configs):
+    state, http_state = Path(settings["state_directory"]), Path(http["state_directory"])
+    # A tool update that stopped between `activating` and `active` is settled before anything else.
+    if reconciled := reconcile_tool(settings, configs, s, dry_run=dry_run, halt=halt):
+        return reconciled
+    halted, counts = deploy_receipt(state, halt)
+    if halted is not None:
+        return halted
+    last, started, failures, misses, waits, gated = counts
     if auto and started and (datetime.now(timezone.utc) - started).total_seconds() < DEPLOY_INTERVAL:
         return {"status": "waiting", "reason": "less than 20 minutes since the last deploy started"}
     if "call_waits" in last or "migration_waits" in last:
@@ -4255,39 +4649,14 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
     if current.get("status") != "applied" or not re.fullmatch(r"[0-9a-f]{40}", current.get("sha", "")):
         return halt(f"the current release is {current.get('status', 'missing')}, not applied; apply one by hand first")
     base = current["sha"]
-    if serving.get("status") == "serving-retirement-pending" and not serving_settled(serving):
-        # Retiring the managed predecessor HTTP pair is promote's last step, safe to repeat; it never cuts a request
-        # short. It changes the router (the admission fence), so its failure pauses.
-        if dry_run:
-            return {"status": "plan", "sha": serving.get("sha"), "steps": ["retire the previous HTTP generation"]}
-        try:
-            s.retire(http, serving["sha"])
-        except Exception as exc:
-            message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
-            return halt(f"retiring the HTTP generation before {serving['sha']} failed: {message}; "
-                        "inspect seamless_release.py status --sha " + serving["sha"])
-        serving = read(http_state / "http-current.json")
-        if not serving_settled(serving):
-            return {"status": "waiting", "reason": "the previous HTTP generation is still draining"}
+    serving, retirement = settle_http_generation(http, s, serving, http_state, dry_run=dry_run, halt=halt)
+    if retirement is not None:
+        return retirement
     if not serving_settled(serving) or not re.fullmatch(r"[0-9a-f]{40}", serving.get("sha", "")):
         return halt(f"the HTTP release is {serving.get('status', 'missing')}; inspect seamless_release.py status")
-    try:
-        # Every failure here precedes any change: this run does nothing, and the third in a row pauses.
-        head = remote_main()
-        mirror = None if head == base == serving["sha"] else main_history(state)
-    except Exception as exc:
-        message, failures = (str(exc) if isinstance(exc, Refused) else type(exc).__name__), failures + 1
-        rest = {key: value for key, value in last.items() if key != "fetch_failures"}
-        if failures >= FETCH_FAILURES:
-            if not dry_run:
-                write(state / "deploy.json", rest)
-            return halt(f"git could not read main {failures} times in a row, last: {message}; "
-                        f"inspect the network and {state / 'deploy-source.git'}")
-        if not dry_run:
-            write(state / "deploy.json", {**rest, "fetch_failures": {"count": failures, "at": now(), "reason": message}})
-        return {"status": "fetch_failed", "reason": message, "failures": failures}
-    if "fetch_failures" in last and not dry_run:
-        write(state / "deploy.json", {key: value for key, value in last.items() if key != "fetch_failures"})
+    halted, mirror = deploy_fetch_main(state, base, serving, last, failures, dry_run, halt)
+    if halted is not None:
+        return halted
     if mirror is None:
         return {"status": "current", "sha": base}
     head = run(["git", "-C", str(mirror), "rev-parse", "refs/heads/main"]).strip()
@@ -4299,58 +4668,14 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
         return halt(drift + "; apply the next release by hand")
     installed = {"scripts/production.py": RUNNING, "scripts/seamless_release.py": s.__file__,
                  **{path: SYSTEMD_DIRECTORY / Path(path).name for path in UNITS}}
-    if unsettled := unsettled_migrations(state):
-        # An unattended migration may have changed the database before its plan A ran: that release is finished
-        # first, whatever main took since (ANYM-449 M4).
-        if len(unsettled) != 1 or serving["sha"] != base or unsettled[0] == base or not on_main(mirror, base, unsettled[0]):
-            return halt("an unattended migration is unsettled: " + ", ".join(unsettled) + "; inspect its migration.json")
-        candidate, since = unsettled[0], base
-    elif serving["sha"] != base:
-        # Plan A is ahead of the HTTP pair: a deploy whose HTTP release stopped before any change, or plan A applied
-        # by hand.
-        candidate, since = base, serving["sha"]
-    else:
-        candidate = None
-        for sha in run(["git", "-C", str(mirror), "rev-list", "--first-parent", f"{base}..{head}"]).split():
-            # A commit whose deployment was attempted is never retried, and older ones never follow it.
-            if (state / sha / "attempted.json").exists() or (http_state / sha / "http-attempted.json").exists():
-                break
-            # Green CI is the attestation `publish` signs after `CI gate` (promotable); no GitHub API request.
-            try:
-                attested(sha)
-            except Unattested:
-                continue  # not published (yet): its CI still runs or failed, and an older commit may be deployed
-            except Unreachable as exc:
-                # GHCR could not be read: no older commit is taken instead; nothing changed.
-                if misses + 1 >= FETCH_FAILURES:
-                    return halt(f"GHCR or git could not be read {misses + 1} times in a row, last: {exc}")
-                if not dry_run:
-                    write(state / "deploy.json", {**{key: value for key, value in last.items() if key != "unreachable"},
-                                                  "unreachable": {"count": misses + 1, "at": now(), "reason": str(exc)}})
-                return {"status": "error", "reason": f"{exc}; nothing changed, the next run retries"}
-            candidate = sha
-            break
-        if candidate is None:
-            if "unreachable" in last and not dry_run:
-                write(state / "deploy.json", {key: value for key, value in last.items() if key != "unreachable"})
-            return {"status": "waiting", "reason": "no newer main commit has attested images yet", "sha": base}
-        since = base
+    halted, candidate, since = deploy_candidate(state, http_state, mirror, base, head, serving, last, misses, attested,
+                                                dry_run, halt)
+    if halted is not None:
+        return halted
     sql, pending = range_changes(mirror, since, candidate, installed)
-    # M1 (ANYM-449, ANYM-586 K3): a messaging or calendar range migrate-expand may run without a person migrates
-    # instead of pausing.
-    plans = migration_plans(settings, mirror, since, candidate, sql) if sql and not pending and candidate != base else None
-    if (reasons := [] if plans else pause_text(sql, pending, migration_classes(mirror, since, candidate, sql))) and not sql and set(pending) <= TOOL_FILES.keys():
-        # Only the tool pair waits for an install: the self-updating layout installs it, when this run is its tool.
-        try:
-            tool = installed_tool()
-        except Refused as exc:
-            tool = reasons.append(f"the tool does not update itself: {exc}")
-        if tool and [blob(RUNNING), blob(s.__file__)] != [tool["blobs"][path] for path in TOOL_FILES]:
-            tool = reasons.append(f"the tool does not update itself: this run is not {TOOL_ROOT / 'current'}")
-        if tool:
-            return update_tool(settings, configs, s, mirror, candidate, base, tool, dry_run=dry_run, halt=halt)
-    if reasons:
-        return halt("; ".join(reasons), sha=candidate)
+    halted, plans = deploy_plan(settings, s, configs, mirror, base, since, candidate, sql, pending, dry_run, halt)
+    if halted is not None:
+        return halted
     if dry_run:
         migration = [f"migrate {plan['database']} schema {plan['base']} to {plan['target']} after a verified copy and "
                      "its rehearsal" + (", then db-roles and db-roles --check" if plan["database"] == CALENDAR else "")
@@ -4359,101 +4684,20 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
                 "steps": migration + (["plan A"] if candidate != base else []) + ["plan B"]}
     record.update(sha=candidate, base=base, started_at=now(), status="deploying")
     write(state / "deploy.json", record)
-    def finish(status, **fields):
-        record.update(status=status, finished_at=now(), **fields)
-        write(state / "deploy.json", record)
-        return record
-    def retry(exc, message):
-        # A network error changed nothing; git or GHCR failing to be read the third run in a row pauses.
-        if isinstance(exc, Unreachable):
-            if misses + 1 >= FETCH_FAILURES:
-                return finish(**halt(f"GHCR or git could not be read {misses + 1} times in a row, last: {message}"))
-            record["unreachable"] = {"count": misses + 1, "at": now(), "reason": message}
-        return finish("error", reason=message + "; nothing changed, the next run retries")
+    finish, retry = deploy_closers(record, state, misses, halt)
+    # ANYM-689: containers of retired HTTP generations and the images they pinned go before the disk check of the
+    # preparation; the summary rides in deploy.json whether the deploy ends or halts.
+    preflight = preflight_cleanup(settings, http, s, http_state)
     release = state / candidate
     if candidate != base:
-        migrated = False
-        try:
-            # M2 admission (read-only) before preparation; a run that finds migration.json resumes from it (M4).
-            if plans and not (migrated := resumed_migration(settings, plans, candidate, release)):
-                for plan in plans:
-                    migration_gate(settings, http, plan, mirror, base, serving["sha"])
-            if not (release / "prepared.json").exists():
-                if release.exists():
-                    return finish(**halt(f"an earlier preparation of {candidate} did not finish; inspect {release}"))
-                prepare(settings, candidate)
-            if plans and not migrated:
-                migrate(settings, http, plans, mirror, base, serving["sha"], candidate, release)
-                migrated = True
-            apply(settings, candidate)
-        except Exception as exc:
-            message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
-            if isinstance(exc, MigrationRefused):
-                return finish(**halt(message))
-            if isinstance(exc, MigrationWait) and not (release / "attempted.json").exists():
-                if gated + 1 >= MIGRATION_WAITS:
-                    return finish(**halt(f"the migration of {candidate} waited {gated + 1} runs in a row: {message}"))
-                return finish("waiting", reason=message + "; nothing changed, the next run retries",
-                              migration_waits={"count": gated + 1, "at": now(), "reason": message})
-            if migrated:
-                assert plans
-                message += " (" + " and ".join(f"{plan['database']} is already at schema {plan['target']}"
-                                               for plan in plans) + ")"
-            if isinstance(exc, (CallActive, CallsUnknown)) and not (release / "attempted.json").exists():
-                # Nothing was stopped: the prepared release waits for a later run; the fourth wait in a row pauses.
-                if waits + 1 >= CALL_WAITS:
-                    return finish(**halt(f"plan A of {candidate} waited {waits + 1} runs in a row for calls: {message}; "
-                                         "inspect the calls service"))
-                return finish("waiting", reason=message + "; nothing changed, the next run retries",
-                              call_waits={"count": waits + 1, "at": now(), "reason": message})
-            if not (release / "attempted.json").exists():
-                # A network or quota error before preparation started or after it finished changed nothing.
-                if transient(exc) and ((release / "prepared.json").exists() or not release.exists()):
-                    return retry(exc, message)
-                return finish(**halt(f"plan A of {candidate} was refused before any change: {message}"))
-            result = read(release / "result.json") if (release / "result.json").exists() else {}
-            if result.get("status") != "unhealthy":
-                return finish(**halt(f"plan A of {candidate} stopped in an unknown state: {message}; inspect it"))
-            # The previous release still fits: a range either leaves the SQL inventory alone (pause_reasons) or only
-            # expands the schema (ANYM-449 M5), and the base runs on the target schema; a migration is never reversed.
-            try:
-                rollback(settings, candidate, http)
-            except Exception as again:
-                detail = str(again) if isinstance(again, Refused) else type(again).__name__
-                return finish(**halt(f"plan A of {candidate} failed its health wait and its rollback failed: {detail}; "
-                                     "production state is unknown, inspect it"))
-            if migrated:
-                assert plans
-                named = len(plans) > 1 or plans[0]["database"] != AUTO_DATABASE
-                def schemas(text):
-                    return " and ".join((f"{plan['database']} " if named else "") + text.format(**plan) for plan in plans)
-                return finish(**halt(f"plan A of {candidate} failed its health wait after migrating "
-                                     f"{schemas('schema {base} to {target}')}; rolled back to {base} on "
-                                     f"{schemas('schema {target}')}", status="rolled-back"))
-            return finish(**halt(f"plan A of {candidate} failed its health wait; rolled back to {base}",
-                                 status="rolled-back"))
-    try:
-        if not (http_state / candidate / "http-prepared.json").exists():
-            if (http_state / candidate).exists():
-                return finish(**halt(f"an earlier HTTP preparation of {candidate} did not finish; inspect it"))
-            s.prepare(http, candidate)
-        served = s.promote(http, candidate)
-    except Exception as exc:
-        message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
-        directory = http_state / candidate
-        if transient(exc) and not (directory / "http-attempted.json").exists() and (
-                (directory / "http-prepared.json").exists() or not directory.exists()):
-            return retry(exc, message)
-        return finish(**halt(f"plan A of {candidate} is applied, but its HTTP release stopped: {message}; "
-                             "inspect seamless_release.py status --sha " + candidate))
-    outcome = finish("deployed", http=served.get("status"))
-    # Recorded as deployed first: removing old release images never changes that outcome, nor does adding its summary.
-    outcome["image_removal"] = retain_images(settings, held=(http_state, s.GLOBAL_LOCK))
-    try:
-        write(state / "deploy.json", outcome)
-    except Exception:
-        outcome["image_removal"]["receipt"] = "not written; deploy.json keeps the deployed receipt without this summary"
-    return outcome
+        halted = deploy_plan_a(settings, http, plans, mirror, base, serving, candidate, release, gated, waits, halt, finish,
+                               retry)
+        if halted is not None:
+            return attach_cleanup(state, record, halted, preflight)
+    halted, served = deploy_plan_b(http, s, http_state, candidate, halt, finish, retry)
+    if halted is not None:
+        return attach_cleanup(state, record, halted, preflight)
+    return deploy_finish(settings, s, state, http_state, finish, served, preflight)
 
 
 def transient(exc):
@@ -4503,7 +4747,7 @@ def active_config():
     return found
 
 
-def main(argv=None):
+def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["verify", "prepare", "prepare-router", "apply", "rollback", "status",
                                            "images", "check-image", "deploy", "self-test", "tool-rollback",
@@ -4518,85 +4762,107 @@ def main(argv=None):
     parser.add_argument("--database", help="copy-database: a name under the configuration's migration.databases")
     parser.add_argument("--verifier", help="self-test: check this staged verifier build against the pin instead of "
                                            "the installed one (attest-verify install, production.md)")
+    return parser
+
+
+def locked_action(args):
+    """Run state commands while retaining each command's existing lock scope."""
+    settings, http = config(args.config), None
+    state = Path(settings["state_directory"])
+    with ExitStack() as locks:
+        if args.action == "prepare-router":
+            if os.geteuid() != 0:
+                raise Refused("router preparation requires the production host operator")
+            canonical = Path("/var/lib/deedkit-production")
+            locks.enter_context(lock(canonical))
+            if state.resolve() != canonical.resolve():
+                locks.enter_context(lock(state))
+        elif args.action == "rollback":
+            # Plan B's state is read, and the rollback runs, under the locks seamless_release.py holds (its
+            # global lock also without plan B, where the host has one); only an absent default HTTP
+            # configuration can mean no plan B (ANYM-642).
+            s = http_release_tool()
+            http = (None if args.http_config == HTTP_CONFIG and not os.path.lexists(args.http_config)
+                    else s.validate_settings(config(args.http_config)))
+            locks.enter_context(host_locks(settings, http, s) if http else s.locks(settings)
+                                if s.GLOBAL_LOCK.is_dir() else lock(state))
+        else:
+            locks.enter_context(lock(state))
+        if args.action == "status":
+            result = read(state / "current.json") if (state / "current.json").exists() else {"status": "not promoted by this tool"}
+            result["config"] = str(args.config)
+            if (state / "deploy.json").exists():
+                result["deploy"] = read(state / "deploy.json")
+            if PAUSE.exists():
+                result["autodeploy_pause"] = PAUSE.read_text()[:1000].strip()
+        elif args.action == "images":
+            result = remove_images(settings) if args.remove else images_report(settings)
+        elif args.action == "copy-database":
+            with database_copy(settings, args.database, args.sha) as copied:
+                result = copied
+        else:
+            if not re.fullmatch(r"[0-9a-f]{40}", args.sha or ""):
+                raise Refused("an exact lowercase 40-character commit SHA is required")
+            result = (rollback(settings, args.sha, http) if args.action == "rollback" else
+                      {"prepare": prepare, "prepare-router": prepare_router, "apply": apply}[args.action](
+                          settings, args.sha))
+            if args.action == "apply":
+                # Printed only: result.json and current.json stay the release receipts.
+                result = {**result, "image_removal": retain_images(settings)}
+    return result
+
+
+def execute_action(args):
+    if args.action == "check-image":
+        if not args.target:
+            raise Refused("select a target for container verification")
+        source = Path(__file__).resolve().parents[1]
+        sha = run(["git", "-C", str(source), "rev-parse", "HEAD"]).strip()
+        return {"sha": sha, "image": build_image(source, sha, args.target, check=True)}
+    if args.action == "verify":
+        return verify(args.sha or "")
+    if args.action == "self-test":
+        return self_test(args.config, args.http_config, args.verifier)
+    if args.action == "tool-rollback":
+        if os.geteuid() != 0:
+            raise Refused("tool-rollback requires the production host operator")
+        s = http_release_tool()
+        return tool_rollback(config(args.config), s.validate_settings(config(args.http_config)), s)
+    if args.action == "deploy":
+        if os.geteuid() != 0:
+            raise Refused("deploy requires the production host operator")
+        return deploy(config(args.config), http_release_tool().validate_settings(config(args.http_config)),
+                      auto=args.auto, dry_run=args.dry_run, configs=(args.config, args.http_config))
+    return locked_action(args)
+
+
+def print_result(args, result, parser):
+    if args.action == "self-test":
+        print(json.dumps(result))
+    elif args.action == "deploy":
+        # One line per run for the journal; a new pause, an error or a failed fetch exits 1, so the timer unit shows failed.
+        print(json.dumps(result, sort_keys=True))
+        if result["status"] in ("halted", "rolled-back", "error", "fetch_failed"):
+            parser.exit(1)
+    else:
+        # Receipts contain revisions/image IDs, never resolved Compose environments.
+        if args.action == "prepare":
+            result = {key: result[key] for key in ("sha", "ci", "images", "references")}
+        print(json.dumps(result, indent=2))
+        if args.action == "status":
+            # Beside the JSON, not in it: a reader that parses stdout keeps getting one document.
+            print(calendar_backup_line(), file=sys.stderr)
+
+
+def main(argv=None):
+    parser = argument_parser()
     args = parser.parse_args(argv)
     os.umask(0o077)
     try:
         if args.verifier and args.action != "self-test":
             raise Refused("--verifier is only for self-test; every other command uses the installed verifier")
         args.config = args.config or (active_config() if args.action == "status" else CONFIG)
-        if args.action == "check-image":
-            if not args.target:
-                raise Refused("select a target for container verification")
-            source = Path(__file__).resolve().parents[1]
-            sha = run(["git", "-C", str(source), "rev-parse", "HEAD"]).strip()
-            result = {"sha": sha, "image": build_image(source, sha, args.target, check=True)}
-        elif args.action == "verify":
-            result = verify(args.sha or "")
-        elif args.action == "self-test":
-            print(json.dumps(self_test(args.config, args.http_config, args.verifier)))
-            return
-        elif args.action == "tool-rollback":
-            if os.geteuid() != 0:
-                raise Refused("tool-rollback requires the production host operator")
-            s = http_release_tool()
-            result = tool_rollback(config(args.config), s.validate_settings(config(args.http_config)), s)
-        elif args.action == "deploy":
-            if os.geteuid() != 0:
-                raise Refused("deploy requires the production host operator")
-            result = deploy(config(args.config), http_release_tool().validate_settings(config(args.http_config)),
-                            auto=args.auto, dry_run=args.dry_run, configs=(args.config, args.http_config))
-            # One line per run for the journal; a new pause, an error or a failed fetch exits 1, so the timer unit shows failed.
-            print(json.dumps(result, sort_keys=True))
-            if result["status"] in ("halted", "rolled-back", "error", "fetch_failed"):
-                parser.exit(1)
-            return
-        else:
-            settings, http = config(args.config), None
-            state = Path(settings["state_directory"])
-            with ExitStack() as locks:
-                if args.action == "prepare-router":
-                    if os.geteuid() != 0:
-                        raise Refused("router preparation requires the production host operator")
-                    canonical = Path("/var/lib/deedkit-production")
-                    locks.enter_context(lock(canonical))
-                    if state.resolve() != canonical.resolve():
-                        locks.enter_context(lock(state))
-                elif args.action == "rollback":
-                    # Plan B's state is read, and the rollback runs, under the locks seamless_release.py holds (its
-                    # global lock also without plan B, where the host has one); only an absent default HTTP
-                    # configuration can mean no plan B (ANYM-642).
-                    s = http_release_tool()
-                    http = (None if args.http_config == HTTP_CONFIG and not os.path.lexists(args.http_config)
-                            else s.validate_settings(config(args.http_config)))
-                    locks.enter_context(host_locks(settings, http, s) if http else s.locks(settings)
-                                        if s.GLOBAL_LOCK.is_dir() else lock(state))
-                else:
-                    locks.enter_context(lock(state))
-                if args.action == "status":
-                    result = read(state / "current.json") if (state / "current.json").exists() else {"status": "not promoted by this tool"}
-                    result["config"] = str(args.config)
-                    if (state / "deploy.json").exists():
-                        result["deploy"] = read(state / "deploy.json")
-                    if PAUSE.exists():
-                        result["autodeploy_pause"] = PAUSE.read_text()[:1000].strip()
-                elif args.action == "images":
-                    result = remove_images(settings) if args.remove else images_report(settings)
-                elif args.action == "copy-database":
-                    with database_copy(settings, args.database, args.sha) as copied:
-                        result = copied
-                else:
-                    if not re.fullmatch(r"[0-9a-f]{40}", args.sha or ""):
-                        raise Refused("an exact lowercase 40-character commit SHA is required")
-                    result = (rollback(settings, args.sha, http) if args.action == "rollback" else
-                              {"prepare": prepare, "prepare-router": prepare_router, "apply": apply}[args.action](
-                                  settings, args.sha))
-                    if args.action == "apply":
-                        # Printed only: result.json and current.json stay the release receipts.
-                        result = {**result, "image_removal": retain_images(settings)}
-        # Receipts contain revisions/image IDs, never resolved Compose environments.
-        if args.action == "prepare":
-            result = {key: result[key] for key in ("sha", "ci", "images", "references")}
-        print(json.dumps(result, indent=2))
+        print_result(args, execute_action(args), parser)
     except Exception as exc:
         message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
         if isinstance(exc, OSError) and exc.filename:

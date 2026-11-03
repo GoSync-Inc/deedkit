@@ -146,6 +146,15 @@ def test_provider_chat_metadata_is_strict(metadata):
 
 def test_sync_status_accepts_explicit_full_detail_over_mcp(seeded):
     s, key, _ = seeded
+    # ANYM-671: an account with no collector reports a not_ready outbound block in compact, so the quiet overview
+    # this budget measures has connected collectors, as in a deployment.
+    from messaging_service.collector_state import CollectorState
+    archive = Archive(s)
+    for account, platform in (('telegram-demo', 'telegram'), ('whatsapp-demo-1', 'whatsapp')):
+        archive.register(account, platform, 'Synthetic ' + account, discover=True)
+        CollectorState(archive, account, ('budget-worker', archive.acquire(account, 'budget-worker'))).phase(
+            'connection', 'connected', 'provider_ready')
+        archive.set_sending(account, True)
     with TestClient(create_app(s, ['testserver'])) as client:
         for detail in ['compact', 'full']:
             response = rpc(client, key, 'get_sync_status', {'detail': detail}).json()
