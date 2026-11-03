@@ -34,6 +34,8 @@ BRIDGE = 'dk-recordings0'
 # The internal backend bridge holds no host address (gateway mode `isolated`); its INPUT drop is the second layer.
 BACKEND_BRIDGE = 'dk-recbackend0'
 CHAIN = 'DEEDKIT-RECORDINGS'
+# The port recordings-api listens on: the one thing a peer on the backend bridge may open a connection to.
+SERVICE_PORT = 13234
 # Host-local, private, tailnet (CGNAT), link-local (with metadata 169.254.169.254), multicast and reserved.
 DROPPED = ('0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12',
            '192.0.0.0/24', '192.168.0.0/16', '198.18.0.0/15', '224.0.0.0/4', '240.0.0.0/4')
@@ -42,7 +44,15 @@ DROPPED = ('0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0
 def chain_rules(resolver, table):
     """The chain for one table: create, empty, the resolver, every drop, then the one public allow and a final drop."""
     t = f'-t {table} ' if table else ''
-    return ([f'iptables {t}-N {CHAIN}', f'iptables {t}-F {CHAIN}'] +
+    # The backend bridge is internal, but peers on it still reach each other (the gateway listens there on 0.0.0.0): in the
+    # filter table, where conntrack state exists, a connection may be OPENED only to the service port (the gateway's
+    # requests); replies pass, and the recordings container cannot open one to the gateway or any other peer. The raw
+    # table runs before conntrack and holds the egress half only.
+    backend = [] if table else [
+        f'iptables -A {CHAIN} -i {BACKEND_BRIDGE} -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN',
+        f'iptables -A {CHAIN} -i {BACKEND_BRIDGE} -p tcp --dport {SERVICE_PORT} -j RETURN',
+        f'iptables -A {CHAIN} -i {BACKEND_BRIDGE} -j DROP']
+    return ([f'iptables {t}-N {CHAIN}', f'iptables {t}-F {CHAIN}'] + backend +
             [f'iptables {t}-A {CHAIN} -d {resolver} -p {proto} --dport 53 -j RETURN' for proto in ('udp', 'tcp')] +
             [f'iptables {t}-A {CHAIN} -d {network} -j DROP' for network in DROPPED] +
             [f'iptables {t}-A {CHAIN} -p tcp --dport 443 -j RETURN', f'iptables {t}-A {CHAIN} -j DROP'])
@@ -56,6 +66,7 @@ def rules(resolver):
     return (chain_rules(resolver, '') + chain_rules(resolver, 'raw') +
             [f'iptables -I DOCKER-USER -i {BRIDGE} -j {CHAIN}',
              f'iptables -t raw -I PREROUTING -i {BRIDGE} -j {CHAIN}',
+             f'iptables -I DOCKER-USER -i {BACKEND_BRIDGE} -j {CHAIN}',
              # Packets to the host itself are not forwarded, so DOCKER-USER never sees them; both bridges.
              *[f'iptables -I INPUT -i {bridge} -j DROP' for bridge in (BRIDGE, BACKEND_BRIDGE)],
              # The bridges have no IPv6 (enable_ipv6: false); these drop ULA, NAT64 and everything else anyway.
@@ -67,6 +78,7 @@ def rules(resolver):
 def undo():
     return [f'iptables -D DOCKER-USER -i {BRIDGE} -j {CHAIN}',
             f'iptables -t raw -D PREROUTING -i {BRIDGE} -j {CHAIN}',
+            f'iptables -D DOCKER-USER -i {BACKEND_BRIDGE} -j {CHAIN}',
             *[f'iptables -D INPUT -i {bridge} -j DROP' for bridge in (BRIDGE, BACKEND_BRIDGE)],
             f'ip6tables -D DOCKER-USER -i {BRIDGE} -j DROP',
             f'ip6tables -t raw -D PREROUTING -i {BRIDGE} -j DROP',

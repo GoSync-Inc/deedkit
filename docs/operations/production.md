@@ -1747,6 +1747,14 @@ in `DOCKER-USER` and in raw `PREROUTING` (Tailscale's `ts-forward` accept can pr
 conntrack and cannot be passed over by a reorder), plus `INPUT` drops for `dk-recordings0` and `dk-recbackend0` (no route to the
 host itself) and IPv6 drops in all three places. It never edits the inference or delivery rules.
 
+The internal backend bridge `dk-recbackend0` also needs a rule: peers on it reach each other, and the gateway listens there on
+0.0.0.0, so without one the recordings container could open a connection to the gateway. The filter chain therefore starts
+with three rules for traffic entering from `dk-recbackend0` (a third `DOCKER-USER` hook): replies (conntrack
+`RELATED,ESTABLISHED`) pass, a NEW connection to the service port 13234 passes (the gateway's requests), everything else is
+dropped. The raw chain does not hold them (no conntrack before raw). This relies on Docker's `br_netfilter`, which also
+carries its own inter-container rules. Read-back: `check --blocked GATEWAY_BACKEND_IP:13240` from the container is
+blocked, while a gateway request to recordings-api still answers.
+
 Persistence follows "Host firewall persistence (ANYM-693)": the filter blocks go into the `deedkit-recordings` block of
 `/etc/ufw/before.rules` and `before6.rules` (`rules --resolver $RECORDINGS_RESOLVER --format ufw --family v4|v6 --source FILE`
 merges it after the delivery block), the raw half is a function of the ONE generated `/etc/ufw/after.init`
@@ -1762,6 +1770,16 @@ inference verifier would read the composed hook as `table_differs:raw`); then th
 block and hook; `verify` of all three scripts must print `ok`; only then start `recordings-api`. To remove: stop
 `recordings-api` first, then run the rules' `undo` (it removes only the recordings rules and the composed hook goes back to
 the inference-only text, with `RECORDINGS_RESOLVER` removed from the env file).
+
+**DNS.** The overlay sets `dns: [$RECORDINGS_RESOLVER]` (required), the same address the host rules allow: Docker's embedded
+resolver then queries that server from the container's namespace, where the bridge rules apply; without `dns` it would
+use the host's inherited resolvers from the host namespace, outside them. Read-back: `getent hosts api.omi.me` works in the
+container and a query to any other resolver (`check --blocked-dns IP`) gets no answer.
+
+**Boot budget.** The recordings half of `after.init` runs first as a child under its own aggregate bound
+(`DEEDKIT_RECORDINGS_TIMEOUT`, 1-15 s, default 12 s, plus a 2 s kill grace), so it cannot use the inference half's share of the
+hook's 60 s; an overrun records `hook_recordings_124`, a restore or hook failure `restore_recordings_v4` or
+`hook_recordings_v4|v6`, in the same raw-step record, after the inference half has loaded. The hook still exits 0.
 
 **Egress admission.** The overlay sets `RECORDINGS_EGRESS_ADMISSION=required` and requires `RECORDINGS_EGRESS_BLOCKED` and
 `RECORDINGS_EGRESS_OPEN` (comma-separated, in the project's env file; Compose refuses a missing one). Before the CLI binds its

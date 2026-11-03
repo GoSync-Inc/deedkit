@@ -16,6 +16,10 @@ services:
       recordings-backend:
         aliases: [recordings-api]
       recordings-egress: {}
+    # Docker's embedded resolver then queries this server from the container's own namespace, where the bridge rules apply
+    # (without it the host's resolvers are queried from the host namespace, outside them). The same address the host rules
+    # allow (RECORDINGS_RESOLVER in the host env file).
+    dns: ["${RECORDINGS_RESOLVER:?Set the DNS resolver the host rules allow}"]
     restart: unless-stopped
     environment:
       # ANYM-712: the service refuses to bind its port unless the host egress rules are in force (production.md,

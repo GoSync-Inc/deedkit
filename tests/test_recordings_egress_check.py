@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 import yaml
@@ -43,14 +44,20 @@ def commands(*extra):
     return out.splitlines()
 
 
+BACKEND_RULES = [f'-i {BACKEND} -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN', f'-i {BACKEND} -p tcp --dport 13234 -j RETURN',
+                 f'-i {BACKEND} -j DROP']
+
+
 def golden():
-    filter_chain = ([f'iptables -N {CHAIN}', f'iptables -F {CHAIN}'] +
-                    [f'iptables -A {CHAIN} -d {RESOLVER} -p {proto} --dport 53 -j RETURN' for proto in ('udp', 'tcp')] +
-                    [f'iptables -A {CHAIN} -d {network} -j DROP' for network in DROPPED] +
-                    [f'iptables -A {CHAIN} -p tcp --dport 443 -j RETURN', f'iptables -A {CHAIN} -j DROP'])
-    raw_chain = [line.replace('iptables ', 'iptables -t raw ', 1) for line in filter_chain]
+    egress = ([f'iptables -A {CHAIN} -d {RESOLVER} -p {proto} --dport 53 -j RETURN' for proto in ('udp', 'tcp')] +
+              [f'iptables -A {CHAIN} -d {network} -j DROP' for network in DROPPED] +
+              [f'iptables -A {CHAIN} -p tcp --dport 443 -j RETURN', f'iptables -A {CHAIN} -j DROP'])
+    backend = [f'iptables -A {CHAIN} {rule}' for rule in BACKEND_RULES]
+    filter_chain = [f'iptables -N {CHAIN}', f'iptables -F {CHAIN}', *backend, *egress]
+    raw_chain = [line.replace('iptables ', 'iptables -t raw ', 1) for line in [f'iptables -N {CHAIN}', f'iptables -F {CHAIN}', *egress]]
     return (filter_chain + raw_chain +
             [f'iptables -I DOCKER-USER -i {BRIDGE} -j {CHAIN}', f'iptables -t raw -I PREROUTING -i {BRIDGE} -j {CHAIN}',
+             f'iptables -I DOCKER-USER -i {BACKEND} -j {CHAIN}',
              f'iptables -I INPUT -i {BRIDGE} -j DROP', f'iptables -I INPUT -i {BACKEND} -j DROP',
              f'ip6tables -I DOCKER-USER -i {BRIDGE} -j DROP', f'ip6tables -t raw -I PREROUTING -i {BRIDGE} -j DROP',
              f'ip6tables -I INPUT -i {BRIDGE} -j DROP', f'ip6tables -I INPUT -i {BACKEND} -j DROP'])
@@ -68,7 +75,24 @@ def test_rules_print_the_golden_list_for_the_filter_and_the_raw_table():
 
 def chain_of(lines, table):
     prefix = f'iptables -t raw -A {CHAIN} ' if table == 'raw' else f'iptables -A {CHAIN} '
-    return [line.removeprefix(prefix) for line in lines if line.startswith(prefix)]
+    return [rule for rule in (line.removeprefix(prefix) for line in lines if line.startswith(prefix)) if f'-i {BACKEND}' not in rule]
+
+
+def backend_of(lines):
+    return [line.removeprefix(f'iptables -A {CHAIN} ') for line in lines if line.startswith(f'iptables -A {CHAIN} -i {BACKEND}')]
+
+
+def backend_verdict(state, port):
+    """The backend rules in order for one packet that enters from the backend bridge: RETURN (Docker's own rules then
+    decide) or DROP. `state` is `new` for a connection being opened, `reply` for an established one."""
+    for rule in BACKEND_RULES:
+        words = rule.split()
+        if '--ctstate' in words and state not in ('reply',):
+            continue
+        if '--dport' in words and int(words[words.index('--dport') + 1]) != port:
+            continue
+        return words[words.index('-j') + 1]
+    return 'RETURN'
 
 
 def verdict(chain, destination, protocol, port):
@@ -106,6 +130,19 @@ def test_every_blocked_network_precedes_the_public_443_allow_in_both_tables_and_
         assert all(verdict(chain, *packet) == 'DROP' for packet in BLOCKED), [p for p in BLOCKED if verdict(chain, *p) != 'DROP']
         assert all(verdict(chain, *packet) == 'RETURN' for packet in OPEN)
     assert chain_of(lines, 'filter') == chain_of(lines, 'raw')
+
+
+# spec: ANYM-712
+def test_the_backend_bridge_lets_a_peer_open_a_connection_only_to_the_service_port_and_replies_pass():
+    lines = commands()
+    assert backend_of(lines) == BACKEND_RULES and f'iptables -I DOCKER-USER -i {BACKEND} -j {CHAIN}' in lines
+    # They come first in the filter chain, are not in the raw chain (no conntrack before it) and the egress rules never see them.
+    assert [line for line in lines if line.startswith(f'iptables -A {CHAIN} ')][:3] == [f'iptables -A {CHAIN} {rule}' for rule in BACKEND_RULES]
+    assert not any(BACKEND in line for line in lines if line.startswith(f'iptables -t raw -A {CHAIN} '))
+    # The gateway's request to recordings-api (new, service port) and the replies pass; the recordings container opening a
+    # connection to the gateway (13240) or to any other port of a peer is dropped, and so is a UDP flow of a peer.
+    assert backend_verdict('new', 13234) == 'RETURN' and backend_verdict('reply', 51234) == 'RETURN'
+    assert [backend_verdict('new', port) for port in (13240, 80, 443, 22, 5432, 53)] == ['DROP'] * 6
 
 
 # spec: ANYM-712
@@ -263,9 +300,14 @@ def test_the_one_generated_hook_composes_both_families_and_inference_alone_stays
     assert 'ensure iptables PREROUTING -i dk-recordings0 -j DEEDKIT-RECORDINGS || ' in body
     assert 'ensure ip6tables PREROUTING -i dk-recordings0 -j DROP || ' in body
     assert 'record true ok' in composed and 'record false "$REC_FAIL"' in composed and composed.rstrip().endswith('exit 0')
+    # The recordings half is a bounded child with its own aggregate budget, so it cannot take the inference half's share
+    # of the hook's 60 s: at most 15 s (default 12) plus the 2 s kill grace.
+    assert 'timeout -k 2 "$RBUDGET" sh "$0" recordings' in composed and 'RBUDGET=${DEEDKIT_RECORDINGS_TIMEOUT:-12}' in composed
+    assert '"$RBUDGET" -le 15' in composed and 'REC_FAIL=hook_recordings_$?' in composed
     assert 'TOTAL=60' in composed and 'LIMIT=30' in composed
     # The inference half is the base text with only the recordings additions around it.
-    stripped = composed.replace(body, '').replace('    REC_FAIL=\n    recordings_step\n', '')
+    stripped = composed.replace(body, '').replace('    recordings) recordings_step; echo "$REC_FAIL" ;;\n', '')
+    stripped = re.sub(r'    RBUDGET=.*\n.*RBUDGET=12; fi\n    REC_FAIL=.*\n', '', stripped)
     stripped = re.sub(r'    if \[ -n "\$REC_FAIL" \].*\n', '    record true ok\n', stripped)
     assert stripped == inference_only
 
@@ -362,7 +404,7 @@ def test_verify_gives_a_code_for_a_dropped_filter_block_a_kernel_mismatch_an_ipv
     host = Host(tmp_path)
     host.kernel[('ip6tables', 'raw')] = host.kernel[('ip6tables', 'raw')].replace(f'-A PREROUTING -i {BRIDGE} -j DROP\n', '')
     code, out, _ = host.run()
-    assert code == 1 and out.splitlines()[0].startswith('kernel_vs_repo ') and BRIDGE in out, out
+    assert code == 1 and out.splitlines()[0] == 'kernel_vs_repo table_differs:raw', out  # the IPv6 raw table lost its only rule
     host = Host(tmp_path)
     host.files['v6'].write_text(host.files['v6'].read_text().replace(f'-A DOCKER-USER -i {BRIDGE} -j DROP\n', ''))
     code, out, _ = host.run()
@@ -417,6 +459,30 @@ def test_the_boot_receipt_holds_the_recordings_pair_once_it_is_configured(tmp_pa
     assert done.returncode == 1 and json.loads(out.read_text())['recordings'] != 'ok'
 
 
+# spec: ANYM-712
+def test_the_receipt_passes_its_env_file_to_every_default_verifier(tmp_path, monkeypatch):
+    import importlib.util
+    module_spec = importlib.util.spec_from_file_location('firewall_persist_under_test', PERSIST)
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    candidate = tmp_path / 'candidate.env'
+    candidate.write_text(f'RECORDINGS_RESOLVER={RESOLVER}\nINFERENCE_MINI_IP={MINI}\n')
+    seen = []
+
+    def fake(command, **kwargs):
+        seen.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout='ok\n', stderr='')
+    monkeypatch.setattr(module.subprocess, 'run', fake)
+    state = tmp_path / 'raw-step.json'
+    state.write_text('{}')
+    module.receipt_cli(['--out', str(tmp_path / 'receipt.json'), '--boot-id', 'b-1', '--raw-state', str(state),
+                        '--env-file', str(candidate), '--systemctl', 'true', '--docker', 'true'])
+    verifiers = [command for command in seen if 'verify' in command]
+    assert [Path(command[1]).name for command in verifiers] == ['inference_egress_check.py', 'delivery_egress_check.py', 'recordings_egress_check.py']
+    # Every verifier reads the file the receipt was asked about, never its own default.
+    assert all(command[-2:] == ['--env-file', str(candidate)] for command in verifiers), verifiers
+
+
 def namespace_ready():
     if shutil.which('sudo') is None or shutil.which('unshare') is None or shutil.which('iptables-restore') is None:
         return False
@@ -465,36 +531,45 @@ def test_an_injected_failure_or_hang_keeps_the_previous_complete_recordings_chai
     # The second variant hangs every restore.
     marker = tmp_path / 'failed-once'
     variants = {'error_first': f'#!/bin/sh\nif [ ! -e {marker} ]; then touch {marker}; head -n 3 | {real} "$@"; exit 1; fi\nexec {real} "$@"\n',
-                'hang': '#!/bin/sh\nexec sleep 60\n'}
+                'hang': '#!/bin/sh\nexec sleep 60\n',
+                # Only the first restore (the recordings half) hangs, with the default 30 s per-command limit: the
+                # recordings budget (3 s here) ends it and the inference half still loads inside the hook's own bound.
+                'recordings_hang': f'#!/bin/sh\nif [ ! -e {marker} ]; then touch {marker}; exec sleep 60; fi\nexec {real} "$@"\n'}
     for name, body in variants.items():
         (wrappers / name).mkdir(parents=True)
         (wrappers / name / 'iptables-restore').write_text(body)
         (wrappers / name / 'iptables-restore').chmod(0o755)
     for name in variants:
         marker.unlink(missing_ok=True)
+        limits = 'DEEDKIT_RECORDINGS_TIMEOUT=3' if name == 'recordings_hang' else 'DEEDKIT_STEP_TIMEOUT=2'
         script = (f'DEEDKIT_RAW_STATE={state} sh {first}/after.init start; iptables-save -t raw > {tmp_path}/{name}.before; '
-                  f'PATH={wrappers}/{name}:$PATH DEEDKIT_STEP_TIMEOUT=2 DEEDKIT_RAW_STATE={state} sh {second}/after.init start; '
+                  f'PATH={wrappers}/{name}:$PATH {limits} DEEDKIT_RAW_STATE={state} sh {second}/after.init start; '
                   f'echo rc=$?; iptables-save -t raw > {tmp_path}/{name}.after')
+        started = time.monotonic()
         result = in_namespace(script)
+        assert time.monotonic() - started < 40, name
         assert result.returncode == 0 and 'rc=0' in result.stdout, (name, result.stderr)
         before, after = (tmp_path / f'{name}.before').read_text(), (tmp_path / f'{name}.after').read_text()
         mine = lambda text: [re.sub(r'\[\d+:\d+\]', '', line) for line in text.splitlines() if CHAIN in line]
         # The previous complete recordings chain stays, never an empty or half-written one.
         assert mine(before) == mine(after) and f'-d {RESOLVER}/32' in after and '192.0.2.54' not in after, name
         record = json.loads(state.read_text())
-        assert record['ok'] is False and record['reason'].startswith('restore'), (name, record)
+        assert record['ok'] is False, (name, record)
+        if name == 'recordings_hang':
+            assert '100.101.102.104/32' in after and record['reason'] == 'hook_recordings_124', (record, after)
+            continue
         if name == 'error_first':
             # The recordings failure did not skip the inference half: the new mini address is loaded, the reason recorded.
             assert '100.101.102.104/32' in after and record['reason'] == 'restore_recordings_v4', (record, after)
         else:
-            assert '100.101.102.104' not in after
+            assert '100.101.102.104' not in after and record['reason'].startswith('restore'), (record, after)
 
 
 # spec: ANYM-712
 def test_the_hook_runs_the_recordings_half_first_so_either_half_failing_never_skips_the_other():
     text = hook_text()
     step = text[text.index('\nstep() {\n'):]
-    assert step.index('recordings_step') < step.index('iptables-restore') < step.index('record true ok')
+    assert step.index('sh "$0" recordings') < step.index('iptables-restore') < step.index('record true ok')
     # A recordings failure is recorded after the inference half has been loaded; the inference `fail` exits only after
     # the recordings half has run.
     assert 'REC_FAIL=restore_recordings_v4' in text and 'REC_FAIL=hook_recordings_v4' in text and 'REC_FAIL=hook_recordings_v6' in text
@@ -606,6 +681,10 @@ def test_only_recordings_api_joins_the_egress_bridge_with_the_scripts_name_and_n
     assert set(networks) == {'recordings-backend', 'recordings-egress'} and 'integration' not in networks
     assert 'integration' not in document['networks'] and document['networks']['recordings-backend']['external'] is True
     # The admission is on in production and both probe lists are required (compose refuses a missing one).
+    # Docker's embedded resolver queries the explicit servers from the container's namespace, where the bridge rules apply;
+    # without `dns` it would use the host's resolvers from the host namespace, outside them (as in the delivery overlay).
+    dns = document['services']['recordings-api']['dns']
+    assert len(dns) == 1 and dns[0].startswith('${RECORDINGS_RESOLVER:?')
     environment = document['services']['recordings-api']['environment']
     assert environment['RECORDINGS_EGRESS_ADMISSION'] == 'required'
     assert environment['RECORDINGS_EGRESS_BLOCKED'].startswith('${RECORDINGS_EGRESS_BLOCKED:?')
