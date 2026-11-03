@@ -9,6 +9,8 @@ section below adds to the harness section with the same number.
 DeedKit is the product; the repo keeps its AnyMsg identities (`anymsg`, `messaging_service`,
 `ANYM-*`, package, API and database names).
 
+Installing for yourself on your own server? Read docs/personal-install.md.
+
 Harness values: ruleset `deploy/main-ruleset.json`; required checks `CI gate` and
 `checks / verify`; CI check IDs: the seven `anymsg-ci::*` checks; deploy command
 `production.py deploy` (docs/operations/production.md); security document SECURITY.md;
