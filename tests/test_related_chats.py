@@ -103,14 +103,15 @@ def test_a_body_too_long_to_compare_whole_never_matches_on_a_prefix(seeded):
 
 
 # spec: ANYM-656
-def test_case_variants_the_database_does_not_fold_are_not_a_copy_and_the_ones_it_folds_are_a_broadcast(seeded):
-    s,a,_=seeded;pair(s)
-    kelvin=TEXT.replace('Friday','Fri'+chr(0x212a)+'day')
-    chat(s,TG,'fourth');say(s,TG,'fourth','fourth-out',kelvin,2,'outgoing')
-    with s.pool.connection() as c:
-        same=c.execute("SELECT lower(%s)=lower(%s) AS x",(kelvin,TEXT)).fetchone()['x']
-    # The equality is the database's own lower(): a variant it folds to the same text is a second recipient (a
-    # broadcast, no hint); one it leaves different (ASCII-only collations) is another text, so the hint stands.
+@pytest.mark.parametrize('plain,variant',[('k',chr(0x212a)),('i',chr(0x130))])
+def test_case_variants_follow_the_databases_own_lower_not_pythons(seeded,plain,variant):
+    # KELVIN SIGN and CAPITAL I WITH DOT lowercase differently in Python and in an ASCII-only or libc database.
+    s,a,_=seeded;base='Please book the signed lease scan before Friday noon';other=base.replace(plain,variant,1)
+    assert other!=base
+    pair(s,base);chat(s,TG,'third');say(s,TG,'third','third-out',other,2,'outgoing')
+    with s.pool.connection() as c:same=c.execute('SELECT lower(%s)=lower(%s) AS x',(other,base)).fetchone()['x']
+    # The equality is the database's own lower(): a variant it folds to the same text is a second recipient (a broadcast,
+    # no hint); one it leaves different is another text, so the hint stands. Python's answer is never consulted.
     assert ('related_chats' not in rows(s,a)['new'])==same
 
 
