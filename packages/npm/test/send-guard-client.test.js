@@ -20,17 +20,21 @@ test('sendMessage forwards the guard fields unchanged and omits them when absent
   assert.deepEqual(seen[1][1],send);
 });
 
-for(const [code,status] of [['chat_changed_since_seen',409],['chat_guard_unavailable',503]])
-  // spec: ANYM-736
-  test(`the guard error ${code} keeps its code and is never retried`,async()=>{
-    let calls=0;
-    const client=new AnyMsgClient({...options,fetch:async()=>{
-      calls++;return Response.json({error:code,newer_count:2,request_id:'b'.repeat(32)},{status});
-    }});
-    await assert.rejects(client.sendMessage({...send,expected_last_message_id:'msg_synthetic'}),
-      error=>error instanceof AnyMsgError && error.code===code && error.requestId==='b'.repeat(32));
-    assert.equal(calls,1);
-  });
+async function refusedSend(code,status){
+  let calls=0;
+  const client=new AnyMsgClient({...options,fetch:async()=>{
+    calls++;return Response.json({error:code,newer_count:2,request_id:'b'.repeat(32)},{status});
+  }});
+  await assert.rejects(client.sendMessage({...send,expected_last_message_id:'msg_synthetic'}),
+    error=>error instanceof AnyMsgError && error.code===code && error.requestId==='b'.repeat(32));
+  assert.equal(calls,1);
+}
+
+// spec: ANYM-736
+test('the guard error chat_changed_since_seen keeps its code and is never retried',()=>refusedSend('chat_changed_since_seen',409));
+
+// spec: ANYM-736
+test('the guard error chat_guard_unavailable keeps its code and is never retried',()=>refusedSend('chat_guard_unavailable',503));
 
 // spec: ANYM-736
 test('the typings declare the guard fields of a chat_id send',()=>{
