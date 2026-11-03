@@ -3046,21 +3046,39 @@ def test_recordings_enrollment_and_undo_are_hand_releases_through_both_plans(tmp
 
 
 # spec: ANYM-711
-def test_enrolling_recordings_changes_the_prepared_digest_that_autodeploy_compares(tmp_path, monkeypatch):
-    # The real preparation and the real drift check; only the Docker and registry calls are the fixture's.
+def test_enrollment_and_the_fresh_sha_undo_pass_the_real_preparation_guards(tmp_path, monkeypatch):
+    # The real prepare(), receipt files and drift check; only the Docker, git and registry calls are the fixture's.
     settings, _, _ = fixture(tmp_path, monkeypatch)
-    before = p.settings_digest(settings)
-    p.prepare(settings, SHA)
+    second, third = "2" * 40, "3" * 40
+    fixture_run = p.run
+    monkeypatch.setattr(p, "run", lambda argv, **kw: next(iter(wanted)) if "FETCH_HEAD" in argv else fixture_run(argv, **kw))
+    wanted = [SHA]
+    plain_digest = p.settings_digest(settings)
     state = Path(settings["state_directory"])
-    assert p.read(state / SHA / "prepared.json")["config_digest"] == before
+    p.prepare(settings, SHA)
+    assert p.read(state / SHA / "prepared.json")["config_digest"] == plain_digest
+    (tmp_path / "recordings.json").write_text(json.dumps({"name": "deedkit-recordings", "services": {
+        "recordings-api": {"image": "old", "build": {"context": "/unused"}}}}))
     enrolled = copy.deepcopy(settings)
     enrolled["projects"][0]["files"].append(str(tmp_path / "compose.gateway-recordings.yaml"))
     enrolled["projects"].append({"name": "deedkit-recordings", "directory": str(tmp_path),
-                                 "files": [str(tmp_path / "compose.recordings.yaml")],
-                                 "services": {"recordings-api": "recordings"}})
-    assert p.settings_digest(enrolled) != before
+                                 "files": [str(tmp_path / "recordings.json")], "services": {"recordings-api": "recordings"}})
+    (tmp_path / "compose.gateway-recordings.yaml").write_text("{}")
+    assert p.settings_digest(enrolled) != plain_digest
     current = {"sha": SHA, "rollback": {"projects": []}}
     assert "production configuration changed since" in p.configuration_drift(enrolled, {}, current, {})
+    # The enrollment release prepares both projects at a SHA not prepared before.
+    wanted[:] = [second]
+    receipt = p.prepare(enrolled, second)
+    assert [item["name"] for item in receipt["projects"]] == ["synthetic", "deedkit-recordings"]
+    assert p.read(state / second / "prepared.json")["config_digest"] == p.settings_digest(enrolled)
+    # The undo cannot reuse the enrolled SHA; a newer one prepares the plain configuration again.
+    with pytest.raises(p.Refused, match="already exists"):
+        p.prepare(settings, second)
+    wanted[:] = [third]
+    undo = p.prepare(settings, third)
+    assert [item["name"] for item in undo["projects"]] == ["synthetic"]
+    assert p.read(state / third / "prepared.json")["config_digest"] == plain_digest
 
 
 # spec: ANYM-711

@@ -126,6 +126,23 @@ def test_a_refused_recordings_backend_fails_only_the_recordings_tools(tmp_path):
         assert not normal.get('isError'),normal
 
 
+# spec: ANYM-711
+def test_a_refused_recordings_connection_leaves_messaging_and_calendar_answering():
+    async def run():
+        def refuse(request):
+            raise httpx.ConnectError('connection refused',request=request)
+        ok=httpx.MockTransport(lambda r:httpx.Response(200,json={'coverage':'unknown'}))
+        deployment={'modules':['recordings','messaging','calendar'],'backends':{
+            name:{'url':'http://'+name} for name in ('recordings','messaging','calendar')}}
+        async with Clients(deployment,{'recordings':httpx.MockTransport(refuse),'messaging':ok,'calendar':ok}) as clients:
+            with pytest.raises(Denied,match='backend_unavailable'):
+                await clients.call('recordings','list_recordings','synthetic',{})
+            assert (await clients.call('messaging','search','synthetic',{}))['coverage']=='unknown'
+            assert (await clients.call('calendar','slots','synthetic',{}))['coverage']=='unknown'
+            assert all(b.pending==0 for b in clients.budgets.values())
+    asyncio.run(run())
+
+
 # spec: ANYM-648
 def test_gateway_dispatch_reaches_actual_recordings_http_routes(tmp_path):
     import sys
