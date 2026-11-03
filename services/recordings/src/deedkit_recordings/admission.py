@@ -20,6 +20,10 @@ import socket
 import sys
 
 REQUIRED = 'required'
+# The canary of scripts/recordings_egress_check.py (TEST-NET-1, never routable): the host's raw chain drops it, its filter chain
+# refuses it. It must be among the blocked targets: a timeout proves the raw layer is loaded, a refusal means only the filter
+# layer answered, and the start is refused.
+CANARY = '192.0.2.254:9'
 EXIT_CODE = 78
 TIMEOUT = 3.0
 _QUERY = bytes.fromhex('d53401000001000000000000076578616d706c6503636f6d0000010001')
@@ -97,6 +101,8 @@ def failures(environ=None, timeout=TIMEOUT):
         reasons.append('RECORDINGS_EGRESS_BLOCKED is missing')
     if not opened:
         reasons.append('RECORDINGS_EGRESS_OPEN is missing')
+    if blocked and CANARY not in blocked:
+        reasons.append(f'RECORDINGS_EGRESS_BLOCKED must name the canary {CANARY}')
     if reasons:
         return reasons
     for expect, items in (('blocked', blocked), ('open', opened)):

@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT / 'services/recordings/src'))
 
 from deedkit_recordings import admission, cli  # noqa: E402
 
-SILENT = '192.0.2.1:9'  # TEST-NET-1: no host answers, as for a dropped target
+SILENT = admission.CANARY  # 192.0.2.254:9, TEST-NET-1: never routable, no host answers, as for a dropped target
 REQUIRED = 'required'
 
 
@@ -86,12 +86,12 @@ def test_admission_fails_when_a_blocked_target_answers_or_refuses_or_an_open_tar
     with socket.socket() as closed:
         closed.bind(('127.0.0.1', 0))
         refused = f'127.0.0.1:{closed.getsockname()[1]}'
-    assert admission.failures(environ(refused, f'{listener},{resolver}'), timeout=0.5) == [f'blocked target {refused}: refused']
-    assert admission.failures(environ(f'dns:{resolver.removeprefix("dns:")}', f'{listener},{resolver}'), timeout=0.5) == [
+    assert admission.failures(environ(f'{SILENT},{refused}', f'{listener},{resolver}'), timeout=0.5) == [f'blocked target {refused}: refused']
+    assert admission.failures(environ(f'{SILENT},dns:{resolver.removeprefix("dns:")}', f'{listener},{resolver}'), timeout=0.5) == [
         f'blocked target dns:{resolver.removeprefix("dns:")}: answered']
     # An open target that gets no answer or a malformed target fails too.
     assert admission.failures(environ(SILENT, f'{listener},{SILENT}'), timeout=0.5) == [f'open target {SILENT}: timeout']
-    assert admission.failures(environ('not-an-address:443', listener), timeout=0.5) == ['blocked target not-an-address:443: malformed']
+    assert admission.failures(environ(f'{SILENT},not-an-address:443', listener), timeout=0.5) == ['blocked target not-an-address:443: malformed']
     with pytest.raises(SystemExit) as stop:
         admission.require(environ(listener, listener), timeout=0.5)
     assert stop.value.code == admission.EXIT_CODE == 78
@@ -106,6 +106,28 @@ def test_admission_fails_closed_when_a_variable_is_missing_or_empty(blocked, ope
     with pytest.raises(SystemExit) as stop:
         admission.require(environ(blocked, opened), timeout=0.2)
     assert stop.value.code == 78 and 'is missing' in capsys.readouterr().err
+
+
+# spec: ANYM-712
+def test_admission_refuses_to_start_without_the_raw_layer_when_the_filter_layer_alone_answers(listener, monkeypatch):
+    """A boot where inference failed: ufw loaded the filter rules, the raw rules were skipped. The canary then gets a
+    refusal (the filter chain REJECTs it) instead of the timeout the raw chain's DROP gives, and the start is refused."""
+    def host(canary_outcome):
+        def tcp(target, timeout, literal):
+            return canary_outcome if target == admission.CANARY else ('timeout' if literal else 'connected')
+        return tcp
+    other_blocked = '172.18.0.1:8080'
+    values = environ(f'{other_blocked},{admission.CANARY}', listener)
+    monkeypatch.setattr(admission, '_tcp', host('refused'))  # raw missing, filter refusing
+    assert admission.failures(values, timeout=0.5) == [f'blocked target {admission.CANARY}: refused']
+    with pytest.raises(SystemExit) as stop:
+        admission.require(values, timeout=0.5)
+    assert stop.value.code == 78
+    monkeypatch.setattr(admission, '_tcp', host('timeout'))  # raw present: the DROP gives a timeout
+    assert admission.failures(values, timeout=0.5) == []
+    # The canary cannot be left out of the list: fail closed.
+    assert admission.failures(environ(other_blocked, listener), timeout=0.5) == [
+        f'RECORDINGS_EGRESS_BLOCKED must name the canary {admission.CANARY}']
 
 
 # spec: ANYM-712

@@ -25,6 +25,7 @@ MINI = '100.101.102.103'
 CHAIN = 'DEEDKIT-RECORDINGS'
 BRIDGE = 'dk-recordings0'
 BACKEND = 'dk-recbackend0'
+CANARY_IP = '192.0.2.254'
 DROPPED = ('0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12',
            '192.0.0.0/24', '192.168.0.0/16', '198.18.0.0/15', '224.0.0.0/4', '240.0.0.0/4')
 
@@ -53,8 +54,10 @@ def golden():
               [f'iptables -A {CHAIN} -d {network} -j DROP' for network in DROPPED] +
               [f'iptables -A {CHAIN} -p tcp --dport 443 -j RETURN', f'iptables -A {CHAIN} -j DROP'])
     backend = [f'iptables -A {CHAIN} {rule}' for rule in BACKEND_RULES]
-    filter_chain = [f'iptables -N {CHAIN}', f'iptables -F {CHAIN}', *backend, *egress]
-    raw_chain = [line.replace('iptables ', 'iptables -t raw ', 1) for line in [f'iptables -N {CHAIN}', f'iptables -F {CHAIN}', *egress]]
+    reject = f'iptables -A {CHAIN} -d {CANARY_IP} -p tcp --dport 9 -j REJECT --reject-with tcp-reset'
+    drop = f'iptables -A {CHAIN} -d {CANARY_IP} -p tcp --dport 9 -j DROP'
+    filter_chain = [f'iptables -N {CHAIN}', f'iptables -F {CHAIN}', *backend, reject, *egress]
+    raw_chain = [line.replace('iptables ', 'iptables -t raw ', 1) for line in [f'iptables -N {CHAIN}', f'iptables -F {CHAIN}', drop, *egress]]
     return (filter_chain + raw_chain +
             [f'iptables -I DOCKER-USER -i {BRIDGE} -j {CHAIN}', f'iptables -t raw -I PREROUTING -i {BRIDGE} -j {CHAIN}',
              f'iptables -I DOCKER-USER -i {BACKEND} -j {CHAIN}',
@@ -129,7 +132,21 @@ def test_every_blocked_network_precedes_the_public_443_allow_in_both_tables_and_
         assert chain.index(f'-d {RESOLVER} -p udp --dport 53 -j RETURN') < chain.index('-d 0.0.0.0/8 -j DROP')
         assert all(verdict(chain, *packet) == 'DROP' for packet in BLOCKED), [p for p in BLOCKED if verdict(chain, *p) != 'DROP']
         assert all(verdict(chain, *packet) == 'RETURN' for packet in OPEN)
-    assert chain_of(lines, 'filter') == chain_of(lines, 'raw')
+    assert chain_of(lines, 'filter')[1:] == chain_of(lines, 'raw')[1:]  # the first rule of each is the canary
+
+
+# spec: ANYM-712
+def test_the_canary_is_dropped_by_the_raw_chain_and_refused_by_the_filter_chain():
+    lines = commands()
+    raw, filtered = chain_of(lines, 'raw'), chain_of(lines, 'filter')
+    assert raw[0] == f'-d {CANARY_IP} -p tcp --dport 9 -j DROP'
+    assert filtered[0] == f'-d {CANARY_IP} -p tcp --dport 9 -j REJECT --reject-with tcp-reset'
+    # TEST-NET-1 (RFC 5737) is not a routable address and is in none of the dropped networks, so only these two rules decide.
+    assert ipaddress.ip_address(CANARY_IP) in ipaddress.ip_network('192.0.2.0/24') and ipaddress.ip_address(CANARY_IP).is_private
+    assert not any(ipaddress.ip_address(CANARY_IP) in ipaddress.ip_network(network) for network in DROPPED)
+    assert verdict(raw, CANARY_IP, 'tcp', 9) == 'DROP' and verdict(filtered, CANARY_IP, 'tcp', 9) == 'REJECT'
+    assert 'CANARY = \'192.0.2.254:9\'' in (ROOT / 'services/recordings/src/deedkit_recordings/admission.py').read_text()
+    assert not any(CANARY_IP in line for line in lines if 'INPUT' in line or 'ip6tables' in line)
 
 
 # spec: ANYM-712

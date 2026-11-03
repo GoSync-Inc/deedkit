@@ -34,6 +34,12 @@ BRIDGE = 'dk-recordings0'
 # The internal backend bridge holds no host address (gateway mode `isolated`); its INPUT drop is the second layer.
 BACKEND_BRIDGE = 'dk-recbackend0'
 CHAIN = 'DEEDKIT-RECORDINGS'
+# The canary (TEST-NET-1, RFC 5737: never routable, no listener anywhere). The raw chain DROPs it first; the filter chain
+# REJECTs it with a reset. From inside the container a timeout therefore proves the raw layer is loaded, and a refusal proves
+# the filter layer answered without it: admission treats a refusal as a failure, so the service cannot start without the raw
+# rules (the raw half is skipped in a boot where inference failed or was slow).
+CANARY = '192.0.2.254'
+CANARY_PORT = 9
 # The port recordings-api listens on: the one thing a peer on the backend bridge may open a connection to.
 SERVICE_PORT = 13234
 # Host-local, private, tailnet (CGNAT), link-local (with metadata 169.254.169.254), multicast and reserved.
@@ -52,7 +58,9 @@ def chain_rules(resolver, table):
         f'iptables -A {CHAIN} -i {BACKEND_BRIDGE} -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN',
         f'iptables -A {CHAIN} -i {BACKEND_BRIDGE} -p tcp --dport {SERVICE_PORT} -j RETURN',
         f'iptables -A {CHAIN} -i {BACKEND_BRIDGE} -j DROP']
-    return ([f'iptables {t}-N {CHAIN}', f'iptables {t}-F {CHAIN}'] + backend +
+    canary = (f'iptables {t}-A {CHAIN} -d {CANARY} -p tcp --dport {CANARY_PORT} -j DROP' if table else
+              f'iptables {t}-A {CHAIN} -d {CANARY} -p tcp --dport {CANARY_PORT} -j REJECT --reject-with tcp-reset')
+    return ([f'iptables {t}-N {CHAIN}', f'iptables {t}-F {CHAIN}'] + backend + [canary] +
             [f'iptables {t}-A {CHAIN} -d {resolver} -p {proto} --dport 53 -j RETURN' for proto in ('udp', 'tcp')] +
             [f'iptables {t}-A {CHAIN} -d {network} -j DROP' for network in DROPPED] +
             [f'iptables {t}-A {CHAIN} -p tcp --dport 443 -j RETURN', f'iptables {t}-A {CHAIN} -j DROP'])

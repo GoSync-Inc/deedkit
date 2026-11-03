@@ -1796,6 +1796,14 @@ DROP never sends one), every open target (`api.omi.me:443`, `dns:<RESOLVER_IP>`)
 it. This covers boot, promotion and any restart. Source runs and tests leave the variable unset and skip it. The probes send
 a TCP handshake and one DNS query, never a token.
 
+**The canary proves the raw layer.** `RECORDINGS_EGRESS_BLOCKED` must name `192.0.2.254:9` (TEST-NET-1, RFC 5737: never
+routable, no listener anywhere); admission refuses to start without it. The raw chain drops that destination first (the probe
+times out), the filter chain REJECTs it with a reset. In a boot where inference failed or was slow, ufw has loaded the filter
+rules but the recordings raw rules were skipped: the canary then gets a refusal instead of a timeout and the start is refused,
+so `recordings-api` cannot serve without the raw layer (the one that survives a tailscaled `ts-forward` reorder) in that boot.
+Example: `RECORDINGS_EGRESS_BLOCKED=192.0.2.254:9,<host listener>,<tailnet listener>,<gateway listener>` and
+`RECORDINGS_EGRESS_OPEN=api.omi.me:443,dns:<resolver>`.
+
 The production read-back runs `check` from the real two-network container (`docker compose $F exec -T recordings-api python -I -
 check --open api.omi.me:443 --open-dns RESOLVER --blocked HOST_BRIDGE_IP:PORT --blocked TAILNET_IP:PORT --blocked
 GATEWAY_IP:PORT < scripts/recordings_egress_check.py`; every blocked target needs a known listener, or "blocked" could mean
