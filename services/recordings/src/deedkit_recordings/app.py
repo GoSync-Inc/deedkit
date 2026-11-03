@@ -14,7 +14,9 @@ from pydantic import Field, ValidationError
 
 from .omi import Provider, metadata, pagination, content
 from . import plaud
-from .security import Strict, Failure, RateLimited, configuration, provider_token, cursor, continuation, canonical, loads
+from .security import (Strict, Failure, RateLimited, configuration, provider_token, cursor, continuation, canonical, loads,
+                       read_document, router_authorized)
+from . import archive_feed
 
 READ, CONTENT, AUDIO = 'recordings:read', 'recordings:content', 'recordings:audio'
 
@@ -229,6 +231,33 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
                 'source_digest': digest, 'complete': end == len(text),
                 'next_cursor': continuation(binding, end, secret, digest) if end < len(text) else None}
 
+    async def feed_route(request, head):
+        # ANYM-726. Without `event_router` configuration these routes do not exist; with it, only the router token opens
+        # them (an agent key is `unauthorized`, and the router token opens no other route).
+        doc, _ = read_document(path)
+        if doc.event_router is None:
+            raise Failure('not_found_or_forbidden', 404)
+        authorization = request.headers.get('authorization', '')
+        if (not authorization.startswith('Bearer ') or not 1 <= len(authorization[7:]) <= 512
+                or not router_authorized(doc, authorization[7:])):
+            raise Failure('unauthorized', 401)
+        query = request.query_params
+        after, limit = query.get('after', '0'), query.get('limit', '100')
+        if head:
+            if query:
+                raise Failure('invalid_parameters', 422)
+        elif (set(query) - {'after', 'limit'} or any(len(query.getlist(key)) > 1 for key in query)
+              or not (after.isascii() and after.isdigit() and limit.isascii() and limit.isdigit()) or len(after) > 16 or len(limit) > 6
+              or int(after) > archive_feed.MAX_SEQ or not 1 <= int(limit) <= archive_feed.MAX_LIMIT):
+            raise Failure('invalid_parameters', 422)
+        return JSONResponse(await local.feed(doc, head, int(after), int(limit)))
+
+    async def events_page(request):
+        return await feed_route(request, False)
+
+    async def events_head(request):
+        return await feed_route(request, True)
+
     async def endpoint(request):
         try:
             return JSONResponse(await invoke(request))
@@ -237,5 +266,7 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
             # Never expose their values through an unhandled exception or server traceback.
             raise Failure('invalid_provider_response') from None
 
+    app.router.routes.append(Route('/v1/events', events_page, methods=['GET']))
+    app.router.routes.append(Route('/v1/events/head', events_head, methods=['GET']))
     app.router.routes.append(Route('/v1/{operation}', endpoint, methods=['POST']))
     return app

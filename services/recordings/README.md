@@ -428,6 +428,52 @@ and the index error code, if any. Older packages refuse schema 4 (`archive_schem
 disabling archive collection and keeping the state files. The online backup and the backup tooling accept schemas 1–4
 (ANYM-714 accepts 1–5).
 
+### Event feed for the module event router (ANYM-726)
+
+With an `event_router` object in the configuration (`key_sha256`: one or two SHA-256 digests, so a rotation can overlap;
+`expires_at`; example in `deploy/recordings-archive.example.json`, digest `1111...`, which no token matches), the backend serves
+`GET /v1/events?after=<seq>&limit=<1-200>` and `GET /v1/events/head` in the producer contract of SUBSCRIPTIONS.md "Module events".
+Without that object both routes answer 404 and nothing reads the feed (ships dark). The router token must differ from every
+principal key (the configuration is refused otherwise), has its own expiry, is checked on every call and opens no other route;
+an agent key on these routes is `unauthorized` (401). An older package refuses a configuration that has `event_router`
+(unknown field): remove the object before a package rollback.
+
+- Identity. `seq` = `incarnation` x 10^9 + the offset inside the incarnation's epoch; `id` = `recordings:<seq>`. The incarnation
+  is a time epoch (minutes since 2026-01-01 UTC), `meta.incarnation`; the epochs are `meta.feed_epochs`
+  (`[[first local sequence, incarnation], ...]`, a key/value row: the schema stays 4). A marker file `journal.marker` in the archive
+  directory (outside the SQLite file) holds `{incarnation, high_water}`. It is written and fsynced when the feed is served or
+  maintained (before a page covering those rows leaves the process), never inside the transaction that stores recorded text, so a
+  marker failure makes the feed unavailable (`archive_unavailable`) and can never stop text from being archived. At the first use,
+  and whenever the marker is missing or unreadable, its high-water is above the database's, its incarnation differs from the
+  database's, or an epoch reaches its capacity (below 10^9 offsets, and never past seq 2^53-1), a new epoch starts with incarnation
+  `max(database, marker, last epoch, clock minutes) + 1`, before the next journal row is written (an existing backlog is split
+  into capped epochs). The feed answers `feed_not_ready` (503) until the wall clock has reached the new incarnation's minute (so
+  up to a minute after a start or bump, and until the clock catches up after a clock regression): two restores inside one clock
+  minute can therefore never publish the same incarnation twice. Events keep the identity they were first served with. A restored
+  older database or a marker that does not match the database can therefore never reuse or skip an identity, and a page serves only
+  rows the fsynced marker already covers. Every marker-driven bump on a journal that already has epochs (a lost or damaged marker, a marker older than or ahead of the
+  database: a new volume, a restore, a crash between a bump and its marker) leaves the clock as the only watermark, because two
+  restores of one snapshot with the clock behind pick the same next incarnation; that bump therefore also gives the journal a new
+  `journal_id`: the router reports a source reset and waits for its operator (`set-module-cursor`) instead of reading a possibly
+  reused id as new. Ordinary growth, cap bumps and the first use keep the `journal_id`. A crash between a journal commit and the marker fsync is indistinguishable from a restore and rotates it too: one router operator step, rare, and the safe side. The feed refuses to serve with `sequence_space_exhausted` when no incarnation with
+  room is left (about 2043).
+- Events (references only, at most 1 KiB, no title, text, label, provider ID, token or URL): `recording.text.archived`
+  (`subject` and `data.recording_ref` the opaque ref, `data.account_ref`, `data.revision`; `urgency` `batch`) once per accepted
+  usable text revision, and `recording.access.changed` (`data`: `account_ref`, `principal_ref`, `reason`
+  `permission_removed|account_removed|namespace_replaced`; `urgency` `now`; `subject` the account). `scope_ref` is
+  `recordings:<account id>.<first 16 hex of the account's namespace>`: replacing an account's identity changes the scope.
+  `account_ref` and `principal_ref` are the configured identifiers exactly when they are valid references
+  (`[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`), otherwise `h-` plus the first 24 hex characters of the identifier's SHA-256; that is the
+  encoding every consumer (link creation and lookup, ANYM-653) must use for the same identifier.
+  Text events of an account that is gone or whose namespace was replaced are not served; access-change events are, with the OLD scope.
+- Access changes are detected when the configuration is re-read (each collector pass and each feed request) against the
+  entitlements stored in `meta.access_view`, and written to the same journal (`ref` = `access|reason|principal|account`, `revision` 0).
+  Key expiry and key replacement emit nothing. The detection window is the collector interval or the router's poll, whichever
+  comes first; revoke the link in messaging first (ANYM-653).
+- Isolation. Reads use the four-slot admission and the 2-second SQL deadline (`archive_busy`, `archive_unavailable`); the feed
+  makes no provider, model or network call. While the feed is enabled a failed marker write rolls back that one observation (the
+  marker must never be behind the journal); with no `event_router` the marker is never touched.
+
 Local operations admit at most four simultaneous requests per process, returning
 `archive_busy` instead of building an unbounded queue. SQLite keeps its 100 ms
 busy wait and 2-second SQL progress deadline in worker threads. A busy/corrupt
