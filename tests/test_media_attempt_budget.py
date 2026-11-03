@@ -150,7 +150,7 @@ def gateway(s):
             with s.pool.connection() as c:
                 c.execute(sql.SQL('SET LOCAL ROLE {}').format(sql.Identifier(role)))
                 yield c
-    restricted=copy(s);restricted.pool=RestrictedPool()
+    restricted=copy(s);restricted.pool=RestrictedPool();restricted.role=role
     with s.pool.connection() as c:c.execute(ddl)
     try:yield restricted
     finally:
@@ -218,6 +218,51 @@ def test_wake_function_touches_only_a_queued_job_with_an_open_request_that_is_no
 
 
 # spec: ANYM-699
+def test_restore_without_acls_does_not_leave_wake_media_job_open_to_public(archive):
+    _,s,_,_=archive
+    wake="'public.wake_media_job(text)'::regprocedure"
+    role='media_ungranted_'+uuid4().hex
+    with s.pool.connection() as c:
+        c.execute(f'GRANT EXECUTE ON FUNCTION public.wake_media_job(text) TO PUBLIC')  # what a restore does
+        assert c.execute(f"SELECT has_function_privilege('public',{wake},'EXECUTE') AS open").fetchone()['open'] is True
+    s.migrate();s.migrate()
+    try:
+        with s.pool.connection() as c:
+            assert c.execute(f"SELECT has_function_privilege('public',{wake},'EXECUTE') AS open").fetchone()['open'] is False
+            c.execute(sql.SQL('CREATE ROLE {}').format(sql.Identifier(role)))
+        with gateway(s) as restricted:
+            with restricted.pool.connection() as c:
+                assert c.execute(f"SELECT has_function_privilege({wake},'EXECUTE') AS ok").fetchone()['ok'] is True
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            with s.pool.connection() as c:
+                c.execute(sql.SQL('SET LOCAL ROLE {}').format(sql.Identifier(role)))
+                c.execute("SELECT public.wake_media_job('none')")
+    finally:
+        with s.pool.connection() as c:
+            c.execute(sql.SQL('DROP ROLE IF EXISTS {}').format(sql.Identifier(role)))
+
+
+# spec: ANYM-699
+@pytest.mark.parametrize('case',['function_missing','grant_missing'])
+def test_request_is_recorded_and_the_job_keeps_waiting_when_the_wake_is_not_available(archive,case):
+    ar,s,key,_=archive; fid=pending(ar,s)
+    with s.pool.connection() as c:
+        c.execute("UPDATE media_jobs SET next_due=now()+interval '12 hours',error_code='network_error',attempts=4 WHERE id=%s",(fid,))
+    text=(SOURCES/'migrations/066_media_attempt_budget.sql').read_text()
+    try:
+        with gateway(s) as restricted:
+            with s.pool.connection() as c:
+                if case=='function_missing':c.execute('DROP FUNCTION public.wake_media_job(text)')
+                else:c.execute(sql.SQL('REVOKE EXECUTE ON FUNCTION public.wake_media_job(text) FROM {}').format(sql.Identifier(restricted.role)))
+            result=restricted.request_file_download(key,fid)
+    finally:
+        with s.pool.connection() as c:c.execute(text)
+    assert result['request_status']=='queued' and result['requested_until']
+    row=job_row(s,fid)
+    assert row['attempts']==4 and row['wait']>11*3600
+
+
+# spec: ANYM-699
 @pytest.mark.parametrize('attempts',[5,7])
 def test_evicted_original_that_succeeded_late_can_still_be_requested_again(archive,attempts):
     from test_file_lifecycle import lifecycle,processed
@@ -245,7 +290,7 @@ def test_migration_066_pins_the_cap_is_repeatable_and_keeps_the_acl(archive):
         c.execute(text);c.execute(text)
         assert c.execute(f'SELECT proacl::text AS acl,proowner::regrole::text AS owner FROM pg_proc WHERE oid={queue}').fetchone()==before
         assert c.execute(f'SELECT prosecdef FROM pg_proc WHERE oid={wake}').fetchone()['prosecdef'] is True
-        assert 'PUBLIC' not in (c.execute(f'SELECT coalesce(proacl::text,\'\') AS acl FROM pg_proc WHERE oid={wake}').fetchone()['acl'])
+        assert c.execute(f"SELECT has_function_privilege('public',{wake},'EXECUTE') AS open").fetchone()['open'] is False
     assert 'GRANT EXECUTE ON FUNCTION public.wake_media_job(text) TO messaging_gateway' in (SOURCES/'gateway_role.sql').read_text()
 
 

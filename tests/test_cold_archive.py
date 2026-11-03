@@ -14,6 +14,7 @@ import sys
 
 import pytest
 
+from messaging_service.media_retry import MEDIA_MAX_ATTEMPTS
 from test_archive import archive as archive  # noqa: F401  (fixture)
 from test_file_lifecycle import processed, stored
 
@@ -21,7 +22,6 @@ STUB=r'''
 import hashlib,io,json,sys
 from pathlib import Path
 from messaging_service import backup_r2_receiver as r2
-from messaging_service.media_retry import MEDIA_MAX_ATTEMPTS
 class Code(Exception):
     def __init__(self,code):self.response={'Error':{'Code':code},'ResponseMetadata':{'HTTPStatusCode':int(code) if code.isdigit() else 404}}
 class FileCloud:

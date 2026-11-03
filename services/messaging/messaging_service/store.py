@@ -1393,6 +1393,11 @@ class Store:
                   public.module_event_valid(text,text,text,text,text,jsonb,text,text),
                   public.module_hints_ready(),public.subscription_module_fence() FROM PUBLIC;
                 END IF;
+                -- ANYM-699: only the gateway role (gateway_role.sql) wakes a media job; a restore must not open it.
+                IF pg_has_role((SELECT proowner FROM pg_proc WHERE oid=to_regprocedure(
+                    'public.wake_media_job(text)')),'USAGE') THEN
+                 REVOKE ALL ON FUNCTION public.wake_media_job(text) FROM PUBLIC;
+                END IF;
             END $$''')
 
     def expand_status(self):
