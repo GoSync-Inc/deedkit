@@ -547,6 +547,70 @@ glance" (the receiver has no `jq`).
 Undo: `systemctl disable --now deedkit-calendar-backup-r2-verifier.timer`. Its
 evidence, the protected calendar point and the messaging instance stay as they are.
 
+## Recordings verifier instance
+
+The recordings archive's encrypted bundle (ANYM-714, ANYM-727) goes through the same verifier code as an instance
+with `profile: recordings` (ANYM-728), with its own upload user, receiver config, state directory, recovery key, R2
+prefix and protected marker, exactly as the calendar's (above). Add `"profile": "recordings"` to its receiver config
+and copy [the recordings verifier configuration](deploy/recordings-backup-r2-verifier.example.json) to
+`/etc/deedkit-recordings-backup-r2/verifier.json` (root-owned `0600`). The profile comes only from these root
+configs; a mismatch anywhere fails `verifier_profile_mismatch` and protects nothing. A recordings failure never
+fails or rotates the messaging or calendar instances, and the reverse.
+
+The isolated helper reads the archive in place (no database is restored) and passes a bundle only when all six
+checks hold; each failure has its own code in `status.json`:
+
+| Check | Fails with |
+|---|---|
+| `decryption`: authenticated age EOF | `restore_decryption_failed` |
+| `bundle_integrity`: exactly `manifest.json` and `state/archive.sqlite`, manifest fields, size and SHA-256 | `restore_bundle_failed` |
+| `archive_integrity`: SQLite `integrity_check`, application ID, identity equals the manifest's | `restore_archive_failed` |
+| `schema_version`: `user_version` 1-5 (a newer archive than the helper is refused) | `restore_schema_failed` |
+| `identity`: one `archive_id` and one `incarnation` in `meta` | `restore_archive_failed` |
+| `search_readback`: the full-text index answers a synthetic query and the newest records' parts read back | `restore_readback_failed` |
+
+The proof names `profile: recordings` and the archive's identity (`archive_id`, `incarnation`, `sequence`,
+`records`); `protect` and `rotate` accept on a recordings receiver only that proof with exactly these checks.
+
+Continuity (zero tolerance, no percentage). A healthy SQLite file can still be an emptied or re-created archive, so
+the helper also writes `continuity.json` into the verifier's scratch: hashes only, namely `(ref, part, revision,
+SHA-256 of the part text)` for every non-empty transcript and summary, `(ref, provider-ID hash)`, the tombstone
+hashes and the identity. The verifier compares it with the baseline it keeps beside its proofs
+(`<verifier directory>/continuity.json`, root `0600`, hashes only, replaced only after the protected point moved):
+
+| Refusal (status code) | When |
+|---|---|
+| `archive_identity_changed` | another `archive_id` (a fresh or re-initialized archive) |
+| `archive_incarnation_lower`, `archive_sequence_lower` | a lower incarnation, or a lower highest journal sequence in the same one (a restore onto a volume has a higher incarnation) |
+| `archive_content_lost` | a baseline `(ref, part)` is missing or empty, has a lower revision, or the same revision with other text |
+| `archive_tombstone_dropped` | a baseline tombstone is missing (tombstones are append-only) |
+| `archive_baseline_missing` | a protected point exists but its baseline file does not |
+
+The only permitted loss is a baseline record whose provider-ID hash is a tombstone in the candidate that the
+baseline did not have (ANYM-730 writes tombstones before it deletes; `tombstones(provider_hash)` with the
+SHA-256 of `namespace NUL provider_id`). A refused candidate never replaces the protected point, and the baseline
+stays. To accept a new or deliberately restored archive, the operator re-baselines with a reason, then the next
+verification takes its candidate as the baseline and records the reason in `last-success.json`:
+
+```sh
+python -m messaging_service.backup_r2_verifier --rebaseline --config /etc/deedkit-recordings-backup-r2/verifier.json \
+  --reason "owner re-initialized the archive on 2026-11-10"
+```
+
+Scratch. The verifier decrypts into `payload-<run>` (0700, root) in its directory; for this profile it holds the
+archive's plaintext, including other people's speech, for the verification only. It is removed after success,
+after a failure, and at the start of any retry or restart (`status.json` says `cleanup_complete`). Nothing else
+holds the plaintext (docs/DATA-POLICY.md).
+
+Helper updates. The follow and the pin step self-test the recordings profile on a synthetic archive of the image
+under test, together with the other profiles; a helper that cannot read the recordings bundle holds the shared pin
+move with the fixed code `recordings_helper_failed` and nothing else changes. List the recordings config in the
+instances file ([Two verifiers on one receiver](#two-verifiers-on-one-receiver)) before its timer runs.
+
+Units: [service](deploy/deedkit-recordings-backup-r2-verifier.service) and
+[timer](deploy/deedkit-recordings-backup-r2-verifier.timer). Installing them, the first protected point and the
+restore drill are ANYM-731. Undo: `systemctl disable --now deedkit-recordings-backup-r2-verifier.timer`.
+
 ## Two verifiers on one receiver
 
 Both instances (ANYM-609) run on one host. Each restore can start a 1 GiB

@@ -603,3 +603,20 @@ the processes in the container whose arguments carry this job's snapshot path (`
 none is left (`recordings_exec_unverified` otherwise; staging is then not emptied under a live writer, and the recovery
 looks again). A cleanup that fails is an error (`staging_cleanup_failed`, exit 1), also after a skip. A skipped job
 leaves the freshness clock alone, so the catch-up timer decides.
+
+### Recordings archive: freshness and size (ANYM-728)
+
+`deploy/recordings-backup-freshness.py --verifier-directory /var/lib/deedkit-recordings-backup-r2/verification
+--max-age-hours 30 --state /var/lib/deedkit-recordings-backup-r2/freshness-state.json` is read-only on the verifier
+directory and prints one JSON line: `status` (`fresh`, `stale`, `unknown`), the last verified success and its age
+(the snapshot age; the daily run is verified within hours), `last_error` (the verifier's last failure code, for example
+`archive_content_lost`), `bytes` of the protected point, the archive identity (`archive_id`, `incarnation`,
+`sequence`, `records`; no title, no text) and `unchanged_days` with the hint `unchanged_for_7_days` when the counters
+have not moved for a week, which means a healthy archive that stopped collecting. Exit 0 fresh, 4 stale, 5 unknown.
+The collector's own last success and error are the recordings service's `POST /v1/archive_status` (read scope); the
+script never calls it.
+
+Expected size and retention: the backup server and the R2 prefix hold one protected point and room for one
+candidate, no older history; with `expected_archive_bytes` of 1 GiB that is about 2 GiB of ciphertext plus the
+verifier's scratch for one plaintext copy during each verification. A deleted record leaves the backup at the next
+verified replacement of the protected point (ANYM-730).

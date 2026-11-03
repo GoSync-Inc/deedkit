@@ -24,6 +24,8 @@ import traceback
 
 from . import backup_r2_receiver as r2
 from . import backup_receiver as local
+from . import backup_recordings_continuity as continuity
+from .backup_recordings import SUPPORTED_USER_VERSIONS
 
 GIB = 1024**3
 POSTGRES_IMAGE = 'postgres:18-bookworm@sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c'
@@ -55,6 +57,12 @@ BUSY_WAIT_MAX = 900
 BUSY_POLL_SECONDS = 15
 # Every verifier config on this receiver, for the pin step: {"v": 1, "verifier_configs": [paths]}.
 INSTANCES_FILE = Path('/etc/deedkit-backup-r2/instances.json')
+# The recordings instance's continuity files (ANYM-728), all root-private in the verifier directory: the baseline of
+# the protected point (hashes only), a candidate's facts until its promotion, and the operator's re-baseline request.
+CONTINUITY = 'continuity.json'
+REBASELINE = 'rebaseline.json'
+CONTINUITY_LIMIT = 256 * 1024 ** 2
+REASON = re.compile(r'[ -~]{8,200}')
 
 
 def now():return datetime.now(timezone.utc).isoformat()
@@ -652,6 +660,11 @@ CALENDAR_FAILURES={'restore_bundle_failed','restore_schema_failed','restore_inve
                    'restore_vault_decrypt_failed','verifier_profile_mismatch'}
 
 
+# The recordings helper's own stages (ANYM-728) and the continuity refusals; the shared ones are above.
+RECORDINGS_FAILURES={'restore_archive_failed','restore_readback_failed','invalid_continuity','invalid_rebaseline',
+                     'rebaseline_recordings_only','continuity_too_large',*continuity.REFUSALS}
+
+
 class HelperFailure(RuntimeError):
     def __init__(self,code,detail=None):super().__init__(code);self.detail=detail
 
@@ -662,7 +675,7 @@ def helper_failure(payload):
     try:
         fact=r2.unique_json(private_file(payload/'failure.json',4096))
         safe={'restore_decryption_failed','restore_database_failed','restore_snapshot_failed','restore_quarantine_failed',
-              *CALENDAR_FAILURES}
+              *CALENDAR_FAILURES,*RECORDINGS_FAILURES}
         if (isinstance(fact,dict) and set(fact)=={'v','status','error'} and
                 type(fact['v']) is int and fact['v']==1 and fact['status']=='failed' and type(fact['error']) is str and fact['error'] in safe):failure=fact['error']
     except (OSError,ValueError):pass
@@ -735,16 +748,20 @@ def make_proof(receipt,facts,run,profile='messaging'):
     keys,checks,schemas={'v','status','schema_version','manifest_sha256','checks'},r2.CHECKS,SCHEMAS
     # The calendar schema is fcs.migrations' version, which the helper binds to the manifest; no messaging range.
     if profile=='calendar':keys,checks,schemas=keys|{'profile','vault_warnings'},r2.CALENDAR_CHECKS,range(1,100001)
+    # The recordings schema is the archive's user_version; the identity facts are the bundle manifest's.
+    elif profile=='recordings':keys,checks,schemas=keys|{'profile','archive'},r2.RECORDINGS_CHECKS,SUPPORTED_USER_VERSIONS
     if (not isinstance(facts,dict) or set(facts)!=keys or
             type(facts['v']) is not int or facts['v']!=1 or facts['status']!='verified' or
             type(facts['schema_version']) is not int or facts['schema_version'] not in schemas or
             facts['manifest_sha256']!=receipt['wire']['snapshot_sha256'] or not isinstance(facts['checks'],dict) or
             set(facts['checks'])!=checks or any(v is not True for v in facts['checks'].values()) or
-            (profile=='calendar' and not r2.valid_warnings(facts['vault_warnings']))):
+            (profile=='calendar' and not r2.valid_warnings(facts['vault_warnings'])) or
+            (profile=='recordings' and not r2.valid_archive(facts['archive']))):
         raise ValueError('invalid_helper_result')
     verification={'id':run,'verified_at':now(),'schema_version':facts['schema_version'],
                   'manifest_sha256':facts['manifest_sha256'],'checks':facts['checks']}
     if profile=='calendar':verification={**verification,'profile':profile,'vault_warnings':facts['vault_warnings']}
+    if profile=='recordings':verification={**verification,'profile':profile,'archive':facts['archive']}
     return {'v':1,'type':'independent_restore_verification','status':'verified',
             'backup':{k:receipt['wire'][k] for k in ('id','bytes','sha256','snapshot_sha256')},'verification':verification}
 
@@ -820,6 +837,87 @@ def write_secret(path,data):
     with os.fdopen(fd,'wb') as out:out.write(data);out.flush();os.fsync(out.fileno())
 
 
+def read_private(fd,name,limit):
+    """A root-private file of the held verifier directory, parsed with unique keys; None when it is absent."""
+    try:handle=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=fd)
+    except FileNotFoundError:return None
+    with os.fdopen(handle,'rb') as source:
+        info=os.fstat(source.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid!=0 or info.st_nlink!=1 or info.st_mode&0o077 or
+                info.st_size>limit):raise ValueError('private_root_file_required')
+        return r2.unique_json(source.read(limit+1))
+
+
+def write_private(fd,name,value):
+    """Atomic replace of a root-private file in the held directory (write_maintenance_json is bounded at 64 KiB)."""
+    data=(json.dumps(value,separators=(',',':'))+'\n').encode()
+    if len(data)>CONTINUITY_LIMIT:raise ValueError('continuity_too_large')
+    temporary='.'+name+'-'+secrets.token_hex(16)
+    handle=os.open(temporary,os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600,dir_fd=fd)
+    try:
+        with os.fdopen(handle,'wb') as out:out.write(data);out.flush();os.fsync(out.fileno())
+        os.replace(temporary,name,src_dir_fd=fd,dst_dir_fd=fd);local.fsync_dir(fd)
+    finally:
+        try:os.unlink(temporary,dir_fd=fd)
+        except FileNotFoundError:pass
+
+
+def candidate_facts_name(run):return 'continuity-'+run+'.json'
+
+
+def drop_candidate_facts(fd,run):
+    try:os.unlink(candidate_facts_name(run),dir_fd=fd)
+    except FileNotFoundError:pass
+
+
+def rebaseline_request(fd):
+    value=read_private(fd,REBASELINE,4096)
+    if value is None:return None
+    if (not isinstance(value,dict) or set(value)!={'v','reason','requested_at'} or value['v']!=1 or
+            not isinstance(value['reason'],str) or not REASON.fullmatch(value['reason'])):raise ValueError('invalid_rebaseline')
+    return value['reason']
+
+
+def check_continuity(payload,run,facts,journal,fd):
+    """The recordings candidate against the protected point's baseline (ANYM-728): refused, nothing is promoted and
+    the previous point stays. Without a baseline only the very first enrollment passes; an operator's re-baseline
+    request accepts the candidate as the new baseline and is recorded with its reason."""
+    candidate=continuity.validate_facts(r2.unique_json(private_file(payload/'continuity.json',CONTINUITY_LIMIT)))
+    if candidate['archive']!=facts['archive']:raise ValueError('invalid_helper_result')
+    reason=rebaseline_request(fd)
+    baseline=read_private(fd,CONTINUITY,CONTINUITY_LIMIT)
+    if baseline is not None:baseline=continuity.validate_facts(baseline)
+    if reason is None:
+        if baseline is None:
+            if journal['prior_sha256'] is not None:raise continuity.ContinuityRefused('archive_baseline_missing')
+        else:continuity.judge(baseline,candidate)
+    write_private(fd,candidate_facts_name(run),{'v':1,'facts':candidate,'rebaselined':reason})
+
+
+def adopt_continuity(fd,run):
+    """After the protected point moved: the candidate's facts become the baseline (idempotent for a promotion retry).
+    Returns the re-baseline reason this adoption consumed, if any."""
+    value=read_private(fd,candidate_facts_name(run),CONTINUITY_LIMIT)
+    if value is None:return None
+    if not isinstance(value,dict) or set(value)!={'v','facts','rebaselined'} or value['v']!=1:raise ValueError('invalid_continuity')
+    write_private(fd,CONTINUITY,continuity.validate_facts(value['facts']))
+    reason=value['rebaselined']
+    if reason is not None and rebaseline_request(fd)==reason:os.unlink(REBASELINE,dir_fd=fd)
+    drop_candidate_facts(fd,run);local.fsync_dir(fd)
+    return reason
+
+
+def request_rebaseline(config,reason):
+    """The operator's owner-visible re-baseline (ANYM-728): the next verification of this recordings instance accepts
+    its candidate archive as the new baseline, whatever its identity, and records `reason` in its success status."""
+    if os.geteuid()!=0:raise ValueError('root_verifier_required')
+    if r2.profile(config)!='recordings':raise ValueError('rebaseline_recordings_only')
+    if not isinstance(reason,str) or not REASON.fullmatch(reason):raise ValueError('invalid_rebaseline')
+    with verifier_lock(config['directory']) as fd:
+        write_private(fd,REBASELINE,{'v':1,'reason':reason,'requested_at':now()})
+    return {'v':1,'status':'rebaseline_requested','reason':reason}
+
+
 def verify_run(config,receiver,client,engine,journal,fd):
     run=journal['run'];directory=Path(config['directory']);payload=directory/('payload-'+run);secret_dir=directory/('secrets-'+run)
     data=data_directory(config,run)
@@ -834,10 +932,11 @@ def verify_run(config,receiver,client,engine,journal,fd):
     worker={'v':1,'identity_file':'/run/restore/identity','work_directory':'/work','database_host':'restore-postgres',
             'database_password':password,'snapshot_sha256':journal['receipt']['wire']['snapshot_sha256'],
             'max_plaintext_bytes':min(config['max_plaintext_bytes'],journal['receipt']['wire']['bytes'])}
-    if r2.profile(config)=='calendar':worker['profile']='calendar'
+    if r2.profile(config)!='messaging':worker['profile']=r2.profile(config)
     write_secret(secret_dir/'worker.json',r2.encoded(worker));local.fsync_dir(secret_dir);local.fsync_dir(directory)
     facts=engine.restore(config,receiver,client,journal['receipt'],run,payload,secret_dir)
     proof=make_proof(journal['receipt'],facts,run,r2.profile(config));r2.validate_proof(proof,journal['receipt'],r2.profile(config))
+    if r2.profile(config)=='recordings':check_continuity(payload,run,facts,journal,fd)
     proof_name='proof-'+run+'.json'
     local.write_maintenance_json(proof_name,proof,dir_fd=fd)
     journal={**journal,'phase':'proof_ready'};local.write_maintenance_json('active.json',journal,dir_fd=fd)
@@ -876,7 +975,7 @@ def check_journal(receiver,config,journal,profile):
 def new_journal(config,receiver,candidate,prior,profile):
     pending={'v':1,'run':secrets.token_hex(16),'destination':r2.destination(receiver),'receipt':candidate,
              'prior_sha256':prior,'protected_file':config['protected_file'],'phase':'restoring','helper_image':config['helper_image'],'helper_revision':config['helper_revision']}
-    if profile=='calendar':pending['profile']=profile
+    if profile!='messaging':pending['profile']=profile
     return pending
 
 
@@ -918,8 +1017,9 @@ def promote_proof(receiver,config,client,journal):
                          expected_protected_sha256=journal['prior_sha256'],client=client)
 
 
-def record_verified(engine,journal,fd):
+def record_verified(engine,journal,fd,rebaselined=None):
     status={'v':1,'status':'verified','backup_id':journal['receipt']['wire']['id'],'verification_id':journal['run'],'verified_at':now()}
+    if rebaselined is not None:status['rebaselined']=rebaselined
     if type(resumes:=getattr(engine,'stream_resumes',None)) is int:status['stream_resumes']=resumes
     local.write_maintenance_json('last-success.json',status,dir_fd=fd)
     local.write_maintenance_json('status.json',status,dir_fd=fd)
@@ -946,6 +1046,8 @@ def run_failure(error,engine,config,journal,admitted,profile,fd):
         try:
             cleanup_resources(engine,journal['run'],profile,data_directory(config,journal['run']))
             remove_payload(config['directory'],journal['run'])
+            # A candidate's continuity facts outlive a failure only once its proof is ready (a promotion retry needs them).
+            if profile=='recordings' and journal['phase']=='restoring':drop_candidate_facts(fd,journal['run'])
         except Exception:cleanup_ok=False
     if admitted is not None and cleanup_ok:
         try:release_admission(admitted)
@@ -1009,8 +1111,9 @@ def run(config,*,client=None,engine=None,path=None):
                     if admitted is not None:release_admission(admitted);admitted=None
                     host.close()
                 promote_proof(receiver,config,client,journal)
+                rebaselined=adopt_continuity(fd,journal['run']) if profile=='recordings' else None
                 journal={**journal,'phase':'promoted'};local.write_maintenance_json('active.json',journal,dir_fd=fd)
-                return record_verified(engine,journal,fd)
+                return record_verified(engine,journal,fd,rebaselined)
         except BaseException as error:
             busy=run_failure(error,engine,config,journal,admitted,profile,fd)
             if busy is not None:return busy
@@ -1029,7 +1132,7 @@ def failure_code(error):
           'invalid_verifier_journal','private_root_file_required','restore_docker_failed','restore_postgres_unavailable',
           'isolated_restore_failed','stored_backup_corrupt','protected_backup_corrupt','verifier_host_busy','verifier_cleanup_unconfirmed',
           'verifier_pins_unfinished','verifier_code_unfinished','invalid_verifier_lock','verification_pending','instances_invalid','pins_switch_unresolved','storage_unavailable','unexpected_restore_image_volume','unexpected_restore_helper_layout',
-          *CALENDAR_FAILURES}
+          *CALENDAR_FAILURES,*RECORDINGS_FAILURES}
     return str(error) if str(error) in safe else 'independent_restore_failed'
 
 
@@ -1059,7 +1162,15 @@ def main(argv=None):
     # The pin step (ANYM-609): one helper pair for every instance in the instances file, or none.
     parser.add_argument('--update-pins',action='store_true');parser.add_argument('--instances',default=str(INSTANCES_FILE))
     parser.add_argument('--helper-image');parser.add_argument('--helper-revision')
+    # The recordings instance's re-baseline (ANYM-728): `--rebaseline --config <verifier.json> --reason <text>`.
+    parser.add_argument('--rebaseline',action='store_true');parser.add_argument('--reason')
     args=parser.parse_args(argv)
+    if args.rebaseline:
+        if not args.config or not args.reason or args.update_pins:parser.error('--rebaseline takes --config and --reason')
+        try:result=request_rebaseline(load_config(args.config),args.reason)
+        except Exception as error:
+            print(json.dumps({'error':failure_code(error),'diagnostic':describe(error)},separators=(',',':')),file=sys.stderr);return 1
+        print(json.dumps(result,separators=(',',':')));return 0
     if args.update_pins:
         if args.config or not args.helper_image or not args.helper_revision:
             parser.error('--update-pins takes --helper-image and --helper-revision, not --config')

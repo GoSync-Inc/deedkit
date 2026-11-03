@@ -43,7 +43,9 @@ CHECKS = {'decryption', 'bundle_integrity', 'database_restore', 'table_inventory
 # without `profile` is messaging's. Neither profile accepts the other's proof or a union.
 CALENDAR_CHECKS = {'decryption', 'bundle_integrity', 'database_restore', 'schema_version',
                    'table_inventory', 'vault_complete', 'vault_decrypts'}
-PROFILES = ('messaging', 'calendar')
+# A recordings receiver (ANYM-728) protects only a proof with exactly these checks and the archive's identity facts.
+RECORDINGS_CHECKS = {'decryption', 'bundle_integrity', 'archive_integrity', 'schema_version', 'identity', 'search_readback'}
+PROFILES = ('messaging', 'calendar', 'recordings')
 MAX_WARNINGS = 32
 # Encoded bytes of the copied warnings: an escaped non-ASCII name grows (an emoji is 12 bytes), and
 # the proof must stay far inside the 16 KiB `protect`/`rotate` read limit.
@@ -56,6 +58,15 @@ STOP_SECONDS = 300
 
 def profile(config):
     return config.get('profile', 'messaging')
+
+
+def valid_archive(value):
+    """A recordings proof's archive identity facts (the bundle manifest's): an opaque ID and three counters."""
+    def count(item, low=0):
+        return type(item) is int and low <= item <= 2**63 - 1
+    return (isinstance(value, dict) and set(value) == {'archive_id', 'incarnation', 'sequence', 'records'} and
+            isinstance(value['archive_id'], str) and bool(re.fullmatch(r'[A-Za-z0-9._:-]{1,128}', value['archive_id'])) and
+            count(value['incarnation'], 1) and count(value['sequence']) and count(value['records']))
 
 
 def valid_warnings(value):
@@ -916,6 +927,8 @@ def validate_proof(proof, receipt, expected='messaging'):
     keys, checks = ({'id', 'verified_at', 'schema_version', 'manifest_sha256', 'checks'}, CHECKS)
     if expected == 'calendar':
         keys, checks = keys | {'profile', 'vault_warnings'}, CALENDAR_CHECKS
+    elif expected == 'recordings':
+        keys, checks = keys | {'profile', 'archive'}, RECORDINGS_CHECKS
     if not isinstance(candidate, dict) or set(candidate) != {'id', 'bytes', 'sha256', 'snapshot_sha256'}:
         raise ValueError('invalid_restore_proof')
     new = {key: candidate[key] for key in ('id', 'bytes', 'sha256')}
@@ -929,7 +942,8 @@ def validate_proof(proof, receipt, expected='messaging'):
             verification['manifest_sha256'] != candidate['snapshot_sha256'] or
             not isinstance(verification['checks'], dict) or set(verification['checks']) != checks or
             any(value is not True for value in verification['checks'].values()) or
-            (expected == 'calendar' and not valid_warnings(verification['vault_warnings']))):
+            (expected == 'calendar' and not valid_warnings(verification['vault_warnings'])) or
+            (expected == 'recordings' and not valid_archive(verification['archive']))):
         raise ValueError('independent_restore_proof_required')
     if receipt is None or any(receipt['wire'].get(key) != value for key, value in candidate.items()):
         raise ValueError('candidate_receipt_mismatch')

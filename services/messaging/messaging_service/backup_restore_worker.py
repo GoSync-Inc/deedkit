@@ -44,9 +44,14 @@ DETAIL_TEMPLATES=(
 STAGES={'restore_decryption_failed','restore_database_failed','restore_snapshot_failed','restore_quarantine_failed',
         # The calendar profile (ANYM-606): one code per check after the shared ones, and a bundle of the other profile.
         'restore_bundle_failed','restore_schema_failed','restore_inventory_failed','restore_vault_incomplete',
-        'restore_vault_decrypt_failed','verifier_profile_mismatch'}
+        'restore_vault_decrypt_failed','verifier_profile_mismatch',
+        # The recordings profile (ANYM-728): the archive file's integrity, identity and index, after the shared ones.
+        'restore_archive_failed','restore_readback_failed'}
 CALENDAR_CHECKS=('decryption','bundle_integrity','database_restore','schema_version','table_inventory',
                  'vault_complete','vault_decrypts')
+
+
+RECORDINGS_CHECKS=('decryption','bundle_integrity','archive_integrity','schema_version','identity','search_readback')
 
 
 class RestoreStageError(RuntimeError):detail=''
@@ -209,12 +214,40 @@ def restore_calendar(restored,manifest_sha,*,tool,env,dsn,database):
             'vault_warnings':proof_warnings(warnings)}
 
 
+def write_exclusive(target,data):
+    fd=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'wb') as out:out.write(data);out.flush();os.fsync(out.fileno())
+
+
+def restore_recordings(restored,manifest_sha,work):
+    """Checks of a decrypted recordings bundle (ANYM-728): structure and hashes, schema, SQLite integrity and identity
+    (verify_recordings_bundle), a search/context readback, and the hash-only continuity facts the verifier judges
+    on its host (`continuity.json`, no text). Needs no database: the archive is read in place."""
+    from . import backup_recordings_continuity as continuity
+    from .backup_recordings import verify_recordings_bundle
+    def bundle():
+        try:return verify_recordings_bundle(restored)
+        except ValueError as error:
+            raise RestoreStageError('restore_schema_failed' if str(error)=='recordings_schema_unsupported'
+                                    else 'restore_bundle_failed') from None
+        except RuntimeError:raise RestoreStageError('restore_archive_failed') from None
+    manifest=bundle()
+    archive=restored/'state'/'archive.sqlite'
+    stage('restore_readback_failed',lambda:continuity.readback(archive))
+    facts=stage('restore_archive_failed',lambda:continuity.archive_facts(archive))
+    if facts['archive']!=manifest['archive']:raise RestoreStageError('restore_archive_failed')
+    write_exclusive(work/'continuity.json',encoded(facts))
+    fsync_dir(work)
+    return {'v':1,'status':'verified','profile':'recordings','schema_version':manifest['user_version'],
+            'manifest_sha256':manifest_sha,'checks':{name:True for name in RECORDINGS_CHECKS},'archive':manifest['archive']}
+
+
 def run(config, source=None):
     required = {'v','identity_file','work_directory','database_host','database_password','snapshot_sha256','max_plaintext_bytes'}
     # A calendar worker config (ANYM-606) adds `profile: calendar`; a messaging one is unchanged.
-    profile = 'calendar' if isinstance(config,dict) and 'profile' in config else 'messaging'
-    if profile=='calendar':
-        if config['profile']!='calendar':raise ValueError('invalid_restore_worker_config')
+    profile = config['profile'] if isinstance(config,dict) and 'profile' in config else 'messaging'
+    if profile!='messaging':
+        if profile not in ('calendar','recordings'):raise ValueError('invalid_restore_worker_config')
         required = required | {'profile'}
     if (not isinstance(config,dict) or set(config)!=required or type(config['v']) is not int or config['v']!=1 or
             config['identity_file']!='/run/restore/identity' or config['work_directory']!='/work' or
@@ -238,6 +271,7 @@ def run(config, source=None):
     # Isolated DB name, host, user and arguments are fixed, never taken from the dump.
     env={**os.environ,'PGHOST':'restore-postgres','PGPORT':'5432','PGUSER':'restore_owner',
          'PGDATABASE':DATABASE,'PGPASSWORD':config['database_password'],'PGCONNECT_TIMEOUT':'10'}
+    if profile=='recordings':return write_result(work,restore_recordings(restored,manifest_sha,work))
     if profile=='calendar':
         from psycopg.conninfo import make_conninfo
         result=restore_calendar(restored,manifest_sha,tool=lambda name:[name,'--dbname='+DATABASE],env=env,database=DATABASE,

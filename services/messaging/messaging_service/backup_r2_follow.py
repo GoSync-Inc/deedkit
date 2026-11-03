@@ -96,7 +96,7 @@ LOCK_BYTES = 1024 ** 2
 RECEIVER_IMPORTS = ('boto3', 'botocore.config', 'messaging_service.backup_r2_receiver')
 # Answers that only mean "not now": the service exits cleanly and the next tick retries.
 WAITING = {'verifier_busy', 'verifier_host_busy', 'verification_pending', 'helper_unattested', 'attestation_unreachable', 'main_unreachable'}
-SAFE = WAITING | {'follow_config_mismatch', 'follow_not_forward', 'helper_attestation_refused',
+SAFE = WAITING | {'recordings_helper_failed', 'follow_config_mismatch', 'follow_not_forward', 'helper_attestation_refused',
                   'attest_verifier_unavailable', 'helper_pull_failed', 'helper_schemas_unavailable',
                   'helper_self_test_mismatch', 'helper_self_test_failed', 'publication_directory_foreign',
                   'publication_foreign', 'publication_mount_point', 'untrusted_operator_ancestor',
@@ -172,6 +172,25 @@ for name,data in (('postgres.env',b'POSTGRES_PASSWORD=synthetic\n'),('runtime.js
 os.environ['PGPASSWORD']=password
 public=make_conninfo(host='restore-postgres',user='restore_owner',port='5432',dbname='deedkit_calendar_fixture')
 create_calendar_snapshot(dsn,root/'snapshot',['pg_dump','--dbname='+public],vault_directory=vault,profile_directory=profile)
+encrypt_snapshot(root/'snapshot',root/'ciphertext',recipient)
+(root/'manifest-sha256').write_text(hashlib.sha256((root/'snapshot/manifest.json').read_bytes()).hexdigest())
+'''
+
+
+# The recordings profile's synthetic bundle (ANYM-728): a small archive in the store's table shapes, sealed and
+# age-encrypted by the image under test. It needs no database; the restore helper reads the archive in place.
+RECORDINGS_FIXTURE_SCRIPT = r'''
+import hashlib,os
+from pathlib import Path
+from messaging_service.backup_crypto import encrypt_snapshot
+from messaging_service.backup_recordings import create_recordings_snapshot
+from messaging_service.backup_recordings_continuity import synthetic_archive
+root=Path('/fixture')
+recipient=os.environ['DEEDKIT_SYNTHETIC_RECIPIENT']
+staged=synthetic_archive(root/'staged'/'archive.sqlite',[
+    {'ref':'synthetic%02d'%i,'provider_id':'p%d'%i,'transcript':'synthetic follow self test words %d'%i,'summary':'synthetic %d'%i}
+    for i in range(1,4)])
+create_recordings_snapshot(staged,root/'snapshot')
 encrypt_snapshot(root/'snapshot',root/'ciphertext',recipient)
 (root/'manifest-sha256').write_text(hashlib.sha256((root/'snapshot/manifest.json').read_bytes()).hexdigest())
 '''
@@ -553,6 +572,9 @@ def sweep_self_tests(engine, directory):
             clear_self_test(engine, directory, name[len(SELF_TEST):])
 
 
+FIXTURE_SCRIPTS = {'calendar': CALENDAR_FIXTURE_SCRIPT, 'recordings': RECORDINGS_FIXTURE_SCRIPT}
+
+
 def self_test(engine, config, run=None):
     """Read the image's `backup.SCHEMAS` in a networkless container, then restore a synthetic
     bundle of the config's profile, made and age-encrypted by the image under test, with that image
@@ -603,7 +625,7 @@ def self_test(engine, config, run=None):
                        '--env-file', str(source_secrets / 'postgres.env'), '--env', 'DEEDKIT_SYNTHETIC_RECIPIENT=' + recipient,
                        '--mount', 'type=bind,src=' + str(fixture) + ',dst=/fixture',
                        '--entrypoint', 'python', config['helper_image'], '-c',
-                       CALENDAR_FIXTURE_SCRIPT if profile == 'calendar' else FIXTURE_SCRIPT)
+                       FIXTURE_SCRIPTS.get(profile, FIXTURE_SCRIPT))
         engine.command('container', 'start', '-a', name)
         state = r2.unique_json(engine.command('container', 'inspect', name))[0]['State']
         if state.get('ExitCode') != 0:raise RuntimeError('helper_self_test_failed')
@@ -617,7 +639,7 @@ def self_test(engine, config, run=None):
         verifier.write_secret(target_secrets / 'postgres.env', env)
         worker = {'v': 1, 'identity_file': '/run/restore/identity', 'work_directory': '/work', 'database_host': 'restore-postgres',
                   'database_password': password, 'snapshot_sha256': snapshot, 'max_plaintext_bytes': receipt['wire']['bytes']}
-        if profile == 'calendar':worker['profile'] = profile
+        if profile != 'messaging':worker['profile'] = profile
         verifier.write_secret(target_secrets / 'worker.json', r2.encoded(worker))
         facts = engine.restore(tested, {'bucket': 'synthetic'}, Fixture(), receipt, run, target_payload, target_secrets)
         return schemas, verifier.make_proof(receipt, facts, run, profile)['verification']['schema_version']
@@ -632,7 +654,13 @@ def admitted_test(engine, config, test):
     profile = r2.profile(config); run = secrets.token_hex(16)
     with verifier.host_lock(config, wait=0) as fd:
         verifier.admit(engine, fd, profile, run, self_test_resources(run, profile))
-        result = test(engine, config, run)
+        try:result = test(engine, config, run)
+        except Exception as error:
+            # A helper that cannot handle the recordings bundle holds the shared pin move with one fixed code; the
+            # messaging and calendar verifications never read this failure (ANYM-728).
+            if profile == 'recordings' and not r2.CANCELLED and not isinstance(error, (TimeoutError, InterruptedError)):
+                raise RuntimeError('recordings_helper_failed') from error
+            raise
         # Kept after a failure: the next holder confirms its resources gone first.
         verifier.release_admission(fd)
     return result
