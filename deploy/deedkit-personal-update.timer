@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily update of a personal DeedKit install, off-peak
+
+[Timer]
+# 03:30 server time plus up to 30 minutes; a run missed while the server was off starts at boot.
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=30min
+Persistent=true
+Unit=deedkit-personal-update.service
+
+[Install]
+WantedBy=timers.target
