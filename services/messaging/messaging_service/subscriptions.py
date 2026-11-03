@@ -529,7 +529,11 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
             'consumption': 'passive_read_no_ack', 'scope_masked': False, **modules})
     # ANYM-522: a dynamic definition returns only references the key can see now.
     where, args = visible_filter(row, p, 'sm')
-    events = c.execute('''SELECT e.id,e.kind,e.origin,e.revision,e.created_at,''' +
+    # ANYM-734: when the matcher matched the event, and when the earliest delivered events hint that covers it
+    # finished (null until one is delivered, or once retention pruned it).
+    events = c.execute('''SELECT e.id,e.kind,e.origin,e.revision,e.created_at,sm.matched_at,
+        (SELECT min(o.finished_at) FROM subscription_outbox o WHERE o.subscription=sm.subscription
+            AND o.kind='events' AND o.state='delivered' AND o.through_position>=e.id) AS delivered_at,''' +
         ('sm.own_send_reply' if dynamic(row) else 'false AS own_send_reply') + ''',
         jsonb_strip_nulls(jsonb_build_object(
             'message',e.snapshot->'message','account',e.snapshot->'account','chat',e.snapshot->'chat',
@@ -550,6 +554,7 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
     items = [{**{key: event['snapshot'][key] for key in fields if key in event['snapshot']},
         'event_id': event['id'], 'kind': event['kind'], 'origin': event['origin'],
         'revision': event['revision'], 'observed_at': event['created_at'],
+        'matched_at': event['matched_at'], 'delivered_at': event['delivered_at'],
         'historical': event['origin'] in ('backfill', 'reconcile'),
         'matching_basis': 'exact_event_revision'} for event in events[:limit]]
     from .subscription_consumption import wake_reason

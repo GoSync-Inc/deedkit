@@ -157,6 +157,39 @@ def test_signed_opaque_hints_retry_and_do_not_ack_events(seeded, tmp_path):
     assert not call(store, token, 'fetch_subscription_events', sid).get('acked')
 
 
+# spec: ANYM-734
+def test_event_items_show_when_they_were_matched_and_delivered(seeded, tmp_path):
+    from datetime import datetime
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    token = identity(store)
+    sid = subscription(store, token)
+    rid, _ = receiver(store, token, tmp_path)
+    call(store, token, 'configure_subscription_delivery', sid, 1, rid)
+    first = emit(store)
+    match_subscriptions(store)
+    item = store.get_subscription_events(token, sid)['items'][0]
+    assert item['event_id'] == first and item['matched_at'] and item['delivered_at'] is None
+    assert dispatch_hints(store, transport=lambda *a, **k: 204, resolver=lambda *a, **k: ['93.184.216.34'])['delivered'] == 1
+    item = store.get_subscription_events(token, sid)['items'][0]
+    stages = [datetime.fromisoformat(item[name]) for name in ('sent_at', 'observed_at', 'matched_at', 'delivered_at')]
+    assert stages == sorted(stages) and item['delivered_at'] > item['matched_at']
+    # A later event is not covered by that hint; a dead-lettered hint and a delivered test hint never set the time.
+    second = emit(store)
+    match_subscriptions(store)
+    with store.pool.connection() as c:
+        c.execute("""INSERT INTO subscription_outbox(subscription,subscription_version,receiver,through_position,kind,
+            request_id,state,finished_at) VALUES(%s,1,%s,%s,'test','synthetic-test','delivered',clock_timestamp())""",
+            (sid, rid, second))
+        c.execute("""UPDATE subscription_outbox SET state='dead_letter',finished_at=clock_timestamp()
+            WHERE subscription=%s AND kind='events' AND state='pending'""", (sid,))
+    later = [i for i in store.get_subscription_events(token, sid)['items'] if i['event_id'] == second][0]
+    assert later['matched_at'] and later['delivered_at'] is None
+    # Another credential of the same principal still cannot read the subscription.
+    with pytest.raises(APIError, match='not_found'):
+        store.get_subscription_events(identity(store), sid)
+
+
 def test_receiver_validation_and_revocation_fail_closed(seeded, tmp_path):
     from messaging_service.event_delivery import validate_endpoint, dispatch_hints
     for endpoint, addresses in [('http://example.com/wake', ['93.184.216.34']),

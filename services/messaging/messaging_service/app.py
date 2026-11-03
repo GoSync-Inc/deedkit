@@ -1109,6 +1109,8 @@ def register_subscription_tools(mcp, call, async_call, read, upload_write):
         Exact event revision and artifact references remain distinct from current content.
         An empty page with a lagging/paused matcher or a gap does not prove no new data.
         Matching and live provider freshness are separate; get_sync_status checks chats.
+        Each item has sent_at (provider), observed_at (journal commit), matched_at and delivered_at (null until a hint
+        covering it was delivered).
         """
         return call(ctx,'get_subscription_events',subscription_id=subscription_id,after=after,limit=limit)
 
@@ -1176,7 +1178,7 @@ def register_delivery_tools(mcp, call, async_call, read, upload_write):
 
     @mcp.tool(structured_output=True,annotations=read)
     def list_delivery_attempts(ctx: Context,endpoint_id: EndpointReference,limit: AttemptLimit=50,before: ReceiverReference | None=None) -> dict[str,Any]:
-        """List your own endpoint's latest delivery attempts, newest first: time, hint and subscription IDs, attempt number, outcome (delivered, retry, dead_letter, cancelled, paused), HTTP status or error code, latency_ms.
+        """List your own endpoint's latest delivery attempts, newest first: time, hint and subscription IDs, attempt number, outcome (delivered, retry, dead_letter, cancelled, paused), HTTP status or error code, latency_ms, hint_created_at and hint_admitted_at (null once the hint was pruned).
 
         Requires read + explicit delivery-write. Kept 7 days; no response body, header value or URL. Pass the
         previous page's next_before as before for older attempts.

@@ -729,6 +729,29 @@ def due_now(store):
         c.execute("UPDATE subscription_outbox SET next_attempt_at=clock_timestamp() WHERE state='pending'")
 
 
+# spec: ANYM-734
+def test_attempt_log_names_when_its_hint_was_queued_and_admitted(gate, policy):
+    from datetime import datetime
+    store = gate
+    token = identity(store)
+    eid = register(store, token)['endpoint_id']
+    with store.pool.connection() as c:
+        c.execute("UPDATE delivery_endpoint_tests SET state='cancelled'")
+    store.create_subscription(token, ['telegram-demo-chat'], delivery={'endpoint_id': eid})
+    emit(store)
+    match_subscriptions(store)
+    due_now(store)
+    dispatch_hints(store, transport=lambda *a, **k: 204, resolver=PUBLIC)
+    item = store.list_delivery_attempts(token, eid)['items'][0]
+    created, admitted, at = (datetime.fromisoformat(item[name]) for name in ('hint_created_at', 'hint_admitted_at', 'at'))
+    assert created <= admitted <= at
+    # A hint pruned by retention leaves the attempt listed, with no hint times.
+    with store.pool.connection() as c:
+        c.execute('DELETE FROM subscription_outbox WHERE id=%s', (item['hint_id'],))
+    gone = store.list_delivery_attempts(token, eid)['items'][0]
+    assert (gone['hint_created_at'], gone['hint_admitted_at']) == (None, None)
+
+
 # spec: ANYM-520
 def test_attempt_log_lists_each_attempt_with_its_status_or_error_code_and_nothing_else(gate, policy):
     from messaging_service.delivery_endpoints import EgressNotSent
@@ -756,7 +779,7 @@ def test_attempt_log_lists_each_attempt_with_its_status_or_error_code_and_nothin
     assert {i['subscription_id'] for i in items} == {sid} and len({i['hint_id'] for i in items}) == 1
     assert all(type(i['latency_ms']) is int and i['latency_ms'] >= 0 for i in items)
     assert set(items[0]) == {'attempt_id', 'at', 'hint_id', 'subscription_id', 'attempt', 'outcome', 'http_status',
-        'error_code', 'latency_ms'}
+        'error_code', 'latency_ms', 'hint_created_at', 'hint_admitted_at'}
     assert URL not in json.dumps(page) and (page['has_more'], page['retention_days']) == (False, 7)
     first = store.list_delivery_attempts(token, eid, limit=2)
     assert (first['items'], first['has_more'], first['next_before']) == (items[:2], True, items[1]['attempt_id'])

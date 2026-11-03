@@ -893,13 +893,17 @@ def list_delivery_attempts(store, c, p, endpoint_id, limit=50, before=None):
         if cursor is None:
             raise _error('invalid_parameters', 400)
     at, after = (cursor['created_at'], cursor['id']) if cursor else (None, None)
-    items = c.execute('''SELECT id,created_at,hint,subscription,attempt,outcome,http_status,error_code,latency_ms
-        FROM delivery_attempts WHERE endpoint=%s AND created_at>clock_timestamp()-make_interval(days=>%s)
-        AND (%s::timestamptz IS NULL OR (created_at,id)<(%s::timestamptz,%s::uuid))
-        ORDER BY created_at DESC,id DESC LIMIT %s''', (row['id'], ATTEMPT_DAYS, at, at, after, limit + 1)).fetchall()
+    # ANYM-734: the hint's own times (null once retention pruned the hint) show where a delay was spent.
+    items = c.execute('''SELECT a.id,a.created_at,a.hint,a.subscription,a.attempt,a.outcome,a.http_status,a.error_code,
+        a.latency_ms,o.created_at AS hint_created_at,o.admitted_at AS hint_admitted_at
+        FROM delivery_attempts a LEFT JOIN subscription_outbox o ON o.id=a.hint
+        WHERE a.endpoint=%s AND a.created_at>clock_timestamp()-make_interval(days=>%s)
+        AND (%s::timestamptz IS NULL OR (a.created_at,a.id)<(%s::timestamptz,%s::uuid))
+        ORDER BY a.created_at DESC,a.id DESC LIMIT %s''', (row['id'], ATTEMPT_DAYS, at, at, after, limit + 1)).fetchall()
     page = [{'attempt_id': item['id'], 'at': item['created_at'], 'hint_id': item['hint'],
         'subscription_id': item['subscription'], 'attempt': item['attempt'], 'outcome': item['outcome'],
-        'http_status': item['http_status'], 'error_code': item['error_code'], 'latency_ms': item['latency_ms']}
+        'http_status': item['http_status'], 'error_code': item['error_code'], 'latency_ms': item['latency_ms'],
+        'hint_created_at': item['hint_created_at'], 'hint_admitted_at': item['hint_admitted_at']}
         for item in items[:limit]]
     return serial({'endpoint_id': row['id'], 'items': page, 'has_more': len(items) > limit,
         'next_before': page[-1]['attempt_id'] if len(items) > limit else None, 'retention_days': ATTEMPT_DAYS})

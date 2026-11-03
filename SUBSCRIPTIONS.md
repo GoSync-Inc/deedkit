@@ -133,6 +133,34 @@ an unconditional model turn. Batch delivery groups references; it does not run a
 summarizer in the core. A batch must flush at its maximum wait even under a
 continuous message stream.
 
+### Where the time goes (ANYM-734)
+
+These are design bounds read from the code, not an SLA. A message passes these
+stages in order, and `get_subscription_events` shows where it was at each:
+
+| Stage | Field | Normal cost |
+| --- | --- | --- |
+| The provider sends it | `sent_at` | The provider's own time |
+| The collector captures it and the journal commits it | `observed_at` | Spool drained every 250 ms; up to 30 s more under a burst (COLLECTORS.md) |
+| The matcher matches it | `matched_at` | Polls every 2 s |
+| The hint policy releases the hint | `get_subscription` `delivery.held_reason`, `next_hint_at` | None without a policy |
+| The dispatcher posts it | `delivered_at` (first delivered hint covering the event) | A lane polls every 2 s; the POST times out after 5 s |
+
+`delivered_at` is null until a hint covering the event is delivered, and after
+retention pruned that hint. A test hint or a dead-lettered one never sets it. What can
+add more than a few seconds, each visible in `get_subscription`:
+
+- `debounce_s`, `batch_window_s`, `batch_count`: the hint waits for its window; `max_wait_s`
+  defaults to 300 s (or `debounce_s` if larger) whenever one of them is set.
+- Quiet hours hold a due hint to the window end.
+- The hourly budget (20 hints per key, `SUBSCRIPTION_MAX_HINTS_PER_HOUR`) and the per-host cap
+  (100 per hour) hold a hint to the next slot (`held_reason: budget`).
+- A key with 32 queued hints holds the next for a minute; one attempt per key is in flight.
+- A failed attempt retries after 2, 4, 8, 16, 32 and 64 s, or after the receiver's `Retry-After`
+  (up to an hour); `list_delivery_attempts` shows each attempt with `hint_created_at`,
+  `hint_admitted_at` and `at`, so the wait before the first attempt and between attempts is
+  readable. Attempts are kept 7 days.
+
 ## Schema 32: explicit consumption and registered hints
 
 Schema 32 adds independent subscription consumption. `fetch_subscription_events`
@@ -732,7 +760,8 @@ budget, an expired module event, an auto-pause). `list_delivery_attempts(endpoin
 limit<=50, before?)` returns the key's own rows newest first: `attempt_id`, `at`, `hint_id`,
 `subscription_id`, `attempt` (the hint's attempt number), `outcome` (`delivered`, `retry`,
 `dead_letter`, `cancelled`, `paused`), `http_status` when the receiver answered,
-`error_code` and `latency_ms`. Error codes name the failure, never its text: `timeout`,
+`error_code`, `latency_ms`, and `hint_created_at` and `hint_admitted_at` (when the hint
+was queued and when the dispatcher admitted it; null once the hint was pruned). Error codes name the failure, never its text: `timeout`,
 `tls`, `connect`, `dns_unsafe`, `dns_unavailable`, `egress_unavailable`,
 `invalid_response`, `redirect`, or the hint's own code (`vendor_refused`,
 `outcome_unknown`, `receiver_status`, `delivery_budget_exhausted`, ...). No response body,
