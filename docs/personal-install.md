@@ -183,9 +183,17 @@ agents.example.com {
 
 `systemctl reload caddy`. Your agent connects to `https://agents.example.com/mcp` (Streamable HTTP, Bearer = the contents of `private/agent-gateway.token`). Test: `curl -s -H "Authorization: Bearer $(cat private/agent-gateway.token)" -H 'Content-Type: application/json' -d '{}' https://agents.example.com/v1/messages_capabilities`. Do not log request bodies in Caddy.
 
-## 7. Updates
+## 7. Updates (automatic, daily)
 
-Manual: `cd /opt/deedkit && git pull --ff-only`, then for each stack `docker compose ... build`, `operator migrate` (calendar: `cal migrate`), re-apply `gateway_role.sql`/`collector_role.sql`, `docker compose up -d`. Read the release notes in [SETUP.md](../SETUP.md) first: some releases need extra steps. An automatic daily update script is added separately (`deploy/personal-update.sh`).
+`deploy/personal-update.sh` follows `origin/main` (there is no newer release tag), but only to a commit whose GitHub `CI gate` is green. Each run: refuses if tracked files in the checkout were edited (keep settings in `.env` and `private/`); takes a local `pg_dump` of each database into `/var/backups/deedkit-local` (newest 3 kept; this is the only backup in this lite path, a rollback for a bad migration, media files are not included); builds; runs migrations and re-applies the role SQL; `docker compose up -d` for the services that already exist; waits for health; writes one line to `/var/log/deedkit-update.log`. A failure before the containers are replaced leaves the old ones running. Collectors restart on an update, so their sessions reconnect.
+
+```sh
+cp /opt/deedkit/deploy/deedkit-personal-update.{service,timer} /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now deedkit-personal-update.timer
+/opt/deedkit/deploy/personal-update.sh      # run once by hand to see the result line
+```
+
+The timer runs at about 03:30 server time. Settings (`DEEDKIT_TRACK=tag` to follow release tags later, dump directory, keep count) are at the top of the script. Rollback instructions are in the same header. Read the release notes in [SETUP.md](../SETUP.md) when an update fails: some releases need extra steps.
 
 ## 8. Optional later
 
