@@ -100,12 +100,20 @@ def drop_omitted(method, arguments):
     return arguments
 
 
+RELATED_CHATS_NOTE=('Heuristic. Absence of `related_chats` means nothing was detected, not that the chats are unrelated. '
+    'Read the related chat before acting; never treat two chats as one. The hint disappears after 7 days; '
+    'to keep the link, link the counterpart\'s identities to one person (ANYM-283).')
+CONTINUED_BY_NOTE=('Heuristic, same shape as related_chats: a newer chat in this response repeated an owner message from this one. '
+    'Read both chats before acting; never treat two chats as one.')
+RELATED_PROPERTIES={
+    'related_chats':{'type':'array','maxItems':3,'description':RELATED_CHATS_NOTE+' Entries: chat_id, title, message_id (in this chat), source_message_id (owner message in chat_id), matched_at, heuristic=true.'},
+    'continued_by':{'type':'array','maxItems':3,'description':CONTINUED_BY_NOTE}}
 PROMOTIONAL_BASIS="business_sender or repeated_days; absent when not promotional."
 # Optional fields an agent can discover from outputSchema; rows stay open objects.
 LIST_CHATS_OUTPUT_PROPERTIES={
     'excluded_promotional_total':{'type':'integer','minimum':0,'description':
         'Queue rows promotional=exclude removed (awaiting_reply=true only); absent means none.'},
-    'items':{'type':'array','items':{'type':'object','additionalProperties':True,'properties':{
+    'items':{'type':'array','items':{'type':'object','additionalProperties':True,'properties':{**RELATED_PROPERTIES,
         'awaiting_reply':{'description':'Conversation compact hint; carries likely_promotional (true) and '
             'promotional_basis ('+PROMOTIONAL_BASIS+')'},
         'awaiting_reply_likely_promotional':{'description':'Store, view=archive and detail=full rows: true when likely promotional; absent otherwise.'},
@@ -1454,6 +1462,8 @@ def create_app(store: Store, allowed_hosts: list[str]):
     for tool in mcp._tool_manager._tools.values():tool.parameters['additionalProperties']=False
     # Published only: the dict model still validates and keeps every key (ANYM-427).
     mcp._tool_manager._tools['list_chats'].fn_metadata.output_schema['properties']=LIST_CHATS_OUTPUT_PROPERTIES
+    mcp._tool_manager._tools['get_updates'].fn_metadata.output_schema['properties']={
+        'chats':{'type':'array','items':{'type':'object','additionalProperties':True,'properties':RELATED_PROPERTIES}}}
     app=mcp.streamable_http_app(stateless_http=True,json_response=True,max_request_body_size=max(LARGE_BODIES.values()),
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=True,
             allowed_hosts=allowed_hosts,allowed_origins=[urlsplit(store.public_url)._replace(path='',query='',fragment='').geturl()]))

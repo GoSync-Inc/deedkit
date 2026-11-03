@@ -328,6 +328,29 @@ needs `order="waiting_longest"` and the reverse; neither combines with
 (`invalid_filter` with a `hint` naming the order). Through the gateway pass
 `order` explicitly: it fills `order="activity"` otherwise.
 
+### Related older chat (heuristic hint)
+
+When a counterpart moves to a new chat (a new number, or another messenger), the archive links nothing, and writing
+into the old chat is a send under the owner's name. `list_chats` rows and `get_updates` `view=by_chat` rows of a **new
+private chat** (its first archived message, by message time, is at most 7 days old) may carry `related_chats`: up to 3
+`{chat_id, title, message_id, source_message_id, matched_at, heuristic: true}`. `message_id` is the message in this chat that
+matched, `source_message_id` the owner's message in `chat_id`. The older chat's row carries `continued_by` (same shape,
+`message_id` in the new chat, `source_message_id` in this chat) only when the new chat is in the same response.
+
+- Heuristic. Absence of `related_chats` means nothing was detected, not that the chats are unrelated. Read the related chat
+  before acting; never treat two chats as one. The hint disappears after 7 days; to keep the link, link the counterpart's
+  identities to one person (ANYM-283).
+- The only basis is a copy: one of the new chat's first 3 incoming messages equals, after Unicode NFKC, casefolding and
+  whitespace collapse, an owner message sent in exactly one other private chat in the 7 days before it. The older chat may be
+  on another account the key can read.
+- Skipped: bodies under 24 characters or one token (a bare URL, number, address); a body the owner sent to more than one visible
+  chat in the window (a broadcast or canned reply); groups and channels on either side; a WhatsApp alias chat; deleted or purged
+  messages and hidden chats (the check reads only what the key can read, so a hidden copy neither creates nor suppresses a hint).
+- Bounded: at most 5 new chats per page, 200 outgoing candidates per copy, one 1-second budget for the whole check. When a cap
+  or the budget stops it, the hint is left out and the rows, order and cursors are unchanged. In the `by_chat` overview the hints
+  are the first thing removed when the page exceeds its 10,000-character budget.
+- Read-only: no stored link, schema or event.
+
 ## Ordering and windows
 
 `position` is local to the returned page/window, never a permanent chat sequence.
