@@ -57,7 +57,7 @@ def setup(tmp_path, old):
 def test_the_catalog_names_body_format_and_the_new_backend_receives_it_only_when_given(tmp_path, tool):
     entry = CATALOG["messages_" + tool]
     assert entry["inputSchema"]["properties"]["body_format"]["anyOf"][0]["enum"] == ["", "html"]
-    assert "body_format=html" in entry["description"] and "omitted_types" in entry["description"]
+    assert "omitted_types" in entry["inputSchema"]["properties"]["body_format"]["description"]
     app, seen = setup(tmp_path, old=False)
     with TestClient(app) as client:
         for given in (None, "", "html"):
