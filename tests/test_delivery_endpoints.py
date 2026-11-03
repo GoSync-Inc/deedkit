@@ -770,7 +770,8 @@ def test_attempt_log_times_a_hint_held_by_the_host_budget_until_its_admission(ga
     stats = dispatch_hints(store, transport=lambda *a, **k: 204, resolver=PUBLIC)
     assert (stats['delivered'], stats['deferred']) == (1, 1)
     with store.pool.connection() as c:
-        c.execute("UPDATE subscription_outbox SET admitted_at=admitted_at-interval '61 minutes' WHERE admitted_at IS NOT NULL")
+        c.execute('''UPDATE subscription_outbox SET created_at=created_at-interval '61 minutes',
+            admitted_at=admitted_at-interval '61 minutes' WHERE admitted_at IS NOT NULL''')
         # The held hint has waited a minute for its slot (distinct, deterministic times).
         c.execute("UPDATE subscription_outbox SET created_at=created_at-interval '1 minute' WHERE admitted_at IS NULL")
     due_now(store)
