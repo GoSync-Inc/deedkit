@@ -264,7 +264,8 @@ def test_collector_reservations_are_atomic_and_foreground_use_is_counted_never_r
         assert await r.reserve(fingerprint, [('transcripts', 5)], T0 + 2) is False
         assert sql(doc, 'SELECT bucket,sum(count) FROM ledger GROUP BY bucket ORDER BY bucket') == [('reads', 13), ('transcripts', 15)]
         assert await r.reserve(fingerprint, [('transcripts', 5)], T0 + 3800) is True
-        assert sql(doc, "SELECT sum(count) FROM ledger WHERE bucket='transcripts'") == [(1,)]
+        # Rows older than the sliding hour (plus margin) no longer count, though they stay as clock evidence for 2 h.
+        assert sql(doc, "SELECT sum(count) FROM ledger WHERE bucket='transcripts' AND window_start>?", T0 + 3800 - 3675) == [(1,)]
         await r.close()
     asyncio.run(run())
     stored = Path(doc['archive']['directory'], 'archive.sqlite').read_bytes()
