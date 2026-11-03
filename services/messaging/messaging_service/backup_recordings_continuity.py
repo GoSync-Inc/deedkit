@@ -145,22 +145,29 @@ def judge(baseline, candidate):
             raise ContinuityRefused('archive_content_lost')
 
 
-def _readable(raw):
-    """The stored parts JSON as a dict whose parts are objects with string texts, else ValueError."""
-    stored = json.loads(raw)
-    if not isinstance(stored, dict):
-        raise ValueError()
-    for kind in KINDS:
-        part = stored.get(kind)
-        if part is not None and (not isinstance(part, dict) or not isinstance(part.get('text', ''), str)):
-            raise ValueError()
-    return stored
+def _bodies(text):
+    """The spoken or written words of a stored part, one string per line, as the store's index sees them: a transcript
+    line is a JSON utterance object (its `text` or `content`), a summary line a `{type, text}` object, any other line
+    itself. Used in memory to pick a query word; nothing here is kept or returned."""
+    out = []
+    for line in text.split('\n'):
+        body = line
+        if line.startswith('{'):
+            try:
+                row = json.loads(line)
+            except (ValueError, RecursionError):
+                row = None
+            if isinstance(row, dict):
+                body = row.get('text', row.get('content')) if isinstance(row.get('text', row.get('content')), str) else ''
+        out.append(body)
+    return out
 
 
 def readback(path):
-    """A search and a context read on the decrypted archive. The full-text index answers a synthetic query, and for
-    the newest records that hold accepted text (not skipped or awaiting the indexer) the index must have their row and
-    find one of its own words for that very record: an archive whose text survived but whose index was emptied fails.
+    """A search and a context read on the decrypted archive. The full-text index answers a synthetic query, and for the
+    three newest records that hold accepted text (chosen before the sample limit; not skipped or awaiting the indexer)
+    a word taken from the record's own stored text must be found by the index in that record's own transcript or
+    summary column: an archive whose text survived but whose index was emptied, or indexes something else, fails.
     The words are compared in memory only; nothing read is kept, returned or put in a message."""
     try:
         db = _connect(path)
@@ -170,19 +177,29 @@ def readback(path):
             db.execute('SELECT count(*) FROM ' + table + ' WHERE ' + table + ' MATCH ?', ('deedkitsyntheticprobe',)).fetchone()
             names = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             skip = ''.join(' AND ref NOT IN (SELECT ref FROM ' + name + ')' for name in ('index_skips', 'index_dirty') if name in names)
-            for ref, raw in db.execute('SELECT ref,parts FROM records WHERE 1=1' + skip + ' ORDER BY rowid DESC LIMIT 3').fetchall():
-                stored = _readable(raw)
-                if not any(isinstance(stored.get(kind), dict) and stored[kind].get('text') for kind in KINDS):
-                    continue
-                row = db.execute('SELECT title,transcript,summary FROM ' + table + ' WHERE ref=?', (ref,)).fetchone()
-                if row is None:
+            cursor = db.execute(
+                'SELECT ref,parts FROM records WHERE CASE WHEN json_valid(parts) THEN '
+                "(COALESCE(json_extract(parts,'$.transcript.text'),'')<>'' OR COALESCE(json_extract(parts,'$.summary.text'),'')<>'') "
+                'ELSE 1 END' + skip + ' ORDER BY rowid DESC LIMIT 3')
+            for ref, raw in cursor.fetchall():
+                stored = json.loads(raw)
+                if not isinstance(stored, dict):
                     raise ValueError()
-                word = re.search(r'[^\W_]{4,}', ' '.join(item or '' for item in row))
-                if word is None:
-                    continue
-                found = db.execute('SELECT count(*) FROM ' + table + ' WHERE ' + table + ' MATCH ? AND ref=?',
-                                   ('"' + word.group(0) + '"', ref)).fetchone()[0]
-                if found < 1:
+                candidates = []
+                for kind in KINDS:
+                    part = stored.get(kind)
+                    if part is not None and (not isinstance(part, dict) or not isinstance(part.get('text', ''), str)):
+                        raise ValueError()
+                    for body in _bodies(part.get('text', '')) if isinstance(part, dict) else ():
+                        candidates += [(kind, word) for word in re.findall(r'[^\W_]{4,}', body)[:3]]
+                if not candidates:
+                    continue  # only short words: nothing to query by
+                for kind, word in candidates[:6]:
+                    found = db.execute('SELECT count(*) FROM ' + table + ' WHERE ' + table + ' MATCH ? AND ref=?',
+                                       (kind + ' : "' + word + '"', ref)).fetchone()[0]
+                    if found:
+                        break
+                else:
                     raise ValueError()
         finally:
             db.close()
@@ -219,7 +236,7 @@ def synthetic_archive(path, records=None, *, archive_id=SYNTHETIC_ARCHIVE_ID, in
         db.execute('INSERT INTO records(ref,namespace,provider_id,metadata,parts,revision) VALUES(?,?,?,?,?,?)',
                    (item['ref'], namespace, item['provider_id'], '{}', json.dumps(parts), item.get('revision', 1)))
         db.execute('INSERT INTO texts4(ref,namespace,title,transcript,summary) VALUES(?,?,?,?,?)',
-                   (item['ref'], namespace, '', item.get('transcript', ''), item.get('summary', '')))
+                   (item['ref'], namespace, '', '\n'.join(_bodies(item.get('transcript', ''))), '\n'.join(_bodies(item.get('summary', '')))))
     db.executemany('INSERT INTO events(ref) VALUES(?)', [(None,)] * (len(records) if events is None else events))
     db.executemany('INSERT INTO meta VALUES(?,?)', [('archive_id', archive_id), ('incarnation', incarnation),
                                                     ('journal_id', 'journal-synthetic')])

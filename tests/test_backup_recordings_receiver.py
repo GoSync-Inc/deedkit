@@ -168,6 +168,31 @@ def test_a_readback_fails_when_the_text_survived_but_its_index_was_emptied(tmp_p
 
 
 # spec: ANYM-728
+@pytest.mark.parametrize('case', ['empty_row', 'unrelated_title', 'metadata_only_records_newer'])
+def test_a_readback_cannot_be_satisfied_by_an_empty_row_a_title_or_newer_records_without_text(tmp_path, case):
+    import sqlite3
+    records = [rec(1)] + ([rec(i, transcript='', summary='') for i in range(2, 6)] if case == 'metadata_only_records_newer' else [])
+    path = archive(tmp_path, records, case)
+    db = sqlite3.connect(path)
+    db.execute('DELETE FROM texts4')
+    if case == 'empty_row':
+        db.execute("INSERT INTO texts4(ref,namespace,title,transcript,summary) VALUES('r0001','omi:synthetic','','','')")
+    if case == 'unrelated_title':
+        db.execute("INSERT INTO texts4(ref,namespace,title,transcript,summary) VALUES('r0001','omi:synthetic','synthetic words','','')")
+    db.commit()
+    db.close()
+    with pytest.raises(ValueError, match='readback_failed'):
+        cont.readback(path)
+
+
+# spec: ANYM-728
+def test_a_readback_finds_the_words_of_a_real_shaped_transcript_and_ignores_short_words(tmp_path):
+    lines = '\n'.join(json.dumps({'speaker': 'A', 'text': text}) for text in ('ok hi', 'planning the quarterly review'))
+    path = archive(tmp_path, [rec(1, transcript=lines), rec(2, transcript='ok hi', summary='')])
+    cont.readback(path)
+
+
+# spec: ANYM-728
 def test_record_identities_must_be_unambiguous_so_a_tombstone_authorizes_one_record(tmp_path):
     facts = facts_of(tmp_path, [rec(1), rec(2)])
     other = tomb(2)
@@ -688,3 +713,35 @@ def test_a_recordings_refusal_never_fails_or_rotates_messaging_or_calendar_and_t
     s.engine.records = [rec(1), rec(2), rec(3)]
     assert Path(s.messaging['protected_file']).read_bytes() == messaging_marker
     assert v.run(s.recordings, client=s.recordings_cloud, engine=s.engine)['backup_id'] == THIRD
+
+
+# spec: ANYM-728
+def test_rollback_with_a_pending_recordings_bundle_and_a_protected_point_keeps_a_reader_for_existing_bundles(follower, trio, recordings_instance):  # noqa: F811
+    from test_backup_r2 import receive, THIRD
+    s, t = follower, trio
+    path, recordings, messaging, write_json, cloud = recordings_instance
+    write_json(s.v.INSTANCES_FILE, {'v': 1, 'verifier_configs': [str(messaging), str(path)]})
+    # A protected recordings point, then a pending (uploaded, unverified) bundle.
+    assert t.v.run(t.recordings, client=cloud, engine=t.engine)['status'] == 'verified'
+    marker = Path(t.recordings['protected_file']).read_bytes()
+    receive(r2.load_config(t.recordings['receiver_config_file']), cloud, bid=THIRD)
+    assert s.run()['status'] == 'switched'
+    assert [(c['helper_image'], c['helper_revision']) for c in map(s.v.load_config, (messaging, path))] == [(NEW_IMAGE, HEAD)] * 2
+    # The kept helper cannot read the recordings bundle: the rollback holds every pin and the point is untouched.
+    s.calendar_failure = RuntimeError('kept helper predates the recordings profile')
+    with pytest.raises(RuntimeError, match='recordings_helper_failed'):
+        s.revert()
+    assert [(c['helper_image'], c['helper_revision']) for c in map(s.v.load_config, (messaging, path))] == [(NEW_IMAGE, HEAD)] * 2
+    assert Path(t.recordings['protected_file']).read_bytes() == marker
+    # The reader that stays can still verify the pending bundle, which then replaces the protected point.
+    t.engine.records = [rec(1), rec(2), rec(3)]
+    assert t.v.run(s.v.load_config(path), client=cloud, engine=t.engine)['backup_id'] == THIRD
+    assert Path(t.recordings['protected_file']).read_bytes() != marker
+    # A rollback that the kept helper passes moves every pin back, and the rolled-back reader verifies the next bundle.
+    s.calendar_failure = None
+    assert s.revert()['status'] == 'reverted'
+    rolled_back = s.v.load_config(path)
+    assert (rolled_back['helper_image'], rolled_back['helper_revision']) == (t.recordings['helper_image'], t.recordings['helper_revision'])
+    receive(r2.load_config(t.recordings['receiver_config_file']), cloud, bid='20261016T111703Z-2123456789abcdef')
+    t.engine.records = [rec(1), rec(2), rec(3), rec(4)]
+    assert t.v.run(rolled_back, client=cloud, engine=t.engine)['status'] == 'verified'
