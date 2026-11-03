@@ -3444,7 +3444,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "Inspect bounded durable matches after an event ID; no consumer ACK or push.\n\nSave the returned next boundary locally to page; no server progress is advanced.\nMessage/original/text/transcript/description readiness are separate event kinds.\nExact event revision and artifact references remain distinct from current content.\nAn empty page with a lagging/paused matcher or a gap does not prove no new data.\nMatching and live provider freshness are separate; get_sync_status checks chats.\n",
+      "description": "Inspect bounded durable matches after an event ID; no consumer ACK or push.\n\nSave the returned next boundary locally to page; no server progress is advanced.\nMessage/original/text/transcript/description readiness are separate event kinds.\nExact event revision and artifact references remain distinct from current content.\nAn empty page with a lagging/paused matcher or a gap does not prove no new data.\nMatching and live provider freshness are separate; get_sync_status checks chats.\nEach item has sent_at (provider), observed_at (journal commit), matched_at and delivered_at (null until a hint\ncovering it was delivered).\n",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -4023,7 +4023,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "List your own endpoint's latest delivery attempts, newest first: time, hint and subscription IDs, attempt number, outcome (delivered, retry, dead_letter, cancelled, paused), HTTP status or error code, latency_ms.\n\nRequires read + explicit delivery-write. Kept 7 days; no response body, header value or URL. Pass the\nprevious page's next_before as before for older attempts.\n",
+      "description": "List your own endpoint's latest delivery attempts, newest first: time, hint and subscription IDs, attempt number, outcome (delivered, retry, dead_letter, cancelled, paused), HTTP status or error code, latency_ms, hint_created_at and hint_admitted_at (null once the hint was pruned).\n\nRequires read + explicit delivery-write. Kept 7 days; no response body, header value or URL. Pass the\nprevious page's next_before as before for older attempts.\n",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {

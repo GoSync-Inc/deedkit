@@ -557,7 +557,7 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
             'consumption': 'passive_read_no_ack', 'scope_masked': False, **modules})
     # ANYM-522: a dynamic definition returns only references the key can see now.
     where, args = visible_filter(row, p, 'sm')
-    events = c.execute('''SELECT e.id,e.kind,e.origin,e.revision,e.created_at,''' +
+    events = c.execute('''SELECT e.id,e.kind,e.origin,e.revision,e.created_at,sm.matched_at,''' +
         ('sm.own_send_reply' if dynamic(row) else 'false AS own_send_reply') + ''',
         jsonb_strip_nulls(jsonb_build_object(
             'message',e.snapshot->'message','account',e.snapshot->'account','chat',e.snapshot->'chat',
@@ -575,11 +575,31 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
         (row['id'], after, *args, limit + 1)).fetchall()
     fields = ('message', 'account', 'chat', 'sender', 'provider_id', 'revision', 'sent_at',
         'direction', 'deleted', 'processing', 'metadata', 'reply_evidence', 'send_id', 'error_code', 'status')
+    # ANYM-734: delivered_at is when the earliest delivered events hint covering the event finished. Retention deletes
+    # finished hints as a prefix up to hints_deleted_through: for an event at or below it the first covering hint may be
+    # gone, so the time is unknown (null), never the next hint's. One read per page, no per-row query.
+    delivered = c.execute('''SELECT through_position,finished_at FROM subscription_outbox WHERE subscription=%s
+        AND kind='events' AND state='delivered' AND through_position>=%s''',
+        (row['id'], events[0]['id'])).fetchall() if events else []
+    pruned_through = row.get('hints_deleted_through') or 0
+    # Retention deletes only finished hints older than the cutoff, and a hint covering an event is created after the
+    # event matched. An event matched at or after (last deletion - retention days) can therefore have lost none of its
+    # covering hints, whatever states and positions the kept hints have; an older one may have lost its first (a batch
+    # limit can take one of several hints at a position and leave hints_deleted_through unmoved): unknown.
+    cutoff = row['hints_deleted_at'] - timedelta(days=CLOSED_RETENTION_DAYS) if row.get('hints_deleted_at') else None
+
+    def delivered_at(event):
+        if event['id'] <= pruned_through or (cutoff is not None and event['matched_at'] < cutoff):
+            return None
+        return min((hint['finished_at'] for hint in delivered
+            if hint['through_position'] >= event['id'] and hint['finished_at']), default=None)
+
     seen = [seen_origin(row['selector']['origins'], event['origin'], event['kind'], event['snapshot'].get('sent_at'),
         event['created_at']) for event in events[:limit]]
     items = [{**{key: event['snapshot'][key] for key in fields if key in event['snapshot']},
         'event_id': event['id'], 'kind': event['kind'], 'origin': origin,
         'revision': event['revision'], 'observed_at': event['created_at'],
+        'matched_at': event['matched_at'], 'delivered_at': delivered_at(event),
         'historical': origin in ('backfill', 'reconcile'),
         'matching_basis': 'exact_event_revision'} for event, origin in zip(events, seen)]
     from .subscription_consumption import wake_reason

@@ -148,6 +148,42 @@ an unconditional model turn. Batch delivery groups references; it does not run a
 summarizer in the core. A batch must flush at its maximum wait even under a
 continuous message stream.
 
+### Where the time goes (ANYM-734)
+
+These are design bounds read from the code, not an SLA. A message passes these
+stages in order, and `get_subscription_events` shows where it was at each:
+
+| Stage | Field | Normal cost |
+| --- | --- | --- |
+| The provider sends it | `sent_at` | The provider's own time |
+| The collector captures it and the journal commits it | `observed_at` | Spool drained every 250 ms; up to 30 s more under a burst (COLLECTORS.md) |
+| The matcher matches it | `matched_at` | Polls every 2 s |
+| The hint policy releases the hint | `get_subscription` `delivery.held_reason`, `next_hint_at` | None without a policy; the holds below apply with or without one |
+| The dispatcher posts it | `delivered_at` (first delivered hint covering the event) | A lane polls every 2 s; the POST times out after 5 s |
+
+`delivered_at` is null until a hint covering the event is delivered. It is also null for
+an event at or below `hints_deleted_through`, and for an event matched more than 30 days
+before the last retention deletion of finished hints, because its first covering hint may be
+gone (it never shows a later hint's time instead). A test hint or a dead-lettered one never sets it.
+What can add more than a few seconds:
+
+- Hint policy, visible in `get_subscription` as `delivery.held_reason` and `next_hint_at`:
+  `debounce_s` waits for a quiet gap, `batch_window_s` for its window, `batch_count` for
+  its count; `max_wait_s` caps `debounce_s` and is the timeout of a `batch_count` without a
+  `batch_window_s` (with both, the window ends the wait unless the count comes first), and
+  defaults to 300 s (or `debounce_s` if larger) whenever `debounce_s` or `batch_count` is set. Quiet hours hold a due hint to the window end.
+  The policy's hourly budget (20 hints per key, `SUBSCRIPTION_MAX_HINTS_PER_HOUR`) holds it
+  to the next slot, and a self-service key with 32 queued hints holds the next one for a
+  minute; both read `held_reason: budget`.
+- Dispatcher admission, with or without a policy: the first POST of a hint takes one slot of the
+  key's rolling hour (the same 20) and, for a self-service endpoint, one of its host's
+  (100 per hour, `DELIVERY_MAX_HINTS_PER_HOST_PER_HOUR`). These holds keep the hint `pending` in the outbox and are not in `get_subscription`
+  until it is admitted: `list_delivery_attempts` then shows `hint_created_at` and
+  `hint_admitted_at`, the wait.
+- Retries after a failed attempt: 2, 4, 8, 16, 32, 64 and 128 s, or the receiver's
+  `Retry-After` (up to an hour), over at most 8 attempts; each attempt is a row with `at`
+  and `latency_ms`. Attempts are kept 7 days.
+
 ## Schema 32: explicit consumption and registered hints
 
 Schema 32 adds independent subscription consumption. `fetch_subscription_events`
@@ -747,7 +783,8 @@ budget, an expired module event, an auto-pause). `list_delivery_attempts(endpoin
 limit<=50, before?)` returns the key's own rows newest first: `attempt_id`, `at`, `hint_id`,
 `subscription_id`, `attempt` (the hint's attempt number), `outcome` (`delivered`, `retry`,
 `dead_letter`, `cancelled`, `paused`), `http_status` when the receiver answered,
-`error_code` and `latency_ms`. Error codes name the failure, never its text: `timeout`,
+`error_code`, `latency_ms`, and `hint_created_at` and `hint_admitted_at` (when the hint
+was queued and when the dispatcher admitted it; null once the hint was pruned). Error codes name the failure, never its text: `timeout`,
 `tls`, `connect`, `dns_unsafe`, `dns_unavailable`, `egress_unavailable`,
 `invalid_response`, `redirect`, or the hint's own code (`vendor_refused`,
 `outcome_unknown`, `receiver_status`, `delivery_budget_exhausted`, ...). No response body,

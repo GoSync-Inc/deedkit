@@ -157,6 +157,113 @@ def test_signed_opaque_hints_retry_and_do_not_ack_events(seeded, tmp_path):
     assert not call(store, token, 'fetch_subscription_events', sid).get('acked')
 
 
+# spec: ANYM-734
+def test_event_items_show_when_they_were_matched_and_delivered(seeded, tmp_path):
+    from datetime import datetime
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    token = identity(store)
+    sid = subscription(store, token)
+    rid, _ = receiver(store, token, tmp_path)
+    call(store, token, 'configure_subscription_delivery', sid, 1, rid)
+    first = emit(store)
+    match_subscriptions(store)
+    item = store.get_subscription_events(token, sid)['items'][0]
+    assert item['event_id'] == first and item['matched_at'] and item['delivered_at'] is None
+    assert dispatch_hints(store, transport=lambda *a, **k: 204, resolver=lambda *a, **k: ['93.184.216.34'])['delivered'] == 1
+    item = store.get_subscription_events(token, sid)['items'][0]
+    stages = [datetime.fromisoformat(item[name]) for name in ('sent_at', 'observed_at', 'matched_at', 'delivered_at')]
+    assert stages == sorted(stages) and item['delivered_at'] > item['matched_at']
+    # A later event is not covered by that hint; a dead-lettered hint and a delivered test hint never set the time.
+    second = emit(store)
+    match_subscriptions(store)
+    with store.pool.connection() as c:
+        c.execute("""INSERT INTO subscription_outbox(subscription,subscription_version,receiver,through_position,kind,
+            request_id,state,finished_at) VALUES(%s,1,%s,%s,'test','synthetic-test','delivered',clock_timestamp())""",
+            (sid, rid, second))
+        c.execute("""UPDATE subscription_outbox SET state='dead_letter',finished_at=clock_timestamp()
+            WHERE subscription=%s AND kind='events' AND state='pending'""", (sid,))
+    later = [i for i in store.get_subscription_events(token, sid)['items'] if i['event_id'] == second][0]
+    assert later['matched_at'] and later['delivered_at'] is None
+    # Another credential of the same principal still cannot read the subscription.
+    with pytest.raises(APIError, match='not_found'):
+        store.get_subscription_events(identity(store), sid)
+
+
+# spec: ANYM-734
+def test_delivered_at_is_unknown_once_retention_removed_the_first_hint_that_covered_the_event(seeded, tmp_path):
+    from messaging_service import subscription_retention
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    token = identity(store)
+    sid = subscription(store, token)
+    rid, _ = receiver(store, token, tmp_path)
+    call(store, token, 'configure_subscription_delivery', sid, 1, rid)
+    ids = []
+    for _ in range(2):
+        ids.append(emit(store))
+        match_subscriptions(store)
+        assert dispatch_hints(store, transport=lambda *a, **k: 204,
+            resolver=lambda *a, **k: ['93.184.216.34'])['delivered'] == 1
+    first, second = ids
+    times = {i['event_id']: i['delivered_at'] for i in store.get_subscription_events(token, sid)['items']}
+    assert times[first] and times[second] and times[first] <= times[second]
+    # Retention removes the oldest finished hint (the one that first covered `first`) and keeps the next one,
+    # which also covers `first`: the answer for `first` becomes unknown, not the later hint's time.
+    with store.pool.connection() as c:
+        row = c.execute('SELECT * FROM subscriptions WHERE id=%s', (sid,)).fetchone()
+        assert subscription_retention._delete_hints(c, row, 1) == 1
+    after = {i['event_id']: i['delivered_at'] for i in store.get_subscription_events(token, sid)['items']}
+    assert after[first] is None and after[second] == times[second]
+
+
+# spec: ANYM-734
+@pytest.mark.parametrize('twin_state', ['delivered', 'cancelled', 'dead_letter'])
+def test_delivered_at_is_unknown_when_a_batch_limit_removed_one_of_two_hints_at_the_same_position(
+        seeded, tmp_path, twin_state):
+    from messaging_service import subscription_retention
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    token = identity(store)
+    sid = subscription(store, token)
+    rid, _ = receiver(store, token, tmp_path)
+    call(store, token, 'configure_subscription_delivery', sid, 1, rid)
+    ids = []
+    for _ in range(2):
+        ids.append(emit(store))
+        match_subscriptions(store)
+        assert dispatch_hints(store, transport=lambda *a, **k: 204,
+            resolver=lambda *a, **k: ['93.184.216.34'])['delivered'] == 1
+    first, second = ids
+    with store.pool.connection() as c:
+        # A second finished hint at the first event's position (an endpoint resume writes one), in any final state.
+        c.execute("""INSERT INTO subscription_outbox(subscription,subscription_version,receiver,through_position,kind,
+            request_id,state,attempts,created_at,admitted_at,finished_at)
+            SELECT subscription,subscription_version,receiver,through_position,kind,'synthetic-twin',%s,attempts,
+                created_at,admitted_at,finished_at FROM subscription_outbox
+            WHERE subscription=%s AND kind='events' AND through_position=%s""", (twin_state, sid, first))
+        pair = [r['id'] for r in c.execute("SELECT id FROM subscription_outbox WHERE subscription=%s AND kind='events' "
+            "AND through_position=%s ORDER BY id", (sid, first)).fetchall()]
+        # The world is 45 days old at that position: the event matched, and its two hints finished (41 and 40 days ago).
+        # The lower ID, the first to be deleted, is the delivered one when the twin is not.
+        for days, hint in zip((41, 40), pair):
+            c.execute("UPDATE subscription_outbox SET finished_at=clock_timestamp()-make_interval(days=>%s) WHERE id=%s",
+                (days, hint))
+        c.execute("UPDATE subscription_outbox SET state='delivered' WHERE id=%s", (pair[0],))
+        c.execute("UPDATE subscription_outbox SET state=%s WHERE id=%s", (twin_state, pair[1]))
+        c.execute("UPDATE subscription_matches SET matched_at=clock_timestamp()-interval '45 days' WHERE event=%s", (first,))
+    times = {i['event_id']: i['delivered_at'] for i in store.get_subscription_events(token, sid)['items']}
+    assert times[first] and times[second]
+    # Retention takes one hint per batch, the lower ID; its twin stays, so the visibility floor does not move.
+    with store.pool.connection() as c:
+        row = c.execute('SELECT * FROM subscriptions WHERE id=%s', (sid,)).fetchone()
+        assert subscription_retention._delete_hints(c, row, 1, days=30) == 1
+        assert c.execute('SELECT hints_deleted_through AS t FROM subscriptions WHERE id=%s', (sid,)).fetchone()['t'] == 0
+    after = {i['event_id']: i['delivered_at'] for i in store.get_subscription_events(token, sid)['items']}
+    # Never the later hint's time: the first delivery of `first` is gone; `second` matched after the cutoff.
+    assert after[first] is None and after[second] == times[second]
+
+
 def test_receiver_validation_and_revocation_fail_closed(seeded, tmp_path):
     from messaging_service.event_delivery import validate_endpoint, dispatch_hints
     for endpoint, addresses in [('http://example.com/wake', ['93.184.216.34']),
