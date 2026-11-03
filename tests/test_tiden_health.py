@@ -526,6 +526,7 @@ def test_a_suite_with_rows_and_no_active_case_fails_as_not_reporting(repo, serve
     ("", "s:tests.test_webrtc::test_a", "calls"),
     ("", "s:tests.test_other::test_a", "unassigned"),
     ("services/gateway/tests/test_a.py", "", "gateway"),
+    ("services/inference/tests/test_a.py", "", "inference"),
     ("whatsapp/whatsmeow/send_test.go", "", "whatsmeow-go"),
     ("send_test.go", "", "whatsmeow-go"),
     ("internal/send_test.go", "", "unassigned"),
@@ -547,6 +548,16 @@ def test_wake_relay_cases_belong_to_the_npm_suite_that_runs_them():
 # spec: ANYM-360
 def test_shared_contract_package_cases_belong_to_their_own_suite():
     assert suite({"filePath": "packages/platform-contracts/tests/test_agent.py", "externalId": ""}) == "platform-contracts"
+
+
+# spec: ANYM-360
+def test_inference_service_cases_belong_to_their_own_suite_and_are_not_unassigned(repo, server):
+    assert suite({"filePath": "services/inference/tests/test_admission.py", "externalId": ""}) == "inference"
+    _, b = history(repo)
+    server.world(b, cases=[case("c1"), case("inf", "services/inference/tests/test_admission.py")])
+    metric = measure(repo, server, b)[1]["metrics"]["unlinked_tests"]
+    assert metric["state"] == PASS and metric["numbers"]["suites"]["inference"]["active"] == 1
+    assert metric["numbers"]["suites"]["unassigned"]["cases"] == 0
 
 
 # Stale anchors.
