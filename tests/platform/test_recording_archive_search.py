@@ -174,6 +174,67 @@ def test_metadata_only_change_updates_title_index_atomically_without_text_event(
 
 
 # spec: ANYM-652
+def test_hit_order_cannot_be_changed_by_documents_of_forbidden_accounts(tmp_path):
+    """bm25() uses statistics of the whole FTS table: a hidden document containing only one of the query words used to flip
+    which permitted hit came first. The order now depends on the permitted rows alone."""
+    async def run():
+        async with seeded(tmp_path) as (app, client, _, doc, _):
+            allowed, hidden = doc['accounts'][0], doc['accounts'][1]
+            archive = app.state.archive
+            for name, text in [('first', 'alpha alpha alpha beta'), ('second', 'alpha beta beta beta')] + [(f'n{i}', 'neutral words') for i in range(10)]:
+                await archive.db('discover', allowed, [{'id': name}], None, 100)
+                await archive.db('observe', allowed, name, {'id': name}, {'transcript': ('available', text, None)}, 101)
+            async def first(limit=1):
+                response = await client.post('/v1/search', json={'account': 'omi-a', 'query': 'alpha beta', 'limit': limit})
+                assert response.status_code == 200, response.text
+                return [item['provider_recording_id'] for item in response.json()['items']]
+            baseline = await first(), await first(2)
+            for index, text in enumerate(['alpha', 'beta', 'alpha beta alpha beta', 'beta beta beta beta']):
+                name = f'hidden-{index}'
+                await archive.db('discover', hidden, [{'id': name}], None, 100)
+                await archive.db('observe', hidden, name, {'id': name}, {'transcript': ('available', text, None)}, 101)
+                assert (await first(), await first(2)) == baseline, text
+            assert len(baseline[1]) == 2
+    asyncio.run(run())
+
+
+# spec: ANYM-652
+def test_a_title_hit_ranks_before_summary_and_transcript_hits(tmp_path):
+    async def run():
+        async with seeded(tmp_path) as (app, client, _, doc, _):
+            account, archive = doc['accounts'][0], app.state.archive
+            for name, item, parts in [('in-transcript', {'id': 'in-transcript'}, {'transcript': ('available', 'comet', None)}),
+                                      ('in-summary', {'id': 'in-summary'}, {'summary': ('available', 'comet', None)}),
+                                      ('in-title', {'id': 'in-title', 'title': 'comet'}, {'transcript': ('available', 'plain', None)})]:
+                await archive.db('discover', account, [item], None, 100)
+                await archive.db('observe', account, name, item, parts, 101)
+            response = await client.post('/v1/search', json={'account': 'omi-a', 'query': 'comet'})
+            assert [item['provider_recording_id'] for item in response.json()['items']] == ['in-title', 'in-summary', 'in-transcript']
+    asyncio.run(run())
+
+
+# spec: ANYM-652
+def test_plaud_recording_names_are_indexed_returned_and_rebuilt_as_titles(tmp_path):
+    async def run():
+        async with seeded(tmp_path) as (app, _, _, doc, _):
+            plaud, archive = doc['accounts'][1], app.state.archive
+            item = {'id': 'file-a', 'name': 'Telescope', 'duration': 12}  # the PLAUD metadata adapter retains `name`
+            await archive.db('discover', plaud, [item], None, 100)
+            await archive.db('observe', plaud, 'file-a', item, {'transcript': ('available', 'plain text', None)}, 101)
+            async def titles():
+                return [hit['title'] for hit in await archive.db('search', plaud, '"Telescope"', 5)]
+            assert await titles() == ['Telescope']
+            # A schema-1 archive is rebuilt from the retained metadata: the name is indexed again.
+            await archive.close()
+            db_path = Path(doc['archive']['directory']) / 'archive.sqlite'
+            with sqlite3.connect(db_path) as db:
+                db.executescript("DROP TABLE texts; CREATE VIRTUAL TABLE texts USING fts5(ref UNINDEXED, namespace UNINDEXED, transcript, summary, tokenize='unicode61'); PRAGMA user_version=1;")
+            await archive.start(background=False)
+            assert await titles() == ['Telescope']
+    asyncio.run(run())
+
+
+# spec: ANYM-652
 def test_version_one_archive_index_upgrades_without_rewriting_records_and_backups(tmp_path):
     async def run():
         async with seeded(tmp_path) as (app, client, _, doc, refs):

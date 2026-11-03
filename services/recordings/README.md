@@ -329,7 +329,7 @@ token and make no provider, model or embedding request.
   with AND. Operators, column selectors and wildcards are not an FTS language
   exposed to the caller. Returns at most 50 hits with a snippet of at most
   320 characters, stable `recording_ref`, revision and per-part digest,
-  freshness and attempt state. Ranking uses SQLite bm25. No total count or
+  freshness and attempt state. Order is a title hit, then a summary hit, then a transcript hit, then the newer revision (no corpus statistics, so other accounts cannot influence it). No total count or
   cross-account search is returned. This is lexical search over observed local
   text; an empty result is not proof of vendor history completeness.
 - `recordings_context({account, recording_ref, kind: "transcript", page_chars: 4000})`:

@@ -37,11 +37,20 @@ BEGIN IMMEDIATE;
 DROP TABLE texts;
 CREATE VIRTUAL TABLE texts USING fts5(ref UNINDEXED, namespace UNINDEXED, title, transcript, summary, tokenize='unicode61');
 INSERT INTO texts(ref,namespace,title,transcript,summary)
- SELECT ref,namespace,COALESCE(json_extract(metadata,'$.title'),''),
+ SELECT ref,namespace,COALESCE(NULLIF(json_extract(metadata,'$.title'),''),json_extract(metadata,'$.name'),''),
  COALESCE(json_extract(parts,'$.transcript.text'),''),COALESCE(json_extract(parts,'$.summary.text'),'') FROM records;
 PRAGMA user_version=2;
 COMMIT;
 '''
+
+
+def title_of(metadata):
+    """The recording title both providers retain: Omi `title`, PLAUD `name`. Text only, never a non-string value."""
+    for key in ('title', 'name'):
+        value = metadata.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ''
 
 
 def namespace(account):
@@ -210,7 +219,7 @@ class Store:
                 db.execute('INSERT INTO records(ref,namespace,provider_id,metadata,parts) VALUES(?,?,?,?,?)',
                     (ref, ns, item['id'], canonical(item).decode(), '{}'))
                 db.execute('INSERT INTO texts(ref,namespace,title,transcript,summary) VALUES(?,?,?,?,?)',
-                           (ref, ns, item.get('title', ''), '', ''))
+                           (ref, ns, title_of(item), '', ''))
             db.execute('UPDATE accounts SET checkpoint=?,error=NULL WHERE namespace=?',
                        (canonical(checkpoint).decode(), ns))
         self.write(change, guard)
@@ -280,7 +289,7 @@ class Store:
             if usable_change or body != row['metadata']:
                 db.execute('DELETE FROM texts WHERE ref=?', (row['ref'],))
                 db.execute('INSERT INTO texts(ref,namespace,title,transcript,summary) VALUES(?,?,?,?,?)',
-                    (row['ref'], ns, metadata.get('title', ''), parts.get('transcript', {}).get('text', ''), parts.get('summary', {}).get('text', '')))
+                    (row['ref'], ns, title_of(metadata), parts.get('transcript', {}).get('text', ''), parts.get('summary', {}).get('text', '')))
             if usable_change:
                 db.execute('INSERT INTO events(event_id,namespace,ref,revision,occurred) VALUES(?,?,?,?,?)',
                            (uuid.uuid4().hex, ns, row['ref'], revision, now))
@@ -306,13 +315,20 @@ class Store:
         with self.connection() as db:
             # FTS MATCH narrows by indexed terms; both sides of the join retain
             # the current namespace. Never materialize accepted text for all hits.
+            # The order must not depend on other namespaces: bm25() uses statistics of the whole FTS table, so a document
+            # of a forbidden account could change which permitted hit comes first. The rank here is a title hit, then a
+            # summary hit, then a transcript hit, then the newer revision, then the reference: each fact is a property of the
+            # row itself (MATCH membership), never a corpus statistic.
             rows = db.execute('''SELECT r.ref,r.provider_id,r.revision,
-                substr(COALESCE(json_extract(r.metadata,'$.title'),''),1,256) AS title,
+                substr(COALESCE(NULLIF(json_extract(r.metadata,'$.title'),''),json_extract(r.metadata,'$.name'),''),1,256) AS title,
                 json_remove(r.parts,'$.transcript.text','$.summary.text') AS evidence,
                 substr(snippet(texts,-1,'[',']','…',32),1,320) AS snippet
                 FROM texts JOIN records r ON r.ref=texts.ref
                 WHERE texts MATCH ? AND texts.namespace=? AND r.namespace=?
-                ORDER BY bm25(texts,0,0,5,1,2),r.ref LIMIT ?''', (expression, ns, ns, limit))
+                ORDER BY CASE WHEN r.ref IN (SELECT ref FROM texts WHERE texts MATCH ? AND namespace=?) THEN 0
+                              WHEN r.ref IN (SELECT ref FROM texts WHERE texts MATCH ? AND namespace=?) THEN 1 ELSE 2 END,
+                         r.revision DESC, r.ref LIMIT ?''',
+                (expression, ns, ns, f'title : ({expression})', ns, f'summary : ({expression})', ns, limit))
             return [{'recording_ref': row['ref'], 'provider_recording_id': row['provider_id'],
                      'revision': row['revision'], 'title': row['title'], 'snippet': row['snippet'],
                      'parts': loads(row['evidence'])} for row in rows]
