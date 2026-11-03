@@ -1,7 +1,8 @@
 {
   "modules": [
     {"source": "deedkit:calls", "url": "http://calls:13842", "token_file": "/run/secrets/module-tokens/calls"},
-    {"source": "deedkit:calendar", "url": "http://calendar-api:13232", "token_file": "/run/secrets/module-tokens/calendar"}
+    {"source": "deedkit:calendar", "url": "http://calendar-api:13232", "token_file": "/run/secrets/module-tokens/calendar"},
+    {"source": "deedkit:recordings", "url": "http://recordings-api:13234", "token_file": "/run/secrets/module-tokens/recordings"}
   ],
   "timeout_s": 5,
   "interval_s": 5

@@ -16,6 +16,10 @@ services:
       recordings-backend:
         aliases: [recordings-api]
       recordings-egress: {}
+      # ANYM-732: shared only with the module event router (an internal network, no route out). Needed once the router
+      # reads the feed; create it before the first deploy of this file (production.md, "Module event router").
+      recordings-router:
+        aliases: [recordings-api]
     # Docker's embedded resolver then queries this server from the container's own namespace, where the bridge rules apply
     # (without it the host's resolvers are queried from the host namespace, outside them). The same address the host rules
     # allow (RECORDINGS_RESOLVER in the host env file).
@@ -71,6 +75,11 @@ networks:
   recordings-backend:
     external: true
     name: ${RECORDINGS_BACKEND_NETWORK:-deedkit-recordings-backend}
+  # Created once by hand: docker network create --internal -o com.docker.network.bridge.name=dk-recrouter0
+  #   -o com.docker.network.bridge.gateway_mode_ipv4=isolated deedkit-recordings-router
+  recordings-router:
+    external: true
+    name: ${RECORDINGS_ROUTER_NETWORK:-deedkit-recordings-router}
   recordings-egress:
     driver: bridge
     enable_ipv6: false

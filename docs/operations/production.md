@@ -1032,6 +1032,32 @@ tokens (secrets and access) and the link grants (ANYM-564). The agent prepares e
    `module_source_health`.
 5. Link grants (ANYM-564) and the gateway profile switch: owner steps of those cards; without a
    link no subscription has a module source and published events wake nobody.
+6. Recordings source (ANYM-732; ships disabled, planned here and read back in ANYM-653's evidence). It needs schema 67 (hand
+   release 067: SUBSCRIPTIONS.md "Recordings source"; `receiver_schema_max` and the backup and restore runtimes at 67 first) and
+   the recordings feed (ANYM-726: `event_router` in the recordings configuration, its SHA-256 and expiry). Steps, none during an
+   active call:
+   a. Token: a random value in `private/event-router-tokens/recordings` (0600, uid 10001); its SHA-256 goes into
+      `event_router.key_sha256` of the recordings configuration (an atomic replace inside the private directory; the service
+      re-reads it). Never the value into Git, a log or a chat.
+   b. Network, once, before the recordings container is deployed from `compose.recordings.yaml` of this change or the router is
+      started with the new overlay: `docker network create --internal -o com.docker.network.bridge.name=dk-recrouter0 -o com.docker.network.bridge.gateway_mode_ipv4=isolated deedkit-recordings-router`.
+      Internal, no host address, no route out, no IPv6; only `event-router` and `recordings-api` join it, and
+      `recordings-egress` stays the container's one way out. Host firewall: ANYM-712's rules (`recordings_egress_check.py`)
+      do not name this bridge yet (a card candidate); until they do, the isolation rests on Docker's internal network with the
+      isolated gateway mode, and the router has no listener to reach.
+   c. Enrollment: the recordings project gets the same compose file with the new network (a compatible service update, undo
+      below); `recordings` is added to `private/event-router.json` (`http://recordings-api:13234`, token file
+      `/run/secrets/module-tokens/recordings`) and the router restarted.
+   d. Connectivity test (read-only): `docker compose $F exec -T event-router python -c "import urllib.request as u; print(u.urlopen(u.Request('http://recordings-api:13234/v1/events/head', headers={'Authorization': 'Bearer ' + open('/run/secrets/module-tokens/recordings').read().strip()}), timeout=5).status)"`
+      prints 200. `docker network inspect deedkit-recordings-router` lists exactly the two containers, `Internal: true` and no
+      gateway; from `recordings-api` a connection to the router's address on that network is refused (it has no listener).
+      `module-router-status` shows the
+      `deedkit:recordings` cursor at the feed's head after the first pass.
+   Undo: remove `recordings` from `private/event-router.json` and restart the router. The network may stay (it joins nothing else).
+   To remove it, first redeploy the recordings project and the router from files without the `recordings-router` entries (both
+   compose files require it while they name it), then `docker network disconnect deedkit-recordings-router <container>` for any
+   container still on it, then `docker network rm deedkit-recordings-router`.
+   Rotate or revoke the token: replace the digest in the recordings configuration and the token file together (two digests allow a rotation).
 Read-back: a synthetic module event published by a test producer appears in `module-router-status`
 (cursor moved) and in `module_events`, only after the owner-kept tokens exist. Undo: `docker
 compose $F stop event-router`, remove it from `files`; cursors and gaps stay (schema 58 is

@@ -119,7 +119,7 @@ def main():
     parser.add_argument('--person',help='link-person: add to this person UUID (default: a new person); delete-person, list-people')
     parser.add_argument('--purpose',choices=['message','call'],help='set-person-channel: the purpose of the preference')
     parser.add_argument('--clear',action='store_true',help='set-person-channel: clear the preference instead of --account')
-    parser.add_argument('--source',help='set-module-cursor, abandon-module-gap: deedkit:calls or deedkit:calendar')
+    parser.add_argument('--source',help='set-module-cursor, abandon-module-gap: deedkit:calls, deedkit:calendar or deedkit:recordings')
     parser.add_argument('--after',type=int,help='set-module-cursor: the exclusive module seq to read after; abandon-module-gap: the gap\'s after_seq')
     parser.add_argument('--gap-kind',choices=['quarantine','retention_gap'],help='abandon-module-gap: the open gap\'s kind')
     args=parser.parse_args()

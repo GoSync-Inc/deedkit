@@ -1130,8 +1130,8 @@ attribute names, not the CloudEvents HTTP binding:
 | Attribute | Value |
 | --- | --- |
 | `specversion` | `1.0` |
-| `id` | `<module>:<seq>`, `calendar:` or `calls:` plus the module's own journal number; also the idempotency key (`event_key`, one identifier) |
-| `source` | `deedkit:calendar` or `deedkit:calls` |
+| `id` | `<module>:<seq>`, `calendar:`, `calls:` or `recordings:` plus the module's own journal number; also the idempotency key (`event_key`, one identifier) |
+| `source` | `deedkit:calendar`, `deedkit:calls` or `deedkit:recordings` |
 | `type` | one of the types below |
 | `subject` | the primary reference (`event_ref` or `call_id`), equal to that data key |
 | `time` | when it happened (RFC 3339) |
@@ -1154,8 +1154,11 @@ attribute names, not the CloudEvents HTTP binding:
 | `recording.text.archived` | `recording_ref`, `account_ref`, `revision` (producer: recordings, ANYM-726; `urgency=batch`; `scope_ref` `recordings:<account>.<namespace16>`) |
 | `recording.access.changed` | `account_ref`, `principal_ref`, `reason` (`permission_removed`, `account_removed`, `namespace_replaced`); `urgency=now`, `scope_ref` the old scope (producer: recordings, ANYM-726) |
 
-The recordings rows are the producer side only: the feed is served by `services/recordings` (README "Event feed for the module event
-router"); the messaging contract for these two types and the router's use of the `recordings:<seq>` ids come with ANYM-732.
+The feed is served by `services/recordings` (README "Event feed for the module event router"). Messaging takes these two types from
+schema 67 (ANYM-732, "Recordings source" below): `deedkit:recordings`, ids `recordings:<seq>` (seq up to 2^53-1), exactly the key sets above
+(`revision` an integer 0 to 2^53-1; `reason` one of the three values), `urgency` `batch` for `recording.text.archived` and `now` for
+`recording.access.changed`, `expires_at` null for both, the 1 KiB bound as for every type. Any other key, a free-text value, a recording type under another source (or the reverse),
+or the wrong urgency or expiry is refused by `validate_event` and again by `module_event_valid`; the router quarantines it by seq.
 The recordings feed changes its `journal_id` (a source reset the router operator confirms) whenever its restore marker is lost, damaged, older than or ahead of the database, which includes a crash between a journal commit and the marker fsync: rare, and the safe side, because a possibly reused id is never read as new.
 
 References are `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`; `end_reason` and `outcome` are lowercase
@@ -1291,6 +1294,22 @@ WHERE kind='module_events' AND state IN ('pending','leased')`), because an older
 send them as message hints, then deploy. The module tables stay; an older matcher stages no module
 hint, and the fence holds every module stream an older runtime resumes.
 
+### Recordings source (ANYM-732, schema 67)
+
+Migration `067_recording_module_source.sql` (`-- rollout: manual`, risk tier **dangerous**: `module_events_check1` compares two
+columns, so it is not a same-column widening pair; a fresh verified backup and the pre-migration copy come first; its header holds
+the inventory of every constraint and function of 056 and 058 that named the module list) widens eight CHECKs that listed `calendar`
+and `calls` and rebuilds `module_event_valid` on 065's text, so `call.failed` keeps its provider-cause keys. It changes no table,
+column, row, grant or role: existing ACLs stay and are read back after the release. No expand part exists: everything the change needs
+is a widened existing constraint or a replaced function, which the unattended class never runs. Release order: the backup receiver
+(`receiver_schema_max` 67), the backup and restore runtimes (`SCHEMAS` up to 67) and the prepared images first, then the backup and
+copy, then the hand release of 067 (production.md "Migration releases"), then the router overlay (ordering in "Module event router").
+Rollback of the service images to schema 66: the database keeps schema 67, which a schema-66 runtime refuses at `migrate()`
+(`database_newer_than_runtime`; tested against the deployed 045f37b7), so the images stay at schema 67 or the database is restored.
+A schema-66 router refuses a `deedkit:recordings` entry in its configuration and its validator quarantines a recordings event; its
+backup tooling stops at schema 66. Rows of `deedkit:recordings` stay in the journal; the router's recordings cursor and gap rows stay,
+and a later start resumes from them.
+
 ### Module event router (ANYM-575, schema 58)
 
 `messaging_service/event_router.py` is a worker (overlay `deploy/compose.event-router.yaml`) that
@@ -1324,6 +1343,11 @@ returns the stored seq for each `event_key`, so no event is journaled twice.
   broken page is reported through `report_module_reachability` (`module_unreachable`) and
   cleared by the next good answer. The router never writes a message row or takes the
   `feed_counter` lock, so message writes and hints never wait for it.
+- Recordings (ANYM-732): the router reads `http://recordings-api:13234` over `recordings-router`, an internal Docker network
+  (no host address, no route out) that only the router and the recordings container join, with the recordings router read
+  token (`event_router` in the recordings configuration). The feed's own `journal_id` rotation is a `source_reset` for
+  `deedkit:recordings` (the operator sets the cursor). A recordings failure or timeout marks only `deedkit:recordings`
+  `module_unreachable`; calls, calendar and message hints are polled and delivered as before.
 - Role: `messaging_module_router` executes the two definer functions and reads and writes only
   its own cursor and gap rows (`module_router_role.sql`). The gateway reads open gaps
   (`gateway_role.sql`); before that grant, `get_subscription` shows no `module_gap`.

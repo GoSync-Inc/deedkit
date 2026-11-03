@@ -774,7 +774,9 @@ def test_only_recordings_api_joins_the_egress_bridge_with_the_scripts_name_and_n
     joined = [name for name, unit in document['services'].items() if 'recordings-egress' in unit.get('networks', {})]
     assert joined == ['recordings-api']
     networks = document['services']['recordings-api']['networks']
-    assert set(networks) == {'recordings-backend', 'recordings-egress'} and 'integration' not in networks
+    # ANYM-732: the one added network is the internal pair with the module event router, never a route out.
+    assert set(networks) == {'recordings-backend', 'recordings-egress', 'recordings-router'} and 'integration' not in networks
+    assert document['networks']['recordings-router']['external'] is True and 'driver_opts' not in document['networks']['recordings-router']
     assert 'integration' not in document['networks'] and document['networks']['recordings-backend']['external'] is True
     # The admission is on in production and both probe lists are required (compose refuses a missing one).
     # Docker's embedded resolver queries the explicit servers from the container's namespace, where the bridge rules apply;

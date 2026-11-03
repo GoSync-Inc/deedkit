@@ -38,6 +38,20 @@ def starting_event(seq, start='2026-10-29T10:15:00Z'):
         'urgency': 'now', 'expires_at': start}
 
 
+RECORDING_SCOPE = 'recordings:omi-a.0123456789abcdef'
+
+
+def recording_event(seq, kind='recording.text.archived', **changes):
+    """An ANYM-726 feed event (SUBSCRIPTIONS.md "Module events"): references only."""
+    text = kind == 'recording.text.archived'
+    data = ({'recording_ref': 'rec-1', 'account_ref': 'omi-a', 'revision': 1} if text else
+        {'account_ref': 'omi-a', 'principal_ref': 'agent-1', 'reason': 'permission_removed'})
+    event = {'specversion': '1.0', 'id': f'recordings:{seq}', 'source': 'deedkit:recordings', 'type': kind,
+        'subject': data['recording_ref' if text else 'account_ref'], 'time': '2026-11-03T10:00:00Z', 'data': data,
+        'urgency': 'batch' if text else 'now', 'expires_at': None}
+    return {**event, **changes}
+
+
 # spec: ANYM-562
 @settings(max_examples=200)
 @given(seq=st.integers(1, 10**12), call_id=REFS, extra=st.from_regex(r'[a-z_]{1,20}', fullmatch=True),
@@ -220,6 +234,175 @@ def test_publish_is_gapless_idempotent_and_never_waits_for_the_message_counter(m
     with store.pool.connection() as c:
         assert [row['seq'] for row in c.execute('SELECT seq FROM module_events ORDER BY seq')] == [first, seq] == [1, 2]
         assert c.execute('SELECT value FROM module_event_counter').fetchone()['value'] == 2
+
+
+# spec: ANYM-732
+def test_recording_events_publish_idempotently_conflict_on_other_fields_and_leave_calls_and_calendar_rows_alone(modules):
+    store = modules[0]
+    call = publish(store, call_event(1))
+    start = publish(store, starting_event(2), 'family-calendar')
+    with store.pool.connection() as c:
+        before = c.execute('SELECT * FROM module_events ORDER BY seq').fetchall()
+    text = publish(store, recording_event(7), RECORDING_SCOPE)
+    assert publish(store, recording_event(7), RECORDING_SCOPE) == text == 3
+    access = publish(store, recording_event(8, 'recording.access.changed'), RECORDING_SCOPE)
+    assert access == 4
+    with pytest.raises(errors.UniqueViolation, match='module_event_conflict'):
+        publish(store, recording_event(7, data={'recording_ref': 'rec-1', 'account_ref': 'omi-a', 'revision': 2}),
+            RECORDING_SCOPE)
+    with pytest.raises(errors.UniqueViolation, match='module_event_conflict'):
+        publish(store, recording_event(7), 'recordings:omi-a.fedcba9876543210')
+    with pytest.raises(ModuleContractError, match='data_key_not_allowed'):
+        publish(store, data_of(recording_event(9), title='private words'), RECORDING_SCOPE)
+    with pytest.raises(errors.CheckViolation, match='invalid_module_event'), store.pool.connection() as c:
+        # The definer function refuses free text even when a caller skips the Python contract.
+        c.execute('SELECT public.publish_module_event(%s,%s,%s,%s,%s,%s,%s,%s,%s)', ('recordings:9',
+            'deedkit:recordings', 'recording.text.archived', 'rec-1', RECORDING_SCOPE, '2026-11-03T10:00:00Z',
+            json.dumps({'recording_ref': 'rec-1', 'account_ref': 'omi-a', 'revision': 1, 'title': 'private words'}),
+            'batch', None))
+    with store.pool.connection() as c:
+        rows = c.execute('SELECT * FROM module_events ORDER BY seq').fetchall()
+        assert c.execute('SELECT value FROM module_event_counter').fetchone()['value'] == 4
+    assert [(r['seq'], r['event_key'], r['source'], r['type'], r['urgency'], r['expires_at']) for r in rows[2:]] == [
+        (3, 'recordings:7', 'deedkit:recordings', 'recording.text.archived', 'batch', None),
+        (4, 'recordings:8', 'deedkit:recordings', 'recording.access.changed', 'now', None)]
+    assert rows[:2] == before and (call, start) == (1, 2)
+
+
+def data_of(event, **values):
+    return {**event, 'data': {**event['data'], **values}}
+
+
+# The constraints and the function that 056 and 058 wrote with the module list, as written there (ANYM-732 inventory).
+OLD_MODULE_LISTS = {
+    'module_events': [
+        ('module_events_event_key_check', "event_key ~ '^(calendar|calls):[1-9][0-9]{0,17}$'"),
+        ('module_events_source_check', "source IN ('deedkit:calendar','deedkit:calls')"),
+        ('module_events_type_check', "type IN ('calendar.event.created','calendar.event.changed','calendar.event.cancelled',"
+            "'calendar.event.starting','call.finished','call.failed','call.not_answered','call.interrupted','call.owner_request')"),
+        ('module_events_check', "split_part(event_key,':',1)=split_part(source,':',2)"),
+        ('module_events_check1', "split_part(type,'.',1)=CASE source WHEN 'deedkit:calendar' THEN 'calendar' ELSE 'call' END")],
+    **{table: [(f'{table}_source_check', "source IN ('deedkit:calendar','deedkit:calls')")] for table in (
+        'subscription_module_sources', 'module_source_health', 'module_router_cursors', 'module_router_gaps')}}
+
+
+def _constraint_expression(c, table, name):
+    found = c.execute("SELECT pg_get_constraintdef(oid) AS d FROM pg_constraint WHERE conrelid=%s::regclass AND conname=%s",
+        (table, name)).fetchone()
+    assert found is not None, (table, name)
+    assert found['d'].startswith('CHECK ')
+    return found['d'][len('CHECK '):]
+
+
+# spec: ANYM-732
+def test_every_module_list_constraint_admits_recordings_and_each_new_one_is_a_superset_of_the_old(modules):
+    store = modules[0]
+    modules_seen = ('calendar', 'calls', 'recordings', 'messages')
+    keys = [f'{m}:{n}' for m in modules_seen for n in ('1', '0', '01', '9' * 18, '9' * 19)]
+    sources = [f'deedkit:{m}' for m in modules_seen] + ['', 'calls']
+    types = sorted(KINDS) + ['recording.other', 'recording.', 'messages.x', 'call.', 'calendar.']
+    grid = [(k, s, t) for k in keys for s in sources for t in types]
+    def evaluate(c, expression, rows):
+        result = c.execute(f'SELECT ({expression}) AS ok FROM unnest(%s::text[], %s::text[], %s::text[]) '
+            'AS t(event_key, source, type)', [[row[i] for row in rows] for i in range(3)]).fetchall()
+        return [row['ok'] for row in result]
+    with store.pool.connection() as c:
+        for table, olds in OLD_MODULE_LISTS.items():
+            old = ' AND '.join(f'({expression})' for _, expression in olds)
+            new = ' AND '.join(_constraint_expression(c, table, name) for name, _ in olds)
+            before, after = evaluate(c, old, grid), evaluate(c, new, grid)
+            # A superset: nothing the old list admitted is refused now (the whole table's checks together: the old
+            # source list shut out the rows only 'deedkit:recordings' could otherwise change).
+            assert not [row for row, was, now in zip(grid, before, after) if was and not now], table
+            admitted = {row for row, now in zip(grid, after) if now}
+            if table == 'module_events':
+                for kind in ('recording.text.archived', 'recording.access.changed'):
+                    assert ('recordings:1', 'deedkit:recordings', kind) in admitted
+                    assert ('recordings:' + '9' * 18, 'deedkit:recordings', kind) in admitted
+                assert not {row for row in admitted if row[1] == 'deedkit:recordings' and (
+                    not row[0].startswith('recordings:') or not row[2].startswith('recording.'))}
+                assert not {row for row in admitted if row[0].startswith('recordings:') and row[1] != 'deedkit:recordings'}
+                assert not {row for row in admitted if row[0].split(':')[0] not in ('calendar', 'calls', 'recordings')}
+            else:
+                assert {row[1] for row in admitted} == {'deedkit:calendar', 'deedkit:calls', 'deedkit:recordings'}, table
+        # Inventory: no CHECK of any table and no function still names the two modules without the third.
+        stale = c.execute("""SELECT conrelid::regclass::text AS t, conname FROM pg_constraint WHERE contype='c'
+            AND connamespace='public'::regnamespace AND pg_get_constraintdef(oid) ~ 'deedkit:calls|calendar\\|calls'
+            AND pg_get_constraintdef(oid) !~ 'recordings'""").fetchall()
+        assert stale == []
+        functions = c.execute("""SELECT proname, prosrc ~ 'recordings' AS names_it FROM pg_proc
+            WHERE pronamespace='public'::regnamespace AND prosrc ~ 'deedkit:calls|calendar\\|calls|call\\.finished'""").fetchall()
+        assert [row['proname'] for row in functions] == ['module_event_valid'] and functions[0]['names_it']
+
+
+# spec: ANYM-732
+def test_schema67_replaces_only_the_module_lists_keeps_every_acl_and_is_repeatable(modules):
+    from messaging_service import store as store_module
+    store = modules[0]
+    root = Path(store_module.__file__).parent / 'migrations'
+    text = (root / '067_recording_module_source.sql').read_text()
+    function = "'public.module_event_valid(text,text,text,text,text,jsonb,text,text)'::regprocedure"
+    other = "'public.publish_module_event(text,text,text,text,text,text,jsonb,text,text)'::regprocedure"
+    with store.pool.connection() as c:
+        c.execute('DELETE FROM archive_migrations WHERE version=67')
+        c.execute("UPDATE probe_metadata SET value='66' WHERE name='schema_version'")
+        acl = [c.execute(f'SELECT proacl::text AS acl, proowner::regrole::text AS owner, prosrc FROM pg_proc WHERE oid={f}').fetchone()
+            for f in (function, other)]
+        grants = c.execute("SELECT oid,relacl::text FROM pg_class WHERE relnamespace='public'::regnamespace ORDER BY oid").fetchall()
+        shape = c.execute("""SELECT conrelid::regclass::text AS t, conname FROM pg_constraint
+            WHERE connamespace='public'::regnamespace ORDER BY 1,2""").fetchall()
+        columns = c.execute("""SELECT table_name,column_name,data_type FROM information_schema.columns
+            WHERE table_schema='public' ORDER BY 1,2""").fetchall()
+    store.migrate()
+    store.migrate()
+    with store.pool.connection() as c:
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '67'
+        assert c.execute('SELECT count(*) AS n FROM archive_migrations WHERE version=67').fetchone()['n'] == 1
+        now = [c.execute(f'SELECT proacl::text AS acl, proowner::regrole::text AS owner, prosrc FROM pg_proc WHERE oid={f}').fetchone()
+            for f in (function, other)]
+        assert [(row['acl'], row['owner']) for row in now] == [(row['acl'], row['owner']) for row in acl]
+        assert now[1]['prosrc'] == acl[1]['prosrc']  # publish_module_event itself is not replaced
+        assert c.execute("SELECT oid,relacl::text FROM pg_class WHERE relnamespace='public'::regnamespace ORDER BY oid").fetchall() == grants
+        assert c.execute("""SELECT conrelid::regclass::text AS t, conname FROM pg_constraint
+            WHERE connamespace='public'::regnamespace ORDER BY 1,2""").fetchall() == shape  # same names, widened bodies
+        assert c.execute("""SELECT table_name,column_name,data_type FROM information_schema.columns
+            WHERE table_schema='public' ORDER BY 1,2""").fetchall() == columns
+    # Risk tier and rollout class are named; only the eight widened constraints are dropped; no row, grant or table is touched.
+    assert text.startswith('-- rollout: manual') and 'Risk tier: DANGEROUS' in text
+    dropped = re.findall(r'DROP\s+CONSTRAINT\s+(\w+)', text)
+    # module_events_check (id module = source module) names no module, so it is kept as it is.
+    assert sorted(dropped) == sorted(name for olds in OLD_MODULE_LISTS.values() for name, _ in olds
+        if name != 'module_events_check')
+    assert len(re.findall(r'\bDROP\b', text, re.I)) == len(dropped)
+    assert not re.search(r'\b(GRANT|REVOKE|CREATE\s+(TABLE|INDEX)|INSERT|UPDATE|DELETE|TRUNCATE)\b', text, re.I)
+    assert 'octet_length(p_data::text)>1024' in text
+
+
+# spec: ANYM-732
+def test_calls_and_calendar_decisions_of_the_validator_are_those_of_schema_65_for_every_case(modules):
+    from messaging_service import store as store_module
+    store = modules[0]
+    old = (Path(store_module.__file__).parent / 'migrations/065_call_failed_provider_error.sql').read_text()
+    start = old.index('CREATE OR REPLACE FUNCTION public.module_event_valid(')
+    previous = old[start:old.index('END $$;', start) + len('END $$;')].replace('public.module_event_valid(',
+        'public.anym732_previous_valid(', 1)
+    arguments = '%s,%s,%s,%s,%s,%s,%s,%s'
+    cases = {name: event for name, event in _mutations().items() if 'recording' not in name}
+    cases.update({f'provider_{label}': failed_event(1, **data) for label, data in (('five', {'provider_cause':
+        'geo_permission_missing', 'provider_code': 21215}), ('code_alone', {'provider_code': 21215}),
+        ('text', {'provider_text': 'x'}))})
+    with store.pool.connection() as c:
+        c.execute(previous)
+        try:
+            assert len(cases) > 40
+            for name, event in cases.items():
+                values = (event['id'], event['source'], event['type'], event['subject'], event['time'],
+                    json.dumps(event['data']), event['urgency'], event['expires_at'])
+                kept = c.execute(f'SELECT public.anym732_previous_valid({arguments}) AS ok', values).fetchone()['ok']
+                now = c.execute(f'SELECT public.module_event_valid({arguments}) AS ok', values).fetchone()['ok']
+                assert kept == now, name
+        finally:
+            c.execute('DROP FUNCTION public.anym732_previous_valid(text,text,text,text,text,jsonb,text,text)')
 
 
 # spec: ANYM-562
@@ -473,6 +656,33 @@ def _mutations():
         'valid_interrupted': {**finished, 'type': 'call.interrupted', 'data': {'call_id': 'call-1',
             'end_reason': 'service_restart'}},
         'valid_latest_expiry': {**finished, 'expires_at': '9999-12-30T00:00:00Z'},
+        # ANYM-732: the recordings source, the exact key sets and the urgency and expiry rules of ANYM-726.
+        'valid_recording_text': recording_event(1), 'valid_recording_max_seq': recording_event(2**53 - 1),
+        'valid_recording_access': recording_event(2, 'recording.access.changed'),
+        'recording_extra_key': data(recording_event(1), title='private words'),
+        'recording_free_text_ref': {**data(recording_event(1), recording_ref='private words'), 'subject': 'private words'},
+        'recording_ref_too_long': {**data(recording_event(1), recording_ref='r' * 129), 'subject': 'r' * 129},
+        'recording_missing_revision': {**recording_event(1), 'data': {'recording_ref': 'rec-1', 'account_ref': 'omi-a'}},
+        'recording_revision_negative': data(recording_event(1), revision=-1),
+        'recording_revision_text': data(recording_event(1), revision='1'),
+        'recording_revision_bool': data(recording_event(1), revision=True),
+        'recording_revision_fraction': data(recording_event(1), revision=1.5),
+        'recording_access_extra_key': data(recording_event(1, 'recording.access.changed'), note='text'),
+        'recording_reason_outside_enum': data(recording_event(1, 'recording.access.changed'), reason='title_changed'),
+        'recording_subject_mismatch': recording_event(1, subject='other'),
+        'recording_access_subject_is_the_recording': recording_event(1, 'recording.access.changed', subject='rec-1'),
+        'recording_text_now': recording_event(1, urgency='now'),
+        'recording_access_batch': recording_event(1, 'recording.access.changed', urgency='batch'),
+        'recording_text_expiring': recording_event(1, expires_at='2099-10-29T10:30:00Z'),
+        'recording_access_expiring': recording_event(1, 'recording.access.changed', expires_at='2099-10-29T10:30:00Z'),
+        'recording_id_of_calls': recording_event(1, id='calls:1'),
+        'recording_id_zero': recording_event(1, id='recordings:0'),
+        'recording_id_leading_zero': recording_event(1, id='recordings:01'),
+        'recording_id_above_2_53': recording_event(1, id='recordings:9007199254740992'),
+        'recording_type_under_the_calls_source': recording_event(1, id='calls:1', source='deedkit:calls'),
+        'call_type_under_the_recordings_source': {**finished, 'id': 'recordings:1', 'source': 'deedkit:recordings'},
+        'calendar_type_under_the_recordings_source': {**starting_event(4), 'id': 'recordings:4',
+            'source': 'deedkit:recordings'},
         'time_infinite': {**finished, 'time': 'infinity'}, 'expiry_infinite': {**finished, 'expires_at': 'infinity'},
         'time_before_1970': {**finished, 'time': '1969-12-31T23:59:59Z'},
         'expiry_past_latest': {**finished, 'expires_at': '9999-12-31T23:59:59Z'},
@@ -600,14 +810,14 @@ def test_schema65_replaces_only_the_validator_function_keeps_its_acl_and_is_repe
         # Synthetic disposable database only: the schema-64 function, ledger and version.
         c.execute(previous)
         assert accepts(c, failed_event(1)) and not accepts(c, five)
-        c.execute('DELETE FROM archive_migrations WHERE version IN (65,66)')
+        c.execute('DELETE FROM archive_migrations WHERE version IN (65,66,67)')
         c.execute("UPDATE probe_metadata SET value='64' WHERE name='schema_version'")
         acl = c.execute(f'SELECT proacl::text AS acl, proowner::regrole::text AS owner FROM pg_proc WHERE oid={function}').fetchone()
         grants = c.execute("SELECT oid,relacl::text FROM pg_class WHERE relnamespace='public'::regnamespace ORDER BY oid").fetchall()
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '66'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '67'
         assert c.execute('SELECT count(*) AS n FROM archive_migrations WHERE version=65').fetchone()['n'] == 1
         assert accepts(c, five) and accepts(c, failed_event(1))
         assert not accepts(c, failed_event(1, provider_code=21215)) and not accepts(c, failed_event(1, provider_text='x'))
@@ -925,6 +1135,9 @@ def test_the_deployed_release_runs_beside_module_rows_after_the_documented_rollb
     beat(store)
     message = emit(store)
     seq = publish(store, call_event(1))
+    # ANYM-732: a recordings row beside it; the previous runtime ignores it and leaves it untouched.
+    recorded = publish(store, recording_event(2), RECORDING_SCOPE)
+    assert recorded == seq + 1
     match_subscriptions(store)
     page = store.fetch_subscription_events(token, sid)
     assert [item['module_event_id'] for item in page['module']['items']] == [seq]
@@ -970,6 +1183,177 @@ def test_the_deployed_release_runs_beside_module_rows_after_the_documented_rollb
     assert view['module_stream']['state'] == 'held_after_rollback' and view['module_stream']['acked_through'] == 0
     view = store.update_subscription(token, sid, view['version'], action='resume')
     assert [item['module_event_id'] for item in store.fetch_subscription_events(token, sid)['module']['items']] == [seq]
+
+
+# The runtime production runs today (release n8, migration 066): schema 66, router and module matcher included.
+DEPLOYED_RELEASE = '045f37b7fc98647ac1514c59f845104ce7843780'
+DEPLOYED_DRIVER = '''
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from messaging_service import backup, event_router, module_events
+from messaging_service.store import RUNTIME_SCHEMA, Store
+a = json.loads(sys.argv[2])
+out = {'schema': RUNTIME_SCHEMA, 'backup_max': backup.SCHEMAS[-1]}
+try:
+    store = Store(Path(a['dsn']).read_text().strip(), Path(a['files']), 'http://testserver')
+    store.migrate()
+    out['migrate'] = 'opened'
+    store.close()
+except RuntimeError as error:
+    out['migrate'] = str(error)
+for name, event in a['events'].items():
+    try:
+        module_events.validate_event(event)
+        out[name] = 'accepted'
+    except module_events.ModuleContractError as error:
+        out[name] = str(error)
+config = Path(a['files']) / 'router.json'
+config.write_text(json.dumps({'modules': [{'source': 'deedkit:recordings', 'url': 'http://recordings-api:13234',
+    'token_file': '/run/secrets/t'}]}))
+try:
+    event_router.load_config(config)
+    out['config'] = 'loaded'
+except ValueError as error:
+    out['config'] = str(error)
+print(json.dumps(out))
+'''
+
+
+# spec: ANYM-732
+def test_the_deployed_schema66_runtime_refuses_schema67_and_its_router_validator_and_backup_refuse_recordings(modules,
+        tmp_path):
+    import os
+    import subprocess
+    import sys
+    from messaging_service import backup
+    source = _release_source(tmp_path / 'deployed', DEPLOYED_RELEASE)
+    files = tmp_path / 'deployed-files'
+    files.mkdir()
+    events = {'text': recording_event(1), 'access': recording_event(2, 'recording.access.changed')}
+    run = subprocess.run([sys.executable, '-c', DEPLOYED_DRIVER, str(source), json.dumps({
+        'dsn': os.environ['PROBE_TEST_DSN_FILE'], 'files': str(files), 'events': events})], capture_output=True,
+        text=True, timeout=120)
+    assert run.returncode == 0, run.stderr[-2000:]
+    out = json.loads(run.stdout.strip().splitlines()[-1])
+    # Safe refusals, all of them: the runtime will not start on schema 67, its configuration will not name the
+    # source, its contract check quarantines the event, and its backup tooling stops below schema 67.
+    assert out['schema'] == 66 and out['migrate'] == 'database_newer_than_runtime'
+    assert out['config'] == 'invalid_router_config'
+    assert (out['text'], out['access']) == ('invalid_envelope', 'invalid_envelope')
+    assert out['backup_max'] == 66 and backup.SCHEMAS[-1] == 67
+
+
+# The deployed consumers never call migrate(): matcher, dispatcher, API reads and retention keep running on the
+# database the hand release has moved to schema 67.
+DEPLOYED_CONSUMERS = '''
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from messaging_service import heartbeats
+from messaging_service.event_delivery import dispatch_hints
+from messaging_service.store import RUNTIME_SCHEMA, Store
+from messaging_service.subscriptions import match_subscriptions, prune_subscriptions
+a = json.loads(sys.argv[2])
+store, token, sid, sent = Store(Path(a['dsn']).read_text().strip(), Path(a['files']), 'http://testserver'), \\
+    a['token'], a['sid'], []
+out = {'schema': RUNTIME_SCHEMA}
+heartbeats.record(store, 'dispatcher')
+out['matched'] = match_subscriptions(store)
+out['dispatch'] = dispatch_hints(store, transport=lambda url, body, headers, **k: sent.append(json.loads(body)) or 204,
+    resolver=lambda *x, **k: ['93.184.216.34'])
+out['updates'] = [e['event_sequence'] for e in store.get_updates(a['old'], 'probe-deployed')['items']]
+out['view'] = store.get_subscription(token, sid)
+out['passive'] = store.get_subscription_events(token, sid)
+page = store.fetch_subscription_events(token, sid)
+out['fetch'] = page
+out['ack'] = store.ack_subscription_events(token, sid, page['receipt'], page['ack_version'])
+with store.pool.connection() as c:  # every match past the retention window, the module ones too
+    for table in ('subscription_matches', 'subscription_module_matches'):
+        c.execute(f"UPDATE {table} SET matched_at=matched_at-interval '30 days' WHERE subscription=%s", (sid,))
+out['sent'], out['pruned'] = sent, prune_subscriptions(store)
+store.close()
+print(json.dumps(out, default=str))
+'''
+
+
+# spec: ANYM-732
+def test_the_deployed_schema66_consumers_run_beside_recordings_rows_in_the_schema67_database(modules, tmp_path):
+    import os
+    import subprocess
+    import sys
+    source = _release_source(tmp_path / 'deployed', DEPLOYED_RELEASE)
+    store, old, _ = modules
+    token = subscriber(store)
+    sid = mixed(store, token)
+    bound(store, token, sid, tmp_path)
+    beat(store)
+    message = emit(store)
+    seq = publish(store, call_event(1))
+    recorded = [publish(store, recording_event(2), RECORDING_SCOPE),
+        publish(store, recording_event(3, 'recording.access.changed'), RECORDING_SCOPE)]
+    assert recorded == [seq + 1, seq + 2]
+    with store.pool.connection() as c:
+        rows = c.execute('SELECT seq,event_key,source,type,data FROM module_events ORDER BY seq').fetchall()
+    files = tmp_path / 'deployed-files'
+    files.mkdir()
+    store.set_subscription_retention(True)
+    try:
+        run = subprocess.run([sys.executable, '-c', DEPLOYED_CONSUMERS, str(source), json.dumps({
+            'dsn': os.environ['PROBE_TEST_DSN_FILE'], 'files': str(files), 'token': token, 'sid': sid, 'old': old})],
+            capture_output=True, text=True, timeout=120)
+    finally:
+        with store.pool.connection() as c:
+            c.execute("DELETE FROM probe_metadata WHERE name='subscription_retention'")
+    assert run.returncode == 0, run.stderr[-2000:]
+    out = json.loads(run.stdout.strip().splitlines()[-1])
+    assert out['schema'] == 66
+    # The deployed matcher logs a module-matching failure and carries on with the messages, so stderr is read too.
+    assert not re.search(r'traceback|error|exception', run.stderr, re.I), run.stderr[-2000:]
+    # The old matcher, reads, fetch, ACK, delivery and retention work, see the message and the call, and never
+    # name, match or deliver a recordings row.
+    assert message in out['updates'] and out['updates'] == [e['event_sequence']
+        for e in store.get_updates(old, 'probe-current')['items']]
+    assert [item['module_event_id'] for item in out['passive']['module']['items']] == [seq]
+    assert [item['event_id'] for item in out['fetch']['items']] == [message]
+    assert [item['module_event_id'] for item in out['fetch']['module']['items']] == [seq]
+    text = json.dumps(out, default=str)
+    assert 'recording' not in text, text[:2000]
+    assert out['pruned']['retention_failed'] == 0 and out['pruned']['pruned'] >= 2 and out['sent']
+    assert all(body['kind'] != 'events' or 'recording' not in json.dumps(body) for body in out['sent'])
+    with store.pool.connection() as c:
+        # The journal is untouched; the matcher went through the recordings rows to the head without matching one;
+        # the ACK moved the call's position; retention removed the aged message and call matches, nothing else.
+        assert c.execute('SELECT seq,event_key,source,type,data FROM module_events ORDER BY seq').fetchall() == rows
+        stream = c.execute('SELECT matched_through,acked_through FROM subscription_module_streams WHERE subscription=%s',
+            (sid,)).fetchone()
+        assert (stream['matched_through'], stream['acked_through']) == (recorded[-1], seq)
+        assert c.execute('SELECT count(*) AS n FROM subscription_matches WHERE subscription=%s',
+            (sid,)).fetchone()['n'] == 0
+        assert c.execute('SELECT count(*) AS n FROM subscription_module_matches WHERE subscription=%s',
+            (sid,)).fetchone()['n'] == 0
+
+def _release_source(tmp_path, commit):
+    """A `git archive` of one release (or a sibling checkout named by ANYMSG_PREVIOUS_SOURCE), as _previous_source."""
+    import os
+    import subprocess
+    named = os.environ.get('ANYMSG_PREVIOUS_SOURCE_66')
+    if named:
+        return Path(named) / 'services/messaging'
+    root = Path(__file__).resolve().parents[1]
+    def missing():
+        return subprocess.run(['git', 'cat-file', '-e', commit + '^{commit}'], cwd=root, capture_output=True).returncode
+    if missing():
+        subprocess.run(['git', 'fetch', '--quiet', '--depth=1', 'origin', commit], cwd=root, capture_output=True,
+            timeout=120)
+    if missing():
+        (pytest.fail if os.environ.get('CI') else pytest.skip)(
+            f'the deployed release {commit} is not reachable; set ANYMSG_PREVIOUS_SOURCE_66')
+    archive = subprocess.run(['git', 'archive', commit, 'services/messaging'], cwd=root, capture_output=True,
+        check=True).stdout
+    tmp_path.mkdir()
+    subprocess.run(['tar', '-x', '-C', str(tmp_path)], input=archive, check=True)
+    return tmp_path / 'services/messaging'
 
 
 def _outbox(store):
