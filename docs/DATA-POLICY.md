@@ -33,8 +33,9 @@ volume) (owner 11-03, see Data egress).
   the owner's request (this wording is the orchestrator's reading of «2) ок», an interim default). No deletion tool or automatic deletion exists today: a deletion is manual, under the
   data-deletion gates (process.md section 2), and a provider-side deletion does not purge the local text
   (services/recordings/README.md). The owner named no term; a term is a new owner decision. Once the
-  archive backup runs (ANYM-728), a deletion from the live archive leaves the backup at the next daily
-  rotation, which keeps one protected point and no older history.
+  archive backup runs, a deletion from the live archive reaches the backup only through the sanitizing
+  deletion procedure (ANYM-730: index rebuild and VACUUM, then a new snapshot replaces the protected
+  point, which is the only one kept); rotating the backup alone does not remove deleted text.
 - Bot buttons: the labels, kinds, URLs, Mini App links and callback data of a message's inline and
   reply buttons are stored and deleted with the message text (retention above, deletion below; owner
   11-01 «4 да» to the bot-buttons question, with «надо сделать чтоб он бот мог делать действия которые
@@ -133,11 +134,13 @@ volume) (owner 11-03, see Data egress).
       account, newest first and within Omi's hourly limits (days to weeks), not only new recordings, and the
       archive goes into the daily backup as its own encrypted profile on the shared backup server and its
       private R2 prefix, with one protected point plus one candidate and no older history. The backup holds
-      other people's speech, encrypted. Owner 11-03, asked by the orchestrator whether the recordings archive
+      other people's speech, encrypted; its plaintext exists only in the producer's private staging
+      directory for one run and in the verifier's private scratch during each daily verification. Owner 11-03, asked by the orchestrator whether the recordings archive
       goes on and into backups: «давай включим да»; and: «пусть качает все и дает удобную интексацию
       агентам». Covers Omi and PLAUD text only: audio stays out (`recordings_audio` above still needs its
-      own ask) and so does any other recipient. Archive polling may start on production once the
-      recordings cards for it (ANYM-724 and the backup parts ANYM-714, 727, 728) are delivered.
+      own ask) and so does any other recipient. Archive polling may start on production once the archive
+      backup is installed on the host and verified with the archive still off (ANYM-731, milestone I);
+      the first protected snapshot and a restore drill follow in the same activation plan.
     - Agent search and new-recording hints (owner 11-03): the principals with recordings grants
       (`owner-claude-code`, `claude-code`, `grokbot`) search and read the archived text through scoped
       gateway tools; the returned text goes into those agents' model contexts, the model provider of
