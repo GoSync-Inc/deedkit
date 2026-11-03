@@ -156,12 +156,12 @@ def test_a_document_profile_without_a_limit_sends_codex_only_text_never_the_32_m
     original=tmp_path/'original';original.write_bytes(bytes(32*1024**2))
     previous=subprocess.run
     def run(command,**kwargs):
-        if 'exec' in command:listed.extend(Path(kwargs['cwd']).iterdir())
+        if 'exec' in command:listed.extend(f.stat().st_size for f in Path(kwargs['cwd']).iterdir())  # the directory is gone afterwards
         return previous(command,**kwargs)
     monkeypatch.setattr(subprocess,'run',run)
     infer(p,'document',original,'application/pdf','Договор аренды')
     command,kwargs=[c for c in calls if 'exec' in c[0]][0]
-    assert '--image' not in command and all(f.stat().st_size<64*1024 for f in listed)  # schema.json only, no copy of the original
+    assert '--image' not in command and listed and max(listed)<64*1024  # schema.json only, no copy of the original
     assert len(kwargs['input'])<64*1024 and 'Договор аренды'.encode() in kwargs['input']
 
 
