@@ -89,9 +89,10 @@ main() {
   if [ -n "$cal" ]; then migrate_calendar || { revert; return 1; }; fi
 
   # 7-8. replace containers, then wait for health (collectors restart: their provider sessions reconnect)
-  [ -z "$msg" ] || docker compose up -d >/dev/null || { say failed "docker compose up failed (messaging); from=$FROM"; return 1; }
-  [ -z "$cal" ] || docker compose -f compose.calendar.yaml up -d >/dev/null || { say failed "docker compose up failed (calendar)"; return 1; }
-  [ -z "$gw" ] || docker compose -f compose.gateway.yaml up -d >/dev/null || { say failed "docker compose up failed (gateway)"; return 1; }
+  # Only services that already have a container are brought up (a calendar worker you never started stays off).
+  [ -z "$msg" ] || up_existing messaging || return 1
+  [ -z "$cal" ] || up_existing calendar -f compose.calendar.yaml || return 1
+  [ -z "$gw" ] || up_existing gateway -f compose.gateway.yaml || return 1
   [ -z "$msg" ] || wait_healthy messaging || return 1
   [ -z "$cal" ] || wait_healthy calendar -f compose.calendar.yaml || return 1
   [ -z "$gw" ] || wait_healthy gateway -f compose.gateway.yaml || return 1
@@ -171,6 +172,13 @@ migrate_calendar() {
     && docker run --rm -v "$state:/data/service" --network "$net" "$image" db-roles >/dev/null 2>&1 \
     && docker run --rm -v "$state:/data/service" --network "$net" "$image" db-roles --check >/dev/null 2>&1 \
     || { say failed "calendar migrate or db-roles failed; old containers still running"; return 1; }
+}
+
+up_existing() {  # up_existing <label> [compose args]
+  local label=$1 services; shift
+  services=$(docker compose "$@" ps -a --services 2>/dev/null | sort -u | tr '\n' ' ')
+  # shellcheck disable=SC2086
+  docker compose "$@" up -d $services >/dev/null 2>&1 || { say failed "docker compose up failed ($label); new images are built, see header for rollback"; return 1; }
 }
 
 wait_healthy() {  # wait_healthy <label> [compose args]
