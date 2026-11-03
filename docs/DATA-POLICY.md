@@ -19,13 +19,19 @@ Data held: messages, chats, contacts and sender identities, attachments (origina
 transcripts, descriptions), receipts, call records and calendar data from the owner's own messenger and
 calendar accounts; stores: PostgreSQL, the original/media directory, the private R2 cold archive of
 originals, encrypted backups on the shared backup server and its object storage, service logs (confirmed with this
-file, owner 11-01).
+file, owner 11-01). Wearable recordings of the owner's Omi and PLAUD accounts (conversation metadata,
+transcripts, summaries; they include other people's speech) are read on demand without being stored, and,
+once archive polling is enabled, held as text in the recordings archive (SQLite on the recordings service
+volume) and its encrypted backup (owner 11-03, see Data egress).
 
 - Retention: processed, unpinned originals may leave local disk after 30 days without a request, only
   with a verified cold copy; text, titles, summaries and transcripts stay (MEDIA_STORAGE.md; owner 10-17
   cold archive «yes»; owner 10-18 BL-33 disk vs retention «давай оставим как есть если так работает»).
   Backup copies age out by the backup rotation (BACKUP.md). Messages and other kinds: proposal (no
   owner decision on a limit).
+- Recording texts (recordings archive, owner 11-03 «2) ок»): kept until the owner sets a term; deleted on
+  the owner's request. No automatic deletion exists today, and a provider-side deletion does not purge
+  the local text (services/recordings/README.md). The owner named no term; a term is a new owner decision.
 - Bot buttons: the labels, kinds, URLs, Mini App links and callback data of a message's inline and
   reply buttons are stored and deleted with the message text (retention above, deletion below; owner
   11-01 «4 да» to the bot-buttons question, with «надо сделать чтоб он бот мог делать действия которые
@@ -103,6 +109,21 @@ file, owner 11-01).
   - Cloud model providers for enrichment (ENRICHMENT.md: OpenAI, Anthropic, Gemini endpoints; Codex not
     deployed) stay off; media understanding uses the local models above (owner 11-01 «2 b»). Enabling a
     cloud endpoint is a `user-data` ask.
+  - Wearable recordings (Omi, PLAUD; services/recordings/README.md; both vendors are US-hosted, the
+    PLAUD remote MCP has its own logging that DeedKit cannot verify):
+    - On-demand reads: the owner's provider key (Omi) or OAuth token (PLAUD), recording identifiers, date
+      bounds and page parameters go to api.omi.me and mcp.plaud.ai; the returned metadata, transcript or
+      summary text goes to the requesting agent through the gateway, and so into that agent's model
+      context. Nothing is stored by the read itself. Owner 11-03, asked by the orchestrator: «Можно ли,
+      чтобы ваши агенты по запросу читали разговоры из Omi и Plaud? Ключи уходят в их облака (оба в США),
+      текст разговора попадает к модели агента.» Answer: «1) да». Covers these reads only: no audio
+      download by DeedKit (a PLAUD signed link goes to the caller only under the separate audio grant),
+      no other vendor, no other recipient.
+    - Local copy: the archive keeps the accepted text, titles, summaries and vendor identifiers on the
+      DeedKit server, including other people's speech, for the retention line above. Owner 11-03: «Можно ли
+      хранить копию расшифровок на нашем сервере, включая речь других людей? Сколько хранить?» Answer:
+      «2) ок». Polling is enabled on production only after the archive is in the daily encrypted backup
+      (the encrypted bundle goes to the backup flows above) and its restore proof passed.
   - Tiden error tracking (TELEMETRY.md, off by default): proposal, which fields go where is not yet an
     owner decision.
   - Any other recipient or field is a `user-data` ask before it ships.
