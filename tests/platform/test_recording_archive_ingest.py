@@ -741,7 +741,17 @@ def test_a_record_over_the_batch_budget_is_skipped_and_no_batch_exceeds_it(tmp_p
     try:
         with store.connection() as db:
             assert db.execute('SELECT max(length(CAST(metadata AS BLOB))+length(CAST(parts AS BLOB))) FROM records').fetchone()[0] > 4 * 1024 ** 2
-        finish(store)
+        fetched = []
+        original = type(store).index_row
+        def watching(self, db, row):
+            fetched.append(len(row['metadata'].encode()) + len(row['parts'].encode()))
+            return original(self, db, row)
+        type(store).index_row = watching
+        try:
+            finish(store)
+        finally:
+            type(store).index_row = original
+        assert fetched and max(fetched) <= 4 * 1024 ** 2, fetched  # the oversized record was never read into memory
         state = store.index_state()
         assert state['state'] == 'ready' and state['built'] == 3 and state['skipped'] == 1
         assert store.status(OMI_A)['index']['skipped'] == 1

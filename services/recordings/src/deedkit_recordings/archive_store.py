@@ -619,8 +619,15 @@ class Store:
         self.index_record(db, row['namespace'], row['rid'], row['ref'], metadata, parts, row['revision'])
 
     def index_rows_of(self, db, rids):
-        """Build the given records (a bounded batch chosen by `index_take`)."""
+        """Build the given records (a bounded batch chosen by `index_take`). The stored size is measured in SQL first: a
+        record over the budget is skipped (counted) without its metadata or parts ever being read into memory."""
         for rid in rids:
+            head = db.execute(f'SELECT ref, length(CAST(metadata AS BLOB)), {BYTES} FROM records WHERE rowid=?', (rid,)).fetchone()
+            if head is None:
+                continue
+            if head[1] > MAX_METADATA or head[2] > INDEX_BATCH_BYTES:
+                self.index_skip(db, rid, head[0])
+                continue
             row = db.execute('SELECT rowid AS rid,* FROM records WHERE rowid=?', (rid,)).fetchone()
             if row is not None:
                 self.index_row(db, row)
