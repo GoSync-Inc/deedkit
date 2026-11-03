@@ -116,10 +116,9 @@ bytes it needs. The original always stays in the archive; the metadata says what
   restart once, and track all of those rows.
 - **Documents up to 32 MiB (ANYM-702).** A `document` profile without `max_input_bytes` takes 32 MiB, the validator's
   maximum, not 20: for a document the limit only bounds the worker's disk copy (digest-checked in its `/tmp`) and the
-  child's file-size limit, while the request of `deedkit_inference` and of the OpenAI-style providers carries just the
-  extracted text, at most `max_text_chars`, never the file. Only the optional `codex_cli` provider reads the file
-  itself: a `codex_cli` document profile must set `max_input_bytes` explicitly, or Codex may read files up to 32 MiB.
-  A document over 32 MiB ends as `original_size_limit` and no profile can raise the limit.
+  child's file-size limit, while the request of every provider (`deedkit_inference`, the OpenAI-style ones and the
+  optional `codex_cli`, which opens a file only for an image) carries just the extracted text, at most
+  `max_text_chars`, never the file. A document over 32 MiB ends as `original_size_limit` and no profile can raise the limit.
 - **Final limit codes (ANYM-702).** Three codes mean the file can never pass the profile as it is, so the job is
   attempted once, the event says `retryable` false, and `attempts` stays 1 (the number of attempts made). The code
   is what an agent sees as `enrichment_failure` on a file read:

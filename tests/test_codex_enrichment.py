@@ -149,6 +149,22 @@ def test_subscription_semantics_survive_worker_revalidation(monkeypatch,tmp_path
     assert again['metadata']['prompt_version']=='codex-file-description-v1'
 
 
+# spec: ANYM-702
+def test_a_document_profile_without_a_limit_sends_codex_only_text_never_the_32_mib_original(monkeypatch,tmp_path):
+    p=profile(tmp_path);assert p['max_input_bytes']==32*1024**2
+    calls=fake_runner(monkeypatch,tmp_path);listed=[]
+    original=tmp_path/'original';original.write_bytes(bytes(32*1024**2))
+    previous=subprocess.run
+    def run(command,**kwargs):
+        if 'exec' in command:listed.extend(Path(kwargs['cwd']).iterdir())
+        return previous(command,**kwargs)
+    monkeypatch.setattr(subprocess,'run',run)
+    infer(p,'document',original,'application/pdf','Договор аренды')
+    command,kwargs=[c for c in calls if 'exec' in c[0]][0]
+    assert '--image' not in command and all(f.stat().st_size<64*1024 for f in listed)  # schema.json only, no copy of the original
+    assert len(kwargs['input'])<64*1024 and 'Договор аренды'.encode() in kwargs['input']
+
+
 # spec: ANYM-311
 def test_codex_example_stays_disabled_and_the_doc_lists_the_open_blockers():
     root=Path(__file__).resolve().parents[1]

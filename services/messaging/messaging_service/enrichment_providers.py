@@ -118,9 +118,8 @@ def validate_profile(raw,kind):
     # CPU-local ASR can take longer than an API call. Keep an explicit bounded
     # deadline and matching lease; cloud requests retain their shorter ceiling.
     timeout_maximum=3600 if provider=='faster_whisper' else 900 if mini else 600
-    # A document's original is only copied to disk (the request carries its extracted text), so it defaults to the
-    # kind's maximum; audio and images are read by the worker's tools and keep 20 MiB (ANYM-702). A codex_cli
-    # document profile reads the file itself: set max_input_bytes there explicitly (ENRICHMENT.md).
+    # A document's original is only copied to disk (every provider, codex_cli included, is sent its extracted text
+    # alone), so it defaults to the kind's maximum; audio and images are read by the worker's tools and keep 20 MiB (ANYM-702).
     for key,default,maximum in [('max_input_bytes',32*1024**2 if kind=='document' else 20*1024**2,AUDIO_ORIGINAL_MAX_BYTES if kind=='audio' else 32*1024**2),('max_text_chars',40000,100000),
             ('max_output_tokens',2000,16000),('timeout_seconds',120,timeout_maximum),('max_audio_seconds',3600,14400),
             ('memory_limit_mb',2048,8192)]:
