@@ -1048,12 +1048,15 @@ tokens (secrets and access) and the link grants (ANYM-564). The agent prepares e
    c. Enrollment: the recordings project gets the same compose file with the new network (a compatible service update, undo
       below); `recordings` is added to `private/event-router.json` (`http://recordings-api:13234`, token file
       `/run/secrets/module-tokens/recordings`) and the router restarted.
-   d. Connectivity test (read-only): `docker exec event-router python -c "import urllib.request as u; print(u.urlopen(u.Request('http://recordings-api:13234/v1/events/head', headers={'Authorization': 'Bearer ' + open('/run/secrets/module-tokens/recordings').read().strip()}), timeout=5).status)"`
+   d. Connectivity test (read-only): `docker compose $F exec -T event-router python -c "import urllib.request as u; print(u.urlopen(u.Request('http://recordings-api:13234/v1/events/head', headers={'Authorization': 'Bearer ' + open('/run/secrets/module-tokens/recordings').read().strip()}), timeout=5).status)"`
       prints 200. `docker network inspect deedkit-recordings-router` lists exactly the two containers, `Internal: true` and no
       gateway; from `recordings-api` a connection to the router's address on that network is refused (it has no listener).
       `module-router-status` shows the
       `deedkit:recordings` cursor at the feed's head after the first pass.
-   Undo: remove `recordings` from `private/event-router.json` and restart the router; `docker network disconnect deedkit-recordings-router <container>` for each of the two containers (or redeploy recordings from the previous file); then `docker network rm deedkit-recordings-router`.
+   Undo: remove `recordings` from `private/event-router.json` and restart the router. The network may stay (it joins nothing else).
+   To remove it, first redeploy the recordings project and the router from files without the `recordings-router` entries (both
+   compose files require it while they name it), then `docker network disconnect deedkit-recordings-router <container>` for any
+   container still on it, then `docker network rm deedkit-recordings-router`.
    Rotate or revoke the token: replace the digest in the recordings configuration and the token file together (two digests allow a rotation).
 Read-back: a synthetic module event published by a test producer appears in `module-router-status`
 (cursor moved) and in `module_events`, only after the owner-kept tokens exist. Undo: `docker

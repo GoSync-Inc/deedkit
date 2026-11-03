@@ -1296,17 +1296,19 @@ hint, and the fence holds every module stream an older runtime resumes.
 
 ### Recordings source (ANYM-732, schema 67)
 
-Migration `067_recording_module_source.sql` (`-- rollout: manual`, risk tier medium; its header holds the inventory of every
-constraint and function of 056 and 058 that named the module list) widens the nine CHECKs that listed `calendar` and `calls`
-and rebuilds `module_event_valid` on 065's text, so `call.failed` keeps its provider-cause keys. It changes no table, column, row,
-grant or role: existing ACLs stay and are read back after the release. No expand part exists: everything the change needs is a
-widened existing constraint or a replaced function, which the unattended class never runs. Release order: the backup receiver
-(`receiver_schema_max` 67), the backup and restore runtimes (`SCHEMAS` up to 67) and the prepared images first, then the hand
-release of 067 (production.md "Migration releases"), then the router overlay (ordering in "Module event router").
-Rollback of the service images to schema 66: the database keeps schema 67, which a schema-66 runtime refuses; deploy the
-schema-67 images again or restore. Rows of `deedkit:recordings` stay in the journal (an older matcher, `get_updates`, retention
-and backup read no module source, and the older router's configuration refuses `deedkit:recordings`, so remove the recordings
-entry from the router's JSON first). The router's recordings cursor and gap rows stay; a later start resumes from them.
+Migration `067_recording_module_source.sql` (`-- rollout: manual`, risk tier **dangerous**: `module_events_check1` compares two
+columns, so it is not a same-column widening pair; a fresh verified backup and the pre-migration copy come first; its header holds
+the inventory of every constraint and function of 056 and 058 that named the module list) widens eight CHECKs that listed `calendar`
+and `calls` and rebuilds `module_event_valid` on 065's text, so `call.failed` keeps its provider-cause keys. It changes no table,
+column, row, grant or role: existing ACLs stay and are read back after the release. No expand part exists: everything the change needs
+is a widened existing constraint or a replaced function, which the unattended class never runs. Release order: the backup receiver
+(`receiver_schema_max` 67), the backup and restore runtimes (`SCHEMAS` up to 67) and the prepared images first, then the backup and
+copy, then the hand release of 067 (production.md "Migration releases"), then the router overlay (ordering in "Module event router").
+Rollback of the service images to schema 66: the database keeps schema 67, which a schema-66 runtime refuses at `migrate()`
+(`database_newer_than_runtime`; tested against the deployed 045f37b7), so the images stay at schema 67 or the database is restored.
+A schema-66 router refuses a `deedkit:recordings` entry in its configuration and its validator quarantines a recordings event; its
+backup tooling stops at schema 66. Rows of `deedkit:recordings` stay in the journal; the router's recordings cursor and gap rows stay,
+and a later start resumes from them.
 
 ### Module event router (ANYM-575, schema 58)
 

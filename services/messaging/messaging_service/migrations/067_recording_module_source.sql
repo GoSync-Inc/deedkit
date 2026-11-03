@@ -2,7 +2,7 @@
 -- ANYM-732: messaging accepts the recordings module (source deedkit:recordings, ids recordings:<seq>, types
 -- recording.text.archived and recording.access.changed, the keys of ANYM-726's feed). 056 and 058 wrote the module
 -- list into constraints and into one function, so replacing the validator alone would leave the journal refusing
--- the rows. Inventory of every place that names calendar or calls (replaced here unless marked "kept"):
+-- the rows. Inventory of every place that names calendar or calls (replaced here unless marked "kept"; eight CHECKs and one function):
 --  056 module_events: event_key_check (id pattern), source_check, type_check, check1 (source-to-type correspondence);
 --      check (id module = source module) names no module: kept.
 --  056 subscription_module_sources_source_check, module_source_health_source_check.
@@ -16,12 +16,15 @@
 -- (tests/test_module_events.py checks the whole module_events conjunction over a grid, and that no CHECK or function
 -- of the schema names the two modules without the third). Removing the old constraint and adding the widened one
 -- share this transaction under a 2 s lock timeout; the tables are small. No row, column, grants or role change.
--- Risk tier: medium (docs/operations/production.md "Migration risk tiers": CHECK widening pairs proven a superset, and
--- CREATE OR REPLACE FUNCTION that no index, constraint or trigger uses). Doubt for the plan review: module_events_check1
--- compares two columns (type and source), not one; read that as outside "the same column" and the release is
--- dangerous (backup and copy first). A hand release (it removes constraints): never unattended. Applied
--- 056, 058 and 065 stay as they are. A schema-66 runtime refuses this schema; no runtime may write a recordings
--- row before it (the router's own check is the first gate, this function the second).
+-- Risk tier: DANGEROUS (docs/operations/production.md "Migration risk tiers": in doubt, dangerous). Seven of the eight
+-- widenings are CHECK widening pairs on one column and the function replacement is a CREATE OR REPLACE that no index,
+-- constraint or trigger uses (medium on their own), but module_events_check1 compares two columns (type and source), and
+-- on its own it is not a superset (source deedkit:recordings with a call.* type passed the old one and fails the new
+-- one; the old source CHECK shut that row out, so the table's checks together stay a superset). The release therefore
+-- needs a fresh verified backup and the pre-migration copy first. A hand release (it removes constraints): never
+-- unattended. Applied 056, 058 and 065 stay as they are. A schema-66 runtime refuses this schema
+-- (database_newer_than_runtime); no runtime may write a recordings row before it (the router's own check is the
+-- first gate, this function the second).
 SET LOCAL lock_timeout='2s';
 
 ALTER TABLE module_events DROP CONSTRAINT module_events_event_key_check;

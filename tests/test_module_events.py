@@ -367,8 +367,8 @@ def test_schema67_replaces_only_the_module_lists_keeps_every_acl_and_is_repeatab
             WHERE connamespace='public'::regnamespace ORDER BY 1,2""").fetchall() == shape  # same names, widened bodies
         assert c.execute("""SELECT table_name,column_name,data_type FROM information_schema.columns
             WHERE table_schema='public' ORDER BY 1,2""").fetchall() == columns
-    # Risk tier and rollout class are named; only the nine constraints are dropped; no row, grant or table is touched.
-    assert text.startswith('-- rollout: manual') and 'Risk tier: medium' in text
+    # Risk tier and rollout class are named; only the eight widened constraints are dropped; no row, grant or table is touched.
+    assert text.startswith('-- rollout: manual') and 'Risk tier: DANGEROUS' in text
     dropped = re.findall(r'DROP\s+CONSTRAINT\s+(\w+)', text)
     # module_events_check (id module = source module) names no module, so it is kept as it is.
     assert sorted(dropped) == sorted(name for olds in OLD_MODULE_LISTS.values() for name, _ in olds
@@ -1183,6 +1183,88 @@ def test_the_deployed_release_runs_beside_module_rows_after_the_documented_rollb
     assert view['module_stream']['state'] == 'held_after_rollback' and view['module_stream']['acked_through'] == 0
     view = store.update_subscription(token, sid, view['version'], action='resume')
     assert [item['module_event_id'] for item in store.fetch_subscription_events(token, sid)['module']['items']] == [seq]
+
+
+# The runtime production runs today (release n8, migration 066): schema 66, router and module matcher included.
+DEPLOYED_RELEASE = '045f37b7fc98647ac1514c59f845104ce7843780'
+DEPLOYED_DRIVER = '''
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from messaging_service import backup, event_router, module_events
+from messaging_service.store import RUNTIME_SCHEMA, Store
+a = json.loads(sys.argv[2])
+out = {'schema': RUNTIME_SCHEMA, 'backup_max': backup.SCHEMAS[-1]}
+try:
+    store = Store(Path(a['dsn']).read_text().strip(), Path(a['files']), 'http://testserver')
+    store.migrate()
+    out['migrate'] = 'opened'
+    store.close()
+except RuntimeError as error:
+    out['migrate'] = str(error)
+for name, event in a['events'].items():
+    try:
+        module_events.validate_event(event)
+        out[name] = 'accepted'
+    except module_events.ModuleContractError as error:
+        out[name] = str(error)
+config = Path(a['files']) / 'router.json'
+config.write_text(json.dumps({'modules': [{'source': 'deedkit:recordings', 'url': 'http://recordings-api:13234',
+    'token_file': '/run/secrets/t'}]}))
+try:
+    event_router.load_config(config)
+    out['config'] = 'loaded'
+except ValueError as error:
+    out['config'] = str(error)
+print(json.dumps(out))
+'''
+
+
+# spec: ANYM-732
+def test_the_deployed_schema66_runtime_refuses_schema67_and_its_router_validator_and_backup_refuse_recordings(modules,
+        tmp_path):
+    import os
+    import subprocess
+    import sys
+    from messaging_service import backup
+    source = _release_source(tmp_path / 'deployed', DEPLOYED_RELEASE)
+    files = tmp_path / 'deployed-files'
+    files.mkdir()
+    events = {'text': recording_event(1), 'access': recording_event(2, 'recording.access.changed')}
+    run = subprocess.run([sys.executable, '-c', DEPLOYED_DRIVER, str(source), json.dumps({
+        'dsn': os.environ['PROBE_TEST_DSN_FILE'], 'files': str(files), 'events': events})], capture_output=True,
+        text=True, timeout=120)
+    assert run.returncode == 0, run.stderr[-2000:]
+    out = json.loads(run.stdout.strip().splitlines()[-1])
+    # Safe refusals, all of them: the runtime will not start on schema 67, its configuration will not name the
+    # source, its contract check quarantines the event, and its backup tooling stops below schema 67.
+    assert out['schema'] == 66 and out['migrate'] == 'database_newer_than_runtime'
+    assert out['config'] == 'invalid_router_config'
+    assert (out['text'], out['access']) == ('invalid_envelope', 'invalid_envelope')
+    assert out['backup_max'] == 66 and backup.SCHEMAS[-1] == 67
+
+
+def _release_source(tmp_path, commit):
+    """A `git archive` of one release (or a sibling checkout named by ANYMSG_PREVIOUS_SOURCE), as _previous_source."""
+    import os
+    import subprocess
+    named = os.environ.get('ANYMSG_PREVIOUS_SOURCE_66')
+    if named:
+        return Path(named) / 'services/messaging'
+    root = Path(__file__).resolve().parents[1]
+    def missing():
+        return subprocess.run(['git', 'cat-file', '-e', commit + '^{commit}'], cwd=root, capture_output=True).returncode
+    if missing():
+        subprocess.run(['git', 'fetch', '--quiet', '--depth=1', 'origin', commit], cwd=root, capture_output=True,
+            timeout=120)
+    if missing():
+        (pytest.fail if os.environ.get('CI') else pytest.skip)(
+            f'the deployed release {commit} is not reachable; set ANYMSG_PREVIOUS_SOURCE_66')
+    archive = subprocess.run(['git', 'archive', commit, 'services/messaging'], cwd=root, capture_output=True,
+        check=True).stdout
+    tmp_path.mkdir()
+    subprocess.run(['tar', '-x', '-C', str(tmp_path)], input=archive, check=True)
+    return tmp_path / 'services/messaging'
 
 
 def _outbox(store):
