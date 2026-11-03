@@ -472,7 +472,10 @@ and the job keeps waiting. The same migration raises the cap of `queue_managed_o
 and a request does not (above); rows that failed under the old five-attempt budget stay
 `failed` until the operator recovery of DK-05. The code stored on a job is the last failure's.
 `network_error` is the catch-all for a failure that has no typed code: a lost adapter, a reply
-timeout, an unclassified error, and for Telegram a refreshed file reference. A WhatsApp media
+timeout and an unclassified error. A Telegram file reference that expired during the download
+is `media_reference_expired`: every attempt reads the message again, so it is retried twice (30 s, then
+5 min) and a third failure makes the job `failed` (`MEDIA_ATTEMPT_CAPS`, `media_retry.py`); it never
+follows the 32.6 h schedule. Rows stored before this code carry `network_error`. A WhatsApp media
 code the adapter returns (for example `media_network_error`, `media_timeout`) is stored as that
 code. So a `failed` original with `network_error` or `rate_limited` is not proof the provider no
 longer has the file. Attachment status reports `queued`, not `failed`, while attempts remain;

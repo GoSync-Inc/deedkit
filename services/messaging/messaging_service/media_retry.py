@@ -11,6 +11,10 @@ MEDIA_RETRY_JITTER = 0.10
 MEDIA_RATE_LIMIT_FREE_DAYS = 7
 # Codes that end the job at the first failure.
 MEDIA_PERMANENT_CODES = frozenset({'unavailable', 'size_limit'})
+# A code with a smaller budget than MEDIA_MAX_ATTEMPTS: the last attempt that may fail and retry.
+# media_reference_expired: every attempt reads the message again, so a fresh reference gets two quick retries
+# (30 s, 5 min) and a third failure ends the job; the 32.6 h schedule would only spin on it.
+MEDIA_ATTEMPT_CAPS = {'media_reference_expired': 3}
 # Explicit requests wake a job whose backoff is at least this long.
 MEDIA_REQUEST_WAKE_SECONDS = 3600
 
