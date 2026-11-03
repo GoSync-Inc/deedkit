@@ -42,6 +42,9 @@ MAX_TSV_BYTES = 16 * 1024**2
 TSV_COLUMNS = ['level', 'page_num', 'block_num', 'par_num', 'line_num', 'word_num', 'left', 'top', 'width', 'height',
                'conf', 'text']
 PROCESSOR_VERSION = 'bounded-v3'
+# ANYM-669: image OCR rows that carry the word counters. A release from before the counters validates and reuses only
+# 'bounded-v3' rows, so after a rollback it never meets a row whose metadata it would reject; this release reuses both.
+MEASURED_PROCESSOR_VERSION = 'bounded-v3+ocr1'
 MAX_PDF_PAGES = 100
 MAX_OCR_PAGES = 5
 MAX_CELL_SPANS = 20000
@@ -143,15 +146,17 @@ def _ocr_measure(path):
         if not line:
             continue
         cells = line.split('\t', len(TSV_COLUMNS) - 1)
-        if len(cells) < len(TSV_COLUMNS) - 1:
+        # Every row is complete (an empty text column keeps its tab); a truncated row discards the measurement.
+        if len(cells) != len(TSV_COLUMNS):
             return {}
         try:
             confidence = float(cells[10])
         except ValueError:
             return {}
-        if not math.isfinite(confidence):
+        # Tesseract writes -1 for rows that are not words and 0-100 for words; anything else is not its TSV.
+        if not math.isfinite(confidence) or not -1 <= confidence <= 100:
             return {}
-        if confidence >= 0 and len(cells) == len(TSV_COLUMNS) and cells[11].strip():
+        if confidence >= 0 and cells[11].strip():
             words += 1
             total += confidence
     measured = {'ocr_words': min(words, MAX_TEXT_CHARS)}
@@ -580,7 +585,10 @@ def _native(data, kind, text_char_limit=MAX_TEXT_CHARS):
         sink.add(text)
         sink.truncated |= output.stat().st_size > len(raw)
         result = sink.result(engine)
-        measured = _ocr_measure(root / 'output.tsv')
+        try:
+            measured = _ocr_measure(root / 'output.tsv')
+        except Exception:  # a measurement never fails or changes the extraction
+            measured = {}
         return replace(result, metadata={**result.metadata, **measured}) if measured else result
 
 

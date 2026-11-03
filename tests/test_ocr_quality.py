@@ -13,8 +13,8 @@ import pytest
 from psycopg.types.json import Jsonb
 
 import messaging_service.file_extract as module
-from messaging_service.file_extract import (IMAGE_OCR_EXTRACTOR, OCR_LOW_CONFIDENCE, extract_original, ocr_quality,
-                                            valid_metadata)
+from messaging_service.file_extract import (IMAGE_OCR_EXTRACTOR, MEASURED_PROCESSOR_VERSION, OCR_LOW_CONFIDENCE,
+                                            PROCESSOR_VERSION, Extraction, extract_original, ocr_quality, valid_metadata)
 from test_file_index import add_file, drain, original, png_text, search, text, worker_for
 from test_media_text_excerpt import read
 
@@ -143,6 +143,12 @@ MALFORMED = {
     'bad-confidence': tsv(row(90, 'fine'), row('abc', 'broken')),
     'not-a-number': tsv(row('nan', 'broken')),
     'short-row': tsv(row(90, 'fine'), '5\t1\t1\n'),
+    # A final row cut right after its confidence must not leave a measurement made of the rows before it.
+    'truncated-last-row': tsv(row(20, 'complete')) + b'5\t1\t1\t1\t1\t1\t0\t0\t10\t10\t90',
+    # Two huge confidences each pass a finite check; their sum would overflow the mean.
+    'overflowing-confidences': tsv(row(1e308, 'a'), row(1e308, 'b')),
+    'confidence-above-100': tsv(row(101, 'loud')),
+    'confidence-below-minus-1': tsv(row(-2, 'quiet')),
 }
 
 
@@ -334,3 +340,33 @@ def test_low_quality_excerpt_is_omitted_with_the_reason(seeded):
     assert read(s, b, detail='compact')['ocr-low']['text_excerpt'] == shown['ocr-low']['text_excerpt']
     pointer = shown['ocr-low']['text_excerpt']['read_more']
     assert text(s, b, pointer['attachment_id'], offset=pointer['offset'], content=pointer['content'])['text'] == NOISE
+
+
+# spec: ANYM-669
+def test_measured_rows_have_their_own_cache_version_so_a_rollback_never_reuses_them(seeded):
+    """A release from before the counters reuses only 'bounded-v3' rows and would reject metadata with the new keys."""
+    s, _, _ = seeded
+    calls = []
+
+    def extractor(path, **kwargs):
+        if not kwargs['filename'].endswith('.png'):
+            return extract_original(path, **kwargs)
+        calls.append(path)
+        return Extraction('ready', 'Synthetic photo text', IMAGE_OCR_EXTRACTOR, False, None,
+                          {'ocr_words': 3, 'ocr_confidence': 20})
+    for name, message in [('ocr-a', 'demo-tg-1'), ('ocr-b', 'demo-tg-2')]:
+        add_file(s, name, message, b'the same synthetic bytes', name + '.png', 'image/png')
+    add_file(s, 'plain', 'demo-tg-1', b'Plain synthetic note', 'plain.txt')
+    drain(worker_for(s, extractor=extractor))
+    drain(worker_for(s))
+    with s.pool.connection() as c:
+        versions = {r['attachment']: r['processor_version'] for r in c.execute(
+            "SELECT attachment,processor_version FROM attachment_text WHERE attachment IN ('ocr-a','ocr-b','plain')")}
+        old_reader = c.execute(
+            "SELECT count(*) AS n FROM attachment_text WHERE processor_version=%s AND extractor=%s",
+            (PROCESSOR_VERSION, IMAGE_OCR_EXTRACTOR)).fetchone()['n']
+    assert versions == {'ocr-a': MEASURED_PROCESSOR_VERSION, 'ocr-b': MEASURED_PROCESSOR_VERSION,
+                        'plain': PROCESSOR_VERSION}
+    assert len(calls) == 1  # the second identical image reused the first one's measured row
+    assert old_reader == 0
+

@@ -360,7 +360,9 @@ and stored cell values. A model document type is generated metadata, not a verif
 classification. `complete=false` identifies bounded or partial extraction.
 
 `FILE_TEXT_CHAR_LIMIT` / `--text-char-limit` accepts 1,000..1,000,000, default
-1,000,000. The processor version is bounded-v3; cached extraction reuse requires
+1,000,000. The processor version is bounded-v3 (image OCR rows that carry the ANYM-669 counters are
+`bounded-v3+ocr1`, so a release from before them never reuses a row whose metadata it would reject; this release reuses
+both); cached extraction reuse requires
 the same configured cap. Migration 016 backfills two derived chunk tables and
 adds their scoped gateway read grants and backup manifest entries. It does not
 reparse old originals automatically: an operator may selectively requeue old

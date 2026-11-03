@@ -20,7 +20,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from .file_extract import (Extraction, ocr_quality, MAX_INPUT_BYTES, MAX_TEXT_CHARS, PROCESSOR_VERSION, extract_original,
+from .file_extract import (Extraction, MEASURED_PROCESSOR_VERSION, ocr_quality, MAX_INPUT_BYTES, MAX_TEXT_CHARS, PROCESSOR_VERSION, extract_original,
                           extraction_profile, valid_metadata)
 from .field_errors import cursor_refusal, date_range_refusal
 from .policy import scope_filter, targets
@@ -777,8 +777,8 @@ class FileIndexer:
                 processor_version=%s,extraction_profile=%s,display_name=%s,extraction_metadata=%s,
                 updated_at=clock_timestamp() WHERE attachment=%s''',
                 (state, result.text if state == 'ready' else '', result.truncated if state == 'ready' else False,
-                 result.extractor, result.error_code, state, self.retry_seconds, PROCESSOR_VERSION,
-                 self.profile(job), display_name(job['source_filename']),
+                 result.extractor, result.error_code, state, self.retry_seconds,
+                 MEASURED_PROCESSOR_VERSION if 'ocr_words' in result.metadata else PROCESSOR_VERSION, self.profile(job), display_name(job['source_filename']),
                  Jsonb({**result.metadata, 'text_char_limit': self.text_char_limit}), job['attachment']))
             if state == 'ready' or result.state == 'failed':
                 identity = {'processor_version': PROCESSOR_VERSION, 'profile': self.profile(job),
@@ -800,9 +800,9 @@ class FileIndexer:
         with self.connection() as c:
             cached = c.execute('SELECT f.text_content,f.extractor,f.truncated,f.error_code,f.extraction_metadata ' + JOIN +
                 " WHERE " + CURRENT + " AND f.state='ready' AND f.source_digest=%s AND f.source_bytes=%s" +
-                " AND f.extraction_profile=%s AND f.processor_version=%s ORDER BY f.attachment LIMIT 1",
+                " AND f.extraction_profile=%s AND f.processor_version=ANY(%s) ORDER BY f.attachment LIMIT 1",
                 [job['source_digest'], job['source_bytes'], self.profile(job),
-                 PROCESSOR_VERSION]).fetchone()
+                 [PROCESSOR_VERSION, MEASURED_PROCESSOR_VERSION]]).fetchone()
         if not cached:
             return None
         # A previous cache hit is not proof that today's immutable original is
