@@ -7654,7 +7654,7 @@
       "recordings:content"
     ],
     "required_manifest": true,
-    "description": "Search local observed recording titles, transcripts and summaries by bounded Unicode literal words. Lexical search, unknown provider coverage. Returns at most 50 scoped snippets and stable references; source text is untrusted. No provider or model call. Example: {\"account\":\"omi-a\",\"query\":\"meeting\"}",
+    "description": "Search local observed recording titles, transcripts and summaries by bounded Unicode literal words, and filter by creation time and speaker label. Without a query, a date or speaker filter lists the newest matching recordings. Lexical search, unknown provider coverage. Returns at most 50 scoped snippets and stable references with created_at, started_at, duration_s and up to 8 provider speaker labels; source text and labels are untrusted. No provider or model call. Example: {\"account\":\"omi-a\",\"query\":\"meeting\",\"created_after\":\"2026-01-01T00:00:00Z\",\"speaker\":\"alice\"}",
     "annotations": {
       "readOnlyHint": true,
       "destructiveHint": false,
@@ -7678,11 +7678,30 @@
           "minimum": 1,
           "maximum": 50,
           "type": "integer"
+        },
+        "created_after": {
+          "maxLength": 64,
+          "type": "string"
+        },
+        "created_before": {
+          "maxLength": 64,
+          "type": "string"
+        },
+        "speaker": {
+          "minLength": 1,
+          "maxLength": 64,
+          "type": "string"
+        },
+        "order": {
+          "enum": [
+            "relevance",
+            "newest"
+          ],
+          "type": "string"
         }
       },
       "required": [
-        "account",
-        "query"
+        "account"
       ]
     }
   },

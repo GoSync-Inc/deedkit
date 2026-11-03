@@ -200,7 +200,7 @@ def test_schema3_upgrade_is_additive_and_a_failed_upgrade_rolls_back_to_usable_v
     meta = dict(sql(doc, 'SELECT key,value FROM meta'))
     archive_id, incarnation, journal_id = meta['archive_id'], meta['incarnation'], meta['journal_id']
     assert len(archive_id) == 32 and len(journal_id) == 32 and incarnation == 1 and archive_id != journal_id
-    assert sql(doc, 'SELECT key,typeof(value) FROM meta ORDER BY key') == [
+    assert sql(doc, "SELECT key,typeof(value) FROM meta WHERE key NOT LIKE 'index_%' ORDER BY key") == [
         ('archive_id', 'text'), ('incarnation', 'integer'), ('journal_id', 'text')]
     columns = {row[1] for row in sql(doc, 'PRAGMA table_info(accounts)')}
     assert {'throttled_until', 'traversal_state', 'passes_completed', 'last_page_at'} <= columns
@@ -217,11 +217,11 @@ def test_online_backup_accepts_schema3_and_unknown_newer_schema_is_refused(tmp_p
         snapshots.mkdir(mode=0o700)
         backup_archive(r.document().archive, str(snapshots / 'copy.sqlite'))
         with sqlite3.connect(snapshots / 'copy.sqlite') as copy:
-            assert copy.execute('PRAGMA user_version').fetchone() == (3,)
+            assert copy.execute('PRAGMA user_version').fetchone() == (4,)  # ANYM-725: a new archive starts at schema 4
             assert copy.execute('SELECT count(*) FROM records').fetchone() == (3,)
         await r.close()
     asyncio.run(run())
-    sql(doc, 'PRAGMA user_version=4')
+    sql(doc, 'PRAGMA user_version=5')
     async def refused():
         r = runtime(path, omi); await r.start(background=False)
         assert r.error == 'archive_schema_unsupported'

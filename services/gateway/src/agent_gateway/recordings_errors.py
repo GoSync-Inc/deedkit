@@ -8,6 +8,8 @@ RECOVERY = {
     'archive_schema_unsupported': (False, 'operator_check_recording_archive_version'),
     'archive_capacity': (False, 'operator_check_recording_archive_capacity'),
     'archive_busy': (True, 'retry_after_delay'),
+    'index_building': (True, 'retry_after_delay'),
+    'query_or_filter_required': (False, 'correct_arguments'),
     'transcript_window_exceeded': (False, 'provider_transcript_window_limit'),
     'unsupported_plaud_filters_or_limit': (False, 'correct_arguments'),
     'audio_unsupported': (False, 'provider_audio_unsupported'),
