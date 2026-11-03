@@ -159,8 +159,12 @@ exit 0
 """
 
 
-def spec(mini):
-    """The canonical rules per table, read back from `rules()` (the one rule list), and the generated after.init."""
+def spec(mini, resolver=None):
+    """The canonical rules per table, read back from `rules()` (the one rule list), and the generated after.init.
+
+    With a recordings `resolver` (RECORDINGS_RESOLVER, ANYM-712) the hook is the composed one, generated from both families
+    (firewall_persist.compose_after_init); without it the text is the inference-only hook, byte for byte.
+    """
     lines = [line for line in rules(mini) if ' -N ' not in line and ' -F ' not in line]
     tables = persist().spec_from_commands(lines, CHAIN)
     raw = ['*raw', f':{CHAIN} - [0:0]', *tables['raw']['chain'], 'COMMIT']
@@ -168,6 +172,9 @@ def spec(mini):
               for binary, family, table in (('iptables', 'v4', 'raw'), ('ip6tables', 'v6', 'raw6'))
               for hook in tables[table]['hooks']]
     text = AFTER_INIT.replace('@RAW@', '\n'.join(raw)).replace('@ENSURE@', '\n'.join(ensure))
+    if resolver is not None:
+        recordings = persist().load('recordings_egress_check')
+        text = persist().compose_after_init(text, recordings.step_text(recordings.spec(resolver)['tables']))
     return {'chain': CHAIN, 'bridges': (BRIDGE, DB_BRIDGE), 'tables': tables, 'after_init': text}
 
 
@@ -282,12 +289,15 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ['verify']:
         address = re.compile(r'^-A DEEDKIT-INFERENCE -d \S+ -p tcp --dport 443 -j RETURN$')
-        return persist().verify_cli(argv[1:], lambda value: spec(mini_address(value)), 'INFERENCE_MINI_IP',
-                                    'compare the repository, the ufw files and the kernel for the mini worker rules', address)
+        return persist().verify_cli(argv[1:], lambda value, resolver: spec(mini_address(value), ipaddress.IPv4Address(resolver) if resolver else None),
+                                    'INFERENCE_MINI_IP', 'compare the repository, the ufw files and the kernel for the mini worker rules',
+                                    address, also='RECORDINGS_RESOLVER')
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     commands = parser.add_subparsers(dest='command', required=True)
     rule = commands.add_parser('rules', help='print the host firewall commands')
     rule.add_argument('--mini-ip', type=mini_address, help="the Mac mini's tailnet IPv4 address (100.64.0.0/10)")
+    rule.add_argument('--recordings-resolver', type=ipaddress.IPv4Address,
+                      help='with --format after-init: add the recordings half (RECORDINGS_RESOLVER, ANYM-712) to the one hook')
     rule.add_argument('--undo', action='store_true', help='print the commands that remove the rules')
     rule.add_argument('--format', choices=('commands', 'ufw', 'after-init'), default='commands',
                       help='commands (default), the block for ufw rules files, or the after.init hook')
@@ -321,7 +331,7 @@ def main(argv=None):
         if args.format == 'ufw':
             print(ufw_form(args.mini_ip, args.family, args.source), end='')
         elif args.format == 'after-init':
-            print(spec(args.mini_ip)['after_init'], end='')
+            print(spec(args.mini_ip, args.recordings_resolver)['after_init'], end='')
         else:
             print('\n'.join(undo() if args.undo else rules(args.mini_ip)))
         return 0

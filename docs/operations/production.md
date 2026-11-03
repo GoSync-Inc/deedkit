@@ -1374,6 +1374,8 @@ What is persisted and where (ufw owns `DOCKER-USER`, so a second restore file wo
 | delivery filter chain, `DOCKER-USER` hook, host-bound drops, IPv6 drops | `deedkit-delivery` block in `/etc/ufw/before.rules` and `before6.rules` (the first block; it declares `:DOCKER-USER`) | ufw, at boot and at every `ufw reload` |
 | inference filter chain, `DOCKER-USER` hook, host-bound drops (`dk-inference0`, `dk-inferencedb0`), IPv6 drops | `deedkit-inference` block in the same two files, after the delivery block (it declares only its own chain) | ufw |
 | inference raw chain and the `raw` `PREROUTING` jumps (IPv4 chain, IPv4 and IPv6 jump) | `/etc/ufw/after.init` (mode 0755, root), `rules --format after-init` | ufw, with `start`, after it has loaded its rules |
+| recordings filter chain, `DOCKER-USER` hook, host-bound drops (`dk-recordings0`, `dk-recbackend0`), IPv6 drops (ANYM-712) | `deedkit-recordings` block in the same two files, after the delivery block (it declares only its own chain) | ufw |
+| recordings raw chain and the `raw` `PREROUTING` jumps | a function of the same `/etc/ufw/after.init`, which is then generated from both families (`rules --format after-init` of either script) | ufw, with `start` |
 | comparison and boot receipt | `verify` of both scripts; `deedkit-firewall-verify.service`, which writes `/var/lib/deedkit/firewall-verify.json` | each boot, after `ufw.service` and `docker.service` |
 
 The raw table is not in ufw's files because restoring them would flush Docker's own raw rules. `after.init` replaces
@@ -1735,6 +1737,82 @@ file a regular file of mode 0600 owned by 10001. Paths inside `config.json` are 
 `deploy/recordings-archive.example.json` adds the archive (under `/data/archive`, never a `/private/...` path of the
 README example) and each account's `archive_namespace`, and is used only after the archive gates pass. The owner
 writes the provider keys by hand; the agent only checks modes and that a file is not empty.
+
+**Network confinement (ANYM-712).** `recordings-api` joins only `recordings-backend` (internal) and `recordings-egress`
+(bridge `dk-recordings0`, no IPv6); no other service joins the egress bridge. `scripts/recordings_egress_check.py` prints the
+host rules (`rules --resolver IP`, with `--undo` for the exact inverse): the chain `DEEDKIT-RECORDINGS` allows UDP and TCP 53
+to the host resolver, drops `0.0.0.0/8`, `10/8`, `100.64/10` (tailnet), `127/8`, `169.254/16` (metadata), `172.16/12`,
+`192.0.0/24`, `192.168/16`, `198.18/15`, multicast and reserved, allows TCP 443 and drops everything else. It is hooked twice,
+in `DOCKER-USER` and in raw `PREROUTING` (Tailscale's `ts-forward` accept can precede `DOCKER-USER`; the raw hook runs before
+conntrack and cannot be passed over by a reorder), plus `INPUT` drops for `dk-recordings0` and `dk-recbackend0` (no route to the
+host itself) and IPv6 drops in all three places. It never edits the inference or delivery rules.
+
+The internal backend bridge `dk-recbackend0` also needs a rule: peers on it reach each other, and the gateway listens there on
+0.0.0.0, so without one the recordings container could open a connection to the gateway. The filter chain therefore starts
+with three rules for traffic entering from `dk-recbackend0` (a third `DOCKER-USER` hook): replies (conntrack
+`RELATED,ESTABLISHED`) pass, a NEW connection to the service port 13234 passes (the gateway's requests), everything else is
+dropped. The raw chain does not hold them (no conntrack before raw). This relies on Docker's `br_netfilter`, which also
+carries its own inter-container rules. Read-back: `check --blocked GATEWAY_BACKEND_IP:13240` from the container is
+blocked, while a gateway request to recordings-api still answers.
+
+Persistence follows "Host firewall persistence (ANYM-693)": the filter blocks go into the `deedkit-recordings` block of
+`/etc/ufw/before.rules` and `before6.rules` (`rules --resolver $RECORDINGS_RESOLVER --format ufw --family v4|v6 --source FILE`
+merges it after the delivery block), the raw half is a function of the ONE generated `/etc/ufw/after.init`
+(`rules --resolver $RECORDINGS_RESOLVER --mini-ip $INFERENCE_MINI_IP --format after-init`; the inference script prints the same
+text with `--recordings-resolver`). `RECORDINGS_RESOLVER` (the host's DNS resolver the container uses, IPv4) is a new line of
+`/opt/personal-os-probe/.env`; with it set, both `verify` commands expect the composed hook, without it the hook is the
+inference-only text of before. `recordings_egress_check.py verify` prints `ok` or `<pair> <code>`; the boot receipt gets a
+`recordings` key (`not_installed` until the resolver is configured, then it decides `ok`).
+
+Order for the root activation (the plan is Astra-reviewed, none runs during an active call): install the updated
+`firewall_persist.py`, `inference_egress_check.py`, `recordings_egress_check.py` to `/usr/local/lib/deedkit/` FIRST (the old
+inference verifier would read the composed hook as `table_differs:raw`); then the ANYM-693 "Safe order" steps with the new
+block and hook; `verify` of all three scripts must print `ok`; only then start `recordings-api`. To remove: stop
+`recordings-api` first, then run the rules' `undo` (it removes only the recordings rules and the composed hook goes back to
+the inference-only text, with `RECORDINGS_RESOLVER` removed from the env file).
+
+**DNS.** The overlay sets `dns: [$RECORDINGS_RESOLVER]` (required), the same address the host rules allow: Docker's embedded
+resolver then queries that server from the container's namespace, where the bridge rules apply; without `dns` it would
+use the host's inherited resolvers from the host namespace, outside them. Read-back: `getent hosts api.omi.me` works in the
+container and a query to any other resolver (`check --blocked-dns IP`) gets no answer.
+
+**Boot order and budget.** The recordings half of `after.init` runs LAST, after the inference half has loaded and just before
+the record is written, so it cannot delay, shorten or break the inference half, which runs exactly as before under the
+hook's unchanged 60 s bound. When inference fails or is slow, the recordings rules are not loaded in that boot: the failure
+is in the raw-step record, in `verify` and in the receipt, and `recordings-api` refuses to serve without them (admission,
+fail closed). The recordings half is a child of the hook under its own bound (`DEEDKIT_RECORDINGS_TIMEOUT`, 1-10 s, default
+8 s, plus a 2 s kill grace). GNU `timeout` puts each command in its own process group, so the child gets the same value as its
+per-command limit and `/dev/null` for stdin, stdout and stderr, and reports by exit status (11 restore, 12 and 13 the hook),
+never by captured output. An overrun records `hook_recordings_124` (or `restore_recordings_v4` when the command's own limit,
+the same value, ends first), a restore or hook failure `restore_recordings_v4` or `hook_recordings_v4|v6`, in the same
+raw-step record. The hook still exits 0.
+
+**Egress admission.** The overlay sets `RECORDINGS_EGRESS_ADMISSION=required` and requires `RECORDINGS_EGRESS_BLOCKED` and
+`RECORDINGS_EGRESS_OPEN` (comma-separated, in the project's env file; Compose refuses a missing one). Before the CLI binds its
+port it probes them from inside the container: every blocked `IP:PORT` (a known host listener, a tailnet address with a known
+listener, the gateway's listener; `dns:IP` for a DNS query) must get no answer (timeout or no route; a refusal fails, since a
+DROP never sends one), every open target (`api.omi.me:443`, `dns:<RESOLVER_IP>`) must answer. Otherwise it exits 78 and
+`restart: unless-stopped` loops only this service; the gateway returns its recordings tool error, nothing else depends on
+it. This covers boot, promotion and any restart. Source runs and tests leave the variable unset and skip it. The probes send
+a TCP handshake and one DNS query, never a token.
+
+**The canary proves the raw layer.** `RECORDINGS_EGRESS_BLOCKED` must name `192.0.2.254:9` (TEST-NET-1, RFC 5737: never
+routable, no listener anywhere); admission refuses to start without it. The raw chain drops that destination first (the probe
+times out), the filter chain REJECTs it with a reset. In a boot where inference failed or was slow, ufw has loaded the filter
+rules but the recordings raw rules were skipped: the canary then gets a refusal instead of a timeout and the start is refused,
+so `recordings-api` cannot serve without the raw layer (the one that survives a tailscaled `ts-forward` reorder) in that boot.
+Example: `RECORDINGS_EGRESS_BLOCKED=192.0.2.254:9,<host listener>,<tailnet listener>,<gateway listener>` and
+`RECORDINGS_EGRESS_OPEN=api.omi.me:443,dns:<resolver>`.
+
+The production read-back runs `check` from the real two-network container (`docker compose $F exec -T recordings-api python -I -
+check --open api.omi.me:443 --open-dns RESOLVER --blocked HOST_BRIDGE_IP:PORT --blocked TAILNET_IP:PORT --blocked
+GATEWAY_IP:PORT < scripts/recordings_egress_check.py`; every blocked target needs a known listener, or "blocked" could mean
+that nothing listens; `listen` in a sibling container is the positive control).
+
+*Residual, documented:* the bridge does not pin hostnames. Any public HTTPS host is reachable by the container; host pinning
+rests on the adapters' fixed origins (`api.omi.me`, `mcp.plaud.ai`) and refused redirects and proxies (`trust_env=False` in
+`omi.py` and `plaud.py`, with their tests) until a proxy-capable adapter exists. Follow-up card candidate: a hostname-allowlisting
+egress (a proxy or DNS-level allowlist) for the recordings bridge.
 
 **First publication (owner action, once).** GHCR creates the new package `deedkit-recordings` private. The host has
 no GitHub token and `production.py` reads the registry anonymously, so before the first start an organization owner
