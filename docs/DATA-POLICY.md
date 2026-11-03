@@ -30,7 +30,7 @@ volume) (owner 11-03, see Data egress).
   Backup copies age out by the backup rotation (BACKUP.md). Messages and other kinds: proposal (no
   owner decision on a limit).
 - Recording texts (recordings archive, owner 11-03 «2) ок»): kept until the owner sets a term; deleted on
-  the owner's request. No deletion tool or automatic deletion exists today: a deletion is manual, under the
+  the owner's request (this wording is the orchestrator's reading of «2) ок», an interim default). No deletion tool or automatic deletion exists today: a deletion is manual, under the
   data-deletion gates (process.md section 2), and a provider-side deletion does not purge the local text
   (services/recordings/README.md). The owner named no term; a term is a new owner decision.
 - Bot buttons: the labels, kinds, URLs, Mini App links and callback data of a message's inline and
