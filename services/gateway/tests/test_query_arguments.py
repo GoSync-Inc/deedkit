@@ -33,6 +33,17 @@ def test_search_chat_types_validate_and_include_channels_defaults_false():
             arguments(search, values)
 
 
+# spec: ANYM-665
+def test_gateway_does_not_inject_media_defaults():
+    search = CATALOG["messages_search"]
+    # The default (true) lives in messaging, so a new gateway in front of an old backend sends nothing it does not know.
+    assert "include_media_text" not in arguments(search, {})
+    assert arguments(search, {"include_media_text": False})["include_media_text"] is False
+    assert "default" not in search["inputSchema"]["properties"]["include_media_text"]
+    with pytest.raises(ValueError):
+        arguments(search, {"include_media_text": "no"})
+
+
 @pytest.mark.parametrize("tool,values", [
     ("messages_search", {"query": "synthetic", "exclude_channels": True}),
     ("messages_get_updates", {"consumer": "synthetic-new", "start_from": "now"}),

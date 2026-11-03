@@ -4,7 +4,7 @@ import re
 MESSAGE_FIELDS = ('id','message','account','chat','sender','sent_at','revision','direction',
     'provider_message_id','kind','origin','historical','is_backfill','event_sequence','sender_name','sender_name_basis','username',
     'chat_title','chat_type','reply_to_provider_id','reply_to','mentions_owner','reply_to_owner','forwarded','media_kind','body_truncated',
-    'sender_identity_basis','agent_send','delivery_receipt','formatting','body_rendered','body_rendered_unavailable')
+    'sender_identity_basis','agent_send','delivery_receipt','formatting','body_rendered','body_rendered_unavailable','matched_in','media_matches')
 CONVERSATION_FIELDS = ('body','kind','is_service','display_text','position','order_basis',
     'order_status','timestamp_resolution','first_observed_at','first_observed_basis',
     'ingested_at','ordering_warning','conversation_view_version','provider_message_type',
@@ -139,6 +139,9 @@ def lean_message(row, *, search=False, files=True):
         for key in ('chat_title','chat_type'):
             if row.get(key):result[key]=row[key][:72]
         if row.get('match_type') not in (None,'history'):result['match_type']=row['match_type']
+        # ANYM-665: where a query matched, and the photo, PDF or voice note when it was one.
+        for key in ('matched_in','media_matches'):
+            if row.get(key) is not None:result[key]=row[key]
     text=row.get('display_text') or ''
     result['display_text']=text
     if row.get('display_text_truncated') or row.get('body_truncated'):result['truncated']=True
@@ -180,7 +183,8 @@ def lean_view(view):
     return result
 
 
-EVIDENCE_SUMMARY=('empty_reason','requested_range_traversed','active_conflicts_in_range','next_action','empty_fields')
+EVIDENCE_SUMMARY=('empty_reason','requested_range_traversed','active_conflicts_in_range','next_action','empty_fields',
+    'media_text_pending','media_text_unavailable')
 EVIDENCE_LIVE=('live','live_wait','suggested_call','archive_reread')
 EVIDENCE_CONSTANTS=('basis','full_history_verified','message_index')
 
@@ -430,6 +434,11 @@ def lean(method, result, include_coverage=False):
     # The search block echoes the request; only a fuzzy match changes how to read the rows (they are near misses).
     block=result.pop('search',None)
     if block and block.get('fuzzy_used'):result['search']={'fuzzy_used':True}
+    # ANYM-665: a query that skipped the media arm on purpose says so (exact mode with its hint, or include_media_text=false),
+    # and the count of hits that are OCR noise.
+    if block and block.get('media_text_applied') is False:
+        result.setdefault('search',{}).update({k:block[k] for k in ('media_text_applied','media_text_hint') if k in block})
+    if block and block.get('media_low_quality_hits'):result.setdefault('search',{})['media_low_quality_hits']=block['media_low_quality_hits']
     if method=='get_context':
         anchor=result['message']
         rows=result['context']

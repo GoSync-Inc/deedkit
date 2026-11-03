@@ -377,6 +377,8 @@ class Store:
                         from .error_details import classified
                         code=classified(error)
                         failure = APIError(code,503) if code in ('query_timeout','service_busy','service_unavailable') else error
+                        # ANYM-665: a reviewed recovery hint set on the database error survives the conversion.
+                        if failure is not error and hasattr(error,'next_action'):failure.next_action=error.next_action
                         p = p or getattr(error, 'audit_identity', None)
                         # transaction_timeout ends the server session (ANYM-265): nothing was committed, and the
                         # failure is audited on a fresh connection instead of the closed one.
@@ -772,7 +774,7 @@ class Store:
                to_time='', after='', limit=20, *, accounts=None, chats=None, senders=None, collapse_forwards=True,
                query_mode='all', order='asc', before='', direction='', search_language='auto',
                fuzzy=False, compact=False, body_chars=None, include_coverage=True,view='archive',include_system=False,exclude_channels=False,
-               chat_types=None,include_channels=False,person='',body_format='',_scope=None):
+               chat_types=None,include_channels=False,person='',body_format='',include_media_text=True,_scope=None):
         # None is the internal no-default sentinel of message_queries.search, never a public value.
         if type(include_channels) is not bool:raise APIError('invalid_filter')
         from .message_queries import named_chats
@@ -785,7 +787,7 @@ class Store:
                 accounts=accounts,chats=chats,senders=senders,collapse_forwards=collapse_forwards,query_mode=query_mode,
                 order=order,before=before,direction=direction,search_language=search_language,
                 fuzzy=fuzzy,compact=compact,body_chars=body_chars,include_coverage=include_coverage,view=view,include_system=include_system,exclude_channels=exclude_channels,
-                chat_types=chat_types,include_channels=include_channels,person=person,body_format=body_format)
+                chat_types=chat_types,include_channels=include_channels,person=person,body_format=body_format,include_media_text=include_media_text)
             self._search_suggestion(c,p,account,accounts,chat,chats,chat_types,exclude_channels,result)
             return result
 

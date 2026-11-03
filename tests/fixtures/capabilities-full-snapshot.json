@@ -417,6 +417,25 @@
    "full",
    "transcript"
   ],
+  "message_media_text": {
+   "default": true,
+   "max_chars_per_attachment": 32000,
+   "parameter": "include_media_text",
+   "query_modes": [
+    "all",
+    "any",
+    "phrase",
+    "web"
+   ],
+   "row_fields": [
+    "matched_in",
+    "media_matches"
+   ],
+   "sources": [
+    "extracted",
+    "transcript"
+   ]
+  },
   "model_processing": "optional_operator_configured_local_or_api",
   "optional_coverage": true,
   "orders": [
