@@ -101,7 +101,7 @@ test('typed action definitions retain required identities and optional reviewed 
     SubscriptionEventKind:['message.created','message.edited','message.deleted','message.status',
       'attachment.ready','file.text.ready','file.transcript.ready','file.description.ready','file.processing.failed',
       'send.failed','source.health'],
-    SubscriptionOrigin:['live','backfill','reconcile','fixture'],
+    SubscriptionOrigin:['live','live_recovered','backfill','reconcile','fixture'],
   };
   for(const [name,members] of Object.entries(unions)){
     const body=new RegExp(`export type ${name} = ([\\s\\S]*?);`).exec(declared)?.[1];

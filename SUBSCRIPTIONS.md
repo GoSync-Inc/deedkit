@@ -42,6 +42,21 @@ can include `backfill`, `reconcile` or synthetic `fixture`; historical matches
 are marked. Expiry is optional, timezone-aware, in the future and at most 366
 days ahead. No messages before the creation frontier are replayed.
 
+The live stream can lose a message (a reconnect, a capture overload restart;
+COLLECTORS.md, Availability of new messages). The next reconcile pass then stores
+it, minutes to hours after it was sent, and the journal records it with origin
+`reconcile` as before (the update feed and older readers see no change). A
+subscription reads such a message as origin `live_recovered` (ANYM-733) when the
+event was committed at most 6 hours after the message was sent: a selector with
+`live` or `live_recovered` matches it, it is not `historical`, and it wakes like a
+live message (`incoming_message` and the other live wake rules).
+Compare its `sent_at` and `observed_at` to see how late it was. A message first
+stored more than 6 hours after it was sent, an unparsable sent time, every edit
+or deletion found by reconcile, `backfill` and `fixture` keep their origin and
+stay historical. A selector that lists `reconcile` asked for the stored origin and
+keeps it: it sees the message as `reconcile` and `historical`, as before. A webhook
+reference carries the same `origin` and `wake_reason` the fetch shows.
+
 Lifecycle is `active`, `paused`, `closed`, `expired` or `access_changed`.
 Resume defaults to `catch_up`; explicit `skip` records the intentionally skipped
 journal range. Re-read the version after a `subscription_conflict`. For an explicit
@@ -598,7 +613,7 @@ is `rotation_in_progress` with `retry_after_s`. Operator receivers keep the
 **Payload.** No message text, names or file content, and no `host_turn_verified`.
 An `events` hint is `{type, hint_id, subscription_id, version, label, references,
 references_omitted, next_call}` within 4 KiB: at most 20 references, each
-`{event_id, kind, occurred_at, wake_reason, account_id, chat_id, message_id,
+`{event_id, kind, origin, occurred_at, wake_reason, account_id, chat_id, message_id,
 sender_id, reply_to_send_id?}`, the rest counted in `references_omitted`;
 `next_call` is `messages_fetch_subscription_events`. References are rechecked at
 dispatch under the revocation fence. A `silence` hint carries the anchor `send_id`
