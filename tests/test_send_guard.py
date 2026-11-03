@@ -199,6 +199,33 @@ def test_next_call_window_holds_every_counted_message_at_one_instant(guarded):
     assert [row['id'] for row in window][0] == counted[0] and set(counted) <= {row['id'] for row in window}
 
 
+def listed(context):
+    return {context['message']['id']} | {row['id'] for row in context['context']}
+
+
+# spec: ANYM-736
+def test_returned_continuation_reads_every_counted_message_over_rest_and_mcp(guarded):
+    s, archive, key = guarded
+    seen = say(archive, 1, 0)
+    counted = [say(archive, 30 + n, 10) for n in range(10)]
+    headers = {'Authorization': 'Bearer ' + key}
+    with TestClient(create_app(s, ['testserver'])) as client:
+        refusal = client.post('/v1/send_message', headers=headers, json={'account': ACCOUNT, 'chat_id': CHAT,
+            'text': 'Exact synthetic text', 'request_id': 'guard-request-0001', 'expected_last_message_id': seen})
+        body = refusal.json()
+        assert refusal.status_code == 409 and body['error'] == 'chat_changed_since_seen'
+        step = body['next_call']
+        assert step['tool'] == 'get_context' and step['arguments']['view'] == 'conversation'
+        rest = client.post('/v1/get_context', headers=headers, json=step['arguments'])
+        mcp = client.post('/mcp', headers={**headers, 'Accept': 'application/json, text/event-stream'},
+            json={'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call',
+                  'params': {'name': step['tool'], 'arguments': step['arguments']}})
+    assert rest.status_code == 200 and set(counted) <= listed(rest.json())
+    assert mcp.json()['result']['isError'] is False
+    assert set(counted) <= listed(mcp.json()['result']['structuredContent'])
+    assert rows(s) == []
+
+
 def normalized(response):
     body = response.json()
     body.pop('request_id', None)

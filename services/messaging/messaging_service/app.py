@@ -465,18 +465,16 @@ def register_send_tools(mcp, call, async_call, read):
         with no chat: preview_message with username, then send_message with the same username
         and that preview_digest; the send resolves the username again and refuses a different
         person (identity_changed), then returns chat_id, chat_existed, user_id and name.
-        Optional guard for a chat_id send (needs read on the chat): expected_last_message_id is the archive ID
-        of the newest message you actually read in this chat (never an ID from a preview). If newer eligible
-        messages reached the archive since, nothing is queued and the call is refused chat_changed_since_seen
-        (409) with newer_count, newer_outgoing_count, first_newer_message_id, newest_message_id and a next_call
-        that reads them: read, then decide again. guard any_message (default) counts every newer visible
-        message, including your own earlier send (after a send pass its archive ID); outgoing_only counts only
-        messages the owner wrote from any device. A retry with the same request_id returns the first result,
-        never a new check. The guard sees only what the archive holds at that moment: a message not yet ingested,
-        an older backfilled message and an edit are not seen, and one arriving after the check and before the
-        provider send is a race it cannot close. It does not replace the owner's confirmation or the duplicate
-        rules. An unknown ID, or a phone or username recipient, is invalid_parameters expected_message_unknown;
-        chat_guard_unavailable (503) queued nothing.
+        Optional guard, chat_id sends with read on the chat: expected_last_message_id is the archive ID of the
+        newest message you actually read (never one from a preview). If newer eligible messages reached the archive,
+        nothing is queued and the call is refused chat_changed_since_seen (409) with newer_count,
+        newer_outgoing_count, first_newer_message_id, newest_message_id and a next_call that reads them: read, then
+        decide again. guard any_message (default) counts any newer visible message, your own earlier send included;
+        outgoing_only counts only the owner's. A retry with the same request_id returns the first result. The guard
+        sees only the archive at that moment (not messages not yet ingested or edited) and cannot close the race
+        before the provider send; it does not replace the owner's confirmation. An unknown ID or a phone/username
+        recipient is invalid_parameters expected_message_unknown; chat_guard_unavailable (503) queued nothing.
+        After a lost response use get_send_status with request_id.
         """
         guarded={k:v for k,v in (('expected_last_message_id',expected_last_message_id),('guard',guard)) if v is not None}
         return await async_call(ctx,'send_message',account=account,chat_id=chat_id,phone=phone,username=username,

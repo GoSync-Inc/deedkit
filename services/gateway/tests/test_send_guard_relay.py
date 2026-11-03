@@ -142,14 +142,15 @@ def test_a_changed_chat_refusal_is_relayed_with_the_gateways_own_next_call(tmp_p
             "newer_count_capped": False, "newer_outgoing_count": 1, "first_newer_message_id": "msg_" + "1" * 32,
             "newest_message_id": "msg_" + "2" * 32, "next_action": "read_newer_messages_then_decide",
             "next_call": {"tool": "get_context", "arguments": {"message_id": "msg_" + "1" * 32, "before_count": 0,
-                                                                  "after_count": 20}, "caller_supplies": []}})
+                                                                  "after_count": 20, "view": "conversation"}, "caller_supplies": []}})
     app, _ = setup(tmp_path, grants=("read", "send"), answer=changed)
     result = post(app, "messages_send_message", GUARDED)
     body = result.json()
     assert result.status_code == 409 and body["error"] == "chat_changed_since_seen"
     assert (body["newer_count"], body["newer_outgoing_count"], body["newest_message_id"]) == (2, 1, "msg_" + "2" * 32)
     assert body["next_call"]["tool"] == "messages_get_context"
-    assert body["next_call"]["arguments"]["after_count"] == 20
+    assert body["next_call"]["arguments"] == {"message_id": "msg_" + "1" * 32, "before_count": 0, "after_count": 20,
+                                              "view": "conversation"}
 
 
 # spec: ANYM-736
