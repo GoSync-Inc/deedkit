@@ -582,24 +582,24 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
         AND kind='events' AND state='delivered' AND through_position>=%s''',
         (row['id'], events[0]['id'])).fetchall() if events else []
     pruned_through = row.get('hints_deleted_through') or 0
-    # A batch limit can delete one of several finished hints at one position and keep another: hints_deleted_through
-    # then stays below that position. A kept hint finished before the last deletion's cutoff was eligible for it, so an
-    # earlier twin may be gone: its time is not the first delivery either.
+    # Retention deletes only finished hints older than the cutoff, and a hint covering an event is created after the
+    # event matched. An event matched at or after (last deletion - retention days) can therefore have lost none of its
+    # covering hints, whatever states and positions the kept hints have; an older one may have lost its first (a batch
+    # limit can take one of several hints at a position and leave hints_deleted_through unmoved): unknown.
     cutoff = row['hints_deleted_at'] - timedelta(days=CLOSED_RETENTION_DAYS) if row.get('hints_deleted_at') else None
 
-    def delivered_at(event_id):
-        if event_id <= pruned_through:
+    def delivered_at(event):
+        if event['id'] <= pruned_through or (cutoff is not None and event['matched_at'] < cutoff):
             return None
-        first = min((hint['finished_at'] for hint in delivered
-            if hint['through_position'] >= event_id and hint['finished_at']), default=None)
-        return None if first is not None and cutoff is not None and first < cutoff else first
+        return min((hint['finished_at'] for hint in delivered
+            if hint['through_position'] >= event['id'] and hint['finished_at']), default=None)
 
     seen = [seen_origin(row['selector']['origins'], event['origin'], event['kind'], event['snapshot'].get('sent_at'),
         event['created_at']) for event in events[:limit]]
     items = [{**{key: event['snapshot'][key] for key in fields if key in event['snapshot']},
         'event_id': event['id'], 'kind': event['kind'], 'origin': origin,
         'revision': event['revision'], 'observed_at': event['created_at'],
-        'matched_at': event['matched_at'], 'delivered_at': delivered_at(event['id']),
+        'matched_at': event['matched_at'], 'delivered_at': delivered_at(event),
         'historical': origin in ('backfill', 'reconcile'),
         'matching_basis': 'exact_event_revision'} for event, origin in zip(events, seen)]
     from .subscription_consumption import wake_reason

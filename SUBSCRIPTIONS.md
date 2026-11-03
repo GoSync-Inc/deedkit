@@ -162,8 +162,9 @@ stages in order, and `get_subscription_events` shows where it was at each:
 | The dispatcher posts it | `delivered_at` (first delivered hint covering the event) | A lane polls every 2 s; the POST times out after 5 s |
 
 `delivered_at` is null until a hint covering the event is delivered. It is also null for
-an event at or below `hints_deleted_through`, or whose first hint may be gone because
-retention deleted finished hints (it never shows a later hint's time instead). A test hint or a dead-lettered one never sets it.
+an event at or below `hints_deleted_through`, and for an event matched more than 30 days
+before the last retention deletion of finished hints, because its first covering hint may be
+gone (it never shows a later hint's time instead). A test hint or a dead-lettered one never sets it.
 What can add more than a few seconds:
 
 - Hint policy, visible in `get_subscription` as `delivery.held_reason` and `next_hint_at`:
