@@ -12,6 +12,7 @@ from .security import Failure, RateLimited, provider_token, read_document
 PAGE = 200          # list page size the collector asks for (Omi clamps to 1-200)
 HEAD_RESERVE = 6    # reads per hour only the head refresh and brand-new conversations may use
 HEAD_EVERY = 300    # seconds between head refreshes once the history traversal is under way
+REFRESH_EVERY = 86400  # a finished history is walked again this often (list rows only) to notice changed older records
 HARD = ('archive_capacity', 'archive_unavailable', 'archive_disabled', 'archive_authorization_changed',
         'provider_auth_required', 'ledger_uncertain')
 
@@ -163,8 +164,9 @@ class ArchiveRuntime:
                     pass
         return names
 
-    async def throttle(self, credential, seconds, now):
-        await self.db('throttle', self.sharing(credential), now + seconds)
+    async def throttle(self, credential, seconds, received):
+        """Pause the collector for this credential until `received + seconds` (measured from the 429's arrival)."""
+        await self.db('throttle', credential, self.sharing(credential), received + seconds)
 
     async def note_rate_limit(self, token, seconds):
         """An on-demand read met a 429: the collector pauses for that credential too. Best effort."""
@@ -188,12 +190,20 @@ class ArchiveRuntime:
         items = [metadata(value) for value in values]
         fingerprints = {item['id']: fingerprint(value) for item, value in zip(items, values)}
         info, next_page = pagination(headers, len(items), limit)
-        # A truncated page is re-read, never taken as the end; a page that says more without a cursor cannot continue.
-        complete = info['list_truncated'] is not True
-        if complete and info['has_more'] is True and next_page is None:
-            raise Failure('invalid_provider_response')
+        # A truncated page is re-read, never taken as the end. The end needs affirmative evidence (no more pages, not
+        # truncated, an effective limit); a page that proves neither a cursor nor the end keeps what it listed but
+        # leaves the position where it was and is reported.
+        unproven = False
+        if info['list_truncated'] is True:
+            complete = False
+        elif next_page is not None or info['complete'] is True:
+            complete = True
+        else:
+            complete, unproven = False, True
         done = await self.db('discover', account, items, next_page, now, lambda: self.current(account, credential),
-                             kind, fingerprints, complete)
+                             kind, fingerprints, complete, cursor)
+        if unproven:
+            raise Failure('invalid_provider_response')
         return done['inserted']
 
     async def discover_omi(self, account, token, credential, now, settings, plan):
@@ -211,14 +221,18 @@ class ArchiveRuntime:
             free = cap - queued
             if free >= 1:
                 inserted = await self.list_page(account, token, credential, now, settings, kind='head',
-                                                cursor=plan['head_cursor'], limit=min(PAGE, free))
+                                                cursor=plan['head_cursor'] or None, limit=min(PAGE, free))
                 queued += inserted or 0
             else:
                 await self.db('head_blocked', account, now)
         room = cap - reserve - queued
-        if plan['state'] == 'in_progress' and room >= 1:
-            await self.list_page(account, token, credential, now, settings, kind='history', cursor=plan['checkpoint'],
-                                 limit=min(PAGE, room))
+        # A finished history is walked again once a day: list rows only, so a changed title or overview of an older
+        # record is noticed without a transcript call (the head alone only sees the newest pages).
+        again = plan['state'] == 'reached_end' and plan['last_page_at'] is not None and \
+            now - plan['last_page_at'] >= REFRESH_EVERY
+        if (plan['state'] == 'in_progress' or again) and room >= 1:
+            await self.list_page(account, token, credential, now, settings, kind='history',
+                                 cursor=None if again else plan['checkpoint'], limit=min(PAGE, room))
 
     async def pass_omi(self, account, now, settings):
         token = self.current(account)
@@ -226,7 +240,7 @@ class ArchiveRuntime:
         plan = await self.db('plan', account, credential, now)
         if plan['throttled_until'] is not None and plan['throttled_until'] > now:
             return  # Retry-After is honoured: no provider call, no error, no record touched
-        budget, discovery_error = settings.omi_budget, None
+        budget, discovery_error, started = settings.omi_budget, None, time.monotonic()
         try:
             try:
                 await self.discover_omi(account, token, credential, now, settings, plan)
@@ -236,13 +250,20 @@ class ArchiveRuntime:
                 if error.code in HARD:
                     raise
                 discovery_error = error.code
-            for recording_id, fresh in await self.db('work_items', account, now, 8, lambda: self.current(account)):
+            items = await self.db('work_items', account, now, 8, lambda: self.current(account), False)
+            items.sort(key=lambda item: not item[1])  # conversations of the last 24 h first: they own the reserved reads
+            rotated = False
+            for recording_id, fresh in items:
                 reads = budget.reads_per_hour if fresh else budget.reads_per_hour - HEAD_RESERVE
                 if not await self.reserve(credential, [('reads', reads), ('transcripts', budget.transcript_per_hour)], now):
                     break
+                if not rotated:
+                    # Fairness advances with dispatched work, not with passes a spent window denied.
+                    await self.db('rotate', account)
+                    rotated = True
                 await self.observe(account, recording_id, now)
         except RateLimited as limited:
-            await self.throttle(credential, limited.retry_after_s, now)
+            await self.throttle(credential, limited.retry_after_s, now + int(time.monotonic() - started))
             return
         if discovery_error:
             raise Failure(discovery_error)

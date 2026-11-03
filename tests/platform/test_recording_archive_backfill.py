@@ -17,7 +17,7 @@ from deedkit_recordings.app import create_app
 from deedkit_recordings.archive import ArchiveRuntime
 from deedkit_recordings.archive_store import backup_archive, namespace
 from deedkit_recordings.omi import Provider
-from deedkit_recordings.security import ArchiveSettings
+from deedkit_recordings.security import ArchiveSettings, Failure
 
 T0 = 1_800_000_000
 
@@ -48,7 +48,7 @@ class Omi:
     def __init__(self, count=0, created=None):
         self.items, self.now, self.calls = [], float(T0), []
         self.windows, self.peak, self.limited = {}, {}, {}
-        self.truncated, self.hide_overview = 0, False
+        self.truncated, self.hide_overview, self.no_headers = 0, False, False
         for n in range(count):
             self.add(f'c{n:05d}', (created if created is not None else T0 - 86400 * 30) - n * 60)
 
@@ -102,6 +102,8 @@ class Omi:
             self.truncated -= 1
         headers = {'X-Omi-Has-More': str(more).lower(), 'X-Omi-List-Truncated': str(truncated).lower(),
                    'X-Omi-Effective-Limit': str(size)}
+        if self.no_headers:
+            return httpx.Response(200, json=[self.view(i, False) for i in page])
         if more:
             headers['X-Omi-Next-Cursor'] = f'c{start + size}'
         return httpx.Response(200, json=[self.view(i, False) for i in page], headers=headers)
@@ -193,9 +195,11 @@ def test_schema3_upgrade_is_additive_and_a_failed_upgrade_rolls_back_to_usable_v
     asyncio.run(upgraded())
     assert sql(doc, 'PRAGMA user_version') == [(3,)]
     assert (sql(doc, OLD_COLUMNS), sql(doc, 'SELECT * FROM events ORDER BY sequence'), sql(doc, 'SELECT * FROM texts')) == before
-    archive_id, incarnation, journal_id = sql(doc, 'SELECT archive_id,incarnation,journal_id FROM meta')[0]
+    meta = dict(sql(doc, 'SELECT key,value FROM meta'))
+    archive_id, incarnation, journal_id = meta['archive_id'], meta['incarnation'], meta['journal_id']
     assert len(archive_id) == 32 and len(journal_id) == 32 and incarnation == 1 and archive_id != journal_id
-    assert sql(doc, 'SELECT count(*) FROM meta') == [(1,)]
+    assert sql(doc, 'SELECT key,typeof(value) FROM meta ORDER BY key') == [
+        ('archive_id', 'text'), ('incarnation', 'integer'), ('journal_id', 'text')]
     columns = {row[1] for row in sql(doc, 'PRAGMA table_info(accounts)')}
     assert {'throttled_until', 'traversal_state', 'passes_completed', 'last_page_at'} <= columns
     assert sql(doc, 'SELECT checkpoint FROM accounts') == [('"old-cursor"',)]
@@ -256,14 +260,59 @@ def test_collector_reservations_are_atomic_and_foreground_use_is_counted_never_r
         assert sum(grants) == 2
         await asyncio.gather(*[r.count('tokenaaaa', True, now=T0 + 1) for _ in range(10)])
         assert await r.reserve(fingerprint, [('transcripts', 5)], T0 + 2) is False
-        assert sql(doc, 'SELECT bucket,count FROM ledger ORDER BY bucket') == [('reads', 13), ('transcripts', 15)]
-        assert await r.reserve(fingerprint, [('transcripts', 5)], T0 + 3601) is True
-        assert sql(doc, "SELECT count FROM ledger WHERE bucket='transcripts'") == [(1,)]
+        assert sql(doc, 'SELECT bucket,sum(count) FROM ledger GROUP BY bucket ORDER BY bucket') == [('reads', 13), ('transcripts', 15)]
+        assert await r.reserve(fingerprint, [('transcripts', 5)], T0 + 3800) is True
+        assert sql(doc, "SELECT sum(count) FROM ledger WHERE bucket='transcripts'") == [(1,)]
         await r.close()
     asyncio.run(run())
     stored = Path(doc['archive']['directory'], 'archive.sqlite').read_bytes()
     assert b'tokenaaaa' not in stored and hashlib.sha256(b'tokenaaaa').hexdigest().encode() in stored
     assert {row[1] for row in sql(doc, 'PRAGMA table_info(ledger)')} >= {'credential', 'bucket', 'window_start', 'count'}
+
+
+# spec: ANYM-724
+def test_reservation_window_slides_so_an_undispatched_reservation_never_frees_a_slot_early(tmp_path):
+    path, doc = build(tmp_path); omi = Omi()
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        credential = hashlib.sha256(b'tokenaaaa').hexdigest()
+        share = [('transcripts', 18)]
+        assert await r.reserve(credential, share, T0) is True  # reserved, then the process died before it dispatched
+        grants = [await r.reserve(credential, share, T0 + 600) for _ in range(20)]
+        assert sum(grants) == 17
+        # A fixed window of ours would reset here, while Omi's, started by the call at T0 + 600, runs to T0 + 4200.
+        assert await r.reserve(credential, share, T0 + 3600) is False
+        assert await r.reserve(credential, share, T0 + 3700) is True
+        assert await r.reserve(credential, share, T0 + 3700) is False
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-724
+def test_a_foreground_read_cannot_erase_the_evidence_of_a_clock_that_stepped_back(tmp_path):
+    path, doc = build(tmp_path); omi = Omi()
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        credential = hashlib.sha256(b'tokenaaaa').hexdigest()
+        assert await r.reserve(credential, [('reads', 45)], T0 + 500) is True
+        await r.count('tokenaaaa', False, now=T0 + 200)
+        with pytest.raises(Failure, match='ledger_uncertain'):
+            await r.reserve(credential, [('reads', 45)], T0 + 200)
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-724
+def test_a_429_recorded_meanwhile_stops_the_next_collector_reservation_even_with_budget_left(tmp_path):
+    path, doc = build(tmp_path); omi = Omi()
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        credential = hashlib.sha256(b'tokenaaaa').hexdigest()
+        await r.db('throttle', credential, [], T0 + 1800)
+        assert await r.reserve(credential, [('reads', 45)], T0 + 10) is False
+        assert await r.reserve(credential, [('reads', 45)], T0 + 1800) is True
+        await r.close()
+    asyncio.run(run())
 
 
 # spec: ANYM-724
@@ -406,6 +455,100 @@ def test_truncated_page_is_reread_never_taken_as_the_end(tmp_path):
 
 
 # spec: ANYM-724
+def test_truncated_head_page_replayed_does_not_strand_ids_behind_the_next_cursor(tmp_path):
+    path, doc = build(tmp_path); omi = Omi(450, created=T0 - 86400 * 40)
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        await passes(r, omi, T0, 10, 3)
+        assert (await r.status(account, now=T0 + 30))['traversal']['state'] == 'reached_end'
+        for n in range(300):
+            omi.add(f'new-{n:03d}', T0 + 100 + n, front=True)
+        omi.truncated = 1
+        await passes(r, omi, T0 + 1000, 400, 5)
+        assert sql(doc, "SELECT count(*) FROM records WHERE provider_id LIKE 'new-%'") == [(300,)]
+        assert (await r.status(account, now=T0 + 3000))['head_backlog'] is False
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-724
+def test_a_page_without_end_of_list_evidence_never_marks_the_history_finished(tmp_path):
+    path, doc = build(tmp_path); omi = Omi(30)
+    omi.no_headers = True
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        await passes(r, omi, T0, 10, 1)
+        status = await r.status(account, now=T0)
+        assert status['traversal']['state'] == 'not_started' and status['error'] == 'invalid_provider_response'
+        assert sql(doc, 'SELECT count(*) FROM records') == [(30,)]
+        omi.no_headers = False
+        await passes(r, omi, T0 + 10, 10, 1)
+        status = await r.status(account, now=T0 + 10)
+        assert status['traversal']['state'] == 'reached_end' and status['error'] is None
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-724
+def test_a_finished_history_is_walked_again_daily_so_older_title_changes_are_noticed(tmp_path):
+    path, doc = build(tmp_path); omi = Omi(300, created=T0 - 86400 * 40)
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        await passes(r, omi, T0, 10, 3)
+        omi.items[250]['structured']['title'] = 'Renamed deep zebra'
+        await passes(r, omi, T0 + 3600, 400, 4)
+        assert await r.db('search', account, '"zebra"', 5) == []
+        calls = len(omi.of('tokenaaaa', 'list'))
+        await passes(r, omi, T0 + 86500, 10, 3)
+        assert [h['provider_recording_id'] for h in await r.db('search', account, '"zebra"', 5)] == ['c00250']
+        assert len(omi.of('tokenaaaa', 'list')) <= calls + 4
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-724
+def test_clearing_a_title_clears_the_searchable_title_without_a_transcript_call(tmp_path):
+    path, doc = build(tmp_path); omi = Omi(1, created=T0 - 86400 * 3)
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        await passes(r, omi, T0, 10, 1)
+        assert await r.db('search', account, '"Title"', 5)
+        omi.items[0]['structured']['title'] = ''
+        await passes(r, omi, T0 + 400, 10, 1)
+        assert await r.db('search', account, '"Title"', 5) == []
+        assert len(omi.of('tokenaaaa', 'detail')) == 1
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-724
+def test_queue_at_the_cap_blocks_the_head_only_until_a_slot_frees(tmp_path):
+    path, doc = build(tmp_path, max_queued=200); omi = Omi(0)
+    for n in range(200):
+        omi.add(f'q{n:03d}', T0 - 86400 * 30 - n)
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        old = [{'id': f'q{n:03d}', 'created_at': iso(T0 - 86400 * 30 - n)} for n in range(200)]
+        await r.db('discover', account, old[:100], None, T0, lambda: None)
+        await r.db('discover', account, old[100:], None, T0, lambda: None, 'head')
+        assert (await r.status(account, now=T0))['queued'] == 200
+        omi.add('born', T0 + 400, front=True)
+        await passes(r, omi, T0 + 400, 1, 1)
+        status = await r.status(account, now=T0 + 400)
+        assert status['head_backlog'] is True and await r.db('record', account, 'born') is None
+        await passes(r, omi, T0 + 800, 1, 1)
+        assert (await r.db('record', account, 'born'))['revision'] == 1
+        assert (await r.status(account, now=T0 + 800))['head_backlog'] is False
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-724
 def test_kill_between_id_insert_and_checkpoint_commit_resumes_with_no_duplicate_or_skipped_id(tmp_path):
     path, doc = build(tmp_path); omi = Omi(450)
     async def run():
@@ -501,6 +644,43 @@ def test_new_conversation_is_fetched_before_a_five_thousand_backlog_and_backlog_
 
 
 # spec: ANYM-724
+def test_one_transcript_an_hour_still_serves_a_failed_record_among_a_new_backlog(tmp_path):
+    path, doc = build(tmp_path, omi_budget={'transcript_per_hour': 1}); omi = Omi(6, created=T0 - 86400 * 2)
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        await passes(r, omi, T0, 10, 1)
+        await r.db('observe', account, 'c00005', {'id': 'c00005'}, {'summary': ('error', '', 'provider_unavailable')}, T0)
+        for hour in range(1, 5):
+            await passes(r, omi, T0 + hour * 3600, 300, 13)
+        details = [c[3] for c in omi.of('tokenaaaa', 'detail')]
+        assert 'c00005' in details and len(set(details)) >= 4
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-724
+def test_a_conversation_of_the_last_day_keeps_the_reserved_reads_when_a_retry_is_denied_first(tmp_path):
+    path, doc = build(tmp_path); omi = Omi(0)
+    omi.add('old-failed', T0 - 86400 * 30)
+    omi.add('fresh-one', T0, front=True)
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        await r.db('discover', account, [{'id': 'old-failed', 'created_at': iso(T0 - 86400 * 30)},
+                                         {'id': 'fresh-one', 'created_at': iso(T0)}], None, T0, lambda: None)
+        await r.db('observe', account, 'old-failed', {'id': 'old-failed'}, {'summary': ('error', '', 'provider_unavailable')}, T0)
+        await r.db('rotate', account)
+        for _ in range(39):
+            await r.count('tokenaaaa', False, now=T0 + 100)
+        await passes(r, omi, T0 + 200, 1, 1)
+        details = [c[3] for c in omi.of('tokenaaaa', 'detail')]
+        assert details == ['fresh-one']
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-724
 def test_two_hundred_unchanged_saved_records_cost_zero_transcript_calls_in_24_hours(tmp_path):
     path, doc = build(tmp_path, omi_budget={'transcript_per_hour': 25}); omi = Omi(200, created=T0 - 86400 * 3)
     async def run():
@@ -515,26 +695,26 @@ def test_two_hundred_unchanged_saved_records_cost_zero_transcript_calls_in_24_ho
 
 
 # spec: ANYM-724
-def test_late_summary_is_picked_up_by_the_bounded_pending_retry_and_never_hourly(tmp_path):
+def test_summary_arriving_48_hours_after_creation_is_picked_up_within_the_daily_retry_never_hourly(tmp_path):
     path, doc = build(tmp_path); omi = Omi(0)
     item = omi.add('late', T0, overview=None)
     omi.hide_overview = True
     async def run():
         r = runtime(path, omi); await r.start(background=False)
         account = accounts_of(r)[0]
-        await passes(r, omi, T0 + 3600, 3600, 1)
-        record = await r.db('record', account, 'late')
-        assert record['parts']['summary']['attempt_state'] == 'unavailable' and record['parts']['transcript']['text']
-        item['structured']['overview'] = 'Decided to build a telescope'
-        await passes(r, omi, T0 + 2 * 3600, 3600, 80)
-        record = await r.db('record', account, 'late')
-        assert record['parts']['summary']['text'] == 'Decided to build a telescope'
-        details = omi.of('tokenaaaa', 'detail')
-        assert len(details) <= 1 + 8 + 4
-        gaps = [b[0] - a[0] for a, b in zip(details, details[1:])]
-        assert min(gaps) >= 3 * 3600
-        late_pick = max(c[0] for c in details)
-        assert late_pick <= T0 + 48 * 3600 + 25 * 3600 or details[-1][0] <= T0 + 2 * 3600 + 80 * 3600
+        found_at = None
+        for hour in range(1, 100):
+            moment = T0 + hour * 3600
+            if hour == 48:
+                item['structured']['overview'] = 'Decided to build a telescope'
+            await passes(r, omi, moment, 1, 1)
+            if found_at is None and (await r.db('record', account, 'late'))['parts']['summary'].get('text'):
+                found_at = moment
+        assert found_at is not None and T0 + 48 * 3600 < found_at <= T0 + 48 * 3600 + 24 * 3600 + 3600
+        details = [c[0] for c in omi.of('tokenaaaa', 'detail')]
+        assert min(b - a for a, b in zip(details, details[1:])) >= 3 * 3600
+        first_day = [t for t in details if t < T0 + 24 * 3600]
+        assert len(first_day) <= 9 and len([t for t in details if T0 + 24 * 3600 <= t < T0 + 48 * 3600]) <= 2
         await r.close()
     asyncio.run(run())
 
@@ -573,7 +753,7 @@ def test_status_reports_progress_capacity_and_budget_without_any_content(tmp_pat
         assert status['traversal']['state'] == 'reached_end' and status['traversal']['discovered_total'] == 40
         assert status['with_text'] == 18 == 40 - status['queued'] and status['failed'] == 0 and status['pending'] == 0
         assert status['coverage'] == 'unknown' and status['throttled_until'] is None
-        assert status['usage']['transcripts'] == {'used': 18, 'limit': 18, 'resets_at': T0 + 3600}
+        assert status['usage']['transcripts'] == {'used': 18, 'limit': 18, 'resets_at': T0 + 3675}
         assert status['usage']['reads']['limit'] == 45 and status['usage']['reads']['used'] >= 19
         assert status['db_bytes'] > 0 and status['bytes_ceiling'] == 1024 ** 3
         assert status['eta'] is None and status['capacity_warning'] is False
@@ -585,6 +765,23 @@ def test_status_reports_progress_capacity_and_budget_without_any_content(tmp_pat
         small = r.store.settings.model_copy(update={'max_bytes': 20_000})
         r.store.settings = small
         assert (await r.status(account, now=T0 + 7200))['capacity_warning'] is True
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-724
+def test_capacity_projection_never_collapses_below_what_the_accepted_text_costs(tmp_path):
+    path, doc = build(tmp_path); omi = Omi(0)
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        items = [{'id': f'm{n:04d}', 'title': 'T' * 450, 'created_at': iso(T0 - n)} for n in range(1000)]
+        await r.db('discover', account, items, None, T0, lambda: None)
+        for n in range(3):
+            await r.db('observe', account, f'm{n:04d}', items[n], {'transcript': ('available', 'w' * 20000, None)}, T0)
+        status = await r.status(account, now=T0 + 10)
+        assert status['with_text'] == 3 and status['traversal']['discovered_total'] == 1000
+        assert status['projected_db_bytes'] > 1000 * 3 * 20000 * 0.9
         await r.close()
     asyncio.run(run())
 
@@ -615,7 +812,7 @@ def test_foreground_reads_are_ledgered_never_refused_and_use_up_the_collector_sh
                 assert (await client.post('/v1/list_recordings', json={'account': 'omi-a'})).status_code == 200
                 for _ in range(3):
                     assert (await client.post('/v1/read_recording', json={'account': 'omi-a', 'recording_id': 'c00000'})).status_code == 200
-            counts = dict(sql(doc, 'SELECT bucket,count FROM ledger'))
+            counts = dict(sql(doc, "SELECT bucket,sum(count) FROM ledger WHERE bucket<>'throttle' GROUP BY bucket"))
             assert counts == {'reads': 4, 'transcripts': 3}
             before = len(omi.of('tokenaaaa', 'detail'))
             moment = time.time()  # foreground reads are stamped with the real clock
