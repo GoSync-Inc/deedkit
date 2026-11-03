@@ -26,10 +26,12 @@ def setup(tmp_path, *, grants=SCOPES, backend=SCOPES, missing_tool=False, deploy
     actor['grants']['recordings'] = list(grants)
     for name in ('calendar', 'recordings'):
         key = tmp_path / (name + '.key')
-        key.write_text('synthetic-' + name); key.chmod(0o600)
+        key.write_text('synthetic-' + name)
+        key.chmod(0o600)
         actor['credentials'][name] = {'key_file': str(key), 'key_sha256': hashlib.sha256(key.read_bytes()).hexdigest()}
     path = tmp_path / 'policy.json'
-    path.write_text(json.dumps(value)); path.chmod(0o600)
+    path.write_text(json.dumps(value))
+    path.chmod(0o600)
     seen = []
     def handler(request):
         operation = request.url.path.removeprefix('/v1/')
