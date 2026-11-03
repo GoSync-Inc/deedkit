@@ -42,7 +42,7 @@ be labelled cloud. It takes no `local-heavy` lock: the work happens on the mini.
 | `timeout_seconds` | up to 900 (a 4-hour recording takes about 8.5 minutes); sent to the service as `X-Request-Deadline-Seconds`, its queue deadline |
 | `backpressure_seconds` | cooldown when the mini says "not now" and gives no `Retry-After`: 1 to 900, default 120 |
 | `audio_response_format` | `verbose_json` (default, with segments) or `json` |
-| `max_input_bytes` | the largest original the worker copies: default 20 MiB; up to 200 MiB for an `audio` profile, 32 MiB for `image` and `document` (ANYM-697). What is sent is capped separately, below |
+| `max_input_bytes` | the largest original the worker copies: default 20 MiB for `audio` and `image`, 32 MiB for `document` (ANYM-702); the most a profile may set is 200 MiB for `audio` and 32 MiB for `image` and `document` (ANYM-697). What is sent is capped separately, below |
 
 Audio uses `POST {base_url}/audio/transcriptions`; photos and documents use `POST {base_url}/chat/completions`, a
 document sending its extracted text without an image (scanned-PDF page images are not part of this connector).
@@ -114,6 +114,23 @@ bytes it needs. The original always stays in the archive; the metadata says what
   line first. Editing the profile changes its hash, and the worker, which reads its profile once at start, picks every
   failed row of that kind again after its next restart, within the day budgets: check the budget before the edit,
   restart once, and track all of those rows.
+- **Documents up to 32 MiB (ANYM-702).** A `document` profile without `max_input_bytes` takes 32 MiB, the validator's
+  maximum, not 20: for a document the limit only bounds the worker's disk copy (digest-checked in its `/tmp`) and the
+  child's file-size limit, while the request of `deedkit_inference` and of the OpenAI-style providers carries just the
+  extracted text, at most `max_text_chars`, never the file. Only the optional `codex_cli` provider reads the file
+  itself: a `codex_cli` document profile must set `max_input_bytes` explicitly, or Codex may read files up to 32 MiB.
+  A document over 32 MiB ends as `original_size_limit` and no profile can raise the limit.
+- **Final limit codes (ANYM-702).** Three codes mean the file can never pass the profile as it is, so the job is
+  attempted once, the event says `retryable` false, and `attempts` stays 1 (the number of attempts made). The code
+  is what an agent sees as `enrichment_failure` on a file read:
+  - `original_size_limit`: the original is larger than the profile's `max_input_bytes`;
+  - `audio_duration_limit`: the recording is longer than the profile's `max_audio_seconds`;
+  - `audio_transcode_size_limit`: the Opus form does not fit one upload; the recording needs splitting (a later card).
+
+  These rows are final for their profile: the worker takes them again only after the profile changes (a different
+  hash), which restarts the attempts as for any failed row. `audio_transcode_size_limit` depends on the worker image's
+  transcode settings, so a new image alone does not reopen it. A file whose size differs from the recorded one is not
+  a size limit: it fails as `original_integrity_error` and stays retryable.
 - **Photos, `deedkit_inference` only.** A picture whose longer edge is over 2048 px or whose file is over 700 KB (700,000
   bytes, so about 930 KB as base64) is scaled by ffmpeg to a longer edge of at most 2048 px (never enlarged, EXIF
   orientation applied, one frame) and sent as jpeg, also when the source is png, webp or gif; the EXIF block, GPS

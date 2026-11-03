@@ -58,17 +58,22 @@ def verified_copy(files,row,directory,maximum):
     out=Path(directory)/'original';sha=hashlib.sha256();total=0
     with os.fdopen(fd,'rb') as f,out.open('xb') as target:
         st=os.fstat(f.fileno())
-        if not stat.S_ISREG(st.st_mode) or st.st_size!=row['bytes'] or st.st_size>maximum:
-            raise ModelError('original_size_limit')
+        # `original_size_limit` means only "larger than the profile's max_input_bytes" and is final for the profile
+        # (FINAL_LIMIT_CODES); a file that is not what the row recorded is an integrity problem and stays retryable.
+        if not stat.S_ISREG(st.st_mode) or st.st_size!=row['bytes']:raise ModelError('original_integrity_error')
+        if st.st_size>maximum:raise ModelError('original_size_limit')
         while b:=f.read(65536):
             total+=len(b)
-            if total>maximum:raise ModelError('original_size_limit')
+            if total>row['bytes']:raise ModelError('original_integrity_error')  # grew while it was read
             sha.update(b);target.write(b)
     if total!=row['bytes'] or sha.hexdigest()!=digest:raise ModelError('original_integrity_error')
     return out
 
 
 MAX_RESULT_BYTES=8*1024**2
+# A file that can never pass these limits fails once: `claim` does not take the row again while its profile hash is
+# unchanged, and the event says `retryable` false. Editing the profile (a new hash) is the way back (ANYM-702).
+FINAL_LIMIT_CODES=('original_size_limit','audio_duration_limit','audio_transcode_size_limit')
 
 
 def child_limits(profile):
@@ -261,11 +266,12 @@ class EnrichmentWorker:
                     LEFT JOIN processing_control pc ON pc.account=m.account AND pc.kind=%s AND pc.profile_hash=%s
                     WHERE '''+PROCESSABLE_ORIGINAL+''' AND (pc.pause_reason IS NULL OR pc.paused_until<=clock_timestamp()) AND a.active AND NOT m.deleted AND e.source_digest=a.digest AND e.source_revision=m.revision
                     AND m.account=ANY(%s) AND '''+condition+''' AND e.next_due<=clock_timestamp()
-                    AND ((e.state IN ('unconfigured','queued','failed') AND (e.attempts<3 OR e.profile_hash IS DISTINCT FROM %s))
+                    AND ((e.state IN ('unconfigured','queued','failed') AND (e.attempts<3 OR e.profile_hash IS DISTINCT FROM %s)
+                            AND NOT (e.state='failed' AND coalesce(e.error_code,'')=ANY(%s) AND e.profile_hash IS NOT DISTINCT FROM %s))
                         OR (e.state='leased' AND e.lease_until<clock_timestamp() AND e.attempts<3)
                         OR (e.state='unsupported' AND e.profile_hash IS DISTINCT FROM %s))
                     ORDER BY fresh DESC,last_started_at,m.sent_at DESC,a.id LIMIT 1 FOR UPDATE OF e SKIP LOCKED''',
-                    (kind,ph,eligible,ph,ph)).fetchone()
+                    (kind,ph,eligible,ph,list(FINAL_LIMIT_CODES),ph,ph)).fetchone()
                 if row:candidates.append((row,kind,profile,ph))
             candidates.sort(key=lambda item:(not item[0]['fresh'],item[0]['last_started_at'],-item[0]['sent_at'].timestamp()))
             for row,kind,profile,ph in candidates:
@@ -344,7 +350,7 @@ class EnrichmentWorker:
                         'model_auth_failed','codex_private_auth_required','codex_chatgpt_login_required',
                         'codex_login_check_failed',
                         'codex_cli_unavailable','codex_upgrade_required','invalid_model_key',
-                        'local_model_not_installed','audio_tools_unavailable','retry_exhausted'))
+                        'local_model_not_installed','audio_tools_unavailable','retry_exhausted')+FINAL_LIMIT_CODES)
             resource_admission.release(c,row.get('_resource_lease'))
             if finished and error:resource_admission.pause_profile(c,row['account'],row['kind'],row['profile_hash'],error)
             return finished
