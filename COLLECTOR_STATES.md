@@ -153,6 +153,20 @@ which can carry provider bytes, is never kept. The trade-off: a provider bug
 that hits every chat now leaves the collector running with every chat failed
 and status degraded, instead of restarting it.
 
+A stored peer kind that differs from the kind the dialog reports for the same
+chat id (`collector_chats.peer_kind`, ANYM-102) fails only that chat, with reason
+`peer_kind_conflict` in `history.chat_errors` and `last_error_code`
+`provider_unavailable`; the pass goes on. A live capture of that chat is moved to the
+spool's quarantine with the same reason (bytes kept, counted in `capture_progress`),
+so other chats keep draining. Discovery does not rewrite the stored kind, with one
+exception: Telethon's `Dialog.is_channel` is false for a `ChannelForbidden`, so
+discovery now takes the kind from the dialog's raw TL peer (a marked id cannot tell a
+channel from a basic group whose id starts with 100), and a discovery pass repairs a row
+stored as `chat` to `channel` when the provider reports a channel; a cached replay
+never rewrites it. Other mismatches stay failures: Telegram gives a basic group and the supergroup it becomes
+different ids (`-N` and `-100N`), so one chat id never legitimately changes kind, and a
+rewrite would hide an id mix-up instead of surfacing it.
+
 Connection failures survive Node exits through a private fsynced side-channel
 file. No unsolicited stdout frame can interleave with a page/media RPC. Raw
 exception text, QR contents, credentials, media keys and paths are not exposed.

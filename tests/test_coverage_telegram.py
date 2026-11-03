@@ -9,7 +9,7 @@ import sqlite3
 from types import SimpleNamespace as NS
 
 import pytest
-from telethon import events, functions, types
+from telethon import events, functions, types, utils
 
 from messaging_service.collector_state import CaptureSpool, session_lock
 from messaging_service.telegram_collector import (
@@ -386,6 +386,73 @@ def test_one_chat_provider_errors_fail_only_that_chat_in_history_reconcile(worke
     assert all(line['frames'] for line in lines)
     # Every chat was attempted once; the next pass keeps the same fair rotation, no extra retry first.
     assert w.state.inventory(asyncio.run(w.provider.dialogs(10)), None) == ['101', '102', '103', '104', '105']
+
+
+# spec: ANYM-102
+def test_peer_kind_mismatch_fails_only_that_chat_and_the_pass_goes_on(worker, capsys):
+    w, store, _ = worker
+    w.provider = ChatErrorProvider({})
+    # Chat 102 is stored as a basic group while the dialog reports a user: the stored kind never clears.
+    w.state.chat('102', 'chat')
+    asyncio.run(w.sync_once())
+    for chat in ('101', '103', '104', '105'):
+        assert w.state.chat(chat, 'user')['initialized'] is True
+    with store.pool.connection() as c:
+        row = c.execute('SELECT peer_kind,initialized,last_error_code FROM collector_chats WHERE account=%s '
+            'AND provider_chat=%s', (w.account, '102')).fetchone()
+        health = c.execute('SELECT status,detail_code,operations FROM collector_health WHERE account=%s',
+            (w.account,)).fetchone()
+    assert (row['peer_kind'], row['initialized'], row['last_error_code']) == ('chat', False, 'provider_unavailable')
+    assert (health['status'], health['detail_code']) == ('degraded', 'configured_chat_unavailable')
+    recorded = {e['chat']: e for e in health['operations']['history']['chat_errors']}
+    assert list(recorded) == ['102'] and recorded['102']['reason_code'] == 'peer_kind_conflict'
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines() if 'telegram_chat_error' in line]
+    assert [(line['chat'], line['code']) for line in lines] == [('102', 'peer_kind_conflict')]
+
+
+# spec: ANYM-102
+def test_live_capture_of_a_peer_kind_conflict_is_quarantined_and_other_chats_keep_draining(worker):
+    w, store, _ = worker
+    w.state.chat('102', 'chat')
+    for chat, n in (('102', 1), ('103', 2)):
+        asyncio.run(w.capture(NS(message=message(n, chat=chat))))
+    asyncio.run(w.drain_captures([w.spool]))
+    assert w.spool.quarantined() == 1 and not list(w.spool.path.glob('*.json'))
+    with store.pool.connection() as c:
+        archived = {r['provider_chat'] for r in c.execute('SELECT provider_chat FROM chats WHERE account=%s',
+            (w.account,))}
+    assert '103' in archived and '102' not in archived
+
+
+# spec: ANYM-102
+def test_discovery_repairs_a_basic_group_row_of_a_dialog_the_provider_reports_as_channel(worker):
+    w, store, _ = worker
+    for chat, kind in (('201', 'chat'), ('202', 'channel'), ('203', 'chat'), ('204', 'user')):
+        w.state.chat(chat, kind)
+    # A cached replay (no discovery) never rewrites a kind; a discovery pass rewrites only chat -> channel.
+    w.state.inventory([('201', 'channel', 'A', 'channel')], None)
+    w.state.inventory([('201', 'channel', 'A', 'channel'), ('202', 'chat', 'B', 'group'),
+                       ('203', 'chat', 'C', 'group'), ('204', 'channel', 'D', 'channel')], None, discovery=True)
+    with store.pool.connection() as c:
+        kinds = {r['provider_chat']: r['peer_kind'] for r in c.execute(
+            'SELECT provider_chat,peer_kind FROM collector_chats WHERE account=%s', (w.account,))}
+    assert kinds == {'201': 'channel', '202': 'channel', '203': 'chat', '204': 'user'}
+
+
+# spec: ANYM-102
+def test_dialog_kind_comes_from_the_raw_peer_so_a_forbidden_channel_is_a_channel_and_a_100_basic_group_is_not():
+    from test_chat_roles import Dialogs
+    class Governor:
+        async def call(self, operation, phase): return await operation()
+    # Telethon's Dialog.is_channel is False for a ChannelForbidden; a basic group with id 100123 is marked -100123.
+    forbidden = NS(id=utils.get_peer_id(types.PeerChannel(2)), is_channel=False, is_user=False, is_group=False,
+        name='Forbidden', entity=None, dialog=NS(peer=types.PeerChannel(2)))
+    basic = NS(id=utils.get_peer_id(types.PeerChat(100123)), is_channel=False, is_user=False, is_group=True,
+        name='Basic', entity=None, dialog=NS(peer=types.PeerChat(100123)))
+    provider = TelethonProvider.__new__(TelethonProvider)
+    provider.client = NS(iter_dialogs=lambda **kwargs: Dialogs([forbidden, basic])); provider.governor = Governor()
+    async def collect(): return [row async for batch in provider.dialog_batches(None) for row in batch]
+    assert [(row[0], row[1]) for row in asyncio.run(collect())] == [(str(forbidden.id), 'channel'), ('-100123', 'chat')]
 
 
 def fake_reconcile(provider, failed):
