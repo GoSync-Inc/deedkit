@@ -4,6 +4,7 @@ from starlette.testclient import TestClient
 
 from messaging_service.app import create_app
 from messaging_service.archive import Archive
+from messaging_service.store import APIError
 from test_archive import event
 
 FIRST = 'alias-first'
@@ -63,6 +64,21 @@ def test_a_cursor_from_one_form_continues_with_the_other(alias, tool):
     assert (listing(s, key, tool, accounts=[FIRST], after=singular['next_cursor'], limit=1)
             == listing(s, key, tool, account=FIRST, after=singular['next_cursor'], limit=1))
     assert listing(s, key, tool, accounts=[FIRST], after=singular['next_cursor'], limit=1)['items']
+
+
+# spec: ANYM-646
+def test_activity_order_cursors_bind_the_account_filter_in_either_form(alias):
+    """order=activity cursors are bound (q1.…) to the filters: account and accounts=[id] bind the same filter."""
+    s, key, _ = alias
+    singular = s.list_chats(key, account=FIRST, order='activity', limit=1)
+    plural = s.list_chats(key, accounts=[FIRST], order='activity', limit=1)
+    assert singular['next_cursor'].startswith('q1.') and singular == plural
+    more = s.list_chats(key, accounts=[FIRST], order='activity', limit=1, after=singular['next_cursor'])
+    assert more == s.list_chats(key, account=FIRST, order='activity', limit=1, after=singular['next_cursor'])
+    assert more['items'] and more['items'] != singular['items']
+    for other in ({'account': SECOND}, {'accounts': [SECOND]}, {'accounts': BOTH}):
+        with pytest.raises(APIError, match='invalid_cursor|cursor_changed'):
+            s.list_chats(key, order='activity', limit=1, after=singular['next_cursor'], **other)
 
 
 # spec: ANYM-646

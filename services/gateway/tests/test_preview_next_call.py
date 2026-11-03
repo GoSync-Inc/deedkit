@@ -114,3 +114,15 @@ def test_a_caller_without_the_preview_tool_gets_no_next_call(tmp_path, tool, arg
     with TestClient(app) as client:
         body = client.post("/v1/" + tool, json=arguments, headers=HEADERS).json()
         assert body["error"] == "preview_required" and "next_call" not in body
+
+
+# spec: ANYM-646
+@pytest.mark.parametrize("tool,arguments,step,supplied", CASES)
+def test_the_fixed_hint_survives_message_words_that_overlap_it(tmp_path, tool, arguments, step, supplied):
+    """The gateway drops a hint that carries the caller's words; the two reviewed hints are constants and stay."""
+    app, _ = setup(tmp_path, step, "preview_required", TOOLS)
+    overlapping = {**arguments, **({"text": "Please show the preview to the owner"} if "text" in arguments else {})}
+    with TestClient(app) as client:
+        body = client.post("/v1/" + tool, json=overlapping, headers=HEADERS).json()
+        assert body["hint"].startswith("If next_call is present")
+

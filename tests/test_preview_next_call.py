@@ -257,3 +257,61 @@ def test_join_chat_after_a_fresh_check_names_the_preview_and_without_one_keeps_i
     fresh = s.preview_messenger_operation(key, **valid(tools, body['next_call'], parameters=args['parameters']))
     assert s.execute_messenger_operation(key, **args, request_id='next-join-0001',
                                          preview_digest=fresh['preview_digest'])['status'] == 'queued'
+
+
+# spec: ANYM-646
+def test_a_malformed_digest_echoes_no_reference_that_does_not_resolve(sending):
+    s, key = sending
+    for call in (archive_send(chat_id='+12025550147', format='plain', reply_to=''),  # a number is not an archive chat
+                 archive_send(chat_id='private-chat-name', format='plain', reply_to=''),
+                 archive_send(account='not-my-account', format='plain', reply_to='')):
+        body = refusal(lambda: s.send_message(key, **call, preview_digest='bad'), 'preview_mismatch')
+        assert 'next_call' not in body and 'hint' not in body
+        clean(body, call['chat_id'], 'not-my-account')
+    operation = operation_args(message_id='private-filename.txt')
+    body = refusal(lambda: s.execute_messenger_operation(key, **operation, request_id='next-leak-0001',
+                                                         preview_digest='bad'), 'preview_mismatch')
+    assert 'next_call' not in body
+    clean(body, 'private-filename.txt')
+    unknown = operation_args(account='not-my-account')
+    body = refusal(lambda: s.execute_messenger_operation(key, **unknown, request_id='next-leak-0002',
+                                                         preview_digest='bad'), 'preview_mismatch')
+    assert 'next_call' not in body
+    clean(body, 'not-my-account')
+
+
+# spec: ANYM-646
+def test_a_malformed_digest_on_a_phone_send_echoes_only_the_callers_own_account(native):  # noqa: F811
+    s, archive, state, key = native
+    request = {**phone_draft(), 'request_id': 'next-phone-bad-1'}
+    body = refusal(lambda: s.phone_send_begin(key, **request, preview_digest='bad'), 'preview_mismatch')
+    assert body['next_call']['arguments'] == {'account': PHONE_ACCOUNT}
+    other = {**request, 'account': 'not-my-account', 'request_id': 'next-phone-bad-2'}
+    body = refusal(lambda: s.phone_send_begin(key, **other, preview_digest='bad'), 'preview_mismatch')
+    assert 'next_call' not in body
+    clean(body, 'not-my-account', PHONE)
+
+
+# spec: ANYM-646
+def test_a_malformed_digest_on_join_chat_needs_a_fresh_successful_check(operator):  # noqa: F811
+    s, _, key, state = operator
+    s.set_messenger_operations(ACCOUNT, ['check_chat_link', 'join_chat'])
+    args = {'account': ACCOUNT, 'operation': 'join_chat', 'parameters': {'link': LINK}}
+
+    def join():
+        return refusal(lambda: s.execute_messenger_operation(key, **args, request_id='next-join-bad-1',
+                                                             preview_digest='bad'), 'preview_mismatch')
+    assert 'next_call' not in join()  # no check at all
+    link_check(s, key, state, request_id='next-check-bad-1')
+    assert join()['next_call']['tool'] == 'preview_messenger_operation'
+    with s.pool.connection() as c:  # a failed check, then a pending one, then an expired one
+        c.execute("UPDATE messenger_commands SET status='failed' WHERE operation='check_chat_link'")
+    assert 'next_call' not in join()
+    with s.pool.connection() as c:
+        c.execute("UPDATE messenger_commands SET status='queued',finished_at=NULL WHERE operation='check_chat_link'")
+    assert 'next_call' not in join()
+    with s.pool.connection() as c:
+        c.execute("UPDATE messenger_commands SET status='succeeded',finished_at=clock_timestamp()-interval '61 minutes'"
+                  " WHERE operation='check_chat_link'")
+    assert 'next_call' not in join()
+

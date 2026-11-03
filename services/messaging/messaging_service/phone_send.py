@@ -179,7 +179,7 @@ def send_begin(store, c, p, account, phone, text, request_id, reply_to, format, 
     def refused(error):
         # ANYM-646: a caller's own send names the preview call; a messages_send child keeps its body.
         if child: return error
-        return preview_refusal.send(error, account, phone=phone, reply_to=reply_to if isinstance(reply_to, str) else '',
+        return preview_refusal.send(error, p, account, phone=phone, reply_to=reply_to if isinstance(reply_to, str) else '',
                                     format=format, link_preview=link_preview, allow_lossy=allow_lossy)
     try: format_options(format, link_preview, allow_lossy, preview_digest)
     except APIError as error: raise refused(error) from None
