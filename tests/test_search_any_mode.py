@@ -53,7 +53,8 @@ def test_query_mode_is_described_with_all_modes_the_traps_and_an_example():
     assert [line.split(' ')[0].rstrip(':') for line in mode_lines] == list(modes)
     catalog = json.loads((ROOT / 'services/gateway/src/agent_gateway/catalog.json').read_text())
     for operation in ('search', 'search_files'):
-        entry, = [e for e in catalog if e['operation'] == operation]
+        # `operation` is a backend path, unique per module only: the messaging tools are the ones under test.
+        entry, = [e for e in catalog if e['operation'] == operation and e['module'] == 'messaging']
         mode = entry['inputSchema']['properties']['query_mode']
         assert mode['description'] == text and mode['enum'] == ['all', 'any', 'phrase', 'web', 'exact']
     contracts = json.loads((ROOT / 'tests/platform/fixtures/messaging-contracts.json').read_text())
