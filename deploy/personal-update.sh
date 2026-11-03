@@ -10,14 +10,18 @@
 #
 # Order, stopping at the first failure (before step 6 the old containers keep running untouched):
 #   1 refuse a modified checkout (tracked files)   2 fetch, pick target, require a fast-forward
-#   3 local pg_dump of each database (the only "backup" of this lite path: a cheap rollback for a bad migration)
+#   3 local pg_dump of each database (the only "backup" of this lite path: a cheap rollback for a bad migration).
+#     One dump per database is pinned (dump/<name>/pinned/): the one taken before the last successful update, or
+#     before the very first run; it never rotates. The other dumps rotate, newest KEEP kept.
+#     A target SHA whose update failed is skipped (no retry, no new dump) until a newer one appears, or for
+#     DEEDKIT_RETRY_DAYS (default 7); delete <dumpdir>/failed-sha to retry at once.
 #   4 check out the target   5 build images   6 migrate + re-apply role SQL   7 docker compose up -d
 #   8 wait for health.  Exactly one summary line per run goes to the log.
 #
 # Settings (environment, or private/personal-update.env next to this script):
 #   DEEDKIT_TRACK=main|tag  DEEDKIT_REMOTE=origin  DEEDKIT_DUMP_DIR=/var/backups/deedkit-local
 #   DEEDKIT_DUMP_KEEP=3  DEEDKIT_UPDATE_LOG=/var/log/deedkit-update.log  DEEDKIT_HEALTH_WAIT=180
-#   DEEDKIT_MIN_FREE_MB=2048
+#   DEEDKIT_MIN_FREE_MB=2048  DEEDKIT_RETRY_DAYS=7
 # Rollback after a bad update: git checkout <from-sha>; rebuild; docker compose up -d. If a migration ran,
 # restore the matching dump first (pg_restore into a fresh database; see the log line for the dump path).
 set -uo pipefail
@@ -33,10 +37,10 @@ main() {
   TRACK=${DEEDKIT_TRACK:-main}; REMOTE=${DEEDKIT_REMOTE:-origin}
   DUMPS=${DEEDKIT_DUMP_DIR:-/var/backups/deedkit-local}; KEEP=${DEEDKIT_DUMP_KEEP:-3}
   LOG=${DEEDKIT_UPDATE_LOG:-/var/log/deedkit-update.log}; WAIT=${DEEDKIT_HEALTH_WAIT:-180}
-  MIN_MB=${DEEDKIT_MIN_FREE_MB:-2048}
-  FROM=unknown; TO=unknown; SCHEMA=-; DUMPED=-
+  MIN_MB=${DEEDKIT_MIN_FREE_MB:-2048}; RETRY=${DEEDKIT_RETRY_DAYS:-7}
+  FROM=unknown; TO=unknown; SCHEMA=-; DUMPED=-; ATTEMPT=0; DUMPFILES=()
   mkdir -p -m 700 "$DUMPS" "$(dirname "$LOG")" 2>/dev/null
-  ERR=$DUMPS/last-error.log; : > "$ERR" 2>/dev/null   # output of the failing command; overwritten each run
+  ERR=$DUMPS/last-error.log   # output of the failing command of the latest update attempt
   for tool in git docker flock curl python3; do command -v "$tool" >/dev/null || { say failed "missing $tool"; return 1; }; done
   exec 9>"$DUMPS/.lock" || { say failed "cannot write $DUMPS"; return 1; }
   flock -n 9 || { say skipped "another update is running"; return 0; }
@@ -66,6 +70,12 @@ main() {
     done
     [ "$TO" != unknown ] || { uptodate_check "no newer origin/main commit with green CI among the newest 20"; return $?; }
   fi
+  # An update to this SHA already failed: do not retry it (nor take another dump) until a newer SHA appears.
+  if [ -n "$(find "$DUMPS/failed-sha" -mtime -"$RETRY" 2>/dev/null)" ] \
+     && git merge-base --is-ancestor "$TO" "$(cat "$DUMPS/failed-sha")" 2>/dev/null; then
+    uptodate_check "target ${TO:0:12} failed on an earlier run (details in $ERR); skipped until a newer one appears, or ${RETRY} days, or delete $DUMPS/failed-sha" skipped; return $?
+  fi
+  : > "$ERR" 2>/dev/null
   local free; free=$(df -Pm "$DUMPS" | awk 'NR==2{print $4}')
   [ "${free:-0}" -ge "$MIN_MB" ] || { say failed "less than ${MIN_MB} MB free in $DUMPS"; return 1; }
 
@@ -81,11 +91,12 @@ main() {
 
   # 4-5. new code, new images; a failed build restores the old checkout and touches no container
   git checkout --quiet --detach "$TO" || { say failed "checkout of target failed"; return 1; }
+  ATTEMPT=1   # from here a failure marks $TO as failed
   cd "$repo/deploy" || return 1
   build_all "$msg" "$gw" "$cal" || { revert; say failed "image build failed; old containers untouched"; return 1; }
 
   # 6. migrations and roles run on the new image while the old containers still serve
-  # A failure up to here reverts the checkout to the old commit, so the next run tries again.
+  # A failure up to here reverts the checkout to the old commit and marks the target as failed (see the header).
   if [ -n "$msg" ]; then migrate_messaging || { revert; return 1; }; fi
   if [ -n "$cal" ]; then migrate_calendar || { revert; return 1; }; fi
 
@@ -97,21 +108,23 @@ main() {
   [ -z "$msg" ] || wait_healthy messaging || return 1
   [ -z "$cal" ] || wait_healthy calendar -f compose.calendar.yaml || return 1
   [ -z "$gw" ] || wait_healthy gateway -f compose.gateway.yaml || return 1
+  pin_success; rm -f "$DUMPS/failed-sha"
   say ok "updated"
 }
 
 revert() { git checkout --quiet --detach "$FROM"; }
 
-uptodate_check() {  # nothing to update: still report a stack that is not running healthy (a failed earlier update)
-  local reason=$1 WAIT=30
+uptodate_check() {  # uptodate_check <reason> [result]: nothing to update; still report a stack that is not running healthy
+  local reason=$1 result=${2:-uptodate} WAIT=30
   cd "$REPO/deploy" || return 1
   if [ -n "$(docker compose ps -aq db 2>/dev/null)" ]; then wait_healthy messaging || return 1; fi
   if [ -n "$(docker compose -f compose.calendar.yaml ps -aq calendar-api 2>/dev/null)" ]; then wait_healthy calendar -f compose.calendar.yaml || return 1; fi
   if [ -n "$(docker compose -f compose.gateway.yaml ps -aq gateway 2>/dev/null)" ]; then wait_healthy gateway -f compose.gateway.yaml || return 1; fi
-  say uptodate "$reason"
+  say "$result" "$reason"
 }
 
 say() {  # say <result> <detail>: the one summary line
+  [ "$1" = failed ] && [ "$ATTEMPT" = 1 ] && printf '%s\n' "$TO" > "$DUMPS/failed-sha"
   printf '%s result=%s from=%.12s to=%.12s schema=%s dumps=%s %s\n' "$(date -u +%FT%TZ)" "$1" "$FROM" "$TO" "$SCHEMA" "$DUMPED" "$2" | tee -a "$LOG" >&2
 }
 
@@ -144,9 +157,28 @@ dump() {  # dump <name> "<compose -f args>" <service> <user> <db>
      || ! docker compose $args exec -T "$svc" pg_restore --list < "$out.partial" >/dev/null 2>&1; then
     rm -f "$out.partial"; say failed "pg_dump of $name failed; nothing changed"; return 1
   fi
-  mv "$out.partial" "$out"; DUMPED=$dir
-  # keep the newest $KEEP dumps of this database
+  mv "$out.partial" "$out"; DUMPED=$dir; DUMPFILES+=("$name:$out")
+  # the first dump ever is the pinned one until an update succeeds
+  mkdir -p -m 700 "$dir/pinned"
+  [ -n "$(find "$dir/pinned" -name '*.dump' | head -n 1)" ] || pin_file "$out" "$dir/pinned"
+  # rotate the others: newest $KEEP stay (a pinned dump is a hard link, so it survives rotation)
   ls -1t "$dir"/*.dump | tail -n +"$((KEEP + 1))" | while read -r old; do rm -f "$old"; done
+}
+
+pin_success() {  # after a successful update the dumps taken before it become the pinned ones
+  local e name out dir
+  for e in "${DUMPFILES[@]}"; do
+    name=${e%%:*}; out=${e#*:}; dir=$DUMPS/$name/pinned
+    pin_file "$out" "$dir"
+  done
+}
+
+pin_file() {  # pin_file <dump> <pinned dir>: the new pin is complete before the old one is removed
+  local out=$1 dir=$2
+  rm -f "$dir/.new"
+  { ln "$out" "$dir/.new" 2>/dev/null || cp -p "$out" "$dir/.new"; } || { rm -f "$dir/.new"; return 1; }
+  find "$dir" -name '*.dump' -delete 2>/dev/null
+  mv "$dir/.new" "$dir/$(basename "$out")"
 }
 
 build_all() {
