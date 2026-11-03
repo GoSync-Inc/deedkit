@@ -470,11 +470,12 @@ class Store:
             return preview(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy)
 
     def send_message(self,token,account,chat_id,text,request_id,reply_to='',format='plain',
-                     preview_digest='',link_preview=False,allow_lossy=False):
+                     preview_digest='',link_preview=False,allow_lossy=False,
+                     expected_last_message_id=None,guard=None):
         from .outgoing import enqueue
         with self.authorized(token,'send_message') as (c,p):
             return enqueue(c,p,account,chat_id,text,request_id,reply_to,format,
-                preview_digest,link_preview,allow_lossy)
+                preview_digest,link_preview,allow_lossy,expected_last_message_id=expected_last_message_id,guard=guard)
 
     # ANYM-532: a phone recipient; phone_send.preview and phone_send.send wait between these short reads.
     def phone_preview_lookup(self,token,account,phone,text,reply_to='',format='plain',
@@ -562,10 +563,11 @@ class Store:
             return advance(self,c,p,intent_id,open_chat=open_grants(arguments),
                            files=arguments.get('allow_files') is not False)
 
-    def get_send_status(self,token,send_id):
+    def get_send_status(self,token,send_id=None,request_id=None):
         from .outgoing import status
         with self.authorized(token,'get_send_status') as (c,p):
-            return status(c,p,send_id)
+            # A send_id call keeps the old call shape; only a request_id lookup (ANYM-736) names it.
+            return status(c,p,send_id) if request_id is None else status(c,p,send_id,request_id)
 
     def prepare_file_upload(self,token,account,chat_id,filename,mime,bytes,sha256,request_id):
         from .uploads import prepare

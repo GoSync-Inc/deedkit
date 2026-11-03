@@ -7,7 +7,7 @@ import re
 
 REASONS = frozenset((
     "required", "unknown_field", "type", "enum", "min_length", "max_length", "pattern", "minimum",
-    "maximum", "min_items", "max_items", "unique", "format", "blank", "size",
+    "maximum", "min_items", "max_items", "unique", "format", "blank", "size", "expected_message_unknown",
 ))
 MAX_ENTRIES = 20
 MAX_PATH = 128

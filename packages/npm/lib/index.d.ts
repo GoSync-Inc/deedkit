@@ -53,6 +53,11 @@ export interface MessageActionFields {
   preview_digest?: string;
   /** Bounded receipt wait, 0–25 seconds. Zero is omitted for older servers. */
   wait_s?: number;
+  /** ANYM-736, chat_id sends only: the archive ID of the newest message you read in this chat. Newer eligible
+   * messages refuse the send as `chat_changed_since_seen` and nothing is queued. */
+  expected_last_message_id?: string;
+  /** With `expected_last_message_id`: `any_message` (default) or `outgoing_only` (only the owner's own messages count). */
+  guard?: 'any_message' | 'outgoing_only';
 }
 export interface MessengerOperationPreview {
   account: string;
@@ -264,6 +269,8 @@ export declare class AnyMsgClient {
   sendMessage(args: MessageAction): Promise<Record<string,unknown>>;
   messagesSend(args: MessagesSendArguments): Promise<Record<string,unknown>>;
   getSendStatus(args: {send_id:string}): Promise<Record<string,unknown>>;
+  /** ANYM-736: the `request_id` you chose for the send, which recovers a lost response (exactly one of the two keys). */
+  getSendStatus(args: {request_id:string}): Promise<Record<string,unknown>>;
   /** Passive catalog and scoped permission read, with no provider request. */
   listMessengerOperations(args: {account:string}): Promise<Record<string,unknown>>;
   /** Passive validation; show exact targets, effects and warnings before owner confirmation. */

@@ -29,6 +29,10 @@ LIVE_SEARCH = "search_messages_live"
 OPEN_CHAT_BY_PHONE = "open_chat_by_phone"
 OPEN_CHAT_BY_USERNAME = "open_chat_by_username"
 SEND_FILE = "send_file"
+# ANYM-736: the guard of send_message compares the chat's messages, so it needs the call its refusal names.
+GUARD_ARGUMENTS = ("expected_last_message_id", "guard")
+GUARD_CONTEXT_TOOL = "messages_get_context"
+GUARD_REFUSED = "send_guard_not_permitted"
 # One line each for an agent choosing what to load (ANYM-271); the ids are the deployable modules.
 # No ", " or ": ": the MCP text block is compact JSON (ANYM-408).
 MODULE_PURPOSES = {
@@ -441,6 +445,15 @@ class Dispatch:
                 and not rules_ceiling):
             # A projection and its undo are planned from guardian rules: the assignment ceiling of rules in members.
             raise Denied()
+        if (module == "messaging" and tool["operation"] == "send_message"
+                and any(args.get(name) is not None for name in GUARD_ARGUMENTS)
+                and not self.guard_readable(snapshot, agent, caps, args.get("account"))):
+            # ANYM-736: before any backend send: a gateway that cannot read the chat learns nothing about it from
+            # the refusal's counts, even when the backend credential could. A lost response is recovered by
+            # request_id, never by repeating the guarded call.
+            denied = Denied(GUARD_REFUSED, 403)
+            denied.detail = {"error": GUARD_REFUSED, "next_action": "check_send_status_by_request_id"}
+            raise denied
         allowed_actions = self.actions(snapshot, agent, caps) if module == "messaging" else []
         if tool["operation"] == "get_messenger_operation":
             # Retained receipts are independent of current provider support.
@@ -469,6 +482,13 @@ class Dispatch:
             # ANYM-546: files go as send_file operations, under the same action grant.
             raise Denied()
         return allowed_actions
+
+    def guard_readable(self, snapshot, agent, caps, account):
+        """Whether this caller may run the get_context call a guard refusal names, on this account."""
+        tool = CATALOG.get(GUARD_CONTEXT_TOOL)
+        return (tool is not None and GUARD_CONTEXT_TOOL in self.policy.visible(snapshot, agent)
+                and set(tool["scopes"]) <= set(caps["permissions"])
+                and self.implemented(tool, snapshot, agent, caps, account))
 
     @staticmethod
     def backend_call(tool, args, caps):
@@ -666,7 +686,15 @@ class Dispatch:
             if error.code == "backend_busy" and module == "messaging" and tool["operation"] == "wait_for_subscription_events":
                 # ANYM-518: a full wait pool is a wait outcome, not a bare 503.
                 return {"wait_status": "busy", "retry_after_s": WAIT_RETRY_AFTER_S, "wait_pool": WAIT_POOL}
-            if error.code in {"backend_unavailable", "backend_response_too_large"} and not read_only:
+            if (error.code == "backend_unavailable" and module == "messaging" and tool["operation"] == "send_message"
+                    and getattr(error, "detail", {}).get("backend_error") == "chat_guard_unavailable"):
+                # ANYM-736: the guard read failed before anything was queued: a rejection, not an unknown outcome.
+                diagnostics = error.detail
+                error.detail = {
+                    **safe_error("chat_guard_unavailable"), "next_action": "retry_after_delay",
+                    **{key: diagnostics[key] for key in FAILURE_FIELDS if key in diagnostics},
+                }
+            elif error.code in {"backend_unavailable", "backend_response_too_large"} and not read_only:
                 diagnostics = getattr(error, "detail", {})
                 error.detail = {
                     **safe_error("mutation_outcome_unknown", unknown_outcome=True),

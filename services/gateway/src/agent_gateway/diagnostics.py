@@ -15,6 +15,7 @@ from .catalog import CATALOG, public
 NEXT_DISCOVERY_ACTION = "refresh_connection_if_tools_list_differs"
 BACKEND_ERROR_CODES = frozenset({
     "query_timeout", "service_busy", "service_unavailable", "temporarily_unavailable", "subscription_wait_timeout",
+    "chat_guard_unavailable",
 })
 REQUEST_ID = re.compile(r"(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})\Z")
 

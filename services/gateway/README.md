@@ -72,7 +72,7 @@ Arguments that fail a tool's input schema are rejected with 422 `invalid_argumen
 `{field, reason, expected?, allowed?}`. `field` is a slash path from the reviewed schema
 (`destination_source`, `rows/0/version`), or `$` for the arguments object itself. `reason` is one of
 `required`, `unknown_field`, `type`, `enum`, `min_length`, `max_length`, `pattern`, `minimum`,
-`maximum`, `min_items`, `max_items`, `unique`, `format`, `blank`, `size`. `expected` and `allowed` come
+`maximum`, `min_items`, `max_items`, `unique`, `format`, `blank`, `size`, `expected_message_unknown`. `expected` and `allowed` come
 from the schema, never from the submitted value, and an unknown key is named only when it is a short
 identifier. Other rejections (non-finite numbers, a non-object body) keep the bare
 `{"error": "invalid_arguments"}`.

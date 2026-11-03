@@ -7,7 +7,7 @@ import re
 
 FIELD_ERROR_REASONS = frozenset(('required', 'unknown_field', 'type', 'enum', 'min_length',
     'max_length', 'pattern', 'minimum', 'maximum', 'min_items', 'max_items', 'unique',
-    'format', 'blank', 'size'))
+    'format', 'blank', 'size', 'expected_message_unknown'))
 MAX_FIELD_ERRORS = 20
 MAX_FIELD_PATH = 128
 MAX_ALLOWED = 50

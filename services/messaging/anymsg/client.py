@@ -47,6 +47,8 @@ SAFE_ERROR_CODES = frozenset({
     'rotation_in_progress','endpoint_limit','endpoint_conflict','operator_disabled','invalid_endpoint_state','endpoint_paused','endpoint_auto_paused',
     # ANYM-546/547: messages_send.
     'invalid_arguments','preview_stale','preview_expired','invalid_confirm_token','in_progress','identity_changed',
+    # ANYM-736: the send_message chat-head guard.
+    'chat_changed_since_seen','chat_guard_unavailable',
 })
 
 _UPLOAD_CHUNK_BYTES = 262144
@@ -532,16 +534,22 @@ class Client:
             reply_to=reply_to,format=format,link_preview=link_preview,allow_lossy=allow_lossy))
 
     def send_message(self,*,account,chat_id,text,request_id,reply_to='',format='plain',
-                     preview_digest='',link_preview=False,allow_lossy=False,wait_s=0):
+                     preview_digest='',link_preview=False,allow_lossy=False,wait_s=0,
+                     expected_last_message_id=None,guard=None):
         """Submit exactly confirmed content; rich sends must match a reviewed preview.
 
         Keep request_id until the result is known. The digest never proves human
         approval; the acting agent obtains exact owner confirmation separately.
+        expected_last_message_id (ANYM-736): the archive ID of the newest message you read in this chat; newer
+        messages refuse the send as chat_changed_since_seen and nothing is queued. guard: any_message or
+        outgoing_only. Both are omitted from the wire when None, so older servers see the old payload.
         """
         parameters=dict(account=account,chat_id=chat_id,text=text,
             request_id=request_id,reply_to=reply_to)
         _wait_seconds(wait_s)
         if wait_s!=0:parameters['wait_s']=wait_s
+        if expected_last_message_id is not None:parameters['expected_last_message_id']=expected_last_message_id
+        if guard is not None:parameters['guard']=guard
         # Default plain calls remain compatible with older strict servers.
         # Nondefault values pass unchanged so the server can reject bad types.
         if (format!='plain' or preview_digest!='' or link_preview is not False
@@ -565,8 +573,12 @@ class Client:
         if 'wait_s' in parameters:_wait_seconds(parameters['wait_s'])
         return self.call('messages_send',parameters)
 
-    def get_send_status(self,send_id):
-        return self.call('get_send_status',{'send_id':send_id})
+    def get_send_status(self,send_id=None,*,request_id=None):
+        """A send's saved state by send_id, or (ANYM-736) by the request_id you chose: the recovery for a lost response.
+
+        Exactly one of the two; send_id alone keeps the payload older servers accept."""
+        return self.call('get_send_status',{name:value for name,value in dict(send_id=send_id,request_id=request_id).items()
+            if value is not None})
 
     def list_messenger_operations(self, *, account):
         """Read this account's allowlisted operations and your independently scoped grants."""

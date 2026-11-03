@@ -55,6 +55,8 @@ const SAFE_ERRORS = new Set([
   'rotation_in_progress','endpoint_limit','endpoint_conflict','operator_disabled','invalid_endpoint_state','endpoint_paused','endpoint_auto_paused',
   // ANYM-546/547: messages_send.
   'invalid_arguments','preview_stale','preview_expired','invalid_confirm_token','in_progress','identity_changed',
+  // ANYM-736: the send_message chat-head guard.
+  'chat_changed_since_seen','chat_guard_unavailable',
 ]);
 
 const UPLOAD_FIELDS = Object.freeze({
