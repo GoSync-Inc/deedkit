@@ -206,7 +206,7 @@ class ArchiveRuntime:
                 await self.list_page(account, token, credential, now, settings, kind='first', cursor=None,
                                      limit=min(PAGE, free))
             return
-        head_due = plan['head_cursor'] is not None or plan['last_head_at'] is None or now - plan['last_head_at'] >= HEAD_EVERY
+        head_due = plan['head_cursor'] is not None or plan['last_head_at'] is None or not 0 <= now - plan['last_head_at'] < HEAD_EVERY
         if head_due:
             free = cap - queued
             if free >= 1:

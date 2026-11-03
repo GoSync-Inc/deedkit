@@ -149,6 +149,7 @@ def test_capacity_pause_disk_full_rollback_and_recovery(tmp_path, monkeypatch):
         def full(): raise Failure('archive_capacity')
         monkeypatch.setattr(r.store, 'capacity', full)
         vendor.value = conversation(text='changed text')
+        vendor.value['structured']['overview'] = 'Changed overview'  # ANYM-724: a changed list row makes it due
         await r.run_once(now=4000)
         assert r.error == 'archive_capacity'
         assert (await r.db('record', account, 'conv-a'))['revision'] == old['revision']
