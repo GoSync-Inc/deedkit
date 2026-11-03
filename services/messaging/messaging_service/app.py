@@ -1050,7 +1050,8 @@ def register_subscription_tools(mcp, call, async_call, read, upload_write):
         reply_to_own_send (dynamic only) catches an exact native reply to any confirmed send of
         this key. Optional sender_ids (explicit chats only) are exact account-scoped IDs from search_people.
         Starts at the committed event boundary; default message.created/incoming/live.
-        Historical events require explicit backfill/reconcile origins. File readiness
+        Historical events require explicit backfill/reconcile origins; a message the live stream lost and a
+        reconcile pass found within 6 hours of sending has origin live_recovered and matches live. File readiness
         is independent of message arrival. Optional expiry is a future zoned ISO time
         within 366 days. Label is only a correlation hint, not authority to wake a task.
         Delivery uses separate fetch/ACK and configured signed hints; no provider read-state mutation.

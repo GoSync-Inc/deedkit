@@ -47,6 +47,44 @@ def test_defaults_start_at_committed_head_and_do_not_ack(seeded):
     assert len(store.get_updates(old, 'existing')['items']) == 5
 
 
+# spec: ANYM-733
+def test_live_recovered_events_match_live_and_reconcile_selectors_and_are_not_historical(seeded):
+    store, _, _ = seeded
+    token = key(store)
+    selectors = {'default': None, 'live': ['live'], 'recovered': ['live_recovered'], 'reconcile': ['reconcile'],
+        'old_only': ['backfill', 'fixture']}
+    sids = {name: create(store, token, label=name, origins=origins)['subscription_id']
+        for name, origins in selectors.items()}
+    plain = emit(store)
+    recovered = emit(store, 'demo-tg-2', origin='live_recovered')
+    match_subscriptions(store)
+    pages = {name: store.get_subscription_events(token, sid)['items'] for name, sid in sids.items()}
+    assert {name: [item['event_id'] for item in items] for name, items in pages.items()} == {
+        'default': [plain, recovered], 'live': [plain, recovered], 'recovered': [recovered],
+        'reconcile': [recovered], 'old_only': []}
+    item = pages['recovered'][0]
+    assert item['origin'] == 'live_recovered' and item['historical'] is False
+    assert 'historical_event' not in item['wake_reason']
+    with pytest.raises(APIError) as error:
+        create(store, token, origins=['live_recovered', 'unknown'])
+    assert error.value.code == 'invalid_filter'
+
+
+# spec: ANYM-733
+def test_a_recovered_message_wakes_like_a_live_one_and_an_old_reconcile_one_does_not(seeded):
+    store, _, _ = seeded
+    token = key(store)
+    sid = create(store, token, origins=['live', 'live_recovered', 'reconcile'],
+        wake_rules=['incoming_message'])['subscription_id']
+    old = emit(store, origin='reconcile')
+    recovered = emit(store, 'demo-tg-2', origin='live_recovered')
+    match_subscriptions(store)
+    items = store.get_subscription_events(token, sid)['items']
+    assert [item['event_id'] for item in items] == [recovered]
+    assert items[0]['wake_reason'] == ['incoming_message']
+    assert old not in [item['event_id'] for item in items]
+
+
 def test_independent_source_sets_senders_and_event_revisions(seeded):
     store, _, _ = seeded
     token = key(store, accounts=['telegram-demo', 'whatsapp-demo-1'])

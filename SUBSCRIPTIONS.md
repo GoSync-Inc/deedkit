@@ -42,6 +42,17 @@ can include `backfill`, `reconcile` or synthetic `fixture`; historical matches
 are marked. Expiry is optional, timezone-aware, in the future and at most 366
 days ahead. No messages before the creation frontier are replayed.
 
+The live stream can lose a message (a reconnect, a capture overload restart;
+COLLECTORS.md, Availability of new messages). The next reconcile pass then stores
+it with origin `reconcile`, which is minutes to hours after it was sent. When
+that pass creates a message sent at most 6 hours earlier, the event has origin
+`live_recovered` (ANYM-733): a selector with `live`, `live_recovered` or
+`reconcile` matches it, it is not `historical`, and it wakes like a live message
+(`incoming_message` and the other live wake rules). Compare its `sent_at` and
+`observed_at` to see how late it was. A message first stored more than 6 hours
+after it was sent, and every edit or deletion found by reconcile, keeps origin
+`reconcile` and stays historical; `backfill` and `fixture` are never recovered.
+
 Lifecycle is `active`, `paused`, `closed`, `expired` or `access_changed`.
 Resume defaults to `catch_up`; explicit `skip` records the intentionally skipped
 journal range. Re-read the version after a `subscription_conflict`. For an explicit

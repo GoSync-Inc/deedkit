@@ -23,7 +23,14 @@ EVENT_KINDS = frozenset(('message.created', 'message.edited', 'message.deleted',
 FAILURE_KINDS = frozenset(('send.failed', 'source.health'))
 # A journal write the send or collector path survived, per kind, since process start.
 JOURNAL_FAILURES = Counter()
-ORIGINS = frozenset(('live', 'fixture', 'backfill', 'reconcile'))
+ORIGINS = frozenset(('live', 'live_recovered', 'fixture', 'backfill', 'reconcile'))
+# ANYM-733: a message the live stream lost and a reconcile pass found soon after (archive.journal_origin) is live for
+# `live` selectors, and still seen by the `reconcile` selectors that already received it.
+RECOVERED_SELECTORS = frozenset(('live', 'live_recovered', 'reconcile'))
+
+
+def origin_selected(origin, selected):
+    return not RECOVERED_SELECTORS.isdisjoint(selected) if origin == 'live_recovered' else origin in selected
 WAKE_RULES = frozenset(('incoming_message', 'owner_mention', 'reply_to_owner', 'reply_to_confirmed_send',
     'reply_to_own_send'))
 # ANYM-522: the operator's switch for dynamic sources (set-dynamic-subscriptions); creation reads it under
@@ -663,11 +670,11 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                 selected = source in lookup if visible is None else source in visible
                 if event['kind'] in FAILURE_KINDS:
                     # Direction and senders describe messages; these kinds have their own audience.
-                    matches = (event['kind'] in selector['kinds'] and event['origin'] in selector['origins'] and
+                    matches = (event['kind'] in selector['kinds'] and origin_selected(event['origin'], selector['origins']) and
                         _failure_audience(event, selected, row, p))
                 else:
                     matches = (selected and event['kind'] in selector['kinds'] and
-                        event['origin'] in selector['origins'])
+                        origin_selected(event['origin'], selector['origins']))
                     if matches and visible is not None:
                         matches = _dynamic_match(selector['sources'], visible[source], snapshot)
                     if matches and selector['direction']:
