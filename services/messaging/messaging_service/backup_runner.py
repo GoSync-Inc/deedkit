@@ -652,6 +652,7 @@ class Runner:
             while chunk:=f.read(1024**2):
                 digest.update(chunk);size+=len(chunk)
                 if self.clock()-started>seconds:raise RuntimeError('recordings_hash_timeout')
+        if self.clock()-started>seconds:raise RuntimeError('recordings_hash_timeout')
         if size==0:raise RuntimeError('recordings_snapshot_empty')
         return size,digest.hexdigest()
     def clean_staging(self):

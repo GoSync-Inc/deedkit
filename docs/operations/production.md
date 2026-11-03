@@ -1904,6 +1904,21 @@ network `deedkit-recordings-backend` and the enroll tag; the owner revokes the p
 - *Read archive health:* `docker exec` into `recordings-api` and send `POST /v1/archive_status` for an account with an
   operator backend key; it returns counts, last success and fixed error codes and contacts no vendor.
 
+**Recordings archive backup (ANYM-727).** `deedkit-recordings-backup.timer` runs the daily job at 21:30 UTC and
+`deedkit-recordings-backup-catchup.timer` the catch-up at 23:15 UTC (from 23:00, only when the last good bundle is older
+than 22 hours); the units and `deploy/backup-runner-recordings.example.json` are installed by ANYM-731, not by a deploy.
+Staging: create `/opt/deedkit/recordings-backup/staging` by hand, owner 10001:10001, mode 0700 (the runner refuses
+`recordings_staging_unsafe`), and mount it at `/backup-staging` in the recordings container
+(`deploy/compose.recordings.yaml`, `RECORDINGS_BACKUP_STAGING`). Admission: the runner starts only when its worst case
+ends 15 minutes before the next start of another profile, read from their timer files; else `recordings_skipped_window`
+(also `_schedule_unknown`, `_yielded`, `_lock_busy`, `_disk`, `_container_down`, `_archive_disabled`; all are status
+`skipped`, exit 0, with nothing left in staging). The expected archive size (`expected_archive_bytes`, default 1 GiB) plus
+`min_free_bytes` must be free; the status file records the real `archive_bytes`. Archive polling and this timer are
+independent: with the archive off the job skips `recordings_skipped_archive_disabled`. Read-back after installation:
+`systemctl list-timers deedkit-recordings-backup.timer`, the status file, and an empty staging directory. Undo:
+`systemctl disable --now deedkit-recordings-backup.timer deedkit-recordings-backup-catchup.timer`. BACKUP.md "Staging,
+slot and admission" has the full rule.
+
 ## Image retention
 
 ```sh

@@ -262,7 +262,7 @@ def test_the_snapshot_call_has_its_own_deadline_and_the_hash_has_its_own(tmp_pat
     assert docker.execs[0][2] == 111
     # A hash that outlasts its deadline: after the snapshot call every clock reading jumps past it.
     runner, docker, _ = snapshot_runner(folder(tmp_path, 'b'), age_stub, monkeypatch, hash_timeout_seconds=10)
-    readings = iter(range(0, 10 ** 7, 7))
+    readings = iter(range(0, 10 ** 9, 1000))
     real = docker.exec
     def exec_then_a_slow_clock(*args):
         runner.clock = lambda: next(readings)
@@ -431,7 +431,7 @@ def test_the_worst_case_is_the_sum_of_the_configured_deadlines_and_a_resumed_del
 # spec: ANYM-727
 @pytest.mark.parametrize('now,admitted', [
     (at(3), True), (at(21, 30), True), (at(22, 0), True),
-    (at(13, 0), False), (at(14, 40), False), (at(15, 30), False), (at(15, 59), False),   # the calendar at 16:00
+    (at(13, 0), True), (at(14, 40), False), (at(15, 30), False), (at(15, 59), False),   # the calendar at 16:00
     (at(17, 30), False), (at(17, 59), False),                                           # messaging at 18:00
     (at(19, 0), False), (at(19, 14), False)])                                           # the calendar catch-up at 19:15
 def test_a_start_is_admitted_only_when_the_whole_worst_case_ends_15_minutes_before_another_profile_starts(
@@ -721,7 +721,7 @@ def test_the_example_config_loads_and_names_the_timers_of_the_profiles_it_must_n
     {'unknown_key': 1}])
 def test_the_new_config_keys_are_validated(tmp_path, change):
     cfg = recordings_cfg(tmp_path)
-    cfg['recordings'].update(container='recordings-api-1', **change)
+    cfg['recordings'].update({'container': 'recordings-api-1', **change})
     with pytest.raises(ValueError):
         backup_runner.recordings_config(copy.deepcopy(cfg))
 

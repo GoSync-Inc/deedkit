@@ -566,3 +566,29 @@ shows a mount inside staging or a directory is on another device.
 The marker `<state_directory>/.unsettled` records the worker until it is verified stopped, like the calendar's
 `<host_lock>.unsettled`; `production.py` does not read it (the run holds `host_lock` throughout; a deploy check
 for it is for ANYM-727/731 to decide).
+
+### Staging, slot and admission (ANYM-727)
+
+The recordings job runs from `deedkit-recordings-backup.timer` daily at 21:30 UTC, with a catch-up at 23:15 UTC
+(`deedkit-recordings-backup-catchup.timer`; it acts only from 23:00 and when `freshness.py` reports the last good
+bundle older than 22 hours). 21:30 follows messaging (18:00), the calendar run (16:00) and the calendar catch-up's worst
+case (19:15 + 6300 s + two 180 s stops = 21:06 UTC). Polling the archive and this timer are independent: if the
+archive is off (not enabled in the recordings config, or the container is stopped), the job ends `skipped` with
+`recordings_skipped_archive_disabled` or `recordings_skipped_container_down`, exit 0, and nothing is staged.
+
+Staging directory: `/opt/deedkit/recordings-backup/staging` on the host (override `RECORDINGS_BACKUP_STAGING`), mounted
+at `/backup-staging` in the recordings container; owner 10001:10001, mode 0700, created by hand at installation
+(ANYM-731). The runner refuses any other owner or mode (`recordings_staging_unsafe`). The snapshot is taken by
+`docker exec deedkit-recordings ... --backup-to /backup-staging/<job id>/archive.sqlite` (SQLite Online Backup, one
+consistent file); the worker reads it in place, so there is no separate copy deadline: the copy runs inside the exec
+deadline, the hash has its own deadline, and the worker refuses `recordings_snapshot_changed` when the file differs from
+the recorded size or sha256.
+
+Admission (before anything is staged): the runner reads the other profiles' timer files, and starts only when its
+worst case ends at least 15 minutes (900 s) before the next scheduled start of another profile; otherwise it ends
+`skipped` with `recordings_skipped_window` (an unreadable timer file: `recordings_skipped_schedule_unknown`). While running it
+yields at checkpoints and in the capture poll loop when that guard time arrives (`recordings_skipped_yielded`). Disk:
+free space must cover `min_free_bytes` plus the expected archive size (`expected_archive_bytes`, default 1 GiB, or
+the last recorded `archive_bytes` of the status file when larger), else `recordings_skipped_disk`. The recordings
+run never waits for the host lock (`recordings_skipped_lock_busy`); only `--recover-stop` waits, up to 120 s. A
+skipped job leaves the freshness clock alone, so the catch-up timer decides.
