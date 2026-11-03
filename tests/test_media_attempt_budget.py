@@ -223,7 +223,7 @@ def test_restore_without_acls_does_not_leave_wake_media_job_open_to_public(archi
     wake="'public.wake_media_job(text)'::regprocedure"
     role='media_ungranted_'+uuid4().hex
     with s.pool.connection() as c:
-        c.execute(f'GRANT EXECUTE ON FUNCTION public.wake_media_job(text) TO PUBLIC')  # what a restore does
+        c.execute('GRANT EXECUTE ON FUNCTION public.wake_media_job(text) TO PUBLIC')  # what a restore does
         assert c.execute(f"SELECT has_function_privilege('public',{wake},'EXECUTE') AS open").fetchone()['open'] is True
     s.migrate();s.migrate()
     try:
