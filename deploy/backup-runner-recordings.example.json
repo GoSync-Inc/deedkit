@@ -1,0 +1,31 @@
+{
+  "profile": "recordings",
+  "directory": "/opt/deedkit/recordings-backup/backups",
+  "project": "deedkit-recordings",
+  "image": "sha256:REPLACE_WITH_THE_BACKUP_IMAGE_ID_MESSAGING_PINS",
+  "delivery_mode": "staged_v1",
+  "recipient_file": "/opt/deedkit/recordings-backup/recipient",
+  "transfer": {
+    "host": "backup.example.invalid",
+    "user": "deedkit-recordings-backup",
+    "identity_file": "/opt/deedkit/recordings-backup/delivery_ed25519",
+    "known_hosts_file": "/opt/deedkit/recordings-backup/known_hosts"
+  },
+  "timeout_seconds": 900,
+  "busy_wait_seconds": 1800,
+  "keep_local": 1,
+  "host_lock": "/opt/personal-os-probe/backups/.runner.lock",
+  "recordings": {
+    "staging_directory": "/opt/deedkit/recordings-backup/staging",
+    "state_directory": "/opt/deedkit/recordings-backup/state",
+    "capture_timeout_seconds": 1200,
+    "container": "deedkit-recordings-recordings-api-1",
+    "container_config": "/run/deedkit/recordings/config.json",
+    "container_staging": "/backup-staging",
+    "timers": [
+      "/etc/systemd/system/personal-os-backup.timer",
+      "/etc/systemd/system/deedkit-calendar-backup.timer",
+      "/etc/systemd/system/deedkit-calendar-backup-catchup.timer"
+    ]
+  }
+}

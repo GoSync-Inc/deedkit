@@ -1,0 +1,32 @@
+[Unit]
+Description=DeedKit recordings archive encrypted backup and delivery (ANYM-727)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# No clock condition: the runner admits a start itself. It reads the next scheduled start of messaging and of the calendar
+# from their timer files and does not start unless its worst case (STOP 35 + snapshot call + hash + worker container +
+# delivery + recovery 120, from runner.json) ends 15 minutes before it; otherwise it records `skipped` and exits 0. A busy
+# host lock (another profile, a deploy) is skipped the same way, never waited for.
+ExecStart=/usr/bin/python3 -I /opt/personal-os-probe/ops/backup_runner.py --config /opt/deedkit/recordings-backup/runner.json
+# Recovery after every run that started: stops only its own worker and empties the staging directory (plaintext of the
+# archive). A journal left by an earlier failed recovery waits for the next run, and the staging is emptied at its start.
+ExecStopPost=/usr/bin/python3 -I /opt/personal-os-probe/ops/backup_runner.py --config /opt/deedkit/recordings-backup/runner.json --recover-stop
+# STOP 35 + 300 + 120 + 1200 + 900 + 1800 = 4355 s for the run; the recovery has its own TimeoutStopSec. No Restart=: a retry
+# could reach another profile's start; a failed day stays in status.json until the catch-up or the next day.
+TimeoutStartSec=4400s
+TimeoutStopSec=180s
+User=root
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+MemoryMax=192M
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+# Its own job, staging and state directories; messaging's backup directory only for the shared lock.
+ReadWritePaths=/opt/deedkit/recordings-backup /opt/personal-os-probe/backups

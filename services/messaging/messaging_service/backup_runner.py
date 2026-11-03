@@ -33,7 +33,14 @@ SAFE_ERRORS={'backup_capture_failed','backup_capture_timeout','backup_container_
     'collector_missing_during_resume','collector_identity_changed','collector_missing_during_stop','host_lock_busy',
     'recordings_snapshot_absent','recordings_snapshot_empty','recordings_snapshot_unsafe','recordings_snapshot_corrupt',
     'recordings_snapshot_foreign','recordings_schema_unsupported','recordings_identity_missing',
-    'staging_mount_refused','staging_cleanup_failed'}
+    'staging_mount_refused','staging_cleanup_failed','recordings_snapshot_changed','recordings_integrity_timeout',
+    'recordings_encrypt_timeout','recordings_no_space','recordings_exec_timeout','recordings_exec_failed',
+    'recordings_hash_timeout',
+    'recordings_staging_unsafe',
+    # A skip is not a failure (ANYM-727): nothing was sealed, no other profile was touched, a later start tries again.
+    'recordings_skipped_lock_busy','recordings_skipped_window','recordings_skipped_schedule_unknown',
+    'recordings_skipped_disk','recordings_skipped_container_down','recordings_skipped_archive_disabled',
+    'recordings_skipped_yielded'}
 # The receiver's own verifier holds its upload lock for a whole restore (about an hour). A delivery it refuses as busy
 # before it stores anything (stream_v2: before the stream started) is offered again, same backup ID, every
 # BUSY_RETRY_SECONDS while the bound since the first offer allows; each offer keeps its upload timeout.
@@ -47,7 +54,22 @@ HOST_LOCK_POLL_SECONDS=5
 POLL_SECONDS=1.0
 CALENDAR_WORKER='deedkit-calendar-backup-'
 RECORDINGS_WORKER='deedkit-recordings-backup-'
+# ANYM-727. A recordings job stays this far from the next scheduled start of any other backup profile (the same quarter
+# hour the admission, the yield and the unit tests use); STOP_BUDGET is `docker stop`'s 25 s plus a margin, RECOVERY_BUDGET
+# the ExecStopPost run; CONTAINER_UID is the recordings image's user (Dockerfile USER, compose `user:`).
+GUARD_SECONDS=900
+STOP_BUDGET=35
+RECOVERY_BUDGET=120
+RECOVERY_LOCK_WAIT=120
+CONTAINER_UID=10001
+RECORDINGS_DEFAULTS={'exec_timeout_seconds':300,'hash_timeout_seconds':120,'integrity_timeout_seconds':300,
+                     'encrypt_timeout_seconds':600,'min_free_bytes':1024**3,'expected_archive_bytes':1024**3}
 MOUNTINFO='/proc/self/mountinfo'  # the Linux mount table; absent elsewhere (a development host), then no mount is known
+
+
+class Skip(RuntimeError):
+    """A recordings job that ends by choice (ANYM-727): fixed `code`, exit 0, `state: skipped` in status.json."""
+    def __init__(self,code):super().__init__(code);self.code=code
 
 
 def read_json(path,limit=65536):
@@ -125,8 +147,64 @@ def mounts_under(root,mountinfo=None):
     return found
 
 
+DAILY_START=re.compile(r'\*-\*-\* ([01][0-9]|2[0-3]):([0-5][0-9])(?::([0-5][0-9]))? UTC')
+
+
+def timer_starts(path):
+    """Seconds after 00:00 UTC of every `OnCalendar=*-*-* HH:MM[:SS] UTC` line of a systemd timer file.
+
+    Anything else (another calendar form, no such line, an unreadable file) is unknown, and an unknown schedule
+    stops the job (fail closed): the admission must never guess when another backup starts.
+    """
+    try:
+        with open(path,'rb') as f:text=f.read(65537).decode()
+    except (OSError,UnicodeDecodeError):raise Skip('recordings_skipped_schedule_unknown') from None
+    if len(text)>65536:raise Skip('recordings_skipped_schedule_unknown')
+    starts=[]
+    for line in text.splitlines():
+        line=line.strip()
+        if not line.startswith('OnCalendar='):continue
+        match=DAILY_START.fullmatch(line[len('OnCalendar='):].strip())
+        if match is None:raise Skip('recordings_skipped_schedule_unknown')
+        starts.append(int(match[1])*3600+int(match[2])*60+int(match[3] or 0))
+    if not starts:raise Skip('recordings_skipped_schedule_unknown')
+    return starts
+
+
+def next_start(now,starts):
+    """The first of the daily `starts` after epoch second `now` (UTC days)."""
+    day=int(now//86400)*86400
+    return min(t for d in (0,86400) for t in (day+d+x for x in starts) if t>now)
+
+
+def recordings_options(cfg):
+    return {**RECORDINGS_DEFAULTS,**cfg['recordings']}
+
+
+def worst_case(cfg,phase='full'):
+    """Seconds from the start of a recordings run to the end of its recovery, from the configured deadlines alone.
+
+    stop + snapshot call + hash + worker container + delivery (an offer's timeout plus the busy wait) + recovery.
+    A resumed `upload` job owns only the delivery and the recovery. The units' TimeoutStartSec and the admission use it.
+    """
+    options=recordings_options(cfg)
+    delivery=cfg['timeout_seconds']+cfg.get('busy_wait_seconds',BUSY_WAIT_SECONDS)
+    if phase=='upload':return delivery+RECOVERY_BUDGET
+    return (STOP_BUDGET+options['exec_timeout_seconds']+options['hash_timeout_seconds']+
+            options['capture_timeout_seconds']+delivery+RECOVERY_BUDGET)
+
+
+def container_path(value):
+    return (isinstance(value,str) and re.fullmatch(r'/[a-zA-Z0-9_./-]{1,200}',value) is not None and
+            '..' not in value.split('/') and '//' not in value)
+
+
 def recordings_config(cfg):
-    """`profile: recordings` (ANYM-714): one staged archive snapshot, no database and no network, messaging's lock."""
+    """`profile: recordings` (ANYM-714): one staged archive snapshot, no database and no network, messaging's lock.
+
+    ANYM-727 adds the running container the snapshot is taken in (`docker exec`), its paths, the other profiles' timer
+    files the admission reads, and a deadline per phase.
+    """
     if set(cfg)-{'delivery_mode','busy_wait_seconds'}!={'profile','directory','project','image','recipient_file',
                   'transfer','timeout_seconds','keep_local','host_lock','recordings'}:raise ValueError('invalid_backup_config')
     if cfg.get('delivery_mode','staged_v1')!='staged_v1':raise ValueError('invalid_backup_config')
@@ -138,8 +216,9 @@ def recordings_config(cfg):
         if not isinstance(cfg[key],str) or not path_valid(cfg[key]):raise ValueError('invalid_backup_path')
     if Path(cfg['host_lock'])==Path(cfg['directory'])/'.runner.lock':raise ValueError('invalid_backup_path')
     own=cfg['recordings']
-    if not isinstance(own,dict) or set(own)!={'staging_directory','state_directory','capture_timeout_seconds'}:
-        raise ValueError('invalid_backup_config')
+    required={'staging_directory','state_directory','capture_timeout_seconds','container','container_config',
+              'container_staging','timers'}
+    if not isinstance(own,dict) or set(own)-set(RECORDINGS_DEFAULTS)!=required:raise ValueError('invalid_backup_config')
     for key in ('staging_directory','state_directory'):
         if not isinstance(own[key],str) or not path_valid(own[key]):raise ValueError('invalid_backup_path')
     # The runner empties the staging directory: it must be nothing else's (not the runner root, its lock, or state).
@@ -151,8 +230,28 @@ def recordings_config(cfg):
     if any(nested(staging,cfg[key]) for key in ('recipient_file',)) or any(
         nested(staging,cfg['transfer'][key]) for key in ('identity_file','known_hosts_file')):
         raise ValueError('invalid_backup_path')
+    if not isinstance(own['container'],str) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}',own['container']):
+        raise ValueError('invalid_backup_config')
+    if not container_path(own['container_config']) or not container_path(own['container_staging']):
+        raise ValueError('invalid_backup_path')
+    # Other profiles' timers: read at every start for the next scheduled time (never hard-coded); none of them may be a
+    # file this job writes or deletes.
+    timers=own['timers']
+    if (not isinstance(timers,list) or not 1<=len(timers)<=8 or len(set(timers))!=len(timers) or
+        not all(isinstance(t,str) and path_valid(t) and t.endswith('.timer') for t in timers) or
+        any(nested(staging,t) or nested(state,t) or nested(cfg['directory'],t) for t in timers)):
+        raise ValueError('invalid_backup_path')
     if type(cfg['timeout_seconds']) is not int or not 60<=cfg['timeout_seconds']<=7200:raise ValueError('invalid_backup_timeout')
     if type(own['capture_timeout_seconds']) is not int or not 60<=own['capture_timeout_seconds']<=7200:
+        raise ValueError('invalid_backup_timeout')
+    options=recordings_options(cfg)
+    ranges={'exec_timeout_seconds':(30,1800),'hash_timeout_seconds':(10,1800),'integrity_timeout_seconds':(30,1800),
+            'encrypt_timeout_seconds':(30,3600),'min_free_bytes':(256*1024**2,1024**4),
+            'expected_archive_bytes':(1024**2,1024**4)}
+    for key,(low,high) in ranges.items():
+        if type(options[key]) is not int or not low<=options[key]<=high:raise ValueError('invalid_backup_timeout')
+    # The worker container runs the integrity check and the encryption: its deadline covers both phases plus start-up.
+    if options['integrity_timeout_seconds']+options['encrypt_timeout_seconds']+60>own['capture_timeout_seconds']:
         raise ValueError('invalid_backup_timeout')
     if type(cfg.get('busy_wait_seconds',0)) is not int or not 0<=cfg.get('busy_wait_seconds',0)<=7200:
         raise ValueError('invalid_backup_timeout')
@@ -210,6 +309,12 @@ class Docker:
             if b'No such container' in result.stderr or b'No such object' in result.stderr:return None
             raise RuntimeError('docker_inspection_failed')
         return json.loads(result.stdout)[0]
+    @staticmethod
+    def exec(container,args,timeout):
+        """`docker exec` with its own deadline: (exit code, the first 2000 bytes of stderr). No output is kept otherwise."""
+        try:result=subprocess.run(['docker','exec',container,*args],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=timeout)
+        except subprocess.TimeoutExpired:raise RuntimeError('recordings_exec_timeout') from None
+        return result.returncode,result.stderr[:2000].decode(errors='replace')
     def running_collectors(self,project):
         ids=self.call('ps','-q','--no-trunc','--filter','label=com.docker.compose.project='+project).split()
         result=[]
@@ -418,6 +523,7 @@ class Runner:
             if state.is_symlink() or state.stat().st_mode&0o077:raise ValueError('private_backup_directory_required')
             self.unsettled_path=state/'.unsettled'
             self.staging_root=Path(cfg['recordings']['staging_directory'])
+            self.container_uid=self.container_gid=CONTAINER_UID;self.disk=shutil.disk_usage;self.yield_at=float('inf')
     def save(self):write_json(self.journal_path,self.journal)
     def settle(self,container):
         """Remove the unsettled marker once `container` (this profile's own worker) is absent or stopped."""
@@ -489,10 +595,65 @@ class Runner:
         self.save();self.status('capturing')
         if self.recordings:
             # Plaintext left by a crashed earlier job goes first; this job's directory is then staged into.
-            self.clean_staging();snapshot=self.staging_root/backup_id;snapshot.mkdir(mode=0o700)
-            self.stage_snapshot(snapshot)
+            self.clean_staging();(self.staging_root/backup_id).mkdir(mode=0o700)
+    def admit(self,phase):
+        """Latest-start admission (ANYM-727): this job and its recovery must end 15 minutes before the next scheduled start
+        of any other profile, read from those profiles' timer files now. Sets the instant after which the job yields."""
+        own=self.cfg['recordings'];now=self.clock()
+        following=min(next_start(now,timer_starts(path)) for path in own['timers'])
+        if now+worst_case(self.cfg,phase)>following-GUARD_SECONDS:raise Skip('recordings_skipped_window')
+        self.yield_at=following-GUARD_SECONDS
+    def guard(self):
+        """A checkpoint before anything is sealed: past the yield instant the job gives way and cleans up."""
+        if self.clock()>=self.yield_at:raise Skip('recordings_skipped_yielded')
+    def space(self,plain,cipher):
+        """Free space for `plain` more bytes of plaintext in staging and `cipher` of ciphertext in the job directory,
+        counted together when both are on one filesystem, above the floor."""
+        floor=recordings_options(self.cfg)['min_free_bytes'];staging,root=self.staging_root,self.root
+        needs=[(staging,plain+cipher)] if os.stat(staging).st_dev==os.stat(root).st_dev else [(staging,plain),(root,cipher)]
+        for path,size in needs:
+            if self.disk(path).free<floor+size:raise Skip('recordings_skipped_disk')
     def stage_snapshot(self,destination):
-        """Put `archive.sqlite` into `destination`, a private directory made for this job (ANYM-727 implements it)."""
+        """The archive snapshot, made by the single running writer (ANYM-727): `docker exec` of the existing CLI into
+        `destination`, this job's private directory in the staging mount (never a second container on the archive volume).
+
+        Skips (no failure, nothing sealed): container not running, archive not configured, no space, past the yield
+        instant. Records the staged file's size and SHA-256 in the journal; the worker must see the same bytes.
+        """
+        own=self.cfg['recordings'];options=recordings_options(self.cfg);self.guard()
+        info=self.staging_root.stat()
+        if info.st_uid!=self.container_uid or info.st_mode&0o777!=0o700:raise RuntimeError('recordings_staging_unsafe')
+        previous=read_json(self.status_path).get('archive_bytes') if self.status_path.exists() else None
+        estimate=max(options['expected_archive_bytes'],previous if type(previous) is int else 0)
+        self.space(estimate,estimate)
+        box=self.docker.inspect(own['container'])
+        if box is None or not box['State']['Running']:raise Skip('recordings_skipped_container_down')
+        for entry in destination.iterdir():  # a resumed job: nothing of an earlier attempt stays
+            shutil.rmtree(entry) if entry.is_dir() and not entry.is_symlink() else entry.unlink()
+        os.chown(destination,self.container_uid,self.container_gid)
+        target=own['container_staging'].rstrip('/')+'/'+destination.name+'/archive.sqlite'
+        code,error=self.docker.exec(own['container'],['deedkit-recordings','--config',own['container_config'],
+                                                      '--backup-to',target],options['exec_timeout_seconds'])
+        if code:
+            if 'archive_disabled' in error:raise Skip('recordings_skipped_archive_disabled')
+            if self.disk(self.staging_root).free<options['min_free_bytes']:raise RuntimeError('recordings_no_space')
+            raise RuntimeError('recordings_schema_unsupported' if 'archive_schema_unsupported' in error else 'recordings_exec_failed')
+        self.guard();size,digest=self.hash_staged(destination/'archive.sqlite',options['hash_timeout_seconds'])
+        self.space(0,size);self.guard()
+        self.journal['archive']={'bytes':size,'sha256':digest}
+    def hash_staged(self,path,seconds):
+        """Size and SHA-256 of the snapshot through one descriptor (no link followed), within its own deadline."""
+        started=self.clock()
+        try:fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        except OSError:raise RuntimeError('recordings_snapshot_absent') from None
+        with os.fdopen(fd,'rb') as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):raise RuntimeError('recordings_snapshot_unsafe')
+            digest=hashlib.sha256();size=0
+            while chunk:=f.read(1024**2):
+                digest.update(chunk);size+=len(chunk)
+                if self.clock()-started>seconds:raise RuntimeError('recordings_hash_timeout')
+        if size==0:raise RuntimeError('recordings_snapshot_empty')
+        return size,digest.hexdigest()
     def clean_staging(self):
         """Empty the staging directory (never the directory itself): plaintext of the archive must not linger.
 
@@ -531,8 +692,13 @@ class Runner:
     def create_recordings_worker(self,work):
         """The recordings profile's worker: the staged snapshot read-only, no network, no database, no secrets but age."""
         write_json(self.unsettled_path,{'profile':'recordings','id':self.journal['id'],'container':self.journal['container']})
+        options=recordings_options(self.cfg);archive=self.journal.get('archive')
         write_json(work/'worker.json',{'profile':'recordings','id':self.journal['id'],'snapshot_directory':'/sources/snapshot',
-            'recipient_file':'/run/secrets/recipient','work_directory':'/work'})
+            'recipient_file':'/run/secrets/recipient','work_directory':'/work',
+            'integrity_timeout_seconds':options['integrity_timeout_seconds'],
+            'encrypt_timeout_seconds':options['encrypt_timeout_seconds'],
+            # What the runner hashed after the snapshot call: the worker refuses a file that differs.
+            **({'expected_bytes':archive['bytes'],'expected_sha256':archive['sha256']} if archive else {})})
         self.docker.call('create','--name',self.journal['container'],'--label','personal-os.backup.id='+self.journal['id'],
             '--label','personal-os.backup.project='+self.cfg['project'],'--network','none',
             '--read-only','--user','0','--cap-drop','ALL','--cap-add','DAC_OVERRIDE','--security-opt','no-new-privileges',
@@ -588,6 +754,7 @@ class Runner:
                 info=self.docker.inspect(saved['id'])
                 if info is None:raise RuntimeError('collector_missing_during_stop')
                 if info['State']['Running']:self.docker.call('stop','--time','25',saved['id'])
+            if self.recordings:self.stage_snapshot(self.staging_root/self.journal['id'])
             self.journal['phase']='capturing';self.save()
         info=self.check_worker(self.docker.inspect(self.journal['container']))
         if info is None:
@@ -606,6 +773,7 @@ class Runner:
             if not info['State']['Running']:
                 if info['State']['ExitCode']!=0:raise RuntimeError(self.refusal(work) or 'backup_capture_failed')
                 self.resume_collectors();break
+            if self.recordings:self.guard()  # another profile is about to start: give way before anything is sealed
             if self.clock()-self.journal['created']>(self.cfg['recordings']['capture_timeout_seconds'] if self.recordings
                                                      else self.cfg['timeout_seconds']):raise RuntimeError('backup_capture_timeout')
             self.sleep(POLL_SECONDS)
@@ -832,6 +1000,7 @@ class Runner:
         status=read_json(self.status_path)
         status.update(last_success_at=datetime.now(timezone.utc).isoformat(),last_success_id=result['id'],
                       ciphertext_bytes=result['bytes'],ciphertext_sha256=result['sha256'],last_snapshot_at=result['captured_at'])
+        if self.recordings and type(result.get('snapshot',{}).get('bytes')) is int:status['archive_bytes']=result['snapshot']['bytes']
         write_json(self.status_path,status)
         info=self.check_worker(self.docker.inspect(self.journal['container']))
         if info:self.docker.call('rm',self.journal['container'])
@@ -841,6 +1010,9 @@ class Runner:
                          key=lambda p:p.name,reverse=True)
         for old in completed[self.cfg['keep_local']:]:shutil.rmtree(old)
     def run(self):
+        if self.recordings:
+            resumed=read_json(self.journal_path).get('phase') if self.journal_path.exists() else None
+            self.admit('upload' if resumed=='upload' else 'full')
         self.prepare();work=self.root/self.journal['id']
         try:
             if self.journal['phase']=='abandoning':
@@ -863,7 +1035,7 @@ class Runner:
             receipt,_=self.deliver(lambda:asyncio.run(self.send(path,result,self.cfg['transfer'],self.cfg['timeout_seconds'])))
             self.finish(work,result,receipt)
         except BaseException as exc:
-            self.status('error',str(exc) if str(exc) in SAFE_ERRORS else 'backup_job_failed')
+            self.status('skipped' if isinstance(exc,Skip) else 'error',str(exc) if str(exc) in SAFE_ERRORS else 'backup_job_failed')
             if self.recordings:
                 try:self.clean_staging()
                 except (OSError,ValueError):pass  # the next start empties it again
@@ -907,16 +1079,17 @@ class Runner:
             if info:self.docker.call('rm',self.journal['container'])
             self.abandon(self.root/self.journal['id'])
         # Preserve the actionable error from the initiating process.
-        if not self.status_path.exists() or read_json(self.status_path).get('state')!='error':
+        if not self.status_path.exists() or read_json(self.status_path).get('state') not in ('error','skipped'):
             self.status('error','backup_job_failed')
         self.settle(self.journal['container'])
 
 
 @contextmanager
-def hold_locks(cfg):
+def hold_locks(cfg,wait=HOST_LOCK_WAIT_SECONDS):
     """The runner's own lock; a calendar run then also messaging's lock (`host_lock`), the one a deploy holds.
 
-    The host lock is waited for at most HOST_LOCK_WAIT_SECONDS (`host_lock_busy`); both are held until the run ends.
+    The host lock is waited for at most `wait` seconds (`host_lock_busy`); both are held until the run ends. A recordings
+    run asks for no wait (ANYM-727): busy means another profile or a deploy is running, so it skips and a catch-up retries.
     """
     fds=[]
     try:
@@ -925,12 +1098,14 @@ def hold_locks(cfg):
         except BlockingIOError:raise RuntimeError('backup_job_already_running') from None
         if cfg.get('profile') in ('calendar','recordings'):
             fds.append(os.open(cfg['host_lock'],os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600))
-            deadline=time.monotonic()+HOST_LOCK_WAIT_SECONDS
+            deadline=time.monotonic()+wait
             while True:
                 try:fcntl.flock(fds[1],fcntl.LOCK_EX|fcntl.LOCK_NB);break
                 except BlockingIOError:
                     left=deadline-time.monotonic()
-                    if left<=0:raise RuntimeError('host_lock_busy') from None
+                    if left<=0:
+                        raise (Skip('recordings_skipped_lock_busy') if cfg['profile']=='recordings' and wait==0
+                               else RuntimeError('host_lock_busy')) from None
                     time.sleep(min(HOST_LOCK_POLL_SECONDS,left))
         yield
     finally:
@@ -959,7 +1134,9 @@ def main():
     runner=Runner(config(args.config))
     owns_lock=False;code='backup_job_failed'
     try:
-        with hold_locks(runner.cfg):
+        # A recordings run does not wait for the host lock; its recovery waits briefly (it only cleans up its own).
+        with hold_locks(runner.cfg,0 if runner.recordings and not args.recover_stop else
+                        RECOVERY_LOCK_WAIT if runner.recordings else HOST_LOCK_WAIT_SECONDS):
             owns_lock=True
             try:
                 if args.recover_stop:runner.recover_stop()
@@ -969,6 +1146,11 @@ def main():
                 except Exception:pass  # Journal remains for ExecStopPost / next operator run.
                 raise
     except Exception as exc:
+        if isinstance(exc,Skip):
+            try:runner.status('skipped',exc.code)
+            except Exception:pass
+            print(json.dumps({'status':'skipped','code':exc.code},separators=(',',':')),flush=True)
+            raise SystemExit(0) from None
         if not owns_lock and str(exc)=='host_lock_busy':
             code='host_lock_busy'
             try:runner.status('error',code)

@@ -1,0 +1,11 @@
+[Unit]
+Description=DeedKit recordings archive backup catch-up (23:15 UTC, only when the newest snapshot is old)
+
+[Timer]
+OnCalendar=*-*-* 23:15:00 UTC
+Persistent=true
+AccuracySec=1s
+Unit=deedkit-recordings-backup-catchup.service
+
+[Install]
+WantedBy=timers.target
