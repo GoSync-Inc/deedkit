@@ -4,6 +4,7 @@ from datetime import datetime
 import re
 import unicodedata
 
+from . import archive_feed
 from .archive_store import namespace, utc_text
 from .security import Failure, read_document, principal, cursor, continuation
 
@@ -53,6 +54,21 @@ class LocalArchive:
         if expected is not None and identity != expected:
             raise Failure('not_found_or_forbidden', 403)
         return account, identity
+
+    async def feed(self, doc, head, after=0, limit=100):
+        """The router's read of the journal (ANYM-726): the same four-slot admission and 2-second SQL deadline as every local
+        read; a busy or broken archive is a fixed code and nothing else (the collector never waits for it)."""
+        if self.budget.locked():
+            raise Failure('archive_busy')
+        async with self.budget:
+            if doc.archive is None:
+                raise Failure('archive_disabled')
+            if self.runtime.store is None or doc.archive.directory != str(self.runtime.store.directory):
+                raise Failure(self.runtime.error or 'archive_unavailable')
+            view = archive_feed.access_view(doc, namespace)
+            if head:
+                return await self.runtime.db('feed_head', view)
+            return await self.runtime.db('feed_page', view, after, limit)
 
     async def invoke(self, operation, args, key):
         account, identity = self.authorized(key, args.account, content=operation != 'archive_status')

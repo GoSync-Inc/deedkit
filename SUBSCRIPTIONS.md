@@ -1151,6 +1151,12 @@ attribute names, not the CloudEvents HTTP binding:
 | `call.interrupted` | `call_id`, `end_reason` (`service_restart`) |
 | `call.owner_request` | `call_id`, `decision_id`, `state` (`pending`); `urgency=now` and `expires_at` = the decision's stored deadline |
 
+| `recording.text.archived` | `recording_ref`, `account_ref`, `revision` (producer: recordings, ANYM-726; `urgency=batch`; `scope_ref` `recordings:<account>.<namespace16>`) |
+| `recording.access.changed` | `account_ref`, `principal_ref`, `reason` (`permission_removed`, `account_removed`, `namespace_replaced`); `urgency=now`, `scope_ref` the old scope (producer: recordings, ANYM-726) |
+
+The recordings rows are the producer side only: the feed is served by `services/recordings` (README "Event feed for the module event
+router"); the messaging contract for these two types and the router's use of the `recordings:<seq>` ids come with ANYM-732.
+
 References are `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`; `end_reason` and `outcome` are lowercase
 tokens of at most 48 characters. No titles, places, descriptions, guest names, destinations,
 transcripts or owner answers. `data` is at most 1 KiB (as PostgreSQL prints jsonb); the module

@@ -4,6 +4,7 @@ import hashlib
 from pathlib import Path
 import time
 
+from . import archive_feed
 from .archive_store import Store, MAX_TEXT, namespace
 from . import plaud, archive_plaud
 from .omi import metadata, pagination, content, fingerprint
@@ -27,6 +28,7 @@ class ArchiveRuntime:
         self.path, self.provider, self.remote = Path(path), provider, remote
         self.store, self.task, self.error = None, None, None
         self.index_error = None  # the schema-4 index build's own last failure; it never stops collection
+        self.feed_error = None  # the event feed's own last failure (ANYM-726); it never stops collection
         self.collecting, self.turn, self.ledger = asyncio.Lock(), 0, asyncio.Lock()
         self.errors = {}
         self.started = monotonic()
@@ -387,6 +389,21 @@ class ArchiveRuntime:
                                   {kind:('error','','archive_content_limit')},now,guard)
 
 
+    async def maintain_feed(self, doc):
+        """Keep the event feed's identity and access-change events current (ANYM-726). Contained like the index build:
+        a failure is recorded and collection goes on."""
+        if doc.event_router is None:
+            self.feed_error = None
+            return
+        try:
+            async with asyncio.timeout(30):
+                await self.db('feed_sync', archive_feed.access_view(doc, namespace))
+            self.feed_error = None
+        except Failure as error:
+            self.feed_error = error.code
+        except Exception:
+            self.feed_error = 'archive_unavailable'
+
     async def build_index(self):
         """Advance the schema-4 index build by a bounded step. A failure here is recorded for the status and never
         reaches collection: the old index (or the published one) keeps serving reads."""
@@ -412,6 +429,8 @@ class ArchiveRuntime:
                 if doc.archive.directory != str(self.store.directory):
                     raise Failure('archive_unavailable')
                 self.store.settings = doc.archive
+                self.store.feed_enabled = doc.event_router is not None
+                await self.maintain_feed(doc)
                 await self.build_index()
                 accounts = [a for a in doc.accounts if a.archive_namespace is not None]
                 if not accounts:

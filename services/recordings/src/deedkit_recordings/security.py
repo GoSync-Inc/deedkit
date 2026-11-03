@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import stat
 import time
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -61,12 +61,20 @@ class ArchiveSettings(Strict):
     omi_budget: OmiBudget = Field(default_factory=OmiBudget)
 
 
+class EventRouter(Strict):
+    """The module event router's read token (ANYM-726): SHA-256 digests (two allow a rotation) with an expiry of their own.
+    It is distinct from every principal key and opens only `GET /v1/events` and `GET /v1/events/head`."""
+    key_sha256: list[Annotated[str, Field(pattern=r'^[0-9a-f]{64}$')]] = Field(min_length=1, max_length=2)
+    expires_at: str
+
+
 class Document(Strict):
     version: Literal[1]
     cursor_secret_file: str
     accounts: list[Account] = Field(max_length=64)
     principals: list[Principal] = Field(max_length=256)
     archive: ArchiveSettings | None = None
+    event_router: EventRouter | None = None
 
 
 def unique(pairs):
@@ -125,6 +133,12 @@ def read_document(path, *, include_archive=True):
             expiry = datetime.fromisoformat(actor.expires_at.replace('Z', '+00:00'))
             if expiry.tzinfo is None:
                 raise ValueError('expiry requires timezone')
+        if doc.event_router is not None:
+            router = doc.event_router
+            if len(set(router.key_sha256)) != len(router.key_sha256) or set(router.key_sha256) & {p.key_sha256 for p in doc.principals}:
+                raise ValueError('router token reuse')
+            if datetime.fromisoformat(router.expires_at.replace('Z', '+00:00')).tzinfo is None:
+                raise ValueError('expiry requires timezone')
         secret = private(doc.cursor_secret_file, 256).strip()
         if len(secret) < 32:
             raise ValueError('short cursor secret')
@@ -142,6 +156,16 @@ def principal(doc, key):
             if expiry > datetime.now(timezone.utc):
                 return actor, accounts
     raise Failure('unauthorized', 401)
+
+
+def router_authorized(doc, key):
+    """True for a live router read token; compares every digest."""
+    router = doc.event_router
+    hashed = hashlib.sha256(key.encode()).hexdigest()
+    matched = False
+    for digest in router.key_sha256:
+        matched |= hmac.compare_digest(digest, hashed)
+    return matched and datetime.fromisoformat(router.expires_at.replace('Z', '+00:00')) > datetime.now(timezone.utc)
 
 
 def configuration(path, key):

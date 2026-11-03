@@ -13,6 +13,7 @@ import stat
 import time
 import uuid
 
+from . import archive_feed
 from .security import Failure, canonical, loads
 
 MAX_TEXT = 2 * 1024 ** 2
@@ -311,6 +312,9 @@ def backup_archive(settings, destination):
 
 
 class Store:
+    feed_enabled = False  # set by the runtime while the configuration has `event_router` (ANYM-726)
+    clock = staticmethod(time.time)
+
     def __init__(self, settings):
         self.settings, self.lock = settings, None
         try:
@@ -900,8 +904,12 @@ class Store:
             if usable_change or body != row['metadata']:
                 self.put_text(db, ns, row['rid'], row['ref'], metadata, parts, revision)
             if usable_change:
-                db.execute('INSERT INTO events(event_id,namespace,ref,revision,occurred) VALUES(?,?,?,?,?)',
-                           (uuid.uuid4().hex, ns, row['ref'], revision, now))
+                if self.feed_enabled:
+                    archive_feed.prepare(db, self.directory, self.clock())
+                created = db.execute('INSERT INTO events(event_id,namespace,ref,revision,occurred) VALUES(?,?,?,?,?)',
+                                     (uuid.uuid4().hex, ns, row['ref'], revision, now))
+                if self.feed_enabled:  # the marker reaches the disk before the row commits (ANYM-726)
+                    archive_feed.after_event(db, self.directory, created.lastrowid, self.clock())
             db.execute('UPDATE accounts SET last_success=COALESCE(?,last_success),error=?,text_bytes=MAX(0,text_bytes+?) '
                        'WHERE namespace=?',
                 (now if any(o[0] == 'available' for o in observations.values()) else None,
@@ -1052,6 +1060,26 @@ class Store:
             if row is None:
                 raise Failure('not_found_or_forbidden', 403)
             return self.decoded(row)
+
+    def feed_sync(self, view, now=None):
+        """Start or repair the feed identity and record the access changes the configuration made (one write, only if due)."""
+        now = self.clock() if now is None else now
+        with self.connection() as db:
+            due = archive_feed.sync_needed(db, self.directory, view, now)
+        if due:
+            self.write(lambda db: archive_feed.sync(db, self.directory, view, now))
+
+    def feed_page(self, view, after, limit):
+        self.feed_sync(view)
+        with self.connection() as db:
+            db.execute('BEGIN')
+            return archive_feed.page(db, view, after, limit)
+
+    def feed_head(self, view):
+        self.feed_sync(view)
+        with self.connection() as db:
+            db.execute('BEGIN')
+            return archive_feed.head_page(db)
 
     def events(self, after, limit):
         with self.connection() as db:
