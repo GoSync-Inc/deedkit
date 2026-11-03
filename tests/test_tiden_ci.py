@@ -783,7 +783,7 @@ def test_image_build_job_is_gated_only_by_the_change_decision():
     assert build["needs"] == "changes" and build["if"] == "${{ needs.changes.outputs.build == 'true' }}"
     assert "name" not in build  # production.py finds `images / build (backup)` by the job key
     assert build["strategy"]["matrix"]["target"] == [
-        "runtime", "indexer", "enricher-local", "whatsapp-native", "gateway", "calendar", "calls", "backup"]
+        "runtime", "indexer", "enricher-local", "whatsapp-native", "gateway", "calendar", "recordings", "calls", "backup"]
     # The build and smoke test come first; the publication steps after it only export what was tested.
     names = [step.get("name") for step in build["steps"]]
     check = names.index("Build and smoke-test the production target without providers")

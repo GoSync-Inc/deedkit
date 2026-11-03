@@ -2727,7 +2727,8 @@ class Deployer:
     def current(self, sha):
         p.write(self.state / "current.json", {"sha": sha, "status": "applied", "ci": {"url": "https://example.invalid"},
                                               "rollback": {"version": 1, "projects": [
-                                                  {"name": "synthetic", "after_digest": p.digest(self.document)}]}})
+                                                  {"name": project["name"], "after_digest": p.digest(self.document)}
+                                                  for project in self.settings["projects"]]}})
         (self.state / sha).mkdir(exist_ok=True)
         p.write(self.state / sha / "prepared.json", {"sha": sha, "config_digest": p.digest(self.settings)})
 
@@ -3001,6 +3002,103 @@ def test_deploy_pauses_when_the_configuration_changed_since_the_current_release(
         host.http["http_release"]["drain_timeout"] = 1
     outcome = host.deploy()
     assert outcome["status"] == "halted" and "changed since" in outcome["reason"] and host.steps == []
+
+
+# spec: ANYM-711
+def test_recordings_enrollment_and_undo_are_hand_releases_through_both_plans(tmp_path, monkeypatch):
+    third = "3" * 40
+    host = Deployer(tmp_path, monkeypatch, history=(NEWER, NEWEST, third), green=(NEWER, NEWEST, third))
+    unrelated = copy.deepcopy(host.settings["projects"])
+    overlay = str(tmp_path / "compose.gateway-recordings.yaml")
+    project = host.settings["projects"][0]  # the same dict serves plan A and plan B
+    project["files"].append(overlay)
+    host.settings["projects"].append({"name": "deedkit-recordings", "directory": str(tmp_path),
+                                      "files": [str(tmp_path / "compose.recordings.yaml")],
+                                      "services": {"recordings-api": "recordings"}})
+    # Both configurations changed: autodeploy halts before any step and leaves the pause file.
+    outcome = host.deploy()
+    assert outcome["status"] == "halted" and "changed since" in outcome["reason"] and host.steps == []
+    assert host.paused() == outcome["reason"]
+    # A dry run under the pause file answers `paused` before it looks at drift.
+    assert host.deploy(dry_run=True)["status"] == "paused"
+    # The hand release: plan A, then plan B (promote re-records the HTTP digest), then the pause goes.
+    for step, configuration in ((p.prepare, host.settings), (p.apply, host.settings),
+                                (host.s.prepare, host.http), (host.s.promote, host.http)):
+        step(configuration, NEWER)
+    assert [name for name, _ in host.steps] == ["prepare", "apply", "seamless prepare", "seamless promote"]
+    p.PAUSE.unlink()
+    assert p.read(host.http_state / "http-current.json")["config_digest"] == p.digest(host.http)
+    plan = host.deploy(dry_run=True)
+    assert plan["status"] != "halted" and "changed since" not in json.dumps(plan)
+    # Undo: the configurations go back; autodeploy halts again and does not undo anything itself.
+    project["files"].remove(overlay)
+    host.settings["projects"] = [project]
+    host.steps.clear()
+    halted = host.deploy()
+    assert halted["status"] == "halted" and "changed since" in halted["reason"] and host.steps == []
+    # The undo is a release at a SHA newer than any prepared with recordings, through both plans.
+    for step, configuration in ((p.prepare, host.settings), (p.apply, host.settings),
+                                (host.s.prepare, host.http), (host.s.promote, host.http)):
+        step(configuration, third)
+    p.PAUSE.unlink()
+    assert host.deploy() == {"status": "current", "sha": third}
+    assert host.settings["projects"] == unrelated
+
+
+# spec: ANYM-711
+def test_enrollment_and_the_fresh_sha_undo_pass_the_real_preparation_guards(tmp_path, monkeypatch):
+    # The real prepare(), receipt files and drift check; only the Docker, git and registry calls are the fixture's.
+    settings, _, _ = fixture(tmp_path, monkeypatch)
+    second, third = "2" * 40, "3" * 40
+    fixture_run = p.run
+    stores, wanted = {}, [SHA]  # one synthetic image store per commit: identities, revision labels and recipes per target
+    def routed(argv, **kwargs):
+        if "FETCH_HEAD" in argv:
+            return wanted[0]
+        store = stores.setdefault(wanted[0], ImageStore())
+        if argv[:2] in (["docker", "pull"], ["docker", "tag"], ["docker", "run"]) or argv[:3] in (
+                ["docker", "image", "ls"], ["docker", "image", "inspect"]):
+            try:
+                return store.run(argv, **kwargs)
+            except (KeyError, StopIteration):
+                pass  # an image the store never held (the running container's): the fixture answers
+        return fixture_run(argv, **kwargs)
+    monkeypatch.setattr(p, "run", routed)
+    monkeypatch.setattr(p, "published", lambda target, sha: stores.setdefault(sha, ImageStore()).published(target, sha))
+    plain_digest = p.settings_digest(settings)
+    state = Path(settings["state_directory"])
+    p.prepare(settings, SHA)
+    assert p.read(state / SHA / "prepared.json")["config_digest"] == plain_digest
+    (tmp_path / "recordings.json").write_text(json.dumps({"name": "deedkit-recordings", "services": {
+        "recordings-api": {"image": "old", "build": {"context": "/unused"}}}}))
+    enrolled = copy.deepcopy(settings)
+    enrolled["projects"][0]["files"].append(str(tmp_path / "compose.gateway-recordings.yaml"))
+    enrolled["projects"].append({"name": "deedkit-recordings", "directory": str(tmp_path),
+                                 "files": [str(tmp_path / "recordings.json")], "services": {"recordings-api": "recordings"}})
+    (tmp_path / "compose.gateway-recordings.yaml").write_text("{}")
+    assert p.settings_digest(enrolled) != plain_digest
+    current = {"sha": SHA, "rollback": {"projects": []}}
+    assert "production configuration changed since" in p.configuration_drift(enrolled, {}, current, {})
+    # The enrollment release prepares both projects at a SHA not prepared before.
+    wanted[:] = [second]
+    receipt = p.prepare(enrolled, second)
+    assert [item["name"] for item in receipt["projects"]] == ["synthetic", "deedkit-recordings"]
+    assert p.read(state / second / "prepared.json")["config_digest"] == p.settings_digest(enrolled)
+    # The undo cannot reuse the enrolled SHA; a newer one prepares the plain configuration again.
+    with pytest.raises(p.Refused, match="already exists"):
+        p.prepare(settings, second)
+    wanted[:] = [third]
+    undo = p.prepare(settings, third)
+    assert [item["name"] for item in undo["projects"]] == ["synthetic"]
+    assert p.read(state / third / "prepared.json")["config_digest"] == plain_digest
+
+
+# spec: ANYM-711
+def test_a_sha_prepared_with_recordings_cannot_be_prepared_again(tmp_path, monkeypatch):
+    settings, _, _ = fixture(tmp_path, monkeypatch)
+    p.prepare(settings, SHA)
+    with pytest.raises(p.Refused, match="already exists"):
+        p.prepare(settings, SHA)
 
 
 def test_a_failed_health_wait_rolls_back_once_and_pauses(tmp_path, monkeypatch):

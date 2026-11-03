@@ -1,0 +1,12 @@
+# Attaches the gateway to the recordings backend network and changes nothing else (ANYM-711). List it after
+# compose.gateway.yaml for the gateway project in BOTH /etc/deedkit/production.json and
+# /etc/deedkit/http-production.json, only at the recordings activation (docs/operations/production.md, "Recordings"):
+# the serving HTTP gateway generation takes its networks from this project's gateway service.
+services:
+  gateway:
+    networks:
+      - recordings-backend
+networks:
+  recordings-backend:
+    external: true
+    name: ${RECORDINGS_BACKEND_NETWORK:-deedkit-recordings-backend}

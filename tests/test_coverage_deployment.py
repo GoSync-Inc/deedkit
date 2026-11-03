@@ -66,7 +66,7 @@ def test_application_units_enforce_sandbox_resource_and_log_bounds():
     applications = units()
     assert set(applications) == {'api', 'db', 'telegram', 'whatsapp1', 'whatsapp2',
         'indexer', 'enricher', 'enricher-local', 'enricher-mini', 'operator', 'subscriptions',
-        'calendar-db', 'calendar-api', 'calendar-worker', 'gateway', 'calls',
+        'calendar-db', 'calendar-api', 'calendar-worker', 'recordings-api', 'gateway', 'calls',
         'file-lifecycle', 'file-understanding', 'cold-archive', 'cold-restore', 'message-purge', 'delivery',
         'delivery-egress', 'event-router'}
     for name, unit in applications.items():
@@ -290,7 +290,7 @@ def test_operator_backup_worker_has_narrow_privilege_exception_and_private_mount
 
 
 HEALTHCHECKS = {'api': 'deploy/compose.yaml', 'gateway': 'deploy/compose.gateway.yaml',
-                'calendar-api': 'deploy/compose.calendar.yaml'}
+                'calendar-api': 'deploy/compose.calendar.yaml', 'recordings-api': 'deploy/compose.recordings.yaml'}
 
 
 def healthcheck(name):
@@ -385,6 +385,70 @@ def test_calendar_healthcheck_uses_the_service_port_bind_and_allowed_hosts(tmp_p
         allowed.clear()
         assert probe(code, FCS_DATA_DIR=str(tmp_path)) == 1
     assert probe(code, FCS_DATA_DIR=str(tmp_path / 'missing')) == 1
+
+
+class StatusServer:
+    """Synthetic loopback server answering every POST with one status."""
+    def __init__(self, status):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(status)
+                self.send_header('Content-Length', '2'); self.end_headers(); self.wfile.write(b'{}')
+            def log_message(self, *args):
+                pass
+        self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+    def __enter__(self):
+        self.thread.start(); return self
+    def __exit__(self, *_):
+        self.server.shutdown(); self.server.server_close(); self.thread.join(timeout=5)
+
+
+# spec: ANYM-711
+def test_recordings_healthcheck_passes_only_on_the_unauthenticated_refusal_and_contacts_no_vendor(tmp_path):
+    import hashlib
+    import socket
+    import httpx
+    import uvicorn
+    sys.path.insert(0, str(ROOT / 'services/recordings/src'))
+    from deedkit_recordings.app import create_app
+    code, arguments = healthcheck('recordings-api')
+    assert arguments == [] and '127.0.0.1:13234' in code
+    def at(port):
+        return code.replace('13234', str(port))
+    # The probe talks to the real application: no key, no configuration read, no provider call.
+    def refuse(request):
+        raise AssertionError('the health probe reached a provider client')
+    for name, value in (('cursor.key', 'c' * 64), ('omi.key', 'omi_dev_synthetic')):
+        (tmp_path / name).write_text(value); (tmp_path / name).chmod(0o600)
+    document_ = {'version': 1, 'cursor_secret_file': str(tmp_path / 'cursor.key'),
+                 'accounts': [{'id': 'omi-a', 'provider': 'omi', 'label': 'Synthetic', 'token_file': str(tmp_path / 'omi.key')}],
+                 'principals': [{'id': 'agent-a', 'key_sha256': hashlib.sha256(b'k').hexdigest(),
+                                 'expires_at': '2999-01-01T00:00:00Z', 'accounts': ['omi-a'],
+                                 'permissions': ['recordings:read']}]}
+    (tmp_path / 'config.json').write_text(json.dumps(document_)); (tmp_path / 'config.json').chmod(0o600)
+    app = create_app(tmp_path / 'config.json', transport=httpx.MockTransport(refuse), archive_background=False)
+    listener = socket.socket(); listener.bind(('127.0.0.1', 0)); listener.listen()
+    port = listener.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(app, log_level='warning', access_log=False))
+    thread = threading.Thread(target=server.run, kwargs={'sockets': [listener]}, daemon=True); thread.start()
+    try:
+        for _ in range(100):
+            if server.started:
+                break
+            threading.Event().wait(.05)
+        assert probe(at(port)) == 0
+    finally:
+        server.should_exit = True; thread.join(timeout=10); listener.close()
+    # A closed port, an answer that is not the refusal, and a server error are failed probes.
+    assert probe(at(port)) == 1
+    for status in (200, 500, 403):
+        with StatusServer(status) as stub:
+            assert probe(at(stub.port)) == 1, status
+    with StatusServer(401) as stub:
+        assert probe(at(stub.port)) == 0
 
 
 def specific_bind_server(path, allowed, address):

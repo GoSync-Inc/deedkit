@@ -41,6 +41,7 @@ jobs:
             services/calendar/
             services/calls/
             services/gateway/
+            services/recordings/
             services/messaging/
             whatsapp/
             scripts/production.py
@@ -82,7 +83,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [runtime, indexer, enricher-local, whatsapp-native, gateway, calendar, calls, backup]
+        target: [runtime, indexer, enricher-local, whatsapp-native, gateway, calendar, recordings, calls, backup]
     services:
       # A throwaway registry for the publication dry run; it holds nothing after the job. Like the
       # pinned base images check-image already pulls, it comes from Docker Hub by digest.

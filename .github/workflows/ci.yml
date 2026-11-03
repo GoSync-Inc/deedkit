@@ -331,6 +331,14 @@ jobs:
           subject-digest: ${{ steps.publish.outputs.digest_calendar }}
           push-to-registry: true
           create-storage-record: false
+      - name: Attest recordings
+        if: steps.publish.outputs.attest_recordings == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/gosync-inc/deedkit-recordings
+          subject-digest: ${{ steps.publish.outputs.digest_recordings }}
+          push-to-registry: true
+          create-storage-record: false
       - name: Attest calls
         if: steps.publish.outputs.attest_calls == 'true'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2

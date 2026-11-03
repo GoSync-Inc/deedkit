@@ -444,7 +444,7 @@ def test_a_malformed_layer_is_refused_even_when_its_digest_matches(tmp_path, lay
 def test_own_package_list_covers_every_project_installed_into_an_image():
     names = set()
     for pyproject in ("services/gateway", "services/calendar", "services/calls", "packages/platform-contracts",
-                      "services/messaging"):
+                      "services/messaging", "services/recordings"):
         project = tomllib.loads((ROOT / pyproject / "pyproject.toml").read_text())
         names.add(project["project"]["name"].replace("-", "_").replace(".", "_").lower())
         for wheel in project.get("tool", {}).get("hatch", {}).get("build", {}).get("targets", {}).get("wheel", {}).get("packages", []):
