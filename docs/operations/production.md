@@ -115,7 +115,7 @@ the currently running application services to replace. Obtain those paths from
 overlays. Do not replace the host's Compose topology with the example.
 
 Available build targets are `runtime` (API, Telegram, subscriptions), `indexer`,
-`enricher-local`, `whatsapp-native`, `gateway`, `calendar`, `calls` and `backup`.
+`enricher-local`, `whatsapp-native`, `gateway`, `calendar`, `recordings`, `calls` and `backup`.
 The backup target supplies the producer and isolated restore helper; building it
 does not start a capture or a restore. The two
 calendar services share the `calendar` image; a legacy service named `voice`
@@ -236,7 +236,7 @@ or add storage before retrying.
 
 ## CI-published images
 
-Every `main` push run publishes the eight images its `images / build (<target>)`
+Every `main` push run publishes the nine images its `images / build (<target>)`
 jobs built and smoke-tested as `ghcr.io/gosync-inc/deedkit-<target>:<sha40>`,
 where `<sha40>` is the full source commit. Preparation pulls them by verified
 digest instead of building them ([Prepare and inspect](#prepare-and-inspect),
@@ -842,8 +842,9 @@ or restart policy counts as a change. If another operator changed a runtime or
 config after preparation, prepare a fresh reviewed candidate. The selected services stop before their replacements start; `up` uses
 `--no-build --pull never --no-deps --wait`. Databases and other Compose projects
 are not restarted. Routine promotion may briefly interrupt selected services.
-The messaging API, gateway and calendar API define Compose liveness healthchecks
-(their unauthenticated health routes, with an allowed Host, on loopback), so
+The messaging API, gateway, calendar API and recordings API define Compose liveness healthchecks
+(their unauthenticated health routes, with an allowed Host, on loopback; the recordings API has no health
+route, so its probe sends one unauthenticated POST and requires the 401 refusal, contacting no vendor), so
 `--wait` also requires them to report healthy; the first probe runs about 30
 seconds after start. Collectors, workers, indexer and enrichment expose no
 container-local health signal and are verified only as running. Docker does not
@@ -1714,6 +1715,74 @@ Undo: a row that fails again returns to `failed` by itself; nothing else changes
 applies, so a large cohort can take several days. Track each returned id until it has a stored transcript or
 description or a recorded disposition (failed again with its code, or still queued with the budget spent); the failed
 count falls the moment the rows are queued and proves nothing. A queued or leased row is open evidence.
+
+## Recordings (ANYM-711)
+
+`deploy/compose.recordings.yaml` runs the optional recordings backend (Omi and PLAUD reads,
+[services/recordings/README.md](../../services/recordings/README.md)) as `recordings-api`. Merging and promoting the
+image enable nothing: the service needs the private configuration directory, a gateway policy grant, a first
+start by hand and an enrollment release, all of them under the section 2 gates and none of them during an active
+call. The container joins no `integration` network. The gateway reaches it over the internal network
+`deedkit-recordings-backend` (bridge `dk-recbackend0`, gateway mode `isolated`, no host address), and its one
+way out is the filtered bridge `dk-recordings0` (ANYM-712; the host rules come first). Archive polling, audio
+links and the archive backup are separate gates (docs/DATA-POLICY.md).
+
+**Private directory** (`RECORDINGS_STATE_DIR`, outside Git, mounted read-only as a DIRECTORY at
+`/run/deedkit/recordings`, so an atomic replace inside it reaches the running service): mode 0700, owner
+10001, holding `config.json`, `cursor.key`, `omi.key`, `plaud.key` and the per-agent backend key files, every
+file a regular file of mode 0600 owned by 10001. Paths inside `config.json` are the in-container ones;
+`deploy/recordings.example.json` is the synthetic structure (token files under `/run/deedkit/recordings/`);
+`deploy/recordings-archive.example.json` adds the archive (under `/data/archive`, never a `/private/...` path of the
+README example) and each account's `archive_namespace`, and is used only after the archive gates pass. The owner
+writes the provider keys by hand; the agent only checks modes and that a file is not empty.
+
+**First start by hand** (`production.py` cannot start a service that is not enrolled: `snapshot` needs one
+running container). With `<sha>` a green `main` SHA whose `publish` job finished:
+1. `gh attestation verify oci://ghcr.io/gosync-inc/deedkit-recordings:<sha> --repo GoSync-Inc/deedkit
+   --signer-workflow GoSync-Inc/deedkit/.github/workflows/ci.yml --source-ref refs/heads/main --source-digest <sha>
+   --deny-self-hosted-runners` (see "CI-published images"), `docker pull` that digest and
+   `docker tag <digest ref> deedkit-recordings:enroll-<sha>` (a new tag, never `--build`).
+2. Once: `docker network create --internal -o com.docker.network.bridge.name=dk-recbackend0 -o
+   com.docker.network.bridge.gateway_mode_ipv4=isolated deedkit-recordings-backend`.
+3. `DEEDKIT_VERSION=enroll-<sha> docker compose -p deedkit-recordings -f deploy/compose.recordings.yaml up
+   -d --no-build --pull never` and read `docker ps` health (healthy after about 30 seconds).
+
+**Gateway.** Upgrade the gateway to a release that knows the module before the policy names it (an old gateway
+rejects the module name). The policy gets, in one atomic replace with a higher `revision` and a backup first:
+`deployment.modules` + `recordings`, `deployment.backends.recordings.url` = `http://recordings-api:13234`, the
+profile's `recordings_capabilities` / `recordings_list` / `recordings_read` tools, per principal
+`credentials.recordings` = `{key_file: /run/deedkit/keys/recordings-<agent>.key, key_sha256}` (the key file is
+0600, owned by 10001, in the gateway keys directory) and `grants.recordings` = `recordings:read` +
+`recordings:content` (no `recordings:audio`). A backend URL change needs a gateway restart.
+
+**Enrollment is a hand release**, modelled on the delivery enrollment (step 5 of "Apply and verify"). The host
+lists `deploy/compose.recordings.yaml` as a new project `recordings` with `"services": {"recordings-api":
+"recordings"}` in `/etc/deedkit/production.json` ONLY (plan B accepts exactly two services, the API and the
+gateway), and `deploy/compose.gateway-recordings.yaml` after `compose.gateway.yaml` in the gateway project's
+`files` in BOTH `/etc/deedkit/production.json` and `/etc/deedkit/http-production.json`, so the promoted HTTP gateway
+generation joins `deedkit-recordings-backend`. The change makes the recorded configuration digests differ, so
+autodeploy halts at "apply the next release by hand". Sequence: create the pause file; back up and edit both
+configuration files; `production.py prepare --sha S` and `apply --sha S` (plan A); `seamless_release.py prepare
+--sha S` and `promote --sha S` (plan B); `status`; remove the pause; `production.py deploy --dry-run` must report
+the new state current (a dry run with the pause file present returns `paused` before it checks drift). Plan A apply
+restarts the selected services of the enrolled projects as in any release.
+
+**Undo**, in order: remove the module, tools, grants and credential from the policy (new revision); stop
+`recordings-api` only (`docker compose -p deedkit-recordings stop`) and leave autodeploy paused, which is the
+holding state; at a NEWER green `main` SHA (a docs-only pull request creates one) restore both configuration backups
+and repeat the hand release sequence above (a SHA prepared with recordings can never be prepared again); `deploy
+--dry-run` must report current without a drift halt; then `docker compose -p deedkit-recordings down`, remove the
+network `deedkit-recordings-backend` and the enroll tag; the owner revokes the provider keys in Omi and PLAUD.
+
+**Operations on the running service.**
+- *Add an account:* add it to `config.json` (atomic replace inside the directory) with its token file; a new
+  provider identity gets a new `archive_namespace` when it is archived.
+- *Rotate a token:* replace the token file (atomically, 0600); the service re-reads it on every provider call, so no
+  restart is needed; keep the archive namespace.
+- *Replace an account:* a different provider identity under a reused local account ID needs a new
+  `archive_namespace`; remove the old account first.
+- *Read archive health:* `docker exec` into `recordings-api` and send `POST /v1/archive_status` for an account with an
+  operator backend key; it returns counts, last success and fixed error codes and contacts no vendor.
 
 ## Image retention
 

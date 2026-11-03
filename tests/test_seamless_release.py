@@ -129,6 +129,34 @@ def test_candidate_has_unique_aliases_no_ports_and_reuses_external_state(tmp_pat
     assert 'policy' not in private
 
 
+# spec: ANYM-711
+def test_the_gateway_candidate_joins_the_recordings_network_and_keeps_its_others(tmp_path):
+    cfg = settings(tmp_path)
+    source = documents(cfg)
+    source['gateway']['services']['gateway']['networks']['recordings-backend'] = {}
+    source['gateway']['networks']['recordings-backend'] = {'name': 'deedkit-recordings-backend'}
+    release = Path(cfg['state_directory']) / SHA
+    release.mkdir()
+    doc, _ = s.isolate(cfg, source, {'runtime': IMAGE, 'gateway': IMAGE}, release, GEN, SHA)
+    unit = doc['services']['http-gateway-' + GEN]
+    assert set(unit['networks']) == {'gateway-integration', 'gateway-frontend', 'gateway-recordings-backend'}
+    assert all(net['aliases'] == ['http-gateway-' + GEN] for net in unit['networks'].values())
+    assert doc['networks']['gateway-recordings-backend'] == {'external': True, 'name': 'deedkit-recordings-backend'}
+    assert doc['networks']['gateway-integration'] == {'external': True, 'name': 'integration'}
+
+
+# spec: ANYM-711
+def test_the_recordings_project_cannot_become_a_third_selected_http_service(tmp_path):
+    cfg = settings(tmp_path)
+    overlay = str(tmp_path / 'compose.gateway-recordings.yaml')
+    cfg['projects'][1]['files'].append(overlay)
+    assert s.validate_settings(cfg) is cfg  # the gateway overlay changes no selection
+    cfg['projects'].append({'name': 'recordings', 'directory': str(tmp_path), 'files': [overlay],
+                            'services': {'recordings-api': 'recordings'}})
+    with pytest.raises(s.Refused, match='two'):
+        s.validate_settings(cfg)
+
+
 def test_isolation_preserves_empty_resolved_network_ipam_metadata(tmp_path):
     cfg = settings(tmp_path)
     source = documents(cfg)

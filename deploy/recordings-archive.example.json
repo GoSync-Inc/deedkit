@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "cursor_secret_file": "/run/deedkit/recordings/cursor.key",
+  "accounts": [
+    {
+      "id": "omi-a",
+      "provider": "omi",
+      "label": "Owner Omi",
+      "token_file": "/run/deedkit/recordings/omi.key",
+      "archive_namespace": "00000000000000000000000000000000"
+    },
+    {
+      "id": "plaud-a",
+      "provider": "plaud",
+      "label": "Owner PLAUD",
+      "token_file": "/run/deedkit/recordings/plaud.key",
+      "archive_namespace": "11111111111111111111111111111111"
+    }
+  ],
+  "principals": [
+    {
+      "id": "owner-claude-code",
+      "key_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "expires_at": "2026-12-31T00:00:00Z",
+      "accounts": [
+        "omi-a",
+        "plaud-a"
+      ],
+      "permissions": [
+        "recordings:read",
+        "recordings:content"
+      ]
+    }
+  ],
+  "archive": {
+    "directory": "/data/archive",
+    "poll_seconds": 300,
+    "max_bytes": 1073741824,
+    "free_reserve_bytes": 1073741824
+  }
+}

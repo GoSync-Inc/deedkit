@@ -67,6 +67,7 @@ BUILDS = {
     "whatsapp-native": (".", "services/messaging/Dockerfile", "whatsapp-native", "import messaging_service.whatsapp_collector"),
     "gateway": (".", "services/gateway/Dockerfile", "", "import agent_gateway, platform_contracts.release"),
     "calendar": ("services/calendar", "services/calendar/Dockerfile", "", "import family_calendar"),
+    "recordings": ("services/recordings", "services/recordings/Dockerfile", "", "import deedkit_recordings.app"),
     "calls": ("services/calls", "services/calls/Dockerfile", "", "import fastapi, pipecat"),
     "backup": (".", "services/messaging/Dockerfile", "backup",
                "import messaging_service.backup_restore_worker; import subprocess; "
@@ -75,7 +76,7 @@ BUILDS = {
 }
 # The images the main push run publishes (scripts/publish_images.py TARGETS): preparation pulls these by verified
 # digest instead of building them; `http-router` and `check-image` still build locally (ANYM-301 B1).
-PUBLISHED = ("runtime", "indexer", "enricher-local", "whatsapp-native", "gateway", "calendar", "calls", "backup")
+PUBLISHED = ("runtime", "indexer", "enricher-local", "whatsapp-native", "gateway", "calendar", "recordings", "calls", "backup")
 REGISTRY = "ghcr.io/gosync-inc/deedkit-"
 # The tokenless attestation verifier, built reproducibly from tools/attest-verify and installed by the owner;
 # tests keep this hash equal to tools/attest-verify/attest-verify.linux-amd64.sha256.

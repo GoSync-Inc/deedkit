@@ -10,6 +10,6 @@ paths:
 - Authority and gates: AGENTS.md section 2 and harness process.md section 2. For a confirmed production incident, follow `docs/operations/incident-recovery.md`: minimal reversible recovery first, deferred reviews/records next, other tasks last. The existing service/session restart has standing incident authority; a compatible service-only recovery needs no fresh full backup or restore drill. Keep main/CI/artifact verification, active-call checks, locks and state/session identity.
 - Preserve the host's Compose topology, state, sessions, mounts and private overlays. Select only the replaced app services; databases are never selected.
 - Never `down -v`, prune shared Docker data or delete runtime data to free the 15 GiB minimum. Keep previous images until acceptance.
-- Health checks: compose healthchecks for the messaging API, gateway and calendar API; collectors and workers are only checked as running. Sends, ACKs, calls and new sessions are never health probes.
+- Health checks: compose healthchecks for the messaging API, gateway, calendar API and recordings API; collectors and workers are only checked as running. Sends, ACKs, calls and new sessions are never health probes.
 - `deploy/private/` and `*.example.json` copies hold DSNs, keys, permits and session dirs. Keep them out of Git, images and logs.
 - The promotion guard's refusals (mount roots, `PYTHON*`/`LD_*` env vars, privileged settings) are deliberate. Do not loosen them to make a candidate pass.

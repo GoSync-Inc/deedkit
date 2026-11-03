@@ -18,7 +18,8 @@ TOOLS=['recordings_capabilities','recordings_list','recordings_read']
 SCOPES=['recordings:read','recordings:content']
 
 
-def setup(tmp_path, gateway_scopes=SCOPES, backend_scopes=SCOPES, content_tool=True, deployed=True, backend_app=None):
+def setup(tmp_path, gateway_scopes=SCOPES, backend_scopes=SCOPES, content_tool=True, deployed=True, backend_app=None,
+          refuse=False):
     value=config()
     value['deployment']={'modules':['calendar']+(['recordings'] if deployed else []),
         'backends':{'calendar':{'url':'http://calendar'},'recordings':{'url':'http://recordings'}}}
@@ -40,6 +41,8 @@ def setup(tmp_path, gateway_scopes=SCOPES, backend_scopes=SCOPES, content_tool=T
     calls=[]
     async def backend(request):
         module=request.url.host
+        if module=='recordings' and refuse:
+            raise httpx.ConnectError('connection refused',request=request)
         if module=='recordings' and backend_app is not None:
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=backend_app),
                                          base_url='http://recordings') as real:
@@ -109,6 +112,18 @@ def test_recordings_saturation_failure_and_cancellation_leave_other_modules_avai
                 await asyncio.gather(*tasks,return_exceptions=True)
             assert clients.budgets['recordings'].pending==0
     asyncio.run(run())
+
+
+# spec: ANYM-711
+def test_a_refused_recordings_backend_fails_only_the_recordings_tools(tmp_path):
+    app,calls=setup(tmp_path,refuse=True)
+    with TestClient(app) as c:
+        refused=rpc(c,'tools/call',{'name':'recordings_list','arguments':{'account':'omi-a'}}).json()['result']
+        assert refused['isError'] and calls==[]
+        normal=rpc(c,'tools/call',{'name':'calendar_slots','arguments':{
+            'member_ids':['synthetic'],'duration_minutes':30,
+            'start':'2026-10-01T00:00:00Z','end':'2026-10-02T00:00:00Z'}}).json()['result']
+        assert not normal.get('isError'),normal
 
 
 # spec: ANYM-648
