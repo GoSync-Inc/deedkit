@@ -1403,6 +1403,18 @@ class Store:
                     'public.queue_managed_original(text)')),'USAGE') THEN
                  REVOKE ALL ON FUNCTION public.queue_managed_original(text) FROM PUBLIC;
                 END IF;
+                -- Migration 033: the rest of the file-lifecycle functions (backup fences, residency, lifecycle locks).
+                -- Each is guarded on its own owner; the constants below are the only text that reaches EXECUTE.
+                DECLARE f text;
+                BEGIN
+                 FOREACH f IN ARRAY ARRAY['public.touch_original(text,bigint)','public.begin_backup_fence(text)',
+                   'public.end_backup_fence(text)','public.register_original_residency()',
+                   'public.register_resident_original(text,bigint)','public.lock_lifecycle_sources(text)'] LOOP
+                  IF pg_has_role((SELECT proowner FROM pg_proc WHERE oid=to_regprocedure(f)),'USAGE') THEN
+                   EXECUTE 'REVOKE ALL ON FUNCTION '||f||' FROM PUBLIC';
+                  END IF;
+                 END LOOP;
+                END;
             END $$''')
 
     def expand_status(self):
