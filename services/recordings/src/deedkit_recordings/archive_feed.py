@@ -6,7 +6,7 @@ Feed `seq` = incarnation x 10^9 + the offset inside the incarnation's epoch. An 
 served, a later bump only gives later events a larger base. A marker file on the archive volume, outside the SQLite file,
 holds `{incarnation, high_water}`; it is written (and fsynced) only when the feed is served or maintained, before the data it
 covers leaves the process, never inside the transaction that stores recorded text. A restored older database, a lost or
-damaged marker, a marker from a newer incarnation, or a reached offset cap starts a new epoch (`needs_bump`), and the feed
+damaged marker, a marker from another incarnation or ahead of the database, or a reached offset cap starts a new epoch (`needs_bump`); every such restore signal on a journal with epochs also rotates `meta.journal_id`, and the feed
 stays unavailable (`feed_not_ready`) until the wall clock has reached the new incarnation's minute: two restarts inside one
 minute can therefore never hand out the same incarnation twice after anything was published.
 """
@@ -177,10 +177,13 @@ def inspect(db, directory, now, handled=None):
         marker_stale = marker is None or marker['high_water'] > head or marker['incarnation'] != stored
     bump_now = not epochs or stored != last or capped or marker_stale
     new = max(stored, last, marker['incarnation'] if marker else 0, minutes(now)) + 1 if bump_now else None
-    # A marker that is gone (lost, damaged, a new volume) on a journal that already has epochs leaves no surviving evidence of
-    # what was published, and the clock is the only watermark left. The journal then gets a new `journal_id`: the router reports a
-    # source reset and waits for its operator instead of reading a possibly reused id as new (SUBSCRIPTIONS.md, producer contract).
-    rotate = bump_now and bool(epochs) and marker is None
+    # Every marker-driven bump on a journal that already has epochs (the marker is gone, older than the database, ahead of it, or
+    # unreadable) is a restore or a crash we cannot tell apart, and the clock is the only watermark left: two restores of one
+    # snapshot, each with the clock behind, would pick the same next incarnation and publish different rows under one id. The
+    # journal then gets a new `journal_id`: the router reports a source reset and waits for its operator instead of reading a
+    # possibly reused id as new (SUBSCRIPTIONS.md, producer contract). A marker the same process is still to write (`handled`)
+    # is not stale, and an aborted bump that left its marker behind is judged stale again, so a rolled-back rotation repeats.
+    rotate = bump_now and bool(epochs) and marker_stale
     return {'epochs': epochs, 'head': head, 'marker': marker, 'bump': bump_now, 'new': new, 'unverified': unverified, 'last': last,
             'rotate': rotate}
 

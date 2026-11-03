@@ -444,17 +444,18 @@ an agent key on these routes is `unauthorized` (401). An older package refuses a
   directory (outside the SQLite file) holds `{incarnation, high_water}`. It is written and fsynced when the feed is served or
   maintained (before a page covering those rows leaves the process), never inside the transaction that stores recorded text, so a
   marker failure makes the feed unavailable (`archive_unavailable`) and can never stop text from being archived. At the first use,
-  and whenever the marker is missing or unreadable, its high-water is above the database's, its incarnation is above the
+  and whenever the marker is missing or unreadable, its high-water is above the database's, its incarnation differs from the
   database's, or an epoch reaches its capacity (below 10^9 offsets, and never past seq 2^53-1), a new epoch starts with incarnation
   `max(database, marker, last epoch, clock minutes) + 1`, before the next journal row is written (an existing backlog is split
   into capped epochs). The feed answers `feed_not_ready` (503) until the wall clock has reached the new incarnation's minute (so
   up to a minute after a start or bump, and until the clock catches up after a clock regression): two restores inside one clock
   minute can therefore never publish the same incarnation twice. Events keep the identity they were first served with. A restored
   older database or a marker that does not match the database can therefore never reuse or skip an identity, and a page serves only
-  rows the fsynced marker already covers. A LOST or damaged marker on a journal that already has epochs (a new volume, a restore
-  without the marker) leaves the clock as the only watermark, so that bump also gives the journal a new `journal_id`: the router
-  reports a source reset and waits for its operator (`set-module-cursor`) instead of reading a possibly reused id as new. A restore
-  whose marker survived keeps the `journal_id`. The feed refuses to serve with `sequence_space_exhausted` when no incarnation with
+  rows the fsynced marker already covers. Every marker-driven bump on a journal that already has epochs (a lost or damaged marker, a marker older than or ahead of the
+  database: a new volume, a restore, a crash between a bump and its marker) leaves the clock as the only watermark, because two
+  restores of one snapshot with the clock behind pick the same next incarnation; that bump therefore also gives the journal a new
+  `journal_id`: the router reports a source reset and waits for its operator (`set-module-cursor`) instead of reading a possibly
+  reused id as new. Ordinary growth, cap bumps and the first use keep the `journal_id`. The feed refuses to serve with `sequence_space_exhausted` when no incarnation with
   room is left (about 2043).
 - Events (references only, at most 1 KiB, no title, text, label, provider ID, token or URL): `recording.text.archived`
   (`subject` and `data.recording_ref` the opaque ref, `data.account_ref`, `data.revision`; `urgency` `batch`) once per accepted

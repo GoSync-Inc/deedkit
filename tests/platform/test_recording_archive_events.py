@@ -734,7 +734,7 @@ def replace_database(doc, source, keep_marker=None):
 
 
 # spec: ANYM-726
-def test_a_lost_marker_rotates_the_journal_id_and_a_surviving_marker_keeps_it(tmp_path):
+def test_a_lost_marker_rotates_the_journal_id_and_so_does_a_marker_ahead_of_the_database(tmp_path):
     """Two restores of the same older snapshot, each with a lost marker and a clock behind the other's incarnation, may
     reuse an id; the router must see another journal_id (a source reset), never a continuation."""
     path, doc = configuration(tmp_path)
@@ -762,12 +762,13 @@ def test_a_lost_marker_rotates_the_journal_id_and_a_surviving_marker_keeps_it(tm
         finally:
             store.close()
     assert len(seen) == 3  # every lost-marker restore is a source reset for the router
-    # a restore whose marker survives (the marker is ahead of the older database) stays monotone and keeps the journal
+    # a restore whose marker survives (the marker is ahead of the older database) is no safer: two such restores pick the same
+    # next incarnation, so it rotates the journal as well
     replace_database(doc, snapshots / 'older.sqlite', keep_marker=saved)
     store = open_store(doc, clock=T0 + 3600)
     try:
         write(store, account, 'after-restore', now=30)
-        assert journal_of(store, doc) == original
+        assert journal_of(store, doc) not in seen
     finally:
         store.close()
 
@@ -804,6 +805,63 @@ def test_a_marker_older_than_the_database_is_a_restore_after_a_restart(tmp_path,
         assert not set(later[5:]) & set(published[5:]) and later[-1] // archive_feed.BASE > max(published) // archive_feed.BASE
     finally:
         store.close()
+
+
+# spec: ANYM-726
+def test_two_restores_of_one_snapshot_never_share_a_journal_id_whatever_the_marker_says(tmp_path, monkeypatch):
+    """Sol r3: an older marker after a restart, a marker ahead in rows, and a rotation rolled back after its marker was renamed
+    each left the journal unchanged while two clock-behind timelines picked one incarnation."""
+    monkeypatch.setattr(archive_feed, 'LOCAL_CAP', 5)
+    path, doc = configuration(tmp_path)
+    account = accounts_of(doc)['omi-a']
+    archive = Path(doc['archive']['directory'])
+    snapshots = tmp_path.resolve() / 'snapshots'
+    snapshots.mkdir(mode=0o700)
+    store = open_store(doc)
+    try:
+        for number in range(3):
+            write(store, account, f'rec-{number}', now=number)
+        original = journal_of(store, doc)
+        older_marker = (archive / archive_feed.MARKER).read_text()
+        write(store, account, 'rec-3', now=3)
+        write(store, account, 'rec-4', now=4)  # a cap bump inside the text write, its marker not yet written
+        backup_archive(parsed(doc).archive, snapshots / 'between.sqlite')
+        for number in range(5, 8):
+            write(store, account, f'rec-{number}', now=number)
+        journal_of(store, doc)
+        newest_marker = (archive / archive_feed.MARKER).read_text()
+    finally:
+        store.close()
+    seen = {original}
+    for stale in (older_marker, newest_marker):  # a marker older than the database; a marker ahead of it
+        for attempt in range(2):
+            replace_database(doc, snapshots / 'between.sqlite', keep_marker=stale)
+            store = open_store(doc, clock=T0)
+            try:
+                write(store, account, f'timeline-{attempt}', now=40)
+                journal = journal_of(store, doc)
+                assert journal not in seen
+                seen.add(journal)
+            finally:
+                store.close()
+    real = archive_feed.write_marker  # a lost marker, and the marker write dies after the rename and before the commit
+    def torn(*args):
+        real(*args)
+        raise OSError('directory fsync failed')
+    for attempt in range(2):
+        replace_database(doc, snapshots / 'between.sqlite')
+        store = open_store(doc, clock=T0)
+        try:
+            store.clock.now += 120
+            monkeypatch.setattr(archive_feed, 'write_marker', torn)
+            with pytest.raises(Failure, match='archive_unavailable'):
+                store.run('feed_page', view_of(doc), 0, 10)
+            monkeypatch.setattr(archive_feed, 'write_marker', real)
+            journal = journal_of(store, doc)
+            assert journal not in seen
+            seen.add(journal)
+        finally:
+            store.close()
 
 
 # spec: ANYM-726
