@@ -292,6 +292,36 @@ def test_bound_collector_terminal_events_and_schema62_guard_isolation(sender, ol
 
 
 # spec: ANYM-655
+@pytest.mark.parametrize('error,quiet',[('LockNotAvailable',True),('OperationalError',False)])
+def test_expiry_skips_a_busy_lease_row_quietly_and_still_reports_other_database_errors(monkeypatch,caplog,error,quiet):
+    from psycopg import errors
+    from messaging_service import telegram_collector
+    calls = []; waits = []
+    class Backoff:
+        def __init__(self,owner): pass
+        async def wait(self): waits.append(True)
+        def reset(self): pass
+    def failing(self,**kwargs): calls.append(True); raise getattr(errors,error)('synthetic')
+    monkeypatch.setattr(outgoing.OutgoingWorker, 'expire_queued', failing)
+    monkeypatch.setattr(telegram_collector, 'DbBackoff', Backoff)
+    worker = TelegramCollector.__new__(TelegramCollector); worker.state = None; worker.database_retry = .01
+    caplog.set_level('WARNING','messaging_service.telegram_collector')
+    async def scenario():
+        task = asyncio.create_task(worker.outgoing_expiry_loop())
+        try:
+            for _ in range(200):
+                if len(calls) >= 4: break
+                await asyncio.sleep(.01)
+        finally:
+            task.cancel(); await asyncio.gather(task,return_exceptions=True)
+    asyncio.run(scenario())
+    assert len(calls) >= 4
+    # A busy collector_leases row (ingest holds it) is housekeeping contention: no warning, no growing backoff.
+    assert ('outgoing_expiry_failed' not in caplog.text) is quiet
+    assert (waits == []) is quiet
+
+
+# spec: ANYM-655
 def test_expiry_shutdown_waits_for_owned_sql_thread(monkeypatch):
     entered = Event(); release = Event()
     def stalled(self,**kwargs): entered.set(); assert release.wait(2)
