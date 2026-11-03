@@ -41,6 +41,16 @@ def test_idempotent_ingest_revision_and_snapshot_history(archive):
         assert c.execute('SELECT count(*) AS n FROM message_revisions WHERE message=%s',(mid,)).fetchone()['n']==2
 
 
+# spec: ANYM-733
+def test_reconcile_creating_a_recent_message_keeps_reconcile_in_the_journal(archive):
+    # Subscriptions derive `live_recovered` when they read; the journal, the feed and older readers see `reconcile`.
+    ar,s,_,_=archive
+    sent=(datetime.now(timezone.utc)-timedelta(minutes=5)).isoformat()
+    mid=ar.ingest(event(provider_id='300',origin='reconcile',sent_at=sent,updated_at=sent))['message']
+    with s.pool.connection() as c:
+        assert [r['origin'] for r in c.execute('SELECT origin FROM events WHERE message=%s',(mid,)).fetchall()]==['reconcile']
+
+
 def test_same_version_conflict_is_explicit_no_overwrite(archive):
     ar,s,key,_=archive
     ar.ingest(event())

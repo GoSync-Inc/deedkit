@@ -409,6 +409,26 @@ def failing_hint_step(monkeypatch):
     monkeypatch.setattr(delivery_policy, 'after_match', broken)
 
 
+# spec: ANYM-733
+def test_a_recovered_message_is_a_live_wake_reason_in_the_hint_window_and_an_old_reconcile_one_is_not(seeded, tmp_path):
+    store, _, _ = seeded
+    token = identity(store)
+    live = bound(store, token, tmp_path, {'debounce_s': 600}, origins=['live'])
+    old = bound(store, token, tmp_path, {'debounce_s': 600}, origins=['reconcile'])
+    with store.pool.connection() as c:
+        c.execute("UPDATE messages SET sent_at=clock_timestamp()-interval '1 hour' WHERE id='demo-tg-2'")
+    for message in ('demo-tg-1', 'demo-tg-2'):
+        with store.pool.connection() as c:
+            store.append_event(c, 'telegram-demo', message, origin='reconcile')
+        match_subscriptions(store)
+    with store.pool.connection() as c:
+        reasons = {name: c.execute('SELECT match_count,reasons FROM subscription_hint_windows WHERE subscription=%s',
+            (sid,)).fetchone() for name, sid in (('live', live), ('old', old))}
+    assert reasons['live']['match_count'] == 1 and 'incoming_message' in reasons['live']['reasons']
+    assert 'historical_event' not in reasons['live']['reasons']
+    assert reasons['old']['match_count'] == 2 and 'historical_event' in reasons['old']['reasons']
+
+
 # spec: ANYM-252
 @pytest.mark.parametrize('held_first', [False, True])
 def test_recovery_replays_reasons_and_an_on_time_reply(seeded, tmp_path, monkeypatch, held_first):

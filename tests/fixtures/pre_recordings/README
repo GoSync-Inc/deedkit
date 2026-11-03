@@ -1,0 +1,2 @@
+Verbatim copies of backup_crypto.py and backup_runner.py at ef1489da (before ANYM-714): the "old reader" of tests/test_backup_recordings.py.
+Never edit; they are loaded under the messaging_service package name so their relative imports resolve.

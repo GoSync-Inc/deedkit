@@ -1099,7 +1099,7 @@ def test_address_check_refuses_nat64_6to4_teredo_mapped_multicast_and_cgnat(addr
         '2606:2800:220:1::1']
 
 
-def endpoint_setup(store, tmp_path, monkeypatch, *, events=1):
+def endpoint_setup(store, tmp_path, monkeypatch, *, events=1, origin='live', sent_ago=None, origins=None):
     import base64
     policy = tmp_path / 'delivery-policy.json'
     policy.write_text(json.dumps({'allow_hosts': ['example.test']}))
@@ -1114,12 +1114,36 @@ def endpoint_setup(store, tmp_path, monkeypatch, *, events=1):
     with store.pool.connection() as c:
         # Only the hint is under test here, not the inline test.
         c.execute("UPDATE delivery_endpoint_tests SET state='cancelled' WHERE endpoint=%s", (endpoint['endpoint_id'],))
-    sid = store.create_subscription(token, ['telegram-demo-chat'], label='Synthetic endpoint',
+    sid = store.create_subscription(token, ['telegram-demo-chat'], label='Synthetic endpoint', origins=origins,
         delivery={'endpoint_id': endpoint['endpoint_id']})['subscription_id']
     with store.pool.connection() as c:
-        ids = [store.append_event(c, 'telegram-demo', 'demo-tg-1', origin='live') for _ in range(events)]
+        if sent_ago:
+            c.execute('UPDATE messages SET sent_at=clock_timestamp()-%s::interval WHERE id=%s', (sent_ago, 'demo-tg-1'))
+        ids = [store.append_event(c, 'telegram-demo', 'demo-tg-1', origin=origin) for _ in range(events)]
     match_subscriptions(store)
     return token, endpoint, sid, ids
+
+
+# spec: ANYM-733
+@pytest.mark.parametrize('origins,origin,reason', [
+    (None, 'live_recovered', ['incoming_message']), (['live'], 'live_recovered', ['incoming_message']),
+    (['live_recovered'], 'live_recovered', ['incoming_message']),
+    # A selector that lists `reconcile` asked for the stored origin: unchanged, historical.
+    (['live', 'reconcile'], 'reconcile', ['historical_event']), (['reconcile'], 'reconcile', ['historical_event'])])
+def test_endpoint_hint_reference_of_a_recovered_message_names_its_origin_and_live_reason(
+        seeded, tmp_path, monkeypatch, origins, origin, reason):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    try:
+        token, endpoint, sid, ids = endpoint_setup(store, tmp_path, monkeypatch, origin='reconcile', sent_ago='1 hour',
+            origins=origins)
+        sent = []
+        assert dispatch_hints(store, transport=lambda url, body, headers, **k: sent.append(body) or 204,
+            resolver=lambda *a, **k: ['93.184.216.34'])['delivered'] == 1
+    finally:
+        store.set_delivery_features(False)
+    reference = json.loads(sent[0])['references'][0]
+    assert reference['event_id'] == ids[0] and reference['origin'] == origin and reference['wake_reason'] == reason
 
 
 # spec: ANYM-519
@@ -1141,7 +1165,7 @@ def test_endpoint_hint_body_pins_the_reference_fields_and_the_cap(seeded, tmp_pa
     # At most 20 references, dropped from the end into references_omitted until the body fits 4 KiB.
     listed = [ref['event_id'] for ref in payload['references']]
     assert 1 <= len(listed) <= 20 and listed == ids[:len(listed)] and payload['references_omitted'] == 25 - len(listed)
-    assert {key for ref in payload['references'] for key in ref} == {'event_id', 'kind', 'occurred_at', 'wake_reason',
+    assert {key for ref in payload['references'] for key in ref} == {'event_id', 'kind', 'origin', 'occurred_at', 'wake_reason',
         'account_id', 'chat_id', 'message_id', 'sender_id'}
     assert payload['references'][0]['wake_reason'] == ['incoming_message']
     assert payload['next_call'] == {'tool': 'messages_fetch_subscription_events', 'subscription_id': sid}
@@ -1208,7 +1232,7 @@ def test_failure_kind_hints_carry_only_reference_fields(seeded, tmp_path, monkey
         store.set_delivery_features(False)
     payload = json.loads(sent[0])
     assert payload['subscription_id'] == sid and payload['references_omitted'] == 0
-    common = {'event_id', 'kind', 'occurred_at', 'wake_reason', 'account_id', 'chat_id', 'message_id', 'sender_id'}
+    common = {'event_id', 'kind', 'origin', 'occurred_at', 'wake_reason', 'account_id', 'chat_id', 'message_id', 'sender_id'}
     failed, health = payload['references']
     assert set(failed) == common | {'send_id', 'status'} and set(health) == common | {'status'}
     assert (failed['kind'], failed['account_id'], failed['chat_id'], failed['send_id'], failed['status']) == (

@@ -121,6 +121,17 @@ def test_subscription_strict_bounds_before_backend(method,extra):
     assert store.calls==[]
 
 
+# spec: ANYM-733
+def test_live_recovered_is_an_accepted_subscription_origin_on_rest_and_mcp():
+    store=RecordingStore();origins=['live','live_recovered','backfill','reconcile','fixture']
+    params={**arguments(METHODS[0]),'origins':origins}
+    with TestClient(create_app(store,['testserver'])) as client:
+        rest=client.post('/v1/'+METHODS[0],headers={'Authorization':'Bearer synthetic-token'},json=params)
+        mcp=rpc(client,METHODS[0],params)
+    assert rest.status_code==200 and not mcp.json()['result']['isError']
+    assert [call[1]['origins'] for call in store.calls]==[origins,origins]
+
+
 def test_subscription_defaults_do_not_enable_historical_replay_or_delivery():
     store=RecordingStore()
     with TestClient(create_app(store,['testserver'])) as client:

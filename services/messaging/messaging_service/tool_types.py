@@ -46,12 +46,13 @@ SubscriptionEventKind = Literal['message.created','message.edited','message.dele
     'message.status','attachment.ready','file.text.ready','file.transcript.ready',
     'file.description.ready','file.processing.failed','send.failed','source.health']
 EventOrigin = Literal['live','backfill','reconcile','fixture']
+SubscriptionOrigin = Literal['live','live_recovered','backfill','reconcile','fixture']
 MessageFormat = Literal['plain','markdown','html']
 SubscriptionReference = Annotated[StrictStr, Field(min_length=1,max_length=256,
     pattern=r'^[^\x00-\x20\x7f]+$')]
 SubscriptionReferences = Annotated[list[SubscriptionReference], Field(min_length=1,max_length=64)]
 SubscriptionKinds = Annotated[list[SubscriptionEventKind], Field(min_length=1,max_length=11)]
-SubscriptionOrigins = Annotated[list[EventOrigin], Field(min_length=1,max_length=4)]
+SubscriptionOrigins = Annotated[list[SubscriptionOrigin], Field(min_length=1,max_length=5)]
 SubscriptionLimit = Annotated[StrictInt, Field(ge=1,le=100)]
 SubscriptionVersion = Annotated[StrictInt, Field(ge=1,le=9007199254740991)]
 SubscriptionPosition = Annotated[StrictInt, Field(ge=0,le=9007199254740991)]
