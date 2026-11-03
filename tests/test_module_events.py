@@ -1308,22 +1308,30 @@ def test_the_deployed_schema66_consumers_run_beside_recordings_rows_in_the_schem
     assert run.returncode == 0, run.stderr[-2000:]
     out = json.loads(run.stdout.strip().splitlines()[-1])
     assert out['schema'] == 66
+    # The deployed matcher logs a module-matching failure and carries on with the messages, so stderr is read too.
+    assert not re.search(r'traceback|error|exception', run.stderr, re.I), run.stderr[-2000:]
     # The old matcher, reads, fetch, ACK, delivery and retention work, see the message and the call, and never
     # name, match or deliver a recordings row.
     assert message in out['updates'] and out['updates'] == [e['event_sequence']
         for e in store.get_updates(old, 'probe-current')['items']]
+    assert [item['module_event_id'] for item in out['passive']['module']['items']] == [seq]
     assert [item['event_id'] for item in out['fetch']['items']] == [message]
-    assert [item['module_event_id'] for item in out['fetch'].get('module', {}).get('items', [])] in ([seq], [])
+    assert [item['module_event_id'] for item in out['fetch']['module']['items']] == [seq]
     text = json.dumps(out, default=str)
     assert 'recording' not in text, text[:2000]
-    assert out['pruned']['retention_failed'] == 0 and out['sent']
+    assert out['pruned']['retention_failed'] == 0 and out['pruned']['pruned'] >= 2 and out['sent']
     assert all(body['kind'] != 'events' or 'recording' not in json.dumps(body) for body in out['sent'])
     with store.pool.connection() as c:
+        # The journal is untouched; the matcher went through the recordings rows to the head without matching one;
+        # the ACK moved the call's position; retention removed the aged message and call matches, nothing else.
         assert c.execute('SELECT seq,event_key,source,type,data FROM module_events ORDER BY seq').fetchall() == rows
-        matched = [row['event'] for row in c.execute('SELECT event FROM subscription_module_matches WHERE subscription=%s',
-            (sid,))]
-    assert set(matched) <= {seq}
-
+        stream = c.execute('SELECT matched_through,acked_through FROM subscription_module_streams WHERE subscription=%s',
+            (sid,)).fetchone()
+        assert (stream['matched_through'], stream['acked_through']) == (recorded[-1], seq)
+        assert c.execute('SELECT count(*) AS n FROM subscription_matches WHERE subscription=%s',
+            (sid,)).fetchone()['n'] == 0
+        assert c.execute('SELECT count(*) AS n FROM subscription_module_matches WHERE subscription=%s',
+            (sid,)).fetchone()['n'] == 0
 
 def _release_source(tmp_path, commit):
     """A `git archive` of one release (or a sibling checkout named by ANYMSG_PREVIOUS_SOURCE), as _previous_source."""
