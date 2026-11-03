@@ -449,6 +449,19 @@ def test_original_integrity_before_disclosure(tmp_path):
         verified_copy(tmp_path,{'source_digest':sha,'bytes':len(data)},dest,100)
 
 
+# spec: ANYM-702
+def test_a_size_that_differs_from_the_row_is_an_integrity_error_and_only_a_larger_file_is_a_size_limit(tmp_path):
+    data=b'original';sha=hashlib.sha256(data).hexdigest()
+    def copy(content,bytes_,maximum):
+        (tmp_path/sha).write_bytes(content);dest=tmp_path/'work';dest.mkdir(exist_ok=True)
+        (dest/'original').unlink(missing_ok=True)
+        return verified_copy(tmp_path,{'source_digest':sha,'bytes':bytes_},dest,maximum)
+    with pytest.raises(ModelError,match='original_integrity_error'):copy(data[:-1],len(data),100)
+    with pytest.raises(ModelError,match='original_integrity_error'):copy(data+b'!',len(data),100)
+    with pytest.raises(ModelError,match='original_size_limit'):copy(data,len(data),len(data)-1)
+    assert copy(data,len(data),len(data)).read_bytes()==data
+
+
 def add_audio(s):
     data=b'synthetic-audio';sha=hashlib.sha256(data).hexdigest();(s.files/sha).write_bytes(data)
     with s.pool.connection() as c:
@@ -711,6 +724,45 @@ def test_an_audio_profile_keeps_originals_up_to_200_mib_and_other_kinds_stay_at_
         else:
             with pytest.raises(ValueError,match='invalid_model_limit'):mini(tmp_path,kind,max_input_bytes=limit)
     assert mini(tmp_path,'audio')['max_input_bytes']==20*1024**2
+
+
+# spec: ANYM-702
+def test_a_document_profile_defaults_to_32_mib_while_audio_and_image_keep_20_and_an_explicit_value_is_untouched(tmp_path):
+    assert mini(tmp_path,'document')['max_input_bytes']==32*1024**2==33554432
+    assert mini(tmp_path,'audio')['max_input_bytes']==mini(tmp_path,'image')['max_input_bytes']==20*1024**2
+    assert mini(tmp_path,'document',max_input_bytes=5*1024**2)['max_input_bytes']==5*1024**2
+    assert profile(tmp_path,kind='document')['max_input_bytes']==32*1024**2
+    with pytest.raises(ValueError,match='invalid_model_limit'):mini(tmp_path,'document',max_input_bytes=32*1024**2+1)
+
+
+# spec: ANYM-702
+def test_a_32_mib_document_is_copied_and_described_with_only_its_text_in_the_request(tmp_path,monkeypatch):
+    import contextlib
+    import messaging_service.enrichment as worker_module
+    files=tmp_path/'files';files.mkdir();work=tmp_path/'work';work.mkdir()
+    data=bytes(32*1024**2);sha=hashlib.sha256(data).hexdigest();(files/sha).write_bytes(data)
+    p=mini(tmp_path,'document');seen={}
+    row={'source_digest':sha,'bytes':len(data),'kind':'document','mime':'application/pdf','source_text':'Договор аренды'}
+    monkeypatch.setattr(worker_module.tempfile,'TemporaryDirectory',lambda prefix='':contextlib.nullcontext(str(work)))
+    class FakeChild:
+        pid=123457;returncode=0
+        def __init__(self,args,**kwargs):self.output=kwargs['stdout']
+        def communicate(self,payload,**kwargs):
+            seen['payload']=json.loads(payload)
+            seen['copy']=sum(f.stat().st_size for f in work.iterdir())
+            self.output.write(b'{"title":"t","text":"","summary":"s"}')
+    monkeypatch.setattr(worker_module.subprocess,'Popen',FakeChild)
+    monkeypatch.setattr(worker_module.os,'killpg',lambda pid,sig:None)
+    assert worker_module.process(files,row,p)['title']=='t'
+    assert seen['copy']==32*1024**2<33*1024**2 and seen['payload']['source_text']=='Договор аренды'
+    # What the provider sends for that original: the text, never the file.
+    result,requests=run_mini(tmp_path,'document',p,mime='application/pdf',data=data,text='Договор аренды')
+    assert len(requests)==1 and len(requests[0].content)<64*1024 and 'Договор аренды'.encode() in requests[0].content
+    assert b'base64' not in requests[0].content and b'data:' not in requests[0].content
+    # One byte over the profile limit is refused before any copy is used.
+    (work/'original').unlink();(files/sha).write_bytes(data+b'0')
+    with pytest.raises(ModelError,match='original_size_limit'):
+        worker_module.process(files,{**row,'bytes':len(data)+1},p)
 
 
 # spec: ANYM-697
@@ -1064,6 +1116,50 @@ def test_third_expired_lease_becomes_failed_then_new_profile_can_retry(seeded,tm
     w.config['profiles']['audio']['model']='changed-fixture'
     assert w.claim() is not None
     assert not w.finish(job,normalize_result({'text':'obsolete'}))
+
+
+FINAL_LIMIT_CODES=('original_size_limit','audio_duration_limit','audio_transcode_size_limit')
+
+
+def stored_failures(s,attachment):
+    with s.pool.connection() as c:
+        return c.execute("""SELECT snapshot->'processing'->>'error_code' AS code,(snapshot->'processing'->>'retryable')::boolean AS retryable
+            FROM events WHERE snapshot->'processing'->>'attachment_id'=%s AND kind='file.processing.failed' ORDER BY id""",(attachment,)).fetchall()
+
+
+# spec: ANYM-702
+@pytest.mark.parametrize('code',FINAL_LIMIT_CODES)
+def test_a_deterministic_limit_failure_is_attempted_once_and_final_for_its_profile(seeded,tmp_path,code):
+    s,_,_=seeded;add_audio(s);w=worker(s,tmp_path)
+    with s.pool.connection() as c:c.execute('TRUNCATE enrichment_budget')
+    row,_=w.claim();assert w.finish(row,error=code)
+    with s.pool.connection() as c:
+        c.execute("UPDATE attachment_enrichment SET next_due=clock_timestamp()-interval '1 hour' WHERE attachment='enrich-audio'")
+    assert w.claim() is None
+    with s.pool.connection() as c:
+        saved=c.execute("SELECT state,error_code,attempts FROM attachment_enrichment WHERE attachment='enrich-audio'").fetchone()
+    assert saved=={'state':'failed','error_code':code,'attempts':1}
+    assert stored_failures(s,'enrich-audio')==[{'code':code,'retryable':False}]
+    # Editing the profile (a new hash) is the way back, with the attempts counted afresh.
+    w.config['profiles']['audio']['model']='changed-fixture'
+    again,_=w.claim()
+    assert again['attachment']=='enrich-audio' and again['attempts']==1
+
+
+# spec: ANYM-702
+def test_a_timeout_still_returns_the_job_to_the_queue_and_an_old_third_attempt_size_failure_stays_closed(seeded,tmp_path):
+    s,_,_=seeded;add_audio(s);w=worker(s,tmp_path)
+    with s.pool.connection() as c:c.execute('TRUNCATE enrichment_budget')
+    row,_=w.claim();assert w.finish(row,error='model_timeout')
+    assert stored_failures(s,'enrich-audio')==[{'code':'model_timeout','retryable':True}]
+    with s.pool.connection() as c:
+        c.execute("UPDATE attachment_enrichment SET next_due=clock_timestamp()-interval '1 hour' WHERE attachment='enrich-audio'")
+    second,_=w.claim();assert second['attempts']==2
+    assert w.finish(second,error='original_size_limit')
+    # The old behaviour left such rows at attempts 3 under the same hash: they are not reopened either.
+    with s.pool.connection() as c:
+        c.execute("UPDATE attachment_enrichment SET attempts=3,next_due=clock_timestamp()-interval '1 hour' WHERE attachment='enrich-audio'")
+    assert w.claim() is None
 
 
 def test_source_truncation_persists_after_enrichment_normalization(seeded,tmp_path):
