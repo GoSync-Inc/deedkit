@@ -6,15 +6,21 @@ import time
 
 from .archive_store import Store, MAX_TEXT, namespace
 from . import plaud, archive_plaud
-from .omi import metadata, pagination, content
-from .security import Failure, provider_token, read_document
+from .omi import metadata, pagination, content, fingerprint
+from .security import Failure, RateLimited, provider_token, read_document
+
+PAGE = 200          # list page size the collector asks for (Omi clamps to 1-200)
+HEAD_RESERVE = 6    # reads per hour only the head refresh and brand-new conversations may use
+HEAD_EVERY = 300    # seconds between head refreshes once the history traversal is under way
+HARD = ('archive_capacity', 'archive_unavailable', 'archive_disabled', 'archive_authorization_changed',
+        'provider_auth_required', 'ledger_uncertain')
 
 
 class ArchiveRuntime:
     def __init__(self, path, provider, remote):
         self.path, self.provider, self.remote = Path(path), provider, remote
         self.store, self.task, self.error = None, None, None
-        self.collecting, self.turn = asyncio.Lock(), 0
+        self.collecting, self.turn, self.ledger = asyncio.Lock(), 0, asyncio.Lock()
         self.errors = {}
 
     def document(self):
@@ -94,35 +100,152 @@ class ArchiveRuntime:
         self.store.settings = doc.archive
         return token
 
-    async def discover(self, account, now):
+    async def discover_legacy(self, account, now):
+        """PLAUD: head page and one history page per pass, as before schema 3."""
         checkpoint = await self.db('checkpoint', account)
         # Head refresh and one history page, with their discovered work committed
         # before continuation advances. A replay after interruption is harmless.
         for position in ([None, checkpoint] if checkpoint is not None else [None]):
             token = self.current(account)
             fingerprint = hashlib.sha256(token.encode()).hexdigest()
-            if account.provider == 'plaud':
-                page = position if position is not None else 1
-                if type(page) is not int or not 1 <= page <= 100000:
-                    raise Failure('archive_unavailable')
-                value = await self.remote.call(token,'list_files',{'page':page,'page_size':25})
-                try:
-                    items, _, next_page = plaud.listing(value,25,page)
-                except (ValueError,TypeError,OverflowError,UnicodeError,RecursionError):
-                    raise Failure('invalid_provider_response') from None
-            else:
-                params = {'limit':25, 'offset':0, 'include_transcript':'false'}
-                if position is not None:
-                    params['cursor'] = position
-                values, headers = await self.provider.get(token, params=params)
-                if not isinstance(values, list) or len(values) > 25:
-                    raise Failure('invalid_provider_response')
-                items = [metadata(value) for value in values]
-                _, next_page = pagination(headers, len(items), 25)
+            page = position if position is not None else 1
+            if type(page) is not int or not 1 <= page <= 100000:
+                raise Failure('archive_unavailable')
+            value = await self.remote.call(token,'list_files',{'page':page,'page_size':25})
+            try:
+                items, _, next_page = plaud.listing(value,25,page)
+            except (ValueError,TypeError,OverflowError,UnicodeError,RecursionError):
+                raise Failure('invalid_provider_response') from None
             # Refreshing the head must not replace an unfinished history cursor.
             next_checkpoint = checkpoint if position is None and checkpoint is not None else next_page
             await self.db('discover', account, items, next_checkpoint, now,
-                          lambda: self.current(account, fingerprint))
+                          lambda: self.current(account, fingerprint), 'legacy')
+
+    async def pass_legacy(self, account, now):
+        discovery_error = None
+        try:
+            await self.discover_legacy(account, now)
+        except Failure as error:
+            if error.code in HARD:
+                raise
+            discovery_error = error.code
+        for recording_id in await self.db('work', account, now, 8, lambda: self.current(account)):
+            await self.observe(account, recording_id, now)
+        if discovery_error:
+            raise Failure(discovery_error)
+
+    async def reserve(self, credential, specs, now):
+        """Count the collector's own provider call before it is made; False when its share of a window is spent."""
+        async with self.ledger:
+            return await self.db('reserve', credential, specs, now)
+
+    async def count(self, token, detail, now=None):
+        """Foreground Omi reads are written to the same ledger but never refused by it and never fail the read."""
+        try:
+            if self.store is None:
+                return
+            buckets = ['reads', 'transcripts'] if detail else ['reads']
+            async with self.ledger:
+                await self.db('record_use', hashlib.sha256(token.encode()).hexdigest(), buckets,
+                              time.time() if now is None else now)
+        except Exception:
+            pass
+
+    def sharing(self, credential):
+        """Namespaces of the archived Omi accounts whose token file holds this credential."""
+        names = []
+        for account in self.document().accounts:
+            if account.provider == 'omi' and account.archive_namespace is not None:
+                try:
+                    if hashlib.sha256(provider_token(account).encode()).hexdigest() == credential:
+                        names.append(namespace(account))
+                except Exception:
+                    pass
+        return names
+
+    async def throttle(self, credential, seconds, now):
+        await self.db('throttle', self.sharing(credential), now + seconds)
+
+    async def note_rate_limit(self, token, seconds):
+        """An on-demand read met a 429: the collector pauses for that credential too. Best effort."""
+        try:
+            if self.store is not None:
+                await self.throttle(hashlib.sha256(token.encode()).hexdigest(), seconds, time.time())
+        except Exception:
+            pass
+
+    async def list_page(self, account, token, credential, now, settings, *, kind, cursor, limit):
+        """One cheap list call (IDs and list metadata, never a transcript); None when the budget has no slot."""
+        reads = settings.omi_budget.reads_per_hour
+        if not await self.reserve(credential, [('reads', reads - HEAD_RESERVE if kind in ('first', 'history') else reads)], now):
+            return None
+        params = {'limit': limit, 'offset': 0, 'include_transcript': 'false'}
+        if cursor is not None:
+            params['cursor'] = cursor
+        values, headers = await self.provider.get(token, params=params)
+        if not isinstance(values, list) or len(values) > limit:
+            raise Failure('invalid_provider_response')
+        items = [metadata(value) for value in values]
+        fingerprints = {item['id']: fingerprint(value) for item, value in zip(items, values)}
+        info, next_page = pagination(headers, len(items), limit)
+        # A truncated page is re-read, never taken as the end; a page that says more without a cursor cannot continue.
+        complete = info['list_truncated'] is not True
+        if complete and info['has_more'] is True and next_page is None:
+            raise Failure('invalid_provider_response')
+        done = await self.db('discover', account, items, next_page, now, lambda: self.current(account, credential),
+                             kind, fingerprints, complete)
+        return done['inserted']
+
+    async def discover_omi(self, account, token, credential, now, settings, plan):
+        """Cheap enumeration. The head (newest pages) and the history traversal are separate, so a full queue
+        pauses only the history and never blocks a conversation created now."""
+        queued, cap, reserve = plan['queued'], plan['cap'], plan['slice']
+        if plan['state'] == 'not_started':
+            free = cap - reserve - queued
+            if free >= 1:
+                await self.list_page(account, token, credential, now, settings, kind='first', cursor=None,
+                                     limit=min(PAGE, free))
+            return
+        head_due = plan['head_cursor'] is not None or plan['last_head_at'] is None or now - plan['last_head_at'] >= HEAD_EVERY
+        if head_due:
+            free = cap - queued
+            if free >= 1:
+                inserted = await self.list_page(account, token, credential, now, settings, kind='head',
+                                                cursor=plan['head_cursor'], limit=min(PAGE, free))
+                queued += inserted or 0
+            else:
+                await self.db('head_blocked', account, now)
+        room = cap - reserve - queued
+        if plan['state'] == 'in_progress' and room >= 1:
+            await self.list_page(account, token, credential, now, settings, kind='history', cursor=plan['checkpoint'],
+                                 limit=min(PAGE, room))
+
+    async def pass_omi(self, account, now, settings):
+        token = self.current(account)
+        credential = hashlib.sha256(token.encode()).hexdigest()
+        plan = await self.db('plan', account, credential, now)
+        if plan['throttled_until'] is not None and plan['throttled_until'] > now:
+            return  # Retry-After is honoured: no provider call, no error, no record touched
+        budget, discovery_error = settings.omi_budget, None
+        try:
+            try:
+                await self.discover_omi(account, token, credential, now, settings, plan)
+            except RateLimited:
+                raise
+            except Failure as error:
+                if error.code in HARD:
+                    raise
+                discovery_error = error.code
+            for recording_id, fresh in await self.db('work_items', account, now, 8, lambda: self.current(account)):
+                reads = budget.reads_per_hour if fresh else budget.reads_per_hour - HEAD_RESERVE
+                if not await self.reserve(credential, [('reads', reads), ('transcripts', budget.transcript_per_hour)], now):
+                    break
+                await self.observe(account, recording_id, now)
+        except RateLimited as limited:
+            await self.throttle(credential, limited.retry_after_s, now)
+            return
+        if discovery_error:
+            raise Failure(discovery_error)
 
     async def observe(self, account, recording_id, now):
         if account.provider == 'plaud':
@@ -146,6 +269,8 @@ class ArchiveRuntime:
                     except (Failure, ValueError, TypeError, OverflowError, UnicodeError, RecursionError) as error:
                         code = error.code if isinstance(error, Failure) else 'invalid_provider_response'
                         observations[kind] = 'error', '', code
+        except RateLimited:
+            raise  # a 429 is the provider's pause, not a failed record
         except (Failure, TimeoutError, ValueError, TypeError, UnicodeError, RecursionError) as error:
             code = error.code if isinstance(error, Failure) else (
                 'provider_timeout' if isinstance(error, TimeoutError) else 'invalid_provider_response')
@@ -161,7 +286,7 @@ class ArchiveRuntime:
             rejected = {kind: ('error', '', 'archive_content_limit') for kind in observations}
             await self.db('observe', account, recording_id, old['metadata'], rejected, now, guard)
 
-    async def status(self, account):
+    async def status(self, account, now=None):
         account_id = account if isinstance(account,str) else account.id
         result = {'account':account_id,'enabled':False,'coverage':'unknown','record_count':None,
                   'queued_count':None,'retry_count':None,'last_success':None,'error':None,'collector_error':self.error}
@@ -173,7 +298,8 @@ class ArchiveRuntime:
             result['enabled'] = True
             if self.store is None or doc.archive.directory != str(self.store.directory):
                 return {**result,'error':self.error or 'archive_unavailable'}
-            result.update(await self.db('status',current))
+            budget = doc.archive.omi_budget if current.provider == 'omi' else None
+            result.update(await self.db('status', current, time.time() if now is None else now, budget))
             # This overlay needs no write, including when quota prevents writing
             # account_error. Account-specific failures never leak another account.
             result['error'] = self.errors.get(namespace(current),result['error'])
@@ -249,18 +375,10 @@ class ArchiveRuntime:
                         account = accounts[index]
                         try:
                             await self.db('capacity')
-                            discovery_error = None
-                            try:
-                                await self.discover(account, now)
-                            except Failure as error:
-                                if error.code in ('archive_capacity','archive_unavailable','archive_disabled',
-                                                  'archive_authorization_changed','provider_auth_required'):
-                                    raise
-                                discovery_error = error.code
-                            for recording_id in await self.db('work', account, now, 8, lambda: self.current(account)):
-                                await self.observe(account, recording_id, now)
-                            if discovery_error:
-                                raise Failure(discovery_error)
+                            if account.provider == 'plaud':
+                                await self.pass_legacy(account, now)
+                            else:
+                                await self.pass_omi(account, now, doc.archive)
                             self.errors.pop(namespace(account),None)
                         except Failure as error:
                             self.error = error.code

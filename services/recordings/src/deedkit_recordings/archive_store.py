@@ -1,5 +1,6 @@
 """Private, bounded SQLite text state. No provider or messaging dependencies."""
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import os
@@ -15,21 +16,31 @@ from .security import Failure, canonical, loads
 MAX_TEXT = 2 * 1024 ** 2
 HEADROOM = 64 * 1024 ** 2
 QUEUE_LIMIT = 10000
+HEAD_SLICE = 100
+FAR = 1e18  # `due` of a record that waits for a changed list fingerprint instead of a clock
+WINDOW = 3600
 APPLICATION_ID = 0x444B5243
+SCHEMA_VERSION = 3
 SCHEMA = '''
 BEGIN IMMEDIATE;
-CREATE TABLE accounts(namespace TEXT PRIMARY KEY, checkpoint TEXT, last_success REAL, error TEXT, work_turn INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE accounts(namespace TEXT PRIMARY KEY, checkpoint TEXT, last_success REAL, error TEXT, work_turn INTEGER NOT NULL DEFAULT 0,
+ throttled_until REAL, traversal_state TEXT NOT NULL DEFAULT 'not_started', passes_completed INTEGER NOT NULL DEFAULT 0,
+ last_page_at REAL, started_at REAL, last_head_at REAL, head_cursor TEXT, head_backlog_since REAL, credential TEXT);
 CREATE TABLE records(
  ref TEXT PRIMARY KEY, namespace TEXT NOT NULL, provider_id TEXT NOT NULL,
  metadata TEXT NOT NULL, parts TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0,
- attempted REAL, due REAL NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0,
+ attempted REAL, due REAL NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, fingerprint TEXT,
  UNIQUE(namespace, provider_id));
 CREATE INDEX records_due ON records(namespace, due, attempted);
 CREATE TABLE events(sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,
  namespace TEXT NOT NULL, ref TEXT NOT NULL, revision INTEGER NOT NULL, occurred REAL NOT NULL);
 CREATE VIRTUAL TABLE texts USING fts5(ref UNINDEXED, namespace UNINDEXED, title, transcript, summary, tokenize='unicode61');
+CREATE TABLE ledger(credential TEXT NOT NULL, bucket TEXT NOT NULL, window_start REAL NOT NULL, count INTEGER NOT NULL,
+ updated REAL NOT NULL, PRIMARY KEY(credential, bucket));
+CREATE TABLE meta(id INTEGER PRIMARY KEY CHECK(id=1), archive_id TEXT NOT NULL, incarnation INTEGER NOT NULL, journal_id TEXT NOT NULL);
+INSERT INTO meta(id,archive_id,incarnation,journal_id) VALUES(1,'{archive}',1,'{journal}');
 PRAGMA application_id=1145786947;
-PRAGMA user_version=2;
+PRAGMA user_version=3;
 COMMIT;
 '''
 UPGRADE_INDEX = '''
@@ -42,6 +53,53 @@ INSERT INTO texts(ref,namespace,title,transcript,summary)
 PRAGMA user_version=2;
 COMMIT;
 '''
+# Schema 3 is additive: new tables and nullable/defaulted columns only. No index rebuild, no row rewritten.
+UPGRADE_V3 = '''
+BEGIN IMMEDIATE;
+ALTER TABLE accounts ADD COLUMN throttled_until REAL;
+ALTER TABLE accounts ADD COLUMN traversal_state TEXT NOT NULL DEFAULT 'not_started';
+ALTER TABLE accounts ADD COLUMN passes_completed INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE accounts ADD COLUMN last_page_at REAL;
+ALTER TABLE accounts ADD COLUMN started_at REAL;
+ALTER TABLE accounts ADD COLUMN last_head_at REAL;
+ALTER TABLE accounts ADD COLUMN head_cursor TEXT;
+ALTER TABLE accounts ADD COLUMN head_backlog_since REAL;
+ALTER TABLE accounts ADD COLUMN credential TEXT;
+ALTER TABLE records ADD COLUMN fingerprint TEXT;
+CREATE TABLE ledger(credential TEXT NOT NULL, bucket TEXT NOT NULL, window_start REAL NOT NULL, count INTEGER NOT NULL,
+ updated REAL NOT NULL, PRIMARY KEY(credential, bucket));
+CREATE TABLE meta(id INTEGER PRIMARY KEY CHECK(id=1), archive_id TEXT NOT NULL, incarnation INTEGER NOT NULL, journal_id TEXT NOT NULL);
+INSERT INTO meta(id,archive_id,incarnation,journal_id) VALUES(1,'{archive}',1,'{journal}');
+PRAGMA user_version=3;
+COMMIT;
+'''
+
+
+def with_ids(template):
+    return template.format(archive=uuid.uuid4().hex, journal=uuid.uuid4().hex)
+
+
+def provider_of(account):
+    return account['provider'] if isinstance(account, dict) else account.provider
+
+
+def pending_gap(metadata, now):
+    """Seconds until a record with a pending part may be read again: 3 h in the first day, daily to 14 days, then never."""
+    created = metadata.get('created_at')
+    try:
+        age = now - datetime.fromisoformat(created.replace('Z', '+00:00')).timestamp()
+    except (AttributeError, ValueError, TypeError, OverflowError):
+        age = 0
+    if age < 86400:
+        return 3 * 3600
+    return 86400 if age < 14 * 86400 else None
+
+
+def fixed_bytes():
+    """Measured size of the empty schema, the fixed part of the capacity projection."""
+    with closing(sqlite3.connect(':memory:')) as db:
+        db.executescript(with_ids(SCHEMA))
+        return db.execute('PRAGMA page_count').fetchone()[0] * db.execute('PRAGMA page_size').fetchone()[0]
 
 
 def title_of(metadata):
@@ -89,7 +147,7 @@ def backup_archive(settings, destination):
     try:
         with store.connection() as db:
             if db.execute('PRAGMA application_id').fetchone()[0] != APPLICATION_ID or db.execute(
-                    'PRAGMA user_version').fetchone()[0] not in (1, 2):
+                    'PRAGMA user_version').fetchone()[0] not in (1, 2, 3):
                 raise Failure('archive_schema_unsupported')
         return store.run('backup', destination)
     except (OSError, sqlite3.Error, ValueError):
@@ -113,14 +171,18 @@ class Store:
             with self.connection(readonly=False) as db:
                 empty = self.path.stat().st_size == 0
                 if empty:
-                    db.executescript(SCHEMA)
+                    db.executescript(with_ids(SCHEMA))
                 version = db.execute('PRAGMA user_version').fetchone()[0]
-                if db.execute('PRAGMA application_id').fetchone()[0] != APPLICATION_ID or version not in (1, 2):
+                if db.execute('PRAGMA application_id').fetchone()[0] != APPLICATION_ID or version not in (1, 2, 3):
                     raise Failure('archive_schema_unsupported')
                 if version == 1:
                     # Only this derived index is rebuilt. Accepted records, refs,
                     # revisions and journal survive atomically; interruption rolls back.
                     db.executescript(UPGRADE_INDEX)
+                    version = 2
+                if version == 2:
+                    # Additive only; any failure rolls the whole script back to a usable schema 2.
+                    db.executescript(with_ids(UPGRADE_V3))
                 if db.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
                     raise Failure('archive_unavailable')
                 db.execute('PRAGMA journal_mode=WAL')
@@ -204,28 +266,169 @@ class Store:
             row = db.execute('SELECT checkpoint FROM accounts WHERE namespace=?', (namespace(account),)).fetchone()
             return loads(row[0]) if row and row[0] is not None else None
 
-    def discover(self, account, items, checkpoint, now, guard=lambda: None):
+    def queue_cap(self):
+        return getattr(self.settings, 'max_queued', None) or QUEUE_LIMIT
+
+    def head_slice(self):
+        return min(HEAD_SLICE, self.queue_cap() // 2)
+
+    def plan(self, account, credential, now):
+        """Everything one collector pass needs to choose its provider calls, in one short write."""
         ns = namespace(account)
         def change(db):
+            db.execute('INSERT OR IGNORE INTO accounts(namespace) VALUES(?)', (ns,))
+            db.execute('UPDATE accounts SET credential=?,started_at=COALESCE(started_at,?) WHERE namespace=?',
+                       (credential, now, ns))
+            row = db.execute('SELECT * FROM accounts WHERE namespace=?', (ns,)).fetchone()
+            queued = db.execute('SELECT count(*) FROM records WHERE namespace=? AND attempted IS NULL', (ns,)).fetchone()[0]
+            checkpoint = loads(row['checkpoint']) if row['checkpoint'] is not None else None
+            state = row['traversal_state']
+            if state == 'not_started' and checkpoint is not None:
+                state = 'in_progress'  # an archive written before schema 3 resumes its stored cursor
+            return {'state': state, 'checkpoint': checkpoint, 'throttled_until': row['throttled_until'],
+                    'last_head_at': row['last_head_at'], 'head_cursor': row['head_cursor'], 'queued': queued,
+                    'cap': self.queue_cap(), 'slice': self.head_slice()}
+        return self.write(change)
+
+    def discover(self, account, items, checkpoint, now, guard=lambda: None, kind='history', fingerprints=None,
+                 complete=True):
+        """Commit one listed page with its traversal position. kind: `first` (opening page, also the head),
+        `history` (cursor pages; `first` and `history` stay behind the head slice), `head` (newest pages, may resume), `legacy` (PLAUD)."""
+        ns = namespace(account)
+        fingerprints = fingerprints or {}
+        def change(db):
+            cap = self.queue_cap()
+            room = cap if kind in ('head', 'legacy') else cap - self.head_slice()
             queued = db.execute('SELECT count(*) FROM records WHERE namespace=? AND attempted IS NULL', (ns,)).fetchone()[0]
             unique = {item['id']: item for item in items}
-            new = [item for item in unique.values() if not db.execute('SELECT 1 FROM records WHERE namespace=? AND provider_id=?',
-                (ns, item['id'])).fetchone()]
-            if queued + len(new) > QUEUE_LIMIT:
+            known = {}
+            for ident in unique:
+                row = db.execute('SELECT * FROM records WHERE namespace=? AND provider_id=?', (ns, ident)).fetchone()
+                if row is not None:
+                    known[ident] = row
+            new = [item for ident, item in unique.items() if ident not in known]
+            if queued + len(new) > room:
                 raise Failure('archive_queue_full')
             db.execute('INSERT OR IGNORE INTO accounts(namespace) VALUES(?)', (ns,))
             for item in new:
                 ref = uuid.uuid4().hex
-                db.execute('INSERT INTO records(ref,namespace,provider_id,metadata,parts) VALUES(?,?,?,?,?)',
-                    (ref, ns, item['id'], canonical(item).decode(), '{}'))
+                db.execute('INSERT INTO records(ref,namespace,provider_id,metadata,parts,fingerprint) VALUES(?,?,?,?,?,?)',
+                    (ref, ns, item['id'], canonical(item).decode(), '{}', fingerprints.get(item['id'])))
                 db.execute('INSERT INTO texts(ref,namespace,title,transcript,summary) VALUES(?,?,?,?,?)',
                            (ref, ns, title_of(item), '', ''))
-            db.execute('UPDATE accounts SET checkpoint=?,error=NULL WHERE namespace=?',
-                       (canonical(checkpoint).decode(), ns))
-        self.write(change, guard)
+            if kind != 'legacy':
+                for ident, row in known.items():
+                    self.refresh(db, ns, row, unique[ident], fingerprints.get(ident), now)
+            if kind == 'legacy':
+                db.execute('UPDATE accounts SET checkpoint=?,error=NULL WHERE namespace=?', (canonical(checkpoint).decode(), ns))
+            elif kind == 'head':
+                if complete:
+                    # More new pages behind a page with no known ID: resume there next pass, never skip an ID.
+                    resume = checkpoint is not None and not known
+                    since = db.execute('SELECT head_backlog_since FROM accounts WHERE namespace=?', (ns,)).fetchone()[0]
+                    db.execute('UPDATE accounts SET head_cursor=?,head_backlog_since=?,last_head_at=?,error=NULL WHERE namespace=?',
+                               (checkpoint if resume else None, (since if since is not None else now) if resume else None, now, ns))
+            elif complete:
+                db.execute('UPDATE accounts SET traversal_state=?,checkpoint=?,last_page_at=?,passes_completed=passes_completed+1,'
+                           'last_head_at=CASE WHEN ?=\'first\' THEN ? ELSE last_head_at END,error=NULL WHERE namespace=?',
+                    ('in_progress' if checkpoint is not None else 'reached_end',
+                     canonical(checkpoint).decode() if checkpoint is not None else None, now, kind, now, ns))
+            else:
+                db.execute('UPDATE accounts SET error=NULL WHERE namespace=?', (ns,))
+            return {'inserted': len(new), 'known': len(known)}
+        return self.write(change, guard)
+
+    @staticmethod
+    def refresh(db, ns, row, item, fingerprint, now):
+        """A listed row of a known record: a changed fingerprint makes a saved record due; a changed title updates the
+        stored title and index in place (no provider call, no text-change event)."""
+        if fingerprint is not None and row['fingerprint'] != fingerprint:
+            # A record saved before schema 3 has no fingerprint yet: remember it without a re-read.
+            if row['fingerprint'] is not None and row['attempted'] is not None and not row['failures']:
+                db.execute('UPDATE records SET fingerprint=?,due=MIN(due,?) WHERE ref=?', (fingerprint, now, row['ref']))
+            else:
+                db.execute('UPDATE records SET fingerprint=? WHERE ref=?', (fingerprint, row['ref']))
+        title = item.get('title')
+        stored = loads(row['metadata'])
+        if title and stored.get('title') != title:
+            stored['title'] = title
+            stored.pop('title_truncated', None)
+            if item.get('title_truncated'):
+                stored['title_truncated'] = True
+            parts = loads(row['parts'])
+            db.execute('UPDATE records SET metadata=?,revision=revision+?  WHERE ref=?',
+                       (canonical(stored).decode(), int(row['revision'] > 0), row['ref']))
+            db.execute('DELETE FROM texts WHERE ref=?', (row['ref'],))
+            db.execute('INSERT INTO texts(ref,namespace,title,transcript,summary) VALUES(?,?,?,?,?)',
+                (row['ref'], ns, title_of(stored), parts.get('transcript', {}).get('text', ''), parts.get('summary', {}).get('text', '')))
+
+    def head_blocked(self, account, now):
+        ns = namespace(account)
+        self.write(lambda db: db.execute('UPDATE accounts SET head_backlog_since=COALESCE(head_backlog_since,?) WHERE namespace=?', (now, ns)))
+
+    def throttle(self, namespaces, until):
+        def change(db):
+            for ns in namespaces:
+                db.execute('INSERT INTO accounts(namespace,throttled_until) VALUES(?,?) ON CONFLICT(namespace) '
+                           'DO UPDATE SET throttled_until=excluded.throttled_until', (ns, until))
+        self.write(change)
+
+    def ledger_change(self, credential, specs, now, strict):
+        """Count one use of each bucket in a single transaction. With limits (strict) the whole set is granted or
+        refused; without (foreground) it is only recorded. Any doubt about the rows is `ledger_uncertain`."""
+        def change(db):
+            updates = []
+            for bucket, limit in specs:
+                row = db.execute('SELECT window_start,count,updated FROM ledger WHERE credential=? AND bucket=?',
+                                 (credential, bucket)).fetchone()
+                start, used = now, 0
+                if row is not None:
+                    start, used, seen = row
+                    if any(type(v) not in (int, float) for v in (start, used, seen)) or used < 0 or type(used) is not int:
+                        raise Failure('ledger_uncertain')
+                    if strict and (seen > now + 60 or start > now + 60):
+                        raise Failure('ledger_uncertain')  # the clock went backwards: the window cannot be trusted
+                    if now >= start + WINDOW:
+                        start, used = now, 0
+                if limit is not None and used + 1 > limit:
+                    return False
+                updates.append((bucket, start, used + 1))
+            for bucket, start, used in updates:
+                db.execute('INSERT INTO ledger(credential,bucket,window_start,count,updated) VALUES(?,?,?,?,?) '
+                           'ON CONFLICT(credential,bucket) DO UPDATE SET window_start=excluded.window_start,'
+                           'count=excluded.count,updated=excluded.updated', (credential, bucket, start, used, now))
+            return True
+        for attempt in range(20):
+            try:
+                return self.write(change)
+            except sqlite3.OperationalError as error:
+                if 'locked' in str(error) and attempt < 19:
+                    time.sleep(0.05)
+                    continue
+                if getattr(error, 'sqlite_errorcode', 0) & 255 == sqlite3.SQLITE_FULL or str(error) == 'database or disk is full':
+                    raise
+                raise Failure('ledger_uncertain') from None
+            except sqlite3.Error as error:
+                if getattr(error, 'sqlite_errorcode', 0) & 255 == sqlite3.SQLITE_FULL:
+                    raise
+                raise Failure('ledger_uncertain') from None
+
+    def reserve(self, credential, specs, now):
+        return self.ledger_change(credential, specs, now, True)
+
+    def record_use(self, credential, buckets, now):
+        return self.ledger_change(credential, [(bucket, None) for bucket in buckets], now, False)
 
     def work(self, account, now, limit=8, guard=lambda: None):
+        return [ident for ident, _ in self.work_items(account, now, limit, guard)]
+
+    def work_items(self, account, now, limit=8, guard=lambda: None):
+        """Provider ids to read now with a `fresh` flag. Omi: never-fetched records newest first (last 24 h ahead of the
+        backlog), then failed records by backoff, then records waiting on a pending part or a changed list row.
+        PLAUD keeps its earlier due-time order and hourly revisit."""
         ns = namespace(account)
+        omi = provider_of(account) == 'omi'
+        cutoff = datetime.fromtimestamp(now - 86400, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
         def select(db):
             db.execute('INSERT OR IGNORE INTO accounts(namespace) VALUES(?)',(ns,))
             turn = db.execute('SELECT work_turn FROM accounts WHERE namespace=?',(ns,)).fetchone()[0]
@@ -233,8 +436,15 @@ class Store:
             for condition, budget in (('attempted IS NULL', 3),
                                       ('attempted IS NOT NULL AND failures>0', 3),
                                       ('attempted IS NOT NULL AND failures=0', 2)):
-                groups.append([row[0] for row in db.execute('SELECT provider_id FROM records WHERE namespace=? AND due<=? AND ' + condition +
-                    ' ORDER BY due,ref LIMIT ?', (ns, now, budget))])
+                if omi and condition == 'attempted IS NULL':
+                    created = "COALESCE(substr(json_extract(metadata,'$.created_at'),1,19),'')"
+                    rows = db.execute(f'SELECT provider_id,{created}>=? AS fresh FROM records WHERE namespace=? AND due<=? AND '
+                        + condition + f' ORDER BY (CASE WHEN {created}>=? THEN 0 ELSE 1 END),{created} DESC,rowid LIMIT ?',
+                        (cutoff, ns, now, cutoff, budget)).fetchall()
+                    groups.append([(row[0], bool(row[1])) for row in rows])
+                else:
+                    groups.append([(row[0], False) for row in db.execute('SELECT provider_id FROM records WHERE namespace=? AND due<=? AND ' + condition +
+                        ' ORDER BY due,ref LIMIT ?', (ns, now, budget))])
             # Persist priority before execution: even a pass interrupted after
             # its first slow record serves another class on its next attempt.
             db.execute('UPDATE accounts SET work_turn=? WHERE namespace=?',((turn+1)%3,ns))
@@ -277,13 +487,22 @@ class Store:
                         part['consistency'] = consistency[kind]
                 part.update(attempt_state=state, attempt_error=error, attempted_at=now)
                 parts[kind] = part
-            failed = any(part.get('attempt_state') in ('pending','unavailable','error') for part in parts.values())
+            states = [part.get('attempt_state') for part in parts.values()]
+            failed = any(state in ('pending','unavailable','error') for state in states)
             if sum(len(p['text'].encode()) for p in parts.values()) > MAX_TEXT:
                 raise Failure('archive_content_limit')
             body = canonical(metadata).decode()
             revision = row['revision'] + int(usable_change or (row['revision'] > 0 and body != row['metadata']))
-            failures = min(row['failures'] + 1, 10) if failed else 0
-            due = now + min(3600, 60 * 2 ** (failures - 1)) if failed else now + 3600
+            if provider_of(account) == 'omi':
+                # Only a failed read backs off; a part that is still pending waits on a bounded schedule, and a
+                # complete record waits for a changed list row. Nothing is re-read hourly.
+                failures = min(row['failures'] + 1, 10) if 'error' in states else 0
+                gap = pending_gap(metadata, now) if failures == 0 and failed else None
+                due = (now + min(3600, 60 * 2 ** (failures - 1)) if failures else
+                       now + gap if gap else FAR)
+            else:
+                failures = min(row['failures'] + 1, 10) if failed else 0
+                due = now + min(3600, 60 * 2 ** (failures - 1)) if failed else now + 3600
             db.execute('UPDATE records SET metadata=?,parts=?,revision=?,attempted=?,due=?,failures=? WHERE ref=?',
                 (body, canonical(parts).decode(), revision, now, due, failures, row['ref']))
             if usable_change or body != row['metadata']:
@@ -302,13 +521,66 @@ class Store:
         self.write(lambda db: db.execute('INSERT INTO accounts(namespace,error) VALUES(?,?) ON CONFLICT(namespace) DO UPDATE SET error=excluded.error',
                                         (namespace(account), code)))
 
-    def status(self, account):
+    def status(self, account, now=None, budget=None):
+        """Counts and last success; with `budget` (Omi) also the backfill progress, bucket usage and capacity.
+        Never text, titles or tokens."""
         ns = namespace(account)
+        now = time.time() if now is None else now
         with self.connection() as db:
-            row = db.execute('SELECT last_success,error FROM accounts WHERE namespace=?', (ns,)).fetchone()
-            counts = db.execute('SELECT count(*),sum(attempted IS NULL),sum(failures>0) FROM records WHERE namespace=?', (ns,)).fetchone()
-            return {'coverage':'unknown', 'record_count':counts[0], 'queued_count':counts[1] or 0,
-                    'retry_count':counts[2] or 0, 'last_success':row[0] if row else None, 'error':row[1] if row else None}
+            row = db.execute('SELECT * FROM accounts WHERE namespace=?', (ns,)).fetchone()
+            counts = db.execute('SELECT count(*),sum(attempted IS NULL),sum(failures>0),sum(revision>0),'
+                                'sum(attempted IS NOT NULL AND failures=0 AND due<?) FROM records WHERE namespace=?',
+                                (FAR / 10, ns)).fetchone()
+            result = {'coverage':'unknown', 'record_count':counts[0], 'queued_count':counts[1] or 0,
+                      'retry_count':counts[2] or 0, 'last_success':row['last_success'] if row else None,
+                      'error':row['error'] if row else None}
+            if budget is None:
+                return result
+            total, queued, failed, with_text, pending = counts[0], counts[1] or 0, counts[2] or 0, counts[3] or 0, counts[4] or 0
+            state = row['traversal_state'] if row else 'not_started'
+            if state == 'not_started' and row and row['checkpoint'] is not None:
+                state = 'in_progress'
+            usage, uncertain = {}, False
+            try:
+                for bucket, limit in (('reads', budget.reads_per_hour), ('transcripts', budget.transcript_per_hour)):
+                    found = db.execute('SELECT window_start,count FROM ledger WHERE credential=? AND bucket=?',
+                                       (row['credential'] if row else None, bucket)).fetchone()
+                    if found is not None and (type(found[0]) not in (int, float) or type(found[1]) is not int or found[1] < 0):
+                        raise ValueError
+                    live = found is not None and now < found[0] + WINDOW
+                    usage[bucket] = {'used': found[1] if live else 0, 'limit': limit,
+                                     'resets_at': found[0] + WINDOW if live else None}
+            except (sqlite3.Error, ValueError):
+                usage, uncertain = None, True
+            size = db.execute('PRAGMA page_size').fetchone()[0]
+            pages = db.execute('PRAGMA page_count').fetchone()[0] * size
+            fixed = fixed_bytes()
+            sample = db.execute('SELECT avg(length(metadata)) FROM (SELECT metadata FROM records WHERE namespace=? AND revision=0 LIMIT 200)',
+                                (ns,)).fetchone()[0]
+            projected = None
+            if with_text:
+                # Measured, not promised: what the text-bearing records cost per record, times what was discovered.
+                per_text = max(pages - fixed - 4 * (sample or 200) * (total - with_text), 0) / with_text
+                projected = int(fixed + per_text * total)
+            started = row['started_at'] if row else None
+            fetched = total - queued
+            eta = None
+            if started is not None and now - started >= 3600 and fetched > 0 and queued > 0:
+                eta = int(queued / (fetched / (now - started)))
+            since = row['head_backlog_since'] if row else None
+            throttled = row['throttled_until'] if row else None
+            result.update(
+                traversal={'state': state, 'discovered_total': total, 'passes_completed': row['passes_completed'] if row else 0,
+                           'last_page_at': row['last_page_at'] if row else None},
+                with_text=with_text, queued=queued, pending=pending, failed=failed,
+                throttled_until=throttled if throttled is not None and throttled > now else None,
+                usage=usage, db_bytes=sum(path.stat().st_size for path in self.files()),
+                bytes_ceiling=self.settings.max_bytes, projected_db_bytes=projected,
+                capacity_warning=projected is not None and projected > self.settings.max_bytes / 3, eta=eta,
+                head_backlog=since is not None, head_slice_full=since is not None and now - since > 3600)
+            if uncertain:
+                result['error'] = 'ledger_uncertain'
+            return result
 
     def search(self, account, expression, limit):
         ns = namespace(account)

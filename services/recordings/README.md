@@ -267,6 +267,47 @@ It returns counts, last success and fixed durable/runtime errors without reading
 provider tokens or contacting a vendor. In particular, `archive_capacity` stays
 visible even when no error-state write is possible, and clears after recovery.
 
+### Omi full backfill (ANYM-724)
+
+For an Omi account the collector downloads the whole conversation history inside Omi's published hourly limits
+(per credential, fixed windows that start at the first counted request; conversation reads 60/h shared by list, detail and
+transcript, transcript fetches an additional 25/h). Enumeration is cheap: history pages of up to 200 IDs with list metadata
+only (never a transcript), then transcripts one detail call at a time, newest first, with conversations of the last 24 hours
+ahead of the older backlog.
+
+```json
+{"archive": {"max_queued": 10000, "omi_budget": {"transcript_per_hour": 18, "reads_per_hour": 45}}}
+```
+
+- `omi_budget` is the collector's own share (validated 1..25 and 12..60). A reservation is written before each provider call, so
+  the collector never starts a call that would take its own use above it. On-demand reads (`recordings_list/read`) draw on the
+  same windows: they are counted in the same ledger but never refused by it, so agents may spend the rest (and more; Omi then
+  answers 429). The ledger is keyed by a hash of the credential, so two local accounts with one token share it. If the ledger
+  is unreadable or the clock moved back by more than a minute the collector stops calling that credential and reports
+  `ledger_uncertain`; on-demand reads and local search are unaffected. Usage by other tools on the credential is unknown to
+  the ledger: the defaults leave headroom and the 429 handling is the final control.
+- A 429 pauses the collector for that credential for `Retry-After` seconds (missing or invalid 3600, at most 6 h): no call, no
+  error observation, no record's `failures` increases. Another credential and PLAUD keep running. On-demand reads answer
+  `provider_rate_limited` with `retry_after_s`.
+- The head (newest pages) is separate from the history traversal. It is read at most every 5 minutes, may use all reads of the
+  budget, and 6 reads per hour plus a queue slice of 100 IDs (`max_queued`, default 10,000, at most 200,000) are reserved for
+  it: a full queue pauses only the history traversal. The head page is limited to the free slice and resumes from its own cursor
+  when more new IDs wait (`head_backlog`; `head_slice_full` after an hour), so no ID is skipped. A truncated page is read
+  again, never taken as the end. `reached_end` is a fact about the traversal only; `coverage` stays `unknown`.
+- A saved record is read again only when its list row changed (overview presence/digest or the deferred flag), or while a part
+  is pending: every 3 hours during the first 24 hours after creation, then daily until 14 days, then only on a change. Nothing
+  is re-read hourly. A title-only change updates the title and index without a provider call. Failed reads keep the bounded
+  backoff and share the budget.
+- `archive_status` (read scope; no titles or text) adds `traversal` (`state`, `discovered_total`, `passes_completed` = history
+  list pages committed, `last_page_at`), `with_text`, `queued`, `pending`, `failed`, `throttled_until`, `usage` per bucket
+  (`used`, `limit`, `resets_at`), `db_bytes` (all SQLite files incl. WAL), `bytes_ceiling`, `projected_db_bytes`
+  (measured size per text-bearing record times `discovered_total`, plus the measured empty-schema size; an estimate),
+  `capacity_warning` (projection above one third of `max_bytes`) and `eta` (only after an hour of observed rate).
+- Duration is documented, not promised: at 18 transcript calls per hour the backfill takes about conversations / 432 days
+  (1,000: 2.3 days; 5,000: 11.6; 10,000: 23.1), longer when agents use their share or Omi throttles. Size `max_bytes` as
+  3 x `projected_db_bytes` (all SQLite pages count toward the one-third page cap); the free-space reserve applies on top.
+  The production example uses 4 GiB (about 1.33 GiB of pages); set the real value from the first discovery count.
+
 ### Consistent local snapshot and restore probe
 
 The archive is **not automatically enrolled in the existing backup system**.
@@ -360,6 +401,12 @@ atomically rebuilds a schema-1 index from accepted local records under the same
 capacity/progress limits; refs, records, revisions and the event journal are
 preserved. A failed rebuild rolls back. Title-only changes update the index in
 the same transaction without emitting a text-change event. Online backup accepts
-schema 1 or 2. Older packages refuse schema 2: disable archive collection and
-retain its state before a package downgrade. There is no down migration or
+schema 1 to 3. Older packages refuse schema 2: disable archive collection and
+retain its state before a package downgrade.
+
+Archive schema 3 (ANYM-724) is additive: the `ledger` and `meta` tables (random `archive_id`, `incarnation` starting at 1,
+`journal_id`), new columns on `accounts` (throttle, traversal and head state) and one nullable `records.fingerprint` column.
+Starting the single writer applies it in one short transaction (no index rebuild, no row rewritten); a failed upgrade rolls back
+to a usable schema 2. Packages older than this one refuse schema 3 (`archive_schema_unsupported`): disable archive collection
+and keep the state before a downgrade. There is no down migration or
 automatic archive deletion, and no production archive activation in this slice.

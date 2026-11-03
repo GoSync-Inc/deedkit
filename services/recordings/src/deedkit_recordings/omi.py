@@ -1,16 +1,26 @@
 """Only documented Omi GET routes. Bounded, cancellable, no retries or persistence."""
 import asyncio
+import hashlib
 import json
 import math
 import re
 
 import httpx
 
-from .security import Failure, loads
+from .security import Failure, RateLimited, loads
 
 ORIGIN = 'https://api.omi.me'
 ROUTE = '/v1/dev/user/conversations'
 ID = re.compile(r'[A-Za-z0-9_-]{1,256}')
+RETRY_DEFAULT, RETRY_CAP = 3600, 6 * 3600
+
+
+def retry_after(headers):
+    """Seconds from a `Retry-After` header; missing or anything but a plain integer gives the default, never over 6 h."""
+    raw = headers.get('retry-after', '')
+    if not re.fullmatch(r'[0-9]{1,9}', raw):
+        return RETRY_DEFAULT
+    return min(max(int(raw), 1), RETRY_CAP)
 
 
 class Provider:
@@ -33,6 +43,8 @@ class Provider:
                                                     'Accept': 'application/json', 'Accept-Encoding': 'identity'}) as response:
                         if response.status_code in (401, 403):
                             raise Failure('provider_auth_required')
+                        if response.status_code == 429:
+                            raise RateLimited(retry_after(response.headers))
                         if response.status_code == 404 and recording:
                             raise Failure('not_found_or_forbidden', 404)
                         if response.status_code != 200:
@@ -74,6 +86,16 @@ def metadata(value):
     if type(value.get('processing_deferred')) is bool:
         result['processing_deferred'] = value['processing_deferred']
     return result
+
+
+def fingerprint(value):
+    """What a list row says about content that can still change: the overview and the deferred-processing flag."""
+    structured = value.get('structured') if isinstance(value, dict) else None
+    overview = structured.get('overview') if isinstance(structured, dict) else None
+    deferred = value.get('processing_deferred') if isinstance(value, dict) else None
+    body = json.dumps([overview if isinstance(overview, str) else None, deferred if type(deferred) is bool else None],
+                      ensure_ascii=False, separators=(',', ':'))
+    return hashlib.sha256(body.encode()).hexdigest()[:32]
 
 
 def pagination(headers, count, limit):
