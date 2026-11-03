@@ -24,6 +24,19 @@ approval. The API intentionally does not accept `approved: true` as proof.
    Changing the payload with that ID fails with `idempotency_conflict`.
    Never create another action ID automatically to bypass an uncertain result.
 
+### A refused preview names the next call (ANYM-646)
+
+`send_message` refused for a missing or changed preview (`preview_required`, `preview_mismatch`; archive
+chat, phone or username) keeps its code and status and adds `next_action: preview_then_send_with_digest` (a
+phone or username `preview_mismatch` keeps `preview_message_again`), a fixed `hint` and
+`next_call: {tool: "preview_message", arguments, caller_supplies}`. `arguments` holds the account (and the
+archive `chat_id`); `caller_supplies` names every argument the refused call set that the digest binds (`text`,
+and whichever of `phone`, `username`, `reply_to`, `format`, `link_preview`, `allow_lossy` it set). Call the tool
+with `arguments` plus your own values for `caller_supplies`, show the preview to the owner and, after the owner
+confirms, repeat the send unchanged with the returned `preview_digest`. A key or route that cannot run the
+preview tool gets no `next_call`. The refusal never carries a digest or the call's text, number, username or
+link, and the server runs nothing itself. A phone or username send refused after its chat-opening step is unchanged.
+
 ### Translated sends
 
 DeedKit translates nothing and stores no separate original-language text or

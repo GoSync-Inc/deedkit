@@ -470,7 +470,18 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
             preview_digest='',link_preview=False,allow_lossy=False,phone_hash=None,child=False):
     """phone_hash: a phone send (ANYM-532) whose digest the caller checked; it is the request hash.
     child: a messages_send step (ANYM-546) under its child key; only such a call may use the child prefix."""
-    format_options(format,link_preview,allow_lossy,preview_digest)
+    def refused(error,resolved=False):
+        # ANYM-646: a caller's own send names the preview call; a phone step or a messages_send child keeps its body.
+        # The chat is echoed only once it resolves for this key; a malformed digest is refused before that.
+        if phone_hash is not None or child:return error
+        if not resolved:
+            try:target(c,p,account,chat_id,reply_to)
+            except Exception:return error
+        from . import preview_refusal
+        return preview_refusal.send(error,p,account,chat_id,reply_to=reply_to if isinstance(reply_to,str) else '',
+            format=format,link_preview=link_preview,allow_lossy=allow_lossy)
+    try:format_options(format,link_preview,allow_lossy,preview_digest)
+    except APIError as error:raise refused(error) from None
     # Source length is bounded by the renderer; the actual provider wire payload
     # must satisfy the conservative 4000 UTF-16-unit limit.
     if not isinstance(text,str) or not text.strip() or any(
@@ -504,10 +515,10 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
                 (existing.get('preview_digest') or '')==preview_digest)
         if not matches:raise APIError('idempotency_conflict',409)
         return result(existing,c,p)
-    if not default_policy and not preview_digest:raise APIError('preview_required',409)
+    if not default_policy and not preview_digest:raise refused(APIError('preview_required',409),True)
     draft=reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id)
     if phone_hash is None and preview_digest and preview_digest!=draft['preview_digest']:
-        raise APIError('preview_mismatch',409)
+        raise refused(APIError('preview_mismatch',409),True)
     artifact={name:draft[name] for name in ('format','source_text','rendered_text','provider_text','entities',
         'provider_payload','warnings','links','utf16_units','renderer_version')}
     request_hash=phone_hash or legacy_hash if default_policy else phone_hash or hashlib.sha256(canonical([

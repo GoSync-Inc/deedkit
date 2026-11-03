@@ -447,12 +447,23 @@ def _input(account,operation,chat_id,message_id,expected_revision,parameters,pre
 def enqueue(store,c,p,account,operation,chat_id='',message_id='',expected_revision=0,parameters=None,
             request_id='',preview_digest='',internal=None,child=False):
     from .outgoing import CHILD_KEY_PREFIX
+    from . import preview_refusal
+
+    def refused(error,resolved=False):
+        # ANYM-646: a caller's own operation names its preview; an internal step (phone, username) or child keeps its body.
+        # The references are echoed only once the same call as the preview accepts them (this also keeps a join_chat
+        # without a fresh successful link check bare); a malformed digest is refused before that.
+        if child or internal:return error
+        if not resolved:
+            try:_resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,parameters,verify_file=True)
+            except Exception:return error
+        return preview_refusal.operation(error,p,account,operation,chat_id,message_id,expected_revision,parameters)
     # ANYM-546: the child prefix is reserved for messages_send steps (child=True), never a caller's key.
     if not isinstance(request_id,str) or not re.fullmatch(r'[a-zA-Z0-9_.:-]{8,128}',request_id) or (
             request_id.startswith(CHILD_KEY_PREFIX)!=child):
         raise APIError('invalid_request_id')
     if not isinstance(preview_digest,str) or (preview_digest and not re.fullmatch(r'[a-f0-9]{64}',preview_digest)):
-        raise APIError('preview_mismatch',409)
+        raise refused(APIError('preview_mismatch',409))
     request_input,request_hash=_input(account,operation,chat_id,message_id,expected_revision,parameters,preview_digest)
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('commands:'+str(p['key_id']),))
     existing=c.execute('SELECT * FROM messenger_commands WHERE principal=%s AND key_id=%s AND request_id=%s',
@@ -467,8 +478,8 @@ def enqueue(store,c,p,account,operation,chat_id='',message_id='',expected_revisi
                          ready=True,verify_file=True)
     if internal:payload.update({k:v for k,v in internal.items() if k in PHONE_INTERNAL})
     expected=_digest(p,payload)
-    if spec['mutation'] and not preview_digest:raise APIError('preview_required',409)
-    if preview_digest and preview_digest!=expected:raise APIError('preview_mismatch',409)
+    if spec['mutation'] and not preview_digest:raise refused(APIError('preview_required',409),True)
+    if preview_digest and preview_digest!=expected:raise refused(APIError('preview_mismatch',409),True)
     payload['request_input']=request_input
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('commands-account:'+account,))
     if operation=='join_chat':_join_guard(c,account,payload['parameters']['link'])

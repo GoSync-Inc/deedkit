@@ -215,6 +215,13 @@ REVIEWED_HINTS = frozenset({
     "omit sections to get all sections",
     "omit my_roles for all roles",
     "swap the bounds or widen the range; the range is half-open and must not be empty",
+    # ANYM-646: the two fixed hints of a refused preview (send / messenger operation).
+    "If next_call is present, call its tool with its arguments plus your own values for caller_supplies, show the "
+    "preview to the owner and, after the owner confirms, repeat this send unchanged with the returned "
+    "preview_digest; if it is absent, this key or route cannot run the preview tool.",
+    "If next_call is present, call its tool with its arguments plus your own values for caller_supplies, show the "
+    "preview to the owner and, after the owner confirms, repeat this operation unchanged with the returned "
+    "preview_digest; if it is absent, this key or route cannot run the preview tool.",
 })
 
 

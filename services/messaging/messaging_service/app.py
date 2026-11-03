@@ -631,7 +631,7 @@ def register_messenger_operation_tools(mcp, call, async_call, read):
 def register_conversation_tools(mcp, call, read):
     @mcp.tool(structured_output=True, annotations=read)
     def list_chats(ctx: Context, after: str='', limit: int=25, accounts: list[StrictStr] | None=None,
-                   query: str='', chat_types: list[Literal['private','group','channel','unknown']] | None=None,
+                   account: StrictStr='', query: str='', chat_types: list[Literal['private','group','channel','unknown']] | None=None,
                    order: Literal['id','activity','last_activity_desc','priority','waiting_longest']='activity',
                    exclude_channels: bool=False, awaiting_reply: bool=False,
                    from_time: str='', to_time: str='', include_coverage: bool | None=None, detail: Detail='compact',
@@ -642,7 +642,7 @@ def register_conversation_tools(mcp, call, read):
                    my_roles: list[Literal['creator','admin','member','left','unknown']] | None=None,
                    can_post: StrictBool | None=None,awaiting_their_reply: StrictBool=False,
                    min_wait_hours: StrictInt | None=None) -> dict[str, Any]:
-        """List permitted chats. order: activity (default) or last_activity_desc = recent first; id = stable catalogue traversal. query also matches a channel @username. accounts gives each account's source status and last ingest. No provider read changes.
+        """List permitted chats. order: activity (default) or last_activity_desc = recent first; id = stable catalogue traversal. query also matches a channel @username. account/accounts: each account's source status and last ingest. No provider read changes.
         awaiting_reply: private incoming, excluding known bots, or explicit group owner mention/reply; heuristic, not obligation. Attention expires after awaiting_reply_days (0 = no age limit) from the attention message time; group evidence survives others' chatter and clears after owner writes. priority requires awaiting_reply=true; score/reasons are transparent heuristics (an owner group mention without a question mark scores owner_request; detail=full adds awaiting_reply_priority_components). Private-only: chat_types=['private']. A due snooze returns with snoozed_until and snooze_due. Details: CONVERSATION.md.
         Compact rows omit values the row fixes (rows without type omit nothing); an absent field means the value below.
         last_turn: not_applicable on groups, and on channel and self_chat rows without suggested_action;
@@ -662,7 +662,7 @@ def register_conversation_tools(mcp, call, read):
         Compact rows omit an unknown my_role.
         limit defaults to 25 (maximum 100); continue with next_cursor.
         """
-        return call(ctx,'list_chats',detail=detail,after=after,limit=limit,accounts=accounts,query=query,chat_types=chat_types,
+        return call(ctx,'list_chats',detail=detail,after=after,limit=limit,accounts=accounts,account=account,query=query,chat_types=chat_types,
                     order=order,exclude_channels=exclude_channels,awaiting_reply=awaiting_reply,
                     from_time=from_time,to_time=to_time,include_coverage=include_coverage,
                     awaiting_reply_days=awaiting_reply_days,exclude_chats=exclude_chats,exclude_senders=exclude_senders,
@@ -760,8 +760,10 @@ def register_archive_tools(mcp, call, async_call, read):
     @mcp.tool(structured_output=True, annotations=read)
     def search_people(ctx: Context, query: str='', accounts: list[StrictStr] | None=None,
                       chats: list[StrictStr] | None=None, after: str='', limit: int=20,
-                      transliterate: bool=True,group_by_sender: bool=False,person: StrictStr='') -> dict[str, Any]:
+                      transliterate: bool=True,group_by_sender: bool=False,person: StrictStr='',
+                      account: StrictStr='') -> dict[str, Any]:
         """Find provider-reported name/username fragments or sender IDs in permitted archived chats.
+        account (one ID) and accounts (a list) both narrow by account and are ANDed when both are given; an empty account is no filter.
         Results are account/chat-scoped observations, not verified or merged identities.
         Use account + sender_id with search() and source_message with get_context().
         Missing matches may mean metadata has not been observed; no contact-book/provider call.
@@ -770,7 +772,7 @@ def register_archive_tools(mcp, call, async_call, read):
         lists the name observations of that person's identities you can read (across messengers),
         and search(person=<id>) finds their messages. Links are owner-made, never inferred from names.
         """
-        return call(ctx,'search_people',query=query,accounts=accounts,chats=chats,after=after,limit=limit,
+        return call(ctx,'search_people',query=query,accounts=accounts,account=account,chats=chats,after=after,limit=limit,
                     transliterate=transliterate,group_by_sender=group_by_sender,person=person)
 
     # ANYM-478: live may ask Telegram itself, so search is open-world.

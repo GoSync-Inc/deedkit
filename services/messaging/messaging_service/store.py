@@ -626,7 +626,7 @@ class Store:
             if not changed:raise ValueError('unknown_account')
             audit(c,None,'set_operations','ok')
 
-    def list_chats(self, token, after='', limit=25, *, accounts=None,query='',chat_types=None,
+    def list_chats(self, token, after='', limit=25, *, accounts=None,account='',query='',chat_types=None,
                    order='id',exclude_channels=False,awaiting_reply=False,from_time='',to_time='',
                    include_coverage=True,awaiting_reply_days=14,exclude_chats=None,exclude_senders=None,
                    only_questions=False,only_unread=False,view='archive',exclude_likely_broadcasts=False,
@@ -634,7 +634,9 @@ class Store:
                    awaiting_their_reply=False,min_wait_hours=None):
         from .chat_queries import list_chats
         from .message_queries import hint_forward_origin
+        from .search_query import fold_account
         with self.authorized(token,'list_chats') as (c,p):
+            accounts=fold_account(account,accounts)
             result=list_chats(self,c,p,after,limit,accounts=accounts,query=query,chat_types=chat_types,
                 order=order,exclude_channels=exclude_channels,awaiting_reply=awaiting_reply,
                 from_time=from_time,to_time=to_time,include_coverage=include_coverage,
@@ -676,9 +678,11 @@ class Store:
             return list_entries(self,c,p,kind,after,limit)
 
     def search_people(self,token,query='',*,accounts=None,chats=None,after='',limit=20,
-                      transliterate=False,group_by_sender=False,person=''):
+                      transliterate=False,group_by_sender=False,person='',account=''):
         from .people_candidates import search_people
+        from .search_query import fold_account
         with self.authorized(token,'search_people') as (c,p):
+            accounts=fold_account(account,accounts)
             if type(transliterate) is not bool or type(group_by_sender) is not bool:
                 raise APIError('invalid_filter')
             return search_people(self,c,p,query,accounts=accounts,chats=chats,after=after,limit=limit,

@@ -166,7 +166,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "List permitted chats. order: activity (default) or last_activity_desc = recent first; id = stable catalogue traversal. query also matches a channel @username. accounts gives each account's source status and last ingest. No provider read changes.\nawaiting_reply: private incoming, excluding known bots, or explicit group owner mention/reply; heuristic, not obligation. Attention expires after awaiting_reply_days (0 = no age limit) from the attention message time; group evidence survives others' chatter and clears after owner writes. priority requires awaiting_reply=true; score/reasons are transparent heuristics (an owner group mention without a question mark scores owner_request; detail=full adds awaiting_reply_priority_components). Private-only: chat_types=['private']. A due snooze returns with snoozed_until and snooze_due. Details: CONVERSATION.md.\nCompact rows omit values the row fixes (rows without type omit nothing); an absent field means the value below.\nlast_turn: not_applicable on groups, and on channel and self_chat rows without suggested_action;\nelse the shown head's direction (owner/peer; a head hint: peer).\nsuggested_action and basis on channel and self_chat rows: not_applicable, channel_or_self_chat. On a group without a hint, suggested_action, basis and\nowner_attention: not_applicable, no_observed_owner_attention.\nowner_attention on a group with a hint: last_turn peer.\nA question is question_mark in reasons. A private hint's basis: last_archived_message_incoming.\nsender_name on an outgoing head without sender_id: the owner. head_freshness: stale.\nWithout conversation.basis beside a hint, the hint's confidence, else its basis, gives the reason.\nnext_step: provider_head_stale, provider_head_not_verified, history_has_gaps, message_version_conflict -> answer_with_caveat.\nnext_step: ambiguous_message_order, ambiguous_attention_reply_order, head_candidates_truncated -> answer_with_caveat.\nnext_step: message_revision_changed_during_read -> reread_now. next_step: rate_limited, provider_temporarily_unavailable -> wait_for_provider_cooldown.\nnext_step: provider_unavailable, provider_chat_error -> check_provider_access. next_step: no_archived_messages -> wait_for_history.\nnext_step: unclassified_latest_message, chat_type_unknown, any other code -> get_context.\nA known head conflict (Telegram only) keeps the row's action; caveat: known_conflicts. retry_after_s: seconds left of a rate limit. catchup (WhatsApp): moving, queued, stalled or unknown.\nCompact rows omit an unknown my_role.\nlimit defaults to 25 (maximum 100); continue with next_cursor.\n",
+    "description": "List permitted chats. order: activity (default) or last_activity_desc = recent first; id = stable catalogue traversal. query also matches a channel @username. account/accounts: each account's source status and last ingest. No provider read changes.\nawaiting_reply: private incoming, excluding known bots, or explicit group owner mention/reply; heuristic, not obligation. Attention expires after awaiting_reply_days (0 = no age limit) from the attention message time; group evidence survives others' chatter and clears after owner writes. priority requires awaiting_reply=true; score/reasons are transparent heuristics (an owner group mention without a question mark scores owner_request; detail=full adds awaiting_reply_priority_components). Private-only: chat_types=['private']. A due snooze returns with snoozed_until and snooze_due. Details: CONVERSATION.md.\nCompact rows omit values the row fixes (rows without type omit nothing); an absent field means the value below.\nlast_turn: not_applicable on groups, and on channel and self_chat rows without suggested_action;\nelse the shown head's direction (owner/peer; a head hint: peer).\nsuggested_action and basis on channel and self_chat rows: not_applicable, channel_or_self_chat. On a group without a hint, suggested_action, basis and\nowner_attention: not_applicable, no_observed_owner_attention.\nowner_attention on a group with a hint: last_turn peer.\nA question is question_mark in reasons. A private hint's basis: last_archived_message_incoming.\nsender_name on an outgoing head without sender_id: the owner. head_freshness: stale.\nWithout conversation.basis beside a hint, the hint's confidence, else its basis, gives the reason.\nnext_step: provider_head_stale, provider_head_not_verified, history_has_gaps, message_version_conflict -> answer_with_caveat.\nnext_step: ambiguous_message_order, ambiguous_attention_reply_order, head_candidates_truncated -> answer_with_caveat.\nnext_step: message_revision_changed_during_read -> reread_now. next_step: rate_limited, provider_temporarily_unavailable -> wait_for_provider_cooldown.\nnext_step: provider_unavailable, provider_chat_error -> check_provider_access. next_step: no_archived_messages -> wait_for_history.\nnext_step: unclassified_latest_message, chat_type_unknown, any other code -> get_context.\nA known head conflict (Telegram only) keeps the row's action; caveat: known_conflicts. retry_after_s: seconds left of a rate limit. catchup (WhatsApp): moving, queued, stalled or unknown.\nCompact rows omit an unknown my_role.\nlimit defaults to 25 (maximum 100); continue with next_cursor.\n",
     "inputSchema": {
       "properties": {
         "after": {
@@ -193,6 +193,11 @@
           ],
           "default": null,
           "title": "Accounts"
+        },
+        "account": {
+          "default": "",
+          "title": "Account",
+          "type": "string"
         },
         "query": {
           "default": "",
@@ -469,7 +474,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Read-only. Find provider-reported name or username fragments, or sender IDs, in permitted archived chats; no contact-book or provider call. Rows are account/chat-scoped observations, not verified identities; a missing match may mean the name was never observed; an empty result may carry see_also: messages_read_contacts list_contacts with query. Use account + sender_id with messages_search and source_message with messages_get_context. A row the owner linked carries person (a UUID); links are owner-made, never inferred from names. Example: {\"query\":\"Anna\",\"limit\":10}",
+    "description": "Read-only. Find provider-reported name or username fragments, or sender IDs, in permitted archived chats; no contact-book or provider call. account/accounts narrow by account. Rows are account/chat-scoped observations, not verified identities; a missing match may mean the name was never observed; an empty result may carry see_also: messages_read_contacts list_contacts with query. Use account + sender_id with messages_search and source_message with messages_get_context. A row the owner linked carries person (a UUID); links are owner-made, never inferred from names. Example: {\"query\":\"Anna\",\"limit\":10}",
     "inputSchema": {
       "properties": {
         "query": {
@@ -531,6 +536,11 @@
           "default": "",
           "description": "A person UUID: lists the name observations of that person's identities you can read (across messengers); messages_search(person) finds their messages.",
           "title": "Person",
+          "type": "string"
+        },
+        "account": {
+          "default": "",
+          "title": "Account",
           "type": "string"
         }
       },

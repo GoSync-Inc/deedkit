@@ -1,6 +1,6 @@
 # People search
 
-`search_people(query, accounts, chats, after, limit)` searches by observed name,
+`search_people(query, accounts, account, chats, after, limit)` searches by observed name,
 username (with or without `@`) and provider sender ID. The search is case-insensitive
 and matches a literal fragment; `%` and `_` are not wildcards. For fragments
 of three or more characters a PostgreSQL trigram GIN is used. The query is normalized
