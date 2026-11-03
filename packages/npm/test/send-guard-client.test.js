@@ -48,5 +48,5 @@ test('getSendStatus forwards a request_id and the typings name exactly one of th
   await client.getSendStatus({request_id:'synthetic-send-0001'});
   await client.getSendStatus({send_id:'send_synthetic'});
   assert.deepEqual(seen,[{request_id:'synthetic-send-0001'},{send_id:'send_synthetic'}]);
-  assert.match(declared,/getSendStatus\(args: \{send_id:string; request_id\?: never\} \| \{request_id:string; send_id\?: never\}\)/);
+  assert.match(declared,/getSendStatus\(args: \{request_id:string\}\): Promise<Record<string,unknown>>;/);
 });

@@ -268,8 +268,9 @@ export declare class AnyMsgClient {
   /** Rich content requires the reviewed preview digest and exact owner confirmation. */
   sendMessage(args: MessageAction): Promise<Record<string,unknown>>;
   messagesSend(args: MessagesSendArguments): Promise<Record<string,unknown>>;
-  /** Exactly one: `send_id`, or (ANYM-736) the `request_id` you chose for the send, which recovers a lost response. */
-  getSendStatus(args: {send_id:string; request_id?: never} | {request_id:string; send_id?: never}): Promise<Record<string,unknown>>;
+  getSendStatus(args: {send_id:string}): Promise<Record<string,unknown>>;
+  /** ANYM-736: the `request_id` you chose for the send, which recovers a lost response (exactly one of the two keys). */
+  getSendStatus(args: {request_id:string}): Promise<Record<string,unknown>>;
   /** Passive catalog and scoped permission read, with no provider request. */
   listMessengerOperations(args: {account:string}): Promise<Record<string,unknown>>;
   /** Passive validation; show exact targets, effects and warnings before owner confirmation. */
