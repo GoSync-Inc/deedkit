@@ -662,7 +662,7 @@ CALENDAR_FAILURES={'restore_bundle_failed','restore_schema_failed','restore_inve
 
 # The recordings helper's own stages (ANYM-728) and the continuity refusals; the shared ones are above.
 RECORDINGS_FAILURES={'restore_archive_failed','restore_readback_failed','invalid_continuity','invalid_rebaseline',
-                     'rebaseline_recordings_only','continuity_too_large',*continuity.REFUSALS}
+                     'rebaseline_recordings_only','continuity_too_large','continuity_unresolved',*continuity.REFUSALS}
 
 
 class HelperFailure(RuntimeError):
@@ -749,19 +749,19 @@ def make_proof(receipt,facts,run,profile='messaging'):
     # The calendar schema is fcs.migrations' version, which the helper binds to the manifest; no messaging range.
     if profile=='calendar':keys,checks,schemas=keys|{'profile','vault_warnings'},r2.CALENDAR_CHECKS,range(1,100001)
     # The recordings schema is the archive's user_version; the identity facts are the bundle manifest's.
-    elif profile=='recordings':keys,checks,schemas=keys|{'profile','archive'},r2.RECORDINGS_CHECKS,SUPPORTED_USER_VERSIONS
+    elif profile=='recordings':keys,checks,schemas=keys|{'profile','archive','captured_at'},r2.RECORDINGS_CHECKS,SUPPORTED_USER_VERSIONS
     if (not isinstance(facts,dict) or set(facts)!=keys or
             type(facts['v']) is not int or facts['v']!=1 or facts['status']!='verified' or
             type(facts['schema_version']) is not int or facts['schema_version'] not in schemas or
             facts['manifest_sha256']!=receipt['wire']['snapshot_sha256'] or not isinstance(facts['checks'],dict) or
             set(facts['checks'])!=checks or any(v is not True for v in facts['checks'].values()) or
             (profile=='calendar' and not r2.valid_warnings(facts['vault_warnings'])) or
-            (profile=='recordings' and not r2.valid_archive(facts['archive']))):
+            (profile=='recordings' and not (r2.valid_archive(facts['archive']) and r2.valid_instant(facts['captured_at'])))):
         raise ValueError('invalid_helper_result')
     verification={'id':run,'verified_at':now(),'schema_version':facts['schema_version'],
                   'manifest_sha256':facts['manifest_sha256'],'checks':facts['checks']}
     if profile=='calendar':verification={**verification,'profile':profile,'vault_warnings':facts['vault_warnings']}
-    if profile=='recordings':verification={**verification,'profile':profile,'archive':facts['archive']}
+    if profile=='recordings':verification={**verification,'profile':profile,'archive':facts['archive'],'captured_at':facts['captured_at']}
     return {'v':1,'type':'independent_restore_verification','status':'verified',
             'backup':{k:receipt['wire'][k] for k in ('id','bytes','sha256','snapshot_sha256')},'verification':verification}
 
@@ -878,6 +878,26 @@ def rebaseline_request(fd):
     return value['reason']
 
 
+def durable_phase(fd):
+    """The phase the journal file on disk names now ('restoring' when none is there); None when it cannot be read.
+    A failed write of the journal may have replaced the file anyway, so the in-memory journal is not the evidence."""
+    try:
+        journal=r2.read_root(fd,'active.json',missing=True)[1]
+        return 'restoring' if journal is None else journal.get('phase')
+    except Exception:return None
+
+
+def read_baseline(fd):
+    """The protected point's baseline record, or None before the first enrollment."""
+    value=read_private(fd,CONTINUITY,CONTINUITY_LIMIT)
+    if value is None:return None
+    if (not isinstance(value,dict) or set(value)!={'v','run','rebaselined','facts'} or value['v']!=1 or
+            not isinstance(value['run'],str) or not re.fullmatch('[a-f0-9]{32}',value['run']) or
+            (value['rebaselined'] is not None and not isinstance(value['rebaselined'],str))):raise ValueError('invalid_continuity')
+    continuity.validate_facts(value['facts'])
+    return value
+
+
 def check_continuity(payload,run,facts,journal,fd):
     """The recordings candidate against the protected point's baseline (ANYM-728): refused, nothing is promoted and
     the previous point stays. Without a baseline only the very first enrollment passes; an operator's re-baseline
@@ -885,23 +905,31 @@ def check_continuity(payload,run,facts,journal,fd):
     candidate=continuity.validate_facts(r2.unique_json(private_file(payload/'continuity.json',CONTINUITY_LIMIT)))
     if candidate['archive']!=facts['archive']:raise ValueError('invalid_helper_result')
     reason=rebaseline_request(fd)
-    baseline=read_private(fd,CONTINUITY,CONTINUITY_LIMIT)
-    if baseline is not None:baseline=continuity.validate_facts(baseline)
+    baseline=read_baseline(fd)
     if reason is None:
         if baseline is None:
             if journal['prior_sha256'] is not None:raise continuity.ContinuityRefused('archive_baseline_missing')
-        else:continuity.judge(baseline,candidate)
+        else:continuity.judge(baseline['facts'],candidate)
     write_private(fd,candidate_facts_name(run),{'v':1,'facts':candidate,'rebaselined':reason})
 
 
 def adopt_continuity(fd,run):
-    """After the protected point moved: the candidate's facts become the baseline (idempotent for a promotion retry).
-    Returns the re-baseline reason this adoption consumed, if any."""
+    """After the protected point moved: the candidate's facts become the baseline, bound to the promoted proof's run.
+    Idempotent for a promotion retry: a baseline already written for this run answers with its recorded reason. Facts
+    that are neither pending nor adopted fail closed (`continuity_unresolved`): the baseline would be older than the
+    protected point. Returns the re-baseline reason of this run, if any."""
     value=read_private(fd,candidate_facts_name(run),CONTINUITY_LIMIT)
-    if value is None:return None
+    if value is None:
+        baseline=read_baseline(fd)
+        if baseline is not None and baseline['run']==run:return baseline['rebaselined']
+        raise ValueError('continuity_unresolved')
     if not isinstance(value,dict) or set(value)!={'v','facts','rebaselined'} or value['v']!=1:raise ValueError('invalid_continuity')
-    write_private(fd,CONTINUITY,continuity.validate_facts(value['facts']))
+    facts=continuity.validate_facts(value['facts'])
+    proof=read_private(fd,'proof-'+run+'.json',65536)
+    verification=proof.get('verification') if isinstance(proof,dict) else None
+    if not isinstance(verification,dict) or verification.get('archive')!=facts['archive']:raise ValueError('continuity_unresolved')
     reason=value['rebaselined']
+    write_private(fd,CONTINUITY,{'v':1,'run':run,'rebaselined':reason,'facts':facts})
     if reason is not None and rebaseline_request(fd)==reason:os.unlink(REBASELINE,dir_fd=fd)
     drop_candidate_facts(fd,run);local.fsync_dir(fd)
     return reason
@@ -1047,7 +1075,7 @@ def run_failure(error,engine,config,journal,admitted,profile,fd):
             cleanup_resources(engine,journal['run'],profile,data_directory(config,journal['run']))
             remove_payload(config['directory'],journal['run'])
             # A candidate's continuity facts outlive a failure only once its proof is ready (a promotion retry needs them).
-            if profile=='recordings' and journal['phase']=='restoring':drop_candidate_facts(fd,journal['run'])
+            if profile=='recordings' and durable_phase(fd)=='restoring':drop_candidate_facts(fd,journal['run'])
         except Exception:cleanup_ok=False
     if admitted is not None and cleanup_ok:
         try:release_admission(admitted)

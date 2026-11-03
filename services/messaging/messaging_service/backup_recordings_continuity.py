@@ -108,6 +108,13 @@ def validate_facts(value):
             not isinstance(item, list) or len(item) != 2 or not isinstance(item[0], str) or not REF.fullmatch(item[0]) or
             not isinstance(item[1], str) or not HASH.fullmatch(item[1]) for item in value['providers']):
         bad()
+    # Record identities are unambiguous: one provider hash per ref, one ref per provider hash, every part's ref is a
+    # record, and the record count is the archive's. Otherwise a tombstone could authorize more than one record.
+    refs = [item[0] for item in value['providers']]
+    hashes = [item[1] for item in value['providers']]
+    if (len(set(refs)) != len(refs) or len(set(hashes)) != len(hashes) or len(refs) != archive['records'] or
+            not {item[0] for item in value['parts']} <= set(refs)):
+        bad()
     if not isinstance(value['tombstones'], list) or any(
             not isinstance(item, str) or not HASH.fullmatch(item) for item in value['tombstones']):
         bad()
@@ -138,19 +145,44 @@ def judge(baseline, candidate):
             raise ContinuityRefused('archive_content_lost')
 
 
+def _readable(raw):
+    """The stored parts JSON as a dict whose parts are objects with string texts, else ValueError."""
+    stored = json.loads(raw)
+    if not isinstance(stored, dict):
+        raise ValueError()
+    for kind in KINDS:
+        part = stored.get(kind)
+        if part is not None and (not isinstance(part, dict) or not isinstance(part.get('text', ''), str)):
+            raise ValueError()
+    return stored
+
+
 def readback(path):
-    """A search and a context read on the decrypted archive: the FTS index answers a synthetic query and the newest
-    records' stored parts read back as JSON text. Nothing read is kept or returned."""
+    """A search and a context read on the decrypted archive. The full-text index answers a synthetic query, and for
+    the newest records that hold accepted text (not skipped or awaiting the indexer) the index must have their row and
+    find one of its own words for that very record: an archive whose text survived but whose index was emptied fails.
+    The words are compared in memory only; nothing read is kept, returned or put in a message."""
     try:
         db = _connect(path)
         try:
             version = db.execute('PRAGMA user_version').fetchone()[0]
             table = 'texts4' if version >= 4 else 'texts'
             db.execute('SELECT count(*) FROM ' + table + ' WHERE ' + table + ' MATCH ?', ('deedkitsyntheticprobe',)).fetchone()
-            for (raw,) in db.execute('SELECT parts FROM records ORDER BY rowid DESC LIMIT 3'):
-                stored = json.loads(raw)
-                if not isinstance(stored, dict) or any(
-                        not isinstance(stored[kind].get('text', ''), str) for kind in KINDS if isinstance(stored.get(kind), dict)):
+            names = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            skip = ''.join(' AND ref NOT IN (SELECT ref FROM ' + name + ')' for name in ('index_skips', 'index_dirty') if name in names)
+            for ref, raw in db.execute('SELECT ref,parts FROM records WHERE 1=1' + skip + ' ORDER BY rowid DESC LIMIT 3').fetchall():
+                stored = _readable(raw)
+                if not any(isinstance(stored.get(kind), dict) and stored[kind].get('text') for kind in KINDS):
+                    continue
+                row = db.execute('SELECT title,transcript,summary FROM ' + table + ' WHERE ref=?', (ref,)).fetchone()
+                if row is None:
+                    raise ValueError()
+                word = re.search(r'[^\W_]{4,}', ' '.join(item or '' for item in row))
+                if word is None:
+                    continue
+                found = db.execute('SELECT count(*) FROM ' + table + ' WHERE ' + table + ' MATCH ? AND ref=?',
+                                   ('"' + word.group(0) + '"', ref)).fetchone()[0]
+                if found < 1:
                     raise ValueError()
         finally:
             db.close()
@@ -175,6 +207,8 @@ def synthetic_archive(path, records=None, *, archive_id=SYNTHETIC_ARCHIVE_ID, in
         ' parts TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0, UNIQUE(namespace, provider_id));'
         'CREATE TABLE events(sequence INTEGER PRIMARY KEY AUTOINCREMENT, ref TEXT);'
         'CREATE TABLE meta(key TEXT PRIMARY KEY, value);'
+        'CREATE TABLE index_skips(ref TEXT PRIMARY KEY) WITHOUT ROWID;'
+        'CREATE TABLE index_dirty(ref TEXT PRIMARY KEY) WITHOUT ROWID;'
         "CREATE VIRTUAL TABLE texts4 USING fts5(ref UNINDEXED, namespace UNINDEXED, title, transcript, summary, tokenize='unicode61');")
     if user_version >= 5:
         db.execute('CREATE TABLE tombstones(provider_hash TEXT PRIMARY KEY)')

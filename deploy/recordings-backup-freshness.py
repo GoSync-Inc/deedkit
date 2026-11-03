@@ -1,10 +1,12 @@
 #!/usr/bin/python3 -I
-"""Is the recordings archive backup verified recently, and is the archive still moving? (ANYM-728)
+"""Is the recordings archive backup recent, and is the archive still moving? (ANYM-728)
 
 Standard library only and read-only on the recordings verifier's directory: no lock, no docker, no network. It reads
-``last-success.json``, ``status.json`` and the newest ``proof-*.json`` there and prints one JSON line: the last verified
-success, its age, the last error code, the protected point's bytes and the archive identity (an opaque ID and three
-counters; no title, no text). With ``--state`` it also remembers the archive's counters and says
+``last-success.json``, the proof of exactly that verification (``proof-<verification_id>.json``, never a newer proof
+whose promotion failed) and ``last-failure.json``, and prints one JSON line: the last verified success, the snapshot
+age (from the bundle manifest's capture time, authenticated by the decrypting verifier and carried in the proof), the
+verification age, the last error code and time, the protected point's bytes and the archive identity (an opaque ID and
+three counters; no title, no text). With ``--state`` it also remembers the archive's counters and says
 ``unchanged_for_7_days`` once they have not moved for that long: an archive that is healthy but no longer collecting.
 The collector's own last success and error code are the recordings service's `POST /v1/archive_status`; this script
 never calls it (BACKUP.md, "Recordings archive: freshness").
@@ -18,6 +20,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 
@@ -65,18 +68,20 @@ def read_object(path):
     return data
 
 
-def newest_proof(directory):
-    """The newest proof's backup bytes and archive facts, or (None, None) when no proof is there."""
-    proofs = sorted(Path(directory).glob("proof-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not proofs:
-        return None, None
-    proof = read_object(proofs[0]) or {}
+def proof_of(directory, verification_id):
+    """(bytes, archive facts, capture time) of the proof of that verification; ValueError when it is not there."""
+    if not isinstance(verification_id, str) or not re.fullmatch("[a-f0-9]{32}", verification_id):
+        raise ValueError("last-success has no verification_id")
+    proof = read_object(Path(directory) / f"proof-{verification_id}.json")
+    if proof is None:
+        raise ValueError("the proof of the last success is missing")
     backup, verification = proof.get("backup"), proof.get("verification")
     size = backup.get("bytes") if isinstance(backup, dict) else None
     archive = verification.get("archive") if isinstance(verification, dict) else None
+    captured = verification.get("captured_at") if isinstance(verification, dict) else None
     if not isinstance(archive, dict) or set(archive) != set(ARCHIVE_KEYS):
         archive = None
-    return (size if type(size) is int else None), archive
+    return (size if type(size) is int else None), archive, captured
 
 
 def unchanged(state_path, archive, now):
@@ -109,28 +114,33 @@ def write_json(path, value, mode):
 
 
 def evaluate(directory, limit, now) -> tuple[int, dict]:
-    """(exit code, result dict)."""
+    """(exit code, result dict). The limit applies to the snapshot age."""
     base = Path(directory)
     if not base.is_dir():
         return UNKNOWN, {"status": "unknown", "reason": "no verifier directory"}
     try:
-        success, status = read_object(base / "last-success.json"), read_object(base / "status.json")
-        size, archive = newest_proof(base)
+        success, failure = read_object(base / "last-success.json"), read_object(base / "last-failure.json")
+        proof = proof_of(base, success.get("verification_id")) if success is not None else None
     except (ValueError, OSError) as exc:
         return UNKNOWN, {"status": "unknown", "reason": str(exc)[:60]}
-    result = {"max_age_hours": limit, "bytes": size, "archive": archive}
-    if isinstance(status, dict) and status.get("status") == "failed" and isinstance(status.get("error"), str):
-        result["last_error"] = status["error"][:64]
-    if success is None:
+    result = {"max_age_hours": limit, "bytes": None, "archive": None}
+    if failure is not None and isinstance(failure.get("error"), str):
+        result["last_error"] = failure["error"][:64]
+        result["last_error_at"] = failure.get("failed_at") if isinstance(failure.get("failed_at"), str) else None
+    if success is None or proof is None:
         return STALE, {**result, "status": "stale", "reason": "no verified success yet"}
-    verified = parse_time(success.get("verified_at"))
-    if verified is None:
-        return UNKNOWN, {**result, "status": "unknown", "reason": "verified_at cannot be parsed"}
-    seconds = (now - verified).total_seconds()
-    if seconds < -FUTURE_GRACE_SECONDS:
-        return UNKNOWN, {**result, "status": "unknown", "reason": "verified_at is in the future"}
-    result.update(verified_at=success["verified_at"], age_hours=round(max(seconds, 0) / 3600, 1))
-    if seconds > limit * 3600:
+    result["bytes"], result["archive"] = proof[0], proof[1]
+    verified, captured = parse_time(success.get("verified_at")), parse_time(proof[2])
+    if verified is None or captured is None:
+        return UNKNOWN, {**result, "status": "unknown", "reason": "verified_at or captured_at cannot be parsed"}
+    seen = {"verified_at": success["verified_at"], "captured_at": proof[2]}
+    snapshot_seconds = (now - captured).total_seconds()
+    verified_seconds = (now - verified).total_seconds()
+    if min(snapshot_seconds, verified_seconds) < -FUTURE_GRACE_SECONDS:
+        return UNKNOWN, {**result, **seen, "status": "unknown", "reason": "a recorded time lies in the future"}
+    result.update(seen, age_hours=round(max(snapshot_seconds, 0) / 3600, 1),
+                  verified_age_hours=round(max(verified_seconds, 0) / 3600, 1))
+    if snapshot_seconds > limit * 3600:
         return STALE, {**result, "status": "stale"}
     return FRESH, {**result, "status": "fresh"}
 

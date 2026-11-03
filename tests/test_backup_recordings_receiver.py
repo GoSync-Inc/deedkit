@@ -12,9 +12,10 @@ import pytest
 from messaging_service import backup_r2_receiver as r2
 from messaging_service import backup_recordings_continuity as cont
 from messaging_service.backup_recordings import create_recordings_snapshot
-from test_backup_r2_verifier import HEAD, NEW_IMAGE, follow_status, follower, instances, module, operator, pins  # noqa: F401  (fixtures)
+from test_backup_r2_verifier import HEAD, HostEngine, NEW_IMAGE, follow_status, follower, instances, module, operator, pins  # noqa: F401  (fixtures)
 
 TEXT = 'synthetic words about a synthetic meeting'
+CAPTURED = '2026-11-03T21:30:00+00:00'
 
 
 def rec(i, **changes):
@@ -148,6 +149,38 @@ def test_readback_searches_the_index_and_reads_the_context_of_a_synthetic_archiv
         cont.readback(broken)
 
 
+# spec: ANYM-728
+def test_a_readback_fails_when_the_text_survived_but_its_index_was_emptied(tmp_path):
+    import sqlite3
+    emptied = archive(tmp_path, [rec(1), rec(2)], 'emptied')
+    db = sqlite3.connect(emptied)
+    db.execute('DELETE FROM texts4')
+    db.commit()
+    db.close()
+    with pytest.raises(ValueError, match='readback_failed'):
+        cont.readback(emptied)
+    # A record the indexer skipped or has not reached yet is not a failure.
+    db = sqlite3.connect(emptied)
+    db.executemany('INSERT INTO index_skips VALUES(?)', [('r0001',), ('r0002',)])
+    db.commit()
+    db.close()
+    cont.readback(emptied)
+
+
+# spec: ANYM-728
+def test_record_identities_must_be_unambiguous_so_a_tombstone_authorizes_one_record(tmp_path):
+    facts = facts_of(tmp_path, [rec(1), rec(2)])
+    other = tomb(2)
+    ambiguous = {**facts, 'providers': [[facts['providers'][0][0], facts['providers'][0][1]], [facts['providers'][0][0], other],
+                                        facts['providers'][1]]}
+    for broken in (ambiguous,
+                   {**facts, 'providers': [facts['providers'][0], [facts['providers'][1][0], facts['providers'][0][1]]]},
+                   {**facts, 'providers': facts['providers'][:1]},
+                   {**facts, 'parts': [*facts['parts'], ['r9999', 'transcript', 1, 'a' * 64]]}):
+        with pytest.raises(ValueError, match='invalid_continuity'):
+            cont.validate_facts(broken)
+
+
 # --- the restore helper -------------------------------------------------------------------------------------------
 
 def sealed(tmp_path, records, name='bundle', **kwargs):
@@ -164,8 +197,9 @@ def test_the_restore_helper_gives_the_recordings_checks_and_the_continuity_file(
     work.mkdir()
     sha = hashlib.sha256((bundle / 'manifest.json').read_bytes()).hexdigest()
     result = worker.restore_recordings(bundle, sha, work)
+    captured = json.loads((bundle / 'manifest.json').read_text())['captured_at']
     assert result == {'v': 1, 'status': 'verified', 'profile': 'recordings', 'schema_version': 4, 'manifest_sha256': sha,
-                      'checks': {name: True for name in r2.RECORDINGS_CHECKS},
+                      'checks': {name: True for name in r2.RECORDINGS_CHECKS}, 'captured_at': captured,
                       'archive': {'archive_id': cont.SYNTHETIC_ARCHIVE_ID, 'incarnation': 1, 'sequence': 5, 'records': 2}}
     written = json.loads((work / 'continuity.json').read_text())
     assert cont.validate_facts(written) == written and len(written['parts']) == 4
@@ -248,7 +282,7 @@ def recordings_operator(operator, tmp_path):  # noqa: F811  (the imported fixtur
             out.write(json.dumps(facts, separators=(',', ':')))
         return {'v': 1, 'status': 'verified', 'profile': 'recordings', 'schema_version': 4,
                 'manifest_sha256': receipt['wire']['snapshot_sha256'], 'checks': {k: True for k in r2.RECORDINGS_CHECKS},
-                'archive': facts['archive']}
+                'archive': facts['archive'], 'captured_at': CAPTURED}
     engine.restore = recordings_restore
     return v, config, receiver, cloud, engine, write_json
 
@@ -310,7 +344,69 @@ def test_an_emptied_archive_never_replaces_the_protected_point_and_the_baseline_
     assert status(config)['error'] == 'archive_content_lost'
     assert Path(config['protected_file']).read_bytes() == marker
     assert (Path(config['directory']) / 'continuity.json').read_bytes() == baseline
-    assert json.loads(baseline)['parts'] and 'synthetic words' not in baseline.decode()
+    assert json.loads(baseline)['facts']['parts'] and 'synthetic words' not in baseline.decode()
+
+
+# spec: ANYM-728
+def test_a_failed_journal_write_after_the_proof_is_ready_keeps_the_facts_and_the_retry_adopts_them(recordings_operator, monkeypatch):
+    from test_backup_r2 import receive, THIRD
+    v, config, receiver, cloud, engine, _ = recordings_operator
+    v.run(config, client=cloud, engine=engine)
+    receive(receiver, cloud, bid=THIRD)
+    engine.records = [rec(1), rec(2), rec(3)]
+    original = v.local.write_maintenance_json
+
+    def crashing(name, value, **kw):
+        original(name, value, **kw)
+        if name == 'active.json' and value.get('phase') == 'proof_ready':
+            raise OSError('synthetic directory fsync failure')
+    monkeypatch.setattr(v.local, 'write_maintenance_json', crashing)
+    with pytest.raises(OSError, match='synthetic'):
+        v.run(config, client=cloud, engine=engine)
+    monkeypatch.setattr(v.local, 'write_maintenance_json', original)
+    assert len(list(Path(config['directory']).glob('continuity-*.json'))) == 1  # the durable journal says proof_ready
+    assert v.run(config, client=cloud, engine=engine)['backup_id'] == THIRD
+    baseline = json.loads((Path(config['directory']) / 'continuity.json').read_text())
+    assert len(baseline['facts']['providers']) == 3 and not list(Path(config['directory']).glob('continuity-*.json'))
+    # The protected point and its baseline moved together: a later candidate that lost a newly protected part is refused.
+    receive(receiver, cloud, bid='20261016T111703Z-2123456789abcdef')
+    engine.records = [rec(1), rec(2), rec(5)]
+    with pytest.raises(RuntimeError, match='archive_content_lost'):
+        v.run(config, client=cloud, engine=engine)
+
+
+# spec: ANYM-728
+def test_the_rebaseline_reason_survives_a_crash_after_adoption(recordings_operator, monkeypatch):
+    from test_backup_r2 import receive, THIRD
+    v, config, receiver, cloud, engine, _ = recordings_operator
+    v.run(config, client=cloud, engine=engine)
+    receive(receiver, cloud, bid=THIRD)
+    engine.options = {'archive_id': 'arch-fresh-0003'}
+    reason = 'owner re-initialized the archive'
+    assert v.request_rebaseline(config, reason)['status'] == 'rebaseline_requested'
+    original = v.record_verified
+    calls = []
+
+    def crashing(*args, **kw):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError('synthetic crash before the success record')
+        return original(*args, **kw)
+    monkeypatch.setattr(v, 'record_verified', crashing)
+    with pytest.raises(OSError, match='synthetic'):
+        v.run(config, client=cloud, engine=engine)
+    baseline = json.loads((Path(config['directory']) / 'continuity.json').read_text())
+    assert baseline['rebaselined'] == reason and not (Path(config['directory']) / 'rebaseline.json').exists()
+    assert v.run(config, client=cloud, engine=engine)['rebaselined'] == reason
+    assert json.loads((Path(config['directory']) / 'last-success.json').read_text())['rebaselined'] == reason
+
+
+# spec: ANYM-728
+def test_adoption_without_pending_or_adopted_facts_fails_closed(recordings_operator):
+    v, config, *_ = recordings_operator
+    with v.verifier_lock(config['directory']) as fd:
+        with pytest.raises(ValueError, match='continuity_unresolved'):
+            v.adopt_continuity(fd, 'a' * 32)
 
 
 # spec: ANYM-728
@@ -333,7 +429,7 @@ def test_a_new_archive_is_refused_until_the_operator_rebaselines_with_a_reason(r
     result = v.run(config, client=cloud, engine=engine)
     assert result['status'] == 'verified' and result['rebaselined'] == 'owner re-initialized the archive'
     assert not (Path(config['directory']) / 'rebaseline.json').exists()
-    assert json.loads((Path(config['directory']) / 'continuity.json').read_text())['archive']['archive_id'] == 'arch-fresh-0003'
+    assert json.loads((Path(config['directory']) / 'continuity.json').read_text())['facts']['archive']['archive_id'] == 'arch-fresh-0003'
 
 
 # spec: ANYM-728
@@ -356,7 +452,7 @@ def test_deletion_with_a_tombstone_rotates_and_the_tombstone_joins_the_baseline(
     engine.records = [rec(2)]
     engine.options = {'tombstones': [tomb(1)], 'user_version': 5, 'events': 3}
     assert v.run(config, client=cloud, engine=engine)['backup_id'] == THIRD
-    assert json.loads((Path(config['directory']) / 'continuity.json').read_text())['tombstones'] == [tomb(1)]
+    assert json.loads((Path(config['directory']) / 'continuity.json').read_text())['facts']['tombstones'] == [tomb(1)]
 
 
 # spec: ANYM-728
@@ -367,7 +463,7 @@ def test_proofs_are_bound_to_their_profile_and_the_recordings_checks_never_mix()
                         'received_at': '2026-10-16T09:17:03+00:00'}}
     archive_facts = {'archive_id': 'arch-x', 'incarnation': 1, 'sequence': 3, 'records': 2}
     facts = {'v': 1, 'status': 'verified', 'profile': 'recordings', 'schema_version': 4, 'manifest_sha256': 'b' * 64,
-             'checks': {k: True for k in r2.RECORDINGS_CHECKS}, 'archive': archive_facts}
+             'checks': {k: True for k in r2.RECORDINGS_CHECKS}, 'archive': archive_facts, 'captured_at': CAPTURED}
     proof = v.make_proof(receipt, facts, 'c' * 32, 'recordings')
     assert r2.validate_proof(proof, receipt, 'recordings')
     for other in ('messaging', 'calendar'):
@@ -377,7 +473,8 @@ def test_proofs_are_bound_to_their_profile_and_the_recordings_checks_never_mix()
         v.make_proof(receipt, facts, 'c' * 32)
     for bad in ({'checks': {k: True for k in r2.CHECKS}}, {'checks': {k: True for k in r2.RECORDINGS_CHECKS | r2.CHECKS}},
                 {'archive': {**archive_facts, 'text': 'x'}}, {'archive': {**archive_facts, 'incarnation': 0}},
-                {'archive': {**archive_facts, 'archive_id': 'bad id'}}, {'schema_version': 6}):
+                {'archive': {**archive_facts, 'archive_id': 'bad id'}}, {'schema_version': 6},
+                {'captured_at': 'yesterday'}, {'captured_at': '2026-11-03T21:30:00'}):
         with pytest.raises(ValueError, match='invalid_helper_result'):
             v.make_proof(receipt, {**facts, **bad}, 'c' * 32, 'recordings')
     stripped = {**proof, 'verification': {k: v_ for k, v_ in proof['verification'].items() if k != 'archive'}}
@@ -457,7 +554,8 @@ def recordings_instance(operator, tmp_path):  # noqa: F811  (the imported fixtur
     write_json(control / 'credentials.json', {'access_key_id': 'e' * 32, 'secret_access_key': 'f' * 64})
     own = {**receiver, 'state_directory': str(tmp_path / 'rec-state'), 'credentials_file': str(control / 'credentials.json'),
            'prefix': 'recordings'}
-    receive(own, Cloud())
+    own_cloud = Cloud()
+    receive(own, own_cloud)
     write_json(control / 'receiver.json', {**own, 'profile': 'recordings'})
     identity = control / 'identity'
     identity.write_text('SYNTHETIC_NOT_A_KEY')
@@ -469,13 +567,13 @@ def recordings_instance(operator, tmp_path):  # noqa: F811  (the imported fixtur
     write_json(path, recordings)
     messaging = Path(config['receiver_config_file']).parent / 'verifier.json'
     write_json(messaging, config)
-    return path, recordings, messaging, write_json
+    return path, recordings, messaging, write_json, own_cloud
 
 
 # spec: ANYM-728
 def test_the_pin_step_moves_messaging_calendar_and_recordings_pins_together(pins, recordings_instance):  # noqa: F811  (the imported fixture)
     s = pins
-    path, _, _, write_json = recordings_instance
+    path, _, _, write_json, _ = recordings_instance
     s.paths = [*s.paths, path]
     write_json(s.v.INSTANCES_FILE, {'v': 1, 'verifier_configs': [str(p) for p in s.paths]})
     assert s.update()['status'] == 'pinned'
@@ -486,7 +584,7 @@ def test_the_pin_step_moves_messaging_calendar_and_recordings_pins_together(pins
 # spec: ANYM-728
 def test_a_recordings_only_helper_failure_holds_every_pin_with_one_fixed_code(pins, recordings_instance):  # noqa: F811  (the imported fixture)
     s = pins
-    path, _, _, write_json = recordings_instance
+    path, _, _, write_json, _ = recordings_instance
     s.paths = [*s.paths, path]
     write_json(s.v.INSTANCES_FILE, {'v': 1, 'verifier_configs': [str(p) for p in s.paths]})
     before = [p.read_bytes() for p in s.paths]
@@ -500,7 +598,7 @@ def test_a_recordings_only_helper_failure_holds_every_pin_with_one_fixed_code(pi
 # spec: ANYM-728
 def test_follow_holds_only_the_shared_pin_move_for_a_recordings_failure_and_moves_all_pins_after(follower, recordings_instance):  # noqa: F811  (the imported fixture)
     s = follower
-    path, _, messaging, write_json = recordings_instance
+    path, _, messaging, write_json, _ = recordings_instance
     write_json(s.v.INSTANCES_FILE, {'v': 1, 'verifier_configs': [str(messaging), str(path)]})
     before = [p.read_bytes() for p in (messaging, path)]
     s.calendar_failure = RuntimeError('old helper cannot read a recordings bundle')
@@ -534,3 +632,59 @@ def test_the_follow_fixture_makes_a_bundle_the_recordings_helper_accepts(tmp_pat
     work = tmp_path / 'work'
     work.mkdir()
     assert worker.restore_recordings(snapshot, 'a' * 64, work)['checks'] == {name: True for name in r2.RECORDINGS_CHECKS}
+
+
+# --- one host, three profiles: failures stay in their own instance -----------------------------------------------------
+
+@pytest.fixture
+def trio(instances, recordings_instance, tmp_path):  # noqa: F811  (the imported fixtures)
+    path, recordings, _, _, cloud = recordings_instance
+
+    class Engine(HostEngine):
+        records = [rec(1), rec(2)]
+
+        def restore(self, config, receiver, client, receipt, run, payload, secret_dir):
+            facts = super().restore(config, receiver, client, receipt, run, payload, secret_dir)
+            if r2.profile(config) != 'recordings':
+                return facts
+            found = cont.archive_facts(cont.synthetic_archive(tmp_path / f'trio-{run}.sqlite', self.records))
+            descriptor = os.open(payload / 'continuity.json', os.O_WRONLY | os.O_CREAT, 0o600)
+            with os.fdopen(descriptor, 'w') as out:
+                out.write(json.dumps(found, separators=(',', ':')))
+            return {'v': 1, 'status': 'verified', 'profile': 'recordings', 'schema_version': 4,
+                    'manifest_sha256': receipt['wire']['snapshot_sha256'], 'checks': {k: True for k in r2.RECORDINGS_CHECKS},
+                    'archive': found['archive'], 'captured_at': CAPTURED}
+    instances.engine = Engine(instances.v, instances.engine.root, instances.host)
+    instances.recordings = recordings
+    instances.recordings_cloud = cloud
+    return instances
+
+
+# spec: ANYM-728
+def test_a_recordings_refusal_never_fails_or_rotates_messaging_or_calendar_and_the_reverse(trio):
+    from test_backup_r2 import receive, THIRD
+    s = trio
+    v = s.v
+    runs = ((s.messaging, s.cloud), (s.calendar, s.calendar_cloud), (s.recordings, s.recordings_cloud))
+    for config, cloud in runs:
+        assert v.run(config, client=cloud, engine=s.engine)['status'] == 'verified'
+    markers = [Path(config['protected_file']).read_bytes() for config, _ in runs]
+    for config, cloud in runs:
+        receive(r2.load_config(config['receiver_config_file']), cloud, bid=THIRD)
+    s.engine.records = [rec(1, transcript=''), rec(2, summary='')]
+    with pytest.raises(RuntimeError, match='archive_content_lost'):
+        v.run(s.recordings, client=s.recordings_cloud, engine=s.engine)
+    assert Path(s.recordings['protected_file']).read_bytes() == markers[2]
+    for index, (config, cloud) in enumerate(runs[:2]):
+        assert v.run(config, client=cloud, engine=s.engine)['backup_id'] == THIRD
+        assert Path(config['protected_file']).read_bytes() != markers[index]
+    # The reverse: a messaging failure on the next candidate does not touch the recordings point, which then rotates.
+    receive(r2.load_config(s.messaging['receiver_config_file']), s.cloud, bid='20261016T111703Z-2123456789abcdef')
+    messaging_marker = Path(s.messaging['protected_file']).read_bytes()
+    s.engine.failure = RuntimeError('restore_docker_failed')
+    with pytest.raises(RuntimeError, match='restore_docker_failed'):
+        v.run(s.messaging, client=s.cloud, engine=s.engine)
+    s.engine.failure = None
+    s.engine.records = [rec(1), rec(2), rec(3)]
+    assert Path(s.messaging['protected_file']).read_bytes() == messaging_marker
+    assert v.run(s.recordings, client=s.recordings_cloud, engine=s.engine)['backup_id'] == THIRD

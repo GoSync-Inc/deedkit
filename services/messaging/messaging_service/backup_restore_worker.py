@@ -239,7 +239,8 @@ def restore_recordings(restored,manifest_sha,work):
     write_exclusive(work/'continuity.json',encoded(facts))
     fsync_dir(work)
     return {'v':1,'status':'verified','profile':'recordings','schema_version':manifest['user_version'],
-            'manifest_sha256':manifest_sha,'checks':{name:True for name in RECORDINGS_CHECKS},'archive':manifest['archive']}
+            'manifest_sha256':manifest_sha,'checks':{name:True for name in RECORDINGS_CHECKS},'archive':manifest['archive'],
+            'captured_at':manifest['captured_at']}
 
 
 def run(config, source=None):

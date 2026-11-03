@@ -211,6 +211,26 @@ def test_follow_self_test_restores_a_synthetic_calendar_bundle_made_by_the_image
     finally:shutil.rmtree(root)
 
 
+# spec: ANYM-728
+def test_follow_self_test_restores_a_synthetic_recordings_bundle_made_by_the_image_under_test():
+    # The pin step's proof of a helper for the recordings instance: the image builds, seals and encrypts a synthetic
+    # archive, and the same image reads it back in place (no restore of a database), against the image CI built.
+    from messaging_service import backup_r2_follow as follow
+    parent=Path('/root/deedkit-backup-native-tests');parent.mkdir(mode=0o700,exist_ok=True)
+    root=parent/secrets.token_hex(16);root.mkdir(mode=0o700)
+    engine=follow.Docker(900)
+    config={'directory':str(root),'helper_image':IMAGE,'helper_revision':REVISION,'postgres_image':verifier.POSTGRES_IMAGE,
+            'identity_file':'/never/mounted/by/the/self-test','profile':'recordings'}
+    try:
+        engine.preflight(config)
+        schemas,version=follow.self_test(engine,config)
+        assert schemas==[verifier.SCHEMAS[0],verifier.SCHEMAS[-1]] and version==4
+        assert list(root.iterdir())==[]
+        leftover=engine.command('container','ls','-a','--filter','label='+verifier.LABEL+'.owned=1','--format','{{.Names}}')
+        assert not [n for n in leftover.decode().split() if '-recordings-' in n]
+    finally:shutil.rmtree(root)
+
+
 CALENDAR_FIXTURE_SCRIPT=r'''
 import hashlib,os
 from pathlib import Path

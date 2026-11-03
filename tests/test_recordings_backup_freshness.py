@@ -21,16 +21,23 @@ def stamp(at):
     return at.strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
-def verifier(tmp_path, *, verified=NOW - timedelta(hours=3), status=None, archive=ARCHIVE, proof=True):
+RUN = 'a' * 32
+
+
+def verifier(tmp_path, *, verified=NOW - timedelta(hours=3), captured=None, status=None, archive=ARCHIVE, proof=True, failure=None):
     directory = tmp_path / 'verifier'
     directory.mkdir(parents=True, exist_ok=True)
     if verified is not None:
-        (directory / 'last-success.json').write_text(json.dumps({'v': 1, 'status': 'verified', 'verified_at': stamp(verified)}))
+        (directory / 'last-success.json').write_text(json.dumps({'v': 1, 'status': 'verified', 'verification_id': RUN,
+                                                                 'verified_at': stamp(verified)}))
     if status is not None:
         (directory / 'status.json').write_text(json.dumps(status))
+    if failure is not None:
+        (directory / 'last-failure.json').write_text(json.dumps(failure))
     if proof:
-        (directory / 'proof-a.json').write_text(json.dumps({'backup': {'bytes': 4096},
-                                                            'verification': {'archive': archive}}))
+        taken = captured or (verified or NOW) - timedelta(hours=2)
+        (directory / f'proof-{RUN}.json').write_text(json.dumps({'backup': {'bytes': 4096}, 'verification': {
+            'archive': archive, 'captured_at': stamp(taken)}}))
     return directory
 
 
@@ -42,18 +49,37 @@ def check(tmp_path, *args, now=NOW, **kwargs):
 
 
 # spec: ANYM-728
-def test_a_recent_verified_success_is_fresh_and_shows_bytes_and_identity(tmp_path):
+def test_a_recent_verified_success_is_fresh_and_shows_bytes_identity_and_the_snapshot_age(tmp_path):
     code, line = check(tmp_path)
-    assert code == 0 and line['status'] == 'fresh' and line['age_hours'] == 3.0
+    assert code == 0 and line['status'] == 'fresh' and line['verified_age_hours'] == 3.0 and line['age_hours'] == 5.0
     assert line['bytes'] == 4096 and line['archive'] == ARCHIVE and 'last_error' not in line
 
 
 # spec: ANYM-728
-def test_an_old_or_missing_success_is_stale_and_the_last_error_code_is_shown(tmp_path):
-    code, line = check(tmp_path, verified=NOW - timedelta(hours=31), status={'status': 'failed', 'error': 'archive_content_lost'})
-    assert code == 4 and line['status'] == 'stale' and line['last_error'] == 'archive_content_lost'
-    code, line = check(tmp_path / 'none', verified=None, proof=False)
-    assert code == 4 and line['reason'] == 'no verified success yet'
+def test_a_delayed_old_snapshot_is_stale_even_right_after_its_verification(tmp_path):
+    code, line = check(tmp_path, verified=NOW - timedelta(minutes=5), captured=NOW - timedelta(hours=40))
+    assert code == 4 and line['status'] == 'stale' and line['age_hours'] == 40.0 and line['verified_age_hours'] == 0.1
+
+
+# spec: ANYM-728
+def test_the_evidence_is_the_proof_of_the_last_success_not_a_newer_proof_of_a_failed_promotion(tmp_path):
+    directory = verifier(tmp_path)
+    newer = {**ARCHIVE, 'sequence': 999}
+    (directory / ('proof-' + 'b' * 32 + '.json')).write_text(json.dumps({'backup': {'bytes': 1}, 'verification': {
+        'archive': newer, 'captured_at': stamp(NOW)}}))
+    lines = []
+    assert load().run(['--verifier-directory', str(directory), '--max-age-hours', '30'], now=NOW, out=lines.append) == 0
+    assert json.loads(lines[0])['archive'] == ARCHIVE and json.loads(lines[0])['bytes'] == 4096
+
+
+# spec: ANYM-728
+def test_the_last_error_code_survives_an_idle_tick_and_a_missing_success_is_stale(tmp_path):
+    failure = {'v': 1, 'status': 'failed', 'error': 'archive_content_lost', 'failed_at': stamp(NOW - timedelta(hours=1))}
+    idle = {'v': 1, 'status': 'idle', 'checked_at': stamp(NOW)}
+    code, line = check(tmp_path, status=idle, failure=failure)
+    assert code == 0 and line['last_error'] == 'archive_content_lost' and line['last_error_at'] == failure['failed_at']
+    code, line = check(tmp_path / 'none', verified=None, proof=False, failure=failure)
+    assert code == 4 and line['reason'] == 'no verified success yet' and line['last_error'] == 'archive_content_lost'
 
 
 # spec: ANYM-728
@@ -63,6 +89,7 @@ def test_unreadable_input_is_unknown_not_fresh(tmp_path):
     (directory / 'last-success.json').write_text('{broken')
     assert load().run(['--verifier-directory', str(directory), '--max-age-hours', '30'], now=NOW, out=lambda _: None) == 5
     assert check(tmp_path / 'future', verified=NOW + timedelta(hours=2))[0] == 5
+    assert check(tmp_path / 'noproof', proof=False)[0] == 5
 
 
 # spec: ANYM-728

@@ -608,9 +608,10 @@ leaves the freshness clock alone, so the catch-up timer decides.
 
 `deploy/recordings-backup-freshness.py --verifier-directory /var/lib/deedkit-recordings-backup-r2/verification
 --max-age-hours 30 --state /var/lib/deedkit-recordings-backup-r2/freshness-state.json` is read-only on the verifier
-directory and prints one JSON line: `status` (`fresh`, `stale`, `unknown`), the last verified success and its age
-(the snapshot age; the daily run is verified within hours), `last_error` (the verifier's last failure code, for example
-`archive_content_lost`), `bytes` of the protected point, the archive identity (`archive_id`, `incarnation`,
+directory and prints one JSON line: `status` (`fresh`, `stale`, `unknown`), the last verified success and its ages
+(`age_hours` is the snapshot age from the manifest's capture time, `verified_age_hours` the verification's), read from
+the proof of exactly that verification, `last_error` and `last_error_at` (the verifier's last failure, for example
+`archive_content_lost`, kept across idle ticks), `bytes` of the protected point, the archive identity (`archive_id`, `incarnation`,
 `sequence`, `records`; no title, no text) and `unchanged_days` with the hint `unchanged_for_7_days` when the counters
 have not moved for a week, which means a healthy archive that stopped collecting. Exit 0 fresh, 4 stale, 5 unknown.
 The collector's own last success and error are the recordings service's `POST /v1/archive_status` (read scope); the

@@ -567,16 +567,19 @@ checks hold; each failure has its own code in `status.json`:
 | `archive_integrity`: SQLite `integrity_check`, application ID, identity equals the manifest's | `restore_archive_failed` |
 | `schema_version`: `user_version` 1-5 (a newer archive than the helper is refused) | `restore_schema_failed` |
 | `identity`: one `archive_id` and one `incarnation` in `meta` | `restore_archive_failed` |
-| `search_readback`: the full-text index answers a synthetic query and the newest records' parts read back | `restore_readback_failed` |
+| `search_readback`: the full-text index answers a synthetic query, and for the newest records holding text (not skipped or awaiting the indexer) it has their row and finds one of their own words for that record | `restore_readback_failed` |
 
-The proof names `profile: recordings` and the archive's identity (`archive_id`, `incarnation`, `sequence`,
-`records`); `protect` and `rotate` accept on a recordings receiver only that proof with exactly these checks.
+The proof names `profile: recordings`, the archive's identity (`archive_id`, `incarnation`, `sequence`,
+`records`) and the bundle's `captured_at` (the snapshot's time); `protect` and `rotate` accept on a recordings receiver only that proof with exactly these checks.
 
 Continuity (zero tolerance, no percentage). A healthy SQLite file can still be an emptied or re-created archive, so
 the helper also writes `continuity.json` into the verifier's scratch: hashes only, namely `(ref, part, revision,
 SHA-256 of the part text)` for every non-empty transcript and summary, `(ref, provider-ID hash)`, the tombstone
-hashes and the identity. The verifier compares it with the baseline it keeps beside its proofs
-(`<verifier directory>/continuity.json`, root `0600`, hashes only, replaced only after the protected point moved):
+hashes and the identity. The host validates it before use: one provider hash per ref and one ref per hash, every
+part's ref is a record, and the record count is the archive's. The verifier compares it with the baseline it keeps beside its proofs
+(`<verifier directory>/continuity.json`, root `0600`, hashes only, written only after the protected point moved and
+bound to the run whose proof was promoted; a crash between the two is resumed by the retry, and facts that are neither
+pending nor adopted fail closed with `continuity_unresolved`):
 
 | Refusal (status code) | When |
 |---|---|
@@ -601,6 +604,10 @@ Scratch. The verifier decrypts into `payload-<run>` (0700, root) in its director
 archive's plaintext, including other people's speech, for the verification only. It is removed after success,
 after a failure, and at the start of any retry or restart (`status.json` says `cleanup_complete`). Nothing else
 holds the plaintext (docs/DATA-POLICY.md).
+
+The recordings instance still starts the throwaway PostgreSQL container and network of every instance (unused: the
+helper reads the archive in place), and the follow's fixture container is not read-only; both are shared helper code
+and unchanged here.
 
 Helper updates. The follow and the pin step self-test the recordings profile on a synthetic archive of the image
 under test, together with the other profiles; a helper that cannot read the recordings bundle holds the shared pin

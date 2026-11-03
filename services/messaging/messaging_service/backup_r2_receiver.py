@@ -69,6 +69,14 @@ def valid_archive(value):
             count(value['incarnation'], 1) and count(value['sequence']) and count(value['records']))
 
 
+def valid_instant(value):
+    """A timezone-aware ISO 8601 time of at most 64 characters (the bundle manifest's `captured_at`)."""
+    try:
+        return isinstance(value, str) and len(value) <= 64 and datetime.fromisoformat(value).utcoffset() is not None
+    except ValueError:
+        return False
+
+
 def valid_warnings(value):
     """A calendar proof's copied vault warnings: a short list of {kind, name} labels, never a value."""
     return (isinstance(value, list) and len(value) <= MAX_WARNINGS and
@@ -928,7 +936,7 @@ def validate_proof(proof, receipt, expected='messaging'):
     if expected == 'calendar':
         keys, checks = keys | {'profile', 'vault_warnings'}, CALENDAR_CHECKS
     elif expected == 'recordings':
-        keys, checks = keys | {'profile', 'archive'}, RECORDINGS_CHECKS
+        keys, checks = keys | {'profile', 'archive', 'captured_at'}, RECORDINGS_CHECKS
     if not isinstance(candidate, dict) or set(candidate) != {'id', 'bytes', 'sha256', 'snapshot_sha256'}:
         raise ValueError('invalid_restore_proof')
     new = {key: candidate[key] for key in ('id', 'bytes', 'sha256')}
@@ -943,7 +951,8 @@ def validate_proof(proof, receipt, expected='messaging'):
             not isinstance(verification['checks'], dict) or set(verification['checks']) != checks or
             any(value is not True for value in verification['checks'].values()) or
             (expected == 'calendar' and not valid_warnings(verification['vault_warnings'])) or
-            (expected == 'recordings' and not valid_archive(verification['archive']))):
+            (expected == 'recordings' and not (valid_archive(verification['archive']) and
+                                               valid_instant(verification['captured_at'])))):
         raise ValueError('independent_restore_proof_required')
     if receipt is None or any(receipt['wire'].get(key) != value for key, value in candidate.items()):
         raise ValueError('candidate_receipt_mismatch')
