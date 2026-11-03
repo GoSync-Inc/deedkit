@@ -182,8 +182,8 @@ def test_entity_count_boundary(count, expected):
     assert reason == expected
 
 
-# spec: ANYM-737
 # The sender counts its root in the 32-level cap, so 31 nested spans are the most it accepts.
+# spec: ANYM-737
 @pytest.mark.parametrize('depth,expected', [(31, None), (32, 'not_reproducible')])
 def test_nesting_boundary(depth, expected):
     body = 'x' * (depth + 1)
