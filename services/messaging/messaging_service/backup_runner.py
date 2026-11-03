@@ -30,7 +30,9 @@ SAFE_ERRORS={'backup_capture_failed','backup_capture_timeout','backup_container_
     'backup_delivery_failed','invalid_backup_receipt','local_backup_corrupt','receiver_quota','receiver_disk_reserve',
     'receiver_busy','backup_id_conflict','docker_inspection_failed','docker_operation_failed',
     'backup_fence_release_failed','backup_capture_unfenced','backup_fence_retained',
-    'collector_missing_during_resume','collector_identity_changed','collector_missing_during_stop','host_lock_busy'}
+    'collector_missing_during_resume','collector_identity_changed','collector_missing_during_stop','host_lock_busy',
+    'recordings_snapshot_absent','recordings_snapshot_empty','recordings_snapshot_unsafe','recordings_snapshot_corrupt',
+    'recordings_snapshot_foreign','recordings_schema_unsupported','recordings_identity_missing'}
 # The receiver's own verifier holds its upload lock for a whole restore (about an hour). A delivery it refuses as busy
 # before it stores anything (stream_v2: before the stream started) is offered again, same backup ID, every
 # BUSY_RETRY_SECONDS while the bound since the first offer allows; each offer keeps its upload timeout.
@@ -43,6 +45,7 @@ HOST_LOCK_POLL_SECONDS=5
 # Each wait for a worker container runs `docker container inspect` once per poll (ANYM-635).
 POLL_SECONDS=1.0
 CALENDAR_WORKER='deedkit-calendar-backup-'
+RECORDINGS_WORKER='deedkit-recordings-backup-'
 
 
 def read_json(path,limit=65536):
@@ -101,11 +104,49 @@ def calendar_config(cfg):
     return cfg
 
 
+def nested(a,b):
+    """True when one path is the other or lies inside it."""
+    a,b=Path(a),Path(b)
+    return a==b or a in b.parents or b in a.parents
+
+
+def recordings_config(cfg):
+    """`profile: recordings` (ANYM-714): one staged archive snapshot, no database and no network, messaging's lock."""
+    if set(cfg)-{'delivery_mode','busy_wait_seconds'}!={'profile','directory','project','image','recipient_file',
+                  'transfer','timeout_seconds','keep_local','host_lock','recordings'}:raise ValueError('invalid_backup_config')
+    if cfg.get('delivery_mode','staged_v1')!='staged_v1':raise ValueError('invalid_backup_config')
+    if not isinstance(cfg['project'],str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,128}',cfg['project']):
+        raise ValueError('invalid_backup_config')
+    if not isinstance(cfg['image'],str) or not re.fullmatch(r'[a-zA-Z0-9_./:@-]{1,256}',cfg['image']):
+        raise ValueError('invalid_backup_config')
+    for key in ('directory','recipient_file','host_lock'):
+        if not isinstance(cfg[key],str) or not path_valid(cfg[key]):raise ValueError('invalid_backup_path')
+    if Path(cfg['host_lock'])==Path(cfg['directory'])/'.runner.lock':raise ValueError('invalid_backup_path')
+    own=cfg['recordings']
+    if not isinstance(own,dict) or set(own)!={'staging_directory','state_directory','capture_timeout_seconds'}:
+        raise ValueError('invalid_backup_config')
+    for key in ('staging_directory','state_directory'):
+        if not isinstance(own[key],str) or not path_valid(own[key]):raise ValueError('invalid_backup_path')
+    # The runner empties the staging directory: it must be nothing else's (not the runner root, its lock, or state).
+    staging,state=own['staging_directory'],own['state_directory']
+    if (nested(staging,state) or nested(staging,cfg['directory']) or nested(state,cfg['directory']) or
+        nested(staging,cfg['host_lock']) or nested(state,cfg['host_lock'])):raise ValueError('invalid_backup_path')
+    if not transfer_valid(cfg['transfer']):raise ValueError('invalid_backup_transfer')
+    if type(cfg['timeout_seconds']) is not int or not 60<=cfg['timeout_seconds']<=7200:raise ValueError('invalid_backup_timeout')
+    if type(own['capture_timeout_seconds']) is not int or not 60<=own['capture_timeout_seconds']<=7200:
+        raise ValueError('invalid_backup_timeout')
+    if type(cfg.get('busy_wait_seconds',0)) is not int or not 0<=cfg.get('busy_wait_seconds',0)<=7200:
+        raise ValueError('invalid_backup_timeout')
+    if type(cfg['keep_local']) is not int or not 1<=cfg['keep_local']<=24:raise ValueError('invalid_backup_retention')
+    return cfg
+
+
 def config(path):
     cfg=read_json(path)
-    if not isinstance(cfg,dict) or cfg.get('profile','messaging') not in ('messaging','calendar'):
+    if not isinstance(cfg,dict) or cfg.get('profile','messaging') not in ('messaging','calendar','recordings'):
         raise ValueError('invalid_backup_config')
     if cfg.get('profile')=='calendar':return calendar_config(cfg)
+    if cfg.get('profile')=='recordings':return recordings_config(cfg)
     if set(cfg)-{'profile','delivery_mode','busy_wait_seconds','dump_timeout_seconds'}!={'directory','project','network','image','files_volume','dsn_file','recipient_file',
                   'mounts','recovery','transfer','timeout_seconds','keep_local'}:raise ValueError('invalid_backup_config')
     if cfg.get('delivery_mode','staged_v1') not in ('staged_v1','stream_v2'):raise ValueError('invalid_backup_config')
@@ -344,17 +385,25 @@ class Runner:
         if self.root.is_symlink() or self.root.stat().st_mode&0o077:raise ValueError('private_backup_directory_required')
         self.journal_path=self.root/'journal.json';self.status_path=self.root/'status.json'
         self.docker=docker or Docker();self.clock=clock;self.sleep=sleep;self.send=send;self.stream_send=stream_send;self.journal=None
-        self.calendar=cfg.get('profile')=='calendar'
-        # The calendar delivers to the R2 receiver, which takes only the v2 wire (ANYM-607).
-        if send is None:self.send=upload_file_v2 if self.calendar else upload
-        # Exists from before the calendar worker is created until it is verified stopped: a deploy refuses while it
+        self.calendar=cfg.get('profile')=='calendar';self.recordings=cfg.get('profile')=='recordings'
+        # Both own no application container, open no fence and take the host lock; each names only its own worker.
+        self.hostless=self.calendar or self.recordings
+        self.worker_prefix=RECORDINGS_WORKER if self.recordings else CALENDAR_WORKER
+        # The calendar and recordings deliver to the R2 receiver, which takes only the v2 wire (ANYM-607).
+        if send is None:self.send=upload_file_v2 if self.hostless else upload
+        # Exists from before the worker is created until it is verified stopped: a deploy refuses while the calendar's
         # exists (production.py), also after this process died or failed its recovery and released the locks.
         self.unsettled_path=Path(cfg['host_lock']+'.unsettled') if self.calendar else None
+        if self.recordings:
+            state=Path(cfg['recordings']['state_directory']);state.mkdir(mode=0o700,exist_ok=True)
+            if state.is_symlink() or state.stat().st_mode&0o077:raise ValueError('private_backup_directory_required')
+            self.unsettled_path=state/'.unsettled'
+            self.staging_root=Path(cfg['recordings']['staging_directory'])
     def save(self):write_json(self.journal_path,self.journal)
     def settle(self,container):
         """Remove the unsettled marker once `container` (this profile's own worker) is absent or stopped."""
-        if not self.calendar or not os.path.lexists(self.unsettled_path):return
-        if not container.startswith(CALENDAR_WORKER):raise RuntimeError('backup_container_mismatch')
+        if not self.hostless or not os.path.lexists(self.unsettled_path):return
+        if not container.startswith(self.worker_prefix):raise RuntimeError('backup_container_mismatch')
         info=self.docker.inspect(container)
         if info is not None and info['State']['Running']:raise RuntimeError('backup_shutdown_unverified')
         self.unsettled_path.unlink()
@@ -362,7 +411,7 @@ class Runner:
         self.journal=read_json(self.journal_path)
         if not ID.fullmatch(self.journal['id']):raise ValueError('invalid_backup_journal')
         # A calendar job names only its own worker: never an application container to stop, start or remove.
-        if self.calendar and (self.journal['stopped'] or self.journal['container']!=CALENDAR_WORKER+self.journal['id'].lower()):
+        if self.hostless and (self.journal['stopped'] or self.journal['container']!=self.worker_prefix+self.journal['id'].lower()):
             raise ValueError('invalid_backup_journal')
     def deliver(self,send,sent=lambda:False):
         """`send()`, offered again while the receiver answers busy and `sent()` says the stream has not started; a new
@@ -411,10 +460,23 @@ class Runner:
         if self.journal_path.exists():return self.load()
         backup_id=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+secrets.token_hex(8)
         work=self.root/backup_id;work.mkdir(mode=0o700)
-        stopped=[] if self.calendar else self.docker.running_collectors(self.cfg['project'])
+        stopped=[] if self.hostless else self.docker.running_collectors(self.cfg['project'])
         self.journal={'id':backup_id,'phase':'stopping','stopped':stopped,'created':self.clock(),
-                      'container':(CALENDAR_WORKER if self.calendar else 'pos-backup-')+backup_id.lower()}
+                      'container':(self.worker_prefix if self.hostless else 'pos-backup-')+backup_id.lower()}
         self.save();self.status('capturing')
+        if self.recordings:
+            # Plaintext left by a crashed earlier job goes first; this job's directory is then staged into.
+            self.clean_staging();snapshot=self.staging_root/backup_id;snapshot.mkdir(mode=0o700)
+            self.stage_snapshot(snapshot)
+    def stage_snapshot(self,destination):
+        """Put `archive.sqlite` into `destination`, a private directory made for this job (ANYM-727 implements it)."""
+    def clean_staging(self):
+        """Empty the staging directory (never the directory itself): plaintext of the archive must not linger."""
+        root=self.staging_root;root.mkdir(mode=0o700,exist_ok=True)
+        if root.is_symlink() or root.stat().st_mode&0o077:raise ValueError('private_backup_directory_required')
+        for entry in root.iterdir():
+            if entry.is_symlink() or not entry.is_dir():entry.unlink()
+            else:shutil.rmtree(entry)
     def create_calendar_worker(self,work):
         """The calendar profile's worker: its database, vault and profile files read-only, no files volume."""
         write_json(self.unsettled_path,{'profile':'calendar','id':self.journal['id'],'container':self.journal['container']})
@@ -432,8 +494,28 @@ class Runner:
             '--mount','type=bind,src='+self.cfg['recipient_file']+',dst=/run/secrets/recipient,readonly',
             '--mount','type=bind,src='+mounts['vault']+',dst=/sources/vault,readonly',
             '--mount','type=bind,src='+mounts['profile']+',dst=/sources/profile,readonly',self.cfg['image'])
+    def create_recordings_worker(self,work):
+        """The recordings profile's worker: the staged snapshot read-only, no network, no database, no secrets but age."""
+        write_json(self.unsettled_path,{'profile':'recordings','id':self.journal['id'],'container':self.journal['container']})
+        write_json(work/'worker.json',{'profile':'recordings','id':self.journal['id'],'snapshot_directory':'/sources/snapshot',
+            'recipient_file':'/run/secrets/recipient','work_directory':'/work'})
+        self.docker.call('create','--name',self.journal['container'],'--label','personal-os.backup.id='+self.journal['id'],
+            '--label','personal-os.backup.project='+self.cfg['project'],'--network','none',
+            '--read-only','--user','0','--cap-drop','ALL','--cap-add','DAC_OVERRIDE','--security-opt','no-new-privileges',
+            '--memory','384m','--cpus','0.75','--pids-limit','64','--tmpfs','/tmp:size=128m,noexec,nosuid',
+            '--mount','type=bind,src='+str(work)+',dst=/work',
+            '--mount','type=bind,src='+str(work/'worker.json')+',dst=/run/secrets/backup_config,readonly',
+            '--mount','type=bind,src='+self.cfg['recipient_file']+',dst=/run/secrets/recipient,readonly',
+            '--mount','type=bind,src='+str(self.staging_root/self.journal['id'])+',dst=/sources/snapshot,readonly',
+            self.cfg['image'])
+    def refusal(self,work):
+        """The worker's fixed refusal code, if it wrote one (recordings only); never anything else from the file."""
+        try:code=read_json(work/'refused.json').get('code')
+        except (OSError,ValueError):return None
+        return code if self.recordings and code in SAFE_ERRORS and code.startswith('recordings_') else None
     def create_worker(self,work):
         if self.calendar:return self.create_calendar_worker(work)
+        if self.recordings:return self.create_recordings_worker(work)
         streaming=self.cfg.get('delivery_mode')=='stream_v2'
         if streaming:
             if not (work/'snapshot').exists():
@@ -486,10 +568,12 @@ class Runner:
             info=self.check_worker(self.docker.inspect(self.journal['container']))
             if info is None:raise RuntimeError('backup_container_disappeared')
             if not info['State']['Running']:
-                if info['State']['ExitCode']!=0:raise RuntimeError('backup_capture_failed')
+                if info['State']['ExitCode']!=0:raise RuntimeError(self.refusal(work) or 'backup_capture_failed')
                 self.resume_collectors();break
-            if self.clock()-self.journal['created']>self.cfg['timeout_seconds']:raise RuntimeError('backup_capture_timeout')
+            if self.clock()-self.journal['created']>(self.cfg['recordings']['capture_timeout_seconds'] if self.recordings
+                                                     else self.cfg['timeout_seconds']):raise RuntimeError('backup_capture_timeout')
             self.sleep(POLL_SECONDS)
+        if self.recordings:self.clean_staging()  # the worker has exited: the bundle holds the only copy now
         self.journal['phase']='upload';self.save()
     def cleanup_plaintext(self,work):
         # Only this job's closed container work directory is eligible.
@@ -603,7 +687,7 @@ class Runner:
         write_json(work/'delivery.json',receipt)
         self.cleanup_plaintext(work);self.finish(work,result,receipt)
     def release_fence(self,work):
-        if self.calendar:return  # The calendar capture opens no attachment fence.
+        if self.hostless:return  # The calendar and recordings captures open no attachment fence.
         metadata=read_json(work/('stream.json' if (work/'stream.json').exists() else 'result.json'))
         if 'backup_fence' not in metadata:return  # Pre-lifecycle deliveries remain compatible.
         if metadata['backup_fence']!=self.journal['id']:raise RuntimeError('backup_capture_unfenced')
@@ -683,7 +767,7 @@ class Runner:
             # Durable decision first: a lost acknowledgement is read back, never guessed.
             self.journal['phase']='abandoning';self.save()
         jid=self.journal['id']
-        if self.calendar:
+        if self.hostless:
             # No fence to end: removing the undelivered job is the whole abandonment.
             self.remove_abandoned(work)
             status=read_json(self.status_path) if self.status_path.exists() else {}
@@ -734,7 +818,7 @@ class Runner:
             if result.get('id')!=self.journal['id'] or result.get('status')!='encrypted' or path.is_symlink():
                 raise RuntimeError('invalid_backup_result')
             # A backup image from before ANYM-607 names no manifest hash: its bundle could never be verified.
-            if self.calendar and not re.fullmatch('[a-f0-9]{64}',str(result.get('snapshot_sha256'))):
+            if self.hostless and not re.fullmatch('[a-f0-9]{64}',str(result.get('snapshot_sha256'))):
                 raise RuntimeError('invalid_backup_result')
             with path.open('rb') as f:
                 if path.stat().st_size!=result['bytes'] or hashlib.file_digest(f,'sha256').hexdigest()!=result['sha256']:
@@ -744,14 +828,18 @@ class Runner:
             self.finish(work,result,receipt)
         except BaseException as exc:
             self.status('error',str(exc) if str(exc) in SAFE_ERRORS else 'backup_job_failed')
+            if self.recordings:
+                try:self.clean_staging()
+                except (OSError,ValueError):pass  # the next start empties it again
             raise
     def recover_stop(self):
         """systemd ExecStopPost: settle the owned container, then resume its collectors."""
+        if self.recordings:self.clean_staging()  # no job survives this call with archive plaintext in staging
         if not self.journal_path.exists():
-            if self.calendar and os.path.lexists(self.unsettled_path):self.settle(read_json(self.unsettled_path)['container'])
+            if self.hostless and os.path.lexists(self.unsettled_path):self.settle(read_json(self.unsettled_path)['container'])
             return
         self.load()
-        if not self.calendar:
+        if not self.hostless:
             for kind in ('release','abandon'):self.settle_fence_action(kind)
         info=self.check_worker(self.docker.inspect(self.journal['container']))
         if info and info['State']['Running']:
@@ -785,7 +873,7 @@ def hold_locks(cfg):
         fds.append(os.open(Path(cfg['directory'])/'.runner.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600))
         try:fcntl.flock(fds[0],fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:raise RuntimeError('backup_job_already_running') from None
-        if cfg.get('profile')=='calendar':
+        if cfg.get('profile') in ('calendar','recordings'):
             fds.append(os.open(cfg['host_lock'],os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600))
             deadline=time.monotonic()+HOST_LOCK_WAIT_SECONDS
             while True:

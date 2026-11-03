@@ -156,7 +156,40 @@ def run_calendar(config):
     return result
 
 
+def run_recordings(config):
+    """Recordings archive profile (ANYM-714): one staged SQLite snapshot, checked, sealed and encrypted. No network."""
+    from .backup_recordings import RecordingsRefused,create_recordings_snapshot
+    from .backup_receiver import BACKUP_ID
+    from .recovery_state import read_manifest
+    required={'profile','id','snapshot_directory','recipient_file','work_directory'}
+    if set(config)!=required or config['profile']!='recordings':raise ValueError('invalid_backup_worker_config')
+    if not isinstance(config['id'],str) or not BACKUP_ID.fullmatch(config['id']):raise ValueError('invalid_backup_id')
+    work=Path(config['work_directory'])
+    if work.is_symlink() or not work.is_dir() or work.stat().st_mode&0o077:raise ValueError('private_work_directory_required')
+    try:snapshot=create_recordings_snapshot(Path(config['snapshot_directory'])/'archive.sqlite',work/'snapshot')
+    except RecordingsRefused as exc:
+        # A fixed code only: no path, no archive content. No bundle exists and none is started.
+        write_json(work/'refused.json',{'id':config['id'],'status':'refused','code':exc.code})
+        raise
+    write_json(work/'captured.json',{'id':config['id'],'status':'capture_complete'})
+    manifest=read_manifest(work/'snapshot')
+    with (work/'snapshot/manifest.json').open('rb') as f:snapshot_sha=hashlib.file_digest(f,'sha256').hexdigest()
+    output=work/'bundle.tar.age'
+    try:encrypt_snapshot(work/'snapshot',output,Path(config['recipient_file']).read_text().strip())
+    finally:
+        # The plaintext copy of other people's speech never outlives this call; a retry captures anew.
+        shutil.rmtree(work/'snapshot')
+    with output.open('rb') as f:digest=hashlib.file_digest(f,'sha256').hexdigest()
+    result={'v':1,'id':config['id'],'profile':'recordings','status':'encrypted','bytes':output.stat().st_size,
+            'sha256':digest,'snapshot_sha256':snapshot_sha,'snapshot':snapshot,'created_at':datetime.now(timezone.utc).isoformat(),
+            'captured_at':manifest['captured_at']}
+    write_json(work/'result.json',result)
+    print(json.dumps({'status':'encrypted','id':config['id'],'profile':'recordings','bytes':result['bytes']}),flush=True)
+    return result
+
+
 def run(config):
+    if config.get('profile')=='recordings':return run_recordings(config)
     if 'profile' in config:return run_calendar(config)
     if config.get('action') in ('release_fence','abandon_fence'):
         if set(config)!={'action','id','dsn_file','work_directory'}:raise ValueError('invalid_backup_worker_config')
@@ -245,8 +278,9 @@ def main():
     parser=argparse.ArgumentParser();parser.add_argument('--config',type=Path,required=True)
     args=parser.parse_args();os.umask(0o077)
     from .backup_calendar import CalendarCaptureRefused
+    from .backup_recordings import RecordingsRefused
     try:run(private_json(args.config))
-    except CalendarCaptureRefused as exc:
+    except (CalendarCaptureRefused,RecordingsRefused) as exc:
         print(json.dumps({'status':'refused','code':exc.code}),flush=True)
         raise SystemExit(1) from None
     except Exception:
