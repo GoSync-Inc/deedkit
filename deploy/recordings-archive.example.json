@@ -35,7 +35,11 @@
   "archive": {
     "directory": "/data/archive",
     "poll_seconds": 300,
-    "max_bytes": 1073741824,
-    "free_reserve_bytes": 1073741824
+    "max_bytes": 4294967296,
+    "free_reserve_bytes": 1073741824,
+    "omi_budget": {
+      "transcript_per_hour": 18,
+      "reads_per_hour": 45
+    }
   }
 }

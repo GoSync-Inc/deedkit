@@ -1738,6 +1738,14 @@ file a regular file of mode 0600 owned by 10001. Paths inside `config.json` are 
 README example) and each account's `archive_namespace`, and is used only after the archive gates pass. The owner
 writes the provider keys by hand; the agent only checks modes and that a file is not empty.
 
+**Omi backfill sizing (ANYM-724).** The archive example sets `max_bytes` to 4 GiB (about 1.33 GiB of SQLite pages: all pages
+count toward the one-third page cap) and the collector's `omi_budget` to 18 transcripts and 45 reads per hour (agents keep the
+rest of Omi's 25/60). Activation sets the real `max_bytes` from the first discovery count: read `archive_status`
+(`traversal.discovered_total`, `projected_db_bytes`, `capacity_warning`, `usage`) after the first hour and size
+`max_bytes = 3 x projected_db_bytes`, plus `free_reserve_bytes` of free space. Schema 3 is additive and applies when the
+single writer starts; the backup tooling must accept schema 3 first (ANYM-714). Archive polling stays off until the ANYM-731
+activation milestones.
+
 **Network confinement (ANYM-712).** `recordings-api` joins only `recordings-backend` (internal) and `recordings-egress`
 (bridge `dk-recordings0`, no IPv6); no other service joins the egress bridge. `scripts/recordings_egress_check.py` prints the
 host rules (`rules --resolver IP`, with `--undo` for the exact inverse): the chain `DEEDKIT-RECORDINGS` allows UDP and TCP 53

@@ -19,6 +19,13 @@ class Failure(Exception):
         super().__init__(code)
 
 
+class RateLimited(Failure):
+    """The provider answered 429; `retry_after_s` is already validated and capped."""
+    def __init__(self, retry_after_s):
+        super().__init__('provider_rate_limited', 429)
+        self.retry_after_s = retry_after_s
+
+
 class Strict(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
 
@@ -39,11 +46,19 @@ class Principal(Strict):
     permissions: list[Literal['recordings:read', 'recordings:content', 'recordings:audio']]
 
 
+class OmiBudget(Strict):
+    """The collector's own hourly share of Omi's windows; agents' foreground reads are counted, not refused."""
+    transcript_per_hour: int = Field(default=18, ge=1, le=25)
+    reads_per_hour: int = Field(default=45, ge=12, le=60)
+
+
 class ArchiveSettings(Strict):
     directory: str
     poll_seconds: int = Field(default=300, ge=60, le=86400)
     max_bytes: int = Field(default=1024 ** 3, ge=128 * 1024 ** 2)
     free_reserve_bytes: int = Field(default=1024 ** 3, ge=256 * 1024 ** 2)
+    max_queued: int | None = Field(default=None, ge=200, le=200000)
+    omi_budget: OmiBudget = Field(default_factory=OmiBudget)
 
 
 class Document(Strict):

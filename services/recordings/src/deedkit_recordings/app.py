@@ -14,7 +14,7 @@ from pydantic import Field, ValidationError
 
 from .omi import Provider, metadata, pagination, content
 from . import plaud
-from .security import Strict, Failure, configuration, provider_token, cursor, continuation, canonical, loads
+from .security import Strict, Failure, RateLimited, configuration, provider_token, cursor, continuation, canonical, loads
 
 READ, CONTENT, AUDIO = 'recordings:read', 'recordings:content', 'recordings:audio'
 
@@ -102,7 +102,20 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
     local = LocalArchive(app.state.archive)
 
     async def failure(request, error):
-        return JSONResponse({'error': error.code}, status_code=error.status)
+        body = {'error': error.code}
+        if isinstance(error, RateLimited):
+            body['retry_after_s'] = error.retry_after_s
+        return JSONResponse(body, status_code=error.status)
+
+    async def omi_get(token, recording=None, params=None):
+        # Foreground Omi reads share the provider's windows with the collector: counted in the ledger, never refused
+        # by it, and a 429 also pauses the collector for this credential.
+        await app.state.archive.count(token, recording is not None)
+        try:
+            return await provider.get(token, recording, params)
+        except RateLimited as limited:
+            await app.state.archive.note_rate_limit(token, limited.retry_after_s)
+            raise
 
     app.add_exception_handler(Failure, failure)
 
@@ -177,7 +190,7 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
                 if not isinstance(previous.get('position'), str):
                     raise Failure('invalid_cursor', 400)
                 params['cursor'] = previous['position']
-            values, headers = await provider.get(token, params=params)
+            values, headers = await omi_get(token, params=params)
             if not isinstance(values, list) or len(values) > args.limit:
                 raise Failure('invalid_provider_response')
             evidence, next_page = pagination(headers, len(values), args.limit)
@@ -193,7 +206,7 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
             state, text = plaud.content(value, args.kind, args.recording_id)
             record = {'id': args.recording_id}
         else:
-            value, _ = await provider.get(token, args.recording_id, {'include_transcript': 'true'})
+            value, _ = await omi_get(token, args.recording_id, {'include_transcript': 'true'})
             record = metadata(value)
             if record['id'] != args.recording_id:
                 raise Failure('invalid_provider_response')

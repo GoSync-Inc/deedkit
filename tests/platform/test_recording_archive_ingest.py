@@ -85,7 +85,7 @@ def test_capture_restart_replay_pending_and_failure_preserve_accepted_text(tmp_p
         assert pending['parts']['summary']['attempt_state'] == 'pending'
         assert pending['parts']['summary']['text'] == one['parts']['summary']['text']
         vendor.fail = True
-        await r.run_once(now=12000)
+        await r.run_once(now=20000)
         failed = await r.db('record', doc['accounts'][0], 'conv-a')
         assert failed['parts']['transcript']['attempt_error'] == 'provider_unavailable'
         assert failed['parts']['transcript']['text'] == one['parts']['transcript']['text']
@@ -149,6 +149,7 @@ def test_capacity_pause_disk_full_rollback_and_recovery(tmp_path, monkeypatch):
         def full(): raise Failure('archive_capacity')
         monkeypatch.setattr(r.store, 'capacity', full)
         vendor.value = conversation(text='changed text')
+        vendor.value['structured']['overview'] = 'Changed overview'  # ANYM-724: a changed list row makes it due
         await r.run_once(now=4000)
         assert r.error == 'archive_capacity'
         assert (await r.db('record', account, 'conv-a'))['revision'] == old['revision']
@@ -247,7 +248,8 @@ def test_queue_bound_duplicate_ids_and_fair_new_retry_refresh_selection(tmp_path
             await r.db('observe', account, f'conv-{n}', {'id':f'conv-{n}'}, {'summary':observation}, 100)
         chosen = await r.db('work', account, 4000)
         assert {'conv-0','conv-1','conv-2'} <= set(chosen)
-        assert len(set(chosen) & {'conv-3','conv-4','conv-5'}) == 2
+        # ANYM-724: saved, complete records are no longer revisited hourly.
+        assert not set(chosen) & {'conv-3','conv-4','conv-5'}
         assert len(set(chosen) & {f'conv-{n}' for n in range(6,15)}) == 3
         monkeypatch.setattr('deedkit_recordings.archive_store.QUEUE_LIMIT', 9)
         with pytest.raises(Failure,match='archive_queue_full'):
@@ -444,8 +446,8 @@ def test_work_classes_make_actual_progress_across_interrupted_passes(tmp_path,mo
         items = [{'id':f'new-{n}'} for n in range(30)] + [{'id':'retry'},{'id':'refresh'}]
         await r.db('discover',account,items,None,1)
         await r.db('observe',account,'retry',{'id':'retry'},{'summary':('error','','provider_unavailable')},1)
-        await r.db('observe',account,'refresh',{'id':'refresh'},{'summary':('available','old summary',None)},1)
-        for now in (4000,4010,4020): await r.run_once(now=now)
+        await r.db('observe',account,'refresh',{'id':'refresh'},{'summary':('pending','',None)},1)
+        for now in (40000,40010,40020): await r.run_once(now=now)
         assert (await r.db('record',account,'retry'))['attempted'] > 1
         assert (await r.db('record',account,'refresh'))['attempted'] > 1
         await r.close()

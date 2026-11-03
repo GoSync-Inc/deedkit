@@ -152,7 +152,7 @@ def test_read_only_principal_gets_status_without_content_or_search(tmp_path):
                 assert result.status_code == 403, result.text
             response = await client.post('/v1/archive_status', json={'account': 'omi-a'})
             assert response.status_code == 200 and response.json()['record_count'] == 1
-            assert 'text' not in response.text and 'звёзды' not in response.text and 'title' not in response.text
+            assert 'text' not in response.text.replace('with_text', '') and 'звёзды' not in response.text and 'title' not in response.text
     asyncio.run(run())
 
 
@@ -254,7 +254,7 @@ def test_version_one_archive_index_upgrades_without_rewriting_records_and_backup
             assert backup_archive(app.state.archive.document().archive, target)['state'] == 'saved'
             with sqlite3.connect(target) as snapshot:
                 assert snapshot.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
-                assert snapshot.execute('PRAGMA user_version').fetchone()[0] == 2
+                assert snapshot.execute('PRAGMA user_version').fetchone()[0] == 3  # ANYM-724: upgraded on to schema 3
     asyncio.run(run())
 
 
