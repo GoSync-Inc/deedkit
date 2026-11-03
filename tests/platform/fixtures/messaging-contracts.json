@@ -1584,7 +1584,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "title": "Body Format"
           },
           "chat": {
@@ -2148,7 +2147,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "title": "Body Format"
           },
           "chat_id": {
@@ -2300,7 +2298,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "title": "Body Format"
           },
           "compact": {

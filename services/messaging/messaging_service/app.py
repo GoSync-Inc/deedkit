@@ -810,7 +810,7 @@ def register_archive_tools(mcp, call, async_call, read):
                compact: bool | None=None, body_chars: StrictInt | None=None, include_coverage: bool | None=None, detail: MessageDetail='compact',
                     view: ConversationView='conversation',include_system: StrictBool=False,exclude_channels: StrictBool=False,
                chat_types: list[Literal['private','group','channel','unknown']] | None=None,include_channels: StrictBool=False,
-               collapse_forwards: StrictBool=True,person: StrictStr='',body_format: Literal['','html'] | None=None,
+               collapse_forwards: StrictBool=True,person: StrictStr='',body_format: Annotated[Literal['','html'] | None,Field(json_schema_extra=no_schema_default)]=None,
                live: Literal['off','auto','on']='off', wait_s: LiveWaitSeconds | None=None, request_id: StrictStr='') -> dict[str, Any]:
         """Search archived text across chosen accounts/chats/sender IDs. Lists use OR within each
         dimension, AND between dimensions; [] matches nothing. Exact account-scoped sender IDs,
@@ -898,7 +898,7 @@ def register_archive_tools(mcp, call, async_call, read):
                      before: str='', order: Literal['asc','desc']='asc', from_time: str='', to_time: str='',
                      compact: bool | None=None,body_chars: StrictInt | None=None,include_coverage: bool | None=None, detail: MessageDetail='compact',
                     view: ConversationView='conversation',include_system: StrictBool=False,
-                     body_format: Literal['','html'] | None=None) -> dict[str, Any]:
+                     body_format: Annotated[Literal['','html'] | None,Field(json_schema_extra=no_schema_default)]=None) -> dict[str, Any]:
         """Archived history. order=desc starts at newest; next_cursor as after continues in that
         order. To expand older than context_window.older_cursor, use before with order=desc.
         To expand newer than context_window.newer_cursor, use after with order=asc.
@@ -923,7 +923,7 @@ def register_archive_tools(mcp, call, async_call, read):
                     before_count: StrictInt | None=None, after_count: StrictInt | None=None,
                     compact: bool | None=None, body_chars: StrictInt | None=None, include_coverage: bool | None=None, detail: MessageDetail='compact',
                     view: ConversationView='conversation',include_system: StrictBool=False,
-                    body_format: Literal['','html'] | None=None) -> dict[str, Any]:
+                    body_format: Annotated[Literal['','html'] | None,Field(json_schema_extra=no_schema_default)]=None) -> dict[str, Any]:
         """Message, counted nearby conversation, files and first five visible reviews.
         Known system events are hidden unless include_system=true; unknown empty records stay visible.
         conversation describes the actual known chat head, not this window. Inspect freshness,
