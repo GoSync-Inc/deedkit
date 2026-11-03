@@ -450,6 +450,30 @@ described above: an aged-out job resumes only on request). Fix the storage path,
 then downloads resume on their own. Jobs recorded as `network_error` before this
 classification keep their recorded code.
 
+Provider attempt budget (as of main b74761bd). A job is claimed only while
+`attempts<5`, and every claim adds one attempt (`archive.py` `claim_media`). A failure
+that is not permanent re-queues the job after `min(3600, 10*2^attempts)` seconds, or
+the provider's `retry_after` if larger: 20, 40, 80 and 160 seconds, so all five
+attempts fit in about five minutes. The fifth failure, or any permanent code
+(`unavailable`, `size_limit`, and the typed codes in the collector's permanent list),
+makes the job `failed`; nothing re-queues a `failed` job, and a request does not
+(above). The code stored on a failed job is the last failure's. `network_error` is the
+catch-all for a failure that has no typed code: a lost adapter, a reply timeout, an
+unclassified error, and for Telegram a refreshed file reference. A WhatsApp media code
+the adapter returns (for example `media_network_error`, `media_timeout`) is stored
+as that code. A provider rate limit (`rate_limited`) and a lost connection also spend
+an attempt; only the storage pauses above give it back. So a `failed` original with
+`network_error` or `rate_limited` is not proof the provider no longer has the file.
+
+`outside_history_bounds` is deliberate (ANYM-477), not a failure. Such a job is
+`queued`, is never claimed by the collector alone, does not set `needs_attention`
+(only `terminal_failed_jobs` does) and is counted in `operations.media` as
+`outside_history_bounds_jobs`, apart from `eligible_queued_jobs`; an explicit
+`request_file_download` fetches it. The raw `files.download` counters group by job
+state only, so these jobs are included in `queued` there, and `download_errors` keeps
+the last code of a queued job (for example an old `rate_limited`). Read the eligible
+subset from `operations.media`, not from `files.download.queued`.
+
 Media reservation expiry follows the media lease and is renewed with it.
 Expiry, edit/delete supersession, successful completion and failure release
 capacity. Cleanup is idempotent and matches the exact lease epoch, so an old
