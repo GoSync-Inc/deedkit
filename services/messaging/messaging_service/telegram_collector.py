@@ -1073,6 +1073,7 @@ class TelegramCollector:
 
     async def outgoing_expiry_loop(self):
         from psycopg import Error
+        from psycopg.errors import LockNotAvailable
         from .outgoing import OutgoingWorker,EXPIRY_SECONDS,EXPIRY_GRACE
         worker=OutgoingWorker(self.state,None)
         backoff=DbBackoff(self)
@@ -1086,6 +1087,12 @@ class TelegramCollector:
                 await asyncio.wait({pending},timeout=max(0,deadline+EXPIRY_GRACE-time.monotonic()))
                 pending.add_done_callback(lambda t:t.cancelled() or t.exception())
                 raise
+            except LockNotAvailable:
+                # Every ingest transaction holds this account's collector_leases row (fence) and expire_queued
+                # waits only 100 ms for it, so a busy archive is routine contention, not a fault. The pass
+                # skips, tries again at the fixed database_retry (no doubling) and logs nothing; claim()
+                # still expires a due send before it dispatches and reads report it expired by the clock.
+                await asyncio.sleep(self.database_retry);continue
             except (Error,TimeoutError,*database_errors()) as exc:
                 log.warning('outgoing_expiry_failed exception_type=%s',type(exc).__name__)
                 await backoff.wait();continue
