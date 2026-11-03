@@ -105,9 +105,9 @@ revert() { git checkout --quiet --detach "$FROM"; }
 uptodate_check() {  # nothing to update: still report a stack that is not running healthy (a failed earlier update)
   local reason=$1 WAIT=30
   cd "$REPO/deploy" || return 1
-  if [ -n "$(docker compose ps -q db 2>/dev/null)" ]; then wait_healthy messaging || return 1; fi
-  if [ -n "$(docker compose -f compose.calendar.yaml ps -q calendar-api 2>/dev/null)" ]; then wait_healthy calendar -f compose.calendar.yaml || return 1; fi
-  if [ -n "$(docker compose -f compose.gateway.yaml ps -q gateway 2>/dev/null)" ]; then wait_healthy gateway -f compose.gateway.yaml || return 1; fi
+  if [ -n "$(docker compose ps -aq db 2>/dev/null)" ]; then wait_healthy messaging || return 1; fi
+  if [ -n "$(docker compose -f compose.calendar.yaml ps -aq calendar-api 2>/dev/null)" ]; then wait_healthy calendar -f compose.calendar.yaml || return 1; fi
+  if [ -n "$(docker compose -f compose.gateway.yaml ps -aq gateway 2>/dev/null)" ]; then wait_healthy gateway -f compose.gateway.yaml || return 1; fi
   say uptodate "$reason"
 }
 
@@ -151,14 +151,14 @@ dump() {  # dump <name> "<compose -f args>" <service> <user> <db>
 
 build_all() {
   local msg=$1 gw=$2 cal=$3 native
-  [ -z "$msg" ] || docker compose build >>"$ERR" 2>&1 || return 1
+  [ -z "$msg" ] || docker compose build --quiet >>"$ERR" 2>&1 || return 1
   # The WhatsApp native image has no build section in compose: rebuild it when this install uses it.
   native=$(docker compose config --images 2>/dev/null | grep '^anymsg-whatsapp-native:' | sort -u | head -n 1)
   if [ -n "$native" ] && docker image inspect "$native" >/dev/null 2>&1; then
     docker build --quiet --target whatsapp-native -t "$native" .. >>"$ERR" 2>&1 || return 1
   fi
-  [ -z "$gw" ] || docker compose -f compose.gateway.yaml build >>"$ERR" 2>&1 || return 1
-  [ -z "$cal" ] || docker compose -f compose.calendar.yaml build calendar-api >>"$ERR" 2>&1 || return 1
+  [ -z "$gw" ] || docker compose -f compose.gateway.yaml build --quiet >>"$ERR" 2>&1 || return 1
+  [ -z "$cal" ] || docker compose -f compose.calendar.yaml build --quiet calendar-api >>"$ERR" 2>&1 || return 1
 }
 
 migrate_messaging() {
@@ -200,7 +200,7 @@ wait_healthy() {  # wait_healthy <label> [compose args]
   local label=$1 deadline ids id st hs ok good=0; shift
   deadline=$(( $(date +%s) + WAIT ))
   while :; do
-    ok=1; ids=$(docker compose "$@" ps -q 2>/dev/null)
+    ok=1; ids=$(docker compose "$@" ps -aq 2>/dev/null)
     [ -n "$ids" ] || ok=0
     for id in $ids; do
       read -r st hs < <(docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id")
