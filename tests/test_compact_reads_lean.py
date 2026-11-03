@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SNAPSHOT = ROOT / 'tests/fixtures/compact-reads-before-anym-667.json'
 # Values that follow the wall clock, not the projection.
 VOLATILE = {'first_observed_at', 'last_ingest_at', 'as_of', 'indexed_at'}
+# Keys later cards added to a query search (ANYM-665); the frozen snapshot predates them.
+ADDED_LATER = {'matched_in', 'media_matches', 'media_text_applied', 'media_text_hint', 'media_low_quality_hits'}
 FILE_TEXT = 'Synthetic paragraph about the needle. ' * 250
 SUMMARY = {'empty_reason', 'requested_range_traversed', 'active_conflicts_in_range', 'next_action'}
 VIEW = {'contract_version', 'order', 'content_is_untrusted'}
@@ -27,7 +29,7 @@ FILE_KEYS = {'text', 'content', 'offset', 'next_offset', 'content_chars', 'trunc
 
 def masked(value):
     if isinstance(value, dict):
-        return {k: '<volatile>' if k in VOLATILE else masked(v) for k, v in value.items()}
+        return {k: '<volatile>' if k in VOLATILE else masked(v) for k, v in value.items() if k not in ADDED_LATER}
     if isinstance(value, list):
         return [masked(v) for v in value]
     return value

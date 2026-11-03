@@ -830,6 +830,11 @@
           "title": "Collapse Forwards",
           "type": "boolean"
         },
+        "include_media_text": {
+          "description": "Default true (set by the backend): a query also finds messages by the text inside their photos (OCR), PDFs and voice-note transcripts (first 32,000 characters each; search_files reads whole documents). Hits carry matched_in and, for media, media_matches. false searches message text only. exact mode skips media text.",
+          "title": "Include Media Text",
+          "type": "boolean"
+        },
         "live": {
           "description": "Telegram, first page only. on also searches Telegram itself; auto only when the archive answer is thin (empty_reason history_loading/history_not_scanned/history_has_gaps/no_matches_in_partial_archive); off makes no provider calls. Supported with query (all/phrase), one chat, chat_types/channels, from_time/to_time; anything else gives unsupported_filter. Needs read-live and the account's search_messages_live opt-in. result_evidence.live has per account state, stored_new and the provider hits.",
           "enum": [

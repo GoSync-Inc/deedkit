@@ -214,7 +214,8 @@ def test_any_mode_keeps_spellings_that_differ_after_lowercasing(seeded, query):
     add_file(s, 'any-ss-f1', 'demo-tg-1', 'Straße'.encode(), 'f1.txt')
     add_file(s, 'any-ss-f2', 'demo-tg-2', 'STRASSE'.encode(), 'f2.txt')
     drain(worker_for(s))
-    assert ids(s.search(b, query, query_mode='any', search_language='simple')) == ['any-ss-1', 'any-ss-2']
+    # The message search under test reads bodies; the files above belong to the file search below (ANYM-665).
+    assert ids(s.search(b, query, query_mode='any', search_language='simple', include_media_text=False)) == ['any-ss-1', 'any-ss-2']
     assert sorted(x['attachment_id'] for x in search_files(s, b, query, query_mode='any', search_language='simple')['items']
                   if x['attachment_id'].startswith('any-ss-f')) == ['any-ss-f1', 'any-ss-f2']
     assert compile_query(query, 'any').terms == 2 and compile_query('invoice INVOICE Invoice', 'any').terms == 1

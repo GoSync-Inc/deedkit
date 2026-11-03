@@ -307,18 +307,21 @@ def named_chats(c, p, chat='', chats=None):
 def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time='',after='',limit=20,
            *,accounts=None,chats=None,senders=None,query_mode='all',order='asc',before='',direction='',
            search_language='auto',fuzzy=False,compact=False,body_chars=None,include_coverage=True,view='archive',include_system=False,
-           exclude_channels=False,chat_types=None,include_channels=None,collapse_forwards=True,person='',body_format=''):
+           exclude_channels=False,chat_types=None,include_channels=None,collapse_forwards=True,person='',body_format='',include_media_text=True):
     from .store import APIError,bounded,serial
     from .formatting_readback import option
     body_format=option(body_format)
     import re
+    import psycopg.errors
+    from . import message_media_search as media_text
     from .conversation import options,numeric_order_sql,visible_sql,decorate_messages,presentation
     options(view,include_system)
     conversation=view=='conversation'
     bounded(limit)
     cap=output_options(compact,body_chars,include_coverage)
     plan=compile_query(query,query_mode,search_language)
-    if order not in ('asc','desc','relevance') or type(fuzzy) is not bool or type(collapse_forwards) is not bool:
+    if (order not in ('asc','desc','relevance') or type(fuzzy) is not bool or type(collapse_forwards) is not bool
+            or type(include_media_text) is not bool):
         raise APIError('invalid_filter')
     valid_text(after,4096);valid_text(before,4096)
     if after and before or before and order=='relevance':raise APIError('invalid_filter')
@@ -340,15 +343,26 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
     typed=exclude_channels or chat_types is not None or include_channels is True
     # ANYM-273: an explicit flat view binds its cursor, so a page cannot continue in the other view.
     flat=bool(plan.query) and not collapse_forwards
+    # ANYM-665: the media arm is on by default; only the body-only view binds, so earlier cursors stay valid.
+    media=media_text.applies(plan,include_media_text)
+    body_only=bool(plan.query) and not include_media_text
+    def run(sql,values):
+        # A media search that runs out of time names the cheaper call (include_media_text=false).
+        try:return c.execute(sql,values)
+        except psycopg.errors.QueryCanceled as error:
+            raise (media_text.timeout(error) if media else error)
     binding=cursor_binding(p,'messages',{**normalized,'query':query,'query_mode':query_mode,
         'language':search_language,'order':order,'fuzzy':fuzzy,
         # Only the non-default exact view binds, so cursors issued before ANYM-273 stay valid.
         **({'collapse_forwards':False} if flat else {}),
+        **({'include_media_text':False} if body_only else {}),
         **({'person':person} if members is not None else {}),
         **({'view':view,'include_system':include_system,'conversation_version':1} if conversation else {})})
     extra_join=' LEFT JOIN message_metadata cmd ON cmd.message=m.id AND cmd.revision=m.revision' if conversation else ''
     if conversation and not include_system:clauses.append(visible_sql('m','cmd'))
     fuzzy_used=False;contact_from=None;contact_args=[]
+    digits=None;media_params=[]
+    order_sql=numeric_order_sql('m') if conversation else '0::bigint'
     if plan.query:
         # ANYM-529: a shared contact matches by its name or phone digits, under the same scope clauses.
         digits=contact_digits(query)
@@ -361,6 +375,12 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
         # A contact hit is a primary match too: it keeps the exact view.
         if not has_primary and contact_from:
             has_primary=c.execute('WITH '+plan.cte+' SELECT 1 FROM '+contact_from+' LIMIT 1',[*plan.params,*contact_args]).fetchone()
+        # ANYM-665: a media hit is a primary hit too; the fuzzy fallback never scans media text.
+        if not has_primary and media:
+            media_sql,media_params=media_text.ctes(plan)
+            has_primary=run('WITH '+','.join([plan.cte,*media_sql])+' SELECT 1 FROM ('+
+                media_text.arm(order_sql,clauses,extra_join,False)+') u LIMIT 1',[*plan.params,*media_params,*args]).fetchone()
+            media_params=[]
         fuzzy_used=not bool(has_primary)
     score=plan.rank('m','m.body');match_type=plan.match_type('m')
     if fuzzy_used:
@@ -385,7 +405,14 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
         # Separate selective indexed matching from the chronological LIMIT.
         # Otherwise the planner may prefer walking the date index, expecting
         # early hits; a rare or absent query then traverses the entire archive.
-        ctes.append('matches AS MATERIALIZED ('+base_sql+' UNION '+contact_sql+')')
+        if media:
+            # One row per message, its best score: a body hit outranks the same message's media hit.
+            media_sql,media_params=media_text.ctes(plan,order=='relevance')
+            ctes.extend(media_sql)
+            match_args=[*match_args,*args]
+            ctes.append('matches AS MATERIALIZED (SELECT DISTINCT ON (id) * FROM ('+base_sql+' UNION ALL '+contact_sql+
+                ' UNION ALL '+media_text.arm(order_sql,clauses,extra_join,order=='relevance')+') u ORDER BY id,score DESC)')
+        else:ctes.append('matches AS MATERIALIZED ('+base_sql+' UNION '+contact_sql+')')
     else:
         ctes.append('matches AS NOT MATERIALIZED ('+base_sql+')')
     cursor_clause='';cursor_args=[]
@@ -398,7 +425,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
     def read_snapshot():
         value=c.execute('WITH '+','.join(snapshot_ctes)+''' SELECT count(*) AS n,
             coalesce(sum(hashtextextended(id||'|'||sent_at::text||'|'||revision::text||'|'||source_order::text,0)::numeric),0)::text AS checksum
-            FROM matches''',[*plan.params,*match_args]).fetchone()
+            FROM matches''',[*plan.params,*media_params,*match_args]).fetchone()
         return fingerprint(value)
     if after or before:
         cursor=after or before
@@ -432,7 +459,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
                     cursor_clause='WHERE (sent_at,id)'+('<' if before or order=='desc' else '>')+'(%s,%s)'
                     cursor_args=[at,mid]
         else:
-            if order=='relevance' or conversation or typed or flat or members is not None:raise cursor_refusal()
+            if order=='relevance' or conversation or typed or flat or body_only or members is not None:raise cursor_refusal()
             anchor=store.message(c,p,cursor)
             cursor_clause='WHERE (sent_at,id)'+('<' if before or order=='desc' else '>')+'(%s,%s)'
             cursor_args=[anchor['sent_at'],anchor['id']]
@@ -447,13 +474,22 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
     if collapsing:final_sort=re.sub(r'\bm\.','page.',final_sort)
     snippet='left('+plan.snippet('m.body')+',800)'
     projection=BASE if cap is None else BASE.replace('m.body','left(m.body,'+str(cap)+') AS body,length(m.body)>'+str(cap)+' AS body_truncated')
-    rows=c.execute('WITH '+','.join(ctes)+' SELECT '+projection+','+META+',page.score,'+match_type+
-        ' AS match_type,'+snippet+' AS snippet,page.source_order'+(',page.gkey,page.copies_total,page.latest_copy_at,page.id AS position_id,page.sent_at AS position_at,page.revision AS position_revision,listed.copy_ids,listed.copy_chats,listed.copy_senders,listed.copy_times' if collapsing else '')+(',view_snapshot.n AS snapshot_count,view_snapshot.checksum AS snapshot_checksum' if conversation else '')+' FROM page JOIN messages m ON m.id='+('coalesce(page.shown,page.id) ' if collapsing else 'page.id ')+JOINS+(' LEFT JOIN listed ON listed.gkey=page.gkey' if collapsing else '')+
-        ' CROSS JOIN search_query q'+(' CROSS JOIN view_snapshot' if conversation else '')+' ORDER BY '+final_sort,[*plan.params,*match_args,*cursor_args,limit+1]).fetchall()
+    # ANYM-665: what each shown row matched is read in the page statement itself (body, contact and media candidates).
+    flag_sql='';flag_args=[]
+    if plan.query:
+        flag_sql=',('+plan.predicate('m')+') AS hit_body,EXISTS(SELECT 1 FROM message_metadata x WHERE x.message=m.id AND x.revision=m.revision'+\
+            " AND x.metadata ? 'contact' AND "+contact_match(plan)+') AS hit_contact'+\
+            (',EXISTS(SELECT 1 FROM media_text t WHERE t.message=m.id AND t.source_revision=m.revision) AS hit_media' if media and not fuzzy_used else '')
+        flag_args=[digits,digits,digits]
+    rows=run('WITH '+','.join(ctes)+' SELECT '+projection+','+META+',page.score,'+match_type+
+        ' AS match_type,'+snippet+' AS snippet,page.source_order'+flag_sql+(',page.gkey,page.copies_total,page.latest_copy_at,page.id AS position_id,page.sent_at AS position_at,page.revision AS position_revision,listed.copy_ids,listed.copy_chats,listed.copy_senders,listed.copy_times' if collapsing else '')+(',view_snapshot.n AS snapshot_count,view_snapshot.checksum AS snapshot_checksum' if conversation else '')+' FROM page JOIN messages m ON m.id='+('coalesce(page.shown,page.id) ' if collapsing else 'page.id ')+JOINS+(' LEFT JOIN listed ON listed.gkey=page.gkey' if collapsing else '')+
+        ' CROSS JOIN search_query q'+(' CROSS JOIN view_snapshot' if conversation else '')+' ORDER BY '+final_sort,[*plan.params,*media_params,*match_args,*cursor_args,limit+1,*flag_args]).fetchall()
     if conversation and rows:
         current_snapshot=fingerprint({'n':rows[0]['snapshot_count'],'checksum':rows[0]['snapshot_checksum']})
         if snapshot is not None and snapshot!=current_snapshot:raise APIError('cursor_changed',409)
         snapshot=current_snapshot
+    # The flags are read before the rows are shaped; the internal columns leave with the other internals below.
+    flags={r['id']:(r['hit_body'],r['hit_contact'],r.get('hit_media',False)) for r in rows[:limit]} if plan.query else {}
     items=reply_context(c,p,resolve(c,p,forward_presence(rows[:limit])))
     if collapsing:attach_copies(items)
     retitle(c,p,items)
@@ -468,11 +504,12 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
             next_cursor=encode_cursor(binding,{'id':last['id'],'at':last['sent_at'],'score':last['score'],
                 'revision':last['revision'],'fuzzy':fuzzy_used,'source_order':last['source_order'],'snapshot':snapshot,**extra})
         else:next_cursor=encode_cursor(binding,{'id':last['id'],'at':last['sent_at'],'score':last['score'],
-            'revision':last['revision'],'fuzzy':fuzzy_used,**extra}) if order=='relevance' or fuzzy or typed or flat or members is not None else last['id']
+            'revision':last['revision'],'fuzzy':fuzzy_used,**extra}) if order=='relevance' or fuzzy or typed or flat or body_only or members is not None else last['id']
     shape_messages(items,compact=False if conversation else compact)
     from .result_evidence import decorate
     from .chat_evidence import query_evidence
     decorate(c,items,with_body=bool(body_format))
+    low_hits=media_text.annotate(c,plan,items,flags,fuzzy_used=fuzzy_used) if plan.query else 0
     if conversation:
         decorate_messages(c,p,items,include_system=include_system)
         # Explicit caps bound source excerpts and the added readable field;
@@ -485,13 +522,20 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
         from .formatting_readback import attach
         attach(items)
     for item in items:
-        for internal in ('source_order','snapshot_count','snapshot_checksum','position_id','position_at','position_revision'):item.pop(internal,None)
+        for internal in ('source_order','snapshot_count','snapshot_checksum','position_id','position_at','position_revision','hit_body','hit_contact','hit_media'):item.pop(internal,None)
     targets(p,[i for r in items for i in [r['id'],*(x['message_id'] for x in r.get('copies',()))]])
+    evidence=query_evidence(c,p,normalized,items,paged=bool(after or before),include=include_coverage)
+    # ANYM-665: an empty answer says which media text is not searchable yet, under every filter of this search.
+    if media and not items and not (after or before):media_text.pending_evidence(c,clauses,args,extra_join,evidence)
     return serial({'items':items,'next_cursor':next_cursor,
-        'result_evidence':query_evidence(c,p,normalized,items,paged=bool(after or before),include=include_coverage),
+        'result_evidence':evidence,
         **({'conversation_view':presentation(items,order=order,include_system=include_system)} if conversation else {}),
         'search':{'language':search_language,'query_mode':query_mode,'order':order,'fuzzy_used':fuzzy_used,
-            'fuzzy_candidate_limit':200 if fuzzy_used else None,'collapse_forwards':collapsing},**coverage(store,c,p,include_coverage)})
+            'fuzzy_candidate_limit':200 if fuzzy_used else None,'collapse_forwards':collapsing,
+            **({'media_text_applied':media,
+                **({'media_low_quality_hits':low_hits} if media else {}),
+                **({'media_text_hint':media_text.hint(plan,include_media_text)} if media_text.hint(plan,include_media_text) else {})}
+               if plan.query else {})},**coverage(store,c,p,include_coverage)})
 
 
 def history_snapshot(c,p,chat,*,include_system=False):

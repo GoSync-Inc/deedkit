@@ -55,7 +55,8 @@ def payload(error,operation='',request_id=None):
     if operation in ('search','search_files'):info['results_state']='not_returned_due_to_error'
     # Narrowing helps a slow or busy query, not a rejected parameter.
     if operation in ('search','search_files') and retry:
-        info['next_action']='narrow_account_chat_or_date_filters'
+        # ANYM-665: a media search that timed out names the cheaper call first.
+        info['next_action']=getattr(error,'next_action','narrow_account_chat_or_date_filters')
         info['fallback']='get_messages_for_known_chat_then_get_context' if operation=='search' else 'get_file_text_for_known_attachment_then_get_context'
     elif hasattr(error,'next_action'):info['next_action']=error.next_action
     elif code in ('not_found','forbidden'):

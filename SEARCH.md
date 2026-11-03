@@ -234,6 +234,58 @@ linked to that person and the key can read, as exact `(account, sender)` pairs, 
 filters; no text query is needed. Cursors of a `person` request are bound to it. Linking, visibility
 and errors: [PEOPLE.md](PEOPLE.md#linked-people-anym-283-schema-43).
 
+### Text inside photos, PDFs and voice notes (ANYM-665)
+
+`search` (`messages_search`) also finds a message by the text of its attachments: the ready extracted text
+of a photo (OCR), PDF or document, and the ready transcript of a voice note. `include_media_text` is
+true by default and the default lives in messaging (the gateway sends nothing it was not given);
+`include_media_text: false` is the body-only search of earlier releases and binds its cursor.
+
+- **What matches.** A message with a current attachment whose ready text (`attachment_text`) or, for audio,
+  ready transcript (`attachment_enrichment`) matches the query, in the modes `all`, `any`, `phrase`
+  and `web`. The same GIN indexes as `search_files` serve it, over the first 32,000 characters of the
+  text; read whole documents with `search_files` and `get_file_text`. A filename or display name never
+  matches here, and model descriptions of images never match (ANYM-490). A deleted message, a superseded
+  extraction (source revision changed) and an inactive attachment never match. Scope and every filter
+  of the search apply as to a body match.
+- **`query_mode: exact`** skips the media arm (no index serves `LIKE`): `search.media_text_applied` is
+  `false` and `search.media_text_hint` names `search_files` with `query_mode=exact`. The fuzzy
+  fallback never scans media text; a media hit is a primary hit, so fuzzy runs only when neither the body
+  nor the media matched.
+- **Evidence on every hit row of a query.** `matched_in` lists what matched, in this order: `body`,
+  `contact`, `extracted`, `transcript` (an empty-query listing has none). A media hit adds `media_matches`,
+  one entry per matching attachment in attachment order: `{attachment_id, source, snippet,
+  model_generated, untrusted: true, read_more}` with a snippet of at most 200 characters around the first
+  match (`[[ ]]` marks it) and `read_more` for `get_file_text` (the match lies in the first 32,000
+  characters, so the passage starts at offset 0). Photo text carries `quality` as in ANYM-669. `match_type`
+  of a row that matched only through media is `media_text`. A match whose original is unreadable
+  (missing and not evicted, ANYM-490) is `{attachment_id, source, unreadable: true}` without a snippet.
+  A message collapsed under ANYM-273 lists the shown copy's attachments.
+- **Low-quality OCR** (ANYM-669 `quality: low`): the entry is `{attachment_id, source, quality: "low",
+  read_more}` without a snippet. It is still a hit, ranks last, and `search.media_low_quality_hits` counts
+  the rows of the page that are hits only through such text.
+- **Order.** `order=asc|desc` keep time order. With `order=relevance` a media hit takes the rank tier of the
+  query mode over its text alone (`all`/`phrase`: literal, adjacent words or other; `any`: the share of
+  distinct terms, filename terms not counted; `web`: one tier), without the density a body hit adds, and sits
+  one unit under it: a body hit of the same tier always comes first, media hits of one tier keep the time
+  order (newest first), and a low-quality hit ranks last. A message that matches both ways takes its better
+  rank. `score` keeps its scale, so relevance cursors issued before this release stay valid.
+- **Web queries.** A `web` query that only excludes words, or joins `OR` with an exclusion, would match
+  every attachment without the word: it skips the media arm (`search.media_text_applied: false` with a hint
+  to use `search_files`). Otherwise an excluded word is judged on the text, never on the filename.
+- **Empty result.** `result_evidence` may add, computed with every filter of the search; each group (a stage,
+  a reason) is read on its own and counts at most 20 (`capped: true` when there are more; a reason's count
+  is a lower bound and `media_text_unavailable.count` caps at 20 as a whole): `media_text_pending`
+  `{count, newest_sent_at, next_action}` for media whose text may still arrive (download, extraction or
+  transcript queued or leased), and `media_text_unavailable` `{count, reasons}` for media whose text will
+  not arrive on its own, with a reason per group: `unconfigured` (audio; names the accounts, only the owner can enable
+  transcription), `unsupported`, `failed`, `size_limit`, `collection_excluded`, `outside_history_bounds`.
+  A queued download outside the collection policy or the history bounds is unavailable, not pending.
+  Neither replaces `empty_reason`. Both are optional: a failure to compute them costs only the fields.
+- **Cost.** A search that runs past the statement limit returns the existing `query_timeout` with
+  `next_action: retry_search_with_include_media_text=false`.
+- **Live.** `live=auto` and `live=on` are unchanged; live results are provider text only.
+
 ### Forwarded copies in search (ANYM-273)
 
 A `search` with a non-empty `query` returns forwarded copies of one message as
@@ -355,7 +407,9 @@ ANYM-53 summary (`empty_reason`, `requested_range_traversed`, `active_conflicts_
 `empty_fields` when a filter is empty) plus the live keys (`live`, `live_wait`, `suggested_call`,
 `archive_reread`) where they exist. `conversation_view` is `contract_version`, `order`,
 `content_is_untrusted` and `warnings` when there are any. The `search` block appears only as
-`{fuzzy_used: true}` when a fuzzy match was used (the rows are near misses). `detail="full"` adds
+`{fuzzy_used: true}` when a fuzzy match was used (the rows are near misses), and carries
+`media_text_applied`/`media_text_hint` when a query skipped media text and `media_low_quality_hits` when
+above zero (ANYM-665); rows add `matched_in` and `media_matches`, `result_evidence` the two media-text fields. `detail="full"` adds
 `basis`, `full_history_verified`, `message_index`, the `search` echo (`language`, `query_mode`, `order`,
 `fuzzy_candidate_limit`, `collapse_forwards`) and the `view` and `system_filter` fields of
 `conversation_view` (every full message row's `evidence` states `provider_currentness_verified`);
