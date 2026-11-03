@@ -428,8 +428,9 @@ class TelethonProvider:
         except FloodWaitError as exc: raise ProviderRateLimited(exc.seconds) from None
         except (FileReferenceExpiredError,FilerefUpgradeNeededError):
             # Even a freshly fetched preview can contain an expired reference.
-            # Retry this job with a fresh message on the next bounded attempt;
-            # one unavailable original must not stop every chat's collection.
+            # Retry this job with a fresh message on the next attempt (its own code and a
+            # three-attempt budget, media_retry.MEDIA_ATTEMPT_CAPS); one unavailable original
+            # must not stop every chat's collection.
             raise OSError('media_reference_expired') from None
 
 
@@ -945,6 +946,7 @@ class TelegramCollector:
                 # A missing directory, permission or read-only mount is local
                 # storage, not the provider network.
                 code,permanent='storage_unavailable',False
+            elif str(exc)=='media_reference_expired': code,permanent='media_reference_expired',False
             elif str(exc) in ('media_size_mismatch','media_hash_mismatch','blob_corrupt'):
                 code,permanent='integrity_error',False
             else: code,permanent='network_error',False

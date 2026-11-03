@@ -11,7 +11,7 @@ from time import monotonic
 from psycopg.types.json import Jsonb
 
 from .identifiers import ACCOUNT_RE
-from .media_retry import MEDIA_MAX_ATTEMPTS,MEDIA_PERMANENT_CODES,MEDIA_RATE_LIMIT_FREE_DAYS,retry_delay
+from .media_retry import MEDIA_ATTEMPT_CAPS,MEDIA_MAX_ATTEMPTS,MEDIA_PERMANENT_CODES,MEDIA_RATE_LIMIT_FREE_DAYS,retry_delay
 from .envelope import canonical, fingerprint, stable_id, validate
 from .store import serial as serial
 from .incoming_formatting import known as known_formatting, unknown as unknown_formatting, wire_digest
@@ -736,7 +736,7 @@ class Archive:
     def fail_media(self,job,code,*,permanent=False,retry_after=None,collector_lease=None):
         from .operational import LOCAL_STORAGE_ERRORS,MEDIA_ERRORS
         allowed={'unavailable','size_limit','rate_limited','network_error','disk_reserve','paused_storage',
-            'integrity_error','storage_unavailable'}
+            'integrity_error','storage_unavailable','media_reference_expired'}
         if code not in allowed|MEDIA_ERRORS: raise ValueError('invalid_error_code')
         if retry_after is not None and (type(retry_after) is not int or not 1<=retry_after<2**31):
             raise ValueError('invalid_retry_delay')
@@ -754,7 +754,7 @@ class Archive:
                 (MEDIA_RATE_LIMIT_FREE_DAYS,job['id'])).fetchone()['young']
             attempts=max(0,row['attempts']-1) if local_pause or local_storage or asked else row['attempts']
             terminal=not (local_pause or local_storage or asked) and (
-                permanent or code in MEDIA_PERMANENT_CODES or attempts>=MEDIA_MAX_ATTEMPTS)
+                permanent or code in MEDIA_PERMANENT_CODES or attempts>=MEDIA_ATTEMPT_CAPS.get(code,MEDIA_MAX_ATTEMPTS))
             stored='paused_storage' if local_pause else 'storage_unavailable' if code=='media_storage_unavailable' else code
             wait=60 if local_pause else 300 if local_storage else retry_delay(attempts,retry_after)
             c.execute('''UPDATE media_jobs SET state=%s,error_code=%s,lease_until=NULL,attempts=%s,
