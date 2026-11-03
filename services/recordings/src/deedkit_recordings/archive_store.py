@@ -866,6 +866,7 @@ class Store:
 
     def observe(self, account, provider_id, metadata, observations, now, guard=lambda: None, consistency=None):
         ns = namespace(account)
+        trial = {}
         def change(db):
             row = db.execute('SELECT rowid AS rid,* FROM records WHERE namespace=? AND provider_id=?', (ns, provider_id)).fetchone()
             if row is None:
@@ -907,7 +908,7 @@ class Store:
                 self.put_text(db, ns, row['rid'], row['ref'], metadata, parts, revision)
             if usable_change:
                 if self.feed_enabled:  # database work only: a feed problem can never stop text from being archived (ANYM-726)
-                    archive_feed.prepare(db, self.directory, self.clock(), self.feed_handled)
+                    archive_feed.prepare(db, self.directory, self.clock(), self.feed_handled, trial)
                 db.execute('INSERT INTO events(event_id,namespace,ref,revision,occurred) VALUES(?,?,?,?,?)',
                            (uuid.uuid4().hex, ns, row['ref'], revision, now))
             db.execute('UPDATE accounts SET last_success=COALESCE(?,last_success),error=?,text_bytes=MAX(0,text_bytes+?) '
@@ -915,6 +916,7 @@ class Store:
                 (now if any(o[0] == 'available' for o in observations.values()) else None,
                  next((o[2] for o in observations.values() if o[2]), None), text_after - text_before, ns))
         self.write(change, guard)
+        self.feed_handled.update(trial)  # only a committed bump counts as handled
 
     def account_error(self, account, code):
         self.write(lambda db: db.execute('INSERT INTO accounts(namespace,error) VALUES(?,?) ON CONFLICT(namespace) DO UPDATE SET error=excluded.error',
@@ -1068,20 +1070,21 @@ class Store:
             due = archive_feed.sync_needed(db, self.directory, view, now, self.feed_handled)
         if due:
             self.write(lambda db: archive_feed.sync(db, self.directory, view, now, self.feed_handled))
+            self.feed_handled.clear()  # committed: the marker now speaks for this database
 
     def feed_page(self, view, after, limit):
         now = self.clock()
         self.feed_sync(view, now)
         with self.connection() as db:
             db.execute('BEGIN')
-            return archive_feed.page(db, view, after, limit, now)
+            return archive_feed.page(db, self.directory, view, after, limit, now)
 
     def feed_head(self, view):
         now = self.clock()
         self.feed_sync(view, now)
         with self.connection() as db:
             db.execute('BEGIN')
-            return archive_feed.head_page(db, now)
+            return archive_feed.head_page(db, self.directory, now)
 
     def events(self, after, limit):
         with self.connection() as db:

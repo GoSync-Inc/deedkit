@@ -706,6 +706,188 @@ def test_a_consumer_following_the_contract_detects_a_journal_reset_and_never_rea
     asyncio.run(run())
 
 
+def journal_of(store, doc):
+    store.clock.now += 120
+    for _ in range(5):
+        try:
+            return store.run('feed_page', view_of(doc), 0, 1)['journal_id']
+        except Failure as error:
+            if error.code != 'feed_not_ready':
+                raise
+            store.clock.now += 120
+    raise AssertionError('never ready')
+
+
+def replace_database(doc, source, keep_marker=None):
+    archive = Path(doc['archive']['directory'])
+    for stale in archive.glob('archive.sqlite*'):
+        stale.unlink()
+    shutil.copy(source, archive / 'archive.sqlite')
+    (archive / 'archive.sqlite').chmod(0o600)
+    marker = archive / archive_feed.MARKER
+    if keep_marker is None:
+        marker.unlink(missing_ok=True)
+    else:
+        marker.write_text(keep_marker)
+        marker.chmod(0o600)
+    return archive
+
+
+# spec: ANYM-726
+def test_a_lost_marker_rotates_the_journal_id_and_a_surviving_marker_keeps_it(tmp_path):
+    """Two restores of the same older snapshot, each with a lost marker and a clock behind the other's incarnation, may
+    reuse an id; the router must see another journal_id (a source reset), never a continuation."""
+    path, doc = configuration(tmp_path)
+    account = accounts_of(doc)['omi-a']
+    snapshots = tmp_path.resolve() / 'snapshots'
+    snapshots.mkdir(mode=0o700)
+    store = open_store(doc)
+    try:
+        write(store, account, 'rec-1')
+        original = journal_of(store, doc)
+        backup_archive(parsed(doc).archive, snapshots / 'older.sqlite')
+        write(store, account, 'rec-2')
+        assert journal_of(store, doc) == original  # ordinary growth and bumps keep the journal
+    finally:
+        store.close()
+    archive = Path(doc['archive']['directory'])
+    saved = (archive / archive_feed.MARKER).read_text()
+    seen = {original}
+    for attempt in range(2):  # two timelines from one snapshot, the clock at the same minute, no marker
+        replace_database(doc, snapshots / 'older.sqlite')
+        store = open_store(doc, clock=T0)
+        try:
+            write(store, account, f'timeline-{attempt}', now=20)
+            seen.add(journal_of(store, doc))
+        finally:
+            store.close()
+    assert len(seen) == 3  # every lost-marker restore is a source reset for the router
+    # a restore whose marker survives (the marker is ahead of the older database) stays monotone and keeps the journal
+    replace_database(doc, snapshots / 'older.sqlite', keep_marker=saved)
+    store = open_store(doc, clock=T0 + 3600)
+    try:
+        write(store, account, 'after-restore', now=30)
+        assert journal_of(store, doc) == original
+    finally:
+        store.close()
+
+
+# spec: ANYM-726
+def test_a_marker_older_than_the_database_is_a_restore_after_a_restart(tmp_path, monkeypatch):
+    monkeypatch.setattr(archive_feed, 'LOCAL_CAP', 5)
+    path, doc = configuration(tmp_path)
+    account = accounts_of(doc)['omi-a']
+    snapshots = tmp_path.resolve() / 'snapshots'
+    snapshots.mkdir(mode=0o700)
+    store = open_store(doc)
+    try:
+        for number in range(3):
+            write(store, account, f'rec-{number}', now=number)
+        served(store, doc)  # marker: first incarnation, high water 3
+        archive = Path(doc['archive']['directory'])
+        old_marker = (archive / archive_feed.MARKER).read_text()
+        write(store, account, 'rec-3', now=3)  # the fourth row fills the epoch (capacity 4)
+        write(store, account, 'rec-4', now=4)  # the fifth: a cap bump INSIDE the text write, the marker not yet written
+        assert json.loads((archive / archive_feed.MARKER).read_text()) == json.loads(old_marker)
+        backup_archive(parsed(doc).archive, snapshots / 'between.sqlite')  # a volume snapshot taken in that window
+        for number in range(5, 8):
+            write(store, account, f'rec-{number}', now=number)
+        published = seqs(served(store, doc))
+    finally:
+        store.close()
+    replace_database(doc, snapshots / 'between.sqlite', keep_marker=old_marker)  # database newer than its marker
+    store = open_store(doc, clock=T0 + 3600)
+    try:
+        write(store, account, 'fresh', now=50)
+        later = seqs(served(store, doc))
+        assert later[-1] > max(published) and len(set(later)) == len(later)
+        assert not set(later[5:]) & set(published[5:]) and later[-1] // archive_feed.BASE > max(published) // archive_feed.BASE
+    finally:
+        store.close()
+
+
+# spec: ANYM-726
+def test_a_rolled_back_bump_does_not_suppress_the_next_one(tmp_path):
+    path, doc = configuration(tmp_path)
+    account = accounts_of(doc)['omi-a']
+    snapshots = tmp_path.resolve() / 'snapshots'
+    snapshots.mkdir(mode=0o700)
+    store = open_store(doc)
+    try:
+        for number in range(3):
+            write(store, account, f'rec-{number}', now=number)
+        backup_archive(parsed(doc).archive, snapshots / 'older.sqlite')
+        for number in range(3, 6):
+            write(store, account, f'rec-{number}', now=number)
+        published = seqs(served(store, doc))
+    finally:
+        store.close()
+    saved = (Path(doc['archive']['directory']) / archive_feed.MARKER).read_text()
+    replace_database(doc, snapshots / 'older.sqlite', keep_marker=saved)  # marker ahead of the database
+    store = open_store(doc, clock=T0 + 3600)
+    try:
+        store.discover(account, [{'id': 'next', 'title': 'T'}], None, 60)
+        def refuse():
+            raise Failure('archive_authorization_changed')
+        with pytest.raises(Failure, match='archive_authorization_changed'):
+            store.observe(account, 'next', {'id': 'next', 'title': 'T'}, {'transcript': ('available', 'words', None)}, 61, guard=refuse)
+        assert store.feed_handled == {}  # the rolled-back bump left no memory behind
+        store.observe(account, 'next', {'id': 'next', 'title': 'T'}, {'transcript': ('available', 'words', None)}, 62)
+        later = seqs(served(store, doc))
+        assert later[-1] > max(published) and later[-1] not in published
+    finally:
+        store.close()
+
+
+# spec: ANYM-726
+def test_a_page_serves_only_rows_the_marker_covers(tmp_path, monkeypatch):
+    path, doc = configuration(tmp_path)
+    account = accounts_of(doc)['omi-a']
+    store = open_store(doc)
+    try:
+        for number in range(3):
+            write(store, account, f'rec-{number}', now=number)
+        original = Store.feed_sync
+        def racing(self, view, now=None):
+            original(self, view, now)
+            if not racing.done:  # a collector commits between the sync and the page read
+                racing.done = True
+                write(self, account, 'racer', now=9)
+        racing.done = False
+        monkeypatch.setattr(Store, 'feed_sync', racing)
+        store.clock.now += 120
+        first = store.run('feed_page', view_of(doc), 0, 100)
+        assert len(first['events']) == 3 and first['has_more'] is False  # the raced row is not covered yet
+        monkeypatch.undo()
+        second = store.run('feed_page', view_of(doc), first['next_after'], 100)
+        assert len(second['events']) == 1
+        marker = archive_feed.read_marker(Path(doc['archive']['directory']))
+        assert marker['high_water'] == 4  # the marker covered the row before it was served
+        assert store.run('feed_head', view_of(doc))['head'] == seqs(second['events'])[-1]
+    finally:
+        store.close()
+
+
+# spec: ANYM-726
+def test_access_events_respect_the_epoch_capacity_one_by_one(tmp_path, monkeypatch):
+    monkeypatch.setattr(archive_feed, 'LOCAL_CAP', 5)
+    path, doc = configuration(tmp_path)
+    doc['principals'] = [{'id': f'agent-{n}', 'key_sha256': sha(f'key-{n}'), 'expires_at': '2099-01-01T00:00:00Z',
+                          'accounts': ['omi-a', 'omi-b'], 'permissions': ['recordings:read', 'recordings:content']} for n in range(4)]
+    store = open_store(doc)
+    try:
+        store.run('feed_sync', view_of(doc))
+        emptied = copy.deepcopy(doc)
+        emptied['principals'] = []
+        store.run('feed_sync', view_of(emptied))  # eight retractions in one sync
+        events = served(store, emptied)
+        assert len(events) == 8
+        assert max(s % archive_feed.BASE for s in seqs(events)) <= 4 and seqs(events) == sorted(set(seqs(events)))
+        assert len({s // archive_feed.BASE for s in seqs(events)}) == 2
+    finally:
+        store.close()
+
+
 # spec: ANYM-726
 def test_the_feed_meets_the_router_reference_consumer_rules(tmp_path):
     async def run():

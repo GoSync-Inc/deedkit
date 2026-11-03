@@ -450,8 +450,12 @@ an agent key on these routes is `unauthorized` (401). An older package refuses a
   into capped epochs). The feed answers `feed_not_ready` (503) until the wall clock has reached the new incarnation's minute (so
   up to a minute after a start or bump, and until the clock catches up after a clock regression): two restores inside one clock
   minute can therefore never publish the same incarnation twice. Events keep the identity they were first served with. A restored
-  older database, a lost marker, a new volume or a clock that went back can therefore never reuse or skip an identity. The feed
-  refuses to serve with `sequence_space_exhausted` when no incarnation with room is left (about 2043).
+  older database or a marker that does not match the database can therefore never reuse or skip an identity, and a page serves only
+  rows the fsynced marker already covers. A LOST or damaged marker on a journal that already has epochs (a new volume, a restore
+  without the marker) leaves the clock as the only watermark, so that bump also gives the journal a new `journal_id`: the router
+  reports a source reset and waits for its operator (`set-module-cursor`) instead of reading a possibly reused id as new. A restore
+  whose marker survived keeps the `journal_id`. The feed refuses to serve with `sequence_space_exhausted` when no incarnation with
+  room is left (about 2043).
 - Events (references only, at most 1 KiB, no title, text, label, provider ID, token or URL): `recording.text.archived`
   (`subject` and `data.recording_ref` the opaque ref, `data.account_ref`, `data.revision`; `urgency` `batch`) once per accepted
   usable text revision, and `recording.access.changed` (`data`: `account_ref`, `principal_ref`, `reason`

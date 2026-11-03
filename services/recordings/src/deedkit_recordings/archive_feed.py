@@ -15,6 +15,7 @@ import json
 import os
 import re
 import stat
+import uuid
 from datetime import datetime, timezone
 
 from .security import Failure, loads
@@ -171,13 +172,20 @@ def inspect(db, directory, now, handled=None):
     if unverified:
         marker_stale = marker != handled['marker']
     else:
-        marker_stale = marker is None or marker['high_water'] > head or marker['incarnation'] > stored
+        # Any marker that does not match the database is a restore or a crash we cannot tell apart: a lower incarnation is
+        # accepted only while this process itself made the bump and has not yet written the marker (`handled`).
+        marker_stale = marker is None or marker['high_water'] > head or marker['incarnation'] != stored
     bump_now = not epochs or stored != last or capped or marker_stale
     new = max(stored, last, marker['incarnation'] if marker else 0, minutes(now)) + 1 if bump_now else None
-    return {'epochs': epochs, 'head': head, 'marker': marker, 'bump': bump_now, 'new': new, 'unverified': unverified, 'last': last}
+    # A marker that is gone (lost, damaged, a new volume) on a journal that already has epochs leaves no surviving evidence of
+    # what was published, and the clock is the only watermark left. The journal then gets a new `journal_id`: the router reports a
+    # source reset and waits for its operator instead of reading a possibly reused id as new (SUBSCRIPTIONS.md, producer contract).
+    rotate = bump_now and bool(epochs) and marker is None
+    return {'epochs': epochs, 'head': head, 'marker': marker, 'bump': bump_now, 'new': new, 'unverified': unverified, 'last': last,
+            'rotate': rotate}
 
 
-def bump(db, new):
+def bump(db, new, rotate=False):
     """Start a new epoch (database rows only; no file I/O). The first start partitions an existing backlog so that no epoch
     holds more than `capacity` rows. The marker is written later, by `sync`."""
     epochs, head = read_epochs(db), head_sequence(db)
@@ -200,9 +208,11 @@ def bump(db, new):
             epochs.append([start, new])
     meta_set(db, 'feed_epochs', json.dumps(epochs, separators=(',', ':')))
     meta_set(db, 'incarnation', epochs[-1][1])
+    if rotate:
+        meta_set(db, 'journal_id', uuid.uuid4().hex)
 
 
-def prepare(db, directory, now, handled):
+def prepare(db, directory, now, handled, trial):
     """Inside the transaction that is about to insert a journal row, while the feed is enabled: when the identity is stale
     the new epoch starts BEFORE the row, so the row can never take an identity the router may already have consumed. Database
     work only; the marker file is not written here, so a marker failure can never stop text from being archived. An
@@ -210,8 +220,8 @@ def prepare(db, directory, now, handled):
     try:
         state = inspect(db, directory, now, handled)
         if state['bump']:
-            bump(db, state['new'])
-            handled['marker'] = state['marker']
+            bump(db, state['new'], state['rotate'])
+            trial['marker'] = state['marker']  # becomes `handled` only if the surrounding transaction commits
     except Failure:
         return
 
@@ -247,6 +257,12 @@ def changes(old, new):
     return result
 
 
+def ensure_room(db, now):
+    epochs = read_epochs(db)
+    if epochs and head_sequence(db) - epochs[-1][0] + 1 >= capacity(epochs[-1][1]):
+        bump(db, max(epochs[-1][1], minutes(now)) + 1)
+
+
 def sync_needed(db, directory, view, now, handled):
     state = inspect(db, directory, now, handled)
     desired = state['marker'] is not None and state['marker']['high_water'] == state['head'] and state['marker']['incarnation'] == state['last']
@@ -260,7 +276,7 @@ def sync(db, directory, view, now, handled):
     these rows is served). Idempotent: the view is stored in the same transaction as its events."""
     state = inspect(db, directory, now, handled)
     if state['bump']:
-        bump(db, state['new'])
+        bump(db, state['new'], state['rotate'])
     stored = meta_get(db, 'access_view')
     try:
         old = loads(stored) if stored is not None else None
@@ -268,6 +284,7 @@ def sync(db, directory, view, now, handled):
         old = None  # unreadable: re-baseline without events rather than guess
     if old is not None:
         for reason, name, account, namespace in changes(old, view['principals']):
+            ensure_room(db, now)  # every event, not only the batch, respects the epoch capacity
             ref = '|'.join(('access', reason, safe_ref(name), account))
             db.execute('INSERT INTO events(event_id,namespace,ref,revision,occurred) VALUES(?,?,?,?,?)',
                        (hashlib.sha256(f'{reason}|{name}|{account}|{namespace}|{now}'.encode()).hexdigest()[:32] + os.urandom(2).hex(),
@@ -275,7 +292,6 @@ def sync(db, directory, view, now, handled):
     meta_set(db, 'access_view', json.dumps(view['principals'], sort_keys=True, separators=(',', ':')))
     epochs = read_epochs(db)
     write_marker(directory, epochs[-1][1], head_sequence(db))
-    handled.clear()  # the marker now speaks for this database
 
 
 def ready(epochs, now):
@@ -305,13 +321,20 @@ def envelope(row, seq, namespaces):
     return None
 
 
-def page(db, view, after, limit, now):
+def covered(db, directory):
+    """The highest local journal number the marker on disk covers. A page serves nothing above it, so a row that a collector
+    committed after the marker was written is published only after the next sync has covered it."""
+    marker = read_marker(directory)
+    return min(head_sequence(db), marker['high_water']) if marker else 0
+
+
+def page(db, directory, view, after, limit, now):
     epochs = read_epochs(db)
     if not ready(epochs, now):
         raise Failure('feed_not_ready')
-    head = head_sequence(db)
-    rows = db.execute('SELECT sequence,event_id,namespace,ref,revision,occurred FROM events WHERE sequence>? '
-                      'ORDER BY sequence LIMIT ?', (local_after(epochs, after, head), max(SCAN, limit * 5))).fetchall()
+    head, ceiling = head_sequence(db), covered(db, directory)
+    rows = db.execute('SELECT sequence,event_id,namespace,ref,revision,occurred FROM events WHERE sequence>? AND sequence<=? '
+                      'ORDER BY sequence LIMIT ?', (local_after(epochs, after, head), ceiling, max(SCAN, limit * 5))).fetchall()
     events, last_local, last_seq = [], None, None
     for row in rows:
         seq = seq_of(epochs, row['sequence'])
@@ -321,14 +344,15 @@ def page(db, view, after, limit, now):
             events.append(built)
             if len(events) == limit:
                 break
-    more = last_local is not None and db.execute('SELECT 1 FROM events WHERE sequence>? LIMIT 1', (last_local,)).fetchone() is not None
+    more = last_local is not None and db.execute('SELECT 1 FROM events WHERE sequence>? AND sequence<=? LIMIT 1',
+                                                 (last_local, ceiling)).fetchone() is not None
     floor = meta_get(db, 'feed_retention_floor', 0)
     return {'events': events, 'next_after': max(after, last_seq) if last_seq is not None else after, 'has_more': more,
             'retention_floor': floor if type(floor) is int else 0, 'journal_id': meta_get(db, 'journal_id')}
 
 
-def head_page(db, now):
+def head_page(db, directory, now):
     epochs = read_epochs(db)
     if not ready(epochs, now):
         raise Failure('feed_not_ready')
-    return {'journal_id': meta_get(db, 'journal_id'), 'head': head_of(epochs, head_sequence(db))}
+    return {'journal_id': meta_get(db, 'journal_id'), 'head': head_of(epochs, covered(db, directory))}
