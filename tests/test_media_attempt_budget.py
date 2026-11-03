@@ -244,6 +244,31 @@ def test_restore_without_acls_does_not_leave_wake_media_job_open_to_public(archi
 
 
 # spec: ANYM-699
+def test_restore_without_acls_does_not_leave_queue_managed_original_open_to_public(archive):
+    _,s,_,_=archive
+    queue="'public.queue_managed_original(text)'::regprocedure"
+    role='media_ungranted_'+uuid4().hex
+    try:
+        with s.pool.connection() as c:c.execute(sql.SQL('CREATE ROLE {}').format(sql.Identifier(role)))
+        with gateway(s) as restricted:
+            with s.pool.connection() as c:
+                c.execute('GRANT EXECUTE ON FUNCTION public.queue_managed_original(text) TO PUBLIC')  # what a restore does
+                assert c.execute(f"SELECT has_function_privilege('public',{queue},'EXECUTE') AS open").fetchone()['open'] is True
+            s.migrate();s.migrate()
+            with s.pool.connection() as c:
+                assert c.execute(f"SELECT has_function_privilege('public',{queue},'EXECUTE') AS open").fetchone()['open'] is False
+            with restricted.pool.connection() as c:
+                assert c.execute(f"SELECT has_function_privilege({queue},'EXECUTE') AS ok").fetchone()['ok'] is True
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            with s.pool.connection() as c:
+                c.execute(sql.SQL('SET LOCAL ROLE {}').format(sql.Identifier(role)))
+                c.execute("SELECT public.queue_managed_original('none')")
+    finally:
+        with s.pool.connection() as c:
+            c.execute(sql.SQL('DROP ROLE IF EXISTS {}').format(sql.Identifier(role)))
+
+
+# spec: ANYM-699
 @pytest.mark.parametrize('case',['function_missing','grant_missing'])
 def test_request_is_recorded_and_the_job_keeps_waiting_when_the_wake_is_not_available(archive,case):
     ar,s,key,_=archive; fid=pending(ar,s)

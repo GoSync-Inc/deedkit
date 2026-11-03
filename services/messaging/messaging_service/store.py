@@ -1398,6 +1398,11 @@ class Store:
                     'public.wake_media_job(text)')),'USAGE') THEN
                  REVOKE ALL ON FUNCTION public.wake_media_job(text) FROM PUBLIC;
                 END IF;
+                -- Migration 033: queue_managed_original reopens a ready job for the gateway and cold-archive roles only.
+                IF pg_has_role((SELECT proowner FROM pg_proc WHERE oid=to_regprocedure(
+                    'public.queue_managed_original(text)')),'USAGE') THEN
+                 REVOKE ALL ON FUNCTION public.queue_managed_original(text) FROM PUBLIC;
+                END IF;
             END $$''')
 
     def expand_status(self):
