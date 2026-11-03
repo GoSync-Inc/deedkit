@@ -162,14 +162,15 @@ stages in order, and `get_subscription_events` shows where it was at each:
 | The dispatcher posts it | `delivered_at` (first delivered hint covering the event) | A lane polls every 2 s; the POST times out after 5 s |
 
 `delivered_at` is null until a hint covering the event is delivered. It is also null for
-an event at or below `hints_deleted_through`, because retention deleted finished hints
-and the first one that covered it may be gone (it never shows a later hint's time instead). A test hint or a dead-lettered one never sets it.
+an event at or below `hints_deleted_through`, or whose first hint may be gone because
+retention deleted finished hints (it never shows a later hint's time instead). A test hint or a dead-lettered one never sets it.
 What can add more than a few seconds:
 
 - Hint policy, visible in `get_subscription` as `delivery.held_reason` and `next_hint_at`:
   `debounce_s` waits for a quiet gap, `batch_window_s` for its window, `batch_count` for
-  its count; `max_wait_s` caps `debounce_s` and `batch_count` and defaults to 300 s (or
-  `debounce_s` if larger) whenever either is set. Quiet hours hold a due hint to the window end.
+  its count; `max_wait_s` caps `debounce_s` and is the timeout of a `batch_count` without a
+  `batch_window_s` (with both, the window ends the wait unless the count comes first), and
+  defaults to 300 s (or `debounce_s` if larger) whenever `debounce_s` or `batch_count` is set. Quiet hours hold a due hint to the window end.
   The policy's hourly budget (20 hints per key, `SUBSCRIPTION_MAX_HINTS_PER_HOUR`) holds it
   to the next slot, and a self-service key with 32 queued hints holds the next one for a
   minute; both read `held_reason: budget`.

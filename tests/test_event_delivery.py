@@ -217,6 +217,40 @@ def test_delivered_at_is_unknown_once_retention_removed_the_first_hint_that_cove
     assert after[first] is None and after[second] == times[second]
 
 
+# spec: ANYM-734
+def test_delivered_at_is_unknown_when_a_batch_limit_removed_one_of_two_hints_at_the_same_position(seeded, tmp_path):
+    from messaging_service import subscription_retention
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    token = identity(store)
+    sid = subscription(store, token)
+    rid, _ = receiver(store, token, tmp_path)
+    call(store, token, 'configure_subscription_delivery', sid, 1, rid)
+    event = emit(store)
+    match_subscriptions(store)
+    assert dispatch_hints(store, transport=lambda *a, **k: 204, resolver=lambda *a, **k: ['93.184.216.34'])['delivered'] == 1
+    with store.pool.connection() as c:
+        # A second finished hint at the same position (an endpoint resume writes one); the earlier one has the lower ID.
+        c.execute("""INSERT INTO subscription_outbox(subscription,subscription_version,receiver,through_position,kind,
+            request_id,state,attempts,created_at,admitted_at,finished_at)
+            SELECT subscription,subscription_version,receiver,through_position,kind,'synthetic-twin',state,attempts,
+                created_at,admitted_at,finished_at FROM subscription_outbox WHERE subscription=%s AND kind='events'""", (sid,))
+        ids = [r['id'] for r in c.execute("SELECT id FROM subscription_outbox WHERE subscription=%s AND kind='events' "
+            "ORDER BY id", (sid,)).fetchall()]
+        for days, hint in zip((41, 40), ids):
+            c.execute("UPDATE subscription_outbox SET finished_at=clock_timestamp()-make_interval(days=>%s) WHERE id=%s",
+                (days, hint))
+    [item] = store.get_subscription_events(token, sid)['items']
+    assert item['event_id'] == event and item['delivered_at'] is not None
+    # Retention takes one hint per batch, the earlier of the two; the other stays and the visibility floor does not move.
+    with store.pool.connection() as c:
+        row = c.execute('SELECT * FROM subscriptions WHERE id=%s', (sid,)).fetchone()
+        assert subscription_retention._delete_hints(c, row, 1, days=30) == 1
+        assert c.execute('SELECT hints_deleted_through AS t FROM subscriptions WHERE id=%s', (sid,)).fetchone()['t'] == 0
+    [item] = store.get_subscription_events(token, sid)['items']
+    assert item['delivered_at'] is None
+
+
 def test_receiver_validation_and_revocation_fail_closed(seeded, tmp_path):
     from messaging_service.event_delivery import validate_endpoint, dispatch_hints
     for endpoint, addresses in [('http://example.com/wake', ['93.184.216.34']),
