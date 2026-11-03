@@ -10,6 +10,7 @@ import pytest
 from messaging_service import archive as archive_module
 from messaging_service.blobs import BlobWriter
 from messaging_service.envelope import stable_id
+from messaging_service.media_retry import MEDIA_MAX_ATTEMPTS
 from test_archive import archive as archive, event
 
 
@@ -175,8 +176,8 @@ def housekeeping(ar, s):
     exhausted=message(ar,'exhausted',40*86400)
     jobs=[]
     with s.pool.connection() as c:
-        c.execute('''UPDATE media_jobs SET state='leased',attempts=5,lease_owner='crashed',lease_epoch=5,
-            lease_until=clock_timestamp()-interval '1 minute' WHERE message=%s''',(exhausted,))
+        c.execute('''UPDATE media_jobs SET state='leased',attempts=%s,lease_owner='crashed',lease_epoch=5,
+            lease_until=clock_timestamp()-interval '1 minute' WHERE message=%s''',(MEDIA_MAX_ATTEMPTS,exhausted))
         for name,expires in (('reaped-expired','-1 minute'),('reaped-stale','1 hour'),('kept','1 hour')):
             mid=message(ar,name,50*86400)
             job=c.execute('SELECT id FROM media_jobs WHERE message=%s',(mid,)).fetchone()['id']
@@ -370,7 +371,7 @@ def test_window_path_keeps_collection_safety(backlog, change):
         elif change=='disabled':c.execute('UPDATE account_policies SET enabled=false WHERE account=%s',(ACCOUNT,))
         elif change=='superseded':c.execute("UPDATE media_jobs SET state='superseded' WHERE message=%s",(mid,))
         elif change=='cooldown':c.execute("UPDATE media_jobs SET next_due=clock_timestamp()+interval '1 hour' WHERE message=%s",(mid,))
-        elif change=='attempts':c.execute('UPDATE media_jobs SET attempts=5 WHERE message=%s',(mid,))
+        elif change=='attempts':c.execute('UPDATE media_jobs SET attempts=%s WHERE message=%s',(MEDIA_MAX_ATTEMPTS,mid))
     assert claim() is None
 
 

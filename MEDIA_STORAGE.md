@@ -464,8 +464,11 @@ whose lease expires spends its attempt the same way, and the expired lease of th
 older than 7 days (`created_at`) it spends one again, so no job waits forever. The storage
 pauses above also give the attempt back. A job waiting out a backoff never blocks another job
 (the claim takes the next due one), and an explicit `request_file_download` makes a job whose
-backoff is an hour or longer due at once, without an attempt, except while a provider
-`rate_limited` wait runs (then the request is `deferred`). Nothing re-queues a `failed` job,
+backoff is an hour or longer due at once, without an attempt, also while an earlier request
+window is open (`coalesced`), except while a provider `rate_limited` wait runs (then the request
+is `deferred`). The wake is the SQL function `wake_media_job` (migration 066; the gateway role
+holds only EXECUTE on it, not UPDATE on `next_due`); before 066 the request is still recorded
+and the job keeps waiting. The same migration raises the cap of `queue_managed_original` to 8. Nothing re-queues a `failed` job,
 and a request does not (above); rows that failed under the old five-attempt budget stay
 `failed` until the operator recovery of DK-05. The code stored on a job is the last failure's.
 `network_error` is the catch-all for a failure that has no typed code: a lost adapter, a reply

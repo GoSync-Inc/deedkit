@@ -600,14 +600,14 @@ def test_schema65_replaces_only_the_validator_function_keeps_its_acl_and_is_repe
         # Synthetic disposable database only: the schema-64 function, ledger and version.
         c.execute(previous)
         assert accepts(c, failed_event(1)) and not accepts(c, five)
-        c.execute('DELETE FROM archive_migrations WHERE version=65')
+        c.execute('DELETE FROM archive_migrations WHERE version IN (65,66)')
         c.execute("UPDATE probe_metadata SET value='64' WHERE name='schema_version'")
         acl = c.execute(f'SELECT proacl::text AS acl, proowner::regrole::text AS owner FROM pg_proc WHERE oid={function}').fetchone()
         grants = c.execute("SELECT oid,relacl::text FROM pg_class WHERE relnamespace='public'::regnamespace ORDER BY oid").fetchall()
     store.migrate()
     store.migrate()
     with store.pool.connection() as c:
-        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '65'
+        assert c.execute("SELECT value FROM probe_metadata WHERE name='schema_version'").fetchone()['value'] == '66'
         assert c.execute('SELECT count(*) AS n FROM archive_migrations WHERE version=65').fetchone()['n'] == 1
         assert accepts(c, five) and accepts(c, failed_event(1))
         assert not accepts(c, failed_event(1, provider_code=21215)) and not accepts(c, failed_event(1, provider_text='x'))

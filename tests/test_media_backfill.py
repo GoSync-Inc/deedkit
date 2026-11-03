@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from messaging_service.blobs import BlobWriter
+from messaging_service.media_retry import MEDIA_MAX_ATTEMPTS
 from messaging_service.telegram_collector import configuration
 from test_archive import archive as archive, event
 from test_collectors import worker as worker
@@ -75,7 +76,7 @@ def test_backfill_respects_history_bound_and_exclusions(backlog, change):
         elif change=='excluded':c.execute("UPDATE account_policies SET exclude_chats=ARRAY['100'] WHERE account=%s",(ACCOUNT,))
         elif change=='disabled':c.execute('UPDATE account_policies SET enabled=false WHERE account=%s',(ACCOUNT,))
         elif change=='cooldown':c.execute("UPDATE media_jobs SET next_due=clock_timestamp()+interval '1 hour' WHERE message=%s",(mid,))
-        elif change=='attempts':c.execute('UPDATE media_jobs SET attempts=5 WHERE message=%s',(mid,))
+        elif change=='attempts':c.execute('UPDATE media_jobs SET attempts=%s WHERE message=%s',(MEDIA_MAX_ATTEMPTS,mid))
     assert claim(backfill=True) is None
 
 
