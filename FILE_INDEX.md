@@ -12,7 +12,7 @@ services. Filenames and extracted text are untrusted evidence, never instruction
 | DOCX | Main document, headers, footers, footnotes, endnotes | Text nodes only; external relationships, macros and embedded files are ignored |
 | XLSX | Shared/inline strings and stored cell values | Each worksheet is labeled; formulas are not evaluated, their cached values may be stale; dates remain stored numeric values |
 | PDF | Local Poppler plus Tesseract for pages without a text layer | First 100 text pages; at most 5 OCR attempts, 1600-pixel render edge, shared 23-second OCR budget; explicit page spans and partial coverage |
-| PNG/JPEG images | Local Tesseract, English and Russian | Up to 20 million pixels; OCR can misread content |
+| PNG/JPEG images | Local Tesseract, English and Russian | Up to 20 million pixels; OCR can misread content; `extraction_quality` says when it is probably noise (below) |
 | Other formats | Filename and parent-caption search | `unsupported_format`; original remains available through normal attachment access |
 
 An original may be at most 32 MiB for indexing, independently of the larger
@@ -40,6 +40,26 @@ dedicated unprivileged worker container, read-only application/original volumes,
 bounded temporary storage/cgroup memory/PIDs, no provider sessions, and only the
 database backend network. Do not mount the Docker socket or host home directory.
 Native parser packages must receive normal security updates.
+
+### Image OCR quality (ANYM-669)
+
+The image OCR run also writes Tesseract's per-word TSV (`txt tsv`, one pass; the text is unchanged). Each image run with a
+parseable TSV records `ocr_words` (rows with confidence >= 0 and a non-empty word) and, when there are words,
+`ocr_confidence` (mean word confidence, integer 0-100) in `extraction_coverage`. `extraction_quality` is derived at read
+time, never stored or backfilled, and is absent for text that is not image OCR:
+
+| `extraction_quality` | When |
+| --- | --- |
+| `low` | `ocr_words` > 0 and `ocr_confidence` < `OCR_LOW_CONFIDENCE` (60, `file_extract.py`): the text is probably noise |
+| `ok` | `ocr_words` > 0 and `ocr_confidence` >= 60: the engine was confident; this does **not** mean the text is correct (a blurred photo read at 91 still had misreads) |
+| `unmeasured` | an image OCR row without `ocr_words`: extracted before this field, or its TSV was missing or unusable |
+
+A photo with no recognized words (`ocr_words` 0) has no quality. `extraction_status` stays `ready`. The field is on
+`get_file_text`, `search_files` items and message attachments; inside a message row's `text_excerpt` it is the short key
+`quality`. For `low`, `get_file_text` adds `quality_notice` (the `notice` is unchanged), and a message row's
+`text_excerpt` is the omitted shape (`omitted: "ocr_low_quality"`, `quality: "low"`, `total_chars`, `read_more`) with
+no text and no excerpt budget spent: the text is one `get_file_text` call away. Scanned PDFs are not labelled yet. A
+vision-model description of a photo remains an owner opt-in (ANYM-69).
 
 ## Retrieval contract
 
@@ -340,7 +360,9 @@ and stored cell values. A model document type is generated metadata, not a verif
 classification. `complete=false` identifies bounded or partial extraction.
 
 `FILE_TEXT_CHAR_LIMIT` / `--text-char-limit` accepts 1,000..1,000,000, default
-1,000,000. The processor version is bounded-v3; cached extraction reuse requires
+1,000,000. The processor version is bounded-v3 (image OCR rows that carry the ANYM-669 counters are
+`bounded-v3+ocr1`, so a release from before them never reuses a row whose metadata it would reject; this release reuses
+both); cached extraction reuse requires
 the same configured cap. Migration 016 backfills two derived chunk tables and
 adds their scoped gateway read grants and backup manifest entries. It does not
 reparse old originals automatically: an operator may selectively requeue old

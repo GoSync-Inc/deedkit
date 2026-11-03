@@ -32,7 +32,7 @@ def processing_phases(c, row):
         m.provider_id AS provider_message_id,
         (SELECT metadata->>'media_kind' FROM message_metadata
             WHERE message=m.id AND revision=m.revision) AS media_kind,
-        coalesce(length(f.text_content),0) AS text_chars,f.processor_version,
+        coalesce(length(f.text_content),0) AS text_chars,f.processor_version,f.extractor,
         coalesce(f.truncated,false) AS truncated,
         (f.extraction_metadata-'page_spans'-'sheet_spans'-'cell_spans') AS extraction_metadata,
         CASE WHEN coalesce(e.state,'unconfigured')='unconfigured' AND EXISTS(
@@ -102,8 +102,12 @@ def attachment_fields(row, *, original_present=None):
             action='get_attachment' if requested or state=='leased' else 'request_file_download' if state=='queued' else 'get_sync_status_for_chat'
     extraction=row.get('extraction_state',row.get('extraction_status','unknown')) if registered else 'awaiting_download'
     enrichment=row.get('enrichment_state',row.get('enrichment_status','unconfigured')) if registered else 'awaiting_download'
-    coverage={key:row[key] for key in ('text_chars','processor_version','truncated','extraction_metadata')
+    coverage={key:row[key] for key in ('text_chars','processor_version','truncated','extraction_metadata','extractor')
         if registered and key in row}
+    # ANYM-669: a message read selects only the two OCR counters (ocr_metadata); they join the coverage for OCR rows
+    # without adding an extraction_metadata (or extractor) key to the attachment item.
+    ocr=row.get('ocr_metadata') if registered and 'extraction_metadata' not in row else None
+    if ocr:coverage['extraction_metadata']=ocr
     provenance={key:row[key] for key in ('provider_platform','provider_message_id','media_kind') if key in row}
     description={key:value for key,value in row.items() if key.startswith('understanding_')}
     detail=(describe(reason) if reason in WAITING else
@@ -113,6 +117,8 @@ def attachment_fields(row, *, original_present=None):
         'digest':digest if registered else None,'error_code':error,**coverage,**provenance,**description},
         download_status=download_status,extraction_status=extraction,
         enrichment_status={'leased':'processing','unconfigured':'not_configured'}.get(enrichment,enrichment))
+    item.pop('extractor',None)
+    if ocr:item.pop('extraction_metadata',None)
     item.update(state=state,status='unavailable' if original_present is False and registered else state,
         declared_mime=descriptor.get('mime'),declared_bytes=descriptor.get('bytes'),
         verified_bytes=row.get('bytes') if registered else None,
