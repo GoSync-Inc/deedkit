@@ -808,9 +808,18 @@ def test_text_saved_before_an_upgrade_is_counted_once_so_the_projection_sees_it(
     async def run():
         r = runtime(path, omi); await r.start(background=False)
         await r.run_once(now=T0)
-        status = await r.status(account, now=T0 + 10)
+        current = accounts_of(r)[0]
+        status = await r.status(current, now=T0 + 10)
         assert status['with_text'] == 6 and status['traversal']['discovered_total'] == 706
         assert status['projected_db_bytes'] > 15_000_000
+        # Transcript-only records count in full, and the counter is stable across passes and a restart.
+        assert sql(doc, 'SELECT text_bytes FROM accounts WHERE namespace=?', ns) == [(3 * 20000 + 3 * len('old words 0'),)]
+        await r.run_once(now=T0 + 400)
+        await r.close()
+        r = runtime(path, omi); await r.start(background=False)
+        await r.run_once(now=T0 + 800)
+        assert sql(doc, 'SELECT text_bytes FROM accounts WHERE namespace=?', ns) == [(3 * 20000 + 3 * len('old words 0'),)]
+        assert (await r.status(accounts_of(r)[0], now=T0 + 900))['projected_db_bytes'] > 15_000_000
         await r.close()
     asyncio.run(run())
 

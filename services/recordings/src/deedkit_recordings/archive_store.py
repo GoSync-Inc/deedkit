@@ -297,8 +297,10 @@ class Store:
             if db.execute("SELECT 1 FROM meta WHERE key='text_reconciled'").fetchone() is None:
                 # An archive upgraded from schema 2: count the text it already holds once (account counters only; no
                 # record is rewritten), so the capacity projection sees accepted text saved before the upgrade.
-                db.execute("UPDATE accounts SET text_bytes=(SELECT COALESCE(SUM(length(CAST(json_extract(parts,'$.transcript.text') AS BLOB))"
-                           "+length(CAST(json_extract(parts,'$.summary.text') AS BLOB))),0) FROM records "
+                # A record with one part only has NULL for the other: each part counts as 0 when absent.
+                db.execute("UPDATE accounts SET text_bytes=(SELECT COALESCE(SUM("
+                           "COALESCE(length(CAST(json_extract(parts,'$.transcript.text') AS BLOB)),0)"
+                           "+COALESCE(length(CAST(json_extract(parts,'$.summary.text') AS BLOB)),0)),0) FROM records "
                            "WHERE records.namespace=accounts.namespace)")
                 db.execute("INSERT INTO meta(key,value) VALUES('text_reconciled',1)")
             row = db.execute('SELECT * FROM accounts WHERE namespace=?', (ns,)).fetchone()
