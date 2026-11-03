@@ -24,7 +24,7 @@ from .archive import Archive
 from .blobs import BlobWriter
 from .envelope import stable_id
 from .collector_state import LIVE_REJECT_CODES,CaptureSpool,CollectorState,PeerKindConflict,session_lock
-from .spool import InvalidCapture
+from .spool import InvalidCapture,PoisonItem
 from .collector_common import DbBackoff,commit_items,validate_common,validate_ranges
 from .store import Store
 from .telegram_governor import LIVE_BUDGETS,LIVE_STATE,ProviderRateLimited,RequestGovernor
@@ -160,6 +160,11 @@ def history_bound(value):
     except ValueError: raise ValueError('invalid_history_since') from None
     if result.tzinfo is None: raise ValueError('invalid_history_since')
     return result.astimezone(timezone.utc)
+
+
+def marked_channel(peer_id):
+    """A marked -100... id is a channel even where Telethon's Dialog.is_channel is False (a ChannelForbidden)."""
+    return re.fullmatch(r'-100[0-9]+',str(peer_id)) is not None
 
 
 def peer_kind(message):
@@ -346,7 +351,7 @@ class TelethonProvider:
             except ProviderRateLimited:
                 if batch:yield batch;batch=[]
                 continue
-            kind='channel' if dialog.is_channel else ('user' if dialog.is_user else 'chat')
+            kind='channel' if dialog.is_channel or marked_channel(dialog.id) else ('user' if dialog.is_user else 'chat')
             chat_type='private' if dialog.is_user else ('group' if dialog.is_group else 'channel')
             raw=getattr(dialog,'dialog',None)
             observation={'observed_at':page_observed_at,
@@ -792,15 +797,20 @@ class TelegramCollector:
 
     async def drain_captures(self,spools,history_spools=()):
         last=None;count=0
+        def settle(item):
+            # A kept item whose chat has another stored kind can never apply: quarantine its bytes so the
+            # other chats keep draining (counted in capture_progress), instead of ending the worker.
+            try:return self.state.apply(item)
+            except PeerKindConflict as exc:raise PoisonItem('peer_kind_conflict') from exc
         def apply(item):
             nonlocal last,count
-            self.state.apply(item);last=item;count+=1
+            settle(item);last=item;count+=1
         gap_lock=getattr(getattr(self,'provider',None),'read_gap_lock',None) or nullcontext()
         async with gap_lock:await self.flush_read_gap()
         for spool in spools:await asyncio.to_thread(spool.drain,apply,100)
         # History pages were applied inline when fetched. Replaying them is
         # idempotent and is neither live progress nor live backlog.
-        for spool in history_spools:await asyncio.to_thread(spool.drain,self.state.apply,100)
+        for spool in history_spools:await asyncio.to_thread(spool.drain,settle,100)
         publish=getattr(self.state,'publish_receipts',None)
         if callable(publish):await asyncio.to_thread(publish,limit=100)
         if count or time.monotonic()>=getattr(self,'_next_capture_status',0):

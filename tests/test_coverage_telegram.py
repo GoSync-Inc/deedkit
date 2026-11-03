@@ -410,6 +410,47 @@ def test_peer_kind_mismatch_fails_only_that_chat_and_the_pass_goes_on(worker, ca
     assert [(line['chat'], line['code']) for line in lines] == [('102', 'peer_kind_conflict')]
 
 
+# spec: ANYM-102
+def test_live_capture_of_a_peer_kind_conflict_is_quarantined_and_other_chats_keep_draining(worker):
+    w, store, _ = worker
+    w.state.chat('102', 'chat')
+    for chat, n in (('102', 1), ('103', 2)):
+        asyncio.run(w.capture(NS(message=message(n, chat=chat))))
+    asyncio.run(w.drain_captures([w.spool]))
+    assert w.spool.quarantined() == 1 and not list(w.spool.path.glob('*.json'))
+    with store.pool.connection() as c:
+        archived = {r['provider_chat'] for r in c.execute('SELECT provider_chat FROM chats WHERE account=%s',
+            (w.account,))}
+    assert '103' in archived and '102' not in archived
+
+
+# spec: ANYM-102
+def test_discovery_repairs_only_a_chat_stored_as_basic_group_under_a_marked_channel_id(worker):
+    w, store, _ = worker
+    for chat, kind in (('-1001', 'chat'), ('-7', 'channel'), ('300', 'chat')):
+        w.state.chat(chat, kind)
+    w.state.inventory([('-1001', 'channel', 'A', 'channel'), ('-7', 'chat', 'B', 'group'),
+                       ('300', 'channel', 'C', 'channel')], None, discovery=True)
+    with store.pool.connection() as c:
+        kinds = {r['provider_chat']: r['peer_kind'] for r in c.execute(
+            'SELECT provider_chat,peer_kind FROM collector_chats WHERE account=%s', (w.account,))}
+    assert kinds == {'-1001': 'channel', '-7': 'channel', '300': 'chat'}
+    assert w.state.chat('-1001', 'channel')['peer_kind'] == 'channel'
+
+
+# spec: ANYM-102
+def test_dialog_of_a_forbidden_channel_is_discovered_as_a_channel():
+    from test_chat_roles import Dialogs
+    class Governor:
+        async def call(self, operation, phase): return await operation()
+    # Telethon's Dialog.is_channel is False for a ChannelForbidden, whose marked id is still a channel id.
+    forbidden = NS(id=-1002, is_channel=False, is_user=False, is_group=False, name='Forbidden', entity=None, dialog=None)
+    provider = TelethonProvider.__new__(TelethonProvider)
+    provider.client = NS(iter_dialogs=lambda **kwargs: Dialogs([forbidden])); provider.governor = Governor()
+    async def collect(): return [row async for batch in provider.dialog_batches(None) for row in batch]
+    assert [row[1] for row in asyncio.run(collect())] == ['channel']
+
+
 def fake_reconcile(provider, failed):
     async def dialogs(limit): return [('100', 'user', 'One'), ('200', 'user', 'Two')]
     provider.dialogs = dialogs

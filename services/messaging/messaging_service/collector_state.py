@@ -89,8 +89,9 @@ MAX_REJECTED_MESSAGES=20
 # Per-chat history scan errors (ANYM-293): an unavailable peer, a rate limit, a transient server
 # error after its retries, or any other provider error of that chat. The last two are stored as
 # provider_unavailable, which every deployed reader knows; history.chat_errors keeps the exact one.
-CHAT_SCAN_ERRORS=('provider_unavailable','rate_limited','provider_temporarily_unavailable','provider_chat_error',
-    'peer_kind_conflict')
+CHAT_SCAN_ERRORS=('provider_unavailable','rate_limited','provider_temporarily_unavailable','provider_chat_error')
+# Reasons kept only in history.chat_errors: the column stores provider_unavailable, so no reader's mapping grows.
+CHAT_DIAGNOSTIC_ERRORS=('peer_kind_conflict',)
 
 
 class PeerKindConflict(RuntimeError):
@@ -424,7 +425,10 @@ class CollectorState:
                         VALUES(%s,%s,%s,%s) ON CONFLICT(account,provider_chat) DO UPDATE SET
                         window_complete=CASE WHEN collector_chats.history_since IS DISTINCT FROM
                             excluded.history_since THEN false ELSE collector_chats.window_complete END,
-                        history_since=excluded.history_since''',(self.account,chat,kind,history_since))
+                        history_since=excluded.history_since,
+                        peer_kind=CASE WHEN collector_chats.peer_kind='chat' AND excluded.peer_kind='channel'
+                            AND excluded.provider_chat ~ '^-100[0-9]+$' THEN 'channel' ELSE collector_chats.peer_kind END''',
+                        (self.account,chat,kind,history_since))
                     c.execute('''INSERT INTO chats(id,account,title,chat_type,provider_chat) VALUES(%s,%s,%s,%s,%s)
                         ON CONFLICT(id) DO UPDATE SET
                         title=CASE WHEN excluded.title<>%s AND excluded.title<>'' THEN excluded.title ELSE chats.title END,
@@ -475,7 +479,7 @@ class CollectorState:
                       (self.account,chat))
 
     def failed(self,chat,code,evidence=None):
-        if code not in CHAT_SCAN_ERRORS:raise ValueError('invalid_scan_error')
+        if code not in CHAT_SCAN_ERRORS+CHAT_DIAGNOSTIC_ERRORS:raise ValueError('invalid_scan_error')
         if evidence is not None:evidence=validate_chat_error(evidence)
         with self.archive.store.pool.connection() as c:
             self.archive.fence(c,self.account,self.lease)
