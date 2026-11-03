@@ -146,8 +146,9 @@ do not promise that a boolean always controls provider behavior.
   32-level depth cap (31 nested spans). A layout that needs different separators, a span ending in whitespace, crossing
   spans or nested code is `not_reproducible`.
 - **Escaping.** `&`, `<`, `>` are escaped in text and in `code`/`pre`; an `href` is double-quoted with `&`, `"`, `<`, `>` escaped.
-- **Bounds.** One rendering per unique (message, revision); the `body_rendered` objects of one response total at most
-  256 KiB, later rows get `response_budget`. Nothing is sent to a third party, logged or stored; the agent still shows the
+- **Bounds.** One conversion per unique (message, revision); every serialized `body_rendered` (a repeated anchor too) counts, the
+  total in one response is at most 256 KiB and later rows get `response_budget`. The text must also fit a preview or send request
+  (16 KiB HTTP body): a text over 15,100 bytes as JSON UTF-8 is `too_long`. Nothing is sent to a third party, logged or stored; the agent still shows the
   owner the text and format before a send (SENDING.md).
 
 ## Acceptance

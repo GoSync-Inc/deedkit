@@ -8,9 +8,13 @@ import json
 
 from .formatting import MAX_WIRE_UNITS, _url, render_message, utf16_units
 from .incoming_formatting import wire_digest
+from .store import APIError
 
 BODY_KEY = '_revision_body'
 BUDGET_BYTES = 256 * 1024
+# The HTTP body of a preview or send is capped at 16,384 bytes (app.py NORMAL_BODY_BYTES); the rest of the request
+# (account, chat, request id, digest, format) needs room, so the generated text is limited as JSON UTF-8.
+MAX_TEXT_BYTES = 15100
 TAGS = {'bold': 'b', 'italic': 'i', 'underline': 'u', 'strikethrough': 's', 'spoiler': 'tg-spoiler',
         'code': 'code', 'pre': 'pre', 'blockquote': 'blockquote', 'text_link': 'a'}
 BLOCKS = frozenset(('blockquote', 'pre'))
@@ -66,7 +70,7 @@ def _split(entities):
         if kind == 'text_link':
             try:
                 _url(entity.get('url'))
-            except Exception:
+            except APIError:
                 omitted.add(kind)
                 continue
         spans.append(entity)
@@ -142,7 +146,7 @@ def _build(body, evidence):
         raise Unavailable('partial_evidence')
     try:
         units = utf16_units(body)
-    except Exception:
+    except APIError:
         raise Unavailable('not_reproducible') from None
     if units > MAX_WIRE_UNITS:
         raise Unavailable('too_long')
@@ -151,12 +155,15 @@ def _build(body, evidence):
     omitted |= more
     try:
         source = _source(body, spans)
+        if len(json.dumps(source, ensure_ascii=False).encode()) > MAX_TEXT_BYTES:
+            raise Unavailable('too_long')
         artifact = render_message('telegram', source, 'html')
     except Unavailable:
         raise
-    except Exception:
+    except APIError:
         # The sender refused the generated text (limits, controls, whitespace spans): never returned.
         raise Unavailable('not_reproducible') from None
+    # Any other exception is a fault of this code, not a property of the row: attach() reports render_failed.
     if artifact['rendered_text'] != body or _canonical(artifact['entities']) != _canonical(spans):
         raise Unavailable('not_reproducible')
     return {'format': 'html', 'text': source, 'lossless': not omitted, 'omitted_types': sorted(omitted)}
@@ -169,7 +176,7 @@ def _size(artifact):
 def attach(rows):
     """Add body_rendered or body_rendered_unavailable to rows in response order; always drop the internal body.
 
-    One rendering per (message, revision); the serialized artifacts of one response stay within BUDGET_BYTES.
+    One conversion per (message, revision); the serialized artifacts of one response, repeats included, stay within BUDGET_BYTES.
     """
     done, spent, exceeded = {}, 0, False
     try:
@@ -178,19 +185,19 @@ def attach(rows):
             key = (row.get('id') or row.get('message'), row.get('revision'))
             if key not in done:
                 try:
-                    artifact, reason = build(body, {k: v for k, v in (row.get('formatting') or {}).items()
-                                                    if k != 'offsets_reference'})
+                    done[key] = build(body, {k: v for k, v in (row.get('formatting') or {}).items()
+                                             if k != 'offsets_reference'})
                 except Exception:
                     # Never the text or the exception: the type of failure is not logged either.
-                    artifact, reason = None, 'render_failed'
-                if artifact is not None:
-                    size = _size(artifact)
-                    if exceeded or spent + size > BUDGET_BYTES:
-                        exceeded, artifact, reason = True, None, 'response_budget'
-                    else:
-                        spent += size
-                done[key] = (artifact, reason)
+                    done[key] = (None, 'render_failed')
             artifact, reason = done[key]
+            if artifact is not None:
+                # Converted once, but every serialized occurrence (the anchor repeats in full detail) is charged.
+                size = _size(artifact)
+                if exceeded or spent + size > BUDGET_BYTES:
+                    exceeded, artifact, reason = True, None, 'response_budget'
+                else:
+                    spent += size
             if artifact is not None:
                 row['body_rendered'] = artifact
             else:

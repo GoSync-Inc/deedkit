@@ -150,7 +150,8 @@ def test_evidence_states_and_their_precedence_with_the_real_normalizer():
 @pytest.mark.parametrize('body,expected', [
     ('x' * 4000, None), ('x' * 4001, 'too_long'),
     ('x' * 3999, None), ('x' * 4000 + '😀', 'too_long'), ('😀' * 2000, None), ('😀' * 2001, 'too_long'),
-    ('&' * 3200, None), ('&' * 3201, 'not_reproducible'),  # 5 source units each: 16,000 allowed, 16,005 not
+    # 5 source units each: the sender allows 16,000 source units, but a reusable text must fit one 16 KiB request.
+    ('&' * 3000, None), ('&' * 3021, 'too_long'), ('&' * 3201, 'too_long'),
     ('   \n ', 'not_reproducible'), ('a\x01b', 'not_reproducible'),
 ])
 def test_length_and_character_boundaries(body, expected):
@@ -483,3 +484,38 @@ def test_the_rendering_is_accepted_by_preview_and_send(sender):
     sent = s.send_message(key, ACCOUNT, CHAT, text, 'synthetic-rendered-request', format='html',
                           preview_digest=preview['preview_digest'])
     assert sent and sent.get('error') is None
+
+
+# spec: ANYM-737
+def test_a_text_the_request_limit_would_refuse_is_never_returned_as_ready_to_send():
+    body = 'abc'
+    url = 'https://example.com/' + '漢' * 2000
+    entities = [span('text_link', i, 1, url=url) for i in range(3)]
+    # Valid for the sender by UTF-16 units (6,108), but 18,108 UTF-8 bytes against a 16,384-byte request.
+    assert build(body, evidence(body, entities)) == (None, 'too_long')
+    artifact, reason = build(body, evidence(body, entities[:1]))
+    assert reason is None and len(json.dumps(artifact['text'], ensure_ascii=False).encode()) <= formatting_readback.MAX_TEXT_BYTES
+
+
+# spec: ANYM-737
+def test_a_fault_inside_the_converter_is_render_failed_not_a_property_of_the_row(sender, monkeypatch):
+    s, archive, key, _, _ = sender
+    mid = ingest(archive, 90, 'fault row', [span('bold', 0, 5)])
+    monkeypatch.setattr(formatting_readback, 'render_message', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom')))
+    row = next(r for r in rows_of(s.get_messages(key, CHAT, body_format='html')) if r['id'] == mid)
+    assert row['body_rendered_unavailable'] == 'render_failed' and row['body'] == 'fault row'
+
+
+# spec: ANYM-737
+def test_a_saturated_full_context_stays_within_the_budget_by_serialized_size(sender):
+    s, archive, key, _, _ = sender
+    ids = [ingest(archive, n, '&' * 3000 + str(n)[-1]) for n in range(300, 351)]
+    # The middle message is the anchor; 25 neighbours each side, enough rows to pass the cap.
+    plain = s.get_context(key, ids[25], before_count=25, after_count=25, view='archive', compact=False)
+    asked = s.get_context(key, ids[25], before_count=25, after_count=25, view='archive', compact=False, body_format='html')
+    pack = lambda v: json.dumps(v, ensure_ascii=False, separators=(',', ':')).encode()  # noqa: E731
+    occurrences = [asked['message'], *asked['context']]
+    charged = [r['body_rendered'] for r in occurrences if 'body_rendered' in r]
+    assert sum(len(pack(a)) for a in charged) <= formatting_readback.BUDGET_BYTES
+    assert any(r.get('body_rendered_unavailable') == 'response_budget' for r in occurrences)
+    assert len(pack(asked)) <= len(pack(plain)) + formatting_readback.BUDGET_BYTES + 64 * len(occurrences)
