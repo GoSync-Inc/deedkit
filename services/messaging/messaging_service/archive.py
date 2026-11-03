@@ -11,6 +11,7 @@ from time import monotonic
 from psycopg.types.json import Jsonb
 
 from .identifiers import ACCOUNT_RE
+from .media_retry import MEDIA_MAX_ATTEMPTS,MEDIA_PERMANENT_CODES,MEDIA_RATE_LIMIT_FREE_DAYS,retry_delay
 from .envelope import canonical, fingerprint, stable_id, validate
 from .store import serial as serial
 from .incoming_formatting import known as known_formatting, unknown as unknown_formatting, wire_digest
@@ -515,11 +516,11 @@ class Archive:
                 if account is None: raise ValueError('collector_account_required')
                 self.fence(c,account,collector_lease)
             if sweep:
-                # Attachment status already reports an expired fifth lease as
+                # Attachment status already reports an expired last-attempt lease as
                 # retry_exhausted until this sweep rewrites it.
                 c.execute("""UPDATE media_jobs SET state='failed',error_code='retry_exhausted',lease_until=NULL
-                    WHERE state='leased' AND attempts>=5 AND lease_until<clock_timestamp()
-                    AND (%s::text IS NULL OR account=%s)""",(account,account))
+                    WHERE state='leased' AND attempts>=%s AND lease_until<clock_timestamp()
+                    AND (%s::text IS NULL OR account=%s)""",(MEDIA_MAX_ATTEMPTS,account,account))
             # One fresh time, taken after the lock waits, bounds the prefetch and live
             # windows; unlike per-row clock_timestamp() it can bound an index range.
             now=c.execute('SELECT clock_timestamp() AS at').fetchone()['at']
@@ -549,7 +550,7 @@ class Archive:
                     m.sent_at>=%(now)s-%(live_window)s*interval '1 second' AND
                     m.sent_at<=%(now)s+interval '5 minutes',false) AS live_media,
                     COALESCE(j.requested_until>clock_timestamp(),false) AS requested,'''+MEDIA_TIER+''' AS tier) priority
-                WHERE p.enabled AND (%(account)s::text IS NULL OR j.account=%(account)s) AND j.attempts<5 AND
+                WHERE p.enabled AND (%(account)s::text IS NULL OR j.account=%(account)s) AND j.attempts<%(max_attempts)s AND
                 NOT m.deleted AND NOT(ch.provider_chat=ANY(p.exclude_chats)) AND
                 (p.discover_chats OR ch.provider_chat=ANY(p.include_chats)) AND
                 (%(since)s::timestamptz IS NULL OR m.sent_at>=%(since)s OR
@@ -571,7 +572,7 @@ class Archive:
                     CASE WHEN NOT priority.requested THEN m.sent_at END DESC,j.next_due,j.id
                 FOR UPDATE OF j SKIP LOCKED LIMIT 1''',
                 {'live_max':live_max,'live_window':live_window_seconds,'account':account,'since':since,
-                    'days':media_prefetch_days,'now':now,'backfill_ids':backfill_ids,**tiers}).fetchone()
+                    'days':media_prefetch_days,'now':now,'backfill_ids':backfill_ids,'max_attempts':MEDIA_MAX_ATTEMPTS,**tiers}).fetchone()
             if not job: return None
             expires=c.execute("SELECT clock_timestamp()+%s*interval '1 second' AS at",(ttl,)).fetchone()['at']
             reservation=None
@@ -604,13 +605,13 @@ class Archive:
                 JOIN chats ch ON ch.id=m.chat AND ch.account=j.account
                 CROSS JOIN LATERAL (SELECT '''+MEDIA_TIER+''' AS tier) priority
                 WHERE ((j.state='queued' AND j.next_due<=clock_timestamp()) OR
-                    (j.state='leased' AND j.lease_until<clock_timestamp())) AND j.attempts<5 AND
+                    (j.state='leased' AND j.lease_until<clock_timestamp())) AND j.attempts<%(max_attempts)s AND
                 (%(account)s::text IS NULL OR j.account=%(account)s) AND p.enabled AND NOT m.deleted AND
                 NOT(ch.provider_chat=ANY(p.exclude_chats)) AND (p.discover_chats OR ch.provider_chat=ANY(p.include_chats)) AND
                 (%(since)s::timestamptz IS NULL OR m.sent_at>=%(since)s) AND
                 m.sent_at<clock_timestamp()-%(days)s*interval '1 day' AND priority.tier<2
                 ORDER BY priority.tier,m.sent_at DESC,j.next_due,j.id LIMIT %(limit)s''',
-                {'account':account,'since':since,'days':days,'limit':BACKFILL_CANDIDATES,**tiers})]
+                {'account':account,'since':since,'days':days,'limit':BACKFILL_CANDIDATES,'max_attempts':MEDIA_MAX_ATTEMPTS,**tiers})]
 
     @contextmanager
     def _media_sweep(self,account):
@@ -746,12 +747,18 @@ class Archive:
             # Unwritable local storage is operator-fixable: it never consumes a
             # provider attempt or fails the original terminally.
             local_storage=code in LOCAL_STORAGE_ERRORS
-            attempts=max(0,row['attempts']-1) if local_pause or local_storage else row['attempts']
-            terminal=not (local_pause or local_storage) and (permanent or attempts>=5)
+            # A provider-requested wait is not a failure of the job: it gives the attempt back
+            # until the job is a week old, so a long FloodWait cannot exhaust the budget.
+            asked=code=='rate_limited' and retry_after is not None and not permanent and c.execute(
+                "SELECT created_at>clock_timestamp()-make_interval(days=>%s) AS young FROM media_jobs WHERE id=%s",
+                (MEDIA_RATE_LIMIT_FREE_DAYS,job['id'])).fetchone()['young']
+            attempts=max(0,row['attempts']-1) if local_pause or local_storage or asked else row['attempts']
+            terminal=not (local_pause or local_storage or asked) and (
+                permanent or code in MEDIA_PERMANENT_CODES or attempts>=MEDIA_MAX_ATTEMPTS)
             stored='paused_storage' if local_pause else 'storage_unavailable' if code=='media_storage_unavailable' else code
+            wait=60 if local_pause else 300 if local_storage else retry_delay(attempts,retry_after)
             c.execute('''UPDATE media_jobs SET state=%s,error_code=%s,lease_until=NULL,attempts=%s,
                 next_due=clock_timestamp()+%s*interval '1 second' WHERE id=%s''',
-                ('failed' if terminal else 'queued',stored,attempts,
-                 60 if local_pause else 300 if local_storage else max(min(3600,10*2**attempts),retry_after or 0),job['id']))
+                ('failed' if terminal else 'queued',stored,attempts,wait,job['id']))
             from .storage_admission import StorageAdmission
             StorageAdmission.release(c,job)

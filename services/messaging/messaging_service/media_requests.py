@@ -7,6 +7,7 @@ this path never acquires the collector/capacity lock while holding either one.
 from .attachment_metadata import attachment_fields, processing_phases
 from .file_index import _available,_absent
 from .media_policy import ELIGIBILITY_JOIN
+from .media_retry import MEDIA_MAX_ATTEMPTS,MEDIA_REQUEST_WAKE_SECONDS
 from .policy import scope_filter, targets
 from .storage_admission import cold_grant
 from .store import APIError, serial
@@ -150,7 +151,7 @@ def _request(store,c,p,attachment_id):
             cold.update(restore_state='failed',restore_error=error);fallback=True
         if cold and cold['restore_state']=='failed' and cold['restore_error']:result['cold_failure']=cold['restore_error']
         # A provider job that is not running (ready, failed or exhausted) never blocks the owner's own copy.
-        idle_job=row['job_state'] in ('ready','failed') or (row['job_state']=='queued' and row['attempts']>=5)
+        idle_job=row['job_state'] in ('ready','failed') or (row['job_state']=='queued' and row['attempts']>=MEDIA_MAX_ATTEMPTS)
         if cold and cold['verified'] and idle_job:
             if cold['restore_state']=='requested':
                 result.update(request_status='coalesced',reason='managed_original_evicted',rehydration_source='cold_archive',
@@ -176,7 +177,7 @@ def _request(store,c,p,attachment_id):
         result.update(request_status='processing',requested_until=row['requested_until'],
             next_action='get_attachment')
         return serial(result)
-    if row['job_state']=='failed' or row['attempts']>=5:
+    if row['job_state']=='failed' or row['attempts']>=MEDIA_MAX_ATTEMPTS:
         result.update(request_status='failed',reason=row['error_code'] or 'retry_exhausted',
             requested_until=None)
         return serial(result)
@@ -187,14 +188,18 @@ def _request(store,c,p,attachment_id):
     if active and not fallback and not (managed and row['job_state']=='ready'):
         result.update(request_status='coalesced',requested_until=row['requested_until'])
         return serial(result)
-    deferred=c.execute('''SELECT %s::timestamptz>=clock_timestamp()+interval '1 hour' AS deferred,
+    deferred=c.execute('''SELECT %s::timestamptz>=clock_timestamp()+%s*interval '1 second' AS deferred,
         greatest(0,ceil(extract(epoch FROM %s::timestamptz-clock_timestamp())))::bigint AS retry_after_seconds''',
-        (row['next_due'],row['next_due'])).fetchone()
-    if deferred['deferred']:
+        (row['next_due'],MEDIA_REQUEST_WAKE_SECONDS,row['next_due'])).fetchone()
+    if deferred['deferred'] and row['error_code']=='rate_limited':
+        # A provider-requested wait still running holds the job.
         result.update(request_status='deferred',reason='retry_after_request_window',
             requested_until=None,retry_after_seconds=deferred['retry_after_seconds'],
             next_action='request_file_download_after_retry')
         return serial(result)
+    if deferred['deferred']:
+        # A long transient backoff (up to 12 h) does not defer an explicit request; no attempt is spent.
+        c.execute("UPDATE media_jobs SET next_due=clock_timestamp() WHERE id=%s AND state='queued'",(attachment_id,))
     count=provider_demand(c,p['key_digest'])
     if count['total']>=GLOBAL_LIMIT or count['own']>=PER_KEY_LIMIT:
         raise APIError('media_request_limit',429)
@@ -225,7 +230,7 @@ def cold_request(c,p,attachment_id,row,result):
         AND restore_requested_at>clock_timestamp()-make_interval(secs=>%s)""",(COLD_RESTORE_STALL_SECONDS,)).fetchone()['total']
     if outstanding>=GLOBAL_LIMIT:raise APIError('media_request_limit',429)
     provider=(row['job_state']=='ready' and row['collection_enabled'] and row['provider_chat_id'] not in row['exclude_chats'] and
-        (row['discover_chats'] or row['provider_chat_id'] in row['include_chats']) and row['attempts']<5 and not c.execute(
+        (row['discover_chats'] or row['provider_chat_id'] in row['include_chats']) and row['attempts']<MEDIA_MAX_ATTEMPTS and not c.execute(
         "SELECT %s::timestamptz>=clock_timestamp()+interval '1 hour' AS deferred",(row['next_due'],)).fetchone()['deferred'])
     if provider:
         # The fallback is provider demand: it is admitted against the same quotas now.

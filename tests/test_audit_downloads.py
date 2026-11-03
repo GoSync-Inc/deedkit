@@ -2,6 +2,7 @@
 import pytest
 from messaging_service.blobs import BlobWriter
 from messaging_service.file_index import file_response_fields
+from messaging_service.media_retry import MEDIA_MAX_ATTEMPTS
 from test_archive import archive as archive, event
 
 @pytest.mark.parametrize('kind,generated',[('photo',True),('document',False)])
@@ -37,7 +38,7 @@ def test_fifth_active_media_attempt_is_still_processing_when_requested(archive):
         'mime':'image/jpeg','bytes':4}]))
     job=ar.claim_media('synthetic-fixture')
     with store.pool.connection() as c:
-        c.execute('UPDATE media_jobs SET attempts=5 WHERE id=%s',(job['id'],))
+        c.execute('UPDATE media_jobs SET attempts=%s WHERE id=%s',(MEDIA_MAX_ATTEMPTS,job['id']))
     result=store.request_file_download(key,job['id'])
     assert result['download_status']=='processing'
     assert result['request_status'] in ('coalesced','processing')
@@ -51,7 +52,7 @@ def test_expired_fifth_media_lease_reports_exhaustion(archive):
         'mime':'image/jpeg','bytes':4}]))
     job=ar.claim_media('synthetic-fixture')
     with store.pool.connection() as c:
-        c.execute("UPDATE media_jobs SET attempts=5,lease_until=clock_timestamp()-interval '1 second' WHERE id=%s",(job['id'],))
+        c.execute("UPDATE media_jobs SET attempts=%s,lease_until=clock_timestamp()-interval '1 second' WHERE id=%s",(MEDIA_MAX_ATTEMPTS,job['id']))
     result=store.request_file_download(key,job['id'])
     assert result['download_status']=='failed'
     assert result['request_status']=='failed'

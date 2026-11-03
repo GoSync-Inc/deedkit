@@ -6,6 +6,7 @@ import pytest
 from messaging_service.archive import Archive
 from messaging_service.blobs import BlobWriter
 from messaging_service.envelope import validate
+from messaging_service.media_retry import MEDIA_MAX_ATTEMPTS
 from messaging_service.spool import DurableSpool
 from messaging_service.store import APIError
 
@@ -479,7 +480,7 @@ def test_media_retry_backoff_and_exhausted_crash(archive):
     with s.pool.connection() as c: c.execute("UPDATE media_jobs SET next_due=now()-interval '1 second'")
     job=ar.claim_media('worker'); assert job['attempts']==2
     with s.pool.connection() as c:
-        c.execute("UPDATE media_jobs SET attempts=5,lease_until=now()-interval '1 second'")
+        c.execute("UPDATE media_jobs SET attempts=%s,lease_until=now()-interval '1 second'",(MEDIA_MAX_ATTEMPTS,))
     assert ar.claim_media('worker') is None
     assert s.get_attachment(key,job['id'])['status']=='failed'
 
