@@ -1,0 +1,15 @@
+[Unit]
+Description=DeedKit recordings archive backup cadence (daily, after the calendar catch-up's worst case)
+
+[Timer]
+# 21:30 UTC: after messaging's 18:00 run and the calendar's 16:00 run, and after the calendar catch-up (19:15 UTC) at its
+# worst case: 19:15 + TimeoutStartSec 6300 s + two TimeoutStopSec 180 s = 21:06 UTC. The runner admits a start only when
+# its whole worst case ends 15 minutes before the next scheduled start of another profile, read from their timer files.
+OnCalendar=*-*-* 21:30:00 UTC
+Persistent=true
+RandomizedDelaySec=30s
+AccuracySec=1s
+Unit=deedkit-recordings-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -566,3 +566,40 @@ shows a mount inside staging or a directory is on another device.
 The marker `<state_directory>/.unsettled` records the worker until it is verified stopped, like the calendar's
 `<host_lock>.unsettled`; `production.py` does not read it (the run holds `host_lock` throughout; a deploy check
 for it is for ANYM-727/731 to decide).
+
+### Staging, slot and admission (ANYM-727)
+
+The recordings job runs from `deedkit-recordings-backup.timer` daily at 21:30 UTC, with a catch-up at 23:15 UTC
+(`deedkit-recordings-backup-catchup.timer`; it acts only from 23:00 and when `freshness.py` reports the last good
+bundle older than 22 hours). 21:30 follows messaging (18:00), the calendar run (16:00) and the calendar catch-up's worst
+case (19:15 + 6300 s + two 180 s stops = 21:06 UTC). Polling the archive and this timer are independent: if the
+archive is off (not enabled in the recordings config, or the container is stopped), the job ends `skipped` with
+`recordings_skipped_archive_disabled` or `recordings_skipped_container_down`, exit 0, and nothing is staged.
+
+Staging directory: `/opt/deedkit/recordings-backup/staging` on the host (override `RECORDINGS_BACKUP_STAGING`), mounted
+at `/run/deedkit/backup-staging` in the recordings container; owner 10001:10001, mode 0700, created by hand at installation
+(ANYM-731). The runner refuses any other owner or mode (`recordings_staging_unsafe`). The snapshot is taken by
+`docker exec deedkit-recordings ... --backup-to /run/deedkit/backup-staging/<job id>/archive.sqlite` (SQLite Online Backup, one
+consistent file); the worker reads it in place, so there is no separate copy deadline: the copy runs inside the exec
+deadline, the hash has its own deadline, and the worker refuses `recordings_snapshot_changed` when the file differs from
+the recorded size or sha256.
+
+Admission (before anything is staged): the runner reads the other profiles' timer files, and starts only when its
+whole bound ends at least 15 minutes (900 s) before the next scheduled start of another profile; otherwise it ends
+`skipped` with `recordings_skipped_window` (an unreadable timer file: `recordings_skipped_schedule_unknown`). The bound
+is the unit's, for every phase including a resumed `upload`: the worst case of all deadlines plus the two stop budgets
+(180 s each) the service may use after its TimeoutStartSec. A start of another profile that is already due, within its
+`RandomizedDelaySec` plus 120 s, is a veto too (that run may be waiting for the shared lock). While running it yields at
+checkpoints and in the capture poll loop when the guard time arrives (`recordings_skipped_yielded`). The worker's capture
+budget starts after the staging work, not at the journal's creation. Disk: free space must cover `min_free_bytes` plus
+the expected archive size (`expected_archive_bytes`, default 1 GiB, or the last recorded `archive_bytes` of the status
+file when larger), else `recordings_skipped_disk`.
+
+Locks and cleanup: the recordings run never waits for the host lock (`recordings_skipped_lock_busy`), but when it gives
+up it first empties what a crashed earlier job left in staging, under the runner's own lock alone. `--recover-stop`
+takes only the runner's own lock (it touches nothing of messaging or calendar), so it is never blocked by another
+profile. A `docker exec` that hits its deadline is not trusted to have stopped the snapshot producer: the runner finds
+the processes in the container whose arguments carry this job's snapshot path (`docker top`), kills them and checks that
+none is left (`recordings_exec_unverified` otherwise; staging is then not emptied under a live writer, and the recovery
+looks again). A cleanup that fails is an error (`staging_cleanup_failed`, exit 1), also after a skip. A skipped job
+leaves the freshness clock alone, so the catch-up timer decides.

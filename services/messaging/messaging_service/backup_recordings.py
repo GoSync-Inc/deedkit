@@ -15,6 +15,7 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+import time
 from urllib.parse import quote
 
 from .spool import fsync_dir
@@ -32,7 +33,8 @@ MAX_INT=2**63-1  # SQLite's INTEGER range
 # The only codes a refusal may carry (runner SAFE_ERRORS and status); they name no path and no content.
 REFUSAL_CODES=('recordings_snapshot_absent','recordings_snapshot_empty','recordings_snapshot_unsafe',
                'recordings_snapshot_corrupt','recordings_snapshot_foreign','recordings_schema_unsupported',
-               'recordings_identity_missing')
+               'recordings_identity_missing','recordings_snapshot_changed','recordings_integrity_timeout',
+               'recordings_encrypt_timeout','recordings_no_space')
 
 
 class RecordingsRefused(RuntimeError):
@@ -76,8 +78,12 @@ def _counts(db):
     return sequence or 0,db.execute('SELECT COUNT(*) FROM records').fetchone()[0]
 
 
-def inspect_archive(path):
-    """Facts of a snapshot file, or RecordingsRefused. Opened read-only and immutable: the file is never written."""
+def inspect_archive(path,deadline=None):
+    """Facts of a snapshot file, or RecordingsRefused. Opened read-only and immutable: the file is never written.
+
+    `deadline` (an absolute `time.monotonic()` value) bounds the integrity check: SQLite is interrupted from its
+    progress handler, so a huge or hostile file ends `recordings_integrity_timeout` instead of running on.
+    """
     path=Path(path)
     try:info=path.lstat()
     except FileNotFoundError:raise RecordingsRefused('recordings_snapshot_absent') from None
@@ -88,6 +94,7 @@ def inspect_archive(path):
         with path.open('rb') as f:header=f.read(16)
         if header!=SQLITE_HEADER:raise RecordingsRefused('recordings_snapshot_corrupt')
         db=sqlite3.connect('file:'+quote(str(path))+'?mode=ro&immutable=1',uri=True)
+        if deadline is not None:db.set_progress_handler(lambda:1 if time.monotonic()>deadline else 0,100)
         try:
             if db.execute('PRAGMA application_id').fetchone()[0]!=APPLICATION_ID:
                 raise RecordingsRefused('recordings_snapshot_foreign')
@@ -97,7 +104,9 @@ def inspect_archive(path):
             archive_id,incarnation=_identity(db)
             sequence,records=_counts(db)
         finally:db.close()
-    except sqlite3.Error:raise RecordingsRefused('recordings_snapshot_corrupt') from None
+    except sqlite3.Error:
+        if deadline is not None and time.monotonic()>deadline:raise RecordingsRefused('recordings_integrity_timeout') from None
+        raise RecordingsRefused('recordings_snapshot_corrupt') from None
     except OSError:raise RecordingsRefused('recordings_snapshot_unsafe') from None
     return {'user_version':user_version,
             'archive':{'archive_id':archive_id,'incarnation':incarnation,'sequence':sequence,'records':records}}
@@ -143,13 +152,16 @@ def _write_manifest(directory,size,digest,mtime,facts):
         out.write(json.dumps(manifest,ensure_ascii=False,indent=2)+'\n');out.flush();os.fsync(out.fileno())
 
 
-def create_recordings_snapshot(staged,destination,*,copy_state=True):
+def create_recordings_snapshot(staged,destination,*,copy_state=True,expected=None,integrity_seconds=None):
     """Check `staged` (an SQLite snapshot file) and write the bundle directory at `destination`; refuse a bad one.
 
     `copy_state=False` (the backup worker) writes only `manifest.json`: the archive is read in place from its
     private staging directory and streamed into the encryption (`encrypt_snapshot(..., recordings_state=staged)`),
     so no plaintext copy of it exists anywhere else. `copy_state=True` also copies it to `state/archive.sqlite`
     (a complete bundle, as a restore produces) and checks the copy.
+
+    `expected` is the runner's `{bytes, sha256}` of the staged file (ANYM-727): a file that differs from what the
+    runner hashed after the snapshot call ends `recordings_snapshot_changed`. `integrity_seconds` bounds the check.
     """
     destination=Path(destination);staged=Path(staged)
     if destination.exists():raise ValueError('backup_destination_exists')
@@ -160,15 +172,18 @@ def create_recordings_snapshot(staged,destination,*,copy_state=True):
             (temporary/'state').mkdir(mode=0o700)
             copy=temporary/'state'/STATE_FILE
             size,digest,mtime=_copy_staged(staged,copy)
-            facts=inspect_archive(copy)  # the sealed copy is what is checked, not a file that may change underneath
+            target=copy  # the sealed copy is what is checked, not a file that may change underneath
         else:
             size,digest,mtime=_hash_staged(staged)
-            facts=inspect_archive(staged)
+            target=staged
+        if expected is not None and (size,digest)!=(expected['bytes'],expected['sha256']):
+            raise RecordingsRefused('recordings_snapshot_changed')
+        facts=inspect_archive(target,None if integrity_seconds is None else time.monotonic()+integrity_seconds)
         _write_manifest(temporary,size,digest,mtime,facts)
         if copy_state:fsync_dir(temporary/'state')
         fsync_dir(temporary);os.rename(temporary,destination);fsync_dir(destination.parent)
         return {'status':'snapshot_created','profile':'recordings','user_version':facts['user_version'],
-                'records':facts['archive']['records']}
+                'records':facts['archive']['records'],'bytes':size}
     finally:
         if temporary.exists():shutil.rmtree(temporary)  # Only this function's temporary directory.
 

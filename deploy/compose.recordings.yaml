@@ -12,6 +12,12 @@ services:
       # The DIRECTORY, never a single file: an atomic replace inside it reaches the running service.
       - ${RECORDINGS_STATE_DIR:?Set the private recordings configuration directory}:/run/deedkit/recordings:ro
       - recordings-data:/data
+      # ANYM-727: the one place the archive snapshot is written (docker exec of `deedkit-recordings --backup-to`), read by
+      # the root backup runner on the host. The host directory is created once by hand, owner 10001:10001, mode 0700
+      # (production.md, "Recordings"); the runner makes one 0700 directory per run inside it and empties it after every
+      # run. The default keeps a deploy of this file working before that step; Docker would then create the path
+      # root-owned, and the runner refuses such a staging directory (`recordings_staging_unsafe`).
+      - ${RECORDINGS_BACKUP_STAGING:-/opt/deedkit/recordings-backup/staging}:/run/deedkit/backup-staging
     networks:
       recordings-backend:
         aliases: [recordings-api]

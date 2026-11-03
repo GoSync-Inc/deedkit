@@ -7,8 +7,10 @@ import argparse
 from datetime import datetime,timezone
 import hashlib
 import json
+import errno
 import os
 from pathlib import Path
+import signal
 import tempfile
 import stat
 import time
@@ -156,13 +158,43 @@ def run_calendar(config):
     return result
 
 
+class time_limit:
+    """Raise RecordingsRefused(code) when the block runs past `seconds` (SIGALRM, this thread; None: no limit).
+
+    Any error the interrupted code raises on its way out is replaced by the code: the limit is the cause.
+    """
+    def __init__(self,seconds,code):self.seconds,self.code,self.fired,self.previous=seconds,code,False,None
+    def __enter__(self):
+        if self.seconds is None:return self
+        def fire(*_):self.fired=True;raise TimeoutError(self.code)
+        self.previous=signal.signal(signal.SIGALRM,fire);signal.setitimer(signal.ITIMER_REAL,self.seconds)
+        return self
+    def __exit__(self,kind,error,trace):
+        if self.seconds is None:return False
+        signal.setitimer(signal.ITIMER_REAL,0);signal.signal(signal.SIGALRM,self.previous)
+        if self.fired:
+            from .backup_recordings import RecordingsRefused
+            raise RecordingsRefused(self.code) from None
+        return False
+
+
 def run_recordings(config):
     """Recordings archive profile (ANYM-714): one staged SQLite snapshot, checked and encrypted in place. No network."""
     from .backup_recordings import RecordingsRefused,create_recordings_snapshot
     from .backup_receiver import BACKUP_ID
     from .recovery_state import read_manifest
     required={'profile','id','snapshot_directory','recipient_file','work_directory'}
-    if set(config)!=required or config['profile']!='recordings':raise ValueError('invalid_backup_worker_config')
+    optional={'integrity_timeout_seconds','encrypt_timeout_seconds','expected_bytes','expected_sha256'}
+    if set(config)-optional!=required or config['profile']!='recordings':raise ValueError('invalid_backup_worker_config')
+    for key in ('integrity_timeout_seconds','encrypt_timeout_seconds'):
+        if key in config and (type(config[key]) is not int or not 1<=config[key]<=7200):raise ValueError('invalid_backup_worker_config')
+    expected=None
+    if ('expected_bytes' in config)!=('expected_sha256' in config):raise ValueError('invalid_backup_worker_config')
+    if 'expected_bytes' in config:
+        if (type(config['expected_bytes']) is not int or config['expected_bytes']<1 or
+            not isinstance(config['expected_sha256'],str) or not re.fullmatch('[a-f0-9]{64}',config['expected_sha256'])):
+            raise ValueError('invalid_backup_worker_config')
+        expected={'bytes':config['expected_bytes'],'sha256':config['expected_sha256']}
     if not isinstance(config['id'],str) or not BACKUP_ID.fullmatch(config['id']):raise ValueError('invalid_backup_id')
     work=Path(config['work_directory'])
     if work.is_symlink() or not work.is_dir() or work.stat().st_mode&0o077:raise ValueError('private_work_directory_required')
@@ -172,16 +204,25 @@ def run_recordings(config):
     # read-only staging into the encryption, so no plaintext copy of it exists outside staging. The directory goes
     # on every exit, the whole lifetime of the capture.
     try:
-        try:snapshot=create_recordings_snapshot(staged,directory,copy_state=False)
-        except RecordingsRefused as exc:
-            # A fixed code only: no path, no archive content. No bundle exists and none is started.
-            write_json(work/'refused.json',{'id':config['id'],'status':'refused','code':exc.code})
-            raise
+        snapshot=create_recordings_snapshot(staged,directory,copy_state=False,expected=expected,
+                                            integrity_seconds=config.get('integrity_timeout_seconds'))
         write_json(work/'captured.json',{'id':config['id'],'status':'capture_complete'})
         manifest=read_manifest(directory)
         with (directory/'manifest.json').open('rb') as f:snapshot_sha=hashlib.file_digest(f,'sha256').hexdigest()
         output=work/'bundle.tar.age'
-        encrypt_snapshot(directory,output,Path(config['recipient_file']).read_text().strip(),recordings_state=staged)
+        try:
+            with time_limit(config.get('encrypt_timeout_seconds'),'recordings_encrypt_timeout'):
+                encrypt_snapshot(directory,output,Path(config['recipient_file']).read_text().strip(),recordings_state=staged)
+        except OSError as exc:
+            if exc.errno!=errno.ENOSPC:raise
+            raise RecordingsRefused('recordings_no_space') from None
+    except RecordingsRefused as exc:
+        # A fixed code only: no path, no archive content. No bundle exists and none is started (a partial age
+        # file of a refused encryption goes with the job directory).
+        write_json(work/'refused.json',{'id':config['id'],'status':'refused','code':exc.code})
+        output=work/'bundle.tar.age'
+        if output.exists() and not (work/'result.json').exists():output.unlink()
+        raise
     finally:
         if directory.exists():shutil.rmtree(directory)
     with output.open('rb') as f:digest=hashlib.file_digest(f,'sha256').hexdigest()

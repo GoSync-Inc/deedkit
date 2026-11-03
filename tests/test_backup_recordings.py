@@ -393,7 +393,20 @@ def recordings_cfg(tmp_path, **overrides):
             'image': 'backup:test', 'recipient_file': str(tmp_path / 'recipient'), 'transfer': dict(TRANSFER),
             'timeout_seconds': 60, 'keep_local': 1, 'host_lock': str(tmp_path / 'messaging' / '.runner.lock'),
             'recordings': {'staging_directory': str(tmp_path / 'staging'), 'state_directory': str(tmp_path / 'state'),
-                           'capture_timeout_seconds': 120}, **overrides}
+                           'capture_timeout_seconds': 1200, 'container': 'recordings-api-1',
+                           'container_config': '/run/deedkit/recordings/config.json', 'container_staging': '/run/deedkit/backup-staging',
+                           'timers': [str(tmp_path / 'timers' / 'messaging.timer'),
+                                      str(tmp_path / 'timers' / 'calendar.timer')]}, **overrides}
+
+
+# 2026-11-04 03:00 UTC: 13 hours before the calendar's 16:00 run, so ANYM-727's admission always lets these runs start.
+NOW = 1793761200.0
+
+
+def write_timers(tmp_path):
+    (tmp_path / 'timers').mkdir(exist_ok=True)
+    for name, time in (('messaging', '18:00:00'), ('calendar', '16:00:00')):
+        (tmp_path / 'timers' / f'{name}.timer').write_text(f'[Timer]\nOnCalendar=*-*-* {time} UTC\nPersistent=true\n')
 
 
 def private_file(path, data):
@@ -478,6 +491,7 @@ def recordings_runner(tmp_path, age_stub, monkeypatch, send=None, staged='good')
     cfg = recordings_cfg(tmp_path)
     Path(cfg['host_lock']).parent.mkdir(mode=0o700)
     (tmp_path / 'recipient').write_text('fake')
+    write_timers(tmp_path)
     docker = RecordingsDocker(Path(cfg['directory']), age_stub, monkeypatch)
     sent = []
     async def stored(path, result, transfer, timeout):
@@ -485,7 +499,7 @@ def recordings_runner(tmp_path, age_stub, monkeypatch, send=None, staged='good')
         decrypt_snapshot(path, 'fake', tmp_path / f'received-{len(sent)}', age=age_stub)
         sent.append((result['id'], result['sha256'], verify_recordings_bundle(tmp_path / f'received-{len(sent)}')))
         return {**result, 'status': 'stored', 'duplicate': False}
-    runner = StagingRunner(cfg, docker=docker, sleep=lambda _: None, send=send or stored)
+    runner = StagingRunner(cfg, docker=docker, sleep=lambda _: None, send=send or stored, clock=lambda: NOW)
     if staged == 'good':
         runner.staged = make_archive(tmp_path / 'source' / 'archive.sqlite')
     elif staged:
@@ -595,7 +609,8 @@ def test_a_recordings_run_stages_reads_only_and_delivers_a_verified_bundle(tmp_p
     assert not any('database_url' in m or 'type=volume' in m for m in mounts)
     (job,) = [p for p in root.iterdir() if p.is_dir() and backup_runner.ID.fullmatch(p.name)]
     assert read_json(job / 'worker.json') == {'profile': 'recordings', 'id': job.name, 'snapshot_directory': '/sources/snapshot',
-                                              'recipient_file': '/run/secrets/recipient', 'work_directory': '/work'}
+                                              'recipient_file': '/run/secrets/recipient', 'work_directory': '/work',
+                                              'integrity_timeout_seconds': 300, 'encrypt_timeout_seconds': 600}
     (delivered,) = sent
     assert delivered[0] == job.name and delivered[2]['archive']['archive_id'] == ARCHIVE_ID
     status = read_json(root / 'status.json')
@@ -700,7 +715,7 @@ def test_a_resumed_upload_journal_empties_surviving_staging_before_delivery(tmp_
     async def stored(path, result, transfer, timeout):
         seen.append(staging_entries(runner))
         return {**result, 'status': 'stored', 'duplicate': False}
-    again = StagingRunner(runner.cfg, docker=docker, sleep=lambda _: None, send=stored)
+    again = StagingRunner(runner.cfg, docker=docker, sleep=lambda _: None, send=stored, clock=lambda: NOW)
     again.run()
     assert seen == [[]] and staging_entries(again) == []
     # `--recover-stop` of an upload-phase journal empties it too.
@@ -765,7 +780,8 @@ def test_a_journal_naming_another_container_is_refused_before_any_docker_call(tm
     journal = read_json(runner.journal_path)
     journal['container'] = 'deedkit-calendar-backup-' + journal['id'].lower()
     write_json(runner.journal_path, journal)
-    for action in (Runner(runner.cfg, docker=docker).recover_stop, Runner(runner.cfg, docker=docker).run):
+    for action in (Runner(runner.cfg, docker=docker).recover_stop,
+                   Runner(runner.cfg, docker=docker, clock=lambda: NOW).run):
         with pytest.raises(ValueError, match='invalid_backup_journal'):
             action()
     assert docker.calls == []
@@ -793,7 +809,7 @@ def test_a_bundle_written_before_a_rollback_stays_readable_by_the_new_runner(tmp
         decrypt_snapshot(path, 'fake', tmp_path / 'received', age=age_stub)
         sent.append(result['id'])
         return {**result, 'status': 'stored', 'duplicate': False}
-    again = StagingRunner(runner.cfg, docker=docker, sleep=lambda _: None, send=stored)
+    again = StagingRunner(runner.cfg, docker=docker, sleep=lambda _: None, send=stored, clock=lambda: NOW)
     again.run()
     assert sent == [job.name] and attempts == [job.name]
     assert verify_recordings_bundle(tmp_path / 'received')['archive']['archive_id'] == ARCHIVE_ID
