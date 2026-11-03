@@ -209,7 +209,7 @@ def overview(store,c,p,consumer,limit,filters,lower,upper,width):
     # ANYM-656: a read-only heuristic hint; any failure inside leaves the rows exactly as they are.
     from . import related_chats
     found=related_chats.hints(c,p,[{'id':r['chat'],'type':named.get('chat_type'),'last_activity':r['latest_at']}
-        for r,named in zip(rows,names)],hidden=related_chats.hidden_side(aliases,{r['chat'] for r in rows}),twins=aliases)
+        for r,named in zip(rows,names)])
     for row in chats:row.update(found.get(row['chat'],{}))
     targets(p,[mid for mid in ids if mid])
     total=rows[0] if rows else {'chats_total':0,'live_total':0,'backfill_total':0}

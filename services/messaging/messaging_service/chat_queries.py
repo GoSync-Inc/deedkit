@@ -726,8 +726,7 @@ def list_chats(store,c,p,after='',limit=25,*,accounts=None,query='',chat_types=N
     if not selected_chat:
         # ANYM-656: a read-only heuristic hint; any failure inside leaves the rows exactly as they are.
         from . import related_chats
-        found=related_chats.hints(c,p,[{'id':r['id'],'type':r['type'],'last_activity':r['last_activity']} for r in items],
-            hidden=set(aliases)-set(listed),twins=aliases)
+        found=related_chats.hints(c,p,[{'id':r['id'],'type':r['type'],'last_activity':r['last_activity']} for r in items])
         for row in items:row.update(found.get(row['id'],{}))
     targets(p,[r['id'] for r in items])
     if include_coverage:

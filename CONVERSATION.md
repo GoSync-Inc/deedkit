@@ -340,11 +340,13 @@ matched, `source_message_id` the owner's message in `chat_id`. The older chat's 
 - Heuristic. Absence of `related_chats` means nothing was detected, not that the chats are unrelated. Read the related chat
   before acting; never treat two chats as one. The hint disappears after 7 days; to keep the link, link the counterpart's
   identities to one person (ANYM-283).
-- The only basis is a copy: one of the new chat's first 3 incoming messages equals, after Unicode NFKC, casefolding and
+- The only basis is a copy: one of the new chat's first 3 incoming messages equals, after lowercasing and
   whitespace collapse, an owner message sent in exactly one other private chat in the 7 days before it. The older chat may be
-  on another account the key can read.
+  on another account the key can read. There is no Unicode compatibility folding: the lookup uses the `lower(body)` index, and a
+  variant it cannot see could not be excluded as a broadcast.
 - Skipped: bodies under 24 characters or one token (a bare URL, number, address); a body the owner sent to more than one visible
-  chat in the window (a broadcast or canned reply); groups and channels on either side; a WhatsApp alias chat; deleted or purged
+  chat in the window (a broadcast or canned reply); groups and channels on either side; a WhatsApp alias chat (the LID chat of
+  a verified readable pair, whatever the page's filters); a body over 2 KB, which is never matched on a prefix; deleted or purged
   messages and hidden chats (the check reads only what the key can read, so a hidden copy neither creates nor suppresses a hint).
 - Bounded: at most 5 new chats per page, 200 outgoing candidates per copy, one 1-second budget for the whole check. When a cap
   or the budget stops it, the hint is left out and the rows, order and cursors are unchanged. In the `by_chat` overview the hints

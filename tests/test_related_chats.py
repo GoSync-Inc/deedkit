@@ -68,8 +68,44 @@ def test_a_copied_owner_message_links_the_new_chat_to_the_older_one_and_back(see
 # spec: ANYM-656
 def test_normalization_matches_case_and_spacing(seeded):
     s,a,_=seeded
-    pair(s,TEXT);say(s,TG,'new','new-2','  PLEASE send   the signed lease scan before Friday noon\n',0.5)
-    assert rows(s,a)['new']['related_chats'][0]['source_message_id']=='old-out'
+    chat(s,TG,'old');chat(s,TG,'new')
+    say(s,TG,'old','old-out',TEXT,3,'outgoing')
+    say(s,TG,'new','new-in','  PLEASE send   the signed lease scan before Friday noon\n',1)
+    for read in (rows,updates):
+        page=read(s,a)
+        assert page['new']['related_chats'][0]['source_message_id']=='old-out'
+
+
+# spec: ANYM-656
+def test_unicode_compatibility_forms_are_different_text_not_a_hidden_broadcast(seeded):
+    s,a,_=seeded;pair(s)
+    chat(s,TG,'third');say(s,TG,'third','third-out',TEXT.replace('lease','ｌｅａｓｅ'),2,'outgoing')
+    # The lookup sees lowercase and spacing only; a compatibility variant is not a copy, so the hint stands.
+    assert rows(s,a)['new']['related_chats'][0]['chat_id']=='old'
+
+
+# spec: ANYM-656
+def test_a_body_too_long_to_compare_whole_never_matches_on_a_prefix(seeded):
+    s,a,_=seeded
+    head='request '*300
+    chat(s,TG,'old');chat(s,TG,'new');chat(s,TG,'near')
+    say(s,TG,'old','old-out',head+'alpha ending',3,'outgoing')
+    say(s,TG,'near','near-in',head+'beta ending',2)
+    say(s,TG,'new','new-in',head+'alpha ending',1)
+    assert not any(HINT_KEYS&set(r) for r in rows(s,a).values())
+    # The 2 KB limit counts bytes: 1600 characters of Cyrillic text are 2400 bytes.
+    chat(s,TG,'old2');chat(s,TG,'new2');body='ж '*800
+    say(s,TG,'old2','old2-out',body,3,'outgoing');say(s,TG,'new2','new2-in',body,1)
+    assert not any(HINT_KEYS&set(r) for r in rows(s,a).values())
+
+
+# spec: ANYM-656
+def test_cyrillic_text_matches_only_where_the_database_lowercases_it(seeded):
+    s,a,_=seeded;text='Пожалуйста пришлите подписанный договор до пятницы'
+    chat(s,TG,'old');chat(s,TG,'new')
+    say(s,TG,'old','old-out',text,3,'outgoing');say(s,TG,'new','new-in',text.upper(),1)
+    with s.pool.connection() as c:folds=c.execute("SELECT lower('Я')='я' AS x").fetchone()['x']
+    assert ('related_chats' in rows(s,a)['new'])==folds
 
 
 # spec: ANYM-656
@@ -119,12 +155,43 @@ def test_a_purged_older_chat_never_enters_a_candidate(seeded):
     assert not any(HINT_KEYS&set(r) for r in rows(s,a).values())
 
 
+def alias_pair(s,copies=0):
+    """A verified WhatsApp pair on whatsapp-demo-1: the LID chat is the alias; `copies` owner copies of TEXT sit in it."""
+    with s.pool.connection() as c:
+        c.execute("""INSERT INTO chats(id,account,provider_chat,title,chat_type) VALUES
+            ('lid-chat','whatsapp-demo-1','900@lid','Synthetic lid','private'),
+            ('pn-chat','whatsapp-demo-1','1234567890@c.us','Synthetic pn','private')""")
+        c.execute("""INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
+            VALUES('lid-src','whatsapp-demo-1','lid-chat','lid-src','900@lid','Synthetic hello from the peer',%s,'incoming')""",(when(30),))
+        c.execute("""INSERT INTO whatsapp_identity_observations(account,source_message,identity_id,pn,lid,provenance,first_observed_at,observed_at)
+            VALUES('whatsapp-demo-1','lid-src','900@lid','1234567890@c.us','900@lid','whatsmeow_message_alt_v1',now(),now())""")
+        c.execute("""INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
+            SELECT 'lid-out-'||n,'whatsapp-demo-1','lid-chat','lid-out-'||n,'owner',%s,%s,'outgoing' FROM generate_series(1,%s) n""",
+            (TEXT,when(2),copies))
+
+
 # spec: ANYM-656
-def test_an_alias_chat_is_neither_a_candidate_nor_a_count(seeded):
+@pytest.mark.parametrize('filters',[{},{'accounts':[TG]}])
+def test_alias_copies_neither_create_nor_suppress_a_hint_and_page_filters_change_nothing(seeded,filters):
     s,a,_=seeded;pair(s)
-    with s.authorized(a,'list_chats') as (c,p):
-        found=related_chats.hints(c,p,[{'id':'new','type':'private','last_activity':when(1)}],hidden={'old'})
-    assert found=={}
+    alias_pair(s,copies=205)  # more than the candidate cap: counted before alias removal they would silence the hint
+    for read in (rows,updates):
+        assert read(s,a,**filters)['new']['related_chats'][0]['chat_id']=='old'
+    with s.pool.connection() as c:c.execute("UPDATE messages SET deleted=true WHERE id LIKE 'lid-out-%'")
+    assert rows(s,a,**filters)['new']['related_chats'][0]['chat_id']=='old'
+
+
+# spec: ANYM-656
+def test_a_new_chats_own_alias_twin_is_not_another_chat(seeded):
+    s,a,_=seeded
+    alias_pair(s,copies=0)
+    chat(s,TG,'old');say(s,TG,'old','old-out',TEXT,3,'outgoing')
+    with s.pool.connection() as c:
+        c.execute("""INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
+            VALUES('pn-in','whatsapp-demo-1','pn-chat','pn-in','1234567890@c.us',%s,%s,'incoming'),
+                  ('lid-out-x','whatsapp-demo-1','lid-chat','lid-out-x','owner',%s,%s,'outgoing')""",(TEXT,when(1),TEXT,when(1.5)))
+    # The owner's copy in the twin of the new chat is the same conversation, not a second recipient.
+    assert rows(s,a)['pn-chat']['related_chats'][0]['chat_id']=='old'
 
 
 # spec: ANYM-656
@@ -270,7 +337,11 @@ def test_a_slow_or_failing_helper_returns_the_same_page_without_hints(seeded,cap
     assert stripped({**overview,'consumer':'slow'})==baseline_updates
     assert not any(HINT_KEYS&set(r) for r in overview['chats'])
     # Exactly one audit record per call, as for an ordinary read; one content-free log line per failure.
-    assert len(audited(s))-seen==2 and all(r['outcome']=='ok' for r in audited(s)[seen:])
+    assert len(audited(s))-seen==2 and all(r['outcome']=='ok' for r in audited(s))
+    # The same targets an ordinary read records (the helper adds none).
+    # Each call's record names the same targets as the ordinary read before it (audit ids are not ordered).
+    from collections import Counter
+    assert set(Counter((r['operation'],tuple(r['resource_ids'])) for r in audited(s)).values())=={2}
     lines=[r for r in caplog.records if r.name==related_chats.log.name]
     assert len(lines)==2 and all(TEXT not in r.getMessage() and 'Synthetic' not in r.getMessage() for r in lines)
     assert all(why in r.getMessage() for r in lines)
