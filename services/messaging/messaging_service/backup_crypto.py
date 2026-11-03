@@ -121,7 +121,7 @@ def snapshot_profile(directory):
     return profile
 
 
-def encrypt_snapshot(directory,output,recipient,age='age',*,consume_staged_blobs=False):
+def encrypt_snapshot(directory,output,recipient,age='age',*,consume_staged_blobs=False,recordings_state=None):
     """Encrypt a verified bundle, optionally releasing exclusively owned staging.
 
     Only the backup worker opts in: its blob copies are disposable after tar has
@@ -132,11 +132,15 @@ def encrypt_snapshot(directory,output,recipient,age='age',*,consume_staged_blobs
     directory=Path(directory); output=Path(output)
     if type(consume_staged_blobs) is not bool: raise ValueError('invalid_staging_consumption')
     profile=snapshot_profile(directory);calendar=profile=='calendar';recordings=profile=='recordings'
+    # The recordings worker streams the archive from its private read-only staging: no second plaintext copy exists.
+    if recordings_state is not None:
+        if not recordings:raise ValueError('invalid_recordings_state')
+        recordings_state=Path(recordings_state)
     if recordings:
         from .backup_recordings import valid_recordings_member,verify_recordings_bundle
         # One SQLite snapshot under state/; nothing to consume, and no other member is admitted.
         if consume_staged_blobs: raise ValueError('invalid_staging_consumption')
-        verify_recordings_bundle(directory)
+        verify_recordings_bundle(directory,state=recordings_state)
     elif calendar:
         # A calendar bundle stages nothing it may consume; state/ members only under its profile.
         from .backup_calendar import valid_calendar_member,verify_calendar_bundle
@@ -155,7 +159,7 @@ def encrypt_snapshot(directory,output,recipient,age='age',*,consume_staged_blobs
             try:
                 with tarfile.open(fileobj=process.stdin,mode='w|') as archive:
                     if recordings:
-                        paths=[directory/'manifest.json',directory/'state'/'archive.sqlite']
+                        paths=[directory/'manifest.json',recordings_state or directory/'state'/'archive.sqlite']
                     elif calendar:
                         paths=[directory/'manifest.json',directory/'database.dump',
                                *(directory/'state'/name for name in sorted(manifest['state_files']))]
@@ -164,7 +168,7 @@ def encrypt_snapshot(directory,output,recipient,age='age',*,consume_staged_blobs
                         if (directory/'recovery').exists():paths+=sorted((directory/'recovery').iterdir())
                     for path in paths:
                         if path.is_symlink() or not path.is_file(): raise ValueError('invalid_backup_file')
-                        relative=path.relative_to(directory).as_posix()
+                        relative='state/archive.sqlite' if path==recordings_state else path.relative_to(directory).as_posix()
                         if not (valid_recordings_member(relative) if recordings else
                                 valid_calendar_member(relative) if calendar else valid_member(relative)):
                             raise ValueError('invalid_backup_file')

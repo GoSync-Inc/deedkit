@@ -34,7 +34,7 @@ TRANSFER = {'host': 'backup.example.invalid', 'user': 'recbackup', 'identity_fil
 
 
 def make_archive(path, *, user_version=3, meta=True, application_id=APPLICATION_ID, records=2, events=3,
-                 archive_id=ARCHIVE_ID, incarnation=1, bulk=0):
+                 archive_id=ARCHIVE_ID, incarnation=1, bulk=0, meta_key='TEXT PRIMARY KEY'):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path)
@@ -43,7 +43,7 @@ def make_archive(path, *, user_version=3, meta=True, application_id=APPLICATION_
     db.executemany('INSERT INTO records VALUES(?,?)', [(f'r{i}', 'synthetic transcript ' * bulk) for i in range(records + bulk)])
     db.executemany('INSERT INTO events(ref) VALUES(?)', [(f'r{i % max(records, 1)}',) for i in range(events)])
     if meta:
-        db.execute('CREATE TABLE meta(key TEXT PRIMARY KEY, value)')
+        db.execute(f'CREATE TABLE meta(key {meta_key}, value)')
         if archive_id is not None:
             db.execute("INSERT INTO meta VALUES('archive_id',?)", (archive_id,))
         if incarnation is not None:
@@ -169,6 +169,26 @@ def build_bad(tmp_path, kind):
         path.symlink_to(tmp_path / 'real.sqlite')
     elif kind == 'directory':
         path.mkdir()
+    elif kind == 'duplicate_archive_id':
+        make_archive(path, meta_key='TEXT')
+        db = sqlite3.connect(path)
+        db.execute("INSERT INTO meta VALUES('archive_id','arch-second-conflicting-id')")
+        db.commit()
+        db.close()
+    elif kind == 'text_incarnation':
+        make_archive(path, incarnation='1')
+    elif kind == 'meta_wrong_shape':
+        make_archive(path, meta=False)
+        db = sqlite3.connect(path)
+        db.execute('CREATE TABLE meta(name TEXT, val TEXT)')
+        db.commit()
+        db.close()
+    elif kind == 'text_sequence':
+        make_archive(path)
+        db = sqlite3.connect(path)
+        db.executescript("DROP TABLE events; CREATE TABLE events(sequence TEXT); INSERT INTO events VALUES('not-a-sequence');")
+        db.commit()
+        db.close()
     return path
 
 
@@ -177,6 +197,8 @@ BAD = [('absent', 'recordings_snapshot_absent'), ('empty', 'recordings_snapshot_
        ('no_meta', 'recordings_identity_missing'), ('meta_without_archive_id', 'recordings_identity_missing'),
        ('meta_without_incarnation', 'recordings_identity_missing'), ('incarnation_zero', 'recordings_identity_missing'),
        ('old_schema_without_meta', 'recordings_identity_missing'),
+       ('duplicate_archive_id', 'recordings_identity_missing'), ('text_incarnation', 'recordings_identity_missing'),
+       ('meta_wrong_shape', 'recordings_identity_missing'), ('text_sequence', 'recordings_snapshot_corrupt'),
        ('foreign_application', 'recordings_snapshot_foreign'), ('symlink', 'recordings_snapshot_unsafe'),
        ('directory', 'recordings_snapshot_unsafe')]
 
@@ -240,6 +262,51 @@ def test_a_manifest_that_disagrees_with_the_archive_identity_is_refused(tmp_path
     (bundle / 'manifest.json').write_text(json.dumps(manifest))
     with pytest.raises(RuntimeError, match='archive_corrupt'):
         verify_recordings_bundle(bundle)
+
+
+# spec: ANYM-714
+@pytest.mark.parametrize('field,value', [
+    ('bytes', True), ('bytes', 0), ('bytes', '10'), ('user_version', '3'), ('user_version', 3.0), ('sha256', 'A' * 64),
+    ('created_at', 'yesterday'), ('captured_at', 5), ('format', 2), ('archive', []),
+    ('archive.sequence', '7'), ('archive.sequence', -1), ('archive.records', True), ('archive.incarnation', 0),
+    ('archive.incarnation', '1'), ('archive.archive_id', ''), ('archive.archive_id', 'a b'), ('archive.extra', 1)])
+def test_a_manifest_field_of_the_wrong_type_or_range_is_refused_independently_of_the_archive(tmp_path, field, value):
+    bundle = sealed(tmp_path)
+    manifest = read_json_loose(bundle / 'manifest.json')
+    if field.startswith('archive.'):
+        manifest['archive'][field.split('.', 1)[1]] = value
+    else:
+        manifest[field] = value
+    (bundle / 'manifest.json').write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match='invalid_recordings_bundle'):
+        verify_recordings_bundle(bundle)
+
+
+# spec: ANYM-714
+def test_the_worker_form_checks_and_encrypts_the_archive_in_place_with_a_manifest_only_directory(tmp_path, age_stub):
+    staged = make_archive(tmp_path / 'staging' / 'archive.sqlite')
+    create_recordings_snapshot(staged, tmp_path / 'snapshot', copy_state=False)
+    assert [p.name for p in (tmp_path / 'snapshot').rglob('*')] == ['manifest.json']
+    manifest = verify_recordings_bundle(tmp_path / 'snapshot', state=staged)
+    with pytest.raises(ValueError, match='invalid_recordings_bundle'):
+        verify_recordings_bundle(tmp_path / 'snapshot')
+    encrypt_snapshot(tmp_path / 'snapshot', tmp_path / 'out.age', 'fake', age=age_stub, recordings_state=staged)
+    with tarfile.open(tmp_path / 'out.age') as archive:
+        assert archive.getnames() == ['manifest.json', 'state/archive.sqlite']
+    decrypt_snapshot(tmp_path / 'out.age', 'fake', tmp_path / 'restored', age=age_stub)
+    assert verify_recordings_bundle(tmp_path / 'restored') == manifest
+    assert (tmp_path / 'restored/state/archive.sqlite').read_bytes() == staged.read_bytes()
+    # A changed archive no longer matches the manifest it was checked against; another profile takes no external state.
+    with staged.open('r+b') as f:
+        f.seek(-1, os.SEEK_END)
+        f.write(b'\x01')
+    with pytest.raises(RuntimeError, match='archive_corrupt'):
+        encrypt_snapshot(tmp_path / 'snapshot', tmp_path / 'again.age', 'fake', age=age_stub, recordings_state=staged)
+    calendar_like = tmp_path / 'calendar'
+    calendar_like.mkdir()
+    (calendar_like / 'manifest.json').write_text('{"profile":"calendar"}')
+    with pytest.raises(ValueError, match='invalid_recordings_state'):
+        encrypt_snapshot(calendar_like, tmp_path / 'c.age', 'fake', age=age_stub, recordings_state=staged)
 
 
 # spec: ANYM-714
@@ -457,6 +524,9 @@ def test_a_valid_recordings_config_loads_and_a_config_without_it_is_unchanged(tm
     ({'recordings': 'directory_holds_staging'}, 'invalid_backup_path'),
     ({'recordings': 'staging_holds_lock'}, 'invalid_backup_path'),
     ({'recordings': 'state_in_staging'}, 'invalid_backup_path'),
+    ({'recordings': 'recipient_in_staging'}, 'invalid_backup_path'),
+    ({'recordings': 'identity_in_staging'}, 'invalid_backup_path'),
+    ({'recordings': 'known_hosts_in_staging'}, 'invalid_backup_path'),
     ({'recordings': 'capture_short'}, 'invalid_backup_timeout'),
     ({'recordings': 'capture_long'}, 'invalid_backup_timeout'),
     ({'busy_wait_seconds': 7201}, 'invalid_backup_timeout'),
@@ -485,6 +555,12 @@ def test_a_recordings_config_with_a_foreign_key_a_missing_own_key_or_overlapping
             own['staging_directory'] = str(Path(cfg['host_lock']).parent)
         elif value == 'state_in_staging':
             own['state_directory'] = own['staging_directory'] + '/state'
+        elif value == 'recipient_in_staging':
+            cfg['recipient_file'] = own['staging_directory'] + '/recipient'
+        elif value == 'identity_in_staging':
+            cfg['transfer']['identity_file'] = own['staging_directory'] + '/keys/id_ed25519'
+        elif value == 'known_hosts_in_staging':
+            cfg['transfer']['known_hosts_file'] = own['staging_directory'] + '/known_hosts'
         elif value == 'capture_short':
             own['capture_timeout_seconds'] = 59
         elif value == 'capture_long':
@@ -572,6 +648,102 @@ def test_plaintext_left_in_staging_by_a_crashed_run_is_removed_at_the_next_start
     assert entries == [own] and backup_runner.ID.fullmatch(own), 'only this job\'s empty directory remains at staging time'
     assert (tmp_path / 'source' / 'archive.sqlite').exists(), 'a symlink in staging is removed, never followed'
     assert staging_entries(runner) == [] and len(sent) == 1
+
+
+# spec: ANYM-714
+def test_a_mount_inside_staging_is_refused_before_anything_is_deleted(tmp_path, age_stub, monkeypatch):
+    runner, docker, sent = recordings_runner(tmp_path, age_stub, monkeypatch)
+    staging = runner.staging_root
+    staging.mkdir(mode=0o700)
+    (staging / 'mounted').mkdir()
+    (staging / 'mounted' / 'outside-data.txt').write_text('belongs to another filesystem')
+    (staging / 'plain').mkdir()
+    (staging / 'plain' / 'archive.sqlite').write_bytes(b'plaintext')
+    table = tmp_path / 'mountinfo'
+    table.write_text(f'36 35 0:30 / {staging.resolve()}/mounted rw,relatime - ext4 /dev/sda1 rw\n')
+    monkeypatch.setattr(backup_runner, 'MOUNTINFO', str(table))
+    with pytest.raises(ValueError, match='staging_mount_refused'):
+        runner.clean_staging()
+    assert (staging / 'mounted' / 'outside-data.txt').exists() and (staging / 'plain' / 'archive.sqlite').exists()
+    with pytest.raises(ValueError, match='staging_mount_refused'):
+        runner.run()
+    assert docker.calls == [] and sent == [] and (staging / 'mounted' / 'outside-data.txt').exists()
+
+
+# spec: ANYM-714
+def test_the_mount_table_reading_finds_only_mounts_strictly_inside_the_directory(tmp_path):
+    root = tmp_path / 'stag ing'
+    root.mkdir()
+    escaped = str(root.resolve()).replace(' ', '\\040')
+    table = tmp_path / 'mountinfo'
+    table.write_text(f'1 0 0:1 / {escaped}/sub\\040dir rw - ext4 a b\n2 0 0:2 / {escaped} rw - ext4 a b\n'
+                     f'3 0 0:3 / {escaped}-other rw - ext4 a b\n4 0 0:4 /\n')
+    assert backup_runner.mounts_under(root, table) == [str(root.resolve()) + '/sub dir']
+    assert backup_runner.mounts_under(root, tmp_path / 'absent') == []
+
+
+# spec: ANYM-714
+def test_a_resumed_upload_journal_empties_surviving_staging_before_delivery(tmp_path, age_stub, monkeypatch):
+    seen = []
+    async def failing(path, result, transfer, timeout):
+        raise RuntimeError('backup_delivery_failed')
+    runner, docker, sent = recordings_runner(tmp_path, age_stub, monkeypatch, send=failing)
+    with pytest.raises(RuntimeError, match='backup_delivery_failed'):
+        runner.run()
+    runner.recover_stop()
+    job = runner.journal['id']
+    assert read_json(runner.journal_path)['phase'] == 'upload'
+    survivors = runner.staging_root / job
+    survivors.mkdir(mode=0o700)
+    (survivors / 'archive.sqlite').write_bytes(b'plaintext left by a crash')
+    (runner.staging_root / 'stray.sqlite').write_bytes(b'plaintext')
+    async def stored(path, result, transfer, timeout):
+        seen.append(staging_entries(runner))
+        return {**result, 'status': 'stored', 'duplicate': False}
+    again = StagingRunner(runner.cfg, docker=docker, sleep=lambda _: None, send=stored)
+    again.run()
+    assert seen == [[]] and staging_entries(again) == []
+    # `--recover-stop` of an upload-phase journal empties it too.
+    survivors.mkdir(mode=0o700)
+    (survivors / 'archive.sqlite').write_bytes(b'plaintext')
+    Runner(runner.cfg, docker=docker).recover_stop()
+    assert staging_entries(again) == []
+
+
+# spec: ANYM-714
+def test_a_failing_cleanup_does_not_stop_recovery_from_stopping_the_running_worker(tmp_path, age_stub, monkeypatch):
+    runner, docker, _ = recordings_runner(tmp_path, age_stub, monkeypatch)
+    runner.prepare()
+    job = runner.journal['id']
+    container = OWNED + job.lower()
+    docker.containers[container] = {'Id': container, 'Mounts': [], 'State': {'Running': True, 'Status': 'running', 'ExitCode': 0},
+                                    'Config': {'Labels': {'personal-os.backup.id': job,
+                                                          'personal-os.backup.project': 'deedkit-recordings'}}}
+    def broken():
+        raise OSError('staging is on a failing filesystem')
+    monkeypatch.setattr(runner, 'clean_staging', broken)
+    with pytest.raises(OSError, match='failing filesystem'):
+        runner.recover_stop()
+    assert ('stop', '--time', '25', container) in docker.calls and container not in docker.containers
+    assert read_json(runner.status_path)['error_code'] == 'staging_cleanup_failed'
+
+
+# spec: ANYM-714
+def test_a_worker_refusal_file_that_is_not_an_object_changes_no_other_profiles_failure(tmp_path, age_stub, monkeypatch):
+    cfg = {'profile': 'calendar', 'directory': str(tmp_path / 'cal'), 'project': 'p', 'network': 'n', 'image': 'i',
+           'dsn_file': '/d', 'recipient_file': '/r', 'state_mounts': {'vault': '/v', 'profile': '/p'},
+           'transfer': dict(TRANSFER), 'timeout_seconds': 60, 'keep_local': 1, 'host_lock': str(tmp_path / 'm' / '.runner.lock')}
+    calendar = Runner(cfg)
+    work = tmp_path / 'job'
+    work.mkdir(mode=0o700)
+    private_file(work / 'refused.json', ['not', 'an', 'object'])
+    assert calendar.refusal(work) is None
+    runner, _, _ = recordings_runner(tmp_path, age_stub, monkeypatch)
+    for content in (['x'], {'code': 5}, {'code': 'backup_capture_timeout'}, {'code': 'recordings_made_up'}):
+        private_file(work / 'refused.json', content)
+        assert runner.refusal(work) is None
+    private_file(work / 'refused.json', {'code': 'recordings_snapshot_corrupt'})
+    assert runner.refusal(work) == 'recordings_snapshot_corrupt'
 
 
 # spec: ANYM-714
@@ -672,3 +844,41 @@ def test_the_worker_config_is_exact_and_a_refusal_writes_only_a_fixed_code(tmp_p
     (work / 'refused.json').unlink()
     result = backup_worker.run(config)
     assert result['profile'] == 'recordings' and (work / 'bundle.tar.age').is_file() and not (work / 'snapshot').exists()
+
+
+# spec: ANYM-714
+@pytest.mark.parametrize('failure', [None, 'captured', 'encrypt'])
+def test_the_worker_keeps_no_plaintext_copy_of_the_archive_outside_staging_on_any_exit(tmp_path, age_stub, monkeypatch, failure):
+    def encrypt(*a, **k):
+        if failure == 'encrypt':
+            raise RuntimeError('backup_encryption_failed')
+        return encrypt_snapshot(*a, age=age_stub, **k)
+    monkeypatch.setattr(backup_worker, 'encrypt_snapshot', encrypt)
+    real_write = backup_worker.write_json
+    def write(path, data):
+        if failure == 'captured' and Path(path).name == 'captured.json':
+            raise OSError('disk full')
+        return real_write(path, data)
+    monkeypatch.setattr(backup_worker, 'write_json', write)
+    work = tmp_path / 'work'
+    work.mkdir(mode=0o700)
+    snapshots = tmp_path / 'snapshots'
+    make_archive(snapshots / 'archive.sqlite')
+    (tmp_path / 'recipient').write_text('fake')
+    config = {'profile': 'recordings', 'id': JOB_ID, 'snapshot_directory': str(snapshots),
+              'recipient_file': str(tmp_path / 'recipient'), 'work_directory': str(work)}
+    seen = []
+    real_encrypt = encrypt
+    def watching(directory, *a, **k):
+        seen.extend(sorted(p.relative_to(directory).as_posix() for p in Path(directory).rglob('*')))
+        return real_encrypt(directory, *a, **k)
+    monkeypatch.setattr(backup_worker, 'encrypt_snapshot', watching)
+    if failure:
+        with pytest.raises((OSError, RuntimeError)):
+            backup_worker.run(config)
+    else:
+        backup_worker.run(config)
+    assert not (work / 'snapshot').exists() and not list(work.rglob('archive.sqlite'))
+    assert not list(work.glob('.recordings-backup-*'))
+    assert seen in ([], ['manifest.json']), 'only the manifest is ever beside the encryption'
+    assert (snapshots / 'archive.sqlite').is_file()

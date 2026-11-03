@@ -32,7 +32,8 @@ SAFE_ERRORS={'backup_capture_failed','backup_capture_timeout','backup_container_
     'backup_fence_release_failed','backup_capture_unfenced','backup_fence_retained',
     'collector_missing_during_resume','collector_identity_changed','collector_missing_during_stop','host_lock_busy',
     'recordings_snapshot_absent','recordings_snapshot_empty','recordings_snapshot_unsafe','recordings_snapshot_corrupt',
-    'recordings_snapshot_foreign','recordings_schema_unsupported','recordings_identity_missing'}
+    'recordings_snapshot_foreign','recordings_schema_unsupported','recordings_identity_missing',
+    'staging_mount_refused','staging_cleanup_failed'}
 # The receiver's own verifier holds its upload lock for a whole restore (about an hour). A delivery it refuses as busy
 # before it stores anything (stream_v2: before the stream started) is offered again, same backup ID, every
 # BUSY_RETRY_SECONDS while the bound since the first offer allows; each offer keeps its upload timeout.
@@ -46,6 +47,7 @@ HOST_LOCK_POLL_SECONDS=5
 POLL_SECONDS=1.0
 CALENDAR_WORKER='deedkit-calendar-backup-'
 RECORDINGS_WORKER='deedkit-recordings-backup-'
+MOUNTINFO='/proc/self/mountinfo'  # the Linux mount table; absent elsewhere (a development host), then no mount is known
 
 
 def read_json(path,limit=65536):
@@ -110,6 +112,19 @@ def nested(a,b):
     return a==b or a in b.parents or b in a.parents
 
 
+def mounts_under(root,mountinfo=None):
+    """Mount points strictly inside `root`, read from the mount table (octal escapes undone)."""
+    try:text=Path(mountinfo or MOUNTINFO).read_text()
+    except FileNotFoundError:return []
+    root=os.path.realpath(root).rstrip('/');found=[]
+    for line in text.splitlines():
+        fields=line.split(' ')
+        if len(fields)<5:continue
+        point=re.sub(r'\\([0-7]{3})',lambda m:chr(int(m.group(1),8)),fields[4])
+        if point.startswith(root+'/'):found.append(point)
+    return found
+
+
 def recordings_config(cfg):
     """`profile: recordings` (ANYM-714): one staged archive snapshot, no database and no network, messaging's lock."""
     if set(cfg)-{'delivery_mode','busy_wait_seconds'}!={'profile','directory','project','image','recipient_file',
@@ -132,6 +147,10 @@ def recordings_config(cfg):
     if (nested(staging,state) or nested(staging,cfg['directory']) or nested(state,cfg['directory']) or
         nested(staging,cfg['host_lock']) or nested(state,cfg['host_lock'])):raise ValueError('invalid_backup_path')
     if not transfer_valid(cfg['transfer']):raise ValueError('invalid_backup_transfer')
+    # Emptying the staging directory must never reach a credential this runner needs.
+    if any(nested(staging,cfg[key]) for key in ('recipient_file',)) or any(
+        nested(staging,cfg['transfer'][key]) for key in ('identity_file','known_hosts_file')):
+        raise ValueError('invalid_backup_path')
     if type(cfg['timeout_seconds']) is not int or not 60<=cfg['timeout_seconds']<=7200:raise ValueError('invalid_backup_timeout')
     if type(own['capture_timeout_seconds']) is not int or not 60<=own['capture_timeout_seconds']<=7200:
         raise ValueError('invalid_backup_timeout')
@@ -457,7 +476,11 @@ class Runner:
             if not info['State']['Running']:self.docker.call('start',saved['id'])
             self.journal['stopped'].remove(saved);self.save()
     def prepare(self):
-        if self.journal_path.exists():return self.load()
+        if self.journal_path.exists():
+            self.load()
+            # A job past its capture needs no plaintext: whatever a crash left in staging goes before delivery resumes.
+            if self.recordings and self.journal['phase']=='upload':self.clean_staging()
+            return
         backup_id=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+secrets.token_hex(8)
         work=self.root/backup_id;work.mkdir(mode=0o700)
         stopped=[] if self.hostless else self.docker.running_collectors(self.cfg['project'])
@@ -471,29 +494,23 @@ class Runner:
     def stage_snapshot(self,destination):
         """Put `archive.sqlite` into `destination`, a private directory made for this job (ANYM-727 implements it)."""
     def clean_staging(self):
-        """Empty the staging directory (never the directory itself): plaintext of the archive must not linger."""
+        """Empty the staging directory (never the directory itself): plaintext of the archive must not linger.
+
+        Refuses, before deleting anything, a mount point inside it or a directory on another device: removing
+        the files of a mounted directory would delete what is mounted there.
+        """
         root=self.staging_root;root.mkdir(mode=0o700,exist_ok=True)
         if root.is_symlink() or root.stat().st_mode&0o077:raise ValueError('private_backup_directory_required')
+        if mounts_under(root):raise ValueError('staging_mount_refused')
+        device=root.stat().st_dev;folders=[]
         for entry in root.iterdir():
-            if entry.is_symlink() or not entry.is_dir():entry.unlink()
-            else:shutil.rmtree(entry)
-    def create_calendar_worker(self,work):
-        """The calendar profile's worker: its database, vault and profile files read-only, no files volume."""
-        write_json(self.unsettled_path,{'profile':'calendar','id':self.journal['id'],'container':self.journal['container']})
-        write_json(work/'worker.json',{'profile':'calendar','id':self.journal['id'],'dsn_file':'/run/secrets/database_url',
-            'vault_directory':'/sources/vault','profile_directory':'/sources/profile',
-            'recipient_file':'/run/secrets/recipient','work_directory':'/work'})
-        mounts=self.cfg['state_mounts']
-        self.docker.call('create','--name',self.journal['container'],'--label','personal-os.backup.id='+self.journal['id'],
-            '--label','personal-os.backup.project='+self.cfg['project'],'--network',self.cfg['network'],
-            '--read-only','--user','0','--cap-drop','ALL','--cap-add','DAC_OVERRIDE','--security-opt','no-new-privileges',
-            '--memory','384m','--cpus','0.75','--pids-limit','64','--tmpfs','/tmp:size=32m,noexec,nosuid',
-            '--mount','type=bind,src='+str(work)+',dst=/work',
-            '--mount','type=bind,src='+str(work/'worker.json')+',dst=/run/secrets/backup_config,readonly',
-            '--mount','type=bind,src='+self.cfg['dsn_file']+',dst=/run/secrets/database_url,readonly',
-            '--mount','type=bind,src='+self.cfg['recipient_file']+',dst=/run/secrets/recipient,readonly',
-            '--mount','type=bind,src='+mounts['vault']+',dst=/sources/vault,readonly',
-            '--mount','type=bind,src='+mounts['profile']+',dst=/sources/profile,readonly',self.cfg['image'])
+            if entry.is_symlink() or not entry.is_dir():continue
+            for base,_,_ in os.walk(entry,followlinks=False):
+                if os.lstat(base).st_dev!=device:raise ValueError('staging_mount_refused')
+            folders.append(entry)
+        for entry in root.iterdir():
+            if entry in folders:shutil.rmtree(entry)
+            else:entry.unlink()
     def create_recordings_worker(self,work):
         """The recordings profile's worker: the staged snapshot read-only, no network, no database, no secrets but age."""
         write_json(self.unsettled_path,{'profile':'recordings','id':self.journal['id'],'container':self.journal['container']})
@@ -510,9 +527,11 @@ class Runner:
             self.cfg['image'])
     def refusal(self,work):
         """The worker's fixed refusal code, if it wrote one (recordings only); never anything else from the file."""
-        try:code=read_json(work/'refused.json').get('code')
+        if not self.recordings:return None
+        try:data=read_json(work/'refused.json')
         except (OSError,ValueError):return None
-        return code if self.recordings and code in SAFE_ERRORS and code.startswith('recordings_') else None
+        code=data.get('code') if isinstance(data,dict) else None
+        return code if isinstance(code,str) and code in SAFE_ERRORS and code.startswith('recordings_') else None
     def create_worker(self,work):
         if self.calendar:return self.create_calendar_worker(work)
         if self.recordings:return self.create_recordings_worker(work)
@@ -833,8 +852,22 @@ class Runner:
                 except (OSError,ValueError):pass  # the next start empties it again
             raise
     def recover_stop(self):
-        """systemd ExecStopPost: settle the owned container, then resume its collectors."""
-        if self.recordings:self.clean_staging()  # no job survives this call with archive plaintext in staging
+        """systemd ExecStopPost: settle the owned container, then resume its collectors.
+
+        A recordings job's staging is emptied after that attempt, whatever its outcome: a stop that failed is not
+        masked by the cleanup, and a cleanup that failed does not undo a verified stop (status `staging_cleanup_failed`).
+        """
+        failure=None
+        try:self.settle_job()
+        except BaseException as exc:failure=exc
+        if self.recordings:
+            try:self.clean_staging()
+            except Exception as exc:
+                try:self.status('error','staging_mount_refused' if str(exc)=='staging_mount_refused' else 'staging_cleanup_failed')
+                except Exception:pass
+                failure=failure or exc
+        if failure is not None:raise failure
+    def settle_job(self):
         if not self.journal_path.exists():
             if self.hostless and os.path.lexists(self.unsettled_path):self.settle(read_json(self.unsettled_path)['container'])
             return

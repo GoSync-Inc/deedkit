@@ -28,6 +28,7 @@ STATE_FILE='archive.sqlite'
 MANIFEST_KEYS={'profile','format','created_at','captured_at','user_version','bytes','sha256','archive'}
 ARCHIVE_KEYS={'archive_id','incarnation','sequence','records'}
 ARCHIVE_ID=re.compile(r'[A-Za-z0-9._:-]{1,128}')
+MAX_INT=2**63-1  # SQLite's INTEGER range
 # The only codes a refusal may carry (runner SAFE_ERRORS and status); they name no path and no content.
 REFUSAL_CODES=('recordings_snapshot_absent','recordings_snapshot_empty','recordings_snapshot_unsafe',
                'recordings_snapshot_corrupt','recordings_snapshot_foreign','recordings_schema_unsupported',
@@ -45,15 +46,34 @@ def valid_recordings_member(name):
     return name in MEMBERS
 
 
+def _columns(db,table):
+    return {row[1] for row in db.execute(f'PRAGMA table_info({table})').fetchall()}
+
+
 def _identity(db):
-    """`meta` is key/value rows (ANYM-724): archive_id, incarnation (>=1). Anything else is no identity."""
-    try:rows=dict(db.execute("SELECT key,value FROM meta WHERE key IN ('archive_id','incarnation')").fetchall())
-    except sqlite3.OperationalError:raise RecordingsRefused('recordings_identity_missing') from None
-    archive_id,incarnation=rows.get('archive_id'),rows.get('incarnation')
-    if isinstance(incarnation,str) and re.fullmatch(r'[0-9]{1,15}',incarnation):incarnation=int(incarnation)
-    if (not isinstance(archive_id,str) or not ARCHIVE_ID.fullmatch(archive_id) or type(incarnation) is not int or
-        incarnation<1):raise RecordingsRefused('recordings_identity_missing')
-    return archive_id,incarnation
+    """`meta` is key/value rows (ANYM-724): exactly one `archive_id` (text) and one `incarnation` (integer >= 1).
+
+    A missing table, a duplicated key, another type or another shape is no identity: the facts must be unambiguous.
+    """
+    if not {'key','value'}<=_columns(db,'meta'):raise RecordingsRefused('recordings_identity_missing')
+    rows=db.execute("SELECT key,value,typeof(value) FROM meta WHERE key IN ('archive_id','incarnation')").fetchall()
+    found={}
+    for key,value,kind in rows:
+        if key in found:raise RecordingsRefused('recordings_identity_missing')
+        found[key]=(value,kind)
+    archive_id,incarnation=found.get('archive_id',(None,None)),found.get('incarnation',(None,None))
+    if (archive_id[1]!='text' or not ARCHIVE_ID.fullmatch(archive_id[0]) or incarnation[1]!='integer' or
+        not 1<=incarnation[0]<=MAX_INT):raise RecordingsRefused('recordings_identity_missing')
+    return archive_id[0],incarnation[0]
+
+
+def _counts(db):
+    """Highest journal sequence and record count; a different shape or type is a damaged archive, not a fact."""
+    if 'sequence' not in _columns(db,'events') or not _columns(db,'records'):raise RecordingsRefused('recordings_snapshot_corrupt')
+    sequence,kind=db.execute('SELECT MAX(sequence),typeof(MAX(sequence)) FROM events').fetchone()
+    if kind not in ('integer','null') or (kind=='integer' and not 0<=sequence<=MAX_INT):
+        raise RecordingsRefused('recordings_snapshot_corrupt')
+    return sequence or 0,db.execute('SELECT COUNT(*) FROM records').fetchone()[0]
 
 
 def inspect_archive(path):
@@ -75,8 +95,7 @@ def inspect_archive(path):
             if user_version not in SUPPORTED_USER_VERSIONS:raise RecordingsRefused('recordings_schema_unsupported')
             if db.execute('PRAGMA integrity_check').fetchall()!=[('ok',)]:raise RecordingsRefused('recordings_snapshot_corrupt')
             archive_id,incarnation=_identity(db)
-            sequence=db.execute('SELECT COALESCE(MAX(sequence),0) FROM events').fetchone()[0]
-            records=db.execute('SELECT COUNT(*) FROM records').fetchone()[0]
+            sequence,records=_counts(db)
         finally:db.close()
     except sqlite3.Error:raise RecordingsRefused('recordings_snapshot_corrupt') from None
     except OSError:raise RecordingsRefused('recordings_snapshot_unsafe') from None
@@ -89,9 +108,12 @@ def _copy_staged(source,target):
     try:fd=os.open(source,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
     except FileNotFoundError:raise RecordingsRefused('recordings_snapshot_absent') from None
     except OSError:raise RecordingsRefused('recordings_snapshot_unsafe') from None
-    with os.fdopen(fd,'rb') as src:
-        info=os.fstat(src.fileno())
+    try:
+        info=os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):raise RecordingsRefused('recordings_snapshot_unsafe')
+    except BaseException:
+        os.close(fd);raise  # a directory opens read-only but cannot be wrapped by fdopen
+    with os.fdopen(fd,'rb') as src:
         sha=hashlib.sha256();size=0
         out=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
         with os.fdopen(out,'wb') as dst:
@@ -100,45 +122,92 @@ def _copy_staged(source,target):
     return size,sha.hexdigest(),info.st_mtime
 
 
-def create_recordings_snapshot(staged,destination):
-    """Seal `staged` (an SQLite snapshot file) into a bundle directory at `destination`; refuse a bad one."""
-    destination=Path(destination)
+def _hash_staged(source):
+    """sha256, size and mtime of `source` read through one descriptor (no symlink followed, regular files only)."""
+    try:fd=os.open(source,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    except FileNotFoundError:raise RecordingsRefused('recordings_snapshot_absent') from None
+    except OSError:raise RecordingsRefused('recordings_snapshot_unsafe') from None
+    try:
+        info=os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):raise RecordingsRefused('recordings_snapshot_unsafe')
+    except BaseException:
+        os.close(fd);raise  # a directory opens read-only but cannot be wrapped by fdopen
+    with os.fdopen(fd,'rb') as src:return info.st_size,hashlib.file_digest(src,'sha256').hexdigest(),info.st_mtime
+
+
+def _write_manifest(directory,size,digest,mtime,facts):
+    manifest={'profile':'recordings','format':1,'created_at':datetime.now(timezone.utc).isoformat(),
+              'captured_at':datetime.fromtimestamp(mtime,timezone.utc).isoformat(),
+              'user_version':facts['user_version'],'bytes':size,'sha256':digest,'archive':facts['archive']}
+    with (directory/'manifest.json').open('x') as out:
+        out.write(json.dumps(manifest,ensure_ascii=False,indent=2)+'\n');out.flush();os.fsync(out.fileno())
+
+
+def create_recordings_snapshot(staged,destination,*,copy_state=True):
+    """Check `staged` (an SQLite snapshot file) and write the bundle directory at `destination`; refuse a bad one.
+
+    `copy_state=False` (the backup worker) writes only `manifest.json`: the archive is read in place from its
+    private staging directory and streamed into the encryption (`encrypt_snapshot(..., recordings_state=staged)`),
+    so no plaintext copy of it exists anywhere else. `copy_state=True` also copies it to `state/archive.sqlite`
+    (a complete bundle, as a restore produces) and checks the copy.
+    """
+    destination=Path(destination);staged=Path(staged)
     if destination.exists():raise ValueError('backup_destination_exists')
     destination.parent.mkdir(parents=True,exist_ok=True)
     temporary=Path(tempfile.mkdtemp(prefix='.recordings-backup-',dir=destination.parent))
     try:
-        (temporary/'state').mkdir(mode=0o700)
-        copy=temporary/'state'/STATE_FILE
-        size,digest,mtime=_copy_staged(staged,copy)
-        facts=inspect_archive(copy)  # the sealed copy is what is checked, not a file that may change underneath
-        manifest={'profile':'recordings','format':1,'created_at':datetime.now(timezone.utc).isoformat(),
-                  'captured_at':datetime.fromtimestamp(mtime,timezone.utc).isoformat(),
-                  'user_version':facts['user_version'],'bytes':size,'sha256':digest,'archive':facts['archive']}
-        with (temporary/'manifest.json').open('x') as out:
-            out.write(json.dumps(manifest,ensure_ascii=False,indent=2)+'\n');out.flush();os.fsync(out.fileno())
-        fsync_dir(temporary/'state');fsync_dir(temporary);os.rename(temporary,destination);fsync_dir(destination.parent)
+        if copy_state:
+            (temporary/'state').mkdir(mode=0o700)
+            copy=temporary/'state'/STATE_FILE
+            size,digest,mtime=_copy_staged(staged,copy)
+            facts=inspect_archive(copy)  # the sealed copy is what is checked, not a file that may change underneath
+        else:
+            size,digest,mtime=_hash_staged(staged)
+            facts=inspect_archive(staged)
+        _write_manifest(temporary,size,digest,mtime,facts)
+        if copy_state:fsync_dir(temporary/'state')
+        fsync_dir(temporary);os.rename(temporary,destination);fsync_dir(destination.parent)
         return {'status':'snapshot_created','profile':'recordings','user_version':facts['user_version'],
                 'records':facts['archive']['records']}
     finally:
         if temporary.exists():shutil.rmtree(temporary)  # Only this function's temporary directory.
 
 
-def verify_recordings_bundle(directory):
-    """Structure, hashes and identity of a recordings bundle; the protected-point decision is ANYM-728's."""
+def _manifest_valid(manifest):
+    """Every field's type and range, independent of the archive: a manifest is never trusted for its shape."""
+    def count(value,low=0):return type(value) is int and low<=value<=MAX_INT
+    def moment(value):
+        try:return isinstance(value,str) and datetime.fromisoformat(value) is not None
+        except ValueError:return False
+    archive=manifest.get('archive')
+    return (set(manifest)==MANIFEST_KEYS and manifest['profile']=='recordings' and manifest['format']==1 and
+            moment(manifest['created_at']) and moment(manifest['captured_at']) and count(manifest['user_version']) and
+            count(manifest['bytes'],1) and isinstance(manifest['sha256'],str) and
+            bool(re.fullmatch('[a-f0-9]{64}',manifest['sha256'])) and isinstance(archive,dict) and
+            set(archive)==ARCHIVE_KEYS and isinstance(archive['archive_id'],str) and
+            bool(ARCHIVE_ID.fullmatch(archive['archive_id'])) and count(archive['incarnation'],1) and
+            count(archive['sequence']) and count(archive['records']))
+
+
+def verify_recordings_bundle(directory,*,state=None):
+    """Structure, hashes and identity of a recordings bundle; the protected-point decision is ANYM-728's.
+
+    `state` (the backup worker only): the archive is read in place and `directory` holds `manifest.json` alone.
+    """
     from .recovery_state import read_manifest
     directory=Path(directory);manifest=read_manifest(directory)
-    if (not isinstance(manifest,dict) or set(manifest)!=MANIFEST_KEYS or manifest['profile']!='recordings' or
-        manifest['format']!=1 or type(manifest['user_version']) is not int or type(manifest['bytes']) is not int or
-        not isinstance(manifest['sha256'],str) or not re.fullmatch('[a-f0-9]{64}',manifest['sha256']) or
-        not isinstance(manifest['archive'],dict) or set(manifest['archive'])!=ARCHIVE_KEYS):
-        raise ValueError('invalid_recordings_bundle')
+    if not isinstance(manifest,dict) or not _manifest_valid(manifest):raise ValueError('invalid_recordings_bundle')
     if manifest['user_version'] not in SUPPORTED_USER_VERSIONS:raise ValueError('recordings_schema_unsupported')
     entries={p.name for p in directory.iterdir()}
-    if entries!={'manifest.json','state'}:raise ValueError('invalid_recordings_bundle')
-    state=directory/'state'
-    if state.is_symlink() or not state.is_dir() or {p.name for p in state.iterdir()}!={STATE_FILE}:
-        raise ValueError('invalid_recordings_bundle')
-    path=state/STATE_FILE
+    if state is not None:
+        if entries!={'manifest.json'}:raise ValueError('invalid_recordings_bundle')
+        path=Path(state)
+    else:
+        if entries!={'manifest.json','state'}:raise ValueError('invalid_recordings_bundle')
+        folder=directory/'state'
+        if folder.is_symlink() or not folder.is_dir() or {p.name for p in folder.iterdir()}!={STATE_FILE}:
+            raise ValueError('invalid_recordings_bundle')
+        path=folder/STATE_FILE
     try:
         fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
         with os.fdopen(fd,'rb') as source:

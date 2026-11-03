@@ -157,7 +157,7 @@ def run_calendar(config):
 
 
 def run_recordings(config):
-    """Recordings archive profile (ANYM-714): one staged SQLite snapshot, checked, sealed and encrypted. No network."""
+    """Recordings archive profile (ANYM-714): one staged SQLite snapshot, checked and encrypted in place. No network."""
     from .backup_recordings import RecordingsRefused,create_recordings_snapshot
     from .backup_receiver import BACKUP_ID
     from .recovery_state import read_manifest
@@ -166,19 +166,24 @@ def run_recordings(config):
     if not isinstance(config['id'],str) or not BACKUP_ID.fullmatch(config['id']):raise ValueError('invalid_backup_id')
     work=Path(config['work_directory'])
     if work.is_symlink() or not work.is_dir() or work.stat().st_mode&0o077:raise ValueError('private_work_directory_required')
-    try:snapshot=create_recordings_snapshot(Path(config['snapshot_directory'])/'archive.sqlite',work/'snapshot')
-    except RecordingsRefused as exc:
-        # A fixed code only: no path, no archive content. No bundle exists and none is started.
-        write_json(work/'refused.json',{'id':config['id'],'status':'refused','code':exc.code})
-        raise
-    write_json(work/'captured.json',{'id':config['id'],'status':'capture_complete'})
-    manifest=read_manifest(work/'snapshot')
-    with (work/'snapshot/manifest.json').open('rb') as f:snapshot_sha=hashlib.file_digest(f,'sha256').hexdigest()
-    output=work/'bundle.tar.age'
-    try:encrypt_snapshot(work/'snapshot',output,Path(config['recipient_file']).read_text().strip())
+    staged=Path(config['snapshot_directory'])/'archive.sqlite'
+    directory=work/'snapshot'
+    # `snapshot` holds only manifest.json (identity facts, no speech); the archive itself is streamed from its private
+    # read-only staging into the encryption, so no plaintext copy of it exists outside staging. The directory goes
+    # on every exit, the whole lifetime of the capture.
+    try:
+        try:snapshot=create_recordings_snapshot(staged,directory,copy_state=False)
+        except RecordingsRefused as exc:
+            # A fixed code only: no path, no archive content. No bundle exists and none is started.
+            write_json(work/'refused.json',{'id':config['id'],'status':'refused','code':exc.code})
+            raise
+        write_json(work/'captured.json',{'id':config['id'],'status':'capture_complete'})
+        manifest=read_manifest(directory)
+        with (directory/'manifest.json').open('rb') as f:snapshot_sha=hashlib.file_digest(f,'sha256').hexdigest()
+        output=work/'bundle.tar.age'
+        encrypt_snapshot(directory,output,Path(config['recipient_file']).read_text().strip(),recordings_state=staged)
     finally:
-        # The plaintext copy of other people's speech never outlives this call; a retry captures anew.
-        shutil.rmtree(work/'snapshot')
+        if directory.exists():shutil.rmtree(directory)
     with output.open('rb') as f:digest=hashlib.file_digest(f,'sha256').hexdigest()
     result={'v':1,'id':config['id'],'profile':'recordings','status':'encrypted','bytes':output.stat().st_size,
             'sha256':digest,'snapshot_sha256':snapshot_sha,'snapshot':snapshot,'created_at':datetime.now(timezone.utc).isoformat(),

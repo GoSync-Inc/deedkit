@@ -379,49 +379,6 @@ returns `busy` (`backup_running`) before any change. `backup_runner.py --config 
 `{"status":"idle"}` and exits 0, or prints the unfinished journal's `id`, `phase` and the
 number of stopped collectors and exits 3.
 
-## Recordings archive bundle (ANYM-714)
-
-The recordings archive (one SQLite file with transcripts and summaries, including other people's speech) is
-backed up as its own profile, never as a member of the messaging or calendar bundle. This section is the
-format and the host runner's plumbing (part 1 of 5); staging the snapshot and the units are ANYM-727, the
-receiver, verifier, restore helper and protected point ANYM-728, installation ANYM-731, deletion ANYM-730.
-Nothing runs it yet and no production config carries it.
-
-Bundle: manifest `"profile": "recordings"`, `format` 1, and exactly two members, `manifest.json` and
-`state/archive.sqlite` (any other member, a second state file or a path escape is refused when sealing,
-encrypting and decrypting). The manifest records `user_version` (accepted: 1 to 5, every schema this package
-supports; a newer one is refused `recordings_schema_unsupported`, so a helper older than the archive fails
-closed), `bytes`, `sha256` and `archive`: `archive_id`, `incarnation`, the highest event `sequence` and the
-record `records` count, all read from the snapshot's `meta` (key/value rows `archive_id`, `incarnation`)
-and tables. A schema 1-2 archive has no `meta` and is refused until ANYM-724's schema 3 has run. The messaging
-and calendar validators refuse this bundle, and this one refuses theirs; a runner or reader from before this
-change refuses it by its `profile` value (`invalid_backup_config`, `unsupported_backup`).
-
-Worker (`python -m messaging_service.backup_worker`, `"profile": "recordings"`, keys `id`, `snapshot_directory`
-(read-only, holds `archive.sqlite`), `recipient_file`, `work_directory`; no network, no database): it copies the
-staged file, then checks the copy: a regular file (no symlink), non-empty, SQLite header, the archive's
-`application_id`, a supported `user_version`, `PRAGMA integrity_check` and a `meta` identity. Otherwise the job
-ends with one fixed code in `refused.json` and the status file and creates no bundle: `recordings_snapshot_absent`,
-`_empty`, `_unsafe`, `_corrupt`, `_foreign`, `recordings_schema_unsupported`, `recordings_identity_missing`.
-A valid archive that lost data (emptied, re-initialized) is not decided here: the worker only records the
-identity facts, and the continuity decision against the protected point is ANYM-728.
-
-Host runner config (`profile: "recordings"`): `directory`, `project`, `image`, `recipient_file`, `transfer`,
-`timeout_seconds`, `keep_local`, `host_lock` and a `recordings` object `{staging_directory, state_directory,
-capture_timeout_seconds}` (60-7200 s, the worker's deadline); optional `delivery_mode` (`staged_v1`) and
-`busy_wait_seconds`. Unknown keys, the calendar's `network`/`dsn_file`/`state_mounts` and overlapping paths (the
-staging or state directory equal to, inside or holding another, the runner `directory` or `host_lock`) are
-refused. The run follows the calendar's rules: no application container is listed, stopped or started, the
-worker is `deedkit-recordings-backup-<id>`, the same lock order and `host_lock` wait, the v2 wire, the journal
-and resume. Its worker has `--network none` and sees only its job's staging directory read-only.
-
-Plaintext hygiene: the snapshot is staged in `<staging_directory>/<job id>` (0700). The runner empties the
-staging directory (never the directory itself) at the start of every new job, when the worker has exited,
-when a job fails, and in `--recover-stop`; the worker deletes its own plaintext copy right after encryption.
-The marker `<state_directory>/.unsettled` records the worker until it is verified stopped, like the calendar's
-`<host_lock>.unsettled`; `production.py` does not read it (the run holds `host_lock` throughout; a deploy check
-for it is for ANYM-727/731 to decide).
-
 The bundle holds:
 - `database.dump`: `pg_dump --format=custom --no-owner --no-acl` of `family_calendar`,
   taken from the snapshot exported by one REPEATABLE READ READ ONLY transaction;
@@ -560,3 +517,52 @@ runner reads the previous file when it writes status). Steps: stop both calendar
 `status.json.corrupt-<date>` in the same directory; start the catch-up service once
 (`systemctl start deedkit-calendar-backup-catchup.service`; it is admitted only 19:00-23:59, otherwise start the daily
 service before 16:02); read `fresh` from the freshness command; start both timers again.
+
+## Recordings archive bundle (ANYM-714)
+
+The recordings archive (one SQLite file with transcripts and summaries, including other people's speech) is
+backed up as its own profile, never as a member of the messaging or calendar bundle. This section is the
+format and the host runner's plumbing (part 1 of 5); staging the snapshot and the units are ANYM-727, the
+receiver, verifier, restore helper and protected point ANYM-728, installation ANYM-731, deletion ANYM-730.
+Nothing runs it yet and no production config carries it.
+
+Bundle: manifest `"profile": "recordings"`, `format` 1, and exactly two members, `manifest.json` and
+`state/archive.sqlite` (any other member, a second state file or a path escape is refused when sealing,
+encrypting and decrypting). The manifest records `user_version` (accepted: 1 to 5, every schema this package
+supports; a newer one is refused `recordings_schema_unsupported`, so a helper older than the archive fails
+closed), `bytes`, `sha256` and `archive`: `archive_id`, `incarnation`, the highest event `sequence` and the
+record `records` count, all read from the snapshot's `meta` (key/value rows `archive_id`, `incarnation`)
+and tables. A schema 1-2 archive has no `meta` and is refused until ANYM-724's schema 3 has run. The messaging
+and calendar validators refuse this bundle, and this one refuses theirs; a runner or reader from before this
+change refuses it by its `profile` value (`invalid_backup_config`, `unsupported_backup`).
+
+Worker (`python -m messaging_service.backup_worker`, `"profile": "recordings"`, keys `id`, `snapshot_directory`
+(read-only, holds `archive.sqlite`), `recipient_file`, `work_directory`; no network, no database): it checks the
+staged file in place: a regular file (no symlink), non-empty, SQLite header, the archive's `application_id`, a
+supported `user_version`, `PRAGMA integrity_check` and a `meta` identity that is unambiguous (exactly one text
+`archive_id`, one integer `incarnation` >= 1; integer `sequence`). It writes only `manifest.json` into
+`<work>/snapshot` (identity facts, no speech) and streams the archive from its read-only staging into the
+encryption, so no second plaintext copy exists; that directory is removed on every exit. Otherwise the job
+ends with one fixed code in `refused.json` and the status file and creates no bundle: `recordings_snapshot_absent`,
+`_empty`, `_unsafe`, `_corrupt`, `_foreign`, `recordings_schema_unsupported`, `recordings_identity_missing`.
+A valid archive that lost data (emptied, re-initialized) is not decided here: the worker only records the
+identity facts, and the continuity decision against the protected point is ANYM-728.
+
+Host runner config (`profile: "recordings"`): `directory`, `project`, `image`, `recipient_file`, `transfer`,
+`timeout_seconds`, `keep_local`, `host_lock` and a `recordings` object `{staging_directory, state_directory,
+capture_timeout_seconds}` (60-7200 s, the worker's deadline); optional `delivery_mode` (`staged_v1`) and
+`busy_wait_seconds`. Unknown keys, the calendar's `network`/`dsn_file`/`state_mounts` and overlapping paths (the
+staging or state directory equal to, inside or holding another, the runner `directory`, `host_lock`,
+`recipient_file` or a transfer key file; the runner empties staging, so none may live there) are refused. The run follows the calendar's rules: no application container is listed, stopped or started, the
+worker is `deedkit-recordings-backup-<id>`, the same lock order and `host_lock` wait, the v2 wire, the journal
+and resume. Its worker has `--network none` and sees only its job's staging directory read-only.
+
+Plaintext hygiene: the snapshot is staged in `<staging_directory>/<job id>` (0700), the only place the archive's
+plaintext exists. The runner empties the staging directory (never the directory itself) at the start of every
+new job, when the worker has exited, when a job fails, when an `upload`-phase journal resumes, and in
+`--recover-stop` (after the owned worker is stopped; a failed cleanup does not undo the stop and sets
+`staging_cleanup_failed`). It refuses (`staging_mount_refused`) before deleting anything when the mount table
+shows a mount inside staging or a directory is on another device.
+The marker `<state_directory>/.unsettled` records the worker until it is verified stopped, like the calendar's
+`<host_lock>.unsettled`; `production.py` does not read it (the run holds `host_lock` throughout; a deploy check
+for it is for ANYM-727/731 to decide).
