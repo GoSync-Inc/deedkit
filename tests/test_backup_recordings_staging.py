@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import signal
 import sys
 from types import SimpleNamespace
 
@@ -20,7 +21,7 @@ import yaml
 from messaging_service import backup_runner, backup_worker
 from messaging_service.backup_crypto import decrypt_snapshot
 from messaging_service.backup_recordings import RecordingsRefused, create_recordings_snapshot, verify_recordings_bundle
-from messaging_service.backup_runner import (GUARD_SECONDS, RECOVERY_BUDGET, STOP_BUDGET, Runner, Skip, next_start, read_json,
+from messaging_service.backup_runner import (GUARD_SECONDS, admission_bound, timer_delay, RECOVERY_BUDGET, STOP_BUDGET, Runner, Skip, next_start, read_json,
                                              timer_starts, worst_case)
 from test_backup_recordings import ARCHIVE_ID, NOW, RecordingsDocker, make_archive, recordings_cfg, write_timers
 
@@ -49,7 +50,9 @@ class SnapshotDocker(RecordingsDocker):
     """
     def __init__(self, root, age, monkeypatch, staging):
         super().__init__(root, age, monkeypatch)
-        self.staging, self.mode, self.hold, self.execs = staging, 'ok', False, []
+        self.staging, self.mode, self.hold, self.execs, self.processes = staging, 'ok', False, [], []
+        self.killed = []  # a signalled producer is gone (a test that wants it to survive replaces os.kill)
+        monkeypatch.setattr(backup_runner.os, 'kill', lambda pid, sig: (self.killed.append((pid, sig)), self.processes.clear()))
         self.containers[CONTAINER] = {'Id': CONTAINER, 'Config': {'Labels': {}}, 'Mounts': [],
                                       'State': {'Running': True, 'Status': 'running', 'ExitCode': 0}}
     def exec(self, container, args, timeout):
@@ -57,6 +60,8 @@ class SnapshotDocker(RecordingsDocker):
         target = self.staging / Path(args[-1]).parent.name / 'archive.sqlite'
         assert args[-1] == f'/backup-staging/{target.parent.name}/archive.sqlite'
         if self.mode == 'timeout':
+            # The client gave up; the producer inside the container is still writing the file.
+            self.processes = [(4242, 'deedkit-recordings --config c.json --backup-to ' + args[-1])]
             raise RuntimeError('recordings_exec_timeout')
         if self.mode == 'disabled':
             return 1, 'Archive backup failed: archive_disabled\n'
@@ -74,6 +79,8 @@ class SnapshotDocker(RecordingsDocker):
             make_archive(target, bulk=50)
         os.chmod(target, 0o600)
         return 0, ''
+    def top(self, container):
+        return list(self.processes)
     def call(self, *args):
         if args[0] == 'start' and self.hold:
             self.calls.append(args)
@@ -451,13 +458,51 @@ def test_a_start_is_admitted_only_when_the_whole_worst_case_ends_15_minutes_befo
 # spec: ANYM-727
 def test_the_admission_boundary_is_exact(tmp_path, age_stub, monkeypatch):
     probe, _, _ = snapshot_runner(folder(tmp_path, 'a'), age_stub, monkeypatch)
-    latest = at(16) - GUARD_SECONDS - worst_case(probe.cfg)
+    latest = at(16) - GUARD_SECONDS - admission_bound(probe.cfg)
     admitted, _, _ = snapshot_runner(folder(tmp_path, 'b'), age_stub, monkeypatch, now=latest)
     admitted.admit('full')
     assert admitted.yield_at == at(16) - GUARD_SECONDS
     late, _, _ = snapshot_runner(folder(tmp_path, 'c'), age_stub, monkeypatch, now=latest + 1)
     with pytest.raises(Skip, match='recordings_skipped_window'):
         late.admit('full')
+
+
+# spec: ANYM-727
+def test_a_start_of_another_profile_that_is_due_or_waiting_for_its_delay_is_a_veto(tmp_path, age_stub, monkeypatch):
+    runner, _, _ = snapshot_runner(tmp_path, age_stub, monkeypatch)
+    (tmp_path / 'timers' / 'calendar.timer').write_text(
+        '[Timer]\nOnCalendar=*-*-* 16:00:00 UTC\nRandomizedDelaySec=30s\nPersistent=true\n')
+    for moment in (at(16), at(16, 0, 5), at(16, 1), at(16, 2, 29), at(18, 0, 5)):
+        runner.clock = lambda moment=moment: moment
+        for phase in ('full', 'upload'):
+            with pytest.raises(Skip, match='recordings_skipped_window'):
+                runner.admit(phase)
+    runner.clock = lambda: at(18, 2, 1)  # messaging's grace is over (the calendar's start is two hours back)
+    runner.admit('full')
+
+
+# spec: ANYM-727
+def test_the_randomized_delay_of_a_timer_file_is_read_and_an_unknown_form_stops_the_job(tmp_path):
+    timer = tmp_path / 'x.timer'
+    for text, expected in (('[Timer]\nOnCalendar=*-*-* 18:00:00 UTC\n', 0), ('RandomizedDelaySec=30s\n', 30),
+                           ('RandomizedDelaySec=5min\n', 300), ('RandomizedDelaySec=1h\n', 3600), ('RandomizedDelaySec=45\n', 45)):
+        timer.write_text(text)
+        assert timer_delay(timer) == expected
+    timer.write_text('RandomizedDelaySec=1d 2h\n')
+    with pytest.raises(Skip, match='recordings_skipped_schedule_unknown'):
+        timer_delay(timer)
+    with pytest.raises(Skip, match='recordings_skipped_schedule_unknown'):
+        timer_delay(tmp_path / 'absent.timer')
+
+
+# spec: ANYM-727
+def test_every_phase_is_admitted_against_the_whole_unit_bound_including_a_resumed_upload(tmp_path, age_stub, monkeypatch):
+    runner, _, _ = snapshot_runner(tmp_path, age_stub, monkeypatch)
+    assert admission_bound(runner.cfg) == worst_case(runner.cfg) + 2 * backup_runner.UNIT_STOP_SECONDS
+    runner.clock = lambda: at(14, 58)  # the delivery tail alone would end 15:20; the unit may run to 16:19
+    for phase in ('full', 'upload'):
+        with pytest.raises(Skip, match='recordings_skipped_window'):
+            runner.admit(phase)
 
 
 # spec: ANYM-727
@@ -540,12 +585,12 @@ def test_a_busy_host_lock_is_a_skip_without_waiting_and_the_other_profile_is_not
 
 
 # spec: ANYM-727
-def test_the_runner_takes_the_host_lock_without_a_wait_for_a_run_and_briefly_for_its_recovery(tmp_path, monkeypatch):
+def test_the_runner_takes_the_host_lock_without_a_wait_for_a_run_and_not_at_all_for_its_recovery(tmp_path, monkeypatch):
     waits = []
     from contextlib import contextmanager
     @contextmanager
-    def spy(cfg, wait=backup_runner.HOST_LOCK_WAIT_SECONDS):
-        waits.append(wait)
+    def spy(cfg, wait=backup_runner.HOST_LOCK_WAIT_SECONDS, busy=None, host=True):
+        waits.append((wait, busy is not None, host))
         yield
     monkeypatch.setattr(backup_runner, 'hold_locks', spy)
     monkeypatch.setattr(Runner, 'run', lambda self: None)
@@ -553,7 +598,8 @@ def test_the_runner_takes_the_host_lock_without_a_wait_for_a_run_and_briefly_for
     cfg = recordings_cfg(tmp_path)
     assert run_main(monkeypatch, tmp_path, cfg) == 0
     assert run_main(monkeypatch, tmp_path, cfg, '--recover-stop') == 0
-    assert waits == [0, backup_runner.RECOVERY_LOCK_WAIT]
+    # A run: no wait, and a cleanup when the lock is busy. Its recovery: the runner's own lock only.
+    assert waits == [(0, True, True), (backup_runner.HOST_LOCK_WAIT_SECONDS, False, False)]
 
 
 # spec: ANYM-727
@@ -621,6 +667,113 @@ def test_a_reboot_in_the_middle_leaves_a_worker_and_plaintext_that_the_recovery_
     fresh.recover_stop()
     assert clean(fresh) and delivered == [] and ('stop', '--time', '25', 'deedkit-recordings-backup-' + job.lower()) in docker.calls
     assert not Path(fresh.unsettled_path).exists()
+
+
+# spec: ANYM-727
+def test_a_snapshot_producer_that_outlives_the_exec_deadline_is_killed_and_verified_gone(tmp_path, age_stub, monkeypatch):
+    runner, docker, _ = snapshot_runner(tmp_path, age_stub, monkeypatch)
+    docker.mode = 'timeout'
+    with pytest.raises(RuntimeError, match='recordings_exec_timeout'):
+        runner.run()
+    assert docker.killed == [(4242, signal.SIGKILL)] and docker.processes == []
+    assert 'exec_target' not in runner.journal
+    runner.recover_stop()
+    assert clean(runner)
+
+
+# spec: ANYM-727
+def test_a_producer_not_verified_gone_keeps_the_plaintext_marked_until_the_recovery_reaps_it(tmp_path, age_stub, monkeypatch):
+    runner, docker, _ = snapshot_runner(tmp_path, age_stub, monkeypatch)
+    docker.mode = 'timeout'
+    monkeypatch.setattr(backup_runner.os, 'kill', lambda pid, sig: None)  # it ignores the signal
+    with pytest.raises(RuntimeError, match='recordings_exec_unverified'):
+        runner.run()
+    assert status_of(runner)['error_code'] == 'recordings_exec_unverified'
+    assert list(runner.staging_root.iterdir()) != [] and runner.journal['exec_target'].startswith('/backup-staging/')
+    with pytest.raises(RuntimeError, match='recordings_exec_unverified'):
+        runner.recover_stop()
+    assert list(runner.staging_root.iterdir()) != [], 'nothing is cleaned under a live writer'
+    docker.processes.clear()
+    runner.recover_stop()
+    assert clean(runner)
+
+
+# spec: ANYM-727
+def test_a_busy_host_lock_does_not_leave_the_plaintext_of_a_crashed_run(tmp_path, age_stub, monkeypatch, capsys):
+    runner, docker, _ = snapshot_runner(tmp_path, age_stub, monkeypatch)
+    docker.hold = True
+    crash(runner)
+    leftover = runner.staging_root / runner.journal['id'] / 'archive.sqlite'
+    assert leftover.exists()
+    other = os.open(runner.cfg['host_lock'], os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        assert run_main(monkeypatch, tmp_path, runner.cfg) == 0
+    finally:
+        os.close(other)
+    assert json.loads(capsys.readouterr().out.splitlines()[-1]) == {'status': 'skipped', 'code': 'recordings_skipped_lock_busy'}
+    assert list(runner.staging_root.iterdir()) == [], 'emptied under the runner lock alone'
+
+
+# spec: ANYM-727
+def test_a_cleanup_that_fails_while_the_host_lock_is_busy_is_an_error(tmp_path, age_stub, monkeypatch, capsys):
+    runner, docker, _ = snapshot_runner(tmp_path, age_stub, monkeypatch)
+    docker.hold = True
+    crash(runner)
+    other = os.open(runner.cfg['host_lock'], os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    monkeypatch.setattr(Runner, 'clean_staging', lambda self: (_ for _ in ()).throw(OSError('read-only filesystem')))
+    try:
+        assert run_main(monkeypatch, tmp_path, runner.cfg) == 1
+    finally:
+        os.close(other)
+    assert json.loads(capsys.readouterr().out.splitlines()[-1]) == {'status': 'error', 'code': 'staging_cleanup_failed'}
+    assert status_of(runner)['error_code'] == 'staging_cleanup_failed'
+
+
+# spec: ANYM-727
+def test_a_skip_whose_recovery_could_not_empty_staging_is_a_failure_not_a_skip(tmp_path, monkeypatch, capsys):
+    cfg = recordings_cfg(tmp_path)
+    Path(cfg['host_lock']).parent.mkdir(mode=0o700)
+    (tmp_path / 'recipient').write_text('fake')
+    monkeypatch.setattr(Runner, 'run', lambda self: (_ for _ in ()).throw(Skip('recordings_skipped_window')))
+    monkeypatch.setattr(Runner, 'clean_staging', lambda self: (_ for _ in ()).throw(OSError('read-only filesystem')))
+    assert run_main(monkeypatch, tmp_path, cfg) == 1
+    assert json.loads(capsys.readouterr().out.splitlines()[-1]) == {'status': 'error', 'code': 'staging_cleanup_failed'}
+    assert read_json(Path(cfg['directory']) / 'status.json')['error_code'] == 'staging_cleanup_failed'
+
+
+# spec: ANYM-727
+def test_the_locks_a_recordings_run_gives_up_with_call_the_cleanup_and_a_recovery_needs_only_the_runner_lock(tmp_path):
+    cfg = recordings_cfg(tmp_path)
+    Path(cfg['host_lock']).parent.mkdir(mode=0o700)
+    Path(cfg['directory']).mkdir(mode=0o700)
+    other = os.open(cfg['host_lock'], os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    calls = []
+    try:
+        with pytest.raises(Skip, match='recordings_skipped_lock_busy'):
+            with backup_runner.hold_locks(cfg, 0, lambda: calls.append('cleanup')):
+                pass
+        assert calls == ['cleanup']
+        with backup_runner.hold_locks(cfg, 0, None, False):
+            pass  # the recovery of a recordings job does not wait for, or take, the host lock
+    finally:
+        os.close(other)
+
+
+# spec: ANYM-727
+def test_the_workers_capture_budget_starts_after_the_staging_work(tmp_path, age_stub, monkeypatch):
+    runner, docker, _ = snapshot_runner(tmp_path, age_stub, monkeypatch, capture_timeout_seconds=800)
+    docker.hold = True
+    real = docker.exec
+    def slow_exec(*args):
+        runner.now[0] += 700  # staging used most of what the journal's age would count against the worker
+        return real(*args)
+    monkeypatch.setattr(docker, 'exec', slow_exec)
+    with pytest.raises(RuntimeError, match='backup_capture_timeout'):
+        runner.run()
+    assert 1500 <= runner.now[0] - NOW < 1530
 
 
 # spec: ANYM-727
@@ -768,10 +921,10 @@ def test_the_daily_slot_follows_the_calendar_catch_ups_worst_case_and_the_whole_
     messaging, calendar = 18 * HOUR, hms('deedkit-calendar-backup.timer')
     assert slot > messaging and slot > calendar
     nxt = min(calendar + 86400, messaging + 86400, hms('deedkit-calendar-backup-catchup.timer') + 86400)
-    assert slot + worst_case(cfg) <= nxt - GUARD_SECONDS
+    assert slot + admission_bound(cfg) <= nxt - GUARD_SECONDS
     # The catch-up slot is after the daily one's worst case, and it also ends before the next start.
     retry = hms('deedkit-recordings-backup-catchup.timer')
-    assert retry >= slot + worst_case(cfg) and retry + worst_case(cfg) <= nxt - GUARD_SECONDS
+    assert retry >= slot + admission_bound(cfg) and retry + admission_bound(cfg) <= nxt - GUARD_SECONDS
 
 
 # spec: ANYM-727

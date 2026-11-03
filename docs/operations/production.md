@@ -1910,7 +1910,8 @@ than 22 hours); the units and `deploy/backup-runner-recordings.example.json` are
 Staging: create `/opt/deedkit/recordings-backup/staging` by hand, owner 10001:10001, mode 0700 (the runner refuses
 `recordings_staging_unsafe`), and mount it at `/backup-staging` in the recordings container
 (`deploy/compose.recordings.yaml`, `RECORDINGS_BACKUP_STAGING`). Admission: the runner starts only when its worst case
-ends 15 minutes before the next start of another profile, read from their timer files; else `recordings_skipped_window`
+ends 15 minutes before the next start of another profile (worst case plus the unit's two stop budgets, read from their
+timer files; a start already due within its randomized delay plus 120 s is a veto); else `recordings_skipped_window`
 (also `_schedule_unknown`, `_yielded`, `_lock_busy`, `_disk`, `_container_down`, `_archive_disabled`; all are status
 `skipped`, exit 0, with nothing left in staging). The expected archive size (`expected_archive_bytes`, default 1 GiB) plus
 `min_free_bytes` must be free; the status file records the real `archive_bytes`. Archive polling and this timer are

@@ -585,10 +585,21 @@ deadline, the hash has its own deadline, and the worker refuses `recordings_snap
 the recorded size or sha256.
 
 Admission (before anything is staged): the runner reads the other profiles' timer files, and starts only when its
-worst case ends at least 15 minutes (900 s) before the next scheduled start of another profile; otherwise it ends
-`skipped` with `recordings_skipped_window` (an unreadable timer file: `recordings_skipped_schedule_unknown`). While running it
-yields at checkpoints and in the capture poll loop when that guard time arrives (`recordings_skipped_yielded`). Disk:
-free space must cover `min_free_bytes` plus the expected archive size (`expected_archive_bytes`, default 1 GiB, or
-the last recorded `archive_bytes` of the status file when larger), else `recordings_skipped_disk`. The recordings
-run never waits for the host lock (`recordings_skipped_lock_busy`); only `--recover-stop` waits, up to 120 s. A
-skipped job leaves the freshness clock alone, so the catch-up timer decides.
+whole bound ends at least 15 minutes (900 s) before the next scheduled start of another profile; otherwise it ends
+`skipped` with `recordings_skipped_window` (an unreadable timer file: `recordings_skipped_schedule_unknown`). The bound
+is the unit's, for every phase including a resumed `upload`: the worst case of all deadlines plus the two stop budgets
+(180 s each) the service may use after its TimeoutStartSec. A start of another profile that is already due, within its
+`RandomizedDelaySec` plus 120 s, is a veto too (that run may be waiting for the shared lock). While running it yields at
+checkpoints and in the capture poll loop when the guard time arrives (`recordings_skipped_yielded`). The worker's capture
+budget starts after the staging work, not at the journal's creation. Disk: free space must cover `min_free_bytes` plus
+the expected archive size (`expected_archive_bytes`, default 1 GiB, or the last recorded `archive_bytes` of the status
+file when larger), else `recordings_skipped_disk`.
+
+Locks and cleanup: the recordings run never waits for the host lock (`recordings_skipped_lock_busy`), but when it gives
+up it first empties what a crashed earlier job left in staging, under the runner's own lock alone. `--recover-stop`
+takes only the runner's own lock (it touches nothing of messaging or calendar), so it is never blocked by another
+profile. A `docker exec` that hits its deadline is not trusted to have stopped the snapshot producer: the runner finds
+the processes in the container whose arguments carry this job's snapshot path (`docker top`), kills them and checks that
+none is left (`recordings_exec_unverified` otherwise; staging is then not emptied under a live writer, and the recovery
+looks again). A cleanup that fails is an error (`staging_cleanup_failed`, exit 1), also after a skip. A skipped job
+leaves the freshness clock alone, so the catch-up timer decides.

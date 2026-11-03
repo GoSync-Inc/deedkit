@@ -35,7 +35,7 @@ SAFE_ERRORS={'backup_capture_failed','backup_capture_timeout','backup_container_
     'recordings_snapshot_foreign','recordings_schema_unsupported','recordings_identity_missing',
     'staging_mount_refused','staging_cleanup_failed','recordings_snapshot_changed','recordings_integrity_timeout',
     'recordings_encrypt_timeout','recordings_no_space','recordings_exec_timeout','recordings_exec_failed',
-    'recordings_hash_timeout',
+    'recordings_hash_timeout','recordings_exec_unverified',
     'recordings_staging_unsafe',
     # A skip is not a failure (ANYM-727): nothing was sealed, no other profile was touched, a later start tries again.
     'recordings_skipped_lock_busy','recordings_skipped_window','recordings_skipped_schedule_unknown',
@@ -60,7 +60,12 @@ RECORDINGS_WORKER='deedkit-recordings-backup-'
 GUARD_SECONDS=900
 STOP_BUDGET=35
 RECOVERY_BUDGET=120
-RECOVERY_LOCK_WAIT=120
+# Admission also counts the unit's own stop budgets (TimeoutStopSec of the main process and of ExecStopPost), and refuses a
+# start while another profile's scheduled start is this recent (it may be due but waiting for its randomized delay).
+UNIT_STOP_SECONDS=180
+DUE_GRACE_SECONDS=120
+REAP_SECONDS=20
+CLEANUP_CODES={'staging_cleanup_failed','staging_mount_refused','recordings_exec_unverified'}
 CONTAINER_UID=10001
 RECORDINGS_DEFAULTS={'exec_timeout_seconds':300,'hash_timeout_seconds':120,'integrity_timeout_seconds':300,
                      'encrypt_timeout_seconds':600,'min_free_bytes':1024**3,'expected_archive_bytes':1024**3}
@@ -171,6 +176,27 @@ def timer_starts(path):
     return starts
 
 
+def timer_delay(path):
+    """`RandomizedDelaySec` of a timer file in seconds (0 when absent); a form this does not understand is unknown."""
+    try:
+        with open(path,'rb') as f:text=f.read(65537).decode()
+    except (OSError,UnicodeDecodeError):raise Skip('recordings_skipped_schedule_unknown') from None
+    delay=0
+    for line in text.splitlines():
+        line=line.strip()
+        if not line.startswith('RandomizedDelaySec='):continue
+        match=re.fullmatch(r'(\d{1,6})\s*(s|sec|min|m|h)?',line[len('RandomizedDelaySec='):].strip())
+        if match is None:raise Skip('recordings_skipped_schedule_unknown')
+        delay=int(match[1])*{None:1,'s':1,'sec':1,'min':60,'m':60,'h':3600}[match[2]]
+    return delay
+
+
+def previous_start(now,starts):
+    """The latest of the daily `starts` at or before epoch second `now` (UTC days)."""
+    day=int(now//86400)*86400
+    return max(t for d in (-86400,0) for t in (day+d+x for x in starts) if t<=now)
+
+
 def next_start(now,starts):
     """The first of the daily `starts` after epoch second `now` (UTC days)."""
     day=int(now//86400)*86400
@@ -192,6 +218,11 @@ def worst_case(cfg,phase='full'):
     if phase=='upload':return delivery+RECOVERY_BUDGET
     return (STOP_BUDGET+options['exec_timeout_seconds']+options['hash_timeout_seconds']+
             options['capture_timeout_seconds']+delivery+RECOVERY_BUDGET)
+
+
+def admission_bound(cfg):
+    """Seconds from a start to the end of its recovery as the unit enforces them (any phase)."""
+    return worst_case(cfg,'full')+2*UNIT_STOP_SECONDS
 
 
 def container_path(value):
@@ -309,6 +340,16 @@ class Docker:
             if b'No such container' in result.stderr or b'No such object' in result.stderr:return None
             raise RuntimeError('docker_inspection_failed')
         return json.loads(result.stdout)[0]
+    @staticmethod
+    def top(container):
+        """(host pid, command line) of every process of a running container; none when it is not running."""
+        info=Docker.inspect(container)
+        if info is None or not info['State']['Running']:return []
+        rows=[]
+        for line in Docker.call('top',container,'-eo','pid,args').splitlines()[1:]:
+            pid,_,args=line.strip().partition(' ')
+            if pid.isdigit():rows.append((int(pid),args.strip()))
+        return rows
     @staticmethod
     def exec(container,args,timeout):
         """`docker exec` with its own deadline: (exit code, the first 2000 bytes of stderr). No output is kept otherwise."""
@@ -596,12 +637,20 @@ class Runner:
         if self.recordings:
             # Plaintext left by a crashed earlier job goes first; this job's directory is then staged into.
             self.clean_staging();(self.staging_root/backup_id).mkdir(mode=0o700)
-    def admit(self,phase):
+    def admit(self,phase='full'):
         """Latest-start admission (ANYM-727): this job and its recovery must end 15 minutes before the next scheduled start
-        of any other profile, read from those profiles' timer files now. Sets the instant after which the job yields."""
-        own=self.cfg['recordings'];now=self.clock()
-        following=min(next_start(now,timer_starts(path)) for path in own['timers'])
-        if now+worst_case(self.cfg,phase)>following-GUARD_SECONDS:raise Skip('recordings_skipped_window')
+        of any other profile, read from those profiles' timer files now. Sets the instant after which the job yields.
+
+        The bound is the unit's: a fresh service run (also a resumed `upload` job) is killed only at TimeoutStartSec and
+        then stopped within two TimeoutStopSec, so every phase is admitted against the full worst case plus those stops.
+        A start of another profile that is already due (within its randomized delay and a grace) is a veto too: its run
+        may be waiting for the shared lock this run would take first."""
+        own=self.cfg['recordings'];now=self.clock();following=None
+        for path in own['timers']:
+            starts=timer_starts(path)
+            if now-previous_start(now,starts)<DUE_GRACE_SECONDS+timer_delay(path):raise Skip('recordings_skipped_window')
+            following=min(next_start(now,starts),following or 1<<62)
+        if now+admission_bound(self.cfg)>following-GUARD_SECONDS:raise Skip('recordings_skipped_window')
         self.yield_at=following-GUARD_SECONDS
     def guard(self):
         """A checkpoint before anything is sealed: past the yield instant the job gives way and cleans up."""
@@ -632,8 +681,14 @@ class Runner:
             shutil.rmtree(entry) if entry.is_dir() and not entry.is_symlink() else entry.unlink()
         os.chown(destination,self.container_uid,self.container_gid)
         target=own['container_staging'].rstrip('/')+'/'+destination.name+'/archive.sqlite'
-        code,error=self.docker.exec(own['container'],['deedkit-recordings','--config',own['container_config'],
-                                                      '--backup-to',target],options['exec_timeout_seconds'])
+        # The client's deadline does not stop the producer inside the container: remember what it is, and reap it.
+        self.journal['exec_target']=target;self.save()
+        try:
+            code,error=self.docker.exec(own['container'],['deedkit-recordings','--config',own['container_config'],
+                                                          '--backup-to',target],options['exec_timeout_seconds'])
+        except BaseException:
+            self.reap_snapshot();raise
+        self.journal.pop('exec_target',None);self.save()
         if code:
             if 'archive_disabled' in error:raise Skip('recordings_skipped_archive_disabled')
             if self.disk(self.staging_root).free<options['min_free_bytes']:raise RuntimeError('recordings_no_space')
@@ -641,6 +696,39 @@ class Runner:
         self.guard();size,digest=self.hash_staged(destination/'archive.sqlite',options['hash_timeout_seconds'])
         self.space(0,size);self.guard()
         self.journal['archive']={'bytes':size,'sha256':digest}
+    def reap_snapshot(self):
+        """Kill and verify gone every process in the recordings container that writes this job's snapshot file.
+
+        Matches the exact target path as one argument of a process listed by `docker top`; unverified after REAP_SECONDS
+        is `recordings_exec_unverified`, and the journal keeps the target so the recovery looks again.
+        """
+        target=(self.journal or {}).get('exec_target')
+        if not target:return
+        container=self.cfg['recordings']['container'];deadline=self.clock()+REAP_SECONDS
+        while True:
+            mine=[pid for pid,args in self.docker.top(container) if target in args.split()]
+            if not mine:break
+            if self.clock()>=deadline:raise RuntimeError('recordings_exec_unverified')
+            for pid in mine:
+                try:os.kill(pid,signal.SIGKILL)
+                except ProcessLookupError:pass
+            self.sleep(1)
+        self.journal.pop('exec_target',None);self.save()
+    def cleanup_unowned(self):
+        """Under the runner's own lock only (the shared host lock is busy): what a crashed earlier job left in staging.
+
+        Reaps a still-running snapshot producer, then empties staging; nothing of messaging or calendar is touched.
+        A failure is reported as `staging_cleanup_failed`.
+        """
+        try:
+            if self.journal_path.exists():
+                self.load();self.reap_snapshot()
+            if self.staging_root.exists():self.clean_staging()
+        except Exception as exc:
+            code=str(exc) if str(exc) in CLEANUP_CODES else 'staging_cleanup_failed'
+            try:self.status('error',code)
+            except Exception:pass
+            raise RuntimeError(code) from None
     def hash_staged(self,path,seconds):
         """Size and SHA-256 of the snapshot through one descriptor (no link followed), within its own deadline."""
         started=self.clock()
@@ -755,7 +843,7 @@ class Runner:
                 info=self.docker.inspect(saved['id'])
                 if info is None:raise RuntimeError('collector_missing_during_stop')
                 if info['State']['Running']:self.docker.call('stop','--time','25',saved['id'])
-            if self.recordings:self.stage_snapshot(self.staging_root/self.journal['id'])
+            if self.recordings:self.stage_snapshot(self.staging_root/self.journal['id']);self.journal['capture_started']=self.clock()
             self.journal['phase']='capturing';self.save()
         info=self.check_worker(self.docker.inspect(self.journal['container']))
         if info is None:
@@ -775,8 +863,10 @@ class Runner:
                 if info['State']['ExitCode']!=0:raise RuntimeError(self.refusal(work) or 'backup_capture_failed')
                 self.resume_collectors();break
             if self.recordings:self.guard()  # another profile is about to start: give way before anything is sealed
-            if self.clock()-self.journal['created']>(self.cfg['recordings']['capture_timeout_seconds'] if self.recordings
-                                                     else self.cfg['timeout_seconds']):raise RuntimeError('backup_capture_timeout')
+            # The worker's own budget starts when it can start, after the staging work (which has deadlines of its own).
+            began=self.journal.get('capture_started',self.journal['created']) if self.recordings else self.journal['created']
+            if self.clock()-began>(self.cfg['recordings']['capture_timeout_seconds'] if self.recordings
+                                   else self.cfg['timeout_seconds']):raise RuntimeError('backup_capture_timeout')
             self.sleep(POLL_SECONDS)
         if self.recordings:self.clean_staging()  # the worker has exited: the bundle holds the only copy now
         self.journal['phase']='upload';self.save()
@@ -1037,7 +1127,8 @@ class Runner:
             self.finish(work,result,receipt)
         except BaseException as exc:
             self.status('skipped' if isinstance(exc,Skip) else 'error',str(exc) if str(exc) in SAFE_ERRORS else 'backup_job_failed')
-            if self.recordings:
+            # A snapshot producer not verified gone still holds the file: the recovery reaps it first, then cleans.
+            if self.recordings and not (self.journal or {}).get('exec_target'):
                 try:self.clean_staging()
                 except (OSError,ValueError):pass  # the next start empties it again
             raise
@@ -1047,10 +1138,17 @@ class Runner:
         A recordings job's staging is emptied after that attempt, whatever its outcome: a stop that failed is not
         masked by the cleanup, and a cleanup that failed does not undo a verified stop (status `staging_cleanup_failed`).
         """
-        failure=None
+        failure=None;reaped=True
+        if self.recordings and self.journal_path.exists():
+            # A snapshot producer still writing into staging must be gone before anything is cleaned or settled.
+            try:self.load();self.reap_snapshot()
+            except BaseException as exc:
+                failure=exc;reaped=False
+                try:self.status('error','recordings_exec_unverified' if str(exc)=='recordings_exec_unverified' else 'backup_job_failed')
+                except Exception:pass
         try:self.settle_job()
-        except BaseException as exc:failure=exc
-        if self.recordings:
+        except BaseException as exc:failure=failure or exc
+        if self.recordings and reaped:
             try:self.clean_staging()
             except Exception as exc:
                 try:self.status('error','staging_mount_refused' if str(exc)=='staging_mount_refused' else 'staging_cleanup_failed')
@@ -1086,18 +1184,21 @@ class Runner:
 
 
 @contextmanager
-def hold_locks(cfg,wait=HOST_LOCK_WAIT_SECONDS):
+def hold_locks(cfg,wait=HOST_LOCK_WAIT_SECONDS,busy=None,host=True):
     """The runner's own lock; a calendar run then also messaging's lock (`host_lock`), the one a deploy holds.
 
     The host lock is waited for at most `wait` seconds (`host_lock_busy`); both are held until the run ends. A recordings
     run asks for no wait (ANYM-727): busy means another profile or a deploy is running, so it skips and a catch-up retries.
+    `busy` (a recordings run) is called with the runner's own lock held before that give-up, so what a crashed earlier
+    job left in staging goes even then; `host=False` (a recordings recovery, which touches nothing of the others) takes
+    the runner's own lock only.
     """
     fds=[]
     try:
         fds.append(os.open(Path(cfg['directory'])/'.runner.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600))
         try:fcntl.flock(fds[0],fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:raise RuntimeError('backup_job_already_running') from None
-        if cfg.get('profile') in ('calendar','recordings'):
+        if host and cfg.get('profile') in ('calendar','recordings'):
             fds.append(os.open(cfg['host_lock'],os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600))
             deadline=time.monotonic()+wait
             while True:
@@ -1105,6 +1206,7 @@ def hold_locks(cfg,wait=HOST_LOCK_WAIT_SECONDS):
                 except BlockingIOError:
                     left=deadline-time.monotonic()
                     if left<=0:
+                        if busy is not None:busy()
                         raise (Skip('recordings_skipped_lock_busy') if cfg['profile']=='recordings' and wait==0
                                else RuntimeError('host_lock_busy')) from None
                     time.sleep(min(HOST_LOCK_POLL_SECONDS,left))
@@ -1133,21 +1235,28 @@ def main():
     def interrupted(*_):raise InterruptedError('backup_interrupted')
     signal.signal(signal.SIGTERM,interrupted);signal.signal(signal.SIGINT,interrupted)
     runner=Runner(config(args.config))
-    owns_lock=False;code='backup_job_failed'
+    owns_lock=False;code='backup_job_failed';unrecovered=None
     try:
-        # A recordings run does not wait for the host lock; its recovery waits briefly (it only cleans up its own).
-        with hold_locks(runner.cfg,0 if runner.recordings and not args.recover_stop else
-                        RECOVERY_LOCK_WAIT if runner.recordings else HOST_LOCK_WAIT_SECONDS):
+        # A recordings run does not wait for the host lock and cleans up even when it is busy; its recovery needs only the
+        # runner's own lock (it touches nothing of messaging or calendar).
+        recordings=runner.recordings
+        with hold_locks(runner.cfg,0 if recordings and not args.recover_stop else HOST_LOCK_WAIT_SECONDS,
+                        runner.cleanup_unowned if recordings and not args.recover_stop else None,
+                        not (recordings and args.recover_stop)):
             owns_lock=True
             try:
                 if args.recover_stop:runner.recover_stop()
                 else:runner.run()
             except Exception:
                 try:runner.recover_stop()
-                except Exception:pass  # Journal remains for ExecStopPost / next operator run.
+                except Exception as again:unrecovered=again  # Journal remains for ExecStopPost / next operator run.
                 raise
     except Exception as exc:
-        if isinstance(exc,Skip):
+        if runner.recordings and str(unrecovered) in CLEANUP_CODES:code=str(unrecovered)
+        elif runner.recordings and isinstance(unrecovered,OSError):code='staging_cleanup_failed'
+        elif runner.recordings and str(exc) in CLEANUP_CODES:code=str(exc)
+        # A skip whose cleanup failed is a failure: plaintext may remain.
+        if isinstance(exc,Skip) and not (runner.recordings and unrecovered is not None):
             try:runner.status('skipped',exc.code)
             except Exception:pass
             print(json.dumps({'status':'skipped','code':exc.code},separators=(',',':')),flush=True)
