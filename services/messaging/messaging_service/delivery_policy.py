@@ -298,9 +298,10 @@ def _absorb_page(c, row, binding, window, limit, p=None):
         FROM subscription_matches m JOIN events e ON e.id=m.event
         WHERE m.subscription=%s AND m.event>%s ORDER BY m.event LIMIT %s''',
         (*args, row['id'], start, limit)).fetchall()
-    from .subscriptions import view_origin
+    from .subscriptions import seen_origin
     for item in matches:
-        item['origin'] = view_origin(item['origin'], item['kind'], item['sent_at'], item['committed_at'])
+        item['origin'] = seen_origin(row['selector']['origins'], item['origin'], item['kind'], item['sent_at'],
+            item['committed_at'])
     if not matches:
         return 0
     shown = [item for item in matches if item['visible']]

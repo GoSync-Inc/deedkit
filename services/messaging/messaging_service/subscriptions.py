@@ -28,7 +28,7 @@ ORIGINS = frozenset(('live', 'live_recovered', 'fixture', 'backfill', 'reconcile
 # journal keeps origin `reconcile` (the feed and an older matcher read it unchanged); `view_origin` derives
 # `live_recovered` from the event's own times, so it needs no stored value, schema or writer change.
 RECOVERED_WINDOW = timedelta(hours=6)
-RECOVERED_SELECTORS = frozenset(('live', 'live_recovered', 'reconcile'))
+RECOVERED_SELECTORS = frozenset(('live', 'live_recovered'))
 
 
 def view_origin(origin, kind, sent_at, committed_at):
@@ -41,6 +41,13 @@ def view_origin(origin, kind, sent_at, committed_at):
     except (TypeError, ValueError):
         return origin
     return 'live_recovered' if timedelta(0) <= age <= RECOVERED_WINDOW else origin
+
+
+def seen_origin(selected, origin, kind, sent_at, committed_at):
+    """view_origin for a subscription whose selector lists `selected`: one that lists `reconcile` asked for the stored
+    origin and keeps it (historical, as before); every other selector sees `live_recovered`. Exact for any matched event:
+    a reconcile-origin message that matched a selector without `reconcile` matched as recovered."""
+    return origin if 'reconcile' in selected else view_origin(origin, kind, sent_at, committed_at)
 
 
 def origin_selected(origin, selected):
@@ -568,8 +575,8 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
         (row['id'], after, *args, limit + 1)).fetchall()
     fields = ('message', 'account', 'chat', 'sender', 'provider_id', 'revision', 'sent_at',
         'direction', 'deleted', 'processing', 'metadata', 'reply_evidence', 'send_id', 'error_code', 'status')
-    seen = [view_origin(event['origin'], event['kind'], event['snapshot'].get('sent_at'), event['created_at'])
-        for event in events[:limit]]
+    seen = [seen_origin(row['selector']['origins'], event['origin'], event['kind'], event['snapshot'].get('sent_at'),
+        event['created_at']) for event in events[:limit]]
     items = [{**{key: event['snapshot'][key] for key in fields if key in event['snapshot']},
         'event_id': event['id'], 'kind': event['kind'], 'origin': origin,
         'revision': event['revision'], 'observed_at': event['created_at'],
@@ -651,7 +658,8 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                 FROM events WHERE id>%s AND id<=%s ORDER BY id LIMIT %s''',
                 (row['matched_through'], head, batch_size)).fetchall()
             for event in events:
-                event['origin'] = view_origin(event['origin'], event['kind'], event['sent_at'], event['created_at'])
+                event['origin'] = seen_origin(row['selector']['origins'], event['origin'], event['kind'],
+                    event['sent_at'], event['created_at'])
             count = c.execute('SELECT count(*) AS n FROM subscription_matches WHERE subscription=%s',
                 (row['id'],)).fetchone()['n']
             lookup = {(source['account'], source['chat']): source['sender_ids'] for source in sources}

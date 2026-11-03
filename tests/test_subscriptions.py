@@ -79,7 +79,7 @@ def test_live_recovered_events_match_live_and_reconcile_selectors_and_are_not_hi
     store, _, _ = seeded
     token = key(store)
     selectors = {'default': None, 'live': ['live'], 'recovered': ['live_recovered'], 'reconcile': ['reconcile'],
-        'old_only': ['backfill', 'fixture']}
+        'mixed': ['live', 'reconcile'], 'old_only': ['backfill', 'fixture']}
     sids = {name: create(store, token, label=name, origins=origins)['subscription_id']
         for name, origins in selectors.items()}
     plain = emit(store)
@@ -91,12 +91,16 @@ def test_live_recovered_events_match_live_and_reconcile_selectors_and_are_not_hi
     pages = {name: store.get_subscription_events(token, sid)['items'] for name, sid in sids.items()}
     assert {name: [item['event_id'] for item in items] for name, items in pages.items()} == {
         'default': [plain, recovered], 'live': [plain, recovered], 'recovered': [recovered],
-        'reconcile': [recovered, old], 'old_only': []}
+        'reconcile': [recovered, old], 'mixed': [plain, recovered, old], 'old_only': []}
     item = pages['recovered'][0]
     assert item['origin'] == 'live_recovered' and item['historical'] is False
     assert 'historical_event' not in item['wake_reason']
-    by_event = {item['event_id']: item for item in pages['reconcile']}
-    assert by_event[old]['origin'] == 'reconcile' and by_event[old]['historical'] is True
+    # A selector that lists `reconcile` asked for the stored origin: every reconcile message stays historical for it.
+    for name in ('reconcile', 'mixed'):
+        by_event = {item['event_id']: item for item in pages[name]}
+        assert [(by_event[event]['origin'], by_event[event]['historical']) for event in (recovered, old)] == [
+            ('reconcile', True)] * 2, name
+    assert [(item['origin'], item['historical']) for item in pages['live']] == [('live', False), ('live_recovered', False)]
     with store.pool.connection() as c:
         assert c.execute('SELECT origin FROM events WHERE id=%s', (recovered,)).fetchone()['origin'] == 'reconcile'
     with pytest.raises(APIError) as error:
@@ -108,8 +112,9 @@ def test_live_recovered_events_match_live_and_reconcile_selectors_and_are_not_hi
 def test_a_recovered_message_wakes_like_a_live_one_and_an_old_reconcile_one_does_not(seeded):
     store, _, _ = seeded
     token = key(store)
-    sid = create(store, token, origins=['live', 'live_recovered', 'reconcile'],
-        wake_rules=['incoming_message'])['subscription_id']
+    sid = create(store, token, origins=['live', 'live_recovered'], wake_rules=['incoming_message'])['subscription_id']
+    # A selector that lists `reconcile` keeps the stored origin, so a reconcile message never satisfies a live rule.
+    listed = create(store, token, origins=['live', 'reconcile'], wake_rules=['incoming_message'])['subscription_id']
     old = emit(store, origin='reconcile')
     sent_ago(store, 'demo-tg-2', '1 hour')
     recovered = emit(store, 'demo-tg-2', origin='reconcile')
@@ -118,6 +123,7 @@ def test_a_recovered_message_wakes_like_a_live_one_and_an_old_reconcile_one_does
     assert [item['event_id'] for item in items] == [recovered]
     assert items[0]['wake_reason'] == ['incoming_message']
     assert old not in [item['event_id'] for item in items]
+    assert store.get_subscription_events(token, listed)['items'] == []
 
 
 def test_independent_source_sets_senders_and_event_revisions(seeded):
