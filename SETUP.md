@@ -1,5 +1,7 @@
 # Server setup
 
+Installing DeedKit for yourself on one rented server? Read [docs/personal-install.md](docs/personal-install.md) first: it is the short path without the maintainers' production tooling.
+
 The Python package includes server code, SQL migrations and Node adapter sources.
 The npm package is a client for an existing server. Neither package silently
 installs a database, signs in to a messenger or starts background services.
@@ -8,12 +10,14 @@ installs a database, signs in to a messenger or starts background services.
 
 These steps target a fresh Linux amd64 VPS with Docker Compose and Python 3.
 Run the administrative commands as root in a private checkout, not on a machine
-that already holds an archive. Clone the tagged release, then enter `deploy/`.
+that already holds an archive. Clone the repository, then enter `deploy/`. The last
+tag (`v0.9.9`) predates the gateway, calendar and native WhatsApp files below, so
+use `main` (source version 0.9.19) until a newer tag exists.
 PostgreSQL has no public port; the API binds to loopback on port 18940.
 
 ```sh
-git clone --branch v0.9.9 https://github.com/GoSync-Inc/deedkit.git
-cd anymsg/deploy
+git clone https://github.com/GoSync-Inc/deedkit.git
+cd deedkit/deploy
 cp .env.example .env
 ```
 
@@ -49,7 +53,7 @@ PY
 docker compose build api
 docker compose up -d db
 docker compose -f compose.yaml -f compose.operator.yaml run --rm operator migrate
-docker compose exec -T db psql -v ON_ERROR_STOP=1 -U probe_owner -d messaging_probe < ../messaging_service/gateway_role.sql
+docker compose exec -T db psql -v ON_ERROR_STOP=1 -U probe_owner -d messaging_probe < ../services/messaging/messaging_service/gateway_role.sql
 docker compose exec -T db psql -v ON_ERROR_STOP=1 -U probe_owner -d messaging_probe < private/bootstrap.sql
 rm private/bootstrap.sql
 ```
@@ -63,7 +67,7 @@ For a synthetic evaluation only:
 
 ```sh
 docker compose -f compose.yaml -f compose.operator.yaml run --rm operator init
-docker compose -f compose.yaml -f compose.operator.yaml run --rm operator issue-key --principal evaluation-agent --accounts telegram-demo whatsapp-demo-1 --permissions read download cursor-write --days 7 --key-file /operator-private/issued-keys/evaluation.token
+docker compose -f compose.yaml -f compose.operator.yaml run --rm operator issue-key --principal evaluation-agent --accounts telegram-demo whatsapp-demo-1 --permissions read download cursor-write --days 7 --key-file /operator-private/evaluation.token
 docker compose up -d api
 ```
 
@@ -94,9 +98,9 @@ Optional images are built locally from this checkout; there are no prepublished
 AnyMsg container images in this release:
 
 ```sh
-docker build --target indexer -t anymsg-indexer:0.9.9 ..
-docker build --target whatsapp -t anymsg-whatsapp:0.9.9 ..
-docker build --target backup -t anymsg-backup:0.9.9 ..
+docker build --target indexer -t anymsg-indexer:0.9.19 ..
+docker build --target whatsapp -t anymsg-whatsapp:0.9.19 ..
+docker build --target backup -t anymsg-backup:0.9.19 ..
 ```
 
 Native OCR, transcription, Chromium sandboxing, quotas and encrypted backups need

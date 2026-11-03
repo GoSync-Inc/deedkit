@@ -1,0 +1,10 @@
+# Personal install only: puts the messaging API on the gateway's network under the name the gateway uses.
+# Use as: docker compose -f compose.yaml -f compose.personal.yaml ... (see docs/personal-install.md).
+services:
+  api:
+    networks:
+      integration: {aliases: [anymsg-api]}
+networks:
+  integration:
+    external: true
+    name: ${DEEDKIT_NETWORK:-deedkit-integration}

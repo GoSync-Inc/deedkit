@@ -80,6 +80,7 @@ off until explicitly configured.
 - **npm `anymsg`**: dependency-free JavaScript HTTP client and CLI for an existing server.
   It does not install PostgreSQL, Chromium or a second messenger session.
 - **Source / Docker**: [server setup](SETUP.md) and explicit collector overlays in `deploy/`.
+- **Your own server**: [personal install](docs/personal-install.md), one VPS, no maintainer tooling.
 
 For a source installation with Python 3.13:
 
