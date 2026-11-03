@@ -118,6 +118,11 @@ a missing, skipped, extra or duplicate case fails it. A missing report blocks
 it, and that is what happens for a tested source without the node or the target.
 Assembly refuses evidence whose shard reports hold one of these cases.
 
+A pull request that adds a test location or a CI module adds its `suite()` rule and `SUITES` name
+(`scripts/tiden_health.py`) and, for a module, its `MODULE_REPORTS` entry (`scripts/tiden_ci.py`); the tests in
+`tests/test_tiden_health.py` fail on a tracked test file or a module path that no suite claims, and name the missing rule.
+Test files CI never publishes to Tiden are listed there by prefix with the reason (`UNPUBLISHED`).
+
 The separate reporting job receives no database or messenger credentials. It
 uses Tiden CLI 0.41.0 from the official release with a pinned SHA-256 checksum.
 Fork pull requests do not receive the Tiden secret or publish evidence. Package
