@@ -166,7 +166,7 @@ def test_expired_telegram_media_is_retried_without_stopping_other_jobs(worker,er
     with s.pool.connection() as c:
         failed=c.execute('SELECT state,error_code,attempts,next_due>now() AS delayed FROM media_jobs WHERE message=%s',
                          (stable_id('msg',w.account,'100','24'),)).fetchone()
-        assert failed['state']=='queued' and failed['error_code']=='network_error'
+        assert failed['state']=='queued' and failed['error_code']=='media_reference_expired'
         assert failed['attempts']==1 and failed['delayed']
         c.execute('UPDATE media_jobs SET next_due=now() WHERE message=%s',
                   (stable_id('msg',w.account,'100','24'),))

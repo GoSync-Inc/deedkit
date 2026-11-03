@@ -83,6 +83,24 @@ def test_permanent_code_is_terminal_at_the_first_failure(archive,code):
 
 
 # spec: ANYM-699
+def test_expired_provider_reference_is_retried_twice_then_fails_with_its_own_code(archive):
+    ar,s,_,_=archive; m=budget(); fid=one_job(ar,s)
+    assert m.MEDIA_ATTEMPT_CAPS=={'media_reference_expired':3}
+    for attempt in (1,2):
+        due_now(s,fid)
+        job=ar.claim_media('worker'); assert job['attempts']==attempt
+        ar.fail_media(job,'media_reference_expired')
+        row=job_row(s,fid); base=m.MEDIA_RETRY_DELAYS[attempt-1]
+        assert (row['state'],row['attempts'],row['error_code'])==('queued',attempt,'media_reference_expired')
+        assert base-3<=row['wait']<=base*1.1, (attempt,row['wait'])
+    due_now(s,fid)
+    job=ar.claim_media('worker'); assert job['attempts']==3
+    ar.fail_media(job,'media_reference_expired')
+    row=job_row(s,fid)
+    assert (row['state'],row['attempts'],row['error_code'])==('failed',3,'media_reference_expired')
+
+
+# spec: ANYM-699
 def test_provider_wait_spends_no_attempt_until_the_job_is_a_week_old(archive):
     ar,s,_,_=archive; fid=one_job(ar,s)
     job=ar.claim_media('worker'); assert job['attempts']==1
