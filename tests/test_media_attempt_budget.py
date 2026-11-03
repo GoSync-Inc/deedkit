@@ -287,6 +287,37 @@ def test_restore_without_acls_does_not_leave_queue_managed_original_open_to_publ
 
 
 # spec: ANYM-699
+def test_restore_without_acls_does_not_leave_the_lifecycle_functions_of_033_open_to_public(archive):
+    _,s,_,_=archive
+    names=('touch_original(text,bigint)','begin_backup_fence(text)','end_backup_fence(text)',
+        'register_original_residency()','register_resident_original(text,bigint)','lock_lifecycle_sources(text)')
+    def regproc(name):return f"'public.{name}'::regprocedure"
+    def open_to_public(c):
+        return [n for n in names if c.execute(f"SELECT has_function_privilege('public',{regproc(n)},'EXECUTE') AS open").fetchone()['open']]
+    def grants(c):  # every explicit non-PUBLIC ACL entry: the roles' own grants must survive the repair
+        return {n:c.execute(f"""SELECT a.grantee::regrole::text AS grantee,a.grantor::regrole::text AS grantor,
+            a.privilege_type,a.is_grantable FROM pg_proc p
+            CROSS JOIN LATERAL aclexplode(p.proacl) a WHERE p.oid={regproc(n)} AND a.grantee<>0
+            ORDER BY 1,2,3""").fetchall() for n in names}
+    with gateway(s) as restricted:  # the gateway role holds EXECUTE on touch_original (gateway_role.sql:75)
+        try:
+            with s.pool.connection() as c:
+                before=grants(c)
+                assert open_to_public(c)==[]
+                for n in names:c.execute(f'GRANT EXECUTE ON FUNCTION public.{n} TO PUBLIC')  # what a restore does
+                assert open_to_public(c)==list(names)
+            s.migrate();s.migrate()
+            with s.pool.connection() as c:
+                assert open_to_public(c)==[]
+                assert grants(c)==before
+            with restricted.pool.connection() as c:
+                assert c.execute(f"SELECT has_function_privilege({regproc(names[0])},'EXECUTE') AS ok").fetchone()['ok'] is True
+        finally:  # the session database outlives a failing test: close what the simulated restore opened
+            with s.pool.connection() as c:
+                for n in names:c.execute(f'REVOKE ALL ON FUNCTION public.{n} FROM PUBLIC')
+
+
+# spec: ANYM-699
 @pytest.mark.parametrize('case',['function_missing','grant_missing'])
 def test_request_is_recorded_and_the_job_keeps_waiting_when_the_wake_is_not_available(archive,case):
     ar,s,key,_=archive; fid=pending(ar,s)
