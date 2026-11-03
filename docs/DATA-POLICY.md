@@ -32,7 +32,9 @@ volume) (owner 11-03, see Data egress).
 - Recording texts (recordings archive, owner 11-03 «2) ок»): kept until the owner sets a term; deleted on
   the owner's request (this wording is the orchestrator's reading of «2) ок», an interim default). No deletion tool or automatic deletion exists today: a deletion is manual, under the
   data-deletion gates (process.md section 2), and a provider-side deletion does not purge the local text
-  (services/recordings/README.md). The owner named no term; a term is a new owner decision.
+  (services/recordings/README.md). The owner named no term; a term is a new owner decision. Once the
+  archive backup runs (ANYM-728), a deletion from the live archive leaves the backup at the next daily
+  rotation, which keeps one protected point and no older history.
 - Bot buttons: the labels, kinds, URLs, Mini App links and callback data of a message's inline and
   reply buttons are stored and deleted with the message text (retention above, deletion below; owner
   11-01 «4 да» to the bot-buttons question, with «надо сделать чтоб он бот мог делать действия которые
@@ -86,7 +88,7 @@ volume) (owner 11-03, see Data egress).
     message, sender and send IDs, the subscription version, event kinds and times, wake reasons, the
     count of omitted references, the next tool to call, the signature headers, the delivery timing, and
     what the agent itself set (the subscription's `label`, its own headers); never archive message text,
-    contact names or file content (SECURITY.md, SUBSCRIPTIONS.md:558-561; owner 10-27 webhooks «... возможность прописывать
+    contact names, file content or recording titles, transcripts, summaries and speakers (SECURITY.md, SUBSCRIPTIONS.md:558-561; owner 10-27 webhooks «... возможность прописывать
     самостоятельно агенты ...»). Under self-registration the receiver is any public host the agent names,
     with no operator host entry (ANYM-585; owner 10-28 «... дать агентам себе создавать вот этот, прописывать
     эту штуку ...»).
@@ -126,8 +128,25 @@ volume) (owner 11-03, see Data egress).
       including other people's speech, for the retention line above. Archive polling sends the same fields
       as the reads to the same two hosts on a schedule. Owner 11-03: «Можно ли хранить копию расшифровок на
       нашем сервере, включая речь других людей? Сколько хранить?» Answer: «2) ок». Covers the local copy
-      only. Putting the archive into the shared backup server and its object storage is a separate
-      `user-data` ask; archive polling stays off on production until that is decided.
+      only.
+    - Full history and backups (owner 11-03): the archive downloads the whole Omi history of the owner's
+      account, newest first and within Omi's hourly limits (days to weeks), not only new recordings, and the
+      archive goes into the daily backup as its own encrypted profile on the shared backup server and its
+      private R2 prefix, with one protected point plus one candidate and no older history. The backup holds
+      other people's speech, encrypted. Owner 11-03, asked by the orchestrator whether the recordings archive
+      goes on and into backups: «давай включим да»; and: «пусть качает все и дает удобную интексацию
+      агентам». Covers Omi and PLAUD text only: audio stays out (`recordings_audio` above still needs its
+      own ask) and so does any other recipient. Archive polling may start on production once the
+      recordings cards for it (ANYM-724 and the backup parts ANYM-714, 727, 728) are delivered.
+    - Agent search and new-recording hints (owner 11-03): the principals with recordings grants
+      (`owner-claude-code`, `claude-code`, `grokbot`) search and read the archived text through scoped
+      gateway tools; the returned text goes into those agents' model contexts, the model provider of
+      `grokbot` included (owner 11-03 «грогу надо тоже» for the reads; «пусть качает все и дает удобную
+      интексацию агентам» for the search). An agent may subscribe to «new recording transcript archived»
+      (owner 11-03: «и еще надо чтоб была возможность подписаться на хук о новой записи транскрипции»);
+      the hint carries only opaque references (recording reference, account, revision, time, next tool),
+      never a title, transcript, summary or speaker, to an endpoint the agent or operator registered under
+      the webhook line above.
   - Tiden error tracking (TELEMETRY.md, off by default): proposal, which fields go where is not yet an
     owner decision.
   - Any other recipient or field is a `user-data` ask before it ships.
