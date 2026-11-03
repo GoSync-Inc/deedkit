@@ -22,6 +22,13 @@ account queues, processing profile summaries or lease observations.
   history. A WhatsApp gap can coexist with connected/receiving live capture: the
   legacy account `status` stays `receiving` with `detail_code=whatsapp_catchup_gap`,
   and the gap remains in `history.gap_chats` and the `provider_history_gaps` alert.
+  The flag means the catch-up could not reach the chat's previous head (the
+  browser engine ran out of earlier messages), not that messages are proven lost:
+  live capture runs independently. The native engine never sets it (its pages
+  report `exhausted: false`), so a gap on a native account was set earlier, under
+  the browser engine. Nothing clears the flag today (as of main b74761bd): it
+  stays after a later traversal covers the hole. `catchup_pending_chats`
+  is a different count: chats whose catch-up is still walking back.
   Reconciliation and backfill pages use their own durable spool (WhatsApp pages,
   Telegram `history/` beside the live spool); `history.pending_events` counts them,
   so they never make `live_capture` look backlogged.
