@@ -1,4 +1,4 @@
-"""Module events (ANYM-562): calendar and calls events in a journal of their own.
+"""Module events (ANYM-562): calendar, calls and (ANYM-732) recordings events in a journal of their own.
 
 The module journal (schema 56) has its own gapless counter, so publishing never takes the
 feed_counter lock of the message journal. A subscription's module part is a second stream with
@@ -14,12 +14,14 @@ import re
 
 from psycopg.types.json import Jsonb
 
-SOURCES = {'deedkit:calendar': 'calendar', 'deedkit:calls': 'calls'}
+SOURCES = {'deedkit:calendar': 'calendar', 'deedkit:calls': 'calls', 'deedkit:recordings': 'recordings'}
+# The first part of an event type that belongs to each module (calls publish `call.*`, recordings `recording.*`).
+TYPE_PREFIX = {'calendar': 'calendar', 'calls': 'call', 'recordings': 'recording'}
 URGENCIES = frozenset(('now', 'batch'))
 _REF = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,127}')
 _SCOPE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,255}')
 _TOKEN = re.compile(r'[a-z][a-z0-9_]{0,47}')
-_ID = re.compile(r'(calendar|calls):([1-9][0-9]{0,15})')
+_ID = re.compile(r'(calendar|calls|recordings):([1-9][0-9]{0,15})')
 _TIME = re.compile(r'(19[7-9][0-9]|[2-9][0-9]{3})-\d{2}-\d{2}T([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d{1,6})?(Z|[+-](0\d|1[0-5]):[0-5]\d)')
 # Every time is finite and inside this range (UTC), so every reader decodes it; the definer function
 # enforces the same bounds.
@@ -77,7 +79,14 @@ KINDS = {
     'call.interrupted': ({'call_id': _ref, 'end_reason': _enum('service_restart')}, frozenset(), 'call_id'),
     'call.owner_request': ({'call_id': _ref, 'decision_id': _ref, 'state': _enum('pending')}, frozenset(),
         'call_id'),
+    # ANYM-726/732: opaque references and an enumeration only; never a title, text, label, provider id, token or URL.
+    'recording.text.archived': ({'recording_ref': _ref, 'account_ref': _ref, 'revision': _int(0, MAX_SEQ)}, frozenset(),
+        'recording_ref'),
+    'recording.access.changed': ({'account_ref': _ref, 'principal_ref': _ref,
+        'reason': _enum('permission_removed', 'account_removed', 'namespace_replaced')}, frozenset(), 'account_ref'),
 }
+# ANYM-732: a new archived text is batched, an access change is urgent; neither expires.
+RECORDING_URGENCY = {'recording.text.archived': 'batch', 'recording.access.changed': 'now'}
 ENVELOPE = frozenset(('specversion', 'id', 'source', 'type', 'subject', 'time', 'data', 'urgency', 'expires_at'))
 # Measured as PostgreSQL prints jsonb (', ' and ': '), so the definer function's bound is the same number.
 DATA_LIMIT_BYTES = 1024
@@ -101,7 +110,7 @@ def validate_event(event):
     if match is None or match.group(1) != SOURCES[event['source']] or int(match.group(2)) > MAX_SEQ:
         _fail('invalid_id')
     kind = KINDS.get(event['type']) if isinstance(event['type'], str) else None
-    if kind is None or event['type'].split('.')[0] != ('calendar' if match.group(1) == 'calendar' else 'call'):
+    if kind is None or event['type'].split('.')[0] != TYPE_PREFIX[match.group(1)]:
         _fail('invalid_type')
     checks, optional, subject = kind
     data = event['data']
@@ -117,6 +126,9 @@ def validate_event(event):
         _fail('invalid_envelope')
     if event['type'] == 'call.failed' and 'provider_code' in data and 'provider_cause' not in data:
         _fail('provider_code_needs_cause')
+    if event['type'] in RECORDING_URGENCY and (event['urgency'] != RECORDING_URGENCY[event['type']] or
+            event['expires_at'] is not None):
+        _fail('recording_urgency_or_expiry')
     if event['type'] == 'call.owner_request' and (event['urgency'] != 'now' or event['expires_at'] is None):
         # The decision's stored deadline: an owner request is never held by batching or kept past it.
         _fail('owner_request_needs_now_and_deadline')
@@ -212,8 +224,7 @@ def attach_sources(c, subscription_id, sources):
     for source, scope_ref, types in sources:
         if (source not in SOURCES or not isinstance(scope_ref, str) or _SCOPE.fullmatch(scope_ref) is None or
                 not isinstance(types, (list, tuple)) or not 1 <= len(types) <= 16 or
-                any(kind not in KINDS or kind.split('.')[0] != ('calendar' if source == 'deedkit:calendar' else
-                    'call') for kind in types)):
+                any(kind not in KINDS or kind.split('.')[0] != TYPE_PREFIX[SOURCES[source]] for kind in types)):
             raise APIError('invalid_filter')
     head = c.execute('SELECT value FROM module_event_counter WHERE id=1').fetchone()['value']
     c.execute('''INSERT INTO subscription_module_streams(subscription,start_position,matched_through,

@@ -37,6 +37,20 @@ def call_event(seq, call_id='call-1', kind='call.finished', scope='owner-calls',
     return {**event, **changes}
 
 
+RECORDING_SCOPE = 'recordings:omi-a.0123456789abcdef'
+
+
+def recording_event(seq, kind='recording.text.archived', scope=RECORDING_SCOPE, **changes):
+    """An ANYM-726 feed event with its top-level scope_ref (references only)."""
+    text = kind == 'recording.text.archived'
+    data = ({'recording_ref': 'rec-1', 'account_ref': 'omi-a', 'revision': 1} if text else
+        {'account_ref': 'omi-a', 'principal_ref': 'agent-1', 'reason': 'permission_removed'})
+    event = {'specversion': '1.0', 'id': f'recordings:{seq}', 'source': 'deedkit:recordings', 'type': kind,
+        'subject': data['recording_ref' if text else 'account_ref'], 'time': '2026-11-03T10:00:00Z', 'data': data,
+        'urgency': 'batch' if text else 'now', 'expires_at': None, 'scope_ref': scope}
+    return {**event, **changes}
+
+
 class Producer:
     """A reference producer of the shared contract (SUBSCRIPTIONS.md, Producers' read endpoint) over HTTP."""
 
@@ -393,6 +407,60 @@ def test_a_malformed_event_is_quarantined_the_page_continues_and_coverage_stays_
     assert [g['resolution'] for g in router_state(store)[1]] == ['refetched', 'abandoned']
     view = store.get_subscription(token, sid)['module_stream']
     assert view['health'] == [] and view['sources'][0]['coverage'] == 'complete'
+
+
+# spec: ANYM-732
+def test_a_recordings_page_is_published_with_its_scope_and_free_text_is_quarantined_by_name(routed, producers, tmp_path):
+    store, connect = routed
+    feed = producers('deedkit:recordings', 'recordings-journal-1')
+    module = feed.module(tmp_path)
+    sweep(connect, module)
+    feed.add(recording_event(1))
+    bad = feed.add(recording_event(2, data={'recording_ref': 'rec-1', 'account_ref': 'omi-a', 'revision': 1,
+        'title': MARKER}))
+    feed.add(recording_event(3, 'recording.access.changed', scope='recordings:omi-a.fedcba9876543210'))
+    feed.add({**recording_event(4), 'id': 'calls:4'})
+    feed.add(recording_event(5))
+    sweep(connect, module)
+    assert journal(store) == [(1, 'recordings:1', RECORDING_SCOPE), (2, 'recordings:3', 'recordings:omi-a.fedcba9876543210'),
+        (3, 'recordings:5', RECORDING_SCOPE)]
+    cursor, gaps = router_state(store, 'deedkit:recordings')
+    assert cursor == {'after_seq': 5, 'journal_id': 'recordings-journal-1', 'origin': 'router'}
+    assert [(g['kind'], g['after_seq'], g['through_seq'], g['code']) for g in gaps] == [
+        ('quarantine', bad - 1, bad, 'data_key_not_allowed'), ('quarantine', 3, 4, 'invalid_id')]
+    with store.pool.connection() as c:
+        assert MARKER not in json.dumps(c.execute('SELECT * FROM module_router_gaps').fetchall(), default=str)
+    # Idempotent on recordings:<seq>: the operator's replay adds no duplicate row.
+    with store.pool.connection() as c:
+        event_router.set_cursor(c, 'deedkit:recordings', 0)
+    sweep(connect, module)
+    assert [key for _, key, _ in journal(store)] == ['recordings:1', 'recordings:3', 'recordings:5']
+
+
+# spec: ANYM-732
+def test_a_failing_recordings_feed_marks_only_its_source_unreachable_and_never_stalls_calls(routed, producers, tmp_path):
+    store, connect = routed
+    feed = producers('deedkit:recordings', 'recordings-journal-1')
+    calls = producers()
+    recordings_module, calls_module = feed.module(tmp_path, timeout_s=0.5), calls.module(tmp_path)
+    sweep(connect, recordings_module, calls_module)
+    feed.add(recording_event(1))
+    calls.add()
+    feed.stall = 3  # slow: past the router's deadline
+    started = time.monotonic()
+    sweep(connect, recordings_module, calls_module)
+    assert time.monotonic() - started < 2.5
+    assert [key for _, key, _ in journal(store)] == ['calls:1']
+    with store.pool.connection() as c:
+        unreachable = {row['source'] for row in c.execute(
+            'SELECT source FROM module_source_health WHERE unreachable_since IS NOT NULL')}
+    assert unreachable == {'deedkit:recordings'}
+    assert router_state(store, 'deedkit:recordings')[0]['after_seq'] == 0
+    feed.stall = 0
+    sweep(connect, recordings_module, calls_module)
+    assert [key for _, key, _ in journal(store)] == ['calls:1', 'recordings:1']
+    with store.pool.connection() as c:
+        assert c.execute('SELECT count(*) AS n FROM module_source_health WHERE unreachable_since IS NOT NULL').fetchone()['n'] == 0
 
 
 # spec: ANYM-575
@@ -834,12 +902,20 @@ def test_router_config_refuses_unsafe_or_unknown_settings(tmp_path):
     path = tmp_path / 'router.json'
     path.write_text(json.dumps(good))
     assert event_router.load_config(path)['timeout_s'] == 5
+    # ANYM-732: the recordings source is a valid module of its own, beside the other two.
+    three = {'modules': [{**good['modules'][0], 'source': source} for source in ('deedkit:calls', 'deedkit:calendar',
+        'deedkit:recordings')]}
+    path.write_text(json.dumps(three))
+    assert [m['source'] for m in event_router.load_config(path)['modules']] == [m['source'] for m in three['modules']]
+    path.write_text(json.dumps(good))
     for bad in ({**good, 'extra': 1},
             {'modules': [{**good['modules'][0], 'url': 'https://calls:13842'}]},
             {'modules': [{**good['modules'][0], 'url': 'http://user:pw@calls:13842'}]},
             {'modules': [{**good['modules'][0], 'url': 'file:///etc/passwd'}]},
             {'modules': [{**good['modules'][0], 'source': 'deedkit:messages'}]},
             {'modules': good['modules'] * 2},
+            {'modules': [{**good['modules'][0], 'source': source} for source in ('deedkit:calls', 'deedkit:calendar',
+                'deedkit:recordings', 'deedkit:calls')]},
             {**good, 'timeout_s': 0}):
         path.write_text(json.dumps(bad))
         with pytest.raises(ValueError, match='invalid_router_config'):
@@ -852,11 +928,14 @@ def test_router_overlay_is_opt_in_restricted_and_its_example_config_loads():
     root = Path(__file__).resolve().parents[1] / 'deploy'
     service = yaml.safe_load((root / 'compose.event-router.yaml').read_text())['services']['event-router']
     assert service['command'][:3] == ['python', '-m', 'messaging_service.event_router']
-    assert set(service['networks']) == {'backend', 'integration'} and not service.get('ports')
+    # ANYM-732: the one added network is the internal pair with the recordings container (below).
+    assert set(service['networks']) == {'backend', 'integration', 'recordings-router'} and not service.get('ports')
     assert service['read_only'] is True and service['cap_drop'] == ['ALL'] and service['user'] == '10001:10001'
     assert all(volume['read_only'] and volume['bind']['create_host_path'] is False and
         volume['source'].startswith('./private/') for volume in service['volumes'])
     assert 'event-router' not in yaml.safe_load((root / 'compose.yaml').read_text())['services']
     config = event_router.load_config(root / 'event-router.example.json')
-    assert {module['source'] for module in config['modules']} == {'deedkit:calls', 'deedkit:calendar'}
+    assert {module['source'] for module in config['modules']} == {'deedkit:calls', 'deedkit:calendar', 'deedkit:recordings'}
+    recordings = next(module for module in config['modules'] if module['source'] == 'deedkit:recordings')
+    assert recordings['url'] == 'http://recordings-api:13234' and recordings['token_file'].endswith('/recordings')
     assert all(module['token_file'].startswith('/run/secrets/module-tokens/') for module in config['modules'])

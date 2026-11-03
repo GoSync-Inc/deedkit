@@ -31,8 +31,10 @@ services:
         target: /run/secrets/module-tokens
         read_only: true
         bind: {create_host_path: false}
-    # backend reaches the database; integration reaches the modules' read endpoints (calls, calendar-api).
-    networks: [backend, integration]
+    # backend reaches the database; integration reaches the modules' read endpoints (calls, calendar-api);
+    # recordings-router (ANYM-732) is the internal network the router shares with the recordings container alone, which
+    # is how it reaches the recordings feed (created once by hand, see the network entry below).
+    networks: [backend, integration, recordings-router]
     read_only: true
     user: "10001:10001"
     cap_drop: [ALL]
@@ -49,3 +51,10 @@ networks:
   integration:
     external: true
     name: ${DEEDKIT_NETWORK:-deedkit-integration}
+  # Created once by hand, before the recordings container or the router starts with this overlay (docs/operations/production.md,
+  # "Module event router"): docker network create --internal -o com.docker.network.bridge.name=dk-recrouter0
+  #   -o com.docker.network.bridge.gateway_mode_ipv4=isolated deedkit-recordings-router
+  # Internal and without a host address: no route out. Only this service and recordings-api join it.
+  recordings-router:
+    external: true
+    name: ${RECORDINGS_ROUTER_NETWORK:-deedkit-recordings-router}

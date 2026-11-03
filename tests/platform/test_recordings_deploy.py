@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT))
 OVERLAY = ROOT / 'deploy/compose.recordings.yaml'
 GATEWAY_OVERLAY = ROOT / 'deploy/compose.gateway-recordings.yaml'
 NETWORK = 'deedkit-recordings-backend'
+PAIR_NETWORK = 'deedkit-recordings-router'
 
 
 def compose(path):
@@ -67,7 +68,8 @@ def test_recordings_api_is_confined_to_the_internal_backend_and_the_filtered_egr
     assert document['name'] == 'deedkit-recordings'
     unit = document['services']['recordings-api']
     assert not unit.get('ports') and 'network_mode' not in unit
-    assert set(unit['networks']) == {'recordings-backend', 'recordings-egress'}  # never `integration`
+    # never `integration`; ANYM-732 adds the internal pair network with the module event router (below)
+    assert set(unit['networks']) == {'recordings-backend', 'recordings-egress', 'recordings-router'}
     assert unit['networks']['recordings-backend']['aliases'] == ['recordings-api']
     assert 'integration' not in OVERLAY.read_text().replace('`integration`', '')
     volumes = unit['volumes']
@@ -81,6 +83,40 @@ def test_recordings_api_is_confined_to_the_internal_backend_and_the_filtered_egr
     assert egress['enable_ipv6'] is False and egress['driver_opts'] == {'com.docker.network.bridge.name': 'dk-recordings0'}
     assert 'internal' not in egress  # it must have a route out; the host rules (ANYM-712) filter it
     assert not re.search(r'(?i)(token|secret|password)\s*[:=]\s*\S{8,}', OVERLAY.read_text())
+
+
+# spec: ANYM-732
+def test_the_router_and_recordings_share_one_internal_network_that_nothing_else_joins_and_that_opens_no_route_out():
+    router = compose(ROOT / 'deploy/compose.event-router.yaml')
+    recordings = compose(OVERLAY)
+    for document in (router, recordings):
+        network = document['networks']['recordings-router']
+        assert network['external'] is True and network['name'].endswith(':-' + PAIR_NETWORK + '}')
+        assert set(network) == {'external', 'name'}  # created once by hand: internal, isolated gateway, no host address
+    assert router['networks']['recordings-router'] == recordings['networks']['recordings-router']
+    assert recordings['services']['recordings-api']['networks']['recordings-router']['aliases'] == ['recordings-api']
+    class Loose(yaml.SafeLoader):  # other overlays use Compose tags such as `!override`; only the structure matters here
+        pass
+    Loose.add_multi_constructor('!', lambda loader, suffix, node: loader.construct_sequence(node)
+        if isinstance(node, yaml.SequenceNode) else loader.construct_mapping(node) if isinstance(node, yaml.MappingNode)
+        else loader.construct_scalar(node))
+    members = []
+    for path in sorted((ROOT / 'deploy').glob('compose*.yaml')):
+        for name, unit in (yaml.load(path.read_text(), Loose) or {}).get('services', {}).items():
+            if 'recordings-router' in (unit.get('networks') or []):
+                members.append(name)
+    assert sorted(members) == ['event-router', 'recordings-api']
+    # No new route out and no new reach for the router: the egress bridge and the router's other networks are as before.
+    assert set(router['services']['event-router']['networks']) == {'backend', 'integration', 'recordings-router'}
+    egress = recordings['networks']['recordings-egress']
+    assert egress['driver_opts'] == {'com.docker.network.bridge.name': 'dk-recordings0'} and 'internal' not in egress
+    assert 'recordings-egress' not in router['services']['event-router']['networks']
+    assert not router['services']['event-router'].get('ports') and not recordings['services']['recordings-api'].get('ports')
+    docs = (ROOT / 'docs/operations/production.md').read_text()
+    for needle in ('docker network create --internal -o com.docker.network.bridge.name=dk-recrouter0 -o '
+                   'com.docker.network.bridge.gateway_mode_ipv4=isolated ' + PAIR_NETWORK,
+                   'docker network disconnect ' + PAIR_NETWORK, 'docker network rm ' + PAIR_NETWORK):
+        assert needle in docs, needle
 
 
 # spec: ANYM-711
