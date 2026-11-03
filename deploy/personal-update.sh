@@ -36,10 +36,10 @@ main() {
   MIN_MB=${DEEDKIT_MIN_FREE_MB:-2048}
   FROM=unknown; TO=unknown; SCHEMA=-; DUMPED=-
   mkdir -p -m 700 "$DUMPS" "$(dirname "$LOG")" 2>/dev/null
+  for tool in git docker flock curl python3; do command -v "$tool" >/dev/null || { say failed "missing $tool"; return 1; }; done
   exec 9>"$DUMPS/.lock"
   flock -n 9 || { say skipped "another update is running"; return 0; }
   cd "$repo" || { say failed "no checkout at $repo"; return 1; }
-  for tool in git docker flock; do command -v "$tool" >/dev/null || { say failed "missing $tool"; return 1; }; done
 
   # 1. clean checkout (untracked files such as deploy/private and .env are fine)
   [ -z "$(git status --porcelain --untracked-files=no)" ] || { say failed "checkout has local changes to tracked files; update refused"; return 1; }
