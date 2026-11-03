@@ -164,6 +164,15 @@ Native WhatsApp operations and sends write each provider frame once (no resend
 after a reconnect) and answer within 20 s, `send_file` within 75 s; a late
 change or send ends `unknown` (docs/whatsapp-native.md).
 
+A mutation refused for a missing or changed preview (`preview_required`, `preview_mismatch`) keeps its code
+and status and adds `next_action: preview_then_send_with_digest`, a fixed `hint` and `next_call: {tool:
+"preview_messenger_operation", arguments, caller_supplies}` (ANYM-646). `arguments` holds `account`,
+`operation` and the `chat_id`, `message_id` and `expected_revision` the call gave; `caller_supplies` is
+`["parameters"]` when it gave parameters. Preview with those plus your own `parameters`, show the owner the
+preview and, after confirmation, repeat the execute unchanged with the returned `preview_digest`. The refusal
+carries no digest or parameter value, and the server runs nothing. `join_chat` without a fresh successful link
+check keeps its earlier `preview_required` body.
+
 ## Risk-class gateway tools
 
 The gateway also offers four tools, one per risk class (ANYM-549). Each routes a

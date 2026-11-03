@@ -470,12 +470,13 @@ def test_nested_unsafe_key_redacted_to_its_parent_gets_no_stale_hint(tmp_path):
 
 # spec: ANYM-452
 def test_a_singular_field_of_a_plural_one_names_it_and_does_not_call_the_list_stale():
-    # `account` on list_chats: the tool has `accounts`; the current tool list is not stale.
-    tool = CATALOG["messages_list_chats"]
+    # `chat` on search_people: the tool has `chats`; the current tool list is not stale. (ANYM-646 gave list_chats and
+    # search_people `account`, so the example moved to the one singular they still lack.)
+    tool = CATALOG["messages_search_people"]
     detail = {"error": "invalid_arguments", "next_action": "check_parameters",
-              "field_errors": [{"field": "account", "reason": "unknown_field"}]}
+              "field_errors": [{"field": "chat", "reason": "unknown_field"}]}
     hinted = diagnostics.stale_arguments_hint(tool, detail)
-    assert hinted["use_instead"] == {"account": "accounts"} and "accounts" in hinted["tool_fields"]["optional"]
+    assert hinted["use_instead"] == {"chat": "chats"} and "chats" in hinted["tool_fields"]["optional"]
     assert "tool_list_stale" not in hinted and "owner_hint" not in hinted
     # One unknown field without a near name keeps the stale-list hint and names no replacement.
     detail["field_errors"].append({"field": "voice_style", "reason": "unknown_field"})

@@ -35,6 +35,10 @@ Rulebook v1 adds:
 `hint`, `next` and candidates never carry message text, file names or phone numbers taken from a request or a backend
 error; the ANYM-295 privacy allowlist is unchanged.
 
+A send or messenger operation refused with `preview_required` or `preview_mismatch` carries `next_call` (the ANYM-531
+form, `caller_supplies` naming what the caller adds), a fixed `next_action` and a fixed `hint`; it never carries the
+digest or the call's text, number, username or link (ANYM-646; SENDING.md, MESSENGER_OPERATIONS.md).
+
 ## Read refusals name the field (ANYM-660)
 
 A refused archive read says which parameter to change, the rule and the next step; codes and HTTP statuses stay.

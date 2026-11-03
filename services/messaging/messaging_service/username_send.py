@@ -152,7 +152,15 @@ def send_begin(store, c, p, account, username, text, request_id, reply_to, forma
     """The first send result of this request_id, or the chat step to wait for. Nothing reaches a provider here."""
     from .commands import enqueue
     from .outgoing import CHILD_KEY_PREFIX, format_options, phone_step_id, valid_text
-    format_options(format, link_preview, allow_lossy, preview_digest)
+    from . import preview_refusal
+
+    def refused(error):
+        # ANYM-646: a caller's own send names the preview call; a messages_send child keeps its body.
+        if child: return error
+        return preview_refusal.send(error, account, username=username, reply_to=reply_to if isinstance(reply_to, str) else '',
+                                    format=format, link_preview=link_preview, allow_lossy=allow_lossy)
+    try: format_options(format, link_preview, allow_lossy, preview_digest)
+    except APIError as error: raise refused(error) from None
     if not isinstance(text, str) or not text.strip(): raise APIError('invalid_message_text')
     if format == 'plain': valid_text(text)
     if (not isinstance(request_id, str) or not re.fullmatch(r'[a-zA-Z0-9_.:-]{8,128}', request_id)
@@ -171,7 +179,7 @@ def send_begin(store, c, p, account, username, text, request_id, reply_to, forma
     if step:
         if step['payload'].get('send_request_hash') != expected: raise APIError('idempotency_conflict', 409)
         return {'operation_id': step['id']}
-    if not preview_digest: raise APIError('preview_required', 409)
+    if not preview_digest: raise refused(APIError('preview_required', 409))
     policy = c.execute('SELECT enabled,send_enabled FROM account_policies WHERE account=%s', (account,)).fetchone()
     if not policy or not policy['enabled'] or not policy['send_enabled']: raise APIError('sending_disabled', 409)
     _admit(store, c, p, account, username, True)
@@ -185,7 +193,7 @@ def send_begin(store, c, p, account, username, text, request_id, reply_to, forma
                          link_preview, allow_lossy)
     if draft['preview_digest'] != preview_digest:
         failure = APIError('preview_mismatch', 409); failure.next_action = 'preview_message_again'
-        raise failure
+        raise refused(failure)
     receipt = enqueue(store, c, p, account, OPERATION, parameters={'username': username, 'create': True},
                       request_id=phone_step_id(request_id), internal={'expected_user_id': user_id,
                       'send_request_hash': expected, 'preview_lookup': lookup['id'],

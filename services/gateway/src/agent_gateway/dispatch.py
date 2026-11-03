@@ -123,6 +123,17 @@ def expiring(snapshot, now=None):
     ]
 
 
+def fold_account(args):
+    """ANYM-646: `account` joins `accounts` here, so a messaging server without the field (the deployed one) takes
+    both tools. Both given are ANDed as in search: an account outside the list leaves no account; "" is no filter."""
+    account = args.get("account")
+    args = {k: v for k, v in args.items() if k != "account"}
+    if not account:
+        return args
+    accounts = args.get("accounts")
+    return {**args, "accounts": [account] if accounts is None or account in accounts else []}
+
+
 class Dispatch:
     def __init__(self, policy, clients, tickets=None):
         self.policy, self.clients, self.tickets = policy, clients, tickets
@@ -608,6 +619,8 @@ class Dispatch:
         if module == "messaging" and tool["operation"] in ("preview_message", "send_message"):
             # An empty recipient field is not sent, so a backend from before ANYM-532 keeps taking chat_id calls.
             args = {k: v for k, v in args.items() if k not in ("chat_id", "phone", "username") or v != ""}
+        if module == "messaging" and tool["operation"] in ("list_chats", "search_people"):
+            args = fold_account(args)
         if module == "messaging" and tool["operation"] == "messages_send":
             # ANYM-546: whether a phone with no chat may be opened, and whether files may go, is this gateway's
             # grant on every call (a token-only or resume call carries no files), never the agent's word.

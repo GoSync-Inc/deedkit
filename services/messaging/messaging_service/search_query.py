@@ -54,6 +54,17 @@ def filter_values(values):
     return sorted(set(valid_text(v, empty=False) for v in values))
 
 
+def fold_account(account, accounts):
+    """ANYM-646: the singular `account` joins the plural `accounts` filter before the query and the cursor binding.
+    Both given are ANDed, as in search(): an account outside the list leaves no account. An empty string is no filter."""
+    valid_text(account)
+    if account=='':
+        return accounts
+    if accounts is None:
+        return [account]
+    return [account] if account in filter_values(accounts) else []
+
+
 def fingerprint(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), default=str).encode()).hexdigest()
 

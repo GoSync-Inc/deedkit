@@ -300,6 +300,8 @@ as a debt.
 - Mutes apply as in the queue: `muted_total` while the principal has a mute,
   `include_muted=true` returns the rows with `waiting.muted` (`chat` or
   `sender`).
+- `account` (one ID) is accepted beside `accounts` (a list) in `list_chats` and `search_people`, as in `search`: both given are
+  ANDed, an empty `account` is no filter, and a cursor from one form continues with the other (ANYM-646).
 - `accounts` gives each scoped account's source `status` and `last_ingest_at`,
   so an empty list after a stopped collector reads as "nothing archived", not
   "nobody owes a reply".
