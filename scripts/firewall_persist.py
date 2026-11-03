@@ -258,14 +258,15 @@ def load(name):
 def compose_after_init(base, step):
     """The inference after.init `base` with the recordings function `step` added (ANYM-712), or `base` when `step` is None.
 
-    The recordings half runs first, as a child of the hook (`sh "$0" recordings`) under its own aggregate budget
-    (DEEDKIT_RECORDINGS_TIMEOUT, 1-10 s, default 8 s, plus a 2 s kill grace), so it takes at most 12 s of the hook's outer
-    60 s and the inference half keeps the rest. GNU timeout puts every command in its own process group, so killing the
-    child leaves nested commands running: the child therefore gets the same value as its per-command limit
-    (DEEDKIT_STEP_TIMEOUT), its stdin, stdout and stderr are /dev/null (nothing it leaves behind can hold a pipe of the
-    caller), and its result is its exit status (11 restore, 12 and 13 the IPv4 and IPv6 hook), never captured output. An
-    overrun or a failure is a reason (REC_FAIL) recorded in the same raw-step record after the inference half has run,
-    and the hook still exits 0. The inference text is otherwise unchanged.
+    The recordings half runs LAST, after the inference half has loaded and just before the record is written, so it cannot
+    delay, shorten or break the inference half: the inference commands run exactly as in `base`, under the hook's unchanged
+    outer 60 s bound. If inference fails (`fail` exits) or is slow, the recordings rules are simply not loaded in this boot;
+    the failure is in the record, `verify` and the receipt, and recordings-api's admission refuses to serve without the rules
+    (fail closed). The recordings half is a child of the hook (`sh "$0" recordings`) with a budget of its own
+    (DEEDKIT_RECORDINGS_TIMEOUT, 1-10 s, default 8 s, plus a 2 s kill grace), the same value as its per-command limit
+    (DEEDKIT_STEP_TIMEOUT: GNU timeout puts nested commands in their own process groups), /dev/null for stdin, stdout and
+    stderr (nothing it leaves behind can hold a pipe of the caller) and an exit status as its result (11 restore, 12 and 13
+    the IPv4 and IPv6 hook). A failure or an overrun is a reason (REC_FAIL) in the same raw-step record; the hook exits 0.
     """
     if step is None:
         return base
@@ -283,7 +284,7 @@ def compose_after_init(base, step):
            '        *) REC_FAIL=hook_recordings_$? ;;\n'
            '    esac\n')
     done = '    if [ -n "$REC_FAIL" ]; then log "failed: $REC_FAIL"; record false "$REC_FAIL"; else record true ok; fi\n}'
-    return (base.replace(head, step + head + run).replace(tail, done)
+    return (base.replace(tail, run + done).replace(head, step + head)
             .replace(case, case + '    recordings) recordings_step; exit $? ;;\n'))
 
 

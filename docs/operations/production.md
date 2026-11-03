@@ -1776,12 +1776,16 @@ resolver then queries that server from the container's namespace, where the brid
 use the host's inherited resolvers from the host namespace, outside them. Read-back: `getent hosts api.omi.me` works in the
 container and a query to any other resolver (`check --blocked-dns IP`) gets no answer.
 
-**Boot budget.** The recordings half of `after.init` runs first as a child under its own aggregate bound
-(`DEEDKIT_RECORDINGS_TIMEOUT`, 1-10 s, default 8 s, plus a 2 s kill grace; at most 12 s of the hook's 60 s, the rest stays
-the inference half's). GNU `timeout` puts each command in its own process group, so the child gets the same value as its
+**Boot order and budget.** The recordings half of `after.init` runs LAST, after the inference half has loaded and just before
+the record is written, so it cannot delay, shorten or break the inference half, which runs exactly as before under the
+hook's unchanged 60 s bound. When inference fails or is slow, the recordings rules are not loaded in that boot: the failure
+is in the raw-step record, in `verify` and in the receipt, and `recordings-api` refuses to serve without them (admission,
+fail closed). The recordings half is a child of the hook under its own bound (`DEEDKIT_RECORDINGS_TIMEOUT`, 1-10 s, default
+8 s, plus a 2 s kill grace). GNU `timeout` puts each command in its own process group, so the child gets the same value as its
 per-command limit and `/dev/null` for stdin, stdout and stderr, and reports by exit status (11 restore, 12 and 13 the hook),
-never by captured output; an overrun records `hook_recordings_124` (or `restore_recordings_v4` when the command's own limit, the same value, ends first), a restore or hook failure `restore_recordings_v4` or
-`hook_recordings_v4|v6`, in the same raw-step record, after the inference half has loaded. The hook still exits 0.
+never by captured output. An overrun records `hook_recordings_124` (or `restore_recordings_v4` when the command's own limit,
+the same value, ends first), a restore or hook failure `restore_recordings_v4` or `hook_recordings_v4|v6`, in the same
+raw-step record. The hook still exits 0.
 
 **Egress admission.** The overlay sets `RECORDINGS_EGRESS_ADMISSION=required` and requires `RECORDINGS_EGRESS_BLOCKED` and
 `RECORDINGS_EGRESS_OPEN` (comma-separated, in the project's env file; Compose refuses a missing one). Before the CLI binds its

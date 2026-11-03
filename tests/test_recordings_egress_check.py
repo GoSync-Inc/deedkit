@@ -599,22 +599,22 @@ def test_an_injected_failure_or_hang_keeps_the_previous_complete_recordings_chai
     (first / 'after.init').write_text(hook_text())
     (second / 'after.init').write_text(hook_text(resolver='192.0.2.54', mini='100.101.102.104'))
     wrappers, state = tmp_path / 'bin', tmp_path / 'raw-step.json'
-    # The first restore (the recordings half runs first) commits nothing: its input is cut after three lines, no COMMIT.
-    # The second variant hangs every restore.
-    marker, counter = tmp_path / 'failed-once', tmp_path / 'calls'
-    variants = {'error_first': f'#!/bin/sh\nif [ ! -e {marker} ]; then touch {marker}; head -n 3 | {real} "$@"; exit 1; fi\nexec {real} "$@"\n',
-                'hang': '#!/bin/sh\nexec sleep 60\n',
-                # The recordings restore (the first call) hangs under the DEFAULT 30 s limit while the inference restore is slow
-                # but succeeds (2 s): the recordings budget ends the first, nothing it left behind holds the hook, and the
-                # inference half still loads.
-                'recordings_hang': (f'#!/bin/sh\nn=$(cat {counter} 2>/dev/null || echo 0); echo $((n+1)) > {counter}\n'
-                                    f'case $n in 0) exec sleep 60;; 1) sleep 2;; esac\nexec {real} "$@"\n')}
+    # The restores are numbered by call: the first is the inference restore, the second the recordings restore (it runs last).
+    counter = tmp_path / 'calls'
+    head = f'#!/bin/sh\nn=$(cat {counter} 2>/dev/null || echo 0); echo $((n+1)) > {counter}\n'
+    variants = {
+        # The recordings restore commits nothing: its input is cut after three lines, no COMMIT.
+        'recordings_error': head + f'case $n in 1) head -n 3 | {real} "$@"; exit 1;; esac\nexec {real} "$@"\n',
+        # Every restore hangs: the inference half fails at its own bound and the recordings half is never started.
+        'hang': '#!/bin/sh\nexec sleep 60\n',
+        # The inference restore is slow (2 s) but succeeds, then the recordings restore hangs under the DEFAULT 30 s limit:
+        # the recordings budget ends it and nothing it left behind holds the hook.
+        'recordings_hang': head + f'case $n in 0) sleep 2;; 1) exec sleep 60;; esac\nexec {real} "$@"\n'}
     for name, body in variants.items():
         (wrappers / name).mkdir(parents=True)
         (wrappers / name / 'iptables-restore').write_text(body)
         (wrappers / name / 'iptables-restore').chmod(0o755)
     for name in variants:
-        marker.unlink(missing_ok=True)
         counter.unlink(missing_ok=True)
         limits = 'DEEDKIT_RECORDINGS_TIMEOUT=3' if name == 'recordings_hang' else 'DEEDKIT_STEP_TIMEOUT=2'
         script = (f'DEEDKIT_RAW_STATE={state} sh {first}/after.init start; iptables-save -t raw > {tmp_path}/{name}.before; '
@@ -635,21 +635,23 @@ def test_an_injected_failure_or_hang_keeps_the_previous_complete_recordings_chai
             # The child's own command limit and the outer budget are the same value: either one ends the hang first.
             assert '100.101.102.104/32' in after and record['reason'] in ('hook_recordings_124', 'restore_recordings_v4'), (record, after)
             continue
-        if name == 'error_first':
-            # The recordings failure did not skip the inference half: the new mini address is loaded, the reason recorded.
+        if name == 'recordings_error':
+            # The inference half loaded first and stays; the recordings failure is the recorded reason.
             assert '100.101.102.104/32' in after and record['reason'] == 'restore_recordings_v4', (record, after)
         else:
             assert '100.101.102.104' not in after and record['reason'].startswith('restore'), (record, after)
 
 
 # spec: ANYM-712
-def test_the_hook_runs_the_recordings_half_first_so_either_half_failing_never_skips_the_other():
+def test_the_hook_runs_the_recordings_half_last_so_it_can_never_delay_or_break_the_inference_half():
     text = hook_text()
     step = text[text.index('\nstep() {\n'):]
-    assert step.index('sh "$0" recordings') < step.index('iptables-restore') < step.index('record true ok')
-    # A recordings failure is recorded after the inference half has been loaded; the inference `fail` exits only after
-    # the recordings half has run.
+    # The inference restore and both of its hooks run exactly as before, then the bounded recordings child, then the record.
+    order = [step.index(marker) for marker in ('iptables-restore', 'ensure iptables', 'ensure ip6tables', 'sh "$0" recordings', 'record true ok')]
+    assert order == sorted(order)
     assert 'REC_FAIL=restore_recordings_v4' in text and 'REC_FAIL=hook_recordings_v4' in text and 'REC_FAIL=hook_recordings_v6' in text
+    # Nothing of the recordings half is before the inference commands inside step().
+    assert 'recordings' not in step[:step.index('ensure ip6tables')]
 
 
 def listener():
