@@ -13,14 +13,15 @@
 #   3 local pg_dump of each database (the only "backup" of this lite path: a cheap rollback for a bad migration).
 #     One dump per database is pinned (dump/<name>/pinned/): the one taken before the last successful update, or
 #     before the very first run; it never rotates. The other dumps rotate, newest KEEP kept.
-#     A target SHA whose update failed is skipped (no retry, no new dump) until a newer one appears.
+#     A target SHA whose update failed is skipped (no retry, no new dump) until a newer one appears, or for
+#     DEEDKIT_RETRY_DAYS (default 7); delete <dumpdir>/failed-sha to retry at once.
 #   4 check out the target   5 build images   6 migrate + re-apply role SQL   7 docker compose up -d
 #   8 wait for health.  Exactly one summary line per run goes to the log.
 #
 # Settings (environment, or private/personal-update.env next to this script):
 #   DEEDKIT_TRACK=main|tag  DEEDKIT_REMOTE=origin  DEEDKIT_DUMP_DIR=/var/backups/deedkit-local
 #   DEEDKIT_DUMP_KEEP=3  DEEDKIT_UPDATE_LOG=/var/log/deedkit-update.log  DEEDKIT_HEALTH_WAIT=180
-#   DEEDKIT_MIN_FREE_MB=2048
+#   DEEDKIT_MIN_FREE_MB=2048  DEEDKIT_RETRY_DAYS=7
 # Rollback after a bad update: git checkout <from-sha>; rebuild; docker compose up -d. If a migration ran,
 # restore the matching dump first (pg_restore into a fresh database; see the log line for the dump path).
 set -uo pipefail
@@ -36,7 +37,7 @@ main() {
   TRACK=${DEEDKIT_TRACK:-main}; REMOTE=${DEEDKIT_REMOTE:-origin}
   DUMPS=${DEEDKIT_DUMP_DIR:-/var/backups/deedkit-local}; KEEP=${DEEDKIT_DUMP_KEEP:-3}
   LOG=${DEEDKIT_UPDATE_LOG:-/var/log/deedkit-update.log}; WAIT=${DEEDKIT_HEALTH_WAIT:-180}
-  MIN_MB=${DEEDKIT_MIN_FREE_MB:-2048}
+  MIN_MB=${DEEDKIT_MIN_FREE_MB:-2048}; RETRY=${DEEDKIT_RETRY_DAYS:-7}
   FROM=unknown; TO=unknown; SCHEMA=-; DUMPED=-; ATTEMPT=0; DUMPFILES=()
   mkdir -p -m 700 "$DUMPS" "$(dirname "$LOG")" 2>/dev/null
   ERR=$DUMPS/last-error.log   # output of the failing command of the latest update attempt
@@ -70,8 +71,9 @@ main() {
     [ "$TO" != unknown ] || { uptodate_check "no newer origin/main commit with green CI among the newest 20"; return $?; }
   fi
   # An update to this SHA already failed: do not retry it (nor take another dump) until a newer SHA appears.
-  if [ -r "$DUMPS/failed-sha" ] && [ "$(cat "$DUMPS/failed-sha")" = "$TO" ]; then
-    uptodate_check "target ${TO:0:12} failed on an earlier run (details in $ERR); skipped until a newer one appears" skipped; return $?
+  if [ -n "$(find "$DUMPS/failed-sha" -mtime -"$RETRY" 2>/dev/null)" ] \
+     && git merge-base --is-ancestor "$TO" "$(cat "$DUMPS/failed-sha")" 2>/dev/null; then
+    uptodate_check "target ${TO:0:12} failed on an earlier run (details in $ERR); skipped until a newer one appears, or ${RETRY} days, or delete $DUMPS/failed-sha" skipped; return $?
   fi
   : > "$ERR" 2>/dev/null
   local free; free=$(df -Pm "$DUMPS" | awk 'NR==2{print $4}')
@@ -94,7 +96,7 @@ main() {
   build_all "$msg" "$gw" "$cal" || { revert; say failed "image build failed; old containers untouched"; return 1; }
 
   # 6. migrations and roles run on the new image while the old containers still serve
-  # A failure up to here reverts the checkout to the old commit, so the next run tries again.
+  # A failure up to here reverts the checkout to the old commit and marks the target as failed (see the header).
   if [ -n "$msg" ]; then migrate_messaging || { revert; return 1; }; fi
   if [ -n "$cal" ]; then migrate_calendar || { revert; return 1; }; fi
 
@@ -158,7 +160,7 @@ dump() {  # dump <name> "<compose -f args>" <service> <user> <db>
   mv "$out.partial" "$out"; DUMPED=$dir; DUMPFILES+=("$name:$out")
   # the first dump ever is the pinned one until an update succeeds
   mkdir -p -m 700 "$dir/pinned"
-  [ -n "$(find "$dir/pinned" -name '*.dump' | head -n 1)" ] || ln "$out" "$dir/pinned/" 2>/dev/null || cp -p "$out" "$dir/pinned/"
+  [ -n "$(find "$dir/pinned" -name '*.dump' | head -n 1)" ] || pin_file "$out" "$dir/pinned"
   # rotate the others: newest $KEEP stay (a pinned dump is a hard link, so it survives rotation)
   ls -1t "$dir"/*.dump | tail -n +"$((KEEP + 1))" | while read -r old; do rm -f "$old"; done
 }
@@ -167,9 +169,16 @@ pin_success() {  # after a successful update the dumps taken before it become th
   local e name out dir
   for e in "${DUMPFILES[@]}"; do
     name=${e%%:*}; out=${e#*:}; dir=$DUMPS/$name/pinned
-    find "$dir" -name '*.dump' -delete 2>/dev/null
-    ln "$out" "$dir/" 2>/dev/null || cp -p "$out" "$dir/"
+    pin_file "$out" "$dir"
   done
+}
+
+pin_file() {  # pin_file <dump> <pinned dir>: the new pin is complete before the old one is removed
+  local out=$1 dir=$2
+  rm -f "$dir/.new"
+  { ln "$out" "$dir/.new" 2>/dev/null || cp -p "$out" "$dir/.new"; } || { rm -f "$dir/.new"; return 1; }
+  find "$dir" -name '*.dump' -delete 2>/dev/null
+  mv "$dir/.new" "$dir/$(basename "$out")"
 }
 
 build_all() {
