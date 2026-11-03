@@ -11,13 +11,13 @@ CONVERSATION_FIELDS = ('body','kind','is_service','display_text','position','ord
     'media_duration_seconds','provider_id','timestamp_precision','first_observed_at_basis',
     'ordering','display_text_truncated')
 FILE_FIELDS = ('attachment_id','id','message_id','account','chat','revision','sha256','mime',
-    'bytes','display_name','download_status','extraction_status','enrichment_status',
+    'bytes','display_name','download_status','extraction_status','extraction_quality','enrichment_status',
     'truncated','error_code','title','document_type','snippet','match_type',
     'matched_content','media_class','match_sources','message_context','excerpt_source','transcript_ready','text_excerpt','processing_profile','error_detail','attempts','next_due')
 
 
 TRANSCRIPT_BODY_CHARS = 2000
-LEAN_FILE_FIELDS = ('id','display_name','mime','bytes','download_status','extraction_status','error_code','transcript_ready','text_excerpt')
+LEAN_FILE_FIELDS = ('id','display_name','mime','bytes','download_status','extraction_status','extraction_quality','error_code','transcript_ready','text_excerpt')
 
 
 def options(method, arguments):
@@ -486,7 +486,7 @@ def transcript(method, result):
 
 FILE_TEXT_KEYS=('text','content','offset','next_offset','content_chars','truncated','extraction_status',
     'enrichment_status','download_status','empty_reason','empty_reason_detail','failure_reason','next_action',
-    'message_id','mime','display_name','model_generated','notice')
+    'message_id','mime','display_name','model_generated','notice','extraction_quality','quality_notice')
 PROVENANCE_KEYS=('attachment_id','message_id','revision','content','extractor','model','provider','processor_version','sha256')
 
 

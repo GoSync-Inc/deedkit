@@ -6,10 +6,11 @@ Only this module and the standard library are imported in the parser child.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import io
 import json
+import math
 import os
 import posixpath
 from pathlib import Path
@@ -33,6 +34,13 @@ MAX_IMAGE_PIXELS = 20_000_000
 EXTRACTION_TIMEOUT = 40
 MAX_RESULT_BYTES = MAX_TEXT_CHARS * 12 + 4 * 1024**2
 OCR_LANGUAGES = 'eng+rus'
+IMAGE_OCR_EXTRACTOR = 'tesseract-eng-rus-v1'
+# ANYM-669: mean word confidence (0-100) below which image OCR text is probably noise. The constant sits between the
+# clean fixtures (>= 80) and the noise/rotated ones (<= 50) of tests/test_ocr_quality.py.
+OCR_LOW_CONFIDENCE = 60
+MAX_TSV_BYTES = 16 * 1024**2
+TSV_COLUMNS = ['level', 'page_num', 'block_num', 'par_num', 'line_num', 'word_num', 'left', 'top', 'width', 'height',
+               'conf', 'text']
 PROCESSOR_VERSION = 'bounded-v3'
 MAX_PDF_PAGES = 100
 MAX_OCR_PAGES = 5
@@ -52,7 +60,8 @@ class Extraction:
 def valid_metadata(value):
     if not isinstance(value, dict) or set(value) - {
             'pages_total', 'pages_processed', 'ocr_pages', 'ocr_attempts', 'ocr_pages_limit', 'pdf_page_limit', 'page_spans',
-            'text_char_limit', 'sheet_spans', 'cell_spans', 'sheets_total', 'sheets_processed', 'provenance_truncated'}:
+            'text_char_limit', 'sheet_spans', 'cell_spans', 'sheets_total', 'sheets_processed', 'provenance_truncated',
+            'ocr_words', 'ocr_confidence'}:
         return False
     for key, item in value.items():
         if key == 'page_spans':
@@ -89,9 +98,66 @@ def valid_metadata(value):
         elif key == 'provenance_truncated':
             if type(item) is not bool:
                 return False
+        elif key == 'ocr_confidence':
+            if type(item) is not int or not 0 <= item <= 100:
+                return False
         elif type(item) is not int or not 0 <= item <= MAX_TEXT_CHARS:
             return False
     return True
+
+
+def ocr_quality(extractor, metadata):
+    """ANYM-669, derived at read time and never stored: `low` or `ok` from the image OCR's mean word confidence,
+    `unmeasured` for an image OCR row without the count (extracted before this field, or an unusable TSV), None for
+    text that did not come from image OCR and for a photo with no recognized words. `ok` means the engine was
+    confident, not that the text is correct."""
+    if extractor != IMAGE_OCR_EXTRACTOR:
+        return None
+    metadata = metadata if isinstance(metadata, dict) else {}
+    words = metadata.get('ocr_words')
+    if type(words) is not int:
+        return 'unmeasured'
+    if words == 0:
+        return None
+    confidence = metadata.get('ocr_confidence')
+    if type(confidence) is not int:
+        return 'unmeasured'
+    return 'low' if confidence < OCR_LOW_CONFIDENCE else 'ok'
+
+
+def _ocr_measure(path):
+    """The word count and mean word confidence of Tesseract's TSV, or {} when it is missing, empty or unparseable:
+    a measurement never fails or changes the extraction. A word is a row with confidence >= 0 and a non-empty text."""
+    try:
+        if not path.is_file() or path.stat().st_size > MAX_TSV_BYTES:
+            return {}
+        lines = path.read_bytes().decode('utf-8').split('\n')
+    except (OSError, UnicodeDecodeError):
+        return {}
+    if lines[0].rstrip('\r').split('\t') != TSV_COLUMNS:
+        return {}
+    words = 0
+    total = 0.0
+    for line in lines[1:]:
+        line = line.rstrip('\r')
+        if not line:
+            continue
+        cells = line.split('\t', len(TSV_COLUMNS) - 1)
+        if len(cells) < len(TSV_COLUMNS) - 1:
+            return {}
+        try:
+            confidence = float(cells[10])
+        except ValueError:
+            return {}
+        if not math.isfinite(confidence):
+            return {}
+        if confidence >= 0 and len(cells) == len(TSV_COLUMNS) and cells[11].strip():
+            words += 1
+            total += confidence
+    measured = {'ocr_words': min(words, MAX_TEXT_CHARS)}
+    if words:
+        measured['ocr_confidence'] = max(0, min(100, round(total / words)))
+    return measured
 
 
 def extraction_profile(mime, filename):
@@ -494,9 +560,10 @@ def _native(data, kind, text_char_limit=MAX_TEXT_CHARS):
                     return Extraction('unsupported', error_code=error.code)
                 raise
         else:
+            # ANYM-669: the TSV (per-word confidence) comes from the same run; the text is the txt output as before.
             command = ['tesseract', str(source), str(root / 'output'), '-l', OCR_LANGUAGES,
-                       '--dpi', '150', '--psm', '6']
-            engine = 'tesseract-eng-rus-v1'
+                       '--dpi', '150', '--psm', '6', 'txt', 'tsv']
+            engine = IMAGE_OCR_EXTRACTOR
         try:
             completed = subprocess.run(command, stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, check=False, pass_fds=_resource_fds())
@@ -513,7 +580,8 @@ def _native(data, kind, text_char_limit=MAX_TEXT_CHARS):
         sink.add(text)
         sink.truncated |= output.stat().st_size > len(raw)
         result = sink.result(engine)
-        return result
+        measured = _ocr_measure(root / 'output.tsv')
+        return replace(result, metadata={**result.metadata, **measured}) if measured else result
 
 
 def _extract(data, mime, filename, text_char_limit=MAX_TEXT_CHARS):
