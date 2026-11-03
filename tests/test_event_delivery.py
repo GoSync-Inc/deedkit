@@ -190,6 +190,33 @@ def test_event_items_show_when_they_were_matched_and_delivered(seeded, tmp_path)
         store.get_subscription_events(identity(store), sid)
 
 
+# spec: ANYM-734
+def test_delivered_at_is_unknown_once_retention_removed_the_first_hint_that_covered_the_event(seeded, tmp_path):
+    from messaging_service import subscription_retention
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    token = identity(store)
+    sid = subscription(store, token)
+    rid, _ = receiver(store, token, tmp_path)
+    call(store, token, 'configure_subscription_delivery', sid, 1, rid)
+    ids = []
+    for _ in range(2):
+        ids.append(emit(store))
+        match_subscriptions(store)
+        assert dispatch_hints(store, transport=lambda *a, **k: 204,
+            resolver=lambda *a, **k: ['93.184.216.34'])['delivered'] == 1
+    first, second = ids
+    times = {i['event_id']: i['delivered_at'] for i in store.get_subscription_events(token, sid)['items']}
+    assert times[first] and times[second] and times[first] <= times[second]
+    # Retention removes the oldest finished hint (the one that first covered `first`) and keeps the next one,
+    # which also covers `first`: the answer for `first` becomes unknown, not the later hint's time.
+    with store.pool.connection() as c:
+        row = c.execute('SELECT * FROM subscriptions WHERE id=%s', (sid,)).fetchone()
+        assert subscription_retention._delete_hints(c, row, 1) == 1
+    after = {i['event_id']: i['delivered_at'] for i in store.get_subscription_events(token, sid)['items']}
+    assert after[first] is None and after[second] == times[second]
+
+
 def test_receiver_validation_and_revocation_fail_closed(seeded, tmp_path):
     from messaging_service.event_delivery import validate_endpoint, dispatch_hints
     for endpoint, addresses in [('http://example.com/wake', ['93.184.216.34']),

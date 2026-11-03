@@ -529,11 +529,7 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
             'consumption': 'passive_read_no_ack', 'scope_masked': False, **modules})
     # ANYM-522: a dynamic definition returns only references the key can see now.
     where, args = visible_filter(row, p, 'sm')
-    # ANYM-734: when the matcher matched the event, and when the earliest delivered events hint that covers it
-    # finished (null until one is delivered, or once retention pruned it).
-    events = c.execute('''SELECT e.id,e.kind,e.origin,e.revision,e.created_at,sm.matched_at,
-        (SELECT min(o.finished_at) FROM subscription_outbox o WHERE o.subscription=sm.subscription
-            AND o.kind='events' AND o.state='delivered' AND o.through_position>=e.id) AS delivered_at,''' +
+    events = c.execute('''SELECT e.id,e.kind,e.origin,e.revision,e.created_at,sm.matched_at,''' +
         ('sm.own_send_reply' if dynamic(row) else 'false AS own_send_reply') + ''',
         jsonb_strip_nulls(jsonb_build_object(
             'message',e.snapshot->'message','account',e.snapshot->'account','chat',e.snapshot->'chat',
@@ -551,10 +547,23 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
         (row['id'], after, *args, limit + 1)).fetchall()
     fields = ('message', 'account', 'chat', 'sender', 'provider_id', 'revision', 'sent_at',
         'direction', 'deleted', 'processing', 'metadata', 'reply_evidence', 'send_id', 'error_code', 'status')
+    # ANYM-734: delivered_at is when the earliest delivered events hint covering the event finished. Retention deletes
+    # finished hints as a prefix up to hints_deleted_through: for an event at or below it the first covering hint may be
+    # gone, so the time is unknown (null), never the next hint's. One read per page, no per-row query.
+    delivered = c.execute('''SELECT through_position,finished_at FROM subscription_outbox WHERE subscription=%s
+        AND kind='events' AND state='delivered' AND through_position>=%s''',
+        (row['id'], events[0]['id'])).fetchall() if events else []
+    pruned_through = row.get('hints_deleted_through') or 0
+
+    def delivered_at(event_id):
+        return None if event_id <= pruned_through else min(
+            (hint['finished_at'] for hint in delivered if hint['through_position'] >= event_id and hint['finished_at']),
+            default=None)
+
     items = [{**{key: event['snapshot'][key] for key in fields if key in event['snapshot']},
         'event_id': event['id'], 'kind': event['kind'], 'origin': event['origin'],
         'revision': event['revision'], 'observed_at': event['created_at'],
-        'matched_at': event['matched_at'], 'delivered_at': event['delivered_at'],
+        'matched_at': event['matched_at'], 'delivered_at': delivered_at(event['id']),
         'historical': event['origin'] in ('backfill', 'reconcile'),
         'matching_basis': 'exact_event_revision'} for event in events[:limit]]
     from .subscription_consumption import wake_reason

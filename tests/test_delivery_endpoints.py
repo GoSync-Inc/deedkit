@@ -752,6 +752,41 @@ def test_attempt_log_names_when_its_hint_was_queued_and_admitted(gate, policy):
     assert (gone['hint_created_at'], gone['hint_admitted_at']) == (None, None)
 
 
+# spec: ANYM-734
+def test_attempt_log_times_a_hint_held_by_the_host_budget_until_its_admission(gate, policy, monkeypatch):
+    from datetime import datetime, timedelta
+    store = gate
+    monkeypatch.setenv('DELIVERY_MAX_HINTS_PER_HOST_PER_HOUR', '1')
+    tokens = {name: identity(store, name) for name in ('endpoint-one', 'endpoint-two')}
+    endpoints = {'endpoint-one': register(store, tokens['endpoint-one'])['endpoint_id'],
+        'endpoint-two': register(store, tokens['endpoint-two'], secret=OTHER_SECRET)['endpoint_id']}
+    with store.pool.connection() as c:
+        c.execute("UPDATE delivery_endpoint_tests SET state='cancelled'")
+    for name, token in tokens.items():
+        store.create_subscription(token, ['telegram-demo-chat'], delivery={'endpoint_id': endpoints[name]})
+    emit(store)
+    match_subscriptions(store)
+    # One hint is admitted; the other waits for the host's hourly slot and has no admission yet.
+    stats = dispatch_hints(store, transport=lambda *a, **k: 204, resolver=PUBLIC)
+    assert (stats['delivered'], stats['deferred']) == (1, 1)
+    with store.pool.connection() as c:
+        c.execute("UPDATE subscription_outbox SET admitted_at=admitted_at-interval '61 minutes' WHERE admitted_at IS NOT NULL")
+        # The held hint has waited a minute for its slot (distinct, deterministic times).
+        c.execute("UPDATE subscription_outbox SET created_at=created_at-interval '1 minute' WHERE admitted_at IS NULL")
+    due_now(store)
+    assert dispatch_hints(store, transport=lambda *a, **k: 204, resolver=PUBLIC)['delivered'] == 1
+    gaps = {}
+    for name, token in tokens.items():
+        [item] = store.list_delivery_attempts(token, endpoints[name])['items']
+        with store.pool.connection() as c:
+            hint = c.execute('SELECT created_at,admitted_at FROM subscription_outbox WHERE id=%s', (item['hint_id'],)).fetchone()
+        created, admitted, at = (datetime.fromisoformat(item[key]) for key in ('hint_created_at', 'hint_admitted_at', 'at'))
+        assert (created, admitted) == (hint['created_at'], hint['admitted_at']) and created <= admitted <= at
+        gaps[name] = admitted - created
+    # The held hint was admitted at least a minute after it was queued; the other one at once.
+    assert max(gaps.values()) >= timedelta(minutes=1) > min(gaps.values())
+
+
 # spec: ANYM-520
 def test_attempt_log_lists_each_attempt_with_its_status_or_error_code_and_nothing_else(gate, policy):
     from messaging_service.delivery_endpoints import EgressNotSent

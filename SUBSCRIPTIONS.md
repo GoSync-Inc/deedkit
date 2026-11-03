@@ -143,23 +143,29 @@ stages in order, and `get_subscription_events` shows where it was at each:
 | The provider sends it | `sent_at` | The provider's own time |
 | The collector captures it and the journal commits it | `observed_at` | Spool drained every 250 ms; up to 30 s more under a burst (COLLECTORS.md) |
 | The matcher matches it | `matched_at` | Polls every 2 s |
-| The hint policy releases the hint | `get_subscription` `delivery.held_reason`, `next_hint_at` | None without a policy |
+| The hint policy releases the hint | `get_subscription` `delivery.held_reason`, `next_hint_at` | None without a policy; the holds below apply with or without one |
 | The dispatcher posts it | `delivered_at` (first delivered hint covering the event) | A lane polls every 2 s; the POST times out after 5 s |
 
-`delivered_at` is null until a hint covering the event is delivered, and after
-retention pruned that hint. A test hint or a dead-lettered one never sets it. What can
-add more than a few seconds, each visible in `get_subscription`:
+`delivered_at` is null until a hint covering the event is delivered. It is also null for
+an event at or below `hints_deleted_through`, because retention deleted finished hints
+and the first one that covered it may be gone (it never shows a later hint's time instead). A test hint or a dead-lettered one never sets it.
+What can add more than a few seconds:
 
-- `debounce_s`, `batch_window_s`, `batch_count`: the hint waits for its window; `max_wait_s`
-  defaults to 300 s (or `debounce_s` if larger) whenever one of them is set.
-- Quiet hours hold a due hint to the window end.
-- The hourly budget (20 hints per key, `SUBSCRIPTION_MAX_HINTS_PER_HOUR`) and the per-host cap
-  (100 per hour) hold a hint to the next slot (`held_reason: budget`).
-- A key with 32 queued hints holds the next for a minute; one attempt per key is in flight.
-- A failed attempt retries after 2, 4, 8, 16, 32 and 64 s, or after the receiver's `Retry-After`
-  (up to an hour); `list_delivery_attempts` shows each attempt with `hint_created_at`,
-  `hint_admitted_at` and `at`, so the wait before the first attempt and between attempts is
-  readable. Attempts are kept 7 days.
+- Hint policy, visible in `get_subscription` as `delivery.held_reason` and `next_hint_at`:
+  `debounce_s` waits for a quiet gap, `batch_window_s` for its window, `batch_count` for
+  its count; `max_wait_s` caps `debounce_s` and `batch_count` and defaults to 300 s (or
+  `debounce_s` if larger) whenever either is set. Quiet hours hold a due hint to the window end.
+  The policy's hourly budget (20 hints per key, `SUBSCRIPTION_MAX_HINTS_PER_HOUR`) holds it
+  to the next slot, and a self-service key with 32 queued hints holds the next one for a
+  minute; both read `held_reason: budget`.
+- Dispatcher admission, with or without a policy: the first POST of a hint takes one slot of the
+  key's rolling hour (the same 20) and, for a self-service endpoint, one of its host's
+  (100 per hour, `DELIVERY_MAX_HINTS_PER_HOST_PER_HOUR`). These holds keep the hint `pending` in the outbox and are not in `get_subscription`
+  until it is admitted: `list_delivery_attempts` then shows `hint_created_at` and
+  `hint_admitted_at`, the wait.
+- Retries after a failed attempt: 2, 4, 8, 16, 32, 64 and 128 s, or the receiver's
+  `Retry-After` (up to an hour), over at most 8 attempts; each attempt is a row with `at`
+  and `latency_ms`. Attempts are kept 7 days.
 
 ## Schema 32: explicit consumption and registered hints
 
