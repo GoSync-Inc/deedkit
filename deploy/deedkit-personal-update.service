@@ -8,7 +8,6 @@ After=network-online.target docker.service
 Type=oneshot
 User=root
 Group=root
-UMask=0077
 WorkingDirectory=/opt/deedkit
 ExecStart=/opt/deedkit/deploy/personal-update.sh
 TimeoutStartSec=2h

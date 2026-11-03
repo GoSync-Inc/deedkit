@@ -21,7 +21,7 @@
 # Rollback after a bad update: git checkout <from-sha>; rebuild; docker compose up -d. If a migration ran,
 # restore the matching dump first (pg_restore into a fresh database; see the log line for the dump path).
 set -uo pipefail
-umask 077
+# No global umask: git checkout and docker build must keep files readable (images run as uid 10001).
 
 main() {
   local here repo conf
@@ -81,11 +81,12 @@ main() {
   # 4-5. new code, new images; a failed build restores the old checkout and touches no container
   git checkout --quiet --detach "$TO" || { say failed "checkout of target failed"; return 1; }
   cd "$repo/deploy" || return 1
-  build_all "$msg" "$gw" "$cal" || { git checkout --quiet --detach "$FROM"; say failed "image build failed; old containers untouched"; return 1; }
+  build_all "$msg" "$gw" "$cal" || { revert; say failed "image build failed; old containers untouched"; return 1; }
 
   # 6. migrations and roles run on the new image while the old containers still serve
-  if [ -n "$msg" ]; then migrate_messaging || return 1; fi
-  if [ -n "$cal" ]; then migrate_calendar || return 1; fi
+  # A failure up to here reverts the checkout to the old commit, so the next run tries again.
+  if [ -n "$msg" ]; then migrate_messaging || { revert; return 1; }; fi
+  if [ -n "$cal" ]; then migrate_calendar || { revert; return 1; }; fi
 
   # 7-8. replace containers, then wait for health (collectors restart: their provider sessions reconnect)
   [ -z "$msg" ] || docker compose up -d >/dev/null || { say failed "docker compose up failed (messaging); from=$FROM"; return 1; }
@@ -96,6 +97,8 @@ main() {
   [ -z "$gw" ] || wait_healthy gateway -f compose.gateway.yaml || return 1
   say ok "updated"
 }
+
+revert() { git checkout --quiet --detach "$FROM"; }
 
 say() {  # say <result> <detail>: the one summary line
   printf '%s result=%s from=%.12s to=%.12s schema=%s dumps=%s %s\n' "$(date -u +%FT%TZ)" "$1" "$FROM" "$TO" "$SCHEMA" "$DUMPED" "$2" | tee -a "$LOG" >&2
@@ -122,7 +125,7 @@ dump() {  # dump <name> "<compose -f args>" <service> <user> <db>
   dir=$DUMPS/$name; mkdir -p -m 700 "$dir"
   out=$dir/$name-$(date -u +%Y%m%dT%H%M%SZ)-${FROM:0:12}.dump
   # shellcheck disable=SC2086
-  if ! docker compose $args exec -T "$svc" pg_dump -U "$user" -d "$db" -Fc > "$out.partial" 2>/dev/null || [ ! -s "$out.partial" ] \
+  if ! (umask 077; docker compose $args exec -T "$svc" pg_dump -U "$user" -d "$db" -Fc > "$out.partial" 2>/dev/null) || [ ! -s "$out.partial" ] \
      || ! docker compose $args exec -T "$svc" pg_restore --list < "$out.partial" >/dev/null 2>&1; then
     rm -f "$out.partial"; say failed "pg_dump of $name failed; nothing changed"; return 1
   fi
