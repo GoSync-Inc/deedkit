@@ -592,6 +592,115 @@ def test_publication_verifies_against_records_and_continues_building_on_a_mismat
         store.close()
 
 
+NESTED = '{"a":' * 12000 + '1' + '}' * 12000  # valid-looking JSON line, far deeper than the parser's recursion limit
+
+
+# spec: ANYM-725
+def test_deeply_nested_json_text_is_ordinary_text_in_observe_and_in_the_migration(tmp_path):
+    path, doc = fixture(tmp_path)
+    store = open_store(path)
+    try:
+        store.discover(OMI_A, [{'id': 'conv-n', 'title': 'T'}], None, 1)
+        store.observe(OMI_A, 'conv-n', {'id': 'conv-n', 'title': 'T'}, {'summary': ('available', NESTED, None)}, 2)
+        assert store.record(OMI_A, 'conv-n')['revision'] == 1 and len(store.events(0, 10)) == 1  # the observation committed whole
+        assert store.index_state()['skipped'] == 0 and [h['provider_recording_id'] for h in store.search(OMI_A, '"a"', 5)] == ['conv-n']
+    finally:
+        store.close()
+    other = tmp_path / 'upgrade'
+    other.mkdir(mode=0o700)
+    path2, _ = fixture(other)
+    metadata, parts, _, _ = stored('conv-x', 1)
+    parts['summary'] = {**parts['summary'], 'text': NESTED}
+    legacy_archive(other, 5, extra=[(json.dumps(metadata), json.dumps(parts))])
+    store = open_store(path2)
+    try:
+        finish(store)
+        assert store.index_state()['state'] == 'ready' and store.index_state()['skipped'] == 0 and store.index_state()['built'] == 6
+    finally:
+        store.close()
+
+
+# spec: ANYM-725
+def test_any_failure_deriving_one_record_is_a_counted_skip_and_never_loses_an_observation(tmp_path, monkeypatch):
+    from deedkit_recordings import archive_store
+    path, doc = fixture(tmp_path)
+    store = open_store(path)
+    try:
+        store.discover(OMI_A, [{'id': 'conv-n', 'title': 'T'}], None, 1)
+        monkeypatch.setattr(archive_store, 'plain_text', lambda *args: (_ for _ in ()).throw(RuntimeError('boom')))
+        store.observe(OMI_A, 'conv-n', {'id': 'conv-n', 'title': 'T'}, {'summary': ('available', 'kept words', None)}, 2)
+        monkeypatch.undo()
+        assert store.record(OMI_A, 'conv-n')['parts']['summary']['text'] == 'kept words' and len(store.events(0, 10)) == 1
+        assert store.index_state()['skipped'] == 1 and store.search(OMI_A, '"kept"', 5) == []
+        store.observe(OMI_A, 'conv-n', {'id': 'conv-n', 'title': 'T'}, {'summary': ('available', 'kept words again', None)}, 3)
+        assert store.index_state()['skipped'] == 0 and store.search(OMI_A, '"kept"', 5)  # the next write heals it
+    finally:
+        store.close()
+
+
+# spec: ANYM-725
+def test_publication_catches_rows_changed_by_a_writer_that_does_not_know_the_index(tmp_path):
+    path, doc = fixture(tmp_path)
+    file = legacy_archive(tmp_path, 25)
+    store = open_store(path)
+    try:
+        assert store.run('index_step', 1) == 'built' and store.index_state()['cursor'] == 25  # everything is built, nothing published
+        with sqlite3.connect(file) as old_writer:  # a schema-3 package resumes: it rewrites authoritative fields only
+            old_writer.execute("UPDATE records SET revision=0, metadata=json_set(metadata,'$.title','newtitle') WHERE provider_id='conv-00003'")
+            old_writer.execute("UPDATE records SET parts=json_set(parts,'$.transcript.text',"
+                               "'{\"start\":0,\"end\":1,\"speaker\":\"Zed\",\"text\":\"zebra words\"}') WHERE provider_id='conv-00004'")
+        outcomes = []
+        while not outcomes or outcomes[-1] != 'idle':
+            outcomes.append(store.run('index_step', 1))
+        assert outcomes.index('built') < outcomes.index('published'), outcomes
+        assert [h['provider_recording_id'] for h in store.search(OMI_A, '"newtitle"', 5)] == ['conv-00003']
+        assert [h['provider_recording_id'] for h in store.search(OMI_A, '"zebra"', 5)] == ['conv-00004']
+        assert store.search(OMI_A, '"alpha4"', 5) == []
+        assert [h['provider_recording_id'] for h in store.search(OMI_A, None, 5, speaker='zed')] == ['conv-00004']
+    finally:
+        store.close()
+
+
+# spec: ANYM-725
+def test_newest_ordering_waits_for_the_published_index(tmp_path, monkeypatch):
+    monkeypatch.setattr('deedkit_recordings.archive_store.INDEX_BATCH_ROWS', 10)
+    path, doc = fixture(tmp_path)
+    legacy_archive(tmp_path, 40)
+    store = open_store(path)
+    try:
+        store.run('index_step', 1)
+        assert store.search(OMI_A, '"alpha1"', 5, order='relevance')
+        with pytest.raises(Failure, match='index_building'):
+            store.search(OMI_A, '"alpha1"', 5, order='newest')  # created_at is complete only after publication
+        finish(store)
+        assert store.search(OMI_A, '"alpha1"', 5, order='newest')
+    finally:
+        store.close()
+
+
+# spec: ANYM-725
+def test_batch_and_metadata_bounds_count_utf8_bytes_not_characters(tmp_path, monkeypatch):
+    monkeypatch.setattr('deedkit_recordings.archive_store.INDEX_BATCH_BYTES', 2_000_000)
+    path, doc = fixture(tmp_path)
+    extra = []
+    for number in range(4):  # 400,000 characters = 1.2 MB each: four fit in 2 MB by characters, one at a time by bytes
+        metadata, parts, _, _ = stored(f'conv-{number:05d}', number)
+        parts['summary'] = {**parts['summary'], 'text': '语' * 400_000}
+        extra.append((json.dumps(metadata), json.dumps(parts, ensure_ascii=False)))
+    wide, parts, _, _ = stored('conv-00004', 4)
+    wide['title'] = '语' * 30_000  # 30,000 characters = 90,000 bytes: over the 64 KiB metadata bound
+    extra.append((json.dumps(wide, ensure_ascii=False), json.dumps(parts)))
+    legacy_archive(tmp_path, 0, extra=extra)
+    store = open_store(path)
+    try:
+        assert store.run('index_step', 1) == 'built' and store.index_state()['cursor'] == 1
+        finish(store)
+        state = store.index_state()
+        assert state['state'] == 'ready' and state['built'] == 4 and state['skipped'] == 1
+    finally:
+        store.close()
+
+
 # spec: ANYM-725
 def test_new_archive_starts_at_schema4_and_runs_the_build_inside_collector_passes(tmp_path):
     path, doc = fixture(tmp_path)

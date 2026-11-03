@@ -27,11 +27,13 @@ SCHEMA_VERSION = 4
 INDEX_BATCH_BYTES = 4 * 1024 ** 2  # stored bytes one build batch reads and indexes (at least one record)
 INDEX_BATCH_ROWS = 500
 INDEX_STEP_SECONDS = 10  # one collector pass spends at most this long building the schema-4 index
-MAX_METADATA = 64 * 1024  # a stored metadata document above this is skipped by the index build, never parsed
+MAX_METADATA = 64 * 1024  # bytes: a stored metadata document above this is skipped by the index build, never parsed
+MAX_PARTS = 16 * 1024 ** 2  # bytes: stored parts above this (the 2 MiB text limit, JSON-escaped, is far below) are skipped
 MAX_LABEL = 64
 MAX_LABELS = 256
 MAX_RESTARTS = 3
 HIT_SPEAKERS = 8
+BYTES = 'length(CAST(metadata AS BLOB))+length(CAST(parts AS BLOB))'  # stored bytes of a record (SQLite length(TEXT) counts characters)
 # Schema 4 (ANYM-725): derived tables only. `texts4` holds plain text (no JSON keys, no labels), `speakers` the provider
 # labels, `index_rows` what each indexed row was built from (verified against `records` before publication), and
 # `records.created_at`/`duration_s` the normalized filter values. Records, refs, revisions, parts and events are untouched.
@@ -41,6 +43,7 @@ CREATE TABLE IF NOT EXISTS speakers(ref TEXT NOT NULL, label TEXT NOT NULL, disp
 CREATE INDEX IF NOT EXISTS speakers_label ON speakers(label, ref);
 CREATE TABLE IF NOT EXISTS index_rows(ref TEXT PRIMARY KEY, revision INTEGER NOT NULL, digest TEXT NOT NULL) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS index_skips(ref TEXT PRIMARY KEY) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS index_dirty(ref TEXT PRIMARY KEY) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS records_created ON records(namespace, created_at);
 '''
 SCHEMA = '''
@@ -117,6 +120,12 @@ def upgrade_v3(db):
 UPGRADE_V4 = '''
 BEGIN IMMEDIATE;
 {alters}{index_tables}INSERT OR REPLACE INTO meta(key,value) VALUES('index_state','building');
+-- Whatever writes metadata, parts or revision while the index builds (this package, or an older one that does not know
+-- the index) marks the record; the build rebuilds every marked record behind the cursor before it may publish.
+CREATE TRIGGER IF NOT EXISTS records_dirty_update AFTER UPDATE OF metadata, parts, revision ON records
+ WHEN (SELECT value FROM meta WHERE key='index_state')='building' BEGIN INSERT OR IGNORE INTO index_dirty(ref) VALUES(NEW.ref); END;
+CREATE TRIGGER IF NOT EXISTS records_dirty_insert AFTER INSERT ON records
+ WHEN (SELECT value FROM meta WHERE key='index_state')='building' BEGIN INSERT OR IGNORE INTO index_dirty(ref) VALUES(NEW.ref); END;
 INSERT OR IGNORE INTO meta(key,value) VALUES('index_cursor',0);
 INSERT OR REPLACE INTO meta(key,value) VALUES('index_restarts',0);
 COMMIT;
@@ -226,8 +235,8 @@ def plain_text(kind, text):
         if line.startswith('{'):
             try:
                 row = json.loads(line)
-            except ValueError:
-                row = None
+            except (ValueError, RecursionError):
+                row = None  # not an utterance object (or too deeply nested to be one): ordinary text
         if kind == 'transcript':
             body = row.get('text', row.get('content')) if isinstance(row, dict) and set(row) <= TRANSCRIPT_KEYS else None
         else:
@@ -543,21 +552,35 @@ class Store:
         if state == 'ready' or rid <= cursor:
             self.index_record(db, ns, rid, ref, metadata, parts, revision)
 
+    @staticmethod
+    def derive_index(metadata, parts):
+        """Everything the new index stores for one record, derived without touching the database; None when this record
+        cannot be derived (any failure: the caller counts it as skipped, so one record never stops a write or the build)."""
+        try:
+            transcript, labels = plain_text('transcript', parts.get('transcript', {}).get('text', ''))
+            summary, _ = plain_text('summary', parts.get('summary', {}).get('text', ''))
+            return {'title': title_of(metadata), 'transcript': transcript, 'summary': summary, 'labels': labels,
+                    'derived': derive_metadata(metadata), 'digest': part_digest(parts)}
+        except Exception:
+            return None
+
     def index_record(self, db, ns, rid, ref, metadata, parts, revision):
         """Replace the new-index rows of one record from its current stored data (idempotent)."""
-        transcript, labels = plain_text('transcript', parts.get('transcript', {}).get('text', ''))
-        summary, _ = plain_text('summary', parts.get('summary', {}).get('text', ''))
-        derived = derive_metadata(metadata)
-        digest = part_digest(parts)
+        found = self.derive_index(metadata, parts)
+        if found is None:
+            self.index_skip(db, rid, ref)
+            return
         db.execute('DELETE FROM texts4 WHERE rowid=?', (rid,))
         db.execute('INSERT INTO texts4(rowid,ref,namespace,title,transcript,summary) VALUES(?,?,?,?,?,?)',
-                   (rid, ref, ns, title_of(metadata), transcript, summary))
+                   (rid, ref, ns, found['title'], found['transcript'], found['summary']))
         db.execute('DELETE FROM speakers WHERE ref=?', (ref,))
-        db.executemany('INSERT OR IGNORE INTO speakers(ref,label,display) VALUES(?,?,?)', [(ref, label.lower(), label) for label in labels])
+        db.executemany('INSERT OR IGNORE INTO speakers(ref,label,display) VALUES(?,?,?)',
+                       [(ref, label.lower(), label) for label in found['labels']])
         db.execute('UPDATE records SET created_at=?,duration_s=?,part_digest=? WHERE ref=?',
-                   (derived['created_at'], derived['duration_s'], digest, ref))
-        db.execute('INSERT OR REPLACE INTO index_rows(ref,revision,digest) VALUES(?,?,?)', (ref, revision, digest))
+                   (found['derived']['created_at'], found['derived']['duration_s'], found['digest'], ref))
+        db.execute('INSERT OR REPLACE INTO index_rows(ref,revision,digest) VALUES(?,?,?)', (ref, revision, found['digest']))
         db.execute('DELETE FROM index_skips WHERE ref=?', (ref,))
+        db.execute('DELETE FROM index_dirty WHERE ref=?', (ref,))
 
     @staticmethod
     def index_skip(db, rid, ref):
@@ -567,10 +590,11 @@ class Store:
         db.execute('DELETE FROM index_rows WHERE ref=?', (ref,))
         db.execute('UPDATE records SET created_at=NULL,duration_s=NULL,part_digest=NULL WHERE ref=?', (ref,))
         db.execute('INSERT OR IGNORE INTO index_skips(ref) VALUES(?)', (ref,))
+        db.execute('DELETE FROM index_dirty WHERE ref=?', (ref,))
 
     def index_row(self, db, row):
         try:
-            if len(row['metadata']) > MAX_METADATA:
+            if len(row['metadata'].encode('utf-8', 'replace')) > MAX_METADATA or len(row['parts'].encode('utf-8', 'replace')) > MAX_PARTS:
                 raise ValueError
             metadata, parts = loads(row['metadata']), loads(row['parts'])
             if not isinstance(metadata, dict) or not isinstance(parts, dict) or any(
@@ -601,7 +625,7 @@ class Store:
     def index_cursor_save(self, db, cursor):
         db.execute("UPDATE meta SET value=? WHERE key='index_cursor'", (cursor,))
 
-    MISMATCH = ('''SELECT r.rowid AS rid, length(r.metadata)+length(r.parts) AS size FROM records r
+    MISMATCH = (f'''SELECT r.rowid AS rid, {BYTES} AS size FROM records r
         LEFT JOIN index_rows i ON i.ref=r.ref
         WHERE NOT EXISTS (SELECT 1 FROM index_skips k WHERE k.ref=r.ref)
           AND (i.ref IS NULL OR i.revision<>r.revision OR i.digest IS NOT r.part_digest) ORDER BY r.rowid LIMIT ?''')
@@ -615,18 +639,26 @@ class Store:
                 return 'idle'
             db.execute('DROP TABLE texts')  # the superseded index; a separate transaction from the publication
             return 'dropped'
-        sizes = db.execute('SELECT rowid, length(metadata)+length(parts) FROM records WHERE rowid>? ORDER BY rowid LIMIT ?',
+        sizes = db.execute(f'SELECT rowid, {BYTES} FROM records WHERE rowid>? ORDER BY rowid LIMIT ?',
                            (cursor, INDEX_BATCH_ROWS)).fetchall()
         if sizes:
             taken = self.index_take(sizes)
             self.index_rows_of(db, taken)
             self.index_cursor_save(db, taken[-1])
             return 'built'
+        # Every record is behind the cursor now. First the records any writer touched while the index was built (the dirty
+        # marks of the triggers: this package's dual write clears its own, an older package's stay), then the rows whose
+        # revision or accepted-part digest differs from `records`: rebuild exactly those, never publish over them.
+        dirty = self.index_take([(row[0], row[1]) for row in db.execute(
+            f'SELECT r.rowid, {BYTES} FROM index_dirty d JOIN records r ON r.ref=d.ref ORDER BY r.rowid LIMIT ?', (INDEX_BATCH_ROWS,))])
+        if dirty:
+            self.index_rows_of(db, dirty)
+            return 'built'
         stale = self.index_take([(row[0], row[1]) for row in db.execute(self.MISMATCH, (INDEX_BATCH_ROWS,))])
         if stale:
-            # A write that skipped the dual write (an older package, a bug): rebuild exactly those rows.
             self.index_rows_of(db, stale)
             return 'built'
+        db.execute('DELETE FROM index_dirty WHERE ref NOT IN (SELECT ref FROM records)')
         records = db.execute('SELECT count(*) FROM records').fetchone()[0]
         built = db.execute('SELECT count(*) FROM index_rows').fetchone()[0]
         skipped = db.execute('SELECT count(*) FROM index_skips').fetchone()[0]
@@ -942,8 +974,8 @@ class Store:
         with self.connection() as db:
             db.execute('BEGIN')  # one snapshot: the index state read below and the query agree across a publication
             state, _ = self.index_mode(db)
-            if state != 'ready' and (filtered or expression is None):
-                raise Failure('index_building', 409)
+            if state != 'ready' and (filtered or expression is None or order == 'newest'):
+                raise Failure('index_building', 409)  # `records.created_at` is complete only once the index is published
             # FTS MATCH narrows by indexed terms; both sides of the join retain
             # the current namespace. Never materialize accepted text for all hits.
             # The order must not depend on other namespaces: bm25() uses statistics of the whole FTS table, so a document
