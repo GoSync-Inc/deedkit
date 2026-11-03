@@ -313,10 +313,12 @@ def backup_archive(settings, destination):
 
 class Store:
     feed_enabled = False  # set by the runtime while the configuration has `event_router` (ANYM-726)
+    feed_handled = None  # process memory of the marker a feed bump reacted to (see archive_feed.inspect)
     clock = staticmethod(time.time)
 
     def __init__(self, settings):
         self.settings, self.lock = settings, None
+        self.feed_handled = {}
         try:
             self.directory = private_directory(settings.directory, create=True)
             self.path = self.directory / 'archive.sqlite'
@@ -904,12 +906,10 @@ class Store:
             if usable_change or body != row['metadata']:
                 self.put_text(db, ns, row['rid'], row['ref'], metadata, parts, revision)
             if usable_change:
-                if self.feed_enabled:
-                    archive_feed.prepare(db, self.directory, self.clock())
-                created = db.execute('INSERT INTO events(event_id,namespace,ref,revision,occurred) VALUES(?,?,?,?,?)',
-                                     (uuid.uuid4().hex, ns, row['ref'], revision, now))
-                if self.feed_enabled:  # the marker reaches the disk before the row commits (ANYM-726)
-                    archive_feed.after_event(db, self.directory, created.lastrowid, self.clock())
+                if self.feed_enabled:  # database work only: a feed problem can never stop text from being archived (ANYM-726)
+                    archive_feed.prepare(db, self.directory, self.clock(), self.feed_handled)
+                db.execute('INSERT INTO events(event_id,namespace,ref,revision,occurred) VALUES(?,?,?,?,?)',
+                           (uuid.uuid4().hex, ns, row['ref'], revision, now))
             db.execute('UPDATE accounts SET last_success=COALESCE(?,last_success),error=?,text_bytes=MAX(0,text_bytes+?) '
                        'WHERE namespace=?',
                 (now if any(o[0] == 'available' for o in observations.values()) else None,
@@ -1065,21 +1065,23 @@ class Store:
         """Start or repair the feed identity and record the access changes the configuration made (one write, only if due)."""
         now = self.clock() if now is None else now
         with self.connection() as db:
-            due = archive_feed.sync_needed(db, self.directory, view, now)
+            due = archive_feed.sync_needed(db, self.directory, view, now, self.feed_handled)
         if due:
-            self.write(lambda db: archive_feed.sync(db, self.directory, view, now))
+            self.write(lambda db: archive_feed.sync(db, self.directory, view, now, self.feed_handled))
 
     def feed_page(self, view, after, limit):
-        self.feed_sync(view)
+        now = self.clock()
+        self.feed_sync(view, now)
         with self.connection() as db:
             db.execute('BEGIN')
-            return archive_feed.page(db, view, after, limit)
+            return archive_feed.page(db, view, after, limit, now)
 
     def feed_head(self, view):
-        self.feed_sync(view)
+        now = self.clock()
+        self.feed_sync(view, now)
         with self.connection() as db:
             db.execute('BEGIN')
-            return archive_feed.head_page(db)
+            return archive_feed.head_page(db, now)
 
     def events(self, after, limit):
         with self.connection() as db:

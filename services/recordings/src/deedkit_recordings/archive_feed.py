@@ -4,8 +4,11 @@ Feed `seq` = incarnation x 10^9 + the offset inside the incarnation's epoch. An 
 (`events.sequence`) that share one incarnation; the epochs are listed in `meta.feed_epochs` as `[[first_sequence, incarnation], ...]`
 (a key/value row: schema 4 stays, schema 5 belongs to ANYM-730). An event keeps the identity it had when it was first
 served, a later bump only gives later events a larger base. A marker file on the archive volume, outside the SQLite file,
-holds `{incarnation, high_water}` and is rewritten and fsynced before every journal commit, so a restored older database
-(or a lost marker) is detected at the next start and can never reuse an identity the router already consumed.
+holds `{incarnation, high_water}`; it is written (and fsynced) only when the feed is served or maintained, before the data it
+covers leaves the process, never inside the transaction that stores recorded text. A restored older database, a lost or
+damaged marker, a marker from a newer incarnation, or a reached offset cap starts a new epoch (`needs_bump`), and the feed
+stays unavailable (`feed_not_ready`) until the wall clock has reached the new incarnation's minute: two restarts inside one
+minute can therefore never hand out the same incarnation twice after anything was published.
 """
 import hashlib
 import json
@@ -32,9 +35,15 @@ def minutes(now):
     return int((now - EPOCH_ZERO) // 60)
 
 
+def capacity(incarnation):
+    """The largest offset an epoch of this incarnation may reach: below 10^9 and with the whole seq at most 2^53-1."""
+    return min(LOCAL_CAP - 1, MAX_SEQ - incarnation * BASE)
+
+
 def safe_ref(value):
-    """The value when it is a valid reference without ':' or '|', else a fixed-length hash of it."""
-    if isinstance(value, str) and REF.fullmatch(value) and ':' not in value:
+    """The identifier itself when it is a valid reference (`[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`), else `h-` and the first 24
+    hex characters of its SHA-256. This encoding is the contract for every consumer that keys on these references."""
+    if isinstance(value, str) and REF.fullmatch(value):
         return value
     return 'h-' + hashlib.sha256(str(value).encode()).hexdigest()[:24]
 
@@ -104,14 +113,9 @@ def local_after(epochs, after, head):
     return head  # ahead of everything this journal knows: nothing to serve
 
 
-def marker_path(directory):
-    return directory / MARKER
-
-
 def read_marker(directory):
-    path = marker_path(directory)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(directory / MARKER, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
     try:
@@ -130,8 +134,7 @@ def read_marker(directory):
 
 
 def write_marker(directory, incarnation, high_water):
-    """Write, fsync, rename and fsync the directory: the marker on disk is never behind a journal row that commits after it."""
-    path = marker_path(directory)
+    """Write, fsync, rename and fsync the directory."""
     temporary = directory / (MARKER + '.tmp')
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     try:
@@ -139,7 +142,7 @@ def write_marker(directory, incarnation, high_water):
         os.fsync(fd)
     finally:
         os.close(fd)
-    os.replace(temporary, path)
+    os.replace(temporary, directory / MARKER)
     folder = os.open(directory, os.O_RDONLY)
     try:
         os.fsync(folder)
@@ -147,69 +150,70 @@ def write_marker(directory, incarnation, high_water):
         os.close(folder)
 
 
-def plan(db, directory, now):
-    """None when the journal's identity is current, else the new incarnation. Raises `sequence_space_exhausted` when the
-    next base would reach 2^53-1. Reads only."""
+def inspect(db, directory, now, handled=None):
+    """The journal identity's state. Reads only (the marker file is read, never written). Raises `sequence_space_exhausted`
+    when the current epoch can hold no further offset and no incarnation is left."""
     stored = int(meta_get(db, 'incarnation', 1) or 1)
     epochs = read_epochs(db)
     head = head_sequence(db)
     marker = read_marker(directory)
     last = epochs[-1][1] if epochs else 0
-    capped = bool(epochs) and head - epochs[-1][0] + 1 >= LOCAL_CAP - 1
-    stale = (not epochs or marker is None or marker['high_water'] > head or marker['incarnation'] != stored
-             or stored != last or capped)
-    if not stale:
-        if stored * BASE >= MAX_SEQ:
-            raise Failure('sequence_space_exhausted')
-        return None
-    new = max(stored, last, marker['incarnation'] if marker else 0, minutes(now)) + 1
-    if new * BASE >= MAX_SEQ:
+    # `handled` is process memory, never the database: a bump made inside a text write remembers the marker it reacted to, so
+    # the next rows of the same run do not bump again for the same marker. A new process, or a different marker (the volume was
+    # restored again), judges afresh, so nothing stored in a restored database can suppress a needed bump.
+    unverified = bool(handled) and 'marker' in handled
+    capped = bool(epochs) and head - epochs[-1][0] + 1 >= capacity(last)
+    if epochs and not capped and capacity(last) < 1:
         raise Failure('sequence_space_exhausted')
-    return new
-
-
-def apply(db, directory, new):
-    head = head_sequence(db)
-    epochs = read_epochs(db)
-    start = head + 1 if epochs else 1
-    if epochs and epochs[-1][0] == start:
-        epochs[-1][1] = new  # nothing was written under the last epoch yet: nothing was served from it
+    # Identity problems that need a new epoch whatever the marker says: first use, a database whose incarnation and epoch
+    # list disagree, an epoch at its cap. Marker problems (lost, damaged, ahead of the database in rows or incarnation) need
+    # one too, unless a bump already reacted to this very marker inside a text write and only its marker is still to be written.
+    if unverified:
+        marker_stale = marker != handled['marker']
     else:
-        epochs.append([start, new])
+        marker_stale = marker is None or marker['high_water'] > head or marker['incarnation'] > stored
+    bump_now = not epochs or stored != last or capped or marker_stale
+    new = max(stored, last, marker['incarnation'] if marker else 0, minutes(now)) + 1 if bump_now else None
+    return {'epochs': epochs, 'head': head, 'marker': marker, 'bump': bump_now, 'new': new, 'unverified': unverified, 'last': last}
+
+
+def bump(db, new):
+    """Start a new epoch (database rows only; no file I/O). The first start partitions an existing backlog so that no epoch
+    holds more than `capacity` rows. The marker is written later, by `sync`."""
+    epochs, head = read_epochs(db), head_sequence(db)
+    if not epochs:
+        start, incarnation = 1, new
+        while True:
+            if capacity(incarnation) < 1:
+                raise Failure('sequence_space_exhausted')
+            epochs.append([start, incarnation])
+            if head - start + 1 <= capacity(incarnation):
+                break
+            start, incarnation = start + capacity(incarnation), incarnation + 1
+    else:
+        start = head + 1
+        if capacity(new) < 1:
+            raise Failure('sequence_space_exhausted')
+        if epochs[-1][0] == start:
+            epochs[-1][1] = new  # nothing was written under the last epoch yet: nothing was served from it
+        else:
+            epochs.append([start, new])
     meta_set(db, 'feed_epochs', json.dumps(epochs, separators=(',', ':')))
-    meta_set(db, 'incarnation', new)
-    write_marker(directory, new, head)
+    meta_set(db, 'incarnation', epochs[-1][1])
 
 
-def prepare(db, directory, now):
-    """Called inside the transaction that is about to insert a journal row, while the feed is enabled: when the identity is
-    stale (first use, lost or damaged marker, restored older database, offset cap) the new epoch starts BEFORE the row, so the
-    row can never take an identity the router may already have consumed. An exhausted sequence space is not an error here:
-    collection goes on and the feed refuses to serve (`sequence_space_exhausted`)."""
+def prepare(db, directory, now, handled):
+    """Inside the transaction that is about to insert a journal row, while the feed is enabled: when the identity is stale
+    the new epoch starts BEFORE the row, so the row can never take an identity the router may already have consumed. Database
+    work only; the marker file is not written here, so a marker failure can never stop text from being archived. An
+    exhausted sequence space is not an error here: collection goes on and the feed refuses to serve."""
     try:
-        new = plan(db, directory, now)
+        state = inspect(db, directory, now, handled)
+        if state['bump']:
+            bump(db, state['new'])
+            handled['marker'] = state['marker']
     except Failure:
         return
-    if new is not None:
-        apply(db, directory, new)
-
-
-def after_event(db, directory, sequence, now):
-    """Called inside the transaction that inserts a journal row, while the feed is enabled: keep the marker ahead of the
-    database and start a new epoch when the local offset reaches the cap."""
-    epochs = read_epochs(db)
-    if not epochs:
-        return
-    start, incarnation = epochs[-1]
-    if sequence - start + 1 >= LOCAL_CAP:
-        new = max(incarnation, minutes(now)) + 1
-        if new * BASE >= MAX_SEQ:
-            return  # the feed refuses to serve from here (`sequence_space_exhausted`)
-        epochs.append([sequence, new])
-        meta_set(db, 'feed_epochs', json.dumps(epochs, separators=(',', ':')))
-        meta_set(db, 'incarnation', new)
-        incarnation = new
-    write_marker(directory, incarnation, sequence)
 
 
 def access_view(doc, namespace):
@@ -243,17 +247,20 @@ def changes(old, new):
     return result
 
 
-def sync_needed(db, directory, view, now):
+def sync_needed(db, directory, view, now, handled):
+    state = inspect(db, directory, now, handled)
+    desired = state['marker'] is not None and state['marker']['high_water'] == state['head'] and state['marker']['incarnation'] == state['last']
     stored = meta_get(db, 'access_view')
-    return plan(db, directory, now) is not None or stored is None or loads(stored) != view['principals']
+    return state['bump'] or state['unverified'] or not desired or stored is None or loads(stored) != view['principals']
 
 
-def sync(db, directory, view, now):
-    """One write transaction: the identity bump (if due) and the access-change events for what the configuration removed
-    since the stored view. Idempotent: the view is stored in the same transaction as its events."""
-    new = plan(db, directory, now)
-    if new is not None:
-        apply(db, directory, new)
+def sync(db, directory, view, now, handled):
+    """One write transaction: the identity bump (if due), the access-change events for what the configuration removed since
+    the stored view, and then the marker (written and fsynced before this transaction commits and before any page covering
+    these rows is served). Idempotent: the view is stored in the same transaction as its events."""
+    state = inspect(db, directory, now, handled)
+    if state['bump']:
+        bump(db, state['new'])
     stored = meta_get(db, 'access_view')
     try:
         old = loads(stored) if stored is not None else None
@@ -265,8 +272,15 @@ def sync(db, directory, view, now):
             db.execute('INSERT INTO events(event_id,namespace,ref,revision,occurred) VALUES(?,?,?,?,?)',
                        (hashlib.sha256(f'{reason}|{name}|{account}|{namespace}|{now}'.encode()).hexdigest()[:32] + os.urandom(2).hex(),
                         namespace, ref, 0, now))
-            after_event(db, directory, db.execute('SELECT last_insert_rowid()').fetchone()[0], now)
     meta_set(db, 'access_view', json.dumps(view['principals'], sort_keys=True, separators=(',', ':')))
+    epochs = read_epochs(db)
+    write_marker(directory, epochs[-1][1], head_sequence(db))
+    handled.clear()  # the marker now speaks for this database
+
+
+def ready(epochs, now):
+    """False until the clock has reached the current incarnation's minute (see the module docstring)."""
+    return bool(epochs) and minutes(now) >= epochs[-1][1]
 
 
 def envelope(row, seq, namespaces):
@@ -291,8 +305,10 @@ def envelope(row, seq, namespaces):
     return None
 
 
-def page(db, view, after, limit):
+def page(db, view, after, limit, now):
     epochs = read_epochs(db)
+    if not ready(epochs, now):
+        raise Failure('feed_not_ready')
     head = head_sequence(db)
     rows = db.execute('SELECT sequence,event_id,namespace,ref,revision,occurred FROM events WHERE sequence>? '
                       'ORDER BY sequence LIMIT ?', (local_after(epochs, after, head), max(SCAN, limit * 5))).fetchall()
@@ -311,5 +327,8 @@ def page(db, view, after, limit):
             'retention_floor': floor if type(floor) is int else 0, 'journal_id': meta_get(db, 'journal_id')}
 
 
-def head_page(db):
-    return {'journal_id': meta_get(db, 'journal_id'), 'head': head_of(read_epochs(db), head_sequence(db))}
+def head_page(db, now):
+    epochs = read_epochs(db)
+    if not ready(epochs, now):
+        raise Failure('feed_not_ready')
+    return {'journal_id': meta_get(db, 'journal_id'), 'head': head_of(epochs, head_sequence(db))}

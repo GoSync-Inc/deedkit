@@ -247,7 +247,7 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
             if query:
                 raise Failure('invalid_parameters', 422)
         elif (set(query) - {'after', 'limit'} or any(len(query.getlist(key)) > 1 for key in query)
-              or not (after.isascii() and after.isdigit() and limit.isascii() and limit.isdigit()) or len(after) > 16
+              or not (after.isascii() and after.isdigit() and limit.isascii() and limit.isdigit()) or len(after) > 16 or len(limit) > 6
               or int(after) > archive_feed.MAX_SEQ or not 1 <= int(limit) <= archive_feed.MAX_LIMIT):
             raise Failure('invalid_parameters', 422)
         return JSONResponse(await local.feed(doc, head, int(after), int(limit)))

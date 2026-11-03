@@ -56,10 +56,19 @@ def parsed(doc):
     return Document.model_validate(doc)
 
 
+class Clock:
+    """The test clock: serving waits for the clock to reach the incarnation's minute, so tests move it explicitly."""
+    def __init__(self, now):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
 def open_store(doc, clock=T0):
     store = Store(parsed(doc).archive)
     store.feed_enabled = True
-    store.clock = lambda: clock
+    store.clock = Clock(clock)
     return store
 
 
@@ -79,8 +88,18 @@ def view_of(doc):
 def served(store, doc, after=0, limit=200):
     """Every event after `after`, paged the way the router pages."""
     view, result, cursor = view_of(doc), [], after
+    store.clock.now += 120  # the incarnation's minute has passed: the feed may publish
     for _ in range(1000):
-        page = store.run('feed_page', view, cursor, limit)
+        for _ in range(5):  # a bump just made (a cap, a restore) may need one more minute of clock
+            try:
+                page = store.run('feed_page', view, cursor, limit)
+                break
+            except Failure as error:
+                if error.code != 'feed_not_ready':
+                    raise
+                store.clock.now += 120
+        else:
+            raise AssertionError('the feed never became ready')
         result += page['events']
         assert page['next_after'] >= cursor
         if not page['has_more']:
@@ -103,12 +122,17 @@ async def running(tmp_path, router=True, populate=0):
     archive = app.state.archive
     await archive.start(background=False)
     archive.store.feed_enabled = router
+    clock = Clock(T0)
+    archive.store.clock = clock
     account = archive.document().accounts[0]
     for number in range(populate):
         ident = f'rec-{number:04d}'
         await archive.db('discover', account, [{'id': ident, 'title': CANARY}], None, 100 + number)
         await archive.db('observe', account, ident, {'id': ident, 'title': CANARY},
                          {'transcript': ('available', f'{CANARY} words {number}', None)}, 100 + number)
+    if router:
+        await archive.db('feed_sync', archive_feed.access_view(archive.document(), namespace))
+        clock.now += 120  # the incarnation's minute has passed
     try:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://local') as client:
             yield app, client, path, doc
@@ -159,7 +183,8 @@ def test_router_token_is_distinct_from_agent_keys_and_has_its_own_expiry(tmp_pat
             assert (await get(client, '/v1/events')).status_code == 401  # expired
             doc['event_router'] = {'key_sha256': [sha('old'), sha(ROUTER)], 'expires_at': '2099-01-01T00:00:00Z'}
             save(path, doc)
-            assert (await get(client, '/v1/events')).status_code == 200  # a rotation keeps two digests
+            ready = await get(client, '/v1/events')  # a rotation keeps two digests: authenticated, and the first minute is not ready
+            assert ready.status_code == 503 and ready.json() == {'error': 'feed_not_ready'}
         await app.state.archive.close()
     asyncio.run(run())
 
@@ -256,7 +281,7 @@ def test_head_is_the_highest_assigned_seq_and_a_fresh_journal_starts_at_its_base
 
 # spec: ANYM-726
 @pytest.mark.parametrize('query', ['after=-1', 'after=x', 'limit=0', 'limit=201', 'limit=', 'extra=1', 'after=1&after=2',
-                                   'after=99999999999999999', f'after={2 ** 53}'])
+                                   'after=99999999999999999', f'after={2 ** 53}', 'limit=' + '9' * 5000, 'after=' + '9' * 5000])
 def test_malformed_feed_queries_are_refused_with_a_fixed_code(tmp_path, query):
     async def run():
         async with running(tmp_path) as (_, client, _, _):
@@ -317,7 +342,7 @@ def test_a_lost_marker_or_a_new_volume_bumps_past_everything_published(tmp_path)
     finally:
         store.close()
     (archive / archive_feed.MARKER).unlink()  # a new volume with the database restored onto it
-    store = open_store(doc)
+    store = open_store(doc, clock=T0 + 3600)
     try:
         write(store, account, 'rec-after', now=9)
         events = served(store, doc)
@@ -328,7 +353,7 @@ def test_a_lost_marker_or_a_new_volume_bumps_past_everything_published(tmp_path)
         store.close()
     (archive / archive_feed.MARKER).write_text('not json')
     (archive / archive_feed.MARKER).chmod(0o600)  # a damaged marker is a lost marker
-    store = open_store(doc)
+    store = open_store(doc, clock=T0 + 7200)
     try:
         write(store, account, 'rec-again', now=10)
         assert seqs(served(store, doc))[-1] > seqs(events)[-1] and len(served(store, doc)) == 7
@@ -351,6 +376,12 @@ def test_a_clock_regression_cannot_reuse_an_incarnation(tmp_path):
     store = open_store(doc, clock=T0 - 100 * 24 * 3600)  # the host clock went back by 100 days
     try:
         write(store, account, 'rec-2')
+        store.clock.now += 120
+        with pytest.raises(Failure, match='feed_not_ready'):  # fail closed: no publication until the clock reaches the incarnation
+            store.run('feed_page', view_of(doc), 0, 10)
+        with pytest.raises(Failure, match='feed_not_ready'):
+            store.run('feed_head', view_of(doc))
+        store.clock.now = T0 + 3 * 60
         second = seqs(served(store, doc))
         assert second[:1] == first and second[1] > first[0] and second[1] // archive_feed.BASE > first[0] // archive_feed.BASE
     finally:
@@ -508,22 +539,171 @@ def test_a_busy_or_broken_archive_gives_a_fixed_code_and_the_collector_goes_on(t
 
 
 # spec: ANYM-726
-def test_a_marker_failure_rolls_back_only_the_observation_and_only_while_the_feed_is_enabled(tmp_path, monkeypatch):
+def test_a_marker_failure_never_stops_text_from_being_archived_and_only_the_feed_waits(tmp_path, monkeypatch):
     path, doc = configuration(tmp_path)
     account = accounts_of(doc)['omi-a']
     store = open_store(doc)
     try:
         write(store, account, 'rec-1')
-        store.discover(account, [{'id': 'rec-2', 'title': 'T'}], None, 2)
-        monkeypatch.setattr(archive_feed, 'write_marker', lambda *args: (_ for _ in ()).throw(OSError('disk full')))
+        calls = []
+        real = archive_feed.write_marker
+        monkeypatch.setattr(archive_feed, 'write_marker', lambda *args: calls.append(args) or (_ for _ in ()).throw(OSError('disk full')))
+        for number in range(2, 6):  # the whole text path, many records, with every marker write failing
+            write(store, account, f'rec-{number}', now=number)
+        assert calls == [] and store.record(account, 'rec-5')['revision'] == 1  # observe() never touches the marker file
+        assert len(store.events(0, 100)) == 5
+        store.clock.now += 120
         with pytest.raises(Failure, match='archive_unavailable'):
-            store.run('observe', account, 'rec-2', {'id': 'rec-2', 'title': 'T'}, {'transcript': ('available', 'words', None)}, 3)
-        assert store.record(account, 'rec-2')['revision'] == 0  # the marker invariant holds: no commit without the marker
-        store.feed_enabled = False  # a deployment without the router never depends on the marker
-        store.observe(account, 'rec-2', {'id': 'rec-2', 'title': 'T'}, {'transcript': ('available', 'words', None)}, 3)
-        assert store.record(account, 'rec-2')['revision'] == 1
+            store.run('feed_page', view_of(doc), 0, 10)  # only the feed is unavailable, and nothing was served
+        monkeypatch.setattr(archive_feed, 'write_marker', real)
+        assert len(served(store, doc)) == 5  # then it catches up, identities intact
     finally:
         store.close()
+
+
+# spec: ANYM-726
+def test_publication_waits_for_the_clock_so_two_restores_inside_a_minute_cannot_collide(tmp_path):
+    path, doc = configuration(tmp_path)
+    account = accounts_of(doc)['omi-a']
+    archive = Path(doc['archive']['directory'])
+    snapshot = tmp_path.resolve() / 'snapshots'
+    snapshot.mkdir(mode=0o700)
+    store = open_store(doc)
+    try:
+        write(store, account, 'rec-1')
+        backup_archive(parsed(doc).archive, snapshot / 'older.sqlite')  # the snapshot every restore below starts from
+    finally:
+        store.close()
+    published = []
+    for attempt in range(3):  # restore the older snapshot with a lost marker, again and again, the clock barely moving
+        for stale in archive.glob('archive.sqlite*'):
+            stale.unlink()
+        shutil.copy(snapshot / 'older.sqlite', archive / 'archive.sqlite')
+        (archive / 'archive.sqlite').chmod(0o600)
+        (archive / archive_feed.MARKER).unlink(missing_ok=True)
+        store = open_store(doc, clock=T0 + attempt * 5)  # seconds apart: the same clock minute
+        try:
+            write(store, account, f'new-{attempt}', now=10 + attempt)
+            with pytest.raises(Failure, match='feed_not_ready'):  # nothing is published inside the minute of the bump
+                store.run('feed_page', view_of(doc), 0, 10)
+            with pytest.raises(Failure, match='feed_not_ready'):
+                store.run('feed_head', view_of(doc))
+            if attempt < 2:
+                continue  # a restore before anything was published may take any incarnation
+            events = served(store, doc)  # the clock moved on: now it publishes
+            published = [e['id'] for e in events]
+        finally:
+            store.close()
+    assert len(published) == 2 and len(set(published)) == 2
+    # a further restore after that publication takes a larger incarnation than anything published
+    for stale in archive.glob('archive.sqlite*'):
+        stale.unlink()
+    shutil.copy(snapshot / 'older.sqlite', archive / 'archive.sqlite')
+    (archive / 'archive.sqlite').chmod(0o600)
+    (archive / archive_feed.MARKER).unlink()
+    store = open_store(doc, clock=T0 + 120)
+    try:
+        write(store, account, 'last', now=99)
+        assert min(seqs(served(store, doc))[1:]) > max(int(i.split(':')[1]) for i in published)
+    finally:
+        store.close()
+
+
+# spec: ANYM-726
+def test_the_whole_sequence_stays_below_2_pow_53_and_a_backlog_is_partitioned_into_capped_epochs(tmp_path, monkeypatch):
+    limit = (archive_feed.MAX_SEQ - 1) // archive_feed.BASE
+    assert archive_feed.capacity(limit) == archive_feed.MAX_SEQ - limit * archive_feed.BASE < archive_feed.BASE - 1
+    assert archive_feed.capacity(limit) * 1 + limit * archive_feed.BASE == archive_feed.MAX_SEQ  # the last usable seq
+    assert archive_feed.capacity(limit + 1) < 1 and archive_feed.capacity(1) == archive_feed.LOCAL_CAP - 1
+    monkeypatch.setattr(archive_feed, 'LOCAL_CAP', 5)
+    path, doc = configuration(tmp_path)
+    account = accounts_of(doc)['omi-a']
+    store = open_store(doc)
+    store.feed_enabled = False  # a dark archive with a backlog of 12 usable text events
+    try:
+        for number in range(12):
+            write(store, account, f'rec-{number:02d}', now=number)
+        store.feed_enabled = True
+        events = served(store, doc)
+        assert len(events) == 12
+        offsets = [s % archive_feed.BASE for s in seqs(events)]
+        assert max(offsets) <= 4 and seqs(events) == sorted(set(seqs(events)))  # offsets 1..4 in each of three epochs
+        assert len({s // archive_feed.BASE for s in seqs(events)}) == 3
+    finally:
+        store.close()
+
+
+# spec: ANYM-726
+def test_retraction_events_keep_the_exact_principal_and_account_identifiers(tmp_path):
+    path, doc = configuration(tmp_path)
+    doc['accounts'].append({'id': '_hidden', 'provider': 'omi', 'label': 'Synthetic', 'token_file': doc['accounts'][0]['token_file'],
+                            'archive_namespace': 'e' * 32})
+    doc['principals'] += [{'id': 'agent:reader', 'key_sha256': sha('k1'), 'expires_at': '2099-01-01T00:00:00Z',
+                           'accounts': ['omi-a', '_hidden'], 'permissions': ['recordings:read', 'recordings:content']},
+                          {'id': 'agent reader', 'key_sha256': sha('k2'), 'expires_at': '2099-01-01T00:00:00Z',
+                           'accounts': ['omi-a'], 'permissions': ['recordings:read', 'recordings:content']}]
+    store = open_store(doc)
+    try:
+        store.run('feed_sync', view_of(doc))
+        gone = copy.deepcopy(doc)
+        gone['principals'] = [p for p in doc['principals'] if p['id'] in ('agent-a', 'agent-b')]
+        store.run('feed_sync', view_of(gone))
+        events = [e for e in served(store, gone) if e['type'] == 'recording.access.changed']
+        data = {(e['data']['principal_ref'], e['data']['account_ref']) for e in events}
+        assert ('agent:reader', 'omi-a') in data  # a valid reference is kept exactly, ':' included
+        assert (archive_feed.safe_ref('agent reader'), 'omi-a') in data and archive_feed.safe_ref('agent reader').startswith('h-')
+        hidden = next(e for e in events if e['data']['principal_ref'] == 'agent:reader' and e['data']['account_ref'] != 'omi-a')
+        assert hidden['data']['account_ref'] == archive_feed.safe_ref('_hidden') and hidden['data']['account_ref'].startswith('h-')
+        assert hidden['scope_ref'] == f"recordings:_hidden.{namespace(accounts_of(doc)['_hidden'])[:16]}"  # the scope keeps the exact account id
+        assert archive_feed.safe_ref('omi-a') == 'omi-a' and archive_feed.safe_ref('A' * 128) == 'A' * 128
+        assert archive_feed.safe_ref('A' * 129).startswith('h-')
+    finally:
+        store.close()
+
+
+# spec: ANYM-726
+def test_a_large_entitlement_removal_is_published_in_one_pass(tmp_path):
+    path, doc = configuration(tmp_path)
+    doc['principals'] = [{'id': f'agent-{n:03d}', 'key_sha256': sha(f'key-{n}'), 'expires_at': '2099-01-01T00:00:00Z',
+                          'accounts': ['omi-a', 'omi-b'], 'permissions': ['recordings:read', 'recordings:content']} for n in range(256)]
+    store = open_store(doc)
+    try:
+        store.run('feed_sync', view_of(doc))
+        emptied = copy.deepcopy(doc)
+        emptied['principals'] = []
+        store.run('feed_sync', view_of(emptied))  # 512 retractions in one bounded write; marker I/O happens once
+        events = [e for e in served(store, emptied) if e['type'] == 'recording.access.changed']
+        assert len(events) == 512 and {e['data']['reason'] for e in events} == {'permission_removed'}
+        store.run('feed_sync', view_of(emptied))
+        assert len([e for e in served(store, emptied) if e['type'] == 'recording.access.changed']) == 512
+    finally:
+        store.close()
+
+
+# spec: ANYM-726
+def test_a_consumer_following_the_contract_detects_a_journal_reset_and_never_reads_it_as_new(tmp_path):
+    def consume(cursor, known_journal, page):
+        """The router's reference rules (SUBSCRIPTIONS.md): another journal_id, or a next_after behind the cursor, is a source reset."""
+        if page['journal_id'] != known_journal or page['next_after'] < cursor:
+            return 'source_reset', cursor
+        return 'ok', page['next_after']
+    async def run():
+        async with running(tmp_path / 'one', populate=3) as (_, client, _, _):
+            first = (await get(client, '/v1/events')).json()
+            assert consume(0, first['journal_id'], first) == ('ok', first['next_after'])
+            cursor, journal = first['next_after'], first['journal_id']
+            same = (await get(client, f'/v1/events?after={cursor}')).json()
+            assert same['events'] == [] and consume(cursor, journal, same) == ('ok', cursor)  # an idle journal never moves the cursor back
+            ahead = (await get(client, f'/v1/events?after={cursor + archive_feed.BASE * 50}')).json()
+            assert ahead['events'] == [] and ahead['next_after'] >= cursor + archive_feed.BASE * 50  # a cursor ahead of the journal is not rewound
+        async with running(tmp_path / 'two', populate=3) as (_, client, _, _):  # a different archive: a new journal_id
+            other = (await get(client, '/v1/events')).json()
+            assert other['journal_id'] != journal and consume(cursor, journal, other)[0] == 'source_reset'
+            behind = dict(other, journal_id=journal, next_after=cursor - 1)
+            assert consume(cursor, journal, behind)[0] == 'source_reset'
+    (tmp_path / 'one').mkdir()
+    (tmp_path / 'two').mkdir()
+    asyncio.run(run())
 
 
 # spec: ANYM-726

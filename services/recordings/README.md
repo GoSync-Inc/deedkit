@@ -441,17 +441,25 @@ an agent key on these routes is `unauthorized` (401). An older package refuses a
 - Identity. `seq` = `incarnation` x 10^9 + the offset inside the incarnation's epoch; `id` = `recordings:<seq>`. The incarnation
   is a time epoch (minutes since 2026-01-01 UTC), `meta.incarnation`; the epochs are `meta.feed_epochs`
   (`[[first local sequence, incarnation], ...]`, a key/value row: the schema stays 4). A marker file `journal.marker` in the archive
-  directory (outside the SQLite file) holds `{incarnation, high_water}` and is fsynced before every journal commit. At the first use,
-  and whenever the marker is missing or unreadable, its high-water is above the database's, its incarnation differs from
-  the database's, or the offset reaches 10^9, a new epoch starts with incarnation `max(database, marker, last epoch, clock minutes) + 1`,
-  before the next journal row is written. Events keep the identity they were first served with. A restored older database, a lost
-  marker, a new volume or a clock that went back can therefore never reuse or skip an identity. The feed refuses to start with
-  `sequence_space_exhausted` when `incarnation x 10^9` would reach 2^53-1 (about 2043).
+  directory (outside the SQLite file) holds `{incarnation, high_water}`. It is written and fsynced when the feed is served or
+  maintained (before a page covering those rows leaves the process), never inside the transaction that stores recorded text, so a
+  marker failure makes the feed unavailable (`archive_unavailable`) and can never stop text from being archived. At the first use,
+  and whenever the marker is missing or unreadable, its high-water is above the database's, its incarnation is above the
+  database's, or an epoch reaches its capacity (below 10^9 offsets, and never past seq 2^53-1), a new epoch starts with incarnation
+  `max(database, marker, last epoch, clock minutes) + 1`, before the next journal row is written (an existing backlog is split
+  into capped epochs). The feed answers `feed_not_ready` (503) until the wall clock has reached the new incarnation's minute (so
+  up to a minute after a start or bump, and until the clock catches up after a clock regression): two restores inside one clock
+  minute can therefore never publish the same incarnation twice. Events keep the identity they were first served with. A restored
+  older database, a lost marker, a new volume or a clock that went back can therefore never reuse or skip an identity. The feed
+  refuses to serve with `sequence_space_exhausted` when no incarnation with room is left (about 2043).
 - Events (references only, at most 1 KiB, no title, text, label, provider ID, token or URL): `recording.text.archived`
   (`subject` and `data.recording_ref` the opaque ref, `data.account_ref`, `data.revision`; `urgency` `batch`) once per accepted
   usable text revision, and `recording.access.changed` (`data`: `account_ref`, `principal_ref`, `reason`
   `permission_removed|account_removed|namespace_replaced`; `urgency` `now`; `subject` the account). `scope_ref` is
   `recordings:<account id>.<first 16 hex of the account's namespace>`: replacing an account's identity changes the scope.
+  `account_ref` and `principal_ref` are the configured identifiers exactly when they are valid references
+  (`[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`), otherwise `h-` plus the first 24 hex characters of the identifier's SHA-256; that is the
+  encoding every consumer (link creation and lookup, ANYM-653) must use for the same identifier.
   Text events of an account that is gone or whose namespace was replaced are not served; access-change events are, with the OLD scope.
 - Access changes are detected when the configuration is re-read (each collector pass and each feed request) against the
   entitlements stored in `meta.access_view`, and written to the same journal (`ref` = `access|reason|principal|account`, `revision` 0).
