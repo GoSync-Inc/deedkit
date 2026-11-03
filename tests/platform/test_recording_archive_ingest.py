@@ -702,6 +702,54 @@ def test_batch_and_metadata_bounds_count_utf8_bytes_not_characters(tmp_path, mon
 
 
 # spec: ANYM-725
+def test_a_json_escape_that_decodes_to_an_unstorable_string_stays_ordinary_text(tmp_path):
+    line = '{"type":"summary","text":"\\ud800 lone"}'
+    label_line = '{"start":0,"end":1,"speaker":"\\ud800","text":"spoken"}'
+    path, doc = fixture(tmp_path)
+    store = open_store(path)
+    try:
+        store.discover(OMI_A, [{'id': 'conv-s', 'title': 'T'}], None, 1)
+        store.observe(OMI_A, 'conv-s', {'id': 'conv-s', 'title': 'T'},
+                      {'summary': ('available', line, None), 'transcript': ('available', label_line, None)}, 2)
+        assert store.record(OMI_A, 'conv-s')['revision'] == 1 and len(store.events(0, 10)) == 1  # the observation committed whole
+        assert store.index_state()['skipped'] == 0 and [h['provider_recording_id'] for h in store.search(OMI_A, '"spoken"', 5)] == ['conv-s']
+    finally:
+        store.close()
+    other = tmp_path / 'upgrade'
+    other.mkdir(mode=0o700)
+    path2, _ = fixture(other)
+    metadata, parts, _, _ = stored('conv-x', 1)
+    parts['summary'] = {**parts['summary'], 'text': line}
+    legacy_archive(other, 5, extra=[(json.dumps(metadata), json.dumps(parts))])
+    store = open_store(path2)
+    try:
+        finish(store)
+        state = store.index_state()
+        assert state['state'] == 'ready' and state['built'] == 6 and state['skipped'] == 0
+    finally:
+        store.close()
+
+
+# spec: ANYM-725
+def test_a_record_over_the_batch_budget_is_skipped_and_no_batch_exceeds_it(tmp_path):
+    escaped = '\x01' * 800_000  # accepted by schema 3 (under the 2 MiB text limit); JSON-escaped it stores as about 4.8 MB
+    metadata, parts, _, _ = stored('conv-big', 1)
+    parts['summary'] = {**parts['summary'], 'text': escaped}
+    path, doc = fixture(tmp_path)
+    legacy_archive(tmp_path, 3, extra=[(json.dumps(metadata), json.dumps(parts))])
+    store = open_store(path)
+    try:
+        with store.connection() as db:
+            assert db.execute('SELECT max(length(CAST(metadata AS BLOB))+length(CAST(parts AS BLOB))) FROM records').fetchone()[0] > 4 * 1024 ** 2
+        finish(store)
+        state = store.index_state()
+        assert state['state'] == 'ready' and state['built'] == 3 and state['skipped'] == 1
+        assert store.status(OMI_A)['index']['skipped'] == 1
+    finally:
+        store.close()
+
+
+# spec: ANYM-725
 def test_new_archive_starts_at_schema4_and_runs_the_build_inside_collector_passes(tmp_path):
     path, doc = fixture(tmp_path)
     async def run():

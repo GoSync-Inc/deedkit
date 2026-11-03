@@ -28,7 +28,6 @@ INDEX_BATCH_BYTES = 4 * 1024 ** 2  # stored bytes one build batch reads and inde
 INDEX_BATCH_ROWS = 500
 INDEX_STEP_SECONDS = 10  # one collector pass spends at most this long building the schema-4 index
 MAX_METADATA = 64 * 1024  # bytes: a stored metadata document above this is skipped by the index build, never parsed
-MAX_PARTS = 16 * 1024 ** 2  # bytes: stored parts above this (the 2 MiB text limit, JSON-escaped, is far below) are skipped
 MAX_LABEL = 64
 MAX_LABELS = 256
 MAX_RESTARTS = 3
@@ -222,6 +221,15 @@ def derive_metadata(metadata):
     return {'created_at': created, 'started_at': started, 'duration_s': duration}
 
 
+def encodable(value):
+    """False for a string SQLite cannot bind (a lone surrogate that a JSON escape such as \\ud800 decodes to)."""
+    try:
+        value.encode('utf-8')
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
 def plain_text(kind, text):
     """(plain text, speaker labels) of a stored part. A transcript is stored as one JSON object per utterance; the plain
     text is the spoken words only, and the labels (`speaker_name`, `speaker_id` or `speaker`, at most 64 characters,
@@ -241,15 +249,15 @@ def plain_text(kind, text):
             body = row.get('text', row.get('content')) if isinstance(row, dict) and set(row) <= TRANSCRIPT_KEYS else None
         else:
             body = row['text'] if isinstance(row, dict) and set(row) == {'type', 'text'} else None
-        if not isinstance(body, str):
-            out.append(line)
+        if not isinstance(body, str) or not encodable(body):
+            out.append(line)  # the stored line itself (ASCII-escaped, as accepted) when its decoded words cannot be stored
             continue
         if body:
             out.append(body)
         label = next((row[key] for key in SPEAKER_KEYS if row.get(key) is not None and row[key] != ''), None)
         if type(label) in (str, int) and len(labels) < MAX_LABELS:
             label = str(label).strip()[:MAX_LABEL]
-            if label and label.lower() not in seen:
+            if label and encodable(label) and label.lower() not in seen:
                 seen.add(label.lower())
                 labels.append(label)
     return '\n'.join(out), labels
@@ -559,8 +567,11 @@ class Store:
         try:
             transcript, labels = plain_text('transcript', parts.get('transcript', {}).get('text', ''))
             summary, _ = plain_text('summary', parts.get('summary', {}).get('text', ''))
-            return {'title': title_of(metadata), 'transcript': transcript, 'summary': summary, 'labels': labels,
-                    'derived': derive_metadata(metadata), 'digest': part_digest(parts)}
+            found = {'title': title_of(metadata), 'transcript': transcript, 'summary': summary, 'labels': labels,
+                     'derived': derive_metadata(metadata), 'digest': part_digest(parts)}
+            for value in (found['title'], transcript, summary, *labels):
+                value.encode('utf-8')  # anything SQLite could not bind is a skip here, never an error at the write
+            return found
         except Exception:
             return None
 
@@ -594,7 +605,9 @@ class Store:
 
     def index_row(self, db, row):
         try:
-            if len(row['metadata'].encode('utf-8', 'replace')) > MAX_METADATA or len(row['parts'].encode('utf-8', 'replace')) > MAX_PARTS:
+            metadata_bytes = len(row['metadata'].encode('utf-8', 'replace'))
+            # A record over the batch budget is skipped (counted), so no batch ever exceeds INDEX_BATCH_BYTES.
+            if metadata_bytes > MAX_METADATA or metadata_bytes + len(row['parts'].encode('utf-8', 'replace')) > INDEX_BATCH_BYTES:
                 raise ValueError
             metadata, parts = loads(row['metadata']), loads(row['parts'])
             if not isinstance(metadata, dict) or not isinstance(parts, dict) or any(
