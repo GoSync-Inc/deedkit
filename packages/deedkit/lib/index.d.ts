@@ -1,5 +1,8 @@
 export type ToolName =
+  | 'recordings_archive_status'
   | 'recordings_audio'
+  | 'recordings_context'
+  | 'recordings_search'
   | 'recordings_capabilities'
   | 'recordings_list'
   | 'recordings_read'

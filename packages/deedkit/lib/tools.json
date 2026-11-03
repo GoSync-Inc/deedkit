@@ -88,8 +88,11 @@
   {"name": "platform_capabilities", "read_only": true},
   {"name": "platform_resolve_target", "read_only": true},
   {"name": "platform_select_modules", "read_only": false},
+  {"name": "recordings_archive_status", "read_only": true},
   {"name": "recordings_audio", "read_only": true},
   {"name": "recordings_capabilities", "read_only": true},
+  {"name": "recordings_context", "read_only": true},
   {"name": "recordings_list", "read_only": true},
-  {"name": "recordings_read", "read_only": true}
+  {"name": "recordings_read", "read_only": true},
+  {"name": "recordings_search", "read_only": true}
 ]

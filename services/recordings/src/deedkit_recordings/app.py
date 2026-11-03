@@ -43,6 +43,18 @@ class ArchiveStatus(Strict):
     account: str = Field(pattern=r'^[A-Za-z0-9_-]{1,64}$')
 
 
+class Searching(ArchiveStatus):
+    query: str = Field(min_length=1, max_length=256)
+    limit: int = Field(default=10, ge=1, le=50)
+
+
+class Context(ArchiveStatus):
+    recording_ref: str = Field(pattern=r'^[0-9a-f]{32}$')
+    kind: Literal['transcript', 'summary'] = 'transcript'
+    page_chars: int = Field(default=4000, ge=100, le=10000)
+    cursor: str | None = Field(default=None, min_length=1, max_length=8192)
+
+
 class Audio(Strict):
     account: str = Field(pattern=r'^[A-Za-z0-9_-]{1,64}$')
     recording_id: str = Field(pattern=r'^[A-Za-z0-9_-]{1,256}$')
@@ -86,6 +98,8 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
     app.state.plaud = remote
     path = Path(config_path).absolute()
     app.state.archive = ArchiveRuntime(path, provider, remote)
+    from .archive_read import LocalArchive
+    local = LocalArchive(app.state.archive)
 
     async def failure(request, error):
         return JSONResponse({'error': error.code}, status_code=error.status)
@@ -98,11 +112,12 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
         if not authorization.startswith('Bearer ') or not 1 <= len(authorization[7:]) <= 512:
             raise Failure('unauthorized', 401)
         actor, accounts, secret = configuration(path, authorization[7:])
-        models = {'capabilities': Empty, 'list_recordings': Listing, 'read_recording': Reading, 'audio': Audio, 'archive_status': ArchiveStatus}
+        models = {'capabilities': Empty, 'list_recordings': Listing, 'read_recording': Reading, 'audio': Audio,
+                  'archive_status': ArchiveStatus, 'search': Searching, 'context': Context}
         model = models.get(operation)
         if model is None:
             raise Failure('not_found_or_forbidden', 404)
-        required = {READ, CONTENT} if operation == 'read_recording' else ({READ, AUDIO} if operation == 'audio' else {READ})
+        required = {READ, CONTENT} if operation in ('read_recording', 'search', 'context') else ({READ, AUDIO} if operation == 'audio' else {READ})
         if not required <= set(actor.permissions):
             raise Failure('not_found_or_forbidden', 403)
         raw = bytearray()
@@ -121,17 +136,19 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
         if operation == 'capabilities':
             return {'service': 'deedkit-recordings', 'version': '0.1.0', 'principal': actor.id,
                     'permissions': actor.permissions, 'tool_manifest': {'names': [n for n in models
-                        if (n != 'archive_status' or app.state.archive.store is not None) and (n != 'read_recording' or CONTENT in actor.permissions) and (n != 'audio' or AUDIO in actor.permissions)]},
+                        if (n not in ('read_recording', 'search', 'context') or CONTENT in actor.permissions) and (n != 'audio' or AUDIO in actor.permissions)]},
                     'accounts': [{'id': a.id, 'provider': a.provider, 'label': a.label}
                                  for a in accounts.values() if a.id in actor.accounts],
                     'audio': 'plaud_link_requires_audio_scope' if any(a.provider == 'plaud' and a.id in actor.accounts for a in accounts.values()) else 'unsupported', 'coverage': 'on_demand_provider_reads_not_archive',
+                    'local_archive': {'search_mode': 'lexical', 'coverage': 'local_observed_unknown',
+                                      'provider_calls_for_local_reads': False},
                     'limits': {'provider_timeout_seconds': 12, 'provider_response_bytes': 2 * 1024 * 1024,
                                'active_calls_per_process': 4, 'cursor_ttl_seconds': 900}}
         if args.account not in actor.accounts:
             raise Failure('not_found_or_forbidden', 403)
         account = accounts[args.account]
-        if operation == 'archive_status':
-            return await app.state.archive.status(account.id)
+        if operation in ('search', 'context', 'archive_status'):
+            return await local.invoke(operation, args, authorization[7:])
         token = provider_token(account)
         params = dates(args) if operation == 'list_recordings' else {}
         binding = {'provider': account.provider, 'account': account.id, 'principal': actor.key_sha256,

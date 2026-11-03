@@ -3,6 +3,11 @@ from .policy import Denied
 
 # Permanent failures must not invite a blind retry. Only explicitly transient states do.
 RECOVERY = {
+    'archive_disabled': (False, 'operator_enable_recording_archive'),
+    'archive_unavailable': (False, 'operator_check_recording_archive'),
+    'archive_schema_unsupported': (False, 'operator_check_recording_archive_version'),
+    'archive_capacity': (False, 'operator_check_recording_archive_capacity'),
+    'archive_busy': (True, 'retry_after_delay'),
     'transcript_window_exceeded': (False, 'provider_transcript_window_limit'),
     'unsupported_plaud_filters_or_limit': (False, 'correct_arguments'),
     'audio_unsupported': (False, 'provider_audio_unsupported'),

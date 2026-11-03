@@ -118,16 +118,21 @@ def read_document(path, *, include_archive=True):
     return doc, secret
 
 
-def configuration(path, key):
-    doc, secret = read_document(path, include_archive=False)
+def principal(doc, key):
     accounts = {a.id: a for a in doc.accounts}
     hashed = hashlib.sha256(key.encode()).hexdigest()
     for actor in doc.principals:
         if hmac.compare_digest(actor.key_sha256, hashed):
             expiry = datetime.fromisoformat(actor.expires_at.replace('Z', '+00:00'))
             if expiry > datetime.now(timezone.utc):
-                return actor, accounts, secret
+                return actor, accounts
     raise Failure('unauthorized', 401)
+
+
+def configuration(path, key):
+    doc, secret = read_document(path, include_archive=False)
+    actor, accounts = principal(doc, key)
+    return actor, accounts, secret
 
 
 def provider_token(account):
@@ -161,7 +166,7 @@ def continuation(binding, position, secret, digest=None):
     return token
 
 
-def cursor(token, binding, secret):
+def cursor(token, binding, secret, *, revocation_fields=()):
     try:
         if len(token) > 8192:
             raise ValueError
@@ -171,6 +176,9 @@ def cursor(token, binding, secret):
         if not hmac.compare_digest(received, signature(raw, secret)):
             raise ValueError
         value = loads(raw)
+        if isinstance(value.get('binding'), dict) and any(
+                value['binding'].get(field) != binding.get(field) for field in revocation_fields):
+            raise Failure('not_found_or_forbidden', 403)
         if value['binding'] != binding or type(value['expires']) is not int or value['expires'] < time.time():
             raise ValueError
         return value
