@@ -772,7 +772,7 @@ class Store:
                to_time='', after='', limit=20, *, accounts=None, chats=None, senders=None, collapse_forwards=True,
                query_mode='all', order='asc', before='', direction='', search_language='auto',
                fuzzy=False, compact=False, body_chars=None, include_coverage=True,view='archive',include_system=False,exclude_channels=False,
-               chat_types=None,include_channels=False,person='',_scope=None):
+               chat_types=None,include_channels=False,person='',body_format='',_scope=None):
         # None is the internal no-default sentinel of message_queries.search, never a public value.
         if type(include_channels) is not bool:raise APIError('invalid_filter')
         from .message_queries import named_chats
@@ -785,7 +785,7 @@ class Store:
                 accounts=accounts,chats=chats,senders=senders,collapse_forwards=collapse_forwards,query_mode=query_mode,
                 order=order,before=before,direction=direction,search_language=search_language,
                 fuzzy=fuzzy,compact=compact,body_chars=body_chars,include_coverage=include_coverage,view=view,include_system=include_system,exclude_channels=exclude_channels,
-                chat_types=chat_types,include_channels=include_channels,person=person)
+                chat_types=chat_types,include_channels=include_channels,person=person,body_format=body_format)
             self._search_suggestion(c,p,account,accounts,chat,chats,chat_types,exclude_channels,result)
             return result
 
@@ -830,16 +830,18 @@ class Store:
         return search(self,c,p,*args,**kwargs)
 
     def get_messages(self, token, chat_id, after='', limit=20, *, before='', order='asc',
-                     from_time='',to_time='',compact=False,body_chars=None,include_coverage=True,view='archive',include_system=False):
+                     from_time='',to_time='',compact=False,body_chars=None,include_coverage=True,view='archive',include_system=False,body_format=''):
         with self.authorized(token,'get_messages') as (c,p):
             if not isinstance(chat_id,str) or not 1<=len(chat_id)<=256:raise APIError('not_found',404)
             return self._search(c,p,chat=chat_id,after=after,limit=limit,before=before,
                 order=order,from_time=from_time,to_time=to_time,compact=compact,
-                body_chars=body_chars,include_coverage=include_coverage,view=view,include_system=include_system)
+                body_chars=body_chars,include_coverage=include_coverage,view=view,include_system=include_system,body_format=body_format)
 
     def get_context(self, token, message_id, limit=10, *, before_count=None,after_count=None,
-                    compact=False,body_chars=None,include_coverage=True,view='archive',include_system=False):
+                    compact=False,body_chars=None,include_coverage=True,view='archive',include_system=False,body_format=''):
         from .search_query import coverage,output_options
+        from .formatting_readback import option
+        body_format=option(body_format)
         from .message_queries import history_snapshot
         from .conversation import options
         options(view,include_system)
@@ -848,9 +850,9 @@ class Store:
             bounded(limit,50)
             cap=output_options(compact,body_chars,include_coverage)
             explicit,before_count,after_count=self._context_counts(before_count,after_count)
-            anchor,snapshot=self._context_anchor(c,p,message_id,conversation,include_system)
+            anchor,snapshot=self._context_anchor(c,p,message_id,conversation,include_system,body_format)
             scans=self._context_scans(c,anchor,conversation,include_system,explicit,limit,before_count,after_count)
-            rows,older,newer=self._context_rows(c,p,anchor,scans,conversation,include_system,explicit,limit,compact,cap)
+            rows,older,newer=self._context_rows(c,p,anchor,scans,conversation,include_system,explicit,limit,compact,cap,body_format)
             files=[f for f in anchor['attachments'] if f['download_status']=='ready']
             jobs=[f for f in anchor['attachments'] if f['download_status']!='ready']
             from .reviews import list_reviews
@@ -876,7 +878,7 @@ class Store:
                 raise APIError('invalid_limit')
         return explicit,before_count,after_count
 
-    def _context_anchor(self,c,p,message_id,conversation,include_system):
+    def _context_anchor(self,c,p,message_id,conversation,include_system,body_format=''):
         from .message_queries import enrich
         anchor=self.message(c,p,message_id)
         snapshot=None
@@ -886,7 +888,7 @@ class Store:
             # Authorization remains READ COMMITTED. Re-read source evidence
             # after pinning the view, then reject changes around all scans.
             anchor=self.message(c,p,message_id)
-            enrich(c,[anchor],p)
+            enrich(c,[anchor],p,with_body=bool(body_format))
         return anchor,snapshot
 
     @staticmethod
@@ -915,7 +917,7 @@ class Store:
         return scans
 
     @staticmethod
-    def _context_rows(c,p,anchor,scans,conversation,include_system,explicit,limit,compact,cap):
+    def _context_rows(c,p,anchor,scans,conversation,include_system,explicit,limit,compact,cap,body_format=''):
         from .message_queries import enrich
         from .search_query import shape_messages
         from .conversation import sort_key,decorate_messages
@@ -928,7 +930,7 @@ class Store:
                 abs((r['sent_at']-anchor['sent_at']).total_seconds())))[:limit]
         if conversation:
             # Excerpts spend their budget in the returned order (ANYM-490).
-            enrich(c,rows,p,order_key=sort_key);rows.sort(key=sort_key)
+            enrich(c,rows,p,order_key=sort_key,with_body=bool(body_format));rows.sort(key=sort_key)
             shape_messages(rows,compact=False,body_chars=cap)
             shape_messages([anchor],compact=False,body_chars=cap)
             decorate_messages(c,p,rows,include_system=include_system);decorate_messages(c,p,[anchor],include_system=include_system)
@@ -938,9 +940,13 @@ class Store:
                         row['display_text']=row['display_text'][:cap];row['display_text_truncated']=True
         else:
             rows.sort(key=lambda r:(r['sent_at'],r['id']))
-            enrich(c,rows,p);enrich(c,[anchor],p)
+            enrich(c,rows,p,with_body=bool(body_format));enrich(c,[anchor],p,with_body=bool(body_format))
             shape_messages(rows,compact=compact,body_chars=cap)
             shape_messages([anchor],compact=compact,body_chars=cap)
+        if body_format:
+            # Response order: the anchor first; one rendering and one budget share per (message, revision).
+            from .formatting_readback import attach
+            attach([anchor,*rows])
         return rows,older,newer
 
     @staticmethod

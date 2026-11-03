@@ -864,6 +864,22 @@
           "description": "A person UUID from messages_search_people: messages sent by any identity the owner linked to that person and you can read, ANDed with the other filters; archive only.",
           "title": "Person",
           "type": "string"
+        },
+        "body_format": {
+          "anyOf": [
+            {
+              "enum": [
+                "",
+                "html"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Body Format",
+          "description": "html adds body_rendered {format,text,lossless,omitted_types} to Telegram rows whose formatting is known: the complete body as HTML for preview_message/send_message text with format=html, verified by the server; lossless=false lists omitted_types; otherwise body_rendered_unavailable names the reason. Empty or absent adds nothing. Not with detail=transcript."
         }
       },
       "type": "object",
@@ -1272,6 +1288,22 @@
           "description": "The conversation view hides known system events unless true.",
           "title": "Include System",
           "type": "boolean"
+        },
+        "body_format": {
+          "anyOf": [
+            {
+              "enum": [
+                "",
+                "html"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Body Format",
+          "description": "html adds body_rendered {format,text,lossless,omitted_types} to Telegram rows whose formatting is known: the complete body as HTML for preview_message/send_message text with format=html, verified by the server; lossless=false lists omitted_types; otherwise body_rendered_unavailable names the reason. Empty or absent adds nothing. Not with detail=transcript."
         }
       },
       "required": [
@@ -1397,6 +1429,22 @@
           "description": "Known system events are hidden unless true; unknown empty records stay visible.",
           "title": "Include System",
           "type": "boolean"
+        },
+        "body_format": {
+          "anyOf": [
+            {
+              "enum": [
+                "",
+                "html"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Body Format",
+          "description": "html adds body_rendered {format,text,lossless,omitted_types} to Telegram rows whose formatting is known: the complete body as HTML for preview_message/send_message text with format=html, verified by the server; lossless=false lists omitted_types; otherwise body_rendered_unavailable names the reason. Empty or absent adds nothing. Not with detail=transcript."
         }
       },
       "required": [

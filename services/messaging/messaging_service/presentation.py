@@ -4,7 +4,7 @@ import re
 MESSAGE_FIELDS = ('id','message','account','chat','sender','sent_at','revision','direction',
     'provider_message_id','kind','origin','historical','is_backfill','event_sequence','sender_name','sender_name_basis','username',
     'chat_title','chat_type','reply_to_provider_id','reply_to','mentions_owner','reply_to_owner','forwarded','media_kind','body_truncated',
-    'sender_identity_basis','agent_send','delivery_receipt','formatting')
+    'sender_identity_basis','agent_send','delivery_receipt','formatting','body_rendered','body_rendered_unavailable')
 CONVERSATION_FIELDS = ('body','kind','is_service','display_text','position','order_basis',
     'order_status','timestamp_resolution','first_observed_at','first_observed_basis',
     'ingested_at','ordering_warning','conversation_view_version','provider_message_type',
@@ -30,6 +30,9 @@ def options(method, arguments):
         if arguments['compact'] is None:arguments['compact']=detail=='compact'
         else:detail='compact' if arguments['compact'] else 'full'
     if detail=='transcript':
+        if arguments.get('body_format'):
+            from .store import APIError
+            raise APIError('invalid_parameters')
         # The numbered transcript exists only in the conversation view.
         if arguments.get('view')!='conversation':
             from .store import APIError
@@ -158,6 +161,8 @@ def lean_message(row, *, search=False, files=True):
         result['delivery']={'state':receipt['state'],
             'recipient_delivery_confirmed':receipt.get('recipient_delivery_confirmed') is True}
     if row.get('order_status')=='ambiguous':result['order_status']='ambiguous'
+    for key in ('body_rendered','body_rendered_unavailable'):
+        if row.get(key) is not None:result[key]=row[key]
     evidence=row.get('evidence') or {}
     problems={k:evidence[k] for k in ('active_conflicts','conflict','revision_changed_during_read') if evidence.get(k)}
     if problems:result['integrity']=problems

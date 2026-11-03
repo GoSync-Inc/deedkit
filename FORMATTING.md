@@ -126,6 +126,31 @@ do not promise that a boolean always controls provider behavior.
   Quarantine restore cancels queued rich sends and marks interrupted attempts
   unknown, just as it does plain sends. Never retry an uncertain provider result.
 
+## Reading formatting back
+
+`get_messages`, `get_context` and `search` accept `body_format=html` (ANYM-737; empty or absent adds nothing, and
+`detail=transcript` refuses it with `invalid_parameters`). A Telegram row whose formatting is known then carries
+`body_rendered = {format, text, lossless, omitted_types}`: the complete provider body (even when `body_chars` cut
+`body`) as HTML that `preview_message` and `send_message` accept as `text` with `format=html`.
+
+- **Verified, not trusted.** The server runs the sender's own `render_message('telegram', text, 'html')` on the generated
+  text and returns it only when the visible text equals the stored body and the entities equal the stored supported
+  entities. Anything else gives `body_rendered_unavailable` with one of `unknown_formatting`, `no_entities` (WhatsApp),
+  `partial_evidence`, `evidence_mismatch`, `too_long`, `not_reproducible`, `response_budget` or `render_failed`. Visible
+  text is never changed to make a row pass.
+- **Lossless.** `bold`, `italic`, `underline`, `strikethrough`, `spoiler`, `code`, `pre` (with `language`),
+  `blockquote` and `text_link` render; Telegram's implicit entities (`url`, `email`, `phone`, `mention`, `hashtag`,
+  `cashtag`, `bot_command`) stay plain text. `expandable_blockquote`, `mention_name`, `custom_emoji`, unknown types and a
+  link the sender's validator rejects are left out and listed in `omitted_types`; `lossless` is then `false`.
+- **Dialect limits.** The sender treats `blockquote` and `pre` as blocks joined by a blank line, and counts its root in the
+  32-level depth cap (31 nested spans). A layout that needs different separators, a span ending in whitespace, crossing
+  spans or nested code is `not_reproducible`.
+- **Escaping.** `&`, `<`, `>` are escaped in text and in `code`/`pre`; an `href` is double-quoted with `&`, `"`, `<`, `>` escaped.
+- **Bounds.** One conversion per unique (message, revision); every serialized `body_rendered` (a repeated anchor too) counts, the
+  total in one response is at most 256 KiB and later rows get `response_budget`. The text must also fit a preview or send request
+  (16 KiB HTTP body): a text over 15,100 bytes as JSON UTF-8 is `too_long`. Nothing is sent to a third party, logged or stored; the agent still shows the
+  owner the text and format before a send (SENDING.md).
+
 ## Acceptance
 
 Use synthetic fixtures for Cyrillic, emoji before/inside spans, nested styles,

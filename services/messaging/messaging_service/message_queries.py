@@ -226,7 +226,7 @@ def chat_titles(c, items, *, cap=64, p=None):
     return items
 
 
-def enrich(c, rows, p, *, titles=None, order_key=None):
+def enrich(c, rows, p, *, titles=None, order_key=None, with_body=False):
     """Rows were individually authorized; metadata comes from the same chat.
 
     A missing sender name falls back only to names the caller can read (sender_names).
@@ -242,7 +242,7 @@ def enrich(c, rows, p, *, titles=None, order_key=None):
     for row in rows:
         row.update(by_id.get(row['id'],{}))
     from .result_evidence import decorate
-    decorate(c,[r for r in rows if 'revision' in r],order_key=order_key)
+    decorate(c,[r for r in rows if 'revision' in r],order_key=order_key,with_body=with_body)
     return rows
 
 
@@ -307,8 +307,10 @@ def named_chats(c, p, chat='', chats=None):
 def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time='',after='',limit=20,
            *,accounts=None,chats=None,senders=None,query_mode='all',order='asc',before='',direction='',
            search_language='auto',fuzzy=False,compact=False,body_chars=None,include_coverage=True,view='archive',include_system=False,
-           exclude_channels=False,chat_types=None,include_channels=None,collapse_forwards=True,person=''):
+           exclude_channels=False,chat_types=None,include_channels=None,collapse_forwards=True,person='',body_format=''):
     from .store import APIError,bounded,serial
+    from .formatting_readback import option
+    body_format=option(body_format)
     import re
     from .conversation import options,numeric_order_sql,visible_sql,decorate_messages,presentation
     options(view,include_system)
@@ -470,7 +472,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
     shape_messages(items,compact=False if conversation else compact)
     from .result_evidence import decorate
     from .chat_evidence import query_evidence
-    decorate(c,items)
+    decorate(c,items,with_body=bool(body_format))
     if conversation:
         decorate_messages(c,p,items,include_system=include_system)
         # Explicit caps bound source excerpts and the added readable field;
@@ -479,6 +481,9 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
             for item in items:
                 if len(item['display_text'])>cap:
                     item['display_text']=item['display_text'][:cap];item['display_text_truncated']=True
+    if body_format:
+        from .formatting_readback import attach
+        attach(items)
     for item in items:
         for internal in ('source_order','snapshot_count','snapshot_checksum','position_id','position_at','position_revision'):item.pop(internal,None)
     targets(p,[i for r in items for i in [r['id'],*(x['message_id'] for x in r.get('copies',()))]])
