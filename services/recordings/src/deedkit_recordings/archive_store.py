@@ -56,27 +56,39 @@ COMMIT;
 # Schema 3 is additive: new tables and nullable/defaulted columns only. No index rebuild, no row rewritten.
 UPGRADE_V3 = '''
 BEGIN IMMEDIATE;
-ALTER TABLE accounts ADD COLUMN throttled_until REAL;
-ALTER TABLE accounts ADD COLUMN traversal_state TEXT NOT NULL DEFAULT 'not_started';
-ALTER TABLE accounts ADD COLUMN passes_completed INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE accounts ADD COLUMN last_page_at REAL;
-ALTER TABLE accounts ADD COLUMN started_at REAL;
-ALTER TABLE accounts ADD COLUMN last_head_at REAL;
-ALTER TABLE accounts ADD COLUMN head_cursor TEXT;
-ALTER TABLE accounts ADD COLUMN head_backlog_since REAL;
-ALTER TABLE accounts ADD COLUMN credential TEXT;
-ALTER TABLE records ADD COLUMN fingerprint TEXT;
-CREATE TABLE ledger(credential TEXT NOT NULL, bucket TEXT NOT NULL, window_start REAL NOT NULL, count INTEGER NOT NULL,
- updated REAL NOT NULL, PRIMARY KEY(credential, bucket));
-CREATE TABLE meta(id INTEGER PRIMARY KEY CHECK(id=1), archive_id TEXT NOT NULL, incarnation INTEGER NOT NULL, journal_id TEXT NOT NULL);
-INSERT INTO meta(id,archive_id,incarnation,journal_id) VALUES(1,'{archive}',1,'{journal}');
+{alters}CREATE TABLE IF NOT EXISTS ledger(credential TEXT NOT NULL, bucket TEXT NOT NULL, window_start REAL NOT NULL,
+ count INTEGER NOT NULL, updated REAL NOT NULL, PRIMARY KEY(credential, bucket));
+CREATE TABLE IF NOT EXISTS meta(id INTEGER PRIMARY KEY CHECK(id=1), archive_id TEXT NOT NULL, incarnation INTEGER NOT NULL,
+ journal_id TEXT NOT NULL);
+INSERT OR IGNORE INTO meta(id,archive_id,incarnation,journal_id) VALUES(1,'{archive}',1,'{journal}');
 PRAGMA user_version=3;
 COMMIT;
 '''
+V3_COLUMNS = (
+    ('accounts', 'throttled_until', 'REAL'),
+    ('accounts', 'traversal_state', "TEXT NOT NULL DEFAULT 'not_started'"),
+    ('accounts', 'passes_completed', 'INTEGER NOT NULL DEFAULT 0'),
+    ('accounts', 'last_page_at', 'REAL'),
+    ('accounts', 'started_at', 'REAL'),
+    ('accounts', 'last_head_at', 'REAL'),
+    ('accounts', 'head_cursor', 'TEXT'),
+    ('accounts', 'head_backlog_since', 'REAL'),
+    ('accounts', 'credential', 'TEXT'),
+    ('records', 'fingerprint', 'TEXT'),
+)
 
 
-def with_ids(template):
-    return template.format(archive=uuid.uuid4().hex, journal=uuid.uuid4().hex)
+def upgrade_v3(db):
+    """Apply schema 3 in one transaction: add only the columns still missing, then the new tables."""
+    alters = ''
+    for table, column, declaration in V3_COLUMNS:
+        if column not in {row[1] for row in db.execute(f'PRAGMA table_info({table})')}:
+            alters += f'ALTER TABLE {table} ADD COLUMN {column} {declaration};\n'
+    db.executescript(with_ids(UPGRADE_V3, alters=alters))
+
+
+def with_ids(template, **extra):
+    return template.format(archive=uuid.uuid4().hex, journal=uuid.uuid4().hex, **extra)
 
 
 def provider_of(account):
@@ -182,7 +194,7 @@ class Store:
                     version = 2
                 if version == 2:
                     # Additive only; any failure rolls the whole script back to a usable schema 2.
-                    db.executescript(with_ids(UPGRADE_V3))
+                    upgrade_v3(db)
                 if db.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
                     raise Failure('archive_unavailable')
                 db.execute('PRAGMA journal_mode=WAL')
