@@ -1736,16 +1736,23 @@ file a regular file of mode 0600 owned by 10001. Paths inside `config.json` are 
 README example) and each account's `archive_namespace`, and is used only after the archive gates pass. The owner
 writes the provider keys by hand; the agent only checks modes and that a file is not empty.
 
+**First publication (owner action, once).** GHCR creates the new package `deedkit-recordings` private. The host has
+no GitHub token and `production.py` reads the registry anonymously, so before the first start an organization owner
+sets the package public in its package settings (as for the other packages, "CI-published images"), and an
+anonymous check passes: `docker logout ghcr.io`, then `docker manifest inspect ghcr.io/gosync-inc/deedkit-recordings:<sha>`
+answers. Until then promotion cannot resolve the image; changing visibility is the owner's.
+
 **First start by hand** (`production.py` cannot start a service that is not enrolled: `snapshot` needs one
-running container). With `<sha>` a green `main` SHA whose `publish` job finished:
+running container). `F` is `-p deedkit-recordings -f /opt/deedkit/deploy/compose.recordings.yaml` with
+`RECORDINGS_STATE_DIR` and `DEEDKIT_VERSION` set. With `<sha>` a green `main` SHA whose `publish` job finished:
 1. `gh attestation verify oci://ghcr.io/gosync-inc/deedkit-recordings:<sha> --repo GoSync-Inc/deedkit
    --signer-workflow GoSync-Inc/deedkit/.github/workflows/ci.yml --source-ref refs/heads/main --source-digest <sha>
    --deny-self-hosted-runners` (see "CI-published images"), `docker pull` that digest and
    `docker tag <digest ref> deedkit-recordings:enroll-<sha>` (a new tag, never `--build`).
 2. Once: `docker network create --internal -o com.docker.network.bridge.name=dk-recbackend0 -o
    com.docker.network.bridge.gateway_mode_ipv4=isolated deedkit-recordings-backend`.
-3. `DEEDKIT_VERSION=enroll-<sha> docker compose -p deedkit-recordings -f deploy/compose.recordings.yaml up
-   -d --no-build --pull never` and read `docker ps` health (healthy after about 30 seconds).
+3. `DEEDKIT_VERSION=enroll-<sha> docker compose $F up -d --no-build --pull never` and read `docker ps` health
+   (healthy after about 30 seconds).
 
 **Gateway.** Upgrade the gateway to a release that knows the module before the policy names it (an old gateway
 rejects the module name). The policy gets, in one atomic replace with a higher `revision` and a backup first:
@@ -1756,7 +1763,8 @@ profile's `recordings_capabilities` / `recordings_list` / `recordings_read` tool
 `recordings:content` (no `recordings:audio`). A backend URL change needs a gateway restart.
 
 **Enrollment is a hand release**, modelled on the delivery enrollment (step 5 of "Apply and verify"). The host
-lists `deploy/compose.recordings.yaml` as a new project `recordings` with `"services": {"recordings-api":
+lists `deploy/compose.recordings.yaml` as a new project `deedkit-recordings` (the Compose project name of the first
+start; `snapshot()` finds the running container by that label) with `"services": {"recordings-api":
 "recordings"}` in `/etc/deedkit/production.json` ONLY (plan B accepts exactly two services, the API and the
 gateway), and `deploy/compose.gateway-recordings.yaml` after `compose.gateway.yaml` in the gateway project's
 `files` in BOTH `/etc/deedkit/production.json` and `/etc/deedkit/http-production.json`, so the promoted HTTP gateway
@@ -1768,10 +1776,10 @@ the new state current (a dry run with the pause file present returns `paused` be
 restarts the selected services of the enrolled projects as in any release.
 
 **Undo**, in order: remove the module, tools, grants and credential from the policy (new revision); stop
-`recordings-api` only (`docker compose -p deedkit-recordings stop`) and leave autodeploy paused, which is the
+`recordings-api` only (`docker compose $F stop recordings-api`) and leave autodeploy paused, which is the
 holding state; at a NEWER green `main` SHA (a docs-only pull request creates one) restore both configuration backups
 and repeat the hand release sequence above (a SHA prepared with recordings can never be prepared again); `deploy
---dry-run` must report current without a drift halt; then `docker compose -p deedkit-recordings down`, remove the
+--dry-run` must report current without a drift halt; then `docker compose $F down`, remove the
 network `deedkit-recordings-backend` and the enroll tag; the owner revokes the provider keys in Omi and PLAUD.
 
 **Operations on the running service.**

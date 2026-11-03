@@ -64,6 +64,7 @@ def test_recordings_is_a_published_attested_build_target_that_imports_in_the_ima
 def test_recordings_api_is_confined_to_the_internal_backend_and_the_filtered_egress_bridge():
     document = compose(OVERLAY)
     assert set(document['services']) == {'recordings-api'}
+    assert document['name'] == 'deedkit-recordings'
     unit = document['services']['recordings-api']
     assert not unit.get('ports') and 'network_mode' not in unit
     assert set(unit['networks']) == {'recordings-backend', 'recordings-egress'}  # never `integration`
@@ -119,7 +120,8 @@ def test_the_operator_documentation_names_the_recordings_section_and_its_four_op
                    'deploy/recordings.example.json', 'deploy/recordings-archive.example.json',
                    'deploy/compose.gateway-recordings.yaml', '/etc/deedkit/http-production.json',
                    'seamless_release.py prepare', 'NEWER green `main` SHA', 'dk-recbackend0',
-                   'gateway_mode_ipv4=isolated', 'ONLY (plan B accepts exactly two services'):
+                   'gateway_mode_ipv4=isolated', 'ONLY (plan B accepts exactly two services', 'project `deedkit-recordings`',
+                   'First publication (owner action, once)', 'docker manifest inspect', 'docker compose $F stop recordings-api'):
         assert needle in section, needle
     assert 'recordings' in docs[docs.index('Available build targets'):][:300]
     readme = (ROOT / 'services/recordings/README.md').read_text()

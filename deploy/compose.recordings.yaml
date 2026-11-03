@@ -3,6 +3,7 @@
 # (docs/operations/production.md, "Recordings"). The container joins no `integration` network: the gateway reaches it
 # only over the internal `recordings-backend` network (created once by hand, no host address on its bridge), and
 # its one way out is the filtered bridge `recordings-egress` (ANYM-712; the host rules come first).
+name: deedkit-recordings
 services:
   recordings-api:
     image: deedkit-recordings:${DEEDKIT_VERSION:-0.1.0}

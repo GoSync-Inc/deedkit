@@ -3012,7 +3012,7 @@ def test_recordings_enrollment_and_undo_are_hand_releases_through_both_plans(tmp
     overlay = str(tmp_path / "compose.gateway-recordings.yaml")
     project = host.settings["projects"][0]  # the same dict serves plan A and plan B
     project["files"].append(overlay)
-    host.settings["projects"].append({"name": "recordings", "directory": str(tmp_path),
+    host.settings["projects"].append({"name": "deedkit-recordings", "directory": str(tmp_path),
                                       "files": [str(tmp_path / "compose.recordings.yaml")],
                                       "services": {"recordings-api": "recordings"}})
     # Both configurations changed: autodeploy halts before any step and leaves the pause file.
@@ -3022,8 +3022,9 @@ def test_recordings_enrollment_and_undo_are_hand_releases_through_both_plans(tmp
     # A dry run under the pause file answers `paused` before it looks at drift.
     assert host.deploy(dry_run=True)["status"] == "paused"
     # The hand release: plan A, then plan B (promote re-records the HTTP digest), then the pause goes.
-    for step in (p.prepare, p.apply, host.s.prepare, host.s.promote):
-        step(host.settings, NEWER)
+    for step, configuration in ((p.prepare, host.settings), (p.apply, host.settings),
+                                (host.s.prepare, host.http), (host.s.promote, host.http)):
+        step(configuration, NEWER)
     assert [name for name, _ in host.steps] == ["prepare", "apply", "seamless prepare", "seamless promote"]
     p.PAUSE.unlink()
     assert p.read(host.http_state / "http-current.json")["config_digest"] == p.digest(host.http)
@@ -3036,11 +3037,30 @@ def test_recordings_enrollment_and_undo_are_hand_releases_through_both_plans(tmp
     halted = host.deploy()
     assert halted["status"] == "halted" and "changed since" in halted["reason"] and host.steps == []
     # The undo is a release at a SHA newer than any prepared with recordings, through both plans.
-    for step in (p.prepare, p.apply, host.s.prepare, host.s.promote):
-        step(host.settings, third)
+    for step, configuration in ((p.prepare, host.settings), (p.apply, host.settings),
+                                (host.s.prepare, host.http), (host.s.promote, host.http)):
+        step(configuration, third)
     p.PAUSE.unlink()
     assert host.deploy() == {"status": "current", "sha": third}
     assert host.settings["projects"] == unrelated
+
+
+# spec: ANYM-711
+def test_enrolling_recordings_changes_the_prepared_digest_that_autodeploy_compares(tmp_path, monkeypatch):
+    # The real preparation and the real drift check; only the Docker and registry calls are the fixture's.
+    settings, _, _ = fixture(tmp_path, monkeypatch)
+    before = p.settings_digest(settings)
+    p.prepare(settings, SHA)
+    state = Path(settings["state_directory"])
+    assert p.read(state / SHA / "prepared.json")["config_digest"] == before
+    enrolled = copy.deepcopy(settings)
+    enrolled["projects"][0]["files"].append(str(tmp_path / "compose.gateway-recordings.yaml"))
+    enrolled["projects"].append({"name": "deedkit-recordings", "directory": str(tmp_path),
+                                 "files": [str(tmp_path / "compose.recordings.yaml")],
+                                 "services": {"recordings-api": "recordings"}})
+    assert p.settings_digest(enrolled) != before
+    current = {"sha": SHA, "rollback": {"projects": []}}
+    assert "production configuration changed since" in p.configuration_drift(enrolled, {}, current, {})
 
 
 # spec: ANYM-711
