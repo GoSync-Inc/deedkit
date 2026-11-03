@@ -334,7 +334,8 @@ precondition, like HTTP `If-Match`:
 If newer eligible messages reached the archive, nothing is queued and the call is refused
 `chat_changed_since_seen` (HTTP 409) with `newer_count` (at most 20, `newer_count_capped: true` beyond),
 `newer_outgoing_count`, `first_newer_message_id`, `newest_message_id` and a `next_call` for `get_context`
-with `message_id` = `first_newer_message_id`, `before_count` 0 and `after_count` 20. Read, then decide again;
+with `message_id` = `first_newer_message_id`, `before_count` 0, `after_count` 20 and `view` `conversation`
+(the order the guard counts in). Read, then decide again;
 page on with the returned cursor when capped. The window shows every message, so with `outgoing_only` or
 hidden rows it can also show messages that were not counted. The body carries no message text, name or
 file name. Newer means a later `sent_at` or, on Telegram, the same `sent_at` and a larger numeric ID;
@@ -348,7 +349,9 @@ fails or takes over 1 s the call is refused `chat_guard_unavailable` (HTTP 503) 
 
 A retry with the same `request_id` returns the first saved result (`unknown` included) without a new
 check, even after newer messages arrived; a different payload under that ID is still `idempotency_conflict`.
-A lost response is recovered with `get_send_status`, never by repeating the guarded call. Through the
+A lost response is recovered with `get_send_status` by `request_id` (pass exactly one of `send_id` or
+`request_id`; it reads the saved row and needs neither the guard nor read access), never by repeating the guarded
+call. A twin of the same `request_id` that commits while a guard read runs wins over a refusal. Through the
 gateway the guard needs read access to `get_context` on the account: without it the call is refused
 `send_guard_not_permitted` before any backend request.
 
