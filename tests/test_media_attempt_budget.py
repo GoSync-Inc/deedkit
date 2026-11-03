@@ -277,21 +277,26 @@ def test_restore_without_acls_does_not_leave_the_lifecycle_functions_of_033_open
     def open_to_public(c):
         return [n for n in names if c.execute(f"SELECT has_function_privilege('public',{regproc(n)},'EXECUTE') AS open").fetchone()['open']]
     def grants(c):  # every explicit non-PUBLIC ACL entry: the roles' own grants must survive the repair
-        return {n:c.execute(f"""SELECT a.grantee::regrole::text AS grantee,a.privilege_type FROM pg_proc p
+        return {n:c.execute(f"""SELECT a.grantee::regrole::text AS grantee,a.grantor::regrole::text AS grantor,
+            a.privilege_type,a.is_grantable FROM pg_proc p
             CROSS JOIN LATERAL aclexplode(p.proacl) a WHERE p.oid={regproc(n)} AND a.grantee<>0
-            ORDER BY 1,2""").fetchall() for n in names}
+            ORDER BY 1,2,3""").fetchall() for n in names}
     with gateway(s) as restricted:  # the gateway role holds EXECUTE on touch_original (gateway_role.sql:75)
-        with s.pool.connection() as c:
-            before=grants(c)
-            assert open_to_public(c)==[]
-            for n in names:c.execute(f'GRANT EXECUTE ON FUNCTION public.{n} TO PUBLIC')  # what a restore does
-            assert open_to_public(c)==list(names)
-        s.migrate();s.migrate()
-        with s.pool.connection() as c:
-            assert open_to_public(c)==[]
-            assert grants(c)==before
-        with restricted.pool.connection() as c:
-            assert c.execute(f"SELECT has_function_privilege({regproc(names[0])},'EXECUTE') AS ok").fetchone()['ok'] is True
+        try:
+            with s.pool.connection() as c:
+                before=grants(c)
+                assert open_to_public(c)==[]
+                for n in names:c.execute(f'GRANT EXECUTE ON FUNCTION public.{n} TO PUBLIC')  # what a restore does
+                assert open_to_public(c)==list(names)
+            s.migrate();s.migrate()
+            with s.pool.connection() as c:
+                assert open_to_public(c)==[]
+                assert grants(c)==before
+            with restricted.pool.connection() as c:
+                assert c.execute(f"SELECT has_function_privilege({regproc(names[0])},'EXECUTE') AS ok").fetchone()['ok'] is True
+        finally:  # the session database outlives a failing test: close what the simulated restore opened
+            with s.pool.connection() as c:
+                for n in names:c.execute(f'REVOKE ALL ON FUNCTION public.{n} FROM PUBLIC')
 
 
 # spec: ANYM-699
