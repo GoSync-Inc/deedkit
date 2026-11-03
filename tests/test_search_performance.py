@@ -65,10 +65,12 @@ def test_related_chat_check_reads_bounded_messages_in_a_200k_archive(seeded):
         def __getattr__(self,name):return getattr(self.connection,name)
     with s.pool.connection() as c:
         c.execute("SET LOCAL statement_timeout='120s'")
+        # 200k messages over 1000 chats, as an archive spreads them (not one giant chat), all inside the 7-day window.
         c.execute("""INSERT INTO chats(id,account,provider_chat,title,chat_type)
-            VALUES('busy','telegram-demo','busy','Busy','private'),('fresh','telegram-demo','fresh','Fresh','private')""")
+            SELECT 'busy-'||n,'telegram-demo','busy-'||n,'Busy '||n,'private' FROM generate_series(0,999) n
+            UNION ALL SELECT 'fresh','telegram-demo','fresh','Fresh','private'""")
         c.execute("""INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
-            SELECT 'bulk-'||n,'telegram-demo','busy',n::text,'owner','unique-token-'||n||'-end ordinary words around the lease',
+            SELECT 'bulk-'||n,'telegram-demo','busy-'||(n%1000),n::text,'owner','unique-token-'||n||'-end ordinary words around the lease',
                 now()-n*interval '3 seconds','outgoing' FROM generate_series(1,200000) n""")
         c.execute("""INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
             VALUES('fresh-1','telegram-demo','fresh','1','peer','unique-token-50-end ordinary words around the lease',now()-interval '1 second','incoming')""")
@@ -77,7 +79,7 @@ def test_related_chat_check_reads_bounded_messages_in_a_200k_archive(seeded):
         measured=Explained(c)
         found=related_chats.hints(measured,p,[{'id':'fresh','type':'private','last_activity':datetime.now(timezone.utc)}])
     assert found['fresh']['related_chats'][0]['source_message_id']=='bulk-50'
-    assert len(measured.plans)==5 and sum(visited(plan,{'messages'}) for plan in measured.plans)<2000,[(visited(plan,{'messages'}),[(x['Node Type'],x.get('Index Name'),x.get('Actual Rows'),x.get('Rows Removed by Filter'),x.get('Actual Loops')) for x in scans(plan) if x.get('Relation Name')=='messages']) for plan in measured.plans]
+    assert len(measured.plans)==4 and sum(visited(plan,{'messages'}) for plan in measured.plans)<2000,[(visited(plan,{'messages'}),[(x['Node Type'],x.get('Index Name'),x.get('Actual Rows'),x.get('Rows Removed by Filter'),x.get('Actual Loops')) for x in scans(plan) if x.get('Relation Name')=='messages']) for plan in measured.plans]
 
 
 # spec: ANYM-272

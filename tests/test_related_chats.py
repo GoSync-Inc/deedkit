@@ -93,10 +93,25 @@ def test_a_body_too_long_to_compare_whole_never_matches_on_a_prefix(seeded):
     say(s,TG,'near','near-in',head+'beta ending',2)
     say(s,TG,'new','new-in',head+'alpha ending',1)
     assert not any(HINT_KEYS&set(r) for r in rows(s,a).values())
-    # The 2 KB limit counts bytes: 1600 characters of Cyrillic text are 2400 bytes.
-    chat(s,TG,'old2');chat(s,TG,'new2');body='ж '*800
-    say(s,TG,'old2','old2-out',body,3,'outgoing');say(s,TG,'new2','new2-in',body,1)
-    assert not any(HINT_KEYS&set(r) for r in rows(s,a).values())
+    # The 2 KB limit counts bytes. The same shape under the limit does hint (the ASCII token is searchable), so only the
+    # byte guard stops the 2400-byte body: 1600 characters of Cyrillic text.
+    for name,repeat in (('short',300),('long',800)):
+        chat(s,TG,'old-'+name);chat(s,TG,'new-'+name);body='confirmation '+'ж '*repeat
+        say(s,TG,'old-'+name,'old-'+name+'-out',body,3,'outgoing');say(s,TG,'new-'+name,'new-'+name+'-in',body,1)
+    page=rows(s,a)
+    assert 'related_chats' in page['new-short'] and 'related_chats' not in page['new-long']
+
+
+# spec: ANYM-656
+def test_case_variants_the_database_does_not_fold_are_not_a_copy_and_the_ones_it_folds_are_a_broadcast(seeded):
+    s,a,_=seeded;pair(s)
+    kelvin=TEXT.replace('Friday','Fri'+chr(0x212a)+'day')
+    chat(s,TG,'fourth');say(s,TG,'fourth','fourth-out',kelvin,2,'outgoing')
+    with s.pool.connection() as c:
+        same=c.execute("SELECT lower(%s)=lower(%s) AS x",(kelvin,TEXT)).fetchone()['x']
+    # The equality is the database's own lower(): a variant it folds to the same text is a second recipient (a
+    # broadcast, no hint); one it leaves different (ASCII-only collations) is another text, so the hint stands.
+    assert ('related_chats' not in rows(s,a)['new'])==same
 
 
 # spec: ANYM-656
