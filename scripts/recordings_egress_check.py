@@ -96,7 +96,7 @@ def persist():
     return module
 
 
-# The recordings half of the generated /etc/ufw/after.init. It is a function the inference step calls first (see
+# The recordings half of the generated /etc/ufw/after.init. It is a function the inference step calls last (see
 # firewall_persist.compose_after_init) as a bounded child: its exit status (0, 11 restore, 12 and 13 the IPv4 and IPv6
 # hook) is recorded in the same raw-step record, and it never stops the inference half or the hook. Heredoc lines start at column 0 on purpose.
 STEP = r"""recordings_step() {
