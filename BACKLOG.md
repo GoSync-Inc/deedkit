@@ -49,7 +49,7 @@ as new specs on `proposal/2026-10-21-*` branches, so they are off Tiden main unt
 | DK-27 | 465 (was 245) | Evaluate expiring server-managed message approvals |
 | DK-28 | 246 | Extend native WhatsApp capabilities one reviewed operation at a time |
 | DK-29 | 247 | Publish a verified package release with registry receipts |
-| DK-30 | 466 (was 248) | Add authenticated bounded MCP discovery notifications |
+| DK-30 | 466, 735, 740 | Tell MCP clients when their tool list changes: authenticated bounded listen streams (466), host probe (735), one reload sentence (740) |
 | DK-31 | 467 (was 249) | Record disposition of historical telemetry and subscription reviews |
 | DK-33 | 250 | Accept deployed agent-audit behavior on the intended installation |
 | DK-35 | 251 | Establish owner-selected calendar sources and primary/duplicate mapping |
