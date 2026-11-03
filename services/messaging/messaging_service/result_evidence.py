@@ -45,21 +45,27 @@ def send_provenance(c,rows):
                 'owner_approval_verified_by_server':False}
 
 
-def formatting_evidence(c,rows):
-    """Read exact authorized revisions; never attach newer proof to old events."""
+def formatting_evidence(c,rows,*,with_body=False):
+    """Read exact authorized revisions; never attach newer proof to old events.
+
+    with_body (ANYM-737, body_format): the same statement also returns that revision's complete body, kept in an
+    internal field that formatting_readback.attach removes before the response."""
     from .incoming_formatting import unknown
-    missing=[r for r in rows if 'formatting' not in r]
+    from .formatting_readback import BODY_KEY
+    missing=[r for r in rows if ('formatting' not in r or with_body and BODY_KEY not in r)]
     if not missing:return
     # A message may occur at multiple frozen revisions in an update batch.
     pairs=list(dict.fromkeys((r.get('id') or r['message'],r['revision']) for r in missing))
-    proof={(r['message'],r['revision']):r['formatting'] for r in c.execute(
-        """SELECT mr.message,mr.revision,mr.snapshot->'formatting' AS formatting
+    proof={(r['message'],r['revision']):r for r in c.execute(
+        """SELECT mr.message,mr.revision,mr.snapshot->'formatting' AS formatting"""+(""",mr.snapshot->>'body' AS body""" if with_body else '')+"""
             FROM message_revisions mr JOIN unnest(%s::text[],%s::integer[]) AS requested(message,revision)
                 ON mr.message=requested.message AND mr.revision=requested.revision""",
         ([p[0] for p in pairs],[p[1] for p in pairs])).fetchall()}
     for row in missing:
-        value=proof.get((row.get('id') or row['message'],row['revision']))
-        row['formatting']=value if value is not None else unknown()
+        found=proof.get((row.get('id') or row['message'],row['revision']))
+        value=found['formatting'] if found else None
+        if 'formatting' not in row:row['formatting']=value if value is not None else unknown()
+        if with_body:row[BODY_KEY]=found['body'] if found else None
 
 
 def delivery_evidence(c,rows):
@@ -105,7 +111,7 @@ def text_excerpt(c,file,budget):
         'read_more':None if len(head)==total else {**pointer,'offset':len(head)}}
 
 
-def decorate(c,rows,*,order_key=None):
+def decorate(c,rows,*,order_key=None,with_body=False):
     if not rows:return rows
     ids=list({r['id'] for r in rows})
     files=c.execute('''SELECT j.message,j.id AS attachment_id,a.id,a.filename,a.mime,a.bytes,a.digest,
@@ -177,7 +183,7 @@ def decorate(c,rows,*,order_key=None):
         (active,known_classes()))} if active else {}
     send_provenance(c,rows)
     delivery_evidence(c,rows)
-    formatting_evidence(c,rows)
+    formatting_evidence(c,rows,with_body=with_body)
     for row in rows:
         # Some query paths truncate before decoration; never imply these spans
         # address the shortened response body. Do not mutate stored snapshots.
