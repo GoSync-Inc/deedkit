@@ -1156,6 +1156,7 @@ attribute names, not the CloudEvents HTTP binding:
 
 The recordings rows are the producer side only: the feed is served by `services/recordings` (README "Event feed for the module event
 router"); the messaging contract for these two types and the router's use of the `recordings:<seq>` ids come with ANYM-732.
+The recordings feed changes its `journal_id` (a source reset the router operator confirms) whenever its restore marker is lost, damaged, older than or ahead of the database, which includes a crash between a journal commit and the marker fsync: rare, and the safe side, because a possibly reused id is never read as new.
 
 References are `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`; `end_reason` and `outcome` are lowercase
 tokens of at most 48 characters. No titles, places, descriptions, guest names, destinations,

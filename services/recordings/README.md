@@ -455,7 +455,7 @@ an agent key on these routes is `unauthorized` (401). An older package refuses a
   database: a new volume, a restore, a crash between a bump and its marker) leaves the clock as the only watermark, because two
   restores of one snapshot with the clock behind pick the same next incarnation; that bump therefore also gives the journal a new
   `journal_id`: the router reports a source reset and waits for its operator (`set-module-cursor`) instead of reading a possibly
-  reused id as new. Ordinary growth, cap bumps and the first use keep the `journal_id`. The feed refuses to serve with `sequence_space_exhausted` when no incarnation with
+  reused id as new. Ordinary growth, cap bumps and the first use keep the `journal_id`. A crash between a journal commit and the marker fsync is indistinguishable from a restore and rotates it too: one router operator step, rare, and the safe side. The feed refuses to serve with `sequence_space_exhausted` when no incarnation with
   room is left (about 2043).
 - Events (references only, at most 1 KiB, no title, text, label, provider ID, token or URL): `recording.text.archived`
   (`subject` and `data.recording_ref` the opaque ref, `data.account_ref`, `data.revision`; `urgency` `batch`) once per accepted
