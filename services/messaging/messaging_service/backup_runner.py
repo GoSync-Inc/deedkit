@@ -511,6 +511,23 @@ class Runner:
         for entry in root.iterdir():
             if entry in folders:shutil.rmtree(entry)
             else:entry.unlink()
+    def create_calendar_worker(self,work):
+        """The calendar profile's worker: its database, vault and profile files read-only, no files volume."""
+        write_json(self.unsettled_path,{'profile':'calendar','id':self.journal['id'],'container':self.journal['container']})
+        write_json(work/'worker.json',{'profile':'calendar','id':self.journal['id'],'dsn_file':'/run/secrets/database_url',
+            'vault_directory':'/sources/vault','profile_directory':'/sources/profile',
+            'recipient_file':'/run/secrets/recipient','work_directory':'/work'})
+        mounts=self.cfg['state_mounts']
+        self.docker.call('create','--name',self.journal['container'],'--label','personal-os.backup.id='+self.journal['id'],
+            '--label','personal-os.backup.project='+self.cfg['project'],'--network',self.cfg['network'],
+            '--read-only','--user','0','--cap-drop','ALL','--cap-add','DAC_OVERRIDE','--security-opt','no-new-privileges',
+            '--memory','384m','--cpus','0.75','--pids-limit','64','--tmpfs','/tmp:size=32m,noexec,nosuid',
+            '--mount','type=bind,src='+str(work)+',dst=/work',
+            '--mount','type=bind,src='+str(work/'worker.json')+',dst=/run/secrets/backup_config,readonly',
+            '--mount','type=bind,src='+self.cfg['dsn_file']+',dst=/run/secrets/database_url,readonly',
+            '--mount','type=bind,src='+self.cfg['recipient_file']+',dst=/run/secrets/recipient,readonly',
+            '--mount','type=bind,src='+mounts['vault']+',dst=/sources/vault,readonly',
+            '--mount','type=bind,src='+mounts['profile']+',dst=/sources/profile,readonly',self.cfg['image'])
     def create_recordings_worker(self,work):
         """The recordings profile's worker: the staged snapshot read-only, no network, no database, no secrets but age."""
         write_json(self.unsettled_path,{'profile':'recordings','id':self.journal['id'],'container':self.journal['container']})

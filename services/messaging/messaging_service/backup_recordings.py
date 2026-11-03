@@ -180,7 +180,7 @@ def _manifest_valid(manifest):
         try:return isinstance(value,str) and datetime.fromisoformat(value) is not None
         except ValueError:return False
     archive=manifest.get('archive')
-    return (set(manifest)==MANIFEST_KEYS and manifest['profile']=='recordings' and manifest['format']==1 and
+    return (set(manifest)==MANIFEST_KEYS and manifest['profile']=='recordings' and type(manifest['format']) is int and manifest['format']==1 and
             moment(manifest['created_at']) and moment(manifest['captured_at']) and count(manifest['user_version']) and
             count(manifest['bytes'],1) and isinstance(manifest['sha256'],str) and
             bool(re.fullmatch('[a-f0-9]{64}',manifest['sha256'])) and isinstance(archive,dict) and

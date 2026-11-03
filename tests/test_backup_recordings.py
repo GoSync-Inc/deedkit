@@ -267,7 +267,7 @@ def test_a_manifest_that_disagrees_with_the_archive_identity_is_refused(tmp_path
 # spec: ANYM-714
 @pytest.mark.parametrize('field,value', [
     ('bytes', True), ('bytes', 0), ('bytes', '10'), ('user_version', '3'), ('user_version', 3.0), ('sha256', 'A' * 64),
-    ('created_at', 'yesterday'), ('captured_at', 5), ('format', 2), ('archive', []),
+    ('created_at', 'yesterday'), ('captured_at', 5), ('format', 2), ('format', True), ('format', 1.0), ('archive', []),
     ('archive.sequence', '7'), ('archive.sequence', -1), ('archive.records', True), ('archive.incarnation', 0),
     ('archive.incarnation', '1'), ('archive.archive_id', ''), ('archive.archive_id', 'a b'), ('archive.extra', 1)])
 def test_a_manifest_field_of_the_wrong_type_or_range_is_refused_independently_of_the_archive(tmp_path, field, value):
