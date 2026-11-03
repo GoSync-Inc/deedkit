@@ -17,7 +17,7 @@ services:
       # (production.md, "Recordings"); the runner makes one 0700 directory per run inside it and empties it after every
       # run. The default keeps a deploy of this file working before that step; Docker would then create the path
       # root-owned, and the runner refuses such a staging directory (`recordings_staging_unsafe`).
-      - ${RECORDINGS_BACKUP_STAGING:-/opt/deedkit/recordings-backup/staging}:/backup-staging
+      - ${RECORDINGS_BACKUP_STAGING:-/opt/deedkit/recordings-backup/staging}:/run/deedkit/backup-staging
     networks:
       recordings-backend:
         aliases: [recordings-api]

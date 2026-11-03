@@ -1908,7 +1908,7 @@ network `deedkit-recordings-backend` and the enroll tag; the owner revokes the p
 `deedkit-recordings-backup-catchup.timer` the catch-up at 23:15 UTC (from 23:00, only when the last good bundle is older
 than 22 hours); the units and `deploy/backup-runner-recordings.example.json` are installed by ANYM-731, not by a deploy.
 Staging: create `/opt/deedkit/recordings-backup/staging` by hand, owner 10001:10001, mode 0700 (the runner refuses
-`recordings_staging_unsafe`), and mount it at `/backup-staging` in the recordings container
+`recordings_staging_unsafe`), and mount it at `/run/deedkit/backup-staging` in the recordings container
 (`deploy/compose.recordings.yaml`, `RECORDINGS_BACKUP_STAGING`). Admission: the runner starts only when its worst case
 ends 15 minutes before the next start of another profile (worst case plus the unit's two stop budgets, read from their
 timer files; a start already due within its randomized delay plus 120 s is a veto); else `recordings_skipped_window`

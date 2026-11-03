@@ -394,7 +394,7 @@ def recordings_cfg(tmp_path, **overrides):
             'timeout_seconds': 60, 'keep_local': 1, 'host_lock': str(tmp_path / 'messaging' / '.runner.lock'),
             'recordings': {'staging_directory': str(tmp_path / 'staging'), 'state_directory': str(tmp_path / 'state'),
                            'capture_timeout_seconds': 1200, 'container': 'recordings-api-1',
-                           'container_config': '/run/deedkit/recordings/config.json', 'container_staging': '/backup-staging',
+                           'container_config': '/run/deedkit/recordings/config.json', 'container_staging': '/run/deedkit/backup-staging',
                            'timers': [str(tmp_path / 'timers' / 'messaging.timer'),
                                       str(tmp_path / 'timers' / 'calendar.timer')]}, **overrides}
 

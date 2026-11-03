@@ -577,9 +577,9 @@ archive is off (not enabled in the recordings config, or the container is stoppe
 `recordings_skipped_archive_disabled` or `recordings_skipped_container_down`, exit 0, and nothing is staged.
 
 Staging directory: `/opt/deedkit/recordings-backup/staging` on the host (override `RECORDINGS_BACKUP_STAGING`), mounted
-at `/backup-staging` in the recordings container; owner 10001:10001, mode 0700, created by hand at installation
+at `/run/deedkit/backup-staging` in the recordings container; owner 10001:10001, mode 0700, created by hand at installation
 (ANYM-731). The runner refuses any other owner or mode (`recordings_staging_unsafe`). The snapshot is taken by
-`docker exec deedkit-recordings ... --backup-to /backup-staging/<job id>/archive.sqlite` (SQLite Online Backup, one
+`docker exec deedkit-recordings ... --backup-to /run/deedkit/backup-staging/<job id>/archive.sqlite` (SQLite Online Backup, one
 consistent file); the worker reads it in place, so there is no separate copy deadline: the copy runs inside the exec
 deadline, the hash has its own deadline, and the worker refuses `recordings_snapshot_changed` when the file differs from
 the recorded size or sha256.

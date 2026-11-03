@@ -21,7 +21,7 @@
     "capture_timeout_seconds": 1200,
     "container": "deedkit-recordings-recordings-api-1",
     "container_config": "/run/deedkit/recordings/config.json",
-    "container_staging": "/backup-staging",
+    "container_staging": "/run/deedkit/backup-staging",
     "timers": [
       "/etc/systemd/system/personal-os-backup.timer",
       "/etc/systemd/system/deedkit-calendar-backup.timer",

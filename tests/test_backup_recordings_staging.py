@@ -58,7 +58,7 @@ class SnapshotDocker(RecordingsDocker):
     def exec(self, container, args, timeout):
         self.execs.append((container, list(args), timeout))
         target = self.staging / Path(args[-1]).parent.name / 'archive.sqlite'
-        assert args[-1] == f'/backup-staging/{target.parent.name}/archive.sqlite'
+        assert args[-1] == f'/run/deedkit/backup-staging/{target.parent.name}/archive.sqlite'
         if self.mode == 'timeout':
             # The client gave up; the producer inside the container is still writing the file.
             self.processes = [(4242, 'deedkit-recordings --config c.json --backup-to ' + args[-1])]
@@ -155,7 +155,7 @@ def test_the_complete_handoff_snapshot_in_the_running_container_hash_worker_bund
     (name,) = [p.name for p in job.iterdir() if backup_runner.ID.fullmatch(p.name)]
     assert container == CONTAINER and timeout == 300
     assert args == ['deedkit-recordings', '--config', '/run/deedkit/recordings/config.json', '--backup-to',
-                    f'/backup-staging/{name}/archive.sqlite']
+                    f'/run/deedkit/backup-staging/{name}/archive.sqlite']
     # One writer: no container is created from the archive volume, only the offline worker (no network, read-only snapshot).
     create = next(call for call in docker.calls if call[0] == 'create')
     assert [call[0] for call in docker.calls].count('create') == 1 and 'run' not in {call[0] for call in docker.calls}
@@ -696,7 +696,7 @@ def test_a_producer_not_verified_gone_keeps_the_plaintext_marked_until_the_recov
     with pytest.raises(RuntimeError, match='recordings_exec_unverified'):
         runner.run()
     assert status_of(runner)['error_code'] == 'recordings_exec_unverified'
-    assert list(runner.staging_root.iterdir()) != [] and runner.journal['exec_target'].startswith('/backup-staging/')
+    assert list(runner.staging_root.iterdir()) != [] and runner.journal['exec_target'].startswith('/run/deedkit/backup-staging/')
     for _ in range(2):  # again and again: the journal that names the producer is never abandoned while it lives
         with pytest.raises(RuntimeError, match='recordings_exec_unverified'):
             runner.recover_stop()
@@ -888,7 +888,7 @@ def test_the_example_config_loads_and_names_the_timers_of_the_profiles_it_must_n
     assert cfg['profile'] == 'recordings' and cfg['host_lock'] == '/opt/personal-os-probe/backups/.runner.lock'
     assert {Path(t).name for t in cfg['recordings']['timers']} == {
         'personal-os-backup.timer', 'deedkit-calendar-backup.timer', 'deedkit-calendar-backup-catchup.timer'}
-    assert cfg['recordings']['container_staging'] == '/backup-staging'
+    assert cfg['recordings']['container_staging'] == '/run/deedkit/backup-staging'
     assert Path(cfg['recordings']['staging_directory']).parent == Path(cfg['directory']).parent
 
 
@@ -986,10 +986,10 @@ def test_the_catch_up_runs_only_in_the_late_evening_and_only_for_a_snapshot_olde
 def test_the_compose_overlay_mounts_a_writable_staging_directory_at_the_path_the_runner_execs_into(tmp_path):
     document = yaml.safe_load((DEPLOY / 'compose.recordings.yaml').read_text())
     volumes = document['services']['recordings-api']['volumes']
-    (staging,) = [v for v in volumes if v.endswith(':/backup-staging')]
+    (staging,) = [v for v in volumes if v.endswith(':/run/deedkit/backup-staging')]
     cfg = example(tmp_path)
-    assert staging == '${RECORDINGS_BACKUP_STAGING:-' + cfg['recordings']['staging_directory'] + '}:/backup-staging'
-    assert not staging.endswith(':ro') and cfg['recordings']['container_staging'] == '/backup-staging'
+    assert staging == '${RECORDINGS_BACKUP_STAGING:-' + cfg['recordings']['staging_directory'] + '}:/run/deedkit/backup-staging'
+    assert not staging.endswith(':ro') and cfg['recordings']['container_staging'] == '/run/deedkit/backup-staging'
     assert cfg['recordings']['container'] == 'deedkit-recordings-recordings-api-1'
     assert document['services']['recordings-api']['read_only'] is True
     assert document['services']['recordings-api']['user'] == f'{backup_runner.CONTAINER_UID}:{backup_runner.CONTAINER_UID}'

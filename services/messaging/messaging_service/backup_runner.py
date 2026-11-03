@@ -263,7 +263,7 @@ def recordings_config(cfg):
     if any(nested(staging,cfg[key]) for key in ('recipient_file',)) or any(
         nested(staging,cfg['transfer'][key]) for key in ('identity_file','known_hosts_file')):
         raise ValueError('invalid_backup_path')
-    if not isinstance(own['container'],str) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}',own['container']):
+    if not isinstance(own['container'],str) or not (len(own['container'])<=128 and re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]*',own['container'])):
         raise ValueError('invalid_backup_config')
     if not container_path(own['container_config']) or not container_path(own['container_staging']):
         raise ValueError('invalid_backup_path')
