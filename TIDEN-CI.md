@@ -655,7 +655,7 @@ then shown only with its own SHA. A case is active when it has a result in that
 run (`run results --latest-only`) and linked when its `linkedRequirementCount`
 is above zero. Other case rows are stale: counted and listed in the artifact,
 never deleted. The suites are fixed in the script, one path rule each: root
-`tests/`, calendar, calls frontend, calls, gateway, platform contracts
+`tests/`, calendar, calls frontend, calls, gateway, inference (`services/inference/`), platform contracts
 (`packages/platform-contracts/`), release router Go
 (`services/release-router/`, or an `externalId` starting with
 `s:github.com/GoSync-Inc/deedkit/services/release-router::`, since Tiden's Go
