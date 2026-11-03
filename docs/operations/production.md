@@ -1374,6 +1374,8 @@ What is persisted and where (ufw owns `DOCKER-USER`, so a second restore file wo
 | delivery filter chain, `DOCKER-USER` hook, host-bound drops, IPv6 drops | `deedkit-delivery` block in `/etc/ufw/before.rules` and `before6.rules` (the first block; it declares `:DOCKER-USER`) | ufw, at boot and at every `ufw reload` |
 | inference filter chain, `DOCKER-USER` hook, host-bound drops (`dk-inference0`, `dk-inferencedb0`), IPv6 drops | `deedkit-inference` block in the same two files, after the delivery block (it declares only its own chain) | ufw |
 | inference raw chain and the `raw` `PREROUTING` jumps (IPv4 chain, IPv4 and IPv6 jump) | `/etc/ufw/after.init` (mode 0755, root), `rules --format after-init` | ufw, with `start`, after it has loaded its rules |
+| recordings filter chain, `DOCKER-USER` hook, host-bound drops (`dk-recordings0`, `dk-recbackend0`), IPv6 drops (ANYM-712) | `deedkit-recordings` block in the same two files, after the delivery block (it declares only its own chain) | ufw |
+| recordings raw chain and the `raw` `PREROUTING` jumps | a function of the same `/etc/ufw/after.init`, which is then generated from both families (`rules --format after-init` of either script) | ufw, with `start` |
 | comparison and boot receipt | `verify` of both scripts; `deedkit-firewall-verify.service`, which writes `/var/lib/deedkit/firewall-verify.json` | each boot, after `ufw.service` and `docker.service` |
 
 The raw table is not in ufw's files because restoring them would flush Docker's own raw rules. `after.init` replaces
@@ -1735,6 +1737,50 @@ file a regular file of mode 0600 owned by 10001. Paths inside `config.json` are 
 `deploy/recordings-archive.example.json` adds the archive (under `/data/archive`, never a `/private/...` path of the
 README example) and each account's `archive_namespace`, and is used only after the archive gates pass. The owner
 writes the provider keys by hand; the agent only checks modes and that a file is not empty.
+
+**Network confinement (ANYM-712).** `recordings-api` joins only `recordings-backend` (internal) and `recordings-egress`
+(bridge `dk-recordings0`, no IPv6); no other service joins the egress bridge. `scripts/recordings_egress_check.py` prints the
+host rules (`rules --resolver IP`, with `--undo` for the exact inverse): the chain `DEEDKIT-RECORDINGS` allows UDP and TCP 53
+to the host resolver, drops `0.0.0.0/8`, `10/8`, `100.64/10` (tailnet), `127/8`, `169.254/16` (metadata), `172.16/12`,
+`192.0.0/24`, `192.168/16`, `198.18/15`, multicast and reserved, allows TCP 443 and drops everything else. It is hooked twice,
+in `DOCKER-USER` and in raw `PREROUTING` (Tailscale's `ts-forward` accept can precede `DOCKER-USER`; the raw hook runs before
+conntrack and cannot be passed over by a reorder), plus `INPUT` drops for `dk-recordings0` and `dk-recbackend0` (no route to the
+host itself) and IPv6 drops in all three places. It never edits the inference or delivery rules.
+
+Persistence follows "Host firewall persistence (ANYM-693)": the filter blocks go into the `deedkit-recordings` block of
+`/etc/ufw/before.rules` and `before6.rules` (`rules --resolver $RECORDINGS_RESOLVER --format ufw --family v4|v6 --source FILE`
+merges it after the delivery block), the raw half is a function of the ONE generated `/etc/ufw/after.init`
+(`rules --resolver $RECORDINGS_RESOLVER --mini-ip $INFERENCE_MINI_IP --format after-init`; the inference script prints the same
+text with `--recordings-resolver`). `RECORDINGS_RESOLVER` (the host's DNS resolver the container uses, IPv4) is a new line of
+`/opt/personal-os-probe/.env`; with it set, both `verify` commands expect the composed hook, without it the hook is the
+inference-only text of before. `recordings_egress_check.py verify` prints `ok` or `<pair> <code>`; the boot receipt gets a
+`recordings` key (`not_installed` until the resolver is configured, then it decides `ok`).
+
+Order for the root activation (the plan is Astra-reviewed, none runs during an active call): install the updated
+`firewall_persist.py`, `inference_egress_check.py`, `recordings_egress_check.py` to `/usr/local/lib/deedkit/` FIRST (the old
+inference verifier would read the composed hook as `table_differs:raw`); then the ANYM-693 "Safe order" steps with the new
+block and hook; `verify` of all three scripts must print `ok`; only then start `recordings-api`. To remove: stop
+`recordings-api` first, then run the rules' `undo` (it removes only the recordings rules and the composed hook goes back to
+the inference-only text, with `RECORDINGS_RESOLVER` removed from the env file).
+
+**Egress admission.** The overlay sets `RECORDINGS_EGRESS_ADMISSION=required` and requires `RECORDINGS_EGRESS_BLOCKED` and
+`RECORDINGS_EGRESS_OPEN` (comma-separated, in the project's env file; Compose refuses a missing one). Before the CLI binds its
+port it probes them from inside the container: every blocked `IP:PORT` (a known host listener, a tailnet address with a known
+listener, the gateway's listener; `dns:IP` for a DNS query) must get no answer (timeout or no route; a refusal fails, since a
+DROP never sends one), every open target (`api.omi.me:443`, `dns:<RESOLVER_IP>`) must answer. Otherwise it exits 78 and
+`restart: unless-stopped` loops only this service; the gateway returns its recordings tool error, nothing else depends on
+it. This covers boot, promotion and any restart. Source runs and tests leave the variable unset and skip it. The probes send
+a TCP handshake and one DNS query, never a token.
+
+The production read-back runs `check` from the real two-network container (`docker compose $F exec -T recordings-api python -I -
+check --open api.omi.me:443 --open-dns RESOLVER --blocked HOST_BRIDGE_IP:PORT --blocked TAILNET_IP:PORT --blocked
+GATEWAY_IP:PORT < scripts/recordings_egress_check.py`; every blocked target needs a known listener, or "blocked" could mean
+that nothing listens; `listen` in a sibling container is the positive control).
+
+*Residual, documented:* the bridge does not pin hostnames. Any public HTTPS host is reachable by the container; host pinning
+rests on the adapters' fixed origins (`api.omi.me`, `mcp.plaud.ai`) and refused redirects and proxies (`trust_env=False` in
+`omi.py` and `plaud.py`, with their tests) until a proxy-capable adapter exists. Follow-up card candidate: a hostname-allowlisting
+egress (a proxy or DNS-level allowlist) for the recordings bridge.
 
 **First publication (owner action, once).** GHCR creates the new package `deedkit-recordings` private. The host has
 no GitHub token and `production.py` reads the registry anonymously, so before the first start an organization owner

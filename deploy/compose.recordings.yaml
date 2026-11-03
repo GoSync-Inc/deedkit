@@ -17,6 +17,13 @@ services:
         aliases: [recordings-api]
       recordings-egress: {}
     restart: unless-stopped
+    environment:
+      # ANYM-712: the service refuses to bind its port unless the host egress rules are in force (production.md,
+      # "Recordings"): every BLOCKED target (IP:PORT with a known listener, or dns:IP) must get no answer, every OPEN
+      # target (HOST:PORT, or dns:RESOLVER_IP) must answer. Both lists are required: a missing one refuses the start.
+      RECORDINGS_EGRESS_ADMISSION: required
+      RECORDINGS_EGRESS_BLOCKED: ${RECORDINGS_EGRESS_BLOCKED:?Set the blocked egress probe targets (IP:PORT, comma-separated)}
+      RECORDINGS_EGRESS_OPEN: ${RECORDINGS_EGRESS_OPEN:?Set the open egress probe targets (HOST:PORT or dns:IP, comma-separated)}
     # Liveness only: one unauthenticated POST must be refused with 401, which proves the app answers without
     # any key and without contacting a vendor. Prints nothing.
     healthcheck:

@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import collections
 import datetime
+import importlib.util
 import json
 import os
 import re
@@ -229,16 +230,44 @@ def extract(text, table, chain, bridges, family='v4', kernel=False):
     return found
 
 
-def extract_hook(text, chain):
-    """The raw-table rules a generated after.init holds: the restore payload and the `ensure` hook lines."""
+def extract_hook(text, chain, fail='fail '):
+    """The raw-table rules a generated after.init holds: the restore payload and the `ensure` hook lines of one chain.
+
+    `fail` is the regular expression that follows `||` on the family's own hook lines (the inference half says `fail `,
+    the recordings half `{ REC_FAIL=`), so one composed hook is read once per family and never mixed.
+    """
     found = {'raw': empty_table(), 'raw6': empty_table()}
     for raw in text.splitlines():
         line = raw.strip()
         if line.startswith(f'-A {chain} '):
             found['raw']['chain'].append(canon(line))
-        elif match := re.match(r'ensure (ip6?tables) (PREROUTING .*?) \|\| fail ', line):
+        elif match := re.match(rf'ensure (ip6?tables) (PREROUTING .*?) \|\| {fail}', line):
             found['raw6' if match.group(1) == 'ip6tables' else 'raw']['hooks'].append(canon(f'-A {match.group(2)}'))
     return found
+
+
+def load(name):
+    """A sibling script as a module (the families compose one hook, so each needs the other's text)."""
+    path = Path(__file__).resolve().with_name(f'{name}.py')
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def compose_after_init(base, step):
+    """The inference after.init `base` with the recordings function `step` added (ANYM-712), or `base` when `step` is None.
+
+    The function is defined before `step()` and runs first, so a failure of either half neither skips nor undoes the
+    other; its reason (REC_FAIL) is recorded in the same raw-step record at the end, and the hook still exits 0.
+    """
+    if step is None:
+        return base
+    head, tail = 'step() {\n', '    record true ok\n}'
+    if base.count(head) != 1 or base.count(tail) != 1:
+        die('the inference after.init has an unexpected shape; not composing')
+    done = ('    if [ -n "$REC_FAIL" ]; then log "failed: $REC_FAIL"; record false "$REC_FAIL"; else record true ok; fi\n}')
+    return base.replace(head, step + head + '    REC_FAIL=\n    recordings_step\n').replace(tail, done)
 
 
 def compare(expected, actual, label, address=None):
@@ -375,7 +404,19 @@ def receipt_state(path, boot_id):
     return 'receipt ok' if data.get('ok') is True else 'receipt not_ok'
 
 
-def verify_cli(argv, spec_for, key, description, address=None):
+def env_optional(path, key):
+    """The value of `key` in the env file, or None when the file or the key is absent."""
+    try:
+        for line in Path(path).read_text().splitlines():
+            name, _, value = line.strip().partition('=')
+            if name == key and value:
+                return value.strip().strip('\'"')
+    except OSError:
+        pass
+    return None
+
+
+def verify_cli(argv, spec_for, key, description, address=None, also=None, also_required=False):
     """`verify`: repository vs persisted files vs kernel. Prints `ok` or `<pair> <code>` lines; exit 1 on any."""
     parser = argparse.ArgumentParser(prog='verify', description=description)
     parser.add_argument('--env-file', default=ENV_FILE)
@@ -390,7 +431,13 @@ def verify_cli(argv, spec_for, key, description, address=None):
     parser.add_argument('--boot-id', default=None)
     args = parser.parse_args(argv)
     try:
-        spec = spec_for(env_value(args.env_file, key))
+        if also is None:
+            spec = spec_for(env_value(args.env_file, key))
+        else:
+            # The generated hook holds both families: `also` is the other family's input (optional for inference, where
+            # an absent value means the hook has no recordings half).
+            other = env_value(args.env_file, also) if also_required else env_optional(args.env_file, also)
+            spec = spec_for(env_value(args.env_file, key), other)
     except (ValueError, argparse.ArgumentTypeError) as error:
         die(f'{key}: {error}')
     expected, chain, bridges = spec['tables'], spec['chain'], spec['bridges']
@@ -400,7 +447,7 @@ def verify_cli(argv, spec_for, key, description, address=None):
     # ufw runs the hook only when it is executable; a hook that is not byte for byte the generated one differs even when
     # its rules are the same (it could stop early).
     runs = spec['after_init'] is not None and os.access(args.after_init, os.X_OK)
-    hooked = extract_hook(hook, chain) if runs else {'raw': empty_table(), 'raw6': empty_table()}
+    hooked = extract_hook(hook, chain, spec.get('hook_fail', 'fail ')) if runs else {'raw': empty_table(), 'raw6': empty_table()}
     persisted = {'filter': found['filter'], 'v6': found['v6'], **hooked}
     lines = []
     code = declaration_diff(expected, found, chain) or first_diff(expected, persisted, address)
@@ -497,16 +544,24 @@ def receipt_cli(argv):
     parser.add_argument('--out', default=RECEIPT)
     parser.add_argument('--boot-id', default=None)
     parser.add_argument('--raw-state', default=RAW_STATE)
+    parser.add_argument('--env-file', default=ENV_FILE)
     parser.add_argument('--systemctl', default='systemctl')
     parser.add_argument('--docker', default='docker')
     parser.add_argument('--verify', action='append', default=[], metavar='NAME=COMMAND',
-                        help='replace the verify command of inference or delivery (tests)')
+                        help='replace the verify command of inference, delivery or recordings (tests)')
     args = parser.parse_args(argv)
     boot = args.boot_id or read(BOOT_ID).strip()
     custom = dict(item.partition('=')[::2] for item in args.verify)
     here = Path(__file__).resolve().parent
     results = {}
-    for name in ('inference', 'delivery'):
+    # The recordings pair is part of the receipt once its resolver is configured (ANYM-712); before that it reads
+    # `not_installed` and does not decide `ok`, so a host that has not enrolled recordings keeps its green receipt.
+    names = ['inference', 'delivery']
+    if 'recordings' in custom or env_optional(args.env_file, 'RECORDINGS_RESOLVER'):
+        names.append('recordings')
+    else:
+        results['recordings'] = 'not_installed'
+    for name in names:
         command = shlex.split(custom[name]) if name in custom else [sys.executable, str(here / f'{name}_egress_check.py'), 'verify']
         try:
             done = subprocess.run(command, text=True, capture_output=True, timeout=LIMIT)
@@ -524,7 +579,8 @@ def receipt_cli(argv):
     ufw = unit_time(args.systemctl, 'ufw.service', 'ExecMainExitTimestampMonotonic')
     container = first_container_start(args.docker)
     receipt = {'boot_id': boot, 'inference': results['inference'], 'delivery': results['delivery'],
-               'ok': all(value == 'ok' for value in results.values()),
+               'recordings': results['recordings'],
+               'ok': all(value == 'ok' for name, value in results.items() if name in names),
                'ufw_rules_loaded_monotonic': ufw, 'raw_step_monotonic': raw_time, 'raw_step_ok': raw_ok,
                'docker_start_monotonic': unit_time(args.systemctl, 'docker.service', 'ExecMainStartTimestampMonotonic'),
                'first_container_monotonic': container,
