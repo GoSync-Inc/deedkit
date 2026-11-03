@@ -42,29 +42,13 @@ def test_idempotent_ingest_revision_and_snapshot_history(archive):
 
 
 # spec: ANYM-733
-def test_reconcile_creating_a_recent_message_is_journaled_as_live_recovered(archive):
+def test_reconcile_creating_a_recent_message_keeps_reconcile_in_the_journal(archive):
+    # Subscriptions derive `live_recovered` when they read; the journal, the feed and older readers see `reconcile`.
     ar,s,_,_=archive
-    now=datetime.now(timezone.utc)
-    def at(delta): return (now-delta).isoformat()
-    def origins(mid):
-        with s.pool.connection() as c:
-            return [r['origin'] for r in c.execute('SELECT origin FROM events WHERE message=%s ORDER BY id',(mid,)).fetchall()]
-    cases=[('reconcile',timedelta(hours=5,minutes=59),'live_recovered'),
-           ('reconcile',timedelta(hours=6,minutes=1),'reconcile'),
-           ('reconcile',timedelta(hours=-1),'reconcile'),
-           ('backfill',timedelta(minutes=1),'backfill'),
-           ('live',timedelta(minutes=1),'live')]
-    for number,(origin,age,expected) in enumerate(cases):
-        sent=at(age)
-        mid=ar.ingest(event(provider_id=str(200+number),origin=origin,sent_at=sent,updated_at=sent))['message']
-        assert origins(mid)==[expected],(origin,age)
-    # The same envelope again is a duplicate and journals nothing; a reconcile edit keeps its own origin.
-    sent=at(timedelta(minutes=5))
-    first=event(provider_id='300',origin='reconcile',sent_at=sent,updated_at=sent)
-    mid=ar.ingest(first)['message']
-    assert ar.ingest(first)['outcome']=='duplicate' and origins(mid)==['live_recovered']
-    edited=event(provider_id='300',origin='reconcile',sent_at=sent,body='edited',updated_at=at(timedelta(minutes=4)))
-    assert ar.ingest(edited)['outcome']=='edited' and origins(mid)==['live_recovered','reconcile']
+    sent=(datetime.now(timezone.utc)-timedelta(minutes=5)).isoformat()
+    mid=ar.ingest(event(provider_id='300',origin='reconcile',sent_at=sent,updated_at=sent))['message']
+    with s.pool.connection() as c:
+        assert [r['origin'] for r in c.execute('SELECT origin FROM events WHERE message=%s',(mid,)).fetchall()]==['reconcile']
 
 
 def test_same_version_conflict_is_explicit_no_overwrite(archive):

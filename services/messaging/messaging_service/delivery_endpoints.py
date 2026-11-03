@@ -1188,8 +1188,12 @@ def hint_body(c, hint, row, p):
     references = []
     for item in matches:
         evidence = item['evidence']
+        # ANYM-733: the definer function returns no sent_at, so a reconcile-created message that matched a selector
+        # without `reconcile` matched as recovered (subscriptions.view_origin); the fetch shows the exact origin.
+        origin = ('live_recovered' if item['origin'] == 'reconcile' and item['kind'] == 'message.created' and
+            'reconcile' not in row['selector']['origins'] else item['origin'])
         reasons = wake_reason({**evidence, 'account': item['account'], 'kind': item['kind'],
-            'historical': item['origin'] in ('backfill', 'reconcile'),
+            'historical': origin in ('backfill', 'reconcile'),
             'reply_to_own_send': flags.get(item['event'], {}).get('own_send_reply') is True}, row['selector'])
         reference = {'event_id': item['event'], 'kind': item['kind'], 'occurred_at': serial(item['created_at']),
             'wake_reason': reasons, 'account_id': item['account'], 'chat_id': evidence.get('chat'),

@@ -415,9 +415,11 @@ def test_a_recovered_message_is_a_live_wake_reason_in_the_hint_window_and_an_old
     token = identity(store)
     live = bound(store, token, tmp_path, {'debounce_s': 600}, origins=['live'])
     old = bound(store, token, tmp_path, {'debounce_s': 600}, origins=['reconcile'])
-    for message, origin in (('demo-tg-1', 'reconcile'), ('demo-tg-2', 'live_recovered')):
+    with store.pool.connection() as c:
+        c.execute("UPDATE messages SET sent_at=clock_timestamp()-interval '1 hour' WHERE id='demo-tg-2'")
+    for message in ('demo-tg-1', 'demo-tg-2'):
         with store.pool.connection() as c:
-            store.append_event(c, 'telegram-demo', message, origin=origin)
+            store.append_event(c, 'telegram-demo', message, origin='reconcile')
         match_subscriptions(store)
     with store.pool.connection() as c:
         reasons = {name: c.execute('SELECT match_count,reasons FROM subscription_hint_windows WHERE subscription=%s',

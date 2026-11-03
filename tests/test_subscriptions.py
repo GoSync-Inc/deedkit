@@ -47,6 +47,33 @@ def test_defaults_start_at_committed_head_and_do_not_ack(seeded):
     assert len(store.get_updates(old, 'existing')['items']) == 5
 
 
+def sent_ago(store, message, interval):
+    """The message was sent this long ago; an event appended afterwards snapshots that time."""
+    with store.pool.connection() as c:
+        c.execute('UPDATE messages SET sent_at=clock_timestamp()-%s::interval WHERE id=%s', (interval, message))
+
+
+# spec: ANYM-733
+@pytest.mark.parametrize('origin,kind,sent_at,expected', [
+    ('reconcile', 'message.created', '2026-11-03T06:01:00+00:00', 'live_recovered'),
+    ('reconcile', 'message.created', '2026-11-03T06:00:00+00:00', 'live_recovered'),
+    ('reconcile', 'message.created', '2026-11-03T05:59:00+00:00', 'reconcile'),
+    ('reconcile', 'message.created', '2026-11-03T12:00:00+00:00', 'live_recovered'),
+    ('reconcile', 'message.created', '2026-11-03T12:00:01+00:00', 'reconcile'),
+    ('reconcile', 'message.created', '2026-11-03T06:01:00', 'reconcile'),
+    ('reconcile', 'message.created', 'not a time', 'reconcile'),
+    ('reconcile', 'message.created', None, 'reconcile'),
+    ('reconcile', 'message.edited', '2026-11-03T11:00:00+00:00', 'reconcile'),
+    ('reconcile', 'message.deleted', '2026-11-03T11:00:00+00:00', 'reconcile'),
+    ('backfill', 'message.created', '2026-11-03T11:00:00+00:00', 'backfill'),
+    ('live', 'message.created', '2026-11-03T11:00:00+00:00', 'live'),
+    ('fixture', 'message.created', '2026-11-03T11:00:00+00:00', 'fixture')])
+def test_view_origin_marks_only_a_recent_reconcile_created_message_as_recovered(origin, kind, sent_at, expected):
+    from messaging_service.subscriptions import view_origin
+    committed = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
+    assert view_origin(origin, kind, sent_at, committed) == expected
+
+
 # spec: ANYM-733
 def test_live_recovered_events_match_live_and_reconcile_selectors_and_are_not_historical(seeded):
     store, _, _ = seeded
@@ -56,15 +83,22 @@ def test_live_recovered_events_match_live_and_reconcile_selectors_and_are_not_hi
     sids = {name: create(store, token, label=name, origins=origins)['subscription_id']
         for name, origins in selectors.items()}
     plain = emit(store)
-    recovered = emit(store, 'demo-tg-2', origin='live_recovered')
+    # Sent 1 hour ago and first stored by reconcile: recovered. Sent in October and first stored by reconcile: historical.
+    sent_ago(store, 'demo-tg-2', '1 hour')
+    recovered = emit(store, 'demo-tg-2', origin='reconcile')
+    old = emit(store, 'demo-tg-1', origin='reconcile')
     match_subscriptions(store)
     pages = {name: store.get_subscription_events(token, sid)['items'] for name, sid in sids.items()}
     assert {name: [item['event_id'] for item in items] for name, items in pages.items()} == {
         'default': [plain, recovered], 'live': [plain, recovered], 'recovered': [recovered],
-        'reconcile': [recovered], 'old_only': []}
+        'reconcile': [recovered, old], 'old_only': []}
     item = pages['recovered'][0]
     assert item['origin'] == 'live_recovered' and item['historical'] is False
     assert 'historical_event' not in item['wake_reason']
+    by_event = {item['event_id']: item for item in pages['reconcile']}
+    assert by_event[old]['origin'] == 'reconcile' and by_event[old]['historical'] is True
+    with store.pool.connection() as c:
+        assert c.execute('SELECT origin FROM events WHERE id=%s', (recovered,)).fetchone()['origin'] == 'reconcile'
     with pytest.raises(APIError) as error:
         create(store, token, origins=['live_recovered', 'unknown'])
     assert error.value.code == 'invalid_filter'
@@ -77,7 +111,8 @@ def test_a_recovered_message_wakes_like_a_live_one_and_an_old_reconcile_one_does
     sid = create(store, token, origins=['live', 'live_recovered', 'reconcile'],
         wake_rules=['incoming_message'])['subscription_id']
     old = emit(store, origin='reconcile')
-    recovered = emit(store, 'demo-tg-2', origin='live_recovered')
+    sent_ago(store, 'demo-tg-2', '1 hour')
+    recovered = emit(store, 'demo-tg-2', origin='reconcile')
     match_subscriptions(store)
     items = store.get_subscription_events(token, sid)['items']
     assert [item['event_id'] for item in items] == [recovered]

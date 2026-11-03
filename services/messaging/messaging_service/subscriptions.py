@@ -7,7 +7,7 @@ advances each checkpoint in the same transaction as its matching references.
 from __future__ import annotations
 
 from collections import Counter
-from datetime import timedelta
+from datetime import datetime, timedelta
 import json
 import os
 from uuid import UUID
@@ -24,9 +24,23 @@ FAILURE_KINDS = frozenset(('send.failed', 'source.health'))
 # A journal write the send or collector path survived, per kind, since process start.
 JOURNAL_FAILURES = Counter()
 ORIGINS = frozenset(('live', 'live_recovered', 'fixture', 'backfill', 'reconcile'))
-# ANYM-733: a message the live stream lost and a reconcile pass found soon after (archive.journal_origin) is live for
-# `live` selectors, and still seen by the `reconcile` selectors that already received it.
+# ANYM-733: a message the live stream lost and a reconcile pass first stored soon after is live for a subscription. The
+# journal keeps origin `reconcile` (the feed and an older matcher read it unchanged); `view_origin` derives
+# `live_recovered` from the event's own times, so it needs no stored value, schema or writer change.
+RECOVERED_WINDOW = timedelta(hours=6)
 RECOVERED_SELECTORS = frozenset(('live', 'live_recovered', 'reconcile'))
+
+
+def view_origin(origin, kind, sent_at, committed_at):
+    """The origin a subscription sees: `live_recovered` for a reconcile-created message committed 0 to 6 h after it
+    was sent; the stored origin otherwise, also for a missing, naive or unparsable sent_at."""
+    if origin != 'reconcile' or kind != 'message.created' or not isinstance(sent_at, str):
+        return origin
+    try:
+        age = committed_at - datetime.fromisoformat(sent_at)
+    except (TypeError, ValueError):
+        return origin
+    return 'live_recovered' if timedelta(0) <= age <= RECOVERED_WINDOW else origin
 
 
 def origin_selected(origin, selected):
@@ -554,11 +568,13 @@ def get_subscription_events(store, c, p, subscription_id, *, after=0, limit=50, 
         (row['id'], after, *args, limit + 1)).fetchall()
     fields = ('message', 'account', 'chat', 'sender', 'provider_id', 'revision', 'sent_at',
         'direction', 'deleted', 'processing', 'metadata', 'reply_evidence', 'send_id', 'error_code', 'status')
+    seen = [view_origin(event['origin'], event['kind'], event['snapshot'].get('sent_at'), event['created_at'])
+        for event in events[:limit]]
     items = [{**{key: event['snapshot'][key] for key in fields if key in event['snapshot']},
-        'event_id': event['id'], 'kind': event['kind'], 'origin': event['origin'],
+        'event_id': event['id'], 'kind': event['kind'], 'origin': origin,
         'revision': event['revision'], 'observed_at': event['created_at'],
-        'historical': event['origin'] in ('backfill', 'reconcile'),
-        'matching_basis': 'exact_event_revision'} for event in events[:limit]]
+        'historical': origin in ('backfill', 'reconcile'),
+        'matching_basis': 'exact_event_revision'} for event, origin in zip(events, seen)]
     from .subscription_consumption import wake_reason
     for item, event in zip(items, events):
         item['wake_reason'] = wake_reason({**item, 'reply_to_own_send': event['own_send_reply']}, row['selector'])
@@ -627,13 +643,15 @@ def match_subscriptions(store, *, batch_size=250, max_subscriptions=32):
                 stats['access_changed'] += 1
                 continue
             head = c.execute('SELECT value FROM feed_counter WHERE id=1').fetchone()['value']
-            events = c.execute('''SELECT id,account,kind,origin,
+            events = c.execute('''SELECT id,account,kind,origin,created_at,snapshot->>'sent_at' AS sent_at,
                 jsonb_strip_nulls(jsonb_build_object('chat',snapshot->'chat',
                     'sender',snapshot->'sender','direction',snapshot->'direction',
                     'metadata',snapshot->'metadata','reply_evidence',snapshot->'reply_evidence',
                     'principal',snapshot->'principal','key_id',snapshot->'key_id')) AS snapshot
                 FROM events WHERE id>%s AND id<=%s ORDER BY id LIMIT %s''',
                 (row['matched_through'], head, batch_size)).fetchall()
+            for event in events:
+                event['origin'] = view_origin(event['origin'], event['kind'], event['sent_at'], event['created_at'])
             count = c.execute('SELECT count(*) AS n FROM subscription_matches WHERE subscription=%s',
                 (row['id'],)).fetchone()['n']
             lookup = {(source['account'], source['chat']): source['sender_ids'] for source in sources}

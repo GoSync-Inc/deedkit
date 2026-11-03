@@ -290,13 +290,17 @@ def _absorb_page(c, row, binding, window, limit, p=None):
         start = window['hinted_through'] if window['hinted_through'] is not None else row['start_position']
     # ANYM-522: references a dynamic definition cannot show now give no reason, count or match time.
     columns, args = reference_columns(row, p)
-    matches = c.execute('''SELECT m.event,m.matched_at,e.account,e.kind,e.origin,''' + columns + ''',
+    matches = c.execute('''SELECT m.event,m.matched_at,e.account,e.kind,e.origin,e.created_at AS committed_at,
+        e.snapshot->>'sent_at' AS sent_at,''' + columns + ''',
         jsonb_strip_nulls(jsonb_build_object('chat',e.snapshot->'chat',
             'sender',e.snapshot->'sender','direction',e.snapshot->'direction',
             'metadata',e.snapshot->'metadata','reply_evidence',e.snapshot->'reply_evidence')) AS snapshot
         FROM subscription_matches m JOIN events e ON e.id=m.event
         WHERE m.subscription=%s AND m.event>%s ORDER BY m.event LIMIT %s''',
         (*args, row['id'], start, limit)).fetchall()
+    from .subscriptions import view_origin
+    for item in matches:
+        item['origin'] = view_origin(item['origin'], item['kind'], item['sent_at'], item['committed_at'])
     if not matches:
         return 0
     shown = [item for item in matches if item['visible']]

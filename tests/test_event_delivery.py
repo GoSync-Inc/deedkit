@@ -1039,7 +1039,7 @@ def test_address_check_refuses_nat64_6to4_teredo_mapped_multicast_and_cgnat(addr
         '2606:2800:220:1::1']
 
 
-def endpoint_setup(store, tmp_path, monkeypatch, *, events=1):
+def endpoint_setup(store, tmp_path, monkeypatch, *, events=1, origin='live', sent_ago=None):
     import base64
     policy = tmp_path / 'delivery-policy.json'
     policy.write_text(json.dumps({'allow_hosts': ['example.test']}))
@@ -1057,9 +1057,27 @@ def endpoint_setup(store, tmp_path, monkeypatch, *, events=1):
     sid = store.create_subscription(token, ['telegram-demo-chat'], label='Synthetic endpoint',
         delivery={'endpoint_id': endpoint['endpoint_id']})['subscription_id']
     with store.pool.connection() as c:
-        ids = [store.append_event(c, 'telegram-demo', 'demo-tg-1', origin='live') for _ in range(events)]
+        if sent_ago:
+            c.execute('UPDATE messages SET sent_at=clock_timestamp()-%s::interval WHERE id=%s', (sent_ago, 'demo-tg-1'))
+        ids = [store.append_event(c, 'telegram-demo', 'demo-tg-1', origin=origin) for _ in range(events)]
     match_subscriptions(store)
     return token, endpoint, sid, ids
+
+
+# spec: ANYM-733
+def test_endpoint_hint_reference_of_a_recovered_message_is_not_historical(seeded, tmp_path, monkeypatch):
+    from messaging_service.event_delivery import dispatch_hints
+    store, _, _ = seeded
+    try:
+        token, endpoint, sid, ids = endpoint_setup(store, tmp_path, monkeypatch, origin='reconcile', sent_ago='1 hour')
+        sent = []
+        assert dispatch_hints(store, transport=lambda url, body, headers, **k: sent.append(body) or 204,
+            resolver=lambda *a, **k: ['93.184.216.34'])['delivered'] == 1
+    finally:
+        store.set_delivery_features(False)
+    payload = json.loads(sent[0])
+    assert [ref['event_id'] for ref in payload['references']] == ids
+    assert payload['references'][0]['wake_reason'] == ['incoming_message']
 
 
 # spec: ANYM-519

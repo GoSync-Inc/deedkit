@@ -1,6 +1,6 @@
 """Durable ingestion and worker leases. Used only by operator/collector DB roles."""
 from contextlib import contextmanager
-from datetime import datetime,timedelta,timezone
+from datetime import datetime,timedelta
 import hashlib
 import os
 import stat
@@ -42,18 +42,6 @@ def whatsapp_user(sender):
 # history and reconcile paths can read one message's time a few seconds apart (ANYM-530 class A).
 WHATSAPP_SENT_AT_TOLERANCE=timedelta(seconds=6)
 REVISION_FIELDS=('message','provider_chat','chat','revision')
-
-# ANYM-733: a message the live stream lost and a reconcile pass first stores within this long of its sent_at
-# is journaled as `live_recovered`, so live subscriptions still see it; an older one stays `reconcile`.
-RECOVERED_WINDOW=timedelta(hours=6)
-
-
-def journal_origin(e,outcome):
-    """The origin the journal event gets: the envelope's own, except a recent reconcile-created message."""
-    if outcome!='created' or e['origin']!='reconcile':return e['origin']
-    try:age=datetime.now(timezone.utc)-datetime.fromisoformat(e['sent_at'])
-    except (TypeError,ValueError):return e['origin']
-    return 'live_recovered' if timedelta(0)<=age<=RECOVERED_WINDOW else e['origin']
 
 
 def whatsapp_sent_at_jitter(retained,candidate):
@@ -452,7 +440,7 @@ class Archive:
             if outcome in ('created','edited','deleted'):
                 from .reply_evidence import capture as capture_reply
                 reply = capture_reply(c,e,cid) if outcome=='created' else None
-                self.store.append_event(c,aid,mid,'message.'+outcome,journal_origin(e,outcome),receipt,
+                self.store.append_event(c,aid,mid,'message.'+outcome,e['origin'],receipt,
                     snapshot_metadata={'reply_evidence':reply} if reply else None)
             if not previous:c.execute('INSERT INTO ingest_receipts(digest,account,envelope,outcome) VALUES(%s,%s,%s,%s)',
                 (receipt,aid,Jsonb(captured),outcome))
