@@ -563,10 +563,10 @@ class Store:
             return advance(self,c,p,intent_id,open_chat=open_grants(arguments),
                            files=arguments.get('allow_files') is not False)
 
-    def get_send_status(self,token,send_id):
+    def get_send_status(self,token,send_id=None,request_id=None):
         from .outgoing import status
         with self.authorized(token,'get_send_status') as (c,p):
-            return status(c,p,send_id)
+            return status(c,p,send_id,request_id)
 
     def prepare_file_upload(self,token,account,chat_id,filename,mime,bytes,sha256,request_id):
         from .uploads import prepare

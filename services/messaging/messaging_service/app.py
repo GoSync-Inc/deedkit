@@ -89,7 +89,7 @@ OMITTED_WHEN_NONE = {'create_subscription':('chat_ids','sources','wake_rules','r
     'search_files':('media_kind','ready'),
     'list_delivery_attempts':('before',),
     # ANYM-736: an omitted guard keeps every request, hash and stored row as before.
-    'send_message':('expected_last_message_id','guard')}
+    'send_message':('expected_last_message_id','guard'),'get_send_status':('send_id','request_id')}
 def no_schema_default(schema):
     """ANYM-736: an optional guard argument declares no default, so the gateway never inserts a null for it."""
     schema.pop('default',None)
@@ -525,14 +525,19 @@ def register_send_tools(mcp, call, async_call, read):
             allow_open_username=allow_open_username)
 
     @mcp.tool(structured_output=True,annotations=read)
-    def get_send_status(ctx: Context,send_id: StrictStr) -> dict[str,Any]:
+    def get_send_status(ctx: Context,
+                        send_id: Annotated[StrictStr | None,Field(json_schema_extra=no_schema_default)]=None,
+                        request_id: Annotated[StrictStr | None,Field(json_schema_extra=no_schema_default)]=None
+                        ) -> dict[str,Any]:
         """Read your own scoped send result and separate delivery_receipt observations.
+        Pass exactly one of send_id or request_id (the key you chose for the send): request_id recovers a
+        result whose response was lost, and needs no read access to the chat.
         Provider acceptance is not recipient delivery/read. Missing receipts are unknown;
         exact provider times remain null. A sent result adds messenger_reports (the receipt
         levels this chat can ever report) and receipt_state (pending, overdue, delivered, read,
         played, not_reported, receipt_error or unknown). Never sends, retries or marks a chat read.
         """
-        return call(ctx,'get_send_status',send_id=send_id)
+        return call(ctx,'get_send_status',**{k:v for k,v in (('send_id',send_id),('request_id',request_id)) if v is not None})
 
 
 def register_upload_tools(mcp, call, read, upload_write):

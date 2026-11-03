@@ -75,7 +75,7 @@ def test_newer_incoming_refuses(guarded):
     assert (error.newer_count, error.newer_count_capped, error.newer_outgoing_count) == (1, False, 0)
     assert error.first_newer_message_id == error.newest_message_id == newer
     assert error.next_call == {'tool': 'get_context', 'arguments': {'message_id': newer, 'before_count': 0,
-        'after_count': 20}, 'caller_supplies': []}
+        'after_count': 20, 'view': 'conversation'}, 'caller_supplies': []}
     body = payload(error, 'send_message')
     assert body['error'] == 'chat_changed_since_seen' and body['next_call'] == error.next_call
     assert CANARY not in str(body) and 'Exact synthetic text' not in str(body)
@@ -180,9 +180,23 @@ def test_next_call_window_starts_at_first_counted_message(guarded, guard):
     assert error.first_newer_message_id == counted[0] and error.newest_message_id == counted[-1]
     step = error.next_call['arguments']
     window = s.get_context(key, step['message_id'], before_count=step['before_count'],
-        after_count=step['after_count'], view='archive')['context']
+        after_count=step['after_count'], view=step['view'])['context']
     ids = [row['id'] for row in window]
     assert ids[0] == error.first_newer_message_id and set(counted) <= set(ids)
+
+
+# spec: ANYM-736
+def test_next_call_window_holds_every_counted_message_at_one_instant(guarded):
+    s, archive, key = guarded
+    seen = say(archive, 1, 0)
+    # One sent_at: the guard orders Telegram messages by numeric provider ID, the window must do the same.
+    counted = [say(archive, 30 + n, 10) for n in range(10)]
+    error = refused(s, key, expected_last_message_id=seen)
+    assert error.newer_count == 10 and error.first_newer_message_id == counted[0]
+    step = error.next_call['arguments']
+    window = s.get_context(key, step['message_id'], before_count=step['before_count'],
+        after_count=step['after_count'], view=step['view'])['context']
+    assert [row['id'] for row in window][0] == counted[0] and set(counted) <= {row['id'] for row in window}
 
 
 def normalized(response):
@@ -285,6 +299,64 @@ def test_concurrent_twin_returns_saved_result(guarded, monkeypatch):
     monkeypatch.setattr(send_guard, 'check', racing)
     result = send(s, key, expected_last_message_id=seen)
     assert result['send_id'] == twin['send_id'] and len(rows(s)) == 1
+
+
+# spec: ANYM-736
+@pytest.mark.parametrize('failure', ['changed', 'timeout'])
+def test_refusal_never_hides_a_twin_committed_meanwhile(guarded, monkeypatch, failure):
+    s, archive, key = guarded
+    seen = say(archive, 1, 0)
+    say(archive, 2, 10)
+    twin = {}
+    real = send_guard.newer
+
+    def racing(c, *args):
+        # A concurrent twin commits this request_id after the lock-free look, while the guard read runs.
+        twin.update(send(s, key))
+        if failure == 'timeout':
+            raise psycopg.errors.QueryCanceled('synthetic')
+        return real(c, *args)
+    monkeypatch.setattr(send_guard, 'newer', racing)
+    result = send(s, key, expected_last_message_id=seen)
+    assert result['send_id'] == twin['send_id'] and len(rows(s)) == 1
+    # A different payload under that ID is the conflict, never the guard's refusal.
+    with pytest.raises(APIError, match='idempotency_conflict'):
+        send(s, key, text='Different synthetic text', expected_last_message_id=seen)
+
+
+# spec: ANYM-736
+def test_status_by_request_id_recovers_a_lost_response_without_read_access(guarded):
+    s, archive, key = guarded
+    seen = say(archive, 1, 0)
+    first = send(s, key, expected_last_message_id=seen)   # the response is "lost": only the request_id is kept
+    s.set_access('guard-agent', permissions=['send'])
+    say(archive, 2, 10)
+    # The retry would also return the saved row, but the gateway refuses it without read access: the status call
+    # by request_id is the recovery path, and it needs neither read access nor a guard.
+    saved = s.get_send_status(key, request_id='guard-request-0001')
+    assert saved['send_id'] == first['send_id'] and saved['status'] == first['status'] and len(rows(s)) == 1
+
+
+# spec: ANYM-736
+@pytest.mark.parametrize('arguments', [{}, {'send_id': 'send_x', 'request_id': 'guard-request-0001'}])
+def test_status_takes_exactly_one_of_send_id_and_request_id(guarded, arguments):
+    s, archive, key = guarded
+    with pytest.raises(APIError) as failure:
+        s.get_send_status(key, **arguments)
+    assert failure.value.code == 'invalid_parameters'
+    assert failure.value.field_errors == [{'field': 'send_id', 'reason': 'required'}]
+
+
+# spec: ANYM-736
+def test_status_by_request_id_is_scoped_to_the_principal(guarded):
+    s, archive, key = guarded
+    say(archive, 1, 0)
+    send(s, key)
+    other = s.issue_key('guard-other-agent', [ACCOUNT], permissions=['read', 'send'])
+    for request_id in ('guard-request-0001', 'guard-missing-0001', 'x', 'child:' + 'a' * 10):
+        with pytest.raises(APIError) as failure:
+            s.get_send_status(other, request_id=request_id)
+        assert (failure.value.code, failure.value.status) == ('not_found', 404)
 
 
 # spec: ANYM-736

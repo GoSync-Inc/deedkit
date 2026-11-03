@@ -97,15 +97,16 @@ def test_after_read_access_is_removed_the_guarded_retry_is_refused_and_the_statu
     assert sent.status_code == 200 and len(seen) == 1
 
     def saved(path, arguments):
-        return httpx.Response(200, json={"status": "queued", "send_id": arguments["send_id"], "request_id_state": "saved"})
+        return httpx.Response(200, json={"status": "queued", "send_id": "send_" + "e" * 32})
     later_dir = tmp_path / "after"
     later_dir.mkdir()
     after, later = setup(later_dir, grants=("send",), answer=saved)
+    # The first response is lost: only the request_id the caller chose is kept.
     retried, status = run(after, ("messages_send_message", GUARDED),
-                          ("messages_get_send_status", {"send_id": sent.json()["send_id"]}))
+                          ("messages_get_send_status", {"request_id": GUARDED["request_id"]}))
     assert retried.status_code == 403 and retried.json()["next_action"] == "check_send_status_by_request_id"
     assert status.status_code == 200 and status.json()["send_id"] == sent.json()["send_id"]
-    assert later == [("/v1/get_send_status", {"send_id": sent.json()["send_id"]})]
+    assert later == [("/v1/get_send_status", {"request_id": GUARDED["request_id"]})]
 
 
 def closed_schema(path, arguments):

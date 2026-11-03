@@ -38,3 +38,15 @@ test('the typings declare the guard fields of a chat_id send',()=>{
   assert.match(declared,/guard\?: 'any_message' \| 'outgoing_only';/);
   assert.match(declared,/sendMessage\(args: MessageAction\): Promise<Record<string,unknown>>;/);
 });
+
+// spec: ANYM-736
+test('getSendStatus forwards a request_id and the typings name exactly one of the two keys',async()=>{
+  const seen=[];
+  const client=new AnyMsgClient({...options,fetch:async(url,request)=>{
+    seen.push(JSON.parse(request.body));return Response.json({status:'queued'});
+  }});
+  await client.getSendStatus({request_id:'synthetic-send-0001'});
+  await client.getSendStatus({send_id:'send_synthetic'});
+  assert.deepEqual(seen,[{request_id:'synthetic-send-0001'},{send_id:'send_synthetic'}]);
+  assert.match(declared,/getSendStatus\(args: \{send_id:string; request_id\?: never\} \| \{request_id:string; send_id\?: never\}\)/);
+});

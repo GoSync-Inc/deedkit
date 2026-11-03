@@ -573,8 +573,12 @@ class Client:
         if 'wait_s' in parameters:_wait_seconds(parameters['wait_s'])
         return self.call('messages_send',parameters)
 
-    def get_send_status(self,send_id):
-        return self.call('get_send_status',{'send_id':send_id})
+    def get_send_status(self,send_id=None,*,request_id=None):
+        """A send's saved state by send_id, or (ANYM-736) by the request_id you chose: the recovery for a lost response.
+
+        Exactly one of the two; send_id alone keeps the payload older servers accept."""
+        return self.call('get_send_status',{name:value for name,value in dict(send_id=send_id,request_id=request_id).items()
+            if value is not None})
 
     def list_messenger_operations(self, *, account):
         """Read this account's allowlisted operations and your independently scoped grants."""

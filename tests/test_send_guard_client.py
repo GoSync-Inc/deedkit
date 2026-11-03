@@ -34,3 +34,15 @@ def test_python_guard_errors_keep_their_code_and_are_never_retried(code, status)
             client.send_message(**SEND, expected_last_message_id='msg_synthetic')
     assert failure.value.code == code and failure.value.request_id == 'b' * 32
     assert seen == ['/v1/send_message']
+
+
+# spec: ANYM-736
+def test_python_get_send_status_by_request_id_and_by_send_id():
+    seen = []
+    def transport(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={'status': 'queued'})
+    with Client('https://archive.example', 'synthetic-token', transport=httpx.MockTransport(transport)) as client:
+        client.get_send_status('send_synthetic')
+        client.get_send_status(request_id='synthetic-send-0001')
+    assert seen == [{'send_id': 'send_synthetic'}, {'request_id': 'synthetic-send-0001'}]

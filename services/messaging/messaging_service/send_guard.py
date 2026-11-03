@@ -92,6 +92,8 @@ def check(c, p, account, chat_id, platform, expected, guard):
     failure.first_newer_message_id = rows[0]['id']
     failure.newest_message_id = newest
     failure.next_action = NEXT_ACTION
+    # view=conversation orders a window like this guard (on Telegram the numeric provider ID at one instant); a
+    # direct REST caller defaults to the archive order, which would start the window past a counted message.
     failure.next_call = {'tool': 'get_context', 'arguments': {'message_id': rows[0]['id'],
-        'before_count': 0, 'after_count': COUNT_CAP}, 'caller_supplies': []}
+        'before_count': 0, 'after_count': COUNT_CAP, 'view': 'conversation'}, 'caller_supplies': []}
     raise failure

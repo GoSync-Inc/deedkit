@@ -133,20 +133,35 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Read your own scoped send result and separate delivery_receipt observations.\nProvider acceptance is not recipient delivery/read. Missing receipts are unknown;\nexact provider times remain null. A sent result adds messenger_reports (the receipt\nlevels this chat can ever report) and receipt_state (pending, overdue, delivered, read,\nplayed, not_reported, receipt_error or unknown). Never sends, retries or marks a chat read.\n",
+    "description": "Read your own scoped send result and separate delivery_receipt observations.\nPass exactly one of send_id or request_id (the key you chose for the send): request_id recovers a\nresult whose response was lost, and needs no read access to the chat.\nProvider acceptance is not recipient delivery/read. Missing receipts are unknown;\nexact provider times remain null. A sent result adds messenger_reports (the receipt\nlevels this chat can ever report) and receipt_state (pending, overdue, delivered, read,\nplayed, not_reported, receipt_error or unknown). Never sends, retries or marks a chat read.\n",
     "inputSchema": {
+      "additionalProperties": false,
       "properties": {
+        "request_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Request Id"
+        },
         "send_id": {
-          "title": "Send Id",
-          "type": "string"
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Send Id"
         }
       },
-      "required": [
-        "send_id"
-      ],
-      "type": "object",
       "title": "get_send_statusArguments",
-      "additionalProperties": false
+      "type": "object"
     },
     "name": "messages_get_send_status",
     "outputSchema": {

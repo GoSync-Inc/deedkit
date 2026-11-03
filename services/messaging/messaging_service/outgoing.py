@@ -498,12 +498,15 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
         from . import send_guard
         send_guard.validate(expected_last_message_id,guard)
     chat,reply_id=target(c,p,account,chat_id,reply_to)
+    guard_refusal=None
     if guarded and not c.execute('SELECT 1 FROM outgoing_messages WHERE principal=%s AND request_id=%s',
             (p['id'],request_id)).fetchone():
         # ANYM-736: before the principal lock, so a slow guard read never delays another send; a request_id with a
-        # saved row skips it and returns the saved result below, whatever arrived since. The race between this
-        # read and the insert is the guard's documented limit.
-        send_guard.check(c,p,account,chat_id,chat['platform'],expected_last_message_id,guard)
+        # saved row skips it and returns the saved result below, whatever arrived since. A refusal waits for the
+        # locked lookup below: a concurrent twin that committed this request_id meanwhile wins over it. The race
+        # between this read and the insert is the guard's documented limit.
+        try:send_guard.check(c,p,account,chat_id,chat['platform'],expected_last_message_id,guard)
+        except APIError as failure:guard_refusal=failure
     default_policy=format=='plain' and not link_preview and not allow_lossy
     legacy_hash=hashlib.sha256(canonical([account,chat_id,text,reply_id])).hexdigest()
     c.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',('outgoing:'+p['id'],))
@@ -527,6 +530,7 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
                 (existing.get('preview_digest') or '')==preview_digest)
         if not matches:raise APIError('idempotency_conflict',409)
         return result(existing,c,p)
+    if guard_refusal is not None:raise guard_refusal
     if not default_policy and not preview_digest:raise refused(APIError('preview_required',409),True)
     draft=reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id)
     if phone_hash is None and preview_digest and preview_digest!=draft['preview_digest']:
@@ -556,10 +560,22 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
     return result(row,c,p)
 
 
-def status(c,p,send_id):
-    if not isinstance(send_id,str) or not SEND_ID_RE.fullmatch(send_id):
+def status(c,p,send_id=None,request_id=None):
+    """One send's saved state by its send_id, or (ANYM-736) by the request_id the caller chose: the way back to a
+    result whose response was lost, with no guard and no read access needed."""
+    if (send_id is None)==(request_id is None):
+        from .field_errors import refusal
+        raise refusal('invalid_parameters',[('send_id','required')])
+    if request_id is not None:
+        if (not isinstance(request_id,str) or not re.fullmatch(r'[a-zA-Z0-9_.:-]{8,128}',request_id)
+                or request_id.startswith(CHILD_KEY_PREFIX)):
+            raise APIError('not_found',404)
+        row=c.execute('SELECT * FROM outgoing_messages WHERE principal=%s AND request_id=%s',
+            (p['id'],request_id)).fetchone()
+    elif not isinstance(send_id,str) or not SEND_ID_RE.fullmatch(send_id):
         raise APIError('not_found',404)
-    row=c.execute('SELECT * FROM outgoing_messages WHERE id=%s AND principal=%s',(send_id,p['id'])).fetchone()
+    else:
+        row=c.execute('SELECT * FROM outgoing_messages WHERE id=%s AND principal=%s',(send_id,p['id'])).fetchone()
     if not row or not permitted(p,row['account'],row['chat']):raise APIError('not_found',404)
     observed=c.execute('SELECT clock_timestamp() AS now').fetchone()['now']
     if row['status']=='queued' and row['expires_at']<=observed:
