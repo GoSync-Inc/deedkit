@@ -1244,6 +1244,87 @@ def test_the_deployed_schema66_runtime_refuses_schema67_and_its_router_validator
     assert out['backup_max'] == 66 and backup.SCHEMAS[-1] == 67
 
 
+# The deployed consumers never call migrate(): matcher, dispatcher, API reads and retention keep running on the
+# database the hand release has moved to schema 67.
+DEPLOYED_CONSUMERS = '''
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from messaging_service import heartbeats
+from messaging_service.event_delivery import dispatch_hints
+from messaging_service.store import RUNTIME_SCHEMA, Store
+from messaging_service.subscriptions import match_subscriptions, prune_subscriptions
+a = json.loads(sys.argv[2])
+store, token, sid, sent = Store(Path(a['dsn']).read_text().strip(), Path(a['files']), 'http://testserver'), \\
+    a['token'], a['sid'], []
+out = {'schema': RUNTIME_SCHEMA}
+heartbeats.record(store, 'dispatcher')
+out['matched'] = match_subscriptions(store)
+out['dispatch'] = dispatch_hints(store, transport=lambda url, body, headers, **k: sent.append(json.loads(body)) or 204,
+    resolver=lambda *x, **k: ['93.184.216.34'])
+out['updates'] = [e['event_sequence'] for e in store.get_updates(a['old'], 'probe-deployed')['items']]
+out['view'] = store.get_subscription(token, sid)
+out['passive'] = store.get_subscription_events(token, sid)
+page = store.fetch_subscription_events(token, sid)
+out['fetch'] = page
+out['ack'] = store.ack_subscription_events(token, sid, page['receipt'], page['ack_version'])
+with store.pool.connection() as c:  # every match past the retention window, the module ones too
+    for table in ('subscription_matches', 'subscription_module_matches'):
+        c.execute(f"UPDATE {table} SET matched_at=matched_at-interval '30 days' WHERE subscription=%s", (sid,))
+out['sent'], out['pruned'] = sent, prune_subscriptions(store)
+store.close()
+print(json.dumps(out, default=str))
+'''
+
+
+# spec: ANYM-732
+def test_the_deployed_schema66_consumers_run_beside_recordings_rows_in_the_schema67_database(modules, tmp_path):
+    import os
+    import subprocess
+    import sys
+    source = _release_source(tmp_path / 'deployed', DEPLOYED_RELEASE)
+    store, old, _ = modules
+    token = subscriber(store)
+    sid = mixed(store, token)
+    bound(store, token, sid, tmp_path)
+    beat(store)
+    message = emit(store)
+    seq = publish(store, call_event(1))
+    recorded = [publish(store, recording_event(2), RECORDING_SCOPE),
+        publish(store, recording_event(3, 'recording.access.changed'), RECORDING_SCOPE)]
+    assert recorded == [seq + 1, seq + 2]
+    with store.pool.connection() as c:
+        rows = c.execute('SELECT seq,event_key,source,type,data FROM module_events ORDER BY seq').fetchall()
+    files = tmp_path / 'deployed-files'
+    files.mkdir()
+    store.set_subscription_retention(True)
+    try:
+        run = subprocess.run([sys.executable, '-c', DEPLOYED_CONSUMERS, str(source), json.dumps({
+            'dsn': os.environ['PROBE_TEST_DSN_FILE'], 'files': str(files), 'token': token, 'sid': sid, 'old': old})],
+            capture_output=True, text=True, timeout=120)
+    finally:
+        with store.pool.connection() as c:
+            c.execute("DELETE FROM probe_metadata WHERE name='subscription_retention'")
+    assert run.returncode == 0, run.stderr[-2000:]
+    out = json.loads(run.stdout.strip().splitlines()[-1])
+    assert out['schema'] == 66
+    # The old matcher, reads, fetch, ACK, delivery and retention work, see the message and the call, and never
+    # name, match or deliver a recordings row.
+    assert message in out['updates'] and out['updates'] == [e['event_sequence']
+        for e in store.get_updates(old, 'probe-current')['items']]
+    assert [item['event_id'] for item in out['fetch']['items']] == [message]
+    assert [item['module_event_id'] for item in out['fetch'].get('module', {}).get('items', [])] in ([seq], [])
+    text = json.dumps(out, default=str)
+    assert 'recording' not in text, text[:2000]
+    assert out['pruned']['retention_failed'] == 0 and out['sent']
+    assert all(body['kind'] != 'events' or 'recording' not in json.dumps(body) for body in out['sent'])
+    with store.pool.connection() as c:
+        assert c.execute('SELECT seq,event_key,source,type,data FROM module_events ORDER BY seq').fetchall() == rows
+        matched = [row['event'] for row in c.execute('SELECT event FROM subscription_module_matches WHERE subscription=%s',
+            (sid,))]
+    assert set(matched) <= {seq}
+
+
 def _release_source(tmp_path, commit):
     """A `git archive` of one release (or a sibling checkout named by ANYMSG_PREVIOUS_SOURCE), as _previous_source."""
     import os
