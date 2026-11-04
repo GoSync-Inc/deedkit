@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timedelta
 import json
+import math
 import os
 from uuid import UUID
 
@@ -289,39 +290,62 @@ def _module_view(c, row):
 
 
 
-def _hint_counts(c, row, p, ids=None):
-    """{state: n} of the definition's hints the key can see now; ids narrows it to those outbox rows."""
+# ANYM-752: per state, the age of its oldest hint and the seconds until its earliest attempt; a leased hint is
+# scheduled by lease_until, because leasing leaves next_attempt_at unchanged.
+_HINT_AGES = ''',extract(epoch FROM clock_timestamp()-min(o.created_at)) AS age_s,extract(epoch FROM
+    min(CASE o.state WHEN 'leased' THEN coalesce(o.lease_until,o.next_attempt_at) ELSE o.next_attempt_at END)
+    -clock_timestamp()) AS next_s'''
+
+
+def _hint_states(c, row, p, ids=None):
+    """Per-state rows (state, n, age_s, next_s) of the definition's hints the key can see now; ids narrows them."""
     if dynamic(row):
         if p is None:
-            return {}  # ANYM-447: no key can read it now, so the worker counts none and discloses nothing.
+            return []  # ANYM-447: no key can read it now, so the worker counts none and discloses nothing.
         # ANYM-522: only events hints that cover a reference the key can see now count, in every state; a resume's
         # backlog wake covers it from the ACK position, as hint_visible sends it.
         where, args = visible_filter(row, p)
-        counts = c.execute('''SELECT o.state,count(*) AS n FROM subscription_outbox o WHERE o.subscription=%s
-            AND (%s::uuid[] IS NULL OR o.id=ANY(%s))
+        return c.execute('''SELECT o.state,count(*) AS n''' + _HINT_AGES + ''' FROM subscription_outbox o
+            WHERE o.subscription=%s AND (%s::uuid[] IS NULL OR o.id=ANY(%s))
             AND o.error_code IS DISTINCT FROM 'scope_changed' AND (o.kind<>'events' OR EXISTS(
                 SELECT FROM subscription_matches m WHERE m.subscription=o.subscription AND m.event<=o.through_position
                 AND m.event>CASE WHEN starts_with(o.request_id,'resume:') THEN ''' + _ACK_POSITION + '''
                 ELSE ''' + _PREVIOUS_HINT + ''' END AND ''' + where + ''')) GROUP BY o.state''',
             (row['id'], ids, ids, row['start_position'], hint_floor(row), *args)).fetchall()
-    else:
-        counts = c.execute('''SELECT state,count(*) AS n FROM subscription_outbox WHERE subscription=%s
-            AND (%s::uuid[] IS NULL OR id=ANY(%s)) GROUP BY state''', (row['id'], ids, ids)).fetchall()
-    return {item['state']: item['n'] for item in counts}
+    return c.execute('''SELECT o.state,count(*) AS n''' + _HINT_AGES + ''' FROM subscription_outbox o
+        WHERE o.subscription=%s AND (%s::uuid[] IS NULL OR o.id=ANY(%s)) GROUP BY o.state''',
+        (row['id'], ids, ids)).fetchall()
+
+
+def _hint_counts(c, row, p, ids=None):
+    """{state: n} of the definition's hints the key can see now; ids narrows it to those outbox rows."""
+    return {item['state']: item['n'] for item in _hint_states(c, row, p, ids)}
+
+
+def _lag(states):
+    """ANYM-752: the queue lag over exactly the hints hint_counts counts; unfinished means pending or leased."""
+    unfinished = [item for item in states if item['state'] in ('pending', 'leased')]
+    if not unfinished:
+        return {'pending_hints': 0, 'oldest_unfinished_age_s': None, 'next_attempt_in_s': None}
+    # A future attempt rounds up, so a running lease never reads as due now; a due or past one reads 0.
+    return {'pending_hints': sum(item['n'] for item in unfinished),
+        'oldest_unfinished_age_s': max(0, math.floor(max(item['age_s'] for item in unfinished))),
+        'next_attempt_in_s': max(0, math.ceil(min(item['next_s'] for item in unfinished)))}
 
 
 def _delivery_view(c, row, p=None):
     # Every column: before schema 49 the binding has no endpoint column (rolling upgrade).
     binding = c.execute('SELECT * FROM subscription_delivery WHERE subscription=%s', (row['id'],)).fetchone()
     # ANYM-447: counters that never decrease: the hints the worker deleted plus the rows still kept.
-    live, deleted = _hint_counts(c, row, p), row.get('deleted_hint_counts') or {}
+    states = _hint_states(c, row, p)
+    live, deleted = {item['state']: item['n'] for item in states}, row.get('deleted_hint_counts') or {}
     # An unbound subscription reads no policy state, so its view needs no schema-38 column.
     from .delivery_policy import UNBOUND, delivery_state
     view = {'passive_read': True, 'ack': True, 'push': binding is not None,
         'receiver_id': str(binding['receiver']) if binding and binding['receiver'] else None, 'host_wakeup': 'unverified',
         'host_turn_verified': False,
         'hint_counts': {state: live.get(state, 0) + deleted.get(state, 0) for state in sorted({*live, *deleted})},
-        'deleted_hint_counts': deleted, 'hints_deleted_at': row.get('hints_deleted_at'),
+        'deleted_hint_counts': deleted, 'hints_deleted_at': row.get('hints_deleted_at'), 'lag': _lag(states),
         **(delivery_state(c, row) if binding else UNBOUND)}
     if binding and binding.get('endpoint'):
         # ANYM-519: a deleted endpoint leaves the subscription pull-only; a paused one names its state.
