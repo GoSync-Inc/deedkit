@@ -764,7 +764,7 @@ def test_new_archive_starts_at_schema4_and_runs_the_build_inside_collector_passe
     path, doc = fixture(tmp_path)
     async def run():
         r = runtime(path, Vendor()); await r.start(background=False)
-        assert r.store.version() == 4 and r.store.index_state()['state'] == 'ready'
+        assert r.store.version() == 5 and r.store.index_state()['state'] == 'ready'  # ANYM-730: a new archive starts at schema 5
         await r.run_once(now=100)
         assert (await r.db('status', doc['accounts'][0]))['index']['state'] == 'ready'
         await r.close()
@@ -807,7 +807,7 @@ def test_an_index_failure_never_stops_collection(tmp_path, monkeypatch):
 
 
 # spec: ANYM-725
-def test_backup_accepts_schema_1_to_4_and_unknown_newer_schema_is_refused(tmp_path):
+def test_backup_accepts_schema_1_to_5_and_unknown_newer_schema_is_refused(tmp_path):
     from deedkit_recordings.archive_store import backup_archive
     path, doc = fixture(tmp_path)
     file = legacy_archive(tmp_path, 3)
@@ -824,7 +824,7 @@ def test_backup_accepts_schema_1_to_4_and_unknown_newer_schema_is_refused(tmp_pa
     finally:
         settings.close()
     with sqlite3.connect(file) as db:
-        db.execute('PRAGMA user_version=5')
+        db.execute('PRAGMA user_version=6')
     with pytest.raises(Failure, match='archive_schema_unsupported'):
         open_store(path)
 

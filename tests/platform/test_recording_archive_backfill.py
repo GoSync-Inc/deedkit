@@ -217,11 +217,11 @@ def test_online_backup_accepts_schema3_and_unknown_newer_schema_is_refused(tmp_p
         snapshots.mkdir(mode=0o700)
         backup_archive(r.document().archive, str(snapshots / 'copy.sqlite'))
         with sqlite3.connect(snapshots / 'copy.sqlite') as copy:
-            assert copy.execute('PRAGMA user_version').fetchone() == (4,)  # ANYM-725: a new archive starts at schema 4
+            assert copy.execute('PRAGMA user_version').fetchone() == (5,)  # ANYM-725/730: a new archive starts at schema 5
             assert copy.execute('SELECT count(*) FROM records').fetchone() == (3,)
         await r.close()
     asyncio.run(run())
-    sql(doc, 'PRAGMA user_version=5')
+    sql(doc, 'PRAGMA user_version=6')
     async def refused():
         r = runtime(path, omi); await r.start(background=False)
         assert r.error == 'archive_schema_unsupported'

@@ -30,9 +30,9 @@ volume) (owner 11-03, see Data egress).
   Backup copies age out by the backup rotation (BACKUP.md). Messages and other kinds: proposal (no
   owner decision on a limit).
 - Recording texts (recordings archive, owner 11-03 «2) ок»): kept until the owner sets a term; deleted on
-  the owner's request (this wording is the orchestrator's reading of «2) ок», an interim default). No deletion tool or automatic deletion exists today: a deletion is manual, under the
-  data-deletion gates (process.md section 2), and a provider-side deletion does not purge the local text
-  (services/recordings/README.md). The owner named no term; a term is a new owner decision. Once the
+  the owner's request (this wording is the orchestrator's reading of «2) ок», an interim default). No automatic deletion exists: the owner's deletion is the operator command `deedkit-recordings --delete` (ANYM-730,
+  services/recordings/README.md "Schema 5 and owner-requested deletion"), run under the data-deletion gates
+  (process.md section 2); a provider-side deletion does not purge the local text. The owner named no term; a term is a new owner decision. Once the
   archive backup runs, a deletion from the live archive reaches the backup only through the sanitizing
   deletion procedure (ANYM-730: index rebuild and VACUUM, then a new snapshot replaces the protected
   point, which is the only one kept); rotating the backup alone does not remove deleted text.

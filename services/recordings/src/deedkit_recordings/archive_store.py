@@ -24,7 +24,8 @@ FAR = 1e18  # `due` of a record that waits for a changed list fingerprint instea
 WINDOW = 3600
 SLACK = 75  # dispatch drift inside one pass (60 s) plus a provider timeout: never reuse a call that may still count
 APPLICATION_ID = 0x444B5243
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+DELETE_BATCH = 200  # records one deletion transaction removes (ANYM-730)
 INDEX_BATCH_BYTES = 4 * 1024 ** 2  # stored bytes one build batch reads and indexes (at least one record)
 INDEX_BATCH_ROWS = 500
 INDEX_STEP_SECONDS = 10  # one collector pass spends at most this long building the schema-4 index
@@ -64,10 +65,11 @@ CREATE TABLE events(sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NO
 {index_tables}CREATE TABLE ledger(credential TEXT NOT NULL, bucket TEXT NOT NULL, window_start REAL NOT NULL, count INTEGER NOT NULL,
  updated REAL NOT NULL, PRIMARY KEY(credential, bucket, window_start));
 CREATE TABLE meta(key TEXT PRIMARY KEY, value);  -- key/value rows: the backup tooling reads archive_id and incarnation (ANYM-714)
+CREATE TABLE tombstones(provider_hash TEXT PRIMARY KEY);  -- ANYM-730: SHA-256 of namespace NUL provider_id, no content
 INSERT INTO meta(key,value) VALUES('archive_id','{archive}'),('incarnation',1),('journal_id','{journal}'),('text_reconciled',1),
  ('index_state','ready');
 PRAGMA application_id=1145786947;
-PRAGMA user_version=4;
+PRAGMA user_version=5;
 COMMIT;
 '''
 UPGRADE_INDEX = '''
@@ -139,6 +141,24 @@ def upgrade_v4(db):
         if column not in {row[1] for row in db.execute(f'PRAGMA table_info({table})')}:
             alters += f'ALTER TABLE {table} ADD COLUMN {column} {declaration};\n'
     db.executescript(UPGRADE_V4.format(alters=alters, index_tables=INDEX_TABLES))
+
+
+# Schema 5 (ANYM-730) is additive: one table of provider-ID hashes (no content). The backup tooling reads it as the authorization
+# a deletion needs (backup_recordings_continuity.py); an older package refuses a schema-5 archive (`archive_schema_unsupported`).
+UPGRADE_V5 = '''
+BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS tombstones(provider_hash TEXT PRIMARY KEY);
+PRAGMA user_version=5;
+COMMIT;
+'''
+
+
+def upgrade_v5(db):
+    db.executescript(UPGRADE_V5)
+
+
+def provider_hash(ns, provider_id):
+    return hashlib.sha256((ns + '\x00' + provider_id).encode('utf-8', 'surrogatepass')).hexdigest()
 
 
 def with_ids(template, **extra):
@@ -304,7 +324,7 @@ def backup_archive(settings, destination):
     try:
         with store.connection() as db:
             if db.execute('PRAGMA application_id').fetchone()[0] != APPLICATION_ID or db.execute(
-                    'PRAGMA user_version').fetchone()[0] not in (1, 2, 3, 4):
+                    'PRAGMA user_version').fetchone()[0] not in (1, 2, 3, 4, 5):
                 raise Failure('archive_schema_unsupported')
         return store.run('backup', destination)
     except (OSError, sqlite3.Error, ValueError):
@@ -335,7 +355,7 @@ class Store:
                 if empty:
                     db.executescript(with_ids(SCHEMA))
                 version = db.execute('PRAGMA user_version').fetchone()[0]
-                if db.execute('PRAGMA application_id').fetchone()[0] != APPLICATION_ID or version not in (1, 2, 3, 4):
+                if db.execute('PRAGMA application_id').fetchone()[0] != APPLICATION_ID or version not in (1, 2, 3, 4, 5):
                     raise Failure('archive_schema_unsupported')
                 if version == 1:
                     # Only this derived index is rebuilt. Accepted records, refs,
@@ -350,6 +370,8 @@ class Store:
                     # Additive only: new columns and tables. The index fills in bounded batches (`index_step`) and
                     # `user_version` becomes 4 only when it is published; schema 3 stays fully usable until then.
                     upgrade_v4(db)
+                if version == 4:
+                    upgrade_v5(db)  # additive; a schema-3 archive reaches it after its index is published and the next open
                 if db.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
                     raise Failure('archive_unavailable')
                 db.execute('PRAGMA journal_mode=WAL')
@@ -481,6 +503,12 @@ class Store:
             queued = db.execute('SELECT count(*) FROM records WHERE namespace=? AND attempted IS NULL', (ns,)).fetchone()[0]
             floor_now = db.execute('SELECT COALESCE(max(rowid),0) FROM records').fetchone()[0]
             unique = {item['id']: item for item in items}
+            fenced = 0
+            if self.tombstones_exist(db):  # ANYM-730: a deleted recording is never archived again
+                for ident in list(unique):
+                    if db.execute('SELECT 1 FROM tombstones WHERE provider_hash=?', (provider_hash(ns, ident),)).fetchone():
+                        del unique[ident]
+                        fenced += 1
             known = {}
             for ident in unique:
                 row = db.execute('SELECT rowid AS rid,* FROM records WHERE namespace=? AND provider_id=?', (ns, ident)).fetchone()
@@ -522,7 +550,7 @@ class Store:
                      canonical(checkpoint).decode() if checkpoint is not None else None, now, kind, now, ns))
             else:
                 db.execute('UPDATE accounts SET error=NULL WHERE namespace=?', (ns,))
-            return {'inserted': len(new), 'known': len(known)}
+            return {'inserted': len(new), 'known': len(known), 'fenced': fenced}
         return self.write(change, guard)
 
     def refresh(self, db, ns, row, item, fingerprint, now):
@@ -1108,3 +1136,164 @@ class Store:
             destination.unlink()
             raise
         return {'state':'saved'}
+
+    # ---- ANYM-730: owner-requested deletion (operator command, service stopped; the single-writer lock is held by this Store)
+
+    @staticmethod
+    def tombstones_exist(db):
+        return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tombstones'").fetchone() is not None
+
+    @contextmanager
+    def operator_connection(self):
+        """A writer for the deletion command: no 2 s progress deadline and no page ceiling (VACUUM needs a copy of the
+        file), `secure_delete` on so freed pages are overwritten. The caller holds the single-writer lock."""
+        self.files()
+        db = sqlite3.connect(self.path, timeout=5)
+        try:
+            db.row_factory = sqlite3.Row
+            db.isolation_level = None
+            db.execute('PRAGMA trusted_schema=OFF')
+            db.execute('PRAGMA synchronous=FULL')
+            db.execute('PRAGMA secure_delete=ON')
+            yield db
+        finally:
+            db.close()
+
+    def deletion_capacity(self):
+        """VACUUM rewrites the file: it needs about the file's size again plus the WAL it may grow, and the usual reserve."""
+        used = sum(path.stat().st_size for path in self.files())
+        if shutil.disk_usage(self.directory).free < 2 * used + HEADROOM + self.settings.free_reserve_bytes:
+            raise Failure('archive_capacity')
+
+    def deletion_targets(self, db, refs, namespaces, created_from, created_to):
+        ranged = bool(namespaces) or created_from is not None or created_to is not None
+        if refs and ranged:
+            raise Failure('deletion_selector_ambiguous')
+        if not refs and not ranged:
+            raise Failure('deletion_selector_required')
+        if refs:
+            if any(not isinstance(ref, str) or len(ref) != 32 or any(c not in '0123456789abcdef' for c in ref) for ref in refs):
+                raise Failure('deletion_selector_invalid')
+            marks = ','.join('?' * len(refs))
+            return db.execute(f'SELECT rowid AS rid, ref, namespace, provider_id FROM records WHERE ref IN ({marks}) ORDER BY rowid',
+                              tuple(refs)).fetchall()
+        if not namespaces or (created_from is None and created_to is None):
+            raise Failure('deletion_selector_invalid')
+        low = parse_time(created_from) if created_from is not None else None
+        high = parse_time(created_to) if created_to is not None else None
+        if (created_from is not None and low is None) or (created_to is not None and high is None):
+            raise Failure('deletion_selector_invalid')
+        marks = ','.join('?' * len(namespaces))
+        sql = f'SELECT rowid AS rid, ref, namespace, provider_id FROM records WHERE namespace IN ({marks}) AND created_at IS NOT NULL'
+        values = list(namespaces)
+        if low is not None:
+            sql += ' AND created_at>=?'
+            values.append(low)
+        if high is not None:
+            sql += ' AND created_at<=?'
+            values.append(high)
+        return db.execute(sql + ' ORDER BY rowid', values).fetchall()
+
+    def delete_records(self, *, refs=None, namespaces=None, created_from=None, created_to=None, apply=False, snapshot_to=None):
+        """Remove the selected recordings (rows, index entries, speaker labels, journal events), record a tombstone for each
+        provider ID, rewrite the file so the bytes are gone (FTS5 rebuild, `secure_delete`, VACUUM, WAL truncated), and
+        optionally write a post-deletion snapshot. Preview unless `apply`. The receipt holds counts and identity only."""
+        try:
+            return self.delete_unchecked(refs, namespaces, created_from, created_to, apply, snapshot_to)
+        except sqlite3.Error as error:
+            full = getattr(error, 'sqlite_errorcode', 0) & 255 == sqlite3.SQLITE_FULL
+            raise Failure('archive_capacity' if full else 'archive_unavailable') from None
+        except (OSError, ValueError, TypeError, KeyError):
+            raise Failure('archive_unavailable') from None
+
+    def delete_unchecked(self, refs, namespaces, created_from, created_to, apply, snapshot_to):
+        with self.operator_connection() as db:
+            if db.execute('PRAGMA user_version').fetchone()[0] != SCHEMA_VERSION or not self.tombstones_exist(db):
+                raise Failure('archive_index_building')
+            state, _ = self.index_mode(db)
+            if state != 'ready' or db.execute("SELECT 1 FROM sqlite_master WHERE name='texts'").fetchone() is not None:
+                raise Failure('archive_index_building')
+            if db.execute("SELECT 1 FROM meta WHERE key='feed_epochs'").fetchone() is not None or (
+                    self.directory / archive_feed.MARKER).exists():
+                raise Failure('deletion_feed_unsupported')  # the event feed owns the journal identity (ANYM-726); not yet supported
+            targets = self.deletion_targets(db, refs, namespaces, created_from, created_to)
+            receipt = {'v': 1, 'applied': False, 'selected': len(targets), 'deleted': 0, 'batches': 0,
+                       'tombstones': db.execute('SELECT count(*) FROM tombstones').fetchone()[0], 'tombstones_added': 0,
+                       'sanitized': False, 'incarnation': int(db.execute("SELECT value FROM meta WHERE key='incarnation'").fetchone()[0]),
+                       'snapshot': None, 'backup_replacement': 'not_needed'}
+            if not apply:
+                return receipt
+            # With --yes the rewrite below always runs, also for a selection that is already gone: it finishes a run that
+            # a crash stopped between the last batch and the VACUUM.
+            self.deletion_capacity()
+            added = 0
+            for start in range(0, len(targets), DELETE_BATCH):
+                chunk = targets[start:start + DELETE_BATCH]
+                db.execute('BEGIN IMMEDIATE')
+                try:
+                    if receipt['batches'] == 0:
+                        # A bundle sealed before the deletion carries the old incarnation: the verifier refuses it
+                        # (`archive_incarnation_lower`), so a pending pre-deletion bundle is cancelled by this one write.
+                        db.execute("UPDATE meta SET value=value+1 WHERE key='incarnation'")
+                    for row in chunk:
+                        added += db.execute('INSERT OR IGNORE INTO tombstones(provider_hash) VALUES(?)',
+                                            (provider_hash(row['namespace'], row['provider_id']),)).rowcount
+                        db.execute('DELETE FROM texts4 WHERE rowid=?', (row['rid'],))
+                        for table in ('speakers', 'index_rows', 'index_skips', 'index_dirty', 'events'):
+                            db.execute(f'DELETE FROM {table} WHERE ref=?', (row['ref'],))
+                        db.execute('DELETE FROM records WHERE ref=?', (row['ref'],))
+                    db.execute("UPDATE accounts SET text_bytes=(SELECT COALESCE(SUM("
+                               "COALESCE(length(CAST(json_extract(parts,'$.transcript.text') AS BLOB)),0)"
+                               "+COALESCE(length(CAST(json_extract(parts,'$.summary.text') AS BLOB)),0)),0) FROM records "
+                               "WHERE records.namespace=accounts.namespace)")
+                    db.execute('COMMIT')
+                except BaseException:
+                    db.execute('ROLLBACK')
+                    raise
+                receipt['batches'] += 1
+                receipt['deleted'] += len(chunk)
+            # Sanitization: the index is rebuilt and merged, then the file is rewritten so no freed page keeps text.
+            db.execute("INSERT INTO texts4(texts4) VALUES('rebuild')")
+            db.execute("INSERT INTO texts4(texts4) VALUES('optimize')")
+            db.execute('VACUUM')
+            db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            wal = Path(str(self.path) + '-wal')
+            receipt['sanitized'] = (db.execute('PRAGMA freelist_count').fetchone()[0] == 0 and
+                                    db.execute('PRAGMA quick_check').fetchone()[0] == 'ok' and
+                                    (not wal.exists() or wal.stat().st_size == 0))
+            receipt.update(applied=True, tombstones_added=added, backup_replacement='backup_replacement_pending',
+                           tombstones=db.execute('SELECT count(*) FROM tombstones').fetchone()[0],
+                           incarnation=int(db.execute("SELECT value FROM meta WHERE key='incarnation'").fetchone()[0]))
+        if snapshot_to is not None:
+            self.backup(snapshot_to)
+            with self.connection() as db:
+                receipt['snapshot'] = self.snapshot_identity(db)
+        else:
+            with self.connection() as db:
+                receipt['snapshot'] = self.snapshot_identity(db)
+        return receipt
+
+    @staticmethod
+    def snapshot_identity(db):
+        """The archive's identity counters (the shape the verifier's proof carries); no title, no text."""
+        meta = {row[0]: row[1] for row in db.execute("SELECT key,value FROM meta WHERE key IN ('archive_id','incarnation')")}
+        return {'archive_id': meta['archive_id'], 'incarnation': int(meta['incarnation']),
+                'sequence': db.execute('SELECT COALESCE(MAX(sequence),0) FROM events').fetchone()[0],
+                'records': db.execute('SELECT count(*) FROM records').fetchone()[0]}
+
+    def lift_tombstone(self, ns, provider_id, apply=False):
+        """Lift one tombstone so the recording may be archived again. The next backup then needs a reasoned re-baseline
+        (the continuity rule `archive_tombstone_dropped`, BACKUP_R2.md)."""
+        try:
+            with self.operator_connection() as db:
+                if not self.tombstones_exist(db):
+                    raise Failure('archive_index_building')
+                found = db.execute('SELECT count(*) FROM tombstones WHERE provider_hash=?', (provider_hash(ns, provider_id),)).fetchone()[0]
+                if apply and found:
+                    db.execute('BEGIN IMMEDIATE')
+                    db.execute('DELETE FROM tombstones WHERE provider_hash=?', (provider_hash(ns, provider_id),))
+                    db.execute('COMMIT')
+                return {'v': 1, 'lifted': found if apply else 0, 'applied': bool(apply),
+                        'tombstones': db.execute('SELECT count(*) FROM tombstones').fetchone()[0]}
+        except sqlite3.Error:
+            raise Failure('archive_unavailable') from None
