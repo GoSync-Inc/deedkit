@@ -119,7 +119,8 @@ never provider response bodies or credentials.
 
 `invalid_provider_response` (HTTP 503, not retryable) adds `detail_code`, one word
 from a closed vocabulary that names the rejected part of an Omi body, never its
-value (ANYM-753). The gateway relays only these words:
+value (ANYM-753). PLAUD and local-archive failures keep the bare code. The gateway
+relays only these words:
 
 | `detail_code` | Rejected part; what the operator checks |
 |---|---|

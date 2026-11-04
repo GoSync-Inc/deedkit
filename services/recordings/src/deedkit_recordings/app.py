@@ -170,6 +170,7 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
         account = accounts[args.account]
         if operation in ('search', 'context', 'archive_status'):
             return await local.invoke(operation, args, authorization[7:])
+        request.state.provider = account.provider
         token = provider_token(account)
         params = dates(args) if operation == 'list_recordings' else {}
         binding = {'provider': account.provider, 'account': account.id, 'principal': actor.key_sha256,
@@ -266,7 +267,9 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
         except (ValueError, TypeError, OverflowError, UnicodeError, RecursionError):
             # Provider projection and JSON encoding can fail after the HTTP client boundary.
             # Never expose their values through an unhandled exception or server traceback.
-            raise Failure('invalid_provider_response', detail_code='projection_error') from None
+            # ANYM-753 names Omi body parts only; a PLAUD body keeps the bare code.
+            omi = getattr(request.state, 'provider', None) == 'omi'
+            raise Failure('invalid_provider_response', detail_code='projection_error' if omi else None) from None
 
     app.router.routes.append(Route('/v1/events', events_page, methods=['GET']))
     app.router.routes.append(Route('/v1/events/head', events_head, methods=['GET']))
