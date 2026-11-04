@@ -5,7 +5,7 @@ from collections.abc import Mapping
 import copy
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager,nullcontext,suppress
-from functools import cached_property
+from functools import cached_property,partial
 from datetime import datetime,timedelta,timezone
 import errno
 import json
@@ -1226,11 +1226,12 @@ class TelegramCollector:
         operation's outcome. A confirmed create_group receipt always says which (ANYM-750): `archive` is
         `collected` with `chat_id`, or `not_collected` with an `archive_reason` from a closed vocabulary and its
         fixed `next_step`; the collection policy's reason comes first, never exception text."""
-        from psycopg.errors import LockNotAvailable,QueryCanceled
+        from psycopg.errors import LockNotAvailable,QueryCanceled,TransactionTimeout
+        from psycopg_pool import PoolTimeout
         from telethon import types,utils
         data=answer.get('data') if isinstance(answer,dict) and answer.get('outcome')=='confirmed' else None
         if not isinstance(data,dict):return
-        failure='catalog_failed'
+        failure,policy='catalog_failed',job.get('_policy')
         try:
             chat=data.get('provider_chat_id')
             if not isinstance(chat,str) or job['operation']=='join_chat' and data.get('archive')!='collected':return
@@ -1244,21 +1245,23 @@ class TelegramCollector:
             if budget<=0:
                 failure='catalog_timeout';return
             state=bounded_state(self.state,time.monotonic()+budget)
-            if await asyncio.wait_for(finished(state.catalog,chat,'chat' if peer is types.PeerChat else 'channel',
-                    title if isinstance(title,str) and title else chat,chat_type,self.history_since),budget):
-                data['chat_id']=stable_id('chat',self.account,chat)
+            # The policy the write was judged by names a refusal, not the one read before the provider call.
+            found,policy=await asyncio.wait_for(finished(partial(state.catalog,explain=True),chat,
+                'chat' if peer is types.PeerChat else 'channel',title if isinstance(title,str) and title else chat,
+                chat_type,self.history_since),budget)
+            if found:data['chat_id']=stable_id('chat',self.account,chat)
         except asyncio.CancelledError:
             # A shutdown during the catalog write: the worker settles the confirmed receipt first, then stops.
             job['_cancel_after_settle']=True
             log.warning('new_chat_catalog_failed operation=%s error=CancelledError',job.get('operation'))
-        except (TimeoutError,QueryCanceled,LockNotAvailable) as exc:
+        except (TimeoutError,QueryCanceled,LockNotAvailable,TransactionTimeout,PoolTimeout) as exc:
             failure='catalog_timeout'
             log.warning('new_chat_catalog_failed operation=%s error=%s',job.get('operation'),type(exc).__name__)
         except Exception as exc:
             log.warning('new_chat_catalog_failed operation=%s error=%s',job.get('operation'),type(exc).__name__)
         finally:
             if job.get('operation')=='create_group':
-                with suppress(Exception):archive_receipt(data,job.get('_policy'),failure)
+                with suppress(Exception):archive_receipt(data,policy,failure)
 
     async def queue_edit_for_archive(self,job,answer):
         """ANYM-747: a confirmed edit reaches the archive through the edit spool, which the drain loop applies with

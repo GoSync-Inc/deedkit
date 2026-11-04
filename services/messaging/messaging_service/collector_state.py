@@ -453,24 +453,26 @@ class CollectorState:
             return [r['provider_chat'] for r in c.execute('''SELECT provider_chat FROM collector_chats
                 WHERE account=%s ORDER BY last_attempt_at NULLS FIRST,provider_chat''',(self.account,))]
 
-    def catalog(self,provider_chat,peer_kind,title,chat_type,history_since):
+    def catalog(self,provider_chat,peer_kind,title,chat_type,history_since,*,explain=False):
         """ANYM-476: a chat first seen in a live search hit enters the catalog as a dialog would; a known one is left as is.
-        True only when the current collection policy allows the chat and its archive row exists afterwards."""
+        True only when the current collection policy allows the chat and its archive row exists afterwards.
+        explain=True (ANYM-750) returns (that answer, the policy row it was evaluated against)."""
         with self.archive.store.pool.connection() as c:
             self.archive.fence(c,self.account,self.lease)
             known=c.execute('SELECT 1 FROM collector_chats WHERE account=%s AND provider_chat=%s',
                             (self.account,provider_chat)).fetchone()
-            if known: return self.catalogued(c,provider_chat)
+            if known: return self.catalogued(c,provider_chat,explain)
         self.inventory([(provider_chat,peer_kind,title,chat_type or 'unknown')],history_since)
         with self.archive.store.pool.connection() as c:
             self.archive.fence(c,self.account,self.lease)
-            return self.catalogued(c,provider_chat)
+            return self.catalogued(c,provider_chat,explain)
 
-    def catalogued(self,c,provider_chat):
+    def catalogued(self,c,provider_chat,explain=False):
         # A collector checkpoint alone is no archive chat: live capture writes it before the chats row.
         policy=c.execute('SELECT * FROM account_policies WHERE account=%s AND enabled',(self.account,)).fetchone()
-        return bool(policy and self.allows(policy,provider_chat) and c.execute('SELECT 1 FROM chats WHERE id=%s',
+        found=bool(policy and self.allows(policy,provider_chat) and c.execute('SELECT 1 FROM chats WHERE id=%s',
                     (stable_id('chat',self.account,provider_chat),)).fetchone())
+        return (found,policy) if explain else found
 
     def attempted(self,chat):
         with self.archive.store.pool.connection() as c:

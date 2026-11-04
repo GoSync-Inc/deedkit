@@ -24,13 +24,19 @@ def source(w, s, chats=None):
 GROUP = '-4001'
 
 
-def create_group(w, policy=None, **job):
+def set_policy(w, policy):
+    with w.archive.store.pool.connection() as c:
+        c.execute('UPDATE account_policies SET discover_chats=%s,include_chats=%s,exclude_chats=%s '
+                  'WHERE account=%s', (policy.get('discover', True), policy.get('include', []),
+                                       policy.get('exclude', []), w.account))
+
+
+def create_group(w, policy=None, during=None, **job):
     if policy:
-        with w.archive.store.pool.connection() as c:
-            c.execute('UPDATE account_policies SET discover_chats=%s,include_chats=%s,exclude_chats=%s '
-                      'WHERE account=%s', (policy.get('discover', True), policy.get('include', []),
-                                           policy.get('exclude', []), w.account))
+        set_policy(w, policy)
     async def provider(work):
+        if during:
+            during()
         return {'outcome': 'confirmed', 'data': {'provider_chat_id': GROUP, 'missing_invitee_ids': [],
                                                  'all_members_added': True, 'basis': 'provider_created_chat'}}
     w.provider.execute_operation = provider
@@ -59,20 +65,32 @@ def test_created_group_is_listed_and_sendable_at_once_and_its_receipt_says_colle
 # spec: ANYM-750
 @pytest.mark.parametrize('case,reason', [('discovery_off', 'discovery_disabled'), ('excluded', 'chat_excluded'),
                                          ('write_raises', 'catalog_failed'), ('budget_spent', 'catalog_timeout'),
-                                         ('write_too_slow', 'catalog_timeout')])
+                                         ('write_too_slow', 'catalog_timeout'), ('pool_timeout', 'catalog_timeout'),
+                                         ('transaction_timeout', 'catalog_timeout'),
+                                         ('discovery_off_during_create', 'discovery_disabled'),
+                                         ('excluded_and_write_raises', 'chat_excluded')])
 def test_created_group_receipt_names_why_it_is_not_in_the_archive(worker, monkeypatch, caplog, case, reason):
     import time
     from messaging_service import telegram_collector
     from messaging_service.telegram_operations import CREATE_GROUP_NEXT_STEPS
+    from psycopg.errors import TransactionTimeout
+    from psycopg_pool import PoolTimeout
     w, s, key = worker
-    policy, job = None, {}
+    policy, job, during = None, {}, None
     if case == 'discovery_off':
         policy = {'discover': False}
-    if case == 'excluded':
+    if case in ('excluded', 'excluded_and_write_raises'):
         policy = {'exclude': [GROUP]}
-    if case == 'write_raises':
-        def broken(*args):
-            raise RuntimeError('synthetic-secret-detail')
+    if case == 'discovery_off_during_create':
+        # the policy read before the provider call still allows the group; the one the write is judged by does not
+        during = lambda: set_policy(w, {'discover': False})  # noqa: E731
+    failure = {'write_raises': RuntimeError('synthetic-secret-detail'),
+               'excluded_and_write_raises': RuntimeError('synthetic-secret-detail'),
+               'pool_timeout': PoolTimeout('synthetic-secret-detail'),
+               'transaction_timeout': TransactionTimeout('synthetic-secret-detail')}.get(case)
+    if failure is not None:
+        def broken(*args, **kwargs):
+            raise failure
         monkeypatch.setattr(CollectorState, 'catalog', broken)
     if case == 'budget_spent':
         job = {'_ends_at': time.monotonic()}
@@ -80,19 +98,19 @@ def test_created_group_receipt_names_why_it_is_not_in_the_archive(worker, monkey
         monkeypatch.setattr(telegram_collector, 'CATALOG_SECONDS', .05)
         monkeypatch.setattr(telegram_collector, 'STORE_GRACE', 0)
         real = CollectorState.catalog
-        def slow(*args):
+        def slow(*args, **kwargs):
             time.sleep(.3)
-            return real(*args)
+            return real(*args, **kwargs)
         monkeypatch.setattr(CollectorState, 'catalog', slow)
     caplog.set_level('WARNING', 'messaging_service.telegram_collector')
-    answer = create_group(w, policy, **job)
+    answer = create_group(w, policy, during, **job)
     assert answer['outcome'] == 'confirmed'
     data = answer['data']
     assert data['archive'] == 'not_collected' and data['archive_reason'] == reason
     assert data['next_step'] == CREATE_GROUP_NEXT_STEPS[reason] and 'chat_id' not in data
     assert data['provider_chat_id'] == GROUP
     assert 'synthetic-secret-detail' not in json.dumps(answer) + caplog.text
-    if case in ('discovery_off', 'excluded'):
+    if case in ('discovery_off', 'excluded', 'discovery_off_during_create'):
         assert stable_id('chat', w.account, GROUP) not in [c['id'] for c in s.list_chats(key)['items']]
 
 
@@ -103,10 +121,10 @@ def test_cancelled_group_catalog_write_still_settles_the_confirmed_receipt_first
     w, _, _ = worker
     monkeypatch.setattr(telegram_collector, 'STORE_GRACE', 0)
     entered, release = Event(), Event()
-    def stalled(*args):
+    def stalled(*args, **kwargs):
         entered.set()
         assert release.wait(5)
-        return False
+        return False, None
     monkeypatch.setattr(CollectorState, 'catalog', stalled)
     async def provider(work):
         return {'outcome': 'confirmed', 'data': {'provider_chat_id': GROUP, 'basis': 'provider_created_chat'}}
