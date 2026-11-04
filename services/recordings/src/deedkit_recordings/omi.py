@@ -1,9 +1,11 @@
 """Only documented Omi GET routes. Bounded, cancellable, no retries or persistence."""
 import asyncio
+from datetime import datetime
 import hashlib
 import json
 import math
 import re
+import time
 
 import httpx
 
@@ -13,6 +15,8 @@ ORIGIN = 'https://api.omi.me'
 ROUTE = '/v1/dev/user/conversations'
 ID = re.compile(r'[A-Za-z0-9_-]{1,256}')
 RETRY_DEFAULT, RETRY_CAP = 3600, 6 * 3600
+UNPLACED = -1.0  # Omi's start == end sentinel for text it could not place on the timeline (UNPLACED_SEGMENT_OFFSET)
+PROCESSING = 86400  # an empty title and overview this young is Omi's lazy processing, not a missing summary
 
 
 def retry_after(headers):
@@ -125,7 +129,16 @@ def pagination(headers, count, limit):
             'staleness_seconds': 10, 'date_field': 'created_at'}, next_page if more is True else None
 
 
-def content(value, kind):
+def young(created, now):
+    """True when `created_at` parses and is under a day old (a creation time in the future counts as young)."""
+    try:
+        moment = datetime.fromisoformat(created.replace('Z', '+00:00'))
+        return moment.tzinfo is not None and now - moment.timestamp() < PROCESSING
+    except (AttributeError, ValueError, TypeError, OverflowError):
+        return False
+
+
+def content(value, kind, now=None):
     if not isinstance(value, dict):
         raise Failure('invalid_provider_response', detail_code='not_object')
     if kind == 'summary':
@@ -135,6 +148,9 @@ def content(value, kind):
         text = structured.get('overview') if isinstance(structured, dict) else None
         if not isinstance(text, str):
             return 'unavailable', ''
+        # GET never carries `processing_deferred`: a deferred conversation is listed with an empty structured block.
+        if not text and structured.get('title') in (None, '') and young(value.get('created_at'), time.time() if now is None else now):
+            return 'pending', ''
         return ('available' if text else 'empty'), text
     if value.get('transcript_included') is not True:
         return 'unavailable', ''
@@ -159,6 +175,8 @@ def content(value, kind):
                 raise Failure('invalid_provider_response', detail_code='segment_offset')
             offsets.append(number)
         if segment['text']:
-            rows.append(json.dumps({'start': offsets[0], 'end': offsets[1], 'speaker': str(speaker),
-                                    'text': segment['text']}, ensure_ascii=False, separators=(',', ':')))
+            row = {'start': offsets[0], 'end': offsets[1], 'speaker': str(speaker), 'text': segment['text']}
+            if offsets[0] == UNPLACED and offsets[1] == UNPLACED:
+                row.update(start=None, end=None, placed=False)  # other negative offsets are real pre-pin times: kept
+            rows.append(json.dumps(row, ensure_ascii=False, separators=(',', ':')))
     return ('available' if rows else 'empty'), '\n'.join(rows)
