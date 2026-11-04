@@ -1,5 +1,5 @@
 [Unit]
-Description=DeedKit family calendar backup cadence (daily, inside autodeploy's no-start hours)
+Description=DeedKit family calendar backup cadence (daily; the runner lock excludes a deploy)
 
 [Timer]
 OnCalendar=*-*-* 16:00:00 UTC
