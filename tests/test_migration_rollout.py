@@ -624,8 +624,26 @@ CRITICAL_FORMS = {
     'do-execute': ("DO $$ BEGIN EXECUTE 'DROP TABLE messages'; END $$;", 'DO'),
     'extension': ('CREATE EXTENSION citext;', 'CREATE EXTENSION'),
     'other-schema-table': ('ALTER TABLE other.messages ADD COLUMN x text;', 'unparsed'),
-    'unknown': ('VACUUM messages;', 'statement VACUUM'),
+    'unknown': ('VACUUM ANALYZE messages;', 'other statement'),
+    'do-call': ("DO $$ BEGIN IF synthetic_clear() THEN NULL; END IF; END $$;", 'DO'),
+    'new-function-default': ('CREATE FUNCTION synthetic_f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$; '
+                             'ALTER TABLE messages ADD COLUMN y int DEFAULT synthetic_f();', 'FUNCTION CALL'),
+    'bare-alter': ('ALTER;', 'unparsed'),
+    'bare-set': ('ALTER TABLE messages SET;', 'unparsed'),
+    'bare-create': ('CREATE TABLE;', 'unparsed'),
 }
+
+
+def calendar_rollout():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        'calendar_rollout', SOURCE.parents[1] / 'calendar/family_calendar/service/migration_rollout.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+CLASSIFIERS = {'messaging': rollout, 'calendar': calendar_rollout()}
 NON_CRITICAL_FORMS = {
     'widening-pair': ALLOWED['widen-in'],
     'index-on-existing': 'CREATE INDEX messages_body ON messages (body);',
@@ -646,46 +664,61 @@ NON_CRITICAL_FORMS = {
 
 
 # spec: ANYM-743
+@pytest.mark.parametrize('database', sorted(CLASSIFIERS))
 @pytest.mark.parametrize('form', sorted(CRITICAL_FORMS))
-def test_a_statement_that_deletes_or_rewrites_rows_or_drops_stored_data_is_critical_with_its_line(form):
-    text, kind = CRITICAL_FORMS[form]
+def test_a_statement_that_deletes_or_rewrites_rows_or_drops_stored_data_is_critical_with_its_line(form, database):
+    module, (text, kind) = CLASSIFIERS[database], CRITICAL_FORMS[form]
     file = EXPAND + 'ALTER TABLE messages ADD COLUMN synthetic_note text;\n\n' + text + '\n'
-    assert rollout.risk_class(file) == ('critical', 4, kind)
-    assert rollout.unattended_class(file) == 'manual'
+    assert module.risk_class(file) == ('critical', 4, kind) and kind in module.RISK_KINDS
+    assert module.unattended_class(file) == 'manual'
 
 
 # spec: ANYM-743
+@pytest.mark.parametrize('database', sorted(CLASSIFIERS))
 @pytest.mark.parametrize('form', sorted(NON_CRITICAL_FORMS))
-def test_every_other_named_form_is_non_critical_and_unattended_whatever_the_header_class(form):
-    text = NON_CRITICAL_FORMS[form]
-    assert rollout.risk_class(text) == ('non-critical', None, None)
-    assert rollout.unattended_class(EXPAND + text) == rollout.unattended_class('-- rollout: manual\n' + text) == 'expand'
-    assert rollout.unattended_class(text) == 'manual'  # no header
-    assert rollout.unattended_class(EXPAND + text + '\nCREATE INDEX CONCURRENTLY x ON messages (id);') == 'manual'
+def test_every_other_named_form_is_non_critical_and_unattended_whatever_the_header_class(form, database):
+    module, text = CLASSIFIERS[database], NON_CRITICAL_FORMS[form]
+    assert module.risk_class(text) == ('non-critical', None, None)
+    assert module.unattended_class(EXPAND + text) == module.unattended_class('-- rollout: manual\n' + text) == 'expand'
+    assert module.unattended_class(text) == 'manual'  # no header
+    assert module.unattended_class(EXPAND + text + '\nCREATE INDEX CONCURRENTLY x ON messages (id);') == 'manual'
 
 
 # spec: ANYM-743
 @given(st.text(alphabet='abcdefghijklmnopqrstuvwxyz _(),;\'$-\n', max_size=200),
-       st.sampled_from(sorted(CRITICAL_FORMS)))
+       st.sampled_from(sorted(CRITICAL_FORMS)), st.sampled_from(sorted(CLASSIFIERS)))
 @settings(max_examples=300, deadline=None)
-def test_a_critical_statement_keeps_a_file_critical_whatever_precedes_it(noise, form):
+def test_a_critical_statement_keeps_a_file_critical_whatever_precedes_it(noise, form, database):
     # Fail-closed: no text before a critical statement makes the file non-critical (noise that does not tokenize
     # is critical too).
-    assert rollout.risk_class(noise + ';\n' + CRITICAL_FORMS[form][0])[0] == 'critical'
+    assert CLASSIFIERS[database].risk_class(noise + ';\n' + CRITICAL_FORMS[form][0])[0] == 'critical'
+
+
+# spec: ANYM-743
+@given(st.text(alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz', min_size=4, max_size=30),
+       st.sampled_from(['{m};', '{m} now please;', 'CREATE {m} x;', 'DROP {m} x;', 'ALTER TABLE t {m} x;',
+                        'DO $$ BEGIN {m}(); END $$;', '{m} ( ;', "SELECT '{m}"]))
+@settings(max_examples=200, deadline=None)
+def test_the_pause_names_a_fixed_kind_never_a_word_of_the_file(marker, shape):
+    from scripts import production
+    text = EXPAND + shape.format(m='Zq' + marker) + '\n'
+    for module in CLASSIFIERS.values():
+        tier, _, kind = module.risk_class(text)
+        assert tier == 'non-critical' or kind in module.RISK_KINDS
+    assert set(production.RISK_KINDS) == set(rollout.RISK_KINDS) == set(CLASSIFIERS['calendar'].RISK_KINDS)
+    named = production.classifier_child(production.CLASSIFY, {'source': Path(rollout.__file__).read_text(),
+                                                              'texts': [text]})
+    assert production.NAMED_CLASS.fullmatch(named[0]) and 'zq' + marker.lower() not in named[0].lower()
 
 
 # spec: ANYM-743
 def test_most_applied_migrations_are_non_critical():
-    # The owner's «большая часть» (ANYM-743 C1b): more than half of every applied messaging and calendar file.
-    import importlib.util
+    # The owner's «большая часть» (ANYM-743 C1b): more than half of the applied files of each database.
     folder = SOURCE.parents[1] / 'calendar/family_calendar/service'
-    spec = importlib.util.spec_from_file_location('calendar_rollout', folder / 'migration_rollout.py')
-    calendar = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(calendar)
-    tiers = [rollout.risk_class(path.read_text())[0] for path in MIGRATIONS.values()]
-    tiers += [calendar.risk_class(path.read_text())[0]
-              for path in folder.glob('schema_v[0-9]*.sql')]
-    assert len(tiers) > 60 and tiers.count('non-critical') > len(tiers) / 2
+    for module, paths, least in ((rollout, MIGRATIONS.values(), 60),
+                                 (CLASSIFIERS['calendar'], folder.glob('schema_v[0-9]*.sql'), 7)):
+        tiers = [module.risk_class(path.read_text())[0] for path in paths]
+        assert len(tiers) >= least and tiers.count('non-critical') > len(tiers) / 2
 
 
 # 038 holds the widening pair too, but its partial unique index already makes it manual for `classify`.

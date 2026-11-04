@@ -2,6 +2,7 @@
 the catalog and rehearsal tests use the isolated PostgreSQL container (ANYMSG_TEST_POSTGRES_CONTAINER) like ANYM-588's."""
 from contextlib import contextmanager
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ from uuid import uuid4
 import pytest
 
 from messaging_service import __version__
+from messaging_service import migration_rollout as rollout
 from messaging_service.archive import Archive
 from messaging_service.event_delivery import dispatch_hints
 from messaging_service.subscriptions import match_subscriptions
@@ -790,6 +792,26 @@ def test_the_data_check_allows_only_the_migrations_own_ledger_rows(source_db, wr
     found = p.data_unchanged(before, data(source_db), PLAN)
     assert found == {"none": None, "delivery-features": "probe_metadata changed beyond schema_version",
                      "existing-table": "rows of public.messages were written"}[write]
+
+
+# Astra r1 F1 (ANYM-743): a TRUNCATE inside a function a DO condition calls, on a populated table.
+TRUNCATING = ("-- rollout: manual\nCREATE FUNCTION synthetic_clear() RETURNS boolean\nLANGUAGE plpgsql AS $f$\n"
+              "BEGIN TRUNCATE messages CASCADE; RETURN true; END;\n$f$;\nDO $b$\nBEGIN IF synthetic_clear() THEN NULL; "
+              "END IF; END;\n$b$;\n")
+
+
+# spec: ANYM-743
+def test_a_truncate_hidden_in_a_function_is_critical_in_both_classifiers_and_the_rehearsal_refuses_it(source_db):
+    spec = importlib.util.spec_from_file_location(
+        "calendar_rollout", ROLLOUT.parents[3] / "services/calendar/family_calendar/service/migration_rollout.py")
+    calendar = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(calendar)
+    for module in (rollout, calendar):
+        assert module.risk_class(TRUNCATING)[0] == "critical" and module.unattended_class(TRUNCATING) == "manual"
+    before = data(source_db)
+    psql(source_db, "BEGIN; " + LEDGER_ROW.format(digest="a" * 64) + TRUNCATING.split("\n", 1)[1]
+         + " SELECT pg_stat_force_next_flush(); COMMIT;")
+    assert p.data_unchanged(before, data(source_db), PLAN) == "the row count of public.messages changed"
 
 
 @pytest.fixture

@@ -465,6 +465,16 @@ DROPPED = {'index', 'trigger', 'function', 'procedure', 'policy', 'view', 'type'
 DO_STARTS = {'begin', 'grant', 'revoke', 'raise', 'if', 'elsif', 'end', 'create', 'null'}
 DO_FORBIDDEN = {'delete', 'update', 'insert', 'merge', 'truncate', 'drop', 'copy', 'perform', 'execute', 'call',
                 'alter', 'loop', 'declare'}
+# In a DO body a word before `(` is a call unless it is one of these (a function can write, Astra r1 F1).
+DO_CALLS = {'exists', 'not', 'and', 'or', 'in', 'any', 'all', 'to_regclass', 'pg_relation_size', 'coalesce', 'using',
+            'check'}
+# DROP kinds named in a critical kind; any other critical CREATE or DROP kind reads `other` (the pause prints kinds,
+# never a word of the file: Astra r1 F2).
+DROP_KINDS = {'table', 'schema', 'sequence', 'materialized', 'extension', 'owned', 'database', 'server'}
+RISK_KINDS = frozenset({*CRITICAL_FIRST.values(), 'INSERT ON CONFLICT DO UPDATE', 'DO', 'SET', 'CREATE EXTENSION',
+                        'CREATE other', *(f'DROP {kind.upper()}' for kind in DROP_KINDS), 'DROP other', 'DROP CASCADE',
+                        'DROP COLUMN', 'ALTER COLUMN TYPE', 'ALTER CASCADE', 'FUNCTION CALL', 'other statement',
+                        'unparsed', 'untokenizable'})
 
 
 def statement_lines(text):
@@ -484,8 +494,10 @@ def do_body_critical(body):
     except Untokenizable:
         return True
     start, granting = True, False
-    for kind, value in items:
+    for at, (kind, value) in enumerate(items):
         word = value if kind == 'word' else None
+        if (not granting and kind in ('word', 'ident') and items[at + 1:at + 2] == [('punct', '(')]
+                and value not in DO_CALLS): return True
         if start and kind != 'punct':
             if word not in DO_STARTS: return True
             granting = word in ('grant', 'revoke')
@@ -504,7 +516,7 @@ TABLE_ACTIONS = {'add', 'drop', 'alter', 'rename', 'validate', 'enable', 'disabl
 def table_action(part):
     """The critical kind of one ALTER TABLE action, or None."""
     c = Cursor(part)
-    if c.peek()[0] != 'word' or c.peek()[1] not in TABLE_ACTIONS: return 'unparsed'
+    if c.peek()[0] != 'word' or c.peek()[1] not in TABLE_ACTIONS or len(part) < 2: return 'unparsed'
     if c.word('drop'):
         if ('word', 'cascade') in part: return 'DROP CASCADE'
         return None if c.word('constraint') else 'DROP COLUMN'
@@ -522,6 +534,7 @@ def statement_risk(statement):
     c = Cursor(statement)
     first = c.peek()[1] if c.peek()[0] == 'word' else None
     if first in CRITICAL_FIRST: return CRITICAL_FIRST[first]
+    if len(statement) < 3 and first != 'do': return 'unparsed'  # no admitted form is shorter (Astra r1 F5)
     if first in ('grant', 'revoke', 'comment', 'analyze'): return None
     if first == 'set': return None if c.peek(1) == ('word', 'local') else 'SET'
     if first == 'insert':
@@ -541,13 +554,14 @@ def statement_risk(statement):
         if c.word('or'): c.expect('replace')
         while c.word('temporary', 'temp', 'unlogged', 'constraint', 'recursive'): pass
         kind = c.peek()[1] if c.peek()[0] == 'word' else None
-        return None if kind in CREATED else 'CREATE ' + str(kind).upper()
+        return None if kind in CREATED else 'CREATE EXTENSION' if kind == 'extension' else 'CREATE other'
     if first == 'drop':
         kind = c.peek()[1] if c.peek()[0] == 'word' else None
         if ('word', 'cascade') in statement: return 'DROP CASCADE'
-        return None if kind in DROPPED else 'DROP ' + str(kind).upper()
+        return None if kind in DROPPED else f'DROP {kind.upper()}' if kind in DROP_KINDS else 'DROP other'
     if first == 'alter':
         if not c.word('table'): return 'ALTER CASCADE' if ('word', 'cascade') in statement else None
+        if len(statement) < 4: return 'unparsed'
         if c.word('if'): c.expect('exists')
         c.word('only')
         c.name()
@@ -556,7 +570,24 @@ def statement_risk(statement):
         for part in split(statement[c.at:]):
             if kind := table_action(part): return kind
         return None
-    return 'statement ' + str(first).upper()
+    return 'other statement'
+
+
+def new_function_call(statement, created):
+    """'FUNCTION CALL' when `statement` calls a function the same file creates (a DEFAULT, CHECK, index, INSERT or
+    DO condition runs it during the migration, Astra r1 F1); its own definition and a trigger's EXECUTE FUNCTION do
+    not."""
+    first = statement[:1]
+    if first in ([('word', 'grant')], [('word', 'revoke')], [('word', 'comment')]) or first in (
+            [('word', 'create')], [('word', 'alter')], [('word', 'drop')]) and any(
+            item in statement[:4] for item in (('word', 'function'), ('word', 'procedure'))): return None
+    for at, (kind, value) in enumerate(statement):
+        if kind in ('word', 'ident') and value in created and statement[at + 1:at + 2] == [('punct', '(')]:
+            before = at - 2 if statement[max(at - 2, 0):at] == [('word', 'public'), ('punct', '.')] else at
+            if statement[max(before - 2, 0):before] not in ([('word', 'execute'), ('word', 'function')],
+                                                            [('word', 'execute'), ('word', 'procedure')]):
+                return 'FUNCTION CALL'
+    return None
 
 
 def risk_class(text):
@@ -566,12 +597,18 @@ def risk_class(text):
         parsed, lines = statements(text), statement_lines(text)
     except Untokenizable:
         return 'critical', 0, 'untokenizable'
+    created = set()
+    for statement in parsed:
+        c = Cursor(statement)
+        if c.word('create') and (not c.word('or') or c.word('replace')) and c.word('function', 'procedure'):
+            try: created.add(c.name())
+            except Manual: pass
     for statement, line in zip(parsed, lines):
         try:
-            kind = statement_risk(statement)
+            kind = statement_risk(statement) or new_function_call(statement, created)
         except (Manual, Untokenizable):
             kind = 'unparsed'
-        if kind: return 'critical', line, kind
+        if kind: return 'critical', line, kind if kind in RISK_KINDS else 'other statement'
     return 'non-critical', None, None
 
 

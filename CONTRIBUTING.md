@@ -78,20 +78,22 @@ range creates); `CREATE [UNIQUE] INDEX [name] ON
 or identity column); a `DROP CONSTRAINT c` directly followed by `ADD CONSTRAINT c CHECK (<col>
 IN (<literals>)) NOT VALID` or `CHECK (<col> <@ ARRAY[<literals>]::text[]) NOT VALID`; 036's
 `DO` precondition template; `COMMENT ON TABLE <t>` or `COMMENT ON COLUMN <t>.<c> IS '<literal>'` of such
-a table (ANYM-619: a comment on a schema, role, function or any other object is `manual`). Deploy's
-admission classifies without the table list and accepts any unqualified table there; `migrate-expand` passes
-the database's tables and refuses an unknown one with `not_unattended`, nothing applied. Anything else (transaction control,
+a table (ANYM-619: a comment on a schema, role, function or any other object is `manual`). With the database's
+tables, `additive_class` (this language with no DROP) refuses an unknown table; the feedback autoloop's owner
+boundary is `additive_class` (docs/operations/feedback-autoloop.md). Anything else (transaction control,
 DML, functions, triggers, other `DO` blocks, grants, drops, renames, type/default/nullability
 changes), and any text not lexed exactly as PostgreSQL does (U&, B, X or N strings, a string
 continued after a newline, an unclosed quote or comment), is `manual`.
 `tests/test_migration_rollout.py` never executes a declared `expand` that `classify` rejects; it
 applies the others to PostgreSQL and fails unless the catalog only gained those kinds of change
-(row security included; a widened list must be a superset of numbers or strings). Nothing runs a migration because of its class: `deploy` only names it in its pause.
+(row security included; a widened list must be a superset of numbers or strings). The header class decides
+no release: `deploy` names it with the tier in its pause and runs a file by `unattended_class` below.
 The unattended entry point `python -m messaging_service migrate-expand --plan <file>` (ANYM-596; `migrate`
 is unchanged) runs only files whose `unattended_class` is `expand` (ANYM-743): a file with a rollout header
 whose `risk_class` is non-critical (no statement that deletes or rewrites rows or drops stored data, production.md
 "Migration risk tiers"), with no `CONCURRENTLY` and no name over 63 bytes; the deployer's rehearsal on a copy then
-refuses a removed table or column, a changed column type and any row write. Role files may only grow: `role_class` calls the
+refuses a removed table or column, a changed column type, a new NOT NULL column without a default, any row
+write and any changed row count. Role files may only grow: `role_class` calls the
 appended text `additive` when the file still starts with its old text byte for byte and every appended
 statement is a comment, a `GRANT <SELECT|INSERT|UPDATE|DELETE|REFERENCES>[(<columns>)], ... ON [TABLE]
 <table>, ... TO <role>` to a role the old text already grants to, or 050's permissive `DO ... CREATE POLICY`

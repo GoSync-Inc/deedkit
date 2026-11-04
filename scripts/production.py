@@ -2845,7 +2845,15 @@ CLASSIFY = CLASSIFY_PRELUDE + """def named(text):
     return kind + (" non-critical" if tier == "non-critical" else f" critical: line {line} {what}")
 print(json.dumps([named(text) for text in data["texts"]]))
 """
-NAMED_CLASS = re.compile(r"(?:expand|manual|no header)(?: non-critical| critical: line [0-9]{1,6} [A-Za-z_ ]{1,60})?")
+# The statement kinds `risk_class` names (migration_rollout.RISK_KINDS): an exact list, so a pause line carries no word
+# of a migration file (Astra r1 F2).
+RISK_KINDS = ("DELETE", "UPDATE", "MERGE", "TRUNCATE", "COPY", "SELECT", "CALL", "WITH", "PERFORM", "EXECUTE",
+              "INSERT ON CONFLICT DO UPDATE", "DO", "SET", "CREATE EXTENSION", "CREATE other", "DROP TABLE", "DROP SCHEMA",
+              "DROP SEQUENCE", "DROP MATERIALIZED", "DROP EXTENSION", "DROP OWNED", "DROP DATABASE", "DROP SERVER",
+              "DROP other", "DROP CASCADE", "DROP COLUMN", "ALTER COLUMN TYPE", "ALTER CASCADE", "FUNCTION CALL",
+              "other statement", "unparsed", "untokenizable")
+NAMED_CLASS = re.compile(r"(?:expand|manual|no header)(?: non-critical| critical: line [0-9]{1,6} (?:"
+                         + "|".join(map(re.escape, RISK_KINDS)) + "))?")
 
 
 def classifier_limits():
@@ -2871,16 +2879,23 @@ def classifier_child(script, payload):
 
 
 def migration_classes(mirror, base, candidate, sql):
-    """`<file> <class>` for each migration `base..candidate` adds (ANYM-444): the class the candidate's classifier
-    gives the candidate's bytes, `expand`, `manual` or `no header`. It only names; whatever fails here is `manual`."""
-    if not any(MIGRATION.fullmatch(path) for path in sql):
-        return []
+    """`<file> <class> <tier>` for each messaging or calendar migration `base..candidate` adds (ANYM-444, ANYM-743):
+    what the candidate's classifier of that database gives the candidate's bytes. It only names; whatever fails here
+    is `manual` with no tier."""
+    named = []
+    for pattern, classifier in ((MIGRATION, CLASSIFIER), (CALENDAR_MIGRATION, CALENDAR_CLASSIFIER)):
+        if any(pattern.fullmatch(path) for path in sql):
+            named += database_classes(mirror, base, candidate, pattern, classifier)
+    return named
+
+
+def database_classes(mirror, base, candidate, pattern, classifier):
     try:
         added = [path for path in run(["git", "-C", str(mirror), "diff", "--name-only", "--no-renames", "--diff-filter=A",
-                                       "-z", base, candidate]).split("\0") if MIGRATION.fullmatch(path)]
+                                       "-z", base, candidate]).split("\0") if pattern.fullmatch(path)]
     except Refused:
         return []
-    objects = [f"{candidate}:{path}" for path in added + [CLASSIFIER]]
+    objects = [f"{candidate}:{path}" for path in added + [classifier]]
     try:
         # Sizes first: nothing over the input limit is read, and then no process starts.
         if sum(int(run(["git", "-C", str(mirror), "cat-file", "-s", obj])) for obj in objects) > CLASSIFY_INPUT_LIMIT:
@@ -2894,7 +2909,7 @@ def migration_classes(mirror, base, candidate, sql):
         classes = None
     if not (isinstance(classes, list) and len(classes) == len(added) and all(isinstance(c, str) and NAMED_CLASS.fullmatch(c) for c in classes)):
         classes = ["manual"] * len(added)
-    return [f"{MIGRATION.fullmatch(path)[1]} {kind}" for path, kind in zip(added, classes)]
+    return [f"{pattern.fullmatch(path)[1]} {kind}" for path, kind in zip(added, classes)]
 
 
 def pause_text(sql, pending, classes=()):
@@ -3049,7 +3064,10 @@ MIGRATION_DATA = r"""SELECT line FROM (
          CASE WHEN name = 'schema_version' THEN value ELSE md5(value) END)::text AS line FROM probe_metadata
   UNION ALL SELECT json_build_object('k', json_build_array('ledger', version::text), 'v', sha256)::text FROM archive_migrations
   UNION ALL SELECT json_build_object('k', json_build_array('writes', format('%I.%I', schemaname, relname)), 'v',
-         json_build_array(n_tup_ins, n_tup_upd, n_tup_del))::text FROM pg_stat_user_tables) AS lines ORDER BY line;"""
+         json_build_array(n_tup_ins, n_tup_upd, n_tup_del))::text FROM pg_stat_user_tables
+  UNION ALL SELECT json_build_object('k', json_build_array('rows', format('%I.%I', schemaname, relname)), 'v',
+         (xpath('/row/c/text()', query_to_xml(format('SELECT count(*) AS c FROM %I.%I', schemaname, relname), false,
+                                              true, '')))[1]::text)::text FROM pg_stat_user_tables) AS lines ORDER BY line;"""
 LEDGER = r"""SELECT json_build_object('schema_version', (SELECT value FROM probe_metadata WHERE name = 'schema_version'),
   'applied', (SELECT coalesce(json_object_agg(version::text, sha256 ORDER BY version), '{}'::json) FROM archive_migrations))::text;"""
 OTHER_SESSIONS = "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend' AND pid <> pg_backend_pid();"
@@ -3093,6 +3111,7 @@ CALENDAR_PACKAGE = "services/calendar/family_calendar/service/"
 CALENDAR_FILE = re.compile(r"schema(?:_v([1-9][0-9]*))?\.sql")
 CALENDAR_ROLES = CALENDAR_PACKAGE + "roles.sql"
 CALENDAR_CLASSIFIER, CALENDAR_STORE = CALENDAR_PACKAGE + "migration_rollout.py", CALENDAR_PACKAGE + "store.py"
+CALENDAR_MIGRATION = re.compile(re.escape(CALENDAR_PACKAGE) + r"(schema_v[0-9]+\.sql)")
 CALENDAR_TARGET = "calendar"
 CALENDAR_RUNTIME = "/data/service/runtime.json"
 # K0: the calendar Store's pool prepares no statement server-side either.
@@ -3112,7 +3131,10 @@ CALENDAR_LEDGER = r"""SELECT json_build_object('schema_version', coalesce(max(ve
 CALENDAR_DATA = r"""SELECT line FROM (
   SELECT json_build_object('k', json_build_array('ledger', version::text), 'v', checksum)::text AS line FROM fcs.migrations
   UNION ALL SELECT json_build_object('k', json_build_array('writes', format('%I.%I', schemaname, relname)), 'v',
-         json_build_array(n_tup_ins, n_tup_upd, n_tup_del))::text FROM pg_stat_user_tables) AS lines ORDER BY line;"""
+         json_build_array(n_tup_ins, n_tup_upd, n_tup_del))::text FROM pg_stat_user_tables
+  UNION ALL SELECT json_build_object('k', json_build_array('rows', format('%I.%I', schemaname, relname)), 'v',
+         (xpath('/row/c/text()', query_to_xml(format('SELECT count(*) AS c FROM %I.%I', schemaname, relname), false,
+                                              true, '')))[1]::text)::text FROM pg_stat_user_tables) AS lines ORDER BY line;"""
 # fcs.migrations has no applied_at: the rehearsal's transaction time is the database's active and idle-in-transaction
 # milliseconds its session added (counted at its exit), plus the few reads between (an overestimate).
 BUSY = ("SELECT round(active_time + idle_in_transaction_time) FROM pg_stat_database "
@@ -3360,9 +3382,10 @@ def data_unchanged(before, after, plan):
     if set(plan["pending"]) & set(ledger(before)) or ledger(after) != {**ledger(before), **plan["pending"]}:
         return "archive_migrations changed beyond the pending versions"
     for key, value in sorted(before.items(), key=json.dumps):
-        if key[0] == "writes" and key[1] not in ("public.probe_metadata", "public.archive_migrations") \
+        # ANYM-743 (Astra r1 F1): a TRUNCATE moves no write counter, so the exact row count of every table counts too.
+        if key[0] in ("writes", "rows") and key[1] not in ("public.probe_metadata", "public.archive_migrations") \
                 and after.get(key) != value:
-            return f"rows of {key[1]} were written"
+            return f"rows of {key[1]} were written" if key[0] == "writes" else f"the row count of {key[1]} changed"
     return None
 
 
@@ -3373,8 +3396,8 @@ def calendar_data_unchanged(before, after, plan):
     if set(plan["pending"]) & set(ledger(before)) or ledger(after) != {**ledger(before), **plan["pending"]}:
         return "fcs.migrations changed beyond the pending versions"
     for key, value in sorted(before.items(), key=json.dumps):
-        if key[0] == "writes" and key[1] != "fcs.migrations" and after.get(key) != value:
-            return f"rows of {key[1]} were written"
+        if key[0] in ("writes", "rows") and key[1] != "fcs.migrations" and after.get(key) != value:
+            return f"rows of {key[1]} were written" if key[0] == "writes" else f"the row count of {key[1]} changed"
     return None
 
 
@@ -5011,8 +5034,10 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
         migration = [f"migrate {plan['database']} schema {plan['base']} to {plan['target']} after a verified copy and "
                      "its rehearsal" + (", then db-roles and db-roles --check" if plan["database"] == CALENDAR else "")
                      for plan in plans or ()]
+        # ANYM-743: every added migration with its class and tier, also when the range runs unattended.
         return {"status": "plan", "sha": candidate, "base": base,
-                "steps": migration + (["plan A"] if candidate != base else []) + ["plan B"]}
+                "steps": migration + (["plan A"] if candidate != base else []) + ["plan B"],
+                **({"migrations": classes} if (classes := migration_classes(mirror, since, candidate, sql)) else {})}
     record.update(sha=candidate, base=base, started_at=now(), status="deploying")
     if backup_waited:  # ANYM-744
         record["backup_wait_seconds"] = backup_waited
