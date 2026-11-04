@@ -25,7 +25,7 @@ from .archive import Archive
 from .blobs import BlobWriter
 from .envelope import stable_id
 from .collector_state import LIVE_REJECT_CODES,CaptureSpool,CollectorState,PeerKindConflict,session_lock
-from .spool import InvalidCapture,PoisonItem
+from .spool import DurableSpool,InvalidCapture,PoisonItem
 from .collector_common import DbBackoff,commit_items,validate_common,validate_ranges
 from .store import Store
 from .telegram_governor import LIVE_BUDGETS,LIVE_STATE,ProviderRateLimited,RequestGovernor
@@ -845,7 +845,7 @@ class TelegramCollector:
         from psycopg_pool import PoolTimeout
         while True:
             try:
-                await self.drain_captures([self.spool,self.edit_spool],[self.history_spool])
+                await self.drain_captures([self.spool],[self.history_spool])
                 await asyncio.to_thread(self.state.apply_tombstones)
             except (psycopg.OperationalError,PoolTimeout):
                 # Capture remains durable; the independent heartbeat stops the
@@ -855,6 +855,11 @@ class TelegramCollector:
 
     async def drain_captures(self,spools,history_spools=()):
         last=None;count=0
+        # ANYM-747: the edit spool beside the live spool drains with it, as live progress (WhatsApp's drain passes
+        # its events spool, never self.spool, so it gains nothing).
+        live=getattr(self,'spool',None)
+        if isinstance(live,DurableSpool) and any(spool is live for spool in spools):
+            spools=[*spools,self.edit_spool]
         def settle(item):
             # A kept item whose chat has another stored kind can never apply: quarantine its bytes so the
             # other chats keep draining (counted in capture_progress), instead of ending the worker.

@@ -418,7 +418,13 @@ def test_a_stalled_edit_hand_off_holds_its_slot_and_takes_no_shared_thread(worke
     assert [a['data']['archive'] for a in answers]==['not_queued']*3
     assert len(calls)==1 and held==1  # one write in flight, its slot held past the timeout; no second write
     assert w.capture_count==0 and not w.failed.is_set() and w.failure_code is None
-    assert drained(w)==['created']*11  # ten live captures, then the hand-off item once its write ended
+    # the drain loop's own call, drain_captures([live],[history]), applies the edit spool with the live one
+    asyncio.run(w.drain_captures([w.spool],[w.history_spool]))
+    assert not list(w.spool.path.glob('*.json')) and not list(w.edit_spool.path.glob('*.json'))
+    with s.pool.connection() as c:
+        bodies=c.execute('SELECT body FROM messages WHERE id=ANY(%s)',([stable_id('msg',w.account,'100',str(n))
+            for n in (9,*range(20,30))],)).fetchall()
+    assert sorted(r['body'] for r in bodies)==sorted(['after edit',*(f'message {n}' for n in range(20,30))])
 
 
 def poisoned_keyboard():
