@@ -376,7 +376,7 @@ def test_a_rollback_after_a_moved_pin_keeps_the_new_pin(tmp_path, monkeypatch):
 
 # spec: ANYM-589
 @pytest.mark.parametrize("case", ["not-qualifying", "compatible", "no-backup-image", "candidate-too-old", "unit-active",
-                                  "runner-not-installed", "unit-unreadable"])
+                                  "unit-unreadable"])
 def test_the_producer_pin_does_not_move_outside_a_qualifying_range_or_a_safe_moment(tmp_path, monkeypatch, case):
     files = {"051_synthetic_widen.sql": b"-- rollout: manual\nUPDATE messages SET body = 'marker-1';\n"} \
         if case == "not-qualifying" else None
@@ -391,11 +391,6 @@ def test_the_producer_pin_does_not_move_outside_a_qualifying_range_or_a_safe_mom
         host.unit = "activating"
     elif case == "unit-unreadable":
         host.unit = None
-    elif case == "runner-not-installed":
-        # The installed runner is not the candidate's (ANYM-488): refused before any write.
-        monkeypatch.setattr(p, "BACKUP_RUNNER", tmp_path / "backup_runner.py")
-        monkeypatch.setenv("DEEDKIT_BACKUP_LOCK", str(tmp_path / ".runner.lock"))
-        p.BACKUP_RUNNER.write_text("# synthetic older runner\n")
     outcome = host.deploy()
     assert host.runner.read_bytes() == host.old and not host.undo().exists()
     assert not (host.state / NEWEST / "producer-pin.json").exists()
@@ -403,8 +398,6 @@ def test_the_producer_pin_does_not_move_outside_a_qualifying_range_or_a_safe_mom
         assert outcome["status"] == "deployed" and "backup image" not in host.events
     elif case == "not-qualifying":
         assert outcome["status"] == "halted" and host.events == [] and host.steps == []
-    elif case == "runner-not-installed":
-        assert outcome["status"] == "halted" and f"the backup runner {p.BACKUP_RUNNER} is blob" in outcome["reason"] and "copy" not in host.events
     else:
         assert outcome["status"] == "waiting" and outcome["migration_waits"]["count"] == 1 and "copy" not in host.events
         assert outcome["reason"].startswith({"unit-active": "personal-os-backup.service is activating",

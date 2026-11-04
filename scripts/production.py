@@ -974,9 +974,10 @@ def now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# The host backup runner (BACKUP.md) is no image and no deploy tool: an operator installs it together with the backup
-# image its runner.json pins. Plan A refuses while the installed file is not the release's, so a merged runner fix never
-# stays off the host unnoticed. A host without the file runs no backup and is not checked.
+# The host backup runner (BACKUP.md) is no image and no deploy tool: `deploy` installs it together with the backup
+# image every runner.json pins (`install_backup_runner`, owner 11-04); a manual `apply` refuses while the installed file
+# is not the release's, so a merged runner fix never stays off the host unnoticed. A host without the file runs no
+# backup and is not checked.
 BACKUP_RUNNER = Path("/opt/personal-os-probe/ops/backup_runner.py")
 BACKUP_RUNNER_SOURCE = "services/messaging/messaging_service/backup_runner.py"
 # Messaging's runner lock: messaging's run and the calendar's (its `host_lock`, ANYM-608) hold it. A manual `deploy`,
@@ -1170,9 +1171,14 @@ def wait_backup_idle(settings, deadline, *, single=False):
         os.close(fd)
 
 
-def check_backup_runner(source, sha):
+def git_blob(data):
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def runner_blobs(source, sha):
+    """`(installed, expected)`: the git blob of the host backup runner and of `sha`'s; None on a host without it."""
     if not os.path.lexists(BACKUP_RUNNER):
-        return
+        return None
     expected = run(["git", "-C", str(source), "rev-parse", f"{sha}:{BACKUP_RUNNER_SOURCE}"]).strip()
     try:
         # The file itself, never a link to another one.
@@ -1181,9 +1187,15 @@ def check_backup_runner(source, sha):
             if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
                 raise Refused(f"the backup runner {BACKUP_RUNNER} is not a regular file")
             content = handle.read()
-        installed = hashlib.sha1(b"blob %d\0" % len(content) + content).hexdigest()
     except OSError as exc:
         raise Refused(f"cannot read the backup runner {BACKUP_RUNNER}: {type(exc).__name__}") from exc
+    return git_blob(content), expected
+
+
+def check_backup_runner(source, sha):
+    if (found := runner_blobs(source, sha)) is None:
+        return
+    installed, expected = found
     if installed != expected:
         raise Refused(f"the backup runner {BACKUP_RUNNER} is blob {installed[:12]}, not {sha[:12]}'s {expected[:12]}; "
                       "install it with its backup image (production.md, Backup runner)")
@@ -3680,6 +3692,37 @@ def leaf_write(directory, name, data, like):
         os.fsync(handle.fileno())
 
 
+def stage_leaf(directory, path, old, before, data, suffix, what):
+    """The first half of replacing `path` (read as `old` with stat `before`) below the open `directory`:
+    `<name>.before-<suffix>` keeps `old` (only an earlier run's copy of the same bytes may stay it) and
+    `.<name>.<suffix>.tmp` holds `data` with the owner and mode of `before`. Refused when `path` changed meanwhile; the
+    caller renames the temporary over `path`. Returns the temporary's name and whether this call wrote the copy."""
+    name, undo, temporary = path.name, f"{path.name}.before-{suffix}", f".{path.name}.{suffix}.tmp"
+    try:
+        kept = leaf_read(directory, undo)[0]
+    except FileNotFoundError:
+        kept = None
+        leaf_write(directory, undo, old, before)
+        os.fsync(directory)
+    except OSError:
+        kept = b""
+    if kept is not None and kept != old:
+        raise MigrationRefused(f"{path.parent / undo} exists and is not {path}; inspect both before {what} moves")
+    with suppress(FileNotFoundError):
+        os.unlink(temporary, dir_fd=directory)
+    leaf_write(directory, temporary, data, before)
+    try:
+        again, current = leaf_read(directory, name)
+        same = again == old and leaf_identity(current) == leaf_identity(before) == leaf_identity(
+            os.stat(name, dir_fd=directory, follow_symlinks=False))
+    except OSError:
+        same = False
+    if not same:
+        os.unlink(temporary, dir_fd=directory)
+        raise MigrationRefused(f"{path} changed while deploy moved {what}; inspect it")
+    return temporary, kept is None
+
+
 def settle_pin(path, receipt):
     """A run that stopped after the rename and before its receipt said so: the receipt follows the file."""
     with suppress(FileNotFoundError, ValueError, OSError, KeyError, TypeError):
@@ -3722,7 +3765,7 @@ def follow_producer(settings, mirror, plan, candidate, release):
             raise MigrationWait(f"the state of {unit} could not be read; the backup producer pin waits") from exc
         if active not in ("inactive", "failed"):
             raise MigrationWait(f"{unit} is {active}; the backup producer pin moves when it is idle")
-    name, undo, temporary = path.name, f"{path.name}.before-{candidate}", f".{path.name}.{candidate}.tmp"
+    name, undo = path.name, f"{path.name}.before-{candidate}"
     try:
         directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
     except OSError as exc:
@@ -3735,29 +3778,9 @@ def follow_producer(settings, mirror, plan, candidate, release):
             raise waiting from exc
         if not isinstance(pinned, dict) or not isinstance(pinned.get("image"), str):
             raise waiting
-        try:
-            kept = leaf_read(directory, undo)[0]
-        except FileNotFoundError:
-            kept = None
-            leaf_write(directory, undo, old, before)
-            os.fsync(directory)
-        except OSError:
-            kept = b""
-        if kept is not None and kept != old:
-            # Only an earlier run's copy of the same bytes may stay the undo.
-            raise MigrationRefused(f"{path.parent / undo} exists and is not {path}; inspect both before the pin moves")
-        with suppress(FileNotFoundError):
-            os.unlink(temporary, dir_fd=directory)
-        leaf_write(directory, temporary, (json.dumps({**pinned, "image": image}, indent=2) + "\n").encode(), before)
-        try:
-            again, current = leaf_read(directory, name)
-            same = again == old and leaf_identity(current) == leaf_identity(before) == leaf_identity(
-                os.stat(name, dir_fd=directory, follow_symlinks=False))
-        except OSError:
-            same = False
-        if not same:
-            os.unlink(temporary, dir_fd=directory)
-            raise MigrationRefused(f"{path} changed while deploy moved the backup producer pin; inspect it")
+        temporary = stage_leaf(directory, path, old, before,
+                               (json.dumps({**pinned, "image": image}, indent=2) + "\n").encode(), candidate,
+                               "the backup producer pin")[0]
         record = {"runner_config": str(path), "before": pinned["image"], "after": image, "undo": str(path.parent / undo),
                   "status": "moving", "at": now()}
         write_record(receipt, record)
@@ -3767,6 +3790,128 @@ def follow_producer(settings, mirror, plan, candidate, release):
         os.close(directory)
     write_record(receipt, {**record, "status": "moved", "moved_at": now()})
     producer_reads(settings, mirror, plan["target"])
+
+
+# Owner 11-04 («давай все делать не ждать ничего»): `deploy` installs the backup runner itself. The three backup profiles
+# (BACKUP.md) run the one host runner and pin messaging's backup image; the recordings profile exists once activated.
+RUNNER_CONFIGS = (Path("/opt/personal-os-probe/backup-config/runner.json"),
+                  Path("/opt/deedkit/calendar-backup/runner.json"), Path("/opt/deedkit/recordings-backup/runner.json"))
+RUNNER_UNITS = (*BACKUP_UNITS, "deedkit-recordings-backup.service", "deedkit-recordings-backup-catchup.service")
+RUNNER_PYTHON = "/usr/bin/python3"  # the interpreter of the backup units' ExecStart
+
+
+def install_backup_runner(settings, candidate, release):
+    """Plan A after preparation, under the runner lock `deploy` holds (production.md, Backup runner): when the host
+    runner is not the candidate's, install it with the candidate's verified backup image pinned in every runner.json,
+    instead of pausing. Every check runs before the first rename: the backup units are idle and the image pulls (else a
+    wait), the image is the candidate's, the new runner's read-only `--check` exits 0 on every runner.json as it will
+    be (else a pause; exit 3 is an unfinished journal), and no call is active (else a call wait). Then each runner.json and the runner are replaced by one rename each, after a
+    `.before-<candidate>` copy, keeping owner and mode; the runner is read back by its blob. The receipt is
+    `<candidate>/backup-runner.json`. A manual `apply` keeps refusing a mismatch (check_backup_runner)."""
+    source, receipt = release / "source", release / "backup-runner.json"
+    if (found := runner_blobs(source, candidate)) is None or found[0] == found[1]:
+        # A run that stopped after the last rename (the runner's) and before its receipt: the receipt follows.
+        with suppress(FileNotFoundError, ValueError, OSError, KeyError, TypeError):
+            if found and read(receipt)["status"] == "installing":
+                write_record(receipt, {**read(receipt), "status": "installed", "settled_at": now()})
+        return
+    installed, expected = found
+    for unit in RUNNER_UNITS:
+        try:
+            active = run(["systemctl", "show", "-P", "ActiveState", unit], timeout=60).strip()
+        except Exception as exc:
+            raise MigrationWait(f"the state of {unit} could not be read; the backup runner install waits") from exc
+        if active not in ("inactive", "failed"):
+            raise MigrationWait(f"{unit} is {active}; the backup runner is installed when it is idle")
+    runner = run(["git", "-C", str(source), "cat-file", "blob", f"{candidate}:{BACKUP_RUNNER_SOURCE}"], binary=True)
+    if git_blob(runner) != expected:
+        raise Refused(f"the backup runner of {candidate[:12]} does not read as its blob {expected[:12]}")
+    # The backup target is no Compose service, so preparation did not resolve it: pulled by its attested digest. A
+    # failed pull (a registry or network error, a timeout) waits like the producer pin's (follow_producer).
+    try:
+        image = build_image(source, candidate, "backup")
+    except Exception as exc:
+        detail = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+        raise MigrationWait(f"the backup image of {candidate[:12]} could not be pulled: {detail}; the backup runner "
+                            "install waits") from exc
+    found = run(["docker", "image", "inspect", "--format",
+                 '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}}', image], timeout=60).split()
+    if not IMAGE_DIGEST.fullmatch(image) or found != [image, candidate]:
+        raise Refused(f"the backup image of {candidate[:12]} is not its verified image; the backup runner stays")
+    try:
+        messaging = Path(unattended_settings(settings)["runner_config"])
+    except Refused:
+        messaging = RUNNER_CONFIGS[0]
+    configs = [path for path in dict.fromkeys((messaging, *RUNNER_CONFIGS[1:])) if os.path.lexists(path)]
+    # staged: (path, temporary, before, after); copies: the `.before-<candidate>` files this run wrote.
+    directories, staged, copies = {}, [], []
+    try:
+        for path in (BACKUP_RUNNER, *configs):
+            directories[path] = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            old, before = leaf_read(directories[BACKUP_RUNNER], BACKUP_RUNNER.name)
+        except OSError as exc:
+            raise Refused(f"cannot read the backup runner {BACKUP_RUNNER}: {type(exc).__name__}") from exc
+        if git_blob(old) != installed:
+            raise MigrationRefused(f"{BACKUP_RUNNER} changed while deploy read it; inspect it")
+        work, wrote = stage_leaf(directories[BACKUP_RUNNER], BACKUP_RUNNER, old, before, runner, candidate,
+                                 "the backup runner")
+        copies += [BACKUP_RUNNER] if wrote else []
+        staged.append((BACKUP_RUNNER, work, installed, expected))
+        for path in configs:
+            try:
+                old, before = leaf_read(directories[path], path.name)
+                pinned = json.loads(old)
+            except (OSError, ValueError) as exc:
+                raise MigrationRefused(f"cannot read {path}: {type(exc).__name__}; install the backup runner by hand "
+                                       "(production.md, Backup runner)") from exc
+            if not isinstance(pinned, dict) or not isinstance(pinned.get("image"), str):
+                raise MigrationRefused(f"{path} names no backup image; install the backup runner by hand")
+            live = path
+            if pinned["image"] != image:
+                data = (json.dumps({**pinned, "image": image}, indent=2) + "\n").encode()
+                temporary, wrote = stage_leaf(directories[path], path, old, before, data, candidate,
+                                              "the backup image pin")
+                live, copies = path.parent / temporary, copies + ([path] if wrote else [])
+                staged.append((path, live.name, pinned["image"], image))
+            try:
+                run([RUNNER_PYTHON, "-I", str(BACKUP_RUNNER.parent / work), "--config", str(live), "--check"],
+                    timeout=60)
+            except Refused as exc:
+                raise MigrationRefused(f"the new backup runner's --check of {path} with image {image[:19]} failed: "
+                                       f"{exc} (exit 3: an unfinished journal, production.md Backup runner)") from exc
+        record = {"sha": candidate, "status": "installing", "at": now(), "image": image,
+                  "files": [{"path": str(path), "before": old, "after": new, "undo": f"{path}.before-{candidate}"}
+                            for path, _, old, new in staged]}
+        # No production change during an active call (AGENTS.md section 1): checked last before the first rename; a
+        # call (or an unreadable call state) ends the run with the staged files removed, so nothing changed.
+        wait_for_calls(settings, time.monotonic() + CALL_POLL)
+        copies.clear()  # from here on the copies are the undo
+        write_record(receipt, record)
+        try:
+            # runner.json first: the new runner may write a worker.json key an older worker refuses (BACKUP.md).
+            for path, temporary, _, _ in [*staged[1:], staged[0]]:
+                os.replace(temporary, path.name, src_dir_fd=directories[path], dst_dir_fd=directories[path])
+                os.fsync(directories[path])
+            if runner_blobs(source, candidate) != (expected, expected):
+                raise Refused(f"{BACKUP_RUNNER} does not read back as {expected[:12]}")
+        except Exception as exc:
+            detail = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+            raise MigrationRefused(f"the backup runner install of {candidate} stopped after it began to rename: "
+                                   f"{detail}; inspect {receipt}") from exc
+        staged.clear()
+    finally:
+        # A check failed before any rename: the files this run wrote go, so a pause leaves the host as it was.
+        for path, temporary, _, _ in staged:
+            with suppress(OSError):
+                os.unlink(temporary, dir_fd=directories[path])
+        for path in copies:
+            with suppress(OSError):
+                os.unlink(f"{path.name}.before-{candidate}", dir_fd=directories[path])
+        for directory in directories.values():
+            os.close(directory)
+    write_record(receipt, {**record, "status": "installed", "installed_at": now()})
+    print(f"backup runner: installed {expected[:12]}, image {image[:19]}", file=sys.stderr, flush=True)
 
 
 def migration_gate(settings, http, plan, mirror, base, serving):
@@ -4731,6 +4876,8 @@ def deploy_plan_a(settings, http, plans, mirror, base, serving, candidate, relea
             if release.exists():
                 return finish(**halt(f"an earlier preparation of {candidate} did not finish; inspect {release}"))
             prepare(settings, candidate)
+        # Before the producer pin (migrate) and apply: both read the installed runner as the candidate's.
+        install_backup_runner(settings, candidate, release)
         if plans and not migrated:
             migrate(settings, http, plans, mirror, base, serving["sha"], candidate, release)
             migrated = True

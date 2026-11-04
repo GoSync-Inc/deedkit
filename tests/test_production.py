@@ -3399,33 +3399,155 @@ def test_a_refusal_before_any_change_pauses_and_a_network_or_quota_error_is_retr
         # The retry applies the prepared release without preparing it again.
         assert host.deploy()["status"] == "deployed" and host.steps[0] == ("apply", NEWEST)
 
-# spec: ANYM-488
-def test_an_automatic_deploy_pauses_on_a_host_backup_runner_mismatch_and_keeps_the_prepared_release(tmp_path,
-                                                                                                  monkeypatch):
-    host = Deployer(tmp_path, monkeypatch)
-    runner = tmp_path / "backup_runner.py"
-    runner.write_bytes(b"stale runner\n")
-    monkeypatch.setattr(p, "BACKUP_RUNNER", runner)
-    release = b"release runner\n"
-    expected = hashlib.sha1(b"blob %d\0" % len(release) + release).hexdigest()
-    original = p.run
-    def command(argv, **kw):
-        if argv[-2:-1] == ["rev-parse"] and argv[-1].endswith(":" + p.BACKUP_RUNNER_SOURCE):
-            return expected + "\n"
-        return original(argv, **kw)
-    monkeypatch.setattr(p, "run", command)
-    def refused(sha):
-        (host.state / sha / "attempted.json").unlink()  # the real apply refuses before it writes the attempt
-        p.check_backup_runner(host.state / sha / "source", sha)
-    host.fail_apply = refused
-    outcome = host.deploy(auto=True)
-    assert outcome["status"] == "halted" and "refused before any change" in outcome["reason"]
-    assert expected[:12] in outcome["reason"] and p.blob(runner)[:12] in outcome["reason"]
-    assert expected[:12] in host.paused() and expected[:12] in json.dumps(p.read(host.state / "deploy.json"))
-    assert (host.state / NEWEST / "prepared.json").exists() and p.read(host.state / "current.json")["sha"] == BASE
-    host.steps.clear()
-    assert host.deploy(auto=True)["status"] == "paused" and host.steps == []
+BACKUP_IMAGE_ID = "sha256:" + "c" * 64
+# A synthetic runner: its read-only --check exits 3 on a config that names an unfinished journal, else 0.
+RUNNER_CHECK = (b"import json, sys\nconfig = json.load(open(sys.argv[sys.argv.index('--config') + 1]))\n"
+                b"sys.exit(3 if config.get('unfinished') else 0)\n")
 
+
+def runner_host(tmp_path, monkeypatch, *, unit="inactive", revision=NEWEST, pull=None, calls=None):
+    """A Deployer host whose backup runner is older than NEWEST's, with messaging's and the calendar's runner.json
+    (owner mode 0640) pinning OLD_IMAGE and no recordings profile; the units report `unit`, the candidate's backup
+    image carries `revision`, its pull raises `pull` and the call check raises `calls`."""
+    host = Deployer(tmp_path, monkeypatch)
+    host.events = []
+    (tmp_path / "ops").mkdir()
+    runner = tmp_path / "ops" / "backup_runner.py"
+    runner.write_bytes(b"# synthetic older runner\n" + RUNNER_CHECK)
+    runner.chmod(0o600)
+    configs = []
+    for name in ("backup-config", "calendar-backup"):
+        (tmp_path / name).mkdir()
+        configs.append(tmp_path / name / "runner.json")
+        configs[-1].write_text('{\n  "image": "%s",\n  "directory": "/synthetic/%s"\n}\n' % (OLD_IMAGE, name))
+        configs[-1].chmod(0o640)
+    monkeypatch.setattr(p, "BACKUP_RUNNER", runner)
+    monkeypatch.setattr(p, "RUNNER_CONFIGS", (*configs, tmp_path / "recordings-backup" / "runner.json"))
+    monkeypatch.setattr(p, "RUNNER_PYTHON", sys.executable)
+    new = b"# synthetic candidate runner\n" + RUNNER_CHECK
+    host.contents[f"{NEWEST}:{p.BACKUP_RUNNER_SOURCE}"] = new
+    host.blobs[f"{NEWEST}:{p.BACKUP_RUNNER_SOURCE}"] = p.git_blob(new)
+    def command(argv, **kwargs):
+        if argv[0] == "systemctl":
+            host.events.append(("unit", argv[-1]))
+            return unit + "\n"
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return f"{argv[-1]} {revision}\n"
+        if argv[0] == sys.executable:
+            host.events.append(("check", Path(argv[2]).name, Path(argv[-2]).name))
+            return Deployer.real_run(argv, **kwargs)
+        return host.run(argv, **kwargs)
+    monkeypatch.setattr(p, "run", command)
+    def backup_image(source, sha, target, **kwargs):
+        host.events.append(("pull", sha, target))
+        if pull:
+            raise pull
+        return BACKUP_IMAGE_ID
+    monkeypatch.setattr(p, "build_image", backup_image)
+    def call_check(settings, deadline):
+        host.events.append(("calls",))
+        if calls:
+            raise calls
+    monkeypatch.setattr(p, "wait_for_calls", call_check)
+    return host, runner, configs, new
+
+
+# spec: ANYM-488
+def test_an_automatic_deploy_installs_the_candidates_backup_runner_with_its_image_pin(tmp_path, monkeypatch):
+    host, runner, configs, new = runner_host(tmp_path, monkeypatch)
+    old, pins = runner.read_bytes(), [config.read_bytes() for config in configs]
+    host.fail_apply = lambda sha: p.check_backup_runner(host.state / sha / "source", sha)  # apply's own check passes
+    outcome = host.deploy(auto=True)
+    assert outcome["status"] == "deployed" and host.paused() is None and ("apply", NEWEST) in host.steps
+    assert runner.read_bytes() == new and oct(runner.stat().st_mode & 0o777) == "0o600"
+    assert runner.with_name(f"backup_runner.py.before-{NEWEST}").read_bytes() == old
+    for config, pin in zip(configs, pins, strict=True):
+        assert json.loads(config.read_text()) == {**json.loads(pin), "image": BACKUP_IMAGE_ID}
+        assert config.with_name(f"runner.json.before-{NEWEST}").read_bytes() == pin
+        assert oct(config.stat().st_mode & 0o777) == "0o640"
+        assert sorted(path.name for path in config.parent.iterdir()) == ["runner.json", f"runner.json.before-{NEWEST}"]
+    # Every unit is idle, the new runner checks each runner.json as it will be, before the first rename.
+    assert [event[1] for event in host.events if event[0] == "unit"] == list(p.RUNNER_UNITS)
+    assert [event for event in host.events if event[0] == "check"] == [
+        ("check", f".backup_runner.py.{NEWEST}.tmp", f".runner.json.{NEWEST}.tmp")] * 2
+    receipt = p.read(host.state / NEWEST / "backup-runner.json")
+    assert receipt["status"] == "installed" and receipt["image"] == BACKUP_IMAGE_ID
+    assert [item["path"] for item in receipt["files"]] == [str(runner), *map(str, configs)]
+    # A run that stopped after the runner's rename and before its receipt: the next run settles the receipt only.
+    p.write_record(host.state / NEWEST / "backup-runner.json", {**receipt, "status": "installing"})
+    host.events.clear()
+    p.install_backup_runner(host.settings, NEWEST, host.state / NEWEST)
+    assert host.events == [] and p.read(host.state / NEWEST / "backup-runner.json")["status"] == "installed"
+
+
+# spec: ANYM-488
+@pytest.mark.parametrize("case", ["unit-active", "unfinished-journal", "other-image", "pull-failed", "pull-timeout",
+                                  "call-active", "calls-unknown"])
+def test_a_backup_runner_that_cannot_be_installed_safely_changes_nothing(tmp_path, monkeypatch, case):
+    # A failed `docker pull` reaches build_image as run()'s plain Refused; a hung one as subprocess's TimeoutExpired.
+    pulls = {"pull-failed": p.Refused("docker failed (exit 1); production was not accepted"),
+             "pull-timeout": subprocess.TimeoutExpired(["docker", "pull"], 1800)}
+    calls = {"call-active": p.CallActive("1 call is active"), "calls-unknown": p.CallsUnknown("calls_probe_failed")}
+    host, runner, configs, _ = runner_host(
+        tmp_path, monkeypatch, unit="activating" if case == "unit-active" else "inactive",
+        revision=NEWER if case == "other-image" else NEWEST, pull=pulls.get(case), calls=calls.get(case))
+    if case == "unfinished-journal":
+        configs[1].write_text('{"image": "%s", "directory": "/synthetic/calendar", "unfinished": true}\n' % OLD_IMAGE)
+    files = {path: path.read_bytes() for path in (runner, *configs)}
+    outcome = host.deploy(auto=True)
+    assert {path: path.read_bytes() for path in files} == files
+    assert all(sorted(child.name for child in path.parent.iterdir()) == [path.name] for path in files)
+    assert ("apply", NEWEST) not in host.steps and not (host.state / NEWEST / "backup-runner.json").exists()
+    assert (host.state / NEWEST / "prepared.json").exists() and p.read(host.state / "current.json")["sha"] == BASE
+    if case == "unit-active":
+        assert outcome["status"] == "waiting" and outcome["reason"].startswith("personal-os-backup.service is activating")
+    elif case in pulls:
+        assert outcome["status"] == "waiting" and outcome["migration_waits"]["count"] == 1 and host.paused() is None
+        assert outcome["reason"].startswith(f"the backup image of {NEWEST[:12]} could not be pulled")
+    elif case in calls:
+        # Checked last, after every other check: the staged files are gone again.
+        assert outcome["status"] == "waiting" and outcome["call_waits"]["count"] == 1 and host.paused() is None
+        assert [event[0] for event in host.events][-1] == "calls"
+    else:
+        assert outcome["status"] == "halted" and host.paused()
+        assert ({"unfinished-journal": f"--check of {configs[1]}", "other-image": "is not its verified image"}[case]
+                in outcome["reason"])
+
+
+
+# spec: ANYM-488
+@pytest.mark.parametrize("stop", [1, 2, 3])
+def test_an_interrupted_backup_runner_install_never_runs_the_new_runner_on_an_old_pin_and_a_rerun_completes(
+        tmp_path, monkeypatch, stop):
+    # ANYM-627: a newer runner writes worker.json keys an older worker refuses, so every runner.json moves first.
+    host, runner, configs, new = runner_host(tmp_path, monkeypatch)
+    old, pins = runner.read_bytes(), [config.read_bytes() for config in configs]
+    replace, renamed = os.replace, []
+    def interrupted(source, target, **kwargs):
+        if "dst_dir_fd" not in kwargs:  # a receipt or state file
+            return replace(source, target, **kwargs)
+        if len(renamed) + 1 == stop:
+            raise OSError("synthetic crash")
+        replace(source, target, **kwargs)
+        renamed.append(target)
+        assert runner.read_bytes() != new or all(
+            json.loads(config.read_text())["image"] == BACKUP_IMAGE_ID for config in configs)
+    monkeypatch.setattr(p.os, "replace", interrupted)
+    outcome = host.deploy(auto=True)
+    assert outcome["status"] == "halted" and "stopped after it began to rename" in outcome["reason"]
+    assert renamed == ["runner.json"] * (stop - 1) and runner.read_bytes() == old
+    assert p.read(host.state / NEWEST / "backup-runner.json")["status"] == "installing"
+    # The operator reads the receipt and removes the pause; the .before copies are the old bytes, so the rerun installs.
+    p.PAUSE.unlink()
+    monkeypatch.setattr(p.os, "replace", replace)
+    monkeypatch.setattr(p, "DEPLOY_INTERVAL", 0)
+    assert host.deploy(auto=True)["status"] == "deployed"
+    assert runner.read_bytes() == new and runner.with_name(f"backup_runner.py.before-{NEWEST}").read_bytes() == old
+    for config, pin in zip(configs, pins, strict=True):
+        assert json.loads(config.read_text())["image"] == BACKUP_IMAGE_ID
+        assert config.with_name(f"runner.json.before-{NEWEST}").read_bytes() == pin
+        assert sorted(path.name for path in config.parent.iterdir()) == ["runner.json", f"runner.json.before-{NEWEST}"]
+    assert p.read(host.state / NEWEST / "backup-runner.json")["status"] == "installed"
 
 
 def test_deploy_waits_for_the_api_quota_and_for_the_interval_between_automatic_deploys(tmp_path, monkeypatch):
