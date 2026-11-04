@@ -243,7 +243,7 @@ accepted nonempty text part. Each part keeps its last accepted digest/time and
 its latest attempt state/error; these may differ. Only actual usable text changes
 produce reference-only journal events. Replays do not duplicate records/events.
 Latest accepted text is retained indefinitely; provider deletions do not purge it.
-No content or journal retention deletion is automated.
+No content or journal retention deletion is automated; the owner's deletion is the operator command below (ANYM-730).
 
 Limits: 60 seconds per record, 60 seconds per Omi-only pass (300 seconds when
 PLAUD is configured), 2 MiB combined accepted text per record,
@@ -408,6 +408,36 @@ token and make no provider, model or embedding request.
 - `recordings_archive_status({account})`: read-only metadata counts, coverage,
   freshness and fixed archive errors, with no titles or text. Content scope is
   not needed. Missing archive settings return `archive_disabled`.
+
+#### Schema 5 and owner-requested deletion (ANYM-730)
+
+A new archive starts at schema 5; a published schema-4 archive gains one table at the writer's start (additive, no record
+rewritten): `tombstones(provider_hash TEXT PRIMARY KEY)`, the SHA-256 of `namespace NUL provider_id` (no content; the same
+value `backup_recordings_continuity.provider_hash` computes). A schema-3 archive reaches 5 at the first start after its
+index is published. Older packages refuse schema 5 (`archive_schema_unsupported`); rolling back means disabling archive
+collection and keeping the state files. The online backup and the backup tooling accept schemas 1-5.
+
+`deedkit-recordings --config <file> --delete ...` is an operator command (run as the data-deletion gates of process.md section 2
+require, on the owner's request; not an HTTP route or an agent tool). The service must be stopped: the command takes the
+single-writer lock. Select by `--ref <recording_ref>` (repeatable) or by `--account <id>` with `--created-from` and/or
+`--created-to`; both together, or neither, is refused. Without `--yes` it only previews (the receipt's `selected`). With `--yes` it
+deletes in batches of 200 records, one transaction each: the rows, their full-text entries, speaker labels and journal events,
+and records one tombstone per provider ID. The first batch also raises the archive `incarnation` by one: a bundle sealed before the
+deletion then carries a lower incarnation and the verifier refuses it (`archive_incarnation_lower`), so a pending pre-deletion
+bundle is cancelled. After the last batch it rebuilds and merges the full-text index, runs `VACUUM` with `secure_delete` on (a
+temporary file stays in the private archive directory), truncates the WAL, and reports `sanitized` only when no free page is left,
+`quick_check` is `ok` and the WAL is empty. `--snapshot-to <new absolute path>` is required with `--yes`: the command writes the post-deletion snapshot and the receipt describes that file. The first batch also sets a durable `sanitize_pending` mark in `meta`, cleared only after the rewrite is verified (no free page, `quick_check` ok, `wal_checkpoint(TRUNCATE)` not busy, empty WAL); while it is set, every Online Backup (`--backup-to`, the snapshot) is refused `archive_sanitization_pending`, because `secure_delete` alone leaves deleted text in FTS5 storage. A crash or a pinned reader (`deletion_sanitization_incomplete`) is finished by repeating the command with `--yes`. It needs
+free space of about twice the archive plus the reserve (`archive_capacity` otherwise) and refuses while the index builds
+(`archive_index_building`) and while an event feed exists (`deletion_feed_unsupported`: the feed owns the journal identity, ANYM-726).
+
+The receipt is one JSON line: `selected`, `deleted`, `batches`, `tombstones`, `tombstones_added`, `sanitized`, the new
+`incarnation`, the identity of the snapshot file it wrote (`archive_id`, `incarnation`, `sequence`, `records`) and `backup_replacement`, which is
+`backup_replacement_pending` after a deletion: the protected point on the backup server still holds the old text until the next
+verified bundle replaces it (BACKUP_R2.md; one protected point plus room for one candidate). Run the operator procedure of BACKUP_R2.md "Owner-requested deletion" around it (drain, delete, `--revoke-below`). Confirm it with the verifier's next
+proof (`verification.archive` shows the new incarnation and a lower record count) and by the single object under the R2 prefix.
+The collector never archives a tombstoned provider ID again (`discover` skips it, the receipt of a pass reports nothing about
+it). `--lift-tombstone --account <id> --provider-id <id> [--yes]` allows one to be archived again; the next backup then needs a
+reasoned `--rebaseline` (the continuity rule `archive_tombstone_dropped`). A provider-side deletion is still never mirrored.
 
 #### Schema 4 and the index build (ANYM-725)
 

@@ -620,6 +620,8 @@ script never calls it.
 Expected size and retention: the backup server and the R2 prefix hold one protected point and room for one
 candidate, no older history; with `expected_archive_bytes` of 1 GiB that is about 2 GiB of ciphertext plus the
 verifier's scratch for one plaintext copy during each verification. A deleted record leaves the backup at the next
-verified replacement of the protected point (ANYM-730).
+verified replacement of the protected point (ANYM-730): the deletion command raises the archive incarnation, writes tombstones
+(`tombstones(provider_hash)`, SHA-256 of namespace NUL provider id) and vacuums the file, services/recordings/README.md "Schema 5 and
+owner-requested deletion".
 
 Installation, activation, the first protected snapshot and the restore drill are one reviewed operation plan: [docs/operations/recordings-archive-activation.md](docs/operations/recordings-archive-activation.md) (ANYM-731).
