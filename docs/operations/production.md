@@ -974,12 +974,19 @@ never a release hold. The autodeploy unit has no clock window either ("Timer").
 
 The host backup runner (`/opt/personal-os-probe/ops/backup_runner.py`, the
 `personal-os-backup.service` program, BACKUP.md) is neither an image nor a deploy
-tool, so neither `apply` nor `deploy` installs it: the operator installs it
-together with the backup image its private `runner.json` pins. Apply refuses
-before any stop while that file exists and its git blob is not the release's
-`services/messaging/messaging_service/backup_runner.py`; the refusal names both
-blob ids, and under `deploy --auto` it pauses the deployer like any refusal
-before a change. A host without the file runs no backup and is not checked.
+tool. `deploy` (manual and `--auto`) installs it itself (owner 11-04: «давай все делать не ждать ничего»):
+after `prepare` and before any migration or apply, when the file exists and its git blob is not
+the candidate's `services/messaging/messaging_service/backup_runner.py`, it does the script below
+under the runner lock it already holds, for every `runner.json` that exists (messaging's, the
+calendar's and the recordings', all pinning messaging's image): the backup units idle (else the
+run waits like a migration wait), the candidate's attested backup image (its revision label the
+candidate), the new runner's `--check` exit 0 on each `runner.json` as it will be, then a
+`.before-<sha>` copy and one rename per file (each `runner.json`, then the runner; owner and mode
+kept), the runner read back by its blob, receipt `<state>/<sha>/backup-runner.json`. A failed
+check or a changed file pauses and leaves the host as it was; a registry error retries. A manual
+`apply` still refuses before any stop while the file is not the release's (the refusal names both
+blob ids): install it with the script below. A host without the file runs no backup and is not
+checked.
 The install is one step under the runner's own lock, so no messaging or calendar backup and no
 deploy can start between the check and the hash (a backup started meanwhile refuses
 `backup_job_already_running`, then follows its unit's retry behaviour under "Continuous deployment"; a deploy
@@ -1027,7 +1034,8 @@ inside the lock, and the new `runner.json` is written beside the live one and ch
 it replaces it; the script's `install` is the former separate `sudo install` step, now under
 the lock. Install the new runner before you add any new `runner.json` key: the runner refuses
 keys it does not know. Then remove `/etc/deedkit/autodeploy.pause` only when its reason is
-this runner's refusal (`the backup runner ... is blob`); a pause for another reason stays.
+this runner's refusal (`the backup runner ... is blob`, from a manual run or a tool older than
+the automatic install); a pause for another reason stays.
 The step is done when the next messaging backup reaches `state: ok` with a new
 `last_success_id` (`/opt/personal-os-probe/backups/status.json`). Undo, under the same `flock`
 and with the backup service idle, in this order: remove from `runner.json` every key the
@@ -2232,9 +2240,10 @@ Otherwise it:
    for an unattended migration ("Unattended migrations"): then the run migrates in phases instead;
    When the only such change is the `production.py`/`seamless_release.py`
    pair, the self-updating layout installs it instead ("Deploy tool updates");
-   apply also refuses before any change while the host backup runner is not
-   the candidate's ("Backup runner"), so every merge that changes
-   `backup_runner.py` pauses automatic deploys until the operator installs it;
+   when the host backup runner is not the candidate's, `deploy` installs it with
+   the candidate's backup image pin after `prepare` and before any migration or
+   apply ("Backup runner"), so a merge that changes `backup_runner.py` no longer
+   pauses automatic deploys;
 4. runs `prepare` + `apply` (plan A), then `seamless_release.py prepare` +
    `promote` (plan B), all at that one SHA with every guard of those steps;
    when plan A is ahead of the HTTP release, it runs plan B only;
