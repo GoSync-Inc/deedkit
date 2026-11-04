@@ -1918,7 +1918,7 @@ timer files; a start already due within its randomized delay plus 120 s is a vet
 independent: with the archive off the job skips `recordings_skipped_archive_disabled`. Read-back after installation:
 `systemctl list-timers deedkit-recordings-backup.timer`, the status file, and an empty staging directory. Undo:
 `systemctl disable --now deedkit-recordings-backup.timer deedkit-recordings-backup-catchup.timer`. BACKUP.md "Staging,
-slot and admission" has the full rule.
+slot and admission" has the full rule. The ordered installation (runner blob and pins, receiver instance, units, first skip), the bounded archive activation, the first protected snapshot and the restore drill are [recordings-archive-activation.md](recordings-archive-activation.md) (ANYM-731).
 
 ## Image retention
 

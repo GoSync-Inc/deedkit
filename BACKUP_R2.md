@@ -614,6 +614,17 @@ under test, together with the other profiles; a helper that cannot read the reco
 move with the fixed code `recordings_helper_failed` and nothing else changes. List the recordings config in the
 instances file ([Two verifiers on one receiver](#two-verifiers-on-one-receiver)) before its timer runs.
 
+DeedKit's recordings project on the shared receiver (ANYM-731): upload user `deedkit-recordings-backup` with its own
+`Match User` block and `AuthorizedKeysFile /etc/ssh/authorized_keys.d/deedkit-recordings-backup` (root `0644`), whose one line is
+`restrict,from="<producer tailnet address>",command="/opt/deedkit-backup-r2/venv/bin/python -I -m messaging_service.backup_r2_receiver --config /etc/deedkit-recordings-backup-r2/receive.json receive"`;
+upload state `/srv/backups/deedkit-recordings/state/receive`; under `/etc/deedkit-recordings-backup-r2/` the upload-owned
+`receive.json` and its credentials, the root `operator.json` and its credentials (both configs `"profile": "recordings"`,
+messaging's bucket and endpoint, the prefix `deedkit-recordings/egor-<date>`; the two credential files copy messaging's token),
+`control/`, `restore/identity.agekey` (its own age recovery key, never copied to the producer) and `verifier.json`; proofs and
+the continuity baseline in `/var/lib/deedkit-recordings-backup-r2/verification`. It shares messaging's venv, bucket and token, but
+no user, SSH or recovery key, config, state directory or prefix. The ordered installation, its read-backs and undo are in
+[the activation plan](docs/operations/recordings-archive-activation.md).
+
 Units: [service](deploy/deedkit-recordings-backup-r2-verifier.service) and
 [timer](deploy/deedkit-recordings-backup-r2-verifier.timer). Installing them, the first protected point and the
 restore drill are ANYM-731. Undo: `systemctl disable --now deedkit-recordings-backup-r2-verifier.timer`.
