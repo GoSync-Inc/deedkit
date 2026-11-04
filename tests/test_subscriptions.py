@@ -852,102 +852,122 @@ def lags(store, token, sid):
         store.fetch_subscription_events(token, sid)['subscription']['delivery']['lag']]
 
 
-def hints_set(store, sid, assignments):
-    """The database clock stays real: each case sets its times relative to clock_timestamp()."""
+def freeze(store, monkeypatch):
+    """The lag's clock stops at the database's current time; hint times are set relative to it."""
+    from messaging_service import subscriptions
     with store.pool.connection() as c:
-        c.execute('UPDATE subscription_outbox SET ' + assignments + ' WHERE subscription=%s', (sid,))
+        now = c.execute('SELECT clock_timestamp() AS now').fetchone()['now']
+    monkeypatch.setattr(subscriptions, '_observed_at', lambda c: now)
+    return now
 
 
-def hint_copy(store, sid, state, request_id, age):
-    """A copy of the subscription's hint in another state, created age ago."""
+def seconds(value):
+    from datetime import timedelta
+    return timedelta(seconds=value)
+
+
+def hints_set(store, sid, assignments, *args):
+    with store.pool.connection() as c:
+        c.execute('UPDATE subscription_outbox SET ' + assignments + ' WHERE subscription=%s', (*args, sid))
+
+
+def hint_copy(store, sid, state, request_id, created, due, lease_until=None):
+    """A copy of the subscription's hint in another state."""
     with store.pool.connection() as c:
         c.execute('''INSERT INTO subscription_outbox(subscription,subscription_version,receiver,through_position,kind,
             request_id,state,created_at,next_attempt_at,lease_until,finished_at)
-            SELECT subscription,subscription_version,receiver,through_position,kind,%s,%s,clock_timestamp()-%s::interval,
-            clock_timestamp()-%s::interval,CASE WHEN %s='leased' THEN clock_timestamp()+interval '10 minutes' END,
+            SELECT subscription,subscription_version,receiver,through_position,kind,%s,%s,%s,%s,%s,
             CASE WHEN %s IN ('delivered','dead_letter','cancelled') THEN clock_timestamp() END
             FROM subscription_outbox WHERE subscription=%s ORDER BY created_at LIMIT 1''',
-            (request_id, state, age, age, state, state, sid))
+            (request_id, state, created, due, lease_until, state, sid))
 
 
 # spec: ANYM-752
-def test_lag_reads_nulls_without_unfinished_hints_and_the_age_of_the_oldest_pending_one(seeded, tmp_path):
+def test_lag_reads_nulls_without_unfinished_hints_and_the_age_of_the_oldest_pending_one(seeded, tmp_path,
+        monkeypatch):
     store, _, _ = seeded
     token = lag_key(store)
+    now = freeze(store, monkeypatch)
     assert store.get_subscription(token, create(store, token)['subscription_id'])['delivery']['lag'] == NO_LAG
     sid = bind(store, token, create(store, token)['subscription_id'], tmp_path)
     assert lags(store, token, sid) == [NO_LAG] * 3
     emit(store)
     match_subscriptions(store)
-    hints_set(store, sid, "created_at=clock_timestamp()-interval '1 hour',next_attempt_at=clock_timestamp()")
-    for lag in lags(store, token, sid):
-        assert lag['pending_hints'] == 1 and 3600 <= lag['oldest_unfinished_age_s'] < 3660
-        assert lag['next_attempt_in_s'] == 0
+    # The age rounds down: 3600.7 s is 3600.
+    hints_set(store, sid, 'created_at=%s,next_attempt_at=%s', now - seconds(3600.7), now)
+    assert lags(store, token, sid) == [{'pending_hints': 1, 'oldest_unfinished_age_s': 3600,
+        'next_attempt_in_s': 0}] * 3
     assert store.get_subscription(token, sid)['delivery']['hint_counts'] == {'pending': 1}
 
 
 # spec: ANYM-752
-def test_lag_counts_leased_hints_and_leaves_out_delivered_dead_lettered_and_cancelled_ones(seeded, tmp_path):
+def test_lag_counts_leased_hints_and_leaves_out_delivered_dead_lettered_and_cancelled_ones(seeded, tmp_path,
+        monkeypatch):
     store, _, _ = seeded
     token = lag_key(store)
+    now = freeze(store, monkeypatch)
     sid = bind(store, token, create(store, token)['subscription_id'], tmp_path)
     emit(store)
     match_subscriptions(store)
-    hints_set(store, sid, "next_attempt_at=clock_timestamp()+interval '1 hour'")
+    hints_set(store, sid, 'created_at=%s,next_attempt_at=%s', now - seconds(60), now + seconds(3600))
+    # Finished hints older and due sooner than any unfinished one change nothing.
     for number, state in enumerate(('delivered', 'dead_letter', 'cancelled')):
-        hint_copy(store, sid, state, f'lag-finished-{number}', '3 hours')
-    hint_copy(store, sid, 'leased', 'lag-leased', '2 hours')
+        hint_copy(store, sid, state, f'lag-finished-{number}', now - seconds(10800), now - seconds(10800))
+    hint_copy(store, sid, 'leased', 'lag-leased', now - seconds(7200), now - seconds(3600), now + seconds(600))
     assert store.get_subscription(token, sid)['delivery']['hint_counts'] == {
         'cancelled': 1, 'dead_letter': 1, 'delivered': 1, 'leased': 1, 'pending': 1}
-    for lag in lags(store, token, sid):
-        # The leased copy is the oldest unfinished hint and its lease (10 minutes) the earliest attempt.
-        assert lag['pending_hints'] == 2 and 7200 <= lag['oldest_unfinished_age_s'] < 7260
-        assert 590 <= lag['next_attempt_in_s'] <= 600
+    # The leased copy is the oldest unfinished hint and the end of its lease the earliest attempt.
+    assert lags(store, token, sid) == [{'pending_hints': 2, 'oldest_unfinished_age_s': 7200,
+        'next_attempt_in_s': 600}] * 3
 
 
 # spec: ANYM-752
-def test_lag_schedules_a_pending_hint_by_next_attempt_and_a_leased_one_by_its_lease(seeded, tmp_path):
+def test_lag_schedules_a_pending_hint_by_next_attempt_and_a_leased_one_by_its_lease(seeded, tmp_path, monkeypatch):
     store, _, _ = seeded
     token = lag_key(store)
+    now = freeze(store, monkeypatch)
     sid = bind(store, token, create(store, token)['subscription_id'], tmp_path)
     emit(store)
     match_subscriptions(store)
     cases = [
-        # A future attempt counts down to it.
-        ("next_attempt_at=clock_timestamp()+interval '1 hour'", 3590, 3600),
+        # A future attempt counts down to it, rounded up: 0.4 s is 1, never "due now".
+        ('pending', now + seconds(3600), None, 3600),
+        ('pending', now + seconds(0.4), None, 1),
         # A due or past attempt reads 0.
-        ("next_attempt_at=clock_timestamp()-interval '1 second'", 0, 0),
-        # A running lease is never due now, though leasing left next_attempt_at in the past.
-        ("state='leased',lease_until=clock_timestamp()+interval '10 minutes',"
-         "next_attempt_at=clock_timestamp()-interval '1 hour'", 590, 600),
-        ("state='leased',lease_until=clock_timestamp()+interval '2 seconds',"
-         "next_attempt_at=clock_timestamp()-interval '1 hour'", 1, 2),
-        # An expired lease is due again.
-        ("state='leased',lease_until=clock_timestamp()-interval '1 second'", 0, 0)]
-    for assignments, low, high in cases:
-        hints_set(store, sid, assignments)
-        for lag in lags(store, token, sid):
-            assert lag['pending_hints'] == 1 and low <= lag['next_attempt_in_s'] <= high, (assignments, lag)
+        ('pending', now, None, 0),
+        ('pending', now - seconds(1), None, 0),
+        # A leased hint is scheduled by its lease, though leasing left next_attempt_at in the past.
+        ('leased', now - seconds(3600), now + seconds(600), 600),
+        ('leased', now - seconds(3600), now + seconds(0.4), 1),
+        # An ended lease is due again.
+        ('leased', now - seconds(3600), now, 0),
+        ('leased', now + seconds(3600), now - seconds(0.5), 0)]
+    for state, due, lease_until, expected in cases:
+        hints_set(store, sid, 'state=%s,next_attempt_at=%s,lease_until=%s', state, due, lease_until)
+        assert [lag['next_attempt_in_s'] for lag in lags(store, token, sid)] == [expected] * 3, (state, due, lease_until)
 
 
 # spec: ANYM-752
-def test_lag_of_two_subscriptions_does_not_mix(seeded, tmp_path):
+def test_lag_of_two_subscriptions_does_not_mix(seeded, tmp_path, monkeypatch):
     store, _, _ = seeded
     token = lag_key(store)
+    now = freeze(store, monkeypatch)
     old = bind(store, token, create(store, token)['subscription_id'], tmp_path)
     new = bind(store, token, create(store, token)['subscription_id'], tmp_path)
     emit(store)
     match_subscriptions(store)
-    hints_set(store, old, "created_at=clock_timestamp()-interval '1 hour'")
-    for lag in lags(store, token, old):
-        assert lag['pending_hints'] == 1 and 3600 <= lag['oldest_unfinished_age_s'] < 3660
-    for lag in lags(store, token, new):
-        assert lag['pending_hints'] == 1 and lag['oldest_unfinished_age_s'] < 60
+    hints_set(store, old, 'created_at=%s,next_attempt_at=%s', now - seconds(3600), now + seconds(30))
+    hints_set(store, new, 'created_at=%s,next_attempt_at=%s', now - seconds(5), now + seconds(90))
+    assert lags(store, token, old) == [{'pending_hints': 1, 'oldest_unfinished_age_s': 3600,
+        'next_attempt_in_s': 30}] * 3
+    assert lags(store, token, new) == [{'pending_hints': 1, 'oldest_unfinished_age_s': 5,
+        'next_attempt_in_s': 90}] * 3
 
 
 # spec: ANYM-752
-def test_lag_leaves_out_a_hint_of_a_reference_the_key_cannot_see(seeded, tmp_path):
+def test_lag_leaves_out_a_hint_of_a_reference_the_key_cannot_see(seeded, tmp_path, monkeypatch):
     store, _, _ = seeded
+    now = freeze(store, monkeypatch)
     store.set_dynamic_subscriptions(True)
     try:
         token = lag_key(store, 'dynamic-reader')
@@ -956,9 +976,9 @@ def test_lag_leaves_out_a_hint_of_a_reference_the_key_cannot_see(seeded, tmp_pat
             'dynamic-reader')
         emit(store, 'demo-tg-x')
         match_subscriptions(store)
-        hints_set(store, sid, "created_at=clock_timestamp()-interval '1 hour'")
-        assert all(lag['pending_hints'] == 1 and lag['oldest_unfinished_age_s'] >= 3600
-            for lag in lags(store, token, sid))
+        hints_set(store, sid, 'created_at=%s,next_attempt_at=%s', now - seconds(3600), now + seconds(30))
+        assert lags(store, token, sid) == [{'pending_hints': 1, 'oldest_unfinished_age_s': 3600,
+            'next_attempt_in_s': 30}] * 3
         store.set_access('dynamic-reader', chats=['telegram-demo-chat'])
         # Back to pending, as if the scope change had not cancelled it: its only reference is hidden now.
         hints_set(store, sid, "state='pending',error_code=NULL,finished_at=NULL")

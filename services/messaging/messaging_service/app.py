@@ -1131,6 +1131,7 @@ def register_subscription_tools(mcp, call, async_call, read, upload_write):
         matcher_caught_up covers committed archive events, not live-provider freshness,
         complete history, downloaded originals or completed file processing. Use chat
         get_sync_status and file tools for those independent states. No ACK or push.
+        delivery.lag: unfinished push hints, the oldest one's age and seconds to the next attempt.
         """
         return call(ctx,'get_subscription',subscription_id=subscription_id)
 

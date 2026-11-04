@@ -3477,7 +3477,7 @@
         "openWorldHint": false,
         "readOnlyHint": true
       },
-      "description": "Read your definition, lifecycle/version and archive matcher boundary.\n\nmatcher_caught_up covers committed archive events, not live-provider freshness,\ncomplete history, downloaded originals or completed file processing. Use chat\nget_sync_status and file tools for those independent states. No ACK or push.\n",
+      "description": "Read your definition, lifecycle/version and archive matcher boundary.\n\nmatcher_caught_up covers committed archive events, not live-provider freshness,\ncomplete history, downloaded originals or completed file processing. Use chat\nget_sync_status and file tools for those independent states. No ACK or push.\ndelivery.lag: unfinished push hints, the oldest one's age and seconds to the next attempt.\n",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {

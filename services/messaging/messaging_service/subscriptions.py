@@ -290,15 +290,14 @@ def _module_view(c, row):
 
 
 
-# ANYM-752: per state, the age of its oldest hint and the seconds until its earliest attempt; a leased hint is
-# scheduled by lease_until, because leasing leaves next_attempt_at unchanged.
-_HINT_AGES = ''',extract(epoch FROM clock_timestamp()-min(o.created_at)) AS age_s,extract(epoch FROM
-    min(CASE o.state WHEN 'leased' THEN coalesce(o.lease_until,o.next_attempt_at) ELSE o.next_attempt_at END)
-    -clock_timestamp()) AS next_s'''
+# ANYM-752: per state, the creation time of its oldest hint and its earliest attempt; a leased hint is scheduled by
+# lease_until, because leasing leaves next_attempt_at unchanged.
+_HINT_AGES = ''',min(o.created_at) AS oldest,
+    min(CASE o.state WHEN 'leased' THEN coalesce(o.lease_until,o.next_attempt_at) ELSE o.next_attempt_at END) AS due'''
 
 
 def _hint_states(c, row, p, ids=None):
-    """Per-state rows (state, n, age_s, next_s) of the definition's hints the key can see now; ids narrows them."""
+    """Per-state rows (state, n, oldest, due) of the definition's hints the key can see now; ids narrows them."""
     if dynamic(row):
         if p is None:
             return []  # ANYM-447: no key can read it now, so the worker counts none and discloses nothing.
@@ -322,15 +321,22 @@ def _hint_counts(c, row, p, ids=None):
     return {item['state']: item['n'] for item in _hint_states(c, row, p, ids)}
 
 
-def _lag(states):
+def _observed_at(c):
+    """The database clock the lag is read at (tests freeze it)."""
+    return c.execute('SELECT clock_timestamp() AS now').fetchone()['now']
+
+
+def _lag(c, states):
     """ANYM-752: the queue lag over exactly the hints hint_counts counts; unfinished means pending or leased."""
     unfinished = [item for item in states if item['state'] in ('pending', 'leased')]
     if not unfinished:
         return {'pending_hints': 0, 'oldest_unfinished_age_s': None, 'next_attempt_in_s': None}
+    now = _observed_at(c)
+    age = (now - min(item['oldest'] for item in unfinished)).total_seconds()
+    wait = (min(item['due'] for item in unfinished) - now).total_seconds()
     # A future attempt rounds up, so a running lease never reads as due now; a due or past one reads 0.
-    return {'pending_hints': sum(item['n'] for item in unfinished),
-        'oldest_unfinished_age_s': max(0, math.floor(max(item['age_s'] for item in unfinished))),
-        'next_attempt_in_s': max(0, math.ceil(min(item['next_s'] for item in unfinished)))}
+    return {'pending_hints': sum(item['n'] for item in unfinished), 'oldest_unfinished_age_s': max(0, math.floor(age)),
+        'next_attempt_in_s': max(0, math.ceil(wait))}
 
 
 def _delivery_view(c, row, p=None):
@@ -345,7 +351,7 @@ def _delivery_view(c, row, p=None):
         'receiver_id': str(binding['receiver']) if binding and binding['receiver'] else None, 'host_wakeup': 'unverified',
         'host_turn_verified': False,
         'hint_counts': {state: live.get(state, 0) + deleted.get(state, 0) for state in sorted({*live, *deleted})},
-        'deleted_hint_counts': deleted, 'hints_deleted_at': row.get('hints_deleted_at'), 'lag': _lag(states),
+        'deleted_hint_counts': deleted, 'hints_deleted_at': row.get('hints_deleted_at'), 'lag': _lag(c, states),
         **(delivery_state(c, row) if binding else UNBOUND)}
     if binding and binding.get('endpoint'):
         # ANYM-519: a deleted endpoint leaves the subscription pull-only; a paused one names its state.
