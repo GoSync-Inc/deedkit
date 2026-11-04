@@ -341,6 +341,26 @@ def test_confirmed_edit_hand_off_becomes_one_next_revision(worker,order):
         assert c.execute("SELECT count(*) AS n FROM message_conflicts").fetchone()['n']==0
 
 
+# spec: ANYM-755
+def test_a_confirmed_formatted_edit_archives_its_formatting_with_the_next_revision(worker):
+    from telethon import types
+    w,s,key=worker
+    asyncio.run(w.capture(NS(message=own(message(9,body='before edit')))))
+    assert drained(w)==['created']
+    edited=own(message(9,body='Edited link',edited=datetime(2026,10,2,tzinfo=timezone.utc)))
+    edited.entities=[types.MessageEntityBold(0,6),types.MessageEntityTextUrl(7,4,'https://example.invalid/x')]
+    assert edit_hand_off(w,edited)['data']['archive']=='queued'
+    assert drained(w,edits_first=True)[0]=='edited'
+    with s.pool.connection() as c:
+        row=c.execute('SELECT revision,snapshot FROM message_revisions WHERE message=%s ORDER BY revision DESC LIMIT 1',
+                      (stable_id('msg',w.account,'100','9'),)).fetchone()
+    formatting=row['snapshot']['formatting']
+    assert (row['revision'],row['snapshot']['body'])==(2,'Edited link')
+    assert formatting['state']=='observed' and formatting['basis']=='telegram_native_entities'
+    assert [(e['type'],e['offset'],e['length'],e.get('url')) for e in formatting['entities']]==[
+        ('bold',0,6,None),('text_link',7,4,'https://example.invalid/x')]
+
+
 # spec: ANYM-747
 @pytest.mark.parametrize('trouble',['spool_raises','slot_full','cancelled'])
 def test_edit_hand_off_trouble_never_fails_the_collector(worker,trouble):

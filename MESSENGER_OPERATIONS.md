@@ -171,10 +171,12 @@ react without holding `read-live`; the owner's opt-in for the read operation app
 after the one edit request, one scoped read of the message (inside the same 30-second timeout)
 settles it. The receipt is `succeeded` (`result.data`: `basis: provider_read_back`,
 `effect_verified: true`) when the read shows this account's message, same chat and id, with the
-requested text (surrounding whitespace ignored on both sides) and no formatting, and the message
-before the edit differed from that (a plain edit of the same text that removes bold or a text link
-is a change). Links, mentions, hashtags and similar entities Telegram detects in the text itself
-are not formatting. Everything else stays `unknown` with `provider_result_unverified`, as before
+requested text (surrounding whitespace ignored on both sides) and the requested formatting (none
+for a plain edit; for a formatted edit, ANYM-755, every span with its type, offset, length, link
+and `pre` language, in any order), and the message before the edit differed from that (a plain
+edit of the same text that removes bold or a text link is a change, and so is a formatted edit
+that only adds bold). Entities that differ from the request leave it `unknown`. Links, mentions,
+hashtags and similar entities Telegram detects in the text itself are not formatting. Everything else stays `unknown` with `provider_result_unverified`, as before
 this release: another text, a missing message, formatting still present, a message that already
 had the requested state, a read error, a timeout or a flood wait (which adds
 `evidence.retry_after_s`). `unknown` still means "not known": the edit may have applied. Its
@@ -754,9 +756,16 @@ and `bot-press` from the keys; the widened check is harmless.
 
 - WhatsApp `delete_message` is unsupported: the upstream global-revoke behavior
   can fall back silently to local deletion. AnyMsg does not offer that fallback.
-- `edit_message` accepts plain text for an own outgoing message at the exact
-  archive revision; provider edit windows and rights still apply. Existing rich
-  text sending uses `preview_message` / `send_message`, not a raw rich-edit payload.
+- `edit_message` edits an own outgoing message at the exact archive revision;
+  provider edit windows and rights still apply. It takes a send's options
+  (ANYM-755): `format` (`plain` by default, `markdown`, `html`), `link_preview`
+  and `allow_lossy`, rendered by the same renderer as `send_message`, so the
+  same source gives the same text and entities, and refused with the same codes
+  before anything is queued. The preview shows the rendering as `edit_artifact`
+  and its `preview_digest` binds it. Defaults, given or omitted, leave the stored
+  request as a plain edit's. On WhatsApp, edits stay plain text: any non-default
+  option is refused `unsupported_operation` with a `next_step` to repeat the edit
+  with text only.
 - Telegram mark-read uses the selected message as the read boundary; WhatsApp
   mark-read affects the whole chat. Ordinary sends remain `sendSeen: false` on
   WhatsApp; read-state changes require a separately confirmed explicit operation.

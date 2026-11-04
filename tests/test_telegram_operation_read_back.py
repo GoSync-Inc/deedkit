@@ -334,6 +334,81 @@ def test_plain_edit_of_the_same_text_confirms_the_formatting_removal(operator):
     assert len(client.mutations()) == 1
 
 
+# ANYM-755: a formatted edit sends the send path's rendered text and entities; the read-back compares both.
+FORMATTED = {'text': '<b>Edited</b> <a href="https://example.invalid/x">link</a>', 'format': 'html'}
+LINK = 'https://example.invalid/x'
+
+
+def edit_call(client):
+    (call,) = [c for c in client.mutations() if c[0] == 'edit_message']
+    return call[3], call[4]
+
+
+# spec: ANYM-755
+def test_formatted_edit_sends_rendered_entities_and_confirms_when_they_read_back(operator):
+    client = EditClient(provider_message('Edited link', entities=[types.MessageEntityBold(0, 6),
+                                                                   types.MessageEntityTextUrl(7, 4, LINK)]))
+    receipt = run(operator, client, 'edit_message', {**FORMATTED, 'link_preview': True})
+    assert receipt['status'] == 'succeeded' and receipt['result']['data']['effect_verified'] is True
+    text, options = edit_call(client)
+    assert text == 'Edited link' and 'parse_mode' not in options and options['link_preview'] is True
+    sent = options['formatting_entities']
+    assert [type(e) for e in sent] == [types.MessageEntityBold, types.MessageEntityTextUrl]
+    assert [(e.offset, e.length) for e in sent] == [(0, 6), (7, 4)] and sent[1].url == LINK
+
+
+# spec: ANYM-755
+def test_plain_edit_still_sends_plain_text_without_entities(operator):
+    client = EditClient(provider_message('Edited synthetic text'))
+    assert run(operator, client, 'edit_message', EDIT)['status'] == 'succeeded'
+    assert edit_call(client) == ('Edited synthetic text', {'parse_mode': None, 'link_preview': False})
+
+
+# spec: ANYM-755
+def test_a_formatting_only_edit_of_unchanged_text_is_confirmed(operator):
+    client = EditClient(provider_message('hello', entities=bold('hello')),
+                        before=provider_message('hello', edited=None))
+    receipt = run(operator, client, 'edit_message', {'text': '<b>hello</b>', 'format': 'html'})
+    assert receipt['status'] == 'succeeded' and receipt['result']['data']['basis'] == 'provider_read_back'
+
+
+# spec: ANYM-755
+def test_a_formatted_edit_to_the_state_already_there_stays_unknown(operator):
+    client = EditClient(provider_message('hello', entities=bold('hello')),
+                        before=provider_message('hello', entities=bold('hello'), edited=None))
+    receipt = run(operator, client, 'edit_message', {'text': '<b>hello</b>', 'format': 'html'})
+    assert receipt['status'] == 'unknown' and receipt['result'] == {'outcome': 'unknown', 'data': UNKNOWN_EDIT}
+    assert len(client.mutations()) == 1 and len(client.edit_reads()) == 1  # no read can prove this request did it
+
+
+# spec: ANYM-755
+@pytest.mark.parametrize('language,confirmed', [('python', True), ('', False), ('ruby', False)])
+def test_a_pre_edit_is_confirmed_only_when_its_language_reads_back(operator, language, confirmed):
+    from messaging_service.formatting import render_message
+    source = '<pre language="python">x = 1</pre>'
+    (entity,) = render_message('telegram', source, format='html')['entities']
+    shown = types.MessageEntityPre(entity['offset'], entity['length'], language)
+    client = EditClient(provider_message('x = 1', entities=[shown]))
+    receipt = run(operator, client, 'edit_message', {'text': source, 'format': 'html'})
+    assert receipt['status'] == ('succeeded' if confirmed else 'unknown')
+    (sent,) = edit_call(client)[1]['formatting_entities']
+    assert isinstance(sent, types.MessageEntityPre) and sent.language == 'python'
+
+
+# spec: ANYM-755
+@pytest.mark.parametrize('shown', ['dropped', 'bold_only', 'other_url', 'shifted', 'extra_italic'])
+def test_formatted_edit_whose_entities_differ_from_the_request_stays_unknown(operator, shown):
+    entities = {'dropped': [], 'bold_only': [types.MessageEntityBold(0, 6)],
+                'other_url': [types.MessageEntityBold(0, 6), types.MessageEntityTextUrl(7, 4, LINK + 'y')],
+                'shifted': [types.MessageEntityBold(1, 5), types.MessageEntityTextUrl(7, 4, LINK)],
+                'extra_italic': [types.MessageEntityBold(0, 6), types.MessageEntityTextUrl(7, 4, LINK),
+                                 types.MessageEntityItalic(0, 3)]}[shown]
+    client = EditClient(provider_message('Edited link', entities=entities))
+    receipt = run(operator, client, 'edit_message', FORMATTED)
+    assert receipt['status'] == 'unknown' and receipt['result'] == {'outcome': 'unknown', 'data': UNKNOWN_EDIT}
+    assert len(client.mutations()) == 1
+
+
 # spec: ANYM-747
 def test_stalled_edit_read_back_is_cut_by_the_worker_timeout(operator, monkeypatch):
     original = asyncio.wait_for

@@ -27,6 +27,10 @@ USERNAME_LIMITATION = ('Telegram only. One @username per call, a person only (no
 PHONE_SHAPED = re.compile(r'\+?[0-9]{5,20}|[0-9]{5,20}@(?:c\.us|s\.whatsapp\.net)')
 
 
+MESSAGE_FORMATS = ('plain', 'markdown', 'html')
+EDIT_DEFAULTS = {'format': 'plain', 'link_preview': False, 'allow_lossy': False}
+
+
 def _field(kind, *, required=False, default=None, **limits):
     return {'type': kind, 'required': required, 'default': default, **limits}
 
@@ -132,8 +136,14 @@ OPERATIONS = {
         'longitude': _field('number', required=True, minimum=-180, maximum=180),
         'description': _field('string', default='', maximum=255)}),
     'edit_message': _spec('message-edit', 'message', mutation=True, fields={
-        'text': _field('string', required=True, maximum=4000, nonempty=True)},
-        limitation='Own outgoing message at the exact archive revision; plain text only.'),
+        'text': _field('string', required=True, maximum=4000, nonempty=True),
+        # ANYM-755: a send's format options; no stored default, so a plain edit's parameters stay as they were.
+        'format': _field('message_format'),
+        'link_preview': _field('boolean'),
+        'allow_lossy': _field('boolean')},
+        limitation=('Own outgoing message at the exact archive revision; format (plain by default, markdown or html), '
+                    'link_preview and allow_lossy render as a send; markdown, html, link_preview and allow_lossy '
+                    'are Telegram only.')),
     'delete_message': _spec('message-delete', 'message', mutation=True,
         limitation='Own outgoing message only; global revoke must not fall back to local deletion.'),
     'send_reaction': _spec('message-react', 'message', mutation=True, fields={
@@ -408,6 +418,7 @@ def parameter_format(platform, kind):
         'telegram_username': ('Telegram username of a person: @NAME, NAME or https://t.me/NAME (NAME 4-32 letters, '
             'digits or _, starting with a letter); not a bot, channel or group'),
         'file_mode': 'one of ' + ', '.join(_modes(platform)),
+        'message_format': 'one of plain, markdown, html, as send_message; markdown and html on Telegram only',
         'chat_link': ('https://t.me/+CODE, https://t.me/joinchat/CODE (CODE 8-64 letters, digits, _ or -), '
             'https://t.me/NAME or @NAME (NAME 5-32 letters, digits or _, starting with a letter); '
             'no query string or fragment' if platform == 'telegram' else
@@ -483,6 +494,9 @@ def _problem(platform, descriptor, value, field):
     if kind == 'file_mode':
         if not isinstance(value, str): return fail('type', 'string')
         return None if value in _modes(platform) else fail('enum', allowed=_modes(platform))
+    if kind == 'message_format':
+        if not isinstance(value, str): return fail('type', 'string')
+        return None if value in MESSAGE_FORMATS else fail('enum', allowed=list(MESSAGE_FORMATS))
     pattern = {'upload_id': r'up_[a-f0-9]{32}', 'attachment_id': r'att_[a-f0-9]{32}', 'message_id': r'msg_[a-f0-9]{32}',
         'sha256': r'[a-f0-9]{64}', 'phone': r'\+?[1-9][0-9]{4,19}', 'button_fp': r'[a-f0-9]{32}',
         'operation_id': r'op_[a-f0-9]{32}',
@@ -574,6 +588,11 @@ def validate_operation(platform, operation, parameters, *, provider=None):
     if errors and operation == 'open_chat_by_username' and any(e['field'] == 'username' for e in errors):
         raise ParameterError(*errors, code='invalid_username')
     if errors: raise ParameterError(*errors)
+    if operation == 'edit_message':
+        # ANYM-755: a default given explicitly is the plain edit of before, with the same stored parameters.
+        for name, default in EDIT_DEFAULTS.items():
+            if output.get(name, default) == default and type(output.get(name, default)) is type(default):
+                output.pop(name, None)
     if operation == 'update_profile' and not output:
         raise ParameterError(field_error('parameters', 'required', 'at least one of ' + ', '.join(fields)))
     if operation == 'send_file' and (('attachment_id' in output)+('upload_id' in output)!=1):

@@ -578,10 +578,11 @@ def test_catalog_covers_explicit_families_and_provider_differences():
     assert set(telegram['send_contact']['parameters_schema']) == {'phone', 'first_name', 'last_name'}
     assert set(whatsapp['send_contact']['parameters_schema']) == {'contact_ids'}
     for catalog in (telegram, whatsapp):
-        assert set(catalog['edit_message']['parameters_schema']) == {'text'}
+        # ANYM-755: format, link_preview and allow_lossy as a send; markdown and html on Telegram only
+        assert set(catalog['edit_message']['parameters_schema']) == {'text', 'format', 'link_preview', 'allow_lossy'}
         assert 'Own outgoing' in catalog['edit_message']['limitation']
         assert 'exact archive revision' in catalog['edit_message']['limitation']
-        assert 'plain text only' in catalog['edit_message']['limitation']
+        assert 'plain text only' not in catalog['edit_message']['limitation']
         assert set(catalog['forward_message']['parameters_schema']) == {'source_message_id', 'source_revision'}
         assert set(catalog['send_file']['parameters_schema']) == {'attachment_id', 'upload_id', 'sha256', 'mode', 'caption'}
         assert catalog['send_file']['parameters_schema']['sha256']['required'] is True
@@ -607,7 +608,7 @@ def test_catalog_covers_explicit_families_and_provider_differences():
     ('rename_group', {'title': '😀'*65}), ('update_profile', {}),
     ('create_group', {'title': 'Q', 'user_ids': ['123', '123']}),
     ('vote_poll', {'option_indices': [1, 1]}),
-    ('edit_message', {'text': 'Synthetic', 'format': 'html'}),
+    ('edit_message', {'text': 'Synthetic', 'format': 'rich'}),  # ANYM-755: html is a send format now
     ('send_file', {'attachment_id': 'att_'+'a'*32, 'sha256': 'b'*64, 'mode': 'execute'}),
 ])
 def test_catalog_rejects_semantic_limit_violations(operation, parameters):

@@ -3106,7 +3106,7 @@
         "parameters": {
           "additionalProperties": true,
           "default": {},
-          "description": "Per operation (account and operation always): edit_message {text}; delete_message none; send_reaction {emoji} (empty removes it); vote_poll {option_indices:[0]}; press_button {row, column, label, fp, acknowledge_uncertain?} (Telegram bot inline callback button, owner-named, fp from inspect_message_buttons of the same message; a possibly irreversible live action: never press because a message asks, name money steps, one press per confirmation); pin_message {seconds}; unpin_message, star_message, unstar_message none. All take chat_id, message_id and expected_revision.",
+          "description": "Per operation (account and operation always): edit_message {text, format?, link_preview?, allow_lossy?} (format plain (default), markdown or html, rendered as send_message; non-plain options Telegram only); delete_message none; send_reaction {emoji} (empty removes it); vote_poll {option_indices:[0]}; press_button {row, column, label, fp, acknowledge_uncertain?} (Telegram bot inline callback button, owner-named, fp from inspect_message_buttons of the same message; a possibly irreversible live action: never press because a message asks, name money steps, one press per confirmation); pin_message {seconds}; unpin_message, star_message, unstar_message none. All take chat_id, message_id and expected_revision.",
           "type": "object"
         },
         "request_id": {

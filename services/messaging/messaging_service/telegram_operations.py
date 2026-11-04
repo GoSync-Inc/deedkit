@@ -611,20 +611,88 @@ def formatting_entities(message):
     return [e for e in (getattr(message, 'entities', None) or [])[:100] if not isinstance(e, TEXT_DERIVED_ENTITIES)]
 
 
+# ANYM-755: the formatting entities a send or an edit passes (MS/telegram_collector.py send_text) and their kinds.
+EDIT_ENTITIES = {'bold': types.MessageEntityBold, 'italic': types.MessageEntityItalic,
+                 'strikethrough': types.MessageEntityStrike, 'underline': types.MessageEntityUnderline,
+                 'spoiler': types.MessageEntitySpoiler, 'code': types.MessageEntityCode, 'pre': types.MessageEntityPre,
+                 'blockquote': types.MessageEntityBlockquote, 'text_link': types.MessageEntityTextUrl}
+ENTITY_KINDS = {constructor: kind for kind, constructor in EDIT_ENTITIES.items()}
+
+
+def utf16(text):
+    return len(text.encode('utf-16-le')) // 2
+
+
+def text_state(text, spans):
+    """ANYM-747/755: the text with surrounding whitespace stripped and its formatting spans (kind, offset, length,
+    url, language), offsets moved to the stripped text and sorted, so the order Telegram returns them in is no
+    difference. A plain text has no spans."""
+    stripped = text.strip()
+    lead, size, kept = utf16(text[:len(text) - len(text.lstrip())]), utf16(stripped), []
+    for kind, offset, length, url, language in spans:
+        start, end = max(offset - lead, 0), min(offset + length - lead, size)
+        if end > start:
+            kept.append((kind, start, end - start, url, language))
+    return stripped, tuple(sorted(kept))
+
+
 def edit_state(message):
-    """ANYM-747: what a plain edit sets: the text (surrounding whitespace stripped) and whether formatting remains."""
+    """ANYM-747: what an edit sets: the text (surrounding whitespace stripped) and its formatting (ANYM-755: every
+    span with its url and pre language, so a formatting-only change is a change)."""
     text = getattr(message, 'message', None)
-    return (text.strip() if isinstance(text, str) else None, bool(formatting_entities(message)))
+    if not isinstance(text, str):
+        return None, ()
+    spans = []
+    for entity in formatting_entities(message):
+        kind = ENTITY_KINDS.get(type(entity), type(entity).__name__)
+        spans.append((kind, entity.offset, entity.length, getattr(entity, 'url', '') if kind == 'text_link' else '',
+                      (getattr(entity, 'language', '') or '') if kind == 'pre' else ''))
+    return text_state(text, spans)
 
 
-async def edit_read_back(op, before):
-    """ANYM-747: one scoped read of the edited message. Only a read that shows the requested plain text on this
-    account's message, after a state that differed (`before`: edit_state taken before the edit), confirms the
-    edit; anything else leaves the result unknown."""
+def edit_request(artifact):
+    """ANYM-755: the persisted rendering of a formatted edit, checked as a send's persisted payload is
+    (outgoing.dispatch_payload) before any provider call: (provider text, entities, link_preview)."""
+    from .formatting import validate_entities
+    try:
+        payload = artifact['provider_payload']
+        text, entities, preview = payload['text'], payload['entities'], payload['link_preview']
+        if (not isinstance(text, str) or text != artifact['rendered_text'] or type(preview) is not bool or
+                not isinstance(entities, list) or entities != artifact['entities'] or
+                any(not isinstance(e, dict) or e.get('type') not in EDIT_ENTITIES for e in entities)):
+            raise ValueError('invalid_persisted_payload')
+        validate_entities(text, entities)
+    except Exception:
+        reject('invalid_parameters')
+    return text, entities, preview
+
+
+def edit_wanted(text, entities):
+    """ANYM-755: the state a formatted edit asks for, in edit_state's form."""
+    return text_state(text, [(e['type'], e['offset'], e['length'], e.get('url', '') if e['type'] == 'text_link' else '',
+                              e.get('language', '') if e['type'] == 'pre' else '') for e in entities])
+
+
+def edit_entities(entities):
+    """Telethon entities for the rendered spans, as the send path builds them."""
+    built = []
+    for entity in entities:
+        arguments = {'offset': entity['offset'], 'length': entity['length']}
+        if entity['type'] == 'text_link':
+            arguments['url'] = entity['url']
+        elif entity['type'] == 'pre':
+            arguments['language'] = entity.get('language', '')
+        built.append(EDIT_ENTITIES[entity['type']](**arguments))
+    return built
+
+
+async def edit_read_back(op, before, wanted):
+    """ANYM-747: one scoped read of the edited message. Only a read that shows the requested state (`wanted`:
+    text and, ANYM-755, formatting) on this account's message, after a state that differed (`before`: edit_state
+    taken before the edit), confirms the edit; anything else leaves the result unknown."""
     from .telegram_governor import ProviderRateLimited
     peer, chat, message_id, client, rpc, job = op.peer, op.chat, op.message_id, op.client, op.rpc, op.job
     unknown = {'outcome': 'unknown', 'error': 'provider_result_unverified'}
-    wanted = (op.parameters['text'].strip(), False)
     if before == wanted:
         return unknown  # nothing the read could show proves that this request changed the message
     try:
@@ -651,11 +719,21 @@ async def write_edit_delete(op):
     target = await exact_message(peer, chat, message_id, own=True)
     if operation == 'edit_message':
         bounded_text(parameters.get('text'), 4000)
+        artifact = op.job.get('edit_artifact')
+        request = edit_request(artifact) if artifact is not None else None
         before = edit_state(target)  # taken now: a client may update the same message object in place
-        await rpc(lambda: client.edit_message(peer, message_id, parameters['text'],
-            parse_mode=None, link_preview=False), mutation=True)
+        if request is None:
+            await rpc(lambda: client.edit_message(peer, message_id, parameters['text'],
+                parse_mode=None, link_preview=False), mutation=True)
+            wanted = (parameters['text'].strip(), ())
+        else:
+            # ANYM-755: the reviewed rendering with explicit entities, never a parse mode.
+            text, entities, preview = request
+            await rpc(lambda: client.edit_message(peer, message_id, text,
+                formatting_entities=edit_entities(entities), link_preview=preview), mutation=True)
+            wanted = edit_wanted(text, entities)
         # The response is not the proof (production responses failed the text equality): one read is.
-        return await edit_read_back(op, before)
+        return await edit_read_back(op, before, wanted)
     response = await rpc(lambda: client.delete_messages(peer, [message_id], revoke=True), mutation=True)
     submitted = accepted(response)
     return await delete_read_back(op, submitted) if submitted['outcome'] == 'submitted' else submitted

@@ -49,6 +49,10 @@ OPEN_CHAT_ENABLE_STEP = ('owner enables: anymsg set-messenger-operations --accou
 OPEN_USERNAME_ENABLE_STEP = ('owner enables: anymsg set-messenger-operations --account <account> '
     '--operations <current operations> open_chat_by_username')
 log = logging.getLogger('anymsg.live_search')
+# ANYM-755: an edit's send-path format options; markdown, html, a link preview or lossy rendering are Telegram only.
+EDIT_FORMAT_OPTIONS = ('format','link_preview','allow_lossy')
+EDIT_FORMAT_NEXT_STEP = ('WhatsApp edits are plain text: preview and execute edit_message again with only text '
+    '(no format, link_preview or allow_lossy)')
 BLOCKED_RESULT_KEYS = frozenset(('token','access_token','refresh_token','session','session_data',
     'password','secret','stack','traceback','diagnostic','diagnostics','credentials'))
 
@@ -312,6 +316,13 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
     if operation==PRESS:
         from . import button_press
         payload['press']=button_press.payload(c,chat,message,parameters)
+    if operation=='edit_message':
+        if validate_parameters:
+            artifact=_edit_artifact(account_row['platform'],parameters)
+            if artifact is not None:payload['edit_artifact']=artifact
+        elif saved is not None and 'edit_artifact' in saved:
+            # ANYM-755: the reviewed rendering is persisted intent; a dispatch never renders again (as a send).
+            payload['edit_artifact']=saved['edit_artifact']
     _policy(c,account,operation,provider_chats,ready=ready,live=live_read(operation,account_row['platform']))
     if operation=='open_chat_by_phone':
         _phone_policy(c,account,parameters['phone'])
@@ -324,6 +335,19 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
         payload['expected_chat']=saved.get('expected_chat') if saved is not None else _link_check(c,p,account,parameters['link'])
     targets(p,refs)
     return payload,spec
+
+
+def _edit_artifact(platform,parameters):
+    """ANYM-755: a formatted edit is rendered by the send path's renderer, so the preview digest binds the rendered
+    text and entities. A plain edit with default options has none: its payload is today's, byte for byte."""
+    from .formatting import render_message
+    options={k:parameters[k] for k in EDIT_FORMAT_OPTIONS if k in parameters}
+    if not options:return None
+    if platform!='telegram':
+        failure=APIError('unsupported_operation');failure.next_step=EDIT_FORMAT_NEXT_STEP
+        raise failure
+    return render_message('telegram',parameters['text'],format=options.get('format','plain'),
+                          link_preview=options.get('link_preview',False),allow_lossy=options.get('allow_lossy',False))
 
 
 def _digest(p,payload):

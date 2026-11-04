@@ -187,6 +187,60 @@ def test_unknown_edit_names_the_verifying_read(operator):
         assert _verify({**row,'status':'succeeded'},c) is None
 
 
+FORMATTED_EDIT={'text':'<b>Edited</b> <a href="https://example.invalid/x">link</a>','format':'html'}
+
+
+# spec: ANYM-755
+def test_formatted_edit_binds_the_rendered_artifact_to_its_preview_digest(operator):
+    from messaging_service.formatting import render_message
+    s,_,key,_=operator
+    plain=s.preview_messenger_operation(key,**operation_args(operation='edit_message',parameters={'text':'Edited'}))
+    assert 'edit_artifact' not in plain and plain['parameters']=={'text':'Edited'}  # defaults: today's payload
+    args=operation_args(operation='edit_message',parameters=FORMATTED_EDIT)
+    draft=s.preview_messenger_operation(key,**args)
+    assert draft['edit_artifact']==render_message('telegram',FORMATTED_EDIT['text'],format='html')
+    assert draft['edit_artifact']['rendered_text']=='Edited link'
+    assert draft['edit_artifact']['provider_payload']['entities']==[{'type':'bold','offset':0,'length':6},
+        {'type':'text_link','offset':7,'length':4,'url':'https://example.invalid/x'}]
+    # the same continuation as any mutation without (or with another) preview; nothing is queued
+    for digest,code in (('','preview_required'),(plain['preview_digest'],'preview_mismatch')):
+        with pytest.raises(APIError,match=code) as refused:
+            s.execute_messenger_operation(key,**args,request_id='synthetic-format-0001',preview_digest=digest)
+        assert refused.value.next_action=='preview_then_send_with_digest'
+        assert refused.value.next_call['tool']=='preview_messenger_operation'
+    other=s.preview_messenger_operation(key,**operation_args(operation='edit_message',
+        parameters={**FORMATTED_EDIT,'link_preview':True}))
+    assert other['preview_digest']!=draft['preview_digest']
+    queued=s.execute_messenger_operation(key,**args,request_id='synthetic-format-0001',
+                                         preview_digest=draft['preview_digest'])
+    with s.pool.connection() as c:
+        payload=c.execute('SELECT payload FROM messenger_commands WHERE id=%s',(queued['operation_id'],)).fetchone()['payload']
+    assert payload['edit_artifact']==draft['edit_artifact']
+    # a source the send path refuses is refused here, before anything is queued
+    with pytest.raises(APIError,match='unsafe_message_markup|unsupported_message_formatting'):
+        s.preview_messenger_operation(key,**operation_args(operation='edit_message',
+            parameters={'text':'<script>x</script>','format':'html'}))
+
+
+# spec: ANYM-755
+@pytest.mark.parametrize('options',[{'format':'html'},{'format':'markdown'},{'link_preview':True},{'allow_lossy':True}])
+def test_whatsapp_formatted_edit_is_refused_unsupported_with_a_plain_next_step(seeded,options):
+    from messaging_service.commands import EDIT_FORMAT_NEXT_STEP
+    s,_,_=seeded
+    archive=Archive(s)
+    archive.register('edit-wa','whatsapp','Synthetic WhatsApp',discover=True)
+    archive.ingest(event(account='edit-wa',platform='whatsapp',chat='900@c.us',provider_id='1',direction='outgoing',
+                         body='Original'))
+    key=s.issue_key('wa-editor',['edit-wa'],permissions=['read','message-edit'])
+    s.set_messenger_operations('edit-wa',['edit_message'])
+    args=dict(account='edit-wa',operation='edit_message',chat_id=stable_id('chat','edit-wa','900@c.us'),
+              message_id=stable_id('msg','edit-wa','900@c.us','1'),expected_revision=1)
+    with pytest.raises(APIError,match='unsupported_operation') as refused:
+        s.preview_messenger_operation(key,**args,parameters={'text':'*Edited*',**options})
+    assert refused.value.next_step==EDIT_FORMAT_NEXT_STEP
+    assert 'edit_artifact' not in s.preview_messenger_operation(key,**args,parameters={'text':'*Edited*'})
+
+
 @pytest.mark.parametrize('change',['key','principal','policy','revision','expiry','connection'])
 def test_worker_rechecks_mutable_authority(operator,change):
     from messaging_service.commands import CommandWorker
