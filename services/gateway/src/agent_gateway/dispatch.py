@@ -29,6 +29,9 @@ LIVE_SEARCH = "search_messages_live"
 OPEN_CHAT_BY_PHONE = "open_chat_by_phone"
 OPEN_CHAT_BY_USERNAME = "open_chat_by_username"
 SEND_FILE = "send_file"
+# ANYM-756: the objects below the top level that may hold a next_call, as key paths: get_sync_status(chat_id)'s
+# history and a read's result_evidence.history_hint.
+NESTED_NEXT_CALLS = (("history",), ("result_evidence", "history_hint"))
 # ANYM-736: the guard of send_message compares the chat's messages, so it needs the call its refusal names.
 GUARD_ARGUMENTS = ("expected_last_message_id", "guard")
 GUARD_CONTEXT_TOOL = "messages_get_context"
@@ -203,7 +206,15 @@ class Dispatch:
 
     def next_call(self, value, snapshot, agent, caps):
         """ANYM-531: name the backend's suggested call by this gateway's own tool, or drop it where this
-        gateway would refuse it (hidden tool, missing scope or action grant for the account)."""
+        gateway would refuse it (hidden tool, missing scope or action grant for the account). ANYM-756: the
+        same for the history pointer nested in a chat's sync status and in a read's result evidence."""
+        if isinstance(value, dict):
+            for *path, key in NESTED_NEXT_CALLS:
+                parent = value
+                for name in path:
+                    parent = parent.get(name) if isinstance(parent, dict) else None
+                if isinstance(parent, dict) and isinstance(parent.get(key), dict) and "next_call" in parent[key]:
+                    parent[key] = self.next_call(parent[key], snapshot, agent, caps)
         step = value.get("next_call") if isinstance(value, dict) else None
         if not isinstance(step, dict):
             return value

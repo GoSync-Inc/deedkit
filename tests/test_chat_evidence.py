@@ -183,6 +183,70 @@ def test_failed_chat_scan_is_visible_and_clears_after_success(worker):
     assert s.get_sync_status(key,chat_id=cid)['history']['last_error_code'] is None
 
 
+def history_reader(w,s,permissions=('read','read-live')):
+    """A non-synthetic account and a key that may (or may not) run request_chat_history."""
+    with s.pool.connection() as c:c.execute('UPDATE accounts SET synthetic=false WHERE id=%s',(w.account,))
+    return s.issue_key('history-pointer',[w.account],permissions=list(permissions))
+
+
+# spec: ANYM-756
+def test_incomplete_telegram_traversal_names_the_page_before_the_oldest_archived_message(worker):
+    w,s,_=worker
+    key=history_reader(w,s)
+    # batch_size 2 over messages 1-5: the first pass archives 5 and 4 and leaves older pages to traverse.
+    asyncio.run(w.sync_once())
+    cid=stable_id('chat',w.account,'100')
+    history=s.get_sync_status(key,chat_id=cid)['history']
+    assert history['state']=='loading' and not history['history_traversal_complete']
+    assert history['next_call']=={'tool':'execute_messenger_operation','arguments':{'account':w.account,
+        'operation':'request_chat_history','chat_id':cid,
+        'parameters':{'before_message':stable_id('msg',w.account,'100','4'),'count':100}},
+        'caller_supplies':['request_id','preview_digest']}
+    assert 'history_hint' not in history
+    # A key without the operation's permission sees only that coverage is unknown.
+    narrow=s.issue_key('history-narrow',[w.account],permissions=['read'])
+    history=s.get_sync_status(narrow,chat_id=cid)['history']
+    assert 'next_call' not in history and history['history_hint']=={'coverage':'unknown','reason':'traversal_incomplete'}
+
+
+# spec: ANYM-756
+def test_not_scanned_or_empty_telegram_chat_gets_an_unknown_hint_and_no_invented_anchor(worker):
+    w,s,_=worker
+    key=history_reader(w,s)
+    w.state.inventory([('200','user','Waiting'),('300','user','Empty')],None)
+    with s.pool.connection() as c:
+        c.execute("UPDATE collector_chats SET initialized=true WHERE account=%s AND provider_chat='300'",(w.account,))
+    for chat,reason in (('200','not_scanned'),('300','empty_archive')):
+        history=s.get_sync_status(key,chat_id=stable_id('chat',w.account,chat))['history']
+        assert 'next_call' not in history and history['history_hint']=={'coverage':'unknown','reason':reason}
+
+
+# spec: ANYM-756
+@pytest.mark.parametrize('case',['complete','error'])
+def test_complete_or_failed_telegram_chat_has_no_history_pointer(worker,case):
+    w,s,_=worker
+    key=history_reader(w,s)
+    if case=='complete':w.provider.messages=[message(1)]
+    asyncio.run(w.sync_once())
+    if case=='error':w.state.failed('100','provider_unavailable')
+    history=s.get_sync_status(key,chat_id=stable_id('chat',w.account,'100'))['history']
+    assert history['history_traversal_complete'] is (case=='complete')
+    assert 'next_call' not in history and 'history_hint' not in history
+
+
+# spec: ANYM-756
+def test_whatsapp_chat_keeps_its_gap_tokens_and_has_no_history_pointer(wa):
+    w,s,_=wa
+    async def partial(chat,**kwargs):return {'messages':[],'exhausted':False,'pending':False}
+    w.provider.page=partial
+    asyncio.run(w.sync_once())
+    key=history_reader(w,s)
+    cid=s.resolve_reference(key,w.account,'123@c.us')['chat']['id']
+    history=s.get_sync_status(key,chat_id=cid)['history']
+    assert not history['history_traversal_complete'] and 'gaps' in history
+    assert 'next_call' not in history and 'history_hint' not in history
+
+
 def test_file_empty_search_explains_pending_originals(worker):
     w,s,key=worker
     asyncio.run(w.capture(NS(message=message(9,media=True))));w.spool.drain(w.state.apply)

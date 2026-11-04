@@ -1,6 +1,11 @@
 """Coverage of the requested chats; traversal evidence is not provider completeness."""
+import logging
+
 from .policy import scope_filter, targets
 from .search_query import valid_text
+
+# ANYM-756: one request_chat_history page, Telegram's maximum (messenger_operations.TELEGRAM_HISTORY_FIELDS).
+HISTORY_PAGE=100
 
 
 def backfill(c):
@@ -109,8 +114,41 @@ def history(row,lower=None,upper=None):
         'older_edits_and_deletions_verified':False}
 
 
+def history_pointer(c,p,row,h):
+    """ANYM-756: (next_call, hint) for a Telegram chat whose traversal is not complete.
+
+    The call is the one request_chat_history page before the chat's oldest archived message. An incomplete
+    traversal proves no older message is missing, so coverage stays `unknown`; a chat never scanned or with
+    no archived message gets the hint without a call (no anchor is invented), and so does a key without the
+    operation's permission. Complete, failed, synthetic and WhatsApp chats get neither. Interior holes
+    between archived messages are not detected."""
+    from .messenger_operations import HISTORY,OPERATIONS
+    if row['platform']!='telegram' or row['synthetic'] or h['history_traversal_complete'] or h['last_error_code']:
+        return None,None
+    if h['state']=='not_scanned':return None,{'coverage':'unknown','reason':'not_scanned'}
+    oldest=c.execute('SELECT id FROM messages WHERE account=%s AND chat=%s AND NOT deleted '
+        'ORDER BY length(provider_id),provider_id LIMIT 1',(row['account'],row['chat_id'])).fetchone()
+    if not oldest:return None,{'coverage':'unknown','reason':'empty_archive'}
+    hint={'coverage':'unknown','reason':'traversal_incomplete'}
+    if OPERATIONS[HISTORY]['permission'] not in p['permissions']:return None,hint
+    # Reference-only arguments (ANYM-531): the account, this chat and an archive ID the key can already read.
+    return {'tool':'execute_messenger_operation','arguments':{'account':row['account'],'operation':HISTORY,
+        'chat_id':row['chat_id'],'parameters':{'before_message':oldest['id'],'count':HISTORY_PAGE}},
+        'caller_supplies':['request_id','preview_digest']},hint
+
+
+def guarded_pointer(c,p,row,h):
+    """The pointer is optional: its failure (in a savepoint) never costs the read it decorates (as ANYM-478)."""
+    try:
+        with c.transaction():return history_pointer(c,p,row,h)
+    except Exception as error:
+        logging.getLogger(__name__).warning('history_hint_failed exception_type=%s',type(error).__name__)
+        return None,None
+
+
 def chat_statuses(c,p,chat_ids,lower=None,upper=None,*,conflict_items=False):
-    """`conflict_items` adds the bounded listing behind `inspect_chat` (get_sync_status with a chat_id only)."""
+    """`conflict_items` adds the bounded listing behind `inspect_chat` and the history pointer (ANYM-756) of
+    `history` (get_sync_status with a chat_id only)."""
     from .sync_status import _files,empty_files
     from .conflict_classes import grouped,listing,report
     records=rows(c,p,chat_ids);result={}
@@ -128,7 +166,11 @@ def chat_statuses(c,p,chat_ids,lower=None,upper=None,*,conflict_items=False):
         line=report(open_by_class)
         # The chat's conflict line only where it says something: open conflicts, or the get_sync_status listing.
         conflict={'active':active,'historical':historical,**(line if active or conflict_items else {})}
-        if conflict_items:conflict['items']=listing(c,chat)
+        if conflict_items:
+            conflict['items']=listing(c,chat)
+            step,hint=guarded_pointer(c,p,row,h)
+            if step:h['next_call']=step
+            elif hint:h['history_hint']=hint
         file_data=files.get(chat) or {**empty_files(),'extraction':{},'enrichment':{}}
         file_data['download']=downloads.get(chat,{})
         result[chat]={'chat_id':chat,'account':row['account'],'provider_chat_id':row['provider_chat'],
@@ -206,6 +248,11 @@ def query_evidence(c,p,normalized,items,*,paged=False,include=True):
         if ids is not None and len(ids)<=20:
             permitted=[r['chat_id'] for r in records]
             result['chats']=list(chat_statuses(c,p,permitted,lower,upper).values())
+        # ANYM-756: a read of one named chat says whether older history may be missing and names the call.
+        named=[(r,h) for r,h in zip(records,histories) if r['chat_id']==chat] if chat else []
+        if named:
+            step,hint=guarded_pointer(c,p,*named[0])
+            if hint:result['history_hint']={**hint,**({'next_call':step} if step else {})}
     return result
 
 
