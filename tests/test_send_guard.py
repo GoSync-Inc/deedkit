@@ -462,12 +462,12 @@ def dup_refused(s, key, request_id='guard-request-0002', **changes):
     return failure.value
 
 
-def settle(s, request_id, status, **columns):
+def settle(s, rid, status, /, **columns):
     """Move one saved send to `status` (and any other column), as the worker or an operator would."""
     columns = {'status': status, **columns}
     names = ','.join(name + '=%s' for name in columns)
     with s.pool.connection() as c:
-        c.execute('UPDATE outgoing_messages SET ' + names + ' WHERE request_id=%s', (*columns.values(), request_id))
+        c.execute('UPDATE outgoing_messages SET ' + names + ' WHERE request_id=%s', (*columns.values(), rid))
 
 
 def aged(s, request_id, minutes):
@@ -536,10 +536,12 @@ def test_other_chat_text_account_principal_do_not_block(duplicated):
         dup(s, key)
         settle(s, 'guard-request-0001', 'unknown')
         assert dup(s, key, 'guard-request-0002', text='Changed synthetic text')['status'] == 'queued'
-        assert dup(s, key, 'guard-request-0003', chat_id=OTHER_CHAT)['status'] == 'queued'
+        assert s.send_message(key, account=ACCOUNT, chat_id=OTHER_CHAT, text='Exact synthetic text',
+                              request_id='guard-request-0003', duplicate_guard=True)['status'] == 'queued'
         assert dup(s, other_principal, 'guard-request-0004')['status'] == 'queued'
         other_chat = stable_id('chat', 'guard-other', '100')
-        assert dup(s, both, 'guard-request-0005', account='guard-other', chat_id=other_chat)['status'] == 'queued'
+        assert s.send_message(both, account='guard-other', chat_id=other_chat, text='Exact synthetic text',
+                              request_id='guard-request-0005', duplicate_guard=True)['status'] == 'queued'
         # The control: the same content again by the first principal is still refused.
         assert dup_refused(s, key, 'guard-request-0006').earlier_request_id == 'guard-request-0001'
     finally:
