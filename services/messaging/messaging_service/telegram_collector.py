@@ -5,7 +5,7 @@ from collections.abc import Mapping
 import copy
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager,nullcontext,suppress
-from functools import cached_property,partial
+from functools import cached_property
 from datetime import datetime,timedelta,timezone
 import errno
 import json
@@ -1245,11 +1245,11 @@ class TelegramCollector:
             if budget<=0:
                 failure='catalog_timeout';return
             state=bounded_state(self.state,time.monotonic()+budget)
-            # The policy the write was judged by names a refusal, not the one read before the provider call.
-            found,policy=await asyncio.wait_for(finished(partial(state.catalog,explain=True),chat,
-                'chat' if peer is types.PeerChat else 'channel',title if isinstance(title,str) and title else chat,
-                chat_type,self.history_since),budget)
-            if found:data['chat_id']=stable_id('chat',self.account,chat)
+            if await asyncio.wait_for(finished(state.catalog,chat,'chat' if peer is types.PeerChat else 'channel',
+                    title if isinstance(title,str) and title else chat,chat_type,self.history_since),budget):
+                data['chat_id']=stable_id('chat',self.account,chat)
+            # A refusal is named by the policy the write was judged by, not the one read before the provider call.
+            policy=getattr(state,'evaluated_policy',policy)
         except asyncio.CancelledError:
             # A shutdown during the catalog write: the worker settles the confirmed receipt first, then stops.
             job['_cancel_after_settle']=True

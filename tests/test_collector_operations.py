@@ -124,7 +124,7 @@ def test_cancelled_group_catalog_write_still_settles_the_confirmed_receipt_first
     def stalled(*args, **kwargs):
         entered.set()
         assert release.wait(5)
-        return False, None
+        return False
     monkeypatch.setattr(CollectorState, 'catalog', stalled)
     async def provider(work):
         return {'outcome': 'confirmed', 'data': {'provider_chat_id': GROUP, 'basis': 'provider_created_chat'}}
