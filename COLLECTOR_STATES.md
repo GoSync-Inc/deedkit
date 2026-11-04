@@ -45,6 +45,44 @@ runs about every 15 seconds only while the provider session is open; older than
 states, not only messages. It does not prove every provider callback arrived.
 The compact view carries only `liveness_state`; `detail=full` has the block.
 
+### Older history pointer (ANYM-756)
+
+`get_sync_status` with a `chat_id` of a Telegram chat whose traversal is not
+complete (`history_traversal_complete` false, no `last_error_code`, not a
+synthetic account) and that has at least one archived message adds
+`history.history_hint: {coverage: unknown, reason: traversal_incomplete}` and
+`history.next_call`: `execute_messenger_operation` with `operation`
+`request_chat_history`, the chat, `parameters.before_message` = the chat's oldest
+archived message (archive ID, lowest Telegram message ID) and `count` 100 (one
+page, the operation's maximum), and `caller_supplies` `request_id` and
+`preview_digest`: the operation is a mutation, so preview it, show the owner and
+send the same payload with the digest (MESSENGER_OPERATIONS.md). Its limits stay:
+per account 3 requests at once, then one per 10 s, 300 per UTC day. A repeat
+after that page names the next older message, so each call reaches one page
+further back. A chat never scanned (`state` `not_scanned`) or with no archived
+message gets `history.history_hint: {coverage: unknown, reason:
+not_scanned|empty_archive}` and no call (no anchor is invented); a key without
+the operation's `read-live` permission gets the `traversal_incomplete` hint and
+no call. Complete, failed, synthetic and WhatsApp chats
+get neither (WhatsApp keeps its `gaps` tokens).
+
+`get_messages` (and a `search_messages` naming one `chat`) adds the same to
+`result_evidence.history_hint`: `{coverage: unknown, reason:
+traversal_incomplete, next_call}`, or `reason` `not_scanned`/`empty_archive`
+without a call; a complete traversal carries none. It is part of the compact
+summary, so it is also present with `include_coverage=false`. An
+incomplete traversal proves no older message is missing, so the hint never says
+that messages are missing, and it never carries message text. Interior holes
+(messages missing between archived ones) are not detected. The gateway names the
+call by its own tool (`messages_execute_messenger_operation`) and drops it, keeping
+the hint, when the caller may not run the operation now (tool hidden, no action
+grant for the account, the account does not offer it, or the account's
+availability report does not list it, e.g. not opted in). A failure while
+computing the pointer drops only the pointer; the read answers as before. A
+gateway older than this change passes a nested call through unmapped (backend tool
+name) and unfiltered; its own admission still refuses a call the caller may not
+make.
+
 ### Version conflicts (ANYM-557)
 
 Account-scoped readers get one conflict line per account, `conflicts`:

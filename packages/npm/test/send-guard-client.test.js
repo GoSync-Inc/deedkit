@@ -36,6 +36,22 @@ test('the guard error chat_changed_since_seen keeps its code and is never retrie
 // spec: ANYM-736
 test('the guard error chat_guard_unavailable keeps its code and is never retried',()=>refusedSend('chat_guard_unavailable',503));
 
+// spec: ANYM-748
+test('sendMessage forwards allow_duplicate and duplicate_send_unresolved keeps its code and is never retried',async()=>{
+  const seen=[];
+  const client=new AnyMsgClient({...options,fetch:async(url,request)=>{
+    const body=JSON.parse(request.body);seen.push(body);
+    return 'allow_duplicate' in body?Response.json({status:'queued'}):
+      Response.json({error:'duplicate_send_unresolved',earlier_request_id:'synthetic-send-0000',
+        earlier_status:'unknown',request_id:'b'.repeat(32)},{status:409});
+  }});
+  await assert.rejects(client.sendMessage(send),
+    error=>error instanceof AnyMsgError && error.code==='duplicate_send_unresolved' && error.requestId==='b'.repeat(32));
+  await client.sendMessage({...send,allow_duplicate:true});
+  assert.deepEqual(seen,[send,{...send,allow_duplicate:true}]);
+  assert.match(declared,/allow_duplicate\?: boolean;/);
+});
+
 // spec: ANYM-736
 test('the typings declare the guard fields of a chat_id send',()=>{
   assert.match(declared,/expected_last_message_id\?: string;/);

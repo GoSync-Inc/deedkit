@@ -109,6 +109,8 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
 
     async def failure(request, error):
         body = {'error': error.code}
+        if error.detail_code:
+            body['detail_code'] = error.detail_code
         if isinstance(error, RateLimited):
             body['retry_after_s'] = error.retry_after_s
         return JSONResponse(body, status_code=error.status)
@@ -168,6 +170,7 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
         account = accounts[args.account]
         if operation in ('search', 'context', 'archive_status'):
             return await local.invoke(operation, args, authorization[7:])
+        request.state.provider = account.provider
         token = provider_token(account)
         params = dates(args) if operation == 'list_recordings' else {}
         binding = {'provider': account.provider, 'account': account.id, 'principal': actor.key_sha256,
@@ -198,7 +201,7 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
                 params['cursor'] = previous['position']
             values, headers = await omi_get(token, params=params)
             if not isinstance(values, list) or len(values) > args.limit:
-                raise Failure('invalid_provider_response')
+                raise Failure('invalid_provider_response', detail_code='list_shape')
             evidence, next_page = pagination(headers, len(values), args.limit)
             return {'account': account.id, 'provider': 'omi', 'items': [metadata(v) for v in values],
                     'pagination': evidence,
@@ -215,7 +218,7 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
             value, _ = await omi_get(token, args.recording_id, {'include_transcript': 'true'})
             record = metadata(value)
             if record['id'] != args.recording_id:
-                raise Failure('invalid_provider_response')
+                raise Failure('invalid_provider_response', detail_code='id_mismatch')
             state, text = content(value, args.kind)
         digest = hashlib.sha256(canonical({'state': state, 'text': text})).hexdigest()
         offset = 0
@@ -264,7 +267,9 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
         except (ValueError, TypeError, OverflowError, UnicodeError, RecursionError):
             # Provider projection and JSON encoding can fail after the HTTP client boundary.
             # Never expose their values through an unhandled exception or server traceback.
-            raise Failure('invalid_provider_response') from None
+            # ANYM-753 names Omi body parts only; a PLAUD body keeps the bare code.
+            omi = getattr(request.state, 'provider', None) == 'omi'
+            raise Failure('invalid_provider_response', detail_code='projection_error' if omi else None) from None
 
     app.router.routes.append(Route('/v1/events', events_page, methods=['GET']))
     app.router.routes.append(Route('/v1/events/head', events_head, methods=['GET']))

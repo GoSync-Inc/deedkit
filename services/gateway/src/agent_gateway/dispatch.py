@@ -29,6 +29,9 @@ LIVE_SEARCH = "search_messages_live"
 OPEN_CHAT_BY_PHONE = "open_chat_by_phone"
 OPEN_CHAT_BY_USERNAME = "open_chat_by_username"
 SEND_FILE = "send_file"
+# ANYM-756: the objects below the top level that may hold a next_call, as key paths: get_sync_status(chat_id)'s
+# history and a read's result_evidence.history_hint.
+NESTED_NEXT_CALLS = (("history",), ("result_evidence", "history_hint"))
 # ANYM-736: the guard of send_message compares the chat's messages, so it needs the call its refusal names.
 GUARD_ARGUMENTS = ("expected_last_message_id", "guard")
 GUARD_CONTEXT_TOOL = "messages_get_context"
@@ -203,7 +206,10 @@ class Dispatch:
 
     def next_call(self, value, snapshot, agent, caps):
         """ANYM-531: name the backend's suggested call by this gateway's own tool, or drop it where this
-        gateway would refuse it (hidden tool, missing scope or action grant for the account)."""
+        gateway would refuse it (hidden tool, missing scope or action grant for the account). ANYM-756: the
+        same for the history pointer nested in a chat's sync status and in a read's result evidence."""
+        if isinstance(value, dict):
+            self.nested_next_calls(value, snapshot, agent, caps)
         step = value.get("next_call") if isinstance(value, dict) else None
         if not isinstance(step, dict):
             return value
@@ -226,6 +232,34 @@ class Dispatch:
         elif value.get("error") == "not_found" or arguments.get("operation") == "open_chat_by_phone":
             value["next_action"] = "key_cannot_open_new_chats"
         return value
+
+    def nested_next_calls(self, value, snapshot, agent, caps):
+        """ANYM-756: a history pointer below the top level follows the ANYM-531 rule and, in addition, is
+        dropped unless the account reports the operation available now (key permitted and account opt-in),
+        as usable_actions advertises; the hint beside it always stays."""
+        for *path, key in NESTED_NEXT_CALLS:
+            parent = value
+            for name in path:
+                parent = parent.get(name) if isinstance(parent, dict) else None
+            holder = parent.get(key) if isinstance(parent, dict) else None
+            if not isinstance(holder, dict) or "next_call" not in holder:
+                continue
+            step = holder["next_call"]
+            arguments = step.get("arguments") if isinstance(step, dict) else None
+            arguments = arguments if isinstance(arguments, dict) else {}
+            if self.available(caps, arguments.get("account"), arguments.get("operation")):
+                parent[key] = self.next_call(holder, snapshot, agent, caps)
+            else:
+                parent[key] = {k: v for k, v in holder.items() if k != "next_call"}
+
+    @staticmethod
+    def available(caps, account, operation):
+        """The backend's availability report for one account; a backend without one makes nothing available."""
+        operations = caps.get("messenger_operations")
+        accounts = operations.get("supported_by_account") if isinstance(operations, dict) else None
+        row = accounts.get(account) if isinstance(accounts, dict) and isinstance(account, str) else None
+        names = row.get("available_operations") if isinstance(row, dict) else None
+        return isinstance(names, list) and isinstance(operation, str) and operation in names
 
     def implemented(self, tool, snapshot, agent, caps, account=None):
         if tool.get("required_manifest"):

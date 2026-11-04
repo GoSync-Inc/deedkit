@@ -50,7 +50,7 @@ class Provider:
                         if response.status_code != 200:
                             raise Failure('provider_unavailable')
                         if response.headers.get('content-encoding', 'identity').lower() != 'identity':
-                            raise Failure('invalid_provider_response')
+                            raise Failure('invalid_provider_response', detail_code='encoding')
                         body = bytearray()
                         async for chunk in response.aiter_bytes(65536):
                             if len(body) + len(chunk) > self.maximum:
@@ -62,20 +62,22 @@ class Provider:
         except httpx.HTTPError:
             raise Failure('provider_unavailable') from None
         except (ValueError, UnicodeError, RecursionError):
-            raise Failure('invalid_provider_response') from None
+            raise Failure('invalid_provider_response', detail_code='not_json') from None
         finally:
             self.active -= 1
 
 
 def metadata(value):
-    if not isinstance(value, dict) or not isinstance(value.get('id'), str) or not ID.fullmatch(value['id']):
-        raise Failure('invalid_provider_response')
+    if not isinstance(value, dict):
+        raise Failure('invalid_provider_response', detail_code='not_object')
+    if not isinstance(value.get('id'), str) or not ID.fullmatch(value['id']):
+        raise Failure('invalid_provider_response', detail_code='id_invalid')
     result = {'id': value['id']}
     for name in ('created_at', 'started_at', 'finished_at', 'language', 'source'):
         item = value.get(name)
         if item is not None:
             if not isinstance(item, str) or len(item) > 128:
-                raise Failure('invalid_provider_response')
+                raise Failure('invalid_provider_response', detail_code='metadata_field')
             result[name] = item
     structured = value.get('structured')
     if isinstance(structured, dict) and isinstance(structured.get('title'), str):
@@ -114,7 +116,7 @@ def pagination(headers, count, limit):
     complete = False if more is True or truncated is True else (
         True if more is False and truncated is False and effective is not None else None)
     if count > min(limit, effective or limit):
-        raise Failure('invalid_provider_response')
+        raise Failure('invalid_provider_response', detail_code='list_pagination')
     return {'has_more': more, 'list_truncated': truncated, 'effective_limit': effective,
             'complete': complete, 'ordering': 'provider_order_not_snapshot',
             'staleness_seconds': 10, 'date_field': 'created_at'}, next_page if more is True else None
@@ -122,7 +124,7 @@ def pagination(headers, count, limit):
 
 def content(value, kind):
     if not isinstance(value, dict):
-        raise Failure('invalid_provider_response')
+        raise Failure('invalid_provider_response', detail_code='not_object')
     if kind == 'summary':
         if value.get('processing_deferred') is True:
             return 'pending', ''
@@ -138,18 +140,20 @@ def content(value, kind):
         return 'unavailable', ''
     rows = []
     for segment in segments:
-        if not isinstance(segment, dict) or not isinstance(segment.get('text'), str):
-            raise Failure('invalid_provider_response')
+        if not isinstance(segment, dict):
+            raise Failure('invalid_provider_response', detail_code='segment_shape')
+        if not isinstance(segment.get('text'), str):
+            raise Failure('invalid_provider_response', detail_code='segment_text')
         # Preserve supplied diarization, without claiming an identity inferred from prose.
         speaker = next((segment[field] for field in ('speaker_name', 'speaker_id', 'speaker')
                         if segment.get(field) is not None and segment[field] != ''), 'unknown')
         if not isinstance(speaker, (str, int)) or isinstance(speaker, bool) or len(str(speaker)) > 256:
-            raise Failure('invalid_provider_response')
+            raise Failure('invalid_provider_response', detail_code='segment_speaker')
         offsets = []
         for field in ('start', 'end'):
             number = segment.get(field)
             if number is not None and (type(number) not in (int, float) or not -1e10 <= number <= 1e10 or not math.isfinite(number)):
-                raise Failure('invalid_provider_response')
+                raise Failure('invalid_provider_response', detail_code='segment_offset')
             offsets.append(number)
         if segment['text']:
             rows.append(json.dumps({'start': offsets[0], 'end': offsets[1], 'speaker': str(speaker),

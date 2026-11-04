@@ -29,12 +29,16 @@ const send={account:'synthetic',chat_id:'chat_synthetic',text:'Confirmed',reques
 client.sendMessage({...send,expected_last_message_id:'msg_synthetic'});
 client.sendMessage({...send,expected_last_message_id:'msg_synthetic',guard:'outgoing_only'});
 client.sendMessage({...send,guard:'any_message'});
+// ANYM-748: the opt-out of the unresolved-duplicate refusal.
+client.sendMessage({...send,allow_duplicate:true});
 client.getSendStatus({send_id:'send_synthetic'});
 client.getSendStatus({request_id:'synthetic-send-0001'});
 // @ts-expect-error guard names one of two values
 client.sendMessage({...send,expected_last_message_id:'msg_synthetic',guard:'newest'});
 // @ts-expect-error the expected ID is a string
 client.sendMessage({...send,expected_last_message_id:7});
+// @ts-expect-error allow_duplicate is a boolean
+client.sendMessage({...send,allow_duplicate:'yes'});
 // @ts-expect-error exactly one of send_id and request_id
 client.getSendStatus({send_id:'send_synthetic',request_id:'synthetic-send-0001'});
 // @ts-expect-error one of them is required

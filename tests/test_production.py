@@ -37,6 +37,12 @@ def no_host_state(tmp_path, monkeypatch):
         monkeypatch.setattr(p, name, tmp_path / "absent" / name.lower())
 
 
+@pytest.fixture(autouse=True)
+def no_apply_settle(monkeypatch):
+    """apply's settle (ANYM-758) sleeps on the real clock; only the tests that set APPLY_SETTLE_SECONDS run it."""
+    monkeypatch.setattr(p, "APPLY_SETTLE_SECONDS", 0, raising=False)
+
+
 def comparison(sha, *, behind=0):
     """GitHub's `compare/main...<sha>` when main contains SHA (`behind` commits ahead of it), or diverged."""
     if sha != SHA:
@@ -2384,6 +2390,112 @@ def test_an_unhealthy_release_is_not_rolled_back_after_another_release_became_cu
     rolled_back_refusal(host, "another release was applied or rolled back")
 
 
+def settling_apply(host, monkeypatch, *states, settle=10):
+    """Apply RELEASES[1] over RELEASES[0] with apply's settle (ANYM-758) on the fake clock. Once `up` passed its health
+    wait, the replacement shows `states` in turn, one (State, RestartCount) per inspect (the last repeats). Returns the
+    clock and the inspects of the replacement, or raises what apply raises."""
+    host.release(RELEASES[0])
+    host.main = RELEASES[1]
+    p.prepare(host.settings, RELEASES[1])
+    clock, original, inspects = Clock(), host.run, []
+    monkeypatch.setattr(p, "time", clock)
+    monkeypatch.setattr(p, "APPLY_SETTLE_SECONDS", settle)
+    def run(argv, **kwargs):
+        if argv[:2] == ["docker", "inspect"] and host.container["Image"] == host.image(RELEASES[1]):
+            state, restarts = states[min(len(inspects), len(states) - 1)]
+            host.container.update({"State": dict(state), "RestartCount": restarts})
+            inspects.append(argv)
+        return original(argv, **kwargs)
+    monkeypatch.setattr(p, "run", run)
+    try:
+        p.apply(host.settings, RELEASES[1])
+    finally:
+        monkeypatch.setattr(p, "run", original)
+    return clock, inspects
+
+
+RUNNING, LOOPING = {"Running": True, "Status": "running"}, {"Running": True, "Restarting": True, "Status": "restarting"}
+
+
+# spec: ANYM-758
+@pytest.mark.parametrize("later", [(LOOPING, 1), ({"Running": True, "Status": "running"}, 2),
+                                   ({"Running": False, "Status": "exited"}, 1)], ids=["restarting", "restarted", "exited"])
+def test_a_replacement_that_loops_after_its_health_wait_is_recorded_unhealthy_with_rollback_data(tmp_path, monkeypatch,
+                                                                                                   later):
+    host = Host(tmp_path, monkeypatch)
+    with pytest.raises(p.Refused, match="failed its health wait") as refused:
+        settling_apply(host, monkeypatch, (RUNNING, 0), later)
+    assert f"rollback --sha {RELEASES[1]}" in str(refused.value)
+    assert "synthetic/api is restarting or stopped 10 s after it started" in str(refused.value.__cause__)
+    result = p.read(host.state / RELEASES[1] / "result.json")
+    assert result["status"] == "unhealthy" and [item["name"] for item in result["rollback"]["projects"]] == ["synthetic"]
+    assert p.read(host.state / "current.json")["sha"] == RELEASES[0]
+    p.rollback(host.settings, RELEASES[1])
+    assert host.container["Image"] == host.image(RELEASES[0]) and host.container["State"]["Running"]
+
+
+# spec: ANYM-758
+def test_a_steady_replacement_passes_the_settle_with_exactly_one_more_inspect(tmp_path, monkeypatch):
+    counts = []
+    for settle in (0, 10):
+        (tmp_path / str(settle)).mkdir()
+        host = Host(tmp_path / str(settle), monkeypatch)
+        clock, inspects = settling_apply(host, monkeypatch, (RUNNING, 0), settle=settle)
+        assert p.read(host.state / "current.json")["sha"] == RELEASES[1] and "rollback-attempted.json" not in {
+            path.name for path in (host.state / RELEASES[1]).iterdir()}
+        assert clock.sleeps == ([10] if settle else [])
+        counts.append(len(inspects))
+    assert counts[1] == counts[0] + 1
+
+
+# spec: ANYM-758
+def test_a_replacement_with_a_compose_healthcheck_relies_on_its_health_wait_and_never_settles(tmp_path, monkeypatch):
+    host = Host(tmp_path, monkeypatch)
+    healthy = {**RUNNING, "Health": {"Status": "healthy"}}
+    clock, _ = settling_apply(host, monkeypatch, (healthy, 0), (LOOPING, 3))
+    assert clock.sleeps == [] and p.read(host.state / "current.json")["sha"] == RELEASES[1]
+
+
+# spec: ANYM-758
+def test_the_settle_sleeps_once_per_project_and_leaves_the_call_wait_alone(tmp_path, monkeypatch):
+    # A call starts after the first project settled and before the second project's stop.
+    host = CallHost(tmp_path, monkeypatch, answers=((), (), [(CALL, "active")], ()))
+    monkeypatch.setattr(p, "APPLY_SETTLE_SECONDS", 10)
+    host.prepared(RELEASES[0])
+    assert p.apply(host.settings, RELEASES[0])["status"] == "applied"
+    # One settle per project, the unchanged call poll between them.
+    assert len(host.settings["projects"]) == 2 and host.clock.sleeps == [10, p.CALL_POLL, 10]
+    voice = host.events.index(("stop", "personal-os-voice"))
+    assert [event for event in host.events[:voice] if event[0] == "probe"][-2:] == [
+        ("probe", "voice0", [f"{RELEASES[0]}/attempted.json"])] * 2  # the active probe, then the one that let it stop
+
+
+# spec: ANYM-758
+def test_the_settle_of_a_project_with_several_services_sleeps_once_and_inspects_each(tmp_path, monkeypatch):
+    clock, inspected = Clock(), []
+    monkeypatch.setattr(p, "time", clock)
+    monkeypatch.setattr(p, "APPLY_SETTLE_SECONDS", 10)
+    def run(argv, **kwargs):
+        assert argv[:2] == ["docker", "inspect"] and clock.sleeps == [10]  # every inspect after the one sleep
+        inspected.append(argv[2])
+        return json.dumps([{"Id": argv[2], "State": {"Running": True}, "RestartCount": 0}])
+    monkeypatch.setattr(p, "run", run)
+    project = {"name": "workers", "services": {"indexer": "runtime", "enricher": "runtime", "sender": "runtime"}}
+    item = {"running": {service: {"container": "old-" + service} for service in project["services"]}}
+    unproven = [(service, "new-" + service, {"State": {"Running": True}, "RestartCount": 0}) for service in project["services"]]
+    assert p.restart_loop(project, item, unproven) is None
+    assert clock.sleeps == [10] and inspected == ["new-indexer", "new-enricher", "new-sender"]
+    # The second of three loops: one sleep still, the first two inspected, and its name in the reason.
+    clock.sleeps.clear()
+    inspected.clear()
+    def looping(argv, **kwargs):
+        inspected.append(argv[2])
+        return json.dumps([{"Id": argv[2], "State": {"Running": True}, "RestartCount": 1 if argv[2] == "new-enricher" else 0}])
+    monkeypatch.setattr(p, "run", looping)
+    assert "workers/enricher is restarting or stopped 10 s" in p.restart_loop(project, item, unproven)
+    assert clock.sleeps == [10] and inspected == ["new-indexer", "new-enricher"]
+
+
 def inventory(*versions, changed=()):
     """A synthetic image schema inventory: schema.sql and the migrations of these numbers, `changed` ones with another
     checksum."""
@@ -3198,6 +3310,50 @@ def test_a_failed_health_wait_rolls_back_once_and_pauses(tmp_path, monkeypatch):
     assert outcome["status"] == "rolled-back" and f"rolled back to {BASE}" in outcome["reason"]
     assert p.read(host.state / "deploy.json")["status"] == "rolled-back" and host.paused() == outcome["reason"]
     # After a human removes the pause, the failed commit is never retried and nothing older follows it.
+    p.PAUSE.unlink()
+    host.steps.clear()
+    assert host.deploy()["status"] == "waiting" and host.steps == []
+
+
+# spec: ANYM-758
+def test_a_replacement_looping_after_the_real_apply_health_wait_rolls_back_once_and_pauses(tmp_path, monkeypatch):
+    # `deploy` on the Deployer's mirror and GitHub fakes, with the real prepare and apply on Host's synthetic Docker.
+    real = {"prepare": p.prepare, "apply": p.apply}
+    (tmp_path / "docker").mkdir()
+    docker = Host(tmp_path / "docker", monkeypatch)
+    host = Deployer(tmp_path, monkeypatch)
+    docker.state, docker.main = host.state, NEWEST
+    docker.settings["state_directory"] = str(host.state)
+    host.settings, host.document = docker.settings, json.loads(docker.original.read_text())
+    host.current(BASE)
+    inside, inspects = [], []
+    def run(argv, **kwargs):
+        if argv[:2] == ["docker", "inspect"] and docker.container["Image"] == docker.image(NEWEST):
+            # Running when `up --wait` returns and at apply's first inspect, restarting after the settle.
+            state, restarts = ((RUNNING, 0), (LOOPING, 1))[min(len(inspects), 1)]
+            docker.container.update({"State": dict(state), "RestartCount": restarts})
+            inspects.append(argv)
+        return docker.run(argv, **kwargs) if inside or argv[0] == "docker" else host.run(argv, **kwargs)
+    monkeypatch.setattr(p, "run", run)
+    def step(name):
+        def call(settings, sha, *rest, **options):
+            host.steps.append((name, sha))
+            inside.append(name)
+            try:
+                return real[name](settings, sha, *rest, **options)
+            finally:
+                inside.pop()
+        return call
+    for name in real:
+        monkeypatch.setattr(p, name, step(name))
+    clock = Clock()
+    monkeypatch.setattr(p, "time", clock)
+    monkeypatch.setattr(p, "APPLY_SETTLE_SECONDS", 10)
+    outcome = host.deploy()
+    assert host.steps == [("prepare", NEWEST), ("apply", NEWEST), ("rollback", NEWEST)]
+    assert p.read(host.state / NEWEST / "result.json")["status"] == "unhealthy" and 10 in clock.sleeps
+    assert outcome["status"] == "rolled-back" and f"rolled back to {BASE}" in outcome["reason"]
+    assert p.read(host.state / "deploy.json")["status"] == "rolled-back" and host.paused() == outcome["reason"]
     p.PAUSE.unlink()
     host.steps.clear()
     assert host.deploy()["status"] == "waiting" and host.steps == []

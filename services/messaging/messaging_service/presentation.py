@@ -184,7 +184,7 @@ def lean_view(view):
 
 
 EVIDENCE_SUMMARY=('empty_reason','requested_range_traversed','active_conflicts_in_range','next_action','empty_fields',
-    'media_text_pending','media_text_unavailable')
+    'media_text_pending','media_text_unavailable','history_hint')
 EVIDENCE_LIVE=('live','live_wait','suggested_call','archive_reread')
 EVIDENCE_CONSTANTS=('basis','full_history_verified','message_index')
 

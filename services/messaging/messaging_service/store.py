@@ -380,9 +380,10 @@ class Store:
                         # ANYM-665: a reviewed recovery hint set on the database error survives the conversion.
                         if failure is not error and hasattr(error,'next_action'):failure.next_action=error.next_action
                         p = p or getattr(error, 'audit_identity', None)
-                        # transaction_timeout ends the server session (ANYM-265): nothing was committed, and the
-                        # failure is audited on a fresh connection instead of the closed one.
-                        late = isinstance(error, TransactionTimeout) and c.closed
+                        # transaction_timeout ends the server session (ANYM-265), and so does a lost connection: nothing
+                        # was committed, and the failure is audited on a fresh connection instead of the closed one, so
+                        # a known refusal (ANYM-748: chat_guard_unavailable, nothing queued) is never masked.
+                        late = c.closed
                     if operation:
                         outcome = 'ok' if failure is None else ('denied' if isinstance(failure, APIError) else 'error')
                         entry = (p, operation, outcome,
@@ -473,11 +474,12 @@ class Store:
 
     def send_message(self,token,account,chat_id,text,request_id,reply_to='',format='plain',
                      preview_digest='',link_preview=False,allow_lossy=False,
-                     expected_last_message_id=None,guard=None):
+                     expected_last_message_id=None,guard=None,allow_duplicate=None,duplicate_guard=False):
         from .outgoing import enqueue
         with self.authorized(token,'send_message') as (c,p):
             return enqueue(c,p,account,chat_id,text,request_id,reply_to,format,
-                preview_digest,link_preview,allow_lossy,expected_last_message_id=expected_last_message_id,guard=guard)
+                preview_digest,link_preview,allow_lossy,expected_last_message_id=expected_last_message_id,guard=guard,
+                duplicate_guard=duplicate_guard,allow_duplicate=allow_duplicate)
 
     # ANYM-532: a phone recipient; phone_send.preview and phone_send.send wait between these short reads.
     def phone_preview_lookup(self,token,account,phone,text,reply_to='',format='plain',

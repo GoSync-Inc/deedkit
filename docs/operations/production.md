@@ -864,8 +864,16 @@ The messaging API, gateway, calendar API and recordings API define Compose liven
 route, so its probe sends one unauthenticated POST and requires the 401 refusal, contacting no vendor), so
 `--wait` also requires them to report healthy; the first probe runs about 30
 seconds after start. Collectors, workers, indexer and enrichment expose no
-container-local health signal and are verified only as running. Docker does not
-restart an unhealthy container; monitor `docker ps`/`health_status` events.
+container-local health signal, so `--wait` passes them as soon as they run once
+and a crash-looping one can be caught running. Apply therefore settles them
+(ANYM-758): once per project, after its replacements started, it waits
+`APPLY_SETTLE_SECONDS` (10, a constant of the tool) and inspects each replacement
+without a healthcheck again. One that is restarting, not running, or has
+restarted since this apply created it fails apply exactly like a failed `--wait`:
+the release is recorded `unhealthy` with rollback data and `deploy` rolls it back
+once and pauses. A release adds at most 10 seconds per project; services with a
+healthcheck rely on `--wait` and add none. Docker does not restart an unhealthy
+container; monitor `docker ps`/`health_status` events.
 
 A plan A stop never cuts a call (ANYM-442): restarting the calls service ends
 every unfinished call as `interrupted`, and the Telegram collector carries

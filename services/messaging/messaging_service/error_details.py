@@ -50,6 +50,9 @@ def payload(error,operation='',request_id=None):
     # ANYM-736: a refused guarded send; counts and archive IDs the key may read, never message text or names.
     for name in ('newer_count','newer_count_capped','newer_outgoing_count','first_newer_message_id','newest_message_id'):
         if hasattr(error,name):info[name]=getattr(error,name)
+    # ANYM-748: a refused duplicate names the caller's own earlier request_id and its status, never text or send_id.
+    for name in ('earlier_request_id','earlier_status'):
+        if hasattr(error,name):info[name]=getattr(error,name)
     if retry:info['retry_after_seconds']=2
     if code in EXPECTED:info['expected']=EXPECTED[code]
     if operation in ('search','search_files'):info['results_state']='not_returned_due_to_error'

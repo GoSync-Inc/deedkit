@@ -34,7 +34,8 @@ Rulebook v1 adds:
 
 A guarded `send_message` refusal (`chat_changed_since_seen`, ANYM-736) carries only counts and archive IDs
 (`newer_count`, `newer_count_capped`, `newer_outgoing_count`, `first_newer_message_id`, `newest_message_id`)
-and a reference-only `next_call`; see SENDING.md.
+and a reference-only `next_call`; see SENDING.md. An unresolved duplicate (`duplicate_send_unresolved`, ANYM-748)
+carries only the caller's own `earlier_request_id`, `earlier_status` and a `get_send_status` `next_call`.
 
 `hint`, `next` and candidates never carry message text, file names or phone numbers taken from a request or a backend
 error; the ANYM-295 privacy allowlist is unchanged.
