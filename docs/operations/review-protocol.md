@@ -55,6 +55,13 @@ list: release, deploy and `production.py`, sends and live provider-session code.
   A host-tool change still waits for the owner to install it before autodeploy resumes
   (docs/operations/production.md).
 
+- A format the installed host tool reads (manifest keys, configuration shape, receipt fields) never gains a required
+  part in the PR that first uses it: the part is optional, or the tool that reads it merges and installs first and the
+  format follows in a second PR. An installed tool reads an unknown key as a malformed file, and the enrollment gate runs
+  before the tool updates itself. Incident 11-04: #632 added a required manifest key and every deploy paused with
+  `enroll_required` for the running recordings module until #638. Enforcer: `test_the_recordings_manifest_uses_only_keys_the_installed_host_tool_reads_and_the_networks_key_is_optional`
+  (tests/test_module_enroll.py), which pins the five keys.
+
 - Autoloop protected paths (docs/operations/feedback-autoloop.md), not a change-path signal: a
   hit keeps an autoloop PR out of the controller merge. This is the one list; it covers the
   checks' own verifiers (load budgets, test config, release contracts, import shadowing). In a
