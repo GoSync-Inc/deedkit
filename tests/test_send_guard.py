@@ -443,6 +443,283 @@ def test_refusal_creates_no_row(guarded):
     assert rows(s) == []
 
 
+# ANYM-748: the unresolved-duplicate refusal. Store calls pass duplicate_guard=True as the send_message tool does.
+def dup(s, key, request_id='guard-request-0001', **changes):
+    return send(s, key, request_id, duplicate_guard=True, **changes)
+
+
+def dup_refused(s, key, request_id='guard-request-0002', **changes):
+    with pytest.raises(APIError) as failure:
+        dup(s, key, request_id, **changes)
+    return failure.value
+
+
+def settle(s, request_id, status, **columns):
+    """Move one saved send to `status` (and any other column), as the worker or an operator would."""
+    columns = {'status': status, **columns}
+    names = ','.join(name + '=%s' for name in columns)
+    with s.pool.connection() as c:
+        c.execute('UPDATE outgoing_messages SET ' + names + ' WHERE request_id=%s', (*columns.values(), request_id))
+
+
+def aged(s, request_id, minutes):
+    with s.pool.connection() as c:
+        c.execute("UPDATE outgoing_messages SET created_at=clock_timestamp()-make_interval(mins=>%s),"
+                  "expires_at=clock_timestamp()+interval '10 minutes' WHERE request_id=%s", (minutes, request_id))
+
+
+# spec: ANYM-748
+def test_unknown_earlier_send_refuses(guarded):
+    s, archive, key = guarded
+    first = dup(s, key)
+    settle(s, 'guard-request-0001', 'unknown', error_code='sender_interrupted')
+    error = dup_refused(s, key)
+    assert (error.code, error.status) == ('duplicate_send_unresolved', 409)
+    assert (error.earlier_request_id, error.earlier_status) == ('guard-request-0001', 'unknown')
+    assert error.next_call == {'tool': 'get_send_status', 'arguments': {'request_id': 'guard-request-0001'},
+                               'caller_supplies': []}
+    body = payload(error, 'send_message')
+    assert body['error'] == 'duplicate_send_unresolved' and body['next_call'] == error.next_call
+    assert (body['earlier_request_id'], body['earlier_status']) == ('guard-request-0001', 'unknown')
+    # No message text and never the internal send id.
+    assert 'Exact synthetic text' not in str(body) and first['send_id'] not in str(body)
+    assert len(rows(s)) == 1
+    # No guard state is kept: once the earlier send settles, the same call succeeds.
+    settle(s, 'guard-request-0001', 'sent', provider_message_id='9001')
+    assert dup(s, key, 'guard-request-0002')['status'] == 'queued'
+
+
+# spec: ANYM-748
+def test_queued_and_dispatching_refuse(guarded):
+    s, archive, key = guarded
+    dup(s, key)
+    assert dup_refused(s, key).earlier_status == 'queued'
+    settle(s, 'guard-request-0001', 'dispatching')
+    assert dup_refused(s, key).earlier_status == 'dispatching'
+    assert len(rows(s)) == 1
+
+
+# spec: ANYM-748
+@pytest.mark.parametrize('status', ['sent', 'failed'])
+def test_sent_and_failed_do_not_block(guarded, status):
+    s, archive, key = guarded
+    dup(s, key)
+    settle(s, 'guard-request-0001', status, error_code=None if status == 'sent' else 'provider_rejected')
+    assert dup(s, key, 'guard-request-0002')['status'] == 'queued'
+    assert len(rows(s)) == 2
+
+
+def connected(archive, account, worker):
+    epoch = archive.acquire(account, worker)
+    CollectorState(archive, account, (worker, epoch)).phase('connection', 'connected', 'provider_ready')
+    archive.set_sending(account, True)
+    return lambda: archive.release(account, worker, epoch)
+
+
+# spec: ANYM-748
+def test_other_chat_text_account_principal_do_not_block(guarded):
+    s, archive, key = guarded
+    say(archive, 1, 0, chat='200')
+    say(archive, 2, 0, chat='100', account='guard-other')
+    release = connected(archive, 'guard-other', 'synthetic-guard-other-worker')
+    try:
+        both = s.issue_key('guard-both-agent', [ACCOUNT, 'guard-other'], permissions=['read', 'send'])
+        other_principal = s.issue_key('guard-twin-agent', [ACCOUNT], permissions=['read', 'send'])
+        dup(s, key)
+        settle(s, 'guard-request-0001', 'unknown')
+        assert dup(s, key, 'guard-request-0002', text='Changed synthetic text')['status'] == 'queued'
+        assert dup(s, key, 'guard-request-0003', chat_id=OTHER_CHAT)['status'] == 'queued'
+        assert dup(s, other_principal, 'guard-request-0004')['status'] == 'queued'
+        other_chat = stable_id('chat', 'guard-other', '100')
+        assert dup(s, both, 'guard-request-0005', account='guard-other', chat_id=other_chat)['status'] == 'queued'
+        # The control: the same content again by the first principal is still refused.
+        assert dup_refused(s, key, 'guard-request-0006').earlier_request_id == 'guard-request-0001'
+    finally:
+        release()
+
+
+# spec: ANYM-748
+def test_expired_queued_does_not_block(guarded):
+    s, archive, key = guarded
+    dup(s, key)
+    with s.pool.connection() as c:
+        # Expiry is projected at read time only; the stored status stays queued.
+        c.execute("UPDATE outgoing_messages SET expires_at=clock_timestamp()-interval '1 second'")
+    assert dup(s, key, 'guard-request-0002')['status'] == 'queued'
+
+
+# spec: ANYM-748
+def test_different_reply_target_format_or_render_policy_does_not_block(guarded):
+    s, archive, key = guarded
+    target = say(archive, 1, 0)
+    dup(s, key)
+    assert dup(s, key, 'guard-request-0002', reply_to=target)['status'] == 'queued'
+    for n, policy in enumerate(({'format': 'markdown'}, {'link_preview': True}, {'allow_lossy': True}), 3):
+        digest = s.preview_message(key, account=ACCOUNT, chat_id=CHAT, text='Exact synthetic text',
+                                   **policy)['preview_digest']
+        assert dup(s, key, f'guard-request-{n:04d}', preview_digest=digest, **policy)['status'] == 'queued'
+    # The control: the same reply target again is refused and names the reply send.
+    assert dup_refused(s, key, 'guard-request-0009', reply_to=target).earlier_request_id == 'guard-request-0002'
+
+
+# spec: ANYM-748
+def test_internal_child_request_rows_are_ignored(guarded):
+    s, archive, key = guarded
+    dup(s, key)
+    # A messages_send step's row: get_send_status answers not_found for it, so a refusal could not name it.
+    settle(s, 'guard-request-0001', 'unknown', request_id='agent-child:synthetic-0001')
+    assert dup(s, key, 'guard-request-0002')['status'] == 'queued'
+
+
+# spec: ANYM-748
+def test_phone_username_and_send_intent_paths_unchanged(guarded):
+    import inspect
+    from messaging_service import outgoing, phone_send, send_intent, username_send
+    s, archive, key = guarded
+    assert inspect.signature(outgoing.enqueue).parameters['duplicate_guard'].default is False
+    assert inspect.signature(type(s).send_message).parameters['duplicate_guard'].default is False
+    for module in (phone_send, username_send, send_intent):
+        assert 'duplicate_guard' not in inspect.getsource(module) and 'allow_duplicate' not in inspect.getsource(module)
+    # The shared enqueue without the keyword queues identical unresolved content as before.
+    with s.authorized(key, 'send_message') as (c, p):
+        first = outgoing.enqueue(c, p, ACCOUNT, CHAT, 'Exact synthetic text', 'guard-request-0001')
+        second = outgoing.enqueue(c, p, ACCOUNT, CHAT, 'Exact synthetic text', 'guard-request-0002')
+    assert first['status'] == second['status'] == 'queued' and len(rows(s)) == 2
+
+
+# spec: ANYM-748
+@pytest.mark.parametrize('minutes,blocks', [(59, True), (61, False)])
+def test_61_minutes_does_not_block(guarded, minutes, blocks):
+    s, archive, key = guarded
+    dup(s, key)
+    settle(s, 'guard-request-0001', 'unknown')
+    aged(s, 'guard-request-0001', minutes)
+    if blocks:
+        assert dup_refused(s, key).code == 'duplicate_send_unresolved'
+    else:
+        assert dup(s, key, 'guard-request-0002')['status'] == 'queued'
+
+
+# spec: ANYM-748
+def test_same_request_id_returns_saved_result_before_guard(guarded, monkeypatch):
+    from messaging_service import outgoing
+    s, archive, key = guarded
+    first = dup(s, key)
+    settle(s, 'guard-request-0001', 'unknown')
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('the duplicate lookup ran for a saved request_id')
+    monkeypatch.setattr(outgoing, 'unresolved_send', forbidden)
+    again = dup(s, key)
+    assert again['send_id'] == first['send_id'] and again['status'] == 'unknown' and len(rows(s)) == 1
+
+
+# spec: ANYM-748
+def test_allow_duplicate_sends(guarded):
+    s, archive, key = guarded
+    plain = dup(s, key)
+    settle(s, 'guard-request-0001', 'unknown')
+    assert dup_refused(s, key, allow_duplicate=False).code == 'duplicate_send_unresolved'
+    allowed = dup(s, key, 'guard-request-0002', allow_duplicate=True)
+    assert allowed['status'] == 'queued' and set(allowed) == set(plain)
+    stored = rows(s)
+    # No part of the stored request: the same hash and digest as the first send.
+    assert stored[0]['request_hash'] == stored[1]['request_hash']
+    assert stored[0]['preview_digest'] == stored[1]['preview_digest']
+    # Its retry without the opt-out returns the saved row.
+    assert dup(s, key, 'guard-request-0002')['send_id'] == allowed['send_id'] and len(rows(s)) == 2
+    error = refused(s, key, request_id='guard-request-0003', allow_duplicate='yes', duplicate_guard=True)
+    assert error.code == 'invalid_parameters' and error.field_errors[0]['field'] == 'allow_duplicate'
+
+
+# spec: ANYM-748
+def test_duplicate_refusal_creates_no_row(guarded):
+    s, archive, key = guarded
+    dup(s, key)
+    settle(s, 'guard-request-0001', 'unknown')
+    for n in range(2, 5):
+        dup_refused(s, key, f'guard-request-{n:04d}')
+    assert [r['request_id'] for r in rows(s)] == ['guard-request-0001']
+
+
+# spec: ANYM-748
+def test_concurrent_identical_calls_one_wins(guarded, monkeypatch):
+    import time
+    from messaging_service import outgoing
+    s, archive, key = guarded
+    real = outgoing.unresolved_send
+
+    def slow(*args):
+        # Widens the window: a lookup before the lock would let both calls see nothing and both queue.
+        time.sleep(0.3)
+        return real(*args)
+    monkeypatch.setattr(outgoing, 'unresolved_send', slow)
+    start, outcomes = threading.Barrier(2), []
+
+    def call(n):
+        start.wait(10)
+        try:
+            outcomes.append(dup(s, key, f'guard-concurrent-{n:04d}')['status'])
+        except APIError as error:
+            outcomes.append(error.code)
+    threads = [threading.Thread(target=call, args=(n,)) for n in (1, 2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(20)
+    assert sorted(outcomes) == ['duplicate_send_unresolved', 'queued'] and len(rows(s)) == 1
+
+
+# spec: ANYM-748
+def test_lookup_timeout_refuses_nothing_queued(guarded, monkeypatch):
+    from messaging_service import outgoing
+    s, archive, key = guarded
+    monkeypatch.setattr(outgoing, 'DUPLICATE_TIMEOUT_MS', 50)
+    monkeypatch.setattr(outgoing, 'unresolved_send', lambda c, *args: c.execute('SELECT pg_sleep(2)'))
+    error = dup_refused(s, key, 'guard-request-0001')
+    assert (error.code, error.status) == ('chat_guard_unavailable', 503)
+    assert payload(error, 'send_message')['retryable'] is True and rows(s) == []
+    monkeypatch.setattr(outgoing, 'unresolved_send',
+                        lambda *args: (_ for _ in ()).throw(psycopg.OperationalError('synthetic')))
+    assert dup_refused(s, key, 'guard-request-0001').code == 'chat_guard_unavailable'
+    assert rows(s) == []
+    # The session's own statement timeout is back after a successful lookup.
+    monkeypatch.undo()
+    with s.authorized(key, 'send_message') as (c, p):
+        before = c.execute("SELECT current_setting('statement_timeout') AS v").fetchone()['v']
+        outgoing.refuse_unresolved_duplicate(c, p, ACCOUNT, CHAT, 'guard-request-0001', 'Exact synthetic text',
+                                             'plain', False, False, None)
+        assert c.execute("SELECT current_setting('statement_timeout') AS v").fetchone()['v'] == before
+
+
+# spec: ANYM-748
+def test_send_message_tool_runs_the_duplicate_guard_over_rest_and_mcp(guarded):
+    s, archive, key = guarded
+    with TestClient(create_app(s, ['testserver'])) as client:
+        headers = {'Authorization': 'Bearer ' + key}
+        mcp = {**headers, 'Accept': 'application/json, text/event-stream'}
+        body = {'account': ACCOUNT, 'chat_id': CHAT, 'text': 'Exact synthetic text', 'request_id': 'guard-request-0001'}
+        assert client.post('/v1/send_message', headers=headers, json=body).status_code == 200
+        settle(s, 'guard-request-0001', 'unknown')
+        rest = client.post('/v1/send_message', headers=headers, json={**body, 'request_id': 'guard-request-0002'})
+        tool = client.post('/mcp', headers=mcp, json={'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call', 'params': {
+            'name': 'send_message', 'arguments': {**body, 'request_id': 'guard-request-0003'}}}).json()['result']
+        null = client.post('/v1/send_message', headers=headers,
+                           json={**body, 'request_id': 'guard-request-0004', 'allow_duplicate': None})
+        allowed = client.post('/v1/send_message', headers=headers,
+                              json={**body, 'request_id': 'guard-request-0005', 'allow_duplicate': True})
+        tools = client.post('/mcp', headers=mcp,
+            json={'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list', 'params': {}}).json()['result']['tools']
+    assert rest.status_code == 409 and rest.json()['error'] == 'duplicate_send_unresolved'
+    assert rest.json()['earlier_request_id'] == 'guard-request-0001' and rest.json()['earlier_status'] == 'unknown'
+    assert tool['isError'] is True and 'duplicate_send_unresolved' in str(tool)
+    assert null.status_code == 409 and allowed.status_code == 200
+    assert [r['request_id'] for r in rows(s)] == ['guard-request-0001', 'guard-request-0005']
+    properties = next(t for t in tools if t['name'] == 'send_message')['inputSchema']['properties']
+    # No schema default: the gateway inserts defaults into routed arguments.
+    assert 'allow_duplicate' in properties and 'default' not in properties['allow_duplicate']
+
+
 # spec: ANYM-736
 def test_unguarded_call_never_reaches_the_guard(guarded, monkeypatch):
     s, archive, key = guarded
