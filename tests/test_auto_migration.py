@@ -235,7 +235,7 @@ def test_a_range_that_does_not_qualify_pauses_with_todays_text(tmp_path, monkeyp
 
 
 # spec: ANYM-449
-@pytest.mark.parametrize("gate", ["call", "behind", "ahead", "store", "receiver"])
+@pytest.mark.parametrize("gate", ["call", "behind", "ahead", "store"])
 def test_an_admission_gate_waits_or_pauses_with_no_copy_container_or_production_write(tmp_path, monkeypatch, gate):
     host = MigrationHost(tmp_path, monkeypatch, {"051_synthetic_note.sql": NOTE})
     if gate == "call":
@@ -243,17 +243,12 @@ def test_an_admission_gate_waits_or_pauses_with_no_copy_container_or_production_
     elif gate in ("behind", "ahead"):
         host.version = 49 if gate == "behind" else 51
         host.applied.pop("50") if gate == "behind" else host.applied.update(host.pending)
-    elif gate == "store":
-        host.contents[f"{BASE}:{p.STORE_SOURCE}"] = STORE.replace("None", "0").encode()
     else:
-        del host.settings["migration"]["receiver_schema_max"]
+        host.contents[f"{BASE}:{p.STORE_SOURCE}"] = STORE.replace("None", "0").encode()
     outcome = host.deploy()
     assert host.steps == [] and not {"copy", "migrate", "status"} & set(host.events) and host.migration() is None
     if gate == "call":
         assert outcome["status"] == "waiting" and outcome["call_waits"]["count"] == 1 and host.paused() is None
-    elif gate == "receiver":
-        assert outcome["status"] == "waiting" and outcome["migration_waits"]["count"] == 1 and host.paused() is None
-        assert outcome["reason"].startswith("the backup receiver does not read schema 51 yet")
     else:
         assert outcome["status"] == "halted" and host.paused() == outcome["reason"]
         assert outcome["reason"] == ("the running release would fail on the new columns: deploy #352 first"
@@ -262,13 +257,17 @@ def test_an_admission_gate_waits_or_pauses_with_no_copy_container_or_production_
 
 
 # spec: ANYM-449
-def test_the_third_wait_in_a_row_for_the_receiver_pauses(tmp_path, monkeypatch):
+@pytest.mark.parametrize("receiver", ["behind", "absent"])
+def test_a_backup_receiver_behind_the_target_schema_holds_no_unattended_migration(tmp_path, monkeypatch, receiver):
+    # Owner 11-04: backups block nothing; a receiver that does not read the target yet is a backup follow-up.
     host = MigrationHost(tmp_path, monkeypatch, {"051_synthetic_note.sql": NOTE})
-    host.settings["migration"]["receiver_schema_max"] = 50
-    assert [host.deploy()["status"] for _ in range(2)] == ["waiting", "waiting"]
+    if receiver == "behind":
+        host.settings["migration"]["receiver_schema_max"] = 50
+    else:
+        del host.settings["migration"]["receiver_schema_max"]
     outcome = host.deploy()
-    assert outcome["status"] == "halted" and "waited 3 runs in a row: the backup receiver does not read schema 51" \
-        in outcome["reason"] and host.steps == [] and "copy" not in host.events
+    assert outcome["status"] == "deployed" and host.migration()["status"] == "migrated" and host.paused() is None
+    assert "migration_waits" not in outcome or not outcome["migration_waits"]
 
 
 # spec: ANYM-449

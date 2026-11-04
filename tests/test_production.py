@@ -3540,39 +3540,21 @@ def admission_skips(bin_dir, backup, hour, *, systemctl_fails=False, date_fails=
 
 
 # spec: ANYM-407
-def test_the_autodeploy_unit_runs_deploy_auto_and_never_starts_during_or_just_before_the_backup(tmp_path):
+def test_the_autodeploy_unit_runs_deploy_auto_at_any_hour_and_never_while_the_backup_unit_runs(tmp_path):
+    # Owner 11-04: no clock window; the only exclusion is the backup itself (unit state here, runner lock below).
     lines = autodeploy_unit()
     timer = (ROOT / "deploy/deedkit-autodeploy.timer").read_text()
     assert "/usr/local/lib/deedkit/production.py deploy --auto " in lines["ExecStart"]
     assert "personal-os-backup.service" in lines["After"] and "OnUnitInactiveSec=5min" in timer
+    assert "date" not in lines["ExecCondition"]
 
     def skipped(*arguments, **failures):
         return admission_skips(tmp_path / "bin", *arguments, **failures)
 
-    assert not skipped("inactive", "12") and not skipped("failed", "19") and not skipped("inactive", "00")
-    assert skipped("activating", "12") and skipped("active", "03") and skipped("deactivating", "12")
-    assert skipped("inactive", "16") and skipped("inactive", "17") and skipped("inactive", "18")
+    assert not any(skipped(state, f"{hour:02d}") for state in ("inactive", "failed") for hour in range(24))
+    assert skipped("activating", "12") and skipped("active", "17") and skipped("deactivating", "18")
     # A failed or unexpected read never admits a deploy.
-    assert skipped("inactive", "12", systemctl_fails=True) and skipped("inactive", "12", date_fails=True)
-    assert skipped("", "12") and skipped("inactive", "garbage") and skipped("inactive", "24")
-
-
-# spec: ANYM-407
-def test_a_deploy_admitted_before_the_backup_window_ends_before_the_daily_backup_starts(tmp_path):
-    # personal-os-backup.timer starts the backup at 18:00 UTC; a deploy holding the runner lock then would fail
-    # the backup and its retries (StartLimitBurst=3 in 8 hours, 30 minutes apart) until the backup is lost for the day.
-    lines = autodeploy_unit()
-    seconds = {"h": 3600, "min": 60, "s": 1}
-
-    def duration(value):
-        number, unit = re.fullmatch(r"(\d+)(h|min|s)", value).groups()
-        return int(number) * seconds[unit]
-
-    admitted = [hour for hour in range(18) if not admission_skips(tmp_path / "bin", "inactive", f"{hour:02d}")]
-    latest_start = (admitted[-1] + 1) * 3600 - 1  # the last second of the last admitted hour before 18:00
-    # The single ExecStart follows the hour read at once and gets TimeoutStartSec; then systemd stops it within TimeoutStopSec.
-    latest_end = latest_start + duration(lines["TimeoutStartSec"]) + duration(lines["TimeoutStopSec"])
-    assert latest_end < 18 * 3600 - 30 * 60  # half an hour before the backup, whatever the run's length
+    assert skipped("inactive", "12", systemctl_fails=True) and skipped("", "12") and skipped("garbage", "12")
 
 
 # spec: ANYM-407
