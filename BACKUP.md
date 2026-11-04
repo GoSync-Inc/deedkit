@@ -621,3 +621,5 @@ Expected size and retention: the backup server and the R2 prefix hold one protec
 candidate, no older history; with `expected_archive_bytes` of 1 GiB that is about 2 GiB of ciphertext plus the
 verifier's scratch for one plaintext copy during each verification. A deleted record leaves the backup at the next
 verified replacement of the protected point (ANYM-730).
+
+Installation, activation, the first protected snapshot and the restore drill are one reviewed operation plan: [docs/operations/recordings-archive-activation.md](docs/operations/recordings-archive-activation.md) (ANYM-731).
