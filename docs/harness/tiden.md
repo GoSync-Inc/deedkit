@@ -112,6 +112,11 @@ of the raw verdict.
 New work comes from the owner, agent feedback (`submit_feedback`), production issue triage and
 audits. A worker that finds work outside its task reports it to the orchestrator.
 
+Covered defects, infra and refactors take the short `Problem / Expected / Proof` route in
+task-flow.md, linking the existing spec/issue; no duplicate card, research or wave plan. New
+capabilities or changed product criteria keep intake below. Real access/data/live-action and
+owner gates apply equally to both routes.
+
 1. **Triage.** Search Tiden main and open branches. A match, merged or not, is updated, not
    duplicated. A new feature or epic idea from agents (feedback, audits, triage or any other
    source) is written as a draft without asking the owner first (owner 10-26): its reviews make
@@ -127,8 +132,8 @@ audits. A worker that finds work outside its task reports it to the orchestrator
    round with the product-manager prompt, which also checks `How others solve it` (adopt | adapt |
    build, sized to the task) and whether the card should be split; cards that set a contract on
    access, data, migrations or release Astra r1 and at most one scoped recheck, other contract cards
-   Fable or the author's self-check (reviews.md, Rounds 6); production operation plans Astra r1 by
-   risk tier, a Sol recheck only after a blocking or major finding (Rounds 7); small cards the author's
+   Fable or the author's self-check (reviews.md, Rounds 6); production operation plans at most
+   one round, none for a tested runbook (Rounds 7); small cards the author's
    self-check. A product card that is also such a contract card gets Fable + Astra r1; no
    separate Sol correctness round. Reviewers first
    judge whether the card should exist and may shrink or reject it.
@@ -163,10 +168,10 @@ Ready: <date>, <reviews and verdicts>; asked by <owner, date | agent or MCP rela
 
 A card that changes a schema splits its migrations (owner 10-30): the expand part (tables,
 columns, indexes, grants on objects the same change creates) in its own migration, which rides
-unattended autodeploy (a `CONCURRENTLY` index the runner cannot apply: by hand, reviews.md
-Rounds 7); backfills, triggers and grants on existing objects in a separate one, the only part
-that needs a hand release. The split decides how each part is released, not its review: role
-SQL, grants included, keeps its Astra r1 (process.md section 2). `Expected paths:` names both
+unattended autodeploy; backfills, triggers, grants on existing objects and a `CONCURRENTLY`
+index the runner cannot apply in a separate one, released at once (by hand where the tool
+cannot; no backup, window or freeze unless it deletes or rewrites user data, process.md section
+2). Role SQL, grants included, keeps its Astra r1. `Expected paths:` names both
 migrations, `Evidence to close:` the production deploy of each.
 
 Categories: defect = current behaviour breaks a contract or spec; feature = a new owner-visible
@@ -180,11 +185,10 @@ with merged PRs (the project names its reference PRs). Agents give points only; 
 come only from the estimate script's measurements of the repository (the owner's `estimate-task`
 and `estimate-backlog` skills, run on described cards only; no `--task` at card intake: the
 orchestrator logs the task's forecast, orchestration.md, Estimates), never from a model's guess. A 13 or
-21 becomes a parent with child stories of at most 8, each one PR. For a new module, an
-infrastructure mechanism, an external integration or more than ~300 new lines, `How others
-solve it` is a 30–60 minute study
-(open source, standards, built-ins of the platforms the project uses), and the worker
-re-checks it for 10–15 minutes before starting.
+21 becomes a parent with child stories of at most 8, each one PR. For a new module,
+infrastructure mechanism or external integration, `How others solve it` answers specific open
+adopt/adapt/build questions using existing research first. Set a time box by uncertainty and
+consequence; neither line count nor the worker starting triggers another mandatory study.
 
 ### Brainstorm and vision
 
@@ -346,7 +350,8 @@ spec text is current at merge. One `main` push can carry several squashes (a mer
 batch): a project that groups or batches makes B merge the Tiden branch of every squash in the push's
 range, not only the last one's (its Boss, with the CI change; orchestration.md, Merging). This holds for every PR that changes behaviour; a PR that delivers no new card and changes no spec text names no branch.
 Each deliverable has its own branch, because B merges only the specs a PR names. A project without
-check A and sync B in CI does those steps by hand (differences.md).
+check A and sync B in CI does those steps by hand (differences.md); in pre-production mode the
+merging agent does them without a window (orchestration.md, Pre-production mode).
 
 Every PR description carries `Spec impact:` (the `Spec:` and `Delivers:` IDs, each with its
 flags, such as a criterion deferred or not built, and the anchors it adds, or `none`) and

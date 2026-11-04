@@ -575,7 +575,7 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
    off, ANYM-607) keeps a restore point anyway: unattended, its pre-migration copy (Database copies); by
    hand, `copy-database` first. A critical release needs the backup gate above (a fresh backup and its
    restore proof, never a reused daily backup), `copy-database` first and one Astra review round of
-   its plan (reviews.md Rounds 7, AGENTS.md section 2). The release kit or PR names each file's tier.
+   its plan (harness process.md section 2, reviews.md Rounds 7). The release kit or PR names each file's tier.
 
    Accepted risk (owner 10-29, 11-01 and 11-04, quoted above): if a non-critical `migrate` destroys or
    corrupts data, a restore returns the database to the latest daily backup (about 24 hours old at most
