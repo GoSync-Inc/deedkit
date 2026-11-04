@@ -819,6 +819,175 @@ def test_debounce_flushes_at_max_wait(seeded, tmp_path):
     assert all(later - first <= 300 for first, later in zip([0] + [t + 5 for t in emitted_at], emitted_at))
 
 
+NO_LAG = {'pending_hints': 0, 'oldest_unfinished_age_s': None, 'next_attempt_in_s': None}
+
+
+def lag_key(store, principal='lag-reader', accounts=('telegram-demo',)):
+    permissions = ['read', 'subscription-write', 'subscription-ack']
+    return store.issue_key(principal, list(accounts), permissions=permissions, key_permissions=permissions)
+
+
+def bind(store, token, sid, tmp_path, principal='lag-reader'):
+    """A synthetic receiver of the key bound to the subscription."""
+    from uuid import uuid4
+    from messaging_service.event_delivery import register_receiver
+    secret = tmp_path / 'receiver.key'
+    secret.write_bytes(b'synthetic receiver secret bytes 0123456789')
+    secret.chmod(0o600)
+    with store.authorized(token) as (_, p):
+        key_id = str(p['key_id'])
+    rid = str(uuid4())
+    register_receiver(store, rid, principal, key_id, 'https://hooks.example.test/wake', str(secret),
+        resolver=lambda *a, **k: ['93.184.216.34'])
+    store.configure_subscription_delivery(token, sid, store.get_subscription(token, sid)['version'], rid)
+    return sid
+
+
+def lags(store, token, sid):
+    """The delivery view's lag through get, wait and fetch, in that order."""
+    import asyncio
+    from messaging_service.subscription_consumption import wait_for_subscription_events
+    waited = asyncio.run(wait_for_subscription_events(store, token, sid, timeout=0))
+    return [store.get_subscription(token, sid)['delivery']['lag'], waited['subscription']['delivery']['lag'],
+        store.fetch_subscription_events(token, sid)['subscription']['delivery']['lag']]
+
+
+def freeze(store, monkeypatch):
+    """The lag's clock stops at the database's current time; hint times are set relative to it."""
+    from messaging_service import subscriptions
+    with store.pool.connection() as c:
+        now = c.execute('SELECT clock_timestamp() AS now').fetchone()['now']
+    monkeypatch.setattr(subscriptions, '_observed_at', lambda c: now)
+    return now
+
+
+def seconds(value):
+    from datetime import timedelta
+    return timedelta(seconds=value)
+
+
+def hints_set(store, sid, assignments, *args):
+    with store.pool.connection() as c:
+        c.execute('UPDATE subscription_outbox SET ' + assignments + ' WHERE subscription=%s', (*args, sid))
+
+
+def hint_copy(store, sid, state, request_id, created, due, lease_until=None):
+    """A copy of the subscription's hint in another state."""
+    with store.pool.connection() as c:
+        c.execute('''INSERT INTO subscription_outbox(subscription,subscription_version,receiver,through_position,kind,
+            request_id,state,created_at,next_attempt_at,lease_until,finished_at)
+            SELECT subscription,subscription_version,receiver,through_position,kind,%s,%s,%s,%s,%s,
+            CASE WHEN %s IN ('delivered','dead_letter','cancelled') THEN clock_timestamp() END
+            FROM subscription_outbox WHERE subscription=%s ORDER BY created_at LIMIT 1''',
+            (request_id, state, created, due, lease_until, state, sid))
+
+
+# spec: ANYM-752
+def test_lag_reads_nulls_without_unfinished_hints_and_the_age_of_the_oldest_pending_one(seeded, tmp_path,
+        monkeypatch):
+    store, _, _ = seeded
+    token = lag_key(store)
+    now = freeze(store, monkeypatch)
+    assert store.get_subscription(token, create(store, token)['subscription_id'])['delivery']['lag'] == NO_LAG
+    sid = bind(store, token, create(store, token)['subscription_id'], tmp_path)
+    assert lags(store, token, sid) == [NO_LAG] * 3
+    emit(store)
+    match_subscriptions(store)
+    # The age rounds down: 3600.7 s is 3600.
+    hints_set(store, sid, 'created_at=%s,next_attempt_at=%s', now - seconds(3600.7), now)
+    assert lags(store, token, sid) == [{'pending_hints': 1, 'oldest_unfinished_age_s': 3600,
+        'next_attempt_in_s': 0}] * 3
+    assert store.get_subscription(token, sid)['delivery']['hint_counts'] == {'pending': 1}
+
+
+# spec: ANYM-752
+def test_lag_counts_leased_hints_and_leaves_out_delivered_dead_lettered_and_cancelled_ones(seeded, tmp_path,
+        monkeypatch):
+    store, _, _ = seeded
+    token = lag_key(store)
+    now = freeze(store, monkeypatch)
+    sid = bind(store, token, create(store, token)['subscription_id'], tmp_path)
+    emit(store)
+    match_subscriptions(store)
+    hints_set(store, sid, 'created_at=%s,next_attempt_at=%s', now - seconds(60), now + seconds(3600))
+    # Finished hints older and due sooner than any unfinished one change nothing.
+    for number, state in enumerate(('delivered', 'dead_letter', 'cancelled')):
+        hint_copy(store, sid, state, f'lag-finished-{number}', now - seconds(10800), now - seconds(10800))
+    hint_copy(store, sid, 'leased', 'lag-leased', now - seconds(7200), now - seconds(3600), now + seconds(600))
+    assert store.get_subscription(token, sid)['delivery']['hint_counts'] == {
+        'cancelled': 1, 'dead_letter': 1, 'delivered': 1, 'leased': 1, 'pending': 1}
+    # The leased copy is the oldest unfinished hint and the end of its lease the earliest attempt.
+    assert lags(store, token, sid) == [{'pending_hints': 2, 'oldest_unfinished_age_s': 7200,
+        'next_attempt_in_s': 600}] * 3
+
+
+# spec: ANYM-752
+def test_lag_schedules_a_pending_hint_by_next_attempt_and_a_leased_one_by_its_lease(seeded, tmp_path, monkeypatch):
+    store, _, _ = seeded
+    token = lag_key(store)
+    now = freeze(store, monkeypatch)
+    sid = bind(store, token, create(store, token)['subscription_id'], tmp_path)
+    emit(store)
+    match_subscriptions(store)
+    cases = [
+        # A future attempt counts down to it, rounded up: 0.4 s is 1, never "due now".
+        ('pending', now + seconds(3600), None, 3600),
+        ('pending', now + seconds(0.4), None, 1),
+        # A due or past attempt reads 0.
+        ('pending', now, None, 0),
+        ('pending', now - seconds(1), None, 0),
+        # A leased hint is scheduled by its lease, though leasing left next_attempt_at in the past.
+        ('leased', now - seconds(3600), now + seconds(600), 600),
+        ('leased', now - seconds(3600), now + seconds(0.4), 1),
+        # An ended lease is due again.
+        ('leased', now - seconds(3600), now, 0),
+        ('leased', now + seconds(3600), now - seconds(0.5), 0)]
+    for state, due, lease_until, expected in cases:
+        hints_set(store, sid, 'state=%s,next_attempt_at=%s,lease_until=%s', state, due, lease_until)
+        assert [lag['next_attempt_in_s'] for lag in lags(store, token, sid)] == [expected] * 3, (state, due, lease_until)
+
+
+# spec: ANYM-752
+def test_lag_of_two_subscriptions_does_not_mix(seeded, tmp_path, monkeypatch):
+    store, _, _ = seeded
+    token = lag_key(store)
+    now = freeze(store, monkeypatch)
+    old = bind(store, token, create(store, token)['subscription_id'], tmp_path)
+    new = bind(store, token, create(store, token)['subscription_id'], tmp_path)
+    emit(store)
+    match_subscriptions(store)
+    hints_set(store, old, 'created_at=%s,next_attempt_at=%s', now - seconds(3600), now + seconds(30))
+    hints_set(store, new, 'created_at=%s,next_attempt_at=%s', now - seconds(5), now + seconds(90))
+    assert lags(store, token, old) == [{'pending_hints': 1, 'oldest_unfinished_age_s': 3600,
+        'next_attempt_in_s': 30}] * 3
+    assert lags(store, token, new) == [{'pending_hints': 1, 'oldest_unfinished_age_s': 5,
+        'next_attempt_in_s': 90}] * 3
+
+
+# spec: ANYM-752
+def test_lag_leaves_out_a_hint_of_a_reference_the_key_cannot_see(seeded, tmp_path, monkeypatch):
+    store, _, _ = seeded
+    now = freeze(store, monkeypatch)
+    store.set_dynamic_subscriptions(True)
+    try:
+        token = lag_key(store, 'dynamic-reader')
+        chat_message(store, 'telegram-demo-chat-2', 'demo-tg-x')
+        sid = bind(store, token, store.create_subscription(token, sources=ALL_VISIBLE)['subscription_id'], tmp_path,
+            'dynamic-reader')
+        emit(store, 'demo-tg-x')
+        match_subscriptions(store)
+        hints_set(store, sid, 'created_at=%s,next_attempt_at=%s', now - seconds(3600), now + seconds(30))
+        assert lags(store, token, sid) == [{'pending_hints': 1, 'oldest_unfinished_age_s': 3600,
+            'next_attempt_in_s': 30}] * 3
+        store.set_access('dynamic-reader', chats=['telegram-demo-chat'])
+        # Back to pending, as if the scope change had not cancelled it: its only reference is hidden now.
+        hints_set(store, sid, "state='pending',error_code=NULL,finished_at=NULL")
+        assert lags(store, token, sid) == [NO_LAG] * 3
+        assert store.get_subscription(token, sid)['delivery']['hint_counts'] == {}
+    finally:
+        store.set_dynamic_subscriptions(False)
+
+
 def failure_keys(store):
     permissions = ['read', 'send', 'subscription-write']
     return [store.issue_key('failure-agent', ['send-fixture'], permissions=permissions,

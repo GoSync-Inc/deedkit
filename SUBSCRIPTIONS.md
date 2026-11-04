@@ -184,6 +184,38 @@ What can add more than a few seconds:
   `Retry-After` (up to an hour), over at most 8 attempts; each attempt is a row with `at`
   and `latency_ms`. Attempts are kept 7 days.
 
+### Queue lag, late events and shared endpoints (ANYM-752)
+
+**Lag now.** `delivery.lag` in `get_subscription` and in every `fetch_subscription_events`
+and `wait_for_subscription_events` response is `{pending_hints, oldest_unfinished_age_s,
+next_attempt_in_s}`, counted over exactly the hints `hint_counts` counts (a hint whose
+references the key cannot see now adds nothing). `pending_hints` is the number of
+unfinished hints (`pending` or `leased`); `oldest_unfinished_age_s` is the age in seconds of
+the oldest of them; `next_attempt_in_s` is the seconds until the earliest of them is due: a
+`pending` hint at its next attempt, a `leased` one when its lease ends (an attempt is in
+flight until then). It reads 0 when a hint is due now or overdue. With nothing unfinished it
+is `{pending_hints: 0, oldest_unfinished_age_s: null, next_attempt_in_s: null}`. A large
+age with `next_attempt_in_s` 0 means the dispatcher has not reached the hint (admission or
+budget, above); a large `next_attempt_in_s` means a retry backoff or a hold. The lag is the
+queue's state now; per-event times stay in `get_subscription_events` (`sent_at`,
+`observed_at`, `matched_at`, `delivered_at`, above) and per-attempt times in
+`list_delivery_attempts`.
+
+**Late events.** A webhook reference's `occurred_at` is the journal commit time of the
+event (`observed_at` in `get_subscription_events`), not the provider's send time; read
+`sent_at` and `delivered_at` there to see how late it came. One event can sit in several
+hints (a later hint, a resume wake), and the same event reaches every subscription that
+matches it. De-duplicate events by `event_id` together with `subscription_id`; the
+`webhook-id` (the hint ID) only de-duplicates retries of one hint. The payload has no
+"already handled" flag: an agent that also acted by hand compares the reference's
+`chat_id` and `message_id` with what it did.
+
+**One endpoint for several subscriptions.** Any number of subscriptions of one key may bind
+to the same endpoint (`configure_subscription_delivery(..., endpoint_id)`), each with its
+own chat selector. A receiver routes by the envelope's `subscription_id` and `label` and by
+each reference's `chat_id`. The cap of endpoints per key is the operator setting
+`DELIVERY_MAX_ENDPOINTS_PER_KEY` (Limits, below); raising it is the operator's decision.
+
 ## Schema 32: explicit consumption and registered hints
 
 Schema 32 adds independent subscription consumption. `fetch_subscription_events`
