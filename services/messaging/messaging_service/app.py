@@ -92,6 +92,12 @@ OMITTED_WHEN_NONE = {'create_subscription':('chat_ids','sources','wake_rules','r
     # ANYM-736: an omitted guard keeps every request, hash and stored row as before.
     # ANYM-748: so does an omitted allow_duplicate.
     'send_message':('expected_last_message_id','guard','allow_duplicate'),'get_send_status':('send_id','request_id')}
+# ANYM-748: the rule in the argument's schema; the tool description is at its length cap.
+ALLOW_DUPLICATE=('chat_id sends: true sends even while your earlier send of the same text, format, link_preview, '
+    'allow_lossy and reply target to this chat is still queued, dispatching or unknown and under 60 minutes old; '
+    'otherwise that call is refused duplicate_send_unresolved (409) with earlier_request_id, earlier_status and a '
+    'get_send_status next_call, and nothing is queued. Not exactly-once delivery: changed text, an elapsed window '
+    'or a sent or failed earlier send passes; phone and username sends, messages_send and its steps are not covered.')
 def no_schema_default(schema):
     """ANYM-736: an optional guard argument declares no default, so the gateway never inserts a null for it."""
     schema.pop('default',None)
@@ -450,7 +456,8 @@ def register_send_tools(mcp, call, async_call, read):
                      expected_last_message_id: Annotated[StrictStr | None,Field(json_schema_extra=no_schema_default)]=None,
                      guard: Annotated[Literal['any_message','outgoing_only'] | None,
                                       Field(json_schema_extra=no_schema_default)]=None,
-                     allow_duplicate: Annotated[StrictBool | None,Field(json_schema_extra=no_schema_default)]=None
+                     allow_duplicate: Annotated[StrictBool | None,Field(description=ALLOW_DUPLICATE,
+                                                                          json_schema_extra=no_schema_default)]=None
                      ) -> dict[str,Any]:
         """Send exact confirmed content using this account's existing collector.
 
@@ -483,15 +490,12 @@ def register_send_tools(mcp, call, async_call, read):
         newer_outgoing_count, first_newer_message_id, newest_message_id and a next_call that reads them: read, then
         decide again. guard any_message (default) counts any newer visible message, your own earlier send included;
         outgoing_only counts only the owner's. A retry with the same request_id returns the first result. The guard
-        sees only the archive at that moment (not messages not yet ingested or edited) and cannot close the race
-        before the provider send; it does not replace the owner's confirmation. An unknown ID or a phone/username
+        sees only the archive at that moment and cannot close the race
+        before the provider send. An unknown ID or a phone/username
         recipient is invalid_parameters expected_message_unknown; chat_guard_unavailable (503) queued nothing.
         After a lost response use get_send_status with request_id.
-        Duplicate guard, chat_id sends: the same text, format, link_preview, allow_lossy and reply target to the same
-        chat as your earlier send that is still queued, dispatching or unknown and under 60 minutes old is refused
-        duplicate_send_unresolved (409) with earlier_request_id, earlier_status and a get_send_status next_call;
-        nothing is queued. allow_duplicate true sends anyway. Not exactly-once delivery: changed text, an elapsed
-        window or a sent or failed earlier send passes; phone and username sends are not covered.
+        Same content to the same chat while your earlier send is queued, dispatching or unknown (60 min):
+        duplicate_send_unresolved (409); see allow_duplicate.
         """
         guarded={k:v for k,v in (('expected_last_message_id',expected_last_message_id),('guard',guard),
                                  ('allow_duplicate',allow_duplicate)) if v is not None}

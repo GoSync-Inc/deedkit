@@ -566,14 +566,15 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
     return result(row,c,p)
 
 
-# ANYM-748: an earlier send of the same content counts while it is unresolved and this recent.
+# ANYM-748: an earlier send of the same content counts while it is unresolved and this recent. The window uses the
+# stable statement_timestamp(), so it bounds the outgoing_principal_time(principal,created_at) index scan.
 DUPLICATE_WINDOW_MINUTES=60
 DUPLICATE_TIMEOUT_MS=1000
 DUPLICATE_SQL=f"""SELECT request_id,status FROM outgoing_messages
     WHERE principal=%s AND account=%s AND chat=%s AND source_text=%s AND source_format=%s AND render_policy=%s
       AND reply_provider_id IS NOT DISTINCT FROM %s AND request_id<>%s AND left(request_id,{len(CHILD_KEY_PREFIX)})<>%s
       AND (status IN ('dispatching','unknown') OR status='queued' AND expires_at>clock_timestamp())
-      AND created_at>clock_timestamp()-interval '{DUPLICATE_WINDOW_MINUTES} minutes'
+      AND created_at>statement_timestamp()-interval '{DUPLICATE_WINDOW_MINUTES} minutes'
     ORDER BY created_at DESC LIMIT 1"""
 
 

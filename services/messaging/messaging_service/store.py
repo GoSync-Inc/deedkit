@@ -380,9 +380,10 @@ class Store:
                         # ANYM-665: a reviewed recovery hint set on the database error survives the conversion.
                         if failure is not error and hasattr(error,'next_action'):failure.next_action=error.next_action
                         p = p or getattr(error, 'audit_identity', None)
-                        # transaction_timeout ends the server session (ANYM-265): nothing was committed, and the
-                        # failure is audited on a fresh connection instead of the closed one.
-                        late = isinstance(error, TransactionTimeout) and c.closed
+                        # transaction_timeout ends the server session (ANYM-265), and so does a lost connection: nothing
+                        # was committed, and the failure is audited on a fresh connection instead of the closed one, so
+                        # a known refusal (ANYM-748: chat_guard_unavailable, nothing queued) is never masked.
+                        late = c.closed
                     if operation:
                         outcome = 'ok' if failure is None else ('denied' if isinstance(failure, APIError) else 'error')
                         entry = (p, operation, outcome,

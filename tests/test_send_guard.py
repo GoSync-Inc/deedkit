@@ -703,6 +703,46 @@ def test_lookup_timeout_refuses_nothing_queued(duplicated, monkeypatch):
 
 
 # spec: ANYM-748
+def test_the_60_minute_window_bounds_the_principal_time_index(duplicated):
+    import json
+    from psycopg.types.json import Jsonb
+    from messaging_service import outgoing
+    s, archive, key = duplicated
+    dup(s, key)
+    with s.authorized(key, 'send_message') as (c, p):
+        c.execute('SET LOCAL enable_seqscan=off')
+        plan = c.execute('EXPLAIN (FORMAT JSON) ' + outgoing.DUPLICATE_SQL, (p['id'], ACCOUNT, CHAT,
+            'Exact synthetic text', 'plain', Jsonb({'link_preview': False, 'allow_lossy': False}), None,
+            'guard-request-0002', outgoing.CHILD_KEY_PREFIX)).fetchone()
+    def conditions(node):
+        yield node.get('Index Cond', '')
+        for child in node.get('Plans', []):
+            yield from conditions(child)
+    found = list(conditions(plan['QUERY PLAN'][0]['Plan']))
+    # A volatile clock in the bound could never be an index condition: the scan would read the whole history.
+    assert any('created_at' in condition for condition in found), json.dumps(plan)
+
+
+# spec: ANYM-748
+def test_a_lost_connection_during_the_lookup_is_chat_guard_unavailable_and_audited(duplicated, monkeypatch):
+    from messaging_service import outgoing
+    s, archive, key = duplicated
+    # The lookup's own session ends, as a server restart or network loss would end it.
+    monkeypatch.setattr(outgoing, 'unresolved_send',
+                        lambda c, *args: c.execute('SELECT pg_terminate_backend(pg_backend_pid())'))
+    error = dup_refused(s, key, 'guard-request-0001')
+    assert (error.code, error.status) == ('chat_guard_unavailable', 503) and error.audited
+    with TestClient(create_app(s, ['testserver'])) as client:
+        rest = client.post('/v1/send_message', headers={'Authorization': 'Bearer ' + key}, json={
+            'account': ACCOUNT, 'chat_id': CHAT, 'text': 'Exact synthetic text', 'request_id': 'guard-request-0002'})
+    assert rest.status_code == 503 and rest.json()['error'] == 'chat_guard_unavailable'
+    assert rows(s) == []
+    with s.pool.connection() as c:
+        audits = c.execute("SELECT outcome,error_code FROM audit_log WHERE operation='send_message'").fetchall()
+    assert [(a['outcome'], a['error_code']) for a in audits] == [('denied', 'chat_guard_unavailable')] * 2
+
+
+# spec: ANYM-748
 def test_send_message_tool_runs_the_duplicate_guard_over_rest_and_mcp(duplicated):
     s, archive, key = duplicated
     with TestClient(create_app(s, ['testserver'])) as client:
