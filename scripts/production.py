@@ -5702,9 +5702,25 @@ class Enrollment:
 
     def backup(self):
         self.step("backup")
-        self.save(before_images=self.runtime_images())
         directory = self.state / f"enrollment-{self.module}-{self.sha[:12]}"
         directory.mkdir(mode=0o700)
+        self.save(before_images=self.runtime_images())
+        # The gateway project is the one the enrollment edits: plan A's own snapshots are taken from the edited files, so
+        # the pre-run resolved configuration is kept here, with the images that run now, to put the gateway back.
+        gateway = next(project for project in self.settings["projects"] if "gateway" in project["services"].values())
+        document, running = snapshot(gateway)
+        before = copy.deepcopy(document)
+        for service in before["services"].values():
+            service.pop("build", None)
+        for service, identity in running.items():
+            before["services"][service]["image"] = identity["image"]
+        path = directory / "gateway.pre-run.json"
+        with os.fdopen(new_file(path), "w") as handle:
+            json.dump(escaped(before), handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        self.receipt["pre_run"] = {"project": gateway["name"], "file": str(path),
+                                   "images": {service: identity["image"] for service, identity in running.items()}}
         sources = {"production": self.paths["production"], "http": self.paths["http"],
                    "policy": self.http["http_release"]["gateway_policy"]}
         for name, source in sources.items():
@@ -5987,6 +6003,16 @@ class Enrollment:
             content = (json.dumps(value, indent=2) + "\n").encode()
         replace_like(item["path"], content)
 
+    def restore_gateway(self):
+        """Recreate the gateway services from the pre-run resolved configuration and image (the way `rollback` restores
+        a project), without a call running."""
+        item = self.receipt["pre_run"]
+        command = ["docker", "compose", "--profile", "*", "--project-name", item["project"], "-f", item["file"]]
+        wait_for_calls(self.settings, time.monotonic() + CALL_WAIT)
+        run(command + ["stop", *item["images"]])
+        run(command + ["up", "-d", "--no-build", "--pull", "never", "--no-deps", "--wait", "--wait-timeout", "180",
+                       *item["images"]])
+
     def stopped(self, exc):
         message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
         code = getattr(exc, "code", None)
@@ -6013,9 +6039,12 @@ class Enrollment:
             elif attempted and not (outcome.get("status") == "unhealthy" and (release / "rollback.json").exists()):
                 self.save(status="unknown")
                 return self.result("stopped", message, code, "production state is unknown, inspect it; nothing more was changed")
-            if attempted and self.runtime_images() != self.receipt["before_images"]:
-                # The rollback snapshots were prepared from the edited configuration: the images must be the pre-run ones.
-                raise Refused("an existing project does not run its pre-run image after the rollback")
+            if attempted:
+                # The rollback snapshots were prepared from the edited configuration: the gateway is put back from the
+                # pre-run one, and every existing project must run its pre-run image.
+                self.restore_gateway()
+                if self.runtime_images() != self.receipt["before_images"]:
+                    raise Refused("an existing project does not run its pre-run image after the rollback")
             files = self.receipt["files"]
             if "after_sha256" in files.get("policy", {}):
                 self.restore("policy", files["policy"].get("revision"))
@@ -6030,7 +6059,7 @@ class Enrollment:
             return self.result("stopped", message, code, "recovery failed; production state is unknown, inspect it")
         self.save(status="stopped")
         return self.result("stopped", message, code, f"the module was stopped and the configuration restored; the pause stays; undo is not needed ({undo} refuses)"
-                           + ("; a rolled-back plan A gateway keeps the module network until it is next restarted from the restored files"
+                           + ("; the gateway was recreated from its pre-run configuration"
                               if (self.state / self.sha / "attempted.json").exists() else ""))
 
     def result(self, status, message, code, recovery):

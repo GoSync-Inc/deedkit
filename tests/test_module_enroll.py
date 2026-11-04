@@ -803,7 +803,7 @@ class Applier(Enroller):
         for directory in (self.http_state, tmp_path / "global"):
             directory.mkdir(mode=0o700)
         self.identities, self.before_identities = {"deedkit-gateway": "old"}, {"deedkit-gateway": "old"}
-        self.rollback_leaves, self.inspect_fails = False, False
+        self.restore_leaves, self.inspect_fails = False, False
         self.admission, self.isolated, self.confined, self.controlled, self.healthy = "required", True, True, True, True
         self.up = None
         self.repo["scripts/recordings_egress_check.py"] = b"print('ok')\n"
@@ -821,8 +821,11 @@ class Applier(Enroller):
         monkeypatch.setattr(p, "prepare", self.prepare)
         monkeypatch.setattr(p, "apply", self.release_apply)
         monkeypatch.setattr(p, "rollback", self.release_rollback)
-        monkeypatch.setattr(p, "snapshot", lambda project, **kwargs: ({}, {"gateway": {"image": self.identities.get(
-            project["name"], "enroll")}}))
+        monkeypatch.setattr(p, "snapshot", lambda project, **kwargs: (
+            {"name": project["name"], "services": {"gateway": {"image": "built", "build": {"context": "."},
+                                                                 "networks": ["integration"]}}},
+            {"gateway": {"image": self.identities.get(project["name"], "enroll")}}))
+        monkeypatch.setattr(p, "wait_for_calls", lambda settings, deadline: self.event("calls-wait"))
         real_replace, real_drift = p.replace_file, p.configuration_drift
         def replace(path, content, uid, gid, mode):
             real_replace(path, content, uid, gid, mode)
@@ -883,6 +886,12 @@ class Applier(Enroller):
     def run(self, argv, **kwargs):
         if argv[0] == "docker":
             sub = argv[1]
+            if sub == "compose" and any(str(item).endswith("gateway.pre-run.json") for item in argv):
+                self.calls.append(argv)
+                self.event("restore")
+                if "up" in argv and not self.restore_leaves:
+                    self.identities = dict(self.before_identities)
+                return ""
             if sub == "compose" and "up" in argv:
                 self.calls.append(argv)
                 self.up = (argv, kwargs.get("env"))
@@ -955,7 +964,7 @@ class Applier(Enroller):
 
     def release_rollback(self, settings, sha, http=None):
         self.event("rollback")
-        if not self.rollback_leaves:
+        if not self.restore_leaves:
             self.identities = dict(self.before_identities)
         p.write(self.state / sha / "rollback.json", {"sha": sha, "status": "rolled-back"})
 
@@ -1138,6 +1147,7 @@ def test_a_failure_before_promotion_restores_the_projects_the_files_and_the_poli
     assert host.names().count("stop") == (1 if started else 0)
     assert host.names().count("rollback") == (1 if rolled else 0)
     assert host.identities == host.before_identities
+    assert host.names().count("restore") == (2 if rolled else 0)  # the gateway, from its pre-run configuration
     assert "prepare" not in host.names() or point in ("apply", "seamless prepare")
 
 
@@ -1258,9 +1268,21 @@ def test_the_isolation_probe_covers_every_serving_gateway_but_writes_no_address(
 
 
 # spec: ANYM-746
+def test_the_gateway_is_recreated_from_its_pre_run_configuration_not_the_edited_one(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    fail_at(host, "seamless prepare")
+    item = host.receipt()["pre_run"]
+    document = json.loads(Path(item["file"]).read_text())
+    assert document == {"name": "deedkit-gateway", "services": {"gateway": {"image": "old", "networks": ["integration"]}}}
+    restore = [argv for argv in host.calls if item["file"] in argv]
+    assert [argv[argv.index(item["file"]) + 1] for argv in restore] == ["stop", "up"] and "--no-build" in restore[1]
+    assert host.names().index("rollback") < host.names().index("restore")
+
+
+# spec: ANYM-746
 def test_a_rollback_that_leaves_an_existing_project_on_another_image_is_an_unknown_state(tmp_path, monkeypatch):
     host = Applier(tmp_path, monkeypatch)
-    host.rollback_leaves = True
+    host.restore_leaves = True
     result = fail_at(host, "seamless prepare")
     assert host.receipt()["status"] == "unknown" and "unknown, inspect it" in result["recovery"]
     assert json.loads(host.config_path.read_text())["projects"][-1]["name"] == "deedkit-recordings"  # not restored

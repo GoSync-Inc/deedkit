@@ -2035,9 +2035,9 @@ of the module's card.
 for byte and the policy with a revision above anything a gateway may have loaded (never a lower number), stops only the new
 module (`docker compose stop`, never `down`, never a database), keeps the pause and writes the failing step to
 `enrollment.json` (`status: stopped`). A recovery that fails says `production state is unknown, inspect it` and changes
-nothing more; so does a rollback after which an existing project does not run the image it ran before the enrollment (plan A's
-snapshots are prepared from the edited configuration, so a rolled-back gateway keeps the module network until it is next
-restarted from the restored files). Plan B has no rollback of its own: a failure at or after promotion changes nothing more
+nothing more. Plan A's own snapshots are prepared from the edited configuration, so after `rollback` the tool recreates the
+gateway from the resolved configuration and image it ran before the run (kept in `gateway.pre-run.json` beside the copies,
+after a call wait) and requires every existing project to run its pre-run image, else the state is unknown. Plan B has no rollback of its own: a failure at or after promotion changes nothing more
 (any failure of the isolation step, a negative probe or an error reading Docker, still stops the module), keeps the pause, records the failing step and the HTTP status it read in `enrollment.json`
 (`status: http-manual`) and says `HTTP recovery is manual, inspect it` (seamless-release.md); automatic recovery of the
 previous HTTP generation is a separate card. A crash leaves the pause and the receipt: the next `--apply` refuses
