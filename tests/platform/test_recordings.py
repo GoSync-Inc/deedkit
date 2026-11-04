@@ -78,6 +78,181 @@ def test_omi_list_is_metadata_only_and_preserves_bound_provider_continuation(tmp
     asyncio.run(run())
 
 
+def row(identity, created_at=None):
+    value = {'id': identity, 'structured': {'title': 'Synthetic ' + identity}}
+    if created_at is not None:
+        value['created_at'] = created_at
+    return value
+
+
+def pages(*bodies):
+    """A synthetic Omi list that serves `bodies` in order, chained by provider cursors."""
+    seen = []
+    def provider(request):
+        seen.append(dict(request.url.params))
+        index = int(request.url.params.get('cursor', 'page-0')[5:])
+        more = index + 1 < len(bodies)
+        headers = {'X-Omi-Has-More': 'true' if more else 'false', 'X-Omi-List-Truncated': 'false',
+                   'X-Omi-Effective-Limit': '25'}
+        if more:
+            headers['X-Omi-Next-Cursor'] = 'page-%d' % (index + 1)
+        return httpx.Response(200, json=bodies[index], headers=headers)
+    return provider, seen
+
+
+async def listed(path, provider, **args):
+    async with client(application(path, provider)) as c:
+        return await c.post('/v1/list_recordings', json={'account': 'omi-a', **args})
+
+
+# spec: ANYM-754
+@pytest.mark.parametrize('arguments,sent', [
+    ({'start_date': '2026-11-03'}, {'start_date': '2026-11-03T00:00:00Z'}),
+    ({'end_date': '2026-11-03'}, {'end_date': '2026-11-03T23:59:59.999999Z'}),
+    ({'start_date': '2026-11-03', 'end_date': '2026-11-03'},
+     {'start_date': '2026-11-03T00:00:00Z', 'end_date': '2026-11-03T23:59:59.999999Z'}),
+    ({'start_date': '2026-11-02', 'end_date': '2026-11-03T10:00:00+02:00'},
+     {'start_date': '2026-11-02T00:00:00Z', 'end_date': '2026-11-03T08:00:00Z'}),
+    ({'start_date': '2026-11-03T10:00:00Z'}, {'start_date': '2026-11-03T10:00:00Z'}),
+])
+def test_list_accepts_plain_dates_as_whole_utc_days(tmp_path, arguments, sent):
+    path, _ = config(tmp_path)
+    provider, seen = pages([])
+    async def run():
+        response = await listed(path, provider, **arguments)
+        assert response.status_code == 200
+        assert {k: v for k, v in seen[0].items() if k in ('start_date', 'end_date')} == sent
+    asyncio.run(run())
+
+
+# spec: ANYM-754
+@pytest.mark.parametrize('arguments', [
+    {'start_date': '2026-11-04', 'end_date': '2026-11-03'},
+    {'start_date': '2026-11-03T12:00:00Z', 'end_date': '2026-11-03T11:59:59Z'},
+    {'start_date': '2026-11-04', 'end_date': '2026-11-03T23:00:00Z'},
+    {'start_date': '2026-11-03Z'}, {'start_date': '2026-11-03+00:00'}, {'end_date': '2026-11'},
+    {'start_date': '2026-11-31'}, {'end_date': '20261103'}, {'start_date': '2026-11-03T10:00:00'},
+])
+def test_list_refuses_reversed_or_unplaceable_dates(tmp_path, arguments):
+    path, _ = config(tmp_path)
+    provider, seen = pages([])
+    async def run():
+        response = await listed(path, provider, **arguments)
+        assert response.status_code == 422 and response.json() == {'error': 'invalid_parameters'}
+        assert seen == []
+    asyncio.run(run())
+
+
+# spec: ANYM-754
+def test_list_filter_honoured_by_provider_reports_nothing_dropped(tmp_path):
+    path, _ = config(tmp_path)
+    provider, seen = pages([row('in-a', '2026-11-03T09:00:00Z'), row('in-b', '2026-11-03T23:59:59.5+00:00')])
+    async def run():
+        result = (await listed(path, provider, start_date='2026-11-03', end_date='2026-11-03')).json()
+        assert [i['id'] for i in result['items']] == ['in-a', 'in-b']
+        assert result['date_filter'] == {'requested': True, 'filtered_locally': 0, 'pages_read': 1}
+    asyncio.run(run())
+
+
+# spec: ANYM-754
+def test_list_drops_rows_outside_dates_when_provider_ignores_them(tmp_path):
+    path, _ = config(tmp_path)
+    provider, seen = pages([row('old', '2026-11-02T23:59:59Z'), row('in', '2026-11-03T00:00:00Z'),
+                            row('new', '2026-11-04T00:00:00Z'), row('offset', '2026-11-04T01:00:00+02:00'),
+                            row('missing'), row('garbled', 'not a date'), row('naive', '2026-10-01T00:00:00')])
+    async def run():
+        result = (await listed(path, provider, start_date='2026-11-03', end_date='2026-11-03')).json()
+        assert [i['id'] for i in result['items']] == ['in', 'offset', 'missing', 'garbled', 'naive']
+        assert result['date_filter'] == {'requested': True, 'filtered_locally': 2, 'pages_read': 1}
+        assert result['next_cursor'] is None and result['pagination']['has_more'] is False
+    asyncio.run(run())
+
+
+# spec: ANYM-754
+def test_list_follows_provider_pages_past_an_all_outside_page(tmp_path):
+    path, _ = config(tmp_path)
+    provider, seen = pages([row('old-a', '2026-10-01T00:00:00Z'), row('old-b', '2026-10-02T00:00:00Z')],
+                           [row('in', '2026-11-03T12:00:00Z'), row('old-c', '2026-10-03T00:00:00Z')],
+                           [row('later', '2026-11-03T13:00:00Z')])
+    async def run():
+        async with client(application(path, provider)) as c:
+            args = {'account': 'omi-a', 'start_date': '2026-11-03'}
+            result = (await c.post('/v1/list_recordings', json=args)).json()
+            assert [i['id'] for i in result['items']] == ['in']
+            assert result['date_filter'] == {'requested': True, 'filtered_locally': 3, 'pages_read': 2}
+            assert result['pagination']['has_more'] is True and result['next_cursor']
+            assert [p.get('cursor') for p in seen] == [None, 'page-1']
+            assert all(p['start_date'] == '2026-11-03T00:00:00Z' for p in seen)
+            more = (await c.post('/v1/list_recordings', json={**args, 'cursor': result['next_cursor']})).json()
+            assert [i['id'] for i in more['items']] == ['later'] and more['next_cursor'] is None
+            assert more['date_filter'] == {'requested': True, 'filtered_locally': 0, 'pages_read': 1}
+            assert seen[-1]['cursor'] == 'page-2'
+    asyncio.run(run())
+
+
+# spec: ANYM-754
+def test_list_stops_after_five_all_outside_pages_with_a_cursor(tmp_path):
+    path, _ = config(tmp_path)
+    provider, seen = pages(*([row('old-%d' % n, '2026-10-01T00:00:00Z')] for n in range(7)))
+    async def run():
+        result = (await listed(path, provider, start_date='2026-11-03')).json()
+        assert result['items'] == [] and result['next_cursor']
+        assert result['date_filter'] == {'requested': True, 'filtered_locally': 5, 'pages_read': 5}
+        assert len(seen) == 5 and seen[-1]['cursor'] == 'page-4'
+    asyncio.run(run())
+
+
+# spec: ANYM-754
+def test_list_without_dates_is_unchanged_and_reads_one_page(tmp_path):
+    path, _ = config(tmp_path)
+    provider, seen = pages([row('old', '2020-01-01T00:00:00Z')], [row('next', '2020-01-02T00:00:00Z')])
+    async def run():
+        result = (await listed(path, provider)).json()
+        assert set(result) == {'account', 'provider', 'items', 'pagination', 'next_cursor'}
+        assert [i['id'] for i in result['items']] == ['old'] and len(seen) == 1
+        assert 'start_date' not in seen[0] and 'end_date' not in seen[0]
+        empty = (await listed(path, pages([])[0])).json()
+        assert empty['items'] == [] and 'date_filter' not in empty
+    asyncio.run(run())
+
+
+# spec: ANYM-754
+def test_list_does_not_follow_pages_past_the_gateway_deadline(tmp_path):
+    path, _ = config(tmp_path)
+    provider, seen = pages([row('old', '2026-10-01T00:00:00Z')], [row('in', '2026-11-03T12:00:00Z')])
+    async def run():
+        async with client(application(path, provider, provider_timeout=31)) as c:
+            result = (await c.post('/v1/list_recordings', json={'account': 'omi-a', 'start_date': '2026-11-03'})).json()
+        assert result['items'] == [] and result['next_cursor'] and len(seen) == 1
+        assert result['date_filter'] == {'requested': True, 'filtered_locally': 1, 'pages_read': 1}
+    asyncio.run(run())
+
+
+# spec: ANYM-754
+def test_list_followed_page_waiting_on_the_ledger_past_the_deadline_returns_the_last_page(tmp_path, monkeypatch):
+    path, _ = config(tmp_path)
+    module = importlib.import_module('deedkit_recordings.app')
+    monkeypatch.setattr(module, 'DATED_DEADLINE_S', 1.0)
+    provider, seen = pages([row('old', '2026-10-01T00:00:00Z')], [row('in', '2026-11-03T12:00:00Z')])
+    async def run():
+        app = application(path, provider, provider_timeout=0.5)
+        counted = []
+        async def slow_ledger(token, detail, now=None):
+            counted.append(detail)
+            if len(counted) > 1:
+                await asyncio.sleep(5)
+        monkeypatch.setattr(app.state.archive, 'count', slow_ledger)
+        async with client(app) as c:
+            started = asyncio.get_running_loop().time()
+            result = (await c.post('/v1/list_recordings', json={'account': 'omi-a', 'start_date': '2026-11-03'})).json()
+            assert asyncio.get_running_loop().time() - started < 2
+        assert result['items'] == [] and result['next_cursor'] and len(seen) == 1 and len(counted) == 2
+        assert result['pagination']['has_more'] is True
+        assert result['date_filter'] == {'requested': True, 'filtered_locally': 1, 'pages_read': 1}
+        assert app.state.provider.active == 0
+    asyncio.run(run())
+
+
 # spec: ANYM-648
 @pytest.mark.parametrize('headers,complete', [({}, None), ({'X-Omi-Has-More':'oops'}, None),
     ({'X-Omi-Has-More':'false','X-Omi-List-Truncated':'true'}, False)])

@@ -1,8 +1,10 @@
 """Private HTTP backend; the gateway is the agent-facing MCP surface."""
 import asyncio
 import hashlib
+import re
+import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, time as clock, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -19,6 +21,10 @@ from .security import (Strict, Failure, RateLimited, configuration, provider_tok
 from . import archive_feed
 
 READ, CONTENT, AUDIO = 'recordings:read', 'recordings:content', 'recordings:audio'
+PLAIN_DATE = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}')
+# ANYM-754: a dated Omi list follows the provider past pages that leave no row, at most this many pages, and a
+# followed page (ledger wait and provider call) must end inside this deadline, below the gateway's 35-second one.
+DATED_PAGES, DATED_DEADLINE_S = 5, 30
 
 
 class Empty(Strict):
@@ -66,23 +72,45 @@ class Audio(Strict):
     recording_id: str = Field(pattern=r'^[A-Za-z0-9_-]{1,256}$')
 
 
+def instant(value):
+    """An aware ISO timestamp as UTC, or None (a missing, naive or unparsable value cannot be placed)."""
+    try:
+        moment = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        return moment.astimezone(timezone.utc) if moment.tzinfo is not None else None
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+
+
 def dates(args):
+    """Validated bounds as UTC instants. A plain `YYYY-MM-DD` covers that whole UTC day (ANYM-754)."""
     result = {}
     for key in ('start_date', 'end_date'):
         value = getattr(args, key)
         if value is None:
             continue
         try:
-            moment = datetime.fromisoformat(value.replace('Z', '+00:00'))
-            if 'T' not in value or moment.tzinfo is None:
-                raise ValueError
-            result[key] = moment.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
+            if PLAIN_DATE.fullmatch(value):
+                moment = datetime.combine(date.fromisoformat(value), clock.min if key == 'start_date' else clock.max,
+                                          timezone.utc)
+            else:
+                moment = instant(value) if 'T' in value else None
+                if moment is None:
+                    raise ValueError
+            result[key] = moment
         except ValueError:
             raise Failure('invalid_parameters', 422) from None
-    if len(result) == 2 and datetime.fromisoformat(result['start_date'].replace('Z', '+00:00')) > datetime.fromisoformat(
-            result['end_date'].replace('Z', '+00:00')):
+    if len(result) == 2 and result['start_date'] > result['end_date']:
         raise Failure('invalid_parameters', 422)
     return result
+
+
+def outside(item, bounds):
+    """True only for a row whose `created_at` places it outside the asked interval; an unplaceable row stays."""
+    moment = instant(item.get('created_at'))
+    if moment is None:
+        return False
+    return ('start_date' in bounds and moment < bounds['start_date']) or (
+        'end_date' in bounds and moment > bounds['end_date'])
 
 
 def create_app(config_path, *, transport=None, provider_timeout=12, provider_bytes=2 * 1024 * 1024,
@@ -172,7 +200,8 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
             return await local.invoke(operation, args, authorization[7:])
         request.state.provider = account.provider
         token = provider_token(account)
-        params = dates(args) if operation == 'list_recordings' else {}
+        bounds = dates(args) if operation == 'list_recordings' else {}
+        params = {key: value.isoformat().replace('+00:00', 'Z') for key, value in bounds.items()}
         binding = {'provider': account.provider, 'account': account.id, 'principal': actor.key_sha256,
                    'provider_identity': hashlib.sha256(token.encode()).hexdigest(), 'operation': operation,
                    'arguments': {**args.model_dump(exclude={'cursor'}), **params}}
@@ -199,13 +228,34 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
                 if not isinstance(previous.get('position'), str):
                     raise Failure('invalid_cursor', 400)
                 params['cursor'] = previous['position']
-            values, headers = await omi_get(token, params=params)
-            if not isinstance(values, list) or len(values) > args.limit:
-                raise Failure('invalid_provider_response', detail_code='list_shape')
-            evidence, next_page = pagination(headers, len(values), args.limit)
-            return {'account': account.id, 'provider': 'omi', 'items': [metadata(v) for v in values],
-                    'pagination': evidence,
-                    'next_cursor': continuation(binding, next_page, secret) if next_page else None}
+            started, read, dropped = time.monotonic(), 0, 0
+            while True:
+                try:
+                    # A followed page must finish inside the deadline, ledger wait included; else the last page stands.
+                    async with asyncio.timeout(DATED_DEADLINE_S - (time.monotonic() - started) if read else None):
+                        values, headers = await omi_get(token, params=params)
+                except TimeoutError:
+                    if not read:
+                        raise
+                    break
+                if not isinstance(values, list) or len(values) > args.limit:
+                    raise Failure('invalid_provider_response', detail_code='list_shape')
+                evidence, next_page = pagination(headers, len(values), args.limit)
+                items, read = [metadata(v) for v in values], read + 1
+                if not bounds:
+                    break
+                # Omi's own date parameters are passed but not trusted: drop what created_at places outside them.
+                kept = [item for item in items if not outside(item, bounds)]
+                dropped, items = dropped + len(items) - len(kept), kept
+                if (items or next_page is None or read >= DATED_PAGES
+                        or time.monotonic() - started + provider.timeout > DATED_DEADLINE_S):
+                    break
+                params['cursor'] = next_page
+            result = {'account': account.id, 'provider': 'omi', 'items': items, 'pagination': evidence,
+                      'next_cursor': continuation(binding, next_page, secret) if next_page else None}
+            if bounds:
+                result['date_filter'] = {'requested': True, 'filtered_locally': dropped, 'pages_read': read}
+            return result
         if account.provider == 'plaud':
             tool = 'get_transcript' if args.kind == 'transcript' else 'get_note'
             parameters = {'file_id': args.recording_id}
