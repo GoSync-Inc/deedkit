@@ -49,13 +49,9 @@ section 1's exact confirmation. In a task (a ready card) the agent applies its m
 production.md "Migration releases"; enabling a feature never includes send, call, pairing,
 session or allowlist changes, and none of it runs during an active call.
 
-Override: harness process.md section 2's fresh verified backup and reviews.md Rounds 7 (owner
-11-04: «только какие-то быкапы, только в критических случаях», «давай все делать не ждать ничего»,
-«Это не какой-то там банковской системы»). Only critical SQL (deletes or rewrites existing rows,
-drops a table or column; production.md "Migration risk tiers"), a restore or data deletion keeps a
-fresh verified backup and a copy; else the latest daily backup is the restore point. A production
-plan gets at most one review round, none for a tested runbook. No time windows, merge freezes or new
-release kits; the only wait is an active call. Enforcer: production.md (ANYM-743).
+Releases and migrations follow harness process.md section 2 (owner 11-04: ship without gates).
+production.md "Migration risk tiers" lists what deletes or rewrites user data (critical, which also
+takes a `copy-database`); "Migration releases" item 4 is the hand route.
 
 Override: harness process.md sections 1–5 and reviews.md Rounds 7–8, incident recovery only
 (owner 10-30, Telegram sends: «это быстрый hotfix», «И только после этого уже продолжаем работу

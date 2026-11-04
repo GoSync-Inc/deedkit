@@ -1,7 +1,7 @@
 # Recordings archive: install, activation and restore drill (ANYM-731)
 
-Status: a plan, **not applied**. It is the production operation plan of ANYM-731 (one review round, reviews.md Rounds 7 as
-DeedKit AGENTS.md section 2 overrides it, owner 11-04). An agent executes it only on the orchestrator's GO, under AGENTS.md section 2 and harness process.md section 2:
+Status: a plan, **not applied**. It is the production operation plan of ANYM-731 (one review round, harness reviews.md
+Rounds 7, owner 11-04). An agent executes it only on the orchestrator's GO, under AGENTS.md section 2 and harness process.md section 2:
 Astra-reviewed plan, a read-back and an undo for every step, no step during an active call. It contains no send, call, ACK,
 pairing, provider-session start or stop, or allowlist change, and it never touches the on-demand grants (ANYM-713). Receipts
 hold digests, modes, ids and counts, never a key, a transcript or any text of the archive.

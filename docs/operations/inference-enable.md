@@ -1,6 +1,6 @@
 # Production enablement of local media understanding (ANYM-686 plan)
 
-Status: plan for review (one review round, DeedKit AGENTS.md section 2, owner 11-04). No step runs without the plan's APPROVE.
+Status: plan for review (one review round, harness reviews.md Rounds 7, owner 11-04). No step runs without the plan's APPROVE.
 
 What it does: the owner's voice notes, photos and document text are processed by `deedkit-inference` on the
 Mac mini (`enricher-mini`, profile `enrichment-mini`) for the owner's messenger accounts. Authority: owner
