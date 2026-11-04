@@ -1237,6 +1237,7 @@ def apply(settings, sha, *, backup_waited=0):
                            "--wait", "--wait-timeout", "180", *services])
         except Refused as exc:
             unhealthy(release, sha, receipt, evidence, touched, exc)
+        unproven = []
         for service, target in project["services"].items():
             ids = run(command + ["ps", "-q", service]).split()
             if len(ids) != 1:
@@ -1245,6 +1246,10 @@ def apply(settings, sha, *, backup_waited=0):
             if actual["Image"] != receipt["images"][target] or not actual["State"]["Running"]:
                 raise Refused("replacement did not start the prepared image")
             started[project["name"], service] = ids[0], container_settings(actual)
+            if "Health" not in actual["State"]:  # no Compose healthcheck: `--wait` saw it running once, no more
+                unproven.append((service, ids[0], actual))
+        if failure := restart_loop(project, item, unproven):
+            unhealthy(release, sha, receipt, evidence, touched, Refused(failure))
     # What rollback must find unchanged before it stops anything, captured the way prepare captures the baseline.
     # It must still be what this apply started: a change meanwhile leaves the attempt unresolved.
     restore = []
@@ -1268,8 +1273,33 @@ def apply(settings, sha, *, backup_waited=0):
     return result
 
 
+# ANYM-758, Kubernetes' minReadySeconds for one Compose host: `up --wait` proves health only for a service with a Compose
+# healthcheck. One without (collectors, workers, indexer) passes as soon as it runs, so a container that exits and
+# restarts can be caught running. Once per project, after its replacements started, the tool waits this long and
+# inspects each such replacement again. 0 turns the settle off.
+APPLY_SETTLE_SECONDS = 10
+
+
+def restart_loop(project, item, unproven):
+    """Why a replacement without a healthcheck is not running steadily APPLY_SETTLE_SECONDS after `up`, or None.
+    `unproven` holds (service, container ID, first inspect). A container this apply created must not have restarted at
+    all; one `up` kept (its ID is the one before the release) must not have restarted again since the first inspect."""
+    if not unproven or APPLY_SETTLE_SECONDS <= 0:
+        return None
+    time.sleep(APPLY_SETTLE_SECONDS)
+    for service, identity, first in unproven:
+        actual = json.loads(run(["docker", "inspect", identity]))[0]
+        condition = actual.get("State", {})
+        kept = identity.startswith(item["running"][service]["container"])
+        allowed = first.get("RestartCount", 0) if kept else 0
+        if condition.get("Restarting") or not condition.get("Running") or actual.get("RestartCount", 0) > allowed:
+            return (f"replacement {project['name']}/{service} is restarting or stopped {APPLY_SETTLE_SECONDS} s after "
+                    f"it started (restarts: {actual.get('RestartCount', 0)})")
+    return None
+
+
 def unhealthy(release, sha, receipt, evidence, touched, failure):
-    """After `up --wait` failed: when every replacement started so far runs the prepared image, in any state, record
+    """After `up --wait` or the settle (ANYM-758) failed: when every replacement started so far runs the prepared image, in any state, record
     the release as `unhealthy` with rollback data for the projects it touched; otherwise the attempt stays unresolved.
     Either way current.json keeps naming the previous release, and the apply is refused."""
     restore = []
