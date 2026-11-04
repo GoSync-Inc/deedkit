@@ -22,8 +22,8 @@ from . import archive_feed
 
 READ, CONTENT, AUDIO = 'recordings:read', 'recordings:content', 'recordings:audio'
 PLAIN_DATE = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}')
-# ANYM-754: a dated Omi list follows the provider past pages that leave no row, at most this many pages and never
-# into a provider call that could outlast the gateway's 35-second backend deadline.
+# ANYM-754: a dated Omi list follows the provider past pages that leave no row, at most this many pages, and a
+# followed page (ledger wait and provider call) must end inside this deadline, below the gateway's 35-second one.
 DATED_PAGES, DATED_DEADLINE_S = 5, 30
 
 
@@ -230,7 +230,14 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
                 params['cursor'] = previous['position']
             started, read, dropped = time.monotonic(), 0, 0
             while True:
-                values, headers = await omi_get(token, params=params)
+                try:
+                    # A followed page must finish inside the deadline, ledger wait included; else the last page stands.
+                    async with asyncio.timeout(DATED_DEADLINE_S - (time.monotonic() - started) if read else None):
+                        values, headers = await omi_get(token, params=params)
+                except TimeoutError:
+                    if not read:
+                        raise
+                    break
                 if not isinstance(values, list) or len(values) > args.limit:
                     raise Failure('invalid_provider_response', detail_code='list_shape')
                 evidence, next_page = pagination(headers, len(values), args.limit)

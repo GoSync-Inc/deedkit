@@ -228,6 +228,31 @@ def test_list_does_not_follow_pages_past_the_gateway_deadline(tmp_path):
     asyncio.run(run())
 
 
+# spec: ANYM-754
+def test_list_followed_page_waiting_on_the_ledger_past_the_deadline_returns_the_last_page(tmp_path, monkeypatch):
+    path, _ = config(tmp_path)
+    module = importlib.import_module('deedkit_recordings.app')
+    monkeypatch.setattr(module, 'DATED_DEADLINE_S', 1.0)
+    provider, seen = pages([row('old', '2026-10-01T00:00:00Z')], [row('in', '2026-11-03T12:00:00Z')])
+    async def run():
+        app = application(path, provider, provider_timeout=0.5)
+        counted = []
+        async def slow_ledger(token, detail, now=None):
+            counted.append(detail)
+            if len(counted) > 1:
+                await asyncio.sleep(5)
+        monkeypatch.setattr(app.state.archive, 'count', slow_ledger)
+        async with client(app) as c:
+            started = asyncio.get_running_loop().time()
+            result = (await c.post('/v1/list_recordings', json={'account': 'omi-a', 'start_date': '2026-11-03'})).json()
+            assert asyncio.get_running_loop().time() - started < 2
+        assert result['items'] == [] and result['next_cursor'] and len(seen) == 1 and len(counted) == 2
+        assert result['pagination']['has_more'] is True
+        assert result['date_filter'] == {'requested': True, 'filtered_locally': 1, 'pages_read': 1}
+        assert app.state.provider.active == 0
+    asyncio.run(run())
+
+
 # spec: ANYM-648
 @pytest.mark.parametrize('headers,complete', [({}, None), ({'X-Omi-Has-More':'oops'}, None),
     ({'X-Omi-Has-More':'false','X-Omi-List-Truncated':'true'}, False)])
