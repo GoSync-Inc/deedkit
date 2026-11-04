@@ -5856,6 +5856,533 @@ def test_backup_runner_install_reads_the_prepared_source_under_the_configured_st
     assert re.match(r"""sha=\S+; src=["']?([^"';\s]+)""", script)[1] == "<state_directory>/$sha/source"
 
 
+class WaitClock(Clock):
+    """The fake clock, with the real `time` for everything else, and hooks that run after each sleep."""
+
+    def __init__(self):
+        super().__init__()
+        self.hooks = []
+
+    def sleep(self, seconds):
+        super().sleep(seconds)
+        for hook in self.hooks:
+            hook(self.now)
+
+    def __getattr__(self, name):
+        return getattr(REAL_TIME, name)
+
+
+REAL_TIME = p.time
+PLAN_A_ONLY = {"version": 1}  # wait_backup_idle reads nothing from the configuration
+
+
+class BackupHost:
+    """The host side of `wait_backup_idle`: the runner lock and its `.unsettled` marker as real files, a `systemctl`
+    that answers from `states` (unit -> ActiveState, or a function of the fake clock, or an exception to raise), probes
+    that each cost `probe` seconds, and a clock that only probes and sleeps move. `hold` takes the lock like a running
+    backup, until `until` seconds; `free_while_sleeping` records whether the lock was free at each sleep."""
+
+    def __init__(self, tmp_path, monkeypatch, *, probe=0.0):
+        self.tmp_path, self.probe, self.probes, self.on_probe = tmp_path, probe, [], []
+        self.lock = tmp_path / "backups" / ".runner.lock"
+        self.lock.parent.mkdir(mode=0o700, exist_ok=True)
+        self.marker = Path(f"{self.lock}.unsettled")
+        monkeypatch.setenv("DEEDKIT_BACKUP_LOCK", str(self.lock))
+        self.states, self.fd, self.until, self.free_while_sleeping = {}, None, None, []
+        self.clock = WaitClock()
+        self.clock.hooks.append(self.sleeping)
+        self.inner = p.run
+        monkeypatch.setattr(p, "time", self.clock)
+        monkeypatch.setattr(p, "run", self.run)
+
+    def run(self, argv, **kwargs):
+        if argv[:2] != ["systemctl", "show"]:
+            return self.inner(argv, **kwargs)
+        # The producer pin's form (`show -P ActiveState <unit>`) is the one every harness fake answers.
+        if argv[3] == "InactiveExitTimestamp":
+            return "Wed 2026-11-04 18:00:01 UTC\n"
+        assert argv[2:4] == ["-P", "ActiveState"], argv
+        self.clock.now += self.probe
+        self.probes.append(argv[-1])
+        for hook in self.on_probe:
+            hook(len(self.probes))
+        state = self.states.get(argv[-1], "inactive")
+        state = state(self.clock.now) if callable(state) else state
+        if isinstance(state, Exception):
+            raise state
+        return f"{state}\n"
+
+    def hold(self, until=None):
+        self.fd = os.open(self.lock, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.until = until
+
+    def release(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def lock_is_held(self):
+        fd = os.open(self.lock, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(fd)
+        return False
+
+    def sleeping(self, now):
+        if self.fd is not None and self.until is not None and now >= self.until:
+            self.release()
+        if self.fd is None:
+            self.free_while_sleeping.append(not self.lock_is_held())
+
+    def wait(self, seconds=2700):
+        return p.wait_backup_idle(PLAN_A_ONLY, self.clock.monotonic() + seconds, single=seconds == 0)
+
+
+# spec: ANYM-744
+def test_the_wait_returns_at_once_holding_the_lock_when_no_backup_runs(tmp_path, monkeypatch):
+    host = BackupHost(tmp_path, monkeypatch)
+    with host.wait() as waited:
+        assert waited == 0 and host.clock.sleeps == [] and host.lock_is_held()
+    assert not host.lock_is_held()
+    # Every unit and the marker are read before the lock and again under it.
+    assert host.probes == [*p.BACKUP_UNITS, *p.BACKUP_UNITS]
+
+
+# spec: ANYM-744
+def test_every_unit_is_read_the_way_the_producer_pin_reads_it(tmp_path, monkeypatch):
+    # The harness fakes of other tests answer exactly `systemctl show -P ActiveState <unit>`; another form would read as
+    # an unreadable unit there and wait for the whole bound.
+    host = BackupHost(tmp_path, monkeypatch)
+    seen = []
+    inner = p.run
+    monkeypatch.setattr(p, "run", lambda argv, **kwargs: seen.append(argv) or inner(argv, **kwargs))
+    with host.wait():
+        pass
+    assert seen == [["systemctl", "show", "-P", "ActiveState", unit] for unit in [*p.BACKUP_UNITS, *p.BACKUP_UNITS]]
+
+
+# spec: ANYM-744
+def test_a_failed_unit_counts_as_idle(tmp_path, monkeypatch):
+    host = BackupHost(tmp_path, monkeypatch)
+    host.states["personal-os-backup.service"] = "failed"
+    with host.wait():
+        assert host.clock.sleeps == []
+
+
+# spec: ANYM-744
+def test_the_wait_returns_holding_the_lock_after_a_backup_that_ends_20_minutes_later(tmp_path, monkeypatch):
+    host = BackupHost(tmp_path, monkeypatch)
+    host.hold(until=20 * 60)
+    with host.wait() as waited:
+        assert 20 * 60 <= waited < 20 * 60 + 15 and host.lock_is_held() and host.fd is None
+    assert set(host.clock.sleeps) == {p.BACKUP_POLL} and host.free_while_sleeping[-1] is True
+
+
+# spec: ANYM-744
+@pytest.mark.parametrize("state", ["deactivating", "activating", "active", "reloading", "unreadable"])
+def test_a_unit_that_is_not_inactive_or_failed_makes_the_wait_continue(tmp_path, monkeypatch, state):
+    host = BackupHost(tmp_path, monkeypatch)
+    answer = p.Refused("systemctl failed") if state == "unreadable" else state
+    host.states["deedkit-calendar-backup.service"] = lambda now: answer if now < 60 else "inactive"
+    with host.wait() as waited:
+        assert waited >= 60
+    assert host.clock.sleeps and all(host.free_while_sleeping)
+
+
+# spec: ANYM-744
+def test_the_unsettled_marker_makes_the_wait_continue(tmp_path, monkeypatch):
+    host = BackupHost(tmp_path, monkeypatch)
+    host.marker.write_text('{"profile":"calendar"}\n')
+    host.clock.hooks.append(lambda now: host.marker.unlink(missing_ok=True) if now >= 60 else None)
+    with host.wait() as waited:
+        assert waited >= 60
+    assert all(host.free_while_sleeping)
+
+
+# spec: ANYM-744
+def test_a_marker_that_appears_between_the_first_check_and_the_lock_releases_it_and_polls_again(tmp_path, monkeypatch):
+    host = BackupHost(tmp_path, monkeypatch)
+    # The first read under the lock is probe number len(BACKUP_UNITS) + 1: the runner created the marker just then.
+    host.on_probe.append(lambda count: host.marker.write_text("{}\n") if count == len(p.BACKUP_UNITS) + 1 else None)
+    host.clock.hooks.append(lambda now: host.marker.unlink(missing_ok=True) if now >= 30 else None)
+    with host.wait() as waited:
+        assert waited >= 30
+    assert len(host.probes) > 2 * len(p.BACKUP_UNITS) and host.free_while_sleeping and all(host.free_while_sleeping)
+
+
+# spec: ANYM-744
+def test_a_unit_that_changes_between_the_first_read_and_the_lock_releases_it_too(tmp_path, monkeypatch):
+    host = BackupHost(tmp_path, monkeypatch)
+    started = len(p.BACKUP_UNITS) + 1
+    host.states["personal-os-backup.service"] = lambda now: "activating" if len(host.probes) == started else "inactive"
+    with host.wait():
+        pass
+    assert host.clock.sleeps == [p.BACKUP_POLL] and host.free_while_sleeping == [True]
+
+
+# spec: ANYM-744
+def test_a_probe_that_ends_after_the_deadline_refuses_within_one_probe(tmp_path, monkeypatch):
+    host = BackupHost(tmp_path, monkeypatch, probe=60)
+    host.states["personal-os-backup.service"] = "activating"
+    with pytest.raises(p.BackupRunning) as refused:
+        with host.wait(100):
+            raise AssertionError("proceeded without the lock")
+    # One probe, a sleep to the bound, one more probe: past the bound by less than one probe.
+    assert 100 <= host.clock.now < 100 + 60 + p.BACKUP_POLL
+    assert refused.value.unit == "personal-os-backup.service" and refused.value.waited_seconds == int(host.clock.now)
+    assert refused.value.since == "Wed 2026-11-04 18:00:01 UTC" and not host.lock_is_held()
+
+
+# spec: ANYM-744
+@pytest.mark.parametrize("cause", ["lock", "marker"])
+def test_the_refusal_names_the_lock_or_the_marker_that_outlasted_the_bound(tmp_path, monkeypatch, cause):
+    host = BackupHost(tmp_path, monkeypatch)
+    if cause == "lock":
+        host.hold()
+    else:
+        host.marker.write_text("{}\n")
+    with pytest.raises(p.BackupRunning) as refused:
+        with host.wait(60):
+            raise AssertionError("proceeded without the lock")
+    assert refused.value.unit == str(host.lock if cause == "lock" else host.marker)
+    assert refused.value.waited_seconds == 60 and refused.value.since is None
+    assert refused.value.code == "backup_running" and isinstance(refused.value, p.Busy)
+
+
+# spec: ANYM-744
+def test_a_bound_of_zero_keeps_the_single_non_waiting_check(tmp_path, monkeypatch):
+    host = BackupHost(tmp_path, monkeypatch)
+    host.hold()
+    with pytest.raises(p.BackupRunning) as refused:
+        with host.wait(0):
+            raise AssertionError("proceeded without the lock")
+    assert host.clock.sleeps == [] and refused.value.waited_seconds == 0
+    host.release()
+    with host.wait(0):
+        pass
+
+
+# spec: ANYM-744
+def test_slow_probes_cannot_carry_the_wait_past_a_positive_bound(tmp_path, monkeypatch):
+    host = BackupHost(tmp_path, monkeypatch, probe=60)  # every unit idle, each probe takes a minute
+    with pytest.raises(p.BackupRunning) as refused:
+        with host.wait(30):
+            raise AssertionError("admitted after the bound")
+    # The first probe ended past the bound: nothing else is probed, nothing is held.
+    assert host.clock.now == 60 and host.probes == [p.BACKUP_UNITS[0]] and refused.value.waited_seconds == 60
+    assert not host.lock_is_held()
+
+
+# spec: ANYM-744
+def test_a_release_is_never_admitted_after_the_bound_even_when_every_probe_read_idle(tmp_path, monkeypatch):
+    host = BackupHost(tmp_path, monkeypatch, probe=10)
+    # Six idle probes (before the lock and under it) end at 60 s; the bound is 55 s.
+    with pytest.raises(p.BackupRunning):
+        with host.wait(55):
+            raise AssertionError("admitted after the bound")
+    assert host.clock.now <= 55 + 10 and not host.lock_is_held()
+
+
+# spec: ANYM-744
+def test_a_held_lock_with_a_zero_bound_refuses_before_any_probe(tmp_path, monkeypatch):
+    host = BackupHost(tmp_path, monkeypatch, probe=60)
+    host.hold()
+    with pytest.raises(p.BackupRunning):
+        with host.wait(0):
+            raise AssertionError("proceeded without the lock")
+    assert host.probes == [] and host.clock.now == 0
+
+
+# spec: ANYM-744
+def test_a_positive_bound_that_passes_while_the_lock_is_opened_is_still_a_bound(tmp_path, monkeypatch):
+    host = BackupHost(tmp_path, monkeypatch, probe=10)
+    deadline = host.clock.monotonic() + 60
+    opened = p.open_backup_lock
+
+    def slow_open():
+        host.clock.now += 100  # descheduled between the caller's deadline and the first probe
+        return opened()
+
+    monkeypatch.setattr(p, "open_backup_lock", slow_open)
+    with pytest.raises(p.BackupRunning):
+        with p.wait_backup_idle(PLAN_A_ONLY, deadline):
+            raise AssertionError("admitted after the bound")
+    assert host.probes == [p.BACKUP_UNITS[0]] and not host.lock_is_held()
+
+
+# spec: ANYM-744
+def test_the_gate_takes_a_zero_bound_as_the_single_check_and_a_positive_one_as_a_deadline(tmp_path, monkeypatch):
+    host = BackupHost(tmp_path, monkeypatch, probe=10)
+    with p.backup_gate(PLAN_A_ONLY, 0) as waited:
+        assert waited == 60
+    host.hold()
+    with pytest.raises(p.BackupRunning) as refused:
+        with p.backup_gate(PLAN_A_ONLY, 30):
+            raise AssertionError("proceeded without the lock")
+    assert refused.value.waited_seconds == 30
+
+
+# spec: ANYM-744
+def test_an_idle_host_with_a_zero_bound_is_admitted_whatever_the_probes_cost(tmp_path, monkeypatch):
+    host = BackupHost(tmp_path, monkeypatch, probe=60)
+    with host.wait(0) as waited:
+        assert waited == 360 and host.lock_is_held()
+
+
+# spec: ANYM-744
+def test_a_sigterm_during_the_wait_takes_and_writes_nothing(tmp_path):
+    bin_directory = tmp_path / "bin"
+    bin_directory.mkdir()
+    (bin_directory / "systemctl").write_text("#!/bin/sh\necho inactive\n")
+    (bin_directory / "systemctl").chmod(0o755)
+    backups = tmp_path / "backups"
+    backups.mkdir(mode=0o700)
+    lock = backups / ".runner.lock"
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    script = (f"import sys; sys.path.insert(0, {str(ROOT)!r}); from scripts import production as p\n"
+              "import time\n"
+              "with p.wait_backup_idle({'version': 1}, time.monotonic() + 600):\n"
+              "    sys.exit(3)\n")
+    env = {"PATH": f"{bin_directory}:{os.environ['PATH']}", "DEEDKIT_BACKUP_LOCK": str(lock)}
+    child = subprocess.Popen([sys.executable, "-I", "-c", script], env=env, stderr=subprocess.PIPE, text=True)
+    try:
+        assert "backup check: waiting" in child.stderr.readline()
+        child.terminate()
+        assert child.wait(timeout=30) == -15
+    finally:
+        child.stderr.close()
+        child.kill()
+        os.close(fd)
+    assert sorted(path.name for path in backups.iterdir()) == [".runner.lock"]
+
+
+def plan_a_file(tmp_path, **extra):
+    compose = tmp_path / "compose.json"
+    compose.write_text("{}")
+    path = tmp_path / "plan-a.json"
+    path.write_text(json.dumps({"version": 1, "state_directory": str(tmp_path / "state"), "projects": [
+        {"name": "synthetic", "directory": str(tmp_path), "files": [str(compose)], "services": {"api": "runtime"}}],
+        **extra}))
+    path.chmod(0o600)
+    return path
+
+
+# spec: ANYM-744
+@pytest.mark.parametrize("value", [0, 1, 2700, 7200])
+def test_the_configuration_accepts_a_backup_wait_in_range(tmp_path, value):
+    assert p.config(plan_a_file(tmp_path, backup={"wait_seconds": value}))["backup"] == {"wait_seconds": value}
+
+
+# spec: ANYM-744
+@pytest.mark.parametrize("value", [-1, 7201, "10", 1.5, True, None])
+def test_the_configuration_refuses_a_backup_wait_out_of_range_naming_key_value_and_range(tmp_path, value):
+    with pytest.raises(p.Refused, match=r"backup\.wait_seconds .* 0 to 7200") as refused:
+        p.config(plan_a_file(tmp_path, backup={"wait_seconds": value}))
+    assert repr(value) in str(refused.value)
+
+
+# spec: ANYM-744
+@pytest.mark.parametrize("section", [[], "x", {"wait": 5}, {"wait_seconds": 5, "other": 1}])
+def test_the_configuration_refuses_a_backup_section_that_is_not_the_wait_seconds_object(tmp_path, section):
+    with pytest.raises(p.Refused, match=r"backup must be"):
+        p.config(plan_a_file(tmp_path, backup=section))
+
+
+# spec: ANYM-744
+def test_the_backup_section_is_outside_the_configuration_digest_and_defaults_to_45_minutes(tmp_path):
+    plain = p.config(plan_a_file(tmp_path))
+    with_wait = {**plain, "backup": {"wait_seconds": 5}}
+    assert p.settings_digest(plain) == p.settings_digest(with_wait) and p.digest(plain) != p.digest(with_wait)
+    assert p.backup_wait(plain) == 2700 and p.backup_wait(with_wait) == 5
+
+
+# spec: ANYM-744
+def test_standalone_apply_waits_for_a_running_backup_and_records_the_wait(tmp_path, monkeypatch, capsys):
+    host = Host(tmp_path, monkeypatch)
+    backup = BackupHost(tmp_path, monkeypatch)
+    monkeypatch.setattr(p, "config", lambda path: host.settings)
+    host.main = RELEASES[0]
+    p.prepare(host.settings, RELEASES[0])
+    backup.hold(until=20 * 60)
+    p.main(["apply", "--sha", RELEASES[0]])
+    printed, error = capsys.readouterr()
+    result = json.loads(printed)
+    assert result["status"] == "applied" and 20 * 60 <= result["backup_wait_seconds"] < 20 * 60 + 15
+    assert p.read(host.state / RELEASES[0] / "result.json")["backup_wait_seconds"] == result["backup_wait_seconds"]
+    assert error.count("backup check: waiting") == 1 and error.count("backup check: idle after") == 1
+    assert not backup.lock_is_held()  # released when the command ends
+
+
+# spec: ANYM-744
+def test_standalone_apply_holds_the_lock_while_it_waits_for_calls(tmp_path, monkeypatch):
+    host = Host(tmp_path, monkeypatch)
+    backup = BackupHost(tmp_path, monkeypatch)
+    monkeypatch.setattr(p, "config", lambda path: host.settings)
+    host.main = RELEASES[0]
+    p.prepare(host.settings, RELEASES[0])
+    held = []
+    monkeypatch.setattr(p, "wait_for_calls", lambda settings, deadline: held.append(backup.lock_is_held()))
+    p.main(["apply", "--sha", RELEASES[0]])
+    assert held and all(held)
+
+
+# spec: ANYM-744
+def test_standalone_apply_past_the_bound_exits_75_and_writes_nothing(tmp_path, monkeypatch, capsys):
+    host = Host(tmp_path, monkeypatch)
+    backup = BackupHost(tmp_path, monkeypatch)
+    host.settings["backup"] = {"wait_seconds": 90}
+    monkeypatch.setattr(p, "config", lambda path: host.settings)
+    host.main = RELEASES[0]
+    p.prepare(host.settings, RELEASES[0])
+    host.calls.clear()
+    backup.hold()
+    with pytest.raises(SystemExit) as stopped:
+        p.main(["apply", "--sha", RELEASES[0]])
+    printed = capsys.readouterr().out
+    assert stopped.value.code == 75 and printed.count("\n") == 1
+    assert json.loads(printed) == {"status": "busy", "code": "backup_running", "unit": str(backup.lock),
+                                   "waited_seconds": 90, "since": None}
+    assert not (host.state / RELEASES[0] / "attempted.json").exists() and host.mutations() == []
+    assert not p.PAUSE.exists() and backup.clock.now == 90
+
+
+# spec: ANYM-744
+def test_the_inner_admission_of_apply_never_waits_for_a_backup(tmp_path, monkeypatch):
+    # deploy and the command line hold the lock before they call apply; the inner function neither takes nor waits.
+    host = Host(tmp_path, monkeypatch)
+    backup = BackupHost(tmp_path, monkeypatch)
+    host.main = RELEASES[0]
+    p.prepare(host.settings, RELEASES[0])
+    backup.hold()
+    monkeypatch.setattr(p, "wait_backup_idle", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("apply waited")))
+    p.apply(host.settings, RELEASES[0])
+    assert backup.clock.sleeps == [] and backup.probes == []
+
+
+# spec: ANYM-744
+def test_a_manual_deploy_waits_for_a_running_backup_then_deploys_and_the_wait_is_recorded(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    backup = BackupHost(tmp_path, monkeypatch)
+    backup.hold(until=20 * 60)
+    outcome = host.deploy()
+    assert outcome["status"] == "deployed" and host.steps and 20 * 60 <= backup.clock.now < 20 * 60 + 15
+    assert not backup.lock_is_held()
+
+
+# spec: ANYM-744
+def test_a_manual_deploy_with_no_backup_running_waits_zero_seconds(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    backup = BackupHost(tmp_path, monkeypatch)
+    assert host.deploy()["status"] == "deployed" and backup.clock.sleeps == [] and backup.clock.now == 0
+
+
+# spec: ANYM-744
+def test_a_wrapper_held_auto_deploy_waits_zero_seconds_and_reads_no_unit(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    backup = BackupHost(tmp_path, monkeypatch)
+    backup.hold()  # the unit's `flock --nonblock` wrapper holds it
+    assert host.deploy(auto=True)["status"] == "deployed" and backup.clock.now == 0 and backup.probes == []
+
+
+# spec: ANYM-744
+@pytest.mark.parametrize("inner", ["apply", "promote"])
+@pytest.mark.parametrize("auto", [False, True])
+def test_deploys_real_inner_apply_and_promote_run_under_the_held_lock_and_never_wait(tmp_path, monkeypatch, auto, inner):
+    # The real apply (or promote) runs, with its first remote gate replaced by a recorder that stops the deploy there:
+    # whatever admission code the inner function has before that gate ran under deploy's lock, without waiting.
+    from scripts import seamless_release as s
+    real_apply, real_promote = p.apply, s.promote
+    host = Deployer(tmp_path, monkeypatch)
+    backup = BackupHost(tmp_path, monkeypatch)
+    if auto:
+        backup.hold()  # the unit's wrapper
+    if inner == "apply":
+        monkeypatch.setattr(p, "apply", real_apply)
+    else:
+        monkeypatch.setattr(s, "promote", real_promote)
+        monkeypatch.setattr(s, "validate_settings", lambda value: value)
+    waits, gates, real_wait = [], [], p.wait_backup_idle
+    monkeypatch.setattr(p, "wait_backup_idle", lambda *args, **kwargs: waits.append(args) or real_wait(*args, **kwargs))
+
+    def gate(sha):
+        gates.append(backup.lock_is_held())
+        raise p.Refused("stopped at the first remote gate")
+
+    monkeypatch.setattr(p, "promotable", gate)
+    outcome = host.deploy(auto=auto)
+    assert outcome["status"] == "halted" and "stopped at the first remote gate" in outcome["reason"]
+    assert gates == [True] and len(waits) == (0 if auto else 1)
+    assert ("its HTTP release stopped" in outcome["reason"]) == (inner == "promote")
+    assert backup.clock.sleeps == [] and backup.clock.now == 0
+
+
+# spec: ANYM-744
+@pytest.mark.parametrize("auto", [False, True])
+def test_deploy_holds_the_lock_inside_apply_and_promote_and_waits_at_most_once(tmp_path, monkeypatch, auto):
+    host = Deployer(tmp_path, monkeypatch)
+    backup = BackupHost(tmp_path, monkeypatch)
+    waits, held, real_wait = [], [], p.wait_backup_idle
+    if auto:
+        backup.hold()  # the unit's wrapper
+    monkeypatch.setattr(p, "wait_backup_idle", lambda *args, **kwargs: waits.append(args) or real_wait(*args, **kwargs))
+    for module, name in ((p, "apply"), (host.s, "promote")):
+        inner = getattr(module, name)
+        monkeypatch.setattr(module, name, lambda *args, _inner=inner, **kwargs:
+                            (held.append(backup.lock_is_held()), _inner(*args, **kwargs))[1])
+    assert host.deploy(auto=auto)["status"] == "deployed"
+    assert held == [True, True] and len(waits) == (0 if auto else 1)
+
+
+# spec: ANYM-744
+def test_a_dry_run_deploy_never_waits_and_never_takes_the_lock(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    backup = BackupHost(tmp_path, monkeypatch)
+    backup.hold()
+    outcome = host.deploy(dry_run=True)
+    assert outcome["status"] != "busy" and backup.clock.now == 0 and backup.probes == [] and host.steps == []
+
+
+# spec: ANYM-744
+def test_a_manual_deploy_past_the_bound_returns_busy_with_the_code_and_changes_nothing(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    host.settings["backup"] = {"wait_seconds": 45}
+    backup = BackupHost(tmp_path, monkeypatch)
+    backup.hold()
+    outcome = host.deploy()
+    assert outcome == {"status": "busy", "code": "backup_running", "unit": str(backup.lock), "waited_seconds": 45,
+                       "since": None, "reason": f"backup_running: a backup holds {backup.lock}"}
+    assert host.steps == [] and host.git == [] and host.requests == [] and host.paused() is None
+
+
+# spec: ANYM-744
+def test_the_command_line_exits_75_with_one_json_line_for_a_deploy_that_met_a_backup(monkeypatch, capsys):
+    busy = {"status": "busy", "code": "backup_running", "unit": "personal-os-backup.service", "waited_seconds": 2700,
+            "since": "Wed 2026-11-04 18:00:01 UTC", "reason": "backup_running: personal-os-backup.service is active"}
+    monkeypatch.setattr(p, "execute_action", lambda args: busy)
+    with pytest.raises(SystemExit) as stopped:
+        p.main(["deploy"])
+    printed = capsys.readouterr().out
+    assert stopped.value.code == 75 and printed.count("\n") == 1 and json.loads(printed) == busy
+    # Any other busy answer (the deploy lock) keeps its old exit status.
+    monkeypatch.setattr(p, "execute_action", lambda args: {"status": "busy", "reason": "another production operation"})
+    p.main(["deploy"])
+
+
+# spec: ANYM-744
+def test_production_md_names_the_wait_the_exit_code_and_the_windows_that_stay():
+    docs = " ".join((ROOT / "docs/operations/production.md").read_text().split())  # line breaks are layout
+    assert "backup.wait_seconds" in docs and "backup_running" in docs and "exit 75" in docs
+    assert ("A release that would run into a scheduled backup start keeps its clock window: the wait does not "
+            "protect a scheduled start.") in docs
+    # The two real retry behaviours replace the blanket "systemd retries it".
+    assert "at most three starts in 8 hours" in docs and "5400 s" in docs and "systemd retries it;" not in docs
+
+
 def held_backup_lock(tmp_path, monkeypatch):
     """The backup runner's lock, held by a synthetic backup run (another open file description)."""
     path = tmp_path / "backups" / ".runner.lock"
@@ -5869,7 +6396,9 @@ def held_backup_lock(tmp_path, monkeypatch):
 # spec: ANYM-608
 def test_a_manual_deploy_returns_busy_before_any_change_while_a_backup_holds_its_lock(tmp_path, monkeypatch):
     host = Deployer(tmp_path, monkeypatch)
+    host.settings["backup"] = {"wait_seconds": 0}  # ANYM-744: the default waits; 0 is the old single check
     path, fd = held_backup_lock(tmp_path, monkeypatch)
+    BackupHost(tmp_path, monkeypatch)  # answers the unit reads: every unit idle
     try:
         outcome = host.deploy()
     finally:
@@ -5923,9 +6452,11 @@ def test_a_missing_lock_directory_never_skips_the_lock_when_named_or_when_a_runn
 @pytest.mark.parametrize("auto", [False, True])
 def test_a_deploy_returns_busy_while_a_calendar_backup_worker_is_not_verified_stopped(tmp_path, monkeypatch, auto):
     host = Deployer(tmp_path, monkeypatch)
+    host.settings["backup"] = {"wait_seconds": 0}  # ANYM-744: the default waits; 0 is the old single check
     lock = tmp_path / "backups" / ".runner.lock"
     lock.parent.mkdir(mode=0o700)
     monkeypatch.setenv("DEEDKIT_BACKUP_LOCK", str(lock))
+    BackupHost(tmp_path, monkeypatch)  # answers the unit reads: every unit idle
     marker = tmp_path / "backups" / ".runner.lock.unsettled"
     marker.write_text('{"profile":"calendar"}\n')  # a calendar run failed its recovery and released the locks
     outcome = host.deploy(auto=auto)

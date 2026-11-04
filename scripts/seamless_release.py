@@ -586,7 +586,7 @@ def wait_ready(settings, receipt):
         time.sleep(.25)
 
 
-def promote(settings, sha):
+def promote(settings, sha, *, backup_waited=0):
     validate_settings(settings)
     p.promotable(sha)
     release = Path(settings['state_directory']) / sha
@@ -635,6 +635,8 @@ def promote(settings, sha):
         durable_write(release / 'http-attempted.json', {'status': 'recovery-required', 'sha': sha})
         raise Refused('router transaction needs recovery inspection; no blind retry or retirement') from exc
     receipt.update({'status': 'serving-retirement-pending', 'router_after': proposed})
+    if backup_waited:  # ANYM-744: only a release that waited for a running backup says so; prepared receipts are unchanged
+        receipt['backup_wait_seconds'] = backup_waited
     durable_write(release / 'http-result.json', receipt)
     durable_write(release / 'http-attempted.json', {'status': 'serving', 'sha': sha})
     durable_write(Path(settings['state_directory']) / 'http-current.json', receipt)
@@ -986,6 +988,18 @@ def clean_command(settings, remove, plan_a_config):
             'disk_free_gib_before': before, 'disk_free_gib_after': disk_free()}
 
 
+def backup_wait_flag(text):
+    """`--backup-wait`: the standalone promote's bound (ANYM-744) with plan A's key and range; the HTTP configuration,
+    whose digest binds prepared releases, carries none."""
+    try:
+        return p.check_backup_wait(int(text))
+    except ValueError:
+        message = f"backup.wait_seconds {text!r} is not an integer from 0 to {p.BACKUP_WAIT_MAX} seconds"
+    except p.Refused as exc:
+        message = str(exc)
+    raise argparse.ArgumentTypeError(message)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['bootstrap', 'prepare', 'promote', 'retire', 'status', 'clean'])
@@ -993,6 +1007,9 @@ def main(argv=None):
     parser.add_argument('--config', default='/etc/deedkit/http-production.json')
     parser.add_argument('--remove', action='store_true', help='clean: remove the listed containers and then old release images')
     parser.add_argument('--plan-a-config', help='clean --remove: the plan A configuration for the image pass')
+    parser.add_argument('--backup-wait', type=backup_wait_flag, default=p.BACKUP_WAIT, metavar='SECONDS',
+                        help=f'promote: wait up to this long (0 to {p.BACKUP_WAIT_MAX}, default {p.BACKUP_WAIT}) for a '
+                             'running backup, then hold its lock; past it exit 75')
     args = parser.parse_args(argv)
     os.umask(0o077)
     try:
@@ -1001,12 +1018,21 @@ def main(argv=None):
         settings = validate_settings(p.config(args.config))
         if args.action in {'bootstrap', 'prepare', 'promote', 'retire'} and not re.fullmatch(r'[0-9a-f]{40}', args.sha or ''):
             raise Refused('an exact lowercase 40-character main SHA is required')
-        with locks(settings):
+        with locks(settings), ExitStack() as held:
+            waited = 0
+            if args.action == 'promote':
+                # ANYM-744: wait for a running backup inside the locks (deploy's order), then hold its lock.
+                waited = held.enter_context(p.backup_gate(settings, args.backup_wait))
             result = {'bootstrap': lambda: bootstrap(settings, args.sha), 'prepare': lambda: prepare(settings, args.sha),
-                'promote': lambda: promote(settings, args.sha), 'retire': lambda: retire(settings, args.sha),
+                'promote': lambda: promote(settings, args.sha, backup_waited=waited), 'retire': lambda: retire(settings, args.sha),
                 'status': lambda: status(settings, args.sha),
                 'clean': lambda: clean_command(settings, args.remove, args.plan_a_config)}[args.action]()
+            if waited:
+                result = {**result, 'backup_wait_seconds': waited}
         print(json.dumps(result, indent=2))
+    except p.BackupRunning as exc:  # nothing was written
+        print(json.dumps(exc.line()))
+        parser.exit(p.EX_TEMPFAIL)
     except Exception as exc:
         parser.exit(1, 'HTTP release refused: ' + (str(exc) if isinstance(exc, Refused) else type(exc).__name__) + '\n')
 

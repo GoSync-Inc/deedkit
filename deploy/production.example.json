@@ -1,6 +1,7 @@
 {
   "version": 1,
   "state_directory": "/var/lib/deedkit-production",
+  "backup": {"wait_seconds": 2700},
   "migration": {
     "copy_timeout_s": 1800,
     "receiver_schema_max": 51,

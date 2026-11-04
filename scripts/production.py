@@ -450,6 +450,8 @@ def config(path):
     state = Path(value["state_directory"])
     if not state.is_absolute() or state.is_symlink():
         raise Refused("state directory must be an absolute non-symlink path")
+    if "backup" in value:
+        backup_wait(value)  # ANYM-744: refused here, before any command writes
     seen = set()
     for project in value["projects"]:
         name = project["name"]
@@ -973,42 +975,193 @@ def now():
 # stays off the host unnoticed. A host without the file runs no backup and is not checked.
 BACKUP_RUNNER = Path("/opt/personal-os-probe/ops/backup_runner.py")
 BACKUP_RUNNER_SOURCE = "services/messaging/messaging_service/backup_runner.py"
-# Messaging's runner lock: messaging's run and the calendar's (its `host_lock`, ANYM-608) hold it. A manual `deploy` takes
-# it without waiting; `deploy --auto` runs under the unit's `flock` wrapper on the same file (DEEDKIT_BACKUP_LOCK).
+# Messaging's runner lock: messaging's run and the calendar's (its `host_lock`, ANYM-608) hold it. A manual `deploy`,
+# `apply` and the standalone HTTP `promote` wait for a running backup (ANYM-744) and then hold it for their run;
+# `deploy --auto` runs under the unit's `flock` wrapper on the same file (DEEDKIT_BACKUP_LOCK).
 BACKUP_LOCK = Path("/opt/personal-os-probe/backups/.runner.lock")
+# ANYM-744: the bound of that wait (`backup.wait_seconds` of the plan A configuration, `--backup-wait` of the standalone
+# promote), its maximum (the runner's own `busy_wait_seconds` maximum, BACKUP.md), the poll interval and one
+# `systemctl` probe's timeout.
+BACKUP_WAIT, BACKUP_WAIT_MAX, BACKUP_POLL, BACKUP_PROBE = 2700, 7200, 15, 60
+EX_TEMPFAIL = 75  # a backup is running: try again later (the autodeploy unit's SuccessExitStatus)
 
 
 def backup_lock_path():
     return Path(os.environ.get("DEEDKIT_BACKUP_LOCK") or BACKUP_LOCK)
 
 
-def unsettled_backup():
-    """The calendar runner's `<host_lock>.unsettled` marker: its worker may still run although no process holds the
-    lock (a failed recovery, a killed runner). Its `--recover-stop` or next run removes it."""
+def unsettled_marker():
+    """The calendar runner's `<host_lock>.unsettled` marker when it exists: its worker may still run although no
+    process holds the lock (a failed recovery, a killed runner). Its `--recover-stop` or next run removes it."""
     path = Path(f"{backup_lock_path()}.unsettled")
-    if os.path.lexists(path):
+    return path if os.path.lexists(path) else None
+
+
+def unsettled_backup():
+    if path := unsettled_marker():
         return f"backup_running: a calendar backup worker is not verified stopped ({path}); its runner settles it"
     return None
 
 
-@contextmanager
-def backup_lock():
-    """Hold the backup runner's lock, or refuse `Busy` while a backup holds it. Only a host without the runner and
-    without the lock's directory skips it; a missing directory named by DEEDKIT_BACKUP_LOCK refuses."""
+class BackupRunning(Busy):
+    """A backup runs (its lock, unit or unsettled marker) and the bound passed: exit 75, nothing was written."""
+
+    code = "backup_running"
+
+    def __init__(self, unit, waited_seconds, since=None, detail=None):
+        super().__init__(detail or f"backup_running: {unit} is running")
+        self.unit, self.waited_seconds, self.since = unit, waited_seconds, since
+
+    def line(self):
+        return {"status": "busy", "code": self.code, "unit": self.unit, "waited_seconds": self.waited_seconds,
+                "since": self.since}
+
+
+def check_backup_wait(value):
+    if type(value) is not int or not 0 <= value <= BACKUP_WAIT_MAX:
+        raise Refused(f"backup.wait_seconds {value!r} is not an integer from 0 to {BACKUP_WAIT_MAX} seconds")
+    return value
+
+
+def backup_wait(settings):
+    """`backup.wait_seconds` of the plan A configuration (default BACKUP_WAIT), or a refusal naming the key, the value
+    and the range. The section is outside `settings_digest`: adding it changes no prepared release."""
+    section = settings.get("backup")
+    if section is None:
+        return BACKUP_WAIT
+    if not isinstance(section, dict) or set(section) - {"wait_seconds"}:
+        raise Refused("backup must be an object with only wait_seconds")
+    return check_backup_wait(section["wait_seconds"]) if "wait_seconds" in section else BACKUP_WAIT
+
+
+def open_backup_lock():
+    """The runner lock's descriptor, or None on a host without the runner and without the lock's directory (no backup
+    runs there); a missing directory named by DEEDKIT_BACKUP_LOCK or beside an installed runner refuses."""
     path = backup_lock_path()
     try:
-        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        return os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     except FileNotFoundError:
         if path.parent.exists() or os.environ.get("DEEDKIT_BACKUP_LOCK") or os.path.lexists(BACKUP_RUNNER):
             raise Refused(f"the backup runner's lock {path} cannot be opened: its directory is missing") from None
+        return None
+
+
+@contextmanager
+def backup_lock():
+    """Hold the backup runner's lock, or refuse `Busy` while a backup holds it (the single check, bound 0)."""
+    fd = open_backup_lock()
+    if fd is None:
         yield
         return
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise Busy(f"backup_running: a backup holds {path}") from exc
+            raise Busy(f"backup_running: a backup holds {backup_lock_path()}") from exc
         yield
+    finally:
+        os.close(fd)
+
+
+def backup_unit_busy(expired=lambda: False):
+    """`(unit, state)` of the first backup unit that is not positively `inactive` or `failed` (an unreadable one is
+    busy), read the way the producer pin reads it, or None when every one is idle. After every probe `expired()` ends
+    the scan: the bound passed before idle was confirmed."""
+    for unit in BACKUP_UNITS:
+        try:
+            state = run(["systemctl", "show", "-P", "ActiveState", unit], timeout=BACKUP_PROBE).strip()
+        except Exception:
+            return unit, "unreadable"
+        if state not in ("inactive", "failed"):
+            return unit, state or "unreadable"
+        if expired():
+            return unit, "not confirmed idle within the bound"
+    return None
+
+
+def backup_since(unit):
+    """When `unit` last started, from systemd, or None; read once, when the wait gives up."""
+    try:
+        return run(["systemctl", "show", "-P", "InactiveExitTimestamp", unit], timeout=10).strip() or None
+    except Exception:
+        return None
+
+
+def backup_busy(expired=lambda: False):
+    """`(name, detail, unit)` while a backup unit or the unsettled marker says a backup may run; `unit` is the unit to
+    ask for a start time, or None. The marker (a file stat) is read before the units, so a bound that ends the unit scan
+    still names it, and again after them: a runner can create it while the units are read."""
+    if marker := unsettled_marker():
+        return str(marker), unsettled_backup(), None
+    if busy := backup_unit_busy(expired):
+        return busy[0], f"backup_running: {busy[0]} is {busy[1]}", busy[0]
+    if marker := unsettled_marker():
+        return str(marker), unsettled_backup(), None
+    return None
+
+
+def backup_gate(settings, bound):
+    """The caller's wait for a running backup with `bound` seconds (backup_wait, `--backup-wait`): the deadline is
+    taken here, and a bound of 0 is the single non-waiting check."""
+    return wait_backup_idle(settings, time.monotonic() + bound, single=bound == 0)
+
+
+@contextmanager
+def wait_backup_idle(settings, deadline, *, single=False):
+    """Wait until no backup runs, then hold the runner lock for the caller's run; yields the seconds waited. Idle is
+    positive: the lock is free, every BACKUP_UNITS unit reads `inactive` or `failed` and the `.unsettled` marker is
+    absent, read again with the lock held (a runner can create the marker and die between the first read and the
+    lock). The lock is probed first, so a held lock refuses before any `systemctl` runs, and nothing is held while
+    sleeping or reading units for the first time. Polls every BACKUP_POLL seconds. The deadline (time.monotonic) is
+    checked after every probe, also before admission, so it is overshot by at most one probe and a release is never
+    admitted after it; `single` (the caller's bound is 0, see backup_gate) is the one non-waiting check, which no
+    deadline cuts short. A deadline that passed before the call is not `single`. At the bound:
+    BackupRunning, never an unlocked run. `settings` mirrors wait_for_calls; the bound comes from the caller. A host
+    without a backup runner skips the wait (open_backup_lock)."""
+    fd = open_backup_lock()
+    if fd is None:
+        yield 0
+        return
+    started, said, path = time.monotonic(), False, backup_lock_path()
+    held = str(path), f"backup_running: a backup holds {path}", None
+
+    def expired():
+        return not single and time.monotonic() >= deadline
+
+    def take():
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+
+    try:
+        while True:
+            if not take():
+                busy = held
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)  # only a probe: no candidate lock is held while units are read
+                if (busy := backup_busy(expired)) is None:
+                    if not take():
+                        busy = held
+                    elif (busy := backup_busy(expired)) is None:
+                        if not expired():
+                            break
+                        busy = str(path), "backup_running: idle was not confirmed within the bound", None
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    else:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+            now = time.monotonic()
+            if single or now >= deadline:
+                raise BackupRunning(busy[0], int(now - started), backup_since(busy[2]) if busy[2] else None, busy[1])
+            if not said:
+                print("backup check: waiting for " + busy[1].removeprefix("backup_running: "), file=sys.stderr, flush=True)
+                said = True
+            time.sleep(max(0, min(BACKUP_POLL, deadline - now)))
+        waited = int(time.monotonic() - started)
+        if said:
+            print(f"backup check: idle after {waited} s", file=sys.stderr, flush=True)
+        yield waited
     finally:
         os.close(fd)
 
@@ -1032,7 +1185,7 @@ def check_backup_runner(source, sha):
                       "install it with its backup image (production.md, Backup runner)")
 
 
-def apply(settings, sha):
+def apply(settings, sha, *, backup_waited=0):
     promotable(sha)
     state = Path(settings["state_directory"])
     release = state / sha
@@ -1104,6 +1257,8 @@ def apply(settings, sha):
                         "after_digest": digest(document), "running": running})
     result = {"sha": sha, "ci": evidence, "images": receipt["images"], "references": receipt.get("references", {}),
               "status": "applied", "applied_at": now(), "rollback": {"version": 1, "projects": restore}}
+    if backup_waited:  # ANYM-744: only a release that waited for a running backup says so
+        result["backup_wait_seconds"] = backup_waited
     write(release / "result.json", result)
     write(state / "current.json", result)
     return result
@@ -1979,9 +2134,9 @@ class CopyStuck(Refused):
 
 
 def settings_digest(settings):
-    """The plan A configuration digest receipts record. The `migration` section is not in it (ANYM-588 C7): adding it
-    changes no prepared release."""
-    return digest({key: value for key, value in settings.items() if key != "migration"})
+    """The plan A configuration digest receipts record. The `migration` section (ANYM-588 C7) and the `backup` section
+    (ANYM-744) are not in it: adding either changes no prepared release."""
+    return digest({key: value for key, value in settings.items() if key not in ("migration", "backup")})
 
 
 def copy_source(settings, name):
@@ -4294,10 +4449,13 @@ def deploy(settings, http, *, auto=False, dry_run=False, attested=None, configs=
         return outcome
     s = http_release_tool()
     with ExitStack() as held:
+        waited = 0
         try:
             held.enter_context(host_locks(settings, http, s))
-            if not auto:  # --auto: the unit's flock wrapper holds it for this whole run.
-                held.enter_context(backup_lock())
+            if not auto and not dry_run:  # --auto: the unit's flock wrapper holds it for this whole run.
+                waited = held.enter_context(backup_gate(settings, backup_wait(settings)))
+        except BackupRunning as exc:
+            return {**exc.line(), "reason": str(exc)}
         except Busy as exc:
             return {"status": "busy", "reason": str(exc)}
         except Exception as exc:
@@ -4320,15 +4478,16 @@ def deploy(settings, http, *, auto=False, dry_run=False, attested=None, configs=
         # running or failed for one target never starts a release that stops halfway.
         targets = sorted(set(published_targets(settings)) | set(published_targets(http)) | {PROOF_TARGET})
         return deploy_locked(settings, http, s, auto=auto, dry_run=dry_run, halt=halt, configs=configs,
-                             attested=attested or (lambda sha: [published(target, sha) for target in targets]))
+                             attested=attested or (lambda sha: [published(target, sha) for target in targets]),
+                             backup_waited=waited)
 
 
-def deploy_locked(settings, http, s, *, auto, dry_run, attested, halt, configs):
+def deploy_locked(settings, http, s, *, auto, dry_run, attested, halt, configs, backup_waited=0):
     state = Path(settings["state_directory"])
     record = {}
     try:
         return deploy_steps(settings, http, s, auto=auto, dry_run=dry_run, attested=attested, halt=halt, record=record,
-                            configs=configs)
+                            configs=configs, backup_waited=backup_waited)
     except Exception as exc:
         # Every failure the steps do not classify themselves ends here: a pause, unless nothing changed yet
         # and it was the network.
@@ -4625,7 +4784,7 @@ def deploy_finish(settings, s, state, http_state, finish, served, preflight=None
     return outcome
 
 
-def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, configs):
+def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, configs, backup_waited=0):
     state, http_state = Path(settings["state_directory"]), Path(http["state_directory"])
     # A tool update that stopped between `activating` and `active` is settled before anything else.
     if reconciled := reconcile_tool(settings, configs, s, dry_run=dry_run, halt=halt):
@@ -4683,6 +4842,8 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
         return {"status": "plan", "sha": candidate, "base": base,
                 "steps": migration + (["plan A"] if candidate != base else []) + ["plan B"]}
     record.update(sha=candidate, base=base, started_at=now(), status="deploying")
+    if backup_waited:  # ANYM-744
+        record["backup_wait_seconds"] = backup_waited
     write(state / "deploy.json", record)
     finish, retry = deploy_closers(record, state, misses, halt)
     # ANYM-689: containers of retired HTTP generations and the images they pinned go before the disk check of the
@@ -4803,12 +4964,15 @@ def locked_action(args):
         else:
             if not re.fullmatch(r"[0-9a-f]{40}", args.sha or ""):
                 raise Refused("an exact lowercase 40-character commit SHA is required")
-            result = (rollback(settings, args.sha, http) if args.action == "rollback" else
-                      {"prepare": prepare, "prepare-router": prepare_router, "apply": apply}[args.action](
-                          settings, args.sha))
             if args.action == "apply":
-                # Printed only: result.json and current.json stay the release receipts.
-                result = {**result, "image_removal": retain_images(settings)}
+                # ANYM-744: wait for a running backup, then hold its lock for the whole apply (the call wait included).
+                with backup_gate(settings, backup_wait(settings)) as waited:
+                    result = apply(settings, args.sha, backup_waited=waited)
+                    # Printed only: result.json and current.json stay the release receipts.
+                    result = {**result, "image_removal": retain_images(settings)}
+            else:
+                result = (rollback(settings, args.sha, http) if args.action == "rollback" else
+                          {"prepare": prepare, "prepare-router": prepare_router}[args.action](settings, args.sha))
     return result
 
 
@@ -4844,6 +5008,8 @@ def print_result(args, result, parser):
         print(json.dumps(result, sort_keys=True))
         if result["status"] in ("halted", "rolled-back", "error", "fetch_failed"):
             parser.exit(1)
+        if result.get("code") == BackupRunning.code:  # ANYM-744: a manual deploy met a backup past its bound
+            parser.exit(EX_TEMPFAIL)
     else:
         # Receipts contain revisions/image IDs, never resolved Compose environments.
         if args.action == "prepare":
@@ -4863,6 +5029,9 @@ def main(argv=None):
             raise Refused("--verifier is only for self-test; every other command uses the installed verifier")
         args.config = args.config or (active_config() if args.action == "status" else CONFIG)
         print_result(args, execute_action(args), parser)
+    except BackupRunning as exc:  # apply: nothing was written
+        print(json.dumps(exc.line()))
+        parser.exit(EX_TEMPFAIL)
     except Exception as exc:
         message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
         if isinstance(exc, OSError) and exc.filename:

@@ -1,13 +1,16 @@
 """Synthetic release proof: never connects to a provider or production database."""
+import contextlib
 import copy
 import fcntl
 import json
+import os
 from pathlib import Path
 import shutil
 import socket
 import subprocess
 import threading
 import tempfile
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -1168,6 +1171,168 @@ def test_bootstrap_requires_clean_verified_router_build_receipt(tmp_path, monkey
     with pytest.raises(s.Refused, match='router build receipt'):
         s.bootstrap(cfg, SHA)
     assert list(Path(cfg['http_release']['router']['directory']).iterdir()) == []
+
+
+class PromoteCommand:
+    """`seamless_release.py promote` with its locks, configuration and promotion replaced by recorders; the backup wait
+    is the one under test."""
+
+    def __init__(self, tmp_path, monkeypatch):
+        self.events, self.settings = [], settings(tmp_path)
+        self.digest = s.p.digest(self.settings)
+        monkeypatch.setattr(s.os, 'geteuid', lambda: 0)
+        monkeypatch.setattr(s.p, 'config', lambda path: self.settings)
+        monkeypatch.setattr(s, 'validate_settings', lambda value: value)
+        monkeypatch.setattr(s, 'promote', lambda value, sha, **extra: self.events.append(('promote', sha)) or {'sha': sha})
+        monkeypatch.setattr(s, 'locks', self.locks)
+        monkeypatch.setattr(s.p, 'wait_backup_idle', self.wait_backup_idle)
+        monkeypatch.setattr(s.p, 'time', SimpleNamespace(monotonic=lambda: 1000.0))
+        self.refusal = None
+
+    @contextlib.contextmanager
+    def locks(self, value):
+        self.events.append('locks')
+        try:
+            yield
+        finally:
+            self.events.append('unlocks')
+
+    @contextlib.contextmanager
+    def wait_backup_idle(self, value, deadline, *, single=False):
+        self.events.append(('wait', deadline - 1000.0))
+        if self.refusal:
+            raise self.refusal
+        try:
+            yield 7
+        finally:
+            self.events.append('released')
+
+
+# spec: ANYM-744
+@pytest.mark.parametrize('flags, bound', [([], 2700), (['--backup-wait', '30'], 30), (['--backup-wait', '0'], 0),
+                                          (['--backup-wait', '7200'], 7200)])
+def test_standalone_promote_waits_for_a_backup_inside_its_locks_with_the_bound_of_its_flag(tmp_path, monkeypatch, flags, bound):
+    command = PromoteCommand(tmp_path, monkeypatch)
+    s.main(['promote', '--sha', SHA, *flags])
+    assert command.events == ['locks', ('wait', bound), ('promote', SHA), 'released', 'unlocks']
+
+
+# spec: ANYM-744
+@pytest.mark.parametrize('value', ['-1', '7201', 'ten', '1.5', ''])
+def test_standalone_promote_refuses_a_bad_backup_wait_before_any_write(tmp_path, monkeypatch, capsys, value):
+    command = PromoteCommand(tmp_path, monkeypatch)
+    with pytest.raises(SystemExit) as stopped:
+        s.main(['promote', '--sha', SHA, '--backup-wait', value])
+    assert stopped.value.code == 2 and command.events == []
+    assert 'backup.wait_seconds' in capsys.readouterr().err
+
+
+# spec: ANYM-744
+def test_standalone_promote_past_the_bound_exits_75_with_one_json_line_and_promotes_nothing(tmp_path, monkeypatch, capsys):
+    command = PromoteCommand(tmp_path, monkeypatch)
+    command.refusal = s.p.BackupRunning('personal-os-backup.service', 30, 'Wed 2026-11-04 18:00:01 UTC')
+    with pytest.raises(SystemExit) as stopped:
+        s.main(['promote', '--sha', SHA, '--backup-wait', '30'])
+    printed = capsys.readouterr().out
+    assert stopped.value.code == 75 and printed.count('\n') == 1
+    assert json.loads(printed) == {'status': 'busy', 'code': 'backup_running', 'unit': 'personal-os-backup.service',
+                                   'waited_seconds': 30, 'since': 'Wed 2026-11-04 18:00:01 UTC'}
+    assert command.events == ['locks', ('wait', 30), 'unlocks']
+
+
+# spec: ANYM-744
+@pytest.mark.parametrize('action', ['prepare', 'status', 'bootstrap', 'retire', 'clean'])
+def test_the_other_standalone_commands_never_wait_for_a_backup(tmp_path, monkeypatch, action):
+    command = PromoteCommand(tmp_path, monkeypatch)
+    for name in ('prepare', 'status', 'bootstrap', 'retire', 'clean_command'):
+        monkeypatch.setattr(s, name, lambda *args, **extra: {})
+    s.main([action, '--sha', SHA])
+    assert not any(isinstance(event, tuple) and event[0] == 'wait' for event in command.events)
+
+
+# spec: ANYM-744
+def test_the_http_configuration_and_a_prepared_release_digest_do_not_change_with_the_backup_wait(tmp_path, monkeypatch):
+    command = PromoteCommand(tmp_path, monkeypatch)
+    s.main(['promote', '--sha', SHA, '--backup-wait', '30'])
+    assert s.p.digest(command.settings) == command.digest and 'backup' not in command.settings
+
+
+class WaitClock:
+    """The fake clock for the backup wait: only `sleep` moves it, hooks run after each sleep, the rest is real time."""
+
+    def __init__(self):
+        self.now, self.hooks = 0.0, []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+        for hook in self.hooks:
+            hook(self.now)
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+# spec: ANYM-744
+def test_promote_records_the_backup_wait_in_its_receipts_and_the_prepared_receipt_stays_unchanged(tmp_path, monkeypatch):
+    cfg, release, calls, receipt = fixture(tmp_path, monkeypatch)
+    prepared = (release / 'http-prepared.json').read_bytes()
+    s.promote(cfg, SHA, backup_waited=1234)
+    assert s.p.read(release / 'http-result.json')['backup_wait_seconds'] == 1234
+    assert s.p.read(Path(cfg['state_directory']) / 'http-current.json')['backup_wait_seconds'] == 1234
+    assert (release / 'http-prepared.json').read_bytes() == prepared
+
+
+# spec: ANYM-744
+def test_promote_without_a_wait_adds_nothing_to_its_receipts(tmp_path, monkeypatch):
+    cfg, release, calls, receipt = fixture(tmp_path, monkeypatch)
+    s.promote(cfg, SHA)
+    assert 'backup_wait_seconds' not in s.p.read(release / 'http-result.json')
+
+
+# spec: ANYM-744
+def test_standalone_promote_waits_on_the_real_lock_then_runs_the_real_promotion_inside_it(tmp_path, monkeypatch, capsys):
+    cfg, release, calls, receipt = fixture(tmp_path, monkeypatch)
+    lock = tmp_path / 'backups' / '.runner.lock'
+    lock.parent.mkdir(mode=0o700)
+    monkeypatch.setenv('DEEDKIT_BACKUP_LOCK', str(lock))
+    backup = {'fd': os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)}  # a running backup
+    fcntl.flock(backup['fd'], fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def ends_at_ten_minutes(now):
+        if now >= 600 and backup['fd'] is not None:
+            os.close(backup['fd'])
+            backup['fd'] = None
+
+    def held():
+        fd = os.open(lock, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(fd)
+        return False
+
+    clock = WaitClock()
+    clock.hooks.append(ends_at_ten_minutes)
+    monkeypatch.setattr(s.p, 'time', clock)
+    inner = s.p.run
+    monkeypatch.setattr(s.p, 'run', lambda argv, **kw: 'inactive\n' if argv[:2] == ['systemctl', 'show'] else inner(argv, **kw))
+    gate, real_wait, waits, inside = s.p.promotable, s.p.wait_backup_idle, [], []
+    monkeypatch.setattr(s.p, 'promotable', lambda sha: inside.append(held()) or gate(sha))
+    monkeypatch.setattr(s.p, 'wait_backup_idle', lambda *args, **kwargs: waits.append(args) or real_wait(*args, **kwargs))
+    monkeypatch.setattr(s.os, 'geteuid', lambda: 0)
+    monkeypatch.setattr(s.p, 'config', lambda path: cfg)
+    monkeypatch.setattr(s, 'validate_settings', lambda value: value)  # root-ownership checks need a root test host
+    monkeypatch.setattr(s, 'locks', lambda value: contextlib.nullcontext())
+    s.main(['promote', '--sha', SHA])
+    printed = json.loads(capsys.readouterr().out)
+    assert 600 <= printed['backup_wait_seconds'] < 615 and len(waits) == 1
+    assert inside and all(inside) and 'switch' in calls and not held()
+    assert s.p.read(release / 'http-result.json')['backup_wait_seconds'] == printed['backup_wait_seconds']
 
 
 def test_promotion_preserves_every_fenced_issuer_tombstone(tmp_path, monkeypatch):

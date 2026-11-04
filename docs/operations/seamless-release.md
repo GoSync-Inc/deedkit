@@ -160,7 +160,9 @@ diagnostic and cannot authorize enrollment. Preparation starts no serving units.
 
 The [operator](../../scripts/seamless_release.py) exposes `bootstrap`, `prepare`,
 `promote`, `retire`, `status` and `clean` (the containers of retired generations,
-production.md "Image retention"); use `--help` from the reviewed checkout. Commands
+production.md "Image retention"); use `--help` from the reviewed checkout. Standalone
+`promote` waits up to `--backup-wait SECONDS` (0 to 7200, default 2700) for a running backup and holds its lock;
+past the bound it exits 75 (production.md "Waiting for a running backup"). Commands
 coordinate with both the canonical host deployment lock and scoped state lock.
 Keep resolved Compose/policy files, socket directories and journals out of Git
 and distribution artifacts.
