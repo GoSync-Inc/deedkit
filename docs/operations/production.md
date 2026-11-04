@@ -595,9 +595,16 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
       `personal-os-backup.timer`, `deedkit-calendar-backup.timer` and `deedkit-calendar-backup-catchup.timer`
       (record which were active) and read the three services again. A backup that runs: wait for it to end
       (ANYM-744 makes `apply` wait by itself). Undo and the last step: start the recorded timers again.
-   2. `prepare`, the "Backup runner" step (it takes and releases the runner lock itself), `migrate`,
-      `apply`, plan B, then remove the pause (`status` shows no pause and no unfinished attempt).
-   3. Start the timers recorded in step 1. A daily backup the stop skipped runs at its next time; that is a
+   2. `prepare`, then the "Backup runner" step (it takes and releases the runner lock itself).
+   3. Hold the runner lock through the migration and both applies, so no backup, timer-started or by
+      hand, can start in between: `flock --nonblock /opt/personal-os-probe/backups/.runner.lock sh -euc
+      '...'`, whose script first checks again, under the lock, that the three services read `inactive` or
+      `failed` and that the `.unsettled` marker is absent, then runs `migrate`, `apply` and plan B
+      (`seamless_release.py prepare` and `promote`). Once ANYM-744 ships, `apply` and `promote` take that
+      lock themselves (with a bounded wait for a running backup): then only `migrate` runs inside the
+      wrapper, and `apply` and plan B follow it outside. Then remove the pause (`status` shows no pause
+      and no unfinished attempt).
+   4. Start the timers recorded in step 1. A daily backup the stop skipped runs at its next time; that is a
       backup follow-up, never a release hold. So is a backup receiver that does not read the new schema
       yet: a hand release does not read `receiver_schema_max`; raise it once the receiver reads the target.
 

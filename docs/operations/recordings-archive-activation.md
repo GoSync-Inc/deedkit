@@ -462,9 +462,9 @@ no data; if it stopped midway, remove only the exact container and scratch direc
 ## Order and timing
 
 R (0.5 h) -> I1 (2-3 h with the rehearsal) -> I2 (1 h) -> I-read -> A (0.5 h, plus an hour's wait and the sizing) -> V (next 21:30
-slot) -> D (1 h). Steps R, I1.1-I1.6 and I2 can be done in one working window; the archive is switched on only after I-read, at least
-an hour before 21:30. If a window closes mid-step, the stage's undo or the abort rule applies; nothing is left half-installed
-(each step writes new files beside the live ones and replaces atomically, or enables a unit last).
+slot) -> D (1 h). Steps R, I1.1-I1.6 and I2 can be done in one session at any hour (no clock windows, owner 11-04); the archive is
+switched on only after I-read and not while the recordings job runs. A step that fails takes the stage's undo or the abort rule;
+nothing is left half-installed (each step writes new files beside the live ones and replaces atomically, or enables a unit last).
 
 ## Data egress and authority
 
