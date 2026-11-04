@@ -40,7 +40,7 @@ def no_host_state(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def no_apply_settle(monkeypatch):
     """apply's settle (ANYM-758) sleeps on the real clock; only the tests that set APPLY_SETTLE_SECONDS run it."""
-    monkeypatch.setattr(p, "APPLY_SETTLE_SECONDS", 0)
+    monkeypatch.setattr(p, "APPLY_SETTLE_SECONDS", 0, raising=False)
 
 
 def comparison(sha, *, behind=0):
@@ -2458,12 +2458,42 @@ def test_a_replacement_with_a_compose_healthcheck_relies_on_its_health_wait_and_
 
 # spec: ANYM-758
 def test_the_settle_sleeps_once_per_project_and_leaves_the_call_wait_alone(tmp_path, monkeypatch):
-    host = CallHost(tmp_path, monkeypatch)
+    # A call starts after the first project settled and before the second project's stop.
+    host = CallHost(tmp_path, monkeypatch, answers=((), (), [(CALL, "active")], ()))
     monkeypatch.setattr(p, "APPLY_SETTLE_SECONDS", 10)
     host.prepared(RELEASES[0])
     assert p.apply(host.settings, RELEASES[0])["status"] == "applied"
-    assert len(host.settings["projects"]) == 2 and host.clock.sleeps == [10, 10]
-    assert [event for event in host.events if event[0] == "probe"]  # the call checks ran as before
+    # One settle per project, the unchanged call poll between them.
+    assert len(host.settings["projects"]) == 2 and host.clock.sleeps == [10, p.CALL_POLL, 10]
+    voice = host.events.index(("stop", "personal-os-voice"))
+    assert [event for event in host.events[:voice] if event[0] == "probe"][-2:] == [
+        ("probe", "voice0", [f"{RELEASES[0]}/attempted.json"])] * 2  # the active probe, then the one that let it stop
+
+
+# spec: ANYM-758
+def test_the_settle_of_a_project_with_several_services_sleeps_once_and_inspects_each(tmp_path, monkeypatch):
+    clock, inspected = Clock(), []
+    monkeypatch.setattr(p, "time", clock)
+    monkeypatch.setattr(p, "APPLY_SETTLE_SECONDS", 10)
+    def run(argv, **kwargs):
+        assert argv[:2] == ["docker", "inspect"] and clock.sleeps == [10]  # every inspect after the one sleep
+        inspected.append(argv[2])
+        return json.dumps([{"Id": argv[2], "State": {"Running": True}, "RestartCount": 0}])
+    monkeypatch.setattr(p, "run", run)
+    project = {"name": "workers", "services": {"indexer": "runtime", "enricher": "runtime", "sender": "runtime"}}
+    item = {"running": {service: {"container": "old-" + service} for service in project["services"]}}
+    unproven = [(service, "new-" + service, {"State": {"Running": True}, "RestartCount": 0}) for service in project["services"]]
+    assert p.restart_loop(project, item, unproven) is None
+    assert clock.sleeps == [10] and inspected == ["new-indexer", "new-enricher", "new-sender"]
+    # The second of three loops: one sleep still, the first two inspected, and its name in the reason.
+    clock.sleeps.clear()
+    inspected.clear()
+    def looping(argv, **kwargs):
+        inspected.append(argv[2])
+        return json.dumps([{"Id": argv[2], "State": {"Running": True}, "RestartCount": 1 if argv[2] == "new-enricher" else 0}])
+    monkeypatch.setattr(p, "run", looping)
+    assert "workers/enricher is restarting or stopped 10 s" in p.restart_loop(project, item, unproven)
+    assert clock.sleeps == [10] and inspected == ["new-indexer", "new-enricher"]
 
 
 def inventory(*versions, changed=()):
