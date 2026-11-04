@@ -74,14 +74,17 @@ def test_the_calendar_service_may_write_only_its_directory_and_the_shared_lock_d
 
 
 # spec: ANYM-607
-def test_the_calendar_timer_fires_daily_at_16_utc_persistent_inside_autodeploys_no_start_hours():
+def test_the_calendar_timer_fires_daily_at_16_utc_persistent_and_shares_the_runner_lock_with_autodeploy():
+    # Owner 11-04: autodeploy has no clock window; the calendar run and a deploy exclude each other by the lock.
     timer = unit('deedkit-calendar-backup.timer')
     assert timer['Timer']['OnCalendar'] == '*-*-* 16:00:00 UTC' and timer['Timer']['Persistent'] == 'true'
     assert timer['Timer']['Unit'] == 'deedkit-calendar-backup.service'
     assert timer['Install']['WantedBy'] == 'timers.target'
+    host_lock = json.loads((DEPLOY / 'backup-runner-calendar.example.json').read_text())['host_lock']
     autodeploy = (DEPLOY / 'deedkit-autodeploy.service').read_text()
-    blocked = re.search(r'case "\$\$h" in ([0-9|]+)\) exit 1', autodeploy)[1].split('|')
-    assert '16' in blocked and '17' in blocked
+    assert f'Environment=DEEDKIT_BACKUP_LOCK={host_lock}' in autodeploy
+    assert '/usr/bin/flock --nonblock --conflict-exit-code 75 ${DEEDKIT_BACKUP_LOCK} ' in autodeploy
+    assert 'date' not in re.search(r'^ExecCondition=(.*)$', autodeploy, re.M)[1]
 
 
 # spec: ANYM-607

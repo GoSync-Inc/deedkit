@@ -575,16 +575,15 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
    off, ANYM-607) keeps a restore point anyway: unattended, its pre-migration copy (Database copies); by
    hand, `copy-database` first. A critical release needs the backup gate above (a fresh backup and its
    restore proof, never a reused daily backup), `copy-database` first and one Astra review round of
-   its plan (reviews.md Rounds 7, AGENTS.md section 2). The release kit or PR names each file's tier.
+   its plan (harness process.md section 2, reviews.md Rounds 7). The release kit or PR names each file's tier.
 
    Accepted risk (owner 10-29, 11-01 and 11-04, quoted above): if a non-critical `migrate` destroys or
    corrupts data, a restore returns the database to the latest daily backup (about 24 hours old at most
    while the daily backup succeeds), and everything written after it (messages, receipts, keys, operator
    changes) is lost. No gate backup or copy was restored in any hand release from 10-17 to 11-04.
 4. How a non-critical release runs. `deploy` applies it itself when the range qualifies ("Unattended
-   migrations": today `expand` files and appended role grants, and only once `receiver_schema_max` reads
-   the target, phase 1). Any other range, and one held only by that receiver wait, pauses autodeploy
-   until `deploy` applies every non-critical range itself (ANYM-743); meanwhile the agent who sees the
+   migrations": today `expand` files and appended role grants; the backup receiver's schema holds none).
+   Any other range pauses autodeploy until `deploy` applies every non-critical range itself (ANYM-743); meanwhile the agent who sees the
    pause releases it at once, at any hour, with the previous release's tested commands: a tested runbook,
    so no new kit, plan or review round. The order:
    1. Exclusion from the backups (a backup stops the collectors and holds snapshots; an apply recreates
@@ -607,9 +606,8 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
       yet: a hand release does not read `receiver_schema_max`; raise it once the receiver reads the target.
 
    Merges never wait for a release: the candidate is one SHA ("Prepare and inspect"), so there is no merge
-   freeze. A hand release has no time window: its waits are an active call (the tool checks it) and a
-   running backup (step 1). The autodeploy timer still starts nothing 13:00-18:59 UTC (Timer) until its
-   unit changes.
+   freeze. No release has a time window: the waits are an active call (the tool checks it) and a running
+   backup (step 1; the autodeploy unit, "Timer").
 
 ### Migration risk tiers
 
@@ -716,8 +714,8 @@ Configuration, in the plan A file's `migration` section (`deploy/production.exam
 `databases.messaging` (Database copies): `unattended` = `{network, dsn_file, runner_config}` (the
 database's Docker network, the owner DSN file the migration container mounts read-only, readable by the
 image user 10001, and the backup runner's `runner.json`), `receiver_schema_max` (the newest schema the
-backup receiver reads; the operator raises it after updating the receiver, until ANYM-589 asks the
-receiver) and `rehearsal_limit_ms` (default 1000, at most 4000). Undo: remove `unattended` (or
+backup receiver reads, kept for the operator's own record; no release reads or waits on it since owner 11-04:
+a receiver behind the target is a backup follow-up) and `rehearsal_limit_ms` (default 1000, at most 4000). Undo: remove `unattended` (or
 `databases.messaging`) and every SQL change pauses again.
 
 What qualifies (M1): every SQL inventory path of the range is an added
@@ -731,8 +729,7 @@ Phases, each a pause or a wait before any production write:
 
 1. Admission (read-only): no active or unknown call (one poll; else `waiting` with `call_waits`); nothing
    unfinished (`unresolved`); the base release's `store.py` opens its pool with
-   `prepare_threshold: None` (#352; else "deploy #352 first"); `receiver_schema_max` is at least the
-   target (else `waiting`); the live ledger is exactly the base's (`schema_version` and every
+   `prepare_threshold: None` (#352; else "deploy #352 first"); the live ledger is exactly the base's (`schema_version` and every
    `archive_migrations` checksum; else a pause).
 2. Preparation: plan A `prepare` as always, then the producer check: the image `runner.json` pins has an
    `org.opencontainers.image.revision` whose `backup.py` `SCHEMAS` holds the target. When it does not, the
@@ -754,8 +751,8 @@ Phases, each a pause or a wait before any production write:
    applied (`<sha>/migration.json` absent, `rehearsed`, `refused` or `not-applied`): under the runner
    lock with the backup services idle, `cp -p runner.json.before-<sha> runner.json`. After the migration
    the old pin would fail every capture (`unsupported_backup_schema`): keep the new one. The calendar
-   `runner.json` keeps its own pin; move it by hand as in "Backup runner". Waits on the receiver or the
-   producer count in `deploy.json` (`migration_waits`); the third in a row pauses.
+   `runner.json` keeps its own pin; move it by hand as in "Backup runner". Waits on the producer count in
+   `deploy.json` (`migration_waits`); the third in a row pauses.
 3. Copy: ANYM-588 for `messaging`, keeping the scratch server; the copy's keeper also records the live
    catalog in its snapshot (`catalog_sha256`). A failed copy pauses "the pre-migration copy of messaging
    failed: <code>".
@@ -941,8 +938,8 @@ their own run, so no kit waits for a running backup by hand. Idle is positive: t
 sleeps; the deadline is checked after every probe and before admission, so the bound is overshot by at most one
 `systemctl` probe, and a held lock refuses before any probe. The backup wait runs before the call wait, and the
 lock stays held through it. `deploy` takes the lock once and its inner `apply` and `promote` neither wait nor take it;
-`deploy --auto` is unchanged (the unit's `flock --nonblock` holds the lock and exits 75 at once, and its 13:00-18:59 UTC
-admission stays). `prepare`, `verify`, `status`, `images`, `--dry-run` and `release-plan` never wait.
+`deploy --auto` is unchanged (the unit's `flock --nonblock` holds the lock and exits 75 at once; it has no
+clock window, owner 11-04). `prepare`, `verify`, `status`, `images`, `--dry-run` and `release-plan` never wait.
 
 `backup.wait_seconds` is an optional integer from 0 to 7200 (default 2700; 7200 is the runner's own
 `busy_wait_seconds` maximum, BACKUP.md) in the plan A configuration, outside the configuration digest like `migration`;
@@ -963,7 +960,7 @@ the marker; settle it with `--recover-stop`. A SIGTERM during the wait takes and
 A release has no clock window (owner 11-04: «давай все делать не ждать ничего»), so it may run into a scheduled
 backup start: the wait does not protect a scheduled start. A scheduled backup that starts while a release holds the lock
 is refused, and what follows differs by unit (see "Continuous deployment"); a daily lost that way is a backup follow-up,
-never a release hold. Only the autodeploy unit's 13:00-18:59 UTC admission stays until its unit changes.
+never a release hold. The autodeploy unit has no clock window either ("Timer").
 
 ### Backup runner
 
@@ -1942,6 +1939,88 @@ configuration files; `production.py prepare --sha S` and `apply --sha S` (plan A
 the new state current (a dry run with the pause file present returns `paused` before it checks drift). Plan A apply
 restarts the selected services of the enrolled projects as in any release.
 
+**Enrollment (ANYM-745).** The hand release above is declared by a reviewed manifest, `deploy/modules/<module>.json`
+(first one: `recordings.json`), and checked by one read-only command that prints the exact edits:
+
+```sh
+sudo python3 /usr/local/lib/deedkit/production.py enroll --module recordings --sha <green main sha> --plan
+```
+
+The tool reads the manifest from the verified main commit in its source mirror, never from a working tree. It writes no
+production state (its scratch copies live in private temporary directories) and prints no secret: env files, private
+configurations and key files are read for presence, mode, owner and digests, never printed. Exit 0 prints the plan; exit 2
+prints `{"status": "refused", "refusals": [{"code", "detail"}]}` with one entry per failed precondition. Applying and
+undoing a plan is the next command (ANYM-746); until it exists the plan replaces steps 12b-18 of the ANYM-713 hand plan
+and the edits are made by hand from it.
+
+*Manifest.* Exactly these keys, nothing else: `name` (the file name); `project` (`name`, `files` as repository paths under
+`deploy/`, `env_file` as an absolute host path, `env_required` variable names, `services` as service to build target);
+`gateway` (`overlay` a repository path or null, and `policy`: `module`, `backend_url`, `tools`, `principals` with their
+`grants`, `key_dir` as an absolute host directory, `key_file_pattern` with `{principal}`, `key_uid`); `egress`
+(`outside` false, or true with `admission_env` (`blocked` and `open` variable names), `canary`, `verify` (a command whose
+first word is a repository script `scripts/*_egress_check.py`), `verify_env`, `open` targets, `blocked` (the address
+classes `host` and `tailnet` that need a blocked target with a known listener) and `controls` (`dns_env`, the variable
+whose resolver must be an open `dns:` target: the positive control)); `private_config` (`mount` the container directory
+the Compose file mounts, `file` its configuration file, `forbidden_keys` the key paths that must be absent at first start,
+`credential_files` the key paths whose values are provider credential files under that mount); `owner_steps` (strings the plan prints); `live_actions` (always empty). Secrets never
+live in a manifest.
+
+*Refusal codes.* Manifest (one cause each): `manifest_missing`, `manifest_invalid`, `manifest_unknown_key`,
+`manifest_repo_path` (an absolute, `..` or non-`deploy/` repository path), `manifest_relative_path` (a host path that is
+not absolute), `manifest_forbidden_service` (`db`, `calendar-db`, `database`, `postgres`, `operator`),
+`manifest_grant_wildcard` (a grant containing `*`), `manifest_unknown_principal` (a principal the live policy does not
+define), `manifest_egress_incomplete` (`outside` true without admission settings), `manifest_verify_script` (a verify
+script outside `scripts/` or not ending in `_egress_check.py`), `manifest_live_actions` (a non-empty list). Plan:
+`sha_not_verified` (not a green main commit, `promotable`), `sha_already_prepared` (a candidate directory of that SHA
+exists), `module_enrolled` (the project is already in the configuration), `policy_module_present` (the live policy already
+names the module), `no_current_release`, `gateway_project_missing`, `source_unavailable` (a file is not in the commit or
+the gateway project's first file cannot be read), `range_sql_inventory` (the range from the current release changes SQL
+or migrations), `range_tool_pending` (a deploy tool not installed yet), `range_backup_changed` (the backup runner or a
+backup unit changed), `env_file_missing`, `env_file_mode` (not a regular file of mode 0600 owned by root),
+`env_variable_unset` (a required variable is missing or empty), `compose_config_failed` (`docker compose config` of the
+project, or of the gateway project with the overlay, with exactly the files and env file the tool will record),
+`call_active`, `calls_unknown`, `paused` (the autodeploy pause file exists), `egress_env_missing` (the canary or an open
+target is not in the env file), `egress_verify_failed` (the verify script did not print `ok`), `key_file_invalid` (a
+gateway key file is missing, not a regular file, not mode 0600, not owned by `key_uid`, or empty), `policy_unreadable`,
+`policy_check_failed` (the candidate is not additions only, or `deedkit-gateway --check` fails in any serving gateway
+image: every distinct image of a running `gateway` or `http-gateway-*` container), `private_config_unreadable` and
+`private_config_forbidden_key`, `credential_file_invalid` (a file named at a `credential_files` path is missing, outside
+the mount, not a regular file, readable by group or other, not owned by the configuration's owner, or empty: mode, owner
+and size only, never a byte), `egress_target_invalid` (a blocked target that is not `IP:PORT`),
+`egress_blocked_incomplete` (no blocked target in a class the manifest requires), `egress_control_missing` (the open
+targets lack `dns:<resolver>`) and `command_timeout` (a command outside the probes exceeded its time limit; a probe that
+times out refuses with its own code). The verify script gets a private `--env-file` holding exactly the `verify_env`
+values this plan checked, never the process environment. A malformed manifest the range does not change is not parsed by a
+deploy, and a deploy gates the range of the release it selects, not the tip of main. The `private_config_forbidden_key` check reads the private configuration the container will actually mount (resolved
+from the Compose document, so a changed `RECORDINGS_STATE_DIR` selects another file) and refuses when a forbidden key,
+for recordings `archive` or `accounts[*].archive_namespace`, is present: a first enrollment is on-demand reads only
+(docs/DATA-POLICY.md). Only the presence of a key is read, never a value.
+
+*Plan.* The overlays to install (repository path, host path in the gateway project's directory, sha256, git blob id, owner,
+group and mode copied from the gateway project's first file); the project object appended to `production.json` only (plan B
+accepts exactly two services); the gateway project's `files` with the overlay in both `production.json` and
+`http-production.json`; the `env_files` entry; the candidate policy (revision plus one, additions only, listed); the owner
+steps. The output ends with `plan_digest`, the sha256 of the SHA, the manifest blob id, both configuration digests, the live
+policy digest, every overlay digest, the grants, the verify and canary values, the content digests of the env file and of the
+mounted private configuration, the digest of the candidate policy (so a replaced key changes it) and the digests of the resolved Compose documents (the
+project, the plan A gateway and the HTTP gateway, each in its own directory with its own files). Recomputing the plan gives the same digest
+only while none of them changed; the apply command (ANYM-746) refuses a different `--plan-digest`.
+
+*Review sequence.* The manifest pull request is reviewed as code like any change under `deploy/` (the review-protocol
+signal grep already matches `deploy/modules/`; Astra r1 when it adds grants or outside egress). After it merged, the plan
+output for the real host is a production operation plan and gets its own Astra r1 (harness reviews.md, Rounds 7); the apply
+step is bound to the approved digest.
+
+*Autodeploy.* When a deploy finds a manifest in its range for a module the host does not run, or a configuration that
+differs from the recorded digests only by an enrollment, it pauses with `enroll_required: <module>: production.py enroll
+--module <module> --sha <sha> --plan`. It never enrolls by itself: restarts, firewall and access are not for a timer.
+
+*What stays with a person.* The owner writes provider tokens by hand and makes the registry package public after its first
+publication; backend and gateway key files are an agent step under the section 2 gates, only checked here; root firewall
+activation stays its own gated step (the plan runs the read-only verify and refuses unless it prints `ok`); the first real
+read through a provider is the owner-confirmed live read of the module's card. Sends, calls, ACKs, pairing, provider-session
+changes and allowlist changes are never part of a manifest.
+
 **Undo**, in order: remove the module, tools, grants and credential from the policy (new revision); stop
 `recordings-api` only (`docker compose $F stop recordings-api`) and leave autodeploy paused, which is the
 holding state; at a NEWER green `main` SHA (a docs-only pull request creates one) restore both configuration backups
@@ -2014,6 +2093,23 @@ pass. What is lost: a removed container's metadata and json-file logs; an image 
 only from `prepared.json` registry references while the package version exists (a
 local-only build cannot be restored). Unresolved generations (no receipt, no recorded
 retirement, an interrupted promotion) are counted, never removed by the tool.
+
+A release generation whose candidate fails to start (ANYM-757). When `promote` fails after
+it started the candidate (readiness, activation or a guard before traffic), it records
+`startup-failed` in `http-attempted.json`, then stops the candidate with `docker compose
+--project-name deedkit-http-<generation> -f <its http.json> stop http-api-<generation>
+http-gateway-<generation>`: its own project and services only, never the serving generation,
+the router or another project. The containers are stopped, never removed, so their logs and
+state stay inspectable: `docker ps -a --filter label=ai.deedkit.http-release=<generation>`.
+Without the stop, the candidate keeps the live service's restart policy and crash-loops
+unrouted (10-28: 14 hours, 886 error events). The stop is best effort with the tool's
+command timeout; its outcome is recorded as `candidate_stopped: true|false` beside
+`startup-failed`, and its failure never replaces the promotion's own error. A failure
+before any container starts (prepared validation, schema check) stops nothing.
+`production.py status` lists such attempts as `http_failed_attempts` (sha and
+`candidate_stopped`; absent on attempts before ANYM-757). A `startup-failed` attempt does
+not block the next release, which prepares a new generation; removing the stopped
+containers stays manual (`clean` counts them as unresolved).
 
 Only images carrying a `deedkit-production-<target>:*` tag of the eight
 CI-published targets are considered. Kept, with reasons:
@@ -2297,10 +2393,12 @@ the optional `/etc/deedkit/autodeploy.env` (root-owned, mode `0600`) sets
 A deploy and the daily backup never overlap; the backup stops the collectors
 (`personal-os-backup.timer`, 18:00 UTC) and an apply would recreate them.
 Admission: the unit starts no deploy while `personal-os-backup.service` runs or
-waits to retry (any state but `inactive` or `failed`) and none from 13:00 to
-18:59 UTC; a failed or unexpected read of either skips the run. A run admitted
-before 13:00 ends by 17:03 at the latest (the 4-hour start timeout plus the
-3-minute stop timeout), so it is over before the scheduled backup starts.
+waits to retry (any state but `inactive` or `failed`); a failed or unexpected
+read skips the run. There is no clock window (owner 11-04: «давай все делать не
+ждать ничего»): a deploy may still run at 18:00, and then the scheduled backup
+refuses on the runner lock below and systemd retries it (30 minutes apart, at
+most three starts in 8 hours). A daily backup lost that way is a backup
+follow-up, never a release hold (owner 11-04, accepted).
 Exclusion: the deploy holds the backup runner's own lock
 (`/opt/personal-os-probe/backups/.runner.lock`, `DEEDKIT_BACKUP_LOCK`) for its
 whole run, so a backup started by hand during a deploy refuses before it stops
@@ -2353,7 +2451,7 @@ run it as one background command. `LIVE` (exit 0): plan A `applied` and the HTTP
 (or `serving-retirement-pending`) both contain the commit, with no pause and no unfinished attempt.
 `UNSETTLED` (1): both contain it, but a pause exists or an attempt is unfinished, so do not report it
 live. `REFUSED` (1): the commit is not deployed and a pause exists. `TIMEOUT` and `UNREACHABLE` (2):
-no verdict (default budget 4 hours, because the timer starts no deploy from 13:00 to 18:59 UTC). Each
+no verdict (default budget 4 hours). Each
 poll runs one constant ssh command that sends a fixed read-only script, which prints only `sha`,
 `status`, `reason` and `at` of `current.json`, `http-current.json` and `deploy.json`, the pause
 reason and the names of unfinished and serving attempts. The tool reads receipts; it does not probe containers.

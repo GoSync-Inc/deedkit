@@ -23,12 +23,15 @@ if GUARDED:
     sys.addaudithook(refuse_side_effects)
 
 import argparse
+import copy
 from contextlib import ExitStack, contextmanager, suppress
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+import io
+import ipaddress
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import posixpath
 import re
 import resource
@@ -37,6 +40,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import tarfile
 import tempfile
 import time
 import uuid
@@ -3737,8 +3741,9 @@ def follow_producer(settings, mirror, plan, candidate, release):
 
 def migration_gate(settings, http, plan, mirror, base, serving):
     """M2's read-only gates, at admission and again as the final gate: no active or unknown call, nothing
-    unfinished, the base release's Store without server-side prepared statements (#352), a receiver that reads the
-    target, and the live ledger exactly the base's."""
+    unfinished, the base release's Store without server-side prepared statements (#352) and the live ledger exactly
+    the base's. The backup receiver's schema (`receiver_schema_max`) holds no release (owner 11-04): a receiver that
+    does not read the target yet is a backup follow-up."""
     wait_for_calls(settings, time.monotonic() + CALL_POLL)
     if reason := unresolved(Path(settings["state_directory"]), Path(http["state_directory"]), lambda: mirror, serving):
         raise MigrationRefused(reason)
@@ -3750,9 +3755,6 @@ def migration_gate(settings, http, plan, mirror, base, serving):
         store = ""
     if not UNPREPARED.search(store):
         raise MigrationRefused("the running release would fail on the new columns: deploy #352 first")
-    limit = settings["migration"].get("receiver_schema_max")
-    if type(limit) is not int or limit < plan["target"]:
-        raise MigrationWait(f"the backup receiver does not read schema {plan['target']} yet")
     version, applied = live_ledger(copy_source(settings, AUTO_DATABASE)[0])
     if version != plan["base"] or applied != plan["ledger"]:
         raise MigrationRefused(f"the live {AUTO_DATABASE} ledger is not the base's schema {plan['base']}; "
@@ -4824,6 +4826,9 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
     if reason := unresolved(state, http_state, lambda: mirror, serving["sha"]):
         return halt(reason)
     if drift := configuration_drift(settings, http, current, serving):
+        # ANYM-745 M3: a drift that only an enrollment explains names the enrollment command, not "by hand".
+        if enrolled := enrollment_only(mirror, head, settings, http, current, serving):
+            return halt(enroll_required(enrolled[0], head))
         return halt(drift + "; apply the next release by hand")
     installed = {"scripts/production.py": RUNNING, "scripts/seamless_release.py": s.__file__,
                  **{path: SYSTEMD_DIRECTORY / Path(path).name for path in UNITS}}
@@ -4831,6 +4836,10 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
                                                 dry_run, halt)
     if halted is not None:
         return halted
+    # ANYM-745: the gate reads the range of the release this run would deploy, not the tip of main; a catch-up of the
+    # HTTP pair to the applied plan A (candidate == base) installs no new manifest.
+    if candidate != base and (pending := enrollment_pending(mirror, since, candidate, settings)):
+        return halt(enroll_required(pending[0], candidate), sha=candidate)
     sql, pending = range_changes(mirror, since, candidate, installed)
     halted, plans = deploy_plan(settings, s, configs, mirror, base, since, candidate, sql, pending, dry_run, halt)
     if halted is not None:
@@ -4880,6 +4889,20 @@ def http_release_tool():
     return seamless_release
 
 
+def http_failed_attempts(path):
+    """`status`: plan B attempts whose candidate failed to start, each with whether the tool stopped it (ANYM-757:
+    `candidate_stopped`, absent on attempts before it). Nothing without plan B; a read failure is named, never raised."""
+    if not os.path.lexists(path):
+        return []
+    try:
+        http_state = Path(config(path)["state_directory"])
+        attempts = [(item.parent.name, read(item)) for item in sorted(http_state.glob("*/http-attempted.json"))]
+        return [{"sha": sha, **{key: value[key] for key in ("candidate_stopped",) if key in value}}
+                for sha, value in attempts if value.get("status") == "startup-failed"]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, Refused) as exc:
+        return {"error": type(exc).__name__}
+
+
 def active_config():
     """The plan A configuration the autodeploy unit reads: DEEDKIT_DEPLOY_CONFIG from the environment, else from the
     optional /etc/deedkit/autodeploy.env (deploy/deedkit-autodeploy.service), else CONFIG."""
@@ -4908,19 +4931,697 @@ def active_config():
     return found
 
 
+# Enrollment of a new module (ANYM-745, production.md "Enrollment"): `enroll --module M --sha S --plan` reads the
+# reviewed manifest deploy/modules/M.json from the verified main commit S, checks every precondition of a hand
+# enrollment and prints the exact edits with a `plan_digest`. It writes no production state (its scratch files live in
+# private temporary directories) and prints no secret: env files, private configurations and key files are read for
+# presence, mode, owner and digests only.
+MODULE_DIRECTORY = "deploy/modules/"
+ENROLL_OWNER = 0  # the env file's owner on the host: root
+ENROLL_FORBIDDEN_SERVICES = frozenset({"db", "calendar-db", "database", "postgres", "operator"})
+VERIFY_SCRIPT = re.compile(r"scripts/[a-z0-9_]+_egress_check\.py")
+BACKUP_FILES = re.compile(r"services/messaging/messaging_service/backup_runner\.py|deploy/[^/]*backup[^/]*\.(service|timer)")
+MODULE_NAME = re.compile(r"[a-z][a-z0-9-]{0,40}")
+ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+KEY_PATH = re.compile(r"[A-Za-z0-9_]+(\[\*\])?(\.[A-Za-z0-9_]+(\[\*\])?)*")
+ENROLL_CODES = (
+    "manifest_missing", "manifest_invalid", "manifest_unknown_key", "manifest_repo_path", "manifest_relative_path",
+    "manifest_forbidden_service", "manifest_grant_wildcard", "manifest_unknown_principal", "manifest_egress_incomplete",
+    "manifest_verify_script", "manifest_live_actions", "sha_not_verified", "sha_already_prepared", "module_enrolled",
+    "policy_module_present", "range_sql_inventory", "range_tool_pending", "range_backup_changed",
+    "env_file_missing", "env_file_mode", "env_variable_unset", "compose_config_failed", "call_active",
+    "calls_unknown", "paused", "egress_env_missing", "egress_verify_failed", "key_file_invalid",
+    "policy_unreadable", "policy_check_failed", "private_config_unreadable", "private_config_forbidden_key",
+    "no_current_release", "gateway_project_missing", "source_unavailable", "command_timeout", "egress_target_invalid",
+    "egress_blocked_incomplete", "egress_control_missing", "credential_file_invalid")
+# The blocked targets a manifest must cover, by address class (a host listener, a tailnet node's listener).
+EGRESS_CLASSES = {"host": ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"), "tailnet": ("100.64.0.0/10",)}
+MANIFEST_KEYS = {"name", "project", "gateway", "egress", "private_config", "owner_steps", "live_actions"}
+
+
+class EnrollRefused(Refused):
+    """One failed precondition of an enrollment, with its code (ENROLL_CODES) and a detail that never holds a secret."""
+
+    def __init__(self, code, detail=""):
+        super().__init__(f"{code}: {detail}" if detail else code)
+        self.code, self.detail = code, detail
+
+
+class EnrollRefusals(Refused):
+    """Every failed precondition of one plan."""
+
+    def __init__(self, failures):
+        super().__init__("; ".join(f"{item['code']}: {item['detail']}" if item["detail"] else item["code"]
+                                   for item in failures))
+        self.failures = failures
+
+
+def manifest_keys(value, keys, where, required=None):
+    if not isinstance(value, dict):
+        raise EnrollRefused("manifest_invalid", f"{where} must be an object")
+    if unknown := sorted(set(value) - keys):
+        raise EnrollRefused("manifest_unknown_key", f"{where}: {', '.join(unknown)}")
+    if missing := sorted((keys if required is None else required) - set(value)):
+        raise EnrollRefused("manifest_invalid", f"{where} lacks {', '.join(missing)}")
+    return value
+
+
+def manifest_text(value, where, pattern=None):
+    if not isinstance(value, str) or not value or (pattern and not pattern.fullmatch(value)):
+        raise EnrollRefused("manifest_invalid", f"{where} is not an accepted string")
+    return value
+
+
+def manifest_list(value, where, item=manifest_text):
+    if not isinstance(value, list) or not value:
+        raise EnrollRefused("manifest_invalid", f"{where} must be a non-empty list")
+    return [item(entry, where) for entry in value]
+
+
+def repo_path(value, where):
+    path = manifest_text(value, where)
+    if path.startswith("/") or ".." in Path(path).parts or not path.startswith("deploy/"):
+        raise EnrollRefused("manifest_repo_path", f"{where}: {path} is not a repository path under deploy/")
+    return path
+
+
+def host_path(value, where):
+    path = manifest_text(value, where)
+    if not path.startswith("/") or ".." in Path(path).parts:
+        raise EnrollRefused("manifest_relative_path", f"{where}: {path} is not an absolute host path")
+    return path
+
+
+def check_manifest(value, name):
+    """The manifest `value` of module `name`, or the EnrollRefused of its first defect (a code per cause). A field of an
+    unexpected type is a refusal too, never an exception: an unrelated malformed manifest must not halt a release."""
+    try:
+        return checked_manifest(value, name)
+    except (TypeError, AttributeError, KeyError, ValueError) as exc:
+        raise EnrollRefused("manifest_invalid", f"a field has an unexpected type ({type(exc).__name__})") from None
+
+
+def checked_manifest(value, name):
+    manifest_keys(value, MANIFEST_KEYS, "manifest")
+    if manifest_text(value["name"], "name", MODULE_NAME) != name:
+        raise EnrollRefused("manifest_invalid", "name differs from the file name")
+    project = manifest_keys(value["project"], {"name", "files", "env_file", "env_required", "services"}, "project")
+    manifest_text(project["name"], "project.name", re.compile(r"[a-z0-9][a-z0-9_-]*"))
+    manifest_list(project["files"], "project.files", repo_path)
+    host_path(project["env_file"], "project.env_file")
+    manifest_list(project["env_required"], "project.env_required", lambda item, where: manifest_text(item, where, ENV_NAME))
+    services = project["services"]
+    if not isinstance(services, dict) or not services:
+        raise EnrollRefused("manifest_invalid", "project.services must name a service and its build target")
+    for service, target in services.items():
+        if not isinstance(service, str) or service in ENROLL_FORBIDDEN_SERVICES:
+            raise EnrollRefused("manifest_forbidden_service", f"{service} is not a promotable application service")
+        if not isinstance(target, str) or target not in BUILDS:
+            raise EnrollRefused("manifest_invalid", f"project.services.{service} names no known build target")
+    gateway = manifest_keys(value["gateway"], {"overlay", "policy"}, "gateway")
+    if gateway["overlay"] is not None:
+        repo_path(gateway["overlay"], "gateway.overlay")
+    policy = manifest_keys(gateway["policy"], {"module", "backend_url", "tools", "principals", "key_dir", "key_file_pattern",
+                                               "key_uid"}, "gateway.policy")
+    manifest_text(policy["module"], "gateway.policy.module", MODULE_NAME)
+    manifest_text(policy["backend_url"], "gateway.policy.backend_url", re.compile(r"http://[a-z0-9.-]+:[0-9]{2,5}"))
+    manifest_list(policy["tools"], "gateway.policy.tools", lambda item, where: manifest_text(item, where, re.compile(r"[a-z][a-z0-9_]{0,63}")))
+    host_path(policy["key_dir"], "gateway.policy.key_dir")
+    if "{principal}" not in manifest_text(policy["key_file_pattern"], "gateway.policy.key_file_pattern") or not policy["key_file_pattern"].startswith("/"):
+        raise EnrollRefused("manifest_invalid", "gateway.policy.key_file_pattern must be an absolute path with {principal}")
+    if type(policy["key_uid"]) is not int or policy["key_uid"] < 0:
+        raise EnrollRefused("manifest_invalid", "gateway.policy.key_uid must be a user id")
+    principals = policy["principals"]
+    if not isinstance(principals, dict) or not principals:
+        raise EnrollRefused("manifest_invalid", "gateway.policy.principals must name a principal and its grants")
+    for principal, section in principals.items():
+        grants = manifest_keys(section, {"grants"}, f"gateway.policy.principals.{principal}")["grants"]
+        for grant in manifest_list(grants, f"gateway.policy.principals.{principal}.grants"):
+            if "*" in grant:
+                raise EnrollRefused("manifest_grant_wildcard", f"{principal} is granted {grant}")
+    egress = value["egress"]
+    if isinstance(egress, dict) and egress.get("outside") is True:
+        keys = {"outside", "admission_env", "canary", "verify", "verify_env", "open", "blocked", "controls"}
+        if set(egress) < keys:
+            raise EnrollRefused("manifest_egress_incomplete", "outside egress needs " + ", ".join(sorted(keys - set(egress))))
+        manifest_keys(egress, keys, "egress")
+        admission = manifest_keys(egress["admission_env"], {"blocked", "open"}, "egress.admission_env")
+        for key in admission.values():
+            manifest_text(key, "egress.admission_env", ENV_NAME)
+        manifest_text(egress["canary"], "egress.canary", re.compile(r"[0-9.]+:[0-9]{1,5}"))
+        verify = manifest_list(egress["verify"], "egress.verify")
+        if not VERIFY_SCRIPT.fullmatch(verify[0]):
+            raise EnrollRefused("manifest_verify_script", f"{verify[0]} is not a scripts/*_egress_check.py file")
+        manifest_list(egress["verify_env"], "egress.verify_env", lambda item, where: manifest_text(item, where, ENV_NAME))
+        manifest_list(egress["open"], "egress.open")
+        for item in manifest_list(egress["blocked"], "egress.blocked"):
+            if item not in EGRESS_CLASSES:
+                raise EnrollRefused("manifest_invalid", f"egress.blocked: {item} is not one of {', '.join(sorted(EGRESS_CLASSES))}")
+        controls = manifest_keys(egress["controls"], {"dns_env"}, "egress.controls")
+        manifest_text(controls["dns_env"], "egress.controls.dns_env", ENV_NAME)
+    else:
+        manifest_keys(egress, {"outside"}, "egress")
+        if egress["outside"] is not False:
+            raise EnrollRefused("manifest_invalid", "egress.outside must be true or false")
+    private = manifest_keys(value["private_config"], {"mount", "file", "forbidden_keys", "credential_files"}, "private_config")
+    host_path(private["mount"], "private_config.mount")
+    manifest_text(private["file"], "private_config.file", re.compile(r"[A-Za-z0-9_.-]+"))
+    manifest_list(private["forbidden_keys"], "private_config.forbidden_keys", lambda item, where: manifest_text(item, where, KEY_PATH))
+    manifest_list(private["credential_files"], "private_config.credential_files", lambda item, where: manifest_text(item, where, KEY_PATH))
+    if not isinstance(value["owner_steps"], list) or not all(isinstance(step, str) for step in value["owner_steps"]):
+        raise EnrollRefused("manifest_invalid", "owner_steps must be a list of strings")
+    if value["live_actions"] != []:
+        raise EnrollRefused("manifest_live_actions", "a manifest never carries a live action")
+    return value
+
+
+def repo_file(mirror, sha, path):
+    return run(["git", "-C", str(mirror), "cat-file", "blob", f"{sha}:{path}"], binary=True)
+
+
+def repo_blob_id(mirror, sha, path):
+    return run(["git", "-C", str(mirror), "rev-parse", f"{sha}:{path}"]).strip()
+
+
+def read_manifest(mirror, sha, name):
+    path = f"{MODULE_DIRECTORY}{name}.json"
+    try:
+        text = repo_file(mirror, sha, path)
+        blob_id = repo_blob_id(mirror, sha, path)
+    except Refused:
+        raise EnrollRefused("manifest_missing", f"{path} is not in {sha[:12]}") from None
+    try:
+        value = json.loads(text)
+    except ValueError:
+        raise EnrollRefused("manifest_invalid", f"{path} is not JSON") from None
+    return check_manifest(value, name), blob_id
+
+
+def read_env_file(path):
+    """`(variables, content digest)` of the project's env file: a regular file, mode 0600, owned by ENROLL_OWNER.
+    Values stay in memory: a plan prints names and digests only."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        raise EnrollRefused("env_file_missing", path) from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o777 != 0o600 or info.st_uid != ENROLL_OWNER:
+            raise EnrollRefused("env_file_mode", f"{path} must be a regular file, mode 0600, owner {ENROLL_OWNER}")
+        content = os.read(fd, 1 << 20)
+    finally:
+        os.close(fd)
+    variables = {}
+    for line in content.decode("utf-8", "replace").splitlines():
+        key, separator, value = line.strip().partition("=")
+        if separator and ENV_NAME.fullmatch(key):
+            variables[key] = value.strip().strip("'\"")
+    return variables, hashlib.sha256(content).hexdigest()
+
+
+def private_config_nodes(document, pattern):
+    """The values at the manifest key path `pattern` (`archive`, `accounts[*].archive_namespace`) in `document`."""
+    nodes = [document]
+    for segment in pattern.split("."):
+        key, each = segment.removesuffix("[*]"), segment.endswith("[*]")
+        step = [node[key] for node in nodes if isinstance(node, dict) and key in node]
+        nodes = [item for node in step for item in (node if isinstance(node, list) else list(node.values())
+                                                    if isinstance(node, dict) else [])] if each else step
+    return nodes
+
+
+def private_config_keys(document, patterns):
+    """The manifest key paths that are present in `document`; the presence of a key only, never a value."""
+    return [pattern for pattern in patterns if private_config_nodes(document, pattern)]
+
+
+def credential_file_checks(value, private, source, owner):
+    """The credential files `value` (the private configuration) names at the manifest's `credential_files` paths: each
+    resolves through the Compose mount to a regular, non-empty file of the configuration's owner that only the owner can
+    read. Mode, owner and size only; a content byte is never read."""
+    for pattern in private["credential_files"]:
+        parent, _, last = pattern.rpartition(".")
+        if parent and not last.endswith("[*]"):
+            # Every entry the parent path matches must carry the key: one account without it fails the whole configuration.
+            references, entries = [], private_config_nodes(value, parent)
+            for entry in entries:
+                if not isinstance(entry, dict) or last not in entry:
+                    raise EnrollRefused("credential_file_invalid", f"{pattern} is missing in an entry of {parent}")
+                references.append(entry[last])
+        else:
+            references = private_config_nodes(value, pattern)
+        if not references:
+            raise EnrollRefused("credential_file_invalid", f"the private configuration has no value at {pattern}")
+        for reference in references:
+            try:
+                inside = PurePosixPath(reference).relative_to(private["mount"])
+            except (TypeError, ValueError):
+                inside = None
+            if not isinstance(reference, str):
+                inside = None
+            if inside is None or ".." in inside.parts or not inside.parts:
+                raise EnrollRefused("credential_file_invalid", f"{pattern} names a file outside {private['mount']}")
+            path = Path(source) / Path(*inside.parts)
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            except OSError:
+                raise EnrollRefused("credential_file_invalid", f"{path} is missing") from None
+            try:
+                info = os.fstat(fd)
+            finally:
+                os.close(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid != owner or info.st_size == 0
+                    or info.st_size > 8192):
+                raise EnrollRefused("credential_file_invalid",
+                                    f"{path} must be a non-empty regular file, owner {owner}, no group or other access")
+
+
+def serving_gateway_images():
+    """Every distinct image a running gateway container (plan A's or an HTTP generation's) uses."""
+    shown = run(["docker", "ps", "--no-trunc", "--format", '{{.Image}}\t{{.Label "com.docker.compose.service"}}'])
+    images = {image for image, _, service in (line.partition("\t") for line in shown.splitlines())
+              if service == "gateway" or service.startswith("http-gateway-")}
+    return sorted(images)
+
+
+def additions_only(old, new):
+    """`new` holds all of `old`: only object keys and list items were added, nothing was changed or removed."""
+    if isinstance(old, dict):
+        return isinstance(new, dict) and all(key in new and additions_only(value, new[key]) for key, value in old.items())
+    if isinstance(old, list):
+        return isinstance(new, list) and len(new) >= len(old) and all(map(additions_only, old, new))
+    return old == new
+
+
+def candidate_policy(live, manifest, key_hashes):
+    """The live gateway policy plus the module: one revision higher, additions only. `(candidate, added paths)`."""
+    fragment = manifest["gateway"]["policy"]
+    module, new, added = fragment["module"], copy.deepcopy(live), []
+    new["revision"] = live["revision"] + 1
+    added.append(f"revision {live['revision']} -> {new['revision']}")
+    deployment = new["deployment"]
+    if module in deployment["modules"] or module in deployment["backends"]:
+        raise EnrollRefused("policy_module_present", f"the live policy already names {module}")
+    deployment["modules"].append(module)
+    deployment["backends"][module] = {"url": fragment["backend_url"]}
+    added += [f"deployment.modules + {module}", f"deployment.backends.{module} = {fragment['backend_url']}"]
+    by_id = {principal["id"]: principal for principal in new["principals"]}
+    for principal, section in fragment["principals"].items():
+        if principal not in by_id:
+            raise EnrollRefused("manifest_unknown_principal", f"the live policy defines no principal {principal}")
+        entry = by_id[principal]
+        if module in entry["grants"] or module in entry["credentials"]:
+            raise EnrollRefused("policy_module_present", f"{principal} already has {module}")
+        entry["grants"][module] = list(section["grants"])
+        entry["credentials"][module] = {"key_file": fragment["key_file_pattern"].format(principal=principal),
+                                        "key_sha256": key_hashes[principal]}
+        added += [f"principals.{principal}.grants.{module} = {', '.join(section['grants'])}",
+                  f"principals.{principal}.credentials.{module} = key_file {entry['credentials'][module]['key_file']}, "
+                  f"key_sha256 {key_hashes[principal]}"]
+        profile = new["profiles"][entry["profile"]]
+        for tool in fragment["tools"]:
+            if tool not in profile["tools"]:
+                profile["tools"].append(tool)
+                added.append(f"profiles.{entry['profile']}.tools + {tool}")
+    if not additions_only({**live, "revision": new["revision"]}, new):
+        raise EnrollRefused("policy_check_failed", "the candidate policy is not additions only")
+    return new, added
+
+
+def key_digest(manifest, principal):
+    """The sha256 of a principal's gateway key file: present, a regular file, mode 0600, owned by the manifest's uid."""
+    fragment = manifest["gateway"]["policy"]
+    path = Path(fragment["key_dir"]) / Path(fragment["key_file_pattern"].format(principal=principal)).name
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        raise EnrollRefused("key_file_invalid", f"{path} is missing") from None
+    try:
+        info = os.fstat(fd)
+        content = os.read(fd, 1025)
+    finally:
+        os.close(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_mode & 0o777 != 0o600 or info.st_uid != fragment["key_uid"]
+            or not content.strip() or len(content) > 1024):
+        raise EnrollRefused("key_file_invalid", f"{path} must be a non-empty regular file, mode 0600, owner {fragment['key_uid']}")
+    return hashlib.sha256(content.strip()).hexdigest()
+
+
+def check_policy_candidate(candidate, directory):
+    """`deedkit-gateway --check` of the candidate in every serving gateway image, from a private scratch file."""
+    path = Path(directory) / "policy.json"
+    fd = new_file(path)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(json.dumps(candidate))
+    try:
+        images = serving_gateway_images()
+    except (Refused, subprocess.TimeoutExpired):
+        raise EnrollRefused("policy_check_failed", "the serving gateway images cannot be listed") from None
+    if not images:
+        raise EnrollRefused("policy_check_failed", "no serving gateway image was found")
+    for image in images:
+        try:
+            shown = run(["docker", "run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL", "--user", "0:0",
+                         "--entrypoint", "deedkit-gateway", "-v", f"{path}:/policy.json:ro", image, "--check", "--policy",
+                         "/policy.json", "--public-url", "https://check.invalid"], timeout=120)
+            valid = json.loads(shown.strip().splitlines()[-1]).get("valid") is True
+        except (Refused, ValueError, IndexError, AttributeError, subprocess.TimeoutExpired):
+            valid = False
+        if not valid:
+            raise EnrollRefused("policy_check_failed", f"the gateway check of the candidate failed in {image}")
+
+
+def compose_document(project, directory, files):
+    """The resolved Compose document of `project` with exactly `files` and its env files, from scratch copies."""
+    shown = run(compose({**project, "directory": directory, "files": files}) + ["config", "--format", "json"])
+    return json.loads(shown)
+
+
+def enroll_plan(settings, http, name, sha, mirror, state=None):
+    """The enrollment plan of module `name` at `sha` (a dict ending in `plan_digest`), or EnrollRefusals. Writes nothing
+    but private scratch files; the manifest, the live policy, the configurations and the env file are read-only."""
+    if not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
+        raise EnrollRefused("sha_not_verified", "an exact lowercase 40-character commit SHA is required")
+    try:
+        evidence = promotable(sha)
+    except (Refused, subprocess.TimeoutExpired) as exc:
+        raise EnrollRefused("sha_not_verified", str(exc)[:300]) from exc
+    state = Path(settings["state_directory"])
+    manifest, manifest_id = read_manifest(mirror, sha, name)
+    failures = []
+
+    def attempt(check, *args):
+        try:
+            return check(*args)
+        except EnrollRefused as exc:
+            failures.append({"code": exc.code, "detail": exc.detail})
+        return None
+
+    project, fragment, private = manifest["project"], manifest["gateway"]["policy"], manifest["private_config"]
+    if any(item["name"] == project["name"] for item in settings["projects"]):
+        raise EnrollRefused("module_enrolled", f"{project['name']} is already a project of the configuration")
+    if (state / sha).exists():
+        failures.append({"code": "sha_already_prepared", "detail": f"{state / sha} exists"})
+    if PAUSE.exists():
+        failures.append({"code": "paused", "detail": "the autodeploy pause file is present"})
+    try:
+        if active := active_calls(settings):
+            failures.append({"code": "call_active", "detail": f"{len(active)} active call(s)"})
+    except CallsUnknown as exc:
+        failures.append({"code": "calls_unknown", "detail": str(exc)[:200]})
+    current = read(state / "current.json") if (state / "current.json").exists() else {}
+    if not re.fullmatch(r"[0-9a-f]{40}", current.get("sha", "")):
+        failures.append({"code": "no_current_release", "detail": "no applied release is recorded"})
+    else:
+        installed = {"scripts/production.py": RUNNING, "scripts/seamless_release.py": http_release_tool().__file__,
+                     **{path: SYSTEMD_DIRECTORY / Path(path).name for path in UNITS}}
+        sql, tools = range_changes(mirror, current["sha"], sha, installed)
+        if sql:
+            failures.append({"code": "range_sql_inventory", "detail": ", ".join(sql[:5])})
+        if tools:
+            failures.append({"code": "range_tool_pending", "detail": ", ".join(tools[:5])})
+        changed = run(["git", "-C", str(mirror), "diff", "--name-only", "--no-renames", "-z", current["sha"], sha]).split("\0")
+        if backup := [path for path in changed if BACKUP_FILES.fullmatch(path)]:
+            failures.append({"code": "range_backup_changed", "detail": ", ".join(backup[:5])})
+    gateway = next((item for item in settings["projects"] if "gateway" in item["services"].values()), None)
+    gateway_http = next((item for item in http["projects"] if gateway and item["name"] == gateway["name"]), None)
+    if gateway is None or gateway_http is None:
+        raise EnrollRefused("gateway_project_missing", "both configurations need the gateway project")
+    directory = gateway["directory"]
+    overlays, reference = [], None
+    try:
+        reference = os.stat(gateway["files"][0])
+    except OSError:
+        failures.append({"code": "source_unavailable", "detail": "the gateway project's first file cannot be read"})
+    wanted = [*project["files"], *([manifest["gateway"]["overlay"]] if manifest["gateway"]["overlay"] else [])]
+    contents = {}
+    for path in wanted:
+        try:
+            contents[path] = repo_file(mirror, sha, path)
+        except Refused:
+            failures.append({"code": "source_unavailable", "detail": f"{path} is not in {sha[:12]}"})
+    for path, content in contents.items():
+        overlays.append({"repo_path": path, "host_path": f"{directory}/{Path(path).name}",
+                         "sha256": hashlib.sha256(content).hexdigest(), "blob": repo_blob_id(mirror, sha, path),
+                         **({"owner": reference.st_uid, "group": reference.st_gid, "mode": oct(reference.st_mode & 0o777)}
+                            if reference else {})})
+    host = {item["repo_path"]: item["host_path"] for item in overlays}
+    new_project = {"name": project["name"], "directory": directory, "files": [host.get(path, "") for path in project["files"]],
+                   "env_files": [project["env_file"]], "services": dict(project["services"])}
+    overlay_host = host.get(manifest["gateway"]["overlay"])
+    gateway_files = [*gateway["files"], *([overlay_host] if overlay_host and overlay_host not in gateway["files"] else [])]
+    gateway_http_files = [*gateway_http["files"],
+                          *([overlay_host] if overlay_host and overlay_host not in gateway_http["files"] else [])]
+    variables, env_digest = {}, None
+    env = attempt(read_env_file, project["env_file"])
+    if env is not None:
+        variables, env_digest = env
+        for key in project["env_required"]:
+            if not variables.get(key):
+                failures.append({"code": "env_variable_unset", "detail": key})
+    documents = {}
+    with tempfile.TemporaryDirectory(prefix="enroll-") as scratch:
+        os.chmod(scratch, 0o700)
+        scratch_files = {}
+        for path, content in contents.items():
+            target = Path(scratch) / Path(path).name
+            with os.fdopen(new_file(target), "wb") as handle:
+                handle.write(content)
+            scratch_files[path] = str(target)
+        if env is not None and len(contents) == len(wanted):
+            overlay = manifest["gateway"]["overlay"]
+            for label, item, files in (("project", new_project, [scratch_files[path] for path in project["files"]]),
+                                       ("gateway", gateway, [*gateway["files"], *([scratch_files[overlay]] if overlay else [])]),
+                                       ("gateway_http", gateway_http,
+                                        [*gateway_http["files"], *([scratch_files[overlay]] if overlay else [])])):
+                try:
+                    documents[label] = compose_document(item, item["directory"], files)
+                except (Refused, ValueError, subprocess.TimeoutExpired) as exc:
+                    failures.append({"code": "compose_config_failed", "detail": f"{item['name']}: {type(exc).__name__}"})
+        private_digest = None
+        if "project" in documents:
+            private_digest = attempt(check_private_config, documents["project"], project, private)
+        egress = manifest["egress"]
+        if egress["outside"] and env is not None:
+            attempt(check_egress, mirror, sha, egress, variables, scratch)
+        live_path = Path(http["http_release"]["gateway_policy"])
+        live = live_digest = candidate = added = None
+        try:
+            live_bytes = live_path.read_bytes()
+            live, live_digest = json.loads(live_bytes), hashlib.sha256(live_bytes).hexdigest()
+        except (OSError, ValueError):
+            failures.append({"code": "policy_unreadable", "detail": str(live_path)})
+        if live is not None:
+            defined = {entry.get("id") for entry in live.get("principals", [])}
+            unknown = [principal for principal in fragment["principals"] if principal not in defined]
+            for principal in unknown:
+                failures.append({"code": "manifest_unknown_principal", "detail": f"the live policy defines no principal {principal}"})
+            hashes = {}
+            for principal in ([] if unknown else fragment["principals"]):
+                hashes[principal] = attempt(key_digest, manifest, principal)
+            if hashes and all(hashes.values()):
+                try:
+                    candidate, added = candidate_policy(live, manifest, hashes)
+                    check_policy_candidate(candidate, scratch)
+                except EnrollRefused as exc:
+                    failures.append({"code": exc.code, "detail": exc.detail})
+    if failures:
+        raise EnrollRefusals(failures)
+    grants = {principal: sorted(section["grants"]) for principal, section in fragment["principals"].items()}
+    inputs = {"sha": sha, "manifest": manifest_id, "production": digest(settings), "http": digest(http),
+              "live_policy": live_digest, "overlays": {item["repo_path"]: item["sha256"] for item in overlays},
+              "grants": grants, "verify": egress.get("verify"), "canary": egress.get("canary"),
+              "env": env_digest, "private_config": private_digest, "candidate_policy": digest(candidate),
+              "compose": {label: digest(document) for label, document in sorted(documents.items())}}
+    return {"status": "plan", "module": name, "sha": sha, "ci": evidence, "manifest_blob": manifest_id, "overlays": overlays,
+            "production_json": {"append_project": new_project,
+                                "gateway_project_files": gateway_files},
+            "http_production_json": {"gateway_project_files": gateway_http_files},
+            "policy": {"base_revision": live["revision"], "revision": candidate["revision"], "added": added,
+                       "grants": grants, "candidate_digest": inputs["candidate_policy"]},
+            "owner_steps": manifest["owner_steps"], "live_actions": [], "inputs": inputs,
+            "plan_digest": digest(inputs)}
+
+
+def check_private_config(document, project, private):
+    """The digest of the private configuration the container mounts, resolved from the Compose document; refuses
+    while a manifest forbidden key is present (a first start is on-demand reads only)."""
+    mounts = [volume["source"] for service in project["services"] for volume in document["services"].get(service, {}).get("volumes", [])
+              if isinstance(volume, dict) and volume.get("target") == private["mount"] and volume.get("source")]
+    if len(mounts) != 1:
+        raise EnrollRefused("private_config_unreadable", f"the Compose document mounts {private['mount']} {len(mounts)} times")
+    path = Path(mounts[0]) / private["file"]
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            owner = os.fstat(fd).st_uid
+            content = os.read(fd, 1 << 20)
+        finally:
+            os.close(fd)
+        value = json.loads(content)
+    except (OSError, ValueError):
+        raise EnrollRefused("private_config_unreadable", str(path)) from None
+    if present := private_config_keys(value, private["forbidden_keys"]):
+        raise EnrollRefused("private_config_forbidden_key", present[0])
+    credential_file_checks(value, private, mounts[0], owner)
+    return hashlib.sha256(content).hexdigest()
+
+
+def blocked_address(item):
+    """The IP address of a blocked target the way the recordings admission reads it: `IP:PORT` (brackets around an IPv6
+    literal allowed) or `dns:IP`, `dns:IP:PORT`, `dns:[IPV6]` and `dns:[IPV6]:PORT`; None when malformed."""
+    try:
+        if item.startswith("dns:"):
+            body = item[4:]
+            if body.startswith("["):
+                host, closed, rest = body[1:].partition("]")
+                if not closed:
+                    return None
+                port = rest.removeprefix(":") or "53"
+            elif body.count(":") == 1:
+                host, port = body.split(":")
+            else:
+                host, port = body, "53"
+        else:
+            host, _, port = item.rpartition(":")
+            host = host.strip("[]")
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    return address if port.isdecimal() and 0 < int(port) < 65536 else None
+
+
+def check_egress(mirror, sha, egress, variables, scratch):
+    """The admission variables and the canary are in the env file, and the repository's own verify script (run from
+    the pinned source) prints `ok`: the host firewall rules are in force. Nothing is edited."""
+    blocked = [item for item in variables.get(egress["admission_env"]["blocked"], "").split(",") if item]
+    opened = [item for item in variables.get(egress["admission_env"]["open"], "").split(",") if item]
+    if egress["canary"] not in blocked or not set(egress["open"]) <= set(opened):
+        raise EnrollRefused("egress_env_missing", "the env file lacks the canary or an open target")
+    covered = set()
+    for item in blocked:
+        if item == egress["canary"]:
+            continue
+        address = blocked_address(item)
+        if address is None:
+            raise EnrollRefused("egress_target_invalid", f"{item} is not an IP:PORT or dns:IP blocked target")
+        if not item.startswith("dns:"):
+            covered |= {name for name, networks in EGRESS_CLASSES.items()
+                        if any(address in ipaddress.ip_network(network) for network in networks)}
+    if missing := sorted(set(egress["blocked"]) - covered):
+        raise EnrollRefused("egress_blocked_incomplete", "no blocked target (with a known listener) of class " + ", ".join(missing))
+    resolver = variables.get(egress["controls"]["dns_env"], "")
+    if f"dns:{resolver}" not in opened:
+        raise EnrollRefused("egress_control_missing", f"the open targets lack dns:<{egress['controls']['dns_env']}>")
+    archive = run(["git", "-C", str(mirror), "archive", "--format=tar", sha, "scripts"], binary=True)
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        tar.extractall(scratch, filter="data")
+    if unset := [key for key in egress["verify_env"] if not variables.get(key)]:
+        raise EnrollRefused("egress_env_missing", "the env file lacks " + ", ".join(unset))
+    # The verifier reads its inputs from `--env-file`, not from the environment: it gets a private file holding exactly
+    # the values this plan checked.
+    verify_env = Path(scratch) / "verify.env"
+    with os.fdopen(new_file(verify_env), "w") as handle:
+        handle.write("".join(f"{key}={variables[key]}\n" for key in egress["verify_env"]))
+    try:
+        shown = run([sys.executable, "-I", str(Path(scratch) / egress["verify"][0]), *egress["verify"][1:], "--env-file",
+                     str(verify_env)], env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}, timeout=120)
+    except (Refused, subprocess.TimeoutExpired):
+        raise EnrollRefused("egress_verify_failed", "the verify script exited with an error or timed out") from None
+    lines = shown.strip().splitlines()
+    if not lines or lines[-1].strip() != "ok":
+        raise EnrollRefused("egress_verify_failed", (lines[-1] if lines else "no output")[:200])
+
+
+def enroll_command(args):
+    """`enroll --module M --sha S --plan`: the plan, or `{"status": "refused", "refusals": [...]}` (exit 2)."""
+    if not args.plan:
+        raise Refused("enroll needs --plan; applying an enrollment is a separate command")
+    if not args.module:
+        raise Refused("enroll needs --module")
+    settings = config(args.config)
+    s = http_release_tool()
+    http = s.validate_settings(config(args.http_config))
+    try:
+        return enroll_plan(settings, http, args.module, args.sha, main_history(Path(settings["state_directory"])))
+    except EnrollRefusals as exc:
+        return {"status": "refused", "refusals": exc.failures}
+    except EnrollRefused as exc:
+        return {"status": "refused", "refusals": [{"code": exc.code, "detail": exc.detail}]}
+    except subprocess.TimeoutExpired as exc:
+        return {"status": "refused", "refusals": [{"code": "command_timeout", "detail": f"{Path(str(exc.cmd if isinstance(exc.cmd, str) else exc.cmd[0])).name} timed out"}]}
+
+
+def enroll_required(module, sha):
+    return f"enroll_required: {module}: production.py enroll --module {module} --sha {sha} --plan"
+
+
+MANIFEST_FILE = re.compile(MODULE_DIRECTORY + r"[a-z][a-z0-9-]*\.json")
+
+
+def module_manifests(mirror, sha, only=None):
+    """`{module: manifest or None}` for the deploy/modules/*.json at `sha` (those named in `only`, when given); None when
+    a manifest does not parse. A manifest nobody asked for is not parsed."""
+    listing = run(["git", "-C", str(mirror), "ls-tree", "-r", "--name-only", "-z", sha, MODULE_DIRECTORY]).split("\0")
+    found = {}
+    for path in (path for path in listing if MANIFEST_FILE.fullmatch(path) and (only is None or Path(path).stem in only)):
+        try:
+            found[Path(path).stem] = check_manifest(json.loads(repo_file(mirror, sha, path)), Path(path).stem)
+        except (EnrollRefused, ValueError, Refused):
+            found[Path(path).stem] = None
+    return found
+
+
+def enrollment_pending(mirror, base, head, settings):
+    """The modules whose manifest `base..head` adds or changes while the configuration runs no project of it."""
+    changed = run(["git", "-C", str(mirror), "diff", "--name-only", "--no-renames", "-z", base, head]).split("\0")
+    wanted = {Path(path).stem for path in changed if MANIFEST_FILE.fullmatch(path)}
+    running = {project["name"] for project in settings["projects"]}
+    manifests = module_manifests(mirror, head, wanted) if wanted else {}
+    return sorted(module for module in wanted & manifests.keys()
+                  if manifests[module] is None or manifests[module]["project"]["name"] not in running)
+
+
+def without_enrollments(settings, manifests):
+    """`settings` with the edits of each enrolled module's manifest reversed: its project and its gateway overlay."""
+    names = {manifest["project"]["name"] for manifest in manifests}
+    overlays = {Path(manifest["gateway"]["overlay"]).name for manifest in manifests if manifest["gateway"]["overlay"]}
+    reverted = copy.deepcopy(settings)
+    reverted["projects"] = [{**project, "files": [path for path in project["files"] if Path(path).name not in overlays]}
+                            for project in reverted["projects"] if project["name"] not in names]
+    return reverted
+
+
+def enrollment_only(mirror, head, settings, http, current, serving):
+    """The modules whose enrollment alone explains why the configuration differs from the recorded digests: reversing
+    every enrolled manifest of `head` reproduces both. Empty when something else differs too."""
+    running = {project["name"] for project in settings["projects"]}
+    manifests = [manifest for manifest in module_manifests(mirror, head).values()
+                 if manifest is not None and manifest["project"]["name"] in running]
+    if not manifests:
+        return []
+    prepared = read(Path(settings["state_directory"]) / current["sha"] / "prepared.json").get("config_digest")
+    if (settings_digest(without_enrollments(settings, manifests)) != prepared
+            or digest(without_enrollments(http, manifests)) != serving.get("config_digest")):
+        return []
+    return sorted(manifest["name"] for manifest in manifests)
+
+
 def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["verify", "prepare", "prepare-router", "apply", "rollback", "status",
                                            "images", "check-image", "deploy", "self-test", "tool-rollback",
-                                           "copy-database"])
+                                           "copy-database", "enroll"])
     parser.add_argument("--sha")
     parser.add_argument("--target", choices=sorted(BUILDS))
     parser.add_argument("--config", help="default " + CONFIG + "; status: the autodeploy unit's (active_config)")
-    parser.add_argument("--http-config", default=HTTP_CONFIG, help="deploy, rollback: seamless_release.py's")
+    parser.add_argument("--http-config", default=HTTP_CONFIG, help="deploy, rollback, status: seamless_release.py's")
     parser.add_argument("--auto", action="store_true", help="deploy: at most one deploy start per 20 minutes (timer)")
     parser.add_argument("--dry-run", action="store_true", help="deploy: print the plan or pause reason, change nothing")
     parser.add_argument("--remove", action="store_true", help="images: remove the listed candidates")
     parser.add_argument("--database", help="copy-database: a name under the configuration's migration.databases")
+    parser.add_argument("--module", help="enroll: the module of deploy/modules/<module>.json")
+    parser.add_argument("--plan", action="store_true", help="enroll: print the enrollment plan, change nothing")
     parser.add_argument("--verifier", help="self-test: check this staged verifier build against the pin instead of "
                                            "the installed one (attest-verify install, production.md)")
     return parser
@@ -4956,6 +5657,8 @@ def locked_action(args):
                 result["deploy"] = read(state / "deploy.json")
             if PAUSE.exists():
                 result["autodeploy_pause"] = PAUSE.read_text()[:1000].strip()
+            if failed := http_failed_attempts(args.http_config):
+                result["http_failed_attempts"] = failed
         elif args.action == "images":
             result = remove_images(settings) if args.remove else images_report(settings)
         elif args.action == "copy-database":
@@ -4992,6 +5695,10 @@ def execute_action(args):
             raise Refused("tool-rollback requires the production host operator")
         s = http_release_tool()
         return tool_rollback(config(args.config), s.validate_settings(config(args.http_config)), s)
+    if args.action == "enroll":
+        if os.geteuid() != 0:
+            raise Refused("enroll requires the production host operator")
+        return enroll_command(args)
     if args.action == "deploy":
         if os.geteuid() != 0:
             raise Refused("deploy requires the production host operator")
@@ -5010,6 +5717,10 @@ def print_result(args, result, parser):
             parser.exit(1)
         if result.get("code") == BackupRunning.code:  # ANYM-744: a manual deploy met a backup past its bound
             parser.exit(EX_TEMPFAIL)
+    elif args.action == "enroll":
+        print(json.dumps(result, indent=2))
+        if result["status"] == "refused":
+            parser.exit(2)
     else:
         # Receipts contain revisions/image IDs, never resolved Compose environments.
         if args.action == "prepare":

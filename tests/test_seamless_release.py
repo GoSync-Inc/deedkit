@@ -308,13 +308,96 @@ def test_ci_is_rechecked_before_startup_and_again_before_traffic(tmp_path, monke
 
 
 def test_unready_candidate_never_receives_traffic_or_stops_old(tmp_path, monkeypatch):
-    cfg, release, calls, _ = fixture(tmp_path, monkeypatch)
+    cfg, release, calls, receipt = fixture(tmp_path, monkeypatch)
     monkeypatch.setattr(s, 'wait_ready', lambda *a: (_ for _ in ()).throw(s.Refused('not ready')))
     with pytest.raises(s.Refused, match='not ready'):
         s.promote(cfg, SHA)
     assert 'switch' not in calls
-    assert not any(isinstance(c, list) and 'stop' in c for c in calls)
+    # ANYM-757 crit 2: the failed candidate itself is stopped; nothing else, the old generation least of all.
+    assert all(c == candidate_stop(receipt) for c in calls if isinstance(c, list) and 'stop' in c)
     assert s.p.read(release / 'http-attempted.json')['status'] == 'startup-failed'
+
+
+def candidate_stop(receipt, generation=GEN):
+    return s.candidate_command(receipt) + ['stop', 'http-api-' + generation, 'http-gateway-' + generation]
+
+
+def stops(calls):
+    return [c for c in calls if isinstance(c, list) and 'stop' in c]
+
+
+def with_previous(release, receipt, generation='fedcba654321'):
+    receipt['previous'] = {'status': 'serving', 'generation': generation, 'previous': None,
+        'containers': {'api': {'container': 'old-api', 'image': OLD}, 'gateway': {'container': 'old-gateway', 'image': OLD}}}
+    s.p.write(release / 'http-prepared.json', receipt)
+
+
+# spec: ANYM-757
+def test_an_unready_candidate_is_stopped_by_its_own_project_and_services_only(tmp_path, monkeypatch):
+    cfg, release, calls, receipt = fixture(tmp_path, monkeypatch)
+    with_previous(release, receipt)
+    monkeypatch.setattr(s, 'wait_ready', lambda *a: (_ for _ in ()).throw(s.Refused('not ready')))
+    with pytest.raises(s.Refused, match='not ready'):
+        s.promote(cfg, SHA)
+    assert stops(calls) == [['docker', 'compose', '--project-name', 'deedkit-http-' + GEN, '-f', receipt['compose'],
+                             'stop', 'http-api-' + GEN, 'http-gateway-' + GEN]]
+    assert not any(isinstance(c, list) and any('fedcba654321' in str(v) or 'old-' in str(v) for v in c) for c in calls)
+    assert not any(isinstance(c, list) and ('rm' in c or 'down' in c) for c in calls)
+    assert 'switch' not in calls
+    assert s.p.read(release / 'http-attempted.json') == {'status': 'startup-failed', 'sha': SHA, 'candidate_stopped': True}
+
+
+# spec: ANYM-757
+@pytest.mark.parametrize('failure', [s.Refused('compose stop failed'), TimeoutError('compose stop hung')])
+def test_a_failed_candidate_stop_keeps_the_original_refusal_and_records_it(tmp_path, monkeypatch, failure):
+    cfg, release, calls, receipt = fixture(tmp_path, monkeypatch)
+    def run(argv, **kw):
+        calls.append(argv)
+        if 'stop' in argv:
+            raise failure
+        return ''
+    monkeypatch.setattr(s.p, 'run', run)
+    monkeypatch.setattr(s, 'wait_ready', lambda *a: (_ for _ in ()).throw(s.Refused('not ready')))
+    with pytest.raises(s.Refused, match='not ready'):
+        s.promote(cfg, SHA)
+    assert stops(calls) == [candidate_stop(receipt)]
+    assert s.p.read(release / 'http-attempted.json') == {'status': 'startup-failed', 'sha': SHA, 'candidate_stopped': False}
+
+
+# spec: ANYM-757
+@pytest.mark.parametrize('step', ['validate_prepared', 'check_schema'])
+def test_a_candidate_that_fails_before_any_container_exists_is_not_stopped(tmp_path, monkeypatch, step):
+    cfg, release, calls, _ = fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(s, step, lambda *a: (_ for _ in ()).throw(s.Refused('synthetic ' + step)))
+    with pytest.raises(s.Refused, match='synthetic'):
+        s.promote(cfg, SHA)
+    assert stops(calls) == []
+    assert not any(isinstance(c, list) and 'up' in c for c in calls)
+
+
+# spec: ANYM-757
+def test_a_stopped_failed_candidate_does_not_block_the_next_release(tmp_path, monkeypatch):
+    cfg, release, calls, receipt = fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(s, 'wait_ready', lambda *a: (_ for _ in ()).throw(s.Refused('not ready')))
+    with pytest.raises(s.Refused, match='not ready'):
+        s.promote(cfg, SHA)
+    assert s.p.read(release / 'http-attempted.json')['candidate_stopped'] is True
+    state = Path(cfg['state_directory'])
+    # deploy's pre-write check (production.py `unresolved`) still reads a startup-failed attempt as resolved.
+    (tmp_path / 'plan-a').mkdir()
+    assert s.p.unresolved(tmp_path / 'plan-a', state) is None
+    # ANYM-407's retry path: the next sha gets a new generation and promotes as before.
+    nxt, generation = 'd' * 40, 'abcdef654321'
+    (state / nxt).mkdir()
+    (state / nxt / 'http.json').write_text('{}')
+    s.p.write(state / nxt / 'http-prepared.json', {**receipt, 'sha': nxt, 'generation': generation,
+        'compose': str(state / nxt / 'http.json'), 'controls': {name: str(state / nxt / name / 'control.sock') for name in ['api', 'gateway']}})
+    monkeypatch.setattr(s, 'wait_ready', lambda *a: calls.append('ready'))
+    del calls[:]
+    result = s.promote(cfg, nxt)
+    assert result['status'] == 'serving-retirement-pending' and result['generation'] == generation
+    assert 'switch' in calls and stops(calls) == []
+    assert s.p.read(state / nxt / 'http-attempted.json') == {'status': 'serving', 'sha': nxt}
 
 
 def test_schema_mismatch_is_blocked_before_any_container_start(tmp_path, monkeypatch):

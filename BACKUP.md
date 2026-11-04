@@ -435,8 +435,8 @@ On the production host `deploy/deedkit-calendar-backup.service` runs the install
 (`/opt/personal-os-probe/ops/backup_runner.py`, the same file as messaging's) with
 `/opt/deedkit/calendar-backup/runner.json`, and `ExecStopPost` runs the same config's
 `--recover-stop`. `deploy/deedkit-calendar-backup.timer` fires daily at 16:00 UTC with
-`Persistent=true`: inside autodeploy's no-start hours (13:00-18:59), and the runner's 5400 s wait for
-messaging's lock ends before messaging's 18:00 run. The hour only schedules; the lock excludes (above).
+`Persistent=true`; the runner's 5400 s wait for messaging's lock (or a running deploy's) ends before
+messaging's 18:00 run. The hour only schedules; the lock excludes (above).
 Its `ExecCondition` admits a start only up to 16:02 UTC (a `Persistent=` catch-up after a reboot or a
 late manual start is skipped; an unreadable clock skips too; the timer fires within 16:00:31,
 `AccuracySec=1s`). `TimeoutStartSec=6300s` plus the main process's stop and `ExecStopPost`, each with

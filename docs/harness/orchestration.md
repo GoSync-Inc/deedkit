@@ -51,7 +51,11 @@ affect every pull request make parallel edits collide.
   (above). Tests appended at the end of a shared test file are the common cause: add them beside
   related tests.
 - One task while waiting (owner 10-29): a worker waiting on CI or the queue keeps its one task (no
-  other branch meanwhile, its context stays clean); the orchestrator starts more workers instead.
+  other branch meanwhile, its context stays clean). The orchestrator refills within lane and host
+  limits only when the next task can progress without feeding a saturated test runner. While
+  feedback waits grow, finish queued work and fix the measured bottleneck before adding code workers;
+  independent work that does not need that runner may continue. Idle CPU alone does not prove
+  runner capacity: locks, memory, containers and admission policy can serialize it.
 - Project-side CI change for a private repository with paid minutes (the project's Boss, named
   in its AGENTS.md; not a harness script): `pull_request.types` lists
   `opened, synchronize, reopened, ready_for_review`, and jobs skip drafts with
@@ -60,19 +64,19 @@ affect every pull request make parallel edits collide.
   then cost nothing; `ready_for_review` starts the real run.
 - CI once per pull request (owner 10-29, every project; its Boss changes its own CI; a ruleset
   or required-check change, merge-queue grouping included, is process.md section 2: Astra r1, the
-  safe GET->PUT path). The full suite runs once before merge, on the head that merges: in the merge queue or a
-  batch; a project with neither runs it on `ready_for_review` and again on any later push to the
-  ready pull request (so review rounds happen in draft until the last fix push, Draft first above). Draft pushes (review rounds included) keep the draft skip above or run only
-  the tests the change affects (touched modules and their dependents). Recommended: each draft
-  review-fix push reports such a run as its own non-required status (`affected`, never the
-  required check's name), so a red shows during review and is fixed before ready; the full suite
-  stays on ready and merge as below. Keep the full suite on the
-  `main` push run: Done and tiden.md's test evidence read that run. The required status keeps
-  meaning "full suite passed on the merge head"; with the full suite only in the merge queue, the
-  `merge_group` run of the required check is the full suite, and the same check name on the pull
-  request head comes from the affected-only run (never `skipped`, never a bypass). A project
-  switches only after a replay of about 20 recent pull requests shows the affected-only selection
-  missed no failure the full suite caught.
+  safe GET->PUT path). Choose checks by affected modules and consumers. Shared contracts, migrations, security and
+  verification/build inputs get wider checks; unknown dependency coverage runs the full suite.
+  Text-only changes use lightweight checks through main, with no product build/publication.
+  Reuse unchanged verification and image artifacts only with validated input/dependency identities
+  and provenance; record what this exact commit checked or reused. Never relabel an older full
+  suite as newly run. The required gate verifies that decision, not a blanket full-suite rerun.
+  Projects implement and test the selection together with evidence, promotion/autodeploy and
+  Tiden consumers before enabling it; until then their existing required checks still run.
+  A new selector first replays about 20 recent pull requests without missing a failure; changed
+  selector/build inputs force fresh verification. Keep full integration checks for a release
+  candidate when affected coverage cannot establish compatibility. Documentation merges need not
+  create release candidates; production accepts only a verified candidate. The main run records
+  the exact evidence or validated reuse; Done still requires its successful result.
   - Batches: when several pull requests are ready, the full suite runs once on their combination
     and green merges them together. Merge-queue grouping waits minutes at most for a second pull
     request (a lone one merges alone), and on red the queue bisects; local CI: a batch runner
@@ -85,7 +89,11 @@ affect every pull request make parallel edits collide.
   - Test speed is standing work: a periodic pass (the project names the cadence in AGENTS.md)
     over the slowest tests, flaky reruns and parallelism.
   - Each change is measured before and about 3 days after: full runs per merged pull request,
-    minutes per run, merge wait, CI hours per day, timeout and flaky reruns. Both sets go to the
+    minutes per run, merge wait, CI hours per day, timeout and flaky reruns. Separate admission/
+    dependency delay, setup, execution and cleanup when the runner exposes them; unknown stays
+    unknown. For GitHub Actions, `bin/ci-timing.sh <run-id> [owner/repo]` emits the attempt, SHA,
+    job start delays and step durations as JSON. Start delay includes dependency waits and is
+    not a pure runner-queue measurement. Both sets go to the
     harness Boss (`bin/boss-of.sh agent-harness`).
 - Done (process.md section 3): a merge-queue group or batch pushes `main` once, so a squash may
   have no push run of its own. Its runs are those of the first `main` push after the merge whose
@@ -102,7 +110,71 @@ affect every pull request make parallel edits collide.
 - Tiden after a GitHub merge: act on Tiden main only after the `main` push run whose range
   contains the squash has finished.
 
+## Pre-production mode
+
+Owner 11-04: while a project has no production, fast development is on; quality stays, but heavy
+processes, backups and a broken `main` are no tragedy. A project with no production users and no
+production data may switch the mode on with one `Override: pre-production mode` line in its
+AGENTS.md (templates/project-AGENTS-header.md). Switching it on is an OWNER change (process.md
+section 3): the owner's words name it. The owner's words that production starts switch it off; the
+pull request that removes the line restores every normal rule. Enforcers: the AGENTS.md line, which
+every session loads, and the worker brief's mode line (templates/worker-brief-common.md). This
+harness-defined override needs no differences.md row. While it is on, these replace the rules they
+name; everything else stays:
+
+1. Quality stays: failing tests first, real fixes, never a weakened, skipped or deleted test to
+   get green, and the review on the risk paths (item 4).
+2. Merge: with green required checks and no open blocking finding the agent merges at once
+   (`gh pr merge <n> --squash --match-head-commit <sha>`; `--auto` with the same flag where a merge
+   queue exists). No merge lock, freeze or update-and-retest on the latest `main`, also on shared
+   paths. A lock (orchestrator as merger) remains only where order matters: migration numbering
+   and CI routing (`.github/`). Draft first, the conflict guard and the required checks stay.
+3. A red `main` push run is not a stop: whoever sees it first fixes forward or reverts the
+   suspect squash, whichever is faster, as its own pull request; other merges continue.
+4. Reviews (reviews.md, Routing and Rounds): one round; a recheck only after a blocking finding;
+   the author fixes major and minor findings without a new round; no r3 or over-cap round. Astra
+   r1 only on the risk paths: user isolation and privacy, safety, auth and session,
+   migrations, CI permissions; other code gets one Sol r1.
+5. No backup gate (process.md section 2; reviews.md, Rounds 7): deleting or rewriting data,
+   restores and rollbacks need no fresh backup either, because the data is disposable test data;
+   undo and read-back stay. Production-observation steps never gate
+   a merge.
+6. Tiden: where hand steps replace sync B (tiden.md, One Tiden branch per pull request), the
+   merging agent merges the Tiden branch and links the new tests itself once the `main` run's
+   Tiden job has reported, without an orchestrator window; a window only for bulk writes or a
+   branch whose card another open branch edits.
+7. Visual or device verification (screenshots, simulator or device runs) only when a user-visible
+   screen or a native build input changes.
+8. Unchanged: process.md section 2's five owner items (product direction, user-data policy, money,
+   publication, the owner's hands), live-action limits, secrets, incident recovery and never
+   pushing `main`.
+
+## Evidence
+
+Use the existing PR as the delivery index: current head, check/remote-test receipt links, review
+packet and verdict links, next action and undo. Before a PR exists, the task receipt (or brief
+for one-step work) holds those pointers; copy the relevant evidence links when opening it. Execution truth stays in machine-produced
+receipts, with the tested SHA or input identity, selection, result and run/attempt. A diagnostic
+timing report proves no gate and cannot justify reusing a previous result.
+
+The private task-flow.md receipt is the single local record of task stages and next action;
+it records executor-supplied milestones and links, while execution receipts prove results.
+DONE, STATE.md and restart handoffs carry a short snapshot (head, outcome, next action) and
+pointers; do not copy full logs or maintain additional status files or results ledgers for one
+task. A handoff still explains open findings without an archive hunt; the linked receipts supply
+detail. Keep one review packet per PR as reviews.md requires, and private evidence outside Git.
+This adds no second task registry, extra report cadence or approval.
+
 ## Sessions
+
+- Task flow (task-flow.md): one private receipt replaces reconstructed status for multi-step work.
+  Track code, checks, merge, deployment and observation separately, with next action and evidence;
+  show the actual stage in owner updates. A task snapshot fixes ordinary harness rules only;
+  current owner decisions, revocations and safety restrictions prevail. Reuse the receipt on resume.
+  Scope owner asks to the candidate/actions/undo, supersede obsolete plans and refuse late answers.
+  Existing standing authority needs no new question. Record phase timings on existing events;
+  weekly digest names the largest measured delay, interruptions and repeat runs, using existing
+  billing evidence for cost. No new polling/monitor or per-step model round.
 
 - Every session has its own worktree and branch; the stash stack is shared across worktrees, so
   never use bare `git stash`.
@@ -218,7 +290,9 @@ Workers can run on another machine that Paradev (formerly Superset) knows as a h
   level if not in the card, limits beyond the card (production read-only, etc.), SP when Estimates is on,
   plus one line of read targets (owner 10-28): the card's expected paths, prior PRs on them and any file:line the
   card or an earlier worker's DONE names; the worker reads those first instead of surveying the repository
-  (worker brief, Read targets).
+  (worker brief, Read targets). For stateful or asynchronous changes, add the relevant failure
+  cases to that existing brief before tests: restart, cancellation, revoked access, concurrent
+  updates or multiple recipients. Select only cases this task can affect; no separate matrix or review round.
 - Workspaces: no tags on any workspace; the type lives in the workspace name (`code-…`,
   `research-…`, `ops-…`, `process-…`).
 - Worker states (CLI 1.39+): `bin/watch.sh` prints `AGENT <name> (terminal <id8>): <state>`
@@ -311,24 +385,24 @@ Workers can run on another machine that Paradev (formerly Superset) knows as a h
   (computer use, worker brief GUI steps) is dispatched too, one only the owner can take is a `hands` question. List the moves in the digest.
 - On dispatch, move the brief's card to `Active` (tiden.md, Specs and statuses).
 - Merge queue: a queued PR shows `autoMergeRequest=null`; dequeue only via GraphQL
-  `dequeuePullRequest`. Announce a release freeze before giving merge oks.
-- Release apply notice (owner 10-18): the release worker announces the apply time ahead only when
-  another live production action (stop window, drill, live check) is running or planned;
-  otherwise it applies right away and just reports RELEASE APPLIED. The merge freeze still holds
-  from the candidate SHA until RELEASE APPLIED.
+  `dequeuePullRequest`.
+- Releases (owner 11-04: ship without gates): the release worker applies right away and reports
+  RELEASE APPLIED. No merge freeze, release window, apply notice or backup wait; merges go on
+  while a release runs. The only wait is a live activity the project names (process.md section 2).
 - The orchestrator does not change product or production config itself (owner 10-18): every
   change goes to a worker through the process.
 - Cost (process-diet 10-18): no "ok/noted" replies to workers; each wake-up re-reads the whole
   context, so wake less: rely on worker standing approvals and answer worker questions in one
   message. Orchestrator effort medium (owner 10-19).
-- An over-cap ask (an r4) is checked against the packet class first (owner 10-30): a card or
-  production operation plan keeps its one recheck (reviews.md, Rounds 6, 7), so the answer is no
-  and the open finding is the worker's BLOCKED; `bin/review-codex.sh` refuses r3 and r4 there.
+- An over-cap ask (an r4) is checked against the packet class first (owner 10-30): a card keeps its
+  one recheck and a production operation plan gets none (reviews.md, Rounds 6, 7; owner 11-04), so
+  the answer is no: a card's open finding is the worker's BLOCKED, a plan's finding the author
+  cannot fix stops that step (Rounds 7); `bin/review-codex.sh` refuses those rounds.
 - Capacity (owner 10-18): run at least 7 workers in parallel (owner wants 10–15 later). A
   worker's context limit is a restart signal at a natural boundary; never stop a worker just for
   the number.
-- Process and rule changes (owner 10-18, 10-27): agents decide them without asking: research,
-  review (reviews.md, Rounds 8), merge, a "Decided by agents" digest line; the
+- Process and rule changes (owner 10-18, 10-27): agents decide them without asking: checklist,
+  a review only for authority/gate changes (reviews.md, Rounds 8), merge, a "Decided by agents" digest line; the
   owner reverses with one word. Only a change process.md section 3 makes OWNER needs the owner's
   words; a quoted owner request naming it counts. Give your own opinion and say plainly when an owner idea looks wrong or costly.
 - Partner, not yes-man (owner 10-18): hold an evidence-based opinion; when the owner pushes back,
@@ -338,7 +412,9 @@ Workers can run on another machine that Paradev (formerly Superset) knows as a h
   or config value, the review level or who merges, naming (a public name is item 4), process text, or whether you
   understood the owner (restate it in the digest instead). Every ask names its kind, one of the five of process.md
   section 2 (`product`, `user-data`, `money`, `publish`, `hands`), or is an `incident`; an ask that names none
-  is decided by the agent. An `incident` is production or a user-facing path broken or at risk, data loss
+  is decided by the agent. Incident notification never waits for an answer to start the reversible
+  recovery process.md section 2 already authorizes. Restore first, deferred checks and process
+  corrections second, other tasks last. An `incident` is production or a user-facing path broken or at risk, data loss
   or exposure, a security breach, or spend past the cap already happening; a blocked worker, a failed
   check, an open finding or a waiting PR is not one. An owner-kept item is a short explanation for a yes, never
   commands for the owner to run; after the yes an agent runs it. The one allowed command: a dcg block outside the
@@ -365,7 +441,7 @@ Workers can run on another machine that Paradev (formerly Superset) knows as a h
   decided after 24 h (scope and order of tasks, review level and who merges, naming, one project's process text)
   are never asked (Owner asks). Every owner ask is `default: none`: it waits for the owner, and work that needs no
   answer goes on.
-  - Only these get a digest line under "Decided by agents": a process.md section 2 gate step (ruleset or required
+  - Only these get a digest line under "Decided by agents": a process.md section 2 step (ruleset or required
     checks, secrets or access, destructive SQL or deleting data (not a service-run DELETE a ready card or data policy names), restore, rollback, production change, release), a process text
     change, a deleted card or weakened criterion, a GUI or ops step on a live service, a review finding closed
     by narrowing, a follow-up card or a revert (reviews.md, Rounds 5 and the epic review). Each line: `r<n>` (never
