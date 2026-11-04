@@ -716,8 +716,8 @@ Configuration, in the plan A file's `migration` section (`deploy/production.exam
 `databases.messaging` (Database copies): `unattended` = `{network, dsn_file, runner_config}` (the
 database's Docker network, the owner DSN file the migration container mounts read-only, readable by the
 image user 10001, and the backup runner's `runner.json`), `receiver_schema_max` (the newest schema the
-backup receiver reads; the operator raises it after updating the receiver, until ANYM-589 asks the
-receiver) and `rehearsal_limit_ms` (default 1000, at most 4000). Undo: remove `unattended` (or
+backup receiver reads, kept for the operator's own record; no release reads or waits on it since owner 11-04:
+a receiver behind the target is a backup follow-up) and `rehearsal_limit_ms` (default 1000, at most 4000). Undo: remove `unattended` (or
 `databases.messaging`) and every SQL change pauses again.
 
 What qualifies (M1): every SQL inventory path of the range is an added
@@ -731,8 +731,7 @@ Phases, each a pause or a wait before any production write:
 
 1. Admission (read-only): no active or unknown call (one poll; else `waiting` with `call_waits`); nothing
    unfinished (`unresolved`); the base release's `store.py` opens its pool with
-   `prepare_threshold: None` (#352; else "deploy #352 first"); `receiver_schema_max` is at least the
-   target (else `waiting`); the live ledger is exactly the base's (`schema_version` and every
+   `prepare_threshold: None` (#352; else "deploy #352 first"); the live ledger is exactly the base's (`schema_version` and every
    `archive_migrations` checksum; else a pause).
 2. Preparation: plan A `prepare` as always, then the producer check: the image `runner.json` pins has an
    `org.opencontainers.image.revision` whose `backup.py` `SCHEMAS` holds the target. When it does not, the
@@ -754,8 +753,8 @@ Phases, each a pause or a wait before any production write:
    applied (`<sha>/migration.json` absent, `rehearsed`, `refused` or `not-applied`): under the runner
    lock with the backup services idle, `cp -p runner.json.before-<sha> runner.json`. After the migration
    the old pin would fail every capture (`unsupported_backup_schema`): keep the new one. The calendar
-   `runner.json` keeps its own pin; move it by hand as in "Backup runner". Waits on the receiver or the
-   producer count in `deploy.json` (`migration_waits`); the third in a row pauses.
+   `runner.json` keeps its own pin; move it by hand as in "Backup runner". Waits on the producer count in
+   `deploy.json` (`migration_waits`); the third in a row pauses.
 3. Copy: ANYM-588 for `messaging`, keeping the scratch server; the copy's keeper also records the live
    catalog in its snapshot (`catalog_sha256`). A failed copy pauses "the pre-migration copy of messaging
    failed: <code>".
@@ -2297,10 +2296,12 @@ the optional `/etc/deedkit/autodeploy.env` (root-owned, mode `0600`) sets
 A deploy and the daily backup never overlap; the backup stops the collectors
 (`personal-os-backup.timer`, 18:00 UTC) and an apply would recreate them.
 Admission: the unit starts no deploy while `personal-os-backup.service` runs or
-waits to retry (any state but `inactive` or `failed`) and none from 13:00 to
-18:59 UTC; a failed or unexpected read of either skips the run. A run admitted
-before 13:00 ends by 17:03 at the latest (the 4-hour start timeout plus the
-3-minute stop timeout), so it is over before the scheduled backup starts.
+waits to retry (any state but `inactive` or `failed`); a failed or unexpected
+read skips the run. There is no clock window (owner 11-04: «давай все делать не
+ждать ничего»): a deploy may still run at 18:00, and then the scheduled backup
+refuses on the runner lock below and systemd retries it (30 minutes apart, at
+most three starts in 8 hours). A daily backup lost that way is a backup
+follow-up, never a release hold (owner 11-04, accepted).
 Exclusion: the deploy holds the backup runner's own lock
 (`/opt/personal-os-probe/backups/.runner.lock`, `DEEDKIT_BACKUP_LOCK`) for its
 whole run, so a backup started by hand during a deploy refuses before it stops
@@ -2353,7 +2354,7 @@ run it as one background command. `LIVE` (exit 0): plan A `applied` and the HTTP
 (or `serving-retirement-pending`) both contain the commit, with no pause and no unfinished attempt.
 `UNSETTLED` (1): both contain it, but a pause exists or an attempt is unfinished, so do not report it
 live. `REFUSED` (1): the commit is not deployed and a pause exists. `TIMEOUT` and `UNREACHABLE` (2):
-no verdict (default budget 4 hours, because the timer starts no deploy from 13:00 to 18:59 UTC). Each
+no verdict (default budget 4 hours). Each
 poll runs one constant ssh command that sends a fixed read-only script, which prints only `sha`,
 `status`, `reason` and `at` of `current.json`, `http-current.json` and `deploy.json`, the pause
 reason and the names of unfinished and serving attempts. The tool reads receipts; it does not probe containers.

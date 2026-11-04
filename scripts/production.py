@@ -3737,8 +3737,9 @@ def follow_producer(settings, mirror, plan, candidate, release):
 
 def migration_gate(settings, http, plan, mirror, base, serving):
     """M2's read-only gates, at admission and again as the final gate: no active or unknown call, nothing
-    unfinished, the base release's Store without server-side prepared statements (#352), a receiver that reads the
-    target, and the live ledger exactly the base's."""
+    unfinished, the base release's Store without server-side prepared statements (#352) and the live ledger exactly
+    the base's. The backup receiver's schema (`receiver_schema_max`) holds no release (owner 11-04): a receiver that
+    does not read the target yet is a backup follow-up."""
     wait_for_calls(settings, time.monotonic() + CALL_POLL)
     if reason := unresolved(Path(settings["state_directory"]), Path(http["state_directory"]), lambda: mirror, serving):
         raise MigrationRefused(reason)
@@ -3750,9 +3751,6 @@ def migration_gate(settings, http, plan, mirror, base, serving):
         store = ""
     if not UNPREPARED.search(store):
         raise MigrationRefused("the running release would fail on the new columns: deploy #352 first")
-    limit = settings["migration"].get("receiver_schema_max")
-    if type(limit) is not int or limit < plan["target"]:
-        raise MigrationWait(f"the backup receiver does not read schema {plan['target']} yet")
     version, applied = live_ledger(copy_source(settings, AUTO_DATABASE)[0])
     if version != plan["base"] or applied != plan["ledger"]:
         raise MigrationRefused(f"the live {AUTO_DATABASE} ledger is not the base's schema {plan['base']}; "
