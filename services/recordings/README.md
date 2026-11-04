@@ -89,12 +89,30 @@ The private backend uses authenticated `POST /v1/capabilities`,
 the reviewed agent-facing schemas. All source content is untrusted data.
 
 `recordings_list` takes `account`, `limit` (1–50, default 25), optional
-`start_date`/`end_date` as timezone-aware ISO instants, and `cursor`. Date bounds
-are inclusive and compare **created_at**, not recording start. Inspect
+`start_date`/`end_date`, and `cursor`. A date bound is a timezone-aware ISO instant
+with a `T` (`2026-11-03T10:00:00+02:00`) or a plain `YYYY-MM-DD` (ANYM-754): a plain
+`start_date` means 00:00:00 UTC of that day, a plain `end_date` its end
+(23:59:59.999999 UTC). Anything else (a naive time, a date with a zone but no time,
+a month alone) and a start after the end are `invalid_parameters`. Date bounds
+are inclusive and compare **created_at**, not recording start.
+
+The bounds go to Omi as `start_date`/`end_date` but are not trusted: the service
+drops every row whose `created_at` lies outside them and keeps a row whose
+`created_at` is missing, naive or unparsable (it cannot be placed, so it is never
+hidden by a guess). The promise is "drops what it can place outside the dates", not
+"only rows inside". A dated result adds
+`date_filter: {requested: true, filtered_locally: <n>, pages_read: <k>}`. When a
+page leaves no row, the service follows the provider's continuation itself, at most
+5 provider pages per call and never into a provider call that could outlast the
+gateway's deadline, until a page leaves a row or the provider has no more. No order
+of Omi's pages is assumed. `next_cursor` and `pagination` are the last page read, so
+continue exactly as without dates; an empty `items` with a `next_cursor` means "keep
+going". `filtered_locally > 0` means the provider did not apply the dates. Without
+dates the result is unchanged: one provider page, no `date_filter`. Inspect
 `pagination`: unknown or malformed evidence stays null, truncated pages remain
 incomplete even when empty. `complete` concerns this provider traversal's end,
 not account/archive coverage. Provider order can change and lists can be stale
-for ten seconds. No hidden auto-pagination occurs. Follow `next_cursor` with the
+for ten seconds. Apart from the dated follow above, no hidden auto-pagination occurs. Follow `next_cursor` with the
 same filters and limit. Missing provider continuation means no safe next page;
 it never means that an unknown traversal is complete.
 
