@@ -373,11 +373,13 @@ def manifest(c,p,account):
 
 VERIFY={'delete_message':{'operation':'get_message_info','requires':'read-live','decides':'exists:false means deleted'},
     'send_reaction':{'operation':'get_reactions','requires':'read-live',
-        'decides':'a reaction with chosen:true was set by this account'}}
+        'decides':'a reaction with chosen:true was set by this account'},
+    'edit_message':{'operation':'get_message_info','requires':'read-live',
+        'decides':'text equal to the requested text means the edit applied'}}
 
 
 def _verify(row,c=None):
-    """ANYM-666: what an agent reads when a delete or reaction stayed unknown (the receipt carries no secrets)."""
+    """ANYM-666/747: what an agent reads when a delete, reaction or edit stayed unknown (no secrets in the receipt)."""
     base=VERIFY.get(row['operation'])
     if base is None or row['status']!='unknown':return None
     platform=c.execute('SELECT platform FROM accounts WHERE id=%s',(row['account'],)).fetchone() if c is not None else None
@@ -387,7 +389,7 @@ def _verify(row,c=None):
     evidence=data.get('evidence') if isinstance(data,dict) else None
     evidence=evidence if isinstance(evidence,dict) else {}
     wanted=((row.get('payload') or {}).get('parameters') or {}).get('emoji')
-    not_applied=evidence.get('message_present') is True if row['operation']=='delete_message' else (
+    not_applied=False if row['operation']=='edit_message' else evidence.get('message_present') is True if row['operation']=='delete_message' else (
         evidence.get('basis')=='provider_read_back' and isinstance(evidence.get('reaction_present'),bool)
         and evidence['reaction_present']==(not wanted))
     if not_applied:

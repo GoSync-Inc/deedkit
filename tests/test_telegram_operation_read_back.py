@@ -2,15 +2,19 @@
 A fake Telethon client, the real command worker and the disposable database; no provider is touched."""
 import asyncio
 import json
+import threading
 from datetime import datetime, timezone
 from types import SimpleNamespace as NS
 
 import pytest
 from telethon import errors, functions, types
 
-from messaging_service.commands import CommandWorker
+from messaging_service.blobs import BlobWriter
+from messaging_service.collector_state import CaptureSpool
+from messaging_service.commands import VERIFY, CommandWorker
 from messaging_service.envelope import stable_id
 from messaging_service.telegram_governor import ProviderRateLimited, RequestGovernor
+from messaging_service.telegram_collector import TelegramCollector
 from messaging_service.telegram_operations import execute
 from test_archive import event
 from test_messenger_commands import operation_args, operator as operator  # noqa: F401  (fixture)
@@ -83,8 +87,7 @@ class ReadBackClient(Client):
         return [c for c in self.calls if isinstance(c, functions.messages.GetMessagesReactionsRequest)]
 
 
-def run(operator, client, operation='delete_message', parameters=None, governor=None, request_id='read-back-0001',
-        chat='100', message='1'):
+def queue_operation(operator, operation, parameters, request_id, chat='100', message='1'):
     s, archive, key, state = operator
     message_id = stable_id('msg', 'command-fixture', chat, message)
     with s.pool.connection() as c:
@@ -92,13 +95,81 @@ def run(operator, client, operation='delete_message', parameters=None, governor=
     args = operation_args(operation=operation, parameters=parameters or {}, expected_revision=revision,
         chat_id=stable_id('chat', 'command-fixture', chat), message_id=message_id)
     draft = s.preview_messenger_operation(key, **args)
-    queued = s.execute_messenger_operation(key, **args, request_id=request_id, preview_digest=draft['preview_digest'])
+    return s.execute_messenger_operation(key, **args, request_id=request_id, preview_digest=draft['preview_digest'])
+
+
+def run(operator, client, operation='delete_message', parameters=None, governor=None, request_id='read-back-0001',
+        chat='100', message='1', collector=None):
+    s, archive, key, state = operator
+    queued = queue_operation(operator, operation, parameters, request_id, chat, message)
 
     async def provider(job):
         job['_policy'] = POLICY
         return await execute(client, job, governor=governor)
-    assert asyncio.run(CommandWorker(state, provider).once())
+    if collector is not None:
+        # The collector's own operation path (it reads the policy itself), as production dispatches it.
+        collector.provider = NS(execute_operation=lambda job: execute(client, job, governor=governor), verified_self=None)
+    assert asyncio.run(CommandWorker(state, collector.execute_operation if collector is not None else provider).once())
     return s.get_messenger_operation(key, queued['operation_id'])
+
+
+EDITED = datetime(2026, 11, 4, 9, 30, tzinfo=timezone.utc)
+
+
+def provider_message(text, *, entities=(), edited=EDITED, out=True, chat_id=100, message_id=1):
+    """A Telethon-shaped copy of the fixture's archived outgoing message 1 in private chat 100."""
+    return NS(id=message_id, chat_id=chat_id, sender_id=42, message=text, entities=list(entities),
+        date=datetime(2026, 10, 1, 12, tzinfo=timezone.utc), edit_date=edited, out=out, peer_id=types.PeerUser(chat_id),
+        file=None, document=None, photo=None, media=None)
+
+
+def bold(text):
+    return [types.MessageEntityBold(0, len(text))]
+
+
+class EditClient(ReadBackClient):
+    """ANYM-747: `before` is what the dispatch check reads, `after` what the read-back shows, `response` the edit's return."""
+
+    def __init__(self, after=None, *, before=None, response=None):
+        super().__init__()
+        self.before = before or provider_message('Original synthetic text', edited=None)
+        self.after, self.response, self.edited = after, response, False
+
+    async def get_messages(self, peer, *, ids):
+        self.calls.append(('get_messages', peer, ids))
+        if not self.edited:
+            return self.before
+        if self.stall:
+            await self.hang()
+        if self.read_error is not None:
+            raise self.read_error
+        return self.after
+
+    async def edit_message(self, peer, message, text, **kwargs):
+        self.calls.append(('edit_message', peer, message, text, kwargs))
+        self.edited = True
+        return self.response
+
+    def edit_reads(self):
+        return [c for c in self.calls if isinstance(c, tuple) and c[0] == 'get_messages']
+
+
+def collector_for(operator, spool):
+    s, archive, key, state = operator
+    collector = TelegramCollector(archive, 'command-fixture', NS(verified_self=None), spool,
+        writer=BlobWriter(s.files, reserve_bytes=0), owner='synthetic-command-worker')
+    collector.state, collector.policy = state, state.policy()
+    return collector
+
+
+def spooled(spool):
+    items = []
+    spool.drain(items.append)
+    return items
+
+
+EDIT = {'text': 'Edited synthetic text'}
+UNKNOWN_EDIT = {'error': 'provider_result_unverified'}
 
 
 # spec: ANYM-666
@@ -169,6 +240,185 @@ def test_stalled_read_back_is_cut_by_the_worker_timeout_and_stays_unknown(operat
     s = operator[0]
     with s.pool.connection() as c:
         assert c.execute('SELECT count(*) AS n FROM messenger_commands').fetchone()['n'] == 1
+
+
+# spec: ANYM-747
+@pytest.mark.parametrize('response', ['other_text', 'none'])
+def test_edit_settles_succeeded_from_the_read_back(operator, response):
+    client = EditClient(provider_message('Edited synthetic text'),
+        response=provider_message('Edited synthetic text, normalised') if response == 'other_text' else None)
+    receipt = run(operator, client, 'edit_message', EDIT)
+    assert receipt['status'] == 'succeeded' and receipt['error_code'] is None
+    assert receipt['result']['outcome'] == 'confirmed' and receipt['result']['data'] == {'basis': 'provider_read_back',
+        'effect_verified': True, 'provider_message_id': '1', 'provider_chat_id': '100'}
+    assert receipt['next_action'] == 'none' and 'verify' not in receipt
+    assert len(client.mutations()) == 1
+    reads = client.edit_reads()
+    assert len(reads) == 2 and all(type(c[2]) is int for c in reads)  # the dispatch check and one scalar read-back
+
+
+# spec: ANYM-747
+def test_edit_read_back_strips_surrounding_whitespace_and_ignores_text_derived_entities(operator):
+    text = 'See https://example.invalid'
+    client = EditClient(provider_message(f'  {text}\n', entities=[types.MessageEntityUrl(6, 21)]))
+    receipt = run(operator, client, 'edit_message', {'text': text})
+    assert receipt['status'] == 'succeeded' and receipt['result']['data']['effect_verified'] is True
+
+
+# spec: ANYM-747
+@pytest.mark.parametrize('shown', ['old_text', 'missing', 'empty', 'other_chat', 'other_id', 'incoming', 'formatted'])
+def test_edit_stays_unknown_when_the_read_back_does_not_show_it(operator, shown):
+    after = {'old_text': lambda: provider_message('Original synthetic text', edited=None), 'missing': lambda: None,
+        'empty': lambda: types.MessageEmpty(1, types.PeerUser(100)),
+        'other_chat': lambda: provider_message('Edited synthetic text', chat_id=200),
+        'other_id': lambda: provider_message('Edited synthetic text', message_id=7),
+        'incoming': lambda: provider_message('Edited synthetic text', out=False),
+        'formatted': lambda: provider_message('Edited synthetic text', entities=bold('Edited synthetic text'))}[shown]()
+    # a formatted message edited plain: a read-back that still carries the bold is not the plain edit
+    before = provider_message('Original synthetic text', entities=bold('Original synthetic text'), edited=None)
+    client = EditClient(after, before=before if shown == 'formatted' else None)
+    receipt = run(operator, client, 'edit_message', EDIT)
+    assert receipt['status'] == 'unknown' and receipt['error_code'] == 'operation_result_unknown'
+    assert receipt['result'] == {'outcome': 'unknown', 'data': UNKNOWN_EDIT}
+    assert receipt['verify'] == VERIFY['edit_message']
+    assert receipt['next_action'] == 'verify_provider_state_before_any_new_action'
+    assert len(client.mutations()) == 1
+
+
+# spec: ANYM-747
+@pytest.mark.parametrize('error', [OSError('provider down'), asyncio.TimeoutError(), errors.RPCError(None, 'x', 500)])
+def test_edit_stays_unknown_when_the_read_back_fails(operator, error):
+    client = EditClient(provider_message('Edited synthetic text'))
+    client.read_error = error
+    receipt = run(operator, client, 'edit_message', EDIT)
+    assert receipt['status'] == 'unknown' and receipt['result'] == {'outcome': 'unknown', 'data': UNKNOWN_EDIT}
+    assert receipt['verify'] == {'operation': 'get_message_info', 'requires': 'read-live',
+        'decides': 'text equal to the requested text means the edit applied'}
+    assert len(client.mutations()) == 1
+
+
+# spec: ANYM-747
+def test_edit_read_back_flood_wait_carries_retry_after(operator):
+    client = EditClient(provider_message('Edited synthetic text'))
+
+    class Refusing:
+        """A governor that serves the dispatch and the mutation but refuses the scoped read."""
+        async def call(self, fn, phase):
+            return await fn()
+
+        async def scoped_call(self, fn, phase, scope):
+            assert scope == 'read_back'
+            raise ProviderRateLimited(45)
+    receipt = run(operator, client, 'edit_message', EDIT, governor=Refusing())
+    assert receipt['status'] == 'unknown' and receipt['result']['data'] == {**UNKNOWN_EDIT,
+        'evidence': {'basis': 'provider_read_back', 'retry_after_s': 45}}
+    assert receipt['verify'] == {**VERIFY['edit_message'], 'retry_after_s': 45}
+    assert len(client.mutations()) == 1
+
+
+# spec: ANYM-747
+def test_edit_whose_requested_state_was_already_there_stays_unknown(operator):
+    client = EditClient(provider_message('Edited synthetic text'),
+        before=provider_message(' Edited synthetic text ', edited=None))
+    receipt = run(operator, client, 'edit_message', EDIT)
+    assert receipt['status'] == 'unknown' and receipt['result'] == {'outcome': 'unknown', 'data': UNKNOWN_EDIT}
+    assert len(client.mutations()) == 1 and len(client.edit_reads()) == 1  # no read can prove this request did it
+
+
+# spec: ANYM-747
+def test_plain_edit_of_the_same_text_confirms_the_formatting_removal(operator):
+    text = 'Edited synthetic text'
+    client = EditClient(provider_message(text), before=provider_message(text, entities=bold(text), edited=None))
+    receipt = run(operator, client, 'edit_message', {'text': text})
+    assert receipt['status'] == 'succeeded' and receipt['result']['data']['basis'] == 'provider_read_back'
+    assert len(client.mutations()) == 1
+
+
+# spec: ANYM-747
+def test_stalled_edit_read_back_is_cut_by_the_worker_timeout(operator, monkeypatch):
+    original = asyncio.wait_for
+
+    async def short(awaitable, timeout):
+        return await original(awaitable, 0.5 if timeout == 30 else timeout)  # the worker's 30 s operation timeout
+    monkeypatch.setattr(asyncio, 'wait_for', short)
+    client = EditClient(provider_message('Edited synthetic text'))
+    client.stall = True
+    receipt = run(operator, client, 'edit_message', EDIT)
+    assert receipt['status'] == 'unknown' and receipt['error_code'] == 'operation_result_unknown'
+    assert client.cancelled and receipt['result'] is None  # the cancellation reached the read and was not swallowed
+    assert len(client.mutations()) == 1
+
+
+# spec: ANYM-747
+def test_confirmed_edit_queues_one_archive_item_and_an_unknown_one_none(operator, tmp_path):
+    spool = CaptureSpool(tmp_path / 'capture', reserve_bytes=0)
+    collector = collector_for(operator, spool)
+    receipt = run(operator, EditClient(provider_message('Edited synthetic text')), 'edit_message', EDIT,
+        collector=collector)
+    assert receipt['status'] == 'succeeded' and receipt['result']['data']['archive'] == 'queued'
+    assert spooled(spool) == []  # never the live spool and its lock: the edit spool beside it
+    [item] = spooled(collector.edit_spool)
+    assert item['kind'] == 'message' and item['peer_kind'] == 'user'
+    envelope = item['envelope']
+    assert (envelope['account'], envelope['chat'], envelope['provider_id']) == ('command-fixture', '100', '1')
+    assert envelope['body'] == 'Edited synthetic text' and envelope['direction'] == 'outgoing'
+    assert envelope['updated_at'] == '2026-11-04T09:30:00+00:00' and envelope['origin'] == 'live'
+    unknown = run(operator, EditClient(provider_message('Original synthetic text', edited=None)), 'edit_message',
+        EDIT, collector=collector, request_id='read-back-0002')
+    assert unknown['status'] == 'unknown' and 'archive' not in unknown['result']['data']
+    assert spooled(collector.edit_spool) == []
+
+
+# spec: ANYM-747
+def test_a_failing_archive_hand_off_keeps_the_edit_succeeded(operator, tmp_path):
+    spool = CaptureSpool(tmp_path / 'capture', reserve_bytes=0)
+    collector = collector_for(operator, spool)
+
+    def broken(item):
+        raise OSError('disk gone')
+    collector.edit_spool.put = broken
+    receipt = run(operator, EditClient(provider_message('Edited synthetic text')), 'edit_message', EDIT,
+        collector=collector)
+    assert receipt['status'] == 'succeeded' and receipt['error_code'] is None
+    assert receipt['result']['data']['archive'] == 'not_queued'
+    assert not collector.failed.is_set() and collector.capture_count == 0
+
+
+# spec: ANYM-747
+def test_a_cancellation_during_the_hand_off_settles_the_edit_first(operator, tmp_path):
+    s, archive, key, state = operator
+    spool = CaptureSpool(tmp_path / 'capture', reserve_bytes=0)
+    collector = collector_for(operator, spool)
+    entered, release = threading.Event(), threading.Event()
+    original = collector.edit_spool.put
+
+    def slow(item):
+        entered.set()
+        assert release.wait(5)
+        return original(item)
+    collector.edit_spool.put = slow
+    client = EditClient(provider_message('Edited synthetic text'))
+    collector.provider = NS(execute_operation=lambda job: execute(client, job), verified_self=None)
+    queued = queue_operation(operator, 'edit_message', EDIT, 'read-back-cancel-01')
+
+    async def scenario():
+        task = asyncio.ensure_future(CommandWorker(state, collector.execute_operation).once())
+        while not entered.is_set():
+            await asyncio.sleep(.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task  # the worker resumes the cancellation only after the receipt is durable
+        receipt = s.get_messenger_operation(key, queued['operation_id'])
+        release.set()
+        while collector.capture_count:
+            await asyncio.sleep(.01)
+        return receipt
+    receipt = asyncio.run(scenario())
+    assert receipt['status'] == 'succeeded' and receipt['error_code'] is None
+    assert receipt['result']['data']['archive'] == 'not_queued'
+    assert not collector.failed.is_set() and collector.failure_code is None
+    assert len(client.mutations()) == 1
+    assert len(spooled(collector.edit_spool)) == 1  # the write finished after the wait was cut; the drain applies it
 
 
 # spec: ANYM-666

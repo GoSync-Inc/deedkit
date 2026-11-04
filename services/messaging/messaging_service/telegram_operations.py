@@ -32,6 +32,11 @@ history_log = logging.getLogger('anymsg.chat_history')
 
 MAX_ORIGINAL_BYTES = 32 * 1024 * 1024
 MAX_PROFILE_PAGE = 50
+# ANYM-747: entities Telegram detects in plain text (links, mentions, tags); a plain edit cannot remove them, so
+# they are not formatting. Every other entity (bold, a text link, a custom emoji ...) is.
+TEXT_DERIVED_ENTITIES = (types.MessageEntityUrl, types.MessageEntityMention, types.MessageEntityHashtag,
+                         types.MessageEntityCashtag, types.MessageEntityBotCommand, types.MessageEntityEmail,
+                         types.MessageEntityPhone, types.MessageEntityBankCard)
 READ_OPERATIONS = frozenset({
     'chat_info', 'list_participants', 'get_reactions', 'get_message_info',
     'list_topics', 'get_profile', 'list_contacts', 'get_contact', 'list_blocked',
@@ -595,17 +600,56 @@ async def write_media_message(op):
     return accepted_updates(response, chat, random_id)
 
 
+def formatting_entities(message):
+    """The entities of a message that are formatting, not the ones Telegram derives from the text itself."""
+    return [e for e in (getattr(message, 'entities', None) or [])[:100] if not isinstance(e, TEXT_DERIVED_ENTITIES)]
+
+
+def edit_state(message):
+    """ANYM-747: what a plain edit sets: the text (surrounding whitespace stripped) and whether formatting remains."""
+    text = getattr(message, 'message', None)
+    return (text.strip() if isinstance(text, str) else None, bool(formatting_entities(message)))
+
+
+async def edit_read_back(op, before):
+    """ANYM-747: one scoped read of the edited message. Only a read that shows the requested plain text on this
+    account's message, after a state that differed (`before`: edit_state taken before the edit), confirms the
+    edit; anything else leaves the result unknown."""
+    from .telegram_governor import ProviderRateLimited
+    peer, chat, message_id, client, rpc, job = op.peer, op.chat, op.message_id, op.client, op.rpc, op.job
+    unknown = {'outcome': 'unknown', 'error': 'provider_result_unverified'}
+    wanted = (op.parameters['text'].strip(), False)
+    if before == wanted:
+        return unknown  # nothing the read could show proves that this request changed the message
+    try:
+        # The scalar `ids` form, as delete_read_back: a list returns [None] in Telethon 1.45.
+        message = await rpc(lambda: client.get_messages(peer, ids=message_id), scope='read_back')
+    except asyncio.CancelledError:
+        raise
+    except ProviderRateLimited as error:
+        return {**unknown, 'evidence': flood_evidence(error)}
+    except Exception:
+        return unknown
+    if (message is None or isinstance(message, types.MessageEmpty) or getattr(message, 'id', None) != message_id or
+            str(getattr(message, 'chat_id', None)) != str(chat) or getattr(message, 'out', None) is not True or
+            edit_state(message) != wanted):
+        return unknown
+    job['_read_back_message'] = message  # the collector queues it for the archive after the receipt is built
+    return {'outcome': 'confirmed', 'basis': 'provider_read_back', 'effect_verified': True,
+            'provider_message_id': str(message_id), 'provider_chat_id': str(chat)}
+
+
 async def write_edit_delete(op):
     exact_message, peer, chat, message_id, operation, accepted, rpc, parameters, client = (
         op.exact_message, op.peer, op.chat, op.message_id, op.operation, op.accepted, op.rpc, op.parameters, op.client)
-    await exact_message(peer, chat, message_id, own=True)
+    target = await exact_message(peer, chat, message_id, own=True)
     if operation == 'edit_message':
         bounded_text(parameters.get('text'), 4000)
-        response = await rpc(lambda: client.edit_message(peer, message_id, parameters['text'],
+        before = edit_state(target)  # taken now: a client may update the same message object in place
+        await rpc(lambda: client.edit_message(peer, message_id, parameters['text'],
             parse_mode=None, link_preview=False), mutation=True)
-        if getattr(response, 'message', None) != parameters['text'] or getattr(response, 'out', None) is not True:
-            return {'outcome': 'unknown', 'error': 'provider_result_unverified'}
-        return accepted(response, message=True, chat=chat, message_id=message_id)
+        # The response is not the proof (production responses failed the text equality): one read is.
+        return await edit_read_back(op, before)
     response = await rpc(lambda: client.delete_messages(peer, [message_id], revoke=True), mutation=True)
     submitted = accepted(response)
     return await delete_read_back(op, submitted) if submitted['outcome'] == 'submitted' else submitted

@@ -61,6 +61,27 @@ def test_same_version_conflict_is_explicit_no_overwrite(archive):
     assert s.capabilities(key)['sources'][0]['detail_code']=='version_conflict'
 
 
+# spec: ANYM-747
+def test_telegram_edit_envelope_is_the_next_revision_and_the_same_version_stays_conflict(archive):
+    from types import SimpleNamespace as NS
+    from telethon import types
+    from messaging_service.adapters import telegram_message
+    ar,s,key,_=archive
+    def provider_message(text,edited=None):
+        return NS(id=17,chat_id=100,sender_id=42,message=text,entities=[],out=True,peer_id=types.PeerUser(100),
+            date=datetime(2026,10,1,12,tzinfo=timezone.utc),edit_date=edited,file=None,document=None,photo=None,media=None)
+    edited_at=datetime(2026,11,4,9,30,tzinfo=timezone.utc)
+    mid=ar.ingest(telegram_message('archive-test',provider_message('Before the edit')))['message']
+    edited=telegram_message('archive-test',provider_message('After the edit',edited_at))
+    assert edited['updated_at']=='2026-11-04T09:30:00+00:00'
+    assert ar.ingest(edited)['outcome']=='edited'
+    # the same provider version with other content is still a conflict, never a third revision (pinned)
+    assert ar.ingest(telegram_message('archive-test',provider_message('Other text',edited_at)))['outcome']=='conflict'
+    assert s.search(key)['items'][0]['body']=='After the edit'
+    with s.pool.connection() as c:
+        assert c.execute('SELECT revision FROM messages WHERE id=%s',(mid,)).fetchone()['revision']==2
+
+
 def test_sync_conflict_alert_follows_unresolved_conflicts_not_the_sticky_code(archive):
     from messaging_service.sync_status import get_sync_status
     ar,s,key,_=archive

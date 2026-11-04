@@ -2,6 +2,7 @@
 import asyncio
 from collections import deque
 import copy
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager,nullcontext,suppress
 from functools import cached_property
 from datetime import datetime,timedelta,timezone
@@ -24,7 +25,7 @@ from .archive import Archive
 from .blobs import BlobWriter
 from .envelope import stable_id
 from .collector_state import LIVE_REJECT_CODES,CaptureSpool,CollectorState,PeerKindConflict,session_lock
-from .spool import InvalidCapture,PoisonItem
+from .spool import DurableSpool,InvalidCapture,PoisonItem
 from .collector_common import DbBackoff,commit_items,validate_common,validate_ranges
 from .store import Store
 from .telegram_governor import LIVE_BUDGETS,LIVE_STATE,ProviderRateLimited,RequestGovernor
@@ -40,6 +41,10 @@ STORE_GRACE=1.0
 # Operations whose confirmed receipt names a group new to the account, and the seconds its catalog write may take.
 NEW_CHAT_OPERATIONS=('create_group','join_chat')
 CATALOG_SECONDS=5.0
+# ANYM-747: seconds a confirmed edit's archive hand-off (one spool write) may take inside the command's timeout.
+EDIT_ARCHIVE_SECONDS=5.0
+# Its own thread: a stalled hand-off write never holds a thread of the default executor (ANYM-747, Astra r1).
+EDIT_ARCHIVE_EXECUTOR=ThreadPoolExecutor(max_workers=1,thread_name_prefix='edit-archive')
 
 
 class DeadlinePool:
@@ -526,6 +531,17 @@ class TelegramCollector:
                 max_bytes=live.max_bytes,max_entries=live.max_entries,reserve_bytes=live.reserve_bytes)
         return self._history_spool
 
+    @property
+    def edit_spool(self):
+        # ANYM-747: a confirmed edit's archive hand-off, beside the live spool with its own publication lock, so a
+        # stalled hand-off write never holds the lock live captures take. Drained with the live spool.
+        if getattr(self,'_edit_spool',None) is None:
+            from .spool import DurableSpool
+            live=self.spool
+            self._edit_spool=DurableSpool(live.path/'edits',validator=live.validator,
+                max_bytes=live.max_bytes,max_entries=live.max_entries,reserve_bytes=live.reserve_bytes)
+        return self._edit_spool
+
     def fail(self,code,detail=None):
         self.failure_code=code; self.failure_detail=detail; self.failed.set()
 
@@ -839,6 +855,11 @@ class TelegramCollector:
 
     async def drain_captures(self,spools,history_spools=()):
         last=None;count=0
+        # ANYM-747: the edit spool beside the live spool drains with it, as live progress (WhatsApp's drain passes
+        # its events spool, never self.spool, so it gains nothing).
+        live=getattr(self,'spool',None)
+        if isinstance(live,DurableSpool) and any(spool is live for spool in spools):
+            spools=[*spools,self.edit_spool]
         def settle(item):
             # A kept item whose chat has another stored kind can never apply: quarantine its bytes so the
             # other chats keep draining (counted in capture_progress), instead of ending the worker.
@@ -1167,6 +1188,10 @@ class TelegramCollector:
                 answer=await self.provider.execute_operation(job)
                 await self.catalog_new_chat(job,answer)
                 return answer
+            if job.get('operation')=='edit_message':
+                answer=await self.provider.execute_operation(job)
+                await self.queue_edit_for_archive(job,answer)
+                return answer
             if job.get('operation')!='search_messages_live': return await self.provider.execute_operation(job)
             job['_live_hits']=found=[]
             answer=await self.provider.execute_operation(job)
@@ -1206,6 +1231,47 @@ class TelegramCollector:
             log.warning('new_chat_catalog_failed operation=%s error=CancelledError',job.get('operation'))
         except Exception as exc:
             log.warning('new_chat_catalog_failed operation=%s error=%s',job.get('operation'),type(exc).__name__)
+
+    async def queue_edit_for_archive(self,job,answer):
+        """ANYM-747: a confirmed edit reaches the archive through the edit spool, which the drain loop applies with
+        the live spool, so the drain makes it the next revision. Never through capture(): this is best-effort and
+        total, it never fails the collector, and the operation stays confirmed whatever happens here (the live
+        MessageEdited event and reconcile still apply). A capture slot is taken only when one is free at once (waiting
+        for one could fail the collector) and is held until the spool write itself ends, also past a timeout. The
+        write runs on its own one-thread executor, at most one at a time, under the edit spool's own lock: a stalled
+        disk never takes the threads or the lock that receipts, sends, lease renewal and live captures use."""
+        data=answer.get('data') if isinstance(answer,dict) and answer.get('outcome')=='confirmed' else None
+        message=job.pop('_read_back_message',None)
+        if not isinstance(data,dict) or message is None:return
+        data['archive']='not_queued'
+        try:
+            budget=min(EDIT_ARCHIVE_SECONDS,job.get('_ends_at',math.inf)-time.monotonic()-STORE_GRACE-1)
+            if budget<=0 or self.stopping.is_set() or self.failed.is_set():return
+            pending=getattr(self,'_edit_archive_write',None)
+            if pending is not None and not pending.done():return
+            if self.capture_count>=CAPTURE_WRITES or self.capture_waiters:return
+            e=telegram_message(self.account,message,verified_self=getattr(self.provider,'verified_self',None))
+            policy=job.get('_policy') or self.policy
+            if not policy or not self.state.allows(policy,e['chat']):return
+            item={'kind':'message','peer_kind':peer_kind(message),'envelope':e,
+                'captured_at':datetime.now(timezone.utc).isoformat()}
+            self.capture_count+=1
+            try:
+                # The property is read on that thread too: creating the directory is filesystem work.
+                write=asyncio.get_running_loop().run_in_executor(EDIT_ARCHIVE_EXECUTOR,lambda:self.edit_spool.put(item))
+            except BaseException:
+                self.release_capture();raise
+            self._edit_archive_write=write
+            # The slot follows the write, not this call: a timed-out or cancelled wait leaves it held until the end.
+            write.add_done_callback(lambda done:(self.release_capture(),done.cancelled() or done.exception()))
+            await asyncio.wait_for(asyncio.shield(write),budget)
+            data['archive']='queued'
+        except asyncio.CancelledError:
+            # A shutdown during the spool write: the worker settles the confirmed receipt first, then stops.
+            job['_cancel_after_settle']=True
+            log.warning('edit_archive_queue_failed error=CancelledError')
+        except Exception as exc:
+            log.warning('edit_archive_queue_failed error=%s',type(exc).__name__)
 
     async def chat_history(self,job):
         """ANYM-477: one agent-requested history page, archived as live search hits are; stored_new counts new rows."""
