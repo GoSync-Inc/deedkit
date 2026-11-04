@@ -94,6 +94,12 @@ class ChatPageFailed(Exception):
         self.code=code; self.error=error; super().__init__(code)
 
 
+class DiscoveryFailed(Exception):
+    """A dialog page failed for a provider reason that degrades the discovery pass, not the collector (ANYM-749)."""
+    def __init__(self,error):
+        self.code='discovery_provider_error'; self.error=error; super().__init__(self.code)
+
+
 def database_errors():
     # Transient archive faults: statement timeouts, lost connections and a
     # saturated pool. Lease loss is a RuntimeError and still stops the collector.
@@ -341,8 +347,14 @@ class TelethonProvider:
         # Telethon's pinned RequestIter keeps its next-page request unchanged when
         # _load_next_chunk raises FloodWait. Retry THIS iterator after the durable
         # pause, not a fresh traversal. Catalog batches already yielded stay saved.
+        # A transient server error is retried the same way from a budget of CHAT_ATTEMPTS
+        # failures per pass; it and any other non-terminal RPC error then fail only this
+        # pass (DiscoveryFailed, ANYM-749). Rate limits, session-terminal errors and
+        # transport loss propagate as before.
+        from telethon.errors import (AuthKeyDuplicatedError,FloodError,RPCError,ServerError,TimedOutError,
+            UnauthorizedError)
         iterator=self.client.iter_dialogs(limit=limit).__aiter__()
-        batch=[];page_observed_at=datetime.now(timezone.utc).isoformat()
+        batch=[];page_observed_at=datetime.now(timezone.utc).isoformat();failures=0
         while True:
             try:
                 buffer=getattr(iterator,'buffer',None)
@@ -356,6 +368,17 @@ class TelethonProvider:
             except ProviderRateLimited:
                 if batch:yield batch;batch=[]
                 continue
+            except (FloodError,UnauthorizedError,AuthKeyDuplicatedError):raise
+            except (ServerError,TimedOutError,TimeoutError) as exc:
+                # Rows already listed are yielded (and saved) before the wait or the end of the pass.
+                failures+=1
+                if batch:yield batch;batch=[]
+                if failures>=CHAT_ATTEMPTS:raise DiscoveryFailed(exc) from exc
+                await asyncio.sleep(CHAT_RETRY_DELAYS[failures-1])
+                continue
+            except (RPCError,ProviderPageError) as exc:
+                if batch:yield batch
+                raise DiscoveryFailed(exc) from exc
             kind=dialog_kind(dialog)
             chat_type='private' if dialog.is_user else ('group' if dialog.is_group else 'channel')
             raw=getattr(dialog,'dialog',None)
@@ -716,25 +739,36 @@ class TelegramCollector:
     async def sync_once(self):
         from telethon.errors import ChannelPrivateError,ChatAdminRequiredError,PeerIdInvalidError,FloodWaitError
         self.policy=await asyncio.to_thread(self.state.policy)
+        discovery_failed=None
         if self._dialog_cache is None or time.monotonic()>=self._next_discovery:
             await asyncio.to_thread(self.state.status,'receiving','telegram_discovery')
             await asyncio.to_thread(self.state.discovery_started)
             dialogs=[]
-            if hasattr(self.provider,'dialog_batches'):
-                async for batch in self.provider.dialog_batches(self.max_dialogs):
-                    await asyncio.to_thread(self.state.inventory,batch,self.history_since,discovery=True)
-                    dialogs.extend(batch)
+            try:
+                if hasattr(self.provider,'dialog_batches'):
+                    async for batch in self.provider.dialog_batches(self.max_dialogs):
+                        await asyncio.to_thread(self.state.inventory,batch,self.history_since,discovery=True)
+                        dialogs.extend(batch)
+                else:
+                    # Small injected/test providers may expose only a single page.
+                    dialogs=await self.provider.dialogs(self.max_dialogs)
+                    await asyncio.to_thread(self.state.inventory,dialogs,self.history_since,discovery=True)
+            except DiscoveryFailed as failure:
+                # The pass degrades; batches already yielded stay saved, discovery is not marked finished and
+                # the next loop tries again. History goes on over the previous catalog, if any (ANYM-749).
+                discovery_failed=failure.code
+                print(json.dumps({'event':'telegram_discovery_error','code':failure.code}),flush=True)
+                await asyncio.to_thread(self.state.status,'degraded',failure.code)
+                if self._dialog_cache is None:return
+                dialogs=self._dialog_cache
             else:
-                # Small injected/test providers may expose only a single page.
-                dialogs=await self.provider.dialogs(self.max_dialogs)
-                await asyncio.to_thread(self.state.inventory,dialogs,self.history_since,discovery=True)
-            await asyncio.to_thread(self.state.discovery_finished,
-                                    self.max_dialogs is not None and len(dialogs)>=self.max_dialogs)
-            self._dialog_cache=dialogs
-            # Do not refetch an entire account catalog on every history pass.
-            self._next_discovery=time.monotonic()+900
-            print(json.dumps({'event':'telegram_discovery','dialogs':len(dialogs),
-                'limit':self.max_dialogs,'history_since':self.history_since.isoformat() if self.history_since else None}),flush=True)
+                await asyncio.to_thread(self.state.discovery_finished,
+                                        self.max_dialogs is not None and len(dialogs)>=self.max_dialogs)
+                self._dialog_cache=dialogs
+                # Do not refetch an entire account catalog on every history pass.
+                self._next_discovery=time.monotonic()+900
+                print(json.dumps({'event':'telegram_discovery','dialogs':len(dialogs),
+                    'limit':self.max_dialogs,'history_since':self.history_since.isoformat() if self.history_since else None}),flush=True)
         else:dialogs=self._dialog_cache
         order=await asyncio.to_thread(self.state.inventory,dialogs,self.history_since)
         by_id={d[0]:d for d in dialogs}
@@ -765,7 +799,9 @@ class TelegramCollector:
         missing=set(self.policy['include_chats'])-set(self.policy['exclude_chats'])-seen
         code='dialog_discovery_limited' if self.max_dialogs is not None and len(dialogs)>=self.max_dialogs else 'telegram_history_partial'
         if missing or unavailable: code='configured_chat_unavailable'
-        await asyncio.to_thread(self.state.status,'degraded' if missing or unavailable else 'receiving',code)
+        # A pass over the previous catalog after a failed discovery keeps the discovery code (ANYM-749).
+        if discovery_failed: code=discovery_failed
+        await asyncio.to_thread(self.state.status,'degraded' if missing or unavailable or discovery_failed else 'receiving',code)
 
     async def reconcile_loop(self):
         from telethon.errors import FloodWaitError

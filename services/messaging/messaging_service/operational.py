@@ -110,7 +110,7 @@ def operations(row, history, files, now=None, *, eligibility=None):
     phase=dict(phases.get('history') or {})
     phase.update(state='partial_with_gaps' if gaps else
         'partial_with_errors' if row.get('detail_code') in ('configured_chat_unavailable',
-            'whatsapp_chat_unavailable','provider_temporarily_unavailable') else
+            'whatsapp_chat_unavailable','provider_temporarily_unavailable','discovery_provider_error') else
         'traversing' if history.get('catchup_pending_chats') or
             history.get('configured_window',{}).get('in_progress') or
             history.get('unbounded_history',{}).get('in_progress') else 'partial',

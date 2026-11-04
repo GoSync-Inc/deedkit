@@ -3540,39 +3540,21 @@ def admission_skips(bin_dir, backup, hour, *, systemctl_fails=False, date_fails=
 
 
 # spec: ANYM-407
-def test_the_autodeploy_unit_runs_deploy_auto_and_never_starts_during_or_just_before_the_backup(tmp_path):
+def test_the_autodeploy_unit_runs_deploy_auto_at_any_hour_and_never_while_the_backup_unit_runs(tmp_path):
+    # Owner 11-04: no clock window; the only exclusion is the backup itself (unit state here, runner lock below).
     lines = autodeploy_unit()
     timer = (ROOT / "deploy/deedkit-autodeploy.timer").read_text()
     assert "/usr/local/lib/deedkit/production.py deploy --auto " in lines["ExecStart"]
     assert "personal-os-backup.service" in lines["After"] and "OnUnitInactiveSec=5min" in timer
+    assert "date" not in lines["ExecCondition"]
 
     def skipped(*arguments, **failures):
         return admission_skips(tmp_path / "bin", *arguments, **failures)
 
-    assert not skipped("inactive", "12") and not skipped("failed", "19") and not skipped("inactive", "00")
-    assert skipped("activating", "12") and skipped("active", "03") and skipped("deactivating", "12")
-    assert skipped("inactive", "16") and skipped("inactive", "17") and skipped("inactive", "18")
+    assert not any(skipped(state, f"{hour:02d}") for state in ("inactive", "failed") for hour in range(24))
+    assert skipped("activating", "12") and skipped("active", "17") and skipped("deactivating", "18")
     # A failed or unexpected read never admits a deploy.
-    assert skipped("inactive", "12", systemctl_fails=True) and skipped("inactive", "12", date_fails=True)
-    assert skipped("", "12") and skipped("inactive", "garbage") and skipped("inactive", "24")
-
-
-# spec: ANYM-407
-def test_a_deploy_admitted_before_the_backup_window_ends_before_the_daily_backup_starts(tmp_path):
-    # personal-os-backup.timer starts the backup at 18:00 UTC; a deploy holding the runner lock then would fail
-    # the backup and its retries (StartLimitBurst=3 in 8 hours, 30 minutes apart) until the backup is lost for the day.
-    lines = autodeploy_unit()
-    seconds = {"h": 3600, "min": 60, "s": 1}
-
-    def duration(value):
-        number, unit = re.fullmatch(r"(\d+)(h|min|s)", value).groups()
-        return int(number) * seconds[unit]
-
-    admitted = [hour for hour in range(18) if not admission_skips(tmp_path / "bin", "inactive", f"{hour:02d}")]
-    latest_start = (admitted[-1] + 1) * 3600 - 1  # the last second of the last admitted hour before 18:00
-    # The single ExecStart follows the hour read at once and gets TimeoutStartSec; then systemd stops it within TimeoutStopSec.
-    latest_end = latest_start + duration(lines["TimeoutStartSec"]) + duration(lines["TimeoutStopSec"])
-    assert latest_end < 18 * 3600 - 30 * 60  # half an hour before the backup, whatever the run's length
+    assert skipped("inactive", "12", systemctl_fails=True) and skipped("", "12") and skipped("garbage", "12")
 
 
 # spec: ANYM-407
@@ -5758,6 +5740,34 @@ def test_status_reads_the_configuration_the_autodeploy_unit_reads(tmp_path, monk
     monkeypatch.setattr(p, "images_report", lambda settings: {})
     p.main(["images"])
     assert seen == [p.CONFIG]
+
+
+# spec: ANYM-757
+def test_status_names_a_stopped_failed_candidate(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(p, "PAUSE", tmp_path / "autodeploy.pause")
+    monkeypatch.setattr(p, "lock", lambda state: contextlib.nullcontext())
+    state, http_state = tmp_path / "state", tmp_path / "http-state"
+    state.mkdir()
+    p.write(state / "current.json", {"sha": "c" * 40, "status": "applied"})
+    for sha, attempt in (("a" * 40, {"status": "startup-failed", "candidate_stopped": True}),
+                         ("b" * 40, {"status": "startup-failed"}), ("d" * 40, {"status": "serving"}),
+                         ("e" * 40, {"status": "startup-failed", "candidate_stopped": False})):
+        (http_state / sha).mkdir(parents=True)
+        p.write(http_state / sha / "http-attempted.json", {**attempt, "sha": sha})
+    (tmp_path / "http.json").write_text("{}")
+    configs = {"plan-a.json": {"state_directory": str(state)}, "http.json": {"state_directory": str(http_state)}}
+    monkeypatch.setattr(p, "config", lambda path: configs[Path(path).name])
+    def status(*argv):
+        p.main(["status", "--config", str(tmp_path / "plan-a.json"), *argv])
+        return json.loads(capsys.readouterr().out)
+    printed = status("--http-config", str(tmp_path / "http.json"))
+    assert printed["sha"] == "c" * 40
+    assert printed["http_failed_attempts"] == [{"sha": "a" * 40, "candidate_stopped": True}, {"sha": "b" * 40},
+                                               {"sha": "e" * 40, "candidate_stopped": False}]
+    # No plan B on the host: nothing to name, and status never fails because of it.
+    assert "http_failed_attempts" not in status("--http-config", str(tmp_path / "absent.json"))
+    configs["http.json"] = {}
+    assert status("--http-config", str(tmp_path / "http.json"))["http_failed_attempts"] == {"error": "KeyError"}
 
 
 def freshness_file(path, *, checked_ago=timedelta(minutes=20), status="fresh", age=12.3, **extra):

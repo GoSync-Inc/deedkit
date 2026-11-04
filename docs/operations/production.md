@@ -582,9 +582,8 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
    while the daily backup succeeds), and everything written after it (messages, receipts, keys, operator
    changes) is lost. No gate backup or copy was restored in any hand release from 10-17 to 11-04.
 4. How a non-critical release runs. `deploy` applies it itself when the range qualifies ("Unattended
-   migrations": today `expand` files and appended role grants, and only once `receiver_schema_max` reads
-   the target, phase 1). Any other range, and one held only by that receiver wait, pauses autodeploy
-   until `deploy` applies every non-critical range itself (ANYM-743); meanwhile the agent who sees the
+   migrations": today `expand` files and appended role grants; the backup receiver's schema holds none).
+   Any other range pauses autodeploy until `deploy` applies every non-critical range itself (ANYM-743); meanwhile the agent who sees the
    pause releases it at once, at any hour, with the previous release's tested commands: a tested runbook,
    so no new kit, plan or review round. The order:
    1. Exclusion from the backups (a backup stops the collectors and holds snapshots; an apply recreates
@@ -607,9 +606,8 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
       yet: a hand release does not read `receiver_schema_max`; raise it once the receiver reads the target.
 
    Merges never wait for a release: the candidate is one SHA ("Prepare and inspect"), so there is no merge
-   freeze. A hand release has no time window: its waits are an active call (the tool checks it) and a
-   running backup (step 1). The autodeploy timer still starts nothing 13:00-18:59 UTC (Timer) until its
-   unit changes.
+   freeze. No release has a time window: the waits are an active call (the tool checks it) and a running
+   backup (step 1; the autodeploy unit, "Timer").
 
 ### Migration risk tiers
 
@@ -716,8 +714,8 @@ Configuration, in the plan A file's `migration` section (`deploy/production.exam
 `databases.messaging` (Database copies): `unattended` = `{network, dsn_file, runner_config}` (the
 database's Docker network, the owner DSN file the migration container mounts read-only, readable by the
 image user 10001, and the backup runner's `runner.json`), `receiver_schema_max` (the newest schema the
-backup receiver reads; the operator raises it after updating the receiver, until ANYM-589 asks the
-receiver) and `rehearsal_limit_ms` (default 1000, at most 4000). Undo: remove `unattended` (or
+backup receiver reads, kept for the operator's own record; no release reads or waits on it since owner 11-04:
+a receiver behind the target is a backup follow-up) and `rehearsal_limit_ms` (default 1000, at most 4000). Undo: remove `unattended` (or
 `databases.messaging`) and every SQL change pauses again.
 
 What qualifies (M1): every SQL inventory path of the range is an added
@@ -731,8 +729,7 @@ Phases, each a pause or a wait before any production write:
 
 1. Admission (read-only): no active or unknown call (one poll; else `waiting` with `call_waits`); nothing
    unfinished (`unresolved`); the base release's `store.py` opens its pool with
-   `prepare_threshold: None` (#352; else "deploy #352 first"); `receiver_schema_max` is at least the
-   target (else `waiting`); the live ledger is exactly the base's (`schema_version` and every
+   `prepare_threshold: None` (#352; else "deploy #352 first"); the live ledger is exactly the base's (`schema_version` and every
    `archive_migrations` checksum; else a pause).
 2. Preparation: plan A `prepare` as always, then the producer check: the image `runner.json` pins has an
    `org.opencontainers.image.revision` whose `backup.py` `SCHEMAS` holds the target. When it does not, the
@@ -754,8 +751,8 @@ Phases, each a pause or a wait before any production write:
    applied (`<sha>/migration.json` absent, `rehearsed`, `refused` or `not-applied`): under the runner
    lock with the backup services idle, `cp -p runner.json.before-<sha> runner.json`. After the migration
    the old pin would fail every capture (`unsupported_backup_schema`): keep the new one. The calendar
-   `runner.json` keeps its own pin; move it by hand as in "Backup runner". Waits on the receiver or the
-   producer count in `deploy.json` (`migration_waits`); the third in a row pauses.
+   `runner.json` keeps its own pin; move it by hand as in "Backup runner". Waits on the producer count in
+   `deploy.json` (`migration_waits`); the third in a row pauses.
 3. Copy: ANYM-588 for `messaging`, keeping the scratch server; the copy's keeper also records the live
    catalog in its snapshot (`catalog_sha256`). A failed copy pauses "the pre-migration copy of messaging
    failed: <code>".
@@ -941,8 +938,8 @@ their own run, so no kit waits for a running backup by hand. Idle is positive: t
 sleeps; the deadline is checked after every probe and before admission, so the bound is overshot by at most one
 `systemctl` probe, and a held lock refuses before any probe. The backup wait runs before the call wait, and the
 lock stays held through it. `deploy` takes the lock once and its inner `apply` and `promote` neither wait nor take it;
-`deploy --auto` is unchanged (the unit's `flock --nonblock` holds the lock and exits 75 at once, and its 13:00-18:59 UTC
-admission stays). `prepare`, `verify`, `status`, `images`, `--dry-run` and `release-plan` never wait.
+`deploy --auto` is unchanged (the unit's `flock --nonblock` holds the lock and exits 75 at once; it has no
+clock window, owner 11-04). `prepare`, `verify`, `status`, `images`, `--dry-run` and `release-plan` never wait.
 
 `backup.wait_seconds` is an optional integer from 0 to 7200 (default 2700; 7200 is the runner's own
 `busy_wait_seconds` maximum, BACKUP.md) in the plan A configuration, outside the configuration digest like `migration`;
@@ -963,7 +960,7 @@ the marker; settle it with `--recover-stop`. A SIGTERM during the wait takes and
 A release has no clock window (owner 11-04: «давай все делать не ждать ничего»), so it may run into a scheduled
 backup start: the wait does not protect a scheduled start. A scheduled backup that starts while a release holds the lock
 is refused, and what follows differs by unit (see "Continuous deployment"); a daily lost that way is a backup follow-up,
-never a release hold. Only the autodeploy unit's 13:00-18:59 UTC admission stays until its unit changes.
+never a release hold. The autodeploy unit has no clock window either ("Timer").
 
 ### Backup runner
 
@@ -2139,6 +2136,23 @@ only from `prepared.json` registry references while the package version exists (
 local-only build cannot be restored). Unresolved generations (no receipt, no recorded
 retirement, an interrupted promotion) are counted, never removed by the tool.
 
+A release generation whose candidate fails to start (ANYM-757). When `promote` fails after
+it started the candidate (readiness, activation or a guard before traffic), it records
+`startup-failed` in `http-attempted.json`, then stops the candidate with `docker compose
+--project-name deedkit-http-<generation> -f <its http.json> stop http-api-<generation>
+http-gateway-<generation>`: its own project and services only, never the serving generation,
+the router or another project. The containers are stopped, never removed, so their logs and
+state stay inspectable: `docker ps -a --filter label=ai.deedkit.http-release=<generation>`.
+Without the stop, the candidate keeps the live service's restart policy and crash-loops
+unrouted (10-28: 14 hours, 886 error events). The stop is best effort with the tool's
+command timeout; its outcome is recorded as `candidate_stopped: true|false` beside
+`startup-failed`, and its failure never replaces the promotion's own error. A failure
+before any container starts (prepared validation, schema check) stops nothing.
+`production.py status` lists such attempts as `http_failed_attempts` (sha and
+`candidate_stopped`; absent on attempts before ANYM-757). A `startup-failed` attempt does
+not block the next release, which prepares a new generation; removing the stopped
+containers stays manual (`clean` counts them as unresolved).
+
 Only images carrying a `deedkit-production-<target>:*` tag of the eight
 CI-published targets are considered. Kept, with reasons:
 
@@ -2421,10 +2435,12 @@ the optional `/etc/deedkit/autodeploy.env` (root-owned, mode `0600`) sets
 A deploy and the daily backup never overlap; the backup stops the collectors
 (`personal-os-backup.timer`, 18:00 UTC) and an apply would recreate them.
 Admission: the unit starts no deploy while `personal-os-backup.service` runs or
-waits to retry (any state but `inactive` or `failed`) and none from 13:00 to
-18:59 UTC; a failed or unexpected read of either skips the run. A run admitted
-before 13:00 ends by 17:03 at the latest (the 4-hour start timeout plus the
-3-minute stop timeout), so it is over before the scheduled backup starts.
+waits to retry (any state but `inactive` or `failed`); a failed or unexpected
+read skips the run. There is no clock window (owner 11-04: «давай все делать не
+ждать ничего»): a deploy may still run at 18:00, and then the scheduled backup
+refuses on the runner lock below and systemd retries it (30 minutes apart, at
+most three starts in 8 hours). A daily backup lost that way is a backup
+follow-up, never a release hold (owner 11-04, accepted).
 Exclusion: the deploy holds the backup runner's own lock
 (`/opt/personal-os-probe/backups/.runner.lock`, `DEEDKIT_BACKUP_LOCK`) for its
 whole run, so a backup started by hand during a deploy refuses before it stops
@@ -2477,7 +2493,7 @@ run it as one background command. `LIVE` (exit 0): plan A `applied` and the HTTP
 (or `serving-retirement-pending`) both contain the commit, with no pause and no unfinished attempt.
 `UNSETTLED` (1): both contain it, but a pause exists or an attempt is unfinished, so do not report it
 live. `REFUSED` (1): the commit is not deployed and a pause exists. `TIMEOUT` and `UNREACHABLE` (2):
-no verdict (default budget 4 hours, because the timer starts no deploy from 13:00 to 18:59 UTC). Each
+no verdict (default budget 4 hours). Each
 poll runs one constant ssh command that sends a fixed read-only script, which prints only `sha`,
 `status`, `reason` and `at` of `current.json`, `http-current.json` and `deploy.json`, the pause
 reason and the names of unfinished and serving attempts. The tool reads receipts; it does not probe containers.

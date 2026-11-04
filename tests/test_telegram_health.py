@@ -54,6 +54,33 @@ def test_partial_discovery_is_durable_and_does_not_start_history(worker):
         assert not health['discovery_limited']
 
 
+# spec: ANYM-749
+def test_failed_discovery_saves_partial_batches_and_its_code_outlives_the_history_pass(worker):
+    from telethon import errors
+    from messaging_service.telegram_collector import DiscoveryFailed
+    w,s,_=worker
+    async def first(limit):
+        yield [('100','user','First','private')]
+    w.provider.dialog_batches=first
+    asyncio.run(w.sync_once())
+    async def failing(limit):
+        yield [('300','user','Third','private')]
+        raise DiscoveryFailed(errors.RpcCallFailError(None))
+    w.provider.dialog_batches=failing;w._next_discovery=0;w.provider.reads.clear()
+    asyncio.run(w.sync_once())
+    # History ran over the cached catalog; the partial batch is saved; discovery is not marked finished.
+    assert {read[0] for read in w.provider.reads}=={'100'}
+    with s.pool.connection() as c:
+        assert {r['provider_chat'] for r in c.execute('SELECT provider_chat FROM chats WHERE account=%s',
+            (w.account,))}=={'100','300'}
+        health=c.execute('SELECT * FROM collector_health WHERE account=%s',(w.account,)).fetchone()
+        assert health['discovery_completed_at']<health['discovery_started_at']
+        status=get_sync_status(c,{'accounts':[w.account],'chat_ids':None})['sources'][0]
+    assert status['status']=='degraded' and status['detail_code']=='discovery_provider_error'
+    assert status['operations']['history']['state']=='partial_with_errors'
+    assert status['detail']['next_action']=='wait_for_retry'
+
+
 def test_persisted_cooldown_is_monotonic_and_survives_state_recreation(worker):
     w,s,_=worker
     w.state.defer(300)

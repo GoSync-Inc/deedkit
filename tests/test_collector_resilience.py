@@ -223,6 +223,33 @@ def test_reconcile_loop_survives_database_errors(monkeypatch):
     assert len(attempts)==3 and sleeps==[2,4]
 
 
+# spec: ANYM-749
+def test_reconcile_loop_survives_a_failed_discovery_and_retries_it_next_pass(monkeypatch):
+    from telethon import errors
+    from messaging_service.telegram_collector import DiscoveryFailed
+    discoveries=[];sleeps=[];statuses=[]
+    class Stop(BaseException):pass
+    async def dialog_batches(limit):
+        discoveries.append(limit)
+        raise DiscoveryFailed(errors.RpcCallFailError(None))
+        yield
+    async def sleep(delay):
+        sleeps.append(delay)
+        if len(sleeps)==2:raise Stop()
+    import messaging_service.telegram_collector as collector
+    monkeypatch.setattr(collector.asyncio,'sleep',sleep)
+    import messaging_service.telegram_identity as identity
+    monkeypatch.setattr(identity,'repair_sent_senders',lambda *args:None)
+    state=NS(lease=('owner',1),policy=lambda:{'include_chats':[],'exclude_chats':[]},
+        status=lambda *args:statuses.append(args),discovery_started=lambda:None)
+    w=bare_collector(provider=NS(dialog_batches=dialog_batches),interval=60,archive=None,state=state,
+        _dialog_cache=None,_next_discovery=0,max_dialogs=None,history_since=None)
+    with pytest.raises(Stop):asyncio.run(w.reconcile_loop())
+    # The worker task never ended: each pass degraded, slept its interval and tried discovery again.
+    assert discoveries==[None,None] and sleeps==[60,60]
+    assert statuses.count(('degraded','discovery_provider_error'))==2
+
+
 # spec: ANYM-401
 def test_reconcile_database_backoff_doubles_to_60_seconds_and_resets_after_success(monkeypatch):
     from psycopg_pool import PoolTimeout

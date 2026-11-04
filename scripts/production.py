@@ -3741,8 +3741,9 @@ def follow_producer(settings, mirror, plan, candidate, release):
 
 def migration_gate(settings, http, plan, mirror, base, serving):
     """M2's read-only gates, at admission and again as the final gate: no active or unknown call, nothing
-    unfinished, the base release's Store without server-side prepared statements (#352), a receiver that reads the
-    target, and the live ledger exactly the base's."""
+    unfinished, the base release's Store without server-side prepared statements (#352) and the live ledger exactly
+    the base's. The backup receiver's schema (`receiver_schema_max`) holds no release (owner 11-04): a receiver that
+    does not read the target yet is a backup follow-up."""
     wait_for_calls(settings, time.monotonic() + CALL_POLL)
     if reason := unresolved(Path(settings["state_directory"]), Path(http["state_directory"]), lambda: mirror, serving):
         raise MigrationRefused(reason)
@@ -3754,9 +3755,6 @@ def migration_gate(settings, http, plan, mirror, base, serving):
         store = ""
     if not UNPREPARED.search(store):
         raise MigrationRefused("the running release would fail on the new columns: deploy #352 first")
-    limit = settings["migration"].get("receiver_schema_max")
-    if type(limit) is not int or limit < plan["target"]:
-        raise MigrationWait(f"the backup receiver does not read schema {plan['target']} yet")
     version, applied = live_ledger(copy_source(settings, AUTO_DATABASE)[0])
     if version != plan["base"] or applied != plan["ledger"]:
         raise MigrationRefused(f"the live {AUTO_DATABASE} ledger is not the base's schema {plan['base']}; "
@@ -4889,6 +4887,20 @@ def http_release_tool():
     except ImportError:
         import seamless_release
     return seamless_release
+
+
+def http_failed_attempts(path):
+    """`status`: plan B attempts whose candidate failed to start, each with whether the tool stopped it (ANYM-757:
+    `candidate_stopped`, absent on attempts before it). Nothing without plan B; a read failure is named, never raised."""
+    if not os.path.lexists(path):
+        return []
+    try:
+        http_state = Path(config(path)["state_directory"])
+        attempts = [(item.parent.name, read(item)) for item in sorted(http_state.glob("*/http-attempted.json"))]
+        return [{"sha": sha, **{key: value[key] for key in ("candidate_stopped",) if key in value}}
+                for sha, value in attempts if value.get("status") == "startup-failed"]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, Refused) as exc:
+        return {"error": type(exc).__name__}
 
 
 def active_config():
@@ -6166,7 +6178,7 @@ def argument_parser():
     parser.add_argument("--sha")
     parser.add_argument("--target", choices=sorted(BUILDS))
     parser.add_argument("--config", help="default " + CONFIG + "; status: the autodeploy unit's (active_config)")
-    parser.add_argument("--http-config", default=HTTP_CONFIG, help="deploy, rollback: seamless_release.py's")
+    parser.add_argument("--http-config", default=HTTP_CONFIG, help="deploy, rollback, status: seamless_release.py's")
     parser.add_argument("--auto", action="store_true", help="deploy: at most one deploy start per 20 minutes (timer)")
     parser.add_argument("--dry-run", action="store_true", help="deploy: print the plan or pause reason, change nothing")
     parser.add_argument("--remove", action="store_true", help="images: remove the listed candidates")
@@ -6211,6 +6223,8 @@ def locked_action(args):
                 result["deploy"] = read(state / "deploy.json")
             if PAUSE.exists():
                 result["autodeploy_pause"] = PAUSE.read_text()[:1000].strip()
+            if failed := http_failed_attempts(args.http_config):
+                result["http_failed_attempts"] = failed
         elif args.action == "images":
             result = remove_images(settings) if args.remove else images_report(settings)
         elif args.action == "copy-database":
