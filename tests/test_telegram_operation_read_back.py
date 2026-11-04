@@ -262,11 +262,12 @@ def test_edit_read_back_strips_surrounding_whitespace_and_ignores_text_derived_e
 # spec: ANYM-747
 @pytest.mark.parametrize('shown', ['old_text', 'missing', 'empty', 'other_chat', 'other_id', 'incoming', 'formatted'])
 def test_edit_stays_unknown_when_the_read_back_does_not_show_it(operator, shown):
-    after = {'old_text': provider_message('Original synthetic text', edited=None), 'missing': None,
-        'empty': types.MessageEmpty(1), 'other_chat': provider_message('Edited synthetic text', chat_id=200),
-        'other_id': provider_message('Edited synthetic text', message_id=7),
-        'incoming': provider_message('Edited synthetic text', out=False),
-        'formatted': provider_message('Edited synthetic text', entities=bold('Edited synthetic text'))}[shown]
+    after = {'old_text': lambda: provider_message('Original synthetic text', edited=None), 'missing': lambda: None,
+        'empty': lambda: types.MessageEmpty(1, types.PeerUser(100)),
+        'other_chat': lambda: provider_message('Edited synthetic text', chat_id=200),
+        'other_id': lambda: provider_message('Edited synthetic text', message_id=7),
+        'incoming': lambda: provider_message('Edited synthetic text', out=False),
+        'formatted': lambda: provider_message('Edited synthetic text', entities=bold('Edited synthetic text'))}[shown]()
     # a formatted message edited plain: a read-back that still carries the bold is not the plain edit
     before = provider_message('Original synthetic text', entities=bold('Original synthetic text'), edited=None)
     client = EditClient(after, before=before if shown == 'formatted' else None)

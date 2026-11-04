@@ -613,12 +613,13 @@ def edit_state(message):
 
 async def edit_read_back(op, before):
     """ANYM-747: one scoped read of the edited message. Only a read that shows the requested plain text on this
-    account's message, after a state that differed, confirms the edit; anything else leaves the result unknown."""
+    account's message, after a state that differed (`before`: edit_state taken before the edit), confirms the
+    edit; anything else leaves the result unknown."""
     from .telegram_governor import ProviderRateLimited
     peer, chat, message_id, client, rpc, job = op.peer, op.chat, op.message_id, op.client, op.rpc, op.job
     unknown = {'outcome': 'unknown', 'error': 'provider_result_unverified'}
     wanted = (op.parameters['text'].strip(), False)
-    if edit_state(before) == wanted:
+    if before == wanted:
         return unknown  # nothing the read could show proves that this request changed the message
     try:
         # The scalar `ids` form, as delete_read_back: a list returns [None] in Telethon 1.45.
@@ -641,9 +642,10 @@ async def edit_read_back(op, before):
 async def write_edit_delete(op):
     exact_message, peer, chat, message_id, operation, accepted, rpc, parameters, client = (
         op.exact_message, op.peer, op.chat, op.message_id, op.operation, op.accepted, op.rpc, op.parameters, op.client)
-    before = await exact_message(peer, chat, message_id, own=True)
+    target = await exact_message(peer, chat, message_id, own=True)
     if operation == 'edit_message':
         bounded_text(parameters.get('text'), 4000)
+        before = edit_state(target)  # taken now: a client may update the same message object in place
         await rpc(lambda: client.edit_message(peer, message_id, parameters['text'],
             parse_mode=None, link_preview=False), mutation=True)
         # The response is not the proof (production responses failed the text equality): one read is.

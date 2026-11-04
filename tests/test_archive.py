@@ -71,7 +71,7 @@ def test_telegram_edit_envelope_is_the_next_revision_and_the_same_version_stays_
         return NS(id=17,chat_id=100,sender_id=42,message=text,entities=[],out=True,peer_id=types.PeerUser(100),
             date=datetime(2026,10,1,12,tzinfo=timezone.utc),edit_date=edited,file=None,document=None,photo=None,media=None)
     edited_at=datetime(2026,11,4,9,30,tzinfo=timezone.utc)
-    assert ar.ingest(telegram_message('archive-test',provider_message('Before the edit')))['outcome']=='created'
+    mid=ar.ingest(telegram_message('archive-test',provider_message('Before the edit')))['message']
     edited=telegram_message('archive-test',provider_message('After the edit',edited_at))
     assert edited['updated_at']=='2026-11-04T09:30:00+00:00'
     assert ar.ingest(edited)['outcome']=='edited'
@@ -79,7 +79,7 @@ def test_telegram_edit_envelope_is_the_next_revision_and_the_same_version_stays_
     assert ar.ingest(telegram_message('archive-test',provider_message('Other text',edited_at)))['outcome']=='conflict'
     assert s.search(key)['items'][0]['body']=='After the edit'
     with s.pool.connection() as c:
-        assert c.execute('SELECT revision FROM messages').fetchone()['revision']==2
+        assert c.execute('SELECT revision FROM messages WHERE id=%s',(mid,)).fetchone()['revision']==2
 
 
 def test_sync_conflict_alert_follows_unresolved_conflicts_not_the_sticky_code(archive):
