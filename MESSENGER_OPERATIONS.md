@@ -160,6 +160,30 @@ flood wait stopped the read-back. When the read-back showed the request had no e
 the owner's confirmation, and another check will not change the answer. A key may delete or
 react without holding `read-live`; the owner's opt-in for the read operation applies too.
 
+### Telegram edit read-back (ANYM-747)
+
+`edit_message` on Telegram is confirmed the same way. The edit's own response is not the proof:
+after the one edit request, one scoped read of the message (inside the same 30-second timeout)
+settles it. The receipt is `succeeded` (`result.data`: `basis: provider_read_back`,
+`effect_verified: true`) when the read shows this account's message, same chat and id, with the
+requested text (surrounding whitespace ignored on both sides) and no formatting, and the message
+before the edit differed from that (a plain edit of the same text that removes bold or a text link
+is a change). Links, mentions, hashtags and similar entities Telegram detects in the text itself
+are not formatting. Everything else stays `unknown` with `provider_result_unverified`, as before
+this release: another text, a missing message, formatting still present, a message that already
+had the requested state, a read error, a timeout or a flood wait (which adds
+`evidence.retry_after_s`). `unknown` still means "not known": the edit may have applied. Its
+`verify` names `get_message_info` with `read-live`: text equal to the requested text means the
+edit applied. Never send the edit again, or delete and repost, before that read.
+
+A confirmed edit adds `archive: queued` to `result.data`: the collector puts the read message on
+its live capture queue, and the archive shows the new text as the next revision when the queue is
+drained, normally well under a second after the receipt, not inside the operation. Until then
+`get_message` may still show the old revision and an `expected_revision` check still accepts it.
+`archive: not_queued` (a full queue, a stopping collector, a write error or the time budget spent)
+leaves the update to the live edit event or the next reconcile pass; the edit is `succeeded` in
+both cases.
+
 Native WhatsApp operations and sends write each provider frame once (no resend
 after a reconnect) and answer within 20 s, `send_file` within 75 s; a late
 change or send ends `unknown` (docs/whatsapp-native.md).

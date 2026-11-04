@@ -151,6 +151,42 @@ def test_target_revision_and_outgoing_ownership(operator):
             message_id=stable_id('msg','command-fixture','200','2')))
 
 
+# spec: ANYM-747
+def test_a_drained_edit_moves_the_expected_revision(operator,tmp_path):
+    from datetime import datetime,timezone
+    from types import SimpleNamespace as NS
+    from telethon import types
+    from messaging_service.adapters import telegram_message
+    from messaging_service.collector_state import CaptureSpool
+    s,_,key,state=operator
+    edited=NS(id=1,chat_id=100,sender_id=42,message='Edited synthetic text',entities=[],out=True,
+        peer_id=types.PeerUser(100),date=datetime(2026,10,1,12,tzinfo=timezone.utc),
+        edit_date=datetime(2026,11,4,9,30,tzinfo=timezone.utc),file=None,document=None,photo=None,media=None)
+    spool=CaptureSpool(tmp_path/'capture',reserve_bytes=0)
+    spool.put({'kind':'message','peer_kind':'user','envelope':telegram_message('command-fixture',edited),
+               'captured_at':'2026-11-04T09:30:01+00:00'})
+    assert spool.drain(state.apply)==1
+    edit=dict(operation='edit_message',parameters={'text':'Another synthetic text'})
+    with pytest.raises(APIError,match='operation_target_changed'):
+        s.preview_messenger_operation(key,**operation_args(**edit,expected_revision=1))
+    assert s.preview_messenger_operation(key,**operation_args(**edit,expected_revision=2))['preview_digest']
+
+
+# spec: ANYM-747
+def test_unknown_edit_names_the_verifying_read(operator):
+    from messaging_service.commands import VERIFY,_verify
+    s,_,_,_=operator
+    row={'operation':'edit_message','status':'unknown','account':'command-fixture','payload':{'parameters':{'text':'x'}},
+         'result':{'outcome':'unknown','data':{'error':'provider_result_unverified'}}}
+    with s.pool.connection() as c:
+        assert _verify(row,c)==VERIFY['edit_message']=={'operation':'get_message_info','requires':'read-live',
+            'decides':'text equal to the requested text means the edit applied'}
+        flood={**row,'result':{'outcome':'unknown','data':{'error':'provider_result_unverified',
+            'evidence':{'basis':'provider_read_back','retry_after_s':45}}}}
+        assert _verify(flood,c)=={**VERIFY['edit_message'],'retry_after_s':45}
+        assert _verify({**row,'status':'succeeded'},c) is None
+
+
 @pytest.mark.parametrize('change',['key','principal','policy','revision','expiry','connection'])
 def test_worker_rechecks_mutable_authority(operator,change):
     from messaging_service.commands import CommandWorker

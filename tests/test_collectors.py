@@ -301,6 +301,83 @@ def test_checkpoint_backfill_catchup_and_overlap_edit(worker):
     assert len(s.search(key)['items'])==8
 
 
+def own(item):
+    item.out=True;return item
+
+
+def edit_hand_off(w,edited,**job):
+    """A confirmed edit_message on the collector's own operation path; the fake provider leaves the read-back."""
+    async def provider(work):
+        work['_read_back_message']=edited
+        return {'outcome':'confirmed','data':{'basis':'provider_read_back','effect_verified':True}}
+    w.provider.execute_operation=provider
+    return asyncio.run(w.execute_operation({'operation':'edit_message',**job}))
+
+
+def drained(w):
+    outcomes=[]
+    w.spool.drain(lambda item:outcomes.append(w.state.apply(item)['outcome']))
+    return outcomes
+
+
+# spec: ANYM-747
+@pytest.mark.parametrize('order',['hand_off_first','live_first','hand_off_twice'])
+def test_confirmed_edit_hand_off_becomes_one_next_revision(worker,order):
+    w,s,key=worker
+    asyncio.run(w.capture(NS(message=own(message(9,body='before edit')))))
+    assert drained(w)==['created']
+    edited=own(message(9,body='after edit',edited=datetime(2026,10,2,tzinfo=timezone.utc)))
+    if order=='live_first':asyncio.run(w.capture(NS(message=edited)))
+    answer=edit_hand_off(w,edited)
+    assert answer['outcome']=='confirmed' and answer['data']['archive']=='queued'
+    if order=='hand_off_first':asyncio.run(w.capture(NS(message=edited)))
+    if order=='hand_off_twice':edit_hand_off(w,edited)
+    outcomes=drained(w)
+    assert outcomes[0]=='edited' and len(outcomes)==2 and outcomes[1] in ('duplicate','unchanged')
+    with s.pool.connection() as c:
+        row=c.execute('SELECT revision,body FROM messages WHERE id=%s',(stable_id('msg',w.account,'100','9'),)).fetchone()
+        assert (row['revision'],row['body'])==(2,'after edit')
+        assert c.execute("SELECT count(*) AS n FROM message_conflicts").fetchone()['n']==0
+
+
+# spec: ANYM-747
+@pytest.mark.parametrize('trouble',['spool_raises','slot_full','cancelled'])
+def test_edit_hand_off_trouble_never_fails_the_collector(worker,trouble):
+    from messaging_service.telegram_collector import CAPTURE_WRITES
+    w,s,key=worker
+    edited=own(message(9,body='after edit',edited=datetime(2026,10,2,tzinfo=timezone.utc)))
+    original=w.spool.put
+    if trouble=='spool_raises':
+        def broken(item):raise RuntimeError('spool_full')
+        w.spool.put=broken
+    if trouble=='slot_full':w.capture_count=CAPTURE_WRITES
+    job={'operation':'edit_message'}
+    if trouble=='cancelled':
+        entered=Event()
+        def slow(item):entered.set();Event().wait(.3);return original(item)
+        w.spool.put=slow
+        async def scenario():
+            async def provider(work):
+                work['_read_back_message']=edited
+                return {'outcome':'confirmed','data':{}}
+            w.provider.execute_operation=provider
+            task=asyncio.ensure_future(w.execute_operation(job))
+            while not entered.is_set():await asyncio.sleep(.01)
+            task.cancel()
+            return await task
+        answer=asyncio.run(scenario())
+        assert job['_cancel_after_settle'] is True  # the command worker settles the receipt, then stops
+    else:
+        answer=edit_hand_off(w,edited)
+    assert answer['outcome']=='confirmed' and answer['data']['archive']=='not_queued'
+    assert not w.failed.is_set() and w.failure_code is None
+    assert w.capture_count==(CAPTURE_WRITES if trouble=='slot_full' else 0)
+    # the worker keeps capturing
+    w.capture_count=0;w.spool.put=original
+    asyncio.run(w.capture(NS(message=message(10))))
+    assert 'created' in drained(w)
+
+
 def poisoned_keyboard():
     """A real inline markup whose rows fail when read: the parser itself raises, past the type check."""
     from telethon import types
