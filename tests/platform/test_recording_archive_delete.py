@@ -85,7 +85,7 @@ def count(store, sql, *values):
         return db.execute(sql, values).fetchone()[0]
 
 
-# spec: ANYM-730 criterion 1
+# spec: ANYM-730
 def test_preview_selects_by_refs_or_by_account_and_range_and_changes_nothing(archive):
     path, doc, store, refs = archive
     a, b = doc.accounts
@@ -108,7 +108,7 @@ def test_preview_selects_by_refs_or_by_account_and_range_and_changes_nothing(arc
     assert error.value.code == 'deletion_selector_ambiguous'
 
 
-# spec: ANYM-730 criterion 1
+# spec: ANYM-730
 def test_delete_removes_rows_index_speakers_and_journal_references_in_bounded_batches(archive, monkeypatch):
     path, doc, store, refs = archive
     import deedkit_recordings.archive_store as module
@@ -123,7 +123,7 @@ def test_delete_removes_rows_index_speakers_and_journal_references_in_bounded_ba
     assert count(store, "SELECT count(*) FROM texts4 WHERE texts4 MATCH 'ordinary'") >= 1  # the kept text is still searchable
 
 
-# spec: ANYM-730 criterion 2
+# spec: ANYM-730
 def test_a_canary_is_absent_from_the_live_file_the_wal_and_the_snapshot_after_deletion(archive, tmp_path):
     path, doc, store, refs = archive
     assert count(store, 'SELECT count(*) FROM speakers WHERE ref=?', refs['gone']) == 1  # a real structured label, not plain text
@@ -144,7 +144,7 @@ def test_a_canary_is_absent_from_the_live_file_the_wal_and_the_snapshot_after_de
     assert receipt['snapshot']['records'] == 1 and receipt['snapshot']['archive_id']
 
 
-# spec: ANYM-730 criterion 3
+# spec: ANYM-730
 def test_a_deleted_provider_id_is_tombstoned_and_never_archived_again_until_lifted(archive):
     path, doc, store, refs = archive
     a, _ = doc.accounts
@@ -159,7 +159,7 @@ def test_a_deleted_provider_id_is_tombstoned_and_never_archived_again_until_lift
     assert store.discover(a, [{'id': 'gone', 'title': 'again'}], None, 300)['inserted'] == 1
 
 
-# spec: ANYM-730 criterion 3
+# spec: ANYM-730
 def test_a_listed_deleted_recording_is_not_fetched_again_by_the_collector(tmp_path):
     import httpx
     from deedkit_recordings.archive import ArchiveRuntime
@@ -198,7 +198,7 @@ def test_a_listed_deleted_recording_is_not_fetched_again_by_the_collector(tmp_pa
     assert not any(call.endswith('/conv-a') for call in calls), calls
 
 
-# spec: ANYM-730 criterion 5
+# spec: ANYM-730
 def test_schema_five_is_created_fresh_and_upgrades_a_schema_four_archive_additively(archive, tmp_path):
     path, doc, store, refs = archive
     assert count(store, 'PRAGMA user_version') == 5
@@ -218,7 +218,7 @@ def test_schema_five_is_created_fresh_and_upgrades_a_schema_four_archive_additiv
         store.lock = None
 
 
-# spec: ANYM-730 criterion 4
+# spec: ANYM-730
 def test_the_post_deletion_snapshot_passes_continuity_only_because_of_its_tombstones(archive, tmp_path):
     path, doc, store, refs = archive
     folder = tmp_path / 'snaps'
@@ -241,7 +241,7 @@ def test_the_post_deletion_snapshot_passes_continuity_only_because_of_its_tombst
     assert error.value.args[0] == 'archive_incarnation_lower'
 
 
-# spec: ANYM-730 criterion 2
+# spec: ANYM-730
 def test_a_run_interrupted_before_the_rewrite_is_finished_by_repeating_the_command(archive, monkeypatch):
     path, doc, store, refs = archive
     real = Store.operator_connection
@@ -273,7 +273,7 @@ def test_a_run_interrupted_before_the_rewrite_is_finished_by_repeating_the_comma
     assert CANARY['transcript'].encode() not in raw_bytes(store.directory)
 
 
-# spec: ANYM-730 criterion 2
+# spec: ANYM-730
 def test_a_reader_that_pins_the_wal_fails_the_command_and_keeps_the_snapshot_fenced(archive):
     path, doc, store, refs = archive
     reader = sqlite3.connect(store.path)
@@ -294,7 +294,7 @@ def test_a_reader_that_pins_the_wal_fails_the_command_and_keeps_the_snapshot_fen
     store.backup(snap(store))
 
 
-# spec: ANYM-730 criterion 2
+# spec: ANYM-730
 def test_a_deletion_without_a_snapshot_path_is_refused_and_the_receipt_describes_the_written_file(archive, tmp_path):
     path, doc, store, refs = archive
     with pytest.raises(Failure) as error:
@@ -306,7 +306,7 @@ def test_a_deletion_without_a_snapshot_path_is_refused_and_the_receipt_describes
         assert written.execute('SELECT count(*) FROM records').fetchone()[0] == receipt['snapshot']['records'] == 3
 
 
-# spec: ANYM-730 criterion 2
+# spec: ANYM-730
 def test_a_copy_that_started_before_the_deletion_finished_is_discarded_and_schemas_1_and_2_still_back_up(archive, tmp_path, monkeypatch):
     path, doc, store, refs = archive
     # The guard passes (it is told "clean"), but a deletion committed before the copy ended: the copy carries the mark.
@@ -337,7 +337,7 @@ def test_a_copy_that_started_before_the_deletion_finished_is_discarded_and_schem
         assert copy.execute('PRAGMA user_version').fetchone()[0] == 2
 
 
-# spec: ANYM-730 criterion 6
+# spec: ANYM-730
 def test_the_receipt_carries_counts_and_identity_but_no_title_or_text(archive):
     path, doc, store, refs = archive
     receipt = store.delete_records(refs=[refs['gone'], refs['other']], apply=True, snapshot_to=snap(store))
@@ -348,7 +348,7 @@ def test_the_receipt_carries_counts_and_identity_but_no_title_or_text(archive):
     assert receipt['backup_replacement'] == 'backup_replacement_pending' and receipt['tombstones'] == 2
 
 
-# spec: ANYM-730 criterion 1
+# spec: ANYM-730
 def test_deletion_refuses_an_archive_with_an_active_feed_a_building_index_or_too_little_space(archive, monkeypatch):
     path, doc, store, refs = archive
     import deedkit_recordings.archive_store as module
@@ -370,7 +370,7 @@ def test_deletion_refuses_an_archive_with_an_active_feed_a_building_index_or_too
     assert error.value.code == 'archive_index_building' and count(store, 'SELECT count(*) FROM records') == 4
 
 
-# spec: ANYM-730 criterion 1, 6
+# spec: ANYM-730
 def test_the_operator_command_previews_then_applies_only_with_yes(archive, capsys):
     path, doc, store, refs = archive
     store.close()

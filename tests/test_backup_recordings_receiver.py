@@ -770,6 +770,7 @@ def test_rollback_with_a_pending_recordings_bundle_and_a_protected_point_keeps_a
     assert t.v.run(rolled_back, client=cloud, engine=t.engine)['status'] == 'verified'
 
 
+# spec: ANYM-730
 def test_a_tombstone_never_waives_the_checks_of_a_retained_record(tmp_path):
     """ANYM-730 (Astra r1): a new tombstone authorizes only a record that is gone from the candidate."""
     baseline = facts_of(tmp_path, [rec(1), rec(2)])
