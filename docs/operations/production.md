@@ -940,8 +940,8 @@ their own run, so no kit waits for a running backup by hand. Idle is positive: t
 sleeps; the deadline is checked after every probe and before admission, so the bound is overshot by at most one
 `systemctl` probe, and a held lock refuses before any probe. The backup wait runs before the call wait, and the
 lock stays held through it. `deploy` takes the lock once and its inner `apply` and `promote` neither wait nor take it;
-`deploy --auto` is unchanged (the unit's `flock --nonblock` holds the lock and exits 75 at once, and its 13:00-18:59 UTC
-admission stays). `prepare`, `verify`, `status`, `images`, `--dry-run` and `release-plan` never wait.
+`deploy --auto` is unchanged (the unit's `flock --nonblock` holds the lock and exits 75 at once; it has no
+clock window, owner 11-04). `prepare`, `verify`, `status`, `images`, `--dry-run` and `release-plan` never wait.
 
 `backup.wait_seconds` is an optional integer from 0 to 7200 (default 2700; 7200 is the runner's own
 `busy_wait_seconds` maximum, BACKUP.md) in the plan A configuration, outside the configuration digest like `migration`;
