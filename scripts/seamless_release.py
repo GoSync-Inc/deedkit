@@ -586,6 +586,21 @@ def wait_ready(settings, receipt):
         time.sleep(.25)
 
 
+def stop_failed_candidate(release, receipt, sha):
+    """ANYM-757: stop (never remove) the unrouted candidate of a startup-failed promotion, by its own project and
+    service names only, so its restart policy cannot crash-loop it unseen. Best effort: the caller re-raises the
+    original failure, and the outcome is only recorded as `candidate_stopped`."""
+    try:
+        p.run(candidate_command(receipt) + ['stop', 'http-api-' + receipt['generation'], 'http-gateway-' + receipt['generation']])
+        stopped = True
+    except Exception:
+        stopped = False
+    try:
+        durable_write(release / 'http-attempted.json', {'status': 'startup-failed', 'sha': sha, 'candidate_stopped': stopped})
+    except Exception:
+        pass  # the startup-failed record above stands; the original failure must still propagate
+
+
 def promote(settings, sha, *, backup_waited=0):
     validate_settings(settings)
     p.promotable(sha)
@@ -614,6 +629,7 @@ def promote(settings, sha, *, backup_waited=0):
             raise Refused('dedicated router changed before traffic admission')
     except Exception:
         durable_write(release / 'http-attempted.json', {'status': 'startup-failed', 'sha': sha})
+        stop_failed_candidate(release, receipt, sha)
         raise
     proposed = route_document(settings, receipt['generation'], receipt['retained'], baseline=receipt['router_before'])
     durable_write(release / 'router-proposed.json', proposed)
