@@ -125,9 +125,11 @@ image=$(docker image inspect -f '{{.Id}}' "deedkit-production-backup:$sha")
 case $image in sha256:*) ;; *) echo "no backup image for $sha"; exit 1;; esac
 test "$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" = "$sha"
 test ! -e "$ops/backup_runner.py.before-$sha"
-for c in $cfgs; do                                  # every preflight of both profiles, before the first write
+for c in $cfgs; do                                  # pass 1: read-only preflight of both profiles, nothing is written
   test ! -e "$c.before-$sha"
   idle "$new" "$c"
+done
+for c in $cfgs; do                                  # pass 2: stage the two .new files beside the live ones, then check them
   rm -f "$c.new"
   python3 -I -c 'import json,os,sys;p,i=sys.argv[1:];c=json.load(open(p));c["image"]=i
 fd=os.open(p+".new",os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600);os.write(fd,(json.dumps(c,indent=2)+"\n").encode())
@@ -408,11 +410,19 @@ The drill is the manual twin of the verifier's scheduled restore, so it takes th
    (`backup_r2_receiver ... download --id <id> --output <scratch>/candidate.tar.age`, BACKUP_R2.md "Commit, download and independent
    restore"; the download verifies the full ciphertext size and SHA-256 and publishes atomically), compare them with the receipt.
    Then one throwaway container of the **backup image pinned for the instance** (`messaging_service` is in it; the recordings image
-   is not and is not needed): `docker run --rm --name deedkit-drill-recordings-<date> --network none --read-only --user <the
-   verifier's helper user> -v <scratch>:/drill --entrypoint python -v <identity>:/identity:ro <backup image> -I -c <code>` (the
-   image has `ENTRYPOINT []`, `services/messaging/Dockerfile:202`; `age` is the helper's own, `backup_crypto.decrypt_snapshot_stream(
-   source, identity, destination, age='age', max_bytes=...)` with an explicit `max_bytes` bound; if the rehearsal shows a temp
-   directory is needed, mount a subdirectory of the scratch as `/tmp`). The code, in this order: decrypt and extract into
+   is not and is not needed), with the **scheduled helper's isolation and resource limits** (`backup_r2_verifier.py:596-619`):
+   `docker run --rm --name deedkit-drill-recordings-<date> --network none --log-driver=none --restart=no --cpus=1 --pids-limit=256
+   --memory=512m --memory-swap=512m --read-only --cap-drop=ALL --security-opt=no-new-privileges --tmpfs /tmp:<the
+   `HELPER_TMPFS['/tmp']` options, `rw,noexec,nosuid,size=64m` at S, read from the installed wheel> --user <the verifier's helper
+   user> --mount type=bind,src=<scratch>,dst=/drill --mount type=bind,src=<identity>,dst=/identity,readonly --entrypoint python
+   <backup image> -I -c <code>`. The temporary file `decrypt_snapshot_stream` opens (`backup_crypto.py:225`) lands on that private
+   `/tmp` tmpfs, which is mandatory, not optional. The image has `ENTRYPOINT []` (`services/messaging/Dockerfile:202`) and copies
+   `messaging_service` into `/app` without installing it, while `python -I` leaves `/app` off `sys.path`: the code therefore begins
+   `import sys; sys.path.insert(0, '/app')` (the one trusted path; the scratch is never on it). `age` is the image's own
+   (`/usr/local/bin/age`); `backup_crypto.decrypt_snapshot_stream(source, identity, destination, age='age', max_bytes=...)` takes an
+   explicit `max_bytes` bound, and `archive_facts` is bounded by the object size. If a container limit is hit, the drill ends with
+   its exit code and the failure cleanup of item 1; the limits are never raised for the drill. The invocation is the one S4 of I1.7
+   rehearses. The code, in this order: decrypt and extract into
    `/drill/bundle/` **preserving the layout** (`manifest.json`, `state/archive.sqlite`, the two members of `MEMBERS`);
    `backup_recordings.verify_recordings_bundle('/drill/bundle')` (structure, hashes, schema, `integrity_check`, identity);
    `backup_recordings_continuity.readback('/drill/bundle/state/archive.sqlite')` (a full-text search on a synthetic query and a
@@ -436,8 +446,11 @@ The drill is the manual twin of the verifier's scheduled restore, so it takes th
    - **With the feed enabled (ANYM-732/733).** A missing or mismatched marker bumps the incarnation to `max(database, marker, epoch,
      clock)+1` and, when the existing epochs require it, gives the journal a new `journal_id` (README "Identity"), so a restored archive
      never reuses event identities; the module router then reports a source reset and waits for its operator (`set-module-cursor`).
-   The next backup judges the candidate against the baseline. A candidate whose `sequence` is below the baseline's is refused
-   `archive_sequence_lower` (a restore from an older point), and so is a snapshot that lost parts under the continuity rules; the
+   The next backup judges the candidate against the baseline (`backup_recordings_continuity.judge`). With an **equal** incarnation a
+   lower `sequence` is refused `archive_sequence_lower` (a restore from an older point; without the feed, the restored database
+   keeps the snapshot's incarnation, so an older restore lands here); a **lower** incarnation is refused `archive_incarnation_lower`;
+   a higher incarnation with a lower sequence is not refused by that rule and passes if the remaining continuity checks pass (lost
+   parts, dropped tombstones and the others are still refused). The
    operator, after reading the refusal and keeping its evidence, may re-baseline with a reasoned `--rebaseline` (BACKUP_R2.md). Nothing
    is re-baselined by this plan.
 
