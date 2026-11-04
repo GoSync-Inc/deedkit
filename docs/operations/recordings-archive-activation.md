@@ -313,8 +313,8 @@ undo. Messaging's and the calendar's files are not touched. The staging mount st
 
 Applied by the ops step of this plan; the agent only checks the owner's key and file modes, and starts no provider session.
 
-1. **Preconditions.** I-read recorded; the Omi key in place (`omi.key` mode `0600`, owner 10001, non-empty: modes only); no call; not
-   within an hour before 21:30 UTC; `archive_status` for the Omi account answers (archive disabled) with an operator backend key.
+1. **Preconditions.** I-read recorded; the Omi key in place (`omi.key` mode `0600`, owner 10001, non-empty: modes only); no call; the
+   recordings job not running; `archive_status` for the Omi account answers (archive disabled) with an operator backend key.
 2. **Namespace.** For each account to archive generate a fresh 32-hex `archive_namespace` once (`python3 -I -c "import secrets;
    print(secrets.token_hex(16))"`; record the first 6 characters in the receipt, not the value elsewhere). Omi first; PLAUD only
    if its key is in place and the owner's 11-03 words cover it (they cover Omi and PLAUD text, not audio).
