@@ -582,15 +582,29 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
    while the daily backup succeeds), and everything written after it (messages, receipts, keys, operator
    changes) is lost. No gate backup or copy was restored in any hand release from 10-17 to 11-04.
 4. How a non-critical release runs. `deploy` applies it itself when the range qualifies ("Unattended
-   migrations": today `expand` files and appended role grants). Any other range pauses autodeploy until
-   `deploy` applies every non-critical range itself (ANYM-743); meanwhile the agent who sees the pause
-   releases it at once, at any hour, with the previous release's tested commands (`prepare`, the "Backup
-   runner" step, `migrate`, `apply`, then the pause removed): a tested runbook, so no new kit, plan or
-   review round. The runner and producer pin step is part of that release, not a gate. A backup receiver
-   that does not read the new schema yet is a backup follow-up: raise `receiver_schema_max` once it reads
-   it; it never holds a release. Merges never wait for a release: the candidate is one SHA ("Prepare and
-   inspect"), so there is no merge freeze. There is no time window either: the only waits are an active
-   call and a backup that holds the runner lock, and the tool checks both.
+   migrations": today `expand` files and appended role grants, and only once `receiver_schema_max` reads
+   the target, phase 1). Any other range, and one held only by that receiver wait, pauses autodeploy
+   until `deploy` applies every non-critical range itself (ANYM-743); meanwhile the agent who sees the
+   pause releases it at once, at any hour, with the previous release's tested commands: a tested runbook,
+   so no new kit, plan or review round. The order:
+   1. Exclusion from the backups (a backup stops the collectors and holds snapshots; an apply recreates
+      the collectors and a migration takes table locks). `personal-os-backup.service`,
+      `deedkit-calendar-backup.service` and `deedkit-calendar-backup-catchup.service` read `inactive` or
+      `failed`, `/opt/personal-os-probe/backups/.runner.lock.unsettled` is absent and `flock --nonblock` on
+      `/opt/personal-os-probe/backups/.runner.lock` succeeds; then `systemctl stop` the timers
+      `personal-os-backup.timer`, `deedkit-calendar-backup.timer` and `deedkit-calendar-backup-catchup.timer`
+      (record which were active) and read the three services again. A backup that runs: wait for it to end
+      (ANYM-744 makes `apply` wait by itself). Undo and the last step: start the recorded timers again.
+   2. `prepare`, the "Backup runner" step (it takes and releases the runner lock itself), `migrate`,
+      `apply`, plan B, then remove the pause (`status` shows no pause and no unfinished attempt).
+   3. Start the timers recorded in step 1. A daily backup the stop skipped runs at its next time; that is a
+      backup follow-up, never a release hold. So is a backup receiver that does not read the new schema
+      yet: a hand release does not read `receiver_schema_max`; raise it once the receiver reads the target.
+
+   Merges never wait for a release: the candidate is one SHA ("Prepare and inspect"), so there is no merge
+   freeze. A hand release has no time window: its waits are an active call (the tool checks it) and a
+   running backup (step 1). The autodeploy timer still starts nothing 13:00-18:59 UTC (Timer) until its
+   unit changes.
 
 ### Migration risk tiers
 
@@ -599,10 +613,12 @@ highest-tier pending migration file, changed role file or step.
 
 - Critical (the backup gate, `copy-database` and one Astra round on the plan first): a statement that deletes
   or rewrites existing rows or drops stored data. DELETE, UPDATE, MERGE, TRUNCATE, INSERT ... ON CONFLICT
-  DO UPDATE; DROP TABLE, COLUMN, SCHEMA or MATERIALIZED VIEW and any DROP ... CASCADE; ALTER COLUMN ...
-  TYPE or SET EXPRESSION; the same inside a `DO` block, a function the migration calls or a trigger that
-  fires during it; a data-deleting step (item 2); and a statement whose effect on existing rows the author
-  cannot name.
+  DO UPDATE; DROP TABLE, COLUMN, SCHEMA or MATERIALIZED VIEW; a DROP ... CASCADE whose dependents include
+  a table, a column or anything the author cannot list; ALTER COLUMN ... TYPE or SET EXPRESSION that
+  rewrites the table or converts stored values (a binary-coercible change without a rewrite, such as
+  `varchar(n)` to `text`, is not); the same inside a `DO` block, a function the migration calls or a
+  trigger that fires during it; a data-deleting step (item 2); and a statement whose effect on existing
+  rows the author cannot name.
 - Non-critical: everything else. For example new tables, columns and indexes; constraints and CHECK
   changes, `NOT VALID` included (a failing one aborts its own transaction and loses nothing); DROP
   CONSTRAINT, INDEX, DEFAULT or NOT NULL; RENAME; functions, triggers and comments; grants, REVOKE and role

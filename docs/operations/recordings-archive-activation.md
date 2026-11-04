@@ -1,7 +1,7 @@
 # Recordings archive: install, activation and restore drill (ANYM-731)
 
-Status: a plan, **not applied**. It is the production operation plan of ANYM-731 (reviews.md Rounds 7: Astra r1 and one
-recheck). An agent executes it only on the orchestrator's GO, under AGENTS.md section 2 and harness process.md section 2:
+Status: a plan, **not applied**. It is the production operation plan of ANYM-731 (one review round, reviews.md Rounds 7 as
+DeedKit AGENTS.md section 2 overrides it, owner 11-04). An agent executes it only on the orchestrator's GO, under AGENTS.md section 2 and harness process.md section 2:
 Astra-reviewed plan, a read-back and an undo for every step, no step during an active call. It contains no send, call, ACK,
 pairing, provider-session start or stop, or allowlist change, and it never touches the on-demand grants (ANYM-713). Receipts
 hold digests, modes, ids and counts, never a key, a transcript or any text of the archive.
@@ -34,10 +34,11 @@ Polling may start once milestone I is verified (docs/DATA-POLICY.md), not before
   the units named in the step, the runner's `--check`, `docker ps`), then take the undo of the stage that failed. A failed
   command stops a step (`sh -e`). Journals, proofs, markers and status files are evidence: preserved, never deleted to make a
   step pass. Anything unclear stops the plan and goes to the orchestrator.
-- **Windows.** Steps R and I2 run between 08:00 and 15:30 UTC (the calendar daily is 16:00, messaging's 18:00, the calendar
-  catch-up 19:15, the recordings job 21:30, its catch-up 23:15; production.md "Backup runner" says to avoid the minutes around
-  18:00). Milestone A starts after I-read is recorded and never within an hour before 21:30. Nothing runs during a call, a
-  pending autodeploy/plan attempt or while `/etc/deedkit/autodeploy.pause` holds a reason that is not ours.
+- **No clock windows** (owner 11-04). Steps R and I2 run at any hour while no backup runs: the backup services read `inactive`
+  or `failed` and the runner lock is free (each step takes it as written); a backup timer that would fire during a step is
+  stopped for that step and started again right after (production.md "Migration releases" item 4, step 1). Milestone A starts
+  after I-read is recorded, not while the recordings job runs. Nothing runs during a call, a pending autodeploy/plan attempt or
+  while `/etc/deedkit/autodeploy.pause` holds a reason that is not ours.
 - Receipts go to one research note (`research/recordings-731/receipt.md`), appended per step with the time and the read-back
   lines, not the secrets.
 
@@ -55,8 +56,8 @@ Polling may start once milestone I is verified (docs/DATA-POLICY.md), not before
 - P4. No active call (`production.py`'s active-call check, production.md "Apply and verify"), `production.py status` clean, deploy
   lock free, `personal-os-backup.service`, `deedkit-calendar-backup.service`, `deedkit-autodeploy.service` and the recordings
   units inactive, 15 GiB free on `prod`, and on `backup-1` free space for the receiver's two slots (below).
-- P5. Fresh backups exist and are receiver-verified: the latest messaging and calendar dailies are `state: ok`, restore-verified
-  (BACKUP.md "Freshness at a glance"). This plan changes no data, so these are the restore point of the host files it touches;
+- P5. The latest messaging and calendar dailies are read into the receipt (state, age, verified or not; BACKUP.md "Freshness at
+  a glance"); no fresh backup is taken or waited for (owner 11-04), and a failed or old daily is noted, not a hold. This plan changes no data, so these are the restore point of the host files it touches;
   a copy of each file the plan edits is taken before the edit (`.before-<date>`, mode kept).
 - P6. Host facts read into the receipt: the pinned messaging image in `/opt/personal-os-probe/backup-config/runner.json`, the
   installed runner blob (`git hash-object /opt/personal-os-probe/ops/backup_runner.py`), the blob of `S`'s
@@ -289,8 +290,8 @@ from a failure inside item 1 (item 1's own recovery text). The R2 prefix holds o
    the 23:15 catch-up starts and ends with the same `recordings_skipped_archive_disabled`; that is expected and harmless. Then
    `deploy/deedkit-recordings-backup.service`, `.timer`, `-catchup.service`, `-catchup.timer` into `/etc/systemd/system/` (`0644`),
    `daemon-reload`, then `systemctl enable --now deedkit-recordings-backup.timer deedkit-recordings-backup-catchup.timer`.
-5. **First run, archive off.** Do not wait for 21:30: `systemctl start deedkit-recordings-backup.service` once, in an allowed window
-   and not within 15 minutes of another profile's timer (the runner decides; a `recordings_skipped_window` is also a valid
+5. **First run, archive off.** Do not wait for 21:30: `systemctl start deedkit-recordings-backup.service` once, while no other
+   backup runs and not within 15 minutes of another profile's timer (the runner decides; a `recordings_skipped_window` is also a valid
    answer, repeat later). The run reaches the container: its `docker exec ... --backup-to` answers `archive_disabled`, which proves the
    container name and the config path (the mount was proved in item 2). Expected: exit 0, `status.json` of the recordings job
    `state: skipped` with `recordings_skipped_archive_disabled`, staging empty, no worker container, no bundle, nothing delivered.

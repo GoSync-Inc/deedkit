@@ -1,6 +1,6 @@
 # Production enablement of local media understanding (ANYM-686 plan)
 
-Status: plan for review (Astra r1, one recheck). No step runs without the plan's APPROVE.
+Status: plan for review (one review round, DeedKit AGENTS.md section 2, owner 11-04). No step runs without the plan's APPROVE.
 
 What it does: the owner's voice notes, photos and document text are processed by `deedkit-inference` on the
 Mac mini (`enricher-mini`, profile `enrichment-mini`) for the owner's messenger accounts. Authority: owner
@@ -54,8 +54,8 @@ schema change is in this range; if one appears, the migration risk tiers of prod
 
 ## 3. Role and DSN (only if the pre-check found them missing)
 Apply `messaging_service/enrichment_role.sql` as the database owner and create the login per ENRICHMENT.md
-"Isolation and limits", with the backup and undo the section 2 gates ask for (fresh verified backup of the
-affected data; undo `DROP ROLE` and removing the DSN file). The DSN goes to `private/enrichment-local.dsn`
+"Isolation and limits", with the latest daily backup as restore point and an undo (a role change rewrites no
+row, so no fresh backup, owner 11-04; undo `DROP ROLE` and removing the DSN file). The DSN goes to `private/enrichment-local.dsn`
 (mode 0600, owner uid 10001). Skipped when present.
 
 ## 4. Key delivery (inference-mini-setup.md section 11)
