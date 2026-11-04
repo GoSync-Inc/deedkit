@@ -361,6 +361,32 @@ arrives after the check and before the provider send is a race it cannot close. 
 owner's confirmation or the duplicate rules above. Against a messaging service from before this change a
 guarded call fails closed (`invalid_parameters`, `unknown_field`).
 
+### Is an earlier identical send still unresolved? (`duplicate_send_unresolved`, ANYM-748)
+
+A send that ended `unknown` or still waits must be checked before anything is sent again; a new
+`request_id` with the same text would otherwise post it twice. So `send_message` to an archive `chat_id`
+refuses a new send when an earlier send of the same key's principal has the same account, chat, exact source
+text, `format`, `link_preview`, `allow_lossy` and reply target (a reply to another message is a different
+send), is still `queued` (and not expired), `dispatching` or `unknown`, and was created within the last
+60 minutes (fixed, not configurable). Nothing is queued and the call is refused `duplicate_send_unresolved`
+(HTTP 409) with `earlier_request_id`, `earlier_status` and a `next_call` for `get_send_status` with that
+`request_id`. The body carries no message text and no `send_id`. Check that send first: `get_send_status`,
+and for `unknown` the history read above before any newly approved send.
+
+`allow_duplicate: true` sends anyway (the owner confirmed a second copy). It is optional, has no schema
+default and is no part of the request hash or the preview digest; omitted, every request, response and
+stored row is as before. A retry with the same `request_id` returns its saved result before this check. The
+check runs under the principal's send lock, so of two concurrent identical calls one is queued and the
+other is refused. If its read fails or takes over 1 s the call is refused `chat_guard_unavailable`
+(HTTP 503) and nothing was queued. No guard state is stored: once the earlier send settles `sent` or
+`failed`, the same call succeeds.
+
+Honest scope: this is not exactly-once delivery. Changed text, another chat or reply target, an elapsed
+60-minute window, `allow_duplicate`, or a `sent` or `failed` earlier send all pass by design (a repeated
+"ok" or a deliberate resend is normal). Phone and username sends, `messages_send` and messages_send's
+child steps are not covered. Against a messaging service from before this change a call with
+`allow_duplicate` fails closed (`invalid_parameters`, `unknown_field`); one without it works as before.
+
 ### Is sending working? (`outbound` in `get_sync_status`)
 
 Every account row of an unscoped `get_sync_status` (Telegram and WhatsApp) carries

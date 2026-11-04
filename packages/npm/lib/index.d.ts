@@ -58,6 +58,9 @@ export interface MessageActionFields {
   expected_last_message_id?: string;
   /** With `expected_last_message_id`: `any_message` (default) or `outgoing_only` (only the owner's own messages count). */
   guard?: 'any_message' | 'outgoing_only';
+  /** ANYM-748, chat_id sends: `true` sends even while your earlier send of the same content to this chat is still
+   * queued, dispatching or unknown (refused `duplicate_send_unresolved` otherwise). */
+  allow_duplicate?: boolean;
 }
 export interface MessengerOperationPreview {
   account: string;

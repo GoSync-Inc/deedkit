@@ -134,6 +134,45 @@ def test_against_a_deployed_closed_schema_backend_a_plain_send_works_and_a_guard
                                     {"field": "guard", "reason": "unknown_field"}]
 
 
+# spec: ANYM-748
+def test_allow_duplicate_needs_no_read_grant_and_reaches_the_backend_only_when_given(tmp_path):
+    app, seen = setup(tmp_path, grants=("send",))
+    results = run(app, ("messages_send_message", {**SEND, "allow_duplicate": True}), ("messages_send_message", SEND))
+    assert [r.status_code for r in results] == [200, 200]
+    assert seen[0][1]["allow_duplicate"] is True
+    # Omitted, it never reaches the backend: no schema default is inserted for it.
+    assert "allow_duplicate" not in seen[1][1]
+
+
+# spec: ANYM-748
+def test_against_a_deployed_closed_schema_backend_allow_duplicate_fails_closed(tmp_path):
+    app, seen = setup(tmp_path, grants=("send",), answer=closed_schema)
+    plain, refused = run(app, ("messages_send_message", SEND),
+                         ("messages_send_message", {**SEND, "allow_duplicate": True}))
+    assert plain.status_code == 200 and "allow_duplicate" not in seen[0][1]
+    assert refused.status_code == 400 and refused.json()["error"] == "invalid_parameters"
+    assert refused.json()["field_errors"] == [{"field": "allow_duplicate", "reason": "unknown_field"}]
+
+
+# spec: ANYM-748
+def test_an_unresolved_duplicate_refusal_is_relayed_with_the_gateways_status_call(tmp_path):
+    def duplicate(path, arguments):
+        return httpx.Response(409, json={
+            "error": "duplicate_send_unresolved", "request_id": REQUEST_ID, "retryable": False,
+            "earlier_request_id": "req-send-guard-0000", "earlier_status": "unknown",
+            "next_action": "check_earlier_send_status",
+            "next_call": {"tool": "get_send_status", "arguments": {"request_id": "req-send-guard-0000"},
+                          "caller_supplies": []}})
+    app, seen = setup(tmp_path, grants=("send",), answer=duplicate)
+    result = post(app, "messages_send_message", SEND)
+    body = result.json()
+    assert result.status_code == 409 and body["error"] == "duplicate_send_unresolved" and len(seen) == 1
+    assert (body["earlier_request_id"], body["earlier_status"]) == ("req-send-guard-0000", "unknown")
+    assert body.get("outcome") != "unknown"
+    assert body["next_call"]["tool"] == "messages_get_send_status"
+    assert body["next_call"]["arguments"] == {"request_id": "req-send-guard-0000"}
+
+
 # spec: ANYM-736
 def test_a_changed_chat_refusal_is_relayed_with_the_gateways_own_next_call(tmp_path):
     def changed(path, arguments):

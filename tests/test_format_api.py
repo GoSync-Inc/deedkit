@@ -17,7 +17,9 @@ class RecordingStore:
     def audit_boundary(self, code): pass
     def preview_message(self, token, **params):
         self.calls.append(('preview_message',params)); return {'preview_digest':'a'*64}
-    def send_message(self, token, **params):
+    def send_message(self, token, duplicate_guard=False, **params):
+        # ANYM-748: the tool's internal duplicate_guard flag is not a caller argument; it is recorded apart.
+        self.duplicate_guard=duplicate_guard
         self.calls.append(('send_message',params)); return {'status':'queued'}
 
 

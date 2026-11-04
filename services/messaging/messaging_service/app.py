@@ -90,7 +90,14 @@ OMITTED_WHEN_NONE = {'create_subscription':('chat_ids','sources','wake_rules','r
     'search':('body_format',),'get_messages':('body_format',),'get_context':('body_format',),
     'list_delivery_attempts':('before',),
     # ANYM-736: an omitted guard keeps every request, hash and stored row as before.
-    'send_message':('expected_last_message_id','guard'),'get_send_status':('send_id','request_id')}
+    # ANYM-748: so does an omitted allow_duplicate.
+    'send_message':('expected_last_message_id','guard','allow_duplicate'),'get_send_status':('send_id','request_id')}
+# ANYM-748: the rule in the argument's schema; the tool description is at its length cap.
+ALLOW_DUPLICATE=('chat_id sends: true sends even while your earlier send of the same text, format, link_preview, '
+    'allow_lossy and reply target to this chat is still queued, dispatching or unknown and under 60 minutes old; '
+    'otherwise that call is refused duplicate_send_unresolved (409) with earlier_request_id, earlier_status and a '
+    'get_send_status next_call, and nothing is queued. Not exactly-once delivery: changed text, an elapsed window '
+    'or a sent or failed earlier send passes; phone and username sends, messages_send and its steps are not covered.')
 def no_schema_default(schema):
     """ANYM-736: an optional guard argument declares no default, so the gateway never inserts a null for it."""
     schema.pop('default',None)
@@ -448,7 +455,10 @@ def register_send_tools(mcp, call, async_call, read):
                      allow_lossy: StrictBool=False, wait_s: WaitSeconds=0,
                      expected_last_message_id: Annotated[StrictStr | None,Field(json_schema_extra=no_schema_default)]=None,
                      guard: Annotated[Literal['any_message','outgoing_only'] | None,
-                                      Field(json_schema_extra=no_schema_default)]=None) -> dict[str,Any]:
+                                      Field(json_schema_extra=no_schema_default)]=None,
+                     allow_duplicate: Annotated[StrictBool | None,Field(description=ALLOW_DUPLICATE,
+                                                                          json_schema_extra=no_schema_default)]=None
+                     ) -> dict[str,Any]:
         """Send exact confirmed content using this account's existing collector.
 
         For rich formatting or nondefault policies, call preview_message first and
@@ -480,12 +490,15 @@ def register_send_tools(mcp, call, async_call, read):
         newer_outgoing_count, first_newer_message_id, newest_message_id and a next_call that reads them: read, then
         decide again. guard any_message (default) counts any newer visible message, your own earlier send included;
         outgoing_only counts only the owner's. A retry with the same request_id returns the first result. The guard
-        sees only the archive at that moment (not messages not yet ingested or edited) and cannot close the race
-        before the provider send; it does not replace the owner's confirmation. An unknown ID or a phone/username
+        sees only the archive at that moment and cannot close the race
+        before the provider send. An unknown ID or a phone/username
         recipient is invalid_parameters expected_message_unknown; chat_guard_unavailable (503) queued nothing.
         After a lost response use get_send_status with request_id.
+        Same content to the same chat while your earlier send is queued, dispatching or unknown (60 min):
+        duplicate_send_unresolved (409); see allow_duplicate.
         """
-        guarded={k:v for k,v in (('expected_last_message_id',expected_last_message_id),('guard',guard)) if v is not None}
+        guarded={k:v for k,v in (('expected_last_message_id',expected_last_message_id),('guard',guard),
+                                 ('allow_duplicate',allow_duplicate)) if v is not None}
         return await async_call(ctx,'send_message',account=account,chat_id=chat_id,phone=phone,username=username,
             text=text,
             request_id=request_id,reply_to=reply_to,format=format,preview_digest=preview_digest,
@@ -1390,9 +1403,11 @@ def create_app(store: Store, allowed_hosts: list[str]):
         if method == 'send_message':
             from .send_wait import validate_wait_s, wait_for_send
             wait_s=validate_wait_s(arguments.pop('wait_s', 0))
+            # ANYM-748: only a chat_id send runs the unresolved-duplicate guard; phone and username sends ignore it.
+            if phone is not None or username is not None:arguments.pop('allow_duplicate',None)
             if phone is not None:result=await phone_send.send(store,token,arguments)
             elif username is not None:result=await username_send.send(store,token,arguments)
-            else:result=await run_in_threadpool(store.send_message,token,**arguments)
+            else:result=await run_in_threadpool(store.send_message,token,duplicate_guard=True,**arguments)
             if wait_s and result.get('send_id'):
                 try:
                     waited=await wait_for_send(store,token,result['send_id'],wait_s)

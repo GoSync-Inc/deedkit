@@ -36,6 +36,24 @@ def test_python_guard_errors_keep_their_code_and_are_never_retried(code, status)
     assert seen == ['/v1/send_message']
 
 
+# spec: ANYM-748
+def test_python_send_message_forwards_allow_duplicate_and_keeps_its_refusal_code():
+    seen = []
+    def transport(request):
+        body = json.loads(request.content)
+        seen.append(body)
+        if 'allow_duplicate' in body:
+            return httpx.Response(200, json={'status': 'queued'})
+        return httpx.Response(409, json={'error': 'duplicate_send_unresolved', 'request_id': 'b' * 32,
+                                         'earlier_request_id': 'synthetic-send-0000', 'earlier_status': 'unknown'})
+    with Client('https://archive.example', 'synthetic-token', transport=httpx.MockTransport(transport)) as client:
+        with pytest.raises(AnyMsgError) as failure:
+            client.send_message(**SEND)
+        client.send_message(**SEND, allow_duplicate=True)
+    assert failure.value.code == 'duplicate_send_unresolved' and failure.value.request_id == 'b' * 32
+    assert 'allow_duplicate' not in seen[0] and seen[1]['allow_duplicate'] is True and len(seen) == 2
+
+
 # spec: ANYM-736
 def test_python_get_send_status_by_request_id_and_by_send_id():
     seen = []
