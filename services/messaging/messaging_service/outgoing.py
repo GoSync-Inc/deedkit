@@ -468,8 +468,9 @@ def outbound_status(c,accounts):
 
 def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
             preview_digest='',link_preview=False,allow_lossy=False,phone_hash=None,child=False,
-            expected_last_message_id=None,guard=None):
+            expected_last_message_id=None,guard=None,duplicate_guard=False,allow_duplicate=None):
     """expected_last_message_id, guard (ANYM-736): the optional chat-head precondition, send_guard.py.
+    duplicate_guard (ANYM-748): only the send_message tool passes True; allow_duplicate=True skips it for one call.
     phone_hash: a phone send (ANYM-532) whose digest the caller checked; it is the request hash.
     child: a messages_send step (ANYM-546) under its child key; only such a call may use the child prefix."""
     def refused(error,resolved=False):
@@ -493,6 +494,9 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
     if not isinstance(request_id,str) or not re.fullmatch(r'[a-zA-Z0-9_.:-]{8,128}',request_id) or (
             request_id.startswith(CHILD_KEY_PREFIX)!=child):
         raise APIError('invalid_request_id')
+    if allow_duplicate is not None and not isinstance(allow_duplicate,bool):
+        from .field_errors import refusal
+        raise refusal('invalid_parameters',[('allow_duplicate','type','boolean')])
     guarded=expected_last_message_id is not None or guard is not None
     if guarded:
         from . import send_guard
@@ -531,6 +535,8 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
         if not matches:raise APIError('idempotency_conflict',409)
         return result(existing,c,p)
     if guard_refusal is not None:raise guard_refusal
+    if duplicate_guard and allow_duplicate is not True:
+        refuse_unresolved_duplicate(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id)
     if not default_policy and not preview_digest:raise refused(APIError('preview_required',409),True)
     draft=reviewed(c,p,account,chat_id,text,reply_to,format,link_preview,allow_lossy,chat,reply_id)
     if phone_hash is None and preview_digest and preview_digest!=draft['preview_digest']:
@@ -558,6 +564,46 @@ def enqueue(c,p,account,chat_id,text,request_id,reply_to='',format='plain',
          artifact['provider_text'],reply_id,text,format,Jsonb(artifact),Jsonb(draft['render_policy']),preview_digest or None)).fetchone()
     targets(p,[chat_id,row['id']])
     return result(row,c,p)
+
+
+# ANYM-748: an earlier send of the same content counts while it is unresolved and this recent.
+DUPLICATE_WINDOW_MINUTES=60
+DUPLICATE_TIMEOUT_MS=1000
+DUPLICATE_SQL=f"""SELECT request_id,status FROM outgoing_messages
+    WHERE principal=%s AND account=%s AND chat=%s AND source_text=%s AND source_format=%s AND render_policy=%s
+      AND reply_provider_id IS NOT DISTINCT FROM %s AND request_id<>%s AND left(request_id,{len(CHILD_KEY_PREFIX)})<>%s
+      AND (status IN ('dispatching','unknown') OR status='queued' AND expires_at>clock_timestamp())
+      AND created_at>clock_timestamp()-interval '{DUPLICATE_WINDOW_MINUTES} minutes'
+    ORDER BY created_at DESC LIMIT 1"""
+
+
+def unresolved_send(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id):
+    """The newest unresolved earlier send of this principal with the same intent, or None."""
+    return c.execute(DUPLICATE_SQL,(p['id'],account,chat_id,text,format,
+        Jsonb({'link_preview':link_preview,'allow_lossy':allow_lossy}),reply_id,request_id,CHILD_KEY_PREFIX)).fetchone()
+
+
+def refuse_unresolved_duplicate(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id):
+    """ANYM-748: refuse a send whose same content to the same chat is still queued, dispatching or unknown.
+
+    Runs under the principal lock, so of two concurrent identical calls one queues and the other sees it. Its own
+    savepoint and a 1 s statement timeout: any failure is chat_guard_unavailable (503) and nothing was queued.
+    The refusal names the earlier request_id and status only; never the message text or the send's internal id."""
+    try:
+        with c.transaction():
+            previous=c.execute("SELECT current_setting('statement_timeout') AS v").fetchone()['v']
+            c.execute("SELECT set_config('statement_timeout',%s,true)",(str(DUPLICATE_TIMEOUT_MS),))
+            earlier=unresolved_send(c,p,account,chat_id,request_id,text,format,link_preview,allow_lossy,reply_id)
+            c.execute("SELECT set_config('statement_timeout',%s,true)",(previous,))
+    except Exception:
+        raise APIError('chat_guard_unavailable',503) from None
+    if earlier is None:return
+    failure=APIError('duplicate_send_unresolved',409)
+    failure.earlier_request_id=earlier['request_id']
+    failure.earlier_status=earlier['status']
+    failure.next_action='check_earlier_send_status'
+    failure.next_call={'tool':'get_send_status','arguments':{'request_id':earlier['request_id']},'caller_supplies':[]}
+    raise failure
 
 
 def status(c,p,send_id=None,request_id=None):

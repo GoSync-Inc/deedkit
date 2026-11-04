@@ -49,6 +49,8 @@ SAFE_ERROR_CODES = frozenset({
     'invalid_arguments','preview_stale','preview_expired','invalid_confirm_token','in_progress','identity_changed',
     # ANYM-736: the send_message chat-head guard.
     'chat_changed_since_seen','chat_guard_unavailable',
+    # ANYM-748: an earlier identical send is still unresolved.
+    'duplicate_send_unresolved',
 })
 
 _UPLOAD_CHUNK_BYTES = 262144
@@ -535,7 +537,7 @@ class Client:
 
     def send_message(self,*,account,chat_id,text,request_id,reply_to='',format='plain',
                      preview_digest='',link_preview=False,allow_lossy=False,wait_s=0,
-                     expected_last_message_id=None,guard=None):
+                     expected_last_message_id=None,guard=None,allow_duplicate=None):
         """Submit exactly confirmed content; rich sends must match a reviewed preview.
 
         Keep request_id until the result is known. The digest never proves human
@@ -543,6 +545,8 @@ class Client:
         expected_last_message_id (ANYM-736): the archive ID of the newest message you read in this chat; newer
         messages refuse the send as chat_changed_since_seen and nothing is queued. guard: any_message or
         outgoing_only. Both are omitted from the wire when None, so older servers see the old payload.
+        allow_duplicate (ANYM-748): True sends even while your earlier send of the same content to this chat is
+        unresolved (duplicate_send_unresolved otherwise); omitted when None.
         """
         parameters=dict(account=account,chat_id=chat_id,text=text,
             request_id=request_id,reply_to=reply_to)
@@ -550,6 +554,7 @@ class Client:
         if wait_s!=0:parameters['wait_s']=wait_s
         if expected_last_message_id is not None:parameters['expected_last_message_id']=expected_last_message_id
         if guard is not None:parameters['guard']=guard
+        if allow_duplicate is not None:parameters['allow_duplicate']=allow_duplicate
         # Default plain calls remain compatible with older strict servers.
         # Nondefault values pass unchanged so the server can reject bad types.
         if (format!='plain' or preview_digest!='' or link_preview is not False

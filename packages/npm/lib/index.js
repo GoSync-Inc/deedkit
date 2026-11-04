@@ -57,6 +57,8 @@ const SAFE_ERRORS = new Set([
   'invalid_arguments','preview_stale','preview_expired','invalid_confirm_token','in_progress','identity_changed',
   // ANYM-736: the send_message chat-head guard.
   'chat_changed_since_seen','chat_guard_unavailable',
+  // ANYM-748: an earlier identical send is still unresolved.
+  'duplicate_send_unresolved',
 ]);
 
 const UPLOAD_FIELDS = Object.freeze({
