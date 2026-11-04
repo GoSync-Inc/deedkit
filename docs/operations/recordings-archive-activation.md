@@ -492,5 +492,10 @@ an hour before 21:30. If a window closes mid-step, the stage's undo or the abort
    `last_snapshot_at` field) instead of a new recordings-specific producer script: no code change in this PR.
 7. The drill is a manual run under the verifier's host lock with the three timers stopped (no new tool); a scripted drill mode in
    the verifier is a possible follow-up card, not part of this plan.
-6. The plan leaves ANYM-730 (deletion, tombstones) and ANYM-732/733 (the event router block) out; the tombstone contract
-   (`tombstones(provider_hash)`, SHA-256 of namespace NUL provider_id) is in BACKUP_R2.md.
+6. The plan leaves ANYM-732/733 (the event router block) out. Deletion (ANYM-730, merged) is its own operation on the owner's
+   request, not a step of this plan: `deedkit-recordings --delete ... --yes --snapshot-to <path>` on `prod`, then **on `backup-1`
+   `python -m messaging_service.backup_r2_verifier --revoke-below <the receipt's incarnation> --config
+   /etc/deedkit-recordings-backup-r2/verifier.json`** (the deletion floor: a bundle sealed before the deletion is refused at
+   verification and at promotion), in the order of BACKUP_R2.md "Owner-requested deletion" (drain the verifier first, resume the
+   producer timers after). The tombstone contract (`tombstones(provider_hash)`, SHA-256 of namespace NUL provider_id) is in
+   BACKUP_R2.md.
