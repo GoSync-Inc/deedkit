@@ -118,9 +118,9 @@ Synthetic tests do not establish that live quiescence.
 If current and candidate SQL inventories differ, complete a separate reviewed
 compatibility and migration plan before enrollment. Verify that the pinned
 backup and restore runtimes support the current database schema and the planned
-target schema. A low or medium release needs no pre-migration backup or copy: the latest verified daily
-backup is its restore point ([production.md](production.md#migration-releases-and-the-backup-gate)
-item 3, "Migration risk tiers"). For a dangerous release, resolve receiver capacity or delivery failures such as
+target schema. A release without a critical migration needs no pre-migration backup or copy: the latest
+verified daily backup is its restore point ([production.md](production.md#migration-releases-and-the-backup-gate)
+item 3, "Migration risk tiers"). For a critical release, resolve receiver capacity or delivery failures such as
 `receiver_quota` through a reviewed storage/retention operation that preserves
 the protected restore anchor. Then obtain a fresh compatible pre-migration
 snapshot with confirmed durable delivery. Retain its ID, snapshot time, schema,

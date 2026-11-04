@@ -522,7 +522,7 @@ Before applying, follow [backup/migration and rollback](platform-cutover.md).
 This tool runs no migration by hand (`deploy` runs the qualifying messaging ones itself, "Unattended
 migrations" below), does not prove data compatibility, authorize external
 actions, or perform provider readback. A schema change needs the module's explicit
-migration procedure first; a dangerous one also the backup gate below (a low or medium one has none,
+migration procedure first; a critical one also the backup gate below (any other has none,
 "Migration risk tiers" below). Confirm that the pinned
 backup/restore runtimes support both the current database schema and the planned
 target, so the daily backup keeps running after the migration. For the backup gate: resolve delivery
@@ -560,67 +560,66 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
    after it, in migration order; a procedure's "schema-N release" is the prepared release. A
    `migrate` retried after `LockNotAvailable` stays under the same gate.
 2. After the release, no backup is required unless the release deletes data: before such a step
-   (045 step 7, `purge-deleted --apply`, dangerous by "Migration risk tiers") a fresh verified backup
+   (045 step 7, `purge-deleted --apply`, critical by "Migration risk tiers") a fresh verified backup
    at the new schema. Otherwise the next scheduled daily backup follows as usual.
-3. Owner 10-29: «я бы максимально облегчил этот. сценарий и снял бы запрет на этот просто катил бы
-   вот эти все штуки сейчас не дожидаясь и делал такую процедуру сложную очень-очень редко»; «Я готов
-   принять риск максимально. облегчить этот процесс.» Owner 11-01: «с копией базы надо только при
-   опасных миграциях при ластовых и медиум рисках это не обязательно короче не хочется чтоб это был
-   ботлнек у нас эти бек апы». A low or medium release ("Migration risk tiers" below) has no backup
-   gate and no pre-migration copy: no fresh backup, no restore proof, no wait for a proof, no hold, no
-   backup-age check and no `copy-database`; the latest verified daily backup is its restore point. This
-   holds for messaging and calendar; a low release by hand or unattended, a medium one by hand. A
-   database with no scheduled daily backup running (calendar while its timer is off, ANYM-607) keeps a
-   restore point anyway (the orchestrator's reading of 11-01: a restore point must exist): unattended,
-   its pre-migration copy (Database copies); by hand, `copy-database` first. A dangerous release needs
-   the backup gate above (a fresh backup and its restore proof, never a reused daily backup) and
-   `copy-database` first. The release kit (the PR's release note and, once ANYM-680 ships, the pause's
-   per-file lines in `deploy.json`) records each file's class and tier.
+3. Owner 11-04 (process-fast-release, verbatim): «Мы же уже делали, что при простых миграциях никакого
+   быкапа не ждет ... мы нацелены будем на то, чтобы разработка шла быстро ... делали, только какие-то
+   быкапы, только в критических случаях ... Мы быстрее катили и быстро выкатывали, чтобы без этой сложной
+   канители и блоков каких-то заморозок»; «давай все делать не ждать ничего». Before it, owner 10-29 «Я
+   готов принять риск максимально» and 11-01 «с копией базы надо только при опасных миграциях». A
+   release without a critical migration ("Migration risk tiers" below) has no backup gate and nothing to
+   wait for: no fresh backup, restore proof, hold, backup-age check, `copy-database`, time window, merge
+   freeze, new release kit or plan review. The latest verified daily backup is its restore point. Its only
+   waits are the tool's own: an active call, and a backup that holds the runner lock. This holds for
+   messaging and calendar. A database with no scheduled daily backup running (calendar while its timer is
+   off, ANYM-607) keeps a restore point anyway: unattended, its pre-migration copy (Database copies); by
+   hand, `copy-database` first. A critical release needs the backup gate above (a fresh backup and its
+   restore proof, never a reused daily backup), `copy-database` first and one Astra review round of
+   its plan (reviews.md Rounds 7, AGENTS.md section 2). The release kit or PR names each file's tier.
 
-   Accepted risk (owner 10-29 and 11-01, quoted above): if a low or medium `migrate` destroys or corrupts data, a
-   restore returns the database to the latest daily backup (about 24 hours old at most while the
-   daily backup succeeds), and everything written after it (messages, receipts, keys, operator
-   changes) is lost.
+   Accepted risk (owner 10-29, 11-01 and 11-04, quoted above): if a non-critical `migrate` destroys or
+   corrupts data, a restore returns the database to the latest daily backup (about 24 hours old at most
+   while the daily backup succeeds), and everything written after it (messages, receipts, keys, operator
+   changes) is lost. No gate backup or copy was restored in any hand release from 10-17 to 11-04.
+4. How a non-critical release runs. `deploy` applies it itself when the range qualifies ("Unattended
+   migrations": today `expand` files and appended role grants). Any other range pauses autodeploy until
+   `deploy` applies every non-critical range itself (ANYM-743); meanwhile the agent who sees the pause
+   releases it at once, at any hour, with the previous release's tested commands (`prepare`, the "Backup
+   runner" step, `migrate`, `apply`, then the pause removed): a tested runbook, so no new kit, plan or
+   review round. The runner and producer pin step is part of that release, not a gate. A backup receiver
+   that does not read the new schema yet is a backup follow-up: raise `receiver_schema_max` once it reads
+   it; it never holds a release. Merges never wait for a release: the candidate is one SHA ("Prepare and
+   inspect"), so there is no merge freeze. There is no time window either: the only waits are an active
+   call and a backup that holds the runner lock, and the tool checks both.
 
 ### Migration risk tiers
 
-Owner 11-01 (item 3 above) named the tiers, not the forms; the lists below are the orchestrator's
-reading of 11-01 (brief), tightened by review. A release takes the tier of its most dangerous pending
-migration file, changed role file or step. In doubt, or when a statement is not named below: dangerous.
+Owner 11-04 (item 3 above): backups only in critical cases. Two tiers. A release takes the tier of its
+highest-tier pending migration file, changed role file or step.
 
-- Dangerous (backup gate and `copy-database` first): DROP of any kind except these medium ones: the
-  old constraint of a proven CHECK widening pair (below), DROP NOT NULL, DROP DEFAULT; TRUNCATE; DELETE, UPDATE or
-  MERGE of existing rows; RENAME; a narrowing ALTER (a column type change, SET NOT NULL on existing
-  data, a new constraint, `NOT VALID` included, or unique index that can reject existing rows); any
-  other rewrite of existing data; a data-deleting step (item 2); a top-level SELECT, CALL, DO or COPY
-  other than the `DO` precondition the classifiers accept (`precondition()` in each
-  `migration_rollout.py`); code that runs inside the migration's own transaction: a new or replaced
-  trigger or trigger function on a table the release or its runner writes (`archive_migrations`,
-  `probe_metadata`, `fcs.migrations` included), an event trigger (new or already present), an
-  expression or partial index that calls a function that is not built in; replacing a function that an
-  existing index, constraint, generated column or default uses, or that a trigger on a table the
-  release or its runner writes uses.
-- Medium (no fresh backup, no copy; a hand release with its Astra-reviewed plan): non-unique indexes,
-  also on existing tables (CONCURRENTLY, or plain under a `SET LOCAL lock_timeout`); CREATE OR REPLACE
-  FUNCTION and row triggers that the release itself does not fire (above); a CHECK widening pair proven
-  a superset of the old constraint on the same column against the live catalog (by hand: in the plan
-  review); DROP NOT NULL, SET or DROP DEFAULT; grants on existing objects, a REVOKE or a role change
-  (role SQL keeps its Astra r1, read-back and undo; its backup is the latest verified daily one).
-- Low (no fresh backup, no copy; by hand or unattended): what the candidate's `unattended_class` calls
-  `expand` and `role_class` calls `additive` (new tables, their indexes and grants, nullable or
-  constant-default columns, comments; M1, "Unattended migrations" below).
+- Critical (the backup gate, `copy-database` and one Astra round on the plan first): a statement that deletes
+  or rewrites existing rows or drops stored data. DELETE, UPDATE, MERGE, TRUNCATE, INSERT ... ON CONFLICT
+  DO UPDATE; DROP TABLE, COLUMN, SCHEMA or MATERIALIZED VIEW and any DROP ... CASCADE; ALTER COLUMN ...
+  TYPE or SET EXPRESSION; the same inside a `DO` block, a function the migration calls or a trigger that
+  fires during it; a data-deleting step (item 2); and a statement whose effect on existing rows the author
+  cannot name.
+- Non-critical: everything else. For example new tables, columns and indexes; constraints and CHECK
+  changes, `NOT VALID` included (a failing one aborts its own transaction and loses nothing); DROP
+  CONSTRAINT, INDEX, DEFAULT or NOT NULL; RENAME; functions, triggers and comments; grants, REVOKE and role
+  changes; a `DO` block that only grants, revokes or checks a precondition.
 
-The tier decides the backup and the copy only; which release runs it does not change: only low files
-run unattended, medium and dangerous ones are hand releases under their procedures, and every other
-gate stays (the production plan's Astra r1, reviews.md Rounds 7, and its undo; role SQL review; the
-active-call check; the release order). Until ANYM-680 ships, the author names each `manual` file's tier
-in its PR and release note, and the PR review and the plan's Astra r1 check it against the file; until
-ANYM-675 ships, the deployer still copies before every unattended range because its rehearsal runs on
-the copy.
+The tier decides the backup, the copy and the plan review only. Expand, then contract
+(`.claude/rules/migrations.md`) still keeps a DROP, RENAME or narrowing out of a release whose running
+code uses the old shape; role SQL keeps its Astra r1 in its PR; the active-call check and the release
+order stay. The author names the tier in the migration header (`-- Risk tier: critical` with the line
+of the critical statement, or `-- Risk tier: non-critical`) and in the PR; the PR review checks it
+against the file. Until ANYM-743 computes the tier from the diff, that header is the tier. Until
+ANYM-675 ships, the deployer still copies before every unattended range, because its rehearsal runs on
+the copy; that copy is automatic and holds no one.
 
 ### Database copies
 
-ANYM-588. A copy is required only before a dangerous migration, or for a database with no daily backup
+ANYM-588. A copy is required only before a critical migration, or for a database with no daily backup
 running ("Migration risk tiers"; owner 11-01). `production.py copy-database --config <plan A config> --database <name> --sha <sha>` makes an
 exactly checked copy of one live database on this host without stopping its writers, proves it restores
 and leaves nothing running. Automatic migrations (ANYM-449) call the same function; a hand release kit can
@@ -959,7 +958,7 @@ before a change. A host without the file runs no backup and is not checked.
 The install is one step under the runner's own lock, so no messaging or calendar backup and no
 deploy can start between the check and the hash (a backup started meanwhile refuses
 `backup_job_already_running`, then follows its unit's retry behaviour under "Continuous deployment"; a deploy
-waits or exits 75): avoid the minutes around 18:00 UTC; this step keeps its own clock window. No active call. The new runner's read-only `--check` must exit 0 against
+waits or exits 75), so it needs no clock window (owner 11-04). No active call. The new runner's read-only `--check` must exit 0 against
 messaging's `runner.json`: exit 3 means an unfinished journal, whose recovery stays under the
 existing rules (`--recover-stop` restarts the collectors it stopped), and the step stops. Any
 failed command stops it (`sh -e`). From the prepared release: when the backup worker changed
@@ -1040,7 +1039,7 @@ deedkit-calendar-backup-fresh.timer deedkit-calendar-backup-catchup.timer`. `fre
 `/opt/deedkit/calendar-backup/` and its `backups/` stay root `0700` (the runner refuses a job directory with any
 group or other permission bit, `private_backup_directory_required`, so never loosen them or add an ACL there). Run
 `production.py status` as root, as `deploy` does; another user sees `calendar backup: freshness file unreadable
-(PermissionError)`. Not during an active call, and not 17:30Z-19:30Z. Read back: `systemctl start deedkit-calendar-backup-fresh.service` succeeds and `freshness.json`
+(PermissionError)`. Not during an active call. Read back: `systemctl start deedkit-calendar-backup-fresh.service` succeeds and `freshness.json`
 says `fresh`; `production.py status` prints `calendar backup: fresh age=...`; `systemctl list-timers
 'deedkit-calendar-backup-*'` lists both new timers; the first 19:15 fire is skipped by its condition (journal) and
 no second snapshot exists that day. Undo: `systemctl disable --now deedkit-calendar-backup-catchup.timer
@@ -2105,7 +2104,7 @@ Otherwise it:
    space, 4 MiB of input, 64 KiB of output, stderr discarded; the candidate is
    attested main, trusted like a tool self-update, so the hook is no sandbox);
    any failure there names the file `manual`. The
-   class changes nothing else: the run pauses and you migrate by hand, unless the range qualifies
+   class changes nothing else: the run pauses and you migrate by hand at once ("Migration releases" item 4), unless the range qualifies
    for an unattended migration ("Unattended migrations"): then the run migrates in phases instead;
    When the only such change is the `production.py`/`seamless_release.py`
    pair, the self-updating layout installs it instead ("Deploy tool updates");
