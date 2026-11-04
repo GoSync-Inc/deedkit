@@ -513,19 +513,39 @@ TABLE_ACTIONS = {'add', 'drop', 'alter', 'rename', 'validate', 'enable', 'disabl
                  'replica', 'cluster', 'inherit', 'no', 'attach', 'detach', 'force', 'of', 'not'}
 
 
+# The fewest tokens a complete form of an action has (`ENABLE TRIGGER t`, `FORCE ROW LEVEL SECURITY`); another needs 2.
+ACTION_TOKENS = {'enable': 3, 'disable': 3, 'validate': 3, 'replica': 3, 'cluster': 3, 'no': 3, 'attach': 3,
+                 'detach': 3, 'force': 4}
+# What follows ALTER [COLUMN] c, and what follows a table's SET (Sol r2 F5: an incomplete form is unparsed).
+COLUMN_ACTIONS = ('type', 'set', 'drop', 'reset', 'add', 'restart', 'options')
+TABLE_SETS = ('schema', 'tablespace', 'logged', 'unlogged', 'without', 'access')
+
+
 def table_action(part):
-    """The critical kind of one ALTER TABLE action, or None."""
+    """The critical kind of one ALTER TABLE action, or None; `unparsed` for an incomplete form."""
     c = Cursor(part)
-    if c.peek()[0] != 'word' or c.peek()[1] not in TABLE_ACTIONS or len(part) < 2: return 'unparsed'
-    if c.word('drop'):
+    action = c.word(*TABLE_ACTIONS)
+    if action is None or len(part) < ACTION_TOKENS.get(action, 2): return 'unparsed'
+    if action == 'drop':
         if ('word', 'cascade') in part: return 'DROP CASCADE'
-        return None if c.word('constraint') else 'DROP COLUMN'
-    if c.word('alter'):
-        if c.word('constraint'): return None
+        return None if c.word('constraint') and not c.done() else 'DROP COLUMN'
+    if action == 'alter':
+        if c.word('constraint'): return None if len(part) > 3 else 'unparsed'
         c.word('column')
         c.name()
-        if c.word('type') or c.word('set') and (c.word('data') and c.word('type') or c.word('expression')):
+        sub = c.word(*COLUMN_ACTIONS)
+        if sub == 'type' or sub == 'set' and (c.word('data') and c.word('type') or c.word('expression')):
             return 'ALTER COLUMN TYPE'
+        return None if sub == 'restart' or sub and not c.done() else 'unparsed'
+    if action == 'add':
+        c.word('column')
+        if c.word('if'): c.expect('not'), c.expect('exists')
+        return None if len(part) - c.at >= 2 else 'unparsed'
+    if action == 'set':
+        if c.take('punct', '('): return None
+        form = c.word(*TABLE_SETS)
+        return None if form in ('logged', 'unlogged') or form and not c.done() else 'unparsed'
+    if action in ('rename', 'owner'): return None if ('word', 'to') in part else 'unparsed'
     return None
 
 
@@ -565,7 +585,7 @@ def statement_risk(statement):
         if c.word('if'): c.expect('exists')
         c.word('only')
         c.name()
-        if c.word('rename'): return None
+        if c.word('rename'): return None if ('word', 'to') in statement else 'unparsed'
         if c.done(): return 'unparsed'
         for part in split(statement[c.at:]):
             if kind := table_action(part): return kind
@@ -573,14 +593,41 @@ def statement_risk(statement):
     return 'other statement'
 
 
+def bodies(statement):
+    """The tokens of a DO statement's dollar-quoted body; none for another statement (a function body is defined, not
+    run). Untokenizable for a body that does not tokenize."""
+    if statement[:1] != [('word', 'do')]: return []
+    return [item for kind, value in statement if kind == 'dollar' for item in tokens(value)]
+
+
+def definitions(items):
+    """The functions and procedures `items` (a statement and its DO body) creates, and whether it creates a function,
+    procedure, trigger or rule: an INSERT of the same file can fire one (Sol r2 F1)."""
+    names, fires = set(), False
+    for at, item in enumerate(items):
+        if item != ('word', 'create'): continue
+        c = Cursor(items[at + 1:])
+        while c.word('or', 'replace', 'constraint'): pass
+        if c.word('trigger', 'rule'): fires = True
+        elif c.word('function', 'procedure'):
+            fires = True
+            try:
+                name = c.name()
+                while c.take('punct', '.'): name = c.name()
+                names.add(name)
+            except Manual: pass
+    return names, fires
+
+
 def new_function_call(statement, created):
-    """'FUNCTION CALL' when `statement` calls a function the same file creates (a DEFAULT, CHECK, index, INSERT or
-    DO condition runs it during the migration, Astra r1 F1); its own definition and a trigger's EXECUTE FUNCTION do
-    not."""
+    """'FUNCTION CALL' when `statement` or its DO body calls a function the same file creates (a DEFAULT, CHECK,
+    index, INSERT or DO condition runs it during the migration, Astra r1 F1; a created name shadows a DO_CALLS one,
+    Sol r2 F1); its own definition and a trigger's EXECUTE FUNCTION do not."""
     first = statement[:1]
     if first in ([('word', 'grant')], [('word', 'revoke')], [('word', 'comment')]) or first in (
             [('word', 'create')], [('word', 'alter')], [('word', 'drop')]) and any(
             item in statement[:4] for item in (('word', 'function'), ('word', 'procedure'))): return None
+    statement = statement + bodies(statement)
     for at, (kind, value) in enumerate(statement):
         if kind in ('word', 'ident') and value in created and statement[at + 1:at + 2] == [('punct', '(')]:
             before = at - 2 if statement[max(at - 2, 0):at] == [('word', 'public'), ('punct', '.')] else at
@@ -597,15 +644,17 @@ def risk_class(text):
         parsed, lines = statements(text), statement_lines(text)
     except Untokenizable:
         return 'critical', 0, 'untokenizable'
-    created = set()
+    created, fires = set(), False
     for statement in parsed:
-        c = Cursor(statement)
-        if c.word('create') and (not c.word('or') or c.word('replace')) and c.word('function', 'procedure'):
-            try: created.add(c.name())
-            except Manual: pass
+        try: names, defines = definitions(statement + bodies(statement))
+        except Untokenizable: names, defines = set(), True
+        created, fires = created | names, fires or defines
     for statement, line in zip(parsed, lines):
         try:
-            kind = statement_risk(statement) or new_function_call(statement, created)
+            # A trigger or rule the file creates, or a function it creates or replaces (an existing trigger's body),
+            # runs on an INSERT of the same file (Sol r2 F1).
+            kind = statement_risk(statement) or new_function_call(statement, created) or (
+                'FUNCTION CALL' if fires and statement[:1] == [('word', 'insert')] else None)
         except (Manual, Untokenizable):
             kind = 'unparsed'
         if kind: return 'critical', line, kind if kind in RISK_KINDS else 'other statement'

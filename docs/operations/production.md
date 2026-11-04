@@ -621,12 +621,13 @@ highest-tier pending migration file, changed role file or step.
   a table, a column or anything the author cannot list; ALTER COLUMN ... TYPE or SET EXPRESSION that
   rewrites the table or converts stored values (a binary-coercible change without a rewrite, such as
   `varchar(n)` to `text`, is not); the same inside a `DO` block, a function the migration calls or a
-  trigger that fires during it; a data-deleting step (item 2); and a statement whose effect on existing
-  rows the author cannot name.
+  trigger that fires during it (computed: an INSERT in a file that creates or replaces a function, trigger
+  or rule, and a call of a function the file creates); a data-deleting step (item 2); and a statement
+  whose effect on existing rows the author cannot name.
 - Non-critical: everything else. For example new tables, columns and indexes; constraints and CHECK
   changes, `NOT VALID` included (a failing one aborts its own transaction and loses nothing); DROP
-  CONSTRAINT, INDEX, DEFAULT or NOT NULL; RENAME; functions, triggers and comments; grants, REVOKE and role
-  changes; a `DO` block that only grants, revokes or checks a precondition.
+  CONSTRAINT, INDEX, DEFAULT or NOT NULL; RENAME; functions, triggers and comments (with no INSERT in the
+  file); grants, REVOKE and role changes; a `DO` block that only grants, revokes or checks a precondition.
 
 The tier decides the backup, the copy and the plan review only. Expand, then contract
 (`.claude/rules/migrations.md`) still keeps a DROP, RENAME or narrowing out of a release whose running
@@ -776,7 +777,7 @@ Phases, each a pause or a wait before any production write:
    other change (indexes, constraints, functions, triggers, views, policies, grants, defaults, roles)
    passes; `probe_metadata` only by `schema_version`;
    `archive_migrations` only by the pending versions; and no other existing table may show a write in
-   `pg_stat_user_tables` or a changed exact row count (a TRUNCATE moves no write counter; ANYM-743). Its transaction (from `applied_at` to the first read after the container ended)
+   `pg_stat_user_tables` or a changed exact row count (a TRUNCATE moves no write counter; ANYM-743) or column number (a column dropped and added again). Its transaction (from `applied_at` to the first read after the container ended)
    takes at most `rehearsal_limit_ms`. Else the run pauses "not unattended: <first difference>" or "too slow
    for an unattended lock". The copy's release removes and confirms every resource; a killed run leaves
    them to the next run's reconciliation.

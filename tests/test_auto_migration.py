@@ -814,6 +814,35 @@ def test_a_truncate_hidden_in_a_function_is_critical_in_both_classifiers_and_the
     assert p.data_unchanged(before, data(source_db), PLAN) == "the row count of public.messages changed"
 
 
+# Sol r2 F1 (ANYM-743): an INSERT fires a same-file trigger that drops a populated column and adds it again empty;
+# rows, write counters and the column's catalog properties stay the same.
+REPLACING = ("-- rollout: manual\nCREATE FUNCTION synthetic_wipe() RETURNS trigger LANGUAGE plpgsql AS $f$\nBEGIN "
+             "ALTER TABLE messages DROP COLUMN synthetic_keep; ALTER TABLE messages ADD COLUMN synthetic_keep text; "
+             "RETURN NEW; END;\n$f$;\nCREATE TABLE synthetic_fire (id integer);\nCREATE TRIGGER synthetic_fire BEFORE "
+             "INSERT ON synthetic_fire FOR EACH ROW EXECUTE FUNCTION synthetic_wipe();\n"
+             "INSERT INTO synthetic_fire VALUES (1);\n")
+
+
+# spec: ANYM-743
+def test_a_column_replaced_by_a_trigger_an_insert_fires_is_critical_and_the_rehearsal_refuses_it(source_db):
+    spec = importlib.util.spec_from_file_location(
+        "calendar_rollout", ROLLOUT.parents[3] / "services/calendar/family_calendar/service/migration_rollout.py")
+    calendar = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(calendar)
+    for module in (rollout, calendar):
+        assert module.risk_class(REPLACING) == ("critical", 7, "FUNCTION CALL")
+        assert module.unattended_class(REPLACING) == "manual"
+    psql(source_db, "ALTER TABLE messages ADD COLUMN synthetic_keep text; SELECT pg_stat_force_next_flush();")
+    before = data(source_db)
+    psql(source_db, "BEGIN; " + LEDGER_ROW.format(digest="a" * 64) + REPLACING.split("\n", 1)[1]
+         + " SELECT pg_stat_force_next_flush(); COMMIT;")
+    after = data(source_db)
+    assert p.data_unchanged(before, after, PLAN) == "column synthetic_keep of public.messages was dropped or replaced"
+    # The column identity is the only signal: with the old attnum lines the data check passes.
+    kept = {**after, **{key: value for key, value in before.items() if key[0] == "attnum"}}
+    assert p.data_unchanged(before, kept, PLAN) is None
+
+
 @pytest.fixture
 def copy_settings(tmp_path, monkeypatch, source_db):
     monkeypatch.setattr(p, "filesystem", lambda path: (1 << 40, 1 << 40))
@@ -1278,6 +1307,18 @@ def test_a_dry_run_names_both_migrations_in_their_order(tmp_path, monkeypatch):
     assert outcome["steps"][:2] == [
         "migrate calendar schema 5 to 6 after a verified copy and its rehearsal, then db-roles and db-roles --check",
         "migrate messaging schema 50 to 51 after a verified copy and its rehearsal"]
+    assert host.events == [] and host.migration() is None
+
+
+# spec: ANYM-743
+@pytest.mark.parametrize("both", [True, False])
+def test_a_dry_run_of_a_qualifying_range_lists_each_added_file_with_its_computed_tier(tmp_path, monkeypatch, both):
+    # Sol r2 F3: calendar files too, from the calendar classifier, also for a calendar-only range.
+    files = {"051_synthetic_note.sql": NOTE} if both else {}
+    host = CalendarHost(tmp_path, monkeypatch, {"schema_v6.sql": CALENDAR_TABLE}, files=files)
+    outcome = host.deploy(dry_run=True)
+    named = [(line.split()[0], line.endswith(" non-critical")) for line in outcome["migrations"]]
+    assert named == [("051_synthetic_note.sql", True)] * both + [("schema_v6.sql", True)]
     assert host.events == [] and host.migration() is None
 
 

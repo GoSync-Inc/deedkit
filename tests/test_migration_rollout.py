@@ -631,6 +631,26 @@ CRITICAL_FORMS = {
     'bare-alter': ('ALTER;', 'unparsed'),
     'bare-set': ('ALTER TABLE messages SET;', 'unparsed'),
     'bare-create': ('CREATE TABLE;', 'unparsed'),
+    # Sol r2 F1: an INSERT fires a trigger or rule the file creates; a created function shadows a DO_CALLS name.
+    'trigger-on-insert': ('CREATE FUNCTION synthetic_wipe() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN '
+                          'ALTER TABLE messages DROP COLUMN body; RETURN NEW; END; $f$; CREATE TABLE synthetic_fire '
+                          '(id integer); CREATE TRIGGER synthetic_fire BEFORE INSERT ON synthetic_fire FOR EACH ROW '
+                          'EXECUTE FUNCTION synthetic_wipe(); INSERT INTO synthetic_fire VALUES (1);', 'FUNCTION CALL'),
+    'rule-on-insert': ('CREATE TABLE synthetic_fire (id integer); CREATE RULE synthetic_r AS ON INSERT TO '
+                       'synthetic_fire DO INSTEAD DELETE FROM messages; INSERT INTO synthetic_fire VALUES (1);',
+                       'FUNCTION CALL'),
+    'replaced-function-on-insert': ("CREATE OR REPLACE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+                                    "RETURN NEW; END $$; INSERT INTO messages (id) VALUES ('x');", 'FUNCTION CALL'),
+    'shadowed-do-call': ('CREATE FUNCTION to_regclass(integer) RETURNS regclass LANGUAGE plpgsql AS $f$ BEGIN '
+                         'TRUNCATE messages; RETURN NULL; END; $f$; DO $b$ BEGIN IF to_regclass(1) IS NULL THEN NULL; '
+                         'END IF; END; $b$;', 'FUNCTION CALL'),
+    # Sol r2 F5: an incomplete ALTER TABLE action.
+    'add-column-no-name': ('ALTER TABLE messages ADD COLUMN;', 'unparsed'),
+    'add-column-no-type': ('ALTER TABLE messages ADD COLUMN x;', 'unparsed'),
+    'alter-column-no-action': ('ALTER TABLE messages ALTER COLUMN body;', 'unparsed'),
+    'set-unknown': ('ALTER TABLE messages SET foo;', 'unparsed'),
+    'rename-no-target': ('ALTER TABLE messages RENAME;', 'unparsed'),
+    'owner-no-to': ('ALTER TABLE messages OWNER x;', 'unparsed'),
 }
 
 
@@ -660,6 +680,10 @@ NON_CRITICAL_FORMS = {
     'insert': "INSERT INTO probe_metadata (name, value) VALUES ('synthetic', 'x') ON CONFLICT DO NOTHING;",
     'comment': "COMMENT ON SCHEMA public IS 'synthetic';",
     'precondition': ALLOWED['precondition'],
+    'complete-actions': 'ALTER TABLE messages ADD COLUMN IF NOT EXISTS x int, ALTER COLUMN body SET NOT NULL, '
+                        'SET (fillfactor = 70), ADD CONSTRAINT k CHECK (x > 0) NOT VALID, OWNER TO messaging; '
+                        'ALTER TABLE messages ENABLE ROW LEVEL SECURITY; ALTER TABLE messages RENAME TO messages_v2;',
+    'new-table-insert':'CREATE TABLE synthetic_t (id int); INSERT INTO synthetic_t VALUES (1);',
 }
 
 
@@ -709,6 +733,17 @@ def test_the_pause_names_a_fixed_kind_never_a_word_of_the_file(marker, shape):
     named = production.classifier_child(production.CLASSIFY, {'source': Path(rollout.__file__).read_text(),
                                                               'texts': [text]})
     assert production.NAMED_CLASS.fullmatch(named[0]) and 'zq' + marker.lower() not in named[0].lower()
+
+
+# spec: ANYM-743
+def test_the_classifier_child_names_the_tier_of_a_calendar_file_with_the_calendar_classifier():
+    # Sol r2 F3: the calendar module imports hashlib, which the child's audit hook would refuse.
+    from scripts import production
+    source = (SOURCE.parents[1] / 'calendar/family_calendar/service/migration_rollout.py').read_text()
+    texts = [EXPAND + NON_CRITICAL_FORMS['index-on-existing'] + '\n', EXPAND + CRITICAL_FORMS['truncate'][0] + '\n']
+    named = production.classifier_child(production.CLASSIFY, {'source': source, 'texts': texts})
+    assert all(production.NAMED_CLASS.fullmatch(name) for name in named)
+    assert named[0].endswith(' non-critical') and named[1].endswith(' critical: line 2 TRUNCATE')
 
 
 # spec: ANYM-743

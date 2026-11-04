@@ -2836,8 +2836,9 @@ module = {"__name__": "migration_rollout"}
 exec(compile(data["source"], "migration_rollout.py", "exec"), module)
 """
 # ANYM-743: with the candidate's `risk_class`, each class adds the tier, and a critical file its first critical line and
-# statement kind (`manual critical: line 12 DELETE`); a candidate without it names the class alone.
-CLASSIFY = CLASSIFY_PRELUDE + """def named(text):
+# statement kind (`manual critical: line 12 DELETE`); a candidate without it names the class alone. hashlib comes first
+# for the calendar classifier, as in CALENDAR_PLAN (the audit hook refuses an import; Sol r2 F3).
+CLASSIFY = "import hashlib\n" + CLASSIFY_PRELUDE + """def named(text):
     kind, risk = module["rollout_class"](text), module.get("risk_class")
     if risk is None:
         return kind
@@ -3067,7 +3068,10 @@ MIGRATION_DATA = r"""SELECT line FROM (
          json_build_array(n_tup_ins, n_tup_upd, n_tup_del))::text FROM pg_stat_user_tables
   UNION ALL SELECT json_build_object('k', json_build_array('rows', format('%I.%I', schemaname, relname)), 'v',
          (xpath('/row/c/text()', query_to_xml(format('SELECT count(*) AS c FROM %I.%I', schemaname, relname), false,
-                                              true, '')))[1]::text)::text FROM pg_stat_user_tables) AS lines ORDER BY line;"""
+                                              true, '')))[1]::text)::text FROM pg_stat_user_tables
+  UNION ALL SELECT json_build_object('k', json_build_array('attnum', format('%I.%I', s.schemaname, s.relname), a.attname),
+         'v', a.attnum)::text FROM pg_stat_user_tables s JOIN pg_attribute a ON a.attrelid = s.relid
+   WHERE a.attnum > 0 AND NOT a.attisdropped) AS lines ORDER BY line;"""
 LEDGER = r"""SELECT json_build_object('schema_version', (SELECT value FROM probe_metadata WHERE name = 'schema_version'),
   'applied', (SELECT coalesce(json_object_agg(version::text, sha256 ORDER BY version), '{}'::json) FROM archive_migrations))::text;"""
 OTHER_SESSIONS = "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend' AND pid <> pg_backend_pid();"
@@ -3134,7 +3138,10 @@ CALENDAR_DATA = r"""SELECT line FROM (
          json_build_array(n_tup_ins, n_tup_upd, n_tup_del))::text FROM pg_stat_user_tables
   UNION ALL SELECT json_build_object('k', json_build_array('rows', format('%I.%I', schemaname, relname)), 'v',
          (xpath('/row/c/text()', query_to_xml(format('SELECT count(*) AS c FROM %I.%I', schemaname, relname), false,
-                                              true, '')))[1]::text)::text FROM pg_stat_user_tables) AS lines ORDER BY line;"""
+                                              true, '')))[1]::text)::text FROM pg_stat_user_tables
+  UNION ALL SELECT json_build_object('k', json_build_array('attnum', format('%I.%I', s.schemaname, s.relname), a.attname),
+         'v', a.attnum)::text FROM pg_stat_user_tables s JOIN pg_attribute a ON a.attrelid = s.relid
+   WHERE a.attnum > 0 AND NOT a.attisdropped) AS lines ORDER BY line;"""
 # fcs.migrations has no applied_at: the rehearsal's transaction time is the database's active and idle-in-transaction
 # milliseconds its session added (counted at its exit), plus the few reads between (an overestimate).
 BUSY = ("SELECT round(active_time + idle_in_transaction_time) FROM pg_stat_database "
@@ -3370,6 +3377,13 @@ def destroys_data(before, after):
     return None
 
 
+def changed_data(key):
+    """The reason a `writes`, `rows` or `attnum` line of the data check changed."""
+    if key[0] == "writes": return f"rows of {key[1]} were written"
+    if key[0] == "rows": return f"the row count of {key[1]} changed"
+    return f"column {key[2]} of {key[1]} was dropped or replaced"
+
+
 def data_unchanged(before, after, plan):
     """M3's data: the first reason the copy's data changed beyond the migration's own ledger rows, or None."""
     def metadata(rows):
@@ -3382,10 +3396,11 @@ def data_unchanged(before, after, plan):
     if set(plan["pending"]) & set(ledger(before)) or ledger(after) != {**ledger(before), **plan["pending"]}:
         return "archive_migrations changed beyond the pending versions"
     for key, value in sorted(before.items(), key=json.dumps):
-        # ANYM-743 (Astra r1 F1): a TRUNCATE moves no write counter, so the exact row count of every table counts too.
-        if key[0] in ("writes", "rows") and key[1] not in ("public.probe_metadata", "public.archive_migrations") \
+        # ANYM-743 (Astra r1 F1): a TRUNCATE moves no write counter, so the exact row count of every table counts too;
+        # a column dropped and added again under its name has a new attnum and no values (Sol r2 F1).
+        if key[0] in ("writes", "rows", "attnum") and key[1] not in ("public.probe_metadata", "public.archive_migrations") \
                 and after.get(key) != value:
-            return f"rows of {key[1]} were written" if key[0] == "writes" else f"the row count of {key[1]} changed"
+            return changed_data(key)
     return None
 
 
@@ -3396,8 +3411,8 @@ def calendar_data_unchanged(before, after, plan):
     if set(plan["pending"]) & set(ledger(before)) or ledger(after) != {**ledger(before), **plan["pending"]}:
         return "fcs.migrations changed beyond the pending versions"
     for key, value in sorted(before.items(), key=json.dumps):
-        if key[0] in ("writes", "rows") and key[1] != "fcs.migrations" and after.get(key) != value:
-            return f"rows of {key[1]} were written" if key[0] == "writes" else f"the row count of {key[1]} changed"
+        if key[0] in ("writes", "rows", "attnum") and key[1] != "fcs.migrations" and after.get(key) != value:
+            return changed_data(key)
     return None
 
 
