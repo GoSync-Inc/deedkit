@@ -508,6 +508,17 @@ class TelegramCollector:
                 max_bytes=live.max_bytes,max_entries=live.max_entries,reserve_bytes=live.reserve_bytes)
         return self._history_spool
 
+    @property
+    def edit_spool(self):
+        # ANYM-747: a confirmed edit's archive hand-off, beside the live spool with its own publication lock, so a
+        # stalled hand-off write never holds the lock live captures take. Drained with the live spool.
+        if getattr(self,'_edit_spool',None) is None:
+            from .spool import DurableSpool
+            live=self.spool
+            self._edit_spool=DurableSpool(live.path/'edits',validator=live.validator,
+                max_bytes=live.max_bytes,max_entries=live.max_entries,reserve_bytes=live.reserve_bytes)
+        return self._edit_spool
+
     def fail(self,code,detail=None):
         self.failure_code=code; self.failure_detail=detail; self.failed.set()
 
@@ -798,7 +809,7 @@ class TelegramCollector:
         from psycopg_pool import PoolTimeout
         while True:
             try:
-                await self.drain_captures([self.spool],[self.history_spool])
+                await self.drain_captures([self.spool,self.edit_spool],[self.history_spool])
                 await asyncio.to_thread(self.state.apply_tombstones)
             except (psycopg.OperationalError,PoolTimeout):
                 # Capture remains durable; the independent heartbeat stops the
@@ -1181,12 +1192,13 @@ class TelegramCollector:
             log.warning('new_chat_catalog_failed operation=%s error=%s',job.get('operation'),type(exc).__name__)
 
     async def queue_edit_for_archive(self,job,answer):
-        """ANYM-747: a confirmed edit reaches the archive through the live spool, so the drain makes it the next
-        revision. Never through capture(): this is best-effort and total, it never fails the collector, and the
-        operation stays confirmed whatever happens here (the live MessageEdited event and reconcile still apply).
-        A capture slot is taken only when one is free at once (waiting for one could fail the collector) and is held
-        until the spool write itself ends, also past a timeout. The write runs on its own one-thread executor and at
-        most one runs at a time, so a stalled disk never takes threads that receipts, sends or lease renewal use."""
+        """ANYM-747: a confirmed edit reaches the archive through the edit spool, which the drain loop applies with
+        the live spool, so the drain makes it the next revision. Never through capture(): this is best-effort and
+        total, it never fails the collector, and the operation stays confirmed whatever happens here (the live
+        MessageEdited event and reconcile still apply). A capture slot is taken only when one is free at once (waiting
+        for one could fail the collector) and is held until the spool write itself ends, also past a timeout. The
+        write runs on its own one-thread executor, at most one at a time, under the edit spool's own lock: a stalled
+        disk never takes the threads or the lock that receipts, sends, lease renewal and live captures use."""
         data=answer.get('data') if isinstance(answer,dict) and answer.get('outcome')=='confirmed' else None
         message=job.pop('_read_back_message',None)
         if not isinstance(data,dict) or message is None:return
@@ -1204,7 +1216,8 @@ class TelegramCollector:
                 'captured_at':datetime.now(timezone.utc).isoformat()}
             self.capture_count+=1
             try:
-                write=asyncio.get_running_loop().run_in_executor(EDIT_ARCHIVE_EXECUTOR,self.spool.put,item)
+                # The property is read on that thread too: creating the directory is filesystem work.
+                write=asyncio.get_running_loop().run_in_executor(EDIT_ARCHIVE_EXECUTOR,lambda:self.edit_spool.put(item))
             except BaseException:
                 self.release_capture();raise
             self._edit_archive_write=write

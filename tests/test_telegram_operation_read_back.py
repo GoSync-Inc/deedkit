@@ -356,7 +356,8 @@ def test_confirmed_edit_queues_one_archive_item_and_an_unknown_one_none(operator
     receipt = run(operator, EditClient(provider_message('Edited synthetic text')), 'edit_message', EDIT,
         collector=collector)
     assert receipt['status'] == 'succeeded' and receipt['result']['data']['archive'] == 'queued'
-    [item] = spooled(spool)
+    assert spooled(spool) == []  # never the live spool and its lock: the edit spool beside it
+    [item] = spooled(collector.edit_spool)
     assert item['kind'] == 'message' and item['peer_kind'] == 'user'
     envelope = item['envelope']
     assert (envelope['account'], envelope['chat'], envelope['provider_id']) == ('command-fixture', '100', '1')
@@ -365,7 +366,7 @@ def test_confirmed_edit_queues_one_archive_item_and_an_unknown_one_none(operator
     unknown = run(operator, EditClient(provider_message('Original synthetic text', edited=None)), 'edit_message',
         EDIT, collector=collector, request_id='read-back-0002')
     assert unknown['status'] == 'unknown' and 'archive' not in unknown['result']['data']
-    assert spooled(spool) == []
+    assert spooled(collector.edit_spool) == []
 
 
 # spec: ANYM-747
@@ -375,7 +376,7 @@ def test_a_failing_archive_hand_off_keeps_the_edit_succeeded(operator, tmp_path)
 
     def broken(item):
         raise OSError('disk gone')
-    spool.put = broken
+    collector.edit_spool.put = broken
     receipt = run(operator, EditClient(provider_message('Edited synthetic text')), 'edit_message', EDIT,
         collector=collector)
     assert receipt['status'] == 'succeeded' and receipt['error_code'] is None
@@ -389,13 +390,13 @@ def test_a_cancellation_during_the_hand_off_settles_the_edit_first(operator, tmp
     spool = CaptureSpool(tmp_path / 'capture', reserve_bytes=0)
     collector = collector_for(operator, spool)
     entered, release = threading.Event(), threading.Event()
-    original = spool.put
+    original = collector.edit_spool.put
 
     def slow(item):
         entered.set()
         assert release.wait(5)
         return original(item)
-    spool.put = slow
+    collector.edit_spool.put = slow
     client = EditClient(provider_message('Edited synthetic text'))
     collector.provider = NS(execute_operation=lambda job: execute(client, job), verified_self=None)
     queued = queue_operation(operator, 'edit_message', EDIT, 'read-back-cancel-01')
@@ -417,7 +418,7 @@ def test_a_cancellation_during_the_hand_off_settles_the_edit_first(operator, tmp
     assert receipt['result']['data']['archive'] == 'not_queued'
     assert not collector.failed.is_set() and collector.failure_code is None
     assert len(client.mutations()) == 1
-    assert len(spooled(spool)) == 1  # the write itself finished after the wait was cut; the drain applies it
+    assert len(spooled(collector.edit_spool)) == 1  # the write finished after the wait was cut; the drain applies it
 
 
 # spec: ANYM-666
