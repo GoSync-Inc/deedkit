@@ -5456,13 +5456,23 @@ def check_private_config(document, project, private):
 
 
 def blocked_address(item):
-    """The IP address of a blocked target `IP:PORT` or `dns:IP` (an optional `:PORT` after it); None when malformed."""
-    rest = item.removeprefix("dns:")
-    host, _, port = rest.rpartition(":")
+    """The IP address of a blocked target the way the recordings admission reads it: `IP:PORT` (brackets around an IPv6
+    literal allowed) or `dns:IP`, `dns:IP:PORT`, `dns:[IPV6]` and `dns:[IPV6]:PORT`; None when malformed."""
     try:
         if item.startswith("dns:"):
-            with suppress(ValueError):  # `dns:IP` alone, an IPv4 or IPv6 literal
-                return ipaddress.ip_address(rest)
+            body = item[4:]
+            if body.startswith("["):
+                host, closed, rest = body[1:].partition("]")
+                if not closed:
+                    return None
+                port = rest.removeprefix(":") or "53"
+            elif body.count(":") == 1:
+                host, port = body.split(":")
+            else:
+                host, port = body, "53"
+        else:
+            host, _, port = item.rpartition(":")
+            host = host.strip("[]")
         address = ipaddress.ip_address(host)
     except ValueError:
         return None

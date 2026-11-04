@@ -544,6 +544,8 @@ EGRESS_ENV_REFUSALS = [
     ("egress_target_invalid", {"RECORDINGS_EGRESS_BLOCKED": "192.0.2.254:9,10.99.0.1:22,100.64.0.5:0"}),
     ("egress_target_invalid", {"RECORDINGS_EGRESS_BLOCKED": "192.0.2.254:9,10.99.0.1:22,100.64.0.5:22,dns:not-an-ip"}),
     ("egress_target_invalid", {"RECORDINGS_EGRESS_BLOCKED": "192.0.2.254:9,10.99.0.1:22,100.64.0.5:22,dns:"}),
+    ("egress_target_invalid", {"RECORDINGS_EGRESS_BLOCKED": "192.0.2.254:9,10.99.0.1:22,100.64.0.5:22,dns:[2001:db8::53"}),
+    ("egress_target_invalid", {"RECORDINGS_EGRESS_BLOCKED": "192.0.2.254:9,10.99.0.1:22,100.64.0.5:22,dns:[1.1.1.1]:x"}),
     ("egress_target_invalid", {"RECORDINGS_EGRESS_BLOCKED": "192.0.2.254:9,10.99.0.1:22,100.64.0.5:22,dns:1.1.1.1:99999"}),
     ("egress_control_missing", {"RECORDINGS_EGRESS_OPEN": "api.omi.me:443"}),
     ("egress_control_missing", {"RECORDINGS_EGRESS_OPEN": "api.omi.me:443,dns:10.99.0.77"}),
@@ -598,7 +600,8 @@ def test_a_provider_credential_file_that_is_missing_loose_empty_or_unnamed_is_re
 # spec: ANYM-745
 def test_blocked_dns_targets_and_a_second_valid_account_pass(tmp_path, monkeypatch):
     host = Enroller(tmp_path, monkeypatch)
-    host.write_env(RECORDINGS_EGRESS_BLOCKED="192.0.2.254:9,10.99.0.1:22,100.64.0.5:22,dns:1.1.1.1,dns:1.1.1.1:53")
+    host.write_env(RECORDINGS_EGRESS_BLOCKED="192.0.2.254:9,10.99.0.1:22,100.64.0.5:22,dns:1.1.1.1,dns:1.1.1.1:53,"
+                                              "dns:2001:db8::53,dns:[2001:db8::53],dns:[2001:db8::53]:53,[2001:db8::1]:443")
     other = host.state_dir / "plaud.key"
     other.write_text(SECRET + "-plaud\n")
     other.chmod(0o600)
