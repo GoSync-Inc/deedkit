@@ -49,7 +49,7 @@ section 1's exact confirmation. In a task (a ready card) the agent applies its m
 production.md "Migration releases"; enabling a feature never includes send, call, pairing,
 session or allowlist changes, and none of it runs during an active call.
 
-Releases and migrations follow harness process.md section 2 (owner 11-04: ship without gates).
+Releases and migrations follow harness process.md section 2 (owner 11-04: «давай все делать не ждать ничего»).
 production.md "Migration risk tiers" lists what deletes or rewrites user data (critical, which also
 takes a `copy-database`); "Migration releases" item 4 is the hand route.
 
