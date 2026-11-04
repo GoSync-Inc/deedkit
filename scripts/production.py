@@ -1094,15 +1094,22 @@ def backup_busy(expired=lambda: False):
     return None
 
 
+def backup_gate(settings, bound):
+    """The caller's wait for a running backup with `bound` seconds (backup_wait, `--backup-wait`): the deadline is
+    taken here, and a bound of 0 is the single non-waiting check."""
+    return wait_backup_idle(settings, time.monotonic() + bound, single=bound == 0)
+
+
 @contextmanager
-def wait_backup_idle(settings, deadline):
+def wait_backup_idle(settings, deadline, *, single=False):
     """Wait until no backup runs, then hold the runner lock for the caller's run; yields the seconds waited. Idle is
     positive: the lock is free, every BACKUP_UNITS unit reads `inactive` or `failed` and the `.unsettled` marker is
     absent, read again with the lock held (a runner can create the marker and die between the first read and the
     lock). The lock is probed first, so a held lock refuses before any `systemctl` runs, and nothing is held while
-    sleeping or reading units for the first time. Polls every BACKUP_POLL seconds. With a positive bound the
-    deadline (time.monotonic) is checked after every probe, also before admission, so it is overshot by at most one
-    probe and a release is never admitted after it; a bound of 0 is the single non-waiting check. At the bound:
+    sleeping or reading units for the first time. Polls every BACKUP_POLL seconds. The deadline (time.monotonic) is
+    checked after every probe, also before admission, so it is overshot by at most one probe and a release is never
+    admitted after it; `single` (the caller's bound is 0, see backup_gate) is the one non-waiting check, which no
+    deadline cuts short. A deadline that passed before the call is not `single`. At the bound:
     BackupRunning, never an unlocked run. `settings` mirrors wait_for_calls; the bound comes from the caller. A host
     without a backup runner skips the wait (open_backup_lock)."""
     fd = open_backup_lock()
@@ -1113,7 +1120,7 @@ def wait_backup_idle(settings, deadline):
     held = str(path), f"backup_running: a backup holds {path}", None
 
     def expired():
-        return deadline > started and time.monotonic() >= deadline
+        return not single and time.monotonic() >= deadline
 
     def take():
         try:
@@ -1139,7 +1146,7 @@ def wait_backup_idle(settings, deadline):
                     else:
                         fcntl.flock(fd, fcntl.LOCK_UN)
             now = time.monotonic()
-            if now >= deadline:
+            if single or now >= deadline:
                 raise BackupRunning(busy[0], int(now - started), busy[2], busy[1])
             if not said:
                 print("backup check: waiting for " + busy[1].removeprefix("backup_running: "), file=sys.stderr, flush=True)
@@ -4440,7 +4447,7 @@ def deploy(settings, http, *, auto=False, dry_run=False, attested=None, configs=
         try:
             held.enter_context(host_locks(settings, http, s))
             if not auto and not dry_run:  # --auto: the unit's flock wrapper holds it for this whole run.
-                waited = held.enter_context(wait_backup_idle(settings, time.monotonic() + backup_wait(settings)))
+                waited = held.enter_context(backup_gate(settings, backup_wait(settings)))
         except BackupRunning as exc:
             return {**exc.line(), "reason": str(exc)}
         except Busy as exc:
@@ -4953,7 +4960,7 @@ def locked_action(args):
                 raise Refused("an exact lowercase 40-character commit SHA is required")
             if args.action == "apply":
                 # ANYM-744: wait for a running backup, then hold its lock for the whole apply (the call wait included).
-                with wait_backup_idle(settings, time.monotonic() + backup_wait(settings)) as waited:
+                with backup_gate(settings, backup_wait(settings)) as waited:
                     result = apply(settings, args.sha, backup_waited=waited)
                     # Printed only: result.json and current.json stay the release receipts.
                     result = {**result, "image_removal": retain_images(settings)}

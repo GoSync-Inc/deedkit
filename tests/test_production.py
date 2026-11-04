@@ -5935,7 +5935,7 @@ class BackupHost:
             self.free_while_sleeping.append(not self.lock_is_held())
 
     def wait(self, seconds=2700):
-        return p.wait_backup_idle(PLAN_A_ONLY, self.clock.monotonic() + seconds)
+        return p.wait_backup_idle(PLAN_A_ONLY, self.clock.monotonic() + seconds, single=seconds == 0)
 
 
 # spec: ANYM-744
@@ -6081,6 +6081,35 @@ def test_a_held_lock_with_a_zero_bound_refuses_before_any_probe(tmp_path, monkey
 
 
 # spec: ANYM-744
+def test_a_positive_bound_that_passes_while_the_lock_is_opened_is_still_a_bound(tmp_path, monkeypatch):
+    host = BackupHost(tmp_path, monkeypatch, probe=10)
+    deadline = host.clock.monotonic() + 60
+    opened = p.open_backup_lock
+
+    def slow_open():
+        host.clock.now += 100  # descheduled between the caller's deadline and the first probe
+        return opened()
+
+    monkeypatch.setattr(p, "open_backup_lock", slow_open)
+    with pytest.raises(p.BackupRunning):
+        with p.wait_backup_idle(PLAN_A_ONLY, deadline):
+            raise AssertionError("admitted after the bound")
+    assert host.probes == [p.BACKUP_UNITS[0]] and not host.lock_is_held()
+
+
+# spec: ANYM-744
+def test_the_gate_takes_a_zero_bound_as_the_single_check_and_a_positive_one_as_a_deadline(tmp_path, monkeypatch):
+    host = BackupHost(tmp_path, monkeypatch, probe=10)
+    with p.backup_gate(PLAN_A_ONLY, 0) as waited:
+        assert waited == 60
+    host.hold()
+    with pytest.raises(p.BackupRunning) as refused:
+        with p.backup_gate(PLAN_A_ONLY, 30):
+            raise AssertionError("proceeded without the lock")
+    assert refused.value.waited_seconds == 30
+
+
+# spec: ANYM-744
 def test_an_idle_host_with_a_zero_bound_is_admitted_whatever_the_probes_cost(tmp_path, monkeypatch):
     host = BackupHost(tmp_path, monkeypatch, probe=60)
     with host.wait(0) as waited:
@@ -6213,7 +6242,7 @@ def test_the_inner_admission_of_apply_never_waits_for_a_backup(tmp_path, monkeyp
     host.main = RELEASES[0]
     p.prepare(host.settings, RELEASES[0])
     backup.hold()
-    monkeypatch.setattr(p, "wait_backup_idle", lambda *args: (_ for _ in ()).throw(AssertionError("apply waited")))
+    monkeypatch.setattr(p, "wait_backup_idle", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("apply waited")))
     p.apply(host.settings, RELEASES[0])
     assert backup.clock.sleeps == [] and backup.probes == []
 
@@ -6244,6 +6273,38 @@ def test_a_wrapper_held_auto_deploy_waits_zero_seconds_and_reads_no_unit(tmp_pat
 
 
 # spec: ANYM-744
+@pytest.mark.parametrize("inner", ["apply", "promote"])
+@pytest.mark.parametrize("auto", [False, True])
+def test_deploys_real_inner_apply_and_promote_run_under_the_held_lock_and_never_wait(tmp_path, monkeypatch, auto, inner):
+    # The real apply (or promote) runs, with its first remote gate replaced by a recorder that stops the deploy there:
+    # whatever admission code the inner function has before that gate ran under deploy's lock, without waiting.
+    from scripts import seamless_release as s
+    real_apply, real_promote = p.apply, s.promote
+    host = Deployer(tmp_path, monkeypatch)
+    backup = BackupHost(tmp_path, monkeypatch)
+    if auto:
+        backup.hold()  # the unit's wrapper
+    if inner == "apply":
+        monkeypatch.setattr(p, "apply", real_apply)
+    else:
+        monkeypatch.setattr(s, "promote", real_promote)
+        monkeypatch.setattr(s, "validate_settings", lambda value: value)
+    waits, gates, real_wait = [], [], p.wait_backup_idle
+    monkeypatch.setattr(p, "wait_backup_idle", lambda *args, **kwargs: waits.append(args) or real_wait(*args, **kwargs))
+
+    def gate(sha):
+        gates.append(backup.lock_is_held())
+        raise p.Refused("stopped at the first remote gate")
+
+    monkeypatch.setattr(p, "promotable", gate)
+    outcome = host.deploy(auto=auto)
+    assert outcome["status"] == "halted" and "stopped at the first remote gate" in outcome["reason"]
+    assert gates == [True] and len(waits) == (0 if auto else 1)
+    assert ("its HTTP release stopped" in outcome["reason"]) == (inner == "promote")
+    assert backup.clock.sleeps == [] and backup.clock.now == 0
+
+
+# spec: ANYM-744
 @pytest.mark.parametrize("auto", [False, True])
 def test_deploy_holds_the_lock_inside_apply_and_promote_and_waits_at_most_once(tmp_path, monkeypatch, auto):
     host = Deployer(tmp_path, monkeypatch)
@@ -6251,7 +6312,7 @@ def test_deploy_holds_the_lock_inside_apply_and_promote_and_waits_at_most_once(t
     waits, held, real_wait = [], [], p.wait_backup_idle
     if auto:
         backup.hold()  # the unit's wrapper
-    monkeypatch.setattr(p, "wait_backup_idle", lambda *args: waits.append(args) or real_wait(*args))
+    monkeypatch.setattr(p, "wait_backup_idle", lambda *args, **kwargs: waits.append(args) or real_wait(*args, **kwargs))
     for module, name in ((p, "apply"), (host.s, "promote")):
         inner = getattr(module, name)
         monkeypatch.setattr(module, name, lambda *args, _inner=inner, **kwargs:

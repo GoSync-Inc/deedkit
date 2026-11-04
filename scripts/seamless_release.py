@@ -1022,7 +1022,7 @@ def main(argv=None):
             waited = 0
             if args.action == 'promote':
                 # ANYM-744: wait for a running backup inside the locks (deploy's order), then hold its lock.
-                waited = held.enter_context(p.wait_backup_idle(settings, p.time.monotonic() + args.backup_wait))
+                waited = held.enter_context(p.backup_gate(settings, args.backup_wait))
             result = {'bootstrap': lambda: bootstrap(settings, args.sha), 'prepare': lambda: prepare(settings, args.sha),
                 'promote': lambda: promote(settings, args.sha, backup_waited=waited), 'retire': lambda: retire(settings, args.sha),
                 'status': lambda: status(settings, args.sha),

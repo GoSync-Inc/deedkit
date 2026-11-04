@@ -1198,7 +1198,7 @@ class PromoteCommand:
             self.events.append('unlocks')
 
     @contextlib.contextmanager
-    def wait_backup_idle(self, value, deadline):
+    def wait_backup_idle(self, value, deadline, *, single=False):
         self.events.append(('wait', deadline - 1000.0))
         if self.refusal:
             raise self.refusal
@@ -1323,7 +1323,7 @@ def test_standalone_promote_waits_on_the_real_lock_then_runs_the_real_promotion_
     monkeypatch.setattr(s.p, 'run', lambda argv, **kw: 'ActiveState=inactive\n' if argv[:2] == ['systemctl', 'show'] else inner(argv, **kw))
     gate, real_wait, waits, inside = s.p.promotable, s.p.wait_backup_idle, [], []
     monkeypatch.setattr(s.p, 'promotable', lambda sha: inside.append(held()) or gate(sha))
-    monkeypatch.setattr(s.p, 'wait_backup_idle', lambda *args: waits.append(args) or real_wait(*args))
+    monkeypatch.setattr(s.p, 'wait_backup_idle', lambda *args, **kwargs: waits.append(args) or real_wait(*args, **kwargs))
     monkeypatch.setattr(s.os, 'geteuid', lambda: 0)
     monkeypatch.setattr(s.p, 'config', lambda path: cfg)
     monkeypatch.setattr(s, 'validate_settings', lambda value: value)  # root-ownership checks need a root test host
