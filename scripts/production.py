@@ -3803,13 +3803,17 @@ RUNNER_PYTHON = "/usr/bin/python3"  # the interpreter of the backup units' ExecS
 def install_backup_runner(settings, candidate, release):
     """Plan A after preparation, under the runner lock `deploy` holds (production.md, Backup runner): when the host
     runner is not the candidate's, install it with the candidate's verified backup image pinned in every runner.json,
-    instead of pausing. Every check runs before the first rename: the backup units are idle (else a wait), the image is
-    the candidate's, and the new runner's read-only `--check` exits 0 on every runner.json as it will be (else a pause;
-    exit 3 is an unfinished journal). Then each runner.json and the runner are replaced by one rename each, after a
+    instead of pausing. Every check runs before the first rename: the backup units are idle and the image pulls (else a
+    wait), the image is the candidate's, the new runner's read-only `--check` exits 0 on every runner.json as it will
+    be (else a pause; exit 3 is an unfinished journal), and no call is active (else a call wait). Then each runner.json and the runner are replaced by one rename each, after a
     `.before-<candidate>` copy, keeping owner and mode; the runner is read back by its blob. The receipt is
     `<candidate>/backup-runner.json`. A manual `apply` keeps refusing a mismatch (check_backup_runner)."""
-    source = release / "source"
+    source, receipt = release / "source", release / "backup-runner.json"
     if (found := runner_blobs(source, candidate)) is None or found[0] == found[1]:
+        # A run that stopped after the last rename (the runner's) and before its receipt: the receipt follows.
+        with suppress(FileNotFoundError, ValueError, OSError, KeyError, TypeError):
+            if found and read(receipt)["status"] == "installing":
+                write_record(receipt, {**read(receipt), "status": "installed", "settled_at": now()})
         return
     installed, expected = found
     for unit in RUNNER_UNITS:
@@ -3822,8 +3826,14 @@ def install_backup_runner(settings, candidate, release):
     runner = run(["git", "-C", str(source), "cat-file", "blob", f"{candidate}:{BACKUP_RUNNER_SOURCE}"], binary=True)
     if git_blob(runner) != expected:
         raise Refused(f"the backup runner of {candidate[:12]} does not read as its blob {expected[:12]}")
-    # The backup target is no Compose service, so preparation did not resolve it: pulled by its attested digest.
-    image = build_image(source, candidate, "backup")
+    # The backup target is no Compose service, so preparation did not resolve it: pulled by its attested digest. A
+    # failed pull (a registry or network error, a timeout) waits like the producer pin's (follow_producer).
+    try:
+        image = build_image(source, candidate, "backup")
+    except Exception as exc:
+        detail = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+        raise MigrationWait(f"the backup image of {candidate[:12]} could not be pulled: {detail}; the backup runner "
+                            "install waits") from exc
     found = run(["docker", "image", "inspect", "--format",
                  '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}}', image], timeout=60).split()
     if not IMAGE_DIGEST.fullmatch(image) or found != [image, candidate]:
@@ -3834,7 +3844,7 @@ def install_backup_runner(settings, candidate, release):
         messaging = RUNNER_CONFIGS[0]
     configs = [path for path in dict.fromkeys((messaging, *RUNNER_CONFIGS[1:])) if os.path.lexists(path)]
     # staged: (path, temporary, before, after); copies: the `.before-<candidate>` files this run wrote.
-    receipt, directories, staged, copies = release / "backup-runner.json", {}, [], []
+    directories, staged, copies = {}, [], []
     try:
         for path in (BACKUP_RUNNER, *configs):
             directories[path] = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
@@ -3873,6 +3883,9 @@ def install_backup_runner(settings, candidate, release):
         record = {"sha": candidate, "status": "installing", "at": now(), "image": image,
                   "files": [{"path": str(path), "before": old, "after": new, "undo": f"{path}.before-{candidate}"}
                             for path, _, old, new in staged]}
+        # No production change during an active call (AGENTS.md section 1): checked last before the first rename; a
+        # call (or an unreadable call state) ends the run with the staged files removed, so nothing changed.
+        wait_for_calls(settings, time.monotonic() + CALL_POLL)
         copies.clear()  # from here on the copies are the undo
         write_record(receipt, record)
         try:

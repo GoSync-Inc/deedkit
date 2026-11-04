@@ -978,12 +978,16 @@ tool. `deploy` (manual and `--auto`) installs it itself (owner 11-04: «дава
 after `prepare` and before any migration or apply, when the file exists and its git blob is not
 the candidate's `services/messaging/messaging_service/backup_runner.py`, it does the script below
 under the runner lock it already holds, for every `runner.json` that exists (messaging's, the
-calendar's and the recordings', all pinning messaging's image): the backup units idle (else the
-run waits like a migration wait), the candidate's attested backup image (its revision label the
-candidate), the new runner's `--check` exit 0 on each `runner.json` as it will be, then a
+calendar's and the recordings', all pinning messaging's image): the backup units idle and the
+candidate's attested backup image pulled (else the run waits like a migration wait; the third
+wait in a row pauses), that image's revision label the candidate, the new runner's `--check` exit 0
+on each `runner.json` as it will be, and, last, no active call (else a call wait); then a
 `.before-<sha>` copy and one rename per file (each `runner.json`, then the runner; owner and mode
 kept), the runner read back by its blob, receipt `<state>/<sha>/backup-runner.json`. A failed
-check or a changed file pauses and leaves the host as it was; a registry error retries. A manual
+check, a wait or a changed file leaves the host as it was. A stop between renames pauses with
+the receipt at `installing`; every `runner.json` moves before the runner, so the old runner may
+run with the new image but never the reverse, and once the pause is removed the next run finishes
+from the `.before-<sha>` copies. A manual
 `apply` still refuses before any stop while the file is not the release's (the refusal names both
 blob ids): install it with the script below. A host without the file runs no backup and is not
 checked.
