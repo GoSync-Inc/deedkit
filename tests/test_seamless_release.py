@@ -1,4 +1,5 @@
 """Synthetic release proof: never connects to a provider or production database."""
+import contextlib
 import copy
 import fcntl
 import json
@@ -1168,6 +1169,90 @@ def test_bootstrap_requires_clean_verified_router_build_receipt(tmp_path, monkey
     with pytest.raises(s.Refused, match='router build receipt'):
         s.bootstrap(cfg, SHA)
     assert list(Path(cfg['http_release']['router']['directory']).iterdir()) == []
+
+
+class PromoteCommand:
+    """`seamless_release.py promote` with its locks, configuration and promotion replaced by recorders; the backup wait
+    is the one under test."""
+
+    def __init__(self, tmp_path, monkeypatch):
+        self.events, self.settings = [], settings(tmp_path)
+        self.digest = s.p.digest(self.settings)
+        monkeypatch.setattr(s.os, 'geteuid', lambda: 0)
+        monkeypatch.setattr(s.p, 'config', lambda path: self.settings)
+        monkeypatch.setattr(s, 'validate_settings', lambda value: value)
+        monkeypatch.setattr(s, 'promote', lambda value, sha, **extra: self.events.append(('promote', sha)) or {'sha': sha})
+        monkeypatch.setattr(s, 'locks', self.locks)
+        monkeypatch.setattr(s.p, 'wait_backup_idle', self.wait_backup_idle)
+        monkeypatch.setattr(s.p, 'time', SimpleNamespace(monotonic=lambda: 1000.0))
+        self.refusal = None
+
+    @contextlib.contextmanager
+    def locks(self, value):
+        self.events.append('locks')
+        try:
+            yield
+        finally:
+            self.events.append('unlocks')
+
+    @contextlib.contextmanager
+    def wait_backup_idle(self, value, deadline):
+        self.events.append(('wait', deadline - 1000.0))
+        if self.refusal:
+            raise self.refusal
+        try:
+            yield 7
+        finally:
+            self.events.append('released')
+
+
+# spec: ANYM-744
+@pytest.mark.parametrize('flags, bound', [([], 2700), (['--backup-wait', '30'], 30), (['--backup-wait', '0'], 0),
+                                          (['--backup-wait', '7200'], 7200)])
+def test_standalone_promote_waits_for_a_backup_inside_its_locks_with_the_bound_of_its_flag(tmp_path, monkeypatch, flags, bound):
+    command = PromoteCommand(tmp_path, monkeypatch)
+    s.main(['promote', '--sha', SHA, *flags])
+    assert command.events == ['locks', ('wait', bound), ('promote', SHA), 'released', 'unlocks']
+
+
+# spec: ANYM-744
+@pytest.mark.parametrize('value', ['-1', '7201', 'ten', '1.5', ''])
+def test_standalone_promote_refuses_a_bad_backup_wait_before_any_write(tmp_path, monkeypatch, capsys, value):
+    command = PromoteCommand(tmp_path, monkeypatch)
+    with pytest.raises(SystemExit) as stopped:
+        s.main(['promote', '--sha', SHA, '--backup-wait', value])
+    assert stopped.value.code == 2 and command.events == []
+    assert 'backup.wait_seconds' in capsys.readouterr().err
+
+
+# spec: ANYM-744
+def test_standalone_promote_past_the_bound_exits_75_with_one_json_line_and_promotes_nothing(tmp_path, monkeypatch, capsys):
+    command = PromoteCommand(tmp_path, monkeypatch)
+    command.refusal = s.p.BackupRunning('personal-os-backup.service', 30, 'Wed 2026-11-04 18:00:01 UTC')
+    with pytest.raises(SystemExit) as stopped:
+        s.main(['promote', '--sha', SHA, '--backup-wait', '30'])
+    printed = capsys.readouterr().out
+    assert stopped.value.code == 75 and printed.count('\n') == 1
+    assert json.loads(printed) == {'status': 'busy', 'code': 'backup_running', 'unit': 'personal-os-backup.service',
+                                   'waited_seconds': 30, 'since': 'Wed 2026-11-04 18:00:01 UTC'}
+    assert command.events == ['locks', ('wait', 30), 'unlocks']
+
+
+# spec: ANYM-744
+@pytest.mark.parametrize('action', ['prepare', 'status', 'bootstrap', 'retire', 'clean'])
+def test_the_other_standalone_commands_never_wait_for_a_backup(tmp_path, monkeypatch, action):
+    command = PromoteCommand(tmp_path, monkeypatch)
+    for name in ('prepare', 'status', 'bootstrap', 'retire', 'clean_command'):
+        monkeypatch.setattr(s, name, lambda *args, **extra: {})
+    s.main([action, '--sha', SHA])
+    assert not any(isinstance(event, tuple) and event[0] == 'wait' for event in command.events)
+
+
+# spec: ANYM-744
+def test_the_http_configuration_and_a_prepared_release_digest_do_not_change_with_the_backup_wait(tmp_path, monkeypatch):
+    command = PromoteCommand(tmp_path, monkeypatch)
+    s.main(['promote', '--sha', SHA, '--backup-wait', '30'])
+    assert s.p.digest(command.settings) == command.digest and 'backup' not in command.settings
 
 
 def test_promotion_preserves_every_fenced_issuer_tombstone(tmp_path, monkeypatch):

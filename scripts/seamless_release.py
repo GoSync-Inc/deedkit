@@ -986,6 +986,18 @@ def clean_command(settings, remove, plan_a_config):
             'disk_free_gib_before': before, 'disk_free_gib_after': disk_free()}
 
 
+def backup_wait_flag(text):
+    """`--backup-wait`: the standalone promote's bound (ANYM-744) with plan A's key and range; the HTTP configuration,
+    whose digest binds prepared releases, carries none."""
+    try:
+        return p.check_backup_wait(int(text))
+    except ValueError:
+        message = f"backup.wait_seconds {text!r} is not an integer from 0 to {p.BACKUP_WAIT_MAX} seconds"
+    except p.Refused as exc:
+        message = str(exc)
+    raise argparse.ArgumentTypeError(message)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['bootstrap', 'prepare', 'promote', 'retire', 'status', 'clean'])
@@ -993,6 +1005,9 @@ def main(argv=None):
     parser.add_argument('--config', default='/etc/deedkit/http-production.json')
     parser.add_argument('--remove', action='store_true', help='clean: remove the listed containers and then old release images')
     parser.add_argument('--plan-a-config', help='clean --remove: the plan A configuration for the image pass')
+    parser.add_argument('--backup-wait', type=backup_wait_flag, default=p.BACKUP_WAIT, metavar='SECONDS',
+                        help=f'promote: wait up to this long (0 to {p.BACKUP_WAIT_MAX}, default {p.BACKUP_WAIT}) for a '
+                             'running backup, then hold its lock; past it exit 75')
     args = parser.parse_args(argv)
     os.umask(0o077)
     try:
@@ -1001,12 +1016,18 @@ def main(argv=None):
         settings = validate_settings(p.config(args.config))
         if args.action in {'bootstrap', 'prepare', 'promote', 'retire'} and not re.fullmatch(r'[0-9a-f]{40}', args.sha or ''):
             raise Refused('an exact lowercase 40-character main SHA is required')
-        with locks(settings):
+        with locks(settings), ExitStack() as held:
+            if args.action == 'promote':
+                # ANYM-744: wait for a running backup inside the locks (deploy's order), then hold its lock.
+                held.enter_context(p.wait_backup_idle(settings, p.time.monotonic() + args.backup_wait))
             result = {'bootstrap': lambda: bootstrap(settings, args.sha), 'prepare': lambda: prepare(settings, args.sha),
                 'promote': lambda: promote(settings, args.sha), 'retire': lambda: retire(settings, args.sha),
                 'status': lambda: status(settings, args.sha),
                 'clean': lambda: clean_command(settings, args.remove, args.plan_a_config)}[args.action]()
         print(json.dumps(result, indent=2))
+    except p.BackupRunning as exc:  # nothing was written
+        print(json.dumps(exc.line()))
+        parser.exit(p.EX_TEMPFAIL)
     except Exception as exc:
         parser.exit(1, 'HTTP release refused: ' + (str(exc) if isinstance(exc, Refused) else type(exc).__name__) + '\n')
 

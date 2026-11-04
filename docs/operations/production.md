@@ -910,6 +910,40 @@ image/config ([platform-cutover.md](platform-cutover.md)). Do not use `down -v`,
 prune unrelated objects or restart a stale calendar writer. Keep the previous
 images until acceptance.
 
+### Waiting for a running backup (ANYM-744)
+
+`apply`, the standalone `seamless_release.py promote` and a manual `deploy` (not `--auto`, not `--dry-run`) wait up to
+`backup.wait_seconds` for a running backup, then hold the runner lock (`.runner.lock`, `DEEDKIT_BACKUP_LOCK`) for
+their own run, so no kit waits for a running backup by hand. Idle is positive: the lock is free, each of
+`personal-os-backup.service`, `deedkit-calendar-backup.service` and `deedkit-calendar-backup-catchup.service` reads
+`inactive` or `failed` (`deactivating`, `activating`, `active`, `reloading` and an unreadable state are busy) and the
+`.unsettled` marker is absent, read again with the lock held. The tool polls every 15 s and holds no lock while it
+sleeps; the bound is overshot by at most one `systemctl` probe. The backup wait runs before the call wait, and the
+lock stays held through it. `deploy` takes the lock once and its inner `apply` and `promote` neither wait nor take it;
+`deploy --auto` is unchanged (the unit's `flock --nonblock` holds the lock and exits 75 at once, and its 13:00-18:59 UTC
+admission stays). `prepare`, `verify`, `status`, `images`, `--dry-run` and `release-plan` never wait.
+
+`backup.wait_seconds` is an optional integer from 0 to 7200 (default 2700; 7200 is the runner's own
+`busy_wait_seconds` maximum, BACKUP.md) in the plan A configuration, outside the configuration digest like `migration`;
+any other value refuses the configuration before any write. 0 keeps the single non-waiting check. The standalone
+`promote` reads the HTTP configuration, whose digest binds prepared releases, so its bound is the flag
+`--backup-wait SECONDS` (same range and default) and that configuration stays unchanged. The wait prints
+`backup check: waiting for ...` and `backup check: idle after N s` on stderr; a release that waited records
+`backup_wait_seconds` in `result.json` (`apply`) or `deploy.json` (`deploy`).
+
+Past the bound the command ends with exit 75 and prints one JSON line,
+`{"status":"busy","code":"backup_running","unit":"<unit, lock or marker>","waited_seconds":N,"since":"<start, if known>"}`
+(a deploy adds `reason`), and nothing is written: no `attempted.json`, no `http-attempted.json`, no pause. Exit 75
+`backup_running` means try again later. It never runs without the lock: a restart in the middle of a capture loses
+the capture (BACKUP.md "stop recovery"). A stale `.unsettled` marker makes every release wait and then refuse naming
+the marker; settle it with `--recover-stop`. A SIGTERM during the wait takes and writes nothing.
+
+A release that would run into a scheduled backup start keeps its
+clock window: the wait does not protect a scheduled start. Windows that stay: those before the scheduled starts, the
+autodeploy unit's 13:00-18:59 UTC admission, the runner-install shell steps ("Backup runner") and the calendar freshness
+unit install. A scheduled backup that starts while a release holds the lock is refused, and what follows differs by
+unit (see "Continuous deployment"). A guarantee that a release never starves a scheduled start is a separate card.
+
 ### Backup runner
 
 The host backup runner (`/opt/personal-os-probe/ops/backup_runner.py`, the
@@ -922,8 +956,8 @@ blob ids, and under `deploy --auto` it pauses the deployer like any refusal
 before a change. A host without the file runs no backup and is not checked.
 The install is one step under the runner's own lock, so no messaging or calendar backup and no
 deploy can start between the check and the hash (a backup started meanwhile refuses
-`backup_job_already_running` and systemd retries it; a deploy exits 75): avoid the minutes
-around 18:00 UTC. No active call. The new runner's read-only `--check` must exit 0 against
+`backup_job_already_running`, then follows its unit's retry behaviour under "Continuous deployment"; a deploy
+waits or exits 75): avoid the minutes around 18:00 UTC; this step keeps its own clock window. No active call. The new runner's read-only `--check` must exit 0 against
 messaging's `runner.json`: exit 3 means an unfinished journal, whose recovery stays under the
 existing rules (`--recover-stop` restarts the collectors it stopped), and the step stops. Any
 failed command stops it (`sh -e`). From the prepared release: when the backup worker changed
@@ -2249,13 +2283,16 @@ before 13:00 ends by 17:03 at the latest (the 4-hour start timeout plus the
 Exclusion: the deploy holds the backup runner's own lock
 (`/opt/personal-os-probe/backups/.runner.lock`, `DEEDKIT_BACKUP_LOCK`) for its
 whole run, so a backup started by hand during a deploy refuses before it stops
-anything (`backup_job_already_running`) and systemd retries it every 30 minutes,
-at most three starts in 8 hours: pause the timer and let a running deploy finish
-before starting a backup by hand. While a backup holds the lock, the deploy
-exits 75 and the run counts as a skip. The calendar's backup runner holds the
+anything (`backup_job_already_running`). What follows is per unit: messaging's
+unit retries every 30 minutes, at most three starts in 8 hours, so a hold across
+those starts loses the day; the calendar's unit waits up to 5400 s for the lock and
+then fails for the day, with no `Restart=`. Pause the timer and let a running
+deploy finish before starting a backup by hand. While a backup holds the lock, the
+`--auto` deploy exits 75 and the run counts as a skip. The calendar's backup runner holds the
 same lock as its `host_lock` (BACKUP.md, Family calendar), and a manual
-`production.py deploy` (without `--auto`) takes it too, without waiting: while a
-backup holds it the deploy returns `busy` (`backup_running`) before any change. Every
+`production.py deploy` (without `--auto`) takes it too, after waiting up to
+`backup.wait_seconds` for a running backup ("Waiting for a running backup"): past the bound the deploy
+returns `busy` (`backup_running`, exit 75) before any change. Every
 deploy, `--auto` too, also returns `busy` while the calendar runner's
 `<lock>.unsettled` marker exists (its worker is not verified stopped; its runner's
 `--recover-stop` or next run removes it). A missing lock directory skips the lock only on a
