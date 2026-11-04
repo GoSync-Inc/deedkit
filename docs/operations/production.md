@@ -1953,11 +1953,12 @@ The tool reads the manifest from the verified main commit in its source mirror, 
 production state (its scratch copies live in private temporary directories) and prints no secret: env files, private
 configurations and key files are read for presence, mode, owner and digests, never printed. Exit 0 prints the plan; exit 2
 prints `{"status": "refused", "refusals": [{"code", "detail"}]}` with one entry per failed precondition. Applying and
-undoing a plan is the next command (ANYM-746); until it exists the plan replaces steps 12b-18 of the ANYM-713 hand plan
-and the edits are made by hand from it.
+undoing a plan is `--apply` and `--undo` (ANYM-746, below); the hand release above stays the fallback.
 
 *Manifest.* Exactly these keys, nothing else: `name` (the file name); `project` (`name`, `files` as repository paths under
-`deploy/`, `env_file` as an absolute host path, `env_required` variable names, `services` as service to build target);
+`deploy/`, `env_file` as an absolute host path, `env_required` variable names, `services` as service to build target,
+`networks`: the internal Compose networks the first start creates once, each `name`, `bridge` and, for a network the
+gateway joins, `gateway_port`, the port the isolation probe checks on every serving gateway);
 `gateway` (`overlay` a repository path or null, and `policy`: `module`, `backend_url`, `tools`, `principals` with their
 `grants`, `key_dir` as an absolute host directory, `key_file_pattern` with `{principal}`, `key_uid`); `egress`
 (`outside` false, or true with `admission_env` (`blocked` and `open` variable names), `canary`, `verify` (a command whose
@@ -2007,7 +2008,48 @@ steps. The output ends with `plan_digest`, the sha256 of the SHA, the manifest b
 policy digest, every overlay digest, the grants, the verify and canary values, the content digests of the env file and of the
 mounted private configuration, the digest of the candidate policy (so a replaced key changes it) and the digests of the resolved Compose documents (the
 project, the plan A gateway and the HTTP gateway, each in its own directory with its own files). Recomputing the plan gives the same digest
-only while none of them changed; the apply command (ANYM-746) refuses a different `--plan-digest`.
+only while none of them changed; `--apply` refuses a different `--plan-digest` (`plan_changed`).
+
+*Apply (ANYM-746).* `enroll --module <module> --sha <sha> --apply --plan-digest <plan_digest>` performs exactly the plan a
+reviewer approved, as root, through the release machinery `deploy` uses. Refusals (exit 2, nothing written) are the plan's
+codes plus `plan_changed` (the recomputed digest, or the manifest, differs), `enrollment_unfinished` (an
+`enrollment.json` that is not undone, or an unfinished apply or HTTP attempt, exists), `configuration_changed` (the
+configuration drifts from the current release before the run) and `active_call`. Under the host locks and the backup wait
+(ANYM-744: exit 75 after the bound, nothing written) the order is: the plan is recomputed and compared; the tool writes the
+pause (its own marker); copies `production.json`, `http-production.json` and the live policy into a root-only directory
+`enrollment-<module>-<sha12>` of the state directory (sha256 in the receipt `enrollment.json`, mode 0600: digests,
+revisions and step names only); installs the overlays by atomic rename from `git show <sha>:<path>` with read-back
+(`overlay_conflict` when the host path holds other content); creates a missing network of the manifest once (`--internal`,
+its bridge, isolated; `network_unsafe` for an existing one that is not internal or an undeclared external one); tags the
+attested image `deedkit-<target>:enroll-<sha>` (never `--build`); re-reads the private configuration immediately before `up`
+(`private_config_forbidden_key`) and requires the resolved admission to be `required` (`egress_admission_not_required`);
+`up -d --no-build --pull never`, health, and for outside egress the confinement check from inside the container with a host
+positive control per blocked target but the canary (`confinement_check_failed`); edits both configuration files and the
+policy atomically (`deedkit-gateway --check` first); plan A through `deploy_plan_a` (its call wait, health wait and automatic
+`rollback`); plan B `prepare` and `promote`; `status`; the isolation probe of every serving gateway generation on a
+gateway-joined network (`isolation_check_failed`; the addresses are probed, never written); and last the real
+`configuration_drift` and the release checks. Only if they report the new release current and the pause is still the
+marker this run wrote, the tool removes it. The calls are checked immediately before the first start, before the
+configuration and policy writes and before plan A (`active_call`: the run stops there, the pause stays). It never retries an
+uncertain step. The capabilities read-back through the gateway needs a principal key and stays the owner-confirmed first read
+of the module's card.
+
+*Failure.* A failure before plan B's promotion rolls back plan A through `rollback`, restores the configuration files byte
+for byte and the policy with a revision above anything a gateway may have loaded (never a lower number), stops only the new
+module (`docker compose stop`, never `down`, never a database), keeps the pause and writes the failing step to
+`enrollment.json` (`status: stopped`). A recovery that fails says `production state is unknown, inspect it` and changes
+nothing more. Plan B has no rollback of its own: a failure at or after promotion changes nothing more (a failed isolation
+probe still stops the module), keeps the pause, records the failing step and the HTTP status it read in `enrollment.json`
+(`status: http-manual`) and says `HTTP recovery is manual, inspect it` (seamless-release.md); automatic recovery of the
+previous HTTP generation is a separate card. A crash leaves the pause and the receipt: the next `--apply` refuses
+(`enrollment_unfinished`) until `--undo` or an inspection clears them. One receipt serves one enrollment at a time.
+
+*Undo.* `enroll --module <module> --undo` (after the call check; `enrollment_not_applied` unless the receipt says
+`applied`; `configuration_changed` or `policy_changed` when a file differs from what the apply wrote, which is then undone
+by hand) restores both configuration files from the copies byte for byte (sha256 equal), installs the backed-up policy with
+a higher revision (it removes the module), stops the module's services and removes nothing else (overlays, networks and
+the enroll tag stay). Autodeploy stays paused: a SHA prepared with the module can never be prepared again, so deploys
+resume at the next newer green main SHA once the pause is removed.
 
 *Review sequence.* The manifest pull request is reviewed as code like any change under `deploy/` (the review-protocol
 signal grep already matches `deploy/modules/`; Astra r1 when it adds grants or outside egress). After it merged, the plan
@@ -2024,7 +2066,7 @@ activation stays its own gated step (the plan runs the read-only verify and refu
 read through a provider is the owner-confirmed live read of the module's card. Sends, calls, ACKs, pairing, provider-session
 changes and allowlist changes are never part of a manifest.
 
-**Undo**, in order: remove the module, tools, grants and credential from the policy (new revision); stop
+**Undo by hand** (the tool's `--undo` above does the same): remove the module, tools, grants and credential from the policy (new revision); stop
 `recordings-api` only (`docker compose $F stop recordings-api`) and leave autodeploy paused, which is the
 holding state; at a NEWER green `main` SHA (a docs-only pull request creates one) restore both configuration backups
 and repeat the hand release sequence above (a SHA prepared with recordings can never be prepared again); `deploy

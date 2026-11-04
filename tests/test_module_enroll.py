@@ -1,4 +1,5 @@
 """`production.py enroll --plan` (ANYM-745): the module manifest, its refusal codes and the read-only plan."""
+import contextlib
 import copy
 import hashlib
 import io
@@ -244,6 +245,12 @@ MANIFEST_REFUSALS = [
     ("manifest_invalid", set_path("egress", "controls", value={"dns_env": "lower"})),
     ("manifest_invalid", delete_path("private_config", "credential_files")),
     ("manifest_invalid", set_path("private_config", "credential_files", value=[])),
+    ("manifest_invalid", delete_path("project", "networks")),
+    ("manifest_invalid", set_path("project", "networks", value="net")),
+    ("manifest_unknown_key", set_path("project", "networks", 0, "extra", value=1)),
+    ("manifest_invalid", set_path("project", "networks", 0, "bridge", value="Bad Bridge")),
+    ("manifest_invalid", set_path("project", "networks", 0, "gateway_port", value=0)),
+    ("manifest_invalid", set_path("project", "networks", 1, "name", value="deedkit-recordings-backend")),
 ]
 
 
@@ -775,6 +782,536 @@ def test_each_reviewed_input_changes_the_plan_digest(tmp_path, monkeypatch, chan
     before = host.plan()["plan_digest"]
     change(host)
     assert host.plan()["plan_digest"] != before
+
+
+IMAGE_ID = "sha256:" + "c" * 64
+GATEWAY_IP = "172.30.0.5"
+OVERLAY_EVENTS = ["overlay", "overlay", "network", "network", "tag", "up", "edit:production", "edit:http", "edit:policy",
+                  "prepare", "apply", "seamless prepare", "seamless promote", "status", "drift"]
+
+
+class Applier(Enroller):
+    """`enroll --apply` on a synthetic host: real configuration files, a recorder for every mutation and release step
+    (`events`, each with whether the pause existed), and hooks to inject a failure (`failures`) or a call (`triggers`)
+    right after a named event."""
+
+    def __init__(self, tmp_path, monkeypatch, **kwargs):
+        super().__init__(tmp_path, monkeypatch, **kwargs)
+        from scripts import seamless_release as s
+        self.s, self.events, self.triggers, self.failures, self.inputs = s, [], {}, {}, []
+        self.http_state, self.tagged, self.networks = tmp_path / "http-state", set(), set()
+        for directory in (self.http_state, tmp_path / "global"):
+            directory.mkdir(mode=0o700)
+        self.identities, self.before_identities = {"collector": "old", "worker": "old"}, {"collector": "old", "worker": "old"}
+        self.admission, self.isolated, self.confined, self.controlled, self.healthy = "required", True, True, True, True
+        self.up = None
+        self.repo["scripts/recordings_egress_check.py"] = b"print('ok')\n"
+        self.config_path, self.http_path = tmp_path / "production.json", tmp_path / "http-production.json"
+        self.sync()
+        monkeypatch.setattr(p, "http_release_tool", lambda: s)
+        monkeypatch.setattr(p, "main_history", lambda state: self.root / "mirror")
+        monkeypatch.setattr(p, "published", lambda target, sha: {
+            "reference": f"ghcr.io/gosync-inc/deedkit-{target}@{IMAGE_ID}", "digest": IMAGE_ID, "config_digest": IMAGE_ID})
+        monkeypatch.setattr(p, "names_revision", lambda image, sha, dockerfile, recipe=None: True)
+        monkeypatch.setattr(p, "run_input", self.run_input)
+        monkeypatch.setattr(p, "backup_gate", self.gate)
+        monkeypatch.setattr(p, "ENROLL_HEALTH_SECONDS", 0)
+        monkeypatch.setattr(p, "ENROLL_HEALTH_POLL", 0)
+        monkeypatch.setattr(p, "prepare", self.prepare)
+        monkeypatch.setattr(p, "apply", self.release_apply)
+        monkeypatch.setattr(p, "rollback", self.release_rollback)
+        real_replace, real_drift = p.replace_file, p.configuration_drift
+        def replace(path, content, uid, gid, mode):
+            real_replace(path, content, uid, gid, mode)
+            self.event({"production.json": "edit:production", "http-production.json": "edit:http",
+                        "policy.json": "edit:policy"}.get(Path(path).name, "overlay"))
+        def drift(*args):
+            self.event("drift")
+            return real_drift(*args)
+        monkeypatch.setattr(p, "replace_file", replace)
+        monkeypatch.setattr(p, "configuration_drift", drift)
+        monkeypatch.setattr(s, "validate_settings", lambda value: value)
+        monkeypatch.setattr(s, "GLOBAL_LOCK", tmp_path / "global")
+        monkeypatch.setattr(s, "locks", lambda settings: contextlib.nullcontext())
+        monkeypatch.setattr(s, "prepare", self.http_prepare)
+        monkeypatch.setattr(s, "promote", self.http_promote)
+        monkeypatch.setattr(s, "status", self.http_status)
+        self.baseline()
+
+    def sync(self):
+        for path, value in ((self.config_path, self.settings), (self.http_path, self.http)):
+            path.write_text(json.dumps(value))
+            path.chmod(0o600)
+
+    def baseline(self):
+        """BASE as autodeploy leaves it: applied, the HTTP generation serving, nothing drifting."""
+        self.record_current(BASE, self.settings)
+        p.write(self.http_state / "http-current.json", {"sha": BASE, "status": "serving", "config_digest": p.digest(self.http)})
+
+    def record_current(self, sha, settings):
+        (self.state / sha).mkdir(exist_ok=True)
+        p.write(self.state / sha / "prepared.json", {"sha": sha, "config_digest": p.settings_digest(settings)})
+        projects = [{"name": project["name"], "after_digest": p.digest(json.loads(self.run(
+            p.compose(project) + ["config", "--format", "json"])))} for project in settings["projects"]]
+        p.write(self.state / "current.json", {"sha": sha, "status": "applied", "rollback": {"version": 1, "projects": projects}})
+
+    def event(self, name):
+        self.events.append((name, p.PAUSE.exists()))
+        if name in self.triggers:
+            self.triggers.pop(name)()
+        if name in self.failures:
+            raise self.failures.pop(name)
+
+    @contextlib.contextmanager
+    def gate(self, settings, bound):
+        self.event("gate")
+        yield 0
+
+    def run_input(self, argv, data, **kwargs):
+        self.inputs.append((argv, data))
+        if argv[0] == sys.executable:
+            passed = self.controlled
+        elif any(item.endswith(":13240") for item in argv):
+            passed = self.isolated
+        else:
+            passed = self.confined
+        return json.dumps({"passed": passed})
+
+    def run(self, argv, **kwargs):
+        if argv[0] == "docker":
+            sub = argv[1]
+            if sub == "compose" and "up" in argv:
+                self.calls.append(argv)
+                self.up = (argv, kwargs.get("env"))
+                self.event("up")
+                return ""
+            if sub == "compose" and "stop" in argv:
+                self.calls.append(argv)
+                self.event("stop")
+                return ""
+            if sub == "ps" and "--filter" in argv:
+                self.calls.append(argv)
+                if any(item.startswith("network=") for item in argv):
+                    return "gw1\tgateway\nrouter1\trouter\n"
+                return "Up 3 seconds (healthy)\n" if self.healthy else "Up 3 seconds (unhealthy)\n"
+            handled = {"pull": "", "inspect": GATEWAY_IP + "\n", "exec": ""}
+            if sub in handled:
+                self.calls.append(argv)
+                return handled[sub]
+            if sub == "tag":
+                self.calls.append(argv)
+                self.tagged.add(argv[3])
+                self.event("tag")
+                return ""
+            if sub == "image" and argv[2] == "inspect":
+                self.calls.append(argv)
+                return IMAGE_ID + "\n"
+            if sub == "image" and argv[2] == "ls":
+                self.calls.append(argv)
+                return IMAGE_ID + "\n" if argv[-1] in self.tagged else ""
+            if sub == "network":
+                self.calls.append(argv)
+                if argv[2] == "ls":
+                    name = argv[4][len("name=^"):-1]
+                    return name + "\n" if name in self.networks else ""
+                if argv[2] == "inspect":
+                    return "true\n"
+                self.networks.add(argv[-1])
+                self.event("network")
+                return ""
+        return super().run(argv, **kwargs)
+
+    def compose(self, argv):
+        document = json.loads(super().compose(argv))
+        if document["services"]:
+            document["services"]["recordings-api"]["environment"] = {"RECORDINGS_EGRESS_ADMISSION": self.admission}
+            document["networks"] = {
+                "recordings-backend": {"name": "deedkit-recordings-backend", "external": True},
+                "recordings-router": {"name": "deedkit-recordings-router", "external": True},
+                "recordings-egress": {"name": "deedkit-recordings_recordings-egress", "driver": "bridge"}}
+        return json.dumps(document)
+
+    # plan A and plan B: recorded instead of run
+    def prepare(self, settings, sha):
+        self.event("prepare")
+        (self.state / sha).mkdir()
+        p.write(self.state / sha / "prepared.json", {"sha": sha, "config_digest": p.settings_digest(settings)})
+
+    def release_apply(self, settings, sha, **kwargs):
+        p.write(self.state / sha / "attempted.json", {"sha": sha})
+        self.identities = {name: "new" for name in self.identities}
+        try:
+            self.event("apply")
+        except p.Refused:
+            p.write(self.state / sha / "result.json", {"sha": sha, "status": "unhealthy"})
+            raise
+        p.write(self.state / sha / "result.json", {"sha": sha, "status": "applied"})
+        self.record_current(sha, settings)
+
+    def release_rollback(self, settings, sha, http=None):
+        self.event("rollback")
+        self.identities = dict(self.before_identities)
+        p.write(self.state / sha / "rollback.json", {"sha": sha, "status": "rolled-back"})
+
+    def http_prepare(self, http, sha):
+        self.event("seamless prepare")
+        (self.http_state / sha).mkdir()
+        p.write(self.http_state / sha / "http-prepared.json", {"sha": sha})
+
+    def http_promote(self, http, sha):
+        p.write(self.http_state / sha / "http-attempted.json", {"status": "switching"})
+        try:
+            self.event("seamless promote")
+        except p.Refused:
+            p.write(self.http_state / sha / "http-attempted.json", {"status": "recovery-required"})
+            raise
+        p.write(self.http_state / sha / "http-attempted.json", {"status": "serving"})
+        p.write(self.http_state / "http-current.json", {"sha": sha, "status": "serving", "config_digest": p.digest(http)})
+        return {"sha": sha, "status": "serving"}
+
+    def http_status(self, http, sha):
+        self.event("status")
+        return {"sha": sha, "generation": "g2", "status": "serving"}
+
+    # commands
+    def command(self, *flags):
+        args = p.argument_parser().parse_args(["enroll", "--module", "recordings", "--sha", SHA, "--config", str(self.config_path),
+                                               "--http-config", str(self.http_path), *flags])
+        return p.enroll_command(args)
+
+    def apply(self, digest=None):
+        return self.command("--apply", "--plan-digest", digest or self.plan()["plan_digest"])
+
+    def undo(self):
+        return self.command("--undo")
+
+    def receipt(self):
+        return json.loads((self.state / "enrollment.json").read_text())
+
+    def names(self):
+        return [name for name, _ in self.events]
+
+    def held(self):
+        """The events inside the run: while this run held the pause."""
+        return [name for name, paused in self.events if paused]
+
+    def files(self):
+        return {path.name: path.read_bytes() for path in (self.config_path, self.http_path, self.policy)}
+
+    def mutations(self):
+        return [name for name in self.names() if name not in ("gate", "drift")]
+
+
+def fail_at(host, point, error="boom"):
+    host.failures[point] = p.Refused(error)
+    return host.apply()
+
+
+# spec: ANYM-746
+@pytest.mark.parametrize("change", [another_config_byte, another_http_config, another_grant, another_live_policy,
+                                    another_overlay, another_env_byte, another_private_byte, another_state_dir])
+def test_apply_refuses_a_plan_that_changed_since_it_was_approved_before_any_write(tmp_path, monkeypatch, change):
+    host = Applier(tmp_path, monkeypatch)
+    approved = host.plan()["plan_digest"]
+    change(host)
+    host.sync()
+    before = host.files()
+    result = host.apply(approved)
+    assert result == {"status": "refused", "refusals": [{"code": "plan_changed", "detail": result["refusals"][0]["detail"]}]}
+    assert host.mutations() == [] and host.files() == before
+    assert not p.PAUSE.exists() and not (host.state / "enrollment.json").exists()
+
+
+# spec: ANYM-746
+def test_apply_needs_the_reviewed_digest_and_exactly_one_mode(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    for flags in ([], ["--apply"], ["--apply", "--plan-digest", "x"], ["--plan", "--plan-digest", "a" * 64],
+                  ["--plan", "--undo"]):
+        with pytest.raises(p.Refused):
+            host.command(*flags)
+    assert host.apply("0" * 64)["refusals"][0]["code"] == "plan_changed" and host.mutations() == []
+
+
+# spec: ANYM-746
+def test_apply_runs_every_step_in_one_order_under_the_pause_and_removes_it_last(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    before = host.files()
+    result = host.apply()
+    assert result["status"] == "enrolled", result
+    assert host.names()[0] == "gate" and host.held() == OVERLAY_EVENTS  # backup wait first; every step under the pause
+    assert not p.PAUSE.exists() and host.names()[-1] == "drift"
+    receipt = host.receipt()
+    assert receipt["status"] == "applied" and receipt["steps"] == [
+        "backup", "overlays", "first_start", "configuration", "policy", "plan_a", "plan_b", "status", "isolation", "checks",
+        "complete"]
+    assert (host.state / "enrollment.json").stat().st_mode & 0o777 == 0o600
+    for name, path in (("production", host.config_path), ("http", host.http_path), ("policy", host.policy)):
+        copy = Path(receipt["files"][name]["backup"])
+        assert copy.read_bytes() == before[path.name] and copy.stat().st_mode & 0o777 == 0o600
+        assert receipt["files"][name]["after_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert json.loads(host.policy.read_text())["revision"] == 23
+    assert [project["name"] for project in json.loads(host.config_path.read_text())["projects"]] == [
+        "deedkit-gateway", "deedkit-recordings"]
+    assert (host.deploy / "compose.gateway-recordings.yaml").read_bytes() == GATEWAY_OVERLAY
+
+
+# spec: ANYM-746
+def test_the_first_start_uses_the_attested_image_under_an_enroll_tag_and_never_builds(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    assert host.apply()["status"] == "enrolled"
+    argv, env = host.up
+    assert "--no-build" in argv and argv[argv.index("--pull") + 1] == "never" and "--build" not in argv
+    assert env["DEEDKIT_VERSION"] == f"enroll-{SHA}"
+    assert host.tagged == {f"deedkit-recordings:enroll-{SHA}"}
+    tag = next(call for call in host.calls if call[:2] == ["docker", "tag"])
+    assert tag[2] == f"ghcr.io/gosync-inc/deedkit-recordings@{IMAGE_ID}"
+    created = [call for call in host.calls if call[:3] == ["docker", "network", "create"]]
+    assert [call[-1] for call in created] == ["deedkit-recordings-backend", "deedkit-recordings-router"]
+    assert all("--internal" in call for call in created)
+    assert not any(call[:2] in (["docker", "build"], ["docker", "rm"]) or "down" in call for call in host.calls)
+
+
+# spec: ANYM-746
+def test_apply_waits_for_a_running_backup_before_it_writes_anything(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    @contextlib.contextmanager
+    def busy(settings, bound):
+        raise p.BackupRunning("deedkit-backup.service", 0)
+        yield
+    monkeypatch.setattr(p, "backup_gate", busy)
+    with pytest.raises(p.BackupRunning):
+        host.apply()
+    assert host.mutations() == [] and not p.PAUSE.exists() and not (host.state / "enrollment.json").exists()
+
+
+# spec: ANYM-746
+def test_a_call_active_at_apply_is_refused_before_the_pause(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    plan = host.plan()["plan_digest"]
+    host.active = ["call-1"]
+    assert host.apply(plan)["refusals"][0]["code"] == "call_active"
+    assert host.mutations() == [] and not p.PAUSE.exists()
+
+
+# spec: ANYM-746
+@pytest.mark.parametrize("after, stopped_before, started", [("overlay", "up", False), ("up", "edit:production", True),
+                                                             ("edit:policy", "prepare", True)])
+def test_a_call_that_starts_between_steps_stops_the_run_there_with_the_pause_kept(tmp_path, monkeypatch, after, stopped_before,
+                                                                                  started):
+    host = Applier(tmp_path, monkeypatch)
+    before = host.files()
+    host.triggers[after] = lambda: setattr(host, "active", ["call-1"])
+    result = host.apply()
+    assert result["status"] == "stopped" and result["code"] == "active_call", result
+    assert stopped_before not in host.names() and p.PAUSE.exists()
+    assert ("stop" in host.names()) is started
+    assert host.files()["production.json"] == before["production.json"] and host.files()["http-production.json"] == before["http-production.json"]
+    assert host.receipt()["status"] == "stopped"
+
+
+# spec: ANYM-746
+@pytest.mark.parametrize("point, started, rolled", [
+    ("overlay", False, False), ("network", False, False), ("tag", False, False), ("up", True, False),
+    ("edit:production", True, False), ("edit:http", True, False), ("edit:policy", True, False), ("apply", True, True),
+    ("seamless prepare", True, True)])
+def test_a_failure_before_promotion_restores_the_projects_the_files_and_the_policy_and_keeps_the_pause(
+        tmp_path, monkeypatch, point, started, rolled):
+    host = Applier(tmp_path, monkeypatch)
+    before = host.files()
+    result = fail_at(host, point)
+    assert result["status"] == "stopped" and result["failed_step"] and "recovery" in result, result
+    assert p.PAUSE.exists() and host.receipt()["status"] == "stopped"
+    assert host.files()["production.json"] == before["production.json"]
+    assert host.files()["http-production.json"] == before["http-production.json"]
+    restored = json.loads(host.policy.read_text())
+    if point in ("edit:policy", "apply", "seamless prepare"):  # a revision above anything a gateway may have loaded
+        assert restored["revision"] == 24 and {**restored, "revision": 22} == POLICY
+    else:
+        assert host.files()["policy.json"] == before["policy.json"]
+    assert host.names().count("stop") == (1 if started else 0)
+    assert host.names().count("rollback") == (1 if rolled else 0)
+    assert host.identities == host.before_identities
+    assert "prepare" not in host.names() or point in ("apply", "seamless prepare")
+
+
+# spec: ANYM-746
+def test_a_failed_recovery_says_the_state_is_unknown_and_changes_nothing_more(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    host.failures["rollback"] = p.Refused("docker is gone")
+    result = fail_at(host, "apply")
+    edited = host.files()
+    assert result["status"] == "stopped" and "production state is unknown, inspect it" in json.dumps(result)
+    assert host.receipt()["status"] == "unknown" and p.PAUSE.exists()
+    assert json.loads(host.config_path.read_text())["projects"][-1]["name"] == "deedkit-recordings"  # not restored
+    assert "stop" not in host.names() and edited == host.files()
+
+
+# spec: ANYM-746
+@pytest.mark.parametrize("point", ["seamless promote", "status"])
+def test_a_failure_at_or_after_promotion_changes_nothing_more_and_says_http_recovery_is_manual(tmp_path, monkeypatch, point):
+    host = Applier(tmp_path, monkeypatch)
+    result = fail_at(host, point)
+    assert result["status"] == "stopped" and "HTTP recovery is manual, inspect it" in result["recovery"]
+    assert set(host.names()[host.names().index(point) + 1:]) <= {"status"} and p.PAUSE.exists()  # a read, no mutation
+    assert host.receipt()["status"] == "http-manual" and "http" in host.receipt()
+    assert json.loads(host.config_path.read_text())["projects"][-1]["name"] == "deedkit-recordings"
+    assert json.loads(host.policy.read_text())["revision"] == 23
+
+
+# spec: ANYM-746
+def test_completion_needs_the_real_drift_helper_and_a_pause_this_run_owns(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    original = host.release_apply
+    def drifting(settings, sha, **kwargs):
+        original(settings, sha, **kwargs)
+        current = p.read(host.state / "current.json")
+        current["rollback"]["projects"][0]["after_digest"] = "0" * 64  # the applied Compose configuration differs
+        p.write(host.state / "current.json", current)
+    monkeypatch.setattr(p, "apply", drifting)
+    result = host.apply()
+    assert result["status"] == "stopped" and "Compose configuration" in result["reason"] and p.PAUSE.exists()
+
+
+# spec: ANYM-746
+def test_the_pause_is_left_when_another_writer_replaced_it_during_the_run(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    host.triggers["status"] = lambda: p.PAUSE.write_text("someone else paused autodeploy\n")
+    result = host.apply()
+    assert result["status"] == "stopped" and p.PAUSE.read_text() == "someone else paused autodeploy\n"
+
+
+# spec: ANYM-746
+def test_a_module_whose_admission_is_not_required_is_never_started(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    host.admission = "optional"
+    result = host.apply()
+    assert result["code"] == "egress_admission_not_required" and "up" not in host.names() and p.PAUSE.exists()
+
+
+# spec: ANYM-746
+def test_an_archive_key_added_after_the_plan_refuses_the_start(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    host.triggers["tag"] = lambda: (host.state_dir / "config.json").write_text(json.dumps({**STATE_CONFIG, "archive": {"path": "/x"}}))
+    result = host.apply()
+    assert result["code"] == "private_config_forbidden_key" and "up" not in host.names()
+
+
+# spec: ANYM-746
+def test_the_confinement_check_runs_in_the_container_with_a_host_control_per_blocked_target(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    assert host.apply()["status"] == "enrolled"
+    inside = next(argv for argv, _ in host.inputs if argv[0] == "docker" and "check" in argv and not any(a.endswith(":13240") for a in argv))
+    assert inside[inside.index("exec"):inside.index("exec") + 3] == ["exec", "-T", "recordings-api"]
+    assert ["--blocked", "192.0.2.254:9"] == inside[inside.index("--blocked"):inside.index("--blocked") + 2]  # the canary is probed
+    host_check = next(argv for argv, _ in host.inputs if argv[0] == sys.executable)
+    controls = [host_check[index + 1] for index, item in enumerate(host_check) if item == "--control"]
+    assert controls == ["10.99.0.1:22", "100.64.0.5:22"]  # each blocked target but the canary
+
+
+# spec: ANYM-746
+@pytest.mark.parametrize("attribute, code", [("confined", "confinement_check_failed"), ("controlled", "confinement_check_failed")])
+def test_a_failed_confinement_check_or_positive_control_stops_before_the_configuration_is_edited(tmp_path, monkeypatch, attribute, code):
+    host = Applier(tmp_path, monkeypatch)
+    setattr(host, attribute, False)
+    result = host.apply()
+    assert result["code"] == code and "edit:production" not in host.names() and host.names().count("stop") == 1
+
+
+# spec: ANYM-746
+def test_a_gateway_check_that_fails_after_the_configuration_edit_restores_everything(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    before = host.files()
+    host.triggers["edit:http"] = lambda: setattr(host, "gateway_valid", False)
+    result = host.apply()
+    assert result["code"] == "policy_check_failed" and host.files()["production.json"] == before["production.json"]
+    assert host.files()["policy.json"] == before["policy.json"] and "edit:policy" not in host.names()
+
+
+# spec: ANYM-746
+def test_a_failed_isolation_probe_stops_the_module_and_keeps_the_pause_and_no_address_is_written(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    host.isolated = False
+    result = host.apply()
+    assert result["code"] == "isolation_check_failed" and host.names().count("stop") == 1 and p.PAUSE.exists()
+    for text in [path.read_text() for path in (host.config_path, host.http_path, host.policy, host.state / "enrollment.json")]:
+        assert GATEWAY_IP not in text and SECRET not in text
+
+
+# spec: ANYM-746
+def test_the_isolation_probe_covers_every_serving_gateway_but_writes_no_address(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    assert host.apply()["status"] == "enrolled"
+    probes = [argv for argv, _ in host.inputs if any(a.endswith(":13240") for a in argv)]
+    assert len(probes) == 1 and f"{GATEWAY_IP}:13240" in probes[0]
+    assert any(call[:2] == ["docker", "exec"] and GATEWAY_IP in call for call in host.calls)  # the positive control
+    for path in (host.config_path, host.http_path, host.policy, host.state / "enrollment.json"):
+        assert GATEWAY_IP not in path.read_text() and SECRET not in path.read_text()
+
+
+# spec: ANYM-746
+def test_a_second_apply_refuses_until_the_first_is_undone_or_inspected(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    approved = host.plan()["plan_digest"]
+    fail_at(host, "up")
+    assert host.apply(approved)["refusals"][0]["code"] == "enrollment_unfinished"
+
+
+# spec: ANYM-746
+def test_undo_restores_the_files_byte_for_byte_raises_the_policy_revision_and_leaves_autodeploy_paused(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    before = host.files()
+    assert host.apply()["status"] == "enrolled"
+    host.events.clear()
+    result = host.undo()
+    assert result["status"] == "undone" and "newer green main SHA" in result["note"], result
+    assert host.files()["production.json"] == before["production.json"]
+    assert host.files()["http-production.json"] == before["http-production.json"]
+    restored = json.loads(host.policy.read_text())
+    assert restored["revision"] == 24 and {**restored, "revision": 22} == POLICY
+    assert p.PAUSE.exists() and host.receipt()["status"] == "undone"
+    assert host.names()[-1] == "stop"
+    assert (host.deploy / "compose.gateway-recordings.yaml").exists() and host.networks  # nothing else is removed
+    assert not any(call[:3] in (["docker", "network", "rm"], ["docker", "image", "rm"]) or "down" in call for call in host.calls)
+
+
+# spec: ANYM-746
+def test_undo_refuses_during_a_call_and_changes_nothing(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    assert host.apply()["status"] == "enrolled"
+    after = host.files()
+    host.events.clear()
+    host.active = ["call-1"]
+    assert host.undo()["refusals"][0]["code"] == "active_call"
+    assert host.files() == after and host.mutations() == [] and not p.PAUSE.exists()
+
+
+# spec: ANYM-746
+@pytest.mark.parametrize("edit, code", [("production", "configuration_changed"), ("policy", "policy_changed")])
+def test_undo_refuses_when_a_file_changed_since_the_enrollment(tmp_path, monkeypatch, edit, code):
+    host = Applier(tmp_path, monkeypatch)
+    assert host.apply()["status"] == "enrolled"
+    target = host.config_path if edit == "production" else host.policy
+    target.write_text(target.read_text() + " ")
+    after = host.files()
+    assert host.undo()["refusals"][0]["code"] == code and host.files() == after and not p.PAUSE.exists()
+
+
+# spec: ANYM-746
+def test_undo_refuses_without_an_applied_enrollment(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    assert host.undo()["refusals"][0]["code"] == "enrollment_not_applied"
+    fail_at(host, "up")
+    assert host.undo()["refusals"][0]["code"] == "enrollment_not_applied"
+
+
+# spec: ANYM-746
+def test_the_enrollment_flags_and_codes_are_documented_and_the_manifest_declares_its_networks():
+    docs = " ".join((ROOT / "docs/operations/production.md").read_text().split())
+    for text in ("--apply --plan-digest", "--undo", "enrollment.json", "HTTP recovery is manual, inspect it",
+                 "production state is unknown, inspect it"):
+        assert text in docs
+    assert [item["name"] for item in json.loads(RECORDINGS)["project"]["networks"]] == [
+        "deedkit-recordings-backend", "deedkit-recordings-router"]
 
 
 # spec: ANYM-745
