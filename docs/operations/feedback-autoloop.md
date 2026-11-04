@@ -60,8 +60,9 @@ reporter", "paused" and "answered, no change needed" (ANYM-573).
 Additive migrations (owner 2026-10-28, «Да, добавление миграции автоматически с копией.»; the
 copy is autodeploy's pre-migration copy and rehearsal, docs/operations/production.md). The
 controller lets a PR's SQL through only when it is all of: added messaging
-`migrations/NNN_*.sql` or calendar `schema_vN.sql` files that `unattended_class` (this checkout's
-`migration_rollout.py`, never the PR's) names `expand`, and modified messaging `*_role.sql` or
+`migrations/NNN_*.sql` or calendar `schema_vN.sql` files that `additive_class` (this checkout's
+`migration_rollout.py`, never the PR's; ANYM-596's DROP-free expand, kept when deploy moved to ANYM-743's
+wider `unattended_class`) names `expand`, and modified messaging `*_role.sql` or
 calendar `roles.sql` files whose appended text `role_class` names `additive` (GRANTs to roles the
 file already grants to, the 050 policy or calendar guard on a new table) with every GRANT on a table
 those same migrations create by a plain `CREATE TABLE`, or naming, for each privilege, only columns

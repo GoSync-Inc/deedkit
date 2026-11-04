@@ -88,8 +88,10 @@ continued after a newline, an unclosed quote or comment), is `manual`.
 applies the others to PostgreSQL and fails unless the catalog only gained those kinds of change
 (row security included; a widened list must be a superset of numbers or strings). Nothing runs a migration because of its class: `deploy` only names it in its pause.
 The unattended entry point `python -m messaging_service migrate-expand --plan <file>` (ANYM-596; `migrate`
-is unchanged) runs only files whose `unattended_class` is `expand`: a `rollout_class` `expand` with no
-DROP of any kind, so the widening pair stays manual. Role files may only grow: `role_class` calls the
+is unchanged) runs only files whose `unattended_class` is `expand` (ANYM-743): a file with a rollout header
+whose `risk_class` is non-critical (no statement that deletes or rewrites rows or drops stored data, production.md
+"Migration risk tiers"), with no `CONCURRENTLY` and no name over 63 bytes; the deployer's rehearsal on a copy then
+refuses a removed table or column, a changed column type and any row write. Role files may only grow: `role_class` calls the
 appended text `additive` when the file still starts with its old text byte for byte and every appended
 statement is a comment, a `GRANT <SELECT|INSERT|UPDATE|DELETE|REFERENCES>[(<columns>)], ... ON [TABLE]
 <table>, ... TO <role>` to a role the old text already grants to, or 050's permissive `DO ... CREATE POLICY`

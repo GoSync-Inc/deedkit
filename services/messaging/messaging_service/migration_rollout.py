@@ -53,10 +53,13 @@ def closing(text, at, quote, escapes=False):
         else: return end + 1
 
 
-def tokens(text):
+def tokens(text, positions=None):
     """(kind, value) pairs; words are lower-cased, quotes and comments resolved. Anything else is Untokenizable."""
-    found, at = [], 0
+    found, at, begin = [], 0, 0
     while at < len(text):
+        if positions is not None and len(positions) < len(found):
+            positions.append(begin)  # the start of the token the last pass appended
+        begin = at
         if PREFIXED.match(text, at): raise Untokenizable(at)
         if text.startswith(("'", "e'", "E'"), at):
             escapes = text[at] != "'"
@@ -92,6 +95,8 @@ def tokens(text):
             raise Untokenizable(at)
         elif kind == 'word': found.append(('word', value.lower()))
         elif kind not in ('space', 'line'): found.append((kind, value))
+    if positions is not None and len(positions) < len(found):
+        positions.append(begin)
     return found
 
 
@@ -445,13 +450,150 @@ def rollout_class(text, inventory=None):
     return 'manual' if declared == 'manual' else classify(text, inventory)
 
 
-def unattended_class(text, inventory=None):
-    """What `migrate-expand` may run without a person (ANYM-596): a `rollout_class` `expand` with no DROP of any
-    kind, so the CHECK widening pair, which drops its constraint first, stays `manual` here."""
+# ANYM-743 (owner 11-04: backups only in critical cases; docs/operations/production.md "Migration risk tiers"):
+# `critical` deletes or rewrites existing rows or drops stored data. Fail-closed: a statement is non-critical only in
+# the forms named here; every other statement, and text that does not tokenize, is critical.
+CRITICAL_FIRST = {'delete': 'DELETE', 'update': 'UPDATE', 'merge': 'MERGE', 'truncate': 'TRUNCATE', 'copy': 'COPY',
+                  'select': 'SELECT', 'call': 'CALL', 'with': 'WITH', 'perform': 'PERFORM', 'execute': 'EXECUTE'}
+# CREATE [OR REPLACE] [UNIQUE] <kind>: new objects; a function or trigger body is defined, not run.
+CREATED = {'table', 'index', 'unique', 'sequence', 'view', 'materialized', 'function', 'procedure', 'trigger',
+           'constraint', 'type', 'domain', 'policy', 'schema', 'role', 'aggregate', 'rule', 'statistics', 'cast'}
+# DROP <kind> without CASCADE: objects that hold no rows (a DROP of one a column uses fails without CASCADE).
+DROPPED = {'index', 'trigger', 'function', 'procedure', 'policy', 'view', 'type', 'domain', 'aggregate', 'rule',
+           'role', 'statistics', 'cast'}
+# In a DO body: the statements that may follow BEGIN, THEN or ELSE, or a `;`.
+DO_STARTS = {'begin', 'grant', 'revoke', 'raise', 'if', 'elsif', 'end', 'create', 'null'}
+DO_FORBIDDEN = {'delete', 'update', 'insert', 'merge', 'truncate', 'drop', 'copy', 'perform', 'execute', 'call',
+                'alter', 'loop', 'declare'}
+
+
+def statement_lines(text):
+    """The 1-based line of each statement `statements(text)` returns."""
+    positions, lines, fresh = [], [], True
+    for token, at in zip(tokens(text, positions), positions):
+        if token == ('punct', ';'): fresh = True
+        elif fresh: lines.append(text.count('\n', 0, at) + 1); fresh = False
+    return lines
+
+
+def do_body_critical(body):
+    """True unless every statement of a DO block's body only grants, revokes, raises, creates a policy or an index,
+    or tests a condition with no write (production.md: a `DO` block that only grants, revokes or checks)."""
+    try:
+        items = tokens(body)
+    except Untokenizable:
+        return True
+    start, granting = True, False
+    for kind, value in items:
+        word = value if kind == 'word' else None
+        if start and kind != 'punct':
+            if word not in DO_STARTS: return True
+            granting = word in ('grant', 'revoke')
+        # A privilege of a GRANT or REVOKE is no write.
+        if word in DO_FORBIDDEN and not (granting and word in ('delete', 'update', 'insert', 'truncate')): return True
+        if (kind, value) == ('punct', ';'): start, granting = True, False
+        else: start = word in ('begin', 'then', 'else')
+    return False
+
+
+# The ALTER TABLE actions; another first word (a name left by an unknown schema qualifier) is critical.
+TABLE_ACTIONS = {'add', 'drop', 'alter', 'rename', 'validate', 'enable', 'disable', 'owner', 'set', 'reset',
+                 'replica', 'cluster', 'inherit', 'no', 'attach', 'detach', 'force', 'of', 'not'}
+
+
+def table_action(part):
+    """The critical kind of one ALTER TABLE action, or None."""
+    c = Cursor(part)
+    if c.peek()[0] != 'word' or c.peek()[1] not in TABLE_ACTIONS: return 'unparsed'
+    if c.word('drop'):
+        if ('word', 'cascade') in part: return 'DROP CASCADE'
+        return None if c.word('constraint') else 'DROP COLUMN'
+    if c.word('alter'):
+        if c.word('constraint'): return None
+        c.word('column')
+        c.name()
+        if c.word('type') or c.word('set') and (c.word('data') and c.word('type') or c.word('expression')):
+            return 'ALTER COLUMN TYPE'
+    return None
+
+
+def statement_risk(statement):
+    """The critical kind of one top-level statement, or None when it is non-critical."""
+    c = Cursor(statement)
+    first = c.peek()[1] if c.peek()[0] == 'word' else None
+    if first in CRITICAL_FIRST: return CRITICAL_FIRST[first]
+    if first in ('grant', 'revoke', 'comment', 'analyze'): return None
+    if first == 'set': return None if c.peek(1) == ('word', 'local') else 'SET'
+    if first == 'insert':
+        conflict = ('word', 'conflict') in statement and any(
+            statement[at:at + 2] == [('word', 'do'), ('word', 'update')] for at in range(len(statement)))
+        return 'INSERT ON CONFLICT DO UPDATE' if conflict else None
+    if first == 'do':
+        body = next((value for kind, value in statement if kind == 'dollar'), None)
+        try:
+            precondition(Cursor(statement))
+            return None
+        except (Manual, Untokenizable):
+            pass
+        return 'DO' if body is None or do_body_critical(body) else None
+    c.next()
+    if first == 'create':
+        if c.word('or'): c.expect('replace')
+        while c.word('temporary', 'temp', 'unlogged', 'constraint', 'recursive'): pass
+        kind = c.peek()[1] if c.peek()[0] == 'word' else None
+        return None if kind in CREATED else 'CREATE ' + str(kind).upper()
+    if first == 'drop':
+        kind = c.peek()[1] if c.peek()[0] == 'word' else None
+        if ('word', 'cascade') in statement: return 'DROP CASCADE'
+        return None if kind in DROPPED else 'DROP ' + str(kind).upper()
+    if first == 'alter':
+        if not c.word('table'): return 'ALTER CASCADE' if ('word', 'cascade') in statement else None
+        if c.word('if'): c.expect('exists')
+        c.word('only')
+        c.name()
+        if c.word('rename'): return None
+        if c.done(): return 'unparsed'
+        for part in split(statement[c.at:]):
+            if kind := table_action(part): return kind
+        return None
+    return 'statement ' + str(first).upper()
+
+
+def risk_class(text):
+    """ANYM-743: `('non-critical', None, None)`, or `('critical', line, kind)` for the first critical statement
+    (line 0: the text does not tokenize)."""
+    try:
+        parsed, lines = statements(text), statement_lines(text)
+    except Untokenizable:
+        return 'critical', 0, 'untokenizable'
+    for statement, line in zip(parsed, lines):
+        try:
+            kind = statement_risk(statement)
+        except (Manual, Untokenizable):
+            kind = 'unparsed'
+        if kind: return 'critical', line, kind
+    return 'non-critical', None, None
+
+
+def additive_class(text, inventory=None):
+    """ANYM-596's DROP-free `expand` (was `unattended_class` until ANYM-743): a `rollout_class` `expand` with no DROP of
+    any kind and no name over NAME_BYTES. The feedback autoloop keeps it as its owner boundary (AGENTS.md section 2:
+    a non-additive migration from feedback waits for the owner); deploy no longer uses it."""
     if rollout_class(text, inventory) != 'expand': return 'manual'
     parsed = statements(text)
     if any(long_name(statement) for statement in parsed): return 'manual'
     return 'manual' if any(('word', 'drop') in statement for statement in parsed) else 'expand'
+
+
+def unattended_class(text, inventory=None):
+    """What `migrate-expand` may run without a person (ANYM-743, was ANYM-596's DROP-free `expand`): a file with a
+    rollout header whose `risk_class` is non-critical, that runs inside one transaction (no CONCURRENTLY) and names
+    nothing longer than NAME_BYTES. The rehearsal on a copy then refuses a removed table or column, a changed column
+    type and any row write (production.py `destroys_data`, `data_unchanged`). `inventory` is kept for callers."""
+    if header(text) is None or risk_class(text)[0] != 'non-critical': return 'manual'
+    parsed = statements(text)
+    if any(long_name(statement) or ('word', 'concurrently') in statement for statement in parsed): return 'manual'
+    return 'expand'
 
 
 # PostgreSQL truncates a longer name to NAMEDATALEN-1 bytes, so a "new" table could name an existing one.

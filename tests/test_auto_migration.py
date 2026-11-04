@@ -195,16 +195,13 @@ def test_a_new_table_and_its_appended_grant_qualify_with_the_ranges_new_tables(t
 
 # spec: ANYM-449
 @pytest.mark.parametrize("case", [
-    "no-migration-section", "edited-applied-file", "check-widening-pair", "expand-plus-manual", "revoke",
+    "no-migration-section", "edited-applied-file", "expand-plus-manual", "revoke",
     "gap", "schema-sql", "calendar-sql", "deploy-role-file", "new-role-file", "deleted-role-file", "no-header"])
 def test_a_range_that_does_not_qualify_pauses_with_todays_text(tmp_path, monkeypatch, case):
     files, roles, others, modified, deleted = {"051_synthetic_note.sql": NOTE}, {}, [], [], []
     configured = case != "no-migration-section"
     if case == "edited-applied-file":
         others = modified = [MIGRATIONS + "039_synthetic_39.sql"]
-    elif case == "check-widening-pair":
-        files = {"051_synthetic_widen.sql": b"-- rollout: expand\nALTER TABLE messages DROP CONSTRAINT messages_kind_check;\n"
-                 b"ALTER TABLE messages ADD CONSTRAINT messages_kind_check CHECK(kind IN ('a','b','c')) NOT VALID;\n"}
     elif case == "expand-plus-manual":
         files["052_synthetic_manual.sql"] = b"-- rollout: manual\nUPDATE messages SET body = 'marker-1';\n"
     elif case == "revoke":
@@ -232,6 +229,25 @@ def test_a_range_that_does_not_qualify_pauses_with_todays_text(tmp_path, monkeyp
     assert outcome["status"] == "halted" and host.steps == [] and host.events == []
     assert outcome["reason"].startswith(f"the SQL inventory changed ({', '.join(sql)}); migrate by hand (production.md)")
     assert host.migration() is None and "marker" not in outcome["reason"]
+
+
+# spec: ANYM-743
+@pytest.mark.parametrize("case", ["check-widening-pair", "index-on-existing", "manual-header", "calendar-index"])
+def test_a_non_critical_range_qualifies_whatever_its_header_class(tmp_path, monkeypatch, case):
+    # Incident 11-04: 067, a CHECK widening with no row change, paused autodeploy for a hand release.
+    files = {"check-widening-pair": b"-- rollout: manual\nALTER TABLE messages DROP CONSTRAINT messages_kind_check;\n"
+                                    b"ALTER TABLE messages ADD CONSTRAINT messages_kind_check CHECK(kind IN ('a','b','c'))"
+                                    b" NOT VALID;\n",
+             "index-on-existing": b"-- rollout: expand\nCREATE INDEX synthetic_body ON messages (body);\n",
+             "manual-header": b"-- rollout: manual\n" + NOTE.split(b"\n", 1)[1]}
+    if case == "calendar-index":
+        host = CalendarHost(tmp_path, monkeypatch,
+                            {"schema_v6.sql": b"-- rollout: expand\nCREATE INDEX people_label ON people (label);\n"})
+        assert [plan["database"] for plan in host.plans()] == [p.CALENDAR]
+        return
+    host = MigrationHost(tmp_path, monkeypatch, {"051_synthetic_change.sql": files[case]})
+    plan = host.plan()
+    assert plan is not None and plan["files"] == ["051_synthetic_change.sql"] and plan["target"] == 51
 
 
 # spec: ANYM-449
@@ -669,14 +685,14 @@ def test_a_complete_new_table_and_nullable_or_constant_default_columns_are_addit
     before = shape(source_db)
     psql(source_db, ADDITIVE)
     after = shape(source_db)
-    assert p.not_additive(before, after) is None
+    assert p.destroys_data(before, after) is None
     added = {tuple(key) for key, _ in p.catalog_difference(before, after)["added"]}
     for key in [("relation", "public.synthetic_items"), ("relation", "public.synthetic_items_id_seq"),
                 ("index", "public.synthetic_items_note"), ("policy", "public.synthetic_items", "synthetic_items_read"),
                 ("column", "public.messages", "synthetic_rank"), ("sequence", "public.synthetic_items_id_seq")]:
         assert key in added
     assert any(key[0] == "acl" and "synthetic_items" in key[1] and key[3] == "synthetic_reader" for key in added)
-    assert p.not_additive(after, after) is None
+    assert p.destroys_data(after, after) is None
 
 
 # spec: ANYM-449
@@ -687,7 +703,7 @@ def test_literal_defaults_with_the_casts_postgresql_adds_are_constant(source_db)
                     " ADD COLUMN s_text varchar(20) NOT NULL DEFAULT 'pending', ADD COLUMN s_json jsonb DEFAULT '{}',"
                     " ADD COLUMN s_flag boolean NOT NULL DEFAULT false, ADD COLUMN s_mood mood DEFAULT 'busy';")
     after = shape(source_db)
-    assert p.not_additive(before, after) is None
+    assert p.destroys_data(before, after) is None
     assert len([key for key, _ in p.catalog_difference(before, after)["added"] if key[0] == "column"]) == 8
 
 
@@ -703,76 +719,49 @@ def test_the_identity_the_dsn_reaches_is_the_identity_docker_exec_reads(source_d
     assert json.loads(reached) == found and found[1] == source_db and len(found) == 3
 
 
-# spec: ANYM-449
-def test_a_default_behind_a_users_assignment_cast_is_not_constant(source_db):
-    # Astra r2 F5: pg_get_expr prints an implicit cast's argument only, so this default reads `0`.
-    psql(source_db, "CREATE TYPE synthetic_wrap AS (n integer); CREATE FUNCTION synthetic_wrap_of(integer) RETURNS "
-                    "synthetic_wrap VOLATILE LANGUAGE sql AS 'SELECT ROW($1)::synthetic_wrap'; CREATE CAST (integer AS "
-                    "synthetic_wrap) WITH FUNCTION synthetic_wrap_of(integer) AS ASSIGNMENT;")
-    before = shape(source_db)
-    psql(source_db, "ALTER TABLE messages ADD COLUMN s_wrap synthetic_wrap DEFAULT 0;")
-    after = shape(source_db)
-    added = dict((tuple(key), value) for key, value in p.catalog_difference(before, after)["added"])
-    assert added[("column", "public.messages", "s_wrap")][2] == "0"
-    assert p.not_additive(before, after) == "added column public.messages s_wrap"
-
-
-# spec: ANYM-449
-def test_a_constant_default_of_a_quoted_type_name_pauses_as_a_known_case(source_db):
-    # Astra r3 F11, narrowed: the printed text must match LITERAL_DEFAULT as well as the vetted tree, so a quoted
-    # type name pauses and the release goes the manual path.
-    before = shape(source_db)
-    psql(source_db, 'ALTER TABLE messages ADD COLUMN s_char "char" DEFAULT \'x\';')
-    after = shape(source_db)
-    added = dict((tuple(key), value) for key, value in p.catalog_difference(before, after)["added"])
-    assert added[("column", "public.messages", "s_char")][2] == "'x'::\"char\""
-    assert added[("column", "public.messages", "s_char")][6] is True
-    assert p.not_additive(before, after) == "added column public.messages s_char"
-
-
-FORBIDDEN = {
+# ANYM-743: the rehearsal refuses only what loses stored data or breaks the running release's writes.
+DESTROYING = {
     "drop-column": ("ALTER TABLE messages DROP COLUMN body;", "removed column public.messages body"),
     "rename-column": ("ALTER TABLE messages RENAME COLUMN body TO text_body;", "removed column public.messages body"),
-    "revoke": ("REVOKE SELECT ON messages FROM synthetic_reader;", "removed acl"),
-    "enum-value": ("ALTER TYPE mood ADD VALUE 'tired';", "changed type public.mood"),
-    "view-change": ("CREATE OR REPLACE VIEW calm AS SELECT id, body FROM messages WHERE mood = 'calm';",
-                    "changed rule public.calm _RETURN"),
-    "default-acl": ("ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO synthetic_reader;", "added default_acl"),
-    "role-setting": ("ALTER ROLE synthetic_reader IN DATABASE {database} SET work_mem = '8MB';", "added role_setting"),
-    "extension": ("CREATE EXTENSION citext;", "changed count"),
-    "index-on-existing": ("CREATE INDEX synthetic_body ON messages (body);", "added index public.synthetic_body"),
-    "constraint-on-existing": ("ALTER TABLE messages ADD CONSTRAINT synthetic_body_check CHECK (body <> '') NOT VALID;",
-                               "added constraint public.messages synthetic_body_check"),
-    "volatile-default": ("ALTER TABLE messages ADD COLUMN synthetic_at timestamptz DEFAULT now();",
-                         "added column public.messages synthetic_at"),
+    "drop-table": ("DROP TABLE empty_one;", "removed"),
+    "type-change": ("ALTER TABLE messages ALTER COLUMN body TYPE varchar(400);",
+                    "changed the type of column public.messages body"),
     "not-null-without-default": ("ALTER TABLE empty_one ADD COLUMN must integer NOT NULL;",
-                                 "added column public.empty_one must"),
-    "function-and-trigger": ("CREATE FUNCTION synthetic_touch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; "
-                             "END $$; CREATE TRIGGER synthetic_touch BEFORE UPDATE ON messages FOR EACH ROW EXECUTE "
-                             "FUNCTION synthetic_touch();", "added function public.synthetic_touch()"),
-    "new-schema": ("CREATE SCHEMA synthetic;", "added schema synthetic"),
-    "policy-on-existing": ("CREATE POLICY synthetic_all ON messages USING (true);",
-                           "added policy public.messages synthetic_all"),
-    "restrictive-policy": ("CREATE TABLE synthetic_new (id int); CREATE POLICY synthetic_only ON synthetic_new AS "
-                           "RESTRICTIVE USING (true);", "added policy public.synthetic_new synthetic_only"),
-    "new-role": ("CREATE ROLE synthetic_extra_{suffix};", "added role synthetic_extra_"),
-    "composite-attribute": ("ALTER TYPE synthetic_pair ADD ATTRIBUTE b text;", "added column public.synthetic_pair b"),
+                                 "added a NOT NULL column without a default to column public.empty_one must"),
+}
+KEPT = {
+    "revoke": "REVOKE SELECT ON messages FROM synthetic_reader;",
+    "enum-value": "ALTER TYPE mood ADD VALUE 'tired';",
+    "view-change": "CREATE OR REPLACE VIEW calm AS SELECT id, body FROM messages WHERE mood = 'calm';",
+    "default-acl": "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO synthetic_reader;",
+    "index-on-existing": "CREATE INDEX synthetic_body ON messages (body);",
+    "constraint-on-existing": "ALTER TABLE messages ADD CONSTRAINT synthetic_body_check CHECK (body <> '') NOT VALID;",
+    "volatile-default": "ALTER TABLE messages ADD COLUMN synthetic_at timestamptz DEFAULT now();",
+    "function-and-trigger": "CREATE FUNCTION synthetic_touch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; "
+                            "END $$; CREATE TRIGGER synthetic_touch BEFORE UPDATE ON messages FOR EACH ROW EXECUTE "
+                            "FUNCTION synthetic_touch();",
+    "new-schema": "CREATE SCHEMA synthetic;",
+    "policy-on-existing": "CREATE POLICY synthetic_all ON messages USING (true);",
+    "users-cast-default": None,
 }
 
 
-# spec: ANYM-449
-@pytest.mark.parametrize("case", sorted(FORBIDDEN))
-def test_each_forbidden_catalog_change_is_not_additive(source_db, case):
-    text, reason = FORBIDDEN[case]
-    suffix = uuid4().hex[:8]
+# spec: ANYM-743
+@pytest.mark.parametrize("case", sorted(DESTROYING) + sorted(KEPT))
+def test_the_rehearsal_refuses_only_a_change_that_loses_stored_data(source_db, case):
+    if case == "users-cast-default":  # Astra r2 F5's form: a default behind a user's cast no longer pauses
+        psql(source_db, "CREATE TYPE synthetic_wrap AS (n integer); CREATE FUNCTION synthetic_wrap_of(integer) RETURNS "
+                        "synthetic_wrap VOLATILE LANGUAGE sql AS 'SELECT ROW($1)::synthetic_wrap'; CREATE CAST (integer "
+                        "AS synthetic_wrap) WITH FUNCTION synthetic_wrap_of(integer) AS ASSIGNMENT;")
     before = shape(source_db)
-    psql(source_db, text.format(database=source_db, suffix=suffix))
-    try:
-        found = p.not_additive(before, shape(source_db))
-    finally:
-        if case == "new-role":
-            psql(source_db, f"DROP ROLE synthetic_extra_{suffix};")
-    assert found is not None and found.startswith(reason)
+    text = DESTROYING[case][0] if case in DESTROYING else KEPT[case] or \
+        "ALTER TABLE messages ADD COLUMN s_wrap synthetic_wrap DEFAULT 0;"
+    psql(source_db, text)
+    found = p.destroys_data(before, shape(source_db))
+    if case in DESTROYING:
+        assert found is not None and found.startswith(DESTROYING[case][1])
+    else:
+        assert found is None
 
 
 def data(database):
@@ -1377,7 +1366,7 @@ def test_a_clean_two_database_run_reaches_each_container_step_once_in_order(tmp_
 
 # spec: ANYM-586
 @pytest.mark.parametrize("case", ["not-configured", "edited-applied-file", "gap", "no-header", "manual", "revoke",
-                                  "index-on-existing", "other-calendar-sql"])
+                                  "other-calendar-sql"])
 def test_a_calendar_range_that_does_not_qualify_pauses_with_todays_text(tmp_path, monkeypatch, case):
     calendar, roles, modified = {"schema_v6.sql": CALENDAR_TABLE}, b"", []
     if case == "edited-applied-file":
@@ -1390,8 +1379,6 @@ def test_a_calendar_range_that_does_not_qualify_pauses_with_todays_text(tmp_path
         calendar = {"schema_v6.sql": b"-- rollout: manual\nUPDATE people SET label = 'marker';\n"}
     elif case == "revoke":
         roles = b"REVOKE SELECT ON people FROM fcs_worker;\n"
-    elif case == "index-on-existing":
-        calendar = {"schema_v6.sql": b"-- rollout: expand\nCREATE INDEX people_label ON people (label);\n"}
     elif case == "other-calendar-sql":
         modified = ["services/calendar/family_calendar/service/extra.sql"]
     host = CalendarHost(tmp_path, monkeypatch, calendar, calendar_roles=roles, calendar_modified=modified,

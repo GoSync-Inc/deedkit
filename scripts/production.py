@@ -2815,7 +2815,6 @@ def range_changes(mirror, base, candidate, installed):
 
 MIGRATION = re.compile(r"services/messaging/messaging_service/migrations/([0-9]{3}_[A-Za-z0-9_]+\.sql)")
 CLASSIFIER = "services/messaging/messaging_service/migration_rollout.py"
-CLASSES = ("expand", "manual", "no header")
 CLASSIFY_TIMEOUT = 30
 # Bounds of the classifier child: the bytes it gets (migration texts and its source), the stdout read back and its
 # address space. Beyond any of them every added migration is `manual`.
@@ -2836,7 +2835,17 @@ sys.addaudithook(refuse)
 module = {"__name__": "migration_rollout"}
 exec(compile(data["source"], "migration_rollout.py", "exec"), module)
 """
-CLASSIFY = CLASSIFY_PRELUDE + 'print(json.dumps([module["rollout_class"](text) for text in data["texts"]]))\n'
+# ANYM-743: with the candidate's `risk_class`, each class adds the tier, and a critical file its first critical line and
+# statement kind (`manual critical: line 12 DELETE`); a candidate without it names the class alone.
+CLASSIFY = CLASSIFY_PRELUDE + """def named(text):
+    kind, risk = module["rollout_class"](text), module.get("risk_class")
+    if risk is None:
+        return kind
+    tier, line, what = risk(text)
+    return kind + (" non-critical" if tier == "non-critical" else f" critical: line {line} {what}")
+print(json.dumps([named(text) for text in data["texts"]]))
+"""
+NAMED_CLASS = re.compile(r"(?:expand|manual|no header)(?: non-critical| critical: line [0-9]{1,6} [A-Za-z_ ]{1,60})?")
 
 
 def classifier_limits():
@@ -2883,7 +2892,7 @@ def migration_classes(mirror, base, candidate, sql):
         classes = classifier_child(CLASSIFY, {"source": source, "texts": texts})
     except Exception:  # Refused, OSError, a timeout, a limit, RecursionError of deep JSON: all name `manual`
         classes = None
-    if not (isinstance(classes, list) and len(classes) == len(added) and all(c in CLASSES for c in classes)):
+    if not (isinstance(classes, list) and len(classes) == len(added) and all(isinstance(c, str) and NAMED_CLASS.fullmatch(c) for c in classes)):
         classes = ["manual"] * len(added)
     return [f"{MIGRATION.fullmatch(path)[1]} {kind}" for path, kind in zip(added, classes)]
 
@@ -3313,52 +3322,29 @@ def catalog_difference(before, after):
             "added": sorted(([list(key), after[key]] for key in after.keys() - before.keys()), key=order)}
 
 
-# A literal default as pg_get_expr prints it, with the casts PostgreSQL adds ('x'::text, 0, (-1), '{}'::jsonb). The
-# printed text hides implicit casts, so the column's last CATALOG value must also say that its expression tree holds
-# only constants, relabels and built-in immutable functions (a user's assignment cast prints as `0` too, Astra r2 F5):
-# ADD COLUMN then stores it once and rewrites nothing. Both must hold. A quoted type name (`'x'::"char"`, a quoted
-# enum) is no match and pauses: such a release goes the manual path (known pause, Astra r3 F11).
-LITERAL_DEFAULT = re.compile(r"(?:'(?:[^']|'')*'|-?[0-9]+(?:\.[0-9]+)?|\(-[0-9]+(?:\.[0-9]+)?\)|true|false)"
-                             r"(?:::[a-z][a-z0-9_ ]*(?:\([0-9]+(?:,[0-9]+)?\))?(?:\[\])?)*")
-
-
 def described(key):
     return " ".join(str(part) for part in key)
 
 
-def not_additive(before, after):
-    """M3: the first catalog difference that is not additive, or None. Additive: only new tables with their
-    columns, indexes, constraints, sequences, policies and ACL items; new columns on existing tables that are
-    nullable without a default or have a constant default (PostgreSQL 18 records the NOT NULL of such a column as a
-    constraint); added ACL items; new permissive policies on new tables."""
+def destroys_data(before, after):
+    """M3 (ANYM-743; was ANYM-449's `not_additive`, owner 11-04: backups and pauses only in critical cases): the first
+    catalog difference of the rehearsal that loses stored data or breaks the running release's writes, or None. That
+    is a removed table, partitioned table, materialized view or column (a rename reads as one), a column whose type or
+    generation expression changed, and a new NOT NULL column without a default on an existing table. Everything else
+    a non-critical file does (indexes, constraints, functions, triggers, views, policies, grants, defaults, roles)
+    passes; `data_unchanged` refuses any row write."""
     change = catalog_difference(before, after)
-    if change["removed"]:
-        return "removed " + described(change["removed"][0])
-    if change["changed"]:
-        return "changed " + described(change["changed"][0][0])
-    added = [(tuple(key), value) for key, value in change["added"]]
-    tables = {key[1] for key, value in added if key[0] == "relation" and value[0] in ("r", "p")}
-    columns = {(key[1], key[2]) for key, _ in added if key[0] == "column"}
-    for key, value in added:
-        kind = key[0]
-        if kind == "relation":
-            allowed = value[0] in ("r", "p", "S", "i")
-        elif kind == "column":
-            allowed = key[1] in tables or ((before.get(("relation", key[1])) or [None])[0] in ("r", "p")
-                                           and not value[3] and not value[4]
-                                           and (value[6] is True and bool(LITERAL_DEFAULT.fullmatch(value[2]))
-                                                if value[2] is not None else not value[1]))
-        elif kind == "constraint":
-            allowed = key[1] in tables or (value[0] == "n" and bool(value[3])
-                                           and all((key[1], column) in columns for column in value[3]))
-        elif kind == "index":
-            allowed = value[1] in tables
-        elif kind == "policy":
-            allowed = key[1] in tables and value[0] is True
-        else:
-            allowed = kind in ("sequence", "acl")
-        if not allowed:
-            return "added " + described(key)
+    for key in change["removed"]:
+        if key[0] == "column" or key[0] == "relation" and (before[tuple(key)] or [None])[0] in ("r", "p", "m"):
+            return "removed " + described(key)
+    for key, value in change["changed"]:
+        old = before[tuple(key)]
+        if key[0] == "column" and (old[0] != value[0] or old[4] != value[4] or value[4] and old[2] != value[2]):
+            return "changed the type of " + described(key)
+    for key, value in change["added"]:
+        if (key[0] == "column" and value[1] and value[2] is None and not value[3] and not value[4]
+                and (before.get(("relation", key[1])) or [None])[0] in ("r", "p")):
+            return "added a NOT NULL column without a default to " + described(key)
     return None
 
 
@@ -3601,9 +3587,9 @@ def rehearse(copied, plan, image, limit):
     if took is not None and not 0 <= took <= limit:
         raise MigrationRefused(f"too slow for an unattended lock: the rehearsal took {took} ms, over {limit} ms")
     after = catalog_map(scratch_lines(copy, copied, "after", CATALOG))
-    if reason := not_additive(before, after) or (calendar_data_unchanged if calendar else data_unchanged)(
+    if reason := destroys_data(before, after) or (calendar_data_unchanged if calendar else data_unchanged)(
             data, after_data, plan):
-        raise MigrationRefused("not additive: " + reason)
+        raise MigrationRefused("not unattended: " + reason)
     return {"took_ms": took, "difference": catalog_difference(digested(before), digested(after))}
 
 

@@ -582,9 +582,10 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
    while the daily backup succeeds), and everything written after it (messages, receipts, keys, operator
    changes) is lost. No gate backup or copy was restored in any hand release from 10-17 to 11-04.
 4. How a non-critical release runs. `deploy` applies it itself when the range qualifies ("Unattended
-   migrations": today `expand` files and appended role grants; the backup receiver's schema holds none).
-   Any other range pauses autodeploy until `deploy` applies every non-critical range itself (ANYM-743); meanwhile the agent who sees the
-   pause releases it at once, at any hour, with the previous release's tested commands: a tested runbook,
+   migrations": every added file the classifier calls non-critical and appended role grants; the backup
+   receiver's schema holds none). A range that still pauses (a critical file, a rename or another change the
+   rehearsal refuses, a role file that does not only append grants) is released by the agent who sees the
+   pause at once, at any hour, with the previous release's tested commands: a tested runbook,
    so no new kit, plan or review round. The order:
    1. Exclusion from the backups (a backup stops the collectors and holds snapshots; an apply recreates
       the collectors and a migration takes table locks). `personal-os-backup.service`,
@@ -630,9 +631,13 @@ highest-tier pending migration file, changed role file or step.
 The tier decides the backup, the copy and the plan review only. Expand, then contract
 (`.claude/rules/migrations.md`) still keeps a DROP, RENAME or narrowing out of a release whose running
 code uses the old shape; role SQL keeps its Astra r1 in its PR; the active-call check and the release
-order stay. The author names the tier in the migration header (`-- Risk tier: critical` with the line
-of the critical statement, or `-- Risk tier: non-critical`) and in the PR; the PR review checks it
-against the file. Until ANYM-743 computes the tier from the diff, that header is the tier. Until
+order stay. The tier is computed from the file (ANYM-743): `risk_class` in the candidate's
+`migration_rollout.py` (the calendar copy for `schema_vN.sql`) names a statement non-critical only in
+the forms listed above and everything else, text it cannot tokenize included, critical; the deploy pause
+and `deploy --dry-run` print it per added file (`069_x.sql manual critical: line 12 DELETE`; a file whose
+classifier failed reads `manual` with no tier: treat it as critical). A `-- Risk tier:` header is a note
+for the reviewer and cannot lower the computed tier; to take a critical statement out of a release,
+split it into its own file. Until
 ANYM-675 ships, the deployer still copies before every unattended range, because its rehearsal runs on
 the copy; that copy is automatic and holds no one.
 
@@ -722,7 +727,8 @@ What qualifies (M1): every SQL inventory path of the range is an added
 `services/messaging/messaging_service/migrations/NNN_*.sql` or a modified messaging `*_role.sql`,
 or a calendar path of "Calendar" below (`schema.sql`, `deploy/*.sql`, other calendar SQL, a new, deleted or
 renamed role file and an edited applied migration pause); the candidate's `migration_rollout.py`, in the classifier's isolated process, names each
-added file `expand` by `unattended_class` (no DROP of any kind, so the CHECK widening pair pauses) and each
+added file `expand` by `unattended_class` (ANYM-743: a rollout header, `risk_class` non-critical, no
+`CONCURRENTLY`, no name over 63 bytes; the CHECK widening pair qualifies, a critical file pauses) and each
 role file `additive` by `role_class`; the added versions follow the base's highest without a gap.
 
 Phases, each a pause or a wait before any production write:
@@ -763,15 +769,15 @@ Phases, each a pause or a wait before any production write:
    schemas, relations, columns, constraints, indexes, triggers, functions, types and enum labels, rules
    and views, policies, sequences, every ACL item, default ACLs, roles, memberships, role settings and the
    row counts of extensions, publications, subscriptions, casts, operators, access methods, languages,
-   foreign servers, extended statistics and text search) before and after must differ only by new tables
-   with their columns, indexes, constraints, sequences, policies and ACL items, nullable or constant-default
-   columns on existing tables (a literal whose stored expression holds only constants, relabels and
-   built-in immutable casts; a user's cast prints as a literal too and does not count; a default whose
-   printed type name is quoted, such as `'x'::"char"` or a quoted enum, is a known pause: migrate that
-   release by hand) and added ACL items; `probe_metadata` only by `schema_version`;
+   foreign servers, extended statistics and text search) before and after may not lose stored data or
+   break the running release's writes (`destroys_data`, ANYM-743): no removed table, partitioned table,
+   materialized view or column (a rename reads as one and pauses for a hand release), no column whose type
+   or generation expression changed, no new NOT NULL column without a default on an existing table; every
+   other change (indexes, constraints, functions, triggers, views, policies, grants, defaults, roles)
+   passes; `probe_metadata` only by `schema_version`;
    `archive_migrations` only by the pending versions; and no other existing table may show a write in
    `pg_stat_user_tables`. Its transaction (from `applied_at` to the first read after the container ended)
-   takes at most `rehearsal_limit_ms`. Else the run pauses "not additive: <first difference>" or "too slow
+   takes at most `rehearsal_limit_ms`. Else the run pauses "not unattended: <first difference>" or "too slow
    for an unattended lock". The copy's release removes and confirms every resource; a killed run leaves
    them to the next run's reconciliation.
 5. Final gate: admission and the producer check again, the live catalog still the copy's (else "the
