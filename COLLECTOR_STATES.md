@@ -160,6 +160,23 @@ which can carry provider bytes, is never kept. The trade-off: a provider bug
 that hits every chat now leaves the collector running with every chat failed
 and status degraded, instead of restarting it.
 
+Telegram chat discovery (paging the account's dialog list) isolates a provider
+error the same way (ANYM-749). A transient server error (`ServerError`,
+`TimedOutError`, `TimeoutError`) of a dialog page is retried on the same
+traversal after 1 s and then 2 s; the third such failure in one discovery pass,
+or any other RPC error, ends that discovery pass with status `degraded` /
+`discovery_provider_error`. Dialog rows already listed in the pass stay saved,
+discovery is not marked complete (`discovery_completed_at` keeps its previous
+value), and the history pass goes on over the previous catalogue when this
+process has one (it keeps the code as its final status); a first discovery
+without a catalogue ends the pass without a history scan. The worker and live
+capture keep running and the next loop (about 60 s later) tries discovery
+again. Rate limits, session-terminal errors, a duplicated authorization key and
+transport loss still stop the pass as before. The collector prints one
+`telegram_discovery_error` line per failed pass with the code, the exception
+class name and Telegram's fixed RPC code, never exception text. In
+`get_sync_status` the history phase reads `partial_with_errors`.
+
 A stored peer kind that differs from the kind the dialog reports for the same
 chat id (`collector_chats.peer_kind`, ANYM-102) fails only that chat, with reason
 `peer_kind_conflict` in `history.chat_errors` and `last_error_code`
