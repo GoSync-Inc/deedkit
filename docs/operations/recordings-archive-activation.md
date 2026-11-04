@@ -66,39 +66,85 @@ Polling may start once milestone I is verified (docs/DATA-POLICY.md), not before
 - P7. On `backup-1`: `/opt/deedkit-backup-r2/venv` exists, the messaging and calendar verifier timers are active and their last
   `status.json` is `verified` or `idle`, no `active.json` journal is pending in either, `/etc/deedkit-backup-r2/instances.json`
   lists the two configs (messaging first), and `receiver_schema_max` is current. The follow units are not installed there
-  (the receiver's wheel moves by hand).
+  (the receiver's wheel moves by hand). `/usr/local/libexec/deedkit/attest-verify` exists and runs, Docker works, and the Docker
+  data root has the verifier's `reserve_bytes` plus 4 GiB free (the helper image pull of I1.6).
 - P8. Decisions to confirm in the receipt before starting (section "Decisions to review"): receiver limits, the R2 prefix, the age
   recovery key custody and the archive `max_bytes` start value.
 
-## Step R. The host backup runner and the pins (one host step; milestone I, part 1)
+## Step R. The host backup runner and the pins (one host step, one lock window; milestone I, part 1)
 
 727 changed `backup_runner.py` and the backup worker, so the host runner file and the backup image pin must move together. This is
-production.md "Backup runner" with `pin=yes`, plus the calendar pin, in one lock window. Autodeploy refuses to apply while the
-installed runner blob is not the release's, so this step is also what lets the deploys after n9 run: remove
-`/etc/deedkit/autodeploy.pause` only if its reason is the runner's blob refusal (`the backup runner ... is blob`); a pause for another
-reason stays.
+production.md "Backup runner" with `pin=yes`, extended to the calendar pin, **as one script under one `flock` of
+`/opt/personal-os-probe/backups/.runner.lock`**: nothing is written until both profiles passed every preflight, and the lock is
+released only after the verification at the end (settle-before-write; no backup can interleave between the messaging and the
+calendar pin). Autodeploy refuses to apply while the installed runner blob is not the release's, so this step is also what lets the
+deploys after n9 run: remove `/etc/deedkit/autodeploy.pause` only if its reason is the runner's blob refusal (`the backup runner ...
+is blob`); a pause for another reason stays.
 
 1. Record P6. Create `/etc/deedkit/autodeploy.pause` with reason `ANYM-731 runner install` unless one with another reason exists
    (then do not touch it and stop for the orchestrator).
-2. Run the script of production.md "Backup runner" with `sha=S; src=<state_directory>/S/source; pin=yes`. It holds
-   `/opt/personal-os-probe/backups/.runner.lock` (`flock --nonblock`), requires `personal-os-backup.service` and
-   `deedkit-autodeploy.service` idle, checks the new runner against messaging's config, resolves `deedkit-production-backup:S` and
-   its revision label, writes the new `runner.json` beside the live one and checks it, keeps `.before-S` copies of the runner and
-   `runner.json`, installs the runner and verifies its blob.
-3. In the same idle window (the same services idle, under a `flock --nonblock` of the same `.runner.lock`): set
-   `/opt/deedkit/calendar-backup/runner.json`'s `image` to the same ID (keep `runner.json.before-<date>`, write a `.new` file, `mv`), then check both:
-   `python3 -I /opt/personal-os-probe/ops/backup_runner.py --config <cfg> --check` for messaging and for the calendar must print `idle`
-   (exit 0). Exit 3 means an unfinished journal: stop (production.md says how its recovery stays under the existing rules).
-4. Remove the pause (only if it is ours). Read-back **R-read**: `git hash-object` of the installed runner equals `S`'s blob; both
+2. Copy `step-r.sh` (the block after Undo R: the production.md script with the calendar profile added, nothing else changed) to
+   the receipt directory and run it `sudo flock --nonblock /opt/personal-os-probe/backups/.runner.lock sh -eu step-r.sh <S> <src>`.
+   In this one lock window it:
+   1. requires `personal-os-backup.service`, `deedkit-calendar-backup.service` and `deedkit-autodeploy.service` idle
+      (`inactive` or `failed`);
+   2. **preflights both profiles before any write**: the new runner's `--check` against messaging's `runner.json` and against the
+      calendar's (`/opt/deedkit/calendar-backup/runner.json`) must both print `idle`, exit 0 (exit 3 is an unfinished journal in
+      either profile: stop, production.md says how its recovery stays under the existing rules; the calendar's journal is
+      therefore looked at *before* its pin changes); resolves `deedkit-production-backup:S`, compares its revision label with `S`,
+      writes `runner.json.new` for **both** profiles beside the live files and `--check`s each `.new` with the new runner;
+   3. preserves both configurations and the runner: `cp -p` of the runner and of both `runner.json` to `.before-S` (create-only:
+      the script stops when a `.before-S` file already exists);
+   4. installs both pins (`mv` each `.new`) and then the runner (`install -m 0600`), and verifies the blob of the installed runner
+      against `S`'s;
+   5. verifies inside the lock: `git hash-object` equality, both `--check` lines (`idle`), and that both `runner.json` carry the
+      same image ID. Only then does the script end and the lock is released.
+   The abort rule inside the script: a failure after step 4 begins stops the script with the `.before-S` copies in place; Undo R
+   (below) starts from them, still under a fresh `flock`.
+3. Remove the pause (only if it is ours). Read-back **R-read**: `git hash-object` of the installed runner equals `S`'s blob; both
    `--check` print `idle`; after the next scheduled messaging backup `/opt/personal-os-probe/backups/status.json` shows `state: ok`
    with a new `last_success_id`, and the next calendar daily likewise; `production.py deploy --dry-run` no longer reports the runner
    blob refusal.
 
 Undo R: production.md "Backup runner" undo, in its order, under the same `flock` with the backup services idle (remove from
 `runner.json` every key the `.before-S` runner does not know, install the `.before-S` copy, then put back the image pin;
-the calendar `runner.json` from its `.before-<date>` copy). After the migration of n9 the old pin would fail every capture
+the calendar `runner.json` from its `.before-S` copy). After the migration of n9 the old pin would fail every capture
 (`unsupported_backup_schema`): then keep the new pin and undo only the runner if the production.md rule allows it; otherwise stop
 and report. The recordings files of later steps do not exist yet at this point.
+
+```sh
+# step-r.sh <sha> <src>   (run under: flock --nonblock /opt/personal-os-probe/backups/.runner.lock sh -eu step-r.sh ...)
+sha=$1 src=$2 ops=/opt/personal-os-probe/ops
+new=$src/services/messaging/messaging_service/backup_runner.py
+cfgs="/opt/personal-os-probe/backup-config/runner.json /opt/deedkit/calendar-backup/runner.json"
+idle() { out=$(python3 -I "$1" --config "$2" --check); case $out in *'"idle"'*) ;; *) echo "$2 not idle: $out"; exit 1;; esac; }
+for u in personal-os-backup.service deedkit-calendar-backup.service deedkit-autodeploy.service; do
+  case $(systemctl show -P ActiveState $u) in inactive|failed) ;; *) echo "$u not idle"; exit 1;; esac
+done
+image=$(docker image inspect -f '{{.Id}}' "deedkit-production-backup:$sha")
+case $image in sha256:*) ;; *) echo "no backup image for $sha"; exit 1;; esac
+test "$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" = "$sha"
+test ! -e "$ops/backup_runner.py.before-$sha"
+for c in $cfgs; do                                  # every preflight of both profiles, before the first write
+  test ! -e "$c.before-$sha"
+  idle "$new" "$c"
+  rm -f "$c.new"
+  python3 -I -c 'import json,os,sys;p,i=sys.argv[1:];c=json.load(open(p));c["image"]=i
+fd=os.open(p+".new",os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600);os.write(fd,(json.dumps(c,indent=2)+"\n").encode())
+os.fsync(fd);os.close(fd)' "$c" "$image"
+  idle "$new" "$c.new"
+done
+cp -p "$ops/backup_runner.py" "$ops/backup_runner.py.before-$sha"
+for c in $cfgs; do cp -p "$c" "$c.before-$sha"; done
+for c in $cfgs; do mv "$c.new" "$c"; done
+install -o root -g root -m 0600 "$new" "$ops/backup_runner.py"
+test "$(git hash-object "$ops/backup_runner.py")" = "$(git hash-object "$new")"
+for c in $cfgs; do                                  # verification, still inside the lock
+  idle "$ops/backup_runner.py" "$c"
+  test "$(python3 -I -c 'import json,sys;print(json.load(open(sys.argv[1]))["image"])' "$c")" = "$image"
+done
+echo "installed $(git hash-object "$ops/backup_runner.py"), image $image"
+```
 
 ## Step I1. The receiver instance on backup-1 (milestone I, part 2)
 
@@ -108,11 +154,22 @@ Nothing here touches the messaging or calendar instance, except the shared `inst
 
 1. **Wheel.** Build the wheel and the lock from `S` (`python scripts/build.py`, `services/messaging/requirements-backup-r2.lock`),
    inspect the contents (`unzip -l`: `backup_r2_receiver.py`, `backup_r2_verifier.py`, `backup_r2_follow.py`,
-   `backup_restore_worker.py`, `backup_recordings.py`, `backup_recordings_continuity.py`), copy to `backup-1`, and with both
-   existing verifier timers stopped and their services inactive (no pending `active.json`): `pip install --no-deps --force-reinstall`
-   into `/opt/deedkit-backup-r2/venv`, then `pip install --require-hashes -r <lock>`. Keep the previous wheel as
-   `/opt/deedkit-backup-r2/wheel.before-<date>`. Read-back: `python -c "import messaging_service.backup_r2_receiver as r; print(r.PROFILES)"`
-   prints `('messaging', 'calendar', 'recordings')`; start both existing timers again; their next runs end `idle` or `verified`.
+   `backup_restore_worker.py`, `backup_recordings.py`, `backup_recordings_continuity.py`), copy to `backup-1`.
+   **Capture first** (receipt, `systemctl show -P ActiveState,UnitFileState`): the state of both existing verifier timers and
+   services (`deedkit-backup-r2-verifier`, `deedkit-calendar-backup-r2-verifier` or the names `systemctl list-timers` shows),
+   `pip freeze` of the venv (`/opt/deedkit-backup-r2/venv`, saved as `freeze.before-<date>`), the previous wheel kept as
+   `/opt/deedkit-backup-r2/wheel.before-<date>` (copied before anything is replaced), and `TimeoutStartSec` of both services read
+   against BACKUP_R2.md "Install order" (`TimeoutStartSec=26400s`, the deadline pair of the verifier wheel): a service with a shorter
+   timeout is fixed (unit file from `S`, `daemon-reload`) **before** the wheel moves, because a wheel that waits for the receiver
+   lock needs the longer unit.
+   Then stop both existing timers and wait until both services are inactive and no `active.json` is pending (stop the timers in
+   **both directions**: the same stop applies before the install and before any undo that reinstalls a wheel). `pip install
+   --no-deps --force-reinstall` the wheel into the venv, then `pip install --require-hashes -r <lock>`. Read-back: `python -c "import
+   messaging_service.backup_r2_receiver as r; print(r.PROFILES)"` prints `('messaging', 'calendar', 'recordings')`. Restore both
+   timers to their **captured** states (not unconditionally enabled), start them if they were active; their next runs end `idle` or
+   `verified`. **A failure at any point of this item** (install, import, a timer that does not come back) is handled before the
+   abort rule goes on: reinstall the kept wheel and `freeze.before-<date>` with the timers still stopped, restore the captured
+   states, confirm both existing instances' next runs, then stop the plan.
 2. **Account objects.** Create the upload user `deedkit-recordings-backup` with a root-owned home and the `Match User` block and
    `AuthorizedKeysFile /etc/ssh/authorized_keys.d/deedkit-recordings-backup` (root, `0644`) as the calendar's, whose one line is
    `restrict,from="<prod tailnet address>",command="/opt/deedkit-backup-r2/venv/bin/python -I -m messaging_service.backup_r2_receiver --config /etc/deedkit-recordings-backup-r2/receive.json receive" <public key>`.
@@ -131,36 +188,68 @@ Nothing here touches the messaging or calendar instance, except the shared `inst
    `profile: recordings`, paths as above, `helper_image`/`helper_revision` equal to the two existing instances' current pins.
    Append `/etc/deedkit-recordings-backup-r2/verifier.json` to `/etc/deedkit-backup-r2/instances.json` (messaging first; copy
    kept as `instances.json.before-<date>`).
-6. **Pins.** The helper must be a revision that carries 728 (a helper older than it fails the recordings self-test with
-   `recordings_helper_failed`). If the current pins predate it: `python -m messaging_service.backup_r2_verifier --update-pins
-   --helper-image <ID of S's backup image> --helper-revision S`. It self-tests all three profiles on synthetic bundles under the
-   host lock and moves the pins of all three configs together, or none (production.md/BACKUP_R2.md "Two verifiers on one receiver").
-   Read back that all three configs show the same pair.
-7. **Rehearsal on a synthetic archive (before any real data).** With a dedicated synthetic prefix and a throwaway config
-   (BACKUP_R2.md "Scheduling and enrollment": the server-native synthetic drill), real age encryption and the pinned images:
-   make a synthetic recordings bundle (`synthetic_archive` + `create_recordings_snapshot` + `encrypt_snapshot` from the installed
-   wheel), deliver it through the forced SSH route with a throwaway key, and run the verifier on it. Check, with receipts of
-   statuses only: (a) the six checks pass and the first point is protected (`protect` path), (b) a second synthetic bundle with
-   one transcript emptied is refused `archive_content_lost` and the first point and its object stay, (c) a grown third bundle
-   rotates to two points then one, (d) restarts: the verifier is killed (`systemctl kill`) mid-run and re-run, and the receiver
-   process is restarted between delivery and verification, each ending in the same protected point, (e) the scratch
-   (`payload-*`, `secrets-*`) is gone after success, failure and restart, (f) the three profiles keep passing on the shared
-   pins. Remove only its exact owned objects, directories and config (never a bucket-wide delete).
-8. **Units.** Install `deploy/deedkit-recordings-backup-r2-verifier.service` and `.timer` into `/etc/systemd/system/` (`0644`),
-   `systemctl daemon-reload`, `systemctl enable --now deedkit-recordings-backup-r2-verifier.timer`. The timer finds no candidate and
-   writes `status.json` `idle`; that is correct before the first upload.
+6. **Helper image on backup-1, then the pins.** The helper must be a revision that carries 728 (a helper older than it fails the
+   recordings self-test with `recordings_helper_failed`). `--update-pins` only inspects images already in `backup-1`'s Docker
+   (`Docker.preflight`, `backup_r2_verifier.py:557`); it never pulls, and the image of `S` exists on `prod`, not on `backup-1`. So first:
+   - Acquire it on `backup-1` as the follow does (BACKUP_R2.md, the follow's step 3): `/usr/local/libexec/deedkit/attest-verify`
+     (empty environment) verifies the attestation of `ghcr.io/gosync-inc/deedkit-backup@sha256:<digest>` for `S` (the digest of
+     the image `S`'s `publish` job pushed; the same digest `production.py` resolved on `prod`), then `docker pull
+     ghcr.io/gosync-inc/deedkit-backup@sha256:<digest>` (the package is public: anonymous pull; if the registry asks for
+     credentials, stop and ask the orchestrator, never put a token on `backup-1` for this). Needs the verifier's `reserve_bytes`
+     (2 GiB) plus 4 GiB free on the Docker data root.
+   - Read back on `backup-1`: `docker image inspect -f '{{.Id}}'` equals the attested digest (config digest; manifest digest under the
+     containerd image store, BACKUP_R2.md), its `org.opencontainers.image.revision` label is `S`, and the same ID is the ID that
+     `prod`'s `deedkit-production-backup:S` has.
+   Only then, if the current pins predate 728: `python -m messaging_service.backup_r2_verifier --update-pins
+   --helper-image <that image ID> --helper-revision S`. It self-tests all three profiles on synthetic bundles under the host lock
+   and moves the pins of all three configs together, or none (production.md/BACKUP_R2.md "Two verifiers on one receiver"). Keep
+   `pins-previous.json`. Read back that all three configs show the same pair. A new pin pair is a change of the two existing
+   instances too: stop their timers again for this item (same rule as item 1: services inactive, no `active.json`) and restore
+   their captured states after the readback.
+7. **Rehearsal on a synthetic archive (before any real data), in separate isolated scenarios.** Each scenario has its **own**
+   dedicated synthetic prefix, throwaway config, receiver state and verifier directory (BACKUP_R2.md "Scheduling and enrollment":
+   the server-native synthetic drill), real age encryption and the pinned images; scenarios never share a protected point, a retry
+   journal or a receiver quota, because a refused bundle stays beside the protected object and its verifier retry journal survives
+   (a later upload would hit `receiver_quota`, `backup_r2_receiver.py:763`); the journal is never deleted to make a scenario pass.
+   Make each synthetic bundle with `synthetic_archive` + `create_recordings_snapshot` + `encrypt_snapshot` from the installed
+   wheel, deliver it through the forced SSH route with a throwaway key, and run the verifier on it. Receipts hold statuses only.
+   Scenarios (each ends with its own removal of its exact owned objects, directories and config; never a bucket-wide delete):
+   - **S1 enrollment and growth:** (a) the six checks pass and the first point is protected (`protect` path); (c) a grown second
+     bundle rotates to two points then one; (e) the scratch (`payload-*`, `secrets-*`) is gone after success.
+   - **S2 rejection:** on a fresh prefix and state, a first synthetic point is protected, then a bundle with one transcript emptied
+     is refused `archive_content_lost`; the first point and its object stay; the refusal and its retry journal are kept as the
+     evidence of the scenario and the scenario ends there (no third upload).
+   - **S3 restarts:** on a fresh prefix and state, the verifier is killed (`systemctl kill`) mid-run and re-run, and the receiver
+     process is restarted between delivery and verification (as the server-native drill's restart cases), each ending in the same
+     protected point; the scratch is gone after the failure and the restart.
+   - **S4 drill commands:** the commands of milestone D run end to end on S1's protected point (download, decrypt in the pinned
+     image, bundle verify, readback, facts compare, cleanup), so D uses only rehearsed commands.
+   - **S5 shared pins:** the three profiles keep passing on the shared pins.
+   Only the scenarios' own prefixes and directories are removed afterwards; the preserved S2 evidence is moved aside to
+   `*.removed-<date>` (root `0700`) with the other rehearsal leftovers and named in the receipt.
+8. **Units and the verifier-side checker.** Install `deploy/recordings-backup-freshness.py` on `backup-1` as
+   `/opt/deedkit-backup-r2/recordings-backup-freshness.py` (root, `0755`); this is the checker of the *verifier's* directory
+   (`--verifier-directory`) and runs only here. Install `deploy/deedkit-recordings-backup-r2-verifier.service` and `.timer` into
+   `/etc/systemd/system/` (`0644`), `systemctl daemon-reload`, `systemctl enable --now deedkit-recordings-backup-r2-verifier.timer`.
+   The timer finds no candidate and writes `status.json` `idle`; that is correct before the first upload. Read back the checker
+   before the first upload: `python3 -I /opt/deedkit-backup-r2/recordings-backup-freshness.py --verifier-directory
+   /var/lib/deedkit-recordings-backup-r2/verification --max-age-hours 30` exits 4 (stale: no success yet), and exits 5 on a
+   directory that does not exist.
 
 Read-back **I1-read**: wheel profiles line (above); `ssh -G`/`sshd -T` for the user show the forced command only; the three verifier
 timers active; `status.json` of the recordings instance `idle`; the messaging and calendar instances' next runs unchanged;
 `instances.json` and the three `verifier.json` pins equal; `receiver_schema_max` unchanged.
 
 Undo I1 (reverse order): `systemctl disable --now deedkit-recordings-backup-r2-verifier.timer` (let a running service end);
-remove the unit files and `daemon-reload`; restore `instances.json.before-<date>` and re-run `--update-pins` only if the pins
-changed in 6 and the previous pair is wanted (`pins-previous.json`); remove the `Match User` block and the `authorized_keys.d`
+remove the unit files, the checker and `daemon-reload`; restore `instances.json.before-<date>` and re-run `--update-pins` only if the
+pins changed in 6 and the previous pair is wanted (`pins-previous.json`); remove the `Match User` block and the `authorized_keys.d`
 file, `sshd -t`, reload; move `/etc/deedkit-recordings-backup-r2`, `/srv/backups/deedkit-recordings` and
-`/var/lib/deedkit-recordings-backup-r2` aside as `*.removed-<date>` (root `0700`, evidence, the recovery key included); the wheel
-back to `wheel.before-<date>` only with all verifier services inactive (an older wheel refuses nothing of the other two
-profiles: it does not know `recordings`, which is why the unit files go first). The R2 prefix holds only the rehearsal's removed objects.
+`/var/lib/deedkit-recordings-backup-r2` aside as `*.removed-<date>` (root `0700`, evidence, the recovery key included). The wheel
+goes back to `wheel.before-<date>` (with `freeze.before-<date>`) only in this order: stop the two existing timers (and the
+recordings timer, already disabled) and wait for all three verifier services to be inactive with no `active.json`; reinstall;
+restore the captured timer states of item 1; read back both existing instances' next runs (an older wheel refuses nothing of the
+other two profiles: it does not know `recordings`, which is why the unit files go first). The same applies when the undo is taken
+from a failure inside item 1 (item 1's own recovery text). The R2 prefix holds only the rehearsal's removed objects.
 
 ## Step I2. The producer side on prod (milestone I, part 3)
 
@@ -174,20 +263,35 @@ profiles: it does not know `recordings`, which is why the unit files go first). 
    `production.py` (never `compose up --build`, never by hand); the staging directory exists before that release, or Docker creates
    a root-owned one and the runner refuses it. Read back: the `Mounts` entry of the container, and
    `docker exec deedkit-recordings-recordings-api-1 ls -ld /run/deedkit/backup-staging` shows `10001` ownership.
+   **The mount identity is proved here, not by the first skip** (the recordings CLI answers `archive_disabled` before it looks at
+   any destination, `cli.py:17`): with `E` = the effective staging path (the `RECORDINGS_BACKUP_STAGING` value in the env file the
+   recordings project reads, else `/opt/deedkit/recordings-backup/staging`), require all of: the container's mount of destination
+   `/run/deedkit/backup-staging` is read-write and its `Source` (resolved) equals `realpath E`; `realpath E` equals the
+   `staging` path of `runner.json` (item 3) and the path step I2.1 created and chowned. Any inequality stops the plan (make `E` and
+   `runner.json` name one path; the compose side changes only through the release path, never by hand).
 3. **Recipient and config.** `recipient` = the public age line from step I1.4 (`0600` root). `runner.json` from
    `deploy/backup-runner-recordings.example.json` (`0600` root): `image` = messaging's pin after step R (the same ID), `transfer.host` =
    the backup-1 tailnet address, `transfer.user` = `deedkit-recordings-backup`, paths as the example, `container` as P6 read it,
    `recordings.timers` = the real timer files of the other profiles. Check: `python3 -I /opt/personal-os-probe/ops/backup_runner.py
    --config /opt/deedkit/recordings-backup/runner.json --check` prints `{"status":"idle","profile":"recordings"}`.
-4. **Units.** `deploy/deedkit-recordings-backup.service`, `.timer`, `-catchup.service`, `-catchup.timer` into `/etc/systemd/system/`
-   (`0644`), `daemon-reload`, then `systemctl enable --now deedkit-recordings-backup.timer deedkit-recordings-backup-catchup.timer`.
-   Optionally the freshness script: install `deploy/recordings-backup-freshness.py` as `/opt/deedkit/recordings-backup/freshness.py`
-   (`0755` root) for the read-backs below (it is read-only; no unit is needed for it).
+4. **Producer-side freshness checker, then units.** The catch-up unit's second `ExecCondition` runs
+   `/opt/deedkit/recordings-backup/freshness.py --status <status.json> --max-age-hours 22` and starts only on exit 4 or 5. The
+   checker with that interface is the calendar's `deploy/calendar-backup-freshness.py` (it reads `last_snapshot_at` from the runner's
+   `status.json`, which the runner writes for every profile at `finish`, `backup_runner.py:1097`); no new code. The verifier's checker
+   `recordings-backup-freshness.py` takes only `--verifier-directory` (exit 2 on `--status`) and is **not** the one for this unit, so it
+   is not installed on `prod`. **Before any timer is enabled**: install `deploy/calendar-backup-freshness.py` as
+   `/opt/deedkit/recordings-backup/freshness.py` (root, `0755`; a missing file exits 2, which the unit reads as "do not start"), and
+   read back the condition's three outcomes with the exact unit command on a copy of the status path: a status file with a
+   `last_snapshot_at` of now exits 0 (`fresh`; condition false), one with a time 23 hours old exits 4, a missing path exits 5 (both start
+   the catch-up). In the pre-activation state `status.json` has no `last_snapshot_at` (archive off): the checker exits 4, so
+   the 23:15 catch-up starts and ends with the same `recordings_skipped_archive_disabled`; that is expected and harmless. Then
+   `deploy/deedkit-recordings-backup.service`, `.timer`, `-catchup.service`, `-catchup.timer` into `/etc/systemd/system/` (`0644`),
+   `daemon-reload`, then `systemctl enable --now deedkit-recordings-backup.timer deedkit-recordings-backup-catchup.timer`.
 5. **First run, archive off.** Do not wait for 21:30: `systemctl start deedkit-recordings-backup.service` once, in an allowed window
    and not within 15 minutes of another profile's timer (the runner decides; a `recordings_skipped_window` is also a valid
    answer, repeat later). The run reaches the container: its `docker exec ... --backup-to` answers `archive_disabled`, which proves the
-   container name, the config path and the mount without data. Expected: exit 0, `status.json` of the recordings job `state: skipped`
-   with `recordings_skipped_archive_disabled`, staging empty, no worker container, no bundle, nothing delivered.
+   container name and the config path (the mount was proved in item 2). Expected: exit 0, `status.json` of the recordings job
+   `state: skipped` with `recordings_skipped_archive_disabled`, staging empty, no worker container, no bundle, nothing delivered.
 
 Read-back **I-read** (milestone I verified): the file modes (`stat`), the `--check` line, the skip status and code, `ls -A staging`
 empty, `systemctl list-timers 'deedkit-recordings-*' 'deedkit-calendar-*' personal-os-backup.timer` listing every timer with
@@ -197,7 +301,8 @@ times. The recordings-api health and `archive_status` (`archive disabled`) uncha
 Undo I2: `systemctl disable --now deedkit-recordings-backup.timer deedkit-recordings-backup-catchup.timer`; let a running
 `deedkit-recordings-backup.service` end or `systemctl stop` it (its `ExecStopPost` recovers); go on only when it is inactive, no
 `deedkit-recordings-backup-*` container exists, `/opt/deedkit/recordings-backup/state/.unsettled` and
-`/opt/personal-os-probe/backups/.runner.lock.unsettled` are absent and `--check` prints `idle`; remove the units, `daemon-reload`;
+`/opt/personal-os-probe/backups/.runner.lock.unsettled` are absent and `--check` prints `idle`; remove the units and
+`/opt/deedkit/recordings-backup/freshness.py` (it goes with the directory below), `daemon-reload`;
 move `/opt/deedkit/recordings-backup` aside (`*.removed-<date>`, root `0700`, keep its journal and status). A failed check stops the
 undo. Messaging's and the calendar's files are not touched. The staging mount stays (harmless without the timer).
 
@@ -210,19 +315,24 @@ Applied by the ops step of this plan; the agent only checks the owner's key and 
 2. **Namespace.** For each account to archive generate a fresh 32-hex `archive_namespace` once (`python3 -I -c "import secrets;
    print(secrets.token_hex(16))"`; record the first 6 characters in the receipt, not the value elsewhere). Omi first; PLAUD only
    if its key is in place and the owner's 11-03 words cover it (they cover Omi and PLAUD text, not audio).
-3. **Config.** Back up `config.json` (`cp -p` to `config.json.before-<date>` inside the private directory, mode kept). Write the new
+3. **Config.** Keep an **immutable pre-activation copy**: `cp -p config.json config.json.pre-activation` inside the private
+   directory (mode kept; the command is `test ! -e` guarded, and the file is never overwritten, moved or edited afterwards). Every
+   later change (this item, the sizing of item 5) additionally keeps its own copy `config.json.before-<date>-<n>` (`n` counts the
+   changes of the day, also create-only). Write the new
    document to a `.new` file in the same directory (`0600`, owner 10001) from `deploy/recordings-archive.example.json`'s shape: the
    `archive` block (`directory: /data/archive`, `poll_seconds: 300`, `max_bytes: 4294967296`, `free_reserve_bytes: 1073741824`,
    `omi_budget: {transcript_per_hour: 18, reads_per_hour: 45}`) and the `archive_namespace` of the chosen accounts; **no
-   `event_router` block** (ANYM-732/733 own it). Validate with the image's own loader before replacing: `docker run --rm --network none --read-only --user 10001
-   -v <private dir>:/run/deedkit/recordings:ro <recordings image of S> python -I -c "from deedkit_recordings.security import
+   `event_router` block** (ANYM-732/733 own it). Validate with the image's own loader before replacing (the image's `ENTRYPOINT` is
+   `deedkit-recordings`, `services/recordings/Dockerfile:12`, so the interpreter is named with `--entrypoint`): `docker run --rm --network none
+   --read-only --user 10001 -v <private dir>:/run/deedkit/recordings:ro --entrypoint python <recordings image of S> -I -c "from deedkit_recordings.security import
    read_document as r; d,_=r('/run/deedkit/recordings/config.json.new'); print(d.archive is not None, len(d.accounts))"` must print
    `True <n>` (it prints no value of the file); then `mv config.json.new config.json` (atomic replace inside the directory).
 4. **Start.** The collector reads the configuration each pass; read `archive_status` after one `poll_seconds` plus a minute. If the
    traversal has not started, restart **only** `recordings-api` (`docker compose $F restart recordings-api`; admission re-checks the
    egress rules) and read again. The first start applies schema 3 (additive, single writer).
 5. **Sizing, after the first hour.** Read `archive_status` (`traversal.discovered_total`, `projected_db_bytes`, `capacity_warning`,
-   `usage`). Set `max_bytes = 3 x projected_db_bytes` (plus `free_reserve_bytes` of free space) by the same backup-and-atomic-replace;
+   `usage`). Set `max_bytes = 3 x projected_db_bytes` (plus `free_reserve_bytes` of free space) by a **new** create-only copy
+   `config.json.before-<date>-<n>` and the same validate-then-atomic-replace of item 3 (`config.json.pre-activation` is not touched);
    if `capacity_warning` shows or the free space on the archive volume is below the reserve plus one expected archive, stop polling
    (Undo A) and report.
 
@@ -231,8 +341,12 @@ for this collector so agents keep the rest), `db_bytes` below the ceiling; `dock
 the on-demand tools still answer for the existing principals (a read-only `recordings_capabilities`, no content request); the gateway
 policy revision unchanged; no new principal or grant; the egress admission still passes (`docker logs` shows no `exit 78` loop).
 
-Undo A: restore `config.json.before-<date>` (atomic replace) or remove the top-level `archive` and every `archive_namespace`; the
-service stops new collection (README "Optional private text archive"); stop only `recordings-api` if the collector must end at once.
+Undo A: put back **`config.json.pre-activation`** (the archive-off document of item 3, copied back by `cp -p` to `.new` and an atomic
+`mv`; never a `before-<date>-<n>` copy, which may already be an enabled document) or remove the top-level `archive` and every
+`archive_namespace`; the service stops new collection (README "Optional private text archive"); stop only `recordings-api` if the
+collector must end at once. **Verify that collection stopped**: after one `poll_seconds` plus a minute `archive_status` answers
+`archive disabled` (or its traversal counters stop moving between two reads a minute apart) and the container's log shows no
+poll. If it still collects, restart only `recordings-api` and read again; an undo that leaves polling on is not done.
 Keep the archive directory and its state intact for re-enable or recovery; do not delete it.
 
 ## Milestone V. The first protected snapshot
@@ -252,10 +366,18 @@ Keep the archive directory and its state intact for re-enable or recovery; do no
 Read-back **V-read**: the job's `status.json` `state: ok` with `archive_bytes` and a `last_success_id`; on `backup-1` the verifier's
 `last-success.json`, a `proof-<id>.json` whose `verification.archive` equals the job's manifest (`archive_id`, `incarnation`,
 `sequence`, `records`) and whose counters are consistent with `archive_status` (records within the discovery count), the protected
-marker present and naming that backup, exactly one object under the prefix, `continuity.json` present (`run` equals the verification
-id; no text in it: `grep -c` of a known word is 0), staging on `prod` empty, no `payload-*` or `secrets-*` left on `backup-1`, and
-`recordings-backup-freshness.py --verifier-directory /var/lib/deedkit-recordings-backup-r2/verification --max-age-hours 30
---state <state file>` printing `fresh` with the bytes and identity. The messaging and calendar dailies of that day are `ok`.
+marker present and naming that backup, exactly one **ciphertext object** under `<prefix>/objects/` (the protected backup also has
+its receipt under `receipts/`; count the two prefixes separately, `ls`/`find ... | wc -l`, never `grep -c`, whose exit 1 on zero
+matches stops a `sh -e` read-back), `continuity.json` present with `run` equal to the verification id and a **structure check**
+instead of a word search: the verifier's own `backup_r2_verifier.read_baseline` (called from the installed wheel on an open
+descriptor of the verification directory, root) returns a baseline whose `run` equals the verification id and whose `facts` pass
+`backup_recordings_continuity.validate_facts` (exact keys, counts and hash strings only); the read-back prints `ok` or the refusal
+code, never the content, staging on `prod` empty, no `payload-*` or `secrets-*` left on `backup-1`, and (on
+`backup-1`, where the verifier's directory is)
+`python3 -I /opt/deedkit-backup-r2/recordings-backup-freshness.py --verifier-directory /var/lib/deedkit-recordings-backup-r2/verification
+--max-age-hours 30 --state <state file>` printing `fresh` with the bytes and identity (exit 0). On `prod`, the catch-up condition's
+checker (`freshness.py --status ... --max-age-hours 22`) now exits 0 with the new `last_snapshot_at`, so the 23:15 catch-up does not
+start. The messaging and calendar dailies of that day are `ok`.
 A refusal instead (`archive_content_lost`, `archive_identity_changed`, any helper code) is not retried blindly: read the status, keep
 the evidence, stop polling if the cause is the archive (Undo A), report.
 
@@ -269,31 +391,59 @@ itself is untouched.
 Production-parity: the protected point from R2, decrypted with the instance's own recovery key, restored into a scratch directory,
 checked, then removed. It never touches the live archive volume.
 
-1. On `backup-1` as root, with no verification running, make a scratch directory `/var/lib/deedkit-recordings-backup-r2/drill-<date>`
-   (`0700`). Download the protected object and verify its full ciphertext hash and size against its receipt (BACKUP_R2.md "Commit,
-   download and independent restore"), decrypt it with `restore/identity.agekey`, and extract the two members. The key and the
-   plaintext never leave `backup-1`.
-2. Place the member as `<scratch>/archive.sqlite` (`0600`). Run, in a throwaway container with `--network none --read-only`
-   (the backup image, no volume but the scratch): `verify_recordings_bundle` on the extracted bundle (structure, hashes, schema,
-   `integrity_check`, identity), then a **synthetic** readback against the restored copy using a synthetic configuration (no real
-   token, no path of the live archive): the installed recordings code opens the file read-only and answers an `archive_status`-like
-   count query and a search for a fixed synthetic token, and `continuity.archive_facts` produces the hash-only facts. Print counts
-   and the OK lines only, never text.
+The drill is the manual twin of the verifier's scheduled restore, so it takes the verifier's admission instead of bypassing it
+(`BACKUP_R2.md` "One heavy restore at a time"). Its commands are the ones rehearsed in I1.7 S4.
+
+1. **Admission and bounds, on `backup-1` as root.** Stop the three verifier timers (record their states, restore them at the end
+   and on every failure path), wait until the three verifier services are inactive and no `active.json` or `host_directory/
+   admission.json` is pending. Then run everything below under the host lock in a bounded shell: `timeout 3600 flock --nonblock
+   <host_directory>/host.lock sh -eu drill.sh` (`host_directory` from the three verifier configs, the shared value, default
+   `/var/lib/deedkit-backup-verify`; `flock` is the primitive the verifier uses, `backup_r2_verifier.py:248`). Check the free space on
+   the filesystem of the scratch against `3 x` the protected object's size plus the verifier's `reserve_bytes`, and the Docker
+   data root has the reserve; otherwise stop. The scratch is `/var/lib/deedkit-recordings-backup-r2/drill-<date>` (root `0700`).
+   **Failure cleanup** (a `trap` in `drill.sh` and the abort rule): remove only the exact container `deedkit-drill-recordings-<date>`
+   (`docker rm` by that name; started with `--rm`, so `docker stop`) and the exact scratch directory (`rm -r` of the path, cwd outside
+   it), then restore the timers; evidence of the failure (the receipt lines) is kept.
+2. **Download, decrypt, verify.** Download the protected object by its logical id with the instance's `operator.json`
+   (`backup_r2_receiver ... download --id <id> --output <scratch>/candidate.tar.age`, BACKUP_R2.md "Commit, download and independent
+   restore"; the download verifies the full ciphertext size and SHA-256 and publishes atomically), compare them with the receipt.
+   Then one throwaway container of the **backup image pinned for the instance** (`messaging_service` is in it; the recordings image
+   is not and is not needed): `docker run --rm --name deedkit-drill-recordings-<date> --network none --read-only --user <the
+   verifier's helper user> -v <scratch>:/drill --entrypoint python -v <identity>:/identity:ro <backup image> -I -c <code>` (the
+   image has `ENTRYPOINT []`, `services/messaging/Dockerfile:202`; `age` is the helper's own, `backup_crypto.decrypt_snapshot_stream(
+   source, identity, destination, age='age', max_bytes=...)` with an explicit `max_bytes` bound; if the rehearsal shows a temp
+   directory is needed, mount a subdirectory of the scratch as `/tmp`). The code, in this order: decrypt and extract into
+   `/drill/bundle/` **preserving the layout** (`manifest.json`, `state/archive.sqlite`, the two members of `MEMBERS`);
+   `backup_recordings.verify_recordings_bundle('/drill/bundle')` (structure, hashes, schema, `integrity_check`, identity);
+   `backup_recordings_continuity.readback('/drill/bundle/state/archive.sqlite')` (a full-text search on a synthetic query and a
+   context read of the three newest records that hold text, checked against the index rows: this is the search/context assertion, it
+   returns nothing readable and raises `readback_failed`); `backup_recordings_continuity.archive_facts(...)` for the hash-only
+   facts. It prints only `ok` lines, counts, identity counters and hashes, never a text.
 3. Compare: `archive_id`, `incarnation`, `sequence` and `records` from the restored copy equal the manifest and the proof's;
    `continuity.json`'s facts equal the restored copy's facts (hash for hash).
 4. Record the receipt (the backup id, ciphertext hash, sizes, the identity line, the four check results, the times). Remove the
    scratch directory (`rm -r` with the exact path, cwd outside it) and read back that it is gone; the recovery key and every other
    file are untouched.
 5. **Restore procedure for a live volume (documented here, not executed by this plan).** Stop only `recordings-api`; move the live
-   archive directory aside whole (`archive.removed-<date>`, kept as evidence); place the restored `archive.sqlite` (`0600`, owner 10001)
-   in a new `0700` directory with **no** `journal.marker`; start the service. The mismatched or missing marker bumps the incarnation
-   to the clock's minute and gives the journal a new `journal_id` (README "Identity"), so a restored archive never reuses event
-   identities; the module router then reports a source reset and waits for its operator (`set-module-cursor`). The next backup judges the
-   candidate against the baseline: a higher incarnation is accepted, and if the restored snapshot lost parts the continuity rules
-   refuse it until the operator re-baselines with a reason (`--rebaseline`, BACKUP_R2.md).
+   archive directory aside whole (`archive.removed-<date>`, kept as evidence); create the new directory **as owner 10001** (`install -d
+   -o 10001 -g 10001 -m 0700`; root-created, the UID-10001 store rejects it) and place the restored `archive.sqlite` in it (`0600`,
+   `10001:10001`), with **no** `journal.marker`; start the service. What the restart does depends on the feed, and both cases are
+   read back (`archive_status` identity, never content):
+   - **This plan's state (no `event_router` block).** `maintain_feed` returns at once when `doc.event_router is None`
+     (`archive.py:395`): the restart neither keeps nor writes a marker and bumps no incarnation. The restored database keeps the
+     snapshot's own `archive_id`, `incarnation` and `sequence`; read the identity back and record it (expected: equal to the
+     manifest's, not a bumped one; a different value stops the procedure).
+   - **With the feed enabled (ANYM-732/733).** A missing or mismatched marker bumps the incarnation to `max(database, marker, epoch,
+     clock)+1` and, when the existing epochs require it, gives the journal a new `journal_id` (README "Identity"), so a restored archive
+     never reuses event identities; the module router then reports a source reset and waits for its operator (`set-module-cursor`).
+   The next backup judges the candidate against the baseline. A candidate whose `sequence` is below the baseline's is refused
+   `archive_sequence_lower` (a restore from an older point), and so is a snapshot that lost parts under the continuity rules; the
+   operator, after reading the refusal and keeping its evidence, may re-baseline with a reasoned `--rebaseline` (BACKUP_R2.md). Nothing
+   is re-baselined by this plan.
 
-Read-back **D-read**: the receipt lines above and the absence of the scratch. Undo D: none needed (the drill changed nothing);
-if it stopped midway, remove only the scratch directory.
+Read-back **D-read**: the receipt lines above, the absence of the scratch and of the container `deedkit-drill-recordings-<date>`, the
+host lock free, and the three verifier timers back in their captured states with their next runs scheduled. Undo D: the drill changed
+no data; if it stopped midway, remove only the exact container and scratch directory of item 1 and restore the timers.
 
 ## Order and timing
 
@@ -324,6 +474,10 @@ an hour before 21:30. If a window closes mid-step, the stage's undo or the abort
    not get a slot of its own, by design (one heavy restore per host).
 4. `max_bytes` starts at the example's 4 GiB and is sized from the first discovery count, as production.md "Omi backfill sizing".
 5. Where a read-back cannot be done on the real flow (a receiver restart exactly between a delivery and its verification), the
-   synthetic rehearsal of I1.7 stands in and the receipt says so.
+   synthetic rehearsal of I1.7 (scenario S3) stands in and the receipt says so.
+6. The catch-up unit's freshness check reuses the calendar's `deploy/calendar-backup-freshness.py` (same `--status` interface and
+   `last_snapshot_at` field) instead of a new recordings-specific producer script: no code change in this PR.
+7. The drill is a manual run under the verifier's host lock with the three timers stopped (no new tool); a scripted drill mode in
+   the verifier is a possible follow-up card, not part of this plan.
 6. The plan leaves ANYM-730 (deletion, tombstones) and ANYM-732/733 (the event router block) out; the tombstone contract
    (`tombstones(provider_hash)`, SHA-256 of namespace NUL provider_id) is in BACKUP_R2.md.
