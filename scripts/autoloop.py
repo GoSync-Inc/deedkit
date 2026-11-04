@@ -1211,7 +1211,7 @@ LAUNCHER = ROOT / 'deploy' / 'autoloop-runner' / 'launch.py'  # the container ru
 # change-path signal grep (file names, then changed lines) and the autoloop protected paths with their test-directory
 # rules. Every path list matches in any case (`migrations/X.SQL`, `prod.dockerfile`, `AGENTS.MD` on a case-insensitive
 # checkout); only TEST_FILE, an exemption, stays exact, so an odd-case test name is a helper.
-SIGNAL_PATHS = re.compile(r'^\.github/workflows/|main-ruleset\.json|\.sql$|migrations/|gitleaks|compose|'
+SIGNAL_PATHS = re.compile(r'^\.github/workflows/|main-ruleset\.json|\.sql$|migrations/|gitleaks|compose|^deploy/modules/|'
                           r'\.claude/settings\.json|^AGENTS\.md$|^docs/operations/feedback-autoloop\.md$', re.I)
 SIGNAL_TEXT = re.compile(r'^[-+].*(secret|permissions|: *write|write-all|\b(GRANT|REVOKE|DROP|TRUNCATE|DELETE FROM|'
                          r'RENAME)\b|ALTER )', re.I)

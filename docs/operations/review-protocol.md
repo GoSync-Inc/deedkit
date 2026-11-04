@@ -43,7 +43,7 @@ list: release, deploy and `production.py`, sends and live provider-session code.
 - `Change path:` signal grep:
 
   ```sh
-  git diff --no-renames --name-only origin/main... | grep -E -i '^\.github/workflows/|main-ruleset\.json|\.sql$|migrations/|gitleaks|compose|\.claude/settings\.json|^AGENTS\.md$|^docs/operations/feedback-autoloop\.md$'
+  git diff --no-renames --name-only origin/main... | grep -E -i '^\.github/workflows/|main-ruleset\.json|\.sql$|migrations/|gitleaks|compose|^deploy/modules/|\.claude/settings\.json|^AGENTS\.md$|^docs/operations/feedback-autoloop\.md$'
   git diff -U5 origin/main... | grep -E -i '^[-+].*(secret|permissions|: *write|write-all|\b(GRANT|REVOKE|DROP|TRUNCATE|DELETE FROM|RENAME)\b|ALTER )'
   ```
 

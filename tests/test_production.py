@@ -2807,6 +2807,9 @@ class Deployer:
             return f"{len(self.contents[command[2]])}\n"
         if command[:2] in (["cat-file", "blob"], ["cat-file", "-s"]):
             raise p.Refused("git failed (exit 128); production was not accepted")
+        if command[:1] == ["ls-tree"]:  # ANYM-745: the files of a directory at a commit, from `contents`
+            prefix = f"{command[-2]}:{command[-1]}"
+            return "\0".join(key.split(":", 1)[1] for key in self.contents if key.startswith(prefix)) + "\0"
         return ""  # clone and fetch of the blobless mirror
 
     def deploy(self, **options):
@@ -3002,6 +3005,73 @@ def test_deploy_pauses_when_the_configuration_changed_since_the_current_release(
         host.http["http_release"]["drain_timeout"] = 1
     outcome = host.deploy()
     assert outcome["status"] == "halted" and "changed since" in outcome["reason"] and host.steps == []
+
+
+MODULE_MANIFEST = (ROOT / "deploy/modules/recordings.json").read_text()
+
+
+def enroll_required(sha):
+    return f"enroll_required: recordings: production.py enroll --module recordings --sha {sha} --plan"
+
+
+# spec: ANYM-745
+def test_a_module_manifest_in_the_range_pauses_with_the_enroll_command_and_enrolls_nothing(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch, changes={NEWEST: ["deploy/modules/recordings.json"]})
+    host.contents[f"{NEWEST}:deploy/modules/recordings.json"] = MODULE_MANIFEST
+    outcome = host.deploy(auto=True)
+    assert outcome["status"] == "halted" and outcome["reason"] == enroll_required(NEWEST)
+    assert host.steps == [] and host.paused() == outcome["reason"]
+
+
+# spec: ANYM-745
+def test_a_manifest_for_a_module_the_host_already_runs_is_an_ordinary_release(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch, changes={NEWEST: ["deploy/modules/recordings.json"]})
+    host.contents[f"{NEWEST}:deploy/modules/recordings.json"] = MODULE_MANIFEST
+    host.settings["projects"].append({"name": "deedkit-recordings", "directory": str(tmp_path), "files": [],
+                                      "services": {"recordings-api": "recordings"}})
+    # The configuration differs from the recorded one by that enrollment only, so the pause names the command.
+    assert host.deploy(auto=True)["reason"] == enroll_required(NEWEST)
+
+
+# spec: ANYM-745
+def test_a_configuration_that_differs_only_by_an_enrollment_pauses_with_the_enroll_command(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    host.contents[f"{NEWEST}:deploy/modules/recordings.json"] = MODULE_MANIFEST
+    host.settings["projects"][0]["files"].append(str(tmp_path / "compose.gateway-recordings.yaml"))
+    host.settings["projects"].append({"name": "deedkit-recordings", "directory": str(tmp_path),
+                                      "files": [str(tmp_path / "compose.recordings.yaml")],
+                                      "services": {"recordings-api": "recordings"}})
+    outcome = host.deploy(auto=True)
+    assert outcome["status"] == "halted" and outcome["reason"] == enroll_required(NEWEST) and host.steps == []
+
+
+# spec: ANYM-745
+def test_a_drift_beyond_an_enrollment_keeps_the_apply_by_hand_pause(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    host.contents[f"{NEWEST}:deploy/modules/recordings.json"] = MODULE_MANIFEST
+    host.settings["projects"].append({"name": "deedkit-recordings", "directory": str(tmp_path), "files": [],
+                                      "services": {"recordings-api": "recordings"}})
+    host.settings["projects"][0]["services"]["indexer"] = "indexer"  # something else changed too
+    outcome = host.deploy(auto=True)
+    assert outcome["status"] == "halted" and outcome["reason"].endswith("; apply the next release by hand")
+    assert "enroll_required" not in outcome["reason"]
+
+
+# spec: ANYM-745
+def test_production_md_names_every_enrollment_refusal_code_and_the_pause_text():
+    docs = " ".join((ROOT / "docs/operations/production.md").read_text().split())
+    assert not [code for code in p.ENROLL_CODES if f"`{code}`" not in docs]
+    assert "enroll_required: <module>: production.py enroll --module <module> --sha <sha> --plan" in docs
+    assert "plan_digest" in docs and "deploy/modules/<module>.json" in docs
+
+
+# spec: ANYM-745
+def test_the_review_signal_grep_and_the_deploy_rules_cover_module_manifests():
+    protocol = (ROOT / "docs/operations/review-protocol.md").read_text()
+    pattern = re.search(r"grep -E -i '([^']+)'", protocol)[1]
+    assert re.search(pattern, "deploy/modules/recordings.json", re.IGNORECASE)
+    rules = (ROOT / ".claude/rules/deploy.md").read_text()
+    assert '"deploy/**"' in rules
 
 
 # spec: ANYM-711
