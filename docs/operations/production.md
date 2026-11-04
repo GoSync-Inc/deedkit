@@ -1942,9 +1942,11 @@ and the edits are made by hand from it.
 `gateway` (`overlay` a repository path or null, and `policy`: `module`, `backend_url`, `tools`, `principals` with their
 `grants`, `key_dir` as an absolute host directory, `key_file_pattern` with `{principal}`, `key_uid`); `egress`
 (`outside` false, or true with `admission_env` (`blocked` and `open` variable names), `canary`, `verify` (a command whose
-first word is a repository script `scripts/*_egress_check.py`), `verify_env` and `open` targets); `private_config`
-(`mount` the container directory the Compose file mounts, `file` its configuration file, `forbidden_keys` the key paths
-that must be absent at first start); `owner_steps` (strings the plan prints); `live_actions` (always empty). Secrets never
+first word is a repository script `scripts/*_egress_check.py`), `verify_env`, `open` targets, `blocked` (the address
+classes `host` and `tailnet` that need a blocked target with a known listener) and `controls` (`dns_env`, the variable
+whose resolver must be an open `dns:` target: the positive control)); `private_config` (`mount` the container directory
+the Compose file mounts, `file` its configuration file, `forbidden_keys` the key paths that must be absent at first start,
+`credential_files` the key paths whose values are provider credential files under that mount); `owner_steps` (strings the plan prints); `live_actions` (always empty). Secrets never
 live in a manifest.
 
 *Refusal codes.* Manifest (one cause each): `manifest_missing`, `manifest_invalid`, `manifest_unknown_key`,
@@ -1966,7 +1968,14 @@ target is not in the env file), `egress_verify_failed` (the verify script did no
 gateway key file is missing, not a regular file, not mode 0600, not owned by `key_uid`, or empty), `policy_unreadable`,
 `policy_check_failed` (the candidate is not additions only, or `deedkit-gateway --check` fails in any serving gateway
 image: every distinct image of a running `gateway` or `http-gateway-*` container), `private_config_unreadable` and
-`private_config_forbidden_key`. The last one reads the private configuration the container will actually mount (resolved
+`private_config_forbidden_key`, `credential_file_invalid` (a file named at a `credential_files` path is missing, outside
+the mount, not a regular file, readable by group or other, not owned by the configuration's owner, or empty: mode, owner
+and size only, never a byte), `egress_target_invalid` (a blocked target that is not `IP:PORT`),
+`egress_blocked_incomplete` (no blocked target in a class the manifest requires), `egress_control_missing` (the open
+targets lack `dns:<resolver>`) and `command_timeout` (a command outside the probes exceeded its time limit; a probe that
+times out refuses with its own code). The verify script gets a private `--env-file` holding exactly the `verify_env`
+values this plan checked, never the process environment. A malformed manifest the range does not change is not parsed by a
+deploy, and a deploy gates the range of the release it selects, not the tip of main. The `private_config_forbidden_key` check reads the private configuration the container will actually mount (resolved
 from the Compose document, so a changed `RECORDINGS_STATE_DIR` selects another file) and refuses when a forbidden key,
 for recordings `archive` or `accounts[*].archive_namespace`, is present: a first enrollment is on-demand reads only
 (docs/DATA-POLICY.md). Only the presence of a key is read, never a value.
@@ -1977,7 +1986,8 @@ accepts exactly two services); the gateway project's `files` with the overlay in
 `http-production.json`; the `env_files` entry; the candidate policy (revision plus one, additions only, listed); the owner
 steps. The output ends with `plan_digest`, the sha256 of the SHA, the manifest blob id, both configuration digests, the live
 policy digest, every overlay digest, the grants, the verify and canary values, the content digests of the env file and of the
-mounted private configuration, and the digests of the resolved Compose documents. Recomputing the plan gives the same digest
+mounted private configuration, the digest of the candidate policy (so a replaced key changes it) and the digests of the resolved Compose documents (the
+project, the plan A gateway and the HTTP gateway, each in its own directory with its own files). Recomputing the plan gives the same digest
 only while none of them changed; the apply command (ANYM-746) refuses a different `--plan-digest`.
 
 *Review sequence.* The manifest pull request is reviewed as code like any change under `deploy/` (the review-protocol

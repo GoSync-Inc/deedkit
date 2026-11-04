@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tarfile
 
@@ -18,7 +19,8 @@ RECORDINGS = (ROOT / "deploy/modules/recordings.json").read_text()
 OVERLAY = b"name: deedkit-recordings\nservices:\n  recordings-api: {}\n"
 GATEWAY_OVERLAY = b"services:\n  gateway:\n    networks: [recordings-backend]\n"
 SECRET = "synthetic-secret-value-0001"
-STATE_CONFIG = {"accounts": [{"id": "omi-a", "provider": "omi"}]}
+TOKEN_FILE = "/run/deedkit/recordings/omi.key"
+STATE_CONFIG = {"accounts": [{"id": "omi-a", "provider": "omi", "token_file": TOKEN_FILE}]}
 POLICY = {
     "version": 1, "revision": 22,
     "deployment": {"modules": ["messaging", "calendar"],
@@ -33,13 +35,20 @@ POLICY = {
          "grants": {}, "credentials": {}},
     ],
 }
+
+
+def key_credential(principal):
+    key = hashlib.sha256((SECRET + principal).encode()).hexdigest()
+    return f"principals.{principal}.credentials.recordings = key_file /run/deedkit/keys/recordings-{principal}.key, key_sha256 {key}"
+
+
 GOLDEN_ADDED = [
-    "revision 22 -> 23", "deployment.modules + recordings", "deployment.backends.recordings",
+    "revision 22 -> 23", "deployment.modules + recordings", "deployment.backends.recordings = http://recordings-api:13234",
     "principals.owner-claude-code.grants.recordings = recordings:read, recordings:content",
-    "principals.owner-claude-code.credentials.recordings", "profiles.full.tools + recordings_capabilities",
+    key_credential("owner-claude-code"), "profiles.full.tools + recordings_capabilities",
     "profiles.full.tools + recordings_list", "profiles.full.tools + recordings_read",
     "principals.claude-code.grants.recordings = recordings:read, recordings:content",
-    "principals.claude-code.credentials.recordings", "profiles.ro.tools + recordings_capabilities",
+    key_credential("claude-code"), "profiles.ro.tools + recordings_capabilities",
     "profiles.ro.tools + recordings_list", "profiles.ro.tools + recordings_read",
 ]
 
@@ -71,6 +80,9 @@ class Enroller:
         (self.deploy / "compose.gateway.yaml").write_text("services: {gateway: {}}\n")
         (self.deploy / "compose.gateway.yaml").chmod(0o640)
         (self.state_dir / "config.json").write_text(json.dumps(STATE_CONFIG))
+        self.token = self.state_dir / "omi.key"
+        self.token.write_text(SECRET + "-provider\n")
+        self.token.chmod(0o600)
         self.env = self.private / "recordings.env"
         self.write_env()
         for principal in ("owner-claude-code", "claude-code"):
@@ -103,7 +115,8 @@ class Enroller:
 
     def write_env(self, **changes):
         variables = {"RECORDINGS_STATE_DIR": str(self.state_dir), "RECORDINGS_RESOLVER": "10.99.0.2",
-                     "RECORDINGS_EGRESS_BLOCKED": "192.0.2.254:9,10.99.0.1:22", "RECORDINGS_EGRESS_OPEN": "api.omi.me:443,dns:10.99.0.2",
+                     "RECORDINGS_EGRESS_BLOCKED": "192.0.2.254:9,10.99.0.1:22,100.64.0.5:22",
+                     "RECORDINGS_EGRESS_OPEN": "api.omi.me:443,dns:10.99.0.2",
                      "INFERENCE_MINI_IP": "10.99.0.9", "OMI_TOKEN": SECRET, **changes}
         self.env.write_text("".join(f"{key}={value}\n" for key, value in variables.items() if value is not None))
         self.env.chmod(0o600)
@@ -116,12 +129,19 @@ class Enroller:
     def run(self, argv, **kwargs):
         self.calls.append(argv)
         if argv[0] == sys.executable:
+            if isinstance(self.verify_output, Exception):
+                raise self.verify_output
+            # The verifier reads `--env-file`, never the environment: record what it would read.
+            self.verified_with = (argv, kwargs.get("env"), Path(argv[argv.index("--env-file") + 1]).read_text()
+                                  if "--env-file" in argv else None)
             return self.verify_output
         if argv[:2] == ["docker", "compose"]:
             return self.compose(argv)
         if argv[:2] == ["docker", "ps"]:
             return "".join(f"{image}\tgateway\n" for image in self.images) + "other:1\tmessaging\n"
         if argv[:2] == ["docker", "run"]:
+            if isinstance(self.gateway_valid, Exception):
+                raise self.gateway_valid
             return json.dumps({"valid": self.gateway_valid, "revision": 23}) + "\n"
         assert argv[0] == "git", argv
         command = argv[3:]
@@ -215,6 +235,15 @@ MANIFEST_REFUSALS = [
     ("manifest_verify_script", set_path("egress", "verify", value=["../x_egress_check.py"])),
     ("manifest_verify_script", set_path("egress", "verify", value=["scripts/recordings_egress_check.sh"])),
     ("manifest_live_actions", set_path("live_actions", value=["send"])),
+    ("manifest_invalid", set_path("project", "services", value={"recordings-api": []})),
+    ("manifest_invalid", set_path("project", "services", value={"recordings-api": {}})),
+    ("manifest_egress_incomplete", delete_path("egress", "blocked")),
+    ("manifest_egress_incomplete", delete_path("egress", "controls")),
+    ("manifest_invalid", set_path("egress", "blocked", value=["moon"])),
+    ("manifest_invalid", set_path("egress", "blocked", value=[])),
+    ("manifest_invalid", set_path("egress", "controls", value={"dns_env": "lower"})),
+    ("manifest_invalid", delete_path("private_config", "credential_files")),
+    ("manifest_invalid", set_path("private_config", "credential_files", value=[])),
 ]
 
 
@@ -270,7 +299,9 @@ def test_the_happy_plan_for_recordings_equals_the_golden_edits(tmp_path, monkeyp
     assert plan["http_production_json"] == {"gateway_project_files": plan["production_json"]["gateway_project_files"]}
     assert plan["policy"] == {"base_revision": 22, "revision": 23, "added": GOLDEN_ADDED,
                               "grants": {"owner-claude-code": ["recordings:content", "recordings:read"],
-                                         "claude-code": ["recordings:content", "recordings:read"]}}
+                                         "claude-code": ["recordings:content", "recordings:read"]},
+                              "candidate_digest": plan["inputs"]["candidate_policy"]}
+    assert sorted(plan["inputs"]["compose"]) == ["gateway", "gateway_http", "project"]
     assert len(plan["owner_steps"]) == 4 and len(plan["plan_digest"]) == 64
 
 
@@ -330,7 +361,7 @@ def unset_variable(host):
 
 
 def missing_canary(host):
-    host.write_env(RECORDINGS_EGRESS_BLOCKED="10.99.0.1:22")
+    host.write_env(RECORDINGS_EGRESS_BLOCKED="10.99.0.1:22,100.64.0.5:22")
 
 
 def missing_open(host):
@@ -399,6 +430,7 @@ def backup_unit_change(host):
 
 def tool_change(host):
     host.changed = ["scripts/seamless_release.py"]
+    host.repo["scripts/seamless_release.py"] = b"# the candidate's tool\n"
     host.monkeypatch.setattr(p, "blob", lambda path: "0" * 40)
     host.monkeypatch.setattr(p, "RUNNING", host.root / "production.py")
     host.monkeypatch.setattr(p, "SYSTEMD_DIRECTORY", host.root)
@@ -447,6 +479,184 @@ def test_a_backup_unit_change_in_the_range_refuses(tmp_path, monkeypatch):
 # spec: ANYM-745
 def test_a_deploy_tool_not_yet_installed_in_the_range_refuses(tmp_path, monkeypatch):
     refuse(tool_change, "range_tool_pending")(tmp_path, monkeypatch)
+
+
+# spec: ANYM-745
+def test_a_field_of_an_unexpected_type_is_a_refusal_never_an_exception(monkeypatch):
+    def boom(value, name):
+        raise TypeError("unhashable type: 'list'")
+    monkeypatch.setattr(p, "checked_manifest", boom)
+    with pytest.raises(p.EnrollRefused) as refused:
+        p.check_manifest({}, "recordings")
+    assert refused.value.code == "manifest_invalid"
+
+
+# spec: ANYM-745
+def test_the_egress_verifier_reads_a_private_env_file_holding_the_checked_values(tmp_path, monkeypatch):
+    host = Enroller(tmp_path, monkeypatch)
+    host.plan()
+    argv, env, content = host.verified_with
+    assert argv[-2] == "--env-file" and Path(argv[-1]).name == "verify.env"
+    assert env == {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}  # nothing is passed through the environment
+    assert content == "RECORDINGS_RESOLVER=10.99.0.2\nINFERENCE_MINI_IP=10.99.0.9\n"
+
+
+# spec: ANYM-745
+def test_replacing_a_gateway_key_changes_the_candidate_and_the_plan_digest(tmp_path, monkeypatch):
+    host = Enroller(tmp_path, monkeypatch)
+    before = host.plan()
+    key = host.keys / "recordings-claude-code.key"
+    key.write_text("a rotated key\n")
+    key.chmod(0o600)
+    after = host.plan()
+    assert after["policy"]["candidate_digest"] != before["policy"]["candidate_digest"]
+    assert after["plan_digest"] != before["plan_digest"]
+    assert any("key_sha256 " + hashlib.sha256(b"a rotated key").hexdigest() in line for line in after["policy"]["added"])
+
+
+# spec: ANYM-745
+def test_the_http_gateway_is_resolved_in_its_own_directory(tmp_path, monkeypatch):
+    host = Enroller(tmp_path, monkeypatch)
+    other = tmp_path / "http-deploy"
+    other.mkdir()
+    host.http["projects"][0]["directory"] = str(other)
+    host.plan()
+    directories = [call[call.index("--project-directory") + 1] for call in host.calls if call[:2] == ["docker", "compose"]]
+    assert str(other) in directories and str(host.deploy) in directories
+
+
+# spec: ANYM-745
+def test_an_installed_seamless_release_tool_is_not_pending_and_a_stale_one_is(tmp_path, monkeypatch):
+    from scripts import seamless_release as s
+    host = Enroller(tmp_path, monkeypatch)
+    host.changed = ["scripts/seamless_release.py"]
+    host.repo["scripts/seamless_release.py"] = Path(s.__file__).read_bytes()
+    assert host.plan()["status"] == "plan"
+    host.repo["scripts/seamless_release.py"] = b"# an older tool\n"
+    assert "range_tool_pending" in host.codes()
+
+
+EGRESS_ENV_REFUSALS = [
+    ("egress_blocked_incomplete", {"RECORDINGS_EGRESS_BLOCKED": "192.0.2.254:9,10.99.0.1:22"}),
+    ("egress_blocked_incomplete", {"RECORDINGS_EGRESS_BLOCKED": "192.0.2.254:9,100.64.0.5:22"}),
+    ("egress_blocked_incomplete", {"RECORDINGS_EGRESS_BLOCKED": "192.0.2.254:9,dns:10.99.0.2"}),
+    ("egress_target_invalid", {"RECORDINGS_EGRESS_BLOCKED": "192.0.2.254:9,10.99.0.1:22,100.64.0.5:22,tailnet-node:22"}),
+    ("egress_target_invalid", {"RECORDINGS_EGRESS_BLOCKED": "192.0.2.254:9,10.99.0.1:22,100.64.0.5:0"}),
+    ("egress_control_missing", {"RECORDINGS_EGRESS_OPEN": "api.omi.me:443"}),
+    ("egress_control_missing", {"RECORDINGS_EGRESS_OPEN": "api.omi.me:443,dns:10.99.0.77"}),
+]
+
+
+# spec: ANYM-745
+@pytest.mark.parametrize("code, changes", EGRESS_ENV_REFUSALS)
+def test_blocked_targets_and_positive_controls_the_manifest_declares_are_required(tmp_path, monkeypatch, code, changes):
+    host = Enroller(tmp_path, monkeypatch)
+    host.write_env(**changes)
+    assert host.codes() == [code]
+
+
+def token_missing(host):
+    host.token.unlink()
+
+
+def token_loose(host):
+    host.token.chmod(0o640)
+
+
+def token_empty(host):
+    host.token.write_text("")
+
+
+def token_outside_the_mount(host):
+    (host.state_dir / "config.json").write_text(json.dumps({"accounts": [{"id": "a", "token_file": "/etc/passwd"}]}))
+
+
+def token_not_named(host):
+    (host.state_dir / "config.json").write_text(json.dumps({"accounts": []}))
+
+
+# spec: ANYM-745
+@pytest.mark.parametrize("setup", [token_missing, token_loose, token_empty, token_outside_the_mount, token_not_named])
+def test_a_provider_credential_file_that_is_missing_loose_empty_or_unnamed_is_refused(tmp_path, monkeypatch, setup):
+    host = Enroller(tmp_path, monkeypatch)
+    setup(host)
+    assert host.codes() == ["credential_file_invalid"]
+    with pytest.raises(p.Refused) as refused:
+        host.plan()
+    assert SECRET not in json.dumps(refused.value.failures)
+
+
+# spec: ANYM-745
+def test_a_provider_credential_file_is_checked_by_metadata_and_never_read(tmp_path, monkeypatch):
+    host = Enroller(tmp_path, monkeypatch)
+    opened = []
+    real = os.read
+    monkeypatch.setattr(p.os, "read", lambda fd, size: opened.append(os.fstat(fd).st_ino) or real(fd, size))
+    host.plan()
+    assert host.token.stat().st_ino not in opened
+
+
+EXPIRED = subprocess.TimeoutExpired(["docker"], 120)
+
+
+# spec: ANYM-745
+@pytest.mark.parametrize("code, attribute", [("compose_config_failed", "compose_error"), ("egress_verify_failed", "verify_output"),
+                                             ("policy_check_failed", "gateway_valid")])
+def test_a_timeout_of_a_probe_is_a_refusal_with_its_own_code(tmp_path, monkeypatch, code, attribute):
+    host = Enroller(tmp_path, monkeypatch)
+    setattr(host, attribute, EXPIRED)
+    assert code in host.codes()
+
+
+# spec: ANYM-745
+def test_a_timeout_of_the_main_verification_is_a_refusal(tmp_path, monkeypatch):
+    host = Enroller(tmp_path, monkeypatch)
+    monkeypatch.setattr(p, "promotable", lambda sha: (_ for _ in ()).throw(EXPIRED))
+    assert host.codes() == ["sha_not_verified"]
+
+
+# spec: ANYM-745
+def test_a_timeout_outside_a_probe_exits_the_command_with_a_refusal(tmp_path, monkeypatch):
+    host = Enroller(tmp_path, monkeypatch)
+    monkeypatch.setattr(p, "config", lambda path: host.settings if path == p.CONFIG else host.http)
+    monkeypatch.setattr(p.http_release_tool(), "validate_settings", lambda value: value)
+    monkeypatch.setattr(p, "main_history", lambda state: host.root / "mirror")
+    monkeypatch.setattr(p, "enroll_plan", lambda *args: (_ for _ in ()).throw(subprocess.TimeoutExpired(["git", "diff"], 5)))
+    args = p.argument_parser().parse_args(["enroll", "--module", "recordings", "--sha", SHA, "--plan"])
+    assert p.enroll_command(args) == {"status": "refused", "refusals": [{"code": "command_timeout", "detail": "git timed out"}]}
+
+
+def mirror_listing(monkeypatch, changed, manifests):
+    read = []
+
+    def fake(argv, **kwargs):
+        command = argv[3:]
+        if command[0] == "diff":
+            return "\0".join(changed) + "\0"
+        if command[0] == "ls-tree":
+            return "\0".join(manifests) + "\0"
+        read.append(command[2].split(":", 1)[1])
+        return manifests[command[2].split(":", 1)[1]]
+    monkeypatch.setattr(p, "run", fake)
+    return read
+
+
+# spec: ANYM-745
+def test_enrollment_pending_reads_only_the_manifests_the_range_changes(monkeypatch):
+    broken = '{"name": "broken", "project": {"services": {"x": []}}}'
+    read = mirror_listing(monkeypatch, ["README.md"], {"deploy/modules/broken.json": broken})
+    assert p.enrollment_pending(Path("/mirror"), "a" * 40, "b" * 40, {"projects": []}) == [] and read == []
+    read = mirror_listing(monkeypatch, ["deploy/modules/recordings.json"],
+                          {"deploy/modules/broken.json": broken, "deploy/modules/recordings.json": RECORDINGS})
+    assert p.enrollment_pending(Path("/mirror"), "a" * 40, "b" * 40, {"projects": []}) == ["recordings"]
+    assert read == ["deploy/modules/recordings.json"]
+
+
+# spec: ANYM-745
+def test_a_changed_malformed_manifest_is_pending_and_never_an_exception(monkeypatch):
+    broken = '{"name": "broken", "project": {"services": {"x": []}}}'
+    mirror_listing(monkeypatch, ["deploy/modules/broken.json"], {"deploy/modules/broken.json": broken})
+    assert p.enrollment_pending(Path("/mirror"), "a" * 40, "b" * 40, {"projects": []}) == ["broken"]
 
 
 # spec: ANYM-745
@@ -518,6 +728,8 @@ def another_state_dir(host):
     other = host.root / "other-state"
     other.mkdir(mode=0o700)
     (other / "config.json").write_text(json.dumps(STATE_CONFIG))  # the same bytes, another file
+    (other / "omi.key").write_text(host.token.read_text())
+    (other / "omi.key").chmod(0o600)
     host.write_env(RECORDINGS_STATE_DIR=str(other))
 
 

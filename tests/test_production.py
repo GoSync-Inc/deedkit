@@ -3024,6 +3024,22 @@ def test_a_module_manifest_in_the_range_pauses_with_the_enroll_command_and_enrol
 
 
 # spec: ANYM-745
+def test_an_enrollment_after_the_selected_release_does_not_block_it(tmp_path, monkeypatch):
+    third = "3" * 40  # main's tip: its CI has not attested it yet, so NEWEST is the release this run deploys
+    host = Deployer(tmp_path, monkeypatch, history=(NEWER, NEWEST, third), green=(NEWER, NEWEST),
+                    changes={third: ["deploy/modules/recordings.json"]})
+    host.contents[f"{third}:deploy/modules/recordings.json"] = MODULE_MANIFEST
+    assert host.deploy(auto=True)["status"] == "deployed"
+
+
+# spec: ANYM-745
+def test_an_unchanged_malformed_manifest_does_not_halt_an_ordinary_release(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    host.contents[f"{NEWEST}:deploy/modules/broken.json"] = '{"name": "broken", "project": {"services": {"x": []}}}'
+    assert host.deploy(auto=True)["status"] == "deployed" and host.paused() is None
+
+
+# spec: ANYM-745
 def test_a_manifest_for_a_module_the_host_already_runs_is_an_ordinary_release(tmp_path, monkeypatch):
     host = Deployer(tmp_path, monkeypatch, changes={NEWEST: ["deploy/modules/recordings.json"]})
     host.contents[f"{NEWEST}:deploy/modules/recordings.json"] = MODULE_MANIFEST

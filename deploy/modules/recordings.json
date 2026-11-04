@@ -29,12 +29,15 @@
     "canary": "192.0.2.254:9",
     "verify": ["scripts/recordings_egress_check.py", "verify"],
     "verify_env": ["RECORDINGS_RESOLVER", "INFERENCE_MINI_IP"],
-    "open": ["api.omi.me:443"]
+    "open": ["api.omi.me:443"],
+    "blocked": ["host", "tailnet"],
+    "controls": {"dns_env": "RECORDINGS_RESOLVER"}
   },
   "private_config": {
     "mount": "/run/deedkit/recordings",
     "file": "config.json",
-    "forbidden_keys": ["archive", "accounts[*].archive_namespace"]
+    "forbidden_keys": ["archive", "accounts[*].archive_namespace"],
+    "credential_files": ["accounts[*].token_file"]
   },
   "owner_steps": [
     "The owner writes the provider tokens (Omi, PLAUD) by hand in the owner's terminal; the plan checks only mode, owner and non-empty.",
