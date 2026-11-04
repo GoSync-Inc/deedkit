@@ -962,11 +962,10 @@ Past the bound the command ends with exit 75 and prints one JSON line,
 the capture (BACKUP.md "stop recovery"). A stale `.unsettled` marker makes every release wait and then refuse naming
 the marker; settle it with `--recover-stop`. A SIGTERM during the wait takes and writes nothing.
 
-A release that would run into a scheduled backup start keeps its
-clock window: the wait does not protect a scheduled start. Windows that stay: those before the scheduled starts, the
-autodeploy unit's 13:00-18:59 UTC admission, the runner-install shell steps ("Backup runner") and the calendar freshness
-unit install. A scheduled backup that starts while a release holds the lock is refused, and what follows differs by
-unit (see "Continuous deployment"). A guarantee that a release never starves a scheduled start is a separate card.
+A release has no clock window (owner 11-04: «давай все делать не ждать ничего»), so it may run into a scheduled
+backup start: the wait does not protect a scheduled start. A scheduled backup that starts while a release holds the lock
+is refused, and what follows differs by unit (see "Continuous deployment"); a daily lost that way is a backup follow-up,
+never a release hold. Only the autodeploy unit's 13:00-18:59 UTC admission stays until its unit changes.
 
 ### Backup runner
 
