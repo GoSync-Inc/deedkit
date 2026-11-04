@@ -7,6 +7,7 @@ import shutil
 import pytest
 
 from messaging_service.collector_state import CollectorState, session_lock
+from messaging_service.envelope import stable_id
 from messaging_service.sync_status import get_sync_status
 from messaging_service.whatsapp_collector import NodeProvider
 from test_collectors import worker as worker
@@ -16,6 +17,114 @@ from test_whatsapp import wa as wa, event, capture
 def source(w, s, chats=None):
     with s.pool.connection() as c:
         return get_sync_status(c, {'accounts': [w.account], 'chat_ids': chats})['sources'][0]
+
+
+# A Telegram create_group on the collector's own operation path (ANYM-750): the provider confirms a new basic
+# group; the collector catalogs it at once and the receipt says whether it is in the archive.
+GROUP = '-4001'
+
+
+def create_group(w, policy=None, **job):
+    if policy:
+        with w.archive.store.pool.connection() as c:
+            c.execute('UPDATE account_policies SET discover_chats=%s,include_chats=%s,exclude_chats=%s '
+                      'WHERE account=%s', (policy.get('discover', True), policy.get('include', []),
+                                           policy.get('exclude', []), w.account))
+    async def provider(work):
+        return {'outcome': 'confirmed', 'data': {'provider_chat_id': GROUP, 'missing_invitee_ids': [],
+                                                 'all_members_added': True, 'basis': 'provider_created_chat'}}
+    w.provider.execute_operation = provider
+    return asyncio.run(w.execute_operation({'operation': 'create_group',
+                                            'parameters': {'title': 'Synthetic team', 'user_ids': ['42']}, **job}))
+
+
+# spec: ANYM-750
+def test_created_group_is_listed_and_sendable_at_once_and_its_receipt_says_collected(worker):
+    w, s, key = worker
+    answer = create_group(w)
+    chat_id = stable_id('chat', w.account, GROUP)
+    assert answer['outcome'] == 'confirmed'
+    assert answer['data']['chat_id'] == chat_id and answer['data']['archive'] == 'collected'
+    assert 'next_step' not in answer['data']
+    assert chat_id in [chat['id'] for chat in s.list_chats(key, accounts=[w.account])['items']]
+    # No discovery pass has run: the archive row written by the operation is enough to send.
+    w.archive.set_sending(w.account, True)
+    w.state.phase('connection', 'connected', 'provider_ready')
+    sender = s.issue_key('group-sender', [w.account], permissions=['read', 'send'])
+    queued = s.send_message(sender, account=w.account, chat_id=chat_id, text='Synthetic hello',
+                            request_id='synthetic-request-0750')
+    assert queued['status'] == 'queued'
+
+
+# spec: ANYM-750
+@pytest.mark.parametrize('case,reason', [('discovery_off', 'discovery_disabled'), ('excluded', 'chat_excluded'),
+                                         ('write_raises', 'catalog_failed'), ('budget_spent', 'catalog_timeout'),
+                                         ('write_too_slow', 'catalog_timeout')])
+def test_created_group_receipt_names_why_it_is_not_in_the_archive(worker, monkeypatch, caplog, case, reason):
+    import time
+    from messaging_service import telegram_collector
+    from messaging_service.telegram_operations import CREATE_GROUP_NEXT_STEPS
+    w, s, key = worker
+    policy, job = None, {}
+    if case == 'discovery_off':
+        policy = {'discover': False}
+    if case == 'excluded':
+        policy = {'exclude': [GROUP]}
+    if case == 'write_raises':
+        def broken(*args):
+            raise RuntimeError('synthetic-secret-detail')
+        monkeypatch.setattr(CollectorState, 'catalog', broken)
+    if case == 'budget_spent':
+        job = {'_ends_at': time.monotonic()}
+    if case == 'write_too_slow':
+        monkeypatch.setattr(telegram_collector, 'CATALOG_SECONDS', .05)
+        monkeypatch.setattr(telegram_collector, 'STORE_GRACE', 0)
+        real = CollectorState.catalog
+        def slow(*args):
+            time.sleep(.3)
+            return real(*args)
+        monkeypatch.setattr(CollectorState, 'catalog', slow)
+    caplog.set_level('WARNING', 'messaging_service.telegram_collector')
+    answer = create_group(w, policy, **job)
+    assert answer['outcome'] == 'confirmed'
+    data = answer['data']
+    assert data['archive'] == 'not_collected' and data['archive_reason'] == reason
+    assert data['next_step'] == CREATE_GROUP_NEXT_STEPS[reason] and 'chat_id' not in data
+    assert data['provider_chat_id'] == GROUP
+    assert 'synthetic-secret-detail' not in json.dumps(answer) + caplog.text
+    if case in ('discovery_off', 'excluded'):
+        assert stable_id('chat', w.account, GROUP) not in [c['id'] for c in s.list_chats(key)['items']]
+
+
+# spec: ANYM-750
+def test_cancelled_group_catalog_write_still_settles_the_confirmed_receipt_first(worker, monkeypatch):
+    from threading import Event
+    from messaging_service import telegram_collector
+    w, _, _ = worker
+    monkeypatch.setattr(telegram_collector, 'STORE_GRACE', 0)
+    entered, release = Event(), Event()
+    def stalled(*args):
+        entered.set()
+        assert release.wait(5)
+        return False
+    monkeypatch.setattr(CollectorState, 'catalog', stalled)
+    async def provider(work):
+        return {'outcome': 'confirmed', 'data': {'provider_chat_id': GROUP, 'basis': 'provider_created_chat'}}
+    w.provider.execute_operation = provider
+    job = {'operation': 'create_group', 'parameters': {'title': 'Synthetic team', 'user_ids': ['42']}}
+    async def scenario():
+        task = asyncio.ensure_future(w.execute_operation(job))
+        while not entered.is_set():
+            await asyncio.sleep(.01)
+        task.cancel()
+        try:
+            return await task
+        finally:
+            release.set()
+    answer = asyncio.run(scenario())
+    assert job['_cancel_after_settle'] is True  # the command worker settles the receipt, then stops
+    assert answer['outcome'] == 'confirmed' and answer['data']['archive'] == 'not_collected'
+    assert answer['data']['archive_reason'] == 'catalog_failed' and 'chat_id' not in answer['data']
 
 
 def test_history_gap_does_not_mark_connection_or_live_capture_failed(wa):

@@ -73,9 +73,14 @@ its allowlist includes mutations; catalog rows distinguish live reads from write
 
 Account-wide operations such as profile/contact lists and group creation require
 full-account scope as well as their named permission. A Telegram `create_group` receipt
-names the new group's `provider_chat_id` and, when the collection policy collects it, its
-archive `chat_id`: the group is in the archive at once (a send or `resolve_reference` works
-before its first message). Without `chat_id` the group arrives with the next dialog discovery. A chat-scoped key is not a
+names the new group's `provider_chat_id` and its `archive` state (ANYM-750). `archive:
+collected` comes with the archive `chat_id`: the group is in the archive at once (a send or
+`resolve_reference` works before its first message). `archive: not_collected` comes without
+`chat_id` and with `archive_reason` and a fixed `next_step`: `discovery_disabled` (the policy
+collects only included chats; the operator adds this chat), `chat_excluded` (the policy excludes
+it; the operator removes the exclusion), `catalog_timeout` or `catalog_failed` (the archive write
+ran out of time or failed; the next dialog discovery adds the group). The operation stays
+`confirmed` in every case; the reason never carries exception text. A chat-scoped key is not a
 back door to the whole contact book. Source and destination evidence are separately
 authorized for forwarding and files. Authorization, revision, key expiry/revocation,
 operation policy and collector ownership are rechecked before dispatch.

@@ -73,6 +73,12 @@ JOIN_CHAT_REFUSALS = ((errors.InviteHashExpiredError, 'invite_expired'), (errors
     (errors.ChannelsTooMuchError, 'join_not_allowed'), (errors.ChannelPrivateError, 'join_not_allowed'),
     (errors.UserAlreadyParticipantError, 'already_member'))
 JOIN_NEXT_STEP = "the operator adds this chat to the account's collection policy"
+# ANYM-750: a create_group receipt without an archive chat_id names why (archive_reason) and what comes next.
+CREATE_GROUP_NEXT_STEPS = {
+    'discovery_disabled': JOIN_NEXT_STEP,
+    'chat_excluded': "the operator removes this chat from the account's collection policy exclusions",
+    'catalog_timeout': 'the next dialog discovery adds this chat to the archive; list_chats shows it then',
+    'catalog_failed': 'the next dialog discovery adds this chat to the archive; list_chats shows it then'}
 # ANYM-643: the normalized username (messenger_operations.telegram_username).
 USERNAME = re.compile(r'[a-z][a-z0-9_]{3,31}', re.ASCII)
 
