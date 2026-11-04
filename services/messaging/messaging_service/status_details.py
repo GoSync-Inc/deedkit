@@ -13,6 +13,7 @@ DETAILS={
     'configured_chat_unavailable':('At least one configured chat was unavailable.','check_provider_access'),
     'provider_temporarily_unavailable':('A provider operation failed; collection will retry.','check_collector_health'),
     'dialog_discovery_limited':('Chat discovery reached its configured bound.','inspect_catalog_coverage'),
+    'discovery_provider_error':('Telegram chat discovery failed with a provider error; history continues over the last catalogue and discovery is retried on the next pass.','wait_for_retry'),
     'whatsapp_chat_unavailable':('Some WhatsApp history operations failed; live capture is independent.','inspect_chat_gaps'),
     'provider_disconnected':('The collector transport closed; bounded retry is scheduled.','wait_for_retry'),
     'provider_not_ready':('The provider has not established a usable connection.','wait_for_retry'),

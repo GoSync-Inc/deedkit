@@ -455,6 +455,76 @@ def test_dialog_kind_comes_from_the_raw_peer_so_a_forbidden_channel_is_a_channel
     assert [(row[0], row[1]) for row in asyncio.run(collect())] == [(str(forbidden.id), 'channel'), ('-100123', 'chat')]
 
 
+def dialog_provider(pages, errors):
+    """The real TelethonProvider over a real Telethon RequestIter whose page loads raise the scripted errors."""
+    from telethon.requestiter import RequestIter
+    class DialogPages(RequestIter):
+        # _DialogsIter raises before it advances its request; so does this page load.
+        async def _init(self, pages, errors):
+            self.pages = [list(page) for page in pages]; self.errors = errors; self.loads = 0
+        async def _load_next_chunk(self):
+            self.loads += 1
+            error = self.errors.pop(0) if self.errors else None
+            if error is not None: raise error
+            self.buffer.extend(self.pages.pop(0))
+            return not self.pages
+    class Governor:
+        async def call(self, operation, phase): return await operation()
+    rows = [[NS(id=n, is_channel=False, is_user=True, is_group=False, name=f'Synthetic {n}', entity=None, dialog=None)
+             for n in page] for page in pages]
+    provider = TelethonProvider.__new__(TelethonProvider); provider.governor = Governor()
+    provider.iterators = []
+    def iter_dialogs(**kwargs):
+        provider.iterators.append(DialogPages(None, kwargs['limit'], pages=rows, errors=list(errors)))
+        return provider.iterators[-1]
+    provider.client = NS(iter_dialogs=iter_dialogs)
+    return provider
+
+
+def collect_dialog_batches(provider, monkeypatch):
+    import messaging_service.telegram_collector as collector
+    sleeps = []; batches = []
+    real_sleep = asyncio.sleep
+    async def sleep(delay):
+        sleeps.append(delay); await real_sleep(0)
+    monkeypatch.setattr(collector.asyncio, 'sleep', sleep)
+    async def collect():
+        async for batch in provider.dialog_batches(None): batches.append([row[0] for row in batch])
+    return collect, batches, sleeps
+
+
+# spec: ANYM-749
+@pytest.mark.parametrize('kind', ['server', 'timed_out', 'timeout'])
+def test_transient_dialog_page_error_is_retried_on_the_same_iterator(kind, monkeypatch):
+    from telethon import errors
+    error = {'server': lambda: page_error('server'), 'timed_out': lambda: errors.TimedOutError(None, 'Timeout'),
+             'timeout': lambda: TimeoutError(CHAT_SECRET)}[kind]
+    provider = dialog_provider([[1, 2], [3, 4], [5]], [None, error(), error(), None, None])
+    collect, batches, sleeps = collect_dialog_batches(provider, monkeypatch)
+    asyncio.run(collect())
+    # One traversal, every dialog once and in order; rows before the failed page are yielded before the wait.
+    assert len(provider.iterators) == 1 and provider.iterators[0].loads == 5
+    assert batches == [['1', '2'], ['3', '4', '5']] and sleeps == [1, 2]
+
+
+# spec: ANYM-749
+@pytest.mark.parametrize('kind', ['budget', 'interleaved', 'rpc'])
+def test_dialog_page_error_past_the_budget_or_not_transient_fails_only_the_discovery_pass(kind, monkeypatch):
+    from messaging_service.telegram_collector import DiscoveryFailed
+    server = page_error('server')
+    # interleaved: a successful page between failures does not reset the pass budget, and the rows it
+    # listed are yielded before the pass ends.
+    errors = {'budget': [None, server, server, server], 'interleaved': [None, server, server, None, server],
+              'rpc': [None, page_error('rpc')]}[kind]
+    provider = dialog_provider([[1, 2], [3], [4]], errors)
+    collect, batches, sleeps = collect_dialog_batches(provider, monkeypatch)
+    with pytest.raises(DiscoveryFailed) as failed:
+        asyncio.run(collect())
+    assert failed.value.code == 'discovery_provider_error'
+    assert batches == ([['1', '2'], ['3']] if kind == 'interleaved' else [['1', '2']])
+    assert sleeps == ([] if kind == 'rpc' else [1, 2]) and len(provider.iterators) == 1
+
+
 def fake_reconcile(provider, failed):
     async def dialogs(limit): return [('100', 'user', 'One'), ('200', 'user', 'Two')]
     provider.dialogs = dialogs
@@ -487,6 +557,69 @@ def test_rate_limit_session_terminal_and_transport_errors_still_propagate_from_r
         asyncio.run(collector.sync_once())
     assert calls == ['100']
     assert failed in ([], [('100', 'rate_limited')])
+
+
+# spec: ANYM-749
+@pytest.mark.parametrize('error', ['flood', 'unregistered', 'duplicated', 'connection'])
+def test_rate_limit_session_terminal_and_transport_errors_still_propagate_from_discovery(error, monkeypatch):
+    from telethon import errors
+    raised = {'flood': lambda: errors.FloodWaitError(None, capture=5),
+              'unregistered': lambda: errors.AuthKeyUnregisteredError(None),
+              'duplicated': lambda: errors.AuthKeyDuplicatedError(None), 'connection': lambda: ConnectionError('synthetic')}[error]
+    provider = dialog_provider([[1], [2]], [None, raised()])
+    collect, batches, sleeps = collect_dialog_batches(provider, monkeypatch)
+    with pytest.raises(type(raised())):
+        asyncio.run(collect())
+    assert batches == [] and sleeps == []
+    statuses = []; failed = []
+    collector = fake_reconcile(dialog_provider([[1], [2]], [None, raised()]), failed)
+    collector.state.status = lambda *args: statuses.append(args)
+    with pytest.raises(type(raised())):
+        asyncio.run(collector.sync_once())
+    assert ('degraded', 'discovery_provider_error') not in statuses
+
+
+def failing_discovery(failed, statuses, discoveries, pages):
+    """fake_reconcile whose dialog_batches yields one batch and then fails the discovery pass."""
+    from messaging_service.telegram_collector import DiscoveryFailed
+    async def dialog_batches(limit):
+        discoveries.append(limit)
+        yield [('300', 'user', 'Partial')]
+        raise DiscoveryFailed(page_error('rpc'))
+    async def page(chat, **query):
+        pages.append(chat); return []
+    collector = fake_reconcile(NS(page=page, dialog_batches=dialog_batches), failed)
+    collector.state.status = lambda *args: statuses.append(args)
+    collector.state.discovery_finished = lambda limited: statuses.append(('discovery_finished',))
+    collector.state.inventory = lambda dialogs, since, discovery=False: statuses.append(
+        ('inventory', [d[0] for d in dialogs], discovery)) or [d[0] for d in dialogs]
+    return collector
+
+
+# spec: ANYM-749
+def test_failed_discovery_keeps_the_cached_catalog_and_ends_the_pass_degraded(capsys):
+    failed = []; statuses = []; discoveries = []; pages = []
+    collector = failing_discovery(failed, statuses, discoveries, pages)
+    cache = [('100', 'user', 'One'), ('200', 'user', 'Two')]
+    collector._dialog_cache = cache; collector._next_discovery = 0
+    asyncio.run(collector.sync_once())
+    # The partial batch is saved; discovery is not finished; history runs over the cached catalog.
+    assert ('inventory', ['300'], True) in statuses and ('discovery_finished',) not in statuses
+    assert pages == ['100', '200'] and collector._dialog_cache is cache and collector._next_discovery == 0
+    assert statuses[-1] == ('degraded', 'discovery_provider_error') and failed == []
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines() if 'telegram_discovery_error' in line]
+    assert lines == [{'event': 'telegram_discovery_error', 'code': 'discovery_provider_error'}]
+
+
+# spec: ANYM-749
+def test_failed_first_discovery_scans_no_history_and_the_next_pass_retries_discovery():
+    failed = []; statuses = []; discoveries = []; pages = []
+    collector = failing_discovery(failed, statuses, discoveries, pages)
+    asyncio.run(collector.sync_once())
+    assert pages == [] and collector._dialog_cache is None
+    assert statuses[-1] == ('degraded', 'discovery_provider_error')
+    asyncio.run(collector.sync_once())
+    assert len(discoveries) == 2 and pages == []
 
 
 # spec: ANYM-293
