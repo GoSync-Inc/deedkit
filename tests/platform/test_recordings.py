@@ -546,6 +546,16 @@ def test_unplaced_omi_segments_have_null_offsets_and_other_negatives_are_kept():
         (-2453.2, -2450.0, False), (-1.0, 0.5, False), (0.0, 2.0, False)]
 
 
+# spec: ANYM-725
+def test_an_unplaced_omi_segment_is_indexed_as_words_with_its_speaker():
+    from deedkit_recordings.archive_store import plain_text
+    from deedkit_recordings.omi import content
+    segments = [{'text': 'late words', 'speaker_name': 'Alice', 'start': -1.0, 'end': -1.0},
+                {'text': 'live words', 'speaker_name': 'Bob', 'start': 0.0, 'end': 2.0}]
+    _, text = content(conversation(transcript_segments=segments), 'transcript')
+    assert plain_text('transcript', text) == ('late words\nlive words', ['Alice', 'Bob'])
+
+
 # spec: ANYM-648
 @pytest.mark.parametrize('structured,age,state', [
     ({'title': '', 'overview': ''}, 3600, 'pending'),
@@ -553,12 +563,17 @@ def test_unplaced_omi_segments_have_null_offsets_and_other_negatives_are_kept():
     ({'title': '', 'overview': ''}, 2 * 86400, 'empty'),
     ({'title': 'Synthetic', 'overview': ''}, 3600, 'empty'),
     ({'title': '', 'overview': 'Synthetic overview'}, 3600, 'available'),
+    ({'title': '', 'overview': ''}, -1800, 'pending'),
+    ({'title': '', 'overview': ''}, -2 * 3600, 'empty'),
+    ({'title': '', 'overview': ''}, -70 * 365 * 86400, 'empty'),
 ])
 def test_an_empty_omi_summary_is_pending_for_its_first_day_then_empty(structured, age, state):
     from deedkit_recordings.omi import content
     now = 1_800_000_000
     created = datetime.fromtimestamp(now - age, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     assert content(conversation(structured=structured, created_at=created), 'summary', now)[0] == state
+    naive = created.removesuffix('Z')  # no zone means UTC, as the archive index reads it
+    assert content(conversation(structured=structured, created_at=naive), 'summary', now)[0] == state
     assert content(conversation(structured=structured, created_at='not a time'), 'summary', now)[0] == (
         'available' if state == 'available' else 'empty')
 

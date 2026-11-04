@@ -216,7 +216,8 @@ def title_of(metadata):
 
 SECONDS_2000, SECONDS_2101 = 946684800, 4133980800
 SPEAKER_KEYS = ('speaker_name', 'speaker_id', 'speaker')  # the order omi.content and the PLAUD projection use
-TRANSCRIPT_KEYS = frozenset(('text', 'content', 'speaker', 'speaker_name', 'speaker_id', 'start', 'end', 'start_time', 'end_time'))
+TRANSCRIPT_KEYS = frozenset(('text', 'content', 'speaker', 'speaker_name', 'speaker_id', 'start', 'end', 'start_time', 'end_time',
+                             'placed'))  # `placed`: omi.content marks an unplaced Omi segment `false`
 
 
 def utc_text(moment):

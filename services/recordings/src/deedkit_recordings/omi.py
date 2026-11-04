@@ -1,6 +1,6 @@
 """Only documented Omi GET routes. Bounded, cancellable, no retries or persistence."""
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
@@ -17,6 +17,7 @@ ID = re.compile(r'[A-Za-z0-9_-]{1,256}')
 RETRY_DEFAULT, RETRY_CAP = 3600, 6 * 3600
 UNPLACED = -1.0  # Omi's start == end sentinel for text it could not place on the timeline (UNPLACED_SEGMENT_OFFSET)
 PROCESSING = 86400  # an empty title and overview this young is Omi's lazy processing, not a missing summary
+SKEW = 3600  # a creation time at most this far ahead of our clock still counts; further ahead is implausible
 
 
 def retry_after(headers):
@@ -130,11 +131,14 @@ def pagination(headers, count, limit):
 
 
 def young(created, now):
-    """True when `created_at` parses and is under a day old (a creation time in the future counts as young)."""
+    """True when `created_at` parses and is under a day old. No zone means UTC (as Omi documents and the archive index
+    reads it, archive_store.parse_time); a time more than an hour ahead of our clock is implausible, so not young."""
     try:
-        moment = datetime.fromisoformat(created.replace('Z', '+00:00'))
-        return moment.tzinfo is not None and now - moment.timestamp() < PROCESSING
-    except (AttributeError, ValueError, TypeError, OverflowError):
+        moment = datetime.fromisoformat(created.strip().replace('Z', '+00:00'))
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return -SKEW <= now - moment.timestamp() < PROCESSING
+    except (AttributeError, ValueError, TypeError, OverflowError, OSError):
         return False
 
 
