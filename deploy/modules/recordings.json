@@ -1,0 +1,49 @@
+{
+  "name": "recordings",
+  "project": {
+    "name": "deedkit-recordings",
+    "files": ["deploy/compose.recordings.yaml"],
+    "env_file": "/opt/deedkit/deploy/private/recordings.env",
+    "env_required": ["RECORDINGS_STATE_DIR", "RECORDINGS_RESOLVER", "RECORDINGS_EGRESS_BLOCKED",
+                     "RECORDINGS_EGRESS_OPEN", "INFERENCE_MINI_IP"],
+    "services": {"recordings-api": "recordings"}
+  },
+  "gateway": {
+    "overlay": "deploy/compose.gateway-recordings.yaml",
+    "policy": {
+      "module": "recordings",
+      "backend_url": "http://recordings-api:13234",
+      "tools": ["recordings_capabilities", "recordings_list", "recordings_read"],
+      "principals": {
+        "owner-claude-code": {"grants": ["recordings:read", "recordings:content"]},
+        "claude-code": {"grants": ["recordings:read", "recordings:content"]}
+      },
+      "key_dir": "/opt/deedkit/deploy/private/gateway-keys",
+      "key_file_pattern": "/run/deedkit/keys/recordings-{principal}.key",
+      "key_uid": 10001
+    }
+  },
+  "egress": {
+    "outside": true,
+    "admission_env": {"blocked": "RECORDINGS_EGRESS_BLOCKED", "open": "RECORDINGS_EGRESS_OPEN"},
+    "canary": "192.0.2.254:9",
+    "verify": ["scripts/recordings_egress_check.py", "verify"],
+    "verify_env": ["RECORDINGS_RESOLVER", "INFERENCE_MINI_IP"],
+    "open": ["api.omi.me:443"],
+    "blocked": ["host", "tailnet"],
+    "controls": {"dns_env": "RECORDINGS_RESOLVER"}
+  },
+  "private_config": {
+    "mount": "/run/deedkit/recordings",
+    "file": "config.json",
+    "forbidden_keys": ["archive", "accounts[*].archive_namespace"],
+    "credential_files": ["accounts[*].token_file"]
+  },
+  "owner_steps": [
+    "The owner writes the provider tokens (Omi, PLAUD) by hand in the owner's terminal; the plan checks only mode, owner and non-empty.",
+    "After the first publication an organization owner makes the deedkit-recordings registry package public.",
+    "Root firewall activation (ufw files, after.init) is its own gated step; the plan runs only the read-only verify.",
+    "The first real read through a provider is the owner-confirmed live read of the module's card."
+  ],
+  "live_actions": []
+}

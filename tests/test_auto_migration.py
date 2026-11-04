@@ -98,7 +98,7 @@ class MigrationHost(Deployer):
             self.events.append("producer")
             return REVISION + "\n"
         command = argv[3:]
-        if command[:1] == ["ls-tree"]:
+        if command[:1] == ["ls-tree"] and ":" in command[-1]:  # `<sha>:<path>`; deploy/modules/ goes to the Deployer
             sha_, path = command[-1].split(":", 1)
             return "\0".join(sorted(self.trees[sha_, path])) + "\0"
         if command[:1] == ["diff"] and any(option.startswith("--diff-filter=") for option in command):

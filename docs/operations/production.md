@@ -1942,6 +1942,88 @@ configuration files; `production.py prepare --sha S` and `apply --sha S` (plan A
 the new state current (a dry run with the pause file present returns `paused` before it checks drift). Plan A apply
 restarts the selected services of the enrolled projects as in any release.
 
+**Enrollment (ANYM-745).** The hand release above is declared by a reviewed manifest, `deploy/modules/<module>.json`
+(first one: `recordings.json`), and checked by one read-only command that prints the exact edits:
+
+```sh
+sudo python3 /usr/local/lib/deedkit/production.py enroll --module recordings --sha <green main sha> --plan
+```
+
+The tool reads the manifest from the verified main commit in its source mirror, never from a working tree. It writes no
+production state (its scratch copies live in private temporary directories) and prints no secret: env files, private
+configurations and key files are read for presence, mode, owner and digests, never printed. Exit 0 prints the plan; exit 2
+prints `{"status": "refused", "refusals": [{"code", "detail"}]}` with one entry per failed precondition. Applying and
+undoing a plan is the next command (ANYM-746); until it exists the plan replaces steps 12b-18 of the ANYM-713 hand plan
+and the edits are made by hand from it.
+
+*Manifest.* Exactly these keys, nothing else: `name` (the file name); `project` (`name`, `files` as repository paths under
+`deploy/`, `env_file` as an absolute host path, `env_required` variable names, `services` as service to build target);
+`gateway` (`overlay` a repository path or null, and `policy`: `module`, `backend_url`, `tools`, `principals` with their
+`grants`, `key_dir` as an absolute host directory, `key_file_pattern` with `{principal}`, `key_uid`); `egress`
+(`outside` false, or true with `admission_env` (`blocked` and `open` variable names), `canary`, `verify` (a command whose
+first word is a repository script `scripts/*_egress_check.py`), `verify_env`, `open` targets, `blocked` (the address
+classes `host` and `tailnet` that need a blocked target with a known listener) and `controls` (`dns_env`, the variable
+whose resolver must be an open `dns:` target: the positive control)); `private_config` (`mount` the container directory
+the Compose file mounts, `file` its configuration file, `forbidden_keys` the key paths that must be absent at first start,
+`credential_files` the key paths whose values are provider credential files under that mount); `owner_steps` (strings the plan prints); `live_actions` (always empty). Secrets never
+live in a manifest.
+
+*Refusal codes.* Manifest (one cause each): `manifest_missing`, `manifest_invalid`, `manifest_unknown_key`,
+`manifest_repo_path` (an absolute, `..` or non-`deploy/` repository path), `manifest_relative_path` (a host path that is
+not absolute), `manifest_forbidden_service` (`db`, `calendar-db`, `database`, `postgres`, `operator`),
+`manifest_grant_wildcard` (a grant containing `*`), `manifest_unknown_principal` (a principal the live policy does not
+define), `manifest_egress_incomplete` (`outside` true without admission settings), `manifest_verify_script` (a verify
+script outside `scripts/` or not ending in `_egress_check.py`), `manifest_live_actions` (a non-empty list). Plan:
+`sha_not_verified` (not a green main commit, `promotable`), `sha_already_prepared` (a candidate directory of that SHA
+exists), `module_enrolled` (the project is already in the configuration), `policy_module_present` (the live policy already
+names the module), `no_current_release`, `gateway_project_missing`, `source_unavailable` (a file is not in the commit or
+the gateway project's first file cannot be read), `range_sql_inventory` (the range from the current release changes SQL
+or migrations), `range_tool_pending` (a deploy tool not installed yet), `range_backup_changed` (the backup runner or a
+backup unit changed), `env_file_missing`, `env_file_mode` (not a regular file of mode 0600 owned by root),
+`env_variable_unset` (a required variable is missing or empty), `compose_config_failed` (`docker compose config` of the
+project, or of the gateway project with the overlay, with exactly the files and env file the tool will record),
+`call_active`, `calls_unknown`, `paused` (the autodeploy pause file exists), `egress_env_missing` (the canary or an open
+target is not in the env file), `egress_verify_failed` (the verify script did not print `ok`), `key_file_invalid` (a
+gateway key file is missing, not a regular file, not mode 0600, not owned by `key_uid`, or empty), `policy_unreadable`,
+`policy_check_failed` (the candidate is not additions only, or `deedkit-gateway --check` fails in any serving gateway
+image: every distinct image of a running `gateway` or `http-gateway-*` container), `private_config_unreadable` and
+`private_config_forbidden_key`, `credential_file_invalid` (a file named at a `credential_files` path is missing, outside
+the mount, not a regular file, readable by group or other, not owned by the configuration's owner, or empty: mode, owner
+and size only, never a byte), `egress_target_invalid` (a blocked target that is not `IP:PORT`),
+`egress_blocked_incomplete` (no blocked target in a class the manifest requires), `egress_control_missing` (the open
+targets lack `dns:<resolver>`) and `command_timeout` (a command outside the probes exceeded its time limit; a probe that
+times out refuses with its own code). The verify script gets a private `--env-file` holding exactly the `verify_env`
+values this plan checked, never the process environment. A malformed manifest the range does not change is not parsed by a
+deploy, and a deploy gates the range of the release it selects, not the tip of main. The `private_config_forbidden_key` check reads the private configuration the container will actually mount (resolved
+from the Compose document, so a changed `RECORDINGS_STATE_DIR` selects another file) and refuses when a forbidden key,
+for recordings `archive` or `accounts[*].archive_namespace`, is present: a first enrollment is on-demand reads only
+(docs/DATA-POLICY.md). Only the presence of a key is read, never a value.
+
+*Plan.* The overlays to install (repository path, host path in the gateway project's directory, sha256, git blob id, owner,
+group and mode copied from the gateway project's first file); the project object appended to `production.json` only (plan B
+accepts exactly two services); the gateway project's `files` with the overlay in both `production.json` and
+`http-production.json`; the `env_files` entry; the candidate policy (revision plus one, additions only, listed); the owner
+steps. The output ends with `plan_digest`, the sha256 of the SHA, the manifest blob id, both configuration digests, the live
+policy digest, every overlay digest, the grants, the verify and canary values, the content digests of the env file and of the
+mounted private configuration, the digest of the candidate policy (so a replaced key changes it) and the digests of the resolved Compose documents (the
+project, the plan A gateway and the HTTP gateway, each in its own directory with its own files). Recomputing the plan gives the same digest
+only while none of them changed; the apply command (ANYM-746) refuses a different `--plan-digest`.
+
+*Review sequence.* The manifest pull request is reviewed as code like any change under `deploy/` (the review-protocol
+signal grep already matches `deploy/modules/`; Astra r1 when it adds grants or outside egress). After it merged, the plan
+output for the real host is a production operation plan and gets its own Astra r1 (harness reviews.md, Rounds 7); the apply
+step is bound to the approved digest.
+
+*Autodeploy.* When a deploy finds a manifest in its range for a module the host does not run, or a configuration that
+differs from the recorded digests only by an enrollment, it pauses with `enroll_required: <module>: production.py enroll
+--module <module> --sha <sha> --plan`. It never enrolls by itself: restarts, firewall and access are not for a timer.
+
+*What stays with a person.* The owner writes provider tokens by hand and makes the registry package public after its first
+publication; backend and gateway key files are an agent step under the section 2 gates, only checked here; root firewall
+activation stays its own gated step (the plan runs the read-only verify and refuses unless it prints `ok`); the first real
+read through a provider is the owner-confirmed live read of the module's card. Sends, calls, ACKs, pairing, provider-session
+changes and allowlist changes are never part of a manifest.
+
 **Undo**, in order: remove the module, tools, grants and credential from the policy (new revision); stop
 `recordings-api` only (`docker compose $F stop recordings-api`) and leave autodeploy paused, which is the
 holding state; at a NEWER green `main` SHA (a docs-only pull request creates one) restore both configuration backups
