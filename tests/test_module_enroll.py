@@ -802,7 +802,8 @@ class Applier(Enroller):
         self.http_state, self.tagged, self.networks = tmp_path / "http-state", set(), set()
         for directory in (self.http_state, tmp_path / "global"):
             directory.mkdir(mode=0o700)
-        self.identities, self.before_identities = {"collector": "old", "worker": "old"}, {"collector": "old", "worker": "old"}
+        self.identities, self.before_identities = {"deedkit-gateway": "old"}, {"deedkit-gateway": "old"}
+        self.rollback_leaves, self.inspect_fails = False, False
         self.admission, self.isolated, self.confined, self.controlled, self.healthy = "required", True, True, True, True
         self.up = None
         self.repo["scripts/recordings_egress_check.py"] = b"print('ok')\n"
@@ -820,6 +821,8 @@ class Applier(Enroller):
         monkeypatch.setattr(p, "prepare", self.prepare)
         monkeypatch.setattr(p, "apply", self.release_apply)
         monkeypatch.setattr(p, "rollback", self.release_rollback)
+        monkeypatch.setattr(p, "snapshot", lambda project, **kwargs: ({}, {"gateway": {"image": self.identities.get(
+            project["name"], "enroll")}}))
         real_replace, real_drift = p.replace_file, p.configuration_drift
         def replace(path, content, uid, gid, mode):
             real_replace(path, content, uid, gid, mode)
@@ -897,6 +900,8 @@ class Applier(Enroller):
             handled = {"pull": "", "inspect": GATEWAY_IP + "\n", "exec": ""}
             if sub in handled:
                 self.calls.append(argv)
+                if sub == "inspect" and self.inspect_fails:
+                    raise p.Refused("docker inspect failed")
                 return handled[sub]
             if sub == "tag":
                 self.calls.append(argv)
@@ -950,7 +955,8 @@ class Applier(Enroller):
 
     def release_rollback(self, settings, sha, http=None):
         self.event("rollback")
-        self.identities = dict(self.before_identities)
+        if not self.rollback_leaves:
+            self.identities = dict(self.before_identities)
         p.write(self.state / sha / "rollback.json", {"sha": sha, "status": "rolled-back"})
 
     def http_prepare(self, http, sha):
@@ -1061,6 +1067,7 @@ def test_the_first_start_uses_the_attested_image_under_an_enroll_tag_and_never_b
     assert host.apply()["status"] == "enrolled"
     argv, env = host.up
     assert "--no-build" in argv and argv[argv.index("--pull") + 1] == "never" and "--build" not in argv
+    assert argv[argv.index("up"):] == ["up", "-d", "--no-build", "--pull", "never", "--no-deps", "recordings-api"]
     assert env["DEEDKIT_VERSION"] == f"enroll-{SHA}"
     assert host.tagged == {f"deedkit-recordings:enroll-{SHA}"}
     tag = next(call for call in host.calls if call[:2] == ["docker", "tag"])
@@ -1228,9 +1235,11 @@ def test_a_gateway_check_that_fails_after_the_configuration_edit_restores_everyt
 
 
 # spec: ANYM-746
-def test_a_failed_isolation_probe_stops_the_module_and_keeps_the_pause_and_no_address_is_written(tmp_path, monkeypatch):
+@pytest.mark.parametrize("attribute, value", [("isolated", False), ("inspect_fails", True)])
+def test_a_failed_isolation_probe_stops_the_module_and_keeps_the_pause_and_no_address_is_written(
+        tmp_path, monkeypatch, attribute, value):
     host = Applier(tmp_path, monkeypatch)
-    host.isolated = False
+    setattr(host, attribute, value)
     result = host.apply()
     assert result["code"] == "isolation_check_failed" and host.names().count("stop") == 1 and p.PAUSE.exists()
     for text in [path.read_text() for path in (host.config_path, host.http_path, host.policy, host.state / "enrollment.json")]:
@@ -1246,6 +1255,33 @@ def test_the_isolation_probe_covers_every_serving_gateway_but_writes_no_address(
     assert any(call[:2] == ["docker", "exec"] and GATEWAY_IP in call for call in host.calls)  # the positive control
     for path in (host.config_path, host.http_path, host.policy, host.state / "enrollment.json"):
         assert GATEWAY_IP not in path.read_text() and SECRET not in path.read_text()
+
+
+# spec: ANYM-746
+def test_a_rollback_that_leaves_an_existing_project_on_another_image_is_an_unknown_state(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    host.rollback_leaves = True
+    result = fail_at(host, "seamless prepare")
+    assert host.receipt()["status"] == "unknown" and "unknown, inspect it" in result["recovery"]
+    assert json.loads(host.config_path.read_text())["projects"][-1]["name"] == "deedkit-recordings"  # not restored
+    assert p.PAUSE.exists() and "stop" not in host.names()
+
+
+# spec: ANYM-746
+def test_undo_waits_for_the_backup_gate_before_its_first_write(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    assert host.apply()["status"] == "enrolled"
+    after = host.files()
+    host.events.clear()
+    @contextlib.contextmanager
+    def busy(settings, bound):
+        raise p.BackupRunning("deedkit-backup.service", 0)
+        yield
+    monkeypatch.setattr(p, "backup_gate", busy)
+    with pytest.raises(p.BackupRunning):
+        host.undo()
+    assert host.files() == after and host.mutations() == [] and not p.PAUSE.exists()
+    assert host.receipt()["status"] == "applied"
 
 
 # spec: ANYM-746

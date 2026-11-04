@@ -2035,13 +2035,16 @@ of the module's card.
 for byte and the policy with a revision above anything a gateway may have loaded (never a lower number), stops only the new
 module (`docker compose stop`, never `down`, never a database), keeps the pause and writes the failing step to
 `enrollment.json` (`status: stopped`). A recovery that fails says `production state is unknown, inspect it` and changes
-nothing more. Plan B has no rollback of its own: a failure at or after promotion changes nothing more (a failed isolation
-probe still stops the module), keeps the pause, records the failing step and the HTTP status it read in `enrollment.json`
+nothing more; so does a rollback after which an existing project does not run the image it ran before the enrollment (plan A's
+snapshots are prepared from the edited configuration, so a rolled-back gateway keeps the module network until it is next
+restarted from the restored files). Plan B has no rollback of its own: a failure at or after promotion changes nothing more
+(any failure of the isolation step, a negative probe or an error reading Docker, still stops the module), keeps the pause, records the failing step and the HTTP status it read in `enrollment.json`
 (`status: http-manual`) and says `HTTP recovery is manual, inspect it` (seamless-release.md); automatic recovery of the
 previous HTTP generation is a separate card. A crash leaves the pause and the receipt: the next `--apply` refuses
 (`enrollment_unfinished`) until `--undo` or an inspection clears them. One receipt serves one enrollment at a time.
 
-*Undo.* `enroll --module <module> --undo` (after the call check; `enrollment_not_applied` unless the receipt says
+*Undo.* `enroll --module <module> --undo` (under the host locks and the backup wait, as the module's backup runs inside its
+container; after the call check; `enrollment_not_applied` unless the receipt says
 `applied`; `configuration_changed` or `policy_changed` when a file differs from what the apply wrote, which is then undone
 by hand) restores both configuration files from the copies byte for byte (sha256 equal), installs the backed-up policy with
 a higher revision (it removes the module), stops the module's services and removes nothing else (overlays, networks and

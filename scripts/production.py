@@ -5693,8 +5693,16 @@ class Enrollment:
                         "project": self.plan["production_json"]["append_project"]}
         self.save()
 
+    def runtime_images(self):
+        """The image identity of each selected service of the projects that ran before the enrollment (plan A rolls
+        these back); `before_images` of the receipt holds the pre-run answer."""
+        before = self.receipt.get("before_images")
+        return {project["name"]: {service: identity["image"] for service, identity in snapshot(project)[1].items()}
+                for project in self.settings["projects"] if before is None or project["name"] in before}
+
     def backup(self):
         self.step("backup")
+        self.save(before_images=self.runtime_images())
         directory = self.state / f"enrollment-{self.module}-{self.sha[:12]}"
         directory.mkdir(mode=0o700)
         sources = {"production": self.paths["production"], "http": self.paths["http"],
@@ -5826,7 +5834,7 @@ class Enrollment:
         self.start_checks(document, project)
         self.receipt["started"] = True
         self.save()
-        run(compose(project) + ["up", "-d", "--no-build", "--pull", "never"],
+        run(compose(project) + ["up", "-d", "--no-build", "--pull", "never", "--no-deps", *project["services"]],
             env={**os.environ, "DEEDKIT_VERSION": f"enroll-{self.sha}"})
         self.health(project)
         self.confinement(project)
@@ -5889,9 +5897,18 @@ class Enrollment:
         self.save(http=public_http(self.s.status(self.http, self.sha)))
 
     def isolation(self):
+        """The isolation step: any failure of it, a negative probe or an error reading Docker, is `isolation_check_failed`."""
+        self.step("isolation")
+        try:
+            self.probe_isolation()
+        except EnrollRefused as exc:
+            raise exc if exc.code == "isolation_check_failed" else EnrollRefused("isolation_check_failed", exc.code) from None
+        except Exception as exc:
+            raise EnrollRefused("isolation_check_failed", type(exc).__name__) from None
+
+    def probe_isolation(self):
         """After promotion: every serving gateway generation on a gateway-joined module network cannot reach the module's
         backend address (probed only, never written to a configuration)."""
-        self.step("isolation")
         project = self.plan["production_json"]["append_project"]
         egress, service = self.manifest["egress"], next(iter(project["services"]))
         script = repo_file(self.mirror, self.sha, egress["verify"][0]) if egress["outside"] else None
@@ -5978,7 +5995,7 @@ class Enrollment:
         undo = f"production.py enroll --module {self.module} --undo"
         try:
             if self.promoted():
-                if code == "isolation_check_failed" and self.receipt.get("started"):
+                if step == "isolation" and self.receipt.get("started"):
                     project = self.plan["production_json"]["append_project"]
                     run(compose(project) + ["stop", *project["services"]])  # the module only, never the gateway
                 try:
@@ -5996,6 +6013,9 @@ class Enrollment:
             elif attempted and not (outcome.get("status") == "unhealthy" and (release / "rollback.json").exists()):
                 self.save(status="unknown")
                 return self.result("stopped", message, code, "production state is unknown, inspect it; nothing more was changed")
+            if attempted and self.runtime_images() != self.receipt["before_images"]:
+                # The rollback snapshots were prepared from the edited configuration: the images must be the pre-run ones.
+                raise Refused("an existing project does not run its pre-run image after the rollback")
             files = self.receipt["files"]
             if "after_sha256" in files.get("policy", {}):
                 self.restore("policy", files["policy"].get("revision"))
@@ -6009,7 +6029,9 @@ class Enrollment:
             self.save(status="unknown", recovery_error=str(again) if isinstance(again, Refused) else type(again).__name__)
             return self.result("stopped", message, code, "recovery failed; production state is unknown, inspect it")
         self.save(status="stopped")
-        return self.result("stopped", message, code, f"the module was stopped and the configuration restored; the pause stays; undo is not needed ({undo} refuses)")
+        return self.result("stopped", message, code, f"the module was stopped and the configuration restored; the pause stays; undo is not needed ({undo} refuses)"
+                           + ("; a rolled-back plan A gateway keeps the module network until it is next restarted from the restored files"
+                              if (self.state / self.sha / "attempted.json").exists() else ""))
 
     def result(self, status, message, code, recovery):
         return {"status": status, "module": self.module, "sha": self.sha, "failed_step": self.receipt.get("failed_step"),
@@ -6045,7 +6067,7 @@ def enroll_undo(settings_path, http_path, module):
     http = s.validate_settings(config(http_path))
     state = Path(settings["state_directory"])
     path = state / ENROLL_RECEIPT
-    with host_locks(settings, http, s):
+    with host_locks(settings, http, s), backup_gate(settings, backup_wait(settings)):
         receipt = read(path) if path.exists() else {}
         if receipt.get("module") != module or receipt.get("status") != "applied":
             raise EnrollRefused("enrollment_not_applied", f"{path} holds no applied enrollment of {module}")
