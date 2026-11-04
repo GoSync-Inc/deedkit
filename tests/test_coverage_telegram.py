@@ -508,16 +508,21 @@ def test_transient_dialog_page_error_is_retried_on_the_same_iterator(kind, monke
 
 
 # spec: ANYM-749
-@pytest.mark.parametrize('kind', ['budget', 'rpc'])
+@pytest.mark.parametrize('kind', ['budget', 'interleaved', 'rpc'])
 def test_dialog_page_error_past_the_budget_or_not_transient_fails_only_the_discovery_pass(kind, monkeypatch):
     from messaging_service.telegram_collector import DiscoveryFailed
-    errors = [None] + ([page_error('server')] * 3 if kind == 'budget' else [page_error('rpc')])
-    provider = dialog_provider([[1, 2], [3]], errors)
+    server = page_error('server')
+    # interleaved: a successful page between failures does not reset the pass budget, and the rows it
+    # listed are yielded before the pass ends.
+    errors = {'budget': [None, server, server, server], 'interleaved': [None, server, server, None, server],
+              'rpc': [None, page_error('rpc')]}[kind]
+    provider = dialog_provider([[1, 2], [3], [4]], errors)
     collect, batches, sleeps = collect_dialog_batches(provider, monkeypatch)
     with pytest.raises(DiscoveryFailed) as failed:
         asyncio.run(collect())
-    assert failed.value.code == 'discovery_provider_error' and batches == [['1', '2']]
-    assert sleeps == ([1, 2] if kind == 'budget' else []) and len(provider.iterators) == 1
+    assert failed.value.code == 'discovery_provider_error'
+    assert batches == ([['1', '2'], ['3']] if kind == 'interleaved' else [['1', '2']])
+    assert sleeps == ([] if kind == 'rpc' else [1, 2]) and len(provider.iterators) == 1
 
 
 def fake_reconcile(provider, failed):
@@ -603,8 +608,7 @@ def test_failed_discovery_keeps_the_cached_catalog_and_ends_the_pass_degraded(ca
     assert pages == ['100', '200'] and collector._dialog_cache is cache and collector._next_discovery == 0
     assert statuses[-1] == ('degraded', 'discovery_provider_error') and failed == []
     lines = [json.loads(line) for line in capsys.readouterr().out.splitlines() if 'telegram_discovery_error' in line]
-    assert lines == [{'event': 'telegram_discovery_error', 'code': 'discovery_provider_error',
-                      'error_class': 'MsgIdInvalidError', 'rpc_message': 'BAD_REQUEST'}]
+    assert lines == [{'event': 'telegram_discovery_error', 'code': 'discovery_provider_error'}]
 
 
 # spec: ANYM-749

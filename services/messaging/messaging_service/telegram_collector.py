@@ -370,12 +370,15 @@ class TelethonProvider:
                 continue
             except (FloodError,UnauthorizedError,AuthKeyDuplicatedError):raise
             except (ServerError,TimedOutError,TimeoutError) as exc:
+                # Rows already listed are yielded (and saved) before the wait or the end of the pass.
                 failures+=1
-                if failures>=CHAT_ATTEMPTS:raise DiscoveryFailed(exc) from exc
                 if batch:yield batch;batch=[]
+                if failures>=CHAT_ATTEMPTS:raise DiscoveryFailed(exc) from exc
                 await asyncio.sleep(CHAT_RETRY_DELAYS[failures-1])
                 continue
-            except (RPCError,ProviderPageError) as exc:raise DiscoveryFailed(exc) from exc
+            except (RPCError,ProviderPageError) as exc:
+                if batch:yield batch
+                raise DiscoveryFailed(exc) from exc
             kind=dialog_kind(dialog)
             chat_type='private' if dialog.is_user else ('group' if dialog.is_group else 'channel')
             raw=getattr(dialog,'dialog',None)
@@ -754,8 +757,7 @@ class TelegramCollector:
                 # The pass degrades; batches already yielded stay saved, discovery is not marked finished and
                 # the next loop tries again. History goes on over the previous catalog, if any (ANYM-749).
                 discovery_failed=failure.code
-                print(json.dumps({'event':'telegram_discovery_error','code':failure.code,
-                    **chat_error_evidence(failure.error)}),flush=True)
+                print(json.dumps({'event':'telegram_discovery_error','code':failure.code}),flush=True)
                 await asyncio.to_thread(self.state.status,'degraded',failure.code)
                 if self._dialog_cache is None:return
                 dialogs=self._dialog_cache

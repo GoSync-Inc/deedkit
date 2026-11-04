@@ -173,8 +173,8 @@ without a catalogue ends the pass without a history scan. The worker and live
 capture keep running and the next loop (about 60 s later) tries discovery
 again. Rate limits, session-terminal errors, a duplicated authorization key and
 transport loss still stop the pass as before. The collector prints one
-`telegram_discovery_error` line per failed pass with the code, the exception
-class name and Telegram's fixed RPC code, never exception text. In
+`telegram_discovery_error` line per failed pass with the fixed code only, never
+exception text. In
 `get_sync_status` the history phase reads `partial_with_errors`.
 
 A stored peer kind that differs from the kind the dialog reports for the same
