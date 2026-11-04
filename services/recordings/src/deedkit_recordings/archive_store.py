@@ -216,8 +216,19 @@ def title_of(metadata):
 
 SECONDS_2000, SECONDS_2101 = 946684800, 4133980800
 SPEAKER_KEYS = ('speaker_name', 'speaker_id', 'speaker')  # the order omi.content and the PLAUD projection use
-TRANSCRIPT_KEYS = frozenset(('text', 'content', 'speaker', 'speaker_name', 'speaker_id', 'start', 'end', 'start_time', 'end_time',
-                             'placed'))  # `placed`: omi.content marks an unplaced Omi segment `false`
+TRANSCRIPT_KEYS = frozenset(('text', 'content', 'speaker', 'speaker_name', 'speaker_id', 'start', 'end', 'start_time', 'end_time'))
+
+
+def utterance(row):
+    """True for a stored transcript object: only known keys, and `placed` only as omi.content's unplaced marker
+    (`false` with null offsets). Any other object is ordinary text and stays searchable as it is."""
+    if not isinstance(row, dict):
+        return False
+    if 'placed' in row:
+        if not (row['placed'] is False and row.get('start') is None and row.get('end') is None):
+            return False
+        row = {key: value for key, value in row.items() if key != 'placed'}
+    return set(row) <= TRANSCRIPT_KEYS
 
 
 def utc_text(moment):
@@ -285,7 +296,7 @@ def plain_text(kind, text):
             except (ValueError, RecursionError):
                 row = None  # not an utterance object (or too deeply nested to be one): ordinary text
         if kind == 'transcript':
-            body = row.get('text', row.get('content')) if isinstance(row, dict) and set(row) <= TRANSCRIPT_KEYS else None
+            body = row.get('text', row.get('content')) if utterance(row) else None
         else:
             body = row['text'] if isinstance(row, dict) and set(row) == {'type', 'text'} else None
         if not isinstance(body, str) or not encodable(body):

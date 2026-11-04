@@ -554,6 +554,10 @@ def test_an_unplaced_omi_segment_is_indexed_as_words_with_its_speaker():
                 {'text': 'live words', 'speaker_name': 'Bob', 'start': 0.0, 'end': 2.0}]
     _, text = content(conversation(transcript_segments=segments), 'transcript')
     assert plain_text('transcript', text) == ('late words\nlive words', ['Alice', 'Bob'])
+    # Only that exact marker is an utterance: any other `placed` object stays searchable verbatim.
+    for line in ('{"text":"","placed":"telescope"}', '{"text":"x","placed":true}',
+                 '{"start":1.0,"end":null,"text":"x","placed":false}', '{"text":"x","placed":false,"extra":1}'):
+        assert plain_text('transcript', line) == (line, [])
 
 
 # spec: ANYM-648
