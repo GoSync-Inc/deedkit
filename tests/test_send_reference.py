@@ -55,6 +55,8 @@ def test_a_key_that_may_not_read_the_chat_gets_scope_restricted_and_no_ids(sende
     assert view['archive_reference'] is None and view['archive_reference_state'] == 'scope_restricted'
     assert view['message_id'] is None and view['delivery_receipt']['state'] == 'unknown'
     assert stable_id('msg', 'send-fixture', '100', '42') not in str(view)
+    # The send's own requested ids stay; only the projected archive ids are withheld.
+    assert (view['chat_id'], view['provider_chat_id'], view['provider_message_id']) == (CHAT, '100', '42')
 
 
 # spec: ANYM-751
