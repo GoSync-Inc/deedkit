@@ -245,12 +245,12 @@ MANIFEST_REFUSALS = [
     ("manifest_invalid", set_path("egress", "controls", value={"dns_env": "lower"})),
     ("manifest_invalid", delete_path("private_config", "credential_files")),
     ("manifest_invalid", set_path("private_config", "credential_files", value=[])),
-    ("manifest_invalid", delete_path("project", "networks")),
+    ("manifest_invalid", set_path("project", "networks", value={"name": "net"})),
     ("manifest_invalid", set_path("project", "networks", value="net")),
-    ("manifest_unknown_key", set_path("project", "networks", 0, "extra", value=1)),
-    ("manifest_invalid", set_path("project", "networks", 0, "bridge", value="Bad Bridge")),
-    ("manifest_invalid", set_path("project", "networks", 0, "gateway_port", value=0)),
-    ("manifest_invalid", set_path("project", "networks", 1, "name", value="deedkit-recordings-backend")),
+    ("manifest_unknown_key", set_path("project", "networks", value=[{"name": "n", "bridge": "b", "extra": 1}])),
+    ("manifest_invalid", set_path("project", "networks", value=[{"name": "n", "bridge": "Bad Bridge"}])),
+    ("manifest_invalid", set_path("project", "networks", value=[{"name": "n", "bridge": "b", "gateway_port": 0}])),
+    ("manifest_invalid", set_path("project", "networks", value=[{"name": "n", "bridge": "b"}, {"name": "n", "bridge": "c"}])),
 ]
 
 
@@ -785,6 +785,8 @@ def test_each_reviewed_input_changes_the_plan_digest(tmp_path, monkeypatch, chan
 
 
 IMAGE_ID = "sha256:" + "c" * 64
+NETWORKS = [{"name": "deedkit-recordings-backend", "bridge": "dk-recbackend0", "gateway_port": 13240},
+            {"name": "deedkit-recordings-router", "bridge": "dk-recrouter0"}]
 GATEWAY_IP = "172.30.0.5"
 OVERLAY_EVENTS = ["overlay", "overlay", "network", "network", "tag", "up", "edit:production", "edit:http", "edit:policy",
                   "prepare", "apply", "seamless prepare", "seamless promote", "status", "drift"]
@@ -796,7 +798,9 @@ class Applier(Enroller):
     right after a named event."""
 
     def __init__(self, tmp_path, monkeypatch, **kwargs):
-        super().__init__(tmp_path, monkeypatch, **kwargs)
+        def declare(manifest):
+            manifest["project"]["networks"] = NETWORKS
+        super().__init__(tmp_path, monkeypatch, mutate=declare, **kwargs)
         from scripts import seamless_release as s
         self.s, self.events, self.triggers, self.failures, self.inputs = s, [], {}, {}, []
         self.http_state, self.tagged, self.networks = tmp_path / "http-state", set(), set()
@@ -1396,13 +1400,34 @@ def test_undo_refuses_without_an_applied_enrollment(tmp_path, monkeypatch):
 
 
 # spec: ANYM-746
+def test_the_recordings_manifest_uses_only_keys_the_installed_host_tool_reads_and_the_networks_key_is_optional(tmp_path, monkeypatch):
+    # Incident 11-04 (#632): a key the installed tool does not know is a malformed manifest to it, so every deploy paused
+    # with `enroll_required` for the running recordings project. Keys added later reach a host after its tool.
+    assert set(json.loads(RECORDINGS)["project"]) == {"name", "files", "env_file", "env_required", "services"}
+    assert Enroller(tmp_path, monkeypatch).plan()["status"] == "plan"
+
+
+# spec: ANYM-746
+def test_enroll_reads_the_deploy_configuration_the_way_status_does(tmp_path, monkeypatch, capsys):
+    host = Enroller(tmp_path, monkeypatch)
+    from scripts import seamless_release as s
+    seen = []
+    monkeypatch.setattr(p.os, "geteuid", lambda: 0)
+    monkeypatch.setenv("DEEDKIT_DEPLOY_CONFIG", "/etc/deedkit/release-test.json")
+    monkeypatch.setattr(p, "config", lambda path: seen.append(path) or (host.settings if path != p.HTTP_CONFIG else host.http))
+    monkeypatch.setattr(s, "validate_settings", lambda value: value)
+    monkeypatch.setattr(p, "main_history", lambda state: host.root / "mirror")
+    p.main(["enroll", "--module", "recordings", "--sha", SHA, "--plan"])
+    assert seen[0] == "/etc/deedkit/release-test.json" and json.loads(capsys.readouterr().out)["status"] == "plan"
+
+
+# spec: ANYM-746
 def test_the_enrollment_flags_and_codes_are_documented_and_the_manifest_declares_its_networks():
     docs = " ".join((ROOT / "docs/operations/production.md").read_text().split())
     for text in ("--apply --plan-digest", "--undo", "enrollment.json", "HTTP recovery is manual, inspect it",
                  "production state is unknown, inspect it"):
         assert text in docs
-    assert [item["name"] for item in json.loads(RECORDINGS)["project"]["networks"]] == [
-        "deedkit-recordings-backend", "deedkit-recordings-router"]
+    assert "`networks`" in docs  # the key is optional: the recordings manifest of the enrolled module declares none
 
 
 # spec: ANYM-745

@@ -1974,8 +1974,10 @@ undoing a plan is `--apply` and `--undo` (ANYM-746, below); the hand release abo
 
 *Manifest.* Exactly these keys, nothing else: `name` (the file name); `project` (`name`, `files` as repository paths under
 `deploy/`, `env_file` as an absolute host path, `env_required` variable names, `services` as service to build target,
-`networks`: the internal Compose networks the first start creates once, each `name`, `bridge` and, for a network the
-gateway joins, `gateway_port`, the port the isolation probe checks on every serving gateway);
+optional `networks`: the internal Compose networks the first start creates once, each `name`, `bridge` and, for a network
+the gateway joins, `gateway_port`, the port the isolation probe checks on every serving gateway; a module whose
+networks exist already declares none, and a new manifest key reaches a host only after the tool that reads it is
+installed, because an older tool reads an unknown key as a malformed manifest and `deploy` pauses with `enroll_required`);
 `gateway` (`overlay` a repository path or null, and `policy`: `module`, `backend_url`, `tools`, `principals` with their
 `grants`, `key_dir` as an absolute host directory, `key_file_pattern` with `{principal}`, `key_uid`); `egress`
 (`outside` false, or true with `admission_env` (`blocked` and `open` variable names), `canary`, `verify` (a command whose
