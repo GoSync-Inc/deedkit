@@ -6463,8 +6463,8 @@ def test_the_command_line_exits_75_with_one_json_line_for_a_deploy_that_met_a_ba
 def test_production_md_names_the_wait_the_exit_code_and_the_windows_that_stay():
     docs = " ".join((ROOT / "docs/operations/production.md").read_text().split())  # line breaks are layout
     assert "backup.wait_seconds" in docs and "backup_running" in docs and "exit 75" in docs
-    assert ("A release that would run into a scheduled backup start keeps its clock window: the wait does not "
-            "protect a scheduled start.") in docs
+    # Owner 11-04 (#617): no clock window; the wait still does not protect a scheduled start.
+    assert "A release has no clock window" in docs and "the wait does not protect a scheduled start." in docs
     # The two real retry behaviours replace the blanket "systemd retries it".
     assert "at most three starts in 8 hours" in docs and "5400 s" in docs and "systemd retries it;" not in docs
 
