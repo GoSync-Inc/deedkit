@@ -3,12 +3,14 @@ import contextlib
 import copy
 import fcntl
 import json
+import os
 from pathlib import Path
 import shutil
 import socket
 import subprocess
 import threading
 import tempfile
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -1253,6 +1255,84 @@ def test_the_http_configuration_and_a_prepared_release_digest_do_not_change_with
     command = PromoteCommand(tmp_path, monkeypatch)
     s.main(['promote', '--sha', SHA, '--backup-wait', '30'])
     assert s.p.digest(command.settings) == command.digest and 'backup' not in command.settings
+
+
+class WaitClock:
+    """The fake clock for the backup wait: only `sleep` moves it, hooks run after each sleep, the rest is real time."""
+
+    def __init__(self):
+        self.now, self.hooks = 0.0, []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+        for hook in self.hooks:
+            hook(self.now)
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+# spec: ANYM-744
+def test_promote_records_the_backup_wait_in_its_receipts_and_the_prepared_receipt_stays_unchanged(tmp_path, monkeypatch):
+    cfg, release, calls, receipt = fixture(tmp_path, monkeypatch)
+    prepared = (release / 'http-prepared.json').read_bytes()
+    s.promote(cfg, SHA, backup_waited=1234)
+    assert s.p.read(release / 'http-result.json')['backup_wait_seconds'] == 1234
+    assert s.p.read(Path(cfg['state_directory']) / 'http-current.json')['backup_wait_seconds'] == 1234
+    assert (release / 'http-prepared.json').read_bytes() == prepared
+
+
+# spec: ANYM-744
+def test_promote_without_a_wait_adds_nothing_to_its_receipts(tmp_path, monkeypatch):
+    cfg, release, calls, receipt = fixture(tmp_path, monkeypatch)
+    s.promote(cfg, SHA)
+    assert 'backup_wait_seconds' not in s.p.read(release / 'http-result.json')
+
+
+# spec: ANYM-744
+def test_standalone_promote_waits_on_the_real_lock_then_runs_the_real_promotion_inside_it(tmp_path, monkeypatch, capsys):
+    cfg, release, calls, receipt = fixture(tmp_path, monkeypatch)
+    lock = tmp_path / 'backups' / '.runner.lock'
+    lock.parent.mkdir(mode=0o700)
+    monkeypatch.setenv('DEEDKIT_BACKUP_LOCK', str(lock))
+    backup = {'fd': os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)}  # a running backup
+    fcntl.flock(backup['fd'], fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def ends_at_ten_minutes(now):
+        if now >= 600 and backup['fd'] is not None:
+            os.close(backup['fd'])
+            backup['fd'] = None
+
+    def held():
+        fd = os.open(lock, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(fd)
+        return False
+
+    clock = WaitClock()
+    clock.hooks.append(ends_at_ten_minutes)
+    monkeypatch.setattr(s.p, 'time', clock)
+    inner = s.p.run
+    monkeypatch.setattr(s.p, 'run', lambda argv, **kw: 'ActiveState=inactive\n' if argv[:2] == ['systemctl', 'show'] else inner(argv, **kw))
+    gate, real_wait, waits, inside = s.p.promotable, s.p.wait_backup_idle, [], []
+    monkeypatch.setattr(s.p, 'promotable', lambda sha: inside.append(held()) or gate(sha))
+    monkeypatch.setattr(s.p, 'wait_backup_idle', lambda *args: waits.append(args) or real_wait(*args))
+    monkeypatch.setattr(s.os, 'geteuid', lambda: 0)
+    monkeypatch.setattr(s.p, 'config', lambda path: cfg)
+    monkeypatch.setattr(s, 'validate_settings', lambda value: value)  # root-ownership checks need a root test host
+    monkeypatch.setattr(s, 'locks', lambda value: contextlib.nullcontext())
+    s.main(['promote', '--sha', SHA])
+    printed = json.loads(capsys.readouterr().out)
+    assert 600 <= printed['backup_wait_seconds'] < 615 and len(waits) == 1
+    assert inside and all(inside) and 'switch' in calls and not held()
+    assert s.p.read(release / 'http-result.json')['backup_wait_seconds'] == printed['backup_wait_seconds']
 
 
 def test_promotion_preserves_every_fenced_issuer_tombstone(tmp_path, monkeypatch):

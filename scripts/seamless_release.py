@@ -586,7 +586,7 @@ def wait_ready(settings, receipt):
         time.sleep(.25)
 
 
-def promote(settings, sha):
+def promote(settings, sha, *, backup_waited=0):
     validate_settings(settings)
     p.promotable(sha)
     release = Path(settings['state_directory']) / sha
@@ -635,6 +635,8 @@ def promote(settings, sha):
         durable_write(release / 'http-attempted.json', {'status': 'recovery-required', 'sha': sha})
         raise Refused('router transaction needs recovery inspection; no blind retry or retirement') from exc
     receipt.update({'status': 'serving-retirement-pending', 'router_after': proposed})
+    if backup_waited:  # ANYM-744: only a release that waited for a running backup says so; prepared receipts are unchanged
+        receipt['backup_wait_seconds'] = backup_waited
     durable_write(release / 'http-result.json', receipt)
     durable_write(release / 'http-attempted.json', {'status': 'serving', 'sha': sha})
     durable_write(Path(settings['state_directory']) / 'http-current.json', receipt)
@@ -1017,13 +1019,16 @@ def main(argv=None):
         if args.action in {'bootstrap', 'prepare', 'promote', 'retire'} and not re.fullmatch(r'[0-9a-f]{40}', args.sha or ''):
             raise Refused('an exact lowercase 40-character main SHA is required')
         with locks(settings), ExitStack() as held:
+            waited = 0
             if args.action == 'promote':
                 # ANYM-744: wait for a running backup inside the locks (deploy's order), then hold its lock.
-                held.enter_context(p.wait_backup_idle(settings, p.time.monotonic() + args.backup_wait))
+                waited = held.enter_context(p.wait_backup_idle(settings, p.time.monotonic() + args.backup_wait))
             result = {'bootstrap': lambda: bootstrap(settings, args.sha), 'prepare': lambda: prepare(settings, args.sha),
-                'promote': lambda: promote(settings, args.sha), 'retire': lambda: retire(settings, args.sha),
+                'promote': lambda: promote(settings, args.sha, backup_waited=waited), 'retire': lambda: retire(settings, args.sha),
                 'status': lambda: status(settings, args.sha),
                 'clean': lambda: clean_command(settings, args.remove, args.plan_a_config)}[args.action]()
+            if waited:
+                result = {**result, 'backup_wait_seconds': waited}
         print(json.dumps(result, indent=2))
     except p.BackupRunning as exc:  # nothing was written
         print(json.dumps(exc.line()))

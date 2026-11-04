@@ -1063,9 +1063,10 @@ def backup_lock():
         os.close(fd)
 
 
-def backup_unit_busy():
+def backup_unit_busy(expired=lambda: False):
     """`(unit, state, since)` of the first backup unit that is not positively `inactive` or `failed` (an unreadable one
-    is busy, as for the producer pin), or None when every one is idle. `since` is the unit's last start, if read."""
+    is busy, as for the producer pin), or None when every one is idle. `since` is the unit's last start, if read.
+    After every probe `expired()` ends the scan: the bound passed before idle was confirmed."""
     for unit in BACKUP_UNITS:
         try:
             shown = run(["systemctl", "show", "-p", "ActiveState", "-p", "InactiveExitTimestamp", unit],
@@ -1075,12 +1076,18 @@ def backup_unit_busy():
         fields = {key: value.strip() for key, _, value in (line.partition("=") for line in shown.splitlines())}
         if fields.get("ActiveState") not in ("inactive", "failed"):
             return unit, fields.get("ActiveState") or "unreadable", fields.get("InactiveExitTimestamp") or None
+        if expired():
+            return unit, "not confirmed idle within the bound", None
     return None
 
 
-def backup_busy():
-    """`(unit or path, detail, since)` while a backup unit or the unsettled marker says a backup may run."""
-    if busy := backup_unit_busy():
+def backup_busy(expired=lambda: False):
+    """`(unit or path, detail, since)` while a backup unit or the unsettled marker says a backup may run. The marker
+    (a file stat) is read before the units, so a bound that ends the unit scan still names it, and again after them:
+    a runner can create it while the units are read."""
+    if marker := unsettled_marker():
+        return str(marker), unsettled_backup(), None
+    if busy := backup_unit_busy(expired):
         return busy[0], f"backup_running: {busy[0]} is {busy[1]}", busy[2]
     if marker := unsettled_marker():
         return str(marker), unsettled_backup(), None
@@ -1092,27 +1099,45 @@ def wait_backup_idle(settings, deadline):
     """Wait until no backup runs, then hold the runner lock for the caller's run; yields the seconds waited. Idle is
     positive: the lock is free, every BACKUP_UNITS unit reads `inactive` or `failed` and the `.unsettled` marker is
     absent, read again with the lock held (a runner can create the marker and die between the first read and the
-    lock). No candidate lock is held while sleeping. Polls every BACKUP_POLL seconds; the deadline (time.monotonic)
-    is checked after every probe, so it is overshot by at most one probe. At the bound: BackupRunning, never an
-    unlocked run. `settings` mirrors wait_for_calls; the bound comes from the caller. A host without a backup runner
-    skips the wait (open_backup_lock)."""
+    lock). The lock is probed first, so a held lock refuses before any `systemctl` runs, and nothing is held while
+    sleeping or reading units for the first time. Polls every BACKUP_POLL seconds. With a positive bound the
+    deadline (time.monotonic) is checked after every probe, also before admission, so it is overshot by at most one
+    probe and a release is never admitted after it; a bound of 0 is the single non-waiting check. At the bound:
+    BackupRunning, never an unlocked run. `settings` mirrors wait_for_calls; the bound comes from the caller. A host
+    without a backup runner skips the wait (open_backup_lock)."""
     fd = open_backup_lock()
     if fd is None:
         yield 0
         return
-    started, said = time.monotonic(), False
+    started, said, path = time.monotonic(), False, backup_lock_path()
+    held = str(path), f"backup_running: a backup holds {path}", None
+
+    def expired():
+        return deadline > started and time.monotonic() >= deadline
+
+    def take():
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+
     try:
         while True:
-            busy = backup_busy()
-            if busy is None:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    busy = str(backup_lock_path()), f"backup_running: a backup holds {backup_lock_path()}", None
-                else:
-                    if (busy := backup_busy()) is None:
-                        break
-                    fcntl.flock(fd, fcntl.LOCK_UN)
+            if not take():
+                busy = held
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)  # only a probe: no candidate lock is held while units are read
+                if (busy := backup_busy(expired)) is None:
+                    if not take():
+                        busy = held
+                    elif (busy := backup_busy(expired)) is None:
+                        if not expired():
+                            break
+                        busy = str(path), "backup_running: idle was not confirmed within the bound", None
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    else:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
             now = time.monotonic()
             if now >= deadline:
                 raise BackupRunning(busy[0], int(now - started), busy[2], busy[1])

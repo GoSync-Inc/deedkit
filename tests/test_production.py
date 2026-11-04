@@ -6050,6 +6050,44 @@ def test_a_bound_of_zero_keeps_the_single_non_waiting_check(tmp_path, monkeypatc
 
 
 # spec: ANYM-744
+def test_slow_probes_cannot_carry_the_wait_past_a_positive_bound(tmp_path, monkeypatch):
+    host = BackupHost(tmp_path, monkeypatch, probe=60)  # every unit idle, each probe takes a minute
+    with pytest.raises(p.BackupRunning) as refused:
+        with host.wait(30):
+            raise AssertionError("admitted after the bound")
+    # The first probe ended past the bound: nothing else is probed, nothing is held.
+    assert host.clock.now == 60 and host.probes == [p.BACKUP_UNITS[0]] and refused.value.waited_seconds == 60
+    assert not host.lock_is_held()
+
+
+# spec: ANYM-744
+def test_a_release_is_never_admitted_after_the_bound_even_when_every_probe_read_idle(tmp_path, monkeypatch):
+    host = BackupHost(tmp_path, monkeypatch, probe=10)
+    # Six idle probes (before the lock and under it) end at 60 s; the bound is 55 s.
+    with pytest.raises(p.BackupRunning):
+        with host.wait(55):
+            raise AssertionError("admitted after the bound")
+    assert host.clock.now <= 55 + 10 and not host.lock_is_held()
+
+
+# spec: ANYM-744
+def test_a_held_lock_with_a_zero_bound_refuses_before_any_probe(tmp_path, monkeypatch):
+    host = BackupHost(tmp_path, monkeypatch, probe=60)
+    host.hold()
+    with pytest.raises(p.BackupRunning):
+        with host.wait(0):
+            raise AssertionError("proceeded without the lock")
+    assert host.probes == [] and host.clock.now == 0
+
+
+# spec: ANYM-744
+def test_an_idle_host_with_a_zero_bound_is_admitted_whatever_the_probes_cost(tmp_path, monkeypatch):
+    host = BackupHost(tmp_path, monkeypatch, probe=60)
+    with host.wait(0) as waited:
+        assert waited == 360 and host.lock_is_held()
+
+
+# spec: ANYM-744
 def test_a_sigterm_during_the_wait_takes_and_writes_nothing(tmp_path):
     bin_directory = tmp_path / "bin"
     bin_directory.mkdir()
@@ -6203,6 +6241,23 @@ def test_a_wrapper_held_auto_deploy_waits_zero_seconds_and_reads_no_unit(tmp_pat
     backup = BackupHost(tmp_path, monkeypatch)
     backup.hold()  # the unit's `flock --nonblock` wrapper holds it
     assert host.deploy(auto=True)["status"] == "deployed" and backup.clock.now == 0 and backup.probes == []
+
+
+# spec: ANYM-744
+@pytest.mark.parametrize("auto", [False, True])
+def test_deploy_holds_the_lock_inside_apply_and_promote_and_waits_at_most_once(tmp_path, monkeypatch, auto):
+    host = Deployer(tmp_path, monkeypatch)
+    backup = BackupHost(tmp_path, monkeypatch)
+    waits, held, real_wait = [], [], p.wait_backup_idle
+    if auto:
+        backup.hold()  # the unit's wrapper
+    monkeypatch.setattr(p, "wait_backup_idle", lambda *args: waits.append(args) or real_wait(*args))
+    for module, name in ((p, "apply"), (host.s, "promote")):
+        inner = getattr(module, name)
+        monkeypatch.setattr(module, name, lambda *args, _inner=inner, **kwargs:
+                            (held.append(backup.lock_is_held()), _inner(*args, **kwargs))[1])
+    assert host.deploy(auto=auto)["status"] == "deployed"
+    assert held == [True, True] and len(waits) == (0 if auto else 1)
 
 
 # spec: ANYM-744
