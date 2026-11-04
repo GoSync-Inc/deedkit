@@ -169,8 +169,9 @@ def chat_statuses(c,p,chat_ids,lower=None,upper=None,*,conflict_items=False):
         if conflict_items:
             conflict['items']=listing(c,chat)
             step,hint=guarded_pointer(c,p,row,h)
+            # The hint stays beside the call, so a caller the gateway denies the call still reads it.
+            if hint:h['history_hint']=hint
             if step:h['next_call']=step
-            elif hint:h['history_hint']=hint
         file_data=files.get(chat) or {**empty_files(),'extraction':{},'enrichment':{}}
         file_data['download']=downloads.get(chat,{})
         result[chat]={'chat_id':chat,'account':row['account'],'provider_chat_id':row['provider_chat'],
@@ -248,11 +249,12 @@ def query_evidence(c,p,normalized,items,*,paged=False,include=True):
         if ids is not None and len(ids)<=20:
             permitted=[r['chat_id'] for r in records]
             result['chats']=list(chat_statuses(c,p,permitted,lower,upper).values())
-        # ANYM-756: a read of one named chat says whether older history may be missing and names the call.
-        named=[(r,h) for r,h in zip(records,histories) if r['chat_id']==chat] if chat else []
-        if named:
-            step,hint=guarded_pointer(c,p,*named[0])
-            if hint:result['history_hint']={**hint,**({'next_call':step} if step else {})}
+    # ANYM-756: a read of one named chat says whether older history may be missing and names the call; it is
+    # part of the compact summary (presentation.EVIDENCE_SUMMARY), with or without include_coverage.
+    named=[(r,h) for r,h in zip(records,histories) if r['chat_id']==chat] if chat else []
+    if named:
+        step,hint=guarded_pointer(c,p,*named[0])
+        if hint:result['history_hint']={**hint,**({'next_call':step} if step else {})}
     return result
 
 

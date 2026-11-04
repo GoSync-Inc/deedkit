@@ -60,18 +60,43 @@ def test_a_failing_history_pointer_never_costs_the_read(worker, monkeypatch):
     w, s, _ = worker
     key = history_reader(w, s)
     asyncio.run(w.sync_once())
-    def broken(*_):
-        raise RuntimeError('synthetic pointer failure')
+    def broken(c, *_):
+        # A real statement error: without the savepoint it would abort the read's transaction.
+        c.execute('SELECT 1/0')
     monkeypatch.setattr(evidence, 'history_pointer', broken)
-    result = s.get_messages(key, stable_id('chat', w.account, '100'))
+    cid = stable_id('chat', w.account, '100')
+    result = s.get_messages(key, cid)
     assert result['items'] and 'history_hint' not in result['result_evidence']
-    status = s.get_sync_status(key, chat_id=stable_id('chat', w.account, '100'))
+    assert result['result_evidence']['next_action']
+    status = s.get_sync_status(key, chat_id=cid)
     assert 'next_call' not in status['history'] and 'history_hint' not in status['history']
+    assert status['messages']['messages'] == 2 and 'items' in status['conflicts']
 
 
 # spec: ANYM-756
-def test_read_without_coverage_has_no_hint(worker):
+def test_read_without_coverage_keeps_the_hint(worker):
     w, s, _ = worker
     key = history_reader(w, s)
     asyncio.run(w.sync_once())
-    assert 'history_hint' not in read(s, key, w, '100', include_coverage=False)
+    hint = read(s, key, w, '100', include_coverage=False)['history_hint']
+    assert hint['reason'] == 'traversal_incomplete' and hint['next_call']['tool'] == 'execute_messenger_operation'
+
+
+# spec: ANYM-756
+def test_default_compact_mcp_reads_carry_the_pointer(worker):
+    from starlette.testclient import TestClient
+    from messaging_service.app import create_app
+    from test_client_contract import rpc
+    from test_compact_reads_lean import structured
+    w, s, _ = worker
+    key = history_reader(w, s)
+    asyncio.run(w.sync_once())
+    cid = stable_id('chat', w.account, '100')
+    with TestClient(create_app(s, ['testserver'])) as client:
+        read = structured(rpc(client, key, 'get_messages', {'chat_id': cid}))
+        status = structured(rpc(client, key, 'get_sync_status', {'chat_id': cid}))
+    assert read['detail'] == 'compact' and read['result_evidence']['history_hint']['reason'] == 'traversal_incomplete'
+    step = read['result_evidence']['history_hint']['next_call']
+    assert step['arguments']['parameters'] == {'before_message': stable_id('msg', w.account, '100', '4'), 'count': 100}
+    assert status['history']['next_call'] == step
+    assert status['history']['history_hint'] == {**UNKNOWN, 'reason': 'traversal_incomplete'}

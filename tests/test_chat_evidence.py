@@ -202,7 +202,7 @@ def test_incomplete_telegram_traversal_names_the_page_before_the_oldest_archived
         'operation':'request_chat_history','chat_id':cid,
         'parameters':{'before_message':stable_id('msg',w.account,'100','4'),'count':100}},
         'caller_supplies':['request_id','preview_digest']}
-    assert 'history_hint' not in history
+    assert history['history_hint']=={'coverage':'unknown','reason':'traversal_incomplete'}
     # A key without the operation's permission sees only that coverage is unknown.
     narrow=s.issue_key('history-narrow',[w.account],permissions=['read'])
     history=s.get_sync_status(narrow,chat_id=cid)['history']
@@ -219,6 +219,22 @@ def test_not_scanned_or_empty_telegram_chat_gets_an_unknown_hint_and_no_invented
     for chat,reason in (('200','not_scanned'),('300','empty_archive')):
         history=s.get_sync_status(key,chat_id=stable_id('chat',w.account,chat))['history']
         assert 'next_call' not in history and history['history_hint']=={'coverage':'unknown','reason':reason}
+
+
+# spec: ANYM-756
+def test_synthetic_account_chat_has_no_history_pointer(worker):
+    w,s,_=worker
+    key=s.issue_key('history-synthetic',[w.account],permissions=['read','read-live'])
+    asyncio.run(w.sync_once())
+    cid=stable_id('chat',w.account,'100')
+    with s.pool.connection() as c:c.execute('UPDATE accounts SET synthetic=true WHERE id=%s',(w.account,))
+    history=s.get_sync_status(key,chat_id=cid)['history']
+    assert not history['history_traversal_complete'] and history['synthetic']
+    assert 'next_call' not in history and 'history_hint' not in history
+    assert 'history_hint' not in s.get_messages(key,cid)['result_evidence']
+    # The same chat on a real account gets the pointer.
+    with s.pool.connection() as c:c.execute('UPDATE accounts SET synthetic=false WHERE id=%s',(w.account,))
+    assert s.get_sync_status(key,chat_id=cid)['history']['next_call']['arguments']['operation']=='request_chat_history'
 
 
 # spec: ANYM-756

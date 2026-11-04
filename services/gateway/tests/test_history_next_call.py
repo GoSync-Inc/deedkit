@@ -21,20 +21,23 @@ HINT = {"coverage": "unknown", "reason": "traversal_incomplete"}
 TOOLS = ["get_sync_status", "get_messages", "execute_messenger_operation", "preview_messenger_operation"]
 
 
-def backend(request, supported):
+def backend(request, supported, available):
     """A fake messaging backend that answers like the real one for an incompletely traversed Telegram chat."""
     if request.url.path == "/v1/capabilities":
         return httpx.Response(200, json={"permissions": ["read", "read-live"], "messenger_operations": {
-            "supported_by_account": {"synthetic": {"provider": "telethon", "operations": list(supported)}}}})
+            "supported_by_account": {"synthetic": {"provider": "telethon", "operations": list(supported),
+                                                   "available_operations": list(available)}}}})
     operation = request.url.path.removeprefix("/v1/")
     if operation == "get_sync_status":
         return httpx.Response(200, json={"chat_id": CHAT_ID, "account": "synthetic", "history": {
-            "state": "loading", "history_traversal_complete": False, "gaps": [], "next_call": STEP}})
+            "state": "loading", "history_traversal_complete": False, "gaps": [], "history_hint": HINT,
+            "next_call": STEP}})
     return httpx.Response(200, json={"items": [], "next_cursor": None, "result_evidence": {
         "basis": "archived_data", "history_hint": {**HINT, "next_call": STEP}}})
 
 
-def setup(tmp_path, actions=("request_chat_history",), supported=("request_chat_history",), tools=TOOLS):
+def setup(tmp_path, actions=("request_chat_history",), supported=("request_chat_history",), tools=TOOLS,
+          available=("request_chat_history",)):
     value = config()
     value["deployment"] = {"modules": ["messaging"], "backends": {"messaging": {"url": "http://backend.test"}}}
     value["profiles"]["reader"] = {"tools": ["messages_" + n for n in tools],
@@ -51,7 +54,8 @@ def setup(tmp_path, actions=("request_chat_history",), supported=("request_chat_
     path.write_text(json.dumps(value))
     path.chmod(0o600)
     return create_app(path, "http://testserver",
-                      transports={"messaging": httpx.MockTransport(lambda request: backend(request, supported))})
+                      transports={"messaging": httpx.MockTransport(lambda request: backend(request, supported,
+                                                                                            available))})
 
 
 def read_both(app):
@@ -66,17 +70,20 @@ def read_both(app):
 def test_nested_history_next_call_is_named_by_the_gateway_tool(tmp_path):
     history, hint = read_both(setup(tmp_path))
     mapped = {**STEP, "tool": "messages_execute_messenger_operation"}
-    assert history["next_call"] == mapped and history["state"] == "loading"
+    assert history["next_call"] == mapped and history["state"] == "loading" and history["history_hint"] == HINT
     assert hint == {**HINT, "next_call": mapped}
 
 
 # spec: ANYM-756
-@pytest.mark.parametrize("actions,supported,tools", [
-    (("rename_group",), ("request_chat_history",), TOOLS),  # no gateway action grant for the operation
-    (("request_chat_history",), ("rename_group",), TOOLS),  # the account does not offer it
-    (("request_chat_history",), ("request_chat_history",), ["get_sync_status", "get_messages"]),  # tool hidden
+@pytest.mark.parametrize("actions,supported,tools,available", [
+    (("rename_group",), ("request_chat_history",), TOOLS, ("request_chat_history",)),  # no action grant
+    (("request_chat_history",), ("rename_group",), TOOLS, ("rename_group",)),  # the account does not offer it
+    (("request_chat_history",), ("request_chat_history",), ["get_sync_status", "get_messages"],
+     ("request_chat_history",)),  # tool hidden
+    (("request_chat_history",), ("request_chat_history",), TOOLS, ()),  # supported, not enabled for the account
 ])
-def test_nested_history_next_call_is_dropped_where_the_gateway_would_refuse_it(tmp_path, actions, supported, tools):
-    history, hint = read_both(setup(tmp_path, actions, supported, tools))
-    assert "next_call" not in history and history["state"] == "loading"
+def test_nested_history_next_call_is_dropped_where_the_gateway_would_refuse_it(tmp_path, actions, supported, tools,
+                                                                               available):
+    history, hint = read_both(setup(tmp_path, actions, supported, tools, available))
+    assert "next_call" not in history and history["state"] == "loading" and history["history_hint"] == HINT
     assert hint == HINT

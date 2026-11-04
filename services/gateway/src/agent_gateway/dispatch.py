@@ -209,12 +209,7 @@ class Dispatch:
         gateway would refuse it (hidden tool, missing scope or action grant for the account). ANYM-756: the
         same for the history pointer nested in a chat's sync status and in a read's result evidence."""
         if isinstance(value, dict):
-            for *path, key in NESTED_NEXT_CALLS:
-                parent = value
-                for name in path:
-                    parent = parent.get(name) if isinstance(parent, dict) else None
-                if isinstance(parent, dict) and isinstance(parent.get(key), dict) and "next_call" in parent[key]:
-                    parent[key] = self.next_call(parent[key], snapshot, agent, caps)
+            self.nested_next_calls(value, snapshot, agent, caps)
         step = value.get("next_call") if isinstance(value, dict) else None
         if not isinstance(step, dict):
             return value
@@ -237,6 +232,34 @@ class Dispatch:
         elif value.get("error") == "not_found" or arguments.get("operation") == "open_chat_by_phone":
             value["next_action"] = "key_cannot_open_new_chats"
         return value
+
+    def nested_next_calls(self, value, snapshot, agent, caps):
+        """ANYM-756: a history pointer below the top level follows the ANYM-531 rule and, in addition, is
+        dropped unless the account reports the operation available now (key permitted and account opt-in),
+        as usable_actions advertises; the hint beside it always stays."""
+        for *path, key in NESTED_NEXT_CALLS:
+            parent = value
+            for name in path:
+                parent = parent.get(name) if isinstance(parent, dict) else None
+            holder = parent.get(key) if isinstance(parent, dict) else None
+            if not isinstance(holder, dict) or "next_call" not in holder:
+                continue
+            step = holder["next_call"]
+            arguments = step.get("arguments") if isinstance(step, dict) else None
+            arguments = arguments if isinstance(arguments, dict) else {}
+            if self.available(caps, arguments.get("account"), arguments.get("operation")):
+                parent[key] = self.next_call(holder, snapshot, agent, caps)
+            else:
+                parent[key] = {k: v for k, v in holder.items() if k != "next_call"}
+
+    @staticmethod
+    def available(caps, account, operation):
+        """The backend's availability report for one account; a backend without one makes nothing available."""
+        operations = caps.get("messenger_operations")
+        accounts = operations.get("supported_by_account") if isinstance(operations, dict) else None
+        row = accounts.get(account) if isinstance(accounts, dict) and isinstance(account, str) else None
+        names = row.get("available_operations") if isinstance(row, dict) else None
+        return isinstance(names, list) and isinstance(operation, str) and operation in names
 
     def implemented(self, tool, snapshot, agent, caps, account=None):
         if tool.get("required_manifest"):
