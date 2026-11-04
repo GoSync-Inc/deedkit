@@ -159,6 +159,20 @@ Reply to an already archived message is supported. Provider chat
 permissions still apply. Reads and WhatsApp sends do not explicitly mark chats
 read; WhatsApp uses `sendSeen: false`.
 
+### The sent message's reference (`archive_reference`, ANYM-751)
+
+A `sent` result carries `archive_reference` (`provider_chat_id`, `provider_message_id`, `chat_id`,
+`message_id`) with `archive_reference_state: provider_verified` when the provider confirmed the message:
+on native WhatsApp the wire chat and message the receipt names (docs/whatsapp-native.md), on Telegram the
+chat and message id the provider returned for the send. The Telegram reference is derived when the result
+is read, so older sent rows show it too. It is the provider's confirmation of the id, not a promise that
+the archive row exists yet: the send does not wait for the capture, so a read by that `message_id` may lag
+by the capture delay. A key that may not read that chat gets `archive_reference: null`,
+`archive_reference_state: scope_restricted` and `message_id: null`: the projected archive ids are withheld,
+while the requested `chat_id`, `provider_chat_id` and `provider_message_id` of its own send stay. Any other status (`queued`, `dispatching`,
+`unknown`, `failed`) and a WhatsApp receipt without a wire reference keep `archive_reference: null` and
+`legacy_requested`; `message_id` is filled from `provider_message_id` whenever the provider returned one.
+
 ### New WhatsApp conversations by phone number
 
 On native WhatsApp accounts an agent can write to a number that has no archived
