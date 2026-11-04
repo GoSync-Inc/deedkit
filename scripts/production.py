@@ -4972,6 +4972,8 @@ ENROLL_FORBIDDEN_SERVICES = frozenset({"db", "calendar-db", "database", "postgre
 VERIFY_SCRIPT = re.compile(r"scripts/[a-z0-9_]+_egress_check\.py")
 BACKUP_FILES = re.compile(r"services/messaging/messaging_service/backup_runner\.py|deploy/[^/]*backup[^/]*\.(service|timer)")
 MODULE_NAME = re.compile(r"[a-z][a-z0-9-]{0,40}")
+NETWORK_NAME = re.compile(r"[a-z0-9][a-z0-9_.-]{0,62}")
+BRIDGE_NAME = re.compile(r"[a-z][a-z0-9-]{0,14}")
 ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 KEY_PATH = re.compile(r"[A-Za-z0-9_]+(\[\*\])?(\.[A-Za-z0-9_]+(\[\*\])?)*")
 ENROLL_CODES = (
@@ -4983,7 +4985,11 @@ ENROLL_CODES = (
     "calls_unknown", "paused", "egress_env_missing", "egress_verify_failed", "key_file_invalid",
     "policy_unreadable", "policy_check_failed", "private_config_unreadable", "private_config_forbidden_key",
     "no_current_release", "gateway_project_missing", "source_unavailable", "command_timeout", "egress_target_invalid",
-    "egress_blocked_incomplete", "egress_control_missing", "credential_file_invalid")
+    "egress_blocked_incomplete", "egress_control_missing", "credential_file_invalid",
+    # ANYM-746: `enroll --apply` and `--undo`
+    "plan_changed", "enrollment_unfinished", "enrollment_not_applied", "active_call", "overlay_conflict",
+    "network_unsafe", "egress_admission_not_required", "confinement_check_failed", "isolation_check_failed",
+    "configuration_changed", "policy_changed")
 # The blocked targets a manifest must cover, by address class (a host listener, a tailnet node's listener).
 EGRESS_CLASSES = {"host": ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"), "tailnet": ("100.64.0.0/10",)}
 MANIFEST_KEYS = {"name", "project", "gateway", "egress", "private_config", "owner_steps", "live_actions"}
@@ -5051,11 +5057,29 @@ def check_manifest(value, name):
         raise EnrollRefused("manifest_invalid", f"a field has an unexpected type ({type(exc).__name__})") from None
 
 
+def check_networks(networks):
+    """`project.networks`: the internal Compose networks the module needs created once (`apply` creates a missing one
+    with its bridge name and never removes one); `gateway_port` marks a network the gateway joins and the isolation
+    probe checks after promotion."""
+    if not isinstance(networks, list):
+        raise EnrollRefused("manifest_invalid", "project.networks must be a list")
+    seen = set()
+    for item in networks:
+        item = manifest_keys(item, {"name", "bridge", "gateway_port"}, "project.networks", required={"name", "bridge"})
+        manifest_text(item["name"], "project.networks.name", NETWORK_NAME)
+        manifest_text(item["bridge"], "project.networks.bridge", BRIDGE_NAME)
+        port = item.get("gateway_port", 1)
+        if type(port) is not int or not 0 < port < 65536 or item["name"] in seen:
+            raise EnrollRefused("manifest_invalid", "project.networks: a duplicate name or a bad gateway_port")
+        seen.add(item["name"])
+
+
 def checked_manifest(value, name):
     manifest_keys(value, MANIFEST_KEYS, "manifest")
     if manifest_text(value["name"], "name", MODULE_NAME) != name:
         raise EnrollRefused("manifest_invalid", "name differs from the file name")
-    project = manifest_keys(value["project"], {"name", "files", "env_file", "env_required", "services"}, "project")
+    project = manifest_keys(value["project"], {"name", "files", "env_file", "env_required", "services", "networks"}, "project")
+    check_networks(project["networks"])
     manifest_text(project["name"], "project.name", re.compile(r"[a-z0-9][a-z0-9_-]*"))
     manifest_list(project["files"], "project.files", repo_path)
     host_path(project["env_file"], "project.env_file")
@@ -5563,17 +5587,607 @@ def check_egress(mirror, sha, egress, variables, scratch):
         raise EnrollRefused("egress_verify_failed", (lines[-1] if lines else "no output")[:200])
 
 
+# ANYM-746: `enroll --apply` and `enroll --undo` (production.md, "Enrollment"). The plan is ANYM-745's; this block performs
+# exactly the plan whose digest the caller names, through the release machinery `deploy` uses, and recovers what it changed.
+ENROLL_RECEIPT = "enrollment.json"
+ENROLL_HEALTH_SECONDS, ENROLL_HEALTH_POLL = 240, 3
+GATEWAY_SERVICE = re.compile(r"gateway|http-gateway-[a-z0-9-]+")
+# Run inside a gateway container: connect to its own backend address (the positive control of the isolation probe).
+CONNECT_CODE = "import socket,sys;socket.create_connection((sys.argv[1],int(sys.argv[2])),timeout=3).close()"
+
+
+def run_input(argv, data, *, timeout=300):
+    """`argv` with `data` (bytes) on stdin; its stdout. As `run`, nothing of the output goes into an exception."""
+    result = subprocess.run(argv, input=data, capture_output=True, timeout=timeout)
+    if result.returncode:
+        raise Refused(f"{Path(argv[0]).name} failed (exit {result.returncode}); production was not accepted")
+    return result.stdout.decode(errors="replace")
+
+
+def file_sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def replace_file(path, content, uid, gid, mode):
+    """Atomically replace `path` with `content` (bytes) of the given owner and mode, fsynced, and read it back."""
+    path = Path(path)
+    temporary = path.with_name(f".{path.name}.enroll")
+    with suppress(FileNotFoundError):
+        temporary.unlink()
+    try:
+        with os.fdopen(new_file(temporary), "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chown(temporary, uid, gid)
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    except BaseException:
+        with suppress(FileNotFoundError):
+            temporary.unlink()
+        raise
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    if hashlib.sha256(path.read_bytes()).hexdigest() != hashlib.sha256(content).hexdigest():
+        raise Refused(f"{path} does not read back as written")
+
+
+def replace_like(path, content):
+    """`replace_file` with the owner and mode `path` has now."""
+    info = os.stat(path)
+    replace_file(path, content, info.st_uid, info.st_gid, info.st_mode & 0o777)
+
+
+def enroll_calls(settings):
+    """Refuses with `active_call` (`calls_unknown` when the calls database cannot be read) while a call may run; every
+    mutation of an enrollment is preceded by it (ANYM-746 E3)."""
+    try:
+        active = active_calls(settings)
+    except CallsUnknown as exc:
+        raise EnrollRefused("calls_unknown", str(exc)[:200]) from None
+    if active:
+        raise EnrollRefused("active_call", f"{len(active)} active call(s)")
+
+
+def settle_halt(reason, status="halted", **fields):
+    return {"status": status, "reason": reason, **fields}
+
+
+def settle_finish(status, **fields):
+    return {"status": status, **fields}
+
+
+def settle_retry(exc, message):
+    return settle_finish("error", reason=message + "; nothing changed")
+
+
+class Enrollment:
+    """One `enroll --apply` run under the host locks and the backup wait. `receipt` is `enrollment.json`, rewritten after
+    every step (digests, revisions and step names only)."""
+
+    def __init__(self, settings_path, http_path, module, sha, expected, mirror):
+        self.paths = {"production": str(settings_path), "http": str(http_path)}
+        self.module, self.sha, self.expected, self.mirror = module, sha, expected, mirror
+        self.settings = config(settings_path)
+        self.s = http_release_tool()
+        self.http = self.s.validate_settings(config(http_path))
+        self.state, self.http_state = Path(self.settings["state_directory"]), Path(self.http["state_directory"])
+        self.path, self.receipt, self.marker = self.state / ENROLL_RECEIPT, None, None
+
+    # -- receipt
+    def save(self, **fields):
+        self.receipt.update(fields)
+        write(self.path, self.receipt)
+
+    def step(self, name):
+        self.receipt["steps"].append(name)
+        self.save()
+
+    def reload(self):
+        self.settings = config(self.paths["production"])
+        self.http = self.s.validate_settings(config(self.paths["http"]))
+
+    # -- before the first write
+    def check(self):
+        if self.path.exists() and read(self.path).get("status") != "undone":
+            raise EnrollRefused("enrollment_unfinished", f"{self.path} holds an enrollment that is not undone; inspect it")
+        self.plan = enroll_plan(self.settings, self.http, self.module, self.sha, self.mirror)
+        if self.plan["plan_digest"] != self.expected:
+            raise EnrollRefused("plan_changed", "the recomputed plan digest differs from --plan-digest; plan again and review it")
+        self.manifest, blob = read_manifest(self.mirror, self.sha, self.module)
+        if blob != self.plan["manifest_blob"]:
+            raise EnrollRefused("plan_changed", "the manifest changed since the plan")
+        if reason := unresolved(self.state, self.http_state):
+            raise EnrollRefused("enrollment_unfinished", reason)
+        current = read(self.state / "current.json") if (self.state / "current.json").exists() else {}
+        serving = read(self.http_state / "http-current.json") if (self.http_state / "http-current.json").exists() else {}
+        if current.get("status") != "applied" or serving.get("sha") != current.get("sha"):
+            raise EnrollRefused("no_current_release", "plan A and plan B do not serve the same applied release")
+        if drift := configuration_drift(self.settings, self.http, current, serving):
+            raise EnrollRefused("configuration_changed", drift)
+        self.base = current["sha"]
+
+    def begin(self):
+        """The pause (this run's marker), the receipt and the copies; from here a failure keeps the pause."""
+        body = json.dumps({"status": "enrolling", "at": now(), "reason": f"enroll {self.module} at {self.sha[:12]} "
+                           f"is running or stopped; inspect {self.path}"}) + "\n"
+        fd = os.open(PAUSE, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(body)
+        self.marker = body
+        self.receipt = {"version": 1, "module": self.module, "sha": self.sha, "plan_digest": self.expected,
+                        "status": "running", "started_at": now(), "steps": [], "files": {},
+                        "project": self.plan["production_json"]["append_project"]}
+        self.save()
+
+    def runtime_images(self):
+        """The image identity of each selected service of the projects that ran before the enrollment (plan A rolls
+        these back); `before_images` of the receipt holds the pre-run answer."""
+        before = self.receipt.get("before_images")
+        return {project["name"]: {service: identity["image"] for service, identity in snapshot(project)[1].items()}
+                for project in self.settings["projects"] if before is None or project["name"] in before}
+
+    def backup(self):
+        self.step("backup")
+        directory = self.state / f"enrollment-{self.module}-{self.sha[:12]}"
+        directory.mkdir(mode=0o700)
+        self.save(before_images=self.runtime_images())
+        # The gateway project is the one the enrollment edits: plan A's own snapshots are taken from the edited files, so
+        # the pre-run resolved configuration is kept here, with the images that run now, to put the gateway back.
+        gateway = next(project for project in self.settings["projects"] if "gateway" in project["services"].values())
+        document, running = snapshot(gateway)
+        before = copy.deepcopy(document)
+        for service in before["services"].values():
+            service.pop("build", None)
+        for service, identity in running.items():
+            before["services"][service]["image"] = identity["image"]
+        path = directory / "gateway.pre-run.json"
+        with os.fdopen(new_file(path), "w") as handle:
+            json.dump(escaped(before), handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        self.receipt["pre_run"] = {"project": gateway["name"], "file": str(path),
+                                   "images": {service: identity["image"] for service, identity in running.items()}}
+        sources = {"production": self.paths["production"], "http": self.paths["http"],
+                   "policy": self.http["http_release"]["gateway_policy"]}
+        for name, source in sources.items():
+            content = Path(source).read_bytes()
+            target = directory / name
+            with os.fdopen(new_file(target), "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self.receipt["files"][name] = {"path": str(source), "backup": str(target),
+                                           "before_sha256": hashlib.sha256(content).hexdigest()}
+        self.save()
+
+    def original(self, name):
+        item = self.receipt["files"][name]
+        content = Path(item["backup"]).read_bytes()
+        if hashlib.sha256(content).hexdigest() != item["before_sha256"]:
+            raise Refused(f"the copy of {item['path']} was modified")
+        return content
+
+    # -- mutations
+    def overlays(self):
+        self.step("overlays")
+        for item in self.plan["overlays"]:
+            content = repo_file(self.mirror, self.sha, item["repo_path"])
+            if hashlib.sha256(content).hexdigest() != item["sha256"]:
+                raise EnrollRefused("plan_changed", f"{item['repo_path']} differs from the plan")
+            target = Path(item["host_path"])
+            if os.path.lexists(target):
+                if target.is_symlink() or file_sha256(target) != item["sha256"]:
+                    raise EnrollRefused("overlay_conflict", f"{target} exists with other content")
+                continue
+            replace_file(target, content, item["owner"], item["group"], int(item["mode"], 8))
+
+    def start_document(self):
+        project = self.plan["production_json"]["append_project"]
+        return project, compose_document(project, project["directory"], project["files"])
+
+    def networks(self, document):
+        declared = {item["name"]: item for item in self.manifest["project"]["networks"]}
+        external = {network.get("name") for network in document.get("networks", {}).values()
+                    if isinstance(network, dict) and network.get("external")}
+        if undeclared := sorted(name for name in external - declared.keys() if name):
+            raise EnrollRefused("network_unsafe", ", ".join(undeclared) + " is external but not declared in the manifest")
+        for name, item in declared.items():
+            if run(["docker", "network", "ls", "--filter", f"name=^{name}$", "--format", "{{.Name}}"]).split():
+                if run(["docker", "network", "inspect", "--format", "{{.Internal}}", name]).strip() != "true":
+                    raise EnrollRefused("network_unsafe", f"{name} exists but is not internal")
+            else:
+                run(["docker", "network", "create", "--internal", "-o", f"com.docker.network.bridge.name={item['bridge']}",
+                     "-o", "com.docker.network.bridge.gateway_mode_ipv4=isolated", name])
+
+    def tag_images(self):
+        for target in sorted(set(self.manifest["project"]["services"].values())):
+            verified = published(target, self.sha)
+            _, dockerfile, _, _ = BUILDS[target]
+            _, recipe = build_recipe(target, self.sha)
+            run(["docker", "pull", "--quiet", verified["reference"]])
+            image = run(["docker", "image", "inspect", "--format", "{{.Id}}", verified["reference"]]).strip()
+            if image not in (verified["digest"], verified["config_digest"]) or not names_revision(
+                    image, self.sha, dockerfile, recipe):
+                raise Refused(f"the pulled {target} image is not the verified image of {self.sha[:12]}")
+            tag = f"deedkit-{target}:enroll-{self.sha}"
+            existing = run(["docker", "image", "ls", "--quiet", "--no-trunc", tag]).split()
+            if existing and set(existing) != {image}:
+                raise Refused(f"{tag} names another image")
+            if not existing:
+                run(["docker", "tag", verified["reference"], tag])
+                if run(["docker", "image", "ls", "--quiet", "--no-trunc", tag]).split() != [image]:
+                    raise Refused(f"{tag} does not name the verified image")
+
+    def start_checks(self, document, project):
+        """Immediately before `up`: the private configuration holds no forbidden key and the admission is `required`."""
+        check_private_config(document, self.manifest["project"], self.manifest["private_config"])
+        if self.manifest["egress"]["outside"]:
+            values = [str(value) for service in project["services"]
+                      for key, value in (document["services"].get(service, {}).get("environment") or {}).items()
+                      if key.endswith("_EGRESS_ADMISSION")]
+            if not values or set(values) != {"required"}:
+                raise EnrollRefused("egress_admission_not_required", "the resolved Compose configuration must set the admission to required")
+
+    def health(self, project):
+        deadline = time.monotonic() + ENROLL_HEALTH_SECONDS
+        for service in project["services"]:
+            while True:
+                shown = run(["docker", "ps", "--filter", "label=com.docker.compose.project=" + project["name"], "--filter",
+                             "label=com.docker.compose.service=" + service, "--format", "{{.Status}}"]).strip().splitlines()
+                if len(shown) == 1 and "(healthy)" in shown[0]:
+                    break
+                if time.monotonic() >= deadline or any("(unhealthy)" in line for line in shown):
+                    raise Refused(f"{service} is not healthy")
+                time.sleep(ENROLL_HEALTH_POLL)
+
+    def confinement(self, project):
+        """The confinement check from inside the container, and each blocked target's positive control from the host."""
+        egress = self.manifest["egress"]
+        if not egress["outside"]:
+            return
+        variables, _ = read_env_file(project["env_files"][0])
+        script = repo_file(self.mirror, self.sha, egress["verify"][0])
+        blocked = [item for item in variables[egress["admission_env"]["blocked"]].split(",") if item]
+        inside = []
+        for target in egress["open"]:
+            inside += ["--open", target]
+        inside += ["--open-dns", variables[egress["controls"]["dns_env"]]]
+        for target in blocked:
+            inside += ["--blocked-dns", target[4:]] if target.startswith("dns:") else ["--blocked", target]
+        controls = [item for item in blocked if item != egress["canary"] and not item.startswith("dns:")]
+        service = next(iter(project["services"]))
+        try:
+            reports = [json.loads(run_input(compose(project) + ["exec", "-T", service, "python", "-I", "-", "check", *inside], script))]
+            if controls:
+                reports.append(json.loads(run_input([sys.executable, "-I", "-", "check", *[a for t in controls for a in ("--control", t)]], script)))
+            passed = all(report.get("passed") is True for report in reports)
+        except (Refused, ValueError, AttributeError, subprocess.TimeoutExpired):
+            passed = False
+        if not passed:
+            raise EnrollRefused("confinement_check_failed", "the egress confinement or a positive control failed")
+
+    def first_start(self):
+        self.calls()
+        self.step("first_start")
+        project, document = self.start_document()
+        self.networks(document)
+        self.tag_images()
+        project, document = self.start_document()  # the files and the private configuration as they are now
+        self.start_checks(document, project)
+        self.receipt["started"] = True
+        self.save()
+        run(compose(project) + ["up", "-d", "--no-build", "--pull", "never", "--no-deps", *project["services"]],
+            env={**os.environ, "DEEDKIT_VERSION": f"enroll-{self.sha}"})
+        self.health(project)
+        self.confinement(project)
+
+    def calls(self):
+        enroll_calls(self.settings)
+
+    def edit(self):
+        self.calls()
+        self.step("configuration")
+        gateway_files = {"production": self.plan["production_json"]["gateway_project_files"],
+                         "http": self.plan["http_production_json"]["gateway_project_files"]}
+        for name in ("production", "http"):
+            item = self.receipt["files"][name]
+            raw = Path(item["path"]).read_bytes()
+            if hashlib.sha256(raw).hexdigest() != item["before_sha256"]:
+                raise EnrollRefused("plan_changed", f"{item['path']} changed after the copy")
+            value = json.loads(raw)
+            gateway = next(project for project in value["projects"] if "gateway" in project["services"].values())
+            gateway["files"] = gateway_files[name]
+            if name == "production":
+                value["projects"].append(self.plan["production_json"]["append_project"])
+            content = (json.dumps(value, indent=2) + "\n").encode()
+            item["after_sha256"] = hashlib.sha256(content).hexdigest()  # recorded first: a failed write is restored too
+            self.save()
+            replace_like(item["path"], content)
+        self.step("policy")
+        item = self.receipt["files"]["policy"]
+        raw = Path(item["path"]).read_bytes()
+        if hashlib.sha256(raw).hexdigest() != item["before_sha256"]:
+            raise EnrollRefused("plan_changed", "the live policy changed after the copy")
+        fragment = self.manifest["gateway"]["policy"]
+        candidate, _ = candidate_policy(json.loads(raw), self.manifest,
+                                        {principal: key_digest(self.manifest, principal) for principal in fragment["principals"]})
+        if digest(candidate) != self.plan["policy"]["candidate_digest"]:
+            raise EnrollRefused("plan_changed", "the candidate policy differs from the plan")
+        with tempfile.TemporaryDirectory(prefix="enroll-") as scratch:
+            os.chmod(scratch, 0o700)
+            check_policy_candidate(candidate, scratch)
+        content = (json.dumps(candidate, indent=2) + "\n").encode()
+        item.update(after_sha256=hashlib.sha256(content).hexdigest(), revision=candidate["revision"])
+        self.save()
+        replace_like(item["path"], content)
+        self.reload()
+
+    def release(self):
+        """Plan A through the wrapper `deploy` uses (health wait and automatic rollback), then plan B."""
+        self.calls()
+        self.step("plan_a")
+        release = self.state / self.sha
+        halted = deploy_plan_a(self.settings, self.http, None, self.mirror, self.base, {"sha": self.base}, self.sha, release,
+                               0, 0, settle_halt, settle_finish, settle_retry)
+        if halted is not None:
+            raise EnrollStop(halted.get("reason", "plan A did not finish"), halted)
+        self.step("plan_b")
+        halted, served = deploy_plan_b(self.http, self.s, self.http_state, self.sha, settle_halt, settle_finish, settle_retry)
+        if halted is not None:
+            raise EnrollStop(halted.get("reason", "plan B did not finish"), halted)
+        self.step("status")
+        self.save(http=public_http(self.s.status(self.http, self.sha)))
+
+    def isolation(self):
+        """The isolation step: any failure of it, a negative probe or an error reading Docker, is `isolation_check_failed`."""
+        self.step("isolation")
+        try:
+            self.probe_isolation()
+        except EnrollRefused as exc:
+            raise exc if exc.code == "isolation_check_failed" else EnrollRefused("isolation_check_failed", exc.code) from None
+        except Exception as exc:
+            raise EnrollRefused("isolation_check_failed", type(exc).__name__) from None
+
+    def probe_isolation(self):
+        """After promotion: every serving gateway generation on a gateway-joined module network cannot reach the module's
+        backend address (probed only, never written to a configuration)."""
+        project = self.plan["production_json"]["append_project"]
+        egress, service = self.manifest["egress"], next(iter(project["services"]))
+        script = repo_file(self.mirror, self.sha, egress["verify"][0]) if egress["outside"] else None
+        for network in (item for item in self.manifest["project"]["networks"] if "gateway_port" in item):
+            shown = run(["docker", "ps", "--filter", "network=" + network["name"], "--format",
+                         '{{.ID}}\t{{.Label "com.docker.compose.service"}}']).splitlines()
+            gateways = [line.split("\t")[0] for line in shown if GATEWAY_SERVICE.fullmatch(line.partition("\t")[2])]
+            if not gateways:
+                raise EnrollRefused("isolation_check_failed", f"no serving gateway is on {network['name']}")
+            for container in gateways:
+                address = ipaddress.ip_address(run(["docker", "inspect", "--format", '{{(index .NetworkSettings.Networks "'
+                                                    + network["name"] + '").IPAddress}}', container]).strip())
+                target = f"{address}:{network['gateway_port']}"
+                try:
+                    run(["docker", "exec", container, "python", "-I", "-c", CONNECT_CODE, str(address), str(network["gateway_port"])])
+                    shown = json.loads(run_input(compose(project) + ["exec", "-T", service, "python", "-I", "-", "check",
+                                                                     "--blocked", target], script or b""))
+                    isolated = shown.get("passed") is True
+                except (Refused, ValueError, AttributeError, subprocess.TimeoutExpired):
+                    isolated = False
+                if not isolated:
+                    raise EnrollRefused("isolation_check_failed", f"the module can reach a gateway on {network['name']}")
+        with tempfile.TemporaryDirectory(prefix="enroll-") as scratch:
+            os.chmod(scratch, 0o700)
+            check_policy_candidate(json.loads(Path(self.receipt["files"]["policy"]["path"]).read_bytes()), scratch)
+
+    def complete(self):
+        self.step("checks")
+        current = read(self.state / "current.json") if (self.state / "current.json").exists() else {}
+        serving = read(self.http_state / "http-current.json") if (self.http_state / "http-current.json").exists() else {}
+        if current.get("sha") != self.sha or current.get("status") != "applied" or serving.get("sha") != self.sha:
+            raise Refused("plan A or plan B does not report the new release as current")
+        if reason := unresolved(self.state, self.http_state):
+            raise Refused(reason)
+        if drift := configuration_drift(self.settings, self.http, current, serving):
+            raise Refused(drift)
+        if not PAUSE.exists() or PAUSE.read_text() != self.marker:
+            raise Refused("the pause is not the one this run wrote; it stays")
+        self.step("complete")
+        self.save(status="applied", finished_at=now())
+        PAUSE.unlink()
+
+    # -- the run
+    def apply(self):
+        self.check()
+        self.begin()
+        try:
+            self.backup()
+            self.overlays()
+            self.first_start()
+            self.edit()
+            self.release()
+            self.isolation()
+            self.complete()
+        except Exception as exc:
+            return self.stopped(exc)
+        return {"status": "enrolled", "module": self.module, "sha": self.sha, "steps": self.receipt["steps"],
+                "receipt": str(self.path), "undo": f"production.py enroll --module {self.module} --undo"}
+
+    def promoted(self):
+        path = self.http_state / self.sha / "http-attempted.json"
+        try:
+            return path.exists() and read(path).get("status") != "startup-failed"
+        except (OSError, ValueError):
+            return True
+
+    def restore(self, name, revision=None):
+        """Put the original bytes of a file back; the policy gets a revision above anything a gateway may have loaded."""
+        item = self.receipt["files"][name]
+        content = self.original(name)
+        if file_sha256(item["path"]) == item["before_sha256"]:
+            return
+        if name == "policy":
+            value = json.loads(content)
+            value["revision"] = max(value["revision"], revision or 0) + 1
+            content = (json.dumps(value, indent=2) + "\n").encode()
+        replace_like(item["path"], content)
+
+    def restore_gateway(self):
+        """Recreate the gateway services from the pre-run resolved configuration and image (the way `rollback` restores
+        a project), without a call running."""
+        item = self.receipt["pre_run"]
+        command = ["docker", "compose", "--profile", "*", "--project-name", item["project"], "-f", item["file"]]
+        wait_for_calls(self.settings, time.monotonic() + CALL_WAIT)
+        run(command + ["stop", *item["images"]])
+        run(command + ["up", "-d", "--no-build", "--pull", "never", "--no-deps", "--wait", "--wait-timeout", "180",
+                       *item["images"]])
+
+    def stopped(self, exc):
+        message = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+        code = getattr(exc, "code", None)
+        step = self.receipt["steps"][-1] if self.receipt["steps"] else "begin"
+        self.save(failed_step=step, reason=message, **({"code": code} if code else {}))
+        undo = f"production.py enroll --module {self.module} --undo"
+        try:
+            if self.promoted():
+                if step == "isolation" and self.receipt.get("started"):
+                    project = self.plan["production_json"]["append_project"]
+                    run(compose(project) + ["stop", *project["services"]])  # the module only, never the gateway
+                try:
+                    http = public_http(self.s.status(self.http, self.sha))
+                except Exception as again:
+                    http = {"status": "unreadable: " + type(again).__name__}
+                self.save(status="http-manual", http=http)
+                return self.result("stopped", message, code, "no further change was made; the pause and the module stay as they are; "
+                                   "HTTP recovery is manual, inspect it (seamless-release.md)")
+            release = self.state / self.sha
+            attempted = (release / "attempted.json").exists()
+            outcome = read(release / "result.json") if (release / "result.json").exists() else {}
+            if attempted and outcome.get("status") == "applied":
+                rollback(self.settings, self.sha, self.http)
+            elif attempted and not (outcome.get("status") == "unhealthy" and (release / "rollback.json").exists()):
+                self.save(status="unknown")
+                return self.result("stopped", message, code, "production state is unknown, inspect it; nothing more was changed")
+            if attempted:
+                # The rollback snapshots were prepared from the edited configuration: the gateway is put back from the
+                # pre-run one, and every existing project must run its pre-run image.
+                self.restore_gateway()
+                if self.runtime_images() != self.receipt["before_images"]:
+                    raise Refused("an existing project does not run its pre-run image after the rollback")
+            files = self.receipt["files"]
+            if "after_sha256" in files.get("policy", {}):
+                self.restore("policy", files["policy"].get("revision"))
+            for name in ("production", "http"):
+                if "after_sha256" in files.get(name, {}):
+                    self.restore(name)
+            if self.receipt.get("started"):
+                project = self.plan["production_json"]["append_project"]
+                run(compose(project) + ["stop", *project["services"]])
+        except Exception as again:
+            self.save(status="unknown", recovery_error=str(again) if isinstance(again, Refused) else type(again).__name__)
+            return self.result("stopped", message, code, "recovery failed; production state is unknown, inspect it")
+        self.save(status="stopped")
+        return self.result("stopped", message, code, f"the module was stopped and the configuration restored; the pause stays; undo is not needed ({undo} refuses)"
+                           + ("; the gateway was recreated from its pre-run configuration"
+                              if (self.state / self.sha / "attempted.json").exists() else ""))
+
+    def result(self, status, message, code, recovery):
+        return {"status": status, "module": self.module, "sha": self.sha, "failed_step": self.receipt.get("failed_step"),
+                **({"code": code} if code else {}), "reason": message, "recovery": recovery, "receipt": str(self.path)}
+
+
+class EnrollStop(Refused):
+    """A plan A or plan B wrapper ended without finishing; `outcome` is what it returned."""
+
+    def __init__(self, message, outcome):
+        super().__init__(message)
+        self.outcome = outcome
+        self.code = "active_call" if "call_waits" in outcome else None
+
+
+def public_http(value):
+    return {key: value[key] for key in ("sha", "generation", "status", "retirement_reason") if isinstance(value, dict) and key in value}
+
+
+def enroll_apply(settings_path, http_path, module, sha, expected, mirror):
+    """`enroll --apply`: the plan named by `expected`, performed under the host locks and the backup wait."""
+    enrollment = Enrollment(settings_path, http_path, module, sha, expected, mirror)
+    with ExitStack() as held:
+        held.enter_context(host_locks(enrollment.settings, enrollment.http, enrollment.s))
+        held.enter_context(backup_gate(enrollment.settings, backup_wait(enrollment.settings)))
+        return enrollment.apply()
+
+
+def enroll_undo(settings_path, http_path, module):
+    """`enroll --undo`: the configuration files byte for byte, a policy of a higher revision without the module, the
+    module's services stopped, autodeploy left paused. Nothing is removed."""
+    settings, s = config(settings_path), http_release_tool()
+    http = s.validate_settings(config(http_path))
+    state = Path(settings["state_directory"])
+    path = state / ENROLL_RECEIPT
+    with host_locks(settings, http, s), backup_gate(settings, backup_wait(settings)):
+        receipt = read(path) if path.exists() else {}
+        if receipt.get("module") != module or receipt.get("status") != "applied":
+            raise EnrollRefused("enrollment_not_applied", f"{path} holds no applied enrollment of {module}")
+        enroll_calls(settings)
+        files = receipt["files"]
+        for name in ("production", "http", "policy"):
+            if file_sha256(files[name]["path"]) != files[name]["after_sha256"]:
+                raise EnrollRefused("configuration_changed" if name != "policy" else "policy_changed",
+                                    f"{files[name]['path']} changed since the enrollment; undo it by hand")
+            if file_sha256(files[name]["backup"]) != files[name]["before_sha256"]:
+                raise EnrollRefused("configuration_changed", f"the copy of {files[name]['path']} was modified")
+        if not PAUSE.exists():
+            fd = os.open(PAUSE, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(json.dumps({"status": "enrolling", "at": now(), "reason": f"enroll --undo of {module}: resume "
+                                         "deploys at the next newer green main SHA"}) + "\n")
+        write(path, {**receipt, "status": "undoing", "undo_started_at": now()})
+        try:
+            live = json.loads(Path(files["policy"]["path"]).read_bytes())
+            restored = json.loads(Path(files["policy"]["backup"]).read_bytes())
+            restored["revision"] = live["revision"] + 1
+            with tempfile.TemporaryDirectory(prefix="enroll-") as scratch:
+                os.chmod(scratch, 0o700)
+                check_policy_candidate(restored, scratch)
+            replace_like(files["policy"]["path"], (json.dumps(restored, indent=2) + "\n").encode())
+            for name in ("production", "http"):
+                replace_like(files[name]["path"], Path(files[name]["backup"]).read_bytes())
+            project = receipt["project"]
+            run(compose(project) + ["stop", *project["services"]])
+        except Exception as exc:
+            reason = str(exc) if isinstance(exc, Refused) else type(exc).__name__
+            write(path, {**receipt, "status": "undo-failed", "reason": reason})
+            return {"status": "stopped", "module": module, "reason": reason, "receipt": str(path),
+                    "recovery": "no further change was made; the pause stays; inspect the files and the receipt"}
+        write(path, {**receipt, "status": "undone", "undone_at": now()})
+    return {"status": "undone", "module": module, "receipt": str(path),
+            "policy_revision": restored["revision"],
+            "note": "autodeploy stays paused: a SHA prepared with the module can never be prepared again; remove the pause "
+                    "when a newer green main SHA exists (production.md, Undo)"}
+
+
 def enroll_command(args):
-    """`enroll --module M --sha S --plan`: the plan, or `{"status": "refused", "refusals": [...]}` (exit 2)."""
-    if not args.plan:
-        raise Refused("enroll needs --plan; applying an enrollment is a separate command")
+    """`enroll --module M --plan|--apply --plan-digest D|--undo`: the plan, the enrollment or its undo, or
+    `{"status": "refused", "refusals": [...]}` (exit 2) with nothing written by the refused step."""
+    if [args.plan, args.apply, args.undo].count(True) != 1:
+        raise Refused("enroll needs exactly one of --plan, --apply or --undo")
     if not args.module:
         raise Refused("enroll needs --module")
-    settings = config(args.config)
-    s = http_release_tool()
-    http = s.validate_settings(config(args.http_config))
+    if args.apply and not re.fullmatch(r"[0-9a-f]{64}", args.plan_digest or ""):
+        raise Refused("enroll --apply needs --plan-digest, the plan_digest of the plan a reviewer approved")
+    if args.plan_digest and not args.apply:
+        raise Refused("--plan-digest belongs to --apply")
     try:
-        return enroll_plan(settings, http, args.module, args.sha, main_history(Path(settings["state_directory"])))
+        if args.undo:
+            return enroll_undo(args.config, args.http_config, args.module)
+        settings = config(args.config)
+        mirror = main_history(Path(settings["state_directory"]))
+        if args.apply:
+            return enroll_apply(args.config, args.http_config, args.module, args.sha, args.plan_digest, mirror)
+        http = http_release_tool().validate_settings(config(args.http_config))
+        return enroll_plan(settings, http, args.module, args.sha, mirror)
     except EnrollRefusals as exc:
         return {"status": "refused", "refusals": exc.failures}
     except EnrollRefused as exc:
@@ -5652,6 +6266,9 @@ def argument_parser():
     parser.add_argument("--database", help="copy-database: a name under the configuration's migration.databases")
     parser.add_argument("--module", help="enroll: the module of deploy/modules/<module>.json")
     parser.add_argument("--plan", action="store_true", help="enroll: print the enrollment plan, change nothing")
+    parser.add_argument("--apply", action="store_true", help="enroll: perform the plan named by --plan-digest")
+    parser.add_argument("--plan-digest", help="enroll --apply: the plan_digest of the reviewed plan")
+    parser.add_argument("--undo", action="store_true", help="enroll: reverse an applied enrollment")
     parser.add_argument("--verifier", help="self-test: check this staged verifier build against the pin instead of "
                                            "the installed one (attest-verify install, production.md)")
     return parser
@@ -5751,6 +6368,8 @@ def print_result(args, result, parser):
         print(json.dumps(result, indent=2))
         if result["status"] == "refused":
             parser.exit(2)
+        if result["status"] not in ("plan", "enrolled", "undone"):
+            parser.exit(1)
     else:
         # Receipts contain revisions/image IDs, never resolved Compose environments.
         if args.action == "prepare":
