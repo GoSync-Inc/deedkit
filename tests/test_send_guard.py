@@ -739,7 +739,8 @@ def test_a_lost_connection_during_the_lookup_is_chat_guard_unavailable_and_audit
     assert rows(s) == []
     with s.pool.connection() as c:
         audits = c.execute("SELECT outcome,error_code FROM audit_log WHERE operation='send_message'").fetchall()
-    assert [(a['outcome'], a['error_code']) for a in audits] == [('denied', 'chat_guard_unavailable')] * 2
+    # Both refusals are audited on a fresh connection (the audit allowlist records the code as operation_failed).
+    assert [(a['outcome'], a['error_code']) for a in audits] == [('denied', 'operation_failed')] * 2
 
 
 # spec: ANYM-748
