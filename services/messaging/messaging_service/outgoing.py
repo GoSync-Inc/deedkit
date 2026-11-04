@@ -319,13 +319,27 @@ def project_reference(c,p,account,reference):
     return actual,reference_state
 
 
+def telegram_reference(c,row):
+    """ANYM-751: a sent Telegram row with no stored reference names the chat and message id the provider confirmed.
+
+    Derived at read time, never written; the archive row may still lag the receipt by the capture delay (the
+    send does not wait for the archive commit). Returns (reference or None, the account's platform or None)."""
+    if c is None or row['status']!='sent' or not row['provider_message_id'] or row.get('archive_reference'):
+        return None,None
+    found=c.execute('SELECT platform FROM accounts WHERE id=%s',(row['account'],)).fetchone()
+    platform=found['platform'] if found else None
+    if platform!='telegram':return None,platform
+    return {'provider_chat_id':row['provider_chat'],'provider_message_id':row['provider_message_id']},platform
+
+
 def result(row,c=None,p=None):
     from .receipts import for_reference,hint_chat_facts,receipt_hint,unknown_evidence
-    actual,reference_state=project_reference(c,p,row['account'],row.get('archive_reference'))
+    derived,platform=telegram_reference(c,row)
+    actual,reference_state=project_reference(c,p,row['account'],row.get('archive_reference') or derived)
     context={}
     receipt=for_reference(c,row['account'],
         actual['provider_chat_id'] if actual else row['provider_chat'],
-        actual['provider_message_id'] if actual else row['provider_message_id'],context=context) \
+        actual['provider_message_id'] if actual else row['provider_message_id'],platform=platform,context=context) \
         if c is not None and row['status']=='sent' and row['provider_message_id'] else unknown_evidence()
     if reference_state=='scope_restricted':receipt=unknown_evidence()
     artifact=row.get('render_artifact')
