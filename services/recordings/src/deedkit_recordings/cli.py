@@ -9,6 +9,8 @@ def operate(parser, args):
     Preview unless `--yes`; the service must be stopped (the single-writer lock). The receipt has counts and identity only."""
     from .archive_store import Store, namespace
     from .security import Failure, read_document
+    if args.delete and args.yes and not args.snapshot_to:
+        parser.error('--delete --yes needs --snapshot-to: the post-deletion snapshot is part of the operation')
     try:
         doc, _ = read_document(args.config)
         if doc.archive is None:
@@ -47,7 +49,7 @@ def main(argv=None):
     parser.add_argument('--created-from', help='Delete recordings created at or after this time (ISO 8601)')
     parser.add_argument('--created-to', help='Delete recordings created at or before this time (ISO 8601)')
     parser.add_argument('--yes', action='store_true', help='Apply --delete or --lift-tombstone (without it: preview only)')
-    parser.add_argument('--snapshot-to', help='With --delete --yes: also write a post-deletion snapshot at a new absolute path')
+    parser.add_argument('--snapshot-to', help='With --delete --yes (required): write the post-deletion snapshot at a new absolute path')
     parser.add_argument('--lift-tombstone', action='store_true', help='Allow one deleted recording to be archived again (needs --account and --provider-id)')
     parser.add_argument('--provider-id', help='The provider recording id whose tombstone to lift')
     args = parser.parse_args(argv)

@@ -61,6 +61,7 @@ INSTANCES_FILE = Path('/etc/deedkit-backup-r2/instances.json')
 # the protected point (hashes only), a candidate's facts until its promotion, and the operator's re-baseline request.
 CONTINUITY = 'continuity.json'
 REBASELINE = 'rebaseline.json'
+FLOOR = 'deletion-floor.json'
 CONTINUITY_LIMIT = 256 * 1024 ** 2
 REASON = re.compile(r'[ -~]{8,200}')
 
@@ -662,7 +663,7 @@ CALENDAR_FAILURES={'restore_bundle_failed','restore_schema_failed','restore_inve
 
 # The recordings helper's own stages (ANYM-728) and the continuity refusals; the shared ones are above.
 RECORDINGS_FAILURES={'restore_archive_failed','restore_readback_failed','invalid_continuity','invalid_rebaseline',
-                     'rebaseline_recordings_only','continuity_too_large','continuity_unresolved',*continuity.REFUSALS}
+                     'rebaseline_recordings_only','invalid_deletion_floor','revoke_recordings_only','continuity_too_large','continuity_unresolved',*continuity.REFUSALS}
 
 
 class HelperFailure(RuntimeError):
@@ -887,6 +888,20 @@ def durable_phase(fd):
     except Exception:return None
 
 
+def deletion_floor(fd):
+    """The lowest archive incarnation this instance still accepts (ANYM-730): the operator raises it after a deletion, so a
+    bundle sealed before the deletion (older incarnation) is refused at verification and again at promotion."""
+    value=read_private(fd,FLOOR,4096)
+    if value is None:return 0
+    if (not isinstance(value,dict) or set(value)!={'v','incarnation','requested_at'} or value['v']!=1 or
+            type(value['incarnation']) is not int or not 1<=value['incarnation']<=2**53):raise ValueError('invalid_deletion_floor')
+    return value['incarnation']
+
+
+def enforce_deletion_floor(fd,incarnation):
+    if incarnation<deletion_floor(fd):raise continuity.ContinuityRefused('archive_incarnation_lower')
+
+
 def read_baseline(fd):
     """The protected point's baseline record, or None before the first enrollment."""
     value=read_private(fd,CONTINUITY,CONTINUITY_LIMIT)
@@ -904,6 +919,7 @@ def check_continuity(payload,run,facts,journal,fd):
     request accepts the candidate as the new baseline and is recorded with its reason."""
     candidate=continuity.validate_facts(r2.unique_json(private_file(payload/'continuity.json',CONTINUITY_LIMIT)))
     if candidate['archive']!=facts['archive']:raise ValueError('invalid_helper_result')
+    enforce_deletion_floor(fd,candidate['archive']['incarnation'])  # also under a re-baseline: a deletion is never undone by one
     reason=rebaseline_request(fd)
     baseline=read_baseline(fd)
     if reason is None:
@@ -933,6 +949,17 @@ def adopt_continuity(fd,run):
     if reason is not None and rebaseline_request(fd)==reason:os.unlink(REBASELINE,dir_fd=fd)
     drop_candidate_facts(fd,run);local.fsync_dir(fd)
     return reason
+
+
+def request_revocation(config,incarnation):
+    """After an owner-requested deletion (ANYM-730): refuse every bundle of an older incarnation, pending or later. Only raises."""
+    if os.geteuid()!=0:raise ValueError('root_verifier_required')
+    if r2.profile(config)!='recordings':raise ValueError('revoke_recordings_only')
+    if type(incarnation) is not int or not 1<=incarnation<=2**53:raise ValueError('invalid_deletion_floor')
+    with verifier_lock(config['directory']) as fd:
+        if incarnation<deletion_floor(fd):raise ValueError('invalid_deletion_floor')
+        write_private(fd,FLOOR,{'v':1,'incarnation':incarnation,'requested_at':now()})
+    return {'v':1,'status':'deletion_floor_set','incarnation':incarnation}
 
 
 def request_rebaseline(config,reason):
@@ -1138,6 +1165,11 @@ def run(config,*,client=None,engine=None,path=None):
                     remove_payload(config['directory'],journal['run'])
                     if admitted is not None:release_admission(admitted);admitted=None
                     host.close()
+                if profile=='recordings':
+                    # A deletion may have been recorded after this run's proof was ready (a retry): recheck before the point moves.
+                    pending_facts=read_private(fd,candidate_facts_name(journal['run']),CONTINUITY_LIMIT)
+                    if isinstance(pending_facts,dict) and isinstance(pending_facts.get('facts'),dict):
+                        enforce_deletion_floor(fd,continuity.validate_facts(pending_facts['facts'])['archive']['incarnation'])
                 promote_proof(receiver,config,client,journal)
                 rebaselined=adopt_continuity(fd,journal['run']) if profile=='recordings' else None
                 journal={**journal,'phase':'promoted'};local.write_maintenance_json('active.json',journal,dir_fd=fd)
@@ -1192,7 +1224,15 @@ def main(argv=None):
     parser.add_argument('--helper-image');parser.add_argument('--helper-revision')
     # The recordings instance's re-baseline (ANYM-728): `--rebaseline --config <verifier.json> --reason <text>`.
     parser.add_argument('--rebaseline',action='store_true');parser.add_argument('--reason')
+    # After an owner-requested deletion (ANYM-730): `--revoke-below <incarnation> --config <verifier.json>`.
+    parser.add_argument('--revoke-below',type=int)
     args=parser.parse_args(argv)
+    if args.revoke_below is not None:
+        if not args.config or args.rebaseline or args.update_pins:parser.error('--revoke-below takes --config only')
+        try:result=request_revocation(load_config(args.config),args.revoke_below)
+        except Exception as error:
+            print(json.dumps({'error':failure_code(error),'diagnostic':describe(error)},separators=(',',':')),file=sys.stderr);return 1
+        print(json.dumps(result,separators=(',',':')));return 0
     if args.rebaseline:
         if not args.config or not args.reason or args.update_pins:parser.error('--rebaseline takes --config and --reason')
         try:result=request_rebaseline(load_config(args.config),args.reason)

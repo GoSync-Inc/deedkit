@@ -1119,6 +1119,9 @@ class Store:
             return [dict(row) for row in db.execute('SELECT * FROM events WHERE sequence>? ORDER BY sequence LIMIT ?', (after, limit))]
 
     def backup(self, destination):
+        with self.connection() as db:
+            if db.execute("SELECT 1 FROM meta WHERE key='sanitize_pending'").fetchone() is not None:
+                raise Failure('archive_sanitization_pending')  # ANYM-730: a deletion started and its rewrite is not finished
         destination = Path(destination)
         private_directory(str(destination.parent))
         if destination.is_relative_to(self.directory):
@@ -1197,7 +1200,7 @@ class Store:
     def delete_records(self, *, refs=None, namespaces=None, created_from=None, created_to=None, apply=False, snapshot_to=None):
         """Remove the selected recordings (rows, index entries, speaker labels, journal events), record a tombstone for each
         provider ID, rewrite the file so the bytes are gone (FTS5 rebuild, `secure_delete`, VACUUM, WAL truncated), and
-        optionally write a post-deletion snapshot. Preview unless `apply`. The receipt holds counts and identity only."""
+        write the post-deletion snapshot (`snapshot_to`, required with `apply`). Preview unless `apply`. The receipt holds counts and identity only."""
         try:
             return self.delete_unchecked(refs, namespaces, created_from, created_to, apply, snapshot_to)
         except sqlite3.Error as error:
@@ -1217,6 +1220,8 @@ class Store:
                     self.directory / archive_feed.MARKER).exists():
                 raise Failure('deletion_feed_unsupported')  # the event feed owns the journal identity (ANYM-726); not yet supported
             targets = self.deletion_targets(db, refs, namespaces, created_from, created_to)
+            if apply and snapshot_to is None:
+                raise Failure('deletion_snapshot_required')
             receipt = {'v': 1, 'applied': False, 'selected': len(targets), 'deleted': 0, 'batches': 0,
                        'tombstones': db.execute('SELECT count(*) FROM tombstones').fetchone()[0], 'tombstones_added': 0,
                        'sanitized': False, 'incarnation': int(db.execute("SELECT value FROM meta WHERE key='incarnation'").fetchone()[0]),
@@ -1235,6 +1240,9 @@ class Store:
                         # A bundle sealed before the deletion carries the old incarnation: the verifier refuses it
                         # (`archive_incarnation_lower`), so a pending pre-deletion bundle is cancelled by this one write.
                         db.execute("UPDATE meta SET value=value+1 WHERE key='incarnation'")
+                        # Durable "the rewrite is not finished": deleted text may still sit in free pages and FTS5 storage, so
+                        # no snapshot is taken (`backup`) until the rewrite below has cleared it (`secure_delete` alone does not).
+                        db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('sanitize_pending',1)")
                     for row in chunk:
                         added += db.execute('INSERT OR IGNORE INTO tombstones(provider_hash) VALUES(?)',
                                             (provider_hash(row['namespace'], row['provider_id']),)).rowcount
@@ -1252,25 +1260,25 @@ class Store:
                     raise
                 receipt['batches'] += 1
                 receipt['deleted'] += len(chunk)
-            # Sanitization: the index is rebuilt and merged, then the file is rewritten so no freed page keeps text.
+            # Sanitization: the index is rebuilt and merged, then the file is rewritten so no freed page keeps text. Every
+            # check must hold before the durable mark is cleared; otherwise the command fails and a repeat finishes it.
             db.execute("INSERT INTO texts4(texts4) VALUES('rebuild')")
             db.execute("INSERT INTO texts4(texts4) VALUES('optimize')")
             db.execute('VACUUM')
-            db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            busy = db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0]
             wal = Path(str(self.path) + '-wal')
-            receipt['sanitized'] = (db.execute('PRAGMA freelist_count').fetchone()[0] == 0 and
-                                    db.execute('PRAGMA quick_check').fetchone()[0] == 'ok' and
-                                    (not wal.exists() or wal.stat().st_size == 0))
-            receipt.update(applied=True, tombstones_added=added, backup_replacement='backup_replacement_pending',
+            clean = (busy == 0 and db.execute('PRAGMA freelist_count').fetchone()[0] == 0 and
+                     db.execute('PRAGMA quick_check').fetchone()[0] == 'ok' and (not wal.exists() or wal.stat().st_size == 0))
+            if not clean:
+                raise Failure('deletion_sanitization_incomplete')  # a pinned reader, a busy checkpoint: nothing is snapshotted
+            db.execute("DELETE FROM meta WHERE key='sanitize_pending'")
+            db.execute('PRAGMA wal_checkpoint(TRUNCATE)')  # the mark's own change only; no text is left to reach the WAL
+            receipt.update(applied=True, sanitized=True, tombstones_added=added, backup_replacement='backup_replacement_pending',
                            tombstones=db.execute('SELECT count(*) FROM tombstones').fetchone()[0],
                            incarnation=int(db.execute("SELECT value FROM meta WHERE key='incarnation'").fetchone()[0]))
-        if snapshot_to is not None:
-            self.backup(snapshot_to)
-            with self.connection() as db:
-                receipt['snapshot'] = self.snapshot_identity(db)
-        else:
-            with self.connection() as db:
-                receipt['snapshot'] = self.snapshot_identity(db)
+        self.backup(snapshot_to)
+        with closing(sqlite3.connect(Path(snapshot_to).as_uri() + '?mode=ro', uri=True)) as snapshot:
+            receipt['snapshot'] = self.snapshot_identity(snapshot)  # the identity of the file just written, not of the live archive
         return receipt
 
     @staticmethod

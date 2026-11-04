@@ -600,6 +600,22 @@ python -m messaging_service.backup_r2_verifier --rebaseline --config /etc/deedki
   --reason "owner re-initialized the archive on 2026-11-10"
 ```
 
+**Owner-requested deletion (ANYM-730).** `deedkit-recordings --delete` (services/recordings/README.md) removes the text from the live
+archive, writes tombstones and a post-deletion snapshot, and raises the archive `incarnation` by one. A tombstone authorizes
+only a record that is **gone** from the candidate: facts in which a provider hash is both a record and a tombstone are invalid
+(`invalid_continuity`), and the judge still checks every retained record's parts. The operator procedure, in order:
+1. Stop the recordings producer timers and wait until the recordings verifier is idle (`status.json` `idle` or `verified`, no
+   `active.json`): no bundle is then pending, so none can carry the deleted text into the protected point.
+2. Run the deletion with `--yes --snapshot-to <path>`; read the receipt's `incarnation`.
+3. On `backup-1`: `python -m messaging_service.backup_r2_verifier --revoke-below <incarnation> --config
+   /etc/deedkit-recordings-backup-r2/verifier.json`. It writes `deletion-floor.json` (root `0600`, only raises). From then on a
+   bundle of an older incarnation is refused `archive_incarnation_lower` at verification and again at promotion (also a run whose proof
+   was already ready), even under a re-baseline. A refused pending bundle leaves its journal like any refusal; moving it aside is
+   an operator step under the evidence rules above (a card candidate: a verifier command to discard a revoked journal).
+4. Start the producer timers. The next verified bundle (post-deletion incarnation, the tombstones in its facts) rotates the
+   protected point and the old object leaves the backup server and the R2 prefix at that rotation (one protected point plus room
+   for one candidate); the verifier's proof shows the new incarnation and the lower record count.
+
 Scratch. The verifier decrypts into `payload-<run>` (0700, root) in its directory; for this profile it holds the
 archive's plaintext, including other people's speech, for the verification only. It is removed after success,
 after a failure, and at the start of any retry or restart (`status.json` says `cleanup_complete`). Nothing else

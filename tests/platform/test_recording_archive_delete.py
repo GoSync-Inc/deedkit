@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import sys
+import uuid
 
 import pytest
 
@@ -37,11 +38,13 @@ def fixture(tmp_path):
     return path
 
 
-def seed(store, account, ident, created, *, canary=False, text='Speaker 1 [0.0–30.0]: ordinary synthetic words'):
+def seed(store, account, ident, created, *, canary=False, text='ordinary synthetic words'):
     item = {'id': ident, 'created_at': created, 'finished_at': created,
             'title': CANARY['title'] if canary else 'Ordinary title ' + ident}
     store.discover(account, [item], None, 100)
-    transcript = (CANARY['speaker'] + ' [0.0–30.0]: ' + CANARY['transcript'] + ' ' + 'filler words ' * 200) if canary else text
+    # A transcript is stored as one JSON object per utterance: the speaker label lands in the `speakers` table.
+    transcript = (json.dumps({'text': CANARY['transcript'] + ' ' + 'filler words ' * 200, 'speaker': CANARY['speaker']})
+                  if canary else json.dumps({'text': text, 'speaker': 'Ordinary speaker'}))
     summary = CANARY['summary'] if canary else 'Ordinary summary'
     store.observe(account, ident, item, {'transcript': ('available', transcript, None),
                                          'summary': ('available', summary, None)}, 101)
@@ -64,6 +67,13 @@ def archive(tmp_path):
         yield path, doc, store, refs
     finally:
         store.close()
+
+
+def snap(store):
+    """A fresh, not yet existing snapshot path in a private directory beside the archive."""
+    folder = store.directory.parent / 'snaps'
+    folder.mkdir(mode=0o700, exist_ok=True)
+    return str(folder / (uuid.uuid4().hex + '.sqlite'))
 
 
 def raw_bytes(directory):
@@ -103,7 +113,7 @@ def test_delete_removes_rows_index_speakers_and_journal_references_in_bounded_ba
     path, doc, store, refs = archive
     import deedkit_recordings.archive_store as module
     monkeypatch.setattr(module, 'DELETE_BATCH', 1)
-    receipt = store.delete_records(refs=[refs['gone'], refs['also-gone']], apply=True)
+    receipt = store.delete_records(refs=[refs['gone'], refs['also-gone']], apply=True, snapshot_to=snap(store))
     assert receipt['deleted'] == 2 and receipt['batches'] == 2
     for table in ('records', 'index_rows', 'speakers', 'events'):
         column = 'ref'
@@ -116,6 +126,7 @@ def test_delete_removes_rows_index_speakers_and_journal_references_in_bounded_ba
 # spec: ANYM-730 criterion 2
 def test_a_canary_is_absent_from_the_live_file_the_wal_and_the_snapshot_after_deletion(archive, tmp_path):
     path, doc, store, refs = archive
+    assert count(store, 'SELECT count(*) FROM speakers WHERE ref=?', refs['gone']) == 1  # a real structured label, not plain text
     for needle in CANARY.values():
         assert needle.encode() in raw_bytes(store.directory), needle  # the search can fail: before, it finds every canary
     destination = tmp_path / 'snapshots' / 'after.sqlite'
@@ -123,7 +134,7 @@ def test_a_canary_is_absent_from_the_live_file_the_wal_and_the_snapshot_after_de
     receipt = store.delete_records(refs=[refs['gone'], refs['also-gone'], refs['other']], apply=True, snapshot_to=str(destination))
     assert receipt['sanitized'] is True
     live = raw_bytes(store.directory)
-    for needle in CANARY.values():
+    for needle in (*CANARY.values(), CANARY['speaker'].lower()):
         assert needle.encode() not in live, needle
         assert needle.encode() not in destination.read_bytes(), needle
     assert not Path(str(store.path) + '-wal').exists() or Path(str(store.path) + '-wal').stat().st_size == 0
@@ -137,7 +148,7 @@ def test_a_canary_is_absent_from_the_live_file_the_wal_and_the_snapshot_after_de
 def test_a_deleted_provider_id_is_tombstoned_and_never_archived_again_until_lifted(archive):
     path, doc, store, refs = archive
     a, _ = doc.accounts
-    store.delete_records(refs=[refs['gone']], apply=True)
+    store.delete_records(refs=[refs['gone']], apply=True, snapshot_to=snap(store))
     expected = continuity.provider_hash(namespace(a), 'gone')  # the contract of backup_recordings_continuity.py
     assert count(store, 'SELECT count(*) FROM tombstones WHERE provider_hash=?', expected) == 1
     result = store.discover(a, [{'id': 'gone', 'title': 'again'}, {'id': 'fresh', 'title': 'new'}], None, 200)
@@ -174,7 +185,7 @@ def test_a_listed_deleted_recording_is_not_fetched_again_by_the_collector(tmp_pa
     doc, _ = read_document(path)
     store = Store(doc.archive)
     ref = store.record(doc.accounts[0], 'conv-a')['ref']
-    store.delete_records(refs=[ref], apply=True)
+    store.delete_records(refs=[ref], apply=True, snapshot_to=snap(store))
     store.close()
     calls.clear()
     async def second():
@@ -248,20 +259,57 @@ def test_a_run_interrupted_before_the_rewrite_is_finished_by_repeating_the_comma
             yield Crashing(db)
     monkeypatch.setattr(Store, 'operator_connection', crashing)
     with pytest.raises(Failure) as error:
-        store.delete_records(refs=[refs['gone'], refs['also-gone'], refs['other']], apply=True)
+        store.delete_records(refs=[refs['gone'], refs['also-gone'], refs['other']], apply=True, snapshot_to=snap(store))
     assert error.value.code == 'archive_unavailable'
     assert count(store, 'SELECT count(*) FROM records WHERE ref=?', refs['gone']) == 0  # the batches were committed
     assert count(store, 'SELECT count(*) FROM tombstones') == 3
+    with pytest.raises(Failure) as fenced:  # the durable mark: no snapshot, and so no backup, before the rewrite is finished
+        store.backup(snap(store))
+    assert fenced.value.code == 'archive_sanitization_pending'
     monkeypatch.setattr(Store, 'operator_connection', real)
-    repeated = store.delete_records(refs=[refs['gone'], refs['also-gone'], refs['other']], apply=True)
+    repeated = store.delete_records(refs=[refs['gone'], refs['also-gone'], refs['other']], apply=True, snapshot_to=snap(store))
     assert repeated['selected'] == 0 and repeated['sanitized'] is True and repeated['tombstones'] == 3
+    store.backup(snap(store))  # the mark is cleared
     assert CANARY['transcript'].encode() not in raw_bytes(store.directory)
+
+
+# spec: ANYM-730 criterion 2
+def test_a_reader_that_pins_the_wal_fails_the_command_and_keeps_the_snapshot_fenced(archive):
+    path, doc, store, refs = archive
+    reader = sqlite3.connect(store.path)
+    reader.execute('PRAGMA journal_mode=WAL')
+    reader.execute('BEGIN')
+    reader.execute('SELECT count(*) FROM records').fetchone()  # a read transaction the checkpoint cannot pass
+    try:
+        with pytest.raises(Failure) as error:
+            store.delete_records(refs=[refs['gone']], apply=True, snapshot_to=snap(store))
+        assert error.value.code == 'deletion_sanitization_incomplete'
+        with pytest.raises(Failure) as fenced:
+            store.backup(snap(store))
+        assert fenced.value.code == 'archive_sanitization_pending'
+    finally:
+        reader.close()
+    receipt = store.delete_records(refs=[refs['gone']], apply=True, snapshot_to=snap(store))
+    assert receipt['sanitized'] is True and CANARY['transcript'].encode() in raw_bytes(store.directory)  # the other canaries stay
+    store.backup(snap(store))
+
+
+# spec: ANYM-730 criterion 2
+def test_a_deletion_without_a_snapshot_path_is_refused_and_the_receipt_describes_the_written_file(archive, tmp_path):
+    path, doc, store, refs = archive
+    with pytest.raises(Failure) as error:
+        store.delete_records(refs=[refs['gone']], apply=True)
+    assert error.value.code == 'deletion_snapshot_required' and count(store, 'SELECT count(*) FROM records') == 4
+    target = snap(store)
+    receipt = store.delete_records(refs=[refs['gone']], apply=True, snapshot_to=target)
+    with sqlite3.connect(target) as written:
+        assert written.execute('SELECT count(*) FROM records').fetchone()[0] == receipt['snapshot']['records'] == 3
 
 
 # spec: ANYM-730 criterion 6
 def test_the_receipt_carries_counts_and_identity_but_no_title_or_text(archive):
     path, doc, store, refs = archive
-    receipt = store.delete_records(refs=[refs['gone'], refs['other']], apply=True)
+    receipt = store.delete_records(refs=[refs['gone'], refs['other']], apply=True, snapshot_to=snap(store))
     text = json.dumps(receipt)
     assert all(word not in text for word in CANARY.values())
     assert set(receipt) >= {'v', 'applied', 'selected', 'deleted', 'batches', 'tombstones', 'tombstones_added', 'sanitized',
@@ -275,19 +323,19 @@ def test_deletion_refuses_an_archive_with_an_active_feed_a_building_index_or_too
     import deedkit_recordings.archive_store as module
     monkeypatch.setattr(module.shutil, 'disk_usage', lambda _: shutil._ntuple_diskusage(10 ** 12, 10 ** 12 - 1, 1))
     with pytest.raises(Failure) as error:
-        store.delete_records(refs=[refs['gone']], apply=True)
+        store.delete_records(refs=[refs['gone']], apply=True, snapshot_to=snap(store))
     assert error.value.code == 'archive_capacity' and count(store, 'SELECT count(*) FROM records') == 4
     monkeypatch.undo()
     with sqlite3.connect(store.path) as db:
         db.execute("INSERT INTO meta(key,value) VALUES('feed_epochs','[[1,1]]')")
     with pytest.raises(Failure) as error:
-        store.delete_records(refs=[refs['gone']], apply=True)
+        store.delete_records(refs=[refs['gone']], apply=True, snapshot_to=snap(store))
     assert error.value.code == 'deletion_feed_unsupported'
     with sqlite3.connect(store.path) as db:
         db.execute("DELETE FROM meta WHERE key='feed_epochs'")
         db.execute("UPDATE meta SET value='building' WHERE key='index_state'")
     with pytest.raises(Failure) as error:
-        store.delete_records(refs=[refs['gone']], apply=True)
+        store.delete_records(refs=[refs['gone']], apply=True, snapshot_to=snap(store))
     assert error.value.code == 'archive_index_building' and count(store, 'SELECT count(*) FROM records') == 4
 
 
@@ -300,10 +348,12 @@ def test_the_operator_command_previews_then_applies_only_with_yes(archive, capsy
     preview = json.loads(capsys.readouterr().out)
     assert preview['applied'] is False and preview['selected'] == 1
     cli.main(['--config', str(path), '--delete', '--account', 'omi-a', '--created-from', '2026-01-01T00:00:00Z',
-              '--created-to', '2026-02-01T00:00:00Z', '--yes'])
+              '--created-to', '2026-02-01T00:00:00Z', '--yes', '--snapshot-to', snap(store)])
     applied = json.loads(capsys.readouterr().out)
     assert applied['applied'] is True and applied['deleted'] == 2 and applied['backup_replacement'] == 'backup_replacement_pending'
     with pytest.raises(SystemExit):
         cli.main(['--config', str(path), '--delete'])  # a selector is required
+    with pytest.raises(SystemExit):
+        cli.main(['--config', str(path), '--delete', '--ref', refs['kept'], '--yes'])  # --yes needs --snapshot-to
     cli.main(['--config', str(path), '--lift-tombstone', '--account', 'omi-a', '--provider-id', 'gone', '--yes'])
     assert json.loads(capsys.readouterr().out)['lifted'] == 1

@@ -426,14 +426,14 @@ and records one tombstone per provider ID. The first batch also raises the archi
 deletion then carries a lower incarnation and the verifier refuses it (`archive_incarnation_lower`), so a pending pre-deletion
 bundle is cancelled. After the last batch it rebuilds and merges the full-text index, runs `VACUUM` with `secure_delete` on (a
 temporary file stays in the private archive directory), truncates the WAL, and reports `sanitized` only when no free page is left,
-`quick_check` is `ok` and the WAL is empty. `--snapshot-to <new absolute path>` also writes a post-deletion snapshot. It needs
+`quick_check` is `ok` and the WAL is empty. `--snapshot-to <new absolute path>` is required with `--yes`: the command writes the post-deletion snapshot and the receipt describes that file. The first batch also sets a durable `sanitize_pending` mark in `meta`, cleared only after the rewrite is verified (no free page, `quick_check` ok, `wal_checkpoint(TRUNCATE)` not busy, empty WAL); while it is set, every Online Backup (`--backup-to`, the snapshot) is refused `archive_sanitization_pending`, because `secure_delete` alone leaves deleted text in FTS5 storage. A crash or a pinned reader (`deletion_sanitization_incomplete`) is finished by repeating the command with `--yes`. It needs
 free space of about twice the archive plus the reserve (`archive_capacity` otherwise) and refuses while the index builds
 (`archive_index_building`) and while an event feed exists (`deletion_feed_unsupported`: the feed owns the journal identity, ANYM-726).
 
 The receipt is one JSON line: `selected`, `deleted`, `batches`, `tombstones`, `tombstones_added`, `sanitized`, the new
-`incarnation`, the snapshot identity (`archive_id`, `incarnation`, `sequence`, `records`) and `backup_replacement`, which is
+`incarnation`, the identity of the snapshot file it wrote (`archive_id`, `incarnation`, `sequence`, `records`) and `backup_replacement`, which is
 `backup_replacement_pending` after a deletion: the protected point on the backup server still holds the old text until the next
-verified bundle replaces it (BACKUP_R2.md; one protected point plus room for one candidate). Confirm it with the verifier's next
+verified bundle replaces it (BACKUP_R2.md; one protected point plus room for one candidate). Run the operator procedure of BACKUP_R2.md "Owner-requested deletion" around it (drain, delete, `--revoke-below`). Confirm it with the verifier's next
 proof (`verification.archive` shows the new incarnation and a lower record count) and by the single object under the R2 prefix.
 The collector never archives a tombstoned provider ID again (`discover` skips it, the receipt of a pass reports nothing about
 it). `--lift-tombstone --account <id> --provider-id <id> [--yes]` allows one to be archived again; the next backup then needs a

@@ -117,13 +117,14 @@ def test_deletion_is_authorized_only_by_a_new_tombstone_for_that_provider_in_the
     # Tombstones are append-only, and one already in the baseline authorizes nothing new.
     after = facts_of(tmp_path, [rec(2), rec(3)], 'accepted', tombstones=[tomb(1)])
     assert refused(after, facts_of(tmp_path, [rec(2), rec(3)], 'dropped')) == 'archive_tombstone_dropped'
-    assert refused(facts_of(tmp_path, [rec(1), rec(2)], 'pre', tombstones=[tomb(1)]), facts_of(tmp_path, [rec(2)], 'lost', tombstones=[tomb(1)])) == 'archive_content_lost'
+    # (A record and its own tombstone together are invalid facts, ANYM-730: the baseline holds another deletion's tombstone.)
+    assert refused(facts_of(tmp_path, [rec(1), rec(2)], 'pre', tombstones=[tomb(7)]), facts_of(tmp_path, [rec(2)], 'lost', tombstones=[tomb(7)])) == 'archive_content_lost'
 
 
 # spec: ANYM-728
 @pytest.mark.parametrize('bad', ['version', 'extra_key', 'digest', 'ref', 'revision', 'archive_id', 'kind', 'tombstone'])
 def test_facts_from_the_helper_are_validated_before_any_decision(tmp_path, bad):
-    facts = facts_of(tmp_path, [rec(1)], tombstones=[tomb(1)])
+    facts = facts_of(tmp_path, [rec(1)], tombstones=[tomb(7)])
     broken = {'version': {**facts, 'v': 2}, 'extra_key': {**facts, 'text': 'x'},
               'digest': {**facts, 'parts': [['r0001', 'transcript', 1, 'zz']]},
               'ref': {**facts, 'parts': [['bad ref', 'transcript', 1, 'a' * 64]]},
@@ -309,13 +310,14 @@ def recordings_operator(operator, tmp_path):  # noqa: F811  (the imported fixtur
     engine.options = {}
     engine.workers = []
     engine.plaintext = None
+    engine.archive_path = None  # a real archive file (ANYM-730 tests) instead of the synthetic one
 
     def recordings_restore(config, receiver, client, receipt, run, payload, secret_dir):
         engine.workers.append(json.loads((secret_dir / 'worker.json').read_text()))
         restore(config, receiver, client, receipt, run, payload, secret_dir)
         if engine.plaintext is not None:
             (payload / 'archive.sqlite').write_bytes(engine.plaintext)
-        path = cont.synthetic_archive(tmp_path / f'helper-{run}.sqlite', engine.records, **engine.options)
+        path = engine.archive_path or cont.synthetic_archive(tmp_path / f'helper-{run}.sqlite', engine.records, **engine.options)
         facts = cont.archive_facts(path)
         fd = os.open(payload / 'continuity.json', os.O_WRONLY | os.O_CREAT, 0o600)
         with os.fdopen(fd, 'w') as out:
@@ -760,3 +762,137 @@ def test_rollback_with_a_pending_recordings_bundle_and_a_protected_point_keeps_a
     receive(r2.load_config(t.recordings['receiver_config_file']), cloud, bid='20261016T111703Z-2123456789abcdef')
     t.engine.records = [rec(1), rec(2), rec(3), rec(4)]
     assert t.v.run(rolled_back, client=cloud, engine=t.engine)['status'] == 'verified'
+
+
+def test_a_tombstone_never_waives_the_checks_of_a_retained_record(tmp_path):
+    """ANYM-730 (Astra r1): a new tombstone authorizes only a record that is gone from the candidate."""
+    baseline = facts_of(tmp_path, [rec(1), rec(2)])
+    victim = baseline['providers'][0][1]
+    # Facts in which the same record is both retained and tombstoned are invalid, whatever else they say.
+    with pytest.raises(ValueError, match='invalid_continuity'):
+        cont.validate_facts({**baseline, 'tombstones': [victim]})
+    candidate = facts_of(tmp_path, [rec(2)], name='b', tombstones=[victim])
+    assert refused(baseline, candidate) is None  # the genuine deletion still passes
+    # Defence in depth: judge itself ignores an authorization for a ref the candidate still lists.
+    forged = {**candidate, 'providers': baseline['providers'], 'tombstones': [victim],
+              'archive': {**candidate['archive'], 'records': 2}, 'parts': [part for part in candidate['parts']]}
+    assert refused(baseline, forged) == 'archive_content_lost'
+
+
+# spec: ANYM-730
+def test_the_deletion_floor_refuses_a_bundle_sealed_before_the_deletion_at_verification_and_at_promotion(recordings_operator, monkeypatch):
+    from test_backup_r2 import receive, THIRD
+    v, config, receiver, cloud, engine, _ = recordings_operator
+    v.run(config, client=cloud, engine=engine)
+    marker = Path(config['protected_file']).read_bytes()
+    assert v.request_revocation(config, 2)['incarnation'] == 2
+    with pytest.raises(ValueError, match='invalid_deletion_floor'):
+        v.request_revocation(config, 1)  # the floor only rises
+    receive(receiver, cloud, bid=THIRD)
+    engine.records = [rec(1), rec(2), rec(3)]
+    with pytest.raises(RuntimeError, match='archive_incarnation_lower'):  # incarnation 1 against floor 2
+        v.run(config, client=cloud, engine=engine)
+    assert status(config)['error'] == 'archive_incarnation_lower' and Path(config['protected_file']).read_bytes() == marker
+    engine.options = {'incarnation': 2}
+    assert v.run(config, client=cloud, engine=engine)['backup_id'] == THIRD  # the post-deletion bundle passes the floor
+
+
+# spec: ANYM-730
+def test_a_floor_set_after_the_proof_is_ready_stops_the_promotion(recordings_operator, monkeypatch):
+    from test_backup_r2 import receive, THIRD
+    v, config, receiver, cloud, engine, _ = recordings_operator
+    v.run(config, client=cloud, engine=engine)
+    marker = Path(config['protected_file']).read_bytes()
+    receive(receiver, cloud, bid=THIRD)
+    engine.records = [rec(1), rec(2), rec(3)]
+    original = v.local.write_maintenance_json
+
+    def crashing(name, value, **kw):
+        original(name, value, **kw)
+        if name == 'active.json' and value.get('phase') == 'proof_ready':
+            raise OSError('synthetic crash with the proof ready')
+    monkeypatch.setattr(v.local, 'write_maintenance_json', crashing)
+    with pytest.raises(OSError, match='synthetic'):
+        v.run(config, client=cloud, engine=engine)
+    monkeypatch.setattr(v.local, 'write_maintenance_json', original)
+    v.request_revocation(config, 2)  # the owner deleted meanwhile: the pending bundle (incarnation 1) is revoked
+    with pytest.raises(RuntimeError, match='archive_incarnation_lower'):
+        v.run(config, client=cloud, engine=engine)
+    assert Path(config['protected_file']).read_bytes() == marker
+
+
+@pytest.fixture
+def real_archives(tmp_path):
+    """Two real recordings archive files made by the service's own store: before and after an owner-requested deletion.
+    Requested before `recordings_operator`, which fakes file ownership."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'services/recordings/src'))
+    from deedkit_recordings.archive_store import Store
+    from deedkit_recordings.security import read_document
+    tmp_path = tmp_path.resolve()
+    tmp_path.chmod(0o700)
+    secret = tmp_path / 'cursor.key'
+    secret.write_text('c' * 64)
+    secret.chmod(0o600)
+    token = tmp_path / 'omi.key'
+    token.write_text('omi_synthetic')
+    token.chmod(0o600)
+    document = {'version': 1, 'cursor_secret_file': str(secret), 'archive': {'directory': str(tmp_path / 'live'), 'poll_seconds': 60},
+                'accounts': [{'id': 'omi-a', 'provider': 'omi', 'label': 'Synthetic', 'token_file': str(token),
+                              'archive_namespace': 'a' * 32}],
+                'principals': []}
+    config_file = tmp_path / 'recordings.json'
+    config_file.write_text(json.dumps(document))
+    config_file.chmod(0o600)
+    doc, _ = read_document(config_file)
+    store = Store(doc.archive)
+    account = doc.accounts[0]
+    refs = []
+    for number in range(3):
+        item = {'id': f'conv-{number}', 'created_at': '2026-01-10T10:00:00Z', 'finished_at': '2026-01-10T10:00:00Z', 'title': f't{number}'}
+        store.discover(account, [item], None, 100)
+        store.observe(account, item['id'], item, {
+            'transcript': ('available', json.dumps({'text': f'{TEXT} {number}', 'speaker': f'Speaker {number}'}), None),
+            'summary': ('available', f'summary {number}', None)}, 101)
+        refs.append(store.record(account, item['id'])['ref'])
+    snapshots = tmp_path / 'snapshots'
+    snapshots.mkdir(mode=0o700)
+    first, after = snapshots / 'first.sqlite', snapshots / 'after.sqlite'
+    store.backup(str(first))
+    receipt = store.delete_records(refs=[refs[0]], apply=True, snapshot_to=str(after))
+    store.close()
+    return first, after, receipt
+
+
+# spec: ANYM-730
+def test_a_real_schema_five_deletion_snapshot_verifies_rotates_and_survives_an_interrupted_success_record(
+        real_archives, recordings_operator, monkeypatch):
+    """The full path with real archive files: snapshot -> verified point -> deletion -> post-deletion snapshot ->
+    verification (tombstones authorize only the deleted records) -> rotation, and a crash right after the promotion."""
+    from test_backup_r2 import receive, THIRD
+    first, after, receipt = real_archives
+    assert receipt['deleted'] == 1 and receipt['snapshot']['records'] == 2 and receipt['snapshot']['incarnation'] == 2
+    v, config, receiver, cloud, engine, _ = recordings_operator
+    engine.archive_path = first
+    assert v.run(config, client=cloud, engine=engine)['status'] == 'verified'
+    baseline = json.loads((Path(config['directory']) / 'continuity.json').read_text())['facts']
+    assert len(baseline['providers']) == 3 and baseline['tombstones'] == []
+    receive(receiver, cloud, bid=THIRD)
+    engine.archive_path = after
+    original = v.record_verified
+    calls = []
+
+    def crashing(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError('synthetic crash after the promotion')
+        return original(*args, **kwargs)
+    monkeypatch.setattr(v, 'record_verified', crashing)
+    with pytest.raises(OSError, match='synthetic'):
+        v.run(config, client=cloud, engine=engine)
+    monkeypatch.setattr(v, 'record_verified', original)
+    assert v.run(config, client=cloud, engine=engine)['backup_id'] == THIRD  # the retry finishes the same promotion
+    facts = json.loads((Path(config['directory']) / 'continuity.json').read_text())['facts']
+    assert len(facts['providers']) == 2 and len(facts['tombstones']) == 1 and facts['archive']['incarnation'] == 2
+    objects = [key for key in cloud.objects if '/objects/' in key]
+    assert len(objects) == 1 and objects[0].startswith(receiver['prefix'] + '/objects/' + THIRD + '-')

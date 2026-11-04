@@ -118,6 +118,11 @@ def validate_facts(value):
     if not isinstance(value['tombstones'], list) or any(
             not isinstance(item, str) or not HASH.fullmatch(item) for item in value['tombstones']):
         bad()
+    # A record whose provider hash is also a tombstone cannot exist: the deletion writes the tombstone and removes the record in
+    # one transaction and the collector never archives a tombstoned ID again. Such facts could let a tombstone waive the
+    # checks of a retained record, so they are invalid (ANYM-730).
+    if set(hashes) & set(value['tombstones']):
+        bad()
     return value
 
 
@@ -137,8 +142,10 @@ def judge(baseline, candidate):
     authorized = now - kept
     provider = {ref: digest for ref, digest in baseline['providers']}
     parts = {(ref, kind): (revision, digest) for ref, kind, revision, digest in candidate['parts']}
+    retained = {ref for ref, _ in candidate['providers']}
     for ref, kind, revision, digest in baseline['parts']:
-        if provider.get(ref) in authorized:
+        # Only a record that is gone from the candidate may be missing, and only because its provider hash is a new tombstone.
+        if provider.get(ref) in authorized and ref not in retained:
             continue
         found = parts.get((ref, kind))
         if found is None or found[0] < revision or (found[0] == revision and found[1] != digest):

@@ -807,7 +807,7 @@ def test_an_index_failure_never_stops_collection(tmp_path, monkeypatch):
 
 
 # spec: ANYM-725
-def test_backup_accepts_schema_1_to_5_and_unknown_newer_schema_is_refused(tmp_path):
+def test_backup_accepts_schema_1_to_4_and_unknown_newer_schema_is_refused(tmp_path):
     from deedkit_recordings.archive_store import backup_archive
     path, doc = fixture(tmp_path)
     file = legacy_archive(tmp_path, 3)
