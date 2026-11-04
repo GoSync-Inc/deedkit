@@ -181,7 +181,10 @@ this release: another text, a missing message, formatting still present, a messa
 had the requested state, a read error, a timeout or a flood wait (which adds
 `evidence.retry_after_s`). `unknown` still means "not known": the edit may have applied. Its
 `verify` names `get_message_info` with `read-live`: text equal to the requested text means the
-edit applied. Never send the edit again, or delete and repost, before that read.
+edit applied. `get_message_info` shows no formatting, so a formatted edit's `verify` (ANYM-755)
+names `get_messages` with `body_format=html` instead: a newer revision whose `body_rendered`
+equals the preview's rendering means the edit applied (text alone shows only the text).
+Never send the edit again, or delete and repost, before that read.
 
 A confirmed edit adds `archive: queued` to `result.data`: the collector puts the read message on
 its edit queue, a spool beside the live capture queue with its own lock that the same drain loop
@@ -761,7 +764,8 @@ and `bot-press` from the keys; the widened check is harmless.
   (ANYM-755): `format` (`plain` by default, `markdown`, `html`), `link_preview`
   and `allow_lossy`, rendered by the same renderer as `send_message`, so the
   same source gives the same text and entities, and refused with the same codes
-  before anything is queued. The preview shows the rendering as `edit_artifact`
+  before anything is queued (markdown or html source up to 16000 UTF-16 units,
+  rendered text up to 4000, as a send; a plain edit keeps its 4000). The preview shows the rendering as `edit_artifact`
   and its `preview_digest` binds it. Defaults, given or omitted, leave the stored
   request as a plain edit's. On WhatsApp, edits stay plain text: any non-default
   option is refused `unsupported_operation` with a `next_step` to repeat the edit
