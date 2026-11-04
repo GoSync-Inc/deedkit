@@ -267,6 +267,21 @@ def test_empty_or_malformed_provider_page_never_claims_complete(tmp_path, header
 
 
 # spec: ANYM-648
+@pytest.mark.parametrize('headers,complete', [
+    ({'X-Omi-Has-More':'false','X-Omi-Effective-Limit':'25'}, True),
+    ({'X-Omi-Has-More':'false','X-Omi-Effective-Limit':'25','X-Omi-List-Truncated':'maybe'}, None)])
+def test_a_last_page_without_the_truncation_header_is_complete_and_a_malformed_one_is_not(tmp_path, headers, complete):
+    path, _ = config(tmp_path)
+    async def run():
+        async with client(application(path, lambda r: httpx.Response(200, json=[], headers=headers))) as c:
+            result = (await c.post('/v1/list_recordings', json={'account':'omi-a'})).json()
+            assert result['items'] == [] and result['pagination']['complete'] is complete
+            assert result['pagination']['list_truncated'] is (False if complete else None)
+            assert result.get('next_cursor') is None
+    asyncio.run(run())
+
+
+# spec: ANYM-648
 def test_content_continuation_rejects_changed_source_and_cross_credential_reuse(tmp_path):
     path, value = config(tmp_path)
     current = [conversation()]
