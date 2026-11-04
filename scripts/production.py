@@ -4880,6 +4880,20 @@ def http_release_tool():
     return seamless_release
 
 
+def http_failed_attempts(path):
+    """`status`: plan B attempts whose candidate failed to start, each with whether the tool stopped it (ANYM-757:
+    `candidate_stopped`, absent on attempts before it). Nothing without plan B; a read failure is named, never raised."""
+    if not os.path.lexists(path):
+        return []
+    try:
+        http_state = Path(config(path)["state_directory"])
+        attempts = [(item.parent.name, read(item)) for item in sorted(http_state.glob("*/http-attempted.json"))]
+        return [{"sha": sha, **{key: value[key] for key in ("candidate_stopped",) if key in value}}
+                for sha, value in attempts if value.get("status") == "startup-failed"]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, Refused) as exc:
+        return {"error": type(exc).__name__}
+
+
 def active_config():
     """The plan A configuration the autodeploy unit reads: DEEDKIT_DEPLOY_CONFIG from the environment, else from the
     optional /etc/deedkit/autodeploy.env (deploy/deedkit-autodeploy.service), else CONFIG."""
@@ -4916,7 +4930,7 @@ def argument_parser():
     parser.add_argument("--sha")
     parser.add_argument("--target", choices=sorted(BUILDS))
     parser.add_argument("--config", help="default " + CONFIG + "; status: the autodeploy unit's (active_config)")
-    parser.add_argument("--http-config", default=HTTP_CONFIG, help="deploy, rollback: seamless_release.py's")
+    parser.add_argument("--http-config", default=HTTP_CONFIG, help="deploy, rollback, status: seamless_release.py's")
     parser.add_argument("--auto", action="store_true", help="deploy: at most one deploy start per 20 minutes (timer)")
     parser.add_argument("--dry-run", action="store_true", help="deploy: print the plan or pause reason, change nothing")
     parser.add_argument("--remove", action="store_true", help="images: remove the listed candidates")
@@ -4956,6 +4970,8 @@ def locked_action(args):
                 result["deploy"] = read(state / "deploy.json")
             if PAUSE.exists():
                 result["autodeploy_pause"] = PAUSE.read_text()[:1000].strip()
+            if failed := http_failed_attempts(args.http_config):
+                result["http_failed_attempts"] = failed
         elif args.action == "images":
             result = remove_images(settings) if args.remove else images_report(settings)
         elif args.action == "copy-database":

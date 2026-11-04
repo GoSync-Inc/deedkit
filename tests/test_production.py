@@ -5674,6 +5674,34 @@ def test_status_reads_the_configuration_the_autodeploy_unit_reads(tmp_path, monk
     assert seen == [p.CONFIG]
 
 
+# spec: ANYM-757
+def test_status_names_a_stopped_failed_candidate(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(p, "PAUSE", tmp_path / "autodeploy.pause")
+    monkeypatch.setattr(p, "lock", lambda state: contextlib.nullcontext())
+    state, http_state = tmp_path / "state", tmp_path / "http-state"
+    state.mkdir()
+    p.write(state / "current.json", {"sha": "c" * 40, "status": "applied"})
+    for sha, attempt in (("a" * 40, {"status": "startup-failed", "candidate_stopped": True}),
+                         ("b" * 40, {"status": "startup-failed"}), ("d" * 40, {"status": "serving"}),
+                         ("e" * 40, {"status": "startup-failed", "candidate_stopped": False})):
+        (http_state / sha).mkdir(parents=True)
+        p.write(http_state / sha / "http-attempted.json", {**attempt, "sha": sha})
+    (tmp_path / "http.json").write_text("{}")
+    configs = {"plan-a.json": {"state_directory": str(state)}, "http.json": {"state_directory": str(http_state)}}
+    monkeypatch.setattr(p, "config", lambda path: configs[Path(path).name])
+    def status(*argv):
+        p.main(["status", "--config", str(tmp_path / "plan-a.json"), *argv])
+        return json.loads(capsys.readouterr().out)
+    printed = status("--http-config", str(tmp_path / "http.json"))
+    assert printed["sha"] == "c" * 40
+    assert printed["http_failed_attempts"] == [{"sha": "a" * 40, "candidate_stopped": True}, {"sha": "b" * 40},
+                                               {"sha": "e" * 40, "candidate_stopped": False}]
+    # No plan B on the host: nothing to name, and status never fails because of it.
+    assert "http_failed_attempts" not in status("--http-config", str(tmp_path / "absent.json"))
+    configs["http.json"] = {}
+    assert status("--http-config", str(tmp_path / "http.json"))["http_failed_attempts"] == {"error": "KeyError"}
+
+
 def freshness_file(path, *, checked_ago=timedelta(minutes=20), status="fresh", age=12.3, **extra):
     checked = datetime.now(timezone.utc) - checked_ago
     p.write(path, {"checked_at": checked.strftime("%Y-%m-%dT%H:%M:%SZ"), "last_snapshot_at": "2026-11-01T16:00:27Z",

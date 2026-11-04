@@ -2015,6 +2015,23 @@ only from `prepared.json` registry references while the package version exists (
 local-only build cannot be restored). Unresolved generations (no receipt, no recorded
 retirement, an interrupted promotion) are counted, never removed by the tool.
 
+A release generation whose candidate fails to start (ANYM-757). When `promote` fails after
+it started the candidate (readiness, activation or a guard before traffic), it records
+`startup-failed` in `http-attempted.json`, then stops the candidate with `docker compose
+--project-name deedkit-http-<generation> -f <its http.json> stop http-api-<generation>
+http-gateway-<generation>`: its own project and services only, never the serving generation,
+the router or another project. The containers are stopped, never removed, so their logs and
+state stay inspectable: `docker ps -a --filter label=ai.deedkit.http-release=<generation>`.
+Without the stop, the candidate keeps the live service's restart policy and crash-loops
+unrouted (10-28: 14 hours, 886 error events). The stop is best effort with the tool's
+command timeout; its outcome is recorded as `candidate_stopped: true|false` beside
+`startup-failed`, and its failure never replaces the promotion's own error. A failure
+before any container starts (prepared validation, schema check) stops nothing.
+`production.py status` lists such attempts as `http_failed_attempts` (sha and
+`candidate_stopped`; absent on attempts before ANYM-757). A `startup-failed` attempt does
+not block the next release, which prepares a new generation; removing the stopped
+containers stays manual (`clean` counts them as unresolved).
+
 Only images carrying a `deedkit-production-<target>:*` tag of the eight
 CI-published targets are considered. Kept, with reasons:
 
