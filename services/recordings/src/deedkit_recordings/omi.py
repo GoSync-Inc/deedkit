@@ -148,7 +148,7 @@ def content(value, kind):
         offsets = []
         for field in ('start', 'end'):
             number = segment.get(field)
-            if number is not None and (type(number) not in (int, float) or not 0 <= number <= 1e10 or not math.isfinite(number)):
+            if number is not None and (type(number) not in (int, float) or not -1e10 <= number <= 1e10 or not math.isfinite(number)):
                 raise Failure('invalid_provider_response')
             offsets.append(number)
         if segment['text']:
