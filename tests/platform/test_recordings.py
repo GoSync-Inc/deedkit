@@ -277,3 +277,15 @@ def test_numeric_speaker_zero_is_distinct_from_missing_speaker():
     state, text = content(value,'transcript')
     assert state == 'available'
     assert [json.loads(line)['speaker'] for line in text.splitlines()] == ['0','unknown']
+
+
+# spec: ANYM-648
+def test_negative_provider_offsets_are_kept_and_nonfinite_or_huge_offsets_are_rejected():
+    from deedkit_recordings.omi import Failure, content
+    segment = {'text': 'early', 'speaker_name': 'Synthetic', 'speaker_id': 1, 'start': -3.81, 'end': -1.29}
+    state, text = content(conversation(transcript_segments=[segment]), 'transcript')
+    assert state == 'available'
+    assert [(row['start'], row['end']) for row in map(json.loads, text.splitlines())] == [(-3.81, -1.29)]
+    for bad in (float('nan'), float('inf'), float('-inf'), -1e11, 1e11, True, '1'):
+        with pytest.raises(Failure):
+            content(conversation(transcript_segments=[{**segment, 'start': bad}]), 'transcript')
