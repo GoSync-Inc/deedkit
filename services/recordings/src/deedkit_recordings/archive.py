@@ -5,7 +5,7 @@ from pathlib import Path
 import time
 
 from . import archive_feed
-from .archive_store import Store, MAX_TEXT, namespace
+from .archive_store import Store, MAX_TEXT, namespace, provider_missing
 from . import plaud, archive_plaud
 from .omi import metadata, pagination, content, fingerprint
 from .security import Failure, RateLimited, provider_token, read_document
@@ -269,10 +269,11 @@ class ArchiveRuntime:
             items = await self.db('work_items', account, now, 8, lambda: self.current(account), False)
             items.sort(key=lambda item: not item[1])  # conversations of the last 24 h first: they own the reserved reads
             rotated = False
-            for recording_id, fresh in items:
+            for recording_id, fresh, probe in items:
                 reads = budget.reads_per_hour if fresh else budget.reads_per_hour - HEAD_RESERVE
-                if not await self.reserve(credential, [('reads', reads), ('transcripts', budget.transcript_per_hour)],
-                                          self.clock(now)):
+                # A provider_missing record's weekly check reads no transcript, so it reserves no transcript slot.
+                buckets = [('reads', reads)] + ([] if probe else [('transcripts', budget.transcript_per_hour)])
+                if not await self.reserve(credential, buckets, self.clock(now)):
                     break
                 if not rotated:
                     # Fairness advances with dispatched work, not with passes a spent window denied.
@@ -292,6 +293,8 @@ class ArchiveRuntime:
         projected, observations = old['metadata'], {}
         token = self.current(account)
         fingerprint = hashlib.sha256(token.encode()).hexdigest()
+        if provider_missing(old['parts']):
+            return await self.probe_omi(account, recording_id, token, fingerprint, now)
         try:
             async with asyncio.timeout(60):
                 value, _ = await self.provider.get(token, recording_id, {'include_transcript':'true'})
@@ -323,6 +326,18 @@ class ArchiveRuntime:
             # Combined limits reject this attempt, not the previous accepted copy.
             rejected = {kind: ('error', '', 'archive_content_limit') for kind in observations}
             await self.db('observe', account, recording_id, old['metadata'], rejected, now, guard)
+
+    async def probe_omi(self, account, recording_id, token, fingerprint, now):
+        """Does a provider_missing record exist again? One detail read without the transcript; never stores content."""
+        try:
+            async with asyncio.timeout(60):
+                value, _ = await self.provider.get(token, recording_id, {'include_transcript': 'false'})
+            result = 'found' if isinstance(value, dict) and value.get('id') == recording_id else 'unknown'
+        except RateLimited:
+            raise
+        except (Failure, TimeoutError, ValueError, TypeError, UnicodeError, RecursionError) as error:
+            result = 'gone' if isinstance(error, Failure) and error.code == 'not_found_or_forbidden' else 'unknown'
+        await self.db('probe', account, recording_id, result, now, lambda: self.current(account, fingerprint))
 
     async def status(self, account, now=None):
         account_id = account if isinstance(account,str) else account.id

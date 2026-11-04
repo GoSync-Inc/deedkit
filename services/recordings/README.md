@@ -342,9 +342,12 @@ ahead of the older backlog.
 - A saved record is read again only when its list row changed (overview presence/digest or the deferred flag), or while a part
   is pending: every 3 hours during the first 24 hours after creation, then daily until 14 days, then only on a change. Nothing
   is re-read hourly. A title-only change updates the title and index without a provider call. Failed reads keep the bounded
-  backoff and share the budget.
+  backoff and share the budget; `response_too_large` backs off a day.
+- An Omi record that answers 404 twice in a row (merged away, deleted or locked) becomes `provider_missing`: its stored text
+  stays, it is checked at most weekly with `include_transcript=false` (no transcript slot), and it is due again once a list
+  row carries its ID or that check finds it.
 - `archive_status` (read scope; no titles or text) adds `traversal` (`state`, `discovered_total`, `passes_completed` = history
-  list pages committed, `last_page_at`), `with_text`, `queued`, `pending`, `failed`, `throttled_until`, `usage` per bucket
+  list pages committed, `last_page_at`), `with_text`, `queued`, `pending`, `failed`, `provider_missing`, `throttled_until`, `usage` per bucket
   (`used`, `limit`, `resets_at`: when the oldest counted call leaves the sliding hour), `db_bytes` (all SQLite files incl. WAL), `bytes_ceiling`, `projected_db_bytes`
   (the larger of the measured pages and 3 x the accepted text bytes per text-bearing record, times `discovered_total`, plus
   the measured empty-schema size; an estimate),

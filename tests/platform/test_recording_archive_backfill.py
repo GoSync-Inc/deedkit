@@ -50,6 +50,7 @@ class Omi:
         self.windows, self.peak, self.limited = {}, {}, {}
         self.truncated, self.hide_overview, self.no_headers, self.on_list = 0, False, False, None
         self.truncated_header = 'echo'  # 'echo': 'true'/'false'; 'omit': only 'true' is sent, as Omi does; other: raw value
+        self.gone, self.unlisted, self.after_list, self.details = set(), set(), None, []  # 404 on detail; not listed
         for n in range(count):
             self.add(f'c{n:05d}', (created if created is not None else T0 - 86400 * 30) - n * 60)
 
@@ -90,6 +91,9 @@ class Omi:
         self.count(token, ['reads'] if listing else ['reads', 'transcripts'])
         if not listing:
             ident = request.url.path.rsplit('/', 1)[-1]
+            self.details.append((ident, request.url.params.get('include_transcript')))
+            if ident in self.gone:
+                return httpx.Response(404)
             item = next((i for i in self.items if i['id'] == ident), None)
             return httpx.Response(200, json=self.view(item, True)) if item else httpx.Response(404)
         if self.on_list:
@@ -98,8 +102,11 @@ class Omi:
         size, cursor = int(params['limit']), params.get('cursor')
         assert 1 <= size <= 200 and params.get('include_transcript') == 'false' and params.get('offset') == '0'
         start = int(cursor[1:]) if cursor else 0
-        page = self.items[start:start + size]
-        more = start + size < len(self.items)
+        listed = [i for i in self.items if i['id'] not in self.unlisted]
+        page = listed[start:start + size]
+        more = start + size < len(listed)
+        if self.after_list:
+            self.after_list()
         truncated = self.truncated > 0
         if truncated:
             self.truncated -= 1
@@ -714,6 +721,78 @@ def test_one_transcript_an_hour_still_serves_a_failed_record_among_a_new_backlog
             await passes(r, omi, T0 + hour * 3600, 300, 13)
         details = [c[3] for c in omi.of('tokenaaaa', 'detail')]
         assert 'c00005' in details and len(set(details)) >= 4
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-724
+def test_thirty_records_gone_at_omi_use_no_transcript_reads_while_five_new_ones_are_fetched_within_the_hour(tmp_path):
+    path, doc = build(tmp_path); omi = Omi(30, created=T0 - 86400 * 40)
+    gone = {item['id'] for item in omi.items}
+    def vanish():  # listed once, then merged away before their first read: 404 on detail, absent from lists
+        omi.gone.update(gone); omi.unlisted.update(gone); omi.after_list = None
+    omi.after_list = vanish
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        await passes(r, omi, T0, 60, 6 * 60)
+        status = await r.status(account, now=omi.now)
+        assert status['provider_missing'] == 30 and status['failed'] == 0 and status['pending'] == 0
+        assert all(sum(1 for ident, _ in omi.details if ident == g) == 2 for g in gone)  # the two 404s, nothing more
+        before = len(omi.details)
+        for n in range(5):
+            omi.add(f'new-{n}', omi.now, front=True)
+        await passes(r, omi, omi.now + 60, 60, 60)
+        later = omi.details[before:]
+        assert sorted(ident for ident, _ in later) == [f'new-{n}' for n in range(5)]
+        assert sql(doc, "SELECT count(*) FROM records WHERE provider_id LIKE 'new-%' AND revision>0") == [(5,)]
+        back = sorted(gone)[:3]  # listed again (an unlocked conversation): due now, read in full
+        omi.gone.difference_update(back); omi.unlisted.difference_update(back)
+        before = len(omi.details)
+        await passes(r, omi, omi.now + 86400, 60, 3)
+        assert sorted(omi.details[before:]) == [(ident, 'true') for ident in back]
+        assert (await r.status(account, now=omi.now))['provider_missing'] == 27
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-724
+def test_a_missing_record_keeps_its_text_and_is_checked_weekly_without_a_transcript(tmp_path):
+    path, doc = build(tmp_path); omi = Omi()
+    item = omi.add('rec-1', T0 - 3600)
+    item['processing_deferred'] = True  # summary pending: the record is read again in 3 hours
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        await passes(r, omi, T0, 60, 1)
+        omi.gone.add('rec-1'); omi.unlisted.add('rec-1')
+        await passes(r, omi, T0 + 3 * 3600 + 60, 120, 3)
+        assert omi.details == [('rec-1', 'true')] * 3
+        assert (await r.status(account, now=omi.now))['provider_missing'] == 1
+        assert sql(doc, "SELECT json_extract(parts,'$.transcript.text') LIKE '%\"Words of rec-1\"%' FROM records") == [(1,)]
+        await passes(r, omi, omi.now + 3600, 3600, 15 * 24)
+        assert omi.details[3:] == [('rec-1', 'false'), ('rec-1', 'false')]  # weekly, no transcript
+        omi.gone.discard('rec-1')  # found by the next weekly check, still unlisted: read in full again
+        await passes(r, omi, omi.now + 3600, 3600, 7 * 24)
+        assert omi.details[5:] == [('rec-1', 'false'), ('rec-1', 'true')]
+        assert (await r.status(account, now=omi.now))['provider_missing'] == 0
+        assert sql(doc, "SELECT json_extract(parts,'$.transcript.text') LIKE '%\"Words of rec-1\"%' FROM records") == [(1,)]
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-724
+def test_a_response_too_large_record_backs_off_a_day_not_an_hour(tmp_path):
+    path, doc = build(tmp_path); omi = Omi(1, created=T0 - 86400 * 3)
+    omi.items[0]['text'] = 'x' * 4096
+    async def run():
+        r = ArchiveRuntime(path, Provider(httpx.MockTransport(omi), maximum=2048), None); await r.start(background=False)
+        account = accounts_of(r)[0]
+        await passes(r, omi, T0, 300, 12 * 23)
+        assert len(omi.details) == 1
+        assert (await r.status(account, now=omi.now))['failed'] == 1
+        await passes(r, omi, T0 + 86400 + 60, 300, 2)
+        assert len(omi.details) == 2
         await r.close()
     asyncio.run(run())
 
