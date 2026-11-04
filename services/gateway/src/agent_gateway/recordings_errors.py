@@ -28,6 +28,11 @@ RECOVERY = {
     'request_too_large': (False, 'reduce_request_size'),
     'request_timeout': (True, 'retry_after_delay'),
 }
+# ANYM-753: the closed vocabulary naming which part of a provider body the backend rejected. Anything else is dropped.
+DETAIL_CODES = frozenset({
+    'not_object', 'id_invalid', 'id_mismatch', 'metadata_field', 'segment_shape', 'segment_text', 'segment_speaker',
+    'segment_offset', 'list_shape', 'list_pagination', 'encoding', 'not_json', 'projection_error',
+})
 
 
 def failure(value, status):
@@ -39,4 +44,7 @@ def failure(value, status):
     error.detail = {'error': code, 'retryable': retry, 'next_action': action}
     if retry:
         error.detail['retry_after_seconds'] = 2
+    detail_code = value.get('detail_code')
+    if code == 'invalid_provider_response' and isinstance(detail_code, str) and detail_code in DETAIL_CODES:
+        error.detail['detail_code'] = detail_code
     return error

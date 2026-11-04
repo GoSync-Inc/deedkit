@@ -117,6 +117,27 @@ a newer one. Provider responses over 2 MiB fail `response_too_large` without
 partial content. Request bodies are capped at 16 KiB. Errors contain fixed codes,
 never provider response bodies or credentials.
 
+`invalid_provider_response` (HTTP 503, not retryable) adds `detail_code`, one word
+from a closed vocabulary that names the rejected part of an Omi body, never its
+value (ANYM-753). PLAUD and local-archive failures keep the bare code. The gateway
+relays only these words:
+
+| `detail_code` | Rejected part; what the operator checks |
+|---|---|
+| `not_object` | The body (or a list row) is not a JSON object; route or contract change. |
+| `id_invalid` | The recording `id` is missing or not a provider ID. |
+| `id_mismatch` | The read returned another recording than asked. |
+| `metadata_field` | `created_at`, `started_at`, `finished_at`, `language` or `source` is not a string of at most 128 characters. |
+| `segment_shape` | A transcript segment is not an object. |
+| `segment_text` | A segment has no string `text`. |
+| `segment_speaker` | A segment speaker is not a string or integer of at most 256 characters. |
+| `segment_offset` | A segment `start`/`end` is not a finite number in ±1e10. |
+| `list_shape` | The list body is not an array, or holds more rows than asked. |
+| `list_pagination` | The page holds more rows than the provider's own effective limit. |
+| `encoding` | The provider sent a compressed (`Content-Encoding`) body. |
+| `not_json` | The body is not valid JSON. |
+| `projection_error` | The body parsed, but its values could not be projected or encoded (for example an unpaired surrogate). |
+
 The Omi adapter uses only documented HTTPS GET routes at `api.omi.me`. Credentials,
 recording IDs, bounds, limits and provider cursor go to Omi; metadata, requested
 content and continuation tokens go to the authenticated gateway/caller. Redirects,

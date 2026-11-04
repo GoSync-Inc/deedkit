@@ -14,8 +14,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class Failure(Exception):
-    def __init__(self, code, status=503):
-        self.code, self.status = code, status
+    """`detail_code` (ANYM-753) names the rejected part of a provider body from a closed vocabulary, never a value."""
+    def __init__(self, code, status=503, detail_code=None):
+        self.code, self.status, self.detail_code = code, status, detail_code
         super().__init__(code)
 
 

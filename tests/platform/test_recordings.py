@@ -185,6 +185,54 @@ def test_provider_failures_are_bounded_content_free_and_not_retried(tmp_path,sta
     asyncio.run(run())
 
 
+SECRET = 'secret-provider-value'
+LIST_HEADERS = {'X-Omi-Effective-Limit': '1'}
+
+
+# spec: ANYM-753
+@pytest.mark.parametrize('operation,response,detail', [
+    ('read_recording', dict(json=[SECRET]), 'not_object'),
+    ('read_recording', dict(json={'id': '../' + SECRET}), 'id_invalid'),
+    ('read_recording', dict(json=conversation(id='conv-secret')), 'id_mismatch'),
+    ('read_recording', dict(json=conversation(created_at=[SECRET])), 'metadata_field'),
+    ('read_recording', dict(json=conversation(transcript_segments=[SECRET])), 'segment_shape'),
+    ('read_recording', dict(json=conversation(transcript_segments=[{'text': [SECRET]}])), 'segment_text'),
+    ('read_recording', dict(json=conversation(
+        transcript_segments=[{'text': 'a', 'speaker': [SECRET]}])), 'segment_speaker'),
+    ('read_recording', dict(json=conversation(
+        transcript_segments=[{'text': 'a', 'start': SECRET}])), 'segment_offset'),
+    ('list_recordings', dict(json={'items': SECRET}), 'list_shape'),
+    ('list_recordings', dict(json=[conversation(), conversation()], headers=LIST_HEADERS),
+     'list_pagination'),
+    ('read_recording', dict(stream=httpx.ByteStream(SECRET.encode()), headers={'Content-Encoding': 'gzip'}), 'encoding'),
+    ('read_recording', dict(content=b'not json ' + SECRET.encode()), 'not_json'),
+    ('read_recording', dict(content=b'{"id":"conv-a","transcript_included":true,'
+     b'"transcript_segments":[{"text":"\\ud800 secret-provider-value"}]}'), 'projection_error'),
+])
+def test_invalid_provider_response_names_the_rejected_part_without_provider_values(tmp_path, operation, response,
+                                                                                    detail):
+    path, _ = config(tmp_path)
+    async def run():
+        async with client(application(path, lambda r: httpx.Response(200, **response))) as c:
+            args = {'account': 'omi-a', 'limit': 2} if operation == 'list_recordings' else {
+                'account': 'omi-a', 'recording_id': 'conv-a'}
+            result = await c.post('/v1/' + operation, json=args)
+            assert result.status_code == 503
+            assert result.json() == {'error': 'invalid_provider_response', 'detail_code': detail}
+            assert SECRET not in result.text and 'conv-secret' not in result.text
+    asyncio.run(run())
+
+
+# spec: ANYM-753
+def test_other_failures_carry_no_detail_code(tmp_path):
+    path, _ = config(tmp_path)
+    async def run():
+        async with client(application(path, lambda r: httpx.Response(500, text=SECRET))) as c:
+            result = await c.post('/v1/read_recording', json={'account': 'omi-a', 'recording_id': 'conv-a'})
+            assert result.status_code == 503 and result.json() == {'error': 'provider_unavailable'}
+    asyncio.run(run())
+
+
 # spec: ANYM-648
 def test_timeout_saturation_and_cancellation_release_owned_admission(tmp_path):
     path,_=config(tmp_path)
