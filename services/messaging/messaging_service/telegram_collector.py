@@ -1,6 +1,7 @@
 """Single-owner Telegram collector. No sign-in, messages or secrets in gateway tools."""
 import asyncio
 from collections import deque
+from collections.abc import Mapping
 import copy
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager,nullcontext,suppress
@@ -82,6 +83,21 @@ async def finished(fn,*args):
     except asyncio.CancelledError:
         await asyncio.wait({task},timeout=STORE_GRACE)
         task.add_done_callback(lambda t:t.cancelled() or t.exception()); raise
+
+
+def archive_receipt(data,policy,failure):
+    """ANYM-750: the archive state of a confirmed create_group receipt; the policy's refusal wins over a write
+    failure, since discovery would not collect the chat either."""
+    from .telegram_operations import CREATE_GROUP_NEXT_STEPS
+    if 'chat_id' in data:
+        data['archive']='collected';return
+    chat=data.get('provider_chat_id')
+    reason=failure
+    if isinstance(policy,Mapping) and isinstance(chat,str):
+        if chat in (policy.get('exclude_chats') or ()):reason='chat_excluded'
+        elif not policy.get('discover_chats') and chat not in (policy.get('include_chats') or ()):
+            reason='discovery_disabled'
+    data.update(archive='not_collected',archive_reason=reason,next_step=CREATE_GROUP_NEXT_STEPS[reason])
 
 
 class ProviderUnavailable(Exception): pass
@@ -1207,11 +1223,17 @@ class TelegramCollector:
         discovery (15 minutes or more later; a new basic group's only message is a service message, which live
         capture skips), and its receipt names the archive chat_id. The provider change has already happened:
         a failure or an exhausted time budget here leaves the chat to that discovery and never changes the
-        operation's outcome."""
+        operation's outcome. A confirmed create_group receipt always says which (ANYM-750): `archive` is
+        `collected` with `chat_id`, or `not_collected` with an `archive_reason` from a closed vocabulary and its
+        fixed `next_step`; the collection policy's reason comes first, never exception text."""
+        from psycopg.errors import LockNotAvailable,QueryCanceled,TransactionTimeout
+        from psycopg_pool import PoolTimeout
         from telethon import types,utils
+        data=answer.get('data') if isinstance(answer,dict) and answer.get('outcome')=='confirmed' else None
+        if not isinstance(data,dict):return
+        failure,policy='catalog_failed',job.get('_policy')
         try:
-            data=answer.get('data') if isinstance(answer,dict) and answer.get('outcome')=='confirmed' else None
-            chat=data.get('provider_chat_id') if isinstance(data,dict) else None
+            chat=data.get('provider_chat_id')
             if not isinstance(chat,str) or job['operation']=='join_chat' and data.get('archive')!='collected':return
             _,peer=utils.resolve_id(int(chat))
             if peer not in (types.PeerChat,types.PeerChannel):return
@@ -1220,17 +1242,26 @@ class TelegramCollector:
             chat_type='group' if job['operation']=='create_group' or expected.get('kind')=='group' else 'channel'
             # Inside the command's own timeout, so a slow archive never turns a confirmed change into unknown.
             budget=min(CATALOG_SECONDS,job.get('_ends_at',math.inf)-time.monotonic()-STORE_GRACE-1)
-            if budget<=0:return
+            if budget<=0:
+                failure='catalog_timeout';return
             state=bounded_state(self.state,time.monotonic()+budget)
             if await asyncio.wait_for(finished(state.catalog,chat,'chat' if peer is types.PeerChat else 'channel',
                     title if isinstance(title,str) and title else chat,chat_type,self.history_since),budget):
                 data['chat_id']=stable_id('chat',self.account,chat)
+            # A refusal is named by the policy the write was judged by, not the one read before the provider call.
+            policy=getattr(state,'evaluated_policy',policy)
         except asyncio.CancelledError:
             # A shutdown during the catalog write: the worker settles the confirmed receipt first, then stops.
             job['_cancel_after_settle']=True
             log.warning('new_chat_catalog_failed operation=%s error=CancelledError',job.get('operation'))
+        except (TimeoutError,QueryCanceled,LockNotAvailable,TransactionTimeout,PoolTimeout) as exc:
+            failure='catalog_timeout'
+            log.warning('new_chat_catalog_failed operation=%s error=%s',job.get('operation'),type(exc).__name__)
         except Exception as exc:
             log.warning('new_chat_catalog_failed operation=%s error=%s',job.get('operation'),type(exc).__name__)
+        finally:
+            if job.get('operation')=='create_group':
+                with suppress(Exception):archive_receipt(data,policy,failure)
 
     async def queue_edit_for_archive(self,job,answer):
         """ANYM-747: a confirmed edit reaches the archive through the edit spool, which the drain loop applies with
