@@ -1118,10 +1118,17 @@ class Store:
         with self.connection() as db:
             return [dict(row) for row in db.execute('SELECT * FROM events WHERE sequence>? ORDER BY sequence LIMIT ?', (after, limit))]
 
+    @staticmethod
+    def sanitize_marked(db):
+        """ANYM-730: a deletion started and its rewrite is not finished. Schemas 1-2 have no `meta` table: never marked."""
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone() is None:
+            return False
+        return db.execute("SELECT 1 FROM meta WHERE key='sanitize_pending'").fetchone() is not None
+
     def backup(self, destination):
         with self.connection() as db:
-            if db.execute("SELECT 1 FROM meta WHERE key='sanitize_pending'").fetchone() is not None:
-                raise Failure('archive_sanitization_pending')  # ANYM-730: a deletion started and its rewrite is not finished
+            if self.sanitize_marked(db):
+                raise Failure('archive_sanitization_pending')  # an early, cheap refusal; the copy is validated below as well
         destination = Path(destination)
         private_directory(str(destination.parent))
         if destination.is_relative_to(self.directory):
@@ -1135,6 +1142,11 @@ class Store:
                     if time.monotonic() > until:
                         raise Failure('archive_unavailable')
                 source.backup(target, pages=64, progress=progress, sleep=0.01)
+            # The guard above and the copy are separate operations and the backup takes no writer lock: a deletion may have
+            # committed in between. The copy is one consistent state; it is complete only if that state carries no mark.
+            with closing(sqlite3.connect(destination.as_uri() + '?mode=ro', uri=True)) as copy:
+                if self.sanitize_marked(copy):
+                    raise Failure('archive_sanitization_pending')
         except BaseException:
             destination.unlink()
             raise

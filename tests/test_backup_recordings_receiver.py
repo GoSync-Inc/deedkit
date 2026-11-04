@@ -317,6 +317,12 @@ def recordings_operator(operator, tmp_path):  # noqa: F811  (the imported fixtur
         restore(config, receiver, client, receipt, run, payload, secret_dir)
         if engine.plaintext is not None:
             (payload / 'archive.sqlite').write_bytes(engine.plaintext)
+        if engine.archive_path is not None:
+            # A real archive file: the real bundle and the real restore checks of the worker (verify_recordings_bundle,
+            # the search/context readback, archive_facts), whatever schema the file has.
+            from messaging_service.backup_restore_worker import restore_recordings
+            create_recordings_snapshot(engine.archive_path, tmp_path / f'bundle-{run}')
+            return restore_recordings(tmp_path / f'bundle-{run}', receipt['wire']['snapshot_sha256'], payload)
         path = engine.archive_path or cont.synthetic_archive(tmp_path / f'helper-{run}.sqlite', engine.records, **engine.options)
         facts = cont.archive_facts(path)
         fd = os.open(payload / 'continuity.json', os.O_WRONLY | os.O_CREAT, 0o600)
@@ -894,5 +900,7 @@ def test_a_real_schema_five_deletion_snapshot_verifies_rotates_and_survives_an_i
     assert v.run(config, client=cloud, engine=engine)['backup_id'] == THIRD  # the retry finishes the same promotion
     facts = json.loads((Path(config['directory']) / 'continuity.json').read_text())['facts']
     assert len(facts['providers']) == 2 and len(facts['tombstones']) == 1 and facts['archive']['incarnation'] == 2
+    proofs = [json.loads(path.read_text()) for path in Path(config['directory']).glob('proof-*.json')]
+    assert proofs and all(proof['verification']['schema_version'] == 5 for proof in proofs)  # real restore, real schema 5
     objects = [key for key in cloud.objects if '/objects/' in key]
     assert len(objects) == 1 and objects[0].startswith(receiver['prefix'] + '/objects/' + THIRD + '-')

@@ -306,6 +306,37 @@ def test_a_deletion_without_a_snapshot_path_is_refused_and_the_receipt_describes
         assert written.execute('SELECT count(*) FROM records').fetchone()[0] == receipt['snapshot']['records'] == 3
 
 
+# spec: ANYM-730 criterion 2
+def test_a_copy_that_started_before_the_deletion_finished_is_discarded_and_schemas_1_and_2_still_back_up(archive, tmp_path, monkeypatch):
+    path, doc, store, refs = archive
+    # The guard passes (it is told "clean"), but a deletion committed before the copy ended: the copy carries the mark.
+    with sqlite3.connect(store.path) as db:
+        db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('sanitize_pending',1)")
+    real, calls = Store.sanitize_marked, []
+
+    def guard_then_real(db):
+        calls.append(1)
+        return False if len(calls) == 1 else real(db)
+    monkeypatch.setattr(Store, 'sanitize_marked', staticmethod(guard_then_real))
+    target = snap(store)
+    with pytest.raises(Failure) as error:
+        store.backup(target)
+    assert error.value.code == 'archive_sanitization_pending' and not Path(target).exists() and len(calls) == 2
+    monkeypatch.undo()
+    with sqlite3.connect(store.path) as db:
+        db.execute("DELETE FROM meta WHERE key='sanitize_pending'")
+    store.backup(snap(store))
+    # Schema 1-2 archives have no `meta` table and are still accepted by the producer's online backup.
+    store.close()
+    with sqlite3.connect(store.path) as db:
+        db.execute('DROP TABLE meta')
+        db.execute('PRAGMA user_version=2')
+    old = tmp_path / 'snaps' / 'legacy.sqlite'
+    backup_archive(doc.archive, str(old))
+    with sqlite3.connect(old) as copy:
+        assert copy.execute('PRAGMA user_version').fetchone()[0] == 2
+
+
 # spec: ANYM-730 criterion 6
 def test_the_receipt_carries_counts_and_identity_but_no_title_or_text(archive):
     path, doc, store, refs = archive
