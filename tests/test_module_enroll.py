@@ -804,6 +804,7 @@ class Applier(Enroller):
             directory.mkdir(mode=0o700)
         self.identities, self.before_identities = {"deedkit-gateway": "old"}, {"deedkit-gateway": "old"}
         self.restore_leaves, self.inspect_fails = False, False
+        self.runtime_networks = {"deedkit-gateway": ["integration"]}  # what the running gateway is attached to
         self.admission, self.isolated, self.confined, self.controlled, self.healthy = "required", True, True, True, True
         self.up = None
         self.repo["scripts/recordings_egress_check.py"] = b"print('ok')\n"
@@ -821,10 +822,7 @@ class Applier(Enroller):
         monkeypatch.setattr(p, "prepare", self.prepare)
         monkeypatch.setattr(p, "apply", self.release_apply)
         monkeypatch.setattr(p, "rollback", self.release_rollback)
-        monkeypatch.setattr(p, "snapshot", lambda project, **kwargs: (
-            {"name": project["name"], "services": {"gateway": {"image": "built", "build": {"context": "."},
-                                                                 "networks": ["integration"]}}},
-            {"gateway": {"image": self.identities.get(project["name"], "enroll")}}))
+        monkeypatch.setattr(p, "snapshot", self.snapshot)
         monkeypatch.setattr(p, "wait_for_calls", lambda settings, deadline: self.event("calls-wait"))
         real_replace, real_drift = p.replace_file, p.configuration_drift
         def replace(path, content, uid, gid, mode):
@@ -891,6 +889,8 @@ class Applier(Enroller):
                 self.event("restore")
                 if "up" in argv and not self.restore_leaves:
                     self.identities = dict(self.before_identities)
+                    file = next(item for item in argv if str(item).endswith("gateway.pre-run.json"))
+                    self.runtime_networks = {"deedkit-gateway": json.loads(Path(file).read_text())["services"]["gateway"]["networks"]}
                 return ""
             if sub == "compose" and "up" in argv:
                 self.calls.append(argv)
@@ -945,6 +945,17 @@ class Applier(Enroller):
                 "recordings-egress": {"name": "deedkit-recordings_recordings-egress", "driver": "bridge"}}
         return json.dumps(document)
 
+    def attachments(self, project):
+        """The networks the project's files give its gateway: the module network only with the overlay listed."""
+        return ["integration"] + (["recordings-backend"] if any(
+            str(path).endswith("compose.gateway-recordings.yaml") for path in project["files"]) else [])
+
+    def snapshot(self, project, **kwargs):
+        """The resolved configuration of the project as its files give it now, and what runs."""
+        document = {"name": project["name"], "services": {"gateway": {
+            "image": "built", "build": {"context": "."}, "networks": self.attachments(project)}}}
+        return document, {"gateway": {"image": self.identities.get(project["name"], "enroll")}}
+
     # plan A and plan B: recorded instead of run
     def prepare(self, settings, sha):
         self.event("prepare")
@@ -954,6 +965,9 @@ class Applier(Enroller):
     def release_apply(self, settings, sha, **kwargs):
         p.write(self.state / sha / "attempted.json", {"sha": sha})
         self.identities = {name: "new" for name in self.identities}
+        # Plan A recreates the gateway from the edited files, healthy or not.
+        self.runtime_networks = {project["name"]: self.attachments(project) for project in settings["projects"]
+                                 if project["name"] in self.runtime_networks}
         try:
             self.event("apply")
         except p.Refused:
@@ -1265,6 +1279,25 @@ def test_the_isolation_probe_covers_every_serving_gateway_but_writes_no_address(
     assert any(call[:2] == ["docker", "exec"] and GATEWAY_IP in call for call in host.calls)  # the positive control
     for path in (host.config_path, host.http_path, host.policy, host.state / "enrollment.json"):
         assert GATEWAY_IP not in path.read_text() and SECRET not in path.read_text()
+
+
+# spec: ANYM-746
+@pytest.mark.parametrize("point", ["apply", "seamless prepare"])
+def test_the_running_gateway_returns_to_its_pre_run_networks_after_plan_a_ran(tmp_path, monkeypatch, point):
+    host = Applier(tmp_path, monkeypatch)
+    assert host.runtime_networks == {"deedkit-gateway": ["integration"]}
+    result = fail_at(host, point)
+    assert result["status"] == "stopped" and host.receipt()["status"] == "stopped"
+    # Plan A ran from the edited files and `rollback` keeps that topology; the restoration puts the saved one back.
+    assert host.runtime_networks == {"deedkit-gateway": ["integration"]}
+
+
+# spec: ANYM-746
+def test_without_the_restoration_the_gateway_would_keep_the_module_network(tmp_path, monkeypatch):
+    host = Applier(tmp_path, monkeypatch)
+    monkeypatch.setattr(p.Enrollment, "restore_gateway", lambda self: None)
+    assert fail_at(host, "seamless prepare")["status"] == "stopped"
+    assert host.runtime_networks == {"deedkit-gateway": ["integration", "recordings-backend"]}  # what the fake would show
 
 
 # spec: ANYM-746
