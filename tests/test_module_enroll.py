@@ -542,6 +542,9 @@ EGRESS_ENV_REFUSALS = [
     ("egress_blocked_incomplete", {"RECORDINGS_EGRESS_BLOCKED": "192.0.2.254:9,dns:10.99.0.2"}),
     ("egress_target_invalid", {"RECORDINGS_EGRESS_BLOCKED": "192.0.2.254:9,10.99.0.1:22,100.64.0.5:22,tailnet-node:22"}),
     ("egress_target_invalid", {"RECORDINGS_EGRESS_BLOCKED": "192.0.2.254:9,10.99.0.1:22,100.64.0.5:0"}),
+    ("egress_target_invalid", {"RECORDINGS_EGRESS_BLOCKED": "192.0.2.254:9,10.99.0.1:22,100.64.0.5:22,dns:not-an-ip"}),
+    ("egress_target_invalid", {"RECORDINGS_EGRESS_BLOCKED": "192.0.2.254:9,10.99.0.1:22,100.64.0.5:22,dns:"}),
+    ("egress_target_invalid", {"RECORDINGS_EGRESS_BLOCKED": "192.0.2.254:9,10.99.0.1:22,100.64.0.5:22,dns:1.1.1.1:99999"}),
     ("egress_control_missing", {"RECORDINGS_EGRESS_OPEN": "api.omi.me:443"}),
     ("egress_control_missing", {"RECORDINGS_EGRESS_OPEN": "api.omi.me:443,dns:10.99.0.77"}),
 ]
@@ -571,12 +574,18 @@ def token_outside_the_mount(host):
     (host.state_dir / "config.json").write_text(json.dumps({"accounts": [{"id": "a", "token_file": "/etc/passwd"}]}))
 
 
+def token_missing_on_a_second_account(host):
+    (host.state_dir / "config.json").write_text(json.dumps({"accounts": [
+        {"id": "omi-a", "token_file": TOKEN_FILE}, {"id": "plaud-a", "provider": "plaud"}]}))
+
+
 def token_not_named(host):
     (host.state_dir / "config.json").write_text(json.dumps({"accounts": []}))
 
 
 # spec: ANYM-745
-@pytest.mark.parametrize("setup", [token_missing, token_loose, token_empty, token_outside_the_mount, token_not_named])
+@pytest.mark.parametrize("setup", [token_missing, token_loose, token_empty, token_outside_the_mount, token_not_named,
+                                   token_missing_on_a_second_account])
 def test_a_provider_credential_file_that_is_missing_loose_empty_or_unnamed_is_refused(tmp_path, monkeypatch, setup):
     host = Enroller(tmp_path, monkeypatch)
     setup(host)
@@ -584,6 +593,18 @@ def test_a_provider_credential_file_that_is_missing_loose_empty_or_unnamed_is_re
     with pytest.raises(p.Refused) as refused:
         host.plan()
     assert SECRET not in json.dumps(refused.value.failures)
+
+
+# spec: ANYM-745
+def test_blocked_dns_targets_and_a_second_valid_account_pass(tmp_path, monkeypatch):
+    host = Enroller(tmp_path, monkeypatch)
+    host.write_env(RECORDINGS_EGRESS_BLOCKED="192.0.2.254:9,10.99.0.1:22,100.64.0.5:22,dns:1.1.1.1,dns:1.1.1.1:53")
+    other = host.state_dir / "plaud.key"
+    other.write_text(SECRET + "-plaud\n")
+    other.chmod(0o600)
+    (host.state_dir / "config.json").write_text(json.dumps({"accounts": [
+        {"id": "omi-a", "token_file": TOKEN_FILE}, {"id": "plaud-a", "token_file": "/run/deedkit/recordings/plaud.key"}]}))
+    assert host.plan()["status"] == "plan"
 
 
 # spec: ANYM-745

@@ -5148,13 +5148,24 @@ def credential_file_checks(value, private, source, owner):
     resolves through the Compose mount to a regular, non-empty file of the configuration's owner that only the owner can
     read. Mode, owner and size only; a content byte is never read."""
     for pattern in private["credential_files"]:
-        references = private_config_nodes(value, pattern)
+        parent, _, last = pattern.rpartition(".")
+        if parent and not last.endswith("[*]"):
+            # Every entry the parent path matches must carry the key: one account without it fails the whole configuration.
+            references, entries = [], private_config_nodes(value, parent)
+            for entry in entries:
+                if not isinstance(entry, dict) or last not in entry:
+                    raise EnrollRefused("credential_file_invalid", f"{pattern} is missing in an entry of {parent}")
+                references.append(entry[last])
+        else:
+            references = private_config_nodes(value, pattern)
         if not references:
             raise EnrollRefused("credential_file_invalid", f"the private configuration has no value at {pattern}")
         for reference in references:
             try:
                 inside = PurePosixPath(reference).relative_to(private["mount"])
             except (TypeError, ValueError):
+                inside = None
+            if not isinstance(reference, str):
                 inside = None
             if inside is None or ".." in inside.parts or not inside.parts:
                 raise EnrollRefused("credential_file_invalid", f"{pattern} names a file outside {private['mount']}")
@@ -5444,6 +5455,20 @@ def check_private_config(document, project, private):
     return hashlib.sha256(content).hexdigest()
 
 
+def blocked_address(item):
+    """The IP address of a blocked target `IP:PORT` or `dns:IP` (an optional `:PORT` after it); None when malformed."""
+    rest = item.removeprefix("dns:")
+    host, _, port = rest.rpartition(":")
+    try:
+        if item.startswith("dns:"):
+            with suppress(ValueError):  # `dns:IP` alone, an IPv4 or IPv6 literal
+                return ipaddress.ip_address(rest)
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    return address if port.isdecimal() and 0 < int(port) < 65536 else None
+
+
 def check_egress(mirror, sha, egress, variables, scratch):
     """The admission variables and the canary are in the env file, and the repository's own verify script (run from
     the pinned source) prints `ok`: the host firewall rules are in force. Nothing is edited."""
@@ -5453,17 +5478,14 @@ def check_egress(mirror, sha, egress, variables, scratch):
         raise EnrollRefused("egress_env_missing", "the env file lacks the canary or an open target")
     covered = set()
     for item in blocked:
-        if item == egress["canary"] or item.startswith("dns:"):
+        if item == egress["canary"]:
             continue
-        host, _, port = item.rpartition(":")
-        try:
-            address = ipaddress.ip_address(host)
-        except ValueError:
-            address = None
-        if address is None or not port.isdecimal() or not 0 < int(port) < 65536:
-            raise EnrollRefused("egress_target_invalid", f"{item} is not an IP:PORT blocked target")
-        covered |= {name for name, networks in EGRESS_CLASSES.items()
-                    if any(address in ipaddress.ip_network(network) for network in networks)}
+        address = blocked_address(item)
+        if address is None:
+            raise EnrollRefused("egress_target_invalid", f"{item} is not an IP:PORT or dns:IP blocked target")
+        if not item.startswith("dns:"):
+            covered |= {name for name, networks in EGRESS_CLASSES.items()
+                        if any(address in ipaddress.ip_network(network) for network in networks)}
     if missing := sorted(set(egress["blocked"]) - covered):
         raise EnrollRefused("egress_blocked_incomplete", "no blocked target (with a known listener) of class " + ", ".join(missing))
     resolver = variables.get(egress["controls"]["dns_env"], "")
