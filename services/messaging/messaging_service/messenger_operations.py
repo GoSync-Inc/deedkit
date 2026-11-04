@@ -142,8 +142,9 @@ OPERATIONS = {
         'link_preview': _field('boolean'),
         'allow_lossy': _field('boolean')},
         limitation=('Own outgoing message at the exact archive revision; format (plain by default, markdown or html), '
-                    'link_preview and allow_lossy render as a send; markdown, html, link_preview and allow_lossy '
-                    'are Telegram only.')),
+                    'link_preview and allow_lossy render as a send (markdown or html source up to 16000 UTF-16 '
+                    'units, rendered text up to 4000); markdown, html, link_preview and allow_lossy are Telegram '
+                    'only.')),
     'delete_message': _spec('message-delete', 'message', mutation=True,
         limitation='Own outgoing message only; global revoke must not fall back to local deletion.'),
     'send_reaction': _spec('message-react', 'message', mutation=True, fields={
@@ -570,6 +571,10 @@ def validate_operation(platform, operation, parameters, *, provider=None):
                 if descriptor['default'] is None: continue
                 value = deepcopy(descriptor['default'])
             else: value = parameters[name]
+            if (operation, name) == ('edit_message', 'text') and parameters.get('format') in ('markdown', 'html'):
+                # ANYM-755: markup source has the send path's allowance; the renderer bounds the rendered text.
+                from .formatting import MAX_SOURCE_UNITS
+                descriptor = {**descriptor, 'maximum': MAX_SOURCE_UNITS}
             problem = _contact_query_problem(value) if (operation, name) == ('list_contacts', 'query') else _problem(platform, descriptor, value, name)
             if problem: errors.extend(problem)
             else: output[name] = (value.strip() if (operation, name) == ('list_contacts', 'query') else phone_digits(value)[0] if descriptor['type'] == 'phone_number' else

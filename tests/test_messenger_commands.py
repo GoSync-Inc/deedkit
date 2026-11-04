@@ -196,6 +196,13 @@ def test_formatted_edit_binds_the_rendered_artifact_to_its_preview_digest(operat
     s,_,key,_=operator
     plain=s.preview_messenger_operation(key,**operation_args(operation='edit_message',parameters={'text':'Edited'}))
     assert 'edit_artifact' not in plain and plain['parameters']=={'text':'Edited'}  # defaults: today's payload
+    explicit=s.preview_messenger_operation(key,**operation_args(operation='edit_message',
+        parameters={'text':'Edited','format':'plain','link_preview':False,'allow_lossy':False}))
+    assert explicit['preview_digest']==plain['preview_digest'] and explicit['parameters']=={'text':'Edited'}
+    with pytest.raises(APIError,match='invalid_operation_parameters'):  # a plain edit keeps its 4000 units
+        s.preview_messenger_operation(key,**operation_args(operation='edit_message',parameters={'text':'x'*4001}))
+    assert s.preview_messenger_operation(key,**operation_args(operation='edit_message',
+        parameters={'text':'<b>'+'x'*4000+'</b>','format':'html'}))['edit_artifact']['utf16_units']==4000
     args=operation_args(operation='edit_message',parameters=FORMATTED_EDIT)
     draft=s.preview_messenger_operation(key,**args)
     assert draft['edit_artifact']==render_message('telegram',FORMATTED_EDIT['text'],format='html')

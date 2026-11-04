@@ -400,12 +400,17 @@ VERIFY={'delete_message':{'operation':'get_message_info','requires':'read-live',
         'decides':'a reaction with chosen:true was set by this account'},
     'edit_message':{'operation':'get_message_info','requires':'read-live',
         'decides':'text equal to the requested text means the edit applied'}}
+# ANYM-755 (Astra r1): get_message_info shows no formatting, so for a formatted edit it settles only the text.
+VERIFY_FORMATTED_EDIT={'operation':'get_messages','requires':'read',
+    'decides':'body_rendered (body_format=html) of a newer revision equal to the preview\'s rendering means the '
+        'edit applied; get_message_info text equal to edit_artifact.rendered_text shows only that the text applied'}
 
 
 def _verify(row,c=None):
     """ANYM-666/747: what an agent reads when a delete, reaction or edit stayed unknown (no secrets in the receipt)."""
     base=VERIFY.get(row['operation'])
     if base is None or row['status']!='unknown':return None
+    if row['operation']=='edit_message' and 'edit_artifact' in (row.get('payload') or {}):base=VERIFY_FORMATTED_EDIT
     platform=c.execute('SELECT platform FROM accounts WHERE id=%s',(row['account'],)).fetchone() if c is not None else None
     if not platform or platform['platform']!='telegram':return None  # WhatsApp keeps its receipts as they are
     answer=row['result']

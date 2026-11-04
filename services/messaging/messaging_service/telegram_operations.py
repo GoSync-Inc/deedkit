@@ -22,6 +22,7 @@ import time
 from telethon import errors, functions, types, utils
 
 from .envelope import canonical, stable_id
+from .formatting import MAX_SOURCE_UNITS
 from .name_variants import contact_matcher
 from .messenger_operations import (HISTORY, INSPECT_BUTTONS, LIVE_SEARCH, live_cursor_binding, platform_parameters,
                                    validate_operation)
@@ -623,17 +624,17 @@ def utf16(text):
     return len(text.encode('utf-16-le')) // 2
 
 
+# ANYM-755 (Astra r1): a read with more entities than this is never compared, so it stays unknown.
+EDIT_READ_ENTITIES = 256
+
+
 def text_state(text, spans):
     """ANYM-747/755: the text with surrounding whitespace stripped and its formatting spans (kind, offset, length,
-    url, language), offsets moved to the stripped text and sorted, so the order Telegram returns them in is no
-    difference. A plain text has no spans."""
-    stripped = text.strip()
-    lead, size, kept = utf16(text[:len(text) - len(text.lstrip())]), utf16(stripped), []
-    for kind, offset, length, url, language in spans:
-        start, end = max(offset - lead, 0), min(offset + length - lead, size)
-        if end > start:
-            kept.append((kind, start, end - start, url, language))
-    return stripped, tuple(sorted(kept))
+    url, language), sorted, so the order Telegram returns them in is no difference. Offsets move by the stripped
+    leading whitespace and are never clipped: a span over that whitespace still differs, and a plain text has none."""
+    lead = utf16(text[:len(text) - len(text.lstrip())])
+    return text.strip(), tuple(sorted((kind, offset - lead, length, url, language)
+                                      for kind, offset, length, url, language in spans))
 
 
 def edit_state(message):
@@ -642,23 +643,38 @@ def edit_state(message):
     text = getattr(message, 'message', None)
     if not isinstance(text, str):
         return None, ()
+    entities = getattr(message, 'entities', None) or []
+    if not isinstance(entities, (list, tuple)) or len(entities) > EDIT_READ_ENTITIES:
+        return text.strip(), (('entities_not_compared', 0, 0, '', ''),)  # equals no request
     spans = []
-    for entity in formatting_entities(message):
+    # Every entity, never a truncated list: an unrequested span after many text-derived ones is still a difference.
+    for entity in (e for e in entities if not isinstance(e, TEXT_DERIVED_ENTITIES)):
         kind = ENTITY_KINDS.get(type(entity), type(entity).__name__)
         spans.append((kind, entity.offset, entity.length, getattr(entity, 'url', '') if kind == 'text_link' else '',
                       (getattr(entity, 'language', '') or '') if kind == 'pre' else ''))
     return text_state(text, spans)
 
 
-def edit_request(artifact):
+ARTIFACT_KEYS = {'format', 'source_text', 'rendered_text', 'provider_text', 'entities', 'provider_payload', 'warnings',
+                 'links', 'utf16_units', 'renderer_version'}
+
+
+def edit_request(artifact, parameters):
     """ANYM-755: the persisted rendering of a formatted edit, checked as a send's persisted payload is
-    (outgoing.dispatch_payload) before any provider call: (provider text, entities, link_preview)."""
-    from .formatting import validate_entities
+    (outgoing.dispatch_payload) before any provider call: it must be the rendering of these parameters' source,
+    format and link preview, within the wire limits. Returns (provider text, entities, link_preview)."""
+    from .formatting import MAX_WIRE_UNITS, validate_entities
     try:
         payload = artifact['provider_payload']
         text, entities, preview = payload['text'], payload['entities'], payload['link_preview']
-        if (not isinstance(text, str) or text != artifact['rendered_text'] or type(preview) is not bool or
-                not isinstance(entities, list) or entities != artifact['entities'] or
+        if (not isinstance(artifact, dict) or set(artifact) != ARTIFACT_KEYS or not isinstance(payload, dict) or
+                set(payload) != {'text', 'entities', 'link_preview'} or
+                artifact['format'] != parameters.get('format', 'plain') or
+                artifact['source_text'] != parameters.get('text') or
+                preview is not parameters.get('link_preview', False) or
+                not isinstance(text, str) or text != artifact['rendered_text'] or text != artifact['provider_text'] or
+                type(artifact['utf16_units']) is not int or artifact['utf16_units'] != utf16(text) or
+                utf16(text) > MAX_WIRE_UNITS or not isinstance(entities, list) or entities != artifact['entities'] or
                 any(not isinstance(e, dict) or e.get('type') not in EDIT_ENTITIES for e in entities)):
             raise ValueError('invalid_persisted_payload')
         validate_entities(text, entities)
@@ -718,9 +734,10 @@ async def write_edit_delete(op):
         op.exact_message, op.peer, op.chat, op.message_id, op.operation, op.accepted, op.rpc, op.parameters, op.client)
     target = await exact_message(peer, chat, message_id, own=True)
     if operation == 'edit_message':
-        bounded_text(parameters.get('text'), 4000)
         artifact = op.job.get('edit_artifact')
-        request = edit_request(artifact) if artifact is not None else None
+        # ANYM-755: a formatted edit's source has the send path's allowance; its rendered text the wire's 4000.
+        bounded_text(parameters.get('text'), 4000 if artifact is None else MAX_SOURCE_UNITS)
+        request = edit_request(artifact, parameters) if artifact is not None else None
         before = edit_state(target)  # taken now: a client may update the same message object in place
         if request is None:
             await rpc(lambda: client.edit_message(peer, message_id, parameters['text'],
@@ -1258,7 +1275,8 @@ async def _execute(client, job, *, verified_self=None, governor=None):
         # Validate every parameter before the first provider read/mutation.
         text_keys = {'caption': (1024, True), 'question': (300, False),
                      'first_name': (64, False), 'last_name': (64, True),
-                     'text': (4000, False), 'title': (128, False),
+                     'text': (MAX_SOURCE_UNITS if operation == 'edit_message' and job.get('edit_artifact') is not None
+                              else 4000, False), 'title': (128, False),
                      'description': (255, True), 'bio': (139, True)}
         for key, (maximum, empty) in text_keys.items():
             if key in parameters:
