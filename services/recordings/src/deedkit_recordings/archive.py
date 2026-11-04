@@ -206,9 +206,9 @@ class ArchiveRuntime:
         items = [metadata(value) for value in values]
         fingerprints = {item['id']: fingerprint(value) for item, value in zip(items, values)}
         info, next_page = pagination(headers, len(items), limit)
-        # A truncated page is re-read, never taken as the end. The end needs affirmative evidence (no more pages, not
-        # truncated, an effective limit); a page that proves neither a cursor nor the end keeps what it listed but
-        # leaves the position where it was and is reported.
+        # A truncated page is re-read, never taken as the end. The end needs affirmative evidence (no more pages, no
+        # truncation header or `false`, an effective limit); a page that proves neither a cursor nor the end keeps what
+        # it listed but leaves the position where it was and is reported.
         unproven = False
         if info['list_truncated'] is True:
             complete = False

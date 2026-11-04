@@ -104,7 +104,10 @@ def pagination(headers, count, limit):
     def boolean(name):
         value = headers.get(name, '').lower()
         return {'true': True, 'false': False}.get(value)
-    more, truncated = boolean('x-omi-has-more'), boolean('x-omi-list-truncated')
+    # Omi sends `X-Omi-List-Truncated` only as `true` (docs overview.mdx:158): an absent header is not truncated, a
+    # malformed value proves nothing.
+    more = boolean('x-omi-has-more')
+    truncated = boolean('x-omi-list-truncated') if 'x-omi-list-truncated' in headers else False
     raw_limit = headers.get('x-omi-effective-limit', '')
     effective = int(raw_limit) if re.fullmatch(r'[0-9]{1,3}', raw_limit) else None
     if effective is not None and not 1 <= effective <= 200:

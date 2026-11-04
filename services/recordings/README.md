@@ -335,7 +335,8 @@ ahead of the older backlog.
   budget, and 6 reads per hour plus a queue slice of 100 IDs (`max_queued`, default 10,000, at most 200,000) are reserved for
   it: a full queue pauses only the history traversal. The head page is limited to the free slice and resumes from its own cursor
   when more new IDs wait (`head_backlog`; `head_slice_full` after an hour), so no ID is skipped. A truncated page is read
-  again, never taken as the end, and only affirmative evidence (no more pages, not truncated, an effective limit) ends it. A
+  again, never taken as the end, and only affirmative evidence (no more pages, no `X-Omi-List-Truncated: true`, an effective limit) ends it. Omi sends that
+  header only as `true`, so its absence is not truncation; a malformed value proves nothing. A
   finished history is walked again once a day (list rows only) so a changed title or overview of an older record is noticed.
   `reached_end` is a fact about the traversal only; `coverage` stays `unknown`.
 - A saved record is read again only when its list row changed (overview presence/digest or the deferred flag), or while a part

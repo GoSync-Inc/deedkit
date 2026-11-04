@@ -49,6 +49,7 @@ class Omi:
         self.items, self.now, self.calls = [], float(T0), []
         self.windows, self.peak, self.limited = {}, {}, {}
         self.truncated, self.hide_overview, self.no_headers, self.on_list = 0, False, False, None
+        self.truncated_header = 'echo'  # 'echo': 'true'/'false'; 'omit': only 'true' is sent, as Omi does; other: raw value
         for n in range(count):
             self.add(f'c{n:05d}', (created if created is not None else T0 - 86400 * 30) - n * 60)
 
@@ -104,6 +105,10 @@ class Omi:
             self.truncated -= 1
         headers = {'X-Omi-Has-More': str(more).lower(), 'X-Omi-List-Truncated': str(truncated).lower(),
                    'X-Omi-Effective-Limit': str(size)}
+        if self.truncated_header == 'omit' and not truncated:
+            del headers['X-Omi-List-Truncated']
+        elif self.truncated_header not in ('echo', 'omit'):
+            headers['X-Omi-List-Truncated'] = self.truncated_header
         if self.no_headers:
             return httpx.Response(200, json=[self.view(i, False) for i in page])
         if more:
@@ -491,6 +496,56 @@ def test_a_page_without_end_of_list_evidence_never_marks_the_history_finished(tm
         await passes(r, omi, T0 + 10, 10, 1)
         status = await r.status(account, now=T0 + 10)
         assert status['traversal']['state'] == 'reached_end' and status['error'] is None
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-724
+def test_a_last_page_without_the_truncation_header_ends_the_history_as_omi_sends_it(tmp_path):
+    path, doc = build(tmp_path); omi = Omi(450, created=T0 - 86400 * 40)
+    omi.truncated_header, omi.truncated = 'omit', 1
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        await passes(r, omi, T0, 10, 4)
+        assert [c[3].get('cursor') for c in omi.of('tokenaaaa', 'list')] == [None, None, 'c200', 'c400']
+        status = await r.status(account, now=T0 + 40)
+        assert status['traversal']['state'] == 'reached_end' and status['error'] is None
+        assert sql(doc, 'SELECT count(*) FROM records') == [(450,)]
+        calls = len(omi.of('tokenaaaa', 'list'))
+        await passes(r, omi, T0 + 400, 400, 3)
+        assert len(omi.of('tokenaaaa', 'list')) == calls + 3  # the head only; the last page is not read again
+        assert (await r.status(account, now=T0 + 1600))['error'] is None
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-724
+def test_an_account_smaller_than_one_page_ends_on_its_first_page_and_its_head_reads_raise_nothing(tmp_path):
+    path, doc = build(tmp_path); omi = Omi(5, created=T0 - 86400 * 2)
+    omi.truncated_header = 'omit'
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        await passes(r, omi, T0, 400, 4)
+        status = await r.status(account, now=T0 + 1600)
+        assert status['traversal']['state'] == 'reached_end' and status['error'] is None
+        assert len(omi.of('tokenaaaa', 'list')) == 4 and r.error is None
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-724
+@pytest.mark.parametrize('value', ['maybe', '', '1'])
+def test_a_malformed_truncation_header_never_ends_the_history(tmp_path, value):
+    path, doc = build(tmp_path); omi = Omi(30)
+    omi.truncated_header = value
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        await passes(r, omi, T0, 10, 1)
+        status = await r.status(accounts_of(r)[0], now=T0)
+        assert status['traversal']['state'] == 'not_started' and status['error'] == 'invalid_provider_response'
+        assert sql(doc, 'SELECT count(*) FROM records') == [(30,)]
         await r.close()
     asyncio.run(run())
 
