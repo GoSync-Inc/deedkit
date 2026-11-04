@@ -6,11 +6,7 @@
     "env_file": "/opt/deedkit/deploy/private/recordings.env",
     "env_required": ["RECORDINGS_STATE_DIR", "RECORDINGS_RESOLVER", "RECORDINGS_EGRESS_BLOCKED",
                      "RECORDINGS_EGRESS_OPEN", "INFERENCE_MINI_IP"],
-    "services": {"recordings-api": "recordings"},
-    "networks": [
-      {"name": "deedkit-recordings-backend", "bridge": "dk-recbackend0", "gateway_port": 13240},
-      {"name": "deedkit-recordings-router", "bridge": "dk-recrouter0"}
-    ]
+    "services": {"recordings-api": "recordings"}
   },
   "gateway": {
     "overlay": "deploy/compose.gateway-recordings.yaml",

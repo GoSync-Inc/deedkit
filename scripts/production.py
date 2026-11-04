@@ -5078,8 +5078,11 @@ def checked_manifest(value, name):
     manifest_keys(value, MANIFEST_KEYS, "manifest")
     if manifest_text(value["name"], "name", MODULE_NAME) != name:
         raise EnrollRefused("manifest_invalid", "name differs from the file name")
-    project = manifest_keys(value["project"], {"name", "files", "env_file", "env_required", "services", "networks"}, "project")
-    check_networks(project["networks"])
+    # `networks` is optional: a manifest key the installed host tool does not know is a "malformed manifest" to it, and a
+    # deploy then pauses with `enroll_required` even for a module that is already running (incident 11-04, #632).
+    project = manifest_keys(value["project"], {"name", "files", "env_file", "env_required", "services", "networks"}, "project",
+                            required={"name", "files", "env_file", "env_required", "services"})
+    check_networks(project.get("networks", []))
     manifest_text(project["name"], "project.name", re.compile(r"[a-z0-9][a-z0-9_-]*"))
     manifest_list(project["files"], "project.files", repo_path)
     host_path(project["env_file"], "project.env_file")
@@ -5790,7 +5793,7 @@ class Enrollment:
         return project, compose_document(project, project["directory"], project["files"])
 
     def networks(self, document):
-        declared = {item["name"]: item for item in self.manifest["project"]["networks"]}
+        declared = {item["name"]: item for item in self.manifest["project"].get("networks", [])}
         external = {network.get("name") for network in document.get("networks", {}).values()
                     if isinstance(network, dict) and network.get("external")}
         if undeclared := sorted(name for name in external - declared.keys() if name):
@@ -5958,7 +5961,7 @@ class Enrollment:
         project = self.plan["production_json"]["append_project"]
         egress, service = self.manifest["egress"], next(iter(project["services"]))
         script = repo_file(self.mirror, self.sha, egress["verify"][0]) if egress["outside"] else None
-        for network in (item for item in self.manifest["project"]["networks"] if "gateway_port" in item):
+        for network in (item for item in self.manifest["project"].get("networks", []) if "gateway_port" in item):
             shown = run(["docker", "ps", "--filter", "network=" + network["name"], "--format",
                          '{{.ID}}\t{{.Label "com.docker.compose.service"}}']).splitlines()
             gateways = [line.split("\t")[0] for line in shown if GATEWAY_SERVICE.fullmatch(line.partition("\t")[2])]
@@ -6387,7 +6390,7 @@ def main(argv=None):
     try:
         if args.verifier and args.action != "self-test":
             raise Refused("--verifier is only for self-test; every other command uses the installed verifier")
-        args.config = args.config or (active_config() if args.action == "status" else CONFIG)
+        args.config = args.config or (active_config() if args.action in ("status", "enroll") else CONFIG)
         print_result(args, execute_action(args), parser)
     except BackupRunning as exc:  # apply: nothing was written
         print(json.dumps(exc.line()))
