@@ -51,6 +51,7 @@ class Omi:
         self.truncated, self.hide_overview, self.no_headers, self.on_list = 0, False, False, None
         self.truncated_header = 'echo'  # 'echo': 'true'/'false'; 'omit': only 'true' is sent, as Omi does; other: raw value
         self.gone, self.unlisted, self.after_list, self.details = set(), set(), None, []  # 404 on detail; not listed
+        self.failing = set()  # 503 on detail
         for n in range(count):
             self.add(f'c{n:05d}', (created if created is not None else T0 - 86400 * 30) - n * 60)
 
@@ -88,12 +89,15 @@ class Omi:
         limit = self.limited.get((token, kind)) or self.limited.get((token, 'any'))
         if limit and self.now < limit[0]:
             return httpx.Response(429, headers={'Retry-After': limit[1]} if limit[1] is not None else {})
-        self.count(token, ['reads'] if listing else ['reads', 'transcripts'])
+        transcript = not listing and request.url.params.get('include_transcript') == 'true'
+        self.count(token, ['reads', 'transcripts'] if transcript else ['reads'])
         if not listing:
             ident = request.url.path.rsplit('/', 1)[-1]
             self.details.append((ident, request.url.params.get('include_transcript')))
             if ident in self.gone:
                 return httpx.Response(404)
+            if ident in self.failing:
+                return httpx.Response(503)
             item = next((i for i in self.items if i['id'] == ident), None)
             return httpx.Response(200, json=self.view(item, True)) if item else httpx.Response(404)
         if self.on_list:
@@ -777,6 +781,28 @@ def test_a_missing_record_keeps_its_text_and_is_checked_weekly_without_a_transcr
         assert omi.details[5:] == [('rec-1', 'false'), ('rec-1', 'true')]
         assert (await r.status(account, now=omi.now))['provider_missing'] == 0
         assert sql(doc, "SELECT json_extract(parts,'$.transcript.text') LIKE '%\"Words of rec-1\"%' FROM records") == [(1,)]
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-724
+def test_a_missing_record_whose_check_fails_is_still_checked_at_most_weekly(tmp_path):
+    path, doc = build(tmp_path); omi = Omi()
+    omi.add('rec-1', T0 - 86400 * 3)
+    omi.gone.add('rec-1'); omi.unlisted.add('rec-1')
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        await r.db('discover', account, [{'id': 'rec-1'}], None, T0 - 10)
+        await passes(r, omi, T0, 120, 2)
+        assert (await r.status(account, now=omi.now))['provider_missing'] == 1
+        omi.gone.discard('rec-1'); omi.failing.add('rec-1')  # each check now meets an outage
+        await passes(r, omi, omi.now + 3600, 3600, 22 * 24)
+        checks = [moment for moment, _, kind, ident in omi.calls if kind == 'detail' and ident == 'rec-1'][2:]
+        assert len(checks) == 3 and all(b - a >= 7 * 86400 for a, b in zip(checks, checks[1:]))
+        assert omi.details[2:] == [('rec-1', 'false')] * 3
+        assert omi.peak.get(('tokenaaaa', 'transcripts'), 0) <= 2  # the two 404 reads; checks spend no transcript
+        assert (await r.status(account, now=omi.now))['provider_missing'] == 1
         await r.close()
     asyncio.run(run())
 

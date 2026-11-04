@@ -604,7 +604,7 @@ class Store:
 
     def probe(self, account, provider_id, result, now, guard=lambda: None):
         """The weekly check of a provider_missing Omi record, made without a transcript. `found`: due now for a full
-        read; `gone`: checked again in a week; anything else (timeout, outage): again in a day."""
+        read; anything else (404, timeout, outage, a malformed answer): checked again in a week, never sooner."""
         ns = namespace(account)
         def change(db):
             row = db.execute('SELECT * FROM records WHERE namespace=? AND provider_id=?', (ns, provider_id)).fetchone()
@@ -616,8 +616,7 @@ class Store:
             if result == 'found':
                 self.reactivate(db, row['ref'], parts, now)
             else:
-                db.execute('UPDATE records SET attempted=?,due=? WHERE ref=?',
-                           (now, now + (WEEK if result == 'gone' else DAY), row['ref']))
+                db.execute('UPDATE records SET attempted=?,due=? WHERE ref=?', (now, now + WEEK, row['ref']))
         self.write(change, guard)
 
     @staticmethod
