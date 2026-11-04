@@ -7,6 +7,12 @@ only over the private tailnet and relays to object storage at a separate provide
 an offline copy of the recovery key outside every provider account: when the only copy lived on
 the receiver, losing that VM (2026-10-22) left every earlier backup undecryptable.
 
+Backups run in the background and gate no release (owner 11-04: «только какие-то быкапы, только в
+критических случаях»). The latest verified daily backup is the restore point of every release; a fresh
+backup is taken only before a critical migration, a restore or a data deletion
+(docs/operations/production.md "Migration risk tiers"). A failed or late daily backup is a backup
+follow-up and holds no deploy.
+
 ## Contents and consistency
 
 `snapshot` without `--recovery-config` keeps the previous format 1: a consistent PG dump,

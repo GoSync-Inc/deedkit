@@ -1296,8 +1296,8 @@ hint, and the fence holds every module stream an older runtime resumes.
 
 ### Recordings source (ANYM-732, schema 67)
 
-Migration `067_recording_module_source.sql` (`-- rollout: manual`, risk tier **dangerous**: `module_events_check1` compares two
-columns, so it is not a same-column widening pair; a fresh verified backup and the pre-migration copy come first; its header holds
+Migration `067_recording_module_source.sql` (`-- rollout: manual`; its header says risk tier dangerous, but under the 11-04 tiers
+of production.md it is non-critical: it widens CHECKs and rewrites no row, so it needs no fresh backup or copy; its header holds
 the inventory of every constraint and function of 056 and 058 that named the module list) widens eight CHECKs that listed `calendar`
 and `calls` and rebuilds `module_event_valid` on 065's text, so `call.failed` keeps its provider-cause keys. It changes no table,
 column, row, grant or role: existing ACLs stay and are read back after the release. No expand part exists: everything the change needs

@@ -44,10 +44,11 @@ volume) (owner 11-03, see Data egress).
   11-02 «5 да» to the question «Превью ссылок и опросы. Храним по правилам текста?»). Invoices,
   contact cards and other message parts this file does not name: proposal.
 - Pre-migration database copies and backups (ANYM-588, docs/operations/production.md "Migration risk
-  tiers" and "Database copies"): only a dangerous migration gets a fresh verified backup and a
-  pre-migration copy; a low or medium one gets neither, and the latest verified daily backup is its
-  restore point (owner 11-01, quoted in Status, replacing owner 10-28 «добавление миграции
-  автоматически с копией» for low and medium ones). A database with no daily backup running keeps its
+  tiers" and "Database copies"): only a critical migration (it deletes or rewrites existing rows or
+  drops a table or column) gets a fresh verified backup and a pre-migration copy; any other gets
+  neither, and the latest verified daily backup is its restore point (owner 11-04 «только какие-то
+  быкапы, только в критических случаях», after owner 11-01, quoted in Status, which replaced owner
+  10-28 «добавление миграции автоматически с копией»). A database with no daily backup running keeps its
   copy (the orchestrator's reading of 11-01: a restore point must exist). Until ANYM-675 ships, the deployer still copies before every unattended migration (its rehearsal
   runs on the copy). The copy is plaintext, root-only, on the production host's disk, never leaves the host and is
   deleted after 48 h, whatever its state (the orchestrator's reading of 2026-10-28; a later owner line may
