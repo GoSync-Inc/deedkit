@@ -582,9 +582,8 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
    while the daily backup succeeds), and everything written after it (messages, receipts, keys, operator
    changes) is lost. No gate backup or copy was restored in any hand release from 10-17 to 11-04.
 4. How a non-critical release runs. `deploy` applies it itself when the range qualifies ("Unattended
-   migrations": today `expand` files and appended role grants, and only once `receiver_schema_max` reads
-   the target, phase 1). Any other range, and one held only by that receiver wait, pauses autodeploy
-   until `deploy` applies every non-critical range itself (ANYM-743); meanwhile the agent who sees the
+   migrations": today `expand` files and appended role grants; the backup receiver's schema holds none).
+   Any other range pauses autodeploy until `deploy` applies every non-critical range itself (ANYM-743); meanwhile the agent who sees the
    pause releases it at once, at any hour, with the previous release's tested commands: a tested runbook,
    so no new kit, plan or review round. The order:
    1. Exclusion from the backups (a backup stops the collectors and holds snapshots; an apply recreates
@@ -607,9 +606,8 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
       yet: a hand release does not read `receiver_schema_max`; raise it once the receiver reads the target.
 
    Merges never wait for a release: the candidate is one SHA ("Prepare and inspect"), so there is no merge
-   freeze. A hand release has no time window: its waits are an active call (the tool checks it) and a
-   running backup (step 1). The autodeploy timer still starts nothing 13:00-18:59 UTC (Timer) until its
-   unit changes.
+   freeze. No release has a time window: the waits are an active call (the tool checks it) and a running
+   backup (step 1; the autodeploy unit, "Timer").
 
 ### Migration risk tiers
 
@@ -962,7 +960,7 @@ the marker; settle it with `--recover-stop`. A SIGTERM during the wait takes and
 A release has no clock window (owner 11-04: «давай все делать не ждать ничего»), so it may run into a scheduled
 backup start: the wait does not protect a scheduled start. A scheduled backup that starts while a release holds the lock
 is refused, and what follows differs by unit (see "Continuous deployment"); a daily lost that way is a backup follow-up,
-never a release hold. Only the autodeploy unit's 13:00-18:59 UTC admission stays until its unit changes.
+never a release hold. The autodeploy unit has no clock window either ("Timer").
 
 ### Backup runner
 
