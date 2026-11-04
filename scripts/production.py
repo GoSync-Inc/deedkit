@@ -1064,31 +1064,37 @@ def backup_lock():
 
 
 def backup_unit_busy(expired=lambda: False):
-    """`(unit, state, since)` of the first backup unit that is not positively `inactive` or `failed` (an unreadable one
-    is busy, as for the producer pin), or None when every one is idle. `since` is the unit's last start, if read.
-    After every probe `expired()` ends the scan: the bound passed before idle was confirmed."""
+    """`(unit, state)` of the first backup unit that is not positively `inactive` or `failed` (an unreadable one is
+    busy), read the way the producer pin reads it, or None when every one is idle. After every probe `expired()` ends
+    the scan: the bound passed before idle was confirmed."""
     for unit in BACKUP_UNITS:
         try:
-            shown = run(["systemctl", "show", "-p", "ActiveState", "-p", "InactiveExitTimestamp", unit],
-                        timeout=BACKUP_PROBE)
+            state = run(["systemctl", "show", "-P", "ActiveState", unit], timeout=BACKUP_PROBE).strip()
         except Exception:
-            return unit, "unreadable", None
-        fields = {key: value.strip() for key, _, value in (line.partition("=") for line in shown.splitlines())}
-        if fields.get("ActiveState") not in ("inactive", "failed"):
-            return unit, fields.get("ActiveState") or "unreadable", fields.get("InactiveExitTimestamp") or None
+            return unit, "unreadable"
+        if state not in ("inactive", "failed"):
+            return unit, state or "unreadable"
         if expired():
-            return unit, "not confirmed idle within the bound", None
+            return unit, "not confirmed idle within the bound"
     return None
 
 
+def backup_since(unit):
+    """When `unit` last started, from systemd, or None; read once, when the wait gives up."""
+    try:
+        return run(["systemctl", "show", "-P", "InactiveExitTimestamp", unit], timeout=10).strip() or None
+    except Exception:
+        return None
+
+
 def backup_busy(expired=lambda: False):
-    """`(unit or path, detail, since)` while a backup unit or the unsettled marker says a backup may run. The marker
-    (a file stat) is read before the units, so a bound that ends the unit scan still names it, and again after them:
-    a runner can create it while the units are read."""
+    """`(name, detail, unit)` while a backup unit or the unsettled marker says a backup may run; `unit` is the unit to
+    ask for a start time, or None. The marker (a file stat) is read before the units, so a bound that ends the unit scan
+    still names it, and again after them: a runner can create it while the units are read."""
     if marker := unsettled_marker():
         return str(marker), unsettled_backup(), None
     if busy := backup_unit_busy(expired):
-        return busy[0], f"backup_running: {busy[0]} is {busy[1]}", busy[2]
+        return busy[0], f"backup_running: {busy[0]} is {busy[1]}", busy[0]
     if marker := unsettled_marker():
         return str(marker), unsettled_backup(), None
     return None
@@ -1147,7 +1153,7 @@ def wait_backup_idle(settings, deadline, *, single=False):
                         fcntl.flock(fd, fcntl.LOCK_UN)
             now = time.monotonic()
             if single or now >= deadline:
-                raise BackupRunning(busy[0], int(now - started), busy[2], busy[1])
+                raise BackupRunning(busy[0], int(now - started), backup_since(busy[2]) if busy[2] else None, busy[1])
             if not said:
                 print("backup check: waiting for " + busy[1].removeprefix("backup_running: "), file=sys.stderr, flush=True)
                 said = True

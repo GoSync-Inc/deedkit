@@ -1320,7 +1320,7 @@ def test_standalone_promote_waits_on_the_real_lock_then_runs_the_real_promotion_
     clock.hooks.append(ends_at_ten_minutes)
     monkeypatch.setattr(s.p, 'time', clock)
     inner = s.p.run
-    monkeypatch.setattr(s.p, 'run', lambda argv, **kw: 'ActiveState=inactive\n' if argv[:2] == ['systemctl', 'show'] else inner(argv, **kw))
+    monkeypatch.setattr(s.p, 'run', lambda argv, **kw: 'inactive\n' if argv[:2] == ['systemctl', 'show'] else inner(argv, **kw))
     gate, real_wait, waits, inside = s.p.promotable, s.p.wait_backup_idle, [], []
     monkeypatch.setattr(s.p, 'promotable', lambda sha: inside.append(held()) or gate(sha))
     monkeypatch.setattr(s.p, 'wait_backup_idle', lambda *args, **kwargs: waits.append(args) or real_wait(*args, **kwargs))

@@ -5898,6 +5898,10 @@ class BackupHost:
     def run(self, argv, **kwargs):
         if argv[:2] != ["systemctl", "show"]:
             return self.inner(argv, **kwargs)
+        # The producer pin's form (`show -P ActiveState <unit>`) is the one every harness fake answers.
+        if argv[3] == "InactiveExitTimestamp":
+            return "Wed 2026-11-04 18:00:01 UTC\n"
+        assert argv[2:4] == ["-P", "ActiveState"], argv
         self.clock.now += self.probe
         self.probes.append(argv[-1])
         for hook in self.on_probe:
@@ -5906,7 +5910,7 @@ class BackupHost:
         state = state(self.clock.now) if callable(state) else state
         if isinstance(state, Exception):
             raise state
-        return f"ActiveState={state}\nInactiveExitTimestamp=Wed 2026-11-04 18:00:01 UTC\n"
+        return f"{state}\n"
 
     def hold(self, until=None):
         self.fd = os.open(self.lock, os.O_CREAT | os.O_RDWR, 0o600)
@@ -5946,6 +5950,19 @@ def test_the_wait_returns_at_once_holding_the_lock_when_no_backup_runs(tmp_path,
     assert not host.lock_is_held()
     # Every unit and the marker are read before the lock and again under it.
     assert host.probes == [*p.BACKUP_UNITS, *p.BACKUP_UNITS]
+
+
+# spec: ANYM-744
+def test_every_unit_is_read_the_way_the_producer_pin_reads_it(tmp_path, monkeypatch):
+    # The harness fakes of other tests answer exactly `systemctl show -P ActiveState <unit>`; another form would read as
+    # an unreadable unit there and wait for the whole bound.
+    host = BackupHost(tmp_path, monkeypatch)
+    seen = []
+    inner = p.run
+    monkeypatch.setattr(p, "run", lambda argv, **kwargs: seen.append(argv) or inner(argv, **kwargs))
+    with host.wait():
+        pass
+    assert seen == [["systemctl", "show", "-P", "ActiveState", unit] for unit in [*p.BACKUP_UNITS, *p.BACKUP_UNITS]]
 
 
 # spec: ANYM-744
@@ -6120,7 +6137,7 @@ def test_an_idle_host_with_a_zero_bound_is_admitted_whatever_the_probes_cost(tmp
 def test_a_sigterm_during_the_wait_takes_and_writes_nothing(tmp_path):
     bin_directory = tmp_path / "bin"
     bin_directory.mkdir()
-    (bin_directory / "systemctl").write_text("#!/bin/sh\necho ActiveState=inactive\n")
+    (bin_directory / "systemctl").write_text("#!/bin/sh\necho inactive\n")
     (bin_directory / "systemctl").chmod(0o755)
     backups = tmp_path / "backups"
     backups.mkdir(mode=0o700)
