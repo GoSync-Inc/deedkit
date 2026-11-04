@@ -364,7 +364,9 @@ def test_edit_hand_off_trouble_never_fails_the_collector(worker,trouble):
             task=asyncio.ensure_future(w.execute_operation(job))
             while not entered.is_set():await asyncio.sleep(.01)
             task.cancel()
-            return await task
+            answer=await task
+            while w.capture_count:await asyncio.sleep(.01)  # the slot follows the write, which still ends
+            return answer
         answer=asyncio.run(scenario())
         assert job['_cancel_after_settle'] is True  # the command worker settles the receipt, then stops
     else:
@@ -376,6 +378,37 @@ def test_edit_hand_off_trouble_never_fails_the_collector(worker,trouble):
     w.capture_count=0;w.spool.put=original
     asyncio.run(w.capture(NS(message=message(10))))
     assert 'created' in drained(w)
+
+
+# spec: ANYM-747
+def test_a_stalled_edit_hand_off_holds_its_slot_and_takes_no_shared_thread(worker,monkeypatch):
+    import time
+    from messaging_service import telegram_collector
+    w,s,key=worker
+    monkeypatch.setattr(telegram_collector,'STORE_GRACE',0)
+    release=Event();calls=[]
+    def stalled(item):calls.append(item);assert release.wait(5)
+    w.spool.put=stalled
+    edited=own(message(9,body='after edit',edited=datetime(2026,10,2,tzinfo=timezone.utc)))
+    async def scenario():
+        asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=1))
+        async def provider(work):
+            work['_read_back_message']=edited
+            return {'outcome':'confirmed','data':{}}
+        w.provider.execute_operation=provider
+        answers=[]
+        for _ in range(3):  # each wait is cut at its 0.2 s budget; the write is still running
+            answers.append(await w.execute_operation({'operation':'edit_message','_ends_at':time.monotonic()+1.2}))
+        held=w.capture_count
+        # the default executor (one thread here) still serves receipts, sends and lease renewal at once
+        await asyncio.wait_for(asyncio.to_thread(lambda:None),1)
+        release.set()
+        while w.capture_count:await asyncio.sleep(.01)
+        return answers,held
+    answers,held=asyncio.run(scenario())
+    assert [a['data']['archive'] for a in answers]==['not_queued']*3
+    assert len(calls)==1 and held==1  # one write in flight, its slot held past the timeout; no second write
+    assert w.capture_count==0 and not w.failed.is_set() and w.failure_code is None
 
 
 def poisoned_keyboard():

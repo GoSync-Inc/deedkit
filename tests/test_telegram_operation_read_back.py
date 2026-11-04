@@ -2,6 +2,7 @@
 A fake Telethon client, the real command worker and the disposable database; no provider is touched."""
 import asyncio
 import json
+import threading
 from datetime import datetime, timezone
 from types import SimpleNamespace as NS
 
@@ -86,8 +87,7 @@ class ReadBackClient(Client):
         return [c for c in self.calls if isinstance(c, functions.messages.GetMessagesReactionsRequest)]
 
 
-def run(operator, client, operation='delete_message', parameters=None, governor=None, request_id='read-back-0001',
-        chat='100', message='1', collector=None):
+def queue_operation(operator, operation, parameters, request_id, chat='100', message='1'):
     s, archive, key, state = operator
     message_id = stable_id('msg', 'command-fixture', chat, message)
     with s.pool.connection() as c:
@@ -95,7 +95,13 @@ def run(operator, client, operation='delete_message', parameters=None, governor=
     args = operation_args(operation=operation, parameters=parameters or {}, expected_revision=revision,
         chat_id=stable_id('chat', 'command-fixture', chat), message_id=message_id)
     draft = s.preview_messenger_operation(key, **args)
-    queued = s.execute_messenger_operation(key, **args, request_id=request_id, preview_digest=draft['preview_digest'])
+    return s.execute_messenger_operation(key, **args, request_id=request_id, preview_digest=draft['preview_digest'])
+
+
+def run(operator, client, operation='delete_message', parameters=None, governor=None, request_id='read-back-0001',
+        chat='100', message='1', collector=None):
+    s, archive, key, state = operator
+    queued = queue_operation(operator, operation, parameters, request_id, chat, message)
 
     async def provider(job):
         job['_policy'] = POLICY
@@ -375,6 +381,43 @@ def test_a_failing_archive_hand_off_keeps_the_edit_succeeded(operator, tmp_path)
     assert receipt['status'] == 'succeeded' and receipt['error_code'] is None
     assert receipt['result']['data']['archive'] == 'not_queued'
     assert not collector.failed.is_set() and collector.capture_count == 0
+
+
+# spec: ANYM-747
+def test_a_cancellation_during_the_hand_off_settles_the_edit_first(operator, tmp_path):
+    s, archive, key, state = operator
+    spool = CaptureSpool(tmp_path / 'capture', reserve_bytes=0)
+    collector = collector_for(operator, spool)
+    entered, release = threading.Event(), threading.Event()
+    original = spool.put
+
+    def slow(item):
+        entered.set()
+        assert release.wait(5)
+        return original(item)
+    spool.put = slow
+    client = EditClient(provider_message('Edited synthetic text'))
+    collector.provider = NS(execute_operation=lambda job: execute(client, job), verified_self=None)
+    queued = queue_operation(operator, 'edit_message', EDIT, 'read-back-cancel-01')
+
+    async def scenario():
+        task = asyncio.ensure_future(CommandWorker(state, collector.execute_operation).once())
+        while not entered.is_set():
+            await asyncio.sleep(.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task  # the worker resumes the cancellation only after the receipt is durable
+        receipt = s.get_messenger_operation(key, queued['operation_id'])
+        release.set()
+        while collector.capture_count:
+            await asyncio.sleep(.01)
+        return receipt
+    receipt = asyncio.run(scenario())
+    assert receipt['status'] == 'succeeded' and receipt['error_code'] is None
+    assert receipt['result']['data']['archive'] == 'not_queued'
+    assert not collector.failed.is_set() and collector.failure_code is None
+    assert len(client.mutations()) == 1
+    assert len(spooled(spool)) == 1  # the write itself finished after the wait was cut; the drain applies it
 
 
 # spec: ANYM-666

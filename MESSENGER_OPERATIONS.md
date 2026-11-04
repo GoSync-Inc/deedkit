@@ -180,7 +180,8 @@ A confirmed edit adds `archive: queued` to `result.data`: the collector puts the
 its live capture queue, and the archive shows the new text as the next revision when the queue is
 drained, normally well under a second after the receipt, not inside the operation. Until then
 `get_message` may still show the old revision and an `expected_revision` check still accepts it.
-`archive: not_queued` (a full queue, a stopping collector, a write error or the time budget spent)
+`archive: not_queued` (a full queue, an earlier hand-off still writing, a stopping collector, a write error
+or the time budget spent)
 leaves the update to the live edit event or the next reconcile pass; the edit is `succeeded` in
 both cases.
 
