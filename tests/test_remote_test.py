@@ -129,11 +129,14 @@ echo "createdb $*" >> "$FAKE_LOG"
 }
 CAPS = 'WAIT_SECONDS=0\nPOLL_SECONDS=1\nSTOP_SECONDS=3\n'
 # On the runner's PATH: a slot holder that stalls (FAKE_HOLDER=busy says so and never exits, silent never writes its
-# note); every other python3 is the real one.
+# note, held takes the slot, lets Between start and ignores the TERM that would free it); every other python3 is real.
 STALLED_HOLDER = f'''#!/usr/bin/env bash
 case "${{2:-}}" in *fcntl*)
   echo "holder pid=$$ at=$(date +%s)" >> "$FAKE_LOG"
-  [ "$FAKE_HOLDER" = silent ] || echo busy
+  case "$FAKE_HOLDER" in
+    busy) echo busy ;;
+    held) trap '' TERM; echo 'between-ci-1-test ' > "$FAKE_DOCKER_PS_FILE"; echo held ;;
+  esac
   exec sleep 300 ;;
 esac
 exec {shutil.which('python3')} "$@"
@@ -142,6 +145,12 @@ exec {shutil.which('python3')} "$@"
 STALLED_RSYNC = '''#!/usr/bin/env bash
 echo "stalled pid=$$ at=$(date +%s) $*" >> "$FAKE_LOG"
 exec sleep 300
+'''
+# On the laptop's PATH: what openrsync does when its I/O timeout fires and its ssh then ends.
+OPENRSYNC_TIMEOUT = '''#!/usr/bin/env bash
+echo "stalled pid=$$ at=$(date +%s) $*" >> "$FAKE_LOG"
+echo "rsync($$): error: poll: timeout" >&2
+exit 1
 '''
 
 
@@ -670,13 +679,14 @@ def test_a_taken_slot_makes_the_run_wait_in_the_mini_queue_then_ci_covers(mini, 
 
 
 # spec: ANYM-769
-@pytest.mark.parametrize('stall,named', [('busy', 'did not exit'), ('silent', 'wrote no note')],
+@pytest.mark.parametrize('stall,named,caps', [('busy', 'did not exit', 'SLOT_TAKE_SECONDS=5\nHOLDER_NOTE_SECONDS=25\n'),
+                                              ('silent', 'wrote no note', 'SLOT_TAKE_SECONDS=25\nHOLDER_NOTE_SECONDS=5\n')],
                          ids=['never-exits', 'never-writes-its-note'])
-def test_a_slot_holder_that_stalls_ends_the_run_at_its_bound_and_ci_covers(mini, worktree, stall, named):
+def test_a_slot_holder_that_stalls_ends_the_run_at_its_bound_and_ci_covers(mini, worktree, stall, named, caps):
     home, env = mini
-    bound = 2
+    bound = 5  # only the wait under test is short: the other one must not end the run first on a loaded runner
     write(home / 'rbin' / 'python3', STALLED_HOLDER)
-    write(home / 'shared' / 'caps.conf', CAPS + f'SLOT_TAKE_SECONDS={bound}\nHOLDER_NOTE_SECONDS={bound}\n', 0o644)
+    write(home / 'shared' / 'caps.conf', CAPS + caps, 0o644)
     # The guard: without a bound this run never ends.
     result = run_tracked(['bash', str(SCRIPT), '--full', str(worktree), 'gateway'], 30,
                          env=dict(env, FAKE_HOLDER=stall))
@@ -687,6 +697,19 @@ def test_a_slot_holder_that_stalls_ends_the_run_at_its_bound_and_ci_covers(mini,
     assert ended - int(holder.split('at=')[1]) <= bound + 5
     assert not alive(pid_of(holder))
     assert not list((home / 'service' / 'deedkit-ci' / '.locks').glob('holder.*'))
+    assert not log_lines(home, 'uv')
+
+
+# spec: ANYM-769
+def test_a_slot_holder_that_ignores_term_after_the_between_check_is_killed_and_ci_covers(mini, worktree):
+    home, env = mini
+    write(home / 'rbin' / 'python3', STALLED_HOLDER)
+    # The guard: a wait for a holder that ignores TERM never ends.
+    result = run_tracked(['bash', str(SCRIPT), '--full', str(worktree), 'gateway'], 30,
+                         env=dict(env, FAKE_HOLDER='held', FAKE_DOCKER_PS_FILE=str(home / 'between-containers')))
+    assert result.returncode == 90, result.stderr
+    assert 'a Between container is running' in result.stderr and 'CI covers' in result.stderr
+    assert not alive(pid_of(log_lines(home, 'holder')[0]))
     assert not log_lines(home, 'uv')
 
 
@@ -739,15 +762,17 @@ def test_a_mini_that_cannot_start_the_suite_leaves_it_to_ci_and_runs_nothing_loc
 
 
 # spec: ANYM-769
-@pytest.mark.parametrize('double', ['far-end', 'rsync'])
+@pytest.mark.parametrize('double', ['far-end', 'openrsync-reports-a-timeout', 'rsync'])
 def test_a_copy_that_stalls_ends_at_its_bound_and_ci_covers(mini, worktree, double):
     home, env = mini
-    bound = 3
-    extra = {'DEEDKIT_REMOTE_COPY_IO_SECONDS': '1', 'DEEDKIT_REMOTE_COPY_SECONDS': str(bound)}
-    if double == 'far-end':  # the real rsync: GNU exits 30 at --timeout, openrsync then waits for its ssh
+    bound = 8  # long enough that a loaded runner has started the double when the bound ends the copy
+    extra = {'DEEDKIT_REMOTE_COPY_IO_SECONDS': '3', 'DEEDKIT_REMOTE_COPY_SECONDS': str(bound)}
+    if double == 'far-end':  # the real rsync: GNU exits 30 past --timeout, openrsync reports it and then waits for its ssh
         extra['FAKE_SSH_STALL'] = 'rsync --server'
-    else:
+    elif double == 'rsync':
         write(home / 'bin' / 'rsync', STALLED_RSYNC)
+    else:  # its ssh ended after the I/O timeout: openrsync's exit 1 is still a timeout, whichever rsync is here
+        write(home / 'bin' / 'rsync', OPENRSYNC_TIMEOUT)
     # The guard: without a bound this run never ends.
     result = run_tracked(['bash', str(SCRIPT), '--full', str(worktree), 'gateway'], 30, env=dict(env, **extra))
     ended = time.time()
@@ -756,8 +781,8 @@ def test_a_copy_that_stalls_ends_at_its_bound_and_ci_covers(mini, worktree, doub
     stalled = log_lines(home, 'stalled')[0]
     assert ended - int(stalled.split('at=')[1].split()[0]) <= bound + 5
     assert not alive(pid_of(stalled))
-    if double == 'rsync':
-        assert '--timeout=1' in stalled.split()
+    if double != 'far-end':
+        assert '--timeout=3' in stalled.split()
     assert not log_lines(home, 'uv')
     assert not (worker_dir(home) / 'src').exists()
 
