@@ -45,7 +45,16 @@ CALENDAR_CHECKS = {'decryption', 'bundle_integrity', 'database_restore', 'schema
                    'table_inventory', 'vault_complete', 'vault_decrypts'}
 # A recordings receiver (ANYM-728) protects only a proof with exactly these checks and the archive's identity facts.
 RECORDINGS_CHECKS = {'decryption', 'bundle_integrity', 'archive_integrity', 'schema_version', 'identity', 'search_readback'}
-PROFILES = ('messaging', 'calendar', 'recordings')
+# A calls receiver (ANYM-781) protects only a proof with exactly these checks, each the word `ok`, the bundle format as
+# its schema version (backup_calls.SCHEMA_VERSION; SQLite's user_version is 0 in the calls database and is not proven),
+# the verified manifest's `captured_at` and its per-table row counts and digests, never row content.
+CALLS_CHECKS = {'integrity', 'row_counts', 'row_digests'}
+CALLS_SCHEMA_VERSION = 1
+CALLS_MANIFEST = 'calls-manifest.json'  # The helper's copy of the bundle's manifest, in the verifier's scratch.
+CALLS_MANIFEST_BYTES = 65536
+CALLS_TABLE_BYTES = 8192  # Encoded `tables`: far inside the proof's 16 KiB read limit.
+CALLS_TABLE_NAME = re.compile('[A-Za-z_][A-Za-z0-9_]{0,63}')
+PROFILES = ('messaging', 'calendar', 'recordings', 'calls')
 MAX_WARNINGS = 32
 # Encoded bytes of the copied warnings: an escaped non-ASCII name grows (an emoji is 12 bytes), and
 # the proof must stay far inside the 16 KiB `protect`/`rotate` read limit.
@@ -75,6 +84,20 @@ def valid_instant(value):
         return isinstance(value, str) and len(value) <= 64 and datetime.fromisoformat(value).utcoffset() is not None
     except ValueError:
         return False
+
+
+def valid_tables(value):
+    """A calls proof's per-table facts: an identifier, a row count and a digest for each table, nothing else."""
+    return (isinstance(value, dict) and bool(value) and
+            all(isinstance(name, str) and CALLS_TABLE_NAME.fullmatch(name) and isinstance(item, dict) and
+                set(item) == {'rows', 'sha256'} and type(item['rows']) is int and 0 <= item['rows'] <= 2**63 - 1 and
+                isinstance(item['sha256'], str) and local.DIGEST.fullmatch(item['sha256'])
+                for name, item in value.items()) and len(encoded(value)) <= CALLS_TABLE_BYTES)
+
+
+def checks_passed(checks, expected):
+    """Every check of the proof passed: `True` for the older profiles, the word `ok` for calls."""
+    return all(value == 'ok' if expected == 'calls' else value is True for value in checks.values())
 
 
 def valid_warnings(value):
@@ -942,6 +965,8 @@ def validate_proof(proof, receipt, expected='messaging'):
         keys, checks = keys | {'profile', 'vault_warnings'}, CALENDAR_CHECKS
     elif expected == 'recordings':
         keys, checks = keys | {'profile', 'archive', 'captured_at'}, RECORDINGS_CHECKS
+    elif expected == 'calls':
+        keys, checks = keys | {'profile', 'captured_at', 'tables'}, CALLS_CHECKS
     if not isinstance(candidate, dict) or set(candidate) != {'id', 'bytes', 'sha256', 'snapshot_sha256'}:
         raise ValueError('invalid_restore_proof')
     new = {key: candidate[key] for key in ('id', 'bytes', 'sha256')}
@@ -954,8 +979,10 @@ def validate_proof(proof, receipt, expected='messaging'):
             type(verification['schema_version']) is not int or not 1 <= verification['schema_version'] <= 100000 or
             verification['manifest_sha256'] != candidate['snapshot_sha256'] or
             not isinstance(verification['checks'], dict) or set(verification['checks']) != checks or
-            any(value is not True for value in verification['checks'].values()) or
+            not checks_passed(verification['checks'], expected) or
             (expected == 'calendar' and not valid_warnings(verification['vault_warnings'])) or
+            (expected == 'calls' and not (verification['schema_version'] == CALLS_SCHEMA_VERSION and
+                                          valid_instant(verification['captured_at']) and valid_tables(verification['tables']))) or
             (expected == 'recordings' and not (valid_archive(verification['archive']) and
                                                valid_instant(verification['captured_at'])))):
         raise ValueError('independent_restore_proof_required')
@@ -965,7 +992,8 @@ def validate_proof(proof, receipt, expected='messaging'):
         verified = datetime.fromisoformat(verification['verified_at'])
         received = datetime.fromisoformat(receipt['wire']['received_at'])
         if (verified.utcoffset() is None or received.utcoffset() is None or
-                verified > datetime.now(timezone.utc) + timedelta(minutes=5) or verified < received):
+                verified > datetime.now(timezone.utc) + timedelta(minutes=5) or verified < received or
+                (expected == 'calls' and datetime.fromisoformat(verification['captured_at']) > verified + timedelta(minutes=5))):
             raise ValueError()
     except (KeyError, TypeError, ValueError):
         raise ValueError('invalid_restore_time') from None

@@ -6,7 +6,7 @@ own plaintext work. A successful upload is never considered restore evidence.
 """
 import argparse
 from contextlib import ExitStack,contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import json
@@ -670,6 +670,10 @@ RECORDINGS_FAILURES={'restore_archive_failed','restore_readback_failed','invalid
                      'rebaseline_recordings_only','invalid_deletion_floor','revoke_recordings_only','continuity_too_large','continuity_unresolved',*continuity.REFUSALS}
 
 
+# The calls helper's one refusal after the shared stages (ANYM-781).
+CALLS_FAILURES={'restore_mismatch'}
+
+
 class HelperFailure(RuntimeError):
     def __init__(self,code,detail=None):super().__init__(code);self.detail=detail
 
@@ -680,7 +684,7 @@ def helper_failure(payload):
     try:
         fact=r2.unique_json(private_file(payload/'failure.json',4096))
         safe={'restore_decryption_failed','restore_database_failed','restore_snapshot_failed','restore_quarantine_failed',
-              *CALENDAR_FAILURES,*RECORDINGS_FAILURES}
+              *CALENDAR_FAILURES,*RECORDINGS_FAILURES,*CALLS_FAILURES}
         if (isinstance(fact,dict) and set(fact)=={'v','status','error'} and
                 type(fact['v']) is int and fact['v']==1 and fact['status']=='failed' and type(fact['error']) is str and fact['error'] in safe):failure=fact['error']
     except (OSError,ValueError):pass
@@ -748,25 +752,46 @@ def reserve_roots(config,docker_root):
     return [config['directory'],docker_root,*([config['postgres_data_directory']] if 'postgres_data_directory' in config else [])]
 
 
-def make_proof(receipt,facts,run,profile='messaging'):
+def calls_manifest(payload,receipt):
+    """The manifest the calls helper copied out, held only as the very bytes the receipt names (ANYM-781): the helper
+    cannot make a late snapshot look fresh by writing another `captured_at` into its result."""
+    try:
+        raw=private_file(payload/r2.CALLS_MANIFEST,r2.CALLS_MANIFEST_BYTES)
+        if hashlib.sha256(raw).hexdigest()!=receipt['wire']['snapshot_sha256']:raise ValueError('invalid_helper_result')
+        return r2.unique_json(raw)
+    except (OSError,ValueError):raise ValueError('invalid_helper_result') from None
+
+
+def calls_facts_valid(facts,manifest):
+    """The result's capture time and tables are the verified manifest's, and the capture does not lie in the future."""
+    return (r2.valid_instant(facts['captured_at']) and r2.valid_tables(facts['tables']) and isinstance(manifest,dict) and
+            all(key in manifest and manifest[key]==facts[key] for key in ('profile','schema_version','captured_at','tables')) and
+            datetime.fromisoformat(facts['captured_at'])<=datetime.now(timezone.utc)+timedelta(minutes=5))
+
+
+def make_proof(receipt,facts,run,profile='messaging',manifest=None):
     if isinstance(facts,dict) and facts.get('profile','messaging')!=profile:raise ValueError('verifier_profile_mismatch')
     keys,checks,schemas={'v','status','schema_version','manifest_sha256','checks'},r2.CHECKS,SCHEMAS
     # The calendar schema is fcs.migrations' version, which the helper binds to the manifest; no messaging range.
     if profile=='calendar':keys,checks,schemas=keys|{'profile','vault_warnings'},r2.CALENDAR_CHECKS,range(1,100001)
     # The recordings schema is the archive's user_version; the identity facts are the bundle manifest's.
     elif profile=='recordings':keys,checks,schemas=keys|{'profile','archive','captured_at'},r2.RECORDINGS_CHECKS,SUPPORTED_USER_VERSIONS
+    # The calls schema is the bundle format, never SQLite's user_version; `manifest` is calls_manifest's.
+    elif profile=='calls':keys,checks,schemas=keys|{'profile','captured_at','tables'},r2.CALLS_CHECKS,(r2.CALLS_SCHEMA_VERSION,)
     if (not isinstance(facts,dict) or set(facts)!=keys or
             type(facts['v']) is not int or facts['v']!=1 or facts['status']!='verified' or
             type(facts['schema_version']) is not int or facts['schema_version'] not in schemas or
             facts['manifest_sha256']!=receipt['wire']['snapshot_sha256'] or not isinstance(facts['checks'],dict) or
-            set(facts['checks'])!=checks or any(v is not True for v in facts['checks'].values()) or
+            set(facts['checks'])!=checks or not r2.checks_passed(facts['checks'],profile) or
             (profile=='calendar' and not r2.valid_warnings(facts['vault_warnings'])) or
-            (profile=='recordings' and not (r2.valid_archive(facts['archive']) and r2.valid_instant(facts['captured_at'])))):
+            (profile=='recordings' and not (r2.valid_archive(facts['archive']) and r2.valid_instant(facts['captured_at']))) or
+            (profile=='calls' and not calls_facts_valid(facts,manifest))):
         raise ValueError('invalid_helper_result')
     verification={'id':run,'verified_at':now(),'schema_version':facts['schema_version'],
                   'manifest_sha256':facts['manifest_sha256'],'checks':facts['checks']}
     if profile=='calendar':verification={**verification,'profile':profile,'vault_warnings':facts['vault_warnings']}
     if profile=='recordings':verification={**verification,'profile':profile,'archive':facts['archive'],'captured_at':facts['captured_at']}
+    if profile=='calls':verification={**verification,'profile':profile,'captured_at':facts['captured_at'],'tables':facts['tables']}
     return {'v':1,'type':'independent_restore_verification','status':'verified',
             'backup':{k:receipt['wire'][k] for k in ('id','bytes','sha256','snapshot_sha256')},'verification':verification}
 
@@ -1004,7 +1029,8 @@ def verify_run(config,receiver,client,engine,journal,fd):
     if r2.profile(config)!='messaging':worker['profile']=r2.profile(config)
     write_secret(secret_dir/'worker.json',r2.encoded(worker));local.fsync_dir(secret_dir);local.fsync_dir(directory)
     facts=engine.restore(config,receiver,client,journal['receipt'],run,payload,secret_dir)
-    proof=make_proof(journal['receipt'],facts,run,r2.profile(config));r2.validate_proof(proof,journal['receipt'],r2.profile(config))
+    manifest=calls_manifest(payload,journal['receipt']) if r2.profile(config)=='calls' else None
+    proof=make_proof(journal['receipt'],facts,run,r2.profile(config),manifest);r2.validate_proof(proof,journal['receipt'],r2.profile(config))
     if r2.profile(config)=='recordings':check_continuity(payload,run,facts,journal,fd)
     proof_name='proof-'+run+'.json'
     local.write_maintenance_json(proof_name,proof,dir_fd=fd)
@@ -1207,7 +1233,7 @@ def failure_code(error):
           'invalid_verifier_journal','private_root_file_required','restore_docker_failed','restore_postgres_unavailable',
           'isolated_restore_failed','stored_backup_corrupt','protected_backup_corrupt','verifier_host_busy','verifier_cleanup_unconfirmed',
           'verifier_pins_unfinished','verifier_code_unfinished','invalid_verifier_lock','verification_pending','instances_invalid','pins_switch_unresolved','storage_unavailable','unexpected_restore_image_volume','unexpected_restore_helper_layout',
-          *CALENDAR_FAILURES,*RECORDINGS_FAILURES}
+          *CALENDAR_FAILURES,*RECORDINGS_FAILURES,*CALLS_FAILURES}
     return str(error) if str(error) in safe else 'independent_restore_failed'
 
 

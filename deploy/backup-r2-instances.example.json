@@ -3,6 +3,7 @@
   "verifier_configs": [
     "/etc/deedkit-backup-r2/verifier.json",
     "/etc/deedkit-calendar-backup-r2/verifier.json",
-    "/etc/deedkit-recordings-backup-r2/verifier.json"
+    "/etc/deedkit-recordings-backup-r2/verifier.json",
+    "/etc/deedkit-calls-backup-r2/verifier.json"
   ]
 }

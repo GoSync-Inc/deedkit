@@ -691,6 +691,59 @@ Units: [service](deploy/deedkit-recordings-backup-r2-verifier.service) and
 [timer](deploy/deedkit-recordings-backup-r2-verifier.timer). Installing them, the first protected point and the
 restore drill are ANYM-731. Undo: `systemctl disable --now deedkit-recordings-backup-r2-verifier.timer`.
 
+## Calls verifier instance
+
+The calls state's encrypted bundle (ANYM-778, BACKUP.md "Calls state") goes through the same verifier code as an instance
+with `profile: calls` (ANYM-781), with its own upload user, receiver config, state directory, recovery key, R2 prefix and
+protected marker, exactly as the recordings instance. The profile comes only from the root configs; a mismatch anywhere fails
+`verifier_profile_mismatch` and protects nothing. A calls failure never fails or rotates another instance, and the reverse.
+
+The contract (`CALLS_CHECKS`, `CALLS_SCHEMA_VERSION` in backup_r2_receiver.py). The manifest's `schema_version` is the bundle
+format, 1, not SQLite's `user_version`, which the calls database leaves at 0. The helper's result is exactly:
+
+```json
+{"v":1,"status":"verified","profile":"calls","schema_version":1,"manifest_sha256":"<hex>","captured_at":"<instant>",
+ "checks":{"integrity":"ok","row_counts":"ok","row_digests":"ok"},"tables":{"<table>":{"rows":1,"sha256":"<hex>"}}}
+```
+
+`tables` holds the name, row count and digest of each table, never row content. `captured_at` is when the producer's copy
+began, as the verified manifest inside the bundle says, not the delivery or verification time: an old snapshot delivered late
+is old. The helper also copies the manifest's bytes to `calls-manifest.json` in the scratch. `make_proof` holds that copy only
+when its SHA-256 is the receipt's `snapshot_sha256`, and copies `captured_at` and `tables` into the proof only when they equal
+the copy's; a time more than 5 minutes ahead is refused. `protect` and `rotate` accept on a calls receiver only that proof, and
+another profile's receiver refuses it. The proof file is root `0600` in the verifier directory.
+
+The isolated helper (no network, read-only inputs, the existing limits) decrypts the bundle and opens the snapshot read-only and
+immutable, so it writes nothing beside it. No database is restored:
+
+| Check | Fails with |
+|---|---|
+| decryption: authenticated age EOF | `restore_decryption_failed` |
+| exactly `manifest.json` then `state/voice.sqlite3`, manifest fields, the manifest's hash is the receipt's, file size and SHA-256 | `restore_mismatch` |
+| `integrity`: SQLite `PRAGMA integrity_check` is `ok`; `briefs`, `calls` and `voice_events` exist | `restore_mismatch` |
+| `row_counts`, `row_digests`: every table's count and order-free digest, recomputed, equal the manifest's, and no table is added or removed | `restore_mismatch` |
+| the bundle names another profile | `verifier_profile_mismatch` |
+
+A refused candidate never replaces the protected point, and the previous proof stays the one `last-success.json` names. The
+recordings continuity checks do not apply. Like every instance's, a refused candidate keeps its retry journal and its object:
+the receiver refuses the next delivery (`receiver_quota`) until an operator, under the evidence rules above, removes that
+candidate's `active.json`, its object and receipt under the prefix, and its `<id>.attempt.json`, never the protected point
+(tests/test_backup_calls_receiver.py runs exactly these steps). The last proof's age keeps growing while it waits.
+
+Scratch. The verifier decrypts into `payload-<run>` (0700, root) in its directory; for this profile it holds the calls database's
+plaintext for the verification only, and is removed like the recordings scratch above.
+
+Helper updates. The follow and the pin step self-test the calls profile on a synthetic database made by the image under test; a
+helper that cannot read the calls bundle holds the shared pin move with the fixed code `calls_helper_failed`. The pinned backup
+image and the receiver wheel must carry this code before any configuration names `calls`, and the calls config must be in the
+instances file ([Two verifiers on one receiver](#two-verifiers-on-one-receiver)) before its timer runs.
+
+Examples: [receiver](deploy/calls-backup-r2-receive.example.json), [operator](deploy/calls-backup-r2-operator.example.json) and
+[verifier](deploy/calls-backup-r2-verifier.example.json) configurations under `/etc/deedkit-calls-backup-r2/` (root `0600`, the
+receiver's owned by its upload user), with the calls line in [the instances file](deploy/backup-r2-instances.example.json). Units:
+[service](deploy/deedkit-calls-backup-r2-verifier.service) and [timer](deploy/deedkit-calls-backup-r2-verifier.timer).
+Installing them is ANYM-782. Undo: `systemctl disable --now deedkit-calls-backup-r2-verifier.timer`.
+
 ## Two verifiers on one receiver
 
 Both instances (ANYM-609) run on one host. Each restore can start a 1 GiB
