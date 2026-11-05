@@ -1750,7 +1750,8 @@ def sql_hits(files, head, base, text):
             for name in sorted((n for n in mine if kinds[n][1] == 'added'),
                                key=lambda n: int(re.findall(r'[0-9]+', n.rsplit('/', 1)[1])[0])):
                 body = read(name, head)
-                if body is None or rollout.unattended_class(body) != 'expand':
+                # The owner boundary stays ANYM-596's DROP-free expand (AGENTS.md section 2), not deploy's ANYM-743 gate.
+                if body is None or rollout.additive_class(body) != 'expand':
                     owner.append((WAITS_MIGRATION, name))
                     continue
                 bodies.append(body)

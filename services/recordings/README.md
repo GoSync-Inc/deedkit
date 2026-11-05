@@ -131,6 +131,23 @@ lazy processing; its GET omits `processing_deferred`), older it is `empty`.
 Omi raw audio is `unsupported`: its Developer API documents no download route.
 The service does not invent one.
 
+An Omi transcript read also takes optional `from_seconds` and `to_seconds` (ANYM-770;
+numbers from 0 to 1e6, offsets in the recording; one alone is open-ended), for example
+`{"account":"omi-a","recording_id":"...","from_seconds":3600,"to_seconds":4200}`.
+Only segments fully inside are returned (`start >= from_seconds`, `end <= to_seconds`):
+a segment has no word timestamps, so one crossing a bound is left out and counted in
+`excluded_edge_segments`. A segment that cannot be placed (a missing offset, the
+unplaced sentinel, `start` after `end`) is left out uncounted. `text`, `source_digest`,
+`offset` and `complete` describe the filtered text, the cursor is bound to the range,
+and `recording` omits `title` and `title_truncated`. No match is `content_state: empty`.
+The range limits what leaves the service, not what the provider returns to it: the same
+single `GET` reads the whole conversation (Omi's API has no time filter for one
+conversation), and excluded text is not returned, cached or logged. Refusals are
+`invalid_parameters` with a `detail_code`, relayed by the gateway: `range_empty`
+(`from_seconds >= to_seconds`), `range_not_for_summary`, and `range_needs_offsets` (no
+segment placed at or after 0, or any PLAUD account). Without the two arguments the read
+is unchanged.
+
 Continuations last 15 minutes, are authenticated and bound to credential,
 provider account/token identity, operation and exact arguments. They are encoded,
 not encrypted; do not log or share them. They confer no access on their own.
@@ -344,15 +361,22 @@ ahead of the older backlog.
   header only as `true`, so its absence is not truncation; a malformed value proves nothing. A
   finished history is walked again once a day (list rows only) so a changed title or overview of an older record is noticed.
   `reached_end` is a fact about the traversal only; `coverage` stays `unknown`.
-- A saved record is read again only when its list row changed (overview presence/digest or the deferred flag), or while a part
-  is pending: every 3 hours during the first 24 hours after creation, then daily until 14 days, then only on a change. Nothing
-  is re-read hourly. A title-only change updates the title and index without a provider call. Failed reads keep the bounded
+- A saved record is read again only when its list row changed (overview presence/digest or the deferred flag), at its two stage
+  reads (6 and 48 hours after `created_at`, because Omi changes a transcript without touching the list row), or while a part
+  is pending: every 3 hours during the first 24 hours after creation, then daily until 14 days, then only on a change. A read
+  at or after a stage time, whoever caused it, counts as that stage; a record without a usable `created_at` has no stage. In the
+  collector an empty overview on a record under 24 hours old is `pending`, whatever its title, and waits for the stages or a
+  changed list row, not the 3-hour schedule; at 24 hours or older it is `empty`. Nothing
+  is re-read hourly. A changed transcript is a new revision and one `recording.text.archived` event; an identical or empty read changes nothing. A title-only change updates the title and index without a provider call. Failed reads keep the bounded
   backoff and share the budget; `response_too_large` backs off a day.
+- Re-reads (stage, pending, changed row) may use at most `transcript_per_hour - 3` transcript slots an hour (above a budget of 3),
+  so 3 stay for first reads and failed records. Expected load, stated and not measured: three transcript reads per new
+  conversation, a sustained ceiling at the default share of 144 new conversations a day (432 / 3), before retries and other work.
 - An Omi record that answers 404 twice in a row (merged away, deleted or locked) becomes `provider_missing`: its stored text
   stays, it is checked at most weekly with `include_transcript=false` (no transcript slot), and it is due again once a list
   row carries its ID or that check finds it.
 - `archive_status` (read scope; no titles or text) adds `traversal` (`state`, `discovered_total`, `passes_completed` = history
-  list pages committed, `last_page_at`), `with_text`, `queued`, `pending`, `failed`, `provider_missing`, `throttled_until`, `usage` per bucket
+  list pages committed, `last_page_at`), `with_text`, `queued`, `pending` (a part unfinished or a re-read due now; waiting for a later stage is not pending), `failed`, `provider_missing`, `throttled_until`, `usage` per bucket
   (`used`, `limit`, `resets_at`: when the oldest counted call leaves the sliding hour), `db_bytes` (all SQLite files incl. WAL), `bytes_ceiling`, `projected_db_bytes`
   (the larger of the measured pages and 3 x the accepted text bytes per text-bearing record, times `discovered_total`, plus
   the measured empty-schema size; an estimate),

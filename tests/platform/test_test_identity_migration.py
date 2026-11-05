@@ -19,6 +19,7 @@ def test_registered_case_ids_and_matcher_sources_are_unique_and_still_present():
     assert len({case["signature"] for case in cases}) == len(cases)
     for case in cases:
         if case.get("filePath") and not case["signature"].startswith("anymsg-ci::"):
+            # reads: config/tiden-test-identities.json
             assert (ROOT / case["filePath"]).is_file(), case["filePath"]
 
 

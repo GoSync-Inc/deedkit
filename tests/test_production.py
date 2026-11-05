@@ -680,6 +680,9 @@ def test_gateway_calendar_and_calls_images_end_with_the_source_revision(dockerfi
     # production.py already passes the build argument to every target; the final stage must keep it as ENV so the
     # service can report its build. It sits after the build layers so they stay cached; the calls image keeps CMD
     # last (test_coverage_deployment pins it).
+    # reads: services/gateway/Dockerfile
+    # reads: services/calendar/Dockerfile
+    # reads: services/calls/Dockerfile
     lines = (ROOT / dockerfile).read_text().replace("\\\n", " ").splitlines()
     final = []
     for line in (value.strip() for value in lines):
@@ -3017,8 +3020,9 @@ def test_the_sql_pause_names_the_class_the_candidate_classifier_gives_each_added
     # The pause is the one before ANYM-444; its reason adds only file names and classes, never file contents.
     assert outcome["status"] == "halted" and outcome["sha"] == NEWEST and host.steps == []
     assert outcome["reason"] == (f"the SQL inventory changed ({paths}); migrate by hand (production.md); added "
-                                 "migrations: 041_synthetic_expand.sql expand, 042_synthetic_manual.sql manual, "
-                                 "043_synthetic_claim.sql manual, 044_synthetic_bare.sql no header")
+                                 "migrations: 041_synthetic_expand.sql expand non-critical, 042_synthetic_manual.sql "
+                                 "manual non-critical, 043_synthetic_claim.sql manual critical: line 2 UPDATE, "
+                                 "044_synthetic_bare.sql no header non-critical")
     assert host.paused() == outcome["reason"] and "marker" not in outcome["reason"]
     assert [argv[3:] for argv in host.git if argv[3:5] == ["cat-file", "blob"]][-1] == \
         ["cat-file", "blob", f"{NEWEST}:{p.CLASSIFIER}"]
@@ -5391,6 +5395,8 @@ def test_a_snapshot_service_entry_that_is_not_a_mapping_removes_nothing(tmp_path
 
 # Deploy tool updates (ANYM-443): a synthetic tool layout under tmp, the fake mirror serving the candidate's tool files,
 # and the real self-test run as a separate process with the CI Python against synthetic configurations.
+# reads: scripts/production.py
+# reads: scripts/seamless_release.py
 TOOL = {path: (ROOT / path).read_bytes() for path in ("scripts/production.py", "scripts/seamless_release.py")}
 SYNTHETIC_VALUES = ("https://example.invalid/deedkit", "legacy-api:8080", "legacy-gateway:13240", "synthetic-router",
                     "synthetic-frontend", "synthetic-policy-secret")
@@ -5989,6 +5995,8 @@ def test_tool_update_receipts_pause_and_journal_line_hold_no_configuration_value
 def test_both_tool_files_parse_and_compile_as_python_3_12_without_warnings(path):
     import ast
     import warnings
+    # reads: scripts/production.py
+    # reads: scripts/seamless_release.py
     source = (ROOT / path).read_text()
     ast.parse(source, filename=path, feature_version=(3, 12))
     with warnings.catch_warnings():

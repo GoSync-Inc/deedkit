@@ -103,6 +103,26 @@ python3 scripts/feedback_sync.py follow [--apply]   # by hand; `auto` runs it ev
 - `follow` moves each item with a `spec_ref`: card Done and its delivering commit (the one merged
   pull request whose body has `Delivers: ANYM-n`) LIVE: `verify_requested` at the live plan A SHA;
   Done and merged only: `fixed` at that commit; on main, not Done: `received` to `accepted`.
+- A card in `Review` whose delivering commit is on origin/main and LIVE moves its `accepted` items
+  to `verify_requested` at the live SHA with the note `Delivered by ANYM-n; live in deedkit@<sha12>;
+  the card still waits for <its open check>. Please re-check.` The open check is the first
+  `[open: live]`/`[open: measured]` line of the card outside fences and comments, or the word
+  "review", at most 120 characters; that card line reaches the reporter, so it holds no private
+  data. Merged but not LIVE: `fixed`, as for Done. A `Review` card with no delivering commit stays
+  `card not delivered`. `Backlog` and `Active` cards are unchanged. A `verify_requested` item is
+  not rewritten when the card later moves from Review to Done (`already verify_requested`).
+- A reviewed file `config/feedback-delivery.json` maps a `Done` card to its delivering commit:
+  `{"ANYM-171": {"commit": "<40 hex>", "pr": 342, "evidence": "<one line>", "added": "<date>"}}`.
+  An entry is used only when the card is `Done`, no merged `Delivers: ANYM-n` pull request exists,
+  the commit is an ancestor of origin/main and `gh` shows that pull request merged with that squash
+  commit and a body whose `Spec:` line names the card. The plan line shows `delivered by mapping
+  (#<pr>)`. An entry that fails any condition, two entries for one card, or an entry whose card has
+  a `Delivers:` pull request is refused with a named reason (`mapping refused: <why>`) and writes
+  nothing for that card, also no `received` to `accepted`; a file that is not JSON or not an object of `ANYM-n` entries stops the run
+  (exit 1, no write). No mapping is ever derived from a `Spec:` line by the tool. To add an entry:
+  read the card and its candidate pull requests (a later maintenance pull request also names a card
+  with `Spec:`), then open a reviewed pull request with the entry; the `evidence` line says what was
+  checked, in a public repository, so no feedback text.
 - A status never moves down; `verified` and `reopened` never change; `follow` never touches
   `declined` or `duplicate` and keeps the first live SHA of `verify_requested`.
 - Every write is `set-feedback-status --unchanged-since <head - 10 s> --not-after <head + 15 min>`,

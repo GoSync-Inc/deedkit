@@ -73,6 +73,17 @@ def _below_fix(pins):
 # spec: ANYM-137
 @pytest.mark.parametrize('path', UV_LOCKS + REQUIREMENTS_LOCKS)
 def test_lockfile_pins_no_version_below_a_known_advisory_fix(path):
+    # reads: uv.lock
+    # reads: services/messaging/uv.lock
+    # reads: services/gateway/uv.lock
+    # reads: services/calls/uv.lock
+    # reads: services/calendar/uv.lock
+    # reads: tools/dev/uv.lock
+    # reads: services/messaging/requirements.lock
+    # reads: services/messaging/requirements-test.lock
+    # reads: services/messaging/requirements-enrichment.lock
+    # reads: services/messaging/requirements-telemetry.lock
+    # reads: services/messaging/requirements-backup-r2.lock
     pins = _pins((ROOT / path).read_text(encoding='utf-8'), path.endswith('uv.lock'))
     assert pins, path
     assert not _below_fix(pins), path

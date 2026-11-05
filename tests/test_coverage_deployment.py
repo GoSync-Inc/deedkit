@@ -39,6 +39,17 @@ def test_native_overlay_removes_browser_seccomp_without_relaxing_privilege_bound
 
 
 def document(relative):
+    # reads: .github/workflows/checks.yml
+    # reads: deploy/compose.yaml
+    # reads: deploy/compose.calendar.yaml
+    # reads: deploy/compose.calls.yaml
+    # reads: deploy/compose.gateway.yaml
+    # reads: deploy/compose.operator.yaml
+    # reads: deploy/compose.recordings.yaml
+    # reads: deploy/compose.telemetry.yaml
+    # reads: deploy/compose.whatsapp.yaml
+    # reads: deploy/compose.whatsapp-native.yaml
+    # reads: deploy/compose.whatsapp-pair.yaml
     return yaml.load((ROOT / relative).read_text(), Loader=ComposeLoader)
 
 

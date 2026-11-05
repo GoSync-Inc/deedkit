@@ -585,9 +585,10 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
    while the daily backup succeeds), and everything written after it (messages, receipts, keys, operator
    changes) is lost. No gate backup or copy was restored in any hand release from 10-17 to 11-04.
 4. How a non-critical release runs. `deploy` applies it itself when the range qualifies ("Unattended
-   migrations": today `expand` files and appended role grants; the backup receiver's schema holds none).
-   Any other range pauses autodeploy until `deploy` applies every non-critical range itself (ANYM-743); meanwhile the agent who sees the
-   pause releases it at once, at any hour, with the previous release's tested commands: a tested runbook,
+   migrations": every added file the classifier calls non-critical and appended role grants; the backup
+   receiver's schema holds none). A range that still pauses (a critical file, a rename or another change the
+   rehearsal refuses, a role file that does not only append grants) is released by the agent who sees the
+   pause at once, at any hour, with the previous release's tested commands: a tested runbook,
    so no new kit, plan or review round. The order:
    1. Exclusion from the backups (a backup stops the collectors and holds snapshots; an apply recreates
       the collectors and a migration takes table locks). `personal-os-backup.service`,
@@ -622,20 +623,35 @@ highest-tier pending migration file, changed role file or step.
   DO UPDATE; DROP TABLE, COLUMN, SCHEMA or MATERIALIZED VIEW; a DROP ... CASCADE whose dependents include
   a table, a column or anything the author cannot list; ALTER COLUMN ... TYPE or SET EXPRESSION that
   rewrites the table or converts stored values (a binary-coercible change without a rewrite, such as
-  `varchar(n)` to `text`, is not); the same inside a `DO` block, a function the migration calls or a
-  trigger that fires during it; a data-deleting step (item 2); and a statement whose effect on existing
-  rows the author cannot name.
-- Non-critical: everything else. For example new tables, columns and indexes; constraints and CHECK
-  changes, `NOT VALID` included (a failing one aborts its own transaction and loses nothing); DROP
-  CONSTRAINT, INDEX, DEFAULT or NOT NULL; RENAME; functions, triggers and comments; grants, REVOKE and role
-  changes; a `DO` block that only grants, revokes or checks a precondition.
+  `varchar(n)` to `text`, is not); the same inside a `DO` block or a function the file creates or replaces.
+  Computed: a function or procedure whose body writes rows other than by INSERT, changes the schema or runs
+  text as SQL (a word of `FUNCTION_WRITES`), in a language other than SQL or PL/pgSQL, or with its text
+  outside a dollar quote; any trigger, event trigger or rule (the runner's own ledger INSERT and UPDATE fire
+  one); an INSERT in a file that creates or replaces a function; a call of a function the file creates; any
+  ALTER other than ALTER TABLE, and any ALTER TABLE action outside the complete forms below. Also a
+  data-deleting step (item 2) and a statement whose effect on existing rows the author cannot name.
+- Non-critical: only these forms. CREATE of a table, index, sequence, view, materialized view, type, domain,
+  policy, schema, role, aggregate, statistics or cast; a function or procedure the rule above lets through.
+  ALTER TABLE: ADD COLUMN; ADD a CHECK, UNIQUE, PRIMARY KEY, FOREIGN KEY or EXCLUDE constraint, `NOT VALID`
+  included (a failing one aborts its own transaction and loses nothing); VALIDATE CONSTRAINT; DROP CONSTRAINT;
+  ALTER COLUMN SET or DROP DEFAULT and SET or DROP NOT NULL; ENABLE or FORCE ROW LEVEL SECURITY. DROP without
+  CASCADE of an index, function, procedure, policy, view, type, domain, aggregate, statistics, cast or role;
+  a plain INSERT; comments, ANALYZE and `SET LOCAL`; grants and REVOKE; a `DO` block that only grants, revokes
+  or checks a precondition.
 
 The tier decides the backup and the plan review only. Expand, then contract
 (`.claude/rules/migrations.md`) still keeps a DROP, RENAME or narrowing out of a release whose running
 code uses the old shape; role SQL keeps its Astra r1 in its PR; the active-call check and the release
-order stay. The author names the tier in the migration header (`-- Risk tier: critical` with the line
-of the critical statement, or `-- Risk tier: non-critical`) and in the PR; the PR review checks it
-against the file. Until ANYM-743 computes the tier from the diff, that header is the tier. Until
+order stay. The tier is computed from the file (ANYM-743): `risk_class` in the candidate's
+`migration_rollout.py` (the calendar copy for `schema_vN.sql`) names a statement non-critical only in
+the forms listed above and everything else, text it cannot tokenize included, critical; the deploy pause
+and `deploy --dry-run` print it per added file (`069_x.sql manual critical: line 12 DELETE`; a file whose
+classifier failed reads `manual` with no tier: treat it as critical). It reads statements, not what an
+expression calls: a DEFAULT, CHECK or `CREATE TABLE AS` may call a function that already exists. The rehearsal
+sees what such a call does on the copy (a moved write counter, row count or column number); a call that first
+runs after the release is seen by neither. A `-- Risk tier:` header is a note
+for the reviewer and cannot lower the computed tier; to take a critical statement out of a release,
+split it into its own file. Until
 ANYM-675 ships, the deployer still copies before every unattended range, because its rehearsal runs on
 the copy; that copy is automatic and holds no one.
 
@@ -725,7 +741,8 @@ What qualifies (M1): every SQL inventory path of the range is an added
 `services/messaging/messaging_service/migrations/NNN_*.sql` or a modified messaging `*_role.sql`,
 or a calendar path of "Calendar" below (`schema.sql`, `deploy/*.sql`, other calendar SQL, a new, deleted or
 renamed role file and an edited applied migration pause); the candidate's `migration_rollout.py`, in the classifier's isolated process, names each
-added file `expand` by `unattended_class` (no DROP of any kind, so the CHECK widening pair pauses) and each
+added file `expand` by `unattended_class` (ANYM-743: a rollout header, `risk_class` non-critical, no
+`CONCURRENTLY`, no name over 63 bytes; the CHECK widening pair qualifies, a critical file pauses) and each
 role file `additive` by `role_class`; the added versions follow the base's highest without a gap.
 
 Phases, each a pause or a wait before any production write:
@@ -766,15 +783,15 @@ Phases, each a pause or a wait before any production write:
    schemas, relations, columns, constraints, indexes, triggers, functions, types and enum labels, rules
    and views, policies, sequences, every ACL item, default ACLs, roles, memberships, role settings and the
    row counts of extensions, publications, subscriptions, casts, operators, access methods, languages,
-   foreign servers, extended statistics and text search) before and after must differ only by new tables
-   with their columns, indexes, constraints, sequences, policies and ACL items, nullable or constant-default
-   columns on existing tables (a literal whose stored expression holds only constants, relabels and
-   built-in immutable casts; a user's cast prints as a literal too and does not count; a default whose
-   printed type name is quoted, such as `'x'::"char"` or a quoted enum, is a known pause: migrate that
-   release by hand) and added ACL items; `probe_metadata` only by `schema_version`;
+   foreign servers, extended statistics and text search) before and after may not lose stored data or
+   break the running release's writes (`destroys_data`, ANYM-743): no removed table, partitioned table,
+   materialized view or column (a rename reads as one and pauses for a hand release), no column whose type
+   or generation expression changed, no new NOT NULL column without a default on an existing table; every
+   other change (indexes, constraints, functions, triggers, views, policies, grants, defaults, roles)
+   passes; `probe_metadata` only by `schema_version`;
    `archive_migrations` only by the pending versions; and no other existing table may show a write in
-   `pg_stat_user_tables`. Its transaction (from `applied_at` to the first read after the container ended)
-   takes at most `rehearsal_limit_ms`. Else the run pauses "not additive: <first difference>" or "too slow
+   `pg_stat_user_tables` or a changed exact row count (a TRUNCATE moves no write counter; ANYM-743) or column number (a column dropped and added again). Its transaction (from `applied_at` to the first read after the container ended)
+   takes at most `rehearsal_limit_ms`. Else the run pauses "not unattended: <first difference>" or "too slow
    for an unattended lock". The copy's release removes and confirms every resource; a killed run leaves
    them to the next run's reconciliation.
 5. Final gate: admission and the producer check again, the live catalog still the copy's (else "the
@@ -2539,7 +2556,9 @@ fix the sync (docs/operations/feedback-triage.md, Hourly sync).
 `python3 scripts/deedkit.py admin key list` (ANYM-494) shows every agent key in one view: one row
 per gateway principal (label, enabled, gateway expiry) with the messaging, calendar and calls
 credential bound to it (public ID, expiry, `live`, `revoked`, `expired`, `missing`, or `unknown`
-when a backend command fails). It reads the gateway policy and the calls registry and runs the
+when a backend command fails). A recordings credential has the same line (ANYM-772): public ID, expiry and `live`,
+`expired` or `missing`, matched by its key hash in the recordings private configuration (the expiry prints in canonical ISO form). It reads the gateway policy
+and the calls registry and runs the
 messaging `list-keys --all` / `key-info` and calendar `list-agents` / `agent-info` operator
 commands (ACCESS.md, `services/calendar/docs/SERVICE.md`); key files reach those commands on
 stdin, never in argv, environment or output. It takes no lock and writes no store or file, so it
@@ -2558,13 +2577,17 @@ expose them): `credential_missing`, `credential_revoked`, `credential_expired`,
 refuses it), `backend_expires_first` (the backend key ends before the gateway entry),
 `shared_credential` (one backend key bound to two or more principals), `unbound_key` (a backend
 key no principal holds, with its status) and `backend_unavailable` (a failed backend command, or
-no calls registry configured while a principal holds a calls key). With `--principal`, the list
+no calls registry configured while a principal holds a calls key). While a principal holds a recordings key, an
+unconfigured or unusable recordings configuration is a `backend_unavailable` finding with `backend: recordings` and
+the row's fixed `note` (`recordings_config_not_configured`, `_unreadable`, `_invalid` or `_duplicate_key`), so
+`--strict` exits 1 and the other rows still print. With `--principal`, the list
 keeps that principal's findings and every `backend_unavailable` of a backend it uses.
 
 The configuration is a private JSON file (`--config`, default
 `/opt/deedkit/deploy/private/admin/config.json`; template `deploy/admin.example.json`): policy
 and calls registry paths, container-to-host path mappings for key files, and the messaging and
-calendar operator command prefixes. Every private file it reads must be a regular, owner-only
+calendar operator command prefixes. The optional `recordings_config` is the absolute host path of the recordings
+private `config.json`, read only, with the rule below and no owner check (its owner is UID 10001). Every private file it reads must be a regular, owner-only
 file (no group or other bits, no symlink). `admin key label ID TEXT` (1–80 printable characters,
 an existing gateway principal) writes the label to `labels.json` beside it, mode 0600, atomically;
 no service reads that file, so the enforced policy never changes.

@@ -16,7 +16,9 @@ after the plan is never overwritten, and D its head plus 15 minutes, so a call c
 reports the skipped differences. `follow` reads Tiden main, the merged pull request whose body delivers the card
 (`Delivers:`) and the release receipts (scripts/receipt_watch.py): a Done card whose commit is LIVE asks the agent to
 re-check (`verify_requested` at the live SHA), a Done card merged but not LIVE is `fixed` at its commit, a card on main
-not yet Done makes a `received` item `accepted`. A status never moves down, and agent verdicts (verified, reopened)
+not yet Done makes a `received` item `accepted`. A `Review` card with a delivering commit moves the same way and its note
+names the open check; a Done card without a `Delivers:` pull request follows only a reviewed entry of
+config/feedback-delivery.json, never a guess from a `Spec:` line (ANYM-764). A status never moves down, and agent verdicts (verified, reopened)
 are never changed. Every write call is recorded in `pending.json` before it is sent and audited to a private file; a
 call with an unknown outcome stops the run, is never retried, and blocks writes until a later inventory shows it
 landed or, read after D + 10 s, that it can no longer land. Runs on the orchestrator machine (Tiden token, gh, git, the owner's SSH); exit 0 done,
@@ -31,7 +33,7 @@ main is reported, never guessed. All reads finish before the first write, and `-
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -73,6 +75,10 @@ SHA = re.compile(r'[0-9a-f]{40}')
 # ANYM-536: the card line that links feedback to it; the ID anywhere else in a card (History, a quote) does not.
 FEEDBACK_LINE = re.compile(r'^Feedback: ({0}(?:, {0})*)[ \t]*\r?$'.format(UUID.pattern), re.MULTILINE)
 FENCE = re.compile(r'^ {0,3}(`{3,}|~{3,})')
+OPEN_CHECK = re.compile(r'\[open: (?:live|measured)\]')  # tiden_sync.OPEN_CHECK: the markers that keep a card in Review
+CHECK_LIMIT = 120
+MAPPING = Path('config') / 'feedback-delivery.json'
+MAPPING_KEYS = {'commit', 'pr', 'evidence', 'added'}
 STALE = timedelta(hours=3)
 # Queue outcomes that close a row: written, already so, newer than its decision, or kept by the never-down rule.
 CLOSED = ('written', 'unchanged', 'superseded', 'further along', 'agent verdict kept')
@@ -220,13 +226,82 @@ def ancestor(root, sha):
     return done.returncode == 0
 
 
-def delivering(refs, root=ROOT, fetch=True, gh=None):
-    """card -> the merge commit of the one merged pull request whose body delivers it, on origin/main; a card with
-    none or more than one such pull request is absent (no change)."""
-    if fetch:
+class Pairs(list):
+    """A JSON object as its key-value pairs, so that a repeated key is seen."""
+
+
+def entry_problem(entry):
+    values = dict(entry) if isinstance(entry, Pairs) else {}
+    if set(values) != MAPPING_KEYS or len(values) != len(entry):
+        return 'needs exactly commit, pr, evidence, added'
+    if not (isinstance(values['commit'], str) and SHA.fullmatch(values['commit'])):
+        return 'commit is not 40 hex'
+    if type(values['pr']) is not int or values['pr'] < 1:
+        return 'pr is not a number'
+    if not (isinstance(values['evidence'], str) and note_ok(values['evidence'])):
+        return 'evidence is not one line'
+    try:
+        date.fromisoformat(values['added'])
+    except (TypeError, ValueError):
+        return 'added is not a date'
+    return None
+
+
+def mapping_load(root):
+    """(card -> entry, card -> why its entry is refused) of the reviewed file; no file is no mapping. A bad entry holds
+    only its card; a file that cannot be read as card entries is a failed read, which stops the run before any write."""
+    path = root / MAPPING
+    if not path.exists():
+        return {}, {}
+    try:
+        raw = json.loads(path.read_text(), object_pairs_hook=Pairs)
+    except (OSError, ValueError):
+        raise Refused(f'mapping refused: {MAPPING} is not JSON') from None
+    if not isinstance(raw, Pairs) or not all(SPEC.fullmatch(key) for key, _ in raw):
+        raise Refused(f'mapping refused: {MAPPING} is not an object of ANYM-n entries')
+    names = [key for key, _ in raw]
+    entries, refused = {}, {}
+    for key, value in raw:
+        why = 'two entries for the card' if names.count(key) > 1 else entry_problem(value)
+        if why:
+            refused[key] = why
+        else:
+            entries[key] = dict(value)
+    return entries, refused
+
+
+def mapping_problem(ref, entry, root, gh):
+    """Why a well-formed entry of a Done card without a `Delivers:` pull request does not hold, or None."""
+    if not ancestor(root, entry['commit']):
+        return 'the commit is not on origin/main'
+    reply = triage.parse(gh(['gh', 'pr', 'list', '-R', REPO, '--state', 'all', '--search', f'"{ref}" in:body', '--json',
+                             'number,state,body,mergeCommit', '--limit', str(PR_LIMIT)]), 'gh pr list')
+    if not isinstance(reply, list) or len(reply) >= PR_LIMIT:
+        raise Refused(f'gh pr list: unexpected or truncated reply for {ref}')
+    number = entry['pr']
+    found = [pr for pr in reply if isinstance(pr, dict) and pr.get('number') == number]
+    if not found:
+        return f'pull request #{number} does not name the card'
+    if found[0].get('state') != 'MERGED':
+        return f'pull request #{number} is not merged'
+    if (found[0].get('mergeCommit') or {}).get('oid') != entry['commit']:
+        return f'pull request #{number} merged with another commit'
+    body = found[0].get('body')
+    if int(ref.removeprefix('ANYM-')) not in tiden_pr_check.parse_body(body if isinstance(body, str) else '').spec:
+        return f'pull request #{number} has no Spec: line naming the card'
+    return None
+
+
+def delivering(refs, status, root=ROOT, fetch=True, gh=None):
+    """(card -> the commit to follow, card -> the pull request of its mapping entry, card -> why its entry is refused).
+    The commit is the merge commit of the one merged pull request whose body delivers the card, on origin/main, or that
+    of a mapping entry that holds; a card with none or more than one such pull request is absent (no change)."""
+    entries, refused = mapping_load(root)
+    refused |= {ref: 'the card is not Done' for ref in entries if status.get(ref) != 'Done'}
+    if fetch and refs:
         git(root, 'fetch', '-q', 'origin', 'main')
     gh = gh or (lambda argv: triage.run(argv, GIT_TIMEOUT))
-    out = {}
+    out, via = {}, {}
     for ref in sorted(refs):
         reply = triage.parse(gh(['gh', 'pr', 'list', '-R', REPO, '--state', 'merged', '--search',
                                  f'"{ref}" in:body', '--json', 'number,body,mergeCommit',
@@ -235,14 +310,15 @@ def delivering(refs, root=ROOT, fetch=True, gh=None):
             raise Refused(f'gh pr list: unexpected or truncated reply for {ref}')
         shas = {((pr.get('mergeCommit') or {}).get('oid') or '') for pr in reply
                 if isinstance(pr, dict) and ref in delivers(pr.get('body'))}
+        if ref in entries and ref not in refused:
+            why = 'the card has a Delivers: pull request' if shas else mapping_problem(ref, entries[ref], root, gh)
+            if why:
+                refused[ref] = why
+            else:
+                out[ref], via[ref] = entries[ref]['commit'], entries[ref]['pr']
         if len(shas) == 1 and SHA.fullmatch(sha := shas.pop()) and ancestor(root, sha):
             out[ref] = sha
-    return out
-
-
-def cards(read=None):
-    return {spec['ref']: spec['status'] for spec in triage.flatten((read or triage.tiden)('spec', 'list', '--branch', 'main'),
-                                                                   'main')}
+    return out, via, refused
 
 
 def live_probe(host, root=ROOT, probe=None):
@@ -272,34 +348,55 @@ def decide(now, target):
     return target, 'write'
 
 
-def follow_target(now, status, commit, live):
-    """The card-driven target of one item, or (None, reason)."""
+def open_check(text):
+    """What a Review card still waits for: its first marker line outside fences and comments, cut to fit, or "review"."""
+    for line in prose(text):
+        if OPEN_CHECK.search(line):
+            return triage.clean(line, CHECK_LIMIT)
+    return 'review'
+
+
+def follow_target(now, status, commit, live, check=None, via=None, refused=None):
+    """The card-driven target of one item, or (None, reason). `check` is a Review card's open check, `via` the pull
+    request of the mapping entry `commit` comes from, `refused` why the card's entry is refused."""
     ref = now['spec_ref']
     if not ref:
         return None, 'no card'
     if now['status'] in (*AGENT_VERDICTS, 'declined', 'duplicate'):
         return None, f'{now["status"]} kept'
+    if (now.get('note') or '').startswith(triage.HOLD):
+        return None, 'opt-in hold'
     if status is None:
         return None, 'card not on main'
-    if status != 'Done':
-        if now['status'] != 'received':
-            return None, 'card not delivered'
+    if now['status'] == 'verify_requested' and status in ('Done', 'Review'):
+        return None, 'already verify_requested'  # the first live SHA stays, also when Review later becomes Done
+    if refused:  # before every transition that writes: a refused entry writes nothing for its card
+        return None, f'mapping refused: {refused}'
+    if now['status'] == 'received' and status != 'Done':
         return dict(now, status='accepted', note=f'Accepted as {ref}; it follows that card.'), 'card accepted'
+    if status not in ('Done', 'Review') or (status == 'Review' and commit is None):
+        return None, 'card not delivered'
     if commit is None:
         return None, 'no delivering commit on origin/main'
     sha = live(commit)
     if sha:
+        waits = f'; the card still waits for {check or "review"}' if status == 'Review' else ''
         target = dict(now, status='verify_requested', fixed_in='deedkit@' + sha,
-                      note=f'Delivered by {ref}; live in deedkit@{sha[:12]}. Please re-check.')
+                      note=f'Delivered by {ref}; live in deedkit@{sha[:12]}{waits}. Please re-check.')
     else:
         target = dict(now, status='fixed', fixed_in='deedkit@' + commit,
                       note=f'Delivered by {ref} in deedkit@{commit[:12]}; not live yet.')
     # follow only moves forward: a second deploy never rewrites an earlier fixed_in.
-    return (target, 'card delivered') if RANK[target['status']] > RANK[now['status']] else (None, 'already ' + now['status'])
+    moved = f'delivered by mapping (#{via})' if via else 'card delivered, still in Review' if status == 'Review' else 'card delivered'
+    return (target, moved) if RANK[target['status']] > RANK[now['status']] else (None, 'already ' + now['status'])
 
 
 def settled(now, since):
     return now['changed_at'] is None or now['changed_at'] <= datetime.fromisoformat(since)
+
+
+def checks_of(main):
+    return {spec['ref']: open_check(spec['text']) for spec in main if spec['status'] == 'Review'}
 
 
 def plan_apply(state_now, targets, since):
@@ -311,10 +408,13 @@ def plan_apply(state_now, targets, since):
     return rows
 
 
-def plan_follow(state_now, card_status, commits, live, since):
+def plan_follow(state_now, card_status, delivered, live, since, checks=None):
+    commits, via, refused = delivered
     rows = []
     for i, now in sorted(state_now.items()):
-        target, reason = follow_target(now, card_status.get(now['spec_ref']), commits.get(now['spec_ref']), live)
+        ref = now['spec_ref']
+        target, reason = follow_target(now, card_status.get(ref), commits.get(ref), live, (checks or {}).get(ref),
+                                       via.get(ref), refused.get(ref))
         if target is not None:
             chosen, why = decide(now, target)
             target, reason = (chosen, reason) if chosen else (None, why)
@@ -325,7 +425,7 @@ def plan_follow(state_now, card_status, commits, live, since):
 
 
 def wanted(state_now, since):
-    """The cards `follow` asks GitHub about: Done cards of items it could still move."""
+    """The cards of items `follow` could still move; it asks GitHub about the Done and Review ones."""
     return {now['spec_ref'] for now in state_now.values() if now['spec_ref'] and settled(now, since)
             and now['status'] in ('received', 'accepted', 'fixed')}
 
@@ -680,10 +780,10 @@ def auto_run(args, ssh, read, live, gh, run, root, fetch, report):
     cards_of = links(main)
     linked = plan_link(state_now, cards_of, since, busy)
     rest = {i: now for i, now in state_now.items() if i not in busy | {row[0] for row in linked}}
-    refs = {ref for ref in wanted(rest, since) if status.get(ref) == 'Done'}
+    refs = {ref for ref in wanted(rest, since) if status.get(ref) in ('Done', 'Review')}
     followed = []
-    for i, now, target, reason in plan_follow(rest, status, delivering(refs, root, fetch, gh) if refs else {},
-                                              live or live_probe(args.host, root), since):
+    for i, now, target, reason in plan_follow(rest, status, delivering(refs, status, root, fetch, gh),
+                                              live or live_probe(args.host, root), since, checks_of(main)):
         if reason == 'card not on main' and now['status'] in ('received', 'accepted'):
             reason = 'card missing' if now['spec_ref'] in known['seen'] else 'waiting for main'
             if reason == 'waiting for main':
@@ -822,10 +922,11 @@ def main(argv=None, ssh=None, read=None, live=None, gh=None, run=remote_write, r
             if args.action == 'apply':
                 rows = plan_apply(state_now, targets, since)
             else:
-                status = cards(read)
-                refs = {ref for ref in wanted(state_now, since) if status.get(ref) == 'Done'}
-                rows = plan_follow(state_now, status, delivering(refs, root, fetch, gh),
-                                   live or live_probe(args.host, root), since)
+                main_specs = triage.flatten((read or triage.tiden)('spec', 'list', '--branch', 'main'), 'main')
+                status = {spec['ref']: spec['status'] for spec in main_specs}
+                refs = {ref for ref in wanted(state_now, since) if status.get(ref) in ('Done', 'Review')}
+                rows = plan_follow(state_now, status, delivering(refs, status, root, fetch, gh),
+                                   live or live_probe(args.host, root), since, checks_of(main_specs))
             writes = show(rows)
             if writes and not args.apply:
                 print('dry run: nothing written (add --apply)')
