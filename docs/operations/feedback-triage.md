@@ -183,9 +183,9 @@ logged-in macOS session. A run missed in sleep runs once on wake (launchd `Start
 run first pulls: a `git fetch` cut at 120 s (exit 124), then a local `git merge --ff-only`, which is
 never cut, so the job runs current `main` without a hand step. A pull that fails writes `git pull
 failed (exit <n>)` to `launchd.err.log` and the run still syncs the code the checkout has. A checkout
-whose tracked files differ from its `HEAD` (an interrupted update, a hand edit) is not one revision:
-the run writes `the checkout is not clean` there, exits 1 and syncs nothing until it is cleaned by
-hand. Install outside Git, in
+with a tracked change, an untracked file that Git does not ignore or a stale `index.lock` (an
+interrupted update, a hand edit) is not one revision: the run writes `the checkout is not clean`
+there, exits 1 and syncs nothing until it is cleaned by hand. Install outside Git, in
 `~/Library/LaunchAgents/ai.deedkit.feedback-follow.plist`, with your absolute paths:
 
 ```xml
@@ -195,7 +195,7 @@ hand. Install outside Git, in
   <key>Label</key><string>ai.deedkit.feedback-follow</string>
   <key>ProgramArguments</key><array>
     <string>/bin/sh</string><string>-c</string>
-    <string>{ timeout 120 git fetch -q origin main &amp;&amp; git merge --ff-only origin/main; } || echo "git pull failed (exit $?) at $(date -u +%FT%TZ); this run syncs the current code" &gt;&amp;2; git diff --quiet HEAD || { echo "the checkout is not clean at $(date -u +%FT%TZ); no sync" &gt;&amp;2; exit 1; }; exec /Users/OWNER/.local/bin/uv run --no-project --python 3.13 python scripts/feedback_sync.py auto --apply</string>
+    <string>{ timeout 120 git fetch -q origin main &amp;&amp; git merge --ff-only origin/main; } || echo "git pull failed (exit $?) at $(date -u +%FT%TZ); this run syncs the current code" &gt;&amp;2; { changes=$(git status --porcelain) &amp;&amp; test -z "$changes" &amp;&amp; test ! -e "$(git rev-parse --git-path index.lock)"; } || { echo "the checkout is not clean at $(date -u +%FT%TZ); no sync" &gt;&amp;2; exit 1; }; exec /Users/OWNER/.local/bin/uv run --no-project --python 3.13 python scripts/feedback_sync.py auto --apply</string>
   </array>
   <key>WorkingDirectory</key><string>/Users/OWNER/CHECKOUT</string>
   <key>EnvironmentVariables</key><dict>

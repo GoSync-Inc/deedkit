@@ -665,6 +665,28 @@ def test_live_that_runs_out_of_budget_refuses_and_never_reads_as_not_live(tmp_pa
 
 
 # spec: ANYM-473
+def test_an_unknown_serving_attempt_refuses_only_a_commit_it_could_change(tmp_path):
+    root, shas = repo(tmp_path, ['delivered', 'plan'])
+    plan, later = shas['plan'], git(root, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit-tree', '-m',
+                                    'later', '-p', shas['plan'], git(root, 'rev-parse', 'HEAD^{tree}'))
+    snapshot = {'plan_a': {'sha': plan, 'status': 'applied'}, 'http': {'sha': plan, 'status': 'serving'}, 'deploy': None,
+                'pause': {'present': False, 'reason': None}, 'unresolved': [], 'served': ['e' * 40]}
+    live = sync.live_probe('deedkit-prod', root, lambda host: snapshot)
+    assert live(later) is None  # git proves the production receipts do not contain it
+    with pytest.raises(sync.Refused, match='could not tell'):
+        live(shas['delivered'])
+
+
+# spec: ANYM-473
+def test_a_commit_git_does_not_know_refuses(tmp_path):
+    root, shas = repo(tmp_path, ['plan'])
+    snapshot = {'plan_a': {'sha': shas['plan'], 'status': 'applied'}, 'http': {'sha': shas['plan'], 'status': 'serving'},
+                'deploy': None, 'pause': {'present': False, 'reason': None}, 'unresolved': [], 'served': []}
+    with pytest.raises(sync.Refused, match='could not tell'):
+        sync.live_probe('deedkit-prod', root, lambda host: snapshot)('e' * 40)
+
+
+# spec: ANYM-473
 def test_an_exhausted_budget_stops_the_run_before_an_accepted_item_is_written_fixed(tmp_path, monkeypatch):
     root, shas = repo(tmp_path, ['delivered', 'plan'])
     gh, _ = pull_requests({'ANYM-10': [(1, 'Delivers: ANYM-10', shas['delivered'])]})
@@ -1196,12 +1218,13 @@ def launch_agent(tmp_path, checkout=None, **exits):
 
 SYNC_RUN = 'uv run --no-project --python 3.13 python scripts/feedback_sync.py auto --apply'
 PULL = ['timeout 120', 'git fetch -q origin main', 'git merge --ff-only origin/main']
+CLEAN = ['git status --porcelain', 'git rev-parse --git-path index.lock']
 
 
 # spec: ANYM-536
 def test_the_launch_agent_pulls_the_checkout_before_the_sync_and_never_waits_on_a_prompt(tmp_path):
     agent, done, ran = launch_agent(tmp_path)
-    assert ran == [*PULL, 'git diff --quiet HEAD', SYNC_RUN]
+    assert ran == [*PULL, *CLEAN, SYNC_RUN]
     assert done.returncode == 7 and done.stderr == ''  # the sync's own exit code is launchd's
     assert agent['EnvironmentVariables']['GIT_TERMINAL_PROMPT'] == '0'
 
@@ -1210,7 +1233,7 @@ def test_the_launch_agent_pulls_the_checkout_before_the_sync_and_never_waits_on_
 @pytest.mark.parametrize('failure,code,steps', [('fetch', 124, PULL[:2]), ('merge', 3, PULL)])
 def test_a_failed_pull_is_logged_with_its_exit_code_and_the_sync_of_the_current_code_still_runs(tmp_path, failure, code, steps):
     _, done, ran = launch_agent(tmp_path, **{failure: code})
-    assert ran == [*steps, 'git diff --quiet HEAD', SYNC_RUN]
+    assert ran == [*steps, *CLEAN, SYNC_RUN]
     assert done.returncode == 7 and f'git pull failed (exit {code})' in done.stderr
 
 
@@ -1245,9 +1268,10 @@ def test_the_launch_agent_moves_a_clean_checkout_to_main_before_the_sync_with_re
 
 
 # spec: ANYM-536
-def test_a_checkout_left_partly_updated_never_reaches_the_sync(tmp_path):
+@pytest.mark.parametrize('leftover', ['f.py', 'new_module.py', '.git/index.lock'])
+def test_a_checkout_left_partly_updated_never_reaches_the_sync(tmp_path, leftover):
     publish, job, _ = checkout_of_a_moving_main(tmp_path)
-    (job / 'f.py').write_text('half of an interrupted update')
+    (job / leftover).write_text('left by an interrupted update')
     publish('two')
     _, done, ran = launch_agent(tmp_path, checkout=job)
     assert SYNC_RUN not in ran and done.returncode == 1 and 'the checkout is not clean' in done.stderr

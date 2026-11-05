@@ -201,8 +201,8 @@ def short(state: dict | None) -> str:
 
 class Watch:
     def __init__(self, sha: str, root: Path, left, known: dict | None = None):
-        """`known` keeps ancestry answers across the Watches of one snapshot; `undecided` says a relation stayed unknown,
-        so a None verdict is "cannot tell", not "not live"."""
+        """`known` keeps ancestry answers across the Watches of one snapshot; `undecided` says the last None verdict means
+        "cannot tell", not "not live"."""
         self.sha, self.root, self.left, self.fetched = sha, root, left, False
         self.known, self.undecided = {} if known is None else known, False
 
@@ -231,12 +231,6 @@ class Watch:
         return answer
 
     def related(self, older: str, newer: str) -> bool | None:
-        """`lookup`, remembering that a relation stayed unknown."""
-        answer = self.lookup(older, newer)
-        self.undecided = self.undecided or answer is None
-        return answer
-
-    def lookup(self, older: str, newer: str) -> bool | None:
         """`ancestry`, with one fetch per run when a commit is unknown; the answer is read again after the fetch."""
         answer = self.ancestry(older, newer)
         if answer is None and not self.fetched:
@@ -274,7 +268,10 @@ class Watch:
                 unresolved.append(name + ":http-unpublished")
             unknown = unknown or related is None
         applied = plan.get("status") == "applied" and http.get("status") in ("serving", "serving-retirement-pending")
-        both = applied and self.reaches(plan) is True and self.reaches(http) is True
+        reached = [self.reaches(plan), self.reaches(http)] if applied else [False]
+        both = all(item is True for item in reached)
+        # A receipt proven not to contain the SHA decides "not live", whatever else git could not answer.
+        self.undecided = False not in reached and (not both or unknown)
         if both and unknown:
             return None
         if both and not pause["present"] and not unresolved:
