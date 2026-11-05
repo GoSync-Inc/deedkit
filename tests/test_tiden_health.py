@@ -1960,6 +1960,9 @@ def test_the_job_token_reaches_the_report_step_alone_and_the_lookup_names_the_re
 def test_the_workflow_is_not_a_required_check():
     ruleset = (ROOT / "deploy/main-ruleset.json").read_text()
     assert "Tiden health" not in ruleset and "tiden-health" not in ruleset
+    # reads: .github/workflows/ci.yml
+    # reads: .github/workflows/checks.yml
+    # reads: scripts/production.py
     for path in (".github/workflows/ci.yml", ".github/workflows/checks.yml", "scripts/production.py"):
         text = (ROOT / path).read_text()
         assert "tiden-health" not in text and "tiden_health" not in text and "Tiden health" not in text

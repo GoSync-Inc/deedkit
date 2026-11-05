@@ -343,7 +343,17 @@ matches `*.md` or `.claude/**` and none of the deny rules in
 `scripts/docs_only.py`: `README.md` in any directory, `SETUP.md`,
 `THIRD_PARTY_NOTICES.md`, `TELEMETRY.md`, license texts (`LICENSE*`, `COPYING*`,
 `licenses/**`) and everything under `services/`, `packages/` and `whatsapp/`.
-Those are the Markdown files code reads, packages or ships. A pull request run
+Those are the Markdown files code reads, packages or ships. A document that a
+test file of the classified commit names is not documentation for this rule
+either (ANYM-767): `scripts/docs_only.py` scans `tests/`, `test/`, `conftest.py`,
+`*_test.go` and `scripts/check_*.py` without running them, and the job summary
+names the document and its first reader. The result is computed from literal and
+prefix reads, not a complete dependency check: a path with a non-literal part, a
+glob or a directory walk counts as reading every document under its longest
+literal directory, until a `# reads: <repository path>` comment line above that
+statement names what it reads (a comment naming no tracked file fails a test). A
+read through a helper in another module or through non-test code is not seen. A
+scan that fails or takes over 20 seconds means full verification. A pull request run
 classifies GitHub's two-parent merge of exactly this head against the base; a
 merge queue run classifies its group commit against its first parent, which
 must be the group's base. Any of these means full verification: a mode or type
@@ -357,8 +367,8 @@ keep their rules, and `checks / tiden` records a skipped route with the reason.
 Main pushes, dispatch runs and package releases never take this path. The main
 push of a docs-only group finds no queue run whose `checks / verify` passed, so
 it verifies in full, and `production.py verify` accepts no commit without that
-green push run. A document a test reads therefore reaches `main` untested only
-until its push run, which then fails and needs a fix forward. Editing a pull
+green push run. A document only such an unseen read uses therefore reaches `main`
+untested only until its push run, which then fails and needs a fix forward. Editing a pull
 request description does not rerun CI, and a rerun reuses the captured event, so
 adding a `Tiden intent branch:` line later needs a new push.
 

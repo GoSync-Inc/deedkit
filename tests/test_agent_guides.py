@@ -11,6 +11,8 @@ def flat(text: str) -> str:
 
 
 def section(path: str, heading: str) -> str:
+    # reads: CONVERSATION.md
+    # reads: SENDING.md
     text = (ROOT / path).read_text(encoding='utf-8')
     level = heading.split(' ', 1)[0]
     match = re.search(rf'^{re.escape(heading)}\n(.*?)(?=^#{{1,{len(level)}}} |\Z)', text, re.M | re.S)

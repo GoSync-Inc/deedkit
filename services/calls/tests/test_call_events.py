@@ -266,6 +266,8 @@ def test_the_closed_cause_list_is_the_one_the_calls_code_the_readme_and_subscrip
     assert code == set(call_events.PROVIDER_CAUSES)
     root = Path(__file__).resolve().parents[3]
     def table(path, heading):
+        # reads: services/calls/README.md
+        # reads: SUBSCRIPTIONS.md
         text = (root / path).read_text()
         section = text[text.index(heading):]
         rows = []

@@ -6,6 +6,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 
 
+# reads: docs/plans/cross-module-subscriptions.md
+# reads: docs/quality/merge-queue-dequeues-2026-10-29.md
 def sections(path: str) -> dict[str, str]:
     text = (ROOT / path).read_text(encoding='utf-8')
     return {match.group(1): ' '.join(match.group(2).split())

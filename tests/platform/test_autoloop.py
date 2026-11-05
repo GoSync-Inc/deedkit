@@ -1837,6 +1837,8 @@ def sql_change(migrations=(), roles=(), other=()):
                           sha=hashlib.sha1(body.encode()).hexdigest()))
         texts[(path, H1)] = body
     for path, added in roles:
+        # reads: services/messaging/messaging_service/gateway_role.sql
+        # reads: services/calendar/family_calendar/service/roles.sql
         base = (ROOT / path).read_text()
         files.append(dict(changed_file(path, 'modified', ''.join('+' + row for row in added.splitlines(True))),
                           sha=hashlib.sha1((base + added).encode()).hexdigest()))
@@ -1936,6 +1938,7 @@ def test_any_other_sql_or_grant_still_waits_for_the_owner(case):
             [(MIGRATION, '-- rollout: expand\nCREATE TABLE ' + 'public.' * 5000 + 'widget_notes (id bigint);\n')]),
     }[case]
     if case == 'role file rewritten':  # a changed line before the appended GRANT: not an append
+        # reads: services/messaging/messaging_service/gateway_role.sql
         base = (ROOT / ROLE).read_text()
         files.append(changed_file(ROLE, 'modified', '+' + table_grant))
         texts[(ROLE, MERGE_BASE)], texts[(ROLE, H1)] = base, base.replace('GRANT', 'GRANT ', 1) + table_grant
