@@ -20,6 +20,7 @@ from pathlib import Path
 import re
 import socket
 import struct
+import sys
 import threading
 import time
 from typing import Annotated
@@ -432,15 +433,20 @@ def local_ipv4():
 
 def main_sockets(host, port, environ=None, addresses=local_ipv4, resolve=socket.gethostbyname):
     """Sockets for the main listener on every address but the hint channel's, so the receiver's bridge holds no main listener whatever
-    the host's firewall does. None means the plain bind: no hint listener configured, a specific host, or an address that cannot be
-    read. The main API keeps serving then, and the receiver's `Isolation` sees the listener and stays closed."""
+    the host's firewall does. None means the plain bind: no hint listener configured, or a specific host. With a hint listener and a
+    wildcard host, an exclusion that cannot be established refuses the start with egress admission's exit (the same fail-closed start,
+    and `restart: unless-stopped` retries it): a wildcard bind from one bad start would stay until the next restart."""
     value = (os.environ if environ is None else environ).get(LISTEN_ENV)
-    if not value or host != '0.0.0.0':
+    if not value or host not in ('0.0.0.0', '::', ''):
         return None
     made = []
     try:
-        hint_address = resolve(value.rpartition(':')[0])
-        for address in addresses():
+        if host != '0.0.0.0':
+            raise OSError('not the IPv4 wildcard')
+        hint_address, local = resolve(value.rpartition(':')[0]), addresses()
+        if hint_address not in local:
+            raise OSError('the hint address is not on this container')
+        for address in local:
             if address != hint_address:
                 listening = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 made.append(listening)
@@ -452,8 +458,8 @@ def main_sockets(host, port, environ=None, addresses=local_ipv4, resolve=socket.
     except (OSError, UnicodeError):
         for listening in made:
             listening.close()
-        print('main_listener plain_bind', flush=True)
-        return None
+        print('main_listener refused', file=sys.stderr, flush=True)
+        raise SystemExit(admission.EXIT_CODE) from None
 
 
 class Listener:

@@ -444,14 +444,57 @@ def test_the_main_listener_has_no_socket_on_the_hint_address_and_serves_the_othe
 
 
 # spec: ANYM-760
-def test_without_a_hint_listener_or_with_an_unreadable_address_the_main_bind_stays_plain(capfd):
+def test_without_a_hint_listener_or_on_a_specific_host_the_main_bind_stays_plain():
     assert hint.main_sockets('0.0.0.0', 1, {}) is None
     assert hint.main_sockets('127.0.0.1', 1, {hint.LISTEN_ENV: 'a:1'}) is None
 
-    def broken(name):
-        raise OSError('no name')
-    assert hint.main_sockets('0.0.0.0', 1, {hint.LISTEN_ENV: 'a:1'}, lambda: ['127.0.0.1'], broken) is None
-    assert capfd.readouterr().out == 'main_listener plain_bind\n'
+
+def _no_name(name):
+    raise OSError('no name')
+
+
+def _no_addresses():
+    raise OSError('no ioctl')
+
+
+# spec: ANYM-760
+@pytest.mark.parametrize('host, addresses, resolve', [
+    ('0.0.0.0', lambda: ['127.0.0.1'], _no_name),
+    ('0.0.0.0', _no_addresses, lambda name: '127.0.0.2'),
+    ('0.0.0.0', lambda: ['127.0.0.1'], lambda name: '192.0.2.10'),
+    ('0.0.0.0', lambda: ['127.0.0.2'], lambda name: '127.0.0.2'),
+    ('::', lambda: ['127.0.0.1'], lambda name: '127.0.0.1'),
+], ids=['unresolved', 'unreadable', 'not_local', 'nothing_else', 'ipv6_wildcard'])
+def test_an_exclusion_it_cannot_establish_refuses_the_start_and_never_binds_the_wildcard(capfd, host, addresses, resolve):
+    with pytest.raises(SystemExit) as refused:
+        hint.main_sockets(host, 1, {hint.LISTEN_ENV: 'a:1'}, addresses, resolve)
+    assert refused.value.code == hint.admission.EXIT_CODE
+    assert capfd.readouterr().err == 'main_listener refused\n'
+
+
+# spec: ANYM-760
+@pytest.mark.skipif(sys.platform != 'linux', reason='all of 127.0.0.0/8 is local only on Linux')
+def test_a_bind_failure_on_one_address_closes_the_others_and_refuses_the_start():
+    with socket.socket() as taken:
+        taken.bind(('127.0.0.1', 0))
+        taken.listen(1)
+        port = taken.getsockname()[1]
+        with pytest.raises(SystemExit):
+            hint.main_sockets('0.0.0.0', port, {hint.LISTEN_ENV: 'a:1'}, lambda: ['127.0.0.3', '127.0.0.1', '127.0.0.2'], lambda name: '127.0.0.2')
+        with socket.socket() as again:  # the first socket was closed, so the address is free again
+            again.bind(('127.0.0.3', port))
+
+
+# spec: ANYM-760
+def test_the_backend_command_refuses_before_it_serves_when_the_exclusion_fails(monkeypatch):
+    monkeypatch.setenv(hint.LISTEN_ENV, '192.0.2.10:13235')
+    monkeypatch.delenv('RECORDINGS_EGRESS_ADMISSION', raising=False)
+    served = []
+    monkeypatch.setattr('uvicorn.run', lambda *args, **kwargs: served.append(args))
+    monkeypatch.setattr('uvicorn.Server.run', lambda *args, **kwargs: served.append(args))
+    with pytest.raises(SystemExit) as refused:
+        cli.main(['--config', '/nonexistent/config.json', '--host', '0.0.0.0'])
+    assert refused.value.code == hint.admission.EXIT_CODE and not served
 
 
 # spec: ANYM-760
@@ -1520,6 +1563,121 @@ def test_on_real_bridges_the_receiver_opens_only_the_channel_and_the_proxy_only_
             assert f'{phase} {name}=fail' in lines, (phase, name, result.stdout)
 
 
+MAIN_HELPER = """import select, socket, sys, time
+from deedkit_recordings import hint
+sockets = hint.main_sockets('0.0.0.0', int(sys.argv[1]), {hint.LISTEN_ENV: sys.argv[2] + ':13235'})
+print('main_bound ' + ','.join(sorted(s.getsockname()[0] for s in sockets)), flush=True)
+for one in sockets:
+    one.listen(8)
+end = time.monotonic() + 170
+while time.monotonic() < end:
+    for ready in select.select(sockets, [], [], 0.5)[0]:
+        conn = ready.accept()[0]
+        conn.sendall(b'ok')
+        conn.close()
+"""
+# The host as it is (no br_netfilter effect: no iptables rule exists in this namespace and the bridge call is off), the committed table
+# file, and the real `main_sockets` on the backend's real interfaces. Backend .2 on the hint bridge (10.78.0.0/24) and on a third bridge
+# (10.80.0.0/24, standing for its backend network, with a gateway at .3); receiver .3 and proxy .2 as above. Port 13234 is a wildcard
+# listener, the plain bind the table must hold against; 13334 is the main listener as `main_sockets` makes it. Exit 77: cannot build.
+BRIDGE_TABLE_TOPOLOGY = """
+[ -e /proc/sys/net/bridge/bridge-nf-call-iptables ] && sysctl -qw net.bridge.bridge-nf-call-iptables=0 || true
+ip link set lo up || exit 77
+for bridge in dk-rechint0:10.78.0.1 dk-rechook0:10.79.0.1 dk-recbackend0:10.80.0.1; do
+  ip link add ${bridge%:*} type bridge && ip link set ${bridge%:*} up && ip addr add ${bridge#*:}/24 dev ${bridge%:*} || exit 77
+done
+unshare -n sleep 190 >/dev/null 2>&1 &
+API=$!
+unshare -n sleep 190 >/dev/null 2>&1 &
+REC=$!
+unshare -n sleep 190 >/dev/null 2>&1 &
+PROXY=$!
+unshare -n sleep 190 >/dev/null 2>&1 &
+GW=$!
+sleep 0.5
+ip link add vapi type veth peer name vapi1 && ip link add vapib type veth peer name vapib1 && ip link add vgw type veth peer name vgw1 || exit 77
+ip link add vrech type veth peer name vrech1 && ip link add vproxy type veth peer name vproxy1 && ip link add vrecp type veth peer name vrecp1 || exit 77
+ip link set vapi1 netns $API && ip link set vapib1 netns $API && ip link set vgw1 netns $GW || exit 77
+ip link set vrech1 netns $REC && ip link set vrecp1 netns $REC && ip link set vproxy1 netns $PROXY || exit 77
+for port in vapi vrech; do ip link set $port master dk-rechint0 && ip link set $port up || exit 77; done
+for port in vproxy vrecp; do ip link set $port master dk-rechook0 && ip link set $port up || exit 77; done
+for port in vapib vgw; do ip link set $port master dk-recbackend0 && ip link set $port up || exit 77; done
+nsenter -t $API -n sh -c 'ip addr add 10.78.0.2/24 dev vapi1 && ip link set vapi1 up && ip addr add 10.80.0.2/24 dev vapib1 && ip link set vapib1 up && ip link set lo up' || exit 77
+nsenter -t $REC -n sh -c 'ip addr add 10.78.0.3/24 dev vrech1 && ip link set vrech1 up && ip addr add 10.79.0.3/24 dev vrecp1 && ip link set vrecp1 up && ip link set lo up' || exit 77
+nsenter -t $PROXY -n sh -c 'ip addr add 10.79.0.2/24 dev vproxy1 && ip link set vproxy1 up && ip link set lo up' || exit 77
+nsenter -t $GW -n sh -c 'ip addr add 10.80.0.3/24 dev vgw1 && ip link set vgw1 up && ip link set lo up' || exit 77
+nft -c -f @TABLE@ || exit 77
+for port in 13234 13235 13240; do nsenter -t $API -n python3 @HELPER@ serve $port >/dev/null 2>&1 & done
+nsenter -t $API -n env PYTHONPATH=@SOURCE@ @PYTHON@ @MAIN@ 13334 10.78.0.2 &
+nsenter -t $REC -n python3 @HELPER@ serve 13236 >/dev/null 2>&1 &
+nsenter -t $PROXY -n python3 @HELPER@ serve 443 >/dev/null 2>&1 &
+probe() { if nsenter -t $2 -n python3 @HELPER@ connect $3 $4; then echo "$5 $1=ok"; else echo "$5 $1=fail"; fi; }
+probes() {
+  probe channel $REC 10.78.0.2 13235 $1
+  probe proxy_to_receiver $PROXY 10.79.0.3 13236 $1
+  probe plain_main $REC 10.78.0.2 13234 $1
+  probe other_port $REC 10.78.0.2 13240 $1
+  probe proxy_public $REC 10.79.0.2 443 $1
+  probe backend_to_receiver $API 10.78.0.3 13236 $1
+  probe excluded_main $REC 10.78.0.2 13334 $1
+  probe gateway_path $GW 10.80.0.2 13334 $1
+  probe health $API 127.0.0.1 13334 $1
+}
+for wait in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  if nsenter -t $GW -n python3 @HELPER@ connect 10.80.0.2 13334; then break; fi
+  sleep 0.5
+done
+probes baseline
+nft -f @TABLE@
+probes loaded
+nft -f @TABLE@
+probes reloaded
+nft delete table bridge deedkit_rechint
+probes removed
+kill $API $REC $PROXY $GW 2>/dev/null || true
+kill $(jobs -p) 2>/dev/null || true
+"""
+
+
+# spec: ANYM-760
+def test_on_real_bridges_without_br_netfilter_the_committed_table_and_the_listeners_hold_also_after_a_reload_and_a_removal(tmp_path):
+    if not namespace_ready() or not shutil.which('nft'):
+        if os.environ.get('GITHUB_ACTIONS'):
+            pytest.fail('the bridge table must be proven in CI: sudo, unshare, nsenter, ip, iptables-restore or nft is missing')
+        pytest.skip('needs sudo, unshare, nsenter, ip and nft on Linux')
+    helper, main = tmp_path / 'net.py', tmp_path / 'main.py'
+    helper.write_text(NET_HELPER)
+    main.write_text(MAIN_HELPER)
+    text = BRIDGE_TABLE_TOPOLOGY
+    for name, value in (('HELPER', helper), ('TABLE', ROOT / 'deploy/recordings-hint-bridge.nft'), ('SOURCE', ROOT / 'services/recordings/src'),
+                        ('PYTHON', sys.executable), ('MAIN', main)):
+        text = text.replace(f'@{name}@', str(value))
+    result = subprocess.run(['sudo', '-n', 'unshare', '-n', 'sh', '-ec', text], text=True, capture_output=True, timeout=240)
+    if result.returncode == 77:
+        if os.environ.get('GITHUB_ACTIONS'):
+            pytest.fail('the bridge table must be proven in CI: this runner cannot build it: ' + result.stderr)
+        pytest.skip('this environment cannot build the bridges or load the bridge table')
+    assert result.returncode == 0, result.stderr
+    lines = set(result.stdout.split('\n'))
+    # The real SIOCGIFCONF read and the real exclusion: every interface but the hint address.
+    assert 'main_bound 10.80.0.2,127.0.0.1' in lines, result.stdout
+    # What the table does: the channel and the proxy's route pass; everything else on both bridges stops, including a plain main listener.
+    expected = {
+        'baseline': dict(channel='ok', proxy_to_receiver='ok', plain_main='ok', other_port='ok', proxy_public='ok', backend_to_receiver='ok'),
+        'loaded': dict(channel='ok', proxy_to_receiver='ok', plain_main='fail', other_port='fail', proxy_public='fail', backend_to_receiver='fail'),
+        # Removal is the failure the listener layer answers: the same probes open again, which proves the table was what held them.
+        'removed': dict(channel='ok', proxy_to_receiver='ok', plain_main='ok', other_port='ok', proxy_public='ok', backend_to_receiver='ok'),
+    }
+    expected['reloaded'] = expected['loaded']
+    for phase, outcomes in expected.items():
+        for name, outcome in outcomes.items():
+            assert f'{phase} {name}={outcome}' in lines, (phase, name, result.stdout)
+        # In every phase: no main listener on the hint address, and the gateway's path and the healthcheck's address keep answering.
+        assert f'{phase} excluded_main=fail' in lines, (phase, result.stdout)
+        assert f'{phase} gateway_path=ok' in lines, (phase, result.stdout)
+        assert f'{phase} health=ok' in lines, (phase, result.stdout)
+
+
 # spec: ANYM-760
 def test_hint_verify_compares_repository_files_and_kernel_and_reports_a_lost_rule(tmp_path):
     chain = 'DEEDKIT-RECORDINGS-HINT'
@@ -1669,6 +1827,15 @@ def test_the_ingress_plan_states_route_topology_rules_rotation_undo_promotion_an
     readme = (ROOT / 'services/recordings/README.md').read_text()
     assert 'No transcription, model API, paid processing or\ninbound webhook runs' not in readme
     assert 'omi_hint' in readme and 'ANYM-760' in readme
+
+
+# spec: ANYM-760
+def test_the_ingress_plan_shuts_the_proxy_routes_to_the_hook_subnet_apart_from_the_bridge_table():
+    docs = (ROOT / 'docs/operations/production.md').read_text()
+    section = docs[docs.index('### Omi webhook receiver (ANYM-760)'):docs.index('## Image retention')]
+    for needle in ('order abort first', '@recordings_hook remote_ip <hook subnet>', 'abort @recordings_hook', '--interface <PROXY_HOOK_IP>', 'main_listener refused'):
+        assert needle in section, needle
+    assert 'plain_bind' not in section
 
 
 # spec: ANYM-760
