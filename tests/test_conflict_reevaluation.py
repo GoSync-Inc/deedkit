@@ -768,6 +768,52 @@ def test_a_stored_link_conflict_on_a_message_that_moved_on_stays_open_without_st
 
 
 # spec: ANYM-796
+def test_two_link_receipts_of_one_message_in_one_batch_complete_it_once_and_later_rows_still_run(archive):  # noqa: F811
+    from test_archive import linked, native
+    ar, s, _, _ = archive
+    first = link_conflict(ar, s, '1')
+    other = native([linked(url='https://example.invalid/other')])
+    assert n1_archive(s).ingest(event(provider_id='1', origin='backfill', formatting=other))['outcome'] == 'conflict'
+    later = link_conflict(ar, s, '2')
+    assert run(ar, s, None) == 'done'
+    with s.pool.connection() as c:
+        rows = c.execute('SELECT resolved_at,resolved_revision FROM message_conflicts WHERE message=%s ORDER BY observed_at', (first,)).fetchall()
+    assert rows[0]['resolved_revision'] == 2 and rows[1]['resolved_at'] is None and len(link_revisions(s, first)) == 2
+    assert conflicts(s)[later]['resolved_revision'] == 2
+    assert progress(s)['telegram_link_completed']['last_error'] is None
+
+
+# spec: ANYM-796
+def test_a_stored_link_conflict_in_an_excluded_chat_stays_open_and_later_rows_still_run(archive):  # noqa: F811
+    from test_archive import linked, native, LINK
+    ar, s, _, _ = archive
+    ar.register('archive-test', 'telegram', 'Synthetic archive', include_chats=['100', '200'])
+    old = n1_archive(s)
+    excluded = old.ingest(event(provider_id='1', chat='200', formatting=native([], [LINK])))['message']
+    assert old.ingest(event(provider_id='1', chat='200', origin='reconcile', formatting=native([linked()])))['outcome'] == 'conflict'
+    completed = link_conflict(ar, s, '2')
+    ar.register('archive-test', 'telegram', 'Synthetic archive', include_chats=['100'])
+    assert run(ar, s, None) == 'done'
+    rows = conflicts(s)
+    assert rows[excluded]['resolved_at'] is None and rows[completed]['resolved_revision'] == 2
+    assert progress(s)['telegram_link_completed']['last_error'] is None
+
+
+# spec: ANYM-796
+def test_a_replayed_link_receipt_does_not_restore_an_old_chat_title(archive):  # noqa: F811
+    from test_archive import linked, native, LINK
+    ar, s, _, _ = archive
+    old = n1_archive(s)
+    mid = old.ingest(event(provider_id='1', chat_title='Старое', formatting=native([], [LINK])))['message']
+    assert old.ingest(event(provider_id='1', chat_title='Старое', origin='reconcile', formatting=native([linked()])))['outcome'] == 'conflict'
+    ar.ingest(event(provider_id='2', chat_title='Новое', sent_at='2026-10-01T12:00:09+00:00', updated_at='2026-10-01T12:00:09+00:00'))
+    assert run(ar, s, None) == 'done'
+    assert conflicts(s)[mid]['resolved_revision'] == 2
+    with s.pool.connection() as c:
+        assert c.execute("SELECT title FROM chats WHERE provider_chat='100'").fetchone()['title'] == 'Новое'
+
+
+# spec: ANYM-796
 def test_a_crash_between_the_link_revision_and_the_resolve_is_repaired_by_the_next_pass(archive, monkeypatch):  # noqa: F811
     ar, s, _, _ = archive
     mid = link_conflict(ar, s)

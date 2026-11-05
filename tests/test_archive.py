@@ -249,6 +249,41 @@ def test_a_worse_or_equal_reread_of_a_partial_revision_keeps_todays_outcome(arch
     assert revisions(s,mid)[-1]==native([linked()])
 
 
+KEYBOARD_A={'rows':[[{'text':'A','kind':'callback'}]]}
+KEYBOARD_B={'rows':[[{'text':'B','kind':'callback'}]]}
+
+
+# spec: ANYM-796
+@pytest.mark.parametrize('candidate',[{'chat_type':'private'},{'chat_type':'private','buttons':KEYBOARD_B}])
+def test_a_completion_keeps_the_retained_keyboard(archive,candidate):
+    ar,s,key,_=archive
+    mid=ar.ingest(event(formatting=native([],[LINK]),metadata={'chat_type':'private','buttons':KEYBOARD_A}))['message']
+    assert ar.ingest(event(origin='backfill',formatting=native([linked()]),metadata=candidate))['outcome']=='edited'
+    with s.pool.connection() as c:
+        snapshot=c.execute('SELECT snapshot FROM message_revisions WHERE message=%s AND revision=2',(mid,)).fetchone()['snapshot']
+        current=c.execute('SELECT metadata FROM message_metadata WHERE message=%s',(mid,)).fetchone()['metadata']
+    assert snapshot['metadata']['buttons']==KEYBOARD_A and current['buttons']==KEYBOARD_A
+
+
+# spec: ANYM-796
+def test_a_completion_closes_more_than_a_hundred_equal_rows_past_other_formattings(archive):
+    from test_conflict_reevaluation import n1_archive
+    ar,s,_,_=archive
+    old=n1_archive(s)
+    mid=old.ingest(event(formatting=native([],[LINK])))['message']
+    other=native([linked(url='https://example.invalid/other')])
+    for n in range(101):
+        assert old.ingest(event(chat_title=f'Заголовок {n}',origin='reconcile',formatting=other))['outcome']=='conflict'
+    for n in range(101):
+        assert old.ingest(event(chat_title=f'Заголовок {n}',origin='reconcile',formatting=native([linked()])))['outcome']=='conflict'
+    assert ar.ingest(event(origin='backfill',formatting=native([linked()])))['outcome']=='edited'
+    with s.pool.connection() as c:
+        rows=c.execute('''SELECT r.envelope->'formatting' AS formatting,mc.resolved_at FROM message_conflicts mc
+            JOIN ingest_receipts r ON r.digest=mc.receipt_digest WHERE mc.message=%s''',(mid,)).fetchall()
+    assert sum(r['resolved_at'] is not None for r in rows)==101
+    assert all(r['resolved_at'] is None for r in rows if r['formatting']==other)
+
+
 # spec: ANYM-796
 def test_a_completion_needs_the_retained_version_and_content(archive):
     ar,s,_,_=archive

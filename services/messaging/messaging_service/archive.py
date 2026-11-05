@@ -367,7 +367,8 @@ class Archive:
             # A WhatsApp observation that could not be read (kind `unknown`, no text, no attachment)
             # may create its chat but never rewrites the chat's title or type.
             unreadable_shape=whatsapp_unreadable_shape(e)
-            if unreadable_shape:c.execute('''INSERT INTO chats(id,account,title,provider_chat,chat_type)
+            # So does a stored receipt's replay: the chat row may have moved on since (ANYM-796).
+            if unreadable_shape or replay:c.execute('''INSERT INTO chats(id,account,title,provider_chat,chat_type)
                 VALUES(%s,%s,%s,%s,%s) ON CONFLICT(id) DO NOTHING''',(cid,aid,e['chat_title'],e['chat'],chat_type))
             else:c.execute('''INSERT INTO chats(id,account,title,provider_chat,chat_type) VALUES(%s,%s,%s,%s,%s)
                 ON CONFLICT(id) DO UPDATE SET
@@ -399,6 +400,14 @@ class Archive:
              web_preview_refresh,known_candidate,known_retained,old_format,link_completed)=ingest_outcome(old,e,retained_snapshot,sender_alias,
                 effective_buttons(c,mid,old,retained_snapshot))
             if replay and outcome!='edited':raise ValueError('replay_not_accepted')
+            if link_completed and outcome=='edited':
+                # The same provider version: the new revision keeps the retained keyboard, as a same-version
+                # observation does (ANYM-658). Metadata is outside the content hash.
+                kept=effective_buttons(c,mid,old,retained_snapshot)
+                metadata={k:v for k,v in (e.get('metadata') or {}).items() if k!='buttons'}
+                if kept is not None:metadata['buttons']=kept
+                e={k:v for k,v in e.items() if k!='metadata'}
+                if metadata:e['metadata']=metadata
             # An incomplete observation of the same retained provider body must
             # not erase known formatting, including authenticated sender repair.
             inherited_format=bool(old and known_retained and not known_candidate and not e['deleted']
@@ -527,7 +536,7 @@ class Archive:
                     candidates=c.execute('''SELECT mc.receipt_digest,r.envelope FROM message_conflicts mc
                         JOIN ingest_receipts r ON r.digest=mc.receipt_digest
                         WHERE mc.message=%s AND mc.resolved_at IS NULL AND mc.candidate_updated_at=%s
-                        ORDER BY mc.observed_at,mc.receipt_digest LIMIT 100''',(mid,updated)).fetchall()
+                        AND r.envelope->'formatting'=%s::jsonb''',(mid,updated,Jsonb(e['formatting']))).fetchall()
                     same=[r['receipt_digest'] for r in candidates if same_link_completion(r['envelope'],content,e['formatting'])]
                     if same:c.execute('''UPDATE message_conflicts SET resolved_at=clock_timestamp(),'''+resolution_set(c,'link_completed')+'''
                         resolved_revision=%s WHERE message=%s AND receipt_digest=ANY(%s) AND resolved_at IS NULL''',

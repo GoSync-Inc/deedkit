@@ -67,7 +67,7 @@ def resolution_set(c, value):
 class Job:
     """`function(row)` gets a read-only mapping of one row's stored evidence (`envelope`: the receipt envelope,
     `observed`: the observed revision's snapshot, `observed_revision`, `candidate_updated_at`, `reason`,
-    `archive_version`: the message's provider version now, `archive_revision`: its revision now, `tombstoned`: a provider tombstone names it,
+    `archive_version`: the message's provider version now, `archive_revision`: its revision now, `collected`: the account's policy still collects its chat, `tombstoned`: a provider tombstone names it,
     `reconstructed`: migration 017 chose `observed_revision` by transaction times on a message with more revisions) and returns
     a class name (`classify`), 'keep' or 'resolve' (`resolve`), or None or a candidate envelope the current rule
     accepts as a new revision (`accept`). `classes` are fnmatch patterns over ANYM-557's classes."""
@@ -147,7 +147,7 @@ def still_raised(row):
 
 def _decide(job, row):
     evidence = MappingProxyType({key: deepcopy(row[key]) for key in
-        ('envelope', 'observed', 'observed_revision', 'candidate_updated_at', 'reason', 'archive_version', 'archive_revision', 'tombstoned', 'reconstructed')})
+        ('envelope', 'observed', 'observed_revision', 'candidate_updated_at', 'reason', 'archive_version', 'archive_revision', 'collected', 'tombstoned', 'reconstructed')})
     try: result = job.function(evidence)
     except Exception: raise Failed('evaluation_error') from None
     if job.kind == 'classify' and isinstance(result, str) and result in EXPLANATIONS: return result
@@ -164,6 +164,8 @@ SCOPE = '''FROM message_conflicts mc JOIN messages m ON m.id=mc.message
     AND (%(at)s::timestamptz IS NULL OR (mc.observed_at,mc.receipt_digest)>(%(at)s::timestamptz,%(digest)s::text))'''
 CANDIDATES = '''SELECT mc.receipt_digest AS digest,mc.message,mc.observed_at,mc.observed_revision,mc.reason,
     mc.candidate_updated_at,r.envelope,v.snapshot AS observed,m.provider_updated_at AS archive_version,m.revision AS archive_revision,
+    EXISTS(SELECT 1 FROM account_policies p JOIN chats ch ON ch.id=m.chat WHERE p.account=m.account AND p.enabled
+        AND NOT ch.provider_chat=ANY(p.exclude_chats) AND (p.discover_chats OR ch.provider_chat=ANY(p.include_chats))) AS collected,
     (r.digest IS NULL OR mc.observed_at<=r.received_at) AND m.revision<>1 AS reconstructed,
     EXISTS(SELECT 1 FROM provider_tombstones t WHERE t.account=m.account AND t.provider_id=m.provider_id
         AND t.provider_chat IN ((SELECT provider_chat FROM chats WHERE id=m.chat),'')) AS tombstoned
@@ -387,6 +389,9 @@ class Runner:
                     AND reason=%s AND reason=ANY(%s) AND observed_revision=%s FOR UPDATE NOWAIT''',
                     (row['digest'], row['reason'], list(job.classes), row['observed_revision'])).fetchone()
                 if candidate is not None and open_row:
+                    # The decision was made on the revision the evaluation read; an earlier row of this batch or an
+                    # ingest may have moved the message since: read again from the last committed row (ANYM-796).
+                    if c.execute('SELECT revision FROM messages WHERE id=%s', (row['message'],)).fetchone()['revision'] != row['archive_revision']: return True
                     if (candidate.get('account') != self.account or not isinstance(candidate.get('chat'), str)
                             or stable_id('msg', self.account, candidate['chat'], str(candidate.get('provider_id'))) != row['message']):
                         raise Failed('invalid_result')
@@ -436,12 +441,12 @@ register(Job('classify', REASON_VERSION, 'classify', reclassify))
 def telegram_link_completed(row):
     """ANYM-796: the stored receipt when it completes the revision it contradicted, else None. A re-read repeating the
     receipt is `duplicate` and never reaches the rule. Only a replay ingest would accept today: a refused one stops
-    the job for this start, so a message that moved on, a tombstoned one or unreadable evidence leaves its row open."""
+    the job for this start, so a message that moved on, a tombstoned one, a chat out of collection or unreadable evidence leaves its row open."""
     from .archive import ingest_outcome, telegram_link_completion
     from .conflict_classes import SNAPSHOT_FIELDS
     from .envelope import validate
     try:
-        if row['tombstoned'] or row['reconstructed'] or row['archive_revision'] != row['observed_revision']: return None
+        if not row['collected'] or row['tombstoned'] or row['reconstructed'] or row['archive_revision'] != row['observed_revision']: return None
         if row['archive_version'] != row['candidate_updated_at']: return None
         candidate, snapshot = validate(row['envelope']), row['observed']
         if not telegram_link_completion(snapshot, candidate): return None
