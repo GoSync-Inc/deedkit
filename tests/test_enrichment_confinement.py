@@ -383,7 +383,10 @@ def waits(stop_state, monkeypatch):
     psycopg.errors.QueryCanceled('synthetic'), psycopg.errors.LockNotAvailable('synthetic'),
     psycopg.errors.DeadlockDetected('synthetic'), psycopg.errors.AdminShutdown('synthetic'),
     psycopg.OperationalError('connection failed: connection timeout expired'),
-], ids=lambda error: type(error).__name__)
+    psycopg.OperationalError('consuming input failed: SSL SYSCALL error: EOF detected'),
+    psycopg.OperationalError('consuming input failed: SSL error: unexpected eof while reading'),
+], ids=['QueryCanceled', 'LockNotAvailable', 'DeadlockDetected', 'AdminShutdown', 'connect_timeout_text',
+        'ssl_syscall_eof_text', 'ssl_unexpected_eof_text'])
 def test_a_transient_database_error_in_a_pass_does_not_end_the_worker(waits, error):
     worker = Flaky([error])
     worker.run()
@@ -486,7 +489,11 @@ def test_a_database_error_that_is_not_transient_still_ends_the_worker(waits):
     psycopg.OperationalError('connection is bad: FATAL:  password authentication failed for user "synthetic"'),
     psycopg.OperationalError('connection is bad: FATAL:  no pg_hba.conf entry for host "192.0.2.1"'),
     psycopg.OperationalError('connection failed: invalid sslmode value: "synthetic"'),
-], ids=['InvalidPassword', 'ConfigFileError', 'password_text', 'hba_text', 'sslmode_text'])
+    psycopg.OperationalError('connection failed: Connection refused\nMultiple connection attempts failed. '
+                             'FATAL:  password authentication failed for user "synthetic"'),
+    psycopg.OperationalError('connection failed: SSL error: certificate verify failed'),
+], ids=['InvalidPassword', 'ConfigFileError', 'password_text', 'hba_text', 'sslmode_text', 'mixed_attempts_text',
+        'certificate_text'])
 def test_a_permanent_database_failure_still_ends_the_worker(waits, error):
     worker = Flaky([error])
     with pytest.raises(psycopg.OperationalError):
@@ -510,11 +517,15 @@ def test_an_operational_error_outside_the_transient_list_is_fatal_whatever_its_s
 
 
 # spec: ANYM-688
-@given(st.text().filter(lambda text: not any(marker in text for marker in enrichment.DB_CONNECTION_LOST)),
-       st.sampled_from(enrichment.DB_CONNECTION_LOST), st.text())
-def test_an_error_without_a_sqlstate_is_transient_exactly_when_its_text_names_a_lost_connection(before, marker, after):
-    assert not enrichment.transient_database_error(psycopg.OperationalError(before))
-    assert enrichment.transient_database_error(psycopg.OperationalError(before + marker + after))
+@given(st.text().filter(lambda text: not any(marker in text for marker in
+                                              enrichment.DB_CONNECTION_LOST + enrichment.DB_LOGIN_REFUSED)),
+       st.sampled_from(enrichment.DB_CONNECTION_LOST), st.sampled_from(enrichment.DB_LOGIN_REFUSED))
+def test_an_error_without_a_sqlstate_is_transient_only_for_a_lost_connection_and_no_refusal(text, lost, refused):
+    assert not enrichment.transient_database_error(psycopg.OperationalError(text))
+    assert enrichment.transient_database_error(psycopg.OperationalError(text + lost))
+    assert not enrichment.transient_database_error(psycopg.OperationalError(text + refused))
+    assert not enrichment.transient_database_error(psycopg.OperationalError(lost + text + refused))
+    assert not enrichment.transient_database_error(psycopg.OperationalError(refused + text + lost))
 
 
 def mini_config(tmp_path, blocked=None):

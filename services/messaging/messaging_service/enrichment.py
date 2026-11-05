@@ -109,7 +109,11 @@ DB_TRANSIENT=(psycopg.errors.QueryCanceled,psycopg.errors.LockNotAvailable,psyco
 DB_CONNECTION_LOST=('timeout expired','Connection refused','Connection reset','Connection timed out','No route to host',
     'Network is unreachable','could not translate host name','server closed the connection',
     'could not send data to server','could not receive data from server','SSL connection has been closed',
+    'SSL SYSCALL error: EOF detected','SSL error: unexpected eof while reading',
     'the database system is','too many clients','the connection is closed','connection is lost')
+# psycopg joins the errors of every address it tried, so a refusal outranks a lost connection in the same text.
+DB_LOGIN_REFUSED=('password authentication failed','no password supplied','no pg_hba.conf entry','role "','database "',
+    'not permitted to log in','permission denied for database','certificate')
 
 
 def transient_database_error(error):
@@ -117,7 +121,9 @@ def transient_database_error(error):
     read only at start, so a retry cannot repair a refused login or a bad option, and a running container hides it."""
     if isinstance(error,DB_TRANSIENT):return True
     if error.sqlstate:return False
-    return any(text in str(error) for text in DB_CONNECTION_LOST)
+    message=str(error)
+    if any(text in message for text in DB_LOGIN_REFUSED):return False
+    return any(text in message for text in DB_CONNECTION_LOST)
 
 
 def cooldown_seconds(profile,retry_after):
