@@ -111,6 +111,23 @@ async def finish(task):
     await asyncio.gather(task, return_exceptions=True)
 
 
+async def running_child(s, path):
+    """A running child with progress files, before any tick."""
+    task = await s.submit(s.transcribe(fk(tick=str(path), ticks=100)))
+    await s.until(lambda: size(f"{path}.main") > 2)
+    return task, s.service.scheduler.children()[0].proc.pid
+
+
+async def stops_on_the_second_tick(s, clock, pid):
+    """The flag and the CPU hold now: the count of manual ticks decides, not the wall clock of a loaded host (ANYM-791).
+    The signal is sent inside the second tick; `ps` may show it a little later, hence the deadline."""
+    await tick(s, clock)
+    assert s.service.yielder.paused == {} and not stopped(pid), "stopped on the first tick"
+    await tick(s, clock)
+    assert len(s.service.yielder.paused) == 1, "not stopped on the second tick"
+    await s.until(lambda: stopped(pid), 5)
+
+
 # --- criterion 1: what is paused, and what is not --------------------------------------------------------------
 # spec: ANYM-691
 async def test_running_phase_stops_while_busy_and_continues_after(env):
@@ -359,15 +376,28 @@ async def test_an_idle_warm_worker_is_not_stopped(env):
 # --- criterion 2: when ----------------------------------------------------------------------------------------
 # spec: ANYM-691
 async def test_stop_follows_a_fresh_busy_flag_and_foreign_cpu_within_two_ticks(env):
-    path = env.tmp / "prog"
-    async with env.running(aliases=long_timeout(), **yielding(env)) as s:
-        task = await s.submit(s.transcribe(fk(tick=str(path), ticks=100)))
-        await s.until(lambda: size(f"{path}.main") > 2)
-        pid = s.service.scheduler.children()[0].proc.pid
-        started = time.monotonic()
+    clock, path = Virtual(), env.tmp / "prog"
+    async with manual(env, clock) as (s, _cpu):
+        task, pid = await running_child(s, path)
         s.probe.ci = True
-        await s.until(lambda: stopped(pid), 3)
-        assert time.monotonic() - started < 1.0  # two 50 ms ticks, the sample and the ps poll
+        await stops_on_the_second_tick(s, clock, pid)
+        await finish(task)
+
+
+# spec: ANYM-791
+async def test_the_two_tick_check_fails_when_the_stop_comes_on_the_fourth_tick(env):
+    clock, path = Virtual(), env.tmp / "prog"
+    async with manual(env, clock) as (s, _cpu):
+        task, pid = await running_child(s, path)
+        s.probe.ci = True
+        s.service.yielder.streak = -2  # the streak reaches two on the fourth tick from here
+        with pytest.raises(AssertionError, match="second tick"):
+            await stops_on_the_second_tick(s, clock, pid)
+        await tick(s, clock)
+        assert s.service.yielder.paused == {}  # the third tick: still running
+        await tick(s, clock)
+        assert len(s.service.yielder.paused) == 1  # the fourth tick is the one the check above refused
+        await s.until(lambda: stopped(pid), 5)
         await finish(task)
 
 
