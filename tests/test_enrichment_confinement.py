@@ -6,9 +6,10 @@ import sys
 import threading
 import time
 
+import psycopg
 import pytest
 
-from messaging_service import enrichment, inference_confinement
+from messaging_service import enrichment, inference_confinement, telemetry
 from messaging_service.enrichment import EnrichmentWorker
 from messaging_service.enrichment_providers import validate_profile
 from messaging_service.inference_confinement import Confinement, ConfinementLost
@@ -346,6 +347,136 @@ def test_a_worker_without_the_guard_runs_as_before(stop_state):
     worker = Recorder(None, after_first=stop_state.STOP.set)
     worker.run()
     assert worker.calls == ['publish', 'once', 'unpublish']
+
+
+class Flaky(Recorder):
+    """Recorder whose passes follow a script: an exception is what that pass raises, None a clean pass.
+    The worker is told to stop when the script ends."""
+    def __init__(self, script):
+        super().__init__(None)
+        self.script = list(script)
+
+    def once(self):
+        self.calls.append('once')
+        if not self.script:
+            enrichment.STOP.set()
+            return True
+        step = self.script.pop(0)
+        if step:
+            raise step
+        return True
+
+
+@pytest.fixture
+def waits(stop_state, monkeypatch):
+    """The delays the loop waited for, without waiting."""
+    seen = []
+    stop = stop_state.STOP
+    monkeypatch.setattr(stop, 'wait', lambda seconds=None: seen.append(seconds) or stop.is_set())
+    return seen
+
+
+# Incident 11-05: one statement timeout in claim() ended enricher-mini (exit 1, restart policy `no`) and halted autodeploy.
+# spec: ANYM-688
+@pytest.mark.parametrize('error', [
+    psycopg.errors.QueryCanceled('synthetic'), psycopg.errors.LockNotAvailable('synthetic'),
+    psycopg.errors.DeadlockDetected('synthetic'), psycopg.errors.AdminShutdown('synthetic'),
+    psycopg.OperationalError('synthetic connection failure'),
+], ids=lambda error: type(error).__name__)
+def test_a_transient_database_error_in_a_pass_does_not_end_the_worker(waits, error):
+    worker = Flaky([error])
+    worker.run()
+    assert worker.calls == ['publish', 'once', 'publish', 'once', 'unpublish']
+    assert waits == [enrichment.DB_RETRY_SECONDS]
+
+
+# spec: ANYM-688
+def test_a_transient_database_error_while_publishing_profiles_does_not_end_the_worker(waits):
+    worker = Flaky([])
+    real = worker.publish_profiles
+    failures = [psycopg.errors.QueryCanceled('synthetic')]
+
+    def publish(*, enabled=True):
+        real(enabled=enabled)
+        if failures:
+            raise failures.pop()
+
+    worker.publish_profiles = publish
+    worker.run()
+    assert worker.calls == ['publish', 'publish', 'once', 'unpublish']
+    assert waits == [enrichment.DB_RETRY_SECONDS]
+
+
+# spec: ANYM-688
+def test_the_database_retry_delay_doubles_to_its_limit_and_a_clean_pass_resets_it(waits):
+    timeout = psycopg.errors.QueryCanceled('synthetic')
+    Flaky([timeout] * 6 + [None, timeout]).run()
+    assert waits == [5, 10, 20, 40, 60, 60, 5]
+
+
+# spec: ANYM-688
+def test_the_database_retry_reports_only_the_exception_type(waits, capsys, monkeypatch):
+    captured = []
+    monkeypatch.setattr(telemetry, 'capture', lambda error, code: captured.append((type(error), code)))
+    Flaky([psycopg.OperationalError('connection failed: synthetic-dsn-host secret-text')]).run()
+    err = capsys.readouterr().err
+    assert 'synthetic-dsn-host' not in err and 'secret-text' not in err
+    assert json.loads(err) == {'status': 'error', 'error_code': 'enrichment_database_retry',
+                               'exception_type': 'OperationalError', 'retry_seconds': 5}
+    assert captured == [(psycopg.OperationalError, 'enrichment_failed')]
+
+
+# spec: ANYM-688
+def test_confinement_lost_after_a_database_error_still_ends_the_worker_before_the_next_claim(waits):
+    fake = Fake()
+
+    def lost_then_timeout():
+        fake.open_ports.add(('1.1.1.1', 443))
+        raise psycopg.errors.QueryCanceled('synthetic')
+
+    worker = Recorder(guard(fake), after_first=lost_then_timeout)
+    with pytest.raises(ConfinementLost):
+        worker.run()
+    assert worker.calls == ['publish', 'once', 'unpublish']
+
+
+# spec: ANYM-688
+def test_the_confinement_monitor_ends_a_database_backoff_at_once(stop_state, monkeypatch):
+    fake = Fake()
+    monkeypatch.setattr(enrichment, 'DB_RETRY_SECONDS', 60)
+
+    def lost_then_timeout():
+        fake.open_ports.add(('1.1.1.1', 443))
+        raise psycopg.errors.QueryCanceled('synthetic')
+
+    worker = Recorder(guard(fake, fresh=3600.0, interval=0.05), after_first=lost_then_timeout)
+    started = time.monotonic()
+    with pytest.raises(ConfinementLost):
+        worker.run()
+    assert time.monotonic() - started < 5
+    assert worker.calls == ['publish', 'once', 'unpublish']
+
+
+# spec: ANYM-688
+def test_a_database_error_after_the_stop_request_still_ends_the_worker(waits):
+    def stop_then_timeout():
+        enrichment.STOP.set()
+        raise psycopg.errors.QueryCanceled('synthetic')
+
+    worker = Recorder(None, after_first=stop_then_timeout)
+    with pytest.raises(psycopg.errors.QueryCanceled):
+        worker.run()
+    assert worker.calls == ['publish', 'once', 'unpublish']
+    assert waits == []
+
+
+# spec: ANYM-688
+def test_a_database_error_that_is_not_transient_still_ends_the_worker(waits):
+    worker = Flaky([psycopg.errors.UndefinedTable('synthetic')])
+    with pytest.raises(psycopg.errors.UndefinedTable):
+        worker.run()
+    assert worker.calls == ['publish', 'once', 'unpublish']
+    assert waits == []
 
 
 def mini_config(tmp_path, blocked=None):
