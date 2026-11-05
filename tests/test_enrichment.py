@@ -1464,7 +1464,7 @@ def enrichment_row(s):
         return c.execute("SELECT state,attempts,error_code FROM attachment_enrichment WHERE attachment='enrich-audio'").fetchone()
 
 
-def write_always_times_out(attempt):
+def statement_times_out(attempt):
     import psycopg
     raise psycopg.errors.QueryCanceled('synthetic statement timeout')
 
@@ -1473,7 +1473,7 @@ def write_always_times_out(attempt):
 def test_a_transient_error_writing_a_good_result_is_retried_and_records_no_failure(seeded,tmp_path,monkeypatch,stop_state):
     s,_,_=seeded
     def once_then_ok(attempt):
-        if attempt==1:write_always_times_out(attempt)
+        if attempt==1:statement_times_out(attempt)
     run=result_worker(s,tmp_path,stop_state,monkeypatch,before=once_then_ok)
     assert run.worker.once() is True
     assert enrichment_row(s)=={'state':'ready','attempts':1,'error_code':None}
@@ -1484,7 +1484,7 @@ def test_a_transient_error_writing_a_good_result_is_retried_and_records_no_failu
 # spec: ANYM-787
 def test_a_result_write_that_runs_out_of_retries_records_no_failure_and_reaches_the_backoff(seeded,tmp_path,monkeypatch,stop_state):
     s,_,_=seeded;module=stop_state
-    run=result_worker(s,tmp_path,module,monkeypatch,before=write_always_times_out)
+    run=result_worker(s,tmp_path,module,monkeypatch,before=statement_times_out)
     run.worker.run()
     attempts=module.FINISH_RETRY_SECONDS+1
     assert run.writes==[None]*attempts      # one second apart; never a write of the failure
@@ -1498,7 +1498,7 @@ def test_the_result_write_stops_retrying_when_the_lease_ends(seeded,tmp_path,mon
     import psycopg
     s,_,_=seeded;module=stop_state
     monkeypatch.setattr(module,'FINISH_RETRY_SECONDS',10**6,raising=False)
-    run=result_worker(s,tmp_path,module,monkeypatch,before=write_always_times_out)
+    run=result_worker(s,tmp_path,module,monkeypatch,before=statement_times_out)
     ttl=run.worker.config['profiles']['audio']['timeout_seconds']+60
     with pytest.raises(psycopg.errors.QueryCanceled):run.worker.once()
     assert len(run.writes)==ttl+1 and run.closes==[ttl+1]
@@ -1514,7 +1514,7 @@ def test_a_write_that_committed_and_then_raised_publishes_nothing_on_the_retry(s
         published.append(fields['state']);return real_publish(c,row,**fields)
     monkeypatch.setattr(processing_events,'publish',publish)
     def lost_answer(attempt):
-        if attempt==1:write_always_times_out(attempt)
+        if attempt==1:statement_times_out(attempt)
     run=result_worker(s,tmp_path,stop_state,monkeypatch,after=lost_answer)
     assert run.worker.once() is True
     assert enrichment_row(s)=={'state':'ready','attempts':1,'error_code':None}
@@ -1580,7 +1580,7 @@ def test_a_stop_ends_the_result_write_retry_at_once(seeded,tmp_path,monkeypatch,
     s,_,_=seeded;module=stop_state
     def fails(attempt):
         if not stop_during_wait:module.STOP.set()
-        write_always_times_out(attempt)
+        statement_times_out(attempt)
     run=result_worker(s,tmp_path,module,monkeypatch,before=fails)
     if stop_during_wait:
         def wait(seconds=None):
