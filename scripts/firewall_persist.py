@@ -579,8 +579,12 @@ def receipt_cli(argv):
         names.append('recordings')
     else:
         results['recordings'] = 'not_installed'
+    # ANYM-760: the Omi webhook's bridges join the receipt once installed; before that the receipt is byte-identical.
+    if 'recordings_hint' in custom or env_optional(args.env_file, 'RECORDINGS_HINT_RULES'):
+        names.append('recordings_hint')
     for name in names:
-        command = shlex.split(custom[name]) if name in custom else [sys.executable, str(here / f'{name}_egress_check.py'), 'verify', '--env-file', args.env_file]
+        script, word = ('recordings', 'hint-verify') if name == 'recordings_hint' else (name, 'verify')
+        command = shlex.split(custom[name]) if name in custom else [sys.executable, str(here / f'{script}_egress_check.py'), word, '--env-file', args.env_file]
         try:
             done = subprocess.run(command, text=True, capture_output=True, timeout=LIMIT)
             first = (done.stdout.strip().splitlines() or [f'error:exit {done.returncode}'])[0]
@@ -603,6 +607,8 @@ def receipt_cli(argv):
                'docker_start_monotonic': unit_time(args.systemctl, 'docker.service', 'ExecMainStartTimestampMonotonic'),
                'first_container_monotonic': container,
                'rules_before_first_container': rules_before_first_container(ufw, raw_time, raw_ok, container)}
+    if 'recordings_hint' in results:
+        receipt['recordings_hint'] = results['recordings_hint']
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     temporary = out.with_name(out.name + '.tmp')

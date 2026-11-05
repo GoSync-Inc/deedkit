@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 import re
 import time
 from contextlib import asynccontextmanager
@@ -17,7 +18,7 @@ from starlette.routing import Route
 from pydantic import Field, ValidationError
 
 from .omi import Provider, metadata, pagination, content
-from . import plaud
+from . import hint, plaud
 from .security import (Strict, Failure, RateLimited, configuration, provider_token, cursor, continuation, canonical, loads,
                        read_document, router_authorized)
 from . import archive_feed
@@ -159,9 +160,12 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
     @asynccontextmanager
     async def lifespan(app):
         await app.state.archive.start(background=archive_background)
+        listener = await hint.start_listener(app.state.archive)  # ANYM-760: None without its variable and configuration
         try:
             yield
         finally:
+            if listener is not None:
+                await listener.stop()
             await app.state.archive.close()
 
     app = Starlette(lifespan=lifespan)
@@ -171,6 +175,8 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
     app.state.plaud = remote
     path = Path(config_path).absolute()
     app.state.archive = ArchiveRuntime(path, provider, remote)
+    if os.environ.get(hint.LISTEN_ENV):
+        app.add_middleware(hint.MainGuard, hints=app.state.archive.hints)
     from .archive_read import LocalArchive
     local = LocalArchive(app.state.archive)
 

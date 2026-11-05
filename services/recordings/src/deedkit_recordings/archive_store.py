@@ -535,13 +535,14 @@ class Store:
                  complete=True, page_cursor=None):
         """Commit one listed page with its traversal position. kind: `first` (opening page, also the head),
         `history` (cursor pages; `first` and `history` stay behind the head slice), `head` (newest pages, may resume),
-        `legacy` (PLAUD). `complete` False: a truncated or unproven page, re-read later and never taken as the end;
+        `legacy` (PLAUD), `hint` (ANYM-760: inserts unseen rows with their fingerprints and touches no known row and no
+        traversal state). `complete` False: a truncated or unproven page, re-read later and never taken as the end;
         `page_cursor` is the cursor this page was read with."""
         ns = namespace(account)
         fingerprints = fingerprints or {}
         def change(db):
             cap = self.queue_cap()
-            room = cap if kind in ('head', 'legacy') else cap - self.head_slice()
+            room = cap if kind in ('head', 'legacy', 'hint') else cap - self.head_slice()
             queued = db.execute('SELECT count(*) FROM records WHERE namespace=? AND attempted IS NULL', (ns,)).fetchone()[0]
             floor_now = db.execute('SELECT COALESCE(max(rowid),0) FROM records').fetchone()[0]
             unique = {item['id']: item for item in items}
@@ -565,6 +566,8 @@ class Store:
                 created = db.execute('INSERT INTO records(ref,namespace,provider_id,metadata,parts,fingerprint) VALUES(?,?,?,?,?,?)',
                     (ref, ns, item['id'], canonical(item).decode(), '{}', fingerprints.get(item['id'])))
                 self.put_text(db, ns, created.lastrowid, ref, item, {}, 0, new=True)
+            if kind == 'hint':
+                return {'inserted': len(new), 'known': len(known), 'fenced': fenced}
             if kind != 'legacy':
                 for ident, row in known.items():
                     self.refresh(db, ns, row, unique[ident], fingerprints.get(ident), now)

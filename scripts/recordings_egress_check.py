@@ -18,6 +18,9 @@ Persistence (ANYM-693 family, as root on the host, nothing here changes a firewa
 /etc/ufw/after.init (the raw-table halves of the inference and the recordings rules), and `verify` compares the repository
 (`RECORDINGS_RESOLVER` and `INFERENCE_MINI_IP` in the env file), the persisted files and the kernel: `ok`, or `<pair> <code>`
 per differing pair (file_vs_repo, kernel_vs_repo, file_vs_kernel), exit 1.
+
+`hint-rules` and `hint-verify` are the same forms for the Omi webhook's two internal bridges (ANYM-760; production.md, "Omi
+webhook receiver"): their own chain and ufw block, so `rules` and `verify` above stay as installed.
 """
 from __future__ import annotations
 
@@ -42,6 +45,10 @@ CANARY = '192.0.2.254'
 CANARY_PORT = 9
 # The port recordings-api listens on: the one thing a peer on the backend bridge may open a connection to.
 SERVICE_PORT = 13234
+# ANYM-760: the Omi webhook's internal bridges and the one port a peer on each may open a connection to.
+HINT_CHAIN = 'DEEDKIT-RECORDINGS-HINT'
+HINT_LABEL = 'deedkit-recordings-hint'
+HINT_BRIDGES = (('dk-rechint0', 13235), ('dk-rechook0', 13236))
 # Host-local, private, tailnet (CGNAT), link-local (with metadata 169.254.169.254), multicast and reserved.
 DROPPED = ('0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12',
            '192.0.0.0/24', '192.168.0.0/16', '198.18.0.0/15', '224.0.0.0/4', '240.0.0.0/4')
@@ -93,6 +100,43 @@ def undo():
             *[f'ip6tables -D INPUT -i {bridge} -j DROP' for bridge in (BRIDGE, BACKEND_BRIDGE)],
             f'iptables -F {CHAIN}', f'iptables -X {CHAIN}',
             f'iptables -t raw -F {CHAIN}', f'iptables -t raw -X {CHAIN}']
+
+
+def hint_rules():
+    """The Omi webhook's two internal bridges (ANYM-760), their own chain and block: `rules` above and the installed `verify` do
+    not change. Peers on a bridge may open a connection only to its one listener (the channel, the receiver); replies pass,
+    the host, IPv6 and every other port are dropped. Filter table only, as for the backend bridge: no conntrack in raw and no
+    route off an isolated internal bridge."""
+    chain = [f'iptables -N {HINT_CHAIN}', f'iptables -F {HINT_CHAIN}']
+    for bridge, port in HINT_BRIDGES:
+        chain += [f'iptables -A {HINT_CHAIN} -i {bridge} -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN',
+                  f'iptables -A {HINT_CHAIN} -i {bridge} -p tcp --dport {port} -j RETURN',
+                  f'iptables -A {HINT_CHAIN} -i {bridge} -j DROP']
+    bridges = [bridge for bridge, _ in HINT_BRIDGES]
+    return (chain + [f'iptables -I DOCKER-USER -i {bridge} -j {HINT_CHAIN}' for bridge in bridges]
+            + [f'iptables -I INPUT -i {bridge} -j DROP' for bridge in bridges]
+            + [f'ip6tables -I DOCKER-USER -i {bridge} -j DROP' for bridge in bridges]
+            + [f'ip6tables -I INPUT -i {bridge} -j DROP' for bridge in bridges])
+
+
+def hint_undo():
+    return ([line.replace(' -I ', ' -D ', 1) for line in hint_rules() if ' -I ' in line]
+            + [f'iptables -F {HINT_CHAIN}', f'iptables -X {HINT_CHAIN}'])
+
+
+def hint_spec():
+    lines = [line for line in hint_rules() if ' -N ' not in line and ' -F ' not in line]
+    return {'chain': HINT_CHAIN, 'bridges': tuple(bridge for bridge, _ in HINT_BRIDGES),
+            'tables': persist().spec_from_commands(lines, HINT_CHAIN), 'after_init': None}
+
+
+def hint_ufw_form(family, source):
+    """The block for before.rules (v4) or before6.rules (v6), or `source` with it merged in after the recordings block."""
+    module = persist()
+    block = module.ufw_block(hint_spec()['tables'], HINT_LABEL, HINT_CHAIN, family, False)
+    if source is None:
+        return block
+    return module.merge_block(Path(source).read_text(), block, HINT_LABEL, r'^# deedkit-recordings end$', False, '# deedkit-recordings end')
 
 
 def persist():
@@ -238,8 +282,17 @@ def main(argv=None):
                                     'RECORDINGS_RESOLVER',
                                     'compare the repository, the ufw files and the kernel for the recordings rules',
                                     also='INFERENCE_MINI_IP', also_required=True)
+    if argv[:1] == ['hint-verify']:
+        return persist().verify_cli(argv[1:], lambda value: hint_spec(), 'RECORDINGS_HINT_RULES',
+                                    'compare the repository, the ufw files and the kernel for the Omi webhook bridges')
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     commands = parser.add_subparsers(dest='command', required=True)
+    hinted = commands.add_parser('hint-rules', help='print the host firewall commands of the Omi webhook bridges (ANYM-760)')
+    hinted.add_argument('--undo', action='store_true', help='print the commands that remove them')
+    hinted.add_argument('--format', choices=('commands', 'ufw'), default='commands')
+    hinted.add_argument('--family', choices=('v4', 'v6'), help='with --format ufw: before.rules (v4) or before6.rules (v6)')
+    hinted.add_argument('--source', help='with --format ufw: the rules file to merge the block into (printed whole)')
+    commands.add_parser('hint-verify', add_help=False, help='compare repository, ufw files and kernel for those bridges (root, read-only)')
     rule = commands.add_parser('rules', help='print the host firewall commands')
     rule.add_argument('--resolver', type=ipaddress.IPv4Address, help='the DNS resolver the container uses')
     rule.add_argument('--mini-ip', type=ipaddress.IPv4Address, help='with --format after-init: the inference mini address')
@@ -267,6 +320,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == 'listen':
         return serve(args.port, args.seconds)
+    if args.command == 'hint-rules':
+        if args.format == 'ufw' and (args.undo or args.family is None):
+            parser.error('--format ufw needs --family and cannot be combined with --undo')
+        if args.format == 'ufw':
+            print(hint_ufw_form(args.family, args.source), end='')
+        else:
+            print('\n'.join(hint_undo() if args.undo else hint_rules()))
+        return 0
     if args.command == 'rules':
         if not args.undo and args.resolver is None:
             parser.error('rules needs --resolver')

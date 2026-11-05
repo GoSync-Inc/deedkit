@@ -1,7 +1,12 @@
 import argparse
+import hashlib
 import json
 import logging
 import os
+from pathlib import Path
+import re
+import secrets
+import stat
 
 
 def operate(parser, args):
@@ -37,9 +42,72 @@ def operate(parser, args):
     print(json.dumps(receipt, sort_keys=True))
 
 
+def private_target(path):
+    """A new file in an existing directory that only its owner can enter; the refusal names no value."""
+    target = Path(path)
+    if not target.is_absolute():
+        raise ValueError('absolute_path_required')
+    parent = os.lstat(target.parent)
+    if not stat.S_ISDIR(parent.st_mode) or parent.st_mode & 0o077 or parent.st_uid != os.geteuid():
+        raise ValueError('directory_not_private')
+    if os.path.lexists(target):
+        raise ValueError('file_exists')
+    return target
+
+
+def write_private(target, text):
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        handle.write(text + '\n')
+
+
+def issue_hint(parser, args):
+    """ANYM-760: make the Omi webhook's path token and channel credential. Each goes only into its private file; the output is
+    their digests for the configuration. Run it once per rotation with new file names: nothing old changes until removed."""
+    origin = args.public_origin or ''
+    if not re.fullmatch(r'https://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?', origin) or not args.url_file or not args.channel_key_file:
+        parser.exit(1, 'Omi hint issue refused: invalid_arguments\n')
+    try:
+        if os.path.abspath(args.url_file) == os.path.abspath(args.channel_key_file):
+            raise ValueError('same_file')
+        url_file, key_file = private_target(args.url_file), private_target(args.channel_key_file)
+        token, key = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+        write_private(url_file, origin + '/omi/memory/' + token)
+        try:
+            write_private(key_file, key)
+        except OSError:
+            os.unlink(url_file)
+            raise
+    except ValueError as error:
+        parser.exit(1, f'Omi hint issue refused: {error}\n')
+    except OSError:
+        parser.exit(1, 'Omi hint issue refused: file_unavailable\n')
+    print(json.dumps({'channel_key_sha256': hashlib.sha256(key.encode()).hexdigest(),
+                      'path_token_sha256': hashlib.sha256(token.encode()).hexdigest()}, sort_keys=True))
+
+
+def run_receiver(args):
+    """ANYM-760: the internet-facing receiver, the same image with another command. No archive, no provider, no admission probe."""
+    import uvicorn
+    from .hint import CONNECTION_LIFETIME, RECEIVER_CONNECTIONS, Receiver, bounded_protocol
+    for name in ('httpx', 'httpcore'):
+        logging.getLogger(name).setLevel(logging.CRITICAL)
+    # Secret path: no request line is logged, and the proxy's access log carries none either.
+    uvicorn.run(Receiver(args.config), host=args.host, port=args.port, workers=1, access_log=False, lifespan='off', log_level='warning',
+                server_header=False, date_header=False, proxy_headers=False, limit_concurrency=RECEIVER_CONNECTIONS, timeout_keep_alive=1,
+                http=bounded_protocol(RECEIVER_CONNECTIONS, CONNECTION_LIFETIME),
+                h11_max_incomplete_event_size=16384)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Private recordings backend; no provider login or activation')
-    parser.add_argument('--config', required=True, help='Absolute path to a private owner-installed configuration')
+    parser.add_argument('--config', help='Absolute path to a private owner-installed configuration (required but for --omi-hint-issue)')
+    parser.add_argument('--omi-hint-receiver', action='store_true', help='Run the Omi webhook receiver: --config names its own private file')
+    parser.add_argument('--omi-hint-issue', action='store_true', help='Make a webhook path token and channel credential (private files only; prints digests)')
+    parser.add_argument('--public-origin', help='With --omi-hint-issue: the https origin of the existing proxy')
+    parser.add_argument('--url-file', help='With --omi-hint-issue: a new file for the full webhook URL, in a 0700 directory')
+    parser.add_argument('--channel-key-file', help="With --omi-hint-issue: a new file for the channel credential, in the receiver's 0700 directory")
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', default=13234, type=int)
     parser.add_argument('--backup-to', help='Create a private, consistent text archive snapshot at a new absolute path')
@@ -53,6 +121,12 @@ def main(argv=None):
     parser.add_argument('--lift-tombstone', action='store_true', help='Allow one deleted recording to be archived again (needs --account and --provider-id)')
     parser.add_argument('--provider-id', help='The provider recording id whose tombstone to lift')
     args = parser.parse_args(argv)
+    if args.omi_hint_issue:
+        return issue_hint(parser, args)
+    if not args.config:
+        parser.error('the following arguments are required: --config')
+    if args.omi_hint_receiver:
+        return run_receiver(args)
     if args.delete or args.lift_tombstone:
         if args.backup_to or (args.delete and args.lift_tombstone):
             parser.error('--delete, --lift-tombstone and --backup-to are separate commands')

@@ -2145,6 +2145,108 @@ independent: with the archive off the job skips `recordings_skipped_archive_disa
 `systemctl disable --now deedkit-recordings-backup.timer deedkit-recordings-backup-catchup.timer`. BACKUP.md "Staging,
 slot and admission" has the full rule. The ordered installation (runner blob and pins, receiver instance, units, first skip), the bounded archive activation, the first protected snapshot and the restore drill are [recordings-archive-activation.md](recordings-archive-activation.md) (ANYM-731).
 
+### Omi webhook receiver (ANYM-760)
+
+The ingress plan, reviewed with the code. Merging and deploying change nothing: without `archive.omi_hint` and `RECORDINGS_HINT_LISTEN`
+no listener exists, and the receiver container exists only in `deploy/compose.recordings-hint.yaml`. Every step below is an agent step
+under process.md section 2 (backup of the affected files, read-back, undo) after merge and deploy, none during an active call, except
+the Omi app step, which is the owner's. Polling stays the source of truth throughout: every state of this plan leaves collection as it is.
+
+**Route.** One public route, `POST /omi/memory/<token>`, on the existing proxy's existing host. The proxy forwards one prefix and nothing
+else of recordings, and has no secret in the proxy configuration (the token is the path suffix, checked by the receiver against its stored
+digests). The Caddy form inside the site block, with the body cap the receiver enforces again:
+
+```
+handle /omi/memory/* {
+    request_body {
+        max_size 4MiB
+    }
+    reverse_proxy recordings-omi-hint:13236
+}
+```
+
+The proxy's log carries no path: `deploy/Caddyfile.example` lines 2-13 delete the request fields. That is the example, not the running proxy,
+and a running container proves neither its log filter nor a restart path (the ingress note under "Apply and verify"). So before enabling read
+the live configuration back, and run the **proxy-log canary**: one `POST` to `/omi/memory/<43 random characters that are no token>` answers
+404, and `docker logs --since 5m <proxy> 2>&1 | grep -c <those characters>` prints 0. A missing filter or a nonzero count stops the plan.
+
+**Topology.** Omi → proxy → (`deedkit-recordings-hook`, bridge `dk-rechook0`) → `recordings-omi-hint:13236` → (`deedkit-recordings-hint`,
+bridge `dk-rechint0`) → the backend's second listener `recordings-hint-channel:13235`, `POST /omi-hint`. Both networks are internal, gateway mode
+`isolated`, no host address, no IPv6; only the proxy and the receiver join the first, only the receiver and `recordings-api` the second.
+The receiver has no volume but its own private directory, no provider token, no archive, read-only root, non-root, all capabilities dropped.
+The backend binds the hint listener to the one address its alias resolves to on `deedkit-recordings-hint` and refuses a wildcard; its main API and
+feed answer 404 on that address, and gain no published port.
+
+**Host rules (ANYM-760 chain, persisted like the recordings bridges).** `scripts/recordings_egress_check.py hint-rules` prints the chain
+`DEEDKIT-RECORDINGS-HINT`: from each bridge replies pass, a NEW connection only to that bridge's one port (13235 on `dk-rechint0`, 13236 on `dk-rechook0`), everything else drops; plus
+`DOCKER-USER` hooks, `INPUT` drops and IPv6 drops for both bridges. Filter table only, as for `dk-recbackend0` (no conntrack in raw, no route off an
+isolated internal bridge). `rules` and `verify` of ANYM-712 are unchanged, so the installed verifier sees no drift. Persist with `hint-rules --format ufw
+--family v4|v6 --source FILE`, which merges a `deedkit-recordings-hint` block after the `deedkit-recordings` block of `/etc/ufw/before.rules` and
+`before6.rules` ("Host firewall persistence (ANYM-693)", Safe order). `hint-verify` compares repository, files and kernel and prints `ok`.
+`RECORDINGS_HINT_RULES=1` in `/opt/personal-os-probe/.env` adds the pair to `deedkit-firewall-verify`'s boot receipt as `recordings_hint`; without the
+line the receipt is as before.
+
+**Secrets.** `--omi-hint-issue` makes the 256-bit path token and the channel credential, writes each to its own new 0600 file in a 0700 directory
+it refuses to widen, and prints only their SHA-256 digests. Neither value is an argument, an output, a log line, a PR, a chat message or an orchestrator
+record: only file paths are passed on. It needs no configuration and no network:
+
+```sh
+docker run --rm --network none --read-only --cap-drop ALL -u 10001:10001 -v /opt/deedkit/recordings-hint:/out/receiver \
+  -v /opt/deedkit/recordings-hint-handoff:/out/handoff ghcr.io/gosync-inc/deedkit-recordings:<sha> --omi-hint-issue \
+  --public-origin https://<proxy host> --url-file /out/handoff/omi-url --channel-key-file /out/receiver/channel.key
+```
+
+**Order.** Back up the affected files first; each read-back must pass before the next step.
+1. Deploy a green `main` SHA holding this code. Install the updated `firewall_persist.py` and `recordings_egress_check.py` to `/usr/local/lib/deedkit/`.
+2. Once: `docker network create --internal -o com.docker.network.bridge.name=dk-rechint0 -o com.docker.network.bridge.gateway_mode_ipv4=isolated deedkit-recordings-hint`
+   and `docker network create --internal -o com.docker.network.bridge.name=dk-rechook0 -o com.docker.network.bridge.gateway_mode_ipv4=isolated deedkit-recordings-hook`.
+3. Host rules: apply, persist, `RECORDINGS_HINT_RULES=1`, `hint-verify` prints `ok`.
+4. Make `/opt/deedkit/recordings-hint` and `/opt/deedkit/recordings-hint-handoff` (owner 10001, mode 0700), run the issue command, write `receiver.json`
+   (`deploy/recordings-omi-hint-receiver.example.json`: the owner's Omi `uid`, the path digest; mode 0600), and add `archive.omi_hint` to the recordings
+   `config.json` by an atomic replace (`account`, `uid`, `channel_key_sha256`, `path_token_sha256`, `expires_at`).
+5. Promotion: the receiver is the same published image with another command, so `production.py` needs no change: the project's `files` gain
+   `deploy/compose.recordings-hint.yaml` after `compose.recordings.yaml`, `services` gains `"recordings-omi-hint": "recordings"`, the env file gains
+   `RECORDINGS_HINT_STATE_DIR`. `snapshot` needs a running container of every selected service, so this is a **first start by hand** and a hand
+   release, as in "Enrollment is a hand release". It takes a green `main` SHA `S` newer than the deployed one and not prepared yet (`prepare` refuses an existing
+   candidate directory). Pause; verify and pull `S`'s attested recordings image and tag it `deedkit-recordings:enroll-<S>` ("First start by hand", step 1); with
+   `F` = `-p deedkit-recordings -f /opt/deedkit/deploy/compose.recordings.yaml -f /opt/deedkit/deploy/compose.recordings-hint.yaml --env-file <the project's env file>`,
+   `DEEDKIT_VERSION=enroll-<S> docker compose $F up -d --no-build --pull never`; edit `/etc/deedkit/production.json`; `prepare --sha S` and `apply --sha S`; `status`; remove the pause;
+   `deploy --dry-run`. The backend restarts once, which also opens its listener (it opens only at start; revoking needs no restart). Should the tool ever need to change for this, that is a separate release-path PR.
+6. Connectivity, from the real receiver container: `docker compose $F exec -T recordings-omi-hint python -I - check --blocked API_HINT_IP:13234 --blocked
+   GATEWAY_IP:13240 --blocked HOST_BRIDGE_IP:PORT --blocked 192.0.2.254:9 --control API_HINT_IP:13235 < scripts/recordings_egress_check.py`. Every blocked target is a known
+   listener; from the proxy, `check --blocked API_HINT_IP:13234`. Run `ufw reload` and repeat: the persisted rules must give the same answer, and `hint-verify` still `ok`.
+7. Proxy: keep the reviewed manifest of "Apply and verify", join the proxy to `deedkit-recordings-hook` (`docker network connect`, and the same line in that manifest),
+   add the route, validate without recreating the listener, reload. Read-backs: the log filter, the proxy-log canary, a wrong-token request answers the same 404 as an unknown one, a right-token request with a wrong `uid` answers 400 (no provider is called by either).
+8. The owner's hands (below). Then remove `/opt/deedkit/recordings-hint-handoff/omi-url`.
+
+**The owner's step in the Omi app.** Entering the URL needs the owner's device and Omi login (a Firebase user token; our `omi_dev_` key cannot do it); no agent tries. In the
+Omi app (source read at the pinned commit, `app/lib/pages/settings/developer.dart:240-247`, `profile.dart:68-73`): Settings → Developer Mode → Developer Settings → Webhooks →
+Conversation Events ("New conversation created"), switch it on, paste the content of the handoff file (the owner reads it in their own SSH session), Save. The agent gets the owner's `uid`
+for step 4 from the owner: Settings → Account → User ID (tapping the row copies it). That place is read in source, not yet seen on the owner's device: if the owner's app does not show it, stop before step 4; per ANYM-760 criterion 8 dropping the uid factor is Astra's decision, recorded on the PR, and needs a code change. A `uid` is no secret and no factor by itself; the path token is the factor.
+
+**What Omi sends.** `memory_created` at Omi commit `cf601889` (`backend/utils/webhooks.py:309-345`, `utils/conversations/render.py:181-228`) POSTs JSON to `<url>?uid=<uid>`, with an
+`Idempotency-Key` header, unsigned; 4 attempts at 1, 5 and 30 s, no retry on a 4xx other than 408 and 429. The body is `Conversation.model_dump()` of `backend/models/conversation.py:464` with
+`geolocation`, `capture_coverage` and `client_processing` removed:
+`sync_content_revision`, `sync_relevance`, `id`, `created_at`, `updated_at`, `started_at`, `finished_at`, `recorded_start`, `recorded_end`, `arrival_at`, `clock`, `episode_id`, `source`, `language`,
+`uses_custom_stt`, `record_audio_partial`, `structured`, `processing_state`, `summary_retryable`, `transcript_segments`, `transcript_segments_compressed`, `photos`, `audio_files`,
+`conversation_audio`, `private_cloud_sync_enabled`, `audio_timeline`, `speaker_resolution`, `screenshot_sharing_enabled`, `apps_results`, `suggested_summarization_apps`, `plugins_results`,
+`user_corrections`, `user_overview`, `external_data`, `app_id`, `capture_group`, `content_kind`, `discarded`, `imported`, `visibility`, `starred`, `processing_memory_id`,
+`processing_conversation_id`, `status`, `is_locked`, `deferred`, `processing_deferred`, `data_protection_level`, `folder_id`, `folder_name`, `is_call`, `call_platform`, `calendar_event_id`, `geolocation_scope`,
+`other_participants_location`, `call_id`, `calendar_event`, `client_device_id`, `client_platform`, `meeting_treatment_eligible`, `meeting_treatment_reason`, `meeting_duration_s`, `meeting_dedup_speech_s`.
+`structured` holds `title`, `overview`, `emoji`, `category`, `sections`, `action_items`, `events`, `meeting_type`, `participants`, `insights`, `salience`, `note_claims`, `title_provenance`. Each of `transcript_segments` holds
+`id`, `text`, `original_text`, `speaker`, `speaker_name`, `speaker_id`, `is_user`, `person_id`, `speaker_label_source`, `start`, `end`, `translations`, `speech_profile_processed`, `stt_provider`, `speaker_match_source`, `speaker_id_scope`, `speaker_identity_status`.
+The receiver parses this in memory for the length of the request (4 MiB at most), takes `id` and drops the rest: nothing else is stored, logged, answered or forwarded, and nothing goes to a third party (docs/DATA-POLICY.md is unchanged on purpose). The only datum leaving the receiver is the validated `id`, held by the backend in memory.
+
+**Deferred inserts.** A forced list whose page holds no known row while more pages follow inserts nothing (`archive_status.omi_hint.deferred` counts it): the regular head, which walks on, inserts them all, up to one poll later. So a hint never ends a head walk early.
+
+**Worst cases.** A leaked URL brings forward at most 6 head lists an hour, and cannot create a record, read a transcript or put in text; these lists count in `omi_budget`, in the head share, so while a backfill holds the rest of the hour they can use the slots a regular head list would, and the forced list then does the regular list's discovery; rotate. A compromised receiver can read the conversation bodies Omi sends while it is compromised, holds the digests and one channel credential, starts no connection but the channel, and cannot reach the archive, the main listener or a provider. On the channel it holds at most 16 connections, each for at most 5 seconds (bound at the transport, before any HTTP parsing).
+
+*Rotate:* run the issue command with new file names. Put the new path digest beside the old one in `receiver.json` and `archive.omi_hint.path_token_sha256`, the new channel digest beside the old one in `channel_key_sha256`, then atomically replace `channel.key` with the new file. The owner updates the URL in the Omi app. Remove both old digests and the old files.
+*Revoke:* remove the digests: the path digests from `receiver.json` (every request answers the same 404) and the whole `archive.omi_hint` object from `config.json` (the channel answers 404). Polling goes on.
+*Undo:* remove the proxy route, stop `recordings-omi-hint`, remove `archive.omi_hint`; the collector is unaffected. Then, if wanted, take the overlay out of the project's `files` by the same hand release, run `hint-rules --undo`, remove the ufw block and `RECORDINGS_HINT_RULES`, and `docker network rm` both networks. Rolling a package back: remove `archive.omi_hint` before a package downgrade (an older package refuses the unknown field, which would disable the archive consumers while on-demand reads go on).
+
+By this plan no existing recordings isolation is weakened: `compose.recordings.yaml`, its internal networks, egress admission, the ANYM-712 rules and the no-host-address bridges stay as they are, and `recordings-egress` stays the backend's only way out. Closing evidence after the owner's step: one real new Omi conversation in the archive within about a minute of Omi finishing it, with the receiver's counters (`docker logs`: `omi_hint_receiver`, counts only), `archive_status.omi_hint` and the date on the card.
+
 ## Image retention
 
 ```sh
