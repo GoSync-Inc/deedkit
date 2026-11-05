@@ -15,6 +15,8 @@ from messaging_service.app import create_app
 from messaging_service.commands import CommandWorker
 from messaging_service.envelope import stable_id
 from messaging_service.store import APIError
+from messaging_service import send_intent, uploads as uploads_module
+from messaging_service.error_details import payload as error_body
 from messaging_service.uploads import CHUNK_BYTES, MAX_BYTES, RESERVE_BYTES
 from messaging_service.storage_admission import STREAM_WORKSPACE_BYTES
 from test_messenger_commands import operator as operator
@@ -312,10 +314,96 @@ def test_api_gateway_database_role_can_upload_without_mutating_archive(uploader)
 
 def test_quota_is_bounded_and_expiry_reclaims_it(uploader):
     s,key,_=uploader
-    for index in range(4):prepare(s,key,request_id=f'synthetic-quota-{index}')
+    for index in range(uploads_module.MAX_ACTIVE_PER_KEY):prepare(s,key,request_id=f'synthetic-quota-{index}')
     with pytest.raises(APIError,match='upload_limit'):prepare(s,key,request_id='synthetic-quota-next')
     with s.pool.connection() as c:c.execute("UPDATE file_uploads SET expires_at=clock_timestamp()-interval '1 second'")
     assert prepare(s,key,request_id='synthetic-quota-next')['status']=='uploading'
+
+
+LIMIT_HINT=('An upload frees its slot only when it expires (get_file_upload shows expires_at); '
+    'an expired upload still being sent keeps its slot until the send ends.')
+
+
+def refusal(s,key):
+    with pytest.raises(APIError,match='upload_limit') as refused:prepare(s,key,request_id='synthetic-limit-next')
+    assert refused.value.status==409
+    return error_body(refused.value,'prepare_file_upload')
+
+
+def assert_only_counters(body,**expected):
+    assert {k:body.get(k) for k in expected}==expected and body['hint']==LIMIT_HINT
+    assert body['retryable'] is False and 'retry_after_seconds' not in body
+    assert set(body)<={'error','request_id','retryable','next_action','limit','active','max','hint','resets_in_seconds'}
+
+
+def fill(s,key,count,prefix='synthetic-fill'):
+    for index in range(count):prepare(s,key,request_id=f'{prefix}-{index}')
+
+
+def copies(s,count):
+    """Direct inserts: `count` more rows of the key that prepared synthetic-other-key."""
+    with s.pool.connection() as c:c.execute("""INSERT INTO file_uploads(principal,key_id,account,chat,filename,mime,bytes,sha256,volume_key,request_id)
+        SELECT u.principal,u.key_id,u.account,u.chat,u.filename,u.mime,u.bytes,u.sha256,u.volume_key,'synthetic-copy-'||g
+        FROM file_uploads u,generate_series(1,%s) g WHERE u.request_id='synthetic-other-key'""",(count,))
+
+
+# spec: ANYM-795
+def test_per_key_cap_fits_one_full_send_and_the_total_cap_is_64():
+    assert uploads_module.MAX_ACTIVE_PER_KEY==send_intent.MAX_FILES==10 and uploads_module.MAX_ACTIVE_TOTAL==64
+
+
+# spec: ANYM-795
+def test_key_refusal_names_limit_count_cap_and_earliest_expiry_and_other_keys_still_prepare(uploader):
+    s,key,_=uploader
+    fill(s,key,10)
+    with s.pool.connection() as c:
+        c.execute("UPDATE file_uploads SET expires_at=clock_timestamp()+interval '90 seconds' WHERE request_id='synthetic-fill-3'")
+    body=refusal(s,key)
+    assert_only_counters(body,error='upload_limit',limit='key',active=10,max=10)
+    assert 89<=body['resets_in_seconds']<=90
+    other=s.issue_key('upload-other',['command-fixture'],permissions=['read','send','upload'])
+    assert prepare(s,other,request_id='synthetic-other-key')['status']=='uploading'
+
+
+# spec: ANYM-795
+def test_total_refusal_names_the_total_scope_only_with_count_and_time(uploader):
+    s,key,_=uploader
+    other=s.issue_key('upload-other',['command-fixture'],permissions=['read','send','upload'])
+    prepare(s,other,request_id='synthetic-other-key');copies(s,63)
+    with s.pool.connection() as c:
+        c.execute("UPDATE file_uploads SET expires_at=clock_timestamp()+interval '90 seconds' WHERE request_id='synthetic-copy-7'")
+    body=refusal(s,key)
+    assert_only_counters(body,error='upload_limit',limit='total',active=64,max=64)
+    assert 89<=body['resets_in_seconds']<=90
+
+
+# spec: ANYM-795
+def test_key_limit_wins_when_both_scopes_are_full(uploader):
+    s,key,_=uploader
+    fill(s,key,10)
+    other=s.issue_key('upload-other',['command-fixture'],permissions=['read','send','upload'])
+    prepare(s,other,request_id='synthetic-other-key');copies(s,53)
+    assert_only_counters(refusal(s,key),limit='key',active=10,max=10)
+
+
+# spec: ANYM-795
+def test_pinned_expired_uploads_refuse_without_a_promised_time(uploader):
+    s,key,_=uploader
+    for index in range(10):
+        row=prepare(s,key,request_id=f'synthetic-pinned-{index}');chunk(s,key,row,b'Synthetic file')
+        args=send_args(row);draft=s.preview_messenger_operation(key,**args)
+        s.execute_messenger_operation(key,**args,preview_digest=draft['preview_digest'],request_id=f'synthetic-pinned-send-{index}')
+    with s.pool.connection() as c:c.execute("UPDATE file_uploads SET expires_at=clock_timestamp()-interval '1 second'")
+    body=refusal(s,key)
+    assert_only_counters(body,limit='key',active=10,max=10)
+    assert 'resets_in_seconds' not in body
+
+
+# spec: ANYM-795
+def test_repeated_prepare_at_the_cap_costs_no_slot(uploader):
+    s,key,_=uploader
+    fill(s,key,10)
+    assert prepare(s,key,request_id='synthetic-fill-0')['status']=='uploading'
 
 
 def test_upload_rejects_symlink_and_changed_content_at_dispatch(uploader,tmp_path):

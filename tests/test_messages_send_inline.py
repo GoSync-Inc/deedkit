@@ -61,7 +61,7 @@ def test_a_dry_run_preview_and_its_confirm_token_send_the_inline_file_once(world
     again = world.call(to=CHAT, files=[item], dry_run=True)
     assert first['preview']['files'][0] == {'name': 'synthetic-note.txt', 'bytes': 4096, 'mode': 'document',
         'caption': '', 'sha256': hashlib.sha256(data).hexdigest(), 'mime': 'application/octet-stream'}
-    # Repeated dry runs of one payload reuse their staged upload (a key holds at most 4 active ones).
+    # Repeated dry runs of one payload reuse their staged upload (a key holds at most 10 active ones).
     assert len(uploads(world)) == 1 and again['preview'] == first['preview']
     changed = {**item, 'base64': base64.b64encode(data[:-1] + b'!').decode()}
     with pytest.raises(APIError) as error:

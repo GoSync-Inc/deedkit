@@ -36,6 +36,9 @@ A guarded `send_message` refusal (`chat_changed_since_seen`, ANYM-736) carries o
 (`newer_count`, `newer_count_capped`, `newer_outgoing_count`, `first_newer_message_id`, `newest_message_id`)
 and a reference-only `next_call`; see SENDING.md. An unresolved duplicate (`duplicate_send_unresolved`, ANYM-748)
 carries only the caller's own `earlier_request_id`, `earlier_status` and a `get_send_status` `next_call`.
+A refused `prepare_file_upload` (`upload_limit`, ANYM-795) carries beside `retryable` (false) and `hint` only counters:
+`limit` (`key` or `total`), `active`, `max` and, when an expiry is scheduled, `resets_in_seconds`; see SENDING.md. The
+npm and Python SDK errors do not expose these body fields.
 
 `hint`, `next` and candidates never carry message text, file names or phone numbers taken from a request or a backend
 error; the ANYM-295 privacy allowlist is unchanged.

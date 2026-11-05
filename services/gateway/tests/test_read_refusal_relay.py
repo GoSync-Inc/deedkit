@@ -9,6 +9,7 @@ import pytest
 
 from test_strict_arguments import post_both
 from test_diagnostics import configured
+from test_messages_send_inline import gateway
 
 BODIES = {
     ("messages_list_chats", "my_roles"): (
@@ -80,6 +81,24 @@ def test_reviewed_hint_survives_a_query_word_that_occurs_in_it(tmp_path, case, v
     rest, mcp = post_both(app_with_refusing_backend(tmp_path, "messages_list_chats", body), "messages_list_chats", values)
     assert rest.status_code == 400 and rest.json()["hint"] == body["hint"]
     assert mcp["isError"] and mcp["structuredContent"]["hint"] == body["hint"]
+
+
+# spec: ANYM-795
+def test_upload_limit_fields_and_hint_survive_a_payload_that_contains_the_word_upload(tmp_path):
+    tool = "messages_prepare_file_upload"
+    body = {"error": "upload_limit", "request_id": "r1", "retryable": False, "next_action": "check_parameters",
+            "limit": "key", "active": 10, "max": 10, "resets_in_seconds": 90,
+            "hint": "An upload frees its slot only when it expires (get_file_upload shows expires_at); an expired "
+                    "upload still being sent keeps its slot until the send ends."}
+
+    app, _ = gateway(tmp_path, lambda _: httpx.Response(409, json=body))
+    values = {"account": "synthetic", "chat_id": "chat_synthetic", "filename": "upload", "mime": "text/plain", "bytes": 1,
+              "sha256": "a" * 64, "request_id": "synthetic-request"}
+    rest, mcp = post_both(app, tool, values)
+    assert rest.status_code == 409 and mcp["isError"]
+    for key in ("error", "limit", "active", "max", "resets_in_seconds", "hint", "retryable"):
+        assert rest.json().get(key) == body[key], key
+        assert mcp["structuredContent"].get(key) == body[key], key
 
 
 # spec: ANYM-660

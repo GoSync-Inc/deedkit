@@ -526,7 +526,7 @@ def register_send_tools(mcp, call, async_call, read):
         phone, @username, JID); reply_to (a msg_ ID) alone sends into its chat. files: up to
         10 of {upload_id} (messages_prepare_file_upload), {attachment_id} (forward an
         archived file) or a small file inline as {name, mime, base64} (at most 262144 bytes
-        decoded per call, counted against the key's 4 active uploads; over that, field_errors
+        decoded per call, counted against the key's 10 active uploads; over that, field_errors
         and a next to messages_prepare_file_upload), each with optional mode; they go in order. A plain caption up to
         1024 characters rides on the first file, other text is sent after the files.
         States: previewed, running (repeat with next), succeeded, failed with resumable
