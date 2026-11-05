@@ -572,7 +572,7 @@ It stops at the first failure, and on every exit, success, failure or signal, it
 
 Teardown works by the project's label and the directory's prefix, so it needs no Compose config and no earlier step. It
 removes the scratch containers, the helpers (which carry the same label), the volume, the network, the state directory
-and the decrypted files, lists each, and fails if anything is left. The pulled image and the Compose package stay, and
+and the decrypted files, lists each, and fails if anything is left or if Docker cannot say. The pulled image and the Compose package stay, and
 neither holds data; delete your copy of the two files. Stderr that can quote a password or a row goes to a private file
 removed with the rest, and the scratch containers log nothing.
 

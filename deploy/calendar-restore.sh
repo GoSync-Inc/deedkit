@@ -19,11 +19,12 @@ LABEL=com.docker.compose.project=$PROJECT
 export CALENDAR_RESTORE_IMAGE="ghcr.io/gosync-inc/deedkit-calendar@$DIGEST"
 export CALENDAR_RESTORE_STATE_DIR=""
 
+# What the scratch project still holds; fails when Docker cannot say, which is never the same as "nothing".
 scratch_left() {
-  docker ps -aq --filter "label=$LABEL"
-  docker volume ls -q --filter "label=$LABEL"
-  docker network ls -q --filter "label=$LABEL"
-  ls -d "${ROOT:?}"/calendar-restore.* 2>/dev/null
+  docker ps -aq --filter "label=$LABEL" || return 1
+  docker volume ls -q --filter "label=$LABEL" || return 1
+  docker network ls -q --filter "label=$LABEL" || return 1
+  ls -d "${ROOT:?}"/calendar-restore.* 2>/dev/null || true
 }
 
 # By the project's label and the fixed directory prefix, so it needs no Compose config and no earlier step, and it also
@@ -42,8 +43,10 @@ teardown() {
   echo "files:"; find "${ROOT:?}"/calendar-restore.* -mindepth 1 -maxdepth 2 -printf '%P\n' 2>/dev/null
   rm -rf -- "${ROOT:?}"/calendar-restore.*
   local left
-  left=$(scratch_left)
-  if [ -n "$left" ]; then
+  if ! left=$(scratch_left); then
+    echo "COULD NOT VERIFY the teardown: Docker did not answer; restored data may remain in the scratch project's volume"
+    [ "$status" -ne 0 ] || status=1
+  elif [ -n "$left" ]; then
     echo "LEFT BEHIND, remove by hand:"; echo "$left"
     [ "$status" -ne 0 ] || status=1
   else
@@ -69,7 +72,8 @@ helper() {
     --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp --entrypoint python "$@"
 }
 
-if [ -n "$(scratch_left)" ]; then
+LEFT=$(scratch_left)
+if [ -n "$LEFT" ]; then
   echo "an interrupted restore left resources; this run only clears them: run it again"
   exit 1
 fi

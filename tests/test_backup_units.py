@@ -233,10 +233,10 @@ log = Path(os.environ['FAKE_LOG'])
 calls = len(log.read_text().splitlines()) if log.exists() else 0
 args = sys.argv[1:]
 with log.open('a') as file:
-    file.write(' '.join(args) + '\n')
+    file.write(json.dumps(args) + '\n')
 if args[0] in ('run', 'compose') and not sys.stdin.isatty():
     sys.stdin.read()
-if calls + 1 == int(os.environ.get('FAKE_FAIL_AT', '0')):
+if calls + 1 == int(os.environ.get('FAKE_FAIL_AT', '0')) or calls + 1 >= int(os.environ.get('FAKE_FAIL_FROM', '1000000')):
     sys.exit(7)
 if os.environ.get('FAKE_RESTORE_FAILS') and 'pg_restore' in args:
     sys.stderr.write('pg_restore: error: COPY failed: private row\n')
@@ -280,7 +280,8 @@ def restore_run(tmp_path, *, reserve=1, **env):
         'PATH': f'{fakes}:/usr/bin:/bin', 'DIGEST': 'sha256:' + 'c' * 64, 'FAKE_LOG': str(log),
         'CALENDAR_RESTORE_ROOT': str(root), 'CALENDAR_RESTORE_CONFIG': str(config),
         'CALENDAR_RESTORE_LOCK': str(tmp_path / 'host.lock'), 'CALENDAR_RESTORE_PYTHON': str(fakes / 'receiver'), **env})
-    return result, (log.read_text().splitlines() if log.exists() else []), root
+    calls = [' '.join(json.loads(line)) for line in log.read_text().splitlines()] if log.exists() else []
+    return result, calls, root
 
 
 # spec: ANYM-610
@@ -291,11 +292,27 @@ def test_the_restore_stops_at_any_failing_docker_call_and_always_tears_down(tmp_
     # The first three calls are the check for an interrupted run's leftovers; the count ends where teardown starts.
     first_teardown = next(i for i, call in enumerate(calls) if i > 3 and call.startswith('ps -aq'))
     assert first_teardown > 10
-    for number in range(4, first_teardown + 1):
+    for number in range(1, first_teardown + 1):
         result, seen, root = restore_run(tmp_path, FAKE_FAIL_AT=str(number))
         assert result.returncode != 0 and 'restore proved' not in result.stdout, number
         assert '== teardown' in result.stdout and not list(root.iterdir()), number
         assert any(call.startswith('ps -aq') for call in seen[number:]), number
+
+
+# spec: ANYM-610
+def test_a_teardown_docker_cannot_verify_never_reports_nothing_left(tmp_path):
+    _, calls, _ = restore_run(tmp_path)
+    first_teardown = next(i for i, call in enumerate(calls) if i > 3 and call.startswith('ps -aq'))
+    result, _, _ = restore_run(tmp_path, FAKE_FAIL_FROM=str(first_teardown + 1))
+    assert 'restore proved' in result.stdout and result.returncode != 0
+    assert 'COULD NOT VERIFY' in result.stdout and 'left: nothing' not in result.stdout
+
+
+# spec: ANYM-610
+def test_a_docker_that_cannot_answer_the_leftovers_check_stops_the_run_before_it_starts(tmp_path):
+    result, calls, _ = restore_run(tmp_path, FAKE_FAIL_FROM='1')
+    assert result.returncode != 0 and 'COULD NOT VERIFY' in result.stdout and 'left: nothing' not in result.stdout
+    assert not any(call.startswith(('run ', 'pull ', 'compose ')) for call in calls)
 
 
 # spec: ANYM-610
