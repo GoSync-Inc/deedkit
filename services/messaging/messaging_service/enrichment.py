@@ -97,6 +97,33 @@ STOP=threading.Event()
 CHILDREN=set()
 REQUEUE_SECONDS=30
 BACKPRESSURE_CAP_SECONDS=900
+# After a pass that failed on a transient database error: this delay, doubled per consecutive failure up to the limit.
+DB_RETRY_SECONDS=5
+DB_RETRY_LIMIT_SECONDS=60
+DB_TRANSIENT=(psycopg.errors.QueryCanceled,psycopg.errors.LockNotAvailable,psycopg.errors.DeadlockDetected,
+    psycopg.errors.SerializationFailure,psycopg.errors.AdminShutdown,psycopg.errors.CrashShutdown,
+    psycopg.errors.CannotConnectNow,psycopg.errors.IdleSessionTimeout,psycopg.errors.TooManyConnections,
+    psycopg.errors.DiskFull,psycopg.errors.OutOfMemory)
+# A failed or lost connection has no SQLSTATE: psycopg raises a plain OperationalError with libpq's text, and a refused
+# login or a bad DSN option looks the same. Only these texts are retried; a text not listed ends the worker, as before.
+DB_CONNECTION_LOST=('timeout expired','Connection refused','Connection reset','Connection timed out','No route to host',
+    'Network is unreachable','could not translate host name','server closed the connection',
+    'could not send data to server','could not receive data from server','SSL connection has been closed',
+    'SSL SYSCALL error: EOF detected','SSL error: unexpected eof while reading',
+    'the database system is','too many clients','the connection is closed','connection is lost')
+# psycopg joins the errors of every address it tried, so a refusal outranks a lost connection in the same text.
+DB_LOGIN_REFUSED=('password authentication failed','no password supplied','no pg_hba.conf entry','role "','database "',
+    'not permitted to log in','permission denied for database','certificate')
+
+
+def transient_database_error(error):
+    """A timeout, a conflict, a busy or restarting server, a lost connection. Anything else stays fatal: the DSN is
+    read only at start, so a retry cannot repair a refused login or a bad option, and a running container hides it."""
+    if isinstance(error,DB_TRANSIENT):return True
+    if error.sqlstate:return False
+    message=str(error)
+    if any(text in message for text in DB_LOGIN_REFUSED):return False
+    return any(text in message for text in DB_CONNECTION_LOST)
 
 
 def cooldown_seconds(profile,retry_after):
@@ -167,10 +194,19 @@ def process(files,row,profile):
         return result
 
 
+def database_retry(error,delay):
+    """The exception's type only: a psycopg message can name the DSN's host or carry row values."""
+    from .telemetry import capture
+    capture(error,'enrichment_failed')
+    print(json.dumps({'status':'error','error_code':'enrichment_database_retry',
+        'exception_type':type(error).__name__,'retry_seconds':delay}),file=sys.stderr,flush=True)
+
+
 class EnrichmentWorker:
     def __init__(self,dsn,files,config,*,processor=process,lock_directory=None,confinement=None):
         self.dsn,self.files,self.config,self.processor=dsn,Path(files),config,processor
         self.confinement=confinement
+        self.requeueing=False
         self.lock_directory=lock_directory or os.environ.get('PROCESSING_LOCK_DIR','/processing-locks')
     def connection(self):
         return psycopg.connect(self.dsn,row_factory=dict_row,connect_timeout=5,
@@ -417,7 +453,9 @@ class EnrichmentWorker:
         if not claim:return False
         row,profile=claim
         try:self.finish(row,self.processor(self.files,row,profile))
-        except WorkerStopping:self.requeue(row)
+        except WorkerStopping:
+            self.requeueing=True
+            self.requeue(row)
         except ModelBackpressure as exc:self.defer(row,profile,exc.retry_after)
         except ModelError as exc:self.finish(row,error=exc.code)
         except Exception as error:
@@ -433,11 +471,21 @@ class EnrichmentWorker:
             # again before every claim older than the guard's freshness and in the background.
             guard.ensure()
             guard.start_monitor(request_stop)
+        delay=DB_RETRY_SECONDS
         try:
             while not STOP.is_set():
                 if guard:guard.ensure()
-                self.publish_profiles()
-                if not self.once():STOP.wait(10)
+                try:
+                    self.publish_profiles()
+                    if not self.once():STOP.wait(10)
+                except psycopg.OperationalError as error:
+                    # Incident 11-05: one statement timeout in claim() ended the worker. A job whose finish failed, or
+                    # a claim whose commit was lost, stays under its lease until that expires. The stop path keeps
+                    # ending the worker. The next pass proves the confinement again first; a lost one wakes this wait.
+                    if STOP.is_set() or self.requeueing or not transient_database_error(error):raise
+                    database_retry(error,delay)
+                    STOP.wait(delay);delay=min(DB_RETRY_LIMIT_SECONDS,delay*2)
+                else:delay=DB_RETRY_SECONDS
         finally:
             # Also when the stop path itself fails: never keep advertising a worker that is going away.
             if guard:guard.stop_monitor()
