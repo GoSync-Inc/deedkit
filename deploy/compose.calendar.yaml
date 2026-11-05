@@ -2,6 +2,8 @@ name: deedkit-calendar
 services:
   calendar-db:
     image: postgres:18-bookworm@sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c
+    # One line per successful login; retention and limits: services/calendar/docs/SERVICE.md, Login log.
+    command: [postgres, -c, log_connections=authorization]
     env_file: ${CALENDAR_STATE_DIR:?Set explicit restored calendar state}/service/postgres.env
     volumes: ["calendar-database:/var/lib/postgresql"]
     networks: [calendar-backend]

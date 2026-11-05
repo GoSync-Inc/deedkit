@@ -329,6 +329,22 @@ and only the contract's data keys: `calendar_ref`, `event_ref`, `start_at`, `ver
 
 Credentials and the raw source cache are encrypted, but event details, plans and the journal contain private data in the DB. This service does not encrypt the volume. The daily encrypted backup (ANYM-607; [BACKUP.md, Family calendar](../../../BACKUP.md#family-calendar)) takes the PostgreSQL database (one snapshot), the Vault tokens with their key, and the four profile files `postgres.env`, `gateway.json`, `worker.json` and `runtime.json` (the database passwords). It does not take the agents' key files (`service/keys/`; the database keeps their hashes) or logs. It goes encrypted to the calendar recovery key to its own project on the shared backup server, whose verifier restores each bundle in isolation before it replaces the protected point. Only the backup server's root copy of that recovery key exists until the owner confirms an offline copy, as for messaging. Restoring production from it is ANYM-610's procedure (not yet written). This is a local MVP, not a public multi-tenant deployment.
 
+### Login log (ANYM-775)
+
+`calendar-db` runs with `log_connections=authorization` (`deploy/compose.calendar.yaml`): PostgreSQL writes one line for each successful login, `connection authorized: user=... database=... application_name=...`, with no password and no query. Decision: ON. A failed login is always logged, but without this setting a successful one leaves no trace, and in the 2026-11-05 incident the logs could not show that an exposed owner password had not been used. Disconnections and statements stay unlogged, and the messaging database is not changed.
+
+Read it on the host: `docker logs --since <time> deedkit-calendar-calendar-db-1 2>&1 | grep 'connection authorized'`.
+
+What the log can show is limited:
+
+- The log proves non-use only for the period the retained 10 MB ring covers, about 35 to 70 hours. The ring is 2 x 5 MB, and the healthcheck alone fills it: `pg_isready` logs in as `fcs_owner` every 5 seconds, about 17,000 lines or 3.4 MB a day (200 bytes a line, measured on the pinned image). Other log lines shorten the period. Nothing can be said about a time before the oldest retained line.
+- `application_name` is chosen by the client. A login that names itself `pg_isready` writes an identical line, so never discard those lines by name alone. Healthcheck lines are at least 5 seconds apart: two `pg_isready` lines closer than that include a login that was not the healthcheck.
+- A root user on the host can edit the container log, so the log is evidence against a stolen password, not against a host compromise.
+
+Production: the container started before this setting and a release does not recreate it (`calendar-db` is not a selected service), so the live value comes from `ALTER SYSTEM SET log_connections = 'authorization'` and `SELECT pg_reload_conf()`, as the owner role through `docker exec`. This needs no restart and drops no connection; new sessions take the value, and an open session keeps the one it started with. When ANYM-779 has moved the project to the repository file, the two values agree; until then the `ALTER SYSTEM` value is the live one and the recreate takes the command line.
+
+Undo: before a recreate, `ALTER SYSTEM RESET log_connections` and `SELECT pg_reload_conf()`. After a recreate the command line wins over `ALTER SYSTEM`, so the undo is removing `command` from the compose file and recreating `calendar-db`.
+
 ## Availability and preview boundaries
 
 `slots` lists `checked_member_sources` and the resulting `source_selection`.

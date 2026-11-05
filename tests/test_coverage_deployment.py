@@ -98,6 +98,29 @@ def test_application_units_enforce_sandbox_resource_and_log_bounds():
             assert unit['logging'] == {'driver': 'json-file', 'options': {'max-size': '5m', 'max-file': '2'}}, name
 
 
+# spec: ANYM-775
+def test_calendar_database_command_logs_authorized_logins_and_nothing_else():
+    command = document('deploy/compose.calendar.yaml')['services']['calendar-db']['command']
+    assert command == ['postgres', '-c', 'log_connections=authorization']
+    assert command.count('-c') == 1
+    assert not any('password' in word.lower() for word in command)
+
+
+# spec: ANYM-775
+def test_calendar_service_guide_names_the_login_log_and_limits_what_it_proves():
+    guide = ' '.join((ROOT / 'services/calendar/docs/SERVICE.md').read_text(encoding='utf-8').split())
+    assert '### Login log (ANYM-775)' in guide
+    assert '`log_connections=authorization`' in guide
+    assert "docker logs --since <time> deedkit-calendar-calendar-db-1 2>&1 | grep 'connection authorized'" in guide
+    # The claim stays limited: the retained ring, in hours, and a healthcheck name any client can copy.
+    assert 'proves non-use only for the period the retained 10 MB ring covers, about 35 to 70 hours' in guide
+    assert 'A login that names itself `pg_isready` writes an identical line' in guide
+    # The bridge: the live value before a recreate, and the undo on each side of it.
+    assert "`ALTER SYSTEM SET log_connections = 'authorization'`" in guide
+    assert 'the recreate takes the command line' in guide
+    assert 'the command line wins over `ALTER SYSTEM`' in guide
+
+
 def test_database_and_optional_workers_have_isolated_networks_and_role_mounts():
     base = document('deploy/compose.yaml')
     db = base['services']['db']
