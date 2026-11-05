@@ -475,7 +475,7 @@ def test_a_failed_copy_rehearsal_or_final_gate_pauses_before_the_migration_and_i
         host.copy_failure = "count_mismatch"
     elif failure == "rehearsal":
         def refuse(copied, plan, image, limit):
-            raise p.MigrationRefused("not additive: added index public.synthetic_body")
+            raise p.MigrationRefused("not unattended: rows of public.synthetic_items were written")
         monkeypatch.setattr(p, "rehearse", refuse)
     elif failure == "shape":
         real = host.live_lines
@@ -496,7 +496,7 @@ def test_a_failed_copy_rehearsal_or_final_gate_pauses_before_the_migration_and_i
         assert outcome["status"] == "waiting" and host.migration() is None
         return
     reason = {"copy": "the pre-migration copy of messaging failed: count_mismatch",
-              "rehearsal": "not additive: added index public.synthetic_body",
+              "rehearsal": "not unattended: rows of public.synthetic_items were written",
               "shape": "the database changed shape since its copy"}[failure]
     assert outcome["status"] == "halted" and outcome["reason"] == reason == host.paused()
     assert host.migration()["status"] == "refused" and host.migration()["reason"] == reason
@@ -910,7 +910,7 @@ def test_the_rehearsal_runs_on_the_copy_over_an_internal_network_and_leaves_noth
         assert 0 <= record["took_ms"] <= 4000
         assert ["relation", "public.synthetic_items"] in [key for key, _ in record["difference"]["added"]]
     else:
-        assert str(refused.value).startswith({"delivery-features": "not additive: probe_metadata changed beyond "
+        assert str(refused.value).startswith({"delivery-features": "not unattended: probe_metadata changed beyond "
                                                                   "schema_version",
                                               "slow": "too slow for an unattended lock: the rehearsal took"}[case])
     # The live database itself never changed.
@@ -1651,7 +1651,7 @@ def test_the_calendar_rehearsal_runs_on_the_copy_times_its_transaction_and_check
         assert 0 <= record["took_ms"] <= 1000
         assert ["relation", "fcs.synthetic_marks"] in [key for key, _ in record["difference"]["added"]]
     else:
-        assert str(refused.value).startswith({"existing-table": "not additive: rows of fcs.people were written",
+        assert str(refused.value).startswith({"existing-table": "not unattended: rows of fcs.people were written",
                                               "slow": "too slow for an unattended lock: the rehearsal took"}[case])
     if case == "slow":
         assert int(str(refused.value).split("took ")[1].split(" ")[0]) >= 1200
