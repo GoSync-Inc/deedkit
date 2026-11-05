@@ -61,3 +61,36 @@ service stores nothing that can be read back. On the production side the worker 
 and the mini (docs/operations/production.md, "Mini enrichment worker"). Model output is untrusted data,
 like any extracted text. Runbook and rotation:
 [docs/operations/inference-mini-setup.md](docs/operations/inference-mini-setup.md).
+
+Agent sessions: reading container environments (ANYM-774). A session transcript goes to the model provider, so the
+PreToolUse hook `.claude/hooks/block-secret-env-reads.sh` refuses Bash commands that print secret-bearing environment,
+and refuses when it cannot decide. The threat is an agent's accidental read while diagnosing; a deliberate bypass is out
+of scope. The hook does not parse shell: it matches the raw text with quotes dropped, and refuses syntax it does not read
+(`${...}`, arithmetic, `eval`, `env -S`, a decode step) on a line that holds a guarded name. False refusals are accepted,
+and the refusal names the allowed way, including passing prose through a file. Blocked, also inside `ssh`, `sudo`, `bash -c`, a pipe or `$(...)`: `docker inspect`
+without a template, with any `--format=`/`-f=` form, or with a template that reads `.Config`, `.Spec` or the whole
+object; `docker compose config` unless limited by `--services`, `--images`, `--hash`, `--quiet` or `--volumes`, and always with
+`--environment`; `env`, `printenv`, `set` or `export` directly or through
+`docker exec|run` and `docker compose exec|run`; any such command naming `/proc/*/environ`; `cat`, `less`, `more`, `head`, `tail`, `grep`, `rg`, `sed`, `awk`, `strings`, `xxd`, `base64`, `nl`, `tac`, `od`, `hexdump`,
+`bat`, `cut`, `sort` or `uniq` of a path ending `.env`, named `.env.*` (except `.env.example` and `.env.sample`), or ending `environ`, `config.v2.json`, `.dsn`, `.token`, `.key`, `.pem` or
+`.agekey`, or a glob that selects one (`.env*`); a pattern search of a `private` or `.local` directory or `/etc/deedkit`; `systemctl show` of `Environment` or without a property filter. Allowed:
+`docker inspect --format '<template>'` limited to `.State`, `.Name`, `.Image`, `.RestartCount` or `.Created`; `docker compose config --services`, `--images` or
+`--hash`; a key-names read through the orchestrator. Limits: it covers sessions started in
+this repository or its worktrees; it does not cover the orchestrator, other projects or a determined bypass (encoding,
+a script that prints the file, a path or command name held in a variable). A recursive pattern search of a parent
+directory is not refused (`grep -r PASSWORD .`), and neither is a plain reader of a non-sensitive name inside a private
+directory (`cat /etc/deedkit/config.json`, `cat deploy/private/*`). `docker compose config` with `--no-env-resolution` is blocked because it still
+prints values interpolated from a project `.env`; adding `--no-interpolate` hides those and `env_file` values but still
+prints a literal value in the Compose document, which a rendered project document holds (synthetic probe, Compose 5.5.0). The
+durable fix is secrets as files, not environment variables, which is a separate decision.
+
+Because it fails closed on every Bash call, a broken hook stops all Bash in sessions of this repository, incident
+recovery included. A refusal says which it is: a secret refusal, a load refusal (the 5 second deadline on a busy host:
+retry the same command), or a broken hook. Recovery from a broken hook, both tested on Claude Code 2.1.318 with a hook
+that always blocks: the owner's `!` prefix runs a command without PreToolUse hooks; the Edit tool is not matched by this
+hook, so an agent can change this entry's `matcher` in `.claude/settings.json`, and Bash works again in the same session.
+That edit is local to one worktree and only for a broken hook; revert the merged change through the normal route. Hosts:
+the laptop and the Mac mini hold `timeout` in `/opt/homebrew/bin`, which a non-login shell on the mini lacks on `PATH`, so
+the hook also looks there, and `python3` in `/usr/bin` (mini) or on `PATH` (laptop). CI runs only this hook's tests, on
+Ubuntu, which has `timeout`. Cloud sessions were not checked. The production host runs no agent session: an SSH command
+is checked on the machine that starts it, and Codex does not read `.claude/` hooks.
