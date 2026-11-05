@@ -153,8 +153,13 @@ def main(argv=None):
     # Provider URLs may carry source IDs/cursors. No request URL/body logging.
     for name in ('httpx', 'httpcore'):
         logging.getLogger(name).setLevel(logging.CRITICAL)
-    uvicorn.run(create_app(args.config), host=args.host, port=args.port, workers=1, access_log=False,
-                limit_concurrency=64, timeout_keep_alive=5)
+    options = {'host': args.host, 'port': args.port, 'workers': 1, 'access_log': False, 'limit_concurrency': 64, 'timeout_keep_alive': 5}
+    from .hint import main_sockets
+    sockets = main_sockets(args.host, args.port)
+    if sockets is None:
+        uvicorn.run(create_app(args.config), **options)
+    else:
+        uvicorn.Server(uvicorn.Config(create_app(args.config), **options)).run(sockets=sockets)
 
 
 if __name__ == '__main__':

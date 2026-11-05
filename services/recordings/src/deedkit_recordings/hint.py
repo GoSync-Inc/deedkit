@@ -6,10 +6,12 @@ in-memory queue the collector's sleep wakes on: it lists the newest page once, o
 never-fetched conversations of the last 24 hours. No hint names a record to read, stores an id or spends above `omi_budget`;
 polling stays the source of truth. Nothing of a request but counters by reason is ever logged or kept.
 """
+from array import array
 import asyncio
 from collections import Counter, OrderedDict, deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -17,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import struct
 import threading
 import time
 from typing import Annotated
@@ -41,7 +44,7 @@ RECEIVER_REASONS = frozenset(('accepted', 'duplicate', 'not_found', 'bad_uid', '
                               'channel_failed', 'isolation_unproven'))
 MAIN_PORT = 13234  # the backend's main listener: the known listener the isolation probe must not reach
 ISOLATION_TIMEOUT = 3
-ISOLATION_EVERY, ISOLATION_RETRY, ISOLATION_TTL = 60, 5, 180
+ISOLATION_EVERY, ISOLATION_RETRY, ISOLATION_TTL = 10, 5, 30
 
 CHANNEL_PATH = '/omi-hint'
 CHANNEL_ALIAS = 'recordings-hint-channel'
@@ -173,30 +176,37 @@ def conversation_id(raw):
 
 
 class Isolation:
-    """Serve only while the host's bridge table is proven to work (production.md, "Omi webhook receiver"). A boot whose table failed
-    to load, or a flushed ruleset, still lets Docker start this process, and nothing else would notice. A proof is one round in which
-    the backend's main listener, a known listener on the same bridge, times out while the channel on the same address connects.
-    An answer from the main listener closes at once; any other result proves nothing and the last proof ages out, so a backend
-    restart costs no hint and a dead probe thread fails closed. It cannot bind a compromised process, which can ignore it."""
+    """A second layer over the listeners (`main_sockets`): the receiver serves only while the host's bridge table is seen working, so a
+    boot whose table failed to load ends in polling alone. A proof is one round, on one resolved address, in which the main listener
+    times out while the channel connects. It samples: it is no certificate of the policy, and it covers the hint bridge only. An
+    answer from the main listener closes at once; other results prove nothing and the last proof ages out, so a dead thread fails
+    closed. A compromised process can ignore it; what holds then is that no main listener exists on this bridge."""
     def __init__(self, *, host=CHANNEL_ALIAS, target_port=MAIN_PORT, control_port=CHANNEL_PORT, timeout=ISOLATION_TIMEOUT, probe=None,
                  clock=None):
         self.host, self.target_port, self.control_port, self.timeout = host, target_port, control_port, timeout
-        self.probe = probe or self.connect
+        self.probe = probe
         self.clock = clock or monotonic
         self.proof, self.said = None, None
 
-    def connect(self, port):
-        return admission.probe(f'{self.host}:{port}', 'open', self.timeout)[0]
+    def connector(self):
+        """A probe bound to one address for the whole round."""
+        try:
+            address = socket.getaddrinfo(self.host, self.control_port, type=socket.SOCK_STREAM)[0][4][0]
+        except (OSError, UnicodeError):
+            return lambda port: 'unresolved'
+        return lambda port: admission.probe(f'{address}:{port}', 'open', self.timeout)[0]
 
     def proven(self):
-        return self.proof is not None and self.clock() - self.proof < ISOLATION_TTL
+        proof = self.proof
+        return proof is not None and self.clock() - proof < ISOLATION_TTL
 
     def round(self):
-        target = self.probe(self.target_port)
-        control = self.probe(self.control_port)
+        probe = self.probe or self.connector()
+        target = probe(self.target_port)
         if target in ('connected', 'refused'):  # a DROP never sends a refusal
             self.proof = None
-        elif target == 'timeout' and control == 'connected':
+            return
+        if target == 'timeout' and probe(self.control_port) == 'connected':
             self.proof = self.clock()
 
     def step(self):
@@ -295,6 +305,8 @@ class Receiver:
         if query.get('uid') != [settings.uid]:
             raise Reject(400, 'bad_uid')
         ident = conversation_id(await read_body(scope, receive, MAX_BODY, self.deadline))
+        if self.isolation is not None and not self.isolation.proven():
+            raise Reject(404, 'isolation_unproven')
         key = self.key_digest(scope)
         if key is not None and self.recent(key):
             raise Reject(200, 'duplicate')
@@ -406,6 +418,42 @@ class MainGuard:
             await answer(send, 404)
             return
         await self.app(scope, receive, send)
+
+
+def local_ipv4():
+    """This container's IPv4 addresses, every interface."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        names = array('B', bytes(4096))
+        pointer, _ = names.buffer_info()
+        size = struct.unpack('iL', fcntl.ioctl(probe.fileno(), 0x8912, struct.pack('iL', len(names), pointer)))[0]  # SIOCGIFCONF
+    data = names.tobytes()[:size]
+    return [socket.inet_ntoa(data[start + 20:start + 24]) for start in range(0, size, 40)]
+
+
+def main_sockets(host, port, environ=None, addresses=local_ipv4, resolve=socket.gethostbyname):
+    """Sockets for the main listener on every address but the hint channel's, so the receiver's bridge holds no main listener whatever
+    the host's firewall does. None means the plain bind: no hint listener configured, a specific host, or an address that cannot be
+    read. The main API keeps serving then, and the receiver's `Isolation` sees the listener and stays closed."""
+    value = (os.environ if environ is None else environ).get(LISTEN_ENV)
+    if not value or host != '0.0.0.0':
+        return None
+    made = []
+    try:
+        hint_address = resolve(value.rpartition(':')[0])
+        for address in addresses():
+            if address != hint_address:
+                listening = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                made.append(listening)
+                listening.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listening.bind((address, port))
+        if not made:
+            raise OSError('no address')
+        return made
+    except (OSError, UnicodeError):
+        for listening in made:
+            listening.close()
+        print('main_listener plain_bind', flush=True)
+        return None
 
 
 class Listener:

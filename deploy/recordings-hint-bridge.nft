@@ -1,0 +1,21 @@
+table bridge deedkit_rechint
+delete table bridge deedkit_rechint
+table bridge deedkit_rechint {
+  chain to_channel {
+    ether type arp accept
+    ip protocol tcp tcp dport 13235 counter accept
+    ip protocol tcp tcp flags & (syn | ack) != syn counter accept
+    counter drop
+  }
+  chain to_receiver {
+    ether type arp accept
+    ip protocol tcp tcp dport 13236 counter accept
+    ip protocol tcp tcp flags & (syn | ack) != syn counter accept
+    counter drop
+  }
+  chain forward {
+    type filter hook forward priority -200; policy accept;
+    meta ibrname "dk-rechint0" jump to_channel
+    meta ibrname "dk-rechook0" jump to_receiver
+  }
+}

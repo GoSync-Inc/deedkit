@@ -279,14 +279,13 @@ class Clock:
 
 def isolation(answers, clock=None):
     """An isolation probe with scripted (main listener, channel) outcomes."""
-    pending = list(answers)
+    pending, current = list(answers), [None]
 
     def probe(port):
-        pair = pending[0]
-        if port == hint.CHANNEL_PORT:
-            pending.pop(0)
-            return pair[1]
-        return pair[0]
+        if port == hint.MAIN_PORT:
+            current[0] = pending.pop(0)
+            return current[0][0]
+        return current[0][1]
     return hint.Isolation(probe=probe, clock=clock or Clock())
 
 
@@ -382,8 +381,87 @@ def test_the_receiver_entry_point_starts_the_probe_and_gates_the_app(tmp_path, m
 
 # spec: ANYM-760
 def test_the_probed_main_port_is_the_port_the_backend_serves():
-    command = yaml.safe_load((ROOT / 'deploy/compose.recordings.yaml').read_text())['services']['recordings-api']['command']
+    line = next(line for line in (ROOT / 'services/recordings/Dockerfile').read_text().splitlines() if line.startswith('CMD '))
+    command = json.loads(line[4:])
     assert command[command.index('--port') + 1] == str(hint.MAIN_PORT)
+    assert command[command.index('--host') + 1] == '0.0.0.0'
+
+
+# spec: ANYM-760
+def test_an_answer_from_the_main_listener_closes_without_waiting_for_the_channel():
+    def probe(port):
+        if port == hint.CHANNEL_PORT:
+            raise RuntimeError('a stuck channel probe')
+        return 'connected'
+    guard = hint.Isolation(probe=probe, clock=Clock())
+    guard.proof = guard.clock()
+    assert guard.proven()
+    guard.step()
+    assert not guard.proven()
+
+
+# spec: ANYM-760
+def test_one_round_probes_one_resolved_address(monkeypatch):
+    resolved, seen = iter(['192.0.2.10', '192.0.2.99']), []
+    monkeypatch.setattr(hint.socket, 'getaddrinfo', lambda *args, **kwargs: [(0, 0, 0, '', (next(resolved), 0))])
+    monkeypatch.setattr(hint.admission, 'probe', lambda target, expect, timeout: (seen.append(target), ('timeout' if target.endswith(':13234') else 'connected'))[1:])
+    guard = hint.Isolation()
+    guard.round()
+    assert seen == ['192.0.2.10:13234', '192.0.2.10:13235'] and guard.proven()
+
+
+# spec: ANYM-760
+def test_a_flush_seen_while_a_body_is_read_stops_the_hint_before_the_channel(tmp_path, monkeypatch):
+    async def scenario():
+        guard = isolation([('timeout', 'connected'), ('connected', 'connected')])
+        guard.round()
+        app, channel = receiver(tmp_path, isolation=guard)
+        real = hint.read_body
+
+        async def reading(*args):
+            guard.round()
+            return await real(*args)
+        monkeypatch.setattr(hint, 'read_body', reading)
+        assert (await call(app))[0] == 404 and not channel.requests
+    asyncio.run(scenario())
+
+
+# spec: ANYM-760
+def test_the_main_listener_has_no_socket_on_the_hint_address_and_serves_the_others():
+    environ = {hint.LISTEN_ENV: 'recordings-hint-channel:13235'}
+    with socket.socket() as free:
+        free.bind(('127.0.0.1', 0))
+        port = free.getsockname()[1]
+    sockets = hint.main_sockets('0.0.0.0', port, environ, lambda: ['127.0.0.1', '127.0.0.2'], lambda name: '127.0.0.2')
+    assert [s.getsockname()[0] for s in sockets] == ['127.0.0.1']
+    sockets[0].listen(1)
+    try:
+        socket.create_connection(('127.0.0.1', port), timeout=1).close()
+        with pytest.raises(OSError):
+            socket.create_connection(('127.0.0.2', port), timeout=1)
+    finally:
+        sockets[0].close()
+
+
+# spec: ANYM-760
+def test_without_a_hint_listener_or_with_an_unreadable_address_the_main_bind_stays_plain(capfd):
+    assert hint.main_sockets('0.0.0.0', 1, {}) is None
+    assert hint.main_sockets('127.0.0.1', 1, {hint.LISTEN_ENV: 'a:1'}) is None
+
+    def broken(name):
+        raise OSError('no name')
+    assert hint.main_sockets('0.0.0.0', 1, {hint.LISTEN_ENV: 'a:1'}, lambda: ['127.0.0.1'], broken) is None
+    assert capfd.readouterr().out == 'main_listener plain_bind\n'
+
+
+# spec: ANYM-760
+def test_the_bridge_table_and_its_unit_in_the_repository_hold_both_bridges():
+    table = (ROOT / 'deploy/recordings-hint-bridge.nft').read_text()
+    for needle in ('table bridge deedkit_rechint', 'meta ibrname "dk-rechint0" jump to_channel', 'meta ibrname "dk-rechook0" jump to_receiver',
+                   'tcp dport 13235', 'tcp dport 13236'):
+        assert needle in table
+    unit = (ROOT / 'deploy/deedkit-rechint-nft.service').read_text()
+    assert 'Before=docker.service' in unit and 'Requires=' not in unit and '/etc/deedkit/rechint.nft' in unit
 
 
 # spec: ANYM-760

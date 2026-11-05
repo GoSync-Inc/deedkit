@@ -1,0 +1,14 @@
+[Unit]
+Description=DeedKit Omi webhook bridge isolation (bridge-family nft table, ANYM-760)
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=10
+ExecStart=/usr/sbin/nft -f /etc/deedkit/rechint.nft
+ExecStartPost=/bin/sh -c "/usr/sbin/nft list table bridge deedkit_rechint | grep -q 'dport 13235' && /usr/sbin/nft list table bridge deedkit_rechint | grep -q 'dport 13236'"
+ExecStop=-/usr/sbin/nft delete table bridge deedkit_rechint
+
+[Install]
+WantedBy=multi-user.target
