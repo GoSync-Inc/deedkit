@@ -41,12 +41,14 @@
 #   a killed holder or copy going away (reap_jobs)  5 s per job                                 phase    goes on
 #   laptop copy with no bytes moving                COPY_IO_SECONDS 120 s                       phase    91
 #   laptop copy as a whole                          COPY_SECONDS 600 s                          phase    91
-#   an earlier run's leftovers (stop_leftovers)     stop_recorded below, per run directory      cumulative  its record stays
+#   an earlier run's leftovers (stop_leftovers)     stop_recorded below per run directory, then cumulative  its record stays
+#                                                   STOP_SECONDS tries per unrecorded PostgreSQL
 #
 #   Under the lease:
 #   mini copy, initdb, suite and every other step   RUN_SECONDS 7200 s                          lease    TERM, then KILL
 #   PostgreSQL ready (pg_start)                     60 tries of pg_isready (3 s each) + 1 s     count    the run fails
-#   stop_recorded                                   STOP_SECONDS 30 s, then KILL and 5 s        phase    its record stays
+#   stop_recorded                                   STOP_SECONDS 30 tries, KILL, 5 tries, 1 s   count    its record stays
+#                                                   apart, each try a process lookup
 #   finish: children, then each database, then      STOP_SECONDS + 5 s per job, each step       cumulative  the lease's KILL
 #     stop_recorded
 #
@@ -56,8 +58,9 @@
 #                                                   channel ends it sooner
 #
 # No bound of their own: a command that hangs on a live mini outside the lease, where only ssh's dead-channel bound
-# applies (`docker ps` in the queue check, `df` in the disk guard, `tar` in `--here dist`), and the laptop's local
-# staging (`tar` on its own disk). No stall has been shown for them, so none is added.
+# applies (`docker ps` in the queue check, `df` in the disk guard, `tar` in `--here dist`, `ps` in the tries of
+# stop_leftovers), and the laptop's local staging (`tar` on its own disk). No stall has been shown for them, so none
+# is added.
 set -euo pipefail
 
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
