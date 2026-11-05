@@ -1,4 +1,6 @@
-"""The calendar backup's systemd units (ANYM-607): its own config, messaging's lock, a daily run that ends by 18:00."""
+"""The calendar backup's systemd units (ANYM-607): its own config, messaging's lock, a daily run that ends by 18:00.
+
+The restore stack and procedure (ANYM-610): the Compose file's isolation, the written commands' shell syntax."""
 import configparser
 import json
 from pathlib import Path
@@ -7,6 +9,7 @@ import shlex
 import subprocess
 
 from messaging_service import backup_runner
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = ROOT / 'deploy'
@@ -138,6 +141,82 @@ def test_the_admission_condition_admits_only_minutes_up_to_its_bound_and_fails_c
         return subprocess.run(['/bin/sh', '-c', script], env={'PATH': f'{tmp_path}:/usr/bin:/bin'}).returncode == 0
     assert all(admitted(clock) for clock in ('0000', '0930', '1600', '1602'))
     assert not any(admitted(clock) for clock in ('1603', '1605', '1700', '1759', '1800', '2359', 'x', ''))
+
+
+def restore_stack():
+    return yaml.safe_load((DEPLOY / 'compose.calendar-restore.yaml').read_text())
+
+
+def restore_section():
+    """The text of BACKUP.md "Restore the family calendar", up to the next section."""
+    match = re.search(r'^### Restore the family calendar.*?(?=^## )', (ROOT / 'BACKUP.md').read_text(), re.M | re.S)
+    assert match
+    return match[0]
+
+
+# spec: ANYM-610
+def test_the_restore_stack_is_the_database_and_the_api_only_with_no_worker():
+    assert set(restore_stack()['services']) == {'calendar-db', 'calendar-api'}
+
+
+# spec: ANYM-610
+def test_the_restore_stack_has_one_internal_network_and_no_external_or_provider_network():
+    stack = restore_stack()
+    assert stack['networks'] == {'calendar-backend': {'internal': True}}
+    for service in stack['services'].values():
+        assert service['networks'] == ['calendar-backend'] and 'network_mode' not in service
+
+
+# spec: ANYM-610
+def test_the_restore_stack_mounts_no_vault_and_gives_the_api_only_its_own_profile():
+    stack = restore_stack()
+    assert stack['services']['calendar-api']['volumes'] == [
+        '${CALENDAR_RESTORE_STATE_DIR}/service/gateway.json:/data/service/gateway.json:ro']
+    assert stack['services']['calendar-db']['volumes'] == ['calendar-restore-database:/var/lib/postgresql']
+    assert 'vault' not in json.dumps(stack['services'])
+
+
+# spec: ANYM-610
+def test_the_restore_stack_shares_no_name_with_production():
+    stack, production = restore_stack(), yaml.safe_load((DEPLOY / 'compose.calendar.yaml').read_text())
+    assert stack['name'] != production['name']
+    assert not set(stack['volumes']) & set(production['volumes'])
+    assert stack['volumes'] == {'calendar-restore-database': {}}  # project-scoped, never an external volume
+    assert 'CALENDAR_RESTORE_STATE_DIR:?' in stack['services']['calendar-db']['env_file']
+    text = (DEPLOY / 'compose.calendar-restore.yaml').read_text()
+    assert '${CALENDAR_STATE_DIR' not in text and '${CALENDAR_DATABASE_VOLUME' not in text
+
+
+# spec: ANYM-610
+def test_the_restore_stack_publishes_no_port_and_starts_nothing_by_itself():
+    # Docker 29 publishes nothing for a container whose only network is internal (probe on the backup server, 11-05).
+    for service in restore_stack()['services'].values():
+        assert 'ports' not in service and service['restart'] == 'no' and 'build' not in service
+
+
+# spec: ANYM-610
+def test_the_restore_api_runs_a_required_image_and_the_production_apis_sandbox_and_health_check():
+    stack, production = restore_stack(), yaml.safe_load((DEPLOY / 'compose.calendar.yaml').read_text())
+    api, live = stack['services']['calendar-api'], production['services']['calendar-api']
+    assert api['image'].startswith('${CALENDAR_RESTORE_IMAGE:?')
+    for key in ('command', 'healthcheck', 'read_only', 'user', 'cap_drop', 'security_opt', 'tmpfs', 'mem_limit', 'pids_limit'):
+        assert api[key] == live[key], key
+    assert stack['services']['calendar-db']['image'] == production['services']['calendar-db']['image']
+
+
+# spec: ANYM-610
+def test_the_restore_procedure_is_linked_and_its_commands_parse(tmp_path):
+    section = restore_section()
+    target = 'BACKUP.md#restore-the-family-calendar'
+    assert target in (ROOT / 'docs/operations/platform-cutover.md').read_text()
+    assert target in (ROOT / 'services/calendar/docs/SERVICE.md').read_text()
+    blocks = re.findall(r'^```sh\n(.*?)^```$', section, re.M | re.S)
+    assert blocks
+    script = tmp_path / 'restore.sh'
+    script.write_text(''.join(blocks))
+    subprocess.run(['bash', '-n', str(script)], check=True)
+    assert 'db-roles\n' not in ''.join(blocks) and 'db-roles --check' in ''.join(blocks)  # the check mints nothing
+    assert '--exit-on-error' in ''.join(blocks) and 'docker volume rm' in ''.join(blocks)
 
 
 FRESHNESS_DIRECTORY = '/opt/deedkit/calendar-backup/backups'
