@@ -3,6 +3,7 @@ import asyncio
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -16,7 +17,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'services/recordings/src'))
 from deedkit_recordings.app import create_app
 from deedkit_recordings.archive import ArchiveRuntime
-from deedkit_recordings.archive_store import backup_archive, namespace, stage_due
+from deedkit_recordings.archive_store import backup_archive, namespace, pending_gap, stage_due
 from deedkit_recordings.omi import Provider
 from deedkit_recordings.security import ArchiveSettings, Failure
 
@@ -186,6 +187,33 @@ def seed_v2(doc, ns='a' * 32):
 
 
 OLD_COLUMNS = 'SELECT ref,namespace,provider_id,metadata,parts,revision,attempted,due,failures FROM records ORDER BY ref'
+
+
+# spec: ANYM-724
+@given(moment=st.integers(T0, T0 + 86400 * 365), age=st.sampled_from((0, 3600, 86399, 86400, 86400 * 14 - 1, 86400 * 14)),
+       zone=st.sampled_from(('UTC', 'Asia/Tokyo', 'America/New_York', 'Pacific/Kiritimati')))
+def test_a_zone_less_created_at_is_utc_for_the_pending_gap_on_a_host_in_any_zone(moment, age, zone):
+    text = datetime.fromtimestamp(moment, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
+    expected = 3 * 3600 if age < 86400 else 86400 if age < 14 * 86400 else None
+    before = os.environ.get('TZ')
+    os.environ['TZ'] = zone
+    time.tzset()
+    try:
+        assert pending_gap({'created_at': text}, moment + age) == expected
+        assert pending_gap({'created_at': text + 'Z'}, moment + age) == expected
+        assert stage_due({'created_at': text}, moment - 1) == stage_due({'created_at': text + 'Z'}, moment - 1)
+    finally:
+        if before is None:
+            del os.environ['TZ']
+        else:
+            os.environ['TZ'] = before
+        time.tzset()
+
+
+# spec: ANYM-724
+@pytest.mark.parametrize('created', (None, '', 'not a time', [], {}))
+def test_an_unusable_created_at_keeps_the_three_hour_pending_gap(created):
+    assert pending_gap({'created_at': created}, T0) == 3 * 3600
 
 
 # spec: ANYM-724
