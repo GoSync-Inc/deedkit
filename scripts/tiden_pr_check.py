@@ -586,7 +586,8 @@ def check(root: Path, base: str, head: str, body: str, cli: str, product: str, r
     if failures:
         report(f"{len(failures)} problem(s):")
         report("\n".join(f"- {failure}" for failure in failures))
-        code, closing = 1, "Fix the pull request body or the markers (TIDEN-CI.md, PR check), then rerun."
+        code, closing = 1, ("Fix the pull request body or the markers (TIDEN-CI.md, PR check), then push a commit or "
+                            "close and reopen the pull request: a rerun replays the old body.")
     else:
         code, closing = 0, "Passed."
     if lines.branch and status != "merged":  # the merged path adds no Tiden call

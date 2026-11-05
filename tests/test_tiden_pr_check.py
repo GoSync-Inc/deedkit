@@ -753,10 +753,23 @@ def test_only_a_verdict_fails_the_pr_check_job_and_anything_else_warns(repo, ser
                  "Refused: the spec listing of main is incomplete", "Refused: git diff exited 128",
                  "Refused: tiden spec list timed out", "Refused: tests/x.py does not parse"):
         assert outcome(tmp_path, ["## Tiden PR check", line], 1) == "outcome=unchecked", line
-    verdict = "Fix the pull request body or the markers (TIDEN-CI.md, PR check), then rerun."
+    verdict = ("Fix the pull request body or the markers (TIDEN-CI.md, PR check), then push a commit or close and reopen "
+               "the pull request: a rerun replays the old body.")
     assert outcome(tmp_path, [verdict, "Refused: tiden spec list exited 3"], 1) == "outcome=unchecked"
     assert outcome(tmp_path, [verdict], 2) == "outcome=unchecked"
     assert outcome(tmp_path, [verdict], 137) == "outcome=unchecked"
+
+
+# spec: ANYM-792
+def test_the_closing_line_equals_the_workflow_literal_and_says_how_to_check_again(repo, server, tmp_path):
+    server.set(main=[spec(12)])
+    code, out = run(repo, server, {"app/core.py": "x = 2\n"}, "Spec: ANYM-99")
+    closing = out.splitlines()[-1]
+    step = next(step for step in pr_check_job()["steps"] if step.get("id") == "check")
+    [literal] = re.findall(r"^verdict='(.+)'$", step["run"], re.MULTILINE)
+    assert code == 1 and closing == literal == VERDICT
+    assert "then rerun" not in closing and "push a commit or close and reopen" in closing
+    assert outcome(tmp_path, out.splitlines(), code) == "outcome=failed"
 
 
 # spec: ANYM-405
@@ -821,7 +834,8 @@ def test_line_breaks_follow_each_language_so_no_marker_authorizes_an_unrelated_t
 
 
 GATE_FIXTURE = json.loads((Path(ROOT_SCRIPT).parents[1] / "tests/fixtures/tiden-gate-branch-041.json").read_text())
-VERDICT = "Fix the pull request body or the markers (TIDEN-CI.md, PR check), then rerun."
+VERDICT = ("Fix the pull request body or the markers (TIDEN-CI.md, PR check), then push a commit or close and reopen "
+           "the pull request: a rerun replays the old body.")
 
 
 class Clock:
