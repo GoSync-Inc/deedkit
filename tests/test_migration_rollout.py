@@ -631,7 +631,15 @@ CRITICAL_FORMS = {
     'bare-alter': ('ALTER;', 'unparsed'),
     'bare-set': ('ALTER TABLE messages SET;', 'unparsed'),
     'bare-create': ('CREATE TABLE;', 'unparsed'),
-    # Sol r2 F1: an INSERT fires a function the file creates or replaces; a created function shadows a DO_CALLS name.
+    # Sol r2 F1: an INSERT fires a trigger or rule the file creates; a created function shadows a DO_CALLS name.
+    'trigger-on-insert': ('CREATE FUNCTION synthetic_wipe() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN '
+                          'ALTER TABLE messages DROP COLUMN body; RETURN NEW; END; $f$; CREATE TABLE synthetic_fire '
+                          '(id integer); CREATE TRIGGER synthetic_fire BEFORE INSERT ON synthetic_fire FOR EACH ROW '
+                          'EXECUTE FUNCTION synthetic_wipe(); INSERT INTO synthetic_fire VALUES (1);',
+                          'WRITING FUNCTION'),
+    'rule-on-insert': ('CREATE TABLE synthetic_fire (id integer); CREATE RULE synthetic_r AS ON INSERT TO '
+                       'synthetic_fire DO INSTEAD DELETE FROM messages; INSERT INTO synthetic_fire VALUES (1);',
+                       'CREATE RULE'),
     'replaced-function-on-insert': ("CREATE OR REPLACE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
                                     "RETURN NEW; END $$; INSERT INTO messages (id) VALUES ('x');", 'FUNCTION CALL'),
     'shadowed-do-call': ('CREATE FUNCTION to_regclass(integer) RETURNS regclass LANGUAGE plpgsql AS $f$ BEGIN '
