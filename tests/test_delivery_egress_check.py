@@ -66,10 +66,11 @@ def test_dns_probes_need_an_answer_or_silence_and_the_listener_is_a_positive_con
         allowed, other = (f'127.0.0.1:{s.getsockname()[1]}' for s in (resolver, silent))
         code, out = run('check', '--timeout', '1', '--open-dns', allowed, '--blocked-dns', other)
         thread.join(5)
-    assert code == 0, out
-    assert [(r['expect'], r['outcome']) for r in json.loads(out)['results']] == [('open-dns', 'answered'), ('blocked-dns', 'timeout')]
-    # A resolver that does not answer (the port is closed now) fails as open; a name is malformed.
-    code, out = run('check', '--timeout', '1', '--open-dns', other, '--blocked-dns', 'resolver.invalid')
+        assert code == 0, out
+        assert [(r['expect'], r['outcome']) for r in json.loads(out)['results']] == [('open-dns', 'answered'), ('blocked-dns', 'timeout')]
+        # A resolver that does not answer (the port stays bound and unread, so no other socket can own it and answer)
+        # fails as open; a name is malformed.
+        code, out = run('check', '--timeout', '1', '--open-dns', other, '--blocked-dns', 'resolver.invalid')
     results = json.loads(out)['results']
     assert code == 1 and results[0]['outcome'] in ('refused', 'timeout') and not results[0]['passed']
     assert (results[1]['outcome'], results[1]['passed']) == ('malformed', False)
