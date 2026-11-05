@@ -323,7 +323,16 @@ when its fields match a file of the same call. A dry run or a `request_id` call 
 inline file as the key's own upload under a child key of the call (`agent-child:…`),
 written like `messages_prepare_file_upload` plus one chunk. Previews and intents keep only
 its `upload_id`, name, size and hash, and repeated dry runs of one payload reuse the upload.
-Staged files count toward the key's 4 active uploads and need the `upload` permission. After
+A key holds at most 10 active uploads (one full send) and the server 64. An upload lives one
+hour and is never extended; a finished or sent upload that was not inline keeps its slot until
+it expires, and an expired upload still being sent keeps it until the send ends. A prepare over
+a cap is refused with `upload_limit` (409, `retryable: false`): `limit` (`key`, or `total` for
+the server cap), `active`, `max`, a fixed `hint` and `resets_in_seconds`, the time until the
+earliest scheduled expiry in that scope. That is the schedule, not a promise of a free slot, and
+it is absent when every counted upload is past its expiry and still being sent. For `total` the
+body states only the count and the time, nothing of another key's uploads. Repeating a prepare
+with the same `request_id` costs no slot.
+Staged files count toward the key's 10 active uploads and need the `upload` permission. After
 a successful send the server deletes the staged bytes, also when the call followed a `next`
 that names them by `upload_id`, unless another live preview or unfinished send of the key's
 principal still names them; a later dry run stages the file afresh. A retry of a completed

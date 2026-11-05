@@ -53,6 +53,10 @@ def payload(error,operation='',request_id=None):
     # ANYM-748: a refused duplicate names the caller's own earlier request_id and its status, never text or send_id.
     for name in ('earlier_request_id','earlier_status'):
         if hasattr(error,name):info[name]=getattr(error,name)
+    # ANYM-795: a refused prepare's scope, count and cap; only this code, these names are common attributes.
+    if code=='upload_limit':
+        for name in ('limit','active','max'):
+            if hasattr(error,name):info[name]=getattr(error,name)
     if retry:info['retry_after_seconds']=2
     if code in EXPECTED:info['expected']=EXPECTED[code]
     if operation in ('search','search_files'):info['results_state']='not_returned_due_to_error'

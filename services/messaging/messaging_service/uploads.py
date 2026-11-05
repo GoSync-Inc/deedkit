@@ -22,6 +22,11 @@ CHUNK_BYTES=262144
 UPLOAD_BODY_BYTES=360448
 RESERVE_BYTES=1024**3
 REQUIRED=frozenset(('read','send','upload'))
+# One send takes up to send_intent.MAX_FILES files, so one key can stage a whole send (ANYM-795).
+MAX_ACTIVE_PER_KEY=10
+MAX_ACTIVE_TOTAL=64
+LIMIT_HINT=('An upload frees its slot only when it expires (get_file_upload shows expires_at); '
+    'an expired upload still being sent keeps its slot until the send ends.')
 
 
 def _permissions(p):
@@ -147,10 +152,12 @@ def prepare(store,c,p,account,chat_id,filename,mime,bytes,sha256,request_id,*,ch
     root=_root(store,create=True)
     volume=volume_key(root)
     active=c.execute("""SELECT count(*) AS total,count(*) FILTER(WHERE key_id=%s) AS own,
-        coalesce(sum(2*bytes+%s) FILTER(WHERE volume_key=%s),0) AS reserved
+        coalesce(sum(2*bytes+%s) FILTER(WHERE volume_key=%s),0) AS reserved,
+        ceil(extract(epoch FROM min(expires_at) FILTER(WHERE expires_at>clock_timestamp())-clock_timestamp())) AS total_resets,
+        ceil(extract(epoch FROM min(expires_at) FILTER(WHERE key_id=%s AND expires_at>clock_timestamp())-clock_timestamp())) AS own_resets
         FROM file_uploads WHERE state<>'expired'""",
-        (p['key_id'],STREAM_WORKSPACE_BYTES,volume)).fetchone()
-    if active['total']>=32 or active['own']>=4:raise APIError('upload_limit',409)
+        (p['key_id'],STREAM_WORKSPACE_BYTES,volume,p['key_id'])).fetchone()
+    if active['total']>=MAX_ACTIVE_TOTAL or active['own']>=MAX_ACTIVE_PER_KEY:raise _limit_error(active)
     media=c.execute('SELECT coalesce(sum(reserved_bytes),0) AS bytes FROM media_reservations WHERE volume_key=%s AND expires_at>clock_timestamp()',
         (volume,)).fetchone()['bytes']+restore_reserved(c)
     if shutil.disk_usage(root).free-media-active['reserved']-2*bytes-STREAM_WORKSPACE_BYTES<RESERVE_BYTES:
@@ -159,6 +166,20 @@ def prepare(store,c,p,account,chat_id,filename,mime,bytes,sha256,request_id,*,ch
         VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *''',
         (p['id'],p['key_id'],account,chat_id,filename,mime,bytes,sha256,volume,request_id)).fetchone()
     return _public(row,c)
+
+
+def _limit_error(active):
+    """A refused prepare's body: counters and a fixed hint, never a name, ID or another key's data (ANYM-795)."""
+    key=active['own']>=MAX_ACTIVE_PER_KEY
+    error=APIError('upload_limit',409)
+    error.limit='key' if key else 'total'
+    error.active=active['own'] if key else active['total']
+    error.max=MAX_ACTIVE_PER_KEY if key else MAX_ACTIVE_TOTAL
+    error.hint=LIMIT_HINT
+    resets=active['own_resets'] if key else active['total_resets']
+    # None: every counted upload is past its expiry and pinned by a send, so no time can be promised.
+    if resets is not None:error.resets_in_seconds=max(1,int(resets))
+    return error
 
 
 def owned(c,p,upload_id,*,lock=False):

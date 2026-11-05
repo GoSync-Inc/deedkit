@@ -639,7 +639,7 @@ def stage(store, token, arguments):
         # A request_id call's own child key first: its repeat finds its upload.
         row = staged(request_id) if is_request_id(request_id) else None
         if row is None or row['status'] == 'expired':
-            # Else a live staged upload of the same file and chat (a key holds at most 4 active ones), else a fresh
+            # Else a live staged upload of the same file and chat (a key holds at most 10 active ones), else a fresh
             # child key: a released or expired upload is never reused, however often the file is sent.
             with store.authorized(token, 'prepare_file_upload') as (c, p):
                 live = c.execute('''SELECT id FROM file_uploads WHERE principal=%s AND key_id=%s AND account=%s

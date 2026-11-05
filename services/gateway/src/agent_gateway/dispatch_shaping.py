@@ -222,6 +222,9 @@ REVIEWED_HINTS = frozenset({
     "If next_call is present, call its tool with its arguments plus your own values for caller_supplies, show the "
     "preview to the owner and, after the owner confirms, repeat this operation unchanged with the returned "
     "preview_digest; if it is absent, this key or route cannot run the preview tool.",
+    # ANYM-795: the fixed hint of a refused file upload (upload_limit).
+    "An upload frees its slot only when it expires (get_file_upload shows expires_at); an expired upload still being "
+    "sent keeps its slot until the send ends.",
 })
 
 

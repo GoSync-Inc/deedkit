@@ -82,6 +82,30 @@ def test_reviewed_hint_survives_a_query_word_that_occurs_in_it(tmp_path, case, v
     assert mcp["isError"] and mcp["structuredContent"]["hint"] == body["hint"]
 
 
+# spec: ANYM-795
+def test_upload_limit_fields_and_hint_survive_a_payload_that_contains_the_word_upload(tmp_path):
+    tool = "messages_prepare_file_upload"
+    body = {"error": "upload_limit", "request_id": "r1", "retryable": False, "next_action": "check_parameters",
+            "limit": "key", "active": 10, "max": 10, "resets_in_seconds": 90,
+            "hint": "An upload frees its slot only when it expires (get_file_upload shows expires_at); an expired "
+                    "upload still being sent keeps its slot until the send ends."}
+
+    def backend(request):
+        if request.url.path == "/v1/capabilities":
+            return httpx.Response(200, json={"permissions": ["read", "send", "upload"],
+                                             "tool_manifest": {"names": ["prepare_file_upload"]}})
+        return httpx.Response(409, json=body)
+
+    app = configured(tmp_path, backend, module="messaging", tools=[tool], grants=["read", "send", "upload", "send_file"])[0]
+    values = {"account": "synthetic", "chat_id": "chat_synthetic", "filename": "upload", "mime": "text/plain", "bytes": 1,
+              "sha256": "a" * 64, "request_id": "synthetic-request"}
+    rest, mcp = post_both(app, tool, values)
+    assert rest.status_code == 409 and mcp["isError"]
+    for key in ("error", "limit", "active", "max", "resets_in_seconds", "hint", "retryable"):
+        assert rest.json().get(key) == body[key], key
+        assert mcp["structuredContent"].get(key) == body[key], key
+
+
 # spec: ANYM-660
 def test_an_unreviewed_hint_that_repeats_the_query_is_still_dropped(tmp_path):
     body = {"error": "invalid_filter", "request_id": "r1", "retryable": False, "hint": "swap the range bounds"}
