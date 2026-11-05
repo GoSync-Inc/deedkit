@@ -56,6 +56,7 @@ BUSY_WAIT_SECONDS=7200
 # hold, so a 16:00 run gives up before messaging's 18:00 one. Its worker owns no application container.
 HOST_LOCK_WAIT_SECONDS=5400
 HOST_LOCK_POLL_SECONDS=5
+ROTATION_TOKEN_ENV='DEEDKIT_ROTATION_BACKUP_TOKEN'  # scripts/calendar_rotate.py's own backup run (ANYM-784)
 # Each wait for a worker container runs `docker container inspect` once per poll (ANYM-635).
 POLL_SECONDS=1.0
 CALENDAR_WORKER='deedkit-calendar-backup-'
@@ -1496,6 +1497,19 @@ def hold_locks(cfg,wait=HOST_LOCK_WAIT_SECONDS,busy=None,host=True):
         for fd in reversed(fds):os.close(fd)
 
 
+def rotation_admission(cfg):
+    """A calendar run waits for scripts/calendar_rotate.py (ANYM-784): while its marker exists, only the tool's own run
+    in phase `verifying` (the token the marker holds) starts. Doubt refuses. The catch-up timer starts it again later."""
+    if cfg.get('profile')!='calendar':return
+    marker=Path(cfg['directory']).parent/'rotation'/'rotation.unsettled'
+    if not os.path.lexists(marker):return
+    try:data=read_json(marker)
+    except Exception:raise RuntimeError('rotation_in_progress') from None
+    token=os.environ.get(ROTATION_TOKEN_ENV)
+    if isinstance(data,dict) and data.get('phase')=='verifying' and token and data.get('backup_token')==token:return
+    raise RuntimeError('rotation_in_progress')
+
+
 def check(cfg):
     """Read-only: does an unfinished journal exist? No Docker call, no lock, nothing created."""
     profile=cfg.get('profile','messaging');journal=Path(cfg['directory'])/'journal.json'
@@ -1521,10 +1535,13 @@ def main():
         # A recordings run does not wait for the host lock and cleans up even when it is busy; its recovery needs only the
         # runner's own lock (it touches nothing of messaging or calendar).
         recordings=runner.staged_profile  # the calls profile follows the same rule (ANYM-778)
+        if not args.recover_stop:rotation_admission(runner.cfg)  # no lock wait for a run that cannot start
         with hold_locks(runner.cfg,0 if recordings and not args.recover_stop else HOST_LOCK_WAIT_SECONDS,
                         runner.cleanup_unowned if recordings and not args.recover_stop else None,
                         not (recordings and args.recover_stop)):
             owns_lock=True
+            # Again with the locks held: the tool writes its marker under them, and this run may have waited an hour.
+            if not args.recover_stop:rotation_admission(runner.cfg)
             try:
                 if args.recover_stop:runner.recover_stop()
                 else:runner.run()
@@ -1543,8 +1560,8 @@ def main():
             except Exception:pass
             print(json.dumps({'status':'skipped','code':exc.code},separators=(',',':')),flush=True)
             raise SystemExit(0) from None
-        if not owns_lock and str(exc)=='host_lock_busy':
-            code='host_lock_busy'
+        if (not owns_lock and str(exc)=='host_lock_busy') or str(exc)=='rotation_in_progress':
+            code=str(exc)
             try:runner.status('error',code)
             except Exception:pass
         print(json.dumps({'status':'error','code':code},separators=(',',':')),flush=True)

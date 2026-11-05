@@ -1231,6 +1231,7 @@ BACKUP_RUNNER_SOURCE = "services/messaging/messaging_service/backup_runner.py"
 # `apply` and the standalone HTTP `promote` wait for a running backup (ANYM-744) and then hold it for their run;
 # `deploy --auto` runs under the unit's `flock` wrapper on the same file (DEEDKIT_BACKUP_LOCK).
 BACKUP_LOCK = Path("/opt/personal-os-probe/backups/.runner.lock")
+ROTATION_MARKER = Path("/opt/deedkit/calendar-backup/rotation/rotation.unsettled")
 # ANYM-744: the bound of that wait (`backup.wait_seconds` of the plan A configuration, `--backup-wait` of the standalone
 # promote), its maximum (the runner's own `busy_wait_seconds` maximum, BACKUP.md), the poll interval and one
 # `systemctl` probe's timeout.
@@ -1252,6 +1253,14 @@ def unsettled_marker():
 def unsettled_backup():
     if path := unsettled_marker():
         return f"backup_running: a calendar backup worker is not verified stopped ({path}); its runner settles it"
+    return None
+
+
+def rotation_running():
+    """The reason a deploy waits while scripts/calendar_rotate.py has a rotation open (ANYM-784), or None. The marker
+    outlives its process: a rotation killed half way holds new passwords that the running services may not have yet."""
+    if os.path.lexists(ROTATION_MARKER):
+        return f"rotation_running: a calendar password rotation is unsettled ({ROTATION_MARKER}); calendar_rotate.py recover or finish settles it"
     return None
 
 
@@ -5108,6 +5117,8 @@ def deploy(settings, http, *, auto=False, dry_run=False, attested=None, configs=
             return {"status": "paused", "reason": PAUSE.read_text()[:1000].strip()}
         if unsettled := unsettled_backup():
             return {"status": "busy", "reason": unsettled}
+        if rotating := rotation_running():
+            return {"status": "busy", "code": "rotation_running", "reason": rotating}
         if stale := stale_tool(s):
             return {"status": "error", "reason": stale + "; nothing changed, the next run uses it"}
         if not dry_run:

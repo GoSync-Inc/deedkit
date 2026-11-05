@@ -2380,6 +2380,89 @@ Rolling a package back: remove `archive.omi_hint` before a package downgrade (an
 
 By this plan no existing recordings isolation is weakened: `compose.recordings.yaml`, its internal networks, egress admission, the ANYM-712 rules and the no-host-address bridges stay as they are, and `recordings-egress` stays the backend's only way out. Closing evidence after the owner's step: one real new Omi conversation in the archive within about a minute of Omi finishing it, with the receiver's counters (`docker logs`: `omi_hint_receiver`, counts only), `archive_status.omi_hint` and the date on the card.
 
+## Rotate the calendar database passwords
+
+`scripts/calendar_rotate.py` (ANYM-784; stdlib only, as root, from the release's verified source directory
+`<state_directory>/<sha>/source`) rotates `fcs_owner` (`apply owner`) or `fcs_gateway` and `fcs_worker` together
+(`apply roles`). Use it after an exposure, after a restore (`--mode isolated`, before any service can reach the
+restored database) or on a schedule you start by hand. It is not autonomous and has no timer. It prints
+fingerprints (12 hex of sha256) only, never a value, a DSN or a file content; the same lines go to
+`rotation.log` beside the journal, so a dropped ssh loses nothing. Exit 0 done, 1 refused or failed (the
+line's `code` says why, `next` says what to run), 75 `busy` (nothing changed by that attempt, run it again later).
+Not in scope: Google or CalDAV credentials, the gateway keys, the messaging database.
+
+The sequence, one role set at a time:
+
+```sh
+cd <state_directory>/<sha>/source
+sudo python3 scripts/calendar_rotate.py plan        # `plan`: read-only; `ready` and `issues` say whether apply would pass
+sudo python3 scripts/calendar_rotate.py apply owner # or `apply roles`: stage, ALTER, files, stop and start of api and worker
+sudo python3 scripts/calendar_rotate.py verify      # `verify`: database, files, services, then one real calendar backup
+sudo python3 scripts/calendar_rotate.py finish      # `finish`: needs the verified state and that backup; old copies go
+sudo python3 scripts/calendar_rotate.py undo-note   # `undo-note`: what undo means
+```
+
+What each step does:
+
+- `apply` needs the runner and the installed `production.py` to read the marker (`admission_not_installed`
+  otherwise: a deploy installs both), no active call (the call gate of `production.py`, read-only, before the
+  step, before the restart and after the step), the runner's `.runner.lock`, messaging's `host_lock` and the
+  deploy locks free (`busy`), and every file of the set agreeing on one value the database accepts.
+- Files: `fcs_owner`: `postgres.env`, `runtime.json`, the backup `owner.dsn`. `fcs_gateway`: `gateway.json`,
+  `fcs_worker`: `worker.json`, where only the password in `dsn` changes (`bind`, `allowed_hosts` and
+  `allowed_origins` stay). Each keeps its owner and mode and is staged, parsed, renamed and read back.
+- The verifier is computed on the host (SCRAM-SHA-256), so the plaintext reaches no server log, argv,
+  environment or `psql` history. The `ALTER` goes over the database container's local socket. A login probe runs
+  in a throwaway container of the database's image on its internal network, scram only, with the value on stdin.
+- `verify`: the replaced value is refused and the new one accepted on fresh connections, the files hold the new
+  value, `db-roles --check` is ok through `runtime.json`, `/health` is 200, the saved container identities are the
+  same, then a real calendar backup through the new `owner.dsn`. `verify --no-backup` makes `finish` refuse.
+- Retired list: `apply owner` appends the replaced password's prefix to
+  `/opt/deedkit/calendar-backup/retired-passwords` (0600 root, one per line) once the `ALTER` settled; entries are
+  never removed. The restore card (ANYM-780) reads it.
+
+Admission: `/opt/deedkit/calendar-backup/rotation/rotation.unsettled` exists from the first byte of phase `staged`
+until `finished`, and it outlives the process. While it exists `production.py deploy` (also `--auto` and
+`--dry-run`) returns `busy` with code `rotation_running`, and a calendar backup run refuses with
+`rotation_in_progress` (the catch-up timer starts it again later; a `--recover-stop` still runs). In phase
+`verifying` only the tool's own backup passes, by the token in the marker. Other `production.py` commands (`apply`,
+`rollback`) do not read the marker: run none during a rotation. The tool holds the locks only for the instants it
+writes, and they are free while its backup runs.
+
+Phases in `journal.json` (0600, directory 0700, fsync and atomic rename): `staged` (copies of the old files on
+disk, the new value staged 0600), `altered`, `files`, `verifying`, `finished`. HUP, INT, TERM, QUIT and TSTP are
+ignored from the start of `apply`, `recover` and `finish`. A `plan` during an open rotation names the phase.
+
+After any interruption run `recover`. It is forward only: once an `ALTER` may have committed it asks the database
+which value it accepts and completes with the staged one; it never enables the replaced value again.
+
+| Interrupted | State | `recover` |
+|---|---|---|
+| before the `ALTER` was sent (`staged`) | nothing changed in the database or the files | aborts, removes the staged files and the marker; run `apply` again |
+| after the `ALTER`, before the first file | the database has the new value (or the `ALTER`'s result is uncertain, which a probe settles before any file changes), the files the old one | completes with the staged value: sends it again if needed, retired list, files, restart, `verifying` |
+| between files | some files old, some new | rewrites the rest from what each holds now |
+| a short write or a killed write | the file itself is whole (rename); a `.tmp` beside it | removes the `.tmp`, writes the file |
+| staged value lost | the journal's fingerprint no longer matches a file | generates a fresh value, sends it, rewrites every file |
+| before `verify` | files new, services restarted or not | restarts again and returns to `verifying` |
+| a failed `verify` | `verify_failed` with the failed check names | fix the cause, `recover`, `verify` |
+| after `finish` | none | `nothing_to_recover`; a kill inside `finish` is completed |
+
+Usable operator credentials exist throughout: the database container's local socket needs no password, and the old
+copies and the staged value stay on disk (`rotation/staged/<id>/`, 0600) until `finish`. An active call or a held
+lock makes `recover` answer `busy`: the marker stays and it is run again. A marker with an unreadable journal
+(`journal_unreadable`) never happens through the tool: stop and compare the database and the files by hand.
+
+Restore (ANYM-780): `--mode isolated --container <name> --profile-dir <dir> [--retired-list <file>]` on every
+subcommand rotates the roles in that container and rewrites only the profile files in that directory (the journal
+goes to `<dir>.rotation`). It refuses when the container's project has a `calendar-api` or `calendar-worker`, when
+the container is on a non-internal network, or when the directory is production state. It restarts nothing, reads
+no production credential, takes no production admission and verifies at the database level only.
+
+Undo: undo is another rotation (`apply` the same set again); an exposed value is never restored. Until ANYM-779
+moves the calendar project off its rendered Compose document, that document keeps the previous `POSTGRES_PASSWORD`
+(read only at initdb of an empty directory) and a changed `postgres.env` can read as drift (ANYM-783): those two
+cards come before the first production use.
+
 ## Image retention
 
 ```sh

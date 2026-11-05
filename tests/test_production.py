@@ -7723,6 +7723,29 @@ def test_a_missing_lock_directory_never_skips_the_lock_when_named_or_when_a_runn
     assert host.steps == [] and host.git == []
 
 
+# spec: ANYM-784
+@pytest.mark.parametrize("auto", [False, True])
+def test_a_deploy_returns_busy_while_a_calendar_rotation_is_unsettled(tmp_path, monkeypatch, auto):
+    host = Deployer(tmp_path, monkeypatch)
+    marker = tmp_path / "rotation.unsettled"
+    monkeypatch.setattr(p, "ROTATION_MARKER", marker)
+    marker.write_text('{"phase":"altered"}\n')  # its process may be long gone: the file is the admission
+    outcome = host.deploy(auto=auto)
+    assert outcome["status"] == "busy" and outcome["code"] == "rotation_running" and str(marker) in outcome["reason"]
+    assert host.steps == [] and host.git == [] and host.paused() is None
+    marker.unlink()
+    assert host.deploy(auto=auto)["status"] == "deployed"
+
+
+# spec: ANYM-784
+def test_a_rotation_keeps_a_dry_run_from_planning_a_release_and_exits_without_a_pause(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    marker = tmp_path / "rotation.unsettled"
+    monkeypatch.setattr(p, "ROTATION_MARKER", marker)
+    marker.write_text('{"phase":"verifying"}\n')
+    assert host.deploy(dry_run=True)["code"] == "rotation_running" and host.paused() is None
+
+
 # spec: ANYM-608
 @pytest.mark.parametrize("auto", [False, True])
 def test_a_deploy_returns_busy_while_a_calendar_backup_worker_is_not_verified_stopped(tmp_path, monkeypatch, auto):
