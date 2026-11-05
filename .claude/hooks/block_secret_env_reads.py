@@ -7,6 +7,7 @@ The refusal never holds the command, which may itself hold the secret. Standard 
 """
 import json
 import re
+import shlex
 import sys
 
 MAX_INPUT = 256 * 1024
@@ -100,13 +101,19 @@ class Parser:
         return end
 
     def arithmetic_end(self, start):
-        """The index after the `))` of the arithmetic that opens with `((` at start, or None when it is a subshell."""
+        """The index after the `))` of arithmetic opening with `((` at start, or None when it is commands. As bash reads it:
+        the inner parenthesis closes directly before the outer one. Quotes and a shift in a doubtful region refuse."""
         text, depth = self.text, 0
-        for index in range(start, len(text)):
-            if text[index] == "(": depth += 1
-            elif text[index] == ")":
+        for index in range(start + 1, len(text)):
+            char = text[index]
+            if char in "'\"": return None
+            if char == "(": depth += 1
+            elif char == ")":
                 depth -= 1
-                if depth == 0: return index + 1 if text[index - 1] == ")" else None
+                if depth: continue
+                if text[index + 1:index + 2] == ")": return index + 2
+                if "<<" in text[start:text.find("\n", index) % (len(text) + 1)]: raise ValueError("doubtful arithmetic")
+                return None
         return None
 
     def dollar_paren(self, index):
@@ -184,7 +191,7 @@ class Parser:
                 if not segment.words and not quoted and word == "esac":
                     cases, pattern = max(cases - 1, 0), False
                 segment.words.append(word)
-                if word == "in" and not quoted and segment.words[0] == "case":
+                if word == "in" and not quoted and without_prefix(segment.words)[:1] == ["case"]:
                     cases, pattern = cases + 1, True
                     segment.words = []
             elif pending == "in": segment.inputs.append(word)
@@ -292,10 +299,9 @@ class Parser:
                         break
             elif char == "(" and pattern:
                 index += 1  # the optional opening of a case pattern
-            elif text.startswith("((", index) and not in_word and self.arithmetic_end(index):
-                end = self.arithmetic_end(index)
-                Parser(text[index + 2:end - 2], self.depth + 1).collect_expansions(self.segments)
-                index = end
+            elif text.startswith("((", index) and not in_word and (closing := self.arithmetic_end(index)) is not None:
+                Parser(text[index + 2:closing - 2], self.depth + 1).collect_expansions(self.segments)
+                index = closing
             elif char == "(":
                 finish()
                 parens += 1
@@ -311,7 +317,7 @@ class Parser:
                     finish()
                     return index + 1
                 else:
-                    finish(keep=False)
+                    raise ValueError("unmatched parenthesis")  # a shell refuses it too; a misread must not hide a command
                 index += 1
             else:
                 buffer.append(char)
@@ -326,7 +332,10 @@ class Parser:
 
 
 def is_blocked(command, depth=0):
-    return any(segment_blocked(segment, depth) for segment in Parser(command, depth).run())
+    try:
+        return any(segment_blocked(segment, depth) for segment in Parser(command, depth).run())
+    except (ValueError, RecursionError):
+        return True  # it cannot be read as a shell would read it, so it is refused
 
 
 def segment_blocked(segment, depth):
@@ -560,9 +569,10 @@ def env_blocked(args, depth):
         word = args[index]
         split = re.fullmatch(r"(?:-[iv0]*S|--split-string=?)(.*)", word, re.DOTALL)
         if split:
+            # env splits only this payload, with no shell; the words after it stay literal arguments.
             tail = args[index + 1:] if split.group(1) else args[index + 2:]
-            head = split.group(1) or (args[index + 1] if index + 1 < len(args) else "")
-            return is_blocked(" ".join([head, *tail]), depth + 1)
+            payload = split.group(1) or (args[index + 1] if index + 1 < len(args) else "")
+            return command_blocked([*map(Word, shlex.split(payload)), *tail], depth + 1)
         if word in ("-u", "--unset", "-C", "--chdir"): index += 2
         elif is_flag(word) or ASSIGNMENT.match(word): index += 1
         else: return command_blocked(args[index:], depth + 1)
@@ -574,8 +584,8 @@ def path_value_sensitive(value):
 
 
 def pattern_reader_blocked(name, args):
-    if name == "rg" and "--files" in args: return False  # lists names; reads no content
     (letters, long_value), explicit, positional, index = PATTERN_READERS[name], False, [], 0
+    listing, found = False, False
     while index < len(args):
         word = args[index]
         index += 1
@@ -584,13 +594,14 @@ def pattern_reader_blocked(name, args):
             break
         if word.startswith("--"):
             key, equals, value = word.partition("=")
+            listing = listing or (name == "rg" and word == "--files")  # lists names; reads no content
             if not equals and key in long_value and index < len(args):
                 value = args[index]
                 index += 1
             elif not equals:
                 continue
             explicit = explicit or key in LONG_EXPLICIT
-            if key in LONG_PATH and path_value_sensitive(value): return True
+            found = found or (key in LONG_PATH and path_value_sensitive(value))
         elif is_flag(word):
             for position, char in enumerate(word[1:], 1):
                 if char not in letters: continue
@@ -599,11 +610,12 @@ def pattern_reader_blocked(name, args):
                     value = args[index]
                     index += 1
                 explicit = explicit or char in "ef"
-                if char in "fg" and path_value_sensitive(value): return True
+                found = found or (char in "fg" and path_value_sensitive(value))
                 break
         else:
             positional.append(word)
-    return any(sensitive(word) for word in (positional if explicit else positional[1:]))
+    if listing: return False
+    return found or any(sensitive(word) for word in (positional if explicit else positional[1:]))
 
 
 def decide(raw):

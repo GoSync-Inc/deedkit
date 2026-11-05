@@ -125,6 +125,14 @@ BLOCKED = [
     "docker inspect -f'{{.Config.Env}}' c",
     "docker inspect -f'{{.}}' c",
     "((printenv); ls)",
+    "((echo ok); (docker inspect c))",
+    "(('))'; printenv)",
+    "$((1)<<(2))\nprintenv",
+    "env -S 'cat a.env' ')'",
+    "rg -e PASSWORD -e --files a.env",
+    "rg -- --files a.env",
+    "ls )\nprintenv",
+    "for x in a; do case $x in a) printenv;; esac; done",
 ]
 
 ALLOWED = [
@@ -174,6 +182,11 @@ ALLOWED = [
     "((printenv))",
     "docker compose config --environment=false --services",
     "x=${y:-env}",
+    "env -S echo '$(printenv)'",
+    "echo $(( (1 + 2) * 3 ))",
+    "echo $((1 << 2))",
+    "for x in a; do case $x in env) ls;; esac; done",
+    "if true; then case $x in set|env) ls ;; esac; fi",
     "python -m messaging_service key-info --key-file /dev/stdin < /private/a.token",
 ]
 
@@ -378,6 +391,8 @@ def test_no_document_prescribes_a_blocked_command():
     module = matcher()
     listing = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z", "*.md"], check=True, capture_output=True, text=True)
     found = []
+    # A docs-only change stays docs-only (ANYM-767): the main push run checks every document, so this names one, not `.`.
+    # reads: docs/operations/production.md
     for name in filter(None, listing.stdout.split("\0")):
         path = ROOT / name
         if not path.is_file(): continue
