@@ -169,8 +169,13 @@ open rows without one; `resolve` closes open rows of the job's classes that the
 current rule would not raise (the retained revision stands); `accept` writes the
 completed revision through ingest. Rule jobs wait for the account's classification
 (`last_error` `classify_pending`). Each resolve records `message_conflicts.resolution`:
-`newer_observation` or `sender_completed` from ingest, `rule_changed:<job>@<version>`
-from a job; NULL is unknown (rows resolved before schema 57 or by older code).
+`newer_observation`, `sender_completed` or `link_completed` from ingest,
+`rule_changed:<job>@<version>` from a job; NULL is unknown (rows resolved before
+schema 57 or by older code).
+
+`telegram_link_completed` (ANYM-796, `accept`, class `telegram_other_equal_version`)
+replays a stored receipt that only gives every unsupported link of its `partial`
+revision a URL. A revision with another unsupported span stays as it is.
 
 Account-scoped `get_sync_status` (`detail=full`) shows `conflict_reevaluations`,
 one `{job, version, done, done_at, rows_resolved, last_error}` per job the

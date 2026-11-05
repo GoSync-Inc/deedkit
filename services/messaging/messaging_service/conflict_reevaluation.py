@@ -39,7 +39,7 @@ EVALUATION_TIMEOUT = 10
 TICK = 1
 KINDS = ('classify', 'resolve', 'accept')
 # What ingest's own resolves record from schema 57; NULL is unknown (legacy, or resolved by an N-1 writer).
-RESOLUTIONS = ('newer_observation', 'sender_completed')
+RESOLUTIONS = ('newer_observation', 'sender_completed', 'link_completed')
 # A resolve or accept job selects open rows by stored class; `unclassified` names no rule's evidence.
 CLASSES = tuple(sorted(name for name in EXPLANATIONS if name != UNCLASSIFIED))
 NAME = re.compile(r'[a-z][a-z0-9_]{0,47}')
@@ -67,7 +67,7 @@ def resolution_set(c, value):
 class Job:
     """`function(row)` gets a read-only mapping of one row's stored evidence (`envelope`: the receipt envelope,
     `observed`: the observed revision's snapshot, `observed_revision`, `candidate_updated_at`, `reason`,
-    `archive_version`: the message's provider version now, `tombstoned`: a provider tombstone names it,
+    `archive_version`: the message's provider version now, `archive_revision`: its revision now, `tombstoned`: a provider tombstone names it,
     `reconstructed`: migration 017 chose `observed_revision` by transaction times on a message with more revisions) and returns
     a class name (`classify`), 'keep' or 'resolve' (`resolve`), or None or a candidate envelope the current rule
     accepts as a new revision (`accept`). `classes` are fnmatch patterns over ANYM-557's classes."""
@@ -114,6 +114,15 @@ class Failed(Exception):
     """A fixed `last_error` code for this job's run."""
 
 
+def _retained_row(retained):
+    """The message row's fields ingest_outcome reads, as of the validated revision `retained`."""
+    from datetime import datetime
+    from .envelope import fingerprint
+    return {'sent_at': datetime.fromisoformat(retained['sent_at']), 'direction': retained['direction'],
+            'sender': retained['sender'], 'deleted': retained['deleted'], 'body': retained['body'],
+            'content_hash': fingerprint(retained)}
+
+
 def still_raised(row):
     """Whether the current ingest rule (archive.ingest_outcome) could raise this conflict again: the receipt envelope
     against the revision it contradicted. The provider version the archive held then is not stored; it was at least
@@ -123,15 +132,13 @@ def still_raised(row):
     from datetime import datetime
     from .archive import ingest_outcome
     from .conflict_classes import SNAPSHOT_FIELDS
-    from .envelope import fingerprint, validate
+    from .envelope import validate
     try:
         candidate, snapshot = validate(row['envelope']), row['observed']
         retained = validate({**{k: v for k, v in snapshot.items() if k not in SNAPSHOT_FIELDS},
                              'chat': snapshot['provider_chat']})
         own, at = datetime.fromisoformat(retained['updated_at']), row['candidate_updated_at']
-        old = {'sent_at': datetime.fromisoformat(retained['sent_at']), 'direction': retained['direction'],
-               'sender': retained['sender'], 'deleted': retained['deleted'], 'body': retained['body'],
-               'content_hash': fingerprint(retained)}
+        old = _retained_row(retained)
         return any(ingest_outcome({**old, 'provider_updated_at': max(own, at + step)}, candidate,
                                   snapshot)[0] == 'conflict' for step in ORDERS)
     except Exception:
@@ -140,7 +147,7 @@ def still_raised(row):
 
 def _decide(job, row):
     evidence = MappingProxyType({key: deepcopy(row[key]) for key in
-        ('envelope', 'observed', 'observed_revision', 'candidate_updated_at', 'reason', 'archive_version', 'tombstoned', 'reconstructed')})
+        ('envelope', 'observed', 'observed_revision', 'candidate_updated_at', 'reason', 'archive_version', 'archive_revision', 'tombstoned', 'reconstructed')})
     try: result = job.function(evidence)
     except Exception: raise Failed('evaluation_error') from None
     if job.kind == 'classify' and isinstance(result, str) and result in EXPLANATIONS: return result
@@ -156,7 +163,7 @@ SCOPE = '''FROM message_conflicts mc JOIN messages m ON m.id=mc.message
     WHERE m.account=%(account)s AND mc.resolved_at IS NULL AND {selector}
     AND (%(at)s::timestamptz IS NULL OR (mc.observed_at,mc.receipt_digest)>(%(at)s::timestamptz,%(digest)s::text))'''
 CANDIDATES = '''SELECT mc.receipt_digest AS digest,mc.message,mc.observed_at,mc.observed_revision,mc.reason,
-    mc.candidate_updated_at,r.envelope,v.snapshot AS observed,m.provider_updated_at AS archive_version,
+    mc.candidate_updated_at,r.envelope,v.snapshot AS observed,m.provider_updated_at AS archive_version,m.revision AS archive_revision,
     (r.digest IS NULL OR mc.observed_at<=r.received_at) AND m.revision<>1 AS reconstructed,
     EXISTS(SELECT 1 FROM provider_tombstones t WHERE t.account=m.account AND t.provider_id=m.provider_id
         AND t.provider_chat IN ((SELECT provider_chat FROM chats WHERE id=m.chat),'')) AS tombstoned
@@ -424,6 +431,29 @@ class Runner:
 
 # ANYM-622: a class for each open row stored without one (before schema 54, or by an N-1 writer later).
 register(Job('classify', REASON_VERSION, 'classify', reclassify))
+
+
+def telegram_link_completed(row):
+    """ANYM-796: the stored receipt when it completes the revision it contradicted, else None. A re-read repeating the
+    receipt is `duplicate` and never reaches the rule. Only a replay ingest would accept today: a refused one stops
+    the job for this start, so a message that moved on, a tombstoned one or unreadable evidence leaves its row open."""
+    from .archive import ingest_outcome, telegram_link_completion
+    from .conflict_classes import SNAPSHOT_FIELDS
+    from .envelope import validate
+    try:
+        if row['tombstoned'] or row['reconstructed'] or row['archive_revision'] != row['observed_revision']: return None
+        if row['archive_version'] != row['candidate_updated_at']: return None
+        candidate, snapshot = validate(row['envelope']), row['observed']
+        if not telegram_link_completion(snapshot, candidate): return None
+        retained = validate({**{k: v for k, v in snapshot.items() if k not in SNAPSHOT_FIELDS},
+                             'chat': snapshot['provider_chat']})
+        old = {**_retained_row(retained), 'provider_updated_at': row['candidate_updated_at']}
+        return dict(row['envelope']) if ingest_outcome(old, candidate, snapshot)[0] == 'edited' else None
+    except Exception:
+        return None
+
+
+register(Job('telegram_link_completed', 1, 'accept', telegram_link_completed, classes=('telegram_other_equal_version',)))
 
 
 def start(archive, account, lease):
