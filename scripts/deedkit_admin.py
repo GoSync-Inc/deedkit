@@ -59,6 +59,9 @@ TOOL_NAME = re.compile(r"[a-z][a-z0-9_]{0,63}")  # a gateway catalog tool name; 
 VALIDATORS = {"policy": ["deedkit-gateway", "--check", "--policy", "{path}", "--public-url", "https://check.invalid"],
               "registry": ["python", "agent_api.py", "--check-registry", "{path}"]}
 BACKENDS = ("messaging", "calendar", "calls")
+RECORDINGS_ID_MAX = 128  # services/recordings security.py Principal.id
+EXPIRY_MAX = 64  # fromisoformat ignores excess fractional digits, so instant() alone does not bound the text
+DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
 class AdminError(Exception):
@@ -209,6 +212,44 @@ def public_id(service: str, record: dict) -> str | None:
     return record.get("principal_id") or record.get("id")
 
 
+def recordings_principals(config: dict) -> tuple[dict[str, dict], str | None]:
+    """The recordings principals by key hash and a fixed note when they cannot be used (ANYM-772). Never raises and
+    never returns the file's text: a broken file must not stop the listing of the other backends."""
+    path = config.get("recordings_config")
+    if not path:
+        return {}, "recordings_config_not_configured"
+    if not isinstance(path, str) or not os.path.isabs(path):
+        return {}, "recordings_config_unreadable"
+    try:
+        raw = read_private(path)
+    except (OSError, ValueError, AdminError):
+        return {}, "recordings_config_unreadable"
+    try:
+        document = json.loads(raw)
+    except (ValueError, RecursionError):
+        return {}, "recordings_config_invalid"
+    entries = document.get("principals") if isinstance(document, dict) else None
+    if not isinstance(entries, list) or not all(
+            isinstance(item, dict) and isinstance(item.get("key_sha256"), str) and DIGEST.fullmatch(item["key_sha256"])
+            for item in entries):
+        return {}, "recordings_config_invalid"
+    found = {item["key_sha256"]: item for item in entries}
+    return ({}, "recordings_config_duplicate_key") if len(found) != len(entries) else (found, None)
+
+
+def clean_text(value: object, limit: int) -> bool:
+    """Safe to print: a bounded string with no control character or lone surrogate, which print() could not encode."""
+    return isinstance(value, str) and 1 <= len(value) <= limit and value.isprintable()
+
+
+def recordings_row(match: dict, now: datetime) -> dict:
+    """The public fields of a recordings principal; a value that fails validation is dropped, never copied."""
+    identity, expiry = match.get("id"), match.get("expires_at")
+    expiry = expiry if clean_text(expiry, EXPIRY_MAX) and instant(expiry) is not None else None
+    return {"public_id": identity if clean_text(identity, RECORDINGS_ID_MAX) else None, "expires_at": expiry,
+            "status": status({"expires_at": expiry}, now)}
+
+
 def collect(config: dict, run, now: datetime | None = None) -> dict:
     """The joined view: one row per gateway principal and the findings, public fields only."""
     now = now or datetime.now(timezone.utc)
@@ -220,14 +261,16 @@ def collect(config: dict, run, now: datetime | None = None) -> dict:
     registry = load_json(config["calls_registry"], "calls registry") if config.get("calls_registry") else {}
     calls = [entry for entry in registry.get("principals", []) if isinstance(entry, dict)]
     by_hash = {entry.get("key_sha256"): entry for entry in calls}
+    recordings, recordings_note = recordings_principals(config)
     labels = load_labels(config)
     pending: dict[str, list[tuple[dict, str]]] = {"messaging": [], "calendar": []}
-    rows, unconfigured = [], False
+    rows, unconfigured, holds_recordings = [], False, False
     for principal in principals:
         credentials = []
         items = principal.get("credentials") if isinstance(principal.get("credentials"), dict) else {}
         for backend, credential in sorted(items.items()):
             entry = {"backend": backend, "public_id": None, "expires_at": None, "status": "missing"}
+            holds_recordings = holds_recordings or backend == "recordings"
             token = read_token(config, credential.get("key_file", "")) if isinstance(credential, dict) else None
             if token is None:
                 entry["note"] = "key_file_unreadable"
@@ -247,6 +290,12 @@ def collect(config: dict, run, now: datetime | None = None) -> dict:
                                                 "expires_at": match.get("expires_at")}, now))
                     if match.get("archive_config"):
                         entry["archive"] = archive(config, match["archive_config"], pending)
+            elif backend == "recordings" and recordings_note:
+                entry.update(status="unknown", note=recordings_note)
+            elif backend == "recordings":
+                match = recordings.get(hashlib.sha256(token.encode()).hexdigest())
+                if match is not None:
+                    entry.update(recordings_row(match, now))
             else:
                 entry.update(status="unknown", note="unsupported_backend")
             credentials.append(entry)
@@ -256,6 +305,8 @@ def collect(config: dict, run, now: datetime | None = None) -> dict:
     unavailable, records = [], {}
     if unconfigured:
         unavailable.append({"code": "backend_unavailable", "backend": "calls", "detail": "calls: no registry configured"})
+    if holds_recordings and recordings_note:
+        unavailable.append({"code": "backend_unavailable", "backend": "recordings", "note": recordings_note})
     for service, items in pending.items():
         # The lookup and the inventory fail apart: a failed inventory keeps the rows' statuses and only loses
         # this backend's unbound_key findings.
@@ -828,6 +879,9 @@ def source_scope(config: dict, run, policy: Document, registry: Document | None,
     if entry.get("enabled") is not True or live_until(entry.get("expires_at")) is None:
         raise AdminError(f"the source {source!r} is disabled or expired; nothing changed")
     credentials = entry.get("credentials") if isinstance(entry.get("credentials"), dict) else {}
+    if "recordings" in credentials:
+        raise AdminError(f"the source {source!r} has a recordings credential; key issue --like cannot clone it; "
+                         "nothing changed")
     if set(credentials) - set(BACKENDS) or not all(isinstance(c, dict) for c in credentials.values()):
         raise AdminError(f"the source {source!r} has a credential this command cannot clone; nothing changed")
     tokens = {}
@@ -1394,6 +1448,11 @@ def holdings(config: dict, run, policy: Document, registry: Document | None, pri
     if entry is None:
         raise AdminError(f"no gateway principal {principal!r}; nothing changed")
     credentials = entry.get("credentials") if isinstance(entry.get("credentials"), dict) else {}
+    if "recordings" in credentials:
+        raise AdminError(f"{principal!r} has a recordings credential; key extend/revoke cannot change it. Editing the "
+                         "recordings private configuration alone does not extend or revoke the gateway principal or "
+                         "its other credentials: a separately reviewed cross-store operation is required (not in this "
+                         "card); nothing changed")
     if set(credentials) - set(BACKENDS) or not all(isinstance(c, dict) for c in credentials.values()):
         raise AdminError(f"{principal!r} has a credential this command does not know; nothing changed")
     now, tokens, files, calls = datetime.now(timezone.utc), {}, {}, None
