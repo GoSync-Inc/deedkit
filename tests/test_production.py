@@ -1,4 +1,5 @@
 """Promotion guards use synthetic GitHub/Compose responses; no live runtime access."""
+import ast
 import contextlib
 import copy
 from datetime import datetime, timedelta, timezone
@@ -17,6 +18,7 @@ import sys
 from types import SimpleNamespace
 import urllib.error
 
+from hypothesis import given, strategies as st
 import pytest
 import yaml
 
@@ -3227,6 +3229,73 @@ def test_production_md_states_the_manifest_invalid_pause_and_the_earlier_network
     assert "is refused as `network_unsafe` before the pause, the receipt or any file is written" in docs
 
 
+HALT_CALLS = 41  # every halt(...) of production.py; a new call raises this number and adds its code to p.HALTS
+
+
+def halt_call_problems(source, table):
+    """The number of `halt(...)` calls in `source` and, by line or by code, what breaks the parity with `table`."""
+    calls, used, problems = 0, set(), []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        if (node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", None)) != "halt":
+            continue
+        calls += 1
+        code = next((keyword.value for keyword in node.keywords if keyword.arg == "code"), None)
+        if not (isinstance(code, ast.Constant) and isinstance(code.value, str)):
+            problems.append(f"line {node.lineno}: halt has no literal code=")
+        elif code.value not in table:
+            problems.append(f"line {node.lineno}: code {code.value} is not in the table")
+        else:
+            used.add(code.value)
+    return calls, problems + [f"code {code} has no call site" for code in sorted(set(table) - used)]
+
+
+# spec: ANYM-766
+def test_every_halt_call_has_a_literal_code_of_the_table_and_the_table_no_unused_code():
+    calls, problems = halt_call_problems((ROOT / "scripts/production.py").read_text(), p.HALTS)
+    assert problems == [] and calls == HALT_CALLS
+
+
+# spec: ANYM-766
+def test_the_halt_parity_walk_names_each_kind_of_break():
+    source = ('halt("a")\nhalt(reason, code=variable)\nhalt(reason, **fields)\nfinish(**halt(helper(), code="other"))\n'
+              'self.halt("b", code="known")\n')
+    assert halt_call_problems(source, {"known": 0, "unused": 0}) == (5, [
+        "line 1: halt has no literal code=", "line 2: halt has no literal code=", "line 3: halt has no literal code=",
+        "line 4: code other is not in the table", "code unused has no call site"])
+
+
+# spec: ANYM-766
+def test_each_halt_names_an_actor_and_one_command_or_an_existing_document_anchor():
+    docs = (ROOT / "docs/operations/production.md").read_text()
+    anchors = {re.sub(r"[^a-z0-9 -]", "", line.lstrip("#").strip().lower()).replace(" ", "-")
+               for line in docs.splitlines() if re.match(r"#+ ", line)}
+    # No halt waits for section 2's owner items: production changes are agents' under AGENTS.md section 2 (D25).
+    assert {code for code, (actor, _) in p.HALTS.items() if actor != "agent"} == set()
+    assert p.BackupRunning.code not in p.HALTS  # print_result reads that code as its exit 75
+    for code, (_, step) in p.HALTS.items():
+        document, _, anchor = step.partition("#")
+        assert (document == "docs/operations/production.md" and anchor in anchors) or (
+            not anchor and step.startswith(("production.py ", "seamless_release.py "))), code
+
+
+# spec: ANYM-766
+def test_a_halt_that_may_have_no_http_attempt_or_sha_routes_to_the_document_not_the_http_status_command():
+    # Sol r1: an unfinished plan A apply, a preparation that wrote no attempt receipt, and a reason that names no SHA.
+    for code in ("attempt_unresolved", "http_release_unsettled", "plan_b_preparation_unfinished"):
+        assert p.HALTS[code][1] == "docs/operations/production.md#continuous-deployment"
+
+
+# spec: ANYM-766
+def test_the_halts_table_of_production_md_is_the_table_of_the_tool():
+    docs = (ROOT / "docs/operations/production.md").read_text()
+    section = docs.split("\n### Halts\n", 1)[1].split("\n### ", 1)[0]
+    rows = "".join(f"| `{code}` | {actor} | `{step}` |\n" for code, (actor, step) in sorted(p.HALTS.items()))
+    assert "| Code | Actor | Next |\n|---|---|---|\n" + rows in section
+    assert docs.count("(#halts)") >= 2
+
+
 # spec: ANYM-745
 def test_the_review_signal_grep_and_the_deploy_rules_cover_module_manifests():
     protocol = (ROOT / "docs/operations/review-protocol.md").read_text()
@@ -3800,6 +3869,60 @@ def test_a_dry_run_reports_the_plan_or_the_pause_reason_and_changes_nothing(tmp_
     host.changes = {NEWEST: ["services/messaging/messaging_service/migrations/036_synthetic.sql"]}
     assert "SQL inventory" in host.deploy(dry_run=True)["would_pause"]
     assert host.steps == [] and host.paused() is None and not (host.state / "deploy.json").exists()
+
+
+# spec: ANYM-766
+def test_a_halt_adds_its_code_actor_and_next_on_one_line_mode_0600_and_a_dry_run_is_unchanged(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    host.changes = {NEWEST: ["services/messaging/messaging_service/migrations/036_synthetic.sql"]}
+    planned = host.deploy(dry_run=True)
+    assert not p.PAUSE.exists() and not (host.state / "deploy.json").exists()
+    outcome = host.deploy()
+    raw = p.PAUSE.read_text()
+    assert raw.endswith("}\n") and raw.count("\n") == 1 and stat.S_IMODE(p.PAUSE.stat().st_mode) == 0o600
+    assert json.loads(raw) == outcome and outcome["reason"].startswith("the SQL inventory changed (")
+    assert planned == {"status": "plan", "would_pause": outcome["reason"], "sha": NEWEST}
+    actor, step = p.HALTS["migration_by_hand"]
+    assert (outcome["code"], outcome["actor"], outcome["next"]) == ("migration_by_hand", actor, step)
+
+
+# spec: ANYM-766
+def test_a_code_missing_from_the_table_writes_agent_and_the_halts_anchor(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    host.changes = {NEWEST: ["services/messaging/messaging_service/migrations/036_synthetic.sql"]}
+    monkeypatch.setattr(p, "HALTS", {})
+    written = host.deploy()
+    assert (written["code"], written["actor"], written["next"]) == (
+        "migration_by_hand", "agent", "docs/operations/production.md#halts")
+
+
+# spec: ANYM-766
+def test_the_range_and_enrollment_halts_keep_their_reason_under_their_own_code(tmp_path, monkeypatch):
+    path = "deploy/modules/recordings.json"
+    host = Deployer(tmp_path, monkeypatch, changes={NEWEST: [path]})
+    host.contents[f"{NEWEST}:{path}"] = MODULE_MANIFEST
+    written = host.deploy(auto=True)
+    assert written["code"] == "enroll_required" and written["reason"] == enroll_required(NEWEST)
+    p.PAUSE.unlink()
+    host.contents[f"{BASE}:{path}"], host.contents[f"{NEWEST}:{path}"] = MODULE_MANIFEST, "{not json"
+    host.settings["projects"].append({"name": "deedkit-recordings", "directory": str(tmp_path), "files": [],
+                                      "services": {"recordings-api": "recordings"}})
+    host.current(BASE)
+    assert host.deploy(auto=True)["code"] == "manifest_invalid"
+    p.PAUSE.unlink()
+    host.changes = {NEWEST: ["scripts/production.py"]}
+    host.modified = {"scripts/production.py"}
+    assert host.deploy(auto=True)["code"] == "tool_by_hand"
+
+
+# spec: ANYM-766
+def test_autodeploys_own_pause_read_keeps_working_with_the_new_keys(tmp_path, monkeypatch):
+    host = Deployer(tmp_path, monkeypatch)
+    host.changes = {NEWEST: ["services/messaging/messaging_service/migrations/036_synthetic.sql"]}
+    host.deploy()
+    steps = list(host.steps)
+    assert host.deploy() == {"status": "paused", "reason": p.PAUSE.read_text()[:1000].strip()}
+    assert host.deploy(dry_run=True)["status"] == "paused" and host.steps == steps
 
 
 def test_the_command_line_runs_deploy_only_as_the_host_operator_and_exits_1_on_a_new_pause(tmp_path, monkeypatch,
@@ -6106,6 +6229,68 @@ def status_with_freshness(tmp_path, monkeypatch, capsys, freshness):
     monkeypatch.setattr(p, "config", lambda path: {"state_directory": str(state)})
     p.main(["status"])
     return capsys.readouterr()
+
+
+def status_with_pause(tmp_path, monkeypatch, capsys, content):
+    (tmp_path / "etc").mkdir()
+    (tmp_path / "etc" / "autodeploy.pause").write_bytes(content)
+    return json.loads(status_with_freshness(tmp_path, monkeypatch, capsys, tmp_path / "freshness.json").out)
+
+
+def ago(**delta):
+    return (datetime.now(timezone.utc) - timedelta(**delta)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# spec: ANYM-766
+def test_status_prints_the_halt_with_its_waiting_time_and_keeps_the_existing_keys(tmp_path, monkeypatch, capsys):
+    reason = "r" * 1500  # past the 1000 characters of autodeploy_pause: the halt is still read whole
+    body = json.dumps({"status": "halted", "reason": reason, "at": ago(hours=3, minutes=7, seconds=10),
+                       "code": "configuration_drift", "actor": "agent", "next": "docs/operations/production.md#halts"})
+    printed = status_with_pause(tmp_path, monkeypatch, capsys, body.encode() + b"\n")
+    assert printed["sha"] == "c" * 40 and printed["autodeploy_pause"] == body[:1000]
+    assert printed["autodeploy_halt"] == {"reason": reason, "code": "configuration_drift", "actor": "agent",
+                                          "next": "docs/operations/production.md#halts", "waiting": "waiting for 3h7m"}
+
+
+# spec: ANYM-766
+def test_status_keeps_the_text_read_of_autodeploy_pause_for_a_crlf_file(tmp_path, monkeypatch, capsys):
+    printed = status_with_pause(tmp_path, monkeypatch, capsys, b"maintenance\r\nwindow\r\n")
+    assert printed["autodeploy_pause"] == "maintenance\nwindow" == printed["autodeploy_halt"]["reason"]
+
+
+# spec: ANYM-766
+@pytest.mark.parametrize("content, reason", [
+    (json.dumps({"status": "halted", "reason": "old", "at": "2026-11-01T00:00:00Z"}).encode(), "old"),
+    (json.dumps({"status": "halted", "reason": "no at", "code": "x", "actor": "agent", "next": "y"}).encode(), "no at"),
+    (json.dumps({"reason": "bad at", "at": "yesterday", "code": "x", "actor": "agent", "next": "y"}).encode(), "bad at"),
+    (json.dumps({"reason": "number", "at": 5, "code": "x", "actor": "agent", "next": "y"}).encode(), "number"),
+    (json.dumps({"reason": "future", "at": "2999-01-01T00:00:00Z", "code": "x", "actor": "agent", "next": "y"}).encode(),
+     "future"),
+    (b"owner: synthetic maintenance\n", "owner: synthetic maintenance"),
+    (b"", ""),  # the documented `touch`
+    (b"[1, 2]\n", "[1, 2]"),
+    (b"\xff\xfe paused\n", "\ufffd\ufffd paused"),
+], ids=["old-shape", "no-at", "bad-at", "number-at", "future-at", "text", "empty", "json-list", "not-utf8"])
+def test_status_prints_any_other_pause_file_as_actor_unknown_without_a_waiting_time(tmp_path, monkeypatch, capsys,
+                                                                                    content, reason):
+    printed = status_with_pause(tmp_path, monkeypatch, capsys, content)["autodeploy_halt"]
+    assert printed["reason"] == reason and printed["actor"] == "unknown" and "waiting" not in printed
+
+
+JSON_VALUES = st.recursive(st.none() | st.booleans() | st.integers() | st.floats() | st.text(),
+                           lambda inner: st.lists(inner) | st.dictionaries(st.text(), inner), max_leaves=8)
+PAUSE_FILES = st.fixed_dictionaries({}, optional={key: JSON_VALUES | st.sampled_from(["agent", "owner", "2026-11-01T00:00:00Z"])
+                                                  for key in ("reason", "at", "code", "actor", "next", "status")})
+
+
+# spec: ANYM-766
+@given(st.text() | JSON_VALUES.map(json.dumps) | PAUSE_FILES.map(json.dumps))
+def test_any_pause_text_gives_a_printable_summary_that_claims_a_wait_only_for_a_known_actor(text):
+    summary = p.halt_summary(text)
+    json.dumps(summary)
+    assert summary["actor"] in ("unknown", "agent", "owner")
+    assert ("waiting" in summary) == (summary["actor"] != "unknown")
+    assert {"reason", "code", "actor", "next"} <= summary.keys()
 
 
 # spec: ANYM-694

@@ -1265,7 +1265,7 @@ first).
    mode `isolated` have no host address; the rules are the second layer), and, from `dk-delivery0`, the tailnet (100.64.0.0/10), RFC 1918,
    link-local and metadata (169.254.0.0/16), loopback and every IPv6 packet; they allow DNS to `<ip>`
    and TCP 443 to public addresses. Undo: `rules --undo`. Writing `DELIVERY_RESOLVER` or a new
-   overlay changes the project's Compose configuration, so the next autodeploy halts and writes the
+   overlay changes the project's Compose configuration, so the next autodeploy [halts](#halts) and writes the
    pause file ("apply the next release by hand"): a plan that changes the host's Compose files or env
    file lists step 5.5's hand apply of the next green `main` SHA S2.
 5. First enrollment (owner-authorized, once; `production.py` cannot do it: a selected service must
@@ -2029,7 +2029,7 @@ start; `snapshot()` finds the running container by that label) with `"services":
 gateway), and `deploy/compose.gateway-recordings.yaml` after `compose.gateway.yaml` in the gateway project's
 `files` in BOTH `/etc/deedkit/production.json` and `/etc/deedkit/http-production.json`, so the promoted HTTP gateway
 generation joins `deedkit-recordings-backend`. The change makes the recorded configuration digests differ, so
-autodeploy halts at "apply the next release by hand". Sequence: create the pause file; back up and edit both
+autodeploy [halts](#halts) at "apply the next release by hand". Sequence: create the pause file; back up and edit both
 configuration files; `production.py prepare --sha S` and `apply --sha S` (plan A); `seamless_release.py prepare
 --sha S` and `promote --sha S` (plan B); `status`; remove the pause; `production.py deploy --dry-run` must report
 the new state current (a dry run with the pause file present returns `paused` before it checks drift). Plan A apply
@@ -2520,6 +2520,56 @@ inspection). `--dry-run` changes no release or runtime state (it may update
 the source mirror and take the locks). `status` shows `deploy.json` and the pause reason. To resume after
 a pause, fix the cause (migrate, install the tools, inspect the state), then
 remove the pause file.
+
+### Halts
+
+A halt's pause file is one JSON line, mode 0600: `status`, `reason`, `at`, any fields of the halt, and `code`, `actor`
+(`agent` or `owner`) and `next` (one command or one anchor; the `reason` names the SHA and module its placeholders stand
+for) from the table below. No code is `owner` today: production changes are agents' under AGENTS.md section 2. A code
+the table lacks writes `agent` and this section. `production.py status` keeps `autodeploy_pause` and adds
+`autodeploy_halt` with `reason`, `code`, `actor`, `next` and `waiting` (`waiting for <h>h<m>m`, from `at`; there is no time
+estimate: a halt waits for whoever acts). Any other pause file (an older tool's without a route, hand-written or empty,
+a missing, unparsable or future `at`) prints `actor: unknown` and no `waiting`. `tool-rollback` and `enroll` write their
+own pause, in that older shape. A dry run reports `would_pause` and writes nothing.
+
+| Code | Actor | Next |
+|---|---|---|
+| `attempt_unresolved` | agent | `docs/operations/production.md#continuous-deployment` |
+| `call_wait_exhausted` | agent | `docs/operations/production.md#continuous-deployment` |
+| `configuration_drift` | agent | `docs/operations/production.md#apply-and-verify` |
+| `copies_unreconciled` | agent | `docs/operations/production.md#database-copies` |
+| `deploy_receipt_malformed` | agent | `docs/operations/production.md#continuous-deployment` |
+| `deploy_refused` | agent | `docs/operations/production.md#continuous-deployment` |
+| `deploy_unknown_state` | agent | `production.py status` |
+| `enroll_required` | agent | `production.py enroll --module <module> --sha <sha> --plan` |
+| `host_locks_failed` | agent | `docs/operations/production.md#continuous-deployment` |
+| `http_release_unsettled` | agent | `docs/operations/production.md#continuous-deployment` |
+| `http_retirement_failed` | agent | `seamless_release.py status --sha <sha>` |
+| `main_unreadable` | agent | `docs/operations/production.md#continuous-deployment` |
+| `manifest_invalid` | agent | `docs/operations/production.md#recordings-anym-711` |
+| `migration_by_hand` | agent | `docs/operations/production.md#migration-releases-and-the-backup-gate` |
+| `migration_refused` | agent | `docs/operations/production.md#unattended-migrations` |
+| `migration_unsettled` | agent | `docs/operations/production.md#unattended-migrations` |
+| `migration_wait_exhausted` | agent | `docs/operations/production.md#unattended-migrations` |
+| `plan_a_preparation_unfinished` | agent | `docs/operations/production.md#prepare-and-inspect` |
+| `plan_a_refused` | agent | `docs/operations/production.md#prepare-and-inspect` |
+| `plan_a_rolled_back` | agent | `docs/operations/production.md#roll-back-the-current-release` |
+| `plan_a_unknown_state` | agent | `production.py status` |
+| `plan_b_preparation_unfinished` | agent | `docs/operations/production.md#continuous-deployment` |
+| `plan_b_stopped` | agent | `seamless_release.py status --sha <sha>` |
+| `registry_unreachable` | agent | `docs/operations/production.md#ci-published-images` |
+| `release_not_applied` | agent | `docs/operations/production.md#apply-and-verify` |
+| `release_not_on_main` | agent | `docs/operations/production.md#continuous-deployment` |
+| `rollback_failed` | agent | `docs/operations/production.md#roll-back-the-current-release` |
+| `tool_blob_mismatch` | agent | `docs/operations/production.md#deploy-tool-updates` |
+| `tool_by_hand` | agent | `docs/operations/production.md#deploy-tool-updates` |
+| `tool_not_descended` | agent | `docs/operations/production.md#deploy-tool-updates` |
+| `tool_release_mismatch` | agent | `docs/operations/production.md#deploy-tool-updates` |
+| `tool_rolled_back` | agent | `docs/operations/production.md#deploy-tool-updates` |
+| `tool_self_test_failed` | agent | `docs/operations/production.md#deploy-tool-updates` |
+| `tool_switch_failed` | agent | `docs/operations/production.md#deploy-tool-updates` |
+| `tool_update_stopped` | agent | `docs/operations/production.md#deploy-tool-updates` |
+| `tool_update_unresolved` | agent | `docs/operations/production.md#deploy-tool-updates` |
 
 ### Deploy tool updates
 
