@@ -227,12 +227,14 @@ def test_the_restore_procedure_is_linked_and_its_commands_parse():
 
 
 FAKE_DOCKER = r'''#!/usr/bin/env python3
-import json, os, sys
+import fcntl, json, os, sys
 from pathlib import Path
-log = Path(os.environ['FAKE_LOG'])
-calls = len(log.read_text().splitlines()) if log.exists() else 0
 args = sys.argv[1:]
-with log.open('a') as file:
+# Under a lock: both sides of `restore run ... | sql` start at once, and each call must get its own number.
+with open(os.environ['FAKE_LOG'], 'a+') as file:
+    fcntl.flock(file, fcntl.LOCK_EX)
+    file.seek(0)
+    calls = len(file.read().splitlines())
     file.write(json.dumps(args) + '\n')
 if args[0] in ('run', 'compose') and not sys.stdin.isatty():
     sys.stdin.read()
