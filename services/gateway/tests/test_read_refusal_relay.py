@@ -9,6 +9,7 @@ import pytest
 
 from test_strict_arguments import post_both
 from test_diagnostics import configured
+from test_messages_send_inline import gateway
 
 BODIES = {
     ("messages_list_chats", "my_roles"): (
@@ -90,13 +91,7 @@ def test_upload_limit_fields_and_hint_survive_a_payload_that_contains_the_word_u
             "hint": "An upload frees its slot only when it expires (get_file_upload shows expires_at); an expired "
                     "upload still being sent keeps its slot until the send ends."}
 
-    def backend(request):
-        if request.url.path == "/v1/capabilities":
-            return httpx.Response(200, json={"permissions": ["read", "send", "upload"],
-                                             "tool_manifest": {"names": ["prepare_file_upload"]}})
-        return httpx.Response(409, json=body)
-
-    app = configured(tmp_path, backend, module="messaging", tools=[tool], grants=["read", "send", "upload", "send_file"])[0]
+    app, _ = gateway(tmp_path, lambda _: httpx.Response(409, json=body))
     values = {"account": "synthetic", "chat_id": "chat_synthetic", "filename": "upload", "mime": "text/plain", "bytes": 1,
               "sha256": "a" * 64, "request_id": "synthetic-request"}
     rest, mcp = post_both(app, tool, values)
