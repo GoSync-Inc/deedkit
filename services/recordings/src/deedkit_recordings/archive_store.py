@@ -21,6 +21,7 @@ HEADROOM = 64 * 1024 ** 2
 QUEUE_LIMIT = 10000
 HEAD_SLICE = 100
 FAR = 1e18  # `due` of a record that waits for a changed list fingerprint instead of a clock
+STAGES = (6 * 3600, 48 * 3600)  # seconds after creation at which a saved Omi record gets its scheduled second looks
 WEEK = 7 * 86400  # a provider_missing Omi record is checked (without a transcript) at most this often
 DAY = 86400  # `response_too_large` backs off this long: the same body will not shrink within the hour
 # An Omi record that answered 404 twice in a row (merged away, deleted or locked) is `provider_missing`: its stored text
@@ -196,6 +197,16 @@ def pending_gap(metadata, now):
     if age < 86400:
         return 3 * 3600
     return 86400 if age < 14 * 86400 else None
+
+
+def stage_due(metadata, now):
+    """When a saved Omi record is read again: the first stage after `now`, FAR when none is left or `created_at` is unusable.
+    Computed from the clock alone, so a read at or after a stage time, whoever caused it, counts as that stage."""
+    created = parse_time(metadata.get('created_at'))
+    if created is None:
+        return FAR
+    moment = datetime.fromisoformat(created.replace('Z', '+00:00')).timestamp()
+    return next((moment + stage for stage in STAGES if moment + stage > now), FAR)
 
 
 def fixed_bytes():
