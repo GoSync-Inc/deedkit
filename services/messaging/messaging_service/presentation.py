@@ -554,7 +554,7 @@ def render(method, result, detail, include_coverage=False):
                     'pending_capture_events','last_capture_commit_at','qualifications')
                 and v is not None and (k!='qualifications' or v)}
             row['history']={k:v for k,v in source.get('history',{}).items()
-                if k in ('observed_chats','unknown_chats','full_history_verified','gap_chats',
+                if k in ('observed_chats','unknown_chats','full_history_verified','gap_chats','gap_cleared_chats',
                     'catchup_pending_chats','configured_window','last_scan_at')}
             row['operations']={name:{k:v for k,v in operation.items()
                 if k in ('state','reason_code','pending_events','collector_running','retry_at','next_action',

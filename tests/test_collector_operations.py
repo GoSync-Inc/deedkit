@@ -2,8 +2,11 @@
 import asyncio
 from datetime import datetime, timezone
 import json
+import os
+from pathlib import Path
 import shutil
 
+from hypothesis import given, strategies as st
 import pytest
 
 from messaging_service.collector_state import CollectorState, session_lock
@@ -308,6 +311,163 @@ def test_explicit_owner_resume_clears_only_the_selected_terminal_gate(wa):
     assert w.state.connection_gate()=={'blocked':False,'remaining_seconds':0}
     with s.pool.connection() as c:
         with pytest.raises(ValueError,match='connection_not_blocked'):resume(c,w.account)
+
+
+GAP_CHAT='123@c.us'
+
+
+def flag_gap(w):
+    """Run real passes until the provider has no bridge to the old head."""
+    asyncio.run(w.sync_once())
+    w.provider.messages=[event(20),event(21)]
+    asyncio.run(w.sync_once());asyncio.run(w.sync_once())
+    progress=w.state.progress(GAP_CHAT,'user');assert progress['gap'] is True
+    return progress
+
+
+def clear(s,account,chat=GAP_CHAT):
+    from messaging_service.collector_control import clear_gap
+    with s.pool.connection() as c:return clear_gap(c,account,chat)
+
+
+def clear_during_next_pass(w,s,prepare=lambda:None):
+    original=w.state.begin_attempt
+    def begin(chat,kind):
+        progress=original(chat,kind);w.state.begin_attempt=original
+        assert clear(s,w.account)=='gap_cleared';prepare()
+        return progress
+    w.state.begin_attempt=begin
+    asyncio.run(w.sync_once())
+    return w.state.progress(GAP_CHAT,'user')
+
+
+# spec: ANYM-700
+def test_clear_gap_removes_only_the_flag_and_records_the_operator(wa):
+    w,s,_=wa;before=flag_gap(w)
+    assert clear(s,w.account)=='gap_cleared'
+    after=w.state.progress(GAP_CHAT,'user')
+    assert 'gap' not in after and after['gap_cleared_by']=='operator' and type(after['gap_cleared_at']) is float
+    assert {k:v for k,v in after.items() if not k.startswith('gap_cleared')}=={k:v for k,v in before.items() if k!='gap'}
+
+
+# spec: ANYM-700
+def test_clear_gap_refuses_a_chat_without_the_flag_unknown_chats_and_bad_input(wa):
+    w,s,_=wa;asyncio.run(w.sync_once())
+    before=w.state.progress(GAP_CHAT,'user')
+    for account,chat,code in ((w.account,GAP_CHAT,'gap_not_set'),(w.account,'999@c.us','chat_not_found'),
+            ('wa-other',GAP_CHAT,'chat_not_found'),(w.account,'not a chat','invalid_chat'),
+            ('bad account',GAP_CHAT,'invalid_account')):
+        with pytest.raises(ValueError,match=code):clear(s,account,chat)
+    assert w.state.progress(GAP_CHAT,'user')==before
+
+
+# spec: ANYM-700
+def test_clear_gap_repeat_changes_nothing(wa):
+    w,s,_=wa;flag_gap(w);clear(s,w.account)
+    first=w.state.progress(GAP_CHAT,'user')
+    assert clear(s,w.account)=='gap_already_cleared'
+    assert w.state.progress(GAP_CHAT,'user')==first
+
+
+# spec: ANYM-700
+def test_clear_committed_during_a_pass_stays_cleared(wa):
+    w,s,_=wa;flag_gap(w)
+    after=clear_during_next_pass(w,s)
+    assert 'gap' not in after and after['gap_cleared_by']=='operator'
+    assert after['gap_cleared_at']>after['last_attempt_at']
+    with s.pool.connection() as c:
+        health=c.execute('SELECT detail_code FROM collector_health WHERE account=%s',(w.account,)).fetchone()
+    assert health['detail_code']=='whatsapp_history_partial'
+    asyncio.run(w.sync_once())
+    assert 'gap' not in w.state.progress(GAP_CHAT,'user')
+
+
+# spec: ANYM-700
+def test_a_pass_that_sets_a_new_gap_after_a_clear_keeps_the_new_gap(wa):
+    w,s,_=wa;flag_gap(w)
+    def older_history_gone():w.provider.messages=[event(30)]
+    after=clear_during_next_pass(w,s,older_history_gone)
+    assert after['gap'] is True and after['gap_cleared_by']=='operator'
+    history=source(w,s)['history'];assert history['gap_chats']==1 and history['gap_cleared_chats']==0
+
+
+# spec: ANYM-700
+def test_status_and_evidence_after_the_last_gap_is_cleared(wa):
+    from messaging_service.chat_evidence import history,rows
+    w,s,_=wa;flag_gap(w)
+    scope={'accounts':[w.account],'chat_ids':None}
+    with s.pool.connection() as c:
+        row=get_sync_status(c,scope)['sources'][0]
+        assert history(rows(c,scope)[0])['gaps']==['catchup_gap']
+    assert row['history']['gap_chats']==1 and row['history']['gap_cleared_chats']==0
+    assert row['detail_code']==row['archive_detail_code']=='whatsapp_catchup_gap'
+    assert 'provider_history_gaps' in row['alerts']
+    clear(s,w.account)
+    with s.pool.connection() as c:
+        row=get_sync_status(c,scope)['sources'][0];evidence=history(rows(c,scope)[0])
+    # Before the next pass rewrites the stored code: the reader follows the flag.
+    assert row['history']['gap_chats']==0 and row['history']['gap_cleared_chats']==1
+    assert row['detail_code']==row['archive_detail_code']=='whatsapp_history_partial'
+    assert row['detail']['next_action']!='inspect_chat_gaps' and 'provider_history_gaps' not in row['alerts']
+    assert row['history']['full_history_verified'] is False and evidence['gaps']==[]
+
+
+# spec: ANYM-700
+def test_clear_gap_command_is_exclusive_and_a_failed_run_changes_nothing(wa,tmp_path,monkeypatch,capsys):
+    from messaging_service.collector_control import main
+    w,s,_=wa;before=flag_gap(w)
+    dsn=tmp_path/'owner.dsn';dsn.write_text(Path(os.environ['PROBE_TEST_DSN_FILE']).read_text());dsn.chmod(0o600)
+    base=['collector_control','--dsn-file',str(dsn),'--account',w.account]
+    monkeypatch.setattr('sys.argv',base+['--resume','--clear-gap',GAP_CHAT])
+    with pytest.raises(SystemExit) as exit_info:main()
+    assert exit_info.value.code==2
+    capsys.readouterr()
+    monkeypatch.setattr('sys.argv',base+['--clear-gap','not a chat'])
+    with pytest.raises(SystemExit) as exit_info:main()
+    assert exit_info.value.code==1 and capsys.readouterr().out.strip()=='invalid_chat'
+    # A held row lock runs into the lock timeout; the output is one fixed code.
+    monkeypatch.setattr('sys.argv',base+['--clear-gap',GAP_CHAT])
+    with s.pool.connection() as c:
+        c.execute('SELECT 1 FROM whatsapp_checkpoints WHERE account=%s FOR UPDATE',(w.account,))
+        with pytest.raises(SystemExit) as exit_info:main()
+    assert exit_info.value.code==1 and capsys.readouterr().out.strip()=='clear_gap_failed'
+    assert w.state.progress(GAP_CHAT,'user')==before
+    main()
+    assert capsys.readouterr().out.strip()=='gap_cleared' and 'gap' not in w.state.progress(GAP_CHAT,'user')
+
+
+# spec: ANYM-700
+def test_clear_gap_command_reports_one_failure_when_the_commit_fails(tmp_path,monkeypatch,capsys):
+    from messaging_service import collector_control
+    class CommitFails:
+        def __enter__(self):return self
+        def __exit__(self,*_):raise collector_control.psycopg.OperationalError('commit failed')
+    monkeypatch.setattr(collector_control.psycopg,'connect',lambda *_,**__:CommitFails())
+    monkeypatch.setattr(collector_control,'clear_gap',lambda *_:'gap_cleared')
+    dsn=tmp_path/'owner.dsn';dsn.write_text('synthetic');dsn.chmod(0o600)
+    with pytest.raises(SystemExit) as exit_info:collector_control.run_clear_gap(dsn,'wa-one',GAP_CHAT)
+    assert exit_info.value.code==1 and capsys.readouterr().out.strip()=='clear_gap_failed'
+
+
+POSITION=st.lists(st.one_of(st.integers(0,2**40),st.text(max_size=8)),max_size=2)
+PROGRESS=st.dictionaries(st.sampled_from(('head','history_before','catchup_before','catchup_head','history_exhausted','other')),
+    st.one_of(POSITION,st.booleans()))
+CLOCK=st.one_of(st.none(),st.floats(0,2e9),st.integers(0,2**31),st.text(max_size=4),st.booleans())
+
+
+# spec: ANYM-700
+@given(PROGRESS,CLOCK,CLOCK,st.booleans(),st.booleans())
+def test_merge_of_a_stored_clear_touches_only_the_gap_keys(base,start,cleared,had_gap,gap_set):
+    from messaging_service.whatsapp_collector import merge_gap_clear
+    progress={**base,'last_attempt_at':start};progress.update({'gap':True} if had_gap or gap_set else {})
+    stored={'gap_cleared_at':cleared,'gap_cleared_by':'operator'}
+    original=dict(progress);merge_gap_clear(progress,stored,gap_set)
+    gap_keys=('gap','gap_cleared_at','gap_cleared_by')
+    assert {k:v for k,v in progress.items() if k not in gap_keys}=={k:v for k,v in original.items() if k not in gap_keys}
+    numbers=all(type(v) in (int,float) for v in (start,cleared))
+    later=numbers and cleared>start
+    assert ('gap' in progress)==('gap' in original and (gap_set or not later))
+    assert ('gap_cleared_at' in progress)==bool(later)
 
 
 def test_post_ready_failure_file_is_read_even_without_an_rpc_in_flight(tmp_path):

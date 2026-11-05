@@ -60,7 +60,7 @@ def _history(platform, catalog_ids, rows):
     elif platform == 'whatsapp':
         result['checkpoint_chats'] = sum(isinstance(row['wa_progress'], dict) for row in rows)
         result.update(successful_scan_chats=0, not_scanned_chats=0,
-                      provider_history_exhausted=0, catchup_pending_chats=0, gap_chats=0)
+                      provider_history_exhausted=0, catchup_pending_chats=0, gap_chats=0, gap_cleared_chats=0)
         for row in rows:
             progress = row['wa_progress']
             if not isinstance(progress, dict):
@@ -77,6 +77,7 @@ def _history(platform, catalog_ids, rows):
             result['provider_history_exhausted'] += progress['history_exhausted']
             result['catchup_pending_chats'] += bool(progress.get('catchup_before'))
             result['gap_chats'] += progress.get('gap') is True
+            result['gap_cleared_chats'] += progress.get('gap') is not True and progress.get('gap_cleared_at') is not None
     else:
         result['unknown_chats'] = result['observed_chats']
     return result
@@ -255,6 +256,10 @@ def get_sync_status(c, p):
             if row.get('archive_detail_code')=='version_conflict' and not row['active_conflicts']:
                 row['archive_detail_code']='coverage_not_reconciled'
             row['deletions']=deletion_status.get(account) or {}
+            # ANYM-700: the stored code waits for the next collector pass; the flag is the truth.
+            if not row['history'].get('gap_chats'):
+                for key in ('detail_code','archive_detail_code'):
+                    if row.get(key)=='whatsapp_catchup_gap':row[key]='whatsapp_history_partial'
             row['detail']=describe(row.get('detail_code'))
             row['archive_detail']=describe(row.get('archive_detail_code'))
             if row.get('archive_detail_code')=='version_conflict':
