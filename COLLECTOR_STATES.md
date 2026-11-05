@@ -26,8 +26,10 @@ account queues, processing profile summaries or lease observations.
   browser engine ran out of earlier messages), not that messages are proven lost:
   live capture runs independently. The native engine never sets it (its pages
   report `exhausted: false`), so a gap on a native account was set earlier, under
-  the browser engine. Nothing clears the flag today (as of main b74761bd): it
-  stays after a later traversal covers the hole. `catchup_pending_chats`
+  the browser engine. The flag clears only by the owner's `--clear-gap` command
+  below, never by a later traversal. `history.gap_cleared_chats` counts chats
+  without a flag whose last gap was cleared by hand; a clear is a judgement from
+  the archive, not a continuity claim. `catchup_pending_chats`
   is a different count: chats whose catch-up is still walking back.
   Reconciliation and backfill pages use their own durable spool (WhatsApp pages,
   Telegram `history/` beside the live spool); `history.pending_events` counts them,
@@ -250,6 +252,22 @@ python -m messaging_service.collector_control --dsn-file /run/secrets/owner.dsn 
 This owner-only command does not pair, send, delete a session or clear history
 gaps/conflicts. It is not an MCP tool. The running blocked supervisor observes
 the explicit resume, or a later collector start proceeds using the same session.
+
+When the archive shows a flagged WhatsApp chat to be covered, the owner may clear
+its history-gap flag, one chat at a time:
+
+```sh
+python -m messaging_service.collector_control --dsn-file /run/secrets/owner.dsn \
+  --account example-whatsapp --clear-gap 12345@c.us
+```
+
+It removes only `gap` from that chat's checkpoint and records `gap_cleared_at` and
+`gap_cleared_by=operator`; it makes no provider call and is not an MCP tool. It
+prints one code: `gap_cleared`, `gap_already_cleared` (exit 0), or `invalid_account`,
+`invalid_chat`, `chat_not_found`, `gap_not_set`, `clear_gap_failed` (exit 1, no
+change). This is a judgement based on the archive, not on the provider: the chat
+then reads as if it had no gap, and `exhausted` keeps its meaning. A later pass that
+again cannot reach the head sets the flag again.
 
 `last_commit` distinguishes `captured_at` from provider message time and gives
 `committed_by`, an upper bound recorded after the archive transaction returns.

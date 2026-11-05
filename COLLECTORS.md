@@ -213,7 +213,9 @@ boundaries, independently from live callbacks and client ACK. A burst spanning
 several pages is reconciled back to the last committed head before advancing it.
 Loading at most four provider history batches per call bounds one request; a
 cursor not yet reached stays pending, not exhausted. An unavailable bridge to the
-old head is reported as a gap. A linked device's exhausted history is always
+old head is reported as a gap; the flag clears only by the owner's `--clear-gap`
+command (COLLECTOR_STATES.md), a judgement based on the archive, not on the
+provider. A linked device's exhausted history is always
 **partial source coverage**, never proof of a full account archive. Same-second
 provider ordering, very deep browser history after restart, old edits/deletions,
 media keys and expired links must still be tested with a real account. Status
