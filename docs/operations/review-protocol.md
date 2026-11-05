@@ -52,8 +52,8 @@ list: release, deploy and `production.py`, sends and live provider-session code.
   as in a migration, is a gated change (process.md section 2), never a `Deletes:` item; only a service-run DELETE of
   rows a card or docs/DATA-POLICY.md names is one.
 
-  A host-tool change still waits for the owner to install it before autodeploy resumes
-  (docs/operations/production.md).
+  A host-tool change reaches the host through the tool's own update; where it cannot, autodeploy
+  pauses until an agent installs it (docs/operations/production.md, "Deploy tool updates").
 
 - A format the installed host tool reads (manifest keys, configuration shape, receipt fields) never gains a required
   part in the PR that first uses it: the part is optional, or the tool that reads it merges and installs first and the
