@@ -172,6 +172,14 @@ completed revision through ingest. Rule jobs wait for the account's classificati
 `newer_observation` or `sender_completed` from ingest, `rule_changed:<job>@<version>`
 from a job; NULL is unknown (rows resolved before schema 57 or by older code).
 
+`telegram_link_completed` (ANYM-796, `accept`, class `telegram_other_equal_version`)
+replays a stored receipt that only gives every unsupported link of its `partial`
+revision a URL. A revision with another unsupported span stays as it is.
+`telegram_link_settled` (`resolve`, same class) closes a receipt of the same observation
+once another receipt or a re-read has made that completion; its row keeps the revision it
+contradicted as `resolved_revision`. A link completion clears this job's watermark for
+the account, so its next start scans the class's open rows again.
+
 Account-scoped `get_sync_status` (`detail=full`) shows `conflict_reevaluations`,
 one `{job, version, done, done_at, rows_resolved, last_error}` per job the
 account's collector has run; empty before a rule card registers a job. `last_error`

@@ -14,7 +14,7 @@ from .identifiers import ACCOUNT_RE
 from .media_retry import MEDIA_ATTEMPT_CAPS,MEDIA_MAX_ATTEMPTS,MEDIA_PERMANENT_CODES,MEDIA_RATE_LIMIT_FREE_DAYS,retry_delay
 from .envelope import canonical, fingerprint, stable_id, validate
 from .store import serial as serial
-from .incoming_formatting import known as known_formatting, unknown as unknown_formatting, wire_digest
+from .incoming_formatting import credential_link, known as known_formatting, unknown as unknown_formatting, validate as validate_formatting, wire_digest
 
 # The retry-exhausted sweep has no selective index: one Archive (a collector)
 # runs it on its first media claim for an account, then at most once per this.
@@ -111,6 +111,31 @@ def telegram_web_preview_refresh(retained,candidate,version):
         return False
 
 
+def telegram_link_completion(retained,candidate):
+    """True when the candidate's formatting only turns every unsupported link of a `partial` retained revision into a
+    supported link at the same span (ANYM-796). `retained` is the revision snapshot, `candidate` a validated envelope.
+    A candidate still `partial` keeps today's outcome, so a link beside another unsupported span stays a conflict. Pure,
+    so the conflict re-evaluation can call it; evidence it cannot read is no completion, never an exception inside ingest."""
+    try:
+        if candidate['platform']!='telegram' or retained['platform']!='telegram' or retained['deleted'] or candidate['deleted']:
+            return False
+        before=validate_formatting(retained['formatting'],retained['body'],'telegram')
+        after=validate_formatting(candidate['formatting'],candidate['body'],'telegram')
+        links=before['unsupported_entities']
+        if before['state']!='partial' or before['warnings']!=['native_link_unsupported'] or after['state']!='observed' or not links:
+            return False
+        added=list(after['entities'])
+        for span in before['entities']:
+            if span not in added:return False
+            added.remove(span)
+        # A login-code link is never captured, so a stored candidate holding one completes nothing.
+        if any(span['type']!='text_link' or credential_link(span['url']) for span in added):return False
+        spans=lambda items:sorted((span['type'],span['offset'],span['length']) for span in items)
+        return spans(added)==spans(links)
+    except (KeyError,TypeError,ValueError,AttributeError):
+        return False
+
+
 def whatsapp_unreadable_shape(e):
     """A WhatsApp observation that could not be read: kind `unknown`, no text, no attachment."""
     return (e['platform']=='whatsapp' and e.get('metadata',{}).get('message_kind')=='unknown'
@@ -123,7 +148,8 @@ _SNAPSHOT=object()
 def ingest_outcome(old,e,retained_snapshot,sender_alias=False,retained_buttons=_SNAPSHOT):
     """What ingest does with the validated candidate `e` against the retained message row `old` (None: a new message)
     and the retained revision's snapshot: (outcome, sender_completed, sender_device_only, unreadable, sent_at_jitter,
-    jitter_version, body_completed, web_preview_refresh, known_candidate, known_retained, old_format). The version a
+    jitter_version, body_completed, web_preview_refresh, known_candidate, known_retained, old_format, link_completed).
+    The version a
     rule compares with is `old['provider_updated_at']`. `sender_alias` is ingest's ANYM-559 lookup, a database read:
     the caller makes it and has already put the retained sender into `e`. Pure, so conflict re-evaluation asks the
     same rule whether it would still raise a stored conflict (ANYM-621); it passes no alias, which keeps a row raised
@@ -195,6 +221,10 @@ def ingest_outcome(old,e,retained_snapshot,sender_alias=False,retained_buttons=_
     web_preview_refresh=bool(old and retained_snapshot and not old['deleted']
         and telegram_web_preview_refresh(retained_snapshot,e,old['provider_updated_at'])
         and fingerprint({**e,'media':retained_snapshot['media']})==old['content_hash'])
+    # A re-read at the retained provider version that gives an old unsupported link its URL improves the revision
+    # stored as `partial`: a new revision, the earlier one stays readable (ANYM-796).
+    link_completed=bool(old and retained_snapshot and not old['deleted'] and old['provider_updated_at']==updated
+        and old['content_hash']==content and telegram_link_completion(retained_snapshot,e))
     if old:
         if old['deleted'] and not e['deleted']: outcome='tombstoned'
         elif sender_completed:outcome='edited'
@@ -207,13 +237,13 @@ def ingest_outcome(old,e,retained_snapshot,sender_alias=False,retained_buttons=_
               or old['sender']!=e['sender']): outcome='conflict'
         elif old['content_hash']==content and not (formatting_changed or formatting_completed or buttons_changed): outcome='unchanged'
         elif old['provider_updated_at'] and updated<old['provider_updated_at']: outcome='stale'
-        elif old['content_hash']==content and formatting_completed:outcome='edited'
+        elif old['content_hash']==content and (formatting_completed or link_completed):outcome='edited'
         elif (old['provider_updated_at']==updated and not e['deleted']): outcome='conflict'
         else: outcome='deleted' if e['deleted'] else 'edited'
         if sender_alias and outcome not in ('unchanged','stale') and old['provider_updated_at']==updated:outcome='conflict'
     elif e['deleted']: outcome='deleted'
     return (outcome,sender_completed,sender_device_only,unreadable,sent_at_jitter,jitter_version,body_completed,
-            web_preview_refresh,known_candidate,known_retained,old_format)
+            web_preview_refresh,known_candidate,known_retained,old_format,link_completed)
 
 
 def effective_buttons(c,mid,old,retained_snapshot):
@@ -331,7 +361,8 @@ class Archive:
             # A WhatsApp observation that could not be read (kind `unknown`, no text, no attachment)
             # may create its chat but never rewrites the chat's title or type.
             unreadable_shape=whatsapp_unreadable_shape(e)
-            if unreadable_shape:c.execute('''INSERT INTO chats(id,account,title,provider_chat,chat_type)
+            # So does a stored receipt's replay: the chat row may have moved on since (ANYM-796).
+            if unreadable_shape or replay:c.execute('''INSERT INTO chats(id,account,title,provider_chat,chat_type)
                 VALUES(%s,%s,%s,%s,%s) ON CONFLICT(id) DO NOTHING''',(cid,aid,e['chat_title'],e['chat'],chat_type))
             else:c.execute('''INSERT INTO chats(id,account,title,provider_chat,chat_type) VALUES(%s,%s,%s,%s,%s)
                 ON CONFLICT(id) DO UPDATE SET
@@ -360,9 +391,17 @@ class Archive:
                     (mid,old['revision'])).fetchone()
                 retained_snapshot=retained['snapshot'] if retained else None
             (outcome,sender_completed,sender_device_only,unreadable,sent_at_jitter,jitter_version,body_completed,
-             web_preview_refresh,known_candidate,known_retained,old_format)=ingest_outcome(old,e,retained_snapshot,sender_alias,
+             web_preview_refresh,known_candidate,known_retained,old_format,link_completed)=ingest_outcome(old,e,retained_snapshot,sender_alias,
                 effective_buttons(c,mid,old,retained_snapshot))
             if replay and outcome!='edited':raise ValueError('replay_not_accepted')
+            if link_completed and outcome=='edited':
+                # The same provider version: the new revision keeps the retained keyboard, as a same-version
+                # observation does (ANYM-658). Metadata is outside the content hash.
+                kept=effective_buttons(c,mid,old,retained_snapshot)
+                metadata={k:v for k,v in (e.get('metadata') or {}).items() if k!='buttons'}
+                if kept is not None:metadata['buttons']=kept
+                e={k:v for k,v in e.items() if k!='metadata'}
+                if metadata:e['metadata']=metadata
             # An incomplete observation of the same retained provider body must
             # not erase known formatting, including authenticated sender repair.
             inherited_format=bool(old and known_retained and not known_candidate and not e['deleted']
@@ -485,6 +524,11 @@ class Archive:
                     if equivalent:c.execute('''UPDATE message_conflicts SET resolved_at=clock_timestamp(),'''+resolution_set(c,'sender_completed')+'''
                         resolved_revision=%s WHERE message=%s AND receipt_digest=ANY(%s) AND resolved_at IS NULL''',
                         (revision,mid,equivalent))
+            if link_completed and outcome=='edited':
+                # A stored receipt of this observation that the settle job passed earlier is closable now: its next
+                # start scans the account's open rows of the class again, in its own bounded batches (ANYM-796).
+                from .conflict_reevaluation import rescan
+                rescan(c,aid,'telegram_link_settled')
             c.execute("""UPDATE source_status SET last_ingest_at=clock_timestamp(),status='receiving',
                 detail_code=CASE WHEN detail_code='version_conflict' THEN detail_code ELSE %s END WHERE account=%s""",
                       ('version_conflict' if outcome=='conflict' else 'coverage_not_reconciled',aid))

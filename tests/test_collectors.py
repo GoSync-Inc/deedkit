@@ -549,6 +549,32 @@ def test_a_near_limit_keyboard_survives_the_live_and_history_paths_and_the_next_
     assert all('SYNTHETIC-CALLBACK' not in item for item in seen)
 
 
+# spec: ANYM-796
+def test_a_history_request_gives_an_old_unsupported_link_its_url_in_get_messages(worker,monkeypatch):
+    from telethon import types
+    link='tg://resolve?domain=synthetic_bot'
+    w,s,key=worker
+    def linked():
+        item=message(9,body='site link')
+        item.entities=[types.MessageEntityTextUrl(0,4,link)]
+        return item
+    monkeypatch.delenv('ANYMSG_CAPTURE_BUTTONS',raising=False)
+    asyncio.run(w.capture(NS(message=linked())))
+    assert drained(w)==['created']
+    cid=stable_id('chat',w.account,'100')
+    before=s.get_messages(key,cid)['items'][0]['formatting']
+    assert before['unsupported_entities'] and before['warnings']==['native_link_unsupported']
+    monkeypatch.setenv('ANYMSG_CAPTURE_BUTTONS','1')
+    async def history(job):
+        job['_history'].append((linked(),{},'private','Fixture'))
+        return {'data':{}}
+    w.provider.execute_operation=history
+    asyncio.run(w.chat_history({'parameters':{'count':1,'before_message':'anchor'},'chat_id':cid,'provider_chat':'100'}))
+    after=s.get_messages(key,cid)['items'][0]['formatting']
+    assert after['state']=='observed' and after['unsupported_entities']==[] and after['warnings']==[]
+    assert [(e['type'],e['offset'],e['length'],e['url']) for e in after['entities']]==[('text_link',0,4,link)]
+
+
 def test_page_failure_leaves_checkpoint_and_durable_captures_for_replay(worker):
     w,s,key=worker; original=w.state.apply; calls=0
     def fail_second(item):

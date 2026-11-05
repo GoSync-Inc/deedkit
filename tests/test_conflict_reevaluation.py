@@ -708,6 +708,223 @@ def test_an_authenticated_group_sender_conflict_an_older_rule_raised_is_accepted
         assert c.execute('SELECT sender,revision FROM messages WHERE id=%s', (mid,)).fetchone() == {'sender': '42', 'revision': 2}
 
 
+def link_conflict(ar, s, provider_id='1', candidate=None):
+    """Criterion 1's two observations as the deployed N-1 ingest stored them: a conflict with the completed receipt."""
+    from test_archive import LINK, linked, native
+    old = n1_archive(s)
+    mid = old.ingest(event(provider_id=provider_id, formatting=native([], [LINK])))['message']
+    assert old.ingest(event(provider_id=provider_id, origin='reconcile',
+                            formatting=candidate or native([linked()])))['outcome'] == 'conflict'
+    return mid
+
+
+def link_revisions(s, mid):
+    with s.pool.connection() as c:
+        return [r['snapshot']['formatting'] for r in c.execute(
+            'SELECT snapshot FROM message_revisions WHERE message=%s ORDER BY revision', (mid,))]
+
+
+# spec: ANYM-796
+def test_the_default_runner_completes_a_stored_link_conflict_once(archive):  # noqa: F811
+    from test_archive import LINK, linked, native
+    ar, s, _, _ = archive
+    mid = link_conflict(ar, s)
+    assert run(ar, s, None) == 'done'
+    row = conflicts(s)[mid]
+    assert row['resolution'] == 'rule_changed:telegram_link_completed@1' and row['resolved_revision'] == 2
+    assert link_revisions(s, mid) == [native([], [LINK]), native([linked()])]
+    assert progress(s)['telegram_link_completed']['last_error'] is None
+    # A second pass changes nothing.
+    assert run(ar, s, None) == 'done'
+    assert conflicts(s)[mid] == row and len(link_revisions(s, mid)) == 2
+    with s.pool.connection() as c:
+        assert c.execute("SELECT count(*) AS n FROM events WHERE message=%s AND kind='message.edited'", (mid,)).fetchone()['n'] == 1
+
+
+# spec: ANYM-796
+def test_a_conflict_whose_envelope_fails_the_predicate_stays_open_and_later_rows_still_run(archive):  # noqa: F811
+    from test_archive import native
+    ar, s, _, _ = archive
+    kept, completed = link_conflict(ar, s, '1', native([])), link_conflict(ar, s, '2')
+    assert run(ar, s, None) == 'done'
+    rows = conflicts(s)
+    assert rows[kept]['resolved_at'] is None and len(link_revisions(s, kept)) == 1
+    assert rows[completed]['resolved_revision'] == 2
+    assert progress(s)['telegram_link_completed']['last_error'] is None
+
+
+# spec: ANYM-796
+def test_a_stored_link_conflict_on_a_message_that_moved_on_stays_open_without_stopping_the_job(archive):  # noqa: F811
+    ar, s, _, _ = archive
+    moved, completed = link_conflict(ar, s, '1'), link_conflict(ar, s, '2')
+    # The stored receipt is older than the message now: a replay would be stale, and must not stop the job.
+    with s.pool.connection() as c:
+        c.execute("UPDATE messages SET provider_updated_at=provider_updated_at+interval '1 second' WHERE id=%s", (moved,))
+    assert run(ar, s, None) == 'done'
+    rows = conflicts(s)
+    assert rows[moved]['resolved_at'] is None and len(link_revisions(s, moved)) == 1
+    assert rows[completed]['resolved_revision'] == 2
+    assert progress(s)['telegram_link_completed']['last_error'] is None
+
+
+# spec: ANYM-796
+def test_a_reread_that_completed_the_message_lets_the_runner_close_the_stored_receipt(archive):  # noqa: F811
+    from test_archive import linked, native
+    ar, s, _, _ = archive
+    mid = link_conflict(ar, s)
+    assert ar.ingest(event(provider_id='1', origin='backfill', formatting=native([linked()])))['outcome'] == 'edited'
+    assert conflicts(s)[mid]['resolved_at'] is None
+    assert run(ar, s, None) == 'done'
+    assert conflicts(s)[mid]['resolution'] == 'rule_changed:telegram_link_settled@1'
+    assert len(link_revisions(s, mid)) == 2
+    assert progress(s)['telegram_link_completed']['last_error'] is None and progress(s)['telegram_link_settled']['last_error'] is None
+
+
+# spec: ANYM-796
+def test_a_receipt_the_settle_job_passed_is_closed_after_a_later_completion(archive):  # noqa: F811
+    from test_archive import LINK, linked, native
+    ar, s, _, _ = archive
+    ar.register('archive-test', 'telegram', 'Synthetic archive', include_chats=['100', '200'])
+    old = n1_archive(s)
+    mid = old.ingest(event(provider_id='1', chat='200', formatting=native([], [LINK])))['message']
+    assert old.ingest(event(provider_id='1', chat='200', origin='reconcile', formatting=native([linked()])))['outcome'] == 'conflict'
+    ar.register('archive-test', 'telegram', 'Synthetic archive', include_chats=['100'])
+    assert run(ar, s, None) == 'done'
+    assert conflicts(s)[mid]['resolved_at'] is None
+    ar.register('archive-test', 'telegram', 'Synthetic archive', include_chats=['100', '200'])
+    assert ar.ingest(event(provider_id='1', chat='200', origin='backfill', formatting=native([linked()])))['outcome'] == 'edited'
+    assert run(ar, s, None) == 'done'
+    assert conflicts(s)[mid]['resolution'] == 'rule_changed:telegram_link_settled@1'
+    assert len(link_revisions(s, mid)) == 2
+
+
+# spec: ANYM-796
+def test_a_failing_rescan_costs_the_completion_nothing(archive, monkeypatch):  # noqa: F811
+    from test_archive import LINK, linked, native
+    ar, s, _, _ = archive
+    # A real statement error: without the savepoint it would abort ingest's transaction.
+    monkeypatch.setattr(cr, 'RESCAN', 'SELECT 1/0 WHERE %s::text IS NOT NULL AND %s::text IS NOT NULL')
+    mid = ar.ingest(event(provider_id='1', formatting=native([], [LINK])))['message']
+    assert ar.ingest(event(provider_id='1', origin='backfill', formatting=native([linked()])))['outcome'] == 'edited'
+    assert link_revisions(s, mid) == [native([], [LINK]), native([linked()])]
+
+
+# spec: ANYM-796
+def test_more_than_a_batch_of_equal_receipts_are_closed_and_another_url_stays_open(archive):  # noqa: F811
+    from test_archive import LINK, linked, native
+    ar, s, _, _ = archive
+    old = n1_archive(s)
+    mid = old.ingest(event(provider_id='1', formatting=native([], [LINK])))['message']
+    other = native([linked(url='https://example.invalid/other')])
+    for n in range(cr.BATCH + 1):
+        assert old.ingest(event(provider_id='1', chat_title=f'Заголовок {n}', origin='reconcile', formatting=native([linked()])))['outcome'] == 'conflict'
+    assert old.ingest(event(provider_id='1', origin='backfill', formatting=other))['outcome'] == 'conflict'
+    assert run(ar, s, None) == 'done'
+    with s.pool.connection() as c:
+        rows = c.execute('''SELECT r.envelope->'formatting' AS formatting,mc.resolved_at FROM message_conflicts mc
+            JOIN ingest_receipts r ON r.digest=mc.receipt_digest WHERE mc.message=%s''', (mid,)).fetchall()
+    assert len(link_revisions(s, mid)) == 2 and sum(r['resolved_at'] is not None for r in rows) == cr.BATCH + 1
+    assert [r['resolved_at'] for r in rows if r['formatting'] == other] == [None]
+    assert progress(s)['telegram_link_settled']['last_error'] is None
+
+
+# spec: ANYM-796
+@pytest.mark.parametrize('change', ['version', 'policy'])
+def test_state_that_moved_after_the_evaluation_sends_the_row_back_and_later_rows_still_run(archive, monkeypatch, change):  # noqa: F811
+    from test_archive import LINK, linked, native
+    ar, s, _, _ = archive
+    ar.register('archive-test', 'telegram', 'Synthetic archive', include_chats=['100', '200'])
+    old = n1_archive(s)
+    moved = old.ingest(event(provider_id='1', chat='200', formatting=native([], [LINK])))['message']
+    assert old.ingest(event(provider_id='1', chat='200', origin='reconcile', formatting=native([linked()])))['outcome'] == 'conflict'
+    later = link_conflict(ar, s, '2')
+    original, done = Runner._evaluate, []
+
+    def evaluate(self, job, rows):
+        result = original(self, job, rows)
+        if job.name == 'telegram_link_completed' and not done:
+            done.append(True)
+            if change == 'policy':
+                ar.register('archive-test', 'telegram', 'Synthetic archive', include_chats=['100'])
+            else:
+                # A later capture with unknown formatting advances the version and leaves the conflict open.
+                unknown = {'version': 1, 'state': 'unknown', 'basis': None, 'wire_sha256': None, 'entities': None,
+                           'unsupported_entities': [], 'warnings': ['native_entities_not_captured']}
+                assert ar.ingest(event(provider_id='1', chat='200', origin='live', updated_at='2026-10-01T12:00:01+00:00',
+                                       formatting=unknown))['outcome'] == 'unchanged'
+        return result
+    monkeypatch.setattr(Runner, '_evaluate', evaluate)
+    assert run(ar, s, None) == 'done'
+    rows = conflicts(s)
+    assert done and rows[moved]['resolved_at'] is None and len(link_revisions(s, moved)) == 1
+    assert rows[later]['resolved_revision'] == 2
+    assert progress(s)['telegram_link_completed']['last_error'] is None
+
+
+# spec: ANYM-796
+def test_two_link_receipts_of_one_message_in_one_batch_complete_it_once_and_later_rows_still_run(archive):  # noqa: F811
+    from test_archive import linked, native
+    ar, s, _, _ = archive
+    first = link_conflict(ar, s, '1')
+    other = native([linked(url='https://example.invalid/other')])
+    assert n1_archive(s).ingest(event(provider_id='1', origin='backfill', formatting=other))['outcome'] == 'conflict'
+    later = link_conflict(ar, s, '2')
+    assert run(ar, s, None) == 'done'
+    with s.pool.connection() as c:
+        rows = c.execute('SELECT resolved_at,resolved_revision FROM message_conflicts WHERE message=%s ORDER BY observed_at', (first,)).fetchall()
+    assert rows[0]['resolved_revision'] == 2 and rows[1]['resolved_at'] is None and len(link_revisions(s, first)) == 2
+    assert conflicts(s)[later]['resolved_revision'] == 2
+    assert progress(s)['telegram_link_completed']['last_error'] is None
+
+
+# spec: ANYM-796
+def test_a_stored_link_conflict_in_an_excluded_chat_stays_open_and_later_rows_still_run(archive):  # noqa: F811
+    from test_archive import linked, native, LINK
+    ar, s, _, _ = archive
+    ar.register('archive-test', 'telegram', 'Synthetic archive', include_chats=['100', '200'])
+    old = n1_archive(s)
+    excluded = old.ingest(event(provider_id='1', chat='200', formatting=native([], [LINK])))['message']
+    assert old.ingest(event(provider_id='1', chat='200', origin='reconcile', formatting=native([linked()])))['outcome'] == 'conflict'
+    completed = link_conflict(ar, s, '2')
+    ar.register('archive-test', 'telegram', 'Synthetic archive', include_chats=['100'])
+    assert run(ar, s, None) == 'done'
+    rows = conflicts(s)
+    assert rows[excluded]['resolved_at'] is None and rows[completed]['resolved_revision'] == 2
+    assert progress(s)['telegram_link_completed']['last_error'] is None
+
+
+# spec: ANYM-796
+def test_a_replayed_link_receipt_does_not_restore_an_old_chat_title(archive):  # noqa: F811
+    from test_archive import linked, native, LINK
+    ar, s, _, _ = archive
+    old = n1_archive(s)
+    mid = old.ingest(event(provider_id='1', chat_title='Старое', formatting=native([], [LINK])))['message']
+    assert old.ingest(event(provider_id='1', chat_title='Старое', origin='reconcile', formatting=native([linked()])))['outcome'] == 'conflict'
+    ar.ingest(event(provider_id='2', chat_title='Новое', sent_at='2026-10-01T12:00:09+00:00', updated_at='2026-10-01T12:00:09+00:00'))
+    assert run(ar, s, None) == 'done'
+    assert conflicts(s)[mid]['resolved_revision'] == 2
+    with s.pool.connection() as c:
+        assert c.execute("SELECT title FROM chats WHERE provider_chat='100'").fetchone()['title'] == 'Новое'
+
+
+# spec: ANYM-796
+def test_a_crash_between_the_link_revision_and_the_resolve_is_repaired_by_the_next_pass(archive, monkeypatch):  # noqa: F811
+    ar, s, _, _ = archive
+    mid = link_conflict(ar, s)
+    original, crashed = cr.Runner._progress, []
+
+    def crash(self, c, job, row, error):
+        if job.name == 'telegram_link_completed' and row and not crashed:
+            crashed.append(row['digest'])
+            raise RuntimeError('crash')
+        return original(self, c, job, row, error)
+    monkeypatch.setattr(cr.Runner, '_progress', crash)
+    with pytest.raises(RuntimeError, match='crash'): run(ar, s, None)
+    assert crashed and conflicts(s)[mid]['resolved_at'] is None and len(link_revisions(s, mid)) == 1
+    assert run(ar, s, None) == 'done'
+    assert conflicts(s)[mid]['resolved_revision'] == 2 and len(link_revisions(s, mid)) == 2
+
+
 # spec: ANYM-621
 def test_a_telegram_link_preview_refresh_conflict_an_older_rule_raised_is_no_longer_raised(archive):  # noqa: F811
     """Rebase on ANYM-611: the deployed N-1 ingest raised Telegram's re-crawl of the same preview page; ingest_outcome
