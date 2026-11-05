@@ -435,6 +435,13 @@ def test_a_test_file_the_scan_cannot_read_means_a_full_run(tmp_path, path, sourc
 def test_a_scan_past_its_time_limit_means_a_full_run(tmp_path, monkeypatch):
     root = with_tests(tmp_path, {"tests/test_x.py": "NAME = 1\n"})
     monkeypatch.setattr(docs_only, "SCAN_SECONDS", 0)
+    real_run = subprocess.run
+    def git_past_its_limit(*arguments, **options):
+        # The scan's git calls alone pass a timeout. A real git can answer inside the 1 ms floor, so this one never gets to.
+        if options.get("timeout") is None: return real_run(*arguments, **options)
+        assert options["timeout"] == 0.001
+        raise subprocess.TimeoutExpired(arguments[0], options["timeout"])
+    monkeypatch.setattr(docs_only.subprocess, "run", git_past_its_limit)
     docs_only_run, why = classify(root, "docs/guide.md")  # git itself gets no time left
     assert docs_only_run is False and why.startswith("the scan of test files failed: TimeoutExpired"), why
     monkeypatch.setattr(docs_only, "tree_blobs", lambda *_: ([("tests/test_x.py", b"NAME = 1\n")], set()))
