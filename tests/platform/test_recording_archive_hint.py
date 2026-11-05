@@ -7,6 +7,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -611,6 +612,47 @@ def test_a_hint_pass_leaves_existing_fingerprints_and_only_reads_never_fetched_c
 
 
 # spec: ANYM-760
+@pytest.mark.parametrize('history', ['reached_end', 'in_progress'])
+def test_a_hint_never_ends_a_head_walk_early_when_more_new_conversations_lie_behind_its_page(tmp_path, history):
+    async def scenario():
+        r, omi, _, doc = backend(tmp_path, omi=Omi(count=1, created=T0 - 30 * 86400))
+        await ready(r)
+        await r.run_once(now=T0)
+        if history == 'in_progress':
+            with sqlite3.connect(Path(doc['archive']['directory']) / 'archive.sqlite') as db:
+                db.execute("UPDATE accounts SET traversal_state='in_progress',checkpoint='\"c1\"'")
+        for n in range(201):
+            omi.add(f'new{n:03d}', T0 + 10 + n, front=True)
+        omi.now = T0 + 100
+        r.hints.offer(['new200'], T0 + 85)
+        await advance(r, omi, T0 + 100, T0 + 100)
+        # A full page of unseen rows with more behind it: nothing inserted, nothing moved, the id counted as found.
+        assert len(lists(omi)) == 2 and sql(doc, 'SELECT count(*) FROM records') == [(1,)]
+        assert r.hints.report()['deferred'] == 1 and not r.hints.pending
+        for moment in (T0 + 400, T0 + 700, T0 + 1000):
+            omi.now = moment
+            await r.run_once(now=moment)
+        rows = {row[0] for row in sql(doc, 'SELECT provider_id FROM records')}
+        assert {f'new{n:03d}' for n in range(201)} <= rows  # the oldest of them too, which a hint-ended walk would lose
+        await r.close()
+    asyncio.run(scenario())
+
+
+# spec: ANYM-760
+def test_a_page_with_a_known_row_and_more_behind_it_still_inserts(tmp_path):
+    async def scenario():
+        r, omi, _, doc = backend(tmp_path, omi=Omi(count=250, created=FRESH - 5000))
+        await ready(r)
+        await r.run_once(now=T0)  # the opening page: 200 rows known, 50 behind them for the traversal
+        omi.add('newest', FRESH, front=True)
+        r.hints.offer(['newest'], T0 + 1)
+        await advance(r, omi, T0 + 16, T0 + 16)
+        assert sql(doc, "SELECT count(*) FROM records WHERE provider_id='newest'") == [(1,)]
+        await r.close()
+    asyncio.run(scenario())
+
+
+# spec: ANYM-760
 def test_at_most_three_conversations_are_dispatched_by_one_hint_pass(tmp_path):
     async def scenario():
         r, omi, _, _ = backend(tmp_path)
@@ -966,6 +1008,52 @@ def test_a_flood_with_a_valid_credential_stays_inside_the_channel_admission_and_
 
 
 # spec: ANYM-760
+def test_idle_and_half_sent_connections_stay_bounded_at_the_transport_while_the_main_listener_and_a_pass_go_on(tmp_path, monkeypatch):
+    monkeypatch.setattr(hint, 'CONNECTION_LIFETIME', 0.6)
+
+    async def scenario():
+        path, _ = build(tmp_path, omi_hint=hint_section())
+        app = create_app(path, transport=httpx.MockTransport(Omi(count=1, created=FRESH)), archive_background=False)
+        runtime = app.state.archive
+        await runtime.start(background=False)
+        listener = await hint.start_listener(runtime, {hint.LISTEN_ENV: '127.0.0.1:0'})
+        held = []
+        for n in range(60):
+            reader, writer = await asyncio.open_connection('127.0.0.1', listener.port)
+            if n % 2:
+                writer.write(b'POST /omi-hint HTTP/1.1\r\nHost: x\r\n')  # headers never finished
+                await writer.drain()
+            held.append((reader, writer))
+        await asyncio.sleep(0.1)
+        live = listener.server.server_state.connections
+        assert len(live) <= hint.CHANNEL_CONNECTIONS
+        assert not runtime.hints.counters['received']
+        client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test')
+        started = time.monotonic()
+        answer = await client.post('/v1/capabilities', headers={'Authorization': 'Bearer backend-a'}, content=b'{}')
+        assert answer.status_code == 200 and time.monotonic() - started < 2
+        await runtime.run_once(now=T0)
+        assert runtime.error is None
+        # Every held connection ends by itself, without one byte more from the client, and the slots come back.
+        for reader, writer in held:
+            try:
+                async with asyncio.timeout(3):
+                    assert await reader.read() == b''
+            except ConnectionError:
+                pass
+            writer.close()
+        await asyncio.sleep(0.05)
+        assert not live
+        async with httpx.AsyncClient(trust_env=False) as direct:
+            answer = await direct.post(f'http://127.0.0.1:{listener.port}{hint.CHANNEL_PATH}', headers=dict(channel_headers()), content=b'{"ids":["after"]}')
+        assert answer.status_code == 200 and 'after' in runtime.hints.pending
+        await client.aclose()
+        await listener.stop()
+        await runtime.close()
+    asyncio.run(scenario())
+
+
+# spec: ANYM-760
 def test_the_channel_window_reopens_after_a_minute(tmp_path, monkeypatch):
     moment = [1000.0]
     monkeypatch.setattr(hint, 'monotonic', lambda: moment[0])
@@ -1116,6 +1204,125 @@ def test_from_the_receiver_only_the_channel_port_opens_a_connection_also_after_t
     assert f'iptables -X {chain}' in undone.splitlines()
     code, base, err = script('rules', '--resolver', '192.0.2.53')
     assert code == 0 and 'dk-rechint0' not in base and 'dk-rechook0' not in base and chain not in base  # no drift for the installed verify
+
+
+NET_HELPER = """import socket, sys, time
+if sys.argv[1] == 'serve':
+    server = socket.create_server(('0.0.0.0', int(sys.argv[2])))
+    server.settimeout(0.5)
+    end = time.monotonic() + 120
+    while time.monotonic() < end:
+        try:
+            conn = server.accept()[0]
+        except OSError:
+            continue
+        conn.sendall(b'ok')
+        conn.close()
+else:
+    try:
+        with socket.create_connection((sys.argv[2], int(sys.argv[3])), timeout=1) as conn:
+            sys.exit(0 if conn.recv(2) == b'ok' else 1)
+    except OSError:
+        sys.exit(1)
+"""
+# Addresses: backend .2 and receiver .3 on the hint bridge (10.78.0.0/24); proxy .2 and receiver .3 on the hook bridge
+# (10.79.0.0/24); the namespace itself is .1 on each, standing for the host, with a listener. Exit 77: this environment cannot build it.
+TOPOLOGY = """
+modprobe br_netfilter 2>/dev/null || true
+[ -e /proc/sys/net/bridge/bridge-nf-call-iptables ] || exit 77
+sysctl -qw net.bridge.bridge-nf-call-iptables=1 || exit 77
+ip link add dk-rechint0 type bridge && ip link set dk-rechint0 up && ip addr add 10.78.0.1/24 dev dk-rechint0 || exit 77
+ip link add dk-rechook0 type bridge && ip link set dk-rechook0 up && ip addr add 10.79.0.1/24 dev dk-rechook0 || exit 77
+unshare -n sleep 150 >/dev/null 2>&1 &
+API=$!
+unshare -n sleep 150 >/dev/null 2>&1 &
+REC=$!
+unshare -n sleep 150 >/dev/null 2>&1 &
+PROXY=$!
+sleep 0.5
+ip link add vapi type veth peer name vapi1 && ip link add vrech type veth peer name vrech1 || exit 77
+ip link add vproxy type veth peer name vproxy1 && ip link add vrecp type veth peer name vrecp1 || exit 77
+ip link set vapi1 netns $API && ip link set vrech1 netns $REC && ip link set vproxy1 netns $PROXY && ip link set vrecp1 netns $REC || exit 77
+for port in vapi vrech; do ip link set $port master dk-rechint0 && ip link set $port up || exit 77; done
+for port in vproxy vrecp; do ip link set $port master dk-rechook0 && ip link set $port up || exit 77; done
+nsenter -t $API -n sh -c 'ip addr add 10.78.0.2/24 dev vapi1 && ip link set vapi1 up && ip link set lo up' || exit 77
+nsenter -t $REC -n sh -c 'ip addr add 10.78.0.3/24 dev vrech1 && ip link set vrech1 up && ip addr add 10.79.0.3/24 dev vrecp1 && ip link set vrecp1 up && ip link set lo up' || exit 77
+nsenter -t $PROXY -n sh -c 'ip addr add 10.79.0.2/24 dev vproxy1 && ip link set vproxy1 up && ip link set lo up' || exit 77
+# Docker's own rules: DOCKER-USER first, then the inter-container accept on each bridge.
+iptables -N DOCKER-USER; iptables -P FORWARD DROP; iptables -A FORWARD -j DOCKER-USER
+iptables -A FORWARD -i dk-rechint0 -o dk-rechint0 -j ACCEPT
+iptables -A FORWARD -i dk-rechook0 -o dk-rechook0 -j ACCEPT
+iptables -N ufw-before-input; iptables -A INPUT -j ufw-before-input
+for port in 13234 13235 13240 5432; do nsenter -t $API -n python3 HELPER serve $port >/dev/null 2>&1 & done
+nsenter -t $REC -n python3 HELPER serve 13236 >/dev/null 2>&1 &
+nsenter -t $PROXY -n python3 HELPER serve 8080 >/dev/null 2>&1 &
+python3 HELPER serve 22222 >/dev/null 2>&1 &
+sleep 1
+probe() { if nsenter -t $2 -n python3 HELPER connect $3 $4; then echo "$5 $1=ok"; else echo "$5 $1=fail"; fi; }
+probes() {
+  probe channel $REC 10.78.0.2 13235 $1
+  probe main_api $REC 10.78.0.2 13234 $1
+  probe gateway $REC 10.78.0.2 13240 $1
+  probe database $REC 10.78.0.2 5432 $1
+  probe host_hint $REC 10.78.0.1 22222 $1
+  probe host_hook $REC 10.79.0.1 22222 $1
+  probe proxy_other $REC 10.79.0.2 8080 $1
+  probe off_bridge $REC 203.0.113.9 443 $1
+  probe proxy_to_receiver $PROXY 10.79.0.3 13236 $1
+  probe proxy_to_channel_network $PROXY 10.78.0.2 13235 $1
+  probe backend_to_receiver $API 10.78.0.3 13236 $1
+}
+# The positive controls: the same listeners answer without the rules, so a later failure is the rules and not an empty port.
+probes baseline
+sh APPLY
+probes commands
+# The persisted rules reloaded: everything of the command form gone, then only ufw's block restored.
+iptables -F DOCKER-USER; iptables -F INPUT; iptables -A INPUT -j ufw-before-input; iptables -F DEEDKIT-RECORDINGS-HINT; iptables -X DEEDKIT-RECORDINGS-HINT
+iptables-restore --noflush PERSISTED
+probes persisted
+kill $API $REC $PROXY 2>/dev/null || true
+kill $(jobs -p) 2>/dev/null || true
+"""
+
+
+def namespace_ready():
+    if not all(shutil.which(tool) for tool in ('sudo', 'unshare', 'iptables-restore', 'nsenter', 'ip')):
+        return False
+    return subprocess.run(['sudo', '-n', 'unshare', '-n', 'true'], capture_output=True).returncode == 0
+
+
+# spec: ANYM-760
+def test_on_real_bridges_the_receiver_opens_only_the_channel_and_the_proxy_only_the_receiver_also_after_a_reload(tmp_path):
+    if not namespace_ready():
+        if os.environ.get('GITHUB_ACTIONS'):
+            pytest.fail('criterion 4 (iv) must run in CI: sudo, unshare, nsenter, ip or iptables-restore is missing')
+        pytest.skip('needs sudo, unshare, nsenter, ip and iptables-restore on Linux')
+    helper, apply, persisted = tmp_path / 'net.py', tmp_path / 'apply.sh', tmp_path / 'persisted.rules'
+    helper.write_text(NET_HELPER)
+    code, out, err = script('hint-rules')
+    assert code == 0, err
+    apply.write_text(out)
+    code, block, err = script('hint-rules', '--format', 'ufw', '--family', 'v4')
+    assert code == 0, err
+    persisted.write_text(f'*filter\n:DOCKER-USER - [0:0]\n:ufw-before-input - [0:0]\n{block}COMMIT\n')
+    text = TOPOLOGY.replace('HELPER', str(helper)).replace('APPLY', str(apply)).replace('PERSISTED', str(persisted))
+    result = subprocess.run(['sudo', '-n', 'unshare', '-n', 'sh', '-ec', text], text=True, capture_output=True, timeout=240)
+    if result.returncode == 77:
+        if os.environ.get('GITHUB_ACTIONS'):
+            pytest.fail('criterion 4 (iv) must run in CI: this runner cannot build the bridges: ' + result.stderr)
+        pytest.skip('this environment cannot build the bridges (br_netfilter, veth or nsenter)')
+    assert result.returncode == 0, result.stderr
+    lines = set(result.stdout.split('\n'))
+    allowed = ('channel', 'proxy_to_receiver')
+    denied = ('main_api', 'gateway', 'database', 'host_hint', 'host_hook', 'proxy_other', 'off_bridge', 'proxy_to_channel_network', 'backend_to_receiver')
+    # Positive controls: every listener on a bridge answers before the rules (the host too; no route off the bridge or across them).
+    for name in ('channel', 'main_api', 'gateway', 'database', 'host_hint', 'host_hook', 'proxy_other', 'proxy_to_receiver', 'backend_to_receiver'):
+        assert f'baseline {name}=ok' in lines, (name, result.stdout)
+    for phase in ('commands', 'persisted'):
+        for name in allowed:
+            assert f'{phase} {name}=ok' in lines, (phase, name, result.stdout)
+        for name in denied:
+            assert f'{phase} {name}=fail' in lines, (phase, name, result.stdout)
 
 
 # spec: ANYM-760

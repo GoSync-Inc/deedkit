@@ -47,6 +47,8 @@ CHANNEL_SLOTS = 2
 CHANNEL_PER_MINUTE = 20
 CHANNEL_DEADLINE = 2
 CHANNEL_CONNECTIONS = 16
+RECEIVER_CONNECTIONS = 64
+CONNECTION_LIFETIME = 5  # seconds any connection may live: above one request's deadline, so idle and half-sent ones end too
 LISTEN_ENV = 'RECORDINGS_HINT_LISTEN'
 
 SETTLE = 15  # Omi caches a list for 10 s
@@ -115,6 +117,32 @@ async def read_body(scope, receive, maximum, seconds):
                     return body
     except TimeoutError:
         raise Reject(408, 'deadline') from None
+
+
+def bounded_protocol(limit, lifetime):
+    """uvicorn's h11 protocol with a transport bound. uvicorn itself accepts every connection and applies `limit_concurrency` only
+    after complete headers, and its keep-alive timer starts after a response, so idle or half-sent connections would hold
+    descriptors outside any admission. Pinned uvicorn 0.54.0."""
+    from uvicorn.protocols.http.h11_impl import H11Protocol
+
+    class Bounded(H11Protocol):
+        timer, refused = None, False
+
+        def connection_made(self, transport):
+            if len(self.connections) >= limit:
+                self.refused = True
+                transport.abort()
+                return
+            super().connection_made(transport)
+            self.timer = self.loop.call_later(lifetime, transport.abort)
+
+        def connection_lost(self, exc):
+            if self.refused:
+                return
+            if self.timer is not None:
+                self.timer.cancel()
+            super().connection_lost(exc)
+    return Bounded
 
 
 # --- The receiver process
@@ -392,9 +420,9 @@ async def start_listener(runtime, environ=None):
         def capture_signals(self):  # the main server owns the signals; this one stops from the lifespan
             yield
 
-    # No request line, header or body is ever logged here. Bounded connections: the channel's own admission does the rest.
-    config = uvicorn.Config(Channel(hints), log_config=None, access_log=False, lifespan='off', server_header=False, date_header=False,
-                            timeout_keep_alive=5, limit_concurrency=CHANNEL_CONNECTIONS, proxy_headers=False,
+    # No request line, header or body is ever logged here. Connections are bounded at the transport; admission does the rest.
+    config = uvicorn.Config(Channel(hints), http=bounded_protocol(CHANNEL_CONNECTIONS, CONNECTION_LIFETIME), log_config=None, access_log=False, lifespan='off', server_header=False, date_header=False,
+                            timeout_keep_alive=1, limit_concurrency=CHANNEL_CONNECTIONS, proxy_headers=False,
                             h11_max_incomplete_event_size=16384)
     server = Quiet(config)
     port = listening.getsockname()[1]
@@ -454,6 +482,7 @@ class Hints:
     def report(self):
         return {'received': self.counters['received'], 'duplicate': self.counters['duplicate'], 'found': self.counters['found'],
                 'dropped': self.counters['dropped'], 'failed': self.counters['failed'], 'forced_lists': self.counters['forced_lists'],
+                'deferred': self.counters['deferred'],
                 'pending': len(self.pending), 'listening': self.listener is not None, 'listener_error': self.listener_error}
 
     async def rest(self, seconds):
@@ -558,10 +587,13 @@ class Hints:
             raise Failure('invalid_provider_response')
         items = [metadata(value) for value in values]
         fingerprints = {item['id']: fingerprint(value) for item, value in zip(items, values)}
-        pagination(headers, len(items), PAGE)
-        cutoff = datetime.fromtimestamp(now - DAY, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
-        fresh = [item for item in items if str(item.get('created_at', ''))[:19] >= cutoff]
-        await runtime.db('discover', account, fresh, None, now, lambda: runtime.current(account, credential), 'hint', fingerprints)
+        info, next_page = pagination(headers, len(items), PAGE)
+        if await self.contiguous(account, items, info, next_page):
+            cutoff = datetime.fromtimestamp(now - DAY, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
+            fresh = [item for item in items if str(item.get('created_at', ''))[:19] >= cutoff]
+            await runtime.db('discover', account, fresh, None, now, lambda: runtime.current(account, credential), 'hint', fingerprints)
+        else:
+            self.counters['deferred'] += 1
         try:
             await self.dispatch(account, credential, settings.omi_budget, now)
         except RateLimited as limited:
@@ -569,6 +601,19 @@ class Hints:
         except Exception:
             self.counters['failed'] += 1
         return {item['id'] for item in items}
+
+    async def contiguous(self, account, items, info, next_page):
+        """May this page insert rows? A regular head walk ends at the first page holding a known row, so a row inserted here must not
+        be what ends it: the page must already hold a known row, or be the last page. Otherwise more unseen conversations may lie
+        behind it, and the regular head, which walks on, inserts them all. Holds by induction: a row inserted here was contiguous."""
+        if info['list_truncated'] is not False:
+            return False
+        if next_page is None and info['has_more'] is False:
+            return True
+        for item in items:
+            if await self.runtime.db('record', account, item['id']) is not None:
+                return True
+        return False
 
     async def dispatch(self, account, credential, budget, now):
         """Only the never-fetched class of the last 24 hours, reserved like any new conversation; no rotation of the other classes."""

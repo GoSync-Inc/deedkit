@@ -90,12 +90,13 @@ def issue_hint(parser, args):
 def run_receiver(args):
     """ANYM-760: the internet-facing receiver, the same image with another command. No archive, no provider, no admission probe."""
     import uvicorn
-    from .hint import Receiver
+    from .hint import CONNECTION_LIFETIME, RECEIVER_CONNECTIONS, Receiver, bounded_protocol
     for name in ('httpx', 'httpcore'):
         logging.getLogger(name).setLevel(logging.CRITICAL)
     # Secret path: no request line is logged, and the proxy's access log carries none either.
     uvicorn.run(Receiver(args.config), host=args.host, port=args.port, workers=1, access_log=False, lifespan='off', log_level='warning',
-                server_header=False, date_header=False, proxy_headers=False, limit_concurrency=64, timeout_keep_alive=5,
+                server_header=False, date_header=False, proxy_headers=False, limit_concurrency=RECEIVER_CONNECTIONS, timeout_keep_alive=1,
+                http=bounded_protocol(RECEIVER_CONNECTIONS, CONNECTION_LIFETIME),
                 h11_max_incomplete_event_size=16384)
 
 

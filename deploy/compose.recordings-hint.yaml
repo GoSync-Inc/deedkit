@@ -53,7 +53,7 @@ services:
     stop_grace_period: 5s
     logging:
       driver: json-file
-      options: {max-size: 1m, max-file: "2"}
+      options: {max-size: 5m, max-file: "2"}
 networks:
   # Created once by hand: docker network create --internal -o com.docker.network.bridge.name=dk-rechint0
   #   -o com.docker.network.bridge.gateway_mode_ipv4=isolated deedkit-recordings-hint

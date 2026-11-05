@@ -2134,7 +2134,9 @@ digests). The Caddy form inside the site block, with the body cap the receiver e
 
 ```
 handle /omi/memory/* {
-    request_body { max_size 4MB }
+    request_body {
+        max_size 4MiB
+    }
     reverse_proxy recordings-omi-hint:13236
 }
 ```
@@ -2181,9 +2183,11 @@ docker run --rm --network none --read-only --cap-drop ALL -u 10001:10001 -v /opt
 5. Promotion: the receiver is the same published image with another command, so `production.py` needs no change: the project's `files` gain
    `deploy/compose.recordings-hint.yaml` after `compose.recordings.yaml`, `services` gains `"recordings-omi-hint": "recordings"`, the env file gains
    `RECORDINGS_HINT_STATE_DIR`. `snapshot` needs a running container of every selected service, so this is a **first start by hand** and a hand
-   release, as in "Enrollment is a hand release": pause, `DEEDKIT_VERSION=enroll-<sha> docker compose $F up -d --no-build --pull never`, edit
-   `/etc/deedkit/production.json`, `prepare` and `apply`, `status`, remove the pause, `deploy --dry-run`. The backend restarts once, which also opens
-   its listener (it opens only at start; revoking needs no restart). Should the tool ever need to change for this, that is a separate release-path PR.
+   release, as in "Enrollment is a hand release". It takes a green `main` SHA `S` newer than the deployed one and not prepared yet (`prepare` refuses an existing
+   candidate directory). Pause; verify and pull `S`'s attested recordings image and tag it `deedkit-recordings:enroll-<S>` ("First start by hand", step 1); with
+   `F` = `-p deedkit-recordings -f /opt/deedkit/deploy/compose.recordings.yaml -f /opt/deedkit/deploy/compose.recordings-hint.yaml --env-file <the project's env file>`,
+   `DEEDKIT_VERSION=enroll-<S> docker compose $F up -d --no-build --pull never`; edit `/etc/deedkit/production.json`; `prepare --sha S` and `apply --sha S`; `status`; remove the pause;
+   `deploy --dry-run`. The backend restarts once, which also opens its listener (it opens only at start; revoking needs no restart). Should the tool ever need to change for this, that is a separate release-path PR.
 6. Connectivity, from the real receiver container: `docker compose $F exec -T recordings-omi-hint python -I - check --blocked API_HINT_IP:13234 --blocked
    GATEWAY_IP:13240 --blocked HOST_BRIDGE_IP:PORT --blocked 192.0.2.254:9 --control API_HINT_IP:13235 < scripts/recordings_egress_check.py`. Every blocked target is a known
    listener; from the proxy, `check --blocked API_HINT_IP:13234`. Run `ufw reload` and repeat: the persisted rules must give the same answer, and `hint-verify` still `ok`.
@@ -2194,7 +2198,7 @@ docker run --rm --network none --read-only --cap-drop ALL -u 10001:10001 -v /opt
 **The owner's step in the Omi app.** Entering the URL needs the owner's device and Omi login (a Firebase user token; our `omi_dev_` key cannot do it); no agent tries. In the
 Omi app (source read at the pinned commit, `app/lib/pages/settings/developer.dart:240-247`, `profile.dart:68-73`): Settings → Developer Mode → Developer Settings → Webhooks →
 Conversation Events ("New conversation created"), switch it on, paste the content of the handoff file (the owner reads it in their own SSH session), Save. The agent gets the owner's `uid`
-for step 4 from the owner: Settings → Account → User ID (tapping the row copies it). A `uid` is no secret and no factor by itself; the path token is the factor.
+for step 4 from the owner: Settings → Account → User ID (tapping the row copies it). That place is read in source, not yet seen on the owner's device: if the owner's app does not show it, stop before step 4; per ANYM-760 criterion 8 dropping the uid factor is Astra's decision, recorded on the PR, and needs a code change. A `uid` is no secret and no factor by itself; the path token is the factor.
 
 **What Omi sends.** `memory_created` at Omi commit `cf601889` (`backend/utils/webhooks.py:309-345`, `utils/conversations/render.py:181-228`) POSTs JSON to `<url>?uid=<uid>`, with an
 `Idempotency-Key` header, unsigned; 4 attempts at 1, 5 and 30 s, no retry on a 4xx other than 408 and 429. The body is `Conversation.model_dump()` of `backend/models/conversation.py:464` with
@@ -2209,7 +2213,9 @@ for step 4 from the owner: Settings → Account → User ID (tapping the row cop
 `id`, `text`, `original_text`, `speaker`, `speaker_name`, `speaker_id`, `is_user`, `person_id`, `speaker_label_source`, `start`, `end`, `translations`, `speech_profile_processed`, `stt_provider`, `speaker_match_source`, `speaker_id_scope`, `speaker_identity_status`.
 The receiver parses this in memory for the length of the request (4 MiB at most), takes `id` and drops the rest: nothing else is stored, logged, answered or forwarded, and nothing goes to a third party (docs/DATA-POLICY.md is unchanged on purpose). The only datum leaving the receiver is the validated `id`, held by the backend in memory.
 
-**Worst cases.** A leaked URL brings forward at most 6 head lists an hour, and cannot create a record, read a transcript or put in text; these lists count in `omi_budget`, in the head share, so while a backfill holds the rest of the hour they can use the slots a regular head list would, and the forced list then does the regular list's discovery; rotate. A compromised receiver can read the conversation bodies Omi sends while it is compromised, holds the digests and one channel credential, starts no connection but the channel, and cannot reach the archive, the main listener or a provider.
+**Deferred inserts.** A forced list whose page holds no known row while more pages follow inserts nothing (`archive_status.omi_hint.deferred` counts it): the regular head, which walks on, inserts them all, up to one poll later. So a hint never ends a head walk early.
+
+**Worst cases.** A leaked URL brings forward at most 6 head lists an hour, and cannot create a record, read a transcript or put in text; these lists count in `omi_budget`, in the head share, so while a backfill holds the rest of the hour they can use the slots a regular head list would, and the forced list then does the regular list's discovery; rotate. A compromised receiver can read the conversation bodies Omi sends while it is compromised, holds the digests and one channel credential, starts no connection but the channel, and cannot reach the archive, the main listener or a provider. On the channel it holds at most 16 connections, each for at most 5 seconds (bound at the transport, before any HTTP parsing).
 
 *Rotate:* run the issue command with new file names. Put the new path digest beside the old one in `receiver.json` and `archive.omi_hint.path_token_sha256`, the new channel digest beside the old one in `channel_key_sha256`, then atomically replace `channel.key` with the new file. The owner updates the URL in the Omi app. Remove both old digests and the old files.
 *Revoke:* remove the digests: the path digests from `receiver.json` (every request answers the same 404) and the whole `archive.omi_hint` object from `config.json` (the channel answers 404). Polling goes on.
