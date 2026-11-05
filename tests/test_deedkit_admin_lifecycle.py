@@ -347,6 +347,15 @@ def test_revoke_disables_the_gateway_first_then_every_backend_and_keeps_the_reco
     assert "bearer probe was not run" in result["evidence"]["bearer_probe"]
 
 
+# spec: ANYM-776
+def test_revoke_note_names_a_reviewed_step_for_deleting_records_not_an_owner_decision(site, capsys):
+    code, result, err = revoke(site, capsys)
+    assert code == 0, err
+    assert result["note"] == ("records stay for audit; deleting them is a separate reviewed step "
+                              "(production.md, Admin CLI)")
+    assert "owner decision" not in result["note"]
+
+
 # spec: ANYM-497
 def test_revoke_with_the_matching_token_requires_a_401_after_a_control_succeeds(site, capsys):
     token = private(site.root / "mac/src.token", site.tokens["src-gateway"] + "\n")
