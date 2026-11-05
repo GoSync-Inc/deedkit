@@ -529,196 +529,61 @@ service before 16:02); read `fresh` from the freshness command; start both timer
 
 A restore (ANYM-610) is not only `pg_restore`: the worker has provider egress, `pg_dump` does not carry the two
 service roles, `db-roles` would mint new passwords and rewrite the profiles without `bind`, `allowed_hosts` and
-`allowed_origins`, and agent keys exist only as hashes. These steps restore the protected point into the scratch
-project of `deploy/compose.calendar-restore.yaml`: the database and the API, no worker, no vault mount, one internal
-network, no published port, so restored tokens cannot reach Google or iCloud. Docker publishes no port for a container
-whose only network is internal; the read below goes to the API's own loopback.
+`allowed_origins`, and agent keys exist only as hashes. `deploy/calendar-restore.sh` restores the protected point into
+the scratch project of `deploy/compose.calendar-restore.yaml`: the database and the API, no worker, no vault mount, one
+internal network, no published port, so restored tokens cannot reach Google or iCloud. Docker publishes no port for a
+container whose only network is internal; the read below goes to the API's own loopback through `docker compose exec`.
 
 Before you start, on the backup server as root: Compose v2 (`apt-get install --no-install-recommends
-docker-compose-v2`); that release's `deploy/compose.calendar-restore.yaml` copied to
-`/root/compose.calendar-restore.yaml`; `DIGEST` set to the calendar image's digest, which must be of the release whose
-highest migration equals the bundle's `schema_version` (normally production's: `docker inspect --format '{{.Image}}'
-deedkit-calendar-calendar-api-1`), and verified first from a machine with `gh`: `gh attestation verify
-oci://ghcr.io/gosync-inc/deedkit-calendar@<digest> --repo GoSync-Inc/deedkit --signer-workflow
+docker-compose-v2`), and both files of the release copied into one root-only directory. `DIGEST` is the calendar image's
+digest, of the release whose highest migration equals the bundle's `schema_version` (normally production's: `docker
+inspect --format '{{.Image}}' deedkit-calendar-calendar-api-1`), verified first from a machine with `gh`: `gh attestation
+verify oci://ghcr.io/gosync-inc/deedkit-calendar@<digest> --repo GoSync-Inc/deedkit --signer-workflow
 GoSync-Inc/deedkit/.github/workflows/ci.yml --source-ref refs/heads/main --source-digest <sha40>
---deny-self-hosted-runners`. Run the blocks in order in one shell. **When a
-block fails, go straight to Teardown**, and run Teardown when all succeed too. Nothing here prints a password, a token
-or a row. The bundled `runtime.json` is optional; if a bundle has none, write one (0600, owner 10001) with
-`{"dsn": "postgresql://fcs_owner:<POSTGRES_PASSWORD>@calendar-db:5432/family_calendar", "port": 13232}` before the
-profile check.
-
-Decrypt the protected point into a new 0700 directory. The backup image holds the decryption code and `age`; it runs
-with no network:
+--deny-self-hosted-runners`. Then:
 
 ```sh
-umask 077
-set -o pipefail
-WORK=$(mktemp -d /srv/backups/calendar-restore.XXXXXX)
-install -m 0600 /root/compose.calendar-restore.yaml "$WORK/compose.yaml"
-export CALENDAR_RESTORE_STATE_DIR="$WORK/state"
-export CALENDAR_RESTORE_IMAGE="ghcr.io/gosync-inc/deedkit-calendar@${DIGEST:?}"
-CONFIG=/etc/deedkit-calendar-backup-r2
-restore() { docker compose -p deedkit-calendar-restore -f "$WORK/compose.yaml" "$@"; }
-owner() { restore run --rm --no-deps -T -v "$CALENDAR_RESTORE_STATE_DIR/service/runtime.json:/data/service/runtime.json:ro" calendar-api "$@"; }
-sql() { restore exec -T calendar-db psql -X -q -v ON_ERROR_STOP=1 -U fcs_owner -d family_calendar "$@"; }
-docker pull -q "$CALENDAR_RESTORE_IMAGE"
-ID=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["backups"][0]["id"])' "$CONFIG/control/protected.json")
-SHA=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["backups"][0]["sha256"])' "$CONFIG/control/protected.json")
-HELPER=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["helper_image"])' "$CONFIG/verifier.json")
-/opt/deedkit-backup-r2/venv/bin/python -m messaging_service.backup_r2_receiver --config "$CONFIG/operator.json" \
-  download --id "$ID" --output "$WORK/bundle.tar.age" >/dev/null
-echo "$SHA  $WORK/bundle.tar.age" | sha256sum --check --quiet
-docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp \
-  -v "$WORK:/work" -v "$CONFIG/restore/identity.agekey:/identity:ro" --entrypoint python "$HELPER" -c '
-from messaging_service.backup_crypto import decrypt_snapshot
-decrypt_snapshot("/work/bundle.tar.age", "/identity", "/work/decrypted")'
+DIGEST=sha256:<verified digest> bash calendar-restore.sh
 ```
 
-Copy the four profile files into the scratch state directory (the API's user owns them; the vault stays out), and
-check that each profile's DSN host is the Compose service `calendar-db`, which resolves inside the scratch project.
-Only this copy is rewritten, and only when it names another host:
+It stops at the first failure, and on every exit, success, failure or signal, it tears down. Its steps:
 
-```sh
-install -d -m 0700 -o 10001 -g 10001 "$CALENDAR_RESTORE_STATE_DIR" "$CALENDAR_RESTORE_STATE_DIR/service"
-for name in postgres.env gateway.json worker.json runtime.json; do
-  install -m 0600 -o 10001 -g 10001 "$WORK/decrypted/state/profile/$name" "$CALENDAR_RESTORE_STATE_DIR/service/$name"
-done
-python3 -I - "$CALENDAR_RESTORE_STATE_DIR/service" <<'PY'
-import json, sys
-from pathlib import Path
-from urllib.parse import urlsplit
-for name in ("gateway", "worker", "runtime"):
-    path = Path(sys.argv[1]) / (name + ".json")
-    config = json.loads(path.read_text())
-    parts = urlsplit(config["dsn"])
-    if parts.hostname == "calendar-db":
-        print(name, "dsn host ok")
-        continue
-    config["dsn"] = parts._replace(netloc=parts.netloc.rsplit("@", 1)[0] + "@calendar-db:5432").geturl()
-    path.write_text(json.dumps(config))
-    print(name, "dsn host rewritten to calendar-db")
-PY
-```
+1. Take the verifiers' host lock (`/var/lib/deedkit-backup-verify/host.lock`, one heavy restore at a time, waiting at
+   most an hour) and hold it to the end; a run that cannot get it creates nothing. Check free disk against the
+   verifier's bound with the plaintext added: twice the point's bytes plus `postgres_headroom_bytes` and
+   `reserve_bytes`. Resources an interrupted run left are removed and the run ends: run it again.
+2. Decrypt the protected point into a new 0700 directory under `/srv/backups`, after its download and sha256 check. The
+   verifier's pinned backup image does the decrypting, with no network and the verifier's bounds.
+3. Copy the four bundled profile files into the scratch state directory, owned by the API's user; the vault stays out.
+   Check that each profile's DSN host is the Compose service `calendar-db`, which resolves inside the scratch project;
+   rewrite only this copy when it names another host. Production's bundles hold `runtime.json`; the format allows a
+   bundle without it, which stops at this copy. The owner DSN it would hold is
+   `postgresql://fcs_owner:<POSTGRES_PASSWORD>@calendar-db:5432/family_calendar`, port 13232.
+4. Start the scratch `calendar-db` with the bundled `postgres.env`. Create `fcs_gateway` and `fcs_worker` with the
+   passwords in the bundled `gateway.json` and `worker.json` (never `db-roles`, which would mint new ones),
+   `pg_restore --exit-on-error`, then apply `roles.sql` read from the release's image. The roles come first, as in the
+   verifier, so a policy naming one still restores. A failed restore prints only the verifier's fixed phrase for it.
+5. Start the scratch `calendar-api`. Prove: no vault and no route out from inside the API (a connection to a public
+   address, never a provider, must fail), `schema-status`, the read-only `db-roles --check` (it mints nothing), and the
+   bundle's table manifest (ANYM-605) rebuilt from the restored database, printing only booleans and counts.
+6. One read through the API by a temporary read-only principal, created in the scratch database with a key given on
+   stdin and deleted after. It prints only the HTTP status and a count of calendars. An empty calendar has no grant to
+   read with and stops here.
 
-Start the scratch database with the bundled `postgres.env`. Create `fcs_gateway` and `fcs_worker` with the passwords in
-the bundled `gateway.json` and `worker.json` (never `db-roles`, which would mint new ones), restore, and apply
-`roles.sql` of the restored schema's release, read from that release's image. The roles come first, as in the
-verifier, so a policy naming one still restores:
-
-```sh
-restore up -d --wait calendar-db
-python3 -I - "$CALENDAR_RESTORE_STATE_DIR/service" <<'PY' | sql
-import json, sys
-from pathlib import Path
-from urllib.parse import unquote, urlsplit
-for name, role in (("gateway", "fcs_gateway"), ("worker", "fcs_worker")):
-    password = unquote(urlsplit(json.loads((Path(sys.argv[1]) / (name + ".json")).read_text())["dsn"]).password)
-    print("CREATE ROLE %s LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;" % (role, password.replace("'", "''")))
-PY
-restore exec -T calendar-db pg_restore --exit-on-error --no-owner --no-acl -U fcs_owner -d family_calendar \
-  < "$WORK/decrypted/database.dump"
-restore run --rm --no-deps -T --entrypoint python calendar-api -c '
-from pathlib import Path
-import family_calendar.service as service
-print(Path(service.__file__).with_name("roles.sql").read_text())' </dev/null | sql
-```
-
-Start the scratch API, then prove the restore: the API has no vault and no route out (a connection to a public address,
-never a provider, must fail), `schema-status`, the read-only `db-roles --check` (it mints nothing and must report no
-drift), and the bundle's table manifest (ANYM-605) rebuilt from the restored database. The manifest check prints only
-booleans and counts:
-
-```sh
-restore up -d --wait --wait-timeout 180 calendar-api
-restore exec -T calendar-api python -I -c '
-import os, socket, sys
-if os.path.exists("/data/service/vault"):
-    sys.exit("vault mounted")
-try:
-    socket.create_connection(("1.1.1.1", 443), timeout=5)
-except OSError:
-    print("isolated: no vault, no route out")
-else:
-    sys.exit("route out exists")' </dev/null
-owner schema-status </dev/null
-owner db-roles --check </dev/null
-python3 -I - "$WORK/decrypted/manifest.json" "$CALENDAR_RESTORE_STATE_DIR/service/runtime.json" <<'PY' |
-import json, sys
-manifest, runtime = (json.load(open(path)) for path in sys.argv[1:3])
-print(json.dumps({"dsn": runtime["dsn"], "tables": manifest["tables"], "schema_version": manifest["schema_version"]}))
-PY
-docker run -i --rm --network deedkit-calendar-restore_calendar-backend --read-only --cap-drop ALL \
-  --security-opt no-new-privileges --tmpfs /tmp --entrypoint python "$HELPER" -c '
-import json, sys
-import psycopg
-from messaging_service.backup_calendar import calendar_manifest, calendar_schema_version
-job = json.load(sys.stdin)
-with psycopg.connect(job["dsn"], connect_timeout=10) as connection:
-    tables = calendar_manifest(connection)[0]
-    version = calendar_schema_version(connection)
-same = {"manifest_equal": tables == job["tables"], "schema_equal": version == job["schema_version"]}
-print(json.dumps({**same, "schema_version": version, "tables": len(tables), "rows": sum(t["rows"] for t in tables.values())}))
-sys.exit(0 if all(same.values()) else 1)'
-```
-
-One read through the API by a temporary read-only principal, created in the scratch database and deleted after. The
-key is the caller's, written to the private directory first and given on stdin, and the read prints only the HTTP
-status and a count:
-
-```sh
-IFS=$'\t' read -r GROUP_ID MEMBER CALENDAR < <(sql -At -F $'\t' -c "SELECT g.group_id, g.person_id, g.calendar_ref
-  FROM fcs.calendar_grants g JOIN fcs.calendars c ON c.ref = g.calendar_ref JOIN fcs.connections n ON n.id = c.connection_id
-  WHERE n.enabled AND g.scopes ? 'agenda:read' ORDER BY 1, 2, 3 LIMIT 1" </dev/null)
-python3 -I -c 'import secrets, sys; sys.stdout.write(secrets.token_urlsafe(48))' > "$WORK/drill.key"
-owner agent-key --id restore-drill --group "$GROUP_ID" --member "$MEMBER" --calendar "$CALENDAR" --days 1 \
-  --token-file /dev/stdin --operation-id restore-drill < "$WORK/drill.key" >/dev/null
-restore exec -T calendar-api python -I -c '
-import json, os, sys, urllib.request
-with open(os.path.join(os.environ["FCS_DATA_DIR"], "service", "gateway.json")) as file:
-    config = json.load(file)
-port = int(config["port"])
-host = (config.get("allowed_hosts") or [f"127.0.0.1:{port}"])[0]
-bind = config.get("bind", "127.0.0.1")
-address = "127.0.0.1" if bind in ("", "0.0.0.0", "::") else f"[{bind}]" if ":" in bind else bind
-request = urllib.request.Request(f"http://{address}:{port}/v1/calendars", data=b"{}", headers={
-    "Host": host, "Content-Type": "application/json", "Authorization": "Bearer " + sys.stdin.read()})
-with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=20) as response:
-    print(json.dumps({"status": response.status, "calendars": len(json.load(response)["calendars"])}))' < "$WORK/drill.key"
-sql -At <<'SQL'
-DELETE FROM fcs.agent_calendars WHERE principal_id = 'restore-drill';
-DELETE FROM fcs.principal_operations WHERE operation_id = 'restore-drill';
-DELETE FROM fcs.principals WHERE id = 'restore-drill';
-SELECT 'temporary principals left: ' || count(*) FROM fcs.principals WHERE id = 'restore-drill';
-SQL
-rm "$WORK/drill.key"
-```
-
-Teardown, on success and on failure. It works by the scratch project's label, so it needs no Compose config and no step
-above to have finished; it lists what it removes, then that nothing is left. The pulled image and the Compose package
-stay; neither holds data:
-
-```sh
-set +e
-PROJECT=label=com.docker.compose.project=deedkit-calendar-restore
-echo "containers:"; docker ps -aq --filter "$PROJECT" | xargs -r docker inspect --format '{{.Name}}'
-docker ps -aq --filter "$PROJECT" | xargs -r docker rm --force --volumes >/dev/null
-echo "volumes:"; docker volume ls -q --filter "$PROJECT"
-docker volume ls -q --filter "$PROJECT" | xargs -r docker volume rm >/dev/null
-echo "networks:"; docker network ls --format '{{.Name}}' --filter "$PROJECT"
-docker network ls -q --filter "$PROJECT" | xargs -r docker network rm >/dev/null
-echo "files:"; find "$WORK" -mindepth 1 -maxdepth 2 -printf '%P\n' 2>/dev/null
-case "$WORK" in /srv/backups/calendar-restore.*) rm -rf -- "$WORK";; esac
-rm -f /root/compose.calendar-restore.yaml
-echo "left:"; docker ps -aq --filter "$PROJECT"; docker volume ls -q --filter "$PROJECT"; docker network ls -q --filter "$PROJECT"; ls -d /srv/backups/calendar-restore.* 2>/dev/null
-```
+Teardown works by the project's label and the directory's prefix, so it needs no Compose config and no earlier step. It
+removes the scratch containers, the helpers (which carry the same label), the volume, the network, the state directory
+and the decrypted files, lists each, and fails if anything is left. The pulled image and the Compose package stay, and
+neither holds data; delete your copy of the two files. Stderr that can quote a password or a row goes to a private file
+removed with the rest, and the scratch containers log nothing.
 
 A production restore runs the same steps only as a section 2 gated restore (AGENTS.md section 2): an Astra-reviewed
 plan, a fresh verified backup and an undo. It uses production's own Compose file and volume names, and starting the
 worker, which reaches the providers, is a step of that plan.
 
 Agent keys. Restored principals keep their key hashes, so an agent that still holds its key works unchanged. An agent
-that lost its key gets `deedkit admin key issue <new-id> --like <old-id>` (docs/operations/production.md; ANYM-496), its
-client is rebound to the new key, and the old principal is revoked (ANYM-497). No hash recreates a key.
+that lost its key gets `deedkit admin key issue <new-id> --like <old-id> --days N` (docs/operations/production.md,
+"Issue a key like an existing one"; ANYM-496), its client is rebound to the new key, and the old principal is revoked
+(ANYM-497). No hash recreates a key.
 
 ## Recordings archive bundle (ANYM-714)
 
