@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -540,15 +541,6 @@ def test_the_helper_never_writes_into_the_snapshot_and_leaves_it_read_only(tmp_p
 
 # --- criterion 4: receive -> restore -> protect -> rotate ---------------------------------------------------------------
 
-def discard_refused_candidate(s, bid):
-    """The operator step of BACKUP_R2.md, Calls verifier instance: a refused candidate blocks later deliveries until its
-    journal, stored object, receipt and committed attempt are gone. The protected point is not touched."""
-    (s.directory / 'active.json').unlink()
-    for key in [key for key in s.calls_cloud.objects if bid in key]:
-        del s.calls_cloud.objects[key]
-    (Path(s.calls_receiver['state_directory']) / (bid + '.attempt.json')).unlink()
-
-
 # spec: ANYM-781
 def test_two_bundles_the_second_corrupt_keep_the_first_and_a_third_good_one_replaces_it(calls_instance):
     s = calls_instance
@@ -569,10 +561,10 @@ def test_two_bundles_the_second_corrupt_keep_the_first_and_a_third_good_one_repl
     answer = freshness().evaluate(s.directory, 36, now)[1]
     assert answer['captured_at'] == first_capture and answer['status'] == 'fresh' and answer['last_error'] == 'restore_mismatch'
 
-    # The refused candidate holds the second object slot until the operator step.
+    # The refused candidate holds the second object slot until the operator's command.
     with pytest.raises(RuntimeError, match='receiver_quota'):
         s.deliver(sealed(root, 'blocked'), THIRD)
-    discard_refused_candidate(s, SECOND)
+    assert s.v.discard_refused(s.calls, SECOND, client=s.calls_cloud) == {'v': 1, 'status': 'discarded', 'backup_id': SECOND}
     assert s.verify()['status'] == 'idle' and Path(s.calls['protected_file']).read_bytes() == marker
 
     third_capture = (now - timedelta(minutes=5)).isoformat()
@@ -602,6 +594,189 @@ def test_calls_rotation_keeps_as_many_points_as_the_calendar_profile(calls_insta
     assert s.calls_receiver['max_objects'] == r2.load_config(s.calendar['receiver_config_file'])['max_objects']
     example = json.loads((ROOT / 'deploy' / 'backup-runner-calls.example.json').read_text())
     assert example['keep_local'] == 1
+
+
+# --- the operator's way past a refused candidate ----------------------------------------------------------------------------
+
+@pytest.fixture
+def refused(calls_instance):
+    """A protected first bundle and a second one the helper refused: its journal and object remain."""
+    s = calls_instance
+    root = s.host.parent
+    s.deliver(sealed(root, 'one'), BID)
+    s.first = s.verify()
+    s.marker = Path(s.calls['protected_file']).read_bytes()
+    s.deliver(flipped(root, sealed(root, 'two')), SECOND)
+    with pytest.raises(RuntimeError, match='restore_mismatch'):
+        s.verify()
+    s.discard = lambda bid=SECOND: s.v.discard_refused(s.calls, bid, client=s.calls_cloud)
+    s.candidate_keys = lambda: [key for key in s.calls_cloud.objects if SECOND in key]
+    s.attempt = Path(s.calls_receiver['state_directory']) / (SECOND + '.attempt.json')
+    s.protected_keys = [key for key in s.calls_cloud.objects if BID in key]
+    return s
+
+
+def assert_replaceable(s):
+    """The refused candidate is gone, the point is untouched, the next run is idle and a good bundle rotates."""
+    assert not s.candidate_keys() and not s.attempt.exists() and not (s.directory / 'active.json').exists()
+    assert Path(s.calls['protected_file']).read_bytes() == s.marker
+    assert all(key in s.calls_cloud.objects for key in s.protected_keys)
+    assert s.verify()['status'] == 'idle'
+    s.deliver(sealed(s.host.parent, 'three'), THIRD)
+    assert s.verify()['backup_id'] == THIRD
+
+
+# spec: ANYM-781
+def test_the_discard_removes_exactly_the_refused_candidate_and_keeps_its_record(refused):
+    s = refused
+    assert s.candidate_keys() and s.attempt.exists()
+    assert s.discard() == {'v': 1, 'status': 'discarded', 'backup_id': SECOND}
+    record = json.loads((s.directory / f'discarded-{SECOND}.json').read_text())
+    assert record['backup_id'] == SECOND and record['failure']['error'] == 'restore_mismatch'
+    assert record['journal']['receipt']['wire']['id'] == SECOND and 'synthetic brief' not in json.dumps(record)
+    assert_replaceable(s)
+
+
+# spec: ANYM-781
+def test_the_discard_command_line_prints_its_outcome_and_a_refusal_is_a_fixed_code(refused, monkeypatch, capsys):
+    s = refused
+    monkeypatch.setattr(s.v.r2, 'make_client', lambda receiver: s.calls_cloud)
+    assert s.v.main(['--discard-refused', THIRD, '--config', str(s.calls_path)]) == 1
+    assert json.loads(capsys.readouterr().err)['error'] == 'discard_not_refused'
+    assert s.v.main(['--discard-refused', SECOND, '--config', str(s.calls_path)]) == 0
+    assert json.loads(capsys.readouterr().out) == {'v': 1, 'status': 'discarded', 'backup_id': SECOND}
+    assert_replaceable(s)
+
+
+def nothing_changed(s, before):
+    assert dict(s.calls_cloud.objects) == before and s.attempt.exists() and (s.directory / 'active.json').exists()
+    assert Path(s.calls['protected_file']).read_bytes() == s.marker
+    assert not list(s.directory.glob('discarded-*'))
+
+
+# spec: ANYM-781
+@pytest.mark.parametrize('case', ['other_id', 'transient_failure', 'cleanup_incomplete', 'proof_ready', 'marker_moved', 'uncommitted'])
+def test_the_discard_refuses_anything_but_a_finished_refusal_of_that_candidate(refused, case):
+    s = refused
+    before = dict(s.calls_cloud.objects)
+    status_path = s.directory / 'status.json'
+    journal_path = s.directory / 'active.json'
+    status, journal = json.loads(status_path.read_text()), json.loads(journal_path.read_text())
+    bid = SECOND
+    if case == 'other_id':
+        bid = THIRD
+    elif case == 'transient_failure':
+        s.write_json(status_path, {**status, 'error': 'restore_docker_failed'})
+    elif case == 'cleanup_incomplete':
+        s.write_json(status_path, {**status, 'cleanup_complete': False})
+    elif case == 'proof_ready':
+        s.write_json(journal_path, {**journal, 'phase': 'proof_ready'})
+    elif case == 'marker_moved':
+        s.write_json(journal_path, {**journal, 'prior_sha256': 'd' * 64})
+    else:
+        attempt = json.loads(s.attempt.read_text())
+        s.attempt.write_text(json.dumps({**attempt, 'phase': 'uploading'}))
+    with pytest.raises(ValueError, match='discard_not_refused'):
+        s.discard(bid)
+    nothing_changed(s, before)
+
+
+# spec: ANYM-781
+def test_the_discard_never_removes_a_protected_point(refused):
+    s = refused
+    before = dict(s.calls_cloud.objects)
+    with pytest.raises(ValueError, match='discard_protected'):
+        s.discard(BID)
+    nothing_changed(s, before)
+    # A record of an earlier discard does not open the way either, whatever it names.
+    s.write_json(s.directory / f'discarded-{BID}.json', {'v': 1, 'backup_id': BID, 'journal': json.loads((s.directory / 'active.json').read_text())})
+    with pytest.raises(ValueError, match='discard_protected'):
+        s.discard(BID)
+    assert dict(s.calls_cloud.objects) == before
+
+
+# spec: ANYM-781
+def test_the_discard_is_calls_only_and_refuses_without_a_journal(calls_instance):
+    s = calls_instance
+    with pytest.raises(ValueError, match='discard_calls_only'):
+        s.v.discard_refused(s.calendar, BID, client=s.calendar_cloud)
+    with pytest.raises(ValueError, match='invalid_backup_id'):
+        s.v.discard_refused(s.calls, '../x', client=s.calls_cloud)
+    with pytest.raises(ValueError, match='discard_not_refused'):
+        s.v.discard_refused(s.calls, BID, client=s.calls_cloud)
+    for code in ('discard_calls_only', 'discard_not_refused', 'discard_protected', 'discard_unconfirmed'):
+        assert s.v.failure_code(ValueError(code)) == code
+
+
+# spec: ANYM-781
+@pytest.mark.parametrize('held', ['verifier', 'receiver'])
+def test_the_discard_changes_nothing_while_a_verifier_or_an_upload_holds_its_lock(refused, held):
+    import fcntl
+    s = refused
+    before = dict(s.calls_cloud.objects)
+    path, code = ((s.directory / '.verifier.lock', 'verifier_busy') if held == 'verifier' else
+                  (Path(s.calls_receiver['state_directory']) / '.receiver.lock', 'receiver_busy'))
+    lock = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(RuntimeError, match=code):
+            s.discard()
+    finally:
+        os.close(lock)
+    nothing_changed(s, before)
+    assert s.discard()['status'] == 'discarded'
+
+
+# spec: ANYM-781
+@pytest.mark.parametrize('stop', ['after_the_record', 'after_the_object', 'after_the_receipt', 'after_the_attempt'])
+def test_a_discard_stopped_at_any_step_harms_nothing_and_the_same_command_finishes_it(refused, stop, monkeypatch):
+    s = refused
+    v = s.v
+    real_delete, real_write, real_unlink = s.calls_cloud.delete_object, v.local.write_maintenance_json, os.unlink
+
+    class Stop(Exception):
+        pass
+
+    def write(name, value, **kw):
+        result = real_write(name, value, **kw)
+        if str(name).startswith('discarded-') and stop == 'after_the_record':
+            raise Stop
+        return result
+
+    def delete(**kw):
+        result = real_delete(**kw)
+        if (stop == 'after_the_object' and '/objects/' in kw['Key']) or (stop == 'after_the_receipt' and '/receipts/' in kw['Key']):
+            raise Stop
+        return result
+
+    def unlink(path, **kw):
+        real_unlink(path, **kw)
+        if stop == 'after_the_attempt' and str(path).endswith('.attempt.json'):
+            raise Stop
+    monkeypatch.setattr(v.local, 'write_maintenance_json', write)
+    monkeypatch.setattr(s.calls_cloud, 'delete_object', delete)
+    monkeypatch.setattr(v.os, 'unlink', unlink)
+    with pytest.raises((Stop, RuntimeError)):  # cloud_call turns a stop inside the SDK call into storage_unavailable
+        s.discard()
+    monkeypatch.setattr(v.local, 'write_maintenance_json', real_write)
+    monkeypatch.setattr(s.calls_cloud, 'delete_object', real_delete)
+    monkeypatch.setattr(v.os, 'unlink', real_unlink)
+    # The journal is still there: the timer's retry fails and moves no point.
+    assert (s.directory / 'active.json').exists()
+    with pytest.raises((RuntimeError, ValueError)):
+        s.verify()
+    assert Path(s.calls['protected_file']).read_bytes() == s.marker
+    assert s.discard()['status'] == 'discarded'
+    assert_replaceable(s)
+
+
+# spec: ANYM-781
+def test_a_discard_that_cannot_confirm_the_removal_keeps_the_journal(refused, monkeypatch):
+    s = refused
+    monkeypatch.setattr(s.calls_cloud, 'delete_object', lambda **kw: {})
+    with pytest.raises(RuntimeError, match='discard_unconfirmed'):
+        s.discard()
+    assert (s.directory / 'active.json').exists() and Path(s.calls['protected_file']).read_bytes() == s.marker
 
 
 # --- criterion 5: failure isolation -------------------------------------------------------------------------------------
@@ -788,7 +963,7 @@ def test_the_calls_verifier_units_are_the_recordings_pair_with_their_own_config(
 def test_the_documents_name_the_calls_profile_its_contract_and_its_restore_check():
     text = (ROOT / 'BACKUP_R2.md').read_text()
     section = text[text.index('## Calls verifier instance'):text.index('## Two verifiers on one receiver')]
-    for word in ('`profile: calls`', '`restore_mismatch`', 'integrity_check', '`captured_at`', '`user_version`',
+    for word in ('`profile: calls`', '`restore_mismatch`', 'integrity_check', '`captured_at`', '`user_version`', '--discard-refused',
                  'calls-backup-r2-verifier.example.json', 'deedkit-calls-backup-r2-verifier.service', 'calls_helper_failed'):
         assert word in section, word
     backup = (ROOT / 'BACKUP.md').read_text()

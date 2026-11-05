@@ -725,10 +725,23 @@ immutable, so it writes nothing beside it. No database is restored:
 | the bundle names another profile | `verifier_profile_mismatch` |
 
 A refused candidate never replaces the protected point, and the previous proof stays the one `last-success.json` names. The
-recordings continuity checks do not apply. Like every instance's, a refused candidate keeps its retry journal and its object:
-the receiver refuses the next delivery (`receiver_quota`) until an operator, under the evidence rules above, removes that
-candidate's `active.json`, its object and receipt under the prefix, and its `<id>.attempt.json`, never the protected point
-(tests/test_backup_calls_receiver.py runs exactly these steps). The last proof's age keeps growing while it waits.
+recordings continuity checks do not apply. Like every instance's, a refused candidate keeps its retry journal and its object, so
+its retries keep failing, the receiver refuses the next delivery (`receiver_quota`) and the last proof's age keeps growing. The
+way past it is one command, on this instance only, with the receipt's backup ID from `active.json`:
+
+```sh
+python -m messaging_service.backup_r2_verifier --discard-refused <backup id> --config /etc/deedkit-calls-backup-r2/verifier.json
+```
+
+It holds the verifier and receiver locks, or fails `verifier_busy`/`receiver_busy` having changed nothing. It refuses with
+`discard_not_refused` unless the journal is that candidate's and still restoring, its prior marker digest is the current marker's,
+the latest status is a `restore_mismatch` whose cleanup completed, and its upload is committed; and with `discard_protected` when
+the marker names that ID. It writes `discarded-<id>.json` in the verifier directory (root, the journal and the failure's code and
+time), then removes the object, the receipt and the attempt, reads back that they are gone (else `discard_unconfirmed`) and removes
+the journal last. A stop at any step is resumed by the same command; meanwhile a retry only fails. The protected point is not
+touched, and the ciphertext of the discarded candidate is gone: copy it first if it must be examined. The next run reads `idle` and
+the next delivery goes in. This is the exception to keeping a failed candidate for retry: a `restore_mismatch` cannot pass on retry.
+Other profiles have no such command (a card candidate).
 
 Scratch. The verifier decrypts into `payload-<run>` (0700, root) in its directory; for this profile it holds the calls database's
 plaintext for the verification only, and is removed like the recordings scratch above.

@@ -670,8 +670,10 @@ RECORDINGS_FAILURES={'restore_archive_failed','restore_readback_failed','invalid
                      'rebaseline_recordings_only','invalid_deletion_floor','revoke_recordings_only','continuity_too_large','continuity_unresolved',*continuity.REFUSALS}
 
 
-# The calls helper's one refusal after the shared stages (ANYM-781).
+# The calls helper's one refusal after the shared stages (ANYM-781), and the discard command's own refusals.
 CALLS_FAILURES={'restore_mismatch'}
+DISCARD_FAILURES={'discard_calls_only','discard_not_refused','discard_protected','discard_unconfirmed'}
+DISCARD_PREFIX='discarded-'
 
 
 class HelperFailure(RuntimeError):
@@ -1039,6 +1041,56 @@ def verify_run(config,receiver,client,engine,journal,fd):
     return journal
 
 
+def discard_intent(receiver,backup_id,journal,status,state_fd,prior):
+    """What a discard keeps of a refused candidate, or a refusal: only the exact candidate a finished helper refused."""
+    if journal is None:raise ValueError('discard_not_refused')
+    validate_journal(receiver,journal)
+    if (r2.profile(journal)!='calls' or journal['phase']!='restoring' or journal['receipt']['wire']['id']!=backup_id or
+            journal['prior_sha256']!=prior or not isinstance(status,dict) or status.get('status')!='failed' or
+            status.get('error') not in CALLS_FAILURES or status.get('cleanup_complete') is not True):
+        raise ValueError('discard_not_refused')
+    attempt=r2.state_read(state_fd,r2.attempt_name(backup_id))
+    if attempt is not None and r2.validate_attempt(receiver,attempt,backup_id)['phase']!='committed':
+        raise ValueError('discard_not_refused')
+    return {'v':1,'backup_id':backup_id,'discarded_at':now(),'journal':journal,'failure':{k:status[k] for k in ('error','failed_at')}}
+
+
+def discard_refused(config,backup_id,*,client=None):
+    """The operator's way past a calls candidate the helper refused (ANYM-781). A refused candidate keeps its journal and
+    object, so its retries fail for good and the receiver refuses the next delivery. Holding both locks, this records why,
+    then removes exactly that candidate's object, receipt, attempt and journal. It never touches a protected point: the
+    marker is read first on every call, and a stop at any step is resumed by the same command from the recorded intent."""
+    if os.geteuid()!=0:raise ValueError('root_verifier_required')
+    if r2.profile(config)!='calls':raise ValueError('discard_calls_only')
+    r2.valid_id(backup_id)
+    receiver=r2.load_config(config['receiver_config_file'])
+    client=client if client is not None else r2.make_client(receiver)
+    name=DISCARD_PREFIX+backup_id+'.json'
+    with verifier_lock(config['directory']) as fd:
+        with local.trusted_directory(receiver['state_directory'],archive=True) as state_fd,receiver_lock(state_fd):
+            prior,marker=read_marker(receiver,config['protected_file'])
+            if marker is not None and any(item['id']==backup_id for item in marker['backups']):raise ValueError('discard_protected')
+            _,intent=r2.read_root(fd,name,missing=True)
+            _,journal=r2.read_root(fd,'active.json',missing=True)
+            if intent is None:
+                _,status=r2.read_root(fd,'status.json',missing=True)
+                intent=discard_intent(receiver,backup_id,journal,status,state_fd,prior)
+                local.write_maintenance_json(name,intent,dir_fd=fd)
+            elif journal is not None and journal!=intent['journal']:raise ValueError('discard_not_refused')
+            receipt=intent['journal']['receipt']
+            # The object before its receipt, as a rotation does: a receipt without an object cannot be a candidate.
+            r2.cloud_call(client.delete_object,Bucket=receiver['bucket'],Key=receipt['object_key'])
+            r2.cloud_call(client.delete_object,Bucket=receiver['bucket'],Key=r2.receipt_key(receiver,backup_id))
+            try:os.unlink(r2.attempt_name(backup_id),dir_fd=state_fd)
+            except FileNotFoundError:pass
+            local.fsync_dir(state_fd)
+            if receipt['object_key'] in r2.inventory(receiver,client) or r2.get_receipt(receiver,client,backup_id) is not None:
+                raise RuntimeError('discard_unconfirmed')
+            # The journal last: until here a retry only fails, and this command resumes.
+            if journal is not None:os.unlink('active.json',dir_fd=fd);local.fsync_dir(fd)
+            return {'v':1,'status':'discarded','backup_id':backup_id}
+
+
 # This invocation's failure record, for main's journal line (ANYM-633); run() clears it first.
 FAILED=[]
 
@@ -1233,7 +1285,7 @@ def failure_code(error):
           'invalid_verifier_journal','private_root_file_required','restore_docker_failed','restore_postgres_unavailable',
           'isolated_restore_failed','stored_backup_corrupt','protected_backup_corrupt','verifier_host_busy','verifier_cleanup_unconfirmed',
           'verifier_pins_unfinished','verifier_code_unfinished','invalid_verifier_lock','verification_pending','instances_invalid','pins_switch_unresolved','storage_unavailable','unexpected_restore_image_volume','unexpected_restore_helper_layout',
-          *CALENDAR_FAILURES,*RECORDINGS_FAILURES,*CALLS_FAILURES}
+          *CALENDAR_FAILURES,*RECORDINGS_FAILURES,*CALLS_FAILURES,*DISCARD_FAILURES}
     return str(error) if str(error) in safe else 'independent_restore_failed'
 
 
@@ -1267,7 +1319,16 @@ def main(argv=None):
     parser.add_argument('--rebaseline',action='store_true');parser.add_argument('--reason')
     # After an owner-requested deletion (ANYM-730): `--revoke-below <incarnation> --config <verifier.json>`.
     parser.add_argument('--revoke-below',type=int)
+    # Past a calls candidate the helper refused (ANYM-781): `--discard-refused <backup id> --config <verifier.json>`.
+    parser.add_argument('--discard-refused')
     args=parser.parse_args(argv)
+    if args.discard_refused is not None:
+        if not args.config or args.rebaseline or args.update_pins or args.revoke_below is not None:
+            parser.error('--discard-refused takes --config only')
+        try:result=discard_refused(load_config(args.config),args.discard_refused)
+        except Exception as error:
+            print(json.dumps({'error':failure_code(error),'diagnostic':describe(error)},separators=(',',':')),file=sys.stderr);return 1
+        print(json.dumps(result,separators=(',',':')));return 0
     if args.revoke_below is not None:
         if not args.config or args.rebaseline or args.update_pins:parser.error('--revoke-below takes --config only')
         try:result=request_revocation(load_config(args.config),args.revoke_below)
