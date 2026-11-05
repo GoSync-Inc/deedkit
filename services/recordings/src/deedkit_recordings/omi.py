@@ -142,6 +142,14 @@ def young(created, now):
         return False
 
 
+def lazy_summary(value, now):
+    """The collector's reading of an empty overview: a record under a day old, not flagged as deferred, has no summary
+    yet, whatever its title. It waits for the stage reads or a changed list row (`deferred` keeps the pending schedule)."""
+    structured = value.get('structured') if isinstance(value, dict) else None
+    return isinstance(structured, dict) and structured.get('overview') == '' and \
+        value.get('processing_deferred') is not True and young(value.get('created_at'), now)
+
+
 def content(value, kind, now=None):
     if not isinstance(value, dict):
         raise Failure('invalid_provider_response', detail_code='not_object')

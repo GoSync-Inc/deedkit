@@ -7,11 +7,12 @@ import time
 from . import archive_feed
 from .archive_store import Store, MAX_TEXT, namespace, provider_missing
 from . import plaud, archive_plaud
-from .omi import metadata, pagination, content, fingerprint
+from .omi import metadata, pagination, content, fingerprint, lazy_summary
 from .security import Failure, RateLimited, provider_token, read_document
 
 PAGE = 200          # list page size the collector asks for (Omi clamps to 1-200)
 HEAD_RESERVE = 6    # reads per hour only the head refresh and brand-new conversations may use
+FIRST_READ_RESERVE = 3  # transcripts per hour re-reads leave to first reads and failed records (a budget of 3 or less keeps none)
 HEAD_EVERY = 300    # seconds between head refreshes once the history traversal is under way
 REFRESH_EVERY = 86400  # a finished history is walked again this often (list rows only) to notice changed older records
 HARD = ('archive_capacity', 'archive_unavailable', 'archive_disabled', 'archive_authorization_changed',
@@ -269,11 +270,16 @@ class ArchiveRuntime:
             items = await self.db('work_items', account, now, 8, lambda: self.current(account), False)
             items.sort(key=lambda item: not item[1])  # conversations of the last 24 h first: they own the reserved reads
             rotated = False
-            for recording_id, fresh, probe in items:
+            for recording_id, fresh, probe, revisit in items:
                 reads = budget.reads_per_hour if fresh else budget.reads_per_hour - HEAD_RESERVE
                 # A provider_missing record's weekly check reads no transcript, so it reserves no transcript slot.
-                buckets = [('reads', reads)] + ([] if probe else [('transcripts', budget.transcript_per_hour)])
+                transcripts = budget.transcript_per_hour
+                if revisit and transcripts > FIRST_READ_RESERVE:
+                    transcripts -= FIRST_READ_RESERVE
+                buckets = [('reads', reads)] + ([] if probe else [('transcripts', transcripts)])
                 if not await self.reserve(credential, buckets, self.clock(now)):
+                    if revisit:
+                        continue  # only the re-reads' share is spent: first reads and failed records behind it still go
                     break
                 if not rotated:
                     # Fairness advances with dispatched work, not with passes a spent window denied.
@@ -290,7 +296,7 @@ class ArchiveRuntime:
         if account.provider == 'plaud':
             return await self.observe_plaud(account, recording_id, now)
         old = await self.db('record', account, recording_id)
-        projected, observations = old['metadata'], {}
+        projected, observations, lazy = old['metadata'], {}, False
         token = self.current(account)
         fingerprint = hashlib.sha256(token.encode()).hexdigest()
         if provider_missing(old['parts']):
@@ -298,12 +304,17 @@ class ArchiveRuntime:
         try:
             async with asyncio.timeout(60):
                 value, _ = await self.provider.get(token, recording_id, {'include_transcript':'true'})
+                # The read is stamped with when it returned, not when the pass began: a stage or the 24-hour boundary the
+                # pass crossed meanwhile counts, so a stage is never read a second time.
+                now = self.clock(now)
                 projected = metadata(value)
                 if projected['id'] != recording_id:
                     raise Failure('invalid_provider_response')
                 for kind in ('transcript', 'summary'):
                     try:
                         state, text = content(value, kind, now)
+                        if kind == 'summary' and lazy_summary(value, now):
+                            state, lazy = 'pending', True
                         if len(text.encode()) > MAX_TEXT:
                             raise Failure('archive_content_limit')
                         observations[kind] = state, text, None
@@ -319,7 +330,7 @@ class ArchiveRuntime:
         def guard():
             self.current(account, fingerprint)
         try:
-            await self.db('observe', account, recording_id, projected, observations, now, guard)
+            await self.db('observe', account, recording_id, projected, observations, now, guard, None, lazy)
         except Failure as error:
             if error.code != 'archive_content_limit':
                 raise
