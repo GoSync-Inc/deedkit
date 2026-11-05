@@ -84,6 +84,7 @@ STEP_LIMIT, GATE_MARGIN, GATE_TIMEOUT, GATE_MIN = 480, 60, 60, 10
 GATE_STATUS = re.compile(r"VERDICT_STATUS_([A-Z]+(?:_[A-Z]+)*)")
 GATE_STATE = re.compile(r"[a-z]+(?:_[a-z]+)*")
 SPEC_STATUS = re.compile(r"[A-Za-z]+(?: [A-Za-z]+)*")
+UNMOVED_STATUSES = ("Backlog", "Active")  # a tuple: a malformed status (a list, a dict) compares false, never raises
 clock = time.monotonic
 
 
@@ -506,6 +507,14 @@ def branch_gate(cli: str, product: str, branch: str, known: dict[int, dict], sta
         return unchecked("unexpected error")
 
 
+def unmoved_notes(lines: Lines, main: dict[int, dict]) -> list[str]:
+    """One advisory line per `Spec:`-only story on main that sync B leaves where it is; never part of the outcome."""
+    return [f"- ANYM-{number} stays {main[number]['status']}: only a Delivers: line moves it (TIDEN-CI.md, Main sync)"
+            for number in lines.spec
+            if number not in lines.delivers and number in main and story(main[number])
+            and main[number].get("status") in UNMOVED_STATUSES]
+
+
 def check(root: Path, base: str, head: str, body: str, cli: str, product: str, report,
           started: float | None = None) -> int:
     started = clock() if started is None else started
@@ -590,6 +599,8 @@ def check(root: Path, base: str, head: str, body: str, cli: str, product: str, r
                             "close and reopen the pull request: a rerun replays the old body.")
     else:
         code, closing = 0, "Passed."
+    for line in unmoved_notes(lines, main):
+        report(line)
     if lines.branch and status != "merged":  # the merged path adds no Tiden call
         for line in branch_gate(cli, product, lines.branch, known, started):
             report(line)
