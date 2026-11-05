@@ -5593,7 +5593,7 @@ def enroll_plan(settings, http, name, sha, mirror, state=None):
             with os.fdopen(new_file(target), "wb") as handle:
                 handle.write(content)
             scratch_files[path] = str(target)
-        if env is not None and len(contents) == len(wanted):
+        if env is not None and contents.keys() >= set(wanted):  # a path listed twice has one entry in `contents`
             overlay = manifest["gateway"]["overlay"]
             for label, item, files in (("project", new_project, [scratch_files[path] for path in project["files"]]),
                                        ("gateway", gateway, [*gateway["files"], *([scratch_files[overlay]] if overlay else [])]),
@@ -5631,6 +5631,8 @@ def enroll_plan(settings, http, name, sha, mirror, state=None):
                     check_policy_candidate(candidate, scratch)
                 except EnrollRefused as exc:
                     failures.append({"code": exc.code, "detail": exc.detail})
+    if "project" not in documents and not failures:  # the private configuration and the networks were not checked
+        failures.append({"code": "compose_config_failed", "detail": f"{project['name']}: no resolved document"})
     if failures:
         raise EnrollRefusals(failures)
     grants = {principal: sorted(section["grants"]) for principal, section in fragment["principals"].items()}

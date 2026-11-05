@@ -1277,6 +1277,25 @@ def test_a_plan_that_cannot_resolve_the_document_says_so_and_apply_writes_nothin
 
 
 # spec: ANYM-765
+def test_a_manifest_that_lists_an_overlay_twice_still_resolves_the_document_and_checks_its_networks(tmp_path, monkeypatch):
+    overlay = "deploy/compose.recordings.yaml"
+    host = NetworkHost(tmp_path, monkeypatch, mutate=set_path("project", "files", value=[overlay, overlay]))
+    plan = host.plan()
+    assert "project" in plan["inputs"]["compose"]
+    host.extra = UNDECLARED[0]
+    assert host.codes() == ["network_unsafe"]
+    files, before = host.files(), tree(host.root)
+    refused_before_the_first_write(host, host.apply(plan["plan_digest"]), "network_unsafe", files, before)
+
+
+# spec: ANYM-765
+def test_a_plan_without_a_resolved_document_never_succeeds(tmp_path, monkeypatch):
+    host = NetworkHost(tmp_path, monkeypatch)
+    monkeypatch.setattr(p, "read_env_file", lambda path: None)  # no document, and no refusal explains why
+    assert host.codes() == ["compose_config_failed"]
+
+
+# spec: ANYM-765
 @pytest.mark.parametrize("networks, undeclared", [
     ({"backend": {"name": "declared", "external": True}}, None),
     ({"declared": {"external": True}}, None),
