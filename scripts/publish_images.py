@@ -38,6 +38,8 @@ TRANSIENT = re.compile(r"(?:HTTP(?: status:)?|status code|StatusCode:) (?:429|5\
                        r"|TLS handshake|no such host|temporary failure|Sigstore verifier"
                        r"|verifier is not available|initialization may have failed", re.IGNORECASE)
 ATTEMPTS, BACKOFF = 4, 5
+# `skopeo copy` tries once more after each of these waits, on any non-zero exit (Registry.push).
+PUSH_WAITS = (15, 45)
 
 
 class Refused(RuntimeError):
@@ -50,8 +52,12 @@ def run(argv, *, check=True):
     except subprocess.TimeoutExpired as exc:
         raise Refused(f"{argv[0]} {argv[1]} did not finish within 30 minutes") from exc
     if check and result.returncode:
-        raise Refused(f"{argv[0]} {argv[1]} failed (exit {result.returncode}): {result.stderr.strip()[-400:]}")
+        raise Refused(failure(argv, result))
     return result
+
+
+def failure(argv, result):
+    return f"{argv[0]} {argv[1]} failed (exit {result.returncode}): {result.stderr.strip()[-400:]}"
 
 
 def transient(result):
@@ -152,8 +158,17 @@ class Registry:
         return json.loads(raw)
 
     def push(self, archive, reference):
-        run(["skopeo", "copy", "--quiet", *[f"--dest-{flag[2:]}" for flag in self.tls],
-             "docker-archive:" + str(archive), "docker://" + reference])
+        """Upload the archive under a staging tag. A repeat is safe: blobs are content-addressed, the tag holds the same manifest."""
+        argv = ["skopeo", "copy", "--quiet", *[f"--dest-{flag[2:]}" for flag in self.tls],
+                "docker-archive:" + str(archive), "docker://" + reference]
+        for attempt, wait in enumerate((*PUSH_WAITS, None), 1):
+            result = run(argv, check=False)
+            if not result.returncode:
+                return
+            print(f"{reference}: attempt {attempt} of {len(PUSH_WAITS) + 1}: {failure(argv, result)}", file=sys.stderr, flush=True)
+            if wait is None:
+                raise Refused(failure(argv, result))
+            time.sleep(wait)
 
     def put(self, reference, raw, media_type):
         """PUT exactly these manifest bytes under a tag (OCI distribution spec, "Pushing manifests"). Never retried."""
