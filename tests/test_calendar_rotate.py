@@ -1203,7 +1203,8 @@ def test_a_link_in_the_journal_directory_is_refused_before_anything_is_written(h
 # spec: ANYM-784
 def test_a_journal_directory_owned_by_someone_else_or_open_to_others_is_refused(host, scratch):
     journal = host.tmp / 'scratch' / 'service.rotation'
-    journal.mkdir(mode=0o755)
+    journal.mkdir()
+    journal.chmod(0o755)  # mkdir's mode passes through the process umask, which an imported module may have set
     code, line, _ = scratch.run(('apply', 'owner'))
     assert code == 1 and line['code'] == 'journal_directory_not_private'
 

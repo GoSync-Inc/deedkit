@@ -684,6 +684,10 @@ jobs:
         id: whatsmeow
         working-directory: whatsapp/whatsmeow
         run: go test -race -count=1 -json ./... > "$RUNNER_TEMP/ci-evidence/whatsmeow.json"
+      - name: Name the failed native WhatsApp adapter tests in the log
+        # ANYM-801: the step above writes its stdout to a file, so its own log holds only the exit status.
+        if: ${{ !cancelled() && steps.whatsmeow.outcome == 'failure' }}
+        run: python3 ci-tools/scripts/go_failures.py "$RUNNER_TEMP/ci-evidence/whatsmeow.json"
       - name: Forked whatsmeow patch tests
         if: ${{ !cancelled() && steps.whatsmeow_fork.outcome == 'success' }}
         working-directory: whatsapp/whatsmeow

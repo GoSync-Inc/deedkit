@@ -13,6 +13,14 @@ from test_backup_operations import runner_fixture
 from test_backup_streaming import streaming_runner
 
 
+@pytest.fixture(autouse=True)
+def private_umask():
+    """`main` runs under 077; a marker written before it must not depend on what an earlier module left."""
+    previous = os.umask(0o077)
+    yield
+    os.umask(previous)
+
+
 def rotation_host(tmp_path, monkeypatch):
     """The real `main` of a calendar run on real locks; the capture is replaced by a record that it started."""
     cfg = calendar_cfg(tmp_path)
