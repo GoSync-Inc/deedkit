@@ -190,6 +190,64 @@ def test_a_branch_listed_twice_is_refused_even_when_merged(repo, server):
         run(repo, server, {"README.md": "text\n"}, "Delivers: ANYM-50\nTiden branch: review/y\n")
 
 
+def stays(number, status):
+    return f"- ANYM-{number} stays {status}: only a Delivers: line moves it (TIDEN-CI.md, Main sync)"
+
+
+# spec: ANYM-799
+@pytest.mark.parametrize("status", ["Backlog", "Active"])
+def test_a_spec_only_body_on_an_unmoved_story_gets_one_note_and_still_passes(repo, server, status):
+    server.set(main=[spec(12, status=status)])
+    code, out = run(repo, server, {"README.md": "text\n"}, "Spec: ANYM-12\n")
+    assert code == 0, out
+    assert out.splitlines()[-2:] == [stays(12, status), "Passed."]
+    assert out.count("only a Delivers: line moves it") == 1 and not server.writes()
+
+
+# spec: ANYM-799
+def test_a_delivers_line_gets_no_note_even_when_the_spec_line_names_the_same_card(repo, server):
+    server.set(main=[spec(12, status="Backlog"), spec(13, status="Backlog")])
+    code, out = run(repo, server, {"README.md": "text\n"}, "Delivers: ANYM-12\n")
+    assert code == 0 and "only a Delivers: line" not in out, out
+    code, out = run(repo, server, {"README.md": "more\n"}, "Delivers: ANYM-12\nSpec: ANYM-12, ANYM-13\n")
+    assert code == 0, out
+    assert stays(13, "Backlog") in out and "ANYM-12 stays" not in out
+
+
+# spec: ANYM-799
+@pytest.mark.parametrize("status", ["Review", "Done"])
+def test_a_spec_only_body_on_a_card_past_active_gets_no_note(repo, server, status):
+    server.set(main=[spec(12, status=status), spec(13, status="Backlog")])
+    code, out = run(repo, server, {"README.md": "text\n"}, "Spec: ANYM-12, ANYM-13\n")
+    assert code == 0 and out.splitlines()[-2:] == [stays(13, "Backlog"), "Passed."], out
+    assert "ANYM-12 stays" not in out
+
+
+# spec: ANYM-799
+def test_a_failing_body_prints_its_problems_and_the_note_and_still_fails(repo, server):
+    server.set(main=[spec(12, status="Backlog")])
+    code, out = run(repo, server, {"README.md": "text\n"}, "Spec: ANYM-12, ANYM-99\n")
+    assert code == 1 and "Passed." not in out
+    assert "ANYM-99 (named by the body) is not a spec on Tiden main" in out and "1 problem(s):" in out
+    assert stays(12, "Backlog") in out and "ANYM-99 stays" not in out
+
+
+# spec: ANYM-799
+def test_the_note_is_only_for_a_story_on_main_and_reads_its_main_status(repo, server):
+    server.set(main=[spec(13, status="Backlog"), spec(20, kind="Epic", status="Backlog"),
+                     spec(30, kind="Feature", children=2)])
+    code, out = run(repo, server, {"README.md": "text\n"}, "Spec: ANYM-13, ANYM-20, ANYM-30\n")
+    assert code == 1 and stays(13, "Backlog") in out, out
+    assert "ANYM-20 stays" not in out and "ANYM-30 stays" not in out
+    server.set(main=[spec(12, status="Review"), spec(13, status="Backlog")], branches=BRANCHES,
+               previews={"proposal/x": {"additions": [{"seqNum": 50}], "modifications": [{"branch": {"seqNum": 12}}]}},
+               branch_specs={"proposal/x": [spec(50, status="Backlog", branch=True),
+                                            spec(12, status="Backlog", branch=True)]})
+    code, out = run(repo, server, {"README.md": "more\n"}, "Spec: ANYM-12, ANYM-13, ANYM-50\nTiden branch: proposal/x\n")
+    assert code == 0 and stays(13, "Backlog") in out, out
+    assert "ANYM-12 stays" not in out and "ANYM-50 stays" not in out
+
+
 BRANCHES = [{"name": "main", "status": "open"}, {"name": "proposal/x", "status": "open"},
             {"name": "review/y", "status": "merged"}]
 
@@ -937,6 +995,22 @@ def test_a_failing_check_near_its_step_deadline_is_still_a_verdict_of_the_workfl
     assert code == 1 and out.splitlines()[-1] == VERDICT
     assert outcome(tmp_path, out.splitlines(), code) == "outcome=failed"
     assert len(gate_calls(server)) == (1 if later == 400.0 else 0)
+
+
+# spec: ANYM-799
+def test_the_report_orders_problems_then_notes_then_gate_rows_then_the_closing_line(repo, server, monkeypatch):
+    gated(server, monkeypatch, PASS_REPLY)
+    rows = ["Tiden branch gate: PASS (advisory, never changes this check)",
+            "- ANYM-12 Active verified (neighbour)", "- ANYM-527 Backlog verified"]
+    code, out = run(repo, server, {"README.md": "text\n"}, "Delivers: ANYM-527\nSpec: ANYM-12, ANYM-99\n"
+                                                           "Tiden branch: proposal/x")
+    assert code == 1
+    assert out.splitlines()[-7:] == ["1 problem(s):",
+                                     "- ANYM-99 (named by the body) is not a spec on Tiden main or proposal/x",
+                                     stays(12, "Active"), *rows, VERDICT], out
+    code, out = run(repo, server, {"README.md": "more\n"}, "Delivers: ANYM-527\nSpec: ANYM-12\nTiden branch: proposal/x")
+    assert code == 0
+    assert out.splitlines()[-5:] == [stays(12, "Active"), *rows, "Passed."], out
 
 
 # spec: ANYM-541
