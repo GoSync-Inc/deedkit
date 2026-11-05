@@ -4518,17 +4518,71 @@ def test_a_release_removal_cut_short_never_reads_as_an_unfinished_apply_and_the_
     (tmp_path / "http").mkdir()
     PruneHost(monkeypatch, [], history)
     p.write(state / ("1" * 40) / "attempted.json", {"status": "applied"})
-    remove = shutil.rmtree
-    def cut_short(path, *args, **kwargs):
+    remove = p.remove_path
+    def cut_short(path, deadline):
         (Path(path) / "result.json").unlink()
-        raise OSError("synthetic")
-    monkeypatch.setattr(p.shutil, "rmtree", cut_short)
+        raise p.subprocess.TimeoutExpired("rm", 1)
+    monkeypatch.setattr(p, "remove_path", cut_short)
     summary = p.prune_releases(settings, tmp_path / "http", p.time.monotonic() + 60)
-    assert summary["failed"][0]["reason"] == "OSError" and p.unfinished(state) == []
+    assert summary["failed"][0]["reason"] == "TimeoutExpired" and p.unfinished(state) == []
     assert (state / p.RELEASE_TRASH / ("1" * 40)).is_dir()
-    monkeypatch.setattr(p.shutil, "rmtree", remove)
+    monkeypatch.setattr(p, "remove_path", remove)
     p.prune_releases(settings, tmp_path / "http", p.time.monotonic() + 60)
     assert list((state / p.RELEASE_TRASH).iterdir()) == []
+
+
+# spec: ANYM-689
+def test_the_release_pass_stops_at_its_deadline_and_leaves_the_trash_for_the_next_pass(tmp_path, monkeypatch):
+    settings, state, history = prune_host(tmp_path)
+    (tmp_path / "http").mkdir()
+    (state / p.RELEASE_TRASH / ("1" * 40)).mkdir(parents=True)
+    PruneHost(monkeypatch, [], history)
+    summary = p.prune_releases(settings, tmp_path / "http", p.time.monotonic() - 1)
+    assert summary["interrupted"] == "time budget" and summary["removed"] == []
+    assert (state / p.RELEASE_TRASH / ("1" * 40)).is_dir() and (state / ("1" * 40)).is_dir()
+
+
+# spec: ANYM-689
+def test_a_failed_apply_not_rolled_back_keeps_its_directory_for_the_rollback(tmp_path, monkeypatch):
+    settings, state, history = prune_host(tmp_path)
+    (tmp_path / "http").mkdir()
+    p.write(state / ("1" * 40) / "result.json", {"sha": "1" * 40, "status": "unhealthy"})
+    PruneHost(monkeypatch, [], history)
+    assert "1" * 12 not in p.prune_releases(settings, tmp_path / "http", p.time.monotonic() + 60)["removed"]
+    assert (state / ("1" * 40) / "synthetic.before.json").exists()
+    p.write(state / ("1" * 40) / "rollback.json", {"status": "rolled-back"})
+    assert "1" * 12 in p.prune_releases(settings, tmp_path / "http", p.time.monotonic() + 60)["removed"]
+
+
+# spec: ANYM-689
+def test_an_old_commit_prepared_since_the_current_release_stays_because_it_can_still_apply(tmp_path, monkeypatch):
+    settings, state, history = prune_host(tmp_path)
+    (tmp_path / "http").mkdir()
+    prepared = state / ("1" * 40) / "prepared.json"
+    (state / ("1" * 40) / "result.json").unlink()
+    bound = p.read(prepared)
+    p.write(prepared, {**bound, "current_digest": p.digest(p.read(state / "current.json"))})
+    PruneHost(monkeypatch, [], history)
+    assert "1" * 12 not in p.prune_releases(settings, tmp_path / "http", p.time.monotonic() + 60)["removed"]
+    p.write(prepared, {**bound, "current_digest": "another release"})
+    assert "1" * 12 in p.prune_releases(settings, tmp_path / "http", p.time.monotonic() + 60)["removed"]
+    # A receipt from before `current_digest`: its age against current.json decides.
+    release = tmp_path / "state" / ("4" * 40)
+    (release / "result.json").unlink()
+    newer = (state / "current.json").stat().st_mtime + 5
+    p.os.utime(release / "prepared.json", (newer, newer))
+    assert p.release_in_use(release, set(), p.read(state / "current.json"))
+    p.os.utime(release / "prepared.json", (newer - 10, newer - 10))
+    assert not p.release_in_use(release, set(), p.read(state / "current.json"))
+
+
+# spec: ANYM-689
+def test_an_http_preparation_stays_while_the_generation_it_names_serves(tmp_path):
+    release = tmp_path / "release"
+    release.mkdir()
+    p.write(release / "http-prepared.json", {"previous": {"generation": "a" * 12}})
+    assert p.release_in_use(release, set(), None, {"generation": "a" * 12})
+    assert not p.release_in_use(release, set(), None, {"generation": "b" * 12})
 
 
 # spec: ANYM-689
@@ -4581,8 +4635,12 @@ def test_the_containerd_store_keeps_the_image_floor_on_its_disk_and_the_host_flo
     monkeypatch.setattr(p.shutil, "disk_usage", lambda path: SimpleNamespace(free=free.get(Path(path), p.MIN_FREE_BYTES)))
     docker_root = tmp_path / "docker"
     p.CONTAINERD_ROOT.mkdir(parents=True)
+    state = tmp_path / "state"
+    free[state] = p.MIN_FREE_BYTES - 1
+    with pytest.raises(p.Refused, match="15 GiB"):
+        p.check_image_space(docker_root, False, state)  # an unknown store keeps the full floor on the state disk
     free[docker_root] = p.MIN_FREE_BYTES - 1
-    p.check_image_space(docker_root, True)  # image bytes do not land on this disk
+    p.check_image_space(docker_root, True, state)  # image bytes do not land on this disk
     with pytest.raises(p.Refused, match="15 GiB"):
         p.check_image_space(docker_root)  # an unknown store keeps the full floor on both
     free[docker_root] = p.HOST_FREE_BYTES - 1

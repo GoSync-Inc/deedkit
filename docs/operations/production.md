@@ -233,7 +233,7 @@ verifies, fetches or pulls anything; the refusal names `production.py images --r
 io.containerd.snapshotter.v1`) that is `/var/lib/containerd`, and the state directory and
 Docker's root need **5 GiB**: no image byte lands there, a preparation writes about
 100 MiB and the floor leaves room for a migration on a database volume. When the store
-cannot be read, Docker's root and `/var/lib/containerd` both keep the 15 GiB. Below 25 GiB on
+cannot be read, the state directory, Docker's root and `/var/lib/containerd` all keep the 15 GiB. Below 25 GiB on
 `/var/lib/containerd` or 15 GiB on `/var/lib/docker` the deploy's `cleanup` line
 (`deploy.json`, journal) and `status` carry `disk_warnings`. A refusal does not authorize pruning shared Docker objects or deleting
 runtime data. Free capacity through a reviewed, targeted operation
@@ -2211,13 +2211,15 @@ old `<state>/<sha>` directories of the plan A and HTTP states: a whole directory
 checkout. Selected are those
 on main before the current release (`git rev-list --first-parent`), beyond the newest 5 of that
 state. Never selected: the current or serving release and its HTTP `previous`, a release a
-container mounts, an unfinished apply, rollback or HTTP attempt, an unsettled migration, the
+container mounts, an unfinished apply, rollback or HTTP attempt, a failed apply not rolled back,
+a preparation made since the current release was applied, an unsettled migration, the
 receipt recording the retirement of a generation whose containers still exist, an unreadable
 receipt, anything newer than the current release or not on main. A state whose release is not
-`applied` or `serving` is left alone. A never-applied preparation older than the current
-release goes too (its bound snapshot can no longer apply), so the image pass can remove its
-images. Each directory is renamed into `<state>/.pruned/` first, because a partly removed one
-would read as an unfinished apply; the next pass finishes an interrupted removal. Best effort:
+`applied` or `serving` is left alone. A never-applied preparation made before the current
+release was applied goes too (the containers it is bound to are gone, so `apply` refuses it), and
+the image pass can then remove its images. Each directory is renamed into `<state>/.pruned/` first, because a partly removed one
+would read as an unfinished apply; the next pass finishes an interrupted removal. Best effort,
+at most 120 seconds of the 300 of the preflight, deletion included:
 `deploy.json` `preflight.releases` lists it. Undo: none needed; `prepare` of that SHA recreates a
 directory. Note a removed release no longer refuses a new `prepare` of its old SHA.
 
