@@ -529,18 +529,31 @@ def test_a_mapping_entry_that_fails_a_condition_is_refused_by_name_and_writes_no
 
 
 # spec: ANYM-764
-def test_a_bad_entry_holds_only_its_own_card_and_an_active_card_still_accepts(tmp_path, capsys):
+def test_a_bad_entry_holds_only_its_own_card(tmp_path, capsys):
     root, shas = repo(tmp_path, ['one'])
     write_mapping(root, {'ANYM-10': dict(entry(shas['one']), pr=0), 'ANYM-12': entry(shas['one'])})
     gh, _ = pull_requests({'ANYM-11': [(1, 'Delivers: ANYM-11', shas['one'])]})
-    prod = Prod({A: disp('accepted', 'ANYM-10'), B: disp('accepted', 'ANYM-11'), C: disp('received', 'ANYM-12'),
+    prod = Prod({A: disp('accepted', 'ANYM-10'), B: disp('accepted', 'ANYM-11'), C: disp('received', 'ANYM-13'),
                  D: disp('accepted', 'ANYM-12')})
-    main = main_of(spec(10, 'Done'), spec(11, 'Done'), spec(12, 'Active'))
+    main = main_of(spec(10, 'Done'), spec(11, 'Done'), spec(12, 'Active'), spec(13, 'Active'))
     assert follow(tmp_path, prod, root, gh, lambda commit: None, main) == 0
     assert prod.rows[B]['status'] == 'fixed' and prod.rows[C]['status'] == 'accepted'
     out = capsys.readouterr().out
     assert f'{A} accepted -> no change (mapping refused: pr is not a number)' in out
     assert f'{D} accepted -> no change (mapping refused: the card is not Done)' in out
+
+
+# spec: ANYM-764
+@pytest.mark.parametrize('status', ['Review', 'Active', 'Backlog'])
+def test_a_refused_entry_writes_nothing_for_a_received_item_of_a_card_not_done(tmp_path, capsys, status):
+    root, shas = repo(tmp_path, ['one'])
+    write_mapping(root, {'ANYM-10': entry(shas['one'])})
+    gh, _ = github([(7, 'Spec: ANYM-10', shas['one'])])
+    kept = disp('received', 'ANYM-10', note='kept')
+    prod = Prod({A: dict(kept)})
+    assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, main_of(spec(10, status))) == 0
+    assert prod.writes == [] and shown(prod, A) == kept
+    assert f'{A} received -> no change (mapping refused: the card is not Done)' in capsys.readouterr().out
 
 
 # spec: ANYM-764

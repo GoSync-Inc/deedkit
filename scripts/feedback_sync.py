@@ -368,12 +368,12 @@ def follow_target(now, status, commit, live, check=None, via=None, refused=None)
         return None, 'opt-in hold'
     if status is None:
         return None, 'card not on main'
-    if now['status'] == 'received' and status != 'Done':
-        return dict(now, status='accepted', note=f'Accepted as {ref}; it follows that card.'), 'card accepted'
     if now['status'] == 'verify_requested' and status in ('Done', 'Review'):
         return None, 'already verify_requested'  # the first live SHA stays, also when Review later becomes Done
-    if refused:
+    if refused:  # before every transition that writes: a refused entry writes nothing for its card
         return None, f'mapping refused: {refused}'
+    if now['status'] == 'received' and status != 'Done':
+        return dict(now, status='accepted', note=f'Accepted as {ref}; it follows that card.'), 'card accepted'
     if status not in ('Done', 'Review') or (status == 'Review' and commit is None):
         return None, 'card not delivered'
     if commit is None:

@@ -118,7 +118,7 @@ python3 scripts/feedback_sync.py follow [--apply]   # by hand; `auto` runs it ev
   commit and a body whose `Spec:` line names the card. The plan line shows `delivered by mapping
   (#<pr>)`. An entry that fails any condition, two entries for one card, or an entry whose card has
   a `Delivers:` pull request is refused with a named reason (`mapping refused: <why>`) and writes
-  nothing for that card; a file that is not JSON or not an object of `ANYM-n` entries stops the run
+  nothing for that card, also no `received` to `accepted`; a file that is not JSON or not an object of `ANYM-n` entries stops the run
   (exit 1, no write). No mapping is ever derived from a `Spec:` line by the tool. To add an entry:
   read the card and its candidate pull requests (a later maintenance pull request also names a card
   with `Spec:`), then open a reviewed pull request with the entry; the `evidence` line says what was
