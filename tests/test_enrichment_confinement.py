@@ -382,7 +382,7 @@ def waits(stop_state, monkeypatch):
 @pytest.mark.parametrize('error', [
     psycopg.errors.QueryCanceled('synthetic'), psycopg.errors.LockNotAvailable('synthetic'),
     psycopg.errors.DeadlockDetected('synthetic'), psycopg.errors.AdminShutdown('synthetic'),
-    psycopg.OperationalError('synthetic connection failure'),
+    psycopg.OperationalError('connection failed: connection timeout expired'),
 ], ids=lambda error: type(error).__name__)
 def test_a_transient_database_error_in_a_pass_does_not_end_the_worker(waits, error):
     worker = Flaky([error])
@@ -419,7 +419,7 @@ def test_the_database_retry_delay_doubles_to_its_limit_and_a_clean_pass_resets_i
 def test_the_database_retry_reports_only_the_exception_type(waits, capsys, monkeypatch):
     captured = []
     monkeypatch.setattr(telemetry, 'capture', lambda error, code: captured.append((type(error), code)))
-    Flaky([psycopg.OperationalError('connection failed: synthetic-dsn-host secret-text')]).run()
+    Flaky([psycopg.OperationalError('synthetic-dsn-host secret-text: Connection refused')]).run()
     err = capsys.readouterr().err
     assert 'synthetic-dsn-host' not in err and 'secret-text' not in err
     assert json.loads(err) == {'status': 'error', 'error_code': 'enrichment_database_retry',
@@ -485,7 +485,8 @@ def test_a_database_error_that_is_not_transient_still_ends_the_worker(waits):
     psycopg.errors.InvalidPassword('synthetic'), psycopg.errors.ConfigFileError('synthetic'),
     psycopg.OperationalError('connection is bad: FATAL:  password authentication failed for user "synthetic"'),
     psycopg.OperationalError('connection is bad: FATAL:  no pg_hba.conf entry for host "192.0.2.1"'),
-], ids=['InvalidPassword', 'ConfigFileError', 'password_text', 'hba_text'])
+    psycopg.OperationalError('connection failed: invalid sslmode value: "synthetic"'),
+], ids=['InvalidPassword', 'ConfigFileError', 'password_text', 'hba_text', 'sslmode_text'])
 def test_a_permanent_database_failure_still_ends_the_worker(waits, error):
     worker = Flaky([error])
     with pytest.raises(psycopg.OperationalError):
@@ -509,11 +510,11 @@ def test_an_operational_error_outside_the_transient_list_is_fatal_whatever_its_s
 
 
 # spec: ANYM-688
-@given(st.text().filter(lambda text: not any(marker in text for marker in enrichment.DB_LOGIN_REFUSED)),
-       st.sampled_from(enrichment.DB_LOGIN_REFUSED), st.text())
-def test_a_connection_failure_is_transient_exactly_when_its_text_names_no_refused_login(before, marker, after):
-    assert enrichment.transient_database_error(psycopg.OperationalError(before))
-    assert not enrichment.transient_database_error(psycopg.OperationalError(before + marker + after))
+@given(st.text().filter(lambda text: not any(marker in text for marker in enrichment.DB_CONNECTION_LOST)),
+       st.sampled_from(enrichment.DB_CONNECTION_LOST), st.text())
+def test_an_error_without_a_sqlstate_is_transient_exactly_when_its_text_names_a_lost_connection(before, marker, after):
+    assert not enrichment.transient_database_error(psycopg.OperationalError(before))
+    assert enrichment.transient_database_error(psycopg.OperationalError(before + marker + after))
 
 
 def mini_config(tmp_path, blocked=None):
