@@ -227,11 +227,15 @@ Check it, without a call or a provider action:
 
 A 403 in step 2 or 3 means the configured address is not the host-side peer.
 
-The state directory, Docker's root and, when it exists, `/var/lib/containerd`
-(the containerd image store keeps image content there, often on another disk than
-Docker's root) each need at least **15 GiB free** before preparation verifies,
-fetches or pulls anything; the refusal names `production.py images --remove`
-(below). A refusal does not authorize pruning shared Docker objects or deleting
+The disk that receives image bytes needs at least **15 GiB free** before preparation
+verifies, fetches or pulls anything; the refusal names `production.py images --remove`
+(below). With the containerd image store (`docker info` reports `driver-type
+io.containerd.snapshotter.v1`) that is `/var/lib/containerd`, and the state directory and
+Docker's root need **5 GiB**: no image byte lands there, a preparation writes about
+100 MiB and the floor leaves room for a migration on a database volume. When the store
+cannot be read, Docker's root and `/var/lib/containerd` both keep the 15 GiB. Below 25 GiB on
+`/var/lib/containerd` or 15 GiB on `/var/lib/docker` the deploy's `cleanup` line
+(`deploy.json`, journal) and `status` carry `disk_warnings`. A refusal does not authorize pruning shared Docker objects or deleting
 runtime data. Free capacity through a reviewed, targeted operation
 or add storage before retrying.
 
@@ -2201,6 +2205,21 @@ before any container starts (prepared validation, schema check) stops nothing.
 `candidate_stopped`; absent on attempts before ANYM-757). A `startup-failed` attempt does
 not block the next release, which prepares a new generation; removing the stopped
 containers stays manual (`clean` counts them as unresolved).
+
+Release directories. The same preflight, between the container and the image pass, removes
+old `<state>/<sha>` directories of the plan A and HTTP states: a whole directory, receipts and
+checkout. Selected are those
+on main before the current release (`git rev-list --first-parent`), beyond the newest 5 of that
+state. Never selected: the current or serving release and its HTTP `previous`, a release a
+container mounts, an unfinished apply, rollback or HTTP attempt, an unsettled migration, the
+receipt recording the retirement of a generation whose containers still exist, an unreadable
+receipt, anything newer than the current release or not on main. A state whose release is not
+`applied` or `serving` is left alone. A never-applied preparation older than the current
+release goes too (its bound snapshot can no longer apply), so the image pass can remove its
+images. Each directory is renamed into `<state>/.pruned/` first, because a partly removed one
+would read as an unfinished apply; the next pass finishes an interrupted removal. Best effort:
+`deploy.json` `preflight.releases` lists it. Undo: none needed; `prepare` of that SHA recreates a
+directory. Note a removed release no longer refuses a new `prepare` of its old SHA.
 
 Only images carrying a `deedkit-production-<target>:*` tag of the eight
 CI-published targets are considered. Kept, with reasons:

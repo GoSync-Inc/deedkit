@@ -734,6 +734,23 @@ def test_prepare_preserves_legacy_and_allows_next_managed_generation(tmp_path, m
     assert all('stop' not in command and 'up' not in command for command in commands)
 
 
+# spec: ANYM-689
+def test_a_new_receipt_keeps_its_predecessor_and_only_the_identity_of_the_one_before():
+    receipt = None
+    sizes = []
+    for number in range(200):
+        receipt = {'generation': f'{number:012x}', 'sha': f'{number:040x}', 'status': 'serving', 'images': {'runtime': IMAGE},
+                   'containers': {'api': {'container': 'c'}}, 'previous': s.predecessor(receipt)}
+        sizes.append(len(json.dumps(receipt, indent=2)))
+    assert sizes[-1] == sizes[-2]  # no growth, whatever the history
+    assert receipt['previous']['containers'] == {'api': {'container': 'c'}}
+    assert receipt['previous']['previous'] == {'generation': f'{197:012x}', 'sha': f'{197:040x}', 'status': 'serving'}
+    assert 'previous' not in receipt['previous']['previous']
+    assert s.predecessor(None) is None
+    first = {'generation': 'a', 'previous': None}
+    assert s.predecessor(first) == first
+
+
 def test_missing_readiness_control_never_counts_as_zero(tmp_path, monkeypatch):
     cfg = settings(tmp_path)
     cfg['http_release']['ready_timeout'] = 0
