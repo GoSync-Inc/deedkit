@@ -631,3 +631,48 @@ verified replacement of the protected point (ANYM-730): the deletion command rai
 owner-requested deletion".
 
 Installation, activation, the first protected snapshot and the restore drill are one reviewed operation plan: [docs/operations/recordings-archive-activation.md](docs/operations/recordings-archive-activation.md) (ANYM-731).
+
+## Calls state (ANYM-778)
+
+The calls state (`voice.sqlite3`) is backed up as its own profile. This section is the producer; the backup server's
+proof is ANYM-781 and the schedule, freshness and installation are ANYM-782. Nothing runs it until then, and
+`docs/operations/production.md` keeps its pre-release SQLite backup clause until ANYM-782's first scheduled run reads fresh.
+
+What the bundle holds: the whole database: briefs, calls and results, events, learning tables, decision journals and the
+single-use media-handshake tokens (`outbound_attempts`), encrypted to the recipient file. It goes only to the receiver the
+`transfer` section names, which delivers to the object storage the R2 receiver requires. It does not cover the container
+image, logs, or keys the database never held (services/calls/README.md "Storage and MVP limits").
+
+Config (`profile: "calls"`, deploy/backup-runner-calls.example.json): `directory`, `project`, `image` (the pinned backup
+image, for the worker), `recipient_file`, `transfer`, `timeout_seconds`, `keep_local` (1 only), `host_lock`, optional
+`delivery_mode` (`staged_v1`) and `busy_wait_seconds`, and a `calls` object: `staging_directory`, `state_directory`,
+`capture_timeout_seconds`, `data_mount` (the host path of the calls state directory), `calls_container` and `timers`. An
+unknown or missing key is `invalid_backup_config`. Staging is never inside the runner root, its lock, a credential or a
+timer file, and `data_mount` never overlaps staging, the state directory or the runner root.
+
+Capture: a helper container, never a process in the calls container, from the image that container runs at this start
+(`docker inspect`, so no pinned image can be removed by image retention): `--network none --read-only --cap-drop ALL`,
+64 MiB memory without swap, 16 processes, half a CPU, user 10001, the state directory read-only and this job's staging
+directory (owner 10001, 0700) writable. It opens the database `mode=ro`, copies it with the online backup API in steps of
+64 pages with a 20 ms pause, runs `PRAGMA integrity_check` on the copy, then `VACUUM INTO` a second file, so pages of
+deleted rows are not in the bundle, and removes the first copy. Writer bound: a commit returns within 250 ms during the
+copy (measured by tests/test_backup_calls.py). Rollback-journal SQLite restarts a copy when a writer commits, and a restart
+waits 1 s, so writes during a call delay the copy until they pause; the copy gives up with `calls_snapshot_busy` after 120
+busy answers in a row, or `calls_helper_timeout` at `capture_timeout_seconds`. On a timeout the runner removes the helper
+and reads back that it is gone before it cleans staging; unverified is `calls_helper_unverified`, staging stays, and the
+recovery looks again. An absent calls container is `no_calls_container` and starts nothing.
+
+Bundle: `bundle.tar.age` with exactly two members, `manifest.json` first and `state/voice.sqlite3`. The manifest holds
+`profile: calls`, `schema_version` 1 (the bundle format), `user_version` (SQLite's, separately), `captured_at` (when the
+copy began; the content is never older), `created_at`, `tables` (per table `rows` and the sha256 of its sorted row
+digests), `voice_events_max_seq`, `bytes` and `sha256`. Any other member is refused when encrypting and decrypting. The
+worker runs in the pinned backup image with no network and sees only staging read-only.
+
+Exclusion: the same as recordings: the profile's own `.runner.lock`, then messaging's `host_lock` with no wait
+(`calls_skipped_lock_busy`), the other profiles' timer files read at every start (`calls_skipped_window`,
+`calls_skipped_schedule_unknown`, `calls_skipped_yielded`), `calls_skipped_disk`, and a deadline per phase. Its unsettled
+marker is `<state_directory>/.unsettled`. A failure at any phase ends with a fixed code, removes staging and leaves the
+previous protected point, the other profiles' journals and the calls container untouched; the next run takes a new snapshot.
+
+Plaintext exists only in the helper's memory and the staging directory, which is emptied after encryption and on every
+failure. Logs and the status file hold codes and counts only.

@@ -1,0 +1,32 @@
+{
+  "profile": "calls",
+  "directory": "/opt/deedkit/calls-backup/backups",
+  "project": "deedkit-calls",
+  "image": "sha256:REPLACE_WITH_THE_BACKUP_IMAGE_ID_MESSAGING_PINS",
+  "delivery_mode": "staged_v1",
+  "recipient_file": "/opt/deedkit/calls-backup/recipient",
+  "transfer": {
+    "host": "backup.example.invalid",
+    "user": "deedkit-calls-backup",
+    "identity_file": "/opt/deedkit/calls-backup/delivery_ed25519",
+    "known_hosts_file": "/opt/deedkit/calls-backup/known_hosts"
+  },
+  "timeout_seconds": 900,
+  "busy_wait_seconds": 1800,
+  "keep_local": 1,
+  "host_lock": "/opt/personal-os-probe/backups/.runner.lock",
+  "calls": {
+    "staging_directory": "/opt/deedkit/calls-backup/staging",
+    "state_directory": "/opt/deedkit/calls-backup/state",
+    "capture_timeout_seconds": 1200,
+    "data_mount": "/opt/deedkit/calls/data",
+    "calls_container": "deedkit-calls-calls-1",
+    "timers": [
+      "/etc/systemd/system/personal-os-backup.timer",
+      "/etc/systemd/system/deedkit-calendar-backup.timer",
+      "/etc/systemd/system/deedkit-calendar-backup-catchup.timer",
+      "/etc/systemd/system/deedkit-recordings-backup.timer",
+      "/etc/systemd/system/deedkit-recordings-backup-catchup.timer"
+    ]
+  }
+}
