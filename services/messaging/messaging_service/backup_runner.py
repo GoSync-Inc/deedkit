@@ -732,15 +732,15 @@ class Runner:
         self.monotonic=time.monotonic;self.docker=docker or Docker();self.clock=clock;self.sleep=sleep;self.send=send;self.stream_send=stream_send;self.journal=None
         self.calendar=cfg.get('profile')=='calendar';self.recordings=cfg.get('profile')=='recordings'
         # Both own no application container, open no fence and take the host lock; each names only its own worker.
-        self.calls=cfg.get('profile')=='calls';self.staged=self.recordings or self.calls
-        self.hostless=self.calendar or self.staged
+        self.calls=cfg.get('profile')=='calls';self.staged_profile=self.recordings or self.calls
+        self.hostless=self.calendar or self.staged_profile
         self.worker_prefix=RECORDINGS_WORKER if self.recordings else CALLS_WORKER if self.calls else CALENDAR_WORKER
         # The calendar and recordings deliver to the R2 receiver, which takes only the v2 wire (ANYM-607).
         if send is None:self.send=upload_file_v2 if self.hostless else upload
         # Exists from before the worker is created until it is verified stopped: a deploy refuses while the calendar's
         # exists (production.py), also after this process died or failed its recovery and released the locks.
         self.unsettled_path=Path(cfg['host_lock']+'.unsettled') if self.calendar else None
-        if self.staged:
+        if self.staged_profile:
             self.own=cfg[cfg['profile']]
             state=Path(self.own['state_directory']);state.mkdir(mode=0o700,exist_ok=True)
             if state.is_symlink() or state.stat().st_mode&0o077:raise ValueError('private_backup_directory_required')
@@ -809,9 +809,9 @@ class Runner:
         if self.journal_path.exists():
             self.load()
             # A snapshot producer of an earlier attempt must be gone before anything is staged, cleaned or run again.
-            if self.staged:self.reap_snapshot()
+            if self.staged_profile:self.reap_snapshot()
             # A job past its capture needs no plaintext: whatever a crash left in staging goes before delivery resumes.
-            if self.staged and self.journal['phase']=='upload':self.clean_staging()
+            if self.staged_profile and self.journal['phase']=='upload':self.clean_staging()
             return
         backup_id=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+secrets.token_hex(8)
         work=self.root/backup_id;work.mkdir(mode=0o700)
@@ -819,7 +819,7 @@ class Runner:
         self.journal={'id':backup_id,'phase':'stopping','stopped':stopped,'created':self.clock(),
                       'container':(self.worker_prefix if self.hostless else 'pos-backup-')+backup_id.lower()}
         self.save();self.status('capturing')
-        if self.staged:
+        if self.staged_profile:
             # Plaintext left by a crashed earlier job goes first; this job's directory is then staged into.
             self.clean_staging();(self.staging_root/backup_id).mkdir(mode=0o700)
     def admit(self,phase='full'):
@@ -1075,7 +1075,7 @@ class Runner:
             self.cfg['image'])
     def refusal(self,work):
         """The worker's fixed refusal code, if it wrote one (staged profiles only); never anything else from the file."""
-        if not self.staged:return None
+        if not self.staged_profile:return None
         try:data=read_json(work/'refused.json')
         except (OSError,ValueError):return None
         code=data.get('code') if isinstance(data,dict) else None
@@ -1120,7 +1120,7 @@ class Runner:
                 info=self.docker.inspect(saved['id'])
                 if info is None:raise RuntimeError('collector_missing_during_stop')
                 if info['State']['Running']:self.docker.call('stop','--time','25',saved['id'])
-            if self.staged:self.stage_snapshot(self.staging_root/self.journal['id']);self.journal['capture_started']=self.clock()
+            if self.staged_profile:self.stage_snapshot(self.staging_root/self.journal['id']);self.journal['capture_started']=self.clock()
             self.journal['phase']='capturing';self.save()
         info=self.check_worker(self.docker.inspect(self.journal['container']))
         if info is None:
@@ -1139,13 +1139,13 @@ class Runner:
             if not info['State']['Running']:
                 if info['State']['ExitCode']!=0:raise RuntimeError(self.refusal(work) or 'backup_capture_failed')
                 self.resume_collectors();break
-            if self.staged:self.guard()  # another profile is about to start: give way before anything is sealed
+            if self.staged_profile:self.guard()  # another profile is about to start: give way before anything is sealed
             # The worker's own budget starts when it can start, after the staging work (which has deadlines of its own).
-            began=self.journal.get('capture_started',self.journal['created']) if self.staged else self.journal['created']
-            if self.clock()-began>(self.own['capture_timeout_seconds'] if self.staged
+            began=self.journal.get('capture_started',self.journal['created']) if self.staged_profile else self.journal['created']
+            if self.clock()-began>(self.own['capture_timeout_seconds'] if self.staged_profile
                                    else self.cfg['timeout_seconds']):raise RuntimeError('backup_capture_timeout')
             self.sleep(POLL_SECONDS)
-        if self.staged:self.clean_staging()  # the worker has exited: the bundle holds the only copy now
+        if self.staged_profile:self.clean_staging()  # the worker has exited: the bundle holds the only copy now
         self.journal['phase']='upload';self.save()
     def cleanup_plaintext(self,work):
         # Only this job's closed container work directory is eligible.
@@ -1368,7 +1368,7 @@ class Runner:
         status=read_json(self.status_path)
         status.update(last_success_at=datetime.now(timezone.utc).isoformat(),last_success_id=result['id'],
                       ciphertext_bytes=result['bytes'],ciphertext_sha256=result['sha256'],last_snapshot_at=result['captured_at'])
-        if self.staged and type(result.get('snapshot',{}).get('bytes')) is int:status['archive_bytes']=result['snapshot']['bytes']
+        if self.staged_profile and type(result.get('snapshot',{}).get('bytes')) is int:status['archive_bytes']=result['snapshot']['bytes']
         write_json(self.status_path,status)
         info=self.check_worker(self.docker.inspect(self.journal['container']))
         if info:self.docker.call('rm',self.journal['container'])
@@ -1378,7 +1378,7 @@ class Runner:
                          key=lambda p:p.name,reverse=True)
         for old in completed[self.cfg['keep_local']:]:shutil.rmtree(old)
     def run(self):
-        if self.staged:
+        if self.staged_profile:
             resumed=read_json(self.journal_path).get('phase') if self.journal_path.exists() else None
             self.admit('upload' if resumed=='upload' else 'full')
         self.prepare();work=self.root/self.journal['id']
@@ -1405,7 +1405,7 @@ class Runner:
         except BaseException as exc:
             self.status('skipped' if isinstance(exc,Skip) else 'error',str(exc) if str(exc) in SAFE_ERRORS else 'backup_job_failed')
             # A snapshot producer not verified gone still holds the file: the recovery reaps it first, then cleans.
-            if self.staged and not (self.journal or {}).get('exec_target') and not (self.journal or {}).get('helper'):
+            if self.staged_profile and not (self.journal or {}).get('exec_target') and not (self.journal or {}).get('helper'):
                 try:self.clean_staging()
                 except (OSError,ValueError):pass  # the next start empties it again
             raise
@@ -1416,7 +1416,7 @@ class Runner:
         masked by the cleanup, and a cleanup that failed does not undo a verified stop (status `staging_cleanup_failed`).
         """
         failure=None;reaped=True
-        if self.staged and self.journal_path.exists():
+        if self.staged_profile and self.journal_path.exists():
             # A snapshot producer still writing into staging must be gone before anything is cleaned or settled.
             try:self.load();self.reap_snapshot()
             except BaseException as exc:
@@ -1427,7 +1427,7 @@ class Runner:
         if reaped:
             try:self.settle_job()
             except BaseException as exc:failure=failure or exc
-        if self.staged and reaped:
+        if self.staged_profile and reaped:
             try:self.clean_staging()
             except Exception as exc:
                 try:self.status('error','staging_mount_refused' if str(exc)=='staging_mount_refused' else 'staging_cleanup_failed')
@@ -1518,7 +1518,7 @@ def main():
     try:
         # A recordings run does not wait for the host lock and cleans up even when it is busy; its recovery needs only the
         # runner's own lock (it touches nothing of messaging or calendar).
-        recordings=runner.staged  # the calls profile follows the same rule (ANYM-778)
+        recordings=runner.staged_profile  # the calls profile follows the same rule (ANYM-778)
         with hold_locks(runner.cfg,0 if recordings and not args.recover_stop else HOST_LOCK_WAIT_SECONDS,
                         runner.cleanup_unowned if recordings and not args.recover_stop else None,
                         not (recordings and args.recover_stop)):
@@ -1531,12 +1531,12 @@ def main():
                 except Exception as again:unrecovered=again  # Journal remains for ExecStopPost / next operator run.
                 raise
     except Exception as exc:
-        if runner.staged and str(unrecovered) in CLEANUP_CODES:code=str(unrecovered)
-        elif runner.staged and isinstance(unrecovered,OSError):code='staging_cleanup_failed'
-        elif runner.staged and str(exc) in CLEANUP_CODES:code=str(exc)
+        if runner.staged_profile and str(unrecovered) in CLEANUP_CODES:code=str(unrecovered)
+        elif runner.staged_profile and isinstance(unrecovered,OSError):code='staging_cleanup_failed'
+        elif runner.staged_profile and str(exc) in CLEANUP_CODES:code=str(exc)
         elif runner.calls and str(exc) in SAFE_ERRORS:code=str(exc)
         # A skip whose cleanup failed is a failure: plaintext may remain.
-        if isinstance(exc,Skip) and not (runner.staged and unrecovered is not None):
+        if isinstance(exc,Skip) and not (runner.staged_profile and unrecovered is not None):
             try:runner.status('skipped',exc.code)
             except Exception:pass
             print(json.dumps({'status':'skipped','code':exc.code},separators=(',',':')),flush=True)

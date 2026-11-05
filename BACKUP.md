@@ -640,8 +640,8 @@ proof is ANYM-781 and the schedule, freshness and installation are ANYM-782. Not
 
 What the bundle holds: the whole database: briefs, calls and results, events, learning tables, decision journals and the
 single-use media-handshake tokens (`outbound_attempts`), encrypted to the recipient file. It goes only to the receiver the
-`transfer` section names, which delivers to the object storage the R2 receiver requires. It does not cover the container
-image, logs, or keys the database never held (services/calls/README.md "Storage and MVP limits").
+`transfer` section names, which delivers to the object storage the R2 receiver requires. It does not cover the
+container image, logs, or keys the database never held (services/calls/README.md "Storage and MVP limits").
 
 Config (`profile: "calls"`, deploy/backup-runner-calls.example.json): `directory`, `project`, `image` (the pinned backup
 image, for the worker), `recipient_file`, `transfer`, `timeout_seconds`, `keep_local` (1 only), `host_lock`, optional

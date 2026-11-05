@@ -42,7 +42,8 @@ def make_state(path, *, rows=3, bulk=0, canary=True):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path)
-    db.executescript('PRAGMA journal_mode=DELETE;'
+    # Some SQLite builds default to secure_delete; the live service's freed pages are what the snapshot must drop.
+    db.executescript('PRAGMA journal_mode=DELETE;PRAGMA secure_delete=OFF;'
                      'CREATE TABLE briefs(id TEXT PRIMARY KEY, body TEXT NOT NULL);'
                      'CREATE TABLE calls(id TEXT PRIMARY KEY, brief_id TEXT UNIQUE NOT NULL, body TEXT NOT NULL);'
                      'CREATE TABLE voice_events(seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE, call_id TEXT, body TEXT NOT NULL);'
