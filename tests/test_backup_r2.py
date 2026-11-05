@@ -100,6 +100,25 @@ class Cloud:
         if self.fail.pop('delete_response',False):raise TimeoutError('lost delete reply')
         return {}
 
+class Etagged(Cloud):
+    """R2's facts from the ANYM-641 probe: one ETag per stored object on GET and HEAD, If-Match refused with 412.
+
+    `reads` holds one key per body read of an object (a ranged resume is part of its pass), `heads` each HEAD."""
+    def __init__(self):super().__init__();self.reads=[];self.heads=[]
+    def etag(self,key):return '"'+sha(self.objects[key])[:32]+'"'
+    def head_object(self,**kw):
+        answer=super().head_object(**kw);self.heads.append(kw['Key'])
+        return {**answer,'ETag':self.etag(kw['Key'])}
+    def get_object(self,**kw):
+        self.hit('get_object');key=kw['Key']
+        if key not in self.objects:raise CloudError(404)
+        etag=self.etag(key)
+        if kw.get('IfMatch',etag)!=etag:raise CloudError(412)
+        body=self.objects[key]
+        if 'Range' in kw:body=body[int(kw['Range'].removeprefix('bytes=').split('-')[0]):]
+        elif '/objects/' in key:self.reads.append(key)
+        return {'ContentLength':len(body),'ETag':etag,'Body':io.BytesIO(body)}
+
 def wire(data=None,bid=BID,snapshot=SNAPSHOT,footer=None,tail=b''):
     data=data if data is not None else r2.AGE_HEADER+b'ciphertext fixture'*8
     header={'v':2,'id':bid,'max_bytes':max(64,len(data)),'snapshot_sha256':snapshot}
@@ -409,6 +428,127 @@ def test_corrupt_previous_object_of_the_right_size_no_longer_blocks_rotation(ope
     assert result['status']=='rotated' and result['duplicate'] is interrupted
     assert old not in cloud.objects and len(cloud.objects)==2 and old not in keys
 
+
+def etagged(operator):
+    config,_,marker,proof=operator
+    return config,Etagged(),marker,proof
+
+def bind(proof,report,cloud,**changed):
+    """The sidecar a verifier writes for this proof, naming the object as it is stored now."""
+    key=next(k for k in cloud.objects if '/objects/' in k and report['backup']['id'] in k)
+    value={'v':1,'backup_id':report['backup']['id'],'sha256':report['backup']['sha256'],'etag':cloud.etag(key),
+           'bytes':len(cloud.objects[key]),'verification_id':report['verification']['id'],**changed}
+    path=proof.with_name(proof.name+'.binding.json');write_json(path,value)
+    return key,path
+
+def candidate_key(cloud,bid=BID):return next(k for k in cloud.objects if '/objects/' in k and bid in k)
+
+# spec: ANYM-641
+@pytest.mark.parametrize('damage',[f'{check}-{how}' for check in sorted(r2.CHECKS) for how in ('missing','false')]+['wrong_profile'])
+def test_invalid_proof_with_matching_binding_refuses(operator,damage):
+    config,cloud,marker,proof=etagged(operator)
+    _,expected=enroll((config,cloud,marker,proof))
+    candidate=receive(config,cloud);report=proof_for(candidate);bind(proof,report,cloud)
+    code='independent_restore_proof_required'
+    if damage=='wrong_profile':report['verification']['profile']='calendar';code='verifier_profile_mismatch'
+    else:
+        check,how=damage.rsplit('-',1)
+        if how=='missing':del report['verification']['checks'][check]
+        else:report['verification']['checks'][check]=False
+    write_json(proof,report);cloud.reads.clear();cloud.heads.clear()
+    with pytest.raises(ValueError,match='^'+code+'$'):
+        r2.rotate(config,marker,proof,expected_protected_sha256=expected,client=cloud)
+    assert sha(marker.read_bytes())==expected and 'delete_object' not in cloud.calls
+    assert candidate_key(cloud) not in cloud.heads and not cloud.reads
+
+# spec: ANYM-641
+@pytest.mark.parametrize('change',['etag','size'])
+@pytest.mark.parametrize('step',['protect','rotate'])
+def test_changed_etag_or_size_refuses_and_keeps_old_point(operator,step,change):
+    config,cloud,marker,proof=etagged(operator)
+    expected=None
+    if step=='rotate':_,expected=enroll((config,cloud,marker,proof))
+    candidate=receive(config,cloud);report=proof_for(candidate);write_json(proof,report)
+    key,_=bind(proof,report,cloud);stored=cloud.objects[key]
+    cloud.objects[key]=stored[:-1]+bytes([stored[-1]^1]) if change=='etag' else stored+b'x'
+    objects=dict(cloud.objects);before=marker.read_bytes() if step=='rotate' else None;cloud.reads.clear()
+    with pytest.raises(ValueError,match='^stored_backup_corrupt$'):
+        if step=='protect':r2.protect(config,marker,proof,client=cloud)
+        else:r2.rotate(config,marker,proof,expected_protected_sha256=expected,client=cloud)
+    assert 'delete_object' not in cloud.calls and cloud.objects==objects and not cloud.reads
+    if step=='protect':assert not marker.exists() and not marker.with_name(marker.name+'.enrollment.json').exists()
+    else:assert marker.read_bytes()==before and not marker.with_name(marker.name+'.rotation.json').exists()
+
+# spec: ANYM-641
+@pytest.mark.parametrize('form',['missing','not_json','duplicate_key','not_object','extra_key','no_etag','other_backup','other_sha',
+                                 'other_verification','other_version','etag_number','etag_empty','bytes_bool','bytes_negative',
+                                 'too_large','public','symlink','hardlink'])
+def test_missing_or_malformed_binding_takes_full_get(operator,form):
+    config,cloud,marker,proof=etagged(operator)
+    _,expected=enroll((config,cloud,marker,proof))
+    candidate=receive(config,cloud);report=proof_for(candidate);write_json(proof,report)
+    changed={'other_backup':{'backup_id':OLD},'other_sha':{'sha256':'f'*64},'other_verification':{'verification_id':'2'*32},
+             'other_version':{'v':2},'etag_number':{'etag':7},'etag_empty':{'etag':''},'bytes_bool':{'bytes':True},
+             'bytes_negative':{'bytes':-1},'extra_key':{'extra':1}}.get(form,{})
+    key,path=bind(proof,report,cloud,**changed)
+    if form=='missing':path.unlink()
+    elif form=='not_json':path.write_text('{"v":1')
+    elif form=='duplicate_key':path.write_text('{"v":1,"v":1}')
+    elif form=='not_object':path.write_text('[]')
+    elif form=='no_etag':value=json.loads(path.read_text());del value['etag'];write_json(path,value)
+    elif form=='too_large':path.write_text(' '*5000+path.read_text())
+    elif form=='public':path.chmod(0o644)
+    elif form=='symlink':target=path.with_name('real-binding.json');path.rename(target);path.symlink_to(target)
+    elif form=='hardlink':os.link(path,path.with_name('extra-binding.json'))
+    cloud.reads.clear();cloud.heads.clear()
+    assert r2.rotate(config,marker,proof,expected_protected_sha256=expected,client=cloud)['status']=='rotated'
+    assert cloud.reads==[key] and key not in cloud.heads
+
+# spec: ANYM-641
+def test_matching_binding_takes_one_head_and_no_body_read(operator):
+    config,cloud,marker,proof=etagged(operator)
+    _,expected=enroll((config,cloud,marker,proof))
+    candidate=receive(config,cloud);report=proof_for(candidate);write_json(proof,report)
+    key,_=bind(proof,report,cloud);cloud.reads.clear();cloud.heads.clear()
+    assert r2.rotate(config,marker,proof,expected_protected_sha256=expected,client=cloud)['status']=='rotated'
+    assert not cloud.reads and cloud.heads.count(key)==1
+
+# spec: ANYM-641
+def test_interrupted_rotation_retry_after_replacement_refuses(operator):
+    config,cloud,marker,proof=etagged(operator)
+    _,expected=enroll((config,cloud,marker,proof))
+    candidate=receive(config,cloud);report=proof_for(candidate);write_json(proof,report)
+    key,_=bind(proof,report,cloud)
+    cloud.fail['delete_response']=True
+    with pytest.raises(RuntimeError,match='storage_unavailable'):
+        r2.rotate(config,marker,proof,expected_protected_sha256=expected,client=cloud)
+    switched=marker.read_bytes();assert json.loads(switched)['backups'][0]['id']==BID
+    deleted=cloud.calls.count('delete_object');stored=cloud.objects[key]
+    cloud.objects[key]=stored[:-1]+bytes([stored[-1]^1]);objects=dict(cloud.objects)
+    with pytest.raises(ValueError,match='^stored_backup_corrupt$'):
+        r2.rotate(config,marker,proof,expected_protected_sha256=expected,client=cloud)
+    assert cloud.calls.count('delete_object')==deleted and cloud.objects==objects and marker.read_bytes()==switched
+    # The object back as proved: the same retry finishes its exact deletion on the binding.
+    cloud.objects[key]=stored;cloud.reads.clear()
+    assert r2.rotate(config,marker,proof,expected_protected_sha256=expected,client=cloud)['duplicate']
+    assert not cloud.reads and all(OLD not in k for k in cloud.objects)
+
+# spec: ANYM-641
+@pytest.mark.parametrize('bound',[True,False],ids=['with-binding','without-binding'])
+@pytest.mark.parametrize('name',['calendar','recordings'])
+def test_calendar_profile_proof_keeps_working(operator,name,bound):
+    config,cloud,marker,proof=etagged(operator)
+    config={**config,'profile':name};candidate=receive(config,cloud);report=proof_for(candidate)
+    verification=report['verification'];verification['profile']=name
+    if name=='calendar':verification.update(checks={k:True for k in r2.CALENDAR_CHECKS},vault_warnings=[])
+    else:verification.update(checks={k:True for k in r2.RECORDINGS_CHECKS},captured_at=verification['verified_at'],
+                             archive={'archive_id':'synthetic-archive','incarnation':1,'sequence':3,'records':2})
+    write_json(proof,report)
+    if bound:key,_=bind(proof,report,cloud)
+    else:key=candidate_key(cloud)
+    cloud.reads.clear();cloud.heads.clear()
+    assert r2.protect(config,marker,proof,client=cloud)['status']=='protected'
+    assert (cloud.reads,cloud.heads)==(([],[key]) if bound else ([key],[]))
 
 def test_rotation_reuses_upload_lock_and_refuses_stale_marker(operator):
     config,cloud,marker,proof=operator
