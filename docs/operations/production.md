@@ -1091,8 +1091,8 @@ service and timer are never touched.
 The router (`deploy/compose.event-router.yaml`, SUBSCRIPTIONS.md "Module event router") is not
 enrolled by any release: nothing runs until these steps. It needs schema 58 and a producer
 endpoint (calls ANYM-563, calendar ANYM-565) deployed. Access steps: the two module read
-tokens (secrets and access) and the link grants (ANYM-564). The agent runs each step under AGENTS.md section 2; the
-gateway profile switch (step 5) changes an allowlist and keeps the owner's exact confirmation (AGENTS.md section 1):
+tokens (secrets and access) and the link grants (ANYM-564). The agent runs each step under AGENTS.md section 2, the
+gateway profile switch (step 5) under the `profile tools` rule ("Write subcommands"):
 1. Module read tokens: one per module, issued by the module for the router's audience, stored
    as `private/event-router-tokens/calls` and `.../calendar` (directory 0700, files 0600, uid
    10001). The repository and the config name only the paths, never a value.
@@ -2569,9 +2569,11 @@ no service reads that file, so the enforced policy never changes.
 
 ### Write subcommands (ANYM-493 shared rules)
 
-An agent runs `key issue`, `key extend`, `key revoke` and their `undo` under AGENTS.md section 2 and the harness
-process.md section 2 access gate. `profile tools` and its `undo` change the tools a profile may call, an allowlist: they
-run only on the owner's exact words (AGENTS.md section 1). Every write subcommand follows these rules
+An agent runs `key issue`, `key extend`, `key revoke`, `profile tools` and their `undo` under AGENTS.md section 2 and
+the harness process.md section 2 access gate. A profile's tool list never gives a principal more than its grants, so a
+tool within the grants of the owner's own agents on that profile is an own-agent grant (the journal's before-state,
+read-back, `undo`); a profile with any other principal takes Astra r1. A tool that sends, calls, ACKs, pairs, starts or
+stops a provider session or changes an allowlist is added only on the owner's exact words (AGENTS.md section 1). Every write subcommand follows these rules
 (tests/test_deedkit_admin_rules.py proves each):
 
 - (a) Locks: it takes the installed host tool's `production.host_locks` (global, HTTP and plan-A
