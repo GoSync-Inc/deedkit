@@ -16,7 +16,7 @@
 # the service user _deedkitci (sudo, docs/operations/remote-test-mini-setup.md) in its own copy
 # ~_deedkitci/deedkit-ci/<worker>/src, with a disposable PostgreSQL 18 on 127.0.0.1, and streams the output
 # back. Nothing of it uses docker there, so tests that need docker skip, as in the local flow without
-# ANYMSG_TEST_POSTGRES_CONTAINER (CI covers them).
+# ANYMSG_TEST_POSTGRES_CONTAINER (CI covers them); a root run ends by naming every module with skipped tests.
 #
 # The mini runs at most MAX_RUNS DeedKit suites at once and gives way to Between: while a Between container
 # runs, the host load or free memory is past its cap, or the slots are taken, a run waits in the mini queue
@@ -27,7 +27,8 @@
 # run's processes, PostgreSQL included).
 #
 # Caps: /Users/Shared/deedkit-ci/caps.conf on the mini (KEY=value lines, defaults below), so they change
-# without a pull request. Worker name: DEEDKIT_REMOTE_WORKER, else the worktree's last two path components.
+# without a pull request. Worker name: DEEDKIT_REMOTE_WORKER, else the worktree's last two path components; `-` reads
+# as `_` everywhere (--cleanup too), and a derived name past 63 characters is cut and ends in a checksum of the whole.
 #
 # Every wait of a run and its bound, in run order. Kinds: phase = a deadline of its own, shorter than the lease; count =
 # a bounded number of tries, each with its own limit; cumulative = bounded steps in sequence; lease = RUN_SECONDS, held
@@ -103,11 +104,16 @@ say() { echo "remote-test: $*" >&2; }
 
 valid_worker() { [[ "$1" =~ ^[a-z0-9][a-z0-9_]{0,62}$ ]]; }
 
+# One worker has one directory, however its name is written.
+canonical_worker() { printf '%s' "${1//-/_}"; }
+
 worker_of() {
-  local name="${DEEDKIT_REMOTE_WORKER:-}"
+  local name
+  name="$(canonical_worker "${DEEDKIT_REMOTE_WORKER:-}")"
   if [ -z "$name" ]; then
     name="$(basename "$(dirname "$1")")_$(basename "$1")"
     name="$(printf '%s' "$name" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '_' | sed 's/^_*//')"
+    if [ "${#name}" -gt 63 ]; then name="${name:0:52}_$(printf '%s' "$name" | cksum | cut -d' ' -f1)"; fi
   fi
   valid_worker "$name" || die "worker name '$name' must match [a-z0-9][a-z0-9_]{0,62}"
   printf '%s' "$name"
@@ -519,6 +525,34 @@ reap_jobs() {
   done
 } 2>/dev/null
 
+# What a root run left out, from pytest's reports: every skip by module, those that need docker first. Never a test's
+# result; a stopped run has no report, so it gets the general line.
+SKIP_REPORT='import collections, re, sys, xml.etree.ElementTree as tree
+docker, other = collections.Counter(), collections.Counter()
+for path in sys.argv[1:]:
+    for case in tree.parse(path).iter("testcase"):
+        for skip in case.findall("skipped"):
+            if not skip.get("type", "").startswith("pytest.xfail"):
+                needs = re.search("docker|container|compose", skip.get("message") or "", re.I)
+                (docker if needs else other)[case.get("file") or case.get("classname") or case.get("name")] += 1
+def line(label, counts):
+    names = ", ".join(f"{name} ({counts[name]})" for name in sorted(counts))
+    print(f"{label}: {sum(counts.values())} tests did not run here" + (f": {names}" if names else ""))
+line("skipped: needs docker (CI covers)", docker)
+if other:
+    line("skipped for another reason", other)'
+
+report_skips() {
+  local out="" line
+  if ls "$RUN_DIR"/junit-*.xml >/dev/null 2>&1; then out="$(python3 -c "$SKIP_REPORT" "$RUN_DIR"/junit-*.xml 2>/dev/null)" || out=""; fi
+  if [ -z "$out" ]; then
+    say "skipped: needs docker (CI covers): the modules that use ANYMSG_TEST_POSTGRES_CONTAINER or the docker CLI;" \
+      "this is not the full suite"
+    return 0
+  fi
+  while IFS= read -r line; do say "$line"; done <<< "$out"
+}
+
 finish() {
   local status=$? pid pg=0 i stopped=1
   trap - EXIT INT TERM HUP
@@ -547,10 +581,7 @@ finish() {
   if [ -n "$DATABASES" ]; then
     pg="$(awk -v a="$(cpu_of "$RUN_DIR/.times")" -v b="$(cpu_of "$RUN_DIR/.times-before")" 'BEGIN { printf "%.1f", a - b }')"
   fi
-  if [ "$SUITE" = root ]; then
-    say "skipped: needs docker (CI covers): the modules that use ANYMSG_TEST_POSTGRES_CONTAINER or the docker CLI;" \
-      "this is not the full suite"
-  fi
+  if [ "$SUITE" = root ]; then report_skips; fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$WORKER" "$SUITE" "$START_ISO" "$((SECONDS - START_EPOCH))" \
     "$(cpu_of "$RUN_DIR/.times")" "$pg" "$status" >> "$ROOT_DIR/load.log"
   if [ "$(cat "$WORKER_DIR/run.pid" 2>/dev/null)" = "$$ $(started $$)" ]; then rm -f "$WORKER_DIR/run.pid"; fi
@@ -580,7 +611,7 @@ suite_root() {
     pg_start pg1
     write_dsn "$RUN_DIR/test-1.dsn"
     [ $# -gt 0 ] || set -- --tb=short "${ignores[@]}" tests
-    run env PROBE_TEST_DSN_FILE="$RUN_DIR/test-1.dsn" uv run pytest "$@"
+    run env PROBE_TEST_DSN_FILE="$RUN_DIR/test-1.dsn" uv run pytest "$@" --junitxml="$RUN_DIR/junit-1.xml" -o junit_family=xunit1
     return
   fi
   # The full suite: PARALLEL file-level shards (scripts/python_shards.py, as CI), each with its own database.
@@ -591,7 +622,7 @@ suite_root() {
   for shard in $(seq 1 "$PARALLEL"); do
     (own_self group
       env DEEDKIT_TEST_SHARD="$shard/$PARALLEL" PROBE_TEST_DSN_FILE="$RUN_DIR/test-$shard.dsn" uv run python \
-      scripts/python_shards.py pytest --tb=short "${ignores[@]}" tests 2>&1 | prefix "[$shard/$PARALLEL] ") &
+      scripts/python_shards.py pytest --tb=short "${ignores[@]}" tests --junitxml="$RUN_DIR/junit-$shard.xml" -o junit_family=xunit1 2>&1 | prefix "[$shard/$PARALLEL] ") &
     pid=$!
     pids="$pids $pid"
   done
@@ -900,11 +931,12 @@ case "${1:-}" in
   --load) need_host; as_service --here load ;;
   --cleanup)
     [ $# = 2 ] || die "usage: $0 --cleanup <worker>"
-    valid_worker "$2" || die "bad worker name"
+    worker="$(canonical_worker "$2")"
+    valid_worker "$worker" || die "bad worker name"
     need_host
     status=0
-    as_service --here cleanup "$2" || status=$?
-    ssh "${SSH_OPTS[@]}" "$HOST" "rm -rf $(printf '%q' "$SHARED/stage/$2")"
+    as_service --here cleanup "$worker" || status=$?
+    ssh "${SSH_OPTS[@]}" "$HOST" "rm -rf $(printf '%q' "$SHARED/stage/$worker")"
     exit "$status" ;;
   --full|*)
     if [ "${1:-}" = --full ]; then FULL=1; shift; fi
