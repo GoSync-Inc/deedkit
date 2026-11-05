@@ -2537,7 +2537,9 @@ fix the sync (docs/operations/feedback-triage.md, Hourly sync).
 `python3 scripts/deedkit.py admin key list` (ANYM-494) shows every agent key in one view: one row
 per gateway principal (label, enabled, gateway expiry) with the messaging, calendar and calls
 credential bound to it (public ID, expiry, `live`, `revoked`, `expired`, `missing`, or `unknown`
-when a backend command fails). It reads the gateway policy and the calls registry and runs the
+when a backend command fails). A recordings credential has the same line (ANYM-772): public ID, expiry and `live`,
+`expired` or `missing`, matched by its key hash in the recordings private configuration (the expiry prints in canonical ISO form). It reads the gateway policy
+and the calls registry and runs the
 messaging `list-keys --all` / `key-info` and calendar `list-agents` / `agent-info` operator
 commands (ACCESS.md, `services/calendar/docs/SERVICE.md`); key files reach those commands on
 stdin, never in argv, environment or output. It takes no lock and writes no store or file, so it
@@ -2556,13 +2558,17 @@ expose them): `credential_missing`, `credential_revoked`, `credential_expired`,
 refuses it), `backend_expires_first` (the backend key ends before the gateway entry),
 `shared_credential` (one backend key bound to two or more principals), `unbound_key` (a backend
 key no principal holds, with its status) and `backend_unavailable` (a failed backend command, or
-no calls registry configured while a principal holds a calls key). With `--principal`, the list
+no calls registry configured while a principal holds a calls key). While a principal holds a recordings key, an
+unconfigured or unusable recordings configuration is a `backend_unavailable` finding with `backend: recordings` and
+the row's fixed `note` (`recordings_config_not_configured`, `_unreadable`, `_invalid` or `_duplicate_key`), so
+`--strict` exits 1 and the other rows still print. With `--principal`, the list
 keeps that principal's findings and every `backend_unavailable` of a backend it uses.
 
 The configuration is a private JSON file (`--config`, default
 `/opt/deedkit/deploy/private/admin/config.json`; template `deploy/admin.example.json`): policy
 and calls registry paths, container-to-host path mappings for key files, and the messaging and
-calendar operator command prefixes. Every private file it reads must be a regular, owner-only
+calendar operator command prefixes. The optional `recordings_config` is the absolute host path of the recordings
+private `config.json`, read only, with the rule below and no owner check (its owner is UID 10001). Every private file it reads must be a regular, owner-only
 file (no group or other bits, no symlink). `admin key label ID TEXT` (1–80 printable characters,
 an existing gateway principal) writes the label to `labels.json` beside it, mode 0600, atomically;
 no service reads that file, so the enforced policy never changes.

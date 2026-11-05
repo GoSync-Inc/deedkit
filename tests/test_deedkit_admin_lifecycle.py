@@ -85,6 +85,31 @@ def unchanged(site, capsys, run, message):
     assert site.operator.state["extended"] == [] and not (site.root / "ops").exists()
 
 
+# spec: ANYM-772
+@pytest.mark.parametrize("argv, message", [
+    (("key", "issue", "fresh", "--like", "src", "--days", "10"),
+     "has a recordings credential; key issue --like cannot clone it"),
+    (("key", "extend", "src", "--days", "120"), "has a recordings credential; key extend/revoke cannot change it. "
+     "Editing the recordings private configuration alone does not extend or revoke the gateway principal or its other "
+     "credentials: a separately reviewed cross-store operation is required (not in this card)"),
+    (("key", "revoke", "src"), "has a recordings credential; key extend/revoke cannot change it. "
+     "Editing the recordings private configuration alone does not extend or revoke the gateway principal or its other "
+     "credentials: a separately reviewed cross-store operation is required (not in this card)"),
+], ids=["issue", "extend", "revoke"])
+def test_a_principal_with_a_recordings_credential_is_refused_by_name_and_nothing_changes(site, capsys, caplog, argv, message):
+    credential = site.key("src-recordings")
+    entry(site.policy(), "src")  # the fake's policy must exist before it is rewritten with the extra credential
+    next(row for row in site.principals if row["id"] == "src")["credentials"]["recordings"] = credential
+    site.write_policy()
+    before = site.snapshot()
+    code, _, err = call(site, capsys, *argv)
+    assert code == 2 and message in err and "nothing changed" in err, err
+    assert site.snapshot() == before and not (site.root / "ops").exists()
+    assert site.operator.state["extended"] == [] and site.operator.state["issued"] == []
+    for secret in (credential["key_sha256"], site.tokens["src-recordings"]):
+        assert secret not in err + caplog.text
+
+
 # key extend
 
 # spec: ANYM-497
