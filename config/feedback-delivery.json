@@ -1,0 +1,8 @@
+{
+  "ANYM-171": {
+    "commit": "d7ab137d5a28f3c81c15fef3cc2d2872ae1eb421",
+    "pr": 342,
+    "evidence": "gh pr view 342: merged as this squash, Spec: names ANYM-171, no Delivers line; #639 names the card later as maintenance",
+    "added": "2026-11-05"
+  }
+}

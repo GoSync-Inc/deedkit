@@ -4,6 +4,7 @@ import fcntl
 import json
 import subprocess
 
+from hypothesis import given, strategies as st
 import pytest
 
 import scripts.feedback_sync as sync
@@ -364,6 +365,254 @@ def test_follow_moves_each_status_after_its_card(tmp_path):
     assert [flags(argv)['--status'] for argv in prod.writes] == ['verify_requested']  # B is live now
     prod.writes.clear()
     assert follow(tmp_path, prod, root, gh, lambda commit: LIVE) == 0 and prod.writes == []
+
+
+REVIEW_LINE = '2. Read-back on production. [open: live]'
+
+
+def in_review(content=REVIEW_LINE):
+    return main_of(dict(spec(10, 'Review'), content=content))
+
+
+# spec: ANYM-764
+def test_a_review_card_with_a_live_commit_asks_for_a_re_check_and_names_its_open_check(tmp_path, capsys):
+    root, shas = repo(tmp_path, ['one'])
+    gh, _ = pull_requests({'ANYM-10': [(1, 'Delivers: ANYM-10', shas['one'])]})
+    prod = Prod({A: disp('accepted', 'ANYM-10'), B: disp('fixed', 'ANYM-10', fixed='deedkit@' + OLD)})
+    assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, in_review('Text\n' + REVIEW_LINE + '\n[open: measured] later')) == 0
+    note = f'Delivered by ANYM-10; live in deedkit@{LIVE[:12]}; the card still waits for {REVIEW_LINE}. Please re-check.'
+    assert shown(prod, A) == shown(prod, B) == disp('verify_requested', 'ANYM-10', fixed='deedkit@' + LIVE, note=note)
+    assert '(card delivered, still in Review)' in capsys.readouterr().out
+    # A second deploy keeps the first live SHA, also when the card then moves to Done.
+    prod.writes.clear()
+    for main in (in_review(), main_of(spec(10, 'Done'))):
+        assert follow(tmp_path, prod, root, gh, lambda commit: OLD, main) == 0
+        assert prod.writes == [] and 'already verify_requested' in capsys.readouterr().out
+    assert prod.rows[A]['fixed_in'] == 'deedkit@' + LIVE
+
+
+# spec: ANYM-764
+def test_a_review_card_merged_but_not_live_is_fixed_and_without_a_commit_stays_not_delivered(tmp_path, capsys):
+    root, shas = repo(tmp_path, ['one'])
+    one = shas['one']
+    gh, asked = pull_requests({'ANYM-10': [(1, 'Delivers: ANYM-10', one)], 'ANYM-11': [(2, 'Spec: ANYM-11', one)]})
+    prod = Prod({A: disp('accepted', 'ANYM-10'), B: disp('accepted', 'ANYM-11'), C: disp('received', 'ANYM-11'),
+                 D: disp('accepted', 'ANYM-12'), E: disp('accepted', 'ANYM-13')})
+    main = main_of(spec(10, 'Review'), spec(11, 'Review'), spec(12, 'Active'), spec(13, 'Backlog'))
+    assert follow(tmp_path, prod, root, gh, lambda commit: None, main) == 0
+    assert shown(prod, A) == disp('fixed', 'ANYM-10', fixed='deedkit@' + one,
+                                  note=f'Delivered by ANYM-10 in deedkit@{one[:12]}; not live yet.')
+    assert shown(prod, C) == disp('accepted', 'ANYM-11', note='Accepted as ANYM-11; it follows that card.')
+    out = capsys.readouterr().out
+    assert f'{B} accepted -> no change (card not delivered)' in out
+    assert f'{D} accepted -> no change (card not delivered)' in out and f'{E} accepted -> no change (card not delivered)' in out
+    assert sorted(asked) == ['ANYM-10', 'ANYM-11']  # Active and Backlog cards are not asked about
+
+
+# spec: ANYM-764
+@pytest.mark.parametrize('content, check', [
+    ('no marker at all', 'review'),
+    ('```\n[open: live] an example in a fence\n```\n<!-- [open: live] a comment -->', 'review'),
+    ('first\n  [open: measured]\tspaced\x01out  \nsecond [open: live]', '[open: measured] spaced out'),
+    ('[open: live] ' + 'x' * 300, '[open: live] ' + 'x' * 106 + '…'),
+], ids=['no-marker', 'fence-and-comment', 'control-characters', 'long-line'])
+def test_the_open_check_is_the_first_marker_line_or_review(content, check):
+    assert sync.open_check(content) == check
+
+
+# spec: ANYM-764
+@given(st.text(max_size=400), st.sampled_from(['[open: live]', '[open: measured]', '']), st.text(max_size=400))
+def test_any_card_text_gives_a_note_the_setter_accepts(before, marker, after):
+    check = sync.open_check(before + marker + after)
+    assert 1 <= len(check) <= 120 and sync.note_ok(check) and check == check.strip()
+    target, _ = sync.follow_target(disp('accepted', 'ANYM-10'), 'Review', LIVE, lambda commit: LIVE, check)
+    assert not sync.problems(target)
+
+
+def write_mapping(root, text):
+    (root / 'config').mkdir(exist_ok=True)
+    (root / 'config' / 'feedback-delivery.json').write_text(text if isinstance(text, str) else json.dumps(text))
+
+
+def entry(commit, pr=7):
+    return {'commit': commit, 'pr': pr, 'evidence': 'one line of provenance', 'added': '2026-11-05'}
+
+
+def github(merged=(), others=(), fail=None):
+    """`gh pr list`: (number, body, commit) per card, `others` the unmerged ones (state, number, body); `fail` is
+    the `--state` whose listing fails ('truncated' for one too long)."""
+    calls = []
+
+    def gh(argv):
+        state, ref = argv[argv.index('--state') + 1], argv[argv.index('--search') + 1].split('"')[1]
+        calls.append((state, ref))
+        if fail == state:
+            raise sync.Refused('gh pr exited 1')
+        rows = [{'number': n, 'body': body, 'state': 'MERGED', 'mergeCommit': {'oid': sha}} for n, body, sha in merged
+                if ref in body]
+        if state == 'all':
+            rows += [{'number': n, 'body': body, 'state': kind, 'mergeCommit': None} for kind, n, body in others if ref in body]
+            rows += [rows[0]] * (sync.PR_LIMIT if fail == 'truncated' and rows else 0)
+        return json.dumps(rows)
+    return gh, calls
+
+
+DONE = {'requirements': [spec(10, 'Done')], 'pagination': {'nextPageToken': '', 'totalCount': 1}}
+
+
+# spec: ANYM-764
+def test_a_done_card_follows_its_reviewed_mapping_entry(tmp_path, capsys):
+    root, shas = repo(tmp_path, ['one'])
+    write_mapping(root, {'ANYM-10': entry(shas['one'])})
+    gh, _ = github([(7, 'Spec: ANYM-9, ANYM-10', shas['one'])])
+    prod = Prod({A: disp('accepted', 'ANYM-10'), B: disp('verified', 'ANYM-10'), C: disp('declined', 'ANYM-10'),
+                 D: disp('duplicate', 'ANYM-10')})
+    assert follow(tmp_path, prod, root, gh, lambda commit: None, DONE) == 0
+    assert shown(prod, A) == disp('fixed', 'ANYM-10', fixed='deedkit@' + shas['one'],
+                                  note=f'Delivered by ANYM-10 in deedkit@{shas["one"][:12]}; not live yet.')
+    assert f'{A} accepted -> fixed ANYM-10 deedkit@{shas["one"]} (delivered by mapping (#7))' in capsys.readouterr().out
+    assert [prod.rows[i]['status'] for i in (B, C, D)] == ['verified', 'declined', 'duplicate']
+    assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, DONE) == 0
+    assert shown(prod, A)['status'] == 'verify_requested' and shown(prod, A)['fixed_in'] == 'deedkit@' + LIVE
+
+
+# spec: ANYM-764
+@pytest.mark.parametrize('case, why', [
+    ('not-merged', 'pull request #7 is not merged'),
+    ('off-main', 'the commit is not on origin/main'),
+    ('other-commit', 'pull request #7 merged with another commit'),
+    ('not-named', 'pull request #7 has no Spec: line naming the card'),
+    ('absent', 'pull request #7 does not name the card'),
+    ('has-delivers', 'the card has a Delivers: pull request'),
+    ('not-done', 'the card is not Done'),
+    ('shape', 'needs exactly commit, pr, evidence, added'),
+    ('short-commit', 'commit is not 40 hex'),
+    ('bad-pr', 'pr is not a number'),
+    ('bad-evidence', 'evidence is not one line'),
+    ('bad-date', 'added is not a date'),
+    ('twice', 'two entries for the card'),
+])
+def test_a_mapping_entry_that_fails_a_condition_is_refused_by_name_and_writes_nothing(tmp_path, capsys, case, why):
+    root, shas = repo(tmp_path, ['one', 'two'])
+    one, two = shas['one'], shas['two']
+    good = entry(one)
+    spec_line = 'Spec: ANYM-10\nmentions ANYM-10'
+    merged, others, main = [(7, spec_line, one)], [], DONE
+    mapping = {'ANYM-10': good}
+    if case == 'not-merged':
+        merged, others = [], [('CLOSED', 7, spec_line)]
+    elif case == 'off-main':
+        mapping = {'ANYM-10': entry(OLD)}
+        merged = [(7, spec_line, OLD)]
+    elif case == 'other-commit':
+        merged = [(7, spec_line, two)]
+    elif case == 'not-named':
+        merged = [(7, 'Spec: ANYM-9\nmentions ANYM-10', one)]
+    elif case == 'absent':
+        merged = []
+    elif case == 'has-delivers':
+        merged = [(7, spec_line, one), (8, 'Delivers: ANYM-10', two)]
+    elif case == 'not-done':
+        main = main_of(spec(10, 'Review'))
+    elif case in ('shape', 'short-commit', 'bad-pr', 'bad-evidence', 'bad-date'):
+        change = {'shape': {'extra': 1}, 'short-commit': {'commit': 'abc'}, 'bad-pr': {'pr': True},
+                  'bad-evidence': {'evidence': 'two\nlines'}, 'bad-date': {'added': 'soon'}}[case]
+        mapping = {'ANYM-10': dict(good, **change)}
+    elif case == 'twice':
+        mapping = '{"ANYM-10": %s, "ANYM-10": %s}' % (json.dumps(good), json.dumps(good))
+    write_mapping(root, mapping)
+    gh, _ = github(merged, others)
+    prod = Prod({A: disp('accepted', 'ANYM-10', note='kept')})
+    assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, main) == 0
+    assert prod.writes == [] and shown(prod, A) == disp('accepted', 'ANYM-10', note='kept')
+    assert f'{A} accepted -> no change (mapping refused: {why})' in capsys.readouterr().out
+
+
+# spec: ANYM-764
+def test_a_bad_entry_holds_only_its_own_card_and_an_active_card_still_accepts(tmp_path, capsys):
+    root, shas = repo(tmp_path, ['one'])
+    write_mapping(root, {'ANYM-10': dict(entry(shas['one']), pr=0), 'ANYM-12': entry(shas['one'])})
+    gh, _ = pull_requests({'ANYM-11': [(1, 'Delivers: ANYM-11', shas['one'])]})
+    prod = Prod({A: disp('accepted', 'ANYM-10'), B: disp('accepted', 'ANYM-11'), C: disp('received', 'ANYM-12'),
+                 D: disp('accepted', 'ANYM-12')})
+    main = main_of(spec(10, 'Done'), spec(11, 'Done'), spec(12, 'Active'))
+    assert follow(tmp_path, prod, root, gh, lambda commit: None, main) == 0
+    assert prod.rows[B]['status'] == 'fixed' and prod.rows[C]['status'] == 'accepted'
+    out = capsys.readouterr().out
+    assert f'{A} accepted -> no change (mapping refused: pr is not a number)' in out
+    assert f'{D} accepted -> no change (mapping refused: the card is not Done)' in out
+
+
+# spec: ANYM-764
+@pytest.mark.parametrize('text', ['not json', '[]', '{"anym-10": {}}'], ids=['not-json', 'array', 'bad-key'])
+def test_an_unreadable_mapping_file_stops_the_run_before_any_write(tmp_path, capsys, text):
+    root, shas = repo(tmp_path, ['one'])
+    write_mapping(root, text)
+    gh, _ = pull_requests({'ANYM-11': [(1, 'Delivers: ANYM-11', shas['one'])]})
+    prod = Prod({A: disp('accepted', 'ANYM-11')})
+    assert follow(tmp_path, prod, root, gh, lambda commit: LIVE) == 1
+    assert prod.writes == [] and 'mapping refused' in capsys.readouterr().err
+
+
+# spec: ANYM-764
+def test_two_spec_pull_requests_move_nothing_until_a_reviewed_entry_names_one(tmp_path, capsys):
+    root, shas = repo(tmp_path, ['one', 'two'])
+    gh, calls = github([(7, 'Spec: ANYM-10', shas['one']), (8, 'Spec: ANYM-10', shas['two'])])
+    prod = Prod({A: disp('accepted', 'ANYM-10')})
+    assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, DONE) == 0
+    assert prod.writes == [] and f'{A} accepted -> no change (no delivering commit on origin/main)' in capsys.readouterr().out
+    assert calls == [('merged', 'ANYM-10')]  # no entry: the tool asks nothing further and never derives one
+    write_mapping(root, {'ANYM-10': entry(shas['two'], 8)})
+    assert follow(tmp_path, prod, root, gh, lambda commit: None, DONE) == 0
+    assert prod.rows[A]['fixed_in'] == 'deedkit@' + shas['two']
+
+
+# spec: ANYM-764
+@pytest.mark.parametrize('fail', ['merged', 'all', 'truncated'])
+def test_a_failed_or_truncated_spec_listing_ends_the_run_with_no_write(tmp_path, fail):
+    root, shas = repo(tmp_path, ['one'])
+    write_mapping(root, {'ANYM-10': entry(shas['one'])})
+    merged = [(7, 'Spec: ANYM-10', shas['one'])]
+    prod = Prod({A: disp('accepted', 'ANYM-10')})
+    assert follow(tmp_path, prod, root, github(merged, fail=fail)[0], lambda commit: None, DONE) == 1
+    assert prod.writes == []
+    assert follow(tmp_path, prod, root, github(merged)[0], lambda commit: None, DONE) == 0
+    assert prod.rows[A]['status'] == 'fixed'
+
+
+# spec: ANYM-764
+def test_the_opt_in_hold_is_kept_on_a_delivered_or_mapped_card(tmp_path):
+    root, shas = repo(tmp_path, ['one'])
+    write_mapping(root, {'ANYM-10': entry(shas['one'])})
+    held = disp('received', 'ANYM-10', note=f'{sync.triage.HOLD} (ANYM-10)')
+    prod = Prod({A: dict(held)})
+    gh, _ = github([(7, 'Spec: ANYM-10', shas['one'])])
+    for main in (DONE, main_of(spec(10, 'Review')), main_of(spec(10, 'Active'))):
+        assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, main) == 0
+        assert prod.writes == [] and shown(prod, A) == held
+
+
+# spec: ANYM-764
+def test_the_hourly_plan_prints_the_new_reasons_without_writing(tmp_path, capsys):
+    root, shas = repo(tmp_path, ['one'])
+    write_mapping(root, {'ANYM-11': entry(shas['one'])})
+    gh, _ = github([(1, 'Delivers: ANYM-10', shas['one']), (7, 'Spec: ANYM-11', shas['one'])])
+    prod = Prod({A: disp('accepted', 'ANYM-10'), B: disp('accepted', 'ANYM-11')})
+    main = main_of(dict(spec(10, 'Review'), content=REVIEW_LINE), spec(11, 'Done'))
+
+    def read(*argv):
+        return main
+    assert sync.main(['auto', '--state', str(state_dir(tmp_path)), '--triage-state', str(triage_dir(tmp_path))], ssh=prod.ssh,
+                     read=read, live=lambda commit: LIVE, gh=gh, run=prod.run, root=root, fetch=False) == 0
+    out = capsys.readouterr().out
+    assert prod.writes == [] and '(card delivered, still in Review)' in out and '(delivered by mapping (#7))' in out
+
+
+# spec: ANYM-764
+def test_the_seeded_mapping_holds_only_anym_171():
+    entries, refused = sync.mapping_load(sync.ROOT)
+    assert refused == {} and list(entries) == ['ANYM-171']
+    assert entries['ANYM-171']['pr'] == 342 and entries['ANYM-171']['commit'] == 'd7ab137d5a28f3c81c15fef3cc2d2872ae1eb421'
 
 
 # spec: ANYM-473
