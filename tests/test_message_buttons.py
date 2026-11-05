@@ -437,6 +437,5 @@ def test_button_texts_say_what_is_offered_and_how_absence_reads():
                      'none,','capture off','production','2026-11-02','unfit','unparsed','deleted'):
             assert word in text, word
         assert text.count('is not offered')==1 and 'Mini App is' in text
-    for text in passages[:3]:
-        assert 'on since 2026-11-02, no backfill' in text and 'no captured keyboard' in text
-    assert len(set(passages[:3]))==1 and passages[0] in setup and 'Nothing presses' not in setup
+        assert 'capture off (default; production on since 2026-11-02, no backfill)' in text, text
+    assert len(set(passages[:3]))==1 and 'no captured keyboard' in passages[0] and passages[0] in setup and 'Nothing presses' not in setup
