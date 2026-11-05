@@ -162,8 +162,9 @@ class time_limit:
     """Raise RecordingsRefused(code) when the block runs past `seconds` (SIGALRM, this thread; None: no limit).
 
     Any error the interrupted code raises on its way out is replaced by the code: the limit is the cause.
+    `refused` is the refusal class to raise, when it is not RecordingsRefused.
     """
-    def __init__(self,seconds,code):self.seconds,self.code,self.fired,self.previous=seconds,code,False,None
+    def __init__(self,seconds,code,refused=None):self.seconds,self.code,self.fired,self.previous,self.refused=seconds,code,False,None,refused
     def __enter__(self):
         if self.seconds is None:return self
         def fire(*_):self.fired=True;raise TimeoutError(self.code)
@@ -174,7 +175,7 @@ class time_limit:
         signal.setitimer(signal.ITIMER_REAL,0);signal.signal(signal.SIGALRM,self.previous)
         if self.fired:
             from .backup_recordings import RecordingsRefused
-            raise RecordingsRefused(self.code) from None
+            raise (self.refused or RecordingsRefused)(self.code) from None
         return False
 
 
@@ -234,8 +235,55 @@ def run_recordings(config):
     return result
 
 
+def run_calls(config):
+    """Calls state profile (ANYM-778): one staged sanitized SQLite snapshot, checked and encrypted in place. No network."""
+    from .backup_calls import CallsRefused,STATE_FILE,create_calls_snapshot
+    from .backup_receiver import BACKUP_ID
+    required={'profile','id','snapshot_directory','recipient_file','work_directory','captured_at','integrity_timeout_seconds',
+              'encrypt_timeout_seconds','expected_bytes','expected_sha256'}
+    if set(config)!=required or config['profile']!='calls':raise ValueError('invalid_backup_worker_config')
+    for key in ('integrity_timeout_seconds','encrypt_timeout_seconds'):
+        if type(config[key]) is not int or not 1<=config[key]<=7200:raise ValueError('invalid_backup_worker_config')
+    if (type(config['expected_bytes']) is not int or config['expected_bytes']<1 or
+        not isinstance(config['expected_sha256'],str) or not re.fullmatch('[a-f0-9]{64}',config['expected_sha256']) or
+        not isinstance(config['captured_at'],str)):raise ValueError('invalid_backup_worker_config')
+    if not isinstance(config['id'],str) or not BACKUP_ID.fullmatch(config['id']):raise ValueError('invalid_backup_id')
+    work=Path(config['work_directory'])
+    if work.is_symlink() or not work.is_dir() or work.stat().st_mode&0o077:raise ValueError('private_work_directory_required')
+    staged=Path(config['snapshot_directory'])/STATE_FILE
+    directory=work/'snapshot';output=work/'bundle.tar.age'
+    # `snapshot` holds only manifest.json (table names, counts and digests, no row): the database is streamed from its
+    # private read-only staging into the encryption. The directory goes on every exit.
+    try:
+        snapshot=create_calls_snapshot(staged,directory,captured_at=config['captured_at'],copy_state=False,
+                                       expected={'bytes':config['expected_bytes'],'sha256':config['expected_sha256']},
+                                       integrity_seconds=config['integrity_timeout_seconds'])
+        write_json(work/'captured.json',{'id':config['id'],'status':'capture_complete'})
+        with (directory/'manifest.json').open('rb') as f:snapshot_sha=hashlib.file_digest(f,'sha256').hexdigest()
+        try:
+            with time_limit(config['encrypt_timeout_seconds'],'calls_encrypt_timeout',CallsRefused):
+                encrypt_snapshot(directory,output,Path(config['recipient_file']).read_text().strip(),calls_state=staged)
+        except OSError as exc:
+            if exc.errno!=errno.ENOSPC:raise
+            raise CallsRefused('calls_no_space') from None
+    except CallsRefused as exc:
+        write_json(work/'refused.json',{'id':config['id'],'status':'refused','code':exc.code})
+        if output.exists():output.unlink()
+        raise
+    finally:
+        if directory.exists():shutil.rmtree(directory)
+    with output.open('rb') as f:digest=hashlib.file_digest(f,'sha256').hexdigest()
+    result={'v':1,'id':config['id'],'profile':'calls','status':'encrypted','bytes':output.stat().st_size,
+            'sha256':digest,'snapshot_sha256':snapshot_sha,'snapshot':snapshot,'created_at':datetime.now(timezone.utc).isoformat(),
+            'captured_at':config['captured_at']}
+    write_json(work/'result.json',result)
+    print(json.dumps({'status':'encrypted','id':config['id'],'profile':'calls','bytes':result['bytes']}),flush=True)
+    return result
+
+
 def run(config):
     if config.get('profile')=='recordings':return run_recordings(config)
+    if config.get('profile')=='calls':return run_calls(config)
     if 'profile' in config:return run_calendar(config)
     if config.get('action') in ('release_fence','abandon_fence'):
         if set(config)!={'action','id','dsn_file','work_directory'}:raise ValueError('invalid_backup_worker_config')
@@ -324,9 +372,10 @@ def main():
     parser=argparse.ArgumentParser();parser.add_argument('--config',type=Path,required=True)
     args=parser.parse_args();os.umask(0o077)
     from .backup_calendar import CalendarCaptureRefused
+    from .backup_calls import CallsRefused
     from .backup_recordings import RecordingsRefused
     try:run(private_json(args.config))
-    except (CalendarCaptureRefused,RecordingsRefused) as exc:
+    except (CalendarCaptureRefused,RecordingsRefused,CallsRefused) as exc:
         print(json.dumps({'status':'refused','code':exc.code}),flush=True)
         raise SystemExit(1) from None
     except Exception:

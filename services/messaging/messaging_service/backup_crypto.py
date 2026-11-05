@@ -113,15 +113,15 @@ def valid_member(name):
 
 
 def snapshot_profile(directory):
-    """None for messaging (its manifests carry no profile), 'calendar' for ANYM-605 bundles, 'recordings' (ANYM-714)."""
+    """None for messaging (its manifests carry no profile), 'calendar' for ANYM-605 bundles, 'recordings' (ANYM-714), 'calls' (ANYM-778)."""
     from .recovery_state import read_manifest
     manifest=read_manifest(directory)
     profile=manifest.get('profile') if isinstance(manifest,dict) else None
-    if profile not in (None,'calendar','recordings'):raise ValueError('unsupported_backup')
+    if profile not in (None,'calendar','recordings','calls'):raise ValueError('unsupported_backup')
     return profile
 
 
-def encrypt_snapshot(directory,output,recipient,age='age',*,consume_staged_blobs=False,recordings_state=None):
+def encrypt_snapshot(directory,output,recipient,age='age',*,consume_staged_blobs=False,recordings_state=None,calls_state=None):
     """Encrypt a verified bundle, optionally releasing exclusively owned staging.
 
     Only the backup worker opts in: its blob copies are disposable after tar has
@@ -136,7 +136,16 @@ def encrypt_snapshot(directory,output,recipient,age='age',*,consume_staged_blobs
     if recordings_state is not None:
         if not recordings:raise ValueError('invalid_recordings_state')
         recordings_state=Path(recordings_state)
-    if recordings:
+    calls=profile=='calls'
+    if calls_state is not None:
+        if not calls:raise ValueError('invalid_calls_state')
+        calls_state=Path(calls_state)
+    if calls:
+        from .backup_calls import STATE_FILE,valid_calls_member,verify_calls_bundle
+        # One SQLite snapshot under state/, the manifest first; no other member is admitted.
+        if consume_staged_blobs: raise ValueError('invalid_staging_consumption')
+        verify_calls_bundle(directory,state=calls_state)
+    elif recordings:
         from .backup_recordings import valid_recordings_member,verify_recordings_bundle
         # One SQLite snapshot under state/; nothing to consume, and no other member is admitted.
         if consume_staged_blobs: raise ValueError('invalid_staging_consumption')
@@ -158,7 +167,9 @@ def encrypt_snapshot(directory,output,recipient,age='age',*,consume_staged_blobs
             process=subprocess.Popen([age,'-r',recipient],stdin=subprocess.PIPE,stdout=encrypted,stderr=errors)
             try:
                 with tarfile.open(fileobj=process.stdin,mode='w|') as archive:
-                    if recordings:
+                    if calls:
+                        paths=[directory/'manifest.json',calls_state or directory/'state'/STATE_FILE]
+                    elif recordings:
                         paths=[directory/'manifest.json',recordings_state or directory/'state'/'archive.sqlite']
                     elif calendar:
                         paths=[directory/'manifest.json',directory/'database.dump',
@@ -168,8 +179,9 @@ def encrypt_snapshot(directory,output,recipient,age='age',*,consume_staged_blobs
                         if (directory/'recovery').exists():paths+=sorted((directory/'recovery').iterdir())
                     for path in paths:
                         if path.is_symlink() or not path.is_file(): raise ValueError('invalid_backup_file')
-                        relative='state/archive.sqlite' if path==recordings_state else path.relative_to(directory).as_posix()
-                        if not (valid_recordings_member(relative) if recordings else
+                        relative=('state/archive.sqlite' if path==recordings_state else 'state/'+STATE_FILE if calls and path==calls_state
+                                  else path.relative_to(directory).as_posix())
+                        if not (valid_calls_member(relative) if calls else valid_recordings_member(relative) if recordings else
                                 valid_calendar_member(relative) if calendar else valid_member(relative)):
                             raise ValueError('invalid_backup_file')
                         with regular_source(path) as source:
@@ -236,13 +248,15 @@ def _decrypt_snapshot(command,destination,max_bytes,*,source=None,cached=False):
             # Digests of the bytes this process wrote, kept in memory only: the bundle can never supply them.
             total=0; seen=set(); profile=None; extracted={}
             from .backup_calendar import valid_calendar_member
+            from .backup_calls import valid_calls_member
             from .backup_recordings import valid_recordings_member
             with tarfile.open(fileobj=process.stdout,mode='r|') as archive:
                 for member in archive:
                     name=member.name
                     # A calendar or recordings manifest, read from the first member, admits only that profile's members.
                     if (not member.isfile() or name in seen or len(seen)>=1000000 or
-                        not (valid_recordings_member(name) if profile=='recordings' else
+                        not (valid_calls_member(name) if profile=='calls' else
+                             valid_recordings_member(name) if profile=='recordings' else
                              valid_calendar_member(name) if profile=='calendar' else valid_member(name))):
                         raise ValueError('invalid_backup_member')
                     total+=member.size
@@ -269,12 +283,18 @@ def _decrypt_snapshot(command,destination,max_bytes,*,source=None,cached=False):
                 thread.join(timeout=10)
                 if thread.is_alive():raise RuntimeError('backup_decryption_failed')
                 if failures:raise failures[0]
-            if not ({'manifest.json','state/archive.sqlite'} if profile=='recordings' else
+            if not ({'manifest.json','state/voice.sqlite3'} if profile=='calls' else
+                    {'manifest.json','state/archive.sqlite'} if profile=='recordings' else
                     {'manifest.json','database.dump'})<=seen: raise ValueError('incomplete_backup')
             # A calendar or recordings manifest anywhere but first never admitted its rules: refuse it.
             if snapshot_profile(temporary)!=profile: raise ValueError('invalid_backup_member')
         from .recovery_state import read_manifest
         from .backup import verify_bundle
+        if profile=='calls':
+            from .backup_calls import verify_calls_bundle
+            verify_calls_bundle(temporary)
+            fsync_dir(temporary/'state'); fsync_dir(temporary); os.rename(temporary,destination); fsync_dir(destination.parent)
+            return destination
         if profile=='recordings':
             from .backup_recordings import verify_recordings_bundle
             verify_recordings_bundle(temporary)
