@@ -8,6 +8,7 @@ import pytest
 from messaging_service import outgoing
 from messaging_service.envelope import stable_id
 from messaging_service.store import APIError
+from test_messenger_commands import operation_args,operator as operator  # noqa: F401  (fixture)
 from test_sending import sender as sender
 
 
@@ -63,6 +64,24 @@ def test_review_digest_required_and_target_reply_policy_binding(sender):
             request_id='formatted-synthetic-request',reply_to='',preview_digest=preview['preview_digest'])
     with s.pool.connection() as c:
         assert c.execute('SELECT count(*) AS n FROM outgoing_messages').fetchone()['n']==0
+
+
+# spec: ANYM-755
+@pytest.mark.parametrize('source,format,options',[
+    ('**Тест 😀** and [link](https://example.invalid/x)','markdown',{}),
+    ('<b>Edited</b> <i>synthetic</i> <a href="https://example.invalid/x">link</a>','html',{'link_preview':True}),
+    ('<pre language="python">x = 1</pre>','html',{}),
+    ('plain with a link preview https://example.invalid/x','plain',{'link_preview':True})])
+def test_formatted_edit_renders_exactly_as_a_send_of_the_same_source(operator,source,format,options):
+    s,_,key,_=operator
+    chat=stable_id('chat','command-fixture','100')
+    with s.authorized(key,'preview_message') as (c,p):
+        sent=outgoing.preview(c,p,'command-fixture',chat,source,format=format,**options)
+    edit=s.preview_messenger_operation(key,**operation_args(operation='edit_message',
+        parameters={'text':source,'format':format,**options}))['edit_artifact']
+    for name in ('format','source_text','rendered_text','provider_text','entities','provider_payload','warnings',
+                 'links','utf16_units','renderer_version'):
+        assert edit[name]==sent[name],name
 
 
 def test_outbox_replays_stored_source_before_renderer_upgrade_and_dispatches_persisted(sender,monkeypatch):

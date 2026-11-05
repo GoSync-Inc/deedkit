@@ -119,12 +119,34 @@ it never means that an unknown traversal is complete.
 `recordings_read` takes `account`, `recording_id`, `kind` (`transcript` or
 `summary`), `page_chars` (100–10000, default 4000), and optional `cursor`.
 Transcript text is newline-delimited JSON segments preserving supplied offsets
-and speaker labels, split at character boundaries. A page may split one JSON
+(negative ones too: device-buffered speech before the live pin) and speaker labels
+(`speaker_name`, else `speaker_id`), split at character boundaries. A segment with
+Omi's unplaced sentinel `start == end == -1.0` has `start`/`end` null and
+`"placed":false`. A page may split one JSON
 segment; concatenate pages from the same digest before parsing it. The overview
 is provider-authored summary text. No extra transcription/model is invoked.
-`content_state` distinguishes `available`, `empty`, `pending`, `unavailable`.
+`content_state` distinguishes `available`, `empty`, `pending`, `unavailable`. An Omi
+summary with an empty title and overview under 24 hours old is `pending` (Omi's
+lazy processing; its GET omits `processing_deferred`), older it is `empty`.
 Omi raw audio is `unsupported`: its Developer API documents no download route.
 The service does not invent one.
+
+An Omi transcript read also takes optional `from_seconds` and `to_seconds` (ANYM-770;
+numbers from 0 to 1e6, offsets in the recording; one alone is open-ended), for example
+`{"account":"omi-a","recording_id":"...","from_seconds":3600,"to_seconds":4200}`.
+Only segments fully inside are returned (`start >= from_seconds`, `end <= to_seconds`):
+a segment has no word timestamps, so one crossing a bound is left out and counted in
+`excluded_edge_segments`. A segment that cannot be placed (a missing offset, the
+unplaced sentinel, `start` after `end`) is left out uncounted. `text`, `source_digest`,
+`offset` and `complete` describe the filtered text, the cursor is bound to the range,
+and `recording` omits `title` and `title_truncated`. No match is `content_state: empty`.
+The range limits what leaves the service, not what the provider returns to it: the same
+single `GET` reads the whole conversation (Omi's API has no time filter for one
+conversation), and excluded text is not returned, cached or logged. Refusals are
+`invalid_parameters` with a `detail_code`, relayed by the gateway: `range_empty`
+(`from_seconds >= to_seconds`), `range_not_for_summary`, and `range_needs_offsets` (no
+segment placed at or after 0, or any PLAUD account). Without the two arguments the read
+is unchanged.
 
 Continuations last 15 minutes, are authenticated and bound to credential,
 provider account/token identity, operation and exact arguments. They are encoded,
@@ -342,9 +364,12 @@ ahead of the older backlog.
 - A saved record is read again only when its list row changed (overview presence/digest or the deferred flag), or while a part
   is pending: every 3 hours during the first 24 hours after creation, then daily until 14 days, then only on a change. Nothing
   is re-read hourly. A title-only change updates the title and index without a provider call. Failed reads keep the bounded
-  backoff and share the budget.
+  backoff and share the budget; `response_too_large` backs off a day.
+- An Omi record that answers 404 twice in a row (merged away, deleted or locked) becomes `provider_missing`: its stored text
+  stays, it is checked at most weekly with `include_transcript=false` (no transcript slot), and it is due again once a list
+  row carries its ID or that check finds it.
 - `archive_status` (read scope; no titles or text) adds `traversal` (`state`, `discovered_total`, `passes_completed` = history
-  list pages committed, `last_page_at`), `with_text`, `queued`, `pending`, `failed`, `throttled_until`, `usage` per bucket
+  list pages committed, `last_page_at`), `with_text`, `queued`, `pending`, `failed`, `provider_missing`, `throttled_until`, `usage` per bucket
   (`used`, `limit`, `resets_at`: when the oldest counted call leaves the sliding hour), `db_bytes` (all SQLite files incl. WAL), `bytes_ceiling`, `projected_db_bytes`
   (the larger of the measured pages and 3 x the accepted text bytes per text-bearing record, times `discovered_total`, plus
   the measured empty-schema size; an estimate),

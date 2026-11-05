@@ -73,9 +73,14 @@ its allowlist includes mutations; catalog rows distinguish live reads from write
 
 Account-wide operations such as profile/contact lists and group creation require
 full-account scope as well as their named permission. A Telegram `create_group` receipt
-names the new group's `provider_chat_id` and, when the collection policy collects it, its
-archive `chat_id`: the group is in the archive at once (a send or `resolve_reference` works
-before its first message). Without `chat_id` the group arrives with the next dialog discovery. A chat-scoped key is not a
+names the new group's `provider_chat_id` and its `archive` state (ANYM-750). `archive:
+collected` comes with the archive `chat_id`: the group is in the archive at once (a send or
+`resolve_reference` works before its first message). `archive: not_collected` comes without
+`chat_id` and with `archive_reason` and a fixed `next_step`: `discovery_disabled` (the policy
+collects only included chats; the operator adds this chat), `chat_excluded` (the policy excludes
+it; the operator removes the exclusion), `catalog_timeout` or `catalog_failed` (the archive write
+ran out of time or failed; the next dialog discovery adds the group). The operation stays
+`confirmed` in every case; the reason never carries exception text. A chat-scoped key is not a
 back door to the whole contact book. Source and destination evidence are separately
 authorized for forwarding and files. Authorization, revision, key expiry/revocation,
 operation policy and collector ownership are rechecked before dispatch.
@@ -166,15 +171,24 @@ react without holding `read-live`; the owner's opt-in for the read operation app
 after the one edit request, one scoped read of the message (inside the same 30-second timeout)
 settles it. The receipt is `succeeded` (`result.data`: `basis: provider_read_back`,
 `effect_verified: true`) when the read shows this account's message, same chat and id, with the
-requested text (surrounding whitespace ignored on both sides) and no formatting, and the message
-before the edit differed from that (a plain edit of the same text that removes bold or a text link
-is a change). Links, mentions, hashtags and similar entities Telegram detects in the text itself
-are not formatting. Everything else stays `unknown` with `provider_result_unverified`, as before
+requested text (surrounding whitespace ignored on both sides) and the requested formatting (none
+for a plain edit; for a formatted edit, ANYM-755, every span with its type, offset, length, link
+and `pre` language, in any order), and the message before the edit differed from that (a plain
+edit of the same text that removes bold or a text link is a change, and so is a formatted edit
+that only adds bold). Entities that differ from the request leave it `unknown`. Links, mentions,
+hashtags and similar entities Telegram detects in the text itself are not formatting. Everything else stays `unknown` with `provider_result_unverified`, as before
 this release: another text, a missing message, formatting still present, a message that already
 had the requested state, a read error, a timeout or a flood wait (which adds
 `evidence.retry_after_s`). `unknown` still means "not known": the edit may have applied. Its
 `verify` names `get_message_info` with `read-live`: text equal to the requested text means the
-edit applied. Never send the edit again, or delete and repost, before that read.
+edit applied. `get_message_info` shows no formatting, so a formatted edit's `verify` (ANYM-755)
+names `get_messages` with `body_format=html` instead. The edit applied when a revision newer
+than `expected_revision` has a `body_rendered` with `lossless: true` and empty `omitted_types`,
+and its `text`, previewed as `edit_message` with `format=html`, gives the `rendered_text` and
+`entities` of this edit's `edit_artifact`. `body_rendered` leaves out what it cannot render, so
+comparing it without `lossless` can miss an entity. No newer revision,
+`body_rendered_unavailable`, `lossless: false` or any difference is inconclusive.
+Never send the edit again, or delete and repost, before that read.
 
 A confirmed edit adds `archive: queued` to `result.data`: the collector puts the read message on
 its edit queue, a spool beside the live capture queue with its own lock that the same drain loop
@@ -749,9 +763,23 @@ and `bot-press` from the keys; the widened check is harmless.
 
 - WhatsApp `delete_message` is unsupported: the upstream global-revoke behavior
   can fall back silently to local deletion. AnyMsg does not offer that fallback.
-- `edit_message` accepts plain text for an own outgoing message at the exact
-  archive revision; provider edit windows and rights still apply. Existing rich
-  text sending uses `preview_message` / `send_message`, not a raw rich-edit payload.
+- `edit_message` edits an own outgoing message at the exact archive revision;
+  provider edit windows and rights still apply. It takes a send's options
+  (ANYM-755): `format` (`plain` by default, `markdown`, `html`), `link_preview`
+  and `allow_lossy`, rendered by the same renderer as `send_message`, so the
+  same source gives the same text and entities, and refused with the same codes
+  before anything is queued (markdown or html source up to 16000 UTF-16 units,
+  rendered text up to 4000, as a send; a plain edit keeps its 4000). Two byte bounds
+  also apply, and a formatted edit's preview refuses over them as execute does
+  (`invalid_operation_parameters`, field `parameters`, reason `size`): the canonical
+  request, 16000 bytes as for every operation, so the longest ASCII source is a little
+  under 16000 units; and the stored row, 65536 bytes, which repeats the source and
+  rendering, so about 3500 three-byte characters such as CJK rather than a send's 4000.
+  The preview shows the rendering as `edit_artifact`
+  and its `preview_digest` binds it. Defaults, given or omitted, leave the stored
+  request as a plain edit's. On WhatsApp, edits stay plain text: any non-default
+  option is refused `unsupported_operation` with a `next_step` to repeat the edit
+  with text only.
 - Telegram mark-read uses the selected message as the read boundary; WhatsApp
   mark-read affects the whole chat. Ordinary sends remain `sendSeen: false` on
   WhatsApp; read-state changes require a separately confirmed explicit operation.

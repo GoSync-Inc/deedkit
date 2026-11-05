@@ -33,6 +33,8 @@ DETAIL_CODES = frozenset({
     'not_object', 'id_invalid', 'id_mismatch', 'metadata_field', 'segment_shape', 'segment_text', 'segment_speaker',
     'segment_offset', 'list_shape', 'list_pagination', 'encoding', 'not_json', 'projection_error',
 })
+# ANYM-770: why a time range was refused. Forwarded only with `invalid_parameters`.
+RANGE_DETAIL_CODES = frozenset({'range_not_for_summary', 'range_needs_offsets', 'range_empty'})
 
 
 def failure(value, status):
@@ -45,6 +47,7 @@ def failure(value, status):
     if retry:
         error.detail['retry_after_seconds'] = 2
     detail_code = value.get('detail_code')
-    if code == 'invalid_provider_response' and isinstance(detail_code, str) and detail_code in DETAIL_CODES:
+    allowed = {'invalid_provider_response': DETAIL_CODES, 'invalid_parameters': RANGE_DETAIL_CODES}.get(code, ())
+    if isinstance(detail_code, str) and detail_code in allowed:
         error.detail['detail_code'] = detail_code
     return error

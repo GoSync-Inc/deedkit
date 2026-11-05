@@ -1,8 +1,10 @@
 """ANYM-756: a read of one Telegram chat says when older history may be missing and names the call that loads it.
 
 Synthetic collector fixture and a disposable database only; no provider."""
+import ast
 import asyncio
 import json
+from pathlib import Path
 
 from messaging_service.envelope import stable_id
 from test_collectors import worker as worker
@@ -80,6 +82,28 @@ def test_read_without_coverage_keeps_the_hint(worker):
     asyncio.run(w.sync_once())
     hint = read(s, key, w, '100', include_coverage=False)['history_hint']
     assert hint['reason'] == 'traversal_incomplete' and hint['next_call']['tool'] == 'execute_messenger_operation'
+
+
+# spec: ANYM-763
+def test_messaging_docstrings_name_the_pointer_fields_their_catalog_descriptions_name():
+    root = Path(__file__).resolve().parents[1]
+    catalog = json.loads((root / 'services/gateway/src/agent_gateway/catalog.json').read_text())
+    named = {}
+    for tool in catalog:
+        fields = sorted(f for f in ('history_hint', 'next_call') if f in tool['description'])
+        if tool['module'] == 'messaging' and fields:
+            named[tool['operation']] = fields
+    # The tools checked, by name: a tool added to the catalog with one of these fields fails here until it is listed.
+    assert named == {
+        'get_messages': ['history_hint', 'next_call'], 'get_sync_status': ['history_hint', 'next_call'],
+        'resolve_reference': ['next_call'], 'send_message': ['next_call']}
+    source = (root / 'services/messaging/messaging_service/app.py').read_text()
+    docstrings = {
+        node.name: ast.get_docstring(node) or '' for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and any(ast.unparse(d).startswith('mcp.tool(') for d in node.decorator_list)}
+    missing = {name: [f for f in fields if f not in docstrings.get(name, '')] for name, fields in named.items()}
+    assert not {name: fields for name, fields in missing.items() if fields}
 
 
 # spec: ANYM-756

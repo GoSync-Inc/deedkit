@@ -11,7 +11,7 @@
 
 Status: confirmed by the owner 11-01 («5) я согласен но с копией базы надо только при опасных миграциях при
 ластовых и медиум рисках это не обязательно короче не хочется чтоб это был ботлнек у нас эти бек апы»;
-~/deedkit-orchestrator/DECISIONS.md 11-01). It covers each line below within its cited scope. A part still
+~/deedkit-orchestrator/DECISIONS.md 11-01; its copy rule replaced by owner 11-04, below). It covers each line below within its cited scope. A part still
 marked `proposal` has no owner decision and covers nothing: a question there goes to the owner as a
 `user-data` ask.
 
@@ -45,11 +45,11 @@ volume) (owner 11-03, see Data egress).
   contact cards and other message parts this file does not name: proposal.
 - Pre-migration database copies and backups (ANYM-588, docs/operations/production.md "Migration risk
   tiers" and "Database copies"): only a critical migration (it deletes or rewrites existing rows or
-  drops a table or column) gets a fresh verified backup and a pre-migration copy; any other gets
-  neither, and the latest verified daily backup is its restore point (owner 11-04 «только какие-то
-  быкапы, только в критических случаях», after owner 11-01, quoted in Status, which replaced owner
-  10-28 «добавление миграции автоматически с копией»). A database with no daily backup running keeps its
-  copy (the orchestrator's reading of 11-01: a restore point must exist). Until ANYM-675 ships, the deployer still copies before every unattended migration (its rehearsal
+  drops a table or column) gets a fresh verified backup; any other gets none, and the latest verified
+  daily backup is its restore point (owner 11-04 «только какие-то быкапы, только в критических случаях», «не
+  умру, не умрет никто», which replaced owner 11-01, quoted in Status, and owner 10-28 «добавление миграции
+  автоматически с копией»). A store with no daily backup running keeps a restore point, production.md "Migration
+  releases" item 3 (the orchestrator's reading: a restore point must exist). Until ANYM-675 ships, the deployer still copies before every unattended migration (its rehearsal
   runs on the copy). The copy is plaintext, root-only, on the production host's disk, never leaves the host and is
   deleted after 48 h, whatever its state (the orchestrator's reading of 2026-10-28; a later owner line may
   tighten it). Its receipts hold table names, row counts, sizes, hashes, times and failure codes only.

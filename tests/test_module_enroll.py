@@ -785,8 +785,6 @@ def test_each_reviewed_input_changes_the_plan_digest(tmp_path, monkeypatch, chan
 
 
 IMAGE_ID = "sha256:" + "c" * 64
-NETWORKS = [{"name": "deedkit-recordings-backend", "bridge": "dk-recbackend0", "gateway_port": 13240},
-            {"name": "deedkit-recordings-router", "bridge": "dk-recrouter0"}]
 GATEWAY_IP = "172.30.0.5"
 OVERLAY_EVENTS = ["overlay", "overlay", "network", "network", "tag", "up", "edit:production", "edit:http", "edit:policy",
                   "prepare", "apply", "seamless prepare", "seamless promote", "status", "drift"]
@@ -798,9 +796,7 @@ class Applier(Enroller):
     right after a named event."""
 
     def __init__(self, tmp_path, monkeypatch, **kwargs):
-        def declare(manifest):
-            manifest["project"]["networks"] = NETWORKS
-        super().__init__(tmp_path, monkeypatch, mutate=declare, **kwargs)
+        super().__init__(tmp_path, monkeypatch, **kwargs)  # the manifest as committed, networks included
         from scripts import seamless_release as s
         self.s, self.events, self.triggers, self.failures, self.inputs = s, [], {}, {}, []
         self.http_state, self.tagged, self.networks = tmp_path / "http-state", set(), set()
@@ -1402,9 +1398,12 @@ def test_undo_refuses_without_an_applied_enrollment(tmp_path, monkeypatch):
 # spec: ANYM-746
 def test_the_recordings_manifest_uses_only_keys_the_installed_host_tool_reads_and_the_networks_key_is_optional(tmp_path, monkeypatch):
     # Incident 11-04 (#632): a key the installed tool does not know is a malformed manifest to it, so every deploy paused
-    # with `enroll_required` for the running recordings project. Keys added later reach a host after its tool.
-    assert set(json.loads(RECORDINGS)["project"]) == {"name", "files", "env_file", "env_required", "services"}
-    assert Enroller(tmp_path, monkeypatch).plan()["status"] == "plan"
+    # with `enroll_required` for the running recordings project. A key reaches the manifest after the tool that reads it
+    # is installed on the host: `networks` since b755b45d (installed 11-04 14:43Z), restored by the second PR.
+    installed = {"name", "files", "env_file", "env_required", "services", "networks"}
+    assert set(json.loads(RECORDINGS)["project"]) == installed
+    legacy = Enroller(tmp_path, monkeypatch, mutate=delete_path("project", "networks"))
+    assert legacy.plan()["status"] == "plan"  # a manifest without the optional key still plans
 
 
 # spec: ANYM-746

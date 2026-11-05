@@ -52,8 +52,15 @@ list: release, deploy and `production.py`, sends and live provider-session code.
   as in a migration, is a gated change (process.md section 2), never a `Deletes:` item; only a service-run DELETE of
   rows a card or docs/DATA-POLICY.md names is one.
 
-  A host-tool change still waits for the owner to install it before autodeploy resumes
-  (docs/operations/production.md).
+  A host-tool change reaches the host through the tool's own update; where it cannot, autodeploy
+  pauses until an agent installs it (docs/operations/production.md, "Deploy tool updates").
+
+- A format the installed host tool reads (manifest keys, configuration shape, receipt fields) never gains a required
+  part in the PR that first uses it: the part is optional, or the tool that reads it merges and installs first and the
+  format follows in a second PR. An installed tool reads an unknown key as a malformed file, and the enrollment gate runs
+  before the tool updates itself. Incident 11-04: #632 added a required manifest key and every deploy paused with
+  `enroll_required` for the running recordings module until #638. Enforcer: `test_the_recordings_manifest_uses_only_keys_the_installed_host_tool_reads_and_the_networks_key_is_optional`
+  (tests/test_module_enroll.py), which pins the manifest keys the installed tool reads.
 
 - Autoloop protected paths (docs/operations/feedback-autoloop.md), not a change-path signal: a
   hit keeps an autoloop PR out of the controller merge. This is the one list; it covers the

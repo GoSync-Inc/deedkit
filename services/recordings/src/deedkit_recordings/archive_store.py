@@ -21,6 +21,12 @@ HEADROOM = 64 * 1024 ** 2
 QUEUE_LIMIT = 10000
 HEAD_SLICE = 100
 FAR = 1e18  # `due` of a record that waits for a changed list fingerprint instead of a clock
+WEEK = 7 * 86400  # a provider_missing Omi record is checked (without a transcript) at most this often
+DAY = 86400  # `response_too_large` backs off this long: the same body will not shrink within the hour
+# An Omi record that answered 404 twice in a row (merged away, deleted or locked) is `provider_missing`: its stored text
+# stays (docs/DATA-POLICY.md), it costs no transcript read, and a list row with its ID makes it due again. The mark is
+# the parts' `attempt_state`, so no schema change is needed.
+MISSING = "CASE WHEN json_valid(parts) THEN json_extract(parts,'$.transcript.attempt_state')='provider_missing' ELSE 0 END"
 WINDOW = 3600
 SLACK = 75  # dispatch drift inside one pass (60 s) plus a provider timeout: never reuse a call that may still count
 APPLICATION_ID = 0x444B5243
@@ -169,6 +175,17 @@ def provider_of(account):
     return account['provider'] if isinstance(account, dict) else account.provider
 
 
+def provider_missing(parts):
+    """True for the parts of a provider_missing record; a stored document that does not parse is not one."""
+    if isinstance(parts, str):
+        try:
+            parts = loads(parts)
+        except (ValueError, TypeError, UnicodeError, RecursionError):
+            return False
+    return isinstance(parts, dict) and isinstance(parts.get('transcript'), dict) and \
+        parts['transcript'].get('attempt_state') == 'provider_missing'
+
+
 def pending_gap(metadata, now):
     """Seconds until a record with a pending part may be read again: 3 h in the first day, daily to 14 days, then never."""
     created = metadata.get('created_at')
@@ -200,6 +217,18 @@ def title_of(metadata):
 SECONDS_2000, SECONDS_2101 = 946684800, 4133980800
 SPEAKER_KEYS = ('speaker_name', 'speaker_id', 'speaker')  # the order omi.content and the PLAUD projection use
 TRANSCRIPT_KEYS = frozenset(('text', 'content', 'speaker', 'speaker_name', 'speaker_id', 'start', 'end', 'start_time', 'end_time'))
+
+
+def utterance(row):
+    """True for a stored transcript object: only known keys, and `placed` only as omi.content's unplaced marker
+    (`false` with null offsets). Any other object is ordinary text and stays searchable as it is."""
+    if not isinstance(row, dict):
+        return False
+    if 'placed' in row:
+        if not (row['placed'] is False and row.get('start') is None and row.get('end') is None):
+            return False
+        row = {key: value for key, value in row.items() if key != 'placed'}
+    return set(row) <= TRANSCRIPT_KEYS
 
 
 def utc_text(moment):
@@ -267,7 +296,7 @@ def plain_text(kind, text):
             except (ValueError, RecursionError):
                 row = None  # not an utterance object (or too deeply nested to be one): ordinary text
         if kind == 'transcript':
-            body = row.get('text', row.get('content')) if isinstance(row, dict) and set(row) <= TRANSCRIPT_KEYS else None
+            body = row.get('text', row.get('content')) if utterance(row) else None
         else:
             body = row['text'] if isinstance(row, dict) and set(row) == {'type', 'text'} else None
         if not isinstance(body, str) or not encodable(body):
@@ -555,7 +584,10 @@ class Store:
 
     def refresh(self, db, ns, row, item, fingerprint, now):
         """A listed row of a known record: a changed fingerprint makes a saved record due; a changed title updates the
-        stored title and index in place (no provider call, no text-change event)."""
+        stored title and index in place (no provider call, no text-change event). A provider_missing record whose ID is
+        listed again is due now."""
+        if provider_missing(row['parts']):
+            self.reactivate(db, row['ref'], loads(row['parts']), now)
         if fingerprint is not None and row['fingerprint'] != fingerprint:
             # A record saved before schema 3 has no fingerprint yet: remember it without a re-read.
             if row['fingerprint'] is not None and row['attempted'] is not None and not row['failures']:
@@ -573,6 +605,31 @@ class Store:
             revision = row['revision'] + int(row['revision'] > 0)
             db.execute('UPDATE records SET metadata=?,revision=?  WHERE ref=?', (canonical(stored).decode(), revision, row['ref']))
             self.put_text(db, ns, row['rid'], row['ref'], stored, parts, revision)
+
+    @staticmethod
+    def reactivate(db, ref, parts, now):
+        """Clear the provider_missing mark (text untouched): the next pass reads the record in full."""
+        for part in parts.values():
+            if isinstance(part, dict) and part.get('attempt_state') == 'provider_missing':
+                part.update(attempt_state=None, attempt_error=None)
+        db.execute('UPDATE records SET parts=?,due=?,failures=0 WHERE ref=?', (canonical(parts).decode(), now, ref))
+
+    def probe(self, account, provider_id, result, now, guard=lambda: None):
+        """The weekly check of a provider_missing Omi record, made without a transcript. `found`: due now for a full
+        read; anything else (404, timeout, outage, a malformed answer): checked again in a week, never sooner."""
+        ns = namespace(account)
+        def change(db):
+            row = db.execute('SELECT * FROM records WHERE namespace=? AND provider_id=?', (ns, provider_id)).fetchone()
+            if row is None:
+                raise Failure('archive_unavailable')
+            parts = loads(row['parts'])
+            if not provider_missing(parts):
+                return
+            if result == 'found':
+                self.reactivate(db, row['ref'], parts, now)
+            else:
+                db.execute('UPDATE records SET attempted=?,due=? WHERE ref=?', (now, now + WEEK, row['ref']))
+        self.write(change, guard)
 
     @staticmethod
     def index_mode(db):
@@ -842,11 +899,12 @@ class Store:
         return self.ledger_change(credential, [(bucket, None) for bucket in buckets], now, False)
 
     def work(self, account, now, limit=8, guard=lambda: None):
-        return [ident for ident, _ in self.work_items(account, now, limit, guard)]
+        return [ident for ident, *_ in self.work_items(account, now, limit, guard)]
 
     def work_items(self, account, now, limit=8, guard=lambda: None, rotate=True):
-        """Provider ids to read now with a `fresh` flag. Omi: never-fetched records newest first (last 24 h ahead of the
-        backlog), then failed records by backoff, then records waiting on a pending part or a changed list row.
+        """Provider ids to read now with `fresh` and `probe` flags. Omi: never-fetched records newest first (last 24 h ahead
+        of the backlog), then failed records by backoff, then records waiting on a pending part or a changed list row and
+        the weekly checks of provider_missing records (`probe`: no transcript).
         PLAUD keeps its earlier due-time order and hourly revisit."""
         ns = namespace(account)
         omi = provider_of(account) == 'omi'
@@ -863,9 +921,10 @@ class Store:
                     rows = db.execute(f'SELECT provider_id,{created}>=? AS fresh FROM records WHERE namespace=? AND due<=? AND '
                         + condition + f' ORDER BY (CASE WHEN {created}>=? THEN 0 ELSE 1 END),{created} DESC,rowid LIMIT ?',
                         (cutoff, ns, now, cutoff, budget)).fetchall()
-                    groups.append([(row[0], bool(row[1])) for row in rows])
+                    groups.append([(row[0], bool(row[1]), False) for row in rows])
                 else:
-                    groups.append([(row[0], False) for row in db.execute('SELECT provider_id FROM records WHERE namespace=? AND due<=? AND ' + condition +
+                    groups.append([(row[0], False, omi and bool(row[1])) for row in db.execute(
+                        f'SELECT provider_id,COALESCE({MISSING},0) FROM records WHERE namespace=? AND due<=? AND ' + condition +
                         ' ORDER BY due,ref LIMIT ?', (ns, now, budget))])
             # Persist priority before execution: even a pass interrupted after
             # its first slow record serves another class on its next attempt. A caller that may be denied
@@ -900,6 +959,7 @@ class Store:
             if row is None:
                 raise Failure('archive_unavailable')
             parts, usable_change = loads(row['parts']), False
+            previous = {kind: part.get('attempt_error') for kind, part in parts.items() if isinstance(part, dict)}
             text_before = sum(len(p.get('text', '').encode()) for p in parts.values())
             failed = False
             for kind, observation in observations.items():
@@ -920,13 +980,21 @@ class Store:
                 raise Failure('archive_content_limit')
             body = canonical(metadata).decode()
             revision = row['revision'] + int(usable_change or (row['revision'] > 0 and body != row['metadata']))
+            error = next((o[2] for o in observations.values() if o[2]), None)
             if provider_of(account) == 'omi':
                 # Only a failed read backs off; a part that is still pending waits on a bounded schedule, and a
                 # complete record waits for a changed list row. Nothing is re-read hourly.
+                codes = {o[2] for o in observations.values()}
                 failures = min(row['failures'] + 1, 10) if 'error' in states else 0
                 gap = pending_gap(metadata, now) if failures == 0 and failed else None
-                due = (now + min(3600, 60 * 2 ** (failures - 1)) if failures else
+                due = (now + (DAY if 'response_too_large' in codes else min(3600, 60 * 2 ** (failures - 1))) if failures else
                        now + gap if gap else FAR)
+                if codes == {'not_found_or_forbidden'} and row['failures'] > 0 and \
+                        all(previous.get(kind) == 'not_found_or_forbidden' for kind in observations):
+                    # The second 404 in a row: gone at the provider (merged away, deleted or locked). Kept, not retried.
+                    for kind in observations:
+                        parts[kind]['attempt_state'] = 'provider_missing'
+                    failures, due, error = 0, now + WEEK, None
             else:
                 failures = min(row['failures'] + 1, 10) if failed else 0
                 due = now + min(3600, 60 * 2 ** (failures - 1)) if failed else now + 3600
@@ -942,7 +1010,7 @@ class Store:
             db.execute('UPDATE accounts SET last_success=COALESCE(?,last_success),error=?,text_bytes=MAX(0,text_bytes+?) '
                        'WHERE namespace=?',
                 (now if any(o[0] == 'available' for o in observations.values()) else None,
-                 next((o[2] for o in observations.values() if o[2]), None), text_after - text_before, ns))
+                 error, text_after - text_before, ns))
         self.write(change, guard)
         self.feed_handled.update(trial)  # only a committed bump counts as handled
 
@@ -958,7 +1026,8 @@ class Store:
         with self.connection() as db:
             row = db.execute('SELECT * FROM accounts WHERE namespace=?', (ns,)).fetchone()
             counts = db.execute('SELECT count(*),sum(attempted IS NULL),sum(failures>0),sum(revision>0),'
-                                'sum(attempted IS NOT NULL AND failures=0 AND due<?) FROM records WHERE namespace=?',
+                                f'sum(attempted IS NOT NULL AND failures=0 AND due<? AND NOT COALESCE({MISSING},0)),'
+                                f'sum(COALESCE({MISSING},0)) FROM records WHERE namespace=?',
                                 (FAR / 10, ns)).fetchone()
             result = {'coverage':'unknown', 'record_count':counts[0], 'queued_count':counts[1] or 0,
                       'retry_count':counts[2] or 0, 'last_success':row['last_success'] if row else None,
@@ -1014,7 +1083,7 @@ class Store:
             result.update(
                 traversal={'state': state, 'discovered_total': total, 'passes_completed': row['passes_completed'] if row else 0,
                            'last_page_at': row['last_page_at'] if row else None},
-                with_text=with_text, queued=queued, pending=pending, failed=failed,
+                with_text=with_text, queued=queued, pending=pending, failed=failed, provider_missing=counts[5] or 0,
                 throttled_until=throttled if throttled is not None and throttled > now else None,
                 usage=usage, db_bytes=sum(path.stat().st_size for path in self.files()),
                 bytes_ceiling=self.settings.max_bytes, projected_db_bytes=projected,

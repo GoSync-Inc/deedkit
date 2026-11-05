@@ -38,6 +38,9 @@ EXPECTED_EXTRA_FIELDS = {
     'get_labels': {'limit', 'offset'},
     'get_reactions': {'limit', 'offset'},
 }
+# Field names the Python catalog publishes for WhatsApp and the Go and JS tables lack, on purpose (ANYM-755 criterion 4):
+# validate_operation drops a default and commands._edit_artifact refuses any other value, so no adapter receives them.
+EXPECTED_PYTHON_ONLY_FIELDS = {'edit_message': {'format', 'link_preview', 'allow_lossy'}}
 # Operations whose raw OPERATIONS[name]['fields'] differ from the per-platform fields the manifest publishes
 # (_fields overrides them); deriving PARAMETERS from the raw field table would change these five.
 EXPECTED_RAW_FIELD_OVERRIDES = {'list_contacts', 'pin_message', 'request_chat_history', 'send_contact', 'update_profile'}
@@ -125,8 +128,9 @@ def test_go_and_js_fields_equal_the_python_whatsapp_fields_but_the_listed_extras
     go, js = _go_fields(), _js_fields()
     assert _extra_fields(go, python) == EXPECTED_EXTRA_FIELDS
     assert _extra_fields(js, python) == EXPECTED_EXTRA_FIELDS
-    # Python never defines a field the other copies lack.
-    assert {name: python[name] - copy[name] for copy in (go, js) for name in copy if python[name] - copy[name]} == {}
+    # Python defines no field the other copies lack, but the listed ones its server refuses before any adapter.
+    assert {name: python[name] - copy[name] for copy in (go, js) for name in copy
+            if python[name] - copy[name]} == EXPECTED_PYTHON_ONLY_FIELDS
     # update_profile and send_contact are the per-platform renames: the manifest, not the raw spec, equals Go and JS.
     assert go['update_profile'] == js['update_profile'] == python['update_profile'] == {'name', 'status'}
     assert go['send_contact'] == js['send_contact'] == python['send_contact'] == {'contact_ids'}
@@ -161,7 +165,8 @@ def test_raw_field_table_differs_from_published_fields_only_for_the_listed_overr
     assert differing == EXPECTED_RAW_FIELD_OVERRIDES
     whatsapp = {name for name, spec in ops.OPERATIONS.items() if 'whatsapp' in spec['platforms']
                 and set(spec['fields']) != _go_fields()[name]}
-    assert whatsapp == (EXPECTED_RAW_FIELD_OVERRIDES & {'send_contact', 'update_profile'}) | set(EXPECTED_EXTRA_FIELDS)
+    assert whatsapp == ((EXPECTED_RAW_FIELD_OVERRIDES & {'send_contact', 'update_profile'}) | set(EXPECTED_EXTRA_FIELDS)
+                        | set(EXPECTED_PYTHON_ONLY_FIELDS))
 
 
 # spec: ANYM-286
