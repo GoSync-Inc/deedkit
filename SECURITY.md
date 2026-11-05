@@ -64,7 +64,10 @@ like any extracted text. Runbook and rotation:
 
 Agent sessions: reading container environments (ANYM-774). A session transcript goes to the model provider, so the
 PreToolUse hook `.claude/hooks/block-secret-env-reads.sh` refuses Bash commands that print secret-bearing environment,
-and refuses when it cannot decide. Blocked, also inside `ssh`, `sudo`, `bash -c`, a pipe or `$(...)`: `docker inspect`
+and refuses when it cannot decide. The threat is an agent's accidental read while diagnosing; a deliberate bypass is out
+of scope. The hook does not parse shell: it matches the raw text with quotes dropped, and refuses syntax it does not read
+(`${...}`, arithmetic, `eval`, `env -S`, a decode step) on a line that holds a guarded name. False refusals are accepted,
+and the refusal names the allowed way, including passing prose through a file. Blocked, also inside `ssh`, `sudo`, `bash -c`, a pipe or `$(...)`: `docker inspect`
 without a template, with any `--format=`/`-f=` form, or with a template that reads `.Config`, `.Spec` or the whole
 object; `docker compose config` unless it has `--no-env-resolution` or is limited by `--services`, `--images`, `--hash`,
 `--quiet` or `--volumes`, and always with `--environment`; `env`, `printenv`, `set` or `export` directly or through
@@ -74,6 +77,6 @@ object; `docker compose config` unless it has `--no-env-resolution` or is limite
 `docker inspect --format '<template>'` limited to `.State`, `.Name`, `.Image`, `.RestartCount` or `.Created`; `docker
 compose config --no-env-resolution`; a key-names read through the orchestrator. Limits: it covers sessions started in
 this repository or its worktrees; it does not cover the orchestrator, other projects or a determined bypass (encoding,
-a script that prints the file, a path held in a variable). `--no-env-resolution` keeps `env_file` values out but still
+a script that prints the file, a path or command name held in a variable). `--no-env-resolution` keeps `env_file` values out but still
 prints values Compose interpolates into the document (`${VAR}` from a project `.env`; probed on Compose 5.5.0). The
 durable fix is secrets as files, not environment variables, which is a separate decision.

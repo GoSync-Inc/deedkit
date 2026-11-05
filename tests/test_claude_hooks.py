@@ -68,6 +68,9 @@ BLOCKED = [
     "printenv SECRET_NAME",
     "set",
     "env | grep NAME",
+    "env -u NAME",
+    "env A=1",
+    "env -i",
     "cat .env",
     "cat deploy/private/postgres.env",
     "less a.env",
@@ -152,12 +155,10 @@ ALLOWED = [
     "docker compose config --quiet",
     "docker compose config --volumes",
     "docker exec c ls /app",
-    "docker exec -it c ls env",
     'git commit -m "env"',
     'git commit -m "docker inspect c and printenv"',
     "ls /usr/bin/printenv",
     "echo printenv",
-    "command -v env",
     "cat <<EOF >> .env\nA=1\nEOF",
     "cat > a.env",
     "cat .env.example",
@@ -166,31 +167,40 @@ ALLOWED = [
     "grep -e .key a.py",
     "grep -r NAME --exclude=*.env .",
     "set -euo pipefail",
+    "env -i HOME=/x PATH=/bin a.sh",
+    "docker image inspect -f '{{index .Config.Labels \"a\"}}' i",
+    "grep -E '((a|b)Dockerfile)' x",
     "set -- a b",
     'run env PROBE_TEST_DSN_FILE="$RUN_DIR/test-1.dsn" uv run pytest "$@"',
     'env PROBE_TEST_DSN_FILE="$RUN_DIR/test-1.dsn" uv run pytest "$@"',
     "systemctl show -P ActiveState unit",
     "systemctl show -p ActiveState,UnitFileState unit",
     "systemctl show --property=Id unit",
-    "case $1 in env) echo one;; set) echo two;; esac",
     "for name in env set; do echo $name; done",
     "gh pr create --body \"$(cat <<'EOF'\nIt's a body: docker inspect c, printenv (and cat .env)\nEOF\n)\"",
     "# printenv\nls",
-    "cat <<\\EOF\n$(printenv)\nEOF",
-    "case x in (env|x) echo ok;; esac",
     "rg --files -g '*.env'",
     "docker inspect -f'{{.State.Status}}' c",
-    "docker exec -u root c ls env",
     "(( n = 1 << 2 ))\nls",
+    "echo $(( (1 + 2) * 3 ))",
+    "echo $((1 << 2))",
+    "for x in a; do case $x in env) ls;; esac; done",
+    "python -m messaging_service key-info --key-file /dev/stdin < /private/a.token",
+]
+
+# Harmless, and refused on purpose: the guard reads raw text, and a false refusal is the accepted cost (ANYM-774, SECURITY.md).
+ACCEPTED_FALSE_REFUSALS = [
+    "docker exec -it c ls env",
+    "command -v env",
+    "case $1 in env) echo one;; set) echo two;; esac",
+    "cat <<\\EOF\n$(printenv)\nEOF",
+    "case x in (env|x) echo ok;; esac",
+    "docker exec -u root c ls env",
     "((printenv))",
     "docker compose config --environment=false --services",
     "x=${y:-env}",
     "env -S echo '$(printenv)'",
-    "echo $(( (1 + 2) * 3 ))",
-    "echo $((1 << 2))",
-    "for x in a; do case $x in env) ls;; esac; done",
     "if true; then case $x in set|env) ls ;; esac; fi",
-    "python -m messaging_service key-info --key-file /dev/stdin < /private/a.token",
 ]
 
 SUBSTITUTED = [
@@ -292,6 +302,13 @@ def test_allowed_command_exits_0(command):
 
 
 # spec: ANYM-774
+@pytest.mark.parametrize("command", ACCEPTED_FALSE_REFUSALS)
+def test_a_harmless_command_near_a_guarded_name_is_refused_and_the_text_names_the_way_out(command):
+    done = run_hook(call(command))
+    assert done.returncode == 2 and b"git commit -F" in done.stderr
+
+
+# spec: ANYM-774
 @pytest.mark.parametrize("stdin", [b"", b"{", b"[]", b"\xff", b"{}", b'{"tool_input": {}}', b'{"tool_input": {"command": 1}}',
                                    b'{"tool_input": {"command": ""}}'])
 def test_bad_input_fails_closed(stdin):
@@ -306,11 +323,6 @@ def test_a_command_of_1_mb_fails_closed():
 # spec: ANYM-774
 def test_a_large_ordinary_command_is_still_read():
     assert run_hook(call("echo " + "word " * 40_000)).returncode == 0
-
-
-# spec: ANYM-774
-def test_deep_nesting_fails_closed():
-    assert matcher().decide(call("echo " + "$(" * 200 + "ls" + ")" * 200).encode())[0] == 2
 
 
 # spec: ANYM-774
@@ -365,7 +377,7 @@ def test_refusal_names_why_and_safe_forms_and_never_echoes_the_command():
     text = done.stderr.decode()
     assert done.returncode == 2 and CANARY not in text and len(text.strip().splitlines()) == 1
     for part in ("model provider", ".State", ".Name", ".Image", ".RestartCount", ".Created", "--no-env-resolution",
-                 "orchestrator"):
+                 "orchestrator", "git commit -F", "gh --body-file"):
         assert part in text
 
 
@@ -373,8 +385,9 @@ def test_refusal_names_why_and_safe_forms_and_never_echoes_the_command():
 def test_security_document_names_the_hook_and_its_limits():
     text = SECURITY_FILE.read_text()
     start = text.index("Agent sessions: reading container environments")
-    paragraph = text[start:]
-    for part in (".claude/hooks/block-secret-env-reads.sh", "worktrees", "orchestrator", "other projects", "secrets as files"):
+    paragraph = " ".join(text[start:].split())
+    for part in (".claude/hooks/block-secret-env-reads.sh", "worktrees", "orchestrator", "other projects", "secrets as files",
+                 "accidental", "out of scope", "False refusals"):
         assert part in paragraph
 
 
@@ -394,7 +407,8 @@ def test_no_document_prescribes_a_blocked_command():
     module = matcher()
     listing = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z", "*.md"], check=True, capture_output=True, text=True)
     found = []
-    # A docs-only change stays docs-only (ANYM-767): the main push run checks every document, so this names one, not `.`.
+    # Criterion 6a checks every *.md. Naming them all would end the docs-only skip (ANYM-767), so a docs-only PR that adds
+    # a blocked command fails only on the main push run: the open major named in the PR. This comment names one document.
     # reads: docs/operations/production.md
     for name in filter(None, listing.stdout.split("\0")):
         path = ROOT / name
@@ -406,9 +420,9 @@ def test_no_document_prescribes_a_blocked_command():
 
 # spec: ANYM-774
 @settings(max_examples=200, deadline=None)
-@given(st.text(max_size=200))
-def test_any_text_as_a_quoted_argument_of_a_plain_command_is_data(text):
-    assert not matcher().is_blocked(f"git commit -m {shlex.quote(text)}")
+@given(st.text(alphabet="abcdefghijklmnopqrstuvwxyz .,-", max_size=200))
+def test_any_message_without_a_separator_is_data_to_a_command_that_runs_nothing(message):
+    assert not matcher().is_blocked(f"git commit -m {shlex.quote(message)}")
 
 
 # spec: ANYM-774
@@ -418,13 +432,6 @@ def test_any_stack_of_wrappers_keeps_a_blocked_command_blocked(command, stack):
     for wrapper in stack:
         command = WRAPPERS[wrapper](command)
     assert matcher().is_blocked(command)
-
-
-# spec: ANYM-774
-@settings(max_examples=200, deadline=None)
-@given(st.lists(st.text(max_size=40).filter(lambda line: "EOF" not in line and "\n" not in line and "\r" not in line), max_size=5))
-def test_any_quoted_heredoc_body_of_a_plain_reader_is_data(lines):
-    assert not matcher().is_blocked("cat <<'EOF'\n" + "\n".join(lines) + "\nEOF\n")
 
 
 # spec: ANYM-774
