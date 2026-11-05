@@ -1,12 +1,104 @@
 """A delivery the receiver refuses as busy (its own verifier holds the upload lock) waits instead of failing."""
+from contextlib import contextmanager
 import json
+import os
+from pathlib import Path
 
 import pytest
 
 from messaging_service import backup_runner
 from messaging_service.backup_runner import read_json
+from test_backup_calendar_runner import calendar_cfg, hold, run_main
 from test_backup_operations import runner_fixture
 from test_backup_streaming import streaming_runner
+
+
+def rotation_host(tmp_path, monkeypatch):
+    """The real `main` of a calendar run on real locks; the capture is replaced by a record that it started."""
+    cfg = calendar_cfg(tmp_path)
+    Path(cfg['directory']).mkdir(mode=0o700)
+    Path(cfg['host_lock']).parent.mkdir(mode=0o700)
+    path = tmp_path / 'runner.json'
+    path.write_text(json.dumps(cfg))
+    started = []
+    monkeypatch.setattr(backup_runner.Runner, 'run', lambda self: started.append('run'))
+    monkeypatch.setattr(backup_runner.Runner, 'recover_stop', lambda self: started.append('recover_stop'))
+    monkeypatch.delenv('DEEDKIT_ROTATION_BACKUP_TOKEN', raising=False)
+    marker = Path(cfg['directory']).parent / 'rotation' / 'rotation.unsettled'
+    marker.parent.mkdir(mode=0o700)
+    return cfg, path, marker, started
+
+
+# spec: ANYM-784
+@pytest.mark.parametrize('phase', ['staged', 'altered', 'files', 'verifying', 'finished'])
+def test_a_rotation_marker_refuses_a_calendar_run_in_every_phase(tmp_path, monkeypatch, capsys, phase):
+    cfg, path, marker, started = rotation_host(tmp_path, monkeypatch)
+    marker.write_text(json.dumps({'phase': phase, 'backup_token': 'the-tools-own'}))
+    assert run_main(monkeypatch, '--config', str(path)) == 1
+    assert started == [] and json.loads(capsys.readouterr().out) == {'status': 'error', 'code': 'rotation_in_progress'}
+    assert read_json(Path(cfg['directory']) / 'status.json')['error_code'] == 'rotation_in_progress'
+    # The first read, before any lock: a refused run does not wait an hour for messaging's lock.
+    assert not os.path.exists(cfg['host_lock']) and not os.path.exists(Path(cfg['directory']) / '.runner.lock')
+
+
+# spec: ANYM-784
+@pytest.mark.parametrize('phase, token, admitted', [
+    ('staged', 'the-tools-own', False), ('altered', 'the-tools-own', False), ('files', 'the-tools-own', False),
+    ('verifying', 'the-tools-own', True), ('verifying', 'another', False), ('finished', 'the-tools-own', False)])
+def test_only_the_tools_own_run_passes_and_only_in_verifying(tmp_path, monkeypatch, phase, token, admitted):
+    cfg, path, marker, started = rotation_host(tmp_path, monkeypatch)
+    marker.write_text(json.dumps({'phase': phase, 'backup_token': 'the-tools-own'}))
+    monkeypatch.setenv('DEEDKIT_ROTATION_BACKUP_TOKEN', token)
+    assert run_main(monkeypatch, '--config', str(path)) == (0 if admitted else 1)
+    assert started == (['run'] if admitted else [])
+
+
+# spec: ANYM-784
+@pytest.mark.parametrize('content', ['', 'not json', '[]'])
+def test_a_marker_that_cannot_be_read_refuses(tmp_path, monkeypatch, content):
+    _, path, marker, started = rotation_host(tmp_path, monkeypatch)
+    marker.write_text(content)
+    monkeypatch.setenv('DEEDKIT_ROTATION_BACKUP_TOKEN', 'the-tools-own')
+    assert run_main(monkeypatch, '--config', str(path)) == 1 and started == []
+
+
+# spec: ANYM-784
+def test_a_marker_written_during_the_lock_wait_refuses_with_the_locks_held(tmp_path, monkeypatch):
+    """The second read: the run passed the first one and then waited for messaging's lock while the tool wrote."""
+    cfg, path, marker, started = rotation_host(tmp_path, monkeypatch)
+    real = backup_runner.hold_locks
+
+    @contextmanager
+    def waited(*args, **kwargs):
+        with real(*args, **kwargs):
+            marker.write_text(json.dumps({'phase': 'staged'}))
+            yield
+    monkeypatch.setattr(backup_runner, 'hold_locks', waited)
+    assert run_main(monkeypatch, '--config', str(path)) == 1 and started == []
+
+
+# spec: ANYM-784
+def test_a_rotation_stops_no_recovery_and_no_other_profile(tmp_path, monkeypatch):
+    cfg, path, marker, started = rotation_host(tmp_path, monkeypatch)
+    marker.write_text(json.dumps({'phase': 'staged'}))
+    assert run_main(monkeypatch, '--config', str(path), '--recover-stop') == 0 and started == ['recover_stop']
+    backup_runner.rotation_admission({'profile': 'messaging', 'directory': cfg['directory']})
+    backup_runner.rotation_admission({'profile': 'recordings', 'directory': cfg['directory']})
+    marker.unlink()
+    assert run_main(monkeypatch, '--config', str(path)) == 0 and started == ['recover_stop', 'run']
+
+
+# spec: ANYM-784
+def test_a_tool_holding_the_locks_keeps_a_calendar_run_out_even_with_a_token(tmp_path, monkeypatch):
+    cfg, path, marker, started = rotation_host(tmp_path, monkeypatch)
+    marker.write_text(json.dumps({'phase': 'verifying', 'backup_token': 'the-tools-own'}))
+    monkeypatch.setenv('DEEDKIT_ROTATION_BACKUP_TOKEN', 'the-tools-own')
+    fd = hold(Path(cfg['directory']) / '.runner.lock')
+    try:
+        assert run_main(monkeypatch, '--config', str(path)) == 1 and started == []
+    finally:
+        os.close(fd)
+    assert run_main(monkeypatch, '--config', str(path)) == 0 and started == ['run']
 
 
 def fake_time(runner):
