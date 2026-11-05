@@ -131,6 +131,23 @@ lazy processing; its GET omits `processing_deferred`), older it is `empty`.
 Omi raw audio is `unsupported`: its Developer API documents no download route.
 The service does not invent one.
 
+An Omi transcript read also takes optional `from_seconds` and `to_seconds` (ANYM-770;
+numbers from 0 to 1e6, offsets in the recording; one alone is open-ended), for example
+`{"account":"omi-a","recording_id":"...","from_seconds":3600,"to_seconds":4200}`.
+Only segments fully inside are returned (`start >= from_seconds`, `end <= to_seconds`):
+a segment has no word timestamps, so one crossing a bound is left out and counted in
+`excluded_edge_segments`. A segment that cannot be placed (a missing offset, the
+unplaced sentinel, `start` after `end`) is left out uncounted. `text`, `source_digest`,
+`offset` and `complete` describe the filtered text, the cursor is bound to the range,
+and `recording` omits `title` and `title_truncated`. No match is `content_state: empty`.
+The range limits what leaves the service, not what the provider returns to it: the same
+single `GET` reads the whole conversation (Omi's API has no time filter for one
+conversation), and excluded text is not returned, cached or logged. Refusals are
+`invalid_parameters` with a `detail_code`, relayed by the gateway: `range_empty`
+(`from_seconds >= to_seconds`), `range_not_for_summary`, and `range_needs_offsets` (no
+segment placed at or after 0, or any PLAUD account). Without the two arguments the read
+is unchanged.
+
 Continuations last 15 minutes, are authenticated and bound to credential,
 provider account/token identity, operation and exact arguments. They are encoded,
 not encrypted; do not log or share them. They confer no access on their own.

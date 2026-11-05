@@ -84,3 +84,45 @@ def test_gateway_relays_only_allowlisted_detail_codes(body,expected):
     detail=failure(body,503).detail
     assert set(detail)<={'error','retryable','next_action','retry_after_seconds','detail_code'}
     assert detail.get('detail_code')==expected and 'private' not in json.dumps(detail)
+
+
+# spec: ANYM-770
+@pytest.mark.parametrize('arguments,segments,detail',[
+    ({'from_seconds':5,'to_seconds':5},[],'range_empty'),
+    ({'kind':'summary','to_seconds':5},[],'range_not_for_summary'),
+    ({'from_seconds':1},[{'text':'private segment'}],'range_needs_offsets')])
+def test_range_detail_code_reaches_the_agent_through_the_gateway(tmp_path,arguments,segments,detail):
+    from deedkit_recordings.app import create_app
+    def private(name,text):
+        path=tmp_path/name
+        path.write_text(text)
+        path.chmod(0o600)
+        return str(path)
+    value={'version':1,'cursor_secret_file':private('secret','x'*64),
+      'accounts':[{'id':'omi-a','provider':'omi','label':'Synthetic','token_file':private('token','synthetic-omi-token')}],
+      'principals':[{'id':'a','key_sha256':hashlib.sha256(b'synthetic-recordings').hexdigest(),
+        'expires_at':'2099-01-01T00:00:00Z','accounts':['omi-a'],
+        'permissions':['recordings:read','recordings:content']}]}
+    def provider(request):
+        return httpx.Response(200,json={'id':'conv-a','transcript_included':True,'transcript_segments':segments})
+    backend=create_app(private('recordings.json',json.dumps(value)),transport=httpx.MockTransport(provider))
+    app,_=setup(tmp_path,backend_app=backend)
+    with TestClient(app) as client:
+        result=rpc(client,'tools/call',{'name':'recordings_read','arguments':{
+            'account':'omi-a','recording_id':'conv-a',**arguments}}).json()['result']
+        assert result['isError']
+        assert result['structuredContent']=={'error':'invalid_parameters','retryable':False,
+            'next_action':'correct_arguments','detail_code':detail}
+        assert 'private' not in json.dumps(result)
+
+
+# spec: ANYM-770
+@pytest.mark.parametrize('body,expected',[
+    ({'error':'invalid_parameters','detail_code':'range_empty'},'range_empty'),
+    ({'error':'invalid_parameters','detail_code':'segment_offset'},None),
+    ({'error':'invalid_parameters','detail_code':'private value'},None),
+    ({'error':'invalid_provider_response','detail_code':'range_empty'},None)])
+def test_gateway_relays_range_codes_only_for_invalid_parameters(body,expected):
+    from agent_gateway.recordings_errors import RANGE_DETAIL_CODES, failure
+    assert RANGE_DETAIL_CODES==frozenset({'range_not_for_summary','range_needs_offsets','range_empty'})
+    assert failure(body,422).detail.get('detail_code')==expected
