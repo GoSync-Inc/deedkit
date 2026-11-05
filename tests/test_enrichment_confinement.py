@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 
+from hypothesis import given, strategies as st
 import psycopg
 import pytest
 
@@ -443,7 +444,7 @@ def test_confinement_lost_after_a_database_error_still_ends_the_worker_before_th
 # spec: ANYM-688
 def test_the_confinement_monitor_ends_a_database_backoff_at_once(stop_state, monkeypatch):
     fake = Fake()
-    monkeypatch.setattr(enrichment, 'DB_RETRY_SECONDS', 60)
+    monkeypatch.setattr(enrichment, 'DB_RETRY_SECONDS', 60, raising=False)
 
     def lost_then_timeout():
         fake.open_ports.add(('1.1.1.1', 443))
@@ -477,6 +478,42 @@ def test_a_database_error_that_is_not_transient_still_ends_the_worker(waits):
         worker.run()
     assert worker.calls == ['publish', 'once', 'unpublish']
     assert waits == []
+
+
+# spec: ANYM-688
+@pytest.mark.parametrize('error', [
+    psycopg.errors.InvalidPassword('synthetic'), psycopg.errors.ConfigFileError('synthetic'),
+    psycopg.OperationalError('connection is bad: FATAL:  password authentication failed for user "synthetic"'),
+    psycopg.OperationalError('connection is bad: FATAL:  no pg_hba.conf entry for host "192.0.2.1"'),
+], ids=['InvalidPassword', 'ConfigFileError', 'password_text', 'hba_text'])
+def test_a_permanent_database_failure_still_ends_the_worker(waits, error):
+    worker = Flaky([error])
+    with pytest.raises(psycopg.OperationalError):
+        worker.run()
+    assert worker.calls == ['publish', 'once', 'unpublish']
+    assert waits == []
+
+
+def coded_operational_errors(parent=psycopg.OperationalError):
+    for child in parent.__subclasses__():
+        yield child
+        yield from coded_operational_errors(child)
+
+
+# spec: ANYM-688
+def test_an_operational_error_outside_the_transient_list_is_fatal_whatever_its_sqlstate():
+    coded = {kind for kind in coded_operational_errors() if kind.sqlstate}
+    assert set(enrichment.DB_TRANSIENT) < coded          # the list names real classes, and not all of them
+    for kind in coded:
+        assert enrichment.transient_database_error(kind('synthetic')) is (kind in enrichment.DB_TRANSIENT)
+
+
+# spec: ANYM-688
+@given(st.text().filter(lambda text: not any(marker in text for marker in enrichment.DB_LOGIN_REFUSED)),
+       st.sampled_from(enrichment.DB_LOGIN_REFUSED), st.text())
+def test_a_connection_failure_is_transient_exactly_when_its_text_names_no_refused_login(before, marker, after):
+    assert enrichment.transient_database_error(psycopg.OperationalError(before))
+    assert not enrichment.transient_database_error(psycopg.OperationalError(before + marker + after))
 
 
 def mini_config(tmp_path, blocked=None):

@@ -254,6 +254,13 @@ def test_enricher_mini_has_a_tmpfs_for_a_200_mib_original_and_the_others_keep_12
     assert overlay()["x-enrichment-common"]["tmpfs"] == ["/tmp:size=128m,noexec,nosuid"]
 
 
+# Incident 11-05: production's host overlay said `no` while this overlay inherited `unless-stopped`.
+# spec: ANYM-688
+def test_docker_never_starts_enricher_mini_by_itself_and_the_others_keep_their_policy():
+    assert mini_service()["restart"] == "no"
+    assert overlay()["x-enrichment-common"]["restart"] == "unless-stopped"
+
+
 # spec: ANYM-688
 def test_enricher_mini_uses_a_published_build_target():
     service = mini_service()
