@@ -327,10 +327,13 @@ def live_probe(host, root=ROOT, probe=None):
     if not receipt_watch.valid(snapshot) or snapshot == {'unstable': True}:
         raise Refused('the release receipts are unstable; run again later')
     plan = (snapshot['plan_a'] or {}).get('sha', '')
-    deadline = time.monotonic() + LIVE_BUDGET
+    deadline, known = time.monotonic() + LIVE_BUDGET, {}
 
     def live(commit):
-        verdict = receipt_watch.Watch(commit, root, lambda: deadline - time.monotonic()).verdict(snapshot)
+        watch = receipt_watch.Watch(commit, root, lambda: deadline - time.monotonic(), known)
+        verdict = watch.verdict(snapshot)
+        if not verdict and watch.undecided:  # "cannot tell" must never become `fixed`, "not live yet"
+            raise Refused(f'could not tell whether {commit[:12]} is live (git failed or the time ran out); run again later')
         return plan if verdict and verdict[0] == 'LIVE' and SHA.fullmatch(plan) else None
     return live
 

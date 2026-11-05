@@ -200,8 +200,11 @@ def short(state: dict | None) -> str:
 
 
 class Watch:
-    def __init__(self, sha: str, root: Path, left):
+    def __init__(self, sha: str, root: Path, left, known: dict | None = None):
+        """`known` keeps ancestry answers across the Watches of one snapshot; `undecided` says a relation stayed unknown,
+        so a None verdict is "cannot tell", not "not live"."""
         self.sha, self.root, self.left, self.fetched = sha, root, left, False
+        self.known, self.undecided = {} if known is None else known, False
 
     def budget(self, limit: float) -> float | None:
         """The seconds a child process may take: the limit, cut to what the overall deadline leaves; None when none."""
@@ -212,6 +215,8 @@ class Watch:
         """True when OLDER is NEWER or its ancestor, False when not, None when unknown or out of time."""
         if older == newer:
             return True
+        if (older, newer) in self.known:
+            return self.known[older, newer]
         timeout = self.budget(GIT_TIMEOUT)
         if timeout is None:
             return None
@@ -220,9 +225,18 @@ class Watch:
                                   capture_output=True, timeout=timeout).returncode
         except (OSError, subprocess.SubprocessError):
             return None
-        return {0: True, 1: False}.get(code)
+        answer = {0: True, 1: False}.get(code)
+        if answer is not None:
+            self.known[older, newer] = answer
+        return answer
 
     def related(self, older: str, newer: str) -> bool | None:
+        """`lookup`, remembering that a relation stayed unknown."""
+        answer = self.lookup(older, newer)
+        self.undecided = self.undecided or answer is None
+        return answer
+
+    def lookup(self, older: str, newer: str) -> bool | None:
         """`ancestry`, with one fetch per run when a commit is unknown; the answer is read again after the fetch."""
         answer = self.ancestry(older, newer)
         if answer is None and not self.fetched:
