@@ -72,6 +72,7 @@ BLOCKED = [
     "set",
     "grep -nE 'DATABASE_URL|PASSWORD|TOKEN' .env",
     "grep --regexp=PASSWORD .env",
+    "bash -c \"ssh h 'grep -nE '\\\"'\\\"'A|B'\\\"'\\\"' .env'\"",
     "grep --regexp='A|B' .env",
     "grep -ePASSWORD .env",
     "grep -R PASSWORD deploy/private",

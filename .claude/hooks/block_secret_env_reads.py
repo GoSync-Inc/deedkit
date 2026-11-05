@@ -71,7 +71,8 @@ def one_word(match):
 
 def normalise(command):
     """Join continued lines, then drop quotes and backslashes: `doc''ker` and `\\"x\\"` read as what a shell would run."""
-    joined = command.replace("\\\n", "").replace("'\"'\"'", '"').replace("'\\''", '"')  # how a shell nests a single quote
+    # A run of quotes is how a shell nests a quote, at any depth: `'"'"'`, `'\"'\"'`.
+    joined = re.sub(r"['\"]{2,}", '"', command.replace("\\\n", "").replace("\\", ""))
     text = READER_PATTERN.sub(one_word, joined)
     text = TEMPLATE_ACTION.sub(lambda match: "{{" + re.sub(r"[;&|()]", " ", match.group(1)) + "}}", text)
     return re.sub(r"[\"'\\]", "", text)
