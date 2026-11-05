@@ -3,7 +3,10 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import tempfile
 
+from hypothesis import given, settings
+from hypothesis import strategies as st
 import pytest
 
 from scripts import deedkit_admin as admin
@@ -12,6 +15,8 @@ NOW = "2026-10-24T12:00:00+00:00"
 LATER = "2027-04-01T00:00:00+00:00"
 SOON = "2026-10-27T00:00:00+00:00"
 PAST = "2026-10-01T00:00:00+00:00"
+ABSENT = object()  # a field the synthetic recordings entry leaves out
+CANARY = "canary-private-value"  # every recordings field that must never reach any output carries it
 FAKE = r'''
 import hashlib, json, sys
 state = json.load(open(sys.argv[1]))
@@ -56,6 +61,7 @@ class Stores:
     def __init__(self, root):
         self.root, self.tokens = root, {}
         self.messaging, self.calendar, self.registry, self.principals = {}, {}, [], []
+        self.recordings = []
         self.config = {"policy": str(root / "gateway-policy/policy.json"),
                        "calls_registry": str(root / "calls-agents.json"),
                        "labels": str(root / "admin/labels.json"),
@@ -91,6 +97,19 @@ class Stores:
         self.registry.append(entry)
         return credential
 
+    def recordings_agent(self, name, **fields):
+        """A gateway recordings credential and its entry in the recordings private configuration."""
+        credential = self.key(name)
+        entry = {"id": name, "key_sha256": credential["key_sha256"], "expires_at": LATER,
+                 "accounts": [CANARY + "-account"], "permissions": [CANARY + "-permission"], **fields}
+        self.recordings.append({k: v for k, v in entry.items() if v is not ABSENT})
+        self.config["recordings_config"] = str(self.recordings_path)
+        return credential
+
+    @property
+    def recordings_path(self):
+        return self.root / "recordings/config.json"
+
     def principal(self, name, credentials, expires=LATER, enabled=True, profile="full"):
         self.principals.append({"id": name, "key_sha256": sha("gateway-" + name), "profile": profile,
                                 "enabled": enabled, "expires_at": expires, "grants": {},
@@ -100,6 +119,10 @@ class Stores:
         private(Path(self.config["policy"]), {"version": 1, "revision": 3, "deployment": {"modules": [], "backends": {}},
                                               "profiles": {"full": {"tools": []}}, "principals": self.principals})
         private(Path(self.config["calls_registry"]), {"version": 1, "revision": 2, "principals": self.registry})
+        if self.recordings:
+            private(self.recordings_path, {"version": 1, "cursor_secret_file": CANARY + "-cursor",
+                                           "accounts": [{"id": CANARY + "-account", "label": CANARY + "-label"}],
+                                           "principals": self.recordings})
         public = lambda rows: [{k: v for k, v in row.items() if k != "digest"} for row in rows]  # noqa: E731
         return {"messaging": {"by_digest": {r["digest"]: public([r])[0] for r in self.messaging.values()},
                               "inventory": [dict(public([r])[0], id=r["key_id"]) for r in self.messaging.values()]},
@@ -304,6 +327,223 @@ def test_no_calls_registry_configured_is_a_finding_when_a_principal_holds_a_call
     assert code == 1 and calls["status"] == "unknown" and calls["note"] == "calls_registry_not_configured"
     assert view["findings"] == [{"code": "backend_unavailable", "backend": "calls",
                                  "detail": "calls: no registry configured"}]
+
+
+# spec: ANYM-772
+@pytest.mark.parametrize("fields, expected", [
+    ({}, ("agent-rec", LATER, "live")),
+    ({"expires_at": PAST}, ("agent-rec", PAST, "expired")),
+    ({"key_sha256": sha("another key")}, (None, None, "missing")),
+    ({"expires_at": ABSENT}, ("agent-rec", None, "expired")),
+    ({"expires_at": {"raw": CANARY}}, ("agent-rec", None, "expired")),
+    ({"expires_at": 1893456000}, ("agent-rec", None, "expired")),
+    ({"expires_at": CANARY}, ("agent-rec", None, "expired")),
+    ({"expires_at": "2027-04-01T00:00:00." + "1" * 5000 + "+00:00"}, ("agent-rec", None, "expired")),
+    ({"expires_at": "2027-04-01\x1b00:00:00+00:00"}, ("agent-rec", None, "expired")),
+    ({"id": "a" * 65}, ("a" * 65, LATER, "live")),
+    ({"id": "a" * 128}, ("a" * 128, LATER, "live")),
+    ({"id": "a" * 129}, (None, LATER, "live")),
+    ({"id": ""}, (None, LATER, "live")),
+    ({"id": {"raw": CANARY}}, (None, LATER, "live")),
+    ({"id": "bad\x1bid"}, (None, LATER, "live")),
+    ({"id": "\ud800"}, (None, LATER, "live")),
+], ids=["live", "expired", "no-match", "missing-expiry", "object-expiry", "number-expiry", "text-expiry",
+        "oversized-expiry", "control-expiry", "id-65", "id-128", "id-129", "id-empty", "id-object", "id-control",
+        "id-surrogate"])
+def test_a_recordings_credential_reports_only_validated_public_fields(stores, capsys, fields, expected):
+    stores.principal("agent", {"recordings": stores.recordings_agent("agent-rec", **fields)})
+    _, view, out = listing(stores, capsys)
+    row = view["principals"][0]["credentials"][0]
+    assert (row["public_id"], row["expires_at"], row["status"]) == expected
+    assert "note" not in row and CANARY not in out.out + out.err
+
+
+# spec: ANYM-772
+def test_a_recordings_key_ending_before_its_gateway_principal_is_backend_expires_first(stores, capsys):
+    stores.principal("agent", {"recordings": stores.recordings_agent("agent-rec", expires_at=SOON)})
+    code, view, _ = listing(stores, capsys, "--expiring", "--strict")
+    assert code == 1 and [row["id"] for row in view["principals"]] == ["agent"]
+    assert view["findings"] == [{"code": "backend_expires_first", "principal": "agent", "backend": "recordings",
+                                 "public_id": "agent-rec", "expires_at": SOON, "gateway_expires_at": LATER}]
+
+
+# spec: ANYM-772
+@pytest.mark.parametrize("fields, finding", [
+    ({"expires_at": PAST}, {"code": "credential_expired", "public_id": "agent-rec"}),
+    ({"key_sha256": sha("another key")}, {"code": "credential_missing", "public_id": None}),
+], ids=["expired", "missing"])
+def test_an_expired_or_unmatched_recordings_credential_is_a_finding(stores, capsys, fields, finding):
+    stores.principal("agent", {"recordings": stores.recordings_agent("agent-rec", **fields)})
+    code, view, _ = listing(stores, capsys, "--strict")
+    assert code == 1
+    assert view["findings"] == [{"principal": "agent", "backend": "recordings", **finding}]
+
+
+def recordings_rows(view):
+    return [c for row in view["principals"] for c in row["credentials"] if c["backend"] == "recordings"]
+
+
+def two_recordings_holders(stores):
+    healthy(stores)
+    stores.principal("agent", {"recordings": stores.recordings_agent("agent-rec")})
+    stores.principal("second", {"recordings": stores.recordings_agent("second-rec")})
+    stores.fake()
+
+
+def assert_only_recordings_is_unavailable(stores, capsys, note):
+    code, view, out = listing(stores, capsys, "--strict")
+    assert code == 1
+    assert [(r["status"], r["note"], r["public_id"], r["expires_at"]) for r in recordings_rows(view)] == [
+        ("unknown", note, None, None)] * 2
+    others = {c["backend"]: c["status"] for c in view["principals"][0]["credentials"]}
+    assert others == {"messaging": "live", "calendar": "live", "calls": "live"}
+    assert view["findings"] == [{"code": "backend_unavailable", "backend": "recordings", "note": note}]
+    assert CANARY not in out.out + out.err and "Traceback" not in out.err
+
+
+# spec: ANYM-772
+@pytest.mark.parametrize("content, note", [
+    (b"{not json " + CANARY.encode(), "recordings_config_invalid"),
+    (b"\xff\xfe" + CANARY.encode(), "recordings_config_invalid"),
+    (b"[" * 200000, "recordings_config_invalid"),
+    (json.dumps([CANARY]).encode(), "recordings_config_invalid"),
+    (b"{}", "recordings_config_invalid"),
+    (b'{"principals": null}', "recordings_config_invalid"),
+    (json.dumps({"principals": CANARY}).encode(), "recordings_config_invalid"),
+    (json.dumps({"principals": {"a": CANARY}}).encode(), "recordings_config_invalid"),
+    (json.dumps({"principals": [CANARY]}).encode(), "recordings_config_invalid"),
+    (json.dumps({"principals": [{"id": CANARY}]}).encode(), "recordings_config_invalid"),
+    (json.dumps({"principals": [{"id": "a", "key_sha256": [CANARY]}]}).encode(), "recordings_config_invalid"),
+    (json.dumps({"principals": [{"id": "a", "key_sha256": CANARY}]}).encode(), "recordings_config_invalid"),
+    (json.dumps({"principals": [{"id": CANARY, "key_sha256": "a" * 64}, {"id": "b", "key_sha256": "a" * 64}]}).encode(),
+     "recordings_config_duplicate_key"),
+], ids=["bad-json", "bad-utf8", "deep-nesting", "top-level-list", "principals-absent", "principals-null",
+        "principals-text", "principals-object", "entry-text", "entry-no-hash", "entry-object-hash", "entry-bad-hash",
+        "duplicate-hash"])
+def test_a_malformed_recordings_configuration_is_one_fixed_note_and_the_rest_still_lists(stores, capsys, content, note):
+    two_recordings_holders(stores)
+    stores.recordings_path.write_bytes(content)
+    assert_only_recordings_is_unavailable(stores, capsys, note)
+
+
+# spec: ANYM-772
+@pytest.mark.parametrize("case", ["missing", "mode-0644", "mode-0640", "symlink", "directory", "oversized"])
+def test_a_missing_or_unsafe_recordings_file_is_unreadable_never_its_text(stores, capsys, case):
+    two_recordings_holders(stores)
+    path = stores.recordings_path
+    if case == "missing":
+        path.unlink()
+    elif case.startswith("mode"):
+        path.chmod(int(case[-4:], 8))
+    elif case == "symlink":
+        target = path.with_name("target.json")
+        path.rename(target)
+        path.symlink_to(target)
+    elif case == "directory":
+        path.unlink()
+        path.mkdir()
+    else:
+        path.write_text(" " * (admin.LIMIT + 1))
+    assert_only_recordings_is_unavailable(stores, capsys, "recordings_config_unreadable")
+
+
+# spec: ANYM-772
+@pytest.mark.parametrize("value", ["relative/config.json", 0.5, ["/a"], "/bad\0path"],
+                         ids=["relative", "number", "list", "nul"])
+def test_a_recordings_config_value_that_is_no_absolute_path_is_unreadable(stores, capsys, value):
+    two_recordings_holders(stores)
+    config = json.loads((stores.root / "admin/config.json").read_text())
+    config["recordings_config"] = value
+    private(stores.root / "admin/config.json", config)
+    assert_only_recordings_is_unavailable(stores, capsys, "recordings_config_unreadable")
+
+
+# spec: ANYM-772
+def test_no_recordings_config_is_unknown_and_a_finding_when_a_principal_holds_a_recordings_key(stores, capsys):
+    two_recordings_holders(stores)
+    config = json.loads((stores.root / "admin/config.json").read_text())
+    del config["recordings_config"]
+    private(stores.root / "admin/config.json", config)
+    assert_only_recordings_is_unavailable(stores, capsys, "recordings_config_not_configured")
+
+
+# spec: ANYM-772
+def test_principal_filter_keeps_the_recordings_finding_only_for_a_holder(stores, capsys):
+    two_recordings_holders(stores)
+    stores.recordings_path.write_text("{}")
+    expected = [{"code": "backend_unavailable", "backend": "recordings", "note": "recordings_config_invalid"}]
+    code, view, _ = listing(stores, capsys, "--principal", "agent", "--strict")
+    assert code == 1 and view["findings"] == expected and [r["id"] for r in view["principals"]] == ["agent"]
+    code, view, _ = listing(stores, capsys, "--principal", "claude-code", "--strict")
+    assert code == 0 and view["findings"] == []
+
+
+# spec: ANYM-772
+def test_a_broken_recordings_file_is_no_finding_without_a_holder_and_stays_one_with_an_unreadable_key_file(stores, capsys):
+    healthy(stores)
+    stores.fake()
+    config = json.loads((stores.root / "admin/config.json").read_text())
+    config["recordings_config"] = str(stores.recordings_path)
+    private(stores.root / "admin/config.json", config)
+    private(stores.recordings_path, "{}")
+    code, view, _ = listing(stores, capsys, "--strict")
+    assert code == 0 and view["findings"] == []
+    policy = json.loads(Path(stores.config["policy"]).read_text())
+    policy["principals"].append({"id": "holder", "expires_at": LATER, "enabled": True, "credentials": {
+        "recordings": {"key_file": "/run/deedkit/keys/absent.key", "key_sha256": "a" * 64}}})
+    private(Path(stores.config["policy"]), policy)
+    code, view, _ = listing(stores, capsys, "--strict")
+    assert code == 1 and recordings_rows(view)[0]["note"] == "key_file_unreadable"
+    assert {"code": "backend_unavailable", "backend": "recordings",
+            "note": "recordings_config_invalid"} in view["findings"]
+
+
+# spec: ANYM-772
+@pytest.mark.parametrize("broken", [False, True], ids=["success", "failure"])
+def test_no_recordings_hash_account_permission_or_raw_field_reaches_any_output(stores, capsys, caplog, broken):
+    credential = stores.recordings_agent("agent-rec", expires_at={"raw": CANARY}, label=CANARY)
+    stores.principal("agent", {"recordings": credential})
+    stores.fake()
+    if broken:
+        stores.recordings_path.write_text(CANARY)
+    before = stores.snapshot()
+    configured = stores.root / "admin/config.json"
+    assert admin.main(["--config", str(configured), "key", "list"]) == 0
+    text = capsys.readouterr()
+    assert admin.main(["--config", str(configured), "key", "list", "--json"]) == 0
+    shown = capsys.readouterr()
+    seen = text.out + text.err + shown.out + shown.err + caplog.text
+    assert "recordings" in text.out and stores.snapshot() == before
+    for secret in (CANARY, credential["key_sha256"], stores.tokens["agent-rec"], "omi", "permissions", "accounts"):
+        assert secret not in seen
+
+
+JSON_VALUES = st.recursive(st.none() | st.booleans() | st.integers() | st.floats(allow_nan=False) | st.text(max_size=70),
+                           lambda inner: st.lists(inner, max_size=3) | st.dictionaries(st.text(max_size=12), inner, max_size=3),
+                           max_leaves=12)
+ENTRIES = st.fixed_dictionaries({}, optional={
+    "id": JSON_VALUES | st.text(max_size=140), "expires_at": JSON_VALUES | st.just(LATER),
+    "key_sha256": JSON_VALUES | st.sampled_from(["a" * 64, "b" * 64])})
+DOCUMENTS = JSON_VALUES | st.fixed_dictionaries({}, optional={"principals": JSON_VALUES | st.lists(ENTRIES | JSON_VALUES, max_size=4)})
+
+
+# spec: ANYM-772
+@settings(max_examples=200, deadline=None)
+@given(DOCUMENTS)
+def test_any_json_document_has_one_defined_outcome_and_only_validated_fields(document):
+    now = admin.datetime.fromisoformat(NOW)
+    with tempfile.TemporaryDirectory() as directory:
+        path = private(Path(directory) / "config.json", document)
+        found, note = admin.recordings_principals({"recordings_config": str(path)})
+    assert note in (None, "recordings_config_invalid", "recordings_config_duplicate_key")
+    assert (note is None) or found == {}
+    for digest, entry in found.items():
+        assert entry["key_sha256"] == digest
+        row = admin.recordings_row(entry, now)
+        assert set(row) == {"public_id", "expires_at", "status"}
+        assert row["public_id"] in (None, entry.get("id")) and row["expires_at"] in (None, entry.get("expires_at"))
+        assert row["public_id"] is None or (1 <= len(row["public_id"]) <= 128 and row["public_id"].isprintable())
+        assert row["status"] == ("live" if row["expires_at"] and admin.instant(row["expires_at"]) > now else "expired")
 
 
 # spec: ANYM-494
