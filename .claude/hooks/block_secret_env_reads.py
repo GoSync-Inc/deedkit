@@ -85,6 +85,7 @@ def name_of(word):
 def sensitive(word):
     base = word.strip().rstrip("}").rsplit("/", 1)[-1].lower()
     if base in SENSITIVE_NAMES or base.endswith(SENSITIVE_ENDINGS): return True
+    if base.startswith(".env.") and base not in (".env.example", ".env.sample"): return True  # .gitignore keeps these private
     return base != "*" and any(char in base for char in "*?[") and any(fnmatchcase(sample, base) for sample in SENSITIVE_SAMPLES)
 
 

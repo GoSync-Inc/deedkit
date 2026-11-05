@@ -79,6 +79,8 @@ BLOCKED = [
     "rg PASSWORD deploy/private",
     "grep -r PASSWORD .local",
     "cat .env*",
+    "cat .env.production",
+    "grep x .env.local",
     "head -n 5 *.env*",
     "cat .en?",
     "nl -ba .env",
