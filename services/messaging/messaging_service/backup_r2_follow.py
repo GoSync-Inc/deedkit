@@ -96,7 +96,7 @@ LOCK_BYTES = 1024 ** 2
 RECEIVER_IMPORTS = ('boto3', 'botocore.config', 'messaging_service.backup_r2_receiver')
 # Answers that only mean "not now": the service exits cleanly and the next tick retries.
 WAITING = {'verifier_busy', 'verifier_host_busy', 'verification_pending', 'helper_unattested', 'attestation_unreachable', 'main_unreachable'}
-SAFE = WAITING | {'recordings_helper_failed', 'follow_config_mismatch', 'follow_not_forward', 'helper_attestation_refused',
+SAFE = WAITING | {'recordings_helper_failed', 'calls_helper_failed', 'follow_config_mismatch', 'follow_not_forward', 'helper_attestation_refused',
                   'attest_verifier_unavailable', 'helper_pull_failed', 'helper_schemas_unavailable',
                   'helper_self_test_mismatch', 'helper_self_test_failed', 'publication_directory_foreign',
                   'publication_foreign', 'publication_mount_point', 'untrusted_operator_ancestor',
@@ -191,6 +191,28 @@ staged=synthetic_archive(root/'staged'/'archive.sqlite',[
     {'ref':'synthetic%02d'%i,'provider_id':'p%d'%i,'transcript':'synthetic follow self test words %d'%i,'summary':'synthetic %d'%i}
     for i in range(1,4)])
 create_recordings_snapshot(staged,root/'snapshot')
+encrypt_snapshot(root/'snapshot',root/'ciphertext',recipient)
+(root/'manifest-sha256').write_text(hashlib.sha256((root/'snapshot/manifest.json').read_bytes()).hexdigest())
+'''
+
+# The calls profile's synthetic bundle (ANYM-781): a small file with the tables a calls database must have, sealed
+# and age-encrypted by the image under test. It needs no database; the restore helper reads the snapshot in place.
+CALLS_FIXTURE_SCRIPT = r'''
+from datetime import datetime,timezone
+import hashlib,os,sqlite3
+from pathlib import Path
+from messaging_service.backup_calls import create_calls_snapshot
+from messaging_service.backup_crypto import encrypt_snapshot
+root=Path('/fixture')
+recipient=os.environ['DEEDKIT_SYNTHETIC_RECIPIENT']
+staged=root/'staged'/'voice.sqlite3';staged.parent.mkdir(mode=0o700)
+db=sqlite3.connect(staged)
+db.executescript("CREATE TABLE briefs(id TEXT PRIMARY KEY,body TEXT);CREATE TABLE calls(id TEXT PRIMARY KEY,brief_id TEXT);"
+                 "CREATE TABLE voice_events(seq INTEGER PRIMARY KEY AUTOINCREMENT,kind TEXT);"
+                 "INSERT INTO briefs VALUES('synthetic','synthetic follow self test');INSERT INTO calls VALUES('synthetic','synthetic');"
+                 "INSERT INTO voice_events(kind) VALUES('synthetic');")
+db.close()
+create_calls_snapshot(staged,root/'snapshot',captured_at=datetime.now(timezone.utc).isoformat())
 encrypt_snapshot(root/'snapshot',root/'ciphertext',recipient)
 (root/'manifest-sha256').write_text(hashlib.sha256((root/'snapshot/manifest.json').read_bytes()).hexdigest())
 '''
@@ -572,7 +594,7 @@ def sweep_self_tests(engine, directory):
             clear_self_test(engine, directory, name[len(SELF_TEST):])
 
 
-FIXTURE_SCRIPTS = {'calendar': CALENDAR_FIXTURE_SCRIPT, 'recordings': RECORDINGS_FIXTURE_SCRIPT}
+FIXTURE_SCRIPTS = {'calendar': CALENDAR_FIXTURE_SCRIPT, 'recordings': RECORDINGS_FIXTURE_SCRIPT, 'calls': CALLS_FIXTURE_SCRIPT}
 
 
 def self_test(engine, config, run=None):
@@ -642,7 +664,8 @@ def self_test(engine, config, run=None):
         if profile != 'messaging':worker['profile'] = profile
         verifier.write_secret(target_secrets / 'worker.json', r2.encoded(worker))
         facts = engine.restore(tested, {'bucket': 'synthetic'}, Fixture(), receipt, run, target_payload, target_secrets)
-        return schemas, verifier.make_proof(receipt, facts, run, profile)['verification']['schema_version']
+        manifest = verifier.calls_manifest(target_payload, receipt) if profile == 'calls' else None
+        return schemas, verifier.make_proof(receipt, facts, run, profile, manifest)['verification']['schema_version']
     finally:
         clear_self_test(Docker(120) if isinstance(engine, verifier.Docker) else engine, directory, run)
 
@@ -656,10 +679,10 @@ def admitted_test(engine, config, test):
         verifier.admit(engine, fd, profile, run, self_test_resources(run, profile))
         try:result = test(engine, config, run)
         except Exception as error:
-            # A helper that cannot handle the recordings bundle holds the shared pin move with one fixed code; the
-            # messaging and calendar verifications never read this failure (ANYM-728).
-            if profile == 'recordings' and not r2.CANCELLED and not isinstance(error, (TimeoutError, InterruptedError)):
-                raise RuntimeError('recordings_helper_failed') from error
+            # A helper that cannot handle the recordings or calls bundle holds the shared pin move with one fixed code;
+            # the messaging and calendar verifications never read this failure (ANYM-728, ANYM-781).
+            if profile in ('recordings', 'calls') and not r2.CANCELLED and not isinstance(error, (TimeoutError, InterruptedError)):
+                raise RuntimeError(profile + '_helper_failed') from error
             raise
         # Kept after a failure: the next holder confirms its resources gone first.
         verifier.release_admission(fd)

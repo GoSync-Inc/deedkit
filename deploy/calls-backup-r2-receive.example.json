@@ -1,0 +1,15 @@
+{
+  "v": 1,
+  "profile": "calls",
+  "endpoint": "https://11111111111111111111111111111111.r2.cloudflarestorage.com",
+  "bucket": "deedkit-backup-example",
+  "prefix": "deedkit-calls/deployment-example",
+  "state_directory": "/srv/backups/deedkit-calls/state/receive",
+  "credentials_file": "/etc/deedkit-calls-backup-r2/receive-credentials.json",
+  "max_bytes": 8589934592,
+  "quota_bytes": 17179869184,
+  "max_objects": 2,
+  "part_bytes": 67108864,
+  "timeout_seconds": 7200,
+  "upload_concurrency": 1
+}

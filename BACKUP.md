@@ -696,7 +696,9 @@ Installation, activation, the first protected snapshot and the restore drill are
 ## Calls state (ANYM-778)
 
 The calls state (`voice.sqlite3`) is backed up as its own profile. This section is the producer; the backup server's
-proof is ANYM-781 and the schedule, freshness and installation are ANYM-782. Nothing runs it until then, and
+proof is [Calls verifier instance](BACKUP_R2.md#calls-verifier-instance) (ANYM-781: an isolated restore recomputes
+`PRAGMA integrity_check`, the per-table row counts and the row digests against the manifest, any difference is
+`restore_mismatch` and the previous protected point stays) and the schedule, freshness and installation are ANYM-782. Nothing runs it until then, and
 `docs/operations/production.md` keeps its pre-release SQLite backup clause until ANYM-782's first scheduled run reads fresh.
 
 What the bundle holds: the whole database: briefs, calls and results, events, learning tables, decision journals and the

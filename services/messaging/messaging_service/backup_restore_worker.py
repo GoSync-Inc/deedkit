@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 from . import backup
 from .backup_crypto import decrypt_snapshot_stream
-from .backup_r2_receiver import MAX_WARNINGS, WARNING_BYTES, private_json, encoded
+from .backup_r2_receiver import CALLS_MANIFEST, MAX_WARNINGS, WARNING_BYTES, private_json, encoded
 from .spool import fsync_dir
 
 DATABASE = 'deedkit_verify_restore_test'
@@ -46,12 +46,17 @@ STAGES={'restore_decryption_failed','restore_database_failed','restore_snapshot_
         'restore_bundle_failed','restore_schema_failed','restore_inventory_failed','restore_vault_incomplete',
         'restore_vault_decrypt_failed','verifier_profile_mismatch',
         # The recordings profile (ANYM-728): the archive file's integrity, identity and index, after the shared ones.
-        'restore_archive_failed','restore_readback_failed'}
+        'restore_archive_failed','restore_readback_failed',
+        # The calls profile (ANYM-781): any difference between the snapshot and its manifest, one code.
+        'restore_mismatch'}
 CALENDAR_CHECKS=('decryption','bundle_integrity','database_restore','schema_version','table_inventory',
                  'vault_complete','vault_decrypts')
 
 
 RECORDINGS_CHECKS=('decryption','bundle_integrity','archive_integrity','schema_version','identity','search_readback')
+CALLS_CHECKS=('integrity','row_counts','row_digests')
+# decrypt_snapshot_stream's refusals of a calls bundle: age authenticated what they read, so they are differences, not decryption failures.
+CALLS_BUNDLE_ERRORS={'invalid_calls_bundle','calls_state_corrupt','invalid_backup_member','incomplete_backup'}
 
 
 class RestoreStageError(RuntimeError):detail=''
@@ -243,12 +248,25 @@ def restore_recordings(restored,manifest_sha,work):
             'captured_at':manifest['captured_at']}
 
 
+def restore_calls(restored,manifest_sha,work):
+    """Checks of a decrypted calls bundle (ANYM-781): the read-only snapshot's PRAGMA integrity_check, then every table's
+    row count and row digest recomputed against the manifest (verify_calls_bundle). Needs no database. The result holds
+    no row content; the manifest's copy lets the host bind `captured_at` and `tables` to the receipt's manifest hash."""
+    from .backup_calls import verify_calls_bundle
+    manifest=stage('restore_mismatch',lambda:verify_calls_bundle(restored))
+    write_exclusive(work/CALLS_MANIFEST,(restored/'manifest.json').read_bytes())
+    fsync_dir(work)
+    return {'v':1,'status':'verified','profile':'calls','schema_version':manifest['schema_version'],
+            'manifest_sha256':manifest_sha,'captured_at':manifest['captured_at'],
+            'checks':{name:'ok' for name in CALLS_CHECKS},'tables':manifest['tables']}
+
+
 def run(config, source=None):
     required = {'v','identity_file','work_directory','database_host','database_password','snapshot_sha256','max_plaintext_bytes'}
     # A calendar worker config (ANYM-606) adds `profile: calendar`; a messaging one is unchanged.
     profile = config['profile'] if isinstance(config,dict) and 'profile' in config else 'messaging'
     if profile!='messaging':
-        if profile not in ('calendar','recordings'):raise ValueError('invalid_restore_worker_config')
+        if profile not in ('calendar','recordings','calls'):raise ValueError('invalid_restore_worker_config')
         required = required | {'profile'}
     if (not isinstance(config,dict) or set(config)!=required or type(config['v']) is not int or config['v']!=1 or
             config['identity_file']!='/run/restore/identity' or config['work_directory']!='/work' or
@@ -262,17 +280,21 @@ def run(config, source=None):
     work=Path(config['work_directory'])
     try:restored=decrypt_snapshot_stream(source,config['identity_file'],work/'bundle',max_bytes=config['max_plaintext_bytes'])
     except Exception as error:
-        code='restore_bundle_failed' if profile=='calendar' and str(error) in CALENDAR_BUNDLE_ERRORS else 'restore_decryption_failed'
+        code=('restore_bundle_failed' if profile=='calendar' and str(error) in CALENDAR_BUNDLE_ERRORS else
+              'restore_mismatch' if profile=='calls' and str(error) in CALLS_BUNDLE_ERRORS else 'restore_decryption_failed')
         raise RestoreStageError(code) from None
     with (restored/'manifest.json').open('rb') as manifest_file:
         manifest_sha=hashlib.file_digest(manifest_file,'sha256').hexdigest()
-    if manifest_sha != config['snapshot_sha256']:raise RuntimeError('restore_manifest_mismatch')
+    if manifest_sha != config['snapshot_sha256']:
+        if profile=='calls':raise RestoreStageError('restore_mismatch')
+        raise RuntimeError('restore_manifest_mismatch')
     found=bundle_profile(restored/'manifest.json')
     if found is not UNREADABLE and found!=profile:raise RestoreStageError('verifier_profile_mismatch')
     # Isolated DB name, host, user and arguments are fixed, never taken from the dump.
     env={**os.environ,'PGHOST':'restore-postgres','PGPORT':'5432','PGUSER':'restore_owner',
          'PGDATABASE':DATABASE,'PGPASSWORD':config['database_password'],'PGCONNECT_TIMEOUT':'10'}
     if profile=='recordings':return write_result(work,restore_recordings(restored,manifest_sha,work))
+    if profile=='calls':return write_result(work,restore_calls(restored,manifest_sha,work))
     if profile=='calendar':
         from psycopg.conninfo import make_conninfo
         result=restore_calendar(restored,manifest_sha,tool=lambda name:[name,'--dbname='+DATABASE],env=env,database=DATABASE,
