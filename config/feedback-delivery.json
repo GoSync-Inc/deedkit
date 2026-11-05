@@ -1,8 +1,27 @@
 {
+  "_header": "Reviewed entries for Done or Review cards without a Delivers: pull request (docs/operations/feedback-triage.md). The tool refuses a delivery undone by git revert; one undone by other means (a manual edit, a fix-forward that removes the function) is the operator's to remove from this file in a reviewed pull request.",
   "ANYM-171": {
     "commit": "d7ab137d5a28f3c81c15fef3cc2d2872ae1eb421",
     "pr": 342,
     "evidence": "gh pr view 342: merged as this squash, Spec: names ANYM-171, no Delivers line; #639 names the card later as maintenance",
+    "added": "2026-11-05"
+  },
+  "ANYM-579": {
+    "commit": "9a0e6b38d383c6eb831736bd9aa1682070e2c51f",
+    "pr": 322,
+    "evidence": "gh pr view 322: merged as this squash, Spec: names ANYM-579, no Delivers line; #607 and #650 only mention the card; no merged pull request has Delivers: ANYM-579",
+    "added": "2026-11-05"
+  },
+  "ANYM-522": {
+    "commit": "cbb894101864fbe8e67845291319c2ca7f2e5cfc",
+    "pr": 452,
+    "evidence": "gh pr view 452: merged as this squash, Spec: names ANYM-522, no Delivers line; #511 names the card as a later refactor, #446, #462, #625 and #650 only mention it; no merged pull request has Delivers: ANYM-522",
+    "added": "2026-11-05"
+  },
+  "ANYM-657": {
+    "commit": "89763a956eac1d3cebff6b0f3afe054dd578d971",
+    "pr": 560,
+    "evidence": "gh pr view 560: merged as this squash, Spec: names ANYM-657, no Delivers line; #650 only mentions the card; no merged pull request has Delivers: ANYM-657",
     "added": "2026-11-05"
   }
 }

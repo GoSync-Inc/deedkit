@@ -516,8 +516,8 @@ def test_a_mapping_entry_that_fails_a_condition_is_refused_by_name_and_writes_no
         merged = []
     elif case == 'has-delivers':
         merged = [(7, spec_line, one), (8, 'Delivers: ANYM-10', two)]
-    elif case == 'not-done':
-        main = main_of(spec(10, 'Review'))
+    elif case == 'not-done':  # ANYM-798: a Review card may use an entry; the parameter is a Tiden ID, kept
+        main, why = main_of(spec(10, 'Backlog')), why + ' or in Review'
     elif case in ('shape', 'short-commit', 'bad-pr', 'bad-evidence', 'bad-date'):
         change = {'shape': {'extra': 1}, 'short-commit': {'commit': 'abc'}, 'bad-pr': {'pr': True},
                   'bad-evidence': {'evidence': 'two\nlines'}, 'bad-date': {'added': 'soon'}}[case]
@@ -544,7 +544,7 @@ def test_a_bad_entry_holds_only_its_own_card(tmp_path, capsys):
     assert prod.rows[B]['status'] == 'fixed' and prod.rows[C]['status'] == 'accepted'
     out = capsys.readouterr().out
     assert f'{A} accepted -> no change (mapping refused: pr is not a number)' in out
-    assert f'{D} accepted -> no change (mapping refused: the card is not Done)' in out
+    assert f'{D} accepted -> no change (mapping refused: the card is not Done or in Review)' in out
 
 
 # spec: ANYM-764
@@ -552,12 +552,144 @@ def test_a_bad_entry_holds_only_its_own_card(tmp_path, capsys):
 def test_a_refused_entry_writes_nothing_for_a_received_item_of_a_card_not_done(tmp_path, capsys, status):
     root, shas = repo(tmp_path, ['one'])
     write_mapping(root, {'ANYM-10': entry(shas['one'])})
-    gh, _ = github([(7, 'Spec: ANYM-10', shas['one'])])
+    # ANYM-798: a Review card's entry is refused only by another condition; the card's status no longer refuses it.
+    body, why = (('Spec: ANYM-9\nmentions ANYM-10', 'pull request #7 has no Spec: line naming the card') if status == 'Review'
+                 else ('Spec: ANYM-10', 'the card is not Done or in Review'))
+    gh, _ = github([(7, body, shas['one'])])
     kept = disp('received', 'ANYM-10', note='kept')
     prod = Prod({A: dict(kept)})
     assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, main_of(spec(10, status))) == 0
     assert prod.writes == [] and shown(prod, A) == kept
-    assert f'{A} received -> no change (mapping refused: the card is not Done)' in capsys.readouterr().out
+    assert f'{A} received -> no change (mapping refused: {why})' in capsys.readouterr().out
+
+
+# spec: ANYM-798
+def test_a_review_card_follows_its_reviewed_mapping_entry_and_names_its_open_check(tmp_path, capsys):
+    root, shas = repo(tmp_path, ['one'])
+    write_mapping(root, {'ANYM-10': entry(shas['one'])})
+    gh, _ = github([(7, 'Spec: ANYM-9, ANYM-10', shas['one'])])
+    prod = Prod({A: disp('accepted', 'ANYM-10'), B: disp('verified', 'ANYM-10'), C: disp('declined', 'ANYM-10'),
+                 D: disp('duplicate', 'ANYM-10')})
+    assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, in_review()) == 0
+    note = f'Delivered by ANYM-10; live in deedkit@{LIVE[:12]}; the card still waits for {REVIEW_LINE}. Please re-check.'
+    assert shown(prod, A) == disp('verify_requested', 'ANYM-10', fixed='deedkit@' + LIVE, note=note)
+    assert f'{A} accepted -> verify_requested ANYM-10 deedkit@{LIVE} (delivered by mapping (#7))' in capsys.readouterr().out
+    assert [prod.rows[i]['status'] for i in (B, C, D)] == ['verified', 'declined', 'duplicate']
+
+
+# spec: ANYM-798
+def test_a_review_card_with_a_mapping_entry_merged_but_not_live_is_fixed(tmp_path, capsys):
+    root, shas = repo(tmp_path, ['one'])
+    write_mapping(root, {'ANYM-10': entry(shas['one'])})
+    gh, _ = github([(7, 'Spec: ANYM-10', shas['one'])])
+    prod = Prod({A: disp('accepted', 'ANYM-10')})
+    assert follow(tmp_path, prod, root, gh, lambda commit: None, in_review()) == 0
+    assert shown(prod, A) == disp('fixed', 'ANYM-10', fixed='deedkit@' + shas['one'],
+                                  note=f'Delivered by ANYM-10 in deedkit@{shas["one"][:12]}; not live yet.')
+    assert '(delivered by mapping (#7))' in capsys.readouterr().out
+
+
+# spec: ANYM-798
+@pytest.mark.parametrize('status', ['Backlog', 'Active'])
+def test_a_mapping_entry_of_a_card_neither_done_nor_in_review_is_refused(tmp_path, capsys, status):
+    root, shas = repo(tmp_path, ['one'])
+    write_mapping(root, {'ANYM-10': entry(shas['one'])})
+    gh, calls = github([(7, 'Spec: ANYM-10', shas['one'])])
+    prod = Prod({A: disp('accepted', 'ANYM-10', note='kept')})
+    assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, main_of(spec(10, status))) == 0
+    assert prod.writes == [] and calls == []
+    assert f'{A} accepted -> no change (mapping refused: the card is not Done or in Review)' in capsys.readouterr().out
+
+
+# spec: ANYM-798
+def test_a_review_card_moved_by_its_entry_keeps_the_first_live_sha_when_it_becomes_done(tmp_path, capsys):
+    root, shas = repo(tmp_path, ['one'])
+    write_mapping(root, {'ANYM-10': entry(shas['one'])})
+    gh, _ = github([(7, 'Spec: ANYM-10', shas['one'])])
+    prod = Prod({A: disp('accepted', 'ANYM-10')})
+    assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, in_review()) == 0
+    moved = shown(prod, A)
+    assert moved['status'] == 'verify_requested' and moved['fixed_in'] == 'deedkit@' + LIVE
+    prod.writes.clear()
+    capsys.readouterr()
+    assert follow(tmp_path, prod, root, gh, lambda commit: OLD, DONE) == 0
+    assert prod.writes == [] and shown(prod, A) == moved
+    assert f'{A} verify_requested -> no change (already verify_requested)' in capsys.readouterr().out
+
+
+def reverted_repo(tmp_path):
+    """A git fixture: a delivery and a real `git revert` of it; returns (root, delivery SHA, revert SHA). origin/main
+    points at the revert."""
+    root, _ = repo(tmp_path, ['base'])
+    who = ('-c', 'user.name=t', '-c', 'user.email=t@example.invalid')
+    (root / 'delivery.txt').write_text('delivered\n')
+    git(root, 'add', 'delivery.txt')
+    git(root, *who, 'commit', '-q', '-m', 'delivery')
+    delivery = git(root, 'rev-parse', 'HEAD')
+    git(root, *who, 'revert', '--no-edit', delivery)
+    undo = git(root, 'rev-parse', 'HEAD')
+    git(root, 'update-ref', 'refs/remotes/origin/main', undo)
+    return root, delivery, undo
+
+
+# spec: ANYM-798
+@pytest.mark.parametrize('status', ['Done', 'Review'])
+def test_a_delivery_reverted_on_origin_main_is_refused_and_writes_nothing(tmp_path, capsys, status):
+    root, delivery, undo = reverted_repo(tmp_path)
+    assert f'This reverts commit {delivery}' in git(root, 'log', '-1', '--format=%B', undo)
+    assert git(root, 'merge-base', '--is-ancestor', delivery, 'origin/main') == ''  # the ancestor check alone passes
+    write_mapping(root, {'ANYM-10': entry(delivery)})
+    gh, _ = github([(7, 'Spec: ANYM-10', delivery)])
+    prod = Prod({A: disp('accepted', 'ANYM-10', note='kept')})
+    assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, main_of(spec(10, status))) == 0
+    assert prod.writes == [] and shown(prod, A) == disp('accepted', 'ANYM-10', note='kept')
+    assert f'{A} accepted -> no change (mapping refused: reverted)' in capsys.readouterr().out
+
+
+# spec: ANYM-798
+def test_a_revert_off_origin_main_or_of_another_commit_does_not_refuse(tmp_path):
+    root, delivery, undo = reverted_repo(tmp_path)
+    write_mapping(root, {'ANYM-10': entry(delivery)})
+    gh, _ = github([(7, 'Spec: ANYM-10', delivery)])
+    git(root, 'update-ref', 'refs/remotes/origin/main', delivery)  # the revert is only local
+    prod = Prod({A: disp('accepted', 'ANYM-10')})
+    assert follow(tmp_path, prod, root, gh, lambda commit: None, DONE) == 0
+    assert prod.rows[A]['status'] == 'fixed'
+    other = git(root, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit-tree', '-m',
+                f'other\n\nThis reverts commit {OLD}.\nThis reverts commit {delivery[:12]}.', '-p', delivery,
+                git(root, 'rev-parse', delivery + '^{tree}'))
+    git(root, 'update-ref', 'refs/remotes/origin/main', other)
+    prod = Prod({B: disp('accepted', 'ANYM-10')})
+    assert follow(tmp_path, prod, root, gh, lambda commit: None, DONE) == 0
+    assert prod.rows[B]['status'] == 'fixed'
+
+
+# spec: ANYM-798
+def test_a_failed_revert_read_stops_the_run_before_any_write(tmp_path, monkeypatch):
+    root, shas = repo(tmp_path, ['one'])
+    write_mapping(root, {'ANYM-10': entry(shas['one'])})
+    gh, _ = github([(7, 'Spec: ANYM-10', shas['one'])])
+    prod = Prod({A: disp('accepted', 'ANYM-10')})
+    plain = sync.git
+
+    def failing(where, *argv, **kw):
+        if argv[0] == 'log':
+            raise sync.Refused('git log exited 128')
+        return plain(where, *argv, **kw)
+    monkeypatch.setattr(sync, 'git', failing)
+    assert follow(tmp_path, prod, root, gh, lambda commit: LIVE, DONE) == 1
+    assert prod.writes == []
+
+
+# spec: ANYM-798
+def test_the_mapping_header_is_not_an_entry_and_a_bad_one_stops_the_run(tmp_path, capsys):
+    root, shas = repo(tmp_path, ['one'])
+    write_mapping(root, {'_header': 'one sentence', 'ANYM-10': entry(shas['one'])})
+    assert list(sync.mapping_load(root)[0]) == ['ANYM-10'] and sync.mapping_load(root)[1] == {}
+    write_mapping(root, {'_header': {'not': 'a sentence'}, 'ANYM-10': entry(shas['one'])})
+    prod = Prod({A: disp('accepted', 'ANYM-10')})
+    assert follow(tmp_path, prod, root, github([(7, 'Spec: ANYM-10', shas['one'])])[0], lambda commit: LIVE, DONE) == 1
+    assert prod.writes == [] and 'mapping refused' in capsys.readouterr().err
 
 
 # spec: ANYM-764
@@ -626,10 +758,24 @@ def test_the_hourly_plan_prints_the_new_reasons_without_writing(tmp_path, capsys
 
 
 # spec: ANYM-764
-def test_the_seeded_mapping_holds_only_anym_171():
+def test_the_seeded_mapping_holds_only_anym_171():  # the name is a Tiden ID; ANYM-798 adds three entries beside the seed
     entries, refused = sync.mapping_load(sync.ROOT)
-    assert refused == {} and list(entries) == ['ANYM-171']
+    assert refused == {} and 'ANYM-171' in entries
     assert entries['ANYM-171']['pr'] == 342 and entries['ANYM-171']['commit'] == 'd7ab137d5a28f3c81c15fef3cc2d2872ae1eb421'
+
+
+# spec: ANYM-798
+def test_the_mapping_file_holds_the_four_reviewed_entries_and_all_validate():
+    entries, refused = sync.mapping_load(sync.ROOT)
+    assert refused == {}  # mapping_load applies the validation: a malformed entry lands here
+    assert {card: (row['pr'], row['commit']) for card, row in entries.items()} == {
+        'ANYM-171': (342, 'd7ab137d5a28f3c81c15fef3cc2d2872ae1eb421'),
+        'ANYM-579': (322, '9a0e6b38d383c6eb831736bd9aa1682070e2c51f'),
+        'ANYM-522': (452, 'cbb894101864fbe8e67845291319c2ca7f2e5cfc'),
+        'ANYM-657': (560, '89763a956eac1d3cebff6b0f3afe054dd578d971'),
+    }
+    assert all(entries[card]['added'] == '2026-11-05' for card in ('ANYM-579', 'ANYM-522', 'ANYM-657'))
+    assert 'in a reviewed pull request' in json.loads((sync.ROOT / sync.MAPPING).read_text())[sync.HEADER]
 
 
 # spec: ANYM-473

@@ -17,8 +17,8 @@ reports the skipped differences. `follow` reads Tiden main, the merged pull requ
 (`Delivers:`) and the release receipts (scripts/receipt_watch.py): a Done card whose commit is LIVE asks the agent to
 re-check (`verify_requested` at the live SHA), a Done card merged but not LIVE is `fixed` at its commit, a card on main
 not yet Done makes a `received` item `accepted`. A `Review` card with a delivering commit moves the same way and its note
-names the open check; a Done card without a `Delivers:` pull request follows only a reviewed entry of
-config/feedback-delivery.json, never a guess from a `Spec:` line (ANYM-764). A status never moves down, and agent verdicts (verified, reopened)
+names the open check; a Done or Review card without a `Delivers:` pull request follows only a reviewed entry of
+config/feedback-delivery.json, never a guess from a `Spec:` line (ANYM-764, ANYM-798). A status never moves down, and agent verdicts (verified, reopened)
 are never changed. Every write call is recorded in `pending.json` before it is sent and audited to a private file; a
 call with an unknown outcome stops the run, is never retried, and blocks writes until a later inventory shows it
 landed or, read after D + 10 s, that it can no longer land. Runs on the orchestrator machine (Tiden token, gh, git, the owner's SSH); exit 0 done,
@@ -79,6 +79,7 @@ OPEN_CHECK = re.compile(r'\[open: (?:live|measured)\]')  # tiden_sync.OPEN_CHECK
 CHECK_LIMIT = 120
 MAPPING = Path('config') / 'feedback-delivery.json'
 MAPPING_KEYS = {'commit', 'pr', 'evidence', 'added'}
+HEADER = '_header'  # the mapping file's one sentence for its reader, not an entry (JSON has no comments)
 STALE = timedelta(hours=3)
 # Queue outcomes that close a row: written, already so, newer than its decision, or kept by the never-down rule.
 CLOSED = ('written', 'unchanged', 'superseded', 'further along', 'agent verdict kept')
@@ -257,11 +258,13 @@ def mapping_load(root):
         raw = json.loads(path.read_text(), object_pairs_hook=Pairs)
     except (OSError, ValueError):
         raise Refused(f'mapping refused: {MAPPING} is not JSON') from None
-    if not isinstance(raw, Pairs) or not all(SPEC.fullmatch(key) for key, _ in raw):
+    if not isinstance(raw, Pairs) or not all(SPEC.fullmatch(key) or (key == HEADER and isinstance(value, str))
+                                             for key, value in raw):
         raise Refused(f'mapping refused: {MAPPING} is not an object of ANYM-n entries')
-    names = [key for key, _ in raw]
+    rows = [(key, value) for key, value in raw if key != HEADER]
+    names = [key for key, _ in rows]
     entries, refused = {}, {}
-    for key, value in raw:
+    for key, value in rows:
         why = 'two entries for the card' if names.count(key) > 1 else entry_problem(value)
         if why:
             refused[key] = why
@@ -271,9 +274,12 @@ def mapping_load(root):
 
 
 def mapping_problem(ref, entry, root, gh):
-    """Why a well-formed entry of a Done card without a `Delivers:` pull request does not hold, or None."""
+    """Why a well-formed entry of a Done or Review card without a `Delivers:` pull request does not hold, or None."""
     if not ancestor(root, entry['commit']):
         return 'the commit is not on origin/main'
+    # A normal revert keeps the squash an ancestor; the line `git revert` writes survives the squash (COMMIT_MESSAGES).
+    if git(root, 'log', '-1', '--format=%H', '-F', f'--grep=This reverts commit {entry["commit"]}', 'origin/main').strip():
+        return 'reverted'
     reply = triage.parse(gh(['gh', 'pr', 'list', '-R', REPO, '--state', 'all', '--search', f'"{ref}" in:body', '--json',
                              'number,state,body,mergeCommit', '--limit', str(PR_LIMIT)]), 'gh pr list')
     if not isinstance(reply, list) or len(reply) >= PR_LIMIT:
@@ -297,7 +303,7 @@ def delivering(refs, status, root=ROOT, fetch=True, gh=None):
     The commit is the merge commit of the one merged pull request whose body delivers the card, on origin/main, or that
     of a mapping entry that holds; a card with none or more than one such pull request is absent (no change)."""
     entries, refused = mapping_load(root)
-    refused |= {ref: 'the card is not Done' for ref in entries if status.get(ref) != 'Done'}
+    refused |= {ref: 'the card is not Done or in Review' for ref in entries if status.get(ref) not in ('Done', 'Review')}
     if fetch and refs:
         git(root, 'fetch', '-q', 'origin', 'main')
     gh = gh or (lambda argv: triage.run(argv, GIT_TIMEOUT))
