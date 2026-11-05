@@ -1124,7 +1124,9 @@ def launch_agent(tmp_path, pull_exit):
     """Runs the ProgramArguments of the plist the document tells the operator to install, with stub git and uv that
     record what ran; returns the finished process and the record."""
     text = (Path(sync.__file__).parents[1] / 'docs/operations/feedback-triage.md').read_text()
-    agent = plistlib.loads(re.search(r'```xml\n(.*?)```', text, re.S)[1].encode())
+    block = re.search(r'```xml\n(.*?)```', text, re.S)
+    assert block
+    agent = plistlib.loads(block[1].encode())
     bin_, log = tmp_path / 'bin', tmp_path / 'ran.log'
     bin_.mkdir()
     for name, body in (('git', f'echo "git $*" >> {log}; exit {pull_exit}'), ('uv', f'echo "uv $*" >> {log}; exit 7'),

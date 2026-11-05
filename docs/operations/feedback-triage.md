@@ -167,7 +167,8 @@ python3 scripts/feedback_sync.py status
   this report is closed.") in the next triage or by hand, which the queue then applies.
 - Fail closed: the inventory, Tiden main, `gh`, `git fetch` and the receipts are all read before
   the first write; a failed, timed-out, non-JSON or truncated read ends the run with exit 1 and
-  no write. ssh runs with `BatchMode=yes`, git and `gh` with prompts off, stdin is never a
+  no write. A release receipt that exists and cannot be read (`http-current.json` over its 256 MiB
+  bound, `current.json` over 64 KiB, malformed) is such a read, named in `last-run.json`. ssh runs with `BatchMode=yes`, git and `gh` with prompts off, stdin is never a
   terminal, every subprocess has a timeout.
 - `last-run.json` (mode 0600): time, exit code, export head, per reason the feedback and card
   IDs, items waiting for a card or for main with their age in hours, the files (complete, open,
@@ -175,10 +176,12 @@ python3 scripts/feedback_sync.py status
 
 ### LaunchAgent `ai.deedkit.feedback-follow` (orchestrator machine)
 
-Prerequisites: a clean checkout of `main` used only by this job (`git pull --ff-only` there
-after a release; the run itself only fetches), an SSH key for `deedkit-prod` that needs no
-prompt, stored `gh` and Tiden tokens, and a logged-in macOS session. A run missed in sleep runs
-once on wake (launchd `StartInterval`). Install outside Git, in
+Prerequisites: a clean checkout of `main` used only by this job, an SSH key for `deedkit-prod`
+that needs no prompt, stored `gh` and Tiden tokens, coreutils `timeout` on the job's `PATH`, and a
+logged-in macOS session. A run missed in sleep runs once on wake (launchd `StartInterval`). Each
+run starts with `git pull --ff-only`, so the job runs current `main` without a hand step; the sync
+itself only fetches. A pull that fails or takes over 120 s (exit 124) writes `git pull failed (exit
+<n>)` to `launchd.err.log` and the run still syncs the code the checkout has. Install outside Git, in
 `~/Library/LaunchAgents/ai.deedkit.feedback-follow.plist`, with your absolute paths:
 
 ```xml
@@ -187,13 +190,13 @@ once on wake (launchd `StartInterval`). Install outside Git, in
 <plist version="1.0"><dict>
   <key>Label</key><string>ai.deedkit.feedback-follow</string>
   <key>ProgramArguments</key><array>
-    <string>/Users/OWNER/.local/bin/uv</string><string>run</string><string>--no-project</string>
-    <string>--python</string><string>3.13</string><string>python</string>
-    <string>scripts/feedback_sync.py</string><string>auto</string><string>--apply</string>
+    <string>/bin/sh</string><string>-c</string>
+    <string>timeout 120 git pull --ff-only || echo "git pull failed (exit $?) at $(date -u +%FT%TZ); this run syncs the current code" &gt;&amp;2; exec /Users/OWNER/.local/bin/uv run --no-project --python 3.13 python scripts/feedback_sync.py auto --apply</string>
   </array>
   <key>WorkingDirectory</key><string>/Users/OWNER/CHECKOUT</string>
   <key>EnvironmentVariables</key><dict>
     <key>PATH</key><string>/Users/OWNER/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    <key>GIT_TERMINAL_PROMPT</key><string>0</string>
   </dict>
   <key>StartInterval</key><integer>3600</integer>
   <key>StandardOutPath</key><string>/Users/OWNER/.deedkit/feedback-sync/launchd.log</string>
