@@ -100,6 +100,22 @@ BACKPRESSURE_CAP_SECONDS=900
 # After a pass that failed on a transient database error: this delay, doubled per consecutive failure up to the limit.
 DB_RETRY_SECONDS=5
 DB_RETRY_LIMIT_SECONDS=60
+DB_TRANSIENT=(psycopg.errors.QueryCanceled,psycopg.errors.LockNotAvailable,psycopg.errors.DeadlockDetected,
+    psycopg.errors.SerializationFailure,psycopg.errors.AdminShutdown,psycopg.errors.CrashShutdown,
+    psycopg.errors.CannotConnectNow,psycopg.errors.IdleSessionTimeout,psycopg.errors.TooManyConnections,
+    psycopg.errors.DiskFull,psycopg.errors.OutOfMemory)
+# A login the server refuses has no SQLSTATE: psycopg raises a plain OperationalError with libpq's text (English on
+# our databases, lc_messages en_US; under another language such an error is retried and logged).
+DB_LOGIN_REFUSED=('password authentication failed','no password supplied','no pg_hba.conf entry','role "','database "',
+    'not permitted to log in','permission denied for database')
+
+
+def transient_database_error(error):
+    """A timeout, a conflict, a busy or restarting server, a lost connection. Anything else stays fatal: the DSN is
+    read only at start, so a retry cannot repair a refused login, and a running container would hide it."""
+    if isinstance(error,DB_TRANSIENT):return True
+    if error.sqlstate:return False
+    return not any(text in str(error) for text in DB_LOGIN_REFUSED)
 
 
 def cooldown_seconds(profile,retry_after):
@@ -455,10 +471,10 @@ class EnrichmentWorker:
                     self.publish_profiles()
                     if not self.once():STOP.wait(10)
                 except psycopg.OperationalError as error:
-                    # Incident 11-05: one statement timeout in claim() ended the worker. A claim rolled back; a job
-                    # whose finish failed stays under its lease until that expires. The stop path keeps ending the
-                    # worker. The next pass proves the confinement again first; a lost one wakes this wait.
-                    if STOP.is_set() or self.requeueing:raise
+                    # Incident 11-05: one statement timeout in claim() ended the worker. A job whose finish failed, or
+                    # a claim whose commit was lost, stays under its lease until that expires. The stop path keeps
+                    # ending the worker. The next pass proves the confinement again first; a lost one wakes this wait.
+                    if STOP.is_set() or self.requeueing or not transient_database_error(error):raise
                     database_retry(error,delay)
                     STOP.wait(delay);delay=min(DB_RETRY_LIMIT_SECONDS,delay*2)
                 else:delay=DB_RETRY_SECONDS

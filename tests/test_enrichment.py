@@ -1363,7 +1363,7 @@ def test_a_real_statement_timeout_in_the_claim_backs_off_and_the_job_is_still_cl
     def stopping(files,row,profile):
         seen.append(row['attachment']);module.STOP.set();raise module.WorkerStopping()
     s,_,_=seeded;add_audio(s);w=stopping_worker(s,tmp_path,module);w.processor=stopping
-    monkeypatch.setattr(module,'DB_RETRY_SECONDS',0.1)
+    monkeypatch.setattr(module,'DB_RETRY_SECONDS',0.1,raising=False)
     held,free=threading.Event(),threading.Event()
     def holder():
         with s.pool.connection() as c:
@@ -1397,8 +1397,48 @@ def test_a_finish_that_keeps_timing_out_leaves_the_worker_running_and_the_job_un
     monkeypatch.setattr(module.STOP,'wait',wait)
     w.run()
     assert waited==[module.DB_RETRY_SECONDS,10]
+    assert_survived_under_lease(s,w,module,monkeypatch)
+
+
+def assert_survived_under_lease(s,w,module,monkeypatch):
+    """The job keeps its lease, attempt and spend, the OS lock is free, and after the lease expires it is claimed again."""
+    from messaging_service import resource_admission
     with s.pool.connection() as c:
         row=c.execute("SELECT state,attempts FROM attachment_enrichment WHERE attachment='enrich-audio'").fetchone()
-        assert row=={'state':'leased','attempts':1}     # as before: the lease expires and the job is claimed again
-        # The unfinished job holds the DB lease; keep it from blocking later tests.
+        assert row=={'state':'leased','attempts':1}
+        assert c.execute('SELECT attempts FROM enrichment_budget WHERE day=current_date').fetchone()['attempts']==1
+        assert c.execute('SELECT sum(attempts) n FROM processing_budget WHERE day=current_date').fetchone()['n']==1
+        assert c.execute("SELECT lease_until>clock_timestamp() AS held FROM processing_resource_leases WHERE resource='local-heavy'").fetchone()['held']
+    fd=resource_admission.lock_file(w.lock_directory)
+    assert fd is not None
+    import os;os.close(fd)
+    with s.pool.connection() as c:
         c.execute("UPDATE processing_resource_leases SET lease_until=clock_timestamp() WHERE resource='local-heavy'")
+        c.execute("UPDATE attachment_enrichment SET lease_until=clock_timestamp() WHERE attachment='enrich-audio'")
+    monkeypatch.undo()
+    again,_=w.claim()
+    assert again['attachment']=='enrich-audio' and again['attempts']==2
+    again['_resource_lease'].close()
+    with s.pool.connection() as c:
+        c.execute("UPDATE processing_resource_leases SET lease_until=clock_timestamp() WHERE resource='local-heavy'")
+
+
+# spec: ANYM-688
+def test_a_deferral_that_runs_out_of_retries_leaves_the_worker_running_and_the_job_under_its_lease(seeded,tmp_path,monkeypatch,stop_state):
+    import psycopg
+    from messaging_service.enrichment_providers import ModelBackpressure
+    module=stop_state;waited=[]
+    s,_,_=seeded;add_audio(s)
+    w=stopping_worker(s,tmp_path,module)
+    def busy(files,row,profile):raise ModelBackpressure(1)
+    w.processor=busy
+    def broken(row,profile,retry_after):raise psycopg.errors.QueryCanceled('synthetic lock wait')
+    monkeypatch.setattr(w,'_defer',broken);monkeypatch.setattr(module,'REQUEUE_SECONDS',0)
+    def wait(seconds=None):
+        waited.append(seconds)
+        if seconds==10:module.STOP.set()
+        return module.STOP.is_set()
+    monkeypatch.setattr(module.STOP,'wait',wait)
+    w.run()
+    assert waited==[module.DB_RETRY_SECONDS,10]
+    assert_survived_under_lease(s,w,module,monkeypatch)

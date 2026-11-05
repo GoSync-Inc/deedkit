@@ -250,12 +250,13 @@ authentication/rate-limit pauses use the existing durable controls. On SIGTERM t
 enrichment worker ends its child process group, requeues the job as `queued` /
 `worker_stopping` without consuming an attempt (the daily budget stays spent),
 releases its local-heavy lease and unpublishes its profile within the 90 s grace
-period. A transient database error in a pass (psycopg `OperationalError`: a statement or
-lock timeout, a deadlock, a lost connection) does not end the enrichment worker: it logs one
+period. A transient database error in a pass (a statement or lock timeout, a deadlock, a busy,
+full or restarting server, a lost connection) does not end the enrichment worker: it logs one
 line naming only the exception type, waits 5 s, doubled per consecutive failure up to 60 s, and
-tries again. A failed claim spent nothing; a job whose result could not be written stays under
-its lease until that expires. Exit 78, a failed requeue while stopping and any other error
-still end it. Fairness
+tries again. A claim that rolled back spent nothing. A claim whose commit reached the server
+but whose answer was lost keeps its attempt and budget, and that job, like one whose result
+could not be written, stays under its lease until that expires. Exit 78, a failed requeue while
+stopping, a refused login and any other error still end it. Fairness
 between modalities/accounts prevents a continuous audio backlog from hiding
 video work. All of this is source functionality; production enablement requires
 the verified promotion and applicable live-session authority in
