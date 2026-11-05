@@ -64,7 +64,9 @@ dsn=""; mode=""
 if [ -n "${{PROBE_TEST_DSN_FILE:-}}" ]; then dsn="$(cat "$PROBE_TEST_DSN_FILE")"; mode="$(ls -l "$PROBE_TEST_DSN_FILE" | cut -c1-10)"; fi
 echo "uv $* | cwd=${{PWD##*/}} dsn=$dsn dsnmode=$mode shard=${{DEEDKIT_TEST_SHARD:-}} fcs=${{FCS_TEST_DSN:-}} pid=$$" >> "$FAKE_LOG"
 [ "$1" = run ] || exit 0
-for arg in "$@"; do case "$arg" in --junitxml=*) [ -z "${{FAKE_JUNIT:-}}" ] || printf '%s' "$FAKE_JUNIT" > "${{arg#--junitxml=}}" ;; esac; done
+for arg in "$@"; do case "$arg" in --junitxml=*)
+  [ -z "${{FAKE_JUNIT:-}}" ] || printf '%s' "$FAKE_JUNIT" > "${{arg#--junitxml=}}"
+  [ "${{FAKE_JUNIT_FIFO:-0}}" = 0 ] || mkfifo "$(dirname "${{arg#--junitxml=}}")/junit-stalled.xml" ;; esac; done
 if [ "${{FAKE_UV_ORPHAN:-0}}" = 1 ]; then sleep 300 >/dev/null 2>&1 & echo "orphan pid=$!" >> "$FAKE_LOG"; fi
 echo "FAKE SUITE OUTPUT ${{DEEDKIT_TEST_SHARD:-}}"
 {BURN}
@@ -503,6 +505,31 @@ def test_the_full_root_suite_adds_up_the_skips_of_every_shard(mini, worktree):
     result = remote(env, '--full', worktree, 'root', FAKE_JUNIT=JUNIT)
     assert result.returncode == 0, result.stderr
     assert 'needs docker (CI covers): 6 tests did not run here: tests/test_auto_migration.py (4), tests/test_compose.py (2)' in result.stderr
+
+
+# spec: ANYM-638
+def test_a_module_level_docker_skip_counts_as_docker(mini, worktree):
+    home, env = mini
+    report = ('<testsuites><testsuite><testcase classname="" name="tests.test_mod"><skipped message="collection skipped">'
+              "('tests/test_mod.py', 1, 'Skipped: Docker is required')</skipped></testcase></testsuite></testsuites>")
+    result = remote(env, worktree, 'root', 'tests/test_app.py', FAKE_JUNIT=report)
+    assert 'needs docker (CI covers): 1 tests did not run here: tests.test_mod (1)' in result.stderr, result.stderr
+
+
+# spec: ANYM-638
+def test_a_report_path_that_is_no_regular_file_never_stalls_the_run(mini, worktree):
+    home, env = mini
+    result = remote(env, worktree, 'root', 'tests/test_app.py', FAKE_JUNIT=JUNIT, FAKE_JUNIT_FIFO='1', FAKE_UV_EXIT='3')
+    assert result.returncode == 3, result.stderr
+    assert 'tests/test_compose.py (1)' in result.stderr
+    assert not list((worker_dir(home) / 'runs').iterdir())
+
+
+# spec: ANYM-638
+def test_the_skip_summary_is_best_effort_in_the_exit_trap():
+    text = SCRIPT.read_text()
+    # A here-string needs a temporary file under bash 3.2, and a failure there would end `finish` under set -e.
+    assert 'report_skips || true' in text and 'done <<<' not in text
 
 
 # spec: ANYM-638

@@ -526,14 +526,20 @@ reap_jobs() {
 } 2>/dev/null
 
 # What a root run left out, from pytest's reports: every skip by module, those that need docker first. Never a test's
-# result; a stopped run has no report, so it gets the general line.
-SKIP_REPORT='import collections, re, sys, xml.etree.ElementTree as tree
+# result; a stopped run has no report, so it gets the general line. Best effort inside the exit trap: regular files only,
+# and SIGALRM ends the reader by itself at 20 s, also when the runner is gone.
+SKIP_REPORT='import collections, os, re, signal, sys, xml.etree.ElementTree as tree
+signal.alarm(20)
+paths = [path for path in sys.argv[1:] if os.path.isfile(path)]
+if not paths:
+    sys.exit(1)
 docker, other = collections.Counter(), collections.Counter()
-for path in sys.argv[1:]:
+for path in paths:
     for case in tree.parse(path).iter("testcase"):
         for skip in case.findall("skipped"):
             if not skip.get("type", "").startswith("pytest.xfail"):
-                needs = re.search("docker|container|compose", skip.get("message") or "", re.I)
+                reason = (skip.get("message") or "") + " " + (skip.text or "")  # A collection skip keeps it in the text.
+                needs = re.search("docker|container|compose", reason, re.I)
                 (docker if needs else other)[case.get("file") or case.get("classname") or case.get("name")] += 1
 def line(label, counts):
     names = ", ".join(f"{name} ({counts[name]})" for name in sorted(counts))
@@ -550,7 +556,7 @@ report_skips() {
       "this is not the full suite"
     return 0
   fi
-  while IFS= read -r line; do say "$line"; done <<< "$out"
+  printf '%s\n' "$out" | while IFS= read -r line; do say "$line"; done
 }
 
 finish() {
@@ -581,7 +587,7 @@ finish() {
   if [ -n "$DATABASES" ]; then
     pg="$(awk -v a="$(cpu_of "$RUN_DIR/.times")" -v b="$(cpu_of "$RUN_DIR/.times-before")" 'BEGIN { printf "%.1f", a - b }')"
   fi
-  if [ "$SUITE" = root ]; then report_skips; fi
+  if [ "$SUITE" = root ]; then report_skips || true; fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$WORKER" "$SUITE" "$START_ISO" "$((SECONDS - START_EPOCH))" \
     "$(cpu_of "$RUN_DIR/.times")" "$pg" "$status" >> "$ROOT_DIR/load.log"
   if [ "$(cat "$WORKER_DIR/run.pid" 2>/dev/null)" = "$$ $(started $$)" ]; then rm -f "$WORKER_DIR/run.pid"; fi
