@@ -580,6 +580,82 @@ def test_registry_reads_retry_a_transient_network_failure_and_nothing_else(monke
     assert len(calls) == 5 + pi.ATTEMPTS
 
 
+def fake_skopeo(monkeypatch, *outcomes):
+    """A fake `skopeo` at the subprocess boundary: one (exit code, stderr) per call; returns the calls and the waits."""
+    calls, delays, outcomes = [], [], list(outcomes)
+    def run(argv, **kwargs):
+        calls.append(argv)
+        code, stderr = outcomes.pop(0)
+        return subprocess.CompletedProcess(argv, code, "", stderr)
+    monkeypatch.setattr(pi.subprocess, "run", run)
+    monkeypatch.setattr(pi.time, "sleep", delays.append)
+    return calls, delays
+
+
+REGISTRY_400 = "writing blob: uploading layer chunked: StatusCode: 400, <html>"
+
+
+# spec: ANYM-793
+def test_push_survives_two_failed_copies_waiting_15_and_45_seconds(monkeypatch, capsys):
+    calls, delays = fake_skopeo(monkeypatch, (1, REGISTRY_400), (125, REGISTRY_400), (0, ""))
+    pi.Registry("ghcr.io/gosync-inc").push(Path("image.tar"), "ghcr.io/gosync-inc/deedkit-calls:" + STAGING)
+    assert len(calls) == 3 and calls[0] == calls[1] == calls[2] and calls[0][:2] == ["skopeo", "copy"]
+    assert delays == [15, 45]
+    printed = capsys.readouterr().err
+    assert "attempt 1 of 3" in printed and "exit 1" in printed and "attempt 2 of 3" in printed and "exit 125" in printed
+    assert "attempt 3" not in printed
+
+
+# spec: ANYM-793
+def test_push_refuses_as_before_after_exactly_three_failed_copies(monkeypatch, capsys):
+    calls, delays = fake_skopeo(monkeypatch, (1, "first " + REGISTRY_400), (1, "second " + REGISTRY_400),
+                                (1, "x" * 500 + "third " + REGISTRY_400))
+    with pytest.raises(pi.Refused) as refused:
+        pi.Registry("ghcr.io/gosync-inc").push(Path("image.tar"), "ghcr.io/gosync-inc/deedkit-calls:" + STAGING)
+    tail = ("x" * 500 + "third " + REGISTRY_400)[-400:]
+    assert str(refused.value) == f"skopeo copy failed (exit 1): {tail}"  # the message and stderr tail of `run`
+    assert len(calls) == 3 and delays == [15, 45]
+    assert "attempt 3 of 3" in capsys.readouterr().err
+
+
+# spec: ANYM-793
+def test_push_does_not_repeat_a_copy_that_timed_out(monkeypatch):
+    calls, delays = [], []
+    def slow(argv, **kwargs):
+        calls.append(argv)
+        raise subprocess.TimeoutExpired(argv, 1800)
+    monkeypatch.setattr(pi.subprocess, "run", slow)
+    monkeypatch.setattr(pi.time, "sleep", delays.append)
+    with pytest.raises(pi.Refused, match="did not finish"):  # only a non-zero exit is repeated: three would pass the job's limit
+        pi.Registry("ghcr.io/gosync-inc").push(Path("image.tar"), "ghcr.io/gosync-inc/deedkit-calls:" + STAGING)
+    assert len(calls) == 1 and delays == []
+
+
+# spec: ANYM-793
+def test_a_failing_tag_write_is_tried_once(monkeypatch):
+    calls, delays = [], []
+    def refuse(request, **kwargs):
+        calls.append(request.full_url)
+        raise OSError("HTTP Error 400: Bad Request")
+    monkeypatch.setattr(pi.urllib.request, "urlopen", refuse)
+    monkeypatch.setattr(pi.time, "sleep", delays.append)
+    with pytest.raises(pi.Refused, match="cannot write"):
+        pi.Registry("localhost:5000/dry-run", insecure=True).put("localhost:5000/dry-run/deedkit-calls:" + SHA, b"{}", MANIFEST)
+    assert len(calls) == 1 and delays == []
+
+
+# spec: ANYM-793
+def test_the_dry_run_push_uses_the_same_retry_and_waits_only_after_a_failure(monkeypatch):
+    registry, reference = pi.Registry("localhost:5000/dry-run", insecure=True), "localhost:5000/dry-run/deedkit-calls:" + STAGING
+    calls, delays = fake_skopeo(monkeypatch, (0, ""))
+    registry.push(Path("image.tar"), reference)
+    assert len(calls) == 1 and delays == []  # a first-try success waits for nothing
+    assert "--dest-tls-verify=false" in calls[0]
+    calls, delays = fake_skopeo(monkeypatch, (1, REGISTRY_400), (0, ""))
+    registry.push(Path("image.tar"), reference)  # finishes at once: the patched sleep is the only wait
+    assert len(calls) == 2 and delays == [15]
+
+
 # spec: ANYM-300
 @pytest.mark.parametrize("stderr", [
     TRANSIENT_FAILURES[8],
