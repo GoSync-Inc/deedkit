@@ -725,6 +725,20 @@ def hold_the_database(path, stop, hold_s, gap_s):
     return thread
 
 
+def hold_the_read_lock(store, release, seconds):
+    """Another reader holds the journal's lock for `seconds` at most, in its own thread, as a read in progress does."""
+    taken = threading.Event()
+
+    def hold():
+        with store._read_lock:
+            taken.set()
+            release.wait(seconds)
+    thread = threading.Thread(target=hold)
+    thread.start()
+    taken.wait()
+    return thread
+
+
 # spec: ANYM-563
 def test_a_journal_read_outlasts_a_commit_longer_than_sqlites_default_wait(tmp_path):
     store = VoiceService(tmp_path)
@@ -771,7 +785,7 @@ def test_a_journal_read_gives_up_at_its_bound_and_a_write_still_lands(tmp_path, 
     try:
         with pytest.raises(sqlite3.OperationalError, match='locked'):
             store.events_head()
-        assert time.monotonic() - started < 5  # The bound, not SQLite's own five-second wait.
+        assert time.monotonic() - started < 0.2 + 2  # The bound plus scheduling, not SQLite's own five-second wait.
     finally:
         stop.set()
         thread.join()
@@ -784,12 +798,39 @@ def test_a_journal_read_gives_up_at_its_bound_and_a_write_still_lands(tmp_path, 
 def test_a_read_queued_behind_another_gives_up_at_the_same_bound(tmp_path, monkeypatch):
     store = VoiceService(tmp_path)
     monkeypatch.setattr(core, 'JOURNAL_BUSY_S', 0.2)
+    release = threading.Event()
+    holder = hold_the_read_lock(store, release, 3)
     started = time.monotonic()
-    with store._read_lock:
+    try:
         with pytest.raises(TimeoutError):
             store.events_head()
-    assert time.monotonic() - started < 5
+        assert time.monotonic() - started < 0.2 + 2
+    finally:
+        release.set()
+        holder.join()
     assert store.events_head()['head'] == 0  # The refused read left the lock free.
+    store.close()
+
+
+# spec: ANYM-563
+def test_a_queued_read_that_then_meets_a_busy_database_keeps_its_first_deadline(tmp_path, monkeypatch):
+    store = VoiceService(tmp_path)
+    store.events_page(0, 1)
+    monkeypatch.setattr(core, 'JOURNAL_BUSY_S', 0.6)
+    release, stop = threading.Event(), threading.Event()
+    thread = hold_the_database(tmp_path / 'voice.sqlite3', stop, 30, None)
+    holder = hold_the_read_lock(store, release, 0.3)  # Half the bound in the queue, then the database stays busy.
+    started = time.monotonic()
+    try:
+        with pytest.raises(sqlite3.OperationalError, match='locked'):
+            store.events_head()
+        taken = time.monotonic() - started
+    finally:
+        stop.set()
+        release.set()
+        thread.join()
+        holder.join()
+    assert 0.5 < taken < 0.6 + 2, taken
     store.close()
 
 
@@ -800,6 +841,23 @@ def test_retrying_reads_leave_a_live_calls_writes_and_the_event_loop_within_boun
     store.events_page(0, 1)
     stop = threading.Event()
     thread = hold_the_database(tmp_path / 'voice.sqlite3', stop, 0.02, 0.02)  # Reads keep meeting a busy database.
+    inner, waits = store.lock, []
+
+    class Timed:
+        """The service RLock, timing the writer's outermost acquisitions, as the ten-thousand-event test does."""
+        depth = 0
+
+        def __enter__(self):
+            started = time.perf_counter()
+            inner.acquire()
+            if Timed.depth == 0:
+                waits.append(time.perf_counter() - started)
+            Timed.depth += 1
+
+        def __exit__(self, *args):
+            Timed.depth -= 1
+            inner.release()
+    store.lock = Timed()
 
     def measure(seconds):
         """The slowest live-call write and the slowest 10 ms event-loop tick over `seconds`; a write that fails raises."""
@@ -832,9 +890,12 @@ def test_retrying_reads_leave_a_live_calls_writes_and_the_event_loop_within_boun
     def reader():
         while not finished.is_set():
             store.events_head()
+            store.events_page(0, 1)
             reads.append(1)
     try:
         write_alone, tick_alone = measure(1.5)
+        slowest_alone = max(waits)
+        waits.clear()
         with concurrent.futures.ThreadPoolExecutor(1) as pool:
             job = pool.submit(reader)
             try:
@@ -846,6 +907,8 @@ def test_retrying_reads_leave_a_live_calls_writes_and_the_event_loop_within_boun
         stop.set()
         thread.join()
     assert reads  # The reader got in under the same contention: it recovers on its own.
+    # The stated bound (README): a write's wait for the service lock, p99 within its slowest alone plus 100 ms, never a second.
+    assert sorted(waits)[int(len(waits) * 0.99)] < slowest_alone + 0.1 and max(waits) < 1.0, (max(waits), slowest_alone)
     assert write_read < write_alone + 1.0, (write_read, write_alone)
     assert tick_read < tick_alone + 0.25, (tick_read, tick_alone)
     store.close()
