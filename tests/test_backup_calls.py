@@ -594,6 +594,20 @@ def real_helper(tmp_path, age_stub, monkeypatch):
     subprocess.run(['docker', 'rm', '--force', name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
 
 
+def capture_running(real, name, staging, timeout):
+    """Start the helper, and return once its copy exists on the staging mount: a writer started then overlaps it."""
+    outcome = {}
+    def attach():
+        outcome['result'] = real.attach(name, timeout)
+    thread = threading.Thread(target=attach)
+    thread.start()
+    limit = time.monotonic() + 60
+    while not (staging / 'voice.copy.sqlite3').exists():
+        assert thread.is_alive() and time.monotonic() < limit, 'the copy never started'
+        time.sleep(.01)
+    return thread, outcome
+
+
 # spec: ANYM-778
 def test_in_the_real_container_a_writer_stays_within_the_bound_and_the_snapshot_is_whole(tmp_path, real_helper):
     source = tmp_path / 'data' / 'voice.sqlite3'
@@ -606,14 +620,20 @@ def test_in_the_real_container_a_writer_stays_within_the_bound_and_the_snapshot_
     os.chmod(source, 0o666)
     real, name, staging, image = real_helper()
     stop, times, errors = threading.Event(), [], []
+    capture, outcome = capture_running(real, name, staging, 300)
     thread = threading.Thread(target=writer_loop, args=(source, stop, times, errors), kwargs={'limit': 40})
     thread.start()
     try:
-        code, output = real.attach(name, 300)
+        while not times and thread.is_alive():
+            time.sleep(.005)
+        assert capture.is_alive() and (staging / 'voice.copy.sqlite3').exists(), 'the first commit must land during the copy'
+        thread.join(timeout=60)
+        capture.join(timeout=300)
     finally:
         stop.set()
         thread.join(timeout=60)
-    assert (code, json.loads(output)) == (0, {'status': 'ok'}) and not errors and times
+    code, output = outcome['result']
+    assert (code, json.loads(output)) == (0, {'status': 'ok'}) and not errors and len(times) == 40
     assert max(times) <= CALLS_WRITER_BOUND_SECONDS
     os.chmod(source, 0o644)
     check = ('import sqlite3,sys;d=sqlite3.connect("file:/s/voice.sqlite3?mode=ro",uri=True);'
@@ -632,19 +652,21 @@ def test_in_the_real_container_its_memory_limit_kills_it_and_not_the_writer(tmp_
     source.unlink()
     make_state(source, rows=5200, bulk=4000, canary=False)
     os.chmod(source, 0o666)
-    hog = 'held = []\nimport threading, time\ndef _hog():\n    time.sleep(.3)\n    while True:\n        held.append(b"x" * 8388608)\n        time.sleep(.01)\nthreading.Thread(target=_hog, daemon=True).start()\n'
+    hog = 'held = []\nimport threading, time\ndef _hog():\n    time.sleep(1)\n    while True:\n        held.append(b"x" * 8388608)\n        time.sleep(.01)\nthreading.Thread(target=_hog, daemon=True).start()\n'
     real, name, staging, _ = real_helper(hog)
     stop, times, errors = threading.Event(), [], []
+    capture, outcome = capture_running(real, name, staging, 120)
     thread = threading.Thread(target=writer_loop, args=(source, stop, times, errors))
     thread.start()
     try:
-        code, _ = real.attach(name, 120)
+        capture.join(timeout=120)
         died_after = len(times)
         time.sleep(.3)
     finally:
         stop.set()
         thread.join(timeout=30)
-    assert code != 0 and not (staging / 'voice.sqlite3').exists()
+    # 137 is SIGKILL, the memory limit's; the helper's own failures all exit 3.
+    assert outcome['result'][0] == 137 and not (staging / 'voice.sqlite3').exists() and died_after > 0
     assert not errors and len(times) > died_after and max(times) <= CALLS_WRITER_BOUND_SECONDS
     assert real.inspect(name) is None or not real.inspect(name)['State']['Running']
 
