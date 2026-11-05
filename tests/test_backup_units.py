@@ -485,6 +485,137 @@ def test_the_catchups_whole_budget_ends_before_the_next_daily_run_and_its_timer_
     assert admission()[1] == 16 * 3600 + 2 * 60 + 59
 
 
+CALLS_UNITS = ('deedkit-calls-backup.service', 'deedkit-calls-backup-catchup.service')
+HOUR = 3600
+
+
+def real_config(tmp_path, name):
+    path = tmp_path / name
+    path.write_text((DEPLOY / name).read_text())
+    path.chmod(0o600)
+    return backup_runner.config(path)
+
+
+def timer_start(name):
+    timer = unit_lines(name)['Timer']
+    (start,) = backup_runner.timer_starts(DEPLOY / name)
+    return start + backup_runner.timer_delay(DEPLOY / name) + seconds(timer['AccuracySec'][0])
+
+
+def unit_bound(service):
+    lines = unit_lines(service)['Service']
+    return seconds(lines['TimeoutStartSec'][0]) + 2 * seconds(lines['TimeoutStopSec'][0])
+
+
+# spec: ANYM-782
+def test_the_calls_units_run_the_host_runner_with_their_config_recover_with_it_and_write_only_their_directories(tmp_path):
+    cfg = real_config(tmp_path, 'backup-runner-calls.example.json')
+    config = '/opt/deedkit/calls-backup/runner.json'
+    for name in CALLS_UNITS:
+        service = unit_lines(name)['Service']
+        assert shlex.split(service['ExecStart'][0]) == ['/usr/bin/python3', '-I', RUNNER, '--config', config]
+        stop = service['ExecStopPost'][0]
+        assert stop.endswith(f'{RUNNER} --config {config} --recover-stop') or stop.endswith(f'{RUNNER} --config {config} --recover-stop\'')
+        assert service['Type'] == ['oneshot'] and service['User'] == ['root'] and 'Restart' not in service
+        assert set(service['ReadWritePaths'][0].split()) == {str(Path(cfg['directory']).parent), str(Path(cfg['host_lock']).parent)}
+        assert all(key in service for key in ('NoNewPrivileges', 'PrivateTmp', 'ProtectHome', 'ProtectSystem'))
+    assert 'ExecCondition' not in unit_lines(CALLS_UNITS[0])['Service']
+
+
+# spec: ANYM-782
+def test_the_calls_units_time_limit_covers_the_runs_budgets_and_stays_inside_the_admission_bound(tmp_path):
+    cfg = real_config(tmp_path, 'backup-runner-calls.example.json')
+    assert backup_runner.worst_case(cfg) == 5515
+    for name in CALLS_UNITS:
+        service = unit_lines(name)['Service']
+        assert seconds(service['TimeoutStartSec'][0]) >= backup_runner.worst_case(cfg) - backup_runner.RECOVERY_BUDGET
+        assert seconds(service['TimeoutStopSec'][0]) == backup_runner.UNIT_STOP_SECONDS
+        assert unit_bound(name) <= backup_runner.admission_bound(cfg)
+
+
+# spec: ANYM-782
+def test_the_calls_timers_are_read_by_the_runner_persistent_and_installed():
+    for name, service in (('deedkit-calls-backup.timer', CALLS_UNITS[0]), ('deedkit-calls-backup-catchup.timer', CALLS_UNITS[1])):
+        lines = unit_lines(name)
+        assert len(backup_runner.timer_starts(DEPLOY / name)) == 1 and lines['Timer']['Persistent'] == ['true']
+        assert lines['Timer']['AccuracySec'] == ['1s'] and lines['Timer']['Unit'] == [service]
+        assert lines['Install']['WantedBy'] == ['timers.target']
+
+
+# spec: ANYM-782
+def test_the_calls_catchup_clock_condition_admits_only_04_00_to_04_59_and_fails_closed(tmp_path):
+    script = sh_script(unit_lines(CALLS_UNITS[1])['Service']['ExecCondition'][0])
+    for clock in ('0400', '0415', '0459'):
+        assert run_condition(script, tmp_path, clock=clock, freshness=0), clock
+    for clock in ('0000', '0215', '0359', '0500', '0859', '1600', '2359', 'x', ''):
+        assert not run_condition(script, tmp_path, clock=clock, freshness=0), clock
+
+
+# spec: ANYM-782
+def test_the_calls_catchup_starts_only_for_a_stale_or_unknown_status_file(tmp_path):
+    script = sh_script(unit_lines(CALLS_UNITS[1])['Service']['ExecCondition'][1])
+    start = shlex.split(script.split(';', 1)[0].replace('>/dev/null 2>&1', ''))
+    assert start[:3] == ['/usr/bin/python3', '-I', '/opt/deedkit/calls-backup/freshness.py']
+    assert start[start.index('--status') + 1] == '/opt/deedkit/calls-backup/backups/status.json'
+    assert start[start.index('--max-age-hours') + 1] == '22'
+    assert run_condition(script, tmp_path, freshness=4) and run_condition(script, tmp_path, freshness=5)
+    for code in (0, 2, 127):
+        assert not run_condition(script, tmp_path, freshness=code)
+
+
+# spec: ANYM-782
+def test_every_installed_example_is_accepted_and_only_calls_and_recordings_name_each_others_timers(tmp_path):
+    calls = real_config(tmp_path, 'backup-runner-calls.example.json')
+    recordings = real_config(tmp_path, 'backup-runner-recordings.example.json')
+    calendar = real_config(tmp_path, 'backup-runner-calendar.example.json')
+    assert 'timers' not in calendar and 'calls' not in calendar
+    assert {Path(t).name for t in recordings['recordings']['timers']} >= {'deedkit-calls-backup.timer', 'deedkit-calls-backup-catchup.timer'}
+    assert {Path(t).name for t in calls['calls']['timers']} == {
+        'personal-os-backup.timer', 'deedkit-calendar-backup.timer', 'deedkit-calendar-backup-catchup.timer',
+        'deedkit-recordings-backup.timer', 'deedkit-recordings-backup-catchup.timer'}
+
+
+# spec: ANYM-782
+def test_each_profiles_worst_case_ends_before_the_next_start_and_the_latest_evening_catchups_clear_the_calls_slot(tmp_path):
+    calls = real_config(tmp_path, 'backup-runner-calls.example.json')
+    recordings = real_config(tmp_path, 'backup-runner-recordings.example.json')
+    day = 24 * HOUR
+    slot, retry = timer_start('deedkit-calls-backup.timer'), timer_start('deedkit-calls-backup-catchup.timer')
+    # (start, bound, next start). Messaging's end is its own unit's and the shared lock's; its unit is not in this repository.
+    runs = [
+        (timer_start('deedkit-calendar-backup.timer'), unit_bound('deedkit-calendar-backup.service'), MESSAGING_RUN),
+        (timer_start('deedkit-calendar-backup-catchup.timer'), unit_bound('deedkit-calendar-backup-catchup.service'),
+         timer_start('deedkit-recordings-backup.timer')),
+        (timer_start('deedkit-recordings-backup.timer'), backup_runner.admission_bound(recordings),
+         timer_start('deedkit-recordings-backup-catchup.timer')),
+        (timer_start('deedkit-recordings-backup-catchup.timer'), backup_runner.admission_bound(recordings), day + 2 * HOUR + 15 * 60),
+        (slot, backup_runner.admission_bound(calls), retry),
+        (retry, backup_runner.admission_bound(calls), 16 * HOUR)]
+    for start, bound, following in runs:
+        assert start + bound <= following, (start, bound, following)
+    last = day - 1  # a clock condition admits a catch-up until 23:59:59
+    for bound in (unit_bound('deedkit-calendar-backup-catchup.service'), backup_runner.admission_bound(recordings)):
+        assert last + bound + backup_runner.GUARD_SECONDS <= day + backup_runner.timer_starts(DEPLOY / 'deedkit-calls-backup.timer')[0]
+
+
+# spec: ANYM-782
+def test_the_runners_admission_reading_the_real_timer_files_admits_the_calls_and_recordings_slots(tmp_path):
+    def following(cfg_timers, start):
+        starts = []
+        for path in cfg_timers:
+            name = Path(path).name
+            starts += [MESSAGING_RUN] if name == 'personal-os-backup.timer' else backup_runner.timer_starts(DEPLOY / name)
+        return backup_runner.next_start(start, starts)
+    calls = real_config(tmp_path, 'backup-runner-calls.example.json')
+    recordings = real_config(tmp_path, 'backup-runner-recordings.example.json')
+    for cfg, timers, names in ((calls, calls['calls']['timers'], ('deedkit-calls-backup.timer', 'deedkit-calls-backup-catchup.timer')),
+                               (recordings, recordings['recordings']['timers'],
+                                ('deedkit-recordings-backup.timer', 'deedkit-recordings-backup-catchup.timer'))):
+        for name in names:
+            start = timer_start(name)
+            assert start + backup_runner.admission_bound(cfg) <= following(timers, start) - backup_runner.GUARD_SECONDS, name
+
+
 # spec: ANYM-607
 def test_a_start_the_condition_skipped_recovers_nothing_and_every_other_end_recovers(tmp_path):
     script = stop_post()

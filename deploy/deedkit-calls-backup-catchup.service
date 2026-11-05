@@ -1,0 +1,30 @@
+[Unit]
+Description=DeedKit calls state encrypted backup, same-night catch-up (ANYM-782)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Starts only when both conditions pass. 1: the clock is between 04:00 and 04:59 UTC (a failed read skips), so a Persistent=
+# run after a later reboot leaves the day to the daily unit and never makes a second snapshot. 2: the newest snapshot in the
+# runner's status file is over 22 h old or unknown (freshness.py exits 4 or 5). That file is delivery state, not a proof:
+# it decides this start only; calls-backup-freshness.py on the backup server answers whether the backup is protected.
+# On a healthy day this is a no-op. The runner's own admission still applies.
+ExecCondition=/bin/sh -c 'm=$$(date -u +%%H%%M) || exit 1; case "$$m" in [0-2][0-9][0-5][0-9]) ;; *) exit 1;; esac; [ "$$m" -ge 400 ] && [ "$$m" -le 459 ]'
+ExecCondition=/bin/sh -c '/usr/bin/python3 -I /opt/deedkit/calls-backup/freshness.py --status /opt/deedkit/calls-backup/backups/status.json --max-age-hours 22 >/dev/null 2>&1; r=$$?; [ "$$r" -eq 4 ] || [ "$$r" -eq 5 ]'
+ExecStart=/usr/bin/python3 -I /opt/personal-os-probe/ops/backup_runner.py --config /opt/deedkit/calls-backup/runner.json
+ExecStopPost=/bin/sh -c '[ "$$SERVICE_RESULT" = exec-condition ] || exec /usr/bin/python3 -I /opt/personal-os-probe/ops/backup_runner.py --config /opt/deedkit/calls-backup/runner.json --recover-stop'
+TimeoutStartSec=5400s
+TimeoutStopSec=180s
+User=root
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+MemoryMax=192M
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/deedkit/calls-backup /opt/personal-os-probe/backups

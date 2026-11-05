@@ -698,7 +698,7 @@ Installation, activation, the first protected snapshot and the restore drill are
 The calls state (`voice.sqlite3`) is backed up as its own profile. This section is the producer; the backup server's
 proof is [Calls verifier instance](BACKUP_R2.md#calls-verifier-instance) (ANYM-781: an isolated restore recomputes
 `PRAGMA integrity_check`, the per-table row counts and the row digests against the manifest, any difference is
-`restore_mismatch` and the previous protected point stays) and the schedule, freshness and installation are ANYM-782. Nothing runs it until then, and
+`restore_mismatch` and the previous protected point stays) and the schedule, freshness and installation are ANYM-782 (below), and
 `docs/operations/production.md` keeps its pre-release SQLite backup clause until ANYM-782's first scheduled run reads fresh.
 
 What the bundle holds: the whole database: briefs, calls and results, events, learning tables, decision journals and the
@@ -742,3 +742,36 @@ previous protected point, the other profiles' journals and the calls container u
 
 Plaintext exists only in the helper's memory and the staging directory, which is emptied after encryption and on every
 failure. Logs and the status file hold codes and counts only.
+
+### Calls state: slot and units (ANYM-782)
+
+`deedkit-calls-backup.timer` runs the job daily at 02:15 UTC; `deedkit-calls-backup-catchup.timer` at 04:15 UTC acts only
+between 04:00 and 04:59 and when the runner's status file reads the newest snapshot over 22 hours old or unknown. 02:15 follows
+the latest evening catch-up a clock condition admits (23:59:59 + 6300 s + two 180 s stops = 01:50:59, plus the 15 minute guard).
+Each unit's `TimeoutStartSec` is 5400 s: the run's 5395 s from the example's budgets, inside the admission bound of 5875 s
+(worst case 5515 s, two stops). The calls and recordings configurations name each other's timers; the calendar configuration
+rejects unknown keys and has none, so it stays apart by the shared lock and the calls-side admission. On the host, install the
+timer files before a configuration names them: a missing file is `_skipped_schedule_unknown`. `deploy` pins the image in
+`/opt/deedkit/calls-backup/runner.json` once it exists and waits for the calls units as for the others.
+
+Host install: `/opt/deedkit/calls-backup/runner.json` (root `0600`) from the example, recipient file, transfer key, known hosts,
+`freshness.py` (a copy of `deploy/calendar-backup-freshness.py`), staging owned by 10001 mode `0700`, the four units. Undo:
+`systemctl disable --now deedkit-calls-backup.timer deedkit-calls-backup-catchup.timer`, remove the calls timers from the
+recordings configuration and then the unit files, the instance's line in the instances file, its restricted SSH command and
+delivery key, and the new configurations. Revocation is a step: restoring earlier files does not undo new access. Protected
+data stays.
+
+### Calls state: freshness
+
+On the backup server, one command away (`ssh root@backup-1 ...`; proofs are root `0600`), installed as
+`/opt/deedkit-backup-r2/calls-backup-freshness.py` (root, `0755`):
+
+```sh
+python3 -I /opt/deedkit-backup-r2/calls-backup-freshness.py --verifier-directory /var/lib/deedkit-calls-backup-r2/verification --max-age-hours 36
+```
+
+Read-only. It follows `last-success.json` to `proof-<verification_id>.json` and prints one JSON line: `status` (`fresh`, `stale`,
+`unknown`), `captured_at`, `age_hours` from that capture, and the verifier's `last_error`. Exit 0 fresh, 4 stale, 5 unknown; the
+limit defaults to 36 hours, so one missed day shows. A rejected candidate leaves the old proof current and a retried old
+snapshot keeps its capture age. No timer runs it, as for recordings. The catch-up's `status.json` check on the host is delivery
+state, not a proof: it only decides whether the catch-up starts.

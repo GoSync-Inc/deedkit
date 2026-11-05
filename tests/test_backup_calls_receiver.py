@@ -243,6 +243,20 @@ def test_a_fresh_snapshot_reads_fresh_through_the_whole_chain(calls_instance):
     assert freshness().evaluate(s.directory, 36, now)[1]['status'] == 'fresh'
 
 
+# spec: ANYM-782
+def test_the_calls_proof_reader_reads_the_real_proof_of_the_whole_chain(calls_instance):
+    s = calls_instance
+    now = datetime.now(timezone.utc)
+    captured = (now - timedelta(hours=2)).isoformat()
+    s.deliver(sealed(s.host.parent, captured=captured), BID)
+    s.verify()
+    spec = importlib.util.spec_from_file_location('calls_backup_freshness', ROOT / 'deploy' / 'calls-backup-freshness.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    code, answer = module.evaluate(s.directory, 36, now)
+    assert code == 0 and answer['status'] == 'fresh' and answer['captured_at'] == captured
+
+
 # spec: ANYM-781
 @pytest.mark.parametrize('change', ['captured_at', 'tables'])
 def test_a_helper_that_lies_about_the_manifest_is_refused_and_protects_nothing(calls_instance, change):

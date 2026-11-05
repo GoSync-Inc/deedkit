@@ -1,0 +1,11 @@
+[Unit]
+Description=DeedKit calls state backup catch-up (04:15 UTC, only when the newest snapshot is old)
+
+[Timer]
+OnCalendar=*-*-* 04:15:00 UTC
+Persistent=true
+AccuracySec=1s
+Unit=deedkit-calls-backup-catchup.service
+
+[Install]
+WantedBy=timers.target

@@ -86,6 +86,13 @@ volume) (owner 11-03, see Data egress).
     them. One protected point plus room for one candidate: the rotation keeps no older point (owner 10-28
     «Ну вообще можно регулярный, ну то есть все одинаковый, короче, пока делать, да»). Agent key files are
     not in it.
+  - The calls state backup (ANYM-782, BACKUP.md "Calls state"): briefs, calls and results, events, learning tables,
+    decision journals and single-use media-handshake tokens, encrypted, daily to the same backup server and the object
+    storage its R2 receiver requires, kept as the last protected point there plus `keep_local` = 1 on the production
+    host. A deleted call leaves the live database at once and leaves the backup after the next successful sanitized
+    replacement (`VACUUM INTO`, ANYM-778) and rotation, not before; this line implies no call-deletion feature. The
+    orchestrator's reading of the "Backups" line above and owner 10-28 «все одинаковый» for every profile; no owner line
+    names the calls state.
   - Webhook receivers named by an agent: hint, test, endpoint, subscription, event, account, chat,
     message, sender and send IDs, the subscription version, event kinds and times, wake reasons, the
     count of omitted references, the next tool to call, the signature headers, the delivery timing, and

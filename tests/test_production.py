@@ -3583,6 +3583,12 @@ def test_an_automatic_deploy_installs_the_candidates_backup_runner_with_its_imag
     assert host.events == [] and p.read(host.state / NEWEST / "backup-runner.json")["status"] == "installed"
 
 
+# spec: ANYM-782
+def test_a_backup_runner_install_pins_the_calls_config_and_waits_for_the_calls_units():
+    assert Path("/opt/deedkit/calls-backup/runner.json") in p.RUNNER_CONFIGS
+    assert {"deedkit-calls-backup.service", "deedkit-calls-backup-catchup.service"} <= set(p.RUNNER_UNITS)
+
+
 # spec: ANYM-488
 @pytest.mark.parametrize("case", ["unit-active", "unfinished-journal", "other-image", "pull-failed", "pull-timeout",
                                   "call-active", "calls-unknown"])

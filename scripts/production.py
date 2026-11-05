@@ -4045,11 +4045,13 @@ def follow_producer(settings, mirror, plan, candidate, release):
     producer_reads(settings, mirror, plan["target"])
 
 
-# Owner 11-04 («давай все делать не ждать ничего»): `deploy` installs the backup runner itself. The three backup profiles
-# (BACKUP.md) run the one host runner and pin messaging's backup image; the recordings profile exists once activated.
+# Owner 11-04 («давай все делать не ждать ничего»): `deploy` installs the backup runner itself. The backup profiles
+# (BACKUP.md) run the one host runner and pin messaging's backup image; recordings and calls exist once installed.
 RUNNER_CONFIGS = (Path("/opt/personal-os-probe/backup-config/runner.json"),
-                  Path("/opt/deedkit/calendar-backup/runner.json"), Path("/opt/deedkit/recordings-backup/runner.json"))
-RUNNER_UNITS = (*BACKUP_UNITS, "deedkit-recordings-backup.service", "deedkit-recordings-backup-catchup.service")
+                  Path("/opt/deedkit/calendar-backup/runner.json"), Path("/opt/deedkit/recordings-backup/runner.json"),
+                  Path("/opt/deedkit/calls-backup/runner.json"))
+RUNNER_UNITS = (*BACKUP_UNITS, "deedkit-recordings-backup.service", "deedkit-recordings-backup-catchup.service",
+                "deedkit-calls-backup.service", "deedkit-calls-backup-catchup.service")
 RUNNER_PYTHON = "/usr/bin/python3"  # the interpreter of the backup units' ExecStart
 
 
