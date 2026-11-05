@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import time
 
+from hypothesis import given, strategies as st
 import httpx
 from pydantic import ValidationError
 import pytest
@@ -15,7 +16,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'services/recordings/src'))
 from deedkit_recordings.app import create_app
 from deedkit_recordings.archive import ArchiveRuntime
-from deedkit_recordings.archive_store import backup_archive, namespace
+from deedkit_recordings.archive_store import backup_archive, namespace, stage_due
 from deedkit_recordings.omi import Provider
 from deedkit_recordings.security import ArchiveSettings, Failure
 
@@ -67,8 +68,8 @@ class Omi:
         if self.hide_overview and not detail:
             value['structured'].pop('overview', None)
         if detail:
-            value.update(transcript_included=True, transcript_segments=[
-                {'text': item['text'], 'speaker': 'Speaker 1', 'start': 0, 'end': 5}])
+            value.update(transcript_included=True, transcript_segments=item.get('segments', [
+                {'text': item['text'], 'speaker': 'Speaker 1', 'start': 0, 'end': 5}]))
         return value
 
     def count(self, token, buckets):
@@ -881,6 +882,290 @@ def test_summary_arriving_48_hours_after_creation_is_picked_up_within_the_daily_
         assert after_day_one and all(b - a >= 24 * 3600 for a, b in zip(after_day_one, after_day_one[1:]))
         first_day = [t for t in details if t < T0 + 24 * 3600]
         assert len(first_day) <= 9 and len([t for t in details if T0 + 24 * 3600 <= t < T0 + 48 * 3600]) <= 2
+        await r.close()
+    asyncio.run(run())
+
+
+HOUR = 3600
+FAR_DUE = 1e18
+
+
+async def seed_saved(r, account, omi, created, count, saved_at):
+    """`count` records already read once at `saved_at`, without provider calls."""
+    items = [omi.add(f'stage-{n:03d}', created) for n in range(count)]
+    await r.db('discover', account, [{'id': i['id'], 'created_at': i['created_at']} for i in items], None, saved_at, lambda: None)
+    for item in items:
+        await r.db('observe', account, item['id'], {'id': item['id'], 'created_at': item['created_at']},
+                   {'transcript': ('available', 'Saved words', None), 'summary': ('available', 'Saved overview', None)}, saved_at)
+    return [i['id'] for i in items]
+
+
+# spec: ANYM-759
+@given(created=st.integers(0, 4 * 10 ** 9), age=st.integers(-10 ** 6, 10 ** 7))
+def test_the_next_stage_is_the_first_stage_after_the_read_and_nothing_between(created, age):
+    now = created + age
+    due = stage_due({'created_at': iso(created)}, now)
+    stages = [created + 6 * HOUR, created + 48 * HOUR]
+    assert due > now and due in [*stages, FAR_DUE]
+    assert not [stage for stage in stages if now < stage < due]
+    assert (due == FAR_DUE) == (now >= stages[1])
+
+
+# spec: ANYM-759
+@pytest.mark.parametrize('created_at', [None, 'not a time', ''])
+def test_a_record_without_a_usable_creation_time_has_no_stage(created_at):
+    assert stage_due({'created_at': created_at} if created_at is not None else {}, T0) == FAR_DUE
+
+
+# spec: ANYM-759
+@pytest.mark.parametrize('age,stages', [(1, [6, 48]), (30, [48]), (60, []), (72, [])])
+def test_an_unchanged_record_is_read_again_only_at_the_stages_still_ahead(tmp_path, age, stages):
+    path, doc = build(tmp_path); omi = Omi()
+    created = T0 - age * HOUR
+    omi.add('rec', created)
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        await passes(r, omi, T0, 900, 1)
+        status = await r.status(account, now=T0 + 60)
+        assert status['pending'] == 0 and status['failed'] == 0  # waiting for a stage is not an unfinished read
+        await passes(r, omi, T0 + 900, 900, 220)
+        assert [c[0] for c in omi.of('tokenaaaa', 'detail')] == [T0] + [created + s * HOUR for s in stages]
+        assert sql(doc, 'SELECT due FROM records') == [(FAR_DUE,)]
+        assert sql(doc, 'SELECT revision FROM records') == [(1,)] and sql(doc, 'SELECT count(*) FROM events') == [(1,)]
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-759
+def test_a_changed_list_row_read_after_a_stage_time_counts_as_that_stage(tmp_path):
+    path, doc = build(tmp_path); omi = Omi()
+    item = omi.add('rec', T0)
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        await passes(r, omi, T0, 900, 19)
+        item['structured']['overview'] = 'Changed just before the stage'
+        await passes(r, omi, T0 + 19 * 900, 900, 200)  # a row changed at 4.75 h is read then; 6 h still follows, once
+        assert [c[0] for c in omi.of('tokenaaaa', 'detail')] == [T0, T0 + 19 * 900, T0 + 6 * HOUR, T0 + 48 * HOUR]
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-759
+def test_a_crash_after_the_stage_get_keeps_the_text_and_repeats_the_read_once(tmp_path):
+    path, doc = build(tmp_path); omi = Omi()
+    item = omi.add('rec', T0 - HOUR)
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        await passes(r, omi, T0, 60, 1)
+        before = (await r.db('record', account, 'rec'))['parts']['transcript']['text']
+        item['text'] = 'Words Omi changed later'
+        def crash(): raise RuntimeError('synthetic kill before commit')
+        original = r.db
+        async def crashing(method, *args):
+            if method == 'observe':
+                args = (*args[:5], crash, *args[6:])
+            return await original(method, *args)
+        r.db = crashing
+        await passes(r, omi, T0 + 5 * HOUR, 60, 1)
+        r.db = original
+        saved = await r.db('record', account, 'rec')
+        assert saved['parts']['transcript']['text'] == before and saved['revision'] == 1
+        await r.close()
+        r = runtime(path, omi); await r.start(background=False)
+        await passes(r, omi, T0 + 5 * HOUR + 60, 60, 3)
+        assert len(omi.of('tokenaaaa', 'detail')) == 3
+        assert 'Words Omi changed later' in (await r.db('record', account, 'rec'))['parts']['transcript']['text']
+        assert sql(doc, 'SELECT revision FROM events ORDER BY sequence') == [(1,), (2,)]
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-759
+@pytest.mark.parametrize('segments,revision,events', [
+    ([{'text': 'Words of rec', 'speaker': 'Speaker 1', 'start': 0, 'end': 5},
+      {'text': 'One more segment', 'speaker': 'Speaker 1', 'start': 5, 'end': 9}], 2, 2),
+    ([{'text': 'Words of rec', 'speaker': 'Speaker 2', 'start': 0, 'end': 5}], 2, 2),
+    ([{'text': 'Words of rec', 'speaker': 'Speaker 1', 'start': 0, 'end': 5}], 1, 1),
+    ([], 1, 1),
+], ids=['one_more_segment', 'speaker_only', 'identical', 'empty'])
+def test_a_stage_read_stores_a_changed_transcript_once_and_nothing_else(tmp_path, segments, revision, events):
+    path, doc = build(tmp_path); omi = Omi()
+    item = omi.add('rec', T0 - HOUR)
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        await passes(r, omi, T0, 60, 1)
+        old = (await r.db('record', account, 'rec'))['parts']['transcript']['text']
+        item['segments'] = segments
+        await passes(r, omi, T0 + 5 * HOUR, 60, 2)
+        saved = await r.db('record', account, 'rec')
+        assert len(omi.of('tokenaaaa', 'detail')) == 2 and saved['revision'] == revision
+        assert sql(doc, 'SELECT count(*) FROM events') == [(events,)]
+        text = saved['parts']['transcript']['text']
+        if revision == 2:
+            assert text != old and [json.loads(line) for line in text.splitlines()][-1]['text'] == segments[-1]['text']
+            if len(segments) == 2:
+                assert [h['provider_recording_id'] for h in await r.db('search', account, '"segment"', 5)] == ['rec']
+        else:
+            assert text == old
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-759
+def test_stage_reads_stop_at_fifteen_an_hour_and_a_new_conversation_takes_a_kept_slot(tmp_path):
+    path, doc = build(tmp_path); omi = Omi()
+    start = T0 + HOUR
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        ids = await seed_saved(r, account, omi, T0 - 5 * HOUR, 100, T0 - 1800)
+        await passes(r, omi, start, 300, 11)
+        assert len(omi.of('tokenaaaa', 'detail')) == 15
+        omi.add('new', omi.now, front=True)
+        await passes(r, omi, omi.now + 300, 300, 1)
+        assert [c[3] for c in omi.of('tokenaaaa', 'detail')][15:] == ['new']
+        await passes(r, omi, omi.now + 300, 300, 12 * 10)
+        details = [c[3] for c in omi.of('tokenaaaa', 'detail')]
+        assert all(details.count(ident) == 1 for ident in ids)  # none lost, none repeated
+        assert omi.peak[('tokenaaaa', 'transcripts')] <= 18 and omi.peak[('tokenaaaa', 'reads')] <= 45
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-759
+@pytest.mark.parametrize('turn', [0, 1, 2])
+def test_a_re_read_denied_by_its_share_never_stops_first_and_failed_reads_behind_it(tmp_path, turn):
+    path, doc = build(tmp_path); omi = Omi()
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        await seed_saved(r, account, omi, T0 - 5 * HOUR, 2, T0 - 1800)
+        old = T0 - 86400 * 30
+        for ident in ('backlog', 'failed'):
+            omi.add(ident, old)
+        await r.db('discover', account, [{'id': i, 'created_at': iso(old)} for i in ('backlog', 'failed')], None, T0, lambda: None)
+        await r.db('observe', account, 'failed', {'id': 'failed'}, {'summary': ('error', '', 'provider_unavailable')}, T0)
+        for _ in range(turn):
+            await r.db('rotate', account)
+        for _ in range(15):
+            await r.count('tokenaaaa', True, now=T0 + 2 * HOUR)
+        await passes(r, omi, T0 + 2 * HOUR + 10, 1, 1)
+        assert sorted(c[3] for c in omi.of('tokenaaaa', 'detail')) == ['backlog', 'failed']
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-759
+def test_a_budget_of_three_transcripts_still_re_reads_a_changed_list_row(tmp_path):
+    path, doc = build(tmp_path, omi_budget={'transcript_per_hour': 3}); omi = Omi(1, created=T0 - 86400 * 3)
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        await passes(r, omi, T0, 300, 1)
+        omi.items[0]['structured']['overview'] = 'A different overview'
+        await passes(r, omi, T0 + 300, 300, 1)
+        assert len(omi.of('tokenaaaa', 'detail')) == 2
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-759
+def test_a_429_on_a_stage_read_changes_nothing_and_the_read_happens_after_the_pause(tmp_path):
+    path, doc = build(tmp_path); omi = Omi()
+    omi.add('rec', T0 - HOUR)
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        await passes(r, omi, T0, 60, 1)
+        stage = T0 + 5 * HOUR
+        omi.limited[('tokenaaaa', 'detail')] = (stage + 600, '600')
+        await passes(r, omi, stage, 60, 5)
+        assert sql(doc, 'SELECT failures,revision,due FROM records') == [(0, 1, stage)]
+        attempts = len(omi.of('tokenaaaa', 'detail'))
+        assert attempts == 2  # the pause holds: one attempt, then nothing until it ends
+        await passes(r, omi, stage + 660, 60, 1)
+        assert len(omi.of('tokenaaaa', 'detail')) == 3
+        assert sql(doc, 'SELECT failures,due FROM records') == [(0, T0 + 47 * HOUR)]
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-759
+def test_a_404_on_a_stage_read_is_an_ordinary_failed_read_that_keeps_the_text(tmp_path):
+    path, doc = build(tmp_path); omi = Omi()
+    omi.add('rec', T0 - HOUR)
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        await passes(r, omi, T0, 60, 1)
+        omi.gone.add('rec')
+        await passes(r, omi, T0 + 5 * HOUR, 60, 1)
+        saved = await r.db('record', account, 'rec')
+        assert 'Words of rec' in saved['parts']['transcript']['text'] and saved['revision'] == 1
+        assert sql(doc, 'SELECT failures FROM records') == [(1,)]
+        assert (await r.status(account, now=omi.now))['failed'] == 1
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-759
+@pytest.mark.parametrize('title', ['Title given', ''], ids=['titled', 'untitled'])
+@pytest.mark.parametrize('age,state', [(1, 'pending'), (30, 'empty')])
+def test_an_empty_overview_is_pending_in_the_collector_only_while_the_record_is_young(tmp_path, title, age, state):
+    path, doc = build(tmp_path); omi = Omi()
+    item = omi.add('rec', T0 - age * HOUR, overview='')
+    item['structured']['title'] = title
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        await passes(r, omi, T0, 60, 1)
+        assert (await r.db('record', account, 'rec'))['parts']['summary']['attempt_state'] == state
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-759
+def test_a_young_record_without_a_summary_costs_three_reads_in_48_hours(tmp_path):
+    path, doc = build(tmp_path); omi = Omi()
+    omi.add('rec', T0 - HOUR, overview='')
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        await passes(r, omi, T0, 900, 200)
+        assert [c[0] for c in omi.of('tokenaaaa', 'detail')] == [T0, T0 + 5 * HOUR, T0 + 47 * HOUR]
+        assert (await r.db('record', account, 'rec'))['parts']['summary']['attempt_state'] == 'empty'
+        assert sql(doc, 'SELECT due,failures FROM records') == [(FAR_DUE, 0)]
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-759
+def test_a_summary_that_arrives_in_a_list_row_is_read_in_the_next_pass(tmp_path):
+    path, doc = build(tmp_path); omi = Omi()
+    item = omi.add('rec', T0 - HOUR, overview='')
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        account = accounts_of(r)[0]
+        await passes(r, omi, T0, 300, 1)
+        item['structured']['overview'] = 'The summary arrived'
+        await passes(r, omi, T0 + 300, 300, 1)
+        summary = (await r.db('record', account, 'rec'))['parts']['summary']
+        assert len(omi.of('tokenaaaa', 'detail')) == 2 and summary['attempt_state'] == 'available'
+        assert summary['text'] == 'The summary arrived'
+        await r.close()
+    asyncio.run(run())
+
+
+# spec: ANYM-759
+def test_a_deferred_summary_keeps_its_three_hour_schedule(tmp_path):
+    path, doc = build(tmp_path); omi = Omi()
+    item = omi.add('rec', T0 - HOUR, overview='')
+    item['processing_deferred'] = True
+    async def run():
+        r = runtime(path, omi); await r.start(background=False)
+        await passes(r, omi, T0, 900, 1)
+        assert sql(doc, 'SELECT due FROM records') == [(T0 + 3 * HOUR,)]
         await r.close()
     asyncio.run(run())
 
