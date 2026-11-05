@@ -215,7 +215,7 @@ Where the value comes from:
 
 Check it, without a call or a provider action:
 
-1. `docker inspect <container> --format '{{range .Config.Env}}{{println .}}{{end}}' | grep '^VOICE_TRUSTED_PEERS='`
+1. `grep VOICE_TRUSTED_PEERS <file>`, where `<file>` is the project's Compose file named above,
    shows the single gateway address.
 2. From the host, `/api/health` through the published port with the owner credential returns 200.
 3. From the host, `/control/mcp` with the control token completes MCP `initialize` and `tools/list`

@@ -61,3 +61,19 @@ service stores nothing that can be read back. On the production side the worker 
 and the mini (docs/operations/production.md, "Mini enrichment worker"). Model output is untrusted data,
 like any extracted text. Runbook and rotation:
 [docs/operations/inference-mini-setup.md](docs/operations/inference-mini-setup.md).
+
+Agent sessions: reading container environments (ANYM-774). A session transcript goes to the model provider, so the
+PreToolUse hook `.claude/hooks/block-secret-env-reads.sh` refuses Bash commands that print secret-bearing environment,
+and refuses when it cannot decide. Blocked, also inside `ssh`, `sudo`, `bash -c`, a pipe or `$(...)`: `docker inspect`
+without a template, with any `--format=`/`-f=` form, or with a template that reads `.Config`, `.Spec` or the whole
+object; `docker compose config` unless it has `--no-env-resolution` or is limited by `--services`, `--images`, `--hash`,
+`--quiet` or `--volumes`, and always with `--environment`; `env`, `printenv`, `set` or `export` directly or through
+`docker exec|run` and `docker compose exec|run`; any such command naming `/proc/*/environ`; `cat`, `less`, `more`, `head`,
+`tail`, `grep`, `rg`, `sed`, `awk`, `strings`, `xxd` or `base64` of a path ending `.env`, `environ`, `config.v2.json`,
+`.dsn`, `.token`, `.key`, `.pem` or `.agekey`; `systemctl show` of `Environment` or without a property filter. Allowed:
+`docker inspect --format '<template>'` limited to `.State`, `.Name`, `.Image`, `.RestartCount` or `.Created`; `docker
+compose config --no-env-resolution`; a key-names read through the orchestrator. Limits: it covers sessions started in
+this repository or its worktrees; it does not cover the orchestrator, other projects or a determined bypass (encoding,
+a script that prints the file, a path held in a variable). `--no-env-resolution` keeps `env_file` values out but still
+prints values Compose interpolates into the document (`${VAR}` from a project `.env`; probed on Compose 5.5.0). The
+durable fix is secrets as files, not environment variables, which is a separate decision.
