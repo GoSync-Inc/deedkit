@@ -35,6 +35,8 @@ FAKES = {
 echo "ssh $*" >> "$FAKE_LOG"
 [ "${FAKE_SSH_DOWN:-0}" = 1 ] && exit 255
 case "$*" in *"${FAKE_SSH_FAIL:-no such command}"*) exit 255 ;; esac
+# FAKE_SSH_STALL: the channel stays up and the far end never reads or writes.
+case "$*" in *"${FAKE_SSH_STALL:-no such command}"*) echo "stalled pid=$$ at=$(date +%s)" >> "$FAKE_LOG"; exec sleep 300 ;; esac
 while [ $# -gt 0 ]; do case "$1" in -[ol]) shift 2 ;; -[ntq]) shift ;; *) break ;; esac; done  # GNU rsync: -l user
 shift
 cd "$FAKE_OWNER_HOME" || exit 255
@@ -126,6 +128,21 @@ echo "createdb $*" >> "$FAKE_LOG"
 ''',
 }
 CAPS = 'WAIT_SECONDS=0\nPOLL_SECONDS=1\nSTOP_SECONDS=3\n'
+# On the runner's PATH: a slot holder that stalls (FAKE_HOLDER=busy says so and never exits, silent never writes its
+# note); every other python3 is the real one.
+STALLED_HOLDER = f'''#!/usr/bin/env bash
+case "${{2:-}}" in *fcntl*)
+  echo "holder pid=$$ at=$(date +%s)" >> "$FAKE_LOG"
+  [ "$FAKE_HOLDER" = silent ] || echo busy
+  exec sleep 300 ;;
+esac
+exec {shutil.which('python3')} "$@"
+'''
+# On the laptop's PATH: an rsync that stops reading and honours no timeout of its own.
+STALLED_RSYNC = '''#!/usr/bin/env bash
+echo "stalled pid=$$ at=$(date +%s) $*" >> "$FAKE_LOG"
+exec sleep 300
+'''
 
 
 def write(path, text, mode=0o755):
@@ -652,6 +669,27 @@ def test_a_taken_slot_makes_the_run_wait_in_the_mini_queue_then_ci_covers(mini, 
     assert log_lines(home, 'uv run pytest -q | cwd=gateway')
 
 
+# spec: ANYM-769
+@pytest.mark.parametrize('stall,named', [('busy', 'did not exit'), ('silent', 'wrote no note')],
+                         ids=['never-exits', 'never-writes-its-note'])
+def test_a_slot_holder_that_stalls_ends_the_run_at_its_bound_and_ci_covers(mini, worktree, stall, named):
+    home, env = mini
+    bound = 2
+    write(home / 'rbin' / 'python3', STALLED_HOLDER)
+    write(home / 'shared' / 'caps.conf', CAPS + f'SLOT_TAKE_SECONDS={bound}\nHOLDER_NOTE_SECONDS={bound}\n', 0o644)
+    # The guard: without a bound this run never ends.
+    result = run_tracked(['bash', str(SCRIPT), '--full', str(worktree), 'gateway'], 30,
+                         env=dict(env, FAKE_HOLDER=stall))
+    ended = time.time()
+    assert result.returncode == 90, result.stderr
+    assert 'mini busy' in result.stderr and 'CI covers' in result.stderr and named in result.stderr
+    holder = log_lines(home, 'holder')[0]
+    assert ended - int(holder.split('at=')[1]) <= bound + 5
+    assert not alive(pid_of(holder))
+    assert not list((home / 'service' / 'deedkit-ci' / '.locks').glob('holder.*'))
+    assert not log_lines(home, 'uv')
+
+
 # spec: ANYM-638
 def test_a_run_that_waited_for_a_slot_checks_for_between_again_before_it_starts(mini, worktree):
     home, env = mini
@@ -696,6 +734,30 @@ def test_a_mini_that_cannot_start_the_suite_leaves_it_to_ci_and_runs_nothing_loc
     result = remote(env, '--full', worktree, 'gateway', **extra)
     assert result.returncode == code
     assert 'CI covers' in result.stderr
+    assert not log_lines(home, 'uv')
+    assert not (worker_dir(home) / 'src').exists()
+
+
+# spec: ANYM-769
+@pytest.mark.parametrize('double', ['far-end', 'rsync'])
+def test_a_copy_that_stalls_ends_at_its_bound_and_ci_covers(mini, worktree, double):
+    home, env = mini
+    bound = 3
+    extra = {'DEEDKIT_REMOTE_COPY_IO_SECONDS': '1', 'DEEDKIT_REMOTE_COPY_SECONDS': str(bound)}
+    if double == 'far-end':  # the real rsync: GNU exits 30 at --timeout, openrsync then waits for its ssh
+        extra['FAKE_SSH_STALL'] = 'rsync --server'
+    else:
+        write(home / 'bin' / 'rsync', STALLED_RSYNC)
+    # The guard: without a bound this run never ends.
+    result = run_tracked(['bash', str(SCRIPT), '--full', str(worktree), 'gateway'], 30, env=dict(env, **extra))
+    ended = time.time()
+    assert result.returncode == 91, result.stderr
+    assert 'copying to the mini timed out, CI covers' in result.stderr
+    stalled = log_lines(home, 'stalled')[0]
+    assert ended - int(stalled.split('at=')[1].split()[0]) <= bound + 5
+    assert not alive(pid_of(stalled))
+    if double == 'rsync':
+        assert '--timeout=1' in stalled.split()
     assert not log_lines(home, 'uv')
     assert not (worker_dir(home) / 'src').exists()
 
