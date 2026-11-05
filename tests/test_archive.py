@@ -1,11 +1,13 @@
 from datetime import datetime,timezone,timedelta
 import hashlib
 
+from hypothesis import given,strategies as st
 import pytest
 
-from messaging_service.archive import Archive
+from messaging_service import archive as archive_module
+from messaging_service.archive import Archive,ingest_outcome
 from messaging_service.blobs import BlobWriter
-from messaging_service.envelope import validate
+from messaging_service.envelope import fingerprint,validate
 from messaging_service.media_retry import MEDIA_MAX_ATTEMPTS
 from messaging_service.spool import DurableSpool
 from messaging_service.store import APIError
@@ -154,6 +156,154 @@ def wire(body='Первый текст lighthouse'):
     return {'version':1,'state':'wire_observed','basis':'whatsapp_native_wire',
         'wire_sha256':hashlib.sha256(body.encode()).hexdigest(),'entities':None,
         'unsupported_entities':[],'warnings':['syntax_interpretation_unknown']}
+
+
+LINK_URL='tg://resolve?domain=synthetic_bot'
+LINK={'type':'text_link','offset':0,'length':6}
+BOLD={'type':'bold','offset':7,'length':5}
+
+
+def native(entities=(),unsupported=(),warnings=('native_link_unsupported',),body='Первый текст lighthouse'):
+    """Telegram formatting evidence; `partial` while anything is unsupported or warned about."""
+    warned=list(warnings) if unsupported else []
+    return {'version':1,'state':'partial' if warned else 'observed','basis':'telegram_native_entities',
+        'wire_sha256':hashlib.sha256(body.encode()).hexdigest(),'entities':list(entities),
+        'unsupported_entities':list(unsupported),'warnings':warned}
+
+
+def linked(**changes):
+    return {**LINK,'url':LINK_URL,**changes}
+
+
+def revisions(s,mid):
+    with s.pool.connection() as c:
+        return [r['snapshot']['formatting'] for r in c.execute(
+            'SELECT snapshot FROM message_revisions WHERE message=%s ORDER BY revision',(mid,))]
+
+
+# spec: ANYM-796
+@pytest.mark.parametrize('kept',[[],[BOLD]])
+def test_a_reread_with_the_link_url_completes_a_partial_telegram_revision(archive,kept):
+    ar,s,key,_=archive
+    retained=native(kept,[LINK])
+    mid=ar.ingest(event(formatting=retained))['message']
+    assert ar.ingest(event(origin='backfill',formatting=native([linked(),*kept])))['outcome']=='edited'
+    stored=revisions(s,mid)
+    assert stored[0]==retained and linked() in stored[1]['entities'] and stored[1]['unsupported_entities']==[]
+    with s.pool.connection() as c:
+        assert c.execute('SELECT count(*) AS n FROM message_conflicts WHERE message=%s',(mid,)).fetchone()['n']==0
+        assert c.execute("SELECT count(*) AS n FROM events WHERE message=%s AND kind='message.edited'",(mid,)).fetchone()['n']==1
+    # The same re-read again finds an equal formatting.
+    assert ar.ingest(event(origin='reconcile',formatting=native([linked(),*kept])))['outcome']=='unchanged'
+    assert len(revisions(s,mid))==2
+
+
+# spec: ANYM-796
+def test_a_completion_closes_an_open_conflict_of_the_same_completed_observation(archive):
+    from test_conflict_reevaluation import n1_archive
+    ar,s,_,_=archive
+    old=n1_archive(s)
+    mid=old.ingest(event(formatting=native([],[LINK])))['message']
+    assert old.ingest(event(origin='reconcile',formatting=native([linked()])))['outcome']=='conflict'
+    assert ar.ingest(event(origin='backfill',formatting=native([linked()])))['outcome']=='edited'
+    with s.pool.connection() as c:
+        row=c.execute('SELECT resolved_at,resolved_revision,resolution FROM message_conflicts WHERE message=%s',(mid,)).fetchone()
+    assert row['resolved_at'] is not None and row['resolved_revision']==2 and row['resolution']=='link_completed'
+
+
+# spec: ANYM-796
+@pytest.mark.parametrize('retained,candidate',[
+    (native([],[LINK]),native([])),  # only removes the span: evidence would be lost
+    (native([],[LINK]),native([linked(offset=7)])),
+    (native([],[LINK]),native([linked(length=5)])),
+    (native([],[LINK]),native([linked(),BOLD])),  # adds an entity that was not unsupported
+    (native([BOLD],[LINK]),native([linked()])),  # drops a retained entity
+    (native([BOLD],[LINK]),native([linked(),{**BOLD,'length':4}])),
+    (native([],[LINK]),native([BOLD],[LINK])),  # a candidate still partial
+    (native([],[LINK,{**BOLD,'type':'text_link'}]),native([linked()],[{**BOLD,'type':'text_link'}])),
+    (native([],[LINK,{**BOLD,'type':'custom_emoji'}],('native_link_unsupported','native_entities_unsupported')),
+     native([linked()],[{**BOLD,'type':'custom_emoji'}],('native_entities_unsupported',))),
+    (native([],[{**LINK,'type':'custom_emoji'}],('native_entities_unsupported',)),native([linked()])),
+    (native([],[LINK],('native_link_unsupported','native_entities_invalid')),native([linked()])),
+    (native([],[LINK]),native([linked(url='https://t.me/login/12345')]))])
+def test_any_other_formatting_difference_stays_a_conflict(archive,retained,candidate):
+    ar,s,_,_=archive
+    mid=ar.ingest(event(formatting=retained))['message']
+    assert ar.ingest(event(origin='backfill',formatting=candidate))['outcome']=='conflict'
+    assert revisions(s,mid)==[retained] and len(stored_conflicts(s,mid))==1
+
+
+# spec: ANYM-796
+def test_a_worse_or_equal_reread_of_a_partial_revision_keeps_todays_outcome(archive):
+    ar,s,_,_=archive
+    retained=native([],[LINK])
+    mid=ar.ingest(event(formatting=retained))['message']
+    assert ar.ingest(event(origin='backfill',formatting=retained))['outcome']=='unchanged'
+    unknown={'version':1,'state':'unknown','basis':None,'wire_sha256':None,'entities':None,
+             'unsupported_entities':[],'warnings':['native_entities_not_captured']}
+    assert ar.ingest(event(origin='reconcile',formatting=unknown))['outcome']=='unchanged'
+    assert revisions(s,mid)==[retained]
+    # After a completion a re-read with the capture flag off is worse: a conflict, the better revision stands.
+    assert ar.ingest(event(origin='backfill',formatting=native([linked()])))['outcome']=='edited'
+    assert ar.ingest(event(origin='reconcile',formatting=retained))['outcome']=='conflict'
+    assert revisions(s,mid)[-1]==native([linked()])
+
+
+# spec: ANYM-796
+def test_a_completion_needs_the_retained_version_and_content(archive):
+    ar,s,_,_=archive
+    mid=ar.ingest(event(formatting=native([],[LINK]),updated_at='2026-10-01T12:00:05+00:00'))['message']
+    assert ar.ingest(event(origin='backfill',formatting=native([linked()])))['outcome']=='stale'
+    changed='Другой текст'
+    assert ar.ingest(event(origin='backfill',body=changed,updated_at='2026-10-01T12:00:05+00:00',
+        formatting=native([linked()],body=changed)))['outcome']=='conflict'
+    assert len(revisions(s,mid))==1
+
+
+# spec: ANYM-796
+def test_whatsapp_keeps_its_formatting_rule(archive):
+    ar,s,_,_=archive
+    ar.register('archive-wa','whatsapp','Synthetic WhatsApp',include_chats=['900@lid'])
+    mid=ar.ingest(whatsapp_event('900@lid'))['message']
+    assert ar.ingest(whatsapp_event('900@lid',origin='reconcile',formatting=wire()))['outcome']=='edited'
+    with s.pool.connection() as c:
+        assert c.execute('SELECT revision FROM messages WHERE id=%s',(mid,)).fetchone()['revision']==2
+
+
+# spec: ANYM-796
+@pytest.mark.parametrize('retained',[
+    {'version':1,'state':'partial'},
+    {**native([],[LINK]),'wire_sha256':'0'*64},
+    {**native([],[LINK]),'unsupported_entities':[{**LINK,'length':0}]},
+    {**native([],[LINK]),'entities':None},
+    'partial'])
+def test_malformed_retained_formatting_is_no_completion(retained):
+    candidate=validate(event(formatting=native([linked()])))
+    snapshot={**candidate,'formatting':retained}
+    assert archive_module.telegram_link_completion(snapshot,candidate) is False
+    if isinstance(retained,dict):
+        old={'sent_at':datetime(2026,10,1,12,tzinfo=timezone.utc),'direction':'incoming','sender':'42','deleted':False,
+             'body':candidate['body'],'content_hash':fingerprint(candidate),
+             'provider_updated_at':datetime(2026,10,1,12,tzinfo=timezone.utc)}
+        assert ingest_outcome(old,candidate,snapshot)[0]=='conflict'
+
+
+SPANS=st.lists(st.tuples(st.integers(0,20),st.integers(1,3)),min_size=1,max_size=6,unique=True)
+
+
+# spec: ANYM-796
+@given(SPANS,st.integers(0,5))
+def test_a_conversion_of_every_link_alone_is_a_completion_in_any_entity_order(spans,rotation):
+    body='x'*30
+    links=[{'type':'text_link','offset':o,'length':n} for o,n in spans[:len(spans)//2+1]]
+    kept=[{'type':'bold','offset':o,'length':n} for o,n in spans[len(spans)//2+1:]]
+    after=[*kept,*[{**span,'url':'https://example.invalid/%d'%i} for i,span in enumerate(links)]]
+    after=after[rotation%len(after):]+after[:rotation%len(after)]
+    envelope=event(body=body,formatting=native(after,body=body))
+    retained={**envelope,'formatting':native(kept,links,body=body)}
+    assert archive_module.telegram_link_completion(retained,validate(envelope)) is True
+    # One link left out or one entity dropped is no completion.
+    assert archive_module.telegram_link_completion(retained,validate({**envelope,'formatting':native(after[1:],body=body)})) is False
 
 
 def sender_rows(s,mid):

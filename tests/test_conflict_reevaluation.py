@@ -708,6 +708,83 @@ def test_an_authenticated_group_sender_conflict_an_older_rule_raised_is_accepted
         assert c.execute('SELECT sender,revision FROM messages WHERE id=%s', (mid,)).fetchone() == {'sender': '42', 'revision': 2}
 
 
+def link_conflict(ar, s, provider_id='1', candidate=None):
+    """Criterion 1's two observations as the deployed N-1 ingest stored them: a conflict with the completed receipt."""
+    from test_archive import LINK, linked, native
+    old = n1_archive(s)
+    mid = old.ingest(event(provider_id=provider_id, formatting=native([], [LINK])))['message']
+    assert old.ingest(event(provider_id=provider_id, origin='reconcile',
+                            formatting=candidate or native([linked()])))['outcome'] == 'conflict'
+    return mid
+
+
+def link_revisions(s, mid):
+    with s.pool.connection() as c:
+        return [r['snapshot']['formatting'] for r in c.execute(
+            'SELECT snapshot FROM message_revisions WHERE message=%s ORDER BY revision', (mid,))]
+
+
+# spec: ANYM-796
+def test_the_default_runner_completes_a_stored_link_conflict_once(archive):  # noqa: F811
+    from test_archive import LINK, linked, native
+    ar, s, _, _ = archive
+    mid = link_conflict(ar, s)
+    assert run(ar, s, None) == 'done'
+    row = conflicts(s)[mid]
+    assert row['resolution'] == 'rule_changed:telegram_link_completed@1' and row['resolved_revision'] == 2
+    assert link_revisions(s, mid) == [native([], [LINK]), native([linked()])]
+    assert progress(s)['telegram_link_completed']['last_error'] is None
+    # A second pass changes nothing.
+    assert run(ar, s, None) == 'done'
+    assert conflicts(s)[mid] == row and len(link_revisions(s, mid)) == 2
+    with s.pool.connection() as c:
+        assert c.execute("SELECT count(*) AS n FROM events WHERE message=%s AND kind='message.edited'", (mid,)).fetchone()['n'] == 1
+
+
+# spec: ANYM-796
+def test_a_conflict_whose_envelope_fails_the_predicate_stays_open_and_later_rows_still_run(archive):  # noqa: F811
+    from test_archive import native
+    ar, s, _, _ = archive
+    kept, completed = link_conflict(ar, s, '1', native([])), link_conflict(ar, s, '2')
+    assert run(ar, s, None) == 'done'
+    rows = conflicts(s)
+    assert rows[kept]['resolved_at'] is None and len(link_revisions(s, kept)) == 1
+    assert rows[completed]['resolved_revision'] == 2
+    assert progress(s)['telegram_link_completed']['last_error'] is None
+
+
+# spec: ANYM-796
+def test_a_stored_link_conflict_on_a_message_that_moved_on_stays_open_without_stopping_the_job(archive):  # noqa: F811
+    ar, s, _, _ = archive
+    moved, completed = link_conflict(ar, s, '1'), link_conflict(ar, s, '2')
+    # The stored receipt is older than the message now: a replay would be stale, and must not stop the job.
+    with s.pool.connection() as c:
+        c.execute("UPDATE messages SET provider_updated_at=provider_updated_at+interval '1 second' WHERE id=%s", (moved,))
+    assert run(ar, s, None) == 'done'
+    rows = conflicts(s)
+    assert rows[moved]['resolved_at'] is None and len(link_revisions(s, moved)) == 1
+    assert rows[completed]['resolved_revision'] == 2
+    assert progress(s)['telegram_link_completed']['last_error'] is None
+
+
+# spec: ANYM-796
+def test_a_crash_between_the_link_revision_and_the_resolve_is_repaired_by_the_next_pass(archive, monkeypatch):  # noqa: F811
+    ar, s, _, _ = archive
+    mid = link_conflict(ar, s)
+    original, crashed = cr.Runner._progress, []
+
+    def crash(self, c, job, row, error):
+        if job.name == 'telegram_link_completed' and row and not crashed:
+            crashed.append(row['digest'])
+            raise RuntimeError('crash')
+        return original(self, c, job, row, error)
+    monkeypatch.setattr(cr.Runner, '_progress', crash)
+    with pytest.raises(RuntimeError, match='crash'): run(ar, s, None)
+    assert crashed and conflicts(s)[mid]['resolved_at'] is None and len(link_revisions(s, mid)) == 1
+    assert run(ar, s, None) == 'done'
+    assert conflicts(s)[mid]['resolved_revision'] == 2 and len(link_revisions(s, mid)) == 2
+
+
 # spec: ANYM-621
 def test_a_telegram_link_preview_refresh_conflict_an_older_rule_raised_is_no_longer_raised(archive):  # noqa: F811
     """Rebase on ANYM-611: the deployed N-1 ingest raised Telegram's re-crawl of the same preview page; ingest_outcome
