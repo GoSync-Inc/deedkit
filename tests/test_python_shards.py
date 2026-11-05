@@ -29,10 +29,14 @@ def test_every_test_module_runs_in_exactly_one_of_the_four_shards():
     assert "tests/test_python_shards.py" in modules and "tests/platform/test_stack.py" in modules
     assert all(name.startswith("tests/") and any(fnmatch.fnmatch(Path(name).name, pattern) for pattern in ("test_*.py", "*_test.py"))
                for name in modules)
+    # reads: tests/test_python_shards.py
+    # reads: tests/platform/test_stack.py
     owners = {name: [index for index in range(1, 5) if not python_shards.ignored(ROOT / name, (index, 4))] for name in modules}
     assert all(len(shards) == 1 for shards in owners.values()), {k: v for k, v in owners.items() if len(v) != 1}
     assert {shards[0] for shards in owners.values()} == {1, 2, 3, 4}
     # Without a shard the whole suite runs, as on a developer machine.
+    # reads: tests/test_python_shards.py
+    # reads: tests/platform/test_stack.py
     assert not any(python_shards.ignored(ROOT / name, None) for name in modules)
 
 

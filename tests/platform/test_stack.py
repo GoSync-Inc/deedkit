@@ -30,6 +30,12 @@ def test_resolved_drift_cannot_hide_behind_declared_version(tmp_path):
     ]:
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
+        # reads: config/stack.toml
+        # reads: services/messaging/uv.lock
+        # reads: services/calendar/uv.lock
+        # reads: services/calls/uv.lock
+        # reads: services/gateway/uv.lock
+        # reads: services/recordings/uv.lock
         shutil.copyfile(ROOT / relative, path)
     path = tmp_path / "services/calls/uv.lock"
     path.write_text(
