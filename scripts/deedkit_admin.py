@@ -1830,7 +1830,7 @@ def run_revoke(config, run, docker, host, journal: Journal, target: dict, found,
         "revoked": [{"store": name, "public_id": data["stores"][name]["public_id"]} for name in ORDER
                     if name in data["stores"]],
         "evidence": evidence, "undo": f"deedkit admin undo {data['operation']}",
-        "note": "records stay for audit; deleting them is a separate owner decision"}
+        "note": "records stay for audit; deleting them is a separate reviewed step (production.md, Admin CLI)"}
     data["state"] = "done"
     journal.save()
     return data["result"]

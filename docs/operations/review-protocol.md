@@ -34,9 +34,9 @@ before unrelated work; this changes ordering, not the findings that must be fixe
 
 ## Codex budget
 
-DeedKit spends at most 4 points a day: the line is `68% + 4 × days since 10-19 03:30Z` until the
-10-24 21:08Z reset, then `4 × days since the last reset`. Risk paths, in addition to the harness
-list: release, deploy and `production.py`, sends and live provider-session code.
+The line is printed by `~/deedkit-orchestrator/bin/codex-meter.sh` from the orchestrator's config.sh
+(`CODEX_DAILY_POINTS`, `CODEX_LINE_OFFSET`); risk paths, in addition to the harness list: release,
+deploy and `production.py`, sends and live provider-session code.
 
 ## Pull request lines
 

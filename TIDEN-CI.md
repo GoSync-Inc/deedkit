@@ -485,9 +485,9 @@ agent that merged waits for the sync run of its squash and reads back the result
 it again by SHA, as above, or by rerunning it, so that it joins the concurrency
 group. A local `scripts/tiden_sync.py` runs only with `--dry-run`: a local write
 or a source repair by hand is outside the group, and a B run that starts during
-it can lose anchors, since both replace whole source lists. Such a write needs a
-maintenance window agreed with the owner, with the workflow disabled and no
-run in progress for the whole operation.
+it can lose anchors, since both replace whole source lists. Such a write needs
+a maintenance window the orchestrator opens (tiden-product-workflow.md), with
+the workflow disabled and no run in progress for the whole operation.
 
 ### Ready merge
 

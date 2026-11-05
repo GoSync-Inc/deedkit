@@ -132,8 +132,8 @@ say the same.
 An agent that needs only some modules can load fewer tools. Selection only narrows the key's list. It grants
 no tool, scope or action.
 
-- **Connection path.** `POST /mcp/modules/<m>[,<m>...]` with `m` from `messaging`, `calendar`, `calls` is the
-  same MCP endpoint as `/mcp`. Its `tools/list` and `tools/call` cover `platform_capabilities`,
+- **Connection path.** `POST /mcp/modules/<m>[,<m>...]` with `m` from `messaging`, `calendar`, `calls`,
+  `recordings` is the same MCP endpoint as `/mcp`. Its `tools/list` and `tools/call` cover `platform_capabilities`,
   `platform_select_modules` (when the profile lists it) and the named modules' tools, intersected with
   everything that limits the key on `/mcp`. Order does not matter (`calendar,messaging` and
   `messaging,calendar` are one path, reported as the sorted form). An unknown or repeated name, an empty list
@@ -143,7 +143,7 @@ no tool, scope or action.
 - **In-session tool.** `platform_select_modules({"modules": [...]})` records a selection for this principal
   and connection path, replacing the previous one. The path's own modules still bound it: on
   `/mcp/modules/messaging`, selecting `["calendar", "messaging"]` keeps messaging only. To widen again, select
-  all three modules. The result has `selection_path`, `effective_modules`, the new `tools_sha256`,
+  all the modules the key can use. The result has `selection_path`, `effective_modules`, the new `tools_sha256`,
   `takes_effect: "next_tools_list"` and `next_action: "refresh_connection_if_tools_list_differs"`; the server
   does not push a list change (ANYM-248). The selection lives in gateway memory only, one entry per
   principal and path, and is cleared by a policy revision change, a gateway restart or a release handover.
@@ -166,8 +166,9 @@ change only the URL path from `/mcp` to the module path (`<gateway>` is the publ
   `https://<gateway>/mcp/modules/messaging`. Reconnect it after a change.
 - Claude Code: `claude mcp add --transport http deedkit-messaging https://<gateway>/mcp/modules/messaging
   --header "Authorization: Bearer <key>"`.
-- Grok (remote MCP tool): `server_url` `https://<gateway>/mcp/modules/calendar,messaging` with the same
-  `Authorization` header as for `/mcp`.
+- Grok (remote MCP tool): `server_url` `https://<gateway>/mcp/modules/calendar,messaging` or
+  `https://<gateway>/mcp/modules/recordings` with the same `Authorization` header as for `/mcp`; a key sees a
+  module's tools only when its credentials include that module.
 
 Hosts with deferred tool loading (Claude Code tool search) need this less; hosts that load every tool
 (Grok, Cursor, some Desktop setups) gain the most.
