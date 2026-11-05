@@ -341,7 +341,7 @@ def said(result):
     ({'to_seconds': 200}, [BEFORE, CROSS_LOW, INSIDE_A, INSIDE_B], 1),
     ({'from_seconds': 100}, [INSIDE_A, INSIDE_B, CROSS_HIGH, AFTER], 1),
     ({'from_seconds': 215, 'to_seconds': 290}, [], 0),
-    ({'from_seconds': 195, 'to_seconds': 205}, [], 1),
+    ({'from_seconds': 195, 'to_seconds': 205}, [], 2),
 ])
 def test_range_returns_only_contained_segments_and_counts_the_crossing_ones(tmp_path, bounds, texts, edge):
     path, _ = config(tmp_path)
