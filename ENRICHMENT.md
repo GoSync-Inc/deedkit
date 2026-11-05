@@ -352,7 +352,7 @@ with another profile: two workers would claim the same jobs. A worker with a
 runs, by trying to reach public addresses, an external resolver and other ports of the
 mini, before every claim and every 15 seconds; if anything answers it claims nothing and exits with code 78
 (`messaging_service/inference_confinement.py`). `enricher-mini` has restart policy `no`, so Docker never starts it
-by itself. The local image includes hash-locked CPU
+by itself; `deedkit-inference-worker.service` does when Docker starts, behind its gates (production.md "Stopped worker"). The local image includes hash-locked CPU
 faster-whisper dependencies, with PyAV 18.1.0 pinned for decoder compatibility.
 Neither image downloads models. Native smoke tests use synthetic speech and
 network-disabled containers. The local profile has only the internal DB network.

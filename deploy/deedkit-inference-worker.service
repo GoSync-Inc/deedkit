@@ -1,0 +1,23 @@
+[Unit]
+Description=Start the stopped mini inference worker when Docker starts, behind its gates (ANYM-794)
+# Ordered after what it reads; nothing is ordered after it and nothing requires it, so it can never delay or stop
+# Docker. No timer: it never undoes an operator's stop while Docker runs. Runbook: production.md "Stopped worker".
+After=ufw.service docker.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=DEEDKIT_DEPLOY_CONFIG=/etc/deedkit/production.json
+Environment=DEEDKIT_HTTP_CONFIG=/etc/deedkit/http-production.json
+Environment=DEEDKIT_BACKUP_LOCK=/opt/personal-os-probe/backups/.runner.lock
+EnvironmentFile=-/etc/deedkit/autodeploy.env
+TimeoutStartSec=600
+ExecStart=/usr/bin/python3 /usr/local/lib/deedkit/inference_worker_start.py
+
+[Install]
+# Started when docker.service is (a Wants=, not an ordering): Docker does not wait for it.
+WantedBy=docker.service

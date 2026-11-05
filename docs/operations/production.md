@@ -1556,7 +1556,7 @@ raw rule is the single `PREROUTING -i dk-inference0 -j DROP` of `rules()` (there
 
 Facts to know: a `ufw reload`, `ufw disable/enable` or a ufw restart loads `before.rules` with `iptables-restore
 --noflush`, and its `:DOCKER-USER` declaration empties that chain; before ANYM-693 this removed the inference hook from
-`DOCKER-USER`. After a reboot `enricher-mini` stays stopped (restart policy `no`); a promotion-tool `up` before the
+`DOCKER-USER`. After a reboot Docker leaves `enricher-mini` stopped (restart policy `no`) and `deedkit-inference-worker.service` starts it behind its gates ("Stopped worker"); a promotion-tool `up` before the
 rules exist starts it into exit 78. With the rules persisted they are there first (`ufw.service` starts before
 `docker.service`).
 
@@ -1751,22 +1751,50 @@ needs the same newer-SHA hand apply as the delivery undo above); `docker image r
 both chains); with the rules persisted, also restore the saved copies of the rules files and `after.init` and
 `ufw reload` ("Host firewall persistence", Rollback), or the next reload or reboot puts the rules back. The worker's jobs requeue on SIGTERM; nothing in the database changes.
 
-### Stopped worker: manual recovery (ANYM-709)
+### Stopped worker: the unit and manual recovery (ANYM-709, ANYM-794)
 
-After a host reboot or a Docker restart `enricher-mini` stays stopped, and nothing starts it. The repository's and the
-host's overlay set `restart: "no"` (ANYM-693, and it stays so: Docker's restart is not the fix, since a policy cannot
-leave out exit 78). A transient database error no longer stops it (ENRICHMENT.md). The
-`deedkit-inference-worker.service` and `/usr/local/sbin/deedkit-inference-guard` that the overlay's comment names do
-not exist: on 2026-11-05 `/usr/local/sbin` is empty, `systemctl list-unit-files` lists no such unit, root has no
-crontab and `/etc/cron.d` holds only `e2scrub_all` and `sysstat`. Queued jobs wait. A stopped selected worker also makes
-`prepare` refuse ("each selected service must already have exactly one running container"), and autodeploy pauses on
-that refusal ("Continuous deployment"), so no release goes out until it runs again and the pause is removed.
+After a host reboot or a Docker restart Docker leaves `enricher-mini` stopped: its restart policy stays `no`, since a policy
+cannot leave out exit 78. `deedkit-inference-worker.service`, a root oneshot wanted by `docker.service` with no `Restart=`
+and no timer, runs `/usr/local/lib/deedkit/inference_worker_start.py` once per Docker start. Nothing requires it and Docker
+does not wait for it. A stopped selected worker makes `prepare` refuse ("each selected service must already have exactly
+one running container") and autodeploy pauses on that refusal ("Continuous deployment"); the unit never removes
+`/etc/deedkit/autodeploy.pause`.
+
+Its steps, in order; a failure records its code, runs no later step and starts nothing. First: an installed tool without a
+function it uses is `tool_too_old`, an unreadable configuration `config_unreadable`.
+a. Container running: outcome `already_running`, nothing else (`docker_unreadable` if `docker ps` fails).
+b. Backup runner's lock, then `deploy.lock`, not waiting, held to the end of k: `backup_running`, `release_running`.
+c. `unresolved` is clean: `release_unresolved`.
+d. One container whose ID, image and settings digest equal `current.json`'s: `no_container`, `identity_mismatch`,
+   `identity_unrecorded` (none or a legacy one, a rolled-back release included).
+e. `/etc/deedkit/inference-worker.hold` is absent: `operator_hold`.
+f. Last exit code is not 78: `previous_exit_78`.
+g. Database healthy within 300 s: `database_not_ready`.
+h. No active call, one 120 s deadline shared with j: `active_call`, `call_probe_failed`.
+i. `inference_egress_check.py verify` prints `ok`: `egress_rules_not_verified`.
+j. Again: the hold file, the identity, the calls.
+k. `docker compose $F --profile enrichment-mini start enricher-mini`, `start` only: `start_failed`. It reads the container
+   for 60 s: an exit records `confinement_not_proved` (78) or `exited_<code>`; it never starts it again. A later 78 stops
+   the next run at f.
+
+Receipt: `/var/lib/deedkit/inference-worker.json` (`checked_at`, `outcome` `started|already_running|refused`, `reason`), and
+`production.py status` prints `inference worker: <outcome> <reason> (checked <time>)` on stderr. Exit 0 for the first two
+outcomes, 1 for `refused`. No retry: a person or the next Docker start decides.
+
+Stop it so that it stays stopped: `touch /etc/deedkit/inference-worker.hold` first, then the `stop` of the Undo below.
+
+Install, by hand, like the firewall unit, only after checking that the deployed release holds ANYM-786 (`git merge-base
+--is-ancestor 4017891b <deployed sha>`: until a lost confinement always exits 78, a masked exit reads as ordinary): copy
+`scripts/inference_worker_start.py` to `/usr/local/lib/deedkit/` and `deploy/deedkit-inference-worker.service` to
+`/etc/systemd/system/`, `systemctl daemon-reload`, `systemctl enable deedkit-inference-worker.service`. Correct the comment
+at lines 48-49 of the host overlay `compose.enrichment-mini.yaml` in the same step (comment only, with a copy and a
+read-back): it names a unit path and a timer that do not exist. Uninstall: `systemctl disable` the unit; nothing else changes.
 
 Who reads its liveness: whoever reads the day's production status (the watch below) and the operator of every release.
 A stopped worker raises the Tiden event `enrichment_no_worker` (triage: "Mini inference: watch and enable record"). Read `docker ps --filter name=enricher-mini` (one container, `Up`)
 and `SELECT account, kind, enabled, pause_reason, expires_at FROM processing_profiles` (operator DSN, no write).
 
-Start it, as root on the host, in this order; a failed step stops:
+The manual path stays for a refused start. Read the reason and fix it first; then start it, as root on the host, in this order; a failed step stops:
 1. The active-call gate (it prints `no active call`; a call or a traceback means stop). This host's configuration is
    the one `active_config()` names, so the `p.CONFIG` form of inference-enable.md fails here: `python3 -I -c 'import sys;
    sys.path.insert(0, "/usr/local/lib/deedkit"); import production as p; found = p.active_calls(p.config(p.active_config()));
@@ -1779,7 +1807,8 @@ Start it, as root on the host, in this order; a failed step stops:
 Check: running, no restarts; a restart with exit 78 means the rules or networks are wrong (self-check above; never
 disable it). The `processing_profiles` rows are enabled again (the worker publishes them at start). If
 `/etc/deedkit/autodeploy.pause` exists, read its reason and remove it only when that reason is this refusal. Undo:
-`docker compose $F --profile enrichment-mini stop enricher-mini`; its jobs requeue on SIGTERM.
+`touch /etc/deedkit/inference-worker.hold`, then `docker compose $F --profile enrichment-mini stop enricher-mini`; its jobs
+requeue on SIGTERM. Remove the hold file before the worker should start again.
 
 ### Working space and audio limit: run record (ANYM-709)
 

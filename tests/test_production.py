@@ -15,6 +15,7 @@ import resource
 import stat
 import subprocess
 import sys
+import tempfile
 from types import SimpleNamespace
 import urllib.error
 
@@ -37,7 +38,7 @@ CHECK_SPACE, RETAIN_IMAGES, PROMOTABLE = p.check_space, p.retain_images, p.promo
 def no_host_state(tmp_path, monkeypatch):
     """No test reads this machine's production state, /etc/deedkit, containerd, tool or systemd directory."""
     for name in ("HOST_STATE", "CONFIG_DIRECTORY", "CONTAINERD_ROOT", "TOOL_ROOT", "SYSTEMD_DIRECTORY", "BACKUP_RUNNER",
-                 "BACKUP_LOCK"):
+                 "BACKUP_LOCK", "INFERENCE_WORKER_RECEIPT"):
         monkeypatch.setattr(p, name, tmp_path / "absent" / name.lower())
 
 
@@ -6860,6 +6861,9 @@ def freshness_file(path, *, checked_ago=timedelta(minutes=20), status="fresh", a
     return checked.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+INFERENCE_WORKER_LINE = "inference worker: no receipt"
+
+
 def status_with_freshness(tmp_path, monkeypatch, capsys, freshness):
     monkeypatch.delenv("DEEDKIT_DEPLOY_CONFIG", raising=False)
     monkeypatch.setattr(p, "CONFIG_DIRECTORY", tmp_path / "etc")
@@ -6871,7 +6875,8 @@ def status_with_freshness(tmp_path, monkeypatch, capsys, freshness):
     p.write(state / "current.json", {"sha": "c" * 40, "status": "applied"})
     monkeypatch.setattr(p, "config", lambda path: {"state_directory": str(state)})
     p.main(["status"])
-    return capsys.readouterr()
+    printed = capsys.readouterr()
+    return SimpleNamespace(out=printed.out, err=printed.err.removesuffix(INFERENCE_WORKER_LINE + "\n"))
 
 
 def status_with_pause(tmp_path, monkeypatch, capsys, content):
@@ -6949,6 +6954,32 @@ def test_status_prints_the_calendar_backup_freshness_line_beside_the_json_a_read
     checked = freshness_file(result, status="unknown", age=None, last_snapshot_at=None)
     printed = status_with_freshness(tmp_path, monkeypatch, capsys, result)
     assert printed.err == f"calendar backup: UNKNOWN age=? (checked {checked})\n"
+
+
+# spec: ANYM-794
+@pytest.mark.parametrize("outcome,reason,shown", [("started", None, "started"), ("already_running", None, "already_running"),
+                                                  ("refused", "operator_hold", "refused operator_hold")])
+def test_status_prints_the_inference_worker_receipt_for_each_outcome(tmp_path, outcome, reason, shown):
+    path = tmp_path / "receipt.json"
+    path.write_text(json.dumps({"checked_at": "2026-11-05T03:25:00Z", "outcome": outcome, "reason": reason}))
+    assert p.inference_worker_line(path) == f"inference worker: {shown} (checked 2026-11-05T03:25:00Z)"
+
+
+# spec: ANYM-794
+def test_status_prints_one_json_document_and_the_inference_worker_line_with_no_receipt(tmp_path, monkeypatch, capsys):
+    printed = status_with_freshness(tmp_path, monkeypatch, capsys, tmp_path / "none.json")
+    assert json.loads(printed.out)["sha"] == "c" * 40
+    assert p.inference_worker_line() == INFERENCE_WORKER_LINE
+
+
+# spec: ANYM-794
+@given(st.binary(max_size=200) | JSON_VALUES.map(lambda value: json.dumps(value).encode()))
+def test_any_inference_worker_receipt_gives_one_line_and_no_error(content):
+    with tempfile.NamedTemporaryFile() as handle:
+        handle.write(content)
+        handle.flush()
+        line = p.inference_worker_line(handle.name)
+    assert line.startswith("inference worker: ") and "\n" not in line
 
 
 # spec: ANYM-694

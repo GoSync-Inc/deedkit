@@ -106,7 +106,7 @@ services:
   enricher-mini:
     <<: *enrichment-common
     # Exit 78 (confinement not proved) stays fatal, and a Docker restart policy has no exit-code filter: `on-failure`
-    # would restart 78 too. So Docker never starts this worker; docs/operations/production.md "Stopped worker".
+    # would restart 78 too. So Docker never starts this worker; deedkit-inference-worker.service does, behind its gates (docs/operations/production.md "Stopped worker").
     restart: "no"
     profiles: [enrichment-mini]
     image: anymsg-enricher-local:${MESSAGING_VERSION:-0.9.9}
