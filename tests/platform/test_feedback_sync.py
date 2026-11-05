@@ -2,6 +2,10 @@
 from datetime import datetime, timedelta, timezone
 import fcntl
 import json
+from pathlib import Path
+import plistlib
+import re
+import shutil
 import subprocess
 
 from hypothesis import given, strategies as st
@@ -650,6 +654,70 @@ def test_a_failed_or_malformed_read_stops_follow_before_any_write(tmp_path, bad)
 
 
 # spec: ANYM-473
+def test_live_that_runs_out_of_budget_refuses_and_never_reads_as_not_live(tmp_path, monkeypatch):
+    root, shas = repo(tmp_path, ['delivered', 'plan'])
+    snapshot = {'plan_a': {'sha': shas['plan'], 'status': 'applied'}, 'http': {'sha': shas['plan'], 'status': 'serving'},
+                'deploy': None, 'pause': {'present': False, 'reason': None}, 'unresolved': [], 'served': []}
+    monkeypatch.setattr(sync, 'LIVE_BUDGET', 0)
+    live = sync.live_probe('deedkit-prod', root, lambda host: snapshot)
+    with pytest.raises(sync.Refused, match='could not tell'):
+        live(shas['delivered'])
+
+
+# spec: ANYM-473
+def test_an_unknown_serving_attempt_refuses_only_a_commit_it_could_change(tmp_path):
+    root, shas = repo(tmp_path, ['delivered', 'plan'])
+    plan, later = shas['plan'], git(root, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit-tree', '-m',
+                                    'later', '-p', shas['plan'], git(root, 'rev-parse', 'HEAD^{tree}'))
+    snapshot = {'plan_a': {'sha': plan, 'status': 'applied'}, 'http': {'sha': plan, 'status': 'serving'}, 'deploy': None,
+                'pause': {'present': False, 'reason': None}, 'unresolved': [], 'served': ['e' * 40]}
+    live = sync.live_probe('deedkit-prod', root, lambda host: snapshot)
+    assert live(later) is None  # git proves the production receipts do not contain it
+    with pytest.raises(sync.Refused, match='could not tell'):
+        live(shas['delivered'])
+
+
+# spec: ANYM-473
+def test_a_commit_git_does_not_know_refuses(tmp_path):
+    root, shas = repo(tmp_path, ['plan'])
+    snapshot = {'plan_a': {'sha': shas['plan'], 'status': 'applied'}, 'http': {'sha': shas['plan'], 'status': 'serving'},
+                'deploy': None, 'pause': {'present': False, 'reason': None}, 'unresolved': [], 'served': []}
+    with pytest.raises(sync.Refused, match='could not tell'):
+        sync.live_probe('deedkit-prod', root, lambda host: snapshot)('e' * 40)
+
+
+# spec: ANYM-473
+def test_an_exhausted_budget_stops_the_run_before_an_accepted_item_is_written_fixed(tmp_path, monkeypatch):
+    root, shas = repo(tmp_path, ['delivered', 'plan'])
+    gh, _ = pull_requests({'ANYM-10': [(1, 'Delivers: ANYM-10', shas['delivered'])]})
+    prod = Prod({A: disp('accepted', 'ANYM-10')})
+    answer = {'plan_a': {'sha': shas['plan'], 'status': 'applied'}, 'http': {'sha': shas['plan'], 'status': 'serving'},
+              'deploy': None, 'pause': {'present': False, 'reason': None}, 'unresolved': [], 'served': []}
+    monkeypatch.setattr(sync, 'LIVE_BUDGET', 0)
+    monkeypatch.setattr(sync.receipt_watch, 'probe', lambda host: answer)
+    assert sync.main(['auto', '--apply', '--state', str(state_dir(tmp_path)), '--triage-state', str(triage_dir(tmp_path))],
+                     ssh=prod.ssh, read=lambda *argv: MAIN, live=None, gh=gh, run=prod.run, root=root, fetch=False) == 1
+    assert prod.writes == [] and 'could not tell' in synced(tmp_path, 'last-run.json')['error']
+
+
+# spec: ANYM-473
+def test_the_ancestry_of_the_serving_attempts_is_asked_once_across_all_commits(tmp_path, monkeypatch):
+    root, shas = repo(tmp_path, ['a', 'b', 'c', 'plan'])
+    plan = shas['plan']
+    snapshot = {'plan_a': {'sha': plan, 'status': 'applied'}, 'http': {'sha': plan, 'status': 'serving'}, 'deploy': None,
+                'pause': {'present': False, 'reason': None}, 'unresolved': [], 'served': [shas['a'], shas['b'], plan]}
+    real, asked = subprocess.run, []
+
+    def counted(command, **kwargs):
+        asked.append(tuple(command[-2:]))
+        return real(command, **kwargs)
+    live = sync.live_probe('deedkit-prod', root, lambda host: snapshot)
+    monkeypatch.setattr(subprocess, 'run', counted)
+    assert [live(shas[name]) for name in ('a', 'b', 'c', 'a')] == [plan] * 4
+    assert len(asked) == len(set(asked))
+
+
+# spec: ANYM-473
 def test_live_follows_the_receipt_watch_verdict(tmp_path):
     root, shas = repo(tmp_path, ['old', 'delivered', 'plan'])
     old, delivered, plan = shas['old'], shas['delivered'], shas['plan']
@@ -1100,6 +1168,113 @@ def test_a_superseded_queue_row_stays_superseded_when_follow_moves_the_item(tmp_
                      fetch=False) == 0
     assert prod.rows[A]['status'] == 'fixed' and flags(prod.writes[0])['--status'] == 'fixed'
     assert synced(tmp_path, 'applied.json')['files'][path.name]['rows'][A]['outcome'] == 'superseded'
+
+
+# spec: ANYM-536
+def test_an_unreadable_release_receipt_stops_the_hourly_run_with_its_name_before_any_write(tmp_path, monkeypatch):
+    root, shas = repo(tmp_path, ['one'])
+    gh, _ = pull_requests({'ANYM-10': [(1, 'Delivers: ANYM-10', shas['one'])]})
+    prod = Prod({A: disp('accepted', 'ANYM-10')})
+    answer = {'plan_a': None, 'http': None, 'deploy': None, 'pause': {'present': False, 'reason': None},
+              'unresolved': ['http-current.json:receipt-unreadable'], 'served': []}
+    real = subprocess.run
+
+    def host_answers(command, **kwargs):
+        if command[0] == 'ssh':
+            return subprocess.CompletedProcess(command, 0, json.dumps(answer), '')
+        return real(command, **kwargs)
+    monkeypatch.setattr(subprocess, 'run', host_answers)
+    assert sync.main(['auto', '--apply', '--state', str(state_dir(tmp_path)), '--triage-state', str(triage_dir(tmp_path))],
+                     ssh=prod.ssh, read=lambda *argv: MAIN, live=None, gh=gh, run=prod.run, root=root, fetch=False) == 1
+    report = synced(tmp_path, 'last-run.json')
+    assert prod.writes == [] and report['exit'] == 1 and 'http-current.json' in report['error']
+
+
+def launch_agent(tmp_path, checkout=None, **exits):
+    """Runs the ProgramArguments of the plist the document tells the operator to install, with a stub uv that records
+    what ran, and with a stub git (exit codes by subcommand) unless a real `checkout` is given."""
+    text = (Path(sync.__file__).parents[1] / 'docs/operations/feedback-triage.md').read_text()
+    block = re.search(r'```xml\n(.*?)```', text, re.S)
+    assert block
+    agent = plistlib.loads(block[1].encode())
+    bin_, log = tmp_path / 'bin', tmp_path / 'ran.log'
+    bin_.mkdir(exist_ok=True)
+    log.write_text('')
+    stubs = {'uv': f'echo "uv $*" >> {log}; exit 7', 'timeout': f'echo "timeout $1" >> {log}; shift; exec "$@"'}
+    if checkout is None:
+        cases = ' '.join(f'{name}) code={code};;' for name, code in exits.items())
+        stubs['git'] = f'echo "git $*" >> {log}; code=0; case "$1" in {cases} esac; exit $code'
+    for name, body in stubs.items():
+        (bin_ / name).write_text(f'#!/bin/sh\n{body}\n')
+        (bin_ / name).chmod(0o755)
+    argv = [word.replace('/Users/OWNER/.local/bin/uv', str(bin_ / 'uv')) for word in agent['ProgramArguments']]
+    real_git = shutil.which('git')
+    assert real_git
+    path = f'{bin_}:{Path(real_git).parent}:/usr/bin:/bin'
+    env = {**agent['EnvironmentVariables'], 'PATH': path}
+    done = subprocess.run(argv, cwd=checkout or tmp_path, env=env, capture_output=True, text=True, timeout=60)
+    return agent, done, log.read_text().splitlines()
+
+
+SYNC_RUN = 'uv run --no-project --python 3.13 python scripts/feedback_sync.py auto --apply'
+PULL = ['timeout 120', 'git fetch -q origin main', 'git merge --ff-only origin/main']
+CLEAN = ['git status --porcelain', 'git rev-parse --git-path index.lock']
+
+
+# spec: ANYM-536
+def test_the_launch_agent_pulls_the_checkout_before_the_sync_and_never_waits_on_a_prompt(tmp_path):
+    agent, done, ran = launch_agent(tmp_path)
+    assert ran == [*PULL, *CLEAN, SYNC_RUN]
+    assert done.returncode == 7 and done.stderr == ''  # the sync's own exit code is launchd's
+    assert agent['EnvironmentVariables']['GIT_TERMINAL_PROMPT'] == '0'
+
+
+# spec: ANYM-536
+@pytest.mark.parametrize('failure,code,steps', [('fetch', 124, PULL[:2]), ('merge', 3, PULL)])
+def test_a_failed_pull_is_logged_with_its_exit_code_and_the_sync_of_the_current_code_still_runs(tmp_path, failure, code, steps):
+    _, done, ran = launch_agent(tmp_path, **{failure: code})
+    assert ran == [*steps, *CLEAN, SYNC_RUN]
+    assert done.returncode == 7 and f'git pull failed (exit {code})' in done.stderr
+
+
+def checkout_of_a_moving_main(tmp_path):
+    """A bare origin, a publisher clone and the job's clone; returns a commit function and the job's clone."""
+    origin, publisher, job = tmp_path / 'origin.git', tmp_path / 'publisher', tmp_path / 'job'
+
+    def git(*argv, cwd=tmp_path):
+        return subprocess.run(['git', *argv], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+    git('init', '-q', '--bare', '-b', 'main', str(origin))
+    git('clone', '-q', str(origin), str(publisher))
+
+    def publish(content):
+        (publisher / 'f.py').write_text(content)
+        git('add', 'f.py', cwd=publisher)
+        git('-c', 'user.name=T', '-c', 'user.email=t@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-q', '-m',
+            content, cwd=publisher)
+        git('push', '-q', 'origin', 'HEAD:main', cwd=publisher)
+        return git('rev-parse', 'HEAD', cwd=publisher)
+    publish('one')
+    git('clone', '-q', str(origin), str(job))
+    return publish, job, lambda: git('rev-parse', 'HEAD', cwd=job)
+
+
+# spec: ANYM-536
+def test_the_launch_agent_moves_a_clean_checkout_to_main_before_the_sync_with_real_git(tmp_path):
+    publish, job, head = checkout_of_a_moving_main(tmp_path)
+    latest = publish('two')
+    _, done, ran = launch_agent(tmp_path, checkout=job)
+    assert head() == latest and (job / 'f.py').read_text() == 'two'
+    assert ran == ['timeout 120', SYNC_RUN] and done.returncode == 7 and done.stderr == ''
+
+
+# spec: ANYM-536
+@pytest.mark.parametrize('leftover', ['f.py', 'new_module.py', '.git/index.lock'])
+def test_a_checkout_left_partly_updated_never_reaches_the_sync(tmp_path, leftover):
+    publish, job, _ = checkout_of_a_moving_main(tmp_path)
+    (job / leftover).write_text('left by an interrupted update')
+    publish('two')
+    _, done, ran = launch_agent(tmp_path, checkout=job)
+    assert SYNC_RUN not in ran and done.returncode == 1 and 'the checkout is not clean' in done.stderr
 
 
 # spec: ANYM-536

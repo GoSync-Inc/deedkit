@@ -282,6 +282,19 @@ def test_a_bad_answer_from_the_host_is_a_failed_poll(monkeypatch, stdout):
         watcher.probe("host")
 
 
+# spec: ANYM-440
+@pytest.mark.parametrize("name", ["current.json", "http-current.json"])
+def test_a_release_receipt_the_host_cannot_read_is_a_failed_poll_that_names_it(monkeypatch, name):
+    stdout = json.dumps({**snap(), "unresolved": [name + ":receipt-unreadable"]})
+    monkeypatch.setattr(subprocess, "run", lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout, ""))
+    with pytest.raises(ValueError, match=name):
+        watcher.probe("host")
+    other = {**snap(), "unresolved": ["c" * 40 + ":result-unreadable"]}
+    monkeypatch.setattr(subprocess, "run",
+                        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, json.dumps(other), ""))
+    assert watcher.probe("host") == other  # an attempt's record stays UNSETTLED's business
+
+
 # --- the real remote script, run on a synthetic host tree -------------------------------------------------------
 
 def tree_digest(root):
@@ -451,6 +464,51 @@ def test_the_real_remote_script_survives_missing_receipts_and_configs(tmp_path):
     assert problems == [] and watcher.valid(state) and state["plan_a"] is None and state["pause"] == IDLE
     write(tmp_path / "etc/autodeploy.pause", "")
     assert json.loads(run_remote(tmp_path))["pause"]["present"] is True
+
+
+def chained_receipt(sha, depth=140):
+    """As production writes it: each release embeds the one before under `previous`, all of it private."""
+    receipt = None
+    for _ in range(depth):
+        receipt = {"sha": sha, "status": "serving", "private_files": {"k": SECRET}, "router_after": "x" * 1024,
+                   "previous": receipt}
+    return receipt
+
+
+# spec: ANYM-440
+def test_a_serving_receipt_over_the_text_limit_is_read_and_a_contained_sha_ends_live(history, host_tree):
+    root, shas = history
+    write(host_tree / "plan/current.json", {"sha": shas["C"], "status": "applied"})
+    write(host_tree / "http/http-current.json", chained_receipt(shas["C"]))
+    assert (host_tree / "http/http-current.json").stat().st_size > 65536
+    problems, output = inspect(host_tree)
+    state = json.loads(output)
+    assert problems == [] and watcher.valid(state) and state["unresolved"] == []
+    assert state["http"] == {"sha": shas["C"], "status": "serving"}
+    code, lines, _ = run(history, Probe(state))
+    assert code == 0 and lines[0].startswith(f"LIVE {shas['B'][:12]} ")
+
+
+# spec: ANYM-440
+@pytest.mark.parametrize("name,content", [
+    ("http/http-current.json", "not json"), ("http/http-current.json", "[1]"),
+    ("plan/current.json", "not json"), ("plan/current.json", "[1]"),
+    ("plan/current.json", json.dumps({"sha": "a" * 40, "status": "applied", "pad": "x" * 70000})),
+])
+def test_the_real_remote_script_names_a_release_receipt_it_cannot_read(host_tree, name, content):
+    write(host_tree / name, content)
+    problems, output = inspect(host_tree)
+    assert problems == [] and json.loads(output)["unresolved"] == [Path(name).name + ":receipt-unreadable"]
+
+
+# spec: ANYM-440
+def test_a_serving_receipt_over_its_own_limit_is_named_and_never_a_silent_none(host_tree):
+    write(host_tree / "http/http-current.json", {"sha": "a" * 40, "status": "serving", "pad": "x" * 70000})
+    assert json.loads(run_remote(host_tree))["unresolved"] == []
+    source = watcher.remote_script(str(host_tree / "etc"))
+    assert "1 << 28" in source
+    state = json.loads(run_remote(host_tree, source.replace("1 << 28", "1 << 16", 1)))
+    assert state["http"] is None and state["unresolved"] == ["http-current.json:receipt-unreadable"]
 
 
 # spec: ANYM-440

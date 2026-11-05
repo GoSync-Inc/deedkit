@@ -41,8 +41,8 @@ def text(path, limit=65536, whole=False):
     except (OSError, ValueError):
         return None
     return None if whole and len(raw) > limit else raw[:limit]
-def load(path):
-    raw = text(path, whole=True)
+def load(path, limit=65536):
+    raw = text(path, limit, whole=True)
     try:
         value = json.loads(raw) if raw is not None else None
     except ValueError:
@@ -95,6 +95,12 @@ def snapshot():
     unresolved, served = [], []
     del unreadable[:]
     current = load(plan + "/current.json") if plan else None
+    # http-current.json embeds its whole `previous` chain (16.6 MB at 140 releases): the projection needs four top-level
+    # strings, so only this file gets the larger bound.
+    serving = load(http + "/http-current.json", 1 << 28) if http else None
+    for path, value in ((plan and plan + "/current.json", current), (http and http + "/http-current.json", serving)):
+        if path and value is None and os.path.lexists(path):
+            unresolved.append(path.rsplit("/", 1)[-1] + ":receipt-unreadable")
     for name in children(plan):
         base = plan + "/" + name
         result = load(base + "/result.json")
@@ -124,8 +130,7 @@ def snapshot():
             value = None
         reason = value.get("reason") if isinstance(value, dict) else raw
         reason = (reason[:200] or None) if isinstance(reason, str) else None
-    return {"plan_a": pick(load(plan + "/current.json")) if plan else None,
-            "http": pick(load(http + "/http-current.json")) if http else None,
+    return {"plan_a": pick(current), "http": pick(serving),
             "deploy": pick(load(plan + "/deploy.json")) if plan else None,
             "pause": {"present": os.path.lexists(pause), "reason": reason},
             "unresolved": (unresolved + unreadable)[:10], "served": served}
@@ -176,6 +181,9 @@ def probe(host: str, timeout: float = SSH_TIMEOUT) -> dict:
         raise ValueError("the host answered with malformed JSON") from None
     if not valid(value):
         raise ValueError("the host answered with an unexpected shape")
+    # A receipt that exists and cannot be read is no answer: without this it reads as "not live" for ever, silently.
+    if damaged := [item for item in value.get("unresolved", ()) if item.endswith(":receipt-unreadable")]:
+        raise ValueError("the host cannot read " + ", ".join(damaged))
     return value
 
 
@@ -192,8 +200,11 @@ def short(state: dict | None) -> str:
 
 
 class Watch:
-    def __init__(self, sha: str, root: Path, left):
+    def __init__(self, sha: str, root: Path, left, known: dict | None = None):
+        """`known` keeps ancestry answers across the Watches of one snapshot; `undecided` says the last None verdict means
+        "cannot tell", not "not live"."""
         self.sha, self.root, self.left, self.fetched = sha, root, left, False
+        self.known, self.undecided = {} if known is None else known, False
 
     def budget(self, limit: float) -> float | None:
         """The seconds a child process may take: the limit, cut to what the overall deadline leaves; None when none."""
@@ -204,6 +215,8 @@ class Watch:
         """True when OLDER is NEWER or its ancestor, False when not, None when unknown or out of time."""
         if older == newer:
             return True
+        if (older, newer) in self.known:
+            return self.known[older, newer]
         timeout = self.budget(GIT_TIMEOUT)
         if timeout is None:
             return None
@@ -212,7 +225,10 @@ class Watch:
                                   capture_output=True, timeout=timeout).returncode
         except (OSError, subprocess.SubprocessError):
             return None
-        return {0: True, 1: False}.get(code)
+        answer = {0: True, 1: False}.get(code)
+        if answer is not None:
+            self.known[older, newer] = answer
+        return answer
 
     def related(self, older: str, newer: str) -> bool | None:
         """`ancestry`, with one fetch per run when a commit is unknown; the answer is read again after the fetch."""
@@ -252,7 +268,10 @@ class Watch:
                 unresolved.append(name + ":http-unpublished")
             unknown = unknown or related is None
         applied = plan.get("status") == "applied" and http.get("status") in ("serving", "serving-retirement-pending")
-        both = applied and self.reaches(plan) is True and self.reaches(http) is True
+        reached = [self.reaches(plan), self.reaches(http)] if applied else [False]
+        both = all(item is True for item in reached)
+        # A receipt proven not to contain the SHA decides "not live", whatever else git could not answer.
+        self.undecided = False not in reached and (not both or unknown)
         if both and unknown:
             return None
         if both and not pause["present"] and not unresolved:
