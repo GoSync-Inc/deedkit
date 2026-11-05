@@ -182,8 +182,12 @@ had the requested state, a read error, a timeout or a flood wait (which adds
 `evidence.retry_after_s`). `unknown` still means "not known": the edit may have applied. Its
 `verify` names `get_message_info` with `read-live`: text equal to the requested text means the
 edit applied. `get_message_info` shows no formatting, so a formatted edit's `verify` (ANYM-755)
-names `get_messages` with `body_format=html` instead: a newer revision whose `body_rendered`
-equals the preview's rendering means the edit applied (text alone shows only the text).
+names `get_messages` with `body_format=html` instead. The edit applied when a revision newer
+than `expected_revision` has a `body_rendered` with `lossless: true` and empty `omitted_types`,
+and its `text`, previewed as `edit_message` with `format=html`, gives the `rendered_text` and
+`entities` of this edit's `edit_artifact`. `body_rendered` leaves out what it cannot render, so
+comparing it without `lossless` can miss an entity. No newer revision,
+`body_rendered_unavailable`, `lossless: false` or any difference is inconclusive.
 Never send the edit again, or delete and repost, before that read.
 
 A confirmed edit adds `archive: queued` to `result.data`: the collector puts the read message on
@@ -765,7 +769,13 @@ and `bot-press` from the keys; the widened check is harmless.
   and `allow_lossy`, rendered by the same renderer as `send_message`, so the
   same source gives the same text and entities, and refused with the same codes
   before anything is queued (markdown or html source up to 16000 UTF-16 units,
-  rendered text up to 4000, as a send; a plain edit keeps its 4000). The preview shows the rendering as `edit_artifact`
+  rendered text up to 4000, as a send; a plain edit keeps its 4000). Two byte bounds
+  also apply, and a formatted edit's preview refuses over them as execute does
+  (`invalid_operation_parameters`, field `parameters`, reason `size`): the canonical
+  request, 16000 bytes as for every operation, so the longest ASCII source is a little
+  under 16000 units; and the stored row, 65536 bytes, which repeats the source and
+  rendering, so about 3500 three-byte characters such as CJK rather than a send's 4000.
+  The preview shows the rendering as `edit_artifact`
   and its `preview_digest` binds it. Defaults, given or omitted, leave the stored
   request as a plain edit's. On WhatsApp, edits stay plain text: any non-default
   option is refused `unsupported_operation` with a `next_step` to repeat the edit

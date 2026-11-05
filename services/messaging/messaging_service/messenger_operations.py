@@ -143,8 +143,8 @@ OPERATIONS = {
         'allow_lossy': _field('boolean')},
         limitation=('Own outgoing message at the exact archive revision; format (plain by default, markdown or html), '
                     'link_preview and allow_lossy render as a send (markdown or html source up to 16000 UTF-16 '
-                    'units, rendered text up to 4000); markdown, html, link_preview and allow_lossy are Telegram '
-                    'only.')),
+                    'units inside a 16000-byte request, rendered text up to 4000); markdown, html, link_preview and '
+                    'allow_lossy are Telegram only.')),
     'delete_message': _spec('message-delete', 'message', mutation=True,
         limitation='Own outgoing message only; global revoke must not fall back to local deletion.'),
     'send_reaction': _spec('message-react', 'message', mutation=True, fields={

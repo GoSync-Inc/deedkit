@@ -5,6 +5,7 @@ are terminal unknown and are never retried automatically.
 """
 import asyncio
 import hashlib
+import json
 import logging
 import math
 import os
@@ -53,6 +54,9 @@ log = logging.getLogger('anymsg.live_search')
 EDIT_FORMAT_OPTIONS = ('format','link_preview','allow_lossy')
 EDIT_FORMAT_NEXT_STEP = ('WhatsApp edits are plain text: preview and execute edit_message again with only text '
     '(no format, link_preview or allow_lossy)')
+# The messenger_commands.payload CHECK (migrations/025_operations.sql). A formatted edit's row repeats its source and
+# rendering, so it can pass the canonical request cap and still not be storable.
+STORED_PAYLOAD_BYTES = 65536
 BLOCKED_RESULT_KEYS = frozenset(('token','access_token','refresh_token','session','session_data',
     'password','secret','stack','traceback','diagnostic','diagnostics','credentials'))
 
@@ -233,6 +237,7 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
     required=_required_permissions(spec['permission'],operation,parameters)
     if set(required)-set(p['permissions']):raise APIError('forbidden',403)
     if spec['full_account'] and p['chat_ids'] is not None:raise APIError('forbidden',403)
+    requested=parameters
     if validate_parameters:
         try:parameters=validate_operation(account_row['platform'],operation,parameters,provider=provider)
         except (ValueError,TypeError,UnicodeError) as exc:
@@ -319,7 +324,9 @@ def _resolve(store,c,p,account,operation,chat_id,message_id,expected_revision,pa
     if operation=='edit_message':
         if validate_parameters:
             artifact=_edit_artifact(account_row['platform'],parameters)
-            if artifact is not None:payload['edit_artifact']=artifact
+            if artifact is not None:
+                payload['edit_artifact']=artifact
+                _check_formatted_edit_size(payload,requested)
         elif saved is not None and 'edit_artifact' in saved:
             # ANYM-755: the reviewed rendering is persisted intent; a dispatch never renders again (as a send).
             payload['edit_artifact']=saved['edit_artifact']
@@ -348,6 +355,15 @@ def _edit_artifact(platform,parameters):
         raise failure
     return render_message('telegram',parameters['text'],format=options.get('format','plain'),
                           link_preview=options.get('link_preview',False),allow_lossy=options.get('allow_lossy',False))
+
+
+def _check_formatted_edit_size(payload,requested):
+    """ANYM-755 (Sol r2): a preview refuses what its execute would. The request is measured as execute stores it, with
+    a digest, and the row in the text form the CHECK measures, so a preview that passes here is storable."""
+    request_input,_=_input(payload['account'],payload['operation'],payload['chat_id'],payload['message_id'],
+                           payload['expected_revision'],requested,'0'*64)
+    if len(json.dumps({**payload,'request_input':request_input},ensure_ascii=False).encode())>STORED_PAYLOAD_BYTES:
+        raise _rejected(('parameters','size','stored formatted edit of at most %d bytes'%STORED_PAYLOAD_BYTES))
 
 
 def _digest(p,payload):
@@ -400,10 +416,12 @@ VERIFY={'delete_message':{'operation':'get_message_info','requires':'read-live',
         'decides':'a reaction with chosen:true was set by this account'},
     'edit_message':{'operation':'get_message_info','requires':'read-live',
         'decides':'text equal to the requested text means the edit applied'}}
-# ANYM-755 (Astra r1): get_message_info shows no formatting, so for a formatted edit it settles only the text.
+# ANYM-755 (Astra r1, Sol r2): get_message_info shows no formatting, and body_rendered leaves out what it cannot render.
 VERIFY_FORMATTED_EDIT={'operation':'get_messages','requires':'read',
-    'decides':'body_rendered (body_format=html) of a newer revision equal to the preview\'s rendering means the '
-        'edit applied; get_message_info text equal to edit_artifact.rendered_text shows only that the text applied'}
+    'decides':'a revision newer than expected_revision whose body_rendered (body_format=html) has lossless true and '
+        'empty omitted_types, and whose text, previewed as edit_message with format html, gives the rendered_text and '
+        'entities of this edit\'s edit_artifact, means the edit applied; no newer revision, body_rendered_unavailable, '
+        'lossless false or any difference is inconclusive: never send the edit again on it'}
 
 
 def _verify(row,c=None):

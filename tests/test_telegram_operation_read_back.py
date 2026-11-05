@@ -412,6 +412,36 @@ def test_formatted_edit_whose_entities_differ_from_the_request_stays_unknown(ope
 
 
 # spec: ANYM-755
+def test_the_formatted_verify_settles_only_on_a_lossless_rendering_equal_to_the_artifact():
+    # Sol r2: comparing body_rendered alone would call an edit applied although the read omitted an entity type.
+    from messaging_service.formatting import render_message
+    from messaging_service.formatting_readback import build
+    from messaging_service.incoming_formatting import wire_digest
+    artifact = render_message('telegram', FORMATTED['text'], format='html')
+    body = artifact['rendered_text']
+
+    def read(entities, unsupported=()):
+        rendered, reason = build(body, {'state': 'partial' if unsupported else 'observed', 'wire_sha256': wire_digest(body),
+                                        'entities': entities, 'unsupported_entities': list(unsupported)})
+        assert reason is None
+        again = render_message('telegram', rendered['text'], format='html')
+        return rendered, (again['rendered_text'], again['entities']) == (artifact['rendered_text'], artifact['entities'])
+
+    applied, equal = read(artifact['entities'])
+    assert applied['lossless'] is True and applied['omitted_types'] == [] and equal
+    # The rendering compares equal with an entity left out of it: only lossless and omitted_types show that.
+    lossy, equal = read(artifact['entities'], [{'type': 'custom_emoji', 'offset': 0, 'length': 1}])
+    assert lossy['lossless'] is False and lossy['omitted_types'] == ['custom_emoji'] and equal
+    different, equal = read(artifact['entities'][:1])
+    assert different['lossless'] is True and not equal
+    decides = VERIFY_FORMATTED_EDIT['decides']
+    assert VERIFY_FORMATTED_EDIT['operation'] == 'get_messages' and 'get_message_info' not in decides
+    for term in ('newer than expected_revision', 'body_format=html', 'lossless true', 'empty omitted_types',
+                 'rendered_text', 'entities', 'edit_artifact', 'inconclusive', 'never send the edit again'):
+        assert term in decides
+
+
+# spec: ANYM-755
 @pytest.mark.parametrize('read', ['as_requested', 'extra_italic_after_many_derived', 'over_the_bound'])
 def test_a_formatted_read_back_compares_every_entity(operator, read):
     # Astra r1: a text-derived entity first no longer pushes an unrequested span out of the comparison.

@@ -229,6 +229,68 @@ def test_formatted_edit_binds_the_rendered_artifact_to_its_preview_digest(operat
             parameters={'text':'<script>x</script>','format':'html'}))
 
 
+def formatted_edit_args(source):
+    return operation_args(operation='edit_message',parameters={'text':source,'format':'html'})
+
+
+def refused_alike(s,key,args,expected):
+    """Preview and execute give one refusal, and nothing is queued."""
+    with s.pool.connection() as c:
+        before=c.execute('SELECT count(*) AS n FROM messenger_commands').fetchone()['n']
+    for call,extra in ((s.preview_messenger_operation,{}),
+                       (s.execute_messenger_operation,{'request_id':'synthetic-size-0001','preview_digest':''})):
+        with pytest.raises(APIError,match='invalid_operation_parameters') as refused:
+            call(key,**args,**extra)
+        assert refused.value.field_errors==[{'field':'parameters','reason':'size','expected':expected}]
+    with s.pool.connection() as c:
+        assert c.execute('SELECT count(*) AS n FROM messenger_commands').fetchone()['n']==before
+
+
+# spec: ANYM-755
+def test_a_formatted_edit_that_previews_also_executes_at_the_request_limit(operator):
+    # Sol r2: a source inside the 16000-unit allowance previewed, then failed the canonical request cap on execute.
+    from messaging_service.envelope import canonical
+    s,_,key,_=operator
+    source=lambda count:'<b>'+'&#120;'*count+'</b>'
+    size=lambda count:len(canonical({**formatted_edit_args(source(count)),'preview_digest':'0'*64}))
+    largest=max(count for count in range(2500,2700) if size(count)<=16000)
+    assert largest<2650 and len(source(2650))<=16000  # the reported source is inside the unit allowance
+    args=formatted_edit_args(source(largest))
+    draft=s.preview_messenger_operation(key,**args)
+    queued=s.execute_messenger_operation(key,**args,request_id='synthetic-size-0002',preview_digest=draft['preview_digest'])
+    assert queued['status']=='queued'
+    for count in (largest+1,2650):
+        refused_alike(s,key,formatted_edit_args(source(count)),'canonical request of at most 16000 bytes')
+
+
+# spec: ANYM-755
+def test_a_formatted_edit_over_the_stored_payload_bound_is_refused_at_preview(operator):
+    # The stored row repeats the source and the rendering: 4000 CJK characters fit the request, not the payload CHECK.
+    import json
+    s,_,key,_=operator
+    args=lambda count:formatted_edit_args('<b>'+'漢'*count+'</b>')
+    def previews(count):
+        try:return bool(s.preview_messenger_operation(key,**args(count))['preview_digest'])
+        except APIError as refused:
+            assert refused.field_errors==[{'field':'parameters','reason':'size',
+                'expected':'stored formatted edit of at most 65536 bytes'}]
+            return False
+    fits,over=3000,4000
+    assert previews(fits) and not previews(over)
+    while over-fits>1:
+        middle=(fits+over)//2
+        if previews(middle):fits=middle
+        else:over=middle
+    refused_alike(s,key,args(over),'stored formatted edit of at most 65536 bytes')
+    # The largest that previews is stored: the bound is the CHECK's own measure, not an estimate of it.
+    draft=s.preview_messenger_operation(key,**args(fits))
+    queued=s.execute_messenger_operation(key,**args(fits),request_id='synthetic-size-0003',preview_digest=draft['preview_digest'])
+    with s.pool.connection() as c:
+        row=c.execute('SELECT payload,octet_length(payload::text) AS bytes FROM messenger_commands WHERE id=%s',
+                      (queued['operation_id'],)).fetchone()
+    assert row['bytes']==len(json.dumps(row['payload'],ensure_ascii=False).encode())<=65536
+
+
 # spec: ANYM-755
 @pytest.mark.parametrize('options',[{'format':'html'},{'format':'markdown'},{'link_preview':True},{'allow_lossy':True}])
 def test_whatsapp_formatted_edit_is_refused_unsupported_with_a_plain_next_step(seeded,options):
