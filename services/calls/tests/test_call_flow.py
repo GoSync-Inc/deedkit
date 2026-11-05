@@ -15,6 +15,7 @@ from google.genai.types import (Blob, Content, FunctionCall, LiveServerContent, 
                                 LiveServerToolCall, Part, Transcription)
 from pipecat.frames.frames import EndFrame
 from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
+from pipecat.transports.smallwebrtc.transport import RawAudioTrack
 
 import voice
 from app import create_app
@@ -98,10 +99,12 @@ class ScriptedGemini(voice.AuditedGemini):
         self.session = ScriptedSession()
         self._client = ScriptedClient(self.session)
         self.end_frame_at, self.scripted_audio_ms = None, 0.0
+        self.played_ms, self.played_at_end = lambda: 0.0, None
 
     async def process_frame(self, frame, direction):
         if isinstance(frame, EndFrame) and self.end_frame_at is None:
             self.end_frame_at = time.monotonic()
+            self.played_at_end = self.played_ms()
         await super().process_frame(frame, direction)
 
     def _put(self, **content):
@@ -154,6 +157,15 @@ async def test_rehearsal_call_flows_from_measured_audio_through_guarded_goodbye_
         return llm
     monkeypatch.setattr(voice, 'create_model', create_model)
     reviewer = StubReviewer()
+    # The audio that left the service's output track. That track paces by media time and catches up after a stall of
+    # the host (run 41965488286: 1.0 s of farewell left in 0.2 s), so the wall clock cannot say what has been played.
+    played, real_recv = [], RawAudioTrack.recv
+    async def counted_recv(self):
+        frame = await real_recv(self)
+        if np.max(np.abs(frame.to_ndarray().astype(np.int32))) > 100:
+            played.append(frame.samples * 1000 / frame.sample_rate)
+        return frame
+    monkeypatch.setattr(RawAudioTrack, 'recv', counted_recv)
     app = create_app(tmp_path, Archive(), reviewer=reviewer)
     track = SpeakingTrack()
     peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
@@ -197,6 +209,7 @@ async def test_rehearsal_call_flows_from_measured_audio_through_guarded_goodbye_
                 await asyncio.wait_for(ready.wait(), 10)
                 await until(lambda: models)
                 llm = models[0]
+                llm.played_ms = lambda: sum(played)
                 def events(kind):
                     return [e for e in service.get_call(identity)['events'] if e['kind'] == kind]
 
@@ -228,10 +241,10 @@ async def test_rehearsal_call_flows_from_measured_audio_through_guarded_goodbye_
                                                                 'evidence': GOODBYE}, 'end-final')
                 assert granted.get('end_requested') is True, granted
                 assert llm.end_frame_at is None
-                farewell_started, heard_before = time.monotonic(), len(heard)
+                played_before, heard_before = llm.played_ms(), len(heard)
                 llm.say('Всего доброго.', FAREWELL_SECONDS)
                 await until(lambda: service.get_call(identity)['status'] not in ACTIVE, 20)
-                assert llm.end_frame_at is not None and llm.end_frame_at - farewell_started >= FAREWELL_SECONDS
+                assert llm.end_frame_at is not None and llm.played_at_end - played_before >= FAREWELL_SECONDS * 1000
                 farewell_heard = sum(ms for _, ms in heard[heard_before:])
                 assert farewell_heard >= FAREWELL_SECONDS * 1000 * .8, farewell_heard
 
