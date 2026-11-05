@@ -28,6 +28,28 @@
 #
 # Caps: /Users/Shared/deedkit-ci/caps.conf on the mini (KEY=value lines, defaults below), so they change
 # without a pull request. Worker name: DEEDKIT_REMOTE_WORKER, else the worktree's last two path components.
+#
+# Every wait of a run and its bound, in run order. A phase deadline ends one wait early. The lease (RUN_SECONDS, held
+# by start_watchdog) is the last bound of all a run does once its watchdog runs; a phase before that has only its own.
+#
+#   Wait                                          Bound                       Kind                    Then
+#   ssh connect; a dead ssh channel (every ssh)   ConnectTimeout 10 s;        phase, before the lease 91, or the step's
+#                                                 ServerAlive 15 s x 4                                own failure
+#   mini queue, retries included (wait_not_busy)  WAIT_SECONDS 1200 s         phase, before the lease 90
+#   a slot holder's note (take_slot)              HOLDER_NOTE_SECONDS 10 s    phase, before the lease 90
+#   a slot holder's exit (take_slot)              SLOT_TAKE_SECONDS 120 s     phase, before the lease 90
+#   laptop copy with no bytes moving              COPY_IO_SECONDS 120 s       phase, before the lease 91
+#   laptop copy as a whole                        COPY_SECONDS 600 s          phase, before the lease 91
+#   an earlier run's leftovers (stop_leftovers)   the stop bound below, each  phase, before the lease its record stays
+#   mini copy, initdb, suite and every other step RUN_SECONDS 7200 s          the lease itself        TERM, KILL 10 x
+#                                                                                                     STOP_SECONDS later
+#   PostgreSQL ready (pg_start)                   60 s                        phase, in the lease     the run fails
+#   stopping a run (finish, stop_recorded)        STOP_SECONDS 30 s, 5 s KILL phase, in the lease     its record stays
+#   the laptop's stop request (here_stop)         20 s                        phase, after the lease  returns
+#   the laptop on `--run`                         the lease; a dead channel   the lease itself        the run's exit
+#
+# Only ssh's dead-channel bound covers a command that hangs on a live mini outside the lease: `docker ps` in the queue
+# check, `df` in the disk guard, `tar` in `--here dist`. No stall has been shown for them, so they have no bound here.
 set -euo pipefail
 
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
@@ -57,8 +79,13 @@ NICE=10             # the mini run's scheduling priority, below Between's
 STOP_SECONDS=30     # how long a stop waits for TERM (PostgreSQL: QUIT) before it sends KILL
 RUN_SECONDS=7200    # a run's lease: its watchdog sends the runner TERM past it, so a run whose laptop is gone
                     # (ssh dropped and the stop never arrived) still ends
+SLOT_TAKE_SECONDS=120   # how long one try for a slot waits for a holder that lost the lock to exit
+HOLDER_NOTE_SECONDS=10  # how long a slot's holder may take to say whether it got the lock
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+# The laptop's copy (caps.conf is the mini's): seconds with no bytes moving (rsync --timeout), and the whole copy.
+COPY_IO_SECONDS="${DEEDKIT_REMOTE_COPY_IO_SECONDS:-120}"
+COPY_SECONDS="${DEEDKIT_REMOTE_COPY_SECONDS:-600}"
 
 die() { echo "remote-test: $*" >&2; exit 2; }
 say() { echo "remote-test: $*" >&2; }
@@ -128,7 +155,7 @@ read_caps() {
   while IFS='=' read -r key value; do
     value="${value%%#*}"; value="${value//[[:space:]]/}"
     case "$key" in
-      MAX_RUNS|PARALLEL|MIN_FREE_GB|MIN_FREE_MEM_GB|WAIT_SECONDS|POLL_SECONDS|BUSY_CHECK|MAX_LOAD|NICE|STOP_SECONDS|RUN_SECONDS)
+      MAX_RUNS|PARALLEL|MIN_FREE_GB|MIN_FREE_MEM_GB|WAIT_SECONDS|POLL_SECONDS|BUSY_CHECK|MAX_LOAD|NICE|STOP_SECONDS|RUN_SECONDS|SLOT_TAKE_SECONDS|HOLDER_NOTE_SECONDS)
         [[ "$value" =~ ^[0-9]+$ ]] || continue ;;
       *) continue ;;
     esac
@@ -138,6 +165,8 @@ read_caps() {
   [ "$PARALLEL" -ge 1 ] || PARALLEL=1
   [ "$STOP_SECONDS" -ge 1 ] || STOP_SECONDS=1
   [ "$POLL_SECONDS" -ge 1 ] || POLL_SECONDS=1
+  [ "$SLOT_TAKE_SECONDS" -ge 1 ] || SLOT_TAKE_SECONDS=1
+  [ "$HOLDER_NOTE_SECONDS" -ge 1 ] || HOLDER_NOTE_SECONDS=1
 }
 
 # --- On the mini (as the admin account for the Between check, as _deedkitci for everything else) --------------
@@ -234,16 +263,41 @@ parent = int(sys.argv[2])
 while parent and os.getppid() == parent:
     time.sleep(0.5)'
 
+# A holder past its bound: say which wait ended, KILL that one process (it holds no lock worth keeping: a flock
+# ends with its process) and report the mini busy. Before the lease, so this is the wait's only bound.
+holder_stalled() {
+  say "mini busy (a slot holder $2), CI covers"
+  kill -KILL "$HOLDER" 2>/dev/null || true
+  reap_jobs "$HOLDER"
+  HOLDER=""
+  rm -f "$1"
+}
+
+# 0: a slot is held. 1: every slot is taken. BUSY: a holder stalled, and the caller gives the run up.
 take_slot() {
-  local slot note
+  local slot note note_end slot_end=$((SECONDS + SLOT_TAKE_SECONDS))
   mkdir -p "$ROOT_DIR/.locks"
   for slot in $(seq 1 "$MAX_RUNS"); do
     note="$ROOT_DIR/.locks/holder.$$"
     rm -f "$note"
     python3 -c "$LOCK_HOLDER" "$ROOT_DIR/.locks/slot$slot" $$ > "$note" 2>/dev/null </dev/null &
     HOLDER=$!
-    while [ ! -s "$note" ] && kill -0 "$HOLDER" 2>/dev/null; do sleep 0.1; done
+    note_end=$((SECONDS + HOLDER_NOTE_SECONDS))
+    while [ ! -s "$note" ] && kill -0 "$HOLDER" 2>/dev/null; do
+      if [ "$SECONDS" -ge "$note_end" ]; then
+        holder_stalled "$note" "wrote no note within $HOLDER_NOTE_SECONDS s"
+        return "$BUSY"
+      fi
+      sleep 0.1
+    done
     if [ "$(cat "$note" 2>/dev/null)" = held ]; then rm -f "$note"; return 0; fi
+    while kill -0 "$HOLDER" 2>/dev/null; do
+      if [ "$SECONDS" -ge "$slot_end" ]; then
+        holder_stalled "$note" "did not exit within $SLOT_TAKE_SECONDS s"
+        return "$BUSY"
+      fi
+      sleep 0.1
+    done
     wait "$HOLDER" 2>/dev/null || true
     HOLDER=""
     rm -f "$note"
@@ -255,12 +309,15 @@ take_slot() {
 # caps again. A run that gets no slot or finds the mini busy holds nothing, waits POLL_SECONDS and returns
 # QUEUED; the laptop then repeats the Between check (as the admin account) before it tries again, under one deadline.
 admit() {
-  local mode="$1" free reason=""
+  local mode="$1" free reason="" taken=0
   mkdir -p "$ROOT_DIR"
   free="$(free_gb "$ROOT_DIR")"
   if [ "$free" -lt "$MIN_FREE_GB" ]; then say "mini disk guard: ${free} G free, need ${MIN_FREE_GB} G; CI covers"; return "$BUSY"; fi
   [ "$mode" = run ] || return 0
-  if ! take_slot run; then
+  take_slot run || taken=$?
+  if [ "$taken" = "$BUSY" ]; then
+    return "$BUSY"
+  elif [ "$taken" != 0 ]; then
     reason="all $MAX_RUNS DeedKit slot(s) taken"
   elif [ "$BUSY_CHECK" = 1 ] && reason="$(between_busy)"; then
     kill "$HOLDER" 2>/dev/null || true
@@ -724,6 +781,30 @@ wait_turn() {
   [ -n "$DEADLINE" ] || { say "the mini sent no queue deadline, CI covers"; return "$UNREACHABLE"; }
 }
 
+# The laptop's copy to the mini's stage, in its own process group so nothing of it (its ssh) outlives the copy. rsync's
+# --timeout ends a silent copy: GNU rsync exits 30. openrsync (macOS) only reports it and exits 1 once its ssh ends, and
+# a far end that keeps the channel open never ends it, so COPY_SECONDS bounds the whole copy. Returns rsync's status,
+# or 30 when that deadline ended it.
+COPY_JOB=""
+copy_to_mini() {
+  local stage="$1" worker="$2" end=$((SECONDS + COPY_SECONDS)) status=0
+  trap 'if [ -n "$COPY_JOB" ]; then kill -KILL -- "-$COPY_JOB" 2>/dev/null || true; fi; exit 130' INT TERM HUP
+  set -m
+  rsync "${RSYNC_COPY[@]}" --timeout="$COPY_IO_SECONDS" -e "ssh ${SSH_OPTS[*]}" "$stage/src/" "$HOST:$SHARED/stage/$worker/" </dev/null &
+  COPY_JOB=$!
+  set +m
+  while kill -0 "$COPY_JOB" 2>/dev/null; do
+    if [ "$SECONDS" -ge "$end" ]; then status=30; break; fi
+    sleep 0.2
+  done
+  if [ "$status" = 0 ]; then wait "$COPY_JOB" || status=$?; fi
+  kill -KILL -- "-$COPY_JOB" 2>/dev/null || true
+  reap_jobs "$COPY_JOB"
+  COPY_JOB=""
+  trap - INT TERM HUP
+  return "$status"
+}
+
 laptop_run() {
   local tree suite="$2" worker stage status mode=modules
   tree="$(cd "$1" && pwd)" || die "no worktree $1"
@@ -743,6 +824,7 @@ laptop_run() {
     fi
   fi
   need_host
+  [[ "$COPY_IO_SECONDS $COPY_SECONDS" =~ ^[1-9][0-9]*\ [1-9][0-9]*$ ]] || die "DEEDKIT_REMOTE_COPY_IO_SECONDS and DEEDKIT_REMOTE_COPY_SECONDS must be positive integers"
   wait_turn || exit $?
   status=0
   as_service --here probe "$worker" || status=$?
@@ -760,11 +842,14 @@ laptop_run() {
   tar -C "$tree" --null -T "$stage/files" -cf - | tar -C "$stage/src" -xpf -
   # The mini stage is read by _deedkitci, not its owner, the admin account: readable to all (rsync -a keeps modes).
   chmod -R go+rX "$stage/src"
-  if ! ssh "${SSH_OPTS[@]}" "$HOST" "mkdir -p $(printf '%q' "$SHARED/stage/$worker")" ||
-     ! rsync "${RSYNC_COPY[@]}" -e "ssh ${SSH_OPTS[*]}" "$stage/src/" "$HOST:$SHARED/stage/$worker/"; then
-    say "copying to the mini failed before the suite started, CI covers"
-    exit "$UNREACHABLE"
-  fi
+  status=0
+  ssh "${SSH_OPTS[@]}" "$HOST" "mkdir -p $(printf '%q' "$SHARED/stage/$worker")" || status=1
+  if [ "$status" = 0 ]; then copy_to_mini "$stage" "$worker" || status=$?; fi
+  case "$status" in
+    0) ;;
+    30) say "copying to the mini timed out, CI covers"; exit "$UNREACHABLE" ;;
+    *) say "copying to the mini failed before the suite started, CI covers"; exit "$UNREACHABLE" ;;
+  esac
   local runner_args=() path again=""
   if [ "${#RUFF[@]}" -gt 0 ]; then for path in "${RUFF[@]}"; do runner_args+=(--ruff "$path"); done; fi
   runner_args+=(--)
