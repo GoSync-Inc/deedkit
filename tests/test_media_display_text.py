@@ -5,6 +5,7 @@ from psycopg.types.json import Jsonb
 from messaging_service.conversation import cap_display_text, excerpt_quote, present_message, presentation
 from messaging_service.presentation import lean_chat, lean_message, message_summary, render
 from test_file_index import add_file, drain, worker_for
+from test_file_retention_api import managed_absence
 from test_voice_transcript_reading import TRANSCRIPT, voice
 
 CHAT = 'telegram-demo-chat'
@@ -260,6 +261,20 @@ def test_long_caption_does_not_hide_the_excerpt(seeded):
     seeded_head = s.list_chats(b, view='conversation')['items']
     state = next(r for r in seeded_head if r['id'] == CHAT)['conversation']['latest_known_meaningful_message']
     assert state['display_text'].endswith(f'«{WORDS}»')
+
+
+# spec: ANYM-664
+def test_managed_eviction_with_queued_text_keeps_the_preparing_reason(seeded):
+    s, _, b = seeded
+    add(s, 'voice-1', 'voice')
+    content = b'synthetic-evicted-audio'
+    digest = add_file(s, 'voice-note', 'voice-1', content, 'memo.ogg', 'audio/ogg')
+    with s.pool.connection() as c:
+        c.execute("INSERT INTO processing_profiles(account,kind,provider,model,enabled,expires_at) "
+                  "VALUES('telegram-demo','audio','synthetic','synthetic-model',true,clock_timestamp()+interval '1 hour')")
+    drain(worker_for(s))
+    managed_absence(s, digest, len(content))
+    assert rows(s, b, 'full')['voice-1']['display_text'] == '[Голосовое; расшифровка готовится]'
 
 
 # spec: ANYM-664

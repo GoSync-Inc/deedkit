@@ -16,7 +16,11 @@ _TRANSCRIPT="(a.mime LIKE 'audio/%%' OR a.mime='application/ogg') AND e.state='r
 _TEXT='(CASE WHEN '+_EXTRACTED+' THEN f.text_content WHEN '+_TRANSCRIPT+' THEN e.text_content END)'
 EXCERPT_COLUMNS=(',CASE WHEN '+_EXTRACTED+" THEN 'extracted' WHEN "+_TRANSCRIPT+" THEN 'transcript' END AS excerpt_source,"
     'left('+_TEXT+',%s) AS excerpt_head,length('+_TEXT+') AS excerpt_total,'
-    'CASE WHEN '+_EXTRACTED+' THEN f.truncated WHEN '+_TRANSCRIPT+' THEN e.truncated END AS excerpt_source_truncated')
+    'CASE WHEN '+_EXTRACTED+' THEN f.truncated WHEN '+_TRANSCRIPT+' THEN e.truncated END AS excerpt_source_truncated,'
+    # ANYM-664: is_managed_evicted's rule inside this read, so a pending label adds no query per file.
+    "CASE WHEN EXISTS(SELECT FROM attachment_residency r JOIN attachment_eviction_journal ej ON ej.id=r.eviction_id"
+    " WHERE r.digest=a.digest AND r.bytes=a.bytes AND r.state='evicted' AND ej.state='completed'"
+    " AND ej.digest=r.digest AND ej.bytes=r.bytes) THEN 'evicted' END AS original_residency")
 
 
 def send_provenance(c,rows):
