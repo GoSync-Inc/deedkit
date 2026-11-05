@@ -660,7 +660,10 @@ copy (measured by tests/test_backup_calls.py). Rollback-journal SQLite restarts 
 waits 1 s, so writes during a call delay the copy until they pause; the copy gives up with `calls_snapshot_busy` after 120
 busy answers in a row, or `calls_helper_timeout` at `capture_timeout_seconds`. On a timeout the runner removes the helper
 and reads back that it is gone before it cleans staging; unverified is `calls_helper_unverified`, staging stays, and the
-recovery looks again. An absent calls container is `no_calls_container` and starts nothing.
+recovery looks again. An absent calls container is `no_calls_container` and starts nothing. Disk: admission needs
+`min_free_bytes` (1 GiB) plus three times the largest of the live file's size, the last snapshot and 256 MiB in staging (the
+copy, the vacuumed file and SQLite's temporary files) and once more for the ciphertext, else `calls_skipped_disk`; while it
+writes, the helper stops with `calls_no_space` when free space on staging falls below `min_free_bytes`.
 
 Bundle: `bundle.tar.age` with exactly two members, `manifest.json` first and `state/voice.sqlite3`. The manifest holds
 `profile: calls`, `schema_version` 1 (the bundle format), `user_version` (SQLite's, separately), `captured_at` (when the

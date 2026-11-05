@@ -114,8 +114,14 @@ def category(exc):
         if name.startswith(prefix):
             return code
     return "sqlite_error"
-def snapshot(source, staging, pages, pause, busy_pause, retries, restart_pause, limit):
+def snapshot(source, staging, pages, pause, busy_pause, retries, restart_pause, limit, reserve):
     deadline = time.monotonic() + limit
+    short = []
+    def low():
+        info = os.statvfs(staging)
+        if info.f_bavail * info.f_frsize < reserve:
+            short.append(True)
+        return bool(short)
     if not source.is_file():
         raise Stop("no_database")
     copy, final = staging / "voice.copy.sqlite3", staging / "voice.sqlite3"
@@ -126,6 +132,8 @@ def snapshot(source, staging, pages, pause, busy_pause, retries, restart_pause, 
         nonlocal busy, last
         if time.monotonic() > deadline:
             raise Stop("timeout")
+        if low():
+            raise Stop("no_space")
         if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
             busy += 1
             if busy > retries:
@@ -138,17 +146,23 @@ def snapshot(source, staging, pages, pause, busy_pause, retries, restart_pause, 
             time.sleep(restart_pause if restarted else pause)
     reader.backup(target, pages=pages, progress=progress, sleep=busy_pause)
     reader.close()
-    target.set_progress_handler(lambda: time.monotonic() > deadline, 1000)
-    if target.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
-        raise Stop("corrupt")
-    target.execute("VACUUM INTO ?", (str(final),))
+    target.set_progress_handler(lambda: time.monotonic() > deadline or low(), 1000)
+    try:
+        if target.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+            raise Stop("corrupt")
+        target.execute("VACUUM INTO ?", (str(final),))
+    except sqlite3.Error:
+        if short:
+            raise Stop("no_space") from None
+        raise
     target.close()
     copy.unlink()
 os.umask(0o077)
 signal.alarm(int(sys.argv[9]))
+reserve = int(sys.argv[10])
 try:
     snapshot(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5]),
-             int(sys.argv[6]), float(sys.argv[7]), float(sys.argv[8]))
+             int(sys.argv[6]), float(sys.argv[7]), float(sys.argv[8]), reserve)
     print(json.dumps({"status": "ok"}))
 except Stop as exc:
     print(json.dumps({"error": exc.code}))
@@ -305,7 +319,8 @@ def recordings_options(cfg):
 def staged_options(cfg):
     """The phase deadlines of a staged profile. The calls helper's budget stands where the recordings exec's does."""
     if cfg.get('profile')=='calls':
-        return {**CALLS_DEFAULTS,**cfg['calls'],'exec_timeout_seconds':cfg['calls']['capture_timeout_seconds']}
+        # Its budget plus what surrounds it: resolving the image, creating the helper, verifying it gone.
+        return {**CALLS_DEFAULTS,**cfg['calls'],'exec_timeout_seconds':cfg['calls']['capture_timeout_seconds']+30+90+REAP_SECONDS}
     return recordings_options(cfg)
 
 
@@ -477,13 +492,13 @@ def dump_timeout(cfg):
 
 class Docker:
     @staticmethod
-    def call(*args):
-        result=subprocess.run(['docker',*args],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=90)
+    def call(*args,timeout=90):
+        result=subprocess.run(['docker',*args],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout)
         if result.returncode:raise RuntimeError('docker_operation_failed')
         return result.stdout.decode().strip()
     @staticmethod
-    def inspect(name):
-        result=subprocess.run(['docker','container','inspect',name],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=30)
+    def inspect(name,timeout=30):
+        result=subprocess.run(['docker','container','inspect',name],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout)
         if result.returncode:
             if b'No such container' in result.stderr or b'No such object' in result.stderr:return None
             raise RuntimeError('docker_inspection_failed')
@@ -714,7 +729,7 @@ class Runner:
         self.cfg=cfg;self.root=Path(cfg['directory']);self.root.mkdir(mode=0o700,parents=True,exist_ok=True)
         if self.root.is_symlink() or self.root.stat().st_mode&0o077:raise ValueError('private_backup_directory_required')
         self.journal_path=self.root/'journal.json';self.status_path=self.root/'status.json'
-        self.docker=docker or Docker();self.clock=clock;self.sleep=sleep;self.send=send;self.stream_send=stream_send;self.journal=None
+        self.monotonic=time.monotonic;self.docker=docker or Docker();self.clock=clock;self.sleep=sleep;self.send=send;self.stream_send=stream_send;self.journal=None
         self.calendar=cfg.get('profile')=='calendar';self.recordings=cfg.get('profile')=='recordings'
         # Both own no application container, open no fence and take the host lock; each names only its own worker.
         self.calls=cfg.get('profile')=='calls';self.staged=self.recordings or self.calls
@@ -877,27 +892,22 @@ class Runner:
         image=self.docker.image_of(own['calls_container'])
         if image is None:raise RuntimeError('no_calls_container')
         previous=read_json(self.status_path).get('archive_bytes') if self.status_path.exists() else None
-        estimate=max(options['expected_archive_bytes'],previous if type(previous) is int else 0)
-        self.space(estimate,estimate)
+        # The live file's size with its free pages: stat only, this root never opens it.
+        try:live=os.lstat(Path(own['data_mount'])/CALLS_SNAPSHOT).st_size
+        except OSError:live=0
+        estimate=max(options['expected_archive_bytes'],previous if type(previous) is int else 0,live)
+        # In staging at once: the copy, the vacuumed file and SQLite's temporary files, each at most the estimate.
+        self.space(3*estimate,estimate)
         for entry in destination.iterdir():  # a resumed job: nothing of an earlier attempt stays
             shutil.rmtree(entry) if entry.is_dir() and not entry.is_symlink() else entry.unlink()
         os.chown(destination,self.container_uid,self.container_gid)
-        name=CALLS_HELPER+self.journal['id'].lower();budget=own['capture_timeout_seconds']
+        name=CALLS_HELPER+self.journal['id'].lower()
         # The content is never older than this instant: a restarted copy only makes it newer.
         self.journal['helper']=name
         self.journal['captured_at']=datetime.fromtimestamp(self.clock(),timezone.utc).isoformat();self.save()
         try:
-            self.docker.call('create','--rm','--init','--name',name,'--label','personal-os.backup.id='+self.journal['id'],
-                '--label','personal-os.backup.project='+self.cfg['project'],'--pull','never','--network','none','--read-only',
-                '--cap-drop','ALL','--security-opt','no-new-privileges','--memory','64m','--memory-swap','64m',
-                '--pids-limit','16','--cpus','0.5','--user',f'{CONTAINER_UID}:{CONTAINER_UID}',
-                '--mount','type=bind,src='+own['data_mount']+',dst=/data,readonly',
-                '--mount','type=bind,src='+str(destination)+',dst=/staging',
-                '--env','SQLITE_TMPDIR=/staging','--entrypoint','python',image,'-I','-c',CALLS_SNAPSHOT_HELPER,
-                '/data/'+CALLS_SNAPSHOT,'/staging',str(CALLS_STEP_PAGES),str(CALLS_STEP_PAUSE),str(CALLS_BUSY_PAUSE),
-                str(CALLS_BUSY_RETRIES),str(CALLS_RESTART_PAUSE),str(budget-CALLS_HELPER_MARGIN),
-                str(budget-CALLS_HELPER_ALARM_MARGIN))
-            code,output=self.docker.attach(name,budget)
+            self.docker.call(*self.helper_args(name,image,destination))
+            code,output=self.docker.attach(name,own['capture_timeout_seconds'])
         except BaseException:
             self.reap_helper();raise
         self.reap_helper()
@@ -910,21 +920,39 @@ class Runner:
         self.guard();size,digest=self.hash_staged(destination/CALLS_SNAPSHOT,options['hash_timeout_seconds'])
         self.space(0,size);self.guard()
         self.journal['archive']={'bytes':size,'sha256':digest}
+    def helper_args(self,name,image,destination):
+        """The helper's whole `docker create`: the limits, the two mounts and the script."""
+        own=self.own;budget=own['capture_timeout_seconds']
+        return ['create','--rm','--init','--name',name,'--label','personal-os.backup.id='+self.journal['id'],
+            '--label','personal-os.backup.project='+self.cfg['project'],'--pull','never','--network','none','--read-only',
+            '--cap-drop','ALL','--security-opt','no-new-privileges','--memory','64m','--memory-swap','64m',
+            '--pids-limit','16','--cpus','0.5','--user',f'{CONTAINER_UID}:{CONTAINER_UID}',
+            '--mount','type=bind,src='+own['data_mount']+',dst=/data,readonly',
+            '--mount','type=bind,src='+str(destination)+',dst=/staging',
+            '--env','SQLITE_TMPDIR=/staging','--entrypoint','python',image,'-I','-c',CALLS_SNAPSHOT_HELPER,
+            '/data/'+CALLS_SNAPSHOT,'/staging',str(CALLS_STEP_PAGES),str(CALLS_STEP_PAUSE),str(CALLS_BUSY_PAUSE),
+            str(CALLS_BUSY_RETRIES),str(CALLS_RESTART_PAUSE),str(budget-CALLS_HELPER_MARGIN),
+            str(budget-CALLS_HELPER_ALARM_MARGIN),str(staged_options(self.cfg)['min_free_bytes'])]
     def reap_helper(self):
-        """Remove this job's helper in any state and read back that it is gone; only a container with this job's labels
-        is touched. Unverified is `calls_helper_unverified`, and the journal keeps the name so the recovery looks again."""
+        """Remove this job's helper in any state and read back that it is gone, within REAP_SECONDS of elapsed time; only a
+        container with this job's labels is touched. Unverified is `calls_helper_unverified`, and the journal keeps the name
+        so the recovery looks again. Once it is gone a journal write that fails (a full disk) must not stop the cleanup that
+        frees the disk: the journal then still names it, and the next recovery reads back the same absence."""
         if not (self.journal or {}).get('helper'):return
-        name=CALLS_HELPER+self.journal['id'].lower();gone=False
-        for _ in range(REAP_SECONDS):
+        name=CALLS_HELPER+self.journal['id'].lower();deadline=self.monotonic()+REAP_SECONDS;gone=False
+        while (left:=deadline-self.monotonic())>0:
             try:
-                if self.check_worker(self.docker.inspect(name)) is None:gone=True;break
-                self.docker.call('rm','--force',name)
+                if self.check_worker(self.docker.inspect(name,timeout=left)) is None:gone=True;break
+                left=deadline-self.monotonic()
+                if left>0:self.docker.call('rm','--force',name,timeout=left)
             except RuntimeError as exc:
                 if str(exc)=='backup_container_mismatch':break
             except subprocess.TimeoutExpired:pass
             self.sleep(1)
         if not gone:raise RuntimeError('calls_helper_unverified')
-        self.journal.pop('helper',None);self.save()
+        self.journal.pop('helper',None)
+        try:self.save()
+        except OSError:pass
     def reap_snapshot(self):
         """Kill and verify gone every process in the recordings container that writes this job's snapshot file.
 

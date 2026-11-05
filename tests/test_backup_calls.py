@@ -8,7 +8,9 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import resource
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -59,10 +61,10 @@ def make_state(path, *, rows=3, bulk=0, canary=True):
 
 
 def helper(source, staging, *, pages=CALLS_STEP_PAGES, pause=CALLS_STEP_PAUSE, busy_pause=.05, retries=20, restart_pause=.1,
-           limit=120, prefix='', **popen):
+           limit=120, prefix='', reserve=0, **popen):
     """The real helper script as a local process."""
     return subprocess.Popen([sys.executable, '-I', '-c', prefix + CALLS_SNAPSHOT_HELPER, str(source), str(staging), str(pages), str(pause),
-                             str(busy_pause), str(retries), str(restart_pause), str(limit), str(limit + 5)],
+                             str(busy_pause), str(retries), str(restart_pause), str(limit), str(limit + 5), str(reserve)],
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, **popen)
 
 
@@ -94,6 +96,7 @@ class CallsDocker:
         self.image: str | None = IMAGE_A
         self.attach_result: object = None  # a code to answer instead of running the helper; 'timeout' raises; 'stuck' never goes
         self.stuck = False
+        self.inspect_hook = None
         monkeypatch.setattr(backup_worker, 'encrypt_snapshot', lambda *a, **k: self.encrypt(age_stub, *a, **k))
         self.encrypt_error = None
     def encrypt(self, age_stub, *args, **kwargs):
@@ -105,10 +108,12 @@ class CallsDocker:
     def image_of(self, name):
         self.calls.append(('image_of', name))
         return self.image
-    def inspect(self, name):
+    def inspect(self, name, timeout=30):
         self.calls.append(('inspect', name))
+        if self.inspect_hook:
+            self.inspect_hook(timeout)
         return copy.deepcopy(self.containers.get(name))
-    def call(self, *args):
+    def call(self, *args, timeout=90):
         self.calls.append(args)
         if args[0] == 'create':
             name, labels = args[args.index('--name') + 1], {}
@@ -173,7 +178,12 @@ def calls_runner(tmp_path, age_stub, monkeypatch, send=None, cls=Runner):
         decrypt_snapshot(path, 'fake', restored, age=age_stub)
         sent.append((result, verify_calls_bundle(restored), restored))
         return {**result, 'status': 'stored', 'duplicate': False}
-    runner = cls(cfg, docker=docker, sleep=lambda _: None, send=send or stored, clock=lambda: NOW)
+    elapsed = [0.0]
+    def sleep(seconds):
+        elapsed[0] += seconds
+    runner = cls(cfg, docker=docker, sleep=sleep, send=send or stored, clock=lambda: NOW)
+    runner.monotonic = lambda: elapsed[0]
+    runner.elapsed = elapsed
     runner.container_uid, runner.container_gid = os.getuid(), os.getgid()
     return runner, docker, sent
 
@@ -336,6 +346,65 @@ def test_a_helper_never_removes_a_container_it_does_not_own(tmp_path, age_stub, 
 
 
 # spec: ANYM-778
+def test_the_reap_budget_is_elapsed_time_and_every_docker_call_gets_only_what_is_left(tmp_path, age_stub, monkeypatch):
+    runner, docker, _ = calls_runner(tmp_path, age_stub, monkeypatch)
+    runner.journal = {'id': '20261103T120000Z-0123456789abcdef', 'helper': 'x'}
+    given = []
+    def timing_out(timeout):
+        given.append(timeout)
+        runner.elapsed[0] += timeout
+        raise subprocess.TimeoutExpired('docker', timeout)
+    docker.inspect_hook = timing_out
+    with pytest.raises(RuntimeError, match='calls_helper_unverified'):
+        runner.reap_helper()
+    assert given == [backup_runner.REAP_SECONDS] and runner.elapsed[0] <= backup_runner.REAP_SECONDS + 1
+
+
+# spec: ANYM-778
+def test_a_full_disk_on_the_journal_does_not_stop_the_cleanup_that_frees_it(tmp_path, age_stub, monkeypatch):
+    runner, docker, _ = calls_runner(tmp_path, age_stub, monkeypatch)
+    docker.attach_result = 'timeout'
+    docker.stuck = True
+    with pytest.raises(RuntimeError, match='calls_helper_unverified'):
+        runner.run()
+    assert list(runner.staging_root.iterdir())
+    docker.stuck = False
+    real = backup_runner.write_json
+    def full(path, data):
+        raise OSError(28, 'no space')
+    monkeypatch.setattr(backup_runner, 'write_json', full)
+    with pytest.raises(OSError):
+        runner.recover_stop()
+    assert not list(runner.staging_root.iterdir())
+    monkeypatch.setattr(backup_runner, 'write_json', real)
+    runner.recover_stop()
+    assert not runner.journal_path.exists()
+
+
+# spec: ANYM-778
+def test_admission_budgets_from_the_live_file_with_its_free_pages(tmp_path, age_stub, monkeypatch):
+    runner, docker, _ = calls_runner(tmp_path, age_stub, monkeypatch)
+    live = tmp_path / 'data' / 'voice.sqlite3'
+    os.truncate(live, 2 * 1024**3)
+    floor = backup_runner.CALLS_DEFAULTS['min_free_bytes']
+    class Usage:
+        free = floor + 3 * 2 * 1024**3
+    runner.disk = lambda path: Usage
+    assert str(fail_and_recover(runner)) == 'calls_skipped_disk'
+    assert not [c for c in docker.calls if c[0] == 'create']
+
+
+# spec: ANYM-778
+def test_the_helper_stops_when_staging_falls_below_its_reserve(tmp_path):
+    source = make_state(tmp_path / 'voice.sqlite3')
+    staging = tmp_path / 'staging'
+    staging.mkdir()
+    process = helper(source, staging, reserve=2**62)
+    output, _ = process.communicate(timeout=60)
+    assert process.returncode == 3 and json.loads(output) == {'error': 'no_space'}
+
+
+# spec: ANYM-778
 def test_the_snapshot_drops_deleted_content_passes_integrity_and_leaves_one_file(tmp_path):
     source = make_state(tmp_path / 'data' / 'voice.sqlite3')
     assert CANARY.encode() in source.read_bytes()
@@ -491,6 +560,93 @@ def test_under_pressure_the_helper_is_killed_by_its_own_limit_and_the_writer_sta
     assert process.returncode != 0 and not (staging / 'voice.sqlite3').exists()
     assert not errors and len(times) > died_after and max(times) <= CALLS_WRITER_BOUND_SECONDS
     assert sqlite3.connect(source).execute('PRAGMA integrity_check').fetchall() == [('ok',)]
+
+
+def docker_ready():
+    if not sys.platform.startswith('linux') or not shutil.which('docker'):
+        return False
+    return subprocess.run(['docker', 'info'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30).returncode == 0
+
+
+@pytest.fixture
+def real_helper(tmp_path, age_stub, monkeypatch):
+    """The shipped `docker create` arguments on the calls image's own base: limits, user 10001, read-only root."""
+    if not docker_ready():
+        pytest.skip('needs Docker on Linux; CI runs it')
+    dockerfile = (Path(__file__).resolve().parents[1] / 'services/calls/Dockerfile').read_text()
+    image = re.findall(r'^FROM (python:\S+)', dockerfile, re.M)[-1]
+    subprocess.run(['docker', 'pull', '-q', image], check=True, stdout=subprocess.DEVNULL, timeout=300)
+    runner, _, _ = calls_runner(tmp_path, age_stub, monkeypatch)
+    runner.journal = {'id': '20261103T120000Z-' + os.urandom(8).hex()}
+    staging = tmp_path / 'job'
+    staging.mkdir()
+    # User 10001 is not this test's user: open permissions stand in for the host's ownership, which the runner checks.
+    os.chmod(staging, 0o777)
+    os.chmod(tmp_path / 'data', 0o777)
+    name = backup_runner.CALLS_HELPER + runner.journal['id'].lower()
+    def create(prefix=''):
+        args = runner.helper_args(name, image, staging)
+        args[args.index('-c') + 1] = prefix + args[args.index('-c') + 1]
+        real = backup_runner.Docker()
+        real.call(*args)
+        return real, name, staging, image
+    yield create
+    subprocess.run(['docker', 'rm', '--force', name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+
+
+# spec: ANYM-778
+def test_in_the_real_container_a_writer_stays_within_the_bound_and_the_snapshot_is_whole(tmp_path, real_helper):
+    source = tmp_path / 'data' / 'voice.sqlite3'
+    source.unlink()
+    make_state(source, rows=5200, bulk=4000)
+    db = sqlite3.connect(source)
+    db.execute('CREATE INDEX synthetic_bodies ON voice_events(body)')  # a real temporary-file demand for VACUUM INTO
+    db.commit()
+    db.close()
+    os.chmod(source, 0o666)
+    real, name, staging, image = real_helper()
+    stop, times, errors = threading.Event(), [], []
+    thread = threading.Thread(target=writer_loop, args=(source, stop, times, errors), kwargs={'limit': 40})
+    thread.start()
+    try:
+        code, output = real.attach(name, 300)
+    finally:
+        stop.set()
+        thread.join(timeout=60)
+    assert (code, json.loads(output)) == (0, {'status': 'ok'}) and not errors and times
+    assert max(times) <= CALLS_WRITER_BOUND_SECONDS
+    os.chmod(source, 0o644)
+    check = ('import sqlite3,sys;d=sqlite3.connect("file:/s/voice.sqlite3?mode=ro",uri=True);'
+             'print(d.execute("PRAGMA integrity_check").fetchone()[0],'
+             'd.execute("SELECT COUNT(*) FROM voice_events").fetchone()[0]-d.execute("SELECT COUNT(*) FROM briefs").fetchone()[0])')
+    done = subprocess.run(['docker', 'run', '--rm', '--pull', 'never', '--network', 'none', '--user', '10001:10001', '--mount',
+                           f'type=bind,src={staging},dst=/s,readonly', image, 'python', '-I', '-c', check],
+                          stdout=subprocess.PIPE, check=True, timeout=120)
+    assert done.stdout.split() == [b'ok', b'0']
+    assert sorted(p.name for p in staging.iterdir()) == ['voice.sqlite3']
+
+
+# spec: ANYM-778
+def test_in_the_real_container_its_memory_limit_kills_it_and_not_the_writer(tmp_path, real_helper):
+    source = tmp_path / 'data' / 'voice.sqlite3'
+    source.unlink()
+    make_state(source, rows=5200, bulk=4000, canary=False)
+    os.chmod(source, 0o666)
+    hog = 'held = []\nimport threading, time\ndef _hog():\n    time.sleep(.3)\n    while True:\n        held.append(b"x" * 8388608)\n        time.sleep(.01)\nthreading.Thread(target=_hog, daemon=True).start()\n'
+    real, name, staging, _ = real_helper(hog)
+    stop, times, errors = threading.Event(), [], []
+    thread = threading.Thread(target=writer_loop, args=(source, stop, times, errors))
+    thread.start()
+    try:
+        code, _ = real.attach(name, 120)
+        died_after = len(times)
+        time.sleep(.3)
+    finally:
+        stop.set()
+        thread.join(timeout=30)
+    assert code != 0 and not (staging / 'voice.sqlite3').exists()
+    assert not errors and len(times) > died_after and max(times) <= CALLS_WRITER_BOUND_SECONDS
+    assert real.inspect(name) is None or not real.inspect(name)['State']['Running']
 
 
 def sealed(tmp_path, name='bundle', **kwargs):
