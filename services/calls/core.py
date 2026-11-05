@@ -26,6 +26,12 @@ GROK_MODEL="grok-voice-3.0"
 ACTIVE={"waiting_for_browser","dialing","ringing","connecting","active"}
 EXPIRY_INTERVAL_S=30
 EXPIRY_BATCH=20
+# A journal read waits this long for commits in progress, then fails (GET /v1/events answers 503, the router polls
+# again). It retries by itself: a commit excludes readers (rollback journal), and SQLite's own busy wait, 100 ms
+# steps, can miss every gap between a busy writer's commits. A refused try holds no lock; a try that gets in holds the
+# shared lock for the same bounded statements as before, so a write can wait for it as long as it always could.
+JOURNAL_BUSY_S=15
+JOURNAL_RETRY_S=0.001
 
 
 INBOUND_KEYS=('input_active_ms','input_frames','input_pcm_ms','input_zero_frames')
@@ -1479,12 +1485,27 @@ class VoiceService:
         under, and it sees committed rows only (the one writing connection commits them in seq order)."""
         if self._reader is None:
             path=(self.directory/'voice.sqlite3').resolve().as_uri()+'?mode=ro'
-            self._reader=sqlite3.connect(path,uri=True,check_same_thread=False)
+            self._reader=sqlite3.connect(path,uri=True,check_same_thread=False,timeout=0)
         return self._reader
 
+    def _journal_read(self,read):
+        """read(connection) on the journal's connection, again while a commit excludes it, up to JOURNAL_BUSY_S."""
+        deadline=time.monotonic()+JOURNAL_BUSY_S
+        if not self._read_lock.acquire(timeout=JOURNAL_BUSY_S):
+            raise TimeoutError('journal_read_queue')
+        try:
+            while True:
+                try:
+                    return read(self._journal())
+                except sqlite3.OperationalError as error:
+                    if getattr(error,'sqlite_errorcode',0)&0xff!=sqlite3.SQLITE_BUSY or time.monotonic()>=deadline:
+                        raise
+                time.sleep(JOURNAL_RETRY_S)
+        finally:
+            self._read_lock.release()
+
     def events_head(self):
-        with self._read_lock:
-            return {'journal_id':self.journal_id,'head':call_events.head(self._journal())}
+        return {'journal_id':self.journal_id,'head':self._journal_read(call_events.head)}
 
     def _expire_soon(self):
         """The inbox and the events read run expiry at most once in EXPIRY_INTERVAL_S; an answer checks its own."""
@@ -1496,8 +1517,7 @@ class VoiceService:
     def events_page(self,after,limit,include_rehearsal=False):
         """GET /v1/events: one bounded page (call_events.page) from the journal's read-only connection."""
         self._expire_soon()
-        with self._read_lock:
-            last,rows=call_events.scan(self._journal(),after)
+        last,rows=self._journal_read(lambda db:call_events.scan(db,after))
         return call_events.page(self.journal_id,after,limit,last,rows,include_rehearsal)
 
     def decision_inbox(self,limit=100,offset=0,*,owner_principal=None):
