@@ -1705,6 +1705,59 @@ needs the same newer-SHA hand apply as the delivery undo above); `docker image r
 both chains); with the rules persisted, also restore the saved copies of the rules files and `after.init` and
 `ufw reload` ("Host firewall persistence", Rollback), or the next reload or reboot puts the rules back. The worker's jobs requeue on SIGTERM; nothing in the database changes.
 
+### Stopped worker: manual recovery (ANYM-709)
+
+After a host reboot or a Docker restart `enricher-mini` stays stopped, and nothing starts it. The host overlay sets
+`restart: "no"` (ANYM-693, and it stays so: Docker's restart is not the fix), and the
+`deedkit-inference-worker.service` and `/usr/local/sbin/deedkit-inference-guard` that the overlay's comment names do
+not exist: on 2026-11-05 `/usr/local/sbin` is empty, `systemctl list-unit-files` lists no such unit, root has no
+crontab and `/etc/cron.d` holds only `e2scrub_all` and `sysstat`. Queued jobs wait. A stopped selected worker also makes
+`prepare` refuse ("each selected service must already have exactly one running container"), and autodeploy pauses on
+that refusal ("Continuous deployment"), so no release goes out until it runs again and the pause is removed.
+
+Who reads its liveness: whoever reads the day's production status (the watch below) and the operator of every release.
+Nothing alerts anyone until the monitoring card exists. Read `docker ps --filter name=enricher-mini` (one container, `Up`)
+and `SELECT account, kind, enabled, pause_reason, expires_at FROM processing_profiles` (operator DSN, no write).
+
+Start it, as root on the host, in this order; a failed step stops:
+1. The active-call gate (it prints `no active call`; a call or a traceback means stop). This host's configuration is
+   the one `active_config()` names, so the `p.CONFIG` form of inference-enable.md fails here: `python3 -I -c 'import sys;
+   sys.path.insert(0, "/usr/local/lib/deedkit"); import production as p; found = p.active_calls(p.config(p.active_config()));
+   print("active calls:" if found else "no active call", found); sys.exit(1 if found else 0)'`.
+2. The rules: `python3 /usr/local/lib/deedkit/inference_egress_check.py verify` must print `ok` ("Host firewall
+   persistence" for any other line).
+3. `docker compose $F --profile enrichment-mini start enricher-mini`: `start`, never `up`, so the container keeps the
+   identity the release receipts recorded. `F` is the project's `files` and `env_files` from that configuration.
+
+Check: running, no restarts; a restart with exit 78 means the rules or networks are wrong (self-check above; never
+disable it). The `processing_profiles` rows are enabled again (the worker publishes them at start). If
+`/etc/deedkit/autodeploy.pause` exists, read its reason and remove it only when that reason is this refusal. Undo:
+`docker compose $F --profile enrichment-mini stop enricher-mini`; its jobs requeue on SIGTERM.
+
+### Working space and audio limit: run record (ANYM-709)
+
+Applied on 2026-11-03 by hand release N8 (`045f37b7`, under the pause, with migration 066; host edit 12:09:58Z, plan A
+12:21:35Z): `tmpfs: ["/tmp:size=320m,noexec,nosuid"]` on `enricher-mini` in the host's `compose.enrichment-mini.yaml`,
+and the audio `max_input_bytes` 94371840 -> 209715200 in `private/enrichment-mini.json` (profile hash `f1cd04ef` ->
+`f9b561c1`). Backups: both files with the suffix `.bak-709-20261103T120954Z`. `profile_max_jobs_per_day.audio` stayed
+500, which covered the inventory plus the day's fresh notes.
+
+Read on 2026-11-05 on release `1003e409`, after later autodeploys kept both edits: the worker runs the release's
+`enricher-local` image, one container, 0 restarts, `Tmpfs` 320m and `df -h /tmp` 320M, the mounted profile shows
+209715200, all nine `processing_profiles` rows are enabled, no audio job is leased, egress `verify` prints `ok`.
+
+Inventory outcome. The two owner notes (43.8 and 47.9 MiB) keep their transcripts, same length and hash. The five old
+rows (14.9, 24.1, 25.8, 28.3 and 39.9 MiB) were **not retried**: they still read `failed` with their codes of 10-14
+(`audio_duration_limit` once, `original_size_limit` four times), attempts 3. Their originals are evicted, and a claim
+skips an evicted original (`PROCESSABLE_ORIGINAL`), so a changed profile hash does not bring such a row back;
+`request_file_download` would (MEDIA_STORAGE.md: cold copy first, then the provider queue), and it was not run. No audio
+over 90 MiB has reached the worker since, so the 200 MiB limit is read back, not yet exercised by a real file.
+
+Undo, with the active-call gate before each step: pause; restore both backups; apply by hand a newer green `main` SHA
+that was never prepared (never a hand `up`); read back `Tmpfs` 128m and 94371840; remove the pause. Restore the profile
+before any older image is applied (an older image refuses a profile above 32 MiB). Completed inference and spent budget
+are not undone.
+
 ## Mini inference: watch and enable record (ANYM-686)
 
 The plan to enable it is [inference-enable.md](inference-enable.md). Whoever reads the production status of a
