@@ -237,14 +237,13 @@ def recordings_principals(config: dict) -> tuple[dict[str, dict], str | None]:
 
 
 def recordings_row(match: dict, now: datetime) -> dict:
-    """The public fields of a recordings principal. Validity follows the backend's own rules; the printed text is
-    safe separately. An expiry prints in canonical form, because fromisoformat takes any separator character and
-    ignores excess fractional digits; an ID the backend accepts prints escaped when it holds a control character or a
-    lone surrogate, which print() could not encode. A value that fails validation is dropped, never copied."""
+    """The public fields of a recordings principal. Validity follows the backend's own rules; printing is safe apart
+    from them (safe_text). The ID stays exact, because findings compare it. An expiry is canonical, because
+    fromisoformat takes any separator character and ignores excess fractional digits. A value that fails validation
+    is dropped, never copied."""
     identity, moment = match.get("id"), instant(match.get("expires_at"))
     valid = isinstance(identity, str) and 1 <= len(identity) <= RECORDINGS_ID_MAX
-    shown = identity if not valid or identity.isprintable() else identity.encode("unicode_escape").decode()
-    return {"public_id": shown if valid else None, "expires_at": moment.isoformat() if moment else None,
+    return {"public_id": identity if valid else None, "expires_at": moment.isoformat() if moment else None,
             "status": status({"expires_at": match.get("expires_at")}, now)}
 
 
@@ -2038,14 +2037,25 @@ def render(view: dict) -> str:
                 lines.append(line("    archive ", credential["archive"]))
     lines.append(f"{len(view['principals'])} principals, {len(view['findings'])} findings")
     for item in view["findings"]:
-        rest = "  ".join(f"{k}={v}" for k, v in item.items() if k != "code")
+        rest = "  ".join(f"{k}={safe_text(str(v))}" for k, v in item.items() if k != "code")
         lines.append(f"  {item['code']}  {rest}")
     return "\n".join(lines)
 
 
+def safe_text(text: str) -> str:
+    """Every non-printable character as its JSON escape: no terminal control, no forged line, and no lone surrogate,
+    which print() could not encode."""
+    return "".join(c if c.isprintable() else json.dumps(c)[1:-1] for c in text)
+
+
+def safe_json(view: dict) -> str:
+    """The list as JSON that parses back to the exact values; only the indent's own newlines stay raw."""
+    return "\n".join(safe_text(part) for part in json.dumps(view, ensure_ascii=False, indent=2).split("\n"))
+
+
 def line(indent: str, credential: dict) -> str:
     note = f"  ({credential['note']})" if credential.get("note") else ""
-    return (f"{indent}{credential['backend']:<9} {credential['public_id'] or '-'}  {credential['status']}"
+    return (f"{indent}{credential['backend']:<9} {safe_text(credential['public_id'] or '-')}  {credential['status']}"
             f"  expires {credential['expires_at'] or '-'}{note}")
 
 
@@ -2140,7 +2150,7 @@ def main(argv: list[str] | None = None, run=None, docker=None, host=None) -> int
     except (AdminError, KeyError) as exc:
         print(f"deedkit admin: {exc}", file=sys.stderr)
         return 2
-    print(json.dumps(view, ensure_ascii=False, indent=2) if args.json else render(view))
+    print(safe_json(view) if args.json else render(view))
     return 1 if args.strict and view["findings"] else 0
 
 

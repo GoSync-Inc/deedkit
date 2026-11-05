@@ -347,9 +347,9 @@ def test_no_calls_registry_configured_is_a_finding_when_a_principal_holds_a_call
     ({"id": "a" * 129}, (None, LATER, "live")),
     ({"id": ""}, (None, LATER, "live")),
     ({"id": {"raw": CANARY}}, (None, LATER, "live")),
-    ({"id": "bad\x1bid"}, ("bad\\x1bid", LATER, "live")),
-    ({"id": "\ud800"}, ("\\ud800", LATER, "live")),
-    ({"id": "a\u00a0b"}, ("a\\xa0b", LATER, "live")),
+    ({"id": "bad\x1bid"}, ("bad\x1bid", LATER, "live")),
+    ({"id": "\ud800"}, ("\ud800", LATER, "live")),
+    ({"id": "a\u00a0b"}, ("a\u00a0b", LATER, "live")),
     ({"id": "агент"}, ("агент", LATER, "live")),
 ], ids=["live", "expired", "no-match", "missing-expiry", "object-expiry", "number-expiry", "text-expiry",
         "z-expiry", "oversized-expiry", "control-expiry", "nbsp-expiry", "id-65", "id-128", "id-129", "id-empty",
@@ -360,6 +360,28 @@ def test_a_recordings_credential_reports_only_validated_public_fields(stores, ca
     row = view["principals"][0]["credentials"][0]
     assert (row["public_id"], row["expires_at"], row["status"]) == expected
     assert "note" not in row and CANARY not in out.out + out.err
+    assert all(part.isprintable() for part in out.out.split("\n"))
+
+
+# spec: ANYM-772
+def test_two_recordings_ids_that_print_alike_stay_two_credentials(stores, capsys):
+    stores.principal("one", {"recordings": stores.recordings_agent("one-rec", id="a\u00a0b")})
+    stores.principal("two", {"recordings": stores.recordings_agent("two-rec", id="a\\xa0b")})
+    code, view, _ = listing(stores, capsys, "--strict")
+    assert code == 0 and view["findings"] == []
+    assert [row["public_id"] for row in recordings_rows(view)] == ["a\u00a0b", "a\\xa0b"]
+
+
+# spec: ANYM-772
+def test_a_recordings_id_with_a_newline_or_control_character_cannot_forge_a_text_line(stores, capsys):
+    stores.principal("agent", {"recordings": stores.recordings_agent("agent-rec", id="x\nforged  live\x1b[2J",
+                                                                     expires_at=PAST)})
+    stores.fake()
+    code = admin.main(["--config", str(stores.root / "admin/config.json"), "key", "list"])
+    out = capsys.readouterr().out
+    assert code == 0 and "\x1b" not in out and not any(row.startswith("forged") for row in out.split("\n"))
+    assert "x\\nforged  live\\u001b[2J" in out
+    assert out.count("x\\nforged") == 2  # the row and its credential_expired finding
 
 
 # spec: ANYM-772
@@ -563,8 +585,9 @@ def test_any_json_document_has_one_defined_outcome_and_only_validated_fields(doc
         assert set(row) == {"public_id", "expires_at", "status"}
         identity, moment = entry.get("id"), admin.instant(entry.get("expires_at"))
         assert (row["public_id"] is not None) == (isinstance(identity, str) and 1 <= len(identity) <= 128)
-        assert row["public_id"] is None or (row["public_id"].isprintable() and CANARY not in row["public_id"])
-        assert row["public_id"] is None or not identity.isprintable() or row["public_id"] == identity
+        assert row["public_id"] is None or row["public_id"] == identity
+        printed = admin.safe_json(row)
+        assert json.loads(printed) == row and all(part.isprintable() for part in printed.split("\n"))
         assert row["expires_at"] is None or row["expires_at"].isprintable()
         assert (admin.instant(row["expires_at"]) if row["expires_at"] else None) == moment  # the printed text round-trips
         assert row["status"] == ("live" if moment and moment > now else "expired")
