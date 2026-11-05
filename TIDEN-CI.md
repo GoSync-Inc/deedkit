@@ -427,6 +427,16 @@ Tiden's next-action text are never printed. These lines never change the
 check's outcome, exit code or closing line; making the branch verdict blocking
 is a later change of the required checks, which the owner keeps.
 
+Only a `Delivers:` line moves a card (Main sync, step 4). So for each `Spec:`
+number that is not also a `Delivers:` number and is a story in `Backlog` or
+`Active` on Tiden main, the check prints an advisory note after any problems and
+above the branch gate's lines (ANYM-799): `- ANYM-n stays <status>: only a
+Delivers: line moves it (TIDEN-CI.md, Main sync)`. A `Spec:`-only pull request
+can be deliberate, for example while a criterion stays open. The note reads the
+listing the check already holds and makes no Tiden call. It never changes the
+check's problems, exit code or closing line. It prints nothing for a `Delivers:`
+number, a card in `Review` or `Done`, or a number not on main.
+
 Only a verdict fails the run, and so `CI gate`. A verdict is the check's list
 of problems in the job summary, or a refusal of the pull request's own content:
 a test file that does not parse, or a changed path that is not UTF-8. The body
