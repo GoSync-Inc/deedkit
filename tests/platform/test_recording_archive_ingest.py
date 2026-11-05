@@ -944,11 +944,11 @@ def test_work_classes_make_actual_progress_across_interrupted_passes(tmp_path,mo
     path,_ = fixture(tmp_path)
     original_timeout = asyncio.timeout
     monkeypatch.setattr('deedkit_recordings.archive.asyncio.timeout',
-                        lambda seconds: original_timeout(0.075 if seconds == 60 else seconds))
+                        lambda seconds: original_timeout(0.3 if seconds == 60 else seconds))
     async def vendor(request):
         if request.url.path.endswith('/conversations'):
             return httpx.Response(200,json=[])
-        await asyncio.sleep(0.04)
+        await asyncio.sleep(0.16)
         return httpx.Response(200,json=conversation(request.url.path.rsplit('/',1)[-1]))
     async def run():
         r = runtime(path,vendor); await r.start(background=False)
