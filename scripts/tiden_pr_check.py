@@ -11,7 +11,8 @@ and every test the diff adds carries `# spec: ANYM-n` (Python) or `// spec: ANYM
 directly above its definition, above its decorators. The check fails when a changed code file has no source anchor on
 Tiden main and the body names no spec, when an added test has no marker and is not in NO_SPEC, when a named ID is not
 an existing story-level spec on Tiden main or the named branch, or when the named branch is not an open proposal or
-review branch, or when that open branch's merge preview changes a spec the body does not name, changes no spec or
+review branch (a merged one passes when every named spec is on main), or when a body line tries to be one of these
+lines but is not read, or when that open branch's merge preview changes a spec the body does not name, changes no spec or
 holds more than spec changes (one preview parser, shared with the main sync). A failed read or an unknown or
 malformed preview is a refusal, not a verdict, except that a forbidden class is judged before the spec numbers. It prints the anchor matches for the job summary. After the outcome is fixed it prints Tiden's own
 verdict for the named branch (`gate check --branch`) as advisory lines that never change it. The main-push sync
@@ -37,6 +38,11 @@ from tiden_drift import ANCHOR_REPOSITORIES, Refused, excluded, shown, tiden  # 
 SPEC_ID = re.compile(r"ANYM-([1-9][0-9]*)")
 ID_LIST = re.compile(r"ANYM-[1-9][0-9]*(?:[ \t]*,[ \t]*ANYM-[1-9][0-9]*)*")
 PR_LINE = re.compile(r"^[ \t]*(Spec|Delivers|Tiden branch):[ \t]*(.*?)[ \t]*$", re.MULTILINE)
+# A line a reader takes for a Tiden line that PR_LINE does not read: a list, quote or heading prefix, emphasis, another
+# case or spelling. It is an error, never silence: unread, the sync reports "no spec" and stays green (11-05: #636, #640,
+# #641, #651, #656). A line starting with a backtick is prose quoting the key, not an attempt (read from 633 bodies).
+PR_LINE_LIKE = re.compile(r"^[ \t]*(?:(?:[-*+>•–—]|\d+[.)]|\[[ xX]?\]|#+)[ \t]*)*(?:\*\*|__|\*|_)?"
+                          r"(?:specs?|delivers?|tiden[ _-]?branch)(?:\*\*|__|\*|_)?[ \t]*:", re.IGNORECASE)
 BRANCH_NAME = re.compile(r"(?:proposal|review)/[a-z0-9]+(?:[/_-][a-z0-9]+)*")
 MARKER = re.compile(r"^[ \t]*(#|//)[ \t]*spec:[ \t]*(.*?)[ \t]*$")
 # A comment that tries to be a marker but is malformed (wrong case, missing colon) is reported, not ignored.
@@ -106,8 +112,12 @@ def ids(text: str) -> list[int] | None:
 
 
 def parse_body(body: str) -> Lines:
-    lines = Lines()
-    for key, value in PR_LINE.findall(body.replace("\r\n", "\n")):
+    lines, body = Lines(), body.replace("\r\n", "\n")
+    for line in body.split("\n"):
+        if PR_LINE_LIKE.match(line) and not PR_LINE.fullmatch(line) and not MARKER.match(line):
+            lines.errors.append(f"`{shown(line.strip())}` is not read: write `Spec:`, `Delivers:` or `Tiden branch:` "
+                                "at column 1 with no list marker or emphasis")
+    for key, value in PR_LINE.findall(body):
         if key == "Tiden branch":
             value = value.strip("`")
             if lines.branch is not None and lines.branch != value:
@@ -490,11 +500,18 @@ def check(root: Path, base: str, head: str, body: str, cli: str, product: str, r
     anchors = anchor_map(main)
     known = main
     previewed: set[int] | None = None
+    status = None
+    accepted = False
     if lines.branch:
         status = branch_status(cli, product, lines.branch)
-        if status != "open":
-            failures.append(f"`Tiden branch: {lines.branch}` is {'missing' if status is None else status}, not open")
-        else:
+        # Merged means sync B or the ready-merge job merged exactly that branch's specs: Tiden lists no merged branch
+        # (`spec list --branch` answers HTTP 400), so the named specs on main are the whole check. Naming none proves nothing.
+        absent = [f"ANYM-{number}" for number in lines.named if number not in main]
+        accepted = status == "merged" and bool(lines.named) and not absent
+        if status != "open" and not accepted:
+            failures.append(f"`Tiden branch: {lines.branch}` is {'missing' if status is None else status}, not open"
+                            + (f" ({', '.join(absent)} not on main)" if status == "merged" and absent else ""))
+        elif status == "open":
             known = {**main, **listing(cli, product, lines.branch)}
             previewed = preview_problems(cli, product, lines, main, known, failures)
 
@@ -506,6 +523,8 @@ def check(root: Path, base: str, head: str, body: str, cli: str, product: str, r
             for number in lines.named))
     if lines.branch:
         report(f"Tiden branch: {lines.branch}")
+    if accepted:
+        report(f"Tiden branch {lines.branch} is merged; named specs are on main")
     if previewed:
         report("Branch preview: " + ", ".join(f"ANYM-{number}" for number in sorted(previewed)))
         for number in lines.named:
@@ -549,7 +568,7 @@ def check(root: Path, base: str, head: str, body: str, cli: str, product: str, r
         code, closing = 1, "Fix the pull request body or the markers (TIDEN-CI.md, PR check), then rerun."
     else:
         code, closing = 0, "Passed."
-    if lines.branch:
+    if lines.branch and status != "merged":  # the merged path adds no Tiden call
         for line in branch_gate(cli, product, lines.branch, known, started):
             report(line)
     report(closing)
