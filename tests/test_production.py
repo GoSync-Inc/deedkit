@@ -4566,7 +4566,7 @@ def test_an_old_commit_prepared_since_the_current_release_stays_because_it_can_s
     p.write(prepared, {**bound, "current_digest": "another release"})
     assert "1" * 12 in p.prune_releases(settings, tmp_path / "http", p.time.monotonic() + 60)["removed"]
     # A receipt from before `current_digest`: its age against current.json decides.
-    release = tmp_path / "state" / ("4" * 40)
+    release = tmp_path / "state" / ("6" * 40)
     (release / "result.json").unlink()
     newer = (state / "current.json").stat().st_mtime + 5
     p.os.utime(release / "prepared.json", (newer, newer))
