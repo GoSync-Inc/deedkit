@@ -1,16 +1,21 @@
 """Omi contract tests: synthetic HTTP only, no wearable/provider sessions."""
 import asyncio
+import base64
+from datetime import datetime, timezone
 import hashlib
 import importlib
 import json
 from pathlib import Path
 import sys
 
+from hypothesis import given, strategies as st
 import httpx
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'services/recordings/src'))
+from deedkit_recordings.security import Failure  # noqa: E402
+
 SCOPES = ['recordings:read', 'recordings:content']
 HEADERS = {'Authorization': 'Bearer backend-a'}
 
@@ -309,6 +314,304 @@ def test_content_continuation_rejects_changed_source_and_cross_credential_reuse(
     asyncio.run(run())
 
 
+BEFORE, CROSS_LOW, INSIDE_A, INSIDE_B, CROSS_HIGH, AFTER, UNPLACED, TITLE = (
+    'MARK-BEFORE', 'MARK-CROSS-LOW', 'inside-a', 'inside-b', 'MARK-CROSS-HIGH', 'MARK-AFTER', 'MARK-UNPLACED', 'MARK-TITLE')
+SEGMENTS = [{'text': BEFORE, 'speaker_name': 'MARK-SPEAKER', 'start': 10, 'end': 50},
+            {'text': CROSS_LOW, 'speaker_name': 'User', 'start': 90, 'end': 110},
+            {'text': INSIDE_A, 'speaker_name': 'User', 'start': 100, 'end': 150},
+            {'text': INSIDE_B, 'speaker_name': 'User', 'start': 150.5, 'end': 200},
+            {'text': CROSS_HIGH, 'speaker_name': 'User', 'start': 190, 'end': 210},
+            {'text': AFTER, 'speaker_name': 'User', 'start': 300, 'end': 340},
+            {'text': UNPLACED, 'speaker_name': 'User', 'start': -1.0, 'end': -1.0}]
+RANGE = {'account': 'omi-a', 'recording_id': 'conv-a', 'from_seconds': 100, 'to_seconds': 200}
+
+
+def ranged_conversation(segments=SEGMENTS):
+    return conversation(transcript_segments=segments, structured={'title': TITLE, 'overview': 'MARK-OVERVIEW'})
+
+
+def said(result):
+    return [json.loads(line)['text'] for line in result['text'].split('\n')] if result['text'] else []
+
+
+# spec: ANYM-770
+@pytest.mark.parametrize('bounds,texts,edge', [
+    ({'from_seconds': 100, 'to_seconds': 200}, [INSIDE_A, INSIDE_B], 2),
+    ({'from_seconds': 100.0, 'to_seconds': 200.0}, [INSIDE_A, INSIDE_B], 2),
+    ({'to_seconds': 200}, [BEFORE, CROSS_LOW, INSIDE_A, INSIDE_B], 1),
+    ({'from_seconds': 100}, [INSIDE_A, INSIDE_B, CROSS_HIGH, AFTER], 1),
+    ({'from_seconds': 215, 'to_seconds': 290}, [], 0),
+    ({'from_seconds': 195, 'to_seconds': 205}, [], 2),
+])
+def test_range_returns_only_contained_segments_and_counts_the_crossing_ones(tmp_path, bounds, texts, edge):
+    path, _ = config(tmp_path)
+    async def run():
+        async with client(application(path, lambda r: httpx.Response(200, json=ranged_conversation()))) as c:
+            response = await c.post('/v1/read_recording', json={'account': 'omi-a', 'recording_id': 'conv-a', **bounds})
+            result = response.json()
+            assert response.status_code == 200 and said(result) == texts and result['excluded_edge_segments'] == edge
+            assert result['content_state'] == ('available' if texts else 'empty')
+            assert result['complete'] is True and result['next_cursor'] is None
+            assert result['source_digest'] == hashlib.sha256(json.dumps(
+                {'state': result['content_state'], 'text': result['text']}, ensure_ascii=False, sort_keys=True,
+                separators=(',', ':')).encode()).hexdigest()
+    asyncio.run(run())
+
+
+# spec: ANYM-770
+@pytest.mark.parametrize('arguments,detail', [
+    ({'kind': 'summary', 'from_seconds': 1}, 'range_not_for_summary'),
+    ({'from_seconds': 5, 'to_seconds': 5}, 'range_empty'),
+    ({'from_seconds': 6, 'to_seconds': 5}, 'range_empty'),
+])
+def test_refused_range_names_a_fixed_code_before_any_provider_call(tmp_path, arguments, detail):
+    path, _ = config(tmp_path)
+    seen = []
+    def provider(request):
+        seen.append(request)
+        return httpx.Response(200, json=ranged_conversation())
+    async def run():
+        async with client(application(path, provider)) as c:
+            response = await c.post('/v1/read_recording', json={'account': 'omi-a', 'recording_id': 'conv-a', **arguments})
+            assert response.status_code == 422
+            assert response.json() == {'error': 'invalid_parameters', 'detail_code': detail}
+        assert seen == []
+    asyncio.run(run())
+
+
+# spec: ANYM-770
+@pytest.mark.parametrize('bound', [-1, -0.5, 1000000.5, True, '5', float('inf')])
+def test_range_bound_outside_its_limits_is_plain_invalid_parameters(tmp_path, bound):
+    path, _ = config(tmp_path)
+    async def run():
+        async with client(application(path, lambda r: httpx.Response(200, json=ranged_conversation()))) as c:
+            raw = '{"account":"omi-a","recording_id":"conv-a","to_seconds":%s}' % json.dumps(bound).replace('Infinity', '1e999')
+            response = await c.post('/v1/read_recording', content=raw)
+            assert response.status_code == 422 and response.json() == {'error': 'invalid_parameters'}
+    asyncio.run(run())
+
+
+# spec: ANYM-770
+@pytest.mark.parametrize('segments', [
+    [{'text': 'MARK-A'}, {'text': 'MARK-B', 'start': None, 'end': None}],
+    [{'text': 'MARK-A', 'start': -1.0, 'end': -1.0}],
+    [{'text': 'MARK-A', 'start': -9.5, 'end': -3.0}, {'text': 'MARK-B', 'start': -1.0, 'end': -1.0}],
+    [{'text': 'MARK-A', 'start': 5}],
+])
+def test_range_on_a_transcript_without_usable_offsets_is_refused_without_text(tmp_path, segments):
+    path, _ = config(tmp_path)
+    async def run():
+        async with client(application(path, lambda r: httpx.Response(200, json=ranged_conversation(segments)))) as c:
+            response = await c.post('/v1/read_recording', json={**RANGE})
+            assert response.status_code == 422
+            assert response.json() == {'error': 'invalid_parameters', 'detail_code': 'range_needs_offsets'}
+            assert 'MARK' not in response.text
+    asyncio.run(run())
+
+
+# spec: ANYM-770
+@pytest.mark.parametrize('payload,state', [({'transcript_segments': []}, 'empty'), ({'transcript_included': False}, 'unavailable')])
+def test_range_keeps_the_state_of_a_transcript_with_no_segments(tmp_path, payload, state):
+    path, _ = config(tmp_path)
+    async def run():
+        async with client(application(path, lambda r: httpx.Response(200, json=conversation(**payload)))) as c:
+            result = (await c.post('/v1/read_recording', json=RANGE)).json()
+            assert result['content_state'] == state and result['text'] == '' and result['excluded_edge_segments'] == 0
+    asyncio.run(run())
+
+
+# spec: ANYM-770
+def test_range_cursor_is_bound_to_the_range_and_the_filtered_text(tmp_path):
+    path, _ = config(tmp_path)
+    long = [{'text': 'Synthetic ' * 40, 'speaker_name': 'User', 'start': 100, 'end': 150},
+            {'text': 'outside', 'speaker_name': 'User', 'start': 400, 'end': 410}]
+    current = [ranged_conversation(long)]
+    async def run():
+        async with client(application(path, lambda r: httpx.Response(200, json=current[0]))) as c:
+            args = {**RANGE, 'page_chars': 100}
+            first = (await c.post('/v1/read_recording', json=args)).json()
+            assert first['offset'] == 0 and len(first['text']) == 100 and first['complete'] is False
+            token = first['next_cursor']
+            second = (await c.post('/v1/read_recording', json={**args, 'cursor': token})).json()
+            assert second['offset'] == 100 and second['source_digest'] == first['source_digest']
+            for other in ({**args, 'to_seconds': 201}, {**args, 'from_seconds': 99}, {key: value for key, value in args.items()
+                          if key != 'to_seconds'}, {key: value for key, value in args.items() if not key.endswith('_seconds')}):
+                wrong = await c.post('/v1/read_recording', json={**other, 'cursor': token})
+                assert wrong.status_code == 400 and wrong.json() == {'error': 'invalid_cursor'}
+            plain = {key: value for key, value in args.items() if not key.endswith('_seconds')}
+            unranged = (await c.post('/v1/read_recording', json=plain)).json()['next_cursor']
+            assert (await c.post('/v1/read_recording', json={**args, 'cursor': unranged})).json() == {'error': 'invalid_cursor'}
+            # A change outside the range is not the reader's text; a change inside it is `source_changed`.
+            current[0] = ranged_conversation([long[0], {**long[1], 'text': 'changed outside'}])
+            assert (await c.post('/v1/read_recording', json={**args, 'cursor': token})).status_code == 200
+            current[0] = ranged_conversation([{**long[0], 'text': 'changed inside ' * 40}, long[1]])
+            changed = await c.post('/v1/read_recording', json={**args, 'cursor': token})
+            assert changed.status_code == 409 and changed.json() == {'error': 'source_changed'}
+    asyncio.run(run())
+
+
+# spec: ANYM-770
+def test_ranged_read_drops_content_derived_recording_fields_and_an_unranged_read_keeps_them(tmp_path):
+    path, _ = config(tmp_path)
+    value = {**ranged_conversation(), 'structured': {'title': TITLE + 'x' * 500}, 'started_at': '2026-10-01T00:00:01Z',
+             'finished_at': '2026-10-01T02:00:00Z', 'language': 'en', 'source': 'omi', 'processing_deferred': False}
+    async def run():
+        async with client(application(path, lambda r: httpx.Response(200, json=value))) as c:
+            ranged = (await c.post('/v1/read_recording', json=RANGE)).json()
+            assert ranged['recording'] == {'id': 'conv-a', 'created_at': '2026-10-01T00:00:00Z',
+                'started_at': '2026-10-01T00:00:01Z', 'finished_at': '2026-10-01T02:00:00Z', 'language': 'en',
+                'source': 'omi', 'processing_deferred': False}
+            plain = (await c.post('/v1/read_recording', json={'account': 'omi-a', 'recording_id': 'conv-a'})).json()
+            assert plain['recording']['title'].startswith(TITLE) and plain['recording']['title_truncated'] is True
+            assert 'excluded_edge_segments' not in plain
+    asyncio.run(run())
+
+
+def archived_config(tmp_path):
+    path, value = config(tmp_path)
+    tmp_path.chmod(0o700)
+    value['archive'] = {'directory': str(tmp_path / 'archive'), 'poll_seconds': 60}
+    value['accounts'][0]['archive_namespace'] = 'a' * 32
+    private(path, json.dumps(value))
+    return path
+
+
+def archive_rows(tmp_path):
+    import sqlite3
+    db = sqlite3.connect(tmp_path / 'archive' / 'archive.sqlite')
+    try:
+        return '\n'.join(db.iterdump()), {name: db.execute('SELECT count(*) FROM ' + name).fetchone()[0]
+                                          for name in ('records', 'events')}
+    finally:
+        db.close()
+
+
+# spec: ANYM-770
+def test_excluded_text_never_reaches_response_cursor_logs_or_archive(tmp_path, caplog):
+    path = archived_config(tmp_path)
+    seen = []
+    long = [{**SEGMENTS[2], 'text': 'inside ' * 60}, *[s for n, s in enumerate(SEGMENTS) if n != 2]]
+    def provider(request):
+        seen.append(request)
+        return httpx.Response(200, json=ranged_conversation(long))
+    async def run():
+        app = application(path, provider, archive_background=False)
+        async with app.router.lifespan_context(app), client(app) as c:
+            caplog.set_level('DEBUG')
+            before = archive_rows(tmp_path)
+            response = await c.post('/v1/read_recording', json={**RANGE, 'page_chars': 100})
+            result = response.json()
+            assert response.status_code == 200 and result['next_cursor']
+            assert len(seen) == 1 and seen[0].method == 'GET' and seen[0].url.host == 'api.omi.me'
+            payload = result['next_cursor'].split('.')[0]
+            decoded = base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)).decode()
+            assert '"to_seconds":200' in decoded  # the decoded form is really the cursor body
+            refused = await c.post('/v1/read_recording', json={'account': 'omi-a', 'recording_id': 'conv-a',
+                                                               'from_seconds': 1, 'to_seconds': 1})
+            after = archive_rows(tmp_path)
+            assert after[1] == before[1] == {'records': 0, 'events': 0}
+            for text in (response.text, decoded, refused.text, caplog.text, after[0]):
+                assert 'MARK' not in text
+    asyncio.run(run())
+
+
+# spec: ANYM-770
+def test_range_error_leaves_the_other_recordings_tools_working(tmp_path):
+    path, _ = config(tmp_path)
+    def provider(request):
+        if request.url.path.endswith('/conv-a'):
+            return httpx.Response(200, json=ranged_conversation([{'text': 'MARK-A'}]))
+        return httpx.Response(200, json=[row('kept', '2026-11-03T00:00:00Z')])
+    async def run():
+        app = application(path, provider)
+        async with client(app) as c:
+            assert (await c.post('/v1/read_recording', json=RANGE)).json()['detail_code'] == 'range_needs_offsets'
+            assert (await c.post('/v1/list_recordings', json={'account': 'omi-a'})).json()['items'][0]['id'] == 'kept'
+            assert (await c.post('/v1/capabilities', json={})).status_code == 200
+            plain = (await c.post('/v1/read_recording', json={'account': 'omi-a', 'recording_id': 'conv-a'})).json()
+            assert said(plain) == ['MARK-A']
+        assert app.state.provider.active == 0
+    asyncio.run(run())
+
+
+# spec: ANYM-770
+def test_range_on_a_plaud_account_is_refused_before_any_provider_call(tmp_path):
+    path, value = config(tmp_path)
+    token = private(tmp_path / 'plaud.key', 'plaud_synthetic_token')
+    value['accounts'].append({'id': 'plaud-a', 'provider': 'plaud', 'label': 'Synthetic', 'token_file': token})
+    value['principals'][0]['accounts'].append('plaud-a')
+    private(path, json.dumps(value))
+    seen = []
+    async def run():
+        async with client(application(path, lambda r: seen.append(r))) as c:
+            response = await c.post('/v1/read_recording', json={**RANGE, 'account': 'plaud-a'})
+            assert response.status_code == 422
+            assert response.json() == {'error': 'invalid_parameters', 'detail_code': 'range_needs_offsets'}
+        assert seen == []
+    asyncio.run(run())
+
+
+# Issued by the code before ANYM-770 (no range in its binding), signed with the synthetic key of `config`, expires in 2100.
+STORED_CURSOR = (
+    'eyJiaW5kaW5nIjp7ImFjY291bnQiOiJvbWktYSIsImFyZ3VtZW50cyI6eyJhY2NvdW50Ijoib21pLWEiLCJraW5kIjoidHJhbnNjcmlwdCIsInBhZ2VfY2hhcnMi'
+    'OjEwMCwicmVjb3JkaW5nX2lkIjoiY29udi1hIn0sIm9wZXJhdGlvbiI6InJlYWRfcmVjb3JkaW5nIiwicHJpbmNpcGFsIjoiZTM5MjUyZDdmZGYxOWY4Mjk5Y2Rm'
+    'ZmFhNzQ1MzNhOTdlN2Q3ZWIzMDRhMjFmZDAxYTg4ZTZlMTliODQ1ZWM0YyIsInByb3ZpZGVyIjoib21pIiwicHJvdmlkZXJfaWRlbnRpdHkiOiJhNWU1ZTM2MDFm'
+    'MzA2OGI3MjI2YmYxNDNiNzUyMWU4YzcyNTQ3YzVjNTg2NDc5M2Q0YzliZmYxNmY1ZGFkOTNlIn0sImRpZ2VzdCI6IjQ3MTk2NTUxNmZmY2ExNmM5ZmZjZGMxNDg2'
+    'M2I4NjFmZjIxMjI4NGY3M2I0MjQwNTIzMjgwOGVjODQwNjM1ZDAiLCJleHBpcmVzIjo0MTAyNDQ0ODAwLCJwb3NpdGlvbiI6MTAwfQ'
+    '.uZljaaZ5toJslFhlYuV5wiYIfbqimB-kUvq2BkZcmFA')
+
+
+# spec: ANYM-770
+def test_unranged_read_is_byte_identical_and_a_stored_cursor_still_replays(tmp_path):
+    path, _ = config(tmp_path)
+    current = [conversation('short')]
+    async def run():
+        async with client(application(path, lambda r: httpx.Response(200, json=current[0]))) as c:
+            args = {'account': 'omi-a', 'recording_id': 'conv-a'}
+            line = '{"start":0,"end":60,"speaker":"SPEAKER_00","text":"short"}'
+            digest = hashlib.sha256(json.dumps({'state': 'available', 'text': line}, sort_keys=True,
+                                               separators=(',', ':')).encode()).hexdigest()
+            response = await c.post('/v1/read_recording', json=args)
+            assert response.content.decode() == (
+                '{"account":"omi-a","provider":"omi","recording":{"id":"conv-a","created_at":"2026-10-01T00:00:00Z",'
+                '"title":"Synthetic title"},"kind":"transcript","content_state":"available","text":'
+                + json.dumps(line, separators=(',', ':')) + ',"offset":0,"source_digest":"' + digest
+                + '","complete":true,"next_cursor":null}')
+            current[0] = conversation()
+            replayed = await c.post('/v1/read_recording', json={**args, 'page_chars': 100, 'cursor': STORED_CURSOR})
+            assert replayed.status_code == 200 and replayed.json()['offset'] == 100
+            assert 'excluded_edge_segments' not in replayed.json()
+    asyncio.run(run())
+
+
+OFFSETS = st.one_of(st.none(), st.floats(min_value=-1e7, max_value=2e6, allow_nan=False))
+
+
+# spec: ANYM-770
+@given(st.lists(st.tuples(OFFSETS, OFFSETS, st.text(max_size=8)), max_size=12),
+       st.floats(min_value=0, max_value=1e6), st.floats(min_value=0, max_value=1e6))
+def test_range_filter_keeps_exactly_the_contained_lines_in_order(rows, one, two):
+    from deedkit_recordings.app import within
+    low, high = min(one, two), max(one, two)
+    lines = [json.dumps({'start': start, 'end': end, 'speaker': 'x', 'text': text}, ensure_ascii=False, separators=(',', ':'))
+             for start, end, text in rows]
+    if not lines:
+        return
+    def placed(row):
+        return row[0] is not None and row[1] is not None and row[0] <= row[1]
+    usable = [row for row in rows if placed(row) and row[1] >= 0]
+    try:
+        kept, edge = within('\n'.join(lines), low, high)
+    except Failure as refused:
+        assert not usable and refused.detail_code == 'range_needs_offsets'
+        return
+    assert usable
+    contained = [line for line, row in zip(lines, rows) if placed(row) and low <= row[0] and row[1] <= high]
+    assert kept == '\n'.join(contained)
+    assert edge == sum(1 for row in rows if placed(row) and not (low <= row[0] and row[1] <= high)
+                       and (row[0] < low < row[1] or row[0] < high < row[1]))
+
+
 # spec: ANYM-648
 def test_backend_scope_account_and_revocation_are_checked_before_egress(tmp_path):
     path, value = config(tmp_path)
@@ -515,6 +818,70 @@ def test_numeric_speaker_zero_is_distinct_from_missing_speaker():
     state, text = content(value,'transcript')
     assert state == 'available'
     assert [json.loads(line)['speaker'] for line in text.splitlines()] == ['0','unknown']
+
+
+# spec: ANYM-648
+def test_omi_speaker_precedence_uses_the_real_developer_fields():
+    from deedkit_recordings.omi import content
+    segments = [{'text': 'a', 'speaker_name': 'User', 'speaker_id': 0, 'start': 0.0, 'end': 1.0},
+                {'text': 'b', 'speaker_name': None, 'speaker_id': 1, 'start': 1.0, 'end': 2.0},
+                {'text': 'c', 'speaker_name': '', 'speaker_id': 2, 'start': 2.0, 'end': 3.0},
+                {'text': 'd', 'speaker_name': None, 'speaker_id': None, 'start': 3.0, 'end': 4.0, 'original_text': 'D'}]
+    state, text = content(conversation(transcript_segments=segments), 'transcript')
+    rows = [json.loads(line) for line in text.splitlines()]
+    assert state == 'available' and [row['speaker'] for row in rows] == ['User', '1', '2', 'unknown']
+    assert [row['text'] for row in rows] == ['a', 'b', 'c', 'd']  # `text` is the corrected line; `original_text` unused
+
+
+# spec: ANYM-648
+def test_unplaced_omi_segments_have_null_offsets_and_other_negatives_are_kept():
+    from deedkit_recordings.omi import content
+    segments = [{'text': 'late', 'speaker_name': 'User', 'start': -1.0, 'end': -1.0},
+                {'text': 'buffered', 'speaker_name': 'User', 'start': -2453.2, 'end': -2450.0},
+                {'text': 'edge', 'speaker_name': 'User', 'start': -1.0, 'end': 0.5},
+                {'text': 'live', 'speaker_name': 'User', 'start': 0.0, 'end': 2.0}]
+    state, text = content(conversation(transcript_segments=segments), 'transcript')
+    rows = [json.loads(line) for line in text.splitlines()]
+    assert state == 'available'
+    assert rows[0] == {'start': None, 'end': None, 'speaker': 'User', 'text': 'late', 'placed': False}
+    assert [(row['start'], row['end'], 'placed' in row) for row in rows[1:]] == [
+        (-2453.2, -2450.0, False), (-1.0, 0.5, False), (0.0, 2.0, False)]
+
+
+# spec: ANYM-725
+def test_an_unplaced_omi_segment_is_indexed_as_words_with_its_speaker():
+    from deedkit_recordings.archive_store import plain_text
+    from deedkit_recordings.omi import content
+    segments = [{'text': 'late words', 'speaker_name': 'Alice', 'start': -1.0, 'end': -1.0},
+                {'text': 'live words', 'speaker_name': 'Bob', 'start': 0.0, 'end': 2.0}]
+    _, text = content(conversation(transcript_segments=segments), 'transcript')
+    assert plain_text('transcript', text) == ('late words\nlive words', ['Alice', 'Bob'])
+    # Only that exact marker is an utterance: any other `placed` object stays searchable verbatim.
+    for line in ('{"text":"","placed":"telescope"}', '{"text":"x","placed":true}',
+                 '{"start":1.0,"end":null,"text":"x","placed":false}', '{"text":"x","placed":false,"extra":1}'):
+        assert plain_text('transcript', line) == (line, [])
+
+
+# spec: ANYM-648
+@pytest.mark.parametrize('structured,age,state', [
+    ({'title': '', 'overview': ''}, 3600, 'pending'),
+    ({'overview': ''}, 3600, 'pending'),
+    ({'title': '', 'overview': ''}, 2 * 86400, 'empty'),
+    ({'title': 'Synthetic', 'overview': ''}, 3600, 'empty'),
+    ({'title': '', 'overview': 'Synthetic overview'}, 3600, 'available'),
+    ({'title': '', 'overview': ''}, -1800, 'pending'),
+    ({'title': '', 'overview': ''}, -2 * 3600, 'empty'),
+    ({'title': '', 'overview': ''}, -70 * 365 * 86400, 'empty'),
+])
+def test_an_empty_omi_summary_is_pending_for_its_first_day_then_empty(structured, age, state):
+    from deedkit_recordings.omi import content
+    now = 1_800_000_000
+    created = datetime.fromtimestamp(now - age, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    assert content(conversation(structured=structured, created_at=created), 'summary', now)[0] == state
+    naive = created.removesuffix('Z')  # no zone means UTC, as the archive index reads it
+    assert content(conversation(structured=structured, created_at=naive), 'summary', now)[0] == state
+    assert content(conversation(structured=structured, created_at='not a time'), 'summary', now)[0] == (
+        'available' if state == 'available' else 'empty')
 
 
 # spec: ANYM-648

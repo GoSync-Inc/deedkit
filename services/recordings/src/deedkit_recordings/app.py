@@ -1,6 +1,8 @@
 """Private HTTP backend; the gateway is the agent-facing MCP surface."""
 import asyncio
 import hashlib
+import json
+import math
 import os
 import re
 import time
@@ -26,6 +28,8 @@ PLAIN_DATE = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}')
 # ANYM-754: a dated Omi list follows the provider past pages that leave no row, at most this many pages, and a
 # followed page (ledger wait and provider call) must end inside this deadline, below the gateway's 35-second one.
 DATED_PAGES, DATED_DEADLINE_S = 5, 30
+# ANYM-770: what a ranged read may say about the recording. The title is derived from the whole talk, so it stays out.
+RANGED_RECORD = ('id', 'created_at', 'started_at', 'finished_at', 'language', 'source', 'processing_deferred')
 
 
 class Empty(Strict):
@@ -46,6 +50,8 @@ class Reading(Strict):
     kind: Literal['transcript', 'summary'] = 'transcript'
     page_chars: int = Field(default=4000, ge=100, le=10000)
     cursor: str | None = Field(default=None, min_length=1, max_length=8192)
+    from_seconds: float | None = Field(default=None, ge=0, le=1e6)
+    to_seconds: float | None = Field(default=None, ge=0, le=1e6)
 
 
 class ArchiveStatus(Strict):
@@ -112,6 +118,39 @@ def outside(item, bounds):
         return False
     return ('start_date' in bounds and moment < bounds['start_date']) or (
         'end_date' in bounds and moment > bounds['end_date'])
+
+
+def refuse_range(args, provider):
+    """A range that cannot apply, refused before any provider call. PLAUD transcripts carry no offsets in Omi's shape."""
+    code = None
+    if args.from_seconds is not None and args.to_seconds is not None and args.from_seconds >= args.to_seconds:
+        code = 'range_empty'
+    elif args.kind == 'summary':
+        code = 'range_not_for_summary'
+    elif provider != 'omi':
+        code = 'range_needs_offsets'
+    if code:
+        raise Failure('invalid_parameters', 422, detail_code=code)
+
+
+def within(text, low, high):
+    """The lines of a non-empty Omi transcript text (omi.content) whose segment lies fully inside [low, high], and how
+    many segments cross a bound. A segment has no word timestamps, so a crossing one would leak the speech outside. One
+    without both offsets in order cannot be placed and is left out uncounted; none placed at or after 0 is a refusal."""
+    kept, crossing, usable = [], 0, False
+    for line in text.split('\n'):  # never splitlines: JSON keeps U+2028 and friends raw inside a segment's text
+        row = json.loads(line)
+        start, end = row['start'], row['end']
+        if start is None or end is None or start > end:
+            continue
+        usable = usable or end >= 0
+        if low <= start and end <= high:
+            kept.append(line)
+        elif start < low < end or start < high < end:
+            crossing += 1
+    if not usable:
+        raise Failure('invalid_parameters', 422, detail_code='range_needs_offsets')
+    return '\n'.join(kept), crossing
 
 
 def create_app(config_path, *, transport=None, provider_timeout=12, provider_bytes=2 * 1024 * 1024,
@@ -204,13 +243,18 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
         account = accounts[args.account]
         if operation in ('search', 'context', 'archive_status'):
             return await local.invoke(operation, args, authorization[7:])
+        ranged = operation == 'read_recording' and (args.from_seconds is not None or args.to_seconds is not None)
+        if ranged:
+            refuse_range(args, account.provider)
         request.state.provider = account.provider
         token = provider_token(account)
         bounds = dates(args) if operation == 'list_recordings' else {}
         params = {key: value.isoformat().replace('+00:00', 'Z') for key, value in bounds.items()}
+        # An unranged read keeps the binding it always had, so cursors issued before the range existed stay valid.
+        unbound = {'cursor'} | ({'from_seconds', 'to_seconds'} if operation == 'read_recording' and not ranged else set())
         binding = {'provider': account.provider, 'account': account.id, 'principal': actor.key_sha256,
                    'provider_identity': hashlib.sha256(token.encode()).hexdigest(), 'operation': operation,
-                   'arguments': {**args.model_dump(exclude={'cursor'}), **params}}
+                   'arguments': {**args.model_dump(exclude=unbound), **params}}
         previous = cursor(args.cursor, binding, secret) if getattr(args, 'cursor', None) else None
         if operation == 'audio':
             if account.provider != 'plaud':
@@ -276,6 +320,13 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
             if record['id'] != args.recording_id:
                 raise Failure('invalid_provider_response', detail_code='id_mismatch')
             state, text = content(value, args.kind)
+        crossing = 0
+        if ranged:
+            record = {key: record[key] for key in RANGED_RECORD if key in record}
+            if state == 'available':
+                text, crossing = within(text, -math.inf if args.from_seconds is None else args.from_seconds,
+                                        math.inf if args.to_seconds is None else args.to_seconds)
+                state = 'available' if text else 'empty'
         digest = hashlib.sha256(canonical({'state': state, 'text': text})).hexdigest()
         offset = 0
         if previous:
@@ -285,10 +336,13 @@ def create_app(config_path, *, transport=None, provider_timeout=12, provider_byt
             if type(offset) is not int or not 0 < offset < len(text):
                 raise Failure('invalid_cursor', 400)
         end = min(len(text), offset + args.page_chars)
-        return {'account': account.id, 'provider': account.provider, 'recording': record, 'kind': args.kind,
-                'content_state': state, 'text': text[offset:end], 'offset': offset,
-                'source_digest': digest, 'complete': end == len(text),
-                'next_cursor': continuation(binding, end, secret, digest) if end < len(text) else None}
+        result = {'account': account.id, 'provider': account.provider, 'recording': record, 'kind': args.kind,
+                  'content_state': state, 'text': text[offset:end], 'offset': offset,
+                  'source_digest': digest, 'complete': end == len(text),
+                  'next_cursor': continuation(binding, end, secret, digest) if end < len(text) else None}
+        if ranged:
+            result['excluded_edge_segments'] = crossing
+        return result
 
     async def feed_route(request, head):
         # ANYM-726. Without `event_router` configuration these routes do not exist; with it, only the router token opens

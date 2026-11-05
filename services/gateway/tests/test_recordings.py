@@ -71,6 +71,41 @@ def test_optional_recordings_catalog_and_routing(tmp_path):
             'kind':'transcript','page_chars':4000})]
 
 
+# spec: ANYM-770
+def test_recordings_read_catalog_offers_the_range_and_says_what_it_limits():
+    tool=CATALOG['recordings_read']
+    properties=tool['inputSchema']['properties']
+    for name in ('from_seconds','to_seconds'):
+        assert properties[name]=={'minimum':0,'maximum':1000000,'type':['number','null']}
+        assert name not in tool['inputSchema']['required']
+    description=tool['description']
+    assert '{"account":"omi-a","recording_id":"...","from_seconds":3600,"to_seconds":4200}' in description
+    assert 'not what the provider returns' in description and 'fully inside' in description
+
+
+# spec: ANYM-770
+def test_recordings_list_catalog_describes_plain_dates_and_dropped_rows():
+    description=CATALOG['recordings_list']['description']
+    assert 'YYYY-MM-DD' in description and 'inclusive, UTC' in description and 'dropped and counted' in description
+    assert 'PLAUD limits 10–50, no date filters' in description
+    assert 'Omi dates are created_at instants' not in description
+
+
+# spec: ANYM-770
+def test_gateway_passes_a_range_to_the_backend_and_refuses_bad_bounds_first(tmp_path):
+    app,calls=setup(tmp_path)
+    with TestClient(app) as c:
+        args={'account':'omi-a','recording_id':'conv-a'}
+        read=rpc(c,'tools/call',{'name':'recordings_read','arguments':{**args,'from_seconds':3600,'to_seconds':4200.5}}).json()['result']
+        assert not read.get('isError'),read
+        assert calls==[('recordings','read_recording',{**args,'kind':'transcript','page_chars':4000,
+            'from_seconds':3600,'to_seconds':4200.5})]
+        for bad in (-1,1000001,'5'):
+            refused=rpc(c,'tools/call',{'name':'recordings_read','arguments':{**args,'to_seconds':bad}}).json()['result']
+            assert refused['isError']
+        assert len(calls)==1
+
+
 # spec: ANYM-648
 @pytest.mark.parametrize('kwargs',[{'gateway_scopes':['recordings:read']},
     {'backend_scopes':['recordings:read']},{'content_tool':False},{'deployed':False}])

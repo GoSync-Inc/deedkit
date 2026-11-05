@@ -19,7 +19,8 @@ not wait for a schema migration, unrelated service updates, fresh full backups
 or a restore drill. Main/CI/artifact verification, candidate inspection, locks,
 active-call checks and session/state preservation still apply. A restart of the
 existing failed service/session has standing incident authority. Routine releases
-and data/schema repairs retain the gates below.
+follow "Migration releases and the backup gate" below; a repair that deletes or
+rewrites user data keeps its gate there.
 
 ## Required CI and main protection
 
@@ -395,7 +396,7 @@ certificate checks. `production.py` runs it with an empty environment, so no
 credential reaches it, and passes its one-line refusal reason on. Any refusal
 stops preparation before the first pull. The trust root is fixed at build time:
 when Sigstore rotates its keys, verification of newer bundles fails closed until
-a reviewed pull request refreshes `trusted_root.json` and the owner installs the
+a reviewed pull request refreshes `trusted_root.json` and an agent installs the
 new build.
 
 ## Prepare and inspect
@@ -518,7 +519,8 @@ runner, no image lock is taken. `check-image` builds the working tree under
 `deedkit-check-<target>:<sha>`, always fresh, and never reuses or touches a
 production tag.
 
-Before applying, follow [backup/migration and rollback](platform-cutover.md).
+A platform cutover follows [backup/migration and rollback](platform-cutover.md); a routine release follows
+"Migration releases" below.
 This tool runs no migration by hand (`deploy` runs the qualifying messaging ones itself, "Unattended
 migrations" below), does not prove data compatibility, authorize external
 actions, or perform provider readback. A schema change needs the module's explicit
@@ -534,8 +536,8 @@ receipt privately, and verify an isolated quarantine restore using the module's
 [backup procedure](../../BACKUP.md). Calculate freshness from the snapshot time,
 not from a later delivery retry. A failed delivery, local-only snapshot or stale
 receipt does not establish this gate. The deployment tool does not verify these
-live backup conditions; preparation and successful source CI are not migration
-approval.
+live backup conditions; preparation and successful source CI do not establish this
+gate.
 
 For R2 delivery, the opt-in [independent receiver verifier](../../BACKUP_R2.md#automated-independent-restore-on-the-receiver)
 can establish this restore evidence on the receiver using a root-only recovery
@@ -565,19 +567,20 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
 3. Owner 11-04 (process-fast-release, verbatim): «Мы же уже делали, что при простых миграциях никакого
    быкапа не ждет ... мы нацелены будем на то, чтобы разработка шла быстро ... делали, только какие-то
    быкапы, только в критических случаях ... Мы быстрее катили и быстро выкатывали, чтобы без этой сложной
-   канители и блоков каких-то заморозок»; «давай все делать не ждать ничего». Before it, owner 10-29 «Я
-   готов принять риск максимально» and 11-01 «с копией базы надо только при опасных миграциях». A
+   канители и блоков каких-то заморозок»; «давай все делать не ждать ничего»; «не умру, не умрет никто. Это
+   не какой-то там банковской системы». Before it, owner 10-29 «Я готов принять риск максимально». A
    release without a critical migration ("Migration risk tiers" below) has no backup gate and nothing to
    wait for: no fresh backup, restore proof, hold, backup-age check, `copy-database`, time window, merge
    freeze, new release kit or plan review. The latest verified daily backup is its restore point. Its only
    waits are the tool's own: an active call, and a backup that holds the runner lock. This holds for
-   messaging and calendar. A database with no scheduled daily backup running (calendar while its timer is
-   off, ANYM-607) keeps a restore point anyway: unattended, its pre-migration copy (Database copies); by
-   hand, `copy-database` first. A critical release needs the backup gate above (a fresh backup and its
-   restore proof, never a reused daily backup), `copy-database` first and one Astra review round of
+   messaging and calendar. A store with no daily backup running keeps a restore point anyway: a PostgreSQL
+   database, unattended, its pre-migration copy (Database copies), by hand `copy-database` first; the calls
+   state (`voice.sqlite3`, which no daily backup covers), a SQLite online backup before a release that changes
+   its schema or stored rows. A critical release needs the backup gate above (a fresh backup and its
+   restore proof, never a reused daily backup), an undo and one Astra review round of
    its plan (harness process.md section 2, reviews.md Rounds 7). The release kit or PR names each file's tier.
 
-   Accepted risk (owner 10-29, 11-01 and 11-04, quoted above): if a non-critical `migrate` destroys or
+   Accepted risk (owner 10-29 and 11-04, quoted above): if a non-critical `migrate` destroys or
    corrupts data, a restore returns the database to the latest daily backup (about 24 hours old at most
    while the daily backup succeeds), and everything written after it (messages, receipts, keys, operator
    changes) is lost. No gate backup or copy was restored in any hand release from 10-17 to 11-04.
@@ -614,7 +617,7 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
 Owner 11-04 (item 3 above): backups only in critical cases. Two tiers. A release takes the tier of its
 highest-tier pending migration file, changed role file or step.
 
-- Critical (the backup gate, `copy-database` and one Astra round on the plan first): a statement that deletes
+- Critical (the backup gate, an undo and one Astra round on the plan first): a statement that deletes
   or rewrites existing rows or drops stored data. DELETE, UPDATE, MERGE, TRUNCATE, INSERT ... ON CONFLICT
   DO UPDATE; DROP TABLE, COLUMN, SCHEMA or MATERIALIZED VIEW; a DROP ... CASCADE whose dependents include
   a table, a column or anything the author cannot list; ALTER COLUMN ... TYPE or SET EXPRESSION that
@@ -627,7 +630,7 @@ highest-tier pending migration file, changed role file or step.
   CONSTRAINT, INDEX, DEFAULT or NOT NULL; RENAME; functions, triggers and comments; grants, REVOKE and role
   changes; a `DO` block that only grants, revokes or checks a precondition.
 
-The tier decides the backup, the copy and the plan review only. Expand, then contract
+The tier decides the backup and the plan review only. Expand, then contract
 (`.claude/rules/migrations.md`) still keeps a DROP, RENAME or narrowing out of a release whose running
 code uses the old shape; role SQL keeps its Astra r1 in its PR; the active-call check and the release
 order stay. The author names the tier in the migration header (`-- Risk tier: critical` with the line
@@ -638,8 +641,8 @@ the copy; that copy is automatic and holds no one.
 
 ### Database copies
 
-ANYM-588. A copy is required only before a critical migration, or for a database with no daily backup
-running ("Migration risk tiers"; owner 11-01). `production.py copy-database --config <plan A config> --database <name> --sha <sha>` makes an
+ANYM-588. A release needs a copy only for a database with no daily backup running (owner 11-04, "Migration
+releases" item 3); an unattended range still gets its automatic one ("Migration risk tiers"). `production.py copy-database --config <plan A config> --database <name> --sha <sha>` makes an
 exactly checked copy of one live database on this host without stopping its writers, proves it restores
 and leaves nothing running. Automatic migrations (ANYM-449) call the same function; a hand release kit can
 call the command. It runs under the plan A lock, like `prepare`.
@@ -1087,8 +1090,9 @@ service and timer are never touched.
 
 The router (`deploy/compose.event-router.yaml`, SUBSCRIPTIONS.md "Module event router") is not
 enrolled by any release: nothing runs until these steps. It needs schema 58 and a producer
-endpoint (calls ANYM-563, calendar ANYM-565) deployed. Owner-kept steps: the two module read
-tokens (secrets and access) and the link grants (ANYM-564). The agent prepares each step for the owner's yes:
+endpoint (calls ANYM-563, calendar ANYM-565) deployed. Access steps: the two module read
+tokens (secrets and access) and the link grants (ANYM-564). The agent runs each step under AGENTS.md section 2, the
+gateway profile switch (step 5) under the `profile tools` rule ("Write subcommands"):
 1. Module read tokens: one per module, issued by the module for the router's audience, stored
    as `private/event-router-tokens/calls` and `.../calendar` (directory 0700, files 0600, uid
    10001). The repository and the config name only the paths, never a value.
@@ -1102,7 +1106,7 @@ tokens (secrets and access) and the link grants (ANYM-564). The agent prepares e
    appended to the project's `files` and `"event-router": "runtime"` selected. The router has no
    healthcheck: it is checked as running; its state is `module-router-status` and
    `module_source_health`.
-5. Link grants (ANYM-564) and the gateway profile switch: owner steps of those cards; without a
+5. Link grants (ANYM-564) and the gateway profile switch, as above; without a
    link no subscription has a module source and published events wake nobody.
 6. Recordings source (ANYM-732; ships disabled, planned here and read back in ANYM-653's evidence). It needs schema 67 (hand
    release 067: SUBSCRIPTIONS.md "Recordings source"; `receiver_schema_max` and the backup and restore runtimes at 67 first) and
@@ -1131,7 +1135,7 @@ tokens (secrets and access) and the link grants (ANYM-564). The agent prepares e
    container still on it, then `docker network rm deedkit-recordings-router`.
    Rotate or revoke the token: replace the digest in the recordings configuration and the token file together (two digests allow a rotation).
 Read-back: a synthetic module event published by a test producer appears in `module-router-status`
-(cursor moved) and in `module_events`, only after the owner-kept tokens exist. Undo: `docker
+(cursor moved) and in `module_events`, only after the module read tokens exist. Undo: `docker
 compose $F stop event-router`, remove it from `files`; cursors and gaps stay (schema 58 is
 additive) and a later start resumes from the stored cursor.
 
@@ -1196,8 +1200,8 @@ it recreates the incompatible pair. The guard covers migration-dependent
 compatibility only: a code-only protocol change between the serving API and
 the workers with equal inventories passes it.
 
-Rollback is a production change: the owner confirms it like `apply` (except
-the one automatic rollback of `deploy`, below). It returns
+Rollback is a production change an agent runs under AGENTS.md section 2 (`deploy`
+also has one automatic rollback, below). It returns
 the current release's selected services to the images and configuration that
 ran before it, from `<state>/<sha>/<project>.before.json`. It does not call
 `promotable()` (the previous revision is no longer current `main`), does not run or
@@ -1386,7 +1390,8 @@ order, outside an active call:
 7. After a fresh verified backup, `purge-deleted --apply`: the point of no return for past
    deletions. `--apply` drains every due mark and exits non-zero while marks stay pending
    (contention or failures); run it again.
-Steps 5 and 7 delete data and wait for the owner's words.
+Step 7 takes the deletion gate of harness process.md section 2 (a fresh verified backup, an undo, one Astra
+review); step 5's worker runs the DELETEs docs/DATA-POLICY.md names.
 The purge is irreversible: rolling back code or schema does not bring content back; only a
 restore of a backup taken before it does, and only while that backup is kept (about two days of
 daily verified backups). `purge-disable` stops the worker without a deploy.
@@ -2666,8 +2671,11 @@ no service reads that file, so the enforced policy never changes.
 
 ### Write subcommands (ANYM-493 shared rules)
 
-Running `key issue`, `key extend`, `key revoke`, `profile tools` or `undo` is the owner's decision (secrets and access); an agent runs them
-only on the owner's exact words. Every write subcommand follows these rules
+An agent runs `key issue`, `key extend`, `key revoke`, `profile tools` and their `undo` under AGENTS.md section 2 and
+the harness process.md section 2 access gate. A profile's tool list never gives a principal more than its grants, so a
+tool within the grants of the owner's own agents on that profile is an own-agent grant (the journal's before-state,
+read-back, `undo`); a profile with any other principal takes Astra r1. A tool that sends, calls, ACKs, pairs, starts or
+stops a provider session or changes an allowlist is added only on the owner's exact words (AGENTS.md section 1). Every write subcommand follows these rules
 (tests/test_deedkit_admin_rules.py proves each):
 
 - (a) Locks: it takes the installed host tool's `production.host_locks` (global, HTTP and plan-A
@@ -2833,7 +2841,7 @@ file it enforces. The journal records whether `--token-file` was given, never it
 `deedkit admin key revoke <id> [--token-file <path>] [--dry-run]` sets the gateway entry
 `enabled: false` first (access ends on the next request), then revokes each backend credential
 (messaging `revoke-key`, calendar `revoke-agent`; one already revoked is skipped) and disables the
-calls registry entry. Records stay for audit; deleting them is a separate owner decision.
+calls registry entry. Records stay for audit; deleting them is a separate step under AGENTS.md section 2.
 Evidence: every running gateway's in-container policy (copied out with `docker cp`) has the
 published file's digest, which disables the principal. With `--token-file`, the file's SHA-256
 must equal the principal's `key_sha256` before any write, and the configuration must name

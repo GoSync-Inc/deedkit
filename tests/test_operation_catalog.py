@@ -33,6 +33,24 @@ def test_defaults_and_strict_bounded_inputs():
         })
 
 
+# spec: ANYM-755
+def test_edit_message_takes_the_send_format_options_and_omits_their_defaults():
+    edit = {'text': 'Edited synthetic text'}
+    for platform in ('telegram', 'whatsapp'):
+        schema = {r['operation']: r for r in operation_manifest(platform)}['edit_message']
+        assert set(schema['parameters_schema']) == {'text', 'format', 'link_preview', 'allow_lossy'}
+        assert 'plain text only' not in schema['limitation']
+        # defaults, given or not, persist exactly the parameters of today's plain edit
+        assert validate_operation(platform, 'edit_message', edit) == edit
+        assert validate_operation(platform, 'edit_message', {**edit, 'format': 'plain', 'link_preview': False,
+                                                              'allow_lossy': False}) == edit
+    assert validate_operation('telegram', 'edit_message', {**edit, 'format': 'html', 'link_preview': True}) == {
+        **edit, 'format': 'html', 'link_preview': True}
+    for bad in [{'format': 'rich'}, {'format': 1}, {'link_preview': 'yes'}, {'allow_lossy': 1}]:
+        with pytest.raises(ValueError, match='invalid_operation_parameters'):
+            validate_operation('telegram', 'edit_message', {**edit, **bad})
+
+
 def test_registered_file_requires_digest_and_has_no_path_or_url():
     value = validate_operation('telegram', 'send_file', {
         'attachment_id': 'att_' + 'a' * 32, 'sha256': 'b' * 64,

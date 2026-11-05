@@ -71,13 +71,12 @@ Owner, 2026-10-30, after delayed recovery of Telegram sends:
 >
 > «И только после этого уже продолжаем работу над задачами.»
 
-This replaces, for the bounded recovery above, the fresh-backup and pre-operation
-plan-review requirements of harness process.md section 2 / reviews.md Round 7,
-the ready-card ordering of process.md sections 1 and 4, pre-merge independent
-review ordering of sections 3 and 5 / reviews.md Round 8, and AGENTS.md section 1's
-per-action confirmation for restarting the existing service/session. Review and
-records move after recovery; no new backup or restore drill is required for the
-stateless recovery itself. The green-main promotion and owner-kept boundaries
+This replaces, for the bounded recovery above, the ready-card ordering of
+process.md sections 1 and 4, pre-merge independent review ordering of sections 3
+and 5 / reviews.md Round 8, and AGENTS.md section 1's per-action confirmation for
+restarting the existing service/session. Review and records move after recovery.
+A stateless recovery takes no fresh backup under harness process.md section 2
+itself (owner 11-04). The green-main promotion and owner-kept boundaries
 above remain. The responding agent enforces this order and records deferred checks.
 
 The motivating incident already has synthetic queue-isolation regression tests

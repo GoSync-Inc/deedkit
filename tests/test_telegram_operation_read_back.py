@@ -11,7 +11,7 @@ from telethon import errors, functions, types
 
 from messaging_service.blobs import BlobWriter
 from messaging_service.collector_state import CaptureSpool
-from messaging_service.commands import VERIFY, CommandWorker
+from messaging_service.commands import VERIFY, VERIFY_FORMATTED_EDIT, CommandWorker
 from messaging_service.envelope import stable_id
 from messaging_service.telegram_governor import ProviderRateLimited, RequestGovernor
 from messaging_service.telegram_collector import TelegramCollector
@@ -332,6 +332,189 @@ def test_plain_edit_of_the_same_text_confirms_the_formatting_removal(operator):
     receipt = run(operator, client, 'edit_message', {'text': text})
     assert receipt['status'] == 'succeeded' and receipt['result']['data']['basis'] == 'provider_read_back'
     assert len(client.mutations()) == 1
+
+
+# ANYM-755: a formatted edit sends the send path's rendered text and entities; the read-back compares both.
+FORMATTED = {'text': '<b>Edited</b> <a href="https://example.invalid/x">link</a>', 'format': 'html'}
+LINK = 'https://example.invalid/x'
+
+
+def edit_call(client):
+    (call,) = [c for c in client.mutations() if c[0] == 'edit_message']
+    return call[3], call[4]
+
+
+# spec: ANYM-755
+def test_formatted_edit_sends_rendered_entities_and_confirms_when_they_read_back(operator):
+    client = EditClient(provider_message('Edited link', entities=[types.MessageEntityBold(0, 6),
+                                                                   types.MessageEntityTextUrl(7, 4, LINK)]))
+    receipt = run(operator, client, 'edit_message', {**FORMATTED, 'link_preview': True})
+    assert receipt['status'] == 'succeeded' and receipt['result']['data']['effect_verified'] is True
+    text, options = edit_call(client)
+    assert text == 'Edited link' and 'parse_mode' not in options and options['link_preview'] is True
+    sent = options['formatting_entities']
+    assert [type(e) for e in sent] == [types.MessageEntityBold, types.MessageEntityTextUrl]
+    assert [(e.offset, e.length) for e in sent] == [(0, 6), (7, 4)] and sent[1].url == LINK
+
+
+# spec: ANYM-755
+def test_plain_edit_still_sends_plain_text_without_entities(operator):
+    client = EditClient(provider_message('Edited synthetic text'))
+    assert run(operator, client, 'edit_message', EDIT)['status'] == 'succeeded'
+    assert edit_call(client) == ('Edited synthetic text', {'parse_mode': None, 'link_preview': False})
+
+
+# spec: ANYM-755
+def test_a_formatting_only_edit_of_unchanged_text_is_confirmed(operator):
+    client = EditClient(provider_message('hello', entities=bold('hello')),
+                        before=provider_message('hello', edited=None))
+    receipt = run(operator, client, 'edit_message', {'text': '<b>hello</b>', 'format': 'html'})
+    assert receipt['status'] == 'succeeded' and receipt['result']['data']['basis'] == 'provider_read_back'
+
+
+# spec: ANYM-755
+def test_a_formatted_edit_to_the_state_already_there_stays_unknown(operator):
+    client = EditClient(provider_message('hello', entities=bold('hello')),
+                        before=provider_message('hello', entities=bold('hello'), edited=None))
+    receipt = run(operator, client, 'edit_message', {'text': '<b>hello</b>', 'format': 'html'})
+    assert receipt['status'] == 'unknown' and receipt['result'] == {'outcome': 'unknown', 'data': UNKNOWN_EDIT}
+    assert len(client.mutations()) == 1 and len(client.edit_reads()) == 1  # no read can prove this request did it
+
+
+# spec: ANYM-755
+@pytest.mark.parametrize('language,confirmed', [('python', True), ('', False), ('ruby', False)])
+def test_a_pre_edit_is_confirmed_only_when_its_language_reads_back(operator, language, confirmed):
+    from messaging_service.formatting import render_message
+    source = '<pre language="python">x = 1</pre>'
+    (entity,) = render_message('telegram', source, format='html')['entities']
+    shown = types.MessageEntityPre(entity['offset'], entity['length'], language)
+    client = EditClient(provider_message('x = 1', entities=[shown]))
+    receipt = run(operator, client, 'edit_message', {'text': source, 'format': 'html'})
+    assert receipt['status'] == ('succeeded' if confirmed else 'unknown')
+    (sent,) = edit_call(client)[1]['formatting_entities']
+    assert isinstance(sent, types.MessageEntityPre) and sent.language == 'python'
+
+
+# spec: ANYM-755
+@pytest.mark.parametrize('shown', ['dropped', 'bold_only', 'other_url', 'shifted', 'extra_italic'])
+def test_formatted_edit_whose_entities_differ_from_the_request_stays_unknown(operator, shown):
+    entities = {'dropped': [], 'bold_only': [types.MessageEntityBold(0, 6)],
+                'other_url': [types.MessageEntityBold(0, 6), types.MessageEntityTextUrl(7, 4, LINK + 'y')],
+                'shifted': [types.MessageEntityBold(1, 5), types.MessageEntityTextUrl(7, 4, LINK)],
+                'extra_italic': [types.MessageEntityBold(0, 6), types.MessageEntityTextUrl(7, 4, LINK),
+                                 types.MessageEntityItalic(0, 3)]}[shown]
+    client = EditClient(provider_message('Edited link', entities=entities))
+    receipt = run(operator, client, 'edit_message', FORMATTED)
+    assert receipt['status'] == 'unknown' and receipt['result'] == {'outcome': 'unknown', 'data': UNKNOWN_EDIT}
+    assert len(client.mutations()) == 1
+    # get_message_info shows no formatting: the continuation names the read that does (Astra r1)
+    assert receipt['verify'] == VERIFY_FORMATTED_EDIT
+
+
+# spec: ANYM-755
+def test_the_formatted_verify_settles_only_on_a_lossless_rendering_equal_to_the_artifact():
+    # Sol r2: comparing body_rendered alone would call an edit applied although the read omitted an entity type.
+    from messaging_service.formatting import render_message
+    from messaging_service.formatting_readback import build
+    from messaging_service.incoming_formatting import wire_digest
+    artifact = render_message('telegram', FORMATTED['text'], format='html')
+    body = artifact['rendered_text']
+
+    def read(entities, unsupported=()):
+        rendered, reason = build(body, {'state': 'partial' if unsupported else 'observed', 'wire_sha256': wire_digest(body),
+                                        'entities': entities, 'unsupported_entities': list(unsupported)})
+        assert reason is None
+        again = render_message('telegram', rendered['text'], format='html')
+        return rendered, (again['rendered_text'], again['entities']) == (artifact['rendered_text'], artifact['entities'])
+
+    applied, equal = read(artifact['entities'])
+    assert applied['lossless'] is True and applied['omitted_types'] == [] and equal
+    # The rendering compares equal with an entity left out of it: only lossless and omitted_types show that.
+    lossy, equal = read(artifact['entities'], [{'type': 'custom_emoji', 'offset': 0, 'length': 1}])
+    assert lossy['lossless'] is False and lossy['omitted_types'] == ['custom_emoji'] and equal
+    different, equal = read(artifact['entities'][:1])
+    assert different['lossless'] is True and not equal
+    decides = VERIFY_FORMATTED_EDIT['decides']
+    assert VERIFY_FORMATTED_EDIT['operation'] == 'get_messages' and 'get_message_info' not in decides
+    for term in ('newer than expected_revision', 'body_format=html', 'lossless true', 'empty omitted_types',
+                 'rendered_text', 'entities', 'edit_artifact', 'inconclusive', 'never send the edit again'):
+        assert term in decides
+
+
+# spec: ANYM-755
+@pytest.mark.parametrize('read', ['as_requested', 'extra_italic_after_many_derived', 'over_the_bound'])
+def test_a_formatted_read_back_compares_every_entity(operator, read):
+    # Astra r1: a text-derived entity first no longer pushes an unrequested span out of the comparison.
+    text = ' '.join(['x'] * 99)
+    source = ' '.join(['<b>x</b>'] * 99)
+    bolds = [types.MessageEntityBold(2 * i, 1) for i in range(99)]
+    entities = {'as_requested': bolds,
+                'extra_italic_after_many_derived': [types.MessageEntityUrl(0, 1)] + bolds + [types.MessageEntityItalic(0, 1)],
+                'over_the_bound': bolds + [types.MessageEntityUrl(0, 1)] * 200}[read]
+    client = EditClient(provider_message(text, entities=entities))
+    receipt = run(operator, client, 'edit_message', {'text': source, 'format': 'html'})
+    assert receipt['status'] == ('succeeded' if read == 'as_requested' else 'unknown')
+
+
+# spec: ANYM-755
+@pytest.mark.parametrize('shown', ['as_rendered', 'indentation_unformatted'])
+def test_formatting_over_leading_whitespace_is_compared_not_clipped(operator, shown):
+    from messaging_service.formatting import render_message
+    source = '<pre language="python">    x=1</pre>'
+    artifact = render_message('telegram', source, format='html')
+    (entity,) = artifact['entities']
+    offset, length = (entity['offset'], entity['length']) if shown == 'as_rendered' else (entity['offset'] + 4,
+                                                                                           entity['length'] - 4)
+    client = EditClient(provider_message(artifact['rendered_text'],
+                                         entities=[types.MessageEntityPre(offset, length, 'python')]))
+    receipt = run(operator, client, 'edit_message', {'text': source, 'format': 'html'})
+    assert receipt['status'] == ('succeeded' if shown == 'as_rendered' else 'unknown')
+
+
+# spec: ANYM-755
+def test_a_plain_edit_with_bold_left_on_leading_whitespace_stays_unknown(operator):
+    # ANYM-747's plain rule (any formatting left is not the plain edit) holds for a span on stripped whitespace.
+    client = EditClient(provider_message('  Edited synthetic text', entities=[types.MessageEntityBold(0, 2)]))
+    receipt = run(operator, client, 'edit_message', EDIT)
+    assert receipt['status'] == 'unknown' and receipt['verify'] == VERIFY['edit_message']
+
+
+# spec: ANYM-755
+def test_formatted_source_has_the_send_allowance_and_its_rendering_the_wire_limit(operator):
+    long = 'x' * 4000
+    client = EditClient(provider_message(long, entities=[types.MessageEntityBold(0, 4000)]))
+    receipt = run(operator, client, 'edit_message', {'text': f'<b>{long}</b>', 'format': 'html'})
+    assert receipt['status'] == 'succeeded' and edit_call(client)[0] == long
+
+
+# spec: ANYM-755
+@pytest.mark.parametrize('change', ['source', 'format', 'link_preview', 'provider_text', 'url', 'units', 'key'])
+def test_a_persisted_edit_artifact_that_is_not_this_requests_rendering_is_refused(change):
+    from messaging_service.commands import CommandRejected
+    from messaging_service.formatting import render_message
+    from messaging_service.telegram_operations import edit_request
+    parameters = dict(FORMATTED)
+    artifact = render_message('telegram', FORMATTED['text'], format='html')
+    assert edit_request(artifact, parameters)[0] == 'Edited link'
+    if change == 'source':
+        parameters['text'] = '<b>Other</b> <a href="https://example.invalid/x">link</a>'
+    if change == 'format':
+        parameters['format'] = 'markdown'
+    if change == 'link_preview':
+        parameters['link_preview'] = True
+    if change == 'provider_text':
+        artifact['provider_payload'] = {**artifact['provider_payload'], 'text': 'Edited lunk'}
+    if change == 'url':
+        bad = [dict(e) for e in artifact['entities']]
+        bad[1]['url'] = 'javascript:alert(1)'
+        artifact['entities'] = bad
+        artifact['provider_payload'] = {**artifact['provider_payload'], 'entities': bad}
+    if change == 'units':
+        artifact['utf16_units'] += 1
+    if change == 'key':
+        artifact['extra'] = True
+    with pytest.raises(CommandRejected, match='invalid_parameters'):
+        edit_request(artifact, parameters)
 
 
 # spec: ANYM-747

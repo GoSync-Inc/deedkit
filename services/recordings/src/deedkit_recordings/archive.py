@@ -309,7 +309,7 @@ class ArchiveRuntime:
                     raise Failure('invalid_provider_response')
                 for kind in ('transcript', 'summary'):
                     try:
-                        state, text = content(value, kind)
+                        state, text = content(value, kind, now)
                         if len(text.encode()) > MAX_TEXT:
                             raise Failure('archive_content_limit')
                         observations[kind] = state, text, None

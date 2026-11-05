@@ -187,6 +187,129 @@ def test_unknown_edit_names_the_verifying_read(operator):
         assert _verify({**row,'status':'succeeded'},c) is None
 
 
+FORMATTED_EDIT={'text':'<b>Edited</b> <a href="https://example.invalid/x">link</a>','format':'html'}
+
+
+# spec: ANYM-755
+def test_formatted_edit_binds_the_rendered_artifact_to_its_preview_digest(operator):
+    from messaging_service.formatting import render_message
+    s,_,key,_=operator
+    plain=s.preview_messenger_operation(key,**operation_args(operation='edit_message',parameters={'text':'Edited'}))
+    assert 'edit_artifact' not in plain and plain['parameters']=={'text':'Edited'}  # defaults: today's payload
+    explicit=s.preview_messenger_operation(key,**operation_args(operation='edit_message',
+        parameters={'text':'Edited','format':'plain','link_preview':False,'allow_lossy':False}))
+    assert explicit['preview_digest']==plain['preview_digest'] and explicit['parameters']=={'text':'Edited'}
+    with pytest.raises(APIError,match='invalid_operation_parameters'):  # a plain edit keeps its 4000 units
+        s.preview_messenger_operation(key,**operation_args(operation='edit_message',parameters={'text':'x'*4001}))
+    assert s.preview_messenger_operation(key,**operation_args(operation='edit_message',
+        parameters={'text':'<b>'+'x'*4000+'</b>','format':'html'}))['edit_artifact']['utf16_units']==4000
+    args=operation_args(operation='edit_message',parameters=FORMATTED_EDIT)
+    draft=s.preview_messenger_operation(key,**args)
+    assert draft['edit_artifact']==render_message('telegram',FORMATTED_EDIT['text'],format='html')
+    assert draft['edit_artifact']['rendered_text']=='Edited link'
+    assert draft['edit_artifact']['provider_payload']['entities']==[{'type':'bold','offset':0,'length':6},
+        {'type':'text_link','offset':7,'length':4,'url':'https://example.invalid/x'}]
+    # the same continuation as any mutation without (or with another) preview; nothing is queued
+    for digest,code in (('','preview_required'),(plain['preview_digest'],'preview_mismatch')):
+        with pytest.raises(APIError,match=code) as refused:
+            s.execute_messenger_operation(key,**args,request_id='synthetic-format-0001',preview_digest=digest)
+        assert refused.value.next_action=='preview_then_send_with_digest'
+        assert refused.value.next_call['tool']=='preview_messenger_operation'
+    other=s.preview_messenger_operation(key,**operation_args(operation='edit_message',
+        parameters={**FORMATTED_EDIT,'link_preview':True}))
+    assert other['preview_digest']!=draft['preview_digest']
+    queued=s.execute_messenger_operation(key,**args,request_id='synthetic-format-0001',
+                                         preview_digest=draft['preview_digest'])
+    with s.pool.connection() as c:
+        payload=c.execute('SELECT payload FROM messenger_commands WHERE id=%s',(queued['operation_id'],)).fetchone()['payload']
+    assert payload['edit_artifact']==draft['edit_artifact']
+    # a source the send path refuses is refused here, before anything is queued
+    with pytest.raises(APIError,match='unsafe_message_markup|unsupported_message_formatting'):
+        s.preview_messenger_operation(key,**operation_args(operation='edit_message',
+            parameters={'text':'<script>x</script>','format':'html'}))
+
+
+def formatted_edit_args(source):
+    return operation_args(operation='edit_message',parameters={'text':source,'format':'html'})
+
+
+def refused_alike(s,key,args,expected):
+    """Preview and execute give one refusal, and nothing is queued."""
+    with s.pool.connection() as c:
+        before=c.execute('SELECT count(*) AS n FROM messenger_commands').fetchone()['n']
+    for call,extra in ((s.preview_messenger_operation,{}),
+                       (s.execute_messenger_operation,{'request_id':'synthetic-size-0001','preview_digest':''})):
+        with pytest.raises(APIError,match='invalid_operation_parameters') as refused:
+            call(key,**args,**extra)
+        assert refused.value.field_errors==[{'field':'parameters','reason':'size','expected':expected}]
+    with s.pool.connection() as c:
+        assert c.execute('SELECT count(*) AS n FROM messenger_commands').fetchone()['n']==before
+
+
+# spec: ANYM-755
+def test_a_formatted_edit_that_previews_also_executes_at_the_request_limit(operator):
+    # Sol r2: a source inside the 16000-unit allowance previewed, then failed the canonical request cap on execute.
+    from messaging_service.envelope import canonical
+    s,_,key,_=operator
+    source=lambda count:'<b>'+'&#120;'*count+'</b>'
+    size=lambda count:len(canonical({**formatted_edit_args(source(count)),'preview_digest':'0'*64}))
+    largest=max(count for count in range(2500,2700) if size(count)<=16000)
+    assert largest<2650 and len(source(2650))<=16000  # the reported source is inside the unit allowance
+    args=formatted_edit_args(source(largest))
+    draft=s.preview_messenger_operation(key,**args)
+    queued=s.execute_messenger_operation(key,**args,request_id='synthetic-size-0002',preview_digest=draft['preview_digest'])
+    assert queued['status']=='queued'
+    for count in (largest+1,2650):
+        refused_alike(s,key,formatted_edit_args(source(count)),'canonical request of at most 16000 bytes')
+
+
+# spec: ANYM-755
+def test_a_formatted_edit_over_the_stored_payload_bound_is_refused_at_preview(operator):
+    # The stored row repeats the source and the rendering: 4000 CJK characters fit the request, not the payload CHECK.
+    import json
+    s,_,key,_=operator
+    args=lambda count:formatted_edit_args('<b>'+'漢'*count+'</b>')
+    def previews(count):
+        try:return bool(s.preview_messenger_operation(key,**args(count))['preview_digest'])
+        except APIError as refused:
+            assert refused.field_errors==[{'field':'parameters','reason':'size',
+                'expected':'stored formatted edit of at most 65536 bytes'}]
+            return False
+    fits,over=3000,4000
+    assert previews(fits) and not previews(over)
+    while over-fits>1:
+        middle=(fits+over)//2
+        if previews(middle):fits=middle
+        else:over=middle
+    refused_alike(s,key,args(over),'stored formatted edit of at most 65536 bytes')
+    # The largest that previews is stored: the bound is the CHECK's own measure, not an estimate of it.
+    draft=s.preview_messenger_operation(key,**args(fits))
+    queued=s.execute_messenger_operation(key,**args(fits),request_id='synthetic-size-0003',preview_digest=draft['preview_digest'])
+    with s.pool.connection() as c:
+        row=c.execute('SELECT payload,octet_length(payload::text) AS bytes FROM messenger_commands WHERE id=%s',
+                      (queued['operation_id'],)).fetchone()
+    assert row['bytes']==len(json.dumps(row['payload'],ensure_ascii=False).encode())<=65536
+
+
+# spec: ANYM-755
+@pytest.mark.parametrize('options',[{'format':'html'},{'format':'markdown'},{'link_preview':True},{'allow_lossy':True}])
+def test_whatsapp_formatted_edit_is_refused_unsupported_with_a_plain_next_step(seeded,options):
+    from messaging_service.commands import EDIT_FORMAT_NEXT_STEP
+    s,_,_=seeded
+    archive=Archive(s)
+    archive.register('edit-wa','whatsapp','Synthetic WhatsApp',discover=True)
+    archive.ingest(event(account='edit-wa',platform='whatsapp',chat='900@c.us',provider_id='1',direction='outgoing',
+                         body='Original'))
+    key=s.issue_key('wa-editor',['edit-wa'],permissions=['read','message-edit'])
+    s.set_messenger_operations('edit-wa',['edit_message'])
+    args=dict(account='edit-wa',operation='edit_message',chat_id=stable_id('chat','edit-wa','900@c.us'),
+              message_id=stable_id('msg','edit-wa','900@c.us','1'),expected_revision=1)
+    with pytest.raises(APIError,match='unsupported_operation') as refused:
+        s.preview_messenger_operation(key,**args,parameters={'text':'*Edited*',**options})
+    assert refused.value.next_step==EDIT_FORMAT_NEXT_STEP
+    assert 'edit_artifact' not in s.preview_messenger_operation(key,**args,parameters={'text':'*Edited*'})
+
+
 @pytest.mark.parametrize('change',['key','principal','policy','revision','expiry','connection'])
 def test_worker_rechecks_mutable_authority(operator,change):
     from messaging_service.commands import CommandWorker
