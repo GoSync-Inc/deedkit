@@ -19,7 +19,6 @@ import urllib.error
 
 from hypothesis import given, strategies as st
 import pytest
-import shutil
 import yaml
 
 from scripts import production as p
