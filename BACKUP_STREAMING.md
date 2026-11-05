@@ -175,7 +175,10 @@ Proof input is bounded to 16 KiB. A separate verifier/operator creates this reco
 **after** actual decryption, manifest and original/recovery hash verification,
 PostgreSQL restore/table verification, and collector quarantine. The receiver
 validates the attestation and its exact ciphertext/manifest identity; it does not
-perform or independently establish those restore checks itself. For example,
+perform or independently establish those restore checks itself. The R2 verifier
+also keeps a [binding sidecar](BACKUP_R2.md#automated-independent-restore-on-the-receiver)
+beside its proof, `<proof file>.binding.json`; this filesystem receiver neither
+writes nor reads it, and the proof's format below is the same with or without it. For example,
 the shape is:
 
 ```json

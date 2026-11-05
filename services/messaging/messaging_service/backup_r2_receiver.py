@@ -328,19 +328,22 @@ def resume_body(config, client, receipt, offset, etag):
         request['IfMatch'] = etag
     response = cloud_call(client.get_object, **request)
     if (response.get('ContentLength') != total - offset or
-            response.get('ContentRange', 'bytes %d-%d/%d' % (offset, total - 1, total)) != 'bytes %d-%d/%d' % (offset, total - 1, total)):
+            response.get('ContentRange', 'bytes %d-%d/%d' % (offset, total - 1, total)) != 'bytes %d-%d/%d' % (offset, total - 1, total) or
+            (etag and response.get('ETag', etag) != etag)):
         response['Body'].close()
         raise ValueError('stored_backup_corrupt')
     return response['Body']
 
 
-def verify_object(config, client, receipt, output=None):
+def verify_object(config, client, receipt, output=None, *, stream=None):
     """Hash actual downloaded bytes; multipart ETags are never integrity proof.
 
     A body read that fails mid-stream resumes at the next byte with a ranged GET
     of the same ETag (STREAM_RESUMES, bounded backoff); the full SHA256 still
     covers every delivered byte. A failed write to `output` is never retried.
     Returns the ranged GETs it used, so a run a resume saved stays visible (ANYM-633).
+    `stream`, a dict, receives the ETag and length of the response just hashed, only
+    once the hash passed and only when that response named an ETag (ANYM-641).
     """
     wire = receipt['wire']
     response = cloud_call(client.get_object, Bucket=config['bucket'], Key=receipt['object_key'])
@@ -389,6 +392,8 @@ def verify_object(config, client, receipt, output=None):
         body.close()
     if size != wire['bytes'] or digest.hexdigest() != wire['sha256'] or prefix != AGE_HEADER:
         raise ValueError('stored_backup_corrupt')
+    if stream is not None and isinstance(etag, str) and 1 <= len(etag) <= 1024:
+        stream.update(etag=etag, bytes=response['ContentLength'])
     return resumes
 
 
@@ -992,13 +997,52 @@ def read_root(directory, name, *, limit=65536, missing=False):
         raise
 
 
-def candidate_from_proof(config, client, proof):
+def binding_name(proof_name):
+    return proof_name + '.binding.json'
+
+
+def binding_value(proof, stream):
+    """The sidecar beside a proof: the object the verifier's hashed GET read (ANYM-641). The proof itself stays v1."""
+    return {'v': 1, 'backup_id': proof['backup']['id'], 'sha256': proof['backup']['sha256'], 'etag': stream['etag'],
+            'bytes': stream['bytes'], 'verification_id': proof['verification']['id']}
+
+
+def read_binding(proof_fd, proof_name, proof):
+    """The sidecar of a proof that already passed every check, or None: anything but an exact match takes the full GET."""
+    try:
+        _, value = read_root(proof_fd, binding_name(proof_name), limit=4096, missing=True)
+    except Exception as exc:
+        if signalled(exc) is not None:
+            raise
+        return None
+    if (not isinstance(value, dict) or set(value) != {'v', 'backup_id', 'sha256', 'etag', 'bytes', 'verification_id'} or
+            type(value['v']) is not int or value['v'] != 1 or value['backup_id'] != proof['backup']['id'] or
+            value['sha256'] != proof['backup']['sha256'] or value['verification_id'] != proof['verification']['id'] or
+            not isinstance(value['etag'], str) or not 1 <= len(value['etag']) <= 1024 or
+            type(value['bytes']) is not int or value['bytes'] < 0):
+        return None
+    return value
+
+
+def bound_object_present(config, client, receipt, binding):
+    """One HEAD in place of the full GET: still the object the proof's hash read, else a refusal that deletes nothing."""
+    head = cloud_call(client.head_object, Bucket=config['bucket'], Key=receipt['object_key'])
+    if (head.get('ETag') != binding['etag'] or head.get('ContentLength') != binding['bytes'] or
+            binding['bytes'] != receipt['wire']['bytes']):
+        raise ValueError('stored_backup_corrupt')
+
+
+def candidate_from_proof(config, client, proof, proof_fd, proof_name):
     if not isinstance(proof, dict) or not isinstance(proof.get('backup'), dict):
         raise ValueError('independent_restore_proof_required')
     bid = proof['backup'].get('id'); valid_id(bid)
     receipt = get_receipt(config, client, bid)
     new = validate_proof(proof, receipt, profile(config))
-    verify_object(config, client, receipt)
+    binding = read_binding(proof_fd, proof_name, proof)
+    if binding is None:
+        verify_object(config, client, receipt)
+    else:
+        bound_object_present(config, client, receipt, binding)
     return new, receipt
 
 
@@ -1008,7 +1052,7 @@ def protect(config, protected_file, proof_file, *, client=None):
     client = client if client is not None else make_client(config)
     with operator_handles(state, marker, proof_file) as (state_fd, control_fd, proof_fd):
         proof_raw, proof = read_root(proof_fd, proof_file.name, limit=16384)
-        new, receipt = candidate_from_proof(config, client, proof)
+        new, receipt = candidate_from_proof(config, client, proof, proof_fd, proof_file.name)
         value = marker_value(config, [new]); proof_sha = hashlib.sha256(proof_raw).hexdigest()
         journal_name = marker.name + '.enrollment.json'
         _, journal = read_root(control_fd, journal_name, missing=True)
@@ -1060,8 +1104,8 @@ def validate_rotation_journal(config, journal):
 def previous_present(config, client, old, *, resumed=False):
     """Receipt-bound size check of a point being superseded; its bytes are never re-read.
 
-    The replacement is proven by its own restore and full re-hash; hashing data
-    about to be deleted protects nothing and would let a corrupt old point block
+    The replacement is proven by its own restore and the hash of that stream; hashing
+    data about to be deleted protects nothing and would let a corrupt old point block
     rotation. Absence is accepted only on a root-journal-bound resume.
     """
     try:
@@ -1085,7 +1129,7 @@ def rotate(config, protected_file, proof_file, *, expected_protected_sha256, cli
         proof_raw, proof = read_root(proof_fd, proof_file.name, limit=16384)
         marker_raw, current = read_root(control_fd, marker.name)
         validate_marker(config, current)
-        new, candidate_receipt = candidate_from_proof(config, client, proof)
+        new, candidate_receipt = candidate_from_proof(config, client, proof, proof_fd, proof_file.name)
         candidate = marker_value(config, [new]); proof_sha = hashlib.sha256(proof_raw).hexdigest()
         journal_name = marker.name + '.rotation.json'
         _, journal = read_root(control_fd, journal_name, missing=True)

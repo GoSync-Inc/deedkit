@@ -111,7 +111,7 @@ def test_verifier_keeps_a_shaped_helper_detail_beside_the_unchanged_failure_fact
         def wait(self, timeout): return 1
         def poll(self): return 1
     monkeypatch.setattr(v.subprocess, 'Popen', lambda *a, **kw: Process())
-    monkeypatch.setattr(r2, 'verify_object', lambda *a: None)
+    monkeypatch.setattr(r2, 'verify_object', lambda *a, **k: None)
     fact = {'v': 1, 'status': 'failed', 'error': 'restore_database_failed'}
     for detail, expected in (({'v': 1, 'detail': 'role does not exist'}, 'role does not exist'),
                              ({'v': 1, 'detail': 'role "' + SENTINEL + '" does not exist'}, None),

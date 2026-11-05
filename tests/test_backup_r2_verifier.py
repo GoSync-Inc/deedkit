@@ -283,7 +283,7 @@ def test_docker_failed_helper_reads_bounded_safe_failure_fact(tmp_path,monkeypat
         def wait(self,timeout):return 1
         def poll(self):return 1
     monkeypatch.setattr(v.subprocess,'Popen',lambda *a,**kw:Process())
-    monkeypatch.setattr(r2,'verify_object',lambda *a:None)
+    monkeypatch.setattr(r2,'verify_object',lambda *a,**k:None)
     monkeypatch.setattr(v,'private_file',lambda *a:r2.encoded({'v':1,'status':'failed','error':'restore_quarantine_failed'}))
     with pytest.raises(RuntimeError,match='restore_quarantine_failed'):
         engine.restore({}, {},None,{},'a'*32,tmp_path,tmp_path)
@@ -520,6 +520,238 @@ def test_first_run_survives_a_transient_cloud_reset_mid_stream(operator,monkeypa
     assert broken and result['status']=='verified' and Path(config['protected_file']).exists()
 
 
+def through_docker(v,engine,monkeypatch,helper=None):
+    """The real Docker.restore around a synthetic helper. The surrounding engine stays the fixture's, so that a failed
+    run's own bookkeeping never starts a docker client."""
+    docker=v.Docker(60)
+    monkeypatch.setattr(docker,'setup',lambda *a:None)
+    monkeypatch.setattr(docker,'inspect_owned',lambda *a:{})
+    monkeypatch.setattr(v,'validate_helper_layout',lambda *a:None)
+    def popen(*args,**kwargs):
+        return (helper or FinishedHelper)(next(Path(engine.directory).glob('payload-*')),engine.facts)
+    monkeypatch.setattr(v.subprocess,'Popen',popen)
+    def restore(config,receiver,client,receipt,run,payload,secret_dir):
+        engine.directory=config['directory'];engine.stream_object=None
+        engine.facts={'v':1,'status':'verified','schema_version':34,'manifest_sha256':receipt['wire']['snapshot_sha256'],
+                      'checks':{k:True for k in r2.CHECKS}}
+        facts=docker.restore(config,receiver,client,receipt,run,payload,secret_dir)
+        engine.stream_object=docker.stream_object
+        return facts
+    engine.restore=restore
+    return docker
+
+
+def binding_file(config,run):return Path(config['directory'])/('proof-'+run+'.json.binding.json')
+
+
+def fresh_candidate(receiver,bid=None):
+    from test_backup_r2 import Etagged,receive,THIRD
+    cloud=Etagged();receive(receiver,cloud,bid=bid or THIRD)
+    return cloud
+
+
+# spec: ANYM-641
+def test_binding_comes_from_the_hashed_get_stream(operator,monkeypatch):
+    from test_backup_r2 import THIRD
+    v,config,receiver,_,engine,_=operator
+    cloud=fresh_candidate(receiver);key=next(k for k in cloud.objects if '/objects/' in k);hashed=cloud.etag(key);stored=cloud.objects[key]
+    class Replacing(FinishedHelper):
+        # The object changes after the verifier's download, before its promotion: the stream has ended when this is asked.
+        def poll(self):
+            cloud.objects[key]=stored[:-1]+bytes([stored[-1]^1])
+            return super().poll()
+    through_docker(v,engine,monkeypatch,Replacing)
+    with pytest.raises(ValueError,match='^stored_backup_corrupt$'):v.run(config,client=cloud,engine=engine)
+    run=json.loads((Path(config['directory'])/'active.json').read_text())['run']
+    proof=json.loads((Path(config['directory'])/('proof-'+run+'.json')).read_text())
+    binding=json.loads(binding_file(config,run).read_text())
+    # The ETag is the response's the hash covered, never a later read of the object.
+    assert binding=={'v':1,'backup_id':THIRD,'sha256':proof['backup']['sha256'],'etag':hashed,'bytes':len(stored),'verification_id':run}
+    assert cloud.etag(key)!=hashed and set(proof)=={'v','type','status','backup','verification'}
+    assert binding_file(config,run).stat().st_mode&0o777==0o600
+    assert not Path(config['protected_file']).exists() and 'delete_object' not in cloud.calls
+    # Nothing beside the verifier's proof reaches upload state, which deployed code enumerates.
+    assert not [name for name in os.listdir(receiver['state_directory']) if 'binding' in name]
+
+
+# spec: ANYM-641
+@pytest.mark.parametrize('answer',['same','other','replaced'])
+def test_binding_survives_ranged_ifmatch_resume(operator,monkeypatch,answer):
+    v,config,receiver,_,engine,_=operator
+    monkeypatch.setattr(r2,'stream_pause',lambda attempt:None)
+    cloud=fresh_candidate(receiver);key=next(k for k in cloud.objects if '/objects/' in k);hashed=cloud.etag(key);stored=cloud.objects[key]
+    original=cloud.get_object;calls=[]
+    def get_object(**kw):
+        if kw['Key']!=key:return original(**kw)
+        if 'Range' in kw and answer=='replaced':cloud.objects[key]=stored[:-1]+bytes([stored[-1]^1])
+        response=original(**kw);calls.append({k:kw[k] for k in ('Range','IfMatch') if k in kw})
+        if 'Range' in kw and answer=='other':response['ETag']='"another-object"'
+        if len(calls)==1:response['Body']=FlakyBody(response['Body'].read(),64)
+        return response
+    cloud.get_object=get_object
+    through_docker(v,engine,monkeypatch)
+    if answer=='same':
+        result=v.run(config,client=cloud,engine=engine)
+        # The resume kept the first response's ETag, and promotion read no body again.
+        assert calls==[{},{'Range':'bytes=64-%d'%(len(stored)-1),'IfMatch':hashed}]
+        assert json.loads(binding_file(config,result['verification_id']).read_text())['etag']==hashed
+        return
+    expected=(ValueError,'^stored_backup_corrupt$') if answer=='other' else (RuntimeError,'^storage_unavailable$')
+    with pytest.raises(expected[0],match=expected[1]):v.run(config,client=cloud,engine=engine)
+    assert not list(Path(config['directory']).glob('*.binding.json')) and not list(Path(config['directory']).glob('proof-*'))
+    assert not Path(config['protected_file']).exists()
+
+
+# spec: ANYM-641
+@pytest.mark.parametrize('case',['no-etag','corrupt-body','helper-failed'])
+def test_no_binding_without_an_etag_a_good_hash_or_a_finished_restore(operator,monkeypatch,case):
+    v,config,receiver,_,engine,_=operator
+    cloud=fresh_candidate(receiver);key=next(k for k in cloud.objects if '/objects/' in k);original=cloud.get_object
+    if case=='no-etag':
+        def get_object(**kw):
+            response=original(**kw);response.pop('ETag')
+            return response
+        cloud.get_object=get_object
+    elif case=='corrupt-body':cloud.objects[key]=b'x'*len(cloud.objects[key])
+    through_docker(v,engine,monkeypatch,(lambda payload,facts:ExitedHelper(payload,None,False)) if case=='helper-failed' else None)
+    if case=='no-etag':
+        result=v.run(config,client=cloud,engine=engine)
+        assert result['status']=='verified' and not binding_file(config,result['verification_id']).exists()
+        return
+    with pytest.raises((ValueError,RuntimeError)):v.run(config,client=cloud,engine=engine)
+    assert not list(Path(config['directory']).glob('*.binding.json')) and not Path(config['protected_file']).exists()
+
+
+# spec: ANYM-641
+def test_a_failed_binding_write_costs_a_full_get_never_the_run(operator,monkeypatch):
+    v,config,receiver,_,engine,_=operator
+    cloud=fresh_candidate(receiver);key=next(k for k in cloud.objects if '/objects/' in k)
+    through_docker(v,engine,monkeypatch);original=v.local.write_maintenance_json
+    def write(name,value,**kw):
+        if str(name).endswith('.binding.json'):raise OSError(28,'No space left on device')
+        return original(name,value,**kw)
+    monkeypatch.setattr(v.local,'write_maintenance_json',write)
+    assert v.run(config,client=cloud,engine=engine)['status']=='verified'
+    assert cloud.reads==[key]*3 and not list(Path(config['directory']).glob('*.binding.json'))
+
+
+# spec: ANYM-641
+@pytest.mark.parametrize('stop',[TimeoutError('restore_deadline'),InterruptedError('restore_stopped')],ids=['deadline','service-stop'])
+def test_a_deadline_during_the_binding_write_still_ends_the_run(operator,monkeypatch,stop):
+    v,config,receiver,_,engine,_=operator
+    cloud=fresh_candidate(receiver)
+    through_docker(v,engine,monkeypatch);original=v.local.write_maintenance_json
+    def write(name,value,**kw):
+        if str(name).endswith('.binding.json'):raise stop
+        return original(name,value,**kw)
+    monkeypatch.setattr(v.local,'write_maintenance_json',write)
+    with pytest.raises(type(stop)):v.run(config,client=cloud,engine=engine)
+    assert not Path(config['protected_file']).exists() and 'delete_object' not in cloud.calls
+
+
+# spec: ANYM-641
+@pytest.mark.parametrize('step',['protect','rotate'])
+@pytest.mark.parametrize('case,reads',[('fresh',2),('no-sidecar',3),('upload-recovery',2),('upload-recovery-no-sidecar',3)],
+                         ids=['fresh','no-sidecar','upload-recovery','upload-recovery-no-sidecar'])
+def test_chain_body_reads_per_case(operator,monkeypatch,step,case,reads):
+    # Candidate body reads by object key, the capability gate failed (criterion 2): the post-upload GET stays. A fresh chain:
+    # that one and the proof's. Without a sidecar: today's three. Recovery of a lost completion: its reconcile GET instead of the
+    # post-upload one, then as in the same chain; the sidecar is bound to the proof's own GET, so a recovery with one needs no third.
+    from test_backup_r2 import Etagged,receive,THIRD
+    v,config,receiver,_,engine,_=operator
+    cloud=Etagged();second='20261016T111703Z-2123456789abcdef'
+    through_docker(v,engine,monkeypatch)
+    if step=='rotate':
+        receive(receiver,cloud,bid=second)
+        assert v.run(config,client=cloud,engine=engine)['status']=='verified'
+    if case.startswith('upload-recovery'):
+        cloud.fail['complete_response']=True
+        with pytest.raises(RuntimeError,match='completion_outcome_unknown'):receive(receiver,cloud,bid=THIRD)
+        assert receive(receiver,cloud,bid=THIRD)['duplicate']
+    else:receive(receiver,cloud,bid=THIRD)
+    key=next(k for k in cloud.objects if '/objects/' in k and THIRD in k)
+    if case.endswith('no-sidecar'):
+        # A state from before the sidecar: the proof exists and its binding does not.
+        monkeypatch.setattr(v,'write_binding',lambda *a,**k:None)
+    assert v.run(config,client=cloud,engine=engine)['backup_id']==THIRD
+    assert cloud.reads.count(key)==reads
+
+
+# The code on the receiver now (`git hash-object` of its two modules, 11-05: e678b1b1 for both, ANYM-730).
+DEPLOYED_RECEIVER='e678b1b1cd4a2e53c9fcc6915f47d264335be216'
+
+
+def deployed_modules(target,monkeypatch):
+    """The deployed verifier and receiver from `git archive`, under their own package name; the source is fetched when absent."""
+    import importlib
+    import importlib.util
+    import subprocess
+    import sys
+    root=Path(__file__).resolve().parents[1]
+    def missing():return subprocess.run(['git','cat-file','-e',DEPLOYED_RECEIVER+'^{commit}'],cwd=root,capture_output=True).returncode
+    if missing():  # CI's shallow clone: the repository is public, so one commit is fetched without credentials
+        subprocess.run(['git','fetch','--quiet','--depth=1','origin',DEPLOYED_RECEIVER],cwd=root,capture_output=True,timeout=120)
+    if missing():
+        # CI must carry the evidence: there an unreachable release fails; a local run may skip.
+        (pytest.fail if os.environ.get('CI') else pytest.skip)(f'the deployed receiver {DEPLOYED_RECEIVER} is not reachable')
+    archive=subprocess.run(['git','archive',DEPLOYED_RECEIVER,'services/messaging/messaging_service'],cwd=root,capture_output=True,check=True).stdout
+    target.mkdir()
+    subprocess.run(['tar','-x','-C',str(target)],input=archive,check=True)
+    source=target/'services/messaging/messaging_service';name='deployed_messaging_service'
+    for loaded in [key for key in sys.modules if key==name or key.startswith(name+'.')]:del sys.modules[loaded]
+    spec=importlib.util.spec_from_file_location(name,source/'__init__.py',submodule_search_locations=[str(source)])
+    package=importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules,name,package);spec.loader.exec_module(package)
+    verifier=importlib.import_module(name+'.backup_r2_verifier')
+    return verifier,verifier.r2
+
+
+# spec: ANYM-641
+@pytest.mark.parametrize('state',['restoring','proof_ready','promoted','interrupted_rotation'])
+def test_deployed_reader_ignores_binding_sidecar(operator,monkeypatch,tmp_path,state):
+    from test_backup_r2 import Etagged,receive,THIRD
+    v,config,receiver,_,engine,_=operator
+    old_v,old_r2=deployed_modules(tmp_path/'deployed',monkeypatch)
+    assert not hasattr(old_r2,'read_binding') and old_r2.__name__!=r2.__name__
+    monkeypatch.setattr(old_v,'INSTANCES_FILE',v.INSTANCES_FILE)
+    cloud=Etagged();through_docker(v,engine,monkeypatch);directory=Path(config['directory'])
+    second='20261016T111703Z-2123456789abcdef'
+    def stop_new_code():
+        if state=='promoted':
+            def lost(*a,**k):raise RuntimeError('verifier_cleanup_unconfirmed')
+            monkeypatch.setattr(v,'record_verified',lost)
+            with pytest.raises(RuntimeError):v.run(config,client=cloud,engine=engine)
+        else:
+            def lost(*a,**k):raise TimeoutError('lost promotion result')
+            monkeypatch.setattr(r2,'protect',lost)
+            with pytest.raises(TimeoutError):v.run(config,client=cloud,engine=engine)
+    if state=='interrupted_rotation':
+        receive(receiver,cloud,bid=second)
+        assert v.run(config,client=cloud,engine=engine)['status']=='verified'
+        receive(receiver,cloud,bid=THIRD);cloud.fail['delete_response']=True
+        with pytest.raises(RuntimeError,match='storage_unavailable'):v.run(config,client=cloud,engine=engine)
+    else:
+        receive(receiver,cloud,bid=THIRD);stop_new_code()
+    journal=json.loads((directory/'active.json').read_text());sidecar=binding_file(config,journal['run']);written=sidecar.read_bytes()
+    assert journal['phase']==('promoted' if state=='promoted' else 'proof_ready')
+    if state=='restoring':
+        (directory/'active.json').write_text(json.dumps({**journal,'phase':'restoring'}))
+    class Deployed(type(engine)):
+        def restore(self,config,receiver,client,receipt,run,payload,secret_dir):
+            for kind,name in old_v.names(run,old_r2.profile(config)).items():self.resources[(kind,name)]={'Labels':{old_v.LABEL:run}}
+            old_r2.verify_object(receiver,client,receipt,io.BytesIO())
+            return {'v':1,'status':'verified','schema_version':34,'manifest_sha256':receipt['wire']['snapshot_sha256'],
+                    'checks':{k:True for k in old_r2.CHECKS}}
+    key=next(k for k in cloud.objects if '/objects/' in k and THIRD in k);cloud.reads.clear();cloud.heads.clear()
+    result=old_v.run(config,client=cloud,engine=Deployed())
+    assert result['status']=='verified' and result['backup_id']==THIRD and result['verification_id']==journal['run']
+    # It verified in full, as today, never by the binding: the sidecar stayed as the new code wrote it.
+    assert key in cloud.reads and key not in cloud.heads and sidecar.read_bytes()==written
+    assert json.loads(Path(config['protected_file']).read_text())['backups'][0]['id']==THIRD
+    assert not (directory/'active.json').exists()
+    assert not [k for k in cloud.objects if second in k]
+
+
 class FinishedHelper:
     """Synthetic helper that reads the whole stream, leaves its result and exits 0."""
     def __init__(self,payload,facts):
@@ -702,7 +934,7 @@ def test_helper_exit_mid_stream_reports_its_failure_fact_not_a_generic_code(oper
     monkeypatch.setattr(docker,'setup',lambda *a:None)
     monkeypatch.setattr(docker,'inspect_owned',lambda *a:{})
     monkeypatch.setattr(v,'validate_helper_layout',lambda *a:None)
-    monkeypatch.setattr(r2,'verify_object',lambda receiver,client,receipt,out:out.write(b'synthetic-ciphertext'))
+    monkeypatch.setattr(r2,'verify_object',lambda receiver,client,receipt,out,**k:out.write(b'synthetic-ciphertext'))
     def popen(*args,**kwargs):
         helpers.append(ExitedHelper(next(Path(config['directory']).glob('payload-*')),fact,hangs));return helpers[-1]
     monkeypatch.setattr(v.subprocess,'Popen',popen)
@@ -1807,7 +2039,7 @@ def test_calendar_helper_failure_fact_reaches_the_status(operator,monkeypatch,co
     monkeypatch.setattr(docker,'setup',lambda *a:None)
     monkeypatch.setattr(docker,'inspect_owned',lambda *a:{})
     monkeypatch.setattr(v,'validate_helper_layout',lambda *a:None)
-    monkeypatch.setattr(r2,'verify_object',lambda receiver,client,receipt,out:out.write(b'synthetic-ciphertext'))
+    monkeypatch.setattr(r2,'verify_object',lambda receiver,client,receipt,out,**k:out.write(b'synthetic-ciphertext'))
     fact=r2.encoded({'v':1,'status':'failed','error':code})
     def popen(*args,**kwargs):
         helpers.append(ExitedHelper(next(Path(config['directory']).glob('payload-*')),fact,False));return helpers[-1]

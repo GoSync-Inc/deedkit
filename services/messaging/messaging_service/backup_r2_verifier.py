@@ -537,6 +537,8 @@ class Docker:
         self.ends=time.monotonic()+timeout;self.disk_roots=[];self.reserve_bytes=0
         # The ranged GETs the last full stream needed (r2.verify_object); None until one completes.
         self.stream_resumes=None
+        # The ETag and length of the GET the last finished restore hashed (ANYM-641); None until one finishes.
+        self.stream_object=None
     def check_reserve(self):
         if any(shutil.disk_usage(path).free<self.reserve_bytes for path in self.disk_roots):
             raise ValueError('restore_disk_capacity')
@@ -620,7 +622,7 @@ class Docker:
                      '-i','--entrypoint','python',config['helper_image'],'-m','messaging_service.backup_restore_worker',
                      '--config','/run/restore/config.json')
     def restore(self,config,receiver,client,receipt,run,payload,secret_dir):
-        self.stream_resumes=None
+        self.stream_resumes=None;self.stream_object=None;stream={}
         self.setup(config,run,payload,secret_dir);resource=names(run,r2.profile(config))
         helper=self.inspect_owned('helper',resource['helper'],run)
         validate_helper_layout(config,run,payload,secret_dir,helper)
@@ -635,7 +637,7 @@ class Docker:
                     engine.check_reserve();return process.stdin.write(data)
             # A helper that exits mid-stream breaks the pipe: stop streaming (never
             # retried), wait for it within the deadline and report its own failure.
-            try:self.stream_resumes=r2.verify_object(receiver,client,receipt,Sink());broken=False
+            try:self.stream_resumes=r2.verify_object(receiver,client,receipt,Sink(),stream=stream);broken=False
             except BrokenPipeError:broken=True
             try:process.stdin.close()
             except BrokenPipeError:broken=True
@@ -653,7 +655,9 @@ class Docker:
                 except subprocess.TimeoutExpired:process.kill();process.wait(timeout=10)
         # Only facts from the helper payload are read here. Root proof is written
         # to a different path after full ciphertext hashing and successful exit.
-        return r2.unique_json(private_file(payload/'result.json',16384))
+        facts=r2.unique_json(private_file(payload/'result.json',16384))
+        self.stream_object=stream or None
+        return facts
 
 
 # The calendar helper's failure per V2 check (ANYM-606), and a bundle of the other profile.
@@ -973,6 +977,16 @@ def request_rebaseline(config,reason):
     return {'v':1,'status':'rebaseline_requested','reason':reason}
 
 
+def write_binding(fd,proof_name,proof,stream):
+    """The hashed GET's identity beside its proof (ANYM-641), written only after the hash and the restore passed. In the
+    proof's own root directory: the receiver's state refuses unknown names. Losing it costs promotion one full GET, never
+    the run; the deadline and a service stop still end the run."""
+    if not stream:return
+    try:local.write_maintenance_json(r2.binding_name(proof_name),r2.binding_value(proof,stream),dir_fd=fd)
+    except Exception as error:
+        if r2.signalled(error) is not None:raise
+
+
 def verify_run(config,receiver,client,engine,journal,fd):
     run=journal['run'];directory=Path(config['directory']);payload=directory/('payload-'+run);secret_dir=directory/('secrets-'+run)
     data=data_directory(config,run)
@@ -994,6 +1008,7 @@ def verify_run(config,receiver,client,engine,journal,fd):
     if r2.profile(config)=='recordings':check_continuity(payload,run,facts,journal,fd)
     proof_name='proof-'+run+'.json'
     local.write_maintenance_json(proof_name,proof,dir_fd=fd)
+    write_binding(fd,proof_name,proof,getattr(engine,'stream_object',None))
     journal={**journal,'phase':'proof_ready'};local.write_maintenance_json('active.json',journal,dir_fd=fd)
     return journal
 
@@ -1062,8 +1077,8 @@ def confirm_candidate(receiver,client,journal):
 
 
 def promote_proof(receiver,config,client,journal):
-    # Existing maintenance takes the same upload lock and independently
-    # rechecks full ciphertext, immutable receipts and root marker CAS.
+    # Existing maintenance takes the same upload lock and independently rechecks immutable
+    # receipts, root marker CAS and the object: its binding to this proof, else the full ciphertext.
     proof_path=Path(config['directory'])/('proof-'+journal['run']+'.json')
     if journal['prior_sha256'] is None:
         r2.protect(receiver,config['protected_file'],proof_path,client=client)
