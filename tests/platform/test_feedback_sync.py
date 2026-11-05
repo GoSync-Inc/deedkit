@@ -452,7 +452,7 @@ def github(merged=(), others=(), fail=None):
                 if ref in body]
         if state == 'all':
             rows += [{'number': n, 'body': body, 'state': kind, 'mergeCommit': None} for kind, n, body in others if ref in body]
-            rows += [rows[0]] * (sync.PR_LIMIT if fail == 'truncated' and rows else 0)
+            rows += rows[:1] * (sync.PR_LIMIT if fail == 'truncated' else 0)
         return json.dumps(rows)
     return gh, calls
 
