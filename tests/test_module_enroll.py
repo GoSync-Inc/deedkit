@@ -136,6 +136,8 @@ class Enroller:
             self.verified_with = (argv, kwargs.get("env"), Path(argv[argv.index("--env-file") + 1]).read_text()
                                   if "--env-file" in argv else None)
             return self.verify_output
+        if argv[:2] == ["docker", "compose"] and "deedkit-env-probe" in argv:  # ANYM-773: names the file, not its value
+            return Path(argv[argv.index("-f") + 1]).read_text()
         if argv[:2] == ["docker", "compose"]:
             return self.compose(argv)
         if argv[:2] == ["docker", "ps"]:
@@ -966,6 +968,8 @@ class Applier(Enroller):
     def run(self, argv, **kwargs):
         if argv[0] == "docker":
             sub = argv[1]
+            if sub == "compose" and "config" in argv and any(str(item).endswith("gateway.pre-run.json") for item in argv):
+                return Path(argv[argv.index("-f") + 1]).read_text()  # ANYM-773: the read-back of the written snapshot
             if sub == "compose" and any(str(item).endswith("gateway.pre-run.json") for item in argv):
                 self.calls.append(argv)
                 self.event("restore")
@@ -1555,6 +1559,48 @@ def test_a_second_apply_refuses_until_the_first_is_undone_or_inspected(tmp_path,
     approved = host.plan()["plan_digest"]
     fail_at(host, "up")
     assert host.apply(approved)["refusals"][0]["code"] == "enrollment_unfinished"
+
+
+# spec: ANYM-773
+def test_enrollment_apply_and_undo_leave_no_env_file_value_in_any_file(tmp_path, monkeypatch):
+    canary = "synthetic-enroll-canary"
+    env = tmp_path / "gateway.env"
+    env.write_text(f"GATEWAY_CREDENTIAL={canary}\n")
+
+    class Host(Applier):
+        def snapshot(self, project, **kwargs):
+            document, running = super().snapshot(project, **kwargs)
+            document["services"]["gateway"]["environment"] = {"GATEWAY_CREDENTIAL": canary}
+            return document, running
+
+        def compose(self, argv):
+            document = json.loads(super().compose(argv))
+            if "--no-interpolate" in argv and "deedkit-gateway" in argv:
+                document["services"] = {"gateway": {"env_file": [{"path": str(env)}]}}
+            return json.dumps(document)
+
+        def run(self, argv, **kwargs):
+            if "config" in argv and any(str(item).endswith("gateway.pre-run.json") for item in argv):
+                document = json.loads(Path(argv[argv.index("-f") + 1]).read_text())
+                unit = document["services"]["gateway"]
+                unit.pop("env_file")
+                unit["environment"] = {"GATEWAY_CREDENTIAL": canary}
+                return json.dumps(document)
+            return super().run(argv, **kwargs)
+
+        def run_input(self, argv, data, **kwargs):
+            if "-" in argv and b"stub" in data:
+                return json.dumps({"services": {"stub": {"environment": {"GATEWAY_CREDENTIAL": canary}}}})
+            return super().run_input(argv, data, **kwargs)
+
+    host = Host(tmp_path, monkeypatch)
+    monkeypatch.setattr(p, "snapshot", host.snapshot)
+    assert host.apply()["status"] == "enrolled"
+    pre_run = json.loads(Path(host.receipt()["pre_run"]["file"]).read_text())
+    assert pre_run["services"]["gateway"]["env_file"] == [{"path": str(env)}]
+    assert host.undo()["status"] == "undone"
+    leaked = [path for path in tmp_path.rglob("*") if path.is_file() and path != env and canary.encode() in path.read_bytes()]
+    assert leaked == []
 
 
 # spec: ANYM-746

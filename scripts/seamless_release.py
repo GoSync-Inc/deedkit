@@ -350,6 +350,30 @@ def policy_mount(unit, settings):
         raise Refused('gateway policy must be the exact configured read-only bind mount')
 
 
+def with_env_references(settings, document, documents, release, generation):
+    """The isolated `document` as it may be written (ANYM-773): each service names the env files of its source service
+    in plan A's written file and drops the keys they provide, unless isolation changed that key's value."""
+    written = copy.deepcopy(document)
+    for role in ('api', 'gateway'):
+        selection = settings['http_release'][role]
+        project = next(item for item in settings['projects'] if item['name'] == selection['project'])
+        resolved = documents[selection['project']]['services'][selection['service']]
+        origin = p.read(Path(release) / (selection['project'] + '.json'))['services'][selection['service']]
+        printed = p.reference_entries(origin.get('env_file'))
+        references = [{**entry, 'path': entry['path'].replace('$$', '$')} for entry in printed]
+        name = 'http-' + role + '-' + generation
+        unit = written['services'][name]
+        literal = set(origin.get('environment') or {})
+        applied = p.applied_values(project, references, resolved, literal) if references else []
+        if references:
+            for key in set(resolved.get('environment') or {}) - literal:
+                if unit['environment'].get(key) == resolved['environment'][key]:
+                    del unit['environment'][key]
+            unit['env_file'] = printed
+        p.check_evidence(project, {'services': {name: unit}}, {'services': {name: origin}}, applied)
+    return written
+
+
 def isolate(settings, documents, images, release, generation, sha):
     result = {'name': 'deedkit-http-' + generation, 'services': {}, 'networks': {}, 'volumes': {}}
     private = {'controls': {}}
@@ -404,7 +428,8 @@ def isolate(settings, documents, images, release, generation, sha):
         if os.geteuid() == 0:
             os.chown(directory, 10001, 10001)
         private['controls'][role] = str(directory / 'control.sock')
-        unit.setdefault('volumes', []).append({'type': 'bind', 'source': str(directory), 'target': '/run/deedkit/release'})
+        # A raw path in a document Compose printed, so in its printed form (ANYM-773, `escaped_rendered`).
+        unit.setdefault('volumes', []).append({'type': 'bind', 'source': str(directory).replace('$', '$$'), 'target': '/run/deedkit/release'})
         environment = unit.get('environment') or {}
         if not isinstance(environment, dict):
             raise Refused('resolved Compose environment must be an object')
@@ -499,7 +524,7 @@ def prepare(settings, sha):
     documents = {name: json.loads(p.run(['docker', 'compose', '--profile', '*', '-f', str(release / (name + '.json')), 'config', '--format', 'json'])) for name in documents}
     document, private = isolate(settings, documents, original['images'], release, generation, sha)
     compose = release / 'http.json'
-    p.write(compose, p.escaped(document))
+    p.write(compose, p.escaped_rendered(with_env_references(settings, document, documents, release, generation)))
     if json.loads(p.run(['docker', 'compose', '--profile', '*', '-f', str(compose), 'config', '--format', 'json'])) != document:
         raise Refused('isolated HTTP Compose snapshot did not round-trip exactly')
     receipt = {'version': 1, 'sha': sha, 'generation': generation, 'config_digest': p.digest(settings),
