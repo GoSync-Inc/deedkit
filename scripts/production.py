@@ -2225,16 +2225,19 @@ def configured_runner(settings):
 
 def pinned_id(path, pinned):
     """The image ID a runner configuration's `image` names now: its own value, or what a tag or reference resolves to.
-    None when a reference resolves to no image: nothing on this host is left to protect."""
+    None only when Docker says no such image: nothing on this host is left to protect. A lookup that failed otherwise says
+    nothing about the image, so it refuses."""
     image = pinned.get("image") if isinstance(pinned, dict) else None
     if not isinstance(image, str):
         raise Refused(f"{path} names no backup image; no image is removed")
     if IMAGE_DIGEST.fullmatch(image):
         return image
     try:
-        found = run(["docker", "image", "inspect", "--format", "{{.Id}}", image], timeout=60).strip()
-    except Refused:
-        return None
+        found = run(["docker", "image", "inspect", "--format", "{{.Id}}", image], timeout=60, reason=True).strip()
+    except Refused as exc:
+        if "no such image" in str(exc).lower():
+            return None
+        raise Refused(f"the image {path} pins could not be looked up; no image is removed") from exc
     if not IMAGE_DIGEST.fullmatch(found):
         raise Refused(f"the image {path} pins has no immutable ID; no image is removed")
     return found

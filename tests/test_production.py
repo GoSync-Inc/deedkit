@@ -2454,10 +2454,15 @@ def test_an_undo_copy_pinned_by_tag_keeps_its_image_and_one_with_no_image_left_h
     path = pin(runners / "messaging" / "runner.json", image_id("a"))
     tag = "deedkit-production-backup:" + "c" * 40
     copied = pin(path.with_name("runner.json.before-" + "1" * 40), tag)
-    pin(path.with_name("runner.json.before-" + "2" * 40), "deedkit-production-backup:" + "e" * 40)
+    gone = "deedkit-production-backup:" + "e" * 40
+    pin(path.with_name("runner.json.before-" + "2" * 40), gone)
     images = Images(monkeypatch, [backup("a"), backup("b"), backup("c"), backup("d")])
     real = images.run
-    monkeypatch.setattr(p, "run", lambda argv, **kw: image_id("c") + "\n" if argv[-1] == tag else real(argv, **kw))
+    def run(argv, **kwargs):
+        if argv[-1] == gone:
+            raise images.refused(f"No such image: {gone}")
+        return image_id("c") + "\n" if argv[-1] == tag else real(argv, **kwargs)
+    monkeypatch.setattr(p, "run", run)
     report = p.images_report(settings)
     assert {item["image"]: item["reasons"] for item in report["keep"]}[image_id("c")] == [f"pinned by the undo copy {copied}"]
     assert [item["image"] for item in report["candidates"]] == [image_id("d")]
@@ -2510,8 +2515,8 @@ def test_the_rollback_guard_covers_each_worker_and_passes_once_they_run_the_serv
 
 # spec: ANYM-525
 @pytest.mark.parametrize("case", ["broken-json", "not-an-object", "no-image", "image-not-a-string", "unresolved-tag",
-                                  "broken-undo-copy", "undo-copy-with-no-image", "configured-missing",
-                                  "configured-not-a-path", "installed-runner-without-a-pin"])
+                                  "live-tag-gone", "broken-undo-copy", "undo-copy-with-no-image", "undo-tag-lookup-failed",
+                                  "configured-missing", "configured-not-a-path", "installed-runner-without-a-pin"])
 def test_removal_refuses_when_a_runner_pin_cannot_be_read(tmp_path, monkeypatch, case):
     configured = tmp_path / "ops" / "runner.json" if case.startswith("configured") else None
     settings, runners = workers_settings(tmp_path, monkeypatch, configured=configured)
@@ -2522,6 +2527,12 @@ def test_removal_refuses_when_a_runner_pin_cannot_be_read(tmp_path, monkeypatch,
     elif case == "undo-copy-with-no-image":
         pin(path, image_id("a"))
         path.with_name("runner.json.before-" + "1" * 40).write_text("{}")
+    elif case == "undo-tag-lookup-failed":
+        # The image is there and every other Docker read answers: this one failed, so nothing says it is gone.
+        pin(path, image_id("a"))
+        pin(path.with_name("runner.json.before-" + "1" * 40), "deedkit-production-backup:" + "c" * 40)
+    elif case == "live-tag-gone":
+        pin(path, "deedkit-production-backup:" + "e" * 40)
     elif case == "installed-runner-without-a-pin":
         p.BACKUP_RUNNER.parent.mkdir(parents=True)
         p.BACKUP_RUNNER.write_text("# synthetic runner\n")
@@ -2539,6 +2550,13 @@ def test_removal_refuses_when_a_runner_pin_cannot_be_read(tmp_path, monkeypatch,
         path.parent.mkdir(parents=True)
         path.write_text({"broken-json": "{", "not-an-object": "[]"}[case])
     images = Images(monkeypatch, [backup("a"), backup("b"), backup("c")])
+    if case == "live-tag-gone":
+        real = images.run
+        def run(argv, **kwargs):
+            if argv[-1] == "deedkit-production-backup:" + "e" * 40:
+                raise images.refused("No such image")
+            return real(argv, **kwargs)
+        monkeypatch.setattr(p, "run", run)
     with pytest.raises(p.Refused, match="no image is removed"):
         p.images_report(settings)
     with pytest.raises(p.Refused, match="no image is removed"):

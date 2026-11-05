@@ -2665,7 +2665,8 @@ CI-published targets are considered. Kept, with reasons:
   `runner.json.before-*` beside each, the undo of a move. Every copy counts, because `cp -p`
   keeps an old time and so no time tells the last move; delete an old copy to let its image
   go. A pin must be read: a `runner.json` or copy that cannot be read or names no image,
-  a `runner.json` pin by tag that resolves to no image, a named `runner_config` that is
+  a pin by tag whose lookup fails (for a `runner.json`, also one Docker answers with no such
+  image; a copy in that state has no image left to keep), a named `runner_config` that is
   missing, or an installed runner with no `runner.json` at all refuses, and nothing is
   removed. A release only reports that refusal as its removal's `skipped`;
 - the image of every container, running or stopped; an image with any other
