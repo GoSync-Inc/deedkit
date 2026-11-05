@@ -92,8 +92,8 @@ The unattended entry point `python -m messaging_service migrate-expand --plan <f
 is unchanged) runs only files whose `unattended_class` is `expand` (ANYM-743): a file with a rollout header
 whose `risk_class` is non-critical (no statement that deletes or rewrites rows or drops stored data, production.md
 "Migration risk tiers"), with no `CONCURRENTLY` and no name over 63 bytes; the deployer's rehearsal on a copy then
-refuses a removed table or column, a changed column type, a new NOT NULL column without a default, any row
-write and any changed row count. Role files may only grow: `role_class` calls the
+refuses a removed table or column, a changed column type, a new NOT NULL column without a default, a moved
+write counter and a changed row count or column number. Role files may only grow: `role_class` calls the
 appended text `additive` when the file still starts with its old text byte for byte and every appended
 statement is a comment, a `GRANT <SELECT|INSERT|UPDATE|DELETE|REFERENCES>[(<columns>)], ... ON [TABLE]
 <table>, ... TO <role>` to a role the old text already grants to, or 050's permissive `DO ... CREATE POLICY`

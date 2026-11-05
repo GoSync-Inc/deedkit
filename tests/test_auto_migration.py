@@ -830,7 +830,7 @@ def test_a_column_replaced_by_a_trigger_an_insert_fires_is_critical_and_the_rehe
     calendar = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(calendar)
     for module in (rollout, calendar):
-        assert module.risk_class(REPLACING) == ("critical", 7, "FUNCTION CALL")
+        assert module.risk_class(REPLACING) == ("critical", 2, "WRITING FUNCTION")
         assert module.unattended_class(REPLACING) == "manual"
     psql(source_db, "ALTER TABLE messages ADD COLUMN synthetic_keep text; SELECT pg_stat_force_next_flush();")
     before = data(source_db)

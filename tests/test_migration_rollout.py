@@ -631,26 +631,79 @@ CRITICAL_FORMS = {
     'bare-alter': ('ALTER;', 'unparsed'),
     'bare-set': ('ALTER TABLE messages SET;', 'unparsed'),
     'bare-create': ('CREATE TABLE;', 'unparsed'),
-    # Sol r2 F1: an INSERT fires a trigger or rule the file creates; a created function shadows a DO_CALLS name.
-    'trigger-on-insert': ('CREATE FUNCTION synthetic_wipe() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN '
-                          'ALTER TABLE messages DROP COLUMN body; RETURN NEW; END; $f$; CREATE TABLE synthetic_fire '
-                          '(id integer); CREATE TRIGGER synthetic_fire BEFORE INSERT ON synthetic_fire FOR EACH ROW '
-                          'EXECUTE FUNCTION synthetic_wipe(); INSERT INTO synthetic_fire VALUES (1);', 'FUNCTION CALL'),
-    'rule-on-insert': ('CREATE TABLE synthetic_fire (id integer); CREATE RULE synthetic_r AS ON INSERT TO '
-                       'synthetic_fire DO INSTEAD DELETE FROM messages; INSERT INTO synthetic_fire VALUES (1);',
-                       'FUNCTION CALL'),
+    # Sol r2 F1: an INSERT fires a function the file creates or replaces; a created function shadows a DO_CALLS name.
     'replaced-function-on-insert': ("CREATE OR REPLACE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
                                     "RETURN NEW; END $$; INSERT INTO messages (id) VALUES ('x');", 'FUNCTION CALL'),
     'shadowed-do-call': ('CREATE FUNCTION to_regclass(integer) RETURNS regclass LANGUAGE plpgsql AS $f$ BEGIN '
-                         'TRUNCATE messages; RETURN NULL; END; $f$; DO $b$ BEGIN IF to_regclass(1) IS NULL THEN NULL; '
-                         'END IF; END; $b$;', 'FUNCTION CALL'),
-    # Sol r2 F5: an incomplete ALTER TABLE action.
+                         'RETURN NULL; END; $f$; DO $b$ BEGIN IF to_regclass(1) IS NULL THEN NULL; END IF; END; $b$;',
+                         'FUNCTION CALL'),
+    # Sol r3 F1: the runner's own ledger INSERT and UPDATE fire what a file creates, with no INSERT in the file.
+    'ledger-trigger-file': ("CREATE FUNCTION synthetic_wipe() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN DROP TABLE "
+                            "synthetic_existing; CREATE TABLE synthetic_existing (body text); INSERT INTO "
+                            "synthetic_existing VALUES ('erased'); RETURN NEW; END; $f$; CREATE TRIGGER synthetic_fire "
+                            "BEFORE INSERT ON archive_migrations FOR EACH ROW EXECUTE FUNCTION synthetic_wipe();",
+                            'WRITING FUNCTION'),
+    'trigger': ('CREATE TRIGGER synthetic_fire BEFORE INSERT ON archive_migrations FOR EACH ROW EXECUTE FUNCTION '
+                'synthetic_read();', 'CREATE TRIGGER'),
+    'constraint-trigger': ('CREATE CONSTRAINT TRIGGER synthetic_fire AFTER INSERT ON archive_migrations FOR EACH ROW '
+                           'EXECUTE FUNCTION synthetic_read();', 'CREATE TRIGGER'),
+    'replaced-trigger': ('CREATE OR REPLACE TRIGGER synthetic_fire BEFORE UPDATE ON probe_metadata FOR EACH ROW EXECUTE '
+                         'FUNCTION synthetic_read();', 'CREATE TRIGGER'),
+    'event-trigger': ('CREATE EVENT TRIGGER synthetic_fire ON ddl_command_end EXECUTE FUNCTION synthetic_read();',
+                      'CREATE TRIGGER'),
+    'rule': ('CREATE RULE synthetic_r AS ON INSERT TO archive_migrations DO ALSO NOTIFY synthetic;', 'CREATE RULE'),
+    'do-select-rule': ('DO $$ BEGIN CREATE RULE synthetic_r AS ON SELECT TO synthetic_v DO ALSO NOTIFY x; END $$;', 'DO'),
+    'do-function': ('DO $$ BEGIN CREATE FUNCTION synthetic_f() RETURNS int LANGUAGE sql AS $f$ SELECT 1 $f$; END $$;',
+                    'DO'),
+    # Routes the trigger rule leaves open: a function that writes is critical however it would run.
+    'renamed-function-default': ("CREATE FUNCTION synthetic_a() RETURNS int LANGUAGE plpgsql AS $f$ BEGIN TRUNCATE "
+                                 "messages; RETURN 1; END; $f$; ALTER FUNCTION synthetic_a() RENAME TO synthetic_b; "
+                                 "ALTER TABLE archive_migrations ADD COLUMN x int DEFAULT synthetic_b();",
+                                 'WRITING FUNCTION'),
+    'function-in-a-string': ("CREATE FUNCTION synthetic_wipe() RETURNS int LANGUAGE plpgsql AS $f$ BEGIN DROP TABLE "
+                             "messages; RETURN 1; END; $f$; ALTER TABLE archive_migrations ADD COLUMN x xml DEFAULT "
+                             "query_to_xml('SELECT synthetic_wipe()', false, true, '');", 'WRITING FUNCTION'),
+    'function-in-a-table-as': ("CREATE FUNCTION synthetic_wipe() RETURNS int LANGUAGE sql AS $f$ DELETE FROM messages "
+                               "RETURNING 1 $f$; CREATE TABLE synthetic_t AS SELECT query_to_xml('SELECT ' || "
+                               "'synthetic_wipe()', false, true, '');", 'WRITING FUNCTION'),
+    'function-body-in-a-string': ("CREATE FUNCTION synthetic_f() RETURNS void LANGUAGE sql AS 'SELECT 1';",
+                                  'WRITING FUNCTION'),
+    'function-body-in-escapes': (r"CREATE FUNCTION synthetic_f() RETURNS void LANGUAGE sql AS E'\x44ELETE FROM messages';",
+                                 'WRITING FUNCTION'),
+    'function-nested-quote': ('CREATE FUNCTION synthetic_f() RETURNS void LANGUAGE plpgsql AS $a$ BEGIN PERFORM $b$ DROP '
+                              'TABLE messages $b$; END; $a$;', 'WRITING FUNCTION'),
+    'function-other-language': ("CREATE FUNCTION synthetic_f() RETURNS void LANGUAGE internal AS $$ synthetic $$;",
+                                'WRITING FUNCTION'),
+    'function-no-language': ('CREATE FUNCTION synthetic_f() RETURNS int RETURN 1;', 'WRITING FUNCTION'),
+    'procedure-writes': ('CREATE PROCEDURE synthetic_p() LANGUAGE sql AS $$ UPDATE messages SET body = $s$x$s$ $$;',
+                         'WRITING FUNCTION'),
+    'alter-function': ('ALTER FUNCTION synthetic_a() RENAME TO synthetic_b;', 'ALTER other'),
+    'alter-other-kinds': ('ALTER ROLE messaging SUPERUSER;', 'ALTER other'),
+    # Sol r2 and r3 F5: an ALTER TABLE action is non-critical only as a complete form the classifier names.
     'add-column-no-name': ('ALTER TABLE messages ADD COLUMN;', 'unparsed'),
     'add-column-no-type': ('ALTER TABLE messages ADD COLUMN x;', 'unparsed'),
+    'add-column-open-bracket': ('ALTER TABLE messages ADD COLUMN x int CHECK (x > 0;', 'unparsed'),
+    'add-constraint-no-form': ('ALTER TABLE messages ADD CONSTRAINT k;', 'unparsed'),
+    'add-check-no-form': ('ALTER TABLE messages ADD CHECK;', 'unparsed'),
     'alter-column-no-action': ('ALTER TABLE messages ALTER COLUMN body;', 'unparsed'),
+    'alter-column-set-unknown': ('ALTER TABLE messages ALTER COLUMN body SET foo;', 'unparsed'),
+    'alter-column-storage': ('ALTER TABLE messages ALTER COLUMN body SET STORAGE EXTERNAL;', 'unparsed'),
+    'alter-column-default-empty': ('ALTER TABLE messages ALTER COLUMN body SET DEFAULT;', 'unparsed'),
+    'alter-constraint': ('ALTER TABLE messages ALTER CONSTRAINT k DEFERRABLE;', 'unparsed'),
+    'validate-no-name': ('ALTER TABLE messages VALIDATE CONSTRAINT;', 'unparsed'),
     'set-unknown': ('ALTER TABLE messages SET foo;', 'unparsed'),
+    'set-open-bracket': ('ALTER TABLE messages SET (;', 'unparsed'),
+    'set-options': ('ALTER TABLE messages SET (fillfactor = 70);', 'unparsed'),
+    'set-unlogged': ('ALTER TABLE messages SET UNLOGGED;', 'unparsed'),
     'rename-no-target': ('ALTER TABLE messages RENAME;', 'unparsed'),
+    'rename-to-no-target': ('ALTER TABLE messages RENAME TO;', 'unparsed'),
+    'rename-table': ('ALTER TABLE messages RENAME TO messages_v2;', 'unparsed'),
+    'rename-column': ('ALTER TABLE messages RENAME COLUMN body TO text_body;', 'unparsed'),
     'owner-no-to': ('ALTER TABLE messages OWNER x;', 'unparsed'),
+    'owner-to-no-target': ('ALTER TABLE messages OWNER TO;', 'unparsed'),
+    'disable-trigger': ('ALTER TABLE messages DISABLE TRIGGER ALL;', 'unparsed'),
+    'detach-partition': ('ALTER TABLE messages DETACH PARTITION synthetic_old;', 'unparsed'),
+    'no-inherit': ('ALTER TABLE messages NO INHERIT synthetic_parent;', 'unparsed'),
 }
 
 
@@ -670,10 +723,11 @@ NON_CRITICAL_FORMS = {
     'drop-index': 'DROP INDEX IF EXISTS messages_body;',
     'drop-constraint': 'ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_kind_check;',
     'drop-default': 'ALTER TABLE messages ALTER COLUMN body DROP DEFAULT, ALTER COLUMN body DROP NOT NULL;',
-    'rename': 'ALTER TABLE messages RENAME COLUMN body TO text_body;',
-    'function-and-trigger': "CREATE OR REPLACE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
-                            "DELETE FROM x; RETURN NEW; END $$; CREATE TRIGGER touch BEFORE UPDATE ON messages FOR "
-                            "EACH ROW EXECUTE FUNCTION touch();",
+    'function-that-reads': "CREATE OR REPLACE FUNCTION synthetic_f() RETURNS int LANGUAGE plpgsql AS $$ BEGIN "
+                           "RETURN (SELECT count(*) FROM messages); END $$;",
+    'function-plpgsql-syntax': "CREATE FUNCTION synthetic_g(p integer) RETURNS integer LANGUAGE plpgsql SET search_path="
+                               "pg_catalog AS $f$ DECLARE t integer[] := ARRAY[1, 2]; n integer := $1; BEGIN FOR i IN "
+                               "1..2 LOOP n := n + t[1:2][1]::integer; END LOOP; RETURN n; END; $f$;",
     'grant-revoke': 'GRANT SELECT, UPDATE, DELETE ON messages TO messaging_gateway; REVOKE ALL ON messages FROM public;',
     'do-grant': "DO $$ BEGIN IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'messaging_gateway') THEN GRANT SELECT, "
                 "INSERT, UPDATE, DELETE ON messages TO messaging_gateway; END IF; END $$;",
@@ -681,8 +735,9 @@ NON_CRITICAL_FORMS = {
     'comment': "COMMENT ON SCHEMA public IS 'synthetic';",
     'precondition': ALLOWED['precondition'],
     'complete-actions': 'ALTER TABLE messages ADD COLUMN IF NOT EXISTS x int, ALTER COLUMN body SET NOT NULL, '
-                        'SET (fillfactor = 70), ADD CONSTRAINT k CHECK (x > 0) NOT VALID, OWNER TO messaging; '
-                        'ALTER TABLE messages ENABLE ROW LEVEL SECURITY; ALTER TABLE messages RENAME TO messages_v2;',
+                        "ALTER body SET DEFAULT 'y', ADD CONSTRAINT k CHECK (x > 0) NOT VALID, ADD UNIQUE (x), "
+                        'VALIDATE CONSTRAINT j, DROP CONSTRAINT l RESTRICT; '
+                        'ALTER TABLE messages ENABLE ROW LEVEL SECURITY; ALTER TABLE messages FORCE ROW LEVEL SECURITY;',
     'new-table-insert':'CREATE TABLE synthetic_t (id int); INSERT INTO synthetic_t VALUES (1);',
 }
 
@@ -754,6 +809,14 @@ def test_most_applied_migrations_are_non_critical():
                                  (CLASSIFIERS['calendar'], folder.glob('schema_v[0-9]*.sql'), 7)):
         tiers = [module.risk_class(path.read_text())[0] for path in paths]
         assert len(tiers) >= least and tiers.count('non-critical') > len(tiers) / 2
+
+
+# spec: ANYM-743
+def test_a_read_only_replaced_function_and_the_incident_widening_stay_non_critical_while_a_trigger_file_does_not():
+    # 067 is the incident of this card; 063 and 065 replace long read-only PL/pgSQL functions; 026 creates a trigger.
+    tier = {number: rollout.risk_class(source(MIGRATIONS[number]))[0] for number in (26, 63, 65, 67)}
+    assert tier == {26: 'critical', 63: 'non-critical', 65: 'non-critical', 67: 'non-critical'}
+    assert rollout.risk_class(source(MIGRATIONS[26]))[2] == 'CREATE TRIGGER'
 
 
 # 038 holds the widening pair too, but its partial unique index already makes it manual for `classify`.

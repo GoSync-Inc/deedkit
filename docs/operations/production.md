@@ -620,14 +620,21 @@ highest-tier pending migration file, changed role file or step.
   DO UPDATE; DROP TABLE, COLUMN, SCHEMA or MATERIALIZED VIEW; a DROP ... CASCADE whose dependents include
   a table, a column or anything the author cannot list; ALTER COLUMN ... TYPE or SET EXPRESSION that
   rewrites the table or converts stored values (a binary-coercible change without a rewrite, such as
-  `varchar(n)` to `text`, is not); the same inside a `DO` block, a function the migration calls or a
-  trigger that fires during it (computed: an INSERT in a file that creates or replaces a function, trigger
-  or rule, and a call of a function the file creates); a data-deleting step (item 2); and a statement
-  whose effect on existing rows the author cannot name.
-- Non-critical: everything else. For example new tables, columns and indexes; constraints and CHECK
-  changes, `NOT VALID` included (a failing one aborts its own transaction and loses nothing); DROP
-  CONSTRAINT, INDEX, DEFAULT or NOT NULL; RENAME; functions, triggers and comments (with no INSERT in the
-  file); grants, REVOKE and role changes; a `DO` block that only grants, revokes or checks a precondition.
+  `varchar(n)` to `text`, is not); the same inside a `DO` block or a function the file creates or replaces.
+  Computed: a function or procedure whose body writes rows other than by INSERT, changes the schema or runs
+  text as SQL (a word of `FUNCTION_WRITES`), in a language other than SQL or PL/pgSQL, or with its text
+  outside a dollar quote; any trigger, event trigger or rule (the runner's own ledger INSERT and UPDATE fire
+  one); an INSERT in a file that creates or replaces a function; a call of a function the file creates; any
+  ALTER other than ALTER TABLE, and any ALTER TABLE action outside the complete forms below. Also a
+  data-deleting step (item 2) and a statement whose effect on existing rows the author cannot name.
+- Non-critical: only these forms. CREATE of a table, index, sequence, view, materialized view, type, domain,
+  policy, schema, role, aggregate, statistics or cast; a function or procedure the rule above lets through.
+  ALTER TABLE: ADD COLUMN; ADD a CHECK, UNIQUE, PRIMARY KEY, FOREIGN KEY or EXCLUDE constraint, `NOT VALID`
+  included (a failing one aborts its own transaction and loses nothing); VALIDATE CONSTRAINT; DROP CONSTRAINT;
+  ALTER COLUMN SET or DROP DEFAULT and SET or DROP NOT NULL; ENABLE or FORCE ROW LEVEL SECURITY. DROP without
+  CASCADE of an index, function, procedure, policy, view, type, domain, aggregate, statistics, cast or role;
+  a plain INSERT; comments, ANALYZE and `SET LOCAL`; grants and REVOKE; a `DO` block that only grants, revokes
+  or checks a precondition.
 
 The tier decides the backup, the copy and the plan review only. Expand, then contract
 (`.claude/rules/migrations.md`) still keeps a DROP, RENAME or narrowing out of a release whose running
@@ -636,7 +643,10 @@ order stay. The tier is computed from the file (ANYM-743): `risk_class` in the c
 `migration_rollout.py` (the calendar copy for `schema_vN.sql`) names a statement non-critical only in
 the forms listed above and everything else, text it cannot tokenize included, critical; the deploy pause
 and `deploy --dry-run` print it per added file (`069_x.sql manual critical: line 12 DELETE`; a file whose
-classifier failed reads `manual` with no tier: treat it as critical). A `-- Risk tier:` header is a note
+classifier failed reads `manual` with no tier: treat it as critical). It reads statements, not what an
+expression calls: a DEFAULT, CHECK or `CREATE TABLE AS` may call a function that already exists. The rehearsal
+sees what such a call does on the copy (a moved write counter, row count or column number); a call that first
+runs after the release is seen by neither. A `-- Risk tier:` header is a note
 for the reviewer and cannot lower the computed tier; to take a critical statement out of a release,
 split it into its own file. Until
 ANYM-675 ships, the deployer still copies before every unattended range, because its rehearsal runs on

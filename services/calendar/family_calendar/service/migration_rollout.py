@@ -622,7 +622,8 @@ CRITICAL_FIRST = {
     "perform": "PERFORM",
     "execute": "EXECUTE",
 }
-# CREATE [OR REPLACE] [UNIQUE] <kind>: new objects; a function or trigger body is defined, not run.
+# CREATE [OR REPLACE] [UNIQUE] <kind>: new objects. A trigger, event trigger or rule is critical: the runner's own ledger
+# INSERT and UPDATE fire one, with no statement of the file to read (Sol r3 F1). A function: `function_writes`.
 CREATED = {
     "table",
     "index",
@@ -630,9 +631,6 @@ CREATED = {
     "sequence",
     "view",
     "materialized",
-    "function",
-    "procedure",
-    "trigger",
     "constraint",
     "type",
     "domain",
@@ -640,7 +638,6 @@ CREATED = {
     "schema",
     "role",
     "aggregate",
-    "rule",
     "statistics",
     "cast",
 }
@@ -676,7 +673,17 @@ DO_FORBIDDEN = {
     "alter",
     "loop",
     "declare",
+    "trigger",
+    "rule",
+    "function",
+    "procedure",
 }
+# Words of a function or procedure that writes existing rows, changes the schema or runs text as SQL. A file with one is
+# critical however it would run: a trigger, a default, a renamed alias or `query_to_xml('SELECT f()')` (Sol r3 F1).
+FUNCTION_WRITES = {"delete", "update", "merge", "truncate", "drop", "alter", "create", "execute", "copy", "call"}
+FUNCTION_LANGUAGES = {("word", "sql"), ("word", "plpgsql"), ("string", "sql"), ("string", "plpgsql")}
+# In a body and not in `tokens`: PL/pgSQL's assignment, a slice's colon, a parameter and a range. A space never joins two words.
+BODY_ONLY = re.compile(r":=|(?<!:):(?!:)|\$[0-9]+|\.\.")
 # In a DO body a word before `(` is a call unless it is one of these (a function can write, Astra r1 F1).
 DO_CALLS = {
     "exists",
@@ -702,14 +709,17 @@ RISK_KINDS = frozenset(
         "DO",
         "SET",
         "CREATE EXTENSION",
+        "CREATE TRIGGER",
+        "CREATE RULE",
         "CREATE other",
         *(f"DROP {kind.upper()}" for kind in DROP_KINDS),
         "DROP other",
         "DROP CASCADE",
         "DROP COLUMN",
         "ALTER COLUMN TYPE",
-        "ALTER CASCADE",
+        "ALTER other",
         "FUNCTION CALL",
+        "WRITING FUNCTION",
         "other statement",
         "unparsed",
         "untokenizable",
@@ -751,7 +761,9 @@ def do_body_critical(body):
                 return True
             granting = word in ("grant", "revoke")
         # A privilege of a GRANT or REVOKE is no write.
-        if word in DO_FORBIDDEN and not (granting and word in ("delete", "update", "insert", "truncate")):
+        if word in DO_FORBIDDEN and not (
+            granting and word in ("delete", "update", "insert", "truncate", "trigger", "function", "procedure")
+        ):
             return True
         if (kind, value) == ("punct", ";"):
             start, granting = True, False
@@ -760,80 +772,81 @@ def do_body_critical(body):
     return False
 
 
-# The ALTER TABLE actions; another first word (a name left by an unknown schema qualifier) is critical.
-TABLE_ACTIONS = {
-    "add",
-    "drop",
-    "alter",
-    "rename",
-    "validate",
-    "enable",
-    "disable",
-    "owner",
-    "set",
-    "reset",
-    "replica",
-    "cluster",
-    "inherit",
-    "no",
-    "attach",
-    "detach",
-    "force",
-    "of",
-    "not",
-}
+def function_writes(statement):
+    """True unless `statement`, a CREATE FUNCTION or PROCEDURE, is in SQL or PL/pgSQL, keeps its text in a dollar quote
+    (another quote can hide a word in escapes) and holds no word of FUNCTION_WRITES, nested dollar quotes included."""
+    after = [statement[at + 1] for at in range(len(statement) - 1) if statement[at] == ("word", "language")]
+    if not after or set(after) - FUNCTION_LANGUAGES:
+        return True
+    if any(
+        item == ("word", "as") and statement[at + 1 : at + 2] != [] and statement[at + 1][0] != "dollar"
+        for at, item in enumerate(statement)
+    ):
+        return True
+    pending = statement[1:]
+    while pending:
+        kind, value = pending.pop()
+        if kind == "word" and value in FUNCTION_WRITES:
+            return True
+        if kind == "dollar":
+            pending.extend(tokens(BODY_ONLY.sub(" ", value)))
+    return False
 
 
-# The fewest tokens a complete form of an action has (`ENABLE TRIGGER t`, `FORCE ROW LEVEL SECURITY`); another needs 2.
-ACTION_TOKENS = {
-    "enable": 3,
-    "disable": 3,
-    "validate": 3,
-    "replica": 3,
-    "cluster": 3,
-    "no": 3,
-    "attach": 3,
-    "detach": 3,
-    "force": 4,
-}
-# What follows ALTER [COLUMN] c, and what follows a table's SET (Sol r2 F5: an incomplete form is unparsed).
-COLUMN_ACTIONS = ("type", "set", "drop", "reset", "add", "restart", "options")
-TABLE_SETS = ("schema", "tablespace", "logged", "unlogged", "without", "access")
+TABLE_CONSTRAINTS = ("check", "unique", "primary", "foreign", "exclude")
 
 
 def table_action(part):
-    """The critical kind of one ALTER TABLE action, or None; `unparsed` for an incomplete form."""
-    c = Cursor(part)
-    action = c.word(*TABLE_ACTIONS)
-    if action is None or len(part) < ACTION_TOKENS.get(action, 2):
+    """The critical kind of one ALTER TABLE action, or None. Fail-closed (Sol r3 F5): None only for a complete form named
+    here, which keeps every stored value (production.md "Migration risk tiers"); any other action is `unparsed`."""
+    c, depth = Cursor(part), 0
+    for kind, value in part:
+        if kind == "punct" and value in "([":
+            depth += 1
+        elif kind == "punct" and value in ")]":
+            depth -= 1
+    if depth:
         return "unparsed"
-    if action == "drop":
+    if c.word("drop"):
         if ("word", "cascade") in part:
             return "DROP CASCADE"
-        return None if c.word("constraint") and not c.done() else "DROP COLUMN"
-    if action == "alter":
-        if c.word("constraint"):
-            return None if len(part) > 3 else "unparsed"
+        if not c.word("constraint"):
+            return "DROP COLUMN"
+        if c.word("if"):
+            c.expect("exists")
+        c.name()
+        c.word("restrict")
+        return None if c.done() else "unparsed"
+    if c.word("alter"):
         c.word("column")
         c.name()
-        sub = c.word(*COLUMN_ACTIONS)
-        if sub == "type" or sub == "set" and (c.word("data") and c.word("type") or c.word("expression")):
+        if c.word("type"):
             return "ALTER COLUMN TYPE"
-        return None if sub == "restart" or sub and not c.done() else "unparsed"
-    if action == "add":
-        c.word("column")
-        if c.word("if"):
-            c.expect("not")
-            c.expect("exists")
-        return None if len(part) - c.at >= 2 else "unparsed"
-    if action == "set":
-        if c.take("punct", "("):
-            return None
-        form = c.word(*TABLE_SETS)
-        return None if form in ("logged", "unlogged") or form and not c.done() else "unparsed"
-    if action in ("rename", "owner"):
-        return None if ("word", "to") in part else "unparsed"
-    return None
+        if c.word("set"):
+            if c.word("data", "expression"):
+                return "ALTER COLUMN TYPE"
+            if c.word("default"):
+                return None if not c.done() else "unparsed"
+            return None if c.word("not") and c.word("null") and c.done() else "unparsed"
+        complete = c.word("drop") and (c.word("default") or c.word("not") and c.word("null")) and c.done()
+        return None if complete else "unparsed"
+    if c.word("add"):
+        if c.word("constraint"):
+            c.name()
+        elif c.peek()[1] not in TABLE_CONSTRAINTS:
+            c.word("column")
+            if c.word("if"):
+                c.expect("not")
+                c.expect("exists")
+            c.name()
+            return None if not c.done() else "unparsed"
+        return None if c.word(*TABLE_CONSTRAINTS) and not c.done() else "unparsed"
+    if c.word("validate"):
+        c.expect("constraint")
+        c.name()
+        return None if c.done() else "unparsed"
+    complete = c.word("enable", "force") and c.word("row") and c.word("level") and c.word("security") and c.done()
+    return None if complete else "unparsed"
 
 
 def statement_risk(statement):
@@ -868,6 +881,12 @@ def statement_risk(statement):
         while c.word("temporary", "temp", "unlogged", "constraint", "recursive"):
             pass
         kind = c.peek()[1] if c.peek()[0] == "word" else None
+        if kind in ("trigger", "event"):
+            return "CREATE TRIGGER"
+        if kind == "rule":
+            return "CREATE RULE"
+        if kind in ("function", "procedure"):
+            return "WRITING FUNCTION" if function_writes(statement) else None
         return None if kind in CREATED else "CREATE EXTENSION" if kind == "extension" else "CREATE other"
     if first == "drop":
         kind = c.peek()[1] if c.peek()[0] == "word" else None
@@ -876,15 +895,13 @@ def statement_risk(statement):
         return None if kind in DROPPED else f"DROP {kind.upper()}" if kind in DROP_KINDS else "DROP other"
     if first == "alter":
         if not c.word("table"):
-            return "ALTER CASCADE" if ("word", "cascade") in statement else None
+            return "ALTER other"  # no applied file has one; a renamed function hides its calls
         if len(statement) < 4:
             return "unparsed"
         if c.word("if"):
             c.expect("exists")
         c.word("only")
         c.name()
-        if c.word("rename"):
-            return None if ("word", "to") in statement else "unparsed"
         if c.done():
             return "unparsed"
         for part in split(statement[c.at :]):
@@ -995,7 +1012,8 @@ def unattended_class(text, inventory=None, schema="fcs"):
     """What `migrate-expand` may run without a person (ANYM-743, was ANYM-596's DROP-free `expand`): a file with a
     rollout header whose `risk_class` is non-critical, that runs inside one transaction (no CONCURRENTLY) and names
     nothing longer than NAME_BYTES. The rehearsal on a copy then refuses a removed table or column, a changed column
-    type and any row write (production.py `destroys_data`, `calendar_data_unchanged`). `inventory` is kept for callers."""
+    type and a moved write counter, row count or column number (production.py `destroys_data`,
+    `calendar_data_unchanged`). `inventory` is kept for callers."""
     if header(text) is None or risk_class(text, schema)[0] != "non-critical":
         return "manual"
     parsed = statements(text, schema)

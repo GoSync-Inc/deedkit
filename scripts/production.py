@@ -2849,10 +2849,11 @@ print(json.dumps([named(text) for text in data["texts"]]))
 # The statement kinds `risk_class` names (migration_rollout.RISK_KINDS): an exact list, so a pause line carries no word
 # of a migration file (Astra r1 F2).
 RISK_KINDS = ("DELETE", "UPDATE", "MERGE", "TRUNCATE", "COPY", "SELECT", "CALL", "WITH", "PERFORM", "EXECUTE",
-              "INSERT ON CONFLICT DO UPDATE", "DO", "SET", "CREATE EXTENSION", "CREATE other", "DROP TABLE", "DROP SCHEMA",
-              "DROP SEQUENCE", "DROP MATERIALIZED", "DROP EXTENSION", "DROP OWNED", "DROP DATABASE", "DROP SERVER",
-              "DROP other", "DROP CASCADE", "DROP COLUMN", "ALTER COLUMN TYPE", "ALTER CASCADE", "FUNCTION CALL",
-              "other statement", "unparsed", "untokenizable")
+              "INSERT ON CONFLICT DO UPDATE", "DO", "SET", "CREATE EXTENSION", "CREATE TRIGGER", "CREATE RULE",
+              "CREATE other", "DROP TABLE", "DROP SCHEMA", "DROP SEQUENCE", "DROP MATERIALIZED", "DROP EXTENSION",
+              "DROP OWNED", "DROP DATABASE", "DROP SERVER", "DROP other", "DROP CASCADE", "DROP COLUMN",
+              "ALTER COLUMN TYPE", "ALTER other", "FUNCTION CALL", "WRITING FUNCTION", "other statement", "unparsed",
+              "untokenizable")
 NAMED_CLASS = re.compile(r"(?:expand|manual|no header)(?: non-critical| critical: line [0-9]{1,6} (?:"
                          + "|".join(map(re.escape, RISK_KINDS)) + "))?")
 
@@ -3360,8 +3361,8 @@ def destroys_data(before, after):
     catalog difference of the rehearsal that loses stored data or breaks the running release's writes, or None. That
     is a removed table, partitioned table, materialized view or column (a rename reads as one), a column whose type or
     generation expression changed, and a new NOT NULL column without a default on an existing table. Everything else
-    a non-critical file does (indexes, constraints, functions, triggers, views, policies, grants, defaults, roles)
-    passes; `data_unchanged` refuses any row write."""
+    a non-critical file does (indexes, constraints, functions, views, policies, grants, defaults, roles) passes;
+    `data_unchanged` refuses a moved write counter, row count or column number."""
     change = catalog_difference(before, after)
     for key in change["removed"]:
         if key[0] == "column" or key[0] == "relation" and (before[tuple(key)] or [None])[0] in ("r", "p", "m"):
