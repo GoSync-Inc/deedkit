@@ -50,8 +50,8 @@ production.md "Migration releases"; enabling a feature never includes send, call
 session or allowlist changes, and none of it runs during an active call.
 
 Releases and migrations follow harness process.md section 2 (owner 11-04: «давай все делать не ждать ничего»).
-production.md "Migration risk tiers" lists what deletes or rewrites user data (critical, which also
-takes a `copy-database`); "Migration releases" item 4 is the hand route.
+production.md "Migration risk tiers" lists what deletes or rewrites user data (critical);
+"Migration releases" item 4 is the hand route.
 
 Override: harness process.md sections 1–5 and reviews.md Rounds 7–8, incident recovery only
 (owner 10-30, Telegram sends: «это быстрый hotfix», «И только после этого уже продолжаем работу
@@ -59,8 +59,7 @@ Override: harness process.md sections 1–5 and reviews.md Rounds 7–8, inciden
 all other work. The agent immediately performs the smallest reversible recovery: restart the
 existing service/session, compatible rollback, or a service-only hotfix from verified green main
 through the promotion tool. This is standing authority; do not ask again for those actions.
-For recovery without schema/data changes, no fresh backup or restore drill is required; defer
-Tiden/card intake and independent review until recovery. Preserve CI, source/image checks, active-call checks,
+Defer Tiden/card intake and independent review until recovery. Preserve CI, source/image checks, active-call checks,
 state and session identity. No sends/replays, new auth, access changes or destructive actions are
 included. Enforcer: follow [incident recovery](docs/operations/incident-recovery.md), including
 before/after evidence and undo; complete deferred checks and process corrections before resuming
