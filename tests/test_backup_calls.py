@@ -584,8 +584,10 @@ def real_helper(tmp_path, age_stub, monkeypatch):
     os.chmod(staging, 0o777)
     os.chmod(tmp_path / 'data', 0o777)
     name = backup_runner.CALLS_HELPER + runner.journal['id'].lower()
-    def create(prefix=''):
+    def create(prefix='', keep=False):
         args = runner.helper_args(name, image, staging)
+        if keep:  # the one change: the container stays, so its OOMKilled state can be read
+            args.remove('--rm')
         args[args.index('-c') + 1] = prefix + args[args.index('-c') + 1]
         real = backup_runner.Docker()
         real.call(*args)
@@ -621,12 +623,14 @@ def test_in_the_real_container_a_writer_stays_within_the_bound_and_the_snapshot_
     real, name, staging, image = real_helper()
     stop, times, errors = threading.Event(), [], []
     capture, outcome = capture_running(real, name, staging, 300)
+    full_size = source.stat().st_size
     thread = threading.Thread(target=writer_loop, args=(source, stop, times, errors), kwargs={'limit': 40})
     thread.start()
     try:
         while not times and thread.is_alive():
             time.sleep(.005)
-        assert capture.is_alive() and (staging / 'voice.copy.sqlite3').exists(), 'the first commit must land during the copy'
+        # A finished online backup is at least the source's size; integrity check and vacuum come only after it.
+        assert capture.is_alive() and (staging / 'voice.copy.sqlite3').stat().st_size < full_size, 'the first commit must land during the copy'
         thread.join(timeout=60)
         capture.join(timeout=300)
     finally:
@@ -638,11 +642,14 @@ def test_in_the_real_container_a_writer_stays_within_the_bound_and_the_snapshot_
     os.chmod(source, 0o644)
     check = ('import sqlite3,sys;d=sqlite3.connect("file:/s/voice.sqlite3?mode=ro",uri=True);'
              'print(d.execute("PRAGMA integrity_check").fetchone()[0],'
-             'd.execute("SELECT COUNT(*) FROM voice_events").fetchone()[0]-d.execute("SELECT COUNT(*) FROM briefs").fetchone()[0])')
+             'd.execute("SELECT COUNT(*) FROM voice_events").fetchone()[0]-d.execute("SELECT COUNT(*) FROM briefs").fetchone()[0],'
+             'd.execute("SELECT COUNT(*) FROM briefs WHERE id LIKE \'w%\'").fetchone()[0])')
     done = subprocess.run(['docker', 'run', '--rm', '--pull', 'never', '--network', 'none', '--user', '10001:10001', '--mount',
                            f'type=bind,src={staging},dst=/s,readonly', image, 'python', '-I', '-c', check],
                           stdout=subprocess.PIPE, check=True, timeout=120)
-    assert done.stdout.split() == [b'ok', b'0']
+    integrity, difference, written = done.stdout.split()
+    # A writer's row in the snapshot: that commit came before the online backup's final pass, which then restarted.
+    assert (integrity, difference) == (b'ok', b'0') and int(written) >= 1
     assert sorted(p.name for p in staging.iterdir()) == ['voice.sqlite3']
 
 
@@ -653,7 +660,7 @@ def test_in_the_real_container_its_memory_limit_kills_it_and_not_the_writer(tmp_
     make_state(source, rows=5200, bulk=4000, canary=False)
     os.chmod(source, 0o666)
     hog = 'held = []\nimport threading, time\ndef _hog():\n    time.sleep(1)\n    while True:\n        held.append(b"x" * 8388608)\n        time.sleep(.01)\nthreading.Thread(target=_hog, daemon=True).start()\n'
-    real, name, staging, _ = real_helper(hog)
+    real, name, staging, _ = real_helper(hog, keep=True)
     stop, times, errors = threading.Event(), [], []
     capture, outcome = capture_running(real, name, staging, 120)
     thread = threading.Thread(target=writer_loop, args=(source, stop, times, errors))
@@ -665,10 +672,12 @@ def test_in_the_real_container_its_memory_limit_kills_it_and_not_the_writer(tmp_
     finally:
         stop.set()
         thread.join(timeout=30)
-    # 137 is SIGKILL, the memory limit's; the helper's own failures all exit 3.
-    assert outcome['result'][0] == 137 and not (staging / 'voice.sqlite3').exists() and died_after > 0
+    limit = time.monotonic() + 15
+    while not real.inspect(name)['State']['OOMKilled'] and time.monotonic() < limit:  # Docker's OOM event is asynchronous
+        time.sleep(.2)
+    assert real.inspect(name)['State']['OOMKilled'] is True
+    assert outcome['result'][0] != 0 and not (staging / 'voice.sqlite3').exists() and died_after > 0
     assert not errors and len(times) > died_after and max(times) <= CALLS_WRITER_BOUND_SECONDS
-    assert real.inspect(name) is None or not real.inspect(name)['State']['Running']
 
 
 def sealed(tmp_path, name='bundle', **kwargs):
