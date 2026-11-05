@@ -291,6 +291,7 @@ import json,os,signal,sys
 from pathlib import Path
 from messaging_service import file_lifecycle as api
 from messaging_service.store import Store
+from test_file_lifecycle import die_after_sql
 spec=json.loads(os.environ['KILL_SPEC'])
 def die(*_,**__):os.kill(os.getpid(),signal.SIGKILL)
 def then_die(function):
@@ -301,7 +302,7 @@ store=Store(spec['dsn'],Path(spec['files']),'http://localhost')
 worker=api.LifecycleWorker(store)
 boundary=spec['boundary']
 if boundary=='inspected':worker._verified=die
-elif boundary=='prepare_uncommitted':api.uuid4=die
+elif boundary=='prepare_uncommitted':worker.store=die_after_sql(store,"SET state='evicting'",die)
 elif boundary=='prepared':worker._complete=die
 elif boundary=='unlinked_unsynced':api.os.fsync=die
 elif boundary=='unlinked':worker._mark_evicted=die
@@ -311,6 +312,23 @@ else:raise SystemExit('unknown boundary')
 worker.run_once(apply=True)
 raise SystemExit('the pass ended without reaching its boundary')
 '''
+
+
+def die_after_sql(store,fragment,die):
+    """`store` whose connections call `die` right after a statement holding `fragment` ran, its transaction still open."""
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    class Connection:
+        def __init__(self,inner):self.inner=inner
+        def __getattr__(self,name):return getattr(self.inner,name)
+        def execute(self,query,*args,**kwargs):
+            result=self.inner.execute(query,*args,**kwargs)
+            if fragment in str(query):die()
+            return result
+    @contextmanager
+    def connection():
+        with store.pool.connection() as inner:yield Connection(inner)
+    return SimpleNamespace(pool=SimpleNamespace(connection=connection,conninfo=store.pool.conninfo),files=store.files)
 
 
 def killed(code,s,boundary,**fields):

@@ -2429,7 +2429,7 @@ def test_a_runner_pin_by_tag_keeps_the_image_it_resolves_to(tmp_path, monkeypatc
 
 
 # spec: ANYM-525
-def test_the_newest_undo_copy_of_a_moved_runner_pin_keeps_its_image(tmp_path, monkeypatch):
+def test_every_undo_copy_of_a_moved_runner_pin_keeps_its_image(tmp_path, monkeypatch):
     settings, runners = workers_settings(tmp_path, monkeypatch)
     released(Path(settings["state_directory"]), "a" * 40, image_id("a"), image_id("b"))
     path = pin(runners / "messaging" / "runner.json", image_id("a"))
@@ -2442,18 +2442,87 @@ def test_the_newest_undo_copy_of_a_moved_runner_pin_keeps_its_image(tmp_path, mo
     kept = {item["image"]: item["reasons"] for item in report["keep"]}
     # `cp -p runner.json.before-<sha> runner.json` is the documented undo of the last move (production.md).
     assert kept[image_id("d")] == [f"pinned by the undo copy {newer}"]
-    assert [item["image"] for item in report["candidates"]] == [image_id("c")]
+    # An older time proves nothing: `cp -p` keeps the source's, so the last move's copy can be the older one.
+    assert kept[image_id("c")] == [f"pinned by the undo copy {older}"]
+    assert report["candidates"] == []
+
+
+# spec: ANYM-525
+def test_an_undo_copy_pinned_by_tag_keeps_its_image_and_one_with_no_image_left_holds_nothing_back(tmp_path, monkeypatch):
+    settings, runners = workers_settings(tmp_path, monkeypatch)
+    released(Path(settings["state_directory"]), "a" * 40, image_id("a"), image_id("b"))
+    path = pin(runners / "messaging" / "runner.json", image_id("a"))
+    tag = "deedkit-production-backup:" + "c" * 40
+    copied = pin(path.with_name("runner.json.before-" + "1" * 40), tag)
+    pin(path.with_name("runner.json.before-" + "2" * 40), "deedkit-production-backup:" + "e" * 40)
+    images = Images(monkeypatch, [backup("a"), backup("b"), backup("c"), backup("d")])
+    real = images.run
+    monkeypatch.setattr(p, "run", lambda argv, **kw: image_id("c") + "\n" if argv[-1] == tag else real(argv, **kw))
+    report = p.images_report(settings)
+    assert {item["image"]: item["reasons"] for item in report["keep"]}[image_id("c")] == [f"pinned by the undo copy {copied}"]
+    assert [item["image"] for item in report["candidates"]] == [image_id("d")]
+
+
+# spec: ANYM-525
+def test_a_named_runner_config_is_read_when_another_migration_setting_is_invalid(tmp_path, monkeypatch):
+    configured = tmp_path / "ops" / "runner.json"
+    settings, _ = workers_settings(tmp_path, monkeypatch, configured=configured)
+    settings["migration"]["rehearsal_limit_ms"] = "not a number"
+    with pytest.raises(p.Refused):
+        p.unattended_settings(settings)
+    released(Path(settings["state_directory"]), "a" * 40, image_id("a"), image_id("b"))
+    pin(configured, image_id("c"))
+    Images(monkeypatch, [backup("a"), backup("b"), backup("c")])
+    report = p.images_report(settings)
+    assert {item["image"]: item["reasons"] for item in report["keep"]}[image_id("c")] == [f"pinned by {configured}"]
+    assert report["candidates"] == []
+
+
+# spec: ANYM-525
+@pytest.mark.parametrize("profile", ["calendar", "recordings", "calls"])
+def test_an_installed_runner_with_only_another_profiles_pin_keeps_removing_images(tmp_path, monkeypatch, profile):
+    settings, runners = workers_settings(tmp_path, monkeypatch)
+    released(Path(settings["state_directory"]), "a" * 40, image_id("a"), image_id("b"))
+    p.BACKUP_RUNNER.parent.mkdir(parents=True)
+    p.BACKUP_RUNNER.write_text("# synthetic runner\n")
+    pin(runners / profile / "runner.json", image_id("c"))
+    Images(monkeypatch, [backup("a"), backup("b"), backup("c"), backup("d")])
+    assert p.remove_images(settings)["removed"] == [{"image": "d" * 12, "tags": ["deedkit-production-backup:" + "d" * 40]}]
+
+
+# spec: ANYM-525
+def test_the_rollback_guard_covers_each_worker_and_passes_once_they_run_the_serving_schema(monkeypatch):
+    project = {"name": "deedkit-file-lifecycle", "services": LIFECYCLE_SERVICES}
+    old_workers = {service: image_id(seed) for service, seed in zip(LIFECYCLE_SERVICES, "ef0")}
+    serving_runtime, current = image_id("a"), {"schema.sql": "1" * 64, "migrations/067_synthetic.sql": "2" * 64}
+    inventories = {serving_runtime: current, **{image: {"schema.sql": "1" * 64} for image in old_workers.values()}}
+    monkeypatch.setattr(p, "http_release_tool", lambda: SimpleNamespace(schema_inventory=inventories.__getitem__))
+    serving = {"generation": "a" * 12, "sha": "a" * 40, "images": {"runtime": serving_runtime}, "schema": current}
+    # Workers that predate the serving schema: a first rollback is refused, before it stops anything (host plan, step 3).
+    for service, image in old_workers.items():
+        with pytest.raises(p.Refused, match=f"deedkit-file-lifecycle/{service}'s restored image"):
+            p.guard_rollback(serving, [(project, None, {service: image})])
+    # Brought to the serving release first: the guard passes for the runtime and backup images alike.
+    refreshed = {"file-lifecycle": serving_runtime, "cold-archive": image_id("b"), "cold-restore": image_id("b")}
+    inventories[image_id("b")] = current
+    assert p.guard_rollback(serving, [(project, None, refreshed)]) is None
 
 
 # spec: ANYM-525
 @pytest.mark.parametrize("case", ["broken-json", "not-an-object", "no-image", "image-not-a-string", "unresolved-tag",
-                                  "broken-undo-copy", "configured-missing", "installed-runner-without-a-pin"])
+                                  "broken-undo-copy", "undo-copy-with-no-image", "configured-missing",
+                                  "configured-not-a-path", "installed-runner-without-a-pin"])
 def test_removal_refuses_when_a_runner_pin_cannot_be_read(tmp_path, monkeypatch, case):
-    configured = tmp_path / "ops" / "runner.json" if case == "configured-missing" else None
+    configured = tmp_path / "ops" / "runner.json" if case.startswith("configured") else None
     settings, runners = workers_settings(tmp_path, monkeypatch, configured=configured)
     released(Path(settings["state_directory"]), "a" * 40, image_id("a"), image_id("b"))
     path = runners / "calendar" / "runner.json"
-    if case == "installed-runner-without-a-pin":
+    if case == "configured-not-a-path":
+        settings["migration"]["unattended"]["runner_config"] = "relative/runner.json"
+    elif case == "undo-copy-with-no-image":
+        pin(path, image_id("a"))
+        path.with_name("runner.json.before-" + "1" * 40).write_text("{}")
+    elif case == "installed-runner-without-a-pin":
         p.BACKUP_RUNNER.parent.mkdir(parents=True)
         p.BACKUP_RUNNER.write_text("# synthetic runner\n")
     elif case == "broken-undo-copy":
@@ -2466,7 +2535,7 @@ def test_removal_refuses_when_a_runner_pin_cannot_be_read(tmp_path, monkeypatch,
         path.write_text("{}")
     elif case == "image-not-a-string":
         pin(path, 7)
-    elif case != "configured-missing":
+    elif not case.startswith("configured"):
         path.parent.mkdir(parents=True)
         path.write_text({"broken-json": "{", "not-an-object": "[]"}[case])
     images = Images(monkeypatch, [backup("a"), backup("b"), backup("c")])
@@ -7145,6 +7214,26 @@ def test_status_keeps_its_document_when_a_service_cannot_be_read(tmp_path, monke
     items = {item["service"]: item for item in found["project_services"]}
     assert found["sha"] == RELEASES[0] and items["cold-archive"]["mark"] == "unknown"
     assert items["cold-archive"]["error"] == "TimeoutExpired" and "mark" not in items["cold-restore"]
+
+
+# spec: ANYM-525
+def test_status_bounds_all_its_docker_reads_by_one_budget(tmp_path, monkeypatch):
+    host = WorkersHost(tmp_path, monkeypatch)
+    host.release(RELEASES[0])
+    current = p.read(host.state / "current.json")
+    timeouts, clock = [], [1000.0]
+    real = host.run
+    def run(argv, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        clock[0] += 25  # A slow daemon: each read answers just inside its own limit.
+        return real(argv, **kwargs)
+    monkeypatch.setattr(p, "run", run)
+    monkeypatch.setattr(p.time, "monotonic", lambda: clock[0])
+    items = {item["service"]: item for item in p.project_services(host.settings, current)}
+    # Each read gets what is left of the budget, and none starts once it is gone.
+    assert timeouts == [30, 30, 10]
+    assert items["file-lifecycle"]["revision"] == RELEASES[0] and "mark" not in items["file-lifecycle"]
+    assert items["cold-archive"]["mark"] == "unknown" and items["cold-restore"]["error"] == "TimeoutError"
 
 
 # spec: ANYM-757

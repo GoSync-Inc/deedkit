@@ -2212,41 +2212,55 @@ def pinned_images(keep, states):
                 keep(image, f"named in {path}")
 
 
-def runner_pins(settings, keep):
-    """The image each backup runner's own configuration pins, and the one its newest `.before-*` copy names, the undo of
-    the last move (ANYM-525). Nothing else protects them once a project deploys the `backup` target and no backup container
-    exists between two runs, so a pin that cannot be read refuses before any removal. A host without the runner and
-    without a runner.json runs no backup and has no pin to read."""
+def configured_runner(settings):
+    """The runner.json `migration.unattended.runner_config` names, or None when none is named. Read on its own: a setting
+    of the migration section that keeps a release from running unattended says nothing about this file's pin."""
+    section = settings.get("migration")
+    found = section.get("unattended") if isinstance(section, dict) else None
+    named = found.get("runner_config") if isinstance(found, dict) else None
+    if named is not None and not (isinstance(named, str) and Path(named).is_absolute()):
+        raise Refused("migration.unattended.runner_config is not an absolute path; no image is removed")
+    return Path(named) if named is not None else None
+
+
+def pinned_id(path, pinned):
+    """The image ID a runner configuration's `image` names now: its own value, or what a tag or reference resolves to.
+    None when a reference resolves to no image: nothing on this host is left to protect."""
+    image = pinned.get("image") if isinstance(pinned, dict) else None
+    if not isinstance(image, str):
+        raise Refused(f"{path} names no backup image; no image is removed")
+    if IMAGE_DIGEST.fullmatch(image):
+        return image
     try:
-        configured = Path(unattended_settings(settings)["runner_config"])
+        found = run(["docker", "image", "inspect", "--format", "{{.Id}}", image], timeout=60).strip()
     except Refused:
-        configured = None
+        return None
+    if not IMAGE_DIGEST.fullmatch(found):
+        raise Refused(f"the image {path} pins has no immutable ID; no image is removed")
+    return found
+
+
+def runner_pins(settings, keep):
+    """The image each backup runner's own configuration pins, and those its `.before-*` copies name, the undo of a move
+    (ANYM-525). Nothing else protects them once a project deploys the `backup` target and no backup container exists between
+    two runs, so a pin that cannot be read refuses before any removal. Every copy counts: `cp -p` keeps an old time, so no
+    time tells the last move, and an operator deletes a copy to let its image go. A host without the runner and without a
+    runner.json runs no backup and has no pin to read; each profile's runner.json is optional, as `deploy` reads them."""
+    configured = configured_runner(settings)
     if configured is not None and not present(configured):
         raise Refused(f"cannot read the configured {configured}; no image is removed")
-    if present(BACKUP_RUNNER) and not (configured or present(RUNNER_CONFIGS[0])):
-        raise Refused(f"the backup runner is installed and {RUNNER_CONFIGS[0]} is missing; no image is removed")
-    for path in dict.fromkeys(item for item in (configured, *RUNNER_CONFIGS) if item is not None):
-        if not present(path):
-            continue
-        pinned = load(path)
-        image = pinned.get("image") if isinstance(pinned, dict) else None
-        if not isinstance(image, str):
-            raise Refused(f"{path} names no backup image; no image is removed")
-        if not IMAGE_DIGEST.fullmatch(image):
-            # A pin by tag or digest reference: the image ID it names now.
-            try:
-                image = run(["docker", "image", "inspect", "--format", "{{.Id}}", image], timeout=60).strip()
-            except Refused as exc:
-                raise Refused(f"the image {path} pins cannot be resolved; no image is removed") from exc
-            if not IMAGE_DIGEST.fullmatch(image):
-                raise Refused(f"the image {path} pins cannot be resolved; no image is removed")
+    paths = [path for path in dict.fromkeys(item for item in (configured, *RUNNER_CONFIGS) if item is not None) if present(path)]
+    if present(BACKUP_RUNNER) and not paths:
+        raise Refused(f"the backup runner {BACKUP_RUNNER} is installed and no runner.json names its image; no image is removed")
+    for path in paths:
+        image = pinned_id(path, load(path))
+        if image is None:
+            raise Refused(f"the image {path} pins cannot be resolved; no image is removed")
         keep(image, f"pinned by {path}")
-        copies = [(found.st_mtime, entry) for entry in directory_entries(path.parent)
-                  if entry.name.startswith(path.name + ".before-") and (found := present(entry))]
-        if copies:
-            newest = max(copies)[1]
-            undo = load(newest)
-            keep(undo.get("image") if isinstance(undo, dict) else None, f"pinned by the undo copy {newest}")
+        for entry in directory_entries(path.parent):
+            if entry.name.startswith(path.name + ".before-") and present(entry):
+                # A copy whose reference resolves to nothing has no image left: its undo is lost either way.
+                keep(pinned_id(entry, load(entry)), f"pinned by the undo copy {entry}")
 
 
 def release_name(name):
@@ -5623,7 +5637,8 @@ def http_release_tool():
     return seamless_release
 
 
-STATUS_READ = 30  # one docker read of `status`: it answers even while the daemon hangs
+# `status` holds the deploy lock: one docker read of its service list, and all of them together, end by these seconds.
+STATUS_READ, STATUS_BUDGET = 30, 60
 
 
 def http_failed_attempts(path):
@@ -5646,22 +5661,27 @@ def project_services(settings, current):
     current.json names the release that was left) or unreadable. Selected fields only, never a container's environment;
     a read failure is named, never raised."""
     expected, found = current.get("sha") if current.get("status") == "applied" else None, []
+    until = time.monotonic() + STATUS_BUDGET
+    def docker_read(argv):
+        if (left := until - time.monotonic()) <= 0:
+            raise TimeoutError("status budget")
+        return run(argv, timeout=min(STATUS_READ, left))
     for project in settings.get("projects") or []:
         for service in project["services"]:
             item = {"project": project["name"], "service": service}
             try:
-                ids = run(["docker", "ps", "--all", "--filter", "label=com.docker.compose.oneoff=False",
-                           "--filter", "label=com.docker.compose.project=" + project["name"],
-                           "--filter", "label=com.docker.compose.service=" + service, "--format", "{{.ID}}"],
-                          timeout=STATUS_READ).split()
+                ids = docker_read(["docker", "ps", "--all", "--filter", "label=com.docker.compose.oneoff=False",
+                                   "--filter", "label=com.docker.compose.project=" + project["name"],
+                                   "--filter", "label=com.docker.compose.service=" + service,
+                                   "--format", "{{.ID}}"]).split()
                 if len(ids) > 1:
                     item.update(state=f"{len(ids)} containers", revision=None, mark="unknown")
                 elif not ids:
                     item.update(state="no container", revision=None, mark="not running")
                 else:
-                    state, _, revision = run(["docker", "inspect", "--format", '{{.State.Status}} {{index .Config.Labels '
-                                              '"org.opencontainers.image.revision"}}', ids[0]],
-                                             timeout=STATUS_READ).strip().partition(" ")
+                    state, _, revision = docker_read(["docker", "inspect", "--format",
+                                                      '{{.State.Status}} {{index .Config.Labels '
+                                                      '"org.opencontainers.image.revision"}}', ids[0]]).strip().partition(" ")
                     item.update(state=state, revision=revision or None)
                     if state != "running":
                         item["mark"] = "not running"

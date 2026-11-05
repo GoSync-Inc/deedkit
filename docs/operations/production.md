@@ -1069,7 +1069,8 @@ mechanism of their own. The tool loads every profile (`--profile *`) and selects
 out. Every release and rollback stops them and starts them on the release's verified images. `production.py status` lists
 each service of each configured project as `project_services` with its `state` and `revision` label; `mark` names one that
 is `not running`, `differs from current.json` (not compared after a rollback, when `current.json` names the release that
-was left) or `unknown` (several containers, or with `error` the read failed; `status` still answers).
+was left) or `unknown` (several containers, or with `error` the read failed or the 60 seconds `status` gives all these
+reads passed; `status` still answers).
 
 What that means for them:
 
@@ -1096,16 +1097,24 @@ because the configuration digest changes and autodeploy otherwise halts with `co
    newer than the deployed one and not prepared yet.
 2. Back up both files with `cp -p`: `/etc/deedkit/file-lifecycle.json` and the plan A configuration that
    `production.active_config()` names.
-3. Move the Compose file, byte for byte, to `/etc/deedkit/file-lifecycle/compose.json` (`sha256sum` before and after): its
-   commands, mounts, credentials and the eviction and upload opt-ins stay exactly. Image retention reads only top-level JSON
-   files of `/etc/deedkit`, so the image IDs in it stop pinning old images.
-4. Append the entry of `deploy/production.example.json` to `projects`. `directory` stays the project's working directory
+3. Bring the three workers to the serving release first, by hand. `guard_rollback` refuses to restore a messaging image with
+   fewer migrations than plan B serves, and `runtime` and `backup` are both messaging images: without this step any rollback of
+   the first release is refused, the automatic one included, because the images it would restore predate the serving schema.
+   Set `image` of `file-lifecycle` to `current.json`'s runtime image, and of `cold-archive` and `cold-restore` to the current
+   release's attested backup image (verify and pull it as in "First start by hand", step 1), then `docker compose -p
+   deedkit-file-lifecycle -f /etc/deedkit/file-lifecycle.json up -d --no-build --pull never --no-deps file-lifecycle cold-archive
+   cold-restore`. Read back the three images and each worker's next pass in its log.
+4. Move the Compose file, byte for byte, to `/etc/deedkit/file-lifecycle/compose.json` (`sha256sum` after the move equals the
+   one before it): besides step 3's images, its commands, mounts, credentials and the eviction and upload opt-ins stay exactly.
+   Image retention reads only top-level JSON files of `/etc/deedkit`, so the image IDs in it stop pinning old images.
+5. Append the entry of `deploy/production.example.json` to `projects`. `directory` stays the project's working directory
    (label `com.docker.compose.project.working_dir` of its containers).
-5. `production.py prepare --sha S`, inspect it, then `apply --sha S` and `status`. Read back: `project_services` shows the three
+6. `production.py prepare --sha S`, inspect it, then `apply --sha S` and `status`. Read back: `project_services` shows the three
    services on `S` with no `mark`. Remove the pause.
 
-Undo: `production.py rollback --sha S`, which restores the images that ran before; then put both files back from their copies
-and remove the pause. Rollback's previous images stay kept as its target (`<project>.before.json`).
+Undo of step 6: `production.py rollback --sha S`, which restores step 3's images; then put the plan A configuration back from
+its copy and remove the pause. Undo of step 3: put `/etc/deedkit/file-lifecycle.json` back from its copy and run the same `up`.
+Rollback's previous images stay kept as its target (`<project>.before.json`).
 
 ### Backup runner
 
@@ -2652,12 +2661,13 @@ CI-published targets are considered. Kept, with reasons:
   directory under the host state root;
 - the image each backup runner pins (ANYM-525), read before any removal: `image` of the
   messaging `runner.json` the configuration names (`migration.unattended.runner_config`)
-  and of every `runner.json` of "Backup runner" that exists, and of the newest
-  `runner.json.before-*` beside each, the undo of the last move. The pin must be read:
-  a `runner.json` that cannot be read or names no image, a pin by tag that resolves
-  to no image, an unreadable undo copy, a named `runner_config` that is missing, or an
-  installed runner with no messaging `runner.json` refuses, and nothing is removed. A
-  release only reports that refusal as its removal's `skipped`;
+  and of every `runner.json` of "Backup runner" that exists, and of every
+  `runner.json.before-*` beside each, the undo of a move. Every copy counts, because `cp -p`
+  keeps an old time and so no time tells the last move; delete an old copy to let its image
+  go. A pin must be read: a `runner.json` or copy that cannot be read or names no image,
+  a `runner.json` pin by tag that resolves to no image, a named `runner_config` that is
+  missing, or an installed runner with no `runner.json` at all refuses, and nothing is
+  removed. A release only reports that refusal as its removal's `skipped`;
 - the image of every container, running or stopped; an image with any other
   name (for example `deedkit-rollback-retained:*`); an image of a target this
   configuration does not deploy. Once the lifecycle workers deploy `backup`, that

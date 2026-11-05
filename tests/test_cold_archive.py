@@ -334,6 +334,7 @@ from pathlib import Path
 from messaging_service import blobs,cold_archive as api,file_lifecycle
 from messaging_service.store import Store
 from test_cold_archive import StubTransport
+from test_file_lifecycle import die_after_sql
 spec=json.loads(os.environ['KILL_SPEC'])
 def die(*_,**__):os.kill(os.getpid(),signal.SIGKILL)
 def then_die(function):
@@ -348,8 +349,14 @@ config=api.load_config(spec['config'])
 transport=StubTransport(spec['receiver'],spec['cloud'])
 if boundary.startswith('restore_'):
     worker=api.ColdRestorer(store,config,transport,reserve_bytes=0)
-    if boundary=='restore_admitted':worker._fetch=die
-    elif boundary=='restore_writing':blobs.BlobSink.push=die
+    if boundary=='restore_admit_uncommitted':worker._admit=then_die(worker._admit)
+    elif boundary=='restore_admitted':worker._fetch=die
+    elif boundary=='restore_writing':
+        push=blobs.BlobSink.push
+        def written(sink,chunk):
+            push(sink,chunk);sink.out.flush();die()
+        blobs.BlobSink.push=written
+    elif boundary=='restore_synced':blobs.os.link=die
     elif boundary=='restore_linked':blobs.fsync_dir=die
     elif boundary=='restore_published':worker._fetch=then_die(worker._fetch)
     elif boundary=='restore_register_uncommitted':file_lifecycle.register_resident_original=then_die(file_lifecycle.register_resident_original)
@@ -366,8 +373,21 @@ else:
             record(digest,size,**fields);die()
         return wrapped
     if boundary=='before_pending':worker._record=recording('pending',kill_after=False)
+    elif boundary=='pending_uncommitted':worker.store=die_after_sql(store,"state='pending',object_key",die)
     elif boundary=='pending_committed':worker._record=recording('pending',kill_after=True)
+    elif boundary=='verified_uncommitted':worker.store=die_after_sql(store,"state='verified',object_key",die)
     elif boundary=='footer_sent':
+        # The stream's end is out and no answer was read: the receiver's completion is still outstanding.
+        spawn=transport._spawn
+        class Input:
+            def __init__(self,inner):self.inner=inner
+            def __getattr__(self,name):return getattr(self.inner,name)
+            def close(self):
+                self.inner.close();die()
+        def spawned():
+            process=spawn();process.stdin=Input(process.stdin);return process
+        transport._spawn=spawned
+    elif boundary=='footer_answered':
         response=api._response;seen=[]
         def second(raw):
             seen.append(raw)
@@ -416,11 +436,14 @@ def receiver_settled(tmp_path):
 # spec: ANYM-525
 @pytest.mark.parametrize('boundary,state,stored_objects,archived',[
     ('before_pending',None,0,1),
+    ('pending_uncommitted',None,0,1),
     ('pending_committed','pending',0,1),
     ('footer_sent','pending',1,1),
+    ('footer_answered','pending',1,1),
     ('stored','pending',1,1),
     ('reading_back','pending',1,1),
     ('read_back','pending',1,1),
+    ('verified_uncommitted','pending',1,1),
     ('verified_committed','verified',1,0)])
 def test_a_killed_archive_pass_is_finished_by_the_next_one_at_every_boundary(env,archive,tmp_path,boundary,state,stored_objects,archived):
     s,cloud,archiver,identity=env;payload=b'Synthetic killed archive original'
@@ -882,20 +905,28 @@ def test_interrupted_publication_is_registered_without_r2(env,archive,monkeypatc
 
 # spec: ANYM-525
 @pytest.mark.parametrize('boundary,published,temporary,is_resident,reads',[
+    ('restore_admit_uncommitted',False,False,False,1),
     ('restore_admitted',False,False,False,1),
     ('restore_writing',False,True,False,1),
+    ('restore_synced',False,True,False,1),
     ('restore_linked',True,True,False,0),
     ('restore_published',True,False,False,0),
     ('restore_register_uncommitted',True,False,False,0),
     ('restore_committed',True,False,True,0)])
 def test_a_killed_restore_pass_is_finished_by_the_next_one_at_every_boundary(env,archive,tmp_path,boundary,published,temporary,is_resident,reads):
     from messaging_service.blobs import BlobWriter
+    from messaging_service.storage_admission import COLD_RESTORING
     _,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive)
     s.request_file_download(key,fid);queued=job_state(s,fid)
     killed_worker(env,archive,tmp_path,boundary)
     temporaries=list(s.files.glob('.pending-*'))
     assert (s.files/blob.digest).exists()==published and bool(temporaries)==temporary
     assert resident(s,blob.digest)==is_resident
+    # The boundary's own side effect is on disk or in the record, not merely its function's entry.
+    if boundary=='restore_writing':assert temporaries[0].stat().st_size>0
+    if boundary in ('restore_synced','restore_linked'):assert temporaries[0].read_bytes()==b'Synthetic retained contract'
+    leased=copy(s,blob.digest)['restore_error']==COLD_RESTORING
+    assert leased==(boundary not in ('restore_admit_uncommitted','restore_committed'))
     before=calls(cloud).count('get_object')
     report=restorer(env).run_once()
     # What was published is registered from the store, never fetched again; what was not is fetched once.
@@ -911,6 +942,20 @@ def test_a_killed_restore_pass_is_finished_by_the_next_one_at_every_boundary(env
         assert BlobWriter(s.files,reserve_bytes=0).sweep_abandoned(max_age=-1)==len(temporaries)
         assert not list(s.files.glob('.pending-*')) and (s.files/blob.digest).exists()
     assert restorer(env).run_once()['restored']==0 and calls(cloud).count('get_object')==before+reads
+
+
+# spec: ANYM-525
+def test_a_reconciliation_killed_after_a_killed_restore_is_finished_without_another_read(env,archive,tmp_path):
+    _,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive)
+    s.request_file_download(key,fid)
+    killed_worker(env,archive,tmp_path,'restore_published')
+    reads=calls(cloud).count('get_object')
+    # The second worker starts from the published file and dies inside its registration.
+    killed_worker(env,archive,tmp_path,'restore_register_uncommitted')
+    assert not resident(s,blob.digest)
+    report=restorer(env).run_once()
+    assert report['reconciled']==1 and report['failed']==0 and resident(s,blob.digest)
+    assert calls(cloud).count('get_object')==reads and copy(s,blob.digest)['restore_state']=='idle'
 
 
 # spec: ANYM-525
