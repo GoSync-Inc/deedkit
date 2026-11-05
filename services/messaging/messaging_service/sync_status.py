@@ -5,6 +5,7 @@ from .envelope import stable_id
 from .policy import scope_filter
 from .status_details import describe,freshness
 from .conflict_classes import grouped, report
+from .enrichment_health import read as enrichment_health
 from .operational import identity_safe, liveness, operations
 from .media_policy import ELIGIBILITY_JOIN, published_window
 
@@ -297,4 +298,6 @@ def get_sync_status(c, p):
                 pause_reason,paused_until
                 FROM processing_profiles WHERE account=%s ORDER BY kind''',(account,)).fetchall()
     return {'scope': 'permitted_chats' if scoped else 'permitted_accounts',
-            'coverage': 'partial', 'sources': sources}
+            'coverage': 'partial', 'sources': sources,
+            # Account-wide queue facts: never for a chat-restricted principal (ANYM-785).
+            'enrichment_health': None if scoped else enrichment_health(p['accounts'])}

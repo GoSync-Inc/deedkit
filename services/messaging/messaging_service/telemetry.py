@@ -24,6 +24,8 @@ CODES = {'request_failed', 'tool_failed', 'collector_failed', 'indexer_failed',
          'module_router_failed', 'uncaught_exception', 'setup_check'}
 # Tiden run environments; an unknown slug would silently create a duplicate (TIDEN-CI.md).
 ENVIRONMENTS = {'production', 'local-synthetic'}
+ENRICHMENT_HEALTH_CODES = frozenset({'enrichment_stalled', 'enrichment_starved', 'enrichment_no_worker'})
+CODES |= ENRICHMENT_HEALTH_CODES
 ROOT = Path(__file__).resolve().parent
 SOURCE_FILES = frozenset(p.name for p in ROOT.glob('*.py'))
 # Repository-root paths, matching Tiden component paths.
@@ -78,6 +80,9 @@ def safe_event(error, component, code):
     # Tiden groups by exception type and frames; a collector stop code needs its own issue (ANYM-410).
     if component in STOP_CODES:
         event['fingerprint'] = ['collector-stop', component, code]
+    # The three codes raise at one frame; each is its own issue (ANYM-785).
+    if code in ENRICHMENT_HEALTH_CODES:
+        event['fingerprint'] = ['enrichment-health', component, code]
     return event
 
 

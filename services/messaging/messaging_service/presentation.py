@@ -577,6 +577,12 @@ def render(method, result, detail, include_coverage=False):
                 if k in ('download','download_errors','download_error_states','extraction','enrichment')
                 and (k!='download_error_states' or v)}
             compact['sources'].append(row)
+        # ANYM-785: the compact budget names only accounts with something to report.
+        health=result.get('enrichment_health')
+        if health:
+            busy={k:v for k,v in health['accounts'].items() if v['codes'] or v['counts']}
+            if busy:compact['enrichment_health']={**health,'accounts':busy}
+            else:del compact['enrichment_health']
         compact['detail']='compact'
         compact['next_action']='get_sync_status_detail_full_or_chat_id_for_diagnostics'
         return compact

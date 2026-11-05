@@ -1539,9 +1539,18 @@ def create_app(store: Store, allowed_hosts: list[str]):
                         await run_in_threadpool(record,store,'api')
                 except Exception:log.error('heartbeat_unavailable')
                 await asyncio.sleep(HEARTBEAT_S)
+        async def enrichment_health_check():
+            # ANYM-785: read-only and separate from every request; the next period tries again.
+            from . import enrichment_health
+            while True:
+                try:
+                    if release is None or release.phase == 'active':
+                        await run_in_threadpool(enrichment_health.check,store)
+                except Exception:log.error('enrichment_health_unavailable')
+                await asyncio.sleep(enrichment_health.CHECK_PERIOD_S)
         async with sdk_lifespan(application) as state:
             tasks=[asyncio.create_task(job()) for job,ready in ((sweep_uploads,hasattr(store,'cleanup_file_uploads')),
-                (heartbeat,hasattr(store,'pool'))) if ready]
+                (heartbeat,hasattr(store,'pool')),(enrichment_health_check,hasattr(store,'pool'))) if ready]
             try:yield state
             finally:
                 for task in tasks:
