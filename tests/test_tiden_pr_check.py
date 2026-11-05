@@ -4,7 +4,10 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
+from hypothesis import given
+from hypothesis import strategies as st
 import pytest
 
 import scripts.tiden_pr_check as pr_check
@@ -140,6 +143,51 @@ def test_a_card_on_the_named_open_branch_counts_and_a_closed_branch_fails(repo, 
                     "Delivers: ANYM-50\nTiden branch: review/y\n")
     assert code == 1 and "`Tiden branch: review/y` is merged, not open" in out
     assert "ANYM-50 (named by the body) is not a spec on Tiden main or review/y" in out
+
+
+MERGED = [{"name": "main", "status": "open"}, {"name": "review/y", "status": "merged"}]
+
+
+# spec: ANYM-768
+def test_a_merged_branch_passes_a_rerun_when_every_named_spec_is_on_main(repo, server):
+    server.set(main=[spec(12), spec(50)], branches=MERGED)
+    code, out = run(repo, server, {"README.md": "text\n"}, "Delivers: ANYM-50\nSpec: ANYM-12\nTiden branch: review/y\n")
+    assert code == 0, out
+    assert "Tiden branch review/y is merged; named specs are on main" in out and "not open" not in out
+    assert sorted(set(server.calls())) == [("branch", "list"), ("spec", "list")] and not server.writes()
+    assert not [entry for entry in server.state()["log"] if entry[:2] == ["spec", "list"] and "review/y" in entry]
+
+
+# spec: ANYM-768
+def test_a_merged_branch_fails_naming_a_spec_absent_from_main(repo, server):
+    server.set(main=[spec(12)], branches=MERGED)
+    code, out = run(repo, server, {"README.md": "text\n"}, "Delivers: ANYM-50\nSpec: ANYM-12\nTiden branch: review/y\n")
+    assert code == 1 and "Passed." not in out
+    assert "`Tiden branch: review/y` is merged, not open (ANYM-50 not on main)" in out
+    assert "ANYM-12 not on main" not in out and not server.writes()
+
+
+# spec: ANYM-768
+def test_a_merged_branch_with_no_named_spec_proves_nothing_and_fails(repo, server):
+    server.set(main=[spec(12)], branches=MERGED)
+    code, out = run(repo, server, {"README.md": "text\n"}, "Tiden branch: review/y\n")
+    assert code == 1 and "`Tiden branch: review/y` is merged, not open" in out
+
+
+# spec: ANYM-768
+@pytest.mark.parametrize("status, word", [("closed", "closed"), (None, "missing")])
+def test_a_closed_or_missing_branch_still_fails_with_its_specs_on_main(repo, server, status, word):
+    branches = [{"name": "main", "status": "open"}] + ([{"name": "review/y", "status": status}] if status else [])
+    server.set(main=[spec(50)], branches=branches)
+    code, out = run(repo, server, {"README.md": "text\n"}, "Delivers: ANYM-50\nTiden branch: review/y\n")
+    assert code == 1 and f"`Tiden branch: review/y` is {word}, not open" in out
+
+
+# spec: ANYM-768
+def test_a_branch_listed_twice_is_refused_even_when_merged(repo, server):
+    server.set(main=[spec(50)], branches=[*MERGED, {"name": "review/y", "status": "merged"}])
+    with pytest.raises(pr_check.Refused, match="names review/y more than once"):
+        run(repo, server, {"README.md": "text\n"}, "Delivers: ANYM-50\nTiden branch: review/y\n")
 
 
 BRANCHES = [{"name": "main", "status": "open"}, {"name": "proposal/x", "status": "open"},
@@ -284,9 +332,10 @@ def test_a_failing_or_malformed_merge_preview_refuses_without_a_verdict_and_no_b
     assert code == 1 and reason in out and "Passed." not in out and "problem(s):" not in out
     assert SECRET not in out and not server.writes()
     server.set(fault={"branch merge-preview": "exit"}, log=[])
-    for body in ("Spec: ANYM-12", "Spec: ANYM-12\nTiden branch: review/y"):
+    for body, expected in (("Spec: ANYM-12", 0), ("Spec: ANYM-12\nTiden branch: review/y", 0),
+                           ("Spec: ANYM-50\nTiden branch: review/y", 1)):  # review/y is merged (ANYM-768)
         code, out = run_main(repo, server, body, monkeypatch, capsys)
-        assert code == (1 if "review/y" in body else 0), out
+        assert code == expected, out
     assert ("branch", "merge-preview") not in server.calls() and not server.writes()
 
 
@@ -323,6 +372,134 @@ def test_body_lines_keep_order_and_delivers_comes_first():
                                 "Spec: ANYM-3\nnot a Spec: ANYM-9 line")
     assert (lines.spec, lines.delivers, lines.branch, lines.errors) == ([3, 1], [7, 3], "proposal/a-b", [])
     assert lines.named == [7, 3, 1]
+
+
+# spec: ANYM-405
+@pytest.mark.parametrize("line", [
+    "- Spec: ANYM-1", "- Delivers: ANYM-1", "* Spec: ANYM-1", "+ Tiden branch: review/x", "1. Delivers: ANYM-1",
+    "2) Spec: ANYM-1", "> Delivers: ANYM-1", "- [x] Delivers: ANYM-1", "## Delivers: ANYM-1", "**Delivers:** ANYM-1",
+    "**Delivers**: ANYM-1", "- **Spec:** ANYM-1", "_Spec:_ ANYM-1", "spec: ANYM-1", "DELIVERS: ANYM-1",
+    "Specs: ANYM-1", "Deliver: ANYM-1", "Spec : ANYM-1", "tiden branch: review/x", "Tiden-branch: review/x",
+    "• Spec: ANYM-1", "  - Spec: ANYM-1", "***Delivers***: ANYM-1", "- **_Delivers_**: ANYM-1",
+    "***Delivers:*** ANYM-1", "1. - [x] **Spec:** ANYM-1",
+])
+def test_a_body_line_that_tries_to_be_a_tiden_line_fails_and_is_not_read(line):
+    lines = pr_check.parse_body(f"Text\n{line}\nMore")
+    assert len(lines.errors) == 1 and "column 1" in lines.errors[0], lines.errors
+    assert not lines.named and lines.branch is None
+
+
+# spec: ANYM-405
+@pytest.mark.parametrize("line", [
+    "Spec impact: none", "Specification: text", "Delivered: PR #12", "- Delivered: text", "not a Spec: ANYM-9 line",
+    "- `Spec:`, not `Delivers:`: prose in a list", "`Delivers: ANYM-5` comes with go-live",
+    "- `# spec: ANYM-5`: a marker quoted in a list", "# spec: ANYM-5", "// spec: ANYM-5", "## Spec", "- Spec",
+    "Tiden branches: text",
+])
+def test_prose_and_quoted_markers_are_not_taken_for_a_tiden_line(line):
+    assert pr_check.parse_body(f"Text\n{line}\nMore").errors == []
+
+
+# spec: ANYM-405
+@given(st.sampled_from(["- ", "* ", "+ ", "> ", "1. ", "3) ", "- [ ] ", "### ", "• ", "  - ", "> - "]),
+       st.sampled_from(["", "**", "__", "*", "_", "***", "**_", "_**"]),
+       st.sampled_from(["Spec", "Delivers", "Tiden branch"]),
+       st.sampled_from(["ANYM-1", "ANYM-1, ANYM-2", "review/x", "text"]))
+def test_every_decorated_tiden_line_is_an_error_never_silence(prefix, emphasis, key, value):
+    lines = pr_check.parse_body(f"{prefix}{emphasis}{key}:{emphasis} {value}")
+    assert lines.errors and not lines.named and lines.branch is None
+
+
+# spec: ANYM-405
+@pytest.mark.parametrize("line", ["#" * 50000 + "x", "1." * 25000 + "x", "[]" * 25000 + "x", "*_ " * 20000 + "x",
+                                  "#" * 50000 + " Spe", "- " * 25000 + "Delivers"])
+def test_a_long_decorated_line_is_judged_in_linear_time(line):
+    started = time.monotonic()
+    assert pr_check.parse_body(line).errors == []
+    assert time.monotonic() - started < 2
+
+
+# spec: ANYM-405
+@pytest.mark.parametrize("fence, close", [("```", "```"), ("~~~", "~~~"), ("````md", "````"), ("  ```", "  ```"),
+                                          ("- ```", "  ```"), ("> ```", "> ```"), ("1. ~~~", "   ~~~")])
+def test_a_fenced_example_is_no_attempt_and_the_real_line_is_still_read(fence, close):
+    lines = pr_check.parse_body(f"Delivers: ANYM-1\n{fence}\n- Delivers: ANYM-999\n{close}\nText")
+    assert (lines.errors, lines.delivers) == ([], [1])
+
+
+# spec: ANYM-405
+@pytest.mark.parametrize("body", [
+    "```\nexample\n```\n- Delivers: ANYM-1",  # closed before the line
+    "```\n~~~\n```\n- Delivers: ANYM-1",  # another character does not close it, and the real close does
+    "````\n```\n````\n- Delivers: ANYM-1",  # a shorter run does not close it
+    "```\nx\n```\n```\ny\n```\n- Delivers: ANYM-1",  # two blocks in a row
+    "    ```\n- Delivers: ANYM-1",  # four spaces indent code, no fence
+    "```inline``` text\n- Delivers: ANYM-1",  # inline code opens nothing
+    "- ```\n  example\n  ```\n- Delivers: ANYM-1",  # a list item's fence, closed before the line
+    "1. ```\n   example\n   ```\n2. Delivers: ANYM-1",  # the same in a numbered list
+    "> ```\n> example\n> ```\n> Delivers: ANYM-1",  # the same in a quote
+    "```\n- Delivers: ANYM-1",  # an unclosed fence hides nothing
+    "```\nx\n```\n```\n- Delivers: ANYM-1",  # nor one after a closed block
+])
+def test_a_tiden_line_after_a_closed_fence_or_a_false_fence_still_fails(body):
+    lines = pr_check.parse_body(body)
+    assert len(lines.errors) == 1 and "column 1" in lines.errors[0], lines.errors
+
+
+# spec: ANYM-405
+def test_a_merged_pull_request_with_a_fenced_example_still_settles_its_card(repo, server):
+    root, _ = repo
+    server.set(main=[spec(12, status="Review")])
+    sha = commit(root, {"README.md": "text\n"}, "squash")
+    report = []
+    tiden_sync.sync(root, sha, 1, "Delivers: ANYM-12\n```\n- Delivers: ANYM-999\n```\n", str(server.cli), "product",
+                    report.append)
+    assert "status: ANYM-12 Review -> Done." in report
+
+
+# spec: ANYM-405
+def test_a_line_after_a_list_items_fence_fails_the_check_and_stops_the_sync(repo, server):
+    root, _ = repo
+    body = "- ```\n  example\n  ```\n- Delivers: ANYM-12\n"
+    server.set(main=[spec(12, sources=[anchor("app/core.py")], status="Review")])
+    code, out = run(repo, server, {"app/core.py": "x = 2\n"}, body)
+    assert code == 1 and "`- Delivers: ANYM-12`" in out
+    sha = commit(root, {"README.md": "text\n"}, "squash")
+    with pytest.raises(tiden_sync.StepFailed) as failed:
+        tiden_sync.sync(root, sha, 1, body, str(server.cli), "product", lambda _: None)
+    assert failed.value.step == "parse" and not server.writes()
+
+
+# spec: ANYM-405
+@pytest.mark.parametrize("line", ["***Delivers***: ANYM-12", "- **_Delivers_**: ANYM-12"])
+def test_nested_emphasis_fails_the_check_and_stops_the_sync(repo, server, line):
+    root, _ = repo
+    server.set(main=[spec(12, sources=[anchor("app/core.py")], status="Review")])
+    code, out = run(repo, server, {"app/core.py": "x = 2\n"}, f"{line}\n")
+    assert code == 1 and "column 1" in out
+    sha = commit(root, {"README.md": "text\n"}, "squash")
+    with pytest.raises(tiden_sync.StepFailed) as failed:
+        tiden_sync.sync(root, sha, 1, f"{line}\n", str(server.cli), "product", lambda _: None)
+    assert failed.value.step == "parse" and not server.writes()
+
+
+# spec: ANYM-405
+def test_a_listed_delivers_line_fails_the_check_on_code_that_needs_no_spec(repo, server):
+    server.set(main=[spec(12, sources=[anchor("app/core.py")])])
+    code, out = run(repo, server, {"app/core.py": "x = 2\n"}, "- Spec: ANYM-12\n- Delivers: ANYM-12\n")
+    assert code == 1 and "Passed." not in out
+    assert out.count("column 1") == 2 and "`- Delivers: ANYM-12`" in out
+
+
+# spec: ANYM-405
+def test_a_listed_delivers_line_stops_the_sync_instead_of_naming_no_spec(repo, server):
+    root, _ = repo
+    server.set(main=[spec(12, status="Review")])
+    sha = commit(root, {"README.md": "text\n"}, "squash")
+    with pytest.raises(tiden_sync.StepFailed) as failed:
+        tiden_sync.sync(root, sha, 1, "- Delivers: ANYM-12\n", str(server.cli), "product", lambda line: None)
+    assert failed.value.step == "parse" and "column 1" in str(failed.value)
+    assert not server.writes()
 
 
 # spec: ANYM-405
