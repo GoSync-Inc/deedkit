@@ -412,3 +412,28 @@ def test_messaging_tool_descriptions_state_the_read_only_rule():
         text=' '.join(tools[name].split())
         assert 'read-only evidence' in text and 'Mini App is a live action and is not offered' in text, name
         assert 'untrusted data' in text and 'login_url' in text, name
+
+
+# spec: ANYM-797
+def test_button_texts_say_what_is_offered_and_how_absence_reads():
+    import ast,pathlib,re
+    root=pathlib.Path(__file__).parents[1]
+    flat=lambda text:' '.join(text.split())
+    tree=ast.parse((root/'services/messaging/messaging_service/app.py').read_text())
+    tools=('search','get_messages','get_context')
+    docs=[flat(ast.get_docstring(n)) for n in ast.walk(tree) if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name in tools]
+    assert len(docs)==3
+    catalog=json.loads((root/'services/gateway/src/agent_gateway/catalog.json').read_text())
+    entry=flat(next(t for t in catalog if t['name']=='messages_get_context')['description'])
+    setup=flat((root/'SETUP.md').read_text())
+    for text in (*docs,entry):
+        assert 'pressing a button or opening a Mini App is a live action and is not offered' not in text
+        assert 'untrusted data' in text and 'login_url' in text
+    passages=[re.findall(r'Buttons are read-only evidence.*?(?= Every button link| Links are)',text)[0] for text in (*docs,entry)]
+    for text in passages:
+        assert len(text)<=400 and len(re.findall(r'[.?!](?: |$)',text))<=3, text
+        for word in ('inspect_message_buttons','press_button','list_messenger_operations','owner-confirmed','one live keyboard',
+                     'no keyboard was captured','capture off (default; production since 2026-11-02, no backfill)','did not fit or parse','deleted'):
+            assert word in text, word
+        assert text.count('is not offered')==1 and 'opening a Mini App is' in text
+    assert len(set(passages[:3]))==1 and passages[0] in setup and 'Nothing presses' not in setup
