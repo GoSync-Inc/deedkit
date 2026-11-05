@@ -57,12 +57,13 @@ def report(stream: Iterable[bytes]) -> tuple[list[str], int]:
     lines: list[str] = []
     for key, verdict in verdicts.items():
         package, test = key
-        if verdict != "fail" or (not test and package in explained):
+        if verdict != "fail":
             continue
         if test:
             lines += [f"FAIL {package} {test}", *outputs.get(key, [])]
             continue
-        lines += [f"FAIL {package}", *(builds.get(causes.get(package, ""), []) + outputs.get(key, []))[:MAX_TEST_LINES]]
+        if package not in explained:
+            lines += [f"FAIL {package}", *(builds.get(causes.get(package, ""), []) + outputs.get(key, []))[:MAX_TEST_LINES]]
         # A timeout or crash leaves its tests without a verdict; their names and output are the explanation.
         for (owner, name), kept in outputs.items():
             if owner == package and name and (owner, name) not in verdicts:

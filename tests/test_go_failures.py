@@ -87,6 +87,15 @@ def test_a_test_left_running_by_a_failed_package_is_named(tmp_path):
 
 
 # spec: ANYM-801
+def test_a_timeout_after_an_earlier_failed_test_still_names_the_test_left_running(tmp_path):
+    done = run(tmp_path, [
+        *failed_test("TestBoom", 1), event("run", test="TestHangs"), output("panic: test timed out", "TestHangs"),
+        output("FAIL"), event("fail")])
+    assert done.stdout.splitlines() == [
+        f"FAIL {PACKAGE} TestBoom", "TestBoom line 0", f"FAIL {PACKAGE} TestHangs", "panic: test timed out"]
+
+
+# spec: ANYM-801
 def test_a_truncated_last_line_and_other_unreadable_lines_are_counted_not_fatal(tmp_path):
     done = run(tmp_path, ["not json", "[1]", json.dumps({"Action": 1}), *failed_test("TestBoom", 1)],
                raw=b'{"Action":"out\xd0')
