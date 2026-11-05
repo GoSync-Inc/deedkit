@@ -1215,7 +1215,7 @@ jobs:
           last=$(tail -n 1 "$RUNNER_TEMP/tiden-pr-check.txt")
           # A verdict is the script's closing line after its problem list, or a refusal of the pull request's own
           # content; every other line the script or a crash can end with is no verdict (tests/test_tiden_pr_check.py).
-          verdict='Fix the pull request body or the markers (TIDEN-CI.md, PR check), then rerun.'
+          verdict='Fix the pull request body or the markers (TIDEN-CI.md, PR check), then push a commit or close and reopen the pull request: a rerun replays the old body.'
           content='^Refused: (.+ does not parse \(.+\)|a changed path is not valid UTF-8)$'
           if [ "$status" -eq 0 ]; then
             echo 'outcome=passed' >> "$GITHUB_OUTPUT"
