@@ -5,12 +5,16 @@ persistent sequence, and a deterministic tie breaker does not prove phone order.
 """
 from __future__ import annotations
 
+import re
+
 from .policy import scope_filter
 
 KINDS=frozenset(('text','photo','video','voice','audio','document','sticker','location','contact','poll','system','unknown'))
 LABELS={'photo':'Фото','video':'Видео','voice':'Голосовое','audio':'Аудио','document':'Документ',
     'sticker':'Стикер','location':'Местоположение','contact':'Контакт','poll':'Опрос',
     'system':'Служебное событие','unknown':'Сообщение неизвестного типа'}
+# Every character str.splitlines breaks on: extracted text must not start a second line (ANYM-664).
+_LINE_BREAKS=re.compile('[\\n\\r\\v\\f\\x1c-\\x1e\\x85\\u2028\\u2029]+')
 
 
 def options(view='archive',include_system=False):
@@ -75,7 +79,80 @@ def contact_lines(block):
     return lines
 
 
-def present_message(row,position):
+def excerpt_quote(excerpt):
+    """The excerpt as one quoted line that cannot forge a label or end its quote early; '' when it has no words."""
+    text=_LINE_BREAKS.sub(' ',excerpt.get('text') or '').replace('«','"').replace('»','"').strip()
+    if not text:return ''
+    return '«'+text+('…' if excerpt.get('complete') is False else '')+'»'
+
+
+def _is_audio(file):
+    # The mime rule of result_evidence._TRANSCRIPT.
+    mime=file.get('mime') or ''
+    return mime.startswith('audio/') or mime=='application/ogg'
+
+
+def _preparing(file):
+    """A downloaded file whose words may still come; an image description never becomes an excerpt."""
+    return file.get('download_status')=='ready' and (file.get('extraction_status') in ('queued','leased','processing')
+        or _is_audio(file) and file.get('enrichment_status') in ('queued','processing'))
+
+
+def _text_reason(attachments,lost):
+    pending=[f for f in attachments if _preparing(f) and f.get('attachment_id') not in lost]
+    if pending:return 'расшифровка готовится' if any(_is_audio(f) for f in pending) else 'текст готовится'
+    if any((f.get('text_excerpt') or {}).get('omitted')=='response_budget' for f in attachments):
+        return 'текст в get_file_text'
+    return None
+
+
+def _button_line(row,kind):
+    # ANYM-658: the transcript has only display_text; a keyboard shows its first labels, never a link or a kind.
+    buttons=row.get('buttons')
+    flat=[b for r in buttons.get('rows',[]) for b in r] if isinstance(buttons,dict) else buttons if isinstance(buttons,list) else []
+    labels=[b['text'][:32] for b in flat[:8] if isinstance(b,dict) and b.get('text')]
+    return '[Кнопки] '+' | '.join(labels) if labels and kind!='system' else ''
+
+
+def displayed_quote(row):
+    """The quote present_message put into display_text, from the row's own marking and first attachment."""
+    if not row.get('display_text_media'):return ''
+    return excerpt_quote((row.get('attachments') or [{}])[0].get('text_excerpt') or {})
+
+
+def _split_display_text(row):
+    """(the sender's text, label and buttons; where the quote sits; the quote) of a row not capped yet.
+
+    The position comes from the row's structure: a caption or a button may hold the same words as the quote."""
+    text=row['display_text']
+    quote=displayed_quote(row)
+    if not quote:return text,len(text),''
+    line=_button_line(row,row.get('kind'))
+    at=len(text)-(len(line)+1 if line else 0)-len(quote)
+    return text[:at-1]+text[at+len(quote):],at-1,quote
+
+
+def _own_text_cut(row,limit):
+    """The truncation flags speak of the sender's text; a contact's lines are its text (ANYM-664 criterion 4)."""
+    if row.get('kind')=='contact':return True
+    return bool(row.get('body_truncated')) or len(row.get('body',row.get('snippet','')) or '')>limit
+
+
+def bound_display_text(row,limit):
+    """A limit bounds the sender's text and the label; the quote has its own bound and stays whole (ANYM-664)."""
+    own,at,quote=_split_display_text(row)
+    if len(own)<=limit:return row['display_text'],False
+    own=own[:limit];at=min(at,limit)
+    return own[:at]+(' ' if at else '')+quote+own[at:] if quote else own,_own_text_cut(row,limit)
+
+
+def cap_display_text(row,cap):
+    if cap is None:return
+    row['display_text'],cut=bound_display_text(row,cap)
+    if cut:row['display_text_truncated']=True
+
+
+def present_message(row,position,*,lost=()):
     body=row.get('body',row.get('snippet','')) or ''
     observed=row.get('message_kind')
     if row.get('is_service') is True:kind='system'
@@ -89,6 +166,14 @@ def present_message(row,position):
     row['kind']=kind;row['is_service']=kind=='system';row['position']=position
     row['conversation_view_version']=1
     label=LABELS.get(kind)
+    # ANYM-664: the first file's words; a sticker, a contact and a service event have none. A caption with a file but
+    # no observed media kind stays kind text and gets the label a file without a caption gets.
+    first=(row.get('attachments') or [{}])[0]
+    quote=excerpt_quote(first.get('text_excerpt') or {}) if kind not in ('sticker','contact','system') else ''
+    if quote:
+        row['display_text_media']=[{'attachment_id':first.get('attachment_id'),'source':first['text_excerpt']['source'],
+            'model_generated':first['text_excerpt']['model_generated'],'untrusted':True}]
+        if kind=='text':label=LABELS['document']+(': '+first['filename'][:256] if first.get('filename') else '')
     if label:
         if kind=='document':
             name=next((f.get('filename') for f in row.get('attachments',[]) if f.get('filename')),None)
@@ -111,19 +196,19 @@ def present_message(row,position):
             elif states & {'deferred'}:
                 label+='; файл доступен по запросу'
             else:label+='; файл пока недоступен'
+        # A video has no transcript profile, a sticker no text to wait for.
+        if not quote and kind not in ('sticker','contact','system','video'):
+            reason=_text_reason(attachments,lost)
+            if reason:label+='; '+reason
         lines=contact_lines(row.get('contact')) if kind=='contact' else []
         if lines:
             # A contact message has no caption: its body is the display name (native) or the raw
             # vCard (fallback), which stays in body; display shows only the structured lines.
             row['display_text']='\n'.join(lines)
-        else:row['display_text']=(body+'\n' if body else '')+'['+label+']'
+        else:row['display_text']=(body+'\n' if body else '')+'['+label+']'+(' '+quote if quote else '')
     else:row['display_text']=body
-    # ANYM-658: the transcript has only display_text; a keyboard shows its first labels, never a link or a kind.
-    buttons=row.get('buttons')
-    flat=[b for r in buttons.get('rows',[]) for b in r] if isinstance(buttons,dict) else buttons if isinstance(buttons,list) else []
-    labels=[b['text'][:32] for b in flat[:8] if isinstance(b,dict) and b.get('text')]
-    if labels and kind!='system':
-        row['display_text']=(row['display_text']+'\n' if row['display_text'] else '')+'[Кнопки] '+' | '.join(labels)
+    line=_button_line(row,kind)
+    if line:row['display_text']=(row['display_text']+'\n' if row['display_text'] else '')+line
     row['timestamp_precision']=row.get('timestamp_resolution') or 'unknown'
     row.setdefault('order_basis','timestamp_only');row.setdefault('order_status','timestamp_only')
     return row
@@ -145,6 +230,10 @@ def decorate_messages(c,p,rows,*,include_system=False):
           AND (s.account,s.chat,s.sent_at) IN(SELECT account,chat,sent_at FROM messages WHERE id=ANY(%s))
         GROUP BY s.account,s.chat,s.sent_at,a.platform''',[*args,ids]).fetchall()
     ties={(r['account'],r['chat'],r['sent_at']):r for r in siblings}
+    # A receipt says ready even when the original is gone with no eviction record: its label stays as it was.
+    from .result_evidence import original_present
+    lost={f['attachment_id'] for r in rows for f in r.get('attachments') or []
+        if _preparing(f) and f.get('original_residency')!='evicted' and not original_present(f)}
     for position,row in enumerate(rows,1):
         tied=ties.get((row['account'],row['chat'],row['sent_at']))
         platform=(tied or {}).get('platform',row.get('platform'))
@@ -156,7 +245,7 @@ def decorate_messages(c,p,rows,*,include_system=False):
         row['ordering']={'basis':row['order_basis'],'status':row['order_status'],
             'same_timestamp_messages':tied['n'] if tied else 1,'position_scope':'returned_view',
             'phone_order_verified':False}
-        present_message(row,position)
+        present_message(row,position,lost=lost)
     return rows
 
 

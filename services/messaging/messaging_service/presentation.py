@@ -102,7 +102,8 @@ def message_summary(row):
     if not snippet and (files or row.get('media_kind')):
         snippet='['+(row.get('media_kind') or 'attachment')+']'
         if files:snippet+=' '+(files[0].get('display_name') or files[0].get('filename') or '')
-        result['display_text_is_media_label']=True
+        # ANYM-664: a row whose display_text got its file's words is not only a label.
+        if not row.get('display_text_media'):result['display_text_is_media_label']=True
     match=snippet.find('[[')
     start=max(0,match-32) if match>=96 else 0
     result['snippet']=snippet[start:start+96]
@@ -147,7 +148,10 @@ def lean_message(row, *, search=False, files=True):
     if row.get('display_text_truncated') or row.get('body_truncated'):result['truncated']=True
     snippet=row.get('snippet') or ''
     # A search excerpt is kept only when it locates a match in a long text.
-    if search and len(text)>200 and snippet and not text.startswith(snippet):
+    # The quoted file text is never a reason (ANYM-664).
+    from .conversation import displayed_quote
+    quote=displayed_quote(row)
+    if search and len(text)-(len(quote)+1 if quote else 0)>200 and snippet and not text.startswith(snippet):
         match=snippet.find('[[')
         start=max(0,match-48) if match>=120 else 0
         result['snippet']=snippet[start:start+160]
@@ -341,7 +345,12 @@ def lean_chat(row):
             # The hint is the head: it carries the text once and last_message is omitted.
             hint['display_text']=result.pop('last_message')['display_text']
             if last.get('truncated'):hint['truncated']=True
-        else:hint['display_text']=(row.get('awaiting_reply_snippet') or '')[:160]
+        else:
+            # ANYM-664: the awaited message is not the head, but the state block may already hold its words.
+            target=(((state or {}).get('owner_attention') or {}).get('target_message')) or {}
+            quoted=target.get('display_text') if target.get('id')==hint['message_id'] and target.get('display_text_media') else None
+            hint['display_text']=(quoted or row.get('awaiting_reply_snippet') or '')[:160]
+            if quoted and len(quoted)>160:hint['truncated']=True
         hint.update(forward_fields({'forwarded':True,'forward_origin':row.get('awaiting_reply_forward_origin'),
             'authorship':row.get('awaiting_reply_authorship')},brief=True))
         if hint['sent_at']==result.get('last_activity'):hint.pop('sent_at')

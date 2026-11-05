@@ -314,7 +314,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
     import re
     import psycopg.errors
     from . import message_media_search as media_text
-    from .conversation import options,numeric_order_sql,visible_sql,decorate_messages,presentation
+    from .conversation import cap_display_text,options,numeric_order_sql,visible_sql,decorate_messages,presentation
     options(view,include_system)
     conversation=view=='conversation'
     bounded(limit)
@@ -514,10 +514,7 @@ def search(store,c,p,query='',account='',chat='',sender='',from_time='',to_time=
         decorate_messages(c,p,items,include_system=include_system)
         # Explicit caps bound source excerpts and the added readable field;
         # message IDs retain access to the complete captured provider body.
-        if cap is not None:
-            for item in items:
-                if len(item['display_text'])>cap:
-                    item['display_text']=item['display_text'][:cap];item['display_text_truncated']=True
+        for item in items:cap_display_text(item,cap)
     if body_format:
         from .formatting_readback import attach
         attach(items)
