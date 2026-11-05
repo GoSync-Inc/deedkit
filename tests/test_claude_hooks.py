@@ -133,6 +133,9 @@ BLOCKED = [
     "rg -- --files a.env",
     "ls )\nprintenv",
     "for x in a; do case $x in a) printenv;; esac; done",
+    "((1 + \"2\" << 3))\nprintenv",
+    "if true; then 'case' x in; (docker inspect c); fi",
+    "FMT='{{.Config.Env}}' env -S 'docker inspect --format \"{{.State.Status}}${FMT}\" c'",
 ]
 
 ALLOWED = [

@@ -70,8 +70,10 @@ def trailing_backslashes(line):
 
 
 class Word(str):
-    """A shell word after quote removal; dynamic: it holds an expansion whose value this hook cannot see."""
+    """A shell word after quote removal; dynamic: it holds an expansion whose value this hook cannot see; quoted: some of
+    it was quoted, so it is never a reserved word."""
     dynamic = False
+    quoted = False
 
 
 class Segment:
@@ -102,18 +104,19 @@ class Parser:
 
     def arithmetic_end(self, start):
         """The index after the `))` of arithmetic opening with `((` at start, or None when it is commands. As bash reads it:
-        the inner parenthesis closes directly before the outer one. Quotes and a shift in a doubtful region refuse."""
+        the inner parenthesis closes directly before the outer one. A doubtful region with a later `<<` refuses, because
+        reading a shift as a here-document would swallow the commands after it."""
         text, depth = self.text, 0
         for index in range(start + 1, len(text)):
             char = text[index]
-            if char in "'\"": return None
+            if char in "'\"": break
             if char == "(": depth += 1
             elif char == ")":
                 depth -= 1
                 if depth: continue
                 if text[index + 1:index + 2] == ")": return index + 2
-                if "<<" in text[start:text.find("\n", index) % (len(text) + 1)]: raise ValueError("doubtful arithmetic")
-                return None
+                break
+        if "<<" in text[start:]: raise ValueError("doubtful arithmetic")
         return None
 
     def dollar_paren(self, index):
@@ -186,12 +189,13 @@ class Parser:
             nonlocal buffer, in_word, dynamic, quoted, pending, cases, pattern
             if not in_word: return
             word = Word("".join(buffer))
-            word.dynamic = dynamic
+            word.dynamic, word.quoted = dynamic, quoted
             if pending is None:
                 if not segment.words and not quoted and word == "esac":
                     cases, pattern = max(cases - 1, 0), False
                 segment.words.append(word)
-                if word == "in" and not quoted and without_prefix(segment.words)[:1] == ["case"]:
+                command = without_prefix(segment.words)
+                if word == "in" and not quoted and len(command) == 3 and command[0] == "case" and not command[0].quoted:
                     cases, pattern = cases + 1, True
                     segment.words = []
             elif pending == "in": segment.inputs.append(word)
@@ -563,6 +567,12 @@ def systemctl_blocked(args):
     return any(part.strip().lower() == "environment" for value in properties for part in value.split(","))
 
 
+def env_split_word(token):
+    word = Word(token)
+    word.dynamic = "$" in token  # env -S expands ${VAR} itself
+    return word
+
+
 def env_blocked(args, depth):
     index = 0
     while index < len(args):
@@ -572,7 +582,7 @@ def env_blocked(args, depth):
             # env splits only this payload, with no shell; the words after it stay literal arguments.
             tail = args[index + 1:] if split.group(1) else args[index + 2:]
             payload = split.group(1) or (args[index + 1] if index + 1 < len(args) else "")
-            return command_blocked([*map(Word, shlex.split(payload)), *tail], depth + 1)
+            return command_blocked([*map(env_split_word, shlex.split(payload)), *tail], depth + 1)
         if word in ("-u", "--unset", "-C", "--chdir"): index += 2
         elif is_flag(word) or ASSIGNMENT.match(word): index += 1
         else: return command_blocked(args[index:], depth + 1)
