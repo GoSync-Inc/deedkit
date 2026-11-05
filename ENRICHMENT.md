@@ -256,7 +256,7 @@ line naming only the exception type, waits 5 s, doubled per consecutive failure 
 tries again. A claim that rolled back spent nothing. A claim whose commit reached the server
 but whose answer was lost keeps its attempt and budget, and that job, like one whose result
 could not be written, stays under its lease until that expires. Exit 78, a failed requeue while
-stopping, a refused login and any other error still end it. Fairness
+stopping, a refused login, a bad DSN option and any other error still end it. Fairness
 between modalities/accounts prevents a continuous audio backlog from hiding
 video work. All of this is source functionality; production enablement requires
 the verified promotion and applicable live-session authority in

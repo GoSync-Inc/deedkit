@@ -104,18 +104,20 @@ DB_TRANSIENT=(psycopg.errors.QueryCanceled,psycopg.errors.LockNotAvailable,psyco
     psycopg.errors.SerializationFailure,psycopg.errors.AdminShutdown,psycopg.errors.CrashShutdown,
     psycopg.errors.CannotConnectNow,psycopg.errors.IdleSessionTimeout,psycopg.errors.TooManyConnections,
     psycopg.errors.DiskFull,psycopg.errors.OutOfMemory)
-# A login the server refuses has no SQLSTATE: psycopg raises a plain OperationalError with libpq's text (English on
-# our databases, lc_messages en_US; under another language such an error is retried and logged).
-DB_LOGIN_REFUSED=('password authentication failed','no password supplied','no pg_hba.conf entry','role "','database "',
-    'not permitted to log in','permission denied for database')
+# A failed or lost connection has no SQLSTATE: psycopg raises a plain OperationalError with libpq's text, and a refused
+# login or a bad DSN option looks the same. Only these texts are retried; a text not listed ends the worker, as before.
+DB_CONNECTION_LOST=('timeout expired','Connection refused','Connection reset','Connection timed out','No route to host',
+    'Network is unreachable','could not translate host name','server closed the connection',
+    'could not send data to server','could not receive data from server','SSL connection has been closed',
+    'the database system is','too many clients','the connection is closed','connection is lost')
 
 
 def transient_database_error(error):
     """A timeout, a conflict, a busy or restarting server, a lost connection. Anything else stays fatal: the DSN is
-    read only at start, so a retry cannot repair a refused login, and a running container would hide it."""
+    read only at start, so a retry cannot repair a refused login or a bad option, and a running container hides it."""
     if isinstance(error,DB_TRANSIENT):return True
     if error.sqlstate:return False
-    return not any(text in str(error) for text in DB_LOGIN_REFUSED)
+    return any(text in str(error) for text in DB_CONNECTION_LOST)
 
 
 def cooldown_seconds(profile,retry_after):
