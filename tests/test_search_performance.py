@@ -52,6 +52,39 @@ def test_absent_lexical_query_reads_bounded_message_candidates(seeded):
 
 
 # spec: ANYM-656
+def test_related_chat_candidates_stay_on_the_text_index_when_a_date_walk_looks_cheaper(seeded,monkeypatch):
+    from datetime import datetime,timezone
+    from messaging_service import related_chats
+    s,a,b=seeded
+    monkeypatch.setattr(related_chats,'DEADLINE_SECONDS',120.0)  # the plan is under test, not the host's speed
+    class Candidates:
+        def __init__(self,connection):self.connection=connection;self.plans=[]
+        def execute(self,sql,args=None):
+            if 'related_chats:candidates' in sql:
+                self.plans.append(self.connection.execute('EXPLAIN (ANALYZE,FORMAT JSON) '+sql,args).fetchone()['QUERY PLAN'][0]['Plan'])
+            return self.connection.execute(sql,args)
+        def __getattr__(self,name):return getattr(self.connection,name)
+    with s.pool.connection() as c:
+        c.execute("SET LOCAL statement_timeout='120s'")
+        c.execute("""INSERT INTO chats(id,account,provider_chat,title,chat_type)
+            SELECT 'busy-'||n,'telegram-demo','busy-'||n,'Busy '||n,'private' FROM generate_series(0,99) n
+            UNION ALL SELECT 'fresh','telegram-demo','fresh','Fresh','private'""")
+        c.execute("""INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
+            SELECT 'bulk-'||n,'telegram-demo','busy-'||(n%100),n::text,'owner','unique-token-'||n||'-end ordinary words around the lease',
+                now()-n*interval '3 seconds','outgoing' FROM generate_series(1,20000) n""")
+        c.execute("""INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction)
+            VALUES('fresh-1','telegram-demo','fresh','1','peer','unique-token-50-end ordinary words around the lease',now()-interval '1 second','incoming')""")
+        c.execute('ANALYZE messages');c.execute('ANALYZE chats')
+    with s.authorized(a,'list_chats') as (c,p):
+        # Sorting priced out is the plan a run met by chance (#646, run 41953348270): the ordered date walk wins whenever it can exist.
+        c.execute('SET LOCAL enable_sort=off');c.execute('SET LOCAL enable_seqscan=off')
+        measured=Candidates(c)
+        found=related_chats.hints(measured,p,[{'id':'fresh','type':'private','last_activity':datetime.now(timezone.utc)}])
+    assert found['fresh']['related_chats'][0]['source_message_id']=='bulk-50'
+    assert len(measured.plans)==1 and visited(measured.plans[0],{'messages'})<2000,[scans(plan) for plan in measured.plans]
+
+
+# spec: ANYM-656
 def test_related_chat_check_reads_bounded_messages_in_a_200k_archive(seeded):
     from datetime import datetime,timezone
     from messaging_service import related_chats
