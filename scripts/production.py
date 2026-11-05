@@ -134,7 +134,7 @@ class CallActive(Refused):
 
 
 
-DEADLINE = None  # a time.monotonic() value: set only by `preflight_cleanup`, so every command of that pass is bounded by it
+DEADLINE = None  # a time.monotonic() value: set only by `preflight_cleanup` and inference_worker_start.py, so every command of that pass or run is bounded by it
 
 
 def run(argv, *, cwd=None, umask=-1, env=None, reason=False, timeout=1800, binary=False):
@@ -4126,6 +4126,34 @@ def calendar_backup_line(path=None, at=None):
         return f"{prefix}freshness file unreadable ({reason})"
 
 
+INFERENCE_WORKER_RECEIPT = Path("/var/lib/deedkit/inference-worker.json")
+
+
+def inference_worker_line(path=None):
+    """The `status` line for deedkit-inference-worker.service's receipt (ANYM-794); read-only, never an error for `status`."""
+    prefix = "inference worker: "
+    try:
+        try:
+            with open(path or INFERENCE_WORKER_RECEIPT, "rb") as handle:
+                data = json.loads(handle.read(65536))
+        except FileNotFoundError:
+            return prefix + "no receipt"
+        if not isinstance(data, dict):
+            return prefix + "receipt unreadable (not an object)"
+        checked, outcome, reason = data.get("checked_at"), data.get("outcome"), data.get("reason")
+        try:
+            datetime.strptime(checked, "%Y-%m-%dT%H:%M:%SZ")
+        except (TypeError, ValueError):
+            return prefix + "receipt unreadable (bad checked_at)"
+        if not isinstance(outcome, str) or outcome not in ("started", "already_running", "refused"):
+            return prefix + "receipt unreadable (bad outcome)"
+        if not (reason is None or isinstance(reason, str) and re.fullmatch(r"[a-z0-9_-]{1,64}", reason)):
+            return prefix + "receipt unreadable (bad reason)"
+        return f"{prefix}{outcome}{' ' + reason if reason else ''} (checked {checked})"
+    except Exception as exc:
+        return f"{prefix}receipt unreadable ({'not JSON' if isinstance(exc, ValueError) else type(exc).__name__})"
+
+
 def leaf_identity(found):
     """What a change to runner.json changes: its inode, content times, size, owner and mode."""
     return (found.st_dev, found.st_ino, found.st_size, found.st_mtime_ns, found.st_ctime_ns, found.st_mode,
@@ -7071,6 +7099,7 @@ def print_result(args, result, parser):
         if args.action == "status":
             # Beside the JSON, not in it: a reader that parses stdout keeps getting one document.
             print(calendar_backup_line(), file=sys.stderr)
+            print(inference_worker_line(), file=sys.stderr)
 
 
 def main(argv=None):
