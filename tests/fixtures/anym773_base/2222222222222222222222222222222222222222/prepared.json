@@ -1,0 +1,29 @@
+{
+ "ci": {
+  "run_id": 12,
+  "sha": "2222222222222222222222222222222222222222"
+ },
+ "images": {
+  "runtime": "sha256:894acae4e53c80f019c7ed48cb9a42623d270fb0fe429320b6848bca621e72cc"
+ },
+ "projects": [
+  {
+   "before_digest": "45b44337b2682c5e52f03e6bc61fd7349fe381b371c4af598d4be159d82b6199",
+   "before_file_digest": "7bbed14f08577d79244507b68d833047fd345b946e9b8ed4f6a41c05d22a08eb",
+   "digest": "f932bce6af3f6d86f5816e84af8128be3618080b97f85682a3f959552dca72a8",
+   "name": "synthetic",
+   "running": {
+    "api": {
+     "container": "container1",
+     "image": "sha256:ba2977b7f288617e054188546cc3311001791f85ab884ed80bd7e4d8d3d60cbf",
+     "settings": "v2:ee6ad0f37651ed6a921b6a20bdf6c0cc574821a4bbdb73120ce72f81864b9589"
+    }
+   }
+  }
+ ],
+ "references": {
+  "runtime": "ghcr.io/gosync-inc/deedkit-runtime@sha256:79396ef8980b554cb66116d8c775a13c499189f5681b6d3a2efd2df8990afc55"
+ },
+ "sha": "2222222222222222222222222222222222222222",
+ "version": 1
+}

@@ -1,0 +1,21 @@
+{
+  "name": "synthetic",
+  "services": {
+    "api": {
+      "image": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "environment": {
+        "SYNTHETIC_CANARY": "synthetic-env-canary-773",
+        "SYNTHETIC": "literal"
+      },
+      "volumes": [
+        {
+          "source": "/existing",
+          "target": "/data"
+        }
+      ]
+    },
+    "db": {
+      "image": "postgres:pinned"
+    }
+  }
+}

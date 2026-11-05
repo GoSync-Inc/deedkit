@@ -19,6 +19,8 @@ from types import SimpleNamespace
 import urllib.error
 
 from hypothesis import given, strategies as st
+import posixpath
+import shutil
 import pytest
 import yaml
 
@@ -1437,6 +1439,425 @@ def test_three_successive_releases_roll_back_only_the_current_one_once(tmp_path,
         with pytest.raises(p.Refused, match="only the current applied release"):
             p.rollback(host.settings, sha)
     assert host.mutations() == []
+
+
+# ANYM-773: Compose as both tested versions behave. Default `config` inlines env files, prints `$` as `$$` and interpolates;
+# `--no-interpolate` keeps absolute references (a path starting with a variable keeps it after the project directory).
+ENV_CANARY = "synthetic-env-canary-773"
+
+
+def env_file_values(path):
+    values = {}
+    if not os.path.exists(path):
+        return values
+    for line in Path(path).read_text().splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            if value[:1] == '"':
+                value = value[1:-1].replace('\\"', '"').replace("\\$", "$")
+            elif value[:1] == "'":
+                value = value[1:-1]
+            values[key] = value
+    return values
+
+
+def render_compose(argv, text, directory, variables=None, ignores=False):
+    document = json.loads(text)
+    keep = "--no-interpolate" in argv and not ignores
+
+    def expand(value):
+        if isinstance(value, str):
+            for name, replacement in (variables or {}).items():
+                value = value.replace("${" + name + "}", replacement)
+            return value
+        if isinstance(value, list):
+            return [expand(item) for item in value]
+        return {key: expand(item) for key, item in value.items()} if isinstance(value, dict) else value
+
+    if not keep:
+        document = expand(document)
+    for unit in document["services"].values():
+        entries = [{"path": entry} if isinstance(entry, str) else entry for entry in unit.pop("env_file", None) or []]
+        if keep:
+            if entries:
+                unit["env_file"] = [{**entry, "path": posixpath.join(directory, entry["path"]), "required": True} for entry in entries]
+            continue
+        environment = {}
+        for entry in entries:
+            environment.update({key: value.replace("$", "$$") for key, value in env_file_values(entry["path"]).items()})
+        environment.update(unit.get("environment") or {})
+        if environment:
+            unit["environment"] = environment
+    return json.dumps(document)
+
+
+class EnvHost(Host):
+    """`Host` whose `api` service names a synthetic env file."""
+
+    def __init__(self, tmp_path, monkeypatch, content=f"SYNTHETIC_CANARY={ENV_CANARY}\n", **unit):
+        super().__init__(tmp_path, monkeypatch)
+        self.env = tmp_path / "api.env"
+        self.env.write_text(content)
+        document = json.loads(self.original.read_text())
+        document["services"]["api"] = {**document["services"]["api"], "env_file": [str(self.env)], **unit}
+        self.original.write_text(json.dumps(document))
+        self.variables, self.ignores = {}, False
+        monkeypatch.setattr(p, "run_input", lambda argv, data, **kw: render_compose(argv, data.decode(), str(tmp_path), self.variables))
+
+    def run(self, argv, **kwargs):
+        if argv[:2] == ["docker", "compose"] and "config" in argv:
+            self.calls.append(argv)
+            return render_compose(argv, Path(argv[argv.index("-f") + 1]).read_text(), str(self.root), self.variables, self.ignores)
+        return super().run(argv, **kwargs)
+
+    def canary_files(self, canary=ENV_CANARY):
+        return [str(path) for path in self.state.rglob("*") if path.is_file() and canary.encode() in path.read_bytes()]
+
+
+BASE_RELEASES = ROOT / "tests" / "fixtures" / "anym773_base"
+
+
+def legacy_prepare(host, sha, monkeypatch=None):
+    """A release as the base code left it: documents and receipt recorded by running that code's `prepare` over this same
+    synthetic host (tests/fixtures/anym773_base/README.md). Only what binds the temporary directory is filled in here."""
+    release, recorded = host.state / sha, BASE_RELEASES / sha
+    release.mkdir(mode=0o700)
+    for name in ("synthetic.json", "synthetic.before.json"):
+        (release / name).write_bytes((recorded / name).read_bytes())
+    receipt = json.loads((recorded / "prepared.json").read_text())
+    for project in receipt["projects"]:
+        project["file"] = str(release / (project["name"] + ".json"))
+    current = host.state / "current.json"
+    receipt["config_digest"] = p.settings_digest(host.settings)
+    receipt["current_digest"] = p.digest(p.read(current) if current.exists() else None)
+    p.write(release / "prepared.json", receipt)
+    host.images[host.image(sha)] = ImageStore.image("c", revision=sha, source=sha) | {"Id": host.image(sha)}
+    assert host.canary_files()  # the legacy shape holds the value inline
+    return receipt
+
+
+# spec: ANYM-773
+def test_prepare_writes_env_file_references_and_no_value_with_digests_over_the_resolved_document(tmp_path, monkeypatch):
+    host = EnvHost(tmp_path, monkeypatch)
+    host.main = RELEASES[0]
+    receipt = p.prepare(host.settings, RELEASES[0])
+    assert host.canary_files() == []
+    for name in ("synthetic.json", "synthetic.before.json"):
+        unit = p.read(host.state / RELEASES[0] / name)["services"]["api"]
+        assert unit["env_file"] == [{"path": str(host.env), "required": True}] and "SYNTHETIC_CANARY" not in unit["environment"]
+    assert unit["environment"]["SYNTHETIC"] == "literal"
+    resolved = json.loads(render_compose(["config"], host.original.read_text(), str(tmp_path)))
+    assert receipt["render"] == 2 and receipt["projects"][0]["before_digest"] == p.digest(resolved)
+    assert receipt["env_files"] == [{"path": str(host.env), "sha256": hashlib.sha256(host.env.read_bytes()).hexdigest()}]
+
+
+# spec: ANYM-773
+@pytest.mark.parametrize("line", ["LD_PRELOAD=/data/evil.so", "PYTHONPATH=/data/code"])
+def test_an_import_override_in_an_env_file_still_refuses_preparation(tmp_path, monkeypatch, line):
+    host = EnvHost(tmp_path, monkeypatch, content=line + "\n")
+    host.main = RELEASES[0]
+    with pytest.raises(p.Refused, match="runtime import path overrides"):
+        p.prepare(host.settings, RELEASES[0])
+
+
+# spec: ANYM-773
+@pytest.mark.parametrize("failure", ["inlines", "drops", "fails"])
+def test_a_compose_that_cannot_give_references_refuses_with_nothing_written(tmp_path, monkeypatch, failure):
+    host = EnvHost(tmp_path, monkeypatch)
+    host.main = RELEASES[0]
+    real = host.run
+
+    def broken(argv, **kwargs):
+        if "deedkit-env-probe" in argv:
+            if failure == "fails":
+                raise p.Refused("docker failed (exit 1)")
+            document = json.loads(Path(argv[argv.index("-f") + 1]).read_text())
+            unit = document["services"]["probe"]
+            environment = env_file_values(unit.pop("env_file")[0]["path"])
+            if failure == "inlines":
+                unit["environment"] = environment
+            return json.dumps(document)
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(p, "run", broken)
+    with pytest.raises(p.Refused, match="compose_ignores_env_resolution") as refused:
+        p.prepare(host.settings, RELEASES[0])
+    assert ENV_CANARY not in str(refused.value) and not (host.state / RELEASES[0]).exists()
+
+
+# spec: ANYM-773
+@pytest.mark.parametrize("canary", ['syn$thetic"canary-773', "plain-canary-value-773"])
+def test_a_value_of_an_env_file_elsewhere_in_the_document_refuses_without_naming_it(tmp_path, monkeypatch, canary):
+    quoted = "'" + canary + "'"
+    host = EnvHost(tmp_path, monkeypatch, content=f"API_OTHER={quoted}\n", command=["--note", "${REFERENCE}"])
+    host.variables = {"REFERENCE": canary.replace("$", "$$")}
+    host.main = RELEASES[0]
+    with pytest.raises(p.Refused, match="env_value_in_evidence") as refused:
+        p.prepare(host.settings, RELEASES[0])
+    message = str(refused.value)
+    assert message == f"env_value_in_evidence: {host.env}" and "API_OTHER" not in message and canary not in message
+    assert not list((host.state / RELEASES[0]).glob("*.json"))
+
+
+# spec: ANYM-773
+def test_a_literal_the_source_writes_at_that_place_passes_unless_its_name_looks_secret(tmp_path, monkeypatch):
+    # Measured on the host: POSTGRES_USER and POSTGRES_DB of postgres.env stand in the db healthcheck as literals.
+    probe = {"test": ["CMD", "pg_isready", "-U", "synthetic_owner"]}
+    host = EnvHost(tmp_path, monkeypatch, content="POSTGRES_USER=synthetic_owner\n", healthcheck=probe)
+    host.main = RELEASES[0]
+    p.prepare(host.settings, RELEASES[0])
+    (tmp_path / "second").mkdir()
+    host = EnvHost(tmp_path / "second", monkeypatch, content="API_PASSWORD=synthetic_owner\n", healthcheck=probe)
+    host.main = RELEASES[1]
+    with pytest.raises(p.Refused, match="env_value_in_evidence"):
+        p.prepare(host.settings, RELEASES[1])
+
+
+# spec: ANYM-773
+def test_a_default_in_the_source_is_not_a_literal_and_refuses(tmp_path, monkeypatch):
+    host = EnvHost(tmp_path, monkeypatch, content="API_OTHER=synthetic-default-value\n", command=["--note", "${NOTE:-synthetic-default-value}"])
+    host.variables = {"NOTE:-synthetic-default-value": "synthetic-default-value"}
+    host.main = RELEASES[0]
+    with pytest.raises(p.Refused, match="env_value_in_evidence"):
+        p.prepare(host.settings, RELEASES[0])
+
+
+# spec: ANYM-773
+@pytest.mark.parametrize("key,value", [("API_CREDENTIAL", "10.99.0.2:8443"), ("DATABASE_URL", "10.99.0.2:8443"), ("VAULT_TOKEN", "/looks/like/a/path")])
+def test_a_secret_named_interpolation_value_refuses_also_when_it_looks_like_a_path(tmp_path, monkeypatch, key, value):
+    host = EnvHost(tmp_path, monkeypatch, content="UNRELATED=x\n", command=["--hosts", "${REFERENCE}"])
+    host.variables = {"REFERENCE": value}
+    (tmp_path / ".env").write_text(f"{key}={value}\n")
+    host.main = RELEASES[0]
+    with pytest.raises(p.Refused, match="env_value_in_evidence"):
+        p.prepare(host.settings, RELEASES[0])
+
+
+# spec: ANYM-773
+def test_interpolation_files_refuse_only_a_secret_named_value_in_the_document(tmp_path, monkeypatch):
+    host = EnvHost(tmp_path, monkeypatch, command=["--hosts", "${PUBLIC_ADDRESS}"])
+    host.variables = {"PUBLIC_ADDRESS": "10.99.0.2:8443"}
+    (tmp_path / ".env").write_text("PUBLIC_ADDRESS=10.99.0.2:8443\nCERT_TOKEN_FILE=/run/secrets/certificate\n")
+    host.main = RELEASES[0]
+    p.prepare(host.settings, RELEASES[0])  # the address a document needs; a path under a secret-looking name
+    (tmp_path / ".env").write_text("PUBLIC_API_TOKEN=10.99.0.2:8443\n")
+    host.main = RELEASES[1]
+    with pytest.raises(p.Refused, match="env_value_in_evidence") as refused:
+        p.prepare(host.settings, RELEASES[1])
+    assert str(refused.value) == f"env_value_in_evidence: {tmp_path / '.env'}"
+
+
+# spec: ANYM-773
+@given(st.text(alphabet='a$"\\b', max_size=12))
+def test_a_value_compose_printed_is_escaped_once_and_reads_back_as_printed(value):
+    printed = value.replace("$", "$$")  # what `config` prints
+    assert p.escaped_rendered(printed) == printed and p.escaped_rendered({"k": [printed]}) == {"k": [printed]}
+    assert p.escaped(value) == printed  # a raw value: `router$$name` keeps both of its dollar signs
+
+
+# spec: ANYM-773
+def test_a_legacy_release_applies_and_rolls_back_and_its_files_stay_as_written(tmp_path, monkeypatch):
+    host = EnvHost(tmp_path, monkeypatch)
+    host.main = RELEASES[0]
+    p.prepare(host.settings, RELEASES[0])
+    p.apply(host.settings, RELEASES[0])
+    host.main = RELEASES[1]
+    legacy_prepare(host, RELEASES[1], monkeypatch)
+    before = {path: path.read_bytes() for path in (host.state / RELEASES[1]).glob("synthetic*.json")}
+    assert "render" not in p.read(host.state / RELEASES[1] / "prepared.json")
+    p.apply(host.settings, RELEASES[1])
+    p.rollback(host.settings, RELEASES[1])
+    assert host.container["Image"] == host.image(RELEASES[0])
+    assert before == {path: path.read_bytes() for path in before}
+
+
+# spec: ANYM-773
+def test_a_new_release_on_a_legacy_current_applies_and_rolls_back(tmp_path, monkeypatch):
+    host = EnvHost(tmp_path, monkeypatch)
+    host.main = RELEASES[0]
+    legacy_prepare(host, RELEASES[0], monkeypatch)
+    p.apply(host.settings, RELEASES[0])
+    host.main = RELEASES[1]
+    p.prepare(host.settings, RELEASES[1])
+    assert p.read(host.state / RELEASES[1] / "prepared.json")["render"] == 2
+    p.apply(host.settings, RELEASES[1])
+    p.rollback(host.settings, RELEASES[1])
+    assert host.container["Image"] == host.image(RELEASES[0])
+    assert p.read(host.state / "current.json")["status"] == "rolled-back"
+
+
+# spec: ANYM-773
+def test_a_legacy_release_keeps_its_unhealthy_rollback(tmp_path, monkeypatch):
+    host = EnvHost(tmp_path, monkeypatch)
+    host.main = RELEASES[0]
+    p.prepare(host.settings, RELEASES[0])
+    p.apply(host.settings, RELEASES[0])
+    host.main = RELEASES[1]
+    legacy_prepare(host, RELEASES[1], monkeypatch)
+    run = host.run
+
+    def failing(argv, **kwargs):
+        if "up" in argv and "--wait" in argv:
+            run(argv, **kwargs)
+            raise p.Refused("docker failed (exit 1)")
+        return run(argv, **kwargs)
+
+    monkeypatch.setattr(p, "run", failing)
+    with pytest.raises(p.Refused, match="failed its health wait"):
+        p.apply(host.settings, RELEASES[1])
+    assert p.read(host.state / RELEASES[1] / "result.json")["status"] == "unhealthy"
+    monkeypatch.setattr(p, "run", run)
+    p.rollback(host.settings, RELEASES[1])
+    assert host.container["Image"] == host.image(RELEASES[0])
+
+
+# spec: ANYM-773
+def test_an_interrupted_legacy_apply_refuses_and_its_rollback_target_restores_by_the_manual_procedure(tmp_path, monkeypatch):
+    class Crash(BaseException):
+        pass
+
+    host = EnvHost(tmp_path, monkeypatch)
+    host.main = RELEASES[0]
+    p.prepare(host.settings, RELEASES[0])
+    p.apply(host.settings, RELEASES[0])
+    host.main = RELEASES[1]
+    prepared = legacy_prepare(host, RELEASES[1], monkeypatch)
+    run = host.run
+
+    def crashing(argv, **kwargs):
+        if "up" in argv and "--wait" in argv:
+            raise Crash
+        return run(argv, **kwargs)
+
+    monkeypatch.setattr(p, "run", crashing)
+    with pytest.raises(Crash):
+        p.apply(host.settings, RELEASES[1])
+    monkeypatch.setattr(p, "run", run)
+    assert not host.container["State"]["Running"]  # stopped, nothing started: the partial state
+    assert RELEASES[1] in p.unfinished(host.state)
+    with pytest.raises(p.Refused, match="already attempted"):
+        p.apply(host.settings, RELEASES[1])
+    with pytest.raises(p.Refused, match="unfinished"):
+        p.rollback(host.settings, RELEASES[0])
+    # The tool has no automatic recovery. The manual procedure is `up` of the bound before-release file.
+    before = host.state / RELEASES[1] / "synthetic.before.json"
+    assert p.digest(p.read(before)) == prepared["projects"][0]["before_file_digest"]
+    command = ["docker", "compose", "--profile", "*", "--project-name", "synthetic", "-f", str(before)]
+    run(command + ["up", "-d", "--no-build", "--pull", "never", "--no-deps", "--wait", "api"])
+    assert host.container["Image"] == host.image(RELEASES[0]) and host.container["State"]["Running"]
+    assert p.read(before)["services"]["api"]["environment"]["SYNTHETIC_CANARY"] == ENV_CANARY
+
+
+# spec: ANYM-773
+@pytest.mark.parametrize("change", ["comment", "value"])
+def test_a_changed_env_file_of_a_selected_service_refuses_apply(tmp_path, monkeypatch, change):
+    host = EnvHost(tmp_path, monkeypatch)
+    host.main = RELEASES[0]
+    p.prepare(host.settings, RELEASES[0])
+    host.env.write_text(host.env.read_text() + ("# a comment\n" if change == "comment" else "API_OTHER=changed-value\n"))
+    host.calls.clear()
+    with pytest.raises(p.Refused, match="production or prepared configuration changed since preparation"):
+        p.apply(host.settings, RELEASES[0])
+    assert host.mutations() == []
+
+
+# spec: ANYM-773
+@pytest.mark.parametrize("legacy", [False, True])
+def test_rollback_after_an_env_file_changed_refuses_and_with_it_unchanged_succeeds(tmp_path, monkeypatch, legacy):
+    host = EnvHost(tmp_path, monkeypatch)
+    host.main = RELEASES[0]
+    p.prepare(host.settings, RELEASES[0])
+    p.apply(host.settings, RELEASES[0])
+    host.main = RELEASES[1]
+    legacy_prepare(host, RELEASES[1], monkeypatch) if legacy else p.prepare(host.settings, RELEASES[1])
+    p.apply(host.settings, RELEASES[1])
+    content = host.env.read_text()
+    host.env.write_text(content + "API_OTHER=changed-value\n")
+    host.calls.clear()
+    with pytest.raises(p.Refused, match="production changed since this release was applied"):
+        p.rollback(host.settings, RELEASES[1])
+    assert host.mutations() == []
+    host.env.write_text(content)
+    p.rollback(host.settings, RELEASES[1])
+    assert host.container["Image"] == host.image(RELEASES[0])
+
+
+# spec: ANYM-773
+def test_real_compose_keeps_references_and_reads_the_written_file_back_exactly(tmp_path, monkeypatch):
+    if not shutil.which("docker") or subprocess.run(["docker", "compose", "version"], capture_output=True, timeout=15).returncode:
+        pytest.skip("Docker Compose CLI is needed for the real parser")
+    canary, dollar = "synthetic-real-canary", "syn$thetic-dollar-value"
+    (tmp_path / "state" / "service").mkdir(parents=True)
+    (tmp_path / "app.env").write_text(f"APP_CREDENTIAL={canary}\nAPP_DOLLAR='{dollar}'\nOVERRIDDEN=from-the-env-file\nPOSTGRES_USER=synthetic_owner\n")
+    (tmp_path / "state" / "service" / "s.env").write_text(f"STATE_CREDENTIAL={canary}-state\n")
+    (tmp_path / "interp.env").write_text(f"STATE_DIR={tmp_path}/state\nPORT=8123\n")
+    (tmp_path / "compose.yaml").write_text(
+        "services:\n  a:\n    image: busybox\n    profiles: [x]\n"
+        "    env_file: [app.env, '${STATE_DIR:?set}/service/s.env', {path: missing.env, required: false}]\n"
+        "    environment: {OVERRIDDEN: from-compose, DERIVED: '${PORT}', LITERAL: 'lit$$eral'}\n"
+        "    ports: ['${PORT}:80']\n"
+        "    healthcheck: {test: [CMD-SHELL, 'pg_isready -U synthetic_owner']}\n"
+        "    volumes: ['${STATE_DIR}:/data/x']\n")
+    project = {"name": "synthetic-real", "directory": str(tmp_path), "files": [str(tmp_path / "compose.yaml")],
+               "env_files": [str(tmp_path / "interp.env")], "services": {"a": "runtime"}}
+    p.check_env_references()
+    resolved = json.loads(p.run(p.compose(project) + ["config", "--format", "json"]))
+    document, named = p.evidence_document(project, resolved)
+    assert named == sorted(str(path) for path in (tmp_path / "app.env", tmp_path / "missing.env", tmp_path / "state/service/s.env"))
+    written = tmp_path / "written.json"
+    p.write(written, p.escaped_rendered(document))
+    text = written.read_text()
+    assert canary not in text and dollar not in text and dollar.replace("$", "$$") not in text
+    reread = p.run(["docker", "compose", "--profile", "*", "-f", str(written), "config", "--format", "json"])
+    assert json.loads(reread) == resolved
+    assert all(entry["path"].startswith("/") for entry in document["services"]["a"]["env_file"])
+    # The real paths: a `$` in a file name, a variable in the middle of an absolute path, and a value needing its service's context.
+    dollars = tmp_path / "state" / "a$b.env"
+    # API_OVERRIDDEN is explicit in the service, with the value of a credential of that context-dependent file.
+    dollars.write_text(f"DOLLAR_CREDENTIAL={canary}-dollars\nENDPOINT=https://${{REVIEW_HOST:?set}}/v1\n"
+                       f"API_OVERRIDDEN={canary}-overridden # a comment\nAPI_QUOTED='{canary}-quoted' # a comment\n")
+    middle = tmp_path / "opt" / "m.env"
+    middle.parent.mkdir()
+    middle.write_text(f"MIDDLE_CREDENTIAL={canary}-middle\n")
+    (tmp_path / "paths.env").write_text(f"MIDDLE_DIR=opt\nROOT={tmp_path}\n")
+    (tmp_path / "paths.yaml").write_text(
+        "services:\n  a:\n    image: busybox\n    environment: {REVIEW_HOST: example.invalid}\n"
+        "    env_file: ['${ROOT}/state/a$$b.env', '" + str(tmp_path) + "/${MIDDLE_DIR}/m.env']\n")
+    paths = {**project, "files": [str(tmp_path / "paths.yaml")], "env_files": [str(tmp_path / "paths.env")]}
+    resolved = json.loads(p.run(p.compose(paths) + ["config", "--format", "json"]))
+    document, named = p.evidence_document(paths, resolved)
+    assert named == sorted([str(dollars), str(middle)])
+    p.write(written, p.escaped_rendered(document))
+    assert canary not in written.read_text() and "example.invalid/v1" not in written.read_text()
+    reread = p.run(["docker", "compose", "--profile", "*", "-f", str(written), "config", "--format", "json"])
+    assert json.loads(reread) == resolved
+    (tmp_path / "paths.yaml").write_text(
+        "services:\n  a:\n    image: busybox\n    environment: {REVIEW_HOST: example.invalid, API_OVERRIDDEN: '${PUBLIC_VALUE}'}\n"
+        "    env_file: ['${ROOT}/state/a$$b.env']\n")
+    (tmp_path / "paths.env").write_text(f"PUBLIC_VALUE={canary}-overridden\nROOT={tmp_path}\n")
+    with pytest.raises(p.Refused, match="env_value_in_evidence"):
+        p.evidence_document(paths, json.loads(p.run(p.compose(paths) + ["config", "--format", "json"])))
+    (tmp_path / "paths.yaml").write_text(
+        "services:\n  a:\n    image: busybox\n    environment: {REVIEW_HOST: example.invalid, API_QUOTED: '${PUBLIC_VALUE}'}\n"
+        "    env_file: ['${ROOT}/state/a$$b.env']\n")
+    (tmp_path / "paths.env").write_text(f"PUBLIC_VALUE={canary}-quoted\nROOT={tmp_path}\n")
+    with pytest.raises(p.Refused, match="env_value_in_evidence"):
+        p.evidence_document(paths, json.loads(p.run(p.compose(paths) + ["config", "--format", "json"])))
+    document, _ = p.evidence_document(project, json.loads(p.run(p.compose(project) + ["config", "--format", "json"])))
+    document["services"]["a"]["command"] = ["--note", canary]
+    applied = p.applied_values(project, [{"path": str(tmp_path / "app.env")}], {}, set())
+    with pytest.raises(p.Refused, match="env_value_in_evidence"):
+        p.check_evidence(project, document, p.evidence_source(project), applied)
+
+
+# spec: ANYM-773
+def test_production_md_names_the_env_file_writers_codes_and_the_rollback_rule():
+    docs = " ".join((ROOT / "docs/operations/production.md").read_text().split())
+    section = docs.split("Release evidence and env files", 1)[1].split("### Migration releases", 1)[0]
+    for text in ("`compose_ignores_env_resolution`", "`env_value_in_evidence`", "Rollback restores images and Compose settings, not env-file values",
+                 "`<project>.json`", "`<project>.before.json`", "`gateway.pre-run.json`", "`http.json`", "`verify.env`", "policy copies",
+                 "resolved documents", "ANYM-779", "ANYM-784", "2.40.3"):
+        assert text in section, text
 
 
 def rolled_back_refusal(host, match):

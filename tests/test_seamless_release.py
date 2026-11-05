@@ -698,6 +698,72 @@ def test_bootstrap_rejects_unverified_source_before_writing_artifacts(tmp_path, 
     assert list(Path(cfg['http_release']['router']['directory']).iterdir()) == []
 
 
+# spec: ANYM-773
+def test_router_bootstrap_keeps_both_dollar_signs_of_a_raw_directory():
+    assert s.p.escaped({'source': 'router$$name'}) == {'source': 'router$$$$name'}
+
+
+# spec: ANYM-773
+def test_a_raw_control_directory_in_the_isolated_document_keeps_its_dollar_signs(tmp_path):
+    cfg = settings(tmp_path)
+    release = tmp_path / 'router$$name'
+    release.mkdir()
+    isolated, private = s.isolate(cfg, documents(cfg), {'runtime': IMAGE, 'gateway': IMAGE}, release, GEN, SHA)
+    written = s.p.escaped_rendered(isolated)
+    binds = [mount['source'] for unit in written['services'].values() for mount in unit['volumes']
+             if mount['target'] == '/run/deedkit/release']
+    # Compose reads `$$$$` as the directory's real `$$`.
+    assert binds and all('router$$$$name' in source for source in binds)
+    assert all('router$$name' in path for path in private['controls'].values())
+
+
+# spec: ANYM-773
+@pytest.mark.parametrize('legacy', [False, True])
+def test_plan_b_keeps_env_file_references_of_a_new_plan_a_and_the_inline_form_of_a_legacy_one(tmp_path, monkeypatch, legacy):
+    canary = 'synthetic-plan-b-canary'
+    cfg = settings(tmp_path)
+    release = Path(cfg['state_directory']) / SHA
+    release.mkdir()
+    env = tmp_path / 'api.env'
+    env.write_text(f'API_CREDENTIAL={canary}\n')
+    docs = documents(cfg)
+    source = cfg['http_release']['api']
+    if legacy:
+        docs[source['project']]['services'][source['service']].setdefault('environment', {})['API_CREDENTIAL'] = canary
+    else:
+        docs[source['project']]['services'][source['service']]['env_file'] = [{'path': str(env)}]
+    baseline = []
+    for project in cfg['projects']:
+        s.p.write(release / (project['name'] + '.json'), s.p.escaped(docs[project['name']]))
+        baseline.append({'name': project['name'], 'before_digest': s.p.digest(docs[project['name']]), 'running': {}})
+    route = s.route_document(cfg)
+    s.p.write(Path(cfg['http_release']['router']['config_file']), route)
+    monkeypatch.setattr(s.p, 'prepare', lambda *a: {'images': {'runtime': IMAGE, 'gateway': IMAGE}, 'projects': baseline, 'ci': {'sha': SHA}})
+    monkeypatch.setattr(s, 'router_identity', lambda *a: None)
+    monkeypatch.setattr(s, 'router_get', lambda *a: (route, '"etag"'))
+    monkeypatch.setattr(s, 'schema_inventory', lambda *a: {'schema.sql': '1' * 64, 'migrations/002_archive.sql': '2' * 64})
+    monkeypatch.setattr(s, 'check_schema', lambda *a: None)
+    monkeypatch.setattr(s.p, 'promotable', lambda *a: {'sha': SHA})
+
+    def resolved(text):
+        document = json.loads(text)
+        for unit in document['services'].values():
+            if unit.pop('env_file', None):
+                unit['environment'] = {'API_CREDENTIAL': canary, **(unit.get('environment') or {})}
+        return json.dumps(document)
+
+    monkeypatch.setattr(s.p, 'run', lambda command: resolved(Path(command[command.index('-f') + 1]).read_text()))
+    monkeypatch.setattr(s.p, 'run_input', lambda command, data, **kw: resolved(data.decode()))
+    assert s.prepare(cfg, SHA)['status'] == 'prepared'
+    written = (release / 'http.json').read_text()
+    unit = next(value for key, value in json.loads(written)['services'].items() if key.startswith('http-api-'))
+    if legacy:
+        assert canary in written and 'env_file' not in unit
+    else:
+        assert canary not in written and unit['env_file'] == [{'path': str(env)}]
+        assert 'API_CREDENTIAL' not in unit['environment'] and unit['environment']['DEEDKIT_RELEASE_SHA'] == SHA
+
+
 def test_prepare_preserves_legacy_and_allows_next_managed_generation(tmp_path, monkeypatch):
     cfg = settings(tmp_path)
     release = Path(cfg['state_directory']) / SHA

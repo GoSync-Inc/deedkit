@@ -549,6 +549,48 @@ key and isolated helper/PostgreSQL containers. It requires its own reviewed
 enrollment and actual successful restore; an enabled timer, upload receipt or
 synthetic CI run does not establish the live backup gate.
 
+### Release evidence and env files
+
+The files the tools write name each `env_file:` and hold none of its values (ANYM-773). Compose 2.40.3, the host's, lists
+`config --no-env-resolution` and ignores it (measured 2026-11-05 on the host and with the upstream 2.40.3 binary; 5.5.0
+honors it), so the tools do not use that flag: a `--no-interpolate` render names the references on both versions, and the
+written document is the resolved document without the keys of those files. Default `config` of each written Compose file
+must read back as exactly the resolved document, so an env file value using a `${VAR}` of the project's interpolation
+input refuses at `prepare`: apply reads the written file without that input. No file on the host does this today.
+
+| Writer | What it holds |
+|---|---|
+| `prepare`'s `<project>.json`, `<project>.before.json` | written with references |
+| enrollment's `gateway.pre-run.json` | written with references |
+| plan B's `http.json` | written with references |
+| enrollment's resolved documents (`enroll --plan`) | digest only; in memory |
+| policy copies (enrollment backup, plan B's digest of the policy) | holds no env-file value: the gateway policy and configurations name no env value |
+| `verify.env` of the egress check | holds the plan's `verify_env` values only inside the private temporary directory of that plan, removed when it ends; never in release evidence |
+
+The resolved document stays in memory: it feeds the runtime checks and every digest, so `before_digest`, `after_digest` and
+the drift comparisons mean what they did. `prepared.json` gains `render: 2` and `env_files: [{path, sha256}]` (a digest of
+each file; `null` for an optional file that is absent); a receipt without `render` is legacy and its inline files keep
+working. `apply` refuses when an env file named by a selected service changed since `prepare`, and any change that alters
+the resolved document refuses `apply`, the current-matches check and `rollback` as drift, as any changed document does.
+Rollback restores images and Compose settings, not env-file values: with unchanged files a legacy `.before.json` restores its
+inline values and a new one uses the env files as they are.
+
+Refusals, which name at most a file path: `compose_ignores_env_resolution` (a synthetic project's env file was printed, or
+its reference dropped; nothing is written) and `env_value_in_evidence` (a value of 8 or more characters of a named env file
+occurs in the document to write, or Compose cannot read such a file to check it). The one exception is a string the source writes unchanged at that same place, under a key
+that does not look secret (`PASSWORD`, `PASSWD`, `SECRET`, `TOKEN`, `*_KEY`, `CREDENTIAL`, `DSN`, `DATABASE_URL`, `PRIVATE`): that
+text comes from the source. The host's db healthcheck writes `POSTGRES_USER` and `POSTGRES_DB` this way. Interpolation files
+(`--env-file`, else the project's `.env`) hold paths, addresses and versions the document needs, never a secret; only a
+secret-named value refuses there, except a `*_FILE` path. This is a limit: a secret under another name in an interpolation file
+is not caught, and neither is a secret written by hand in `environment:` or a Compose file. The calendar project's source is
+such a document until ANYM-779.
+
+This change rewrites and deletes no existing file: release digests bind them, and the current release's `.before.json` is the rollback
+target. Measured 2026-11-05 by key names: of 115 JSON files in 31 release directories, the secret-named key with a value was
+`POSTGRES_PASSWORD` of `calendar-db`; the owner password was rotated that day, so older copies hold a dead value and the two
+current documents the new one. After this change and ANYM-779 are live, one more rotation (ANYM-784) leaves every older file
+with a dead value, so none is deleted. Old release directories leave only by the tool's own retention ("Image retention"), which keeps every rollback target.
+
 ### Migration releases and the backup gate
 
 Owner 10-28: «давай, конечно, в один релиз»; «процесс с бэкапами что нужно менять давайте

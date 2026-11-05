@@ -1,0 +1,24 @@
+{
+  "name": "synthetic",
+  "services": {
+    "api": {
+      "image": "sha256:894acae4e53c80f019c7ed48cb9a42623d270fb0fe429320b6848bca621e72cc",
+      "environment": {
+        "SYNTHETIC_CANARY": "synthetic-env-canary-773",
+        "SYNTHETIC": "literal"
+      },
+      "volumes": [
+        {
+          "source": "/existing",
+          "target": "/data"
+        }
+      ],
+      "labels": {
+        "org.opencontainers.image.revision": "2222222222222222222222222222222222222222"
+      }
+    },
+    "db": {
+      "image": "postgres:pinned"
+    }
+  }
+}

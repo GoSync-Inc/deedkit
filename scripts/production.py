@@ -687,7 +687,7 @@ def validate_runtime(unit):
 
 
 def escaped(value):
-    # Resolved Compose values are parsed a second time when applying the snapshot.
+    # A raw value parsed by Compose when a document is applied.
     if isinstance(value, str):
         return value.replace("$", "$$")
     if isinstance(value, list):
@@ -695,6 +695,204 @@ def escaped(value):
     if isinstance(value, dict):
         return {key: escaped(item) for key, item in value.items()}
     return value
+
+
+def escaped_rendered(value):
+    """`escaped` for a document Compose printed: `config` prints a literal `$` as `$$` (2.40.3 and 5.5.0), so it is
+    decoded first and a dollar sign is never doubled."""
+    if isinstance(value, str):
+        return value.replace("$$", "$").replace("$", "$$")
+    if isinstance(value, list):
+        return [escaped_rendered(item) for item in value]
+    if isinstance(value, dict):
+        return {key: escaped_rendered(item) for key, item in value.items()}
+    return value
+
+
+# ANYM-773: release evidence keeps `env_file:` references, never a value (production.md, "Release evidence and env
+# files"). Compose 2.40.3, the host's, lists `config --no-env-resolution` and ignores it, so the tool does not use it:
+# `--no-interpolate` names the references on both versions, and the resolved document minus the keys of those files is
+# what is written. The caller's round trip (default `config` of the written file) proves that nothing else changed.
+EVIDENCE_VALUE_MINIMUM = 8
+EVIDENCE_SECRET_NAME = re.compile(r"PASSWORD|PASSWD|SECRET|TOKEN|_KEY$|CREDENTIAL|DSN|DATABASE_URL|PRIVATE")
+RENDER_VERSION = 2
+
+
+class EvidenceRefused(Refused):
+    """A refusal that names a code and at most a file path: never a value, key or content."""
+
+    def __init__(self, code, path=""):
+        super().__init__(f"{code}: {path}" if path else code)
+        self.code = code
+
+
+def check_env_references():
+    """Before the first document of a run: this Compose names a synthetic env file without printing its value."""
+    canary = os.urandom(16).hex()
+    with tempfile.TemporaryDirectory(prefix="env-probe-") as scratch:
+        os.chmod(scratch, 0o700)
+        with os.fdopen(new_file(Path(scratch) / "probe.env"), "w") as handle:
+            handle.write(f"DEEDKIT_PROBE={canary}\n")
+        document = {"name": "deedkit-env-probe", "services": {"probe": {
+            "image": "probe", "env_file": [{"path": str(Path(scratch) / "probe.env")}]}}}
+        with os.fdopen(new_file(Path(scratch) / "compose.json"), "w") as handle:
+            json.dump(document, handle)
+        try:
+            shown = run(["docker", "compose", "--profile", "*", "--project-name", "deedkit-env-probe", "--project-directory",
+                         scratch, "-f", str(Path(scratch) / "compose.json"), "config", "--no-interpolate", "--format", "json"])
+            entries = json.loads(shown)["services"]["probe"].get("env_file")
+        except (Refused, ValueError, KeyError, TypeError, AttributeError):
+            raise EvidenceRefused("compose_ignores_env_resolution") from None
+    if canary in shown or not [path for path in reference_paths(entries) if Path(path).name == "probe.env"]:
+        raise EvidenceRefused("compose_ignores_env_resolution")
+
+
+def reference_entries(entries):
+    entries = [entries] if isinstance(entries, (str, dict)) else entries or []
+    return [{"path": entry} if isinstance(entry, str) else entry for entry in entries]
+
+
+def reference_paths(entries):
+    return [entry["path"] for entry in reference_entries(entries)]
+
+
+def compose_stub(project, unit):
+    """`unit` of a one-service document on stdin, rendered with the project's interpolation inputs and nothing on disk."""
+    document = {"services": {"stub": {"image": "stub", **escaped(unit)}}}
+    shown = run_input(compose({**project, "files": ["-"]}) + ["config", "--format", "json"], json.dumps(document).encode())
+    return json.loads(shown)["services"]["stub"]
+
+
+def absolute_reference(project, entry, raw):
+    """The entry with its real absolute path. `raw` is the path as the source writes it: `--no-interpolate` alone puts the
+    project directory before a path that starts with a variable. Compose interpolates it, and then resolves it, the way it does."""
+    path = entry["path"]
+    if "$" in path:
+        document = {"services": {"stub": {"image": "stub", "labels": {"path": raw}}}}
+        shown = run_input(compose({**project, "files": ["-"]}) + ["config", "--format", "json"], json.dumps(document).encode())
+        path = json.loads(shown)["services"]["stub"]["labels"]["path"].replace("$$", "$")
+    if not path.startswith("/"):
+        path = posixpath.join(project["directory"], path)
+    return {key: value for key, value in {**entry, "path": posixpath.normpath(path)}.items() if key in ("path", "required", "format")}
+
+
+ENV_FILE_REFERENCE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def env_file_variables(project, entry, resolved=None):
+    """What Compose itself reads from one env file, overridden keys included: its parser decides quoting, `export`, comments
+    and `format: raw`. The service's resolved values of the variables the file refers to and does not define give it the
+    context it has in the service. A file Compose still cannot read refuses: no value goes unchecked."""
+    if not os.path.exists(entry["path"]):
+        return {}
+    text = Path(entry["path"]).read_text(errors="replace")
+    defined = {line.partition("=")[0].strip().removeprefix("export ").strip() for line in text.splitlines() if "=" in line}
+    available = (resolved or {}).get("environment") or {}
+    context = {name: str(available[name]).replace("$$", "$") for name in set(ENV_FILE_REFERENCE.findall(text)) - defined
+               if available.get(name) is not None}
+    try:
+        environment = compose_stub(project, {"env_file": [entry], **({"environment": context} if context else {})}).get("environment") or {}
+    except (Refused, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+        raise EvidenceRefused("env_value_in_evidence", entry["path"]) from None
+    return {key: str(value).replace("$$", "$") for key, value in environment.items() if value is not None and key not in context}
+
+
+def applied_values(project, references, resolved, literal):
+    """(file path, key, decoded value) of every value of `references`, and of each key `resolved` got from them."""
+    named = [(entry["path"], env_file_variables(project, entry, resolved)) for entry in references]
+    return [*((path, key, value) for path, variables in named for key, value in variables.items()),
+            *((next((path for path, variables in named if key in variables), references[0]["path"]), key, str(value).replace("$$", "$"))
+              for key, value in (resolved.get("environment") or {}).items() if key not in literal and value is not None)]
+
+
+def env_file_digest(path):
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
+
+
+def document_strings(value, where=()):
+    """Every decoded string value with its location; `env_file` holds the references themselves."""
+    if isinstance(value, str):
+        yield where, value
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from document_strings(item, (*where, index))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if key != "env_file":
+                yield from document_strings(item, (*where, key))
+
+
+def interpolation_files(project):
+    """The files Compose interpolates this project from: `--env-file`, which replaces the project's `.env`, or that `.env`."""
+    dotenv = Path(project["directory"]) / ".env"
+    return list(project.get("env_files", [])) or ([str(dotenv)] if dotenv.is_file() else [])
+
+
+def check_evidence(project, document, source, applied):
+    """Refuses `document` when it holds a value read from an env file. The one exception is a string the source writes
+    unchanged at the same location, under a key that does not look secret: that text comes from the source, not the file.
+    An interpolation file holds paths, addresses and versions the document needs: only its secret-named values refuse,
+    except a `*_FILE` key, which names a path."""
+    found = list(document_strings(document))
+    written = dict(document_strings(source))
+
+    def occurs(value):
+        return [where for where, text in found if value in text or value in text.replace("$$", "$")]
+
+    for path, key, value in applied:
+        if len(value) >= EVIDENCE_VALUE_MINIMUM:
+            for where in occurs(value):
+                if EVIDENCE_SECRET_NAME.search(key) or written.get(where) != dict(found)[where]:
+                    raise EvidenceRefused("env_value_in_evidence", path)
+    for path in interpolation_files(project):
+        for key, value in env_file_variables(project, {"path": path}).items():
+            if (EVIDENCE_SECRET_NAME.search(key) and not key.endswith("_FILE") and len(value) >= EVIDENCE_VALUE_MINIMUM
+                    and occurs(value)):
+                raise EvidenceRefused("env_value_in_evidence", path)
+
+
+def evidence_source(project, *flags):
+    return json.loads(run(compose(project) + ["config", "--no-interpolate", *flags, "--format", "json"]))
+
+
+def evidence_document(project, resolved):
+    """`resolved` as it may be written: each service names its env files and holds only the keys its source writes. Paths in
+    the document stay in Compose's printed form, like every other string; the returned names are real paths."""
+    source, document, entries, applied, raw = evidence_source(project), copy.deepcopy(resolved), {}, [], None
+    for name, unit in document["services"].items():
+        origin = source["services"].get(name, {})
+        written = reference_entries(origin.get("env_file"))
+        if not written:
+            continue
+        if raw is None and any("$" in entry["path"] for entry in written):
+            raw = evidence_source(project, "--no-path-resolution")
+        paths = reference_paths(raw["services"][name].get("env_file")) if raw is not None else [None] * len(written)
+        references = [absolute_reference(project, entry, path) for entry, path in zip(written, paths, strict=True)]
+        literal = set(origin.get("environment") or {})
+        applied += applied_values(project, references, unit, literal)
+        environment = {key: value for key, value in (unit.get("environment") or {}).items() if key in literal}
+        if environment:
+            unit["environment"] = environment
+        else:
+            unit.pop("environment", None)
+        entries.update({entry["path"]: entry for entry in references})
+        unit["env_file"] = [{**entry, "path": entry["path"].replace("$", "$$")} for entry in references]
+    check_evidence(project, document, source, applied)
+    return document, sorted(entries)
+
+
+def check_env_files(project, item, receipt):
+    """A file named by a selected service must be the one prepare read. A legacy receipt (no `render`) has inline values."""
+    recorded = {entry["path"]: entry["sha256"] for entry in receipt["env_files"]}
+    services = read(item["file"])["services"]
+    for service in project["services"]:
+        for path in reference_paths(services.get(service, {}).get("env_file")):
+            path = path.replace("$$", "$")
+            if path not in recorded or env_file_digest(path) != recorded[path]:
+                raise Refused(f"production or prepared configuration changed since preparation: {path}")
 
 
 def check_space(directory):
@@ -952,6 +1150,7 @@ def prepare(settings, sha):
     release = state / sha
     if release.exists():
         raise Refused("candidate directory already exists; inspect it before a new preparation")
+    check_env_references()
     release.mkdir(mode=0o700)
     source = release / "source"
     run(["git", "init", "--quiet", str(source)])
@@ -963,10 +1162,12 @@ def prepare(settings, sha):
     # Docker COPY preserves checkout modes. Public code must be readable by
     # image UID 10001; private release parents and snapshots retain 0700/0600.
     run(["git", "-C", str(source), "checkout", "--quiet", "--detach", sha], umask=0o022)
-    snapshots = []
+    snapshots, env_files = [], {}
     for project in settings["projects"]:
         document, running = snapshot(project)
-        snapshots.append({"project": project, "before": document, "running": running})
+        reference, named = evidence_document(project, document)
+        env_files.update({path: env_file_digest(path) for path in named})
+        snapshots.append({"project": project, "before": document, "reference": reference, "running": running})
     images = {}
     targets = sorted({target for project in settings["projects"] for target in project["services"].values()})
     # Every CI-published target is resolved and attested before the first pull.
@@ -978,33 +1179,38 @@ def prepare(settings, sha):
     projects = []
     for item in snapshots:
         project, before = item["project"], item["before"]
-        candidate = json.loads(json.dumps(before))
-        for service in candidate["services"].values():
-            service.pop("build", None)
-        for service, target in project["services"].items():
-            unit = candidate["services"][service]
-            unit["image"] = images[target]
-            unit.setdefault("labels", {})["org.opencontainers.image.revision"] = sha
+        def edited(document):
+            result = json.loads(json.dumps(document))
+            for service in result["services"].values():
+                service.pop("build", None)
+            for service, target in project["services"].items():
+                unit = result["services"][service]
+                unit["image"] = images[target]
+                unit.setdefault("labels", {})["org.opencontainers.image.revision"] = sha
+            return result
+        # The resolved candidate stays in memory: the written file names the env files and must read back as exactly it.
+        candidate = edited(before)
         path = release / (project["name"] + ".json")
-        write(path, escaped(candidate))
+        write(path, escaped_rendered(edited(item["reference"])))
         # Verify that serializing/re-reading did not change secrets, mounts or ports.
         reread = json.loads(run(["docker", "compose", "--profile", "*", "-f", str(path), "config", "--format", "json"]))
         if reread != candidate:
             raise Refused("resolved Compose snapshot did not round-trip exactly")
-        rollback = json.loads(json.dumps(before))
+        rollback = json.loads(json.dumps(item["reference"]))
         for unit in rollback["services"].values():
             unit.pop("build", None)
         for service, identity in item["running"].items():
             rollback["services"][service]["image"] = identity["image"]
         previous = release / (project["name"] + ".before.json")
-        write(previous, escaped(rollback))
+        write(previous, escaped_rendered(rollback))
         # Bound here, so a snapshot changed before apply can never become the rollback baseline.
         projects.append({"name": project["name"], "file": str(path), "digest": digest(read(path)),
                          "before_digest": digest(before), "running": item["running"],
                          "before_file_digest": digest(read(previous))})
     # What current.json said at preparation: rollback of a release that failed its health wait requires it unchanged.
     current = read(state / "current.json") if (state / "current.json").exists() else None
-    receipt = {"version": 1, "sha": sha, "ci": evidence, "images": images,
+    receipt = {"version": 1, "render": RENDER_VERSION, "env_files": [{"path": path, "sha256": env_files[path]} for path in sorted(env_files)],
+               "sha": sha, "ci": evidence, "images": images,
                "references": {target: value["reference"] for target, value in verified.items()},
                "config_digest": settings_digest(settings), "current_digest": digest(current), "projects": projects}
     write(release / "prepared.json", receipt)
@@ -1267,6 +1473,8 @@ def apply(settings, sha, *, backup_waited=0):
             raise Refused("this release was prepared without a bound rollback snapshot; prepare it again")
         if not previous.exists() or digest(read(previous)) != item["before_file_digest"]:
             raise Refused("the before-release snapshot is missing or changed since preparation")
+        if "render" in receipt:
+            check_env_files(project, item, receipt)
     check_backup_runner(release / "source", sha)
     # No call is active before the last remote gate, nor after it: a call that started meanwhile is waited for before
     # anything is written, within the same bound.
@@ -6176,17 +6384,26 @@ class Enrollment:
         # The gateway project is the one the enrollment edits: plan A's own snapshots are taken from the edited files, so
         # the pre-run resolved configuration is kept here, with the images that run now, to put the gateway back.
         gateway = next(project for project in self.settings["projects"] if "gateway" in project["services"].values())
+        check_env_references()
         document, running = snapshot(gateway)
-        before = copy.deepcopy(document)
+        before = evidence_document(gateway, document)[0]
         for service in before["services"].values():
             service.pop("build", None)
         for service, identity in running.items():
             before["services"][service]["image"] = identity["image"]
         path = directory / "gateway.pre-run.json"
         with os.fdopen(new_file(path), "w") as handle:
-            json.dump(escaped(before), handle, indent=2)
+            json.dump(escaped_rendered(before), handle, indent=2)
             handle.flush()
             os.fsync(handle.fileno())
+        # Read back the way `restore_gateway` will: exactly the pre-run resolved configuration with today's images.
+        expected = copy.deepcopy(document)
+        for service in expected["services"].values():
+            service.pop("build", None)
+        for service, identity in running.items():
+            expected["services"][service]["image"] = identity["image"]
+        if json.loads(run(["docker", "compose", "--profile", "*", "-f", str(path), "config", "--format", "json"])) != expected:
+            raise Refused("the pre-run Compose snapshot did not round-trip exactly")
         self.receipt["pre_run"] = {"project": gateway["name"], "file": str(path),
                                    "images": {service: identity["image"] for service, identity in running.items()}}
         sources = {"production": self.paths["production"], "http": self.paths["http"],
