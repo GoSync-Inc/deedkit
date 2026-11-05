@@ -830,6 +830,33 @@ func TestNativeOpenChatByPhoneDeadlineCoversTheSessionStore(t *testing.T) {
 }
 
 // spec: ANYM-430
+func TestNativeOpenChatByPhoneTimedOutResolutionKeepsItsSlot(t *testing.T) {
+	lid, _ := ParseChatID(lidFixture)
+	d, _ := phoneLookupFake(t, nil, &lid)
+	d.lookupTimeout = 50 * time.Millisecond
+	release := make(chan struct{})
+	entries := make(chan struct{}, 2)
+	d.lidForPN = func(context.Context, types.JID) (types.JID, error) {
+		entries <- struct{}{}
+		<-release // ignores its context, like a wedged store
+		return lid, nil
+	}
+	job := phoneJob(map[string]any{"phone": phoneFixture})
+	job.KnownChats = []string{lidFixture}
+	_, first := executeOperation(context.Background(), job, d)
+	_, second := executeOperation(context.Background(), job, d)
+	// Counted while the first call is still wedged: a freed slot would let the second one in.
+	inResolver := len(entries)
+	close(release)
+	waitPhoneSlot(t)
+	requireError(t, first, "provider_timeout")
+	requireError(t, second, "provider_timeout")
+	if inResolver != 1 {
+		t.Fatalf("%d resolutions entered while the first outlived its deadline", inResolver)
+	}
+}
+
+// spec: ANYM-430
 func TestNativeOpenChatByPhoneSpentBudgetStillAnswersLocally(t *testing.T) {
 	lid, _ := ParseChatID(lidFixture)
 	d, queries := phoneLookupFake(t, nil, &lid)
