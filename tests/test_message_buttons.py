@@ -429,11 +429,14 @@ def test_button_texts_say_what_is_offered_and_how_absence_reads():
     for text in (*docs,entry):
         assert 'pressing a button or opening a Mini App is a live action and is not offered' not in text
         assert 'untrusted data' in text and 'login_url' in text
-    passages=[re.findall(r'Buttons are read-only evidence.*?(?= Every button link| Links are)',text)[0] for text in (*docs,entry)]
+    passages=[re.findall(r'Buttons are read-only evidence.*?(?= Every button link| Links:)',text)[0] for text in (*docs,entry)]
     for text in passages:
         assert len(text)<=400 and len(re.findall(r'[.?!](?: |$)',text))<=3, text
-        for word in ('inspect_message_buttons','press_button','list_messenger_operations','owner-confirmed','one live keyboard',
-                     'no keyboard was captured','capture off (default; production since 2026-11-02, no backfill)','did not fit or parse','deleted'):
+        # A listed operation is not an offered one: the manifest lists every supported operation, `available` decides.
+        for word in ('inspect_message_buttons','press_button','owner-confirmed','callback','available','list_messenger_operations',
+                     'none,','capture off','production','2026-11-02','unfit','unparsed','deleted'):
             assert word in text, word
-        assert text.count('is not offered')==1 and 'opening a Mini App is' in text
+        assert text.count('is not offered')==1 and 'Mini App is' in text
+    for text in passages[:3]:
+        assert 'on since 2026-11-02, no backfill' in text and 'no captured keyboard' in text
     assert len(set(passages[:3]))==1 and passages[0] in setup and 'Nothing presses' not in setup

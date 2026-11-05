@@ -239,11 +239,11 @@ same flag lets `tg://resolve`, `tg://join` and `tg://addstickers` links pass in
 buttons and text links (other `tg:` hosts and login-code links such as `tg://login` or
 `https://t.me/login/<code>` are always dropped). The callback data, an inline query
 and any other press token are never read. Capture itself never presses, opens or fetches a button.
-Buttons are read-only evidence: inspect_message_buttons reads one live keyboard,
-press_button is one owner-confirmed callback press, both in list_messenger_operations
-only for an enabled account; opening a Mini App is a live action and is not offered.
-Without buttons no keyboard was captured: none, capture off (default; production since
-2026-11-02, no backfill), did not fit or parse, or deleted.
+Buttons are read-only evidence: inspect_message_buttons reads a live keyboard,
+press_button is one owner-confirmed callback press, both available in
+list_messenger_operations only if the account enabled them; opening a Mini App is a live
+action and is not offered. No buttons, no captured keyboard: none, capture off (default;
+production on since 2026-11-02, no backfill), unfit, unparsed or deleted.
 A keyboard that does not fit the envelope loses its links, then trailing buttons
 (`truncated: true`); a failure in the keyboard code leaves the message without it.
 Messages archived earlier have no keyboard and are not backfilled. Enabling it needs a
