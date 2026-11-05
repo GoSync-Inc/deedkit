@@ -332,9 +332,10 @@ def test_a_failing_or_malformed_merge_preview_refuses_without_a_verdict_and_no_b
     assert code == 1 and reason in out and "Passed." not in out and "problem(s):" not in out
     assert SECRET not in out and not server.writes()
     server.set(fault={"branch merge-preview": "exit"}, log=[])
-    for body in ("Spec: ANYM-12", "Spec: ANYM-12\nTiden branch: review/y"):
+    for body, expected in (("Spec: ANYM-12", 0), ("Spec: ANYM-12\nTiden branch: review/y", 0),
+                           ("Spec: ANYM-50\nTiden branch: review/y", 1)):  # review/y is merged (ANYM-768)
         code, out = run_main(repo, server, body, monkeypatch, capsys)
-        assert code == (1 if "review/y" in body else 0), out
+        assert code == expected, out
     assert ("branch", "merge-preview") not in server.calls() and not server.writes()
 
 
