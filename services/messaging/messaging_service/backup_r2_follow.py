@@ -376,7 +376,7 @@ def normalized(name):
 
 
 def lock_pins(text):
-    """{normalized name: version} of a hashed pip lock. Only `name==version \`, its `--hash=sha256:`
+    r"""{normalized name: version} of a hashed pip lock. Only `name==version \`, its `--hash=sha256:`
     lines and comments are read: any other line (a marker, URL, option or editable) or a name
     pinned twice refuses the lock."""
     pins = {}
