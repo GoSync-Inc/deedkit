@@ -86,8 +86,10 @@ volume) (owner 11-03, see Data egress).
     them. One protected point plus room for one candidate: the rotation keeps no older point (owner 10-28
     «Ну вообще можно регулярный, ну то есть все одинаковый, короче, пока делать, да»). Agent key files are
     not in it.
-  - The calls state backup (ANYM-782, BACKUP.md "Calls state"), proposal: no owner decision names it, so this covers
-    nothing and the backup is not installed until the owner answers. As proposed: briefs, calls and results, events, learning tables,
+  - The calls state backup (ANYM-782, BACKUP.md "Calls state"; owner 11-05, asked whether to turn on a daily backup of
+    the calls database with these classes, this storage and this deletion rule: «Можно, конечно, сделать этот. Ежедневно
+    Если это не геморрой, будет фоне, не будет ничего блокировать. Вот. В целом можно. окей.», so on condition that it runs
+    in the background and blocks nothing): briefs, calls and results, events, learning tables,
     decision journals and single-use media-handshake tokens, encrypted, daily to the same backup server and the object
     storage its R2 receiver requires, kept as the last protected point there plus `keep_local` = 1 on the production
     host. A deleted call leaves the live database at once and leaves the backup after the next successful sanitized

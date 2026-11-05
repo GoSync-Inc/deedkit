@@ -745,8 +745,6 @@ failure. Logs and the status file hold codes and counts only.
 
 ### Calls state: slot and units (ANYM-782)
 
-Installing it waits for the owner's answer to the `proposal` line in docs/DATA-POLICY.md.
-
 `deedkit-calls-backup.timer` runs the job daily at 02:15 UTC; `deedkit-calls-backup-catchup.timer` at 04:15 UTC acts only
 between 04:00 and 04:59 and when the runner's status file reads the newest snapshot over 22 hours old or unknown. 02:15 follows
 the latest evening catch-up a clock condition admits (23:59:59 + 6300 s + two 180 s stops = 01:50:59, plus the 15 minute guard).
