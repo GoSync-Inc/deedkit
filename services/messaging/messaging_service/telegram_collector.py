@@ -504,6 +504,9 @@ CHAT_ATTEMPTS=3; CHAT_RETRY_DELAYS=(1,2,4)
 # Out-of-window backfill: at most one original per MEDIA_BACKFILL_INTERVAL seconds, and a
 # MEDIA_BACKFILL_IDLE pause once nothing is left, on top of the governor's request pacing.
 MEDIA_BACKFILL_INTERVAL=15; MEDIA_BACKFILL_IDLE=600
+# Unapplied deletions (ANYM-789): a deletion event applies in line, so this sweep only repairs a crash between the
+# tombstone's commit and that call, or a chat whose peer_kind arrives later. Its query scans the account's archive.
+TOMBSTONE_SWEEP_SECONDS=60
 
 
 def chat_error_evidence(error):
@@ -519,6 +522,7 @@ class TelegramCollector:
     state_class=CollectorState
     head_pages=HEAD_PAGES_PER_PASS
     _pass_head_capped=None
+    _tombstones_due=-math.inf
     coverage_code='telegram_history_partial'
     connect_timeout=60
     retry_connect=False
@@ -884,12 +888,19 @@ class TelegramCollector:
         while True:
             try:
                 await self.drain_captures([self.spool],[self.history_spool])
-                await asyncio.to_thread(self.state.apply_tombstones)
+                await self.sweep_tombstones()
             except (psycopg.OperationalError,PoolTimeout):
                 # Capture remains durable; the independent heartbeat stops the
                 # provider if database ownership cannot be renewed in time.
                 await asyncio.sleep(1)
             await asyncio.sleep(.25)
+
+    async def sweep_tombstones(self):
+        """Sweep on the first pass, then once a period; a full page sweeps again next pass, a failure leaves it due."""
+        if time.monotonic()<self._tombstones_due:return
+        await asyncio.to_thread(self.state.apply_tombstones)
+        self._tombstones_due=(-math.inf if getattr(self.state,'tombstones_page_full',False)
+            else time.monotonic()+TOMBSTONE_SWEEP_SECONDS)
 
     async def drain_captures(self,spools,history_spools=()):
         last=None;count=0

@@ -653,6 +653,7 @@ class CollectorState:
                     AND (t.provider_chat=cc.provider_chat OR (t.provider_chat='' AND cc.peer_kind IN ('user','chat')))
                 WHERE m.account=%s AND NOT m.deleted GROUP BY m.id,r.snapshot LIMIT %s''',
                 (self.account,limit)).fetchall()
+        self.tombstones_page_full=len(rows)>=limit # Read, not applied: the drain loops' next sweep (ANYM-789).
         applied=0
         for row in rows:
             e=dict(row['snapshot']); e['chat']=e.pop('provider_chat')

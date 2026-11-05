@@ -295,6 +295,65 @@ def test_live_drain_retries_database_failure_and_then_applies_tombstones(monkeyp
     assert seen == ['drain', 'drain', 'tombstones'] and sleeps == [1, .25, .25]
 
 
+def run_tombstone_passes(monkeypatch, kind, passes, outcomes=()):
+    """Run a drain loop under a fake clock (5 s a pass). An outcome is a sweep's full-page flag or its exception."""
+    from messaging_service.whatsapp_collector import WhatsAppCollector
+    if kind == 'telegram':
+        collector = TelegramCollector.__new__(TelegramCollector)
+        collector.spool = object(); collector._history_spool = object()
+    else:
+        collector = WhatsAppCollector.__new__(WhatsAppCollector)
+        collector.events_spool = object(); collector.spool = object()
+        collector.send_receipts = NS(drain=lambda apply, limit: None)
+    clock = [1000.0]; sweeps = []; drains = []; sleeps = []; outcomes = iter(outcomes)
+    monkeypatch.setattr('messaging_service.telegram_collector.time.monotonic', lambda: clock[0])
+    async def drain(spools, history_spools): drains.append(clock[0])
+    collector.drain_captures = drain
+    def sweep():
+        sweeps.append(clock[0])
+        outcome = next(outcomes, False)
+        if isinstance(outcome, Exception): raise outcome
+        collector.state.tombstones_page_full = outcome
+    collector.state = NS(apply_tombstones=sweep)
+    async def sleep(seconds):
+        sleeps.append(seconds)
+        if seconds == .25:
+            clock[0] += 5
+            if sleeps.count(.25) == passes: raise asyncio.CancelledError
+    monkeypatch.setattr('messaging_service.telegram_collector.asyncio.sleep', sleep)
+    with pytest.raises(asyncio.CancelledError): asyncio.run(collector.drain_loop())
+    return sweeps, drains, sleeps
+
+
+# spec: ANYM-789
+@pytest.mark.parametrize('kind', ['telegram', 'whatsapp'])
+def test_drain_loop_sweeps_tombstones_on_its_first_pass_then_once_a_minute(monkeypatch, kind):
+    sweeps, drains, sleeps = run_tombstone_passes(monkeypatch, kind, 10)
+    assert sweeps == [1000.0]  # 10 passes inside 60 s make one sweep
+    assert len(drains) == 10 and sleeps == [.25] * 10  # the drain keeps its rhythm
+    sweeps, drains, sleeps = run_tombstone_passes(monkeypatch, kind, 14)
+    assert sweeps == [1000.0, 1060.0]
+
+
+# spec: ANYM-789
+@pytest.mark.parametrize('kind', ['telegram', 'whatsapp'])
+def test_full_tombstone_page_is_followed_by_a_sweep_on_the_next_pass(monkeypatch, kind):
+    sweeps, drains, sleeps = run_tombstone_passes(monkeypatch, kind, 5, [True, True, False])
+    assert sweeps == [1000.0, 1005.0, 1010.0]  # the page that was not full starts the period
+    assert len(drains) == 5 and sleeps == [.25] * 5
+
+
+# spec: ANYM-789
+@pytest.mark.parametrize('kind', ['telegram', 'whatsapp'])
+def test_failed_tombstone_sweep_is_tried_again_on_the_next_pass(monkeypatch, kind):
+    import psycopg
+    from psycopg_pool import PoolTimeout
+    sweeps, drains, sleeps = run_tombstone_passes(monkeypatch, kind, 5,
+        [psycopg.OperationalError('synthetic database failure'), PoolTimeout('synthetic pool timeout'), False])
+    assert sweeps == [1000.0, 1005.0, 1010.0]  # only the sweep that finished starts the period
+    assert len(drains) == 5 and sleeps == [1, .25, 1, .25, .25, .25, .25]
+
+
 def test_dialog_discovery_uses_cached_catalog_until_fifteen_minute_boundary(monkeypatch):
     clock = [100.0]; catalog_calls = []; history = []; statuses = []
     monkeypatch.setattr('messaging_service.telegram_collector.time.monotonic', lambda: clock[0])

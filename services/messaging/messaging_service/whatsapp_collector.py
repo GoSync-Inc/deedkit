@@ -628,7 +628,7 @@ class WhatsAppCollector(TelegramCollector):
                 await asyncio.to_thread(self.send_receipts.drain,
                     lambda item:reconcile_send_receipt(self.state,item),100)
                 await self.drain_captures([self.events_spool],[self.history_spool])
-                await asyncio.to_thread(self.state.apply_tombstones)
+                await self.sweep_tombstones()
             except (psycopg.OperationalError,PoolTimeout): await asyncio.sleep(1)
             await asyncio.sleep(.25)
     async def run(self):
