@@ -309,6 +309,39 @@ restored schema without running application initialization or migrations. Only
 after all seven proof checks are true may the coordinator call initial `protect`
 or exact-marker `rotate`. It never substitutes upload/HEAD success for restore.
 
+**Binding sidecar (ANYM-641).** The restore's stream is the full read of the
+candidate, so promotion does not repeat it. After the hash and the restore pass,
+the coordinator writes `<proof file>.binding.json` next to the proof, in the
+verifier's root-owned `directory` (`0600`, never in upload state, whose unknown
+names block a run):
+
+```json
+{"v":1,"backup_id":"<id>","sha256":"<receipt sha256>","etag":"<ETag>","bytes":123,"verification_id":"<proof verification id>"}
+```
+
+`etag` and `bytes` come from the response of the GET that was hashed; a ranged
+resume asks `If-Match` on that ETag, and an answer naming another one fails the run
+with `stored_backup_corrupt`. The proof file and its checks do not change. `protect`
+and `rotate` read the sidecar only after the proof passed every check, and use it
+only when it names the proof's backup ID, verification ID and SHA256. Then one HEAD
+must answer the sidecar's ETag and length, and the length must be the receipt's;
+otherwise they refuse with `stored_backup_corrupt`, deleting nothing, and the marker
+stays. A missing, malformed or non-matching sidecar, or one that could not be
+written, takes the full GET as before. A sidecar stays with its proof.
+
+Reads of the candidate's body per backup ID, counted by object key: two on a fresh
+chain (the receiver's check after upload and the restore's stream), and three with
+no sidecar. The receiver's check stays: the
+[capability probe](docs/quality/backup-chain-2026-11-05.md) showed R2 accepts a
+multipart completion with wrong or missing part checksums and returns no composite.
+
+Install order: free, any order. An older receiver or verifier never reads the
+sidecar and never lists that directory; a newer one with no sidecar reads in full.
+Undo: `production.py deploy` does not reinstall the receiver venv, so reinstall the
+previous reviewed wheel into `/opt/deedkit-backup-r2/venv` by
+[Receiver installation](#receiver-installation-and-private-configuration). Sidecars
+may stay: they are ignored, and no state changes.
+
 Plaintext originals, dump and restored database still need disk space. When work
 and Docker share a filesystem, preflight reserves the selected ciphertext's
 wire size plus PostgreSQL headroom and the free-space reserve. With a candidate
@@ -943,7 +976,9 @@ using `PREVIOUS_MARKER_SHA256` supplied by the operator:
 ```
 
 Rotation holds the shared receiver lock, checks destination, exact marker digest,
-receipt/proof identities and the candidate's full ciphertext hash, then fsyncs its
+receipt/proof identities and the candidate (its [binding sidecar](#automated-independent-restore-on-the-receiver)
+by one HEAD; a proof without a valid one, such as a manual proof, by its full
+ciphertext hash), then fsyncs its
 root-owned pending journal. It re-verifies the previous point's receipt and size
 (one HEAD, before the journal and again before deletion) and never downloads it:
 the point being replaced was proven when it was protected, and a corrupt old
