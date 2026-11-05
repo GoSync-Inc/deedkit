@@ -64,6 +64,9 @@ dsn=""; mode=""
 if [ -n "${{PROBE_TEST_DSN_FILE:-}}" ]; then dsn="$(cat "$PROBE_TEST_DSN_FILE")"; mode="$(ls -l "$PROBE_TEST_DSN_FILE" | cut -c1-10)"; fi
 echo "uv $* | cwd=${{PWD##*/}} dsn=$dsn dsnmode=$mode shard=${{DEEDKIT_TEST_SHARD:-}} fcs=${{FCS_TEST_DSN:-}} pid=$$" >> "$FAKE_LOG"
 [ "$1" = run ] || exit 0
+for arg in "$@"; do case "$arg" in --junitxml=*)
+  [ -z "${{FAKE_JUNIT:-}}" ] || printf '%s' "$FAKE_JUNIT" > "${{arg#--junitxml=}}"
+  [ "${{FAKE_JUNIT_FIFO:-0}}" = 0 ] || mkfifo "$(dirname "${{arg#--junitxml=}}")/junit-stalled.xml" ;; esac; done
 if [ "${{FAKE_UV_ORPHAN:-0}}" = 1 ]; then sleep 300 >/dev/null 2>&1 & echo "orphan pid=$!" >> "$FAKE_LOG"; fi
 echo "FAKE SUITE OUTPUT ${{DEEDKIT_TEST_SHARD:-}}"
 {BURN}
@@ -437,7 +440,7 @@ def test_by_default_a_run_takes_ruff_and_the_touched_test_modules_of_its_suite(m
     [ruff] = log_lines(home, 'uv run --project tools/dev --locked ruff check')
     assert ruff.split(' |')[0].split('ruff check ')[1].split() == ['app.py', 'new_module.py', 'tests/test_app.py']
     [pytest_line] = log_lines(home, 'uv run pytest')
-    assert pytest_line.split(' |')[0] == 'uv run pytest tests/test_app.py'
+    assert pytest_line.split(' |')[0].split(' --junitxml=')[0] == 'uv run pytest tests/test_app.py'
     assert remote(env, worktree, 'calendar').returncode == 0
     assert log_lines(home, 'uv run pytest tests/service/test_cal.py | cwd=calendar')
     assert log_lines(home, 'uv run --project tools/dev --locked ruff check services/calendar/tests/service/test_cal.py')
@@ -473,6 +476,68 @@ def test_the_root_suite_gets_a_postgres_on_localhost_and_a_private_dsn_file(mini
     assert log_lines(home, 'postgres stopped by QUIT')
     assert not list((worker_dir(home) / 'runs').iterdir())
     assert 'skipped: needs docker (CI covers)' in result.stderr
+
+
+JUNIT = '''<testsuites><testsuite>
+<testcase file="tests/test_auto_migration.py" name="a"><skipped type="pytest.skip" message="isolated PostgreSQL container unavailable locally"/></testcase>
+<testcase file="tests/test_auto_migration.py" name="b"><skipped type="pytest.skip" message="isolated PostgreSQL container unavailable locally"/></testcase>
+<testcase file="tests/test_compose.py" name="c"><skipped type="pytest.skip" message="Docker is required"/></testcase>
+<testcase file="tests/test_age.py" name="d"><skipped type="pytest.skip" message="age binaries unavailable"/></testcase>
+<testcase file="tests/test_known.py" name="e"><skipped type="pytest.xfail" message="known"/></testcase>
+<testcase file="tests/test_app.py" name="f"/>
+</testsuite></testsuites>'''
+
+
+# spec: ANYM-638
+def test_a_root_run_names_each_module_whose_tests_it_skipped(mini, worktree):
+    home, env = mini
+    result = remote(env, worktree, 'root', 'tests/test_app.py', FAKE_JUNIT=JUNIT)
+    assert result.returncode == 0, result.stderr
+    assert ('skipped: needs docker (CI covers): 3 tests did not run here: tests/test_auto_migration.py (2), '
+            'tests/test_compose.py (1)') in result.stderr
+    assert 'skipped for another reason: 1 tests did not run here: tests/test_age.py (1)' in result.stderr
+    assert 'test_known' not in result.stderr and 'test_app.py (' not in result.stderr
+
+
+# spec: ANYM-638
+def test_the_full_root_suite_adds_up_the_skips_of_every_shard(mini, worktree):
+    home, env = mini
+    result = remote(env, '--full', worktree, 'root', FAKE_JUNIT=JUNIT)
+    assert result.returncode == 0, result.stderr
+    assert 'needs docker (CI covers): 6 tests did not run here: tests/test_auto_migration.py (4), tests/test_compose.py (2)' in result.stderr
+
+
+# spec: ANYM-638
+def test_a_module_level_docker_skip_counts_as_docker(mini, worktree):
+    home, env = mini
+    report = ('<testsuites><testsuite><testcase classname="" name="tests.test_mod"><skipped message="collection skipped">'
+              "('tests/test_mod.py', 1, 'Skipped: Docker is required')</skipped></testcase></testsuite></testsuites>")
+    result = remote(env, worktree, 'root', 'tests/test_app.py', FAKE_JUNIT=report)
+    assert 'needs docker (CI covers): 1 tests did not run here: tests.test_mod (1)' in result.stderr, result.stderr
+
+
+# spec: ANYM-638
+def test_a_report_path_that_is_no_regular_file_never_stalls_the_run(mini, worktree):
+    home, env = mini
+    result = remote(env, worktree, 'root', 'tests/test_app.py', FAKE_JUNIT=JUNIT, FAKE_JUNIT_FIFO='1', FAKE_UV_EXIT='3')
+    assert result.returncode == 3, result.stderr
+    assert 'tests/test_compose.py (1)' in result.stderr
+    assert not list((worker_dir(home) / 'runs').iterdir())
+
+
+# spec: ANYM-638
+def test_the_skip_summary_is_best_effort_in_the_exit_trap():
+    text = SCRIPT.read_text()
+    # A here-string needs a temporary file under bash 3.2, and a failure there would end `finish` under set -e.
+    assert 'report_skips || true' in text and 'done <<<' not in text
+
+
+# spec: ANYM-638
+def test_an_unreadable_skip_report_never_changes_the_runs_status(mini, worktree):
+    home, env = mini
+    result = remote(env, worktree, 'root', 'tests/test_app.py', FAKE_JUNIT='not xml', FAKE_UV_EXIT='3')
+    assert result.returncode == 3, result.stderr
+    assert 'skipped: needs docker (CI covers): the modules that use' in result.stderr
 
 
 # spec: ANYM-638
@@ -1185,6 +1250,30 @@ def test_an_undo_that_cannot_remove_a_resource_keeps_it_in_the_ledger_and_fails(
     again = setup_block(env, blocks[6], shell)
     assert again.returncode == 0 and 'undo-ok' in again.stdout, again.stdout + again.stderr
     assert setup_leftovers(root) == []
+
+
+# spec: ANYM-638
+def test_a_hyphenated_worker_name_is_one_directory_for_a_run_and_its_cleanup(mini, worktree):
+    home, env = mini
+    assert remote(env, worktree, 'gateway', 'tests/test_x.py', DEEDKIT_REMOTE_WORKER='fix-defects-11-05').returncode == 0
+    directory = home / 'service' / 'deedkit-ci' / 'fix_defects_11_05'
+    assert directory.is_dir()
+    assert remote(env, '--cleanup', 'fix-defects-11-05').returncode == 0
+    assert not directory.exists() and not (home / 'shared' / 'stage' / 'fix_defects_11_05').exists()
+
+
+# spec: ANYM-638
+def test_a_long_derived_worker_name_is_cut_and_stays_apart_from_a_near_twin(mini, worktree):
+    home, env = mini
+    previous = worktree
+    for last in ('one', 'two'):
+        tree = worktree.parent / ('Long-Branch-' * 8 + last)
+        previous.rename(tree)
+        previous = tree
+        result = remote(env, tree, 'gateway', 'tests/test_x.py', DEEDKIT_REMOTE_WORKER='')
+        assert result.returncode == 0, result.stderr
+    names = {path.name for path in (home / 'service' / 'deedkit-ci').iterdir() if path.is_dir() and path.name != '.locks'}
+    assert len(names) == 2 and all(len(name) <= 63 and name.startswith('infra_long_branch') for name in names), names
 
 
 # spec: ANYM-638
