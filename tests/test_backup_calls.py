@@ -654,6 +654,14 @@ def test_in_the_real_container_a_writer_stays_within_the_bound_and_the_snapshot_
     assert sorted(p.name for p in staging.iterdir()) == ['voice.sqlite3']
 
 
+def oom_kills_under_docker():
+    """The kernel's count of memory-limit kills in Docker's parent cgroup. A cgroup's count includes its children's, so it
+    outlives the container's own cgroup, and the kernel raises it before it sends the kill, so reading it needs no wait."""
+    driver = subprocess.run(['docker', 'info', '--format', '{{.CgroupDriver}}'], stdout=subprocess.PIPE, text=True, check=True, timeout=30).stdout.strip()
+    events = Path('/sys/fs/cgroup', {'systemd': 'system.slice', 'cgroupfs': 'docker'}[driver], 'memory.events').read_text()
+    return int(dict(line.split() for line in events.splitlines())['oom_kill'])
+
+
 # spec: ANYM-778
 def test_in_the_real_container_its_memory_limit_kills_it_and_not_the_writer(tmp_path, real_helper):
     source = tmp_path / 'data' / 'voice.sqlite3'
@@ -662,6 +670,7 @@ def test_in_the_real_container_its_memory_limit_kills_it_and_not_the_writer(tmp_
     os.chmod(source, 0o666)
     hog = 'held = []\nimport threading, time\ndef _hog():\n    time.sleep(1)\n    while True:\n        held.append(b"x" * 8388608)\n        time.sleep(.01)\nthreading.Thread(target=_hog, daemon=True).start()\n'
     real, name, staging, _ = real_helper(hog, keep=True)
+    kills_before = oom_kills_under_docker()
     stop, times, errors = threading.Event(), [], []
     capture, outcome = capture_running(real, name, staging, 120)
     thread = threading.Thread(target=writer_loop, args=(source, stop, times, errors))
@@ -673,11 +682,10 @@ def test_in_the_real_container_its_memory_limit_kills_it_and_not_the_writer(tmp_
     finally:
         stop.set()
         thread.join(timeout=30)
-    limit = time.monotonic() + 15
-    while not real.inspect(name)['State']['OOMKilled'] and time.monotonic() < limit:  # Docker's OOM event is asynchronous
-        time.sleep(.2)
-    assert real.inspect(name)['State']['OOMKilled'] is True
-    assert outcome['result'][0] != 0 and not (staging / 'voice.sqlite3').exists() and died_after > 0
+    # SIGKILL ended the helper and the kernel counted a memory-limit kill; a `docker kill` gives the same exit and no count.
+    # Docker's OOMKilled flag is not read: it stayed false through 15 s after 14 of 440 such kills (probe run 41982010224).
+    assert outcome['result'][0] == 137 and oom_kills_under_docker() > kills_before, real.inspect(name)['State']
+    assert not (staging / 'voice.sqlite3').exists() and died_after > 0
     assert not errors and len(times) > died_after and max(times) <= CALLS_WRITER_BOUND_SECONDS
 
 
