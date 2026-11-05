@@ -702,6 +702,95 @@ async def test_events_endpoint_reads_only_with_the_router_token(tmp_path):
                 assert (await c.get('/v1/events', params=params, headers=router)).status_code == 422
 
 
+def hold_the_database(path, stop, hold_s, gap_s):
+    """Another connection repeats an exclusive transaction: a commit that excludes readers, as a slow disk makes it."""
+    db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+    db.execute('BEGIN EXCLUSIVE')
+
+    def loop():
+        try:
+            while True:
+                stop.wait(hold_s)
+                db.execute('COMMIT')
+                if stop.is_set() or gap_s is None:
+                    return
+                time.sleep(gap_s)
+                db.execute('BEGIN EXCLUSIVE')
+        finally:
+            db.close()
+    thread = threading.Thread(target=loop)
+    thread.start()
+    return thread
+
+
+# spec: ANYM-563
+def test_a_journal_read_outlasts_a_commit_longer_than_sqlites_default_wait(tmp_path):
+    store = VoiceService(tmp_path)
+    store.events_page(0, 1)  # The expiry pass of this interval is done: the reads below are the journal's alone.
+    stop = threading.Event()
+    thread = hold_the_database(tmp_path / 'voice.sqlite3', stop, 5.5, None)
+    try:
+        assert store.events_head()['head'] == 0
+    finally:
+        stop.set()
+        thread.join()
+    store.close()
+
+
+# spec: ANYM-563
+def test_a_journal_read_finds_the_short_gaps_between_a_busy_writers_commits(tmp_path):
+    store = VoiceService(tmp_path)
+    store.events_page(0, 1)
+    stop = threading.Event()
+    thread = hold_the_database(tmp_path / 'voice.sqlite3', stop, 0.098, 0.002)
+    started = time.monotonic()
+    try:
+        for _ in range(5):
+            assert store.events_head()['head'] == 0
+            assert store.events_page(0, 1)['events'] == []
+        taken = time.monotonic() - started
+    finally:
+        stop.set()
+        thread.join()
+    # Ten reads at SQLite's 100 ms steps average 5 s each here and often fail; one-millisecond retries take a cycle or two.
+    assert taken < 15, taken
+    store.close()
+
+
+# spec: ANYM-563
+def test_a_journal_read_gives_up_at_its_bound_and_a_write_still_lands(tmp_path, monkeypatch):
+    store = VoiceService(tmp_path)
+    identity = external(store)
+    store.events_page(0, 1)
+    monkeypatch.setattr(core, 'JOURNAL_BUSY_S', 0.2)
+    stop = threading.Event()
+    thread = hold_the_database(tmp_path / 'voice.sqlite3', stop, 30, None)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match='locked'):
+            store.events_head()
+    finally:
+        stop.set()
+        thread.join()
+    store.runtime_event(identity, {'kind': 'audio_probe', 'level': 1})
+    assert store.get_call(identity)['events'][-1]['kind'] == 'audio_probe'
+    store.close()
+
+
+# spec: ANYM-563
+def test_a_journal_read_never_retries_an_error_that_is_not_a_busy_database(tmp_path, monkeypatch):
+    store = VoiceService(tmp_path)
+    calls = []
+
+    def broken(db):
+        calls.append(db)
+        raise sqlite3.OperationalError('no such table: sqlite_sequence')
+    monkeypatch.setattr(call_events, 'head', broken)
+    with pytest.raises(sqlite3.OperationalError, match='no such table'):
+        store.events_head()
+    assert len(calls) == 1
+    store.close()
+
+
 # spec: ANYM-563
 def test_reading_ten_thousand_events_keeps_event_writes_of_an_active_call_within_bound(tmp_path):
     # 10k archived calls, each with a terminal row and a due owner request, so reads also trigger expiry.
