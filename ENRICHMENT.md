@@ -254,8 +254,11 @@ period. A transient database error in a pass (a statement or lock timeout, a dea
 full or restarting server, a lost connection) does not end the enrichment worker: it logs one
 line naming only the exception type, waits 5 s, doubled per consecutive failure up to 60 s, and
 tries again. A claim that rolled back spent nothing. A claim whose commit reached the server
-but whose answer was lost keeps its attempt and budget, and that job, like one whose result
-could not be written, stays under its lease until that expires. Exit 78, a failed requeue while
+but whose answer was lost keeps its attempt and budget, and that job stays under its lease until
+that expires. Such an error while writing a good result records no failure: the write is tried
+again each second for up to 30 s while the lease lasts, under the same token, so a retry after a
+commit whose answer was lost changes nothing. If it still fails, or the worker is stopping, the
+job stays under its lease until that expires. Exit 78, a failed requeue while
 stopping, a refused login, a bad DSN option and any other error still end it. Fairness
 between modalities/accounts prevents a continuous audio backlog from hiding
 video work. All of this is source functionality; production enablement requires
