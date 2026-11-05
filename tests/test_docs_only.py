@@ -224,8 +224,11 @@ def classify(root, *paths):
     'assert "see docs/guide.md:12 for the rule"\n',
     'assert "the rule is in docs/guide.md."\n',
     'text = open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "docs", "guide.md")).read()\n',
+    'text = (ROOT / "docs" / Path("guide.md")).read_text()\n',
+    'text = ROOT.joinpath("docs", Path("guide.md")).read_text()\n',
 ], ids=["literal", "whole-path-component", "chain", "file-relative", "path-parts", "joinpath", "os-path-join",
-        "named-directory", "unknown-head", "test-relative", "inside-a-message", "end-of-a-sentence", "os-path-dirname"])
+        "named-directory", "unknown-head", "test-relative", "inside-a-message", "end-of-a-sentence", "os-path-dirname",
+        "relative-path-operand", "relative-path-joinpath"])
 def test_a_document_a_test_names_is_not_docs_only_and_an_unread_one_stays(tmp_path, source):
     root = with_tests(tmp_path, {"tests/test_reader.py": HEADER + source})
     assert docs_only.scan_reason(root, ["NOTES.md"]) is None
@@ -275,7 +278,8 @@ DYNAMIC = 'def test_x(section, name):\n    assert (ROOT / "docs" / section / nam
 @pytest.mark.parametrize("source, directory", [
     (DYNAMIC, "docs"),
     ('def test_x():\n    assert list((ROOT / "docs").glob("*.md"))\n', "docs"),
-    ('def test_x():\n    assert list(ROOT.rglob("docs/**/*.md"))\n', "docs"),
+    ('def test_x():\n    assert list((ROOT / "docs").rglob("*.md"))\n', "docs"),
+    ('def test_x():\n    assert list(ROOT.rglob("docs/*.md"))\n', "."),
     ('def test_x():\n    assert list((ROOT / "docs").iterdir())\n', "docs"),
     ('def test_x():\n    assert list(os.walk(ROOT / "docs"))\n', "docs"),
     ('def test_x():\n    assert list(os.walk("docs"))\n', "docs"),
@@ -287,7 +291,7 @@ DYNAMIC = 'def test_x(section, name):\n    assert (ROOT / "docs" / section / nam
     ('DOCS = ROOT / "docs"\ndef test_x(name):\n    assert (DOCS / name).read_text()\n', "docs"),
     ('def test_x(name):\n    assert (ROOT / name).read_text()\n', "."),
     ('def test_x():\n    assert list(ROOT.glob("*.md"))\n', "."),
-], ids=["component-chain", "glob", "rglob", "iterdir", "os-walk", "os-walk-relative", "os-listdir", "glob-module",
+], ids=["component-chain", "glob", "rglob", "rglob-pattern-at-any-depth", "iterdir", "os-walk", "os-walk-relative", "os-listdir", "glob-module",
         "f-string", "open-f-string", "path-parts", "named-directory", "root", "root-glob"])
 def test_a_dynamic_read_keeps_every_document_under_its_literal_prefix_out_of_docs_only(tmp_path, source, directory):
     root = with_tests(tmp_path, {"tests/test_reader.py": HEADER + source})
@@ -339,6 +343,35 @@ def test_a_reads_comment_above_a_definition_narrows_that_definition_and_no_other
     root = with_tests(tmp_path / "second", {"tests/test_a.py": HEADER + narrowed + f"def other(name):\n    {read}"})
     assert docs_only.scan_reason(root, ["docs/заметки.md"]) == (
         "docs/заметки.md falls under a dynamic read of docs in tests/test_a.py")
+
+
+# spec: ANYM-767
+def test_reads_comment_text_inside_a_string_narrows_nothing_and_needs_no_file(tmp_path):
+    source = HEADER + 'TEXT = """\n# reads: NOTES.md\n"""\ndef test_x(name):\n    assert (ROOT / "docs" / name).read_text()\n'
+    trailing = HEADER + 'def test_y(name):\n    assert (ROOT / "docs" / name).read_text()  # reads: NOTES.md\n'
+    root = with_tests(tmp_path, {"tests/test_a.py": source})
+    assert docs_only.scan_reason(root, ["docs/заметки.md"]) == (
+        "docs/заметки.md falls under a dynamic read of docs in tests/test_a.py")
+    assert docs_only.stale_reads(with_tests(tmp_path / "second", {
+        "tests/test_a.py": 'TEXT = """\n# reads: docs/gone-long-ago.md\n"""\n'})) == []
+    root = with_tests(tmp_path / "third", {"tests/test_b.py": trailing})
+    assert docs_only.scan_reason(root, ["docs/заметки.md"]) == (
+        "docs/заметки.md falls under a dynamic read of docs in tests/test_b.py")
+
+
+# spec: ANYM-767
+def test_a_literal_path_with_a_space_is_a_read(tmp_path):
+    for path, source in (("tests/test_a.py", 'text = open("docs/my guide.md").read()\n'),
+                         ("packages/x/test/a.test.js", "const name = 'docs/my guide.md';\n")):
+        root = with_tests(tmp_path / path.replace("/", "_"), {path: source})
+        assert docs_only.scan_reason(root, ["docs/my guide.md"]) == f"docs/my guide.md is read by {path}"
+
+
+# spec: ANYM-767
+def test_rglob_reaches_a_nested_directory_of_the_same_name(tmp_path):
+    root = with_tests(tmp_path, {"tests/test_a.py": HEADER + 'def test_x():\n    assert list(ROOT.rglob("docs/*.md"))\n'})
+    assert docs_only.scan_reason(root, ["notes/docs/guide.md"]) == (
+        "notes/docs/guide.md falls under a dynamic read of . in tests/test_a.py")
 
 
 # spec: ANYM-767
@@ -402,7 +435,10 @@ def test_a_test_file_the_scan_cannot_read_means_a_full_run(tmp_path, path, sourc
 def test_a_scan_past_its_time_limit_means_a_full_run(tmp_path, monkeypatch):
     root = with_tests(tmp_path, {"tests/test_x.py": "NAME = 1\n"})
     monkeypatch.setattr(docs_only, "SCAN_SECONDS", 0)
-    docs_only_run, why = classify(root, "docs/guide.md")
+    docs_only_run, why = classify(root, "docs/guide.md")  # git itself gets no time left
+    assert docs_only_run is False and why.startswith("the scan of test files failed: TimeoutExpired"), why
+    monkeypatch.setattr(docs_only, "tree_blobs", lambda *_: ([("tests/test_x.py", b"NAME = 1\n")], set()))
+    docs_only_run, why = classify(root, "NOTES.md")  # the files came in time, their parsing did not
     assert docs_only_run is False and why.startswith("the scan of test files failed: TimeoutError"), why
 
 
@@ -428,7 +464,9 @@ def test_the_job_summary_names_the_document_and_its_reader_and_the_step_never_fa
 def test_this_repository_keeps_a_read_document_in_the_full_run_and_an_unread_one_docs_only():
     reason = docs_only.scan_reason(ROOT, ["docs/operations/production.md"])
     assert reason is not None and reason.startswith("docs/operations/production.md is read by "), reason
-    assert docs_only.scan_reason(ROOT, ["docs/no-test-reads-this-synthetic-name.md"]) is None
+    # Built here, because a whole literal of this path would be a read of it by this very file.
+    unread = "/".join(("docs", "no-test-reads-this-synthetic-name.md"))
+    assert docs_only.scan_reason(ROOT, [unread]) is None
 
 
 def workflows():

@@ -19,6 +19,7 @@ the dynamic reads of the next statement (a whole `def` when it stands above one)
 from __future__ import annotations
 
 import ast
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -26,6 +27,7 @@ import re
 import subprocess
 import sys
 import time
+import tokenize
 from typing import NamedTuple
 import warnings
 
@@ -42,9 +44,10 @@ SCAN_SECONDS = 20
 TEST_DIRECTORIES = frozenset({"tests", "test"})
 # Binary fixtures have other suffixes; a file of these suffixes that does not decode fails the scan: a full run.
 TEXT_SUFFIXES = frozenset({".js", ".mjs", ".cjs", ".ts", ".tsx", ".go", ".sh", ".json", ".yml", ".yaml", ".toml", ".txt"})
-READS_COMMENT = re.compile(r"^[ \t]*#[ \t]*reads:[ \t]*(\S.*?)[ \t]*$", re.MULTILINE)
+READS_COMMENT = re.compile(r"#[ \t]*reads:[ \t]*(\S.*?)[ \t]*")
 PATH_TOKEN = re.compile(r"[\w@+.\-/]+")
-QUOTED_PARTS = re.compile(r"""['"`][\w@+.\-/]+['"`](?:\s*,\s*['"`][\w@+.\-/]+['"`])*""")
+QUOTED_PARTS = re.compile(r"""['"`][\w@+.\-/ ]+['"`](?:\s*,\s*['"`][\w@+.\-/ ]+['"`])*""")
+LONGEST_PATH = 1024
 UNBOUND_ROOT = re.compile(r"[A-Z_]*(?:ROOT|REPO)[A-Z_]*")
 TEMPORARY = re.compile(r"te?mp", re.IGNORECASE)
 WILDCARD = re.compile(r"[*?\[]")
@@ -53,7 +56,10 @@ SAME_PATH_METHODS = frozenset({"resolve", "absolute", "expanduser", "as_posix"})
 SAME_PATH_FUNCTIONS = frozenset({"abspath", "realpath", "normpath", "str", "fspath"})
 WALK_METHODS = frozenset({"glob", "rglob", "iterdir", "walk"})
 WALK_FUNCTIONS = frozenset({"walk", "listdir", "scandir", "glob", "iglob"})
-ROOTED, RELATIVE, FLOATING = "rooted", "relative", "floating"
+# ROOTED is anchored at the repository; WORKING a relative path object, the root alone and a tail when joined;
+# RELATIVE a plain string; FLOATING literal parts behind an unknown head.
+ROOTED, WORKING, RELATIVE, FLOATING = "rooted", "working", "relative", "floating"
+LOCATED = (ROOTED, WORKING)
 
 
 def git(root: Path, *arguments: str) -> str:
@@ -90,12 +96,25 @@ def literal_names(text: str, directory: tuple[str, ...]) -> set[str]:
     """Repository paths a piece of text can name: from the root, and from the test file's directory when relative."""
     names = set()
     for token in PATH_TOKEN.findall(text):
-        token = token.rstrip("@+.-")
-        if "." not in token and "/" not in token: continue
-        parts = split_path(token)
-        if token.startswith("."): names.add("/".join(normal(parts, directory)))
-        if ".." not in parts: names.add("/".join(parts))
+        add_path(names, token.rstrip("@+.-"), directory)
     return names
+
+
+def add_path(names: set[str], token: str, directory: tuple[str, ...]) -> None:
+    if "." not in token and "/" not in token: return
+    parts = split_path(token)
+    if token.startswith("."): names.add("/".join(normal(parts, directory)))
+    if ".." not in parts: names.add("/".join(parts))
+
+
+def reads_comments(data: bytes) -> list[tuple[int, str]]:
+    """(line, path) of every `# reads:` comment line of a Python file, by its real comment tokens."""
+    if b"reads:" not in data: return []
+    found = []
+    for token in tokenize.tokenize(io.BytesIO(data).readline):
+        if token.type == tokenize.COMMENT and token.line.lstrip().startswith("#"):
+            if match := READS_COMMENT.fullmatch(token.string): found.append((token.start[0], match.group(1)))
+    return found
 
 
 class Scanner(ast.NodeVisitor):
@@ -136,10 +155,10 @@ class Scanner(ast.NodeVisitor):
         if isinstance(node, ast.JoinedStr): return self.evaluate_fstring(node)
         if isinstance(node, ast.Attribute):
             value = self.evaluate(node.value) if node.attr == "parent" else None
-            return value._replace(parts=value.parts[:-1]) if value and value.anchor == ROOTED else None
+            return value._replace(parts=value.parts[:-1]) if value and value.anchor in LOCATED else None
         if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute) and node.value.attr == "parents":
             value, index = self.evaluate(node.value.value), node.slice
-            if value and value.anchor == ROOTED and isinstance(index, ast.Constant) and isinstance(index.value, int):
+            if value and value.anchor in LOCATED and isinstance(index, ast.Constant) and isinstance(index.value, int):
                 return value._replace(parts=value.parts[:-(index.value + 1)])
             return None
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div): return self.evaluate_division(node)
@@ -150,7 +169,7 @@ class Scanner(ast.NodeVisitor):
         pieces, value = list(node.values), Value((), RELATIVE, True)
         if pieces and isinstance(pieces[0], ast.FormattedValue):
             head = self.evaluate(pieces.pop(0).value)
-            if head is None or head.anchor != ROOTED: return None
+            if head is None or head.anchor not in LOCATED: return None
             value = head._replace(dynamic=True)
         first = pieces[0] if pieces else None
         text = str(first.value) if isinstance(first, ast.Constant) else ""
@@ -163,7 +182,7 @@ class Scanner(ast.NodeVisitor):
             if any(isinstance(part, ast.Name) and TEMPORARY.search(part.id) for part in ast.walk(node.left)): return None
             right = self.evaluate(node.right)
             return Value(right.parts, FLOATING, right.dynamic) if right and right.anchor == RELATIVE else None
-        return self.join([node.right], Value(left.parts, ROOTED if left.anchor == RELATIVE else left.anchor, left.dynamic))
+        return self.join([node.right], Value(left.parts, WORKING if left.anchor == RELATIVE else left.anchor, left.dynamic))
 
     def evaluate_call(self, node: ast.Call) -> Value | None:
         function = node.func
@@ -187,12 +206,12 @@ class Scanner(ast.NodeVisitor):
         return None
 
     def path_call(self, node: ast.Call) -> Value | None:
-        return self.anchored(self.join(node.args)) if node.args else Value((), ROOTED)
+        return self.anchored(self.join(node.args)) if node.args else Value((), WORKING)
 
     @staticmethod
     def anchored(value: Value | None) -> Value | None:
         """A relative path a path object or a file call takes starts at the working directory, the repository root."""
-        return value._replace(anchor=ROOTED) if value and value.anchor == RELATIVE else value
+        return value._replace(anchor=WORKING) if value and value.anchor == RELATIVE else value
 
     def add_dynamic(self, parts: tuple[str, ...], line: int) -> None:
         literal = []
@@ -203,13 +222,15 @@ class Scanner(ast.NodeVisitor):
 
     def record(self, value: Value | None, line: int) -> None:
         if value is None: return
-        if value.anchor == ROOTED:
+        if value.anchor in LOCATED:
             if value.dynamic: self.add_dynamic(value.parts, line)
             else: self.names.add("/".join(value.parts))
         elif value.anchor == FLOATING and not value.dynamic: self.tails.add("/".join(value.parts))
 
     def visit_Constant(self, node: ast.Constant) -> None:
-        if isinstance(node.value, str): self.names |= literal_names(node.value, self.directory)
+        if isinstance(node.value, str):
+            self.names |= literal_names(node.value, self.directory)
+            if len(node.value) <= LONGEST_PATH: add_path(self.names, node.value.strip(), self.directory)
 
     def visit_Expr(self, node: ast.Expr) -> None:
         # A string statement, a docstring above all, is no value any code can read.
@@ -225,8 +246,9 @@ class Scanner(ast.NodeVisitor):
         if isinstance(function, ast.Attribute):
             module = function.value.id if isinstance(function.value, ast.Name) else ""
             receiver = None if module in ("os", "glob") else self.evaluate(function.value)
-            if receiver and receiver.anchor == ROOTED and function.attr in WALK_METHODS:
-                pattern = first.parts if first and first.anchor == RELATIVE and function.attr in ("glob", "rglob") else ()
+            if receiver and receiver.anchor in LOCATED and function.attr in WALK_METHODS:
+                # rglob matches its pattern at any depth, so only glob's pattern narrows the directory.
+                pattern = first.parts if first and first.anchor == RELATIVE and function.attr == "glob" else ()
                 self.add_dynamic(receiver.parts + pattern, node.lineno)
             name = function.attr if module in ("os", "glob") else ""
         else:
@@ -275,9 +297,9 @@ class Scanner(ast.NodeVisitor):
 
     visit_FunctionDef = visit_AsyncFunctionDef = visit_Lambda = visit_ClassDef = scoped
 
-    def result(self, tree: ast.Module, text: str) -> Reads:
+    def result(self, tree: ast.Module, data: bytes) -> Reads:
         names, spans = set(self.names), []
-        lines = [(text.count("\n", 0, match.start(1)) + 1, match.group(1)) for match in READS_COMMENT.finditer(text)]
+        lines = reads_comments(data)
         statements = [statement_span(node) for node in ast.walk(tree) if isinstance(node, ast.stmt)] if lines else []
         for line, path in lines:
             names.add(path)
@@ -299,7 +321,7 @@ def scan_python(path: str, data: bytes) -> Reads:
         tree = ast.parse(data, filename=path)
     scanner = Scanner(path)
     scanner.visit(tree)
-    return scanner.result(tree, data.decode("utf-8"))
+    return scanner.result(tree, data)
 
 
 def scan_text(path: str, data: bytes) -> Reads:
@@ -380,8 +402,8 @@ def stale_reads(root: Path) -> list[tuple[str, str]]:
     """Every (test file, path) of a `# reads:` comment in HEAD that names no tracked file."""
     deadline = time.monotonic() + SCAN_SECONDS
     blobs, tracked = tree_blobs(root, deadline)
-    return [(path, match) for path, data in blobs if path.endswith(".py")
-            for match in READS_COMMENT.findall(data.decode("utf-8")) if match not in tracked]
+    return [(path, name) for path, data in blobs if path.endswith(".py")
+            for _, name in reads_comments(data) if name not in tracked]
 
 
 def eligible(path: str) -> bool:
