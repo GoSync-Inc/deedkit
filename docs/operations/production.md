@@ -1982,7 +1982,7 @@ undoing a plan is `--apply` and `--undo` (ANYM-746, below); the hand release abo
 optional `networks`: the internal Compose networks the first start creates once, each `name`, `bridge` and, for a network
 the gateway joins, `gateway_port`, the port the isolation probe checks on every serving gateway; a module whose
 networks exist already declares none, and a new manifest key reaches a host only after the tool that reads it is
-installed, because an older tool reads an unknown key as a malformed manifest and `deploy` pauses with `enroll_required`);
+installed, because an older tool reads an unknown key as a malformed manifest and `deploy` pauses);
 `gateway` (`overlay` a repository path or null, and `policy`: `module`, `backend_url`, `tools`, `principals` with their
 `grants`, `key_dir` as an absolute host directory, `key_file_pattern` with `{principal}`, `key_uid`); `egress`
 (`outside` false, or true with `admission_env` (`blocked` and `open` variable names), `canary`, `verify` (a command whose
@@ -2038,14 +2038,14 @@ only while none of them changed; `--apply` refuses a different `--plan-digest` (
 reviewer approved, as root, through the release machinery `deploy` uses. Refusals (exit 2, nothing written) are the plan's
 codes plus `plan_changed` (the recomputed digest, or the manifest, differs), `enrollment_unfinished` (an
 `enrollment.json` that is not undone, or an unfinished apply or HTTP attempt, exists), `configuration_changed` (the
-configuration drifts from the current release before the run) and `active_call`. Under the host locks and the backup wait
+configuration drifts from the current release before the run) and `active_call`. An external network the manifest does not
+declare, with or without `name:`, or a declared network that exists and is not internal is refused as `network_unsafe` before the pause, the receipt or any file is written (`--plan` reports the undeclared one too). Under the host locks and the backup wait
 (ANYM-744: exit 75 after the bound, nothing written) the order is: the plan is recomputed and compared; the tool writes the
 pause (its own marker); copies `production.json`, `http-production.json` and the live policy into a root-only directory
 `enrollment-<module>-<sha12>` of the state directory (sha256 in the receipt `enrollment.json`, mode 0600: digests,
 revisions and step names only); installs the overlays by atomic rename from `git show <sha>:<path>` with read-back
 (`overlay_conflict` when the host path holds other content); creates a missing network of the manifest once (`--internal`,
-its bridge, isolated; `network_unsafe` for an existing one that is not internal or an undeclared external one); tags the
-attested image `deedkit-<target>:enroll-<sha>` (never `--build`); re-reads the private configuration immediately before `up`
+its bridge, isolated); tags the attested image `deedkit-<target>:enroll-<sha>` (never `--build`); re-reads the private configuration immediately before `up`
 (`private_config_forbidden_key`) and requires the resolved admission to be `required` (`egress_admission_not_required`);
 `up -d --no-build --pull never`, health, and for outside egress the confinement check from inside the container with a host
 positive control per blocked target but the canary (`confinement_check_failed`); edits both configuration files and the
@@ -2085,7 +2085,9 @@ step is bound to the approved digest.
 
 *Autodeploy.* When a deploy finds a manifest in its range for a module the host does not run, or a configuration that
 differs from the recorded digests only by an enrollment, it pauses with `enroll_required: <module>: production.py enroll
---module <module> --sha <sha> --plan`. It never enrolls by itself: restarts, firewall and access are not for a timer.
+--module <module> --sha <sha> --plan`. It never enrolls by itself: restarts, firewall and access are not for a timer. A
+changed manifest that does not parse, of a module whose manifest at the range's base names a running project, pauses with
+`manifest_invalid: <module>: fix deploy/modules/<module>.json; enroll is not needed` (`manifest_code` in the pause file is the fixed reason).
 
 *What stays with a person.* The owner writes provider tokens by hand and makes the registry package public after its first
 publication; backend and gateway key files are an agent step under the section 2 gates, only checked here; root firewall
