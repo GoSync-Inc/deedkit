@@ -835,24 +835,31 @@ func TestNativeOpenChatByPhoneTimedOutResolutionKeepsItsSlot(t *testing.T) {
 	d, _ := phoneLookupFake(t, nil, &lid)
 	d.lookupTimeout = 50 * time.Millisecond
 	release := make(chan struct{})
-	entries := make(chan struct{}, 2)
+	entered := make(chan struct{}, 2)
 	d.lidForPN = func(context.Context, types.JID) (types.JID, error) {
-		entries <- struct{}{}
+		entered <- struct{}{}
 		<-release // ignores its context, like a wedged store
 		return lid, nil
 	}
 	job := phoneJob(map[string]any{"phone": phoneFixture})
 	job.KnownChats = []string{lidFixture}
 	_, first := executeOperation(context.Background(), job, d)
+	// The caller has given up and its resolution is inside the wedged read, so only a
+	// release at the caller's deadline can empty the slot here.
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("the resolution never started")
+	}
+	held := len(phoneLookupSlot)
 	_, second := executeOperation(context.Background(), job, d)
-	// Counted while the first call is still wedged: a freed slot would let the second one in.
-	inResolver := len(entries)
 	close(release)
 	waitPhoneSlot(t)
 	requireError(t, first, "provider_timeout")
 	requireError(t, second, "provider_timeout")
-	if inResolver != 1 {
-		t.Fatalf("%d resolutions entered while the first outlived its deadline", inResolver)
+	if held != 1 {
+		t.Fatalf("slot count %d while a timed-out resolution was still running", held)
 	}
 }
 
