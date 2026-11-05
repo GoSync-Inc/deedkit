@@ -342,6 +342,19 @@ previous reviewed wheel into `/opt/deedkit-backup-r2/venv` by
 [Receiver installation](#receiver-installation-and-private-configuration). Sidecars
 may stay: they are ignored, and no state changes.
 
+Two wheels can carry one version, and pip then skips the second as already
+installed, leaving the code in place. So in either direction, on a hand-installed
+venv, install with `--force-reinstall` and compare what landed with the reviewed
+revision; every line must match:
+
+```sh
+/opt/deedkit-backup-r2/venv/bin/python -m pip install --force-reinstall --no-deps "$REVIEWED_WHEEL"
+for name in backup_r2_receiver backup_r2_verifier; do
+  sha256sum "$REVIEWED_SOURCE/services/messaging/messaging_service/$name.py" \
+    /opt/deedkit-backup-r2/venv/lib/python3.13/site-packages/messaging_service/$name.py
+done
+```
+
 Plaintext originals, dump and restored database still need disk space. When work
 and Docker share a filesystem, preflight reserves the selected ciphertext's
 wire size plus PostgreSQL headroom and the free-space reserve. With a candidate
