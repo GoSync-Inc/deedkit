@@ -1,4 +1,6 @@
-"""The calendar backup's systemd units (ANYM-607): its own config, messaging's lock, a daily run that ends by 18:00."""
+"""The calendar backup's systemd units (ANYM-607): its own config, messaging's lock, a daily run that ends by 18:00.
+
+The restore stack and procedure (ANYM-610): the Compose file's isolation, the written commands' shell syntax."""
 import configparser
 import json
 from pathlib import Path
@@ -7,6 +9,7 @@ import shlex
 import subprocess
 
 from messaging_service import backup_runner
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = ROOT / 'deploy'
@@ -138,6 +141,227 @@ def test_the_admission_condition_admits_only_minutes_up_to_its_bound_and_fails_c
         return subprocess.run(['/bin/sh', '-c', script], env={'PATH': f'{tmp_path}:/usr/bin:/bin'}).returncode == 0
     assert all(admitted(clock) for clock in ('0000', '0930', '1600', '1602'))
     assert not any(admitted(clock) for clock in ('1603', '1605', '1700', '1759', '1800', '2359', 'x', ''))
+
+
+RESTORE_SCRIPT = DEPLOY / 'calendar-restore.sh'
+
+
+def restore_stack():
+    return yaml.safe_load((DEPLOY / 'compose.calendar-restore.yaml').read_text())
+
+
+def restore_section():
+    """The text of BACKUP.md "Restore the family calendar", up to the next section."""
+    match = re.search(r'^### Restore the family calendar.*?(?=^## )', (ROOT / 'BACKUP.md').read_text(), re.M | re.S)
+    assert match
+    return match[0]
+
+
+# spec: ANYM-610
+def test_the_restore_stack_is_the_database_and_the_api_only_with_no_worker():
+    assert set(restore_stack()['services']) == {'calendar-db', 'calendar-api'}
+
+
+# spec: ANYM-610
+def test_the_restore_stack_has_one_internal_network_and_no_external_or_provider_network():
+    stack = restore_stack()
+    assert stack['networks'] == {'calendar-backend': {'internal': True}}
+    for service in stack['services'].values():
+        assert service['networks'] == ['calendar-backend'] and 'network_mode' not in service
+
+
+# spec: ANYM-610
+def test_the_restore_stack_mounts_no_vault_and_gives_the_api_only_its_own_profile():
+    stack = restore_stack()
+    assert stack['services']['calendar-api']['volumes'] == [
+        '${CALENDAR_RESTORE_STATE_DIR}/service/gateway.json:/data/service/gateway.json:ro']
+    assert stack['services']['calendar-db']['volumes'] == ['calendar-restore-database:/var/lib/postgresql']
+    assert 'vault' not in json.dumps(stack['services'])
+
+
+# spec: ANYM-610
+def test_the_restore_stack_shares_no_name_with_production():
+    stack, production = restore_stack(), yaml.safe_load((DEPLOY / 'compose.calendar.yaml').read_text())
+    assert stack['name'] != production['name']
+    assert not set(stack['volumes']) & set(production['volumes'])
+    assert stack['volumes'] == {'calendar-restore-database': {}}  # project-scoped, never an external volume
+    assert 'CALENDAR_RESTORE_STATE_DIR:?' in stack['services']['calendar-db']['env_file']
+    text = (DEPLOY / 'compose.calendar-restore.yaml').read_text()
+    assert '${CALENDAR_STATE_DIR' not in text and '${CALENDAR_DATABASE_VOLUME' not in text
+
+
+# spec: ANYM-610
+def test_the_restore_stack_publishes_no_port_and_starts_nothing_by_itself():
+    # Docker 29 publishes nothing for a container whose only network is internal (probe on the backup server, 11-05).
+    for service in restore_stack()['services'].values():
+        assert 'ports' not in service and service['restart'] == 'no' and 'build' not in service
+
+
+# spec: ANYM-610
+def test_the_restore_api_runs_a_required_image_and_the_production_apis_sandbox_and_health_check():
+    stack, production = restore_stack(), yaml.safe_load((DEPLOY / 'compose.calendar.yaml').read_text())
+    api, live = stack['services']['calendar-api'], production['services']['calendar-api']
+    assert api['image'].startswith('${CALENDAR_RESTORE_IMAGE:?')
+    for key in ('command', 'healthcheck', 'read_only', 'user', 'cap_drop', 'security_opt', 'tmpfs', 'mem_limit', 'pids_limit'):
+        assert api[key] == live[key], key
+    assert stack['services']['calendar-db']['image'] == production['services']['calendar-db']['image']
+
+
+# spec: ANYM-610
+def test_the_restore_containers_keep_no_log_and_are_bounded():
+    # PostgreSQL logs a failed statement, so a failed CREATE ROLE would leave its password in a retained log.
+    for service in restore_stack()['services'].values():
+        assert service['logging'] == {'driver': 'none'} and service['cpus'] == 1 and service['mem_limit']
+
+
+# spec: ANYM-610
+def test_the_restore_procedure_is_linked_and_its_commands_parse():
+    target = 'BACKUP.md#restore-the-family-calendar'
+    assert target in (ROOT / 'docs/operations/platform-cutover.md').read_text()
+    assert target in (ROOT / 'services/calendar/docs/SERVICE.md').read_text()
+    assert 'deploy/calendar-restore.sh' in restore_section() and '--days N' in restore_section()
+    subprocess.run(['bash', '-n', str(RESTORE_SCRIPT)], check=True)
+    script = RESTORE_SCRIPT.read_text()
+    assert 'owner db-roles --check' in script and not re.search(r'db-roles(?! --check)', script)  # the check mints nothing
+    assert '--exit-on-error' in script and 'set -euo pipefail' in script
+
+
+FAKE_DOCKER = r'''#!/usr/bin/env python3
+import fcntl, json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+# Under a lock: both sides of `restore run ... | sql` start at once, and each call must get its own number.
+with open(os.environ['FAKE_LOG'], 'a+') as file:
+    fcntl.flock(file, fcntl.LOCK_EX)
+    file.seek(0)
+    calls = len(file.read().splitlines())
+    file.write(json.dumps(args) + '\n')
+if args[0] in ('run', 'compose') and not sys.stdin.isatty():
+    sys.stdin.read()
+if calls + 1 == int(os.environ.get('FAKE_FAIL_AT', '0')) or calls + 1 >= int(os.environ.get('FAKE_FAIL_FROM', '1000000')):
+    sys.exit(7)
+if os.environ.get('FAKE_RESTORE_FAILS') and 'pg_restore' in args:
+    sys.stderr.write('pg_restore: error: COPY failed: private row\n')
+    sys.exit(1)
+if args[:1] == ['run'] and any(value.endswith(':/work') for value in args):
+    work = Path(next(value for value in args if value.endswith(':/work')).split(':')[0])
+    profile = work / 'decrypted/state/profile'
+    profile.mkdir(parents=True)
+    for name in ('gateway', 'worker', 'runtime'):
+        (profile / (name + '.json')).write_text(json.dumps({'dsn': 'postgresql://user:synthetic@calendar-db:5432/db', 'port': 1}))
+    (profile / 'postgres.env').write_text('POSTGRES_USER=synthetic\n')
+    (work / 'decrypted/manifest.json').write_text(json.dumps({'tables': {}, 'schema_version': 8}))
+    (work / 'decrypted/database.dump').write_text('synthetic')
+if '-At' in args and '-c' in args:
+    print('family\tmember\tcalendar')
+'''
+FAKE_INSTALL = r'''#!/bin/sh
+if [ "$1" = -d ]; then shift 7; mkdir -p "$@"; else cp "$7" "$8"; fi
+'''
+FAKE_RECEIVER = r'''#!/bin/sh
+while [ $# -gt 0 ]; do [ "$1" = --output ] && echo synthetic > "$2"; shift; done
+'''
+
+
+def restore_run(tmp_path, *, reserve=1, **env):
+    """calendar-restore.sh on fake docker, flock, install, sha256sum and receiver, in a throwaway root."""
+    fakes, root, config = tmp_path / 'fakes', tmp_path / 'root', tmp_path / 'config'
+    for directory in (fakes, root, config / 'control', config / 'restore'):
+        directory.mkdir(parents=True, exist_ok=True)
+    for name, text in {'docker': FAKE_DOCKER, 'install': FAKE_INSTALL, 'receiver': FAKE_RECEIVER,
+                       'flock': '#!/bin/sh\nexit ${FAKE_FLOCK_STATUS:-0}\n',
+                       'sha256sum': '#!/bin/sh\nexit ${FAKE_SHA_STATUS:-0}\n'}.items():
+        (fakes / name).write_text(text)
+        (fakes / name).chmod(0o700)
+    (config / 'control/protected.json').write_text(json.dumps({'backups': [{'id': 'b1', 'sha256': 'a' * 64, 'bytes': 1}]}))
+    (config / 'verifier.json').write_text(json.dumps({'helper_image': 'sha256:' + 'b' * 64, 'postgres_headroom_bytes': 1,
+                                                      'reserve_bytes': reserve}))
+    log = tmp_path / 'docker.log'
+    log.unlink(missing_ok=True)
+    result = subprocess.run(['bash', str(RESTORE_SCRIPT)], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60, env={
+        'PATH': f'{fakes}:/usr/bin:/bin', 'DIGEST': 'sha256:' + 'c' * 64, 'FAKE_LOG': str(log),
+        'CALENDAR_RESTORE_ROOT': str(root), 'CALENDAR_RESTORE_CONFIG': str(config),
+        'CALENDAR_RESTORE_LOCK': str(tmp_path / 'host.lock'), 'CALENDAR_RESTORE_PYTHON': str(fakes / 'receiver'), **env})
+    calls = [' '.join(json.loads(line)) for line in log.read_text().splitlines()] if log.exists() else []
+    return result, calls, root
+
+
+# spec: ANYM-610
+def test_the_restore_stops_at_any_failing_docker_call_and_always_tears_down(tmp_path):
+    result, calls, root = restore_run(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'restore proved' in result.stdout and 'left: nothing' in result.stdout and not list(root.iterdir())
+    # The first three calls are the check for an interrupted run's leftovers; the count ends where teardown starts.
+    first_teardown = next(i for i, call in enumerate(calls) if i > 3 and call.startswith('ps -aq'))
+    assert first_teardown > 10
+    for number in range(1, first_teardown + 1):
+        result, seen, root = restore_run(tmp_path, FAKE_FAIL_AT=str(number))
+        assert result.returncode != 0 and 'restore proved' not in result.stdout, number
+        assert '== teardown' in result.stdout and not list(root.iterdir()), number
+        assert any(call.startswith('ps -aq') for call in seen[number:]), number
+
+
+# spec: ANYM-610
+def test_a_teardown_docker_cannot_verify_never_reports_nothing_left(tmp_path):
+    _, calls, _ = restore_run(tmp_path)
+    first_teardown = next(i for i, call in enumerate(calls) if i > 3 and call.startswith('ps -aq'))
+    result, _, _ = restore_run(tmp_path, FAKE_FAIL_FROM=str(first_teardown + 1))
+    assert 'restore proved' in result.stdout and result.returncode != 0
+    assert 'COULD NOT VERIFY' in result.stdout and 'left: nothing' not in result.stdout
+
+
+# spec: ANYM-610
+def test_a_docker_that_cannot_answer_the_leftovers_check_stops_the_run_before_it_starts(tmp_path):
+    result, calls, _ = restore_run(tmp_path, FAKE_FAIL_FROM='1')
+    assert result.returncode != 0 and 'COULD NOT VERIFY' in result.stdout and 'left: nothing' not in result.stdout
+    assert not any(call.startswith(('run ', 'pull ', 'compose ')) for call in calls)
+
+
+# spec: ANYM-610
+def test_an_interrupted_runs_leftovers_are_removed_and_the_run_ends_without_restoring(tmp_path):
+    (tmp_path / 'root').mkdir()
+    (tmp_path / 'root/calendar-restore.left').mkdir()
+    result, calls, root = restore_run(tmp_path)
+    assert result.returncode == 1 and 'run it again' in result.stdout and not list(root.iterdir())
+    assert not any(call.startswith(('run ', 'pull ', 'compose ')) for call in calls)
+
+
+# spec: ANYM-610
+def test_a_failed_checksum_stops_before_anything_is_decrypted(tmp_path):
+    result, calls, root = restore_run(tmp_path, FAKE_SHA_STATUS='1')
+    assert result.returncode != 0 and '== teardown' in result.stdout and not list(root.iterdir())
+    assert not any(call.startswith('run ') for call in calls)
+
+
+# spec: ANYM-610
+def test_a_failed_pg_restore_prints_no_row_and_tears_down(tmp_path):
+    result, _, root = restore_run(tmp_path, FAKE_RESTORE_FAILS='1')
+    assert result.returncode != 0 and 'pg_restore failed' in result.stdout and not list(root.iterdir())
+    assert 'private row' not in result.stdout + result.stderr
+
+
+# spec: ANYM-610
+def test_the_restore_without_the_host_lock_creates_nothing_and_tears_nothing_down(tmp_path):
+    result, calls, root = restore_run(tmp_path, FAKE_FLOCK_STATUS='1')
+    assert result.returncode != 0 and calls == [] and not list(root.iterdir()) and '== teardown' not in result.stdout
+
+
+# spec: ANYM-610
+def test_the_restore_without_the_disk_bound_stops_before_it_downloads(tmp_path):
+    result, calls, root = restore_run(tmp_path, reserve=2 ** 62)
+    assert result.returncode != 0 and 'restore_disk_capacity' in result.stderr
+    assert not any(call.startswith(('run ', 'pull ', 'compose ')) for call in calls) and not list(root.iterdir())
+
+
+# spec: ANYM-610
+def test_every_restore_helper_carries_the_label_teardown_removes_and_the_verifiers_bounds():
+    script = RESTORE_SCRIPT.read_text()
+    assert script.count('docker run ') == 1  # only in helper()
+    body = re.search(r'^helper\(\) \{\n(.*?)^\}', script, re.M | re.S)[1]
+    for flag in ('--rm', '--label "$LABEL"', '--log-driver none', '--memory 512m', '--memory-swap 512m', '--cpus 1',
+                 '--pids-limit 256', '--read-only', '--cap-drop ALL', '--security-opt no-new-privileges'):
+        assert flag in body, flag
+    assert script.index('flock --wait') < script.index('trap teardown EXIT') < script.index('mktemp -d')
 
 
 FRESHNESS_DIRECTORY = '/opt/deedkit/calendar-backup/backups'

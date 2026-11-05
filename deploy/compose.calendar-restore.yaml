@@ -1,0 +1,69 @@
+# The family calendar restored from a backup into a scratch project (ANYM-610; BACKUP.md, "Restore the family
+# calendar"). Only the database and the API: no worker, no vault mount, no provider-egress or integration network, so
+# restored tokens cannot reach Google or iCloud. Docker publishes no port for a container whose only network is
+# internal, so there is no `ports:`: the procedure reads the API on its own loopback through `docker compose exec`.
+# Logging is off: a failed statement in PostgreSQL's log can hold a role's password or a private row.
+name: deedkit-calendar-restore
+services:
+  calendar-db:
+    image: postgres:18-bookworm@sha256:afc7e2d441324c0388fa80c3d24f733b4194a4eb7f47dd8ee2b08eb1a24a647c
+    env_file: ${CALENDAR_RESTORE_STATE_DIR:?Set the scratch state directory, never the production one}/service/postgres.env
+    volumes: ["calendar-restore-database:/var/lib/postgresql"]
+    networks: [calendar-backend]
+    restart: "no"
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U fcs_owner -d family_calendar"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    mem_limit: 512m
+    cpus: 1
+    logging: {driver: none}
+  calendar-api:
+    image: ${CALENDAR_RESTORE_IMAGE:?Set the calendar image by its attested digest}
+    command: [serve]
+    depends_on:
+      calendar-db: {condition: service_healthy}
+    volumes:
+      - ${CALENDAR_RESTORE_STATE_DIR}/service/gateway.json:/data/service/gateway.json:ro
+    networks: [calendar-backend]
+    restart: "no"
+    # The production API's liveness check (compose.calendar.yaml): /health with a configured allowed Host.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import json, os, sys, urllib.request
+          try:
+              with open(os.path.join(os.environ["FCS_DATA_DIR"], "service", "gateway.json")) as file:
+                  config = json.load(file)
+              port = int(config["port"])
+              host = (config.get("allowed_hosts") or [f"127.0.0.1:{port}"])[0]
+              bind = config.get("bind", "127.0.0.1")
+              address = "127.0.0.1" if bind in ("", "0.0.0.0", "::") else f"[{bind}]" if ":" in bind else bind
+              request = urllib.request.Request(f"http://{address}:{port}/health", headers={"Host": host})
+              with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=8) as response:
+                  healthy = response.status == 200
+          except Exception:
+              healthy = False
+          sys.exit(0 if healthy else 1)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    read_only: true
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:size=32m,noexec,nosuid"]
+    mem_limit: 256m
+    cpus: 1
+    pids_limit: 96
+    stop_grace_period: 20s
+    logging: {driver: none}
+volumes:
+  calendar-restore-database: {}
+networks:
+  calendar-backend: {internal: true}

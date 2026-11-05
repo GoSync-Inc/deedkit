@@ -338,7 +338,7 @@ mounts of `${CALENDAR_STATE_DIR}/service/vault` and `${CALENDAR_STATE_DIR}/servi
 writes `bundle.tar.age`, `result.json` and `captured.json` like a staged messaging run;
 without `profile` the worker behaves as before. Receiver verification is ANYM-606, the
 daily schedule and the data-policy line ANYM-607 (below and docs/DATA-POLICY.md), the restore
-procedure ANYM-610.
+procedure ANYM-610 ([Restore the family calendar](#restore-the-family-calendar)).
 
 The host runner takes it with its own `runner.json` (ANYM-608; example:
 `deploy/backup-runner-calendar.example.json`: the production paths, with the receiver host and
@@ -419,7 +419,8 @@ connection without a token, a token without a connection row, a missing `runtime
 unknown vault entry are `vault_warnings`; the bundle is still built. An empty calendar (no
 connections, a vault with only `key`, or no vault directory yet) builds a valid bundle.
 
-Not in the bundle: agent key files (the database keeps their hashes; recovery is ANYM-610),
+Not in the bundle: agent key files (the database keeps their hashes; recovery:
+[Restore the family calendar](#restore-the-family-calendar), Agent keys),
 calendar logs, the container image and the raw provider data outside the database.
 `backup_crypto` accepts `state/` members only in a bundle whose first member is a manifest with
 `profile: calendar`, and such a bundle accepts no `files/` or `recovery/` member; messaging's
@@ -523,6 +524,66 @@ runner reads the previous file when it writes status). Steps: stop both calendar
 `status.json.corrupt-<date>` in the same directory; start the catch-up service once
 (`systemctl start deedkit-calendar-backup-catchup.service`; it is admitted only 19:00-23:59, otherwise start the daily
 service before 16:02); read `fresh` from the freshness command; start both timers again.
+
+### Restore the family calendar
+
+A restore (ANYM-610) is not only `pg_restore`: the worker has provider egress, `pg_dump` does not carry the two
+service roles, `db-roles` would mint new passwords and rewrite the profiles without `bind`, `allowed_hosts` and
+`allowed_origins`, and agent keys exist only as hashes. `deploy/calendar-restore.sh` restores the protected point into
+the scratch project of `deploy/compose.calendar-restore.yaml`: the database and the API, no worker, no vault mount, one
+internal network, no published port, so restored tokens cannot reach Google or iCloud. Docker publishes no port for a
+container whose only network is internal; the read below goes to the API's own loopback through `docker compose exec`.
+
+Before you start, on the backup server as root: Compose v2 (`apt-get install --no-install-recommends
+docker-compose-v2`), and both files of the release copied into one root-only directory. `DIGEST` is the calendar image's
+digest, of the release whose highest migration equals the bundle's `schema_version` (normally production's: `docker
+inspect --format '{{.Image}}' deedkit-calendar-calendar-api-1`), verified first from a machine with `gh`: `gh attestation
+verify oci://ghcr.io/gosync-inc/deedkit-calendar@<digest> --repo GoSync-Inc/deedkit --signer-workflow
+GoSync-Inc/deedkit/.github/workflows/ci.yml --source-ref refs/heads/main --source-digest <sha40>
+--deny-self-hosted-runners`. Then:
+
+```sh
+DIGEST=sha256:<verified digest> bash calendar-restore.sh
+```
+
+It stops at the first failure, and on every exit, success, failure or signal, it tears down. Its steps:
+
+1. Take the verifiers' host lock (`/var/lib/deedkit-backup-verify/host.lock`, one heavy restore at a time, waiting at
+   most an hour) and hold it to the end; a run that cannot get it creates nothing. Check free disk against the
+   verifier's bound with the plaintext added: twice the point's bytes plus `postgres_headroom_bytes` and
+   `reserve_bytes`. Resources an interrupted run left are removed and the run ends: run it again.
+2. Decrypt the protected point into a new 0700 directory under `/srv/backups`, after its download and sha256 check. The
+   verifier's pinned backup image does the decrypting, with no network and the verifier's bounds.
+3. Copy the four bundled profile files into the scratch state directory, owned by the API's user; the vault stays out.
+   Check that each profile's DSN host is the Compose service `calendar-db`, which resolves inside the scratch project;
+   rewrite only this copy when it names another host. Production's bundles hold `runtime.json`; the format allows a
+   bundle without it, which stops at this copy. The owner DSN it would hold is
+   `postgresql://fcs_owner:<POSTGRES_PASSWORD>@calendar-db:5432/family_calendar`, port 13232.
+4. Start the scratch `calendar-db` with the bundled `postgres.env`. Create `fcs_gateway` and `fcs_worker` with the
+   passwords in the bundled `gateway.json` and `worker.json` (never `db-roles`, which would mint new ones),
+   `pg_restore --exit-on-error`, then apply `roles.sql` read from the release's image. The roles come first, as in the
+   verifier, so a policy naming one still restores. A failed restore prints only the verifier's fixed phrase for it.
+5. Start the scratch `calendar-api`. Prove: no vault and no route out from inside the API (a connection to a public
+   address, never a provider, must fail), `schema-status`, the read-only `db-roles --check` (it mints nothing), and the
+   bundle's table manifest (ANYM-605) rebuilt from the restored database, printing only booleans and counts.
+6. One read through the API by a temporary read-only principal, created in the scratch database with a key given on
+   stdin and deleted after. It prints only the HTTP status and a count of calendars. An empty calendar has no grant to
+   read with and stops here.
+
+Teardown works by the project's label and the directory's prefix, so it needs no Compose config and no earlier step. It
+removes the scratch containers, the helpers (which carry the same label), the volume, the network, the state directory
+and the decrypted files, lists each, and fails if anything is left or if Docker cannot say. The pulled image and the Compose package stay, and
+neither holds data; delete your copy of the two files. Stderr that can quote a password or a row goes to a private file
+removed with the rest, and the scratch containers log nothing.
+
+A production restore runs the same steps only as a section 2 gated restore (AGENTS.md section 2): an Astra-reviewed
+plan, a fresh verified backup and an undo. It uses production's own Compose file and volume names, and starting the
+worker, which reaches the providers, is a step of that plan.
+
+Agent keys. Restored principals keep their key hashes, so an agent that still holds its key works unchanged. An agent
+that lost its key gets `deedkit admin key issue <new-id> --like <old-id> --days N` (docs/operations/production.md,
+"Issue a key like an existing one"; ANYM-496), its client is rebound to the new key, and the old principal is revoked
+(ANYM-497). No hash recreates a key.
 
 ## Recordings archive bundle (ANYM-714)
 
