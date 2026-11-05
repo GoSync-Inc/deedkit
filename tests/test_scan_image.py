@@ -445,6 +445,12 @@ def test_own_package_list_covers_every_project_installed_into_an_image():
     names = set()
     for pyproject in ("services/gateway", "services/calendar", "services/calls", "packages/platform-contracts",
                       "services/messaging", "services/recordings"):
+        # reads: services/gateway/pyproject.toml
+        # reads: services/calendar/pyproject.toml
+        # reads: services/calls/pyproject.toml
+        # reads: packages/platform-contracts/pyproject.toml
+        # reads: services/messaging/pyproject.toml
+        # reads: services/recordings/pyproject.toml
         project = tomllib.loads((ROOT / pyproject / "pyproject.toml").read_text())
         names.add(project["project"]["name"].replace("-", "_").replace(".", "_").lower())
         for wheel in project.get("tool", {}).get("hatch", {}).get("build", {}).get("targets", {}).get("wheel", {}).get("packages", []):

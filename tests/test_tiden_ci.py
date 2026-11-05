@@ -2701,6 +2701,8 @@ def test_the_real_go_suites_produce_every_existing_tiden_go_identity(tmp_path):
     for check in ("whatsmeow", "release_router"):
         stream = tmp_path / f"{check}.json"
         with stream.open("wb") as output:
+            # reads: whatsapp/whatsmeow/go.mod
+            # reads: services/release-router/go.mod
             subprocess.run(["go", "test", "-count=1", "-json", "./..."], cwd=root / MODULE_REPORTS[check][2], stdout=output,
                            stderr=subprocess.DEVNULL, timeout=300, check=False)
         found, _, unexplained = go_results(stream, root, MODULE_REPORTS[check][2], ATTEMPT_URL, check)
@@ -3087,6 +3089,8 @@ def test_both_shard_lines_deselect_exactly_the_nodes_the_module_steps_run():
     root = Path(__file__).resolve().parents[1]
     for node in nodes:
         file, name = node.split("::")
+        # reads: tests/test_audio_native.py
+        # reads: tests/test_collectors.py
         assert [test for test in re.findall(r"^def (test_\w+)", (root / file).read_text(), re.MULTILINE)
                 if test.startswith(name)] == [name]
     outcomes = next(step for step in jobs["verify"]["steps"] if step.get("name") == "Prepare honest CI evidence")["env"]

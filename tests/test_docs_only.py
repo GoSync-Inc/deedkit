@@ -188,6 +188,249 @@ def test_the_decision_step_reports_the_classified_group_commit(tmp_path, monkeyp
         "docs_only=false", "docs_sha="]
 
 
+# The mini's copy of the worktree has no .git (scripts/remote-test.sh); CI runs these.
+IN_A_CHECKOUT = pytest.mark.skipif(not (ROOT / ".git").exists(), reason="needs this repository's git history")
+HEADER = "import glob, os\nfrom pathlib import Path\nROOT = Path(__file__).resolve().parents[1]\n"
+
+
+def with_tests(tmp_path, tests):
+    """The fixture repository with these test files committed to its base; returns its root."""
+    root = repository(tmp_path)
+    for path, source in tests.items():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_bytes(source if isinstance(source, bytes) else source.encode())
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "tests")
+    return root
+
+
+def classify(root, *paths):
+    head, base = group(root, edit(*paths))
+    return docs_only.decide(root, "merge_group", head, "", base)
+
+
+# spec: ANYM-767
+@pytest.mark.parametrize("source", [
+    'NAME = "docs/guide.md"\n',
+    'text = (ROOT / "docs/guide.md").read_text()\n',
+    'text = (ROOT / "docs" / "guide.md").read_text()\n',
+    'text = (Path(__file__).parent.parent / "docs" / "guide.md").read_text()\n',
+    'text = Path("docs", "guide.md").read_text()\n',
+    'text = ROOT.joinpath("docs", "guide.md").read_text()\n',
+    'text = open(os.path.join(ROOT, "docs", "guide.md")).read()\n',
+    'DOCS = ROOT / "docs"\ndef test_x():\n    assert (DOCS / "guide.md").read_text()\n',
+    'def test_x(base):\n    assert (base / "guide.md").read_text()\n',
+    'NAME = "../docs/guide.md"\n',
+    'assert "see docs/guide.md:12 for the rule"\n',
+    'assert "the rule is in docs/guide.md."\n',
+    'text = open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "docs", "guide.md")).read()\n',
+], ids=["literal", "whole-path-component", "chain", "file-relative", "path-parts", "joinpath", "os-path-join",
+        "named-directory", "unknown-head", "test-relative", "inside-a-message", "end-of-a-sentence", "os-path-dirname"])
+def test_a_document_a_test_names_is_not_docs_only_and_an_unread_one_stays(tmp_path, source):
+    root = with_tests(tmp_path, {"tests/test_reader.py": HEADER + source})
+    assert docs_only.scan_reason(root, ["NOTES.md"]) is None
+    assert docs_only.scan_reason(root, ["docs/guide.md"]) == "docs/guide.md is read by tests/test_reader.py"
+    assert classify(root, "NOTES.md") == (True, "only documentation changed (1 file(s))")
+    assert classify(root, "NOTES.md", "docs/guide.md") == (False, "docs/guide.md is read by tests/test_reader.py")
+
+
+# spec: ANYM-767
+@pytest.mark.parametrize("path, source", [
+    ("services/x/tests/test_y.py", 'NAME = "docs/guide.md"\n'),
+    ("services/x/tests/unit/test_y.py", 'NAME = "../../../../docs/guide.md"\n'),
+    ("packages/x/tests/test_y.py", 'NAME = "docs/guide.md"\n'),
+    ("packages/x/test/y.test.js", "const name = 'docs/guide.md';\n"),
+    ("packages/x/test/y.test.js", "const name = path.join(root, 'docs', 'guide.md');\n"),
+    ("whatsapp/tests/y.test.mjs", "const url = new URL('../../docs/guide.md', import.meta.url);\n"),
+    ("scripts/check_y.py", 'NAME = "docs/guide.md"\n'),
+    ("services/x/conftest.py", 'NAME = "docs/guide.md"\n'),
+    ("tests/conftest.py", 'NAME = "docs/guide.md"\n'),
+], ids=["service", "service-relative", "package-tests", "package-test", "package-join", "whatsapp", "check-script",
+        "conftest-anywhere", "conftest"])
+def test_every_kind_of_test_file_counts_as_a_reader(tmp_path, path, source):
+    root = with_tests(tmp_path, {path: source})
+    assert docs_only.scan_reason(root, ["docs/guide.md"]) == f"docs/guide.md is read by {path}"
+    assert docs_only.scan_reason(root, ["NOTES.md"]) is None
+
+
+# spec: ANYM-767
+@pytest.mark.parametrize("path, source", [
+    ("tests/test_x.py", '"""The rule lives in docs/guide.md."""\n# docs/guide.md explains it\ndef test_x():\n'
+                        '    """docs/guide.md"""\n'),
+    ("tests/test_x.py", 'def test_x(tmp_path):\n    (tmp_path / "docs" / "other.md").write_text("x")\n'),
+    ("tests/test_x.py", 'def test_x(tmp_path):\n    (tmp_path / "guide.md").write_text("x")\n'),
+    ("scripts/app.py", 'NAME = "docs/guide.md"\n'),
+    ("tests/fixture.bin", b"docs/guide.md\xff\x00"),
+], ids=["comment-and-docstrings", "other-document-in-a-temporary-directory", "same-name-in-a-temporary-directory",
+        "not-a-test-file", "binary-fixture"])
+def test_a_mention_that_cannot_read_the_document_leaves_it_docs_only(tmp_path, path, source):
+    root = with_tests(tmp_path, {path: source})
+    assert classify(root, "docs/guide.md") == (True, "only documentation changed (1 file(s))")
+
+
+DYNAMIC = 'def test_x(section, name):\n    assert (ROOT / "docs" / section / name).read_text()\n'
+
+
+# spec: ANYM-767
+@pytest.mark.parametrize("source, directory", [
+    (DYNAMIC, "docs"),
+    ('def test_x():\n    assert list((ROOT / "docs").glob("*.md"))\n', "docs"),
+    ('def test_x():\n    assert list(ROOT.rglob("docs/**/*.md"))\n', "docs"),
+    ('def test_x():\n    assert list((ROOT / "docs").iterdir())\n', "docs"),
+    ('def test_x():\n    assert list(os.walk(ROOT / "docs"))\n', "docs"),
+    ('def test_x():\n    assert list(os.walk("docs"))\n', "docs"),
+    ('def test_x():\n    assert os.listdir(os.path.join(ROOT, "docs"))\n', "docs"),
+    ('def test_x():\n    assert glob.glob("docs/*.md")\n', "docs"),
+    ('def test_x(name):\n    assert (ROOT / f"docs/{name}.md").read_text()\n', "docs"),
+    ('def test_x(name):\n    assert open(f"docs/{name}.md").read()\n', "docs"),
+    ('def test_x(name):\n    assert Path("docs", name).read_text()\n', "docs"),
+    ('DOCS = ROOT / "docs"\ndef test_x(name):\n    assert (DOCS / name).read_text()\n', "docs"),
+    ('def test_x(name):\n    assert (ROOT / name).read_text()\n', "."),
+    ('def test_x():\n    assert list(ROOT.glob("*.md"))\n', "."),
+], ids=["component-chain", "glob", "rglob", "iterdir", "os-walk", "os-walk-relative", "os-listdir", "glob-module",
+        "f-string", "open-f-string", "path-parts", "named-directory", "root", "root-glob"])
+def test_a_dynamic_read_keeps_every_document_under_its_literal_prefix_out_of_docs_only(tmp_path, source, directory):
+    root = with_tests(tmp_path, {"tests/test_reader.py": HEADER + source})
+    docs_only_run, why = classify(root, "docs/guide.md")
+    assert docs_only_run is False and why == (
+        f"docs/guide.md falls under a dynamic read of {directory} in tests/test_reader.py"), why
+    outside = docs_only.scan_reason(root, ["NOTES.md"])
+    assert (outside is None) == (directory == "docs"), outside
+
+
+# spec: ANYM-767
+def test_a_dynamic_path_outside_the_repository_is_no_read(tmp_path):
+    root = with_tests(tmp_path, {"tests/test_x.py": HEADER + (
+        'def test_x(tmp_path, name, root, spool, self):\n    assert (tmp_path / "docs" / name).exists()\n'
+        '    assert (root / name).exists()\n    assert list(root.rglob("*.md"))\n'
+        '    assert list(spool.path.glob("*.md"))\n    assert list(Path(self.config["dir"]).glob("*.md"))\n'
+        '    assert Path(f"{self.lock}.md").exists()\n    assert Path(f"/var/{name}.md").exists()\n'
+        '    assert list(self.component.walk("docs"))\n')})
+    assert classify(root, "docs/guide.md") == (True, "only documentation changed (1 file(s))")
+
+
+# spec: ANYM-767
+def test_a_reads_comment_narrows_the_dynamic_read_to_the_named_paths(tmp_path):
+    source = 'def test_x(section, name):\n    # reads: docs/guide.md\n    assert (ROOT / "docs" / section / name).read_text()\n'
+    root = with_tests(tmp_path, {"tests/test_reader.py": HEADER + source})
+    assert docs_only.scan_reason(root, ["docs/guide.md"]) == "docs/guide.md is read by tests/test_reader.py"
+    assert docs_only.scan_reason(root, ["docs/заметки.md"]) is None
+    assert classify(root, "docs/заметки.md") == (True, "only documentation changed (1 file(s))")
+
+
+# spec: ANYM-767
+def test_a_reads_comment_narrows_only_the_statement_below_it(tmp_path):
+    read = 'assert (ROOT / "docs" / name).read_text()\n'
+    root = with_tests(tmp_path, {
+        "tests/test_a.py": HEADER + f"def test_x(name):\n    # reads: docs/guide.md\n    {read}    {read}",
+        "tests/test_b.py": HEADER + f"def test_y(name):\n    {read}",
+    })
+    assert docs_only.scan_reason(root, ["docs/заметки.md"]) == (
+        "docs/заметки.md falls under a dynamic read of docs in tests/test_a.py")
+
+
+# spec: ANYM-767
+def test_a_reads_comment_above_a_definition_narrows_that_definition_and_no_other(tmp_path):
+    read = 'assert (ROOT / "docs" / name).read_text()\n'
+    narrowed = f"# reads: NOTES.md\n@decorator\ndef helper(name):\n    {read}    {read}"
+    root = with_tests(tmp_path, {"tests/test_a.py": HEADER + narrowed})
+    assert docs_only.scan_reason(root, ["docs/заметки.md"]) is None
+    assert docs_only.scan_reason(root, ["NOTES.md"]) == "NOTES.md is read by tests/test_a.py"
+    root = with_tests(tmp_path / "second", {"tests/test_a.py": HEADER + narrowed + f"def other(name):\n    {read}"})
+    assert docs_only.scan_reason(root, ["docs/заметки.md"]) == (
+        "docs/заметки.md falls under a dynamic read of docs in tests/test_a.py")
+
+
+# spec: ANYM-767
+def test_a_reads_comment_naming_a_missing_file_is_reported(tmp_path):
+    root = with_tests(tmp_path, {"tests/test_a.py": "def test_x():\n    # reads: docs/guide.md\n    # reads: docs/gone-long-ago.md\n    pass\n"})
+    assert docs_only.stale_reads(root) == [("tests/test_a.py", "docs/gone-long-ago.md")]
+
+
+# spec: ANYM-767
+@IN_A_CHECKOUT
+def test_every_reads_comment_in_this_repository_names_a_tracked_file():
+    assert docs_only.stale_reads(ROOT) == []
+
+
+# spec: ANYM-767
+def test_the_scan_reads_the_classified_commit_not_the_working_tree(tmp_path):
+    root = repository(tmp_path)
+    git(root, "switch", "-q", "-c", "feature")
+    edit("docs/guide.md")(root)
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "head")
+    head = git(root, "rev-parse", "HEAD")
+    git(root, "switch", "-q", "main")
+    (root / "tests").mkdir()
+    (root / "tests/test_base.py").write_text('NAME = "docs/guide.md"\n')
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "a test on the base")
+    git(root, "merge", "-q", "--no-ff", "--no-edit", "feature")
+    # The merge commit carries the base's new test, though the pull request head does not.
+    assert docs_only.decide(root, "pull_request", head, "") == (False, "docs/guide.md is read by tests/test_base.py")
+    (root / "tests/test_base.py").write_text("")  # an uncommitted edit changes nothing
+    assert docs_only.decide(root, "pull_request", head, "") == (False, "docs/guide.md is read by tests/test_base.py")
+    (root / "tests/test_base.py").unlink()
+    assert docs_only.decide(root, "pull_request", head, "") == (False, "docs/guide.md is read by tests/test_base.py")
+
+
+# spec: ANYM-767
+def test_a_change_that_adds_a_test_of_an_unchanged_document_verifies_in_full_anyway(tmp_path):
+    root = repository(tmp_path)
+    def change(root):
+        (root / "tests").mkdir()
+        (root / "tests/test_new.py").write_text('NAME = "docs/guide.md"\n')
+    head, base = group(root, change)
+    assert docs_only.decide(root, "merge_group", head, "", base) == (
+        False, "not documentation by the docs-only rule: tests/test_new.py")
+
+
+# spec: ANYM-767
+@pytest.mark.parametrize("path, source, failure", [
+    ("tests/test_x.py", b"NAME = '\xff'\n", "SyntaxError"),
+    ("tests/test_x.py", b"def broken(:\n", "SyntaxError"),
+    ("tests/x.test.mjs", b"const name = '\xff';\n", "UnicodeDecodeError"),
+], ids=["python-decode-error", "python-syntax-error", "text-decode-error"])
+def test_a_test_file_the_scan_cannot_read_means_a_full_run(tmp_path, path, source, failure):
+    root = with_tests(tmp_path, {path: source})
+    docs_only_run, why = classify(root, "docs/guide.md")
+    assert docs_only_run is False and why.startswith(f"the scan of test files failed: {failure}"), why
+
+
+# spec: ANYM-767
+def test_a_scan_past_its_time_limit_means_a_full_run(tmp_path, monkeypatch):
+    root = with_tests(tmp_path, {"tests/test_x.py": "NAME = 1\n"})
+    monkeypatch.setattr(docs_only, "SCAN_SECONDS", 0)
+    docs_only_run, why = classify(root, "docs/guide.md")
+    assert docs_only_run is False and why.startswith("the scan of test files failed: TimeoutError"), why
+
+
+# spec: ANYM-767
+def test_any_exception_in_the_scan_returns_a_full_run_with_the_reason(tmp_path, monkeypatch):
+    root = repository(tmp_path)
+    def fail(*_):
+        raise OSError("synthetic scan failure")
+    monkeypatch.setattr(docs_only, "scan_reason", fail)
+    assert classify(root, "docs/guide.md") == (False, "the scan of test files failed: OSError: synthetic scan failure")
+
+
+# spec: ANYM-767
+def test_the_job_summary_names_the_document_and_its_reader_and_the_step_never_fails(tmp_path, monkeypatch):
+    root = with_tests(tmp_path, {"tests/test_x.py": 'NAME = "docs/guide.md"\n'})
+    head = pull_request(root, edit("docs/guide.md"))
+    assert run_main(root, monkeypatch, tmp_path, head=head) == ["docs_only=false", "docs_sha="]
+    assert "Docs-only run: no (docs/guide.md is read by tests/test_x.py)" in (tmp_path / "summary").read_text()
+
+
+# spec: ANYM-767
+@IN_A_CHECKOUT
+def test_this_repository_keeps_a_read_document_in_the_full_run_and_an_unread_one_docs_only():
+    reason = docs_only.scan_reason(ROOT, ["docs/operations/production.md"])
+    assert reason is not None and reason.startswith("docs/operations/production.md is read by "), reason
+    assert docs_only.scan_reason(ROOT, ["docs/no-test-reads-this-synthetic-name.md"]) is None
+
+
 def workflows():
     return (yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text()),
             yaml.safe_load((ROOT / ".github/workflows/checks.yml").read_text()))
