@@ -1707,8 +1707,9 @@ both chains); with the rules persisted, also restore the saved copies of the rul
 
 ### Stopped worker: manual recovery (ANYM-709)
 
-After a host reboot or a Docker restart `enricher-mini` stays stopped, and nothing starts it. The host overlay sets
-`restart: "no"` (ANYM-693, and it stays so: Docker's restart is not the fix), and the
+After a host reboot or a Docker restart `enricher-mini` stays stopped, and nothing starts it. The repository's and the
+host's overlay set `restart: "no"` (ANYM-693, and it stays so: Docker's restart is not the fix, since a policy cannot
+leave out exit 78). A transient database error no longer stops it (ENRICHMENT.md). The
 `deedkit-inference-worker.service` and `/usr/local/sbin/deedkit-inference-guard` that the overlay's comment names do
 not exist: on 2026-11-05 `/usr/local/sbin` is empty, `systemctl list-unit-files` lists no such unit, root has no
 crontab and `/etc/cron.d` holds only `e2scrub_all` and `sysstat`. Queued jobs wait. A stopped selected worker also makes

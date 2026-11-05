@@ -250,7 +250,12 @@ authentication/rate-limit pauses use the existing durable controls. On SIGTERM t
 enrichment worker ends its child process group, requeues the job as `queued` /
 `worker_stopping` without consuming an attempt (the daily budget stays spent),
 releases its local-heavy lease and unpublishes its profile within the 90 s grace
-period. Fairness
+period. A transient database error in a pass (psycopg `OperationalError`: a statement or
+lock timeout, a deadlock, a lost connection) does not end the enrichment worker: it logs one
+line naming only the exception type, waits 5 s, doubled per consecutive failure up to 60 s, and
+tries again. A failed claim spent nothing; a job whose result could not be written stays under
+its lease until that expires. Exit 78, a failed requeue while stopping and any other error
+still end it. Fairness
 between modalities/accounts prevents a continuous audio backlog from hiding
 video work. All of this is source functionality; production enablement requires
 the verified promotion and applicable live-session authority in
@@ -345,7 +350,8 @@ with another profile: two workers would claim the same jobs. A worker with a
 `deedkit_inference` profile also proves its own confinement before it claims and while it
 runs, by trying to reach public addresses, an external resolver and other ports of the
 mini, before every claim and every 15 seconds; if anything answers it claims nothing and exits with code 78
-(`messaging_service/inference_confinement.py`). The local image includes hash-locked CPU
+(`messaging_service/inference_confinement.py`). `enricher-mini` has restart policy `no`, so Docker never starts it
+by itself. The local image includes hash-locked CPU
 faster-whisper dependencies, with PyAV 18.1.0 pinned for decoder compatibility.
 Neither image downloads models. Native smoke tests use synthetic speech and
 network-disabled containers. The local profile has only the internal DB network.

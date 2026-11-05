@@ -97,6 +97,9 @@ STOP=threading.Event()
 CHILDREN=set()
 REQUEUE_SECONDS=30
 BACKPRESSURE_CAP_SECONDS=900
+# After a pass that failed on a transient database error: this delay, doubled per consecutive failure up to the limit.
+DB_RETRY_SECONDS=5
+DB_RETRY_LIMIT_SECONDS=60
 
 
 def cooldown_seconds(profile,retry_after):
@@ -167,10 +170,19 @@ def process(files,row,profile):
         return result
 
 
+def database_retry(error,delay):
+    """The exception's type only: a psycopg message can name the DSN's host or carry row values."""
+    from .telemetry import capture
+    capture(error,'enrichment_failed')
+    print(json.dumps({'status':'error','error_code':'enrichment_database_retry',
+        'exception_type':type(error).__name__,'retry_seconds':delay}),file=sys.stderr,flush=True)
+
+
 class EnrichmentWorker:
     def __init__(self,dsn,files,config,*,processor=process,lock_directory=None,confinement=None):
         self.dsn,self.files,self.config,self.processor=dsn,Path(files),config,processor
         self.confinement=confinement
+        self.requeueing=False
         self.lock_directory=lock_directory or os.environ.get('PROCESSING_LOCK_DIR','/processing-locks')
     def connection(self):
         return psycopg.connect(self.dsn,row_factory=dict_row,connect_timeout=5,
@@ -417,7 +429,9 @@ class EnrichmentWorker:
         if not claim:return False
         row,profile=claim
         try:self.finish(row,self.processor(self.files,row,profile))
-        except WorkerStopping:self.requeue(row)
+        except WorkerStopping:
+            self.requeueing=True
+            self.requeue(row)
         except ModelBackpressure as exc:self.defer(row,profile,exc.retry_after)
         except ModelError as exc:self.finish(row,error=exc.code)
         except Exception as error:
@@ -433,11 +447,21 @@ class EnrichmentWorker:
             # again before every claim older than the guard's freshness and in the background.
             guard.ensure()
             guard.start_monitor(request_stop)
+        delay=DB_RETRY_SECONDS
         try:
             while not STOP.is_set():
                 if guard:guard.ensure()
-                self.publish_profiles()
-                if not self.once():STOP.wait(10)
+                try:
+                    self.publish_profiles()
+                    if not self.once():STOP.wait(10)
+                except psycopg.OperationalError as error:
+                    # Incident 11-05: one statement timeout in claim() ended the worker. A claim rolled back; a job
+                    # whose finish failed stays under its lease until that expires. The stop path keeps ending the
+                    # worker. The next pass proves the confinement again first; a lost one wakes this wait.
+                    if STOP.is_set() or self.requeueing:raise
+                    database_retry(error,delay)
+                    STOP.wait(delay);delay=min(DB_RETRY_LIMIT_SECONDS,delay*2)
+                else:delay=DB_RETRY_SECONDS
         finally:
             # Also when the stop path itself fails: never keep advertising a worker that is going away.
             if guard:guard.stop_monitor()
