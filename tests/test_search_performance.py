@@ -85,10 +85,12 @@ def test_related_chat_candidates_stay_on_the_text_index_when_a_date_walk_looks_c
 
 
 # spec: ANYM-656
-def test_related_chat_check_reads_bounded_messages_in_a_200k_archive(seeded):
+def test_related_chat_check_reads_bounded_messages_in_a_200k_archive(seeded,monkeypatch):
     from datetime import datetime,timezone
     from messaging_service import related_chats
     s,a,b=seeded
+    # This test bounds the rows the check reads, not the host's speed; the 1.0 s budget has its own test below.
+    monkeypatch.setattr(related_chats,'DEADLINE_SECONDS',120.0)
     class Explained:
         def __init__(self,connection):self.connection=connection;self.plans=[]
         def execute(self,sql,args=None):
@@ -113,6 +115,32 @@ def test_related_chat_check_reads_bounded_messages_in_a_200k_archive(seeded):
         found=related_chats.hints(measured,p,[{'id':'fresh','type':'private','last_activity':datetime.now(timezone.utc)}])
     assert found['fresh']['related_chats'][0]['source_message_id']=='bulk-50'
     assert len(measured.plans)==4 and sum(visited(plan,{'messages'}) for plan in measured.plans)<2000,[(visited(plan,{'messages'}),[(x['Node Type'],x.get('Index Name'),x.get('Actual Rows'),x.get('Rows Removed by Filter'),x.get('Actual Loops')) for x in scans(plan) if x.get('Relation Name')=='messages']) for plan in measured.plans]
+
+
+# spec: ANYM-656
+def test_related_chat_check_returns_no_hint_when_its_deadline_is_spent(seeded,monkeypatch,caplog):
+    from datetime import datetime,timezone
+    from messaging_service import related_chats
+    s,a,b=seeded
+    body='unique-token-end ordinary words around the lease'
+    with s.pool.connection() as c:
+        c.execute("""INSERT INTO chats(id,account,provider_chat,title,chat_type) VALUES
+            ('older','telegram-demo','older','Older','private'),('fresh','telegram-demo','fresh','Fresh','private')""")
+        c.execute("""INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction) VALUES
+            ('older-1','telegram-demo','older','1','owner',%s,now()-interval '3 days','outgoing'),
+            ('fresh-1','telegram-demo','fresh','1','peer',%s,now()-interval '1 day','incoming')""",(body,body))
+    def check():
+        with s.authorized(a,'list_chats') as (c,p):
+            found=related_chats.hints(c,p,[{'id':'fresh','type':'private','last_activity':datetime.now(timezone.utc)}])
+            assert c.execute('SELECT 1 AS alive').fetchone()['alive']==1  # the caller's transaction stays usable
+        return found
+    # The same rows give a hint while the budget lasts, so the {} below can only come from the deadline.
+    monkeypatch.setattr(related_chats,'DEADLINE_SECONDS',120.0)
+    assert check()['fresh']['related_chats'][0]['source_message_id']=='older-1'
+    monkeypatch.setattr(related_chats,'DEADLINE_SECONDS',0)
+    with caplog.at_level('WARNING',logger=related_chats.log.name):
+        assert check()=={}
+    assert [r.getMessage() for r in caplog.records if r.name==related_chats.log.name]==['related_chats_abandoned Deadline']
 
 
 # spec: ANYM-272
