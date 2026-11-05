@@ -28,6 +28,8 @@ DAY = 86400  # `response_too_large` backs off this long: the same body will not 
 # stays (docs/DATA-POLICY.md), it costs no transcript read, and a list row with its ID makes it due again. The mark is
 # the parts' `attempt_state`, so no schema change is needed.
 MISSING = "CASE WHEN json_valid(parts) THEN json_extract(parts,'$.transcript.attempt_state')='provider_missing' ELSE 0 END"
+WAITING = ("CASE WHEN json_valid(parts) THEN EXISTS(SELECT 1 FROM json_each(parts) WHERE json_valid(value) AND "
+           "json_extract(value,'$.attempt_state') IN ('pending','unavailable','error')) ELSE 0 END")  # a part not finished yet
 WINDOW = 3600
 SLACK = 75  # dispatch drift inside one pass (60 s) plus a provider timeout: never reuse a call that may still count
 APPLICATION_ID = 0x444B5243
@@ -913,8 +915,8 @@ class Store:
         return [ident for ident, *_ in self.work_items(account, now, limit, guard)]
 
     def work_items(self, account, now, limit=8, guard=lambda: None, rotate=True):
-        """Provider ids to read now with `fresh` and `probe` flags. Omi: never-fetched records newest first (last 24 h ahead
-        of the backlog), then failed records by backoff, then records waiting on a pending part or a changed list row and
+        """Provider ids to read now with `fresh`, `probe` and `revisit` (a re-read of a saved record) flags. Omi: never-fetched records newest first (last 24 h ahead
+        of the backlog), then failed records by backoff, then records waiting on a stage, a pending part or a changed list row and
         the weekly checks of provider_missing records (`probe`: no transcript).
         PLAUD keeps its earlier due-time order and hourly revisit."""
         ns = namespace(account)
@@ -932,9 +934,10 @@ class Store:
                     rows = db.execute(f'SELECT provider_id,{created}>=? AS fresh FROM records WHERE namespace=? AND due<=? AND '
                         + condition + f' ORDER BY (CASE WHEN {created}>=? THEN 0 ELSE 1 END),{created} DESC,rowid LIMIT ?',
                         (cutoff, ns, now, cutoff, budget)).fetchall()
-                    groups.append([(row[0], bool(row[1]), False) for row in rows])
+                    groups.append([(row[0], bool(row[1]), False, False) for row in rows])
                 else:
-                    groups.append([(row[0], False, omi and bool(row[1])) for row in db.execute(
+                    revisit = omi and condition.endswith('failures=0')
+                    groups.append([(row[0], False, omi and bool(row[1]), revisit and not row[1]) for row in db.execute(
                         f'SELECT provider_id,COALESCE({MISSING},0) FROM records WHERE namespace=? AND due<=? AND ' + condition +
                         ' ORDER BY due,ref LIMIT ?', (ns, now, budget))])
             # Persist priority before execution: even a pass interrupted after
@@ -962,7 +965,8 @@ class Store:
                              (namespace(account), provider_id)).fetchone()
             return self.decoded(row) if row else None
 
-    def observe(self, account, provider_id, metadata, observations, now, guard=lambda: None, consistency=None):
+    def observe(self, account, provider_id, metadata, observations, now, guard=lambda: None, consistency=None, lazy=False):
+        """`lazy`: the summary is pending only as a young record without one, so it waits for the stages, not `pending_gap`."""
         ns = namespace(account)
         trial = {}
         def change(db):
@@ -994,12 +998,14 @@ class Store:
             error = next((o[2] for o in observations.values() if o[2]), None)
             if provider_of(account) == 'omi':
                 # Only a failed read backs off; a part that is still pending waits on a bounded schedule, and a
-                # complete record waits for a changed list row. Nothing is re-read hourly.
+                # complete record waits for its next stage or a changed list row. Nothing is re-read hourly.
                 codes = {o[2] for o in observations.values()}
                 failures = min(row['failures'] + 1, 10) if 'error' in states else 0
-                gap = pending_gap(metadata, now) if failures == 0 and failed else None
+                unfinished = any(part.get('attempt_state') in ('pending', 'unavailable', 'error')
+                                 for kind, part in parts.items() if not (lazy and kind == 'summary'))
+                gap = pending_gap(metadata, now) if failures == 0 and unfinished else None
                 due = (now + (DAY if 'response_too_large' in codes else min(3600, 60 * 2 ** (failures - 1))) if failures else
-                       now + gap if gap else FAR)
+                       now + gap if gap else stage_due(metadata, now))
                 if codes == {'not_found_or_forbidden'} and row['failures'] > 0 and \
                         all(previous.get(kind) == 'not_found_or_forbidden' for kind in observations):
                     # The second 404 in a row: gone at the provider (merged away, deleted or locked). Kept, not retried.
@@ -1037,9 +1043,10 @@ class Store:
         with self.connection() as db:
             row = db.execute('SELECT * FROM accounts WHERE namespace=?', (ns,)).fetchone()
             counts = db.execute('SELECT count(*),sum(attempted IS NULL),sum(failures>0),sum(revision>0),'
-                                f'sum(attempted IS NOT NULL AND failures=0 AND due<? AND NOT COALESCE({MISSING},0)),'
+                                f'sum(attempted IS NOT NULL AND failures=0 AND due<? AND NOT COALESCE({MISSING},0) '
+                                f'AND (due<=? OR COALESCE({WAITING},0))),'
                                 f'sum(COALESCE({MISSING},0)) FROM records WHERE namespace=?',
-                                (FAR / 10, ns)).fetchone()
+                                (FAR / 10, now, ns)).fetchone()
             result = {'coverage':'unknown', 'record_count':counts[0], 'queued_count':counts[1] or 0,
                       'retry_count':counts[2] or 0, 'last_success':row['last_success'] if row else None,
                       'error':row['error'] if row else None}
