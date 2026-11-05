@@ -60,11 +60,16 @@ def _snapshot(message):
     known=known_conflict(message.get('evidence'))
     if known:
         snapshot['conflict']=known
-    for key,limit in (('body',1000),('display_text',1200)):
-        value=snapshot.get(key)
-        snapshot[key+'_truncated']=isinstance(value,str) and len(value)>limit
-        if snapshot[key+'_truncated']:
-            snapshot[key]=value[:limit]
+    value=snapshot.get('body')
+    snapshot['body_truncated']=isinstance(value,str) and len(value)>1000
+    if snapshot['body_truncated']:
+        snapshot['body']=value[:1000]
+    snapshot['display_text_truncated']=False
+    if isinstance(message.get('display_text'),str):
+        from .conversation import bound_display_text
+        snapshot['display_text'],snapshot['display_text_truncated']=bound_display_text(message,1200)
+    if message.get('display_text_media'):
+        snapshot['display_text_media']=message['display_text_media']
     return snapshot
 
 

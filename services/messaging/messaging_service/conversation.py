@@ -5,12 +5,16 @@ persistent sequence, and a deterministic tie breaker does not prove phone order.
 """
 from __future__ import annotations
 
+import re
+
 from .policy import scope_filter
 
 KINDS=frozenset(('text','photo','video','voice','audio','document','sticker','location','contact','poll','system','unknown'))
 LABELS={'photo':'Фото','video':'Видео','voice':'Голосовое','audio':'Аудио','document':'Документ',
     'sticker':'Стикер','location':'Местоположение','contact':'Контакт','poll':'Опрос',
     'system':'Служебное событие','unknown':'Сообщение неизвестного типа'}
+# Every character str.splitlines breaks on: extracted text must not start a second line (ANYM-664).
+_LINE_BREAKS=re.compile('[\\n\\r\\v\\f\\x1c-\\x1e\\x85\\u2028\\u2029]+')
 
 
 def options(view='archive',include_system=False):
@@ -75,6 +79,66 @@ def contact_lines(block):
     return lines
 
 
+def excerpt_quote(excerpt):
+    """The excerpt as one quoted line that cannot forge a label or end its quote early; '' when it has no words."""
+    text=_LINE_BREAKS.sub(' ',excerpt.get('text') or '').replace('«','"').replace('»','"').strip()
+    if not text:return ''
+    return '«'+text+('…' if excerpt.get('complete') is False else '')+'»'
+
+
+def _is_audio(file):
+    # The mime rule of result_evidence._TRANSCRIPT.
+    mime=file.get('mime') or ''
+    return mime.startswith('audio/') or mime=='application/ogg'
+
+
+def _text_reason(attachments):
+    """Why a downloaded file's words are not in the message yet; an image description never becomes an excerpt."""
+    pending=[f for f in attachments if f.get('extraction_status') in ('queued','leased','processing')
+        or _is_audio(f) and f.get('enrichment_status') in ('queued','processing')]
+    if pending:return 'расшифровка готовится' if any(_is_audio(f) for f in pending) else 'текст готовится'
+    if any((f.get('text_excerpt') or {}).get('omitted')=='response_budget' for f in attachments):
+        return 'текст в get_file_text'
+    return None
+
+
+def displayed_quote(row):
+    """The quote present_message put into display_text, from the row's own marking and attachment."""
+    for media in (row.get('display_text_media') or ())[:1]:
+        for file in row.get('attachments') or ():
+            if file.get('attachment_id')==media['attachment_id']:return excerpt_quote(file.get('text_excerpt') or {})
+    return ''
+
+
+def _split_display_text(row):
+    """(the sender's text, label and buttons; where the quote sits; the quote)."""
+    text=row['display_text']
+    quote=displayed_quote(row)
+    at=text.rfind(quote) if quote else -1
+    if at<0:return text,len(text),''
+    start=at-1 if at and text[at-1]==' ' else at
+    return text[:start]+text[at+len(quote):],start,quote
+
+
+def own_display_text(row):
+    return _split_display_text(row)[0]
+
+
+def bound_display_text(row,limit):
+    """A limit bounds the sender's text and the label; the quote has its own bound and stays whole (ANYM-664)."""
+    own,at,quote=_split_display_text(row)
+    if len(own)<=limit:return row['display_text'],False
+    own=own[:limit];at=min(at,limit)
+    if not quote:return own,True
+    return own[:at]+(' ' if at else '')+quote+own[at:],True
+
+
+def cap_display_text(row,cap):
+    if cap is None:return
+    row['display_text'],cut=bound_display_text(row,cap)
+    if cut:row['display_text_truncated']=True
+
+
 def present_message(row,position):
     body=row.get('body',row.get('snippet','')) or ''
     observed=row.get('message_kind')
@@ -111,12 +175,25 @@ def present_message(row,position):
             elif states & {'deferred'}:
                 label+='; файл доступен по запросу'
             else:label+='; файл пока недоступен'
+        # ANYM-664: the first file with words; a sticker and a contact never have any, a video has no transcript profile.
+        quote=''
+        if kind not in ('sticker','contact'):
+            for file in attachments:
+                quote=excerpt_quote(file.get('text_excerpt') or {})
+                if quote:
+                    excerpt=file['text_excerpt']
+                    row['display_text_media']=[{'attachment_id':file.get('attachment_id'),'source':excerpt['source'],
+                        'model_generated':excerpt['model_generated'],'untrusted':True}]
+                    break
+            if not quote and states=={'ready'} and kind!='video':
+                reason=_text_reason(attachments)
+                if reason:label+='; '+reason
         lines=contact_lines(row.get('contact')) if kind=='contact' else []
         if lines:
             # A contact message has no caption: its body is the display name (native) or the raw
             # vCard (fallback), which stays in body; display shows only the structured lines.
             row['display_text']='\n'.join(lines)
-        else:row['display_text']=(body+'\n' if body else '')+'['+label+']'
+        else:row['display_text']=(body+'\n' if body else '')+'['+label+']'+(' '+quote if quote else '')
     else:row['display_text']=body
     # ANYM-658: the transcript has only display_text; a keyboard shows its first labels, never a link or a kind.
     buttons=row.get('buttons')

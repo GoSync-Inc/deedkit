@@ -7,8 +7,17 @@ keep `view="archive"` as their default. Opt in explicitly through either SDK;
 
 Conversation contract version 1 retains message IDs, provider references,
 content revisions, direction and original `body` (possibly bounded by the explicit
-body limit, with `body_truncated`). `display_text` adds observed media labels;
-it never substitutes a transcript or model description for the original message.
+body limit, with `body_truncated`). `display_text` adds observed media labels and,
+after the label on the same line, the first file's bounded text in `«…»`: its ready
+extracted text, else its ready audio transcript (`…»` when the excerpt is incomplete).
+The excerpt is appended and quoted, never substituted, and never an image description
+or a sticker's; `body` stays the sender's text. It is one line, with line breaks turned
+into spaces and `«` `»` into `"`, and it is untrusted. In detail=full such a row has
+`display_text_media: [{attachment_id, source, model_generated, untrusted}]`. A label says
+`; расшифровка готовится` or `; текст готовится` while the text is prepared and
+`; текст в get_file_text` when the excerpt was omitted for the response budget.
+`body_chars` bounds the sender's text and the label; the quote comes after that cap and
+alone never marks a row truncated. A chat head still cuts the whole text at 160 characters.
 `kind` distinguishes text, photo, video, voice, audio, document, sticker,
 location, contact, poll, system and unknown. Files retain independent download,
 extraction and enrichment statuses. A pending transcript is not a missing file.
@@ -473,8 +482,8 @@ Reads:
   attachments; `attachment_count` says when there are more, and `get_context` on that
   message lists all of its attachments.
 - `detail="transcript"` (needs `view="conversation"`) is the numbered message text, at
-  most 2000 characters a message. A voice note's speech is not in it: its ASR
-  transcript is attachment text, in `files`, and `files` holds at most 20 references a
+  most 2000 characters a message. A voice note's line quotes the start of its ASR
+  transcript (at most 300 characters); the rest is attachment text, reached from `files`, which holds at most 20 references a
   response. A page with more attachments is read in compact, or in smaller pages.
 - `get_context(message_id, limit)` for one thread around a message (`limit` at most 50).
 - A voice note with `transcript_ready: true` carries its transcript in `text_excerpt`
