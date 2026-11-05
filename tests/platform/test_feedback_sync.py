@@ -2,6 +2,9 @@
 from datetime import datetime, timedelta, timezone
 import fcntl
 import json
+from pathlib import Path
+import plistlib
+import re
 import subprocess
 
 from hypothesis import given, strategies as st
@@ -1100,6 +1103,56 @@ def test_a_superseded_queue_row_stays_superseded_when_follow_moves_the_item(tmp_
                      fetch=False) == 0
     assert prod.rows[A]['status'] == 'fixed' and flags(prod.writes[0])['--status'] == 'fixed'
     assert synced(tmp_path, 'applied.json')['files'][path.name]['rows'][A]['outcome'] == 'superseded'
+
+
+# spec: ANYM-536
+def test_an_unreadable_release_receipt_stops_the_hourly_run_with_its_name_before_any_write(tmp_path, monkeypatch):
+    root, shas = repo(tmp_path, ['one'])
+    gh, _ = pull_requests({'ANYM-10': [(1, 'Delivers: ANYM-10', shas['one'])]})
+    prod = Prod({A: disp('accepted', 'ANYM-10')})
+    answer = {'plan_a': None, 'http': None, 'deploy': None, 'pause': {'present': False, 'reason': None},
+              'unresolved': ['http-current.json:receipt-unreadable'], 'served': []}
+    monkeypatch.setattr(subprocess, 'run',
+                        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, json.dumps(answer), ''))
+    assert sync.main(['auto', '--apply', '--state', str(state_dir(tmp_path)), '--triage-state', str(triage_dir(tmp_path))],
+                     ssh=prod.ssh, read=lambda *argv: MAIN, live=None, gh=gh, run=prod.run, root=root, fetch=False) == 1
+    report = synced(tmp_path, 'last-run.json')
+    assert prod.writes == [] and report['exit'] == 1 and 'http-current.json' in report['error']
+
+
+def launch_agent(tmp_path, pull_exit):
+    """Runs the ProgramArguments of the plist the document tells the operator to install, with stub git and uv that
+    record what ran; returns the finished process and the record."""
+    text = (Path(sync.__file__).parents[1] / 'docs/operations/feedback-triage.md').read_text()
+    agent = plistlib.loads(re.search(r'```xml\n(.*?)```', text, re.S)[1].encode())
+    bin_, log = tmp_path / 'bin', tmp_path / 'ran.log'
+    bin_.mkdir()
+    for name, body in (('git', f'echo "git $*" >> {log}; exit {pull_exit}'), ('uv', f'echo "uv $*" >> {log}; exit 7'),
+                       ('timeout', f'echo "timeout $1" >> {log}; shift; exec "$@"')):
+        (bin_ / name).write_text(f'#!/bin/sh\n{body}\n')
+        (bin_ / name).chmod(0o755)
+    argv = [word.replace('/Users/OWNER/.local/bin/uv', str(bin_ / 'uv')) for word in agent['ProgramArguments']]
+    env = {**agent['EnvironmentVariables'], 'PATH': f'{bin_}:/usr/bin:/bin'}
+    done = subprocess.run(argv, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30)
+    return agent, done, log.read_text().splitlines()
+
+
+SYNC_RUN = 'uv run --no-project --python 3.13 python scripts/feedback_sync.py auto --apply'
+
+
+# spec: ANYM-536
+def test_the_launch_agent_pulls_the_checkout_before_the_sync_and_never_waits_on_a_prompt(tmp_path):
+    agent, done, ran = launch_agent(tmp_path, 0)
+    assert ran == ['timeout 120', 'git pull --ff-only', SYNC_RUN]
+    assert done.returncode == 7 and done.stderr == ''  # the sync's own exit code is launchd's
+    assert agent['EnvironmentVariables']['GIT_TERMINAL_PROMPT'] == '0'
+
+
+# spec: ANYM-536
+def test_a_failed_pull_is_logged_with_its_exit_code_and_the_sync_of_the_current_code_still_runs(tmp_path):
+    _, done, ran = launch_agent(tmp_path, 3)
+    assert ran == ['timeout 120', 'git pull --ff-only', SYNC_RUN]
+    assert done.returncode == 7 and 'git pull failed (exit 3)' in done.stderr
 
 
 # spec: ANYM-536
