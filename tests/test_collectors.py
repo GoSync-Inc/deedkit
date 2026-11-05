@@ -282,6 +282,7 @@ def test_queue_writer_does_not_wait_for_database(worker):
 
 def test_checkpoint_backfill_catchup_and_overlap_edit(worker):
     w,s,key=worker
+    w.head_pages=1  # One page per pass, so the checkpoint below stops at a page boundary.
     asyncio.run(w.sync_once())
     assert {m['body'] for m in s.search(key)['items']}=={'message 4','message 5'}
     assert all(e['historical'] for e in s.get_updates(key,'events')['items'])

@@ -517,6 +517,8 @@ def chat_error_evidence(error):
 
 class TelegramCollector:
     state_class=CollectorState
+    head_pages=HEAD_PAGES_PER_PASS
+    _pass_head_capped=None
     coverage_code='telegram_history_partial'
     connect_timeout=60
     retry_connect=False
@@ -526,7 +528,7 @@ class TelegramCollector:
                  live_writer=None,live_window_seconds=86400,media_prefetch_days=None,media_backfill=False,
                  head_pages=HEAD_PAGES_PER_PASS):
         self.archive,self.account,self.provider,self.spool=archive,account,provider,spool
-        self.head_pages=head_pages;self._head_capped=set();self._pass_head_capped=None
+        self.head_pages=head_pages;self._head_capped=set()
         self.batch_size,self.interval,self.max_dialogs=batch_size,interval,max_dialogs
         self.history_since=history_since
         self.media_prefetch_days=validate_prefetch_days(media_prefetch_days)
