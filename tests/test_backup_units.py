@@ -261,6 +261,8 @@ if [ "$1" = -d ]; then shift 7; mkdir -p "$@"; else cp "$7" "$8"; fi
 FAKE_RECEIVER = r'''#!/bin/sh
 while [ $# -gt 0 ]; do [ "$1" = --output ] && echo synthetic > "$2"; shift; done
 '''
+# Reads its input as the real one does: under pipefail, exiting first can end `echo ... | sha256sum --check` with SIGPIPE.
+FAKE_SHA256SUM = '#!/bin/sh\ncat > /dev/null\nexit ${FAKE_SHA_STATUS:-0}\n'
 
 
 def restore_run(tmp_path, *, reserve=1, **env):
@@ -270,7 +272,7 @@ def restore_run(tmp_path, *, reserve=1, **env):
         directory.mkdir(parents=True, exist_ok=True)
     for name, text in {'docker': FAKE_DOCKER, 'install': FAKE_INSTALL, 'receiver': FAKE_RECEIVER,
                        'flock': '#!/bin/sh\nexit ${FAKE_FLOCK_STATUS:-0}\n',
-                       'sha256sum': '#!/bin/sh\nexit ${FAKE_SHA_STATUS:-0}\n'}.items():
+                       'sha256sum': FAKE_SHA256SUM}.items():
         (fakes / name).write_text(text)
         (fakes / name).chmod(0o700)
     (config / 'control/protected.json').write_text(json.dumps({'backups': [{'id': 'b1', 'sha256': 'a' * 64, 'bytes': 1}]}))
@@ -302,8 +304,19 @@ def test_the_restore_stops_at_any_failing_docker_call_and_always_tears_down(tmp_
 
 
 # spec: ANYM-610
+def test_the_fake_checksum_outlasts_a_slow_writer_of_its_input(tmp_path):
+    fake = tmp_path / 'sha256sum'
+    fake.write_text(FAKE_SHA256SUM)
+    fake.chmod(0o700)
+    # The writer starts after the fake could have exited: a fake that does not read its input ends this pipeline with 141.
+    done = subprocess.run(['bash', '-c', 'set -o pipefail; { sleep .3; echo line; } | "$0" --check --quiet', str(fake)], stdin=subprocess.DEVNULL, timeout=30)
+    assert done.returncode == 0
+
+
+# spec: ANYM-610
 def test_a_teardown_docker_cannot_verify_never_reports_nothing_left(tmp_path):
-    _, calls, _ = restore_run(tmp_path)
+    first, calls, _ = restore_run(tmp_path)
+    assert first.returncode == 0, first.stdout + first.stderr  # a first run that stops early would place the fault too soon
     first_teardown = next(i for i, call in enumerate(calls) if i > 3 and call.startswith('ps -aq'))
     result, _, _ = restore_run(tmp_path, FAKE_FAIL_FROM=str(first_teardown + 1))
     assert 'restore proved' in result.stdout and result.returncode != 0
