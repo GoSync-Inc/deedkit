@@ -631,7 +631,7 @@ def test_the_discard_removes_exactly_the_refused_candidate_and_keeps_its_record(
     s = refused
     assert s.candidate_keys() and s.attempt.exists()
     assert s.discard() == {'v': 1, 'status': 'discarded', 'backup_id': SECOND}
-    record = json.loads((s.directory / f'discarded-{SECOND}.json').read_text())
+    record = json.loads(next(s.directory.glob('discarded-*.json')).read_text())
     assert record['backup_id'] == SECOND and record['failure']['error'] == 'restore_mismatch'
     assert record['journal']['receipt']['wire']['id'] == SECOND and 'synthetic brief' not in json.dumps(record)
     assert_replaceable(s)
@@ -655,7 +655,7 @@ def nothing_changed(s, before):
 
 
 # spec: ANYM-781
-@pytest.mark.parametrize('case', ['other_id', 'transient_failure', 'cleanup_incomplete', 'proof_ready', 'marker_moved', 'uncommitted'])
+@pytest.mark.parametrize('case', ['other_id', 'transient_failure', 'cleanup_incomplete', 'other_run', 'no_run', 'proof_ready', 'marker_moved', 'uncommitted'])
 def test_the_discard_refuses_anything_but_a_finished_refusal_of_that_candidate(refused, case):
     s = refused
     before = dict(s.calls_cloud.objects)
@@ -669,6 +669,10 @@ def test_the_discard_refuses_anything_but_a_finished_refusal_of_that_candidate(r
         s.write_json(status_path, {**status, 'error': 'restore_docker_failed'})
     elif case == 'cleanup_incomplete':
         s.write_json(status_path, {**status, 'cleanup_complete': False})
+    elif case == 'other_run':
+        s.write_json(status_path, {**status, 'run': 'e' * 32})
+    elif case == 'no_run':
+        s.write_json(status_path, {k: value for k, value in status.items() if k != 'run'})
     elif case == 'proof_ready':
         s.write_json(journal_path, {**journal, 'phase': 'proof_ready'})
     elif case == 'marker_moved':
@@ -688,11 +692,6 @@ def test_the_discard_never_removes_a_protected_point(refused):
     with pytest.raises(ValueError, match='discard_protected'):
         s.discard(BID)
     nothing_changed(s, before)
-    # A record of an earlier discard does not open the way either, whatever it names.
-    s.write_json(s.directory / f'discarded-{BID}.json', {'v': 1, 'backup_id': BID, 'journal': json.loads((s.directory / 'active.json').read_text())})
-    with pytest.raises(ValueError, match='discard_protected'):
-        s.discard(BID)
-    assert dict(s.calls_cloud.objects) == before
 
 
 # spec: ANYM-781
@@ -768,6 +767,110 @@ def test_a_discard_stopped_at_any_step_harms_nothing_and_the_same_command_finish
     assert Path(s.calls['protected_file']).read_bytes() == s.marker
     assert s.discard()['status'] == 'discarded'
     assert_replaceable(s)
+
+
+# spec: ANYM-781
+def test_an_earlier_candidates_refusal_never_authorizes_discarding_a_later_one(refused):
+    s = refused
+    stale = (s.directory / 'status.json').read_bytes()
+    assert s.discard()['status'] == 'discarded'
+    s.deliver(sealed(s.host.parent, 'three'), THIRD)
+    # A later candidate's run stopped after its journal, before it wrote any status: the old refusal is still the latest.
+    s.engine.calls_error = RuntimeError('restore_docker_failed')
+    with pytest.raises(RuntimeError, match='restore_docker_failed'):
+        s.verify()
+    (s.directory / 'status.json').write_bytes(stale)
+    before = dict(s.calls_cloud.objects)
+    with pytest.raises(ValueError, match='discard_not_refused'):
+        s.discard(THIRD)
+    assert dict(s.calls_cloud.objects) == before and (s.directory / 'active.json').exists()
+    s.engine.calls_error = None
+    assert s.verify()['backup_id'] == THIRD
+
+
+# spec: ANYM-781
+@pytest.mark.parametrize('stop', ['after_the_object', 'after_the_receipt', 'after_the_attempt'])
+def test_a_retransmission_during_a_stopped_discard_survives_the_resume(refused, stop, monkeypatch):
+    s = refused
+    v = s.v
+    bad = flipped(s.host.parent, sealed(s.host.parent, 'two-again'))
+    # The very bundle the refused candidate was: the producer retrying its delivery under the same ID.
+    journal = json.loads((s.directory / 'active.json').read_text())
+    old_key = journal['receipt']['object_key']
+    real_delete, real_unlink = s.calls_cloud.delete_object, os.unlink
+
+    class Stop(Exception):
+        pass
+
+    def delete(**kw):
+        result = real_delete(**kw)
+        if (stop == 'after_the_object' and '/objects/' in kw['Key']) or (stop == 'after_the_receipt' and '/receipts/' in kw['Key']):
+            raise Stop
+        return result
+
+    def unlink(path, **kw):
+        real_unlink(path, **kw)
+        if stop == 'after_the_attempt' and str(path).endswith('.attempt.json'):
+            raise Stop
+    monkeypatch.setattr(s.calls_cloud, 'delete_object', delete)
+    monkeypatch.setattr(v.os, 'unlink', unlink)
+    with pytest.raises((Stop, RuntimeError)):
+        s.discard()
+    monkeypatch.setattr(s.calls_cloud, 'delete_object', real_delete)
+    monkeypatch.setattr(v.os, 'unlink', real_unlink)
+    wire_bundle = r2.AGE_HEADER + stream(bad)
+    try:
+        receive(s.calls_receiver, s.calls_cloud, data=wire_bundle, bid=SECOND, snapshot=journal['receipt']['wire']['snapshot_sha256'])
+        delivered = True
+    except (RuntimeError, ValueError):
+        delivered = False
+    assert s.discard()['status'] == 'discarded'
+    assert old_key not in s.calls_cloud.objects and Path(s.calls['protected_file']).read_bytes() == s.marker
+    # Repeating a finished discard refuses and touches a later upload not at all.
+    before = dict(s.calls_cloud.objects)
+    with pytest.raises(ValueError, match='discard_not_refused'):
+        s.discard()
+    assert dict(s.calls_cloud.objects) == before
+    left = [key for key in s.calls_cloud.objects if '/objects/' in key and SECOND in key]
+    # While its old attempt stands the receiver refuses the retransmission; once it is gone a new upload goes in.
+    assert delivered == (stop == 'after_the_attempt') and bool(left) == delivered
+    if delivered:
+        # A new upload under the same ID is whole, with its own key, and goes through the ordinary path.
+        assert len(left) == 1 and left[0] != old_key
+        saved = r2.get_receipt(s.calls_receiver, s.calls_cloud, SECOND)
+        assert saved is not None and saved['object_key'] == left[0]
+        assert json.loads(s.attempt.read_text())['key'] == left[0]
+        with pytest.raises(RuntimeError, match='restore_mismatch'):
+            s.verify()
+        assert s.discard()['status'] == 'discarded'
+    assert s.verify()['status'] == 'idle'
+    s.deliver(sealed(s.host.parent, 'three'), THIRD)
+    assert s.verify()['backup_id'] == THIRD
+
+
+# spec: ANYM-781
+def test_the_discard_removes_the_scratch_a_killed_retry_left_with_its_plaintext(refused):
+    s = refused
+    run = json.loads((s.directory / 'active.json').read_text())['run']
+    left = s.directory / ('payload-' + run)
+    left.mkdir(mode=0o700)
+    (left / 'voice.sqlite3').write_bytes(b'SYNTHETIC_LEFT_BEHIND')
+    assert s.discard()['status'] == 'discarded'
+    assert not left.exists()
+
+
+# spec: ANYM-781
+def test_a_first_ever_candidate_that_is_refused_can_be_discarded_with_no_marker(calls_instance):
+    s = calls_instance
+    root = s.host.parent
+    s.deliver(flipped(root, sealed(root)), BID)
+    with pytest.raises(RuntimeError, match='restore_mismatch'):
+        s.verify()
+    assert not Path(s.calls['protected_file']).exists()
+    assert s.v.discard_refused(s.calls, BID, client=s.calls_cloud)['status'] == 'discarded'
+    assert s.verify()['status'] == 'idle'
+    s.deliver(sealed(root, 'good'), THIRD)
+    assert s.verify()['backup_id'] == THIRD
 
 
 # spec: ANYM-781

@@ -1041,53 +1041,56 @@ def verify_run(config,receiver,client,engine,journal,fd):
     return journal
 
 
-def discard_intent(receiver,backup_id,journal,status,state_fd,prior):
-    """What a discard keeps of a refused candidate, or a refusal: only the exact candidate a finished helper refused."""
-    if journal is None:raise ValueError('discard_not_refused')
-    validate_journal(receiver,journal)
-    if (r2.profile(journal)!='calls' or journal['phase']!='restoring' or journal['receipt']['wire']['id']!=backup_id or
-            journal['prior_sha256']!=prior or not isinstance(status,dict) or status.get('status')!='failed' or
-            status.get('error') not in CALLS_FAILURES or status.get('cleanup_complete') is not True):
-        raise ValueError('discard_not_refused')
-    attempt=r2.state_read(state_fd,r2.attempt_name(backup_id))
-    if attempt is not None and r2.validate_attempt(receiver,attempt,backup_id)['phase']!='committed':
-        raise ValueError('discard_not_refused')
-    return {'v':1,'backup_id':backup_id,'discarded_at':now(),'journal':journal,'failure':{k:status[k] for k in ('error','failed_at')}}
+def refusal_of(journal,status):
+    """The latest status is this run's own finished refusal; an older run's cannot speak for a later candidate."""
+    return (isinstance(status,dict) and status.get('status')=='failed' and status.get('run')==journal['run'] and
+            status.get('error') in CALLS_FAILURES and status.get('cleanup_complete') is True)
 
 
 def discard_refused(config,backup_id,*,client=None):
     """The operator's way past a calls candidate the helper refused (ANYM-781). A refused candidate keeps its journal and
     object, so its retries fail for good and the receiver refuses the next delivery. Holding both locks, this records why,
-    then removes exactly that candidate's object, receipt, attempt and journal. It never touches a protected point: the
-    marker is read first on every call, and a stop at any step is resumed by the same command from the recorded intent."""
+    then removes exactly what that candidate's journal names: its object key, and its receipt and attempt only while they
+    are still that object's, so a retransmission under the same ID stays an ordinary candidate. The journal goes last: it
+    is what a stopped discard resumes from, and without it there is nothing to discard. The marker is read first on every
+    call and a protected ID is refused."""
     if os.geteuid()!=0:raise ValueError('root_verifier_required')
     if r2.profile(config)!='calls':raise ValueError('discard_calls_only')
     r2.valid_id(backup_id)
     receiver=r2.load_config(config['receiver_config_file'])
     client=client if client is not None else r2.make_client(receiver)
-    name=DISCARD_PREFIX+backup_id+'.json'
     with verifier_lock(config['directory']) as fd:
         with local.trusted_directory(receiver['state_directory'],archive=True) as state_fd,receiver_lock(state_fd):
             prior,marker=read_marker(receiver,config['protected_file'])
             if marker is not None and any(item['id']==backup_id for item in marker['backups']):raise ValueError('discard_protected')
-            _,intent=r2.read_root(fd,name,missing=True)
             _,journal=r2.read_root(fd,'active.json',missing=True)
+            if journal is None:raise ValueError('discard_not_refused')
+            validate_journal(receiver,journal)
+            if (r2.profile(journal)!='calls' or journal['phase']!='restoring' or journal['receipt']['wire']['id']!=backup_id or
+                    journal['prior_sha256']!=prior):raise ValueError('discard_not_refused')
+            name=DISCARD_PREFIX+journal['run']+'.json'
+            receipt=journal['receipt']
+            attempt=r2.state_read(state_fd,r2.attempt_name(backup_id))
+            if attempt is not None:r2.validate_attempt(receiver,attempt,backup_id)
+            ours=attempt is not None and attempt['key']==receipt['object_key']
+            _,intent=r2.read_root(fd,name,missing=True)
             if intent is None:
+                # A resumed discard already judged this run; its retries since then only failed.
                 _,status=r2.read_root(fd,'status.json',missing=True)
-                intent=discard_intent(receiver,backup_id,journal,status,state_fd,prior)
-                local.write_maintenance_json(name,intent,dir_fd=fd)
-            elif journal is not None and journal!=intent['journal']:raise ValueError('discard_not_refused')
-            receipt=intent['journal']['receipt']
+                if not refusal_of(journal,status) or (attempt is not None and (not ours or attempt['phase']!='committed')):
+                    raise ValueError('discard_not_refused')
+                local.write_maintenance_json(name,{'v':1,'backup_id':backup_id,'discarded_at':now(),'journal':journal,
+                                                   'failure':{k:status[k] for k in ('error','failed_at')}},dir_fd=fd)
             # The object before its receipt, as a rotation does: a receipt without an object cannot be a candidate.
             r2.cloud_call(client.delete_object,Bucket=receiver['bucket'],Key=receipt['object_key'])
-            r2.cloud_call(client.delete_object,Bucket=receiver['bucket'],Key=r2.receipt_key(receiver,backup_id))
-            try:os.unlink(r2.attempt_name(backup_id),dir_fd=state_fd)
-            except FileNotFoundError:pass
-            local.fsync_dir(state_fd)
-            if receipt['object_key'] in r2.inventory(receiver,client) or r2.get_receipt(receiver,client,backup_id) is not None:
+            if r2.get_receipt(receiver,client,backup_id)==receipt:
+                r2.cloud_call(client.delete_object,Bucket=receiver['bucket'],Key=r2.receipt_key(receiver,backup_id))
+            if ours:os.unlink(r2.attempt_name(backup_id),dir_fd=state_fd);local.fsync_dir(state_fd)
+            if receipt['object_key'] in r2.inventory(receiver,client) or r2.get_receipt(receiver,client,backup_id)==receipt:
                 raise RuntimeError('discard_unconfirmed')
-            # The journal last: until here a retry only fails, and this command resumes.
-            if journal is not None:os.unlink('active.json',dir_fd=fd);local.fsync_dir(fd)
+            # A retry killed since the refusal left its scratch, and only this run's journal ever names it.
+            remove_payload(config['directory'],journal['run'])
+            os.unlink('active.json',dir_fd=fd);local.fsync_dir(fd)
             return {'v':1,'status':'discarded','backup_id':backup_id}
 
 
@@ -1203,6 +1206,8 @@ def run_failure(error,engine,config,journal,admitted,profile,fd):
     failure={'v':1,'status':'failed','error':failure_code(error),'failed_at':now(),
              'cleanup_complete':cleanup_ok,'diagnostic':describe(error)}
     if isinstance(error,HelperFailure) and error.detail:failure['detail']=error.detail
+    # The calls discard's evidence: which run was refused (a status otherwise outlives its candidate).
+    if profile=='calls' and journal is not None:failure['run']=journal['run']
     # Counts and Docker's fixed state words only (ANYM-633): the stream's ranged GETs and the helper's end.
     if type(resumes) is int:failure['stream_resumes']=resumes
     if state is not None:failure['helper_state']=state
