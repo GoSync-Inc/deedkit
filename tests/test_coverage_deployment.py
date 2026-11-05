@@ -112,13 +112,18 @@ def test_calendar_service_guide_names_the_login_log_and_limits_what_it_proves():
     assert '### Login log (ANYM-775)' in guide
     assert '`log_connections=authorization`' in guide
     assert "docker logs --since <time> deedkit-calendar-calendar-db-1 2>&1 | grep 'connection authorized'" in guide
-    # The claim stays limited: the retained ring, in hours, and a healthcheck name any client can copy.
-    assert 'proves non-use only for the period the retained 10 MB ring covers, about 35 to 70 hours' in guide
+    # The claim stays limited: an authorization record for the retained ring, in hours, not proof of non-use,
+    # with a healthcheck name any client can copy.
+    assert 'The log records connection authorizations; it is not an activity audit.' in guide
+    assert 'the retained 10 MB ring holds, about 35 to 70 hours, and only from the moment the setting took effect' in guide
+    assert 'A missing line does not prove non-use.' in guide
     assert 'A login that names itself `pg_isready` writes an identical line' in guide
+    assert 'wider spacing does not prove that every line was the healthcheck' in guide
     # The bridge: the live value before a recreate, and the undo on each side of it.
     assert "`ALTER SYSTEM SET log_connections = 'authorization'`" in guide
     assert 'the recreate takes the command line' in guide
-    assert 'the command line wins over `ALTER SYSTEM`' in guide
+    assert 'the command line wins over `ALTER SYSTEM`, and the `ALTER SYSTEM` value stays on the volume' in guide
+    assert 'run `ALTER SYSTEM RESET log_connections`, remove `command` from the compose file, recreate' in guide
 
 
 def test_database_and_optional_workers_have_isolated_networks_and_role_mounts():

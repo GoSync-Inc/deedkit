@@ -335,15 +335,16 @@ Credentials and the raw source cache are encrypted, but event details, plans and
 
 Read it on the host: `docker logs --since <time> deedkit-calendar-calendar-db-1 2>&1 | grep 'connection authorized'`.
 
-What the log can show is limited:
+The log records connection authorizations; it is not an activity audit. What it can show is limited:
 
-- The log proves non-use only for the period the retained 10 MB ring covers, about 35 to 70 hours. The ring is 2 x 5 MB, and the healthcheck alone fills it: `pg_isready` logs in as `fcs_owner` every 5 seconds, about 17,000 lines or 3.4 MB a day (200 bytes a line, measured on the pinned image). Other log lines shorten the period. Nothing can be said about a time before the oldest retained line.
-- `application_name` is chosen by the client. A login that names itself `pg_isready` writes an identical line, so never discard those lines by name alone. Healthcheck lines are at least 5 seconds apart: two `pg_isready` lines closer than that include a login that was not the healthcheck.
-- A root user on the host can edit the container log, so the log is evidence against a stolen password, not against a host compromise.
+- It covers only the period the retained 10 MB ring holds, about 35 to 70 hours, and only from the moment the setting took effect. The ring is 2 x 5 MB, and the healthcheck alone fills it: `pg_isready` logs in as `fcs_owner` every 5 seconds, about 17,000 lines or 3.4 MB a day (200 bytes a line, measured on the pinned image). Other log lines shorten the period.
+- A missing line does not prove non-use. A session opened before the setting took effect, or before the oldest retained line, can keep working and writes no new line. A line does show that a login happened.
+- `application_name` is chosen by the client. A login that names itself `pg_isready` writes an identical line, so never discard those lines by name alone. Two `pg_isready` lines less than 5 seconds apart include a login that was not the healthcheck, but wider spacing does not prove that every line was the healthcheck.
+- A root user on the host can edit the container log, so the log says nothing about a host compromise.
 
 Production: the container started before this setting and a release does not recreate it (`calendar-db` is not a selected service), so the live value comes from `ALTER SYSTEM SET log_connections = 'authorization'` and `SELECT pg_reload_conf()`, as the owner role through `docker exec`. This needs no restart and drops no connection; new sessions take the value, and an open session keeps the one it started with. When ANYM-779 has moved the project to the repository file, the two values agree; until then the `ALTER SYSTEM` value is the live one and the recreate takes the command line.
 
-Undo: before a recreate, `ALTER SYSTEM RESET log_connections` and `SELECT pg_reload_conf()`. After a recreate the command line wins over `ALTER SYSTEM`, so the undo is removing `command` from the compose file and recreating `calendar-db`.
+Undo: before a recreate, `ALTER SYSTEM RESET log_connections` and `SELECT pg_reload_conf()`. After a recreate the command line wins over `ALTER SYSTEM`, and the `ALTER SYSTEM` value stays on the volume, so the undo needs both: run `ALTER SYSTEM RESET log_connections`, remove `command` from the compose file, recreate `calendar-db`, and read `SHOW log_connections` in a new session.
 
 ## Availability and preview boundaries
 
