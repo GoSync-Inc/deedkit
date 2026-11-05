@@ -8,7 +8,7 @@ keep `view="archive"` as their default. Opt in explicitly through either SDK;
 Conversation contract version 1 retains message IDs, provider references,
 content revisions, direction and original `body` (possibly bounded by the explicit
 body limit, with `body_truncated`). `display_text` adds observed media labels and,
-after the label on the same line, the first file's bounded text in `«…»`: its ready
+after the label on the same line, the bounded text of the message's first file in `«…»`: its ready
 extracted text, else its ready audio transcript (`…»` when the excerpt is incomplete).
 The excerpt is appended and quoted, never substituted, and never an image description
 or a sticker's; `body` stays the sender's text. It is one line, with line breaks turned
@@ -16,8 +16,8 @@ into spaces and `«` `»` into `"`, and it is untrusted. In detail=full such a r
 `display_text_media: [{attachment_id, source, model_generated, untrusted}]`. A label says
 `; расшифровка готовится` or `; текст готовится` while the text is prepared and
 `; текст в get_file_text` when the excerpt was omitted for the response budget.
-`body_chars` bounds the sender's text and the label; the quote comes after that cap and
-alone never marks a row truncated. A chat head still cuts the whole text at 160 characters.
+`body_chars` bounds the sender's text and the label; the quote comes after that cap.
+`display_text_truncated` means the sender's text was cut, never only the label or the quote. A chat head still cuts the whole text at 160 characters.
 `kind` distinguishes text, photo, video, voice, audio, document, sticker,
 location, contact, poll, system and unknown. Files retain independent download,
 extraction and enrichment statuses. A pending transcript is not a missing file.

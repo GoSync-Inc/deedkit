@@ -92,36 +92,50 @@ def _is_audio(file):
     return mime.startswith('audio/') or mime=='application/ogg'
 
 
-def _text_reason(attachments):
-    """Why a downloaded file's words are not in the message yet; an image description never becomes an excerpt."""
-    pending=[f for f in attachments if f.get('extraction_status') in ('queued','leased','processing')
-        or _is_audio(f) and f.get('enrichment_status') in ('queued','processing')]
+def _preparing(file):
+    """A downloaded file whose words may still come; an image description never becomes an excerpt."""
+    return file.get('download_status')=='ready' and (file.get('extraction_status') in ('queued','leased','processing')
+        or _is_audio(file) and file.get('enrichment_status') in ('queued','processing'))
+
+
+def _text_reason(attachments,lost):
+    pending=[f for f in attachments if _preparing(f) and f.get('attachment_id') not in lost]
     if pending:return 'расшифровка готовится' if any(_is_audio(f) for f in pending) else 'текст готовится'
     if any((f.get('text_excerpt') or {}).get('omitted')=='response_budget' for f in attachments):
         return 'текст в get_file_text'
     return None
 
 
+def _button_line(row,kind):
+    # ANYM-658: the transcript has only display_text; a keyboard shows its first labels, never a link or a kind.
+    buttons=row.get('buttons')
+    flat=[b for r in buttons.get('rows',[]) for b in r] if isinstance(buttons,dict) else buttons if isinstance(buttons,list) else []
+    labels=[b['text'][:32] for b in flat[:8] if isinstance(b,dict) and b.get('text')]
+    return '[Кнопки] '+' | '.join(labels) if labels and kind!='system' else ''
+
+
 def displayed_quote(row):
-    """The quote present_message put into display_text, from the row's own marking and attachment."""
-    for media in (row.get('display_text_media') or ())[:1]:
-        for file in row.get('attachments') or ():
-            if file.get('attachment_id')==media['attachment_id']:return excerpt_quote(file.get('text_excerpt') or {})
-    return ''
+    """The quote present_message put into display_text, from the row's own marking and first attachment."""
+    if not row.get('display_text_media'):return ''
+    return excerpt_quote((row.get('attachments') or [{}])[0].get('text_excerpt') or {})
 
 
 def _split_display_text(row):
-    """(the sender's text, label and buttons; where the quote sits; the quote)."""
+    """(the sender's text, label and buttons; where the quote sits; the quote) of a row not capped yet.
+
+    The position comes from the row's structure: a caption or a button may hold the same words as the quote."""
     text=row['display_text']
     quote=displayed_quote(row)
-    at=text.rfind(quote) if quote else -1
-    if at<0:return text,len(text),''
-    start=at-1 if at and text[at-1]==' ' else at
-    return text[:start]+text[at+len(quote):],start,quote
+    if not quote:return text,len(text),''
+    line=_button_line(row,row.get('kind'))
+    at=len(text)-(len(line)+1 if line else 0)-len(quote)
+    return text[:at-1]+text[at+len(quote):],at-1,quote
 
 
-def own_display_text(row):
-    return _split_display_text(row)[0]
+def _own_text_cut(row,limit):
+    """The truncation flags speak of the sender's text; a contact's lines are its text (ANYM-664 criterion 4)."""
+    if row.get('kind')=='contact':return True
+    return bool(row.get('body_truncated')) or len(row.get('body',row.get('snippet','')) or '')>limit
 
 
 def bound_display_text(row,limit):
@@ -129,8 +143,7 @@ def bound_display_text(row,limit):
     own,at,quote=_split_display_text(row)
     if len(own)<=limit:return row['display_text'],False
     own=own[:limit];at=min(at,limit)
-    if not quote:return own,True
-    return own[:at]+(' ' if at else '')+quote+own[at:],True
+    return own[:at]+(' ' if at else '')+quote+own[at:] if quote else own,_own_text_cut(row,limit)
 
 
 def cap_display_text(row,cap):
@@ -139,7 +152,7 @@ def cap_display_text(row,cap):
     if cut:row['display_text_truncated']=True
 
 
-def present_message(row,position):
+def present_message(row,position,*,lost=()):
     body=row.get('body',row.get('snippet','')) or ''
     observed=row.get('message_kind')
     if row.get('is_service') is True:kind='system'
@@ -153,6 +166,14 @@ def present_message(row,position):
     row['kind']=kind;row['is_service']=kind=='system';row['position']=position
     row['conversation_view_version']=1
     label=LABELS.get(kind)
+    # ANYM-664: the first file's words; a sticker, a contact and a service event have none. A caption with a file but
+    # no observed media kind stays kind text and gets the label a file without a caption gets.
+    first=(row.get('attachments') or [{}])[0]
+    quote=excerpt_quote(first.get('text_excerpt') or {}) if kind not in ('sticker','contact','system') else ''
+    if quote:
+        row['display_text_media']=[{'attachment_id':first.get('attachment_id'),'source':first['text_excerpt']['source'],
+            'model_generated':first['text_excerpt']['model_generated'],'untrusted':True}]
+        if kind=='text':label=LABELS['document']+(': '+first['filename'][:256] if first.get('filename') else '')
     if label:
         if kind=='document':
             name=next((f.get('filename') for f in row.get('attachments',[]) if f.get('filename')),None)
@@ -175,19 +196,10 @@ def present_message(row,position):
             elif states & {'deferred'}:
                 label+='; файл доступен по запросу'
             else:label+='; файл пока недоступен'
-        # ANYM-664: the first file with words; a sticker and a contact never have any, a video has no transcript profile.
-        quote=''
-        if kind not in ('sticker','contact'):
-            for file in attachments:
-                quote=excerpt_quote(file.get('text_excerpt') or {})
-                if quote:
-                    excerpt=file['text_excerpt']
-                    row['display_text_media']=[{'attachment_id':file.get('attachment_id'),'source':excerpt['source'],
-                        'model_generated':excerpt['model_generated'],'untrusted':True}]
-                    break
-            if not quote and states=={'ready'} and kind!='video':
-                reason=_text_reason(attachments)
-                if reason:label+='; '+reason
+        # A video has no transcript profile, a sticker no text to wait for.
+        if not quote and kind not in ('sticker','contact','system','video'):
+            reason=_text_reason(attachments,lost)
+            if reason:label+='; '+reason
         lines=contact_lines(row.get('contact')) if kind=='contact' else []
         if lines:
             # A contact message has no caption: its body is the display name (native) or the raw
@@ -195,12 +207,8 @@ def present_message(row,position):
             row['display_text']='\n'.join(lines)
         else:row['display_text']=(body+'\n' if body else '')+'['+label+']'+(' '+quote if quote else '')
     else:row['display_text']=body
-    # ANYM-658: the transcript has only display_text; a keyboard shows its first labels, never a link or a kind.
-    buttons=row.get('buttons')
-    flat=[b for r in buttons.get('rows',[]) for b in r] if isinstance(buttons,dict) else buttons if isinstance(buttons,list) else []
-    labels=[b['text'][:32] for b in flat[:8] if isinstance(b,dict) and b.get('text')]
-    if labels and kind!='system':
-        row['display_text']=(row['display_text']+'\n' if row['display_text'] else '')+'[Кнопки] '+' | '.join(labels)
+    line=_button_line(row,kind)
+    if line:row['display_text']=(row['display_text']+'\n' if row['display_text'] else '')+line
     row['timestamp_precision']=row.get('timestamp_resolution') or 'unknown'
     row.setdefault('order_basis','timestamp_only');row.setdefault('order_status','timestamp_only')
     return row
@@ -222,6 +230,9 @@ def decorate_messages(c,p,rows,*,include_system=False):
           AND (s.account,s.chat,s.sent_at) IN(SELECT account,chat,sent_at FROM messages WHERE id=ANY(%s))
         GROUP BY s.account,s.chat,s.sent_at,a.platform''',[*args,ids]).fetchall()
     ties={(r['account'],r['chat'],r['sent_at']):r for r in siblings}
+    # A receipt says ready even when the original is gone: its text is not being prepared (get_file_text's rule).
+    from .result_evidence import _readable
+    lost={f['attachment_id'] for r in rows for f in r.get('attachments') or [] if _preparing(f) and not _readable(c,f)}
     for position,row in enumerate(rows,1):
         tied=ties.get((row['account'],row['chat'],row['sent_at']))
         platform=(tied or {}).get('platform',row.get('platform'))
@@ -233,7 +244,7 @@ def decorate_messages(c,p,rows,*,include_system=False):
         row['ordering']={'basis':row['order_basis'],'status':row['order_status'],
             'same_timestamp_messages':tied['n'] if tied else 1,'position_scope':'returned_view',
             'phone_order_verified':False}
-        present_message(row,position)
+        present_message(row,position,lost=lost)
     return rows
 
 

@@ -2,14 +2,14 @@
 from hypothesis import given, strategies as st
 from psycopg.types.json import Jsonb
 
-from messaging_service.conversation import excerpt_quote, present_message, presentation
-from messaging_service.presentation import lean_message, message_summary, render
+from messaging_service.conversation import cap_display_text, excerpt_quote, present_message, presentation
+from messaging_service.presentation import lean_chat, lean_message, message_summary, render
 from test_file_index import add_file, drain, worker_for
 from test_voice_transcript_reading import TRANSCRIPT, voice
 
 CHAT = 'telegram-demo-chat'
 WORDS = 'Synthetic words of the file'
-LONG = 'caption ' * 100
+LONG = 'caption ' * 250
 
 
 def add(s, mid, kind, body=''):
@@ -131,6 +131,26 @@ def test_second_attachment_is_not_appended():
     row = voice_row(attachment(excerpt()), second)
     assert row['display_text'] == f'[Голосовое 1:14] «{WORDS}»'
     assert second['text_excerpt']['text'] == 'Second words'
+    # Only the first file: a later file's words stay in its own attachment field.
+    assert voice_row(attachment(), second)['display_text'] == '[Голосовое 1:14]'
+
+
+# spec: ANYM-664
+def test_caption_with_a_file_and_no_observed_kind_gets_a_labelled_excerpt(seeded):
+    s, _, b = seeded
+    with s.pool.connection() as c:
+        c.execute("INSERT INTO messages(id,account,chat,provider_id,sender,body,sent_at,direction) "
+                  "VALUES('legacy-1','telegram-demo',%s,'777','synthetic-peer','Legacy caption','2026-12-01T12:00:00Z','incoming')",
+                  (CHAT,))
+    add_file(s, 'legacy-file', 'legacy-1', WORDS.encode(), 'note.txt')
+    drain(worker_for(s))
+    expected = f'Legacy caption\n[Документ: note.txt] «{WORDS}»'
+    full = rows(s, b, 'full')['legacy-1']
+    assert full['kind'] == 'text' and full['body'] == 'Legacy caption' and full['display_text'] == expected
+    assert rows(s, b, 'compact')['legacy-1']['display_text'] == expected
+    hit = render('search', s.search(b, 'Legacy', chat=CHAT, view='conversation'), 'compact')['items']
+    assert next(r for r in hit if r['id'] == 'legacy-1')['display_text'] == expected
+    assert s.get_context(b, 'legacy-1', view='conversation')['message']['display_text'] == expected
 
 
 # spec: ANYM-664
@@ -148,6 +168,28 @@ def test_pending_transcript_label_says_it_is_being_prepared():
 
 
 # spec: ANYM-664
+def test_preparing_reason_is_read_per_downloaded_file():
+    waiting = attachment(download_status='queued', attachment_id='file-2', id='file-2', enrichment_status='queued')
+    assert voice_row(waiting)['display_text'] == '[Голосовое 1:14; файл ожидает загрузки]'
+    mixed = voice_row(attachment(enrichment_status='processing'), waiting)
+    assert mixed['display_text'] == '[Голосовое 1:14; файл ожидает загрузки; расшифровка готовится]'
+
+
+# spec: ANYM-664
+def test_missing_original_with_queued_text_keeps_its_label(seeded):
+    s, _, b = seeded
+    add(s, 'voice-1', 'voice')
+    digest = add_file(s, 'voice-note', 'voice-1', b'synthetic-audio', 'memo.ogg', 'audio/ogg')
+    with s.pool.connection() as c:
+        c.execute("INSERT INTO processing_profiles(account,kind,provider,model,enabled,expires_at) "
+                  "VALUES('telegram-demo','audio','synthetic','synthetic-model',true,clock_timestamp()+interval '1 hour')")
+    drain(worker_for(s))
+    assert rows(s, b, 'full')['voice-1']['display_text'] == '[Голосовое; расшифровка готовится]'
+    (s.files / digest).unlink()
+    assert rows(s, b, 'full')['voice-1']['display_text'] == '[Голосовое]'
+
+
+# spec: ANYM-664
 def test_budget_omitted_excerpt_label_points_to_get_file_text():
     omitted = {'omitted': 'response_budget', 'source': 'transcript', 'model_generated': True, 'untrusted': True}
     assert voice_row(attachment(omitted))['display_text'] == '[Голосовое 1:14; текст в get_file_text]'
@@ -162,6 +204,7 @@ def test_display_text_unchanged_for_failed_unsupported_and_deleted():
     assert voice_row()['display_text'] == '[Голосовое 1:14]'
     gone = voice_row(attachment(download_status='unavailable'))
     assert gone['display_text'] == '[Голосовое 1:14; файл пока недоступен]'
+    assert voice_row(attachment(enrichment_status='queued'), lost={'file-1'})['display_text'] == '[Голосовое 1:14]'
 
 
 # spec: ANYM-664
@@ -213,6 +256,38 @@ def test_long_caption_does_not_hide_the_excerpt(seeded):
     seeded_head = s.list_chats(b, view='conversation')['items']
     state = next(r for r in seeded_head if r['id'] == CHAT)['conversation']['latest_known_meaningful_message']
     assert state['display_text'].endswith(f'«{WORDS}»')
+
+
+# spec: ANYM-664
+def test_button_with_the_excerpts_words_does_not_take_the_quotes_place():
+    row = voice_row(attachment(excerpt('words')), body='cap', buttons=[{'text': '«words»'}])
+    assert row['display_text'] == 'cap\n[Голосовое 1:14] «words»\n[Кнопки] «words»'
+    cap_display_text(row, 18)
+    assert row['display_text'] == 'cap\n[Голосовое 1:1 «words»'
+
+
+# spec: ANYM-664
+def test_cap_that_cuts_only_the_label_is_not_truncated_sender_text():
+    row = voice_row(attachment(excerpt('words')))
+    cap_display_text(row, 1)
+    assert row['display_text'] == '[ «words»' and 'display_text_truncated' not in row
+    line = presentation([{**row, 'sent_at': None}])
+    assert ' […]' not in line['transcript'] and not line['warnings']
+    cut = voice_row(attachment(excerpt('words')), body='sender text')
+    cap_display_text(cut, 6)
+    assert cut['display_text'] == 'sender «words»' and cut['display_text_truncated'] is True
+
+
+# spec: ANYM-664
+def test_awaited_message_that_is_not_the_head_shows_its_quoted_text():
+    target = {'id': 'voice-1', 'display_text': '[Голосовое] «words»', 'display_text_media': [{'attachment_id': 'file-1'}]}
+    row = {'id': 'chat', 'title': 'Synthetic group', 'type': 'group', 'awaiting_reply': True,
+           'awaiting_reply_message_id': 'voice-1', 'awaiting_reply_snippet': '',
+           'conversation': None}
+    assert lean_chat(row)['awaiting_reply']['display_text'] == ''
+    state = {'last_turn': 'peer', 'suggested_action': 'reply', 'head_freshness': 'unknown', 'basis': {'code': 'x', 'evidence': []},
+             'owner_attention': {'last_turn': 'peer', 'suggested_action': 'reply', 'target_message': target}}
+    assert lean_chat({**row, 'conversation': state})['awaiting_reply']['display_text'] == '[Голосовое] «words»'
 
 
 # spec: ANYM-664
