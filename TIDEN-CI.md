@@ -61,7 +61,10 @@ Tiden's own Go reporter named them: signature `<Package>::<Test>` byte for byte
 test name, suite the package's last path element and `file_path` the bare name
 of the one `_test.go` file that declares the top-level test. Only those names,
 the status and the duration leave the runner; test output stays in the GitHub
-artifacts (`ci-evidence-go` 1 day, `ci-evidence` 14 days). A test that started
+artifacts (`ci-evidence-go` 1 day, `ci-evidence` 14 days). When the whatsmeow
+tests fail, `scripts/go_failures.py` also names each failed test and package in
+the job log with the first lines of its output (ANYM-801), so a red run reads
+without the artifact; this log step sends nothing to Tiden. A test that started
 without a verdict failed. A stream without test results, a malformed event, a
 package outside its module, a test whose file is missing or ambiguous, or a
 package failure that no failed test explains blocks or fails that module's check
