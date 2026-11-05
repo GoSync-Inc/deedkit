@@ -2815,7 +2815,6 @@ def range_changes(mirror, base, candidate, installed):
 
 MIGRATION = re.compile(r"services/messaging/messaging_service/migrations/([0-9]{3}_[A-Za-z0-9_]+\.sql)")
 CLASSIFIER = "services/messaging/messaging_service/migration_rollout.py"
-CLASSES = ("expand", "manual", "no header")
 CLASSIFY_TIMEOUT = 30
 # Bounds of the classifier child: the bytes it gets (migration texts and its source), the stdout read back and its
 # address space. Beyond any of them every added migration is `manual`.
@@ -2836,7 +2835,27 @@ sys.addaudithook(refuse)
 module = {"__name__": "migration_rollout"}
 exec(compile(data["source"], "migration_rollout.py", "exec"), module)
 """
-CLASSIFY = CLASSIFY_PRELUDE + 'print(json.dumps([module["rollout_class"](text) for text in data["texts"]]))\n'
+# ANYM-743: with the candidate's `risk_class`, each class adds the tier, and a critical file its first critical line and
+# statement kind (`manual critical: line 12 DELETE`); a candidate without it names the class alone. hashlib comes first
+# for the calendar classifier, as in CALENDAR_PLAN (the audit hook refuses an import; Sol r2 F3).
+CLASSIFY = "import hashlib\n" + CLASSIFY_PRELUDE + """def named(text):
+    kind, risk = module["rollout_class"](text), module.get("risk_class")
+    if risk is None:
+        return kind
+    tier, line, what = risk(text)
+    return kind + (" non-critical" if tier == "non-critical" else f" critical: line {line} {what}")
+print(json.dumps([named(text) for text in data["texts"]]))
+"""
+# The statement kinds `risk_class` names (migration_rollout.RISK_KINDS): an exact list, so a pause line carries no word
+# of a migration file (Astra r1 F2).
+RISK_KINDS = ("DELETE", "UPDATE", "MERGE", "TRUNCATE", "COPY", "SELECT", "CALL", "WITH", "PERFORM", "EXECUTE",
+              "INSERT ON CONFLICT DO UPDATE", "DO", "SET", "CREATE EXTENSION", "CREATE TRIGGER", "CREATE RULE",
+              "CREATE other", "DROP TABLE", "DROP SCHEMA", "DROP SEQUENCE", "DROP MATERIALIZED", "DROP EXTENSION",
+              "DROP OWNED", "DROP DATABASE", "DROP SERVER", "DROP other", "DROP CASCADE", "DROP COLUMN",
+              "ALTER COLUMN TYPE", "ALTER other", "FUNCTION CALL", "WRITING FUNCTION", "other statement", "unparsed",
+              "untokenizable")
+NAMED_CLASS = re.compile(r"(?:expand|manual|no header)(?: non-critical| critical: line [0-9]{1,6} (?:"
+                         + "|".join(map(re.escape, RISK_KINDS)) + "))?")
 
 
 def classifier_limits():
@@ -2862,16 +2881,23 @@ def classifier_child(script, payload):
 
 
 def migration_classes(mirror, base, candidate, sql):
-    """`<file> <class>` for each migration `base..candidate` adds (ANYM-444): the class the candidate's classifier
-    gives the candidate's bytes, `expand`, `manual` or `no header`. It only names; whatever fails here is `manual`."""
-    if not any(MIGRATION.fullmatch(path) for path in sql):
-        return []
+    """`<file> <class> <tier>` for each messaging or calendar migration `base..candidate` adds (ANYM-444, ANYM-743):
+    what the candidate's classifier of that database gives the candidate's bytes. It only names; whatever fails here
+    is `manual` with no tier."""
+    named = []
+    for pattern, classifier in ((MIGRATION, CLASSIFIER), (CALENDAR_MIGRATION, CALENDAR_CLASSIFIER)):
+        if any(pattern.fullmatch(path) for path in sql):
+            named += database_classes(mirror, base, candidate, pattern, classifier)
+    return named
+
+
+def database_classes(mirror, base, candidate, pattern, classifier):
     try:
         added = [path for path in run(["git", "-C", str(mirror), "diff", "--name-only", "--no-renames", "--diff-filter=A",
-                                       "-z", base, candidate]).split("\0") if MIGRATION.fullmatch(path)]
+                                       "-z", base, candidate]).split("\0") if pattern.fullmatch(path)]
     except Refused:
         return []
-    objects = [f"{candidate}:{path}" for path in added + [CLASSIFIER]]
+    objects = [f"{candidate}:{path}" for path in added + [classifier]]
     try:
         # Sizes first: nothing over the input limit is read, and then no process starts.
         if sum(int(run(["git", "-C", str(mirror), "cat-file", "-s", obj])) for obj in objects) > CLASSIFY_INPUT_LIMIT:
@@ -2883,9 +2909,9 @@ def migration_classes(mirror, base, candidate, sql):
         classes = classifier_child(CLASSIFY, {"source": source, "texts": texts})
     except Exception:  # Refused, OSError, a timeout, a limit, RecursionError of deep JSON: all name `manual`
         classes = None
-    if not (isinstance(classes, list) and len(classes) == len(added) and all(c in CLASSES for c in classes)):
+    if not (isinstance(classes, list) and len(classes) == len(added) and all(isinstance(c, str) and NAMED_CLASS.fullmatch(c) for c in classes)):
         classes = ["manual"] * len(added)
-    return [f"{MIGRATION.fullmatch(path)[1]} {kind}" for path, kind in zip(added, classes)]
+    return [f"{pattern.fullmatch(path)[1]} {kind}" for path, kind in zip(added, classes)]
 
 
 def pause_text(sql, pending, classes=()):
@@ -3040,7 +3066,13 @@ MIGRATION_DATA = r"""SELECT line FROM (
          CASE WHEN name = 'schema_version' THEN value ELSE md5(value) END)::text AS line FROM probe_metadata
   UNION ALL SELECT json_build_object('k', json_build_array('ledger', version::text), 'v', sha256)::text FROM archive_migrations
   UNION ALL SELECT json_build_object('k', json_build_array('writes', format('%I.%I', schemaname, relname)), 'v',
-         json_build_array(n_tup_ins, n_tup_upd, n_tup_del))::text FROM pg_stat_user_tables) AS lines ORDER BY line;"""
+         json_build_array(n_tup_ins, n_tup_upd, n_tup_del))::text FROM pg_stat_user_tables
+  UNION ALL SELECT json_build_object('k', json_build_array('rows', format('%I.%I', schemaname, relname)), 'v',
+         (xpath('/row/c/text()', query_to_xml(format('SELECT count(*) AS c FROM %I.%I', schemaname, relname), false,
+                                              true, '')))[1]::text)::text FROM pg_stat_user_tables
+  UNION ALL SELECT json_build_object('k', json_build_array('attnum', format('%I.%I', s.schemaname, s.relname), a.attname),
+         'v', a.attnum)::text FROM pg_stat_user_tables s JOIN pg_attribute a ON a.attrelid = s.relid
+   WHERE a.attnum > 0 AND NOT a.attisdropped) AS lines ORDER BY line;"""
 LEDGER = r"""SELECT json_build_object('schema_version', (SELECT value FROM probe_metadata WHERE name = 'schema_version'),
   'applied', (SELECT coalesce(json_object_agg(version::text, sha256 ORDER BY version), '{}'::json) FROM archive_migrations))::text;"""
 OTHER_SESSIONS = "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend' AND pid <> pg_backend_pid();"
@@ -3084,6 +3116,7 @@ CALENDAR_PACKAGE = "services/calendar/family_calendar/service/"
 CALENDAR_FILE = re.compile(r"schema(?:_v([1-9][0-9]*))?\.sql")
 CALENDAR_ROLES = CALENDAR_PACKAGE + "roles.sql"
 CALENDAR_CLASSIFIER, CALENDAR_STORE = CALENDAR_PACKAGE + "migration_rollout.py", CALENDAR_PACKAGE + "store.py"
+CALENDAR_MIGRATION = re.compile(re.escape(CALENDAR_PACKAGE) + r"(schema_v[0-9]+\.sql)")
 CALENDAR_TARGET = "calendar"
 CALENDAR_RUNTIME = "/data/service/runtime.json"
 # K0: the calendar Store's pool prepares no statement server-side either.
@@ -3103,7 +3136,13 @@ CALENDAR_LEDGER = r"""SELECT json_build_object('schema_version', coalesce(max(ve
 CALENDAR_DATA = r"""SELECT line FROM (
   SELECT json_build_object('k', json_build_array('ledger', version::text), 'v', checksum)::text AS line FROM fcs.migrations
   UNION ALL SELECT json_build_object('k', json_build_array('writes', format('%I.%I', schemaname, relname)), 'v',
-         json_build_array(n_tup_ins, n_tup_upd, n_tup_del))::text FROM pg_stat_user_tables) AS lines ORDER BY line;"""
+         json_build_array(n_tup_ins, n_tup_upd, n_tup_del))::text FROM pg_stat_user_tables
+  UNION ALL SELECT json_build_object('k', json_build_array('rows', format('%I.%I', schemaname, relname)), 'v',
+         (xpath('/row/c/text()', query_to_xml(format('SELECT count(*) AS c FROM %I.%I', schemaname, relname), false,
+                                              true, '')))[1]::text)::text FROM pg_stat_user_tables
+  UNION ALL SELECT json_build_object('k', json_build_array('attnum', format('%I.%I', s.schemaname, s.relname), a.attname),
+         'v', a.attnum)::text FROM pg_stat_user_tables s JOIN pg_attribute a ON a.attrelid = s.relid
+   WHERE a.attnum > 0 AND NOT a.attisdropped) AS lines ORDER BY line;"""
 # fcs.migrations has no applied_at: the rehearsal's transaction time is the database's active and idle-in-transaction
 # milliseconds its session added (counted at its exit), plus the few reads between (an overestimate).
 BUSY = ("SELECT round(active_time + idle_in_transaction_time) FROM pg_stat_database "
@@ -3313,53 +3352,37 @@ def catalog_difference(before, after):
             "added": sorted(([list(key), after[key]] for key in after.keys() - before.keys()), key=order)}
 
 
-# A literal default as pg_get_expr prints it, with the casts PostgreSQL adds ('x'::text, 0, (-1), '{}'::jsonb). The
-# printed text hides implicit casts, so the column's last CATALOG value must also say that its expression tree holds
-# only constants, relabels and built-in immutable functions (a user's assignment cast prints as `0` too, Astra r2 F5):
-# ADD COLUMN then stores it once and rewrites nothing. Both must hold. A quoted type name (`'x'::"char"`, a quoted
-# enum) is no match and pauses: such a release goes the manual path (known pause, Astra r3 F11).
-LITERAL_DEFAULT = re.compile(r"(?:'(?:[^']|'')*'|-?[0-9]+(?:\.[0-9]+)?|\(-[0-9]+(?:\.[0-9]+)?\)|true|false)"
-                             r"(?:::[a-z][a-z0-9_ ]*(?:\([0-9]+(?:,[0-9]+)?\))?(?:\[\])?)*")
-
-
 def described(key):
     return " ".join(str(part) for part in key)
 
 
-def not_additive(before, after):
-    """M3: the first catalog difference that is not additive, or None. Additive: only new tables with their
-    columns, indexes, constraints, sequences, policies and ACL items; new columns on existing tables that are
-    nullable without a default or have a constant default (PostgreSQL 18 records the NOT NULL of such a column as a
-    constraint); added ACL items; new permissive policies on new tables."""
+def destroys_data(before, after):
+    """M3 (ANYM-743; was ANYM-449's `not_additive`, owner 11-04: backups and pauses only in critical cases): the first
+    catalog difference of the rehearsal that loses stored data or breaks the running release's writes, or None. That
+    is a removed table, partitioned table, materialized view or column (a rename reads as one), a column whose type or
+    generation expression changed, and a new NOT NULL column without a default on an existing table. Everything else
+    a non-critical file does (indexes, constraints, functions, views, policies, grants, defaults, roles) passes;
+    `data_unchanged` refuses a moved write counter, row count or column number."""
     change = catalog_difference(before, after)
-    if change["removed"]:
-        return "removed " + described(change["removed"][0])
-    if change["changed"]:
-        return "changed " + described(change["changed"][0][0])
-    added = [(tuple(key), value) for key, value in change["added"]]
-    tables = {key[1] for key, value in added if key[0] == "relation" and value[0] in ("r", "p")}
-    columns = {(key[1], key[2]) for key, _ in added if key[0] == "column"}
-    for key, value in added:
-        kind = key[0]
-        if kind == "relation":
-            allowed = value[0] in ("r", "p", "S", "i")
-        elif kind == "column":
-            allowed = key[1] in tables or ((before.get(("relation", key[1])) or [None])[0] in ("r", "p")
-                                           and not value[3] and not value[4]
-                                           and (value[6] is True and bool(LITERAL_DEFAULT.fullmatch(value[2]))
-                                                if value[2] is not None else not value[1]))
-        elif kind == "constraint":
-            allowed = key[1] in tables or (value[0] == "n" and bool(value[3])
-                                           and all((key[1], column) in columns for column in value[3]))
-        elif kind == "index":
-            allowed = value[1] in tables
-        elif kind == "policy":
-            allowed = key[1] in tables and value[0] is True
-        else:
-            allowed = kind in ("sequence", "acl")
-        if not allowed:
-            return "added " + described(key)
+    for key in change["removed"]:
+        if key[0] == "column" or key[0] == "relation" and (before[tuple(key)] or [None])[0] in ("r", "p", "m"):
+            return "removed " + described(key)
+    for key, value in change["changed"]:
+        old = before[tuple(key)]
+        if key[0] == "column" and (old[0] != value[0] or old[4] != value[4] or value[4] and old[2] != value[2]):
+            return "changed the type of " + described(key)
+    for key, value in change["added"]:
+        if (key[0] == "column" and value[1] and value[2] is None and not value[3] and not value[4]
+                and (before.get(("relation", key[1])) or [None])[0] in ("r", "p")):
+            return "added a NOT NULL column without a default to " + described(key)
     return None
+
+
+def changed_data(key):
+    """The reason a `writes`, `rows` or `attnum` line of the data check changed."""
+    if key[0] == "writes": return f"rows of {key[1]} were written"
+    if key[0] == "rows": return f"the row count of {key[1]} changed"
+    return f"column {key[2]} of {key[1]} was dropped or replaced"
 
 
 def data_unchanged(before, after, plan):
@@ -3374,9 +3397,11 @@ def data_unchanged(before, after, plan):
     if set(plan["pending"]) & set(ledger(before)) or ledger(after) != {**ledger(before), **plan["pending"]}:
         return "archive_migrations changed beyond the pending versions"
     for key, value in sorted(before.items(), key=json.dumps):
-        if key[0] == "writes" and key[1] not in ("public.probe_metadata", "public.archive_migrations") \
+        # ANYM-743 (Astra r1 F1): a TRUNCATE moves no write counter, so the exact row count of every table counts too;
+        # a column dropped and added again under its name has a new attnum and no values (Sol r2 F1).
+        if key[0] in ("writes", "rows", "attnum") and key[1] not in ("public.probe_metadata", "public.archive_migrations") \
                 and after.get(key) != value:
-            return f"rows of {key[1]} were written"
+            return changed_data(key)
     return None
 
 
@@ -3387,8 +3412,8 @@ def calendar_data_unchanged(before, after, plan):
     if set(plan["pending"]) & set(ledger(before)) or ledger(after) != {**ledger(before), **plan["pending"]}:
         return "fcs.migrations changed beyond the pending versions"
     for key, value in sorted(before.items(), key=json.dumps):
-        if key[0] == "writes" and key[1] != "fcs.migrations" and after.get(key) != value:
-            return f"rows of {key[1]} were written"
+        if key[0] in ("writes", "rows", "attnum") and key[1] != "fcs.migrations" and after.get(key) != value:
+            return changed_data(key)
     return None
 
 
@@ -3601,9 +3626,9 @@ def rehearse(copied, plan, image, limit):
     if took is not None and not 0 <= took <= limit:
         raise MigrationRefused(f"too slow for an unattended lock: the rehearsal took {took} ms, over {limit} ms")
     after = catalog_map(scratch_lines(copy, copied, "after", CATALOG))
-    if reason := not_additive(before, after) or (calendar_data_unchanged if calendar else data_unchanged)(
+    if reason := destroys_data(before, after) or (calendar_data_unchanged if calendar else data_unchanged)(
             data, after_data, plan):
-        raise MigrationRefused("not additive: " + reason)
+        raise MigrationRefused("not unattended: " + reason)
     return {"took_ms": took, "difference": catalog_difference(digested(before), digested(after))}
 
 
@@ -5025,8 +5050,10 @@ def deploy_steps(settings, http, s, *, auto, dry_run, attested, halt, record, co
         migration = [f"migrate {plan['database']} schema {plan['base']} to {plan['target']} after a verified copy and "
                      "its rehearsal" + (", then db-roles and db-roles --check" if plan["database"] == CALENDAR else "")
                      for plan in plans or ()]
+        # ANYM-743: every added migration with its class and tier, also when the range runs unattended.
         return {"status": "plan", "sha": candidate, "base": base,
-                "steps": migration + (["plan A"] if candidate != base else []) + ["plan B"]}
+                "steps": migration + (["plan A"] if candidate != base else []) + ["plan B"],
+                **({"migrations": classes} if (classes := migration_classes(mirror, since, candidate, sql)) else {})}
     record.update(sha=candidate, base=base, started_at=now(), status="deploying")
     if backup_waited:  # ANYM-744
         record["backup_wait_seconds"] = backup_waited
