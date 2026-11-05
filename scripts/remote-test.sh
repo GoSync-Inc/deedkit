@@ -29,27 +29,35 @@
 # Caps: /Users/Shared/deedkit-ci/caps.conf on the mini (KEY=value lines, defaults below), so they change
 # without a pull request. Worker name: DEEDKIT_REMOTE_WORKER, else the worktree's last two path components.
 #
-# Every wait of a run and its bound, in run order. A phase deadline ends one wait early. The lease (RUN_SECONDS, held
-# by start_watchdog) is the last bound of all a run does once its watchdog runs; a phase before that has only its own.
+# Every wait of a run and its bound, in run order. Kinds: phase = a deadline of its own, shorter than the lease; count =
+# a bounded number of tries, each with its own limit; cumulative = bounded steps in sequence; lease = RUN_SECONDS, held
+# by start_watchdog (TERM, then KILL 10 x STOP_SECONDS later), the last bound of all a run does once its watchdog runs.
 #
-#   Wait                                          Bound                       Kind                    Then
-#   ssh connect; a dead ssh channel (every ssh)   ConnectTimeout 10 s;        phase, before the lease 91, or the step's
-#                                                 ServerAlive 15 s x 4                                own failure
-#   mini queue, retries included (wait_not_busy)  WAIT_SECONDS 1200 s         phase, before the lease 90
-#   a slot holder's note (take_slot)              HOLDER_NOTE_SECONDS 10 s    phase, before the lease 90
-#   a slot holder's exit (take_slot)              SLOT_TAKE_SECONDS 120 s     phase, before the lease 90
-#   laptop copy with no bytes moving              COPY_IO_SECONDS 120 s       phase, before the lease 91
-#   laptop copy as a whole                        COPY_SECONDS 600 s          phase, before the lease 91
-#   an earlier run's leftovers (stop_leftovers)   the stop bound below, each  phase, before the lease its record stays
-#   mini copy, initdb, suite and every other step RUN_SECONDS 7200 s          the lease itself        TERM, KILL 10 x
-#                                                                                                     STOP_SECONDS later
-#   PostgreSQL ready (pg_start)                   60 s                        phase, in the lease     the run fails
-#   stopping a run (finish, stop_recorded)        STOP_SECONDS 30 s, 5 s KILL phase, in the lease     its record stays
-#   the laptop's stop request (here_stop)         20 s                        phase, after the lease  returns
-#   the laptop on `--run`                         the lease; a dead channel   the lease itself        the run's exit
+#   Before the lease: no watchdog exists yet, so each bound is the wait's only one.
+#   ssh connect; a dead ssh channel (every ssh)     ConnectTimeout 10 s; ServerAlive 15 s x 4   phase    91 or the step's failure
+#   mini queue, retries included (wait_not_busy)    WAIT_SECONDS 1200 s, checked between looks  phase    90
+#   a slot holder's note (take_slot)                HOLDER_NOTE_SECONDS 10 s                    phase    90
+#   a slot holder's exit (take_slot)                SLOT_TAKE_SECONDS 120 s                     phase    90
+#   a killed holder or copy going away (reap_jobs)  5 s per job                                 phase    goes on
+#   laptop copy with no bytes moving                COPY_IO_SECONDS 120 s                       phase    91
+#   laptop copy as a whole                          COPY_SECONDS 600 s                          phase    91
+#   an earlier run's leftovers (stop_leftovers)     stop_recorded below, per run directory      cumulative  its record stays
 #
-# Only ssh's dead-channel bound covers a command that hangs on a live mini outside the lease: `docker ps` in the queue
-# check, `df` in the disk guard, `tar` in `--here dist`. No stall has been shown for them, so they have no bound here.
+#   Under the lease:
+#   mini copy, initdb, suite and every other step   RUN_SECONDS 7200 s                          lease    TERM, then KILL
+#   PostgreSQL ready (pg_start)                     60 tries of pg_isready (3 s each) + 1 s     count    the run fails
+#   stop_recorded                                   STOP_SECONDS 30 s, then KILL and 5 s        phase    its record stays
+#   finish: children, then each database, then      STOP_SECONDS + 5 s per job, each step       cumulative  the lease's KILL
+#     stop_recorded
+#
+#   At any time:
+#   the laptop's stop request (here_stop)           20 s                                        phase    returns
+#   the laptop on `--run`                           the phases above, then the lease; a dead    lease    the run's exit
+#                                                   channel ends it sooner
+#
+# No bound of their own: a command that hangs on a live mini outside the lease, where only ssh's dead-channel bound
+# applies (`docker ps` in the queue check, `df` in the disk guard, `tar` in `--here dist`), and the laptop's local
+# staging (`tar` on its own disk). No stall has been shown for them, so none is added.
 set -euo pipefail
 
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
@@ -320,8 +328,8 @@ admit() {
   elif [ "$taken" != 0 ]; then
     reason="all $MAX_RUNS DeedKit slot(s) taken"
   elif [ "$BUSY_CHECK" = 1 ] && reason="$(between_busy)"; then
-    kill "$HOLDER" 2>/dev/null || true
-    wait "$HOLDER" 2>/dev/null || true
+    kill -KILL "$HOLDER" 2>/dev/null || true
+    reap_jobs "$HOLDER"
     HOLDER=""
   else
     return 0
@@ -784,13 +792,13 @@ wait_turn() {
 # The laptop's copy to the mini's stage, in its own process group so nothing of it (its ssh) outlives the copy. rsync's
 # --timeout ends a silent copy: GNU rsync exits 30. openrsync (macOS) only reports it and exits 1 once its ssh ends, and
 # a far end that keeps the channel open never ends it, so COPY_SECONDS bounds the whole copy. Returns rsync's status,
-# or 30 when that deadline ended it.
+# or 30 when that deadline ended it or rsync itself reported a timeout.
 COPY_JOB=""
 copy_to_mini() {
   local stage="$1" worker="$2" end=$((SECONDS + COPY_SECONDS)) status=0
   trap 'if [ -n "$COPY_JOB" ]; then kill -KILL -- "-$COPY_JOB" 2>/dev/null || true; fi; exit 130' INT TERM HUP
   set -m
-  rsync "${RSYNC_COPY[@]}" --timeout="$COPY_IO_SECONDS" -e "ssh ${SSH_OPTS[*]}" "$stage/src/" "$HOST:$SHARED/stage/$worker/" </dev/null &
+  rsync "${RSYNC_COPY[@]}" --timeout="$COPY_IO_SECONDS" -e "ssh ${SSH_OPTS[*]}" "$stage/src/" "$HOST:$SHARED/stage/$worker/" </dev/null 2>"$stage/copy.err" &
   COPY_JOB=$!
   set +m
   while kill -0 "$COPY_JOB" 2>/dev/null; do
@@ -802,6 +810,8 @@ copy_to_mini() {
   reap_jobs "$COPY_JOB"
   COPY_JOB=""
   trap - INT TERM HUP
+  cat "$stage/copy.err" >&2
+  if [ "$status" != 0 ] && grep -Eq 'poll: timeout|io timeout|timeout in data' "$stage/copy.err"; then status=30; fi
   return "$status"
 }
 
