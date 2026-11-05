@@ -943,13 +943,22 @@ def test_discovery_failure_and_queue_saturation_do_not_block_durable_work(tmp_pa
 def test_work_classes_make_actual_progress_across_interrupted_passes(tmp_path,monkeypatch):
     path,_ = fixture(tmp_path)
     original_timeout = asyncio.timeout
-    monkeypatch.setattr('deedkit_recordings.archive.asyncio.timeout',
-                        lambda seconds: original_timeout(0.3 if seconds == 60 else seconds))
+    budgets,served = [],[]  # of the running pass; budgets[0] is the pass's own 60 s budget, the outermost one
+    def controlled(seconds):
+        # Real asyncio.Timeout objects with no deadline: only the vendor below ends one, the wall clock never does.
+        if seconds != 60: return original_timeout(seconds)
+        budgets.append(original_timeout(None))
+        return budgets[-1]
+    monkeypatch.setattr('deedkit_recordings.archive.asyncio.timeout',controlled)
     async def vendor(request):
         if request.url.path.endswith('/conversations'):
             return httpx.Response(200,json=[])
-        await asyncio.sleep(0.16)
-        return httpx.Response(200,json=conversation(request.url.path.rsplit('/',1)[-1]))
+        if served:
+            # The pass's second read is slower than its budget: the budget ends while this read is held.
+            budgets[0].reschedule(asyncio.get_running_loop().time())
+            await asyncio.Event().wait()
+        served.append(request.url.path.rsplit('/',1)[-1])
+        return httpx.Response(200,json=conversation(served[-1]))
     async def run():
         r = runtime(path,vendor); await r.start(background=False)
         account = r.document().accounts[0]
@@ -957,11 +966,14 @@ def test_work_classes_make_actual_progress_across_interrupted_passes(tmp_path,mo
         await r.db('discover',account,items,None,1)
         await r.db('observe',account,'retry',{'id':'retry'},{'summary':('error','','provider_unavailable')},1)
         await r.db('observe',account,'refresh',{'id':'refresh'},{'summary':('pending','',None)},1)
-        for now in (40000,40010,40020): await r.run_once(now=now)
+        for now in (40000,40010,40020):
+            budgets.clear(); served.clear()
+            await r.run_once(now=now)
+            assert len(served) == 1 and r.error == 'provider_timeout'  # one read finished, then the budget cut the pass
         assert (await r.db('record',account,'retry'))['attempted'] > 1
         assert (await r.db('record',account,'refresh'))['attempted'] > 1
         await r.close()
-    asyncio.run(run())
+    asyncio.run(asyncio.wait_for(run(),120))  # only a hang guard: a pass never reaches it
 
 
 # spec: ANYM-651
