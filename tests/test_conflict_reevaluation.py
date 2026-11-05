@@ -768,6 +768,71 @@ def test_a_stored_link_conflict_on_a_message_that_moved_on_stays_open_without_st
 
 
 # spec: ANYM-796
+def test_a_reread_that_completed_the_message_lets_the_runner_close_the_stored_receipt(archive):  # noqa: F811
+    from test_archive import linked, native
+    ar, s, _, _ = archive
+    mid = link_conflict(ar, s)
+    assert ar.ingest(event(provider_id='1', origin='backfill', formatting=native([linked()])))['outcome'] == 'edited'
+    assert conflicts(s)[mid]['resolved_at'] is None
+    assert run(ar, s, None) == 'done'
+    assert conflicts(s)[mid]['resolution'] == 'rule_changed:telegram_link_settled@1'
+    assert len(link_revisions(s, mid)) == 2
+    assert progress(s)['telegram_link_completed']['last_error'] is None and progress(s)['telegram_link_settled']['last_error'] is None
+
+
+# spec: ANYM-796
+def test_more_than_a_batch_of_equal_receipts_are_closed_and_another_url_stays_open(archive):  # noqa: F811
+    from test_archive import LINK, linked, native
+    ar, s, _, _ = archive
+    old = n1_archive(s)
+    mid = old.ingest(event(provider_id='1', formatting=native([], [LINK])))['message']
+    other = native([linked(url='https://example.invalid/other')])
+    for n in range(cr.BATCH + 1):
+        assert old.ingest(event(provider_id='1', chat_title=f'Заголовок {n}', origin='reconcile', formatting=native([linked()])))['outcome'] == 'conflict'
+    assert old.ingest(event(provider_id='1', origin='backfill', formatting=other))['outcome'] == 'conflict'
+    assert run(ar, s, None) == 'done'
+    with s.pool.connection() as c:
+        rows = c.execute('''SELECT r.envelope->'formatting' AS formatting,mc.resolved_at FROM message_conflicts mc
+            JOIN ingest_receipts r ON r.digest=mc.receipt_digest WHERE mc.message=%s''', (mid,)).fetchall()
+    assert len(link_revisions(s, mid)) == 2 and sum(r['resolved_at'] is not None for r in rows) == cr.BATCH + 1
+    assert [r['resolved_at'] for r in rows if r['formatting'] == other] == [None]
+    assert progress(s)['telegram_link_settled']['last_error'] is None
+
+
+# spec: ANYM-796
+@pytest.mark.parametrize('change', ['version', 'policy'])
+def test_state_that_moved_after_the_evaluation_sends_the_row_back_and_later_rows_still_run(archive, monkeypatch, change):  # noqa: F811
+    from test_archive import LINK, linked, native
+    ar, s, _, _ = archive
+    ar.register('archive-test', 'telegram', 'Synthetic archive', include_chats=['100', '200'])
+    old = n1_archive(s)
+    moved = old.ingest(event(provider_id='1', chat='200', formatting=native([], [LINK])))['message']
+    assert old.ingest(event(provider_id='1', chat='200', origin='reconcile', formatting=native([linked()])))['outcome'] == 'conflict'
+    later = link_conflict(ar, s, '2')
+    original, done = Runner._evaluate, []
+
+    def evaluate(self, job, rows):
+        result = original(self, job, rows)
+        if job.name == 'telegram_link_completed' and not done:
+            done.append(True)
+            if change == 'policy':
+                ar.register('archive-test', 'telegram', 'Synthetic archive', include_chats=['100'])
+            else:
+                # A later capture with unknown formatting advances the version and leaves the conflict open.
+                unknown = {'version': 1, 'state': 'unknown', 'basis': None, 'wire_sha256': None, 'entities': None,
+                           'unsupported_entities': [], 'warnings': ['native_entities_not_captured']}
+                assert ar.ingest(event(provider_id='1', chat='200', origin='live', updated_at='2026-10-01T12:00:01+00:00',
+                                       formatting=unknown))['outcome'] == 'unchanged'
+        return result
+    monkeypatch.setattr(Runner, '_evaluate', evaluate)
+    assert run(ar, s, None) == 'done'
+    rows = conflicts(s)
+    assert done and rows[moved]['resolved_at'] is None and len(link_revisions(s, moved)) == 1
+    assert rows[later]['resolved_revision'] == 2
+    assert progress(s)['telegram_link_completed']['last_error'] is None
+
+
+# spec: ANYM-796
 def test_two_link_receipts_of_one_message_in_one_batch_complete_it_once_and_later_rows_still_run(archive):  # noqa: F811
     from test_archive import linked, native
     ar, s, _, _ = archive

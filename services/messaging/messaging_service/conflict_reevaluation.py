@@ -39,7 +39,7 @@ EVALUATION_TIMEOUT = 10
 TICK = 1
 KINDS = ('classify', 'resolve', 'accept')
 # What ingest's own resolves record from schema 57; NULL is unknown (legacy, or resolved by an N-1 writer).
-RESOLUTIONS = ('newer_observation', 'sender_completed', 'link_completed')
+RESOLUTIONS = ('newer_observation', 'sender_completed')
 # A resolve or accept job selects open rows by stored class; `unclassified` names no rule's evidence.
 CLASSES = tuple(sorted(name for name in EXPLANATIONS if name != UNCLASSIFIED))
 NAME = re.compile(r'[a-z][a-z0-9_]{0,47}')
@@ -67,7 +67,7 @@ def resolution_set(c, value):
 class Job:
     """`function(row)` gets a read-only mapping of one row's stored evidence (`envelope`: the receipt envelope,
     `observed`: the observed revision's snapshot, `observed_revision`, `candidate_updated_at`, `reason`,
-    `archive_version`: the message's provider version now, `archive_revision`: its revision now, `collected`: the account's policy still collects its chat, `tombstoned`: a provider tombstone names it,
+    `archive_version`: the message's provider version now, `archive_revision`: its revision now, `archive_snapshot`: that revision's snapshot when it is not the observed one, `collected`: the account's policy still collects its chat, `tombstoned`: a provider tombstone names it,
     `reconstructed`: migration 017 chose `observed_revision` by transaction times on a message with more revisions) and returns
     a class name (`classify`), 'keep' or 'resolve' (`resolve`), or None or a candidate envelope the current rule
     accepts as a new revision (`accept`). `classes` are fnmatch patterns over ANYM-557's classes."""
@@ -147,7 +147,7 @@ def still_raised(row):
 
 def _decide(job, row):
     evidence = MappingProxyType({key: deepcopy(row[key]) for key in
-        ('envelope', 'observed', 'observed_revision', 'candidate_updated_at', 'reason', 'archive_version', 'archive_revision', 'collected', 'tombstoned', 'reconstructed')})
+        ('envelope', 'observed', 'observed_revision', 'candidate_updated_at', 'reason', 'archive_version', 'archive_revision', 'archive_snapshot', 'collected', 'tombstoned', 'reconstructed')})
     try: result = job.function(evidence)
     except Exception: raise Failed('evaluation_error') from None
     if job.kind == 'classify' and isinstance(result, str) and result in EXPLANATIONS: return result
@@ -162,16 +162,21 @@ STALLED = {'classify': UNCLASSIFIED, 'resolve': 'keep', 'accept': None}
 SCOPE = '''FROM message_conflicts mc JOIN messages m ON m.id=mc.message
     WHERE m.account=%(account)s AND mc.resolved_at IS NULL AND {selector}
     AND (%(at)s::timestamptz IS NULL OR (mc.observed_at,mc.receipt_digest)>(%(at)s::timestamptz,%(digest)s::text))'''
-CANDIDATES = '''SELECT mc.receipt_digest AS digest,mc.message,mc.observed_at,mc.observed_revision,mc.reason,
-    mc.candidate_updated_at,r.envelope,v.snapshot AS observed,m.provider_updated_at AS archive_version,m.revision AS archive_revision,
+# What a decision rests on besides the row itself: `_accept` reads it again under its locks.
+STATE = '''m.provider_updated_at AS archive_version,m.revision AS archive_revision,
     EXISTS(SELECT 1 FROM account_policies p JOIN chats ch ON ch.id=m.chat WHERE p.account=m.account AND p.enabled
         AND NOT ch.provider_chat=ANY(p.exclude_chats) AND (p.discover_chats OR ch.provider_chat=ANY(p.include_chats))) AS collected,
-    (r.digest IS NULL OR mc.observed_at<=r.received_at) AND m.revision<>1 AS reconstructed,
     EXISTS(SELECT 1 FROM provider_tombstones t WHERE t.account=m.account AND t.provider_id=m.provider_id
-        AND t.provider_chat IN ((SELECT provider_chat FROM chats WHERE id=m.chat),'')) AS tombstoned
+        AND t.provider_chat IN ((SELECT provider_chat FROM chats WHERE id=m.chat),'')) AS tombstoned'''
+STATE_KEYS = ('archive_version', 'archive_revision', 'collected', 'tombstoned')
+CANDIDATES = '''SELECT mc.receipt_digest AS digest,mc.message,mc.observed_at,mc.observed_revision,mc.reason,
+    mc.candidate_updated_at,r.envelope,v.snapshot AS observed,'''+STATE+''',
+    CASE WHEN m.revision<>mc.observed_revision THEN a.snapshot END AS archive_snapshot,
+    (r.digest IS NULL OR mc.observed_at<=r.received_at) AND m.revision<>1 AS reconstructed
     FROM message_conflicts mc JOIN messages m ON m.id=mc.message
     LEFT JOIN ingest_receipts r ON r.digest=mc.receipt_digest
     LEFT JOIN message_revisions v ON v.message=mc.message AND v.revision=mc.observed_revision
+    LEFT JOIN message_revisions a ON a.message=mc.message AND a.revision=m.revision
     WHERE m.account=%(account)s AND mc.resolved_at IS NULL AND {selector}
     AND (%(at)s::timestamptz IS NULL OR (mc.observed_at,mc.receipt_digest)>(%(at)s::timestamptz,%(digest)s::text))
     ORDER BY mc.observed_at,mc.receipt_digest LIMIT %(limit)s'''
@@ -389,9 +394,10 @@ class Runner:
                     AND reason=%s AND reason=ANY(%s) AND observed_revision=%s FOR UPDATE NOWAIT''',
                     (row['digest'], row['reason'], list(job.classes), row['observed_revision'])).fetchone()
                 if candidate is not None and open_row:
-                    # The decision was made on the revision the evaluation read; an earlier row of this batch or an
-                    # ingest may have moved the message since: read again from the last committed row (ANYM-796).
-                    if c.execute('SELECT revision FROM messages WHERE id=%s', (row['message'],)).fetchone()['revision'] != row['archive_revision']: return True
+                    # The decision rests on the state the evaluation read; an earlier row of this batch or an ingest
+                    # may have moved it since: read again from the last committed row (ANYM-796).
+                    state = c.execute('SELECT '+STATE+' FROM messages m WHERE m.id=%s', (row['message'],)).fetchone()
+                    if any(state[key] != row[key] for key in STATE_KEYS): return True
                     if (candidate.get('account') != self.account or not isinstance(candidate.get('chat'), str)
                             or stable_id('msg', self.account, candidate['chat'], str(candidate.get('provider_id'))) != row['message']):
                         raise Failed('invalid_result')
@@ -458,7 +464,26 @@ def telegram_link_completed(row):
         return None
 
 
+def telegram_link_settled(row):
+    """ANYM-796: 'resolve' when the message's revision now is this receipt's completion, reached through another
+    receipt of the same observation (a receipt digest includes its origin), else 'keep'. Unreadable evidence: 'keep'."""
+    from .archive import telegram_link_completion
+    from .conflict_classes import SNAPSHOT_FIELDS
+    from .envelope import fingerprint, validate
+    try:
+        current = row['archive_snapshot']
+        if current is None or row['tombstoned'] or row['reconstructed'] or row['archive_version'] != row['candidate_updated_at']:
+            return 'keep'
+        candidate = validate(row['envelope'])
+        retained = validate({**{k: v for k, v in current.items() if k not in SNAPSHOT_FIELDS}, 'chat': current['provider_chat']})
+        same = retained['formatting'] == candidate['formatting'] and fingerprint(retained) == fingerprint(candidate)
+        return 'resolve' if same and telegram_link_completion(row['observed'], candidate) else 'keep'
+    except Exception:
+        return 'keep'
+
+
 register(Job('telegram_link_completed', 1, 'accept', telegram_link_completed, classes=('telegram_other_equal_version',)))
+register(Job('telegram_link_settled', 1, 'resolve', telegram_link_settled, classes=('telegram_other_equal_version',)))
 
 
 def start(archive, account, lease):

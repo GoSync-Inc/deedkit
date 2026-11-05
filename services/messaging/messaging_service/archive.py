@@ -136,12 +136,6 @@ def telegram_link_completion(retained,candidate):
         return False
 
 
-def same_link_completion(envelope,content,formatting):
-    """Whether a stored receipt states this completed observation: its content and its formatting. Unreadable: no."""
-    try:return envelope.get('formatting')==formatting and fingerprint(validate(envelope))==content
-    except (KeyError,TypeError,ValueError,AttributeError):return False
-
-
 def whatsapp_unreadable_shape(e):
     """A WhatsApp observation that could not be read: kind `unknown`, no text, no attachment."""
     return (e['platform']=='whatsapp' and e.get('metadata',{}).get('message_kind')=='unknown'
@@ -530,17 +524,6 @@ class Archive:
                     if equivalent:c.execute('''UPDATE message_conflicts SET resolved_at=clock_timestamp(),'''+resolution_set(c,'sender_completed')+'''
                         resolved_revision=%s WHERE message=%s AND receipt_digest=ANY(%s) AND resolved_at IS NULL''',
                         (revision,mid,equivalent))
-                if link_completed and outcome=='edited':
-                    # The same completed observation under another origin, raised before this rule, no longer
-                    # contradicts anything; left open, its replay would be refused and stop the accept job.
-                    candidates=c.execute('''SELECT mc.receipt_digest,r.envelope FROM message_conflicts mc
-                        JOIN ingest_receipts r ON r.digest=mc.receipt_digest
-                        WHERE mc.message=%s AND mc.resolved_at IS NULL AND mc.candidate_updated_at=%s
-                        AND r.envelope->'formatting'=%s::jsonb''',(mid,updated,Jsonb(e['formatting']))).fetchall()
-                    same=[r['receipt_digest'] for r in candidates if same_link_completion(r['envelope'],content,e['formatting'])]
-                    if same:c.execute('''UPDATE message_conflicts SET resolved_at=clock_timestamp(),'''+resolution_set(c,'link_completed')+'''
-                        resolved_revision=%s WHERE message=%s AND receipt_digest=ANY(%s) AND resolved_at IS NULL''',
-                        (revision,mid,same))
             c.execute("""UPDATE source_status SET last_ingest_at=clock_timestamp(),status='receiving',
                 detail_code=CASE WHEN detail_code='version_conflict' THEN detail_code ELSE %s END WHERE account=%s""",
                       ('version_conflict' if outcome=='conflict' else 'coverage_not_reconciled',aid))

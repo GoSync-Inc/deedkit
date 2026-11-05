@@ -199,19 +199,6 @@ def test_a_reread_with_the_link_url_completes_a_partial_telegram_revision(archiv
 
 
 # spec: ANYM-796
-def test_a_completion_closes_an_open_conflict_of_the_same_completed_observation(archive):
-    from test_conflict_reevaluation import n1_archive
-    ar,s,_,_=archive
-    old=n1_archive(s)
-    mid=old.ingest(event(formatting=native([],[LINK])))['message']
-    assert old.ingest(event(origin='reconcile',formatting=native([linked()])))['outcome']=='conflict'
-    assert ar.ingest(event(origin='backfill',formatting=native([linked()])))['outcome']=='edited'
-    with s.pool.connection() as c:
-        row=c.execute('SELECT resolved_at,resolved_revision,resolution FROM message_conflicts WHERE message=%s',(mid,)).fetchone()
-    assert row['resolved_at'] is not None and row['resolved_revision']==2 and row['resolution']=='link_completed'
-
-
-# spec: ANYM-796
 @pytest.mark.parametrize('retained,candidate',[
     (native([],[LINK]),native([])),  # only removes the span: evidence would be lost
     (native([],[LINK]),native([linked(offset=7)])),
@@ -263,25 +250,6 @@ def test_a_completion_keeps_the_retained_keyboard(archive,candidate):
         snapshot=c.execute('SELECT snapshot FROM message_revisions WHERE message=%s AND revision=2',(mid,)).fetchone()['snapshot']
         current=c.execute('SELECT metadata FROM message_metadata WHERE message=%s',(mid,)).fetchone()['metadata']
     assert snapshot['metadata']['buttons']==KEYBOARD_A and current['buttons']==KEYBOARD_A
-
-
-# spec: ANYM-796
-def test_a_completion_closes_more_than_a_hundred_equal_rows_past_other_formattings(archive):
-    from test_conflict_reevaluation import n1_archive
-    ar,s,_,_=archive
-    old=n1_archive(s)
-    mid=old.ingest(event(formatting=native([],[LINK])))['message']
-    other=native([linked(url='https://example.invalid/other')])
-    for n in range(101):
-        assert old.ingest(event(chat_title=f'Заголовок {n}',origin='reconcile',formatting=other))['outcome']=='conflict'
-    for n in range(101):
-        assert old.ingest(event(chat_title=f'Заголовок {n}',origin='reconcile',formatting=native([linked()])))['outcome']=='conflict'
-    assert ar.ingest(event(origin='backfill',formatting=native([linked()])))['outcome']=='edited'
-    with s.pool.connection() as c:
-        rows=c.execute('''SELECT r.envelope->'formatting' AS formatting,mc.resolved_at FROM message_conflicts mc
-            JOIN ingest_receipts r ON r.digest=mc.receipt_digest WHERE mc.message=%s''',(mid,)).fetchall()
-    assert sum(r['resolved_at'] is not None for r in rows)==101
-    assert all(r['resolved_at'] is None for r in rows if r['formatting']==other)
 
 
 # spec: ANYM-796
