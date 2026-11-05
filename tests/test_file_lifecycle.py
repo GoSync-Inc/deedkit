@@ -1,5 +1,11 @@
 """Synthetic original residency, crash replay and bounded rehydration contracts."""
 from importlib import import_module
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
 
 import pytest
 
@@ -276,6 +282,110 @@ def test_journal_replays_crash_after_unlink_without_losing_derivatives(archive,m
         assert api.is_managed_evicted(c,blob.digest,blob.bytes)
         assert c.execute('SELECT state FROM attachment_text WHERE attachment=%s',(fid,)).fetchone()['state']=='ready'
     assert worker.run_once(apply=True)['evicted']==0
+
+
+# A pass that Compose kills after the stop grace runs no `finally`, rollback or exit handler, so
+# these die by a real SIGKILL at the boundary, in a process of their own.
+LIFECYCLE_KILL=r'''
+import json,os,signal,sys
+from pathlib import Path
+from messaging_service import file_lifecycle as api
+from messaging_service.store import Store
+from test_file_lifecycle import die_after_sql
+spec=json.loads(os.environ['KILL_SPEC'])
+def die(*_,**__):os.kill(os.getpid(),signal.SIGKILL)
+def then_die(function):
+    def wrapped(*args,**kwargs):
+        function(*args,**kwargs);die()
+    return wrapped
+store=Store(spec['dsn'],Path(spec['files']),'http://localhost')
+worker=api.LifecycleWorker(store)
+boundary=spec['boundary']
+if boundary=='inspected':worker._verified=die
+elif boundary=='prepare_uncommitted':worker.store=die_after_sql(store,"SET state='evicting'",die)
+elif boundary=='prepared':worker._complete=die
+elif boundary=='unlinked_unsynced':api.os.fsync=die
+elif boundary=='unlinked':worker._mark_evicted=die
+elif boundary=='marked_uncommitted':worker._mark_evicted=then_die(worker._mark_evicted)
+elif boundary=='committed':worker._complete=then_die(worker._complete)
+else:raise SystemExit('unknown boundary')
+worker.run_once(apply=True)
+raise SystemExit('the pass ended without reaching its boundary')
+'''
+
+
+def die_after_sql(store,fragment,die):
+    """`store` whose connections call `die` right after a statement holding `fragment` ran, its transaction still open."""
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    class Connection:
+        def __init__(self,inner):self.inner=inner
+        def __getattr__(self,name):return getattr(self.inner,name)
+        def execute(self,query,*args,**kwargs):
+            result=self.inner.execute(query,*args,**kwargs)
+            if fragment in str(query):die()
+            return result
+    @contextmanager
+    def connection():
+        with store.pool.connection() as inner:yield Connection(inner)
+    return SimpleNamespace(pool=SimpleNamespace(connection=connection,conninfo=store.pool.conninfo),files=store.files)
+
+
+def killed(code,s,boundary,**fields):
+    """Run `code` in a process of its own until it SIGKILLs itself at `boundary`."""
+    spec={'dsn':s.pool.conninfo,'files':str(s.files),'boundary':boundary,**fields}
+    result=subprocess.run([sys.executable,'-c',code],capture_output=True,timeout=120,
+        env={**os.environ,'KILL_SPEC':json.dumps(spec),'PYTHONPATH':os.pathsep.join(filter(None,(str(Path(__file__).parent),os.environ.get('PYTHONPATH'))))})
+    assert result.returncode==-signal.SIGKILL,result.stderr.decode(errors='replace')[-2000:]
+
+
+def eviction_state(s,digest):
+    with s.pool.connection() as c:
+        residency=c.execute('SELECT state FROM attachment_residency WHERE digest=%s',(digest,)).fetchone()['state']
+        journal=[row['state'] for row in c.execute('SELECT state FROM attachment_eviction_journal WHERE digest=%s ORDER BY created_at,id',(digest,))]
+    return residency,journal,(s.files/digest).exists()
+
+
+# spec: ANYM-525
+@pytest.mark.parametrize('boundary,after_kill,evicted',[
+    ('inspected',('resident',[],True),1),
+    ('prepare_uncommitted',('resident',[],True),1),
+    ('prepared',('evicting',['prepared'],True),1),
+    ('unlinked_unsynced',('evicting',['prepared'],False),1),
+    ('unlinked',('evicting',['prepared'],False),1),
+    ('marked_uncommitted',('evicting',['prepared'],False),1),
+    ('committed',('evicted',['completed'],False),0)])
+def test_a_killed_lifecycle_pass_is_finished_by_the_next_one_at_every_boundary(archive,boundary,after_kill,evicted):
+    _,s,_,_=archive;fid,blob=processed(archive);api=lifecycle();worker=api.LifecycleWorker(s)
+    killed(LIFECYCLE_KILL,s,boundary)
+    assert eviction_state(s,blob.digest)==after_kill
+    if after_kill[0]=='evicting':
+        # A dry-run restart only reports the intent, and a backup still waits for it.
+        before=eviction_state(s,blob.digest)
+        assert worker.run_once()['reasons'].get('pending_replay')==1 and eviction_state(s,blob.digest)==before
+        with s.pool.connection() as c:
+            with pytest.raises(ValueError,match='backup_eviction_pending'):api.begin_backup_fence(c,'synthetic-racing-backup')
+    assert worker.run_once(apply=True)['evicted']==evicted
+    # One intent, one unlink: nothing was prepared or removed twice, and the derivatives stay.
+    assert eviction_state(s,blob.digest)==('evicted',['completed'],False)
+    with s.pool.connection() as c:
+        assert api.is_managed_evicted(c,blob.digest,blob.bytes)
+        assert c.execute('SELECT state FROM attachment_text WHERE attachment=%s',(fid,)).fetchone()['state']=='ready'
+    assert worker.run_once(apply=True)['evicted']==0 and eviction_state(s,blob.digest)==('evicted',['completed'],False)
+
+
+# spec: ANYM-525
+def test_an_original_requested_again_after_a_killed_unlink_stays_resident(archive):
+    _,s,_,_=archive;_,blob=processed(archive);api=lifecycle();worker=api.LifecycleWorker(s)
+    killed(LIFECYCLE_KILL,s,'unlinked')
+    assert not (s.files/blob.digest).exists()
+    # The replay decides again under the lock: it never unlinks what became wanted meanwhile.
+    (s.files/blob.digest).write_bytes(b'Synthetic retained contract')
+    with s.pool.connection() as c:api.touch_original(c,blob.digest,blob.bytes)
+    report=worker.run_once(apply=True)
+    assert report['evicted']==0 and report['reasons']=={'recently_requested':1}
+    assert eviction_state(s,blob.digest)==('resident',['cancelled'],True)
+    with s.pool.connection() as c:assert not api.is_managed_evicted(c,blob.digest,blob.bytes)
 
 
 def test_recent_touch_between_prepare_and_unlink_cancels_eviction(archive,monkeypatch):

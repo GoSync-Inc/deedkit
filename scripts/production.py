@@ -2212,6 +2212,60 @@ def pinned_images(keep, states):
                 keep(image, f"named in {path}")
 
 
+def configured_runner(settings):
+    """The runner.json `migration.unattended.runner_config` names, or None when none is named. Read on its own: a setting
+    of the migration section that keeps a release from running unattended says nothing about this file's pin."""
+    section = settings.get("migration")
+    found = section.get("unattended") if isinstance(section, dict) else None
+    named = found.get("runner_config") if isinstance(found, dict) else None
+    if named is not None and not (isinstance(named, str) and Path(named).is_absolute()):
+        raise Refused("migration.unattended.runner_config is not an absolute path; no image is removed")
+    return Path(named) if named is not None else None
+
+
+def pinned_id(path, pinned):
+    """The image ID a runner configuration's `image` names now: its own value, or what a tag or reference resolves to.
+    None only when Docker says no such image: nothing on this host is left to protect. A lookup that failed otherwise says
+    nothing about the image, so it refuses."""
+    image = pinned.get("image") if isinstance(pinned, dict) else None
+    if not isinstance(image, str):
+        raise Refused(f"{path} names no backup image; no image is removed")
+    if IMAGE_DIGEST.fullmatch(image):
+        return image
+    try:
+        found = run(["docker", "image", "inspect", "--format", "{{.Id}}", image], timeout=60, reason=True).strip()
+    except Refused as exc:
+        if "no such image" in str(exc).lower():
+            return None
+        raise Refused(f"the image {path} pins could not be looked up; no image is removed") from exc
+    if not IMAGE_DIGEST.fullmatch(found):
+        raise Refused(f"the image {path} pins has no immutable ID; no image is removed")
+    return found
+
+
+def runner_pins(settings, keep):
+    """The image each backup runner's own configuration pins, and those its `.before-*` copies name, the undo of a move
+    (ANYM-525). Nothing else protects them once a project deploys the `backup` target and no backup container exists between
+    two runs, so a pin that cannot be read refuses before any removal. Every copy counts: `cp -p` keeps an old time, so no
+    time tells the last move, and an operator deletes a copy to let its image go. A host without the runner and without a
+    runner.json runs no backup and has no pin to read; each profile's runner.json is optional, as `deploy` reads them."""
+    configured = configured_runner(settings)
+    if configured is not None and not present(configured):
+        raise Refused(f"cannot read the configured {configured}; no image is removed")
+    paths = [path for path in dict.fromkeys(item for item in (configured, *RUNNER_CONFIGS) if item is not None) if present(path)]
+    if present(BACKUP_RUNNER) and not paths:
+        raise Refused(f"the backup runner {BACKUP_RUNNER} is installed and no runner.json names its image; no image is removed")
+    for path in paths:
+        image = pinned_id(path, load(path))
+        if image is None:
+            raise Refused(f"the image {path} pins cannot be resolved; no image is removed")
+        keep(image, f"pinned by {path}")
+        for entry in directory_entries(path.parent):
+            if entry.name.startswith(path.name + ".before-") and present(entry):
+                # A copy whose reference resolves to nothing has no image left: its undo is lost either way.
+                keep(pinned_id(entry, load(entry)), f"pinned by the undo copy {entry}")
+
+
 def release_name(name):
     """The CI-published target of a `deedkit-production-<target>:<tag>` name, or None."""
     repository = name.rpartition(":")[0]
@@ -2237,6 +2291,7 @@ def images_report(settings, *, held=(), stack=None):
             idle = directory.resolve() in held or free_lock(directory, probes)
             state_images(directory, keep, revisions, label="" if directory == state else f" of {directory}", idle=idle)
     pinned_images(keep, states)
+    runner_pins(settings, keep)
     containers = run(["docker", "ps", "--all", "--quiet", "--no-trunc"]).split()
     for value in json.loads(run(["docker", "inspect", *containers])) if containers else []:
         keep(value["Image"], "used by container " + value["Id"][:12])
@@ -2255,7 +2310,6 @@ def images_report(settings, *, held=(), stack=None):
             if name.rpartition(":")[2] in revisions:
                 keep(image, revisions[name.rpartition(":")[2]])
         if targets - deployed:
-            # The backup runner, for one, pins its image in its own configuration.
             keep(image, "target " + ", ".join(sorted(targets - deployed)) + " is not deployed by this configuration")
         if image in other:
             keep(image, "also named " + ", ".join(sorted(other[image])))
@@ -5586,6 +5640,10 @@ def http_release_tool():
     return seamless_release
 
 
+# `status` holds the deploy lock: one docker read of its service list, and all of them together, end by these seconds.
+STATUS_READ, STATUS_BUDGET = 30, 60
+
+
 def http_failed_attempts(path):
     """`status`: plan B attempts whose candidate failed to start, each with whether the tool stopped it (ANYM-757:
     `candidate_stopped`, absent on attempts before it). Nothing without plan B; a read failure is named, never raised."""
@@ -5598,6 +5656,44 @@ def http_failed_attempts(path):
                 for sha, value in attempts if value.get("status") == "startup-failed"]
     except (OSError, ValueError, KeyError, TypeError, AttributeError, Refused) as exc:
         return {"error": type(exc).__name__}
+
+
+def project_services(settings, current):
+    """`status` (ANYM-525): each selected service of each configured project with its container's state and revision
+    label; `mark` names one not running, on another revision than `current` (an applied release only: after a rollback
+    current.json names the release that was left) or unreadable. Selected fields only, never a container's environment;
+    a read failure is named, never raised."""
+    expected, found = current.get("sha") if current.get("status") == "applied" else None, []
+    until = time.monotonic() + STATUS_BUDGET
+    def docker_read(argv):
+        if (left := until - time.monotonic()) <= 0:
+            raise TimeoutError("status budget")
+        return run(argv, timeout=min(STATUS_READ, left))
+    for project in settings.get("projects") or []:
+        for service in project["services"]:
+            item = {"project": project["name"], "service": service}
+            try:
+                ids = docker_read(["docker", "ps", "--all", "--filter", "label=com.docker.compose.oneoff=False",
+                                   "--filter", "label=com.docker.compose.project=" + project["name"],
+                                   "--filter", "label=com.docker.compose.service=" + service,
+                                   "--format", "{{.ID}}"]).split()
+                if len(ids) > 1:
+                    item.update(state=f"{len(ids)} containers", revision=None, mark="unknown")
+                elif not ids:
+                    item.update(state="no container", revision=None, mark="not running")
+                else:
+                    state, _, revision = docker_read(["docker", "inspect", "--format",
+                                                      '{{.State.Status}} {{index .Config.Labels '
+                                                      '"org.opencontainers.image.revision"}}', ids[0]]).strip().partition(" ")
+                    item.update(state=state, revision=revision or None)
+                    if state != "running":
+                        item["mark"] = "not running"
+                    elif expected and revision != expected:
+                        item["mark"] = "differs from current.json"
+            except Exception as exc:
+                item.update(mark="unknown", error=type(exc).__name__)
+            found.append(item)
+    return found
 
 
 def active_config():
@@ -7036,6 +7132,8 @@ def locked_action(args):
                 result["autodeploy_halt"] = halt_summary(pause)
             if failed := http_failed_attempts(args.http_config):
                 result["http_failed_attempts"] = failed
+            if services := project_services(settings, result):
+                result["project_services"] = services
             if warnings := disk_warnings():
                 result["disk_warnings"] = warnings
         elif args.action == "images":

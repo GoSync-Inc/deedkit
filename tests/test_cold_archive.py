@@ -4,6 +4,7 @@ The receiver side is the real `backup_r2_receiver.cold_serve` in a child
 process, reached through the producer's own SSH transport code. No credentials,
 network, provider sessions or real data are used.
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -11,12 +12,13 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 
 import pytest
 
 from messaging_service.media_retry import MEDIA_MAX_ATTEMPTS
 from test_archive import archive as archive  # noqa: F401  (fixture)
-from test_file_lifecycle import processed, stored
+from test_file_lifecycle import killed, processed, stored
 
 STUB=r'''
 import hashlib,io,json,sys
@@ -118,13 +120,17 @@ class StubTransport:
                           'known_hosts_file':'/synthetic/known_hosts'},60)
 
 
+def receiver_config(tmp_path):
+    return {'prefix':'synthetic-owner/v1','bucket':'synthetic-backups','state_directory':str(tmp_path/'receiver-state'),
+            'part_bytes':5*1024**2,'cold_max_bytes':64*1024**2}
+
+
 @pytest.fixture
 def env(archive,keys,tmp_path):
     _,s,_,_=archive
     state=tmp_path/'receiver-state';state.mkdir(mode=0o700)
     cloud=tmp_path/'cloud';cloud.mkdir()
-    receiver={'prefix':'synthetic-owner/v1','bucket':'synthetic-backups','state_directory':str(state),
-              'part_bytes':5*1024**2,'cold_max_bytes':64*1024**2}
+    receiver=receiver_config(tmp_path)
     identity=tmp_path/'cold-identity';shutil.copyfile(keys['cold'][0],identity);identity.chmod(0o600)
     config={'v':1,'transfer':{'host':'receiver.invalid','user':'cold','identity_file':'/synthetic/key',
                               'known_hosts_file':'/synthetic/known_hosts'},
@@ -318,6 +324,164 @@ def test_crash_points_and_shared_digest(env,archive,monkeypatch):
     puts=calls(cloud).count('put_object')
     assert archiver().run_once(apply=True)['archived']==1
     assert calls(cloud).count('put_object')==puts and copy(s,second.digest)['state']=='verified'
+
+
+# The workers' side of a real SIGKILL (test_file_lifecycle.killed); the receiver process outlives it, as the
+# forced command outlives a killed ssh client until it reads the end of the stream.
+COLD_KILL=r'''
+import json,os,signal,sys
+from pathlib import Path
+from messaging_service import blobs,cold_archive as api,file_lifecycle
+from messaging_service.store import Store
+from test_cold_archive import StubTransport
+from test_file_lifecycle import die_after_sql
+spec=json.loads(os.environ['KILL_SPEC'])
+def die(*_,**__):os.kill(os.getpid(),signal.SIGKILL)
+def then_die(function):
+    def wrapped(*args,**kwargs):
+        function(*args,**kwargs);die()
+    return wrapped
+store=Store(spec['dsn'],Path(spec['files']),'http://localhost')
+boundary=spec['boundary']
+if boundary=='presence':
+    assert api.WorkerPresence(store.pool.conninfo).acquire();die()
+config=api.load_config(spec['config'])
+transport=StubTransport(spec['receiver'],spec['cloud'])
+if boundary.startswith('restore_'):
+    worker=api.ColdRestorer(store,config,transport,reserve_bytes=0)
+    if boundary=='restore_admit_uncommitted':worker._admit=then_die(worker._admit)
+    elif boundary=='restore_admitted':worker._fetch=die
+    elif boundary=='restore_writing':
+        push=blobs.BlobSink.push
+        def written(sink,chunk):
+            push(sink,chunk);sink.out.flush();die()
+        blobs.BlobSink.push=written
+    elif boundary=='restore_synced':blobs.os.link=die
+    elif boundary=='restore_linked':blobs.fsync_dir=die
+    elif boundary=='restore_published':worker._fetch=then_die(worker._fetch)
+    elif boundary=='restore_register_uncommitted':file_lifecycle.register_resident_original=then_die(file_lifecycle.register_resident_original)
+    elif boundary=='restore_committed':worker._restore_one=then_die(worker._restore_one)
+    else:raise SystemExit('unknown boundary')
+    worker.run_once()
+else:
+    worker=api.ColdArchiver(store,config,transport)
+    record=worker._record
+    def recording(state,*,kill_after):
+        def wrapped(digest,size,**fields):
+            if fields['state']!=state:return record(digest,size,**fields)
+            if not kill_after:die()
+            record(digest,size,**fields);die()
+        return wrapped
+    if boundary=='before_pending':worker._record=recording('pending',kill_after=False)
+    elif boundary=='pending_uncommitted':worker.store=die_after_sql(store,"state='pending',object_key",die)
+    elif boundary=='pending_committed':worker._record=recording('pending',kill_after=True)
+    elif boundary=='verified_uncommitted':worker.store=die_after_sql(store,"state='verified',object_key",die)
+    elif boundary=='footer_sent':
+        # The stream's end is out and no answer was read: the receiver's completion is still outstanding.
+        spawn=transport._spawn
+        class Input:
+            def __init__(self,inner):self.inner=inner
+            def __getattr__(self,name):return getattr(self.inner,name)
+            def close(self):
+                self.inner.close();die()
+        def spawned():
+            process=spawn();process.stdin=Input(process.stdin);return process
+        transport._spawn=spawned
+    elif boundary=='footer_answered':
+        response=api._response;seen=[]
+        def second(raw):
+            seen.append(raw)
+            if len(seen)==2:die()
+            return response(raw)
+        api._response=second
+    elif boundary=='stored':worker.verify=die
+    elif boundary=='reading_back':api.identity_descriptor=die
+    elif boundary=='read_back':worker.verify=then_die(worker.verify)
+    elif boundary=='verified_committed':worker._record=recording('verified',kill_after=True)
+    elif boundary=='streaming':
+        encrypt=worker._encrypt
+        def partly(digest,size):
+            sent=0
+            for chunk in encrypt(digest,size):
+                yield chunk
+                sent+=len(chunk)
+                if sent>spec['stream_bytes']:die()
+        worker._encrypt=partly
+    else:raise SystemExit('unknown boundary')
+    worker.run_once(apply=True)
+raise SystemExit('the pass ended without reaching its boundary')
+'''
+
+
+def killed_worker(env,archive,tmp_path,boundary,**fields):
+    s=archive[1]
+    killed(COLD_KILL,s,boundary,config=str(tmp_path/'cold-archive.json'),receiver=receiver_config(tmp_path),
+           cloud=str(env[1]),**fields)
+
+
+def receiver_settled(tmp_path):
+    """The killed client's receiver has finished: it holds the cold lock until then."""
+    lock=tmp_path/'receiver-state'/'cold'/'.cold.lock'
+    deadline=time.monotonic()+60
+    while lock.exists():
+        with lock.open('a') as handle:
+            try:
+                fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                return
+            except BlockingIOError:pass
+        assert time.monotonic()<deadline,'the receiver kept its lock after the client died'
+        time.sleep(.05)
+
+
+# spec: ANYM-525
+@pytest.mark.parametrize('boundary,state,stored_objects,archived',[
+    ('before_pending',None,0,1),
+    ('pending_uncommitted',None,0,1),
+    ('pending_committed','pending',0,1),
+    ('footer_sent','pending',1,1),
+    ('footer_answered','pending',1,1),
+    ('stored','pending',1,1),
+    ('reading_back','pending',1,1),
+    ('read_back','pending',1,1),
+    ('verified_uncommitted','pending',1,1),
+    ('verified_committed','verified',1,0)])
+def test_a_killed_archive_pass_is_finished_by_the_next_one_at_every_boundary(env,archive,tmp_path,boundary,state,stored_objects,archived):
+    s,cloud,archiver,identity=env;payload=b'Synthetic killed archive original'
+    blob=idle(archive,payload=payload)
+    killed_worker(env,archive,tmp_path,boundary)
+    receiver_settled(tmp_path)
+    row=copy(s,blob.digest)
+    assert (row['state'] if row else None)==state and len(objects(cloud))==stored_objects
+    # Until read back, nothing may authorize an eviction.
+    if state!='verified':assert row is None or row['verified_at'] is None
+    report=archiver().run_once(apply=True)
+    assert report['archived']==archived and report['reasons']=={}
+    # Written once under one key, never replaced, and it counts once in the budget.
+    [stored_object]=objects(cloud)
+    assert calls(cloud).count('put_object')==1
+    row=copy(s,blob.digest)
+    assert row['state']=='verified' and row['ciphertext_sha256']==hashlib.sha256(stored_object.read_bytes()).hexdigest()
+    assert decrypt(identity,stored_object.read_bytes()).stdout==payload
+    assert report['budget']['used_bytes']==blob.bytes
+    # The next pass has no work left; the original is untouched.
+    before=calls(cloud)
+    assert archiver().run_once(apply=True)['candidates']==0 and calls(cloud)==before
+    assert (s.files/blob.digest).read_bytes()==payload
+
+
+# spec: ANYM-525
+def test_a_killed_multipart_upload_leaves_no_object_and_the_next_pass_writes_one(env,archive,tmp_path):
+    s,cloud,archiver,identity=env;payload=os.urandom(6*1024**2)
+    blob=idle(archive,mid='cold-large',payload=payload)
+    # Past the first 5 MiB part, before the footer that could commit anything.
+    killed_worker(env,archive,tmp_path,'streaming',stream_bytes=5*1024**2+1024**2//2)
+    receiver_settled(tmp_path)
+    assert objects(cloud)==[] and 'complete_multipart_upload' not in calls(cloud)
+    assert copy(s,blob.digest) is None
+    assert archiver().run_once(apply=True)['archived']==1
+    [stored_object]=objects(cloud)
+    assert calls(cloud).count('complete_multipart_upload')==1 and not (cloud/'mpu').exists()
+    assert decrypt(identity,stored_object.read_bytes()).stdout==payload and copy(s,blob.digest)['state']=='verified'
 
 
 def test_large_original_streams_through_bounded_multipart(env,archive):
@@ -737,6 +901,75 @@ def test_interrupted_publication_is_registered_without_r2(env,archive,monkeypatc
     # The next backup carries the restored bytes again.
     assert blob.digest in {item['digest'] for item in present} and blob.digest not in {item['digest'] for item in absent}
     assert s.request_file_download(key,fid)['request_status']=='ready'
+
+
+# spec: ANYM-525
+@pytest.mark.parametrize('boundary,published,temporary,is_resident,reads',[
+    ('restore_admit_uncommitted',False,False,False,1),
+    ('restore_admitted',False,False,False,1),
+    ('restore_writing',False,True,False,1),
+    ('restore_synced',False,True,False,1),
+    ('restore_linked',True,True,False,0),
+    ('restore_published',True,False,False,0),
+    ('restore_register_uncommitted',True,False,False,0),
+    ('restore_committed',True,False,True,0)])
+def test_a_killed_restore_pass_is_finished_by_the_next_one_at_every_boundary(env,archive,tmp_path,boundary,published,temporary,is_resident,reads):
+    from messaging_service.blobs import BlobWriter
+    from messaging_service.storage_admission import COLD_RESTORING
+    _,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive)
+    s.request_file_download(key,fid);queued=job_state(s,fid)
+    killed_worker(env,archive,tmp_path,boundary)
+    temporaries=list(s.files.glob('.pending-*'))
+    assert (s.files/blob.digest).exists()==published and bool(temporaries)==temporary
+    assert resident(s,blob.digest)==is_resident
+    # The boundary's own side effect is on disk or in the record, not merely its function's entry.
+    if boundary=='restore_writing':assert temporaries[0].stat().st_size>0
+    if boundary in ('restore_synced','restore_linked'):assert temporaries[0].read_bytes()==b'Synthetic retained contract'
+    leased=copy(s,blob.digest)['restore_error']==COLD_RESTORING
+    assert leased==(boundary not in ('restore_admit_uncommitted','restore_committed'))
+    before=calls(cloud).count('get_object')
+    report=restorer(env).run_once()
+    # What was published is registered from the store, never fetched again; what was not is fetched once.
+    assert calls(cloud).count('get_object')==before+reads
+    assert report['failed']==0 and report['provider_fallback']==0 and report['reasons']=={}
+    assert resident(s,blob.digest) and (s.files/blob.digest).read_bytes()==b'Synthetic retained contract'
+    row=copy(s,blob.digest)
+    assert row['state']=='verified' and row['restore_state']=='idle' and row['restore_finished_at'] is not None
+    # No provider download was queued on the way, and the request is answered.
+    assert job_state(s,fid)==queued and s.request_file_download(key,fid)['request_status']=='ready'
+    # A killed writer's temporary file is the collector sweep's, and the original survives it.
+    if temporary:
+        assert BlobWriter(s.files,reserve_bytes=0).sweep_abandoned(max_age=-1)==len(temporaries)
+        assert not list(s.files.glob('.pending-*')) and (s.files/blob.digest).exists()
+    assert restorer(env).run_once()['restored']==0 and calls(cloud).count('get_object')==before+reads
+
+
+# spec: ANYM-525
+def test_a_reconciliation_killed_after_a_killed_restore_is_finished_without_another_read(env,archive,tmp_path):
+    _,_,key,_=archive;s,cloud,_,_=env;fid,blob=evicted_copy(env,archive)
+    s.request_file_download(key,fid)
+    killed_worker(env,archive,tmp_path,'restore_published')
+    reads=calls(cloud).count('get_object')
+    # The second worker starts from the published file and dies inside its registration.
+    killed_worker(env,archive,tmp_path,'restore_register_uncommitted')
+    assert not resident(s,blob.digest)
+    report=restorer(env).run_once()
+    assert report['reconciled']==1 and report['failed']==0 and resident(s,blob.digest)
+    assert calls(cloud).count('get_object')==reads and copy(s,blob.digest)['restore_state']=='idle'
+
+
+# spec: ANYM-525
+def test_a_killed_restore_worker_frees_its_presence_for_the_next_one(env,archive,tmp_path,restore_worker):
+    s=archive[1];restore_worker.close()
+    killed_worker(env,archive,tmp_path,'presence')
+    next_worker=cold().WorkerPresence(s.pool.conninfo)
+    deadline=time.monotonic()+30
+    try:
+        while not next_worker.acquire():
+            assert time.monotonic()<deadline,'the killed worker kept its presence lock'
+            time.sleep(.05)
+    finally:
+        next_worker.close()
 
 
 # spec: ANYM-350

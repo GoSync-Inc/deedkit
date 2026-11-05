@@ -679,6 +679,10 @@ Owner 10-28: «давай, конечно, в один релиз»; «проц�
    Merges never wait for a release: the candidate is one SHA ("Prepare and inspect"), so there is no merge
    freeze. No release has a time window: the waits are an active call (the tool checks it) and a running
    backup (step 1; the autodeploy unit, "Timer").
+5. The lifecycle workers ("Lifecycle workers") are plan A services in both routes, the unattended one and
+   item 4's: `migrate` runs while they run on the previous images, and `apply` then stops and starts them with
+   the other plan A services; a rollback restores them with the others. A worker image's compatibility with the
+   schema is proven by the release's own tests, not by a label.
 
 ### Migration risk tiers
 
@@ -1056,6 +1060,61 @@ A release has no clock window (owner 11-04: «давай все делать н�
 backup start: the wait does not protect a scheduled start. A scheduled backup that starts while a release holds the lock
 is refused, and what follows differs by unit (see "Continuous deployment"); a daily lost that way is a backup follow-up,
 never a release hold. The autodeploy unit has no clock window either ("Timer").
+
+### Lifecycle workers (ANYM-525)
+
+`file-lifecycle` (target `runtime`), `cold-archive` and `cold-restore` (target `backup`) are one ordinary plan A project,
+`deedkit-file-lifecycle` (`deploy/production.example.json`): its Compose file, its name and per service its target, with no
+mechanism of their own. The tool loads every profile (`--profile *`) and selects exact service names, so the database stays
+out. Every release and rollback stops them and starts them on the release's verified images. `production.py status` lists
+each service of each configured project as `project_services` with its `state` and `revision` label; `mark` names one that
+is `not running`, `differs from current.json` (not compared after a rollback, when `current.json` names the release that
+was left) or `unknown` (several containers, or with `error` the read failed or the 60 seconds `status` gives all these
+reads passed; `status` still answers).
+
+What that means for them:
+
+- A stop gives a pass Compose's 60 seconds (`stop_grace_period`), then kills it. A pass only checks for the stop between
+  passes, so a long one is killed. Tests kill each worker by SIGKILL at every durable boundary (`test_a_killed_*`): the next
+  pass finishes the work and repeats nothing irreversible. An eviction replays its journal, one unlink, one intent. An
+  archive pass reads back the object it finds, one write under the key, and no eviction counts on it before the read-back. A
+  restore registers what it published without another read. A killed restore leaves a `.pending-*` file, which a collector's
+  start removes after a day (`sweep_abandoned`).
+- A start runs a pass at once (the interval wait follows it), so `--limit`, `--max-bytes`, `pass_files` and `pass_bytes` bound
+  a pass, now several a day with releases, not a day. `total_bytes` still bounds the archive. A pass makes more read-backs,
+  never more objects than one per original.
+- While `cold-restore` is stopped no worker holds its presence, so a new request goes to the provider path at once (ANYM-350).
+- They have no healthcheck, so `apply` checks them as it checks other workers (`up --wait`, then the settle): one that exits
+  or restarts fails the whole release's health wait and rolls it back.
+- Eviction stays the owner's opt-in: `--apply` stays out of the Compose commands until the owner adds it. Plan A changes
+  images and labels, never commands, mounts or credentials.
+
+The host change is no part of a merge. It is a production operation plan (one Astra review), run outside a cold-archive pass
+(`docker logs --since 1h deedkit-file-lifecycle-cold-archive-1`), as a hand release like "Enrollment is a hand release",
+because the configuration digest changes and autodeploy otherwise halts with `configuration_drift`:
+
+1. Pause autodeploy and wait until `deedkit-autodeploy.service` is not active. Take a green `main` SHA `S` holding this code,
+   newer than the deployed one and not prepared yet.
+2. Back up both files with `cp -p`: `/etc/deedkit/file-lifecycle.json` and the plan A configuration that
+   `production.active_config()` names.
+3. Bring the three workers to the serving release first, by hand. `guard_rollback` refuses to restore a messaging image with
+   fewer migrations than plan B serves, and `runtime` and `backup` are both messaging images: without this step any rollback of
+   the first release is refused, the automatic one included, because the images it would restore predate the serving schema.
+   Set `image` of `file-lifecycle` to `current.json`'s runtime image, and of `cold-archive` and `cold-restore` to the current
+   release's attested backup image (verify and pull it as in "First start by hand", step 1), then `docker compose -p
+   deedkit-file-lifecycle -f /etc/deedkit/file-lifecycle.json up -d --no-build --pull never --no-deps file-lifecycle cold-archive
+   cold-restore`. Read back the three images and each worker's next pass in its log.
+4. Move the Compose file, byte for byte, to `/etc/deedkit/file-lifecycle/compose.json` (`sha256sum` after the move equals the
+   one before it): besides step 3's images, its commands, mounts, credentials and the eviction and upload opt-ins stay exactly.
+   Image retention reads only top-level JSON files of `/etc/deedkit`, so the image IDs in it stop pinning old images.
+5. Append the entry of `deploy/production.example.json` to `projects`. `directory` stays the project's working directory
+   (label `com.docker.compose.project.working_dir` of its containers).
+6. `production.py prepare --sha S`, inspect it, then `apply --sha S` and `status`. Read back: `project_services` shows the three
+   services on `S` with no `mark`. Remove the pause.
+
+Undo of step 6: `production.py rollback --sha S`, which restores step 3's images; then put the plan A configuration back from
+its copy and remove the pause. Undo of step 3: put `/etc/deedkit/file-lifecycle.json` back from its copy and run the same `up`.
+Rollback's previous images stay kept as its target (`<project>.before.json`).
 
 ### Backup runner
 
@@ -2600,10 +2659,20 @@ CI-published targets are considered. Kept, with reasons:
 - every image ID named in a top-level JSON file of `/etc/deedkit` (configurations
   and jobs that pin an image, such as `file-lifecycle.json`) or of a non-state
   directory under the host state root;
+- the image each backup runner pins (ANYM-525), read before any removal: `image` of the
+  messaging `runner.json` the configuration names (`migration.unattended.runner_config`)
+  and of every `runner.json` of "Backup runner" that exists, and of every
+  `runner.json.before-*` beside each, the undo of a move. Every copy counts, because `cp -p`
+  keeps an old time and so no time tells the last move; delete an old copy to let its image
+  go. A pin must be read: a `runner.json` or copy that cannot be read or names no image,
+  a pin by tag whose lookup fails (for a `runner.json`, also one Docker answers with no such
+  image; a copy in that state has no image left to keep), a named `runner_config` that is
+  missing, or an installed runner with no `runner.json` at all refuses, and nothing is
+  removed. A release only reports that refusal as its removal's `skipped`;
 - the image of every container, running or stopped; an image with any other
   name (for example `deedkit-rollback-retained:*`); an image of a target this
-  configuration does not deploy (the backup runner pins its image by ID in its
-  own configuration).
+  configuration does not deploy. Once the lifecycle workers deploy `backup`, that
+  rule no longer holds backup images: older ones go, and the runner's pin above stays.
 
 Everything else is removed under the deploy lock and the host image lock: the
 image is inspected again and skipped if its ID or names changed; its other
