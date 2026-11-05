@@ -1721,7 +1721,7 @@ crontab and `/etc/cron.d` holds only `e2scrub_all` and `sysstat`. Queued jobs wa
 that refusal ("Continuous deployment"), so no release goes out until it runs again and the pause is removed.
 
 Who reads its liveness: whoever reads the day's production status (the watch below) and the operator of every release.
-Nothing alerts anyone until the monitoring card exists. Read `docker ps --filter name=enricher-mini` (one container, `Up`)
+A stopped worker raises the Tiden event `enrichment_no_worker` (triage: "Mini inference: watch and enable record"). Read `docker ps --filter name=enricher-mini` (one container, `Up`)
 and `SELECT account, kind, enabled, pause_reason, expires_at FROM processing_profiles` (operator DSN, no write).
 
 Start it, as root on the host, in this order; a failed step stops:
@@ -1788,6 +1788,12 @@ hours old (elapsed continuous waiting) together with its `hours_since_ready`; (b
 waiting is above 24 hours **and** `hours_since_ready` is above 24 or NULL (never a success from the mini; compare
 with the enable date). A long wait with fresh successes is a backlog draining at its caps, not a stall. Another
 scope's success does not hide a stalled one: the groups are separate.
+
+The API raises Tiden events on shorter limits than this 24 hour by-hand rule (ANYM-785): `enrichment_stalled` (a live
+worker, queued rows and no `ready` for 6 h), `enrichment_starved` (50 or more queued rows in a scope sent 6-48 h ago),
+`enrichment_no_worker` (a mini row not enabled or expired, last published 30 min to 7 days ago). `get_sync_status` shows
+`enrichment_health` per account. Triage, read-only: the mini's `/healthz` and `busy.json`, the `refusal=` counts in the
+service log, the impact log.
 
 The key and the service: `python3 scripts/inference_probe.py --url https://<mini>.<tailnet>.ts.net --key-file
 private/inference/inference.key` prints one line and exits 0 whatever it finds; report any line that is not

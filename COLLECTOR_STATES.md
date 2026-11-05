@@ -5,6 +5,14 @@ chat checkpoints. Account-scoped readers additionally receive four independent
 `operations` objects. Chat-restricted readers do not receive account health,
 account queues, processing profile summaries or lease observations.
 
+`enrichment_health` (top level, ANYM-785) is the API's last check of the mini's queue:
+`checked_at` and, per permitted account, `codes` (`enrichment_stalled`,
+`enrichment_starved`, `enrichment_no_worker`) and `counts` per kind (`queued`,
+`sent_6h_to_48h`). It is read from memory and runs no query. It is `null` before this
+generation's first check and for a chat-restricted reader. An old `checked_at` means the
+check is failing (log line `enrichment_health_unavailable`).
+`detail=compact` names only accounts with codes or counts and omits the key when none has any.
+
 - `connection`: connected/connecting, retry wait, owner block or stopped. Includes
   `reason_code`, `changed_at`, `observed_at`, `retry_at`, `retry_attempts`,
   `next_action` and the current collector lease's running indication. An expired

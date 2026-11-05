@@ -64,8 +64,14 @@ sends the Sentry-protocol `fingerprint`, `["collector-stop", <component>, <code>
 built only from the validated built-in component and the code above. Each code forms
 its own Tiden issue; the same code stays one issue across other exception types or
 frames. `before_send` rebuilds the fingerprint from those two values and drops any
-incoming `fingerprint` or title; the event sets no title. Events of other components
-carry no fingerprint.
+incoming `fingerprint` or title; the event sets no title. Other events of other
+components carry no fingerprint, except the mini enrichment codes below.
+
+The API checks the mini's enrichment queue every 5 minutes and reports
+`enrichment_stalled`, `enrichment_starved` and `enrichment_no_worker` (component
+`gateway`), one event per episode and again every 24 hours while it lasts. Each has the
+fingerprint `["enrichment-health", <component>, <code>]`. The event carries no count,
+kind, account, profile hash or file name; `get_sync_status` shows the counts.
 
 Collector stop codes: `capture_overload`, `collection_disabled`,
 `collector_already_owned`, `collector_disabled`, `collector_lease_lost`,
