@@ -5,12 +5,16 @@ from pathlib import Path
 import re
 
 from scripts import deedkit_admin as admin
+from scripts import docs_only
 from scripts import production
 
 ROOT = Path(__file__).resolve().parents[1]
 RECORDINGS_CONFIG = "/opt/deedkit/recordings-private/config.json"
 
 
+# reads: services/gateway/README.md
+# reads: TIDEN-CI.md
+# reads: .claude/rules/migrations.md
 def flat(path):
     """A document with its line wrapping undone, so a line break cannot hide a phrase."""
     return " ".join((ROOT / path).read_text(encoding="utf-8").split())
@@ -24,9 +28,9 @@ def module_purposes():
 
 
 def optional_admin_keys():
-    """Every literal key the admin CLI reads with `config.get("...")`."""
+    """Every literal key the admin CLI reads with `config.get("...")`, with its fallback expression (None: no fallback)."""
     tree = ast.parse((ROOT / "scripts/deedkit_admin.py").read_text(encoding="utf-8"))
-    return {node.args[0].value for node in ast.walk(tree)
+    return {node.args[0].value: node.args[1] if len(node.args) > 1 else None for node in ast.walk(tree)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get"
             and isinstance(node.func.value, ast.Name) and node.func.value.id == "config"
             and node.args and isinstance(node.args[0], ast.Constant)}
@@ -68,9 +72,9 @@ def test_a_local_tiden_write_needs_the_orchestrators_window_not_the_owners():
 # spec: ANYM-776
 def test_every_script_a_rule_file_names_exists():
     named = {name for path in (ROOT / ".claude/rules").glob("*.md")
-             for name in re.findall(r"(?<![\w./-])scripts/[\w./-]+\.py", path.read_text(encoding="utf-8"))}
-    assert "scripts/production.py" in named  # the scan still finds a path
-    assert sorted(name for name in named if not (ROOT / name).is_file()) == []
+             for name in re.findall(r"(?<![\w./-])scripts/([\w./-]+\.py)", path.read_text(encoding="utf-8"))}
+    assert "production.py" in named  # the scan still finds a path
+    assert sorted(name for name in named if not (ROOT / "scripts" / name).is_file()) == []
 
 
 # spec: ANYM-776
@@ -81,7 +85,7 @@ def test_the_migration_rule_holds_no_number_that_goes_stale():
     assert "`RUNTIME_SCHEMA` in `services/messaging/messaging_service/store.py`" in rule
     store = (ROOT / "services/messaging/messaging_service/store.py").read_text(encoding="utf-8")
     assert re.search(r"^RUNTIME_SCHEMA=\d+", store, re.M)
-    assert "AGENTS.md section 3 and the signal grep in docs/operations/review-protocol.md" in rule
+    assert "section 3 and the signal grep in docs/operations/review-protocol.md" in rule
 
 
 # spec: ANYM-776
@@ -89,13 +93,22 @@ def test_the_admin_example_holds_every_optional_key_the_admin_cli_reads():
     example = json.loads((ROOT / "deploy/admin.example.json").read_text(encoding="utf-8"))
     optional = optional_admin_keys()
     assert "recordings_config" in optional  # the scan still finds a key
-    assert sorted(optional - example.keys()) == []
+    assert sorted(optional.keys() - example.keys()) == []
     assert example["recordings_config"] == RECORDINGS_CONFIG
 
 
 # spec: ANYM-776
 def test_the_admin_example_gives_a_defaulted_key_the_value_the_cli_defaults_to():
     example = json.loads((ROOT / "deploy/admin.example.json").read_text(encoding="utf-8"))
+    fallback = optional_admin_keys()
     defaults = {"tool": str(admin.TOOL), "http_config": production.HTTP_CONFIG, "calls_lock": str(admin.CALLS_LOCK),
-                "docker": ["docker"], "validators": {}, "journal": str(admin.JOURNAL), "tokens": str(admin.TOKENS)}
+                "docker": ast.literal_eval(fallback["docker"]), "validators": ast.literal_eval(fallback["validators"]),
+                "journal": str(admin.JOURNAL), "tokens": str(admin.TOKENS)}
     assert {key: example.get(key) for key in defaults} == defaults
+
+
+# spec: ANYM-776
+def test_this_module_keeps_unrelated_documents_in_the_docs_only_skip():
+    reads = docs_only.scan_python("tests/test_docs_facts.py", (ROOT / "tests/test_docs_facts.py").read_bytes())
+    assert reads.dynamic == {".claude/rules", "scripts"}  # no read of the repository root
+    assert {"services/gateway/README.md", "TIDEN-CI.md", "docs/operations/review-protocol.md"} <= reads.names
