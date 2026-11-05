@@ -470,6 +470,15 @@ def check_schema(settings, receipt):
             raise Refused('messaging schema inventory mismatch; seamless promotion cannot run migrations')
 
 
+def predecessor(previous):
+    """The `previous` of a new receipt: the serving receipt, whose own `previous` shrinks to its identity. Nothing reads
+    deeper, and the whole chain made every receipt larger than the last (17 MB after 141 releases, 2026-11-05)."""
+    earlier = (previous or {}).get('previous')
+    if not isinstance(earlier, dict):
+        return previous
+    return {**previous, 'previous': {key: earlier[key] for key in ('generation', 'sha', 'status') if key in earlier}}
+
+
 def prepare(settings, sha):
     validate_settings(settings)
     original = p.prepare(settings, sha)
@@ -499,7 +508,7 @@ def prepare(settings, sha):
         'controls': private['controls'], 'schema': schema_inventory(original['images']['runtime']),
         'router_before': baseline, 'router_source_digest': p.digest(source), 'router_container': router_container,
         'baseline': original['projects'],
-        'retained': ([previous['generation']] if previous else []), 'previous': previous, 'ci': original['ci']}
+        'retained': ([previous['generation']] if previous else []), 'previous': predecessor(previous), 'ci': original['ci']}
     check_schema(settings, receipt)
     p.promotable(sha)
     durable_write(release / 'http-prepared.json', receipt)

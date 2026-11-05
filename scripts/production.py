@@ -704,13 +704,54 @@ def check_space(directory):
 
 
 CONTAINERD_ROOT = Path("/var/lib/containerd")
+DOCKER_ROOT = Path("/var/lib/docker")
+# A preparation writes about 100 MiB outside the image store; this floor leaves room for a migration on a database volume.
+HOST_FREE_BYTES = 5 * 1024**3
+# Warnings before the refusals, this far above each floor: `deploy.json`'s cleanup line, the journal and `status`.
+DISK_WARNING_MARGIN = 10 * 1024**3
 
 
-def check_image_space(docker_root):
-    check_space(docker_root)
+def check_host_space(directory):
+    """The floor of a disk that receives receipts and checkouts, not image bytes."""
+    if shutil.disk_usage(directory).free < HOST_FREE_BYTES:
+        raise Refused(f"at least 5 GiB free is required on {directory} before a preparation; "
+                      "this disk holds receipts and data volumes, `production.py images --remove` does not free it")
+
+
+def containerd_image_store():
+    """Whether Docker keeps images in containerd. Unknown is False: both disks then keep the full floor."""
+    try:
+        return ["driver-type", "io.containerd.snapshotter.v1"] in json.loads(
+            run(["docker", "info", "--format", "{{json .DriverStatus}}"]))
+    except Exception:
+        return False
+
+
+def check_image_space(docker_root, containerd=False, state=None):
     # The containerd image store keeps image content under containerd's root, often another disk than DockerRootDir.
+    if containerd and CONTAINERD_ROOT.is_dir():
+        check_space(CONTAINERD_ROOT)
+        check_host_space(docker_root)
+        return
+    # Not positively the containerd store: the state directory keeps the full floor too.
+    if state is not None:
+        check_space(state)
+    check_space(docker_root)
     if CONTAINERD_ROOT.is_dir():
         check_space(CONTAINERD_ROOT)
+
+
+def disk_warnings():
+    """One line per production disk close to its floor. Never raises: an unreadable or absent path warns of nothing."""
+    found = []
+    for path, level in ((CONTAINERD_ROOT, MIN_FREE_BYTES + DISK_WARNING_MARGIN), (DOCKER_ROOT, HOST_FREE_BYTES + DISK_WARNING_MARGIN)):
+        try:
+            free = shutil.disk_usage(path).free
+        except OSError:
+            continue
+        if free < level:
+            found.append(f"{path}: {round(free / 2**30, 2)} GiB free, warning below {level // 2**30} GiB")
+    return found
 
 
 IMAGE_LOCK = Path("/var/lib/deedkit-production/image-build.lock")
@@ -867,11 +908,11 @@ def prepare_router(settings, sha):
         raise Refused("an exact lowercase 40-character commit SHA is required")
     state = Path(settings["state_directory"])
     # Local headroom first: a full disk refuses before the verification fetches anything.
-    check_space(state)
+    check_host_space(state)
     docker_root = run(["docker", "info", "--format", "{{.DockerRootDir}}"]).strip()
     if not docker_root or not Path(docker_root).is_dir():
         raise Refused("preparation requires the local production Docker engine")
-    check_image_space(docker_root)
+    check_image_space(docker_root, containerd_image_store(), state)
     promotable(sha)
     release = state / ("router-" + sha)
     if release.exists():
@@ -902,11 +943,11 @@ def published_targets(settings):
 def prepare(settings, sha):
     state = Path(settings["state_directory"])
     # Local headroom first: a full disk refuses before the verification fetches anything.
-    check_space(state)
+    check_host_space(state)
     docker_root = run(["docker", "info", "--format", "{{.DockerRootDir}}"]).strip()
     if not docker_root or not Path(docker_root).is_dir():
         raise Refused("preparation requires the local production Docker engine")
-    check_image_space(docker_root)
+    check_image_space(docker_root, containerd_image_store(), state)
     evidence = promotable(sha)
     release = state / sha
     if release.exists():
@@ -2087,6 +2128,118 @@ def retain_images(settings, *, held=(), deadline=None, reasons=False):
 
 
 PREFLIGHT_BUDGET = 300
+# Release directories (production.md "Release directories"): the newest of each state stay, counted along main.
+RELEASE_KEEP = 5
+RELEASE_TRASH = ".pruned"
+RELEASE_BUDGET = 120
+
+
+def prunable_releases(history, present, protected, keep=RELEASE_KEEP):
+    """Directories to remove, from `history` (newest first, main up to the current release): beyond the newest `keep` of
+    `present`, never a protected one. A directory outside `history` (newer than the current release, or never on main)
+    is never selected: a candidate may still need it."""
+    ordered = [sha for sha in history if sha in present]
+    return [sha for sha in ordered[keep:] if sha not in protected]
+
+
+def release_in_use(directory, mounted, current=None, serving=None):
+    """Whether a release on main before the current one still matters. Unreadable counts as in use.
+    - A plan A apply that failed and was not rolled back: `rollback` still accepts it and needs its snapshots.
+    - A preparation that may still apply: it is bound to what ran when it was made (older commits may be prepared), so
+      it is stale only when a release was applied since: `current_digest` differs, or a receipt without it is older than
+      current.json. An HTTP preparation is stale when another generation serves than the one it names as previous.
+    - An HTTP attempt with an unknown outcome, or the receipt that records the retirement of a generation whose
+      containers still exist (the container cleanup selects them by it)."""
+    try:
+        result = directory / "result.json"
+        if result.exists() and read(result).get("status") != "applied" and not (directory / "rollback.json").exists():
+            return True
+        prepared = directory / "prepared.json"
+        attempted = directory / "attempted.json"
+        if current is not None and prepared.exists() and not result.exists() and not attempted.exists():
+            bound = read(prepared).get("current_digest")
+            if bound == digest(current) or (bound is None and prepared.stat().st_mtime >= (directory.parent / "current.json").stat().st_mtime):
+                return True
+        http_attempted = directory / "http-attempted.json"
+        http_prepared = directory / "http-prepared.json"
+        if serving is not None and http_prepared.exists() and not http_attempted.exists():
+            if (read(http_prepared).get("previous") or {}).get("generation") == serving.get("generation"):
+                return True
+        if http_attempted.exists() and read(http_attempted).get("status") not in ("serving", "startup-failed"):
+            return True
+        http_result = directory / "http-result.json"
+        return http_result.exists() and (read(http_result).get("previous") or {}).get("sha") in mounted
+    except Exception:
+        return True
+
+
+def remove_path(path, deadline):
+    """A child process, so the time budget also bounds the deletion. Cut short, it stays in the trash for the next pass."""
+    subprocess.run(["rm", "-rf", "--", str(path)], check=True, timeout=max(deadline - time.monotonic(), 0.001),
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def remove_tree(path, deadline):
+    """Remove `path`, first moved out of the `*/marker` globs by one atomic rename: a partly removed release must never
+    read as an unfinished apply, which would pause every deploy. The next pass finishes an interrupted removal."""
+    trash = path.parent / RELEASE_TRASH
+    trash.mkdir(mode=0o700, exist_ok=True)
+    if trash.is_symlink() or path.is_symlink():
+        raise Refused("a release directory is a symbolic link")
+    os.replace(path, trash / path.name)
+    remove_path(trash / path.name, deadline)
+
+
+def prune_state(directory, mirror, tip, protected, mounted, deadline, summary, *, current=None, serving=None):
+    trash = directory / RELEASE_TRASH
+    for leftover in (subdirectories(trash) if trash.is_dir() and not trash.is_symlink() else []):
+        if time.monotonic() >= deadline:
+            summary["interrupted"] = "time budget"
+            return
+        remove_path(leftover, deadline)
+    history = run(["git", "-C", str(mirror), "rev-list", "--first-parent", tip]).split()
+    present = {path.name for path in subdirectories(directory) if RELEASE_DIRECTORY.fullmatch(path.name)}
+    if tip not in history:
+        raise Refused("the current release is not on main")
+    for sha in prunable_releases(history, present, protected | mounted):
+        if time.monotonic() >= deadline:
+            summary["interrupted"] = "time budget"
+            return
+        if release_in_use(directory / sha, mounted, current, serving):
+            continue
+        if time.monotonic() >= deadline:  # reading a receipt may have used the rest
+            summary["interrupted"] = "time budget"
+            return
+        try:
+            remove_tree(directory / sha, deadline)
+            summary["removed"].append(sha[:12])
+        except (OSError, Refused, subprocess.SubprocessError) as exc:
+            summary["failed"].append({"release": sha[:12], "reason": type(exc).__name__})
+
+
+def prune_releases(settings, http_state, deadline):
+    """Before a deploy's disk check, remove the release directories no rollback or running release needs, so the never
+    applied preparations stop pinning their images in the image pass that follows. The caller holds the deploy locks.
+    Best effort like the rest of the pass: never raises, and with a state not settled it leaves that state alone."""
+    summary = {"removed": [], "failed": []}
+    deadline = min(deadline, time.monotonic() + RELEASE_BUDGET)  # the image pass after it frees the image disk
+    try:
+        state, http_state = Path(settings["state_directory"]), Path(http_state)
+        mirror = state / "deploy-source.git"
+        containers = run(["docker", "ps", "--all", "--quiet", "--no-trunc"]).split()
+        mounted = {sha for value in (json.loads(run(["docker", "inspect", *containers])) if containers else [])
+                   for mount in value.get("Mounts") or [] for sha in RELEASE_DIRECTORY.findall(mount.get("Source") or "")}
+        current = read(state / "current.json") if (state / "current.json").exists() else {}
+        if current.get("status") == "applied":
+            prune_state(state, mirror, current["sha"], {current["sha"], *unfinished(state), *unsettled_migrations(state)},
+                        mounted, deadline, summary, current=current)
+        serving = read(http_state / "http-current.json") if (http_state / "http-current.json").exists() else {}
+        if serving.get("status") == "serving":
+            prune_state(http_state, mirror, serving["sha"], {serving["sha"], (serving.get("previous") or {}).get("sha")},
+                        mounted, deadline, summary, serving=serving)
+    except Exception as exc:
+        summary["error"] = type(exc).__name__
+    return summary
 
 
 def preflight_cleanup(settings, http, s, http_state):
@@ -2101,10 +2254,11 @@ def preflight_cleanup(settings, http, s, http_state):
             containers = s.clean(http, True)
         except Exception as exc:
             containers = {"error": type(exc).__name__}
+        releases = prune_releases(settings, http_state, deadline)
         images = retain_images(settings, held=(http_state, s.GLOBAL_LOCK), deadline=deadline, reasons=True)
     finally:
         DEADLINE = None
-    return {"containers": containers, "images": images}
+    return {"containers": containers, "releases": releases, "images": images}
 
 
 def cleanup_line(preflight, final, retired=None):
@@ -2120,7 +2274,9 @@ def cleanup_line(preflight, final, retired=None):
     return {"containers_removed": len(containers.get("removed", [])) + len(later.get("removed", [])),
             "generations": generations,
             "images_removed": len(images.get("removed", [])) + len((final or {}).get("removed", [])),
-            "disk_free_after_gib": free}
+            "releases_removed": len((preflight or {}).get("releases", {}).get("removed", [])),
+            "disk_free_after_gib": free,
+            **({"disk_warnings": warnings} if (warnings := disk_warnings()) else {})}
 
 
 def attach_cleanup(state, record, outcome, preflight, retired=None):
@@ -6622,6 +6778,8 @@ def locked_action(args):
                 result["autodeploy_halt"] = halt_summary(pause)
             if failed := http_failed_attempts(args.http_config):
                 result["http_failed_attempts"] = failed
+            if warnings := disk_warnings():
+                result["disk_warnings"] = warnings
         elif args.action == "images":
             result = remove_images(settings) if args.remove else images_report(settings)
         elif args.action == "copy-database":

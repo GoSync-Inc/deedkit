@@ -4570,6 +4570,228 @@ def test_the_preflight_removes_retired_containers_and_then_the_image_they_pinned
     assert p.cleanup_line(result, None)["containers_removed"] == 2
 
 
+class PruneHost(Images):
+    """`Images` plus main's history and the bind mounts of the containers."""
+
+    def __init__(self, monkeypatch, images, history, mounts=()):
+        super().__init__(monkeypatch, images)
+        self.history, self.mounts = history, mounts
+
+    def run(self, argv, **kwargs):
+        if "rev-list" in argv:
+            if self.history is None:
+                raise p.Refused("git failed")
+            return "\n".join(self.history)
+        if argv[:2] == ["docker", "ps"] and self.mounts:
+            return "mounting\n"
+        if argv[:2] == ["docker", "inspect"] and self.mounts:
+            return json.dumps([{"Id": "mounting", "Image": image_id("f"), "Mounts": [{"Source": source} for source in self.mounts]}])
+        return super().run(argv, **kwargs)
+
+
+def prune_host(tmp_path):
+    """Nine applied plan A releases, seed 9 current and seed 1 oldest."""
+    settings = retention_settings(tmp_path)
+    state = Path(settings["state_directory"])
+    seeds = "123456789"
+    before = OLD_IMAGE
+    for seed in seeds:
+        released(state, seed * 40, image_id(seed), before)
+        before = image_id(seed)
+    return settings, state, [seed * 40 for seed in reversed(seeds)]
+
+
+# spec: ANYM-689
+def test_old_release_directories_go_and_everything_a_rollback_or_a_candidate_needs_stays(tmp_path, monkeypatch):
+    settings, state, history = prune_host(tmp_path)
+    http_state = tmp_path / "http"
+    http_state.mkdir()
+    (state / ("c" * 40)).mkdir()  # newer than the current release: not in its history
+    (state / ("d" * 40)).mkdir()  # a hotfix never on main
+    p.write(state / ("2" * 40) / "attempted.json", {"status": "applying"})  # unfinished once its result is gone
+    (state / ("2" * 40) / "result.json").unlink()
+    PruneHost(monkeypatch, [], history, mounts=[f"{state}/{'3' * 40}/api"])
+    summary = p.prune_releases(settings, http_state, p.time.monotonic() + 60)
+    assert summary == {"removed": ["4" * 12, "1" * 12], "failed": []}
+    left = {path.name for path in state.iterdir() if p.RELEASE_DIRECTORY.fullmatch(path.name)}
+    assert left == {seed * 40 for seed in "98765" "23" "cd"}
+    assert p.unfinished(state) == ["2" * 40]
+
+
+# spec: ANYM-689
+def test_a_never_applied_preparation_older_than_the_current_release_stops_pinning_its_images(tmp_path, monkeypatch):
+    settings, state, history = prune_host(tmp_path)
+    (state / ("1" * 40) / "result.json").unlink()  # prepared, never applied
+    store = PruneHost(monkeypatch, [runtime("1"), runtime("9")], history)
+    assert candidates(settings) == []
+    (tmp_path / "global").mkdir()
+    (tmp_path / "http").mkdir()
+    stage = SimpleNamespace(GLOBAL_LOCK=tmp_path / "global", clean=lambda *a: {"removed": []})
+    result = p.preflight_cleanup(settings, {}, stage, tmp_path / "http")
+    assert "1" * 12 in result["releases"]["removed"]
+    assert [item["image"] for item in result["images"]["removed"]] == ["1" * 12] and image_id("1") not in store.references
+    assert p.cleanup_line(result, None)["releases_removed"] == len(result["releases"]["removed"])
+
+
+# spec: ANYM-689
+def test_a_release_removal_cut_short_never_reads_as_an_unfinished_apply_and_the_next_pass_finishes_it(tmp_path, monkeypatch):
+    settings, state, history = prune_host(tmp_path)
+    (tmp_path / "http").mkdir()
+    PruneHost(monkeypatch, [], history)
+    p.write(state / ("1" * 40) / "attempted.json", {"status": "applied"})
+    remove = p.remove_path
+    def cut_short(path, deadline):
+        (Path(path) / "result.json").unlink()
+        raise p.subprocess.TimeoutExpired("rm", 1)
+    monkeypatch.setattr(p, "remove_path", cut_short)
+    summary = p.prune_releases(settings, tmp_path / "http", p.time.monotonic() + 60)
+    assert summary["failed"][0]["reason"] == "TimeoutExpired" and p.unfinished(state) == []
+    assert (state / p.RELEASE_TRASH / ("1" * 40)).is_dir()
+    monkeypatch.setattr(p, "remove_path", remove)
+    p.prune_releases(settings, tmp_path / "http", p.time.monotonic() + 60)
+    assert list((state / p.RELEASE_TRASH).iterdir()) == []
+
+
+# spec: ANYM-689
+def test_the_release_pass_stops_at_its_deadline_and_leaves_the_trash_for_the_next_pass(tmp_path, monkeypatch):
+    settings, state, history = prune_host(tmp_path)
+    (tmp_path / "http").mkdir()
+    (state / p.RELEASE_TRASH / ("1" * 40)).mkdir(parents=True)
+    PruneHost(monkeypatch, [], history)
+    summary = p.prune_releases(settings, tmp_path / "http", p.time.monotonic() - 1)
+    assert summary["interrupted"] == "time budget" and summary["removed"] == []
+    assert (state / p.RELEASE_TRASH / ("1" * 40)).is_dir() and (state / ("1" * 40)).is_dir()
+
+
+# spec: ANYM-689
+def test_a_failed_apply_not_rolled_back_keeps_its_directory_for_the_rollback(tmp_path, monkeypatch):
+    settings, state, history = prune_host(tmp_path)
+    (tmp_path / "http").mkdir()
+    p.write(state / ("1" * 40) / "result.json", {"sha": "1" * 40, "status": "unhealthy"})
+    PruneHost(monkeypatch, [], history)
+    assert "1" * 12 not in p.prune_releases(settings, tmp_path / "http", p.time.monotonic() + 60)["removed"]
+    assert (state / ("1" * 40) / "synthetic.before.json").exists()
+    p.write(state / ("1" * 40) / "rollback.json", {"status": "rolled-back"})
+    assert "1" * 12 in p.prune_releases(settings, tmp_path / "http", p.time.monotonic() + 60)["removed"]
+
+
+# spec: ANYM-689
+def test_an_old_commit_prepared_since_the_current_release_stays_because_it_can_still_apply(tmp_path, monkeypatch):
+    settings, state, history = prune_host(tmp_path)
+    (tmp_path / "http").mkdir()
+    prepared = state / ("1" * 40) / "prepared.json"
+    (state / ("1" * 40) / "result.json").unlink()
+    bound = p.read(prepared)
+    p.write(prepared, {**bound, "current_digest": p.digest(p.read(state / "current.json"))})
+    PruneHost(monkeypatch, [], history)
+    assert "1" * 12 not in p.prune_releases(settings, tmp_path / "http", p.time.monotonic() + 60)["removed"]
+    p.write(prepared, {**bound, "current_digest": "another release"})
+    assert "1" * 12 in p.prune_releases(settings, tmp_path / "http", p.time.monotonic() + 60)["removed"]
+    # A receipt from before `current_digest`: its age against current.json decides.
+    release = tmp_path / "state" / ("6" * 40)
+    (release / "result.json").unlink()
+    newer = (state / "current.json").stat().st_mtime + 5
+    p.os.utime(release / "prepared.json", (newer, newer))
+    assert p.release_in_use(release, set(), p.read(state / "current.json"))
+    p.os.utime(release / "prepared.json", (newer - 10, newer - 10))
+    assert not p.release_in_use(release, set(), p.read(state / "current.json"))
+
+
+# spec: ANYM-689
+def test_an_http_preparation_stays_while_the_generation_it_names_serves(tmp_path):
+    release = tmp_path / "release"
+    release.mkdir()
+    p.write(release / "http-prepared.json", {"previous": {"generation": "a" * 12}})
+    assert p.release_in_use(release, set(), None, {"generation": "a" * 12})
+    assert not p.release_in_use(release, set(), None, {"generation": "b" * 12})
+
+
+# spec: ANYM-689
+def test_the_release_pass_removes_nothing_when_history_or_settlement_is_unknown(tmp_path, monkeypatch):
+    settings, state, history = prune_host(tmp_path)
+    http_state = tmp_path / "http"
+    http_state.mkdir()
+    count = len(list(state.iterdir()))
+    PruneHost(monkeypatch, [], None)
+    assert p.prune_releases(settings, http_state, p.time.monotonic() + 60)["removed"] == []
+    assert len(list(state.iterdir())) == count
+    PruneHost(monkeypatch, [], history[1:])  # the current release is not on main
+    assert p.prune_releases(settings, http_state, p.time.monotonic() + 60)["error"] == "Refused"
+    p.write(state / "current.json", {**p.read(state / "current.json"), "status": "rolled-back"})
+    PruneHost(monkeypatch, [], history)
+    assert p.prune_releases(settings, http_state, p.time.monotonic() + 60)["removed"] == []
+    assert p.prune_releases({}, http_state, p.time.monotonic() + 60)["error"] == "KeyError"
+
+
+# spec: ANYM-689
+def test_the_receipt_that_records_a_retirement_stays_while_that_generations_containers_exist(tmp_path):
+    release = tmp_path / "release"
+    release.mkdir()
+    p.write(release / "http-attempted.json", {"status": "serving"})
+    p.write(release / "http-result.json", {"previous": {"sha": "a" * 40}})
+    assert p.release_in_use(release, {"a" * 40}) and not p.release_in_use(release, {"b" * 40})
+    p.write(release / "http-attempted.json", {"status": "recovery-required"})
+    assert p.release_in_use(release, set())
+    (release / "http-attempted.json").write_text("{broken")
+    assert p.release_in_use(release, set())
+
+
+SHAS = st.sampled_from([f"{number:040x}" for number in range(30)])
+
+
+# spec: ANYM-689
+@given(st.lists(SHAS, unique=True), st.sets(SHAS), st.sets(SHAS), st.integers(0, 8))
+def test_the_release_selector_never_picks_a_protected_newest_or_off_history_directory(history, present, protected, keep):
+    chosen = p.prunable_releases(history, present, protected, keep)
+    ordered = [sha for sha in history if sha in present]
+    assert set(chosen) <= set(ordered) - set(ordered[:keep]) - protected
+    assert set(ordered) - set(chosen) >= set(ordered[:keep]) | (protected & set(ordered))
+    # Idempotent: a second pass over what is left removes nothing more.
+    assert p.prunable_releases(history, present - set(chosen), protected, keep) == []
+
+
+# spec: ANYM-439
+def test_the_containerd_store_keeps_the_image_floor_on_its_disk_and_the_host_floor_on_dockers_root(tmp_path, monkeypatch):
+    free = {}
+    monkeypatch.setattr(p.shutil, "disk_usage", lambda path: SimpleNamespace(free=free.get(Path(path), p.MIN_FREE_BYTES)))
+    docker_root = tmp_path / "docker"
+    p.CONTAINERD_ROOT.mkdir(parents=True)
+    state = tmp_path / "state"
+    free[state] = p.MIN_FREE_BYTES - 1
+    with pytest.raises(p.Refused, match="15 GiB"):
+        p.check_image_space(docker_root, False, state)  # an unknown store keeps the full floor on the state disk
+    free[docker_root] = p.MIN_FREE_BYTES - 1
+    p.check_image_space(docker_root, True, state)  # image bytes do not land on this disk
+    with pytest.raises(p.Refused, match="15 GiB"):
+        p.check_image_space(docker_root)  # an unknown store keeps the full floor on both
+    free[docker_root] = p.HOST_FREE_BYTES - 1
+    with pytest.raises(p.Refused, match="5 GiB"):
+        p.check_image_space(docker_root, True)
+    free[docker_root], free[p.CONTAINERD_ROOT] = p.MIN_FREE_BYTES, p.MIN_FREE_BYTES - 1
+    with pytest.raises(p.Refused, match="containerd"):
+        p.check_image_space(docker_root, True)
+
+
+# spec: ANYM-439
+@pytest.mark.parametrize(("answer", "expected"), [
+    ('[["driver-type","io.containerd.snapshotter.v1"]]', True), ('[["Backing Filesystem","extfs"]]', False), ("not json", False)])
+def test_the_image_store_is_read_from_docker_and_unknown_is_not_containerd(monkeypatch, answer, expected):
+    monkeypatch.setattr(p, "run", lambda argv, **kw: answer)
+    assert p.containerd_image_store() is expected
+
+
+# spec: ANYM-439
+def test_a_disk_close_to_its_floor_warns_before_the_refusal(monkeypatch):
+    usage = {p.CONTAINERD_ROOT: p.MIN_FREE_BYTES + 1, p.DOCKER_ROOT: p.HOST_FREE_BYTES + 1}
+    monkeypatch.setattr(p.shutil, "disk_usage", lambda path: SimpleNamespace(free=usage[Path(path)]))
+    assert [line.split(":")[0] for line in p.disk_warnings()] == [str(p.CONTAINERD_ROOT), str(p.DOCKER_ROOT)]
+    assert p.cleanup_line(None, None)["disk_warnings"] == p.disk_warnings()
+    usage.update({p.CONTAINERD_ROOT: 30 * 1024**3, p.DOCKER_ROOT: 20 * 1024**3})
+    assert p.disk_warnings() == [] and "disk_warnings" not in p.cleanup_line(None, None)
+    monkeypatch.setattr(p.shutil, "disk_usage", lambda path: (_ for _ in ()).throw(OSError()))
+    assert p.disk_warnings() == []
+
+
 class LifecycleHost:
     """A `Deployer` whose docker is a `RetiredHost`: the real container cleanup, image retention and capacity gate run
     against one fake Docker, and the space the gate sees is credited only when image 1 has actually disappeared."""
