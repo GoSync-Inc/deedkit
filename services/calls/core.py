@@ -28,7 +28,8 @@ EXPIRY_INTERVAL_S=30
 EXPIRY_BATCH=20
 # A journal read waits this long for commits in progress, then fails (GET /v1/events answers 503, the router polls
 # again). It retries by itself: a commit excludes readers (rollback journal), and SQLite's own busy wait, 100 ms
-# steps, can miss every gap between a busy writer's commits. A retry holds no lock, so no write ever waits for it.
+# steps, can miss every gap between a busy writer's commits. A refused try holds no lock; a try that gets in holds the
+# shared lock for the same bounded statements as before, so a write can wait for it as long as it always could.
 JOURNAL_BUSY_S=15
 JOURNAL_RETRY_S=0.001
 
@@ -1490,7 +1491,9 @@ class VoiceService:
     def _journal_read(self,read):
         """read(connection) on the journal's connection, again while a commit excludes it, up to JOURNAL_BUSY_S."""
         deadline=time.monotonic()+JOURNAL_BUSY_S
-        with self._read_lock:
+        if not self._read_lock.acquire(timeout=JOURNAL_BUSY_S):
+            raise TimeoutError('journal_read_queue')
+        try:
             while True:
                 try:
                     return read(self._journal())
@@ -1498,6 +1501,8 @@ class VoiceService:
                     if getattr(error,'sqlite_errorcode',0)&0xff!=sqlite3.SQLITE_BUSY or time.monotonic()>=deadline:
                         raise
                 time.sleep(JOURNAL_RETRY_S)
+        finally:
+            self._read_lock.release()
 
     def events_head(self):
         return {'journal_id':self.journal_id,'head':self._journal_read(call_events.head)}
