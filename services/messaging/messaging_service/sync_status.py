@@ -83,6 +83,16 @@ def _history(platform, catalog_ids, rows):
     return result
 
 
+def _live_only(c, account, rows):
+    """Chats with archived messages that no reconcile ever attempted: only live capture reached them."""
+    candidates = [stable_id('chat', account, row['provider_chat']) for row in rows
+                  if not row['initialized'] and row['last_attempt_at'] is None]
+    found = c.execute('''SELECT candidate.id FROM unnest(%s::text[]) AS candidate(id)
+        WHERE EXISTS (SELECT 1 FROM messages m WHERE m.account=%s AND m.chat=candidate.id)
+        ORDER BY candidate.id''', (candidates, account)).fetchall() if candidates else []
+    return {'live_only_chats': len(found), 'live_only_chat_ids': [row['id'] for row in found[:20]]}
+
+
 def _checkpoints(c, p, allowed_chats):
     # collector_chats predates archive chat IDs. Resolve only identifiers first,
     # then fetch checkpoint state exclusively for permitted catalog entries. No
@@ -248,6 +258,8 @@ def get_sync_status(c, p):
         row.update(messages=data.get('messages', 0), oldest_message_at=data.get('oldest_message_at'),
                    newest_message_at=data.get('newest_message_at'))
         row['history'] = _history(row['platform'], catalog_ids.get(account, set()), checkpoints.get(account, []))
+        if row['platform'] == 'telegram':
+            row['history'].update(_live_only(c, account, checkpoints.get(account, [])))
         if not scoped:
             open_by_class,row['active_conflicts'],row['historical_conflicts']=conflicts.get(account,({},0,0))
             row['conflicts']=report(open_by_class)

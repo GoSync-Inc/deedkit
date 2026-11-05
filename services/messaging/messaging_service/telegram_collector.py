@@ -138,18 +138,23 @@ def private_json(path):
         return json.load(source)
 
 
+# Head pages of one chat per reconcile pass: a chat above one page per pass otherwise falls behind for good.
+HEAD_PAGES_PER_PASS=10
+HEAD_PAGES_RANGE=('head_pages_per_pass',HEAD_PAGES_PER_PASS,1,100)
+
+
 def configuration(path):
     cfg=private_json(path)
     fields={'enabled','account','credentials_file','session_file','permit_file','spool_directory',
             'batch_size','scan_interval_seconds','max_media_bytes','disk_reserve_bytes',
-            'max_dialogs','history_since','media_backfill','live_search_budget'}|MEDIA_POLICY_FIELDS
+            'max_dialogs','history_since','media_backfill','live_search_budget','head_pages_per_pass'}|MEDIA_POLICY_FIELDS
     validate_common(cfg,fields)
     for key in ['credentials_file','session_file','permit_file','spool_directory']:
         if not isinstance(cfg.get(key),str) or not Path(cfg[key]).is_absolute(): raise ValueError('invalid_private_path')
     if not cfg['session_file'].endswith('.session'): raise ValueError('invalid_session_filename')
     validate_ranges(cfg,[('batch_size',100,1,100),('scan_interval_seconds',60,10,3600),
                          ('max_media_bytes',512*1024**2,1,4*1024**3),
-                         ('disk_reserve_bytes',1024**3,1024**3,100*1024**3)])
+                         ('disk_reserve_bytes',1024**3,1024**3,100*1024**3),HEAD_PAGES_RANGE])
     configure_media_policy(cfg)
     if type(cfg.setdefault('media_backfill',True)) is not bool: raise ValueError('invalid_media_backfill')
     maximum=cfg.setdefault('max_dialogs',None)
@@ -512,14 +517,18 @@ def chat_error_evidence(error):
 
 class TelegramCollector:
     state_class=CollectorState
+    head_pages=HEAD_PAGES_PER_PASS
+    _pass_head_capped=None
     coverage_code='telegram_history_partial'
     connect_timeout=60
     retry_connect=False
     database_retry=2
     def __init__(self,archive,account,provider,spool,*,batch_size=100,interval=60,max_dialogs=None,
                  writer=None,owner=None,lease_ttl=60,heartbeat_interval=15,history_since=None,
-                 live_writer=None,live_window_seconds=86400,media_prefetch_days=None,media_backfill=False):
+                 live_writer=None,live_window_seconds=86400,media_prefetch_days=None,media_backfill=False,
+                 head_pages=HEAD_PAGES_PER_PASS):
         self.archive,self.account,self.provider,self.spool=archive,account,provider,spool
+        self.head_pages=head_pages;self._head_capped=set()
         self.batch_size,self.interval,self.max_dialogs=batch_size,interval,max_dialogs
         self.history_since=history_since
         self.media_prefetch_days=validate_prefetch_days(media_prefetch_days)
@@ -748,15 +757,21 @@ class TelegramCollector:
                 history_before=boundary,exhausted=len(recent)<self.batch_size and len(kept)==len(recent),
                 initialized=True,window_complete=len(kept)<len(recent),head_complete=True)
             return
-        new=await self.chat_page(chat,limit=self.batch_size,min_id=state['high_water'],reverse=True)
-        await self.commit_page(self.in_window(new),chat,title,kind,'reconcile')
-        if new: await asyncio.to_thread(self.state.checkpoint,chat,high_water=max(m.id for m in new))
+        high_water=state['high_water']
+        for _ in range(self.head_pages):
+            new=await self.chat_page(chat,limit=self.batch_size,min_id=high_water,reverse=True)
+            await self.commit_page(self.in_window(new),chat,title,kind,'reconcile')
+            if new:
+                high_water=max(high_water,*(m.id for m in new))
+                await asyncio.to_thread(self.state.checkpoint,chat,high_water=high_water)
+            if len(new)<self.batch_size:break
         # Recent overlap catches edits after the library's update state advanced
         # ahead of durable capture. It cannot prove absence of older edits/deletes.
         recent=await self.chat_page(chat,limit=self.batch_size)
         await self.commit_page(self.in_window(recent),chat,title,kind,'reconcile')
         if len(new)<self.batch_size:
             await asyncio.to_thread(self.state.checkpoint,chat,head_complete=True)
+        else:self._head_capped.add(chat)
         if not state['history_exhausted'] and not state['window_complete'] and state['history_before']:
             older=await self.chat_page(chat,limit=self.batch_size,before=state['history_before'])
             kept=self.in_window(older)
@@ -771,7 +786,7 @@ class TelegramCollector:
     async def sync_once(self):
         from telethon.errors import ChannelPrivateError,ChatAdminRequiredError,PeerIdInvalidError,FloodWaitError
         self.policy=await asyncio.to_thread(self.state.policy)
-        discovery_failed=None
+        discovery_failed=None;self._head_capped=set()
         if self._dialog_cache is None or time.monotonic()>=self._next_discovery:
             await asyncio.to_thread(self.state.status,'receiving','telegram_discovery')
             await asyncio.to_thread(self.state.discovery_started)
@@ -834,6 +849,7 @@ class TelegramCollector:
         # A pass over the previous catalog after a failed discovery keeps the discovery code (ANYM-749).
         if discovery_failed: code=discovery_failed
         await asyncio.to_thread(self.state.status,'degraded' if missing or unavailable or discovery_failed else 'receiving',code)
+        self._pass_head_capped=len(self._head_capped)
 
     async def reconcile_loop(self):
         from telethon.errors import FloodWaitError
@@ -842,8 +858,14 @@ class TelegramCollector:
             getattr(self.provider,'verified_self',None))
         backoff=DbBackoff(self)
         while True:
-            try: await self.sync_once()
+            try:
+                await self.sync_once()
+                # Only a pass that reached its end replaces the count; a failed write keeps it for the next try.
+                if self._pass_head_capped is not None:
+                    await asyncio.to_thread(self.state.head_capped,self._pass_head_capped)
+                    self._pass_head_capped=None
             except (FloodWaitError,ProviderRateLimited) as exc:
+                print(json.dumps({'event':'telegram_rate_limited','seconds':exc.seconds}),flush=True)
                 if isinstance(exc,FloodWaitError):await asyncio.to_thread(self.state.defer,max(1,exc.seconds))
                 await asyncio.to_thread(self.state.status,'degraded','rate_limited')
                 governor=getattr(self.provider,'governor',None)
@@ -1456,7 +1478,7 @@ async def run_config(path):
                 reserve_bytes=cfg['media_live_disk_reserve_bytes'])
                 if cfg['media_live_disk_reserve_bytes'] is not None else None)
             worker=TelegramCollector(archive,cfg['account'],TelethonProvider(cfg,auth),spool,
-                batch_size=cfg['batch_size'],interval=cfg['scan_interval_seconds'],max_dialogs=cfg['max_dialogs'],
+                batch_size=cfg['batch_size'],interval=cfg['scan_interval_seconds'],max_dialogs=cfg['max_dialogs'],head_pages=cfg['head_pages_per_pass'],
                 history_since=cfg['history_since'],media_prefetch_days=cfg['media_prefetch_days'],
                 live_writer=live_writer,live_window_seconds=cfg['media_live_window_seconds'],
                 media_backfill=cfg['media_backfill'],
