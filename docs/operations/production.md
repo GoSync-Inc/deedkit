@@ -239,6 +239,27 @@ cannot be read, the state directory, Docker's root and `/var/lib/containerd` all
 runtime data. Free capacity through a reviewed, targeted operation
 or add storage before retrying.
 
+### Files volume on its own disk (host, 11-05)
+
+The current production host keeps original files on Hetzner volume `deedkit-files`
+(`/mnt/HC_Volume_107370696`, tree `anymsg-files`), bind-mounted by `/etc/fstab` over
+`/var/lib/docker/volumes/personal-os-probe_files/_data`. The Docker volume name, Compose
+and the backup's `files_volume` do not change, and a container gets the disk when it starts. Both
+fstab lines carry `nofail` and `x-systemd.before=docker.service`, an ordering and no
+dependency: Docker and unrelated services start without the volume. The old tree under
+the mount is `root:root` mode 000, so without the volume a file consumer gets EACCES
+rather than stale data.
+
+- **The disk floors above do not watch this disk.** `disk_warnings` reads containerd and
+  Docker's root. Collectors stop background media at 19 GiB free here and live capture at 3 GiB.
+- **Named volumes are `master:` mounts here, not rprivate.** A mount placed directly on
+  `_data` reaches every running volume container at once: `ro` consumers become
+  writable and the nested `.uploads` bind is hidden. Never mount there while containers
+  run without first making the parent private (`mount --bind P P; mount --make-private P`).
+- **Never `systemctl stop` that mount unit;** use a plain `umount`. A consumer moves to
+  the other disk only at its next start, so an undo needs both trees kept in sync until
+  every consumer has been recreated.
+
 ## CI-published images
 
 Every `main` push run publishes the nine images its `images / build (<target>)`
