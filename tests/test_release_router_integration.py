@@ -169,9 +169,26 @@ class RouterProof:
     def docker(*arguments, check=True):
         result = subprocess.run(["docker", *map(str, arguments)], capture_output=True,
                                 text=True, timeout=45)
-        if check:
-            assert result.returncode == 0, result.stderr or result.stdout
+        if check and result.returncode != 0:
+            detail = result.stderr or result.stdout
+            if arguments[0] == "exec":
+                detail = f"docker exec exit {result.returncode}: {detail} {RouterProof.container_state(arguments[1])}"
+            raise AssertionError(detail)
         return result
+
+    @staticmethod
+    def container_state(name):
+        """Who killed a `docker exec`: its 137 alone does not say (run 41961829012). The template reads `.State` only, so the
+        message can never carry the container's environment. A failed read keeps the exec's own failure."""
+        try:
+            result = subprocess.run(["docker", "inspect", "--format",
+                                     "OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}}", str(name)],
+                                    capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError) as error:
+            return f"container state unavailable: {type(error).__name__}"
+        if result.returncode != 0:
+            return f"container state unavailable: {result.stderr.strip()}"
+        return result.stdout.strip()
 
     def start(self):
         self.docker("info", "--format", "{{.ServerVersion}}")
@@ -275,7 +292,8 @@ class RouterProof:
                     return
             time.sleep(.05)
         logs = self.docker("logs", "--tail", "8", self.router)
-        pytest.fail("isolated router did not become ready: " + logs.stderr + result.stderr)
+        state = " " + self.container_state(self.client) if result.returncode else ""
+        pytest.fail("isolated router did not become ready: " + logs.stderr + result.stderr + state)
 
     def get(self):
         return self.client_call("get")
@@ -306,6 +324,69 @@ class RouterProof:
             if result.returncode:
                 failures.append(result.stderr)
         assert not failures, failures
+
+
+def scripted_docker(inspect):
+    """A fake subprocess.run: every `docker exec` dies with 137, `docker inspect` answers with `inspect`."""
+    calls = []
+
+    def run(command, **_options):
+        calls.append(command)
+        if command[1] == "inspect":
+            if isinstance(inspect, Exception):
+                raise inspect
+            return inspect
+        return subprocess.CompletedProcess(command, 137 if command[1] == "exec" else 0, "", "")
+
+    return run, calls
+
+
+# spec: ANYM-791
+def test_a_failed_docker_exec_reports_the_container_state_from_a_format_limited_inspect(tmp_path):
+    answer = subprocess.CompletedProcess([], 0, "OOMKilled=true ExitCode=0\n", "")
+    run, calls = scripted_docker(answer)
+    proof = RouterProof(tmp_path, "sha256:" + "0" * 64)
+    with patch.object(subprocess, "run", run), pytest.raises(AssertionError) as failure:
+        proof.client_call("get")
+    assert "OOMKilled=true ExitCode=0" in str(failure.value) and "137" in str(failure.value)
+    assert calls[-1] == ["docker", "inspect", "--format",
+                         "OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}}", proof.client]
+
+
+# spec: ANYM-791
+@pytest.mark.parametrize("answer", [
+    subprocess.CompletedProcess([], 1, "", "No such container\n"),
+    subprocess.TimeoutExpired(["docker", "inspect"], 15),
+    FileNotFoundError("docker"),
+], ids=["gone", "timeout", "no-docker"])
+def test_a_state_read_that_fails_keeps_the_exec_failure(tmp_path, answer):
+    run, _calls = scripted_docker(answer)
+    proof = RouterProof(tmp_path, "sha256:" + "0" * 64)
+    with patch.object(subprocess, "run", run), pytest.raises(AssertionError) as failure:
+        proof.client_call("get")
+    assert "137" in str(failure.value) and "container state unavailable" in str(failure.value)
+
+
+# spec: ANYM-791
+def test_the_state_is_read_only_when_a_checked_exec_fails(tmp_path):
+    run, calls = scripted_docker(subprocess.CompletedProcess([], 0, "", ""))
+    proof = RouterProof(tmp_path, "sha256:" + "0" * 64)
+    with patch.object(subprocess, "run", run):
+        assert proof.docker("network", "create", "synthetic").returncode == 0
+        assert proof.client_call("cas", check=False).returncode == 137  # the caller expects and reads this one
+    assert [command[1] for command in calls] == ["network", "exec"]
+
+
+# spec: ANYM-791
+def test_a_router_that_never_gets_ready_reports_the_container_state(tmp_path):
+    answer = subprocess.CompletedProcess([], 0, "OOMKilled=false ExitCode=137\n", "")
+    run, _calls = scripted_docker(answer)
+    proof = RouterProof(tmp_path, "sha256:" + "0" * 64)
+    ticks = iter(range(0, 1000, 10))  # one look inside the 15 s readiness deadline, the next past it
+    with (patch.object(subprocess, "run", run), patch.object(time, "monotonic", lambda: next(ticks)),
+          patch.object(time, "sleep", lambda _seconds: None), pytest.raises(pytest.fail.Exception) as failure):
+        proof.wait_ready()
+    assert "OOMKilled=false ExitCode=137" in str(failure.value)
 
 
 @pytest.fixture(scope="module")
