@@ -230,9 +230,9 @@ def decorate_messages(c,p,rows,*,include_system=False):
           AND (s.account,s.chat,s.sent_at) IN(SELECT account,chat,sent_at FROM messages WHERE id=ANY(%s))
         GROUP BY s.account,s.chat,s.sent_at,a.platform''',[*args,ids]).fetchall()
     ties={(r['account'],r['chat'],r['sent_at']):r for r in siblings}
-    # A receipt says ready even when the original is gone: its text is not being prepared (get_file_text's rule).
-    from .result_evidence import _readable
-    lost={f['attachment_id'] for r in rows for f in r.get('attachments') or [] if _preparing(f) and not _readable(c,f)}
+    # A receipt says ready even when the original is gone, so nothing can prepare its text. A filesystem check, no SQL.
+    from .result_evidence import original_present
+    lost={f['attachment_id'] for r in rows for f in r.get('attachments') or [] if _preparing(f) and not original_present(f)}
     for position,row in enumerate(rows,1):
         tied=ties.get((row['account'],row['chat'],row['sent_at']))
         platform=(tied or {}).get('platform',row.get('platform'))

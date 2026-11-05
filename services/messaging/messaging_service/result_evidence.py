@@ -77,6 +77,13 @@ def delivery_evidence(c,rows):
         row['delivery_receipt']=proofs.get(row.get('id') or row.get('message'),unknown_evidence())
 
 
+def original_present(file):
+    """The original is resident now; a filesystem check only (ANYM-664: no new SQL on a message read)."""
+    from .file_index import _available
+    root=FILES_ROOT.get()
+    return root is not None and bool(file.get('digest')) and _available(root,{'sha256':file['digest'],'bytes':file['bytes']})
+
+
 def _readable(c,file):
     """get_file_text's rule: the original is resident, or gone by a completed managed eviction."""
     from .file_index import _absent,_available

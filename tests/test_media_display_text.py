@@ -51,9 +51,9 @@ def excerpt(text=WORDS, *, source='transcript', complete=True):
             'excerpt_chars': len(text), 'total_chars': len(text), 'complete': complete, 'read_more': None}
 
 
-def voice_row(*files, **fields):
+def voice_row(*files, lost=(), **fields):
     return present_message({'id': 'm', 'body': '', 'message_kind': 'voice', 'media_duration_seconds': 74,
-                            'attachments': list(files), **fields}, 1)
+                            'attachments': list(files), **fields}, 1, lost=lost)
 
 
 # spec: ANYM-664
@@ -176,8 +176,12 @@ def test_preparing_reason_is_read_per_downloaded_file():
 
 
 # spec: ANYM-664
-def test_missing_original_with_queued_text_keeps_its_label(seeded):
+def test_missing_original_with_queued_text_keeps_its_label(seeded, monkeypatch):
     s, _, b = seeded
+    # The check adds no SQL: the eviction journal is never read for a file with no text yet.
+    def no_query(*_):
+        raise AssertionError('a message read asked the eviction journal')
+    monkeypatch.setattr('messaging_service.file_lifecycle.is_managed_evicted', no_query)
     add(s, 'voice-1', 'voice')
     digest = add_file(s, 'voice-note', 'voice-1', b'synthetic-audio', 'memo.ogg', 'audio/ogg')
     with s.pool.connection() as c:
@@ -262,8 +266,10 @@ def test_long_caption_does_not_hide_the_excerpt(seeded):
 def test_button_with_the_excerpts_words_does_not_take_the_quotes_place():
     row = voice_row(attachment(excerpt('words')), body='cap', buttons=[{'text': '«words»'}])
     assert row['display_text'] == 'cap\n[Голосовое 1:14] «words»\n[Кнопки] «words»'
-    cap_display_text(row, 18)
-    assert row['display_text'] == 'cap\n[Голосовое 1:1 «words»'
+    # The cap falls just past the label, so the button's copy of the words is inside the kept text's reach.
+    cap_display_text(row, 22)
+    assert row['display_text'] == 'cap\n[Голосовое 1:14] «words»\n['
+    assert 'cap\n[Голосовое 1:14] «words»\n[' in presentation([{**row, 'sent_at': None}])['transcript']
 
 
 # spec: ANYM-664
