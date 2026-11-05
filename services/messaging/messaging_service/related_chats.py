@@ -146,13 +146,17 @@ def _find(c,p,todo,floor):
             # Alias chats and a new chat's own twin leave the lookup in SQL, before the cap counts anything.
             aliases,twins=_aliases(run,p)
             candidates={}
+            # The window stays outside the OFFSET 0 subquery. The pattern and dates are lateral parameters the planner
+            # cannot estimate, so a date index reachable from here could walk the whole window for one match.
             for r in run.rows('candidates','''SELECT q.i,o.* FROM jsonb_to_recordset(%s::jsonb) AS q(i int,copy_at timestamptz,pattern text,skip jsonb)
                 CROSS JOIN LATERAL (SELECT m.id,m.chat,m.sent_at,lower(left(m.body,%s)) AS body,char_length(m.body)>%s AS long,
                     c.title,c.chat_type
-                  FROM messages m JOIN chats c ON c.id=m.chat AND c.purged_at IS NULL
-                  WHERE '''+msg_scope+''' AND m.direction='outgoing' AND NOT m.deleted AND NOT m.purged
-                    AND m.chat NOT IN (SELECT jsonb_array_elements_text(q.skip))
-                    AND m.sent_at<=q.copy_at AND m.sent_at>=q.copy_at-%s*interval '1 day' AND lower(m.body) LIKE q.pattern
+                  FROM (SELECT m.id,m.chat,m.sent_at,m.body FROM messages m
+                    WHERE '''+msg_scope+''' AND m.direction='outgoing' AND NOT m.deleted AND NOT m.purged
+                      AND m.chat NOT IN (SELECT jsonb_array_elements_text(q.skip))
+                      AND lower(m.body) LIKE q.pattern OFFSET 0) m
+                  JOIN chats c ON c.id=m.chat AND c.purged_at IS NULL
+                  WHERE m.sent_at<=q.copy_at AND m.sent_at>=q.copy_at-%s*interval '1 day'
                   ORDER BY m.sent_at DESC,m.id DESC LIMIT '''+str(MAX_CANDIDATES+1)+') o',
                 [json.dumps([{'i':q['i'],'copy_at':q['at'].isoformat(),'pattern':_like(q['token']),
                     'skip':sorted(aliases|{twins[q['chat']]}) if q['chat'] in twins else sorted(aliases)} for q in pairs]),
