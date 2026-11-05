@@ -96,6 +96,7 @@ class WorkerStopping(Exception):
 STOP=threading.Event()
 CHILDREN=set()
 REQUEUE_SECONDS=30
+FINISH_RETRY_SECONDS=30
 BACKPRESSURE_CAP_SECONDS=900
 # After a pass that failed on a transient database error: this delay, doubled per consecutive failure up to the limit.
 DB_RETRY_SECONDS=5
@@ -312,6 +313,8 @@ class EnrichmentWorker:
             candidates.sort(key=lambda item:(not item[0]['fresh'],item[0]['last_started_at'],-item[0]['sent_at'].timestamp()))
             for row,kind,profile,ph in candidates:
                 token=uuid4();ttl=profile['timeout_seconds']+60
+                # Read before the UPDATE starts the database's clock, so this end is never later than e.lease_until.
+                lease_end=time.monotonic()+ttl
                 resource_lease=None
                 if resource_admission.local_heavy(profile):
                     resource_lease=resource_admission.acquire(c,self.lock_directory,'enrichment',row['attachment'],token,ttl)
@@ -336,7 +339,8 @@ class EnrichmentWorker:
                     raise
                 return {**row,'kind':kind,'provider':profile['provider'],'model':profile['model'],
                     'attempts':1 if row['profile_hash']!=ph else row['attempts']+1,
-                    'lease_token':token,'profile_hash':ph,'_resource_lease':resource_lease,'_claim_day':claim_day},profile
+                    'lease_token':token,'profile_hash':ph,'_resource_lease':resource_lease,'_claim_day':claim_day,
+                    '_lease_end':lease_end},profile
         return None
     def finish(self,row,result=None,error=None):
         try:return self._finish(row,result,error)
@@ -390,6 +394,25 @@ class EnrichmentWorker:
             resource_admission.release(c,row.get('_resource_lease'))
             if finished and error:resource_admission.pause_profile(c,row['account'],row['kind'],row['profile_hash'],error)
             return finished
+    def write_result(self,row,result):
+        """Write a good result, trying a transient database error again for FINISH_RETRY_SECONDS while the lease lasts.
+
+        A replay is harmless: the token-matched UPDATE finds nothing once the first one committed. Returns the transient
+        error it gave up on (at the deadline or on a stop), else None; the job then stays under its lease with no failure
+        written. Any other error propagates with the resource lease open, for the failure's own finish to close."""
+        deadline=min(time.monotonic()+FINISH_RETRY_SECONDS,row['_lease_end'])
+        while True:
+            try:self._finish(row,result)
+            except psycopg.OperationalError as error:
+                if not transient_database_error(error):raise
+                left=deadline-time.monotonic()
+                # The clock again after the wait: a late wakeup must not start an attempt past the deadline.
+                if left>0 and not STOP.is_set() and not STOP.wait(min(1,left)) and time.monotonic()<deadline:continue
+                unwritten=error
+            else:unwritten=None
+            lease=row.get('_resource_lease')
+            if lease:lease.close()
+            return unwritten
     def _requeue(self,row):
         with self.connection() as c:
             c.execute('''UPDATE attachment_enrichment SET state='queued',error_code='worker_stopping',
@@ -452,7 +475,7 @@ class EnrichmentWorker:
         claim=self.claim()
         if not claim:return False
         row,profile=claim
-        try:self.finish(row,self.processor(self.files,row,profile))
+        try:unwritten=self.write_result(row,self.processor(self.files,row,profile))
         except WorkerStopping:
             self.requeueing=True
             self.requeue(row)
@@ -462,6 +485,9 @@ class EnrichmentWorker:
             from .telemetry import capture
             capture(error, 'enrichment_failed')
             self.finish(row,error='enrichment_failed')
+        else:
+            # Outside the handlers above, so it reaches the backoff in run() as no recorded failure.
+            if unwritten:raise unwritten
         return True
     def run(self):
         guard=self.confinement

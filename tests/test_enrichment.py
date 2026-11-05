@@ -1389,7 +1389,7 @@ def test_a_finish_that_keeps_timing_out_leaves_the_worker_running_and_the_job_un
     s,_,_=seeded;add_audio(s)
     w=stopping_worker(s,tmp_path,module);w.processor=lambda files,row,profile:normalize_result({'text':'synthetic'},audio=True)
     def broken(row,result=None,error=None):raise psycopg.errors.QueryCanceled('synthetic lock wait')
-    monkeypatch.setattr(w,'_finish',broken)
+    monkeypatch.setattr(w,'_finish',broken);monkeypatch.setattr(module,'FINISH_RETRY_SECONDS',0)
     def wait(seconds=None):
         waited.append(seconds)
         if seconds==10:module.STOP.set()     # the idle wait of the pass after the backoff: nothing else to claim
@@ -1421,6 +1421,192 @@ def assert_survived_under_lease(s,w,module,monkeypatch):
     again['_resource_lease'].close()
     with s.pool.connection() as c:
         c.execute("UPDATE processing_resource_leases SET lease_until=clock_timestamp() WHERE resource='local-heavy'")
+
+
+class CountingLease:
+    """The claim's resource lease; each close records how many writes had started by then."""
+    def __init__(self,lease,closes,writes):self.lease,self.token,self.closes,self.writes=lease,lease.token,closes,writes
+    def close(self):
+        self.closes.append(len(self.writes));self.lease.close()
+
+
+def result_worker(s,tmp_path,module,monkeypatch,*,before=None,after=None):
+    """A worker with a good result. `before(n)`/`after(n)` run around the real n-th write and may raise. Waits advance
+    a fake clock instead of sleeping; the idle wait of a later pass stops the worker."""
+    from types import SimpleNamespace
+    add_audio(s)
+    w=stopping_worker(s,tmp_path,module);w.processor=lambda files,row,profile:normalize_result({'text':'synthetic'},audio=True)
+    run=SimpleNamespace(worker=w,writes=[],waited=[],closes=[],captured=[],now=0.0)
+    real_finish,real_claim=w._finish,w.claim
+    def write(row,result=None,error=None):
+        run.writes.append(error)
+        if before:before(len(run.writes))
+        written=real_finish(row,result,error)
+        if after:after(len(run.writes))
+        return written
+    def claim():
+        claimed=real_claim()
+        if claimed:claimed[0]['_resource_lease']=CountingLease(claimed[0]['_resource_lease'],run.closes,run.writes)
+        return claimed
+    def wait(seconds=None):
+        run.waited.append(seconds);run.now+=seconds or 0
+        if seconds==10:module.STOP.set()
+        return module.STOP.is_set()
+    monkeypatch.setattr(w,'_finish',write);monkeypatch.setattr(w,'claim',claim)
+    monkeypatch.setattr(module,'time',SimpleNamespace(monotonic=lambda:run.now,sleep=lambda *_:None))
+    monkeypatch.setattr(module.STOP,'wait',wait)
+    monkeypatch.setattr('messaging_service.telemetry.capture',lambda error,code:run.captured.append(code))
+    return run
+
+
+def enrichment_row(s):
+    with s.pool.connection() as c:
+        return c.execute("SELECT state,attempts,error_code FROM attachment_enrichment WHERE attachment='enrich-audio'").fetchone()
+
+
+def statement_times_out(attempt):
+    import psycopg
+    raise psycopg.errors.QueryCanceled('synthetic statement timeout')
+
+
+# spec: ANYM-787
+def test_a_transient_error_writing_a_good_result_is_retried_and_records_no_failure(seeded,tmp_path,monkeypatch,stop_state):
+    s,_,_=seeded
+    def once_then_ok(attempt):
+        if attempt==1:statement_times_out(attempt)
+    run=result_worker(s,tmp_path,stop_state,monkeypatch,before=once_then_ok)
+    assert run.worker.once() is True
+    assert enrichment_row(s)=={'state':'ready','attempts':1,'error_code':None}
+    assert run.writes==[None,None] and run.waited==[1] and run.captured==[]
+    assert run.closes==[2]      # the resource lease closes once, after the last write
+
+
+# spec: ANYM-787
+def test_a_result_write_that_runs_out_of_retries_records_no_failure_and_reaches_the_backoff(seeded,tmp_path,monkeypatch,stop_state):
+    s,_,_=seeded;module=stop_state
+    run=result_worker(s,tmp_path,module,monkeypatch,before=statement_times_out)
+    run.worker.run()
+    attempts=module.FINISH_RETRY_SECONDS
+    assert run.writes==[None]*attempts      # one second apart; never a write of the failure
+    assert run.waited==[1]*module.FINISH_RETRY_SECONDS+[module.DB_RETRY_SECONDS,10]     # the next pass ran: the worker kept running
+    assert run.closes==[attempts]
+    assert_survived_under_lease(s,run.worker,module,monkeypatch)
+
+
+# spec: ANYM-787
+def test_the_result_write_stops_retrying_when_the_lease_ends(seeded,tmp_path,monkeypatch,stop_state):
+    import psycopg
+    s,_,_=seeded;module=stop_state
+    monkeypatch.setattr(module,'FINISH_RETRY_SECONDS',10**6,raising=False)
+    run=result_worker(s,tmp_path,module,monkeypatch,before=statement_times_out)
+    ttl=run.worker.config['profiles']['audio']['timeout_seconds']+60
+    with pytest.raises(psycopg.errors.QueryCanceled):run.worker.once()
+    assert len(run.writes)==ttl and run.closes==[ttl]
+    assert_survived_under_lease(s,run.worker,module,monkeypatch)
+
+
+# spec: ANYM-787
+@pytest.mark.parametrize('late,started,waited',[(0,[0,1,2],[1,1,0.5]),(5,[0],[1])],ids=['on_time','late_wakeup'])
+def test_no_result_write_starts_past_the_retry_window(seeded,tmp_path,monkeypatch,stop_state,late,started,waited):
+    import psycopg
+    s,_,_=seeded;module=stop_state;starts=[]
+    monkeypatch.setattr(module,'FINISH_RETRY_SECONDS',2.5,raising=False)
+    def fails(attempt):
+        starts.append(run.now);statement_times_out(attempt)
+    run=result_worker(s,tmp_path,module,monkeypatch,before=fails)
+    def wait(seconds=None):
+        run.waited.append(seconds);run.now+=seconds+late
+        return False
+    monkeypatch.setattr(module.STOP,'wait',wait)
+    with pytest.raises(psycopg.errors.QueryCanceled):run.worker.once()
+    assert starts==started and run.waited==waited and run.closes==[len(started)]
+    assert_survived_under_lease(s,run.worker,module,monkeypatch)
+
+
+# spec: ANYM-787
+def test_a_write_that_committed_and_then_raised_publishes_nothing_on_the_retry(seeded,tmp_path,monkeypatch,stop_state):
+    from messaging_service import processing_events
+    s,_,_=seeded;published=[]
+    real_publish=processing_events.publish
+    def publish(c,row,**fields):
+        published.append(fields['state']);return real_publish(c,row,**fields)
+    monkeypatch.setattr(processing_events,'publish',publish)
+    def lost_answer(attempt):
+        if attempt==1:statement_times_out(attempt)
+    run=result_worker(s,tmp_path,stop_state,monkeypatch,after=lost_answer)
+    assert run.worker.once() is True
+    assert enrichment_row(s)=={'state':'ready','attempts':1,'error_code':None}
+    assert run.writes==[None,None] and published==['ready'] and run.captured==[] and run.closes==[2]
+    with s.pool.connection() as c:
+        assert c.execute('SELECT count(*) n FROM events WHERE kind=%s',(processing_events.READY_KINDS['transcript'],)).fetchone()['n']==1
+
+
+def raises(error):
+    def processor(files,row,profile):raise error
+    return processor
+
+
+def _synthetic_write_errors():
+    import psycopg
+    return {'insufficient_privilege':psycopg.errors.InsufficientPrivilege('synthetic'),
+        'refused_login':psycopg.OperationalError('connection failed: password authentication failed'),
+        'other_operational_sqlstate':psycopg.errors.InsufficientResources('synthetic')}
+
+
+# spec: ANYM-787
+@pytest.mark.parametrize('name',sorted(_synthetic_write_errors()))
+def test_a_database_error_that_is_not_transient_still_records_enrichment_failed(seeded,tmp_path,monkeypatch,stop_state,name):
+    s,_,_=seeded
+    def first(attempt):
+        if attempt==1:raise _synthetic_write_errors()[name]
+    run=result_worker(s,tmp_path,stop_state,monkeypatch,before=first)
+    assert run.worker.once() is True
+    assert enrichment_row(s)=={'state':'failed','attempts':1,'error_code':'enrichment_failed'}
+    assert run.writes==[None,'enrichment_failed'] and run.waited==[] and run.captured==['enrichment_failed']
+    assert run.closes==[2]
+
+
+# spec: ANYM-787
+@pytest.mark.parametrize('processor,code,writes,captured',[
+    (raises(ModelError('model_timeout')),'model_timeout',['model_timeout'],[]),
+    (raises(RuntimeError('synthetic')),'enrichment_failed',['enrichment_failed'],['enrichment_failed']),
+    (lambda files,row,profile:{'text':5},'invalid_model_response',[None,'invalid_model_response'],[]),
+],ids=['model_error','processor_exception','invalid_result'])
+def test_the_other_failures_record_their_codes_as_before(seeded,tmp_path,monkeypatch,stop_state,processor,code,writes,captured):
+    s,_,_=seeded
+    run=result_worker(s,tmp_path,stop_state,monkeypatch);run.worker.processor=processor
+    assert run.worker.once() is True
+    assert enrichment_row(s)=={'state':'failed','attempts':1,'error_code':code}
+    assert run.writes==writes and run.waited==[] and run.captured==captured
+    assert run.closes==[len(writes)]
+
+
+# spec: ANYM-787
+def test_a_processor_that_raises_a_transient_database_error_still_records_enrichment_failed(seeded,tmp_path,monkeypatch,stop_state):
+    import psycopg
+    s,_,_=seeded
+    run=result_worker(s,tmp_path,stop_state,monkeypatch);run.worker.processor=raises(psycopg.errors.QueryCanceled('synthetic'))
+    assert run.worker.once() is True
+    assert enrichment_row(s)=={'state':'failed','attempts':1,'error_code':'enrichment_failed'}
+    assert run.writes==['enrichment_failed'] and run.waited==[] and run.closes==[1]
+
+
+# spec: ANYM-787
+@pytest.mark.parametrize('stop_during_wait',[False,True],ids=['already_set','during_the_wait'])
+def test_a_stop_ends_the_result_write_retry_at_once(seeded,tmp_path,monkeypatch,stop_state,stop_during_wait):
+    import psycopg
+    s,_,_=seeded;module=stop_state
+    def fails(attempt):
+        if not stop_during_wait:module.STOP.set()
+        statement_times_out(attempt)
+    run=result_worker(s,tmp_path,module,monkeypatch,before=fails)
+    if stop_during_wait:
+        def wait(seconds=None):
+            run.waited.append(seconds);module.STOP.set();return True
+        monkeypatch.setattr(module.STOP,'wait',wait)
+    with pytest.raises(psycopg.errors.QueryCanceled):run.worker.run()      # the existing stop path ends the worker
+    assert run.writes==[None] and run.waited==([1] if stop_during_wait else []) and run.closes==[1]
+    assert_survived_under_lease(s,run.worker,module,monkeypatch)
 
 
 # spec: ANYM-688
