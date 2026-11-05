@@ -176,6 +176,7 @@ def test_no_worker_needs_no_queue(s, settings, raised):
     assert codes(s) == ({'enrichment_no_worker'} if raised else set())
 
 
+# spec: ANYM-785
 def test_the_thresholds_are_named_with_the_card_defaults():
     assert (health.STALL_S, health.STARVED_ROWS, health.STARVED_MAX_AGE_S, health.NO_WORKER_S, health.NO_WORKER_MAX_AGE_S,
             health.CHECK_PERIOD_S, health.REPEAT_S) == (6*3600, 50, 48*3600, 1800, 7*86400, 300, 86400)
@@ -260,6 +261,7 @@ def test_without_telemetry_the_read_still_works(s, monkeypatch):
     assert health.read([TG])['accounts'][TG]['codes'] == ['enrichment_no_worker']
 
 
+# spec: ANYM-785
 def test_sdk_client_accepts_the_event():
     transport = Transport()
     client = Client('https://synthetic-key@ingest.example.test/synthetic-project',
@@ -338,12 +340,13 @@ class LifespanStore:
         return {}
 
 
-def serve(monkeypatch, store, seen):
+def serve(monkeypatch, store, seen, database=False):
     """A fast API whose heartbeat proves the other lifespan tasks keep running."""
     import messaging_service.heartbeats as heartbeats
     monkeypatch.setattr(health, 'CHECK_PERIOD_S', .01)
     monkeypatch.setattr(heartbeats, 'HEARTBEAT_S', .01)
-    monkeypatch.setattr(heartbeats, 'record', lambda *_: seen.set() or True)
+    real = heartbeats.record
+    monkeypatch.setattr(heartbeats, 'record', lambda *args: seen.set() or real(*args) if database else seen.set() or True)
     return TestClient(create_app(store, ['testserver']))
 
 
@@ -365,24 +368,33 @@ def test_a_database_error_leaves_the_api_serving_and_logs_one_fixed_line(monkeyp
 
 
 # spec: ANYM-785
-def test_a_query_over_its_timeout_is_cancelled_and_the_old_result_stays(s, monkeypatch, caplog):
-    monkeypatch.setattr(health, 'STATEMENT_TIMEOUT_MS', 50)
+def test_a_query_over_its_timeout_is_cancelled_and_the_old_result_stays(seeded, monkeypatch, caplog):
+    s, key, _ = seeded
+    with s.pool.connection() as c:c.execute('DELETE FROM processing_profiles')
+    profile(s, expires='-1 hour', observed='31 minutes')
+    health.check(s, now=0)
+    before = health.read([TG])
+    monkeypatch.setattr(health, 'STATEMENT_TIMEOUT_MS', 1000)
     monkeypatch.setattr(health, 'WORKERS_SQL', 'SELECT pg_sleep(30)')
-    started = time.monotonic()
-    beat, done = threading.Event(), threading.Event()
+    entered, done, beat = threading.Event(), threading.Event(), threading.Event()
     real = health.check
 
     def timed(store):
+        entered.set()
         try:return real(store)
         finally:done.set()
     monkeypatch.setattr(health, 'check', timed)
-    with caplog.at_level(logging.ERROR), serve(monkeypatch, s, beat) as client:
+    started = time.monotonic()
+    with caplog.at_level(logging.ERROR), serve(monkeypatch, s, beat, database=True) as client:
+        assert entered.wait(5)
+        # A database-backed request is served while the check's query is running.
+        served = client.post('/v1/get_sync_status', json={'refresh': True}, headers={'Authorization': 'Bearer '+key})
+        assert served.status_code == 200 and served.json()['enrichment_health']['accounts'] == before['accounts']
         assert done.wait(10) and time.monotonic() - started < 10
         beat.clear()
         assert beat.wait(5)
-        assert client.post('/v1/capabilities', json={}).status_code in (401, 403)
     assert 'enrichment_health_unavailable' in caplog.text
-    assert health.read([TG]) is None
+    assert health.read([TG]) == before
 
 
 # spec: ANYM-785
