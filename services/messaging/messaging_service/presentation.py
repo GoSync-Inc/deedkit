@@ -555,12 +555,13 @@ def render(method, result, detail, include_coverage=False):
                 and v is not None and (k!='qualifications' or v)}
             row['history']={k:v for k,v in source.get('history',{}).items()
                 if k in ('observed_chats','unknown_chats','full_history_verified','gap_chats','gap_cleared_chats',
-                    'catchup_pending_chats','configured_window','last_scan_at')}
+                    'catchup_pending_chats','configured_window','last_scan_at','live_only_chats','live_only_chat_ids')
+                and (k not in ('live_only_chats','live_only_chat_ids') or v)}
             row['operations']={name:{k:v for k,v in operation.items()
                 if k in ('state','reason_code','pending_events','collector_running','retry_at','next_action',
                     'storage_paused','storage_paused_jobs','terminal_failed_jobs','retry_queued_jobs','needs_attention',
-                    'storage_paused_basis','outside_prefetch_window_jobs','outside_history_bounds_jobs')
-                and (k not in ('storage_paused','storage_paused_jobs','terminal_failed_jobs','retry_queued_jobs','needs_attention',
+                    'storage_paused_basis','outside_prefetch_window_jobs','outside_history_bounds_jobs','head_capped_chats')
+                and (k not in ('head_capped_chats','storage_paused','storage_paused_jobs','terminal_failed_jobs','retry_queued_jobs','needs_attention',
                     'outside_prefetch_window_jobs','outside_history_bounds_jobs') or v)}
                 for name,operation in source.get('operations',{}).items()}
             row['files']={k:v for k,v in source.get('files',{}).items()

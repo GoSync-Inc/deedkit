@@ -142,14 +142,12 @@ def test_sync_status_reports_capped_count_and_chats_heard_only_live(worker):
     w.state.head_capped(1)
     live=[str(1000+i) for i in range(22)]
     with s.pool.connection() as c:
-        for chat in [*live,'9000']:
-            c.execute('INSERT INTO collector_chats(account,provider_chat,peer_kind) VALUES(%s,%s,%s)',(w.account,chat,'channel'))
+        c.execute('INSERT INTO collector_chats(account,provider_chat,peer_kind) VALUES(%s,%s,%s)',(w.account,'9000','channel'))
     for i,chat in enumerate(live):
         asyncio.run(w.capture(NS(message=message(50+i,chat=chat))))
     asyncio.run(w.drain_captures([w.spool]))
-    principal=s.authenticate(key) if hasattr(s,'authenticate') else None
     with s.pool.connection() as c:
-        result=get_sync_status(c,principal or {'accounts':[w.account],'chat_ids':None})
+        result=get_sync_status(c,{'accounts':[w.account],'chat_ids':None})
     source=next(row for row in result['sources'] if row['account']==w.account)
     history=source['history']
     assert history['live_only_chats']==22 and len(history['live_only_chat_ids'])==20

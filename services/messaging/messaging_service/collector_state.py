@@ -512,6 +512,13 @@ class CollectorState:
                 (high_water,history_before,history_before,history_before,exhausted,initialized,
                  window_complete,head_complete,self.account,chat))
 
+    def head_capped(self,count):
+        """How many chats ended the last whole reconcile pass at the head page cap."""
+        with self.archive.store.pool.connection() as c:
+            value=self._operations(c)['operations']
+            value['history']={**value.get('history',{}),'head_capped_chats':count}
+            self._save_operations(c,value)
+
     def status(self,status,code):
         if status not in ('starting','receiving','degraded','stopped'): raise ValueError('invalid_status')
         if not re.fullmatch(r'[a-z_]{1,64}',code): raise ValueError('invalid_status_code')

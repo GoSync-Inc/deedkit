@@ -174,6 +174,14 @@ function ran over 10 s; the next start skips that row, and a classification stor
 a row today's ingest rule still raises; the row stays open). A job with an error
 retries at the next collector start.
 
+A Telegram reconcile pass reads up to `head_pages_per_pass` (default 10) full head
+pages of one chat, committing high water after each. A short page sets the head scan
+time; a chat that ends at the cap does not, and `operations.history.head_capped_chats`
+counts such chats in the last whole pass. `history.live_only_chats` and at most 20
+`live_only_chat_ids` name chats with archived messages that reconcile never attempted:
+they get no reconcile, so their ID span measures nothing. A rate limit prints one
+`telegram_rate_limited` line with its seconds.
+
 Telegram history reconcile isolates a provider error of one chat (ANYM-293).
 Rate limits (`FloodWaitError`, the governor's cooldown), session-terminal
 `UnauthorizedError`s, a duplicated authorization key, transport loss
@@ -273,6 +281,8 @@ again cannot reach the head sets the flag again.
 `committed_by`, an upper bound recorded after the archive transaction returns.
 `capture_to_commit_seconds` includes durable queue delay and replay downtime;
 `provider_age_at_capture_seconds` includes old callbacks/history observations.
+`origin=live` can also mean an old message first seen through an edit, so it does
+not prove when the message was sent or that the chat was captured live that day.
 The origin is retained, so backfill/reconciliation are not fresh-message latency
 samples. Clock skew may make provider age negative. Old spool entries without a
 capture timestamp report unknown timing, never substitute message creation time.
