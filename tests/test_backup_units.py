@@ -2,13 +2,16 @@
 
 The restore stack and procedure (ANYM-610): the Compose file's isolation, the written commands' shell syntax."""
 import configparser
+import copy
 import json
 from pathlib import Path
 import re
 import shlex
 import subprocess
+from types import SimpleNamespace
 
 from messaging_service import backup_runner
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -526,11 +529,17 @@ def test_the_calls_units_run_the_host_runner_with_their_config_recover_with_it_a
 def test_the_calls_units_time_limit_covers_the_runs_budgets_and_stays_inside_the_admission_bound(tmp_path):
     cfg = real_config(tmp_path, 'backup-runner-calls.example.json')
     assert backup_runner.worst_case(cfg) == 5515
+    # A smaller accepted budget never admits a run the unit would still let hold the lock.
+    reduced = copy.deepcopy(cfg)
+    reduced['busy_wait_seconds'] = 0
+    assert backup_runner.worst_case(reduced) < 4400
+    assert backup_runner.admission_bound(reduced) == backup_runner.admission_bound(cfg) - 115
     for name in CALLS_UNITS:
         service = unit_lines(name)['Service']
         assert seconds(service['TimeoutStartSec'][0]) >= backup_runner.worst_case(cfg) - backup_runner.RECOVERY_BUDGET
         assert seconds(service['TimeoutStopSec'][0]) == backup_runner.UNIT_STOP_SECONDS
-        assert unit_bound(name) <= backup_runner.admission_bound(cfg)
+        assert seconds(service['TimeoutStartSec'][0]) == backup_runner.CALLS_UNIT_START_SECONDS
+        assert unit_bound(name) <= backup_runner.admission_bound(reduced)
 
 
 # spec: ANYM-782
@@ -600,20 +609,25 @@ def test_each_profiles_worst_case_ends_before_the_next_start_and_the_latest_even
 
 # spec: ANYM-782
 def test_the_runners_admission_reading_the_real_timer_files_admits_the_calls_and_recordings_slots(tmp_path):
-    def following(cfg_timers, start):
-        starts = []
-        for path in cfg_timers:
-            name = Path(path).name
-            starts += [MESSAGING_RUN] if name == 'personal-os-backup.timer' else backup_runner.timer_starts(DEPLOY / name)
-        return backup_runner.next_start(start, starts)
+    (tmp_path / 'personal-os-backup.timer').write_text('[Timer]\nOnCalendar=*-*-* 18:00:00 UTC\n')
+    def admit(cfg, own, clock):
+        paths = [tmp_path / Path(t).name if Path(t).name == 'personal-os-backup.timer' else DEPLOY / Path(t).name
+                 for t in own['timers']]
+        runner = SimpleNamespace(clock=lambda: 20000 * 86400 + clock, cfg=cfg, own={'timers': paths},
+                                 code=lambda word: f"{cfg['profile']}_{word}")
+        backup_runner.Runner.admit(runner)
     calls = real_config(tmp_path, 'backup-runner-calls.example.json')
     recordings = real_config(tmp_path, 'backup-runner-recordings.example.json')
-    for cfg, timers, names in ((calls, calls['calls']['timers'], ('deedkit-calls-backup.timer', 'deedkit-calls-backup-catchup.timer')),
-                               (recordings, recordings['recordings']['timers'],
-                                ('deedkit-recordings-backup.timer', 'deedkit-recordings-backup-catchup.timer'))):
-        for name in names:
-            start = timer_start(name)
-            assert start + backup_runner.admission_bound(cfg) <= following(timers, start) - backup_runner.GUARD_SECONDS, name
+    for name in ('deedkit-calls-backup.timer', 'deedkit-calls-backup-catchup.timer'):
+        admit(calls, calls['calls'], timer_start(name))
+    for name in ('deedkit-recordings-backup.timer', 'deedkit-recordings-backup-catchup.timer'):
+        admit(recordings, recordings['recordings'], timer_start(name))
+    admit(recordings, recordings['recordings'], 24 * HOUR - 1)  # the catch-up's last admitted second keeps its start
+    # The bound reaches the calendar's 16:00 less the guard: one second later is refused, whatever the configured budget.
+    latest = 16 * HOUR - backup_runner.GUARD_SECONDS - backup_runner.admission_bound(calls)
+    admit(calls, calls['calls'], latest)
+    with pytest.raises(backup_runner.Skip, match='calls_skipped_window'):
+        admit(calls, calls['calls'], latest + 1)
 
 
 # spec: ANYM-607
