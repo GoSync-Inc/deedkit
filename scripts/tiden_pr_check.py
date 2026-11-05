@@ -41,8 +41,12 @@ PR_LINE = re.compile(r"^[ \t]*(Spec|Delivers|Tiden branch):[ \t]*(.*?)[ \t]*$", 
 # A line a reader takes for a Tiden line that PR_LINE does not read: a list, quote or heading prefix, emphasis, another
 # case or spelling. It is an error, never silence: unread, the sync reports "no spec" and stays green (11-05: #636, #640,
 # #641, #651, #656). A line starting with a backtick is prose quoting the key, not an attempt (read from 633 bodies).
-PR_LINE_LIKE = re.compile(r"^[ \t]*(?:(?:[-*+>•–—]|\d+[.)]|\[[ xX]?\]|#+)[ \t]*)*(?:\*\*|__|\*|_)?"
-                          r"(?:specs?|delivers?|tiden[ _-]?branch)(?:\*\*|__|\*|_)?[ \t]*:", re.IGNORECASE)
+# DECORATION is one character class, and each list number or checkbox starts with a character outside it, so a line has
+# one way to match (no backtracking, also on a long run of `#`).
+DECORATION = r"[ \t\-*+>#_•–—]*"
+PR_LINE_LIKE = re.compile(rf"^{DECORATION}(?:(?:\d+[.)]|\[[ xX]?\]){DECORATION})*"
+                          r"(?:specs?|delivers?|tiden[ _-]?branch)[*_]*[ \t]*:", re.IGNORECASE)
+FENCE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)$")
 BRANCH_NAME = re.compile(r"(?:proposal|review)/[a-z0-9]+(?:[/_-][a-z0-9]+)*")
 MARKER = re.compile(r"^[ \t]*(#|//)[ \t]*spec:[ \t]*(.*?)[ \t]*$")
 # A comment that tries to be a marker but is malformed (wrong case, missing colon) is reported, not ignored.
@@ -111,9 +115,24 @@ def ids(text: str) -> list[int] | None:
     return list(dict.fromkeys(int(match) for match in SPEC_ID.findall(text)))
 
 
+def unfenced(body: str) -> list[str]:
+    """The lines outside fenced code blocks, as Markdown closes them: the same character, at least as long, alone."""
+    found, opened = [], ""
+    for line in body.split("\n"):
+        fence = FENCE.match(line)
+        if opened:
+            if fence and fence[1][0] == opened[0] and len(fence[1]) >= len(opened) and not fence[2].strip():
+                opened = ""
+        elif fence and not (fence[1][0] == "`" and "`" in fence[2]):  # backticks after the run make it inline code
+            opened = fence[1]
+        else:
+            found.append(line)
+    return found
+
+
 def parse_body(body: str) -> Lines:
     lines, body = Lines(), body.replace("\r\n", "\n")
-    for line in body.split("\n"):
+    for line in unfenced(body):  # an example in a fence is no attempt; only this detector skips fences, not PR_LINE
         if PR_LINE_LIKE.match(line) and not PR_LINE.fullmatch(line) and not MARKER.match(line):
             lines.errors.append(f"`{shown(line.strip())}` is not read: write `Spec:`, `Delivers:` or `Tiden branch:` "
                                 "at column 1 with no list marker or emphasis")

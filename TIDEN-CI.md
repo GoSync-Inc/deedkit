@@ -391,7 +391,8 @@ bookkeeping a merge needs (harness process.md section 4):
 - no line tries to be one of those lines without being read: a list, quote or
   heading prefix, emphasis, another case or spelling fails here and stops sync B
   at step `parse`, where it would otherwise report "no spec" and stay green. A
-  line that starts with a backtick is prose, and a `# spec:` line is a test marker;
+  line that starts with a backtick is prose, a `# spec:` line is a test marker,
+  and a line inside a fenced code block is an example;
 - the merge preview of that open branch (read-only `branch merge-preview`) changes
   every spec the sync would merge and nothing the body does not name: it fails
   when the preview changes a spec the body does not name, changes no spec, or

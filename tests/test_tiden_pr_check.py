@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 from hypothesis import given
 from hypothesis import strategies as st
@@ -378,7 +379,8 @@ def test_body_lines_keep_order_and_delivers_comes_first():
     "2) Spec: ANYM-1", "> Delivers: ANYM-1", "- [x] Delivers: ANYM-1", "## Delivers: ANYM-1", "**Delivers:** ANYM-1",
     "**Delivers**: ANYM-1", "- **Spec:** ANYM-1", "_Spec:_ ANYM-1", "spec: ANYM-1", "DELIVERS: ANYM-1",
     "Specs: ANYM-1", "Deliver: ANYM-1", "Spec : ANYM-1", "tiden branch: review/x", "Tiden-branch: review/x",
-    "• Spec: ANYM-1", "  - Spec: ANYM-1",
+    "• Spec: ANYM-1", "  - Spec: ANYM-1", "***Delivers***: ANYM-1", "- **_Delivers_**: ANYM-1",
+    "***Delivers:*** ANYM-1", "1. - [x] **Spec:** ANYM-1",
 ])
 def test_a_body_line_that_tries_to_be_a_tiden_line_fails_and_is_not_read(line):
     lines = pr_check.parse_body(f"Text\n{line}\nMore")
@@ -399,11 +401,66 @@ def test_prose_and_quoted_markers_are_not_taken_for_a_tiden_line(line):
 
 # spec: ANYM-405
 @given(st.sampled_from(["- ", "* ", "+ ", "> ", "1. ", "3) ", "- [ ] ", "### ", "• ", "  - ", "> - "]),
-       st.sampled_from(["", "**", "__", "*", "_"]), st.sampled_from(["Spec", "Delivers", "Tiden branch"]),
+       st.sampled_from(["", "**", "__", "*", "_", "***", "**_", "_**"]),
+       st.sampled_from(["Spec", "Delivers", "Tiden branch"]),
        st.sampled_from(["ANYM-1", "ANYM-1, ANYM-2", "review/x", "text"]))
 def test_every_decorated_tiden_line_is_an_error_never_silence(prefix, emphasis, key, value):
     lines = pr_check.parse_body(f"{prefix}{emphasis}{key}:{emphasis} {value}")
     assert lines.errors and not lines.named and lines.branch is None
+
+
+# spec: ANYM-405
+@pytest.mark.parametrize("line", ["#" * 50000 + "x", "1." * 25000 + "x", "[]" * 25000 + "x", "*_ " * 20000 + "x",
+                                  "#" * 50000 + " Spe", "- " * 25000 + "Delivers"])
+def test_a_long_decorated_line_is_judged_in_linear_time(line):
+    started = time.monotonic()
+    assert pr_check.parse_body(line).errors == []
+    assert time.monotonic() - started < 2
+
+
+# spec: ANYM-405
+@pytest.mark.parametrize("fence, close", [("```", "```"), ("~~~", "~~~"), ("````md", "````"), ("  ```", "  ```")])
+def test_a_fenced_example_is_no_attempt_and_the_real_line_is_still_read(fence, close):
+    lines = pr_check.parse_body(f"Delivers: ANYM-1\n{fence}\n- Delivers: ANYM-999\n{close}\nText")
+    assert (lines.errors, lines.delivers) == ([], [1])
+
+
+# spec: ANYM-405
+@pytest.mark.parametrize("body", [
+    "```\nexample\n```\n- Delivers: ANYM-1",  # closed before the line
+    "```\n~~~\n```\n- Delivers: ANYM-1",  # another character does not close it, and the real close does
+    "````\n```\n````\n- Delivers: ANYM-1",  # a shorter run does not close it
+    "```\nx\n```\n```\ny\n```\n- Delivers: ANYM-1",  # two blocks in a row
+    "    ```\n- Delivers: ANYM-1",  # four spaces indent code, no fence
+    "```inline``` text\n- Delivers: ANYM-1",  # inline code opens nothing
+])
+def test_a_tiden_line_after_a_closed_fence_or_a_false_fence_still_fails(body):
+    lines = pr_check.parse_body(body)
+    assert len(lines.errors) == 1 and "column 1" in lines.errors[0], lines.errors
+
+
+# spec: ANYM-405
+def test_a_merged_pull_request_with_a_fenced_example_still_settles_its_card(repo, server):
+    root, _ = repo
+    server.set(main=[spec(12, status="Review")])
+    sha = commit(root, {"README.md": "text\n"}, "squash")
+    report = []
+    tiden_sync.sync(root, sha, 1, "Delivers: ANYM-12\n```\n- Delivers: ANYM-999\n```\n", str(server.cli), "product",
+                    report.append)
+    assert "status: ANYM-12 Review -> Done." in report
+
+
+# spec: ANYM-405
+@pytest.mark.parametrize("line", ["***Delivers***: ANYM-12", "- **_Delivers_**: ANYM-12"])
+def test_nested_emphasis_fails_the_check_and_stops_the_sync(repo, server, line):
+    root, _ = repo
+    server.set(main=[spec(12, sources=[anchor("app/core.py")], status="Review")])
+    code, out = run(repo, server, {"app/core.py": "x = 2\n"}, f"{line}\n")
+    assert code == 1 and "column 1" in out
+    sha = commit(root, {"README.md": "text\n"}, "squash")
+    with pytest.raises(tiden_sync.StepFailed) as failed:
+        tiden_sync.sync(root, sha, 1, f"{line}\n", str(server.cli), "product", lambda _: None)
+    assert failed.value.step == "parse" and not server.writes()
 
 
 # spec: ANYM-405
