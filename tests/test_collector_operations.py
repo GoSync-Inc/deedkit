@@ -436,6 +436,19 @@ def test_clear_gap_command_is_exclusive_and_a_failed_run_changes_nothing(wa,tmp_
     assert capsys.readouterr().out.strip()=='gap_cleared' and 'gap' not in w.state.progress(GAP_CHAT,'user')
 
 
+# spec: ANYM-700
+def test_clear_gap_command_reports_one_failure_when_the_commit_fails(tmp_path,monkeypatch,capsys):
+    from messaging_service import collector_control
+    class CommitFails:
+        def __enter__(self):return self
+        def __exit__(self,*_):raise collector_control.psycopg.OperationalError('commit failed')
+    monkeypatch.setattr(collector_control.psycopg,'connect',lambda *_,**__:CommitFails())
+    monkeypatch.setattr(collector_control,'clear_gap',lambda *_:'gap_cleared')
+    dsn=tmp_path/'owner.dsn';dsn.write_text('synthetic');dsn.chmod(0o600)
+    with pytest.raises(SystemExit) as exit_info:collector_control.run_clear_gap(dsn,'wa-one',GAP_CHAT)
+    assert exit_info.value.code==1 and capsys.readouterr().out.strip()=='clear_gap_failed'
+
+
 POSITION=st.lists(st.one_of(st.integers(0,2**40),st.text(max_size=8)),max_size=2)
 PROGRESS=st.dictionaries(st.sampled_from(('head','history_before','catchup_before','catchup_head','history_exhausted','other')),
     st.one_of(POSITION,st.booleans()))

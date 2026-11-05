@@ -46,7 +46,7 @@ def clear_gap(c,account,chat):
 def run_clear_gap(dsn_file,account,chat):
     try:
         with psycopg.connect(private_text(dsn_file).strip(),row_factory=dict_row,connect_timeout=10) as c:
-            print(clear_gap(c,account,chat))
+            result=clear_gap(c,account,chat)
     except ValueError as e:
         code=str(e)
         print(code if code in ('invalid_account','invalid_chat','chat_not_found','gap_not_set') else 'clear_gap_failed')
@@ -54,6 +54,8 @@ def run_clear_gap(dsn_file,account,chat):
     except (OSError,psycopg.Error):
         print('clear_gap_failed')
         raise SystemExit(1) from None
+    # After the connection context: only a committed clear reports success.
+    print(result)
 
 
 def main():
