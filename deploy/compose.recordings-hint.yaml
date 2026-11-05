@@ -1,0 +1,67 @@
+# The Omi webhook receiver (ANYM-760), added after compose.recordings.yaml in the same `deedkit-recordings` project. Nothing here is
+# enabled by itself: it needs the receiver's private directory, `archive.omi_hint`, the two hand-made networks, the host rules and
+# a proxy route (docs/operations/production.md, "Omi webhook receiver"). The receiver has no archive, no provider token and no way
+# out: the proxy reaches it over `recordings-hook`, and the one connection it starts goes over `recordings-hint` to the backend's
+# second listener. The backend gains that one network and no published port.
+services:
+  recordings-api:
+    environment:
+      RECORDINGS_HINT_LISTEN: recordings-hint-channel:13235
+    networks:
+      recordings-hint:
+        aliases: [recordings-hint-channel]
+  recordings-omi-hint:
+    image: deedkit-recordings:${DEEDKIT_VERSION:-0.1.0}
+    command: [--config, /run/deedkit/omi-hint/receiver.json, --omi-hint-receiver, --host, 0.0.0.0, --port, "13236"]
+    volumes:
+      # The DIRECTORY, never a single file: an atomic replace inside it reaches the running receiver. It holds receiver.json and
+      # channel.key only (0700 and 0600, owner 10001), nothing of the backend's private directory.
+      - ${RECORDINGS_HINT_STATE_DIR:?Set the receiver's private directory}:/run/deedkit/omi-hint:ro
+    networks:
+      recordings-hint: {}
+      recordings-hook:
+        aliases: [recordings-omi-hint]
+    restart: unless-stopped
+    # Liveness only: one request on no route must get the 404 every other request gets. It proves the app answers and carries no token.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.error, urllib.request
+          try:
+              urllib.request.build_opener(urllib.request.ProxyHandler({})).open("http://127.0.0.1:13236/", timeout=4)
+              healthy = False
+          except urllib.error.HTTPError as error:
+              healthy = error.code == 404
+          except Exception:
+              healthy = False
+          sys.exit(0 if healthy else 1)
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 15s
+    read_only: true
+    user: "10001:10001"
+    cpu_shares: 256
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:size=4m,noexec,nosuid"]
+    mem_limit: 256m
+    pids_limit: 32
+    stop_grace_period: 5s
+    logging:
+      driver: json-file
+      options: {max-size: 1m, max-file: "2"}
+networks:
+  # Created once by hand: docker network create --internal -o com.docker.network.bridge.name=dk-rechint0
+  #   -o com.docker.network.bridge.gateway_mode_ipv4=isolated deedkit-recordings-hint
+  recordings-hint:
+    external: true
+    name: ${RECORDINGS_HINT_NETWORK:-deedkit-recordings-hint}
+  # Created once by hand: docker network create --internal -o com.docker.network.bridge.name=dk-rechook0
+  #   -o com.docker.network.bridge.gateway_mode_ipv4=isolated deedkit-recordings-hook
+  recordings-hook:
+    external: true
+    name: ${RECORDINGS_HOOK_NETWORK:-deedkit-recordings-hook}

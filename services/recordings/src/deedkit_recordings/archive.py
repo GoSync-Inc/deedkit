@@ -7,6 +7,7 @@ import time
 from . import archive_feed
 from .archive_store import Store, MAX_TEXT, namespace, provider_missing
 from . import plaud, archive_plaud
+from .hint import Hints
 from .omi import metadata, pagination, content, fingerprint
 from .security import Failure, RateLimited, provider_token, read_document
 
@@ -31,6 +32,11 @@ class ArchiveRuntime:
         self.feed_error = None  # the event feed's own last failure (ANYM-726); it never stops collection
         self.collecting, self.turn, self.ledger = asyncio.Lock(), 0, asyncio.Lock()
         self.errors = {}
+        self.started = monotonic()
+        self.hints = Hints(self)  # ANYM-760: wakes the sleep below; holds ids in memory only
+
+    def reclock(self):
+        """A pass of its own starts here (`clock` counts from this moment)."""
         self.started = monotonic()
 
     def document(self):
@@ -93,7 +99,7 @@ class ArchiveRuntime:
                 interval = settings.poll_seconds if settings else 300
             except Exception:
                 interval = 300
-            await asyncio.sleep(interval)
+            await self.hints.rest(interval)
 
     def current(self, account, fingerprint=None):
         doc = self.document()
@@ -353,6 +359,8 @@ class ArchiveRuntime:
                 return {**result,'error':self.error or 'archive_unavailable'}
             budget = doc.archive.omi_budget if current.provider == 'omi' else None
             result.update(await self.db('status', current, time.time() if now is None else now, budget))
+            if doc.archive.omi_hint is not None and doc.archive.omi_hint.account == current.id:
+                result['omi_hint'] = self.hints.report()  # counters only
             # This overlay needs no write, including when quota prevents writing
             # account_error. Account-specific failures never leak another account.
             if 'index' in result:

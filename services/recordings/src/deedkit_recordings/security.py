@@ -53,6 +53,17 @@ class OmiBudget(Strict):
     reads_per_hour: int = Field(default=45, ge=12, le=60)
 
 
+class OmiHint(Strict):
+    """The Omi webhook's hint channel (ANYM-760). `channel_key_sha256` opens only the hint listener and is distinct from every
+    principal key and the router token; `path_token_sha256` is the receiver's public path token, kept here so that the two can
+    never be the same value. Two digests of either allow a rotation; removing the object revokes both."""
+    account: str = Field(pattern=r'^[A-Za-z0-9_-]{1,64}$')
+    uid: str = Field(pattern=r'^[A-Za-z0-9_-]{1,128}$')
+    channel_key_sha256: list[Annotated[str, Field(pattern=r'^[0-9a-f]{64}$')]] = Field(min_length=1, max_length=2)
+    path_token_sha256: list[Annotated[str, Field(pattern=r'^[0-9a-f]{64}$')]] = Field(min_length=1, max_length=2)
+    expires_at: str
+
+
 class ArchiveSettings(Strict):
     directory: str
     poll_seconds: int = Field(default=300, ge=60, le=86400)
@@ -60,6 +71,7 @@ class ArchiveSettings(Strict):
     free_reserve_bytes: int = Field(default=1024 ** 3, ge=256 * 1024 ** 2)
     max_queued: int | None = Field(default=None, ge=200, le=200000)
     omi_budget: OmiBudget = Field(default_factory=OmiBudget)
+    omi_hint: OmiHint | None = None
 
 
 class EventRouter(Strict):
@@ -140,6 +152,15 @@ def read_document(path, *, include_archive=True):
                 raise ValueError('router token reuse')
             if datetime.fromisoformat(router.expires_at.replace('Z', '+00:00')).tzinfo is None:
                 raise ValueError('expiry requires timezone')
+        hint = doc.archive.omi_hint if doc.archive is not None else None
+        if hint is not None:
+            channel, paths = set(hint.channel_key_sha256), set(hint.path_token_sha256)
+            taken = {p.key_sha256 for p in doc.principals} | set(doc.event_router.key_sha256 if doc.event_router else ())
+            if (len(channel) != len(hint.channel_key_sha256) or len(paths) != len(hint.path_token_sha256)
+                    or channel & paths or (channel | paths) & taken):
+                raise ValueError('hint credential reuse')
+            if datetime.fromisoformat(hint.expires_at.replace('Z', '+00:00')).tzinfo is None:
+                raise ValueError('expiry requires timezone')
         secret = private(doc.cursor_secret_file, 256).strip()
         if len(secret) < 32:
             raise ValueError('short cursor secret')
@@ -167,6 +188,21 @@ def router_authorized(doc, key):
     for digest in router.key_sha256:
         matched |= hmac.compare_digest(digest, hashed)
     return matched and datetime.fromisoformat(router.expires_at.replace('Z', '+00:00')) > datetime.now(timezone.utc)
+
+
+def digest_matches(digests, value):
+    """True when the SHA-256 of `value` is one of `digests`; compares every digest in constant time."""
+    hashed = hashlib.sha256(value.encode()).hexdigest()
+    matched = False
+    for digest in digests:
+        matched |= hmac.compare_digest(digest, hashed)
+    return matched
+
+
+def hint_authorized(hint, key):
+    """True for a live channel credential of the Omi hint (ANYM-760)."""
+    return digest_matches(hint.channel_key_sha256, key) and datetime.fromisoformat(
+        hint.expires_at.replace('Z', '+00:00')) > datetime.now(timezone.utc)
 
 
 def configuration(path, key):

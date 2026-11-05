@@ -275,9 +275,9 @@ new collection. Changing its directory requires a service restart.
 
 Only whitelisted metadata, provider IDs, transcript speaker/offset text and the
 vendor's overview are stored locally. No audio, bearer download URL, token or raw
-vendor inventory is stored. No transcription, model API, paid processing or
-inbound webhook runs. A ready transcript can be accepted while summary processing
-is pending. Empty, pending, malformed or failed observations never erase an
+vendor inventory is stored. No transcription, model API or paid processing runs.
+The only inbound webhook is the optional Omi hint below (ANYM-760), which stores
+nothing. A ready transcript can be accepted while summary processing is pending. Empty, pending, malformed or failed observations never erase an
 accepted nonempty text part. Each part keeps its last accepted digest/time and
 its latest attempt state/error; these may differ. Only actual usable text changes
 produce reference-only journal events. Replays do not duplicate records/events.
@@ -500,6 +500,34 @@ does not stop the build. `recordings_archive_status` shows `index.state` (`build
 and the index error code, if any. Older packages refuse schema 4 (`archive_schema_unsupported`); rolling back means
 disabling archive collection and keeping the state files. The online backup and the backup tooling accept schemas 1–4
 (ANYM-714 accepts 1–5).
+
+### Omi webhook as a wake-up hint (ANYM-760)
+
+Ships dark: without `archive.omi_hint` and `RECORDINGS_HINT_LISTEN` nothing listens. Omi's `memory_created` webhook only tells the
+collector to look now; the collector then lists, reads and stores exactly as ever, so polling stays the source of truth and
+reprocesses and edits (which Omi never announces) stay with the list fingerprint.
+
+The receiver (`--omi-hint-receiver`, its own container, `deploy/compose.recordings-hint.yaml`) serves `POST /omi/memory/<token>` with
+`uid=<owner uid>`, a JSON body of at most 4 MiB and a 2-second deadline: 200, or 503 when the backend cannot take the hint, 400 and 413
+(Omi does not retry those) and 408 (it does). Any other method, path or token gets one identical 404 before the body is read. It parses
+the body, takes `id` and drops the rest: no body, id, uid, token or header value reaches a log, a file or a response, only counters by
+reason (`omi_hint_receiver`, at most one line per 5 minutes). It has no archive, no provider token and one connection out.
+
+The channel is the backend's second listener, on the internal `recordings-hint` network: `POST /omi-hint` with a credential of its
+own (`archive.omi_hint`: `account`, `uid`, `channel_key_sha256`, `path_token_sha256`, `expires_at`; one or two digests each), up to
+16 ids, 2 requests at once, 20 a minute, 2 seconds. It shares nothing with the main listener, and the main API answers 404 on that address.
+
+A hint wakes the collector's sleep. After a 15-second settle (Omi caches a list for 10 s) a pass for that one account lists the newest page from
+the start, inserts unseen conversations of the last 24 hours with their fingerprints and reads up to 3 never-fetched ones of the last 24
+hours. It moves no cursor, `head_floor`, `last_head_at` or checkpoint, changes no existing fingerprint and does not move the regular pass. A
+hint never reads a named record or stores an id: ids stay in memory (64 pending, deduplicated for 10 minutes, a restart forgets them). An id the
+list does not show is looked for again at +60 s and +5 min, then dropped. At most 6 forced lists an hour; each list and read is reserved in the ledger
+like any other, and a refused reservation or a 429 pause drops the hint without an error, so the latency promise holds only while the
+hour's budget has a slot. `archive_status` adds `omi_hint`, counters only, when the object is configured.
+
+To roll back, remove `archive.omi_hint` before a package downgrade: an older package refuses the unknown field, which disables the archive
+consumers (on-demand reads go on). The ingress plan, rotation, revocation and the owner's step in the Omi app are in
+[production.md](../../docs/operations/production.md), "Omi webhook receiver".
 
 ### Event feed for the module event router (ANYM-726)
 
