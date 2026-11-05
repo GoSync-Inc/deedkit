@@ -60,7 +60,6 @@ VALIDATORS = {"policy": ["deedkit-gateway", "--check", "--policy", "{path}", "--
               "registry": ["python", "agent_api.py", "--check-registry", "{path}"]}
 BACKENDS = ("messaging", "calendar", "calls")
 RECORDINGS_ID_MAX = 128  # services/recordings security.py Principal.id
-EXPIRY_MAX = 64  # fromisoformat ignores excess fractional digits, so instant() alone does not bound the text
 DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
@@ -237,17 +236,16 @@ def recordings_principals(config: dict) -> tuple[dict[str, dict], str | None]:
     return ({}, "recordings_config_duplicate_key") if len(found) != len(entries) else (found, None)
 
 
-def clean_text(value: object, limit: int) -> bool:
-    """Safe to print: a bounded string with no control character or lone surrogate, which print() could not encode."""
-    return isinstance(value, str) and 1 <= len(value) <= limit and value.isprintable()
-
-
 def recordings_row(match: dict, now: datetime) -> dict:
-    """The public fields of a recordings principal; a value that fails validation is dropped, never copied."""
-    identity, expiry = match.get("id"), match.get("expires_at")
-    expiry = expiry if clean_text(expiry, EXPIRY_MAX) and instant(expiry) is not None else None
-    return {"public_id": identity if clean_text(identity, RECORDINGS_ID_MAX) else None, "expires_at": expiry,
-            "status": status({"expires_at": expiry}, now)}
+    """The public fields of a recordings principal. Validity follows the backend's own rules; the printed text is
+    safe separately. An expiry prints in canonical form, because fromisoformat takes any separator character and
+    ignores excess fractional digits; an ID the backend accepts prints escaped when it holds a control character or a
+    lone surrogate, which print() could not encode. A value that fails validation is dropped, never copied."""
+    identity, moment = match.get("id"), instant(match.get("expires_at"))
+    valid = isinstance(identity, str) and 1 <= len(identity) <= RECORDINGS_ID_MAX
+    shown = identity if not valid or identity.isprintable() else identity.encode("unicode_escape").decode()
+    return {"public_id": shown if valid else None, "expires_at": moment.isoformat() if moment else None,
+            "status": status({"expires_at": match.get("expires_at")}, now)}
 
 
 def collect(config: dict, run, now: datetime | None = None) -> dict:
@@ -264,13 +262,17 @@ def collect(config: dict, run, now: datetime | None = None) -> dict:
     recordings, recordings_note = recordings_principals(config)
     labels = load_labels(config)
     pending: dict[str, list[tuple[dict, str]]] = {"messaging": [], "calendar": []}
-    rows, unconfigured, holds_recordings = [], False, False
+    rows, unconfigured, recordings_down = [], False, False
     for principal in principals:
         credentials = []
         items = principal.get("credentials") if isinstance(principal.get("credentials"), dict) else {}
         for backend, credential in sorted(items.items()):
             entry = {"backend": backend, "public_id": None, "expires_at": None, "status": "missing"}
-            holds_recordings = holds_recordings or backend == "recordings"
+            if backend == "recordings" and recordings_note:  # the file decides every row, before its key file
+                entry.update(status="unknown", note=recordings_note)
+                credentials.append(entry)
+                recordings_down = True
+                continue
             token = read_token(config, credential.get("key_file", "")) if isinstance(credential, dict) else None
             if token is None:
                 entry["note"] = "key_file_unreadable"
@@ -290,8 +292,6 @@ def collect(config: dict, run, now: datetime | None = None) -> dict:
                                                 "expires_at": match.get("expires_at")}, now))
                     if match.get("archive_config"):
                         entry["archive"] = archive(config, match["archive_config"], pending)
-            elif backend == "recordings" and recordings_note:
-                entry.update(status="unknown", note=recordings_note)
             elif backend == "recordings":
                 match = recordings.get(hashlib.sha256(token.encode()).hexdigest())
                 if match is not None:
@@ -305,7 +305,7 @@ def collect(config: dict, run, now: datetime | None = None) -> dict:
     unavailable, records = [], {}
     if unconfigured:
         unavailable.append({"code": "backend_unavailable", "backend": "calls", "detail": "calls: no registry configured"})
-    if holds_recordings and recordings_note:
+    if recordings_down:
         unavailable.append({"code": "backend_unavailable", "backend": "recordings", "note": recordings_note})
     for service, items in pending.items():
         # The lookup and the inventory fail apart: a failed inventory keeps the rows' statuses and only loses

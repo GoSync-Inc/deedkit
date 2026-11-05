@@ -2538,7 +2538,7 @@ fix the sync (docs/operations/feedback-triage.md, Hourly sync).
 per gateway principal (label, enabled, gateway expiry) with the messaging, calendar and calls
 credential bound to it (public ID, expiry, `live`, `revoked`, `expired`, `missing`, or `unknown`
 when a backend command fails). A recordings credential has the same line (ANYM-772): public ID, expiry and `live`,
-`expired` or `missing`, matched by its key hash in the recordings private configuration. It reads the gateway policy
+`expired` or `missing`, matched by its key hash in the recordings private configuration (the expiry prints in canonical ISO form). It reads the gateway policy
 and the calls registry and runs the
 messaging `list-keys --all` / `key-info` and calendar `list-agents` / `agent-info` operator
 commands (ACCESS.md, `services/calendar/docs/SERVICE.md`); key files reach those commands on

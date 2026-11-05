@@ -338,18 +338,22 @@ def test_no_calls_registry_configured_is_a_finding_when_a_principal_holds_a_call
     ({"expires_at": {"raw": CANARY}}, ("agent-rec", None, "expired")),
     ({"expires_at": 1893456000}, ("agent-rec", None, "expired")),
     ({"expires_at": CANARY}, ("agent-rec", None, "expired")),
-    ({"expires_at": "2027-04-01T00:00:00." + "1" * 5000 + "+00:00"}, ("agent-rec", None, "expired")),
-    ({"expires_at": "2027-04-01\x1b00:00:00+00:00"}, ("agent-rec", None, "expired")),
+    ({"expires_at": "2027-04-01T00:00:00Z"}, ("agent-rec", LATER, "live")),
+    ({"expires_at": "2027-04-01T00:00:00." + "1" * 5000 + "+00:00"}, ("agent-rec", "2027-04-01T00:00:00.111111+00:00", "live")),
+    ({"expires_at": "2027-04-01\x1b00:00:00+00:00"}, ("agent-rec", LATER, "live")),
+    ({"expires_at": "2027-04-01\u00a000:00:00+00:00"}, ("agent-rec", LATER, "live")),
     ({"id": "a" * 65}, ("a" * 65, LATER, "live")),
     ({"id": "a" * 128}, ("a" * 128, LATER, "live")),
     ({"id": "a" * 129}, (None, LATER, "live")),
     ({"id": ""}, (None, LATER, "live")),
     ({"id": {"raw": CANARY}}, (None, LATER, "live")),
-    ({"id": "bad\x1bid"}, (None, LATER, "live")),
-    ({"id": "\ud800"}, (None, LATER, "live")),
+    ({"id": "bad\x1bid"}, ("bad\\x1bid", LATER, "live")),
+    ({"id": "\ud800"}, ("\\ud800", LATER, "live")),
+    ({"id": "a\u00a0b"}, ("a\\xa0b", LATER, "live")),
+    ({"id": "агент"}, ("агент", LATER, "live")),
 ], ids=["live", "expired", "no-match", "missing-expiry", "object-expiry", "number-expiry", "text-expiry",
-        "oversized-expiry", "control-expiry", "id-65", "id-128", "id-129", "id-empty", "id-object", "id-control",
-        "id-surrogate"])
+        "z-expiry", "oversized-expiry", "control-expiry", "nbsp-expiry", "id-65", "id-128", "id-129", "id-empty",
+        "id-object", "id-control", "id-surrogate", "id-nbsp", "id-cyrillic"])
 def test_a_recordings_credential_reports_only_validated_public_fields(stores, capsys, fields, expected):
     stores.principal("agent", {"recordings": stores.recordings_agent("agent-rec", **fields)})
     _, view, out = listing(stores, capsys)
@@ -479,7 +483,7 @@ def test_principal_filter_keeps_the_recordings_finding_only_for_a_holder(stores,
 
 
 # spec: ANYM-772
-def test_a_broken_recordings_file_is_no_finding_without_a_holder_and_stays_one_with_an_unreadable_key_file(stores, capsys):
+def test_a_broken_recordings_file_is_no_finding_without_a_holder(stores, capsys):
     healthy(stores)
     stores.fake()
     config = json.loads((stores.root / "admin/config.json").read_text())
@@ -488,14 +492,25 @@ def test_a_broken_recordings_file_is_no_finding_without_a_holder_and_stays_one_w
     private(stores.recordings_path, "{}")
     code, view, _ = listing(stores, capsys, "--strict")
     assert code == 0 and view["findings"] == []
-    policy = json.loads(Path(stores.config["policy"]).read_text())
-    policy["principals"].append({"id": "holder", "expires_at": LATER, "enabled": True, "credentials": {
-        "recordings": {"key_file": "/run/deedkit/keys/absent.key", "key_sha256": "a" * 64}}})
-    private(Path(stores.config["policy"]), policy)
+
+
+# spec: ANYM-772
+@pytest.mark.parametrize("credential", [{"key_file": "/run/deedkit/keys/absent.key", "key_sha256": "a" * 64}, "pin", None],
+                         ids=["unreadable-key-file", "pin-mismatch", "not-an-object"])
+def test_a_broken_recordings_file_decides_a_row_whose_own_key_file_also_fails(stores, capsys, credential):
+    if credential == "pin":
+        credential = dict(stores.key("holder-rec"), key_sha256="a" * 64)
+    stores.principal("holder", {"recordings": credential})
+    stores.fake()
+    config = json.loads((stores.root / "admin/config.json").read_text())
+    config["recordings_config"] = str(stores.recordings_path)
+    private(stores.root / "admin/config.json", config)
+    private(stores.recordings_path, "{}")
     code, view, _ = listing(stores, capsys, "--strict")
-    assert code == 1 and recordings_rows(view)[0]["note"] == "key_file_unreadable"
-    assert {"code": "backend_unavailable", "backend": "recordings",
-            "note": "recordings_config_invalid"} in view["findings"]
+    assert code == 1
+    assert [(r["status"], r["note"]) for r in recordings_rows(view)] == [("unknown", "recordings_config_invalid")]
+    assert view["findings"] == [{"code": "backend_unavailable", "backend": "recordings",
+                                 "note": "recordings_config_invalid"}]
 
 
 # spec: ANYM-772
@@ -513,7 +528,12 @@ def test_no_recordings_hash_account_permission_or_raw_field_reaches_any_output(s
     assert admin.main(["--config", str(configured), "key", "list", "--json"]) == 0
     shown = capsys.readouterr()
     seen = text.out + text.err + shown.out + shown.err + caplog.text
-    assert "recordings" in text.out and stores.snapshot() == before
+    expected = "recordings_config_invalid" if broken else "agent-rec  expired"
+    assert expected in text.out and stores.snapshot() == before
+    row = json.loads(shown.out)["principals"][0]["credentials"][0]
+    assert row == ({"backend": "recordings", "public_id": None, "expires_at": None, "status": "unknown",
+                    "note": "recordings_config_invalid"} if broken else
+                   {"backend": "recordings", "public_id": "agent-rec", "expires_at": None, "status": "expired"})
     for secret in (CANARY, credential["key_sha256"], stores.tokens["agent-rec"], "omi", "permissions", "accounts"):
         assert secret not in seen
 
@@ -541,9 +561,13 @@ def test_any_json_document_has_one_defined_outcome_and_only_validated_fields(doc
         assert entry["key_sha256"] == digest
         row = admin.recordings_row(entry, now)
         assert set(row) == {"public_id", "expires_at", "status"}
-        assert row["public_id"] in (None, entry.get("id")) and row["expires_at"] in (None, entry.get("expires_at"))
-        assert row["public_id"] is None or (1 <= len(row["public_id"]) <= 128 and row["public_id"].isprintable())
-        assert row["status"] == ("live" if row["expires_at"] and admin.instant(row["expires_at"]) > now else "expired")
+        identity, moment = entry.get("id"), admin.instant(entry.get("expires_at"))
+        assert (row["public_id"] is not None) == (isinstance(identity, str) and 1 <= len(identity) <= 128)
+        assert row["public_id"] is None or (row["public_id"].isprintable() and CANARY not in row["public_id"])
+        assert row["public_id"] is None or not identity.isprintable() or row["public_id"] == identity
+        assert row["expires_at"] is None or row["expires_at"].isprintable()
+        assert (admin.instant(row["expires_at"]) if row["expires_at"] else None) == moment  # the printed text round-trips
+        assert row["status"] == ("live" if moment and moment > now else "expired")
 
 
 # spec: ANYM-494
