@@ -50,14 +50,13 @@ PHASES = ("staged", "altered", "files", "verifying", "finished")
 MARKER = "rotation.unsettled"
 TOKEN_ENV = "DEEDKIT_ROTATION_BACKUP_TOKEN"  # backup_runner.py: the tool's own backup in phase `verifying`
 HELPER_LABEL = "io.deedkit.calendar-rotate-helper"  # a throwaway container; its value is the database container
-EXECUTOR = "deedkit-calendar-rotate-"  # + the rotation id: every ALTER's client, psql process and backend carry it
+FENCE_LOCK = 7840001  # the advisory lock every ALTER of this tool takes before it reads what it replaces
 FINGERPRINT = re.compile(rb"[0-9a-f]{12}")
 ITERATIONS = 4096  # PostgreSQL's default scram_iterations
 
 SIGNALS = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGQUIT, signal.SIGTSTP)
 DOCKER_TIMEOUT, ALTER_TIMEOUT, PROBE_TIMEOUT, STOP_TIMEOUT = 60, 60, 30, 120
 HEALTH_WAIT, HEALTH_POLL = 120, 2
-EXECUTOR_TRIES, EXECUTOR_POLL = 10, 1
 BACKUP_TIMEOUT, BACKUP_STOP = 6300, 180  # the calendar backup unit's TimeoutStartSec and TimeoutStopSec
 
 # Runs in a throwaway container of the database's own image, on its network: never the loopback address, whose
@@ -125,6 +124,23 @@ def say(**fields):
                 write_all(descriptor, line)
             finally:
                 os.close(descriptor)
+
+
+def alter_statements(expected, verifiers):
+    """One transaction for a set. It commits only while each role still has the stored verifier `expected` names: Docker
+    runs an exec independently of its client and may start it late, so an ALTER that outlived its caller finds the
+    verifier a recovery wrote and changes nothing. The lock makes the read and the write one step between two of these."""
+    statements = ["BEGIN ISOLATION LEVEL READ COMMITTED;", "SET LOCAL log_statement = 'none';",
+                  "SET LOCAL log_min_error_statement = 'panic';", "SET LOCAL lock_timeout = '10s';",
+                  "SET LOCAL statement_timeout = '30s';", "SET LOCAL idle_in_transaction_session_timeout = '30s';",
+                  f"SELECT pg_advisory_xact_lock({FENCE_LOCK});"]
+    for role in verifiers:
+        statements.append(f"DO $rotate$ BEGIN IF (SELECT coalesce(rolpassword, '') FROM pg_authid WHERE rolname = '{role}') "
+                          f"<> '{expected[role]}' THEN RAISE EXCEPTION 'rotation_fence'; END IF; END $rotate$;")
+    for role, verifier in verifiers.items():
+        statements.append(f"ALTER ROLE \"{role}\" PASSWORD '{verifier}';")
+    statements.append("COMMIT;")
+    return "\n".join(statements) + "\n"
 
 
 def fingerprint(value):
@@ -365,10 +381,9 @@ class Target:
             if docker("rm", "--force", container)[0] != 0:
                 raise Refused("helper_not_removed")
 
-    def sql(self, statements, timeout=DOCKER_TIMEOUT, application=None):
+    def sql(self, statements, timeout=DOCKER_TIMEOUT):
         """Over the container's local socket as the owner: the path that needs no password, so operators keep one."""
-        return docker("exec", "-i", *(("-e", "PGAPPNAME=" + application) if application else ()), self.container,
-                      "psql", "-X", "-q", "-A", "-t", "-w", "-v", "ON_ERROR_STOP=1",
+        return docker("exec", "-i", self.container, "psql", "-X", "-q", "-A", "-t", "-w", "-v", "ON_ERROR_STOP=1",
                       "-U", OWNER, "-d", self.database, "-f", "-", stdin=statements, timeout=timeout)
 
     def probe(self, role, value):
@@ -708,45 +723,21 @@ class Rotation:
         durable_write(self.staged_dir() / "new.json", (json.dumps(values) + "\n").encode())
         self.journal["new"] = {role: fingerprint(value) for role, value in values.items()}
 
-    def executor(self):
-        return EXECUTOR + self.journal["id"]
+    def stored_verifiers(self):
+        """role -> the stored verifier the next ALTER replaces, held in memory only."""
+        roles = SETS[self.journal["set"]]
+        listed = ", ".join(f"'{role}'" for role in roles)
+        code, output = self.target.sql(
+            f"SELECT rolname, coalesce(rolpassword, '') FROM pg_authid WHERE rolname IN ({listed});\n")
+        found = dict(line.split("|", 1) for line in output.splitlines() if "|" in line) if code == 0 else {}
+        if set(found) != set(roles):
+            raise Refused("database_unreadable")
+        return found
 
-    def settle_executors(self):
-        """No earlier ALTER of this rotation can still commit, before anything is sent again or a fresh value is made:
-        Docker runs an exec independently of its client, so a killed tool can leave a client, a psql or a backend that
-        would apply a staged value late. Each is found by the rotation's name and ended; none left, or a refusal."""
-        name = self.executor()
-        found = subprocess.run(["pgrep", "-f", name], stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                               timeout=DOCKER_TIMEOUT, check=False)
-        if found.returncode not in (0, 1):
-            raise Refused("alter_executor_unsettled")
-        for pid in found.stdout.split():
-            if int(pid) != os.getpid():
-                with suppress(ProcessLookupError):
-                    os.kill(int(pid), signal.SIGKILL)
-        # The name is in each psql's environment, so this script's own arguments and environment do not hold it.
-        script = (f"name={name}\nfor dir in /proc/[0-9]*; do\n"
-                  "  if grep -qas \"PGAPPNAME=$name\" \"$dir/environ\"; then kill -9 \"${dir#/proc/}\" 2>/dev/null; echo found; fi\n"
-                  "done\n")
-        query = f"SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE application_name = '{name}';\n"
-        for _ in range(EXECUTOR_TRIES):
-            code, processes = docker("exec", "-i", self.target.container, "sh", "-s", stdin=script)
-            answer, backends = self.target.sql(query)
-            if code == 0 and answer == 0 and not processes.strip() and backends.strip() == "0":
-                return
-            time.sleep(EXECUTOR_POLL)
-        raise Refused("alter_executor_unsettled")
-
-    def send_alter(self, values):
-        """One transaction per set, with the verifier computed here and deadlines the server enforces. The exit status
-        proves nothing: see settle."""
-        statements = ["BEGIN;", "SET LOCAL log_statement = 'none';", "SET LOCAL log_min_error_statement = 'panic';",
-                      "SET LOCAL lock_timeout = '10s';", "SET LOCAL statement_timeout = '30s';",
-                      "SET LOCAL idle_in_transaction_session_timeout = '30s';"]
-        for role, value in values.items():
-            statements.append(f"ALTER ROLE \"{role}\" PASSWORD '{scram_verifier(value)}';")
-        statements.append("COMMIT;")
-        self.target.sql("\n".join(statements) + "\n", timeout=ALTER_TIMEOUT, application=self.executor())
+    def send_alter(self, values, expected):
+        """The exit status proves nothing: see settle."""
+        verifiers = {role: scram_verifier(value) for role, value in values.items()}
+        self.target.sql(alter_statements(expected, verifiers), timeout=ALTER_TIMEOUT)
 
     def settle(self, values, *, resend):
         """Which password the database accepts decides, on fresh connections. `resend` (recover) sends the staged value
@@ -756,7 +747,7 @@ class Rotation:
             return
         if not resend:
             raise Refused("alter_uncertain" if "error" in answers.values() else "alter_not_applied")
-        self.send_alter(values)
+        self.send_alter(values, self.stored_verifiers())
         if any(self.target.probe(role, value) != "accepted" for role, value in values.items()):
             raise Refused("database_unsettled")
 
@@ -823,8 +814,12 @@ def tool_lock(target):
     """One process at a time on a journal (the marker outlives a process, this lock does not)."""
     target.journal_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = target.journal_dir.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o077:
+    if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.geteuid():
         raise Refused("journal_directory_not_private")
+    # Nothing written below may leave this directory: a link in it would carry the copies and the new value elsewhere.
+    for directory, directories, files in os.walk(target.journal_dir):
+        if any(os.path.islink(os.path.join(directory, name)) for name in directories + files):
+            raise Refused("journal_entry_is_a_link")
     fsync_directory(target.journal_dir.parent)
     LOG[0] = target.journal_dir / "rotation.log"
     descriptor = os.open(target.journal_dir / ".tool.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -909,10 +904,11 @@ def apply(target, which):
             write_state(target.journal_path, rotation.journal)
             checkpoint("staged")
             rotation.check_owner()
+            expected = rotation.stored_verifiers()  # refused here: nothing was sent, and recover aborts
             rotation.journal["alter_sent"] = True
             rotation.save()
             checkpoint("before-alter")
-            rotation.send_alter(values)
+            rotation.send_alter(values, expected)
             checkpoint("after-alter")
             rotation.forward(values, resend=False)
         calls_after(target)
@@ -984,7 +980,6 @@ def recover(target):
                 return
             target.require_worker_stopped()
             sweep_staged([entry["path"] for entry in journal["files"]] + ([target.retired] if target.retired else []))
-            rotation.settle_executors()
             values = rotation.new_values()
             if values is None:
                 values = {role: secrets.token_urlsafe(40) for role in SETS[journal["set"]]}

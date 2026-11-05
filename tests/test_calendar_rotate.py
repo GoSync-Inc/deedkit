@@ -36,6 +36,7 @@ FAKE_DOCKER = r'''#!/usr/bin/env python3
 """The docker the tool sees. State and call log live in one JSON file beside it."""
 import base64, fcntl, hashlib, hmac, json, os, re, signal, sys, time, urllib.parse
 HOME = os.path.dirname(os.path.abspath(__file__))
+FENCE = r"rolname = '(\w+)'\) <> '([^']*)'"
 PATTERN = r'''+"\"\"\"ALTER ROLE \"(\\w+)\" PASSWORD '([^']+)';\"\"\""+r'''
 STATE = os.path.join(HOME, 'state.json')
 def locked(change):
@@ -87,23 +88,19 @@ elif command == 'inspect':
                        'NetworkSettings': {'Networks': {name: {'IPAddress': '10.9.0.2'} for name in info['networks']}}}]))
 elif command == 'network':
     print(json.dumps([{'Internal': state['networks'].get(argv[2], False)}]))
-elif command == 'exec' and argv[1] == '-i' and argv[-2:] == ['sh', '-s']:
-    def end(state):
-        alive = state.pop('executors', [])
-        for pid in alive:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        return alive
-    if locked(end):
-        print('found')
-elif command == 'exec' and argv[1] == '-i' and 'pg_terminate_backend' in stdin:
-    print(locked(lambda state: state.pop('backends', 0)))
+elif command == 'exec' and argv[1] == '-i' and 'ALTER' not in stdin and 'pg_authid' in stdin:
+    for role, stored in ((role, stored) for role, stored in state['roles'].items() if role in stdin):
+        print(f"{role}|{'changed-meanwhile' if state.get('fence_race') else stored}")
 elif command == 'exec' and argv[1] == '-i':
     changes = re.findall(PATTERN, stdin)
+    def commit(state):
+        # The transaction's own fence: every role still has the verifier the ALTER expects.
+        if any(state['roles'].get(role) != expected for role, expected in re.findall(FENCE, stdin)):
+            return False
+        state['roles'].update(changes)
+        return True
     if 'ALTER' in stdin and state.get('alter') in ('late', 'orphan'):
-        # The exec outlives its client (`late`) or the client outlives the tool (`orphan`): it commits when the gate goes.
+        # The exec starts when the gate goes, long after its client ended (`late`) or the tool died (`orphan`).
         if state['alter'] == 'orphan':
             os.kill(os.getppid(), signal.SIGKILL)
         elif os.fork():
@@ -112,11 +109,9 @@ elif command == 'exec' and argv[1] == '-i':
             os.setsid()
             for number in (0, 1, 2):
                 os.close(number)
-            locked(lambda state: state.setdefault('executors', []).append(os.getpid()))
         while os.path.exists(state['gate']):
             time.sleep(0.02)
-        locked(lambda state: state['roles'].update(changes))
-        sys.exit(0)
+        sys.exit(0 if locked(commit) else 3)
     if state.get('stop_tool_on') == 'alter' and 'ALTER' in stdin:
         os.kill(os.getppid(), signal.SIGTERM); os.kill(os.getppid(), signal.SIGHUP); time.sleep(0.2)
     while 'ALTER' in stdin and state.get('pause_alter') and os.path.exists(state['pause_alter']):
@@ -126,7 +121,8 @@ elif command == 'exec' and argv[1] == '-i':
         sys.exit(1)
     if mode == 'hang':
         time.sleep(60)
-    locked(lambda state: state['roles'].update(changes))
+    if not locked(commit):
+        sys.exit(3)
     if mode == 'commit_then_error':
         sys.exit(1)
 elif command == 'exec':
@@ -639,35 +635,64 @@ def test_a_lost_staged_value_is_replaced_by_a_fresh_one_never_by_the_old_one(hos
 
 
 # spec: ANYM-784
-@pytest.mark.parametrize('mode', ['late', 'orphan'])
-def test_an_alter_that_outlives_its_caller_cannot_commit_after_the_recovery(host, mode):
-    """Astra r1 M1: its staged value is lost, so the recovery makes a fresh one; the old executor must not overwrite it."""
+@pytest.mark.parametrize('mode, commits_first', [('late', False), ('orphan', False), ('late', True), ('orphan', True)])
+def test_an_alter_that_starts_after_its_caller_cannot_undo_the_recovery(host, mode, commits_first):
+    """Astra r1 and Sol r2 M1: the staged value is lost, so the recovery makes a fresh one. The old exec may start at
+    any moment, also after everything looked settled: its fence finds another verifier and it changes nothing."""
     gate = host.tmp / 'gate'
     gate.write_text('')
     host.change(alter=mode, gate=str(gate))
     code = host.tool('apply', 'owner')[0]
     assert code == (1 if mode == 'late' else -signal.SIGKILL)
-    host.change(alter=None, backends=1)
-    (host.journal_dir / 'staged' / json.loads(host.journal.read_text())['id'] / 'new.json').unlink()
+    host.change(alter=None)
+    staged = host.journal_dir / 'staged' / json.loads(host.journal.read_text())['id'] / 'new.json'
+    lost = json.loads(staged.read_text())['fcs_owner']
+    staged.unlink()
+    if commits_first:  # it won the race: the recovery replaces what it wrote
+        gate.unlink()
+        deadline = time.monotonic() + 30
+        while not host.accepted('fcs_owner', lost):
+            assert time.monotonic() < deadline
+            time.sleep(0.02)
     host.ok('recover')
     value = host.assert_owner_rotated()
-    gate.unlink()  # what was left of the first ALTER would commit now
-    time.sleep(0.5)
-    assert host.assert_owner_rotated() == value
-    assert 'backends' not in host.state() and 'executors' not in host.state()
+    assert value != lost and not host.accepted('fcs_owner', lost)
+    if not commits_first:
+        gate.unlink()
+        time.sleep(0.5)
+    assert host.assert_owner_rotated() == value and not host.accepted('fcs_owner', lost)
     host.ok('verify')
     host.ok('finish')
 
 
 # spec: ANYM-784
-def test_every_alter_carries_the_rotation_name_and_server_side_deadlines(host):
-    host.ok('apply', 'owner')
+def test_every_alter_is_fenced_on_the_verifier_it_replaces_with_deadlines_the_server_enforces(host):
+    host.ok('apply', 'roles')
     entry = next(entry for entry in host.state()['log'] if 'ALTER ROLE' in entry['stdin'])
-    rotation_id = json.loads(host.journal.read_text())['id']
-    assert entry['argv'][2:4] == ['-e', 'PGAPPNAME=' + rotate.EXECUTOR + rotation_id]
+    for role in ('fcs_gateway', 'fcs_worker'):
+        assert f"rolname = '{role}') <> '{verifier(OLD[role])}'" in entry['stdin']
+    stdin = entry['stdin']
+    assert stdin.index('pg_advisory_xact_lock') < stdin.index('rotation_fence') < stdin.index('ALTER ROLE')
     for setting in ('lock_timeout', 'statement_timeout', 'idle_in_transaction_session_timeout'):
-        assert f'SET LOCAL {setting} = ' in entry['stdin']
-    assert len(rotate.EXECUTOR + rotation_id) < 64  # PostgreSQL's limit for a name
+        assert stdin.index(f'SET LOCAL {setting} = ') < stdin.index('pg_advisory_xact_lock')
+
+
+# spec: ANYM-784
+def test_a_fence_that_finds_another_verifier_leaves_the_files_alone(host):
+    """A stored verifier that changed between the read and the ALTER: nothing commits and recover completes."""
+    host.tool('apply', 'owner', kill_at='before-alter')
+    before = {name: path.read_bytes() for name, path in host.files.items()}
+    state = host.state()
+    state['fence_race'] = True
+    host.state_path.write_text(json.dumps(state))
+    code, line, _ = host.tool('recover')
+    assert code == 1 and line['code'] == 'database_unsettled'
+    assert {name: path.read_bytes() for name, path in host.files.items()} == before and host.marker.exists()
+    host.change(fence_race=False)
+    host.ok('recover')
+    host.ok('verify')
+    host.ok('finish')
+    host.assert_owner_rotated()
 
 
 # spec: ANYM-784
@@ -1161,6 +1186,29 @@ def test_a_refused_production_profile_creates_no_journal_directory(host, scratch
 
 
 # spec: ANYM-784
+@pytest.mark.parametrize('entry', ['staged', 'journal.json', 'rotation.log'])
+def test_a_link_in_the_journal_directory_is_refused_before_anything_is_written(host, scratch, entry):
+    """Sol r2 M5: `staged` pointing into production would have carried the copies and the new value there."""
+    journal = host.tmp / 'scratch' / 'service.rotation'
+    journal.mkdir(mode=0o700)
+    (journal / entry).symlink_to(host.service)
+    before = sorted(path.name for path in host.service.iterdir())
+    code, line, _ = scratch.run(('apply', 'owner'))
+    assert code == 1 and line['code'] == 'journal_entry_is_a_link'
+    assert sorted(path.name for path in host.service.iterdir()) == before
+    assert not (journal / 'rotation.unsettled').exists()
+    assert all('ALTER' not in entry['stdin'] for entry in host.state()['log'])
+
+
+# spec: ANYM-784
+def test_a_journal_directory_owned_by_someone_else_or_open_to_others_is_refused(host, scratch):
+    journal = host.tmp / 'scratch' / 'service.rotation'
+    journal.mkdir(mode=0o755)
+    code, line, _ = scratch.run(('apply', 'owner'))
+    assert code == 1 and line['code'] == 'journal_directory_not_private'
+
+
+# spec: ANYM-784
 def test_each_mode_takes_only_its_own_arguments(host, scratch):
     code, line, _ = host.tool('apply', 'owner', '--container', DB)
     assert code == 1 and line['code'] == 'production_mode_takes_no_target'
@@ -1229,7 +1277,7 @@ def test_in_real_postgresql_the_verifier_logs_in_and_the_replaced_value_is_refus
             return subprocess.run([sys.executable, str(driver), str(spec)], capture_output=True, text=True, timeout=180)
 
         assert json.loads(tool('plan').stdout.splitlines()[-1])['ready'] is True
-        assert tool('apply', 'owner', kill_at='after-alter').returncode == -signal.SIGKILL
+        assert tool('apply', 'owner', kill_at='before-alter').returncode == -signal.SIGKILL
         recovered = tool('recover')
         assert recovered.returncode == 0, recovered.stdout
         for command in ('verify', 'finish'):
@@ -1246,6 +1294,12 @@ def test_in_real_postgresql_the_verifier_logs_in_and_the_replaced_value_is_refus
         target.attach(name)
         assert target.probe('fcs_owner', env) == 'accepted' and target.probe('fcs_owner', OLD['fcs_owner']) == 'refused'
         assert target.probe('fcs_owner', 'a-random-value') == 'refused'
+        # The fence in the real database: an ALTER that expects the stored verifier of the start changes nothing.
+        late = rotate.alter_statements({'fcs_owner': verifier(OLD['fcs_owner'])}, {'fcs_owner': verifier('a-late-value')})
+        answer = subprocess.run(['docker', 'exec', '-i', name, 'psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-U', 'fcs_owner',
+                                 '-d', 'family_calendar', '-f', '-'], input=late, text=True, capture_output=True, timeout=60)
+        assert answer.returncode != 0 and 'rotation_fence' in answer.stderr
+        assert target.probe('fcs_owner', env) == 'accepted' and target.probe('fcs_owner', 'a-late-value') == 'refused'
         gateway = re.search(r'fcs_gateway:([^@]+)@', (profile / 'gateway.json').read_text())[1]
         assert target.probe('fcs_gateway', gateway) == 'accepted' and target.probe('fcs_gateway', OLD['fcs_gateway']) == 'refused'
     finally:

@@ -2412,7 +2412,8 @@ What each step does:
   `fcs_worker`: `worker.json`, where only the password in `dsn` changes (`bind`, `allowed_hosts` and
   `allowed_origins` stay). Each keeps its owner and mode and is staged, parsed, renamed and read back.
 - The verifier is computed on the host (SCRAM-SHA-256), so the plaintext reaches no server log, argv,
-  environment or `psql` history. The `ALTER` goes over the database container's local socket. A login probe runs
+  environment or `psql` history. The `ALTER` goes over the database container's local socket, with deadlines the
+  server enforces and a fence on the verifier it replaces. A login probe runs
   in a throwaway container of the database's image on its internal network, scram only, with the value on stdin.
 - `verify`: the replaced value is refused and the new one accepted on fresh connections, the files hold the new
   value, `db-roles --check` is ok through `runtime.json`, `/health` is 200, the saved container identities are the
@@ -2441,7 +2442,7 @@ which value it accepts and completes with the staged one; it never enables the r
 | Interrupted | State | `recover` |
 |---|---|---|
 | before the `ALTER` was sent (`staged`) | nothing changed in the database or the files | aborts, removes the staged files and the marker; run `apply` again |
-| after the `ALTER`, before the first file | the database has the new value (or the `ALTER`'s result is uncertain, which a probe settles before any file changes), the files the old one | ends what is left of the earlier `ALTER` (its docker client, its `psql`, its backend, all named after the rotation), then completes with the staged value: sends it again if needed, retired list, files, restart, `verifying` |
+| after the `ALTER`, before the first file | the database has the new value (or the `ALTER`'s result is uncertain, which a probe settles before any file changes), the files the old one | completes with the staged value: sends it again if needed, retired list, files, restart, `verifying`. Every `ALTER` commits only while the role still has the stored verifier it read, so one that outlived its caller and starts late changes nothing |
 | between files | some files old, some new | rewrites the rest from what each holds now |
 | a short write or a killed write | the file itself is whole (rename); a `.tmp` beside it | removes the `.tmp`, writes the file |
 | staged value lost | the journal's fingerprint no longer matches a file | generates a fresh value, sends it, rewrites every file |
@@ -2460,8 +2461,8 @@ Restore (ANYM-780): `--mode isolated --container <name> --profile-dir <dir> [--r
 subcommand rotates the roles in that container and rewrites only the profile files in that directory (the journal
 goes to `<dir>.rotation`, on the resolved path). It refuses when the container's project has a `calendar-api` or
 `calendar-worker`, when the container is on a non-internal network or shares one with any other container, or when
-the directory or the list is under production state. It restarts nothing, reads no production credential, takes no
-production admission and verifies at the database level only.
+the directory or the list is under production state. A link inside the journal's directory refuses in either mode. It restarts nothing,
+reads no production credential, takes no production admission and verifies at the database level only.
 
 Undo: undo is another rotation (`apply` the same set again); an exposed value is never restored. Until ANYM-779
 moves the calendar project off its rendered Compose document, that document keeps the previous `POSTGRES_PASSWORD`
